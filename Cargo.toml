@@ -1,0 +1,158 @@
+# ztest — Rust integration-test harness for Zcash topologies on
+# Kubernetes. Extracted from `zingolabs/infrastructure` so it can
+# version and release on its own cadence.
+#
+# This Cargo.toml is both a workspace root (so `macros/` can share
+# the dep table) and the `ztest` package definition. The workspace
+# layout keeps the historical flat directory shape from when the
+# code lived in `infrastructure/zcash_kube_net/`.
+
+[workspace]
+members = ["macros"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+authors = ["Zingolabs <zingo@zingolabs.org>"]
+repository = "https://github.com/zingolabs/ztest"
+homepage = "https://github.com/zingolabs/ztest"
+version = "0.0.0"
+
+[workspace.dependencies]
+# Local sub-crate.
+ztest_macros = { path = "macros", version = "0.0.0" }
+
+# Versions tracked against `zingolabs/infrastructure` at extraction
+# time. Bump in lockstep with the rest of the Zcash stack to avoid
+# transitive-resolution divergence.
+thiserror = "1.0.64"
+tokio = "1.42.0"
+tracing = "0.1.40"
+serde_json = "1.0.132"
+hex = "0.4.3"
+reqwest = { version = "0.12", default-features = false }
+
+# Upstream Zcash crates — same set the predecessor `zcash_local_net`
+# uses for RPC drive.
+zebra-rpc = "9.0.0"
+zebra-node-services = "7.0.0"
+zebra-chain = "9.0.0"
+zcash_protocol = { version = "0.9.0", features = ["local-consensus"] }
+
+# Zingo
+zingo_common_components = "0.3.1"
+
+# ─────────────────────────── patches ──────────────────────────────────
+# Mirrors the patch from `zingolabs/infrastructure`'s root Cargo.toml.
+# Required because `zebra-chain` transitively depends on
+# `libzcash_script`, whose published version doesn't build cleanly
+# against current rustc. Lift this patch when upstream cuts a release
+# that drops the requirement.
+[patch.crates-io]
+libzcash_script = { git = "https://github.com/zancas/zcash_script", branch = "fix-bindgen-rust-target" }
+
+# ─────────────────────────── ztest crate ──────────────────────────────
+[package]
+name = "ztest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Boot Zcash topologies on Kubernetes and hand typed RPC handles back to test code."
+
+[lib]
+name = "ztest"
+path = "src/lib.rs"
+
+[dependencies]
+ztest_macros = { workspace = true }
+
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "fs", "process"] }
+tracing = { workspace = true }
+
+# Boxed-future macros for the per-category `*Backend` traits — needed
+# so `Arc<dyn ValidatorBackend>` / `Arc<dyn IndexerBackend>` /
+# `Arc<dyn WalletBackend>` can hold object-safe async methods. The
+# alternative (hand-written `Pin<Box<dyn Future + Send>>` returns) is
+# unreadable at the IndexerBackend's ~15-method surface; one boxed
+# future per RPC call is negligible at test-op frequency.
+async-trait = "0.1"
+
+# Kubernetes client.
+kube = { version = "0.99", default-features = false, features = ["client", "runtime", "ws", "rustls-tls"] }
+k8s-openapi = { version = "0.24", features = ["latest"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+rand = "0.8"
+sha2 = "0.10"
+hex = { workspace = true }
+walkdir = "2"
+
+# Link-time inventory of dev-image declarations submitted via the
+# `dev!` macro. Tests register `DevImageDecl` entries; the ztest CLI
+# spawns each selected test binary with `ZTEST_DUMP_INVENTORY=1` and
+# a ctor hook dumps the linked-in registrations as JSON.
+inventory = "0.3"
+# Pre-main hook used to dump the inventory and exit before libtest
+# sees argv. The ctor fires only when ZTEST_DUMP_INVENTORY is set;
+# normal test runs incur a single env::var_os check.
+ctor = "0.2"
+
+# Upstream Zcash crates — same set zcash_local_net uses for RPC drive.
+zebra-rpc = { workspace = true }
+zebra-node-services = { workspace = true }
+zebra-chain = { workspace = true }
+zcash_protocol = { workspace = true }
+zingo_common_components = { workspace = true }
+
+# JSON-RPC transport. Direct reqwest + jsonrpsee-types so we can attach
+# optional HTTP Basic Auth for zcashd — zebra-node-services::RpcRequestClient
+# has no auth API.
+reqwest = { workspace = true }
+jsonrpsee-types = "0.24"
+
+# gRPC client transport — used by indexer/wallet backends.
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
+prost = "0.13"
+
+# Preflight banner — same stack nextest itself uses for its reporter,
+# so the setup-script output sits visually inside nextest's vocabulary
+# rather than competing with it. Versions pinned to nextest's workspace
+# (https://github.com/nextest-rs/nextest/blob/main/Cargo.toml).
+owo-colors = "4.3.0"
+supports-color = "3.0.2"
+supports-unicode = "3.0.0"
+bytesize = "2.3.1"
+
+# Terminal dimensions for the pinned-header DECSTBM math. Already in
+# our transitive tree via `clap`'s help wrapping; declared explicitly
+# here so we don't depend on a transitive presence.
+terminal_size = "0.4"
+
+# DSR cursor-position query so the preflight banner can be drawn
+# *below* the user's command row instead of overwriting the top of
+# the screen. Handles the raw-mode dance and ANSI parse so we don't
+# have to take a `libc` dep ourselves.
+crossterm = "0.29"
+
+# `ztest` CLI — clap parses our subcommands; the per-subcommand argv is
+# forwarded verbatim to cargo nextest. Matches the clap version range
+# nextest itself depends on so the help text rendering stays familiar.
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+
+# Strongly-typed schema for `cargo nextest list --message-format json`
+# output. Published by the nextest project alongside the binary so the
+# JSON contract is stable.
+nextest-metadata = "0.14"
+
+[build-dependencies]
+tonic-build = { version = "0.12", default-features = false, features = ["prost"] }
+# Vendored protoc binary — avoids requiring a system install on dev
+# machines / CI runners. The tonic-build invocation below sets PROTOC
+# to point at this binary.
+protoc-bin-vendored = "3.1"
