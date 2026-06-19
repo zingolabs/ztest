@@ -33,8 +33,8 @@ use std::convert::TryFrom;
 
 use k8s_openapi::api::core::v1::{Namespace, Node};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use kube::{Api, Client, Config};
 use kube::api::ListParams;
+use kube::{Api, Client, Config};
 
 use super::events::{Event, EventTx};
 
@@ -76,6 +76,8 @@ pub enum ProbeOutcome {
 pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
     let _ = tx.send(Event::ProbeStarted);
 
+    crate::cluster::ensure_crypto_provider();
+
     let config = match Config::infer().await {
         Ok(c) => c,
         Err(err) => {
@@ -106,17 +108,16 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
     let ns_api: Api<Namespace> = Api::all(client.clone());
 
     let lp = ListParams::default();
-    let (nodes, namespaces) =
-        match tokio::try_join!(nodes_api.list(&lp), ns_api.list(&lp)) {
-            Ok(pair) => pair,
-            Err(err) => {
-                let detail = format!("{err}");
-                let _ = tx.send(Event::ProbeFailed {
-                    detail: detail.clone(),
-                });
-                return (ProbeOutcome::Failed { detail }, None);
-            }
-        };
+    let (nodes, namespaces) = match tokio::try_join!(nodes_api.list(&lp), ns_api.list(&lp)) {
+        Ok(pair) => pair,
+        Err(err) => {
+            let detail = format!("{err}");
+            let _ = tx.send(Event::ProbeFailed {
+                detail: detail.clone(),
+            });
+            return (ProbeOutcome::Failed { detail }, None);
+        }
+    };
 
     let summary = summarize_nodes(&nodes.items);
     let slots_used = count_zaino_slots(&namespaces.items);
@@ -164,7 +165,9 @@ fn summarize_nodes(nodes: &[Node]) -> NodeSummary {
         }
         if let Some(status) = &node.status {
             if let Some(conds) = &status.conditions
-                && conds.iter().any(|c| c.type_ == "Ready" && c.status == "True")
+                && conds
+                    .iter()
+                    .any(|c| c.type_ == "Ready" && c.status == "True")
             {
                 ready += 1;
             }

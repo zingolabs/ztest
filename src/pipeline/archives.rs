@@ -90,11 +90,7 @@ pub async fn discover(client: &Client, _tx: &EventTx) -> ArchivesOutcome {
         }
     };
 
-    let entries: Vec<_> = pvcs
-        .items
-        .iter()
-        .filter_map(classify_pvc)
-        .collect();
+    let entries: Vec<_> = pvcs.items.iter().filter_map(classify_pvc).collect();
 
     ArchivesOutcome::Discovered { entries }
 }
@@ -165,7 +161,10 @@ fn parse_storage_bytes(q: &k8s_openapi::apimachinery::pkg::api::resource::Quanti
 pub fn ready_pending_counts(entries: &[ArchiveEntry]) -> (u32, u32) {
     let ready = entries.iter().filter(|e| e.ready).count();
     let pending = entries.len() - ready;
-    (ready.try_into().unwrap_or(u32::MAX), pending.try_into().unwrap_or(u32::MAX))
+    (
+        ready.try_into().unwrap_or(u32::MAX),
+        pending.try_into().unwrap_or(u32::MAX),
+    )
 }
 
 #[cfg(test)]

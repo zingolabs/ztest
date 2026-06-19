@@ -35,9 +35,9 @@ use kube::runtime::wait::{Condition, await_condition, conditions};
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
-use crate::seeds::{self, SEEDS_NAMESPACE, SeedHandle, volume_snapshot_gvk};
-use crate::error::env_err;
 use crate::EnvError;
+use crate::error::env_err;
+use crate::seeds::{self, SEEDS_NAMESPACE, SeedHandle, volume_snapshot_gvk};
 
 const WAIT_INTERVAL: Duration = Duration::from_secs(2);
 const WAIT_BUDGET: Duration = Duration::from_secs(300);
@@ -53,7 +53,11 @@ pub enum Payload {
 /// Get-or-create the seed PVC and ensure it's populated and snapshotted.
 /// Returns a fully-formed `SeedHandle` ready to be consumed by
 /// `mint_shadow_clone`.
-pub async fn ensure_seed(client: &Client, source: &Path, payload: Payload) -> Result<SeedHandle, EnvError> {
+pub async fn ensure_seed(
+    client: &Client,
+    source: &Path,
+    payload: Payload,
+) -> Result<SeedHandle, EnvError> {
     let sha8 = seeds::sha8(source).map_err(|e| EnvError::ArchiveMaterializeFailed {
         archive: source.to_path_buf(),
         reason: format!("hashing source failed: {e}"),
@@ -89,7 +93,12 @@ pub async fn ensure_seed(client: &Client, source: &Path, payload: Payload) -> Re
 async fn ensure_seeds_namespace(client: &Client) -> Result<(), EnvError> {
     use k8s_openapi::api::core::v1::Namespace;
     let api: Api<Namespace> = Api::all(client.clone());
-    if api.get_opt(SEEDS_NAMESPACE).await.map_err(env_err)?.is_some() {
+    if api
+        .get_opt(SEEDS_NAMESPACE)
+        .await
+        .map_err(env_err)?
+        .is_some()
+    {
         return Ok(());
     }
     let ns: Namespace = serde_json::from_value(json!({
@@ -166,7 +175,12 @@ async fn mark_ready(client: &Client, pvc_name: &str) -> Result<(), EnvError> {
 /// to a "wait" branch in `ensure_seed`.
 struct InFlight;
 
-async fn try_materialize(client: &Client, pvc_name: &str, source: &Path, payload: Payload) -> Result<Result<(), EnvError>, InFlight> {
+async fn try_materialize(
+    client: &Client,
+    pvc_name: &str,
+    source: &Path,
+    payload: Payload,
+) -> Result<Result<(), EnvError>, InFlight> {
     match materialize(client, pvc_name, source, payload).await {
         Ok(()) => Ok(Ok(())),
         Err(MaterializeErr::InFlight) => Err(InFlight),
@@ -174,8 +188,15 @@ async fn try_materialize(client: &Client, pvc_name: &str, source: &Path, payload
     }
 }
 
-enum MaterializeErr { InFlight, Fatal(EnvError) }
-impl From<EnvError> for MaterializeErr { fn from(e: EnvError) -> Self { MaterializeErr::Fatal(e) } }
+enum MaterializeErr {
+    InFlight,
+    Fatal(EnvError),
+}
+impl From<EnvError> for MaterializeErr {
+    fn from(e: EnvError) -> Self {
+        MaterializeErr::Fatal(e)
+    }
+}
 
 async fn materialize(
     client: &Client,
@@ -205,22 +226,25 @@ async fn materialize(
     let mut attached = pods
         .attach(
             &pod_name,
-            &AttachParams::default().stdin(true).stderr(true).stdout(false),
+            &AttachParams::default()
+                .stdin(true)
+                .stderr(true)
+                .stdout(false),
         )
         .await
         .map_err(env_err)?;
-    let mut stdin = attached.stdin().ok_or_else(|| {
-        env_err(std::io::Error::other(
-            "uploader pod did not expose stdin",
-        ))
-    })?;
+    let mut stdin = attached
+        .stdin()
+        .ok_or_else(|| env_err(std::io::Error::other("uploader pod did not expose stdin")))?;
     let mut file = tokio::fs::File::open(source).await.map_err(|e| {
         env_err(std::io::Error::new(
             e.kind(),
             format!("opening {}: {e}", source.display()),
         ))
     })?;
-    tokio::io::copy(&mut file, &mut stdin).await.map_err(env_err)?;
+    tokio::io::copy(&mut file, &mut stdin)
+        .await
+        .map_err(env_err)?;
     stdin.shutdown().await.ok();
     drop(stdin);
 

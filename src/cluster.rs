@@ -1,25 +1,50 @@
 //! Kube client + namespace lifecycle.
 //!
-//! Every `TestEnv` lives inside its own namespace (`kn-{test_id}`),
-//! created on `build()` and deleted on `teardown()`. Deleting the
-//! namespace cascades every namespaced object — no per-object owner
-//! references needed.
+//! Every `TestEnv` lives inside its own namespace
+//! (`ztest-{package}-{test}-{suffix}`), created on `build()` and deleted
+//! when the `TestEnv` is dropped. Deleting the namespace cascades every
+//! namespaced object — no per-object owner references needed.
 //!
 //! Cluster-scoped resources we mint (VolumeSnapshotContent shadows in
 //! `seeds.rs`) survive the namespace delete and must be reaped
 //! explicitly. See `docs/architecture-overview.md#ownership-cascade`.
 
 use k8s_openapi::api::core::v1::{Namespace, Service};
-use kube::api::{Api, PostParams};
 use kube::Client;
+use kube::api::{Api, PostParams};
 use serde_json::json;
 
 use crate::naming::RunCoords;
 
+/// Install the process-wide rustls crypto provider exactly once.
+///
+/// kube, tonic, and reqwest all pull rustls 0.23, which treats the
+/// crypto provider as a process-level choice rather than a compile-time
+/// default — so *something* in the process must install one before the
+/// first TLS handshake, or rustls panics ("could not automatically
+/// determine the process-level CryptoProvider"). ztest owns the
+/// transport on the test author's behalf, so ztest makes the choice:
+/// `ring`, matching what the (now-removed) `zebra-*` stack used to
+/// supply transitively.
+///
+/// Idempotent and polite: guarded by a `Once`, and `install_default`
+/// is a no-op if a provider is already set — so a test binary that
+/// installs its own provider first still wins.
+pub(crate) fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Construct a kube client by inferring config: in-cluster SA token in CI,
 /// `~/.kube/config` (over Tailscale) on a dev laptop.
 pub async fn client() -> Result<Client, kube::Error> {
-    let cfg = kube::Config::infer().await.map_err(kube::Error::InferConfig)?;
+    ensure_crypto_provider();
+    let cfg = kube::Config::infer()
+        .await
+        .map_err(kube::Error::InferConfig)?;
     Client::try_from(cfg)
 }
 
@@ -33,15 +58,36 @@ pub fn in_cluster() -> bool {
 /// Create the per-test namespace. Idempotent — a 409 means the
 /// namespace already exists (e.g. a previous run is still being torn
 /// down by k8s GC), which we treat as success.
+/// Whether `ztest run --no-cleanup` asked us to leave per-test namespaces
+/// behind for post-mortem inspection. The CLI flag can't reach the test
+/// process directly (Drop runs inside the test binary, not the `ztest`
+/// process), so it propagates as the `ZTEST_NO_CLEANUP` env var, which
+/// nextest forwards to every test binary. Any non-empty, non-`"0"` value
+/// counts as set.
+pub(crate) fn no_cleanup_requested() -> bool {
+    std::env::var_os("ZTEST_NO_CLEANUP").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 pub async fn ensure_namespace(
     client: &Client,
     namespace: &str,
     coords: &RunCoords,
+    package: &str,
+    test: &str,
 ) -> Result<(), kube::Error> {
     let api: Api<Namespace> = Api::all(client.clone());
     if api.get_opt(namespace).await?.is_some() {
         return Ok(());
     }
+    // Label values must be DNS-1123 (≤63, no `:`); the raw `module::test`
+    // path is slugged for the label and kept verbatim in an annotation
+    // (annotations have no charset/length limit) so nothing is lost.
+    //
+    // `janitor/ttl` is ALWAYS set, even under `--no-cleanup`: the flag only
+    // suppresses immediate teardown in Drop so a developer can inspect the
+    // pods. The 1h janitor backstop still reaps the namespace afterwards —
+    // a developer gets an hour to run `kubectl`, then it's swept. This keeps
+    // `--no-cleanup` from ever leaking namespaces permanently.
     let ns: Namespace = serde_json::from_value(json!({
         "apiVersion": "v1",
         "kind": "Namespace",
@@ -50,10 +96,14 @@ pub async fn ensure_namespace(
             "labels": {
                 "zaino.io/run-id": coords.run_id,
                 "zaino.io/role": "test-env",
+                "zaino.io/user": crate::naming::slug(&coords.user, 63),
+                "zaino.io/package": crate::naming::slug(package, 63),
+                "zaino.io/test": crate::naming::slug(test, 63),
             },
-            // kube-janitor backstop in case teardown is skipped (panic
-            // before Drop runs, OOM-kill, etc).
-            "annotations": { "janitor/ttl": "1h" },
+            "annotations": {
+                "zaino.io/test-full": test,
+                "janitor/ttl": "1h",
+            },
         }
     }))
     .map_err(kube::Error::SerdeError)?;

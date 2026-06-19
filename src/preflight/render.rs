@@ -318,7 +318,10 @@ fn write_archive_detail(out: &mut String, status: &ArchiveStatus, theme: &Theme)
                 out,
                 "{} {dot} {}",
                 "cached".style(theme.styles.pass),
-                ByteSize::b(*size_bytes).display().iec().style(theme.styles.count),
+                ByteSize::b(*size_bytes)
+                    .display()
+                    .iec()
+                    .style(theme.styles.count),
             )
             .expect("write to string");
         }
@@ -331,27 +334,26 @@ fn write_archive_detail(out: &mut String, status: &ArchiveStatus, theme: &Theme)
                 DownloadSource::Lfs => "LFS",
                 DownloadSource::ClusterCache => "cluster cache",
             };
-            let percent = status
-                .download_progress()
-                .map(|(p, _, _)| p)
-                .unwrap_or(0);
+            let percent = status.download_progress().map(|(p, _, _)| p).unwrap_or(0);
             let bar = render_progress_bar(percent, theme);
             write!(
                 out,
                 "downloading from {source_label} {bar} {} {dot} {} / {}",
                 format_args!("{percent}%").style(theme.styles.count),
-                ByteSize::b(*bytes_done).display().iec().style(theme.styles.count),
-                ByteSize::b(*bytes_total).display().iec().style(theme.styles.count),
+                ByteSize::b(*bytes_done)
+                    .display()
+                    .iec()
+                    .style(theme.styles.count),
+                ByteSize::b(*bytes_total)
+                    .display()
+                    .iec()
+                    .style(theme.styles.count),
             )
             .expect("write to string");
         }
         ArchiveStatus::Missing { detail } => {
-            write!(
-                out,
-                "missing {dot} {}",
-                detail.style(theme.styles.dim),
-            )
-            .expect("write to string");
+            write!(out, "missing {dot} {}", detail.style(theme.styles.dim),)
+                .expect("write to string");
         }
     }
 }
@@ -401,7 +403,11 @@ fn render_progress_bar(percent: u8, theme: &Theme) -> String {
     format!(
         "{}{}{}{}",
         "[".style(theme.styles.dim),
-        theme.chars.bar_fill.repeat(filled).style(theme.styles.count),
+        theme
+            .chars
+            .bar_fill
+            .repeat(filled)
+            .style(theme.styles.count),
         theme.chars.bar_empty.repeat(empty).style(theme.styles.dim),
         "]".style(theme.styles.dim),
     )
@@ -409,12 +415,13 @@ fn render_progress_bar(percent: u8, theme: &Theme) -> String {
 
 /// Column width for a name column: max(items) clamped to a sane range
 /// so a single very-long name can't push detail off the right.
-fn column_width<'a>(
-    names: impl IntoIterator<Item = &'a str>,
-    min: usize,
-    max: usize,
-) -> usize {
-    names.into_iter().map(|n| n.len()).max().unwrap_or(0).clamp(min, max)
+fn column_width<'a>(names: impl IntoIterator<Item = &'a str>, min: usize, max: usize) -> usize {
+    names
+        .into_iter()
+        .map(|n| n.len())
+        .max()
+        .unwrap_or(0)
+        .clamp(min, max)
 }
 
 // ─────────────────────────── tests ────────────────────────────────────
@@ -444,11 +451,15 @@ mod tests {
             archives: vec![
                 ArchiveRow {
                     name: "regtest-nu5-h128".to_string(),
-                    status: ArchiveStatus::Cached { size_bytes: 432_013_312 },
+                    status: ArchiveStatus::Cached {
+                        size_bytes: 432_013_312,
+                    },
                 },
                 ArchiveRow {
                     name: "testnet-2.6m".to_string(),
-                    status: ArchiveStatus::Cached { size_bytes: 19_754_106_880 },
+                    status: ArchiveStatus::Cached {
+                        size_bytes: 19_754_106_880,
+                    },
                 },
                 ArchiveRow {
                     name: "testnet-3.1m".to_string(),
@@ -534,7 +545,10 @@ mod tests {
         assert!(s.contains("------------"), "ascii hbar missing:\n{s}");
         assert!(s.contains("OK regtest-nu5-h128"), "ascii ok marker:\n{s}");
         assert!(s.contains(".. testnet-3.1m"), "ascii progress marker:\n{s}");
-        assert!(s.contains("WARN mainnet-snapshot-9.0"), "ascii warn marker:\n{s}");
+        assert!(
+            s.contains("WARN mainnet-snapshot-9.0"),
+            "ascii warn marker:\n{s}"
+        );
     }
 
     #[test]
@@ -563,18 +577,26 @@ mod tests {
         state.future = vec![
             FutureRow { label: "tier" },
             FutureRow { label: "queue" },
-            FutureRow { label: "reservation" },
+            FutureRow {
+                label: "reservation",
+            },
         ];
         let s = render(&state, &plain_unicode_theme());
         // Section header.
-        assert!(s.contains("Future 3 reserved"), "missing future header:\n{s}");
+        assert!(
+            s.contains("Future 3 reserved"),
+            "missing future header:\n{s}"
+        );
         // Rows are dot-separated and tagged not-yet-implemented.
         assert!(s.contains("tier"), "got:\n{s}");
         assert!(s.contains("queue"), "got:\n{s}");
         assert!(s.contains("reservation"), "got:\n{s}");
         assert!(s.contains("not yet implemented"), "got:\n{s}");
         // Blank line separator landed before the Future block.
-        assert!(s.contains("\n\n      Future"), "missing blank separator:\n{s}");
+        assert!(
+            s.contains("\n\n      Future"),
+            "missing blank separator:\n{s}"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! cargo run -p zcash_kube_net --example preflight_demo | cat   # non-TTY: commits final frame only
 //! ```
 
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 use std::thread;
 use std::time::Duration;
 
@@ -45,7 +45,8 @@ fn main() {
     // then commit it — important because `finish` is what writes when
     // stdout isn't a terminal.
     thread::sleep(TICK * 6);
-    live.finish(&preflight::render(&state(STEPS), &theme)).unwrap();
+    live.finish(&preflight::render(&state(STEPS), &theme))
+        .unwrap();
     stdout().flush().unwrap();
 }
 
@@ -60,7 +61,9 @@ fn state(step: u32) -> BannerState {
     let archive_done = step >= STEPS;
 
     let testnet_3_1m = if archive_done {
-        ArchiveStatus::Cached { size_bytes: TOTAL_BYTES }
+        ArchiveStatus::Cached {
+            size_bytes: TOTAL_BYTES,
+        }
     } else {
         ArchiveStatus::Downloading {
             source: DownloadSource::Lfs,
@@ -92,11 +95,15 @@ fn state(step: u32) -> BannerState {
         archives: vec![
             ArchiveRow {
                 name: "regtest-nu5-h128".to_string(),
-                status: ArchiveStatus::Cached { size_bytes: 432_013_312 },
+                status: ArchiveStatus::Cached {
+                    size_bytes: 432_013_312,
+                },
             },
             ArchiveRow {
                 name: "testnet-2.6m".to_string(),
-                status: ArchiveStatus::Cached { size_bytes: 19_754_106_880 },
+                status: ArchiveStatus::Cached {
+                    size_bytes: 19_754_106_880,
+                },
             },
             ArchiveRow {
                 name: "testnet-3.1m".to_string(),
@@ -122,7 +129,9 @@ fn state(step: u32) -> BannerState {
         future: vec![
             FutureRow { label: "tier" },
             FutureRow { label: "queue" },
-            FutureRow { label: "reservation" },
+            FutureRow {
+                label: "reservation",
+            },
         ],
     }
 }

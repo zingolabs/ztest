@@ -39,7 +39,7 @@ developer entry point for the ztest-managed integration suites in this \
 repository.
 
 See docs/running-tests.md for the full developer guide.",
-    propagate_version = true,
+    propagate_version = true
 )]
 pub struct Cli {
     #[command(subcommand)]

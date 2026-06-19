@@ -114,11 +114,7 @@ fn count_lines(frame: &str) -> usize {
         return 0;
     }
     let n = frame.bytes().filter(|&b| b == b'\n').count();
-    if frame.ends_with('\n') {
-        n
-    } else {
-        n + 1
-    }
+    if frame.ends_with('\n') { n } else { n + 1 }
 }
 
 #[cfg(test)]

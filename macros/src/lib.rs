@@ -25,7 +25,10 @@ impl Parse for MountArgs {
         let destination: LitStr = input.parse()?;
         // Allow trailing comma.
         let _ = input.parse::<Option<Token![,]>>();
-        Ok(MountArgs { source, destination })
+        Ok(MountArgs {
+            source,
+            destination,
+        })
     }
 }
 
@@ -80,7 +83,10 @@ fn emit(
 /// is valid UTF-8, and is `< 1 MiB`.
 #[proc_macro]
 pub fn mount_config(input: TokenStream) -> TokenStream {
-    let MountArgs { source, destination } = parse_macro_input!(input as MountArgs);
+    let MountArgs {
+        source,
+        destination,
+    } = parse_macro_input!(input as MountArgs);
     let abs = match resolve_source(&source) {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
@@ -110,7 +116,10 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
     {
         return syn::Error::new(
             source.span(),
-            format!("mount_config! requires UTF-8 source; {} is not UTF-8", abs.display()),
+            format!(
+                "mount_config! requires UTF-8 source; {} is not UTF-8",
+                abs.display()
+            ),
         )
         .to_compile_error()
         .into();
@@ -124,7 +133,10 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
 /// file exists.
 #[proc_macro]
 pub fn mount_file(input: TokenStream) -> TokenStream {
-    let MountArgs { source, destination } = parse_macro_input!(input as MountArgs);
+    let MountArgs {
+        source,
+        destination,
+    } = parse_macro_input!(input as MountArgs);
     let abs = match resolve_source(&source) {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
@@ -138,7 +150,10 @@ pub fn mount_file(input: TokenStream) -> TokenStream {
 /// Compile-time check: file exists. `.tar.zst` suffix recommended.
 #[proc_macro]
 pub fn mount_archive(input: TokenStream) -> TokenStream {
-    let MountArgs { source, destination } = parse_macro_input!(input as MountArgs);
+    let MountArgs {
+        source,
+        destination,
+    } = parse_macro_input!(input as MountArgs);
     let abs = match resolve_source(&source) {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
@@ -166,7 +181,11 @@ pub fn mount_archive(input: TokenStream) -> TokenStream {
 /// small.
 #[proc_macro]
 pub fn dev(input: TokenStream) -> TokenStream {
-    let DevArgs { variant, dockerfile, context } = parse_macro_input!(input as DevArgs);
+    let DevArgs {
+        variant,
+        dockerfile,
+        context,
+    } = parse_macro_input!(input as DevArgs);
 
     // Derive the kind label from the variant name itself — lowercased.
     // `Indexer::Zainod` → `"zainod"`, `Validator::Zebrad` → `"zebrad"`, etc.
@@ -181,10 +200,7 @@ pub fn dev(input: TokenStream) -> TokenStream {
     ) {
         ("Validator", "Zebrad") => ("zebrad".to_string(), vec![]),
         ("Validator", "Zcashd") => ("zcashd".to_string(), vec![]),
-        ("Indexer", "Zainod") => (
-            "zainod".to_string(),
-            vec!["no_tls_use_unencrypted_traffic"],
-        ),
+        ("Indexer", "Zainod") => ("zainod".to_string(), vec!["no_tls_use_unencrypted_traffic"]),
         ("Wallet", "Zingo") => ("zingo".to_string(), vec![]),
         (cat, var) => {
             return syn::Error::new(

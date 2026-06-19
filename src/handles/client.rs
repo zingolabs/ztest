@@ -17,7 +17,7 @@ use crate::{Endpoint, RpcError};
 /// Boxed transport / decode error, mirroring
 /// `zebra_node_services::BoxError` so call sites that use
 /// `RpcError::backend_boxed(...)` keep compiling unchanged.
-pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// HTTP JSON-RPC client with optional Basic Auth.
 ///
@@ -27,7 +27,7 @@ pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// `auth: Option<(user, password)>` for zcashd, which rejects every
 /// unauthed call with HTTP 401.
 #[derive(Debug, Clone)]
-pub(crate) struct AuthedRpc {
+pub struct AuthedRpc {
     client: reqwest::Client,
     url: String,
     auth: Option<(String, String)>,
@@ -36,7 +36,7 @@ pub(crate) struct AuthedRpc {
 impl AuthedRpc {
     /// Plain unauthenticated client. Use for zebrad and for any indexer
     /// JSON-RPC that doesn't gate on auth.
-    pub(crate) fn new(addr: SocketAddr) -> Self {
+    pub fn new(addr: SocketAddr) -> Self {
         Self {
             client: reqwest::Client::new(),
             url: format!("http://{addr}"),
@@ -46,7 +46,7 @@ impl AuthedRpc {
 
     /// Client that attaches `Authorization: Basic base64(user:password)`
     /// to every request. Use for zcashd.
-    pub(crate) fn with_basic_auth(addr: SocketAddr, user: &str, password: &str) -> Self {
+    pub fn with_basic_auth(addr: SocketAddr, user: &str, password: &str) -> Self {
         Self {
             client: reqwest::Client::new(),
             url: format!("http://{addr}"),
@@ -55,9 +55,8 @@ impl AuthedRpc {
     }
 
     fn build(&self, method: &str, params: &str) -> reqwest::RequestBuilder {
-        let body = format!(
-            r#"{{"jsonrpc": "2.0", "method": "{method}", "params": {params}, "id":123 }}"#
-        );
+        let body =
+            format!(r#"{{"jsonrpc": "2.0", "method": "{method}", "params": {params}, "id":123 }}"#);
         let mut req = self
             .client
             .post(&self.url)
@@ -69,7 +68,7 @@ impl AuthedRpc {
         req
     }
 
-    pub(crate) async fn text_from_call(
+    pub async fn text_from_call(
         &self,
         method: impl AsRef<str>,
         params: impl AsRef<str>,
@@ -81,7 +80,7 @@ impl AuthedRpc {
             .await
     }
 
-    pub(crate) async fn json_result_from_call<T: DeserializeOwned>(
+    pub async fn json_result_from_call<T: DeserializeOwned>(
         &self,
         method: impl AsRef<str>,
         params: impl AsRef<str>,
@@ -121,17 +120,13 @@ impl AuthedRpc {
 /// Build an unauthed JSON-RPC client pointed at an `Endpoint`. Cheap —
 /// we rebuild per call site for simplicity. Use this for zebrad and
 /// for indexer JSON-RPC endpoints.
-pub(crate) fn json_rpc(endpoint: &Endpoint) -> AuthedRpc {
+pub fn json_rpc(endpoint: &Endpoint) -> AuthedRpc {
     AuthedRpc::new(endpoint.socket_addr())
 }
 
 /// Build a JSON-RPC client with HTTP Basic Auth credentials attached.
 /// Use this for zcashd, which rejects unauthed calls.
-pub(crate) fn json_rpc_with_basic_auth(
-    endpoint: &Endpoint,
-    user: &str,
-    password: &str,
-) -> AuthedRpc {
+pub fn json_rpc_with_basic_auth(endpoint: &Endpoint, user: &str, password: &str) -> AuthedRpc {
     AuthedRpc::with_basic_auth(endpoint.socket_addr(), user, password)
 }
 
@@ -144,8 +139,8 @@ pub(crate) fn json_rpc_with_basic_auth(
 /// "ready to drive tests" signal it has on regtest); zcashd uses
 /// `getinfo` because its `getblocktemplate` is gated by
 /// `IsInitialBlockDownload`, which never clears on a peer-less
-/// regtest chain. Each `ValidatorBackend` impl picks its probe.
-pub(crate) async fn wait_for_rpc_ready(
+/// regtest chain. Each `ValidatorConfig` impl picks its probe.
+pub async fn wait_for_rpc_ready(
     client: &AuthedRpc,
     address: SocketAddr,
     timeout: Duration,
@@ -181,7 +176,7 @@ pub struct RpcReadinessTimeout {
     pub last_error: String,
 }
 
-/// Typed JSON-RPC client returned by `ValidatorHandle::json_rpc()` and
+/// Typed JSON-RPC client returned by `ValidatorBackend::json_rpc()` and
 /// `IndexerHandle::json_rpc()`.
 ///
 /// Wraps an [`AuthedRpc`] with error attribution (component label) and
@@ -242,7 +237,11 @@ impl JsonRpcClient {
         method: &'static str,
         params: &str,
     ) -> Result<T, RpcError> {
-        let params = if params.trim().is_empty() { "[]" } else { params };
+        let params = if params.trim().is_empty() {
+            "[]"
+        } else {
+            params
+        };
         self.inner
             .json_result_from_call(method, params.to_string())
             .await
@@ -251,11 +250,7 @@ impl JsonRpcClient {
 
     /// Issue a JSON-RPC call returning the raw `serde_json::Value`.
     /// For one-off RPCs where the caller wants to pluck fields by hand.
-    pub async fn call_value(
-        &self,
-        method: &'static str,
-        params: &str,
-    ) -> Result<Value, RpcError> {
+    pub async fn call_value(&self, method: &'static str, params: &str) -> Result<Value, RpcError> {
         self.call(method, params).await
     }
 }

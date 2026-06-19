@@ -195,9 +195,15 @@ mod tests {
         // SU pushed the visible screen into scrollback.
         assert!(s.contains("\x1b[24S"), "no SU(24): {s:?}");
         // Banner placed at top.
-        assert!(s.contains("\x1b[1;1H"), "no top-of-screen positioning: {s:?}");
+        assert!(
+            s.contains("\x1b[1;1H"),
+            "no top-of-screen positioning: {s:?}"
+        );
         // DECSTBM at the right offset for top-of-screen banner.
-        assert!(s.contains("\x1b[11;24r"), "no DECSTBM(11,24) for top: {s:?}");
+        assert!(
+            s.contains("\x1b[11;24r"),
+            "no DECSTBM(11,24) for top: {s:?}"
+        );
     }
 
     #[test]
@@ -208,7 +214,10 @@ mod tests {
             h.redraw("c\nd\n").unwrap();
         }
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("\x1b[s\x1b[5;1H"), "no save+absolute-move: {s:?}");
+        assert!(
+            s.contains("\x1b[s\x1b[5;1H"),
+            "no save+absolute-move: {s:?}"
+        );
         assert!(s.contains("\x1b[Kc\r\n"), "no line-clear+content: {s:?}");
         assert!(s.contains("\x1b[u"), "no restore: {s:?}");
     }

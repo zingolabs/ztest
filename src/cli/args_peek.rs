@@ -30,13 +30,7 @@ pub struct NextestArgs {
 }
 
 /// Flags that take a value as the next argv element.
-const VALUE_FLAGS: &[&str] = &[
-    "--profile",
-    "--test-threads",
-    "-j",
-    "-E",
-    "--filter-expr",
-];
+const VALUE_FLAGS: &[&str] = &["--profile", "--test-threads", "-j", "-E", "--filter-expr"];
 
 /// Walk the arg vector, capturing known flag values.
 ///
@@ -114,13 +108,7 @@ mod tests {
 
     #[test]
     fn ignores_unknown_flags() {
-        let p = peek(&v(&[
-            "--no-fail-fast",
-            "--profile",
-            "ci",
-            "--retries",
-            "2",
-        ]));
+        let p = peek(&v(&["--no-fail-fast", "--profile", "ci", "--retries", "2"]));
         assert_eq!(p.profile.as_deref(), Some("ci"));
         assert!(p.filter_expr.is_none());
         assert!(p.test_threads.is_none());

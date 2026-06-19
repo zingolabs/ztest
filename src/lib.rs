@@ -11,7 +11,7 @@
 //!  - [`mount`]     — `Mount`, `MountSource`, `MountKind`, `SnapshotRef`.
 //!  - [`env`]       — `TestEnv` (builder + live).
 //!  - [`handles`]   — `*Handle` types, `Endpoint`, per-category RPC
-//!    methods, kind enums, named-port tables, and the per-binary
+//!    methods, named-port tables, and the per-binary
 //!    backend call sites.
 //!  - [`regtest`]   — activation-height fixtures, parsing helpers.
 //!  - [`error`]     — `EnvError`, `RpcError`.
@@ -23,21 +23,21 @@
 #![deny(missing_debug_implementations)]
 
 // ─────────────────────────── public modules ────────────────────────────
+pub mod backends;
 pub mod cli;
 pub mod component;
 pub mod env;
 pub mod error;
-pub mod grpc;
 pub mod handles;
 pub mod inventory;
 pub mod mount;
 pub mod pipeline;
 pub mod preflight;
+pub mod protocol;
 pub mod regtest;
 pub mod regtest_conf;
 pub mod testnet_conf;
 pub mod topology;
-pub mod utils;
 
 // ─────────────────────────── internal modules ──────────────────────────
 mod cluster;
@@ -50,21 +50,30 @@ mod seeds;
 
 // ─────────────────────────── top-level re-exports ──────────────────────
 
+pub use crate::backends::lightwalletd::LightwalletdIndexer;
+pub use crate::backends::zainod::ZainoIndexer;
+pub use crate::backends::zcashd::ZcashdValidator;
+pub use crate::backends::zebra::ZebraValidator;
+pub use crate::backends::zingo::{FAUCET_SEED, RECIPIENT_SEED, ZingoBackend, ZingoWallet};
 pub use crate::component::{
-    ComponentOpts, Indexer, Resources, Validator, Wallet, ZainodOpts, ZcashdOpts, ZebradOpts,
-    ZingoOpts,
+    ComponentCategory, ComponentOpts, Indexer, Resources, Validator, Wallet,
 };
-pub use crate::env::TestEnv;
+pub use crate::env::{SharedVolume, TestEnv};
 pub use crate::error::{EnvError, RpcError};
 pub use crate::handles::client::JsonRpcClient;
 pub use crate::handles::indexer::{
-    AddressUtxo, CompactBlock, IndexerInfo, IndexerKind, MempoolTx, SendResult, ShieldedProtocol,
-    SubtreeRoot, TransactionBytes, TreeState,
+    BlockHash, BlockHeight, CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo,
+    RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, Transaction, TreeState, TxId,
+    ZatBalance,
 };
-pub use crate::handles::validator::{Block, BlockTip, MempoolInfo, ValidatorKind};
-pub use crate::handles::wallet::WalletKind;
-pub use crate::component::ComponentKind;
-pub use crate::handles::{Endpoint, IndexerHandle, ValidatorHandle, WalletHandle};
+pub use crate::handles::validator::{
+    BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, Peer, PeerInfo,
+};
+pub use crate::handles::wallet::{Account, AccountId, AccountSpec, BoxError, Pool, PoolBalances};
+pub use crate::handles::{
+    Endpoint, HandleInner, IndexerBackend, IndexerConfig, ValidatorBackend, ValidatorConfig,
+    WalletBackend, WalletConfig,
+};
 pub use crate::mount::{Mount, MountKind, MountSource, SnapshotRef};
 pub use ztest_macros::{dev, mount_archive, mount_config, mount_file};
 
@@ -89,7 +98,7 @@ pub mod __private {
 ///
 /// ```ignore
 /// validator_tests!(
-///     ValidatorKind::Zebrad,
+///     "zebrad",
 ///     get_info => assert_get_info_parity,
 ///     get_block => assert_get_block_parity,
 /// );
@@ -109,13 +118,21 @@ macro_rules! validator_tests {
 // ─────────────────────────── prelude ───────────────────────────────────
 
 /// One-shot import for test code. `use ztest::prelude::*;`.
+///
+/// Curation principle: prelude items must appear in a public signature
+/// that test authors interact with. Convenience-only re-exports
+/// (saving a `Cargo.toml` line for a crate test code never sees) are
+/// rejected — they're SemVer noise that ties ztest's version to
+/// upstream churn for no benefit.
 pub mod prelude {
     pub use super::{
-        AddressUtxo, Block, BlockTip, CompactBlock, Endpoint, EnvError, Indexer, IndexerHandle,
-        IndexerInfo, IndexerKind, JsonRpcClient, MempoolInfo, MempoolTx, Mount, MountKind,
-        MountSource, RpcError, SendResult, ShieldedProtocol, SnapshotRef, SubtreeRoot, TestEnv,
-        TransactionBytes, TreeState, Validator, ValidatorHandle, ValidatorKind, Wallet,
-        WalletHandle, WalletKind,
+        Account, AccountId, BlockHash, BlockHeight, BlockTip, BlockchainInfo, ChainConfig,
+        CompactBlock, CompactTx, Endpoint, EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer,
+        IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, MempoolInfo, Mount,
+        MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction,
+        RpcError, SendResponse, SharedVolume, ShieldedProtocol, SnapshotRef, SubtreeRoot, TestEnv,
+        Transaction, TreeState, TxId, Validator, ValidatorBackend, Wallet, WalletBackend,
+        ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator, ZingoWallet,
     };
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
@@ -124,14 +141,12 @@ pub mod prelude {
         regtest_test_post_nu6_funding_streams,
     };
     pub use crate::topology::NetworkUpgrade;
-    /// Upstream protocol types re-exported so consumers don't need a
-    /// direct dep on `zingo_common_components` / `zcash_protocol` /
-    /// `zebra-chain`.
-    pub mod protocol {
-        pub use zcash_protocol::PoolType;
-        pub use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
-        pub use zingo_common_components::protocol::{ActivationHeights, NetworkType};
-    }
+    /// `ActivationHeights` appears in ztest's public signatures
+    /// ([`ValidatorBackend::activation_heights`],
+    /// [`regtest_test_activation_heights`], etc.), so callers need the
+    /// type to consume what ztest returns. Re-exporting here is the
+    /// Effective-Rust-Item-24 case: avoid forcing callers into a direct
+    /// dep on `zingo_common_components` just to call us.
+    pub use zingo_common_components::protocol::ActivationHeights;
     pub use ztest_macros::{dev, mount_archive, mount_config, mount_file};
-    pub use crate::handles::{ZainoIndexer, ZcashdValidator, ZebraValidator};
 }

@@ -47,6 +47,34 @@ use crate::regtest::{FundingStreams, LockboxDisbursement};
 /// `infrastructure/zingo_test_vectors::REG_T_ADDR_FROM_ABANDONART`.
 pub const MINER_ADDRESS: &str = "tmBsTi2xWTjUdEXnuTceL7fecEQKeWaPDJd";
 
+/// Shielded (Sapling) miner coinbase recipient for zcashd. The faucet's
+/// sapling address under the canonical `abandon … art` seed (mirrors
+/// `infrastructure/zingo_test_vectors::REG_Z_ADDR_FROM_ABANDONART`).
+///
+/// zcashd mines coinbase straight into this sapling pool so the in-process
+/// faucet lightclient sees its funds via ordinary shielded compact-block
+/// sync. Mining to the *transparent* [`MINER_ADDRESS`] instead leaves the
+/// coinbase undetected — the lightclient's transparent discovery does not
+/// credit coinbase UTXOs — so the faucet would carry a zero balance. This
+/// mirrors zingolib's own regtest reference, which uses this same sapling
+/// `mineraddress`.
+pub const SHIELDED_MINER_ADDRESS: &str =
+    "zregtestsapling1fmq2ufux3gm0v8qf7x585wj56le4wjfsqsj27zprjghntrerntggg507hxh2ydcdkn7sx8kya7p";
+
+/// Orchard miner coinbase recipient — a regtest **unified address**
+/// (`uregtest1…`) with an Orchard receiver, under the canonical
+/// `abandon … art` seed (mirrors
+/// `infrastructure/zingo_test_vectors::REG_O_ADDR_FROM_ABANDONART`).
+///
+/// Zebra's coinbase builder fills a unified address's receivers in the
+/// order orchard → sapling → transparent, so this address makes every
+/// coinbase pay into the Orchard pool. Orchard coinbase notes are
+/// spendable once mined (no 100-confirmation maturity), which is the
+/// whole point of mining to it: the faucet is funded without the
+/// mature-then-shield ritual. Only valid at heights at/after NU5
+/// activation — see [`CoinbasePool`].
+pub const ORCHARD_MINER_ADDRESS: &str = "uregtest1zkuzfv5m3yhv2j4fmvq5rjurkxenxyq8r7h4daun2zkznrjaa8ra8asgdm8wwgwjvlwwrxx7347r8w0ee6dqyw4rufw4wg9djwcr6frzkezmdw6dud3wsm99eany5r8wgsctlxquu009nzd6hsme2tcsk0v3sgjvxa70er7h27z5epr67p5q767s2z5gt88paru56mxpm6pwz0cu35m";
+
 /// NU6.1 lockbox-disbursement recipient. Must be **P2SH** (`t2…`) —
 /// zebrad's `subsidy_is_valid` asserts `addr.is_script_hash()` here.
 /// Pair with the lockbox-disbursement TOML stanza emitted by
@@ -93,10 +121,7 @@ impl FromStr for Semver {
     /// `-` or `+` is ignored). Trailing components default to `0`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let trimmed = s.trim_start_matches('v');
-        let core = trimmed
-            .split(['-', '+'])
-            .next()
-            .unwrap_or(trimmed);
+        let core = trimmed.split(['-', '+']).next().unwrap_or(trimmed);
         let mut parts = core.split('.');
         let parse_one = |p: Option<&str>, default: u16| -> Result<u16, VersionParseError> {
             match p {
@@ -135,19 +160,21 @@ pub mod versions {
     /// (`4dec4df0`). Anything earlier rejects the `nuparams=` line as
     /// "Invalid network upgrade".
     ///
-    /// Set to a sentinel `u16::MAX` until the actual release ships;
-    /// update once the upstream image is published.
+    /// `v6.20.0` is verified to start cleanly with both the `4dec4df0`
+    /// (NU6.1) and `5437f330` (NU6.2) nuparams; earlier images may also
+    /// support them but are unverified. This must be ≤ the version a
+    /// wallet test launches when it relies on NU6.1/NU6.2 being active.
     pub const ZCASHD_NU6_1: Semver = Semver {
-        major: u16::MAX,
-        minor: 0,
+        major: 6,
+        minor: 20,
         patch: 0,
     };
 
     /// First zcashd release that recognises the NU6.2 branch ID
-    /// (`5437f330`). Sentinel until the release ships.
+    /// (`5437f330`). See [`ZCASHD_NU6_1`] — `v6.20.0` is verified.
     pub const ZCASHD_NU6_2: Semver = Semver {
-        major: u16::MAX,
-        minor: 0,
+        major: 6,
+        minor: 20,
         patch: 0,
     };
 
@@ -214,7 +241,12 @@ impl Semver {
 /// Always emitted: regtest=1, pre-NU6 nuparams, txindex/insightexplorer,
 /// `lightwalletd=1`, RPC auth (`test`/`test`), `listen=0`,
 /// `mineraddress=` + `minetolocalwallet=0`.
-pub fn zcashd_conf(version: Semver, activation: &ActivationHeights, rpc_port: u16) -> String {
+pub fn zcashd_conf(
+    version: Semver,
+    activation: &ActivationHeights,
+    rpc_port: u16,
+    miner_address: &str,
+) -> String {
     let overwinter = activation
         .overwinter()
         .expect("overwinter activation height must be specified");
@@ -269,6 +301,8 @@ txindex=1
 insightexplorer=1
 experimentalfeatures=1
 lightwalletd=1
+debug=mempool
+debug=mempoolrej
 
 ### RPC Server Interface Options
 # Auth credentials match `RPC_USER` / `RPC_PASSWORD` in
@@ -285,7 +319,7 @@ listen=0
 i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
 
 ### Miner
-mineraddress={MINER_ADDRESS}
+mineraddress={miner_address}
 minetolocalwallet=0
 "
     ));
@@ -308,6 +342,19 @@ minetolocalwallet=0
 ///  - Lockbox disbursements / post-NU6 funding streams — always
 ///    emitted when supplied; the schema is stable across zebrad
 ///    versions that support NU6.1 at all.
+/// Persistent on-disk state for a zebrad that shares its zebra-state DB
+/// with a colocated zaino StateService (see `TestEnv::shared_volume`).
+/// When passed, zebrad persists its state to `cache_dir` (instead of the
+/// default ephemeral state) and serves its indexer gRPC on
+/// `indexer_listen_port`, so the StateService can open the same database
+/// as a RocksDB secondary and sync the non-finalized tip over gRPC.
+#[derive(Debug, Clone, Copy)]
+pub struct ZebradPersistentState<'a> {
+    pub cache_dir: &'a str,
+    pub indexer_listen_port: u16,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn zebrad_conf(
     version: Semver,
     activation: &ActivationHeights,
@@ -316,7 +363,26 @@ pub fn zebrad_conf(
     peers: &[(String, u16)],
     lockbox_disbursements: &[LockboxDisbursement],
     post_nu6_funding_streams: Option<&FundingStreams>,
+    persistent: Option<ZebradPersistentState<'_>>,
+    miner_address: &str,
 ) -> String {
+    // The indexer gRPC and persistent state are both opt-in via
+    // `persistent`; with `None` zebrad keeps the default ephemeral state
+    // and serves no indexer gRPC.
+    let indexer_line = match &persistent {
+        Some(p) => format!(
+            "\nindexer_listen_addr = \"0.0.0.0:{}\"",
+            p.indexer_listen_port
+        ),
+        None => String::new(),
+    };
+    let state_block = match &persistent {
+        Some(p) => format!(
+            "[state]\ndelete_old_database = true\nephemeral = false\ncache_dir = \"{}\"",
+            p.cache_dir
+        ),
+        None => "[state]\ndelete_old_database = true\nephemeral = true".to_string(),
+    };
     let peers_toml = if peers.is_empty() {
         "[]".to_string()
     } else {
@@ -353,11 +419,9 @@ peerset_initial_target_size = 25
 debug_force_finished_sync = false
 enable_cookie_auth = false
 parallel_cpu_threads = 0
-listen_addr = \"0.0.0.0:{rpc_port}\"
+listen_addr = \"0.0.0.0:{rpc_port}\"{indexer_line}
 
-[state]
-delete_old_database = true
-ephemeral = true
+{state_block}
 
 [sync]
 checkpoint_verify_concurrency_limit = 1000
@@ -373,7 +437,7 @@ filter = \"info\"
 use_journald = false
 
 [mining]
-miner_address = \"{MINER_ADDRESS}\"
+miner_address = \"{miner_address}\"
 
 [network.testnet_parameters.activation_heights]
 Canopy = {canopy}
@@ -424,8 +488,7 @@ NU6 = {nu6}",
             if let Some(addresses) = &r.addresses
                 && !addresses.is_empty()
             {
-                let quoted: Vec<String> =
-                    addresses.iter().map(|a| format!("\"{a}\"")).collect();
+                let quoted: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
                 out.push_str(&format!("\naddresses = [{}]", quoted.join(", ")));
             }
         }
@@ -462,10 +525,18 @@ pub fn regtest_zainod_conf(
     validator_rpc_port: u16,
     zebra_db_path: &str,
     zaino_db_path: &str,
+    validator_grpc: Option<&str>,
 ) -> String {
     let backend_literal = match backend {
         crate::testnet_conf::ZainodBackend::Fetch => "fetch",
         crate::testnet_conf::ZainodBackend::State => "state",
+    };
+    // The `state` backend's syncer connects here to pull the
+    // non-finalized tip from the validator's indexer gRPC. The `fetch`
+    // backend ignores it, so it's only emitted when supplied.
+    let validator_grpc_line = match validator_grpc {
+        Some(addr) => format!("\nvalidator_grpc_listen_address = '{addr}'"),
+        None => String::new(),
     };
     format!(
         "\
@@ -482,7 +553,7 @@ listen_address = '0.0.0.0:{grpc_listen_port}'
 json_rpc_listen_address = '127.0.0.1:{jsonrpc_listen_port}'
 
 [validator_settings]
-validator_jsonrpc_listen_address = '{validator_host}:{validator_rpc_port}'
+validator_jsonrpc_listen_address = '{validator_host}:{validator_rpc_port}'{validator_grpc_line}
 # zebrad ignores Basic Auth; zcashd requires it and rejects unauthed
 # calls with HTTP 401. Hardcode the regtest creds zcashd.rs sets up
 # (`fixtures/regtest/zcashd.conf` → `rpcuser=test`/`rpcpassword=test`).
@@ -545,11 +616,16 @@ mod tests {
     #[test]
     fn zcashd_v6_1_omits_nu6_1_and_nu6_2_nuparams() {
         let v: Semver = "6.1.0".parse().unwrap();
-        let conf = zcashd_conf(v, &regtest_test_activation_heights(), 28232);
-        assert!(conf.contains("nuparams=c8e71055:2 # NU6"));
+        let conf = zcashd_conf(
+            v,
+            &regtest_test_activation_heights(),
+            28232,
+            SHIELDED_MINER_ADDRESS,
+        );
+        assert!(conf.contains("nuparams=c8e71055:3 # NU6"));
         assert!(!conf.contains("4dec4df0"));
         assert!(!conf.contains("5437f330"));
-        assert!(conf.contains(&format!("mineraddress={MINER_ADDRESS}")));
+        assert!(conf.contains(&format!("mineraddress={SHIELDED_MINER_ADDRESS}")));
     }
 
     #[test]
@@ -565,9 +641,11 @@ mod tests {
             &[],
             &regtest_test_lockbox_disbursements(),
             Some(&regtest_test_post_nu6_funding_streams()),
+            None,
+            MINER_ADDRESS,
         );
-        assert!(toml.contains("NU6 = 2"));
-        assert!(toml.contains("\"NU6.1\" = 5"));
+        assert!(toml.contains("NU6 = 3"));
+        assert!(toml.contains("\"NU6.1\" = 6"));
         assert!(toml.contains(&format!("miner_address = \"{MINER_ADDRESS}\"")));
         assert!(toml.contains(&format!("address = \"{LOCKBOX_ADDRESS}\"")));
         assert!(toml.contains("initial_testnet_peers = []"));
@@ -587,6 +665,8 @@ mod tests {
             &[],
             &[],
             None,
+            None,
+            MINER_ADDRESS,
         );
         assert!(!toml.contains("\"NU6.1\""));
         assert!(!toml.contains("\"NU6.2\""));
@@ -603,7 +683,26 @@ mod tests {
             &[("alice".to_string(), 18233), ("bob".to_string(), 18233)],
             &regtest_test_lockbox_disbursements(),
             Some(&regtest_test_post_nu6_funding_streams()),
+            None,
+            MINER_ADDRESS,
         );
         assert!(toml.contains("initial_testnet_peers = [\"alice:18233\", \"bob:18233\"]"));
+    }
+
+    #[test]
+    fn zebrad_conf_renders_orchard_unified_miner_address() {
+        let v: Semver = "5.1.1".parse().unwrap();
+        let toml = zebrad_conf(
+            v,
+            &regtest_test_activation_heights(),
+            28232,
+            18233,
+            &[],
+            &regtest_test_lockbox_disbursements(),
+            Some(&regtest_test_post_nu6_funding_streams()),
+            None,
+            ORCHARD_MINER_ADDRESS,
+        );
+        assert!(toml.contains(&format!("miner_address = \"{ORCHARD_MINER_ADDRESS}\"")));
     }
 }

@@ -15,8 +15,10 @@
   # `nix flake check`       — `cargo fmt` + `cargo clippy --all-targets -- -D warnings`
   # `nix fmt`               — format Nix files
   #
-  # The shell sets PROTOC / ROCKSDB_{LIB,INCLUDE}_DIR / LIBCLANG_PATH so
-  # `cargo build -p zcash_kube_net` works out of the box on NixOS.
+  # The shell sets ROCKSDB_{LIB,INCLUDE}_DIR / LIBCLANG_PATH so
+  # `cargo build` works out of the box on NixOS. (Lightwalletd .proto
+  # bindings come from `zcash_client_backend::proto`, so no protoc /
+  # tonic-build is needed here anymore.)
   #
   # Local cluster bring-up (requires a Docker / Podman daemon — enable
   # `virtualisation.docker.enable = true` on NixOS first):
@@ -58,7 +60,6 @@
 
         nativeBuildInputs = with pkgs; [
           rustToolchain
-          protobuf
           pkg-config
           cmake
           # Sets LIBCLANG_PATH so librocksdb-sys's bindgen finds libclang
@@ -90,9 +91,6 @@
         buildInputs = with pkgs; [ rocksdb_8_11 stdenv.cc.cc.lib ];
 
         env = {
-          PROTOC = "${pkgs.protobuf}/bin/protoc";
-          PROTOC_INCLUDE = "${pkgs.protobuf}/include";
-
           # Use nixpkgs' librocksdb instead of librocksdb-sys's bundled
           # C++ compile (which doesn't work cleanly under the Nix clang
           # wrapper).

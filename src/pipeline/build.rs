@@ -135,10 +135,7 @@ pub async fn run(nextest_args: &[String], tx: &EventTx) -> std::io::Result<Build
 fn collect_selected_binaries(summary: &TestListSummary) -> Vec<SelectedBinary> {
     let mut out = Vec::new();
     for (binary_id, suite) in &summary.rust_suites {
-        let has_selected = suite
-            .test_cases
-            .values()
-            .any(|t| t.filter_match.is_match());
+        let has_selected = suite.test_cases.values().any(|t| t.filter_match.is_match());
         if !has_selected {
             continue;
         }

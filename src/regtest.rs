@@ -11,15 +11,27 @@ use zingo_common_components::protocol::ActivationHeights;
 
 /// Single source of truth for regtest fixture activation heights.
 ///
-/// Pre-NU5 upgrades activate at height 1 (matching mainnet's deep-history
-/// shape on a fresh regtest chain); NU5/NU6 at height 2 (first
-/// post-genesis block, NU5 must precede NU6's commitment scheme); NU6.1
-/// at height 5 (keeps activation reachable via normal mining and leaves
-/// 3 NU6 blocks for funding-stream deposits before activation).
+/// Every upgrade that must be independently queryable gets a **distinct**
+/// height. Zebra stores regtest activations in a `Height -> NetworkUpgrade`
+/// map and, on a height collision, keeps only the highest upgrade
+/// (`Testnet::with_activation_heights` — "later network upgrades overwrite
+/// prior ones"). Co-locating NU5 and NU6 at height 2 therefore *dropped*
+/// NU5 from the map, so `Nu5.activation_height()` returned `None` and
+/// zebrad refused to build the Orchard coinbase ("Cannot create Orchard
+/// transactions ... before NU5 activation") — every zebrad mine after
+/// genesis was rejected. NU5, NU6, NU6.1, and NU6.2 each get their own
+/// height to avoid this.
 ///
-/// **Companion config required for callers mining past height 5**: pair
+/// Pre-NU5 upgrades still share height 1 — they collapse to Canopy, which
+/// is harmless (nothing queries their individual activation heights, and
+/// it matches mainnet's deep-history shape on a fresh regtest chain). NU5
+/// at height 2 (Orchard live before the first funded block is mined), NU6
+/// at height 3, NU6.1 at height 6 (leaves 3 NU6 blocks — heights 3, 4, 5 —
+/// for funding-stream deposits before activation), NU6.2 at height 7.
+///
+/// **Companion config required for callers mining past height 6**: pair
 /// with [`regtest_test_lockbox_disbursements`] and
-/// [`regtest_test_post_nu6_funding_streams`]; the activation block is
+/// [`regtest_test_post_nu6_funding_streams`]; the NU6.1 activation block is
 /// rejected without either.
 pub fn regtest_test_activation_heights() -> ActivationHeights {
     ActivationHeights::builder()
@@ -29,16 +41,15 @@ pub fn regtest_test_activation_heights() -> ActivationHeights {
         .set_heartwood(Some(1))
         .set_canopy(Some(1))
         .set_nu5(Some(2))
-        .set_nu6(Some(2))
-        .set_nu6_1(Some(5))
-        .set_nu6_2(Some(5))
+        .set_nu6(Some(3))
+        .set_nu6_1(Some(6))
+        .set_nu6_2(Some(7))
         .set_nu7(None)
         .build()
 }
 
 /// CLI string form for `clap` defaults that need a `&'static str`.
-pub const REGTEST_FIXTURE_HEIGHTS_CLI_STRING: &str =
-    "all=1,nu5=2,nu6=2,nu6_1=5,nu6_2=5,nu7=off";
+pub const REGTEST_FIXTURE_HEIGHTS_CLI_STRING: &str = "all=1,nu5=2,nu6=3,nu6_1=6,nu6_2=7,nu7=off";
 
 /// One lockbox disbursement output for Zebra's regtest
 /// `[network.testnet_parameters]`. Mirrors Zebra's upstream
@@ -126,11 +137,12 @@ pub struct FundingStreams {
 }
 
 /// Canonical regtest post-NU6 funding stream. A single `Deferred`
-/// recipient drawing 1% of block subsidy from height 2 — enough to fund
-/// the dummy disbursement at NU6.1.
+/// recipient drawing 1% of block subsidy from the NU6 activation height
+/// (3) — enough to fund the dummy disbursement at NU6.1. The start height
+/// tracks NU6: the deferred pool only exists once NU6 is active.
 pub fn regtest_test_post_nu6_funding_streams() -> FundingStreams {
     FundingStreams {
-        start_height: 2,
+        start_height: 3,
         end_height: 1_000_000,
         recipients: vec![FundingStreamRecipient {
             receiver: FundingStreamReceiver::Deferred,

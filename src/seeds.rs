@@ -21,9 +21,9 @@ use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, PostParams};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::EnvError;
 use crate::cluster::Sentinel;
 use crate::error::env_err;
-use crate::EnvError;
 
 pub const SEEDS_NAMESPACE: &str = "zaino-seeds";
 
@@ -34,7 +34,9 @@ pub fn sha8(path: &Path) -> Result<String, std::io::Error> {
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     let digest = hasher.finalize();
@@ -53,10 +55,15 @@ pub struct SeedHandle {
 /// Read the CSI snapshot handle for an already-published seed. Assumes
 /// the PVC is `ready=true` and the paired VolumeSnapshot is bound —
 /// `materialize::ensure_seed` guarantees both before calling this.
-pub async fn read_seed_handle(client: &Client, source: &Path, sha8: &str) -> Result<SeedHandle, EnvError> {
+pub async fn read_seed_handle(
+    client: &Client,
+    source: &Path,
+    sha8: &str,
+) -> Result<SeedHandle, EnvError> {
     let pvc_name = format!("seed-{sha8}");
     let snap_gvk = volume_snapshot_gvk();
-    let snap_api: Api<DynamicObject> = Api::namespaced_with(client.clone(), SEEDS_NAMESPACE, &snap_gvk);
+    let snap_api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), SEEDS_NAMESPACE, &snap_gvk);
     let snap = snap_api
         .get_opt(&pvc_name)
         .await
@@ -137,14 +144,17 @@ pub async fn mint_shadow_clone(
             "volumeSnapshotClassName": detect_snapshot_class(),
         }
     });
-    let vsc_obj: DynamicObject =
-        serde_json::from_value(vsc_body).expect("static manifest");
-    vsc_api.create(&PostParams::default(), &vsc_obj).await.map_err(env_err)?;
+    let vsc_obj: DynamicObject = serde_json::from_value(vsc_body).expect("static manifest");
+    vsc_api
+        .create(&PostParams::default(), &vsc_obj)
+        .await
+        .map_err(env_err)?;
 
     // In-namespace VolumeSnapshot. Namespace cascade reaps it on
     // teardown; no owner-ref required.
     let snap_gvk = volume_snapshot_gvk();
-    let snap_api: Api<DynamicObject> = Api::namespaced_with(client.clone(), &sentinel.namespace, &snap_gvk);
+    let snap_api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), &sentinel.namespace, &snap_gvk);
     let snap_body: Value = json!({
         "apiVersion": "snapshot.storage.k8s.io/v1",
         "kind": "VolumeSnapshot",
@@ -157,7 +167,10 @@ pub async fn mint_shadow_clone(
         }
     });
     let snap_obj: DynamicObject = serde_json::from_value(snap_body).expect("static manifest");
-    snap_api.create(&PostParams::default(), &snap_obj).await.map_err(env_err)?;
+    snap_api
+        .create(&PostParams::default(), &snap_obj)
+        .await
+        .map_err(env_err)?;
 
     let clone = ShadowClone {
         shadow_vsc_name: shadow_vsc,
@@ -188,7 +201,10 @@ pub struct ShadowClone {
 pub async fn delete_shadow(client: &Client, shadow: &ShadowClone) -> Result<(), EnvError> {
     let vsc_gvk = volume_snapshot_content_gvk();
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &vsc_gvk);
-    match api.delete(&shadow.shadow_vsc_name, &Default::default()).await {
+    match api
+        .delete(&shadow.shadow_vsc_name, &Default::default())
+        .await
+    {
         Ok(_) => {
             tracing::info!(
                 vsc = %shadow.shadow_vsc_name,

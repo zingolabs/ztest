@@ -1,57 +1,35 @@
 //! Manifest builders for each component variant.
-//!
-//! Everything we hand to Kubernetes is plain JSON via `serde_json::json!`
-//! — readable, and we lean on the API server to validate it. Reasoning
-//! about pod state lives in k8s, not here: `restartPolicy: Never` plus a
-//! `readinessProbe` is enough to express "boot it; tell me when it's
-//! ready; if it dies, surface the exit".
 
 use k8s_openapi::api::core::v1::Pod;
 use serde_json::{Value, json};
 
-use crate::component::ComponentKind;
-use crate::handles::backends;
-use crate::handles::indexer::IndexerKind;
-use crate::handles::validator::ValidatorKind;
-use crate::handles::wallet::WalletKind;
+use crate::EnvError;
+use crate::backends;
+use crate::component::{ComponentCategory, ComponentOpts};
 use crate::mounts::ResolvedMount;
 use crate::naming::RunCoords;
-use crate::{ComponentOpts, EnvError, Indexer, Validator, Wallet};
 
-/// What we need to apply a pod for a single component.
-///
-/// The pod name doubles as the DNS short-name inside the test's
-/// namespace — `create_pod_service` makes a same-named ClusterIP
-/// Service that routes to this pod via the `zaino.io/component-name`
-/// label.
 #[derive(Debug, Clone)]
 pub struct PodSpec {
     pub pod_name: String,
-    /// Typed backend kind. Also the source of the k8s component label
-    /// (via `ComponentKind::as_label`).
-    pub kind: ComponentKind,
+    pub category: ComponentCategory,
+    pub label: &'static str,
     pub image: String,
-    pub ports: Vec<(String, u16)>, // named ports
-    pub ready_port: u16,           // the port the TCP readinessProbe hits
-    /// Container `command` override. `None` lets the upstream image's
-    /// ENTRYPOINT run.
+    pub ports: Vec<(String, u16)>,
+    pub ready_port: u16,
     pub command: Option<Vec<String>>,
-    /// Container `args` override.
     pub args: Option<Vec<String>>,
-    /// Pod-level `securityContext.fsGroup`. Required when the pod
-    /// carries a [`crate::MountKind::Scratch`] mount: kubelet `chown`s
-    /// the emptyDir's mount root to this gid and sets `g+rwxs` so the
-    /// container's uid can write under it. The image's expected
-    /// runtime gid (e.g. 1000 for zaino).
     pub fs_group: Option<i64>,
+    /// `securityContext.runAsUser` override. Set when a pod must read
+    /// another pod's files on a shared volume whose ownership can't be
+    /// reconciled via `fsGroup` (hostPath/local-path volumes ignore
+    /// `fsGroup`) — e.g. a zaino StateService reading the root-owned
+    /// zebra-state DB written by the validator. `None` keeps the image
+    /// default user.
+    pub run_as_user: Option<i64>,
 }
 
 impl PodSpec {
-    /// Render the Pod manifest as JSON. Returns `EnvError::Manifest` if
-    /// the synthesized JSON ever fails to deserialize — in practice this
-    /// is unreachable for a well-formed `PodSpec`, but it's typed input
-    /// (mount volume/volumeMount JSON is built from user-controlled
-    /// paths) so we propagate rather than panic.
     pub fn render(
         &self,
         coords: &RunCoords,
@@ -65,7 +43,7 @@ impl PodSpec {
             .collect();
         let volumes: Vec<Value> = mounts.iter().map(|m| m.volume.clone()).collect();
         let volume_mounts: Vec<Value> = mounts.iter().map(|m| m.volume_mount.clone()).collect();
-        let component_label = self.kind.as_label();
+        let component_label = self.label;
 
         let mut container = json!({
             "name": component_label,
@@ -73,7 +51,6 @@ impl PodSpec {
             "ports": ports_json,
             "volumeMounts": volume_mounts,
             "readinessProbe": {
-                // Let k8s decide "ready" via TCP — no logic on our side.
                 "tcpSocket": { "port": self.ready_port },
                 "initialDelaySeconds": 1,
                 "periodSeconds": 2,
@@ -88,14 +65,20 @@ impl PodSpec {
         }
 
         let mut spec = json!({
-            // Disable legacy Docker-link env var injection.
             "enableServiceLinks": false,
             "restartPolicy": "Never",
             "volumes": volumes,
             "containers": [container],
         });
+        let mut security_context = serde_json::Map::new();
         if let Some(fs_group) = self.fs_group {
-            spec["securityContext"] = json!({ "fsGroup": fs_group });
+            security_context.insert("fsGroup".into(), json!(fs_group));
+        }
+        if let Some(uid) = self.run_as_user {
+            security_context.insert("runAsUser".into(), json!(uid));
+        }
+        if !security_context.is_empty() {
+            spec["securityContext"] = Value::Object(security_context);
         }
 
         let pod = json!({
@@ -107,8 +90,6 @@ impl PodSpec {
                     "zaino.io/run-id": coords.run_id,
                     "zaino.io/component": component_label,
                     "zaino.io/test": test_name,
-                    // Same-named ClusterIP Service selects pods by this
-                    // label — see `cluster::create_pod_service`.
                     "zaino.io/component-name": self.pod_name,
                 },
             },
@@ -119,8 +100,6 @@ impl PodSpec {
         })
     }
 }
-
-// ───────── per-variant tables ─────────
 
 fn merge_ports(defaults: &[(&str, u16)], extra: &[(String, u16)]) -> Vec<(String, u16)> {
     let mut out: Vec<(String, u16)> = defaults
@@ -135,15 +114,16 @@ fn merge_ports(defaults: &[(&str, u16)], extra: &[(String, u16)]) -> Vec<(String
     out
 }
 
-pub fn pod_spec_for_validator(v: &Validator, pod_name: String) -> PodSpec {
-    let opts: &ComponentOpts = match v {
-        Validator::Zebrad(o) => &o.0,
-        Validator::Zcashd(o) => &o.0,
-    };
-    match v {
-        Validator::Zebrad(_) => PodSpec {
+pub fn pod_spec_for_validator(
+    label: &'static str,
+    opts: &ComponentOpts,
+    pod_name: String,
+) -> PodSpec {
+    match label {
+        "zebrad" => PodSpec {
             pod_name,
-            kind: ComponentKind::Validator(ValidatorKind::Zebrad),
+            category: ComponentCategory::Validator,
+            label,
             image: backends::zebra::image_uri(&opts.version),
             ports: merge_ports(
                 &[
@@ -156,11 +136,20 @@ pub fn pod_spec_for_validator(v: &Validator, pod_name: String) -> PodSpec {
             ready_port: crate::handles::ports::ZEBRAD_RPC,
             command: opts.command.clone(),
             args: opts.args.clone(),
-            fs_group: None,
+            // When sharing its zebra-state DB, run zebrad as the same uid
+            // (1000) the zaino reader uses, so the DB files it writes —
+            // including the mode-0600 `version` file — are owned by 1000
+            // and readable by the colocated StateService that opens them
+            // as a secondary. fsGroup is ineffective here: hostPath /
+            // local-path volumes ignore it, and the zainod image refuses
+            // to run as root, so matching uids is the portable fix.
+            fs_group: opts.shared_state.as_ref().map(|_| 1000),
+            run_as_user: opts.shared_state.as_ref().map(|_| 1000),
         },
-        Validator::Zcashd(_) => PodSpec {
+        "zcashd" => PodSpec {
             pod_name,
-            kind: ComponentKind::Validator(ValidatorKind::Zcashd),
+            category: ComponentCategory::Validator,
+            label,
             image: backends::zcashd::image_uri(&opts.version),
             ports: merge_ports(
                 &[("rpc", crate::handles::ports::ZCASHD_RPC)],
@@ -169,56 +158,67 @@ pub fn pod_spec_for_validator(v: &Validator, pod_name: String) -> PodSpec {
             ready_port: crate::handles::ports::ZCASHD_RPC,
             command: opts.command.clone(),
             args: opts.args.clone(),
-            // `electriccoinco/zcashd` runs as the unprivileged `zcash`
-            // user (uid 2001 in historical builds). Setting `fsGroup`
-            // makes the scratch emptyDir at `-datadir` writable to that
-            // user without requiring `runAsUser` overrides.
             fs_group: Some(2001),
+            run_as_user: None,
         },
+        other => panic!("pod_spec_for_validator: unknown validator backend label {other:?}"),
     }
 }
 
-pub fn pod_spec_for_indexer(i: &Indexer, pod_name: String) -> Result<PodSpec, EnvError> {
-    let Indexer::Zainod(o) = i;
-    let resolved = backends::zainod::image_uri(&o.opts).map_err(|source| EnvError::ImageBuild {
-        component: "zaino".into(),
-        source,
-    })?;
-    Ok(PodSpec {
-        pod_name,
-        kind: ComponentKind::Indexer(IndexerKind::Zainod),
-        image: resolved.image,
-        ports: merge_ports(
-            &[
-                ("grpc", crate::handles::ports::ZAINO_GRPC),
-                ("jsonrpc", crate::handles::ports::ZAINO_JSONRPC),
-                ("metrics", crate::handles::ports::ZAINO_METRICS),
-            ],
-            &o.opts.extra_ports,
-        ),
-        ready_port: crate::handles::ports::ZAINO_GRPC,
-        command: o.opts.command.clone(),
-        args: o.opts.args.clone(),
-        // The zaino image runs as uid/gid 1000. Any scratch mount on
-        // this pod (e.g. the regtest `/var/lib/zaino` emptyDir) needs
-        // `fsGroup=1000` so the container can write to the volume root.
-        fs_group: Some(1000),
-    })
-}
-
-pub fn pod_spec_for_wallet(w: &Wallet, pod_name: String) -> PodSpec {
-    let Wallet::Zingo(o) = w;
-    PodSpec {
-        pod_name,
-        kind: ComponentKind::Wallet(WalletKind::Zingo),
-        image: backends::zingo::image_uri(&o.0.version),
-        ports: merge_ports(
-            &[("grpc", crate::handles::ports::ZINGO_GRPC)],
-            &o.0.extra_ports,
-        ),
-        ready_port: crate::handles::ports::ZINGO_GRPC,
-        command: o.0.command.clone(),
-        args: o.0.args.clone(),
-        fs_group: None,
+pub fn pod_spec_for_indexer(
+    label: &'static str,
+    opts: &ComponentOpts,
+    pod_name: String,
+) -> Result<PodSpec, EnvError> {
+    match label {
+        "zainod" => {
+            let resolved =
+                backends::zainod::image_uri(opts).map_err(|source| EnvError::ImageBuild {
+                    component: "zainod".into(),
+                    source,
+                })?;
+            Ok(PodSpec {
+                pod_name,
+                category: ComponentCategory::Indexer,
+                label,
+                image: resolved.image,
+                ports: merge_ports(
+                    &[
+                        ("grpc", crate::handles::ports::ZAINO_GRPC),
+                        ("jsonrpc", crate::handles::ports::ZAINO_JSONRPC),
+                        ("metrics", crate::handles::ports::ZAINO_METRICS),
+                    ],
+                    &opts.extra_ports,
+                ),
+                ready_port: crate::handles::ports::ZAINO_GRPC,
+                command: opts.command.clone(),
+                args: opts.args.clone(),
+                fs_group: Some(1000),
+                // The zainod image refuses to run as root and defaults to
+                // uid 1000. For the shared-DB case the validator is pinned
+                // to the same uid (see the zebrad arm) so this reader owns
+                // the files it must read.
+                run_as_user: None,
+            })
+        }
+        "lightwalletd" => Ok(PodSpec {
+            pod_name,
+            category: ComponentCategory::Indexer,
+            label,
+            image: backends::lightwalletd::image_uri(&opts.version),
+            ports: merge_ports(
+                &[("grpc", crate::handles::ports::LIGHTWALLETD_GRPC)],
+                &opts.extra_ports,
+            ),
+            ready_port: crate::handles::ports::LIGHTWALLETD_GRPC,
+            command: opts.command.clone(),
+            args: opts.args.clone(),
+            fs_group: Some(1000),
+            run_as_user: None,
+        }),
+        other => panic!("pod_spec_for_indexer: unknown indexer backend label {other:?}"),
     }
 }
+
+// No `pod_spec_for_wallet`: wallets run in-process (no pod). See
+// `crate::backends::zingo`.

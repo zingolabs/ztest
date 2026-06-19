@@ -34,6 +34,12 @@ pub enum MountSource {
     /// Source-less mount — backed by a per-pod ephemeral `emptyDir`.
     /// Paired with [`MountKind::Scratch`].
     Empty,
+    /// A PVC shared across pods, provisioned once per env (see
+    /// `TestEnv::shared_volume`). `claim` is the PVC name in the test
+    /// namespace; unlike `File`/`DirArchive`, no PVC is created during
+    /// mount resolution — both referencing pods just name the same claim.
+    /// Paired with [`MountKind::Shared`].
+    SharedClaim { claim: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +55,12 @@ pub enum MountKind {
     /// Pods that carry a scratch mount get `securityContext.fsGroup`
     /// set so the container uid can write to the volume root.
     Scratch,
+    /// A `ReadWriteOnce` PVC shared between two pods co-scheduled on one
+    /// node — used to share an on-disk database (zebrad's zebra-state DB
+    /// ↔ a colocated zaino StateService opening it as a RocksDB
+    /// secondary). The claim is provisioned once per env; both pods
+    /// mount it at the same path. Paired with [`MountSource::SharedClaim`].
+    Shared,
 }
 
 impl Mount {
@@ -71,6 +83,20 @@ impl Mount {
             source: MountSource::Empty,
             destination: destination.into(),
             kind: MountKind::Scratch,
+        }
+    }
+
+    /// Mount the shared, env-scoped PVC named `claim` at `destination`.
+    /// The PVC must already be provisioned (see `TestEnv::shared_volume`,
+    /// which mints it during `build()`). Both pods that share the volume
+    /// call this with the same `claim` and the same `destination`.
+    pub fn shared(claim: impl Into<String>, destination: impl Into<PathBuf>) -> Self {
+        Mount {
+            source: MountSource::SharedClaim {
+                claim: claim.into(),
+            },
+            destination: destination.into(),
+            kind: MountKind::Shared,
         }
     }
 }

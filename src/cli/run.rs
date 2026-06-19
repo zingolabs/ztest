@@ -46,10 +46,19 @@ pub struct Args {
     /// Any flag, filter expression, or positional substring accepted
     /// by `cargo nextest run` works here. Run
     /// `cargo nextest run --help` for the full reference.
+    ///
+    /// One ztest-only flag is recognized anywhere in this list and is
+    /// NOT forwarded to nextest:
+    ///
+    ///   --no-cleanup   Leave each test's Kubernetes namespace (pods,
+    ///                  logs, volumes) in place instead of tearing it
+    ///                  down, so you can `kubectl` into a failure for a
+    ///                  post-mortem. A 1h janitor backstop still reaps
+    ///                  them, so nothing leaks permanently.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
-        value_name = "NEXTEST_ARGS",
+        value_name = "NEXTEST_ARGS"
     )]
     pub nextest_args: Vec<String>,
 }
@@ -68,7 +77,11 @@ pub fn execute(args: Args) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let peek = args_peek::peek(&args.nextest_args);
+    // `--no-cleanup` is a ztest-only flag, not a nextest one — pull it out
+    // of the forwarded argv (nextest would reject it) and remember it.
+    let (no_cleanup, nextest_args) = extract_no_cleanup(args.nextest_args);
+
+    let peek = args_peek::peek(&nextest_args);
     let theme = Theme::detect();
 
     let mut state = build_initial_state(&peek);
@@ -96,7 +109,7 @@ pub fn execute(args: Args) -> ExitCode {
         None
     };
 
-    let outcome = match pipeline_phase(&args.nextest_args, &theme, &mut state, pinned.as_mut()) {
+    let outcome = match pipeline_phase(&nextest_args, &theme, &mut state, pinned.as_mut()) {
         Ok(o) => o,
         Err(err) => {
             eprintln!("ztest run: pipeline phase crashed: {err}");
@@ -165,7 +178,7 @@ pub fn execute(args: Args) -> ExitCode {
     // own `Nextest run ID …` line follows immediately on row 2.
     print_launching_line(&theme);
 
-    exec_nextest_run_inherited(&args.nextest_args)
+    exec_nextest_run_inherited(&nextest_args, no_cleanup)
 }
 
 /// `   Launching nextest run` in nextest's `{:>12} {}` vocabulary.
@@ -243,9 +256,8 @@ fn pipeline_phase(
         // indexing, complete/failed) flows through the event channel
         // so the main loop can mutate `state.build` between passes.
         let build_tx = event_tx.clone();
-        let build_handle = tokio::spawn(async move {
-            pipeline::build::run(&nextest_args, &build_tx).await
-        });
+        let build_handle =
+            tokio::spawn(async move { pipeline::build::run(&nextest_args, &build_tx).await });
 
         drop(event_tx);
         drop(upd_tx);
@@ -487,7 +499,7 @@ fn run_image_phases(binaries: &[pipeline::SelectedBinary]) -> Option<String> {
 /// past the 20s `pod_ready` timeout under stampede. 6 is the empirical
 /// sweet spot; users can override by passing `--test-threads N`
 /// explicitly.
-fn exec_nextest_run_inherited(nextest_args: &[String]) -> ExitCode {
+fn exec_nextest_run_inherited(nextest_args: &[String], no_cleanup: bool) -> ExitCode {
     const DEFAULT_TEST_THREADS: &str = "6";
 
     let user_set_threads = args_peek::peek(nextest_args).test_threads.is_some();
@@ -499,6 +511,13 @@ fn exec_nextest_run_inherited(nextest_args: &[String]) -> ExitCode {
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest").arg("run").args(&effective_args);
 
+    // Propagate `--no-cleanup` to the test binaries. nextest forwards this
+    // process's environment to every test, where `TestEnv::drop` reads
+    // `ZTEST_NO_CLEANUP` and skips namespace teardown for post-mortem.
+    if no_cleanup {
+        cmd.env("ZTEST_NO_CLEANUP", "1");
+    }
+
     match cmd.status() {
         Ok(status) => match status.code() {
             Some(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -509,6 +528,31 @@ fn exec_nextest_run_inherited(nextest_args: &[String]) -> ExitCode {
             ExitCode::from(127)
         }
     }
+}
+
+/// Split the ztest-only `--no-cleanup` flag out of the forwarded argv.
+///
+/// `--no-cleanup` is not a `cargo nextest` flag, so it must be removed
+/// before the rest is handed to nextest (which would otherwise reject it).
+/// Returns whether it was present and the argv with every occurrence
+/// removed. Only tokens *before* a `--` separator are considered — anything
+/// after `--` is a nextest filter positional and is left untouched, matching
+/// the convention in [`crate::cli::args_peek`].
+fn extract_no_cleanup(args: Vec<String>) -> (bool, Vec<String>) {
+    const FLAG: &str = "--no-cleanup";
+    let mut found = false;
+    let mut past_separator = false;
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        if !past_separator && arg == "--" {
+            past_separator = true;
+        } else if !past_separator && arg == FLAG {
+            found = true;
+            continue;
+        }
+        out.push(arg);
+    }
+    (found, out)
 }
 
 /// Walk up from the current working directory looking for a `Cargo.toml`.
@@ -566,5 +610,40 @@ fn build_initial_state(peek: &args_peek::NextestArgs) -> BannerState {
                 label: "reservation",
             },
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn extract_no_cleanup_strips_flag_anywhere() {
+        let (found, rest) = extract_no_cleanup(v(&["-p", "wallet-tests", "--no-cleanup"]));
+        assert!(found);
+        assert_eq!(rest, v(&["-p", "wallet-tests"]));
+
+        let (found, rest) = extract_no_cleanup(v(&["--no-cleanup", "-E", "test(foo)"]));
+        assert!(found);
+        assert_eq!(rest, v(&["-E", "test(foo)"]));
+    }
+
+    #[test]
+    fn extract_no_cleanup_absent_is_identity() {
+        let (found, rest) = extract_no_cleanup(v(&["-p", "wallet-tests"]));
+        assert!(!found);
+        assert_eq!(rest, v(&["-p", "wallet-tests"]));
+    }
+
+    #[test]
+    fn extract_no_cleanup_ignores_after_double_dash() {
+        // After `--`, tokens are nextest filter positionals — left verbatim.
+        let (found, rest) = extract_no_cleanup(v(&["--", "--no-cleanup"]));
+        assert!(!found);
+        assert_eq!(rest, v(&["--", "--no-cleanup"]));
     }
 }

@@ -1,265 +1,182 @@
-//! Validator handle: typed RPC sugar over `ValidatorHandle`.
+//! Validator backends — two traits, nothing else.
 //!
-//! Every method delegates either to a shared JSON-RPC helper (with
-//! the backend's own label string for attribution) or directly to the
-//! [`backends::ValidatorBackend`] trait object set at construction.
-//! No `match` on backend kind in this file.
+//!  - [`ValidatorConfig`] — what your config ZST implements (e.g.
+//!    `ZebraBackend`). Config-time behaviour (label, NU ceiling, regtest
+//!    materialization) plus the factory that turns it into a live handle
+//!    once the env assigns plumbing.
+//!  - [`ValidatorBackend`] — what your live handle implements (e.g.
+//!    `ZebraValidator`): the RPC contract a test drives the validator
+//!    with. Backend-specific RPCs (zebrad's `getblockchaininfo`,
+//!    zcashd's `getblockdeltas`) are *inherent* methods on the concrete
+//!    handle, so calling one on the wrong backend is a compile error.
 
 use std::time::Duration;
 
+use async_trait::async_trait;
 use zingo_common_components::protocol::ActivationHeights;
 
-use crate::handles::client::{AuthedRpc, JsonRpcClient};
-use crate::handles::jsonrpc;
-use crate::handles::ValidatorHandle;
-use crate::mount::SnapshotRef;
+use crate::component::ComponentOpts;
+use crate::handles::client::JsonRpcClient;
+use crate::handles::wallet::Pool;
+use crate::handles::{Endpoint, HandleInner};
+use crate::topology::NetworkUpgrade;
 use crate::{EnvError, RpcError};
 
-/// Which validator backend a `ValidatorHandle` wraps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValidatorKind {
-    Zebrad,
-    Zcashd,
-}
+pub use zcash_primitives::block::BlockHash;
+pub use zcash_protocol::consensus::BlockHeight;
 
+// JSON-RPC envelope types are owned by the protocol module — re-exported
+// here so the public surface at `ztest::handles::validator::*` stays
+// stable for existing consumers and `lib.rs` re-exports.
+pub use crate::protocol::zcash_rpc::{BlockTip, BlockchainInfo, MempoolInfo, Peer, PeerInfo};
 
-/// Block-tip summary returned by `tip`.
-#[derive(Debug, Clone, Copy)]
-pub struct BlockTip {
-    pub height: u32,
-    pub hash: [u8; 32],
-}
-
-/// Full block returned by `block_at`.
-#[derive(Debug, Clone)]
-pub struct Block {
-    pub height: u32,
-    pub hash: [u8; 32],
-}
-
-/// Mempool statistics returned by [`ValidatorHandle::mempool_info`].
-/// `usage` is reported by zcashd but not always by zebrad, so it's
-/// optional.
-#[derive(Debug, Clone, Copy)]
-pub struct MempoolInfo {
-    pub size: u64,
-    pub bytes: u64,
-    pub usage: Option<u64>,
-}
-
-/// Chain identity, tip, and difficulty summary — returned by
-/// `blockchain_info()` on both [`ValidatorHandle`] and
-/// [`crate::handles::IndexerHandle`]. Carries only fields shared by
-/// every supported backend so parity comparisons are exact: backend-
-/// specific extras (mining-info subfields, fee histograms, etc.) stay
-/// reachable via the bare `json_rpc()` client.
+/// Static consensus parameters for a validator's network, sourced from
+/// ztest's pinned view — NOT live chain state. The network identity is
+/// read from the node; the constants are then resolved from ztest's pins
+/// (the `zebra-chain` dependency for zebrad). Distinct from
+/// [`BlockchainInfo`] (runtime tip) and the node-enforced
+/// [`ValidatorBackend::activation_heights`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct BlockchainInfo {
-    /// Chain identifier, e.g. `"regtest"`, `"testnet"`, `"main"`.
-    pub chain: String,
-    /// Current tip height.
-    pub blocks: u32,
-    /// Highest header seen (≥ `blocks` while a sync is in flight).
-    pub headers: u32,
-    /// Lowercase hex of the tip block hash (display byte order).
-    pub best_block_hash: String,
-    /// Difficulty target as reported by the RPC.
-    pub difficulty: f64,
-    /// Estimated final chain height. `None` on backends/networks that
-    /// don't report this (e.g. fresh regtest pre-IBD).
-    pub estimated_height: Option<u32>,
+pub struct ChainConfig {
+    /// Network identifier as the node reports it (`"regtest"`, `"test"`,
+    /// `"main"`).
+    pub network: String,
+    /// Height of the first block-subsidy halving, when ztest models the
+    /// backend's subsidy schedule. `Some` for zebrad (derived from the
+    /// pinned `zebra-chain`); `None` for zcashd — ztest sets no
+    /// `nSubsidyHalvingInterval`, so the binary's regtest default applies
+    /// and ztest does not track it.
+    pub first_halving_height: Option<BlockHeight>,
 }
 
-/// Peer-table snapshot returned by `peer_info()` on both
-/// [`ValidatorHandle`] and [`crate::handles::IndexerHandle`]. Carries
-/// the common subset across zebrad / zcashd / zaino — backends may
-/// expose more fields, reachable via the bare `json_rpc()` client.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PeerInfo {
-    pub peers: Vec<Peer>,
-}
+pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
+    /// The live handle type this backend produces.
+    type Handle: ValidatorBackend + Clone;
 
-/// One row from [`PeerInfo`]. Field set is the intersection across
-/// backends; extend conservatively.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Peer {
-    /// `host:port` of the remote.
-    pub addr: String,
-    /// `true` if the remote initiated the connection.
-    pub inbound: bool,
-    /// Peer-advertised protocol version.
-    pub version: u32,
-    /// Peer-advertised subversion / user agent string.
-    pub subver: String,
-}
+    /// Build the runtime handle once the env has assigned `plumbing`
+    /// (the back-reference + component id used to resolve endpoints).
+    fn into_handle(&self, plumbing: HandleInner) -> Self::Handle;
 
-/// Polling cadence for `poll_chain_height`. Matches
-/// `zcash_local_net::validator::Validator::CHAIN_POLL_INTERVAL`.
-pub const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Total budget for `poll_chain_height`. Matches
-/// `zcash_local_net::validator::Validator::CHAIN_POLL_TIMEOUT`.
-pub const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
-/// Per-block delay in `generate_blocks_with_delay`. Matches
-/// `zcash_local_net::validator::Validator::BLOCK_GENERATION_DELAY`.
-pub const BLOCK_GENERATION_DELAY: Duration = Duration::from_millis(1500);
-
-impl ValidatorHandle {
-    /// Which backend this handle wraps. Delegates to the trait object;
-    /// kept as an inherent method so call sites read `handle.kind()`
-    /// instead of `handle.backend.kind()`.
-    pub fn kind(&self) -> ValidatorKind {
-        self.backend.kind()
+    /// Highest network upgrade this backend, at the given pinned
+    /// version, can decode. Used by the topology resolver to compute the
+    /// activation-height ceiling. `None` opts out of the resolver.
+    fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
+        let _ = version;
+        None
     }
 
-    /// Build the internal `AuthedRpc` for this validator's `rpc`
-    /// endpoint. Auth is the backend's responsibility — see
-    /// [`backends::ValidatorBackend::build_authed_rpc`].
-    async fn rpc_client(&self) -> Result<AuthedRpc, EnvError> {
-        let ep = self.endpoint("rpc").await?;
-        Ok(self.backend.build_authed_rpc(&ep))
+    /// Apply this backend's regtest-time, height-dependent mounts /
+    /// flags to a `ComponentOpts`. Called from `env.build()` after the
+    /// topology resolver has chosen `activation`. Default: no-op.
+    fn materialize_regtest_opts(
+        &self,
+        opts: ComponentOpts,
+        activation: &ActivationHeights,
+        peers: &[(String, u16)],
+    ) -> ComponentOpts {
+        let _ = (activation, peers);
+        opts
     }
+}
+
+#[async_trait]
+pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
+    /// Stable label string for the backend behind this handle.
+    fn label(&self) -> &'static str;
+
+    /// Resolve a named endpoint (e.g. `"rpc"`).
+    async fn endpoint(&self, name: &str) -> Result<Endpoint, EnvError>;
+
+    /// Resolve an endpoint by its container port.
+    async fn endpoint_for(&self, container_port: u16) -> Result<Endpoint, EnvError>;
+
+    /// Typed JSON-RPC client for this validator's `rpc` endpoint.
+    async fn json_rpc(&self) -> Result<JsonRpcClient, EnvError>;
+
+    /// Block until the validator's JSON-RPC reports ready, or `timeout`
+    /// elapses. The readiness probe (`getblocktemplate` for zebrad,
+    /// `getinfo` for zcashd) is backend-specific.
+    async fn ready(&self, timeout: Duration) -> Result<(), RpcError>;
 
     /// Generate `n` blocks. Returns the new chain-tip height once the
-    /// chain has advanced. Saves callers an extra `chain_height()`
-    /// round-trip when they want to pair this with
-    /// `IndexerHandle::wait_for_block_num(tip, ...)`.
-    pub async fn generate_blocks(&self, n: u32) -> Result<u32, RpcError> {
-        let client = self.rpc_client().await?;
-        self.backend.generate_blocks(&client, n).await?;
-        self.chain_height().await
-    }
+    /// chain has advanced. The coinbase pays into [`Self::coinbase_pool`]
+    /// — the pool fixed for this backend.
+    async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError>;
 
-    /// `generate_blocks` with [`BLOCK_GENERATION_DELAY`] between mines.
-    /// Returns the new chain-tip height.
-    pub async fn generate_blocks_with_delay(&self, n: u32) -> Result<u32, RpcError> {
-        let mut tip = self.chain_height().await?;
-        for _ in 0..n {
-            tip = self.generate_blocks(1).await?;
-            tokio::time::sleep(BLOCK_GENERATION_DELAY).await;
-        }
-        Ok(tip)
-    }
+    /// The single value pool this backend mines its coinbase into. A
+    /// fixed property of the backend (the miner address baked into its
+    /// regtest config), not a per-test choice: zebrad mines to
+    /// [`Pool::Orchard`], zcashd to [`Pool::Sapling`].
+    fn coinbase_pool(&self) -> Pool;
+
+    /// Mine `n` blocks, requiring their coinbase to pay into `pool`.
+    ///
+    /// `pool` is the pool the *test* depends on. The node's recipient is
+    /// fixed in config and cannot change at runtime, so this is the one
+    /// pool-aware mining entry point and it is strict: if `pool` is not
+    /// the backend's [`Self::coinbase_pool`] (or the backend cannot mine
+    /// into `pool` at all, e.g. zcashd + [`Pool::Orchard`]), it
+    /// **panics** — the test has asked for something this validator can
+    /// never deliver, and should fail at the call site. On a match it
+    /// delegates to [`Self::generate_blocks`].
+    async fn mine_to(&self, pool: Pool, n: u32) -> Result<BlockHeight, RpcError>;
 
     /// Current chain-tip height.
-    pub async fn chain_height(&self) -> Result<u32, RpcError> {
-        let client = self.rpc_client().await?;
-        jsonrpc::chain_height(self.backend.label(), &client).await
-    }
+    async fn chain_height(&self) -> Result<BlockHeight, RpcError>;
 
-    /// Poll `chain_height` until it reaches `target` or
-    /// [`CHAIN_POLL_TIMEOUT`] elapses. Thin wrapper over
-    /// [`wait_for_block_num`] with the default timeout.
-    pub async fn poll_chain_height(&self, target: u32) -> Result<(), RpcError> {
-        self.wait_for_block_num(target, CHAIN_POLL_TIMEOUT).await
-    }
+    /// Chain-tip `(height, hash)`.
+    async fn tip(&self) -> Result<BlockTip, RpcError>;
 
-    /// Wait until the validator's chain tip reaches `target`, or
-    /// `timeout` elapses. The test-author-facing readiness primitive —
-    /// pair with [`generate_blocks`] for "mine then wait" flows that
-    /// previously lived in `TestManager::generate_blocks_and_wait_for_tip`.
-    pub async fn wait_for_block_num(
-        &self,
-        target: u32,
-        timeout: Duration,
-    ) -> Result<(), RpcError> {
-        let started = tokio::time::Instant::now();
-        let deadline = started + timeout;
-        loop {
-            if self.chain_height().await? >= target {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(RpcError::timeout(
-                    self.backend.label(),
-                    "wait_for_block_num",
-                    started.elapsed(),
-                    format!("chain did not reach height {target}"),
-                ));
-            }
-            tokio::time::sleep(CHAIN_POLL_INTERVAL).await;
-        }
-    }
+    /// `(height, hash)` for the block at `height`.
+    async fn get_block(&self, height: BlockHeight) -> Result<BlockTip, RpcError>;
 
-    /// Typed JSON-RPC client targeting this validator's RPC port.
-    /// Use for any JSON-RPC call outside the small typed-sugar surface
-    /// (`tip`, `chain_height`, …). Cheap; rebuild per call.
-    ///
-    /// Carries the backend's auth credentials when required — see
-    /// [`backends::ValidatorBackend::build_json_rpc`].
-    pub async fn json_rpc(&self) -> Result<JsonRpcClient, EnvError> {
-        let ep = self.endpoint("rpc").await?;
-        Ok(self.backend.build_json_rpc(&ep))
-    }
+    /// `(height, hash)` for the block with `hash`.
+    async fn get_block_by_hash(&self, hash: &BlockHash) -> Result<BlockTip, RpcError>;
 
-    /// Configured network-upgrade activation heights, as reported by
-    /// the running validator.
-    pub async fn activation_heights(&self) -> Result<ActivationHeights, RpcError> {
-        let client = self.rpc_client().await?;
-        jsonrpc::activation_heights(self.backend.label(), &client).await
-    }
+    /// Tip block hash.
+    async fn best_block_hash(&self) -> Result<BlockHash, RpcError>;
 
-    /// `BlockTip { height, hash }` from `getblockchaininfo`.
-    pub async fn tip(&self) -> Result<BlockTip, RpcError> {
-        let client = self.rpc_client().await?;
-        jsonrpc::tip(self.backend.label(), &client).await
-    }
+    /// Current block count.
+    async fn block_count(&self) -> Result<BlockHeight, RpcError>;
 
-    /// `getblock <height> 1` → `Block { height, hash }`.
-    pub async fn get_block(&self, height: u32) -> Result<Block, RpcError> {
-        let client = self.rpc_client().await?;
-        jsonrpc::get_block(self.backend.label(), &client, height).await
-    }
+    /// `getblocksubsidy <height>` — raw JSON (network/branch dependent).
+    async fn block_subsidy(&self, height: BlockHeight) -> Result<serde_json::Value, RpcError>;
 
-    /// `getblock <hash> 1` → `Block`. The hash bytes must be in display
-    /// (big-endian) order — i.e. exactly the bytes stored in
-    /// `Block.hash`, so you can chain `get_block_by_hash(&b.hash)`.
-    pub async fn get_block_by_hash(&self, hash: &[u8; 32]) -> Result<Block, RpcError> {
-        let client = self.rpc_client().await?;
-        jsonrpc::get_block_by_hash(self.backend.label(), &client, hash).await
-    }
+    /// Mempool statistics.
+    async fn mempool_info(&self) -> Result<MempoolInfo, RpcError>;
 
-    /// `getbestblockhash` → tip block hash as a lowercase hex string.
-    pub async fn best_block_hash(&self) -> Result<String, RpcError> {
-        let client = self.rpc_client().await?;
-        jsonrpc::best_block_hash(self.backend.label(), &client).await
-    }
-
-    /// `getblockcount` → current block count. Equivalent to
-    /// [`chain_height`] but issued via the simpler RPC method; useful
-    /// when a test wants parity against this specific RPC.
-    pub async fn block_count(&self) -> Result<u32, RpcError> {
-        let client = self.rpc_client().await?;
-        jsonrpc::block_count(self.backend.label(), &client).await
-    }
-
-    /// `getblocksubsidy <height>` — returned as raw JSON because the
-    /// envelope shape varies across network upgrades (NU6 funding
-    /// streams etc.). Project the fields you need at the call site.
-    pub async fn block_subsidy(&self, height: u32) -> Result<serde_json::Value, RpcError> {
-        let client = self.rpc_client().await?;
-        jsonrpc::block_subsidy(self.backend.label(), &client, height).await
-    }
-
-    /// `getmempoolinfo` → `MempoolInfo { size, bytes, usage }`.
-    pub async fn mempool_info(&self) -> Result<MempoolInfo, RpcError> {
-        let client = self.rpc_client().await?;
-        jsonrpc::mempool_info(self.backend.label(), &client).await
-    }
-
-    /// `getblockheader <hash> <verbose>` — returned as raw JSON. With
-    /// `verbose=true` the result is the structured-object form; with
-    /// `verbose=false` it's a hex-string-wrapped serialized header.
-    pub async fn get_block_header(
+    /// `getblockheader <hash> <verbose>` — raw JSON.
+    async fn get_block_header(
         &self,
         hash: &str,
         verbose: bool,
-    ) -> Result<serde_json::Value, RpcError> {
-        let client = self.rpc_client().await?;
-        jsonrpc::get_block_header(self.backend.label(), &client, hash, verbose).await
-    }
+    ) -> Result<serde_json::Value, RpcError>;
 
-    /// Mid-test snapshot of this validator's PVC.
-    pub async fn snapshot(&self) -> Result<SnapshotRef, EnvError> {
-        unimplemented!("ValidatorHandle::snapshot — mid-test snapshot wiring")
-    }
+    /// Regtest network-upgrade activation heights, read from the chain.
+    async fn activation_heights(&self) -> Result<ActivationHeights, RpcError>;
+
+    /// Static consensus parameters for this validator's network. See
+    /// [`ChainConfig`]. Reads the network identity from the node, then
+    /// resolves ztest's pinned constants for it. Distinct from
+    /// [`Self::activation_heights`] (what the node *enforces*) and from
+    /// [`BlockchainInfo`] (live tip state).
+    async fn chain_config(&self) -> Result<ChainConfig, RpcError>;
+
+    // ── conveniences: loops over the methods above, implemented per
+    //    backend (no default bodies — each handle spells its own out) ──
+
+    /// `generate_blocks` with a per-block delay between mines.
+    async fn generate_blocks_with_delay(&self, n: u32) -> Result<BlockHeight, RpcError>;
+
+    /// Poll until the chain reaches `target`, using the backend's default
+    /// chain-poll timeout.
+    async fn poll_chain_height(&self, target: BlockHeight) -> Result<(), RpcError>;
+
+    /// Poll the chain height until it reaches `target` or `timeout`
+    /// elapses.
+    async fn wait_for_block_num(
+        &self,
+        target: BlockHeight,
+        timeout: Duration,
+    ) -> Result<(), RpcError>;
 }

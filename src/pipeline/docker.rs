@@ -5,7 +5,7 @@
 //! thrashes the daemon). For each declaration we:
 //!
 //! 1. Compute the content-addressed tag via
-//!    [`image::dev_tag`](crate::handles::backends::image::dev_tag).
+//!    [`image::dev_tag`](crate::backends::image::dev_tag).
 //! 2. Check whether the image already exists in the kind node's
 //!    containerd — if yes, skip the build entirely (warm cache).
 //! 3. Otherwise run `docker build -f <dockerfile> -t <tag> <context>`
@@ -17,7 +17,7 @@
 //! containerd are marked `already_loaded = true` so the load phase
 //! can short-circuit those too.
 
-use crate::handles::backends::image;
+use crate::backends::image;
 use crate::inventory::DevImageEntry;
 
 /// One image's outcome from Phase D.

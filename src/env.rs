@@ -1,17 +1,4 @@
-//! The test environment: builder methods, live env, and the
-//! `Arc<EnvInner>` / `Weak<EnvInner>` plumbing that lets handles
-//! borrow nothing from the env yet dispatch through it at call time.
-//!
-//! Lifecycle:
-//! 1. `TestEnv::builder()` → empty `TestEnv` in the unbuilt state.
-//! 2. `env.add_validator(Validator::zebrad("..").named("..").mount(..))`
-//!    → returns an owned `ValidatorHandle`. The handle works after
-//!    `build()` and returns `EnvError::NotBuilt` before it.
-//! 3. `env.build().await` — applies Pods, waits for readiness, flips
-//!    the `is_built` flag.
-//! 4. Test code drives the handles directly.
-//! 5. `env.teardown().await` (or `Drop`) deletes the per-test
-//!    namespace; k8s cascade GC reaps every namespaced resource.
+//! The test environment.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,81 +15,84 @@ use tokio::sync::Mutex;
 
 use std::net::{IpAddr, Ipv4Addr};
 
+use crate::EnvError;
 use crate::cluster::{self, Sentinel};
-use crate::component::{ComponentKind, Indexer, Validator, Wallet};
+use crate::component::{ComponentCategory, ComponentOpts, Indexer, Validator, Wallet};
 use crate::error::env_err;
-use crate::handles::{Endpoint, ForwardRegistry, IndexerHandle, ValidatorHandle, WalletHandle};
+use zingo_common_components::protocol::ActivationHeights;
+
+use crate::handles::indexer::{IndexerBackend, IndexerConfig};
+use crate::handles::validator::{ValidatorBackend, ValidatorConfig};
+use crate::handles::wallet::WalletConfig;
+use crate::handles::{Endpoint, ForwardRegistry, HandleInner};
+use crate::topology::NetworkUpgrade;
+
+/// Config-time regtest materialization, captured per validator at
+/// `add_validator` so the build-time topology resolver can apply it once
+/// the activation heights are known — without retaining the concrete
+/// backend or a dyn-erased config trait.
+type RegtestMaterializeFn =
+    Box<dyn FnOnce(ComponentOpts, &ActivationHeights, &[(String, u16)]) -> ComponentOpts + Send>;
+
+/// Config-time regtest materialization for an indexer (takes the
+/// validator host resolved at build time). Captured at `add_indexer`.
+type IndexerMaterializeFn = Box<dyn FnOnce(ComponentOpts, Option<&str>) -> ComponentOpts + Send>;
 use crate::manifest::{self, PodSpec};
 use crate::mounts::{self, ResolvedMount};
 use crate::naming::{self, RunCoords};
 use crate::portforward::Forwarder;
 use crate::seeds::{self, ShadowClone};
-use crate::EnvError;
 
-/// Per-component bookkeeping captured at `build` time. Internal — only
-/// the in-crate endpoint resolver reads this.
-///
-/// `pod_name` doubles as the in-cluster DNS short-name. A same-named
-/// `ClusterIP` Service (see `cluster::create_pod_service`) makes
-/// `{pod_name}.{namespace}.svc.cluster.local` resolve to the pod.
+/// Per-component bookkeeping captured at `build` time.
 #[derive(Debug, Clone)]
 pub(crate) struct ComponentState {
     pub(crate) namespace: String,
     pub(crate) pod_name: String,
-    pub(crate) kind: ComponentKind,
+    pub(crate) category: ComponentCategory,
+    pub(crate) label: &'static str,
     pub(crate) named_ports: Vec<(String, u16)>,
+    /// Live handle for a validator component (used by the env's own
+    /// readiness/warm probes during `build`). `None` for non-validators.
+    pub(crate) validator_handle: Option<Arc<dyn ValidatorBackend>>,
 }
 
 impl ComponentState {
-    fn new(spec: &PodSpec, namespace: String) -> Self {
+    fn new(
+        spec: &PodSpec,
+        namespace: String,
+        validator_handle: Option<Arc<dyn ValidatorBackend>>,
+    ) -> Self {
         ComponentState {
             namespace,
             pod_name: spec.pod_name.clone(),
-            kind: spec.kind,
+            category: spec.category,
+            label: spec.label,
             named_ports: spec.ports.clone(),
+            validator_handle,
         }
     }
 }
 
 // ────────────────────────────── EnvInner ──────────────────────────────
 
-/// Shared state behind every `TestEnv` and every handle. Lives inside
-/// an `Arc`; handles hold a `Weak<EnvInner>` so they can dispatch
-/// through it without keeping the env alive past the test scope.
-///
-/// Constructed by `TestEnv::builder()` in an empty state, then filled
-/// by `build()`: the kube `Client` and namespace are set, components
-/// are inserted, and `is_built` flips to `true`. Handle methods
-/// short-circuit with `EnvError::NotBuilt` before that point.
 pub(crate) struct EnvInner {
-    /// Set inside `build()`. Reads via `client_ref()` return `NotBuilt`
-    /// if the env hasn't been built yet.
     pub(crate) client: OnceLock<Client>,
-    /// Per-test namespace. `None` before build and after teardown.
     pub(crate) namespace: std::sync::Mutex<Option<String>>,
-    /// Built up by `add_*`; frozen after `build()` returns.
     pub(crate) components: tokio::sync::RwLock<HashMap<u64, ComponentState>>,
     pub(crate) in_cluster: bool,
     pub(crate) forwards: ForwardRegistry,
-    /// Cluster-scoped shadow VSCs minted during build — k8s GC can't
-    /// cascade these across the namespace boundary, so `teardown`
-    /// deletes them explicitly.
     pub(crate) shadow_clones: std::sync::Mutex<Vec<ShadowClone>>,
-    /// `false` during the builder phase; flipped to `true` after
-    /// `build()` returns. Every handle method checks this and returns
-    /// `EnvError::NotBuilt` if false.
     pub(crate) is_built: AtomicBool,
-    /// Per-component readiness budget used by `build()` when waiting
-    /// for pods to become Ready and RPCs to come up. Set via
-    /// [`TestEnv::ready_timeout`]; defaults to
-    /// [`TestEnv::DEFAULT_READY_TIMEOUT`].
     pub(crate) ready_timeout: Duration,
 }
 
 impl std::fmt::Debug for EnvInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EnvInner")
-            .field("namespace", &self.namespace.lock().ok().and_then(|g| g.clone()))
+            .field(
+                "namespace",
+                &self.namespace.lock().ok().and_then(|g| g.clone()),
+            )
             .field("in_cluster", &self.in_cluster)
             .field("is_built", &self.is_built.load(Ordering::Relaxed))
             .finish()
@@ -123,22 +113,15 @@ impl EnvInner {
         }
     }
 
-    /// Return the live kube `Client`. Errors with `NotBuilt` if
-    /// `build()` hasn't run.
     pub(crate) fn client_ref(&self) -> Result<&Client, EnvError> {
         self.client.get().ok_or(EnvError::NotBuilt)
     }
 
-    /// Component state by id. Returns `EnvDropped` if the id is
-    /// unknown — which only happens if a handle was forged with a
-    /// bad id (we don't expose that path).
     pub(crate) async fn component_state(&self, id: u64) -> Result<ComponentState, EnvError> {
         let map = self.components.read().await;
         map.get(&id).cloned().ok_or(EnvError::EnvDropped)
     }
 
-    /// Resolve a named port (e.g. `"rpc"`, `"grpc"`) on the given
-    /// component into a dialable `Endpoint`.
     pub(crate) async fn resolve_named(
         &self,
         state: &ComponentState,
@@ -149,15 +132,12 @@ impl EnvInner {
             .iter()
             .find_map(|(n, p)| (n == name).then_some(*p))
             .ok_or_else(|| EnvError::UnknownEndpoint {
-                component: state.kind.as_label().to_string(),
+                component: state.label.to_string(),
                 name: name.to_string(),
             })?;
         self.resolve_port(state, port).await
     }
 
-    /// Resolve a container-port number into a dialable `Endpoint`.
-    /// In-cluster: returns the pod IP. Out-of-cluster: lazily starts a
-    /// port-forwarder (cached in `self.forwards`).
     pub(crate) async fn resolve_port(
         &self,
         state: &ComponentState,
@@ -177,7 +157,10 @@ impl EnvInner {
                 })?
                 .parse()
                 .map_err(|e: std::net::AddrParseError| env_err(e))?;
-            return Ok(Endpoint { host, port: container_port });
+            return Ok(Endpoint {
+                host,
+                port: container_port,
+            });
         }
 
         let key = (state.pod_name.clone(), container_port);
@@ -209,19 +192,74 @@ impl EnvInner {
     }
 }
 
+// ──────────────────────── pending entries ─────────────────────────────
+
+struct PendingValidator {
+    id: u64,
+    /// This backend's NU ceiling (already dev-image-skipped), fed to the
+    /// topology resolver. `None` opts out.
+    nu_ceiling: Option<NetworkUpgrade>,
+    /// This backend's regtest materialization, applied once the resolver
+    /// has chosen the activation heights. `take`n when applied.
+    materialize: Option<RegtestMaterializeFn>,
+    /// Live handle, threaded into the component's `ComponentState` so the
+    /// env can drive readiness/warm probes through it during `build`.
+    handle: Arc<dyn ValidatorBackend>,
+    opts: ComponentOpts,
+}
+
+struct PendingIndexer {
+    id: u64,
+    /// Pod label, captured from the handle at `add_indexer` (the concrete
+    /// backend isn't retained).
+    label: &'static str,
+    nu_ceiling: Option<NetworkUpgrade>,
+    /// Regtest materialization closure — `Some` only for regtest indexers;
+    /// `take`n when applied.
+    materialize: Option<IndexerMaterializeFn>,
+    opts: ComponentOpts,
+}
+
+struct PendingWallet {
+    nu_ceiling: Option<NetworkUpgrade>,
+    opts: ComponentOpts,
+}
+
+// ──────────────────────────── shared volume ───────────────────────────
+
+/// Handle to an env-scoped `ReadWriteOnce` PVC shared between two
+/// co-scheduled pods. Created via [`TestEnv::shared_volume`]; the PVC is
+/// provisioned during [`TestEnv::build`]. Hand the same handle to a
+/// validator's [`Validator::persistent_state_in`](crate::Validator::persistent_state_in)
+/// and a zaino indexer's [`Indexer::regtest_state_in`](crate::Indexer::regtest_state_in)
+/// so both mount the same on-disk zebra-state database.
+#[derive(Debug, Clone)]
+pub struct SharedVolume {
+    claim: String,
+    mount_path: String,
+}
+
+impl SharedVolume {
+    /// PVC name in the test namespace.
+    pub fn claim(&self) -> &str {
+        &self.claim
+    }
+    /// In-pod path the shared volume is mounted at. Both sharing pods use
+    /// this identical path so zebra's `db_path` resolves to the same
+    /// directory on each side.
+    pub fn mount_path(&self) -> &str {
+        &self.mount_path
+    }
+}
+
 // ────────────────────────────── TestEnv ───────────────────────────────
 
-/// The unified test environment. `TestEnv::builder()` returns one in
-/// the unbuilt state; `add_validator` / `add_indexer` / `add_wallet`
-/// register components and return handles immediately; `build().await`
-/// applies the manifests and flips the live flag.
-///
-/// Handle methods called before `build()` return `EnvError::NotBuilt`.
 pub struct TestEnv {
     inner: Arc<EnvInner>,
-    pending_validators: Vec<(u64, Validator)>,
-    pending_indexers: Vec<(u64, Indexer)>,
-    pending_wallets: Vec<(u64, Wallet)>,
+    pending_validators: Vec<PendingValidator>,
+    pending_indexers: Vec<PendingIndexer>,
+    pending_wallets: Vec<PendingWallet>,
+    pending_shared_volumes: Vec<String>,
     next_id: u64,
 }
 
@@ -237,36 +275,19 @@ impl std::fmt::Debug for TestEnv {
 }
 
 impl TestEnv {
-    /// Default per-component readiness budget. Applies to:
-    ///   - the pod-Ready wait inside `build()` (`materialize_phase`),
-    ///   - each validator's JSON-RPC `getblocktemplate` probe.
-    ///
-    /// Calibrated for a warm cluster with the test images already
-    /// pulled. Cold-pull or unusually heavy tests should call
-    /// [`Self::ready_timeout`] to extend it.
     pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
-    /// New, empty environment in the unbuilt state. Add components
-    /// via `add_validator` / `add_indexer` / `add_wallet`; the handles
-    /// returned from those methods become live after `build().await`.
     pub fn builder() -> Self {
         Self {
             inner: Arc::new(EnvInner::new(Self::DEFAULT_READY_TIMEOUT)),
             pending_validators: Vec::new(),
             pending_indexers: Vec::new(),
             pending_wallets: Vec::new(),
+            pending_shared_volumes: Vec::new(),
             next_id: 0,
         }
     }
 
-    /// Override the per-component readiness budget used during
-    /// `build()`. Default: [`Self::DEFAULT_READY_TIMEOUT`] (20s). Use
-    /// this when the test pulls a cold image, restores a large chain
-    /// archive, or otherwise needs longer than the default to come up.
-    ///
-    /// Panics if called after any component is registered with the
-    /// env — the timeout has to be locked in before `EnvInner` is
-    /// shared, since handles hold a `Weak<EnvInner>`.
     pub fn ready_timeout(mut self, timeout: Duration) -> Self {
         assert!(
             self.pending_validators.is_empty()
@@ -278,41 +299,120 @@ impl TestEnv {
         self
     }
 
+    /// Declare an env-scoped shared volume named `name`. Returns a
+    /// [`SharedVolume`] handle to hand to a validator's
+    /// [`Validator::persistent_state_in`](crate::Validator::persistent_state_in)
+    /// and a zaino indexer's
+    /// [`Indexer::regtest_state_in`](crate::Indexer::regtest_state_in).
+    /// The backing `ReadWriteOnce` PVC is provisioned during
+    /// [`TestEnv::build`]. Both consumers mount it at the same in-pod
+    /// path so zebrad and a colocated zaino StateService address one
+    /// on-disk database.
+    pub fn shared_volume(&mut self, name: &str) -> SharedVolume {
+        let slug = short_kind(name);
+        let claim = format!("shared-{slug}");
+        self.pending_shared_volumes.push(claim.clone());
+        SharedVolume {
+            claim,
+            mount_path: format!("/shared/{slug}"),
+        }
+    }
+
     fn fresh_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         id
     }
 
-    /// Register a validator and return its handle. The handle works
-    /// after `build().await`; using it before returns
-    /// [`EnvError::NotBuilt`].
-    pub fn add_validator(&mut self, v: Validator) -> ValidatorHandle {
+    /// Register a validator and return its concrete, typed handle (e.g.
+    /// `ZebraValidator`) — backend-specific RPCs are inherent methods on
+    /// it, so calling one on the wrong backend is a compile error.
+    pub fn add_validator<B: ValidatorConfig>(&mut self, v: Validator<B>) -> B::Handle {
         let id = self.fresh_id();
-        let kind = v.kind();
-        self.pending_validators.push((id, v));
-        ValidatorHandle::new(Arc::downgrade(&self.inner), id, kind)
+        let plumbing = HandleInner {
+            inner: Arc::downgrade(&self.inner),
+            component_id: id,
+            regtest: v.opts.regtest_mode.is_some(),
+        };
+        // Build the live handle (returned to the caller + stored for the
+        // env's probes). The concrete backend isn't retained, so capture
+        // the config-time behaviour the topology resolver needs: the NU
+        // ceiling (dev images have no parseable version → skip) and the
+        // regtest materialization as a deferred closure.
+        let handle = v.backend.into_handle(plumbing);
+        let dyn_handle: Arc<dyn ValidatorBackend> = Arc::new(handle.clone());
+        let nu_ceiling = match v.opts.image {
+            crate::backends::image::ImageSpec::Dev { .. } => None,
+            _ => v.backend.nu_ceiling(&v.opts.version),
+        };
+        let backend = v.backend;
+        let materialize: RegtestMaterializeFn = Box::new(move |opts, activation, peers| {
+            backend.materialize_regtest_opts(opts, activation, peers)
+        });
+        self.pending_validators.push(PendingValidator {
+            id,
+            nu_ceiling,
+            materialize: Some(materialize),
+            handle: dyn_handle,
+            opts: v.opts,
+        });
+        handle
     }
 
-    /// Register an indexer and return its handle.
-    pub fn add_indexer(&mut self, i: Indexer) -> IndexerHandle {
+    /// Register an indexer and return its concrete, typed handle (e.g.
+    /// `ZainoIndexer`).
+    pub fn add_indexer<B: IndexerConfig>(&mut self, i: Indexer<B>) -> B::Handle {
         let id = self.fresh_id();
-        let kind = i.kind();
-        self.pending_indexers.push((id, i));
-        IndexerHandle::new(Arc::downgrade(&self.inner), id, kind)
+        let plumbing = HandleInner {
+            inner: Arc::downgrade(&self.inner),
+            component_id: id,
+            regtest: i.opts.regtest_mode.is_some(),
+        };
+        let handle = i.backend.into_handle(plumbing);
+        let label = handle.label();
+        let nu_ceiling = match i.opts.image {
+            crate::backends::image::ImageSpec::Dev { .. } => None,
+            _ => i.backend.nu_ceiling(&i.opts.version),
+        };
+        // Capture the regtest materialization closure only for regtest
+        // indexers; it gets the validator host resolved at build time.
+        let materialize: Option<IndexerMaterializeFn> = i.regtest_backend.map(|regtest_backend| {
+            let backend = i.backend;
+            Box::new(move |opts, validator_host: Option<&str>| {
+                backend.materialize_regtest_opts(opts, Some(regtest_backend), validator_host)
+            }) as IndexerMaterializeFn
+        });
+        self.pending_indexers.push(PendingIndexer {
+            id,
+            label,
+            nu_ceiling,
+            materialize,
+            opts: i.opts,
+        });
+        handle
     }
 
-    /// Register a wallet and return its handle.
-    pub fn add_wallet(&mut self, w: Wallet) -> WalletHandle {
+    /// Register an in-process wallet and return its concrete, typed handle
+    /// (e.g. `ZingoWallet`).
+    pub fn add_wallet<B: WalletConfig>(&mut self, w: Wallet<B>) -> B::Handle {
         let id = self.fresh_id();
-        let kind = w.kind();
-        self.pending_wallets.push((id, w));
-        WalletHandle::new(Arc::downgrade(&self.inner), id, kind)
+        let plumbing = HandleInner {
+            inner: Arc::downgrade(&self.inner),
+            component_id: id,
+            regtest: w.opts.regtest_mode.is_some(),
+        };
+        let handle = w.backend.into_handle(plumbing);
+        let nu_ceiling = match w.opts.image {
+            crate::backends::image::ImageSpec::Dev { .. } => None,
+            _ => w.backend.nu_ceiling(&w.opts.version),
+        };
+        self.pending_wallets.push(PendingWallet {
+            nu_ceiling,
+            opts: w.opts,
+        });
+        handle
     }
 
-    /// Enforce v1 topology constraints before touching any cluster
-    /// state: no duplicate hostnames, at most one validator/wallet
-    /// per env, at most two indexers (fetch + state backends).
     fn validate_topology(&self) -> Result<(), EnvError> {
         if self.pending_indexers.len() > 2 {
             return Err(EnvError::Config {
@@ -335,9 +435,9 @@ impl TestEnv {
         let names = self
             .pending_validators
             .iter()
-            .map(|(_, v)| pod_name_of(v.opts()))
-            .chain(self.pending_indexers.iter().map(|(_, i)| pod_name_of(i.opts())))
-            .chain(self.pending_wallets.iter().map(|(_, w)| pod_name_of(w.opts())));
+            .map(|p| pod_name_of(&p.opts))
+            .chain(self.pending_indexers.iter().map(|p| pod_name_of(&p.opts)))
+            .chain(self.pending_wallets.iter().map(|p| pod_name_of(&p.opts)));
         for name in names {
             if !seen.insert(name.clone()) {
                 return Err(EnvError::Config {
@@ -348,89 +448,40 @@ impl TestEnv {
         Ok(())
     }
 
-    /// Walk pending components, resolve the topology activation-height
-    /// ceiling, and render the regtest config of every validator that
-    /// opted in via `.regtest()`. Runs once at the start of
-    /// [`build`](Self::build), after [`validate_topology`].
-    ///
-    /// Indexer / wallet regtest configs don't encode activation heights
-    /// — they read them from the validator at runtime — so they're not
-    /// touched here. Components without `regtest_mode` are left alone
-    /// (they're not running regtest).
     fn materialize_regtest_configs(&mut self) {
-        use crate::component::{ComponentOpts, RegtestMode, Validator};
-        use crate::handles::validator::ValidatorKind;
-        use crate::topology::{
-            activation_heights_for_ceiling, resolve_ceiling, ComponentVersion, NetworkUpgrade,
-        };
+        use crate::component::RegtestMode;
+        use crate::topology::{activation_heights_for_ceiling, resolve_ceiling};
 
-        let opts_versions = |opts: &ComponentOpts, family| -> Option<ComponentVersion> {
-            // From-source components don't have a parseable version — their
-            // `version` field holds a Dockerfile path. Skip them in the
-            // topology resolver; HEAD is assumed to support the highest NU
-            // the rest of the topology asks for, and if it doesn't, the
-            // chain syncer will fail loudly at runtime.
-            if matches!(
-                opts.image,
-                crate::handles::backends::image::ImageSpec::Dev { .. }
-            ) {
-                return None;
+        // Collect each component's reported NU ceiling. The per-component
+        // `nu_ceiling` values were already dev-image-skipped at `add_*`.
+        let mut ceilings: Vec<NetworkUpgrade> = Vec::new();
+        for p in &self.pending_validators {
+            // `nu_ceiling` was already dev-image-skipped at `add_validator`.
+            if let Some(c) = p.nu_ceiling {
+                ceilings.push(c);
             }
-            // The constructor parses the version string; if it can't,
-            // the test author gave us garbage and we want a loud panic
-            // here rather than a confused materialization error later.
-            Some(ComponentVersion {
-                family,
-                version: opts
-                    .version
-                    .parse()
-                    .expect("component version must be a valid Semver"),
-            })
-        };
-
-        let mut topology: Vec<ComponentVersion> = Vec::new();
-        for (_, v) in &self.pending_validators {
-            let family = match v.kind() {
-                ValidatorKind::Zebrad => crate::topology::ComponentFamily::Zebrad,
-                ValidatorKind::Zcashd => crate::topology::ComponentFamily::Zcashd,
-            };
-            topology.extend(opts_versions(v.opts(), family));
         }
-        for (_, i) in &self.pending_indexers {
-            let family = match i.kind() {
-                crate::handles::indexer::IndexerKind::Zainod => {
-                    crate::topology::ComponentFamily::Zaino
-                }
-                crate::handles::indexer::IndexerKind::Lightwalletd => {
-                    crate::topology::ComponentFamily::Lightwalletd
-                }
-            };
-            topology.extend(opts_versions(i.opts(), family));
+        for p in &self.pending_indexers {
+            // `nu_ceiling` was already dev-image-skipped at `add_indexer`.
+            if let Some(c) = p.nu_ceiling {
+                ceilings.push(c);
+            }
         }
-        for (_, w) in &self.pending_wallets {
-            let family = match w.kind() {
-                crate::handles::wallet::WalletKind::Zingo => {
-                    crate::topology::ComponentFamily::Zingo
-                }
-            };
-            topology.extend(opts_versions(w.opts(), family));
+        for p in &self.pending_wallets {
+            if let Some(c) = p.nu_ceiling {
+                ceilings.push(c);
+            }
         }
 
-        // Resolve the ceiling. If any validator opted in to a higher NU
-        // explicitly via `ActivateThrough`, override (and panic on
-        // incompatibility — caller asked for an NU the topology can't
-        // serve).
-        let resolved = resolve_ceiling(&topology);
+        let resolved = resolve_ceiling(&ceilings);
         let mut ceiling = resolved;
-        for (_, v) in &self.pending_validators {
-            if let Some(RegtestMode::ActivateThrough(requested)) = &v.opts().regtest_mode {
+        for p in &self.pending_validators {
+            if let Some(RegtestMode::ActivateThrough(requested)) = &p.opts.regtest_mode {
                 if *requested > resolved {
                     panic!(
                         "validator {:?} requested NU ceiling {:?}, but topology only \
                          supports up to {:?} (one or more pinned components is too old)",
-                        v.opts().name,
-                        requested,
-                        resolved
+                        p.opts.name, requested, resolved
                     );
                 }
                 ceiling = ceiling.max(*requested);
@@ -443,16 +494,11 @@ impl TestEnv {
             "topology activation-height ceiling resolved"
         );
 
-        // Resolve each opted-in validator's peer-name list into
-        // `(host, port)` tuples once, up front — pod names are stable
-        // by this point (validate_topology already ran). Unknown peer
-        // names panic loudly: a typo in a `.peer("aliec")` is a
-        // configuration bug, not a runtime concern.
         let p2p_port = crate::handles::ports::ZEBRAD_P2P;
         let known_validators: std::collections::HashSet<String> = self
             .pending_validators
             .iter()
-            .map(|(_, v)| pod_name_of(v.opts()))
+            .map(|p| pod_name_of(&p.opts))
             .collect();
         let peer_tuples_for = |opts: &ComponentOpts| -> Vec<(String, u16)> {
             opts.peers
@@ -470,98 +516,84 @@ impl TestEnv {
                 .collect()
         };
 
-        // Hand each opted-in validator over to its backend's
-        // materializer. Indexers / wallets aren't height-dependent.
+        // Validators: dispatch through backend trait method.
         let pending = std::mem::take(&mut self.pending_validators);
         self.pending_validators = pending
             .into_iter()
-            .map(|(id, v)| {
-                if v.opts().regtest_mode.is_some() {
-                    let peers = peer_tuples_for(v.opts());
-                    let v = match v {
-                        Validator::Zebrad(_) => {
-                            crate::handles::backends::zebra::materialize_regtest_config(
-                                v, &activation, &peers,
-                            )
-                        }
-                        Validator::Zcashd(_) => {
-                            crate::handles::backends::zcashd::materialize_regtest_config(
-                                v, &activation,
-                            )
-                        }
-                    };
-                    (id, v)
-                } else {
-                    (id, v)
+            .map(|mut p| {
+                if p.opts.regtest_mode.is_some() {
+                    if let Some(materialize) = p.materialize.take() {
+                        let peers = peer_tuples_for(&p.opts);
+                        p.opts = materialize(p.opts, &activation, &peers);
+                    }
                 }
+                p
             })
             .collect();
 
-        // Resolve the validator pod name for indexers that opted in to
-        // regtest. v1 topology: one validator paired with one or more
-        // indexers — pick the only validator's pod name. Indexers that
-        // didn't call `.regtest()` / `.regtest_state()` (no
-        // `regtest_backend` set) are left alone.
         let validator_host = self
             .pending_validators
             .iter()
-            .map(|(_, v)| pod_name_of(v.opts()))
+            .map(|p| pod_name_of(&p.opts))
             .next();
         let pending = std::mem::take(&mut self.pending_indexers);
         self.pending_indexers = pending
             .into_iter()
-            .map(|(id, i)| {
-                let needs_regtest = match &i {
-                    crate::component::Indexer::Zainod(o) => o.regtest_backend.is_some(),
-                };
-                if needs_regtest {
-                    let host = validator_host.as_deref().expect(
-                        "indexer opted in to regtest but no validator is registered in this env",
-                    );
-                    let i = crate::handles::backends::zainod::materialize_regtest_config(i, host);
-                    (id, i)
-                } else {
-                    (id, i)
+            .map(|mut p| {
+                if let Some(materialize) = p.materialize.take() {
+                    p.opts = materialize(p.opts, validator_host.as_deref());
                 }
+                p
             })
             .collect();
 
-        // Suppress unused-variant warning on NetworkUpgrade until we
-        // surface the ActivateThrough opt-in publicly.
         let _ = NetworkUpgrade::HIGHEST;
     }
 
-    /// Apply manifests, wait for readiness. After this returns
-    /// successfully, every handle method works.
     pub async fn build(&mut self) -> Result<(), EnvError> {
         self.validate_topology()?;
         self.materialize_regtest_configs();
 
         let started = std::time::Instant::now();
         let coords = RunCoords::from_env().map_err(env_err)?;
+        // Raw `module::test` (for the namespace annotation + name) and its
+        // DNS-safe slug (for every label value — `::` is illegal in labels).
+        let test_raw = naming::current_test_name();
+        let package = naming::current_package();
+        let test_slug = naming::slug(&test_raw, 63);
         let test_id = naming::test_suffix();
-        let namespace = naming::namespace_for(&test_id);
+        let namespace = naming::namespace_for(&package, &test_raw, &test_id);
         let client = cluster::client().await.map_err(env_err)?;
 
         tracing::info!(
             namespace = %namespace,
+            test = %test_raw,
             validators = self.pending_validators.len(),
             indexers = self.pending_indexers.len(),
             wallets = self.pending_wallets.len(),
             "building TestEnv"
         );
 
-        cluster::ensure_namespace(&client, &namespace, &coords)
+        cluster::ensure_namespace(&client, &namespace, &coords, &package, &test_raw)
             .await
             .map_err(env_err)?;
         let sentinel = Sentinel::new(namespace.clone());
         let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
-        let test_name = current_test_name();
+        let test_name = test_slug;
 
-        // Late-bind the kube client + namespace into EnvInner. After
-        // this point, EnvInner::resolve_port can dial the cluster.
         let _ = self.inner.client.set(client.clone());
-        *self.inner.namespace.lock().expect("namespace mutex poisoned") = Some(namespace.clone());
+        *self
+            .inner
+            .namespace
+            .lock()
+            .expect("namespace mutex poisoned") = Some(namespace.clone());
+
+        // Provision shared PVCs before any pod references them. With the
+        // default (WaitForFirstConsumer) binding the claim stays Pending
+        // until the first consumer — the validator in Phase 1 — schedules.
+        for claim in std::mem::take(&mut self.pending_shared_volumes) {
+            mounts::create_shared_pvc(&client, &sentinel, &claim).await?;
+        }
 
         let ctx = MaterializeCtx {
             client: &client,
@@ -571,42 +603,51 @@ impl TestEnv {
             test_name: &test_name,
         };
 
-        // Phase 1 — validators. Bring them up, wait for JSON-RPC, then
-        // mine one block so indexers (notably zaino's ChainIndex sync
-        // loop) see a real tip from first connect.
+        // Phase 1 — validators.
         let validators: Vec<_> = self
             .pending_validators
             .drain(..)
-            .map(|(id, v)| {
-                let spec = make_validator_spec(&v);
-                let opts = v.opts().clone();
-                (id, spec, opts)
+            .map(|p| {
+                let pod_name = pod_name_of(&p.opts);
+                let spec = manifest::pod_spec_for_validator(p.handle.label(), &p.opts, pod_name);
+                (p.id, spec, p.opts, Some(p.handle))
             })
             .collect();
         self.materialize_phase(&ctx, &validators).await?;
-        self.wait_validators_rpc_ready().await?;
-        self.warm_validators().await?;
+        // The env's own readiness/warm probes drive the validators through
+        // their handles, which gate endpoint resolution on `is_built`.
+        // Flip it on for the probe window, then back off until the whole
+        // build completes — so a Phase-2 failure still leaves test-side
+        // handle calls reporting `NotBuilt`.
+        self.inner.is_built.store(true, Ordering::Release);
+        let warmup = async {
+            self.wait_validators_rpc_ready().await?;
+            self.warm_validators().await?;
+            Ok::<(), EnvError>(())
+        }
+        .await;
+        self.inner.is_built.store(false, Ordering::Release);
+        warmup?;
 
-        // Phase 2 — indexers and wallets. They observe a non-genesis
-        // chain from the moment they connect.
-        let mut dependents: Vec<_> = self
+        // Phase 2 — indexers. (Wallets run in-process; see below.)
+        let dependents: Vec<_> = self
             .pending_indexers
             .drain(..)
-            .map(|(id, i)| {
-                let spec = make_indexer_spec(&i)?;
-                let opts = i.opts().clone();
-                Ok::<_, EnvError>((id, spec, opts))
+            .map(|p| {
+                let pod_name = pod_name_of(&p.opts);
+                let spec = manifest::pod_spec_for_indexer(p.label, &p.opts, pod_name)?;
+                Ok::<_, EnvError>((p.id, spec, p.opts, None))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        dependents.extend(self.pending_wallets.drain(..).map(|(id, w)| {
-            let spec = make_wallet_spec(&w);
-            let opts = w.opts().clone();
-            (id, spec, opts)
-        }));
+        // Wallets run in-process in the test binary — they're libraries
+        // that connect to the indexer over gRPC — so they get no pod.
+        // Their nu_ceiling has already been folded into the topology
+        // resolver in `materialize_regtest_configs`; here we just drop the
+        // pending entries. Account construction happens lazily, on demand,
+        // via `WalletHandle::account`.
+        self.pending_wallets.clear();
         self.materialize_phase(&ctx, &dependents).await?;
 
-        // Flip the live flag last — readers see "either fully built or
-        // not built" with no in-between state.
         self.inner.is_built.store(true, Ordering::Release);
 
         tracing::info!(
@@ -617,56 +658,20 @@ impl TestEnv {
         Ok(())
     }
 
-    /// Explicit teardown — preferred over relying on `Drop`. Deletes
-    /// the per-test namespace (k8s cascades every Pod / Service / PVC
-    /// / CM in it), then deletes the cluster-scoped shadow VSCs
-    /// (which GC can't reach across namespaces).
-    pub async fn teardown(self) -> Result<(), EnvError> {
-        let ns = self
-            .inner
-            .namespace
-            .lock()
-            .expect("namespace mutex poisoned")
-            .take();
-        let shadows: Vec<_> = std::mem::take(
-            &mut *self
-                .inner
-                .shadow_clones
-                .lock()
-                .expect("shadow_clones mutex poisoned"),
-        );
-        tracing::info!(
-            namespace = ?ns,
-            shadow_clones = shadows.len(),
-            "tearing down TestEnv"
-        );
-        let client = self.inner.client.get().cloned();
-        if let (Some(client_ref), Some(ns)) = (client.as_ref(), ns) {
-            cluster::delete_namespace(client_ref, &ns).await.map_err(env_err)?;
-        }
-        if let Some(client) = client {
-            for shadow in shadows {
-                if let Err(e) = seeds::delete_shadow(&client, &shadow).await {
-                    tracing::warn!(error = %e, vsc = %shadow.shadow_vsc_name, "shadow VSC delete failed");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    // ── readiness ────────────────────────────────────────────────────
-
-    /// Probe every validator's JSON-RPC port until `getblocktemplate`
-    /// returns success. Runs all validators concurrently. The
-    /// per-validator budget is the env's `ready_timeout` (default
-    /// [`Self::DEFAULT_READY_TIMEOUT`]).
     async fn wait_validators_rpc_ready(&self) -> Result<(), EnvError> {
-        let validators: Vec<ComponentState> = {
+        // (pod_name, handle) for each validator. Probes drive the handle,
+        // which resolves its own endpoint and picks the backend-specific
+        // readiness RPC.
+        let validators: Vec<(String, Arc<dyn ValidatorBackend>)> = {
             let comps = self.inner.components.read().await;
             comps
                 .values()
-                .filter(|s| matches!(s.kind, ComponentKind::Validator(_)))
-                .cloned()
+                .filter(|s| matches!(s.category, ComponentCategory::Validator))
+                .filter_map(|s| {
+                    s.validator_handle
+                        .as_ref()
+                        .map(|h| (s.pod_name.clone(), Arc::clone(h)))
+                })
                 .collect()
         };
         if validators.is_empty() {
@@ -674,35 +679,15 @@ impl TestEnv {
         }
 
         let timeout = self.inner.ready_timeout;
-        let probes = validators.into_iter().map(|state| {
-            let inner = Arc::clone(&self.inner);
-            async move {
-                let endpoint = inner.resolve_named(&state, "rpc").await?;
-                // Route through the ValidatorBackend trait so the
-                // auth scheme stays in one place — see
-                // `handles::backends::validator_for_kind`.
-                // Route through the ValidatorBackend trait so each
-                // backend gets the readiness probe its RPC contract
-                // actually expects: zebrad polls `getblocktemplate`;
-                // zcashd polls `getinfo` (its `getblocktemplate` is
-                // gated by IBD and never clears on regtest). Anything
-                // non-validator (an indexer that slipped through the
-                // filter above) keeps the legacy probe path.
-                let vk = match state.kind {
-                    ComponentKind::Validator(vk) => vk,
-                    _ => return Ok(()),
-                };
-                let backend = crate::handles::backends::validator_for_kind(vk);
-                let client = backend.build_authed_rpc(&endpoint);
-                backend
-                    .wait_for_ready(&client, endpoint.socket_addr(), timeout)
-                    .await
-                    .map_err(|e| EnvError::RpcTimeout {
-                        component: state.pod_name.clone(),
-                        op: "wait_for_ready",
-                        elapsed: e.timeout,
-                    })
-            }
+        let probes = validators.into_iter().map(|(pod_name, handle)| async move {
+            handle
+                .ready(timeout)
+                .await
+                .map_err(|_| EnvError::RpcTimeout {
+                    component: pod_name,
+                    op: "wait_for_ready",
+                    elapsed: timeout,
+                })
         });
         for res in join_all(probes).await {
             res?;
@@ -710,52 +695,42 @@ impl TestEnv {
         Ok(())
     }
 
-    /// Mine one block on every validator. Called once during `build()`,
-    /// after RPC is ready and before any indexer/wallet sees the chain.
-    /// Zaino's `ChainIndex` sync loop trips its reorg detector on a
-    /// genesis-only chain and would exit permanently otherwise.
     async fn warm_validators(&self) -> Result<(), EnvError> {
-        let validators: Vec<(u64, crate::handles::validator::ValidatorKind)> = {
+        // Mine one block per validator so dependents (indexers) sync
+        // against a non-genesis tip. Drives each validator's handle.
+        let handles: Vec<Arc<dyn ValidatorBackend>> = {
             let comps = self.inner.components.read().await;
             comps
-                .iter()
-                .filter_map(|(id, s)| match s.kind {
-                    ComponentKind::Validator(k) => Some((*id, k)),
-                    _ => None,
-                })
+                .values()
+                .filter(|s| matches!(s.category, ComponentCategory::Validator))
+                .filter_map(|s| s.validator_handle.as_ref().map(Arc::clone))
                 .collect()
         };
-        // Temporarily flip is_built so the fabricated handles can drive
-        // RPCs. `build()` is the unique flip-to-live point, so we reset
-        // it on the way out.
-        self.inner.is_built.store(true, Ordering::Release);
-        let result = async {
-            for (id, kind) in validators {
-                let handle = ValidatorHandle::new(Arc::downgrade(&self.inner), id, kind);
-                handle
-                    .generate_blocks(1)
-                    .await
-                    .map_err(|e| EnvError::Transient(Box::new(e)))?;
-            }
-            Ok::<(), EnvError>(())
+        for handle in handles {
+            handle
+                .generate_blocks(1)
+                .await
+                .map_err(|e| EnvError::Transient(Box::new(e)))?;
         }
-        .await;
-        self.inner.is_built.store(false, Ordering::Release);
-        result
+        Ok(())
     }
 
-    // ── materialize ─────────────────────────────────────────────────
-
-    /// Apply one phase of components: create per-pod ClusterIP Services,
-    /// resolve mounts, apply Pods, then wait for every pod's
-    /// readinessProbe to pass.
     async fn materialize_phase(
         &self,
         ctx: &MaterializeCtx<'_>,
-        items: &[(u64, PodSpec, crate::component::ComponentOpts)],
+        items: &[(
+            u64,
+            PodSpec,
+            ComponentOpts,
+            Option<Arc<dyn ValidatorBackend>>,
+        )],
     ) -> Result<(), EnvError> {
-        for (id, spec, opts) in items {
-            let state = ComponentState::new(spec, ctx.sentinel.namespace.clone());
+        for (id, spec, opts, validator_handle) in items {
+            let state = ComponentState::new(
+                spec,
+                ctx.sentinel.namespace.clone(),
+                validator_handle.clone(),
+            );
             cluster::create_pod_service(
                 ctx.client,
                 &ctx.sentinel.namespace,
@@ -776,7 +751,7 @@ impl TestEnv {
         }
 
         let timeout = self.inner.ready_timeout;
-        let waits = items.iter().map(|(_, spec, _)| {
+        let waits = items.iter().map(|(_, spec, _, _)| {
             let pods = ctx.pods.clone();
             let name = spec.pod_name.clone();
             async move {
@@ -801,15 +776,34 @@ impl TestEnv {
 }
 
 impl Drop for TestEnv {
+    /// Teardown is Drop-only and runs to completion here, pass or fail.
+    ///
+    /// There is deliberately no `teardown().await` method. An explicit
+    /// call is skipped by any early `?`-return on a test's failure path,
+    /// which leaks the namespace (and every pod in it) — the exact cause
+    /// of the cluster filling to its pod cap and every subsequent test
+    /// timing out on `pod_ready`. Tying teardown to `Drop` makes it
+    /// unconditional: the namespace is deleted whether the test returns
+    /// `Ok`, returns `Err`, or panics.
+    ///
+    /// `Drop` cannot `.await`, and the test's own runtime is torn down
+    /// the instant the test future resolves — so a `Handle::spawn`ed
+    /// cleanup task would be cancelled before its DELETE was ever sent
+    /// (that fire-and-forget shape is what leaked namespaces before).
+    /// Instead we run the delete to completion on a dedicated OS thread
+    /// with its own runtime and `join()` it, blocking the dropping
+    /// thread until the API has accepted the deletion. This is
+    /// runtime-flavour agnostic (works under both current-thread and
+    /// multi-thread test runtimes). The kube client is rebuilt inside
+    /// that runtime because the original is bound to the now-dying test
+    /// runtime's reactor and is unsound to reuse across runtimes.
+    ///
+    /// `ztest run --no-cleanup` (→ `ZTEST_NO_CLEANUP`) suppresses the
+    /// delete so a developer can `kubectl` into the surviving pods for a
+    /// post-mortem. The 1h `janitor/ttl` annotation still reaps the
+    /// namespace afterwards, so this never leaks permanently.
     fn drop(&mut self) {
-        // Best-effort async cleanup. If no runtime is current,
-        // kube-janitor backstops.
-        let ns = self
-            .inner
-            .namespace
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take());
+        let ns = self.inner.namespace.lock().ok().and_then(|mut g| g.take());
         let shadows: Vec<_> = self
             .inner
             .shadow_clones
@@ -820,43 +814,72 @@ impl Drop for TestEnv {
         if ns.is_none() && shadows.is_empty() {
             return;
         }
-        let Some(client) = self.inner.client.get().cloned() else {
-            return;
-        };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tracing::debug!(
+        if cluster::no_cleanup_requested() {
+            if let Some(ns) = &ns {
+                // eprintln (not just tracing) so the hint is visible in
+                // captured test output, where a developer is looking.
+                eprintln!(
+                    "ztest: --no-cleanup — preserving namespace {ns} for inspection \
+                     (janitor reaps it in ~1h).\n  \
+                     inspect: kubectl get pods -n {ns}\n  \
+                     logs:    kubectl logs -n {ns} <pod>\n  \
+                     delete:  kubectl delete ns {ns}"
+                );
+            }
+            tracing::warn!(
                 namespace = ?ns,
                 shadow_clones = shadows.len(),
-                "TestEnv dropped without explicit teardown; spawning best-effort cleanup"
+                "ZTEST_NO_CLEANUP set — leaving TestEnv namespace for inspection"
             );
-            handle.spawn(async move {
+            return;
+        }
+        tracing::info!(
+            namespace = ?ns,
+            shadow_clones = shadows.len(),
+            "tearing down TestEnv (Drop)"
+        );
+        let outcome = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("teardown runtime: {e}"))?;
+            rt.block_on(async move {
+                let client = cluster::client()
+                    .await
+                    .map_err(|e| format!("teardown client: {e}"))?;
                 if let Some(ns) = ns {
-                    // Best-effort; kube-janitor backstops if this fails.
-                    let _ = cluster::delete_namespace(&client, &ns).await;
+                    cluster::delete_namespace(&client, &ns)
+                        .await
+                        .map_err(|e| format!("delete namespace {ns}: {e}"))?;
                 }
                 for shadow in shadows {
-                    // Best-effort; kube-janitor backstops if this fails.
-                    let _ = seeds::delete_shadow(&client, &shadow).await;
+                    if let Err(e) = seeds::delete_shadow(&client, &shadow).await {
+                        tracing::warn!(
+                            error = %e,
+                            vsc = %shadow.shadow_vsc_name,
+                            "shadow VSC delete failed"
+                        );
+                    }
                 }
-            });
+                Ok::<(), String>(())
+            })
+        })
+        .join();
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(error = %e, "TestEnv teardown failed"),
+            Err(_) => tracing::error!("TestEnv teardown thread panicked"),
         }
     }
 }
 
 // ─────────────────────────────── helpers ──────────────────────────────
 
-/// `Condition<Pod>` matching pods whose `Ready` status condition is
-/// `True`. `kube-runtime` ships `is_pod_running` but not this — the
-/// "running" predicate fires as soon as containers start, which is
-/// well before the readinessProbe binds the application port.
 fn is_pod_ready() -> impl kube::runtime::wait::Condition<Pod> {
     |pod: Option<&Pod>| {
         pod.and_then(|p| p.status.as_ref())
             .and_then(|s| s.conditions.as_ref())
-            .map(|cs| {
-                cs.iter()
-                    .any(|c| c.type_ == "Ready" && c.status == "True")
-            })
+            .map(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
             .unwrap_or(false)
     }
 }
@@ -864,7 +887,13 @@ fn is_pod_ready() -> impl kube::runtime::wait::Condition<Pod> {
 fn short_kind(s: &str) -> String {
     let s: String = s
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     let s = s.trim_matches('-').to_string();
     if s.is_empty() {
@@ -887,33 +916,14 @@ async fn apply_pod(
         .map_err(env_err)
 }
 
-/// DNS-1123 pod / service name for a component. Defaults to the
-/// backend's kind label; `.named()` overrides.
-fn pod_name_of(opts: &crate::component::ComponentOpts) -> String {
+fn pod_name_of(opts: &ComponentOpts) -> String {
     short_kind(opts.name.as_deref().unwrap_or("x"))
 }
 
-fn make_validator_spec(v: &Validator) -> PodSpec {
-    manifest::pod_spec_for_validator(v, pod_name_of(v.opts()))
-}
-
-fn make_indexer_spec(i: &Indexer) -> Result<PodSpec, EnvError> {
-    manifest::pod_spec_for_indexer(i, pod_name_of(i.opts()))
-}
-
-fn make_wallet_spec(w: &Wallet) -> PodSpec {
-    manifest::pod_spec_for_wallet(w, pod_name_of(w.opts()))
-}
-
-/// Shared inputs threaded into the materialize loop.
 struct MaterializeCtx<'a> {
     client: &'a kube::Client,
     pods: &'a Api<Pod>,
     sentinel: &'a Sentinel,
     coords: &'a RunCoords,
     test_name: &'a str,
-}
-
-fn current_test_name() -> String {
-    std::env::var("NEXTEST_TEST_NAME").unwrap_or_else(|_| "unknown".into())
 }

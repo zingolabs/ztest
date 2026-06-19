@@ -9,7 +9,7 @@
 //! and is no faster. We do them one at a time and emit one stderr
 //! line per image so the scroll region tracks progress.
 
-use crate::handles::backends::image;
+use crate::backends::image;
 use crate::pipeline::docker::BuiltImage;
 
 #[derive(Debug, Clone)]
@@ -35,5 +35,8 @@ pub fn load_all(images: &[BuiltImage]) -> KindLoadOutcome {
         }
         loaded += 1;
     }
-    KindLoadOutcome::Loaded { count: loaded, skipped }
+    KindLoadOutcome::Loaded {
+        count: loaded,
+        skipped,
+    }
 }

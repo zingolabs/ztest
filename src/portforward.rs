@@ -57,7 +57,10 @@ impl Forwarder {
             }
         });
 
-        Ok(Forwarder { local_port, _shutdown: tx })
+        Ok(Forwarder {
+            local_port,
+            _shutdown: tx,
+        })
     }
 }
 
@@ -72,6 +75,8 @@ async fn bridge(
         .take_stream(port)
         .ok_or("portforward did not return a stream for the requested port")?;
     let _ = copy_bidirectional(&mut sock, &mut upstream).await?;
-    pf.join().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    pf.join()
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     Ok(())
 }

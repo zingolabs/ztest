@@ -9,13 +9,24 @@ use std::time::Duration;
 #[derive(Debug, thiserror::Error)]
 pub enum EnvError {
     #[error("{component} failed to become ready after {elapsed:?}")]
-    NotReady { component: String, elapsed: Duration },
+    NotReady {
+        component: String,
+        elapsed: Duration,
+    },
 
     #[error("{component} exited uncleanly (exit {exit_code}) after {elapsed:?}")]
-    UncleanExit { component: String, elapsed: Duration, exit_code: i32 },
+    UncleanExit {
+        component: String,
+        elapsed: Duration,
+        exit_code: i32,
+    },
 
     #[error("{component} RPC '{op}' timed out after {elapsed:?}")]
-    RpcTimeout { component: String, op: &'static str, elapsed: Duration },
+    RpcTimeout {
+        component: String,
+        op: &'static str,
+        elapsed: Duration,
+    },
 
     #[error("archive materialize failed for {}: {reason}", archive.display())]
     ArchiveMaterializeFailed { archive: PathBuf, reason: String },
@@ -24,7 +35,11 @@ pub enum EnvError {
     UnknownEndpoint { component: String, name: String },
 
     #[error("port-forward to {component}:{port} failed: {reason}")]
-    PortForwardFailed { component: String, port: u16, reason: String },
+    PortForwardFailed {
+        component: String,
+        port: u16,
+        reason: String,
+    },
 
     #[error("kube API call failed: {reason}")]
     KubeApi { reason: String },
@@ -39,7 +54,7 @@ pub enum EnvError {
     ImageBuild {
         component: String,
         #[source]
-        source: crate::handles::backends::image::ImageError,
+        source: crate::backends::image::ImageError,
     },
 
     /// A handle method was called before `env.build()`. Components only
@@ -107,7 +122,11 @@ impl RpcError {
     where
         E: StdError + Send + Sync + 'static,
     {
-        RpcError::Backend { component, op, source: Box::new(source) }
+        RpcError::Backend {
+            component,
+            op,
+            source: Box::new(source),
+        }
     }
 
     /// `Backend` error from an already-boxed error (e.g. `zebra_node_services::BoxError`).
@@ -116,7 +135,11 @@ impl RpcError {
         op: &'static str,
         source: Box<dyn StdError + Send + Sync>,
     ) -> Self {
-        RpcError::Backend { component, op, source }
+        RpcError::Backend {
+            component,
+            op,
+            source,
+        }
     }
 
     /// Build a `Decode` error.
@@ -125,7 +148,11 @@ impl RpcError {
         op: &'static str,
         reason: impl Into<String>,
     ) -> Self {
-        RpcError::Decode { component, op, reason: reason.into() }
+        RpcError::Decode {
+            component,
+            op,
+            reason: reason.into(),
+        }
     }
 
     /// Build a `Timeout` error.
@@ -135,7 +162,12 @@ impl RpcError {
         elapsed: Duration,
         detail: impl Into<String>,
     ) -> Self {
-        RpcError::Timeout { component, op, elapsed, detail: detail.into() }
+        RpcError::Timeout {
+            component,
+            op,
+            elapsed,
+            detail: detail.into(),
+        }
     }
 }
 

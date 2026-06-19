@@ -124,7 +124,10 @@ async fn dump_one(bin: &SelectedBinary) -> Result<Vec<DevImageEntry>, String> {
     if !status.success() {
         return Err(format!(
             "binary exited {} during inventory dump; stderr:\n{}",
-            status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into()),
             tail(&stderr_tail, 20)
         ));
     }
