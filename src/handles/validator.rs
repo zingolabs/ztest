@@ -79,6 +79,37 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     }
 }
 
+/// A validator backend's value-pool capabilities.
+///
+/// Groups the two pool facts a test needs about a node: which pools it
+/// validates at all, and the single pool its coinbase pays into. The two
+/// have different cardinality — `supported` is a set, `coinbase` is one
+/// distinguished member of it — so they're modelled as distinct fields
+/// rather than a per-pool map.
+#[derive(Debug, Clone)]
+pub struct PoolSupport {
+    /// Every value pool the node validates on its chain. zcashd is
+    /// end-of-life and never gained Orchard support, so its set omits
+    /// [`Pool::Orchard`]; zebrad lists all three. `coinbase` is always a
+    /// member.
+    pub supported: &'static [Pool],
+
+    /// The single pool the coinbase pays into — a fixed property of the
+    /// backend's miner address (baked into its regtest config), not a
+    /// per-test choice. zebrad mines to [`Pool::Orchard`], zcashd to
+    /// [`Pool::Sapling`]. Always one of [`Self::supported`].
+    pub coinbase: Pool,
+}
+
+impl PoolSupport {
+    /// Whether the node validates `pool`. Tests gate pool-specific work
+    /// on this — e.g. skip an Orchard send where `supports(Pool::Orchard)`
+    /// is `false`, rather than letting it fail deep in the node.
+    pub fn supports(&self, pool: Pool) -> bool {
+        self.supported.contains(&pool)
+    }
+}
+
 #[async_trait]
 pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     /// Stable label string for the backend behind this handle.
@@ -99,22 +130,20 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     async fn ready(&self, timeout: Duration) -> Result<(), RpcError>;
 
     /// Generate `n` blocks. Returns the new chain-tip height once the
-    /// chain has advanced. The coinbase pays into [`Self::coinbase_pool`]
-    /// — the pool fixed for this backend.
+    /// chain has advanced. The coinbase pays into
+    /// [`PoolSupport::coinbase`] — the pool fixed for this backend.
     async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError>;
 
-    /// The single value pool this backend mines its coinbase into. A
-    /// fixed property of the backend (the miner address baked into its
-    /// regtest config), not a per-test choice: zebrad mines to
-    /// [`Pool::Orchard`], zcashd to [`Pool::Sapling`].
-    fn coinbase_pool(&self) -> Pool;
+    /// This backend's value-pool capabilities: which pools it validates
+    /// and the single pool its coinbase pays into. See [`PoolSupport`].
+    fn pool_support(&self) -> PoolSupport;
 
     /// Mine `n` blocks, requiring their coinbase to pay into `pool`.
     ///
     /// `pool` is the pool the *test* depends on. The node's recipient is
     /// fixed in config and cannot change at runtime, so this is the one
     /// pool-aware mining entry point and it is strict: if `pool` is not
-    /// the backend's [`Self::coinbase_pool`] (or the backend cannot mine
+    /// the backend's [`PoolSupport::coinbase`] (or the backend cannot mine
     /// into `pool` at all, e.g. zcashd + [`Pool::Orchard`]), it
     /// **panics** — the test has asked for something this validator can
     /// never deliver, and should fail at the call site. On a match it

@@ -256,7 +256,7 @@ impl ZingoWallet {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        let pool = validator.coinbase_pool();
+        let pool = validator.pool_support().coinbase;
         assert!(
             matches!(pool, Pool::Orchard | Pool::Sapling),
             "funded_faucet: validator mines a {pool:?} coinbase, but only shielded \

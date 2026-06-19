@@ -9,7 +9,7 @@ use zingo_common_components::protocol::ActivationHeights;
 use crate::handles::client::{AuthedRpc, JsonRpcClient, json_rpc, wait_for_rpc_ready};
 use crate::handles::validator::{
     BlockHash, BlockHeight, BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, PeerInfo,
-    ValidatorBackend, ValidatorConfig,
+    PoolSupport, ValidatorBackend, ValidatorConfig,
 };
 use crate::handles::wallet::Pool;
 use crate::handles::{Endpoint, HandleInner};
@@ -177,8 +177,13 @@ impl ValidatorBackend for ZebraValidator {
         self.chain_height().await
     }
 
-    fn coinbase_pool(&self) -> Pool {
-        COINBASE_POOL
+    fn pool_support(&self) -> PoolSupport {
+        // zebrad validates every value pool on regtest; its coinbase pays
+        // into Orchard (see COINBASE_POOL).
+        PoolSupport {
+            supported: &[Pool::Orchard, Pool::Sapling, Pool::Transparent],
+            coinbase: COINBASE_POOL,
+        }
     }
 
     async fn mine_to(&self, pool: Pool, n: u32) -> Result<BlockHeight, RpcError> {

@@ -11,7 +11,7 @@ use crate::handles::client::{
 };
 use crate::handles::validator::{
     BlockHash, BlockHeight, BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, PeerInfo,
-    ValidatorBackend, ValidatorConfig,
+    PoolSupport, ValidatorBackend, ValidatorConfig,
 };
 use crate::handles::wallet::Pool;
 use crate::handles::{Endpoint, HandleInner};
@@ -166,8 +166,14 @@ impl ValidatorBackend for ZcashdValidator {
         self.chain_height().await
     }
 
-    fn coinbase_pool(&self) -> Pool {
-        COINBASE_POOL
+    fn pool_support(&self) -> PoolSupport {
+        // zcashd is end-of-life and never gained Orchard support — see
+        // ORCHARD_DEPRECATION. It validates Sapling and transparent only;
+        // its coinbase pays into Sapling (see COINBASE_POOL).
+        PoolSupport {
+            supported: &[Pool::Sapling, Pool::Transparent],
+            coinbase: COINBASE_POOL,
+        }
     }
 
     async fn mine_to(&self, pool: Pool, n: u32) -> Result<BlockHeight, RpcError> {
