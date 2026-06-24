@@ -57,6 +57,15 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     /// (the back-reference + component id used to resolve endpoints).
     fn into_handle(&self, plumbing: HandleInner) -> Self::Handle;
 
+    /// The value pool this backend mines its coinbase into when a test
+    /// doesn't override it via
+    /// [`Validator::mine_to`](crate::component::Validator::mine_to).
+    /// zebrad defaults to [`Pool::Transparent`] (the pool it can mine
+    /// that avoids the Orchard-anchor and Sapling-scan problems); zcashd
+    /// to [`Pool::Sapling`] (a scannable, instantly-spendable shielded
+    /// coinbase).
+    fn default_coinbase_pool(&self) -> Pool;
+
     /// Highest network upgrade this backend, at the given pinned
     /// version, can decode. Used by the topology resolver to compute the
     /// activation-height ceiling. `None` opts out of the resolver.
@@ -134,21 +143,12 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     /// [`PoolSupport::coinbase`] — the pool fixed for this backend.
     async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError>;
 
-    /// This backend's value-pool capabilities: which pools it validates
-    /// and the single pool its coinbase pays into. See [`PoolSupport`].
+    /// This backend's value-pool capabilities: which pools it validates,
+    /// and the single pool its coinbase pays into (chosen per-validator
+    /// via [`Validator::mine_to`](crate::component::Validator::mine_to),
+    /// defaulting to [`ValidatorConfig::default_coinbase_pool`]). See
+    /// [`PoolSupport`].
     fn pool_support(&self) -> PoolSupport;
-
-    /// Mine `n` blocks, requiring their coinbase to pay into `pool`.
-    ///
-    /// `pool` is the pool the *test* depends on. The node's recipient is
-    /// fixed in config and cannot change at runtime, so this is the one
-    /// pool-aware mining entry point and it is strict: if `pool` is not
-    /// the backend's [`PoolSupport::coinbase`] (or the backend cannot mine
-    /// into `pool` at all, e.g. zcashd + [`Pool::Orchard`]), it
-    /// **panics** — the test has asked for something this validator can
-    /// never deliver, and should fail at the call site. On a match it
-    /// delegates to [`Self::generate_blocks`].
-    async fn mine_to(&self, pool: Pool, n: u32) -> Result<BlockHeight, RpcError>;
 
     /// Current chain-tip height.
     async fn chain_height(&self) -> Result<BlockHeight, RpcError>;

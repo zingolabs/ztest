@@ -349,3 +349,12 @@ First day to debugging a node: under an hour.
    GPU.
 1. **Ceph pool sizing.** Start `size=3` default / `size=1` archive.
    Revisit if disk pressure forces EC (needs ≥5 nodes).
+
+# Shopping List Priced 2026-06-19
+
+SuperMicro Dual Socket LGA 3647 Motherboard ~$700
+Xeon Gold 6258R (28 cores, 2.7GHz) $875
+128GB DDR4 ECC 2666MHz (4x32GB) $1200
+WD-Black 2TB NVMe SSD $250
+Pcie to 4x Nvme Adapter $100
+12TB Seagate Ironwolf Pro Sata HDD $460

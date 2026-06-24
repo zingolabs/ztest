@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::EnvError;
 use crate::env::EnvInner;
+use crate::handles::wallet::Pool;
 use crate::portforward::Forwarder;
 
 pub use self::indexer::{IndexerBackend, IndexerConfig};
@@ -65,6 +66,12 @@ pub struct HandleInner {
     /// `getblockchaininfo.chain` reports `"test"` — indistinguishable from
     /// a real testnet by RPC alone. See `ValidatorBackend::chain_config`.
     pub(crate) regtest: bool,
+    /// The value pool this validator mines its coinbase into, resolved at
+    /// `add_validator` time from the builder's choice (or the backend
+    /// default). `Some` for validators; `None` for indexers/wallets,
+    /// which have no coinbase. Validator handles read it via
+    /// [`validator::PoolSupport`].
+    pub(crate) coinbase_pool: Option<Pool>,
 }
 
 impl HandleInner {

@@ -19,14 +19,34 @@ use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zebrad";
 
-/// The single value pool zebrad mines its coinbase into. zebrad's
-/// `miner_address` is set to a unified address with an Orchard receiver
-/// ([`ORCHARD_MINER_ADDRESS`](crate::regtest_conf::ORCHARD_MINER_ADDRESS)),
-/// and zebra's coinbase builder fills receivers orchard → sapling →
-/// transparent, so every coinbase is an Orchard note — spendable once
-/// mined, with no 100-confirmation maturity. Fixed for the backend; a
-/// test cannot mine zebrad coinbase into another pool.
-const COINBASE_POOL: Pool = Pool::Orchard;
+/// The pool zebrad mines its coinbase into when a test doesn't override
+/// via [`Validator::mine_to`](crate::component::Validator::mine_to).
+///
+/// **Transparent.** zebrad cannot fund a lightclient faucet from any
+/// shielded coinbase on a cold regtest chain: an *Orchard* coinbase has
+/// no anchor at the NU5 activation block ("could not validate orchard
+/// proof"), and a *Sapling* coinbase mines but produces a note zingo
+/// can't scan (`invalid memo bytes`). Transparent always mines, so the
+/// chain advances for walletless tests. (A zingo faucet still can't see a
+/// transparent *coinbase* UTXO, so funded zebrad wallet tests need a
+/// chain cache or upstream fixes — tracked separately.)
+const DEFAULT_COINBASE_POOL: Pool = Pool::Transparent;
+
+/// Resolve the regtest miner address zebrad mines its coinbase to for
+/// `pool`. zebrad pays a unified address's receivers orchard → sapling →
+/// transparent, so each address pins the coinbase to one pool. zebrad
+/// cannot mine a *scannable* Sapling coinbase, so that pool is rejected
+/// at config time rather than producing silently-broken funds.
+fn miner_address(pool: Pool) -> &'static str {
+    match pool {
+        Pool::Orchard => crate::regtest_conf::ORCHARD_MINER_ADDRESS,
+        Pool::Transparent => crate::regtest_conf::MINER_ADDRESS,
+        Pool::Sapling => panic!(
+            "zebrad cannot mine a scannable Sapling coinbase (the note is \
+             unscannable by zingo); mine to Orchard or Transparent"
+        ),
+    }
+}
 
 /// Chain-poll cadence and default ceiling for this backend's `poll_*` /
 /// `wait_for_block_num` loops, plus the inter-block mining delay.
@@ -52,6 +72,10 @@ impl ValidatorConfig for ZebraBackend {
         ZebraValidator { plumbing }
     }
 
+    fn default_coinbase_pool(&self) -> Pool {
+        DEFAULT_COINBASE_POOL
+    }
+
     fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
         version.parse().ok().map(topology::zebrad_ceiling)
     }
@@ -75,16 +99,28 @@ impl ValidatorConfig for ZebraBackend {
         let default_streams = crate::regtest::regtest_test_post_nu6_funding_streams();
         let funding_streams = opts.funding_streams.as_ref().unwrap_or(&default_streams);
 
-        // When this validator shares its zebra-state DB with a colocated
-        // zaino StateService, persist state to the shared mount and serve
-        // the indexer gRPC the StateService syncer connects to.
-        let persistent =
-            opts.shared_state
-                .as_ref()
-                .map(|s| crate::regtest_conf::ZebradPersistentState {
-                    cache_dir: &s.mount_path,
-                    indexer_listen_port: crate::handles::ports::ZEBRAD_INDEXER,
-                });
+        // Persistent on-disk state comes from one of two sources, never
+        // both:
+        //  - `shared_state`: this validator shares its zebra-state DB with
+        //    a colocated zaino StateService — persist to the shared mount
+        //    and serve the indexer gRPC the syncer connects to.
+        //  - `regtest_cache`: boot from (or generate) a chain-cache at
+        //    `ZEBRAD_REGTEST_CACHE_DIR` — persistent, but no StateService,
+        //    so no indexer gRPC.
+        // `shared_state` wins if a caller somehow sets both.
+        let persistent = if let Some(s) = opts.shared_state.as_ref() {
+            Some(crate::regtest_conf::ZebradPersistentState {
+                cache_dir: &s.mount_path,
+                indexer_listen_port: Some(crate::handles::ports::ZEBRAD_INDEXER),
+            })
+        } else if opts.regtest_cache.is_some() {
+            Some(crate::regtest_conf::ZebradPersistentState {
+                cache_dir: ZEBRAD_REGTEST_CACHE_DIR,
+                indexer_listen_port: None,
+            })
+        } else {
+            None
+        };
 
         let toml = crate::regtest_conf::zebrad_conf(
             version,
@@ -95,16 +131,40 @@ impl ValidatorConfig for ZebraBackend {
             lockbox,
             Some(funding_streams),
             persistent,
-            // zebrad mines coinbase to the Orchard pool — see COINBASE_POOL.
-            crate::regtest_conf::ORCHARD_MINER_ADDRESS,
+            // Coinbase recipient for the resolved pool (set in
+            // `add_validator`; falls back to the backend default).
+            miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
         );
         opts.mounts.push(crate::regtest::config_mount_inline(
             toml,
             CONTAINER_CONFIG_PATH,
         ));
+
+        // Back the persistent `cache_dir` with a volume. The shared-state
+        // path mounts its own shared PVC (in `persistent_state_in`), so
+        // only wire the cache mount when `shared_state` is absent.
+        if opts.shared_state.is_none() {
+            match &opts.regtest_cache {
+                Some(crate::component::RegtestCacheSource::Archive(path)) => {
+                    opts.mounts
+                        .push(crate::mount::Mount::archive(path, ZEBRAD_REGTEST_CACHE_DIR));
+                }
+                Some(crate::component::RegtestCacheSource::Blank) => {
+                    opts.mounts
+                        .push(crate::regtest::scratch_mount(ZEBRAD_REGTEST_CACHE_DIR));
+                }
+                None => {}
+            }
+        }
         opts
     }
 }
+
+/// Container path the regtest chain-cache (persistent zebra-state) is
+/// mounted at, and where `zebrad.toml`'s `[state] cache_dir` points when a
+/// validator boots from a cache. Mirrors the testnet cache dir; kept
+/// distinct so the two paths can diverge.
+const ZEBRAD_REGTEST_CACHE_DIR: &str = "/var/cache/zebrad";
 
 // ──────────────────────────── ZebraValidator ──────────────────────────
 
@@ -178,24 +238,15 @@ impl ValidatorBackend for ZebraValidator {
     }
 
     fn pool_support(&self) -> PoolSupport {
-        // zebrad validates every value pool on regtest; its coinbase pays
-        // into Orchard (see COINBASE_POOL).
+        // zebrad validates every value pool on regtest; the pool its
+        // coinbase pays into was chosen per-validator (default Transparent).
         PoolSupport {
             supported: &[Pool::Orchard, Pool::Sapling, Pool::Transparent],
-            coinbase: COINBASE_POOL,
+            coinbase: self
+                .plumbing
+                .coinbase_pool
+                .expect("zebrad validator handle has a resolved coinbase pool"),
         }
-    }
-
-    async fn mine_to(&self, pool: Pool, n: u32) -> Result<BlockHeight, RpcError> {
-        // zebrad's coinbase recipient is fixed (Orchard); it can never
-        // mine into another pool. A request for one is a test bug, not a
-        // recoverable runtime error — fail at the call site.
-        assert_eq!(
-            pool, COINBASE_POOL,
-            "zebrad mines its coinbase into {COINBASE_POOL:?}, but the test asked to \
-             mine to {pool:?}; zebrad cannot mine into {pool:?}"
-        );
-        self.generate_blocks(n).await
     }
 
     async fn chain_height(&self) -> Result<BlockHeight, RpcError> {

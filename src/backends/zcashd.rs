@@ -33,11 +33,13 @@ const BLOCK_GENERATION_DELAY: Duration = Duration::from_millis(1500);
 const CONTAINER_CONF_PATH: &str = "/etc/zcash/zcash.conf";
 const CONTAINER_DATA_DIR: &str = "/var/lib/zcashd";
 
-/// The single value pool zcashd mines its coinbase into: Sapling, its
-/// historical shielded `mineraddress`
+/// The pool zcashd mines its coinbase into when a test doesn't override
+/// via [`Validator::mine_to`](crate::component::Validator::mine_to):
+/// Sapling, its historical shielded `mineraddress`
 /// ([`SHIELDED_MINER_ADDRESS`](crate::regtest_conf::SHIELDED_MINER_ADDRESS)),
-/// so the in-process faucet sees the reward via ordinary shielded sync.
-const COINBASE_POOL: Pool = Pool::Sapling;
+/// so the faucet sees the reward via ordinary shielded sync — instantly
+/// spendable, no maturity wait.
+const DEFAULT_COINBASE_POOL: Pool = Pool::Sapling;
 
 /// Why zcashd refuses an Orchard coinbase. zcashd is end-of-life (its own
 /// config carries `i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet`)
@@ -47,6 +49,16 @@ const COINBASE_POOL: Pool = Pool::Sapling;
 const ORCHARD_DEPRECATION: &str =
     "zcashd is deprecated and cannot mine coinbase into the Orchard pool; \
      use a zebrad validator for Orchard-coinbase tests";
+
+/// Resolve the regtest miner address zcashd mines its coinbase to for
+/// `pool`. Orchard is rejected ([`ORCHARD_DEPRECATION`]).
+fn miner_address(pool: Pool) -> &'static str {
+    match pool {
+        Pool::Sapling => crate::regtest_conf::SHIELDED_MINER_ADDRESS,
+        Pool::Transparent => crate::regtest_conf::MINER_ADDRESS,
+        Pool::Orchard => panic!("{ORCHARD_DEPRECATION}"),
+    }
+}
 
 pub(crate) fn image_uri(version: &str) -> String {
     format!("electriccoinco/zcashd:{version}")
@@ -63,6 +75,10 @@ impl ValidatorConfig for ZcashdBackend {
 
     fn into_handle(&self, plumbing: HandleInner) -> ZcashdValidator {
         ZcashdValidator { plumbing }
+    }
+
+    fn default_coinbase_pool(&self) -> Pool {
+        DEFAULT_COINBASE_POOL
     }
 
     fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
@@ -83,13 +99,19 @@ impl ValidatorConfig for ZcashdBackend {
             version,
             activation,
             RPC_PORT,
-            // zcashd mines coinbase to the Sapling pool — see COINBASE_POOL.
-            crate::regtest_conf::SHIELDED_MINER_ADDRESS,
+            // Coinbase recipient for the resolved pool (set in
+            // `add_validator`; falls back to the backend default).
+            miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
         );
         opts.mounts.push(crate::regtest::config_mount_inline(
             conf,
             CONTAINER_CONF_PATH,
         ));
+        // `opts.regtest_cache` is intentionally ignored: zcashd mines a
+        // shielded coinbase that funds the faucet without the slow
+        // transparent mature-then-shield ritual, so a chain cache buys
+        // nothing here. The opt exists for the generic `Validator<B>` test
+        // helpers, where zebrad consumes it and zcashd no-ops.
         opts
     }
 }
@@ -169,25 +191,15 @@ impl ValidatorBackend for ZcashdValidator {
     fn pool_support(&self) -> PoolSupport {
         // zcashd is end-of-life and never gained Orchard support — see
         // ORCHARD_DEPRECATION. It validates Sapling and transparent only;
-        // its coinbase pays into Sapling (see COINBASE_POOL).
+        // the pool its coinbase pays into was chosen per-validator
+        // (default Sapling).
         PoolSupport {
             supported: &[Pool::Sapling, Pool::Transparent],
-            coinbase: COINBASE_POOL,
+            coinbase: self
+                .plumbing
+                .coinbase_pool
+                .expect("zcashd validator handle has a resolved coinbase pool"),
         }
-    }
-
-    async fn mine_to(&self, pool: Pool, n: u32) -> Result<BlockHeight, RpcError> {
-        // Capability gap first: zcashd cannot build an Orchard coinbase at
-        // all, so name that explicitly rather than as a generic mismatch.
-        assert_ne!(pool, Pool::Orchard, "{ORCHARD_DEPRECATION}");
-        // zcashd mines coinbase into Sapling only; any other pool is a
-        // test bug — fail at the call site.
-        assert_eq!(
-            pool, COINBASE_POOL,
-            "zcashd mines its coinbase into {COINBASE_POOL:?}, but the test asked to \
-             mine to {pool:?}; zcashd cannot mine into {pool:?}"
-        );
-        self.generate_blocks(n).await
     }
 
     async fn chain_height(&self) -> Result<BlockHeight, RpcError> {

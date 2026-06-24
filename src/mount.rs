@@ -86,6 +86,19 @@ impl Mount {
         }
     }
 
+    /// Mount the content-addressed archive at `source` (a local `.tar.*`)
+    /// extracted into a fresh PVC at `destination`. The archive is
+    /// materialized once per cluster (seed PVC + `VolumeSnapshot`) and
+    /// CoW-cloned per test invocation — see `crate::materialize`. The
+    /// compressor is auto-detected from the archive's magic bytes.
+    pub fn archive(source: impl Into<PathBuf>, destination: impl Into<PathBuf>) -> Self {
+        Mount {
+            source: MountSource::ArchiveAbs(source.into()),
+            destination: destination.into(),
+            kind: MountKind::DirArchive,
+        }
+    }
+
     /// Mount the shared, env-scoped PVC named `claim` at `destination`.
     /// The PVC must already be provisioned (see `TestEnv::shared_volume`,
     /// which mints it during `build()`). Both pods that share the volume

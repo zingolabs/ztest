@@ -45,3 +45,5 @@ cargo run --bin ztest -- --help
 - [ ] Scroll terminal after starting tests to give rustc, docker, and nexttest full height
 - [ ] Cargo test compile fail UX
 - [ ] Docker image build fail UX
+- [ ] Test-config/manifest for enabling/disabling a set of cases? Ie, test mode without zcashd
+- [ ] Replace GitLFS stuff with a StorageBackend trait/abstraction, and then create a git-lfs.rs

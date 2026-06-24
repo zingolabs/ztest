@@ -8,7 +8,7 @@
 
 use crate::handles::indexer::IndexerConfig;
 use crate::handles::validator::ValidatorConfig;
-use crate::handles::wallet::WalletConfig;
+use crate::handles::wallet::{Pool, WalletConfig};
 use crate::mount::Mount;
 
 /// Coarse-grained category tag for a component.
@@ -65,6 +65,32 @@ pub struct ComponentOpts {
     /// `zebra_db_path` at the same `mount_path`. `None` for the common
     /// pod-local (ephemeral / fetch) case.
     pub shared_state: Option<SharedState>,
+    /// Which value pool this validator mines its coinbase into. `None`
+    /// means "use the backend default" ([`ValidatorConfig::default_coinbase_pool`]);
+    /// set explicitly via [`Validator::mine_to`]. Resolved to a concrete
+    /// pool (and a regtest miner address) at `env.build()` time. Ignored
+    /// for non-validator components.
+    pub coinbase_pool: Option<Pool>,
+    /// Pre-mined chain to boot this validator from, instead of a cold
+    /// chain. `Archive` loads a committed chain-cache tarball; `Blank`
+    /// boots fresh persistent on-disk state (used to *generate* the
+    /// tarball). Consumed by the zebrad backend (skips the slow
+    /// coinbase-maturity mine in funded tests); a no-op on zcashd, whose
+    /// shielded-coinbase funding needs no cache. `None` for the common
+    /// ephemeral case.
+    pub regtest_cache: Option<RegtestCacheSource>,
+}
+
+/// Where a validator's pre-mined regtest chain comes from. See
+/// [`ComponentOpts::regtest_cache`] and [`Validator::with_regtest_cache`].
+#[derive(Debug, Clone)]
+pub enum RegtestCacheSource {
+    /// Load a committed chain-cache archive (the production test path).
+    Archive(std::path::PathBuf),
+    /// Boot fresh persistent on-disk state — no archive — so a cache
+    /// asset can be mined and extracted. See
+    /// [`Validator::with_blank_persistent_state`].
+    Blank,
 }
 
 /// One side of a shared zebra-state DB: the in-pod path the shared PVC is
@@ -265,6 +291,34 @@ impl<B: WalletConfig> Wallet<B> {
 impl<B: ValidatorConfig> Validator<B> {
     pub fn opts(&self) -> &ComponentOpts {
         &self.opts
+    }
+    /// Choose which value pool this validator mines its coinbase into,
+    /// overriding the backend default ([`ValidatorConfig::default_coinbase_pool`]).
+    /// The pool is resolved to a regtest miner address at `env.build()`;
+    /// a backend that cannot mine the requested pool's coinbase panics
+    /// there (e.g. zebrad + [`Pool::Sapling`], which yields unscannable
+    /// coinbase notes).
+    pub fn mine_to(mut self, pool: Pool) -> Self {
+        self.opts.coinbase_pool = Some(pool);
+        self
+    }
+    /// Boot this validator from a committed chain-cache archive instead of
+    /// a cold chain. On zebrad this loads a pre-mined, matured regtest
+    /// chain so funded tests skip the ~100-block coinbase-maturity mine; a
+    /// no-op on zcashd. Generic over the backend so it composes with the
+    /// `Validator<B>` test helpers — pass [`Self::with_blank_persistent_state`]
+    /// at generation time to mine the asset in the first place.
+    pub fn with_regtest_cache(mut self, archive: impl Into<std::path::PathBuf>) -> Self {
+        self.opts.regtest_cache = Some(RegtestCacheSource::Archive(archive.into()));
+        self
+    }
+    /// Boot this validator with fresh **persistent** on-disk state (rather
+    /// than the default ephemeral state). Used to generate a chain-cache
+    /// asset: mine blocks, then extract the persisted state directory. Not
+    /// for ordinary tests — pair with [`Self::with_regtest_cache`] there.
+    pub fn with_blank_persistent_state(mut self) -> Self {
+        self.opts.regtest_cache = Some(RegtestCacheSource::Blank);
+        self
     }
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.opts.name = Some(name.into());

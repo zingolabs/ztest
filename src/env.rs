@@ -327,12 +327,22 @@ impl TestEnv {
     /// Register a validator and return its concrete, typed handle (e.g.
     /// `ZebraValidator`) — backend-specific RPCs are inherent methods on
     /// it, so calling one on the wrong backend is a compile error.
-    pub fn add_validator<B: ValidatorConfig>(&mut self, v: Validator<B>) -> B::Handle {
+    pub fn add_validator<B: ValidatorConfig>(&mut self, mut v: Validator<B>) -> B::Handle {
         let id = self.fresh_id();
+        // Resolve the coinbase pool once (builder choice, else backend
+        // default) and pin it back into `opts` so the deferred regtest
+        // materialization renders the matching miner address, and into the
+        // handle's plumbing so `funded_faucet` can pick its funding path.
+        let coinbase_pool = v
+            .opts
+            .coinbase_pool
+            .unwrap_or_else(|| v.backend.default_coinbase_pool());
+        v.opts.coinbase_pool = Some(coinbase_pool);
         let plumbing = HandleInner {
             inner: Arc::downgrade(&self.inner),
             component_id: id,
             regtest: v.opts.regtest_mode.is_some(),
+            coinbase_pool: Some(coinbase_pool),
         };
         // Build the live handle (returned to the caller + stored for the
         // env's probes). The concrete backend isn't retained, so capture
@@ -367,6 +377,7 @@ impl TestEnv {
             inner: Arc::downgrade(&self.inner),
             component_id: id,
             regtest: i.opts.regtest_mode.is_some(),
+            coinbase_pool: None,
         };
         let handle = i.backend.into_handle(plumbing);
         let label = handle.label();
@@ -400,6 +411,7 @@ impl TestEnv {
             inner: Arc::downgrade(&self.inner),
             component_id: id,
             regtest: w.opts.regtest_mode.is_some(),
+            coinbase_pool: None,
         };
         let handle = w.backend.into_handle(plumbing);
         let nu_ceiling = match w.opts.image {

@@ -142,6 +142,16 @@ const TEST_WALLET_BIRTHDAY: u32 = 1;
 /// the freshly mined coinbase blocks that fund the faucet.
 const FAUCET_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Regtest coinbase maturity: a coinbase reward is spendable
+/// `COINBASE_MATURITY` blocks after it is mined. A transparent-coinbase
+/// faucet must mine this many extra blocks before its funds are spendable;
+/// a shielded coinbase (Orchard/Sapling) is spendable immediately.
+const COINBASE_MATURITY: u32 = 100;
+
+/// Longer confirm timeout for the transparent-maturity path, which mines
+/// ~100 extra blocks.
+const FAUCET_MATURITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Zingo-specific conveniences on the wallet handle. ztest ships the well-
 /// known regtest seeds, so a test gets a funded faucet or a fresh recipient
 /// without naming a mnemonic.
@@ -232,20 +242,25 @@ impl ZingoWallet {
     }
 
     /// A synced faucet holding at least `notes` independent spendable
-    /// shielded notes.
+    /// shielded notes, funded from the validator's coinbase. The funding
+    /// path depends on the pool the validator mines its coinbase into (see
+    /// [`Validator::mine_to`](crate::component::Validator::mine_to)):
     ///
-    /// Both ztest validators mine their coinbase straight into a shielded
-    /// pool (zebrad → Orchard, zcashd → Sapling). A shielded coinbase note
-    /// is spendable as soon as it is mined and synced — the 100-confirmation
-    /// maturity rule applies only to *transparent* coinbase — and each block
-    /// produces exactly one such note. So funding is just "mine `notes`
-    /// blocks": no maturation wait, no shielding round. The `notes` blocks
-    /// give `notes` independent notes, so a test can issue that many
-    /// back-to-back sends without one spending another's unconfirmed change.
+    /// - **Shielded coinbase** (zcashd → Sapling): a shielded coinbase note
+    ///   is spendable the moment it is mined and synced, and each block
+    ///   yields one — so funding is just "mine `notes` blocks", with no
+    ///   maturity wait and no shield round.
+    /// - **Transparent coinbase** (zebrad → Transparent): a transparent
+    ///   coinbase is subject to [`COINBASE_MATURITY`], and zingo cannot
+    ///   *spend* one directly — only *shield* it. So mature the coinbase,
+    ///   then shield it into Orchard, once per requested note. Each shield
+    ///   consolidates the currently-matured transparent coinbase into one
+    ///   independent Orchard note; a fresh `COINBASE_MATURITY` batch is
+    ///   matured before every shield so each note is independent. This
+    ///   mirrors the upstream dev funding flow (`vec![100; rounds]`).
     ///
-    /// Panics if the validator mines a transparent coinbase — that would
-    /// need the legacy mature-then-shield funding, which ztest no longer
-    /// performs (no shipped backend mines transparent).
+    /// `notes` independent notes let a test issue that many back-to-back
+    /// sends without one spending another's unconfirmed change.
     pub async fn funded_faucet_with_notes<V, I>(
         &self,
         validator: &V,
@@ -256,29 +271,94 @@ impl ZingoWallet {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        let pool = validator.pool_support().coinbase;
-        assert!(
-            matches!(pool, Pool::Orchard | Pool::Sapling),
-            "funded_faucet: validator mines a {pool:?} coinbase, but only shielded \
-             coinbase (Orchard/Sapling) funding is supported — a transparent coinbase \
-             would need the legacy mature-then-shield ritual"
-        );
-
         let faucet = self.faucet(validator, indexer).await?;
-        // One shielded coinbase note per block; mine `notes` of them. Wait
-        // for the indexer to surface the new tip before syncing, so the
-        // faucet's first sync already sees every funding note (under
-        // parallel-test load the indexer can lag the validator).
-        if notes > 0 {
-            let pre = validator.chain_height().await?;
-            validator.generate_blocks(notes).await?;
-            indexer
-                .wait_for_block_num(pre + notes, FAUCET_CONFIRM_TIMEOUT)
-                .await?;
+        match validator.pool_support().coinbase {
+            // Shielded coinbase: one spendable note per mined block.
+            Pool::Orchard | Pool::Sapling => {
+                mine_and_sync(validator, indexer, &faucet, notes, FAUCET_CONFIRM_TIMEOUT).await?;
+            }
+            // Transparent coinbase: mature, then shield into Orchard.
+            Pool::Transparent => {
+                fund_via_shield(validator, indexer, &faucet, notes.max(1)).await?;
+            }
         }
-        faucet.sync().await?;
         Ok(faucet)
     }
+}
+
+/// Mine `n` blocks, wait for the indexer to surface the new tip, then sync
+/// `faucet`. No-op when `n == 0`. Waiting for the indexer before syncing
+/// means the faucet's sync already sees every new note (under parallel-test
+/// load the indexer can lag the validator).
+async fn mine_and_sync<V, I>(
+    validator: &V,
+    indexer: &I,
+    faucet: &Account<ZingoWallet>,
+    n: u32,
+    timeout: std::time::Duration,
+) -> Result<(), RpcError>
+where
+    V: ValidatorBackend + ?Sized,
+    I: IndexerBackend + ?Sized,
+{
+    if n == 0 {
+        return Ok(());
+    }
+    let pre = validator.chain_height().await?;
+    validator.generate_blocks(n).await?;
+    indexer.wait_for_block_num(pre + n, timeout).await?;
+    faucet.sync().await?;
+    Ok(())
+}
+
+/// Fund `faucet` from a *transparent* coinbase: mature it, then shield into
+/// Orchard `notes` times for `notes` independent Orchard notes. zingo can
+/// shield a transparent coinbase but cannot spend one directly, so a direct
+/// send would see a zero balance — the shield is mandatory. Mirrors the
+/// upstream dev funding flow (mine → sync → shield).
+async fn fund_via_shield<V, I>(
+    validator: &V,
+    indexer: &I,
+    faucet: &Account<ZingoWallet>,
+    notes: u32,
+) -> Result<(), RpcError>
+where
+    V: ValidatorBackend + ?Sized,
+    I: IndexerBackend + ?Sized,
+{
+    // Mature a fresh transparent-coinbase batch before *each* shield, so
+    // every shield consolidates a distinct, independent set of matured
+    // coinbase into its own Orchard note. This mirrors the upstream dev
+    // funding flow, which mined a full `COINBASE_MATURITY` batch per shield
+    // round (`shield_faucet_rounds(.., &vec![100; rounds], 1)`); mining only
+    // one block between shields left the faucet re-spending an already-shielded
+    // coinbase, so the second shield's transaction conflicted and never
+    // entered the mempool.
+    //
+    // The FIRST round mines only the deficit to maturity: a cold chain mines
+    // the full `COINBASE_MATURITY + 1`, while a chain-cache booted past
+    // maturity (see `Validator::with_regtest_cache`) mines nothing and only
+    // re-syncs. Subsequent rounds always mine a fresh `COINBASE_MATURITY`
+    // batch.
+    for i in 0..notes {
+        let blocks = if i == 0 {
+            let height = u32::from(validator.chain_height().await?);
+            (COINBASE_MATURITY + 1).saturating_sub(height)
+        } else {
+            COINBASE_MATURITY
+        };
+        if blocks == 0 {
+            // Cached chain already matured — `mine_and_sync` would no-op, so
+            // sync here to surface the matured coinbase before shielding.
+            faucet.sync().await?;
+        } else {
+            mine_and_sync(validator, indexer, faucet, blocks, FAUCET_MATURITY_TIMEOUT).await?;
+        }
+        faucet.shield().await?;
+    }
+    // Confirm the final shield so its Orchard note is spendable.
+    mine_and_sync(validator, indexer, faucet, 1, FAUCET_CONFIRM_TIMEOUT).await?;
+    Ok(())
 }
 
 #[async_trait]

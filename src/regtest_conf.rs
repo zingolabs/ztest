@@ -351,7 +351,11 @@ minetolocalwallet=0
 #[derive(Debug, Clone, Copy)]
 pub struct ZebradPersistentState<'a> {
     pub cache_dir: &'a str,
-    pub indexer_listen_port: u16,
+    /// Indexer gRPC port for a colocated StateService syncer. `None`
+    /// persists state to `cache_dir` without serving the indexer gRPC —
+    /// the chain-cache case, where state is loaded from an archive and no
+    /// StateService shares the DB.
+    pub indexer_listen_port: Option<u16>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,11 +373,8 @@ pub fn zebrad_conf(
     // The indexer gRPC and persistent state are both opt-in via
     // `persistent`; with `None` zebrad keeps the default ephemeral state
     // and serves no indexer gRPC.
-    let indexer_line = match &persistent {
-        Some(p) => format!(
-            "\nindexer_listen_addr = \"0.0.0.0:{}\"",
-            p.indexer_listen_port
-        ),
+    let indexer_line = match persistent.and_then(|p| p.indexer_listen_port) {
+        Some(port) => format!("\nindexer_listen_addr = \"0.0.0.0:{port}\""),
         None => String::new(),
     };
     let state_block = match &persistent {
@@ -704,5 +705,51 @@ mod tests {
             ORCHARD_MINER_ADDRESS,
         );
         assert!(toml.contains(&format!("miner_address = \"{ORCHARD_MINER_ADDRESS}\"")));
+    }
+
+    #[test]
+    fn zebrad_conf_persistent_with_indexer_emits_cache_dir_and_indexer_line() {
+        let v: Semver = "5.1.1".parse().unwrap();
+        let toml = zebrad_conf(
+            v,
+            &regtest_test_activation_heights(),
+            28232,
+            18233,
+            &[],
+            &[],
+            None,
+            Some(ZebradPersistentState {
+                cache_dir: "/shared/zebra-db",
+                indexer_listen_port: Some(8233),
+            }),
+            MINER_ADDRESS,
+        );
+        assert!(toml.contains("ephemeral = false"));
+        assert!(toml.contains("cache_dir = \"/shared/zebra-db\""));
+        assert!(toml.contains("indexer_listen_addr = \"0.0.0.0:8233\""));
+    }
+
+    #[test]
+    fn zebrad_conf_chain_cache_persists_without_indexer() {
+        // The chain-cache path persists state to load a pre-mined chain
+        // but runs no StateService, so it must NOT emit the indexer line.
+        let v: Semver = "5.1.1".parse().unwrap();
+        let toml = zebrad_conf(
+            v,
+            &regtest_test_activation_heights(),
+            28232,
+            18233,
+            &[],
+            &[],
+            None,
+            Some(ZebradPersistentState {
+                cache_dir: "/var/cache/zebrad",
+                indexer_listen_port: None,
+            }),
+            MINER_ADDRESS,
+        );
+        assert!(toml.contains("ephemeral = false"));
+        assert!(toml.contains("cache_dir = \"/var/cache/zebrad\""));
+        assert!(!toml.contains("indexer_listen_addr"));
     }
 }
