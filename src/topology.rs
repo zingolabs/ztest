@@ -52,11 +52,31 @@ impl NetworkUpgrade {
     pub const HIGHEST: NetworkUpgrade = NetworkUpgrade::Nu7;
 }
 
-/// Interop with `zcash_protocol::consensus::NetworkUpgrade`.
-impl From<NetworkUpgrade> for zcash_protocol::consensus::NetworkUpgrade {
-    fn from(nu: NetworkUpgrade) -> Self {
+/// A topology [`NetworkUpgrade`] that has no representation in the stable
+/// `zcash_protocol::consensus::NetworkUpgrade`. Today only [`NetworkUpgrade::Nu7`]:
+/// upstream gates its `Nu7` variant behind `--cfg zcash_unstable="nu7"`, a
+/// viral, consensus-affecting flag we deliberately don't enable, so the
+/// variant cannot even be named here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "network upgrade {0:?} has no zcash_protocol representation without the \
+     `zcash_unstable = \"nu7\"` cfg"
+)]
+pub struct UnsupportedNetworkUpgrade(pub NetworkUpgrade);
+
+/// Best-effort interop with `zcash_protocol::consensus::NetworkUpgrade`.
+///
+/// Partial by nature: ztest's enum is a stable superset that carries
+/// [`NetworkUpgrade::Nu7`], which upstream cannot represent without the
+/// `zcash_unstable="nu7"` cfg. `TryFrom` (not `From`) makes that partiality
+/// explicit at the type level — the `Nu7` arm returns [`UnsupportedNetworkUpgrade`]
+/// rather than naming a variant that doesn't compile on stable.
+impl TryFrom<NetworkUpgrade> for zcash_protocol::consensus::NetworkUpgrade {
+    type Error = UnsupportedNetworkUpgrade;
+
+    fn try_from(nu: NetworkUpgrade) -> Result<Self, Self::Error> {
         use zcash_protocol::consensus::NetworkUpgrade as Up;
-        match nu {
+        Ok(match nu {
             NetworkUpgrade::Overwinter => Up::Overwinter,
             NetworkUpgrade::Sapling => Up::Sapling,
             NetworkUpgrade::Blossom => Up::Blossom,
@@ -66,11 +86,8 @@ impl From<NetworkUpgrade> for zcash_protocol::consensus::NetworkUpgrade {
             NetworkUpgrade::Nu6 => Up::Nu6,
             NetworkUpgrade::Nu6_1 => Up::Nu6_1,
             NetworkUpgrade::Nu6_2 => Up::Nu6_2,
-            NetworkUpgrade::Nu7 => panic!(
-                "topology NU Nu7 cannot be converted to zcash_protocol NU without \
-                 the `zcash_unstable = \"nu7\"` cfg enabled"
-            ),
-        }
+            NetworkUpgrade::Nu7 => return Err(UnsupportedNetworkUpgrade(nu)),
+        })
     }
 }
 
@@ -100,10 +117,23 @@ pub fn zcashd_ceiling(v: Semver) -> NetworkUpgrade {
     }
 }
 
+/// Version at which zaino gains NU6.2 decode support.
+///
+/// **PLACEHOLDER.** zaino has not shipped NU6.2 support as of this writing,
+/// so this is an unreachable sentinel (`u16::MAX`) — no real version
+/// satisfies it, so [`zaino_ceiling`] never returns [`NetworkUpgrade::Nu6_2`]
+/// today. When that release lands, replace this with the real version; the
+/// `zaino_*` tests below should be extended with a case that exercises the
+/// new ceiling so this constant can't quietly go stale.
+const ZAINO_NU6_2_RELEASE: Semver = Semver {
+    major: u16::MAX,
+    minor: 0,
+    patch: 0,
+};
+
 /// zaino capability ceiling.
 pub fn zaino_ceiling(v: Semver) -> NetworkUpgrade {
-    let nu6_2_release = sv(u16::MAX, 0, 0);
-    if v >= nu6_2_release {
+    if v >= ZAINO_NU6_2_RELEASE {
         NetworkUpgrade::Nu6_2
     } else if v >= sv(0, 3, 0) {
         NetworkUpgrade::Nu6_1
@@ -164,6 +194,22 @@ mod tests {
 
     fn parse(v: &str) -> Semver {
         v.parse().expect("valid semver")
+    }
+
+    #[test]
+    fn stable_nus_convert_to_zcash_protocol() {
+        use zcash_protocol::consensus::NetworkUpgrade as Up;
+        assert_eq!(Up::try_from(NetworkUpgrade::Nu5), Ok(Up::Nu5));
+        assert_eq!(Up::try_from(NetworkUpgrade::Nu6_2), Ok(Up::Nu6_2));
+    }
+
+    #[test]
+    fn nu7_has_no_zcash_protocol_representation() {
+        use zcash_protocol::consensus::NetworkUpgrade as Up;
+        assert_eq!(
+            Up::try_from(NetworkUpgrade::Nu7),
+            Err(UnsupportedNetworkUpgrade(NetworkUpgrade::Nu7)),
+        );
     }
 
     #[test]

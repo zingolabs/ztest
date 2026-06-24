@@ -76,15 +76,17 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
 
     /// Apply this backend's regtest-time, height-dependent mounts /
     /// flags to a `ComponentOpts`. Called from `env.build()` after the
-    /// topology resolver has chosen `activation`. Default: no-op.
+    /// topology resolver has chosen `activation`. Returns
+    /// [`EnvError::Config`](crate::EnvError::Config) for invalid
+    /// configuration (e.g. an unparseable pinned version). Default: no-op.
     fn materialize_regtest_opts(
         &self,
         opts: ComponentOpts,
         activation: &ActivationHeights,
         peers: &[(String, u16)],
-    ) -> ComponentOpts {
+    ) -> Result<ComponentOpts, EnvError> {
         let _ = (activation, peers);
-        opts
+        Ok(opts)
     }
 }
 

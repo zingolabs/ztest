@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use zingo_common_components::protocol::ActivationHeights;
 
 use crate::handles::client::{
@@ -14,6 +14,7 @@ use crate::handles::validator::{
     PoolSupport, ValidatorBackend, ValidatorConfig,
 };
 use crate::handles::wallet::Pool;
+use crate::component::ComponentBuilder;
 use crate::handles::{Endpoint, HandleInner};
 use crate::protocol::zcash_rpc::ZcashRpc;
 use crate::topology::{self, NetworkUpgrade};
@@ -21,6 +22,11 @@ use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zcashd";
 
+// Fixed HTTP Basic Auth credentials for zcashd's regtest JSON-RPC. NOT a
+// secret: zcashd rejects unauthed calls, so ztest writes these same
+// throwaway values into the generated regtest `zcash.conf` (`rpcuser`/
+// `rpcpassword`) and presents them here. The node is reachable only inside
+// the test's ephemeral namespace.
 pub(crate) const RPC_USER: &str = "test";
 pub(crate) const RPC_PASSWORD: &str = "test";
 
@@ -90,11 +96,13 @@ impl ValidatorConfig for ZcashdBackend {
         mut opts: crate::component::ComponentOpts,
         activation: &ActivationHeights,
         _peers: &[(String, u16)],
-    ) -> crate::component::ComponentOpts {
+    ) -> Result<crate::component::ComponentOpts, EnvError> {
         let version = opts
             .version
             .parse::<crate::regtest_conf::Semver>()
-            .expect("zcashd version on Validator builder must be a valid semver");
+            .map_err(|_| EnvError::Config {
+                reason: format!("zcashd version {:?} is not valid semver", opts.version),
+            })?;
         let conf = crate::regtest_conf::zcashd_conf(
             version,
             activation,
@@ -112,7 +120,7 @@ impl ValidatorConfig for ZcashdBackend {
         // transparent mature-then-shield ritual, so a chain cache buys
         // nothing here. The opt exists for the generic `Validator<B>` test
         // helpers, where zebrad consumes it and zcashd no-ops.
-        opts
+        Ok(opts)
     }
 }
 
@@ -167,7 +175,7 @@ impl ValidatorBackend for ZcashdValidator {
         // would 401 and burn the whole timeout budget.
         let ep = self.plumbing.endpoint("rpc").await?;
         let client = json_rpc_with_basic_auth(&ep, RPC_USER, RPC_PASSWORD);
-        wait_for_rpc_ready(&client, ep.socket_addr(), timeout, "getinfo", "[]")
+        wait_for_rpc_ready(&client, ep.socket_addr(), timeout, "getinfo", &json!([]))
             .await
             .map_err(|e| {
                 RpcError::timeout(
@@ -182,7 +190,7 @@ impl ValidatorBackend for ZcashdValidator {
     async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError> {
         let client = self.rpc_client().await?;
         let _: Value = client
-            .json_result_from_call("generate", format!("[{n}]"))
+            .json_result_from_call("generate", &json!([n]))
             .await
             .map_err(|e| RpcError::backend_boxed(COMPONENT, "generate", e))?;
         self.chain_height().await
@@ -333,7 +341,7 @@ impl crate::regtest::Regtest for crate::component::Validator<ZcashdBackend> {
     }
 }
 
-const RPC_PORT: u16 = 28232;
+const RPC_PORT: u16 = crate::handles::ports::ZCASHD_RPC;
 
 // ──────────────────── zcashd-only typed JSON-RPC views ─────────────────
 //
@@ -358,9 +366,8 @@ impl ZcashdValidator {
     /// `getblockdeltas <hash>` — zcashd-only RPC.
     pub async fn get_block_deltas(&self, hash: &str) -> Result<Value, RpcError> {
         let client = self.rpc_client().await?;
-        let params = format!(r#"["{hash}"]"#);
         client
-            .json_result_from_call("getblockdeltas", params)
+            .json_result_from_call("getblockdeltas", &json!([hash]))
             .await
             .map_err(|e| RpcError::backend_boxed(COMPONENT, "getblockdeltas", e))
     }

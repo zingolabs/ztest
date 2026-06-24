@@ -69,6 +69,14 @@ pub enum EnvError {
     #[error("TestEnv was dropped or torn down; handle is no longer usable")]
     EnvDropped,
 
+    /// A handle referenced a component id the (live, built) env has no
+    /// record of. Every issued handle's component is registered during
+    /// `build`, so this is an internal invariant violation rather than a
+    /// user error — distinct from [`EnvDropped`](Self::EnvDropped), where
+    /// the env is gone entirely.
+    #[error("internal error: no component registered for handle id {id}")]
+    UnknownComponent { id: u64 },
+
     #[error(transparent)]
     Transient(Box<dyn StdError + Send + Sync>),
 }

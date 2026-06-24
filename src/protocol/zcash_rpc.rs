@@ -25,7 +25,7 @@
 //! format is stable, and owning it leaves the transport + error
 //! attribution under ztest's control.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
 use zingo_common_components::protocol::ActivationHeights;
@@ -93,13 +93,13 @@ impl<'a> ZcashRpc<'a> {
 
     /// `getblockchaininfo.blocks` → current chain-tip height.
     pub async fn chain_height(&self) -> Result<BlockHeight, RpcError> {
-        let v = self.call("getblockchaininfo", "[]").await?;
+        let v = self.call("getblockchaininfo", json!([])).await?;
         self.parse_height("getblockchaininfo", &v, "blocks")
     }
 
     /// `getblockchaininfo.upgrades` → typed [`ActivationHeights`].
     pub async fn activation_heights(&self) -> Result<ActivationHeights, RpcError> {
-        let v = self.call("getblockchaininfo", "[]").await?;
+        let v = self.call("getblockchaininfo", json!([])).await?;
         let upgrades = v
             .get("upgrades")
             .and_then(Value::as_object)
@@ -109,7 +109,7 @@ impl<'a> ZcashRpc<'a> {
 
     /// `getblockchaininfo.{blocks,bestblockhash}` → tip.
     pub async fn tip(&self) -> Result<BlockTip, RpcError> {
-        let v = self.call("getblockchaininfo", "[]").await?;
+        let v = self.call("getblockchaininfo", json!([])).await?;
         let height = self.parse_height("getblockchaininfo", &v, "blocks")?;
         let hash = self.parse_hash_field("getblockchaininfo", &v, "bestblockhash")?;
         Ok((height, hash))
@@ -117,7 +117,7 @@ impl<'a> ZcashRpc<'a> {
 
     /// `getbestblockhash` → tip block hash.
     pub async fn best_block_hash(&self) -> Result<BlockHash, RpcError> {
-        let v = self.call("getbestblockhash", "[]").await?;
+        let v = self.call("getbestblockhash", json!([])).await?;
         let hex_str = v
             .as_str()
             .ok_or_else(|| self.decode_err("getbestblockhash", "expected string"))?;
@@ -126,7 +126,7 @@ impl<'a> ZcashRpc<'a> {
 
     /// `getblockcount` → current block count.
     pub async fn block_count(&self) -> Result<BlockHeight, RpcError> {
-        let v = self.call("getblockcount", "[]").await?;
+        let v = self.call("getblockcount", json!([])).await?;
         v.as_u64()
             .and_then(|h| u32::try_from(h).ok())
             .map(BlockHeight::from)
@@ -137,7 +137,7 @@ impl<'a> ZcashRpc<'a> {
     /// `zcashd` accept a stringified height as the first parameter.
     pub async fn get_block(&self, height: BlockHeight) -> Result<BlockTip, RpcError> {
         let v = self
-            .call("getblock", &format!(r#"["{}", 1]"#, u32::from(height)))
+            .call("getblock", json!([u32::from(height).to_string(), 1]))
             .await?;
         self.parse_block(v)
     }
@@ -148,15 +148,13 @@ impl<'a> ZcashRpc<'a> {
     /// works directly.
     pub async fn get_block_by_hash(&self, hash: &BlockHash) -> Result<BlockTip, RpcError> {
         let hex_str = hex::encode(hash.0);
-        let v = self
-            .call("getblock", &format!(r#"["{hex_str}", 1]"#))
-            .await?;
+        let v = self.call("getblock", json!([hex_str, 1])).await?;
         self.parse_block(v)
     }
 
     /// `getmempoolinfo` → typed [`MempoolInfo`].
     pub async fn mempool_info(&self) -> Result<MempoolInfo, RpcError> {
-        let v = self.call("getmempoolinfo", "[]").await?;
+        let v = self.call("getmempoolinfo", json!([])).await?;
         Ok(MempoolInfo {
             size: self.parse_u64("getmempoolinfo", &v, "size")?,
             bytes: self.parse_u64("getmempoolinfo", &v, "bytes")?,
@@ -166,7 +164,7 @@ impl<'a> ZcashRpc<'a> {
 
     /// `getblockchaininfo` → typed [`BlockchainInfo`].
     pub async fn blockchain_info(&self) -> Result<BlockchainInfo, RpcError> {
-        let v = self.call("getblockchaininfo", "[]").await?;
+        let v = self.call("getblockchaininfo", json!([])).await?;
         Ok(BlockchainInfo {
             chain: self.parse_string("getblockchaininfo", &v, "chain")?,
             blocks: self.parse_height("getblockchaininfo", &v, "blocks")?,
@@ -185,7 +183,7 @@ impl<'a> ZcashRpc<'a> {
     /// shared across `zebrad` and `zcashd`; per-peer extras (banscore,
     /// syncedheaders, etc.) remain reachable via [`Self::call_raw`].
     pub async fn peer_info(&self) -> Result<PeerInfo, RpcError> {
-        let v = self.call("getpeerinfo", "[]").await?;
+        let v = self.call("getpeerinfo", json!([])).await?;
         let arr = v
             .as_array()
             .ok_or_else(|| self.decode_err("getpeerinfo", "expected array"))?;
@@ -201,7 +199,7 @@ impl<'a> ZcashRpc<'a> {
     /// from Canopy), so this is intentionally untyped — callers project
     /// the fields they need.
     pub async fn block_subsidy(&self, height: BlockHeight) -> Result<Value, RpcError> {
-        self.call("getblocksubsidy", &format!("[{}]", u32::from(height)))
+        self.call("getblocksubsidy", json!([u32::from(height)]))
             .await
     }
 
@@ -211,21 +209,21 @@ impl<'a> ZcashRpc<'a> {
     /// untyped so callers can branch on the parity-test shape they
     /// want.
     pub async fn block_header(&self, hash: &str, verbose: bool) -> Result<Value, RpcError> {
-        self.call("getblockheader", &format!(r#"["{hash}", {verbose}]"#))
+        self.call("getblockheader", json!([hash, verbose]))
             .await
     }
 
     /// Escape hatch for RPCs not yet modelled by a typed method. Prefer
     /// the typed methods above when one fits.
-    pub async fn call_raw(&self, method: &'static str, params: &str) -> Result<Value, RpcError> {
+    pub async fn call_raw(&self, method: &'static str, params: Value) -> Result<Value, RpcError> {
         self.call(method, params).await
     }
 
     // ── private helpers ────────────────────────────────────────────────
 
-    async fn call(&self, op: &'static str, params: &str) -> Result<Value, RpcError> {
+    async fn call(&self, op: &'static str, params: Value) -> Result<Value, RpcError> {
         self.client
-            .json_result_from_call(op, params.to_string())
+            .json_result_from_call(op, &params)
             .await
             .map_err(|e| RpcError::backend_boxed(self.component, op, e))
     }

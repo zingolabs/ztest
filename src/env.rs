@@ -31,12 +31,15 @@ use crate::topology::NetworkUpgrade;
 /// `add_validator` so the build-time topology resolver can apply it once
 /// the activation heights are known — without retaining the concrete
 /// backend or a dyn-erased config trait.
-type RegtestMaterializeFn =
-    Box<dyn FnOnce(ComponentOpts, &ActivationHeights, &[(String, u16)]) -> ComponentOpts + Send>;
+type RegtestMaterializeFn = Box<
+    dyn FnOnce(ComponentOpts, &ActivationHeights, &[(String, u16)]) -> Result<ComponentOpts, EnvError>
+        + Send,
+>;
 
 /// Config-time regtest materialization for an indexer (takes the
 /// validator host resolved at build time). Captured at `add_indexer`.
-type IndexerMaterializeFn = Box<dyn FnOnce(ComponentOpts, Option<&str>) -> ComponentOpts + Send>;
+type IndexerMaterializeFn =
+    Box<dyn FnOnce(ComponentOpts, Option<&str>) -> Result<ComponentOpts, EnvError> + Send>;
 use crate::manifest::{self, PodSpec};
 use crate::mounts::{self, ResolvedMount};
 use crate::naming::{self, RunCoords};
@@ -83,7 +86,6 @@ pub(crate) struct EnvInner {
     pub(crate) forwards: ForwardRegistry,
     pub(crate) shadow_clones: std::sync::Mutex<Vec<ShadowClone>>,
     pub(crate) is_built: AtomicBool,
-    pub(crate) ready_timeout: Duration,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -100,7 +102,7 @@ impl std::fmt::Debug for EnvInner {
 }
 
 impl EnvInner {
-    fn new(ready_timeout: Duration) -> Self {
+    fn new() -> Self {
         EnvInner {
             client: OnceLock::new(),
             namespace: std::sync::Mutex::new(None),
@@ -109,7 +111,6 @@ impl EnvInner {
             forwards: Arc::new(Mutex::new(HashMap::new())),
             shadow_clones: std::sync::Mutex::new(Vec::new()),
             is_built: AtomicBool::new(false),
-            ready_timeout,
         }
     }
 
@@ -119,7 +120,9 @@ impl EnvInner {
 
     pub(crate) async fn component_state(&self, id: u64) -> Result<ComponentState, EnvError> {
         let map = self.components.read().await;
-        map.get(&id).cloned().ok_or(EnvError::EnvDropped)
+        map.get(&id)
+            .cloned()
+            .ok_or(EnvError::UnknownComponent { id })
     }
 
     pub(crate) async fn resolve_named(
@@ -261,6 +264,11 @@ pub struct TestEnv {
     pending_wallets: Vec<PendingWallet>,
     pending_shared_volumes: Vec<String>,
     next_id: u64,
+    /// Per-component readiness/RPC-probe budget applied during
+    /// [`build`](Self::build). A plain build-time knob — set it any time
+    /// before `build` via [`ready_timeout`](Self::ready_timeout); it never
+    /// touches the shared [`EnvInner`], so issued handles are unaffected.
+    ready_timeout: Duration,
 }
 
 impl std::fmt::Debug for TestEnv {
@@ -279,23 +287,22 @@ impl TestEnv {
 
     pub fn builder() -> Self {
         Self {
-            inner: Arc::new(EnvInner::new(Self::DEFAULT_READY_TIMEOUT)),
+            inner: Arc::new(EnvInner::new()),
             pending_validators: Vec::new(),
             pending_indexers: Vec::new(),
             pending_wallets: Vec::new(),
             pending_shared_volumes: Vec::new(),
             next_id: 0,
+            ready_timeout: Self::DEFAULT_READY_TIMEOUT,
         }
     }
 
+    /// Override the per-component readiness/RPC-probe budget used during
+    /// [`build`](Self::build). Order-independent — may be called before or
+    /// after `add_*`, since it sets a plain field rather than rebuilding
+    /// the shared env state.
     pub fn ready_timeout(mut self, timeout: Duration) -> Self {
-        assert!(
-            self.pending_validators.is_empty()
-                && self.pending_indexers.is_empty()
-                && self.pending_wallets.is_empty(),
-            "ready_timeout must be called before add_validator/add_indexer/add_wallet",
-        );
-        self.inner = Arc::new(EnvInner::new(timeout));
+        self.ready_timeout = timeout;
         self
     }
 
@@ -426,6 +433,11 @@ impl TestEnv {
     }
 
     fn validate_topology(&self) -> Result<(), EnvError> {
+        // Deliberate v1 caps, not fundamental limits. The build wiring
+        // resolves a single validator host (`materialize_regtest_configs`
+        // takes `pending_validators…next()`) and the typed handles assume
+        // at most a primary/secondary indexer pair and one in-process
+        // wallet. Lift these alongside multi-validator topology support.
         if self.pending_indexers.len() > 2 {
             return Err(EnvError::Config {
                 reason: format!(
@@ -460,7 +472,7 @@ impl TestEnv {
         Ok(())
     }
 
-    fn materialize_regtest_configs(&mut self) {
+    fn materialize_regtest_configs(&mut self) -> Result<(), EnvError> {
         use crate::component::RegtestMode;
         use crate::topology::{activation_heights_for_ceiling, resolve_ceiling};
 
@@ -490,11 +502,13 @@ impl TestEnv {
         for p in &self.pending_validators {
             if let Some(RegtestMode::ActivateThrough(requested)) = &p.opts.regtest_mode {
                 if *requested > resolved {
-                    panic!(
-                        "validator {:?} requested NU ceiling {:?}, but topology only \
-                         supports up to {:?} (one or more pinned components is too old)",
-                        p.opts.name, requested, resolved
-                    );
+                    return Err(EnvError::Config {
+                        reason: format!(
+                            "validator {:?} requested NU ceiling {:?}, but topology only \
+                             supports up to {:?} (one or more pinned components is too old)",
+                            p.opts.name, requested, resolved
+                        ),
+                    });
                 }
                 ceiling = ceiling.max(*requested);
             }
@@ -512,36 +526,37 @@ impl TestEnv {
             .iter()
             .map(|p| pod_name_of(&p.opts))
             .collect();
-        let peer_tuples_for = |opts: &ComponentOpts| -> Vec<(String, u16)> {
+        let peer_tuples_for = |opts: &ComponentOpts| -> Result<Vec<(String, u16)>, EnvError> {
             opts.peers
                 .iter()
                 .map(|name| {
                     let host = short_kind(name);
                     if !known_validators.contains(&host) {
-                        panic!(
-                            "validator peer {name:?} not found in this env's \
-                             topology (known: {known_validators:?})"
-                        );
+                        return Err(EnvError::Config {
+                            reason: format!(
+                                "validator peer {name:?} not found in this env's \
+                                 topology (known: {known_validators:?})"
+                            ),
+                        });
                     }
-                    (host, p2p_port)
+                    Ok((host, p2p_port))
                 })
                 .collect()
         };
 
         // Validators: dispatch through backend trait method.
         let pending = std::mem::take(&mut self.pending_validators);
-        self.pending_validators = pending
-            .into_iter()
-            .map(|mut p| {
-                if p.opts.regtest_mode.is_some() {
-                    if let Some(materialize) = p.materialize.take() {
-                        let peers = peer_tuples_for(&p.opts);
-                        p.opts = materialize(p.opts, &activation, &peers);
-                    }
+        let mut materialized = Vec::with_capacity(pending.len());
+        for mut p in pending {
+            if p.opts.regtest_mode.is_some() {
+                if let Some(materialize) = p.materialize.take() {
+                    let peers = peer_tuples_for(&p.opts)?;
+                    p.opts = materialize(p.opts, &activation, &peers)?;
                 }
-                p
-            })
-            .collect();
+            }
+            materialized.push(p);
+        }
+        self.pending_validators = materialized;
 
         let validator_host = self
             .pending_validators
@@ -549,22 +564,22 @@ impl TestEnv {
             .map(|p| pod_name_of(&p.opts))
             .next();
         let pending = std::mem::take(&mut self.pending_indexers);
-        self.pending_indexers = pending
-            .into_iter()
-            .map(|mut p| {
-                if let Some(materialize) = p.materialize.take() {
-                    p.opts = materialize(p.opts, validator_host.as_deref());
-                }
-                p
-            })
-            .collect();
+        let mut materialized = Vec::with_capacity(pending.len());
+        for mut p in pending {
+            if let Some(materialize) = p.materialize.take() {
+                p.opts = materialize(p.opts, validator_host.as_deref())?;
+            }
+            materialized.push(p);
+        }
+        self.pending_indexers = materialized;
 
         let _ = NetworkUpgrade::HIGHEST;
+        Ok(())
     }
 
     pub async fn build(&mut self) -> Result<(), EnvError> {
         self.validate_topology()?;
-        self.materialize_regtest_configs();
+        self.materialize_regtest_configs()?;
 
         let started = std::time::Instant::now();
         let coords = RunCoords::from_env().map_err(env_err)?;
@@ -690,7 +705,7 @@ impl TestEnv {
             return Ok(());
         }
 
-        let timeout = self.inner.ready_timeout;
+        let timeout = self.ready_timeout;
         let probes = validators.into_iter().map(|(pod_name, handle)| async move {
             handle
                 .ready(timeout)
@@ -762,7 +777,7 @@ impl TestEnv {
             self.inner.components.write().await.insert(*id, state);
         }
 
-        let timeout = self.inner.ready_timeout;
+        let timeout = self.ready_timeout;
         let waits = items.iter().map(|(_, spec, _, _)| {
             let pods = ctx.pods.clone();
             let name = spec.pod_name.clone();

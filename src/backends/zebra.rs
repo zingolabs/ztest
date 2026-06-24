@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use zingo_common_components::protocol::ActivationHeights;
 
 use crate::handles::client::{AuthedRpc, JsonRpcClient, json_rpc, wait_for_rpc_ready};
@@ -12,6 +12,7 @@ use crate::handles::validator::{
     PoolSupport, ValidatorBackend, ValidatorConfig,
 };
 use crate::handles::wallet::Pool;
+use crate::component::ComponentBuilder;
 use crate::handles::{Endpoint, HandleInner};
 use crate::protocol::zcash_rpc::ZcashRpc;
 use crate::topology::{self, NetworkUpgrade};
@@ -85,11 +86,13 @@ impl ValidatorConfig for ZebraBackend {
         mut opts: crate::component::ComponentOpts,
         activation: &ActivationHeights,
         peers: &[(String, u16)],
-    ) -> crate::component::ComponentOpts {
+    ) -> Result<crate::component::ComponentOpts, EnvError> {
         let version = opts
             .version
             .parse::<crate::regtest_conf::Semver>()
-            .expect("zebrad version on Validator builder must be a valid semver");
+            .map_err(|_| EnvError::Config {
+                reason: format!("zebrad version {:?} is not valid semver", opts.version),
+            })?;
 
         let default_lockbox = crate::regtest::regtest_test_lockbox_disbursements();
         let lockbox: &[crate::regtest::LockboxDisbursement] = opts
@@ -156,7 +159,7 @@ impl ValidatorConfig for ZebraBackend {
                 None => {}
             }
         }
-        opts
+        Ok(opts)
     }
 }
 
@@ -209,7 +212,7 @@ impl ValidatorBackend for ZebraValidator {
         // `getblocktemplate`; unauthed, matching `rpc_client`.
         let ep = self.plumbing.endpoint("rpc").await?;
         let client = json_rpc(&ep);
-        wait_for_rpc_ready(&client, ep.socket_addr(), timeout, "getblocktemplate", "[]")
+        wait_for_rpc_ready(&client, ep.socket_addr(), timeout, "getblocktemplate", &json!([]))
             .await
             .map_err(|e| {
                 RpcError::timeout(
@@ -231,7 +234,7 @@ impl ValidatorBackend for ZebraValidator {
         // so no client-side retry loop is needed.
         let client = self.rpc_client().await?;
         let _: Value = client
-            .json_result_from_call("generate", format!("[{n}]"))
+            .json_result_from_call("generate", &json!([n]))
             .await
             .map_err(|e| RpcError::backend_boxed(COMPONENT, "generate", e))?;
         self.chain_height().await
@@ -395,8 +398,8 @@ impl crate::regtest::Regtest for crate::component::Validator<ZebraBackend> {
 /// Container-side path the rendered `zebrad.toml` is mounted at.
 const CONTAINER_CONFIG_PATH: &str = "/etc/zebrad/zebrad.toml";
 
-/// Container-side JSON-RPC port.
-const ZEBRAD_RPC_PORT: u16 = 28232;
+/// Container-side JSON-RPC port. Sourced from the canonical port table.
+const ZEBRAD_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_RPC;
 
 impl crate::regtest::Testnet for crate::component::Validator<ZebraBackend> {
     fn testnet(self, variant: &str) -> Self {
@@ -424,7 +427,7 @@ impl crate::regtest::Testnet for crate::component::Validator<ZebraBackend> {
     }
 }
 
-const ZEBRAD_TESTNET_RPC_PORT: u16 = 18232;
+const ZEBRAD_TESTNET_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_TESTNET_RPC;
 const ZEBRAD_TESTNET_CACHE_DIR: &str = "/var/cache/zebrad";
 
 // ──────────────────── zebrad-only typed JSON-RPC views ─────────────────

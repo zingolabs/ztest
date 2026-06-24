@@ -54,9 +54,25 @@ impl AuthedRpc {
         }
     }
 
-    fn build(&self, method: &str, params: &str) -> reqwest::RequestBuilder {
-        let body =
-            format!(r#"{{"jsonrpc": "2.0", "method": "{method}", "params": {params}, "id":123 }}"#);
+    fn build(&self, method: &str, params: &Value) -> reqwest::RequestBuilder {
+        /// JSON-RPC request envelope, serialized by serde so the method
+        /// name and params are always correctly escaped — never spliced
+        /// into a format string. Always tags `"jsonrpc":"2.0"`; zcashd
+        /// (JSON-RPC 1.0) ignores the field.
+        #[derive(serde::Serialize)]
+        struct Request<'a> {
+            jsonrpc: &'static str,
+            method: &'a str,
+            params: &'a Value,
+            id: u32,
+        }
+        let body = serde_json::to_vec(&Request {
+            jsonrpc: "2.0",
+            method,
+            params,
+            id: 123,
+        })
+        .expect("serializing a JSON-RPC request envelope is infallible");
         let mut req = self
             .client
             .post(&self.url)
@@ -70,20 +86,16 @@ impl AuthedRpc {
 
     pub async fn text_from_call(
         &self,
-        method: impl AsRef<str>,
-        params: impl AsRef<str>,
+        method: &str,
+        params: &Value,
     ) -> reqwest::Result<String> {
-        self.build(method.as_ref(), params.as_ref())
-            .send()
-            .await?
-            .text()
-            .await
+        self.build(method, params).send().await?.text().await
     }
 
     pub async fn json_result_from_call<T: DeserializeOwned>(
         &self,
-        method: impl AsRef<str>,
-        params: impl AsRef<str>,
+        method: &str,
+        params: &Value,
     ) -> std::result::Result<T, BoxError> {
         let text = self.text_from_call(method, params).await?;
         // Permissive parse — accept both JSON-RPC 2.0 (zebrad, zaino:
@@ -145,12 +157,12 @@ pub async fn wait_for_rpc_ready(
     address: SocketAddr,
     timeout: Duration,
     method: &str,
-    params: &str,
+    params: &Value,
 ) -> Result<(), RpcReadinessTimeout> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match client
-            .json_result_from_call::<serde_json::Value>(method, params.to_string())
+            .json_result_from_call::<serde_json::Value>(method, params)
             .await
         {
             Ok(_) => return Ok(()),
@@ -226,31 +238,25 @@ impl JsonRpcClient {
 
     /// Issue a JSON-RPC call and deserialize the result into `T`.
     ///
-    /// `params` is interpolated raw into the request body, so it must
-    /// be a valid JSON value (typically an array like `"[]"` or
-    /// `r#"["1", 0]"#`). As a convenience for no-arg methods, an empty
-    /// or whitespace-only `params` is normalised to `"[]"` — otherwise
-    /// the request body would emit `"params": ` (no value) and the
-    /// server would return JSON-RPC `ParseError`.
+    /// `params` is a [`serde_json::Value`] — typically an array built with
+    /// the [`json!`](serde_json::json) macro, e.g. `json!([])` for a
+    /// no-arg method or `json!(["abc", 0])` for positional args. The
+    /// request envelope is serialized by serde, so values are escaped
+    /// correctly; there is no raw-string splicing.
     pub async fn call<T: DeserializeOwned>(
         &self,
         method: &'static str,
-        params: &str,
+        params: Value,
     ) -> Result<T, RpcError> {
-        let params = if params.trim().is_empty() {
-            "[]"
-        } else {
-            params
-        };
         self.inner
-            .json_result_from_call(method, params.to_string())
+            .json_result_from_call(method, &params)
             .await
             .map_err(|e| RpcError::backend_boxed(self.component, method, e))
     }
 
     /// Issue a JSON-RPC call returning the raw `serde_json::Value`.
     /// For one-off RPCs where the caller wants to pluck fields by hand.
-    pub async fn call_value(&self, method: &'static str, params: &str) -> Result<Value, RpcError> {
+    pub async fn call_value(&self, method: &'static str, params: Value) -> Result<Value, RpcError> {
         self.call(method, params).await
     }
 }

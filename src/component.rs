@@ -20,57 +20,69 @@ pub enum ComponentCategory {
 }
 
 /// A validator component, generic in its backend.
+///
+/// Fields are `pub(crate)`: build them through the constructors
+/// ([`Validator::zebrad`], [`Validator::custom`], …) and the
+/// [`ComponentBuilder`] chain methods, not by struct literal.
 #[derive(Debug, Clone)]
 pub struct Validator<B: ValidatorConfig> {
-    pub backend: B,
-    pub opts: ComponentOpts,
+    pub(crate) backend: B,
+    pub(crate) opts: ComponentOpts,
 }
 
 /// An indexer component, generic in its backend.
 #[derive(Debug, Clone)]
 pub struct Indexer<B: IndexerConfig> {
-    pub backend: B,
-    pub opts: ComponentOpts,
+    pub(crate) backend: B,
+    pub(crate) opts: ComponentOpts,
     /// Set by `.regtest()` / `.regtest_state()`. Picks the `backend =`
     /// line in the rendered TOML for zaino; ignored by other backends.
-    pub regtest_backend: Option<crate::testnet_conf::ZainodBackend>,
+    pub(crate) regtest_backend: Option<crate::testnet_conf::ZainodBackend>,
 }
 
 /// A wallet component, generic in its backend.
 #[derive(Debug, Clone)]
 pub struct Wallet<B: WalletConfig> {
-    pub backend: B,
-    pub opts: ComponentOpts,
+    pub(crate) backend: B,
+    pub(crate) opts: ComponentOpts,
 }
 
 /// Configuration shared by every component variant.
+///
+/// Fields are `pub(crate)`: construct externally via
+/// [`ComponentOpts::builder`] (for [`Validator::custom`] and friends), and
+/// mutate through the [`ComponentBuilder`] chain methods. This keeps the
+/// field set free to evolve without breaking downstream struct literals.
 #[derive(Debug, Clone, Default)]
 pub struct ComponentOpts {
-    pub name: Option<String>,
-    pub version: String,
-    pub image: crate::backends::image::ImageSpec,
-    pub mounts: Vec<Mount>,
-    pub resources: Option<Resources>,
-    pub extra_ports: Vec<(String, u16)>,
-    pub command: Option<Vec<String>>,
-    pub args: Option<Vec<String>>,
-    pub regtest_mode: Option<RegtestMode>,
-    pub peers: Vec<String>,
-    pub funding_streams: Option<crate::regtest::FundingStreams>,
-    pub lockbox_disbursements: Option<Vec<crate::regtest::LockboxDisbursement>>,
+    pub(crate) name: Option<String>,
+    pub(crate) version: String,
+    pub(crate) image: crate::backends::image::ImageSpec,
+    pub(crate) mounts: Vec<Mount>,
+    pub(crate) resources: Option<Resources>,
+    pub(crate) extra_ports: Vec<(String, u16)>,
+    pub(crate) command: Option<Vec<String>>,
+    pub(crate) args: Option<Vec<String>>,
+    /// Environment variables set on the container, in declaration order.
+    /// Set via [`ComponentBuilder::env`].
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) regtest_mode: Option<RegtestMode>,
+    pub(crate) peers: Vec<String>,
+    pub(crate) funding_streams: Option<crate::regtest::FundingStreams>,
+    pub(crate) lockbox_disbursements: Option<Vec<crate::regtest::LockboxDisbursement>>,
     /// Set when this component participates in a shared on-disk
     /// zebra-state DB (see [`crate::SharedVolume`]). On a validator it
     /// flips zebrad to persistent state at `mount_path` and turns on the
     /// indexer gRPC; on a zaino indexer it points the StateService's
     /// `zebra_db_path` at the same `mount_path`. `None` for the common
     /// pod-local (ephemeral / fetch) case.
-    pub shared_state: Option<SharedState>,
+    pub(crate) shared_state: Option<SharedState>,
     /// Which value pool this validator mines its coinbase into. `None`
     /// means "use the backend default" ([`ValidatorConfig::default_coinbase_pool`]);
     /// set explicitly via [`Validator::mine_to`]. Resolved to a concrete
     /// pool (and a regtest miner address) at `env.build()` time. Ignored
     /// for non-validator components.
-    pub coinbase_pool: Option<Pool>,
+    pub(crate) coinbase_pool: Option<Pool>,
     /// Pre-mined chain to boot this validator from, instead of a cold
     /// chain. `Archive` loads a committed chain-cache tarball; `Blank`
     /// boots fresh persistent on-disk state (used to *generate* the
@@ -78,7 +90,7 @@ pub struct ComponentOpts {
     /// coinbase-maturity mine in funded tests); a no-op on zcashd, whose
     /// shielded-coinbase funding needs no cache. `None` for the common
     /// ephemeral case.
-    pub regtest_cache: Option<RegtestCacheSource>,
+    pub(crate) regtest_cache: Option<RegtestCacheSource>,
 }
 
 /// Where a validator's pre-mined regtest chain comes from. See
@@ -99,8 +111,10 @@ pub enum RegtestCacheSource {
 /// path (sourced from a single [`crate::SharedVolume`]).
 #[derive(Debug, Clone)]
 pub struct SharedState {
-    pub claim: String,
-    pub mount_path: String,
+    /// In-pod path the shared PVC is mounted at. The PVC itself is wired in
+    /// as a `Mount::shared` at builder time, so only the path needs to ride
+    /// along here (both sharing pods address the same on-disk directory).
+    pub(crate) mount_path: String,
 }
 
 /// How a component should be configured for regtest.
@@ -110,11 +124,12 @@ pub enum RegtestMode {
     ActivateThrough(crate::topology::NetworkUpgrade),
 }
 
-/// Kubernetes-style resource requests.
+/// Kubernetes container resource *requests*, rendered into the pod spec's
+/// `resources.requests.{cpu,memory}`. Set via [`ComponentBuilder::resources`].
 #[derive(Debug, Clone)]
 pub struct Resources {
-    pub cpu: String,
-    pub memory: String,
+    pub(crate) cpu: String,
+    pub(crate) memory: String,
 }
 
 fn opts_for(version: &str, default_name: &'static str) -> ComponentOpts {
@@ -288,6 +303,131 @@ impl<B: WalletConfig> Wallet<B> {
 
 // ───────────────────────────── builders ───────────────────────────────
 
+/// The chain-style configuration methods shared by every component type
+/// (`Validator`, `Indexer`, `Wallet`) and by [`ComponentOptsBuilder`].
+///
+/// Defined once over a single `&mut ComponentOpts` hook so the six methods
+/// can't drift across the four implementors. Bring it into scope
+/// (`use ztest::prelude::*`) to call `.named(...)`, `.mount(...)`, etc.
+pub trait ComponentBuilder: Sized {
+    /// The `ComponentOpts` the chain methods mutate. Not part of the
+    /// stable surface — implementors expose it so the provided methods can
+    /// reach the shared config.
+    #[doc(hidden)]
+    fn component_opts_mut(&mut self) -> &mut ComponentOpts;
+
+    /// Set the component / pod name (used for peering and lookup).
+    fn named(mut self, name: impl Into<String>) -> Self {
+        self.component_opts_mut().name = Some(name.into());
+        self
+    }
+    /// Mount a file or directory into the component at startup.
+    fn mount(mut self, m: Mount) -> Self {
+        self.component_opts_mut().mounts.push(m);
+        self
+    }
+    /// Kubernetes CPU / memory resource requests.
+    fn resources(mut self, cpu: impl Into<String>, memory: impl Into<String>) -> Self {
+        self.component_opts_mut().resources = Some(Resources {
+            cpu: cpu.into(),
+            memory: memory.into(),
+        });
+        self
+    }
+    /// Expose an additional named container port beyond the backend
+    /// defaults.
+    fn expose(mut self, name: &str, container_port: u16) -> Self {
+        self.component_opts_mut()
+            .extra_ports
+            .push((name.to_string(), container_port));
+        self
+    }
+    /// Override the container entrypoint.
+    fn command<I, S>(mut self, argv: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.component_opts_mut().command = Some(argv.into_iter().map(Into::into).collect());
+        self
+    }
+    /// Override the container arguments.
+    fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.component_opts_mut().args = Some(args.into_iter().map(Into::into).collect());
+        self
+    }
+    /// Set an environment variable on the container. Repeated calls append;
+    /// they're rendered into the container's `env` in declaration order.
+    fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.component_opts_mut()
+            .env
+            .push((name.into(), value.into()));
+        self
+    }
+}
+
+impl<B: ValidatorConfig> ComponentBuilder for Validator<B> {
+    fn component_opts_mut(&mut self) -> &mut ComponentOpts {
+        &mut self.opts
+    }
+}
+
+impl<B: IndexerConfig> ComponentBuilder for Indexer<B> {
+    fn component_opts_mut(&mut self) -> &mut ComponentOpts {
+        &mut self.opts
+    }
+}
+
+impl<B: WalletConfig> ComponentBuilder for Wallet<B> {
+    fn component_opts_mut(&mut self) -> &mut ComponentOpts {
+        &mut self.opts
+    }
+}
+
+/// Builder for a [`ComponentOpts`] to hand to [`Validator::custom`],
+/// [`Indexer::custom`], or [`Wallet::custom`] from outside the crate (the
+/// fields are `pub(crate)`). Gets the [`ComponentBuilder`] chain methods
+/// (`named`, `mount`, …) for free; adds `version` / `image` and a terminal
+/// [`build`](Self::build).
+#[derive(Debug, Clone, Default)]
+pub struct ComponentOptsBuilder {
+    opts: ComponentOpts,
+}
+
+impl ComponentOpts {
+    /// Start building a `ComponentOpts` for a custom backend.
+    pub fn builder() -> ComponentOptsBuilder {
+        ComponentOptsBuilder::default()
+    }
+}
+
+impl ComponentBuilder for ComponentOptsBuilder {
+    fn component_opts_mut(&mut self) -> &mut ComponentOpts {
+        &mut self.opts
+    }
+}
+
+impl ComponentOptsBuilder {
+    /// Set the version string (typically an image tag).
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.opts.version = version.into();
+        self
+    }
+    /// Set the image source.
+    pub fn image(mut self, image: crate::backends::image::ImageSpec) -> Self {
+        self.opts.image = image;
+        self
+    }
+    /// Finish and return the built `ComponentOpts`.
+    pub fn build(self) -> ComponentOpts {
+        self.opts
+    }
+}
+
 impl<B: ValidatorConfig> Validator<B> {
     pub fn opts(&self) -> &ComponentOpts {
         &self.opts
@@ -318,43 +458,6 @@ impl<B: ValidatorConfig> Validator<B> {
     /// for ordinary tests — pair with [`Self::with_regtest_cache`] there.
     pub fn with_blank_persistent_state(mut self) -> Self {
         self.opts.regtest_cache = Some(RegtestCacheSource::Blank);
-        self
-    }
-    pub fn named(mut self, name: impl Into<String>) -> Self {
-        self.opts.name = Some(name.into());
-        self
-    }
-    pub fn mount(mut self, m: Mount) -> Self {
-        self.opts.mounts.push(m);
-        self
-    }
-    pub fn resources(mut self, cpu: impl Into<String>, memory: impl Into<String>) -> Self {
-        self.opts.resources = Some(Resources {
-            cpu: cpu.into(),
-            memory: memory.into(),
-        });
-        self
-    }
-    pub fn expose(mut self, name: &str, container_port: u16) -> Self {
-        self.opts
-            .extra_ports
-            .push((name.to_string(), container_port));
-        self
-    }
-    pub fn command<I, S>(mut self, argv: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.opts.command = Some(argv.into_iter().map(Into::into).collect());
-        self
-    }
-    pub fn args<I, S>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.opts.args = Some(args.into_iter().map(Into::into).collect());
         self
     }
     pub(crate) fn with_regtest_mode(mut self, mode: RegtestMode) -> Self {
@@ -401,7 +504,6 @@ impl<B: ValidatorConfig> Validator<B> {
     /// Pair with [`crate::Indexer::regtest_state_in`] on the same `vol`.
     pub fn persistent_state_in(mut self, vol: &crate::SharedVolume) -> Self {
         self.opts.shared_state = Some(SharedState {
-            claim: vol.claim().to_string(),
             mount_path: vol.mount_path().to_string(),
         });
         self.opts
@@ -415,84 +517,10 @@ impl<B: IndexerConfig> Indexer<B> {
     pub fn opts(&self) -> &ComponentOpts {
         &self.opts
     }
-    pub fn named(mut self, name: impl Into<String>) -> Self {
-        self.opts.name = Some(name.into());
-        self
-    }
-    pub fn mount(mut self, m: Mount) -> Self {
-        self.opts.mounts.push(m);
-        self
-    }
-    pub fn resources(mut self, cpu: impl Into<String>, memory: impl Into<String>) -> Self {
-        self.opts.resources = Some(Resources {
-            cpu: cpu.into(),
-            memory: memory.into(),
-        });
-        self
-    }
-    pub fn expose(mut self, name: &str, container_port: u16) -> Self {
-        self.opts
-            .extra_ports
-            .push((name.to_string(), container_port));
-        self
-    }
-    pub fn command<I, S>(mut self, argv: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.opts.command = Some(argv.into_iter().map(Into::into).collect());
-        self
-    }
-    pub fn args<I, S>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.opts.args = Some(args.into_iter().map(Into::into).collect());
-        self
-    }
 }
 
 impl<B: WalletConfig> Wallet<B> {
     pub fn opts(&self) -> &ComponentOpts {
         &self.opts
-    }
-    pub fn named(mut self, name: impl Into<String>) -> Self {
-        self.opts.name = Some(name.into());
-        self
-    }
-    pub fn mount(mut self, m: Mount) -> Self {
-        self.opts.mounts.push(m);
-        self
-    }
-    pub fn resources(mut self, cpu: impl Into<String>, memory: impl Into<String>) -> Self {
-        self.opts.resources = Some(Resources {
-            cpu: cpu.into(),
-            memory: memory.into(),
-        });
-        self
-    }
-    pub fn expose(mut self, name: &str, container_port: u16) -> Self {
-        self.opts
-            .extra_ports
-            .push((name.to_string(), container_port));
-        self
-    }
-    pub fn command<I, S>(mut self, argv: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.opts.command = Some(argv.into_iter().map(Into::into).collect());
-        self
-    }
-    pub fn args<I, S>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.opts.args = Some(args.into_iter().map(Into::into).collect());
-        self
     }
 }

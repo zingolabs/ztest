@@ -56,7 +56,8 @@ pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::ZebraValidator;
 pub use crate::backends::zingo::{FAUCET_SEED, RECIPIENT_SEED, ZingoBackend, ZingoWallet};
 pub use crate::component::{
-    ComponentCategory, ComponentOpts, Indexer, Resources, Validator, Wallet,
+    ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Indexer, Resources,
+    Validator, Wallet,
 };
 pub use crate::env::{SharedVolume, TestEnv};
 pub use crate::error::{EnvError, RpcError};
@@ -127,12 +128,13 @@ macro_rules! validator_tests {
 pub mod prelude {
     pub use super::{
         Account, AccountId, BlockHash, BlockHeight, BlockTip, BlockchainInfo, ChainConfig,
-        CompactBlock, CompactTx, Endpoint, EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer,
-        IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, MempoolInfo, Mount,
-        MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction,
-        RpcError, SendResponse, SharedVolume, ShieldedProtocol, SnapshotRef, SubtreeRoot, TestEnv,
-        Transaction, TreeState, TxId, Validator, ValidatorBackend, Wallet, WalletBackend,
-        ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator, ZingoWallet,
+        ComponentBuilder, ComponentOptsBuilder, CompactBlock, CompactTx, Endpoint, EnvError,
+        FAUCET_SEED, GetAddressUtxosReply, Indexer, IndexerBackend, JsonRpcClient, LightdInfo,
+        LightwalletdIndexer, MempoolInfo, Mount, MountKind, MountSource, Peer, PeerInfo, Pool,
+        PoolBalances, RECIPIENT_SEED, RawTransaction, RpcError, SendResponse, SharedVolume,
+        ShieldedProtocol, SnapshotRef, SubtreeRoot, TestEnv, Transaction, TreeState, TxId,
+        Validator, ValidatorBackend, Wallet, WalletBackend, ZainoIndexer, ZatBalance,
+        ZcashdValidator, ZebraValidator, ZingoWallet,
     };
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,

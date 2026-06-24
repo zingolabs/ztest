@@ -19,6 +19,7 @@ use zcash_protocol::ShieldedProtocol;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::ZatBalance;
 
+use crate::component::ComponentBuilder;
 use crate::handles::HandleInner;
 use crate::handles::client::JsonRpcClient;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
@@ -73,11 +74,16 @@ impl IndexerConfig for ZainoBackend {
         mut opts: crate::component::ComponentOpts,
         regtest_backend: Option<crate::testnet_conf::ZainodBackend>,
         validator_host: Option<&str>,
-    ) -> crate::component::ComponentOpts {
+    ) -> Result<crate::component::ComponentOpts, EnvError> {
+        // Internal invariant: the env only installs this materialize closure
+        // for regtest indexers, so `regtest_backend` is always `Some` here.
         let backend = regtest_backend
             .expect("materialize_regtest_opts called on a non-regtest zaino indexer");
-        let validator_host = validator_host
-            .expect("indexer opted in to regtest but no validator is registered in this env");
+        let validator_host = validator_host.ok_or_else(|| EnvError::Config {
+            reason: "zaino indexer opted in to regtest but no validator is registered in \
+                     this env"
+                .to_string(),
+        })?;
         let version = match opts.image {
             crate::backends::image::ImageSpec::Dev { .. } => crate::regtest_conf::Semver {
                 major: u16::MAX,
@@ -87,7 +93,9 @@ impl IndexerConfig for ZainoBackend {
             crate::backends::image::ImageSpec::Published => opts
                 .version
                 .parse::<crate::regtest_conf::Semver>()
-                .expect("zaino version on Indexer builder must be a valid semver"),
+                .map_err(|_| EnvError::Config {
+                    reason: format!("zaino version {:?} is not valid semver", opts.version),
+                })?,
         };
         // State backend sharing the validator's DB: point zebra_db_path at
         // the shared mount and connect the syncer to the validator's
@@ -118,7 +126,7 @@ impl IndexerConfig for ZainoBackend {
             toml,
             "/etc/zaino/zainod.toml",
         ));
-        opts
+        Ok(opts)
     }
 }
 
@@ -655,7 +663,6 @@ impl crate::component::Indexer<ZainoBackend> {
     ) -> Self {
         let mut indexer = apply_regtest(self, crate::testnet_conf::ZainodBackend::State);
         indexer.opts.shared_state = Some(crate::component::SharedState {
-            claim: vol.claim().to_string(),
             mount_path: vol.mount_path().to_string(),
         });
         indexer.mount(crate::mount::Mount::shared(vol.claim(), vol.mount_path()))
@@ -665,14 +672,14 @@ impl crate::component::Indexer<ZainoBackend> {
 /// zaino gRPC listen port (regtest). Matches the
 /// `[grpc_settings] listen_address` emitted by the generator and the
 /// `grpc` named port in `manifest.rs`.
-const ZAINO_REGTEST_GRPC_PORT: u16 = 8137;
+const ZAINO_REGTEST_GRPC_PORT: u16 = crate::handles::ports::ZAINO_GRPC;
 
 /// zaino's own JSON-RPC port (regtest).
-const ZAINO_REGTEST_JSONRPC_PORT: u16 = 8232;
+const ZAINO_REGTEST_JSONRPC_PORT: u16 = crate::handles::ports::ZAINO_JSONRPC;
 
-/// Regtest validator's JSON-RPC port — kept consistent with the regtest
-/// `rpc_port` zebra.rs passes to `regtest_conf::zebrad_conf`.
-const ZAINO_REGTEST_VALIDATOR_RPC_PORT: u16 = 28232;
+/// Regtest validator's JSON-RPC port — the same canonical port zebra.rs
+/// and zcashd.rs serve their regtest JSON-RPC on.
+const ZAINO_REGTEST_VALIDATOR_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_RPC;
 
 /// Path the validator state directory is mounted at inside the zaino
 /// pod (used by the `state` backend; harmless when unused by `fetch`).
@@ -748,19 +755,19 @@ fn apply_testnet(
 
 /// zaino gRPC listen port — matches the `[grpc_settings] listen_address`
 /// emitted by the generator and the named port in `manifest.rs`.
-const ZAINO_TESTNET_GRPC_PORT: u16 = 8137;
+const ZAINO_TESTNET_GRPC_PORT: u16 = crate::handles::ports::ZAINO_GRPC;
 
 /// zaino's own JSON-RPC port (testnet canonical 8232).
-const ZAINO_TESTNET_JSONRPC_PORT: u16 = 8232;
+const ZAINO_TESTNET_JSONRPC_PORT: u16 = crate::handles::ports::ZAINO_JSONRPC;
 
 /// In-cluster DNS name of the paired zebrad pod. Matches the pod name
 /// the `Validator::zebrad(…).testnet(variant)` builder assigns by
 /// default — override on both sides if you `.named(…)` differently.
 const ZAINO_TESTNET_VALIDATOR_HOST: &str = "zebrad";
 
-/// Testnet zebrad's JSON-RPC port — kept consistent with
-/// `ZEBRAD_TESTNET_RPC_PORT` in `backends/zebra.rs`.
-const ZAINO_TESTNET_VALIDATOR_RPC_PORT: u16 = 18232;
+/// Testnet zebrad's JSON-RPC port — the same canonical testnet port the
+/// zebrad backend serves on.
+const ZAINO_TESTNET_VALIDATOR_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_TESTNET_RPC;
 
 /// Path the chain-archive snapshot lands at inside the zaino pod.
 const ZAINO_TESTNET_ZEBRA_DB: &str = "/var/lib/zaino/zebra-db";

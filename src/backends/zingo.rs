@@ -87,6 +87,10 @@ pub struct ZingoWallet {
 #[derive(Default)]
 struct ZingoInner {
     builder: AsyncMutex<Option<ClientBuilder>>,
+    /// One `LightClient` per ztest [`AccountId`]. Each client wraps a
+    /// single-seed wallet, so per-account ops address zingolib sub-account
+    /// `zip32::AccountId::ZERO` — ztest's account model maps one ztest
+    /// account to one wallet, not to a zip32 sub-account index.
     clients: StdMutex<HashMap<u32, Arc<AsyncMutex<LightClient>>>>,
     next_id: AtomicU32,
 }

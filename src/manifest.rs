@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::EnvError;
 use crate::backends;
-use crate::component::{ComponentCategory, ComponentOpts};
+use crate::component::{ComponentCategory, ComponentOpts, Resources};
 use crate::mounts::ResolvedMount;
 use crate::naming::RunCoords;
 
@@ -19,6 +19,10 @@ pub struct PodSpec {
     pub ready_port: u16,
     pub command: Option<Vec<String>>,
     pub args: Option<Vec<String>>,
+    /// Container resource requests, rendered into `resources.requests`.
+    pub resources: Option<Resources>,
+    /// Container environment variables, in declaration order.
+    pub env: Vec<(String, String)>,
     pub fs_group: Option<i64>,
     /// `securityContext.runAsUser` override. Set when a pod must read
     /// another pod's files on a shared volume whose ownership can't be
@@ -62,6 +66,19 @@ impl PodSpec {
         }
         if let Some(args) = &self.args {
             container["args"] = json!(args);
+        }
+        if let Some(res) = &self.resources {
+            container["resources"] = json!({
+                "requests": { "cpu": res.cpu, "memory": res.memory },
+            });
+        }
+        if !self.env.is_empty() {
+            let env: Vec<Value> = self
+                .env
+                .iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect();
+            container["env"] = json!(env);
         }
 
         let mut spec = json!({
@@ -136,6 +153,8 @@ pub fn pod_spec_for_validator(
             ready_port: crate::handles::ports::ZEBRAD_RPC,
             command: opts.command.clone(),
             args: opts.args.clone(),
+            resources: opts.resources.clone(),
+            env: opts.env.clone(),
             // When sharing its zebra-state DB, run zebrad as the same uid
             // (1000) the zaino reader uses, so the DB files it writes —
             // including the mode-0600 `version` file — are owned by 1000
@@ -158,6 +177,8 @@ pub fn pod_spec_for_validator(
             ready_port: crate::handles::ports::ZCASHD_RPC,
             command: opts.command.clone(),
             args: opts.args.clone(),
+            resources: opts.resources.clone(),
+            env: opts.env.clone(),
             fs_group: Some(2001),
             run_as_user: None,
         },
@@ -193,6 +214,8 @@ pub fn pod_spec_for_indexer(
                 ready_port: crate::handles::ports::ZAINO_GRPC,
                 command: opts.command.clone(),
                 args: opts.args.clone(),
+                resources: opts.resources.clone(),
+                env: opts.env.clone(),
                 fs_group: Some(1000),
                 // The zainod image refuses to run as root and defaults to
                 // uid 1000. For the shared-DB case the validator is pinned
@@ -213,6 +236,8 @@ pub fn pod_spec_for_indexer(
             ready_port: crate::handles::ports::LIGHTWALLETD_GRPC,
             command: opts.command.clone(),
             args: opts.args.clone(),
+            resources: opts.resources.clone(),
+            env: opts.env.clone(),
             fs_group: Some(1000),
             run_as_user: None,
         }),
@@ -222,3 +247,79 @@ pub fn pod_spec_for_indexer(
 
 // No `pod_spec_for_wallet`: wallets run in-process (no pod). See
 // `crate::backends::zingo`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coords() -> RunCoords {
+        RunCoords {
+            run_id: "run".into(),
+            user: "user".into(),
+        }
+    }
+
+    fn base_spec() -> PodSpec {
+        PodSpec {
+            pod_name: "zebrad".into(),
+            category: ComponentCategory::Validator,
+            label: "zebrad",
+            image: "zfnd/zebra:1.9.1".into(),
+            ports: vec![("rpc".into(), 28232)],
+            ready_port: 28232,
+            command: None,
+            args: None,
+            resources: None,
+            env: Vec::new(),
+            fs_group: None,
+            run_as_user: None,
+        }
+    }
+
+    fn container(pod: &Pod) -> Value {
+        // Round-trip through JSON so the test reads the rendered shape
+        // exactly as the API server would receive it.
+        let v = serde_json::to_value(pod).unwrap();
+        v["spec"]["containers"][0].clone()
+    }
+
+    #[test]
+    fn resources_render_into_requests() {
+        let spec = PodSpec {
+            resources: Some(Resources {
+                cpu: "500m".into(),
+                memory: "512Mi".into(),
+            }),
+            ..base_spec()
+        };
+        let pod = spec.render(&coords(), "t", &[]).unwrap();
+        let c = container(&pod);
+        assert_eq!(c["resources"]["requests"]["cpu"], "500m");
+        assert_eq!(c["resources"]["requests"]["memory"], "512Mi");
+    }
+
+    #[test]
+    fn env_renders_in_declaration_order() {
+        let spec = PodSpec {
+            env: vec![
+                ("RUST_LOG".into(), "debug".into()),
+                ("FOO".into(), "bar".into()),
+            ],
+            ..base_spec()
+        };
+        let pod = spec.render(&coords(), "t", &[]).unwrap();
+        let c = container(&pod);
+        let env = c["env"].as_array().unwrap();
+        assert_eq!(env[0]["name"], "RUST_LOG");
+        assert_eq!(env[0]["value"], "debug");
+        assert_eq!(env[1]["name"], "FOO");
+    }
+
+    #[test]
+    fn no_resources_or_env_omits_the_keys() {
+        let pod = base_spec().render(&coords(), "t", &[]).unwrap();
+        let c = container(&pod);
+        assert!(c.get("resources").is_none());
+        assert!(c.get("env").is_none());
+    }
+}

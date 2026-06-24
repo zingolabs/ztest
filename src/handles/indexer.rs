@@ -48,15 +48,17 @@ pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
         None
     }
 
-    /// Apply regtest-time mounts / flags. Default: no-op.
+    /// Apply regtest-time mounts / flags. Returns
+    /// [`EnvError::Config`](crate::EnvError::Config) for invalid
+    /// configuration (e.g. an unparseable pinned version). Default: no-op.
     fn materialize_regtest_opts(
         &self,
         opts: crate::component::ComponentOpts,
         regtest_backend: Option<crate::testnet_conf::ZainodBackend>,
         validator_host: Option<&str>,
-    ) -> crate::component::ComponentOpts {
+    ) -> Result<crate::component::ComponentOpts, EnvError> {
         let _ = (regtest_backend, validator_host);
-        opts
+        Ok(opts)
     }
 }
 

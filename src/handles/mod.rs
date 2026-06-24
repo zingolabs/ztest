@@ -100,8 +100,16 @@ impl HandleInner {
 
 // ───────────────────────────── named-port table ────────────────────────
 
+/// The single source of truth for every container port ztest assigns.
+/// Backends must reference these rather than redeclaring the literals —
+/// the same number appearing in two places is a drift bug waiting to
+/// happen (a renamed port that only gets updated on one side).
 pub mod ports {
     pub const ZEBRAD_RPC: u16 = 28232;
+    /// zebrad's JSON-RPC port on a *testnet* topology (distinct from the
+    /// regtest [`ZEBRAD_RPC`]). Shared by the zebrad backend and any zaino
+    /// indexer paired with it.
+    pub const ZEBRAD_TESTNET_RPC: u16 = 18232;
     pub const ZEBRAD_METRICS: u16 = 9999;
     pub const ZEBRAD_P2P: u16 = 18233;
     /// zebrad's indexer gRPC (`rpc.indexer_listen_addr`). Only served when
@@ -114,5 +122,4 @@ pub mod ports {
     pub const ZAINO_JSONRPC: u16 = 8232;
     pub const ZAINO_METRICS: u16 = 9998;
     pub const LIGHTWALLETD_GRPC: u16 = 9067;
-    pub const ZINGO_GRPC: u16 = 20000;
 }
