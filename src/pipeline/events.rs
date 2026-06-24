@@ -51,8 +51,7 @@ pub enum Event {
         slots_used: u32,
         nodes_ready: u32,
         nodes_cordoned: u32,
-        cores: u32,
-        memory_gib: u32,
+        capacity: crate::qos::ClusterCapacity,
     },
     ProbeFailed {
         detail: String,

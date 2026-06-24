@@ -26,6 +26,7 @@ use super::{
     ArchiveRow, ArchiveStatus, BannerState, BuildStage, BuildState, DownloadSource, SnapshotRow,
     SnapshotStatus,
 };
+use crate::qos::{GIB, Resources};
 
 /// Width of the action-label column, matching nextest's `{:>12}`.
 const LABEL_WIDTH: usize = 12;
@@ -112,13 +113,52 @@ fn render_cluster_block(out: &mut String, state: &BannerState, theme: &Theme) {
 
     writeln!(
         out,
-        "{INDENT}{} ready {dot} {} cordoned {dot} {} cores {dot} {} GiB",
+        "{INDENT}{} ready {dot} {} cordoned",
         c.nodes_ready.style(theme.styles.count),
         c.nodes_cordoned.style(theme.styles.count),
-        c.cores.style(theme.styles.count),
-        c.memory_gib.style(theme.styles.count),
     )
     .expect("write to string");
+
+    // Capacity: one global figure (allocatable − Σ requested). The gauge
+    // shows free headroom, driven by the tighter of the two dimensions.
+    let alloc = c.capacity.allocatable;
+    let free = c.capacity.free();
+    let pct = free_percent(&free, &alloc);
+    let bar = render_progress_bar(pct, theme);
+    writeln!(
+        out,
+        "{INDENT}capacity {dot} {} / {} cores {dot} {} / {} GiB free {bar} {}",
+        cores_of(&free).style(theme.styles.count),
+        cores_of(&alloc).style(theme.styles.count),
+        gib_of(&free).style(theme.styles.count),
+        gib_of(&alloc).style(theme.styles.count),
+        format_args!("{pct}%").style(theme.styles.count),
+    )
+    .expect("write to string");
+}
+
+/// Whole CPU cores in a [`Resources`] (millicpu / 1000, rounded down).
+fn cores_of(r: &Resources) -> u64 {
+    r.cpu_milli / 1000
+}
+
+/// Whole GiB in a [`Resources`].
+fn gib_of(r: &Resources) -> u64 {
+    r.mem_bytes / GIB
+}
+
+/// Percent of capacity free, taken as the tighter (min) of the CPU and
+/// memory free fractions — the binding constraint for packing more work.
+/// Zero allocatable (e.g. before the probe lands) → 0%.
+fn free_percent(free: &Resources, alloc: &Resources) -> u8 {
+    let frac = |f: u64, a: u64| -> u64 {
+        if a == 0 {
+            0
+        } else {
+            ((f as u128 * 100) / a as u128).min(100) as u64
+        }
+    };
+    frac(free.cpu_milli, alloc.cpu_milli).min(frac(free.mem_bytes, alloc.mem_bytes)) as u8
 }
 
 /// Spinner glyph table — same braille frames `indicatif` uses for its
@@ -263,8 +303,8 @@ fn render_future_block(out: &mut String, state: &BannerState, theme: &Theme) {
     }
     writeln!(
         out,
-        "{:>width$} {} reserved",
-        "Future".style(theme.styles.dim),
+        "{:>width$} {} planned",
+        "Scheduling".style(theme.styles.dim),
         state.future.len().style(theme.styles.dim),
         width = LABEL_WIDTH,
     )
@@ -277,7 +317,7 @@ fn render_future_block(out: &mut String, state: &BannerState, theme: &Theme) {
             out,
             "{INDENT}{:<width$} {dot} {}",
             row.label.style(theme.styles.dim),
-            "not yet implemented".style(theme.styles.dim),
+            "planned (allocator pending)".style(theme.styles.dim),
             width = name_col,
         )
         .expect("write to string");
@@ -440,8 +480,10 @@ mod tests {
                 slots_configured: 6,
                 nodes_ready: 3,
                 nodes_cordoned: 0,
-                cores: 12,
-                memory_gib: 48,
+                capacity: crate::qos::ClusterCapacity {
+                    allocatable: Resources::new(12_000, 48 * GIB),
+                    requested: Resources::new(6_000, 20 * GIB),
+                },
             },
             build: BuildState::Ok {
                 test_count: 47,
@@ -515,7 +557,8 @@ mod tests {
    Preflight ztest
 
      Cluster context kind-zaino-local · 12 / 16 slots used · configured 6 via --test-threads
-             3 ready · 0 cordoned · 12 cores · 48 GiB
+             3 ready · 0 cordoned
+             capacity · 6 / 12 cores · 28 / 48 GiB free [██████░░░░░░] 50%
 
    Inventory ✓ 47 tests across 8 binaries · 18s
 
@@ -584,17 +627,17 @@ mod tests {
         let s = render(&state, &plain_unicode_theme());
         // Section header.
         assert!(
-            s.contains("Future 3 reserved"),
-            "missing future header:\n{s}"
+            s.contains("Scheduling 3 planned"),
+            "missing scheduling header:\n{s}"
         );
-        // Rows are dot-separated and tagged not-yet-implemented.
+        // Rows are dot-separated and tagged planned.
         assert!(s.contains("tier"), "got:\n{s}");
         assert!(s.contains("queue"), "got:\n{s}");
         assert!(s.contains("reservation"), "got:\n{s}");
-        assert!(s.contains("not yet implemented"), "got:\n{s}");
-        // Blank line separator landed before the Future block.
+        assert!(s.contains("planned (allocator pending)"), "got:\n{s}");
+        // Blank line separator landed before the scheduling block.
         assert!(
-            s.contains("\n\n      Future"),
+            s.contains("\n\n  Scheduling"),
             "missing blank separator:\n{s}"
         );
     }
@@ -605,6 +648,38 @@ mod tests {
         assert!(!Theme::for_capabilities(false, true).is_colorized());
         assert!(Theme::for_capabilities(true, false).is_colorized());
         assert!(Theme::for_capabilities(true, true).is_colorized());
+    }
+
+    #[test]
+    fn capacity_line_shows_free_over_allocatable_and_a_gauge() {
+        let s = render(&sample_state(), &plain_unicode_theme());
+        // free = 12-6 cores / 48-20 GiB; gauge driven by the tighter dim.
+        assert!(
+            s.contains("capacity · 6 / 12 cores · 28 / 48 GiB free [██████░░░░░░] 50%"),
+            "capacity line wrong:\n{s}"
+        );
+    }
+
+    #[test]
+    fn capacity_line_degrades_to_zero_before_the_probe_lands() {
+        let mut state = sample_state();
+        state.cluster.capacity = crate::qos::ClusterCapacity::default();
+        let s = render(&state, &plain_unicode_theme());
+        // All-zero capacity renders 0/0 and a 0% gauge, no panic / div-by-zero.
+        assert!(
+            s.contains("capacity · 0 / 0 cores · 0 / 0 GiB free [░░░░░░░░░░░░] 0%"),
+            "zero-capacity line wrong:\n{s}"
+        );
+    }
+
+    #[test]
+    fn free_percent_uses_the_tighter_dimension() {
+        // CPU 50% free, memory 25% free → min = 25.
+        let free = Resources::new(2_000, GIB);
+        let alloc = Resources::new(4_000, 4 * GIB);
+        assert_eq!(free_percent(&free, &alloc), 25);
+        // Zero allocatable → 0, no panic.
+        assert_eq!(free_percent(&Resources::ZERO, &Resources::ZERO), 0);
     }
 
     #[test]

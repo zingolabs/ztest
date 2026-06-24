@@ -16,9 +16,10 @@ use std::thread;
 use std::time::Duration;
 
 use ztest::preflight::{
-    self, ArchiveRow, ArchiveStatus, BannerState, ClusterState, DownloadSource, FutureRow,
-    LiveRender, SnapshotRow, SnapshotStatus, Theme,
+    self, ArchiveRow, ArchiveStatus, BannerState, BuildState, ClusterState, DownloadSource,
+    FutureRow, LiveRender, SnapshotRow, SnapshotStatus, Theme,
 };
+use ztest::qos::{ClusterCapacity, Resources, GIB};
 
 /// Refresh rate. Matches indicatif's default tick interval (~10 Hz).
 const TICK: Duration = Duration::from_millis(100);
@@ -81,7 +82,6 @@ fn state(step: u32) -> BannerState {
     };
 
     BannerState {
-        run_id: "a1b2c3d4-5678".to_string(),
         cluster: ClusterState {
             context: "kind-zaino-local".to_string(),
             slots_used: 12,
@@ -89,8 +89,15 @@ fn state(step: u32) -> BannerState {
             slots_configured: 6,
             nodes_ready: 3,
             nodes_cordoned: 0,
-            cores: 12,
-            memory_gib: 48,
+            capacity: ClusterCapacity {
+                allocatable: Resources::new(12_000, 48 * GIB),
+                requested: Resources::new(6_000, 20 * GIB),
+            },
+        },
+        build: BuildState::Ok {
+            test_count: 47,
+            binary_count: 8,
+            elapsed: Duration::from_secs(18),
         },
         archives: vec![
             ArchiveRow {

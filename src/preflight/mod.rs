@@ -105,8 +105,9 @@ pub struct ClusterState {
     pub slots_configured: u32,
     pub nodes_ready: u32,
     pub nodes_cordoned: u32,
-    pub cores: u32,
-    pub memory_gib: u32,
+    /// Whole-cluster schedulable capacity (`allocatable − Σ requested`).
+    /// One global figure — NVMe vs general is k8s placement, not a split.
+    pub capacity: crate::qos::ClusterCapacity,
 }
 
 #[derive(Debug, Clone)]

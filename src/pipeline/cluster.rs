@@ -31,10 +31,11 @@
 
 use std::convert::TryFrom;
 
-use k8s_openapi::api::core::v1::{Namespace, Node};
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
 use kube::api::ListParams;
 use kube::{Api, Client, Config};
+
+use crate::qos::{ClusterCapacity, Resources, units};
 
 use super::events::{Event, EventTx};
 
@@ -50,8 +51,8 @@ pub enum ProbeOutcome {
         slots_used: u32,
         nodes_ready: u32,
         nodes_cordoned: u32,
-        cores: u32,
-        memory_gib: u32,
+        /// Whole-cluster schedulable capacity (`allocatable − Σ requested`).
+        capacity: ClusterCapacity,
     },
     /// No kubeconfig found, or the inferred config can't be read. Soft
     /// fail — the run continues without cluster data.
@@ -106,130 +107,114 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
 
     let nodes_api: Api<Node> = Api::all(client.clone());
     let ns_api: Api<Namespace> = Api::all(client.clone());
+    // Pods are listed cluster-wide so we can subtract scheduled requests from
+    // node allocatable — the `allocatable − Σ requested` model. NVMe vs
+    // general is k8s placement (taints/tolerations), not a capacity split, so
+    // there is a single global figure.
+    let pods_api: Api<Pod> = Api::all(client.clone());
 
     let lp = ListParams::default();
-    let (nodes, namespaces) = match tokio::try_join!(nodes_api.list(&lp), ns_api.list(&lp)) {
-        Ok(pair) => pair,
-        Err(err) => {
-            let detail = format!("{err}");
-            let _ = tx.send(Event::ProbeFailed {
-                detail: detail.clone(),
-            });
-            return (ProbeOutcome::Failed { detail }, None);
-        }
-    };
+    let (nodes, namespaces, pods) =
+        match tokio::try_join!(nodes_api.list(&lp), ns_api.list(&lp), pods_api.list(&lp)) {
+            Ok(triple) => triple,
+            Err(err) => {
+                let detail = format!("{err}");
+                let _ = tx.send(Event::ProbeFailed {
+                    detail: detail.clone(),
+                });
+                return (ProbeOutcome::Failed { detail }, None);
+            }
+        };
 
-    let summary = summarize_nodes(&nodes.items);
+    let (nodes_ready, nodes_cordoned) = count_nodes(&nodes.items);
+    let capacity = ClusterCapacity {
+        allocatable: cluster_allocatable(&nodes.items),
+        requested: cluster_requested(&pods.items),
+    };
     let slots_used = count_zaino_slots(&namespaces.items);
 
     let _ = tx.send(Event::ProbeComplete {
         context: context.clone(),
         slots_used,
-        nodes_ready: summary.ready,
-        nodes_cordoned: summary.cordoned,
-        cores: summary.cores,
-        memory_gib: summary.memory_gib,
+        nodes_ready,
+        nodes_cordoned,
+        capacity,
     });
 
     (
         ProbeOutcome::Ok {
             context,
             slots_used,
-            nodes_ready: summary.ready,
-            nodes_cordoned: summary.cordoned,
-            cores: summary.cores,
-            memory_gib: summary.memory_gib,
+            nodes_ready,
+            nodes_cordoned,
+            capacity,
         },
         Some(client),
     )
 }
 
-struct NodeSummary {
-    ready: u32,
-    cordoned: u32,
-    cores: u32,
-    memory_gib: u32,
+/// `true` if the node reports a `Ready` condition.
+fn node_ready(node: &Node) -> bool {
+    node.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .map(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+        .unwrap_or(false)
 }
 
-fn summarize_nodes(nodes: &[Node]) -> NodeSummary {
-    let mut ready = 0u32;
-    let mut cordoned = 0u32;
-    let mut cores = 0u32;
-    let mut memory_bytes = 0u64;
-
-    for node in nodes {
-        if let Some(spec) = &node.spec
-            && spec.unschedulable.unwrap_or(false)
-        {
-            cordoned += 1;
-        }
-        if let Some(status) = &node.status {
-            if let Some(conds) = &status.conditions
-                && conds
-                    .iter()
-                    .any(|c| c.type_ == "Ready" && c.status == "True")
-            {
-                ready += 1;
-            }
-            if let Some(cap) = &status.capacity {
-                if let Some(q) = cap.get("cpu") {
-                    cores += parse_cpu_cores(q);
-                }
-                if let Some(q) = cap.get("memory") {
-                    memory_bytes += parse_memory_bytes(q);
-                }
-            }
-        }
-    }
-
-    NodeSummary {
-        ready,
-        cordoned,
-        cores,
-        memory_gib: (memory_bytes / (1024 * 1024 * 1024)) as u32,
-    }
+/// `true` if the node is cordoned (`spec.unschedulable`).
+fn node_cordoned(node: &Node) -> bool {
+    node.spec
+        .as_ref()
+        .and_then(|s| s.unschedulable)
+        .unwrap_or(false)
 }
 
-/// Parse k8s CPU quantity to whole cores, rounded down.
-///
-/// k8s reports CPU as either an integer (e.g. `"12"`) or with a
-/// millicpu suffix (e.g. `"1500m"` = 1.5 cores). For banner display
-/// we only need integer cores.
-fn parse_cpu_cores(q: &Quantity) -> u32 {
-    let s = &q.0;
-    if let Some(num) = s.strip_suffix('m') {
-        num.parse::<u64>().map(|n| (n / 1000) as u32).unwrap_or(0)
-    } else {
-        s.parse::<u32>().unwrap_or(0)
-    }
+/// `(ready, cordoned)` node counts for the banner.
+fn count_nodes(nodes: &[Node]) -> (u32, u32) {
+    let ready = nodes.iter().filter(|n| node_ready(n)).count() as u32;
+    let cordoned = nodes.iter().filter(|n| node_cordoned(n)).count() as u32;
+    (ready, cordoned)
 }
 
-/// Parse k8s memory quantity to bytes.
-///
-/// k8s reports memory as `<n><suffix>` where suffix is one of
-/// `Ki Mi Gi Ti Ei` (binary) or `K M G T E` (decimal) or empty
-/// (raw bytes). Banner only needs GiB precision so the float math
-/// is tolerable.
-fn parse_memory_bytes(q: &Quantity) -> u64 {
-    let s = &q.0;
-    let (num, mult) = if let Some(n) = s.strip_suffix("Ki") {
-        (n, 1024u64)
-    } else if let Some(n) = s.strip_suffix("Mi") {
-        (n, 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix("Gi") {
-        (n, 1024 * 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix("Ti") {
-        (n, 1024_u64.pow(4))
-    } else if let Some(n) = s.strip_suffix("K") {
-        (n, 1_000)
-    } else if let Some(n) = s.strip_suffix("M") {
-        (n, 1_000_000)
-    } else if let Some(n) = s.strip_suffix("G") {
-        (n, 1_000_000_000)
-    } else {
-        (s.as_str(), 1)
+/// A node's `status.allocatable` as [`Resources`] (millicpu + bytes).
+fn node_allocatable(node: &Node) -> Resources {
+    let Some(alloc) = node.status.as_ref().and_then(|s| s.allocatable.as_ref()) else {
+        return Resources::ZERO;
     };
-    num.parse::<u64>().unwrap_or(0).saturating_mul(mult)
+    let cpu = alloc.get("cpu").map(|q| units::parse_cpu_milli(&q.0)).unwrap_or(0);
+    let mem = alloc.get("memory").map(|q| units::parse_mem_bytes(&q.0)).unwrap_or(0);
+    Resources::new(cpu, mem)
+}
+
+/// Total allocatable across **schedulable** nodes (Ready and not cordoned).
+fn cluster_allocatable(nodes: &[Node]) -> Resources {
+    nodes
+        .iter()
+        .filter(|n| node_ready(n) && !node_cordoned(n))
+        .fold(Resources::ZERO, |acc, n| acc.saturating_add(&node_allocatable(n)))
+}
+
+/// `true` if a pod is scheduled (has a node) and still consuming capacity
+/// (not `Succeeded`/`Failed`).
+fn pod_consumes(pod: &Pod) -> bool {
+    let scheduled = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_ref())
+        .is_some();
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
+    scheduled && !matches!(phase, Some("Succeeded") | Some("Failed"))
+}
+
+/// Sum of effective requests over scheduled, live pods cluster-wide.
+fn cluster_requested(pods: &[Pod]) -> Resources {
+    pods.iter()
+        .filter(|p| pod_consumes(p))
+        .filter_map(|p| p.spec.as_ref())
+        .fold(Resources::ZERO, |acc, spec| {
+            acc.saturating_add(&units::pod_effective_requests(spec))
+        })
 }
 
 /// Count `zaino-{ci,dev}-*` namespaces as the proxy for current
@@ -251,26 +236,107 @@ fn count_zaino_slots(namespaces: &[Namespace]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::api::core::v1::{NodeCondition, NodeSpec, NodeStatus, PodSpec, PodStatus};
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+    use std::collections::BTreeMap;
 
-    fn quantity(s: &str) -> Quantity {
-        Quantity(s.to_string())
+    // (Quantity parsing lives in `qos::units`; here we test the node/pod
+    // aggregation over hand-built objects — no cluster needed.)
+
+    fn node(ready: bool, cordoned: bool, cpu: &str, mem: &str) -> Node {
+        Node {
+            spec: Some(NodeSpec {
+                unschedulable: Some(cordoned),
+                ..Default::default()
+            }),
+            status: Some(NodeStatus {
+                conditions: Some(vec![NodeCondition {
+                    type_: "Ready".into(),
+                    status: if ready { "True".into() } else { "False".into() },
+                    ..Default::default()
+                }]),
+                allocatable: Some(BTreeMap::from([
+                    ("cpu".to_string(), Quantity(cpu.to_string())),
+                    ("memory".to_string(), Quantity(mem.to_string())),
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn pod(node_name: Option<&str>, phase: &str, cpu: &str, mem: &str) -> Pod {
+        use k8s_openapi::api::core::v1::{Container, ResourceRequirements};
+        Pod {
+            spec: Some(PodSpec {
+                node_name: node_name.map(str::to_string),
+                containers: vec![Container {
+                    name: "c".into(),
+                    resources: Some(ResourceRequirements {
+                        requests: Some(BTreeMap::from([
+                            ("cpu".to_string(), Quantity(cpu.to_string())),
+                            ("memory".to_string(), Quantity(mem.to_string())),
+                        ])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some(phase.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn parse_cpu_handles_integer_and_milli() {
-        assert_eq!(parse_cpu_cores(&quantity("12")), 12);
-        assert_eq!(parse_cpu_cores(&quantity("1500m")), 1);
-        assert_eq!(parse_cpu_cores(&quantity("2000m")), 2);
-        assert_eq!(parse_cpu_cores(&quantity("garbage")), 0);
+    fn count_nodes_reports_ready_and_cordoned() {
+        let nodes = vec![
+            node(true, false, "4", "8Gi"),
+            node(true, true, "4", "8Gi"), // ready but cordoned
+            node(false, false, "4", "8Gi"), // not ready
+        ];
+        assert_eq!(count_nodes(&nodes), (2, 1));
     }
 
     #[test]
-    fn parse_memory_handles_iec_and_si_suffixes() {
-        assert_eq!(parse_memory_bytes(&quantity("4Gi")), 4 * 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_bytes(&quantity("512Mi")), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_bytes(&quantity("1G")), 1_000_000_000);
-        assert_eq!(parse_memory_bytes(&quantity("4096")), 4096);
-        assert_eq!(parse_memory_bytes(&quantity("invalid")), 0);
+    fn allocatable_sums_only_schedulable_nodes() {
+        let nodes = vec![
+            node(true, false, "4", "8Gi"),  // counted
+            node(true, true, "8", "16Gi"),  // cordoned → excluded
+            node(false, false, "8", "16Gi"), // not ready → excluded
+        ];
+        let a = cluster_allocatable(&nodes);
+        assert_eq!(a.cpu_milli, 4000);
+        assert_eq!(a.mem_bytes, 8 * crate::qos::GIB);
+    }
+
+    #[test]
+    fn requested_sums_only_scheduled_live_pods() {
+        let pods = vec![
+            pod(Some("n1"), "Running", "500m", "512Mi"), // counted
+            pod(Some("n1"), "Pending", "500m", "512Mi"), // counted (scheduled)
+            pod(None, "Pending", "1", "1Gi"),            // unscheduled → excluded
+            pod(Some("n1"), "Succeeded", "1", "1Gi"),    // finished → excluded
+            pod(Some("n1"), "Failed", "1", "1Gi"),       // finished → excluded
+        ];
+        let r = cluster_requested(&pods);
+        assert_eq!(r.cpu_milli, 1000); // 500m + 500m
+        assert_eq!(r.mem_bytes, 1024 * 1024 * 1024); // 512Mi + 512Mi
+    }
+
+    #[test]
+    fn cluster_capacity_free_is_allocatable_minus_requested() {
+        let nodes = vec![node(true, false, "8", "16Gi")];
+        let pods = vec![pod(Some("n1"), "Running", "2", "4Gi")];
+        let cap = ClusterCapacity {
+            allocatable: cluster_allocatable(&nodes),
+            requested: cluster_requested(&pods),
+        };
+        assert_eq!(cap.free().cpu_milli, 6000);
+        assert_eq!(cap.free().mem_bytes, 12 * crate::qos::GIB);
     }
 
     #[test]

@@ -394,15 +394,13 @@ fn apply_update(state: &mut BannerState, upd: Update) {
             context,
             nodes_ready,
             nodes_cordoned,
-            cores,
-            memory_gib,
+            capacity,
             slots_used,
         }) => {
             state.cluster.context = context;
             state.cluster.nodes_ready = nodes_ready;
             state.cluster.nodes_cordoned = nodes_cordoned;
-            state.cluster.cores = cores;
-            state.cluster.memory_gib = memory_gib;
+            state.cluster.capacity = capacity;
             state.cluster.slots_used = slots_used;
         }
         Update::Probe(ProbeOutcome::Missing { detail }) => {
@@ -585,25 +583,15 @@ fn build_initial_state(peek: &args_peek::NextestArgs) -> BannerState {
             slots_configured: peek.test_threads.unwrap_or(0),
             nodes_ready: 0,
             nodes_cordoned: 0,
-            cores: 0,
-            memory_gib: 0,
+            capacity: crate::qos::ClusterCapacity::default(),
         },
         build: crate::preflight::BuildState::Pending,
         archives: Vec::<ArchiveRow>::new(),
         snapshots: Vec::<SnapshotRow>::new(),
+        // Only genuinely-unbuilt features are placeholders now (the cluster
+        // probe, archive fetch, and snapshot bind have real blocks above).
+        // These land once the QoS inventory dump + allocator wiring exist.
         future: vec![
-            FutureRow {
-                label: "cluster probe",
-            },
-            FutureRow {
-                label: "mount inventory",
-            },
-            FutureRow {
-                label: "archive fetch",
-            },
-            FutureRow {
-                label: "snapshot bind",
-            },
             FutureRow { label: "tier" },
             FutureRow { label: "queue" },
             FutureRow {

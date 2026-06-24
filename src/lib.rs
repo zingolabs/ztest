@@ -34,6 +34,7 @@ pub mod mount;
 pub mod pipeline;
 pub mod preflight;
 pub mod protocol;
+pub mod qos;
 pub mod regtest;
 pub mod regtest_conf;
 pub mod testnet_conf;
