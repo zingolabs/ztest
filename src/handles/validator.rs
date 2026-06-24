@@ -66,6 +66,14 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     /// coinbase).
     fn default_coinbase_pool(&self) -> Pool;
 
+    /// Stable label for this backend (`"zcashd"` / `"zebrad"`). Mirrors
+    /// [`ValidatorBackend::label`] on the live handle, but is available on
+    /// the spec *before* launch, so a backend-generic test can branch on it
+    /// — e.g. to pick a [`Validator::mine_to`](crate::component::Validator::mine_to)
+    /// coinbase pool the backend can actually mine (Orchard on zcashd,
+    /// Transparent on zebrad).
+    fn label(&self) -> &'static str;
+
     /// Highest network upgrade this backend, at the given pinned
     /// version, can decode. Used by the topology resolver to compute the
     /// activation-height ceiling. `None` opts out of the resolver.
@@ -99,16 +107,19 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
 /// rather than a per-pool map.
 #[derive(Debug, Clone)]
 pub struct PoolSupport {
-    /// Every value pool the node validates on its chain. zcashd is
-    /// end-of-life and never gained Orchard support, so its set omits
-    /// [`Pool::Orchard`]; zebrad lists all three. `coinbase` is always a
+    /// Every value pool the node validates on its chain. Both zcashd
+    /// (v6.20.0) and zebrad validate — and can mine a coinbase into — all
+    /// three pools, so both list every [`Pool`]. `coinbase` is always a
     /// member.
     pub supported: &'static [Pool],
 
     /// The single pool the coinbase pays into — a fixed property of the
     /// backend's miner address (baked into its regtest config), not a
-    /// per-test choice. zebrad mines to [`Pool::Orchard`], zcashd to
-    /// [`Pool::Sapling`]. Always one of [`Self::supported`].
+    /// per-test choice. Defaults to [`Pool::Transparent`] for zebrad (the
+    /// only coinbase it can mine on a cold chain) and [`Pool::Sapling`] for
+    /// zcashd; either can be overridden per-validator via
+    /// [`Validator::mine_to`](crate::component::Validator::mine_to). Always
+    /// one of [`Self::supported`].
     pub coinbase: Pool,
 }
 

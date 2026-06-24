@@ -35,16 +35,35 @@ const DEFAULT_COINBASE_POOL: Pool = Pool::Transparent;
 
 /// Resolve the regtest miner address zebrad mines its coinbase to for
 /// `pool`. zebrad pays a unified address's receivers orchard → sapling →
-/// transparent, so each address pins the coinbase to one pool. zebrad
-/// cannot mine a *scannable* Sapling coinbase, so that pool is rejected
-/// at config time rather than producing silently-broken funds.
+/// transparent, so each address pins the coinbase to one pool.
+///
+/// Only [`Pool::Transparent`] is mineable on a cold regtest chain — the
+/// two shielded pools are rejected here, at config time, rather than
+/// producing a block the node will reject (or silently-broken funds) at
+/// mine time:
+///
+/// - **Orchard**: the NU5 *activation* block has no parent Orchard tree,
+///   so the coinbase Orchard output has no anchor and zebrad rejects the
+///   block (`"could not validate orchard proof"`). Unlike zcashd, zebrad's
+///   `generate` RPC has no wallet to materialize the output against the
+///   empty-tree anchor. Fund a zebrad faucet with Orchard notes via the
+///   transparent-coinbase mature-then-shield path instead (see
+///   `funded_faucet_with_notes`).
+/// - **Sapling**: mines, but produces a coinbase note zingo cannot scan
+///   (`"invalid memo bytes"`).
 fn miner_address(pool: Pool) -> &'static str {
     match pool {
-        Pool::Orchard => crate::regtest_conf::ORCHARD_MINER_ADDRESS,
         Pool::Transparent => crate::regtest_conf::MINER_ADDRESS,
+        Pool::Orchard => panic!(
+            "zebrad cannot mine an Orchard coinbase on a cold regtest chain: \
+             the NU5 activation block has no parent Orchard tree, so the \
+             coinbase output has no anchor and the block is rejected. Leave \
+             the default transparent coinbase and fund the faucet via \
+             mature-then-shield (funded_faucet_with_notes)."
+        ),
         Pool::Sapling => panic!(
             "zebrad cannot mine a scannable Sapling coinbase (the note is \
-             unscannable by zingo); mine to Orchard or Transparent"
+             unscannable by zingo); mine to Transparent"
         ),
     }
 }
@@ -75,6 +94,10 @@ impl ValidatorConfig for ZebraBackend {
 
     fn default_coinbase_pool(&self) -> Pool {
         DEFAULT_COINBASE_POOL
+    }
+
+    fn label(&self) -> &'static str {
+        COMPONENT
     }
 
     fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {

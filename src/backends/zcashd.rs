@@ -47,22 +47,25 @@ const CONTAINER_DATA_DIR: &str = "/var/lib/zcashd";
 /// spendable, no maturity wait.
 const DEFAULT_COINBASE_POOL: Pool = Pool::Sapling;
 
-/// Why zcashd refuses an Orchard coinbase. zcashd is end-of-life (its own
-/// config carries `i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet`)
-/// and never gained an Orchard miner address: it cannot construct an
-/// Orchard coinbase output. Tests that need mine-to-orchard must use a
-/// zebrad validator.
-const ORCHARD_DEPRECATION: &str =
-    "zcashd is deprecated and cannot mine coinbase into the Orchard pool; \
-     use a zebrad validator for Orchard-coinbase tests";
-
 /// Resolve the regtest miner address zcashd mines its coinbase to for
-/// `pool`. Orchard is rejected ([`ORCHARD_DEPRECATION`]).
+/// `pool`. All three pools are supported. zcashd v6.20.0 mines an Orchard
+/// coinbase to the abandon-art unified address
+/// ([`ORCHARD_MINER_ADDRESS`](crate::regtest_conf::ORCHARD_MINER_ADDRESS))
+/// once NU5 is active (height 2 under
+/// [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights)),
+/// exactly as zebrad does — the wallet materializes the shielded coinbase
+/// output and the prover builds its Halo2 proof, both of which zcashd
+/// already does for the default Sapling coinbase. Orchard coinbase notes
+/// are spendable the moment they are mined (no maturity wait), at the cost
+/// of one Halo2 proof per block; Sapling stays the default coinbase pool
+/// (see [`DEFAULT_COINBASE_POOL`]) so tests that don't need Orchard funds
+/// avoid that cost. Opt in via
+/// [`Validator::mine_to`](crate::component::Validator::mine_to).
 fn miner_address(pool: Pool) -> &'static str {
     match pool {
+        Pool::Orchard => crate::regtest_conf::ORCHARD_MINER_ADDRESS,
         Pool::Sapling => crate::regtest_conf::SHIELDED_MINER_ADDRESS,
         Pool::Transparent => crate::regtest_conf::MINER_ADDRESS,
-        Pool::Orchard => panic!("{ORCHARD_DEPRECATION}"),
     }
 }
 
@@ -85,6 +88,10 @@ impl ValidatorConfig for ZcashdBackend {
 
     fn default_coinbase_pool(&self) -> Pool {
         DEFAULT_COINBASE_POOL
+    }
+
+    fn label(&self) -> &'static str {
+        COMPONENT
     }
 
     fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
@@ -197,12 +204,12 @@ impl ValidatorBackend for ZcashdValidator {
     }
 
     fn pool_support(&self) -> PoolSupport {
-        // zcashd is end-of-life and never gained Orchard support — see
-        // ORCHARD_DEPRECATION. It validates Sapling and transparent only;
-        // the pool its coinbase pays into was chosen per-validator
-        // (default Sapling).
+        // zcashd v6.20.0 validates all three pools and mines an Orchard
+        // coinbase to a unified `mineraddress` once NU5 is active (see
+        // `miner_address`). The pool its coinbase pays into was chosen
+        // per-validator (default Sapling).
         PoolSupport {
-            supported: &[Pool::Sapling, Pool::Transparent],
+            supported: &[Pool::Orchard, Pool::Sapling, Pool::Transparent],
             coinbase: self
                 .plumbing
                 .coinbase_pool

@@ -432,12 +432,28 @@ impl<B: ValidatorConfig> Validator<B> {
     pub fn opts(&self) -> &ComponentOpts {
         &self.opts
     }
+    /// Stable label for the backend (`"zcashd"` / `"zebrad"`), available on
+    /// the builder before launch. Lets a backend-generic test branch its
+    /// [`mine_to`](Self::mine_to) coinbase pool without a live handle. See
+    /// [`ValidatorConfig::label`].
+    pub fn label(&self) -> &'static str {
+        self.backend.label()
+    }
+
     /// Choose which value pool this validator mines its coinbase into,
     /// overriding the backend default ([`ValidatorConfig::default_coinbase_pool`]).
     /// The pool is resolved to a regtest miner address at `env.build()`;
     /// a backend that cannot mine the requested pool's coinbase panics
-    /// there (e.g. zebrad + [`Pool::Sapling`], which yields unscannable
-    /// coinbase notes).
+    /// there (zebrad rejects both shielded pools — [`Pool::Orchard`] has no
+    /// anchor at the NU5 activation block and [`Pool::Sapling`] yields
+    /// unscannable coinbase notes — so only [`Pool::Transparent`] is valid
+    /// for it).
+    ///
+    /// In a test that is generic over the backend, pick the pool from
+    /// [`Self::label`] — `Pool::Orchard` for zcashd (it mines and proves an
+    /// Orchard coinbase directly), `Pool::Transparent` for zebrad (funded
+    /// via the mature-then-shield path) — rather than hardcoding one pool
+    /// both backends can't mine.
     pub fn mine_to(mut self, pool: Pool) -> Self {
         self.opts.coinbase_pool = Some(pool);
         self
