@@ -29,13 +29,17 @@
 //! rather than the sum. This is the inner parallelism — A1 is also
 //! running in parallel with Phase B at a higher level.
 
+use std::collections::BTreeSet;
 use std::convert::TryFrom;
 
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
 use kube::api::ListParams;
 use kube::{Api, Client, Config};
 
-use crate::qos::{ClusterCapacity, Resources, units};
+use crate::qos::{
+    ClusterCapacity, LABEL_ROLE, NVME_NODE_LABEL_KEY, NVME_NODE_LABEL_VALUE, ROLE_TEST_ENV,
+    Resources, units,
+};
 
 use super::events::{Event, EventTx};
 
@@ -53,6 +57,9 @@ pub enum ProbeOutcome {
         nodes_cordoned: u32,
         /// Whole-cluster schedulable capacity (`allocatable − Σ requested`).
         capacity: ClusterCapacity,
+        /// Count of schedulable NVMe-pool nodes — sizes the `qos-sync` nextest
+        /// test-group so `sync` tests run at most one-per-NVMe-node (§11).
+        nvme_nodes: u32,
     },
     /// No kubeconfig found, or the inferred config can't be read. Soft
     /// fail — the run continues without cluster data.
@@ -127,10 +134,13 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
         };
 
     let (nodes_ready, nodes_cordoned) = count_nodes(&nodes.items);
+    let ztest_ns = ztest_namespaces(&namespaces.items);
     let capacity = ClusterCapacity {
         allocatable: cluster_allocatable(&nodes.items),
         requested: cluster_requested(&pods.items),
+        baseline: baseline_requested(&pods.items, &ztest_ns),
     };
+    let nvme_nodes = count_nvme_nodes(&nodes.items);
     let slots_used = count_zaino_slots(&namespaces.items);
 
     let _ = tx.send(Event::ProbeComplete {
@@ -148,9 +158,46 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
             nodes_ready,
             nodes_cordoned,
             capacity,
+            nvme_nodes,
         },
         Some(client),
     )
+}
+
+/// Compute the live whole-cluster schedulable capacity
+/// (`allocatable − Σ requested`) using an existing [`kube::Client`].
+///
+/// This is the same model [`run`] reports in its banner, factored out for the
+/// per-test re-probe in `TestEnv::build()`: a test process (spawned by
+/// nextest, with no access to the parent `ztest run`'s probe result) calls
+/// this to size its allocator's `available` figure before requesting a
+/// reservation. Errors propagate so the caller can fail the build with a clear
+/// message rather than silently admitting against a zero capacity.
+pub async fn capacity(client: &Client) -> Result<ClusterCapacity, kube::Error> {
+    let nodes_api: Api<Node> = Api::all(client.clone());
+    let ns_api: Api<Namespace> = Api::all(client.clone());
+    let pods_api: Api<Pod> = Api::all(client.clone());
+    let lp = ListParams::default();
+    let (nodes, namespaces, pods) =
+        tokio::try_join!(nodes_api.list(&lp), ns_api.list(&lp), pods_api.list(&lp))?;
+    let ztest_ns = ztest_namespaces(&namespaces.items);
+    Ok(ClusterCapacity {
+        allocatable: cluster_allocatable(&nodes.items),
+        requested: cluster_requested(&pods.items),
+        baseline: baseline_requested(&pods.items, &ztest_ns),
+    })
+}
+
+/// Count schedulable NVMe-pool nodes using an existing [`kube::Client`] — the
+/// per-test equivalent of the parent probe's `nvme_nodes`, which doesn't cross
+/// the nextest process boundary. `TestEnv::build()` calls this to fail a
+/// sync-tier admission fast when no NVMe node can host the pod, rather than
+/// admitting against global capacity and letting the pod pend forever on an
+/// unsatisfiable nodeSelector.
+pub async fn nvme_node_count(client: &Client) -> Result<u32, kube::Error> {
+    let nodes_api: Api<Node> = Api::all(client.clone());
+    let nodes = nodes_api.list(&ListParams::default()).await?;
+    Ok(count_nvme_nodes(&nodes.items))
 }
 
 /// `true` if the node reports a `Ready` condition.
@@ -175,6 +222,25 @@ fn count_nodes(nodes: &[Node]) -> (u32, u32) {
     let ready = nodes.iter().filter(|n| node_ready(n)).count() as u32;
     let cordoned = nodes.iter().filter(|n| node_cordoned(n)).count() as u32;
     (ready, cordoned)
+}
+
+/// Count schedulable nodes in the NVMe pool — Ready, not cordoned, and carrying
+/// the NVMe pool label ([`NVME_NODE_LABEL_KEY`]=[`NVME_NODE_LABEL_VALUE`]).
+/// Sizes the `qos-sync` test-group; `0` on a cluster with no NVMe pool (dev /
+/// kind), which the lowering floors back to 1.
+fn count_nvme_nodes(nodes: &[Node]) -> u32 {
+    nodes
+        .iter()
+        .filter(|n| node_ready(n) && !node_cordoned(n))
+        .filter(|n| {
+            n.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(NVME_NODE_LABEL_KEY))
+                .map(|v| v == NVME_NODE_LABEL_VALUE)
+                .unwrap_or(false)
+        })
+        .count() as u32
 }
 
 /// A node's `status.allocatable` as [`Resources`] (millicpu + bytes).
@@ -211,6 +277,51 @@ fn pod_consumes(pod: &Pod) -> bool {
 fn cluster_requested(pods: &[Pod]) -> Resources {
     pods.iter()
         .filter(|p| pod_consumes(p))
+        .filter_map(|p| p.spec.as_ref())
+        .fold(Resources::ZERO, |acc, spec| {
+            acc.saturating_add(&units::pod_effective_requests(spec))
+        })
+}
+
+/// Names of the namespaces ztest manages: per-test environments (labelled
+/// [`LABEL_ROLE`]=[`ROLE_TEST_ENV`] by [`crate::cluster::ensure_namespace`])
+/// plus the QoS infra namespaces (`zaino-qos` ledger, `zaino-seeds` archive
+/// staging). Pods in these are ztest's *own* load, accounted via the ledger;
+/// they are excluded from the baseline so they are never counted twice.
+fn ztest_namespaces(namespaces: &[Namespace]) -> BTreeSet<String> {
+    namespaces
+        .iter()
+        .filter(|ns| {
+            let name = ns.metadata.name.as_deref().unwrap_or_default();
+            name == crate::qos::kube_store::QOS_NAMESPACE
+                || name == crate::seeds::SEEDS_NAMESPACE
+                || ns
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get(LABEL_ROLE))
+                    .map(|v| v == ROLE_TEST_ENV)
+                    .unwrap_or(false)
+        })
+        .filter_map(|ns| ns.metadata.name.clone())
+        .collect()
+}
+
+/// Sum of effective requests over scheduled, live pods that are *not*
+/// ztest-managed — the non-ztest baseline. Sizes
+/// [`ClusterCapacity::admission_ceiling`]: load ztest cannot shed by waiting,
+/// so a footprint exceeding `allocatable − baseline` is a hard reject, while
+/// ztest's own load is tracked separately through the reservation ledger.
+fn baseline_requested(pods: &[Pod], ztest_ns: &BTreeSet<String>) -> Resources {
+    pods.iter()
+        .filter(|p| pod_consumes(p))
+        .filter(|p| {
+            !p.metadata
+                .namespace
+                .as_deref()
+                .map(|ns| ztest_ns.contains(ns))
+                .unwrap_or(false)
+        })
         .filter_map(|p| p.spec.as_ref())
         .fold(Resources::ZERO, |acc, spec| {
             acc.saturating_add(&units::pod_effective_requests(spec))
@@ -291,6 +402,33 @@ mod tests {
         }
     }
 
+    /// A node carrying the NVMe pool label, with the given ready/cordoned state.
+    fn nvme_node(ready: bool, cordoned: bool) -> Node {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+        let mut n = node(ready, cordoned, "4", "8Gi");
+        n.metadata = ObjectMeta {
+            labels: Some(BTreeMap::from([(
+                NVME_NODE_LABEL_KEY.to_string(),
+                NVME_NODE_LABEL_VALUE.to_string(),
+            )])),
+            ..Default::default()
+        };
+        n
+    }
+
+    #[test]
+    fn count_nvme_nodes_counts_only_labeled_schedulable_nodes() {
+        let nodes = vec![
+            nvme_node(true, false),         // counted
+            nvme_node(true, true),          // labeled but cordoned → excluded
+            nvme_node(false, false),        // labeled but not ready → excluded
+            node(true, false, "4", "8Gi"),  // schedulable but unlabeled → excluded
+        ];
+        assert_eq!(count_nvme_nodes(&nodes), 1);
+        // A cluster with no NVMe pool → 0 (lowering floors it back to 1).
+        assert_eq!(count_nvme_nodes(&[node(true, false, "4", "8Gi")]), 0);
+    }
+
     #[test]
     fn count_nodes_reports_ready_and_cordoned() {
         let nodes = vec![
@@ -334,9 +472,82 @@ mod tests {
         let cap = ClusterCapacity {
             allocatable: cluster_allocatable(&nodes),
             requested: cluster_requested(&pods),
+            baseline: baseline_requested(&pods, &BTreeSet::new()),
         };
         assert_eq!(cap.free().cpu_milli, 6000);
         assert_eq!(cap.free().mem_bytes, 12 * crate::qos::GIB);
+    }
+
+    fn pod_in(ns: &str, node_name: Option<&str>, phase: &str, cpu: &str, mem: &str) -> Pod {
+        let mut p = pod(node_name, phase, cpu, mem);
+        p.metadata.namespace = Some(ns.to_string());
+        p
+    }
+
+    fn ns_with_role(name: &str, role: Option<&str>) -> Namespace {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+        Namespace {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                labels: role.map(|r| {
+                    BTreeMap::from([(LABEL_ROLE.to_string(), r.to_string())])
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ztest_namespaces_picks_test_envs_and_infra() {
+        let nss = vec![
+            ns_with_role("ztest-foo-abc", Some(ROLE_TEST_ENV)), // labelled test-env
+            ns_with_role("zaino-qos", None),                    // infra by name
+            ns_with_role("zaino-seeds", None),                  // infra by name
+            ns_with_role("default", None),                      // unrelated
+            ns_with_role("kube-system", Some("something-else")), // wrong role value
+        ];
+        let set = ztest_namespaces(&nss);
+        assert!(set.contains("ztest-foo-abc"));
+        assert!(set.contains("zaino-qos"));
+        assert!(set.contains("zaino-seeds"));
+        assert!(!set.contains("default"));
+        assert!(!set.contains("kube-system"));
+    }
+
+    #[test]
+    fn baseline_excludes_ztest_pods_counts_only_non_ztest() {
+        let ztest_ns: BTreeSet<String> =
+            ["ztest-foo-abc", "zaino-qos"].into_iter().map(String::from).collect();
+        let pods = vec![
+            pod_in("kube-system", Some("n1"), "Running", "500m", "512Mi"), // baseline
+            pod_in("ztest-foo-abc", Some("n1"), "Running", "4", "8Gi"),    // ztest → excluded
+            pod_in("zaino-qos", Some("n1"), "Running", "1", "1Gi"),        // ztest → excluded
+        ];
+        let b = baseline_requested(&pods, &ztest_ns);
+        assert_eq!(b.cpu_milli, 500); // only kube-system
+        assert_eq!(b.mem_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn admission_ceiling_is_allocatable_minus_baseline_only() {
+        let nodes = vec![node(true, false, "8", "16Gi")];
+        let ztest_ns: BTreeSet<String> = ["ztest-foo"].into_iter().map(String::from).collect();
+        // A big ztest pod plus a small non-ztest baseline pod.
+        let pods = vec![
+            pod_in("ztest-foo", Some("n1"), "Running", "6", "12Gi"), // ztest load
+            pod_in("kube-system", Some("n1"), "Running", "1", "2Gi"), // baseline
+        ];
+        let cap = ClusterCapacity {
+            allocatable: cluster_allocatable(&nodes),
+            requested: cluster_requested(&pods),
+            baseline: baseline_requested(&pods, &ztest_ns),
+        };
+        // Ceiling ignores the 6-core ztest pod: 8 − 1 = 7 cores, 16 − 2 = 14Gi.
+        assert_eq!(cap.admission_ceiling().cpu_milli, 7000);
+        assert_eq!(cap.admission_ceiling().mem_bytes, 14 * crate::qos::GIB);
+        // free() still nets out everything: 8 − 7 = 1 core.
+        assert_eq!(cap.free().cpu_milli, 1000);
     }
 
     #[test]

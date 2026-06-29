@@ -4,7 +4,8 @@
 //! `ZTEST_DUMP_INVENTORY=1` (and `--`-terminated argv so no test
 //! filter args confuse the harness — the ctor hook exits before
 //! libtest reads argv anyway, but cleaner). Each binary writes one
-//! JSON-serialized `DevImageEntry` per line to stdout, then exits 0.
+//! `"kind"`-tagged JSON `InventoryLine` per line to stdout, then exits 0;
+//! we keep the `Dev` lines and ignore `Qos` ones (consumed elsewhere).
 //!
 //! We collect across every binary and dedupe by
 //! `(dockerfile, context, repo, features)` — the same `dev!` call
@@ -21,8 +22,15 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::inventory::DevImageEntry;
+use crate::inventory::{DevImageEntry, InventoryLine, QosEntry};
 use crate::pipeline::build::SelectedBinary;
+
+/// Both registries demuxed from one binary's tagged inventory dump stream.
+#[derive(Debug, Default)]
+struct Dumped {
+    dev: Vec<DevImageEntry>,
+    qos: Vec<QosEntry>,
+}
 
 /// Result of Phase C — the deduped set of dev images required by the
 /// currently-selected test set.
@@ -38,34 +46,49 @@ pub enum ImagesOutcome {
 }
 
 /// Run the inventory dump for each selected binary in turn (cheap —
-/// each is sub-100ms — and serial keeps the output legible). Returns
-/// a deduped list ready for the docker pipeline.
-pub async fn discover(binaries: &[SelectedBinary]) -> ImagesOutcome {
+/// each is sub-100ms — and serial keeps the output legible). The same
+/// dump stream carries both registries: returns the deduped dev-image
+/// list for the docker pipeline **and** the per-binary QoS tier
+/// declarations for nextest config lowering (`qos::lower`). QoS entries
+/// are kept binary-scoped because the lowering filters by `binary_id`
+/// (exact test names can collide across binaries).
+pub async fn discover(
+    binaries: &[SelectedBinary],
+) -> (ImagesOutcome, Vec<(String, Vec<QosEntry>)>) {
     let mut seen: BTreeSet<DedupKey> = BTreeSet::new();
     let mut images: Vec<DevImageEntry> = Vec::new();
+    let mut qos_by_binary: Vec<(String, Vec<QosEntry>)> = Vec::new();
 
     for bin in binaries {
         match dump_one(bin).await {
-            Ok(decls) => {
-                for d in decls {
+            Ok(Dumped { dev, qos }) => {
+                for d in dev {
                     if seen.insert(DedupKey::from(&d)) {
                         images.push(d);
                     }
                 }
+                if !qos.is_empty() {
+                    qos_by_binary.push((bin.binary_id.clone(), qos));
+                }
             }
             Err(detail) => {
-                return ImagesOutcome::Failed {
-                    detail: format!("{}: {detail}", bin.binary_id),
-                };
+                // On failure the caller aborts before lowering, so the
+                // partial QoS accumulation is moot.
+                return (
+                    ImagesOutcome::Failed {
+                        detail: format!("{}: {detail}", bin.binary_id),
+                    },
+                    qos_by_binary,
+                );
             }
         }
     }
-    ImagesOutcome::Discovered { images }
+    (ImagesOutcome::Discovered { images }, qos_by_binary)
 }
 
 /// Spawn one binary with `ZTEST_DUMP_INVENTORY=1` and parse the
-/// JSON-lines stdout.
-async fn dump_one(bin: &SelectedBinary) -> Result<Vec<DevImageEntry>, String> {
+/// JSON-lines stdout into both registries.
+async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, String> {
     let mut cmd = Command::new(&bin.binary_path);
     cmd.env("ZTEST_DUMP_INVENTORY", "1")
         .current_dir(&bin.cwd)
@@ -85,19 +108,21 @@ async fn dump_one(bin: &SelectedBinary) -> Result<Vec<DevImageEntry>, String> {
 
     let stdout_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
-        let mut decls = Vec::new();
+        let mut dumped = Dumped::default();
         while let Ok(Some(line)) = lines.next_line().await {
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<DevImageEntry>(&line) {
-                Ok(d) => decls.push(d),
+            // Lines are tagged; demux the two registries onto one stream.
+            match serde_json::from_str::<InventoryLine>(&line) {
+                Ok(InventoryLine::Dev(d)) => dumped.dev.push(d),
+                Ok(InventoryLine::Qos(q)) => dumped.qos.push(q),
                 Err(e) => {
                     return Err(format!("malformed inventory line `{line}`: {e}"));
                 }
             }
         }
-        Ok(decls)
+        Ok(dumped)
     });
 
     let stderr_task = tokio::spawn(async move {
@@ -116,7 +141,7 @@ async fn dump_one(bin: &SelectedBinary) -> Result<Vec<DevImageEntry>, String> {
         .map_err(|e| format!("wait on `{}`: {e}", bin.binary_path.display()))?;
 
     let stderr_tail = stderr_task.await.unwrap_or_default();
-    let decls = stdout_task
+    let dumped = stdout_task
         .await
         .map_err(|e| format!("stdout join: {e}"))?
         .map_err(|e| format!("{e}\nstderr:\n{}", tail(&stderr_tail, 20)))?;
@@ -131,7 +156,7 @@ async fn dump_one(bin: &SelectedBinary) -> Result<Vec<DevImageEntry>, String> {
             tail(&stderr_tail, 20)
         ));
     }
-    Ok(decls)
+    Ok(dumped)
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]

@@ -280,6 +280,15 @@ authenticates with; the broker reads the budget annotation off that SA at
 startup. A `Reject` fails the test with a clear "tier T needs C CPU / M
 GiB; SA budget is …" message.
 
+Budget annotations are validated when read (`qos::parse_sa_budget`): an
+**absent** annotation means unbudgeted/unlimited, a **partial** budget leaves
+the unset dimension unlimited, but a **present-but-unparseable** value fails the
+run with a clear error rather than silently degrading to a `0` budget (which
+would reject every request) or being ignored — a typo must not masquerade as a
+real limit. Infrastructure errors reading the SA (missing object, transient API
+failure) stay best-effort and fall back to unbudgeted, so they never block on a
+cluster hiccup.
+
 ## 6. nextest config lowering
 
 After `nextest list` + the QOS dump, `ztest run` writes a generated
@@ -333,6 +342,29 @@ precedence) so the pool ceiling always takes effect.
 reserved test workloads (distinct from *ztest* tiers — name collision to
 call out in docs).
 
+**Resolved — pod sizing for maximum performance (`env::even_share` +
+`manifest::PodSpec`):** when a test doesn't call `.resources()`, the tier
+footprint is split **evenly across the env's pods** (validators + indexers;
+in-process wallets get none) and rendered as `requests == limits`. The CPU
+share is rounded **up to whole cores** (≥1) so each container is eligible for
+the kubelet **CPU Manager `static` policy** (exclusive, pinned CPUs) — fractional
+CPU would drop the pod into the shared pool. Memory is the exact even share.
+Pods are **killed, never migrated**, on node failure: they are bare `Pod`s with
+`restartPolicy: Never` (k8s never recreates them), and the auto-added
+`node.kubernetes.io/{not-ready,unreachable}` tolerations are overridden to
+`tolerationSeconds: 0` so a lost node deletes the pod immediately instead of
+after the default 5-minute grace. An explicit `.resources()` overrides this
+(requests-only, as before).
+
+Because the per-pod CPU is rounded up to whole cores, `pods × per-pod` can
+exceed the raw tier footprint (8 cores over 3 pods → 3+3+3 = 9). Admission
+therefore reserves the **deployed** footprint (`env::deployed_footprint` =
+per-pod share × pods), *not* the raw tier footprint, so the ledger can never
+under-count and grant capacity a pod then can't schedule into. For the `sync`
+tier (NVMe nodeSelector), `build()` also fails fast if **no NVMe-pool node is
+schedulable** rather than admitting against global capacity and leaving the pod
+Pending on an unsatisfiable selector until `ready_timeout`.
+
 ## 8. Preflight planning & display
 
 `ztest run` already reserves `tier`, `queue`, `reservation` banner rows
@@ -384,21 +416,53 @@ coarse-nextest to precise-2-D.
 
 ## 11. Open questions
 
-- **Per-test reservation table** (§2): the definitive CPU/RAM per tier.
-  Caps/timeouts are locked; sizes are pending.
-- **Tier budget vs per-pod resources** (§2, §7): the tier reserve is the
-  *namespace aggregate* (broker schedules on it; pods share it) — how is
-  it distributed across components when `.resources()` is absent?
-- **SA budget annotation key** (§5.6): exact annotation name/format admins
-  set on the ServiceAccount.
-- **slow-timeout backstop value** (§5.2): exec-cap exactly, or exec-cap +
-  margin? Trade: tighter = kills contended tests sooner; looser = weaker
-  hung-test net.
+- **Per-test reservation table** (§2): _Resolved_ — `basic` 500m/512Mi,
+  `integration` 2c/2Gi, `testnet` 8c/18Gi, `sync` 16c/32Gi
+  (`QosClass::profile`). Caps/timeouts remain locked.
+- **Tier budget vs per-pod resources** (§2, §7): _Resolved_ — split the
+  aggregate footprint **evenly across the env's pods**, `requests == limits`,
+  CPU rounded up to whole cores for static-policy pinning; explicit
+  `.resources()` overrides (see §7).
+- **SA budget annotation key** (§5.6): _Resolved_ —
+  `qos.zaino.io/budget-cpu` / `qos.zaino.io/budget-mem` (k8s quantities) on the
+  run's ServiceAccount, identified by the `ZTEST_SA` env var, read in-cluster
+  (`qos::parse_sa_budget` + `TestEnv::build`).
+- **slow-timeout backstop value** (§5.2): _Resolved_ — no admission-anchored
+  exec-cap timer was built, so nextest's `slow-timeout` is the **sole** cap.
+  Since it measures from process *spawn*, it's set `period = hard_cap,
+  terminate-after = 2`: flagged SLOW at one `hard_cap`, hard-killed at 2× — a
+  test keeps roughly a full execution budget after a (short, by §5.2) queue
+  wait. Teardown on a timeout-kill relies on the `janitor/ttl` backstop. A
+  future in-process watchdog could anchor the cap at admission and demote this
+  to a loose backstop.
 - **NVMe node identification**: exact label/taint key for the NVMe pool.
+  _(Placeholder `zaino.io/pool=nvme` in `qos::NVME_*`; node count sizes the
+  `qos-sync` group via the probe.)_
 _Resolved during audit (§12):_ admission point = `TestEnv::build()` (not
 wrapper scripts), so topology-less tests reserve nothing and we take no
 dependency on experimental nextest scripts; tool-config precedence
 handled by making the broker authoritative (§6).
+
+**Audit hardening (correctness fixes):**
+- **Admission lock TOCTOU** — the per-process lock isn't renewed mid-section,
+  so a critical section that outlives `LOCK_TICKS` could be stolen and let two
+  allocators commit against one free snapshot (overcommit). The reservation
+  `create` is now **fenced** on continued lock ownership (re-check the lock's
+  version == the acquired epoch immediately before committing; abort → `Retry`
+  otherwise), narrowing the window from the whole section to a sub-millisecond
+  gap ≪ `LOCK_TICKS`.
+- **Live-panel signal handling** — `ztest run`'s live panel resets the DECSTBM
+  scroll region on `Drop`, but a signal skips `Drop`. The poll loop now selects
+  on `ctrl_c()` and resets the terminal + cleans the temp tool-config explicitly
+  before exiting `130`, so Ctrl-C (the normal exit for a long `sync` run) never
+  leaves a stuck scroll region.
+
+**Known limitation (deferred):** a present `Job` always counts toward committed
+capacity with no liveness check — a lingering completed/failed Job (no TTL GC,
+stuck finalizer) keeps consuming capacity until externally deleted. Reservations
+self-heal via lease expiry; Jobs lean on the cluster's Job GC / the planned
+`janitor/ttl` backstop. Filtering Jobs by pod phase in `ledger::reconstruct` is
+the eventual fix but needs the kube adapter to surface Job status first.
 
 ## 12. nextest integration strategy (research findings)
 

@@ -592,3 +592,145 @@ mod tests {
         assert!(lease.spec.is_none());
     }
 }
+
+/// End-to-end tests against a **real** cluster — the one thing the in-memory
+/// fake can't cover: that the live `kube` adapter actually performs the
+/// optimistic-concurrency CAS, the `NotOlderThan` watermark read, the
+/// label-filtered list, and the annotation round-trip on genuine
+/// `coordination.k8s.io` Leases.
+///
+/// Logical time is still injected (`now: u64`) exactly as in the unit tests —
+/// only the *store* is real. Each test runs in its own throwaway namespace and
+/// deletes it on the way out.
+///
+/// Gated `#[ignore]` so the default `cargo test` (no cluster) skips them; run
+/// with a reachable kubeconfig via `cargo test -p ztest --lib -- --ignored`
+/// (or `cargo nextest run --run-ignored all`). If no cluster is reachable the
+/// test skips itself gracefully rather than failing.
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use crate::qos::allocator::{Allocator, Outcome, ReservationRequest, reservation_name};
+    use crate::qos::store::{Kind, LabelSelector, ObjectStore};
+    use crate::qos::{
+        ANN_CPU_MILLI, ANN_RENEW_TICK, GIB, LABEL_ROLE, LABEL_TIER, QosClass, ROLE_RESERVATION,
+        Resources,
+    };
+
+    /// Connect to the cluster + create a unique throwaway namespace. `None`
+    /// (skip) when no cluster is reachable.
+    async fn fresh(tag: &str) -> Option<(KubeStore, String)> {
+        let client = crate::cluster::client().await.ok()?;
+        // Unique per (process, test) so concurrent ignored tests don't collide
+        // and a fresh run never sees a previous run's leftovers.
+        let ns = format!("zaino-qos-it-{}-{}", tag, std::process::id());
+        let store = KubeStore::new(client, ns.clone());
+        store.ensure_namespace().await.expect("ensure test namespace");
+        Some((store, ns))
+    }
+
+    /// Best-effort namespace teardown (the Leases live inside it).
+    async fn cleanup(store: &KubeStore, ns: &str) {
+        if let Ok(client) = crate::cluster::client().await {
+            let _ = crate::cluster::delete_namespace(&client, ns).await;
+        }
+        let _ = store; // keep the store alive until here
+    }
+
+    fn rr(unit: &str, cpu: u64, mem: u64, class: QosClass) -> ReservationRequest {
+        ReservationRequest {
+            unit: unit.to_string(),
+            sa: "it-sa".to_string(),
+            footprint: Resources::new(cpu, mem),
+            class,
+        }
+    }
+
+    // Full lifecycle on real Leases: admit → present → read-your-write list at
+    // the created watermark (NotOlderThan) → renew → release → reclaim.
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; run with: cargo test --lib -- --ignored"]
+    async fn kube_reservation_lifecycle() {
+        let Some((store, ns)) = fresh("life").await else {
+            eprintln!("skip: no cluster reachable");
+            return;
+        };
+        // lock TTL 5, reservation TTL 100, grace 10 ticks (injected time).
+        let a = Allocator::new(store.clone(), Resources::new(8_000, 16 * GIB), "it-run", 5, 100, 10);
+
+        // Admit → Granted, lock released, tier label written.
+        let out = a.try_admit(&rr("u1", 4_000, 4 * GIB, QosClass::Sync), 0).await.unwrap();
+        let Outcome::Granted { reservation } = out else {
+            cleanup(&store, &ns).await;
+            panic!("expected grant, got {out:?}");
+        };
+        assert_eq!(reservation, reservation_name("u1"));
+        assert_eq!(store.count_via_list(ROLE_RESERVATION).await, 1);
+
+        // The Lease carries its tier + survives the annotation round-trip.
+        let obj = store.get(Kind::Reservation, &reservation).await.unwrap().unwrap();
+        assert_eq!(obj.labels.get(LABEL_TIER).map(String::as_str), Some("sync"));
+        assert_eq!(obj.annot_u64(ANN_CPU_MILLI), Some(4_000));
+
+        // NotOlderThan read-your-write: a list at the just-created rv must
+        // reflect the create (the watermark read is wired correctly).
+        let fresh_list = store
+            .list(
+                Kind::Reservation,
+                &LabelSelector::eq(LABEL_ROLE, ROLE_RESERVATION),
+                Some(obj.resource_version),
+            )
+            .await
+            .expect("watermark list");
+        assert!(fresh_list.iter().any(|o| o.name == reservation), "read-your-write");
+
+        // Renew bumps the lease (rv advances on the real server).
+        a.renew(&reservation, 50).await.unwrap();
+        let after = store.get(Kind::Reservation, &reservation).await.unwrap().unwrap();
+        assert!(after.resource_version > obj.resource_version, "renew advanced rv");
+        assert_eq!(after.annot_u64(ANN_RENEW_TICK), Some(50));
+
+        // Release removes it.
+        a.release(&reservation).await.unwrap();
+        assert!(store.get(Kind::Reservation, &reservation).await.unwrap().is_none());
+
+        // Reclaim on an empty ledger is a no-op (and idempotent).
+        assert!(a.reclaim_expired(10_000).await.unwrap().is_empty());
+
+        cleanup(&store, &ns).await;
+    }
+
+    // Real lock CAS + cross-instance list: a pool that fits exactly one cannot
+    // be overcommitted by two allocators sharing the cluster.
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; run with: cargo test --lib -- --ignored"]
+    async fn kube_two_allocators_cannot_overcommit() {
+        let Some((store, ns)) = fresh("nooc").await else {
+            eprintln!("skip: no cluster reachable");
+            return;
+        };
+        let pool = Resources::new(4_000, 4 * GIB);
+        let a1 = Allocator::new(store.clone(), pool, "run-a", 5, 100, 10);
+        let a2 = Allocator::new(store.clone(), pool, "run-b", 5, 100, 10);
+
+        let g = a1.try_admit(&rr("u1", 4_000, 4 * GIB, QosClass::Basic), 0).await.unwrap();
+        assert!(matches!(g, Outcome::Granted { .. }), "first admit: {g:?}");
+        // a2's strongly-consistent read sees u1 → no room → Queued (not a 2nd grant).
+        let q = a2.try_admit(&rr("u2", 4_000, 4 * GIB, QosClass::Basic), 1).await.unwrap();
+        assert_eq!(q, Outcome::Queued, "second must queue, not overcommit");
+        assert_eq!(store.count_via_list(ROLE_RESERVATION).await, 1, "exactly one reservation");
+
+        cleanup(&store, &ns).await;
+    }
+
+    impl KubeStore {
+        /// Count reservation Leases via a real label-filtered `list` (test
+        /// helper — exercises the live list path).
+        async fn count_via_list(&self, role: &str) -> usize {
+            self.list(Kind::Reservation, &LabelSelector::eq(LABEL_ROLE, role), None)
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0)
+        }
+    }
+}

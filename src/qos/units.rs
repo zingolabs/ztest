@@ -17,27 +17,32 @@ use super::Resources;
 /// 0 *under*-counts (the unsafe direction for capacity), the goal is to leave
 /// no realistic k8s unit unhandled.
 pub(crate) fn parse_cpu_milli(s: &str) -> u64 {
+    parse_cpu_milli_opt(s).unwrap_or(0)
+}
+
+/// Like [`parse_cpu_milli`] but yields `None` on an unparseable quantity
+/// instead of `0`. Callers that must distinguish "absent or garbage" from a
+/// deliberate `0` (e.g. SA-budget validation, where a typo'd budget must be
+/// rejected loudly rather than silently become a zero budget that fails every
+/// request) use this; the probe path that under-counts safely uses the `u64`
+/// form.
+pub(crate) fn parse_cpu_milli_opt(s: &str) -> Option<u64> {
     let s = s.trim();
     // Float→int casts saturate in Rust (≥1.45): NaN→0, negatives→0,
     // huge→u64::MAX — all safe, no panics.
-    let scaled = |body: &str, per_milli: f64| -> u64 {
-        body.trim()
-            .parse::<f64>()
-            .map(|v| (v / per_milli).round() as u64)
-            .unwrap_or(0)
+    let scaled = |body: &str, per_milli: f64| -> Option<u64> {
+        body.trim().parse::<f64>().ok().map(|v| (v / per_milli).round() as u64)
     };
     if let Some(n) = s.strip_suffix('m') {
         // Millicores are integers in valid k8s quantities.
-        n.trim().parse::<u64>().unwrap_or(0)
+        n.trim().parse::<u64>().ok()
     } else if let Some(n) = s.strip_suffix('u') {
         scaled(n, 1_000.0) // microcores → millicores
     } else if let Some(n) = s.strip_suffix('n') {
         scaled(n, 1_000_000.0) // nanocores → millicores
     } else {
         // Bare cores, possibly fractional or exponent ("1.5", "2e0").
-        s.parse::<f64>()
-            .map(|cores| (cores * 1000.0).round() as u64)
-            .unwrap_or(0)
+        s.parse::<f64>().ok().map(|cores| (cores * 1000.0).round() as u64)
     }
 }
 
@@ -45,6 +50,13 @@ pub(crate) fn parse_cpu_milli(s: &str) -> u64 {
 /// (`Ki/Mi/Gi/Ti/Pi/Ei`), decimal SI (`k/K, M, G, T, P, E`), exponent
 /// (`129e6`), and raw bytes. Overflow saturates; unparseable → 0.
 pub(crate) fn parse_mem_bytes(s: &str) -> u64 {
+    parse_mem_bytes_opt(s).unwrap_or(0)
+}
+
+/// Like [`parse_mem_bytes`] but yields `None` on an unparseable quantity
+/// instead of `0` — see [`parse_cpu_milli_opt`] for the absent-vs-garbage
+/// rationale.
+pub(crate) fn parse_mem_bytes_opt(s: &str) -> Option<u64> {
     let s = s.trim();
     // Order matters: two-char binary suffixes are checked before the
     // single-char decimal ones they'd otherwise shadow.
@@ -77,12 +89,12 @@ pub(crate) fn parse_mem_bytes(s: &str) -> u64 {
     };
     let num = num.trim();
     if let Ok(v) = num.parse::<u64>() {
-        v.saturating_mul(mult)
+        Some(v.saturating_mul(mult))
     } else if let Ok(f) = num.parse::<f64>() {
         // Fractional/exponent forms ("1.5Gi", "129e6").
-        (f.max(0.0) * mult as f64).round() as u64
+        Some((f.max(0.0) * mult as f64).round() as u64)
     } else {
-        0
+        None
     }
 }
 

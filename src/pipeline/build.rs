@@ -32,7 +32,9 @@
 use std::process::Stdio;
 
 use nextest_metadata::TestListSummary;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::preflight::BuildStage;
 
@@ -40,7 +42,16 @@ use super::events::{Event, EventTx};
 
 /// Run the two-step `cargo nextest list` pipeline and emit lifecycle
 /// [`Event`]s.
-pub async fn run(nextest_args: &[String], tx: &EventTx) -> std::io::Result<BuildOutcome> {
+///
+/// When `lines` is `Some`, pass 1's stderr is piped and each line is forwarded
+/// there (so the unified bottom console can relay `Compiling …` into native
+/// scrollback above its panel); when `None`, stderr is inherited as before
+/// (the non-TTY / linear path). The JSON pass is always captured.
+pub async fn run(
+    nextest_args: &[String],
+    tx: &EventTx,
+    lines: Option<UnboundedSender<String>>,
+) -> std::io::Result<BuildOutcome> {
     let _ = tx.send(Event::BuildStarted);
 
     // Strip run-only flags before forwarding to `cargo nextest list`.
@@ -53,18 +64,35 @@ pub async fn run(nextest_args: &[String], tx: &EventTx) -> std::io::Result<Build
     let list_args = strip_run_only_flags(nextest_args);
 
     // ───── Pass 1: chatty compile ─────
-    // stderr inherited → `Compiling foo`, warnings, errors all reach
-    // the user's terminal beneath the pinned banner. stdout=null
-    // drops the human-readable test listing cargo would otherwise
-    // print.
-    let pass1 = Command::new("cargo")
-        .arg("nextest")
-        .arg("list")
-        .args(&list_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .await?;
+    // Cargo's stderr (`Fetching`, `Compiling foo`, warnings, errors) is what the
+    // user watches while test binaries build. stdout=null drops the
+    // human-readable test listing. With `lines` set we pipe stderr and relay it
+    // line-by-line into the console's scrollback; otherwise it's inherited.
+    let pass1 = if let Some(lines) = lines {
+        let mut child = Command::new("cargo")
+            .arg("nextest")
+            .arg("list")
+            .args(&list_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(stderr) = child.stderr.take() {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Some(line) = reader.next_line().await? {
+                let _ = lines.send(line);
+            }
+        }
+        child.wait().await?
+    } else {
+        Command::new("cargo")
+            .arg("nextest")
+            .arg("list")
+            .args(&list_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .await?
+    };
 
     if !pass1.success() {
         let exit_code = pass1.code().unwrap_or(-1);
@@ -79,49 +107,67 @@ pub async fn run(nextest_args: &[String], tx: &EventTx) -> std::io::Result<Build
     }
 
     let _ = tx.send(Event::BuildIndexing);
+    let outcome = index(&list_args).await?;
+    match &outcome {
+        BuildOutcome::Ok {
+            test_count,
+            binary_count,
+            ..
+        } => {
+            let _ = tx.send(Event::BuildComplete {
+                test_count: *test_count,
+                binary_count: *binary_count,
+            });
+        }
+        BuildOutcome::Failed { exit_code, stage } => {
+            let _ = tx.send(Event::BuildFailed {
+                exit_code: *exit_code,
+                stage: *stage,
+            });
+        }
+    }
+    Ok(outcome)
+}
 
-    // ───── Pass 2: silent JSON inventory ─────
-    // stdout=piped so we capture the JSON. stderr=null because
-    // `--message-format=json` suppresses progress anyway and we don't
-    // want a second wave of compile lines (cache is warm).
+/// The `cargo nextest list` arguments, with run-only flags stripped — the
+/// caller (the unified console) runs pass 1 (`cargo nextest list <args>`) under
+/// a PTY itself, then calls [`index`] for pass 2.
+pub fn list_args(nextest_args: &[String]) -> Vec<String> {
+    strip_run_only_flags(nextest_args)
+}
+
+/// Pass 2 — the silent JSON inventory parse. stdout is piped (we capture the
+/// JSON); stderr is dropped (`--message-format=json` suppresses progress and the
+/// compile cache is warm from pass 1). Returns [`BuildOutcome::Ok`] with the
+/// resolved selection, [`BuildOutcome::Failed`] on a non-zero exit, or `Err` on
+/// unparseable JSON.
+pub async fn index(list_args: &[String]) -> std::io::Result<BuildOutcome> {
     let pass2 = Command::new("cargo")
         .arg("nextest")
         .arg("list")
         .arg("--message-format=json")
-        .args(&list_args)
+        .args(list_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
         .await?;
 
     if !pass2.status.success() {
-        let exit_code = pass2.status.code().unwrap_or(-1);
-        let _ = tx.send(Event::BuildFailed {
-            exit_code,
-            stage: BuildStage::Index,
-        });
         return Ok(BuildOutcome::Failed {
-            exit_code,
+            exit_code: pass2.status.code().unwrap_or(-1),
             stage: BuildStage::Index,
         });
     }
 
-    let summary: TestListSummary = match serde_json::from_slice(&pass2.stdout) {
-        Ok(s) => s,
-        Err(err) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("failed to parse `cargo nextest list` JSON: {err}"),
-            ));
-        }
-    };
+    let summary: TestListSummary = serde_json::from_slice(&pass2.stdout).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to parse `cargo nextest list` JSON: {err}"),
+        )
+    })?;
 
     let (test_count, binary_count) = count_selected(&summary);
     let selected_binaries = collect_selected_binaries(&summary);
-    let _ = tx.send(Event::BuildComplete {
-        test_count,
-        binary_count,
-    });
     Ok(BuildOutcome::Ok {
         test_count,
         binary_count,

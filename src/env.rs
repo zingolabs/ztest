@@ -44,6 +44,9 @@ use crate::manifest::{self, PodSpec};
 use crate::mounts::{self, ResolvedMount};
 use crate::naming::{self, RunCoords};
 use crate::portforward::Forwarder;
+use crate::qos::allocator::{Allocator, Outcome, ReservationRequest};
+use crate::qos::kube_store::KubeStore;
+use crate::qos::{self, AdmitStep};
 use crate::seeds::{self, ShadowClone};
 
 /// Per-component bookkeeping captured at `build` time.
@@ -86,6 +89,13 @@ pub(crate) struct EnvInner {
     pub(crate) forwards: ForwardRegistry,
     pub(crate) shadow_clones: std::sync::Mutex<Vec<ShadowClone>>,
     pub(crate) is_built: AtomicBool,
+    /// The QoS capacity reservation Lease held for this env's life, if QoS
+    /// admission was enabled and granted. `Some(name)` ⇒ a `qos-*` Lease in
+    /// the `zaino-qos` namespace must be released on teardown.
+    pub(crate) qos_reservation: std::sync::Mutex<Option<String>>,
+    /// Background task heartbeating [`Self::qos_reservation`]. Aborted on Drop
+    /// (the reservation is then released explicitly, not left to expiry).
+    pub(crate) qos_renew_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -97,6 +107,10 @@ impl std::fmt::Debug for EnvInner {
             )
             .field("in_cluster", &self.in_cluster)
             .field("is_built", &self.is_built.load(Ordering::Relaxed))
+            .field(
+                "qos_reservation",
+                &self.qos_reservation.lock().ok().and_then(|g| g.clone()),
+            )
             .finish()
     }
 }
@@ -111,6 +125,8 @@ impl EnvInner {
             forwards: Arc::new(Mutex::new(HashMap::new())),
             shadow_clones: std::sync::Mutex::new(Vec::new()),
             is_built: AtomicBool::new(false),
+            qos_reservation: std::sync::Mutex::new(None),
+            qos_renew_task: std::sync::Mutex::new(None),
         }
     }
 
@@ -577,6 +593,206 @@ impl TestEnv {
         Ok(())
     }
 
+    /// QoS admission (`docs/qos-design.md` §5, §7).
+    ///
+    /// When QoS is enabled (`ztest run` set `ZTEST_QOS`), reserve this test's
+    /// tier footprint against shared cluster capacity *before* any pod is
+    /// created, via the decentralized in-process [`Allocator`] over the
+    /// `zaino-qos` Lease ledger. Blocks while the request is queued for
+    /// capacity (up to [`qos::ADMIT_BUDGET`]); fails fast if the footprint is
+    /// unschedulable even on an empty cluster. On grant it stores the
+    /// reservation name and spawns a heartbeat task that renews the Lease for
+    /// the env's life; [`Drop`] aborts the heartbeat and releases the Lease.
+    ///
+    /// When QoS is disabled (a developer running `cargo nextest run`
+    /// directly), this is a no-op — admission is skipped and the harness
+    /// behaves exactly as before.
+    async fn admit(
+        &self,
+        client: &Client,
+        namespace: &str,
+        coords: &RunCoords,
+    ) -> Result<(), EnvError> {
+        if !cluster::qos_enabled() {
+            return Ok(());
+        }
+        let profile = qos::current().profile();
+
+        // Per-test re-probe: the parent `ztest run` probe result doesn't cross
+        // the nextest process boundary, so size the allocator's ceiling from a
+        // live probe. Use the *admission ceiling* (`allocatable − non-ztest
+        // baseline`), NOT `free()`: the allocator must reject only footprints
+        // that don't fit an empty-of-ztest cluster, and queue everything else.
+        // ztest's own concurrent load is accounted exactly once, via the
+        // ledger's committed reservations inside `decide()` — counting it again
+        // here (as `free()` does, by subtracting every ztest pod's requests)
+        // collapses the ceiling under load and turns queue-able tests into
+        // spurious `ExceedsClusterCapacity` rejections.
+        let ceiling = crate::pipeline::cluster::capacity(client)
+            .await
+            .map_err(env_err)?
+            .admission_ceiling();
+
+        // Sync-tier pods carry an NVMe nodeSelector (§7). The global ceiling
+        // figure above can't see that this footprint only fits on NVMe nodes,
+        // so check the NVMe pool directly: with none schedulable, fail fast
+        // here instead of admitting and leaving the pod Pending on an
+        // unsatisfiable selector until `ready_timeout`.
+        if profile.pool == qos::Pool::Nvme {
+            let nvme = crate::pipeline::cluster::nvme_node_count(client)
+                .await
+                .map_err(env_err)?;
+            if nvme == 0 {
+                return Err(EnvError::Config {
+                    reason: format!(
+                        "QoS tier {:?} requires an NVMe-pool node ({}={}) but none are \
+                         schedulable; cannot place this test's pods",
+                        qos::current(),
+                        qos::NVME_NODE_LABEL_KEY,
+                        qos::NVME_NODE_LABEL_VALUE,
+                    ),
+                });
+            }
+        }
+
+        // The Lease ledger lives in a single ztest-managed namespace; create
+        // it before the allocator issues any read/write against it (the
+        // store has no other path to bootstrap it, and a missing namespace
+        // is a 404 on every op, not a transient).
+        let store = KubeStore::with_default_namespace(client.clone());
+        store.ensure_namespace().await.map_err(env_err)?;
+
+        let mut allocator = Allocator::new(
+            store,
+            ceiling,
+            coords.run_id.clone(),
+            qos::LOCK_TICKS,
+            qos::RESERVATION_TICKS,
+            qos::GRACE,
+        );
+
+        // ServiceAccount budget (§5.6): the run's reservations are charged to
+        // its SA, identified by `ZTEST_SA` (the runner sets it, e.g. via the
+        // downward API). When running in-cluster, read that SA's budget
+        // annotations and enforce them; out-of-cluster (dev) or with no
+        // `ZTEST_SA` the SA is unbudgeted (the allocator treats absent budget
+        // as unlimited), and reservations are charged under the run id.
+        let sa_id = std::env::var("ZTEST_SA").unwrap_or_else(|_| coords.run_id.clone());
+        if cluster::in_cluster() && std::env::var_os("ZTEST_SA").is_some() {
+            match read_sa_budget(client, client.default_namespace(), &sa_id).await {
+                Ok(Some(budget)) => {
+                    tracing::info!(
+                        sa = %sa_id,
+                        cpu_milli = budget.cpu_milli,
+                        mem_bytes = budget.mem_bytes,
+                        "QoS SA budget enforced"
+                    );
+                    allocator.set_budget(sa_id.clone(), budget);
+                }
+                Ok(None) => {}
+                // A present-but-unparseable budget fails fast with a clear
+                // message rather than silently admitting (or rejecting all).
+                Err(detail) => {
+                    return Err(EnvError::Config {
+                        reason: format!("QoS ServiceAccount budget for {sa_id:?}: {detail}"),
+                    });
+                }
+            }
+        }
+
+        // Opportunistically GC reservations left by crashed runs (the ledger
+        // already excludes them from committed capacity; this just stops the
+        // Lease objects accumulating). Best-effort — never block admission.
+        let _ = allocator.reclaim_expired(qos::now_secs()).await;
+
+        // Reserve what the pods will actually request (per-pod whole-core share
+        // × pod count), not the raw tier footprint — see `deployed_footprint`.
+        let pods = self.pending_validators.len() + self.pending_indexers.len();
+        let req = ReservationRequest {
+            unit: namespace.to_string(),
+            sa: sa_id,
+            footprint: deployed_footprint(profile.footprint, pods),
+            class: qos::current(),
+        };
+
+        let started = std::time::Instant::now();
+        let reservation = loop {
+            let outcome = allocator
+                .try_admit(&req, qos::now_secs())
+                .await
+                .map_err(env_err)?;
+            match qos::classify(&outcome, started.elapsed(), qos::ADMIT_BUDGET) {
+                AdmitStep::Proceed => {
+                    let Outcome::Granted { reservation } = outcome else {
+                        unreachable!("classify mapped a non-grant to Proceed")
+                    };
+                    break reservation;
+                }
+                AdmitStep::RetryNow => continue,
+                AdmitStep::WaitThenRetry => tokio::time::sleep(qos::QUEUE_POLL).await,
+                AdmitStep::Reject(reason) => {
+                    return Err(EnvError::Config {
+                        reason: format!(
+                            "QoS admission rejected tier {:?} ({} mcpu / {} bytes): {reason:?} — \
+                             unschedulable even on an empty cluster",
+                            qos::current(),
+                            profile.footprint.cpu_milli,
+                            profile.footprint.mem_bytes,
+                        ),
+                    });
+                }
+                AdmitStep::Timedout => {
+                    return Err(EnvError::RpcTimeout {
+                        component: namespace.to_string(),
+                        op: "qos_admission",
+                        elapsed: started.elapsed(),
+                    });
+                }
+            }
+        };
+
+        tracing::info!(
+            reservation = %reservation,
+            tier = ?qos::current(),
+            "QoS reservation granted"
+        );
+        *self
+            .inner
+            .qos_reservation
+            .lock()
+            .expect("qos_reservation mutex poisoned") = Some(reservation.clone());
+
+        // Heartbeat the reservation for the env's life on its own allocator
+        // clone (the KubeStore is a cheap Arc-backed handle).
+        let renew_alloc = Allocator::new(
+            KubeStore::with_default_namespace(client.clone()),
+            ceiling,
+            coords.run_id.clone(),
+            qos::LOCK_TICKS,
+            qos::RESERVATION_TICKS,
+            qos::GRACE,
+        );
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(qos::RENEW_INTERVAL).await;
+                if let Err(e) = renew_alloc.renew(&reservation, qos::now_secs()).await {
+                    tracing::warn!(
+                        error = %e,
+                        reservation = %reservation,
+                        "QoS reservation renew failed"
+                    );
+                }
+            }
+        });
+        *self
+            .inner
+            .qos_renew_task
+            .lock()
+            .expect("qos_renew_task mutex poisoned") = Some(handle);
+
+        Ok(())
+    }
+
     pub async fn build(&mut self) -> Result<(), EnvError> {
         self.validate_topology()?;
         self.materialize_regtest_configs()?;
@@ -615,6 +831,22 @@ impl TestEnv {
             .lock()
             .expect("namespace mutex poisoned") = Some(namespace.clone());
 
+        // QoS admission (no-op unless `ztest run` enabled it): hold a capacity
+        // reservation before creating any pod, and decide the tier's node
+        // placement to stamp on every pod spec below.
+        self.admit(&client, &namespace, &coords).await?;
+        let qos_placement = cluster::qos_enabled().then(|| qos::current().profile().pool);
+        // QoS-default pod sizing (§7): split the tier footprint evenly across
+        // the env's pods (validators + indexers; wallets are in-process) as
+        // requests==limits ⇒ Guaranteed QoS. A test's explicit `.resources()`
+        // overrides this per-pod. `None` when QoS is off or there are no pods.
+        let qos_guaranteed = if cluster::qos_enabled() {
+            let pods = self.pending_validators.len() + self.pending_indexers.len();
+            even_share(qos::current().profile().footprint, pods)
+        } else {
+            None
+        };
+
         // Provision shared PVCs before any pod references them. With the
         // default (WaitForFirstConsumer) binding the claim stays Pending
         // until the first consumer — the validator in Phase 1 — schedules.
@@ -636,7 +868,12 @@ impl TestEnv {
             .drain(..)
             .map(|p| {
                 let pod_name = pod_name_of(&p.opts);
-                let spec = manifest::pod_spec_for_validator(p.handle.label(), &p.opts, pod_name);
+                let mut spec =
+                    manifest::pod_spec_for_validator(p.handle.label(), &p.opts, pod_name);
+                spec.placement = qos_placement;
+                if spec.resources.is_none() {
+                    spec.guaranteed = qos_guaranteed.clone();
+                }
                 (p.id, spec, p.opts, Some(p.handle))
             })
             .collect();
@@ -662,7 +899,11 @@ impl TestEnv {
             .drain(..)
             .map(|p| {
                 let pod_name = pod_name_of(&p.opts);
-                let spec = manifest::pod_spec_for_indexer(p.label, &p.opts, pod_name)?;
+                let mut spec = manifest::pod_spec_for_indexer(p.label, &p.opts, pod_name)?;
+                spec.placement = qos_placement;
+                if spec.resources.is_none() {
+                    spec.guaranteed = qos_guaranteed.clone();
+                }
                 Ok::<_, EnvError>((p.id, spec, p.opts, None))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -829,7 +1070,31 @@ impl Drop for TestEnv {
     /// delete so a developer can `kubectl` into the surviving pods for a
     /// post-mortem. The 1h `janitor/ttl` annotation still reaps the
     /// namespace afterwards, so this never leaks permanently.
+    ///
+    /// The QoS capacity reservation is handled separately: the renew
+    /// heartbeat is aborted and the reservation Lease is **always released**,
+    /// even under `--no-cleanup`. Preserving pods for inspection must not
+    /// leak the *capacity accounting* — otherwise the reserve would linger
+    /// until the Lease expired and starve concurrent runs.
     fn drop(&mut self) {
+        // Stop heartbeating immediately so the reservation can't be renewed
+        // out from under the release below.
+        if let Some(task) = self
+            .inner
+            .qos_renew_task
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
+            task.abort();
+        }
+        let reservation = self
+            .inner
+            .qos_reservation
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+
         let ns = self.inner.namespace.lock().ok().and_then(|mut g| g.take());
         let shadows: Vec<_> = self
             .inner
@@ -838,10 +1103,16 @@ impl Drop for TestEnv {
             .ok()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
-        if ns.is_none() && shadows.is_empty() {
+        if ns.is_none() && shadows.is_empty() && reservation.is_none() {
             return;
         }
-        if cluster::no_cleanup_requested() {
+
+        // `--no-cleanup` preserves the namespace + shadows for inspection, but
+        // the reservation is still released (see the doc-comment).
+        let cleanup = !cluster::no_cleanup_requested();
+        let (ns_to_delete, shadows_to_delete) = if cleanup {
+            (ns.clone(), shadows)
+        } else {
             if let Some(ns) = &ns {
                 // eprintln (not just tracing) so the hint is visible in
                 // captured test output, where a developer is looking.
@@ -858,11 +1129,13 @@ impl Drop for TestEnv {
                 shadow_clones = shadows.len(),
                 "ZTEST_NO_CLEANUP set — leaving TestEnv namespace for inspection"
             );
-            return;
-        }
+            (None, Vec::new())
+        };
+
         tracing::info!(
-            namespace = ?ns,
-            shadow_clones = shadows.len(),
+            namespace = ?ns_to_delete,
+            shadow_clones = shadows_to_delete.len(),
+            reservation = ?reservation,
             "tearing down TestEnv (Drop)"
         );
         let outcome = std::thread::spawn(move || {
@@ -874,12 +1147,31 @@ impl Drop for TestEnv {
                 let client = cluster::client()
                     .await
                     .map_err(|e| format!("teardown client: {e}"))?;
-                if let Some(ns) = ns {
+                // Release the QoS reservation first (404-tolerant; the
+                // throwaway allocator's config is irrelevant for a delete).
+                if let Some(reservation) = reservation {
+                    let allocator = Allocator::new(
+                        KubeStore::with_default_namespace(client.clone()),
+                        crate::qos::Resources::ZERO,
+                        "",
+                        0,
+                        0,
+                        0,
+                    );
+                    if let Err(e) = allocator.release(&reservation).await {
+                        tracing::warn!(
+                            error = %e,
+                            reservation = %reservation,
+                            "QoS reservation release failed (reclaimed on expiry)"
+                        );
+                    }
+                }
+                if let Some(ns) = ns_to_delete {
                     cluster::delete_namespace(&client, &ns)
                         .await
                         .map_err(|e| format!("delete namespace {ns}: {e}"))?;
                 }
-                for shadow in shadows {
+                for shadow in shadows_to_delete {
                     if let Err(e) = seeds::delete_shadow(&client, &shadow).await {
                         tracing::warn!(
                             error = %e,
@@ -947,10 +1239,138 @@ fn pod_name_of(opts: &ComponentOpts) -> String {
     short_kind(opts.name.as_deref().unwrap_or("x"))
 }
 
+/// The per-pod Guaranteed reserve when a tier's footprint is split evenly
+/// across `pods` pods (§7), shaped for **maximum performance**:
+///
+/// - **Integer CPU cores.** The kubelet CPU Manager `static` policy only pins
+///   exclusive CPUs to a Guaranteed pod whose CPU is a *whole* number of cores
+///   (fractional ⇒ shared pool, no pinning). So the per-pod CPU is the even
+///   share rounded **up** to whole cores (min 1) — eligible for exclusive
+///   pinning at the cost of slightly over-reserving small tiers vs the
+///   admission footprint. Memory is the exact even share (no integer rule).
+/// - Rendered by [`manifest::PodSpec`] as `requests == limits` ⇒ Guaranteed.
+///
+/// `None` when there are no pods to size.
+fn even_share(footprint: crate::qos::Resources, pods: usize) -> Option<crate::component::Resources> {
+    if pods == 0 {
+        return None;
+    }
+    let (cores, mem_bytes) = per_pod_share(footprint, pods as u64);
+    Some(crate::component::Resources {
+        cpu: cores.to_string(),
+        memory: mem_bytes.to_string(),
+    })
+}
+
+/// The per-pod `(whole CPU cores, memory bytes)` an even footprint split
+/// yields. Shared by [`even_share`] (what each pod requests) and
+/// [`deployed_footprint`] (what admission reserves) so the two agree exactly —
+/// CPU is the even share rounded **up** to whole cores (static-policy pinning;
+/// min 1), memory is the exact even share.
+fn per_pod_share(footprint: crate::qos::Resources, pods: u64) -> (u64, u64) {
+    let cores = (footprint.cpu_milli / pods).div_ceil(1000).max(1);
+    let mem_bytes = (footprint.mem_bytes / pods).max(1);
+    (cores, mem_bytes)
+}
+
+/// The footprint admission must reserve: **exactly what the rendered pods
+/// request** (per-pod whole-core share × `pods`), not the raw tier footprint.
+///
+/// Rounding the per-pod CPU up to whole cores (for static-policy pinning) means
+/// `pods × per-pod` can exceed the tier footprint (e.g. 8 cores over 3 pods →
+/// 3+3+3 = 9). If admission reserved only the raw 8, the ledger would
+/// under-count and the cluster could grant capacity a pod then can't schedule
+/// into — a silent Pending. Reserving the deployed total keeps the ledger and
+/// the pods consistent. Falls back to the tier footprint when there are no QoS
+/// pods to size (e.g. a wallet-only env).
+fn deployed_footprint(footprint: crate::qos::Resources, pods: usize) -> crate::qos::Resources {
+    if pods == 0 {
+        return footprint;
+    }
+    let p = pods as u64;
+    let (cores, mem_bytes) = per_pod_share(footprint, p);
+    crate::qos::Resources::new(
+        cores.saturating_mul(1000).saturating_mul(p),
+        mem_bytes.saturating_mul(p),
+    )
+}
+
+/// Read a ServiceAccount's QoS budget from its annotations (§5.6).
+///
+/// Infrastructure-best-effort: a missing SA or a transient API error yields
+/// `Ok(None)` (⇒ unbudgeted/unlimited) so cluster hiccups never block
+/// admission. But a budget annotation that is *present and unparseable* returns
+/// `Err` — a typo'd budget must fail the run loudly, not silently become a zero
+/// (rejecting every request) or be ignored. The parsing is the pure
+/// [`qos::parse_sa_budget`].
+async fn read_sa_budget(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<crate::qos::Resources>, String> {
+    use k8s_openapi::api::core::v1::ServiceAccount;
+    let api: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    let Some(sa) = api.get_opt(name).await.ok().flatten() else {
+        return Ok(None);
+    };
+    let Some(annotations) = sa.metadata.annotations.as_ref() else {
+        return Ok(None);
+    };
+    qos::parse_sa_budget(annotations)
+}
+
 struct MaterializeCtx<'a> {
     client: &'a kube::Client,
     pods: &'a Api<Pod>,
     sentinel: &'a Sentinel,
     coords: &'a RunCoords,
     test_name: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{deployed_footprint, even_share};
+    use crate::qos::{GIB, MIB, Resources};
+
+    #[test]
+    fn even_share_rounds_cpu_up_to_whole_cores_and_splits_memory() {
+        // sync 16c/32Gi across 2 pods → 8 cores / 16 GiB each (exact).
+        let s = even_share(Resources::new(16_000, 32 * GIB), 2).unwrap();
+        assert_eq!(s.cpu, "8");
+        assert_eq!(s.memory, (16 * GIB).to_string());
+
+        // basic 500m/512Mi on 1 pod → rounds up to 1 whole core (pinning needs
+        // an integer); memory is the exact share.
+        let s = even_share(Resources::new(500, 512 * MIB), 1).unwrap();
+        assert_eq!(s.cpu, "1");
+        assert_eq!(s.memory, (512 * MIB).to_string());
+
+        // testnet 8c/18Gi across 3 pods → 2667m/pod → ceil to 3 cores.
+        let s = even_share(Resources::new(8_000, 18 * GIB), 3).unwrap();
+        assert_eq!(s.cpu, "3");
+
+        // No pods → nothing to size.
+        assert!(even_share(Resources::new(8_000, 8 * GIB), 0).is_none());
+    }
+
+    #[test]
+    fn deployed_footprint_matches_what_the_rendered_pods_request() {
+        // testnet 8c/18Gi over 3 pods: pods request 3 cores each (ceil), so
+        // admission must reserve 9 cores — NOT the raw 8 — or the 3rd pod could
+        // pend on capacity the ledger under-counted. Memory is the floored
+        // share × pods.
+        let fp = deployed_footprint(Resources::new(8_000, 18 * GIB), 3);
+        let mem_per_pod = (18 * GIB) / 3;
+        assert_eq!(fp.cpu_milli, 9_000, "3 pods × ceil(2667m)=3c → 9 cores");
+        assert_eq!(fp.mem_bytes, mem_per_pod * 3);
+
+        // Even split (16c/2 pods = 8 each) reserves exactly the footprint.
+        let fp = deployed_footprint(Resources::new(16_000, 32 * GIB), 2);
+        assert_eq!(fp.cpu_milli, 16_000);
+        assert_eq!(fp.mem_bytes, 32 * GIB);
+
+        // No QoS pods (wallet-only env) → reserve the raw tier footprint.
+        let raw = Resources::new(8_000, 8 * GIB);
+        assert_eq!(deployed_footprint(raw, 0), raw);
+    }
 }

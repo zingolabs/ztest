@@ -53,7 +53,8 @@ use super::scheduler::{self, RejectReason, Verdict};
 use super::store::{Kind, LabelSelector, NewObject, ObjectPatch, ObjectStore, StoreError};
 use super::{
     ANN_CPU_MILLI, ANN_HOLDER, ANN_LEASE_TICKS, ANN_MEM_BYTES, ANN_RENEW_TICK, LABEL_ROLE,
-    LABEL_SA, LABEL_UNIT, ROLE_ALLOCATOR_LOCK, ROLE_JOB, ROLE_RESERVATION, Resources,
+    LABEL_SA, LABEL_TIER, LABEL_UNIT, QosClass, ROLE_ALLOCATOR_LOCK, ROLE_JOB, ROLE_RESERVATION,
+    Resources,
 };
 
 /// Fixed name of the singleton allocator-lock Lease.
@@ -74,6 +75,10 @@ pub struct ReservationRequest {
     pub sa: String,
     /// The namespace-aggregate reserve to schedule against.
     pub footprint: Resources,
+    /// The declared tier — recorded as [`LABEL_TIER`] on the reservation Lease
+    /// for the live during-run panel. Display metadata only; admission keys on
+    /// [`Self::footprint`].
+    pub class: QosClass,
 }
 
 /// The result of an admission attempt.
@@ -199,6 +204,21 @@ impl<S: ObjectStore> Allocator<S> {
             Verdict::Reject(reason) => Ok(Outcome::Rejected(reason)),
             Verdict::Queue => Ok(Outcome::Queued),
             Verdict::Fits => {
+                // Fence the commit on continued lock ownership. The lock isn't
+                // renewed during the section, so a critical section that
+                // outlives `LOCK_TICKS` can be stolen by another allocator that
+                // then reads this same free snapshot and also grants —
+                // overcommit. Re-check the lock immediately before creating: if
+                // its version moved off `epoch` (a steal/renew) or it's no
+                // longer ours, abort and retry rather than commit. This narrows
+                // the TOCTOU window from the whole section to the gap between
+                // this check and the create (sub-millisecond ≪ `LOCK_TICKS`).
+                match self.store.get(Kind::AllocatorLock, LOCK_NAME).await? {
+                    Some(o)
+                        if o.resource_version == epoch
+                            && o.annotations.get(ANN_HOLDER) == Some(&self.identity) => {}
+                    _ => return Ok(Outcome::Retry),
+                }
                 let name = reservation_name(&req.unit);
                 match self
                     .store
@@ -351,7 +371,8 @@ impl<S: ObjectStore> Allocator<S> {
             labels: BTreeMap::from([
                 (LABEL_ROLE.to_string(), ROLE_RESERVATION.to_string()),
                 (LABEL_SA.to_string(), sa_key(&req.sa)),
-                (LABEL_UNIT.to_string(), slug(&req.unit, 63)),
+                (LABEL_UNIT.to_string(), unit_slug(&req.unit)),
+                (LABEL_TIER.to_string(), req.class.as_label().to_string()),
             ]),
             annotations: BTreeMap::from([
                 (ANN_HOLDER.to_string(), self.identity.clone()),
@@ -367,7 +388,19 @@ impl<S: ObjectStore> Allocator<S> {
 /// Deterministic reservation Lease name for an accounting unit — same unit
 /// ⇒ same name (idempotent retry), different units ⇒ different names.
 pub fn reservation_name(unit: &str) -> String {
-    format!("qos-{}", slug(unit, 56))
+    format!("qos-{}", unit_slug(unit))
+}
+
+/// The single canonical slug of an accounting unit, used for *both* the
+/// reservation Lease name ([`reservation_name`]) and its [`LABEL_UNIT`] label
+/// (the ledger's per-unit dedup key). Deriving both from one slug keeps
+/// name-uniqueness and label-uniqueness in lockstep: two units can never map to
+/// the same name while carrying distinct labels (or vice-versa). 56 chars
+/// leaves room for the `qos-` name prefix under the 63-char DNS/label limit —
+/// and `unit` (a `namespace_for` string) is itself ≤56, so no truncation
+/// occurs in practice; this is belt-and-suspenders against future unit shapes.
+fn unit_slug(unit: &str) -> String {
+    slug(unit, 56)
 }
 
 /// The label-safe key an SA is grouped/charged under. Must match between
@@ -394,6 +427,7 @@ mod tests {
             unit: unit.to_string(),
             sa: sa.to_string(),
             footprint: Resources::new(cpu, mem),
+            class: QosClass::Basic,
         }
     }
 
@@ -429,6 +463,26 @@ mod tests {
         assert_eq!(store.count(Kind::Reservation), 1);
         // Lock was released (not left held).
         assert_eq!(store.count(Kind::AllocatorLock), 0);
+    }
+
+    // 1b. The granted reservation Lease records its tier (for the live panel).
+    #[tokio::test]
+    async fn reservation_lease_carries_its_tier_label() {
+        let store = FakeStore::new();
+        let a = allocator(store.clone(), "run-a", Resources::new(8_000, 16 * GIB));
+        let req = ReservationRequest {
+            unit: "u1".to_string(),
+            sa: "acme".to_string(),
+            footprint: Resources::new(4_000, 4 * GIB),
+            class: QosClass::Sync,
+        };
+        a.try_admit(&req, 0).await.unwrap();
+        let obj = store
+            .get(Kind::Reservation, &reservation_name("u1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(obj.labels.get(LABEL_TIER).map(String::as_str), Some("sync"));
     }
 
     // 2. Lock acquire-when-absent.

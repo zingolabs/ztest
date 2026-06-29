@@ -23,10 +23,11 @@ use owo_colors::OwoColorize;
 
 use super::theme::Theme;
 use super::{
-    ArchiveRow, ArchiveStatus, BannerState, BuildStage, BuildState, DownloadSource, SnapshotRow,
-    SnapshotStatus,
+    ArchiveRow, ArchiveStatus, BannerState, BuildStage, BuildState, DownloadSource, QosPlan,
+    SnapshotRow, SnapshotStatus, TierPlan,
 };
-use crate::qos::{GIB, Resources};
+use crate::qos::live::LiveSnapshot;
+use crate::qos::{GIB, MIB, QosClass, Resources};
 
 /// Width of the action-label column, matching nextest's `{:>12}`.
 const LABEL_WIDTH: usize = 12;
@@ -53,6 +54,10 @@ pub fn render(state: &BannerState, theme: &Theme) -> String {
     render_archive_block(&mut out, state, theme);
     blank_line(&mut out);
     render_snapshot_block(&mut out, state, theme);
+    if let Some(plan) = &state.qos_plan {
+        blank_line(&mut out);
+        render_qos_block(&mut out, plan, theme);
+    }
     if !state.future.is_empty() {
         blank_line(&mut out);
         render_future_block(&mut out, state, theme);
@@ -324,6 +329,353 @@ fn render_future_block(out: &mut String, state: &BannerState, theme: &Theme) {
     }
 }
 
+/// The lowercase tier name shown in the scheduling block.
+fn tier_label(c: QosClass) -> &'static str {
+    match c {
+        QosClass::Basic => "basic",
+        QosClass::Integration => "integration",
+        QosClass::Testnet => "testnet",
+        QosClass::Sync => "sync",
+    }
+}
+
+/// A footprint's CPU as `Nc` (whole cores) or `Nm` (millicpu) — so a
+/// half-core `basic` reads `500m`, not `0 cores`.
+fn cpu_str(milli: u64) -> String {
+    if milli != 0 && milli.is_multiple_of(1000) {
+        format!("{}c", milli / 1000)
+    } else {
+        format!("{milli}m")
+    }
+}
+
+/// A footprint's memory as a clean `N GiB` / `N MiB` (exact for the
+/// power-of-two tier reserves).
+fn mem_str(bytes: u64) -> String {
+    if bytes != 0 && bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else {
+        format!("{} MiB", bytes / MIB)
+    }
+}
+
+/// `<cpu> / <mem>` for a single-test footprint (exact units — `500m`, `16 GiB`).
+fn footprint_str(r: &Resources) -> String {
+    format!("{} / {}", cpu_str(r.cpu_milli), mem_str(r.mem_bytes))
+}
+
+/// `<cpu> / <mem>` for an aggregate (peak / total) reserve, in decimal cores
+/// and GiB — `11.5c / 19.5 GiB` reads better than `11500m / 19968 MiB` for the
+/// summed figures.
+fn agg_str(r: &Resources) -> String {
+    let cpu = if r.cpu_milli.is_multiple_of(1000) {
+        format!("{}c", r.cpu_milli / 1000)
+    } else {
+        format!("{:.1}c", r.cpu_milli as f64 / 1000.0)
+    };
+    let mem = if r.mem_bytes.is_multiple_of(GIB) {
+        format!("{} GiB", r.mem_bytes / GIB)
+    } else {
+        format!("{:.1} GiB", r.mem_bytes as f64 / GIB as f64)
+    };
+    format!("{cpu} / {mem}")
+}
+
+/// The QoS scheduling plan (`docs/qos-design.md` §8 planning pass): per-tier
+/// selected counts + footprints, the wave/peak estimate against probed
+/// capacity, and any unschedulable-tier warnings. The live during-run
+/// reservation view is a deferred follow-up, noted as the final dim line.
+fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
+    let dot = theme.chars.dot.style(theme.styles.dim);
+    let total_tests: u32 = plan.tiers.iter().map(|t| t.count).sum();
+
+    match plan.free {
+        Some(_) => writeln!(
+            out,
+            "{:>width$} {} tests {dot} {} waves {dot} peak {} {dot} {} reserved total",
+            "Scheduling".style(theme.styles.pass),
+            total_tests.style(theme.styles.count),
+            plan.waves.style(theme.styles.count),
+            agg_str(&plan.peak).style(theme.styles.count),
+            agg_str(&plan.total).style(theme.styles.count),
+            width = LABEL_WIDTH,
+        )
+        .expect("write to string"),
+        None => writeln!(
+            out,
+            "{:>width$} {} tests {dot} {} reserved total {dot} capacity unknown (probe unavailable)",
+            "Scheduling".style(theme.styles.pass),
+            total_tests.style(theme.styles.count),
+            agg_str(&plan.total).style(theme.styles.count),
+            width = LABEL_WIDTH,
+        )
+        .expect("write to string"),
+    }
+
+    let name_col = column_width(plan.tiers.iter().map(|t| tier_label(t.class)), 12, 16);
+    for TierPlan {
+        class,
+        count,
+        footprint,
+    } in &plan.tiers
+    {
+        writeln!(
+            out,
+            "{INDENT}{:<width$} {} {dot} {} each",
+            tier_label(*class).style(theme.styles.dim),
+            count.style(theme.styles.count),
+            footprint_str(footprint),
+            width = name_col,
+        )
+        .expect("write to string");
+    }
+
+    // Fail-fast: a tier whose footprint exceeds the whole cluster will be
+    // rejected at admission — surface it now.
+    let warn = theme.chars.warn.style(theme.styles.skip);
+    for class in &plan.unschedulable {
+        writeln!(
+            out,
+            "{INDENT}{warn} {} needs {} {dot} exceeds cluster capacity — will be rejected",
+            tier_label(*class).style(theme.styles.skip),
+            footprint_str(&class.profile().footprint),
+        )
+        .expect("write to string");
+    }
+
+    // The live reservation view is the deferred §8 half (decentralized: it
+    // would poll the ledger during the run).
+    writeln!(
+        out,
+        "{INDENT}{:<width$} {dot} {}",
+        "reservation".style(theme.styles.dim),
+        "live view during run (pending)".style(theme.styles.dim),
+        width = name_col,
+    )
+    .expect("write to string");
+}
+
+/// Utilization percent of `part` within `whole`, the tighter (max) of the CPU
+/// and memory fractions — how full the binding dimension is. Zero `whole` → 0%.
+fn used_percent(part: &Resources, whole: &Resources) -> u8 {
+    let frac = |p: u64, w: u64| -> u64 {
+        if w == 0 {
+            0
+        } else {
+            ((p as u128 * 100) / w as u128).min(100) as u64
+        }
+    };
+    frac(part.cpu_milli, whole.cpu_milli).max(frac(part.mem_bytes, whole.mem_bytes)) as u8
+}
+
+/// Live test-run progress for the during-run panel.
+///
+/// Populated by the run loop (`cli::console`): `elapsed` drives the spinner +
+/// wall clock (the proof-of-life heartbeat), and the counts are tallied from
+/// `cargo nextest run`'s relayed per-test result lines. `total` is the test
+/// count discovered during preflight (Phase B); `0` means "unknown" and the
+/// done-of-total fraction is rendered without a denominator.
+#[derive(Debug, Clone, Default)]
+pub struct RunProgress {
+    /// Wall time since the run started — drives the spinner and the clock.
+    pub elapsed: std::time::Duration,
+    /// Tests finished with a passing verdict.
+    pub passed: u32,
+    /// Tests finished with a failing verdict (FAIL/TIMEOUT/LEAK/…).
+    pub failed: u32,
+    /// Total tests to run, from preflight. `0` = unknown.
+    pub total: u32,
+}
+
+impl RunProgress {
+    /// Tests that have reached a terminal verdict.
+    fn done(&self) -> u32 {
+        self.passed + self.failed
+    }
+}
+
+/// The compact live QOS panel pinned beneath nextest's output during the run
+/// (`docs/qos-design.md` §8). Three lines under a top rule: per-tier **running**
+/// (from live reservation Leases) against the planning total, the committed
+/// reserve and a utilization gauge vs probed free capacity, and the test
+/// pass/fail progress + wall clock. Truthful — only what the ledger knows; the
+/// `n/m` is `running / planned`, not a queue depth. No bottom rule, so the only
+/// separator sits at the top; the console ([`crate::cli::console`]) sizes the
+/// panel region to the line count it returns.
+pub fn render_live_panel(
+    snapshot: &LiveSnapshot,
+    plan: &QosPlan,
+    free: &Resources,
+    progress: &RunProgress,
+    theme: &Theme,
+) -> String {
+    let mut out = String::with_capacity(320);
+    let dot = theme.chars.dot.style(theme.styles.dim);
+    // The spinner advances every redraw the run loop triggers (it ticks on a
+    // sub-second cadence independent of cluster polling), so the panel visibly
+    // animates even when no reservation or test verdict has changed — the
+    // "is the cluster still alive?" heartbeat.
+    let spin = spinner_glyph(progress.elapsed);
+
+    render_top_rule(&mut out, theme);
+
+    // When the per-test capacity re-probe was unavailable, `free` is ZERO —
+    // don't render a misleading empty gauge "of 0c / 0 GiB free"; say so, the
+    // same way the preflight block does.
+    let capacity = if free.cpu_milli == 0 && free.mem_bytes == 0 {
+        "capacity unknown (probe unavailable)".to_string()
+    } else {
+        let bar = render_progress_bar(used_percent(&snapshot.committed, free), theme);
+        format!("{bar} of {} free", agg_str(free).style(theme.styles.count))
+    };
+    writeln!(
+        out,
+        "{:>width$} {} {} running {dot} {} committed {dot} {capacity}",
+        "Running".style(theme.styles.pass),
+        spin.style(theme.styles.count),
+        snapshot.total_running().style(theme.styles.count),
+        agg_str(&snapshot.committed).style(theme.styles.count),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+
+    // Test progress + wall clock. `done/total` (or bare `done` when total is
+    // unknown), passing/failing tallies, and elapsed time. This is the line
+    // that answers "are tests actually completing?" as the per-test stream
+    // scrolls past beneath the panel.
+    let done = match progress.total {
+        0 => format!("{} done", progress.done().style(theme.styles.count)),
+        total => format!(
+            "{}/{} done",
+            progress.done().style(theme.styles.count),
+            total.style(theme.styles.count),
+        ),
+    };
+    let failed = if progress.failed > 0 {
+        format!(
+            " {dot} {} {}",
+            progress.failed.style(theme.styles.fail),
+            "failed".style(theme.styles.fail),
+        )
+    } else {
+        String::new()
+    };
+    writeln!(
+        out,
+        "{INDENT}{done} {dot} {} passed{failed} {dot} {}",
+        progress.passed.style(theme.styles.pass),
+        format_elapsed(progress.elapsed).style(theme.styles.dim),
+    )
+    .expect("write to string");
+
+    if !plan.tiers.is_empty() {
+        let parts: Vec<String> = plan
+            .tiers
+            .iter()
+            .map(|t| {
+                let run = snapshot
+                    .running
+                    .get(&t.class)
+                    .map(|x| x.count)
+                    .unwrap_or(0);
+                format!("{} {}/{}", tier_label(t.class), run, t.count)
+            })
+            .collect();
+        writeln!(
+            out,
+            "{INDENT}{} {dot} running / planned",
+            parts.join(&format!(" {} ", theme.chars.dot)),
+        )
+        .expect("write to string");
+    }
+
+    out
+}
+
+/// Compact status panel for the unified bottom console (`cli::console`) during
+/// the **preflight + build + image** phases.
+///
+/// Where [`render`] is the tall multi-section banner (now used only for the
+/// non-TTY CI log), this is the few-line summary kept pinned at the bottom of
+/// the screen while `cargo nextest list` and `docker build` output scrolls
+/// above it into native scrollback. It is the preflight counterpart of
+/// [`render_live_panel`] (the run-phase panel), so the two share one visual
+/// language across the whole session.
+///
+/// Three rows — a top rule, a cluster line, and a build/archives/scheduling
+/// line. No bottom rule (the only separator sits at the top); the console sizes
+/// its panel region to the line count returned. `elapsed` drives the spinner
+/// heartbeat; `phase` is the right-aligned action label (`Preflight`,
+/// `Building`).
+pub fn render_preflight_panel(
+    state: &BannerState,
+    phase: &str,
+    elapsed: std::time::Duration,
+    theme: &Theme,
+) -> String {
+    let mut out = String::with_capacity(256);
+    let dot = theme.chars.dot.style(theme.styles.dim);
+    let spin = spinner_glyph(elapsed);
+
+    render_top_rule(&mut out, theme);
+
+    // Cluster line: context, ready nodes, slot usage.
+    let c = &state.cluster;
+    writeln!(
+        out,
+        "{:>width$} {} {} {dot} {} ready {dot} {} / {} slots",
+        phase.style(theme.styles.pass),
+        spin.style(theme.styles.count),
+        c.context,
+        c.nodes_ready.style(theme.styles.count),
+        c.slots_used.style(theme.styles.count),
+        c.slots_total.style(theme.styles.count),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+
+    // Build · archives · scheduling line.
+    let build = match &state.build {
+        BuildState::Pending => "inventory queued".to_string(),
+        BuildState::Compiling { started_at } => {
+            format!("compiling {}", format_elapsed(started_at.elapsed()))
+        }
+        BuildState::Indexing { started_at } => {
+            format!("indexing {}", format_elapsed(started_at.elapsed()))
+        }
+        BuildState::Ok {
+            test_count,
+            binary_count,
+            ..
+        } => format!("{test_count} tests / {binary_count} bins"),
+        BuildState::Failed { .. } => "build failed".to_string(),
+    };
+    let cached = state
+        .archives
+        .iter()
+        .filter(|a| matches!(a.status, ArchiveStatus::Cached { .. }))
+        .count();
+    write!(
+        out,
+        "{INDENT}{} {dot} {} / {} archives",
+        build.style(theme.styles.count),
+        cached.style(theme.styles.count),
+        state.archives.len().style(theme.styles.count),
+    )
+    .expect("write to string");
+    if let Some(plan) = &state.qos_plan {
+        write!(
+            out,
+            " {dot} {} waves",
+            plan.waves.style(theme.styles.count),
+        )
+        .expect("write to string");
+    }
+    out.push('\n');
+
+    out
+}
+
 // ─────────────────────────── per-row writers ──────────────────────────
 
 fn write_archive_row(
@@ -483,6 +835,7 @@ mod tests {
                 capacity: crate::qos::ClusterCapacity {
                     allocatable: Resources::new(12_000, 48 * GIB),
                     requested: Resources::new(6_000, 20 * GIB),
+                    baseline: Resources::new(2_000, 8 * GIB),
                 },
             },
             build: BuildState::Ok {
@@ -531,7 +884,32 @@ mod tests {
                 },
             ],
             future: vec![],
+            qos_plan: None,
         }
+    }
+
+    #[test]
+    fn preflight_panel_is_three_lines_and_summarizes_phase() {
+        let mut state = sample_state();
+        state.qos_plan = Some(crate::qos::schedule::plan(
+            &std::collections::BTreeMap::from([(QosClass::Basic, 6)]),
+            Some(Resources::new(12_000, 48 * GIB)),
+        ));
+        let s = render_preflight_panel(
+            &state,
+            "Preflight",
+            std::time::Duration::from_secs(3),
+            &plain_unicode_theme(),
+        );
+        // Top rule + cluster line + build/archives/scheduling line — no bottom
+        // rule, so the only separator is at the top.
+        assert_eq!(s.lines().count(), 3, "fixed 3-row panel:\n{s}");
+        assert!(!s.trim_end().ends_with("────────────"), "no bottom rule:\n{s}");
+        assert!(s.contains("Preflight"), "phase label:\n{s}");
+        assert!(s.contains("kind-zaino-local"), "cluster context:\n{s}");
+        assert!(s.contains("47 tests / 8 bins"), "build summary:\n{s}");
+        assert!(s.contains("2 / 4 archives"), "archives cached/total:\n{s}");
+        assert!(s.contains("waves"), "scheduling summary:\n{s}");
     }
 
     /// Theme with no colours and Unicode glyphs — what `Theme::detect()`
@@ -640,6 +1018,132 @@ mod tests {
             s.contains("\n\n  Scheduling"),
             "missing blank separator:\n{s}"
         );
+    }
+
+    #[test]
+    fn qos_plan_renders_tiers_waves_and_unschedulable_warning() {
+        use crate::qos::schedule;
+        use std::collections::BTreeMap;
+        let mut state = sample_state();
+        // sync (8c/16Gi) can't fit a 4-core/8-GiB cluster → unschedulable;
+        // basic + integration schedule normally.
+        state.qos_plan = Some(schedule::plan(
+            &BTreeMap::from([
+                (QosClass::Basic, 3),
+                (QosClass::Integration, 1),
+                (QosClass::Sync, 2),
+            ]),
+            Some(Resources::new(4000, 8 * GIB)),
+        ));
+        let s = render(&state, &plain_unicode_theme());
+        // Header: total test count + a wave estimate.
+        assert!(s.contains("Scheduling 6 tests"), "missing header:\n{s}");
+        assert!(s.contains("waves"), "missing wave estimate:\n{s}");
+        // Per-tier rows (priority order: sync, integration, basic) with
+        // footprints (basic's half-core renders as 500m, not 0c).
+        assert!(s.contains("integration"), "got:\n{s}");
+        assert!(s.contains("500m / 512 MiB"), "missing basic footprint:\n{s}");
+        // Unschedulable warning for sync (16c/32Gi can't fit a 4c/8Gi cluster).
+        assert!(
+            s.contains("sync needs 16c / 32 GiB") && s.contains("will be rejected"),
+            "missing unschedulable warning:\n{s}"
+        );
+        // Deferred live view note.
+        assert!(s.contains("live view during run (pending)"), "got:\n{s}");
+    }
+
+    #[test]
+    fn live_panel_shows_running_over_planned_and_a_gauge() {
+        use crate::qos::live::{LiveSnapshot, TierLive};
+        use crate::qos::schedule;
+        use std::collections::BTreeMap;
+
+        let plan = schedule::plan(
+            &BTreeMap::from([(QosClass::Sync, 2), (QosClass::Basic, 3)]),
+            Some(Resources::new(12_000, 48 * GIB)),
+        );
+        let snapshot = LiveSnapshot {
+            running: BTreeMap::from([
+                (
+                    QosClass::Sync,
+                    TierLive {
+                        count: 1,
+                        reserve: Resources::new(8_000, 16 * GIB),
+                    },
+                ),
+                (
+                    QosClass::Basic,
+                    TierLive {
+                        count: 2,
+                        reserve: Resources::new(1_000, GIB),
+                    },
+                ),
+            ]),
+            committed: Resources::new(9_000, 17 * GIB),
+            by_sa: BTreeMap::new(),
+        };
+        let progress = RunProgress {
+            elapsed: std::time::Duration::from_secs(42),
+            passed: 7,
+            failed: 1,
+            total: 20,
+        };
+        let s = render_live_panel(
+            &snapshot,
+            &plan,
+            &Resources::new(12_000, 48 * GIB),
+            &progress,
+            &plain_unicode_theme(),
+        );
+        assert!(s.contains("3 running"), "header:\n{s}");
+        assert!(s.contains("9c / 17 GiB committed"), "committed:\n{s}");
+        // Test progress line: done/total, passed, failed, elapsed.
+        assert!(s.contains("8/20 done"), "done count:\n{s}");
+        assert!(s.contains("7 passed"), "passed count:\n{s}");
+        assert!(s.contains("1 failed"), "failed count:\n{s}");
+        // Per-tier running/planned in priority order (sync before basic).
+        assert!(s.contains("sync 1/2"), "got:\n{s}");
+        assert!(s.contains("basic 2/3"), "got:\n{s}");
+        let sync_at = s.find("sync 1/2").unwrap();
+        let basic_at = s.find("basic 2/3").unwrap();
+        assert!(sync_at < basic_at, "priority order:\n{s}");
+        assert!(s.contains("running / planned"), "legend:\n{s}");
+        // The separator rule appears only at the top; no bottom rule (and so no
+        // trailing blank when the console sizes the panel region to its lines).
+        assert!(s.starts_with("────────────"), "top rule present:\n{s}");
+        assert!(!s.trim_end().ends_with("────────────"), "no bottom rule:\n{s}");
+    }
+
+    #[test]
+    fn live_panel_with_unknown_capacity_says_so_instead_of_a_zero_gauge() {
+        use crate::qos::live::LiveSnapshot;
+        use crate::qos::schedule;
+        use std::collections::BTreeMap;
+
+        let plan = schedule::plan(&BTreeMap::from([(QosClass::Basic, 2)]), None);
+        let snapshot = LiveSnapshot {
+            committed: Resources::new(1_000, GIB),
+            ..LiveSnapshot::default()
+        };
+        // free == ZERO ⇒ the per-test probe was unavailable.
+        let s = render_live_panel(
+            &snapshot,
+            &plan,
+            &Resources::ZERO,
+            &RunProgress::default(),
+            &plain_unicode_theme(),
+        );
+        assert!(s.contains("capacity unknown (probe unavailable)"), "got:\n{s}");
+        assert!(!s.contains("of 0c"), "should not show a zero-free gauge:\n{s}");
+    }
+
+    #[test]
+    fn no_qos_plan_renders_no_scheduling_block() {
+        let mut state = sample_state();
+        state.qos_plan = None;
+        state.future = vec![]; // also no placeholder rows
+        let s = render(&state, &plain_unicode_theme());
+        assert!(!s.contains("Scheduling"), "unexpected scheduling block:\n{s}");
     }
 
     #[test]

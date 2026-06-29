@@ -550,6 +550,56 @@ mod tests {
         assert_eq!(s.queue_len(), 0);
     }
 
+    // ── decide(): the two ceilings are distinct (regression) ──────────
+    //
+    // These pin the contract `env::admit` relies on: `available` is the
+    // *empty-of-ztest* ceiling (`ClusterCapacity::admission_ceiling`), checked
+    // for Reject; the queue/fit split is `available − committed`. A footprint
+    // that fits the ceiling but not the live free figure must QUEUE, never
+    // Reject. Feeding live-free (`ClusterCapacity::free`) in as `available`
+    // collapses this distinction under load and was the cause of spurious
+    // `ExceedsClusterCapacity` rejections.
+
+    #[test]
+    fn decide_queues_when_fits_ceiling_but_not_free() {
+        // Ceiling 8 CPU; 6 already committed → 2 free. A 4-CPU footprint fits
+        // the ceiling but not free-right-now: it must wait, not fail fast.
+        let v = decide(
+            Resources::new(8_000, 16 * GIB), // available = ceiling
+            Resources::new(6_000, 12 * GIB), // committed
+            Resources::ZERO,                 // sa_usage
+            None,                            // sa_budget
+            Resources::new(4_000, 8 * GIB),  // footprint
+        );
+        assert_eq!(v, Verdict::Queue);
+    }
+
+    #[test]
+    fn decide_rejects_only_when_footprint_exceeds_ceiling() {
+        // Same footprint, ceiling now too small in the memory dimension →
+        // genuinely unschedulable however many committed leases finish.
+        let v = decide(
+            Resources::new(8_000, 4 * GIB),
+            Resources::ZERO,
+            Resources::ZERO,
+            None,
+            Resources::new(4_000, 8 * GIB),
+        );
+        assert_eq!(v, Verdict::Reject(RejectReason::ExceedsClusterCapacity));
+    }
+
+    #[test]
+    fn decide_fits_on_empty_ceiling() {
+        let v = decide(
+            Resources::new(8_000, 16 * GIB),
+            Resources::ZERO,
+            Resources::ZERO,
+            None,
+            Resources::new(4_000, 8 * GIB),
+        );
+        assert_eq!(v, Verdict::Fits);
+    }
+
     // ── Reject: exceeds empty-cluster capacity (fail fast) ─────────────
 
     #[test]

@@ -124,6 +124,20 @@ pub enum StoreError {
     Backend(String),
 }
 
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::AlreadyExists => write!(f, "object already exists (409)"),
+            StoreError::Conflict => write!(f, "resourceVersion conflict / absent on update (409)"),
+            StoreError::NotFound => write!(f, "object not found (404)"),
+            StoreError::StaleRead => write!(f, "read could not be served fresh enough (stale)"),
+            StoreError::Backend(msg) => write!(f, "store backend error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
 /// The k8s operations the allocator depends on. Async because the real
 /// adapter is; the fake is synchronous under the hood.
 #[async_trait]

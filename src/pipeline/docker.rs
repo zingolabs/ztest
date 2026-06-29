@@ -38,9 +38,9 @@ pub enum DockerOutcome {
 }
 
 /// Build every image in `decls`, skipping anything already present in
-/// the cluster's containerd. Blocking I/O — wrapped in
-/// `tokio::task::spawn_blocking` by the caller.
-pub fn build_all(decls: &[DevImageEntry]) -> DockerOutcome {
+/// the cluster's containerd. Blocking I/O. `on_line` receives each `docker
+/// build` output line (relayed into the console's scrollback by the caller).
+pub fn build_all(decls: &[DevImageEntry], on_line: &mut dyn FnMut(&str)) -> DockerOutcome {
     let mut images = Vec::with_capacity(decls.len());
     for decl in decls {
         let dockerfile = std::path::Path::new(&decl.dockerfile);
@@ -72,7 +72,7 @@ pub fn build_all(decls: &[DevImageEntry]) -> DockerOutcome {
             continue;
         }
 
-        if let Err(err) = image::docker_build(dockerfile, context, &decl.features, &tag) {
+        if let Err(err) = image::docker_build(dockerfile, context, &decl.features, &tag, on_line) {
             return DockerOutcome::Failed {
                 detail: format!("docker build {tag}: {err}"),
             };

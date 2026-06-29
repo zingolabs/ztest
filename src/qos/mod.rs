@@ -41,11 +41,21 @@
 pub mod allocator;
 pub mod kube_store;
 pub mod ledger;
+pub mod live;
+pub mod lower;
+pub mod schedule;
 pub mod scheduler;
 pub mod store;
 pub mod units;
 
+/// The four tier attributes — `#[ztest::qos::basic]` … `#[ztest::qos::sync]`.
+/// (Surfaced only under `ztest::qos::*`, not the prelude.)
+pub use ztest_macros::{basic, integration, sync, testnet};
+
+use std::cell::Cell;
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 // ── Shared k8s label / annotation keys ─────────────────────────────────
 //
@@ -63,6 +73,11 @@ pub const ROLE_RESERVATION: &str = "qos-reservation";
 pub const ROLE_JOB: &str = "qos-job";
 /// `LABEL_ROLE` value for the singleton allocator-lock Lease.
 pub const ROLE_ALLOCATOR_LOCK: &str = "qos-allocator-lock";
+/// `LABEL_ROLE` value stamped on a per-test namespace by
+/// `cluster::ensure_namespace`. The capacity probe keys on it to separate
+/// ztest's own pods from the non-ztest baseline (see
+/// [`ClusterCapacity::admission_ceiling`]).
+pub const ROLE_TEST_ENV: &str = "test-env";
 /// Label carrying the pool (`general`/`nvme`); see [`Pool::as_label`].
 pub const LABEL_POOL: &str = "zaino.io/pool";
 /// Label carrying the (slugged) ServiceAccount the reservation is charged to.
@@ -71,6 +86,11 @@ pub const LABEL_SA: &str = "zaino.io/sa";
 /// namespace). Capacity is deduplicated per unit (`max` of reservation vs
 /// Jobs) — see [`ledger`].
 pub const LABEL_UNIT: &str = "zaino.io/unit";
+/// Label recording the [`QosClass`] tier a reservation was granted for. Carried
+/// for the live during-run panel (`qos::live`) so the parent can group active
+/// reservations by tier; the scheduler/ledger ignore it (admission keys on the
+/// footprint, not the tier).
+pub const LABEL_TIER: &str = "qos.zaino.io/tier";
 
 /// Annotation: footprint CPU in millicores (decimal `u64`).
 pub const ANN_CPU_MILLI: &str = "qos.zaino.io/cpu-milli";
@@ -82,6 +102,60 @@ pub const ANN_RENEW_TICK: &str = "qos.zaino.io/renew-tick";
 pub const ANN_LEASE_TICKS: &str = "qos.zaino.io/lease-ticks";
 /// Annotation: the holder identity (run-id) of the allocator lock.
 pub const ANN_HOLDER: &str = "qos.zaino.io/holder";
+
+/// Annotation **on a ServiceAccount**: that SA's total CPU budget, as a
+/// Kubernetes CPU quantity (`"16"`, `"16000m"`). The broker rejects/queues a
+/// run once its SA's concurrent reservations would exceed this (§5.6).
+pub const ANN_SA_BUDGET_CPU: &str = "qos.zaino.io/budget-cpu";
+/// Annotation on a ServiceAccount: that SA's total memory budget, as a
+/// Kubernetes memory quantity (`"32Gi"`). See [`ANN_SA_BUDGET_CPU`].
+pub const ANN_SA_BUDGET_MEM: &str = "qos.zaino.io/budget-mem";
+
+// ── NVMe placement (node taint + nodeSelector) ─────────────────────────
+//
+// The `sync` tier's pods must land on the dedicated NVMe nodes; other tiers
+// must not. This is realised as Kubernetes *placement* (a tainted node pool +
+// a matching pod toleration and nodeSelector), not a capacity partition (see
+// [`Pool`]). These keys are applied to `sync` pod specs at materialize time
+// (`manifest::PodSpec::render`).
+//
+// **§11 TBD:** the exact label/taint key the NVMe nodes carry is an open
+// question pending cluster-admin confirmation. They are isolated here so the
+// production value is a one-line swap.
+
+/// NodeSelector label key marking the NVMe node pool. **§11 TBD.**
+pub const NVME_NODE_LABEL_KEY: &str = "zaino.io/pool";
+/// NodeSelector label value selecting the NVMe node pool. **§11 TBD.**
+pub const NVME_NODE_LABEL_VALUE: &str = "nvme";
+/// Taint key the NVMe nodes carry; a `sync` pod tolerates it. **§11 TBD.**
+pub const NVME_TAINT_KEY: &str = "zaino.io/pool";
+
+// ── Runtime admission timing (wall-clock seconds) ──────────────────────
+//
+// The allocator core is clock-free and counts in abstract `u64` "ticks"
+// ([`allocator::Allocator`]); in production those ticks are **unix epoch
+// seconds** ([`now_secs`]). These constants set the lease lifetimes and the
+// admission-loop pacing the live `TestEnv::build()` uses.
+
+/// Allocator-lock Lease TTL — short; the critical section is a few reads + one
+/// write.
+pub const LOCK_TICKS: u64 = 15;
+/// Reservation Lease TTL. A live test heartbeats it every [`RENEW_INTERVAL`];
+/// a crashed test's reserve is reclaimed once `renew + this + GRACE < now`.
+pub const RESERVATION_TICKS: u64 = 90;
+/// Reclaim grace margin (skew guard) added to the reservation TTL before a
+/// dead reservation is reclaimable.
+pub const GRACE: u64 = 30;
+/// How often the holding test renews its reservation Lease (≈ ⅓ of the TTL, so
+/// two renewals can be missed before expiry).
+pub const RENEW_INTERVAL: Duration = Duration::from_secs(30);
+/// Poll interval while a request is [`Queued`](allocator::Outcome::Queued)
+/// waiting for capacity to free up.
+pub const QUEUE_POLL: Duration = Duration::from_secs(2);
+/// Overall wall-clock budget for admission (queue + lock contention). Exceeding
+/// it fails the build rather than blocking a test indefinitely; nextest's
+/// slow-timeout is the coarser backstop (§5.2).
+pub const ADMIT_BUDGET: Duration = Duration::from_secs(900);
 
 /// One mebibyte, in bytes — for spelling memory amounts legibly.
 pub const MIB: u64 = 1024 * 1024;
@@ -183,15 +257,33 @@ impl Resources {
 pub struct ClusterCapacity {
     /// Σ `node.status.allocatable` over schedulable nodes.
     pub allocatable: Resources,
-    /// Σ effective requests of scheduled, live pods.
+    /// Σ effective requests of *all* scheduled, live pods (ztest and
+    /// non-ztest alike). Drives the preflight banner's free-headroom display.
     pub requested: Resources,
+    /// Σ effective requests of scheduled, live pods *outside* ztest-managed
+    /// namespaces (those not labelled [`LABEL_ROLE`]=[`ROLE_TEST_ENV`], plus
+    /// the QoS infra namespaces). This is the load ztest does not control and
+    /// cannot shed by waiting; it sizes the admission ceiling below.
+    pub baseline: Resources,
 }
 
 impl ClusterCapacity {
-    /// Schedulable headroom: `allocatable − requested`, floored at zero per
-    /// dimension.
+    /// Schedulable headroom for the banner: `allocatable − requested`, floored
+    /// at zero per dimension. Nets out *every* pod, so it shrinks as ztest's
+    /// own tests run — correct for a live "free right now" display, but NOT a
+    /// stable admission ceiling (see [`Self::admission_ceiling`]).
     pub fn free(&self) -> Resources {
         self.allocatable.saturating_sub(&self.requested)
+    }
+
+    /// The capacity available to ztest, independent of ztest's own load:
+    /// `allocatable − baseline`. This is the "empty-of-ztest cluster" figure
+    /// the allocator admits against. Reject means a footprint exceeds *this*
+    /// (unschedulable however many ztest tests finish); the queue/fit split is
+    /// then taken against this minus the ledger's committed reservations —
+    /// counting ztest load exactly once, via the ledger, never the live probe.
+    pub fn admission_ceiling(&self) -> Resources {
+        self.allocatable.saturating_sub(&self.baseline)
     }
 }
 
@@ -233,7 +325,11 @@ impl Pool {
 }
 
 /// The four quality-of-service tiers a test may declare.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Ord` follows declaration order (`Basic < Integration < Testnet < Sync`),
+/// which is also ascending priority — handy as a stable `BTreeMap` key when
+/// grouping tests by tier for deterministic config lowering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum QosClass {
     /// Sub-minute pure-logic checks. 60 s hard cap.
     Basic,
@@ -248,16 +344,15 @@ pub enum QosClass {
 /// The lowered form of a [`QosClass`]: what the harness needs to
 /// schedule and size a tier.
 ///
-/// **Caps, pool, and priority order are locked** (`docs/qos-design.md`
-/// §2). The per-tier `footprint` reserves are still TBD (§11) — the
-/// values in [`QosClass::profile`] are placeholders, and the scheduler
-/// deliberately never reads them (callers pass an explicit
-/// [`scheduler::Request`]), so the engine is correct regardless of the
-/// final numbers.
+/// Caps, pool, priority order, **and the per-tier footprint reserves** are all
+/// fixed (`docs/qos-design.md` §2/§11). The scheduler still doesn't read the
+/// footprint directly — callers pass an explicit [`scheduler::Request`] — so
+/// the engine stays decoupled from the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QosProfile {
     /// Per-test namespace aggregate reserve — the amount the broker
-    /// schedules against (§2). **Placeholder pending §11.**
+    /// schedules against, and (split across the env's pods) the default
+    /// pod requests/limits when a test doesn't call `.resources()` (§7).
     pub footprint: Resources,
     /// Which pool the tier schedules on.
     pub pool: Pool,
@@ -269,13 +364,32 @@ pub struct QosProfile {
 }
 
 impl QosClass {
+    /// The [`LABEL_TIER`] value for this tier (lowercase variant name).
+    pub fn as_label(self) -> &'static str {
+        match self {
+            QosClass::Basic => "basic",
+            QosClass::Integration => "integration",
+            QosClass::Testnet => "testnet",
+            QosClass::Sync => "sync",
+        }
+    }
+
+    /// Parse a [`LABEL_TIER`] value back into a [`QosClass`]; `None` if unknown.
+    pub fn from_label(s: &str) -> Option<QosClass> {
+        match s {
+            "basic" => Some(QosClass::Basic),
+            "integration" => Some(QosClass::Integration),
+            "testnet" => Some(QosClass::Testnet),
+            "sync" => Some(QosClass::Sync),
+            _ => None,
+        }
+    }
+
     /// The const profile table. One source of truth for every tier's
     /// schedulable shape.
     pub const fn profile(self) -> QosProfile {
         match self {
-            // Caps locked at 60 s / 10 min / 6 h / 48 h. Footprints are
-            // placeholders pending the definitive reserve table (§11);
-            // the scheduler never reads them.
+            // Caps locked at 60 s / 10 min / 6 h / 48 h; footprints per §11.
             QosClass::Basic => QosProfile {
                 footprint: Resources::new(500, 512 * MIB),
                 pool: Pool::General,
@@ -289,18 +403,136 @@ impl QosClass {
                 hard_cap: Duration::from_secs(10 * 60),
             },
             QosClass::Testnet => QosProfile {
-                footprint: Resources::new(4_000, 8 * GIB),
+                footprint: Resources::new(8_000, 18 * GIB),
                 pool: Pool::General,
                 priority: 2,
                 hard_cap: Duration::from_secs(6 * 60 * 60),
             },
             QosClass::Sync => QosProfile {
-                footprint: Resources::new(8_000, 16 * GIB),
+                footprint: Resources::new(16_000, 32 * GIB),
                 pool: Pool::Nvme,
                 priority: 3,
                 hard_cap: Duration::from_secs(48 * 60 * 60),
             },
         }
+    }
+}
+
+// ── Runtime tier (the in-process bridge) ───────────────────────────────
+//
+// The `#[ztest::qos::*]` attribute injects `__enter(class)` as a test's first
+// statement; `TestEnv::build()` will read `current()` to size pods and request
+// a reservation. A **thread-local** (not a tokio task-local) is the right tool:
+// nextest runs process-per-test, so there is no cross-test leakage within a
+// process, and `build()` reads the tier at its start — before any `.await`
+// could migrate the test future to another worker thread. This mirrors the
+// thread-name reliance in `naming::current_test_name`.
+
+thread_local! {
+    static CURRENT: Cell<QosClass> = const { Cell::new(QosClass::Basic) };
+}
+
+/// Set the current test's tier. Called by the `#[ztest::qos::*]` attribute as
+/// the test body's first statement; not meant to be called directly.
+#[doc(hidden)]
+pub fn __enter(class: QosClass) {
+    CURRENT.with(|c| c.set(class));
+}
+
+/// The tier declared by the running test, or [`QosClass::Basic`] if none was
+/// declared. Read by `TestEnv::build()`.
+pub fn current() -> QosClass {
+    CURRENT.with(|c| c.get())
+}
+
+// ── Admission loop (pure policy) ───────────────────────────────────────
+//
+// `TestEnv::build()` drives [`allocator::Allocator::try_admit`] in a retry
+// loop; this function is the loop's *pure* decision, factored out so the
+// policy (when to proceed / retry / wait / fail) is unit-testable without a
+// cluster. The async glue in `env.rs` only does the I/O and the sleeping.
+
+/// Parse a ServiceAccount's QoS budget from its annotations
+/// ([`ANN_SA_BUDGET_CPU`] / [`ANN_SA_BUDGET_MEM`]), reusing the same k8s
+/// quantity parsers as the cluster probe.
+///
+/// - `Ok(None)` — neither annotation present ⇒ the SA is unbudgeted/unlimited.
+/// - `Ok(Some(_))` — a present budget. A *partial* budget (only one dimension
+///   set) deliberately leaves the missing dimension unlimited (`u64::MAX`).
+/// - `Err(_)` — an annotation is *present but unparseable*. This is reported
+///   rather than silently treated as `0` (which would reject every request) or
+///   ignored, so a typo'd budget fails the run with a clear message instead of
+///   masquerading as a zero or absent budget.
+///
+/// Pure — the kube `get` lives in the caller (`TestEnv::build`).
+pub fn parse_sa_budget(
+    annotations: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<Resources>, String> {
+    let parse = |key: &str, raw: Option<&String>, f: fn(&str) -> Option<u64>| -> Result<Option<u64>, String> {
+        match raw {
+            None => Ok(None),
+            Some(s) => f(s)
+                .map(Some)
+                .ok_or_else(|| format!("unparseable QoS budget annotation {key}={s:?}")),
+        }
+    };
+    let cpu = parse(ANN_SA_BUDGET_CPU, annotations.get(ANN_SA_BUDGET_CPU), units::parse_cpu_milli_opt)?;
+    let mem = parse(ANN_SA_BUDGET_MEM, annotations.get(ANN_SA_BUDGET_MEM), units::parse_mem_bytes_opt)?;
+    if cpu.is_none() && mem.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Resources::new(cpu.unwrap_or(u64::MAX), mem.unwrap_or(u64::MAX))))
+}
+
+/// Wall-clock now as unix epoch seconds — the production value of the
+/// allocator's abstract `u64` tick. Saturates at 0 before the epoch (never in
+/// practice).
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// What the admission loop should do next given an attempt's [`Outcome`] and
+/// how long it has been trying.
+///
+/// [`Outcome`]: allocator::Outcome
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmitStep {
+    /// Admitted — proceed to build the topology.
+    Proceed,
+    /// Transient (lock contended / stale read) — retry immediately.
+    RetryNow,
+    /// Fits in principle but no room yet — wait [`QUEUE_POLL`] then retry.
+    WaitThenRetry,
+    /// Unschedulable even on an empty cluster / against the whole SA budget —
+    /// fail fast.
+    Reject(scheduler::RejectReason),
+    /// The admission budget was exhausted while retrying/queuing — give up.
+    Timedout,
+}
+
+/// Pure admission-loop policy. `elapsed` is the time spent admitting so far;
+/// `budget` the overall ceiling ([`ADMIT_BUDGET`]). A non-terminal outcome
+/// past the budget becomes [`AdmitStep::Timedout`]; [`Granted`]/[`Rejected`]
+/// are terminal regardless of the clock.
+///
+/// [`Granted`]: allocator::Outcome::Granted
+/// [`Rejected`]: allocator::Outcome::Rejected
+pub fn classify(
+    outcome: &allocator::Outcome,
+    elapsed: Duration,
+    budget: Duration,
+) -> AdmitStep {
+    use allocator::Outcome;
+    match outcome {
+        Outcome::Granted { .. } => AdmitStep::Proceed,
+        Outcome::Rejected(reason) => AdmitStep::Reject(*reason),
+        Outcome::Retry if elapsed < budget => AdmitStep::RetryNow,
+        Outcome::Queued if elapsed < budget => AdmitStep::WaitThenRetry,
+        // Retry / Queued but the budget is spent.
+        _ => AdmitStep::Timedout,
     }
 }
 
@@ -383,5 +615,114 @@ mod tests {
         // sync is the top tier overall (it owns its own pool, but the
         // ordering is still well-defined).
         assert!(t <= s, "sync is not below testnet");
+    }
+
+    #[test]
+    fn qos_class_label_round_trips() {
+        for c in [
+            QosClass::Basic,
+            QosClass::Integration,
+            QosClass::Testnet,
+            QosClass::Sync,
+        ] {
+            assert_eq!(QosClass::from_label(c.as_label()), Some(c));
+        }
+        assert_eq!(QosClass::from_label("nope"), None);
+    }
+
+    #[test]
+    fn qos_class_serde_round_trips() {
+        for c in [
+            QosClass::Basic,
+            QosClass::Integration,
+            QosClass::Testnet,
+            QosClass::Sync,
+        ] {
+            let json = serde_json::to_string(&c).unwrap();
+            assert_eq!(serde_json::from_str::<QosClass>(&json).unwrap(), c);
+        }
+        // Variant names are the wire form.
+        assert_eq!(serde_json::to_string(&QosClass::Sync).unwrap(), "\"Sync\"");
+    }
+
+    #[test]
+    fn current_defaults_to_basic_and_enter_sets_it() {
+        // Default before any `__enter` on this thread.
+        assert_eq!(current(), QosClass::Basic);
+        __enter(QosClass::Testnet);
+        assert_eq!(current(), QosClass::Testnet);
+        __enter(QosClass::Sync);
+        assert_eq!(current(), QosClass::Sync);
+    }
+
+    // ── Admission-loop policy (pure) ───────────────────────────────────
+
+    use crate::qos::allocator::Outcome;
+    use crate::qos::scheduler::RejectReason;
+
+    const BUDGET: Duration = Duration::from_secs(100);
+
+    #[test]
+    fn granted_proceeds_regardless_of_clock() {
+        let g = Outcome::Granted { reservation: "qos-x".into() };
+        // Terminal even past the budget.
+        assert_eq!(classify(&g, Duration::ZERO, BUDGET), AdmitStep::Proceed);
+        assert_eq!(classify(&g, BUDGET * 2, BUDGET), AdmitStep::Proceed);
+    }
+
+    #[test]
+    fn rejected_fails_fast_regardless_of_clock() {
+        let r = Outcome::Rejected(RejectReason::ExceedsClusterCapacity);
+        assert_eq!(
+            classify(&r, Duration::ZERO, BUDGET),
+            AdmitStep::Reject(RejectReason::ExceedsClusterCapacity)
+        );
+        // Still a reject even past budget (terminal beats Timedout).
+        assert_eq!(
+            classify(&r, BUDGET * 2, BUDGET),
+            AdmitStep::Reject(RejectReason::ExceedsClusterCapacity)
+        );
+    }
+
+    #[test]
+    fn retry_and_queued_respect_the_budget() {
+        // Within budget: retry immediately / wait-then-retry.
+        assert_eq!(classify(&Outcome::Retry, Duration::ZERO, BUDGET), AdmitStep::RetryNow);
+        assert_eq!(
+            classify(&Outcome::Queued, Duration::ZERO, BUDGET),
+            AdmitStep::WaitThenRetry
+        );
+        // At/over budget: both give up.
+        assert_eq!(classify(&Outcome::Retry, BUDGET, BUDGET), AdmitStep::Timedout);
+        assert_eq!(classify(&Outcome::Queued, BUDGET, BUDGET), AdmitStep::Timedout);
+    }
+
+    #[test]
+    fn parse_sa_budget_reads_both_dims_partial_and_absent() {
+        use std::collections::BTreeMap;
+        // Both present.
+        let full = BTreeMap::from([
+            (ANN_SA_BUDGET_CPU.to_string(), "16".to_string()),
+            (ANN_SA_BUDGET_MEM.to_string(), "32Gi".to_string()),
+        ]);
+        assert_eq!(parse_sa_budget(&full), Ok(Some(Resources::new(16_000, 32 * GIB))));
+        // Only CPU → mem unlimited.
+        let cpu_only = BTreeMap::from([(ANN_SA_BUDGET_CPU.to_string(), "8000m".to_string())]);
+        assert_eq!(parse_sa_budget(&cpu_only), Ok(Some(Resources::new(8_000, u64::MAX))));
+        // Neither → unbudgeted.
+        assert_eq!(parse_sa_budget(&BTreeMap::new()), Ok(None));
+        // Present but unparseable → a clear error, NOT a silent 0 (which would
+        // reject every request) or a silent skip.
+        let garbage = BTreeMap::from([(ANN_SA_BUDGET_CPU.to_string(), "16cores".to_string())]);
+        assert!(parse_sa_budget(&garbage).is_err());
+    }
+
+    #[test]
+    fn now_secs_is_a_plausible_unix_timestamp() {
+        // Sanity: after 2020-01-01 and before 2100. Guards against a unit
+        // (millis/nanos) regression in the tick mapping.
+        let now = now_secs();
+        assert!(now > 1_577_836_800, "now_secs() before 2020: {now}");
+        assert!(now < 4_102_444_800, "now_secs() after 2100: {now}");
     }
 }

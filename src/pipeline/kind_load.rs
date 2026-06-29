@@ -18,9 +18,10 @@ pub enum KindLoadOutcome {
     Failed { detail: String },
 }
 
-/// Load every non-cached image into the kind cluster. Blocking I/O —
-/// wrapped in `tokio::task::spawn_blocking` by the caller.
-pub fn load_all(images: &[BuiltImage]) -> KindLoadOutcome {
+/// Load every non-cached image into the kind cluster. Blocking I/O. `on_line`
+/// receives each subprocess output line (relayed into the console's scrollback
+/// by the caller).
+pub fn load_all(images: &[BuiltImage], on_line: &mut dyn FnMut(&str)) -> KindLoadOutcome {
     let mut loaded = 0usize;
     let mut skipped = 0usize;
     for built in images {
@@ -28,7 +29,7 @@ pub fn load_all(images: &[BuiltImage]) -> KindLoadOutcome {
             skipped += 1;
             continue;
         }
-        if let Err(err) = image::kind_load(&built.tag) {
+        if let Err(err) = image::kind_load(&built.tag, on_line) {
             return KindLoadOutcome::Failed {
                 detail: format!("kind load {}: {err}", built.tag),
             };

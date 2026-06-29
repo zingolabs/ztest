@@ -296,28 +296,22 @@ pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
 /// because the pipeline lives in `crate::pipeline::docker` and needs
 /// to invoke it directly — the resolver no longer triggers builds.
 ///
-/// Streams `stderr` directly to the user's terminal (BuildKit emits
-/// all human-readable progress on stderr), which lands in the
-/// pinned-banner scroll region the same way cargo's
-/// `Compiling foo v0.1.0` lines do.
+/// Pipes `stderr` (BuildKit emits all human-readable progress there) and relays
+/// it line-by-line through `on_line`, which the caller forwards into the bottom
+/// console's native scrollback the same way cargo's `Compiling foo v0.1.0`
+/// lines are. Because stderr is a pipe rather than a TTY, BuildKit auto-degrades
+/// to `plain` progress mode — exactly what we want for clean one-line-per-step
+/// relay (no in-place spinner rewrites to reconcile).
 ///
-/// `BUILDKIT_PROGRESS` is **left unset** so BuildKit auto-detects the
-/// terminal — when stderr is inherited from a real TTY (the common
-/// case for `ztest run` invoked from a shell) BuildKit picks its
-/// `tty` mode and we get colors + live spinner / in-place stage
-/// rewrites. Those rewrites use save/restore cursor escapes which
-/// the DECSTBM scroll region clamps correctly. CI / pipe destinations
-/// auto-degrade to `plain` mode without us forcing it.
-///
-/// stdout (the image id, if `--quiet` were set) is dropped. On
-/// failure, the upstream stderr is already on screen so we surface
-/// only the exit code — duplicating the error tail would just print
-/// the same lines twice.
+/// stdout (the image id, if `--quiet` were set) is dropped. On failure the
+/// progress lines are already relayed, so we surface only the exit code —
+/// duplicating the error tail would just print the same lines twice.
 pub fn docker_build(
     dockerfile: &Path,
     context: &Path,
     features: &[String],
     tag: &str,
+    on_line: &mut dyn FnMut(&str),
 ) -> Result<(), ImageError> {
     let mut cmd = Command::new("docker");
     cmd.env("DOCKER_BUILDKIT", "1");
@@ -332,16 +326,28 @@ pub fn docker_build(
         ]);
     }
     cmd.arg(context);
+    // Pipe stderr so the caller can relay BuildKit's (plain, non-TTY) progress
+    // into the console's scrollback; stdout carries nothing we want.
     cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::piped());
 
-    eprintln!(
+    on_line(&format!(
         "ztest: docker build -f {} -t {} {}",
         dockerfile.display(),
         tag,
         context.display()
-    );
-    let status = cmd.status().map_err(|err| ImageError::Spawn {
+    ));
+    let mut child = cmd.spawn().map_err(|err| ImageError::Spawn {
+        cmd: "docker build".into(),
+        err,
+    })?;
+    if let Some(stderr) = child.stderr.take() {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            on_line(&line);
+        }
+    }
+    let status = child.wait().map_err(|err| ImageError::Spawn {
         cmd: "docker build".into(),
         err,
     })?;
@@ -357,13 +363,13 @@ pub fn docker_build(
     Ok(())
 }
 
-/// Run `kind load docker-image` for a built tag. Public for the same
-/// reason as [`docker_build`]. Stderr is inherited — `kind`'s output
-/// is one-line-per-step and harmless to the banner. On non-zero exit
-/// we still capture stderr for the error tail.
-pub fn kind_load(tag: &str) -> Result<(), ImageError> {
+/// Run `kind load docker-image` for a built tag. Public for the same reason as
+/// [`docker_build`]. `kind`'s output (stderr) is captured and relayed
+/// one-line-per-step through `on_line` into the console; on non-zero exit the
+/// captured stderr also feeds the error tail.
+pub fn kind_load(tag: &str, on_line: &mut dyn FnMut(&str)) -> Result<(), ImageError> {
     let cluster = std::env::var("KIND_CLUSTER").unwrap_or_else(|_| "zkn".to_string());
-    eprintln!("ztest: kind load docker-image {tag} --name {cluster}");
+    on_line(&format!("ztest: kind load docker-image {tag} --name {cluster}"));
     let out = Command::new("kind")
         .args(["load", "docker-image", tag, "--name", &cluster])
         .output()
@@ -371,6 +377,12 @@ pub fn kind_load(tag: &str) -> Result<(), ImageError> {
             cmd: "kind load".into(),
             err,
         })?;
+    // Relay kind's own progress lines (stderr) into the console.
+    for line in String::from_utf8_lossy(&out.stderr).lines() {
+        if !line.is_empty() {
+            on_line(line);
+        }
+    }
     if !out.status.success() {
         return Err(ImageError::KindLoad {
             stderr_tail: tail(&out.stderr, 40),
@@ -390,14 +402,13 @@ fn read_rust_version(context: &Path) -> String {
     };
     for line in s.lines() {
         let t = line.trim();
-        if let Some(rest) = t.strip_prefix("channel") {
-            if let Some(v) = rest
+        if let Some(rest) = t.strip_prefix("channel")
+            && let Some(v) = rest
                 .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
                 .split('"')
                 .nth(1)
-            {
-                return v.to_string();
-            }
+        {
+            return v.to_string();
         }
     }
     "stable".to_string()

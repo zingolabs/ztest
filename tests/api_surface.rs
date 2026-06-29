@@ -22,7 +22,7 @@ fn builder_chain_compiles_for_every_variant() {
     );
     let _w = t.add_validator(Validator::zcashd("6.4.1").named("bob"));
     let _i = t.add_indexer(Indexer::zaino("0.4.0"));
-    let _z = t.add_wallet(Wallet::zingo("0.1.0"));
+    let _z = t.add_wallet(Wallet::zingo());
 }
 
 #[test]

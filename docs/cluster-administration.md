@@ -350,11 +350,20 @@ First day to debugging a node: under an hour.
 1. **Ceph pool sizing.** Start `size=3` default / `size=1` archive.
    Revisit if disk pressure forces EC (needs ≥5 nodes).
 
-# Shopping List Priced 2026-06-19
+# Xeon LGA 3647 Shopping List Priced 2026-06-19
 
 SuperMicro Dual Socket LGA 3647 Motherboard ~$700
 Xeon Gold 6258R (28 cores, 2.7GHz) $875
 128GB DDR4 ECC 2666MHz (4x32GB) $1200
+WD-Black 2TB NVMe SSD $250
+Pcie to 4x Nvme Adapter $100
+12TB Seagate Ironwolf Pro Sata HDD $460
+
+# AMD Milan Epyc 7xx3 Shopping List Priced 2026-06-24
+
+SuperMicro Dual Socket Epyc 7003 Motherboard $850 (Link)[https://www.newegg.com/p/1JW-0006-00R41]
+AMD Epyc 7453 (28 cores, 2.75Ghz) $500
+128GB DDR4 ECC 3200MHz (4x32GB) $1250
 WD-Black 2TB NVMe SSD $250
 Pcie to 4x Nvme Adapter $100
 12TB Seagate Ironwolf Pro Sata HDD $460

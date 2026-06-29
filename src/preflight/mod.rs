@@ -1,23 +1,27 @@
 //! Preflight banner — session-startup status surface for the ztest harness.
 //!
-//! Rendered once per `cargo nextest` invocation by the `zkn-preflight`
-//! setup script (see [`docs/running-tests.md#preflight`]). Output style
-//! is deliberately aligned with `cargo nextest`'s own reporter — same
-//! crate set (`owo-colors`, `supports-color`, `supports-unicode`,
-//! `bytesize`, `indicatif`), same colour palette, same right-aligned
-//! 12-column action-label convention — so the preflight block reads as
-//! a continuation of nextest's startup banner rather than a parallel
-//! UI.
+//! Drives the bottom status panel that [`cli::run`](crate::cli::run) keeps
+//! pinned through a `ztest run` session: the compact [`render_preflight_panel`]
+//! / [`render_live_panel`] panels on a TTY, and the full [`render`](render())
+//! banner printed once for the log on a non-TTY (CI) run. Output style is
+//! deliberately aligned with `cargo nextest`'s own reporter — same colour
+//! palette, glyph set, and right-aligned 12-column action-label convention — so
+//! the preflight block reads as a continuation of nextest's startup banner
+//! rather than a parallel UI.
 //!
 //! ## Layers
 //!
 //! - [`theme`] — colour palette and glyph table; one `Theme::detect()`
 //!   constructor handles `NO_COLOR` / TTY / Unicode-support gating.
-//! - [`render`] — pure formatter. Takes a fully-known [`BannerState`]
-//!   and a [`Theme`], produces a `String`. No I/O, no async.
+//! - [`render`] — pure formatters. Take a fully-known [`BannerState`] (plus, for
+//!   the panels, live run state) and a [`Theme`], produce a `String`. No I/O, no
+//!   async. [`render`](render()) is the full banner; [`render_preflight_panel`]
+//!   and [`render_live_panel`] are the compact bottom-console panels for the
+//!   preflight and run phases respectively.
 //!
-//! Live cluster probing, LFS fetching, and in-place refresh live in
-//! sibling modules (steps 3+ of the rollout).
+//! The terminal mechanics that *display* these strings — pinning a panel at the
+//! bottom, forwarding output into native scrollback — live in
+//! [`cli::console`](crate::cli::console).
 //!
 //! ## Reference
 //!
@@ -25,15 +29,12 @@
 //!
 //! [`docs/running-tests.md#preflight`]: https://github.com/zingolabs/infrastructure/blob/dev/zcash_kube_net/docs/running-tests.md#preflight
 
-mod live;
-mod pinned;
 mod render;
 mod theme;
 
-pub use self::live::LiveRender;
-pub use self::pinned::PinnedHeader;
-pub use self::render::render;
+pub use self::render::{RunProgress, render, render_live_panel, render_preflight_panel};
 pub use self::theme::Theme;
+pub use crate::qos::schedule::{QosPlan, TierPlan};
 
 // ─────────────────────────── data model ───────────────────────────────
 
@@ -52,6 +53,11 @@ pub struct BannerState {
     /// F1–F5 placeholder rows, rendered between snapshots and the
     /// bottom rule.
     pub future: Vec<FutureRow>,
+    /// The QoS scheduling plan (per-tier counts, wave estimate vs capacity,
+    /// unschedulable warnings) — `Some` once the inventory dump + probe have
+    /// landed. Rendered as the `Scheduling` block. The live during-run
+    /// reservation view is a deferred follow-up (noted in the block).
+    pub qos_plan: Option<QosPlan>,
 }
 
 /// Phase-B status. Owns the `Inventory` row of the banner.

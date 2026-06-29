@@ -9,7 +9,7 @@
 //! `seeds.rs`) survive the namespace delete and must be reaped
 //! explicitly. See `docs/architecture-overview.md#ownership-cascade`.
 
-use k8s_openapi::api::core::v1::{Namespace, Service};
+use k8s_openapi::api::core::v1::{Namespace, Service, ServiceAccount};
 use kube::Client;
 use kube::api::{Api, PostParams};
 use serde_json::json;
@@ -68,6 +68,18 @@ pub(crate) fn no_cleanup_requested() -> bool {
     std::env::var_os("ZTEST_NO_CLEANUP").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// Whether QoS admission is enabled for this run. Set by `ztest run` (which
+/// has done the cluster probe / is talking to a QoS-provisioned cluster) as
+/// the `ZTEST_QOS` env var, forwarded by nextest to every test binary. When
+/// absent — a developer running `cargo nextest run` directly, often against a
+/// kind cluster with no NVMe nodes — `TestEnv::build()` skips admission and
+/// NVMe placement entirely, behaving exactly as before QoS existed (graceful
+/// degradation, `docs/qos-design.md` §5.1). Any non-empty, non-`"0"` value
+/// counts as set, mirroring [`no_cleanup_requested`].
+pub(crate) fn qos_enabled() -> bool {
+    std::env::var_os("ZTEST_QOS").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 pub async fn ensure_namespace(
     client: &Client,
     namespace: &str,
@@ -77,7 +89,9 @@ pub async fn ensure_namespace(
 ) -> Result<(), kube::Error> {
     let api: Api<Namespace> = Api::all(client.clone());
     if api.get_opt(namespace).await?.is_some() {
-        return Ok(());
+        // Already exists (idempotent retry) — still confirm the default SA
+        // landed before any pod is created against it.
+        return wait_for_default_sa(client, namespace).await;
     }
     // Label values must be DNS-1123 (≤63, no `:`); the raw `module::test`
     // path is slugged for the label and kept verbatim in an annotation
@@ -95,7 +109,7 @@ pub async fn ensure_namespace(
             "name": namespace,
             "labels": {
                 "zaino.io/run-id": coords.run_id,
-                "zaino.io/role": "test-env",
+                "zaino.io/role": crate::qos::ROLE_TEST_ENV,
                 "zaino.io/user": crate::naming::slug(&coords.user, 63),
                 "zaino.io/package": crate::naming::slug(package, 63),
                 "zaino.io/test": crate::naming::slug(test, 63),
@@ -108,10 +122,42 @@ pub async fn ensure_namespace(
     }))
     .map_err(kube::Error::SerdeError)?;
     match api.create(&PostParams::default(), &ns).await {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
-        Err(e) => Err(e),
+        Ok(_) => {}
+        Err(kube::Error::Api(e)) if e.code == 409 => {}
+        Err(e) => return Err(e),
     }
+    wait_for_default_sa(client, namespace).await
+}
+
+/// Block until the namespace's auto-provisioned `default` ServiceAccount
+/// exists.
+///
+/// Kubernetes' ServiceAccount controller creates the `default` SA
+/// *asynchronously* after a namespace appears. A pod created in that gap
+/// implicitly references `default` and is rejected with
+/// `serviceaccount "default" not found` (403) — a flaky failure that scales
+/// with how fast we create pods after the namespace. Polling for the SA here
+/// closes the race; a clear timeout error beats the cryptic pod-create 403.
+async fn wait_for_default_sa(client: &Client, namespace: &str) -> Result<(), kube::Error> {
+    const ATTEMPTS: u32 = 150;
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+    let api: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    for _ in 0..ATTEMPTS {
+        if api.get_opt("default").await?.is_some() {
+            return Ok(());
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
+    Err(kube::Error::Api(kube::core::ErrorResponse {
+        status: "Failure".to_string(),
+        message: format!(
+            "namespace {namespace}: the `default` ServiceAccount was not provisioned within {}s \
+             (ServiceAccount controller stalled?)",
+            (ATTEMPTS * INTERVAL.as_millis() as u32) / 1000,
+        ),
+        reason: "Timeout".to_string(),
+        code: 504,
+    }))
 }
 
 /// Delete the test's namespace. Cascades every Pod/PVC/CM/Service in

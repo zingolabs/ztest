@@ -1,36 +1,29 @@
 //! `ztest run` orchestration pipeline.
 //!
 //! The pipeline owns the lifecycle of a `ztest run` invocation. It
-//! coordinates parallel work — cluster probe (Phase A), build /
-//! inventory (Phase B), and the live banner renderer (Phase C) —
-//! around a single `tokio::sync::mpsc` event channel.
+//! coordinates parallel work — cluster probe (Phase A) and build /
+//! inventory (Phase B) — around a single `tokio::sync::mpsc` event
+//! channel, while `cli::run` drives the bottom console.
 //!
 //! ## Architecture
 //!
 //! ```text
 //!                    ┌─────────────────┐
-//!         ┌─────────►│ Phase A — kube  │──► Event::ProbeX
-//!         │          └─────────────────┘
-//!         │                                            ┌─────────────┐
-//!  ztest run args  ┌─────────────────┐                 │ Phase C —   │
-//!         │     ──►│ Phase B — cargo │──► Event::BuildX┤ render loop │
-//!         │        │   nextest list  │                 │ (LiveRender)│
-//!         │        └─────────────────┘                 └─────────────┘
+//!         ┌─────────►│ Phase A — kube  │──► Event::ProbeX ─┐
+//!         │          └─────────────────┘                  │   ┌──────────────┐
+//!  ztest run args                                         ├──►│ cli::run loop│
+//!         │        ┌─────────────────┐                    │   │ → bottom     │
+//!         │     ──►│ Phase B — cargo │──► Event::BuildX ───┘   │   console    │
+//!         │        │   nextest list  │──► relayed stderr ─────►│   panel      │
+//!         │        └─────────────────┘                        └──────────────┘
 //!         │
-//!         └─► barrier ─► exec `cargo nextest run`
+//!         └─► barrier ─► hand off to `cargo nextest run` (see cli::console)
 //! ```
 //!
-//! Each phase is a `pub async fn` taking an [`events::EventTx`] and
-//! the args / config it needs. Phase C is the single consumer of the
-//! channel — all rendering happens in one place.
-//!
-//! ## Current rollout state
-//!
-//! - Phase B: implemented (this module).
-//! - Phase A1 (cluster probe): step 4.
-//! - Phase A2-A4 (session register, archives, snapshots): step 5+.
-//! - Phase C: minimal (renders initial + final frame); evolves into a
-//!   full live loop in step 3b.
+//! Each phase is a `pub async fn` taking an [`events::EventTx`] and the
+//! args / config it needs. `cli::run::pipeline_phase` is the single consumer
+//! of the channel — it folds events into the [`crate::preflight`] banner state
+//! and repaints the [`crate::cli::console`] panel.
 
 pub mod archives;
 pub mod build;

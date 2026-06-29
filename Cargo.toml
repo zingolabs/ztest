@@ -46,7 +46,7 @@ path = "src/lib.rs"
 ztest_macros = { workspace = true }
 
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "fs", "process"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "fs", "process", "signal"] }
 tracing = { workspace = true }
 async-trait = "0.1"
 
@@ -94,5 +94,14 @@ supports-unicode = "3.0.0"
 bytesize = "2.3.1"
 terminal_size = "0.4"
 crossterm = "0.29"
+portable-pty = "0.9"
+# Inline-viewport TUI for the unified bottom console; `scrolling-regions` MUST
+# stay off (default) so output scrolls into native terminal scrollback rather
+# than a DECSTBM region. `avt` is an in-memory VT emulator whose `feed_str`
+# emits lines as they scroll off the top — the mechanism for forwarding child
+# output into native scrollback (see docs/engine-design.md).
+ratatui = "0.30"
+avt = "0.18"
+libc = "0.2"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 nextest-metadata = "0.14"

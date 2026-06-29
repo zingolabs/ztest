@@ -9,7 +9,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
-use syn::{LitStr, Token, parse::Parse, parse::ParseStream, parse_macro_input};
+use syn::{ItemFn, LitStr, Token, parse::Parse, parse::ParseStream, parse_macro_input};
 
 const ONE_MIB: u64 = 1024 * 1024;
 
@@ -335,4 +335,82 @@ fn resolve_dir(rel: &LitStr) -> Result<std::path::PathBuf, syn::Error> {
         ));
     }
     Ok(p)
+}
+
+// ───────────────────────── qos tier attributes ────────────────────────
+
+/// `#[ztest::qos::basic]` — declare a test's quality-of-service tier.
+///
+/// The four tier attributes (`basic`, `integration`, `testnet`, `sync`) wrap
+/// a test, re-emit it intact (preserving any inner `#[tokio::test]` etc.), and
+/// inject two things — mirroring the `dev!` → inventory pattern:
+///   1. an `inventory::submit!` of a [`ztest::inventory::QosDecl`] so
+///      `ztest run` can group selected tests by tier (the out-of-process
+///      bridge, dumped via `ZTEST_DUMP_INVENTORY`);
+///   2. a `::ztest::qos::__enter(class)` first statement so the runtime can
+///      read the tier in `TestEnv::build()` (the in-process bridge).
+///
+/// The attribute takes no arguments.
+#[proc_macro_attribute]
+pub fn basic(attr: TokenStream, item: TokenStream) -> TokenStream {
+    qos_attr("Basic", attr, item)
+}
+
+/// `#[ztest::qos::integration]` — see [`basic`].
+#[proc_macro_attribute]
+pub fn integration(attr: TokenStream, item: TokenStream) -> TokenStream {
+    qos_attr("Integration", attr, item)
+}
+
+/// `#[ztest::qos::testnet]` — see [`basic`].
+#[proc_macro_attribute]
+pub fn testnet(attr: TokenStream, item: TokenStream) -> TokenStream {
+    qos_attr("Testnet", attr, item)
+}
+
+/// `#[ztest::qos::sync]` — see [`basic`].
+#[proc_macro_attribute]
+pub fn sync(attr: TokenStream, item: TokenStream) -> TokenStream {
+    qos_attr("Sync", attr, item)
+}
+
+/// Shared body of the four tier attributes. `variant` is the [`QosClass`]
+/// variant ident (`"Basic"` …).
+fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            Span::call_site(),
+            "ztest qos tier attribute takes no arguments, e.g. `#[ztest::qos::sync]`",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let mut func = match syn::parse::<ItemFn>(item) {
+        Ok(f) => f,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    let variant = syn::Ident::new(variant, Span::call_site());
+    let ident = &func.sig.ident;
+
+    // (b) in-process bridge: set the task-local tier as the first statement,
+    // before any `.await` can migrate the test future across threads.
+    let enter: syn::Stmt = syn::parse_quote! {
+        ::ztest::qos::__enter(::ztest::qos::QosClass::#variant);
+    };
+    func.block.stmts.insert(0, enter);
+
+    // (a) out-of-process bridge: register the tier in the link-time inventory.
+    // `concat!(module_path!(), "::", stringify!(name))` is const-evaluable, so
+    // it satisfies `submit!`'s static initializer.
+    quote! {
+        ::ztest::__private::inventory::submit! {
+            ::ztest::inventory::QosDecl {
+                test_id: concat!(module_path!(), "::", stringify!(#ident)),
+                class: ::ztest::qos::QosClass::#variant,
+            }
+        }
+        #func
+    }
+    .into()
 }
