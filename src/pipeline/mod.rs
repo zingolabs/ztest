@@ -28,15 +28,11 @@
 pub mod archives;
 pub mod build;
 pub mod cluster;
-pub mod docker;
 pub mod events;
 pub mod images;
-pub mod kind_load;
 
 pub use self::archives::{ArchiveEntry, ArchivesOutcome};
 pub use self::build::{BuildOutcome, SelectedBinary};
 pub use self::cluster::ProbeOutcome;
-pub use self::docker::{BuiltImage, DockerOutcome};
 pub use self::events::{Event, EventRx, EventTx, channel};
 pub use self::images::ImagesOutcome;
-pub use self::kind_load::KindLoadOutcome;

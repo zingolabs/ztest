@@ -19,26 +19,35 @@
 //!    its cursor-addressed per-test UI renders faithfully, with the live QoS
 //!    panel pinned beneath; otherwise a plain inherited-stdio run.
 //!
-//! ## Arg-forwarding contract
+//! ## Arg handling
 //!
-//! [`Args::nextest_args`] is a `Vec<String>` populated by clap's
-//! `trailing_var_arg + allow_hyphen_values` mode — it captures
-//! everything after `ztest run` literally. The vec is handed unmodified
-//! to `cargo nextest run`.
+//! [`Args::nextest_args`] captures everything after `ztest run` verbatim
+//! (clap's `trailing_var_arg + allow_hyphen_values`). [`RunOptions::parse`]
+//! makes one pass over it: the few run-behavior flags the engine *acts on*
+//! (`--no-cleanup`, `-j`, `--profile`, …) are extracted, and everything else —
+//! selection, filter, and build flags — is forwarded **unmodified** to
+//! `cargo nextest list`, which resolves the build and test selection exactly as
+//! `cargo nextest run` would. We never re-parse the selection grammar ourselves,
+//! so filtering is identical to nextest by construction.
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write, stdout};
-use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::Parser;
+use nextest_metadata::NextestExitCode;
 
-use crate::cli::args_peek;
 use crate::cli::console::Console;
+use crate::engine;
 use crate::inventory::QosEntry;
 use crate::pipeline::{self, ArchivesOutcome, BuildOutcome, ProbeOutcome};
-use crate::qos::lower::{self, TestRef};
+
+/// A [`NextestExitCode`] constant as a process [`ExitCode`] — `ztest run` mirrors
+/// nextest's documented exit codes so CI can cross-reference them.
+fn exit(code: i32) -> ExitCode {
+    ExitCode::from(code as u8)
+}
 use crate::preflight::{
     self, ArchiveRow, ArchiveStatus, BannerState, ClusterState, SnapshotRow, Theme,
 };
@@ -46,26 +55,192 @@ use crate::preflight::{
 /// `ztest run` arguments.
 #[derive(Debug, Parser)]
 pub struct Args {
-    /// Arguments forwarded verbatim to `cargo nextest run`.
+    /// Arguments accepted exactly as by `cargo nextest run` — any flag, filter
+    /// expression, or positional. Run `cargo nextest run --help` for the full
+    /// reference. Migration is a literal `s/cargo nextest/ztest/`.
     ///
-    /// Any flag, filter expression, or positional substring accepted
-    /// by `cargo nextest run` works here. Run
-    /// `cargo nextest run --help` for the full reference.
+    /// Selection / filter / build flags are forwarded to `cargo nextest list`
+    /// unchanged. The ztest engine consumes the run-behavior flags directly:
+    /// `--retries`, `--fail-fast` / `--no-fail-fast`, `--no-capture`,
+    /// `--profile` / `-P`, `--message-format`, and `-j` / `--test-threads`
+    /// (advisory — the engine auto-scales concurrency to QoS capacity).
     ///
-    /// One ztest-only flag is recognized anywhere in this list and is
-    /// NOT forwarded to nextest:
+    /// Plus one ztest-only flag, recognized here and not forwarded:
     ///
-    ///   --no-cleanup   Leave each test's Kubernetes namespace (pods,
-    ///                  logs, volumes) in place instead of tearing it
-    ///                  down, so you can `kubectl` into a failure for a
-    ///                  post-mortem. A 1h janitor backstop still reaps
-    ///                  them, so nothing leaks permanently.
+    ///   --no-cleanup   Leave each test's Kubernetes namespace (pods, logs,
+    ///                  volumes) in place instead of tearing it down, so you can
+    ///                  `kubectl` into a failure for a post-mortem. A 1h janitor
+    ///                  backstop still reaps them, so nothing leaks permanently.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
         value_name = "NEXTEST_ARGS"
     )]
     pub nextest_args: Vec<String>,
+}
+
+/// The flags `ztest run` pulls out of its `cargo nextest run`-style argv: the
+/// few the engine acts on, plus the verbatim vector forwarded to
+/// `cargo nextest list` (which resolves the build + test selection exactly as
+/// nextest would — we never re-parse that grammar).
+#[derive(Debug, Default)]
+struct RunOptions {
+    /// Args for `cargo nextest list` (Phase B inventory): the verbatim argv with
+    /// the run-only flags stripped, since `list` rejects them. Run behavior
+    /// (retries / fail-fast / slow-timeout) is parsed into the fields below and
+    /// owned by the engine — it is not forwarded to a `cargo nextest run`.
+    list_args: Vec<String>,
+    /// `-j` / `--test-threads` — surfaced in the preflight banner only.
+    test_threads: Option<u32>,
+    /// `--no-tests <ACTION>` — behavior when zero tests are selected
+    /// (`pass` / `warn` / `fail`; nextest default `fail`).
+    no_tests: Option<String>,
+    /// `--no-cleanup` (ztest-only) — leave each test's k8s namespace standing
+    /// (passed to the run as the `ZTEST_NO_CLEANUP` env, not a nextest flag).
+    no_cleanup: bool,
+    /// `--retries N` — max retry attempts per failed test (engine-owned; default 0).
+    retries: u32,
+    /// `--fail-fast` / `--no-fail-fast` — stop admitting on the first terminal
+    /// failure. Default **off**: a ztest run packs the whole (often flaky,
+    /// cluster-dependent) suite and reports every result, rather than abandoning
+    /// the queued majority on the first failure. `--fail-fast` opts back in.
+    fail_fast: bool,
+    /// `--slow-timeout <DUR>` (ztest-only) — soft "slow" threshold; hard kill is
+    /// the tier `hard_cap`. `None` disables the SLOW signal.
+    slow_after: Option<std::time::Duration>,
+    /// Run-only flags the user passed that ztest drops (e.g. `--archive-file`,
+    /// `--debugger`) — surfaced as a warning. Display-only flags aren't listed.
+    unsupported: Vec<String>,
+}
+
+impl RunOptions {
+    /// Classify the verbatim `ztest run` argv in one pass: extract the
+    /// engine-owned flags, forward everything else to `cargo nextest list`.
+    fn parse(args: &[String]) -> Self {
+        // `cargo nextest list` accepts the selection / filter / build / config
+        // flags but REJECTS every run-only flag. We forward by default and strip
+        // the run-only flags here (forward-by-default fails loudly if we miss
+        // one — a dropped *selection* flag would silently mis-select). The tables
+        // below mirror `cargo nextest run --help`'s run-only sections.
+
+        // Run-only, value-taking, that `cargo nextest list` rejects → strip from
+        // `list_args`. A couple we also read (for the banner / zero-test policy);
+        // the rest are stripped only (the *run* still gets them verbatim).
+        const RUN_VALUE: &[&str] = &[
+            "-j", "--test-threads", "--jobs", "--retries", "--message-format", "--no-tests",
+            "--slow-timeout",
+        ];
+        // Run-only booleans `list` rejects → strip. `--no-cleanup` is ztest-only.
+        const RUN_BOOL: &[&str] = &[
+            "--no-cleanup", "--no-capture", "--fail-fast", "--ff", "--no-fail-fast", "--nff",
+        ];
+        // Run-only flags the engine does NOT implement — stripped so `list`
+        // doesn't choke, then ignored. Value-taking (consume their argument):
+        // Runner + Stress + Reporter-display (superseded by ztest's reporter) +
+        // Reuse-build (ztest has its own archive phase).
+        const IGNORED_VALUE: &[&str] = &[
+            "--max-fail", "--debugger", "--tracer",
+            "--stress-count", "--stress-duration",
+            "--failure-output", "--success-output", "--status-level", "--final-status-level",
+            "--show-progress", "--max-progress-running", "--message-format-version",
+            "--archive-file", "--archive-format", "--extract-to", "--cargo-metadata",
+            "--workspace-remap", "--binaries-metadata", "--target-dir-remap",
+        ];
+        // Run-only booleans the engine ignores.
+        const IGNORED_BOOL: &[&str] = &[
+            "--no-run",
+            "--hide-progress-bar", "--no-output-indent", "--no-input-handler",
+            "--extract-overwrite", "--persist-extract-tempdir",
+        ];
+        // The subset of ignored flags that meaningfully change behavior if
+        // dropped (vs. display-only) — worth warning the user about. Display
+        // flags (`--status-level`, `--show-progress`, …) are ignored silently
+        // since ztest owns the console rendering.
+        const WARN_UNSUPPORTED: &[&str] = &[
+            "--max-fail", "--debugger", "--tracer", "--stress-count", "--stress-duration",
+            "--archive-file", "--extract-to", "--cargo-metadata", "--binaries-metadata",
+            "--no-run",
+        ];
+
+        // `fail_fast` defaults OFF (ztest runs the whole suite and reports every
+        // result); `--fail-fast`/`--ff` opts into nextest's stop-on-first-failure.
+        let mut o = RunOptions::default();
+        let mut it = args.iter().peekable();
+        while let Some(arg) = it.next() {
+            // After `--`, the rest are filter positionals — forward verbatim.
+            if arg == "--" {
+                o.list_args.push(arg.clone());
+                o.list_args.extend(it.cloned());
+                break;
+            }
+            let (flag, inline) = split_eq(arg);
+
+            if RUN_BOOL.contains(&flag) {
+                match flag {
+                    "--no-cleanup" => o.no_cleanup = true,
+                    "--no-fail-fast" | "--nff" => o.fail_fast = false,
+                    "--fail-fast" | "--ff" => o.fail_fast = true,
+                    _ => {}
+                }
+                continue; // stripped from list_args
+            }
+            if IGNORED_BOOL.contains(&flag) {
+                if WARN_UNSUPPORTED.contains(&flag) {
+                    o.unsupported.push(flag.to_string());
+                }
+                continue; // stripped + ignored
+            }
+
+            if RUN_VALUE.contains(&flag) || IGNORED_VALUE.contains(&flag) {
+                let value = inline.map(str::to_owned).or_else(|| it.next().cloned());
+                match flag {
+                    "-j" | "--test-threads" | "--jobs" => {
+                        o.test_threads = value.as_deref().and_then(|v| v.parse().ok());
+                    }
+                    "--no-tests" => o.no_tests = value,
+                    "--retries" => {
+                        o.retries = value.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    }
+                    "--slow-timeout" => {
+                        o.slow_after = value.as_deref().and_then(parse_duration_secs);
+                    }
+                    _ => {
+                        if WARN_UNSUPPORTED.contains(&flag) {
+                            o.unsupported.push(flag.to_string());
+                        }
+                    }
+                }
+                continue; // stripped from list_args
+            }
+
+            // Everything else (selection / filter / build / `--profile`) forwards
+            // verbatim to `cargo nextest list`.
+            o.list_args.push(arg.clone());
+        }
+        o
+    }
+
+    /// The zero-tests-selected policy from `--no-tests` (`pass`/`warn`/`fail`;
+    /// nextest default `fail`).
+    fn no_tests_is_error(&self) -> bool {
+        !matches!(self.no_tests.as_deref(), Some("pass") | Some("warn"))
+    }
+}
+
+/// Parse a `--slow-timeout` value as seconds (`"60"` or `"60s"`) into a
+/// [`Duration`](std::time::Duration). `None` on a malformed value.
+fn parse_duration_secs(s: &str) -> Option<std::time::Duration> {
+    let s = s.strip_suffix('s').unwrap_or(s);
+    s.parse::<u64>().ok().map(std::time::Duration::from_secs)
+}
+
+/// Split `--flag=value` into `("--flag", Some("value"))`; a bare token yields
+/// `(token, None)`.
+fn split_eq(arg: &str) -> (&str, Option<&str>) {
+    match arg.split_once('=') {
+        Some((flag, value)) => (flag, Some(value)),
+        None => (arg, None),
+    }
 }
 
 pub fn execute(args: Args) -> ExitCode {
@@ -79,17 +254,22 @@ pub fn execute(args: Args) -> ExitCode {
         eprintln!(
             "       cd into a cargo workspace (one containing a Cargo.toml in this dir or any ancestor) and retry."
         );
-        return ExitCode::from(2);
+        return exit(NextestExitCode::SETUP_ERROR);
     }
 
-    // `--no-cleanup` is a ztest-only flag, not a nextest one — pull it out
-    // of the forwarded argv (nextest would reject it) and remember it.
-    let (no_cleanup, nextest_args) = extract_no_cleanup(args.nextest_args);
-
-    let peek = args_peek::peek(&nextest_args);
+    // One pass over the verbatim argv: extract the engine-owned flags
+    // (`--no-cleanup`, `--profile`, `-j`, …); everything else becomes the
+    // `cargo nextest list` argv.
+    let opts = RunOptions::parse(&args.nextest_args);
+    if !opts.unsupported.is_empty() {
+        eprintln!(
+            "ztest run: ignoring flag(s) the ztest engine doesn't support: {}",
+            opts.unsupported.join(", ")
+        );
+    }
     let theme = Theme::detect();
 
-    let mut state = build_initial_state(&peek);
+    let mut state = build_initial_state(&opts);
     let session_start = Instant::now();
 
     // One compact status panel pinned at the bottom of the terminal for the
@@ -110,7 +290,7 @@ pub fn execute(args: Args) -> ExitCode {
     };
 
     let outcome = match pipeline_phase(
-        &nextest_args,
+        &opts.list_args,
         &theme,
         &mut state,
         console.as_mut(),
@@ -122,7 +302,7 @@ pub fn execute(args: Args) -> ExitCode {
                 let _ = c.finish();
             }
             eprintln!("ztest run: pipeline phase crashed: {err}");
-            return ExitCode::from(127);
+            return ExitCode::FAILURE; // unexpected — nextest maps unknown failures to 1
         }
     };
 
@@ -132,7 +312,7 @@ pub fn execute(args: Args) -> ExitCode {
         selected_binaries, ..
     } = &outcome.build
     {
-        run_image_phases(selected_binaries, console.as_mut(), &state, &theme, session_start)
+        run_image_phases(selected_binaries, console.as_mut(), &mut state, &theme, session_start)
     } else {
         (None, Vec::new())
     };
@@ -152,76 +332,81 @@ pub fn execute(args: Args) -> ExitCode {
     }
 
     // Failure paths: finish the console (clean line) before the error.
-    if let BuildOutcome::Failed { exit_code, .. } = outcome.build {
+    if let BuildOutcome::Failed { .. } = outcome.build {
         if let Some(c) = console.take() {
             let _ = c.finish();
         }
-        return ExitCode::from(exit_code.clamp(1, 255) as u8);
+        // Phase B is `cargo nextest list`; a non-zero exit is a build failure.
+        return exit(NextestExitCode::BUILD_FAILED);
     }
     if let Some(detail) = image_phase_failed {
         if let Some(c) = console.take() {
             let _ = c.finish();
         }
         eprintln!("ztest run: image preflight failed: {detail}");
-        return ExitCode::from(3);
+        return exit(NextestExitCode::SETUP_ERROR);
     }
     if matches!(outcome.probe, ProbeOutcome::Failed { .. }) {
         if let Some(c) = console.take() {
             let _ = c.finish();
         }
-        return ExitCode::from(2);
+        return exit(NextestExitCode::SETUP_ERROR);
     }
 
-    // QoS config lowering (§6): turn the dumped tiers into a generated nextest
-    // tool-config and a capacity-bounded thread pool. Cheap, infallible
-    // (write errors degrade to "no tool-config"), and a no-op when no QoS
-    // tests were declared.
-    let lowered = build_qos_lowering(&qos_by_binary, &peek, &outcome.probe);
-
-    // The run phase, on the same console: emulate `cargo nextest run` under a
-    // PTY so its cursor-addressed per-test UI renders faithfully, with the live
-    // QoS panel pinned beneath. See `cli::console`.
-    if let (Some(mut con), Some(plan)) = (console.take(), state.qos_plan.clone()) {
-        let free = probe_free(&outcome.probe);
-        let total_tests = build_test_count(&state.build);
-        // `quiet_progress = false`: we run nextest under a PTY and emulate it, so
-        // its native live progress (spinner, running count, per-test stream) is
-        // exactly the output we want to show — don't suppress it. The QoS panel
-        // sits beneath as added cluster context.
-        let (effective_args, envs) = nextest_invocation(&nextest_args, no_cleanup, &lowered, false);
-        let exit = con.run_tests(effective_args, envs, &plan, &free, total_tests, &theme);
-        let _ = con.finish();
-        if let Some(path) = &lowered.tool_config {
-            let _ = std::fs::remove_file(path);
+    // No tests selected: honor `--no-tests` (nextest default `fail` ⇒ exit 4).
+    if let BuildOutcome::Ok { test_count: 0, .. } = outcome.build {
+        if let Some(c) = console.take() {
+            let _ = c.finish();
         }
-        return exit;
+        if opts.no_tests_is_error() {
+            eprintln!("ztest run: no tests to run (--no-tests=fail)");
+            return exit(NextestExitCode::NO_TESTS_RUN);
+        }
+        eprintln!("ztest run: no tests to run");
+        return exit(NextestExitCode::OK);
     }
 
-    // No QoS plan (or non-TTY): finish the console, then a plain blocking run.
-    if let Some(c) = console.take() {
-        let _ = c.finish();
-    }
-    print_launching_line(&theme);
-    exec_nextest_run_inherited(&nextest_args, no_cleanup, lowered)
-}
+    // The run phase: the native engine (`crate::engine`) owns process-per-test
+    // execution, driving the reused `Surface` directly — nextest-style verdict
+    // lines scroll into native scrollback while the QoS panel stays pinned
+    // beneath (one viewport, no flash). The engine's 2D scheduler is seeded from
+    // the probed cluster ceiling, so a probed cluster is required.
+    let ceiling = match &outcome.probe {
+        ProbeOutcome::Ok { capacity, .. } => capacity.admission_ceiling(),
+        _ => {
+            if let Some(c) = console.take() {
+                let _ = c.finish();
+            }
+            eprintln!("ztest run: requires a probed cluster (no kubeconfig / probe unavailable)");
+            return exit(NextestExitCode::SETUP_ERROR);
+        }
+    };
+    let (summary, selected_binaries) = match &outcome.build {
+        BuildOutcome::Ok {
+            summary,
+            selected_binaries,
+            ..
+        } => (summary.as_ref(), selected_binaries.as_slice()),
+        // A build failure already returned `BUILD_FAILED` above.
+        BuildOutcome::Failed { .. } => unreachable!("build failure handled above"),
+    };
 
-/// Probed free capacity, or `ZERO` when the probe was unavailable.
-fn probe_free(probe: &ProbeOutcome) -> crate::qos::Resources {
-    match probe {
-        ProbeOutcome::Ok { capacity, .. } => capacity.free(),
-        _ => crate::qos::Resources::ZERO,
-    }
-}
-
-/// The QoS-derived nextest run knobs: an optional generated tool-config file
-/// and the effective `--test-threads` pool.
-#[derive(Debug, Default)]
-struct LoweredRun {
-    /// Absolute path to the generated tool-config TOML, if any QoS tests were
-    /// declared. Passed as `--tool-config-file ztest:<path>`.
-    tool_config: Option<PathBuf>,
-    /// Effective `--test-threads` pool = `min(user ceiling, cluster units)`.
-    test_threads: u32,
+    let sa = std::env::var("ZTEST_SA").unwrap_or_else(|_| "ztest-local".to_string());
+    let input = engine::EngineInput {
+        summary,
+        selected_binaries,
+        qos_by_binary: &qos_by_binary,
+        ceiling,
+        opts: engine::EngineOpts {
+            retries: opts.retries,
+            fail_fast: opts.fail_fast,
+            slow_after: opts.slow_after,
+            sa,
+            no_cleanup: opts.no_cleanup,
+            run_id: format!("ztest-run-{}", std::process::id()),
+        },
+    };
+    engine::run(input, console.take(), &theme, state.qos_plan.clone())
 }
 
 /// Build the §8 scheduling plan for the preflight banner: fold the per-binary
@@ -241,69 +426,14 @@ fn qos_plan_from(
         return None;
     }
     // Plan the wave structure against the admission ceiling (ztest-available
-    // capacity), consistent with the `--test-threads` pool and in-process
-    // admission — not live `free()`, which would shrink the estimate by
-    // ztest's own load and overstate the wave count.
+    // capacity), the same figure the engine scheduler and in-test admission key
+    // on — not live `free()`, which would shrink the estimate by ztest's own
+    // load and overstate the wave count.
     let ceiling = match probe {
         ProbeOutcome::Ok { capacity, .. } => Some(capacity.admission_ceiling()),
         _ => None,
     };
     Some(crate::qos::schedule::plan(&counts, ceiling))
-}
-
-/// Group the per-binary QoS dump by tier, render the tool-config TOML, write
-/// it to a temp file, and compute the capacity-bounded thread pool.
-fn build_qos_lowering(
-    qos_by_binary: &[(String, Vec<QosEntry>)],
-    peek: &args_peek::NextestArgs,
-    probe: &ProbeOutcome,
-) -> LoweredRun {
-    // Size the nextest `--test-threads` pool from the *admission ceiling*
-    // (`allocatable − non-ztest baseline`), NOT live `free()`. The pool only
-    // bounds how many test processes nextest spawns; QoS admission is the
-    // authoritative gate that queues them to fit live capacity. Sizing the
-    // pool on `free()` double-counts ztest's own load — every running ztest
-    // pod (and any zombie left by `--no-cleanup` or a concurrent run) shrinks
-    // the pool, so the suite serializes to one-at-a-time and admission never
-    // sees the contention it exists to manage. The ceiling excludes ztest
-    // namespaces, so the pool reflects how densely the cluster *can* pack.
-    let (ceiling, nvme_nodes) = match probe {
-        ProbeOutcome::Ok {
-            capacity,
-            nvme_nodes,
-            ..
-        } => (Some(capacity.admission_ceiling()), *nvme_nodes),
-        _ => (None, 0),
-    };
-    let test_threads = lower::pool(peek.test_threads, ceiling, lower::DEFAULT_POOL);
-
-    let mut by_tier: BTreeMap<crate::qos::QosClass, Vec<TestRef>> = BTreeMap::new();
-    for (binary_id, entries) in qos_by_binary {
-        for e in entries {
-            by_tier.entry(e.class).or_default().push(TestRef {
-                binary_id: binary_id.clone(),
-                name: lower::nextest_test_name(&e.test_id).to_string(),
-            });
-        }
-    }
-    let profile = peek.profile.as_deref().unwrap_or("default");
-    let tool_config = lower::render_tool_config(&by_tier, profile, nvme_nodes).and_then(|toml| {
-        let path = std::env::temp_dir().join(format!("ztest-qos-{}.toml", std::process::id()));
-        match std::fs::write(&path, toml) {
-            Ok(()) => Some(path),
-            Err(e) => {
-                // Degrade gracefully: the broker is still authoritative (§6),
-                // so a missing tool-config only loses coarse backpressure.
-                eprintln!("ztest: could not write QoS tool-config ({e}); continuing without it");
-                None
-            }
-        }
-    });
-
-    LoweredRun {
-        tool_config,
-        test_threads,
-    }
 }
 
 /// Render the compact bottom panel for the preflight/build/image phases —
@@ -312,16 +442,6 @@ fn build_qos_lowering(
 /// `Building` during the image phase).
 fn phase_panel(state: &BannerState, theme: &Theme, session_start: Instant, phase: &str) -> String {
     preflight::render_preflight_panel(state, phase, session_start.elapsed(), theme)
-}
-
-/// `   Launching nextest run` in nextest's `{:>12} {}` vocabulary.
-fn print_launching_line(theme: &Theme) {
-    use owo_colors::OwoColorize;
-    println!(
-        "{:>12} {} run",
-        "Launching".style(theme.styles.pass),
-        "nextest".style(theme.styles.script_id),
-    );
 }
 
 #[derive(Debug)]
@@ -352,22 +472,22 @@ enum Update {
 /// concurrently and feeds the compact panel. Non-TTY: linear, inherited stderr,
 /// no panel — the CI path, unchanged.
 fn pipeline_phase(
-    nextest_args: &[String],
+    list_args: &[String],
     theme: &Theme,
     state: &mut BannerState,
     console: Option<&mut Console>,
     session_start: Instant,
 ) -> std::io::Result<PipelineOutcome> {
     match console {
-        Some(con) => pipeline_console(nextest_args, theme, state, con, session_start),
-        None => pipeline_inherited(nextest_args, state),
+        Some(con) => pipeline_console(list_args, theme, state, con, session_start),
+        None => pipeline_inherited(list_args, state),
     }
 }
 
 /// TTY pipeline: pass 1 (`cargo nextest list`) under the console PTY with the
 /// probe running concurrently, then pass 2 (JSON index) captured.
 fn pipeline_console(
-    nextest_args: &[String],
+    list_args: &[String],
     theme: &Theme,
     state: &mut BannerState,
     con: &mut Console,
@@ -375,22 +495,21 @@ fn pipeline_console(
 ) -> std::io::Result<PipelineOutcome> {
     use crate::preflight::{BuildStage, BuildState};
 
-    let list_args = pipeline::build::list_args(nextest_args);
     let started_at = Instant::now();
     state.build = BuildState::Compiling { started_at };
 
     // Pass 1 compiles the test binaries. We use `run --no-run` rather than
     // `list` because, under a PTY, stdout and stderr are merged onto one stream
     // — `list` would dump its full human-readable test listing (stdout) into the
-    // view, whereas `run --no-run` emits only cargo's compile output. The args
-    // are the user's run args verbatim (filters etc. don't affect compilation;
-    // run-only flags are valid here). Pass 2 (`index`) does the JSON inventory.
+    // view, whereas `run --no-run` emits only cargo's compile output. The list
+    // args (selection / filter / build) are all that compilation needs. Pass 2
+    // (`index`) does the JSON inventory.
     let mut args = vec![
         "nextest".to_string(),
         "run".to_string(),
         "--no-run".to_string(),
     ];
-    args.extend(nextest_args.iter().cloned());
+    args.extend(list_args.iter().cloned());
 
     // Probe + archives run concurrently on the console's runtime, feeding the
     // panel via the `Update` channel. The throwaway event channel satisfies the
@@ -437,7 +556,7 @@ fn pipeline_console(
         // Pass 2 — JSON index (captured, fast on the warm cache).
         state.build = BuildState::Indexing { started_at };
         let _ = con.paint_panel(&phase_panel(state, theme, session_start, "Preflight"));
-        con.runtime().block_on(pipeline::build::index(&list_args))?
+        con.runtime().block_on(pipeline::build::index(list_args))?
     };
 
     // Reflect the build outcome into the panel state.
@@ -480,14 +599,14 @@ fn pipeline_console(
 /// Non-TTY pipeline: probe + the two-pass build run concurrently with inherited
 /// stderr (cargo's plain output goes straight to the log); no panel.
 fn pipeline_inherited(
-    nextest_args: &[String],
+    list_args: &[String],
     state: &mut BannerState,
 ) -> std::io::Result<PipelineOutcome> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(3)
         .build()?;
-    let nextest_args = nextest_args.to_vec();
+    let list_args = list_args.to_vec();
 
     rt.block_on(async move {
         let (event_tx, mut event_rx) = pipeline::channel();
@@ -512,7 +631,7 @@ fn pipeline_inherited(
 
         let build_tx = event_tx.clone();
         let build_handle =
-            tokio::spawn(async move { pipeline::build::run(&nextest_args, &build_tx, None).await });
+            tokio::spawn(async move { pipeline::build::run(&list_args, &build_tx, None).await });
 
         drop(event_tx);
         drop(upd_tx);
@@ -658,265 +777,153 @@ fn apply_update(state: &mut BannerState, upd: Update) {
     }
 }
 
+/// Run one preflight subprocess (cargo compile / docker build / kind load)
+/// through the **same** console PTY as the cargo compile, so it gets native
+/// colour + live in-place progress emulated into the live region with the panel
+/// pinned beneath. Off a TTY (`console` is `None`) it inherits stdio for the CI
+/// log. Returns the child's exit code. `label` is the panel's action word.
+#[allow(clippy::too_many_arguments)]
+fn run_phase_child(
+    console: Option<&mut Console>,
+    state: &mut BannerState,
+    theme: &Theme,
+    session_start: Instant,
+    label: &'static str,
+    program: &str,
+    argv: &[String],
+    envs: &[(&str, String)],
+) -> std::io::Result<i32> {
+    match console {
+        Some(con) => {
+            // No concurrent background updates during these phases; a dropped
+            // sender just leaves the updates arm inert.
+            let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            con.run_child(
+                program,
+                argv,
+                envs,
+                session_start,
+                state,
+                &mut rx,
+                |_: &mut BannerState, _: ()| {},
+                |_: &mut BannerState, _: &str| {},
+                move |s: &BannerState, elapsed| {
+                    preflight::render_preflight_panel(s, label, elapsed, theme)
+                },
+            )
+        }
+        None => {
+            let mut cmd = std::process::Command::new(program);
+            cmd.args(argv);
+            for (k, v) in envs {
+                cmd.env(k, v);
+            }
+            Ok(cmd.status()?.code().unwrap_or(1))
+        }
+    }
+}
+
 /// Run the inventory-driven image phases (C: dump, D: docker build, E: kind
 /// load). Returns the failure detail (if any) **and** the per-binary QoS tier
 /// declarations harvested from the same dump (consumed by the config-lowering
 /// step). The QoS data is returned even when there are no dev images to build.
 ///
-/// docker/kind output is relayed through `console` into native scrollback
-/// beneath the panel (or, in non-TTY mode, printed to stderr for the CI log).
+/// `docker build` and `kind load` run through the console PTY
+/// ([`run_phase_child`]), so they get the same live-output polish as the cargo
+/// compile (BuildKit's in-place layer progress, kind's progress) rather than a
+/// flat line relay.
 fn run_image_phases(
     binaries: &[pipeline::SelectedBinary],
-    console: Option<&mut Console>,
-    state: &BannerState,
+    mut console: Option<&mut Console>,
+    state: &mut BannerState,
     theme: &Theme,
     session_start: Instant,
 ) -> (Option<String>, Vec<(String, Vec<QosEntry>)>) {
-    use crate::pipeline::{docker, images, kind_load};
+    use crate::backends::image;
+    use crate::pipeline::images;
 
-    // Phase C — inventory dump. Async because it spawns subprocesses
-    // concurrently in the future; for now serial-await is fine.
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(e) => return (Some(format!("tokio runtime: {e}")), Vec::new()),
+    // Phase C — inventory dump (scoped so its runtime is gone before we drive
+    // the console's own runtime in the build/load passes below).
+    let (outcome, qos_by_binary) = {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => return (Some(format!("tokio runtime: {e}")), Vec::new()),
+        };
+        rt.block_on(images::discover(binaries))
     };
-    let (outcome, qos_by_binary) = rt.block_on(images::discover(binaries));
-    let images = match outcome {
+    let decls = match outcome {
         images::ImagesOutcome::Discovered { images } => images,
         images::ImagesOutcome::Failed { detail } => return (Some(detail), qos_by_binary),
     };
-    if images.is_empty() {
+    if decls.is_empty() {
         return (None, qos_by_binary);
     }
 
-    // We're about to relay plain docker/kind lines via `log_line` (insert_before),
-    // which would land *above* whatever the live region currently shows (the
-    // compile's final frame). Commit that frame to scrollback and blank the live
-    // region first so the image output reads in order.
-    let mut console = console;
+    // Commit the compile's final frame to scrollback and blank the live region
+    // so each build/load starts its emulated output on a clean grid.
     if let Some(c) = console.as_mut() {
         let _ = c.flush_live();
         let _ = c.paint_panel(&phase_panel(state, theme, session_start, "Building"));
     }
 
-    // Sink for docker/kind output: relay each line into the console's
-    // scrollback and refresh the panel (or print to stderr when there's no
-    // console, preserving CI-log behaviour).
-    let mut sink = |line: &str| match console.as_mut() {
-        Some(c) => {
-            let _ = c.log_line(line);
-            let _ = c.paint_panel(&phase_panel(state, theme, session_start, "Building"));
+    // Phase D — docker build each declared image (skipping ones already in the
+    // cluster's containerd), then Phase E — kind load each freshly-built tag.
+    let mut to_load: Vec<String> = Vec::new();
+    for decl in &decls {
+        let dockerfile = std::path::Path::new(&decl.dockerfile);
+        let context = std::path::Path::new(&decl.context);
+        let tag = match image::dev_tag(dockerfile, context, &decl.features, &decl.repo) {
+            Ok(t) => t,
+            Err(e) => return (Some(format!("hash context for {}: {e}", decl.dockerfile)), qos_by_binary),
+        };
+        match image::exists_in_kind(&tag) {
+            Ok(true) => continue, // cached: skip both build and load
+            Ok(false) => {}
+            Err(e) => return (Some(format!("cluster image query for {tag}: {e}")), qos_by_binary),
         }
-        None => eprintln!("{line}"),
-    };
-
-    sink(&format!("ztest: {} dev image(s) to preflight", images.len()));
-
-    // Phase D — docker build (blocking; runs synchronously here).
-    let built = match docker::build_all(&images, &mut sink) {
-        docker::DockerOutcome::Built { images } => images,
-        docker::DockerOutcome::Failed { detail } => return (Some(detail), qos_by_binary),
-    };
-
-    // Phase E — kind load (blocking).
-    let failure = match kind_load::load_all(&built, &mut sink) {
-        kind_load::KindLoadOutcome::Loaded { count, skipped } => {
-            sink(&format!("ztest: kind load: {count} loaded, {skipped} cached"));
-            None
+        let argv = image::docker_build_argv(dockerfile, context, &decl.features, &tag);
+        let code = match run_phase_child(
+            console.as_deref_mut(),
+            state,
+            theme,
+            session_start,
+            "Building",
+            "docker",
+            &argv,
+            &[("DOCKER_BUILDKIT", "1".to_string())],
+        ) {
+            Ok(c) => c,
+            Err(e) => return (Some(format!("docker build {tag}: {e}")), qos_by_binary),
+        };
+        if code != 0 {
+            return (Some(format!("docker build {tag} exited {code}")), qos_by_binary);
         }
-        kind_load::KindLoadOutcome::Failed { detail } => Some(detail),
-    };
-    (failure, qos_by_binary)
-}
-
-/// `cargo nextest run` inherits this process's stdio.
-///
-/// We force `--test-threads=<pool>` where `pool = min(user ceiling, cluster
-/// units)` (§6) — replacing any user-supplied value, which acts only as the
-/// *local* ceiling. The current single-node kind cluster gets I/O-bound when
-/// more than ~6 tests spin up their pods concurrently, so [`lower::DEFAULT_POOL`]
-/// (6) is the fallback when capacity is unknown. When QoS tests were declared
-/// we also prepend `--tool-config-file ztest:<generated>` carrying the
-/// per-tier slow-timeout/priority/threads-required overrides (Layer 1, §5.2).
-fn exec_nextest_run_inherited(
-    nextest_args: &[String],
-    no_cleanup: bool,
-    lowered: LoweredRun,
-) -> ExitCode {
-    let mut cmd = build_nextest_command(nextest_args, no_cleanup, &lowered, false);
-    let status = cmd.status();
-
-    // Best-effort temp-file cleanup (the run is over; nextest has read it).
-    if let Some(path) = &lowered.tool_config {
-        let _ = std::fs::remove_file(path);
+        to_load.push(tag);
     }
 
-    match status {
-        Ok(status) => exit_code_of(&status),
-        Err(err) => {
-            eprintln!("ztest run: failed to spawn `cargo nextest run`: {err}");
-            ExitCode::from(127)
+    for tag in &to_load {
+        let argv = image::kind_load_argv(tag);
+        let code = match run_phase_child(
+            console.as_deref_mut(),
+            state,
+            theme,
+            session_start,
+            "Loading",
+            "kind",
+            &argv,
+            &[],
+        ) {
+            Ok(c) => c,
+            Err(e) => return (Some(format!("kind load {tag}: {e}")), qos_by_binary),
+        };
+        if code != 0 {
+            return (Some(format!("kind load {tag} exited {code}")), qos_by_binary);
         }
     }
-}
-
-/// Assemble the `cargo nextest run` command shared by the blocking and
-/// live-panel paths: force `--test-threads=<pool>` (§6), prepend the generated
-/// `--tool-config-file ztest:<path>` if any, set `ZTEST_QOS`/`ZTEST_NO_CLEANUP`,
-/// and — when `quiet_progress` — `--show-progress=none` so nextest's own bar
-/// doesn't fight the pinned QOS panel (skipped if the user set `--show-progress`).
-fn build_nextest_command(
-    nextest_args: &[String],
-    no_cleanup: bool,
-    lowered: &LoweredRun,
-    quiet_progress: bool,
-) -> Command {
-    let (effective_args, envs) =
-        nextest_invocation(nextest_args, no_cleanup, lowered, quiet_progress);
-
-    let mut cmd = Command::new("cargo");
-    cmd.arg("nextest").arg("run").args(&effective_args);
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
-    cmd
-}
-
-/// Compute the `cargo nextest run` argument tail (everything after `run`) and
-/// the extra environment variables, shared by the blocking [`Command`] path
-/// ([`build_nextest_command`]) and the PTY live-panel path ([`crate::cli::console`]).
-///
-/// - Drops any user `--test-threads`/`-j` (already folded into the pool as the
-///   local ceiling) and forces the computed capacity-bounded pool (§6).
-/// - When `quiet_progress`, suppresses nextest's own progress bar with
-///   `--show-progress=none` (unless the user set `--show-progress`) so it
-///   doesn't fight a pinned panel — the panel becomes the progress authority.
-/// - Prepends the generated `--tool-config-file ztest:<path>` if any.
-/// - `ZTEST_NO_CLEANUP` (when requested) and `ZTEST_QOS=1` enable post-mortem
-///   retention and broker admission in the spawned test binaries.
-fn nextest_invocation(
-    nextest_args: &[String],
-    no_cleanup: bool,
-    lowered: &LoweredRun,
-    quiet_progress: bool,
-) -> (Vec<String>, Vec<(&'static str, String)>) {
-    let mut effective_args = strip_test_threads_flag(nextest_args);
-    effective_args.insert(0, format!("--test-threads={}", lowered.test_threads));
-    if quiet_progress && !nextest_args.iter().any(|a| a.starts_with("--show-progress")) {
-        effective_args.insert(0, "--show-progress=none".to_string());
-    }
-    if let Some(path) = &lowered.tool_config {
-        // `--tool-config-file TOOL:ABS_PATH`. The `ztest` tool name namespaces
-        // our overrides; the path must be absolute (it is — `temp_dir()`).
-        effective_args.insert(0, format!("ztest:{}", path.display()));
-        effective_args.insert(0, "--tool-config-file".to_string());
-    }
-
-    let mut envs: Vec<(&'static str, String)> = Vec::with_capacity(2);
-    // Propagate `--no-cleanup` to the test binaries: `TestEnv::drop` reads
-    // `ZTEST_NO_CLEANUP` and skips namespace teardown for post-mortem.
-    if no_cleanup {
-        envs.push(("ZTEST_NO_CLEANUP", "1".to_string()));
-    }
-    // Enable QoS admission in the test binaries. `ztest run` has probed the
-    // cluster and opts every spawned test into broker admission + tier
-    // placement via `ZTEST_QOS`. A developer invoking `cargo nextest run`
-    // directly never sets this, and `TestEnv::build()` degrades gracefully.
-    // See `cluster::qos_enabled`.
-    envs.push(("ZTEST_QOS", "1".to_string()));
-    (effective_args, envs)
-}
-
-/// Map a finished child status to a process exit code. A normal exit
-/// propagates its code; a signal death uses the conventional shell encoding
-/// `128 + signum` (so SIGINT→130, SIGKILL→137, SIGSEGV→139) rather than a flat
-/// 130 that would mask which signal fired.
-fn exit_code_of(status: &std::process::ExitStatus) -> ExitCode {
-    if let Some(code) = status.code() {
-        return ExitCode::from(code.clamp(0, 255) as u8);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(sig) = status.signal() {
-            return ExitCode::from((128 + sig).clamp(0, 255) as u8);
-        }
-    }
-    ExitCode::from(1)
-}
-
-/// Total test count discovered by Phase B, or `0` if the build state never
-/// reached a successful list (degrades the panel's progress line to a bare
-/// "done" count with no denominator).
-fn build_test_count(build: &crate::preflight::BuildState) -> u32 {
-    match build {
-        crate::preflight::BuildState::Ok { test_count, .. } => *test_count as u32,
-        _ => 0,
-    }
-}
-
-/// Split the ztest-only `--no-cleanup` flag out of the forwarded argv.
-///
-/// `--no-cleanup` is not a `cargo nextest` flag, so it must be removed
-/// before the rest is handed to nextest (which would otherwise reject it).
-/// Returns whether it was present and the argv with every occurrence
-/// removed. Only tokens *before* a `--` separator are considered — anything
-/// after `--` is a nextest filter positional and is left untouched, matching
-/// the convention in [`crate::cli::args_peek`].
-fn extract_no_cleanup(args: Vec<String>) -> (bool, Vec<String>) {
-    const FLAG: &str = "--no-cleanup";
-    let mut found = false;
-    let mut past_separator = false;
-    let mut out = Vec::with_capacity(args.len());
-    for arg in args {
-        if !past_separator && arg == "--" {
-            past_separator = true;
-        } else if !past_separator && arg == FLAG {
-            found = true;
-            continue;
-        }
-        out.push(arg);
-    }
-    (found, out)
-}
-
-/// Remove any `--test-threads`/`-j` flag (and its value) from the forwarded
-/// argv, so `exec_nextest_run_inherited` can inject the single
-/// capacity-bounded pool without a duplicate flag. The user's value was
-/// already folded in as the local ceiling (see [`lower::pool`]); here we just
-/// strip it. Handles `--test-threads N`, `--test-threads=N`, `-j N`, `-jN`.
-/// Only tokens before a `--` separator are considered (positionals after `--`
-/// are filter expressions), matching [`extract_no_cleanup`].
-fn strip_test_threads_flag(args: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
-    let mut past_separator = false;
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            // This token is the value of a space-separated `--test-threads`/`-j`.
-            skip_next = false;
-            continue;
-        }
-        if !past_separator && arg == "--" {
-            past_separator = true;
-            out.push(arg.clone());
-            continue;
-        }
-        if !past_separator {
-            if arg == "--test-threads" || arg == "-j" {
-                skip_next = true; // drop the following value token too
-                continue;
-            }
-            if arg.starts_with("--test-threads=") || (arg.starts_with("-j") && arg.len() > 2) {
-                continue; // attached value form
-            }
-        }
-        out.push(arg.clone());
-    }
-    out
+    (None, qos_by_binary)
 }
 
 /// Walk up from the current working directory looking for a `Cargo.toml`.
@@ -940,13 +947,13 @@ fn locate_cargo_workspace() -> Result<(), String> {
     ))
 }
 
-fn build_initial_state(peek: &args_peek::NextestArgs) -> BannerState {
+fn build_initial_state(opts: &RunOptions) -> BannerState {
     BannerState {
         cluster: ClusterState {
             context: "probing…".to_string(),
             slots_used: 0,
             slots_total: 16,
-            slots_configured: peek.test_threads.unwrap_or(0),
+            slots_configured: opts.test_threads.unwrap_or(0),
             nodes_ready: 0,
             nodes_cordoned: 0,
             capacity: crate::qos::ClusterCapacity::default(),
@@ -971,58 +978,109 @@ mod tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
-    #[test]
-    fn extract_no_cleanup_strips_flag_anywhere() {
-        let (found, rest) = extract_no_cleanup(v(&["-p", "wallet-tests", "--no-cleanup"]));
-        assert!(found);
-        assert_eq!(rest, v(&["-p", "wallet-tests"]));
-
-        let (found, rest) = extract_no_cleanup(v(&["--no-cleanup", "-E", "test(foo)"]));
-        assert!(found);
-        assert_eq!(rest, v(&["-E", "test(foo)"]));
+    fn parse(args: &[&str]) -> RunOptions {
+        RunOptions::parse(&v(args))
     }
 
     #[test]
-    fn extract_no_cleanup_absent_is_identity() {
-        let (found, rest) = extract_no_cleanup(v(&["-p", "wallet-tests"]));
-        assert!(!found);
-        assert_eq!(rest, v(&["-p", "wallet-tests"]));
+    fn forwards_selection_and_filter_flags_verbatim() {
+        // Selection / filter flags are not interpreted, just passed through.
+        let o = parse(&["-p", "wallet-tests", "--lib", "-E", "test(reorg)"]);
+        assert_eq!(o.list_args, v(&["-p", "wallet-tests", "--lib", "-E", "test(reorg)"]));
     }
 
     #[test]
-    fn extract_no_cleanup_ignores_after_double_dash() {
-        // After `--`, tokens are nextest filter positionals — left verbatim.
-        let (found, rest) = extract_no_cleanup(v(&["--", "--no-cleanup"]));
-        assert!(!found);
-        assert_eq!(rest, v(&["--", "--no-cleanup"]));
+    fn strips_engine_owned_flags_from_list_args() {
+        // Engine-owned run-behavior flags must not reach `cargo nextest list`.
+        let o = parse(&[
+            "-p", "wt", "--retries", "3", "--no-fail-fast", "--no-capture", "-j", "8",
+            "--message-format", "libtest-json", "--no-cleanup",
+        ]);
+        assert_eq!(o.list_args, v(&["-p", "wt"]), "only selection survives");
+        assert!(o.no_cleanup);
+        assert_eq!(o.test_threads, Some(8));
     }
 
     #[test]
-    fn strip_test_threads_handles_every_form() {
-        // Space-separated long flag (drops flag + value).
-        assert_eq!(
-            strip_test_threads_flag(&v(&["-p", "wt", "--test-threads", "8", "--no-fail-fast"])),
-            v(&["-p", "wt", "--no-fail-fast"])
-        );
-        // Attached long flag.
-        assert_eq!(
-            strip_test_threads_flag(&v(&["--test-threads=8", "-E", "test(x)"])),
-            v(&["-E", "test(x)"])
-        );
-        // Short forms: `-j 8` and `-j8`.
-        assert_eq!(strip_test_threads_flag(&v(&["-j", "8", "x"])), v(&["x"]));
-        assert_eq!(strip_test_threads_flag(&v(&["-j8", "x"])), v(&["x"]));
-        // Absent → identity.
-        assert_eq!(strip_test_threads_flag(&v(&["-p", "wt"])), v(&["-p", "wt"]));
+    fn fail_fast_defaults_off_and_opts_in() {
+        // Regression for the scheduling incident: with fail-fast ON, the first
+        // failure abandoned the queued majority (only the initial ~9-wide
+        // capacity wave ran out of 122 selected). ztest defaults fail-fast OFF —
+        // the whole suite is packed and every result reported.
+        assert!(!parse(&["-p", "wt"]).fail_fast, "default must be OFF");
+        // `--fail-fast` / `--ff` opt back into stop-on-first-failure.
+        assert!(parse(&["-p", "wt", "--fail-fast"]).fail_fast);
+        assert!(parse(&["-p", "wt", "--ff"]).fail_fast);
+        // Explicit `--no-fail-fast` matches the default (and still strips).
+        assert!(!parse(&["-p", "wt", "--no-fail-fast"]).fail_fast);
     }
 
     #[test]
-    fn strip_test_threads_ignores_after_double_dash() {
-        // A filter positional after `--` that happens to contain the text is
-        // left alone.
-        assert_eq!(
-            strip_test_threads_flag(&v(&["--", "--test-threads", "8"])),
-            v(&["--", "--test-threads", "8"])
+    fn no_cleanup_anywhere_is_extracted() {
+        assert!(parse(&["--no-cleanup", "-E", "test(foo)"]).no_cleanup);
+        assert!(parse(&["-p", "x", "--no-cleanup"]).no_cleanup);
+        assert!(!parse(&["-p", "x"]).no_cleanup);
+    }
+
+    #[test]
+    fn no_cleanup_after_double_dash_is_a_filter_positional() {
+        // After `--`, tokens are nextest filter positionals — forwarded verbatim.
+        let o = parse(&["--", "--no-cleanup"]);
+        assert!(!o.no_cleanup);
+        assert_eq!(o.list_args, v(&["--", "--no-cleanup"]));
+    }
+
+    #[test]
+    fn profile_forwards_verbatim() {
+        // `--profile`/`-P` is not interpreted by ztest — it forwards to both
+        // `cargo nextest list` (here) and `cargo nextest run` (verbatim args), so
+        // nextest resolves the profile. Both spelling forms.
+        assert_eq!(parse(&["-P", "ci", "-p", "x"]).list_args, v(&["-P", "ci", "-p", "x"]));
+        assert_eq!(parse(&["--profile=ci"]).list_args, v(&["--profile=ci"]));
+    }
+
+    #[test]
+    fn equals_form_value_flags_are_stripped() {
+        let o = parse(&["--retries=2", "-p", "x", "--test-threads=4"]);
+        assert_eq!(o.list_args, v(&["-p", "x"]));
+        assert_eq!(o.test_threads, Some(4));
+    }
+
+    #[test]
+    fn strips_run_only_flags_that_list_rejects() {
+        // `cargo nextest list` rejects these run-only flags; they must never
+        // reach it (they did before M4.5, breaking Phase B). Selection survives.
+        let o = parse(&[
+            "-p", "wt",
+            "--max-fail", "3",
+            "--no-tests", "warn",
+            "--status-level", "all",
+            "--stress-count", "5",
+            "--no-run",
+            "--final-status-level=none",
+            "--archive-file", "/tmp/a.tar.zst",
+        ]);
+        assert_eq!(o.list_args, v(&["-p", "wt"]), "only selection reaches `nextest list`");
+        assert_eq!(o.no_tests.as_deref(), Some("warn"));
+    }
+
+    #[test]
+    fn no_tests_policy() {
+        assert!(parse(&[]).no_tests_is_error(), "nextest default is fail");
+        assert!(parse(&["--no-tests", "fail"]).no_tests_is_error());
+        assert!(!parse(&["--no-tests", "pass"]).no_tests_is_error());
+        assert!(!parse(&["--no-tests", "warn"]).no_tests_is_error());
+    }
+
+    #[test]
+    fn unsupported_flags_are_recorded_for_warning() {
+        // Behavior-changing run-only flags are surfaced; display-only ones aren't.
+        let o = parse(&["--archive-file", "/a", "--debugger", "gdb", "--status-level", "all"]);
+        assert!(o.unsupported.contains(&"--archive-file".to_string()));
+        assert!(o.unsupported.contains(&"--debugger".to_string()));
+        assert!(
+            !o.unsupported.contains(&"--status-level".to_string()),
+            "display-only flags are ignored silently"
         );
     }
 }

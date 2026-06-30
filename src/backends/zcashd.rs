@@ -42,24 +42,17 @@ const CONTAINER_DATA_DIR: &str = "/var/lib/zcashd";
 /// The pool zcashd mines its coinbase into when a test doesn't override
 /// via [`Validator::mine_to`](crate::component::Validator::mine_to):
 /// Sapling, its historical shielded `mineraddress`
-/// ([`SHIELDED_MINER_ADDRESS`](crate::regtest_conf::SHIELDED_MINER_ADDRESS)),
-/// so the faucet sees the reward via ordinary shielded sync — instantly
-/// spendable, no maturity wait.
+/// ([`SHIELDED_MINER_ADDRESS`](crate::regtest_conf::SHIELDED_MINER_ADDRESS)).
 const DEFAULT_COINBASE_POOL: Pool = Pool::Sapling;
 
 /// Resolve the regtest miner address zcashd mines its coinbase to for
-/// `pool`. All three pools are supported. zcashd v6.20.0 mines an Orchard
-/// coinbase to the abandon-art unified address
-/// ([`ORCHARD_MINER_ADDRESS`](crate::regtest_conf::ORCHARD_MINER_ADDRESS))
-/// once NU5 is active (height 2 under
-/// [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights)),
-/// exactly as zebrad does — the wallet materializes the shielded coinbase
-/// output and the prover builds its Halo2 proof, both of which zcashd
-/// already does for the default Sapling coinbase. Orchard coinbase notes
-/// are spendable the moment they are mined (no maturity wait), at the cost
-/// of one Halo2 proof per block; Sapling stays the default coinbase pool
-/// (see [`DEFAULT_COINBASE_POOL`]) so tests that don't need Orchard funds
-/// avoid that cost. Opt in via
+/// `pool`. All three pools are mineable. The Orchard recipient is the
+/// abandon-art unified address
+/// ([`ORCHARD_MINER_ADDRESS`](crate::regtest_conf::ORCHARD_MINER_ADDRESS)),
+/// which pins the coinbase to Orchard once NU5 is active (height 2 under
+/// [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights)).
+/// Sapling stays the default (see [`DEFAULT_COINBASE_POOL`]) because an
+/// Orchard coinbase costs a Halo2 proof per block; opt in via
 /// [`Validator::mine_to`](crate::component::Validator::mine_to).
 fn miner_address(pool: Pool) -> &'static str {
     match pool {
@@ -122,11 +115,12 @@ impl ValidatorConfig for ZcashdBackend {
             conf,
             CONTAINER_CONF_PATH,
         ));
-        // `opts.regtest_cache` is intentionally ignored: zcashd mines a
-        // shielded coinbase that funds the faucet without the slow
-        // transparent mature-then-shield ritual, so a chain cache buys
-        // nothing here. The opt exists for the generic `Validator<B>` test
-        // helpers, where zebrad consumes it and zcashd no-ops.
+        // `opts.regtest_cache` is intentionally ignored: zcashd's default
+        // coinbase is a shielded (Sapling) coinbase with no maturity gap, so
+        // a chain cache — whose purpose is to skip a transparent coinbase's
+        // ~100-block maturity mine — buys nothing here. The opt exists for
+        // the generic `Validator<B>` test helpers, where zebrad consumes it
+        // and zcashd no-ops.
         Ok(opts)
     }
 }

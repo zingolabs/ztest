@@ -50,6 +50,41 @@ impl NetworkUpgrade {
     /// The highest NU known to ztest. Empty topologies default here —
     /// "no constraints, activate everything we know about."
     pub const HIGHEST: NetworkUpgrade = NetworkUpgrade::Nu7;
+
+    /// This upgrade's activation height in ztest's canonical regtest
+    /// fixture, or `None` if ztest never activates it in regtest.
+    ///
+    /// This is the **single source of truth** for the regtest schedule:
+    /// [`activation_heights_for_ceiling`] gates these heights by the
+    /// topology ceiling, and
+    /// [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights)
+    /// is this same schedule with no ceiling — so the resolver and the
+    /// standalone fixture cannot drift apart.
+    ///
+    /// Every independently-queryable upgrade gets a **distinct** height:
+    /// zebra keeps only the highest upgrade on a height collision (its
+    /// `Height -> NetworkUpgrade` map), so co-locating e.g. NU5 and NU6
+    /// would drop NU5 and break the Orchard coinbase ("Cannot create
+    /// Orchard transactions before NU5 activation"). Pre-NU5 upgrades
+    /// intentionally share height 1 — they collapse to Canopy, which is
+    /// harmless. NU6.1 sits at height 6 (leaving NU6 blocks 3/4/5 for
+    /// funding-stream deposits before activation), NU6.2 at 7. [`Nu7`](Self::Nu7)
+    /// is `None`: it has no stable `zcash_protocol` representation (see
+    /// [`UnsupportedNetworkUpgrade`]) and is never activated in regtest.
+    pub(crate) const fn regtest_height(self) -> Option<u32> {
+        match self {
+            Self::Overwinter
+            | Self::Sapling
+            | Self::Blossom
+            | Self::Heartwood
+            | Self::Canopy => Some(1),
+            Self::Nu5 => Some(2),
+            Self::Nu6 => Some(3),
+            Self::Nu6_1 => Some(6),
+            Self::Nu6_2 => Some(7),
+            Self::Nu7 => None,
+        }
+    }
 }
 
 /// A topology [`NetworkUpgrade`] that has no representation in the stable
@@ -165,24 +200,26 @@ pub fn resolve_ceiling(ceilings: &[NetworkUpgrade]) -> NetworkUpgrade {
         .unwrap_or(NetworkUpgrade::HIGHEST)
 }
 
-/// Build an [`ActivationHeights`] activating every NU ≤ `ceiling` at
-/// the canonical regtest fixture heights and `None` for everything
-/// above. Pre-NU5 heights are pinned to the historical
-/// `regtest_test_activation_heights` values so existing tests don't
-/// shift under us.
+/// Build an [`ActivationHeights`] activating every upgrade at or below
+/// `ceiling` at its [`regtest_height`](NetworkUpgrade::regtest_height), and
+/// `None` for everything above. The heights come from
+/// [`NetworkUpgrade::regtest_height`] — the single source of truth shared
+/// with [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights).
 pub fn activation_heights_for_ceiling(ceiling: NetworkUpgrade) -> ActivationHeights {
-    let above = |nu: NetworkUpgrade, h: u32| if ceiling >= nu { Some(h) } else { None };
+    // An upgrade activates at its scheduled height when the topology reaches
+    // it (NU ≤ ceiling), and is absent otherwise.
+    let at = |nu: NetworkUpgrade| nu.regtest_height().filter(|_| nu <= ceiling);
     ActivationHeights::builder()
-        .set_overwinter(above(NetworkUpgrade::Overwinter, 1))
-        .set_sapling(above(NetworkUpgrade::Sapling, 1))
-        .set_blossom(above(NetworkUpgrade::Blossom, 1))
-        .set_heartwood(above(NetworkUpgrade::Heartwood, 1))
-        .set_canopy(above(NetworkUpgrade::Canopy, 1))
-        .set_nu5(above(NetworkUpgrade::Nu5, 2))
-        .set_nu6(above(NetworkUpgrade::Nu6, 3))
-        .set_nu6_1(above(NetworkUpgrade::Nu6_1, 6))
-        .set_nu6_2(above(NetworkUpgrade::Nu6_2, 7))
-        .set_nu7(above(NetworkUpgrade::Nu7, 10))
+        .set_overwinter(at(NetworkUpgrade::Overwinter))
+        .set_sapling(at(NetworkUpgrade::Sapling))
+        .set_blossom(at(NetworkUpgrade::Blossom))
+        .set_heartwood(at(NetworkUpgrade::Heartwood))
+        .set_canopy(at(NetworkUpgrade::Canopy))
+        .set_nu5(at(NetworkUpgrade::Nu5))
+        .set_nu6(at(NetworkUpgrade::Nu6))
+        .set_nu6_1(at(NetworkUpgrade::Nu6_1))
+        .set_nu6_2(at(NetworkUpgrade::Nu6_2))
+        .set_nu7(at(NetworkUpgrade::Nu7))
         .build()
 }
 
@@ -310,7 +347,47 @@ mod tests {
     }
 
     #[test]
-    fn pre_nu5_heights_match_legacy_fixture() {
+    fn regtest_schedule_pins_canonical_heights() {
+        // Pin the single source of truth: if any of these shift, both the
+        // topology resolver and `regtest::regtest_test_activation_heights`
+        // shift with them, and the zebra height-collision invariant
+        // (distinct heights for NU5+) must be re-checked.
+        assert_eq!(NetworkUpgrade::Overwinter.regtest_height(), Some(1));
+        assert_eq!(NetworkUpgrade::Sapling.regtest_height(), Some(1));
+        assert_eq!(NetworkUpgrade::Blossom.regtest_height(), Some(1));
+        assert_eq!(NetworkUpgrade::Heartwood.regtest_height(), Some(1));
+        assert_eq!(NetworkUpgrade::Canopy.regtest_height(), Some(1));
+        assert_eq!(NetworkUpgrade::Nu5.regtest_height(), Some(2));
+        assert_eq!(NetworkUpgrade::Nu6.regtest_height(), Some(3));
+        assert_eq!(NetworkUpgrade::Nu6_1.regtest_height(), Some(6));
+        assert_eq!(NetworkUpgrade::Nu6_2.regtest_height(), Some(7));
+        assert_eq!(NetworkUpgrade::Nu7.regtest_height(), None);
+    }
+
+    #[test]
+    fn nu5_and_later_have_distinct_heights() {
+        // The collision invariant zebra cares about: every upgrade NU5 and
+        // above maps to its own height (a collision would drop the lower
+        // upgrade from zebra's activation map).
+        let heights: Vec<u32> = [
+            NetworkUpgrade::Nu5,
+            NetworkUpgrade::Nu6,
+            NetworkUpgrade::Nu6_1,
+            NetworkUpgrade::Nu6_2,
+        ]
+        .iter()
+        .filter_map(|nu| nu.regtest_height())
+        .collect();
+        let mut deduped = heights.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(heights.len(), deduped.len(), "NU5+ heights must be distinct");
+    }
+
+    #[test]
+    fn fixture_matches_schedule_with_no_ceiling() {
+        // The standalone fixture is exactly the schedule at HIGHEST ceiling,
+        // so the two cannot disagree. nu7 is absent (no zcash_protocol repr).
         let h = activation_heights_for_ceiling(NetworkUpgrade::HIGHEST);
         assert_eq!(h.overwinter(), Some(1));
         assert_eq!(h.sapling(), Some(1));
@@ -321,6 +398,7 @@ mod tests {
         assert_eq!(h.nu6(), Some(3));
         assert_eq!(h.nu6_1(), Some(6));
         assert_eq!(h.nu6_2(), Some(7));
+        assert_eq!(h.nu7(), None);
     }
 
     #[test]

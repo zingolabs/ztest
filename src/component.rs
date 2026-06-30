@@ -442,18 +442,12 @@ impl<B: ValidatorConfig> Validator<B> {
 
     /// Choose which value pool this validator mines its coinbase into,
     /// overriding the backend default ([`ValidatorConfig::default_coinbase_pool`]).
-    /// The pool is resolved to a regtest miner address at `env.build()`;
-    /// a backend that cannot mine the requested pool's coinbase panics
-    /// there (zebrad rejects both shielded pools — [`Pool::Orchard`] has no
-    /// anchor at the NU5 activation block and [`Pool::Sapling`] yields
-    /// unscannable coinbase notes — so only [`Pool::Transparent`] is valid
-    /// for it).
-    ///
-    /// In a test that is generic over the backend, pick the pool from
-    /// [`Self::label`] — `Pool::Orchard` for zcashd (it mines and proves an
-    /// Orchard coinbase directly), `Pool::Transparent` for zebrad (funded
-    /// via the mature-then-shield path) — rather than hardcoding one pool
-    /// both backends can't mine.
+    /// The pool is resolved to a regtest miner address at `env.build()`.
+    /// Both backends validate and mine all three pools (see
+    /// [`PoolSupport`](crate::handles::validator::PoolSupport)); a shielded
+    /// pool is only mineable once its network upgrade is active at the height
+    /// being mined (Sapling from height 1, Orchard from NU5), which the
+    /// regtest activation fixture guarantees for any block past genesis.
     pub fn mine_to(mut self, pool: Pool) -> Self {
         self.opts.coinbase_pool = Some(pool);
         self

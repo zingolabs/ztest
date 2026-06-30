@@ -26,6 +26,7 @@
 pub mod backends;
 pub mod cli;
 pub mod component;
+pub mod engine;
 pub mod env;
 pub mod error;
 pub mod handles;

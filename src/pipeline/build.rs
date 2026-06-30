@@ -48,20 +48,16 @@ use super::events::{Event, EventTx};
 /// scrollback above its panel); when `None`, stderr is inherited as before
 /// (the non-TTY / linear path). The JSON pass is always captured.
 pub async fn run(
-    nextest_args: &[String],
+    list_args: &[String],
     tx: &EventTx,
     lines: Option<UnboundedSender<String>>,
 ) -> std::io::Result<BuildOutcome> {
     let _ = tx.send(Event::BuildStarted);
 
-    // Strip run-only flags before forwarding to `cargo nextest list`.
-    // The user types one arg vector aimed at `cargo nextest run`; the
-    // `list` subcommand rejects unknown flags with a clap error and
-    // would abort the whole preflight before any test compiles. We
-    // drop only the well-known run-only flags — anything we don't
-    // recognise is left in place, matching the conservative shape of
-    // [`super::super::cli::args_peek`].
-    let list_args = strip_run_only_flags(nextest_args);
+    // `list_args` is already the `cargo nextest list` argv: the caller
+    // (`cli::run::RunOptions`) extracted the engine-owned run-behavior flags
+    // (`--retries`, `--no-fail-fast`, `--no-cleanup`, …) that `list` would reject
+    // and left the selection / filter / build flags untouched.
 
     // ───── Pass 1: chatty compile ─────
     // Cargo's stderr (`Fetching`, `Compiling foo`, warnings, errors) is what the
@@ -72,7 +68,7 @@ pub async fn run(
         let mut child = Command::new("cargo")
             .arg("nextest")
             .arg("list")
-            .args(&list_args)
+            .args(list_args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -87,7 +83,7 @@ pub async fn run(
         Command::new("cargo")
             .arg("nextest")
             .arg("list")
-            .args(&list_args)
+            .args(list_args)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .status()
@@ -107,7 +103,7 @@ pub async fn run(
     }
 
     let _ = tx.send(Event::BuildIndexing);
-    let outcome = index(&list_args).await?;
+    let outcome = index(list_args).await?;
     match &outcome {
         BuildOutcome::Ok {
             test_count,
@@ -127,13 +123,6 @@ pub async fn run(
         }
     }
     Ok(outcome)
-}
-
-/// The `cargo nextest list` arguments, with run-only flags stripped — the
-/// caller (the unified console) runs pass 1 (`cargo nextest list <args>`) under
-/// a PTY itself, then calls [`index`] for pass 2.
-pub fn list_args(nextest_args: &[String]) -> Vec<String> {
-    strip_run_only_flags(nextest_args)
 }
 
 /// Pass 2 — the silent JSON inventory parse. stdout is piped (we capture the
@@ -166,32 +155,46 @@ pub async fn index(list_args: &[String]) -> std::io::Result<BuildOutcome> {
         )
     })?;
 
-    let (test_count, binary_count) = count_selected(&summary);
-    let selected_binaries = collect_selected_binaries(&summary);
+    let (test_count, selected_binaries) = summarize_selection(&summary);
     Ok(BuildOutcome::Ok {
         test_count,
-        binary_count,
+        binary_count: selected_binaries.len(),
         selected_binaries,
+        summary: Box::new(summary),
     })
 }
 
-/// Pick out the binaries that have ≥1 selected test, paired with their
-/// nextest-reported `cwd` so the dump subprocess inherits the right
-/// working directory.
-fn collect_selected_binaries(summary: &TestListSummary) -> Vec<SelectedBinary> {
-    let mut out = Vec::new();
+/// Walk the resolved test list once, picking out the binaries with ≥1 selected
+/// test (and their selected test names) plus the total selected-test count.
+///
+/// A test case is *selected* when its `filter_match` `is_match`; tests filtered
+/// out are present in the JSON but flagged non-matching. The binary count is
+/// simply the number of returned binaries (empty suites are dropped), so the
+/// caller derives it from the vec rather than a second pass. Each binary carries
+/// the `cwd` nextest reports so the inventory-dump subprocess inherits the right
+/// working directory, and the `<bin> --exact <name>` targets the engine runs.
+fn summarize_selection(summary: &TestListSummary) -> (usize, Vec<SelectedBinary>) {
+    let mut test_count = 0;
+    let mut binaries = Vec::new();
     for (binary_id, suite) in &summary.rust_suites {
-        let has_selected = suite.test_cases.values().any(|t| t.filter_match.is_match());
-        if !has_selected {
+        let selected_tests: Vec<String> = suite
+            .test_cases
+            .iter()
+            .filter(|(_, t)| t.filter_match.is_match())
+            .map(|(name, _)| name.as_str().to_string())
+            .collect();
+        if selected_tests.is_empty() {
             continue;
         }
-        out.push(SelectedBinary {
+        test_count += selected_tests.len();
+        binaries.push(SelectedBinary {
             binary_path: suite.binary.binary_path.as_std_path().to_path_buf(),
             cwd: suite.cwd.as_std_path().to_path_buf(),
             binary_id: binary_id.to_string(),
+            selected_tests,
         });
     }
-    out
+    (test_count, binaries)
 }
 
 /// Outcome of one Phase-B run, used by `ztest run` to decide whether
@@ -205,6 +208,12 @@ pub enum BuildOutcome {
         /// nextest reported them. The image-inventory phase spawns each
         /// of these with `ZTEST_DUMP_INVENTORY=1`.
         selected_binaries: Vec<SelectedBinary>,
+        /// The full parsed `cargo nextest list` summary. The engine
+        /// (`engine::nextest`) reconstructs an owned `TestList` from it
+        /// (`TestList::from_summary`) to resolve per-test nextest config
+        /// (retries, slow-timeout) and to drive nextest's reporter. Boxed
+        /// because the summary dwarfs the other fields.
+        summary: Box<TestListSummary>,
     },
     Failed {
         exit_code: i32,
@@ -222,76 +231,13 @@ pub struct SelectedBinary {
     /// the `dev!` macro's compile-time absolute paths and the
     /// dump-time `current_dir` agree.
     pub cwd: std::path::PathBuf,
-    /// Nextest's binary identifier — `<package>::<bin>` shape. Just
-    /// for logging; the path is the load-bearing field.
+    /// Nextest's binary identifier — `<package>::<bin>` shape. Also the key
+    /// the QoS dump (`pipeline::images::discover`) is grouped by, so the engine
+    /// can match a test's tier to its binary.
     pub binary_id: String,
+    /// Names of the selected tests in this binary (`filter_match` true) — the
+    /// `<bin> --exact <name>` targets. Populated for the engine
+    /// (`src/engine`); the nextest path ignores it.
+    pub selected_tests: Vec<String>,
 }
 
-/// Count tests in the resolved selection.
-///
-/// The JSON schema separates `rust_suites` (per binary) from the
-/// `test_cases` map within each suite. A test case is *selected*
-/// when its `filter_match` is `is_match: true`; tests skipped by the
-/// filter are present in the JSON but flagged as non-matching.
-///
-/// Binary count is the number of suites with at least one selected
-/// test — empty suites (every test filtered out) don't show up in
-/// nextest's "binaries" tally.
-/// Run-only `cargo nextest run` flags that `cargo nextest list`
-/// rejects. Drop these from Phase B's invocation so the user can
-/// still forward them to `cargo nextest run` via the normal
-/// pass-through.
-const RUN_ONLY_VALUE_FLAGS: &[&str] = &["--test-threads", "-j", "--retries"];
-const RUN_ONLY_BOOL_FLAGS: &[&str] = &["--no-fail-fast", "--fail-fast"];
-
-/// Return a copy of `args` with the known run-only flags removed.
-/// Handles both `--flag value` and `--flag=value` shapes for the
-/// value-bearing ones. Stops scanning at `--` — anything past it is
-/// nextest filter positionals, never a flag.
-fn strip_run_only_flags(args: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--" {
-            // Pass through everything from `--` onwards verbatim.
-            out.extend(args[i..].iter().cloned());
-            break;
-        }
-        if RUN_ONLY_BOOL_FLAGS.contains(&arg.as_str()) {
-            i += 1;
-            continue;
-        }
-        if let Some((flag, _)) = arg.split_once('=')
-            && (RUN_ONLY_VALUE_FLAGS.contains(&flag) || RUN_ONLY_BOOL_FLAGS.contains(&flag))
-        {
-            i += 1;
-            continue;
-        }
-        if RUN_ONLY_VALUE_FLAGS.contains(&arg.as_str()) {
-            // Skip the flag and the following value (if any).
-            i += if i + 1 < args.len() { 2 } else { 1 };
-            continue;
-        }
-        out.push(arg.clone());
-        i += 1;
-    }
-    out
-}
-
-fn count_selected(summary: &TestListSummary) -> (usize, usize) {
-    let mut tests = 0usize;
-    let mut binaries = 0usize;
-    for suite in summary.rust_suites.values() {
-        let selected_in_suite = suite
-            .test_cases
-            .values()
-            .filter(|t| t.filter_match.is_match())
-            .count();
-        if selected_in_suite > 0 {
-            binaries += 1;
-            tests += selected_in_suite;
-        }
-    }
-    (tests, binaries)
-}

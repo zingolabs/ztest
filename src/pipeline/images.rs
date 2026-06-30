@@ -49,8 +49,8 @@ pub enum ImagesOutcome {
 /// each is sub-100ms — and serial keeps the output legible). The same
 /// dump stream carries both registries: returns the deduped dev-image
 /// list for the docker pipeline **and** the per-binary QoS tier
-/// declarations for nextest config lowering (`qos::lower`). QoS entries
-/// are kept binary-scoped because the lowering filters by `binary_id`
+/// declarations the engine (`engine::plan`) assigns each test from. QoS
+/// entries are kept binary-scoped because the match is keyed by `binary_id`
 /// (exact test names can collide across binaries).
 pub async fn discover(
     binaries: &[SelectedBinary],

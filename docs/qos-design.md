@@ -3,6 +3,15 @@
 Status: **draft / under refinement.** Owner: design in progress with Eli.
 This doc is the working reference; it will move faster than the code.
 
+> **Historical (superseded by `engine-design.md`).** §5.2 (the two-layer
+> split), §6 (nextest config lowering), and §12 (the "nextest has no live event
+> stream / the broker must be the sole live UI source" framing) describe the
+> old `cargo nextest`-wrapper architecture. That is **gone**: `ztest run` now
+> owns execution end-to-end via the engine (`src/engine/`), the QoS
+> `Scheduler` is the single spawn authority (no `--test-threads`, no
+> tool-config `qos/lower.rs`), and the run has a native event stream. Read
+> those three sections as background only; `engine-design.md` is current.
+
 ## 1. Problem & mandate
 
 Tests on this harness range from sub-second pure-logic checks to 48-hour

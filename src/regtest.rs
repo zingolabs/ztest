@@ -9,43 +9,25 @@
 
 use zingo_common_components::protocol::ActivationHeights;
 
-/// Single source of truth for regtest fixture activation heights.
+/// The regtest fixture activation heights: every upgrade ztest activates,
+/// at its canonical height, with no topology constraints.
 ///
-/// Every upgrade that must be independently queryable gets a **distinct**
-/// height. Zebra stores regtest activations in a `Height -> NetworkUpgrade`
-/// map and, on a height collision, keeps only the highest upgrade
-/// (`Testnet::with_activation_heights` — "later network upgrades overwrite
-/// prior ones"). Co-locating NU5 and NU6 at height 2 therefore *dropped*
-/// NU5 from the map, so `Nu5.activation_height()` returned `None` and
-/// zebrad refused to build the Orchard coinbase ("Cannot create Orchard
-/// transactions ... before NU5 activation") — every zebrad mine after
-/// genesis was rejected. NU5, NU6, NU6.1, and NU6.2 each get their own
-/// height to avoid this.
-///
-/// Pre-NU5 upgrades still share height 1 — they collapse to Canopy, which
-/// is harmless (nothing queries their individual activation heights, and
-/// it matches mainnet's deep-history shape on a fresh regtest chain). NU5
-/// at height 2 (Orchard live before the first funded block is mined), NU6
-/// at height 3, NU6.1 at height 6 (leaves 3 NU6 blocks — heights 3, 4, 5 —
-/// for funding-stream deposits before activation), NU6.2 at height 7.
+/// This is the activation schedule
+/// ([`NetworkUpgrade::regtest_height`](crate::topology::NetworkUpgrade::regtest_height) —
+/// the single source of truth) with the ceiling set to
+/// [`NetworkUpgrade::HIGHEST`](crate::topology::NetworkUpgrade::HIGHEST), so
+/// this fixture and the topology-aware resolver
+/// ([`activation_heights_for_ceiling`](crate::topology::activation_heights_for_ceiling))
+/// can never disagree on a height. See `regtest_height` for why NU5 and
+/// later each get a *distinct* height (zebra's height-collision rule) and
+/// why NU7 stays off.
 ///
 /// **Companion config required for callers mining past height 6**: pair
 /// with [`regtest_test_lockbox_disbursements`] and
 /// [`regtest_test_post_nu6_funding_streams`]; the NU6.1 activation block is
 /// rejected without either.
 pub fn regtest_test_activation_heights() -> ActivationHeights {
-    ActivationHeights::builder()
-        .set_overwinter(Some(1))
-        .set_sapling(Some(1))
-        .set_blossom(Some(1))
-        .set_heartwood(Some(1))
-        .set_canopy(Some(1))
-        .set_nu5(Some(2))
-        .set_nu6(Some(3))
-        .set_nu6_1(Some(6))
-        .set_nu6_2(Some(7))
-        .set_nu7(None)
-        .build()
+    crate::topology::activation_heights_for_ceiling(crate::topology::NetworkUpgrade::HIGHEST)
 }
 
 /// CLI string form for `clap` defaults that need a `&'static str`.

@@ -292,103 +292,45 @@ pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
     Ok(false)
 }
 
-/// Run `docker build` with the args the preflight pipeline uses. Public
-/// because the pipeline lives in `crate::pipeline::docker` and needs
-/// to invoke it directly — the resolver no longer triggers builds.
-///
-/// Pipes `stderr` (BuildKit emits all human-readable progress there) and relays
-/// it line-by-line through `on_line`, which the caller forwards into the bottom
-/// console's native scrollback the same way cargo's `Compiling foo v0.1.0`
-/// lines are. Because stderr is a pipe rather than a TTY, BuildKit auto-degrades
-/// to `plain` progress mode — exactly what we want for clean one-line-per-step
-/// relay (no in-place spinner rewrites to reconcile).
-///
-/// stdout (the image id, if `--quiet` were set) is dropped. On failure the
-/// progress lines are already relayed, so we surface only the exit code —
-/// duplicating the error tail would just print the same lines twice.
-pub fn docker_build(
+/// The `docker build` argv (the args **after** the `docker` program name) for a
+/// dev image. The caller runs it through the console PTY (`Console::run_child`)
+/// so BuildKit detects a TTY and renders its native in-place layer progress —
+/// the same live polish cargo's compile gets — with `DOCKER_BUILDKIT=1` set in
+/// the child env. Returns the args in order.
+pub fn docker_build_argv(
     dockerfile: &Path,
     context: &Path,
     features: &[String],
     tag: &str,
-    on_line: &mut dyn FnMut(&str),
-) -> Result<(), ImageError> {
-    let mut cmd = Command::new("docker");
-    cmd.env("DOCKER_BUILDKIT", "1");
-    cmd.args(["build", "-f"]).arg(dockerfile);
-    cmd.args(["-t", tag]);
-    let rust_version = read_rust_version(context);
-    cmd.args(["--build-arg", &format!("RUST_VERSION={rust_version}")]);
+) -> Vec<String> {
+    let mut argv = vec![
+        "build".to_string(),
+        "-f".to_string(),
+        dockerfile.display().to_string(),
+        "-t".to_string(),
+        tag.to_string(),
+        "--build-arg".to_string(),
+        format!("RUST_VERSION={}", read_rust_version(context)),
+    ];
     if !features.is_empty() {
-        cmd.args([
-            "--build-arg",
-            &format!("CARGO_FEATURES={}", features.join(",")),
-        ]);
+        argv.push("--build-arg".to_string());
+        argv.push(format!("CARGO_FEATURES={}", features.join(",")));
     }
-    cmd.arg(context);
-    // Pipe stderr so the caller can relay BuildKit's (plain, non-TTY) progress
-    // into the console's scrollback; stdout carries nothing we want.
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::piped());
-
-    on_line(&format!(
-        "ztest: docker build -f {} -t {} {}",
-        dockerfile.display(),
-        tag,
-        context.display()
-    ));
-    let mut child = cmd.spawn().map_err(|err| ImageError::Spawn {
-        cmd: "docker build".into(),
-        err,
-    })?;
-    if let Some(stderr) = child.stderr.take() {
-        use std::io::{BufRead, BufReader};
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            on_line(&line);
-        }
-    }
-    let status = child.wait().map_err(|err| ImageError::Spawn {
-        cmd: "docker build".into(),
-        err,
-    })?;
-    if !status.success() {
-        let code = status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".to_string());
-        return Err(ImageError::DockerBuild {
-            stderr_tail: format!("`docker build -t {tag}` exited {code} (see output above)"),
-        });
-    }
-    Ok(())
+    argv.push(context.display().to_string());
+    argv
 }
 
-/// Run `kind load docker-image` for a built tag. Public for the same reason as
-/// [`docker_build`]. `kind`'s output (stderr) is captured and relayed
-/// one-line-per-step through `on_line` into the console; on non-zero exit the
-/// captured stderr also feeds the error tail.
-pub fn kind_load(tag: &str, on_line: &mut dyn FnMut(&str)) -> Result<(), ImageError> {
+/// The `kind load docker-image` argv (the args **after** the `kind` program
+/// name) for a built tag. Run through the console PTY like [`docker_build_argv`].
+pub fn kind_load_argv(tag: &str) -> Vec<String> {
     let cluster = std::env::var("KIND_CLUSTER").unwrap_or_else(|_| "zkn".to_string());
-    on_line(&format!("ztest: kind load docker-image {tag} --name {cluster}"));
-    let out = Command::new("kind")
-        .args(["load", "docker-image", tag, "--name", &cluster])
-        .output()
-        .map_err(|err| ImageError::Spawn {
-            cmd: "kind load".into(),
-            err,
-        })?;
-    // Relay kind's own progress lines (stderr) into the console.
-    for line in String::from_utf8_lossy(&out.stderr).lines() {
-        if !line.is_empty() {
-            on_line(line);
-        }
-    }
-    if !out.status.success() {
-        return Err(ImageError::KindLoad {
-            stderr_tail: tail(&out.stderr, 40),
-        });
-    }
-    Ok(())
+    vec![
+        "load".to_string(),
+        "docker-image".to_string(),
+        tag.to_string(),
+        "--name".to_string(),
+        cluster,
+    ]
 }
 
 /// Read `rust-toolchain.toml` from the context dir and extract the

@@ -104,4 +104,18 @@ ratatui = "0.30"
 avt = "0.18"
 libc = "0.2"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+
+# `ztest run` shells out to `cargo nextest list` (inventory) and `cargo nextest
+# run` (the run, under the PTY console). `nextest-metadata` parses the
+# `cargo nextest list --json` summary into the `TestListSummary` the image
+# inventory phase consumes. Version tracks the installed `cargo nextest`; shares
+# the single crossterm 0.29 in the lock — no skew with ratatui's crossterm.
 nextest-metadata = "0.14"
+
+[dev-dependencies]
+# Property testing for the pure admission core: the scheduler is a
+# deterministic function of its inputs (no clock, no I/O), so randomized
+# op-sequences are the natural way to assert its invariants (no overcommit,
+# committed == Σ live leases) far past what hand-picked cases reach. Kept fast
+# and hermetic — no cluster, in line with the FakeStore/logical-clock suite.
+proptest = "1"

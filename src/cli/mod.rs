@@ -18,8 +18,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-pub mod args_peek;
-mod console;
+pub(crate) mod console;
 pub mod list_mounts;
 pub mod run;
 

@@ -41,10 +41,10 @@ use zcash_protocol::consensus::BlockHeight;
 const LABEL: &str = "zingo";
 
 /// BIP-39 mnemonic for the regtest faucet — the wallet the validator mines
-/// to. The miner address ztest writes into each validator config is derived
-/// from this seed (zebrad mines to its Orchard unified address, zcashd to
-/// its Sapling address), so a faucet account built from this seed receives
-/// the coinbase rewards as spendable shielded notes after a sync.
+/// to. Each validator's miner address (resolved from its
+/// `default_coinbase_pool`, overridable via `Validator::mine_to`) is derived
+/// from this seed, so a faucet account built from it receives the coinbase
+/// rewards after a sync.
 pub const FAUCET_SEED: &str = zingo_test_vectors::seeds::ABANDON_ART_SEED;
 
 /// A second well-known test seed, distinct from the faucet — handy for the

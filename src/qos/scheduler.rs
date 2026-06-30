@@ -728,3 +728,109 @@ mod tests {
         assert_eq!(run(), run());
     }
 }
+
+/// Property tests: the invariants the hand-picked cases above pin pointwise,
+/// asserted over *randomized* op-sequences. The scheduler is pure and
+/// deterministic, so this needs no cluster and no clock — it just hammers the
+/// admission core and checks it never overcommits.
+#[cfg(test)]
+mod props {
+    use super::*;
+    use crate::qos::MIB;
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, HashMap};
+
+    /// A scripted operation against the scheduler. `Release` indexes into the
+    /// currently-held leases (modulo their count), so it always targets a real
+    /// lease when one exists.
+    #[derive(Debug, Clone)]
+    enum Op {
+        Request { cpu: u64, mem_mib: u64, prio: u8 },
+        Release { which: usize },
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (1u64..=4_000, 1u64..=8_192, 0u8..=3)
+                .prop_map(|(cpu, mem_mib, prio)| Op::Request { cpu, mem_mib, prio }),
+            (0usize..256).prop_map(|which| Op::Release { which }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// The headline safety property (A/B "no overload", machine-checked):
+        /// for *any* sequence of request/release ops, committed capacity never
+        /// exceeds the ceiling in either dimension, and the scheduler's own
+        /// accounting stays exactly consistent with the set of live leases.
+        #[test]
+        fn committed_never_exceeds_ceiling_under_any_op_sequence(
+            ops in proptest::collection::vec(op(), 1..80)
+        ) {
+            let ceiling = Resources::new(8_000, 16 * 1024 * MIB);
+            let mut s = Scheduler::new(ceiling);
+
+            // Independent mirror of what *should* be committed, rebuilt from the
+            // grants/releases the scheduler reports — never read back from it.
+            // BTreeMap keeps `Release` indexing deterministic for shrinking.
+            let mut live: BTreeMap<LeaseId, Resources> = BTreeMap::new();
+            let mut footprint_of: HashMap<String, Resources> = HashMap::new();
+            let mut seq = 0u64;
+
+            for o in ops {
+                match o {
+                    Op::Request { cpu, mem_mib, prio } => {
+                        let name = format!("t{seq}");
+                        seq += 1;
+                        let fp = Resources::new(cpu, mem_mib * MIB);
+                        footprint_of.insert(name.clone(), fp);
+                        let req = Request {
+                            binary_id: "b".into(),
+                            test_name: name,
+                            sa: "acme".into(),
+                            footprint: fp,
+                            priority: prio,
+                        };
+                        // A fresh enqueue grants at most the request itself
+                        // (capacity only shrank since the last pass).
+                        if let Admission::Granted(id) = s.request(req) {
+                            live.insert(id, fp);
+                        }
+                    }
+                    Op::Release { which } => {
+                        if live.is_empty() {
+                            continue;
+                        }
+                        let ids: Vec<LeaseId> = live.keys().copied().collect();
+                        let id = ids[which % ids.len()];
+                        live.remove(&id);
+                        // Releasing frees capacity, which may backfill queued
+                        // requests — fold each newly-admitted grant into the mirror.
+                        for g in s.release(id) {
+                            let fp = footprint_of[&g.test_name];
+                            live.insert(g.lease_id, fp);
+                        }
+                    }
+                }
+
+                let mirror = live
+                    .values()
+                    .fold(Resources::ZERO, |acc, fp| acc.saturating_add(fp));
+                prop_assert_eq!(
+                    s.committed(),
+                    mirror,
+                    "committed must equal the sum of live leases"
+                );
+                prop_assert!(
+                    s.committed().fits_within(&ceiling),
+                    "committed {:?} must never exceed ceiling {:?}",
+                    s.committed(),
+                    ceiling
+                );
+                prop_assert_eq!(s.free(), ceiling.saturating_sub(&mirror));
+                prop_assert_eq!(s.active_leases(), live.len());
+            }
+        }
+    }
+}

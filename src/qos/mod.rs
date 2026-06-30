@@ -42,7 +42,6 @@ pub mod allocator;
 pub mod kube_store;
 pub mod ledger;
 pub mod live;
-pub mod lower;
 pub mod schedule;
 pub mod scheduler;
 pub mod store;

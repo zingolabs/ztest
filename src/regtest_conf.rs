@@ -47,17 +47,11 @@ use crate::regtest::{FundingStreams, LockboxDisbursement};
 /// `infrastructure/zingo_test_vectors::REG_T_ADDR_FROM_ABANDONART`.
 pub const MINER_ADDRESS: &str = "tmBsTi2xWTjUdEXnuTceL7fecEQKeWaPDJd";
 
-/// Shielded (Sapling) miner coinbase recipient for zcashd. The faucet's
-/// sapling address under the canonical `abandon … art` seed (mirrors
-/// `infrastructure/zingo_test_vectors::REG_Z_ADDR_FROM_ABANDONART`).
-///
-/// zcashd mines coinbase straight into this sapling pool so the in-process
-/// faucet lightclient sees its funds via ordinary shielded compact-block
-/// sync. Mining to the *transparent* [`MINER_ADDRESS`] instead leaves the
-/// coinbase undetected — the lightclient's transparent discovery does not
-/// credit coinbase UTXOs — so the faucet would carry a zero balance. This
-/// mirrors zingolib's own regtest reference, which uses this same sapling
-/// `mineraddress`.
+/// Shielded (Sapling) miner coinbase recipient — the canonical
+/// `abandon … art` regtest seed's sapling address (mirrors
+/// `infrastructure/zingo_test_vectors::REG_Z_ADDR_FROM_ABANDONART`), so it
+/// pins the coinbase to the Sapling pool. Valid at heights at/after Sapling
+/// activation.
 pub const SHIELDED_MINER_ADDRESS: &str =
     "zregtestsapling1fmq2ufux3gm0v8qf7x585wj56le4wjfsqsj27zprjghntrerntggg507hxh2ydcdkn7sx8kya7p";
 
@@ -66,12 +60,11 @@ pub const SHIELDED_MINER_ADDRESS: &str =
 /// `abandon … art` seed (mirrors
 /// `infrastructure/zingo_test_vectors::REG_O_ADDR_FROM_ABANDONART`).
 ///
-/// Zebra's coinbase builder fills a unified address's receivers in the
-/// order orchard → sapling → transparent, so this address makes every
-/// coinbase pay into the Orchard pool. Orchard coinbase notes are
-/// spendable once mined (no 100-confirmation maturity), which is the
-/// whole point of mining to it: the faucet is funded without the
-/// mature-then-shield ritual. Only valid at heights at/after NU5
+/// A coinbase builder fills a unified address's receivers in the order
+/// orchard → sapling → transparent, paying the highest-priority receiver
+/// whose pool is active at the mined height, so this address pins the
+/// coinbase to the Orchard pool once NU5 is active (it falls back to the
+/// sapling receiver below NU5). Only valid at heights at/after NU5
 /// activation — see [`CoinbasePool`].
 pub const ORCHARD_MINER_ADDRESS: &str = "uregtest1zkuzfv5m3yhv2j4fmvq5rjurkxenxyq8r7h4daun2zkznrjaa8ra8asgdm8wwgwjvlwwrxx7347r8w0ee6dqyw4rufw4wg9djwcr6frzkezmdw6dud3wsm99eany5r8wgsctlxquu009nzd6hsme2tcsk0v3sgjvxa70er7h27z5epr67p5q767s2z5gt88paru56mxpm6pwz0cu35m";
 
@@ -247,52 +240,44 @@ pub fn zcashd_conf(
     rpc_port: u16,
     miner_address: &str,
 ) -> String {
-    let overwinter = activation
-        .overwinter()
-        .expect("overwinter activation height must be specified");
-    let sapling = activation
-        .sapling()
-        .expect("sapling activation height must be specified");
-    let blossom = activation
-        .blossom()
-        .expect("blossom activation height must be specified");
-    let heartwood = activation
-        .heartwood()
-        .expect("heartwood activation height must be specified");
-    let canopy = activation
-        .canopy()
-        .expect("canopy activation height must be specified");
-    let nu5 = activation
-        .nu5()
-        .expect("nu5 activation height must be specified");
-    let nu6 = activation
-        .nu6()
-        .expect("nu6 activation height must be specified");
+    // One `nuparams=<branch-id>:<height>` line per *activated* upgrade.
+    // A `None` height means the topology ceiling excluded that upgrade
+    // (see `topology::activation_heights_for_ceiling`), so the line is
+    // omitted rather than fed a value — zcashd is never handed an upgrade
+    // absent from the chain it's configured for. NU6.1/NU6.2 additionally
+    // require a zcashd build that understands them (`zcashd_supports_*`).
+    let nuparams: [(&str, &str, Option<u32>); 9] = [
+        ("5ba81b19", "Overwinter", activation.overwinter()),
+        ("76b809bb", "Sapling", activation.sapling()),
+        ("2bb40e60", "Blossom", activation.blossom()),
+        ("f5b9230b", "Heartwood", activation.heartwood()),
+        ("e9ff75a6", "Canopy", activation.canopy()),
+        ("c2d6d0b4", "NU5 (Orchard)", activation.nu5()),
+        ("c8e71055", "NU6", activation.nu6()),
+        (
+            "4dec4df0",
+            "NU6_1",
+            activation.nu6_1().filter(|_| version.zcashd_supports_nu6_1()),
+        ),
+        (
+            "5437f330",
+            "NU6_2",
+            activation.nu6_2().filter(|_| version.zcashd_supports_nu6_2()),
+        ),
+    ];
+    let mut nuparams_lines = String::new();
+    for (branch_id, label, height) in nuparams {
+        if let Some(h) = height {
+            nuparams_lines.push_str(&format!("nuparams={branch_id}:{h} # {label}\n"));
+        }
+    }
 
     let mut out = format!(
         "\
 ### Blockchain Configuration
 regtest=1
-nuparams=5ba81b19:{overwinter} # Overwinter
-nuparams=76b809bb:{sapling} # Sapling
-nuparams=2bb40e60:{blossom} # Blossom
-nuparams=f5b9230b:{heartwood} # Heartwood
-nuparams=e9ff75a6:{canopy} # Canopy
-nuparams=c2d6d0b4:{nu5} # NU5 (Orchard)
-nuparams=c8e71055:{nu6} # NU6
-"
+{nuparams_lines}"
     );
-
-    if version.zcashd_supports_nu6_1()
-        && let Some(h) = activation.nu6_1()
-    {
-        out.push_str(&format!("nuparams=4dec4df0:{h} # NU6_1\n"));
-    }
-    if version.zcashd_supports_nu6_2()
-        && let Some(h) = activation.nu6_2()
-    {
-        out.push_str(&format!("nuparams=5437f330:{h} # NU6_2\n"));
-    }
 
     out.push_str(&format!(
         "
@@ -438,26 +423,33 @@ filter = \"info\"
 use_journald = false
 
 [mining]
-miner_address = \"{miner_address}\"
-
-[network.testnet_parameters.activation_heights]
-Canopy = {canopy}
-NU5 = {nu5}
-NU6 = {nu6}",
-        canopy = activation.canopy().expect("canopy activation must be set"),
-        nu5 = activation.nu5().expect("nu5 activation must be set"),
-        nu6 = activation.nu6().expect("nu6 activation must be set"),
+miner_address = \"{miner_address}\""
     );
 
-    if version.zebrad_supports_nu6_1()
-        && let Some(h) = activation.nu6_1()
-    {
-        out.push_str(&format!("\n\"NU6.1\" = {h}"));
-    }
-    if version.zebrad_supports_nu6_2()
-        && let Some(h) = activation.nu6_2()
-    {
-        out.push_str(&format!("\n\"NU6.2\" = {h}"));
+    // The `[network.testnet_parameters.activation_heights]` table: one
+    // `<Key> = <height>` entry per *activated* upgrade. A `None` height
+    // means the topology ceiling excluded that upgrade (see
+    // `topology::activation_heights_for_ceiling`), so the entry is omitted
+    // rather than fed a value. NU6.1/NU6.2 additionally require a zebrad
+    // build that understands them (`zebrad_supports_*`).
+    out.push_str("\n\n[network.testnet_parameters.activation_heights]");
+    let activation_entries: [(&str, Option<u32>); 5] = [
+        ("Canopy", activation.canopy()),
+        ("NU5", activation.nu5()),
+        ("NU6", activation.nu6()),
+        (
+            "\"NU6.1\"",
+            activation.nu6_1().filter(|_| version.zebrad_supports_nu6_1()),
+        ),
+        (
+            "\"NU6.2\"",
+            activation.nu6_2().filter(|_| version.zebrad_supports_nu6_2()),
+        ),
+    ];
+    for (key, height) in activation_entries {
+        if let Some(h) = height {
+            out.push_str(&format!("\n{key} = {h}"));
+        }
     }
 
     for d in lockbox_disbursements {

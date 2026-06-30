@@ -59,19 +59,16 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
 
     /// The value pool this backend mines its coinbase into when a test
     /// doesn't override it via
-    /// [`Validator::mine_to`](crate::component::Validator::mine_to).
-    /// zebrad defaults to [`Pool::Transparent`] (the pool it can mine
-    /// that avoids the Orchard-anchor and Sapling-scan problems); zcashd
-    /// to [`Pool::Sapling`] (a scannable, instantly-spendable shielded
-    /// coinbase).
+    /// [`Validator::mine_to`](crate::component::Validator::mine_to). Both
+    /// backends can mine any pool; the default is a cost/convenience choice:
+    /// zebrad defaults to [`Pool::Transparent`] (the cheapest block template
+    /// — no shielded proof per block), zcashd to [`Pool::Sapling`] (its
+    /// historical shielded coinbase default).
     fn default_coinbase_pool(&self) -> Pool;
 
     /// Stable label for this backend (`"zcashd"` / `"zebrad"`). Mirrors
     /// [`ValidatorBackend::label`] on the live handle, but is available on
-    /// the spec *before* launch, so a backend-generic test can branch on it
-    /// — e.g. to pick a [`Validator::mine_to`](crate::component::Validator::mine_to)
-    /// coinbase pool the backend can actually mine (Orchard on zcashd,
-    /// Transparent on zebrad).
+    /// the spec *before* launch, so a backend-generic test can branch on it.
     fn label(&self) -> &'static str;
 
     /// Highest network upgrade this backend, at the given pinned
@@ -115,9 +112,9 @@ pub struct PoolSupport {
 
     /// The single pool the coinbase pays into — a fixed property of the
     /// backend's miner address (baked into its regtest config), not a
-    /// per-test choice. Defaults to [`Pool::Transparent`] for zebrad (the
-    /// only coinbase it can mine on a cold chain) and [`Pool::Sapling`] for
-    /// zcashd; either can be overridden per-validator via
+    /// per-test choice. Defaults to [`Pool::Transparent`] for zebrad (cheapest
+    /// block template) and [`Pool::Sapling`] for zcashd; either can be
+    /// overridden per-validator via
     /// [`Validator::mine_to`](crate::component::Validator::mine_to). Always
     /// one of [`Self::supported`].
     pub coinbase: Pool,

@@ -15,24 +15,28 @@
 //! `insert_before` switches to a DECSTBM region most emulators exclude from
 //! scrollback.
 //!
-//! One [`Console`] is created per session ([`Console::new`]) and reused for
-//! every phase via [`Console::run_child`]: `cargo nextest list` (preflight
-//! build), `docker build` / `kind load` (images), and `cargo nextest run` (the
-//! run phase, via [`Console::run_tests`]). Every child runs under a PTY so its
-//! native colour + in-place progress survive; [`avt`] interprets the result
-//! into a grid we render in the viewport's live region, with the appropriate
-//! panel ([`crate::preflight::render_preflight_panel`] or
-//! [`crate::preflight::render_live_panel`]) pinned beneath, and completed lines
-//! forwarded to native scrollback via `insert_before`.
+//! One [`Console`] is created per session ([`Console::new`]) and reused for the
+//! preflight phases via [`Console::run_child`]: `cargo nextest list` (the
+//! inventory build) and `docker build` / `kind load` (images). Every child runs
+//! under a PTY so its native colour + in-place progress survive; [`avt`]
+//! interprets the result into a grid the shared [`Surface`] renders in the
+//! viewport's live region, with [`crate::preflight::render_preflight_panel`]
+//! pinned beneath and completed lines forwarded to native scrollback.
+//!
+//! The **test run** itself is the engine's job ([`crate::engine`]): it owns
+//! process-per-test execution and drives a panel-only [`Surface`] directly, so
+//! the run phase no longer goes through [`Console`].
 
 use std::io::Stdout;
 
 use ratatui::backend::CrosstermBackend;
 
 mod bridge;
-mod engine;
+mod pty;
+mod viewport;
 
-pub use engine::Console;
+pub(crate) use pty::Console;
+pub(crate) use viewport::Surface;
 
 /// Rows reserved at the bottom for the status panel — the tallest a panel ever
 /// renders: a top rule plus up to three content lines (the run panel's running

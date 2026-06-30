@@ -22,49 +22,23 @@ const COMPONENT: &str = "zebrad";
 
 /// The pool zebrad mines its coinbase into when a test doesn't override
 /// via [`Validator::mine_to`](crate::component::Validator::mine_to).
-///
-/// **Transparent.** zebrad cannot fund a lightclient faucet from any
-/// shielded coinbase on a cold regtest chain: an *Orchard* coinbase has
-/// no anchor at the NU5 activation block ("could not validate orchard
-/// proof"), and a *Sapling* coinbase mines but produces a note zingo
-/// can't scan (`invalid memo bytes`). Transparent always mines, so the
-/// chain advances for walletless tests. (A zingo faucet still can't see a
-/// transparent *coinbase* UTXO, so funded zebrad wallet tests need a
-/// chain cache or upstream fixes — tracked separately.)
+/// Transparent is the cheapest block template (no shielded proof per
+/// block), so it is the default for sessions that don't fund from a
+/// shielded coinbase.
 const DEFAULT_COINBASE_POOL: Pool = Pool::Transparent;
 
-/// Resolve the regtest miner address zebrad mines its coinbase to for
-/// `pool`. zebrad pays a unified address's receivers orchard → sapling →
-/// transparent, so each address pins the coinbase to one pool.
+/// The regtest miner address that pins zebrad's coinbase to `pool`.
 ///
-/// Only [`Pool::Transparent`] is mineable on a cold regtest chain — the
-/// two shielded pools are rejected here, at config time, rather than
-/// producing a block the node will reject (or silently-broken funds) at
-/// mine time:
-///
-/// - **Orchard**: the NU5 *activation* block has no parent Orchard tree,
-///   so the coinbase Orchard output has no anchor and zebrad rejects the
-///   block (`"could not validate orchard proof"`). Unlike zcashd, zebrad's
-///   `generate` RPC has no wallet to materialize the output against the
-///   empty-tree anchor. Fund a zebrad faucet with Orchard notes via the
-///   transparent-coinbase mature-then-shield path instead (see
-///   `funded_faucet_with_notes`).
-/// - **Sapling**: mines, but produces a coinbase note zingo cannot scan
-///   (`"invalid memo bytes"`).
+/// zebrad fills a unified address's receivers in the order orchard →
+/// sapling → transparent, paying the highest-priority receiver whose pool
+/// is active at the block being mined; a bare transparent address pins the
+/// coinbase to the transparent pool. So each address here resolves the
+/// coinbase to exactly one pool.
 fn miner_address(pool: Pool) -> &'static str {
     match pool {
         Pool::Transparent => crate::regtest_conf::MINER_ADDRESS,
-        Pool::Orchard => panic!(
-            "zebrad cannot mine an Orchard coinbase on a cold regtest chain: \
-             the NU5 activation block has no parent Orchard tree, so the \
-             coinbase output has no anchor and the block is rejected. Leave \
-             the default transparent coinbase and fund the faucet via \
-             mature-then-shield (funded_faucet_with_notes)."
-        ),
-        Pool::Sapling => panic!(
-            "zebrad cannot mine a scannable Sapling coinbase (the note is \
-             unscannable by zingo); mine to Transparent"
-        ),
+        Pool::Sapling => crate::regtest_conf::SHIELDED_MINER_ADDRESS,
+        Pool::Orchard => crate::regtest_conf::ORCHARD_MINER_ADDRESS,
     }
 }
 
