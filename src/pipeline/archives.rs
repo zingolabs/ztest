@@ -1,27 +1,17 @@
-//! Phase A3 — archive discovery.
+//! Phase A3: archive discovery.
 //!
-//! Read-only walk of the `zaino-seeds` namespace, enumerating
-//! `seed-{sha8}` PVCs and classifying each as ready or pending based
-//! on the `seeds.zaino.io/ready` label.
+//! Read-only walk of the `zaino-seeds` namespace, enumerating `seed-{sha8}` PVCs
+//! and classifying each as ready or pending based on the `seeds.zaino.io/ready`
+//! label. Provisioning of missing archives (LFS pull, reconcile-Job, byte
+//! progress) is not yet implemented; tests needing a missing archive fail later
+//! at `TestEnv::build()`.
 //!
-//! Provisioning of missing archives — `git lfs pull`, reconcile-Job
-//! spawning, byte-progress streaming — is a future deliverable
-//! (steps 6-7 of the original rollout). A3 today returns the cluster's
-//! current archive state so the banner can show what's available;
-//! tests that need a missing archive will fail at `TestEnv::build()`
-//! with the existing missing-archive error.
-//!
-//! ## Schema
-//!
-//! Per
-//! [`docs/architecture-overview.md`](../../docs/architecture-overview.md#archive-pvcs)
-//! (cited as `architecture-overview.md:259-261` in earlier audits):
-//!
-//! - **Namespace**: `zaino-seeds`
-//! - **PVC name**: `seed-{sha[..8]}`
-//! - **Ready label**: `seeds.zaino.io/ready=true`
-//! - **SHA label**: `seeds.zaino.io/sha=<full-sha256>`
-//! - **Storage capacity**: `spec.resources.requests.storage`
+//! PVC schema (`docs/architecture-overview.md#archive-pvcs`):
+//! - namespace: `zaino-seeds`
+//! - name: `seed-{sha[..8]}`
+//! - ready label: `seeds.zaino.io/ready=true`
+//! - sha label: `seeds.zaino.io/sha=<full-sha256>`
+//! - capacity: `spec.resources.requests.storage`
 
 use std::convert::TryInto;
 
@@ -45,11 +35,10 @@ const READY_LABEL: &str = "seeds.zaino.io/ready";
 pub struct ArchiveEntry {
     /// PVC name (`seed-<sha8>`).
     pub name: String,
-    /// Storage requested from `spec.resources.requests.storage`, in
-    /// bytes. `0` if unknown.
+    /// Storage requested from `spec.resources.requests.storage`, in bytes;
+    /// `0` if unknown.
     pub size_bytes: u64,
-    /// `true` when `seeds.zaino.io/ready=true`. Pending materialisation
-    /// when `false`.
+    /// `true` when `seeds.zaino.io/ready=true`, else pending materialisation.
     pub ready: bool,
 }
 
@@ -58,14 +47,12 @@ pub struct ArchiveEntry {
 pub enum ArchivesOutcome {
     /// PVCs enumerated.
     Discovered { entries: Vec<ArchiveEntry> },
-    /// The `zaino-seeds` namespace doesn't exist on this cluster.
-    /// Soft fail — likely a fresh cluster that hasn't had any tests
-    /// run yet.
+    /// The `zaino-seeds` namespace doesn't exist. Soft fail: likely a fresh
+    /// cluster that hasn't run any tests yet.
     NamespaceMissing,
-    /// API call failed (RBAC, transient outage). Soft fail at the
-    /// pipeline level — the banner shows the error and the run
-    /// proceeds; tests that depend on archives will fail downstream
-    /// at `TestEnv::build()`.
+    /// API call failed (RBAC, transient outage). Soft fail: the banner shows
+    /// the error and the run proceeds; archive-dependent tests fail later at
+    /// `TestEnv::build()`.
     Failed { detail: String },
 }
 
@@ -78,10 +65,9 @@ pub async fn discover(client: &Client, _tx: &EventTx) -> ArchivesOutcome {
     let pvcs = match api.list(&ListParams::default()).await {
         Ok(p) => p,
         Err(err) => {
-            // `kube::Error::Api(ErrorResponse { code: 404, .. })` is
-            // the canonical "namespace doesn't exist" signal — we
-            // string-match to avoid the verbose error-kind pattern
-            // since the typed branch is fragile across kube versions.
+            // 404 is the "namespace doesn't exist" signal. String-match rather
+            // than the typed error-kind pattern, which is fragile across kube
+            // versions.
             let s = err.to_string();
             if s.contains("not found") || s.contains("404") {
                 return ArchivesOutcome::NamespaceMissing;
@@ -95,9 +81,8 @@ pub async fn discover(client: &Client, _tx: &EventTx) -> ArchivesOutcome {
     ArchivesOutcome::Discovered { entries }
 }
 
-/// Classify a single PVC. Returns `Some` for matching seed-PVCs;
-/// `None` for unrelated PVCs in the namespace (manual ones, leftover
-/// scratch volumes).
+/// Classify a single PVC. `Some` for matching seed-PVCs; `None` for unrelated
+/// PVCs in the namespace (manual, leftover scratch volumes).
 fn classify_pvc(pvc: &PersistentVolumeClaim) -> Option<ArchiveEntry> {
     let name = pvc.metadata.name.as_deref()?;
     if !name.starts_with(SEED_PVC_PREFIX) {
@@ -129,11 +114,8 @@ fn classify_pvc(pvc: &PersistentVolumeClaim) -> Option<ArchiveEntry> {
 }
 
 /// k8s `Quantity` parser scoped to storage values (no millicpu form).
-///
-/// Recognises `Ki Mi Gi Ti` (binary) and `K M G T` (decimal) suffixes,
-/// or plain bytes. Mirrors the parser in [`super::cluster`] but
-/// specialised for storage — no need to share since the grammar
-/// subset for storage is smaller.
+/// Recognises `Ki Mi Gi Ti` (binary) and `K M G T` (decimal) suffixes, or plain
+/// bytes.
 fn parse_storage_bytes(q: &k8s_openapi::apimachinery::pkg::api::resource::Quantity) -> u64 {
     let s = &q.0;
     let (num, mult) = if let Some(n) = s.strip_suffix("Ki") {

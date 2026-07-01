@@ -3,12 +3,11 @@
 //! Implements ztest's backend-agnostic
 //! [`WalletBackend`](crate::handles::wallet::WalletBackend) by running
 //! zingolib `LightClient`s directly in the test binary against a pod-hosted
-//! indexer's gRPC endpoint. This is the batteries-included wallet ztest
-//! ships: [`Wallet::zingo`](crate::component::Wallet::zingo) hands a test a
-//! `ZingoWallet` with the full account / send / shield / sync API and no
-//! wallet glue in the test body.
+//! indexer's gRPC endpoint. [`Wallet::zingo`](crate::component::Wallet::zingo)
+//! hands a test a `ZingoWallet` with the full account / send / shield / sync
+//! API and no wallet glue in the test body.
 //!
-//! Activation heights arrive (from the running validator) as ztest's
+//! Activation heights arrive from the running validator as ztest's
 //! [`ActivationHeights`]; [`to_configured`] crosses them into zingolib's
 //! `ChainType::Regtest` representation. zingolib reads each upgrade height
 //! directly with no implicit fill-in, so every pre-Canopy height the chain
@@ -22,10 +21,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 
-use zcash_primitives::transaction::TxId;
+use crate::topology::ActivationHeights;
+use zcash_protocol::TxId;
 use zcash_protocol::value::Zatoshis;
 use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
-use zingo_common_components::protocol::ActivationHeights;
 use zingolib::lightclient::LightClient;
 use zingolib_testutils::scenarios::ClientBuilder;
 
@@ -40,15 +39,14 @@ use zcash_protocol::consensus::BlockHeight;
 
 const LABEL: &str = "zingo";
 
-/// BIP-39 mnemonic for the regtest faucet — the wallet the validator mines
-/// to. Each validator's miner address (resolved from its
-/// `default_coinbase_pool`, overridable via `Validator::mine_to`) is derived
-/// from this seed, so a faucet account built from it receives the coinbase
-/// rewards after a sync.
+/// BIP-39 mnemonic for the regtest faucet, the wallet the validator mines to.
+/// Each validator's miner address (resolved from its `default_coinbase_pool`,
+/// overridable via `Validator::mine_to`) is derived from this seed, so a
+/// faucet account built from it receives the coinbase rewards after a sync.
 pub const FAUCET_SEED: &str = zingo_test_vectors::seeds::ABANDON_ART_SEED;
 
-/// A second well-known test seed, distinct from the faucet — handy for the
-/// "recipient" side of a transfer test.
+/// A second well-known test seed, distinct from the faucet. Handy for the
+/// recipient side of a transfer test.
 pub const RECIPIENT_SEED: &str = zingo_test_vectors::seeds::HOSPITAL_MUSEUM_SEED;
 
 /// In-process zingolib wallet config. ZST handed to the
@@ -66,9 +64,9 @@ impl ZingoBackend {
 impl WalletConfig for ZingoBackend {
     type Handle = ZingoWallet;
 
-    fn into_handle(&self, _plumbing: HandleInner) -> ZingoWallet {
+    fn to_handle(&self, _plumbing: HandleInner) -> ZingoWallet {
         // Wallets run in-process with no pod, so the plumbing back-reference
-        // is unused — the handle owns its own in-process state.
+        // is unused; the handle owns its own in-process state.
         ZingoWallet::new()
     }
 }
@@ -77,8 +75,8 @@ impl WalletConfig for ZingoBackend {
 /// account; methods dispatch to the matching client. A single
 /// [`ClientBuilder`] (created on the first account, bound to that
 /// account's indexer URI) hands out unique wallet data dirs. Cheaply
-/// cloneable — clones share the same in-process state, so an account
-/// built through one clone is visible through all of them.
+/// cloneable: clones share the same in-process state, so an account built
+/// through one clone is visible through all of them.
 #[derive(Clone, Default)]
 pub struct ZingoWallet {
     inner: Arc<ZingoInner>,
@@ -89,8 +87,8 @@ struct ZingoInner {
     builder: AsyncMutex<Option<ClientBuilder>>,
     /// One `LightClient` per ztest [`AccountId`]. Each client wraps a
     /// single-seed wallet, so per-account ops address zingolib sub-account
-    /// `zip32::AccountId::ZERO` — ztest's account model maps one ztest
-    /// account to one wallet, not to a zip32 sub-account index.
+    /// `zip32::AccountId::ZERO`: ztest maps one ztest account to one wallet,
+    /// not to a zip32 sub-account index.
     clients: StdMutex<HashMap<u32, Arc<AsyncMutex<LightClient>>>>,
     next_id: AtomicU32,
 }
@@ -137,9 +135,9 @@ fn to_configured(a: &ActivationHeights) -> ConfiguredActivationHeights {
     }
 }
 
-/// Birthday for the well-known regtest test wallets. Height 1 is the
-/// Sapling activation under the standard regtest fixture, so the wallet's
-/// commitment trees are valid from its first scanned block.
+/// Birthday for the well-known regtest test wallets. Height 1 is Sapling
+/// activation under the standard regtest fixture, so the wallet's commitment
+/// trees are valid from its first scanned block.
 const TEST_WALLET_BIRTHDAY: u32 = 1;
 
 /// How long [`ZingoWallet::funded_faucet`] waits for the indexer to surface
@@ -147,18 +145,18 @@ const TEST_WALLET_BIRTHDAY: u32 = 1;
 const FAUCET_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Regtest coinbase maturity: a coinbase reward is spendable
-/// `COINBASE_MATURITY` blocks after it is mined. A transparent-coinbase
-/// faucet must mine this many extra blocks before its funds are spendable;
-/// a shielded coinbase (Orchard/Sapling) is spendable immediately.
+/// `COINBASE_MATURITY` blocks after it is mined. A transparent-coinbase faucet
+/// must mine this many extra blocks before its funds are spendable; a shielded
+/// coinbase (Orchard/Sapling) is spendable immediately.
 const COINBASE_MATURITY: u32 = 100;
 
 /// Longer confirm timeout for the transparent-maturity path, which mines
 /// ~100 extra blocks.
 const FAUCET_MATURITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Zingo-specific conveniences on the wallet handle. ztest ships the well-
-/// known regtest seeds, so a test gets a funded faucet or a fresh recipient
-/// without naming a mnemonic.
+/// Zingo-specific conveniences on the wallet handle. ztest ships the
+/// well-known regtest seeds, so a test gets a funded faucet or a fresh
+/// recipient without naming a mnemonic.
 impl ZingoWallet {
     /// Build an in-process wallet account: derive the regtest activation
     /// heights from `validator` (the single source of truth) and point
@@ -189,7 +187,7 @@ impl ZingoWallet {
         Ok(Account::new(self.clone(), id, self.label()))
     }
 
-    /// The regtest faucet account — built from [`FAUCET_SEED`], whose
+    /// The regtest faucet account, built from [`FAUCET_SEED`], whose
     /// transparent address the validator mines to. Sync it after mining to
     /// pick up the coinbase.
     pub async fn faucet<V, I>(
@@ -246,22 +244,22 @@ impl ZingoWallet {
     }
 
     /// A synced faucet holding at least `notes` independent spendable
-    /// shielded notes, funded from the validator's coinbase. The funding
-    /// path depends on the pool the validator mines its coinbase into (see
+    /// shielded notes, funded from the validator's coinbase. The funding path
+    /// depends on the pool the validator mines its coinbase into (see
     /// [`Validator::mine_to`](crate::component::Validator::mine_to)):
     ///
-    /// - **Shielded coinbase** (zcashd → Sapling): a shielded coinbase note
-    ///   is spendable the moment it is mined and synced, and each block
-    ///   yields one — so funding is just "mine `notes` blocks", with no
-    ///   maturity wait and no shield round.
-    /// - **Transparent coinbase** (zebrad → Transparent): a transparent
-    ///   coinbase is subject to [`COINBASE_MATURITY`], and zingo cannot
-    ///   *spend* one directly — only *shield* it. So mature the coinbase,
-    ///   then shield it into Orchard, once per requested note. Each shield
-    ///   consolidates the currently-matured transparent coinbase into one
-    ///   independent Orchard note; a fresh `COINBASE_MATURITY` batch is
-    ///   matured before every shield so each note is independent. This
-    ///   mirrors the upstream dev funding flow (`vec![100; rounds]`).
+    /// - Shielded coinbase (zcashd, Sapling): a shielded coinbase note is
+    ///   spendable the moment it is mined and synced, and each block yields
+    ///   one, so funding is just "mine `notes` blocks" with no maturity wait
+    ///   and no shield round.
+    /// - Transparent coinbase (zebrad, Transparent): a transparent coinbase
+    ///   is subject to [`COINBASE_MATURITY`], and zingo cannot spend one
+    ///   directly, only shield it. So mature the coinbase, then shield it into
+    ///   Orchard, once per requested note. Each shield consolidates the
+    ///   currently-matured transparent coinbase into one independent Orchard
+    ///   note; a fresh `COINBASE_MATURITY` batch is matured before every
+    ///   shield so each note is independent. Mirrors the upstream dev funding
+    ///   flow (`vec![100; rounds]`).
     ///
     /// `notes` independent notes let a test issue that many back-to-back
     /// sends without one spending another's unconfirmed change.
@@ -315,11 +313,11 @@ where
     Ok(())
 }
 
-/// Fund `faucet` from a *transparent* coinbase: mature it, then shield into
+/// Fund `faucet` from a transparent coinbase: mature it, then shield into
 /// Orchard `notes` times for `notes` independent Orchard notes. zingo can
 /// shield a transparent coinbase but cannot spend one directly, so a direct
-/// send would see a zero balance — the shield is mandatory. Mirrors the
-/// upstream dev funding flow (mine → sync → shield).
+/// send would see a zero balance; the shield is mandatory. Mirrors the
+/// upstream dev funding flow (mine, sync, shield).
 async fn fund_via_shield<V, I>(
     validator: &V,
     indexer: &I,
@@ -330,16 +328,13 @@ where
     V: ValidatorBackend + ?Sized,
     I: IndexerBackend + ?Sized,
 {
-    // Mature a fresh transparent-coinbase batch before *each* shield, so
-    // every shield consolidates a distinct, independent set of matured
-    // coinbase into its own Orchard note. This mirrors the upstream dev
-    // funding flow, which mined a full `COINBASE_MATURITY` batch per shield
-    // round (`shield_faucet_rounds(.., &vec![100; rounds], 1)`); mining only
-    // one block between shields left the faucet re-spending an already-shielded
-    // coinbase, so the second shield's transaction conflicted and never
-    // entered the mempool.
+    // Mature a fresh transparent-coinbase batch before each shield, so every
+    // shield consolidates a distinct, independent set of matured coinbase into
+    // its own Orchard note. Mining only one block between shields would leave
+    // the faucet re-spending an already-shielded coinbase, conflicting the
+    // second shield's transaction so it never enters the mempool.
     //
-    // The FIRST round mines only the deficit to maturity: a cold chain mines
+    // The first round mines only the deficit to maturity: a cold chain mines
     // the full `COINBASE_MATURITY + 1`, while a chain-cache booted past
     // maturity (see `Validator::with_regtest_cache`) mines nothing and only
     // re-syncs. Subsequent rounds always mine a fresh `COINBASE_MATURITY`
@@ -352,7 +347,7 @@ where
             COINBASE_MATURITY
         };
         if blocks == 0 {
-            // Cached chain already matured — `mine_and_sync` would no-op, so
+            // Cached chain already matured: `mine_and_sync` would no-op, so
             // sync here to surface the matured coinbase before shielding.
             faucet.sync().await?;
         } else {

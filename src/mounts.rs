@@ -2,12 +2,8 @@
 //! creates ConfigMaps for `mount_config!` / `mount_file!`, plus shadow
 //! VSCs and PVCs for `mount_archive!`.
 //!
-//! Everything we make in the slot namespace carries the sentinel's
-//! ownerRef so teardown cascades cleanly.
-//!
-//! ConfigMap-as-binaryData is used for `mount_file!` as a small-file
-//! fallback. The spec's content-addressed single-file PVC lands in the
-//! materialization pass — see `seeds.rs` for the shape we'll reuse.
+//! Everything created in the slot namespace carries the sentinel's ownerRef
+//! so teardown cascades cleanly.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -23,12 +19,12 @@ use crate::materialize::{self, Payload};
 use crate::seeds::{self, ShadowClone};
 use crate::{EnvError, Mount, MountKind, MountSource};
 
-/// Cap on `mount_config!` size — the spec's invariant; we re-check at
-/// runtime in case the bytes changed between compile and run.
+/// Cap on `mount_config!` size. Re-checked at runtime in case the bytes
+/// changed between compile and run.
 const CONFIG_BYTES_MAX: u64 = 1024 * 1024;
 
 /// What a Pod needs for one mount: the `spec.volumes[*]` entry and the
-/// `container.volumeMounts[*]` entry. Both as raw JSON — `manifest.rs`
+/// `container.volumeMounts[*]` entry, both as raw JSON. `manifest.rs`
 /// splats them into the rendered Pod.
 #[derive(Debug, Clone)]
 pub struct ResolvedMount {
@@ -36,8 +32,8 @@ pub struct ResolvedMount {
     pub volume_mount: Value, // pod.spec.containers[*].volumeMounts[i]
 }
 
-/// Returns one `ResolvedMount` per input plus the shadow clones we minted
-/// (so `TestEnv` can delete the cluster-scoped VSCs on teardown).
+/// One `ResolvedMount` per input, plus the shadow clones minted here so
+/// `TestEnv` can delete the cluster-scoped VSCs on teardown.
 #[derive(Debug, Default)]
 pub struct ResolveOutput {
     pub mounts: Vec<ResolvedMount>,
@@ -178,9 +174,9 @@ async fn resolve_config_inline(
 
 // ───────── mount_file! ─────────
 //
-// Same content-addressed-PVC + shadow-VSC machinery as `mount_archive!`,
-// but the uploader writes a single blob into `/seed/blob` (no extraction)
-// and the consuming Pod mounts that blob at the destination via subPath.
+// Same content-addressed-PVC + shadow-VSC machinery as `mount_archive!`, but
+// the uploader writes a single blob into `/seed/blob` (no extraction) and the
+// consuming Pod mounts that blob at the destination via subPath.
 
 #[allow(clippy::too_many_arguments)]
 async fn resolve_file(
@@ -215,9 +211,8 @@ async fn resolve_archive(
     destination: &Path,
     out: &mut ResolveOutput,
 ) -> Result<ResolvedMount, EnvError> {
-    // 1. Materialize on first use (or no-op if already published), then
-    //    read the CSI snapshot handle. Idempotent and race-safe — see
-    //    materialize.rs.
+    // 1. Materialize on first use (no-op if already published), then read the
+    //    CSI snapshot handle. Idempotent and race-safe; see materialize.rs.
     let seed = materialize::ensure_seed(client, source, Payload::Archive).await?;
 
     // 2. Mint shadow VSC + namespaced VolumeSnapshot in the test ns.
@@ -243,8 +238,7 @@ async fn resolve_snapshot_mount(
     _destination: &Path,
     _out: &mut ResolveOutput,
 ) -> Result<ResolvedMount, EnvError> {
-    // Mid-test snapshot clone path. Lands together with
-    // ValidatorBackend::snapshot in the next slice.
+    // Mid-test snapshot clone path. Lands with ValidatorBackend::snapshot.
     unimplemented!("Mount::from_snapshot not yet wired")
 }
 
@@ -320,10 +314,9 @@ async fn create_pvc_from_snapshot(
 }
 
 fn file_volume_from_cm(volume_name: &str, cm_name: &str, destination: &Path) -> ResolvedMount {
-    // ConfigMap mounted as a single file via subPath. The key inside the
-    // CM is always "file" — see `create_cm`. `mountPath` is the absolute
-    // path the test author asked for; `subPath: "file"` selects the one
-    // entry we stored.
+    // ConfigMap mounted as a single file via subPath. The CM key is always
+    // "file" (see `create_cm`). `mountPath` is the absolute path the test
+    // author asked for; `subPath: "file"` selects the stored entry.
     ResolvedMount {
         volume: json!({ "name": volume_name, "configMap": { "name": cm_name } }),
         volume_mount: json!({
@@ -345,11 +338,10 @@ fn resolve_scratch(volume_name: &str, destination: &Path) -> ResolvedMount {
     }
 }
 
-/// A pre-provisioned shared PVC, referenced by `claimName`. No side
-/// effects: the claim is minted once per env in [`create_shared_pvc`],
-/// not here — both sharing pods just point at the same name. Mounted
-/// read-write (the writer pod owns the DB; the reader opens it as a
-/// RocksDB secondary, which only reads the shared path).
+/// A pre-provisioned shared PVC, referenced by `claimName`. No side effects:
+/// the claim is minted once per env in [`create_shared_pvc`], and both sharing
+/// pods point at the same name. Mounted read-write (the writer pod owns the DB;
+/// the reader opens it as a RocksDB secondary, which only reads the path).
 fn resolve_shared(volume_name: &str, claim: &str, destination: &Path) -> ResolvedMount {
     ResolvedMount {
         volume: json!({
@@ -363,15 +355,15 @@ fn resolve_shared(volume_name: &str, claim: &str, destination: &Path) -> Resolve
     }
 }
 
-/// Provision one blank `ReadWriteOnce` PVC named `claim` in the test
-/// namespace, to be shared by two co-scheduled pods. Called once per
-/// shared volume during `TestEnv::build`, before any pod is created.
+/// Provision one blank `ReadWriteOnce` PVC named `claim` in the test namespace,
+/// to be shared by two co-scheduled pods. Called once per shared volume during
+/// `TestEnv::build`, before any pod is created.
 ///
-/// `storageClassName` is left unset so the cluster's default class
-/// provisions it (on kind that's the node-local `standard` class, which
-/// is RWO and lets two pods on the single node share it). Override with
-/// `ZAINO_SHARED_STORAGECLASS` if the default isn't suitable. The PVC is
-/// namespace-scoped, so namespace teardown reclaims it.
+/// `storageClassName` is left unset so the cluster's default class provisions
+/// it (on kind that's the node-local `standard` class, RWO, which lets two pods
+/// on the single node share it). Override with `ZAINO_SHARED_STORAGECLASS` if
+/// the default isn't suitable. The PVC is namespace-scoped, so namespace
+/// teardown reclaims it.
 pub(crate) async fn create_shared_pvc(
     client: &Client,
     sentinel: &Sentinel,

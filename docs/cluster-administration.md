@@ -1,7 +1,7 @@
 # Cluster Administration
 
 Bare-metal Kubernetes cluster hosting self-hosted GH Actions runners +
-the `zcash_kube_net` orchestrator. Optimized for low-maintenance on a
+the `ztest` orchestrator. Optimized for low-maintenance on a
 small team.
 
 Data plane in the cluster; management plane over Tailscale. No public
@@ -176,7 +176,7 @@ helm install zaino-runners \
 ```
 
 `containerMode.type=kubernetes` runs jobs as sibling pods via the kube
-API — not DinD. This is the model `zcash_kube_net` is built against.
+API — not DinD. This is the model `ztest` is built against.
 
 Token: GitHub App with `Actions: read+write` scoped to infrastructure +
 consuming repos. Rotated via External Secrets.

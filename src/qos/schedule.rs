@@ -1,17 +1,17 @@
-//! Pre-run scheduling **plan** for the preflight banner (`docs/qos-design.md`
-//! §8, planning half).
+//! Pre-run scheduling plan for the preflight banner (`docs/qos-design.md` §8,
+//! planning half).
 //!
-//! Distinct from [`super::scheduler`] (one letter apart, on purpose-adjacent):
-//! - `scheduler` is the broker's *live, authoritative* admission decision core
-//!   (one [`Request`](super::scheduler::Request) → fit/queue/reject).
-//! - `schedule` (this module) is a *static estimate* shown before the run: given
+//! Distinct from [`super::scheduler`] (one letter apart, deliberately):
+//! - `scheduler` is the broker's live, authoritative admission decision core
+//!   (one [`Request`](super::scheduler::Request) to fit/queue/reject).
+//! - `schedule` (this module) is a static estimate shown before the run: given
 //!   the selected tests grouped by tier and the probed cluster capacity, how
-//!   many concurrency **waves** will it take, what's the peak reserve, and does
-//!   any tier's footprint exceed the cluster outright (fail-fast)?
+//!   many concurrency waves it will take, the peak reserve, and whether any
+//!   tier's footprint exceeds the cluster outright (fail-fast).
 //!
-//! It is pure — `(tier counts, capacity) → plan` — so it's unit-testable
-//! without a cluster, and it consumes only what the `ztest run` parent already
-//! has in hand (the QoS inventory dump + the cluster probe). No I/O, no ledger.
+//! Pure: `(tier counts, capacity) -> plan`, so it's unit-testable without a
+//! cluster, and consumes only what the `ztest run` parent already has in hand
+//! (the QoS inventory dump + the cluster probe). No I/O, no ledger.
 
 use std::collections::BTreeMap;
 
@@ -29,9 +29,9 @@ pub struct TierPlan {
 /// The estimated schedule for the selected test set against probed capacity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QosPlan {
-    /// Per declared tier, highest priority first (`sync` → `basic`).
+    /// Per declared tier, highest priority first (`sync` down to `basic`).
     pub tiers: Vec<TierPlan>,
-    /// Σ over tiers of `count · footprint` — the reserve if everything ran at
+    /// Σ over tiers of `count · footprint`: the reserve if everything ran at
     /// once.
     pub total: Resources,
     /// Probed free capacity the plan was computed against; `None` when the
@@ -43,8 +43,8 @@ pub struct QosPlan {
     pub waves: u32,
     /// Per-dimension high-water reserve across waves (concurrency peak).
     pub peak: Resources,
-    /// Tiers whose single footprint doesn't fit even the empty cluster — they
-    /// will be **rejected** at admission (the broker's `ExceedsClusterCapacity`),
+    /// Tiers whose single footprint doesn't fit even the empty cluster; they
+    /// will be rejected at admission (the broker's `ExceedsClusterCapacity`),
     /// surfaced here so the operator sees it before launching.
     pub unschedulable: Vec<QosClass>,
 }
@@ -60,7 +60,7 @@ fn scaled(fp: Resources, n: u32) -> Resources {
 /// Compute the schedule estimate. `tier_counts` is the number of selected tests
 /// per declared tier; `free` is the probed cluster headroom (or `None`).
 pub fn plan(tier_counts: &BTreeMap<QosClass, u32>, free: Option<Resources>) -> QosPlan {
-    // Highest priority first (sync, testnet, integration, basic) — both for
+    // Highest priority first (sync, testnet, integration, basic), both for
     // display and so the wave sim admits high-priority tests first.
     let mut tiers: Vec<TierPlan> = tier_counts
         .iter()
@@ -73,9 +73,9 @@ pub fn plan(tier_counts: &BTreeMap<QosClass, u32>, free: Option<Resources>) -> Q
         .collect();
     tiers.sort_by_key(|t| std::cmp::Reverse(t.class.profile().priority));
 
-    let total = tiers
-        .iter()
-        .fold(Resources::ZERO, |acc, t| acc.saturating_add(&scaled(t.footprint, t.count)));
+    let total = tiers.iter().fold(Resources::ZERO, |acc, t| {
+        acc.saturating_add(&scaled(t.footprint, t.count))
+    });
 
     let mut unschedulable = Vec::new();
     let (waves, peak) = match free {
@@ -156,7 +156,10 @@ mod tests {
             None,
         );
         let order: Vec<QosClass> = p.tiers.iter().map(|t| t.class).collect();
-        assert_eq!(order, vec![QosClass::Sync, QosClass::Integration, QosClass::Basic]);
+        assert_eq!(
+            order,
+            vec![QosClass::Sync, QosClass::Integration, QosClass::Basic]
+        );
         // Zero-count tiers are omitted (testnet wasn't declared).
         assert!(!order.contains(&QosClass::Testnet));
     }

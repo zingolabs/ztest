@@ -8,7 +8,7 @@ macros resolve paths relative to `CARGO_MANIFEST_DIR` and **fail compilation** i
 ## At a glance
 
 ```rust
-use zcash_kube_net::prelude::*;
+use ztest::prelude::*;
 
 #[tokio::test]
 async fn zaino_indexes_to_validator_tip() {

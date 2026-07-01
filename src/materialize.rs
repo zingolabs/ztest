@@ -1,29 +1,27 @@
 //! Bring a `seed-{sha8}` PVC into existence and populate it from the
 //! local file system on first use.
 //!
-//! Single entry point: [`ensure_seed`]. Idempotent and race-safe — the
+//! Single entry point: [`ensure_seed`]. Idempotent and race-safe; the
 //! happy path on a warm cluster is two `GET`s.
 //!
-//! ## Strategy
+//! The heavy lifting is done by k8s and a one-shot uploader pod, not by us:
 //!
-//! Everything heavy is done by k8s + a one-shot uploader pod, not by us:
-//!
-//! 1. **Get-or-create** the seed PVC. A 409 means somebody else won the
-//!    race — fall through to wait-for-ready.
-//! 2. If we created it (or it exists but isn't `ready=true`) and there's
-//!    no in-flight uploader, **launch the uploader pod**. The pod runs
-//!    `tar -I zstd -xf - -C /seed` (or `cat > /seed/blob` for files)
-//!    with `stdin: true`, mounting the seed PVC.
-//! 3. **Attach to the pod's stdin** via `Api::<Pod>::attach` and stream
-//!    the local file. When stdin EOFs, the command finishes and the pod
+//! 1. Get-or-create the seed PVC. A 409 means somebody else won the race,
+//!    so fall through to wait-for-ready.
+//! 2. If we created it (or it exists but isn't `ready=true`) and there's no
+//!    in-flight uploader, launch the uploader pod. The pod runs
+//!    `tar -I zstd -xf - -C /seed` (or `cat > /seed/blob` for files) with
+//!    `stdin: true`, mounting the seed PVC.
+//! 3. Attach to the pod's stdin via `Api::<Pod>::attach` and stream the
+//!    local file. When stdin EOFs, the command finishes and the pod
 //!    transitions to `Succeeded`.
-//! 4. **Label** the PVC `seeds.zaino.io/ready=true` and **create the
-//!    paired `VolumeSnapshot`**. From here the lookup path in
-//!    `seeds::read_seed_handle` can resolve the CSI snapshot handle.
+//! 4. Label the PVC `seeds.zaino.io/ready=true` and create the paired
+//!    `VolumeSnapshot`. From here `seeds::read_seed_handle` can resolve the
+//!    CSI snapshot handle.
 //!
 //! Race losers (PVC already exists, not ours) poll the PVC for the
-//! `ready=true` label, then poll the snapshot for `status.readyToUse`.
-//! No leader election — `kubectl get pod` is the lock.
+//! `ready=true` label, then poll the snapshot for `status.readyToUse`. No
+//! leader election; `kubectl get pod` is the lock.
 
 use std::path::Path;
 use std::time::Duration;
@@ -42,7 +40,7 @@ use crate::seeds::{self, SEEDS_NAMESPACE, SeedHandle, volume_snapshot_gvk};
 const WAIT_INTERVAL: Duration = Duration::from_secs(2);
 const WAIT_BUDGET: Duration = Duration::from_secs(300);
 
-/// What we're loading. The choice drives the uploader command — archives
+/// What we're loading. The choice drives the uploader command: archives
 /// are extracted, files are copied byte-for-byte.
 #[derive(Debug, Clone, Copy)]
 pub enum Payload {
@@ -64,6 +62,12 @@ pub async fn ensure_seed(
     })?;
     let pvc_name = format!("seed-{sha8}");
 
+    // Fail fast on a cluster that can't back seeds at all, rather than
+    // creating an unschedulable PVC and polling out the full `WAIT_BUDGET`.
+    // The classic case is a stock kind cluster missing CSI snapshot
+    // support; the fix is a single `ztest setup`.
+    check_seed_support(client, source).await?;
+
     ensure_seeds_namespace(client).await?;
 
     let we_created = create_seed_pvc(client, &pvc_name).await?;
@@ -75,8 +79,8 @@ pub async fn ensure_seed(
                 create_volume_snapshot(client, &pvc_name).await?;
             }
             Ok(Err(e)) => return Err(e),
-            // Another process is materializing — wait it out in the
-            // poll loops below.
+            // Another process is materializing; wait it out in the poll
+            // loops below.
             Err(InFlight) => {
                 tracing::debug!(pvc = %pvc_name, "seed materialization in flight elsewhere; waiting");
             }
@@ -86,6 +90,63 @@ pub async fn ensure_seed(
     wait_pvc_ready(client, &pvc_name).await?;
     wait_snapshot_ready(client, &pvc_name).await?;
     seeds::read_seed_handle(client, source, &sha8).await
+}
+
+// ─────────────────────────── capability preflight ───────────────────
+
+/// Verify the cluster can actually back a seed before we create one.
+/// Without this, a stock kind cluster (no CSI snapshot support) accepts an
+/// unschedulable PVC and we burn the whole [`WAIT_BUDGET`] before failing
+/// with an opaque timeout. Here we surface the real cause (a missing
+/// StorageClass or VolumeSnapshotClass) in milliseconds, with a pointer to
+/// the fix.
+async fn check_seed_support(client: &Client, source: &Path) -> Result<(), EnvError> {
+    use k8s_openapi::api::storage::v1::StorageClass;
+
+    let sc_name = detect_storage_class();
+    let sc_api: Api<StorageClass> = Api::all(client.clone());
+    let sc_missing = match sc_api.get_opt(&sc_name).await {
+        Ok(opt) => opt.is_none(),
+        Err(_) => true,
+    };
+    if sc_missing {
+        return Err(unsupported(
+            source,
+            format!("StorageClass `{sc_name}` not found"),
+        ));
+    }
+
+    let vsc_name = detect_snapshot_class();
+    let gvk = kube::api::GroupVersionKind {
+        group: "snapshot.storage.k8s.io".into(),
+        version: "v1".into(),
+        kind: "VolumeSnapshotClass".into(),
+    };
+    let vsc_api: Api<DynamicObject> =
+        Api::all_with(client.clone(), &kube::api::ApiResource::from_gvk(&gvk));
+    // An `Err` here usually means the snapshot CRDs aren't installed at
+    // all (discovery fails); `Ok(None)` means the class is absent. Both
+    // mean "this cluster can't snapshot".
+    let vsc_missing = !matches!(vsc_api.get_opt(&vsc_name).await, Ok(Some(_)));
+    if vsc_missing {
+        return Err(unsupported(
+            source,
+            format!("VolumeSnapshotClass `{vsc_name}` / CSI snapshot support not found"),
+        ));
+    }
+    Ok(())
+}
+
+/// Build the "this cluster can't back seeds" error with a fix pointer.
+fn unsupported(source: &Path, what: String) -> EnvError {
+    EnvError::ArchiveMaterializeFailed {
+        archive: source.to_path_buf(),
+        reason: format!(
+            "{what} — this archive-backed test needs CSI snapshot support. \
+             On a local kind cluster run `ztest setup`; on a shared cluster \
+             check that the seed StorageClass / VolumeSnapshotClass are installed."
+        ),
+    }
 }
 
 // ─────────────────────────── namespace + PVC ────────────────────────
@@ -170,9 +231,9 @@ async fn mark_ready(client: &Client, pvc_name: &str) -> Result<(), EnvError> {
 
 // ─────────────────────────── uploader pod ───────────────────────────
 
-/// Sentinel error returned by `materialize` when the uploader pod
-/// already exists — i.e. another actor is uploading right now. Collapses
-/// to a "wait" branch in `ensure_seed`.
+/// Sentinel error returned by `materialize` when the uploader pod already
+/// exists (another actor is uploading right now). Collapses to a "wait"
+/// branch in `ensure_seed`.
 struct InFlight;
 
 async fn try_materialize(
@@ -207,19 +268,26 @@ async fn materialize(
     let pod_name = format!("uploader-{}", pvc_name.trim_start_matches("seed-"));
     let pods: Api<Pod> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
 
-    let pod_body = uploader_pod(&pod_name, pvc_name, payload);
+    let cmd = uploader_cmd(payload, source)?;
+    let pod_body = uploader_pod(&pod_name, pvc_name, &cmd);
     match pods.create(&PostParams::default(), &pod_body).await {
         Ok(_) => {}
-        // Another process beat us to launching the uploader — fall back
-        // to wait-for-ready.
+        // Another process beat us to launching the uploader; fall back to
+        // wait-for-ready.
         Err(kube::Error::Api(e)) if e.code == 409 => return Err(MaterializeErr::InFlight),
         Err(e) => return Err(MaterializeErr::Fatal(env_err(e))),
     }
 
     // 1. Wait for the container to be Running so the stdin attach works.
-    await_condition(pods.clone(), &pod_name, conditions::is_pod_running())
-        .await
-        .map_err(env_err)?;
+    //    Bounded: a wedged image pull would otherwise hang the whole test
+    //    until nextest's slow-timeout kills it.
+    tokio::time::timeout(
+        WAIT_BUDGET,
+        await_condition(pods.clone(), &pod_name, conditions::is_pod_running()),
+    )
+    .await
+    .map_err(|_| uploader_stuck(source, &pod_name))?
+    .map_err(env_err)?;
 
     // 2. Stream the local file into the pod's stdin. When we drop stdin,
     //    the command sees EOF and exits.
@@ -248,26 +316,110 @@ async fn materialize(
     stdin.shutdown().await.ok();
     drop(stdin);
 
-    // 3. Wait for the pod to finish successfully.
-    await_condition(pods.clone(), &pod_name, is_pod_succeeded())
-        .await
-        .map_err(env_err)?;
+    // 3. Wait for the pod to terminate (bounded), then distinguish success
+    //    from failure. A failed uploader (e.g. the image lacks the
+    //    decompressor `tar` needs) must surface its logs, not hang.
+    tokio::time::timeout(
+        WAIT_BUDGET,
+        await_condition(pods.clone(), &pod_name, is_pod_finished()),
+    )
+    .await
+    .map_err(|_| uploader_stuck(source, &pod_name))?
+    .map_err(env_err)?;
     let _ = attached.join().await;
-    // Best-effort cleanup — janitor backstops.
+    if pod_phase(&pods, &pod_name).await.as_deref() == Some("Failed") {
+        let logs = pods
+            .logs(&pod_name, &Default::default())
+            .await
+            .unwrap_or_else(|e| format!("<logs unavailable: {e}>"));
+        return Err(MaterializeErr::Fatal(EnvError::ArchiveMaterializeFailed {
+            archive: source.to_path_buf(),
+            reason: format!("uploader pod failed: {}", logs.trim()),
+        }));
+    }
+    // Best-effort cleanup; janitor backstops.
     let _ = pods.delete(&pod_name, &Default::default()).await;
     Ok(())
 }
 
-fn uploader_pod(name: &str, pvc_name: &str, payload: Payload) -> Pod {
-    let cmd = match payload {
-        // tar auto-detects the compressor from the archive's magic bytes
-        // (xz, zstd, gzip, …) — the uploader image must carry the matching
-        // binary on PATH; see `detect_uploader_image`.
-        Payload::Archive => "tar -xf - -C /seed",
-        // File path inside the PVC is always `/seed/blob` — `read_seed_handle`
+/// Error for an uploader that never reached a terminal state within the
+/// budget (typically a wedged image pull).
+fn uploader_stuck(source: &Path, pod: &str) -> MaterializeErr {
+    MaterializeErr::Fatal(EnvError::ArchiveMaterializeFailed {
+        archive: source.to_path_buf(),
+        reason: format!(
+            "uploader pod {pod} did not finish within {WAIT_BUDGET:?} \
+             (check `kubectl -n {SEEDS_NAMESPACE} describe pod {pod}` for image-pull/scheduling errors)"
+        ),
+    })
+}
+
+/// The shell command the uploader runs to populate `/seed` from the
+/// streamed bytes.
+///
+/// For archives we pass an explicit decompression flag chosen from the
+/// source's magic bytes: GNU tar can't auto-detect compression when reading
+/// from a non-seekable stdin pipe (it errors "Use -z/-J option"), which is
+/// exactly how the uploader feeds it. The matching decompressor must exist
+/// in the uploader image: the default base image carries only `gzip`, so
+/// gzip-compressed archives work out of the box; xz/zstd require a
+/// `ZAINO_UPLOADER_IMAGE` that bundles those binaries.
+fn uploader_cmd(payload: Payload, source: &Path) -> Result<String, EnvError> {
+    match payload {
+        Payload::Archive => {
+            let decomp = match archive_compression(source)? {
+                Compression::Gzip => "-z ",
+                Compression::Xz => "-J ",
+                Compression::Bzip2 => "-j ",
+                Compression::Zstd => "--zstd ",
+                Compression::None => "",
+            };
+            Ok(format!("tar {decomp}-xf - -C /seed"))
+        }
+        // File path inside the PVC is always `/seed/blob`; `read_seed_handle`
         // doesn't care, only the consumer's volumeMount path does.
-        Payload::File => "cat > /seed/blob",
-    };
+        Payload::File => Ok("cat > /seed/blob".to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Compression {
+    Gzip,
+    Xz,
+    Bzip2,
+    Zstd,
+    None,
+}
+
+/// Sniff the archive's compression from its leading magic bytes.
+fn archive_compression(source: &Path) -> Result<Compression, EnvError> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(source).map_err(|e| EnvError::ArchiveMaterializeFailed {
+        archive: source.to_path_buf(),
+        reason: format!("opening to sniff compression: {e}"),
+    })?;
+    let mut magic = [0u8; 6];
+    let n = f
+        .read(&mut magic)
+        .map_err(|e| EnvError::ArchiveMaterializeFailed {
+            archive: source.to_path_buf(),
+            reason: format!("reading magic bytes: {e}"),
+        })?;
+    let m = &magic[..n];
+    Ok(if m.starts_with(&[0x1f, 0x8b]) {
+        Compression::Gzip
+    } else if m.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        Compression::Xz
+    } else if m.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Compression::Zstd
+    } else if m.starts_with(b"BZh") {
+        Compression::Bzip2
+    } else {
+        Compression::None
+    })
+}
+
+fn uploader_pod(name: &str, pvc_name: &str, cmd: &str) -> Pod {
     let body = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -358,20 +510,36 @@ where
     }
 }
 
-/// `is_pod_succeeded` — like the built-in `is_pod_running`, but for the
-/// terminal success phase. Used to know when the uploader's `tar` exited 0.
-fn is_pod_succeeded() -> impl Condition<Pod> {
+/// True once a terminal phase is reached, success or failure. We then read
+/// the phase via [`pod_phase`] to tell the two apart, so a failed uploader
+/// surfaces its logs instead of waiting out the budget.
+fn is_pod_finished() -> impl Condition<Pod> {
     |p: Option<&Pod>| {
-        p.and_then(|p| p.status.as_ref())
-            .and_then(|s| s.phase.as_deref())
-            == Some("Succeeded")
+        matches!(
+            p.and_then(|p| p.status.as_ref())
+                .and_then(|s| s.phase.as_deref()),
+            Some("Succeeded") | Some("Failed")
+        )
     }
+}
+
+/// Current `status.phase` of a pod, if it can be read.
+async fn pod_phase(pods: &Api<Pod>, name: &str) -> Option<String> {
+    pods.get_opt(name)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|p| p.status)
+        .and_then(|s| s.phase)
 }
 
 // ─────────────────────────── config knobs ───────────────────────────
 
 fn detect_uploader_image() -> String {
-    // Needs `sh`, `tar`, and `zstd`. Ubuntu's slim variants ship all three.
+    // Needs `sh`, `tar`, and the decompressor matching the archive's
+    // compression (see `uploader_cmd`). The default ships `sh`/`tar`/`gzip`
+    // but not `xz`/`zstd`, so gzip archives work out of the box; for xz or
+    // zstd archives set `ZAINO_UPLOADER_IMAGE` to an image bundling those.
     std::env::var("ZAINO_UPLOADER_IMAGE").unwrap_or_else(|_| "ubuntu:24.04".into())
 }
 fn detect_storage_class() -> String {

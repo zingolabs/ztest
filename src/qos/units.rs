@@ -3,19 +3,19 @@
 //! Shared by the real store adapter ([`crate::qos::kube_store`], which
 //! synthesizes a Job's footprint) and the cluster probe
 //! ([`crate::pipeline::cluster`], which sums pod requests against node
-//! allocatable). One implementation, one set of tests — no per-consumer
-//! drift in how a `"500m"` / `"2Gi"` quantity or a pod's effective
-//! request is computed.
+//! allocatable). One implementation, one set of tests, so no per-consumer
+//! drift in how a `"500m"` / `"2Gi"` quantity or a pod's effective request is
+//! computed.
 
 use k8s_openapi::api::core::v1::{Container, PodSpec};
 
 use super::Resources;
 
-/// Parse a k8s CPU quantity to millicores. Handles `"500m"` → 500, `"2"` →
-/// 2000, `"1.5"` → 1500, and the rarer micro/nano suffixes (`"2500000n"` →
-/// 3, rounded up — conservative). An unrecognized form parses as 0; since
-/// 0 *under*-counts (the unsafe direction for capacity), the goal is to leave
-/// no realistic k8s unit unhandled.
+/// Parse a k8s CPU quantity to millicores. Handles `"500m"` = 500, `"2"` =
+/// 2000, `"1.5"` = 1500, and the rarer micro/nano suffixes (`"2500000n"` = 3,
+/// rounded up, conservative). An unrecognized form parses as 0; since 0
+/// under-counts (the unsafe direction for capacity), the goal is to leave no
+/// realistic k8s unit unhandled.
 pub(crate) fn parse_cpu_milli(s: &str) -> u64 {
     parse_cpu_milli_opt(s).unwrap_or(0)
 }
@@ -28,10 +28,13 @@ pub(crate) fn parse_cpu_milli(s: &str) -> u64 {
 /// form.
 pub(crate) fn parse_cpu_milli_opt(s: &str) -> Option<u64> {
     let s = s.trim();
-    // Float→int casts saturate in Rust (≥1.45): NaN→0, negatives→0,
-    // huge→u64::MAX — all safe, no panics.
+    // Float-to-int casts saturate in Rust (>=1.45): NaN and negatives to 0,
+    // huge to u64::MAX. No panics.
     let scaled = |body: &str, per_milli: f64| -> Option<u64> {
-        body.trim().parse::<f64>().ok().map(|v| (v / per_milli).round() as u64)
+        body.trim()
+            .parse::<f64>()
+            .ok()
+            .map(|v| (v / per_milli).round() as u64)
     };
     if let Some(n) = s.strip_suffix('m') {
         // Millicores are integers in valid k8s quantities.
@@ -42,7 +45,9 @@ pub(crate) fn parse_cpu_milli_opt(s: &str) -> Option<u64> {
         scaled(n, 1_000_000.0) // nanocores → millicores
     } else {
         // Bare cores, possibly fractional or exponent ("1.5", "2e0").
-        s.parse::<f64>().ok().map(|cores| (cores * 1000.0).round() as u64)
+        s.parse::<f64>()
+            .ok()
+            .map(|cores| (cores * 1000.0).round() as u64)
     }
 }
 
@@ -54,7 +59,7 @@ pub(crate) fn parse_mem_bytes(s: &str) -> u64 {
 }
 
 /// Like [`parse_mem_bytes`] but yields `None` on an unparseable quantity
-/// instead of `0` — see [`parse_cpu_milli_opt`] for the absent-vs-garbage
+/// instead of `0`; see [`parse_cpu_milli_opt`] for the absent-vs-garbage
 /// rationale.
 pub(crate) fn parse_mem_bytes_opt(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -105,17 +110,20 @@ pub(crate) fn container_requests(c: &Container) -> Resources {
         return Resources::ZERO;
     };
     let cpu = reqs.get("cpu").map(|q| parse_cpu_milli(&q.0)).unwrap_or(0);
-    let mem = reqs.get("memory").map(|q| parse_mem_bytes(&q.0)).unwrap_or(0);
+    let mem = reqs
+        .get("memory")
+        .map(|q| parse_mem_bytes(&q.0))
+        .unwrap_or(0);
     Resources::new(cpu, mem)
 }
 
-/// The effective resource *request* of a pod — the amount the k8s scheduler
+/// The effective resource request of a pod: the amount the k8s scheduler
 /// actually reserves (requests, not limits).
 ///
 /// Follows the Kubernetes effective-request model rather than a naive sum,
-/// because **native sidecars** (init containers with `restartPolicy: Always`,
-/// k8s ≥1.28) run for the whole pod lifetime and are resource-significant;
-/// ignoring them would under-count and risk overcommit:
+/// because native sidecars (init containers with `restartPolicy: Always`, k8s
+/// >=1.28) run for the whole pod lifetime and are resource-significant;
+/// > ignoring them would under-count and risk overcommit:
 ///
 /// ```text
 /// running   = Σ regular containers + Σ native-sidecar init containers
@@ -124,10 +132,9 @@ pub(crate) fn container_requests(c: &Container) -> Resources {
 /// ```
 pub(crate) fn pod_effective_requests(pod: &PodSpec) -> Resources {
     // Regular containers always run.
-    let mut running = pod
-        .containers
-        .iter()
-        .fold(Resources::ZERO, |acc, c| acc.saturating_add(&container_requests(c)));
+    let mut running = pod.containers.iter().fold(Resources::ZERO, |acc, c| {
+        acc.saturating_add(&container_requests(c))
+    });
 
     // Init containers, in order: native sidecars add permanently; plain init
     // containers contribute their transient peak (their own request plus the
@@ -178,7 +185,10 @@ mod tests {
         assert_eq!(parse_mem_bytes("1T"), 1_000_000_000_000);
         assert_eq!(parse_mem_bytes("1k"), 1_000);
         assert_eq!(parse_mem_bytes("129e6"), 129_000_000);
-        assert_eq!(parse_mem_bytes("1.5Gi"), 1024 * 1024 * 1024 + 512 * 1024 * 1024);
+        assert_eq!(
+            parse_mem_bytes("1.5Gi"),
+            1024 * 1024 * 1024 + 512 * 1024 * 1024
+        );
         assert_eq!(parse_mem_bytes("1048576"), 1_048_576);
         assert_eq!(parse_mem_bytes("nope"), 0);
     }
@@ -214,7 +224,10 @@ mod tests {
 
     #[test]
     fn effective_request_sums_regular_containers() {
-        let p = pod(vec![container("500m", "512Mi"), container("1", "1Gi")], vec![]);
+        let p = pod(
+            vec![container("500m", "512Mi"), container("1", "1Gi")],
+            vec![],
+        );
         let fp = pod_effective_requests(&p);
         assert_eq!(fp.cpu_milli, 1500);
         assert_eq!(fp.mem_bytes, 512 * 1024 * 1024 + GIB);
@@ -241,7 +254,13 @@ mod tests {
     #[test]
     fn empty_pod_and_requestless_containers_are_zero() {
         assert_eq!(pod_effective_requests(&PodSpec::default()), Resources::ZERO);
-        let bare = pod(vec![Container { name: "c".into(), ..Default::default() }], vec![]);
+        let bare = pod(
+            vec![Container {
+                name: "c".into(),
+                ..Default::default()
+            }],
+            vec![],
+        );
         assert_eq!(pod_effective_requests(&bare), Resources::ZERO);
     }
 }

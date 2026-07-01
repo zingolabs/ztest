@@ -1,15 +1,16 @@
 //! Synthesize the live QoS panel inputs each frame from the engine's own
-//! bookkeeping — no cluster poll. The in-memory [`Scheduler`](crate::qos::scheduler::Scheduler)
-//! is the ground truth, so this is more accurate than the Lease-ledger summary.
+//! bookkeeping, with no cluster poll. The in-memory
+//! [`Scheduler`](crate::qos::scheduler::Scheduler) is the ground truth, so this
+//! is more accurate than the Lease-ledger summary.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::engine::plan::WorkItem;
 use crate::engine::events::RunStats;
+use crate::engine::plan::WorkItem;
 use crate::preflight::RunProgress;
-use crate::qos::live::{LiveSnapshot, TierLive};
 use crate::qos::Resources;
+use crate::qos::live::{LiveSnapshot, TierLive};
 
 /// Fold the currently-running work-items into a [`LiveSnapshot`] for
 /// [`render_live_panel`](crate::preflight::render::render_live_panel).
@@ -71,17 +72,18 @@ mod tests {
             priority: p.priority,
             hard_cap: p.hard_cap,
             retries: 0,
+            deps: Vec::new(),
         }
     }
 
     #[test]
     fn folds_running_per_tier() {
-        let running = vec![
+        let running = [
             item(QosClass::Integration),
             item(QosClass::Integration),
             item(QosClass::Sync),
         ];
-        let committed = Resources::new(2_000 * 2 + 16_000, 0); // cpu only for the check
+        let committed = Resources::new(2_000 * 2 + 16_000, 0); // cpu-only for the check
         let snap = live_snapshot(running.iter(), committed, "ztest-local");
 
         let integ = &snap.running[&QosClass::Integration];

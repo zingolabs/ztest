@@ -15,10 +15,10 @@
   # `nix flake check`       — `cargo fmt` + `cargo clippy --all-targets -- -D warnings`
   # `nix fmt`               — format Nix files
   #
-  # The shell sets ROCKSDB_{LIB,INCLUDE}_DIR / LIBCLANG_PATH so
-  # `cargo build` works out of the box on NixOS. (Lightwalletd .proto
-  # bindings come from `zcash_client_backend::proto`, so no protoc /
-  # tonic-build is needed here anymore.)
+  # The shell sets ROCKSDB_{LIB,INCLUDE}_DIR / LIBCLANG_PATH / PROTOC so
+  # `cargo build` works out of the box on NixOS. ztest's build.rs generates
+  # the lightwalletd gRPC client from `proto/*.proto` via tonic-prost-build,
+  # so `protoc` is a build-time requirement (provided here).
   #
   # Local cluster bring-up (requires a Docker / Podman daemon — enable
   # `virtualisation.docker.enable = true` on NixOS first):
@@ -29,7 +29,7 @@
   #     kind delete cluster --name zkn
   #
   # The default kind cluster ships CoreDNS — pod-to-pod DNS by service
-  # name works out of the box, which is what zcash_kube_net relies on.
+  # name works out of the box, which is what ztest relies on.
   #
   # OpenShift Local (CRC) bring-up — for tests that need the OpenShift API
   # surface (Routes, SCCs, ClusterOperators, OperatorHub) rather than plain
@@ -65,6 +65,9 @@
           # Sets LIBCLANG_PATH so librocksdb-sys's bindgen finds libclang
           # without dragging an unpinned LLVM into PATH.
           rustPlatform.bindgenHook
+          # protoc for ztest's build.rs (tonic-prost-build codegen of the
+          # vendored lightwalletd proto). PROTOC is set in `env` below.
+          protobuf
           cargo-nextest
           cargo-deny
           rust-analyzer
@@ -96,6 +99,8 @@
           # wrapper).
           ROCKSDB_LIB_DIR = "${pkgs.rocksdb_8_11}/lib";
           ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb_8_11}/include";
+          # Pin protoc for tonic-prost-build so build.rs doesn't probe PATH.
+          PROTOC = "${pkgs.protobuf}/bin/protoc";
         };
       in
       {

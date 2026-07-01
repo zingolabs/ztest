@@ -1,33 +1,23 @@
-//! Phase B — `cargo nextest list`, two-step.
+//! Phase B: `cargo nextest list`, run in two passes.
 //!
-//! Splitting the inventory work into two cargo invocations is the
-//! pragmatic compromise between "show the user cargo's compile output"
-//! and "parse a stable JSON test list":
+//! Two cargo invocations are the compromise between showing the user cargo's
+//! compile output and parsing a stable JSON test list:
 //!
-//! 1. **Compile pass**: `cargo nextest list [args]` with stderr
-//!    inherited and stdout discarded. Cargo's stderr (`Fetching`,
-//!    `Compiling foo v0.1.0`, warnings, errors) flows directly to
-//!    the user's terminal — which is exactly what they want to see
-//!    while the test binaries build. The stdout text listing is
-//!    thrown away to keep the scroll region clean.
+//! 1. Compile pass: `cargo nextest list [args]` with stderr inherited and
+//!    stdout discarded. Cargo's stderr (`Fetching`, `Compiling foo`, warnings,
+//!    errors) flows to the terminal while test binaries build; the stdout text
+//!    listing is discarded to keep the scroll region clean.
+//! 2. Index pass: `cargo nextest list --message-format=json [args]` with stdout
+//!    piped and stderr discarded. The compile cache is warm from pass 1 so this
+//!    is sub-second (and JSON mode emits no progress). We parse the JSON for the
+//!    resolved test selection.
 //!
-//! 2. **Index pass**: `cargo nextest list --message-format=json [args]`
-//!    with stdout piped and stderr discarded. The compile cache is
-//!    warm from pass 1 so this is sub-second; cargo emits no progress
-//!    in `--message-format=json` mode anyway. We parse the JSON to
-//!    extract the resolved test selection.
+//! On warm caches pass 1 is silent too. The banner's `Inventory` row carries the
+//! rolled-up status either way.
 //!
-//! On warm caches pass 1 is silent too — cargo has nothing to compile
-//! and metadata resolution doesn't produce stderr. The banner's
-//! `Inventory` row carries the rolled-up status either way.
-//!
-//! ## Event timeline
-//!
-//! - [`Event::BuildStarted`] — emitted at function entry, before pass 1.
-//! - [`Event::BuildIndexing`] — emitted between passes, after pass 1 OK.
-//! - [`Event::BuildComplete`] — emitted on pass 2 OK with counts.
-//! - [`Event::BuildFailed`] — emitted on either pass non-zero exit, with
-//!   the [`BuildStage`] indicating which pass failed.
+//! Event timeline: [`Event::BuildStarted`] at entry, [`Event::BuildIndexing`]
+//! between passes, [`Event::BuildComplete`] on pass 2 OK with counts,
+//! [`Event::BuildFailed`] on either pass's non-zero exit (with the [`BuildStage`]).
 
 use std::process::Stdio;
 
@@ -40,13 +30,12 @@ use crate::preflight::BuildStage;
 
 use super::events::{Event, EventTx};
 
-/// Run the two-step `cargo nextest list` pipeline and emit lifecycle
-/// [`Event`]s.
+/// Run the two-pass `cargo nextest list` pipeline and emit lifecycle [`Event`]s.
 ///
-/// When `lines` is `Some`, pass 1's stderr is piped and each line is forwarded
-/// there (so the unified bottom console can relay `Compiling …` into native
-/// scrollback above its panel); when `None`, stderr is inherited as before
-/// (the non-TTY / linear path). The JSON pass is always captured.
+/// When `lines` is `Some`, pass 1's stderr is piped and each line forwarded there
+/// (so the unified bottom console can relay `Compiling …` into scrollback above
+/// its panel); when `None`, stderr is inherited (the non-TTY / linear path). The
+/// JSON pass is always captured.
 pub async fn run(
     list_args: &[String],
     tx: &EventTx,
@@ -55,15 +44,14 @@ pub async fn run(
     let _ = tx.send(Event::BuildStarted);
 
     // `list_args` is already the `cargo nextest list` argv: the caller
-    // (`cli::run::RunOptions`) extracted the engine-owned run-behavior flags
-    // (`--retries`, `--no-fail-fast`, `--no-cleanup`, …) that `list` would reject
-    // and left the selection / filter / build flags untouched.
+    // (`cli::run::RunOptions`) stripped the engine-owned run-behavior flags
+    // (`--retries`, `--no-fail-fast`, `--no-cleanup`, …) that `list` would reject,
+    // leaving the selection / filter / build flags.
 
-    // ───── Pass 1: chatty compile ─────
-    // Cargo's stderr (`Fetching`, `Compiling foo`, warnings, errors) is what the
-    // user watches while test binaries build. stdout=null drops the
-    // human-readable test listing. With `lines` set we pipe stderr and relay it
-    // line-by-line into the console's scrollback; otherwise it's inherited.
+    // Pass 1: chatty compile. Cargo's stderr is what the user watches while test
+    // binaries build; stdout=null drops the human-readable listing. With `lines`
+    // set we pipe stderr and relay it line-by-line into scrollback; otherwise it's
+    // inherited.
     let pass1 = if let Some(lines) = lines {
         let mut child = Command::new("cargo")
             .arg("nextest")
@@ -125,11 +113,11 @@ pub async fn run(
     Ok(outcome)
 }
 
-/// Pass 2 — the silent JSON inventory parse. stdout is piped (we capture the
+/// Pass 2: the silent JSON inventory parse. stdout is piped (we capture the
 /// JSON); stderr is dropped (`--message-format=json` suppresses progress and the
-/// compile cache is warm from pass 1). Returns [`BuildOutcome::Ok`] with the
-/// resolved selection, [`BuildOutcome::Failed`] on a non-zero exit, or `Err` on
-/// unparseable JSON.
+/// cache is warm from pass 1). Returns [`BuildOutcome::Ok`] with the resolved
+/// selection, [`BuildOutcome::Failed`] on non-zero exit, or `Err` on unparseable
+/// JSON.
 pub async fn index(list_args: &[String]) -> std::io::Result<BuildOutcome> {
     let pass2 = Command::new("cargo")
         .arg("nextest")
@@ -164,15 +152,15 @@ pub async fn index(list_args: &[String]) -> std::io::Result<BuildOutcome> {
     })
 }
 
-/// Walk the resolved test list once, picking out the binaries with ≥1 selected
-/// test (and their selected test names) plus the total selected-test count.
+/// Walk the resolved test list once, picking out the binaries with at least one
+/// selected test (and their selected test names) plus the total selected-test
+/// count.
 ///
-/// A test case is *selected* when its `filter_match` `is_match`; tests filtered
-/// out are present in the JSON but flagged non-matching. The binary count is
-/// simply the number of returned binaries (empty suites are dropped), so the
-/// caller derives it from the vec rather than a second pass. Each binary carries
-/// the `cwd` nextest reports so the inventory-dump subprocess inherits the right
-/// working directory, and the `<bin> --exact <name>` targets the engine runs.
+/// A test case is selected when its `filter_match` `is_match`; filtered-out tests
+/// are present in the JSON but flagged non-matching. Empty suites are dropped, so
+/// the caller derives the binary count from the vec. Each binary carries the
+/// `cwd` nextest reports (so the inventory-dump subprocess inherits the right
+/// working directory) and the `<bin> --exact <name>` targets the engine runs.
 fn summarize_selection(summary: &TestListSummary) -> (usize, Vec<SelectedBinary>) {
     let mut test_count = 0;
     let mut binaries = Vec::new();
@@ -197,22 +185,22 @@ fn summarize_selection(summary: &TestListSummary) -> (usize, Vec<SelectedBinary>
     (test_count, binaries)
 }
 
-/// Outcome of one Phase-B run, used by `ztest run` to decide whether
-/// to proceed to the cargo-nextest-run step.
+/// Outcome of one Phase-B run, used by `ztest run` to decide whether to proceed
+/// to the run step.
 #[derive(Debug, Clone)]
 pub enum BuildOutcome {
     Ok {
         test_count: usize,
         binary_count: usize,
-        /// Test binaries with at least one selected test, in the order
-        /// nextest reported them. The image-inventory phase spawns each
-        /// of these with `ZTEST_DUMP_INVENTORY=1`.
+        /// Test binaries with at least one selected test, in the order nextest
+        /// reported them. The image-inventory phase spawns each with
+        /// `ZTEST_DUMP_INVENTORY=1`.
         selected_binaries: Vec<SelectedBinary>,
-        /// The full parsed `cargo nextest list` summary. The engine
+        /// Full parsed `cargo nextest list` summary. The engine
         /// (`engine::nextest`) reconstructs an owned `TestList` from it
-        /// (`TestList::from_summary`) to resolve per-test nextest config
-        /// (retries, slow-timeout) and to drive nextest's reporter. Boxed
-        /// because the summary dwarfs the other fields.
+        /// (`TestList::from_summary`) to resolve per-test config (retries,
+        /// slow-timeout) and drive nextest's reporter. Boxed because it dwarfs
+        /// the other fields.
         summary: Box<TestListSummary>,
     },
     Failed {
@@ -221,23 +209,22 @@ pub enum BuildOutcome {
     },
 }
 
-/// One test binary with at least one selected test. Carries the
-/// information the image-inventory phase needs to spawn the dump.
+/// One test binary with at least one selected test. Carries what the
+/// image-inventory phase needs to spawn the dump.
 #[derive(Debug, Clone)]
 pub struct SelectedBinary {
     /// Absolute path to the test binary on disk.
     pub binary_path: std::path::PathBuf,
-    /// Working directory nextest would run this binary in. Used so
-    /// the `dev!` macro's compile-time absolute paths and the
-    /// dump-time `current_dir` agree.
+    /// Working directory nextest would run this binary in. Keeps the `dev!`
+    /// macro's compile-time absolute paths and the dump-time `current_dir` in
+    /// agreement.
     pub cwd: std::path::PathBuf,
-    /// Nextest's binary identifier — `<package>::<bin>` shape. Also the key
-    /// the QoS dump (`pipeline::images::discover`) is grouped by, so the engine
-    /// can match a test's tier to its binary.
+    /// Nextest's binary identifier (`<package>::<bin>`). Also the key the QoS
+    /// dump (`pipeline::images::discover`) groups by, so the engine can match a
+    /// test's tier to its binary.
     pub binary_id: String,
-    /// Names of the selected tests in this binary (`filter_match` true) — the
-    /// `<bin> --exact <name>` targets. Populated for the engine
-    /// (`src/engine`); the nextest path ignores it.
+    /// Selected test names in this binary (`filter_match` true): the
+    /// `<bin> --exact <name>` targets. Populated for the engine (`src/engine`);
+    /// the nextest path ignores it.
     pub selected_tests: Vec<String>,
 }
-

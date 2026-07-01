@@ -1,85 +1,79 @@
 //! Version-aware regtest config generators.
 //!
-//! Renders `zcashd.conf` and `zebrad.toml` as strings, parameterised by
-//! the binary version so callers can declare `Validator::zcashd("6.1.0")`
-//! / `Validator::zebrad("5.1.1")` and get a conf the pod's binary will
-//! actually accept.
+//! Renders `zcashd.conf` and `zebrad.toml`, parameterised by the binary
+//! version so callers can declare `Validator::zcashd("6.1.0")` /
+//! `Validator::zebrad("5.1.1")` and get a conf the pod's binary accepts.
 //!
-//! Layout (field order, comments, branch-id table) seeded from
-//! `infrastructure/zcash_local_net/src/config.rs`; ownership is local so
-//! we can:
+//! Layout (field order, comments, branch-id table) is seeded from
+//! `infrastructure/zcash_local_net/src/config.rs`; ownership is local so we
+//! can:
 //!
 //!  - gate per-NU `nuparams` and TOML stanzas behind release predicates
-//!    (e.g. NU6.1 / NU6.2 are emitted only on binaries that recognise
-//!    those branch IDs — older binaries reject `nuparams=4dec4df0:…`
-//!    outright and refuse to start);
-//!  - return a `String` so the result can land in a Kubernetes ConfigMap
-//!    via [`MountSource::ConfigInline`](crate::mount::MountSource), with
-//!    no on-disk fixture file in the loop;
-//!  - apply pod-shaped defaults (`rpcbind=0.0.0.0`,
-//!    `rpcallowip=0.0.0.0/0`, `rpcuser=test` / `rpcpassword=test`)
-//!    that match the JsonRpcClient credentials in
-//!    `handles/backends/zcashd.rs::{RPC_USER, RPC_PASSWORD}`.
+//!    (NU6.1 / NU6.2 are emitted only on binaries that recognise those
+//!    branch IDs; older binaries reject `nuparams=4dec4df0:...` outright
+//!    and refuse to start);
+//!  - return a `String` so the result lands in a Kubernetes ConfigMap via
+//!    [`MountSource::ConfigInline`](crate::mount::MountSource), with no
+//!    on-disk fixture file;
+//!  - apply pod-shaped defaults (`rpcbind=0.0.0.0`, `rpcallowip=0.0.0.0/0`,
+//!    `rpcuser=test` / `rpcpassword=test`) matching the JsonRpcClient
+//!    credentials in `handles/backends/zcashd.rs::{RPC_USER, RPC_PASSWORD}`.
 //!
-//! ### Adding a new release
-//!
-//! Two-step: add a `pub const` for the release in the `versions`
-//! sub-module, and add a predicate method on [`Semver`] (or extend an
-//! existing one) that switches on it. The generator functions are
-//! agnostic — they only call predicates. Snapshot tests at the bottom
-//! of this file cover the per-version output.
+//! To add a release: add a `pub const` in the `versions` sub-module, and a
+//! predicate method on [`Semver`] (or extend an existing one) that switches
+//! on it. The generator functions only call predicates. Snapshot tests at
+//! the bottom cover the per-version output.
 
 use std::fmt;
 use std::str::FromStr;
 
-use zingo_common_components::protocol::ActivationHeights;
+use crate::topology::ActivationHeights;
 
 use crate::regtest::{FundingStreams, LockboxDisbursement};
 
 // ─────────────────────────── canonical addresses ──────────────────────
 //
-// Hardcoded for the regtest fixture. Two distinct roles — keep them in
-// two distinct constants so the type system can't conflate them.
+// Hardcoded for the regtest fixture. Two distinct roles kept in two
+// distinct constants so the type system can't conflate them.
 
-/// Miner coinbase recipient. Must be **P2PKH** (`tm…`) — zcashd rejects
-/// P2SH at the `-mineraddress=` parser. Derived from the canonical
-/// `abandon abandon … art` regtest seed; mirrors
+/// Miner coinbase recipient. Must be P2PKH (`tm...`): zcashd rejects P2SH
+/// at the `-mineraddress=` parser. Derived from the canonical
+/// `abandon abandon ... art` regtest seed; mirrors
 /// `infrastructure/zingo_test_vectors::REG_T_ADDR_FROM_ABANDONART`.
 pub const MINER_ADDRESS: &str = "tmBsTi2xWTjUdEXnuTceL7fecEQKeWaPDJd";
 
-/// Shielded (Sapling) miner coinbase recipient — the canonical
-/// `abandon … art` regtest seed's sapling address (mirrors
-/// `infrastructure/zingo_test_vectors::REG_Z_ADDR_FROM_ABANDONART`), so it
-/// pins the coinbase to the Sapling pool. Valid at heights at/after Sapling
-/// activation.
+/// Shielded (Sapling) miner coinbase recipient: the canonical
+/// `abandon ... art` regtest seed's sapling address (mirrors
+/// `infrastructure/zingo_test_vectors::REG_Z_ADDR_FROM_ABANDONART`),
+/// pinning the coinbase to the Sapling pool. Valid at heights at/after
+/// Sapling activation.
 pub const SHIELDED_MINER_ADDRESS: &str =
     "zregtestsapling1fmq2ufux3gm0v8qf7x585wj56le4wjfsqsj27zprjghntrerntggg507hxh2ydcdkn7sx8kya7p";
 
-/// Orchard miner coinbase recipient — a regtest **unified address**
-/// (`uregtest1…`) with an Orchard receiver, under the canonical
-/// `abandon … art` seed (mirrors
+/// Orchard miner coinbase recipient: a regtest unified address
+/// (`uregtest1...`) with an Orchard receiver, under the canonical
+/// `abandon ... art` seed (mirrors
 /// `infrastructure/zingo_test_vectors::REG_O_ADDR_FROM_ABANDONART`).
 ///
 /// A coinbase builder fills a unified address's receivers in the order
-/// orchard → sapling → transparent, paying the highest-priority receiver
-/// whose pool is active at the mined height, so this address pins the
-/// coinbase to the Orchard pool once NU5 is active (it falls back to the
-/// sapling receiver below NU5). Only valid at heights at/after NU5
-/// activation — see [`CoinbasePool`].
+/// orchard, sapling, transparent, paying the highest-priority receiver
+/// whose pool is active at the mined height. This address pins the
+/// coinbase to the Orchard pool once NU5 is active (falling back to the
+/// sapling receiver below NU5). Valid only at heights at/after NU5
+/// activation; see [`CoinbasePool`].
 pub const ORCHARD_MINER_ADDRESS: &str = "uregtest1zkuzfv5m3yhv2j4fmvq5rjurkxenxyq8r7h4daun2zkznrjaa8ra8asgdm8wwgwjvlwwrxx7347r8w0ee6dqyw4rufw4wg9djwcr6frzkezmdw6dud3wsm99eany5r8wgsctlxquu009nzd6hsme2tcsk0v3sgjvxa70er7h27z5epr67p5q767s2z5gt88paru56mxpm6pwz0cu35m";
 
-/// NU6.1 lockbox-disbursement recipient. Must be **P2SH** (`t2…`) —
-/// zebrad's `subsidy_is_valid` asserts `addr.is_script_hash()` here.
-/// Pair with the lockbox-disbursement TOML stanza emitted by
-/// [`zebrad_conf`].
+/// NU6.1 lockbox-disbursement recipient. Must be P2SH (`t2...`): zebrad's
+/// `subsidy_is_valid` asserts `addr.is_script_hash()` here. Pair with the
+/// lockbox-disbursement TOML stanza emitted by [`zebrad_conf`].
 pub const LOCKBOX_ADDRESS: &str = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8";
 
 // ───────────────────────────── version model ──────────────────────────
 //
-// Semver tuple + named release constants + capability predicates. The
-// generator functions never compare versions directly — they call a
-// named predicate, so adding a new feature gate is one constant + one
-// predicate, and the search "what does this gate control?" is grep-able.
+// Semver tuple, named release constants, capability predicates. The
+// generator functions never compare versions directly; they call a named
+// predicate, so adding a feature gate is one constant plus one predicate,
+// and "what does this gate control?" stays grep-able.
 
 /// Semantic version `MAJOR.MINOR.PATCH`. Compared lexicographically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -142,9 +136,9 @@ impl FromStr for Semver {
     }
 }
 
-/// Named release constants — extend when a new pod image lands. The
-/// numeric value of each constant matters: capability predicates
-/// compare `Semver` lexicographically against these.
+/// Named release constants; extend when a new pod image lands. The numeric
+/// value of each constant matters: capability predicates compare `Semver`
+/// lexicographically against these.
 pub mod versions {
     use super::Semver;
 
@@ -155,8 +149,8 @@ pub mod versions {
     ///
     /// `v6.20.0` is verified to start cleanly with both the `4dec4df0`
     /// (NU6.1) and `5437f330` (NU6.2) nuparams; earlier images may also
-    /// support them but are unverified. This must be ≤ the version a
-    /// wallet test launches when it relies on NU6.1/NU6.2 being active.
+    /// support them but are unverified. Must be <= the version a wallet
+    /// test launches when it relies on NU6.1/NU6.2 being active.
     pub const ZCASHD_NU6_1: Semver = Semver {
         major: 6,
         minor: 20,
@@ -164,7 +158,7 @@ pub mod versions {
     };
 
     /// First zcashd release that recognises the NU6.2 branch ID
-    /// (`5437f330`). See [`ZCASHD_NU6_1`] — `v6.20.0` is verified.
+    /// (`5437f330`). See [`ZCASHD_NU6_1`]; `v6.20.0` is verified.
     pub const ZCASHD_NU6_2: Semver = Semver {
         major: 6,
         minor: 20,
@@ -174,10 +168,10 @@ pub mod versions {
     // ─── zebrad ───
     /// First zebrad release with NU6.1 testnet activation support.
     ///
-    /// Set to `1.0.0` — NU6.1 support predates every zebrad release we
-    /// support running, so the gate is dormant for now. Bump this if a
-    /// future zebrad ships an incompatible schema change for the
-    /// activation-height key (e.g. renaming `"NU6.1"`).
+    /// Set to `1.0.0`: NU6.1 support predates every zebrad release we run,
+    /// so the gate is dormant for now. Bump this if a future zebrad ships
+    /// an incompatible schema change for the activation-height key (e.g.
+    /// renaming `"NU6.1"`).
     pub const ZEBRAD_NU6_1: Semver = Semver {
         major: 1,
         minor: 0,
@@ -223,13 +217,13 @@ impl Semver {
 
 /// Render the regtest `zcashd.conf` for a given binary version.
 ///
-/// `rpc_port` is the port zcashd will listen on inside the pod (the
-/// `rpcport=` line). Activation heights come from
+/// `rpc_port` is the port zcashd listens on inside the pod (the `rpcport=`
+/// line). Activation heights come from
 /// [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights).
 ///
 /// Lines gated by version (see [`Semver`] predicates):
-///  - `nuparams=4dec4df0:…` (NU6.1) — only on `zcashd_supports_nu6_1`.
-///  - `nuparams=5437f330:…` (NU6.2) — only on `zcashd_supports_nu6_2`.
+///  - `nuparams=4dec4df0:...` (NU6.1), only on `zcashd_supports_nu6_1`.
+///  - `nuparams=5437f330:...` (NU6.2), only on `zcashd_supports_nu6_2`.
 ///
 /// Always emitted: regtest=1, pre-NU6 nuparams, txindex/insightexplorer,
 /// `lightwalletd=1`, RPC auth (`test`/`test`), `listen=0`,
@@ -240,12 +234,12 @@ pub fn zcashd_conf(
     rpc_port: u16,
     miner_address: &str,
 ) -> String {
-    // One `nuparams=<branch-id>:<height>` line per *activated* upgrade.
-    // A `None` height means the topology ceiling excluded that upgrade
-    // (see `topology::activation_heights_for_ceiling`), so the line is
-    // omitted rather than fed a value — zcashd is never handed an upgrade
-    // absent from the chain it's configured for. NU6.1/NU6.2 additionally
-    // require a zcashd build that understands them (`zcashd_supports_*`).
+    // One `nuparams=<branch-id>:<height>` line per activated upgrade. A
+    // `None` height means the topology ceiling excluded that upgrade (see
+    // `topology::activation_heights_for_ceiling`), so the line is omitted
+    // rather than fed a value: zcashd is never handed an upgrade absent
+    // from the chain it's configured for. NU6.1/NU6.2 additionally require
+    // a zcashd build that understands them (`zcashd_supports_*`).
     let nuparams: [(&str, &str, Option<u32>); 9] = [
         ("5ba81b19", "Overwinter", activation.overwinter()),
         ("76b809bb", "Sapling", activation.sapling()),
@@ -257,12 +251,16 @@ pub fn zcashd_conf(
         (
             "4dec4df0",
             "NU6_1",
-            activation.nu6_1().filter(|_| version.zcashd_supports_nu6_1()),
+            activation
+                .nu6_1()
+                .filter(|_| version.zcashd_supports_nu6_1()),
         ),
         (
             "5437f330",
             "NU6_2",
-            activation.nu6_2().filter(|_| version.zcashd_supports_nu6_2()),
+            activation
+                .nu6_2()
+                .filter(|_| version.zcashd_supports_nu6_2()),
         ),
     ];
     let mut nuparams_lines = String::new();
@@ -314,19 +312,6 @@ minetolocalwallet=0
 
 // ─────────────────────────────── zebrad ───────────────────────────────
 
-/// Render the regtest `zebrad.toml` for a given binary version.
-///
-/// `rpc_port` is the JSON-RPC listen port. `network_listen_port` and
-/// `health_listen_port` are kept at well-known regtest defaults if the
-/// caller passes `0` — zebrad happily binds to an ephemeral port for
-/// those.
-///
-/// Lines gated by version:
-///  - `[network.testnet_parameters.activation_heights]."NU6.1"` /
-///    `"NU6.2"` entries — only on `zebrad_supports_nu6_*`.
-///  - Lockbox disbursements / post-NU6 funding streams — always
-///    emitted when supplied; the schema is stable across zebrad
-///    versions that support NU6.1 at all.
 /// Persistent on-disk state for a zebrad that shares its zebra-state DB
 /// with a colocated zaino StateService (see `TestEnv::shared_volume`).
 /// When passed, zebrad persists its state to `cache_dir` (instead of the
@@ -337,12 +322,25 @@ minetolocalwallet=0
 pub struct ZebradPersistentState<'a> {
     pub cache_dir: &'a str,
     /// Indexer gRPC port for a colocated StateService syncer. `None`
-    /// persists state to `cache_dir` without serving the indexer gRPC —
+    /// persists state to `cache_dir` without serving the indexer gRPC:
     /// the chain-cache case, where state is loaded from an archive and no
     /// StateService shares the DB.
     pub indexer_listen_port: Option<u16>,
 }
 
+/// Render the regtest `zebrad.toml` for a given binary version.
+///
+/// `rpc_port` is the JSON-RPC listen port. `p2p_listen_port` stays at the
+/// well-known regtest default if the caller passes `0`; zebrad then binds to
+/// an ephemeral port.
+///
+/// Lines gated by version:
+///
+///  - `[network.testnet_parameters.activation_heights]."NU6.1"` /
+///    `"NU6.2"` entries, only on `zebrad_supports_nu6_*`.
+///  - Lockbox disbursements and post-NU6 funding streams, always emitted
+///    when supplied; the schema is stable across zebrad versions that
+///    support NU6.1 at all.
 #[allow(clippy::too_many_arguments)]
 pub fn zebrad_conf(
     version: Semver,
@@ -427,7 +425,7 @@ miner_address = \"{miner_address}\""
     );
 
     // The `[network.testnet_parameters.activation_heights]` table: one
-    // `<Key> = <height>` entry per *activated* upgrade. A `None` height
+    // `<Key> = <height>` entry per activated upgrade. A `None` height
     // means the topology ceiling excluded that upgrade (see
     // `topology::activation_heights_for_ceiling`), so the entry is omitted
     // rather than fed a value. NU6.1/NU6.2 additionally require a zebrad
@@ -439,11 +437,15 @@ miner_address = \"{miner_address}\""
         ("NU6", activation.nu6()),
         (
             "\"NU6.1\"",
-            activation.nu6_1().filter(|_| version.zebrad_supports_nu6_1()),
+            activation
+                .nu6_1()
+                .filter(|_| version.zebrad_supports_nu6_1()),
         ),
         (
             "\"NU6.2\"",
-            activation.nu6_2().filter(|_| version.zebrad_supports_nu6_2()),
+            activation
+                .nu6_2()
+                .filter(|_| version.zebrad_supports_nu6_2()),
         ),
     ];
     for (key, height) in activation_entries {
@@ -495,17 +497,16 @@ miner_address = \"{miner_address}\""
 
 /// Render `zainod.toml` for a regtest pod.
 ///
-/// Mirrors [`crate::testnet_conf::testnet_zainod_conf`]; the only
-/// semantic difference is `network = 'Regtest'`. `backend` picks fetch
-/// vs. state (single-line difference in the TOML; kept typed so the
-/// call site records intent). `grpc_listen_port` and
-/// `jsonrpc_listen_port` are zainod's own listeners. `validator_host`
-/// is the in-cluster DNS name of the paired validator pod and
-/// `validator_rpc_port` its JSON-RPC port. `zebra_db_path` and
-/// `zaino_db_path` are container-side paths the snapshot / scratch
-/// mounts land at.
+/// Mirrors [`crate::testnet_conf::testnet_zainod_conf`]; the only semantic
+/// difference is `network = 'Regtest'`. `backend` picks fetch vs. state (a
+/// single-line difference in the TOML, kept typed so the call site records
+/// intent). `grpc_listen_port` and `jsonrpc_listen_port` are zainod's own
+/// listeners. `validator_host` is the in-cluster DNS name of the paired
+/// validator pod and `validator_rpc_port` its JSON-RPC port.
+/// `zebra_db_path` and `zaino_db_path` are container-side paths the
+/// snapshot / scratch mounts land at.
 ///
-/// No version gates fire yet — the `_version` parameter is plumbed so a
+/// No version gates fire yet: the `_version` parameter is plumbed so a
 /// future schema change is one predicate away, matching `zebrad_conf` /
 /// `zcashd_conf` / `testnet_zainod_conf`.
 #[allow(clippy::too_many_arguments)]
@@ -623,8 +624,8 @@ mod tests {
 
     #[test]
     fn zebrad_v5_1_1_emits_nu6_1_activation_heights() {
-        // zebrad 5.1.1 is well past the NU6.1 cutoff (gate is dormant
-        // at version 1.0.0), so NU6.1 lands in the rendered TOML.
+        // zebrad 5.1.1 is well past the NU6.1 cutoff (gate is dormant at
+        // version 1.0.0), so NU6.1 lands in the rendered TOML.
         let v: Semver = "5.1.1".parse().unwrap();
         let toml = zebrad_conf(
             v,
@@ -647,7 +648,7 @@ mod tests {
 
     #[test]
     fn zebrad_pre_nu6_1_version_omits_nu6_1() {
-        // Synthetic pre-1.0 build — exercises the version gate so the
+        // Synthetic pre-1.0 build: exercises the version gate so the
         // predicate doesn't bit-rot if `ZEBRAD_NU6_1` is later bumped.
         let v: Semver = "0.5.0".parse().unwrap();
         let toml = zebrad_conf(
@@ -724,7 +725,7 @@ mod tests {
     #[test]
     fn zebrad_conf_chain_cache_persists_without_indexer() {
         // The chain-cache path persists state to load a pre-mined chain
-        // but runs no StateService, so it must NOT emit the indexer line.
+        // but runs no StateService, so it must not emit the indexer line.
         let v: Semver = "5.1.1".parse().unwrap();
         let toml = zebrad_conf(
             v,

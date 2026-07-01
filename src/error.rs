@@ -69,11 +69,10 @@ pub enum EnvError {
     #[error("TestEnv was dropped or torn down; handle is no longer usable")]
     EnvDropped,
 
-    /// A handle referenced a component id the (live, built) env has no
-    /// record of. Every issued handle's component is registered during
-    /// `build`, so this is an internal invariant violation rather than a
-    /// user error — distinct from [`EnvDropped`](Self::EnvDropped), where
-    /// the env is gone entirely.
+    /// A handle referenced a component id the (live, built) env has no record
+    /// of. Every issued handle's component is registered during `build`, so
+    /// this is an internal invariant violation, not a user error. Distinct from
+    /// [`EnvDropped`](Self::EnvDropped), where the env is gone entirely.
     #[error("internal error: no component registered for handle id {id}")]
     UnknownComponent { id: u64 },
 
@@ -83,9 +82,9 @@ pub enum EnvError {
 
 /// Errors raised by typed RPC sugar (`generate_blocks`, `tip`, etc.).
 ///
-/// Variants carry structured `component` / `op` fields so test code can
-/// match on the *kind* of failure (network vs. decode vs. timeout) without
-/// parsing strings — and surface the underlying wire error via `source()`.
+/// Variants carry structured `component` / `op` fields so test code can match
+/// on the kind of failure (network vs. decode vs. timeout) without parsing
+/// strings, and surface the underlying wire error via `source()`.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
     /// A backend RPC call failed at the wire level. `source` is the

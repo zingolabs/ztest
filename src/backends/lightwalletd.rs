@@ -1,22 +1,22 @@
 //! Lightwalletd indexer backend.
 //!
-//! Speaks the upstream `CompactTxStreamer` gRPC protocol via the
-//! generated bindings in `zcash_client_backend::proto::service`. Each
-//! call opens a fresh tonic connection. Intentionally self-contained —
-//! no shared helpers with `zaino`. Today the two backends speak the
-//! same RPCs; when one diverges in framing, changes land here.
+//! Speaks the upstream `CompactTxStreamer` gRPC protocol via the generated
+//! bindings in `zcash_client_backend::proto::service`. Each call opens a
+//! fresh tonic connection. Intentionally self-contained, with no shared
+//! helpers with `zaino`: today the two backends speak the same RPCs, but when
+//! one diverges in framing, changes land here.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-use zcash_client_backend::proto::compact_formats::{CompactBlock, CompactTx};
-use zcash_client_backend::proto::service as proto;
-use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
-use zcash_primitives::block::BlockHash;
-use zcash_primitives::transaction::{Transaction, TxId};
+use crate::handles::types::BlockHash;
+use crate::proto;
+use crate::proto::compact_tx_streamer_client::CompactTxStreamerClient;
+use crate::proto::{CompactBlock, CompactTx};
 use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::ZatBalance;
 
@@ -49,7 +49,7 @@ pub struct LightwalletdBackend;
 impl IndexerConfig for LightwalletdBackend {
     type Handle = LightwalletdIndexer;
 
-    fn into_handle(&self, plumbing: HandleInner) -> LightwalletdIndexer {
+    fn to_handle(&self, plumbing: HandleInner) -> LightwalletdIndexer {
         LightwalletdIndexer { plumbing }
     }
 
@@ -62,8 +62,8 @@ impl IndexerConfig for LightwalletdBackend {
 
 // ─────────────────────────── LightwalletdIndexer ──────────────────────
 
-/// Live lightwalletd indexer handle. Holds only the env plumbing — all
-/// state is remote, reached over gRPC.
+/// Live lightwalletd indexer handle. Holds only the env plumbing; all state
+/// is remote, reached over gRPC.
 #[derive(Debug, Clone)]
 pub struct LightwalletdIndexer {
     plumbing: HandleInner,
@@ -375,12 +375,10 @@ impl IndexerBackend for LightwalletdIndexer {
         Ok(out)
     }
 
-    async fn send_transaction(&self, tx: &Transaction) -> Result<proto::SendResponse, RpcError> {
+    async fn send_transaction(&self, raw_tx: &[u8]) -> Result<proto::SendResponse, RpcError> {
         let ep = self.plumbing.endpoint("grpc").await?;
         let endpoint = &ep;
-        let mut data = Vec::with_capacity(1024);
-        tx.write(&mut data)
-            .map_err(|e| RpcError::backend(COMPONENT, "SendTransaction", e))?;
+        let data = raw_tx.to_vec();
         let mut client = connect(endpoint).await?;
         Ok(client
             .send_transaction(proto::RawTransaction { data, height: 0 })

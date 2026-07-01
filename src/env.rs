@@ -19,7 +19,7 @@ use crate::EnvError;
 use crate::cluster::{self, Sentinel};
 use crate::component::{ComponentCategory, ComponentOpts, Indexer, Validator, Wallet};
 use crate::error::env_err;
-use zingo_common_components::protocol::ActivationHeights;
+use crate::topology::ActivationHeights;
 
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
 use crate::handles::validator::{ValidatorBackend, ValidatorConfig};
@@ -29,15 +29,19 @@ use crate::topology::NetworkUpgrade;
 
 /// Config-time regtest materialization, captured per validator at
 /// `add_validator` so the build-time topology resolver can apply it once
-/// the activation heights are known — without retaining the concrete
+/// the activation heights are known, without retaining the concrete
 /// backend or a dyn-erased config trait.
 type RegtestMaterializeFn = Box<
-    dyn FnOnce(ComponentOpts, &ActivationHeights, &[(String, u16)]) -> Result<ComponentOpts, EnvError>
+    dyn FnOnce(
+            ComponentOpts,
+            &ActivationHeights,
+            &[(String, u16)],
+        ) -> Result<ComponentOpts, EnvError>
         + Send,
 >;
 
-/// Config-time regtest materialization for an indexer (takes the
-/// validator host resolved at build time). Captured at `add_indexer`.
+/// Config-time regtest materialization for an indexer (takes the validator
+/// host resolved at build time). Captured at `add_indexer`.
 type IndexerMaterializeFn =
     Box<dyn FnOnce(ComponentOpts, Option<&str>) -> Result<ComponentOpts, EnvError> + Send>;
 use crate::manifest::{self, PodSpec};
@@ -90,7 +94,7 @@ pub(crate) struct EnvInner {
     pub(crate) shadow_clones: std::sync::Mutex<Vec<ShadowClone>>,
     pub(crate) is_built: AtomicBool,
     /// The QoS capacity reservation Lease held for this env's life, if QoS
-    /// admission was enabled and granted. `Some(name)` ⇒ a `qos-*` Lease in
+    /// admission was enabled and granted. `Some(name)` means a `qos-*` Lease in
     /// the `zaino-qos` namespace must be released on teardown.
     pub(crate) qos_reservation: std::sync::Mutex<Option<String>>,
     /// Background task heartbeating [`Self::qos_reservation`]. Aborted on Drop
@@ -233,7 +237,7 @@ struct PendingIndexer {
     /// backend isn't retained).
     label: &'static str,
     nu_ceiling: Option<NetworkUpgrade>,
-    /// Regtest materialization closure — `Some` only for regtest indexers;
+    /// Regtest materialization closure; `Some` only for regtest indexers,
     /// `take`n when applied.
     materialize: Option<IndexerMaterializeFn>,
     opts: ComponentOpts,
@@ -248,10 +252,11 @@ struct PendingWallet {
 
 /// Handle to an env-scoped `ReadWriteOnce` PVC shared between two
 /// co-scheduled pods. Created via [`TestEnv::shared_volume`]; the PVC is
-/// provisioned during [`TestEnv::build`]. Hand the same handle to a
-/// validator's [`Validator::persistent_state_in`](crate::Validator::persistent_state_in)
-/// and a zaino indexer's [`Indexer::regtest_state_in`](crate::Indexer::regtest_state_in)
-/// so both mount the same on-disk zebra-state database.
+/// provisioned during [`TestEnv::build`]. Hand the same handle to a validator's
+/// [`Validator::persistent_state_in`](crate::Validator::persistent_state_in)
+/// and a zaino indexer's
+/// [`Indexer::regtest_state_in`](crate::Indexer::regtest_state_in) so both
+/// mount the same on-disk zebra-state database.
 #[derive(Debug, Clone)]
 pub struct SharedVolume {
     claim: String,
@@ -281,9 +286,9 @@ pub struct TestEnv {
     pending_shared_volumes: Vec<String>,
     next_id: u64,
     /// Per-component readiness/RPC-probe budget applied during
-    /// [`build`](Self::build). A plain build-time knob — set it any time
-    /// before `build` via [`ready_timeout`](Self::ready_timeout); it never
-    /// touches the shared [`EnvInner`], so issued handles are unaffected.
+    /// [`build`](Self::build). A plain build-time knob: set it any time before
+    /// `build` via [`ready_timeout`](Self::ready_timeout); it never touches the
+    /// shared [`EnvInner`], so issued handles are unaffected.
     ready_timeout: Duration,
 }
 
@@ -314,9 +319,9 @@ impl TestEnv {
     }
 
     /// Override the per-component readiness/RPC-probe budget used during
-    /// [`build`](Self::build). Order-independent — may be called before or
-    /// after `add_*`, since it sets a plain field rather than rebuilding
-    /// the shared env state.
+    /// [`build`](Self::build). Order-independent: may be called before or after
+    /// `add_*`, since it sets a plain field rather than rebuilding the shared
+    /// env state.
     pub fn ready_timeout(mut self, timeout: Duration) -> Self {
         self.ready_timeout = timeout;
         self
@@ -348,8 +353,8 @@ impl TestEnv {
     }
 
     /// Register a validator and return its concrete, typed handle (e.g.
-    /// `ZebraValidator`) — backend-specific RPCs are inherent methods on
-    /// it, so calling one on the wrong backend is a compile error.
+    /// `ZebraValidator`). Backend-specific RPCs are inherent methods on it, so
+    /// calling one on the wrong backend is a compile error.
     pub fn add_validator<B: ValidatorConfig>(&mut self, mut v: Validator<B>) -> B::Handle {
         let id = self.fresh_id();
         // Resolve the coinbase pool once (builder choice, else backend
@@ -370,9 +375,9 @@ impl TestEnv {
         // Build the live handle (returned to the caller + stored for the
         // env's probes). The concrete backend isn't retained, so capture
         // the config-time behaviour the topology resolver needs: the NU
-        // ceiling (dev images have no parseable version → skip) and the
+        // ceiling (dev images have no parseable version, so skip) and the
         // regtest materialization as a deferred closure.
-        let handle = v.backend.into_handle(plumbing);
+        let handle = v.backend.to_handle(plumbing);
         let dyn_handle: Arc<dyn ValidatorBackend> = Arc::new(handle.clone());
         let nu_ceiling = match v.opts.image {
             crate::backends::image::ImageSpec::Dev { .. } => None,
@@ -402,7 +407,7 @@ impl TestEnv {
             regtest: i.opts.regtest_mode.is_some(),
             coinbase_pool: None,
         };
-        let handle = i.backend.into_handle(plumbing);
+        let handle = i.backend.to_handle(plumbing);
         let label = handle.label();
         let nu_ceiling = match i.opts.image {
             crate::backends::image::ImageSpec::Dev { .. } => None,
@@ -436,7 +441,7 @@ impl TestEnv {
             regtest: w.opts.regtest_mode.is_some(),
             coinbase_pool: None,
         };
-        let handle = w.backend.into_handle(plumbing);
+        let handle = w.backend.to_handle(plumbing);
         let nu_ceiling = match w.opts.image {
             crate::backends::image::ImageSpec::Dev { .. } => None,
             _ => w.backend.nu_ceiling(&w.opts.version),
@@ -564,11 +569,11 @@ impl TestEnv {
         let pending = std::mem::take(&mut self.pending_validators);
         let mut materialized = Vec::with_capacity(pending.len());
         for mut p in pending {
-            if p.opts.regtest_mode.is_some() {
-                if let Some(materialize) = p.materialize.take() {
-                    let peers = peer_tuples_for(&p.opts)?;
-                    p.opts = materialize(p.opts, &activation, &peers)?;
-                }
+            if p.opts.regtest_mode.is_some()
+                && let Some(materialize) = p.materialize.take()
+            {
+                let peers = peer_tuples_for(&p.opts)?;
+                p.opts = materialize(p.opts, &activation, &peers)?;
             }
             materialized.push(p);
         }
@@ -596,7 +601,7 @@ impl TestEnv {
     /// QoS admission (`docs/qos-design.md` §5, §7).
     ///
     /// When QoS is enabled (`ztest run` set `ZTEST_QOS`), reserve this test's
-    /// tier footprint against shared cluster capacity *before* any pod is
+    /// tier footprint against shared cluster capacity before any pod is
     /// created, via the decentralized in-process [`Allocator`] over the
     /// `zaino-qos` Lease ledger. Blocks while the request is queued for
     /// capacity (up to [`qos::ADMIT_BUDGET`]); fails fast if the footprint is
@@ -605,8 +610,8 @@ impl TestEnv {
     /// the env's life; [`Drop`] aborts the heartbeat and releases the Lease.
     ///
     /// When QoS is disabled (a developer running `cargo nextest run`
-    /// directly), this is a no-op — admission is skipped and the harness
-    /// behaves exactly as before.
+    /// directly), this is a no-op: admission is skipped and the harness behaves
+    /// exactly as before.
     async fn admit(
         &self,
         client: &Client,
@@ -620,11 +625,11 @@ impl TestEnv {
 
         // Per-test re-probe: the parent `ztest run` probe result doesn't cross
         // the nextest process boundary, so size the allocator's ceiling from a
-        // live probe. Use the *admission ceiling* (`allocatable − non-ztest
-        // baseline`), NOT `free()`: the allocator must reject only footprints
+        // live probe. Use the admission ceiling (allocatable minus non-ztest
+        // baseline), not `free()`: the allocator must reject only footprints
         // that don't fit an empty-of-ztest cluster, and queue everything else.
         // ztest's own concurrent load is accounted exactly once, via the
-        // ledger's committed reservations inside `decide()` — counting it again
+        // ledger's committed reservations inside `decide()`; counting it again
         // here (as `free()` does, by subtracting every ztest pod's requests)
         // collapses the ceiling under load and turns queue-able tests into
         // spurious `ExceedsClusterCapacity` rejections.
@@ -702,11 +707,11 @@ impl TestEnv {
 
         // Opportunistically GC reservations left by crashed runs (the ledger
         // already excludes them from committed capacity; this just stops the
-        // Lease objects accumulating). Best-effort — never block admission.
+        // Lease objects accumulating). Best-effort; never block admission.
         let _ = allocator.reclaim_expired(qos::now_secs()).await;
 
         // Reserve what the pods will actually request (per-pod whole-core share
-        // × pod count), not the raw tier footprint — see `deployed_footprint`.
+        // × pod count), not the raw tier footprint; see `deployed_footprint`.
         let pods = self.pending_validators.len() + self.pending_indexers.len();
         let req = ReservationRequest {
             unit: namespace.to_string(),
@@ -800,7 +805,7 @@ impl TestEnv {
         let started = std::time::Instant::now();
         let coords = RunCoords::from_env().map_err(env_err)?;
         // Raw `module::test` (for the namespace annotation + name) and its
-        // DNS-safe slug (for every label value — `::` is illegal in labels).
+        // DNS-safe slug (for every label value; `::` is illegal in labels).
         let test_raw = naming::current_test_name();
         let package = naming::current_package();
         let test_slug = naming::slug(&test_raw, 63);
@@ -838,8 +843,9 @@ impl TestEnv {
         let qos_placement = cluster::qos_enabled().then(|| qos::current().profile().pool);
         // QoS-default pod sizing (§7): split the tier footprint evenly across
         // the env's pods (validators + indexers; wallets are in-process) as
-        // requests==limits ⇒ Guaranteed QoS. A test's explicit `.resources()`
-        // overrides this per-pod. `None` when QoS is off or there are no pods.
+        // requests==limits, i.e. Guaranteed QoS. A test's explicit
+        // `.resources()` overrides this per-pod. `None` when QoS is off or
+        // there are no pods.
         let qos_guaranteed = if cluster::qos_enabled() {
             let pods = self.pending_validators.len() + self.pending_indexers.len();
             even_share(qos::current().profile().footprint, pods)
@@ -848,8 +854,8 @@ impl TestEnv {
         };
 
         // Provision shared PVCs before any pod references them. With the
-        // default (WaitForFirstConsumer) binding the claim stays Pending
-        // until the first consumer — the validator in Phase 1 — schedules.
+        // default (WaitForFirstConsumer) binding the claim stays Pending until
+        // the first consumer (the validator in Phase 1) schedules.
         for claim in std::mem::take(&mut self.pending_shared_volumes) {
             mounts::create_shared_pvc(&client, &sentinel, &claim).await?;
         }
@@ -862,7 +868,7 @@ impl TestEnv {
             test_name: &test_name,
         };
 
-        // Phase 1 — validators.
+        // Phase 1: validators.
         let validators: Vec<_> = self
             .pending_validators
             .drain(..)
@@ -880,9 +886,9 @@ impl TestEnv {
         self.materialize_phase(&ctx, &validators).await?;
         // The env's own readiness/warm probes drive the validators through
         // their handles, which gate endpoint resolution on `is_built`.
-        // Flip it on for the probe window, then back off until the whole
-        // build completes — so a Phase-2 failure still leaves test-side
-        // handle calls reporting `NotBuilt`.
+        // Flip it on for the probe window, then back off until the whole build
+        // completes, so a Phase-2 failure still leaves test-side handle calls
+        // reporting `NotBuilt`.
         self.inner.is_built.store(true, Ordering::Release);
         let warmup = async {
             self.wait_validators_rpc_ready().await?;
@@ -893,7 +899,7 @@ impl TestEnv {
         self.inner.is_built.store(false, Ordering::Release);
         warmup?;
 
-        // Phase 2 — indexers. (Wallets run in-process; see below.)
+        // Phase 2: indexers. (Wallets run in-process; see below.)
         let dependents: Vec<_> = self
             .pending_indexers
             .drain(..)
@@ -907,12 +913,12 @@ impl TestEnv {
                 Ok::<_, EnvError>((p.id, spec, p.opts, None))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Wallets run in-process in the test binary — they're libraries
-        // that connect to the indexer over gRPC — so they get no pod.
-        // Their nu_ceiling has already been folded into the topology
-        // resolver in `materialize_regtest_configs`; here we just drop the
-        // pending entries. Account construction happens lazily, on demand,
-        // via `WalletHandle::account`.
+        // Wallets run in-process in the test binary (libraries that connect to
+        // the indexer over gRPC), so they get no pod. Their nu_ceiling was
+        // already folded into the topology resolver in
+        // `materialize_regtest_configs`; here we just drop the pending entries.
+        // Account construction happens lazily, on demand, via
+        // `WalletHandle::account`.
         self.pending_wallets.clear();
         self.materialize_phase(&ctx, &dependents).await?;
 
@@ -986,12 +992,7 @@ impl TestEnv {
     async fn materialize_phase(
         &self,
         ctx: &MaterializeCtx<'_>,
-        items: &[(
-            u64,
-            PodSpec,
-            ComponentOpts,
-            Option<Arc<dyn ValidatorBackend>>,
-        )],
+        items: &[MaterializeItem],
     ) -> Result<(), EnvError> {
         for (id, spec, opts, validator_handle) in items {
             let state = ComponentState::new(
@@ -1046,36 +1047,35 @@ impl TestEnv {
 impl Drop for TestEnv {
     /// Teardown is Drop-only and runs to completion here, pass or fail.
     ///
-    /// There is deliberately no `teardown().await` method. An explicit
-    /// call is skipped by any early `?`-return on a test's failure path,
-    /// which leaks the namespace (and every pod in it) — the exact cause
-    /// of the cluster filling to its pod cap and every subsequent test
-    /// timing out on `pod_ready`. Tying teardown to `Drop` makes it
-    /// unconditional: the namespace is deleted whether the test returns
-    /// `Ok`, returns `Err`, or panics.
+    /// There is deliberately no `teardown().await` method. An explicit call is
+    /// skipped by any early `?`-return on a test's failure path, which leaks
+    /// the namespace (and every pod in it): the exact cause of the cluster
+    /// filling to its pod cap and every subsequent test timing out on
+    /// `pod_ready`. Tying teardown to `Drop` makes it unconditional: the
+    /// namespace is deleted whether the test returns `Ok`, returns `Err`, or
+    /// panics.
     ///
-    /// `Drop` cannot `.await`, and the test's own runtime is torn down
-    /// the instant the test future resolves — so a `Handle::spawn`ed
-    /// cleanup task would be cancelled before its DELETE was ever sent
-    /// (that fire-and-forget shape is what leaked namespaces before).
-    /// Instead we run the delete to completion on a dedicated OS thread
-    /// with its own runtime and `join()` it, blocking the dropping
-    /// thread until the API has accepted the deletion. This is
-    /// runtime-flavour agnostic (works under both current-thread and
-    /// multi-thread test runtimes). The kube client is rebuilt inside
-    /// that runtime because the original is bound to the now-dying test
-    /// runtime's reactor and is unsound to reuse across runtimes.
+    /// `Drop` cannot `.await`, and the test's own runtime is torn down the
+    /// instant the test future resolves, so a `Handle::spawn`ed cleanup task
+    /// would be cancelled before its DELETE was ever sent (that
+    /// fire-and-forget shape is what leaked namespaces before). Instead we run
+    /// the delete to completion on a dedicated OS thread with its own runtime
+    /// and `join()` it, blocking the dropping thread until the API has accepted
+    /// the deletion. This is runtime-flavour agnostic (works under both
+    /// current-thread and multi-thread test runtimes). The kube client is
+    /// rebuilt inside that runtime because the original is bound to the
+    /// now-dying test runtime's reactor and is unsound to reuse across runtimes.
     ///
-    /// `ztest run --no-cleanup` (→ `ZTEST_NO_CLEANUP`) suppresses the
-    /// delete so a developer can `kubectl` into the surviving pods for a
-    /// post-mortem. The 1h `janitor/ttl` annotation still reaps the
-    /// namespace afterwards, so this never leaks permanently.
+    /// `ztest run --no-cleanup` (via `ZTEST_NO_CLEANUP`) suppresses the delete
+    /// so a developer can `kubectl` into the surviving pods for a post-mortem.
+    /// The 1h `janitor/ttl` annotation still reaps the namespace afterwards, so
+    /// this never leaks permanently.
     ///
-    /// The QoS capacity reservation is handled separately: the renew
-    /// heartbeat is aborted and the reservation Lease is **always released**,
-    /// even under `--no-cleanup`. Preserving pods for inspection must not
-    /// leak the *capacity accounting* — otherwise the reserve would linger
-    /// until the Lease expired and starve concurrent runs.
+    /// The QoS capacity reservation is handled separately: the renew heartbeat
+    /// is aborted and the reservation Lease is always released, even under
+    /// `--no-cleanup`. Preserving pods for inspection must not leak the
+    /// capacity accounting, or the reserve would linger until the Lease expired
+    /// and starve concurrent runs.
     fn drop(&mut self) {
         // Stop heartbeating immediately so the reservation can't be renewed
         // out from under the release below.
@@ -1114,8 +1114,8 @@ impl Drop for TestEnv {
             (ns.clone(), shadows)
         } else {
             if let Some(ns) = &ns {
-                // eprintln (not just tracing) so the hint is visible in
-                // captured test output, where a developer is looking.
+                // eprintln (not just tracing) so the hint shows in captured
+                // test output, where a developer is looking.
                 eprintln!(
                     "ztest: --no-cleanup — preserving namespace {ns} for inspection \
                      (janitor reaps it in ~1h).\n  \
@@ -1240,18 +1240,21 @@ fn pod_name_of(opts: &ComponentOpts) -> String {
 }
 
 /// The per-pod Guaranteed reserve when a tier's footprint is split evenly
-/// across `pods` pods (§7), shaped for **maximum performance**:
+/// across `pods` pods (§7), shaped for maximum performance.
 ///
-/// - **Integer CPU cores.** The kubelet CPU Manager `static` policy only pins
-///   exclusive CPUs to a Guaranteed pod whose CPU is a *whole* number of cores
-///   (fractional ⇒ shared pool, no pinning). So the per-pod CPU is the even
-///   share rounded **up** to whole cores (min 1) — eligible for exclusive
-///   pinning at the cost of slightly over-reserving small tiers vs the
-///   admission footprint. Memory is the exact even share (no integer rule).
-/// - Rendered by [`manifest::PodSpec`] as `requests == limits` ⇒ Guaranteed.
+/// Integer CPU cores: the kubelet CPU Manager `static` policy only pins
+/// exclusive CPUs to a Guaranteed pod whose CPU is a whole number of cores
+/// (fractional falls to the shared pool, no pinning). So the per-pod CPU is the
+/// even share rounded up to whole cores (min 1), eligible for exclusive pinning
+/// at the cost of slightly over-reserving small tiers vs the admission
+/// footprint. Memory is the exact even share (no integer rule). Rendered by
+/// [`manifest::PodSpec`] as `requests == limits`, i.e. Guaranteed.
 ///
 /// `None` when there are no pods to size.
-fn even_share(footprint: crate::qos::Resources, pods: usize) -> Option<crate::component::Resources> {
+fn even_share(
+    footprint: crate::qos::Resources,
+    pods: usize,
+) -> Option<crate::component::Resources> {
     if pods == 0 {
         return None;
     }
@@ -1264,23 +1267,23 @@ fn even_share(footprint: crate::qos::Resources, pods: usize) -> Option<crate::co
 
 /// The per-pod `(whole CPU cores, memory bytes)` an even footprint split
 /// yields. Shared by [`even_share`] (what each pod requests) and
-/// [`deployed_footprint`] (what admission reserves) so the two agree exactly —
-/// CPU is the even share rounded **up** to whole cores (static-policy pinning;
-/// min 1), memory is the exact even share.
+/// [`deployed_footprint`] (what admission reserves) so the two agree exactly:
+/// CPU is the even share rounded up to whole cores (static-policy pinning; min
+/// 1), memory is the exact even share.
 fn per_pod_share(footprint: crate::qos::Resources, pods: u64) -> (u64, u64) {
     let cores = (footprint.cpu_milli / pods).div_ceil(1000).max(1);
     let mem_bytes = (footprint.mem_bytes / pods).max(1);
     (cores, mem_bytes)
 }
 
-/// The footprint admission must reserve: **exactly what the rendered pods
-/// request** (per-pod whole-core share × `pods`), not the raw tier footprint.
+/// The footprint admission must reserve: exactly what the rendered pods request
+/// (per-pod whole-core share × `pods`), not the raw tier footprint.
 ///
 /// Rounding the per-pod CPU up to whole cores (for static-policy pinning) means
-/// `pods × per-pod` can exceed the tier footprint (e.g. 8 cores over 3 pods →
+/// `pods × per-pod` can exceed the tier footprint (e.g. 8 cores over 3 pods is
 /// 3+3+3 = 9). If admission reserved only the raw 8, the ledger would
 /// under-count and the cluster could grant capacity a pod then can't schedule
-/// into — a silent Pending. Reserving the deployed total keeps the ledger and
+/// into (a silent Pending). Reserving the deployed total keeps the ledger and
 /// the pods consistent. Falls back to the tier footprint when there are no QoS
 /// pods to size (e.g. a wallet-only env).
 fn deployed_footprint(footprint: crate::qos::Resources, pods: usize) -> crate::qos::Resources {
@@ -1298,9 +1301,9 @@ fn deployed_footprint(footprint: crate::qos::Resources, pods: usize) -> crate::q
 /// Read a ServiceAccount's QoS budget from its annotations (§5.6).
 ///
 /// Infrastructure-best-effort: a missing SA or a transient API error yields
-/// `Ok(None)` (⇒ unbudgeted/unlimited) so cluster hiccups never block
-/// admission. But a budget annotation that is *present and unparseable* returns
-/// `Err` — a typo'd budget must fail the run loudly, not silently become a zero
+/// `Ok(None)` (unbudgeted/unlimited) so cluster hiccups never block admission.
+/// But a budget annotation that is present and unparseable returns `Err`: a
+/// typo'd budget must fail the run loudly, not silently become a zero
 /// (rejecting every request) or be ignored. The parsing is the pure
 /// [`qos::parse_sa_budget`].
 async fn read_sa_budget(
@@ -1326,6 +1329,10 @@ struct MaterializeCtx<'a> {
     coords: &'a RunCoords,
     test_name: &'a str,
 }
+
+/// One pod to materialize: `(id, spec, opts, optional validator backend)`.
+/// Shared by both materialization phases (validators, then dependents).
+type MaterializeItem = (u64, PodSpec, ComponentOpts, Option<Arc<dyn ValidatorBackend>>);
 
 #[cfg(test)]
 mod tests {
@@ -1356,7 +1363,7 @@ mod tests {
     #[test]
     fn deployed_footprint_matches_what_the_rendered_pods_request() {
         // testnet 8c/18Gi over 3 pods: pods request 3 cores each (ceil), so
-        // admission must reserve 9 cores — NOT the raw 8 — or the 3rd pod could
+        // admission must reserve 9 cores (not the raw 8) or the 3rd pod could
         // pend on capacity the ledger under-counted. Memory is the floored
         // share × pods.
         let fp = deployed_footprint(Resources::new(8_000, 18 * GIB), 3);

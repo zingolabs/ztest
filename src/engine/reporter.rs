@@ -1,22 +1,30 @@
-//! A ztest-owned, nextest-*style* run reporter.
+//! A ztest-owned run reporter that reproduces `cargo nextest run`'s default
+//! human output byte-for-byte.
 //!
-//! Formats the engine's lifecycle events into scrolling status lines that mirror
-//! `cargo nextest run`'s default human output — `PASS`/`FAIL`/`SLOW`/retry lines
-//! with right-aligned durations, failure-output replay, and a final summary —
-//! plus colour via `owo-colors`. Visually faithful, not byte-identical: we own
-//! every line, so there is no `nextest-runner` dependency and no vendored fork
-//! to re-sync (see the plan's rendering decision).
+//! Formats the engine's lifecycle events into the exact scrolling status lines
+//! nextest emits — `PASS`/`FAIL`/`XFAIL`/`SLOW`/`TRY n …` verdicts with
+//! right-aligned durations, failure-output replay under `output ───` headers,
+//! and the `Summary` block — matching nextest's indentation, capitalisation,
+//! and colours (`owo-colors`). We own every line, so there is no
+//! `nextest-runner` dependency; the goal is that a captured line is
+//! indistinguishable from nextest's (`reporter/displayer/imp.rs`).
 //!
-//! This reporter emits only scrollback. The live region (the nextest-style
-//! [`progress_line`] + [`render_running`] list, plus the QoS panel) is rendered
-//! separately by the run loop.
+//! Ceiling: the engine's [`Verdict`] models only pass/fail/timeout/spawn-error,
+//! so nextest's leak/flaky/slow-pass/abort status words can't be produced —
+//! those need a richer event model and are intentionally out of scope.
+//!
+//! Emits only scrollback — its verdict lines flow into the terminal's native
+//! scrollback like the build/image subprocess output. The pinned QoS panel is
+//! rendered separately by the run loop. The [`progress_line`] / [`render_running`]
+//! helpers are retained (see their `#[allow(dead_code)]` notes) for a future
+//! nextest-style scrollback progress feed, but nothing is pinned live now.
 
 use std::io::Write as _;
 use std::time::Duration;
 
 use owo_colors::OwoColorize as _;
 
-use crate::engine::events::{RunReporter, RunStats, RunningView, SkipReason, TestEvent, Verdict};
+use crate::engine::events::{RunReporter, RunStats, RunningView, TestEvent, Verdict};
 
 /// Status-line colour intent, mirroring nextest's `Styles`
 /// (`reporter/helpers.rs`): pass = green·bold, fail = red·bold,
@@ -30,26 +38,32 @@ enum Ink {
 }
 
 /// The nextest-style reporter. `color`/`unicode` are resolved by the caller
-/// from terminal support; non-TTY runs pass `color = false`.
+/// from terminal support (`supports_color` / `supports_unicode`, exactly as
+/// nextest does); non-TTY runs pass `color = false`.
 #[derive(Debug)]
 pub struct StyledReporter {
     color: bool,
+    unicode: bool,
     buf: Vec<u8>,
     stats: RunStats,
 }
 
 impl StyledReporter {
-    /// A reporter; `color` enables ANSI styling.
-    pub fn new(color: bool) -> Self {
+    /// A reporter; `color` enables ANSI styling, `unicode` selects `─`/`───`
+    /// over the ASCII `-`/`---` fallback (nextest's `ThemeCharacters`).
+    pub fn new(color: bool, unicode: bool) -> Self {
         Self {
             color,
+            unicode,
             buf: Vec::new(),
             stats: RunStats::default(),
         }
     }
 
-    /// Right-align a status word in a fixed 12-col field and colour it (nextest
-    /// pads the visible text, then wraps it in ANSI — so we pad first too).
+    /// Right-align a status word in a fixed 12-col field and colour it. nextest
+    /// styles the value *through* the formatter (`"{:>12}"`), so the padding
+    /// lands inside the ANSI wrapper — padding first, then painting, is
+    /// byte-identical.
     fn status(&self, word: &str, ink: Ink) -> String {
         let padded = format!("{word:>12}");
         self.paint(&padded, ink)
@@ -60,9 +74,11 @@ impl StyledReporter {
         paint_word(s, ink, self.color)
     }
 
-    /// `[   1.234s]` — right-aligned seconds, unstyled (matching nextest).
-    fn bracket_dur(d: Duration) -> String {
-        format!("[{:>8.3}s]", d.as_secs_f64())
+    /// A horizontal rule of `n` chars: `─` (U+2500) with unicode, else the
+    /// ASCII `-` — nextest's `ThemeCharacters::hbar` (`helpers.rs`).
+    fn hbar(&self, n: usize) -> String {
+        let c = if self.unicode { '─' } else { '-' };
+        std::iter::repeat_n(c, n).collect()
     }
 
     /// `{binary_id} {module::path}::{leaf}` styled like nextest's
@@ -72,30 +88,57 @@ impl StyledReporter {
         instance_str(bin, test, self.color)
     }
 
-    /// One verdict line: `{status} [   d.ddds] {binary} {module::test}`.
-    fn verdict_line(&mut self, status: &str, ink: Ink, dur: Duration, bin: &str, test: &str) {
+    /// One status line: `{status:>12} {bracket}{instance}`. `bracket` already
+    /// carries nextest's trailing space (`DisplayBracketedDuration` &c.), so the
+    /// only literal space here is the one after the status field.
+    fn line(&mut self, word: &str, ink: Ink, bracket: &str, bin: &str, test: &str) {
         let _ = writeln!(
             self.buf,
-            "{} {} {}",
-            self.status(status, ink),
-            Self::bracket_dur(dur),
+            "{} {bracket}{}",
+            self.status(word, ink),
             self.styled_instance(bin, test),
         );
     }
 
-    /// Replay a failed test's captured output under a header.
-    fn replay_output(&mut self, bin: &str, test: &str, output: &[u8]) {
+    /// Replay a failed test's captured output. Matches nextest's default
+    /// (indented) combined-stream layout (`unit_output.rs`): a
+    /// `  {label} ───` header coloured by outcome (fail here), then the raw
+    /// bytes indented four spaces, with no closing rule. The engine captures a
+    /// merged stdout+stderr stream, so nextest's combined `output` header is
+    /// the faithful choice (vs the split `stdout`/`stderr` headers).
+    fn replay_output(&mut self, output: &[u8]) {
         if output.is_empty() {
             return;
         }
-        let header = format!("--- output: {bin} {test} ---");
-        let _ = writeln!(self.buf, "\n{}", self.paint(&header, Ink::Fail));
-        // Verbatim, then a trailing newline if the output didn't end in one.
-        let _ = self.buf.write_all(output);
-        if !output.ends_with(b"\n") {
+        // Header: " " + "output" + hbar(3), each piece styled — as nextest's
+        // `format!("{} {} {}", start, "output", end)` with start=" ", end="───".
+        let header = format!(
+            "{} {} {}",
+            self.paint(" ", Ink::Fail),
+            self.paint("output", Ink::Fail),
+            self.paint(&self.hbar(3), Ink::Fail),
+        );
+        let _ = writeln!(self.buf, "{header}");
+        // Body: indent every non-empty line by four spaces (blank lines stay
+        // bare, matching the `indenter` crate nextest uses), and guarantee a
+        // trailing newline so the next scrollback line isn't glued on.
+        let mut start = 0;
+        for i in 0..output.len() {
+            if output[i] == b'\n' {
+                let l = &output[start..i];
+                if !l.is_empty() {
+                    let _ = self.buf.write_all(b"    ");
+                }
+                let _ = self.buf.write_all(l);
+                let _ = self.buf.write_all(b"\n");
+                start = i + 1;
+            }
+        }
+        if start < output.len() {
+            let _ = self.buf.write_all(b"    ");
+            let _ = self.buf.write_all(&output[start..]);
             let _ = self.buf.write_all(b"\n");
         }
-        let _ = writeln!(self.buf, "{}", self.paint("---", Ink::Fail));
     }
 }
 
@@ -104,12 +147,16 @@ impl RunReporter for StyledReporter {
         match ev {
             TestEvent::RunStarted { total, .. } => {
                 self.stats.total = *total;
-                // nextest: right-aligned green·bold "Starting", bold count.
+                // nextest's full RunStarted block also carries a run-ID/profile
+                // line and "across N binaries" — neither is in the ztest event
+                // model, so this is the faithful subset: right-aligned green·bold
+                // "Starting" + bold count.
+                let word = if *total == 1 { "test" } else { "tests" };
                 let _ = writeln!(
                     self.buf,
-                    "{} {} tests",
+                    "{} {} {word}",
                     self.status("Starting", Ink::Pass),
-                    self.count(*total as u64),
+                    bold_count(*total as u64, self.color),
                 );
             }
             // Test starts are reflected in the pinned QoS panel, not scrollback.
@@ -119,44 +166,69 @@ impl RunReporter for StyledReporter {
                 test_name,
                 elapsed,
                 will_terminate,
+                attempt,
             } => {
-                let (word, ink) = if *will_terminate {
-                    ("TERMINATING", Ink::Fail)
+                // nextest uses the *slow* duration bracket `[>  d.ddds] ` here,
+                // not the ordinary one (`imp.rs` → `DisplaySlowDuration`).
+                let bracket = bracket_slow(*elapsed);
+                if *will_terminate {
+                    self.line("TERMINATING", Ink::Fail, &bracket, binary_id, test_name);
+                } else if *attempt > 1 {
+                    let word = format!("TRY {attempt} SLOW");
+                    self.line(&word, Ink::Skip, &bracket, binary_id, test_name);
                 } else {
-                    ("SLOW", Ink::Skip)
-                };
-                self.verdict_line(word, ink, *elapsed, binary_id, test_name);
+                    self.line("SLOW", Ink::Skip, &bracket, binary_id, test_name);
+                }
             }
             TestEvent::TestRetrying {
                 binary_id,
                 test_name,
                 next_attempt,
+                verdict,
+                duration,
                 ..
             } => {
-                let word = format!("TRY {next_attempt}");
-                self.verdict_line(&word, Ink::Retry, Duration::ZERO, binary_id, test_name);
+                // The attempt that just failed (nextest's `retry_data.attempt`),
+                // rendered magenta as `TRY {n} {short}` with its real duration —
+                // nextest's `TestAttemptFailedWillRetry` line.
+                let failed_attempt = next_attempt.saturating_sub(1).max(1);
+                let word = format!("TRY {failed_attempt} {}", short_status(verdict));
+                self.line(
+                    &word,
+                    Ink::Retry,
+                    &bracket_dur(*duration),
+                    binary_id,
+                    test_name,
+                );
             }
             TestEvent::TestFinished {
                 binary_id,
                 test_name,
                 verdict,
                 duration,
+                attempt,
                 output,
             } => {
-                let (word, ink) = match verdict {
-                    Verdict::Pass => ("PASS", Ink::Pass),
-                    Verdict::Fail(_) => ("FAIL", Ink::Fail),
-                    Verdict::Timeout => ("TIMEOUT", Ink::Fail),
-                    Verdict::SpawnError => ("ERROR", Ink::Fail),
-                };
-                self.verdict_line(word, ink, *duration, binary_id, test_name);
-                if !verdict.is_pass() {
-                    self.replay_output(binary_id, test_name, output);
-                }
-                if verdict.is_pass() {
-                    self.stats.passed += 1;
-                } else {
-                    self.stats.failed += 1;
+                let bracket = bracket_dur(*duration);
+                match verdict {
+                    Verdict::Pass => {
+                        self.line("PASS", Ink::Pass, &bracket, binary_id, test_name);
+                        self.stats.passed += 1;
+                    }
+                    _ => {
+                        // A failing terminal verdict. Attempt 1 uses the long
+                        // status word (`FAIL`/`TIMEOUT`/`XFAIL`); a later attempt
+                        // failing after retries renders `TRY {n} {short}` — both
+                        // in red (`imp.rs` → `ExecutionDescription::Failure`).
+                        let word = if *attempt > 1 {
+                            format!("TRY {attempt} {}", short_status(verdict))
+                        } else {
+                            long_status(verdict).to_string()
+                        };
+                        self.line(&word, Ink::Fail, &bracket, binary_id, test_name);
+                        self.replay_output(output);
+                        self.stats.failed += 1;
+                    }
                 }
             }
             TestEvent::TestSkipped {
@@ -164,17 +236,25 @@ impl RunReporter for StyledReporter {
                 test_name,
                 reason,
             } => {
-                let why = match reason {
-                    SkipReason::ExceedsClusterCapacity => "exceeds cluster capacity",
-                    SkipReason::ExceedsSaBudget => "exceeds SA budget",
-                };
-                let _ = writeln!(
-                    self.buf,
-                    "{} {} {} ({why})",
-                    self.status("SKIP", Ink::Skip),
-                    bin_pad(),
-                    self.styled_instance(binary_id, test_name),
-                );
+                // nextest's skip line: `SKIP` + the empty-duration placeholder
+                // `[         ] ` + instance (`imp.rs` → `write_skip_line`). The
+                // capacity skip *reasons* have no nextest analogue, so they're
+                // dropped to keep the line byte-identical. A
+                // `DependencyUnavailable` skip is a ztest-specific concept with no
+                // nextest form at all, so we append the reason — the test author
+                // needs to know *which* resource sidelined the test.
+                match reason {
+                    crate::engine::events::SkipReason::DependencyUnavailable { resource } => {
+                        let _ = writeln!(
+                            self.buf,
+                            "{} {BRACKET_SKIP}{} {}",
+                            self.status("SKIP", Ink::Skip),
+                            self.styled_instance(binary_id, test_name),
+                            self.paint(&format!("(resource unavailable: {resource})"), Ink::Skip),
+                        );
+                    }
+                    _ => self.line("SKIP", Ink::Skip, BRACKET_SKIP, binary_id, test_name),
+                }
                 self.stats.skipped += 1;
             }
             TestEvent::RunFinished { stats, elapsed } => {
@@ -189,19 +269,13 @@ impl RunReporter for StyledReporter {
 }
 
 impl StyledReporter {
-    /// A bold count number (nextest's `count` style).
-    fn count(&self, n: u64) -> String {
-        bold_count(n, self.color)
-    }
-
-    /// The closing summary block — a unicode rule then
+    /// The closing summary block — a rule then
     /// `Summary [   d.ddds] N tests run: X passed[, Y failed], Z skipped`,
-    /// matching nextest's `RunFinished` line (imp.rs): the rule + a `Summary`
+    /// matching nextest's `RunFinished` line (`imp.rs`): the rule + a `Summary`
     /// label coloured by final status (green pass / red fail / yellow no-run),
     /// the elapsed bracket, `finished[/total]`, then the shared counts tail.
     fn summary(&mut self, stats: &RunStats, elapsed: Duration) {
-        // nextest draws a 12-char horizontal rule (U+2500), not ASCII dashes.
-        let _ = writeln!(self.buf, "{}", "\u{2500}".repeat(12));
+        let _ = writeln!(self.buf, "{}", self.hbar(12));
         // nextest colours "Summary" by outcome: fail if anything failed, skip
         // if nothing ran, else pass.
         let ink = if stats.failed > 0 {
@@ -215,29 +289,72 @@ impl StyledReporter {
         // `9/122` when the run stopped short, else just the finished count.
         let finished = stats.finished();
         let ran = if (finished as usize) != stats.total {
-            format!("{}/{}", self.count(finished as u64), self.count(stats.total as u64))
+            format!(
+                "{}/{}",
+                bold_count(finished as u64, self.color),
+                bold_count(stats.total as u64, self.color),
+            )
         } else {
-            self.count(finished as u64)
+            bold_count(finished as u64, self.color)
+        };
+        // Singular "test run" only when both counts are 1 (nextest's
+        // `tests_plural_if(initial != 1 || finished != 1)`).
+        let tests = if stats.total != 1 || finished != 1 {
+            "tests"
+        } else {
+            "test"
         };
         let _ = writeln!(
             self.buf,
-            "{label} {} {ran} tests run: {}",
-            Self::bracket_dur(elapsed),
+            "{label} {}{ran} {tests} run: {}",
+            bracket_dur(elapsed),
             counts_tail(stats, self.color),
         );
     }
 }
 
-/// A blank field matching [`StyledReporter::bracket_dur`]'s 11-char width
-/// (`[` + 8-wide secs + `s` + `]`), so SKIP lines — which have no duration —
-/// keep the instance column aligned with the verdict lines above them.
-fn bin_pad() -> &'static str {
-    "           "
+/// nextest's long `status_str` for a failing verdict — used on attempt-1 and
+/// final status lines (`imp.rs`). `Pass` never reaches this path.
+fn long_status(v: &Verdict) -> &'static str {
+    match v {
+        Verdict::Fail(_) => "FAIL",
+        Verdict::Timeout => "TIMEOUT",
+        Verdict::SpawnError => "XFAIL",
+        Verdict::Pass => "PASS",
+    }
 }
 
+/// nextest's `short_status_str` for retry lines and post-retry final lines
+/// (max 6 chars): `FAIL` / `TMT` / `XFAIL` (`imp.rs`).
+fn short_status(v: &Verdict) -> &'static str {
+    match v {
+        Verdict::Fail(_) => "FAIL",
+        Verdict::Timeout => "TMT",
+        Verdict::SpawnError => "XFAIL",
+        Verdict::Pass => "PASS",
+    }
+}
+
+/// `[   1.000s] ` — nextest's `DisplayBracketedDuration`: right-aligned 8-wide,
+/// 3-dp seconds, with the trailing space it carries.
+fn bracket_dur(d: Duration) -> String {
+    format!("[{:>8.3}s] ", d.as_secs_f64())
+}
+
+/// `[>  1.000s] ` — nextest's `DisplaySlowDuration`: a literal `>` then a
+/// 7-wide, 3-dp seconds field, plus the trailing space.
+fn bracket_slow(d: Duration) -> String {
+    format!("[>{:>7.3}s] ", d.as_secs_f64())
+}
+
+/// nextest's empty-duration placeholder for SKIP lines: an 11-char bracket
+/// (`[` + 9 spaces + `]`) — same width as a real duration — plus its trailing
+/// space, so the instance column stays aligned with the verdict lines.
+const BRACKET_SKIP: &str = "[         ] ";
+
 /// `{binary_id} {module::path}::{leaf}` — binary-id magenta·bold, module path
-/// cyan, leaf blue·bold (nextest's `DisplayTestInstance`). Shared by the
-/// scrollback verdict lines and the live running region.
+/// cyan, leaf blue·bold (nextest's `DisplayTestInstance` / `list::Styles`).
+/// Shared by the scrollback verdict lines and the live running region.
 fn instance_str(bin: &str, test: &str, color: bool) -> String {
     if !color {
         return format!("{bin} {test}");
@@ -252,7 +369,17 @@ fn instance_str(bin: &str, test: &str, color: bool) -> String {
     format!("{bin} {test}")
 }
 
-/// `HH:MM:SS` elapsed, matching nextest's running-test clock.
+/// `HH:MM:SS` elapsed, matching nextest's `DisplayBracketedHhMmSs`
+/// (`formatters.rs`) used by the top progress line.
+///
+/// Note: nextest's *running-row* clock (`progress.rs`) has a minutes-overflow
+/// bug (`as_secs()/60`, no `% 60`) that mis-renders past one hour; this
+/// (correct) `% 60` version is shared by both our lines, so it matches nextest
+/// under an hour and stays correct — rather than bug-compatible — beyond it.
+// Retained for a future "emit nextest-style progress/START events to
+// scrollback" feature; unused since the pinned per-test live window was dropped
+// in favour of the constant QoS panel (see `engine::run_tty`).
+#[allow(dead_code)]
 fn hms(d: Duration) -> String {
     let s = d.as_secs();
     format!("{:0>2}:{:0>2}:{:0>2}", s / 3600, (s / 60) % 60, s % 60)
@@ -266,7 +393,8 @@ fn hms(d: Duration) -> String {
 /// stays stable frame-to-frame.
 ///
 /// `running` is assumed already sorted longest-first. Returns ANSI strings (one
-/// per line); the caller bridges them into the viewport's live region.
+/// per line).
+#[allow(dead_code)] // see note on `hms`: retained for scrollback progress events
 pub(crate) fn render_running(running: &[RunningView], rows: usize, color: bool) -> Vec<String> {
     if rows == 0 {
         return Vec::new();
@@ -323,13 +451,18 @@ pub(crate) fn render_running(running: &[RunningView], rows: usize, color: bool) 
 /// bold with their words coloured (passed green, failed red, skipped yellow).
 /// nextest's `{wide_bar}` gauge is intentionally omitted — the QoS panel below
 /// already carries a capacity gauge.
+#[allow(dead_code)] // see note on `hms`: retained for scrollback progress events
 pub(crate) fn progress_line(
     stats: &RunStats,
     running: usize,
     elapsed: Duration,
     color: bool,
 ) -> String {
-    let prefix_ink = if stats.failed > 0 { Ink::Fail } else { Ink::Pass };
+    let prefix_ink = if stats.failed > 0 {
+        Ink::Fail
+    } else {
+        Ink::Pass
+    };
     let prefix = paint_word(&format!("{:>12}", "Running"), prefix_ink, color);
     format!(
         "{prefix} [{:>9}] {}/{}: {} running, {}",
@@ -347,7 +480,11 @@ pub(crate) fn progress_line(
 /// always shown, `failed` only when non-zero.
 fn counts_tail(stats: &RunStats, color: bool) -> String {
     let tally = |n: u32, word: &str, ink: Ink| {
-        format!("{} {}", bold_count(n as u64, color), paint_word(word, ink, color))
+        format!(
+            "{} {}",
+            bold_count(n as u64, color),
+            paint_word(word, ink, color)
+        )
     };
     let mut s = format!("{}, ", tally(stats.passed, "passed", Ink::Pass));
     if stats.failed > 0 {
@@ -384,7 +521,7 @@ fn paint_word(s: &str, ink: Ink, color: bool) -> String {
 mod tests {
     use super::*;
 
-    fn finished(bin: &str, test: &str, v: Verdict, out: &[u8]) -> TestEvent<'static> {
+    fn finished(bin: &str, test: &str, v: Verdict, attempt: u32, out: &[u8]) -> TestEvent<'static> {
         // Leak the strings for 'static test events (test-only).
         let bin: &'static str = Box::leak(bin.to_string().into_boxed_str());
         let test: &'static str = Box::leak(test.to_string().into_boxed_str());
@@ -394,43 +531,235 @@ mod tests {
             test_name: test,
             verdict: v,
             duration: Duration::from_millis(234),
+            attempt,
             output: out,
         }
     }
 
     #[test]
-    fn pass_line_is_plain_when_no_color() {
-        let mut r = StyledReporter::new(false);
-        r.handle(&finished("pkg::bin", "mod::ok", Verdict::Pass, b""));
+    fn pass_line_matches_nextest_layout() {
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&finished("pkg::bin", "mod::ok", Verdict::Pass, 1, b""));
         let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.contains("PASS"), "{out}");
-        assert!(out.contains("0.234s"), "{out}");
-        assert!(out.contains("pkg::bin mod::ok"), "{out}");
-        // No ANSI escapes when color is off.
+        assert_eq!(
+            out, "        PASS [   0.234s] pkg::bin mod::ok\n",
+            "{out:?}"
+        );
         assert!(!out.contains('\u{1b}'), "unexpected ANSI: {out:?}");
     }
 
     #[test]
-    fn fail_replays_captured_output() {
-        let mut r = StyledReporter::new(false);
+    fn fail_word_and_output_replay_match_nextest() {
+        let mut r = StyledReporter::new(false, true);
         r.handle(&finished(
             "pkg::bin",
             "mod::boom",
             Verdict::Fail(101),
-            b"panicked at boom",
+            1,
+            b"panicked at boom\nsecond line\n",
         ));
         let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.contains("FAIL"), "{out}");
-        assert!(out.contains("--- output: pkg::bin mod::boom ---"), "{out}");
-        assert!(out.contains("panicked at boom"), "{out}");
+        assert_eq!(
+            out,
+            "        FAIL [   0.234s] pkg::bin mod::boom\n  output ───\n    panicked at boom\n    second line\n",
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn exec_fail_is_xfail() {
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&finished("p::b", "t", Verdict::SpawnError, 1, b""));
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert!(
+            out.starts_with("       XFAIL [   0.234s] p::b t"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn timeout_uses_long_word() {
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&finished("p::b", "t", Verdict::Timeout, 1, b""));
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert!(
+            out.starts_with("     TIMEOUT [   0.234s] p::b t"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn final_fail_after_retries_uses_try_short() {
+        let mut r = StyledReporter::new(false, true);
+        // Failed on attempt 3 (after retries) with a timeout → short word `TMT`.
+        r.handle(&finished("p::b", "t", Verdict::Timeout, 3, b""));
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert!(
+            out.starts_with("   TRY 3 TMT [   0.234s] p::b t"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn retry_line_is_magenta_try_with_duration() {
+        let mut r = StyledReporter::new(true, true);
+        r.handle(&TestEvent::TestRetrying {
+            binary_id: "p::b",
+            test_name: "t",
+            next_attempt: 3, // attempt 2 just failed
+            delay: Duration::ZERO,
+            verdict: Verdict::Fail(1),
+            duration: Duration::from_millis(500),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        let bare = strip_ansi(&out);
+        assert_eq!(bare, "  TRY 2 FAIL [   0.500s] p::b t\n", "{bare:?}");
+        assert!(out.contains("\u{1b}[35m"), "expected magenta: {out:?}");
+    }
+
+    #[test]
+    fn slow_line_uses_slow_bracket() {
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&TestEvent::TestSlow {
+            binary_id: "p::b",
+            test_name: "t",
+            elapsed: Duration::from_secs(30),
+            will_terminate: false,
+            attempt: 1,
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert_eq!(out, "        SLOW [> 30.000s] p::b t\n", "{out:?}");
+    }
+
+    #[test]
+    fn slow_on_retry_prefixes_try() {
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&TestEvent::TestSlow {
+            binary_id: "p::b",
+            test_name: "t",
+            elapsed: Duration::from_secs(30),
+            will_terminate: false,
+            attempt: 2,
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert!(
+            out.starts_with("  TRY 2 SLOW [> 30.000s] p::b t"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn skip_line_shows_empty_bracket_no_reason() {
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&TestEvent::TestSkipped {
+            binary_id: "pkg::bin",
+            test_name: "mod::sk",
+            reason: crate::engine::events::SkipReason::ExceedsClusterCapacity,
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert_eq!(
+            out, "        SKIP [         ] pkg::bin mod::sk\n",
+            "{out:?}"
+        );
     }
 
     #[test]
     fn color_emits_ansi() {
-        let mut r = StyledReporter::new(true);
-        r.handle(&finished("p::b", "t", Verdict::Pass, b""));
+        let mut r = StyledReporter::new(true, true);
+        r.handle(&finished("p::b", "t", Verdict::Pass, 1, b""));
         let out = String::from_utf8(r.take_scrollback()).unwrap();
         assert!(out.contains('\u{1b}'), "expected ANSI escapes: {out:?}");
+    }
+
+    #[test]
+    fn summary_matches_nextest_and_pluralizes() {
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats {
+                passed: 8,
+                failed: 2,
+                skipped: 1,
+                total: 11,
+            },
+            elapsed: Duration::from_secs(2),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert_eq!(
+            out,
+            "────────────\n     Summary [   2.000s] 11 tests run: 8 passed, 2 failed, 1 skipped\n",
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn summary_singular_and_no_failed_clause() {
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats {
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+                total: 1,
+            },
+            elapsed: Duration::from_millis(100),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert!(
+            out.contains("] 1 test run: 1 passed, 0 skipped\n"),
+            "{out:?}"
+        );
+        assert!(!out.contains("failed"), "{out:?}");
+    }
+
+    #[test]
+    fn summary_partial_total_shows_ratio() {
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats {
+                passed: 5,
+                failed: 0,
+                skipped: 2,
+                total: 10,
+            },
+            elapsed: Duration::from_secs(1),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert!(out.contains("7/10 tests run"), "{out:?}");
+    }
+
+    #[test]
+    fn summary_ascii_rule_when_not_unicode() {
+        let mut r = StyledReporter::new(false, false);
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats {
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+                total: 1,
+            },
+            elapsed: Duration::from_secs(1),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert!(out.starts_with("------------\n"), "{out:?}");
+    }
+
+    #[test]
+    fn starting_line_pluralizes() {
+        let mut one = StyledReporter::new(false, true);
+        one.handle(&TestEvent::RunStarted {
+            total: 1,
+            run_id: "r",
+        });
+        let s1 = String::from_utf8(one.take_scrollback()).unwrap();
+        assert_eq!(s1, "    Starting 1 test\n", "{s1:?}");
+
+        let mut many = StyledReporter::new(false, true);
+        many.handle(&TestEvent::RunStarted {
+            total: 42,
+            run_id: "r",
+        });
+        let s2 = String::from_utf8(many.take_scrollback()).unwrap();
+        assert_eq!(s2, "    Starting 42 tests\n", "{s2:?}");
     }
 
     fn running(bin: &str, test: &str, secs: u64, slow: bool) -> RunningView {
@@ -447,9 +776,11 @@ mod tests {
         let r = vec![running("pkg::b", "mod::a", 5, false)];
         let lines = render_running(&r, 4, false);
         assert_eq!(lines.len(), 4, "padded to exactly `rows`");
-        // Running line first (directly under the progress label), blanks below.
-        assert!(lines[0].contains("pkg::b mod::a"), "{:?}", lines[0]);
-        assert!(lines[0].contains("00:00:05"), "{:?}", lines[0]);
+        assert_eq!(
+            lines[0], "             [ 00:00:05] pkg::b mod::a",
+            "{:?}",
+            lines[0]
+        );
         assert_eq!(lines[3], "");
     }
 
@@ -460,8 +791,11 @@ mod tests {
             .collect();
         let lines = render_running(&r, 3, false);
         assert_eq!(lines.len(), 3);
-        // 3 rows: 2 tests shown + 1 overflow summary (5 - 2 = 3 more).
-        assert!(lines[2].contains("3 more tests running"), "{:?}", lines[2]);
+        assert!(
+            lines[2].contains("... and 3 more tests running"),
+            "{:?}",
+            lines[2]
+        );
     }
 
     #[test]
@@ -474,20 +808,14 @@ mod tests {
         };
         // 1h 2m 3s = 3723s.
         let line = progress_line(&stats, 9, Duration::from_secs(3723), false);
-        // `   Running [ 01:02:03] 37/122: 9 running, 30 passed, 6 failed, 1 skipped`
-        assert!(line.trim_start().starts_with("Running"), "{line}");
-        assert!(line.contains("[ 01:02:03]"), "{line}");
-        assert!(line.contains("37/122:"), "{line}"); // finished = 30+6+1
-        assert!(line.contains("9 running"), "{line}");
-        assert!(line.contains("30 passed"), "{line}");
-        assert!(line.contains("6 failed"), "{line}");
-        assert!(line.contains("1 skipped"), "{line}");
+        assert_eq!(
+            line, "     Running [ 01:02:03] 37/122: 9 running, 30 passed, 6 failed, 1 skipped",
+            "{line}"
+        );
     }
 
     #[test]
     fn progress_line_omits_failed_when_zero() {
-        // nextest's write_summary_str shows passed + skipped always, failed
-        // only when non-zero — so no "0 failed" clause.
         let stats = RunStats {
             passed: 5,
             failed: 0,
@@ -500,46 +828,26 @@ mod tests {
     }
 
     #[test]
-    fn summary_omits_failed_when_zero_and_shows_partial_total() {
-        let mut r = StyledReporter::new(false);
-        // 7 finished of 10 total (an interrupted run) with no failures.
-        r.handle(&TestEvent::RunFinished {
-            stats: RunStats {
-                passed: 5,
-                failed: 0,
-                skipped: 2,
-                total: 10,
-            },
-            elapsed: Duration::from_secs(1),
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.contains("7/10 tests run"), "{out}");
-        assert!(out.contains("5 passed, 2 skipped"), "{out}");
-        assert!(!out.contains("failed"), "{out}");
-    }
-
-    #[test]
     fn running_block_empty_is_all_blank() {
         let lines = render_running(&[], 3, false);
         assert_eq!(lines, vec!["".to_string(), "".to_string(), "".to_string()]);
     }
 
-    #[test]
-    fn summary_reports_counts() {
-        let mut r = StyledReporter::new(false);
-        r.handle(&TestEvent::RunFinished {
-            stats: RunStats {
-                passed: 8,
-                failed: 2,
-                skipped: 1,
-                total: 11,
-            },
-            elapsed: Duration::from_secs(1),
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.contains("11 tests run"), "{out}");
-        assert!(out.contains("8 passed"), "{out}");
-        assert!(out.contains("2 failed"), "{out}");
-        assert!(out.contains("1 skipped"), "{out}");
+    /// Strip CSI SGR sequences so colour tests can assert on the text.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for d in chars.by_ref() {
+                    if d == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 }

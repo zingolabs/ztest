@@ -1,83 +1,36 @@
 //! Zcash JSON-RPC client.
 //!
-//! [`ZcashRpc`] pairs an authenticated transport with a per-component
-//! attribution label and exposes typed methods for the bitcoind-derived
-//! JSON-RPC envelope. Both `zebrad` and `zcashd` serve it natively;
-//! `zaino` proxies the same wire format on its `jsonrpc` port. All
-//! three backends consume this client.
+//! [`ZcashRpc`] pairs an authenticated transport with a per-component attribution
+//! label and exposes typed methods for the bitcoind-derived JSON-RPC envelope.
+//! Both `zebrad` and `zcashd` serve it natively; `zaino` proxies the same wire
+//! format on its `jsonrpc` port. All three backends consume this client.
 //!
-//! # Why this lives in ztest rather than an external crate
-//!
-//! A review of the ecosystem (see `docs/architecture-decisions/`) found
-//! no Rust crate that covers ztest's surface:
-//!
-//! - `zaino-fetch` does not expose mining RPCs (`getblocktemplate`,
-//!   `submitblock`, `generate`) — required for regtest block generation
-//!   — calls `std::process::exit` on connect failure, and locks several
-//!   response fields private without accessors.
-//! - `zebra-rpc` only ships server-side types; pulling it as a client
-//!   would drag the full Zebra tree as a transitive dep.
-//! - `bitcoincore-rpc` is archived and shaped for Bitcoin (no
-//!   `upgrades` activation map, no shielded fields, no
-//!   `getblocksubsidy`).
-//!
-//! Surface area is small (~12 methods, ~5 envelope types), the wire
-//! format is stable, and owning it leaves the transport + error
-//! attribution under ztest's control.
+//! Owned in ztest rather than borrowed from an external crate: an ecosystem
+//! review (`docs/architecture-decisions/`) found none covering ztest's surface.
+//! `zaino-fetch` omits the mining RPCs (`getblocktemplate`, `submitblock`,
+//! `generate`) needed for regtest block generation, calls `std::process::exit`
+//! on connect failure, and hides response fields without accessors. `zebra-rpc`
+//! ships only server-side types and would drag the full Zebra tree. And
+//! `bitcoincore-rpc` is archived and Bitcoin-shaped (no `upgrades` activation
+//! map, no shielded fields, no `getblocksubsidy`). Surface area is small (~12
+//! methods, ~5 envelope types) and the wire format stable, so owning it keeps
+//! the transport and error attribution under ztest's control.
 
+use crate::topology::ActivationHeights;
 use serde_json::{Value, json};
-use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
-use zingo_common_components::protocol::ActivationHeights;
 
 use crate::RpcError;
 use crate::handles::client::AuthedRpc;
+// The typed RPC-response envelopes are interface types owned by `handles::types`;
+// this transport imports and produces them.
+use crate::handles::types::{BlockHash, BlockTip, BlockchainInfo, MempoolInfo, Peer, PeerInfo};
 use crate::regtest::parse_activation_heights_from_rpc;
-
-// ─────────────────────────── envelope types ────────────────────────────
-
-/// Block-tip summary: chain height + best block hash.
-pub type BlockTip = (BlockHeight, BlockHash);
-
-/// Mempool statistics returned by [`ZcashRpc::mempool_info`].
-#[derive(Debug, Clone, Copy)]
-pub struct MempoolInfo {
-    pub size: u64,
-    pub bytes: u64,
-    pub usage: Option<u64>,
-}
-
-/// Chain identity, tip, and difficulty summary returned by
-/// [`ZcashRpc::blockchain_info`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct BlockchainInfo {
-    pub chain: String,
-    pub blocks: BlockHeight,
-    pub headers: BlockHeight,
-    pub best_block_hash: BlockHash,
-    pub difficulty: f64,
-    pub estimated_height: Option<BlockHeight>,
-}
-
-/// Peer-table snapshot returned by [`ZcashRpc::peer_info`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct PeerInfo {
-    pub peers: Vec<Peer>,
-}
-
-/// One row from [`PeerInfo`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct Peer {
-    pub addr: String,
-    pub inbound: bool,
-    pub version: u32,
-    pub subver: String,
-}
 
 // ──────────────────────────────── client ───────────────────────────────
 
-/// Typed Zcash JSON-RPC client. Borrows its transport; construct on
-/// demand at a call site rather than caching.
+/// Typed Zcash JSON-RPC client. Borrows its transport; construct on demand at a
+/// call site rather than caching.
 #[derive(Debug)]
 pub struct ZcashRpc<'a> {
     component: &'static str,
@@ -85,8 +38,8 @@ pub struct ZcashRpc<'a> {
 }
 
 impl<'a> ZcashRpc<'a> {
-    /// Pair a transport with the component-attribution label used by
-    /// any [`RpcError`] this client emits.
+    /// Pair a transport with the component-attribution label used by any
+    /// [`RpcError`] this client emits.
     pub fn new(component: &'static str, client: &'a AuthedRpc) -> Self {
         Self { component, client }
     }
@@ -142,10 +95,9 @@ impl<'a> ZcashRpc<'a> {
         self.parse_block(v)
     }
 
-    /// `getblock <hash> 1` → `(height, hash)`. The hash bytes are
-    /// passed in display (big-endian) order — [`BlockHash`] already
-    /// stores them that way, so chaining `get_block_by_hash(&tip_hash)`
-    /// works directly.
+    /// `getblock <hash> 1` → `(height, hash)`. The hash bytes are passed in
+    /// display (big-endian) order, which is how [`BlockHash`] already stores
+    /// them, so chaining `get_block_by_hash(&tip_hash)` works directly.
     pub async fn get_block_by_hash(&self, hash: &BlockHash) -> Result<BlockTip, RpcError> {
         let hex_str = hex::encode(hash.0);
         let v = self.call("getblock", json!([hex_str, 1])).await?;
@@ -179,9 +131,9 @@ impl<'a> ZcashRpc<'a> {
         })
     }
 
-    /// `getpeerinfo` → typed [`PeerInfo`]. Carries the field subset
-    /// shared across `zebrad` and `zcashd`; per-peer extras (banscore,
-    /// syncedheaders, etc.) remain reachable via [`Self::call_raw`].
+    /// `getpeerinfo` → typed [`PeerInfo`]. Carries the field subset shared across
+    /// `zebrad` and `zcashd`; per-peer extras (banscore, syncedheaders, etc.)
+    /// remain reachable via [`Self::call_raw`].
     pub async fn peer_info(&self) -> Result<PeerInfo, RpcError> {
         let v = self.call("getpeerinfo", json!([])).await?;
         let arr = v
@@ -195,22 +147,19 @@ impl<'a> ZcashRpc<'a> {
     }
 
     /// `getblocksubsidy <height>` → raw JSON envelope. The shape is
-    /// network/branch dependent (NU6 splits funding streams differently
-    /// from Canopy), so this is intentionally untyped — callers project
-    /// the fields they need.
+    /// network/branch dependent (NU6 splits funding streams differently from
+    /// Canopy), so this stays untyped; callers project the fields they need.
     pub async fn block_subsidy(&self, height: BlockHeight) -> Result<Value, RpcError> {
         self.call("getblocksubsidy", json!([u32::from(height)]))
             .await
     }
 
-    /// `getblockheader <hash> <verbose>` → raw JSON. `verbose=true`
-    /// returns the object form; `verbose=false` returns the serialized
-    /// header as a hex string wrapped in a JSON string. Returned
-    /// untyped so callers can branch on the parity-test shape they
-    /// want.
+    /// `getblockheader <hash> <verbose>` → raw JSON. `verbose=true` returns the
+    /// object form; `verbose=false` returns the serialized header as a hex string
+    /// wrapped in a JSON string. Untyped so callers can branch on the parity-test
+    /// shape they want.
     pub async fn block_header(&self, hash: &str, verbose: bool) -> Result<Value, RpcError> {
-        self.call("getblockheader", json!([hash, verbose]))
-            .await
+        self.call("getblockheader", json!([hash, verbose])).await
     }
 
     /// Escape hatch for RPCs not yet modelled by a typed method. Prefer

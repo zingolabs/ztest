@@ -10114,7 +10114,7 @@ dependencies = [
  "zebra-chain",
  "zebra-node-services",
  "zebra-rpc",
- "zingo_common_components 0.2.0",
+ "zingo_common_components",
  "zingo_test_vectors 0.0.1 (git+https://github.com/zingolabs/infrastructure.git?tag=nu6_2_update_with_nuparams)",
 ]
 
@@ -10665,15 +10665,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zingo_common_components"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3378e81bdef45a9659736a09deaef2b5e5cb3d1556031468debfca3a21d4fa76"
-dependencies = [
- "hex",
-]
-
-[[package]]
 name = "zingo_test_vectors"
 version = "0.0.1"
 source = "git+https://github.com/zingolabs/infrastructure.git?tag=nu6_2_update_with_nuparams#1550e03208849271577be02c15e95a44d9052981"
@@ -10766,7 +10757,7 @@ dependencies = [
  "zingo-memo",
  "zingo-price",
  "zingo-status",
- "zingo_common_components 0.2.0",
+ "zingo_common_components",
  "zingo_test_vectors 0.0.1 (git+https://github.com/zingolabs/infrastructure.git?branch=dev)",
  "zip32",
 ]
@@ -10784,7 +10775,7 @@ dependencies = [
  "zcash_local_net",
  "zcash_protocol",
  "zebra-chain",
- "zingo_common_components 0.2.0",
+ "zingo_common_components",
  "zingo_test_vectors 0.0.1 (git+https://github.com/zingolabs/infrastructure.git?rev=nu6_2_update_with_nuparams)",
  "zingolib",
  "zip32",
@@ -10869,11 +10860,11 @@ dependencies = [
  "kube",
  "libc",
  "nextest-metadata",
- "nonempty",
  "owo-colors",
  "pepper-sync",
  "portable-pty",
  "proptest",
+ "prost",
  "rand 0.8.6",
  "ratatui",
  "reqwest",
@@ -10888,13 +10879,12 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
  "tracing",
  "walkdir",
- "zcash_client_backend",
- "zcash_primitives",
  "zcash_protocol",
  "zebra-chain",
- "zingo_common_components 0.3.1",
  "zingo_test_vectors 0.0.1 (git+https://github.com/zingolabs/infrastructure.git?tag=zcash_local_net_v0.6.0)",
  "zingolib",
  "zingolib_testutils",

@@ -1,21 +1,21 @@
 //! Zaino indexer backend.
 //!
-//! Speaks the lightwalletd `CompactTxStreamer` gRPC protocol on the
-//! `grpc` named port (8137 by default). Each call opens a fresh tonic
-//! connection. Intentionally self-contained — no shared helpers with
-//! `lightwalletd`. When Zaino's framing diverges, changes land here.
+//! Speaks the lightwalletd `CompactTxStreamer` gRPC protocol on the `grpc`
+//! named port (8137 by default). Each call opens a fresh tonic connection.
+//! Intentionally self-contained, with no shared helpers with `lightwalletd`;
+//! when Zaino's framing diverges, changes land here.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-use zcash_client_backend::proto::compact_formats::{CompactBlock, CompactTx};
-use zcash_client_backend::proto::service as proto;
-use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
-use zcash_primitives::block::BlockHash;
-use zcash_primitives::transaction::{Transaction, TxId};
+use crate::handles::types::BlockHash;
+use crate::proto;
+use crate::proto::compact_tx_streamer_client::CompactTxStreamerClient;
+use crate::proto::{CompactBlock, CompactTx};
 use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::ZatBalance;
 
@@ -37,14 +37,9 @@ const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Resolve the container image for a zaino pod. Used by
-/// `manifest::pod_spec_for_indexer`. Returns the published rc tag when
-/// `opts.image == Published`, or builds + `kind load`s a `zainod:dev-<hash>`
-/// image and returns that tag when `opts.image == FromSource`.
-///
-/// The from-source path blocks while the build runs (only on cache miss);
-/// the first test in a session takes the hit, subsequent tests in the same
-/// process hit the in-memory cache, and a re-run with the same source hits
-/// kind's containerd cache.
+/// `manifest::pod_spec_for_indexer`. Returns the published rc tag for a
+/// `Published` spec, or the `zainod:dev-<hash>` tag for a `Dev` spec (built
+/// and `kind load`ed by the preflight pipeline).
 pub(crate) fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
@@ -61,7 +56,7 @@ pub struct ZainoBackend;
 impl IndexerConfig for ZainoBackend {
     type Handle = ZainoIndexer;
 
-    fn into_handle(&self, plumbing: HandleInner) -> ZainoIndexer {
+    fn to_handle(&self, plumbing: HandleInner) -> ZainoIndexer {
         ZainoIndexer { plumbing }
     }
 
@@ -132,7 +127,7 @@ impl IndexerConfig for ZainoBackend {
 
 // ─────────────────────────────── ZainoIndexer ─────────────────────────
 
-/// Live zaino indexer handle. Holds only the env plumbing — all state is
+/// Live zaino indexer handle. Holds only the env plumbing; all state is
 /// remote, reached over gRPC (and zaino's JSON-RPC proxy).
 #[derive(Debug, Clone)]
 pub struct ZainoIndexer {
@@ -247,7 +242,7 @@ impl IndexerBackend for ZainoIndexer {
     }
 
     /// Drain `GetBlockRange` until the stream ends. Returns `(blocks,
-    /// errored)` — `errored == true` if the stream terminated with a
+    /// errored)`, where `errored` is true if the stream terminated with a
     /// non-Ok item (matching upstream `drain_block_range`).
     async fn drain_block_range(
         &self,
@@ -452,12 +447,10 @@ impl IndexerBackend for ZainoIndexer {
         Ok(out)
     }
 
-    async fn send_transaction(&self, tx: &Transaction) -> Result<proto::SendResponse, RpcError> {
+    async fn send_transaction(&self, raw_tx: &[u8]) -> Result<proto::SendResponse, RpcError> {
         let ep = self.plumbing.endpoint("grpc").await?;
         let endpoint = &ep;
-        let mut data = Vec::with_capacity(1024);
-        tx.write(&mut data)
-            .map_err(|e| RpcError::backend(COMPONENT, "SendTransaction", e))?;
+        let data = raw_tx.to_vec();
         let mut client = connect(endpoint).await?;
         Ok(client
             .send_transaction(proto::RawTransaction { data, height: 0 })
@@ -646,16 +639,16 @@ fn apply_regtest(
 }
 
 impl crate::component::Indexer<ZainoBackend> {
-    /// Apply the regtest **state** backend, sharing the validator's
-    /// on-disk zebra-state DB via `vol`. The StateService opens that DB
-    /// as a RocksDB secondary and syncs the non-finalized tip from the
-    /// validator's indexer gRPC, so the paired validator must be built
-    /// with [`crate::Validator::persistent_state_in`] on the same `vol`.
+    /// Apply the regtest state backend, sharing the validator's on-disk
+    /// zebra-state DB via `vol`. The StateService opens that DB as a RocksDB
+    /// secondary and syncs the non-finalized tip from the validator's indexer
+    /// gRPC, so the paired validator must be built with
+    /// [`crate::Validator::persistent_state_in`] on the same `vol`.
     ///
-    /// Unlike the bare [`crate::regtest::RegtestState::regtest_state`]
-    /// (which points at an empty pod-local dir and cannot boot), this
-    /// wires a real shared database. `_validator` records the pairing;
-    /// the in-cluster gRPC host is resolved from the env's validator.
+    /// Unlike the bare [`crate::regtest::RegtestState::regtest_state`] (which
+    /// points at an empty pod-local dir and cannot boot), this wires a real
+    /// shared database. `_validator` records the pairing; the in-cluster gRPC
+    /// host is resolved from the env's validator.
     pub fn regtest_state_in<V: crate::handles::validator::ValidatorBackend + ?Sized>(
         self,
         vol: &crate::SharedVolume,
@@ -677,8 +670,8 @@ const ZAINO_REGTEST_GRPC_PORT: u16 = crate::handles::ports::ZAINO_GRPC;
 /// zaino's own JSON-RPC port (regtest).
 const ZAINO_REGTEST_JSONRPC_PORT: u16 = crate::handles::ports::ZAINO_JSONRPC;
 
-/// Regtest validator's JSON-RPC port — the same canonical port zebra.rs
-/// and zcashd.rs serve their regtest JSON-RPC on.
+/// Regtest validator's JSON-RPC port: the same canonical port zebra.rs and
+/// zcashd.rs serve their regtest JSON-RPC on.
 const ZAINO_REGTEST_VALIDATOR_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_RPC;
 
 /// Path the validator state directory is mounted at inside the zaino
@@ -753,7 +746,7 @@ fn apply_testnet(
         .args(["start", "--config", "/etc/zaino/zainod.toml"])
 }
 
-/// zaino gRPC listen port — matches the `[grpc_settings] listen_address`
+/// zaino gRPC listen port. Matches the `[grpc_settings] listen_address`
 /// emitted by the generator and the named port in `manifest.rs`.
 const ZAINO_TESTNET_GRPC_PORT: u16 = crate::handles::ports::ZAINO_GRPC;
 
@@ -762,10 +755,10 @@ const ZAINO_TESTNET_JSONRPC_PORT: u16 = crate::handles::ports::ZAINO_JSONRPC;
 
 /// In-cluster DNS name of the paired zebrad pod. Matches the pod name
 /// the `Validator::zebrad(…).testnet(variant)` builder assigns by
-/// default — override on both sides if you `.named(…)` differently.
+/// default. Override on both sides if you `.named(…)` differently.
 const ZAINO_TESTNET_VALIDATOR_HOST: &str = "zebrad";
 
-/// Testnet zebrad's JSON-RPC port — the same canonical testnet port the
+/// Testnet zebrad's JSON-RPC port: the same canonical testnet port the
 /// zebrad backend serves on.
 const ZAINO_TESTNET_VALIDATOR_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_TESTNET_RPC;
 
@@ -778,9 +771,9 @@ const ZAINO_TESTNET_DB: &str = "/var/lib/zaino/db";
 
 // ──────────────────────────── Zaino-only RPCs ─────────────────────────
 //
-// Backend-specific RPCs as inherent methods on the concrete handle —
-// they simply don't exist on `LightwalletdIndexer`, so calling one on
-// the wrong backend is a compile error.
+// Backend-specific RPCs as inherent methods on the concrete handle: they
+// simply don't exist on `LightwalletdIndexer`, so calling one on the wrong
+// backend is a compile error.
 
 impl ZainoIndexer {
     pub async fn get_block_nullifiers(

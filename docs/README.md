@@ -1,4 +1,4 @@
-# `zcash_kube_net` — Design Docs
+# `ztest` — Design Docs
 
 A Rust library that boots Zcash network topologies (validators, indexers,
 wallets) on Kubernetes and hands typed RPC handles back to test code.

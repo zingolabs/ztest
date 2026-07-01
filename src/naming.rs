@@ -1,30 +1,30 @@
-//! Run / test naming. Pure functions over the environment — no I/O.
+//! Run / test naming. Pure functions over the environment, no I/O.
 //!
 //! Each `TestEnv` gets its own Kubernetes namespace named
-//! `ztest-{package}-{test}-{suffix}` — e.g. `ztest-wallet-tests-getblockrange-3af19c2b`.
-//! The `ztest-` prefix marks the namespace as a ztest-created test env (a
-//! convenient `kubectl get ns | grep ztest-` filter); the slugged package +
-//! test make `kubectl get ns` self-describing during a hang; the 8-hex
-//! suffix keeps re-runs and rstest `case_N` parametrizations from colliding.
-//! Slugs are truncated so the whole name stays inside the 63-char DNS-1123
-//! label limit. (Nothing functional keys on the name — cleanup, the janitor,
-//! and any RBAC select on the `zaino.io/role=test-env` label and
-//! `janitor/ttl` annotation, not the prefix.) Inside the namespace, components keep short
-//! stable names (`zebrad`, `zaino`, …) with a deterministic FQDN
+//! `ztest-{package}-{test}-{suffix}` (e.g. `ztest-wallet-tests-getblockrange-3af19c2b`).
+//! The `ztest-` prefix marks the namespace as a ztest-created test env
+//! (`kubectl get ns | grep ztest-`); the slugged package + test make
+//! `kubectl get ns` self-describing during a hang; the 8-hex suffix keeps
+//! re-runs and rstest `case_N` parametrizations from colliding. Slugs are
+//! truncated so the whole name stays inside the 63-char DNS-1123 label limit.
+//! Nothing functional keys on the name: cleanup, the janitor, and any RBAC
+//! select on the `zaino.io/role=test-env` label and `janitor/ttl` annotation,
+//! not the prefix. Inside the namespace, components keep short stable names
+//! (`zebrad`, `zaino`, …) with a deterministic FQDN
 //! `{name}.{namespace}.svc.cluster.local`. Concurrent tests never collide
-//! because they live in different namespaces — no slot pattern needed.
+//! because they live in different namespaces (no slot pattern needed).
 //!
-//! Full, untruncated identity (package, `module::test`, user) is also
-//! stamped as namespace labels (queryable via `kubectl get ns -l`) and a
-//! `zaino.io/test-full` annotation (no length limit), so the truncation in
-//! the name never loses information.
+//! Full, untruncated identity (package, `module::test`, user) is also stamped
+//! as namespace labels (queryable via `kubectl get ns -l`) and a
+//! `zaino.io/test-full` annotation (no length limit), so name truncation
+//! never loses information.
 
 /// Where the test process thinks it is. Picked once at `TestEnv::build`.
 #[derive(Debug, Clone)]
 pub struct RunCoords {
-    /// `${GITHUB_RUN_ID}` in CI, `${USER}-${PPID}` in dev. Stamped as a
-    /// label on every resource so an operator can group all envs from
-    /// one CI run or dev session.
+    /// `${GITHUB_RUN_ID}` in CI, `${USER}-${PPID}` in dev. Stamped as a label
+    /// on every resource so an operator can group all envs from one CI run or
+    /// dev session.
     pub run_id: String,
     /// The invoking user (`${USER}`, or `anon`). Stamped as the
     /// `zaino.io/user` namespace label for per-developer filtering.
@@ -34,7 +34,7 @@ pub struct RunCoords {
 impl RunCoords {
     /// Compute coords from environment variables and the parent process.
     pub fn from_env() -> Result<Self, NamingError> {
-        let ci_run_id = std::env::var("ZCASH_KUBE_NET_RUN_ID")
+        let ci_run_id = std::env::var("ZTEST_RUN_ID")
             .ok()
             .or_else(|| std::env::var("GITHUB_RUN_ID").ok());
 
@@ -54,7 +54,7 @@ impl RunCoords {
 
 #[cfg(target_family = "unix")]
 fn ppid() -> u32 {
-    // libc not in deps; read /proc instead — Linux-only matches our target.
+    // libc not in deps; read /proc instead (Linux-only, matches our target).
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
@@ -70,9 +70,8 @@ fn ppid() -> u32 {
     0
 }
 
-/// Short random token used as the namespace suffix. 8 hex chars —
-/// collision probability across realistic concurrent test counts is
-/// negligible.
+/// Short random token used as the namespace suffix. 8 hex chars; collision
+/// probability across realistic concurrent test counts is negligible.
 pub fn test_suffix() -> String {
     let v: u32 = rand::random();
     format!("{v:08x}")
@@ -87,12 +86,11 @@ pub fn namespace_for(package: &str, test: &str, suffix: &str) -> String {
 }
 
 /// Slugify `s` into a DNS-1123-safe fragment of at most `max` chars:
-/// lowercase, every run of non-alphanumeric characters collapsed to a
-/// single `-`, then trimmed of leading/trailing `-`. Empty input (or
-/// input that slugs to nothing) yields `"x"` so the result is always a
-/// valid label that starts and ends alphanumeric. Used for both name
-/// fragments and label values (label values forbid `:` — so a raw
-/// `module::test` test path must be slugged before it can be a label).
+/// lowercase, every run of non-alphanumeric characters collapsed to a single
+/// `-`, then trimmed of leading/trailing `-`. Empty input (or input that slugs
+/// to nothing) yields `"x"` so the result is always a valid label that starts
+/// and ends alphanumeric. Used for both name fragments and label values (label
+/// values forbid `:`, so a raw `module::test` path must be slugged first).
 pub fn slug(s: &str, max: usize) -> String {
     let mut out = String::with_capacity(s.len().min(max));
     let mut pending_dash = false;
@@ -113,14 +111,13 @@ pub fn slug(s: &str, max: usize) -> String {
     if out.is_empty() { "x".to_string() } else { out }
 }
 
-/// The running test's name (`module::test`, including any rstest
-/// `case_N`), read from the libtest thread name. `TestEnv::build` runs in
-/// the test body, and on every `#[tokio::test]` flavor that future is
-/// driven on the test-named thread, so the name survives (only
-/// `tokio::spawn`ed tasks degrade to `tokio-rt-worker`, and `build` is
-/// awaited directly). `NEXTEST_TEST_NAME` is *not* set by nextest, so the
-/// thread name — not that env var — is the source of truth; we fall back
-/// to it and then `"unknown"` only for completeness.
+/// The running test's name (`module::test`, including any rstest `case_N`),
+/// read from the libtest thread name. `TestEnv::build` runs in the test body,
+/// and on every `#[tokio::test]` flavor that future is driven on the
+/// test-named thread, so the name survives (only `tokio::spawn`ed tasks
+/// degrade to `tokio-rt-worker`, and `build` is awaited directly). nextest
+/// does not set `NEXTEST_TEST_NAME`, so the thread name is the source of
+/// truth; the env var and `"unknown"` are fallbacks only.
 pub fn current_test_name() -> String {
     std::thread::current()
         .name()
@@ -129,10 +126,10 @@ pub fn current_test_name() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// The test crate's package name (`wallet-tests`, `walletless-tests`),
-/// from the `CARGO_PKG_NAME` that cargo sets for the running test process.
-/// Note: this is the *runtime* env var (the test binary's crate), not
-/// `env!("CARGO_PKG_NAME")` (which would resolve to `ztest`).
+/// The test crate's package name (`wallet-tests`, `walletless-tests`), from the
+/// `CARGO_PKG_NAME` cargo sets for the running test process. This is the
+/// runtime env var (the test binary's crate), not `env!("CARGO_PKG_NAME")`
+/// (which would resolve to `ztest`).
 pub fn current_package() -> String {
     std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "unknown".into())
 }

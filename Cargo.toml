@@ -21,11 +21,6 @@ hex = "0.4.3"
 reqwest = { version = "0.12", default-features = false }
 
 zcash_protocol = { version = "0.9.0", features = ["local-consensus"] }
-zcash_primitives = "0.28.0"
-zcash_client_backend = { version = "0.23", default-features = false, features = ["lightwalletd-tonic", "transparent-inputs", "orchard"] }
-
-# TODO: Remove vendored?
-zingo_common_components = "0.3.1"
 
 # ─────────────────────────── ztest crate ──────────────────────────────
 [package]
@@ -63,9 +58,14 @@ inventory = "0.3"
 ctor = "0.2"
 
 zcash_protocol = { workspace = true }
-zcash_primitives = { workspace = true }
-zcash_client_backend = { workspace = true }
-zingo_common_components = { workspace = true }
+
+# Runtime for the vendored lightwalletd gRPC bindings in `src/proto` (the
+# `cash.z.wallet.sdk.rpc` client). ztest owns these bindings rather than
+# pulling `zcash_client_backend`'s proto (which drags a wallet stack and marks
+# the still-served nullifier RPCs `#[deprecated]`). prost = message codec,
+# tonic-prost = the `ProstCodec` the generated client uses over `tonic`.
+prost = "0.14"
+tonic-prost = "0.14"
 
 # In-process wallet backend (`backends::zingo`). zingolib runs as a library
 # in the test binary against the pod-hosted indexer's gRPC. Git pins MUST
@@ -73,19 +73,25 @@ zingo_common_components = { workspace = true }
 # nonempty / TxId copies unify into single versions in the lockfile.
 zingolib = { git = "https://github.com/zingolabs/zingolib.git", rev = "61418d6ecbc679a88da8268a2be5db3926501fc6", features = [
     "testutils",
-] }
-zingolib_testutils = { git = "https://github.com/zingolabs/zingolib.git", rev = "61418d6ecbc679a88da8268a2be5db3926501fc6" }
-pepper-sync = { git = "https://github.com/zingolabs/zingolib.git", rev = "61418d6ecbc679a88da8268a2be5db3926501fc6" }
-zingo_test_vectors = { git = "https://github.com/zingolabs/infrastructure.git", tag = "zcash_local_net_v0.6.0" }
-zebra-chain = "9.0.0"
-zip32 = "0.2.1"
-nonempty = "0.11"
+], optional = true }
+zingolib_testutils = { git = "https://github.com/zingolabs/zingolib.git", rev = "61418d6ecbc679a88da8268a2be5db3926501fc6", optional = true }
+pepper-sync = { git = "https://github.com/zingolabs/zingolib.git", rev = "61418d6ecbc679a88da8268a2be5db3926501fc6", optional = true }
+zingo_test_vectors = { git = "https://github.com/zingolabs/infrastructure.git", tag = "zcash_local_net_v0.6.0", optional = true }
+# Only the `zingo` backend needs zebra-chain (zingolib's ConfiguredActivationHeights
+# param type); ztest core no longer links it. Pinned to 9.0.0 to match zingolib
+# rev 61418d6e's resolved zebra so the type unifies. Optional + gated on `zingo`.
+zebra-chain = { version = "9.0.0", optional = true }
+# zingo-only (the in-process wallet backend); gated on the `zingo` feature.
+zip32 = { version = "0.2.1", optional = true }
+tempfile = { version = "3.2", optional = true }
+# Used by the generated proto client (`http::uri::PathAndQuery`).
 http = "1.1"
-tempfile = "3.2"
 
 reqwest = { workspace = true }
 jsonrpsee-types = "0.24"
-tonic = { version = "0.14", default-features = false, features = ["transport", "channel"] }
+# `codegen` is required by the generated client in `src/proto/service.rs`
+# (`tonic::codegen`); `transport`/`channel` for the gRPC connection.
+tonic = { version = "0.14", default-features = false, features = ["transport", "channel", "codegen"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 owo-colors = "4.3.0"
@@ -112,6 +118,23 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 # the single crossterm 0.29 in the lock — no skew with ratatui's crossterm.
 nextest-metadata = "0.14"
 
+[features]
+default = []
+# In-process zingolib wallet backend (`backends::zingo`, `Wallet::zingo`).
+# OFF by default so consumers that only drive validators/indexers (e.g. zaino's
+# walletless-tests) don't link zingolib — and, transitively, zingolib_testutils
+# → zcash_local_net → the old zebra crates. Enable it in suites that exercise an
+# in-process wallet (e.g. zaino's wallet-tests).
+zingo = [
+    "dep:zingolib",
+    "dep:zingolib_testutils",
+    "dep:pepper-sync",
+    "dep:zingo_test_vectors",
+    "dep:zebra-chain",
+    "dep:zip32",
+    "dep:tempfile",
+]
+
 [dev-dependencies]
 # Property testing for the pure admission core: the scheduler is a
 # deterministic function of its inputs (no clock, no I/O), so randomized
@@ -119,3 +142,8 @@ nextest-metadata = "0.14"
 # committed == Σ live leases) far past what hand-picked cases reach. Kept fast
 # and hermetic — no cluster, in line with the FakeStore/logical-clock suite.
 proptest = "1"
+
+[build-dependencies]
+# Codegen for the vendored lightwalletd proto in `proto/` → `src/proto`.
+# Needs `protoc` at build time (provided by the dev shell, see flake.nix).
+tonic-prost-build = "0.14"

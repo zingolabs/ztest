@@ -1,19 +1,19 @@
-//! Validator backends — two traits, nothing else.
+//! Validator backends: two traits.
 //!
-//!  - [`ValidatorConfig`] — what your config ZST implements (e.g.
-//!    `ZebraBackend`). Config-time behaviour (label, NU ceiling, regtest
-//!    materialization) plus the factory that turns it into a live handle
-//!    once the env assigns plumbing.
-//!  - [`ValidatorBackend`] — what your live handle implements (e.g.
-//!    `ZebraValidator`): the RPC contract a test drives the validator
-//!    with. Backend-specific RPCs (zebrad's `getblockchaininfo`,
-//!    zcashd's `getblockdeltas`) are *inherent* methods on the concrete
-//!    handle, so calling one on the wrong backend is a compile error.
+//!  - [`ValidatorConfig`]: what a config ZST implements (e.g. `ZebraBackend`).
+//!    Config-time behaviour (label, NU ceiling, regtest materialization) plus
+//!    the factory that turns it into a live handle once the env assigns
+//!    plumbing.
+//!  - [`ValidatorBackend`]: what a live handle implements (e.g.
+//!    `ZebraValidator`), the RPC contract a test drives the validator with.
+//!    Backend-specific RPCs (zebrad's `getblockchaininfo`, zcashd's
+//!    `getblockdeltas`) are inherent methods on the concrete handle, so
+//!    calling one on the wrong backend is a compile error.
 
 use std::time::Duration;
 
+use crate::topology::ActivationHeights;
 use async_trait::async_trait;
-use zingo_common_components::protocol::ActivationHeights;
 
 use crate::component::ComponentOpts;
 use crate::handles::client::JsonRpcClient;
@@ -22,30 +22,29 @@ use crate::handles::{Endpoint, HandleInner};
 use crate::topology::NetworkUpgrade;
 use crate::{EnvError, RpcError};
 
-pub use zcash_primitives::block::BlockHash;
 pub use zcash_protocol::consensus::BlockHeight;
 
-// JSON-RPC envelope types are owned by the protocol module — re-exported
-// here so the public surface at `ztest::handles::validator::*` stays
-// stable for existing consumers and `lib.rs` re-exports.
-pub use crate::protocol::zcash_rpc::{BlockTip, BlockchainInfo, MempoolInfo, Peer, PeerInfo};
+// Dev-facing RPC envelope types live in `handles::types`; re-exported here so
+// the public surface at `ztest::handles::validator::*` (and the `lib.rs`
+// prelude) stays stable, and a backend impl pulls the trait and its response
+// types from one path.
+pub use crate::handles::types::{BlockHash, BlockTip, BlockchainInfo, MempoolInfo, Peer, PeerInfo};
 
-/// Static consensus parameters for a validator's network, sourced from
-/// ztest's pinned view — NOT live chain state. The network identity is
-/// read from the node; the constants are then resolved from ztest's pins
-/// (the `zebra-chain` dependency for zebrad). Distinct from
-/// [`BlockchainInfo`] (runtime tip) and the node-enforced
-/// [`ValidatorBackend::activation_heights`].
+/// Static consensus parameters for a validator's network, sourced from ztest's
+/// pinned view, not live chain state. The network identity is read from the
+/// node; the constants are then resolved from ztest's pins (the `zebra-chain`
+/// dependency for zebrad). Distinct from [`BlockchainInfo`] (runtime tip) and
+/// the node-enforced [`ValidatorBackend::activation_heights`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainConfig {
     /// Network identifier as the node reports it (`"regtest"`, `"test"`,
     /// `"main"`).
     pub network: String,
     /// Height of the first block-subsidy halving, when ztest models the
-    /// backend's subsidy schedule. `Some` for zebrad (derived from the
-    /// pinned `zebra-chain`); `None` for zcashd — ztest sets no
-    /// `nSubsidyHalvingInterval`, so the binary's regtest default applies
-    /// and ztest does not track it.
+    /// backend's subsidy schedule. `Some` for zebrad (derived from the pinned
+    /// `zebra-chain`); `None` for zcashd, where ztest sets no
+    /// `nSubsidyHalvingInterval`, so the binary's regtest default applies and
+    /// ztest does not track it.
     pub first_halving_height: Option<BlockHeight>,
 }
 
@@ -55,20 +54,20 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
 
     /// Build the runtime handle once the env has assigned `plumbing`
     /// (the back-reference + component id used to resolve endpoints).
-    fn into_handle(&self, plumbing: HandleInner) -> Self::Handle;
+    fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
 
-    /// The value pool this backend mines its coinbase into when a test
-    /// doesn't override it via
+    /// The value pool this backend mines its coinbase into when a test doesn't
+    /// override it via
     /// [`Validator::mine_to`](crate::component::Validator::mine_to). Both
-    /// backends can mine any pool; the default is a cost/convenience choice:
-    /// zebrad defaults to [`Pool::Transparent`] (the cheapest block template
-    /// — no shielded proof per block), zcashd to [`Pool::Sapling`] (its
+    /// backends can mine any pool; the default is a cost/convenience choice.
+    /// zebrad defaults to [`Pool::Transparent`] (the cheapest block template,
+    /// no shielded proof per block), zcashd to [`Pool::Sapling`] (its
     /// historical shielded coinbase default).
     fn default_coinbase_pool(&self) -> Pool;
 
     /// Stable label for this backend (`"zcashd"` / `"zebrad"`). Mirrors
-    /// [`ValidatorBackend::label`] on the live handle, but is available on
-    /// the spec *before* launch, so a backend-generic test can branch on it.
+    /// [`ValidatorBackend::label`] on the live handle, but is available on the
+    /// spec before launch, so a backend-generic test can branch on it.
     fn label(&self) -> &'static str;
 
     /// Highest network upgrade this backend, at the given pinned
@@ -98,32 +97,31 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
 /// A validator backend's value-pool capabilities.
 ///
 /// Groups the two pool facts a test needs about a node: which pools it
-/// validates at all, and the single pool its coinbase pays into. The two
-/// have different cardinality — `supported` is a set, `coinbase` is one
-/// distinguished member of it — so they're modelled as distinct fields
-/// rather than a per-pool map.
+/// validates at all, and the single pool its coinbase pays into. The two have
+/// different cardinality (`supported` is a set, `coinbase` is one distinguished
+/// member of it), so they're modelled as distinct fields rather than a per-pool
+/// map.
 #[derive(Debug, Clone)]
 pub struct PoolSupport {
     /// Every value pool the node validates on its chain. Both zcashd
-    /// (v6.20.0) and zebrad validate — and can mine a coinbase into — all
-    /// three pools, so both list every [`Pool`]. `coinbase` is always a
-    /// member.
+    /// (v6.20.0) and zebrad validate (and can mine a coinbase into) all three
+    /// pools, so both list every [`Pool`]. `coinbase` is always a member.
     pub supported: &'static [Pool],
 
-    /// The single pool the coinbase pays into — a fixed property of the
-    /// backend's miner address (baked into its regtest config), not a
-    /// per-test choice. Defaults to [`Pool::Transparent`] for zebrad (cheapest
-    /// block template) and [`Pool::Sapling`] for zcashd; either can be
-    /// overridden per-validator via
-    /// [`Validator::mine_to`](crate::component::Validator::mine_to). Always
-    /// one of [`Self::supported`].
+    /// The single pool the coinbase pays into: a fixed property of the
+    /// backend's miner address (baked into its regtest config), not a per-test
+    /// choice. Defaults to [`Pool::Transparent`] for zebrad (cheapest block
+    /// template) and [`Pool::Sapling`] for zcashd; either can be overridden
+    /// per-validator via
+    /// [`Validator::mine_to`](crate::component::Validator::mine_to). Always one
+    /// of [`Self::supported`].
     pub coinbase: Pool,
 }
 
 impl PoolSupport {
-    /// Whether the node validates `pool`. Tests gate pool-specific work
-    /// on this — e.g. skip an Orchard send where `supports(Pool::Orchard)`
-    /// is `false`, rather than letting it fail deep in the node.
+    /// Whether the node validates `pool`. Tests gate pool-specific work on
+    /// this: e.g. skip an Orchard send where `supports(Pool::Orchard)` is
+    /// `false`, rather than letting it fail deep in the node.
     pub fn supports(&self, pool: Pool) -> bool {
         self.supported.contains(&pool)
     }
@@ -148,9 +146,9 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     /// `getinfo` for zcashd) is backend-specific.
     async fn ready(&self, timeout: Duration) -> Result<(), RpcError>;
 
-    /// Generate `n` blocks. Returns the new chain-tip height once the
-    /// chain has advanced. The coinbase pays into
-    /// [`PoolSupport::coinbase`] — the pool fixed for this backend.
+    /// Generate `n` blocks. Returns the new chain-tip height once the chain has
+    /// advanced. The coinbase pays into [`PoolSupport::coinbase`], the pool
+    /// fixed for this backend.
     async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError>;
 
     /// This backend's value-pool capabilities: which pools it validates,
@@ -178,13 +176,13 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     /// Current block count.
     async fn block_count(&self) -> Result<BlockHeight, RpcError>;
 
-    /// `getblocksubsidy <height>` — raw JSON (network/branch dependent).
+    /// `getblocksubsidy <height>`: raw JSON (network/branch dependent).
     async fn block_subsidy(&self, height: BlockHeight) -> Result<serde_json::Value, RpcError>;
 
     /// Mempool statistics.
     async fn mempool_info(&self) -> Result<MempoolInfo, RpcError>;
 
-    /// `getblockheader <hash> <verbose>` — raw JSON.
+    /// `getblockheader <hash> <verbose>`: raw JSON.
     async fn get_block_header(
         &self,
         hash: &str,
@@ -195,14 +193,14 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     async fn activation_heights(&self) -> Result<ActivationHeights, RpcError>;
 
     /// Static consensus parameters for this validator's network. See
-    /// [`ChainConfig`]. Reads the network identity from the node, then
-    /// resolves ztest's pinned constants for it. Distinct from
-    /// [`Self::activation_heights`] (what the node *enforces*) and from
+    /// [`ChainConfig`]. Reads the network identity from the node, then resolves
+    /// ztest's pinned constants for it. Distinct from
+    /// [`Self::activation_heights`] (what the node enforces) and from
     /// [`BlockchainInfo`] (live tip state).
     async fn chain_config(&self) -> Result<ChainConfig, RpcError>;
 
-    // ── conveniences: loops over the methods above, implemented per
-    //    backend (no default bodies — each handle spells its own out) ──
+    // Conveniences: loops over the methods above, implemented per backend
+    // (no default bodies, each handle spells its own out).
 
     /// `generate_blocks` with a per-block delay between mines.
     async fn generate_blocks_with_delay(&self, n: u32) -> Result<BlockHeight, RpcError>;

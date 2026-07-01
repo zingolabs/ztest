@@ -1,14 +1,15 @@
-//! Component handles + per-category RPC dispatch.
+//! Component handles and per-category RPC dispatch.
 //!
 //! Every handle is a concrete per-backend struct (e.g. `ZebraValidator`,
-//! `ZainoIndexer`, `ZingoWallet`) implementing its category's
-//! `*Backend` contract; backend-specific RPCs are inherent methods, so
-//! calling one on the wrong backend is a compile error — no downcasts,
-//! no panics. Each handle holds a [`HandleInner`] (a `Weak<EnvInner>` +
-//! component id) to reach its live component.
+//! `ZainoIndexer`, `ZingoWallet`) implementing its category's `*Backend`
+//! contract; backend-specific RPCs are inherent methods, so calling one on the
+//! wrong backend is a compile error (no downcasts, no panics). Each handle
+//! holds a [`HandleInner`] (a `Weak<EnvInner>` plus component id) to reach its
+//! live component.
 
 pub mod client;
 pub mod indexer;
+pub mod types;
 pub mod validator;
 pub mod wallet;
 
@@ -48,23 +49,22 @@ impl Endpoint {
 
 // ───────────────────────────── handles ─────────────────────────────────
 
-/// Opaque plumbing handed to a handle so it can reach its live
-/// component: a back-reference to the env plus the component id used to
-/// resolve endpoints. The env constructs one per component in
-/// `add_*`; backends receive it via
-/// [`ValidatorSpec::into_handle`](crate::handles::validator::ValidatorSpec::into_handle)
-/// and store it. Fields are crate-private — third-party backends move it
-/// into their handle and call [`endpoint`](Self::endpoint), they don't
-/// construct or inspect it.
+/// Opaque plumbing handed to a handle so it can reach its live component: a
+/// back-reference to the env plus the component id used to resolve endpoints.
+/// The env constructs one per component in `add_*`; backends receive it via
+/// [`ValidatorSpec::to_handle`](crate::handles::validator::ValidatorSpec::to_handle)
+/// and store it. Fields are crate-private: third-party backends move it into
+/// their handle and call [`endpoint`](Self::endpoint), they don't construct or
+/// inspect it.
 #[derive(Debug, Clone)]
 pub struct HandleInner {
     pub(crate) inner: Weak<EnvInner>,
     pub(crate) component_id: u64,
     /// Whether the env configured this component for regtest. Carried as
-    /// plumbing because the network identity is otherwise unrecoverable
-    /// at runtime: zebra models regtest as a Testnet-kind network, so its
-    /// `getblockchaininfo.chain` reports `"test"` — indistinguishable from
-    /// a real testnet by RPC alone. See `ValidatorBackend::chain_config`.
+    /// plumbing because the network identity is otherwise unrecoverable at
+    /// runtime: zebra models regtest as a Testnet-kind network, so its
+    /// `getblockchaininfo.chain` reports `"test"`, indistinguishable from a
+    /// real testnet by RPC alone. See `ValidatorBackend::chain_config`.
     pub(crate) regtest: bool,
     /// The value pool this validator mines its coinbase into, resolved at
     /// `add_validator` time from the builder's choice (or the backend
@@ -101,14 +101,14 @@ impl HandleInner {
 // ───────────────────────────── named-port table ────────────────────────
 
 /// The single source of truth for every container port ztest assigns.
-/// Backends must reference these rather than redeclaring the literals —
-/// the same number appearing in two places is a drift bug waiting to
-/// happen (a renamed port that only gets updated on one side).
+/// Backends must reference these rather than redeclaring the literals: the
+/// same number in two places is a drift bug waiting to happen (a renamed port
+/// updated on only one side).
 pub mod ports {
     pub const ZEBRAD_RPC: u16 = 28232;
-    /// zebrad's JSON-RPC port on a *testnet* topology (distinct from the
-    /// regtest [`ZEBRAD_RPC`]). Shared by the zebrad backend and any zaino
-    /// indexer paired with it.
+    /// zebrad's JSON-RPC port on a testnet topology (distinct from the regtest
+    /// [`ZEBRAD_RPC`]). Shared by the zebrad backend and any zaino indexer
+    /// paired with it.
     pub const ZEBRAD_TESTNET_RPC: u16 = 18232;
     pub const ZEBRAD_METRICS: u16 = 9999;
     pub const ZEBRAD_P2P: u16 = 18233;

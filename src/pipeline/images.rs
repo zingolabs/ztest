@@ -1,20 +1,14 @@
-//! Phase C — dev-image inventory discovery.
+//! Phase C: dev-image inventory discovery.
 //!
-//! For each test binary with ≥1 selected test, spawn it with
-//! `ZTEST_DUMP_INVENTORY=1` (and `--`-terminated argv so no test
-//! filter args confuse the harness — the ctor hook exits before
-//! libtest reads argv anyway, but cleaner). Each binary writes one
-//! `"kind"`-tagged JSON `InventoryLine` per line to stdout, then exits 0;
-//! we keep the `Dev` lines and ignore `Qos` ones (consumed elsewhere).
+//! For each test binary with a selected test, spawn it with
+//! `ZTEST_DUMP_INVENTORY=1`. Each binary writes one `"kind"`-tagged JSON
+//! `InventoryLine` per line to stdout, then exits 0; we keep the `Dev` lines and
+//! ignore `Qos` ones (consumed elsewhere).
 //!
-//! We collect across every binary and dedupe by
-//! `(dockerfile, context, repo, features)` — the same `dev!` call
-//! linked into N binaries produces N submissions, only one of which
-//! needs to be built.
-//!
-//! On an empty inventory (no `dev!` site reachable from any selected
-//! binary) we short-circuit; the docker-build / kind-load phases
-//! become no-ops.
+//! Results are deduped by `(dockerfile, context, repo, features)`: the same
+//! `dev!` call linked into N binaries yields N submissions, only one needing a
+//! build. An empty inventory short-circuits, so the docker-build / kind-load
+//! phases become no-ops.
 
 use std::collections::BTreeSet;
 use std::process::Stdio;
@@ -22,60 +16,100 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::inventory::{DevImageEntry, InventoryLine, QosEntry};
+use crate::inventory::{
+    DevImageEntry, InventoryLine, QosEntry, SeedEntry, SeedPayload, TestDepEntry,
+};
 use crate::pipeline::build::SelectedBinary;
 
-/// Both registries demuxed from one binary's tagged inventory dump stream.
+/// All registries demuxed from one binary's tagged inventory dump stream.
 #[derive(Debug, Default)]
 struct Dumped {
     dev: Vec<DevImageEntry>,
     qos: Vec<QosEntry>,
+    seeds: Vec<SeedEntry>,
+    deps: Vec<TestDepEntry>,
 }
 
-/// Result of Phase C — the deduped set of dev images required by the
-/// currently-selected test set.
+/// Result of Phase C: the deduped set of resources (dev images + data seeds) the
+/// currently-selected test set declares, ready to become resource-graph nodes,
+/// plus the per-binary associations the engine needs to gate admission on
+/// resource readiness.
 #[derive(Debug, Clone)]
-pub enum ImagesOutcome {
+pub enum DumpOutcome {
     /// Inventory was successfully dumped from every selected binary.
-    /// `images` is the deduped declaration list.
-    Discovered { images: Vec<DevImageEntry> },
-    /// One or more binaries failed to dump (non-zero exit, stderr
-    /// captured). The CLI surfaces this and aborts before docker
-    /// build.
+    Discovered {
+        /// Deduped dev images across the whole selection (the graph's image nodes).
+        images: Vec<DevImageEntry>,
+        /// Deduped seeds across the whole selection (the graph's seed nodes).
+        seeds: Vec<SeedEntry>,
+        /// Per-binary dev images (deduped within a binary): the binary-level image
+        /// edge — every test in a binary depends on that binary's images.
+        images_by_binary: Vec<(String, Vec<DevImageEntry>)>,
+        /// Per-binary test→resource edges (`#[ztest::archive]`/`#[needs]`): the
+        /// sound per-test seed edge. Binary-scoped because `test_id`s can collide
+        /// across binaries.
+        deps_by_binary: Vec<(String, Vec<TestDepEntry>)>,
+    },
+    /// One or more binaries failed to dump (non-zero exit, stderr captured). The
+    /// CLI surfaces this and aborts before provisioning.
     Failed { detail: String },
 }
 
-/// Run the inventory dump for each selected binary in turn (cheap —
-/// each is sub-100ms — and serial keeps the output legible). The same
-/// dump stream carries both registries: returns the deduped dev-image
-/// list for the docker pipeline **and** the per-binary QoS tier
-/// declarations the engine (`engine::plan`) assigns each test from. QoS
-/// entries are kept binary-scoped because the match is keyed by `binary_id`
-/// (exact test names can collide across binaries).
-pub async fn discover(
-    binaries: &[SelectedBinary],
-) -> (ImagesOutcome, Vec<(String, Vec<QosEntry>)>) {
-    let mut seen: BTreeSet<DedupKey> = BTreeSet::new();
+/// Run the inventory dump for each selected binary in turn (each is sub-100ms,
+/// and serial keeps the output legible). The dump stream carries every registry:
+/// returns the deduped dev-image + seed lists for the resource graph, the
+/// per-binary image and test→resource edges the engine gates admission on, and
+/// the per-binary QoS tier declarations the engine (`engine::plan`) assigns each
+/// test from. All per-binary lists stay binary-scoped because the match is keyed
+/// by `binary_id` (exact test names can collide across binaries).
+pub async fn discover(binaries: &[SelectedBinary]) -> (DumpOutcome, Vec<(String, Vec<QosEntry>)>) {
+    let mut seen_img: BTreeSet<DedupKey> = BTreeSet::new();
+    let mut seen_seed: BTreeSet<(String, SeedPayload)> = BTreeSet::new();
     let mut images: Vec<DevImageEntry> = Vec::new();
+    let mut seeds: Vec<SeedEntry> = Vec::new();
     let mut qos_by_binary: Vec<(String, Vec<QosEntry>)> = Vec::new();
+    let mut images_by_binary: Vec<(String, Vec<DevImageEntry>)> = Vec::new();
+    let mut deps_by_binary: Vec<(String, Vec<TestDepEntry>)> = Vec::new();
 
     for bin in binaries {
         match dump_one(bin).await {
-            Ok(Dumped { dev, qos }) => {
+            Ok(Dumped {
+                dev,
+                qos,
+                seeds: s,
+                deps,
+            }) => {
+                // Per-binary images, deduped within the binary (the binary edge).
+                let mut seen_bin_img: BTreeSet<DedupKey> = BTreeSet::new();
+                let mut bin_images: Vec<DevImageEntry> = Vec::new();
                 for d in dev {
-                    if seen.insert(DedupKey::from(&d)) {
+                    if seen_bin_img.insert(DedupKey::from(&d)) {
+                        bin_images.push(d.clone());
+                    }
+                    if seen_img.insert(DedupKey::from(&d)) {
                         images.push(d);
+                    }
+                }
+                if !bin_images.is_empty() {
+                    images_by_binary.push((bin.binary_id.clone(), bin_images));
+                }
+                for e in s {
+                    if seen_seed.insert((e.source.clone(), e.payload)) {
+                        seeds.push(e);
                     }
                 }
                 if !qos.is_empty() {
                     qos_by_binary.push((bin.binary_id.clone(), qos));
+                }
+                if !deps.is_empty() {
+                    deps_by_binary.push((bin.binary_id.clone(), deps));
                 }
             }
             Err(detail) => {
                 // On failure the caller aborts before lowering, so the
                 // partial QoS accumulation is moot.
                 return (
-                    ImagesOutcome::Failed {
+                    DumpOutcome::Failed {
                         detail: format!("{}: {detail}", bin.binary_id),
                     },
                     qos_by_binary,
@@ -83,7 +117,15 @@ pub async fn discover(
             }
         }
     }
-    (ImagesOutcome::Discovered { images }, qos_by_binary)
+    (
+        DumpOutcome::Discovered {
+            images,
+            seeds,
+            images_by_binary,
+            deps_by_binary,
+        },
+        qos_by_binary,
+    )
 }
 
 /// Spawn one binary with `ZTEST_DUMP_INVENTORY=1` and parse the
@@ -117,6 +159,8 @@ async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, String> {
             match serde_json::from_str::<InventoryLine>(&line) {
                 Ok(InventoryLine::Dev(d)) => dumped.dev.push(d),
                 Ok(InventoryLine::Qos(q)) => dumped.qos.push(q),
+                Ok(InventoryLine::Seed(s)) => dumped.seeds.push(s),
+                Ok(InventoryLine::Dep(d)) => dumped.deps.push(d),
                 Err(e) => {
                     return Err(format!("malformed inventory line `{line}`: {e}"));
                 }

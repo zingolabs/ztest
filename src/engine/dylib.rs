@@ -2,11 +2,11 @@
 //! every test child must inherit, from the `cargo nextest list` build-meta.
 //!
 //! Without this, test binaries that link libstd dynamically fail to start with
-//! a libstdc++ "exit 127". This reproduces `RustBuildMeta::dylib_paths`
+//! a libstdc++ "exit 127". Reproduces `RustBuildMeta::dylib_paths`
 //! (nextest-runner `list/rust_build_meta.rs`): linked paths (that exist) first,
 //! then each base output directory plus its `deps` subdir, then the host and
-//! target rustc libdirs — deduped, preserving order — prepended to the
-//! inherited value. Pure: the on-disk existence check is injectable.
+//! target rustc libdirs, deduped preserving order, prepended to the inherited
+//! value. The on-disk existence check is injectable, so this stays pure.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ fn dylib_dirs(meta: &RustBuildMetaSummary, exists: &dyn Fn(&Path) -> bool) -> Ve
 
     let mut dirs: Vec<PathBuf> = Vec::new();
 
-    // 1. Linked paths (relative), only if present on disk — Cargo's order.
+    // 1. Linked paths (relative), only if present on disk (Cargo's order).
     for rel in &meta.linked_paths {
         let p = build_dir.join(rel.as_str());
         if exists(&p) {
@@ -54,7 +54,7 @@ fn dylib_dirs(meta: &RustBuildMetaSummary, exists: &dyn Fn(&Path) -> bool) -> Ve
         }
     }
 
-    // 2. Each base output directory, then its `deps` subdir — Cargo's order is
+    // 2. Each base output directory, then its `deps` subdir. Cargo's order is
     //    deps-first.
     for base in &meta.base_output_directories {
         let abs = build_dir.join(base.as_str());
@@ -89,7 +89,9 @@ fn libdir_path(libdir: &PlatformLibdirSummary) -> Option<PathBuf> {
 
 fn dedup_preserving_order(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
-    dirs.into_iter().filter(|p| seen.insert(p.clone())).collect()
+    dirs.into_iter()
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
 }
 
 /// Join `dirs` (prepended) with the `inherited` value using the platform path
@@ -100,7 +102,7 @@ fn join(dirs: Vec<PathBuf>, inherited: Option<OsString>) -> OsString {
         all.extend(std::env::split_paths(&inherited));
     }
     // `join_paths` only errors if a path contains the separator char; our paths
-    // come from cargo metadata and won't, but fall back gracefully.
+    // come from cargo metadata and won't, but fall back gracefully anyway.
     std::env::join_paths(&all).unwrap_or_else(|_| {
         all.first()
             .map(|p| p.as_os_str().to_os_string())
@@ -114,9 +116,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn libdir(path: &str) -> PlatformLibdirSummary {
-        PlatformLibdirSummary::Available {
-            path: path.into(),
-        }
+        PlatformLibdirSummary::Available { path: path.into() }
     }
 
     // `PlatformSummary` lives in `target-spec`, not nextest-metadata, so the
@@ -143,14 +143,17 @@ mod tests {
         let dirs = dylib_dirs(&m, &|_| true);
         assert_eq!(
             dirs,
-            vec![PathBuf::from("/build/debug/deps"), PathBuf::from("/build/debug")]
+            vec![
+                PathBuf::from("/build/debug/deps"),
+                PathBuf::from("/build/debug")
+            ]
         );
     }
 
     #[test]
     fn linked_paths_filtered_by_existence_and_come_first() {
         let m = meta("/build", &["debug"], &["extra/a", "extra/b"]);
-        // Only /build/extra/a "exists".
+        // Only /build/extra/a exists.
         let dirs = dylib_dirs(&m, &|p| p == Path::new("/build/extra/a"));
         assert_eq!(dirs[0], PathBuf::from("/build/extra/a"));
         assert!(!dirs.contains(&PathBuf::from("/build/extra/b")));
@@ -159,7 +162,10 @@ mod tests {
 
     #[test]
     fn libdir_extraction_skips_unavailable() {
-        assert_eq!(libdir_path(&libdir("/rustc/lib")), Some(PathBuf::from("/rustc/lib")));
+        assert_eq!(
+            libdir_path(&libdir("/rustc/lib")),
+            Some(PathBuf::from("/rustc/lib"))
+        );
         assert_eq!(
             libdir_path(&PlatformLibdirSummary::Unavailable {
                 reason: nextest_metadata::PlatformLibdirUnavailable::RUSTC_FAILED,

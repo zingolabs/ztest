@@ -2,12 +2,11 @@
 //! execution, spawning each test as its own process and packing them into live
 //! cluster capacity. Replaces the old `cargo nextest run` subprocess.
 //!
-//! - [`plan`] — the work-list (test × footprint × tier).
-//! - [`dylib`] — the `LD_LIBRARY_PATH` the children inherit.
-//! - [`exec`] — spawning one test process.
-//! - [`schedule`] — the capacity-bounded run loop.
-//! - [`events`] — the lifecycle events + the [`RunReporter`](events::RunReporter) trait.
-//! - [`panel`] — the live QoS panel inputs.
+//! [`plan`] is the work-list (test x footprint x tier). [`dylib`] is the
+//! `LD_LIBRARY_PATH` the children inherit. [`exec`] spawns one test process.
+//! [`schedule`] is the capacity-bounded run loop. [`events`] holds the lifecycle
+//! events and the [`RunReporter`](events::RunReporter) trait. [`panel`] builds
+//! the live QoS panel inputs.
 //!
 //! [`Scheduler`]: crate::qos::scheduler::Scheduler
 
@@ -19,28 +18,32 @@ pub mod plan;
 pub mod reporter;
 pub mod schedule;
 
+#[cfg(test)]
+mod e2e;
+
 use std::process::ExitCode;
 use std::time::Duration;
 
 use nextest_metadata::{NextestExitCode, TestListSummary};
 
-use crate::cli::console::Console;
+use crate::cancel::Cancel;
+use crate::cli::console::{Console, SceneFrame};
 use crate::engine::events::RunReporter as _;
 use crate::engine::exec::EngineEnv;
 use crate::engine::reporter::StyledReporter;
-use crate::engine::schedule::{run_loop, LoopConfig, PanelFrame};
+use crate::engine::schedule::{LoopConfig, PanelFrame, run_loop};
 use crate::inventory::QosEntry;
 use crate::pipeline::SelectedBinary;
-use crate::preflight::{render_live_panel, Theme};
-use crate::qos::schedule::QosPlan;
+use crate::preflight::{Theme, render_live_panel};
 use crate::qos::Resources;
+use crate::qos::schedule::QosPlan;
 
 /// Run-behavior options (parsed from `ztest run` flags).
 #[derive(Debug, Clone)]
 pub struct EngineOpts {
     /// Max retry attempts per test on failure (0 = run once).
     pub retries: u32,
-    /// Stop admitting on the first terminal failure (default false — ztest runs
+    /// Stop admitting on the first terminal failure (default false: ztest runs
     /// the whole suite; `--fail-fast` opts in).
     pub fail_fast: bool,
     /// Soft "slow" threshold; `None` disables the SLOW signal.
@@ -65,6 +68,13 @@ pub struct EngineInput<'a> {
     pub qos_by_binary: &'a [(String, Vec<QosEntry>)],
     /// Cluster admission ceiling (seeds the scheduler).
     pub ceiling: Resources,
+    /// Resource dependency edges (binary images + per-test seeds), attached to
+    /// each work item so the run loop can gate/skip on readiness.
+    pub resource_deps: crate::engine::plan::ResourceDeps,
+    /// Provisioned resource states (node → state) the run loop gates admission
+    /// on. Empty when the run declared no resources.
+    pub resource_states:
+        std::collections::HashMap<crate::provisioning::NodeId, crate::resource::NodeState>,
     /// Run-behavior options.
     pub opts: EngineOpts,
 }
@@ -72,13 +82,15 @@ pub struct EngineInput<'a> {
 /// Run the engine to completion and map the result to a process exit code
 /// (mirroring `NextestExitCode`).
 ///
-/// With a [`Console`] (TTY), the run drives the reused [`Surface`] directly —
-/// nextest-style verdict lines scroll into native scrollback while the QoS
-/// panel ([`render_live_panel`]) stays pinned beneath (one viewport, no flash).
-/// Without one (CI / piped), it renders plain lines to stdout.
+/// With a [`Console`] (TTY), the run produces scenes plus scrollback through the
+/// session's render thread: nextest-style verdict lines scroll into native
+/// scrollback while the QoS panel ([`render_live_panel`]) stays pinned beneath.
+/// Without one (CI / piped), it renders plain lines to stdout. Either way it runs
+/// on the caller's `work_rt`; the render thread is entirely separate.
 pub(crate) fn run(
+    work_rt: &tokio::runtime::Runtime,
     input: EngineInput<'_>,
-    console: Option<Console>,
+    console: Option<&Console>,
     theme: &Theme,
     qos_plan: Option<QosPlan>,
 ) -> ExitCode {
@@ -86,6 +98,7 @@ pub(crate) fn run(
         input.selected_binaries,
         input.qos_by_binary,
         input.opts.retries,
+        &input.resource_deps,
     );
 
     let env = EngineEnv {
@@ -100,12 +113,16 @@ pub(crate) fn run(
         sa: input.opts.sa.clone(),
         redraw: Duration::from_millis(33),
         run_id: input.opts.run_id.clone(),
+        // On a TTY the render thread fires this on Ctrl-C; off a TTY there's no
+        // render thread, so the process dies on the default SIGINT disposition.
+        cancel: console.map(Console::cancel).unwrap_or_else(Cancel::never),
+        resources: input.resource_states,
     };
     let ceiling = input.ceiling;
 
     let stats = match console {
-        Some(c) => run_tty(items, ceiling, cfg, env, c, theme, qos_plan),
-        None => run_inherited(items, ceiling, cfg, env),
+        Some(c) => run_tty(work_rt, items, ceiling, cfg, env, c, theme, qos_plan),
+        None => run_inherited(work_rt, items, ceiling, cfg, env),
     };
 
     let stats = match stats {
@@ -126,85 +143,80 @@ pub(crate) fn run(
     }
 }
 
-/// The TTY path: drive the reused `Surface` — scroll-lines to native scrollback,
-/// the QoS panel pinned beneath — using the console's runtime.
+/// The TTY path: produce scenes plus scrollback through the session's render
+/// thread. Verdict lines go to native scrollback; each tick ships a fresh scene
+/// whose live region is the nextest-style progress line plus running-tests list
+/// and whose panel is the QoS [`render_live_panel`]. The render thread owns all
+/// painting.
+#[allow(clippy::too_many_arguments)]
 fn run_tty(
+    rt: &tokio::runtime::Runtime,
     items: Vec<plan::WorkItem>,
     ceiling: Resources,
     cfg: LoopConfig,
     env: EngineEnv,
-    console: Console,
+    console: &Console,
     theme: &Theme,
     qos_plan: Option<QosPlan>,
 ) -> std::io::Result<events::RunStats> {
     let color = supports_color::on(supports_color::Stream::Stdout).is_some();
-    // The live region: one top progress line (nextest's `progress_str`) + the
-    // running-tests list beneath it.
-    let run_rows = live_region_rows();
-    let live_rows = run_rows + 1;
-    let (mut surface, rt) = console.into_surface(live_rows)?;
-    let mut reporter = StyledReporter::new(color);
+    let mut reporter = StyledReporter::new(
+        color,
+        supports_unicode::on(supports_unicode::Stream::Stdout),
+    );
     let plan = qos_plan.unwrap_or_else(empty_plan);
 
-    let stats = {
-        let surf = &mut surface;
-        drive(items, ceiling, cfg, env, &rt, &mut reporter, |rep, frame| {
-            let bytes = rep.take_scrollback();
-            let sb = if bytes.is_empty() {
-                Vec::new()
-            } else {
-                surf.scrollback_from_ansi(&String::from_utf8_lossy(&bytes))
-            };
-            let to_line = |s: &str| {
-                if s.is_empty() {
-                    ratatui::text::Line::default()
-                } else {
-                    surf.scrollback_from_ansi(s).into_iter().next().unwrap_or_default()
-                }
-            };
-            // Live region = the nextest-style progress line on top, then one
-            // line per in-flight test (with its elapsed clock), padded to a
-            // stable height beneath it.
-            let mut live: Vec<ratatui::text::Line> = Vec::with_capacity(live_rows as usize);
-            live.push(to_line(&reporter::progress_line(
-                &frame.stats,
-                frame.running.len(),
-                frame.progress.elapsed,
-                color,
-            )));
-            live.extend(
-                reporter::render_running(&frame.running, run_rows as usize, color)
-                    .iter()
-                    .map(|s| to_line(s)),
-            );
-            let panel =
-                render_live_panel(&frame.snapshot, &plan, &frame.free, &frame.progress, theme);
-            surf.present(&live, &sb, &panel);
-        })
-    };
+    // Commit the preflight/image phase's final emulated grid into native
+    // scrollback before we switch the live region from the child PTY to our own
+    // engine-rendered lines.
+    console.flush_live();
 
-    // Commit any leftover scroll-lines (incl. the final summary, emitted after
-    // the last tick) and tear down the viewport.
+    let stats = drive(items, ceiling, cfg, env, rt, &mut reporter, |rep, frame| {
+        let bytes = rep.take_scrollback();
+        if !bytes.is_empty() {
+            console.scrollback(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        // The reporter's per-test verdict lines scroll into native scrollback
+        // (above), following nextest conventions just like the build/image
+        // subprocess output. The pinned panel is the QoS/progress summary,
+        // snapshotted into an immutable scene the render thread re-paints (and
+        // animates the spinner) until the next tick.
+        let panel = render_live_panel(&frame.snapshot, &plan, &frame.free, &frame.progress, theme);
+        console.scene(move |_elapsed| SceneFrame {
+            panel: panel.clone(),
+        });
+    });
+
+    // Commit any leftover scroll-lines (including the final summary, emitted
+    // after the last tick). The render thread's teardown restores the terminal.
     let leftover = reporter.take_scrollback();
-    let final_lines = surface.scrollback_from_ansi(&String::from_utf8_lossy(&leftover));
-    surface.finish(&final_lines)?;
+    if !leftover.is_empty() {
+        console.scrollback(String::from_utf8_lossy(&leftover).into_owned());
+    }
     Ok(stats)
 }
 
-/// The non-TTY path: plain scroll-lines to stdout on a fresh runtime.
+/// The non-TTY path: plain scroll-lines to stdout on the work runtime.
 fn run_inherited(
+    rt: &tokio::runtime::Runtime,
     items: Vec<plan::WorkItem>,
     ceiling: Resources,
     cfg: LoopConfig,
     env: EngineEnv,
 ) -> std::io::Result<events::RunStats> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let mut reporter = StyledReporter::new(false);
-    let stats = drive(items, ceiling, cfg, env, &rt, &mut reporter, |rep, _frame| {
-        flush_stdout(rep)
-    });
+    let mut reporter = StyledReporter::new(
+        false,
+        supports_unicode::on(supports_unicode::Stream::Stdout),
+    );
+    let stats = drive(
+        items,
+        ceiling,
+        cfg,
+        env,
+        rt,
+        &mut reporter,
+        |rep, _frame| flush_stdout(rep),
+    );
     flush_stdout(&mut reporter);
     Ok(stats)
 }
@@ -235,20 +247,7 @@ fn drive(
     ))
 }
 
-/// Maximum rows the live running region may occupy. Keeps the reserved viewport
-/// bounded (the last slot is the overflow `… and K more running` summary).
-const MAX_LIVE_ROWS: u16 = 10;
-
-/// Height of the live running region: [`MAX_LIVE_ROWS`], but never more than
-/// half the terminal so the scrollback above it stays usable on short windows.
-fn live_region_rows() -> u16 {
-    let rows = terminal_size::terminal_size()
-        .map(|(_, h)| h.0)
-        .unwrap_or(40);
-    MAX_LIVE_ROWS.min((rows / 2).max(1))
-}
-
-/// An empty plan for runs with no `#[qos]` declarations — the panel then shows
+/// An empty plan for runs with no `#[qos]` declarations: the panel then shows
 /// running/progress counts without per-tier lines.
 fn empty_plan() -> QosPlan {
     QosPlan {

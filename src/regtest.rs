@@ -1,29 +1,28 @@
-//! Regtest fixture helpers — single source of truth for activation
+//! Regtest fixture helpers: single source of truth for activation
 //! heights, lockbox disbursements, and post-NU6 funding streams.
 //!
-//! Copied verbatim from `zcash_local_net::validator` so that test code
-//! authored against either crate uses identical defaults. The rationale
-//! comments are reproduced here because the *why* is load-bearing for
-//! anyone tuning these values — see zingolabs/infrastructure#244 and
-//! zingolabs/zaino#1076.
+//! Copied verbatim from `zcash_local_net::validator` so test code authored
+//! against either crate uses identical defaults. The rationale comments are
+//! reproduced here because the why is load-bearing for anyone tuning these
+//! values; see zingolabs/infrastructure#244 and zingolabs/zaino#1076.
 
-use zingo_common_components::protocol::ActivationHeights;
+use crate::topology::ActivationHeights;
 
 /// The regtest fixture activation heights: every upgrade ztest activates,
 /// at its canonical height, with no topology constraints.
 ///
 /// This is the activation schedule
-/// ([`NetworkUpgrade::regtest_height`](crate::topology::NetworkUpgrade::regtest_height) —
+/// ([`NetworkUpgrade::regtest_height`](crate::topology::NetworkUpgrade::regtest_height),
 /// the single source of truth) with the ceiling set to
 /// [`NetworkUpgrade::HIGHEST`](crate::topology::NetworkUpgrade::HIGHEST), so
 /// this fixture and the topology-aware resolver
 /// ([`activation_heights_for_ceiling`](crate::topology::activation_heights_for_ceiling))
 /// can never disagree on a height. See `regtest_height` for why NU5 and
-/// later each get a *distinct* height (zebra's height-collision rule) and
-/// why NU7 stays off.
+/// later each get a distinct height (zebra's height-collision rule) and why
+/// NU7 stays off.
 ///
-/// **Companion config required for callers mining past height 6**: pair
-/// with [`regtest_test_lockbox_disbursements`] and
+/// Callers mining past height 6 must supply companion config: pair with
+/// [`regtest_test_lockbox_disbursements`] and
 /// [`regtest_test_post_nu6_funding_streams`]; the NU6.1 activation block is
 /// rejected without either.
 pub fn regtest_test_activation_heights() -> ActivationHeights {
@@ -36,13 +35,12 @@ pub const REGTEST_FIXTURE_HEIGHTS_CLI_STRING: &str = "all=1,nu5=2,nu6=3,nu6_1=6,
 /// One lockbox disbursement output for Zebra's regtest
 /// `[network.testnet_parameters]`. Mirrors Zebra's upstream
 /// `ConfiguredLockboxDisbursement`. Required for any regtest chain that
-/// crosses NU6.1 — otherwise `subsidy_is_valid` rejects the activation
-/// block.
+/// crosses NU6.1, or `subsidy_is_valid` rejects the activation block.
 #[derive(Clone, Debug)]
 pub struct LockboxDisbursement {
-    /// Recipient address. Must be a valid regtest P2SH (`t2…`) address —
+    /// Recipient address. Must be a valid regtest P2SH (`t2...`) address:
     /// `subsidy_is_valid` asserts `addr.is_script_hash()`. The standard
-    /// regtest miner P2PKH (`tm…`) is rejected here.
+    /// regtest miner P2PKH (`tm...`) is rejected here.
     pub address: String,
     /// Disbursement amount in zatoshis.
     pub amount_zats: u64,
@@ -50,7 +48,7 @@ pub struct LockboxDisbursement {
 
 impl LockboxDisbursement {
     /// One zatoshi to Zebra's reference testnet NU6.1 disbursement
-    /// address — guaranteed P2SH and to decode under any Testnet-class
+    /// address: guaranteed P2SH and decodes under any Testnet-class
     /// network (regtest included).
     pub fn dummy() -> Self {
         Self {
@@ -60,7 +58,7 @@ impl LockboxDisbursement {
     }
 }
 
-/// Canonical regtest disbursement list — the minimum sufficient set for
+/// Canonical regtest disbursement list: the minimum sufficient set for
 /// zebrad's `is_empty()` gate at the NU6.1 activation block.
 pub fn regtest_test_lockbox_disbursements() -> Vec<LockboxDisbursement> {
     vec![LockboxDisbursement::dummy()]
@@ -93,7 +91,7 @@ impl FundingStreamReceiver {
     }
 }
 
-/// One recipient of a funding stream — mirrors Zebra's
+/// One recipient of a funding stream, mirroring Zebra's
 /// `ConfiguredFundingStreamRecipient`.
 #[derive(Clone, Debug)]
 pub struct FundingStreamRecipient {
@@ -106,7 +104,7 @@ pub struct FundingStreamRecipient {
     pub addresses: Option<Vec<String>>,
 }
 
-/// Funding-stream configuration — written into Zebra's TOML at
+/// Funding-stream configuration, written into Zebra's TOML at
 /// `[network.testnet_parameters.<post_nu6_>funding_streams]`.
 #[derive(Clone, Debug)]
 pub struct FundingStreams {
@@ -120,7 +118,7 @@ pub struct FundingStreams {
 
 /// Canonical regtest post-NU6 funding stream. A single `Deferred`
 /// recipient drawing 1% of block subsidy from the NU6 activation height
-/// (3) — enough to fund the dummy disbursement at NU6.1. The start height
+/// (3), enough to fund the dummy disbursement at NU6.1. The start height
 /// tracks NU6: the deferred pool only exists once NU6 is active.
 pub fn regtest_test_post_nu6_funding_streams() -> FundingStreams {
     FundingStreams {
@@ -168,27 +166,27 @@ pub(crate) fn parse_activation_heights_from_rpc(
 // ─────────────────────────── Regtest builder trait ─────────────────────
 //
 // `Regtest` is the one-shot builder shortcut: every component variant
-// implements it to apply the standard regtest fixture (mount + command
-// + args). The actual config lives in the per-backend file —
-// `handles/backends/zebra.rs`, `handles/backends/zaino.rs`, etc. — so
+// implements it to apply the standard regtest fixture (mount, command,
+// args). The actual config lives in the per-backend file
+// (`handles/backends/zebra.rs`, `handles/backends/zaino.rs`, etc.) so
 // backend knowledge stays colocated with the rest of that backend's
 // integration code.
 
 /// Builder shortcut: apply the standard regtest configuration to a
-/// component. Backend-aware — dispatches by enum variant.
+/// component. Backend-aware; dispatches by enum variant.
 ///
 /// ```ignore
 /// let zebrad = env.add_validator(Validator::zebrad("5.1.1").regtest());
 /// let zaino  = env.add_indexer(Indexer::zainod("0.4.0-rc.2-no-tls").regtest());
 /// ```
 ///
-/// The fixtures live in `zcash_kube_net/fixtures/regtest/` — single
-/// source of truth, no per-test-workspace copies.
+/// The fixtures live in `ztest/fixtures/regtest/`: single source
+/// of truth, no per-test-workspace copies.
 pub trait Regtest: Sized {
-    /// Apply the standard regtest fixture + command/args for this
-    /// component's backend. For indexers this is the **fetch** backend
-    /// by default; pair with [`RegtestState::regtest_state`] for the
-    /// state backend.
+    /// Apply the standard regtest fixture and command/args for this
+    /// component's backend. For indexers this is the fetch backend by
+    /// default; pair with [`RegtestState::regtest_state`] for the state
+    /// backend.
     fn regtest(self) -> Self;
 }
 
@@ -204,15 +202,15 @@ pub trait RegtestState: Sized {
 /// Each `variant` resolves to a curated chain snapshot bundled in this
 /// crate at `fixtures/testnet/<variant>/`. The directory contains one
 /// archive per validator backend:
-///  - `zebra.tar.xz`  — zebrad state dir (consumed by `Validator::zebrad`
+///  - `zebra.tar.xz`: zebrad state dir (consumed by `Validator::zebrad`
 ///    and by any `Indexer::zaino` pod paired with it).
-///  - `zcashd.tar.xz` — zcashd datadir (consumed by `Validator::zcashd`).
+///  - `zcashd.tar.xz`: zcashd datadir (consumed by `Validator::zcashd`).
 ///
 /// Component configs are generated in-process by [`crate::testnet_conf`];
 /// no per-variant TOMLs live on disk.
 ///
-/// Variants are named for the pool / scenario the snapshot is curated
-/// for, e.g. `"orchard"`, `"sapling"`. Add a new variant by adding the
+/// Variants are named for the pool / scenario the snapshot is curated for,
+/// e.g. `"orchard"`, `"sapling"`. Add a new variant by adding the
 /// directory under `fixtures/testnet/`.
 ///
 /// ```ignore
@@ -229,17 +227,17 @@ pub trait TestnetState: Sized {
     fn testnet_state(self, variant: &str) -> Self;
 }
 
-/// Which on-disk chain layout a testnet archive carries — drives the
+/// Which on-disk chain layout a testnet archive carries; drives the
 /// filename inside `fixtures/testnet/<variant>/`. zebrad and zcashd
-/// serialise their state directories incompatibly, so each backend has
-/// its own archive per variant; zaino always pairs with a zebrad pod
-/// and therefore consumes [`TestnetChainKind::Zebra`].
+/// serialise their state directories incompatibly, so each backend has its
+/// own archive per variant. zaino always pairs with a zebrad pod and
+/// therefore consumes [`TestnetChainKind::Zebra`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestnetChainKind {
-    /// `fixtures/testnet/<variant>/zebra.tar.xz` — a zebrad state dir.
+    /// `fixtures/testnet/<variant>/zebra.tar.xz`: a zebrad state dir.
     Zebra,
-    /// `fixtures/testnet/<variant>/zcashd.tar.xz` — a zcashd datadir
-    /// (blocks/, chainstate/, …).
+    /// `fixtures/testnet/<variant>/zcashd.tar.xz`: a zcashd datadir
+    /// (blocks/, chainstate/, ...).
     #[allow(dead_code)] // wired in once Validator::zcashd(_).testnet(_) lands.
     Zcashd,
 }
@@ -256,7 +254,7 @@ impl TestnetChainKind {
 /// Mount a chain-cache archive at `destination`. Looks up
 /// `fixtures/testnet/<variant>/<kind>.tar.xz`; archives are
 /// content-addressed and CoW-cloned per test invocation. Fails at
-/// materialization (not at compile time) if the archive is missing —
+/// materialization (not at compile time) if the archive is missing, since
 /// variant directories without a chain-cache are still useful for local
 /// config-only iteration.
 pub(crate) fn testnet_chain_archive(
@@ -274,9 +272,9 @@ pub(crate) fn testnet_chain_archive(
 
 // ──────────────────────────── Fixture helpers ──────────────────────────
 //
-// Path + `Mount` constructors used by the per-backend `Regtest` impls
-// in `handles/backends/{zebra,zaino,...}.rs`. Kept here (not exposed)
-// because the fixture-directory layout is a regtest concern.
+// Path and `Mount` constructors used by the per-backend `Regtest` impls in
+// `handles/backends/{zebra,zaino,...}.rs`. Kept here (not exposed) because
+// the fixture-directory layout is a regtest concern.
 
 use std::path::PathBuf;
 
@@ -292,10 +290,10 @@ pub(crate) fn scratch_mount(dest: &str) -> Mount {
     Mount::scratch(PathBuf::from(dest))
 }
 
-/// Mount a string of pre-rendered config content at `dest` inside the
-/// pod. Pairs with [`crate::regtest_conf`] generators — the conf body is
-/// produced in-process and lands in a ConfigMap without ever touching a
-/// fixture file. Same `≤1 MiB` UTF-8 cap as `mount_config!`.
+/// Mount a string of pre-rendered config content at `dest` inside the pod.
+/// Pairs with [`crate::regtest_conf`] generators: the conf body is produced
+/// in-process and lands in a ConfigMap without touching a fixture file.
+/// Same `<=1 MiB` UTF-8 cap as `mount_config!`.
 pub(crate) fn config_mount_inline(content: String, dest: &str) -> Mount {
     Mount {
         source: MountSource::ConfigInline(content),

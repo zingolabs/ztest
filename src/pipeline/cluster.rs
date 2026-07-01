@@ -1,33 +1,21 @@
-//! Phase A1 — cluster probe.
+//! Phase A1: cluster probe.
 //!
-//! Discovers the kube context, lists nodes (counting ready vs
-//! cordoned, summing cores and memory), and counts `zaino-{ci,dev}-*`
-//! namespaces as a proxy for current slot utilisation. Runs in
-//! parallel with Phase B (cargo nextest list) under the same tokio
-//! runtime.
+//! Discovers the kube context, lists nodes (counting ready vs cordoned, summing
+//! cores and memory), and counts `zaino-{ci,dev}-*` namespaces as a proxy for
+//! current slot utilisation. Runs in parallel with Phase B (cargo nextest list)
+//! under the same tokio runtime.
 //!
-//! ## Failure modes
-//!
-//! Probing the cluster is *optional* in some local-dev scenarios (a
-//! developer running `ztest run` against a non-cluster-using suite,
-//! or before they've set up their kubeconfig). To accommodate that
-//! without hiding real failures, [`ProbeOutcome`] distinguishes three
+//! Probing is optional in local-dev scenarios (a suite that doesn't use the
+//! cluster, or before kubeconfig setup). [`ProbeOutcome`] distinguishes three
 //! cases:
+//! - `Ok`: probe succeeded; the banner shows real numbers.
+//! - `Missing`: no kubeconfig / no reachable context. Soft fail; the run
+//!   proceeds and cluster-dependent tests fail later at `TestEnv::build()`.
+//! - `Failed`: cluster reached but a downstream API call failed (auth, RBAC,
+//!   transient outage). Hard fail; abort the run rather than mask the issue.
 //!
-//! - `Ok` — probe succeeded; the banner shows real numbers.
-//! - `Missing` — no kubeconfig / no reachable context. The run
-//!   proceeds; tests that actually need the cluster will fail later
-//!   at `TestEnv::build()` with a clearer error.
-//! - `Failed` — cluster reached but a downstream API call failed
-//!   (auth, RBAC, transient outage). This is a hard fail — abort the
-//!   run rather than mask the issue.
-//!
-//! ## Concurrency within the phase
-//!
-//! Node listing and namespace listing are independent; they run via
-//! `tokio::try_join!` so their wall-time is `max(nodes, namespaces)`
-//! rather than the sum. This is the inner parallelism — A1 is also
-//! running in parallel with Phase B at a higher level.
+//! Node and namespace listing are independent, run via `tokio::try_join!` so
+//! wall-time is `max(nodes, namespaces)`, not the sum.
 
 use std::collections::BTreeSet;
 use std::convert::TryFrom;
@@ -45,9 +33,8 @@ use super::events::{Event, EventTx};
 
 /// Outcome of one Phase-A1 run.
 ///
-/// Mirrors the [`super::BuildOutcome`] shape so the caller can write a
-/// single `match outcome` per phase rather than juggling
-/// `Result<Option<_>, _>` types.
+/// Mirrors the [`super::BuildOutcome`] shape so the caller can write a single
+/// `match outcome` per phase rather than juggling `Result<Option<_>, _>`.
 #[derive(Debug, Clone)]
 pub enum ProbeOutcome {
     Ok {
@@ -55,32 +42,28 @@ pub enum ProbeOutcome {
         slots_used: u32,
         nodes_ready: u32,
         nodes_cordoned: u32,
-        /// Whole-cluster schedulable capacity (`allocatable − Σ requested`).
+        /// Whole-cluster schedulable capacity (allocatable minus sum of requested).
         capacity: ClusterCapacity,
-        /// Count of schedulable NVMe-pool nodes — sizes the `qos-sync` nextest
-        /// test-group so `sync` tests run at most one-per-NVMe-node (§11).
+        /// Count of schedulable NVMe-pool nodes; sizes the `qos-sync` nextest
+        /// test-group so `sync` tests run at most one per NVMe node (§11).
         nvme_nodes: u32,
     },
-    /// No kubeconfig found, or the inferred config can't be read. Soft
-    /// fail — the run continues without cluster data.
+    /// No kubeconfig found, or the inferred config can't be read. Soft fail; the
+    /// run continues without cluster data.
     Missing { detail: String },
-    /// Cluster reached but the probe couldn't complete. Hard fail —
-    /// abort the run.
+    /// Cluster reached but the probe couldn't complete. Hard fail; abort the run.
     Failed { detail: String },
 }
 
-/// Run the probe, emit lifecycle events, return the outcome and (on
-/// success) the [`kube::Client`] for downstream A-sub-phases.
+/// Run the probe, emit lifecycle events, and return the outcome plus (on success)
+/// the [`kube::Client`] for downstream A-sub-phases.
 ///
-/// The `Client` is returned alongside the outcome so callers can
-/// share it with Phase A3 (archives) and A4 (snapshots) without
-/// re-paying the kubeconfig-resolution cost. `None` is returned for
-/// `Missing` and `Failed` outcomes — those sub-phases don't run.
+/// The `Client` is returned alongside the outcome so callers can share it with
+/// Phase A3 (archives) and A4 (snapshots) without re-paying kubeconfig
+/// resolution. `None` for `Missing` / `Failed`, where those sub-phases don't run.
 ///
-/// Never panics. Network / API errors are encoded in the
-/// [`ProbeOutcome`] return rather than propagated, so a probe failure
-/// can be displayed in the banner before the caller decides whether
-/// to abort.
+/// Never panics; network / API errors are encoded in [`ProbeOutcome`] so a
+/// failure can be displayed in the banner before the caller decides to abort.
 pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
     let _ = tx.send(Event::ProbeStarted);
 
@@ -97,8 +80,8 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
         }
     };
 
-    // `kube::Config` doesn't expose the active-context name directly;
-    // the cluster URL is the closest stable identifier we have.
+    // `kube::Config` doesn't expose the active-context name; the cluster URL
+    // host is the closest stable identifier.
     let context = config.cluster_url.host().unwrap_or("(unknown)").to_string();
 
     let client = match Client::try_from(config) {
@@ -114,10 +97,9 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
 
     let nodes_api: Api<Node> = Api::all(client.clone());
     let ns_api: Api<Namespace> = Api::all(client.clone());
-    // Pods are listed cluster-wide so we can subtract scheduled requests from
-    // node allocatable — the `allocatable − Σ requested` model. NVMe vs
-    // general is k8s placement (taints/tolerations), not a capacity split, so
-    // there is a single global figure.
+    // Pods are listed cluster-wide so scheduled requests can be subtracted from
+    // node allocatable. NVMe vs general is k8s placement (taints/tolerations),
+    // not a capacity split, so there is a single global figure.
     let pods_api: Api<Pod> = Api::all(client.clone());
 
     let lp = ListParams::default();
@@ -164,15 +146,14 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
     )
 }
 
-/// Compute the live whole-cluster schedulable capacity
-/// (`allocatable − Σ requested`) using an existing [`kube::Client`].
+/// Live whole-cluster schedulable capacity (allocatable minus sum of requested)
+/// using an existing [`kube::Client`].
 ///
-/// This is the same model [`run`] reports in its banner, factored out for the
-/// per-test re-probe in `TestEnv::build()`: a test process (spawned by
-/// nextest, with no access to the parent `ztest run`'s probe result) calls
-/// this to size its allocator's `available` figure before requesting a
-/// reservation. Errors propagate so the caller can fail the build with a clear
-/// message rather than silently admitting against a zero capacity.
+/// Same model [`run`] reports, factored out for the per-test re-probe in
+/// `TestEnv::build()`: a nextest-spawned test process (no access to the parent's
+/// probe result) calls this to size its allocator's `available` figure before
+/// requesting a reservation. Errors propagate so the caller fails the build
+/// rather than silently admitting against zero capacity.
 pub async fn capacity(client: &Client) -> Result<ClusterCapacity, kube::Error> {
     let nodes_api: Api<Node> = Api::all(client.clone());
     let ns_api: Api<Namespace> = Api::all(client.clone());
@@ -188,12 +169,11 @@ pub async fn capacity(client: &Client) -> Result<ClusterCapacity, kube::Error> {
     })
 }
 
-/// Count schedulable NVMe-pool nodes using an existing [`kube::Client`] — the
+/// Count schedulable NVMe-pool nodes using an existing [`kube::Client`]: the
 /// per-test equivalent of the parent probe's `nvme_nodes`, which doesn't cross
 /// the nextest process boundary. `TestEnv::build()` calls this to fail a
 /// sync-tier admission fast when no NVMe node can host the pod, rather than
-/// admitting against global capacity and letting the pod pend forever on an
-/// unsatisfiable nodeSelector.
+/// letting it pend forever on an unsatisfiable nodeSelector.
 pub async fn nvme_node_count(client: &Client) -> Result<u32, kube::Error> {
     let nodes_api: Api<Node> = Api::all(client.clone());
     let nodes = nodes_api.list(&ListParams::default()).await?;
@@ -224,10 +204,10 @@ fn count_nodes(nodes: &[Node]) -> (u32, u32) {
     (ready, cordoned)
 }
 
-/// Count schedulable nodes in the NVMe pool — Ready, not cordoned, and carrying
-/// the NVMe pool label ([`NVME_NODE_LABEL_KEY`]=[`NVME_NODE_LABEL_VALUE`]).
-/// Sizes the `qos-sync` test-group; `0` on a cluster with no NVMe pool (dev /
-/// kind), which the lowering floors back to 1.
+/// Count schedulable NVMe-pool nodes: Ready, not cordoned, and carrying the NVMe
+/// pool label ([`NVME_NODE_LABEL_KEY`]=[`NVME_NODE_LABEL_VALUE`]). Sizes the
+/// `qos-sync` test-group; `0` on a cluster with no NVMe pool (dev / kind), which
+/// the lowering floors back to 1.
 fn count_nvme_nodes(nodes: &[Node]) -> u32 {
     nodes
         .iter()
@@ -248,17 +228,25 @@ fn node_allocatable(node: &Node) -> Resources {
     let Some(alloc) = node.status.as_ref().and_then(|s| s.allocatable.as_ref()) else {
         return Resources::ZERO;
     };
-    let cpu = alloc.get("cpu").map(|q| units::parse_cpu_milli(&q.0)).unwrap_or(0);
-    let mem = alloc.get("memory").map(|q| units::parse_mem_bytes(&q.0)).unwrap_or(0);
+    let cpu = alloc
+        .get("cpu")
+        .map(|q| units::parse_cpu_milli(&q.0))
+        .unwrap_or(0);
+    let mem = alloc
+        .get("memory")
+        .map(|q| units::parse_mem_bytes(&q.0))
+        .unwrap_or(0);
     Resources::new(cpu, mem)
 }
 
-/// Total allocatable across **schedulable** nodes (Ready and not cordoned).
+/// Total allocatable across schedulable nodes (Ready and not cordoned).
 fn cluster_allocatable(nodes: &[Node]) -> Resources {
     nodes
         .iter()
         .filter(|n| node_ready(n) && !node_cordoned(n))
-        .fold(Resources::ZERO, |acc, n| acc.saturating_add(&node_allocatable(n)))
+        .fold(Resources::ZERO, |acc, n| {
+            acc.saturating_add(&node_allocatable(n))
+        })
 }
 
 /// `true` if a pod is scheduled (has a node) and still consuming capacity
@@ -286,8 +274,8 @@ fn cluster_requested(pods: &[Pod]) -> Resources {
 /// Names of the namespaces ztest manages: per-test environments (labelled
 /// [`LABEL_ROLE`]=[`ROLE_TEST_ENV`] by [`crate::cluster::ensure_namespace`])
 /// plus the QoS infra namespaces (`zaino-qos` ledger, `zaino-seeds` archive
-/// staging). Pods in these are ztest's *own* load, accounted via the ledger;
-/// they are excluded from the baseline so they are never counted twice.
+/// staging). Pods here are ztest's own load, accounted via the ledger; they are
+/// excluded from the baseline so they are never counted twice.
 fn ztest_namespaces(namespaces: &[Namespace]) -> BTreeSet<String> {
     namespaces
         .iter()
@@ -307,11 +295,11 @@ fn ztest_namespaces(namespaces: &[Namespace]) -> BTreeSet<String> {
         .collect()
 }
 
-/// Sum of effective requests over scheduled, live pods that are *not*
-/// ztest-managed — the non-ztest baseline. Sizes
+/// Sum of effective requests over scheduled, live pods that are not
+/// ztest-managed: the non-ztest baseline. Sizes
 /// [`ClusterCapacity::admission_ceiling`]: load ztest cannot shed by waiting,
-/// so a footprint exceeding `allocatable − baseline` is a hard reject, while
-/// ztest's own load is tracked separately through the reservation ledger.
+/// so a footprint exceeding `allocatable - baseline` is a hard reject. ztest's
+/// own load is tracked separately through the reservation ledger.
 fn baseline_requested(pods: &[Pod], ztest_ns: &BTreeSet<String>) -> Resources {
     pods.iter()
         .filter(|p| pod_consumes(p))
@@ -328,9 +316,8 @@ fn baseline_requested(pods: &[Pod], ztest_ns: &BTreeSet<String>) -> Resources {
         })
 }
 
-/// Count `zaino-{ci,dev}-*` namespaces as the proxy for current
-/// concurrency. Will be replaced by an authoritative
-/// `Session` CR count once F1/F2 land.
+/// Count `zaino-{ci,dev}-*` namespaces as the proxy for current concurrency.
+/// To be replaced by an authoritative `Session` CR count once F1/F2 land.
 fn count_zaino_slots(namespaces: &[Namespace]) -> u32 {
     namespaces
         .iter()
@@ -351,8 +338,8 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use std::collections::BTreeMap;
 
-    // (Quantity parsing lives in `qos::units`; here we test the node/pod
-    // aggregation over hand-built objects — no cluster needed.)
+    // Quantity parsing lives in `qos::units`; here we test the node/pod
+    // aggregation over hand-built objects, no cluster needed.
 
     fn node(ready: bool, cordoned: bool, cpu: &str, mem: &str) -> Node {
         Node {
@@ -419,10 +406,10 @@ mod tests {
     #[test]
     fn count_nvme_nodes_counts_only_labeled_schedulable_nodes() {
         let nodes = vec![
-            nvme_node(true, false),         // counted
-            nvme_node(true, true),          // labeled but cordoned → excluded
-            nvme_node(false, false),        // labeled but not ready → excluded
-            node(true, false, "4", "8Gi"),  // schedulable but unlabeled → excluded
+            nvme_node(true, false),        // counted
+            nvme_node(true, true),         // labeled but cordoned → excluded
+            nvme_node(false, false),       // labeled but not ready → excluded
+            node(true, false, "4", "8Gi"), // schedulable but unlabeled → excluded
         ];
         assert_eq!(count_nvme_nodes(&nodes), 1);
         // A cluster with no NVMe pool → 0 (lowering floors it back to 1).
@@ -433,7 +420,7 @@ mod tests {
     fn count_nodes_reports_ready_and_cordoned() {
         let nodes = vec![
             node(true, false, "4", "8Gi"),
-            node(true, true, "4", "8Gi"), // ready but cordoned
+            node(true, true, "4", "8Gi"),   // ready but cordoned
             node(false, false, "4", "8Gi"), // not ready
         ];
         assert_eq!(count_nodes(&nodes), (2, 1));
@@ -442,8 +429,8 @@ mod tests {
     #[test]
     fn allocatable_sums_only_schedulable_nodes() {
         let nodes = vec![
-            node(true, false, "4", "8Gi"),  // counted
-            node(true, true, "8", "16Gi"),  // cordoned → excluded
+            node(true, false, "4", "8Gi"),   // counted
+            node(true, true, "8", "16Gi"),   // cordoned → excluded
             node(false, false, "8", "16Gi"), // not ready → excluded
         ];
         let a = cluster_allocatable(&nodes);
@@ -489,9 +476,7 @@ mod tests {
         Namespace {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
-                labels: role.map(|r| {
-                    BTreeMap::from([(LABEL_ROLE.to_string(), r.to_string())])
-                }),
+                labels: role.map(|r| BTreeMap::from([(LABEL_ROLE.to_string(), r.to_string())])),
                 ..Default::default()
             },
             ..Default::default()
@@ -517,8 +502,10 @@ mod tests {
 
     #[test]
     fn baseline_excludes_ztest_pods_counts_only_non_ztest() {
-        let ztest_ns: BTreeSet<String> =
-            ["ztest-foo-abc", "zaino-qos"].into_iter().map(String::from).collect();
+        let ztest_ns: BTreeSet<String> = ["ztest-foo-abc", "zaino-qos"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let pods = vec![
             pod_in("kube-system", Some("n1"), "Running", "500m", "512Mi"), // baseline
             pod_in("ztest-foo-abc", Some("n1"), "Running", "4", "8Gi"),    // ztest → excluded

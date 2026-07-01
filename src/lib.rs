@@ -1,24 +1,21 @@
-//! `ztest` — boot Zcash topologies (validators, indexers, wallets)
-//! on Kubernetes and hand typed RPC handles back to test code.
+//! `ztest`: boot Zcash topologies (validators, indexers, wallets) on
+//! Kubernetes and hand typed RPC handles back to test code.
 //!
 //! See `docs/test-author-api.md` for the user-facing API and
 //! `docs/architecture-overview.md` for what runs under the hood.
 //!
-//! ## Module map
+//! Module map (public, test-author-facing):
+//!  - [`component`]: `Validator` / `Indexer` / `Wallet` builders.
+//!  - [`mount`]: `Mount`, `MountSource`, `MountKind`, `SnapshotRef`.
+//!  - [`env`]: `TestEnv` (builder + live).
+//!  - [`handles`]: `*Handle` types, `Endpoint`, per-category RPC methods,
+//!    named-port tables, and the per-binary backend call sites.
+//!  - [`regtest`]: activation-height fixtures, parsing helpers.
+//!  - [`error`]: `EnvError`, `RpcError`.
 //!
-//! Public, test-author-facing:
-//!  - [`component`] — `Validator` / `Indexer` / `Wallet` builders.
-//!  - [`mount`]     — `Mount`, `MountSource`, `MountKind`, `SnapshotRef`.
-//!  - [`env`]       — `TestEnv` (builder + live).
-//!  - [`handles`]   — `*Handle` types, `Endpoint`, per-category RPC
-//!    methods, named-port tables, and the per-binary
-//!    backend call sites.
-//!  - [`regtest`]   — activation-height fixtures, parsing helpers.
-//!  - [`error`]     — `EnvError`, `RpcError`.
-//!
-//! Internal kube plumbing (not part of the public API):
-//! `cluster`, `manifest`, `materialize`, `mounts` (resolver),
-//! `naming`, `portforward`, `seeds`, `grpc`, `utils`.
+//! Internal kube plumbing (not part of the public API): `cluster`, `manifest`,
+//! `materialize`, `mounts` (resolver), `naming`, `portforward`, `seeds`,
+//! `grpc`, `utils`.
 
 #![deny(missing_debug_implementations)]
 
@@ -34,14 +31,18 @@ pub mod inventory;
 pub mod mount;
 pub mod pipeline;
 pub mod preflight;
+pub mod proto;
 pub mod protocol;
+pub(crate) mod provisioning;
 pub mod qos;
 pub mod regtest;
 pub mod regtest_conf;
+pub mod resource;
 pub mod testnet_conf;
 pub mod topology;
 
 // ─────────────────────────── internal modules ──────────────────────────
+pub mod cancel;
 mod cluster;
 mod manifest;
 mod materialize;
@@ -56,6 +57,7 @@ pub use crate::backends::lightwalletd::LightwalletdIndexer;
 pub use crate::backends::zainod::ZainoIndexer;
 pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::ZebraValidator;
+#[cfg(feature = "zingo")]
 pub use crate::backends::zingo::{FAUCET_SEED, RECIPIENT_SEED, ZingoBackend, ZingoWallet};
 pub use crate::component::{
     ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Indexer, Resources,
@@ -66,8 +68,7 @@ pub use crate::error::{EnvError, RpcError};
 pub use crate::handles::client::JsonRpcClient;
 pub use crate::handles::indexer::{
     BlockHash, BlockHeight, CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo,
-    RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, Transaction, TreeState, TxId,
-    ZatBalance,
+    RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, TreeState, TxId, ZatBalance,
 };
 pub use crate::handles::validator::{
     BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, Peer, PeerInfo,
@@ -77,12 +78,12 @@ pub use crate::handles::{
     Endpoint, HandleInner, IndexerBackend, IndexerConfig, ValidatorBackend, ValidatorConfig,
     WalletBackend, WalletConfig,
 };
-pub use crate::mount::{Mount, MountKind, MountSource, SnapshotRef};
-pub use ztest_macros::{dev, mount_archive, mount_config, mount_file};
+pub use crate::mount::{ArchiveHandle, Mount, MountKind, MountSource, SnapshotRef};
+pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file};
 
 /// Internal re-exports so test-author proc macros can reach their
 /// runtime support code from crates that depend on `ztest`. Not part
-/// of the public API — paths under `__private` may change without
+/// of the public API; paths under `__private` may change without
 /// notice.
 #[doc(hidden)]
 pub mod __private {
@@ -94,10 +95,9 @@ pub mod __private {
 /// Generate one `#[tokio::test(flavor = "multi_thread")]` wrapper per
 /// `name => helper` pair, each calling `helper::<$validator>(&$kind).await`.
 ///
-/// Collapses the per-validator boilerplate when a test module wants the
-/// same generic test function run once against each backend. A macro
-/// (not a fn) because each wrapper must be a discoverable
-/// `#[tokio::test]` item.
+/// Collapses the per-validator boilerplate when a test module wants the same
+/// generic test function run once against each backend. A macro (not a fn)
+/// because each wrapper must be a discoverable `#[tokio::test]` item.
 ///
 /// ```ignore
 /// validator_tests!(
@@ -122,35 +122,34 @@ macro_rules! validator_tests {
 
 /// One-shot import for test code. `use ztest::prelude::*;`.
 ///
-/// Curation principle: prelude items must appear in a public signature
-/// that test authors interact with. Convenience-only re-exports
-/// (saving a `Cargo.toml` line for a crate test code never sees) are
-/// rejected — they're SemVer noise that ties ztest's version to
-/// upstream churn for no benefit.
+/// Curation principle: prelude items must appear in a public signature that
+/// test authors interact with. Convenience-only re-exports (saving a
+/// `Cargo.toml` line for a crate test code never sees) are rejected as SemVer
+/// noise that ties ztest's version to upstream churn for no benefit.
 pub mod prelude {
     pub use super::{
-        Account, AccountId, BlockHash, BlockHeight, BlockTip, BlockchainInfo, ChainConfig,
-        ComponentBuilder, ComponentOptsBuilder, CompactBlock, CompactTx, Endpoint, EnvError,
-        FAUCET_SEED, GetAddressUtxosReply, Indexer, IndexerBackend, JsonRpcClient, LightdInfo,
+        Account, AccountId, ArchiveHandle, BlockHash, BlockHeight, BlockTip, BlockchainInfo,
+        ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Endpoint,
+        EnvError, GetAddressUtxosReply, Indexer, IndexerBackend, JsonRpcClient, LightdInfo,
         LightwalletdIndexer, MempoolInfo, Mount, MountKind, MountSource, Peer, PeerInfo, Pool,
-        PoolBalances, RECIPIENT_SEED, RawTransaction, RpcError, SendResponse, SharedVolume,
-        ShieldedProtocol, SnapshotRef, SubtreeRoot, TestEnv, Transaction, TreeState, TxId,
-        Validator, ValidatorBackend, Wallet, WalletBackend, ZainoIndexer, ZatBalance,
-        ZcashdValidator, ZebraValidator, ZingoWallet,
+        PoolBalances, RawTransaction, RpcError, SendResponse, SharedVolume, ShieldedProtocol,
+        SnapshotRef, SubtreeRoot, TestEnv, TreeState, TxId, Validator, ValidatorBackend, Wallet,
+        WalletBackend, ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
     };
+    #[cfg(feature = "zingo")]
+    pub use super::{FAUCET_SEED, RECIPIENT_SEED, ZingoWallet};
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
         REGTEST_FIXTURE_HEIGHTS_CLI_STRING, Regtest, RegtestState, Testnet, TestnetState,
         regtest_test_activation_heights, regtest_test_lockbox_disbursements,
         regtest_test_post_nu6_funding_streams,
     };
-    pub use crate::topology::NetworkUpgrade;
     /// `ActivationHeights` appears in ztest's public signatures
     /// ([`ValidatorBackend::activation_heights`],
-    /// [`regtest_test_activation_heights`], etc.), so callers need the
-    /// type to consume what ztest returns. Re-exporting here is the
-    /// Effective-Rust-Item-24 case: avoid forcing callers into a direct
-    /// dep on `zingo_common_components` just to call us.
-    pub use zingo_common_components::protocol::ActivationHeights;
-    pub use ztest_macros::{dev, mount_archive, mount_config, mount_file};
+    /// [`regtest_test_activation_heights`], etc.), so callers need the type to
+    /// consume what ztest returns. It's ztest's own type
+    /// ([`crate::topology::ActivationHeights`]).
+    pub use crate::topology::ActivationHeights;
+    pub use crate::topology::NetworkUpgrade;
+    pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file};
 }

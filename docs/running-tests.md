@@ -46,7 +46,7 @@ the actual work via the slot-→-namespace model.
 
 ```yaml
 env:
-  ZCASH_KUBE_NET_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+  ZTEST_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   test:
@@ -58,10 +58,10 @@ jobs:
       - run: cargo nextest run -p zaino-integration-tests --test-threads 8
 
       - if: always()
-        run: kubectl delete ns -l zaino.io/run-id=$ZCASH_KUBE_NET_RUN_ID
+        run: kubectl delete ns -l zaino.io/run-id=$ZTEST_RUN_ID
 ```
 
-`ZCASH_KUBE_NET_RUN_ID` is the only env var the library reads in CI;
+`ZTEST_RUN_ID` is the only env var the library reads in CI;
 test processes use it as the namespace name prefix and stamp it as a
 label on every resource (so observability queries can filter by run).
 

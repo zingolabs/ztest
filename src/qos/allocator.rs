@@ -4,45 +4,36 @@
 //! [`Allocator`] that, to admit a topology-booting test, runs a short
 //! read-decide-write transaction against the shared k8s ledger (via an
 //! [`ObjectStore`]) and either claims a reservation Lease or backs off.
-//! Concurrent runs coordinate purely through k8s.
+//! Concurrent runs coordinate through k8s.
 //!
-//! ## Why a lock at all
+//! The lock does not serialize writes (k8s create-409 already gives per-object
+//! write exclusion). It serializes the read-decide-write transaction
+//! (reconstruct committed capacity, decide fit, commit), which k8s offers no
+//! other primitive for. Without it, two runs could each list capacity, each
+//! see room, and each create a reservation, overcommitting. The lock is a
+//! `coordination.k8s.io` Lease used leader-election style: acquire-if-absent,
+//! steal-if-expired via a `resourceVersion` precondition, back-off-if-held-fresh.
 //!
-//! k8s create-409 already gives per-object write exclusion, so the
-//! allocator lock is **not** there to serialize writes. It serializes the
-//! *read-decide-write transaction* — reconstruct committed capacity, decide
-//! fit, then commit — which k8s offers no other primitive for. Without it,
-//! two runs could each list capacity, each see room, and each create a
-//! reservation → overcommit. The lock is a `coordination.k8s.io` Lease used
-//! leader-election style (acquire-if-absent, steal-if-expired via an
-//! `resourceVersion` precondition, back-off-if-held-fresh).
-//!
-//! ## The read-after-write hazard
-//!
-//! A reservation created by one lock-holder must be visible to the next.
-//! k8s `list` is watch-cache-served and only eventually consistent, so the
-//! in-section reservation/Job list is issued **not-older-than the lock's
-//! version** (its epoch). If the store cannot serve a read that fresh it
-//! returns [`StoreError::StaleRead`], and the allocator **refuses to decide**
+//! Read-after-write hazard: a reservation created by one lock-holder must be
+//! visible to the next. k8s `list` is watch-cache-served and only eventually
+//! consistent, so the in-section reservation/Job list is issued not-older-than
+//! the lock's version (its epoch). If the store cannot serve a read that fresh
+//! it returns [`StoreError::StaleRead`], and the allocator refuses to decide
 //! ([`Outcome::Retry`]) rather than act on a stale view.
 //!
-//! ## Crash safety & clock skew
+//! Crash safety and clock skew: a reservation Lease carries a renew tick +
+//! duration; the [`ledger`] excludes it once `renew + lease + grace < now`, so
+//! a crashed run's capacity is reclaimed without a central coordinator. The
+//! GRACE margin makes reclaim conservative under cross-run clock skew (prefer
+//! transient under-utilization over overcommit).
 //!
-//! A reservation Lease carries a renew tick + duration; the [`ledger`]
-//! excludes it once `renew + lease + grace < now`, so a crashed run's
-//! capacity is reclaimed without any central coordinator. The GRACE margin
-//! makes reclaim conservative under cross-run clock skew (prefer transient
-//! under-utilization over overcommit).
-//!
-//! **Unit-test coverage gaps (by construction):** the test suite injects a
-//! single logical clock, so all actors agree on `now` — the *real*
-//! cross-run clock-skew hazard is unrepresentable here and is owned by the
-//! GRACE constant, integration tests, and the `janitor/ttl` backstop.
-//! Likewise the in-memory fake is authoritative, so tests prove the
-//! allocator *refuses* stale reads, not that the real `kube` adapter
-//! *requests* consistent ones (that binding is the adapter's integration
-//! test). And the interleavings exercised are the ones the test driver
-//! chooses — deterministic by design.
+//! Unit-test coverage gaps: the suite injects a single logical clock, so all
+//! actors agree on `now`; the real cross-run clock-skew hazard is
+//! unrepresentable here and is owned by the GRACE constant, integration tests,
+//! and the `janitor/ttl` backstop. The in-memory fake is authoritative, so
+//! tests prove the allocator refuses stale reads, not that the real `kube`
+//! adapter requests consistent ones (that binding is the adapter's integration
+//! test). Interleavings exercised are the ones the test driver chooses.
 
 use std::collections::BTreeMap;
 
@@ -62,12 +53,12 @@ const LOCK_NAME: &str = "ztest-qos-allocator";
 
 /// A request to reserve capacity for one test.
 ///
-/// Capacity is one global figure, so there is no pool to choose — the
-/// tier's NVMe-vs-general *placement* rides on the pod specs
-/// (toleration/nodeSelector), applied elsewhere, not on the reservation.
+/// Capacity is one global figure, so there is no pool to choose: the tier's
+/// NVMe-vs-general placement rides on the pod specs (toleration/nodeSelector),
+/// applied elsewhere, not on the reservation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReservationRequest {
-    /// The accounting unit — the test's namespace identity. Determines the
+    /// The accounting unit: the test's namespace identity. Determines the
     /// reservation Lease name (so a retry is idempotent) and the
     /// [`LABEL_UNIT`] that links the reservation to its Jobs.
     pub unit: String,
@@ -75,7 +66,7 @@ pub struct ReservationRequest {
     pub sa: String,
     /// The namespace-aggregate reserve to schedule against.
     pub footprint: Resources,
-    /// The declared tier — recorded as [`LABEL_TIER`] on the reservation Lease
+    /// The declared tier, recorded as [`LABEL_TIER`] on the reservation Lease
     /// for the live during-run panel. Display metadata only; admission keys on
     /// [`Self::footprint`].
     pub class: QosClass,
@@ -86,7 +77,7 @@ pub struct ReservationRequest {
 pub enum Outcome {
     /// Admitted; the named reservation Lease is held. Boot the topology.
     Granted { reservation: String },
-    /// Fits in principle but no room (or SA at quota) right now — retry later.
+    /// Fits in principle but no room (or SA at quota) right now; retry later.
     Queued,
     /// Unschedulable even on an empty cluster / against the whole SA budget.
     Rejected(RejectReason),
@@ -101,16 +92,16 @@ pub enum Outcome {
 pub struct Allocator<S> {
     store: S,
     /// Whole-cluster capacity available to ztest (from the probe's
-    /// `ClusterCapacity::free()`) — config, not a writable k8s object.
+    /// `ClusterCapacity::free()`); config, not a writable k8s object.
     available: Resources,
     budgets: BTreeMap<String, Resources>,
     /// This run's holder identity, stamped on the lock and reservations.
     identity: String,
-    /// Allocator-lock duration in logical ticks (short — the section is brief).
+    /// Allocator-lock duration in logical ticks (short: the section is brief).
     lock_ticks: u64,
     /// Reservation Lease duration in logical ticks (the heartbeat TTL).
     reservation_ticks: u64,
-    /// Reclaim grace margin in ticks (skew guard; ≫ plausible clock skew).
+    /// Reclaim grace margin in ticks (skew guard, well above plausible skew).
     grace: u64,
 }
 
@@ -155,8 +146,8 @@ impl<S: ObjectStore> Allocator<S> {
             None => return Ok(Outcome::Retry),
         };
         let outcome = self.decide_and_commit(req, now, epoch).await;
-        // Always release — a transient failure must not wedge admissions
-        // cluster-wide. The lock's own TTL is the backstop if we crash here.
+        // Always release: a transient failure must not wedge admissions
+        // cluster-wide. The lock's TTL is the backstop on a crash here.
         let _ = self.release_lock().await;
         outcome
     }
@@ -184,7 +175,11 @@ impl<S: ObjectStore> Allocator<S> {
         };
         let jobs = match self
             .store
-            .list(Kind::Job, &LabelSelector::eq(LABEL_ROLE, ROLE_JOB), Some(epoch))
+            .list(
+                Kind::Job,
+                &LabelSelector::eq(LABEL_ROLE, ROLE_JOB),
+                Some(epoch),
+            )
             .await
         {
             Ok(v) => v,
@@ -207,12 +202,13 @@ impl<S: ObjectStore> Allocator<S> {
                 // Fence the commit on continued lock ownership. The lock isn't
                 // renewed during the section, so a critical section that
                 // outlives `LOCK_TICKS` can be stolen by another allocator that
-                // then reads this same free snapshot and also grants —
-                // overcommit. Re-check the lock immediately before creating: if
-                // its version moved off `epoch` (a steal/renew) or it's no
+                // then reads this same free snapshot and also grants
+                // (overcommit). Re-check the lock immediately before creating:
+                // if its version moved off `epoch` (a steal/renew) or it's no
                 // longer ours, abort and retry rather than commit. This narrows
                 // the TOCTOU window from the whole section to the gap between
-                // this check and the create (sub-millisecond ≪ `LOCK_TICKS`).
+                // this check and the create (sub-millisecond, far below
+                // `LOCK_TICKS`).
                 match self.store.get(Kind::AllocatorLock, LOCK_NAME).await? {
                     Some(o)
                         if o.resource_version == epoch
@@ -226,8 +222,8 @@ impl<S: ObjectStore> Allocator<S> {
                     .await
                 {
                     Ok(_) => Ok(Outcome::Granted { reservation: name }),
-                    // Deterministic name already present ⇒ an earlier attempt
-                    // of this same unit already claimed it. Idempotent grant.
+                    // Deterministic name already present: an earlier attempt of
+                    // this same unit already claimed it. Idempotent grant.
                     Err(StoreError::AlreadyExists) => Ok(Outcome::Granted { reservation: name }),
                     Err(e) => Err(e),
                 }
@@ -235,9 +231,9 @@ impl<S: ObjectStore> Allocator<S> {
         }
     }
 
-    /// Try to acquire the allocator lock at `now`. `Some(epoch)` = held
-    /// (epoch is the lock's version, used as the read watermark); `None` =
-    /// contended, caller should [`Outcome::Retry`].
+    /// Try to acquire the allocator lock at `now`. `Some(epoch)` is held (epoch
+    /// is the lock's version, used as the read watermark); `None` is contended,
+    /// caller should [`Outcome::Retry`].
     pub async fn acquire_lock(&self, now: u64) -> Result<Option<u64>, StoreError> {
         match self.store.get(Kind::AllocatorLock, LOCK_NAME).await? {
             None => match self
@@ -255,7 +251,7 @@ impl<S: ObjectStore> Allocator<S> {
                 let expired = renew.saturating_add(lease) < now;
                 let mine = obj.annotations.get(ANN_HOLDER) == Some(&self.identity);
                 if expired {
-                    // Steal via an rv precondition — a second stealer with the
+                    // Steal via an rv precondition: a second stealer with the
                     // same stale view loses with Conflict.
                     match self
                         .store
@@ -274,13 +270,13 @@ impl<S: ObjectStore> Allocator<S> {
                 } else if mine {
                     Ok(Some(obj.resource_version)) // re-entrant: already ours
                 } else {
-                    Ok(None) // held fresh by another → back off
+                    Ok(None) // held fresh by another: back off
                 }
             }
         }
     }
 
-    /// Release the allocator lock (best-effort; 404 ⇒ already gone).
+    /// Release the allocator lock (best-effort; 404 means already gone).
     pub async fn release_lock(&self) -> Result<(), StoreError> {
         match self.store.delete(Kind::AllocatorLock, LOCK_NAME).await {
             Ok(()) | Err(StoreError::NotFound) => Ok(()),
@@ -288,8 +284,8 @@ impl<S: ObjectStore> Allocator<S> {
         }
     }
 
-    /// Heartbeat a reservation Lease — bump its renew tick to `now` so it
-    /// stays live. Called periodically by the holding test process.
+    /// Heartbeat a reservation Lease: bump its renew tick to `now` so it stays
+    /// live. Called periodically by the holding test process.
     pub async fn renew(&self, reservation: &str, now: u64) -> Result<(), StoreError> {
         let obj = match self.store.get(Kind::Reservation, reservation).await? {
             Some(o) => o,
@@ -305,7 +301,7 @@ impl<S: ObjectStore> Allocator<S> {
             .map(|_| ())
     }
 
-    /// Release a reservation on clean teardown (404 ⇒ already gone).
+    /// Release a reservation on clean teardown (404 means already gone).
     pub async fn release(&self, reservation: &str) -> Result<(), StoreError> {
         match self.store.delete(Kind::Reservation, reservation).await {
             Ok(()) | Err(StoreError::NotFound) => Ok(()),
@@ -313,10 +309,10 @@ impl<S: ObjectStore> Allocator<S> {
         }
     }
 
-    /// Housekeeping: delete reservation Leases expired past the grace
-    /// margin (crashed runs that never released). Returns reclaimed names.
-    /// Capacity is freed for admission by the ledger's expiry check even
-    /// before this runs; this just stops the objects accumulating.
+    /// Housekeeping: delete reservation Leases expired past the grace margin
+    /// (crashed runs that never released). Returns reclaimed names. Capacity is
+    /// freed for admission by the ledger's expiry check before this runs; this
+    /// stops the objects accumulating.
     pub async fn reclaim_expired(&self, now: u64) -> Result<Vec<String>, StoreError> {
         let reservations = self
             .store
@@ -376,29 +372,37 @@ impl<S: ObjectStore> Allocator<S> {
             ]),
             annotations: BTreeMap::from([
                 (ANN_HOLDER.to_string(), self.identity.clone()),
-                (ANN_CPU_MILLI.to_string(), req.footprint.cpu_milli.to_string()),
-                (ANN_MEM_BYTES.to_string(), req.footprint.mem_bytes.to_string()),
+                (
+                    ANN_CPU_MILLI.to_string(),
+                    req.footprint.cpu_milli.to_string(),
+                ),
+                (
+                    ANN_MEM_BYTES.to_string(),
+                    req.footprint.mem_bytes.to_string(),
+                ),
                 (ANN_RENEW_TICK.to_string(), now.to_string()),
-                (ANN_LEASE_TICKS.to_string(), self.reservation_ticks.to_string()),
+                (
+                    ANN_LEASE_TICKS.to_string(),
+                    self.reservation_ticks.to_string(),
+                ),
             ]),
         }
     }
 }
 
-/// Deterministic reservation Lease name for an accounting unit — same unit
-/// ⇒ same name (idempotent retry), different units ⇒ different names.
+/// Deterministic reservation Lease name for an accounting unit: same unit maps
+/// to the same name (idempotent retry), different units to different names.
 pub fn reservation_name(unit: &str) -> String {
     format!("qos-{}", unit_slug(unit))
 }
 
-/// The single canonical slug of an accounting unit, used for *both* the
-/// reservation Lease name ([`reservation_name`]) and its [`LABEL_UNIT`] label
-/// (the ledger's per-unit dedup key). Deriving both from one slug keeps
-/// name-uniqueness and label-uniqueness in lockstep: two units can never map to
-/// the same name while carrying distinct labels (or vice-versa). 56 chars
-/// leaves room for the `qos-` name prefix under the 63-char DNS/label limit —
-/// and `unit` (a `namespace_for` string) is itself ≤56, so no truncation
-/// occurs in practice; this is belt-and-suspenders against future unit shapes.
+/// The canonical slug of an accounting unit, used for both the reservation
+/// Lease name ([`reservation_name`]) and its [`LABEL_UNIT`] label (the ledger's
+/// per-unit dedup key). Deriving both from one slug keeps name-uniqueness and
+/// label-uniqueness in lockstep: two units can never map to the same name while
+/// carrying distinct labels (or vice-versa). 56 chars leaves room for the
+/// `qos-` name prefix under the 63-char DNS/label limit; `unit` (a
+/// `namespace_for` string) is itself <=56, so no truncation occurs in practice.
 fn unit_slug(unit: &str) -> String {
     slug(unit, 56)
 }
@@ -458,7 +462,10 @@ mod tests {
     async fn admits_when_capacity_is_available_and_releases_the_lock() {
         let store = FakeStore::new();
         let a = allocator(store.clone(), "run-a", Resources::new(8_000, 16 * GIB));
-        let out = a.try_admit(&rr("u1", "acme",4_000, 4 * GIB), 0).await.unwrap();
+        let out = a
+            .try_admit(&rr("u1", "acme", 4_000, 4 * GIB), 0)
+            .await
+            .unwrap();
         assert!(matches!(out, Outcome::Granted { .. }));
         assert_eq!(store.count(Kind::Reservation), 1);
         // Lock was released (not left held).
@@ -494,7 +501,7 @@ mod tests {
         assert_eq!(store.count(Kind::AllocatorLock), 1);
     }
 
-    // 3. Fresh, not-mine lock ⇒ back off (no steal, store unchanged).
+    // 3. Fresh, not-mine lock: back off (no steal, store unchanged).
     #[tokio::test]
     async fn fresh_lock_held_by_another_backs_off() {
         let store = FakeStore::new();
@@ -502,7 +509,7 @@ mod tests {
         let a2 = allocator(store.clone(), "run-b", Resources::ZERO);
         assert!(a1.acquire_lock(0).await.unwrap().is_some());
         let v = store.version();
-        // a2 sees a1's fresh lock → backs off; nothing written.
+        // a2 sees a1's fresh lock and backs off; nothing written.
         assert!(a2.acquire_lock(1).await.unwrap().is_none());
         assert_eq!(store.version(), v);
         // a1 re-acquiring its own fresh lock is fine (re-entrant).
@@ -515,15 +522,25 @@ mod tests {
         let store = FakeStore::new();
         let a1 = allocator(store.clone(), "run-a", Resources::ZERO);
         let a2 = allocator(store.clone(), "run-b", Resources::ZERO);
-        a1.acquire_lock(0).await.unwrap(); // renew 0, lease 5 → expires at 5
+        a1.acquire_lock(0).await.unwrap(); // renew 0, lease 5, expires at 5
         // Capture the (now-expired) version two racers would both see.
-        let stale_rv = store.get(Kind::AllocatorLock, LOCK_NAME).await.unwrap().unwrap().resource_version;
+        let stale_rv = store
+            .get(Kind::AllocatorLock, LOCK_NAME)
+            .await
+            .unwrap()
+            .unwrap()
+            .resource_version;
         // a2 steals at now=6.
         assert!(a2.acquire_lock(6).await.unwrap().is_some());
         // A second stealer holding the same stale rv loses with Conflict.
         assert_eq!(
             store
-                .update(Kind::AllocatorLock, LOCK_NAME, stale_rv, ObjectPatch::default())
+                .update(
+                    Kind::AllocatorLock,
+                    LOCK_NAME,
+                    stale_rv,
+                    ObjectPatch::default()
+                )
                 .await,
             Err(StoreError::Conflict)
         );
@@ -536,10 +553,16 @@ mod tests {
         // Pool fits exactly one 4-CPU reservation.
         let a1 = allocator(store.clone(), "run-a", Resources::new(4_000, 4 * GIB));
         let a2 = allocator(store.clone(), "run-b", Resources::new(4_000, 4 * GIB));
-        let g = a1.try_admit(&rr("u1", "acme",4_000, 4 * GIB), 0).await.unwrap();
+        let g = a1
+            .try_admit(&rr("u1", "acme", 4_000, 4 * GIB), 0)
+            .await
+            .unwrap();
         assert!(matches!(g, Outcome::Granted { .. }));
-        // a2's strongly-consistent read sees u1 → no room → Queued.
-        let q = a2.try_admit(&rr("u2", "acme",4_000, 4 * GIB), 1).await.unwrap();
+        // a2's strongly-consistent read sees u1, no room, so it Queues.
+        let q = a2
+            .try_admit(&rr("u2", "acme", 4_000, 4 * GIB), 1)
+            .await
+            .unwrap();
         assert_eq!(q, Outcome::Queued);
         assert_eq!(store.count(Kind::Reservation), 1, "exactly one reservation");
     }
@@ -551,8 +574,15 @@ mod tests {
         let a = allocator(store.clone(), "run-a", Resources::new(8_000, 16 * GIB));
         // Simulate watch-cache lag on the in-section reservation list.
         store.fail_next_list(StoreError::StaleRead);
-        let out = a.try_admit(&rr("u1", "acme",4_000, 4 * GIB), 0).await.unwrap();
-        assert_eq!(out, Outcome::Retry, "must refuse, not decide on a stale read");
+        let out = a
+            .try_admit(&rr("u1", "acme", 4_000, 4 * GIB), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            Outcome::Retry,
+            "must refuse, not decide on a stale read"
+        );
         assert_eq!(store.count(Kind::Reservation), 0, "nothing committed");
         assert_eq!(store.count(Kind::AllocatorLock), 0, "lock released");
     }
@@ -562,15 +592,21 @@ mod tests {
     async fn crash_reclaim_via_expiry_admits_the_waiter() {
         let store = FakeStore::new();
         let a = allocator(store.clone(), "run-a", Resources::new(4_000, 4 * GIB));
-        a.try_admit(&rr("u1", "acme",4_000, 4 * GIB), 0).await.unwrap();
-        // u1 holds it (renew 0 + lease 100 + grace 10 → expires at 110).
+        a.try_admit(&rr("u1", "acme", 4_000, 4 * GIB), 0)
+            .await
+            .unwrap();
+        // u1 holds it (renew 0 + lease 100 + grace 10, expires at 110).
         assert_eq!(
-            a.try_admit(&rr("u2", "acme",4_000, 4 * GIB), 5).await.unwrap(),
+            a.try_admit(&rr("u2", "acme", 4_000, 4 * GIB), 5)
+                .await
+                .unwrap(),
             Outcome::Queued
         );
-        // Long after expiry, u1 is excluded → u2 admitted.
+        // Long after expiry, u1 is excluded, so u2 is admitted.
         assert!(matches!(
-            a.try_admit(&rr("u2", "acme",4_000, 4 * GIB), 200).await.unwrap(),
+            a.try_admit(&rr("u2", "acme", 4_000, 4 * GIB), 200)
+                .await
+                .unwrap(),
             Outcome::Granted { .. }
         ));
     }
@@ -580,11 +616,15 @@ mod tests {
     async fn reservation_within_grace_is_not_reclaimed() {
         let store = FakeStore::new();
         let a = allocator(store.clone(), "run-a", Resources::new(4_000, 4 * GIB));
-        a.try_admit(&rr("u1", "acme",4_000, 4 * GIB), 0).await.unwrap();
+        a.try_admit(&rr("u1", "acme", 4_000, 4 * GIB), 0)
+            .await
+            .unwrap();
         // lease ends at 100; grace to 110. now=105 is past the lease but
-        // within grace → u1 still counts → waiter Queues.
+        // within grace, so u1 still counts and the waiter Queues.
         assert_eq!(
-            a.try_admit(&rr("u2", "acme",4_000, 4 * GIB), 105).await.unwrap(),
+            a.try_admit(&rr("u2", "acme", 4_000, 4 * GIB), 105)
+                .await
+                .unwrap(),
             Outcome::Queued
         );
     }
@@ -597,12 +637,16 @@ mod tests {
         put_job(&store, "ju", "acme", 4_000, 4 * GIB).await;
         // 4 CPU of the 8 is taken by the Job; a 6-CPU ask doesn't fit.
         assert_eq!(
-            a.try_admit(&rr("u1", "acme",6_000, 2 * GIB), 0).await.unwrap(),
+            a.try_admit(&rr("u1", "acme", 6_000, 2 * GIB), 0)
+                .await
+                .unwrap(),
             Outcome::Queued
         );
         // A 4-CPU ask exactly fills the rest.
         assert!(matches!(
-            a.try_admit(&rr("u1", "acme",4_000, 4 * GIB), 0).await.unwrap(),
+            a.try_admit(&rr("u1", "acme", 4_000, 4 * GIB), 0)
+                .await
+                .unwrap(),
             Outcome::Granted { .. }
         ));
     }
@@ -612,15 +656,24 @@ mod tests {
     async fn release_frees_capacity() {
         let store = FakeStore::new();
         let a = allocator(store.clone(), "run-a", Resources::new(4_000, 4 * GIB));
-        let g = a.try_admit(&rr("u1", "acme",4_000, 4 * GIB), 0).await.unwrap();
-        let Outcome::Granted { reservation } = g else { panic!("expected grant") };
+        let g = a
+            .try_admit(&rr("u1", "acme", 4_000, 4 * GIB), 0)
+            .await
+            .unwrap();
+        let Outcome::Granted { reservation } = g else {
+            panic!("expected grant")
+        };
         assert_eq!(
-            a.try_admit(&rr("u2", "acme",4_000, 4 * GIB), 1).await.unwrap(),
+            a.try_admit(&rr("u2", "acme", 4_000, 4 * GIB), 1)
+                .await
+                .unwrap(),
             Outcome::Queued
         );
         a.release(&reservation).await.unwrap();
         assert!(matches!(
-            a.try_admit(&rr("u2", "acme",4_000, 4 * GIB), 2).await.unwrap(),
+            a.try_admit(&rr("u2", "acme", 4_000, 4 * GIB), 2)
+                .await
+                .unwrap(),
             Outcome::Granted { .. }
         ));
     }
@@ -641,12 +694,12 @@ mod tests {
         a.set_budget("acme", Resources::new(2_000, 2 * GIB));
         // Exceeds the (empty) pool.
         assert_eq!(
-            a.try_admit(&rr("u1", "acme",8_000, GIB), 0).await.unwrap(),
+            a.try_admit(&rr("u1", "acme", 8_000, GIB), 0).await.unwrap(),
             Outcome::Rejected(RejectReason::ExceedsClusterCapacity)
         );
         // Fits the pool but exceeds the whole SA budget.
         assert_eq!(
-            a.try_admit(&rr("u2", "acme",3_000, GIB), 0).await.unwrap(),
+            a.try_admit(&rr("u2", "acme", 3_000, GIB), 0).await.unwrap(),
             Outcome::Rejected(RejectReason::ExceedsSaBudget)
         );
         assert_eq!(store.count(Kind::Reservation), 0);
@@ -655,12 +708,21 @@ mod tests {
     // 13. Deterministic, collision-safe reservation names; retry idempotent.
     #[tokio::test]
     async fn reservation_name_is_deterministic_and_retry_is_idempotent() {
-        assert_eq!(reservation_name("walletless::sync"), reservation_name("walletless::sync"));
+        assert_eq!(
+            reservation_name("walletless::sync"),
+            reservation_name("walletless::sync")
+        );
         assert_ne!(reservation_name("a"), reservation_name("b"));
         let store = FakeStore::new();
         let a = allocator(store.clone(), "run-a", Resources::new(8_000, 8 * GIB));
-        let g1 = a.try_admit(&rr("u1", "acme",4_000, 4 * GIB), 0).await.unwrap();
-        let g2 = a.try_admit(&rr("u1", "acme",4_000, 4 * GIB), 1).await.unwrap();
+        let g1 = a
+            .try_admit(&rr("u1", "acme", 4_000, 4 * GIB), 0)
+            .await
+            .unwrap();
+        let g2 = a
+            .try_admit(&rr("u1", "acme", 4_000, 4 * GIB), 1)
+            .await
+            .unwrap();
         assert_eq!(g1, g2, "same unit re-admit is idempotent");
         assert_eq!(store.count(Kind::Reservation), 1);
     }
@@ -676,28 +738,49 @@ mod tests {
         // (never releases the lock).
         a1.acquire_lock(0).await.unwrap();
         store
-            .create(Kind::Reservation, a1.reservation_object(&reservation_name("u1"), &rr("u1", "acme",4_000, 4 * GIB), 0))
+            .create(
+                Kind::Reservation,
+                a1.reservation_object(
+                    &reservation_name("u1"),
+                    &rr("u1", "acme", 4_000, 4 * GIB),
+                    0,
+                ),
+            )
             .await
             .unwrap();
         // Lock left held (renew 0, lease 5). At now=6 it's expired; a2 steals,
-        // re-lists, sees u1's reservation → no room → Queued (not overcommit).
+        // re-lists, sees u1's reservation, no room, so Queued (not overcommit).
         assert_eq!(
-            a2.try_admit(&rr("u2", "acme",4_000, 4 * GIB), 6).await.unwrap(),
+            a2.try_admit(&rr("u2", "acme", 4_000, 4 * GIB), 6)
+                .await
+                .unwrap(),
             Outcome::Queued
         );
         assert_eq!(store.count(Kind::Reservation), 1, "u1's reservation intact");
     }
 
-    // 15. Determinism: identical scripts + clock ⇒ identical outcomes/state.
+    // 15. Determinism: identical scripts + clock yield identical outcomes/state.
     #[tokio::test]
     async fn identical_scripts_yield_identical_results() {
         async fn run() -> (Vec<Outcome>, usize) {
             let store = FakeStore::new();
             let a = allocator(store.clone(), "run-a", Resources::new(8_000, 8 * GIB));
             let mut outs = Vec::new();
-            outs.push(a.try_admit(&rr("u1", "acme",4_000, 4 * GIB), 0).await.unwrap());
-            outs.push(a.try_admit(&rr("u2", "acme",4_000, 4 * GIB), 1).await.unwrap());
-            outs.push(a.try_admit(&rr("u3", "acme",4_000, 4 * GIB), 2).await.unwrap());
+            outs.push(
+                a.try_admit(&rr("u1", "acme", 4_000, 4 * GIB), 0)
+                    .await
+                    .unwrap(),
+            );
+            outs.push(
+                a.try_admit(&rr("u2", "acme", 4_000, 4 * GIB), 1)
+                    .await
+                    .unwrap(),
+            );
+            outs.push(
+                a.try_admit(&rr("u3", "acme", 4_000, 4 * GIB), 2)
+                    .await
+                    .unwrap(),
+            );
             (outs, store.count(Kind::Reservation))
         }
         assert_eq!(run().await, run().await);
@@ -708,8 +791,12 @@ mod tests {
     async fn reclaim_expired_deletes_only_dead_reservations() {
         let store = FakeStore::new();
         let a = allocator(store.clone(), "run-a", Resources::new(16_000, 16 * GIB));
-        a.try_admit(&rr("old", "acme",1_000, GIB), 0).await.unwrap(); // expires at 110
-        a.try_admit(&rr("new", "acme",1_000, GIB), 1_000).await.unwrap(); // expires at 1110
+        a.try_admit(&rr("old", "acme", 1_000, GIB), 0)
+            .await
+            .unwrap(); // expires at 110
+        a.try_admit(&rr("new", "acme", 1_000, GIB), 1_000)
+            .await
+            .unwrap(); // expires at 1110
         let reclaimed = a.reclaim_expired(500).await.unwrap();
         assert_eq!(reclaimed, vec![reservation_name("old")]);
         assert_eq!(store.count(Kind::Reservation), 1);

@@ -17,11 +17,11 @@
   │     ├─ test bin          │
   │     ├─ test bin          │
   │     └─ test bin          │
-  │       └─ zcash_kube_net  │
+  │       └─ ztest           │
   └──────────────────────────┘
 ```
 
-`zcash_kube_net` is a **library** linked into each test binary. It builds k8s manifests,
+`ztest` is a **library** linked into each test binary. It builds k8s manifests,
 applies them via `kube-rs`, waits on watchers, and exposes typed handles to the test code. Tests run under `cargo nextest run`
 in both dev and CI — no wrapper between them.
 
@@ -64,7 +64,7 @@ CI:  zaino-ci-${GITHUB_RUN_ID}-${SLOT}              # e.g. zaino-ci-17234819-3
 Dev: zaino-dev-${USER}-${NEXTEST_PID}-${SLOT}        # e.g. zaino-dev-eli-48217-3
 ```
 
-- `RUN_ID` = `GITHUB_RUN_ID` in CI (set as `ZCASH_KUBE_NET_RUN_ID` env);
+- `RUN_ID` = `GITHUB_RUN_ID` in CI (set as `ZTEST_RUN_ID` env);
   dev has no run-id — `getppid()` (nextest's PID) disambiguates
   concurrent `cargo nextest` invocations instead.
 - `SLOT` = `NEXTEST_TEST_GLOBAL_SLOT` (nextest 0.9.x+), in `0..test_threads`.
@@ -126,16 +126,18 @@ revisit.
 ## What the library does
 
 ```
-infrastructure/zcash_kube_net/
-├── crates/
-│   ├── zcash_kube_noc macros: mount_file!, mount_archive!
-├── docs/
-└── examples/
+ztest/
+├── src/          the ztest library + the `ztest` CLI binary
+├── macros/       ztest_macros: mount_file!, mount_archive!, dev!
+├── fixtures/     regtest configs, kind/k3s class manifests
+├── proto/        vendored protobuf bindings
+└── docs/
 ```
 
-Two crates, one of them being macros. Test crates depend on
-`zcash_kube_net` as a `dev-dependency`. No `_proto`, no `_client`,
-no `_cli`.
+Two crates: the `ztest` library and the `ztest_macros` proc-macro crate.
+Test crates depend on `ztest` as a `dev-dependency`. The `ztest` CLI
+(`ztest run`) is a thin wrapper that shells out to `cargo nextest run`
+after preflight and cluster orchestration. No `_proto`, no `_client`.
 
 ## Networking
 

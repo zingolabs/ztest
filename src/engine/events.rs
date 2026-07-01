@@ -1,12 +1,11 @@
 //! The lifecycle events the run loop emits, plus the [`RunReporter`] trait the
 //! loop drives.
 //!
-//! The events are a small, ztest-native vocabulary that maps one-to-one onto
-//! nextest's `TestEventKind` (started / slow / retrying / finished / skipped +
-//! run started / finished). The concrete reporter that turns them into
-//! nextest-*style* output is
-//! [`StyledReporter`](crate::engine::reporter::StyledReporter); [`NullReporter`]
-//! is a discard sink for tests.
+//! A small ztest-native vocabulary mapping one-to-one onto nextest's
+//! `TestEventKind` (started, slow, retrying, finished, skipped, plus run
+//! started/finished). The concrete reporter that turns them into nextest-style
+//! output is [`StyledReporter`](crate::engine::reporter::StyledReporter);
+//! [`NullReporter`] is a discard sink for tests.
 
 use std::time::Duration;
 
@@ -19,7 +18,7 @@ pub enum Verdict {
     Pass,
     /// Exited non-zero (the captured exit code).
     Fail(i32),
-    /// Killed at the tier hard cap (or `--slow-timeout` terminate).
+    /// Killed at the tier hard cap (or the `--slow-timeout` terminate).
     Timeout,
     /// The process could not be spawned at all.
     SpawnError,
@@ -35,10 +34,15 @@ impl Verdict {
 /// Why a test was never run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Footprint exceeds the empty-of-ztest cluster ceiling — unschedulable.
+    /// Footprint exceeds the empty-of-ztest cluster ceiling: unschedulable.
     ExceedsClusterCapacity,
     /// Footprint exceeds the ServiceAccount budget.
     ExceedsSaBudget,
+    /// A resource the test declared (`#[ztest::archive]`/`dev!`) failed to
+    /// provision (or is unreachable), so the test can't run — skipped cleanly
+    /// rather than failing at `TestEnv::build()`. Carries a human-readable
+    /// description of the unavailable resource.
+    DependencyUnavailable { resource: String },
 }
 
 /// A single in-flight test, for the live "running" region (nextest's
@@ -82,7 +86,7 @@ impl RunStats {
 }
 
 /// One lifecycle event emitted by the run loop. Borrowed identity fields keep
-/// allocation off the hot path; the reporter clones what it must retain.
+/// allocation off the hot path; the reporter clones what it needs to retain.
 #[derive(Debug, Clone)]
 pub enum TestEvent<'a> {
     /// The run is starting; `total` work-items, `run_id` shared by all children.
@@ -95,26 +99,33 @@ pub enum TestEvent<'a> {
         attempt: u32,
     },
     /// A running test crossed its slow threshold; `will_terminate` if the hard
-    /// cap will kill it.
+    /// cap will kill it. `attempt > 1` renders as nextest's `TRY {attempt} SLOW`.
     TestSlow {
         binary_id: &'a str,
         test_name: &'a str,
         elapsed: Duration,
         will_terminate: bool,
+        attempt: u32,
     },
-    /// A failed attempt will be retried after `delay`.
+    /// A failed attempt will be retried after `delay`. `verdict`/`duration`
+    /// describe the attempt that just failed, so the reporter can render
+    /// nextest's magenta `TRY {n} {status}` retry line with its real duration.
     TestRetrying {
         binary_id: &'a str,
         test_name: &'a str,
         next_attempt: u32,
         delay: Duration,
+        verdict: Verdict,
+        duration: Duration,
     },
-    /// A test reached a terminal verdict.
+    /// A test reached a terminal verdict on its `attempt`-th run (1-based); an
+    /// `attempt > 1` renders as nextest's `TRY {attempt} {status}` final line.
     TestFinished {
         binary_id: &'a str,
         test_name: &'a str,
         verdict: Verdict,
         duration: Duration,
+        attempt: u32,
         /// Merged stdout+stderr captured from the child (for failure replay).
         output: &'a [u8],
     },
@@ -138,7 +149,7 @@ pub enum TestEvent<'a> {
 ///
 /// Scroll-lines (PASS/FAIL/summary) accumulate as bytes drained by
 /// [`take_scrollback`](RunReporter::take_scrollback). The live element (the
-/// nextest-style progress line + running list) is rendered separately by the
+/// nextest-style progress line plus running list) is rendered separately by the
 /// run loop from [`PanelFrame`](crate::engine::schedule::PanelFrame) data.
 pub trait RunReporter {
     /// Consume one lifecycle event.
@@ -147,7 +158,7 @@ pub trait RunReporter {
     fn take_scrollback(&mut self) -> Vec<u8>;
 }
 
-/// A reporter that discards everything — a sink for tests and a safe default.
+/// A reporter that discards everything: a sink for tests and a safe default.
 /// The real output reporter is [`StyledReporter`](crate::engine::reporter::StyledReporter).
 #[derive(Debug, Default)]
 pub struct NullReporter;

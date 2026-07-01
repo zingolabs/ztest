@@ -2,16 +2,15 @@
 //!
 //! See `docs/architecture-overview.md#seeds-content-addressed-archive-pvcs`.
 //!
-//! - **Seed PVC** lives in `zaino-seeds`, named `seed-{sha8}`. Paired with
+//! - The seed PVC lives in `zaino-seeds`, named `seed-{sha8}`, paired with
 //!   a `VolumeSnapshot` of the same name.
-//! - To use a seed from a test namespace we mint a **shadow VSC**
-//!   (cluster-scoped) sharing the CSI snapshot handle, plus a
-//!   **shadow VolumeSnapshot** (namespaced) referencing it. The test's
-//!   PVC `dataSource` points at the shadow snapshot.
-//! - Materialization (uploading bytes to the seed PVC on first use) is
-//!   intentionally out of this module — the upload Job/Pod lands in a
-//!   follow-up. Resolution against a pre-published seed is what this file
-//!   does.
+//! - To use a seed from a test namespace we mint a shadow VSC
+//!   (cluster-scoped) sharing the CSI snapshot handle, plus a shadow
+//!   VolumeSnapshot (namespaced) referencing it. The test's PVC
+//!   `dataSource` points at the shadow snapshot.
+//! - Materialization (uploading bytes to the seed PVC on first use) lives
+//!   in `materialize`, not here. This file resolves against a
+//!   pre-published seed.
 
 use std::io::Read;
 use std::path::Path;
@@ -27,7 +26,7 @@ use crate::error::env_err;
 
 pub const SEEDS_NAMESPACE: &str = "zaino-seeds";
 
-/// 8 lowercase-hex characters — the content-address prefix we name PVCs by.
+/// 8 lowercase-hex characters: the content-address prefix we name PVCs by.
 pub fn sha8(path: &Path) -> Result<String, std::io::Error> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -52,8 +51,8 @@ pub struct SeedHandle {
     pub csi_handle: String,
 }
 
-/// Read the CSI snapshot handle for an already-published seed. Assumes
-/// the PVC is `ready=true` and the paired VolumeSnapshot is bound —
+/// Read the CSI snapshot handle for an already-published seed. Assumes the
+/// PVC is `ready=true` and the paired VolumeSnapshot is bound;
 /// `materialize::ensure_seed` guarantees both before calling this.
 pub async fn read_seed_handle(
     client: &Client,
@@ -109,11 +108,11 @@ pub async fn read_seed_handle(
 
 /// Create the shadow VolumeSnapshotContent (cluster-scoped) + the
 /// in-namespace VolumeSnapshot that references it. Returns the
-/// in-namespace snapshot name — that's the `dataSource` for the test PVC.
+/// in-namespace snapshot name, which is the `dataSource` for the test PVC.
 ///
 /// The cluster-scoped VSC cannot ownerRef back to the namespaced sentinel
 /// (k8s GC won't cross scopes), so the library deletes it explicitly on
-/// teardown — see `delete_shadow`.
+/// teardown; see `delete_shadow`.
 pub async fn mint_shadow_clone(
     client: &Client,
     sentinel: &Sentinel,
@@ -125,16 +124,26 @@ pub async fn mint_shadow_clone(
     let shadow_vsc = format!("shadow-vsc-{}-{}", seed.sha8, suffix);
     let shadow_snap = format!("shadow-snap-{}-{}", seed.sha8, suffix);
 
-    // VSC first — cluster-scoped, no owner.
+    // VSC first: cluster-scoped, no owner.
     let vsc_gvk = volume_snapshot_content_gvk();
     let vsc_api: Api<DynamicObject> = Api::all_with(client.clone(), &vsc_gvk);
+    // Label the cluster-scoped VSC with the run id so the preflight reaper can
+    // clean it up on Ctrl-C: it can't ownerRef the namespaced sentinel (k8s GC
+    // won't cross scopes) and so isn't cascaded by a namespace delete. The label
+    // is the only handle a parent-side, by-identity reap has on it.
+    let run_id = crate::naming::RunCoords::from_env()
+        .map(|c| c.run_id)
+        .unwrap_or_default();
     let vsc_body: Value = json!({
         "apiVersion": "snapshot.storage.k8s.io/v1",
         "kind": "VolumeSnapshotContent",
-        "metadata": { "name": shadow_vsc },
+        "metadata": {
+            "name": shadow_vsc,
+            "labels": { "zaino.io/run-id": run_id },
+        },
         "spec": {
             "deletionPolicy": "Retain",  // we don't own the backend snapshot
-            "driver": detect_driver(),
+            "driver": detect_driver(client).await,
             "source": { "snapshotHandle": seed.csi_handle },
             "sourceVolumeMode": "Filesystem",
             "volumeSnapshotRef": {
@@ -234,7 +243,7 @@ pub(crate) fn volume_snapshot_gvk() -> ApiResource {
     })
 }
 
-fn volume_snapshot_content_gvk() -> ApiResource {
+pub(crate) fn volume_snapshot_content_gvk() -> ApiResource {
     ApiResource::from_gvk(&GroupVersionKind {
         group: "snapshot.storage.k8s.io".into(),
         version: "v1".into(),
@@ -242,11 +251,35 @@ fn volume_snapshot_content_gvk() -> ApiResource {
     })
 }
 
-/// CSI driver name. Configurable via env so we don't have to hard-code
-/// the Ceph install — the cluster operator wires this in via the runner's
-/// deployment.
-fn detect_driver() -> String {
-    std::env::var("ZAINO_CSI_DRIVER").unwrap_or_else(|_| "rook-ceph.rbd.csi.ceph.com".into())
+/// CSI driver name for the shadow `VolumeSnapshotContent`. This must equal
+/// the driver that backs the seed's snapshot; it's the one value we can't
+/// alias by name (the StorageClass / VolumeSnapshotClass names we do keep
+/// identical across Ceph and kind).
+///
+/// Resolution order:
+/// 1. `ZAINO_CSI_DRIVER` env override (explicit operator control).
+/// 2. The `driver` field of the live `VolumeSnapshotClass` we're using.
+///    This makes `ztest setup` turnkey: on kind the class is backed by
+///    `hostpath.csi.k8s.io`, on Ceph by `rook-ceph.rbd.csi.ceph.com`, and
+///    we read whichever is installed.
+/// 3. The Ceph default, as a last resort if the class can't be read.
+async fn detect_driver(client: &Client) -> String {
+    if let Ok(d) = std::env::var("ZAINO_CSI_DRIVER") {
+        return d;
+    }
+    let class = detect_snapshot_class();
+    let gvk = GroupVersionKind {
+        group: "snapshot.storage.k8s.io".into(),
+        version: "v1".into(),
+        kind: "VolumeSnapshotClass".into(),
+    };
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ApiResource::from_gvk(&gvk));
+    if let Ok(Some(c)) = api.get_opt(&class).await
+        && let Some(d) = c.data.get("driver").and_then(Value::as_str)
+    {
+        return d.to_string();
+    }
+    "rook-ceph.rbd.csi.ceph.com".into()
 }
 fn detect_snapshot_class() -> String {
     std::env::var("ZAINO_VOLUMESNAPSHOTCLASS").unwrap_or_else(|_| "ceph-rbd-snapclass".into())

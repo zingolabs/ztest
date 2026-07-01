@@ -1,23 +1,22 @@
 //! The one seam between the decentralized allocator and Kubernetes.
 //!
-//! [`ObjectStore`] is a minimal, conflict-surfacing abstraction over the
-//! handful of k8s operations the allocator needs — `get`/`list`/`create`/
-//! `update`/`delete` on named, label-tagged objects carrying a
-//! server-assigned monotonic `resourceVersion`. Two implementations:
+//! [`ObjectStore`] is a minimal, conflict-surfacing abstraction over the k8s
+//! operations the allocator needs: `get`/`list`/`create`/`update`/`delete` on
+//! named, label-tagged objects carrying a server-assigned monotonic
+//! `resourceVersion`. Two implementations:
 //!
-//! - the in-memory [`fake::FakeStore`] (this file, `#[cfg(test)]`) that
-//!   faithfully models k8s conflict semantics — create-409, stale-rv-409,
-//!   delete-404, label-filtered list, and the **read-after-write
-//!   watermark** that the allocator's strong-consistency requirement
-//!   hangs on. It is the substrate for the entire unit-test suite.
-//! - the real `kube` adapter (`kube_store.rs`, a later increment) that maps
-//!   the same trait onto `Api<Lease>`/`Api<Job>` with quorum reads.
+//! - the in-memory [`fake::FakeStore`] (this file, `#[cfg(test)]`) that models
+//!   k8s conflict semantics (create-409, stale-rv-409, delete-404,
+//!   label-filtered list, and the read-after-write watermark the allocator's
+//!   strong-consistency requirement hangs on). Substrate for the unit-test
+//!   suite.
+//! - the real `kube` adapter (`kube_store.rs`) that maps the same trait onto
+//!   `Api<Lease>`/`Api<Job>` with quorum reads.
 //!
 //! The trait is kind-agnostic: Leases and Jobs flow through the same five
 //! operations, distinguished only by [`Kind`] + a [`LabelSelector`]. The
-//! numeric payload (footprint, renew tick, …) rides in annotations, so the
-//! store never needs a typed spec — see the key constants in
-//! [`crate::qos`].
+//! numeric payload (footprint, renew tick, ...) rides in annotations, so the
+//! store never needs a typed spec (see the key constants in [`crate::qos`]).
 
 use std::collections::BTreeMap;
 
@@ -53,7 +52,7 @@ pub struct StoredObject {
 
 impl StoredObject {
     /// Read an annotation, parsed as a decimal `u64`. `None` if absent or
-    /// unparseable — callers treat a malformed object conservatively.
+    /// unparseable; callers treat a malformed object conservatively.
     pub fn annot_u64(&self, key: &str) -> Option<u64> {
         self.annotations.get(key)?.parse().ok()
     }
@@ -68,7 +67,7 @@ pub struct NewObject {
     pub annotations: BTreeMap<String, String>,
 }
 
-/// A merge patch for [`ObjectStore::update`] — keys merged into the existing
+/// A merge patch for [`ObjectStore::update`]: keys merged into the existing
 /// object's labels/annotations (matching `kube`'s `Patch::Merge`).
 #[derive(Debug, Clone, Default)]
 pub struct ObjectPatch {
@@ -105,9 +104,9 @@ impl LabelSelector {
 /// real client sees and treats specially (see `cluster.rs`/`materialize.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
-    /// `create` against an existing name (HTTP 409). The caller lost a
-    /// create race — for a deterministically-named object, this means the
-    /// claim is already held (possibly by an earlier attempt of its own).
+    /// `create` against an existing name (HTTP 409). The caller lost a create
+    /// race; for a deterministically-named object, the claim is already held
+    /// (possibly by an earlier attempt of its own).
     AlreadyExists,
     /// `update` whose `expected_rv` precondition didn't match, or `update`
     /// of an absent object (HTTP 409). The caller's view is stale; retry.
@@ -116,11 +115,11 @@ pub enum StoreError {
     /// (HTTP 404). Callers usually treat delete-404 as success.
     NotFound,
     /// A `list` could not be served at least as fresh as the requested
-    /// `not_older_than` watermark — the read would be stale (real cluster:
-    /// the watch cache lags behind a known write). The allocator must
-    /// **refuse to decide** on such a read and retry, never act on it.
+    /// `not_older_than` watermark; the read would be stale (real cluster: the
+    /// watch cache lags behind a known write). The allocator refuses to decide
+    /// on such a read and retries, never acting on it.
     StaleRead,
-    /// Transport / serialization / auth failure — opaque, not a conflict.
+    /// Transport / serialization / auth failure: opaque, not a conflict.
     Backend(String),
 }
 
@@ -180,8 +179,8 @@ pub(crate) mod fake {
     //! Authoritative in-memory [`ObjectStore`]. Cheap-clone (shared inner
     //! state) so two `Allocator`s can be pointed at one store to exercise
     //! cross-run contention. Deterministic: objects iterate by name, the
-    //! version counter is a plain `u64`, and there is **no clock** — time is
-    //! the allocator's injected logical tick, never the store's concern.
+    //! version counter is a plain `u64`, and there is no clock: time is the
+    //! allocator's injected logical tick, never the store's concern.
 
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::{Arc, Mutex};
@@ -194,7 +193,7 @@ pub(crate) mod fake {
         objects: BTreeMap<(Kind, String), StoredObject>,
         /// Store-wide monotonic version, bumped on every create/update.
         version: u64,
-        /// Forced errors, popped (FIFO) by the next `list` — lets a test
+        /// Forced errors, popped (FIFO) by the next `list`, letting a test
         /// simulate watch-cache lag (`StaleRead`) or transient backend
         /// failures without a real cluster.
         list_faults: VecDeque<StoreError>,
@@ -227,7 +226,7 @@ pub(crate) mod fake {
                 .count()
         }
 
-        /// Make the next `list` call fail with `err` — simulate cache lag.
+        /// Make the next `list` call fail with `err`; simulate cache lag.
         pub(crate) fn fail_next_list(&self, err: StoreError) {
             self.inner.lock().unwrap().list_faults.push_back(err);
         }
@@ -299,7 +298,7 @@ pub(crate) mod fake {
             let mut st = self.inner.lock().unwrap();
             let key = (kind, name.to_string());
             let Some(obj) = st.objects.get(&key) else {
-                return Err(StoreError::Conflict); // absent → stale view
+                return Err(StoreError::Conflict); // absent: stale view
             };
             if obj.resource_version != expected_rv {
                 return Err(StoreError::Conflict);
@@ -339,15 +338,21 @@ mod tests {
     #[tokio::test]
     async fn create_is_atomic_409_on_duplicate_and_bumps_version() {
         let s = FakeStore::new();
-        let rv1 = s.create(Kind::Reservation, obj("r1", ("p", "x"))).await.unwrap();
+        let rv1 = s
+            .create(Kind::Reservation, obj("r1", ("p", "x")))
+            .await
+            .unwrap();
         assert_eq!(rv1, 1);
-        // Same name again → AlreadyExists, version unchanged.
+        // Same name again: AlreadyExists, version unchanged.
         assert_eq!(
             s.create(Kind::Reservation, obj("r1", ("p", "x"))).await,
             Err(StoreError::AlreadyExists)
         );
         // A different name bumps the monotonic version.
-        let rv2 = s.create(Kind::Reservation, obj("r2", ("p", "x"))).await.unwrap();
+        let rv2 = s
+            .create(Kind::Reservation, obj("r2", ("p", "x")))
+            .await
+            .unwrap();
         assert_eq!(rv2, 2);
         assert_eq!(s.count(Kind::Reservation), 2);
     }
@@ -355,27 +360,36 @@ mod tests {
     #[tokio::test]
     async fn update_requires_matching_resource_version() {
         let s = FakeStore::new();
-        let rv = s.create(Kind::AllocatorLock, obj("lock", ("p", "x"))).await.unwrap();
-        // Stale rv → Conflict.
+        let rv = s
+            .create(Kind::AllocatorLock, obj("lock", ("p", "x")))
+            .await
+            .unwrap();
+        // Stale rv: Conflict.
         assert_eq!(
-            s.update(Kind::AllocatorLock, "lock", rv + 99, ObjectPatch::default()).await,
+            s.update(Kind::AllocatorLock, "lock", rv + 99, ObjectPatch::default())
+                .await,
             Err(StoreError::Conflict)
         );
-        // Correct rv → succeeds, returns a fresh, higher rv.
+        // Correct rv: succeeds, returns a fresh, higher rv.
         let patch = ObjectPatch {
             annotations: BTreeMap::from([("k".into(), "v".into())]),
             ..Default::default()
         };
-        let rv2 = s.update(Kind::AllocatorLock, "lock", rv, patch).await.unwrap();
+        let rv2 = s
+            .update(Kind::AllocatorLock, "lock", rv, patch)
+            .await
+            .unwrap();
         assert!(rv2 > rv);
-        // The same (now-stale) rv fails the second time — optimistic CAS.
+        // The same (now-stale) rv fails the second time: optimistic CAS.
         assert_eq!(
-            s.update(Kind::AllocatorLock, "lock", rv, ObjectPatch::default()).await,
+            s.update(Kind::AllocatorLock, "lock", rv, ObjectPatch::default())
+                .await,
             Err(StoreError::Conflict)
         );
         // Update of an absent object is a Conflict (stale view), not NotFound.
         assert_eq!(
-            s.update(Kind::AllocatorLock, "ghost", 1, ObjectPatch::default()).await,
+            s.update(Kind::AllocatorLock, "ghost", 1, ObjectPatch::default())
+                .await,
             Err(StoreError::Conflict)
         );
     }
@@ -383,20 +397,35 @@ mod tests {
     #[tokio::test]
     async fn delete_is_404_when_absent() {
         let s = FakeStore::new();
-        s.create(Kind::Reservation, obj("r", ("p", "x"))).await.unwrap();
+        s.create(Kind::Reservation, obj("r", ("p", "x")))
+            .await
+            .unwrap();
         assert_eq!(s.delete(Kind::Reservation, "r").await, Ok(()));
-        assert_eq!(s.delete(Kind::Reservation, "r").await, Err(StoreError::NotFound));
+        assert_eq!(
+            s.delete(Kind::Reservation, "r").await,
+            Err(StoreError::NotFound)
+        );
     }
 
     #[tokio::test]
     async fn list_filters_by_kind_and_labels() {
         let s = FakeStore::new();
-        s.create(Kind::Reservation, obj("a", ("pool", "general"))).await.unwrap();
-        s.create(Kind::Reservation, obj("b", ("pool", "nvme"))).await.unwrap();
-        s.create(Kind::Job, obj("j", ("pool", "general"))).await.unwrap();
+        s.create(Kind::Reservation, obj("a", ("pool", "general")))
+            .await
+            .unwrap();
+        s.create(Kind::Reservation, obj("b", ("pool", "nvme")))
+            .await
+            .unwrap();
+        s.create(Kind::Job, obj("j", ("pool", "general")))
+            .await
+            .unwrap();
 
         let general = s
-            .list(Kind::Reservation, &LabelSelector::eq("pool", "general"), None)
+            .list(
+                Kind::Reservation,
+                &LabelSelector::eq("pool", "general"),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(general.len(), 1);
@@ -412,10 +441,13 @@ mod tests {
     #[tokio::test]
     async fn list_refuses_a_watermark_newer_than_the_store() {
         let s = FakeStore::new();
-        s.create(Kind::Reservation, obj("a", ("p", "x"))).await.unwrap(); // version == 1
-        // Demanding freshness beyond what the store has seen → StaleRead.
+        s.create(Kind::Reservation, obj("a", ("p", "x")))
+            .await
+            .unwrap(); // version == 1
+        // Demanding freshness beyond what the store has seen: StaleRead.
         assert_eq!(
-            s.list(Kind::Reservation, &LabelSelector::default(), Some(99)).await,
+            s.list(Kind::Reservation, &LabelSelector::default(), Some(99))
+                .await,
             Err(StoreError::StaleRead)
         );
         // A satisfiable watermark is fine.
@@ -431,19 +463,26 @@ mod tests {
         let s = FakeStore::new();
         s.fail_next_list(StoreError::StaleRead);
         assert_eq!(
-            s.list(Kind::Reservation, &LabelSelector::default(), None).await,
+            s.list(Kind::Reservation, &LabelSelector::default(), None)
+                .await,
             Err(StoreError::StaleRead)
         );
-        // Fault is one-shot — the next list succeeds.
-        assert!(s.list(Kind::Reservation, &LabelSelector::default(), None).await.is_ok());
+        // Fault is one-shot; the next list succeeds.
+        assert!(
+            s.list(Kind::Reservation, &LabelSelector::default(), None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn clone_shares_state() {
         let s = FakeStore::new();
         let s2 = s.clone();
-        s.create(Kind::Reservation, obj("r", ("p", "x"))).await.unwrap();
-        // The clone observes the write — same underlying store.
+        s.create(Kind::Reservation, obj("r", ("p", "x")))
+            .await
+            .unwrap();
+        // The clone observes the write: same underlying store.
         assert!(s2.get(Kind::Reservation, "r").await.unwrap().is_some());
     }
 }

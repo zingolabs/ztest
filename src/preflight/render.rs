@@ -1,20 +1,17 @@
 //! Pure formatter for the preflight banner.
 //!
-//! Takes a [`BannerState`] and a [`Theme`], returns a `String`. No I/O,
-//! no async. The renderer obeys nextest's reporter conventions:
+//! Takes a [`BannerState`] and a [`Theme`], returns a `String`. No I/O, no async.
+//! Obeys nextest's reporter conventions:
+//! - a 12-column right-aligned action label plus a space on every primary line
+//!   (`"{:>12} "`), matching nextest's `Nextest run` / `Starting` / `Running` /
+//!   `Skipped` cadence;
+//! - a 12-char horizontal rule (`theme.chars.hbar(12)`) opening and closing the
+//!   block, the width and glyph nextest uses for `RunStarted` / `RunFinished`;
+//! - `·` between metadata fields, styled `dim`;
+//! - markers (`✓ ⇣ !`) styled `pass` / `dim` / `skip`; numeric counts `count`.
 //!
-//! - A 12-column right-aligned **action label** + single space prefix
-//!   on every primary line (`"{:>12} "`). Matches `cargo nextest`'s
-//!   `Nextest run`, `Starting`, `Running`, `Skipped` cadence.
-//! - 12-character horizontal rule (`theme.chars.hbar(12)`) opening and
-//!   closing the block — same width and glyph nextest uses for
-//!   `RunStarted` and `RunFinished`.
-//! - `·` between metadata fields, styled with `dim`.
-//! - Markers (`✓ ⇣ !`) styled with `pass / dim / skip` respectively;
-//!   numeric counts with `count`.
-//!
-//! Reading the output, a developer sees the preflight as just another
-//! group of action lines in nextest's banner, not a separate UI.
+//! The result is that the preflight reads as another group of action lines in
+//! nextest's banner, not a separate UI.
 
 use std::fmt::Write as _;
 
@@ -38,9 +35,8 @@ const PROGRESS_BAR_WIDTH: usize = 12;
 /// Render one frame of the banner to a `String`.
 ///
 /// The result ends in `\n`. ANSI escape codes are present iff
-/// `theme.is_colorized()`. Callers performing in-place refresh are
-/// responsible for emitting cursor-up sequences between successive
-/// `render` calls; this function only knows how to produce one frame.
+/// `theme.is_colorized()`. Callers doing in-place refresh must emit cursor-up
+/// sequences between successive `render` calls; this only produces one frame.
 pub fn render(state: &BannerState, theme: &Theme) -> String {
     let mut out = String::with_capacity(2048);
 
@@ -67,17 +63,16 @@ pub fn render(state: &BannerState, theme: &Theme) -> String {
     out
 }
 
-/// One blank line — the section separator. Stays a single `\n` so the
-/// live-renderer's line counter doesn't double-count.
+/// One blank line, the section separator. A single `\n` so the live-renderer's
+/// line counter doesn't double-count.
 fn blank_line(out: &mut String) {
     out.push('\n');
 }
 
 // ─────────────────────────── line writers ─────────────────────────────
 
-/// Indent for `{:>12} ` action labels — used directly on lines that
-/// are continuations of the previous label (e.g. the second line of
-/// the cluster block describing nodes).
+/// Indent for `{:>12} ` action labels, used on lines that continue the previous
+/// label (e.g. the cluster block's node line).
 const INDENT: &str = "             "; // 12 spaces + 1 separator = label column width + 1
 
 fn render_top_rule(out: &mut String, theme: &Theme) {
@@ -86,6 +81,19 @@ fn render_top_rule(out: &mut String, theme: &Theme) {
 
 fn render_bottom_rule(out: &mut String, theme: &Theme) {
     writeln!(out, "{}", theme.chars.hbar(LABEL_WIDTH)).expect("write to string");
+}
+
+/// The branded divider between scrolled output above and a pinned status panel
+/// below: `───── Ztest ─────`. Reuses `hbar` so it follows the theme's glyph
+/// (`-----` under the ASCII fallback).
+fn render_label_rule(out: &mut String, theme: &Theme) {
+    let side = theme.chars.hbar(5);
+    writeln!(
+        out,
+        "{side} {} {side}",
+        "Ztest".style(theme.styles.script_id)
+    )
+    .expect("write to string");
 }
 
 fn render_header_line(out: &mut String, _state: &BannerState, theme: &Theme) {
@@ -124,8 +132,8 @@ fn render_cluster_block(out: &mut String, state: &BannerState, theme: &Theme) {
     )
     .expect("write to string");
 
-    // Capacity: one global figure (allocatable − Σ requested). The gauge
-    // shows free headroom, driven by the tighter of the two dimensions.
+    // Capacity: one global figure (allocatable minus sum of requested). The
+    // gauge shows free headroom, driven by the tighter of the two dimensions.
     let alloc = c.capacity.allocatable;
     let free = c.capacity.free();
     let pct = free_percent(&free, &alloc);
@@ -152,9 +160,9 @@ fn gib_of(r: &Resources) -> u64 {
     r.mem_bytes / GIB
 }
 
-/// Percent of capacity free, taken as the tighter (min) of the CPU and
-/// memory free fractions — the binding constraint for packing more work.
-/// Zero allocatable (e.g. before the probe lands) → 0%.
+/// Percent of capacity free, the tighter (min) of the CPU and memory free
+/// fractions: the binding constraint for packing more work. Zero allocatable
+/// (e.g. before the probe lands) gives 0%.
 fn free_percent(free: &Resources, alloc: &Resources) -> u8 {
     let frac = |f: u64, a: u64| -> u64 {
         if a == 0 {
@@ -166,20 +174,20 @@ fn free_percent(free: &Resources, alloc: &Resources) -> u8 {
     frac(free.cpu_milli, alloc.cpu_milli).min(frac(free.mem_bytes, alloc.mem_bytes)) as u8
 }
 
-/// Spinner glyph table — same braille frames `indicatif` uses for its
-/// default spinner. The frame index is derived from the elapsed time
-/// so a ~200ms redraw cadence cycles smoothly.
+/// Spinner glyph table: the braille frames `indicatif` uses for its default
+/// spinner. The frame index is derived from elapsed time so a ~200ms redraw
+/// cadence cycles smoothly.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Pick a spinner frame based on `elapsed`. 100ms per frame ⇒ at
-/// 200ms redraw cadence we advance ~2 frames per tick.
+/// Pick a spinner frame from `elapsed`. 100ms per frame, so a 200ms redraw
+/// cadence advances ~2 frames per tick.
 fn spinner_glyph(elapsed: std::time::Duration) -> &'static str {
     let idx = (elapsed.as_millis() / 100) as usize % SPINNER_FRAMES.len();
     SPINNER_FRAMES[idx]
 }
 
-/// Format an elapsed duration as `12s` / `1m23s`. Matches the
-/// vocabulary nextest uses for its `[NNs]` / `[Nm NNs]` timestamps.
+/// Format an elapsed duration as `12s` / `1m23s`, matching nextest's `[NNs]` /
+/// `[Nm NNs]` timestamp vocabulary.
 fn format_elapsed(d: std::time::Duration) -> String {
     let total = d.as_secs();
     if total < 60 {
@@ -339,8 +347,8 @@ fn tier_label(c: QosClass) -> &'static str {
     }
 }
 
-/// A footprint's CPU as `Nc` (whole cores) or `Nm` (millicpu) — so a
-/// half-core `basic` reads `500m`, not `0 cores`.
+/// A footprint's CPU as `Nc` (whole cores) or `Nm` (millicpu), so a half-core
+/// `basic` reads `500m`, not `0 cores`.
 fn cpu_str(milli: u64) -> String {
     if milli != 0 && milli.is_multiple_of(1000) {
         format!("{}c", milli / 1000)
@@ -359,14 +367,14 @@ fn mem_str(bytes: u64) -> String {
     }
 }
 
-/// `<cpu> / <mem>` for a single-test footprint (exact units — `500m`, `16 GiB`).
+/// `<cpu> / <mem>` for a single-test footprint (exact units: `500m`, `16 GiB`).
 fn footprint_str(r: &Resources) -> String {
     format!("{} / {}", cpu_str(r.cpu_milli), mem_str(r.mem_bytes))
 }
 
-/// `<cpu> / <mem>` for an aggregate (peak / total) reserve, in decimal cores
-/// and GiB — `11.5c / 19.5 GiB` reads better than `11500m / 19968 MiB` for the
-/// summed figures.
+/// `<cpu> / <mem>` for an aggregate (peak / total) reserve, in decimal cores and
+/// GiB: `11.5c / 19.5 GiB` reads better than `11500m / 19968 MiB` for summed
+/// figures.
 fn agg_str(r: &Resources) -> String {
     let cpu = if r.cpu_milli.is_multiple_of(1000) {
         format!("{}c", r.cpu_milli / 1000)
@@ -382,7 +390,7 @@ fn agg_str(r: &Resources) -> String {
 }
 
 /// The QoS scheduling plan (`docs/qos-design.md` §8 planning pass): per-tier
-/// selected counts + footprints, the wave/peak estimate against probed
+/// selected counts and footprints, the wave/peak estimate against probed
 /// capacity, and any unschedulable-tier warnings. The live during-run
 /// reservation view is a deferred follow-up, noted as the final dim line.
 fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
@@ -431,7 +439,7 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
     }
 
     // Fail-fast: a tier whose footprint exceeds the whole cluster will be
-    // rejected at admission — surface it now.
+    // rejected at admission, so surface it now.
     let warn = theme.chars.warn.style(theme.styles.skip);
     for class in &plan.unschedulable {
         writeln!(
@@ -443,8 +451,8 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
         .expect("write to string");
     }
 
-    // The live reservation view is the deferred §8 half (decentralized: it
-    // would poll the ledger during the run).
+    // The live reservation view is the deferred §8 half: it would poll the
+    // ledger during the run.
     writeln!(
         out,
         "{INDENT}{:<width$} {dot} {}",
@@ -456,7 +464,7 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
 }
 
 /// Utilization percent of `part` within `whole`, the tighter (max) of the CPU
-/// and memory fractions — how full the binding dimension is. Zero `whole` → 0%.
+/// and memory fractions: how full the binding dimension is. Zero `whole` gives 0%.
 fn used_percent(part: &Resources, whole: &Resources) -> u8 {
     let frac = |p: u64, w: u64| -> u64 {
         if w == 0 {
@@ -470,20 +478,20 @@ fn used_percent(part: &Resources, whole: &Resources) -> u8 {
 
 /// Live test-run progress for the during-run panel.
 ///
-/// Populated by the run loop (`cli::console`): `elapsed` drives the spinner +
-/// wall clock (the proof-of-life heartbeat), and the counts are tallied from
-/// `cargo nextest run`'s relayed per-test result lines. `total` is the test
-/// count discovered during preflight (Phase B); `0` means "unknown" and the
-/// done-of-total fraction is rendered without a denominator.
+/// Populated by the run loop (`cli::console`): `elapsed` drives the spinner and
+/// wall clock (the proof-of-life heartbeat), and the counts are tallied from the
+/// relayed per-test result lines. `total` is the test count discovered during
+/// preflight (Phase B); `0` means unknown, and the done-of-total fraction
+/// renders without a denominator.
 #[derive(Debug, Clone, Default)]
 pub struct RunProgress {
-    /// Wall time since the run started — drives the spinner and the clock.
+    /// Wall time since the run started; drives the spinner and the clock.
     pub elapsed: std::time::Duration,
     /// Tests finished with a passing verdict.
     pub passed: u32,
     /// Tests finished with a failing verdict (FAIL/TIMEOUT/LEAK/…).
     pub failed: u32,
-    /// Total tests to run, from preflight. `0` = unknown.
+    /// Total tests to run, from preflight; `0` = unknown.
     pub total: u32,
 }
 
@@ -494,14 +502,13 @@ impl RunProgress {
     }
 }
 
-/// The compact live QOS panel pinned beneath nextest's output during the run
-/// (`docs/qos-design.md` §8). Three lines under a top rule: per-tier **running**
-/// (from live reservation Leases) against the planning total, the committed
-/// reserve and a utilization gauge vs probed free capacity, and the test
-/// pass/fail progress + wall clock. Truthful — only what the ledger knows; the
-/// `n/m` is `running / planned`, not a queue depth. No bottom rule, so the only
-/// separator sits at the top; the console ([`crate::cli::console`]) sizes the
-/// panel region to the line count it returns.
+/// The compact live QoS panel pinned beneath nextest's output during the run
+/// (`docs/qos-design.md` §8). Three lines under a top rule: per-tier running
+/// (from live reservation Leases) against the planning total; the committed
+/// reserve and a utilization gauge vs probed free capacity; and the test
+/// pass/fail progress plus wall clock. Reports only what the ledger knows, so the
+/// `n/m` is running / planned, not a queue depth. No bottom rule; the console
+/// ([`crate::cli::console`]) sizes the panel region to the returned line count.
 pub fn render_live_panel(
     snapshot: &LiveSnapshot,
     plan: &QosPlan,
@@ -511,17 +518,17 @@ pub fn render_live_panel(
 ) -> String {
     let mut out = String::with_capacity(320);
     let dot = theme.chars.dot.style(theme.styles.dim);
-    // The spinner advances every redraw the run loop triggers (it ticks on a
-    // sub-second cadence independent of cluster polling), so the panel visibly
-    // animates even when no reservation or test verdict has changed — the
-    // "is the cluster still alive?" heartbeat.
+    // The spinner advances on every redraw the run loop triggers (sub-second
+    // cadence, independent of cluster polling), so the panel animates even when
+    // no reservation or test verdict has changed: the "is the cluster still
+    // alive?" heartbeat.
     let spin = spinner_glyph(progress.elapsed);
 
-    render_top_rule(&mut out, theme);
+    render_label_rule(&mut out, theme);
 
-    // When the per-test capacity re-probe was unavailable, `free` is ZERO —
-    // don't render a misleading empty gauge "of 0c / 0 GiB free"; say so, the
-    // same way the preflight block does.
+    // When the per-test capacity re-probe was unavailable, `free` is ZERO. Don't
+    // render a misleading empty gauge "of 0c / 0 GiB free"; say so, as the
+    // preflight block does.
     let capacity = if free.cpu_milli == 0 && free.mem_bytes == 0 {
         "capacity unknown (probe unavailable)".to_string()
     } else {
@@ -539,10 +546,9 @@ pub fn render_live_panel(
     )
     .expect("write to string");
 
-    // Test progress + wall clock. `done/total` (or bare `done` when total is
-    // unknown), passing/failing tallies, and elapsed time. This is the line
-    // that answers "are tests actually completing?" as the per-test stream
-    // scrolls past beneath the panel.
+    // Test progress + wall clock: `done/total` (or bare `done` when total is
+    // unknown), pass/fail tallies, and elapsed time. Answers "are tests actually
+    // completing?" as the per-test stream scrolls past beneath the panel.
     let done = match progress.total {
         0 => format!("{} done", progress.done().style(theme.styles.count)),
         total => format!(
@@ -573,11 +579,7 @@ pub fn render_live_panel(
             .tiers
             .iter()
             .map(|t| {
-                let run = snapshot
-                    .running
-                    .get(&t.class)
-                    .map(|x| x.count)
-                    .unwrap_or(0);
+                let run = snapshot.running.get(&t.class).map(|x| x.count).unwrap_or(0);
                 format!("{} {}/{}", tier_label(t.class), run, t.count)
             })
             .collect();
@@ -593,20 +595,18 @@ pub fn render_live_panel(
 }
 
 /// Compact status panel for the unified bottom console (`cli::console`) during
-/// the **preflight + build + image** phases.
+/// the preflight, build, and image phases.
 ///
 /// Where [`render`] is the tall multi-section banner (now used only for the
-/// non-TTY CI log), this is the few-line summary kept pinned at the bottom of
-/// the screen while `cargo nextest list` and `docker build` output scrolls
-/// above it into native scrollback. It is the preflight counterpart of
-/// [`render_live_panel`] (the run-phase panel), so the two share one visual
-/// language across the whole session.
+/// non-TTY CI log), this is the few-line summary pinned at the bottom while
+/// `cargo nextest list` and `docker build` output scrolls above into native
+/// scrollback. It is the preflight counterpart of [`render_live_panel`] (the
+/// run-phase panel), so the two share one visual language across the session.
 ///
-/// Three rows — a top rule, a cluster line, and a build/archives/scheduling
-/// line. No bottom rule (the only separator sits at the top); the console sizes
-/// its panel region to the line count returned. `elapsed` drives the spinner
-/// heartbeat; `phase` is the right-aligned action label (`Preflight`,
-/// `Building`).
+/// Three rows: a top rule, a cluster line, and a build/archives/scheduling line.
+/// No bottom rule; the console sizes its panel region to the returned line count.
+/// `elapsed` drives the spinner heartbeat; `phase` is the right-aligned action
+/// label (`Preflight`, `Building`).
 pub fn render_preflight_panel(
     state: &BannerState,
     phase: &str,
@@ -617,7 +617,7 @@ pub fn render_preflight_panel(
     let dot = theme.chars.dot.style(theme.styles.dim);
     let spin = spinner_glyph(elapsed);
 
-    render_top_rule(&mut out, theme);
+    render_label_rule(&mut out, theme);
 
     // Cluster line: context, ready nodes, slot usage.
     let c = &state.cluster;
@@ -664,15 +664,32 @@ pub fn render_preflight_panel(
     )
     .expect("write to string");
     if let Some(plan) = &state.qos_plan {
-        write!(
-            out,
-            " {dot} {} waves",
-            plan.waves.style(theme.styles.count),
-        )
-        .expect("write to string");
+        write!(out, " {dot} {} waves", plan.waves.style(theme.styles.count),)
+            .expect("write to string");
     }
     out.push('\n');
 
+    out
+}
+
+/// The pinned panel shown while a Ctrl-C is being honoured. Rendered by the
+/// console's render thread (which has no [`BannerState`]), so it stands alone:
+/// the branded rule plus a single spinner line. `elapsed` keeps the spinner
+/// animating while subprocesses are torn down.
+pub fn render_cancel_panel(elapsed: std::time::Duration, theme: &Theme) -> String {
+    let mut out = String::with_capacity(128);
+    let dot = theme.chars.dot.style(theme.styles.dim);
+    render_label_rule(&mut out, theme);
+    write!(
+        out,
+        "{:>width$} {} terminating subprocesses… {dot} {}",
+        "Cancelling".style(theme.styles.skip),
+        spinner_glyph(elapsed).style(theme.styles.skip),
+        "Ctrl-C again to force quit".style(theme.styles.dim),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+    out.push('\n');
     out
 }
 
@@ -805,8 +822,8 @@ fn render_progress_bar(percent: u8, theme: &Theme) -> String {
     )
 }
 
-/// Column width for a name column: max(items) clamped to a sane range
-/// so a single very-long name can't push detail off the right.
+/// Column width for a name column: max(items) clamped to a sane range so one
+/// very-long name can't push detail off the right.
 fn column_width<'a>(names: impl IntoIterator<Item = &'a str>, min: usize, max: usize) -> usize {
     names
         .into_iter()
@@ -901,10 +918,13 @@ mod tests {
             std::time::Duration::from_secs(3),
             &plain_unicode_theme(),
         );
-        // Top rule + cluster line + build/archives/scheduling line — no bottom
+        // Top rule + cluster line + build/archives/scheduling line, no bottom
         // rule, so the only separator is at the top.
         assert_eq!(s.lines().count(), 3, "fixed 3-row panel:\n{s}");
-        assert!(!s.trim_end().ends_with("────────────"), "no bottom rule:\n{s}");
+        assert!(
+            !s.trim_end().ends_with("────────────"),
+            "no bottom rule:\n{s}"
+        );
         assert!(s.contains("Preflight"), "phase label:\n{s}");
         assert!(s.contains("kind-zaino-local"), "cluster context:\n{s}");
         assert!(s.contains("47 tests / 8 bins"), "build summary:\n{s}");
@@ -912,9 +932,9 @@ mod tests {
         assert!(s.contains("waves"), "scheduling summary:\n{s}");
     }
 
-    /// Theme with no colours and Unicode glyphs — what `Theme::detect()`
-    /// returns under a UTF-8 locale with `NO_COLOR=1` and lets us
-    /// snapshot byte-exact output.
+    /// Theme with no colours and Unicode glyphs: what `Theme::detect()` returns
+    /// under a UTF-8 locale with `NO_COLOR=1`, letting us snapshot byte-exact
+    /// output.
     fn plain_unicode_theme() -> Theme {
         Theme::for_capabilities(false, true)
     }
@@ -976,9 +996,8 @@ mod tests {
     fn colorized_render_contains_ansi_escapes() {
         let s = render(&sample_state(), &colorized_unicode_theme());
         assert!(s.contains("\x1b["), "colorized output missing ESC:\n{s}");
-        // ANSI sequences should not appear in the action-label slot
-        // count — the visible text "Preflight" must still be present
-        // as a substring.
+        // ANSI sequences must not affect the visible text: "Preflight" is still
+        // present as a substring.
         assert!(s.contains("Preflight"), "Preflight label missing:\n{s}");
     }
 
@@ -1025,8 +1044,8 @@ mod tests {
         use crate::qos::schedule;
         use std::collections::BTreeMap;
         let mut state = sample_state();
-        // sync (8c/16Gi) can't fit a 4-core/8-GiB cluster → unschedulable;
-        // basic + integration schedule normally.
+        // sync (8c/16Gi) can't fit a 4-core/8-GiB cluster, so it's
+        // unschedulable; basic + integration schedule normally.
         state.qos_plan = Some(schedule::plan(
             &BTreeMap::from([
                 (QosClass::Basic, 3),
@@ -1042,7 +1061,10 @@ mod tests {
         // Per-tier rows (priority order: sync, integration, basic) with
         // footprints (basic's half-core renders as 500m, not 0c).
         assert!(s.contains("integration"), "got:\n{s}");
-        assert!(s.contains("500m / 512 MiB"), "missing basic footprint:\n{s}");
+        assert!(
+            s.contains("500m / 512 MiB"),
+            "missing basic footprint:\n{s}"
+        );
         // Unschedulable warning for sync (16c/32Gi can't fit a 4c/8Gi cluster).
         assert!(
             s.contains("sync needs 16c / 32 GiB") && s.contains("will be rejected"),
@@ -1108,10 +1130,13 @@ mod tests {
         let basic_at = s.find("basic 2/3").unwrap();
         assert!(sync_at < basic_at, "priority order:\n{s}");
         assert!(s.contains("running / planned"), "legend:\n{s}");
-        // The separator rule appears only at the top; no bottom rule (and so no
-        // trailing blank when the console sizes the panel region to its lines).
-        assert!(s.starts_with("────────────"), "top rule present:\n{s}");
-        assert!(!s.trim_end().ends_with("────────────"), "no bottom rule:\n{s}");
+        // The branded separator rule appears only at the top; no bottom rule
+        // (and so no trailing blank when the console sizes the panel region).
+        assert!(s.starts_with("───── Ztest ─────"), "top rule present:\n{s}");
+        assert!(
+            !s.trim_end().ends_with("────────────"),
+            "no bottom rule:\n{s}"
+        );
     }
 
     #[test]
@@ -1133,8 +1158,14 @@ mod tests {
             &RunProgress::default(),
             &plain_unicode_theme(),
         );
-        assert!(s.contains("capacity unknown (probe unavailable)"), "got:\n{s}");
-        assert!(!s.contains("of 0c"), "should not show a zero-free gauge:\n{s}");
+        assert!(
+            s.contains("capacity unknown (probe unavailable)"),
+            "got:\n{s}"
+        );
+        assert!(
+            !s.contains("of 0c"),
+            "should not show a zero-free gauge:\n{s}"
+        );
     }
 
     #[test]
@@ -1143,7 +1174,10 @@ mod tests {
         state.qos_plan = None;
         state.future = vec![]; // also no placeholder rows
         let s = render(&state, &plain_unicode_theme());
-        assert!(!s.contains("Scheduling"), "unexpected scheduling block:\n{s}");
+        assert!(
+            !s.contains("Scheduling"),
+            "unexpected scheduling block:\n{s}"
+        );
     }
 
     #[test]

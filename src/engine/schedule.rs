@@ -1,12 +1,12 @@
 //! The capacity-bounded run loop: ztest's 2D [`Scheduler`] is the sole admission
 //! authority. Tests are submitted in priority order; the scheduler grants what
 //! fits the live cluster ceiling and queues the rest. As each child exits, its
-//! lease is released and the freed capacity backfills queued tests — so the
+//! lease is released and the freed capacity backfills queued tests, so the
 //! number of concurrently-running tests scales up and down with capacity, with
 //! no artificial thread cap.
 //!
 //! The spawn function is injected so the loop's policy (admit / backfill /
-//! retry / fail-fast) is unit-tested with a fake spawn — no processes, no
+//! retry / fail-fast) is unit-tested with a fake spawn: no processes, no
 //! cluster.
 
 use std::collections::HashMap;
@@ -16,14 +16,17 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use crate::cancel::Cancel;
 use crate::engine::events::{RunReporter, RunStats, RunningView, SkipReason, TestEvent, Verdict};
 use crate::engine::exec::TestOutcome;
 use crate::engine::panel::{live_snapshot, run_progress};
 use crate::engine::plan::WorkItem;
 use crate::preflight::RunProgress;
+use crate::provisioning::NodeId;
 use crate::qos::Resources;
 use crate::qos::live::LiveSnapshot;
 use crate::qos::scheduler::{Admission, LeaseId, RejectReason, Request, Scheduler};
+use crate::resource::NodeState;
 
 /// Tunables for the run loop.
 #[derive(Debug, Clone)]
@@ -38,20 +41,29 @@ pub struct LoopConfig {
     pub redraw: Duration,
     /// Run id (for `RunStarted`).
     pub run_id: String,
+    /// Cooperative cancellation (Ctrl-C). When it fires the loop stops admitting
+    /// and drops its in-flight test futures; `kill_on_drop` reaps the children.
+    pub cancel: Cancel,
+    /// Resource readiness (node → state) the loop gates admission on: a test
+    /// whose declared dep is `Failed`/`Blocked` is skipped
+    /// (`SkipReason::DependencyUnavailable`) rather than run. Empty ⇒ no gating
+    /// (unit tests, or a run that declared no resources). Provisioning completes
+    /// before the run, so every tracked node is terminal here.
+    pub resources: HashMap<NodeId, NodeState>,
 }
 
 /// The live state handed to the per-tick render callback.
 #[derive(Debug)]
 pub struct PanelFrame {
-    /// Per-tier running counts + reserves.
+    /// Per-tier running counts and reserves.
     pub snapshot: LiveSnapshot,
     /// Pass/fail/elapsed for the QoS panel's progress line.
     pub progress: RunProgress,
-    /// Full tally (incl. skipped) for the nextest-style top progress line.
+    /// Full tally (including skipped) for the nextest-style top progress line.
     pub stats: RunStats,
-    /// Free cluster capacity (ceiling − committed).
+    /// Free cluster capacity (ceiling minus committed).
     pub free: Resources,
-    /// In-flight tests, longest-running first — for the live running region.
+    /// In-flight tests, longest-running first, for the live running region.
     pub running: Vec<RunningView>,
 }
 
@@ -73,7 +85,7 @@ struct Running {
 ///
 /// `spawn(item, attempt)` produces the future that runs one test; `on_tick`
 /// renders the live panel each redraw interval. The whole loop is single-task
-/// (the `Scheduler` is its sole owner — no locking).
+/// (the `Scheduler` is its sole owner, so no locking).
 pub async fn run_loop<S, F>(
     items: Vec<WorkItem>,
     ceiling: Resources,
@@ -95,7 +107,7 @@ where
 
     let mut sched = Scheduler::new(ceiling);
     let mut inflight: HashMap<LeaseId, Running> = HashMap::new();
-    // Identity → (WorkItem, attempt) currently queued in the scheduler, awaiting
+    // Identity to (WorkItem, attempt) currently queued in the scheduler, awaiting
     // a grant. The attempt rides along so a retry that has to wait for capacity
     // resumes at the right attempt when backfilled (not reset to 1).
     let mut parked: HashMap<(String, String), (WorkItem, u32)> = HashMap::new();
@@ -107,7 +119,7 @@ where
         run_id: &cfg.run_id,
     });
 
-    // Helper to spawn a granted test: push its future + record it inflight.
+    // Helper to spawn a granted test: push its future and record it inflight.
     let spawn_granted = |lease: LeaseId,
                          item: WorkItem,
                          attempt: u32,
@@ -135,6 +147,20 @@ where
 
     // Initial admission sweep (priority order already baked into `items`).
     for item in items {
+        // Resource gate: a test whose declared dependency failed to provision is
+        // SKIPPED cleanly here, before it's ever submitted to the scheduler —
+        // rather than admitted, spawned, and failed at `TestEnv::build()` with a
+        // confusing "resource absent" error. Only tests that actually need the
+        // failed resource are affected; the rest run.
+        if let Some(reason) = unmet_dep(&item, &cfg.resources) {
+            reporter.handle(&TestEvent::TestSkipped {
+                binary_id: &item.binary_id,
+                test_name: &item.test_name,
+                reason,
+            });
+            stats.skipped += 1;
+            continue;
+        }
         match sched.request(to_request(&item, &cfg.sa)) {
             Admission::Granted(lease) => {
                 spawn_granted(lease, item, 1, &mut inflight, &mut futs, reporter)
@@ -158,6 +184,12 @@ where
 
     while !futs.is_empty() {
         tokio::select! {
+            // Ctrl-C: stop admitting and drop the in-flight futures. Each test
+            // runs in its own process group with `kill_on_drop`, so dropping the
+            // `FuturesUnordered` reaps the child test binaries. Break to the
+            // RunFinished summary with whatever completed so far.
+            _ = cfg.cancel.cancelled() => break,
+
             Some((lease, outcome)) = futs.next() => {
                 let running = inflight.remove(&lease).expect("inflight entry for completed lease");
                 let grants = sched.release(lease);
@@ -176,6 +208,8 @@ where
                         test_name: &running.item.test_name,
                         next_attempt: next,
                         delay: Duration::ZERO,
+                        verdict: outcome.verdict.clone(),
+                        duration: outcome.duration,
                     });
                     match sched.request(to_request(&running.item, &cfg.sa)) {
                         Admission::Granted(l) => {
@@ -183,7 +217,7 @@ where
                         }
                         Admission::Queued => {
                             // Re-park carrying the attempt, so when capacity frees
-                            // the retry resumes at `next` — not reset to 1, which
+                            // the retry resumes at `next`, not reset to 1, which
                             // would let a contended flaky test retry past `retries`.
                             parked.insert(key(&running.item), (running.item, next));
                         }
@@ -204,7 +238,7 @@ where
                     }
                 }
 
-                // Backfill the freed capacity with queued tests — unless fail-fast
+                // Backfill the freed capacity with queued tests, unless fail-fast
                 // tripped, in which case we drain inflight and admit nothing more.
                 if !fail_fast_tripped {
                     for g in grants {
@@ -217,7 +251,7 @@ where
                 render_tick(reporter, &inflight, &sched, ceiling, stats, start, &cfg, &mut on_tick);
             }
             _ = tick.tick() => {
-                // Soft SLOW detection + spinner refresh.
+                // Soft SLOW detection and spinner refresh.
                 if let Some(after) = cfg.slow_after {
                     for r in inflight.values_mut() {
                         if !r.slow_emitted && r.started.elapsed() >= after {
@@ -245,6 +279,7 @@ fn emit_finished(reporter: &mut dyn RunReporter, running: &Running, outcome: &Te
         test_name: &running.item.test_name,
         verdict: outcome.verdict.clone(),
         duration: outcome.duration,
+        attempt: running.attempt,
         output: &outcome.output,
     });
 }
@@ -261,6 +296,7 @@ fn emit_slows(
                 test_name: &r.item.test_name,
                 elapsed: r.started.elapsed(),
                 will_terminate: false,
+                attempt: r.attempt,
             });
         }
     }
@@ -283,7 +319,7 @@ fn render_tick(
         &cfg.sa,
     );
     // In-flight tests for the live region, longest-running first. Order by the
-    // fixed `started` instant (oldest first) with an identity tiebreak — NOT by
+    // fixed `started` instant (oldest first) with an identity tiebreak, NOT by
     // a re-snapshotted `elapsed`: `inflight` is a HashMap (varying iteration
     // order) and per-test `elapsed()` is measured at slightly different instants
     // each frame, so sorting on it let near-equal tests swap rows frame-to-frame
@@ -328,6 +364,26 @@ fn to_request(item: &WorkItem, sa: &str) -> Request {
     }
 }
 
+/// Whether any of a work item's declared resource dependencies is unavailable
+/// (failed to provision, or blocked behind one that did). Returns the skip reason
+/// naming the first such resource; `None` when every dep is ready (or untracked,
+/// which the batch provisioner never leaves in a non-terminal state). `Ready`,
+/// `Pending`, and `Acquiring` are all treated as non-blocking so the loop never
+/// spuriously skips a resource the graph simply didn't record.
+fn unmet_dep(item: &WorkItem, resources: &HashMap<NodeId, NodeState>) -> Option<SkipReason> {
+    for dep in &item.deps {
+        let detail = match resources.get(dep) {
+            Some(NodeState::Failed(detail)) => format!("{dep:?}: {detail}"),
+            Some(NodeState::Blocked) => {
+                format!("{dep:?}: blocked by a failed dependency")
+            }
+            _ => continue,
+        };
+        return Some(SkipReason::DependencyUnavailable { resource: detail });
+    }
+    None
+}
+
 fn skip_reason(r: RejectReason) -> SkipReason {
     match r {
         RejectReason::ExceedsClusterCapacity => SkipReason::ExceedsClusterCapacity,
@@ -355,6 +411,7 @@ mod tests {
             priority: p.priority,
             hard_cap: p.hard_cap,
             retries,
+            deps: Vec::new(),
         }
     }
 
@@ -365,6 +422,8 @@ mod tests {
             sa: "sa".into(),
             redraw: Duration::from_millis(5),
             run_id: "run".into(),
+            cancel: Cancel::never(),
+            resources: HashMap::new(),
         }
     }
 
@@ -1043,6 +1102,67 @@ mod tests {
             rep.events.last(),
             Some(Ev::RunFinished { stats }) if stats.skipped == 1
         ));
+    }
+
+    /// The resource gate: a test whose declared dependency failed to provision is
+    /// SKIPPED with `DependencyUnavailable` and never started, while a test that
+    /// doesn't need the failed resource still runs. This is the "slow/broken
+    /// archive sidelines only its dependents" guarantee at the loop level.
+    #[tokio::test]
+    async fn dependency_failure_skips_only_dependent_tests() {
+        use crate::provisioning::NodeId;
+        use crate::resource::NodeState;
+
+        let dep = NodeId::Image("zebrad:dev-bad".into());
+        let mut needs_img = item("needs_img", QosClass::Integration, 0);
+        needs_img.deps = vec![dep.clone()];
+        let free = item("free", QosClass::Integration, 0);
+
+        let mut c = cfg();
+        c.resources
+            .insert(dep, NodeState::Failed("docker build failed".into()));
+
+        let mut rep = RecordingReporter::default();
+        let stats = run_loop(
+            vec![needs_img, free],
+            ceiling_two_integration(),
+            c,
+            &mut rep,
+            |_it, _a| async { pass() },
+            |_, _| {},
+        )
+        .await;
+
+        assert_eq!(stats.passed, 1, "the dep-free test still runs");
+        assert_eq!(stats.skipped, 1, "the dependent test is skipped, not run");
+        assert_eq!(stats.failed, 0);
+
+        // The dependent test emits exactly one Skipped (with the reason) and never
+        // a Started; the free test runs normally and is never skipped.
+        let dependent = rep.of("needs_img");
+        assert!(
+            matches!(
+                dependent.as_slice(),
+                [Ev::Skipped {
+                    reason: SkipReason::DependencyUnavailable { .. },
+                    ..
+                }]
+            ),
+            "{dependent:?}"
+        );
+        assert!(
+            !rep.events.iter().any(|e| matches!(
+                e,
+                Ev::Started { test_name, .. } if test_name == "needs_img"
+            )),
+            "a dependency-skipped test must never start"
+        );
+        assert!(
+            rep.of("free")
+                .iter()
+                .any(|e| matches!(e, Ev::Finished { .. })),
+            "the free test must finish"
+        );
     }
 
     /// The terminal `Finished` event carries the child's captured output, so the

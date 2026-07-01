@@ -1,20 +1,20 @@
-//! Wallet backends — two traits.
+//! Wallet backends: two traits.
 //!
-//!  - [`WalletConfig`] — what your config ZST implements (e.g.
-//!    `ZingoBackend`). The factory that produces a live handle, plus the
-//!    (usually trivial) NU ceiling.
-//!  - [`WalletBackend`] — what your live handle implements (e.g.
-//!    `ZingoWallet`): the in-process wallet contract. Backends run
-//!    **in-process** in the test binary — they're libraries that connect
-//!    to the indexer over its gRPC endpoint — so a wallet component gets
-//!    no pod. The concrete wallet implementation (zingolib, etc.) lives
-//!    in the consumer crate, so no wallet-library types ever enter ztest.
+//!  - [`WalletConfig`]: what a config ZST implements (e.g. `ZingoBackend`).
+//!    The factory that produces a live handle, plus the (usually trivial) NU
+//!    ceiling.
+//!  - [`WalletBackend`]: what a live handle implements (e.g. `ZingoWallet`),
+//!    the in-process wallet contract. Backends run in-process in the test
+//!    binary (libraries that connect to the indexer over its gRPC endpoint),
+//!    so a wallet component gets no pod. The concrete wallet implementation
+//!    (zingolib, etc.) lives in the consumer crate, so no wallet-library types
+//!    enter ztest.
 
 use async_trait::async_trait;
 
-use zcash_primitives::transaction::TxId;
+use crate::topology::ActivationHeights;
+use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
-use zingo_common_components::protocol::ActivationHeights;
 
 use crate::RpcError;
 use crate::handles::HandleInner;
@@ -59,14 +59,14 @@ impl PoolBalances {
 }
 
 /// Opaque per-backend account identifier. One account is one lightclient
-/// wallet; a backend assigns the id when [`WalletBackend::add_account`]
+/// wallet; the backend assigns the id when [`WalletBackend::add_account`]
 /// succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AccountId(pub u32);
 
 /// Everything a backend needs to construct one in-process wallet account.
-/// The activation heights come from the *running validator*, so the wallet
-/// can never drift from the chain it syncs against.
+/// The activation heights come from the running validator, so the wallet can
+/// never drift from the chain it syncs against.
 #[derive(Debug, Clone, Copy)]
 pub struct AccountSpec<'a> {
     /// BIP-39 mnemonic phrase for the wallet seed.
@@ -82,19 +82,19 @@ pub struct AccountSpec<'a> {
 
 // ──────────────────────────── WalletConfig ────────────────────────────
 
-/// The config ZST handed to the [`Wallet`](crate::component::Wallet)
-/// builder (e.g. `ZingoBackend`). Just a factory for the live handle
-/// (wallets carry no pod-config), plus the NU ceiling.
+/// The config ZST handed to the [`Wallet`](crate::component::Wallet) builder
+/// (e.g. `ZingoBackend`). A factory for the live handle (wallets carry no
+/// pod-config), plus the NU ceiling.
 pub trait WalletConfig: Send + Sync + std::fmt::Debug + 'static {
     /// The live handle type this backend produces.
     type Handle: WalletBackend + Clone;
 
-    /// Build the runtime handle. Wallets have no pod, so `plumbing` is
-    /// usually ignored — the handle owns its in-process state.
-    fn into_handle(&self, plumbing: HandleInner) -> Self::Handle;
+    /// Build the runtime handle. Wallets have no pod, so `plumbing` is usually
+    /// ignored; the handle owns its in-process state.
+    fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
 
-    /// Highest NU this wallet pin can speak. `None` opts out of the
-    /// topology resolver (the common case — a wallet imposes no ceiling).
+    /// Highest NU this wallet pin can speak. `None` opts out of the topology
+    /// resolver (the common case: a wallet imposes no ceiling).
     fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
         let _ = version;
         None
@@ -142,8 +142,11 @@ pub struct Account<W: WalletBackend> {
 }
 
 impl<W: WalletBackend> Account<W> {
-    /// Construct an account handle. Called by a wallet backend's
-    /// `account` factory once `add_account` has assigned the id.
+    /// Construct an account handle. Called by a wallet backend's `account`
+    /// factory once `add_account` has assigned the id.
+    // Unused when no wallet backend is compiled in (`zingo` is the only feature
+    // today); this is backend infrastructure, not zingo-specific.
+    #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
     pub(crate) fn new(wallet: W, id: AccountId, label: &'static str) -> Self {
         Self { wallet, id, label }
     }

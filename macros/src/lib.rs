@@ -1,4 +1,4 @@
-//! Compile-time mount macros for `zcash_kube_net`.
+//! Compile-time mount macros for `ztest`.
 //!
 //! Each macro takes `(relative_source, container_destination)` and:
 //! - resolves the source against `CARGO_MANIFEST_DIR` of the *invoking* crate,
@@ -61,12 +61,13 @@ fn emit(
     destination: &LitStr,
     kind_ident: &str,
     source_variant: &str,
+    seed_payload: Option<&str>,
 ) -> proc_macro2::TokenStream {
     let abs = source_abs.to_string_lossy().into_owned();
     let dst = destination.value();
     let kind = syn::Ident::new(kind_ident, Span::call_site());
     let src_variant = syn::Ident::new(source_variant, Span::call_site());
-    quote! {
+    let mount = quote! {
         ::ztest::Mount {
             source: ::ztest::MountSource::#src_variant(
                 ::std::path::PathBuf::from(#abs),
@@ -74,6 +75,30 @@ fn emit(
             destination: ::std::path::PathBuf::from(#dst),
             kind: ::ztest::MountKind::#kind,
         }
+    };
+    // For PVC-backed mounts (archive/file), also register a static `SeedDecl` in
+    // the link-time inventory — same pattern as `dev!`. This lets the preflight
+    // resource graph pre-provision the content-addressed seed before any test
+    // runs (`materialize::ensure_seed`), instead of the first test materializing
+    // it lazily at `build()`. The author writes `mount_archive!` exactly as
+    // before; the declaration is invisible. `ConfigMap` mounts have no seed, so
+    // they pass `None` and emit the bare value.
+    match seed_payload {
+        Some(payload) => {
+            let payload = syn::Ident::new(payload, Span::call_site());
+            quote! {
+                {
+                    ::ztest::__private::inventory::submit! {
+                        ::ztest::inventory::SeedDecl {
+                            source: #abs,
+                            payload: ::ztest::inventory::SeedPayload::#payload,
+                        }
+                    }
+                    #mount
+                }
+            }
+        }
+        None => mount,
     }
 }
 
@@ -124,7 +149,7 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
-    emit(&abs, &destination, "Config", "ConfigAbs").into()
+    emit(&abs, &destination, "Config", "ConfigAbs", None).into()
 }
 
 /// `mount_file!("rel/blob.bin", "/path/in/container")`
@@ -141,7 +166,7 @@ pub fn mount_file(input: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
     };
-    emit(&abs, &destination, "File", "FileAbs").into()
+    emit(&abs, &destination, "File", "FileAbs", Some("File")).into()
 }
 
 /// `mount_archive!("rel/data.tar.zst", "/data")`
@@ -158,7 +183,14 @@ pub fn mount_archive(input: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
     };
-    emit(&abs, &destination, "DirArchive", "ArchiveAbs").into()
+    emit(
+        &abs,
+        &destination,
+        "DirArchive",
+        "ArchiveAbs",
+        Some("Archive"),
+    )
+    .into()
 }
 
 // ───────────────────────────── dev! macro ─────────────────────────────
@@ -335,6 +367,105 @@ fn resolve_dir(rel: &LitStr) -> Result<std::path::PathBuf, syn::Error> {
         ));
     }
     Ok(p)
+}
+
+// ─────────────────────── typed resource handles ───────────────────────
+//
+// The sound, per-test resource-dependency surface. `#[ztest::archive(NAME =
+// "path")]` on a test both (a) makes the archive provisionable (a `SeedDecl`,
+// same as `mount_archive!`) and (b) records a per-test dependency edge (a
+// `TestDepDecl`), so `ztest run` can pre-provision it and cleanly SKIP only the
+// tests whose archive failed. It also binds a fn-local `const NAME:
+// ArchiveHandle` the body passes to `Validator::with_regtest_cache` — a real
+// `const`, so a typo is a compile error.
+//
+// When the archive is consumed through a helper (the helper can't see a fn-local
+// const), the test still owns the declaration: pass the `NAME` handle into the
+// helper as a value (e.g. carried by a backend enum variant), rather than
+// declaring the handle out-of-line.
+
+/// `NAME = "rel/path"` — the shared parse for the archive macros.
+struct HandleDecl {
+    name: syn::Ident,
+    source: LitStr,
+}
+
+impl Parse for HandleDecl {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let name: syn::Ident = input.parse()?;
+        let _: Token![=] = input.parse()?;
+        let source: LitStr = input.parse()?;
+        let _ = input.parse::<Option<Token![,]>>();
+        Ok(HandleDecl { name, source })
+    }
+}
+
+/// The `inventory::submit!` that makes an archive provisionable — a `SeedDecl`
+/// with `Archive` payload, keyed by its absolute source path.
+fn seed_decl_submit(abs: &str) -> proc_macro2::TokenStream {
+    quote! {
+        ::ztest::__private::inventory::submit! {
+            ::ztest::inventory::SeedDecl {
+                source: #abs,
+                payload: ::ztest::inventory::SeedPayload::Archive,
+            }
+        }
+    }
+}
+
+/// The `inventory::submit!` for one test→resource edge. `resource` is a const
+/// expression yielding the absolute source path (a string literal for
+/// `#[archive]`, or `HANDLE.source()` for `#[needs]`).
+fn test_dep_submit(
+    fn_ident: &syn::Ident,
+    resource: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    quote! {
+        ::ztest::__private::inventory::submit! {
+            ::ztest::inventory::TestDepDecl {
+                test_id: concat!(module_path!(), "::", stringify!(#fn_ident)),
+                resource: #resource,
+            }
+        }
+    }
+}
+
+/// `#[ztest::archive(NAME = "rel/path.tar.gz")]` — declare + depend + bind, on one
+/// test. Resolves the path against the caller's `CARGO_MANIFEST_DIR` at compile
+/// time (same rule as `mount_archive!`), submits the provisionable `SeedDecl` and
+/// the per-test `TestDepDecl`, and binds a fn-local `const NAME: ArchiveHandle` the
+/// body passes to `with_regtest_cache`. Stacks with `#[ztest::qos::*]`.
+#[proc_macro_attribute]
+pub fn archive(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let HandleDecl { name, source } = parse_macro_input!(attr as HandleDecl);
+    let abs = match resolve_source(&source) {
+        Ok(p) => p,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let abs = abs.to_string_lossy().into_owned();
+
+    let mut func = match syn::parse::<ItemFn>(item) {
+        Ok(f) => f,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let ident = func.sig.ident.clone();
+
+    // fn-local typed handle, bound before the body runs. `dead_code` allowed so a
+    // declared-but-unused handle is a (harmless) over-provision, not a build error.
+    let bind: syn::Stmt = syn::parse_quote! {
+        #[allow(dead_code)]
+        const #name: ::ztest::ArchiveHandle = ::ztest::ArchiveHandle::__new(#abs);
+    };
+    func.block.stmts.insert(0, bind);
+
+    let seed = seed_decl_submit(&abs);
+    let dep = test_dep_submit(&ident, &quote! { #abs });
+    quote! {
+        #seed
+        #dep
+        #func
+    }
+    .into()
 }
 
 // ───────────────────────── qos tier attributes ────────────────────────

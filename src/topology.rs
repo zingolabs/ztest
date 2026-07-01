@@ -1,35 +1,143 @@
 //! Topology-aware activation-height resolver.
 //!
-//! ### Problem
+//! Every Zcash component in a regtest topology (zebrad, zcashd, zaino,
+//! zingo) knows about some prefix of the network-upgrade sequence (Sapling,
+//! Blossom, Heartwood, Canopy, NU5, NU6, NU6.1, NU6.2, NU7, ...). If the
+//! validator activates an NU the indexer can't decode, the chain syncer
+//! fails with `"parse error: invalid consensus branch id"` and the topology
+//! is dead.
 //!
-//! Every Zcash component in a regtest topology — zebrad, zcashd, zaino,
-//! zingo — knows about some prefix of the network-upgrade
-//! sequence (Sapling → Blossom → Heartwood → Canopy → NU5 → NU6 → NU6.1
-//! → NU6.2 → NU7 …). If the validator activates an NU that the indexer
-//! can't decode, the chain syncer fails with
-//! `"parse error: invalid consensus branch id"` and the topology is
-//! dead.
-//!
-//! ### Solution
-//!
-//! Activation heights are a property of the **topology**, not of any
-//! single component. This module computes the *ceiling* — the highest NU
-//! that **every** component in the topology can handle — and renders an
+//! Activation heights are a property of the topology, not of any single
+//! component. This module computes the ceiling (the highest NU every
+//! component in the topology can handle) and renders an
 //! [`ActivationHeights`] that activates exactly the prefix up to that
 //! ceiling.
 //!
-//! Each backend reports its own `nu_ceiling()` via its `*Backend`
-//! trait; the env collects them and feeds them into [`resolve_ceiling`].
-
-use zingo_common_components::protocol::ActivationHeights;
+//! Each backend reports its own `nu_ceiling()` via its `*Backend` trait;
+//! the env collects them and feeds them into [`resolve_ceiling`].
 
 use crate::regtest_conf::Semver;
+
+// ────────────────────────── ActivationHeights ─────────────────────────
+
+/// Per-network-upgrade activation heights for a regtest chain. `None` means
+/// the upgrade is not activated. Build with [`ActivationHeights::builder`];
+/// read with the per-upgrade getters.
+///
+/// ztest owns this type rather than borrowing
+/// `zingo_common_components::protocol::ActivationHeights` (a Zingo crate that
+/// re-implements librustzcash types): the harness defines the interfaces its
+/// callers consume and depends only on the canonical `zcash_protocol`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ActivationHeights {
+    overwinter: Option<u32>,
+    sapling: Option<u32>,
+    blossom: Option<u32>,
+    heartwood: Option<u32>,
+    canopy: Option<u32>,
+    nu5: Option<u32>,
+    nu6: Option<u32>,
+    nu6_1: Option<u32>,
+    nu6_2: Option<u32>,
+    nu7: Option<u32>,
+}
+
+impl ActivationHeights {
+    /// Start building; unset upgrades default to `None`.
+    pub fn builder() -> ActivationHeightsBuilder {
+        ActivationHeightsBuilder::default()
+    }
+
+    pub fn overwinter(&self) -> Option<u32> {
+        self.overwinter
+    }
+    pub fn sapling(&self) -> Option<u32> {
+        self.sapling
+    }
+    pub fn blossom(&self) -> Option<u32> {
+        self.blossom
+    }
+    pub fn heartwood(&self) -> Option<u32> {
+        self.heartwood
+    }
+    pub fn canopy(&self) -> Option<u32> {
+        self.canopy
+    }
+    pub fn nu5(&self) -> Option<u32> {
+        self.nu5
+    }
+    pub fn nu6(&self) -> Option<u32> {
+        self.nu6
+    }
+    pub fn nu6_1(&self) -> Option<u32> {
+        self.nu6_1
+    }
+    pub fn nu6_2(&self) -> Option<u32> {
+        self.nu6_2
+    }
+    pub fn nu7(&self) -> Option<u32> {
+        self.nu7
+    }
+}
+
+/// Builder for [`ActivationHeights`]. Setters take `Option<u32>` so callers
+/// can thread "unknown / inactive" through without branching.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ActivationHeightsBuilder {
+    inner: ActivationHeights,
+}
+
+impl ActivationHeightsBuilder {
+    pub fn set_overwinter(mut self, h: Option<u32>) -> Self {
+        self.inner.overwinter = h;
+        self
+    }
+    pub fn set_sapling(mut self, h: Option<u32>) -> Self {
+        self.inner.sapling = h;
+        self
+    }
+    pub fn set_blossom(mut self, h: Option<u32>) -> Self {
+        self.inner.blossom = h;
+        self
+    }
+    pub fn set_heartwood(mut self, h: Option<u32>) -> Self {
+        self.inner.heartwood = h;
+        self
+    }
+    pub fn set_canopy(mut self, h: Option<u32>) -> Self {
+        self.inner.canopy = h;
+        self
+    }
+    pub fn set_nu5(mut self, h: Option<u32>) -> Self {
+        self.inner.nu5 = h;
+        self
+    }
+    pub fn set_nu6(mut self, h: Option<u32>) -> Self {
+        self.inner.nu6 = h;
+        self
+    }
+    pub fn set_nu6_1(mut self, h: Option<u32>) -> Self {
+        self.inner.nu6_1 = h;
+        self
+    }
+    pub fn set_nu6_2(mut self, h: Option<u32>) -> Self {
+        self.inner.nu6_2 = h;
+        self
+    }
+    pub fn set_nu7(mut self, h: Option<u32>) -> Self {
+        self.inner.nu7 = h;
+        self
+    }
+    pub fn build(self) -> ActivationHeights {
+        self.inner
+    }
+}
 
 // ─────────────────────────── NetworkUpgrade ───────────────────────────
 
 /// Ordered enum of Zcash network upgrades.
 ///
-/// `PartialOrd`/`Ord` reflect supersession: `Nu5 < Nu6 < Nu6_1 < …`. The
+/// `PartialOrd`/`Ord` reflect supersession: `Nu5 < Nu6 < Nu6_1 < ...`. The
 /// resolver uses [`Ord::min`] across components to pick the topology
 /// ceiling. New NUs append to the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -47,37 +155,36 @@ pub enum NetworkUpgrade {
 }
 
 impl NetworkUpgrade {
-    /// The highest NU known to ztest. Empty topologies default here —
-    /// "no constraints, activate everything we know about."
+    /// The highest NU known to ztest. Empty topologies default here (no
+    /// constraints, activate everything we know about).
     pub const HIGHEST: NetworkUpgrade = NetworkUpgrade::Nu7;
 
     /// This upgrade's activation height in ztest's canonical regtest
     /// fixture, or `None` if ztest never activates it in regtest.
     ///
-    /// This is the **single source of truth** for the regtest schedule:
+    /// This is the single source of truth for the regtest schedule:
     /// [`activation_heights_for_ceiling`] gates these heights by the
     /// topology ceiling, and
     /// [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights)
-    /// is this same schedule with no ceiling — so the resolver and the
+    /// is this same schedule with no ceiling, so the resolver and the
     /// standalone fixture cannot drift apart.
     ///
-    /// Every independently-queryable upgrade gets a **distinct** height:
-    /// zebra keeps only the highest upgrade on a height collision (its
+    /// Every independently-queryable upgrade gets a distinct height: zebra
+    /// keeps only the highest upgrade on a height collision (its
     /// `Height -> NetworkUpgrade` map), so co-locating e.g. NU5 and NU6
     /// would drop NU5 and break the Orchard coinbase ("Cannot create
     /// Orchard transactions before NU5 activation"). Pre-NU5 upgrades
-    /// intentionally share height 1 — they collapse to Canopy, which is
+    /// intentionally share height 1: they collapse to Canopy, which is
     /// harmless. NU6.1 sits at height 6 (leaving NU6 blocks 3/4/5 for
-    /// funding-stream deposits before activation), NU6.2 at 7. [`Nu7`](Self::Nu7)
-    /// is `None`: it has no stable `zcash_protocol` representation (see
-    /// [`UnsupportedNetworkUpgrade`]) and is never activated in regtest.
+    /// funding-stream deposits before activation), NU6.2 at 7.
+    /// [`Nu7`](Self::Nu7) is `None`: it has no stable `zcash_protocol`
+    /// representation (see [`UnsupportedNetworkUpgrade`]) and is never
+    /// activated in regtest.
     pub(crate) const fn regtest_height(self) -> Option<u32> {
         match self {
-            Self::Overwinter
-            | Self::Sapling
-            | Self::Blossom
-            | Self::Heartwood
-            | Self::Canopy => Some(1),
+            Self::Overwinter | Self::Sapling | Self::Blossom | Self::Heartwood | Self::Canopy => {
+                Some(1)
+            }
             Self::Nu5 => Some(2),
             Self::Nu6 => Some(3),
             Self::Nu6_1 => Some(6),
@@ -104,8 +211,9 @@ pub struct UnsupportedNetworkUpgrade(pub NetworkUpgrade);
 /// Partial by nature: ztest's enum is a stable superset that carries
 /// [`NetworkUpgrade::Nu7`], which upstream cannot represent without the
 /// `zcash_unstable="nu7"` cfg. `TryFrom` (not `From`) makes that partiality
-/// explicit at the type level — the `Nu7` arm returns [`UnsupportedNetworkUpgrade`]
-/// rather than naming a variant that doesn't compile on stable.
+/// explicit at the type level: the `Nu7` arm returns
+/// [`UnsupportedNetworkUpgrade`] rather than naming a variant that doesn't
+/// compile on stable.
 impl TryFrom<NetworkUpgrade> for zcash_protocol::consensus::NetworkUpgrade {
     type Error = UnsupportedNetworkUpgrade;
 
@@ -154,12 +262,12 @@ pub fn zcashd_ceiling(v: Semver) -> NetworkUpgrade {
 
 /// Version at which zaino gains NU6.2 decode support.
 ///
-/// **PLACEHOLDER.** zaino has not shipped NU6.2 support as of this writing,
-/// so this is an unreachable sentinel (`u16::MAX`) — no real version
-/// satisfies it, so [`zaino_ceiling`] never returns [`NetworkUpgrade::Nu6_2`]
-/// today. When that release lands, replace this with the real version; the
-/// `zaino_*` tests below should be extended with a case that exercises the
-/// new ceiling so this constant can't quietly go stale.
+/// Placeholder: zaino has not shipped NU6.2 support as of this writing, so
+/// this is an unreachable sentinel (`u16::MAX`). No real version satisfies
+/// it, so [`zaino_ceiling`] never returns [`NetworkUpgrade::Nu6_2`] today.
+/// When that release lands, replace this with the real version and extend
+/// the `zaino_*` tests below with a case that exercises the new ceiling so
+/// this constant can't quietly go stale.
 const ZAINO_NU6_2_RELEASE: Semver = Semver {
     major: u16::MAX,
     minor: 0,
@@ -189,9 +297,9 @@ fn sv(major: u16, minor: u16, patch: u16) -> Semver {
 
 // ──────────────────────────── resolver ────────────────────────────────
 
-/// The activation-height ceiling for a topology: the highest NU that
-/// **every** component supports. Empty topologies return
-/// [`NetworkUpgrade::HIGHEST`] (no constraints).
+/// The activation-height ceiling for a topology: the highest NU that every
+/// component supports. Empty topologies return [`NetworkUpgrade::HIGHEST`]
+/// (no constraints).
 pub fn resolve_ceiling(ceilings: &[NetworkUpgrade]) -> NetworkUpgrade {
     ceilings
         .iter()
@@ -203,11 +311,11 @@ pub fn resolve_ceiling(ceilings: &[NetworkUpgrade]) -> NetworkUpgrade {
 /// Build an [`ActivationHeights`] activating every upgrade at or below
 /// `ceiling` at its [`regtest_height`](NetworkUpgrade::regtest_height), and
 /// `None` for everything above. The heights come from
-/// [`NetworkUpgrade::regtest_height`] — the single source of truth shared
+/// [`NetworkUpgrade::regtest_height`], the single source of truth shared
 /// with [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights).
 pub fn activation_heights_for_ceiling(ceiling: NetworkUpgrade) -> ActivationHeights {
     // An upgrade activates at its scheduled height when the topology reaches
-    // it (NU ≤ ceiling), and is absent otherwise.
+    // it (NU <= ceiling), and is absent otherwise.
     let at = |nu: NetworkUpgrade| nu.regtest_height().filter(|_| nu <= ceiling);
     ActivationHeights::builder()
         .set_overwinter(at(NetworkUpgrade::Overwinter))
@@ -381,7 +489,11 @@ mod tests {
         let mut deduped = heights.clone();
         deduped.sort_unstable();
         deduped.dedup();
-        assert_eq!(heights.len(), deduped.len(), "NU5+ heights must be distinct");
+        assert_eq!(
+            heights.len(),
+            deduped.len(),
+            "NU5+ heights must be distinct"
+        );
     }
 
     #[test]

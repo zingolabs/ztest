@@ -24,7 +24,8 @@ pub struct PodSpec {
     pub resources: Option<Resources>,
     /// QoS-default per-pod reserve (the tier footprint split across the env's
     /// pods, §7), injected by `TestEnv::build` when the test didn't call
-    /// `.resources()`. Rendered as `requests == limits` ⇒ k8s "Guaranteed" QoS.
+    /// `.resources()`. Rendered as `requests == limits`, giving k8s
+    /// "Guaranteed" QoS.
     pub guaranteed: Option<Resources>,
     /// Container environment variables, in declaration order.
     pub env: Vec<(String, String)>,
@@ -32,15 +33,15 @@ pub struct PodSpec {
     /// `securityContext.runAsUser` override. Set when a pod must read
     /// another pod's files on a shared volume whose ownership can't be
     /// reconciled via `fsGroup` (hostPath/local-path volumes ignore
-    /// `fsGroup`) — e.g. a zaino StateService reading the root-owned
+    /// `fsGroup`), e.g. a zaino StateService reading the root-owned
     /// zebra-state DB written by the validator. `None` keeps the image
     /// default user.
     pub run_as_user: Option<i64>,
     /// The QoS tier's node placement target, injected by `TestEnv::build()`
-    /// when QoS is enabled. `Some(Pool::Nvme)` renders the NVMe nodeSelector +
-    /// toleration so a `sync` pod lands on the dedicated NVMe pool; `General`
-    /// and `None` schedule anywhere (the default). This is *placement*, not
-    /// sizing — see [`crate::qos::Pool`].
+    /// when QoS is enabled. `Some(Pool::Nvme)` renders the NVMe nodeSelector
+    /// and toleration so a `sync` pod lands on the dedicated NVMe pool;
+    /// `General` and `None` schedule anywhere (the default). This is
+    /// placement, not sizing; see [`crate::qos::Pool`].
     pub placement: Option<crate::qos::Pool>,
 }
 
@@ -122,7 +123,7 @@ impl PodSpec {
         // NVMe placement (the `sync` tier): pin the pod to the tainted NVMe
         // node pool. `nodeSelector` keeps it off general nodes; the matching
         // toleration lets it past the taint that keeps other tiers off NVMe.
-        // `General`/`None` add nothing — default scheduling, so dev/kind
+        // `General`/`None` add nothing (default scheduling), so dev/kind
         // clusters (no NVMe pool, QoS disabled) are unaffected.
         if let Some(crate::qos::Pool::Nvme) = self.placement {
             spec["nodeSelector"] =
@@ -135,17 +136,20 @@ impl PodSpec {
         }
 
         // QoS performance pods (those given a Guaranteed reserve) must be
-        // **killed, not migrated**, when their node goes offline — a moved pod
+        // killed, not migrated, when their node goes offline: a moved pod
         // loses its pinned CPUs and any node-local state, so we never want a
-        // reschedule. These are bare `Pod`s with `restartPolicy: Never`, so k8s
-        // never recreates them; we additionally override the auto-added
+        // reschedule. These are bare `Pod`s with `restartPolicy: Never`, so
+        // k8s never recreates them; we additionally override the auto-added
         // not-ready/unreachable tolerations (default `tolerationSeconds: 300`)
-        // to `0` so a lost node deletes the pod *immediately* rather than after
+        // to `0` so a lost node deletes the pod immediately rather than after
         // the 5-minute grace. (Exclusive-CPU pinning itself is the kubelet's
         // `static` CPU-manager policy, which this pod is eligible for by being
-        // Guaranteed with integer-core CPU — see `env::even_share`.)
+        // Guaranteed with integer-core CPU; see `env::even_share`.)
         if self.guaranteed.is_some() {
-            for cond in ["node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"] {
+            for cond in [
+                "node.kubernetes.io/not-ready",
+                "node.kubernetes.io/unreachable",
+            ] {
                 tolerations.push(json!({
                     "key": cond,
                     "operator": "Exists",
@@ -160,7 +164,7 @@ impl PodSpec {
         }
 
         // Guaranteed-QoS completeness guard (§7). Exclusive static-policy CPU
-        // pinning requires the *whole pod* to be Guaranteed — every container
+        // pinning requires the whole pod to be Guaranteed: every container
         // (regular and any init/sidecar) must carry cpu+memory limits; one
         // missing limit silently downgrades the pod to Burstable and forfeits
         // pinning. This pod is single-container today, so the guard holds; it
@@ -195,7 +199,7 @@ impl PodSpec {
 }
 
 /// `true` if every container (regular and init) in a pod spec carries both
-/// cpu and memory `limits` — the necessary condition for the whole pod to be
+/// cpu and memory `limits`: the necessary condition for the whole pod to be
 /// Guaranteed QoS and thus eligible for the kubelet's `static` CPU-manager
 /// pinning. Containers without a resources block fail the check.
 fn pod_is_guaranteed(spec: &Value) -> bool {
@@ -251,8 +255,8 @@ pub fn pod_spec_for_validator(
             resources: opts.resources.clone(),
             env: opts.env.clone(),
             // When sharing its zebra-state DB, run zebrad as the same uid
-            // (1000) the zaino reader uses, so the DB files it writes —
-            // including the mode-0600 `version` file — are owned by 1000
+            // (1000) the zaino reader uses, so the DB files it writes
+            // (including the mode-0600 `version` file) are owned by 1000
             // and readable by the colocated StateService that opens them
             // as a secondary. fsGroup is ineffective here: hostPath /
             // local-path volumes ignore it, and the zainod image refuses
@@ -322,7 +326,7 @@ pub fn pod_spec_for_indexer(
                 // the files it must read.
                 run_as_user: None,
                 placement: None,
-            guaranteed: None,
+                guaranteed: None,
             })
         }
         "lightwalletd" => Ok(PodSpec {
@@ -415,9 +419,9 @@ mod tests {
             "containers": [{ "resources": { "requests": { "cpu": "2", "memory": "1" } } }],
         });
         assert!(!pod_is_guaranteed(&burstable));
-        // A guaranteed main container but an init container missing limits →
-        // the *whole pod* drops to Burstable: this is the regression the
-        // render-time guard catches.
+        // A guaranteed main container but an init container missing limits:
+        // the whole pod drops to Burstable, the regression the render-time
+        // guard catches.
         let downgraded = json!({
             "containers": [{ "resources": { "limits": { "cpu": "2", "memory": "1" } } }],
             "initContainers": [{ "resources": { "requests": { "cpu": "1", "memory": "1" } } }],
@@ -452,7 +456,8 @@ mod tests {
         assert_eq!(nr["effect"], "NoExecute");
         assert_eq!(nr["tolerationSeconds"], 0);
         assert!(
-            tols.iter().any(|t| t["key"] == "node.kubernetes.io/unreachable"),
+            tols.iter()
+                .any(|t| t["key"] == "node.kubernetes.io/unreachable"),
             "unreachable toleration present: {s}"
         );
         // restartPolicy Never (bare pod ⇒ never rescheduled).
@@ -477,7 +482,10 @@ mod tests {
         };
         let c = container(&spec.render(&coords(), "t", &[]).unwrap());
         assert_eq!(c["resources"]["requests"]["cpu"], "750m");
-        assert!(c["resources"].get("limits").is_none(), "explicit ⇒ requests only");
+        assert!(
+            c["resources"].get("limits").is_none(),
+            "explicit ⇒ requests only"
+        );
     }
 
     #[test]

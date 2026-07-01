@@ -47,5 +47,9 @@ fn tier_attributes_register_in_inventory_with_the_right_class() {
         .iter()
         .find(|d| d.test_id.ends_with("::marker_sync"))
         .unwrap();
-    assert!(sync.test_id.contains("qos_attr"), "module-qualified: {}", sync.test_id);
+    assert!(
+        sync.test_id.contains("qos_attr"),
+        "module-qualified: {}",
+        sync.test_id
+    );
 }

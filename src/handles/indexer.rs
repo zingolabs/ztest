@@ -1,13 +1,13 @@
-//! Indexer backends — two traits.
+//! Indexer backends: two traits.
 //!
-//!  - [`IndexerConfig`] — what your config ZST implements (e.g.
-//!    `ZainoBackend`). Config-time behaviour (NU ceiling, regtest
-//!    materialization) plus the factory that produces a live handle.
-//!  - [`IndexerBackend`] — what your live handle implements (e.g.
-//!    `ZainoIndexer`): the gRPC contract a test drives the indexer with.
-//!    Backend-specific RPCs (zaino's `get_block_nullifiers`, JSON-RPC
-//!    proxy) are *inherent* methods on the concrete handle, so calling
-//!    one on the wrong backend is a compile error.
+//!  - [`IndexerConfig`]: what a config ZST implements (e.g. `ZainoBackend`).
+//!    Config-time behaviour (NU ceiling, regtest materialization) plus the
+//!    factory that produces a live handle.
+//!  - [`IndexerBackend`]: what a live handle implements (e.g. `ZainoIndexer`),
+//!    the gRPC contract a test drives the indexer with. Backend-specific RPCs
+//!    (zaino's `get_block_nullifiers`, JSON-RPC proxy) are inherent methods on
+//!    the concrete handle, so calling one on the wrong backend is a compile
+//!    error.
 
 use std::time::Duration;
 
@@ -18,13 +18,13 @@ use crate::handles::{Endpoint, HandleInner};
 use crate::topology::NetworkUpgrade;
 use crate::{EnvError, RpcError};
 
-pub use zcash_client_backend::proto::compact_formats::{CompactBlock, CompactTx};
-pub use zcash_client_backend::proto::service::{
-    GetAddressUtxosReply, LightdInfo, RawTransaction, SendResponse, SubtreeRoot, TreeState,
+pub use crate::handles::types::BlockHash;
+pub use crate::proto::{
+    CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo, RawTransaction, SendResponse,
+    SubtreeRoot, TreeState,
 };
-pub use zcash_primitives::block::BlockHash;
-pub use zcash_primitives::transaction::{Transaction, TxId};
 pub use zcash_protocol::ShieldedProtocol;
+pub use zcash_protocol::TxId;
 pub use zcash_protocol::consensus::BlockHeight;
 pub use zcash_protocol::value::ZatBalance;
 
@@ -39,7 +39,7 @@ pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
     type Handle: IndexerBackend + Clone;
 
     /// Build the runtime handle once the env has assigned `plumbing`.
-    fn into_handle(&self, plumbing: HandleInner) -> Self::Handle;
+    fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
 
     /// Highest network upgrade this backend's pinned version can decode.
     /// `None` opts out of the topology resolver.
@@ -66,9 +66,9 @@ pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
 
 /// The live indexer: every gRPC call a test drives it with.
 ///
-/// The gRPC methods are all required — each backend implements the whole
-/// surface against its own endpoint. The convenience methods at the
-/// bottom are pure composition over those calls, provided once.
+/// The gRPC methods are all required: each backend implements the whole
+/// surface against its own endpoint. The convenience methods at the bottom are
+/// pure composition over those calls, provided once.
 #[async_trait]
 pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
     /// Stable label string for the backend behind this handle.
@@ -128,11 +128,15 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
         exclude_txid_suffixes: Vec<Vec<u8>>,
     ) -> Result<Vec<CompactTx>, RpcError>;
     async fn get_mempool_stream(&self) -> Result<Vec<RawTransaction>, RpcError>;
-    async fn send_transaction(&self, tx: &Transaction) -> Result<SendResponse, RpcError>;
+    /// Submit a fully-serialized transaction (raw consensus bytes). ztest
+    /// relays the bytes as-is to the indexer's `SendTransaction` RPC. Building
+    /// and serializing a transaction is the wallet integration's job, so the
+    /// harness needn't link a transaction type.
+    async fn send_transaction(&self, raw_tx: &[u8]) -> Result<SendResponse, RpcError>;
     async fn get_transaction(&self, txid: TxId) -> Result<RawTransaction, RpcError>;
 
-    // ── conveniences: composition over the methods above, implemented
-    //    per backend (no default bodies — each handle spells its own) ──
+    // Conveniences: composition over the methods above, implemented per
+    // backend (no default bodies, each handle spells its own).
 
     /// The indexer's gRPC URI as a string (`http://host:port`).
     async fn grpc_uri(&self) -> Result<String, EnvError>;

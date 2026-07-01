@@ -1,63 +1,56 @@
-//! The real [`ObjectStore`] backed by `kube` 0.99 — the only file in
-//! `qos` that names a Kubernetes type.
+//! The real [`ObjectStore`] backed by `kube` 0.99: the only file in `qos` that
+//! names a Kubernetes type.
 //!
 //! It maps the allocator's abstract operations onto concrete objects:
 //!
-//! - [`Kind::AllocatorLock`] and [`Kind::Reservation`] → `coordination.k8s.io/v1`
-//!   `Lease` objects in a single shared namespace ([`KubeStore::namespace`],
-//!   default [`QOS_NAMESPACE`]). The lock must live at one fixed location
-//!   (it is a singleton), and co-locating reservations there makes the
-//!   strongly-consistent in-section list a single-namespace call. The
-//!   Lease's `spec` is left empty — all QoS payload rides in *annotations*
-//!   (footprint, renew tick, …), so the wire shape matches the in-memory
-//!   fake exactly. Crash cleanup is by lease expiry +
-//!   [`crate::qos::allocator::Allocator::reclaim_expired`] + the
+//! - [`Kind::AllocatorLock`] and [`Kind::Reservation`] become
+//!   `coordination.k8s.io/v1` `Lease` objects in a single shared namespace
+//!   ([`KubeStore::namespace`], default [`QOS_NAMESPACE`]). The lock is a
+//!   singleton and must live at one fixed location; co-locating reservations
+//!   there makes the strongly-consistent in-section list a single-namespace
+//!   call. The Lease's `spec` is empty: all QoS payload rides in annotations
+//!   (footprint, renew tick, ...), so the wire shape matches the in-memory fake.
+//!   Crash cleanup is by lease expiry plus
+//!   [`crate::qos::allocator::Allocator::reclaim_expired`] plus the
 //!   `janitor/ttl` backstop, not namespace cascade.
-//! - [`Kind::Job`] → `batch/v1` `Job` objects. These are created by
-//!   *workloads* in per-test `ztest-*` namespaces, so the adapter lists them
-//!   **cluster-wide** (`Api::all`) filtered by `zaino.io/role=qos-job`, and
-//!   synthesizes each Job's footprint annotations from its pod-template
-//!   resource requests (so the pure [`crate::qos::ledger`] stays
-//!   kind-agnostic). The allocator never *creates/gets/deletes* a Job
-//!   through this trait (a `NewObject` can't carry a PodSpec, and a Job's
-//!   namespace isn't known here), so those ops return a clear
-//!   [`StoreError::Backend`] rather than a fake success.
+//! - [`Kind::Job`] becomes `batch/v1` `Job` objects, created by workloads in
+//!   per-test `ztest-*` namespaces, so the adapter lists them cluster-wide
+//!   (`Api::all`) filtered by `zaino.io/role=qos-job` and synthesizes each
+//!   Job's footprint annotations from its pod-template resource requests (so
+//!   the pure [`crate::qos::ledger`] stays kind-agnostic). The allocator never
+//!   creates/gets/deletes a Job through this trait (a `NewObject` can't carry a
+//!   PodSpec, and a Job's namespace isn't known here), so those ops return a
+//!   clear [`StoreError::Backend`] rather than a fake success.
 //!
-//! ## Load-bearing correctness assumptions (audited)
-//!
-//! - **Optimistic concurrency via merge-patch.** [`ObjectStore::update`] is
-//!   a JSON merge patch carrying `metadata.resourceVersion`. Per the
-//!   Kubernetes API conventions, a `resourceVersion` in a write request's
-//!   metadata is a **precondition**: the server returns `409 Conflict` if it
-//!   doesn't match current. This is the same compare-and-swap the lock-steal
-//!   path depends on; a second stealer holding the same stale rv loses.
-//! - **`resourceVersion` is etcd-numeric and globally monotonic.** We parse
-//!   it to `u64` and format it back. etcd's revision is a single global
-//!   sequence shared across *all* object kinds, so a `Lease`'s rv is a valid
-//!   `NotOlderThan` watermark for a cluster-wide `Job` list. (The opaque-rv
-//!   caveat in the API spec is moot on any etcd-backed cluster, which is all
-//!   of them; documented here as the one assumption.)
-//! - **Strong in-section reads.** [`ObjectStore::list`] with a watermark sets
+//! Correctness assumptions:
+//! - Optimistic concurrency via merge-patch: [`ObjectStore::update`] is a JSON
+//!   merge patch carrying `metadata.resourceVersion`. A `resourceVersion` in a
+//!   write request's metadata is a precondition: the server returns
+//!   `409 Conflict` if it doesn't match current. Same compare-and-swap the
+//!   lock-steal path depends on; a second stealer holding the same stale rv
+//!   loses.
+//! - `resourceVersion` is etcd-numeric and globally monotonic: parsed to `u64`
+//!   and formatted back. etcd's revision is one global sequence shared across
+//!   all object kinds, so a `Lease`'s rv is a valid `NotOlderThan` watermark
+//!   for a cluster-wide `Job` list. (The opaque-rv caveat in the API spec is
+//!   moot on any etcd-backed cluster.)
+//! - Strong in-section reads: [`ObjectStore::list`] with a watermark sets
 //!   `resourceVersion=<w>` + `resourceVersionMatch=NotOlderThan`, so the read
 //!   reflects every write up to `w`. If the server can't serve a read that
-//!   fresh (cache lag → `504`, or the rv was compacted → `410`), we surface
+//!   fresh (cache lag: `504`, or rv compacted: `410`), we surface
 //!   [`StoreError::StaleRead`] and the allocator refuses to decide.
 //!
-//! ## RBAC
-//!
-//! The run's ServiceAccount needs: get/list/create/patch/delete on
-//! `leases` in [`KubeStore::namespace`]; cluster-wide list on `jobs`; and
+//! RBAC: the run's ServiceAccount needs get/list/create/patch/delete on
+//! `leases` in [`KubeStore::namespace`], cluster-wide list on `jobs`, and
 //! create on `namespaces` if [`KubeStore::ensure_namespace`] is used.
 //!
-//! ## Testing
-//!
 //! Every conversion/classification function here is pure and unit-tested
-//! below without a cluster — object→[`StoredObject`], footprint synthesis,
-//! quantity parsing, rv parsing, error mapping, selector + patch
-//! construction. Only the thin async `kube` calls are exercised by
-//! integration tests (a real/kind cluster), which must additionally assert
-//! that the reads are issued `NotOlderThan` (the fake can model refusal but
-//! not the real client's request shape).
+//! without a cluster (object to [`StoredObject`], footprint synthesis, quantity
+//! parsing, rv parsing, error mapping, selector + patch construction). Only the
+//! thin async `kube` calls are exercised by integration tests (a real/kind
+//! cluster), which must additionally assert that reads are issued
+//! `NotOlderThan` (the fake models refusal but not the real client's request
+//! shape).
 
 use std::collections::BTreeMap;
 
@@ -70,12 +63,14 @@ use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Versio
 use kube::{Api, Client};
 use serde_json::json;
 
-use super::store::{Kind, LabelSelector, NewObject, ObjectPatch, ObjectStore, StoreError, StoredObject};
+use super::store::{
+    Kind, LabelSelector, NewObject, ObjectPatch, ObjectStore, StoreError, StoredObject,
+};
 use super::{ANN_CPU_MILLI, ANN_MEM_BYTES, Resources, units};
 
 /// Shared namespace holding the allocator-lock Lease and all reservation
-/// Leases. A single ztest-managed namespace acting as the global atomic
-/// datastore for capacity.
+/// Leases. A single ztest-managed namespace acting as the global datastore for
+/// capacity.
 pub const QOS_NAMESPACE: &str = "zaino-qos";
 
 /// `kube`-backed [`ObjectStore`]. Cheap to clone (a `Client` is an
@@ -86,9 +81,8 @@ pub struct KubeStore {
     namespace: String,
 }
 
-// `kube::Client` doesn't implement `Debug`, and the crate denies
-// `missing_debug_implementations`, so hand-roll it (the client isn't
-// useful to print anyway).
+// `kube::Client` doesn't implement `Debug` and the crate denies
+// `missing_debug_implementations`, so hand-roll it.
 impl std::fmt::Debug for KubeStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KubeStore")
@@ -111,11 +105,16 @@ impl KubeStore {
         Self::new(client, QOS_NAMESPACE)
     }
 
-    /// Idempotently create the QoS namespace (409 ⇒ already exists).
+    /// Idempotently create the QoS namespace (409 means already exists).
     /// Mirrors the get-or-create idiom in `cluster.rs`/`materialize.rs`.
     pub async fn ensure_namespace(&self) -> Result<(), StoreError> {
         let api: Api<Namespace> = Api::all(self.client.clone());
-        if api.get_opt(&self.namespace).await.map_err(backend)?.is_some() {
+        if api
+            .get_opt(&self.namespace)
+            .await
+            .map_err(backend)?
+            .is_some()
+        {
             return Ok(());
         }
         let ns: Namespace = Namespace {
@@ -149,7 +148,7 @@ impl ObjectStore for KubeStore {
             Kind::AllocatorLock | Kind::Reservation => {
                 match self.lease_api().get_opt(name).await.map_err(backend)? {
                     // `get` of the lock feeds the steal precondition, so its
-                    // resourceVersion is required here.
+                    // resourceVersion is required.
                     Some(lease) => lease_to_stored(&lease, true).map(Some),
                     None => Ok(None),
                 }
@@ -170,7 +169,11 @@ impl ObjectStore for KubeStore {
                 // List results' resourceVersion is unused downstream (the
                 // ledger reads only labels/annotations), so be lenient on it
                 // and don't let one anomalous object fail the whole read.
-                Ok(objs) => objs.items.iter().map(|l| lease_to_stored(l, false)).collect(),
+                Ok(objs) => objs
+                    .items
+                    .iter()
+                    .map(|l| lease_to_stored(l, false))
+                    .collect(),
                 Err(e) => Err(map_list_err(e)),
             },
             Kind::Job => match self.job_api().list(&lp).await {
@@ -184,7 +187,11 @@ impl ObjectStore for KubeStore {
         match kind {
             Kind::AllocatorLock | Kind::Reservation => {
                 let lease = new_lease(&self.namespace, obj);
-                match self.lease_api().create(&PostParams::default(), &lease).await {
+                match self
+                    .lease_api()
+                    .create(&PostParams::default(), &lease)
+                    .await
+                {
                     Ok(created) => rv_of(&created.metadata),
                     Err(e) if api_code(&e) == Some(409) => Err(StoreError::AlreadyExists),
                     Err(e) => Err(backend(e)),
@@ -210,8 +217,8 @@ impl ObjectStore for KubeStore {
                     .await
                 {
                     Ok(updated) => rv_of(&updated.metadata),
-                    // 409: rv precondition failed. 404: object vanished —
-                    // either way the caller's view is stale.
+                    // 409: rv precondition failed. 404: object vanished. Either
+                    // way the caller's view is stale.
                     Err(e) if matches!(api_code(&e), Some(409) | Some(404)) => {
                         Err(StoreError::Conflict)
                     }
@@ -225,7 +232,11 @@ impl ObjectStore for KubeStore {
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), StoreError> {
         match kind {
             Kind::AllocatorLock | Kind::Reservation => {
-                match self.lease_api().delete(name, &DeleteParams::default()).await {
+                match self
+                    .lease_api()
+                    .delete(name, &DeleteParams::default())
+                    .await
+                {
                     Ok(_) => Ok(()),
                     Err(e) if api_code(&e) == Some(404) => Err(StoreError::NotFound),
                     Err(e) => Err(backend(e)),
@@ -246,21 +257,20 @@ fn api_code(err: &kube::Error) -> Option<u16> {
     }
 }
 
-/// Wrap any `kube` error as an opaque, non-retryable backend failure.
+/// Wrap a `kube` error as an opaque, non-retryable backend failure.
 fn backend(err: kube::Error) -> StoreError {
     StoreError::Backend(err.to_string())
 }
 
 /// A `list` the server couldn't serve fresh enough returns `504 Gateway
-/// Timeout` (the watch cache hasn't reached the `NotOlderThan` watermark) —
-/// the read-after-write hazard the allocator guards against, so it becomes
-/// [`StoreError::StaleRead`] and the allocator refuses to decide / retries.
+/// Timeout` (the watch cache hasn't reached the `NotOlderThan` watermark): the
+/// read-after-write hazard the allocator guards against, so it becomes
+/// [`StoreError::StaleRead`] and the allocator retries.
 ///
-/// `410 Gone` (the watermark was *compacted* — too old) is deliberately NOT
-/// folded in here: our only watermark is a freshly-minted lock epoch, which
-/// can't already be compacted, so a `410` signals a genuine bug rather than
-/// transient lag. We surface it loudly as [`StoreError::Backend`] instead of
-/// silently retrying forever.
+/// `410 Gone` (the watermark was compacted, too old) is not folded in here: the
+/// only watermark is a freshly-minted lock epoch, which can't already be
+/// compacted, so a `410` signals a genuine bug rather than transient lag.
+/// Surfaced loudly as [`StoreError::Backend`] instead of retrying forever.
 fn map_list_err(err: kube::Error) -> StoreError {
     match api_code(&err) {
         Some(504) => StoreError::StaleRead,
@@ -299,7 +309,7 @@ fn rv_of(meta: &ObjectMeta) -> Result<u64, StoreError> {
         })
 }
 
-/// `"k=v,k2=v2"` in sorted (BTreeMap) order — deterministic.
+/// `"k=v,k2=v2"` in sorted (BTreeMap) order.
 fn label_selector_string(selector: &LabelSelector) -> String {
     selector
         .0
@@ -342,7 +352,7 @@ fn non_empty(m: BTreeMap<String, String>) -> Option<BTreeMap<String, String>> {
 
 /// The merge-patch body carrying the `resourceVersion` precondition plus the
 /// label/annotation merge. RFC-7386 merge semantics: present keys are
-/// merged/overwritten, an empty object changes nothing — matching the fake's
+/// merged/overwritten, an empty object changes nothing, matching the fake's
 /// `extend`.
 fn merge_patch(expected_rv: u64, patch: &ObjectPatch) -> serde_json::Value {
     json!({
@@ -359,10 +369,9 @@ fn lease_to_stored(lease: &Lease, require_rv: bool) -> Result<StoredObject, Stor
 }
 
 /// Convert a `Job` to a [`StoredObject`], synthesizing the footprint
-/// annotations the ledger reads from the pod-template requests. Existing
-/// Job annotations are preserved; the synthesized cpu/mem keys win. Jobs are
-/// only ever read via `list`, where the resourceVersion is unused — so it is
-/// not required.
+/// annotations the ledger reads from the pod-template requests. Existing Job
+/// annotations are preserved; the synthesized cpu/mem keys win. Jobs are only
+/// read via `list`, where the resourceVersion is unused, so it is not required.
 fn job_to_stored(job: &Job) -> Result<StoredObject, StoreError> {
     let fp = job_footprint(job);
     let synth = BTreeMap::from([
@@ -372,13 +381,13 @@ fn job_to_stored(job: &Job) -> Result<StoredObject, StoreError> {
     meta_to_stored(&job.metadata, synth, false)
 }
 
-/// Shared metadata→[`StoredObject`] mapping. `extra_annotations` are merged
+/// Shared metadata-to-[`StoredObject`] mapping. `extra_annotations` are merged
 /// in last (overriding object annotations on key clash).
 ///
-/// `require_rv` distinguishes the two read paths: `get` (used to read the
-/// lock for the steal precondition) needs a real resourceVersion, so a
-/// missing/non-numeric one is an error; `list` results never use it, so it
-/// defaults to `0` and one anomalous object can't fail the whole read.
+/// `require_rv` distinguishes the two read paths: `get` (reads the lock for the
+/// steal precondition) needs a real resourceVersion, so a missing/non-numeric
+/// one is an error; `list` results never use it, so it defaults to `0` and one
+/// anomalous object can't fail the whole read.
 fn meta_to_stored(
     meta: &ObjectMeta,
     extra_annotations: BTreeMap<String, String>,
@@ -404,9 +413,9 @@ fn meta_to_stored(
     })
 }
 
-/// A Job's footprint is the effective request of its pod template — see
+/// A Job's footprint is the effective request of its pod template; see
 /// [`crate::qos::units::pod_effective_requests`] (regular + native sidecars +
-/// init-peak). Absent spec/template → zero.
+/// init-peak). Absent spec/template is zero.
 fn job_footprint(job: &Job) -> Resources {
     job.spec
         .as_ref()
@@ -419,9 +428,7 @@ fn job_footprint(job: &Job) -> Resources {
 mod tests {
     use super::*;
     use k8s_openapi::api::batch::v1::JobSpec;
-    use k8s_openapi::api::core::v1::{
-        Container, PodSpec, PodTemplateSpec, ResourceRequirements,
-    };
+    use k8s_openapi::api::core::v1::{Container, PodSpec, PodTemplateSpec, ResourceRequirements};
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
     // (Quantity parsing + pod effective-request tests live in `qos::units`.)
@@ -434,7 +441,10 @@ mod tests {
         assert_eq!(parse_rv("0"), Some(0));
         assert_eq!(parse_rv("not-a-number"), None);
         // Real metadata path: missing rv is an error.
-        let meta = ObjectMeta { name: Some("x".into()), ..Default::default() };
+        let meta = ObjectMeta {
+            name: Some("x".into()),
+            ..Default::default()
+        };
         assert!(rv_of(&meta).is_err());
         let meta = ObjectMeta {
             name: Some("x".into()),
@@ -457,12 +467,12 @@ mod tests {
 
     #[test]
     fn error_codes_classify_per_operation() {
-        // create maps 409 → AlreadyExists (tested via the inline match
+        // create maps 409 to AlreadyExists (tested via the inline match
         // there); here we cover the shared classifiers.
         assert_eq!(api_code(&api_err(409)), Some(409));
         // Only 504 (cache lag vs the NotOlderThan watermark) is a stale read.
         assert_eq!(map_list_err(api_err(504)), StoreError::StaleRead);
-        // 410 (compacted watermark) is a real bug for a fresh epoch → loud.
+        // 410 (compacted watermark) is a real bug for a fresh epoch: loud.
         assert!(matches!(map_list_err(api_err(410)), StoreError::Backend(_)));
         assert!(matches!(map_list_err(api_err(500)), StoreError::Backend(_)));
     }
@@ -482,7 +492,7 @@ mod tests {
         assert_eq!(lp.label_selector.as_deref(), Some("k=v"));
         assert_eq!(lp.resource_version.as_deref(), Some("99"));
         assert_eq!(lp.version_match, Some(VersionMatch::NotOlderThan));
-        // No watermark ⇒ no version match (a plain read).
+        // No watermark means no version match (a plain read).
         let lp = list_params(&LabelSelector::default(), None);
         assert!(lp.resource_version.is_none());
         assert!(lp.version_match.is_none());
@@ -496,10 +506,13 @@ mod tests {
         };
         let body = merge_patch(12, &patch);
         assert_eq!(body["metadata"]["resourceVersion"], "12");
-        assert_eq!(body["metadata"]["annotations"]["qos.zaino.io/renew-tick"], "5");
+        assert_eq!(
+            body["metadata"]["annotations"]["qos.zaino.io/renew-tick"],
+            "5"
+        );
     }
 
-    // ── object → StoredObject ───────────────────────────────────────────
+    // object to StoredObject.
 
     #[test]
     fn lease_to_stored_maps_metadata() {
@@ -508,7 +521,10 @@ mod tests {
                 name: Some("qos-u1".into()),
                 resource_version: Some("3".into()),
                 labels: Some(BTreeMap::from([("zaino.io/pool".into(), "general".into())])),
-                annotations: Some(BTreeMap::from([("qos.zaino.io/cpu-milli".into(), "500".into())])),
+                annotations: Some(BTreeMap::from([(
+                    "qos.zaino.io/cpu-milli".into(),
+                    "500".into(),
+                )])),
                 ..Default::default()
             },
             spec: None,
@@ -523,10 +539,16 @@ mod tests {
     #[test]
     fn lease_without_name_or_rv_is_a_backend_error() {
         let no_name = Lease {
-            metadata: ObjectMeta { resource_version: Some("1".into()), ..Default::default() },
+            metadata: ObjectMeta {
+                resource_version: Some("1".into()),
+                ..Default::default()
+            },
             spec: None,
         };
-        assert!(matches!(lease_to_stored(&no_name, true), Err(StoreError::Backend(_))));
+        assert!(matches!(
+            lease_to_stored(&no_name, true),
+            Err(StoreError::Backend(_))
+        ));
     }
 
     // ── Job footprint synthesis ─────────────────────────────────────────
@@ -555,7 +577,10 @@ mod tests {
             },
             spec: Some(JobSpec {
                 template: PodTemplateSpec {
-                    spec: Some(PodSpec { containers, ..Default::default() }),
+                    spec: Some(PodSpec {
+                        containers,
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -572,7 +597,10 @@ mod tests {
         assert_eq!(s.resource_version, 9);
         assert_eq!(s.labels.get("zaino.io/unit").unwrap(), "u1");
         assert_eq!(s.annotations.get(ANN_CPU_MILLI).unwrap(), "250");
-        assert_eq!(s.annotations.get(ANN_MEM_BYTES).unwrap(), &(64 * 1024 * 1024).to_string());
+        assert_eq!(
+            s.annotations.get(ANN_MEM_BYTES).unwrap(),
+            &(64 * 1024 * 1024).to_string()
+        );
     }
 
     // ── create body ─────────────────────────────────────────────────────
@@ -588,20 +616,20 @@ mod tests {
         assert_eq!(lease.metadata.name.as_deref(), Some("qos-u1"));
         assert_eq!(lease.metadata.namespace.as_deref(), Some("zaino-qos"));
         assert!(lease.metadata.labels.is_some());
-        assert!(lease.metadata.annotations.is_none()); // empty → None
+        assert!(lease.metadata.annotations.is_none()); // empty becomes None
         assert!(lease.spec.is_none());
     }
 }
 
-/// End-to-end tests against a **real** cluster — the one thing the in-memory
-/// fake can't cover: that the live `kube` adapter actually performs the
+/// End-to-end tests against a real cluster: the one thing the in-memory fake
+/// can't cover, that the live `kube` adapter actually performs the
 /// optimistic-concurrency CAS, the `NotOlderThan` watermark read, the
 /// label-filtered list, and the annotation round-trip on genuine
 /// `coordination.k8s.io` Leases.
 ///
-/// Logical time is still injected (`now: u64`) exactly as in the unit tests —
-/// only the *store* is real. Each test runs in its own throwaway namespace and
-/// deletes it on the way out.
+/// Logical time is injected (`now: u64`) exactly as in the unit tests; only the
+/// store is real. Each test runs in its own throwaway namespace and deletes it
+/// on the way out.
 ///
 /// Gated `#[ignore]` so the default `cargo test` (no cluster) skips them; run
 /// with a reachable kubeconfig via `cargo test -p ztest --lib -- --ignored`
@@ -625,7 +653,10 @@ mod integration {
         // and a fresh run never sees a previous run's leftovers.
         let ns = format!("zaino-qos-it-{}-{}", tag, std::process::id());
         let store = KubeStore::new(client, ns.clone());
-        store.ensure_namespace().await.expect("ensure test namespace");
+        store
+            .ensure_namespace()
+            .await
+            .expect("ensure test namespace");
         Some((store, ns))
     }
 
@@ -646,8 +677,8 @@ mod integration {
         }
     }
 
-    // Full lifecycle on real Leases: admit → present → read-your-write list at
-    // the created watermark (NotOlderThan) → renew → release → reclaim.
+    // Full lifecycle on real Leases: admit, present, read-your-write list at
+    // the created watermark (NotOlderThan), renew, release, reclaim.
     #[tokio::test]
     #[ignore = "needs a reachable cluster; run with: cargo test --lib -- --ignored"]
     async fn kube_reservation_lifecycle() {
@@ -656,10 +687,20 @@ mod integration {
             return;
         };
         // lock TTL 5, reservation TTL 100, grace 10 ticks (injected time).
-        let a = Allocator::new(store.clone(), Resources::new(8_000, 16 * GIB), "it-run", 5, 100, 10);
+        let a = Allocator::new(
+            store.clone(),
+            Resources::new(8_000, 16 * GIB),
+            "it-run",
+            5,
+            100,
+            10,
+        );
 
-        // Admit → Granted, lock released, tier label written.
-        let out = a.try_admit(&rr("u1", 4_000, 4 * GIB, QosClass::Sync), 0).await.unwrap();
+        // Admit: Granted, lock released, tier label written.
+        let out = a
+            .try_admit(&rr("u1", 4_000, 4 * GIB, QosClass::Sync), 0)
+            .await
+            .unwrap();
         let Outcome::Granted { reservation } = out else {
             cleanup(&store, &ns).await;
             panic!("expected grant, got {out:?}");
@@ -668,7 +709,11 @@ mod integration {
         assert_eq!(store.count_via_list(ROLE_RESERVATION).await, 1);
 
         // The Lease carries its tier + survives the annotation round-trip.
-        let obj = store.get(Kind::Reservation, &reservation).await.unwrap().unwrap();
+        let obj = store
+            .get(Kind::Reservation, &reservation)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(obj.labels.get(LABEL_TIER).map(String::as_str), Some("sync"));
         assert_eq!(obj.annot_u64(ANN_CPU_MILLI), Some(4_000));
 
@@ -682,17 +727,33 @@ mod integration {
             )
             .await
             .expect("watermark list");
-        assert!(fresh_list.iter().any(|o| o.name == reservation), "read-your-write");
+        assert!(
+            fresh_list.iter().any(|o| o.name == reservation),
+            "read-your-write"
+        );
 
         // Renew bumps the lease (rv advances on the real server).
         a.renew(&reservation, 50).await.unwrap();
-        let after = store.get(Kind::Reservation, &reservation).await.unwrap().unwrap();
-        assert!(after.resource_version > obj.resource_version, "renew advanced rv");
+        let after = store
+            .get(Kind::Reservation, &reservation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.resource_version > obj.resource_version,
+            "renew advanced rv"
+        );
         assert_eq!(after.annot_u64(ANN_RENEW_TICK), Some(50));
 
         // Release removes it.
         a.release(&reservation).await.unwrap();
-        assert!(store.get(Kind::Reservation, &reservation).await.unwrap().is_none());
+        assert!(
+            store
+                .get(Kind::Reservation, &reservation)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Reclaim on an empty ledger is a no-op (and idempotent).
         assert!(a.reclaim_expired(10_000).await.unwrap().is_empty());
@@ -713,24 +774,38 @@ mod integration {
         let a1 = Allocator::new(store.clone(), pool, "run-a", 5, 100, 10);
         let a2 = Allocator::new(store.clone(), pool, "run-b", 5, 100, 10);
 
-        let g = a1.try_admit(&rr("u1", 4_000, 4 * GIB, QosClass::Basic), 0).await.unwrap();
+        let g = a1
+            .try_admit(&rr("u1", 4_000, 4 * GIB, QosClass::Basic), 0)
+            .await
+            .unwrap();
         assert!(matches!(g, Outcome::Granted { .. }), "first admit: {g:?}");
-        // a2's strongly-consistent read sees u1 → no room → Queued (not a 2nd grant).
-        let q = a2.try_admit(&rr("u2", 4_000, 4 * GIB, QosClass::Basic), 1).await.unwrap();
+        // a2's strongly-consistent read sees u1, no room, so Queued (not a 2nd grant).
+        let q = a2
+            .try_admit(&rr("u2", 4_000, 4 * GIB, QosClass::Basic), 1)
+            .await
+            .unwrap();
         assert_eq!(q, Outcome::Queued, "second must queue, not overcommit");
-        assert_eq!(store.count_via_list(ROLE_RESERVATION).await, 1, "exactly one reservation");
+        assert_eq!(
+            store.count_via_list(ROLE_RESERVATION).await,
+            1,
+            "exactly one reservation"
+        );
 
         cleanup(&store, &ns).await;
     }
 
     impl KubeStore {
         /// Count reservation Leases via a real label-filtered `list` (test
-        /// helper — exercises the live list path).
+        /// helper; exercises the live list path).
         async fn count_via_list(&self, role: &str) -> usize {
-            self.list(Kind::Reservation, &LabelSelector::eq(LABEL_ROLE, role), None)
-                .await
-                .map(|v| v.len())
-                .unwrap_or(0)
+            self.list(
+                Kind::Reservation,
+                &LabelSelector::eq(LABEL_ROLE, role),
+                None,
+            )
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0)
         }
     }
 }

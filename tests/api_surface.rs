@@ -22,6 +22,7 @@ fn builder_chain_compiles_for_every_variant() {
     );
     let _w = t.add_validator(Validator::zcashd("6.4.1").named("bob"));
     let _i = t.add_indexer(Indexer::zaino("0.4.0"));
+    #[cfg(feature = "zingo")]
     let _z = t.add_wallet(Wallet::zingo());
 }
 
@@ -39,6 +40,25 @@ fn mount_macros_emit_expected_variants() {
     let m = mount_archive!("tests/assets/archive.tar.zst", "/data");
     assert_eq!(m.kind, MountKind::DirArchive);
     assert!(matches!(m.source, MountSource::ArchiveAbs(_)));
+}
+
+/// The per-test `#[ztest::archive]` binds a fn-local typed handle carrying the
+/// resolved absolute source path, and that handle flows into `with_regtest_cache`
+/// (directly or, in real suites, passed into a helper as a value).
+#[ztest::archive(MATURED_CHAIN = "tests/assets/archive.tar.zst")]
+#[test]
+fn archive_attr_binds_a_typed_handle() {
+    let src = MATURED_CHAIN.source();
+    assert!(
+        std::path::Path::new(src).is_absolute(),
+        "handle source must be absolute: {src}"
+    );
+    assert!(
+        src.ends_with("tests/assets/archive.tar.zst"),
+        "handle source must resolve the declared path: {src}"
+    );
+    // The handle is an `ArchiveHandle` and is accepted by `with_regtest_cache`.
+    let _cached = Validator::zebrad("1.9.1").with_regtest_cache(MATURED_CHAIN);
 }
 
 #[test]

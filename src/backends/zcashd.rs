@@ -2,10 +2,11 @@
 
 use std::time::Duration;
 
+use crate::topology::ActivationHeights;
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use zingo_common_components::protocol::ActivationHeights;
 
+use crate::component::ComponentBuilder;
 use crate::handles::client::{
     AuthedRpc, JsonRpcClient, json_rpc_with_basic_auth, wait_for_rpc_ready,
 };
@@ -14,7 +15,6 @@ use crate::handles::validator::{
     PoolSupport, ValidatorBackend, ValidatorConfig,
 };
 use crate::handles::wallet::Pool;
-use crate::component::ComponentBuilder;
 use crate::handles::{Endpoint, HandleInner};
 use crate::protocol::zcash_rpc::ZcashRpc;
 use crate::topology::{self, NetworkUpgrade};
@@ -22,11 +22,11 @@ use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zcashd";
 
-// Fixed HTTP Basic Auth credentials for zcashd's regtest JSON-RPC. NOT a
-// secret: zcashd rejects unauthed calls, so ztest writes these same
-// throwaway values into the generated regtest `zcash.conf` (`rpcuser`/
-// `rpcpassword`) and presents them here. The node is reachable only inside
-// the test's ephemeral namespace.
+// Fixed HTTP Basic Auth credentials for zcashd's regtest JSON-RPC. Not a
+// secret: zcashd rejects unauthed calls, so ztest writes these throwaway
+// values into the generated regtest `zcash.conf` (`rpcuser`/`rpcpassword`)
+// and presents them here. The node is reachable only inside the test's
+// ephemeral namespace.
 pub(crate) const RPC_USER: &str = "test";
 pub(crate) const RPC_PASSWORD: &str = "test";
 
@@ -75,7 +75,7 @@ pub struct ZcashdBackend;
 impl ValidatorConfig for ZcashdBackend {
     type Handle = ZcashdValidator;
 
-    fn into_handle(&self, plumbing: HandleInner) -> ZcashdValidator {
+    fn to_handle(&self, plumbing: HandleInner) -> ZcashdValidator {
         ZcashdValidator { plumbing }
     }
 
@@ -117,26 +117,26 @@ impl ValidatorConfig for ZcashdBackend {
         ));
         // `opts.regtest_cache` is intentionally ignored: zcashd's default
         // coinbase is a shielded (Sapling) coinbase with no maturity gap, so
-        // a chain cache — whose purpose is to skip a transparent coinbase's
-        // ~100-block maturity mine — buys nothing here. The opt exists for
-        // the generic `Validator<B>` test helpers, where zebrad consumes it
-        // and zcashd no-ops.
+        // a chain cache (whose purpose is to skip a transparent coinbase's
+        // ~100-block maturity mine) buys nothing here. The opt exists for the
+        // generic `Validator<B>` test helpers, where zebrad consumes it and
+        // zcashd no-ops.
         Ok(opts)
     }
 }
 
 // ─────────────────────────── ZcashdValidator ──────────────────────────
 
-/// Live zcashd validator handle. Holds only the env plumbing — all node
-/// state is remote, reached over (Basic-Auth'd) JSON-RPC.
+/// Live zcashd validator handle. Holds only the env plumbing; all node state
+/// is remote, reached over (Basic-Auth'd) JSON-RPC.
 #[derive(Debug, Clone)]
 pub struct ZcashdValidator {
     plumbing: HandleInner,
 }
 
 impl ZcashdValidator {
-    /// JSON-RPC transport with HTTP Basic Auth — zcashd rejects every
-    /// unauthed call with HTTP 401.
+    /// JSON-RPC transport with HTTP Basic Auth; zcashd rejects every unauthed
+    /// call with HTTP 401.
     async fn rpc_client(&self) -> Result<AuthedRpc, EnvError> {
         Ok(json_rpc_with_basic_auth(
             &self.plumbing.endpoint("rpc").await?,
@@ -171,9 +171,9 @@ impl ValidatorBackend for ZcashdValidator {
 
     async fn ready(&self, timeout: std::time::Duration) -> Result<(), RpcError> {
         // zcashd's `getblocktemplate` is gated by `IsInitialBlockDownload`,
-        // which never clears on a peer-less regtest chain — so probe with
-        // `getinfo`. Basic Auth matches `rpc_client`, else every probe
-        // would 401 and burn the whole timeout budget.
+        // which never clears on a peer-less regtest chain, so probe with
+        // `getinfo`. Basic Auth matches `rpc_client`, else every probe would
+        // 401 and burn the whole timeout budget.
         let ep = self.plumbing.endpoint("rpc").await?;
         let client = json_rpc_with_basic_auth(&ep, RPC_USER, RPC_PASSWORD);
         wait_for_rpc_ready(&client, ep.socket_addr(), timeout, "getinfo", &json!([]))
@@ -346,7 +346,7 @@ const RPC_PORT: u16 = crate::handles::ports::ZCASHD_RPC;
 
 // ──────────────────── zcashd-only typed JSON-RPC views ─────────────────
 //
-// Backend-specific RPCs as inherent methods on the concrete handle —
+// Backend-specific RPCs as inherent methods on the concrete handle:
 // `get_block_deltas` simply doesn't exist on `ZebraValidator`.
 
 impl ZcashdValidator {
@@ -364,7 +364,7 @@ impl ZcashdValidator {
             .await
     }
 
-    /// `getblockdeltas <hash>` — zcashd-only RPC.
+    /// `getblockdeltas <hash>`, a zcashd-only RPC.
     pub async fn get_block_deltas(&self, hash: &str) -> Result<Value, RpcError> {
         let client = self.rpc_client().await?;
         client

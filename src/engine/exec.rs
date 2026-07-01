@@ -4,7 +4,7 @@
 //! `--exact <name> --nocapture`, pipe and capture stdout+stderr, enforce a hard
 //! kill deadline, and run the child in its own process group so the kill reaches
 //! the pods/port-forwards a ztest test spawns (a bare `child.kill()` would leak
-//! them — same reasoning as the Ctrl-C path in `cli/console/pty.rs`).
+//! them, same reasoning as the Ctrl-C path in `cli/console/pty.rs`).
 //!
 //! The soft "slow" signal is emitted by the run loop on its render tick (it owns
 //! per-test start times), so this module only handles the hard cap.
@@ -94,8 +94,8 @@ pub async fn spawn_test(item: &WorkItem, env: &EngineEnv, hard_cap: Duration) ->
         }
     };
 
-    // Both readers complete once the pipes hit EOF (the child and all its
-    // fd-inheriting children have exited or been killed).
+    // Both readers complete once the pipes hit EOF: the child and all its
+    // fd-inheriting children have exited or been killed.
     let (mut out, mut err) = tokio::join!(read_out, read_err);
     out.append(&mut err);
 
@@ -125,7 +125,7 @@ fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
         .env("NEXTEST_EXECUTION_MODE", "process-per-test")
         .env("NEXTEST_RUN_ID", &env.run_id)
         .env("CARGO_MANIFEST_DIR", &item.cwd)
-        // Parent owns QoS admission → disable the in-test gate (cluster::qos_enabled
+        // Parent owns QoS admission, so disable the in-test gate (cluster::qos_enabled
         // treats "0" as off; set explicitly to override any inherited "1").
         .env("ZTEST_QOS", "0")
         .env("ZTEST_SA", &env.sa);
@@ -136,7 +136,7 @@ fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        // New process group (pgid == child pid) so `kill(-pgid, …)` reaches the
+        // New process group (pgid == child pid) so `kill(-pgid, ...)` reaches the
         // test's spawned helpers.
         std_cmd.process_group(0);
     }
@@ -196,18 +196,18 @@ mod tests {
             priority: p.priority,
             hard_cap: p.hard_cap,
             retries: 0,
+            deps: Vec::new(),
         }
     }
 
     /// Write an executable `#!/bin/sh` script that ignores its argv (so the
-    /// fixed `--exact … --nocapture` don't matter). Uses `/bin/sh`, which exists
+    /// fixed `--exact ... --nocapture` don't matter). Uses `/bin/sh`, which exists
     /// even where coreutils `/bin/true`/`/bin/false` don't (e.g. NixOS).
     #[cfg(unix)]
     fn script(tag: &str, body: &str) -> PathBuf {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
-        let path =
-            std::env::temp_dir().join(format!("ztest-{tag}-{}.sh", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ztest-{tag}-{}.sh", std::process::id()));
         let mut f = std::fs::File::create(&path).unwrap();
         write!(f, "#!/bin/sh\n{body}\n").unwrap();
         let mut perms = f.metadata().unwrap().permissions();
@@ -221,7 +221,12 @@ mod tests {
     async fn pass_on_zero_exit() {
         let _g = serial().lock().await;
         let p = script("pass", "exit 0");
-        let out = spawn_test(&item(p.to_str().unwrap(), "x"), &env(), Duration::from_secs(5)).await;
+        let out = spawn_test(
+            &item(p.to_str().unwrap(), "x"),
+            &env(),
+            Duration::from_secs(5),
+        )
+        .await;
         let _ = std::fs::remove_file(&p);
         assert_eq!(out.verdict, Verdict::Pass);
     }
@@ -231,7 +236,12 @@ mod tests {
     async fn fail_on_nonzero_exit() {
         let _g = serial().lock().await;
         let p = script("fail", "exit 3");
-        let out = spawn_test(&item(p.to_str().unwrap(), "x"), &env(), Duration::from_secs(5)).await;
+        let out = spawn_test(
+            &item(p.to_str().unwrap(), "x"),
+            &env(),
+            Duration::from_secs(5),
+        )
+        .await;
         let _ = std::fs::remove_file(&p);
         assert_eq!(out.verdict, Verdict::Fail(3));
     }
@@ -241,7 +251,12 @@ mod tests {
     async fn captures_child_output() {
         let _g = serial().lock().await;
         let p = script("cap", "echo hello-stdout");
-        let out = spawn_test(&item(p.to_str().unwrap(), "x"), &env(), Duration::from_secs(5)).await;
+        let out = spawn_test(
+            &item(p.to_str().unwrap(), "x"),
+            &env(),
+            Duration::from_secs(5),
+        )
+        .await;
         let _ = std::fs::remove_file(&p);
         assert!(
             String::from_utf8_lossy(&out.output).contains("hello-stdout"),
@@ -251,15 +266,20 @@ mod tests {
     }
 
     /// Children must run with the in-test k8s admission gate OFF (the parent owns
-    /// admission). If `ZTEST_QOS` regressed to "1"/got dropped, every child would
-    /// create a reservation Lease and leak it — so assert the child actually sees
-    /// `ZTEST_QOS=0`. This is what keeps `kubectl get leases -n zaino-qos` empty.
+    /// admission). If `ZTEST_QOS` regressed to "1" or got dropped, every child
+    /// would create a reservation Lease and leak it, so assert the child actually
+    /// sees `ZTEST_QOS=0`. This is what keeps `kubectl get leases -n zaino-qos` empty.
     #[cfg(unix)]
     #[tokio::test]
     async fn children_run_with_qos_admission_disabled() {
         let _g = serial().lock().await;
         let p = script("qosenv", "printf 'QOS=[%s]\\n' \"$ZTEST_QOS\"");
-        let out = spawn_test(&item(p.to_str().unwrap(), "x"), &env(), Duration::from_secs(5)).await;
+        let out = spawn_test(
+            &item(p.to_str().unwrap(), "x"),
+            &env(),
+            Duration::from_secs(5),
+        )
+        .await;
         let _ = std::fs::remove_file(&p);
         assert_eq!(out.verdict, Verdict::Pass);
         assert!(
@@ -287,7 +307,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let _g = serial().lock().await;
 
-        // A script that ignores its argv (so the fixed `--exact … --nocapture`
+        // A script that ignores its argv (so the fixed `--exact ... --nocapture`
         // don't matter) and sleeps far past the cap.
         let path = std::env::temp_dir().join(format!("ztest-sleeper-{}.sh", std::process::id()));
         {

@@ -2,21 +2,24 @@
 //! live half).
 //!
 //! Decentralized: there is no broker process, so the `ztest run` parent learns
-//! what's running by **listing the `zaino-qos` reservation Leases** while
-//! nextest executes. This module is the *pure* summary — `(reservations, now)
-//! → snapshot` — so it's unit-testable without a cluster; `cli/run.rs` does the
-//! kube list and feeds the result here, then renders the panel.
+//! what's running by listing the `zaino-qos` reservation Leases while nextest
+//! executes. This module is the pure summary `(reservations, now) -> snapshot`,
+//! unit-testable without a cluster; `cli/run.rs` does the kube list, feeds the
+//! result here, then renders the panel.
 //!
-//! Only what the ledger truthfully knows is surfaced: per-tier **running**
-//! (tests currently holding a live reservation), the committed reserve, and
+//! Only what the ledger truthfully knows is surfaced: per-tier running (tests
+//! currently holding a live reservation), the committed reserve, and
 //! per-ServiceAccount usage. A test blocked in its admission loop holds no
-//! Lease, so "queued" is not observable here — the panel derives an estimated
+//! Lease, so "queued" is not observable here; the panel derives an estimated
 //! "remaining" from the planning total separately.
 
 use std::collections::BTreeMap;
 
 use super::store::StoredObject;
-use super::{ANN_CPU_MILLI, ANN_LEASE_TICKS, ANN_MEM_BYTES, ANN_RENEW_TICK, LABEL_SA, LABEL_TIER, QosClass, Resources};
+use super::{
+    ANN_CPU_MILLI, ANN_LEASE_TICKS, ANN_MEM_BYTES, ANN_RENEW_TICK, LABEL_SA, LABEL_TIER, QosClass,
+    Resources,
+};
 
 /// One tier's live footprint: how many reservations are held and their summed
 /// reserve.
@@ -72,8 +75,12 @@ pub fn summarize(reservations: &[StoredObject], now: u64, grace: u64) -> LiveSna
         if !is_live(o, now, grace) {
             continue;
         }
-        let Some(class) = o.labels.get(LABEL_TIER).and_then(|s| QosClass::from_label(s)) else {
-            continue; // not a tier-tagged reservation (or unknown tier) — skip
+        let Some(class) = o
+            .labels
+            .get(LABEL_TIER)
+            .and_then(|s| QosClass::from_label(s))
+        else {
+            continue; // not a tier-tagged reservation (or unknown tier)
         };
         let fp = footprint_of(o);
         let tier = snap.running.entry(class).or_default();
@@ -168,7 +175,10 @@ mod tests {
             res("c", "sync", "beta", 8_000, 16 * GIB, 100, 90),
         ];
         let s = summarize(&r, 100, 10);
-        assert_eq!(s.by_sa["acme"], Resources::new(2_500, 2 * GIB + 512 * crate::qos::MIB));
+        assert_eq!(
+            s.by_sa["acme"],
+            Resources::new(2_500, 2 * GIB + 512 * crate::qos::MIB)
+        );
         assert_eq!(s.by_sa["beta"], Resources::new(8_000, 16 * GIB));
     }
 
@@ -178,7 +188,9 @@ mod tests {
         // A reservation with no tier label at all.
         let mut untagged = res("y", "basic", "acme", 1_000, GIB, 100, 90);
         untagged.labels.remove(LABEL_TIER);
-        weird.labels.insert(LABEL_TIER.to_string(), "bogus".to_string());
+        weird
+            .labels
+            .insert(LABEL_TIER.to_string(), "bogus".to_string());
         let s = summarize(&[weird, untagged], 100, 10);
         assert!(s.running.is_empty());
         assert_eq!(s.committed, Resources::ZERO);

@@ -1,25 +1,24 @@
 //! Pure reconstruction of committed capacity from the k8s ledger.
 //!
-//! Given the live reservation Leases and Jobs (already listed by the
-//! allocator under the lock, with a strongly-consistent read), fold them
-//! into **one global** committed figure and per-ServiceAccount usage — the
-//! inputs [`crate::qos::scheduler::decide`] needs. (Capacity is a single
-//! whole-cluster figure; NVMe vs general is k8s placement, not a partition.)
+//! Given the live reservation Leases and Jobs (already listed by the allocator
+//! under the lock, with a strongly-consistent read), fold them into one global
+//! committed figure and per-ServiceAccount usage: the inputs
+//! [`crate::qos::scheduler::decide`] needs. (Capacity is a single whole-cluster
+//! figure; NVMe vs general is k8s placement, not a partition.)
 //!
-//! Two rules live here, both load-bearing for correctness:
-//!
-//! - **Expiry + GRACE.** A reservation counts only while
+//! Two rules:
+//! - Expiry + GRACE: a reservation counts only while
 //!   `renew_tick + lease_ticks + grace >= now`. The GRACE margin makes
-//!   crash-reclaim conservative: under cross-run clock skew we would rather
-//!   briefly count a dead reservation (transient under-utilization) than
-//!   drop a live one and overcommit. (Jobs have no lease heartbeat; a
-//!   present Job always counts — see the dedup rule.)
-//! - **Per-unit `max` dedup.** A test (one accounting *unit* =
-//!   [`crate::qos::LABEL_UNIT`]) may hold both a reservation Lease and the
-//!   Jobs it spawned. Its contribution is
-//!   `max(live_reservation_footprint, Σ job_requests)`, never the sum — so
-//!   a reservation and its Jobs don't double-count, while an *orphan* Job
-//!   (no live reservation) is still counted as a reconcile correction.
+//!   crash-reclaim conservative: under cross-run clock skew, prefer to briefly
+//!   count a dead reservation (transient under-utilization) over dropping a
+//!   live one and overcommitting. (Jobs have no lease heartbeat; a present Job
+//!   always counts, see the dedup rule.)
+//! - Per-unit `max` dedup: a test (one accounting unit =
+//!   [`crate::qos::LABEL_UNIT`]) may hold both a reservation Lease and the Jobs
+//!   it spawned. Its contribution is `max(live_reservation_footprint, Σ
+//!   job_requests)`, never the sum, so a reservation and its Jobs don't
+//!   double-count, while an orphan Job (no live reservation) is still counted
+//!   as a reconcile correction.
 //!
 //! Pure and clock-free except for the injected `now` / `grace` ticks.
 
@@ -50,7 +49,7 @@ impl Reconstructed {
 #[derive(Default)]
 struct Agg {
     sa: String,
-    /// Sum of *live* reservation footprints for this unit (normally one).
+    /// Sum of live reservation footprints for this unit (normally one).
     reservation: Resources,
     /// Sum of Job pod-request footprints for this unit.
     jobs: Resources,
@@ -139,7 +138,7 @@ mod tests {
         }
     }
 
-    /// Build a Job StoredObject (no lease/renew — Jobs don't heartbeat).
+    /// Build a Job StoredObject (no lease/renew; Jobs don't heartbeat).
     fn job(unit: &str, sa: &str, cpu: u64, mem: u64) -> StoredObject {
         StoredObject {
             name: format!("job-{unit}"),
@@ -171,7 +170,7 @@ mod tests {
             reconstruct(std::slice::from_ref(&r), &[], 15, 5).committed,
             Resources::new(2_000, 4 * GIB)
         );
-        // now == 16: expired → contributes nothing.
+        // now == 16: expired, contributes nothing.
         assert_eq!(reconstruct(&[r], &[], 16, 5).committed, Resources::ZERO);
     }
 
@@ -189,7 +188,10 @@ mod tests {
         let r = res("u1", "acme", 2_000, 8 * GIB, 0, 100);
         let j = job("u1", "acme", 6_000, GIB);
         // Per-dimension max: cpu from job (6000), mem from reservation (8Gi).
-        assert_eq!(reconstruct(&[r], &[j], 1, 5).committed, Resources::new(6_000, 8 * GIB));
+        assert_eq!(
+            reconstruct(&[r], &[j], 1, 5).committed,
+            Resources::new(6_000, 8 * GIB)
+        );
     }
 
     #[test]
