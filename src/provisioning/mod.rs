@@ -35,12 +35,35 @@ use crate::resource::{Graph, Provider};
 /// Content-addressed identity of a resource node. A closed set — one variant per
 /// kind — so the graph stays typed rather than a `dyn` soup. Equal ids denote the
 /// same underlying resource, so the graph deduplicates fan-out for free.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NodeId {
     /// A dev image, keyed by its resolved `<repo>:dev-<hash>` tag.
     Image(String),
     /// A data seed PVC (+ its paired snapshot), keyed by `seed-<sha8>`.
     Seed(String),
+}
+
+/// A per-provider progress reporter for the console's right-column transfer
+/// tracker. A provider calls [`note`](ProgressSink::note) as it moves through its
+/// sub-phases (`building` → `load→kind`); the sink forwards `(node, note)` to the
+/// work side, which folds it into the [`Transfers`](crate::preflight::Transfers)
+/// row for that node. The coarse lifecycle (acquiring / ready / failed) already
+/// reaches the work side through [`Graph::provision`](crate::resource::Graph)'s
+/// `on_change`; this adds the finer sub-phase text. Opaque closure so
+/// `provisioning` needn't name the work side's event type.
+#[derive(Clone)]
+pub struct ProgressSink(std::sync::Arc<dyn Fn(NodeId, String) + Send + Sync>);
+
+impl ProgressSink {
+    /// Wrap a sink function (typically an mpsc send on the work side).
+    pub fn new(f: impl Fn(NodeId, String) + Send + Sync + 'static) -> Self {
+        ProgressSink(std::sync::Arc::new(f))
+    }
+
+    /// Report the current sub-phase note for `id`.
+    pub fn note(&self, id: &NodeId, note: impl Into<String>) {
+        (self.0)(id.clone(), note.into());
+    }
 }
 
 /// Shared context handed to every [`Provider`]. Image providers need only the
@@ -55,6 +78,9 @@ pub struct Cx {
     /// Cluster client for k8s-backed resources (seeds); `None` when no cluster
     /// was probed — seed provisioning then fails with a clear message.
     pub client: Option<Client>,
+    /// Right-column progress reporter (TTY runs). `None` off a TTY, where the
+    /// provider streams its output straight to inherited stdio instead.
+    pub progress: Option<ProgressSink>,
 }
 
 // `kube::Client` is not `Debug`; report only presence so `Cx`/`Graph` stay
@@ -64,6 +90,7 @@ impl std::fmt::Debug for Cx {
         f.debug_struct("Cx")
             .field("console", &self.console.is_some())
             .field("client", &self.client.is_some())
+            .field("progress", &self.progress.is_some())
             .finish()
     }
 }

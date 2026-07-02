@@ -57,8 +57,10 @@ pub use crate::backends::lightwalletd::LightwalletdIndexer;
 pub use crate::backends::zainod::ZainoIndexer;
 pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::ZebraValidator;
+#[cfg(feature = "librustzcash")]
+pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
 #[cfg(feature = "zingo")]
-pub use crate::backends::zingo::{FAUCET_SEED, RECIPIENT_SEED, ZingoBackend, ZingoWallet};
+pub use crate::backends::zingo::{ZingoBackend, ZingoWallet};
 pub use crate::component::{
     ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Indexer, Resources,
     Validator, Wallet,
@@ -73,7 +75,10 @@ pub use crate::handles::indexer::{
 pub use crate::handles::validator::{
     BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, Peer, PeerInfo,
 };
-pub use crate::handles::wallet::{Account, AccountId, AccountSpec, BoxError, Pool, PoolBalances};
+pub use crate::handles::wallet::{
+    Account, AccountId, AccountSpec, BoxError, FAUCET_SEED, Pool, PoolBalances, RECIPIENT_SEED,
+    WalletExt,
+};
 pub use crate::handles::{
     Endpoint, HandleInner, IndexerBackend, IndexerConfig, ValidatorBackend, ValidatorConfig,
     WalletBackend, WalletConfig,
@@ -134,10 +139,11 @@ pub mod prelude {
         LightwalletdIndexer, MempoolInfo, Mount, MountKind, MountSource, Peer, PeerInfo, Pool,
         PoolBalances, RawTransaction, RpcError, SendResponse, SharedVolume, ShieldedProtocol,
         SnapshotRef, SubtreeRoot, TestEnv, TreeState, TxId, Validator, ValidatorBackend, Wallet,
-        WalletBackend, ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
+        WalletBackend, WalletExt, ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
+        FAUCET_SEED, RECIPIENT_SEED,
     };
     #[cfg(feature = "zingo")]
-    pub use super::{FAUCET_SEED, RECIPIENT_SEED, ZingoWallet};
+    pub use super::ZingoWallet;
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
         REGTEST_FIXTURE_HEIGHTS_CLI_STRING, Regtest, RegtestState, Testnet, TestnetState,

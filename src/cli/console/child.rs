@@ -38,7 +38,7 @@ pub(crate) async fn run_child(
     let size = console.size();
     let pair = native_pty_system()
         .openpty(PtySize {
-            rows: console.emu_rows(),
+            rows: console.live_rows(),
             cols: size.cols,
             pixel_width: 0,
             pixel_height: 0,
@@ -65,8 +65,13 @@ pub(crate) async fn run_child(
         .map_err(|e| io::Error::other(format!("spawn {program}: {e}")))?;
     drop(pair.slave);
 
-    // The render thread forwards Ctrl-C to this group.
-    console.child_started(pair.master.process_group_leader());
+    // The render thread forwards Ctrl-C to this group. portable-pty runs the
+    // child under `setsid` (its own session + process group), so the child's PID
+    // *is* its process-group id — use it directly. `master.process_group_leader()`
+    // (a `tcgetpgrp` on the pty) races the child's not-yet-completed `setsid` and
+    // can latch `None` or a stale group for the whole run, silently dropping the
+    // first Ctrl-Cs.
+    console.child_started(child.process_id().map(|pid| pid as i32));
 
     let mut reader = pair
         .master
@@ -89,9 +94,32 @@ pub(crate) async fn run_child(
 
     // `Child::wait` blocks; keep it off the async worker. The reader thread sees
     // PTY EOF when the child exits and the master's last fd closes.
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .map_err(io::Error::other)?;
+    let wait = tokio::task::spawn_blocking(move || child.wait());
+    tokio::pin!(wait);
+
+    // While the child runs, forward terminal resizes to its PTY. We keep the
+    // child's row count pinned to the live region (`live_rows`) — the on-screen
+    // live window is a fixed height — and only propagate the new width, matching
+    // what the render thread does to its `avt` grid. `master.resize` ioctls
+    // TIOCSWINSZ, which makes the kernel deliver SIGWINCH to the child, so tools
+    // like cargo re-wrap to the new width instead of keeping their spawn-time size.
+    let mut size = console.size_watch();
+    let status = loop {
+        tokio::select! {
+            done = &mut wait => break done.map_err(io::Error::other)?,
+            changed = size.changed() => {
+                if changed.is_ok() {
+                    let cols = size.borrow().cols;
+                    let _ = pair.master.resize(PtySize {
+                        rows: console.live_rows(),
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                }
+            }
+        }
+    };
     drop(pair.master);
     let _ = reader_thread.join();
     console.child_exited();
@@ -100,13 +128,24 @@ pub(crate) async fn run_child(
 }
 
 /// Non-TTY fallback: inherit stdio, run synchronously, return the exit code.
+///
+/// A signal death maps to the shell convention `128 + signo` (so a Ctrl-C'd
+/// child reports 130, matching the PTY path's [`code_for`]) rather than a
+/// generic `1` that reads as an ordinary failure.
 fn run_inherited(program: &str, args: &[String], envs: &[(&str, String)]) -> io::Result<i32> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    Ok(cmd.status()?.code().unwrap_or(1))
+    let status = cmd.status()?;
+    Ok(match status.code() {
+        Some(code) => code,
+        None => {
+            use std::os::unix::process::ExitStatusExt as _;
+            status.signal().map_or(1, |sig| 128 + sig)
+        }
+    })
 }
 
 /// Map a finished PTY child status to an exit code. Clean exits propagate their

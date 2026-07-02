@@ -25,26 +25,31 @@ use tokio::time::MissedTickBehavior;
 use avt::Vt;
 
 use crate::cancel::{Cancel, CancelSource};
+// Milliseconds per spinner frame — shared with `preflight`'s `spinner_glyph` so
+// the console redraw gate and the glyph table can't drift apart.
+use crate::preflight::SPINNER_STEP_MS;
 
-use super::{EMU_ROWS, Surface, bridge};
+use super::{Surface, bridge};
 
 /// Target frame interval (~30 fps). State changes are folded into the model as
 /// they arrive, but the terminal repaints at most once per interval, so an
 /// output flood collapses to ~30 clear+repaint cycles a second.
 const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 
-/// Milliseconds per spinner frame (matches `crate::preflight`'s `spinner_glyph`).
-/// The redraw tick forces a repaint when the derived frame index changes, so the
-/// "is it still alive?" heartbeat keeps animating with no new state.
-const SPINNER_STEP_MS: u128 = 100;
-
-/// One frame's worth of content, produced on demand by a [`SceneFn`]: the
-/// pinned bottom panel as an ANSI string, which the render thread turns into
-/// `ratatui` lines. Everything else — subprocess output and the engine's
-/// reporter verdicts — reaches the terminal as native scrollback, not through
-/// the scene.
+/// One frame's worth of content, produced on demand by a [`SceneFn`]: the two
+/// columns of the pinned bottom panel as ANSI strings, which the render thread
+/// splits into side-by-side `ratatui` regions. `left` is the phase-scoped status
+/// (cluster / build / run); `right` is the session-long transfer tracker. Both
+/// are a constant `PANEL_ROWS` lines so the panel never reflows. Everything else
+/// — subprocess output and the engine's reporter verdicts — reaches the terminal
+/// as native scrollback, not through the scene.
 pub(crate) struct SceneFrame {
-    pub panel: String,
+    pub left: String,
+    pub right: String,
+    /// Explicit live-region content (the run phase's running-tests block). `None`
+    /// means "use the child's `avt` grid" — the default for the compile/build
+    /// phases, where the live region mirrors the subprocess's own output.
+    pub live: Option<String>,
 }
 
 /// An immutable recipe for rendering the current data at any instant. `elapsed`
@@ -79,7 +84,7 @@ pub(crate) struct Console {
     tx: mpsc::UnboundedSender<Msg>,
     size: watch::Receiver<PtySize>,
     cancel: Cancel,
-    emu_rows: u16,
+    live_rows: u16,
 }
 
 /// Owns the render thread's join handle. Kept by the session's top-level flow;
@@ -122,7 +127,7 @@ impl Console {
             })
             .map_err(io::Error::other)?;
 
-        let emu_rows = match ready_rx.recv() {
+        let live_rows = match ready_rx.recv() {
             Ok(Ok(rows)) => rows,
             Ok(Err(e)) => {
                 let _ = join.join();
@@ -138,7 +143,7 @@ impl Console {
             tx: tx.clone(),
             size: size_rx,
             cancel,
-            emu_rows,
+            live_rows,
         };
         let guard = ConsoleGuard {
             tx,
@@ -150,6 +155,13 @@ impl Console {
     /// Push a fresh render recipe. Called whenever the work side's domain state
     /// changes; the render thread keeps painting the latest one with an advancing
     /// clock so spinners/timers animate between updates.
+    ///
+    /// Fire-and-forget: if the render thread is already gone the scene is silently
+    /// dropped. That's intentional — a dead render thread means teardown is
+    /// underway, and there's nothing left to paint. The same holds for
+    /// [`scrollback`](Self::scrollback), [`flush_live`](Self::flush_live), and the
+    /// child lifecycle sends; only [`output`](Self::output) reports the loss, so
+    /// the PTY reader thread knows to stop.
     pub fn scene(&self, f: impl Fn(Duration) -> SceneFrame + Send + 'static) {
         let _ = self.tx.send(Msg::Scene(Box::new(f)));
     }
@@ -188,10 +200,18 @@ impl Console {
         *self.size.borrow()
     }
 
-    /// Height of the `avt` emulator grid / child PTY (see [`EMU_ROWS`]); the
-    /// child-runner sizes its PTY to this.
-    pub fn emu_rows(&self) -> u16 {
-        self.emu_rows
+    /// A clone of the size watch, so `child::run_child` can await SIGWINCH-driven
+    /// resizes and forward the new width to its PTY child (`master.resize`).
+    pub fn size_watch(&self) -> watch::Receiver<PtySize> {
+        self.size.clone()
+    }
+
+    /// Height of the live region — the `avt` emulator grid / child PTY, and the
+    /// row count the engine renders its running-tests block into. Derived from the
+    /// surface's reserved rows (see [`super::LIVE_ROWS`]); the child-runner sizes its PTY
+    /// to this.
+    pub fn live_rows(&self) -> u16 {
+        self.live_rows
     }
 
     /// Whether the user has asked to abort (Ctrl-C). Phases check this between
@@ -243,7 +263,7 @@ fn render_thread(
             return;
         }
     };
-    let _ = ready_tx.send(Ok(EMU_ROWS));
+    let _ = ready_tx.send(Ok(surface.live_rows()));
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -271,7 +291,11 @@ async fn render_loop(
     cancel_panel: CancelPanelFn,
     session_start: Instant,
 ) {
-    let mut vt = new_vt(surface.cols(), EMU_ROWS);
+    // The live-region height the surface reserved: the `avt` grid's row count, held
+    // for the session (the inline viewport can't resize, so only cols change on
+    // SIGWINCH). Single source, derived from the surface — no restated constant.
+    let live_rows = surface.live_rows();
+    let mut vt = new_vt(surface.cols(), live_rows);
     let mut carry: Vec<u8> = Vec::new();
     // Scrollback awaiting the next atomic present (avt scroll-off + engine lines),
     // already bridged to ratatui lines.
@@ -312,7 +336,7 @@ async fn render_loop(
                 }
                 Some(Msg::FlushLive) => {
                     pending.extend(bridged(&trimmed_view(&vt)));
-                    vt = new_vt(surface.cols(), EMU_ROWS);
+                    vt = new_vt(surface.cols(), live_rows);
                     clock.mark_dirty();
                 }
                 Some(Msg::ChildStarted(p)) => pgid = p,
@@ -346,8 +370,10 @@ async fn render_loop(
             _ = recv_signal(&mut sigwinch) => {
                 let size = current_pty_size();
                 surface.set_cols(size.cols);
+                // Floor to 1: a 0 dimension underflow-panics inside `avt::resize`
+                // (see `new_vt`); terminals can briefly report 0 during a resize.
                 let sb: Vec<avt::Line> = vt
-                    .resize(size.cols as usize, EMU_ROWS as usize)
+                    .resize((size.cols.max(1)) as usize, (live_rows.max(1)) as usize)
                     .scrollback
                     .collect();
                 pending.extend(bridged(&sb));
@@ -360,19 +386,29 @@ async fn render_loop(
                 if !clock.should_paint(elapsed) {
                     continue;
                 }
-                // The panel is the only pinned content; the Cancelling overlay
-                // replaces it once cancellation is in progress. All other output
-                // is already queued in `pending` for native scrollback.
-                let panel = match scene.as_ref() {
-                    _ if cancelling => cancel_panel(elapsed),
-                    Some(scene) => scene(elapsed).panel,
-                    None if cancelling => cancel_panel(elapsed),
+                // The Cancelling overlay replaces the left column (and clears
+                // transfers + live region) once cancellation is in progress. All
+                // completed output is already queued in `pending` for native
+                // scrollback.
+                let (left, right, live_src) = match scene.as_ref() {
+                    _ if cancelling => (cancel_panel(elapsed), String::new(), Some(String::new())),
+                    Some(scene) => {
+                        let f = scene(elapsed);
+                        (f.left, f.right, f.live)
+                    }
                     // No scene yet: still flush any queued scrollback so early
                     // output isn't withheld, painting an empty panel.
-                    None if !pending.is_empty() => String::new(),
+                    None if !pending.is_empty() => (String::new(), String::new(), None),
                     None => continue,
                 };
-                surface.present(&pending, &panel);
+                // Live region: the scene's explicit content (the run phase's
+                // running-tests block) when present, else the child's live `avt`
+                // grid (compile/build phases mirror the subprocess output).
+                let live_lines: Vec<Line<'static>> = match &live_src {
+                    Some(s) => surface.scrollback_from_ansi(s),
+                    None => vt.view().map(bridge::avt_line).collect(),
+                };
+                surface.present(&pending, &live_lines, &left, &right);
                 pending.clear();
             }
         }
@@ -422,9 +458,13 @@ impl FrameClock {
 /// A fresh `avt` grid of the given size, retaining no scrollback of its own.
 /// `scrollback_limit(0)` yields each line the moment it scrolls past the grid,
 /// which is our feed into native scrollback.
+///
+/// Dimensions are floored to 1: `avt` computes `rows - 1` / `cols - 1` internally
+/// and underflow-panics on a zero dimension, and some terminals momentarily
+/// report a 0 width/height during a resize.
 fn new_vt(cols: u16, rows: u16) -> Vt {
     Vt::builder()
-        .size(cols as usize, rows as usize)
+        .size(cols.max(1) as usize, rows.max(1) as usize)
         .scrollback_limit(0)
         .build()
 }
@@ -567,5 +607,62 @@ mod tests {
         let out = decode(&mut carry, &[b'a', 0xFF, b'b']);
         assert_eq!(out, "a\u{FFFD}b");
         assert!(carry.is_empty());
+    }
+
+    /// Concatenate a bridged line's span text — for asserting grid/scrollback
+    /// content without caring about styling.
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn trimmed_view_drops_trailing_blanks_but_keeps_interior_ones() {
+        // A 4-row grid: content on row 0 and row 2, an interior blank on row 1,
+        // and a trailing blank on row 3. Only the trailing blank should go.
+        let mut vt = new_vt(10, 4);
+        let _ = vt.feed_str("top\r\n\r\nmid\r\n");
+        let trimmed = trimmed_view(&vt);
+        let texts: Vec<String> = trimmed.iter().map(|l| line_text(&bridge::avt_line(l))).collect();
+        assert_eq!(texts, vec!["top".to_string(), String::new(), "mid".to_string()]);
+    }
+
+    #[test]
+    fn trimmed_view_of_a_blank_grid_is_empty() {
+        let vt = new_vt(10, 4);
+        assert!(trimmed_view(&vt).is_empty());
+    }
+
+    #[test]
+    fn feed_forwards_scrolled_off_lines_oldest_first() {
+        // A 2-row grid: feeding three newline-terminated lines scrolls the first
+        // two off the top (oldest first) into `pending`; the third stays live.
+        let mut vt = new_vt(10, 2);
+        let mut carry = Vec::new();
+        let mut pending: Vec<Line<'static>> = Vec::new();
+        feed(&mut vt, &mut carry, &mut pending, b"a\r\nb\r\nc\r\n");
+
+        let scrolled: Vec<String> = pending.iter().map(line_text).collect();
+        assert_eq!(scrolled, vec!["a".to_string(), "b".to_string()]);
+
+        let live: Vec<String> = trimmed_view(&vt)
+            .iter()
+            .map(|l| line_text(&bridge::avt_line(l)))
+            .collect();
+        assert_eq!(live, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn feed_holds_a_split_multibyte_char_in_carry() {
+        // A UTF-8 sequence split across two PTY reads must not corrupt the grid:
+        // the first (partial) feed produces nothing, the second completes it.
+        let mut vt = new_vt(10, 1);
+        let mut carry = Vec::new();
+        let mut pending: Vec<Line<'static>> = Vec::new();
+        feed(&mut vt, &mut carry, &mut pending, &[0xC3]); // lead byte of 'é'
+        assert_eq!(carry, vec![0xC3], "partial char buffered, not fed");
+        feed(&mut vt, &mut carry, &mut pending, &[0xA9]); // continuation
+        assert!(carry.is_empty());
+        let live = line_text(&bridge::avt_line(&vt.view().next().unwrap().clone()));
+        assert_eq!(live, "é");
     }
 }

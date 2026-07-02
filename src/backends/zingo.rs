@@ -14,19 +14,26 @@
 //! activates must be carried across explicitly.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
+use bip0039::Mnemonic;
+use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::topology::ActivationHeights;
+use pepper_sync::config::{PerformanceLevel, SyncConfig, TransparentAddressDiscovery};
 use zcash_protocol::TxId;
 use zcash_protocol::value::Zatoshis;
 use zebra_chain::parameters::testnet::ConfiguredActivationHeights;
+use zingolib::config::{ChainType, load_clientconfig};
 use zingolib::lightclient::LightClient;
-use zingolib_testutils::scenarios::ClientBuilder;
+use zingolib::wallet::keys::unified::ReceiverSelection;
+use zingolib::wallet::{LightWallet, WalletBase, WalletSettings};
 
 use crate::RpcError;
 use crate::handles::HandleInner;
@@ -71,12 +78,10 @@ impl WalletConfig for ZingoBackend {
     }
 }
 
-/// Live in-process zingolib wallet handle. Holds one `LightClient` per
-/// account; methods dispatch to the matching client. A single
-/// [`ClientBuilder`] (created on the first account, bound to that
-/// account's indexer URI) hands out unique wallet data dirs. Cheaply
-/// cloneable: clones share the same in-process state, so an account built
-/// through one clone is visible through all of them.
+/// Live in-process zingolib wallet handle. Holds one [`ClientEntry`] per
+/// account; methods dispatch to the matching client. Cheaply cloneable:
+/// clones share the same in-process state, so an account built through one
+/// clone is visible through all of them.
 #[derive(Clone, Default)]
 pub struct ZingoWallet {
     inner: Arc<ZingoInner>,
@@ -84,13 +89,20 @@ pub struct ZingoWallet {
 
 #[derive(Default)]
 struct ZingoInner {
-    builder: AsyncMutex<Option<ClientBuilder>>,
-    /// One `LightClient` per ztest [`AccountId`]. Each client wraps a
+    /// One [`ClientEntry`] per ztest [`AccountId`]. Each client wraps a
     /// single-seed wallet, so per-account ops address zingolib sub-account
     /// `zip32::AccountId::ZERO`: ztest maps one ztest account to one wallet,
     /// not to a zip32 sub-account index.
-    clients: StdMutex<HashMap<u32, Arc<AsyncMutex<LightClient>>>>,
+    clients: StdMutex<HashMap<u32, ClientEntry>>,
     next_id: AtomicU32,
+}
+
+/// One in-process account: its `LightClient` and the temporary wallet-data
+/// dir held alive for the client's lifetime. Dropping the entry deletes the
+/// dir (and the wallet files under it).
+struct ClientEntry {
+    client: Arc<AsyncMutex<LightClient>>,
+    _datadir: TempDir,
 }
 
 impl std::fmt::Debug for ZingoWallet {
@@ -111,7 +123,7 @@ impl ZingoWallet {
             .lock()
             .expect("zingo clients mutex poisoned")
             .get(&account.0)
-            .cloned()
+            .map(|entry| entry.client.clone())
             .ok_or_else(|| format!("zingo: unknown account {account:?}").into())
     }
 }
@@ -367,34 +379,21 @@ impl WalletBackend for ZingoWallet {
     }
 
     async fn add_account(&self, spec: AccountSpec<'_>) -> Result<AccountId, BoxError> {
-        let mut guard = self.inner.builder.lock().await;
-        if guard.is_none() {
-            let uri: http::Uri = spec
-                .indexer_uri
-                .parse()
-                .map_err(|e| format!("zingo: bad indexer uri {:?}: {e}", spec.indexer_uri))?;
-            let datadir =
-                tempfile::tempdir().map_err(|e| format!("zingo: create wallet tempdir: {e}"))?;
-            *guard = Some(ClientBuilder::new(uri, datadir));
-        }
-        let builder = guard
-            .as_mut()
-            .expect("zingo client builder just initialized");
-        let birthday = u64::from(u32::from(spec.birthday));
-        let client = builder.build_client(
-            spec.mnemonic.to_string(),
-            birthday,
-            true,
-            to_configured(spec.activation),
-        );
-        drop(guard);
-
+        let datadir =
+            tempfile::tempdir().map_err(|e| format!("zingo: create wallet tempdir: {e}"))?;
+        let client = build_light_client(spec.indexer_uri, datadir.path(), &spec)?;
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         self.inner
             .clients
             .lock()
             .expect("zingo clients mutex poisoned")
-            .insert(id, Arc::new(AsyncMutex::new(client)));
+            .insert(
+                id,
+                ClientEntry {
+                    client: Arc::new(AsyncMutex::new(client)),
+                    _datadir: datadir,
+                },
+            );
         Ok(AccountId(id))
     }
 
@@ -457,4 +456,59 @@ impl WalletBackend for ZingoWallet {
             .map_err(|e| Box::new(e) as BoxError)?;
         Ok(txids.into_iter().collect())
     }
+}
+
+/// Build one in-process zingolib `LightClient` from `spec`, bound to
+/// `indexer_uri`, with its wallet files under `datadir`.
+///
+/// This is the whole of what ztest needs from a wallet library — construct a
+/// client from a seed against an indexer — so it lives as a plain function
+/// rather than pulling `zingolib_testutils::scenarios::ClientBuilder`, which
+/// drags the `zcash_local_net → zebra-consensus → libzcash_script` launcher
+/// stack (and `libstdc++`) that ztest exists to replace. Uses `zingolib` core
+/// plus `pepper-sync` only.
+///
+/// Adapted from that `ClientBuilder::build_client` (zingolib rev 61418d6e):
+/// the wallet holds a single seed, so it is created for one zingolib account
+/// with a sapling-only unified address, matching ztest's one-account-per-seed
+/// model. `overwrite` is always true — `datadir` is a fresh empty tempdir.
+fn build_light_client(
+    indexer_uri: &str,
+    datadir: &Path,
+    spec: &AccountSpec<'_>,
+) -> Result<LightClient, BoxError> {
+    let uri: http::Uri = indexer_uri
+        .parse()
+        .map_err(|e| format!("zingo: bad indexer uri {indexer_uri:?}: {e}"))?;
+    let config = load_clientconfig(
+        uri,
+        Some(datadir.to_path_buf()),
+        ChainType::Regtest(to_configured(spec.activation)),
+        WalletSettings {
+            sync_config: SyncConfig {
+                transparent_address_discovery: TransparentAddressDiscovery::minimal(),
+                performance_level: PerformanceLevel::High,
+            },
+            min_confirmations: NonZeroU32::MIN,
+        },
+        NonZeroU32::MIN,
+        String::new(),
+    )
+    .map_err(|e| format!("zingo: load client config: {e}"))?;
+    let mut wallet = LightWallet::new(
+        config.chain,
+        WalletBase::Mnemonic {
+            mnemonic: Mnemonic::from_phrase(spec.mnemonic.to_string())
+                .map_err(|e| format!("zingo: invalid mnemonic phrase: {e}"))?,
+            no_of_accounts: NonZeroU32::MIN,
+        },
+        u32::from(spec.birthday).into(),
+        config.wallet_settings.clone(),
+    )
+    .map_err(|e| format!("zingo: construct LightWallet: {e}"))?;
+    wallet
+        .generate_unified_address(ReceiverSelection::sapling_only(), zip32::AccountId::ZERO)
+        .map_err(|e| format!("zingo: generate unified address: {e}"))?;
+    LightClient::create_from_wallet(wallet, config, true)
+        .map_err(|e| format!("zingo: create LightClient: {e}").into())
 }

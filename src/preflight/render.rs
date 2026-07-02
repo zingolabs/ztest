@@ -21,13 +21,47 @@ use owo_colors::OwoColorize;
 use super::theme::Theme;
 use super::{
     ArchiveRow, ArchiveStatus, BannerState, BuildStage, BuildState, DownloadSource, QosPlan,
-    SnapshotRow, SnapshotStatus, TierPlan,
+    SnapshotRow, SnapshotStatus, TierPlan, TransferKind, TransferProgress, TransferRow, Transfers,
 };
 use crate::qos::live::LiveSnapshot;
 use crate::qos::{GIB, MIB, QosClass, Resources};
 
 /// Width of the action-label column, matching nextest's `{:>12}`.
 const LABEL_WIDTH: usize = 12;
+
+/// The pinned panel's fixed line count (must equal `cli::console::PANEL_ROWS`).
+/// Every left/right block formatter returns exactly this many lines so the
+/// two-column panel is a constant, non-reflowing block for the whole session.
+const PANEL_LINES: usize = 5;
+
+/// The most transfer rows the right column can show at once; a longer list
+/// collapses its tail into a `+N more` line. `PANEL_LINES - 1` because the right
+/// column's top row is left blank to align with the left column's branded rule.
+const MAX_TRANSFER_ROWS: usize = PANEL_LINES - 1;
+
+/// Force `out` to exactly [`PANEL_LINES`] lines: pad short blocks with blank
+/// lines, truncate an over-long one. The panel viewport is a fixed height, so a
+/// block that drifts off `PANEL_LINES` would either leave a ragged gap or push
+/// the rule off the top.
+fn pad_to_panel(out: &mut String) {
+    let n = out.lines().count();
+    match n.cmp(&PANEL_LINES) {
+        std::cmp::Ordering::Less => {
+            for _ in n..PANEL_LINES {
+                out.push('\n');
+            }
+        }
+        std::cmp::Ordering::Greater => {
+            let kept: String = out
+                .lines()
+                .take(PANEL_LINES)
+                .collect::<Vec<_>>()
+                .join("\n");
+            *out = kept;
+        }
+        std::cmp::Ordering::Equal => {}
+    }
+}
 
 /// Width of the bracketed progress bar in [`render_progress_bar`].
 const PROGRESS_BAR_WIDTH: usize = 12;
@@ -179,10 +213,15 @@ fn free_percent(free: &Resources, alloc: &Resources) -> u8 {
 /// cadence cycles smoothly.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Pick a spinner frame from `elapsed`. 100ms per frame, so a 200ms redraw
-/// cadence advances ~2 frames per tick.
+/// Milliseconds per spinner frame. The single source of truth for the animation
+/// cadence: the console's render thread gates its redraw on this same step (so it
+/// repaints exactly when the frame advances) — see `cli::console`'s `FrameClock`.
+pub(crate) const SPINNER_STEP_MS: u128 = 100;
+
+/// Pick a spinner frame from `elapsed`. One frame per [`SPINNER_STEP_MS`], so a
+/// 200ms redraw cadence advances ~2 frames per tick.
 fn spinner_glyph(elapsed: std::time::Duration) -> &'static str {
-    let idx = (elapsed.as_millis() / 100) as usize % SPINNER_FRAMES.len();
+    let idx = (elapsed.as_millis() / SPINNER_STEP_MS) as usize % SPINNER_FRAMES.len();
     SPINNER_FRAMES[idx]
 }
 
@@ -502,13 +541,14 @@ impl RunProgress {
     }
 }
 
-/// The compact live QoS panel pinned beneath nextest's output during the run
-/// (`docs/qos-design.md` §8). Three lines under a top rule: per-tier running
-/// (from live reservation Leases) against the planning total; the committed
-/// reserve and a utilization gauge vs probed free capacity; and the test
-/// pass/fail progress plus wall clock. Reports only what the ledger knows, so the
-/// `n/m` is running / planned, not a queue depth. No bottom rule; the console
-/// ([`crate::cli::console`]) sizes the panel region to the returned line count.
+/// The **left column** during the run phase (`docs/qos-design.md` §8), the
+/// run-phase counterpart of [`render_preflight_panel`]. Exactly [`PANEL_LINES`]
+/// lines under a branded rule: the committed reserve + running count + a
+/// utilization gauge vs probed free capacity; the test pass/fail progress plus
+/// wall clock; and per-tier running (from live reservation Leases) against the
+/// planning total. Reports only what the ledger knows, so the `n/m` is running /
+/// planned, not a queue depth. Blank-padded to the constant height so the panel
+/// does not reflow when the session moves from preflight into the run.
 pub fn render_live_panel(
     snapshot: &LiveSnapshot,
     plan: &QosPlan,
@@ -591,20 +631,24 @@ pub fn render_live_panel(
         .expect("write to string");
     }
 
+    pad_to_panel(&mut out);
     out
 }
 
-/// Compact status panel for the unified bottom console (`cli::console`) during
-/// the preflight, build, and image phases.
+/// The **left column** of the pinned bottom console (`cli::console`) during the
+/// preflight, build, and image phases.
 ///
 /// Where [`render`] is the tall multi-section banner (now used only for the
-/// non-TTY CI log), this is the few-line summary pinned at the bottom while
-/// `cargo nextest list` and `docker build` output scrolls above into native
-/// scrollback. It is the preflight counterpart of [`render_live_panel`] (the
-/// run-phase panel), so the two share one visual language across the session.
+/// non-TTY CI log), this is the fixed-height left block pinned at the bottom
+/// while `cargo nextest list` / `docker build` output scrolls above into native
+/// scrollback and the right column ([`render_transfers`]) tracks background
+/// acquisitions. It is the preflight counterpart of [`render_live_panel`] (the
+/// run-phase left block), so the two share one visual language across the
+/// session and — crucially — the same constant [`PANEL_LINES`] height, so the
+/// panel never reflows between phases.
 ///
-/// Three rows: a top rule, a cluster line, and a build/archives/scheduling line.
-/// No bottom rule; the console sizes its panel region to the returned line count.
+/// Exactly [`PANEL_LINES`] lines: a branded rule, then cluster, capacity,
+/// inventory, and scheduling lines (blank-padded when a section has no data).
 /// `elapsed` drives the spinner heartbeat; `phase` is the right-aligned action
 /// label (`Preflight`, `Building`).
 pub fn render_preflight_panel(
@@ -613,17 +657,17 @@ pub fn render_preflight_panel(
     elapsed: std::time::Duration,
     theme: &Theme,
 ) -> String {
-    let mut out = String::with_capacity(256);
+    let mut out = String::with_capacity(320);
     let dot = theme.chars.dot.style(theme.styles.dim);
     let spin = spinner_glyph(elapsed);
+    let c = &state.cluster;
 
     render_label_rule(&mut out, theme);
 
-    // Cluster line: context, ready nodes, slot usage.
-    let c = &state.cluster;
+    // Line 1 — cluster: phase label + context, ready nodes, slot usage.
     writeln!(
         out,
-        "{:>width$} {} {} {dot} {} ready {dot} {} / {} slots",
+        "{:>width$} {} {} {dot} {} ready {dot} {}/{} slots",
         phase.style(theme.styles.pass),
         spin.style(theme.styles.count),
         c.context,
@@ -634,42 +678,207 @@ pub fn render_preflight_panel(
     )
     .expect("write to string");
 
-    // Build · archives · scheduling line.
-    let build = match &state.build {
-        BuildState::Pending => "inventory queued".to_string(),
-        BuildState::Compiling { started_at } => {
-            format!("compiling {}", format_elapsed(started_at.elapsed()))
-        }
-        BuildState::Indexing { started_at } => {
-            format!("indexing {}", format_elapsed(started_at.elapsed()))
-        }
+    // Line 2 — capacity gauge (free headroom, tighter of cpu/mem). Its own label
+    // (rather than a wide indent) and compact units keep the line inside the left
+    // column so it isn't clipped.
+    let alloc = c.capacity.allocatable;
+    let free = c.capacity.free();
+    let pct = free_percent(&free, &alloc);
+    let bar = render_progress_bar(pct, theme);
+    writeln!(
+        out,
+        "{:>width$} {bar} {} {dot} {}/{}c {dot} {}/{}Gi free",
+        "capacity".style(theme.styles.dim),
+        format_args!("{pct}%").style(theme.styles.count),
+        cores_of(&free).style(theme.styles.count),
+        cores_of(&alloc).style(theme.styles.count),
+        gib_of(&free).style(theme.styles.count),
+        gib_of(&alloc).style(theme.styles.count),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+
+    // Line 3 — inventory / build state.
+    let (build_marker, build_style, build_text) = match &state.build {
+        BuildState::Pending => (theme.chars.dot, theme.styles.dim, "queued".to_string()),
+        BuildState::Compiling { started_at } => (
+            spin,
+            theme.styles.count,
+            format!("compiling test binaries… {dot} {}", format_elapsed(started_at.elapsed())),
+        ),
+        BuildState::Indexing { started_at } => (
+            spin,
+            theme.styles.count,
+            format!("indexing test selection… {dot} {}", format_elapsed(started_at.elapsed())),
+        ),
         BuildState::Ok {
             test_count,
             binary_count,
-            ..
-        } => format!("{test_count} tests / {binary_count} bins"),
-        BuildState::Failed { .. } => "build failed".to_string(),
+            elapsed,
+        } => (
+            theme.chars.ok,
+            theme.styles.pass,
+            format!("{test_count} tests / {binary_count} bins {dot} {}", format_elapsed(*elapsed)),
+        ),
+        BuildState::Failed { exit_code, .. } => (
+            theme.chars.warn,
+            theme.styles.fail,
+            format!("build failed (exit {exit_code})"),
+        ),
     };
-    let cached = state
-        .archives
-        .iter()
-        .filter(|a| matches!(a.status, ArchiveStatus::Cached { .. }))
-        .count();
-    write!(
+    writeln!(
         out,
-        "{INDENT}{} {dot} {} / {} archives",
-        build.style(theme.styles.count),
-        cached.style(theme.styles.count),
-        state.archives.len().style(theme.styles.count),
+        "{:>width$} {} {build_text}",
+        "Inventory".style(theme.styles.pass),
+        build_marker.style(build_style),
+        width = LABEL_WIDTH,
     )
     .expect("write to string");
+
+    // Line 4 — scheduling summary (blank when no QoS plan yet).
     if let Some(plan) = &state.qos_plan {
-        write!(out, " {dot} {} waves", plan.waves.style(theme.styles.count),)
-            .expect("write to string");
+        let total_tests: u32 = plan.tiers.iter().map(|t| t.count).sum();
+        match plan.free {
+            Some(_) => writeln!(
+                out,
+                "{:>width$} {} tests {dot} {} waves {dot} peak {}",
+                "Scheduling".style(theme.styles.pass),
+                total_tests.style(theme.styles.count),
+                plan.waves.style(theme.styles.count),
+                agg_str(&plan.peak).style(theme.styles.count),
+                width = LABEL_WIDTH,
+            ),
+            None => writeln!(
+                out,
+                "{:>width$} {} tests {dot} capacity unknown",
+                "Scheduling".style(theme.styles.pass),
+                total_tests.style(theme.styles.count),
+                width = LABEL_WIDTH,
+            ),
+        }
+        .expect("write to string");
     }
+
+    pad_to_panel(&mut out);
+    out
+}
+
+/// The **right column** of the pinned bottom console: the live set of background
+/// acquisitions (dev-image build+load, archive/seed downloads) tracked
+/// independently of the scrolling main output. Exactly [`PANEL_LINES`] lines:
+/// the top row is blank (aligning with the left column's branded rule), then up
+/// to [`MAX_TRANSFER_ROWS`] transfer rows, the tail collapsing into a `+N more`
+/// line. Blank-padded when idle so the panel height is constant across phases.
+///
+/// `elapsed` drives each active row's spinner (the "still moving" heartbeat).
+pub fn render_transfers(
+    transfers: &Transfers,
+    elapsed: std::time::Duration,
+    theme: &Theme,
+) -> String {
+    let mut out = String::with_capacity(320);
+    // Top row blank: aligns the first transfer with the left column's cluster
+    // line, leaving the branded rule to stand alone on its row.
     out.push('\n');
 
+    let rows = &transfers.rows;
+    let show = rows.len().min(MAX_TRANSFER_ROWS);
+    // Reserve the last slot for `+N more` when the list overflows.
+    let (visible, overflow) = if rows.len() > MAX_TRANSFER_ROWS {
+        (MAX_TRANSFER_ROWS - 1, rows.len() - (MAX_TRANSFER_ROWS - 1))
+    } else {
+        (show, 0)
+    };
+
+    let name_col = column_width(
+        rows.iter().take(visible).map(|r| r.label.as_str()),
+        12,
+        18,
+    );
+    let dot = theme.chars.dot.style(theme.styles.dim);
+    for row in rows.iter().take(visible) {
+        write_transfer_row(&mut out, row, name_col, elapsed, &dot, theme);
+    }
+    if overflow > 0 {
+        writeln!(
+            out,
+            "{} more transferring",
+            format_args!("+{overflow}").style(theme.styles.dim),
+        )
+        .expect("write to string");
+    }
+
+    pad_to_panel(&mut out);
     out
+}
+
+/// One right-column transfer line: an animated marker, the label, and either a
+/// `%` bar (when bytes are known) or the sub-phase note.
+fn write_transfer_row(
+    out: &mut String,
+    row: &TransferRow,
+    name_col: usize,
+    elapsed: std::time::Duration,
+    dot: &impl std::fmt::Display,
+    theme: &Theme,
+) {
+    // Direction glyph (⇡ upload / ⇣ download) conveys the kind; the spinner sits
+    // beside it as the "still moving" heartbeat for rows without a byte bar.
+    let glyph = transfer_glyph(row.kind, theme);
+    match &row.progress {
+        TransferProgress::Active { note, bytes } => {
+            let marker = spinner_glyph(elapsed);
+            write!(
+                out,
+                "{}{} {:<name_col$} {dot} ",
+                glyph.style(theme.styles.dim),
+                marker.style(theme.styles.count),
+                row.label,
+            )
+            .expect("write to string");
+            match bytes {
+                Some((done, total)) => {
+                    let percent = if *total == 0 {
+                        0
+                    } else {
+                        ((*done as u128 * 100) / *total as u128).min(100) as u8
+                    };
+                    let bar = render_progress_bar(percent, theme);
+                    writeln!(
+                        out,
+                        "{bar} {} {dot} {} / {}",
+                        format_args!("{percent}%").style(theme.styles.count),
+                        ByteSize::b(*done).display().iec().style(theme.styles.count),
+                        ByteSize::b(*total).display().iec().style(theme.styles.count),
+                    )
+                    .expect("write to string");
+                }
+                None => {
+                    writeln!(out, "{}", note.style(theme.styles.count)).expect("write to string");
+                }
+            }
+        }
+        TransferProgress::Failed { detail } => {
+            writeln!(
+                out,
+                "{}{} {:<name_col$} {dot} {}",
+                glyph.style(theme.styles.dim),
+                theme.chars.warn.style(theme.styles.fail),
+                row.label,
+                detail.style(theme.styles.dim),
+            )
+            .expect("write to string");
+        }
+    }
+}
+
+/// The direction glyph for a transfer kind: `⇡` for an outgoing dev-image
+/// build+load, `⇣` for an incoming archive/seed download.
+fn transfer_glyph(kind: TransferKind, theme: &Theme) -> &'static str {
+    match kind {
+        TransferKind::Image => theme.chars.up,
+        TransferKind::Download | TransferKind::Seed => theme.chars.progress,
+    }
 }
 
 /// The pinned panel shown while a Ctrl-C is being honoured. Rendered by the
@@ -906,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_panel_is_three_lines_and_summarizes_phase() {
+    fn preflight_panel_is_constant_height_and_summarizes_phase() {
         let mut state = sample_state();
         state.qos_plan = Some(crate::qos::schedule::plan(
             &std::collections::BTreeMap::from([(QosClass::Basic, 6)]),
@@ -918,18 +1127,91 @@ mod tests {
             std::time::Duration::from_secs(3),
             &plain_unicode_theme(),
         );
-        // Top rule + cluster line + build/archives/scheduling line, no bottom
-        // rule, so the only separator is at the top.
-        assert_eq!(s.lines().count(), 3, "fixed 3-row panel:\n{s}");
+        // Constant-height left column: branded rule + cluster + capacity +
+        // inventory + scheduling = PANEL_LINES rows, no bottom rule.
+        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
         assert!(
             !s.trim_end().ends_with("────────────"),
             "no bottom rule:\n{s}"
         );
         assert!(s.contains("Preflight"), "phase label:\n{s}");
         assert!(s.contains("kind-zaino-local"), "cluster context:\n{s}");
+        assert!(s.contains("capacity"), "capacity gauge:\n{s}");
         assert!(s.contains("47 tests / 8 bins"), "build summary:\n{s}");
-        assert!(s.contains("2 / 4 archives"), "archives cached/total:\n{s}");
         assert!(s.contains("waves"), "scheduling summary:\n{s}");
+    }
+
+    #[test]
+    fn preflight_panel_is_constant_height_even_when_empty() {
+        // Before any probe/build lands, the panel must still be exactly
+        // PANEL_LINES so the viewport never reflows between phases.
+        let mut state = sample_state();
+        state.build = BuildState::Pending;
+        state.qos_plan = None;
+        let s = render_preflight_panel(
+            &state,
+            "Preflight",
+            std::time::Duration::ZERO,
+            &plain_unicode_theme(),
+        );
+        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
+    }
+
+    #[test]
+    fn transfers_column_is_constant_height_and_shows_rows() {
+        let theme = plain_unicode_theme();
+        // Idle: still exactly PANEL_LINES (blank rows), so the column reserves its
+        // space even with nothing in flight.
+        let idle = render_transfers(&Transfers::default(), std::time::Duration::ZERO, &theme);
+        assert_eq!(idle.lines().count(), PANEL_LINES, "idle height:\n{idle}");
+
+        let transfers = Transfers {
+            rows: vec![
+                TransferRow {
+                    label: "dev-zainod".to_string(),
+                    kind: TransferKind::Image,
+                    progress: TransferProgress::Active {
+                        note: "building".to_string(),
+                        bytes: None,
+                    },
+                },
+                TransferRow {
+                    label: "testnet-3.1m".to_string(),
+                    kind: TransferKind::Download,
+                    progress: TransferProgress::Active {
+                        note: "downloading".to_string(),
+                        bytes: Some((17_900_000_000, 28_000_000_000)),
+                    },
+                },
+            ],
+        };
+        let s = render_transfers(&transfers, std::time::Duration::from_secs(1), &theme);
+        assert_eq!(s.lines().count(), PANEL_LINES, "active height:\n{s}");
+        assert!(s.contains("dev-zainod"), "image row:\n{s}");
+        assert!(s.contains("building"), "image note:\n{s}");
+        assert!(s.contains("testnet-3.1m"), "download row:\n{s}");
+        assert!(s.contains('%'), "byte bar percent:\n{s}");
+        // Upload vs download direction glyphs.
+        assert!(s.contains(theme.chars.up), "upload glyph:\n{s}");
+        assert!(s.contains(theme.chars.progress), "download glyph:\n{s}");
+    }
+
+    #[test]
+    fn transfers_column_collapses_overflow_tail() {
+        let theme = plain_unicode_theme();
+        let rows: Vec<TransferRow> = (0..8)
+            .map(|i| TransferRow {
+                label: format!("dev-img{i}"),
+                kind: TransferKind::Image,
+                progress: TransferProgress::Active {
+                    note: "building".to_string(),
+                    bytes: None,
+                },
+            })
+            .collect();
+        let s = render_transfers(&Transfers { rows }, std::time::Duration::ZERO, &theme);
+        assert_eq!(s.lines().count(), PANEL_LINES, "overflow height:\n{s}");
+        assert!(s.contains("more transferring"), "overflow marker:\n{s}");
     }
 
     /// Theme with no colours and Unicode glyphs: what `Theme::detect()` returns

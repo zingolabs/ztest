@@ -10,6 +10,8 @@
 //!    (zingolib, etc.) lives in the consumer crate, so no wallet-library types
 //!    enter ztest.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 
 use crate::topology::ActivationHeights;
@@ -18,6 +20,8 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::RpcError;
 use crate::handles::HandleInner;
+use crate::handles::indexer::IndexerBackend;
+use crate::handles::validator::ValidatorBackend;
 use crate::topology::NetworkUpgrade;
 
 /// Boxed error reported by a [`WalletBackend`] method. Third-party backends
@@ -194,4 +198,188 @@ impl<W: WalletBackend> Account<W> {
             .await
             .map_err(|e| RpcError::backend_boxed(self.label, "shield", e))
     }
+}
+
+// ─────────────────────────── convenience layer ────────────────────────────
+
+/// BIP-39 mnemonic for the regtest faucet — the wallet the validator mines to.
+/// Each validator's miner address is derived from this seed, so a faucet built
+/// from it receives the coinbase after a sync. The well-known "abandon … art"
+/// test seed.
+pub const FAUCET_SEED: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon abandon abandon art";
+
+/// A second well-known test seed, distinct from the faucet — the recipient side
+/// of a transfer test.
+pub const RECIPIENT_SEED: &str = "hospital museum valve antique skate museum \
+     unfold vocal weird milk scale social vessel identify \
+     crowd hospital control album rib bulb path oven civil tank";
+
+/// Birthday for the well-known regtest test wallets. Height 1 is Sapling
+/// activation under the standard regtest fixture, so the wallet's commitment
+/// trees are valid from its first scanned block.
+const TEST_WALLET_BIRTHDAY: u32 = 1;
+
+/// How long [`WalletExt::funded_faucet`] waits for the indexer to surface the
+/// freshly mined coinbase blocks that fund the faucet.
+const FAUCET_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Regtest coinbase maturity: a transparent coinbase is spendable this many
+/// blocks after it is mined. A transparent-coinbase faucet must mine this many
+/// extra blocks before shielding; a shielded coinbase is spendable immediately.
+const COINBASE_MATURITY: u32 = 100;
+
+/// Longer confirm timeout for the transparent-maturity path (~100 extra blocks).
+const FAUCET_MATURITY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Backend-agnostic wallet conveniences, built purely on [`WalletBackend`]
+/// primitives (`add_account` / `sync` / `send` / `shield` / `balances`) plus the
+/// running validator and indexer: the well-known seeds, a synced recipient, and
+/// a funded faucet. Auto-implemented for every wallet backend, so a test drives
+/// any backend through the same API.
+#[async_trait]
+pub trait WalletExt: WalletBackend {
+    /// Build an account from `mnemonic`: derive activation heights from
+    /// `validator` (the single source of truth) and point the wallet at
+    /// `indexer`'s gRPC endpoint.
+    async fn account<V, I>(
+        &self,
+        validator: &V,
+        indexer: &I,
+        mnemonic: &str,
+        birthday: BlockHeight,
+    ) -> Result<Account<Self>, RpcError>
+    where
+        V: ValidatorBackend + ?Sized,
+        I: IndexerBackend + ?Sized,
+    {
+        let activation = validator.activation_heights().await?;
+        let indexer_uri = indexer.grpc_uri().await?;
+        let id = self
+            .add_account(AccountSpec {
+                mnemonic,
+                birthday,
+                indexer_uri: &indexer_uri,
+                activation: &activation,
+            })
+            .await
+            .map_err(|e| RpcError::backend_boxed(self.label(), "add_account", e))?;
+        Ok(Account::new(self.clone(), id, self.label()))
+    }
+
+    /// The regtest faucet account (built from [`FAUCET_SEED`]), whose address
+    /// the validator mines to. Sync it after mining to pick up the coinbase.
+    async fn faucet<V, I>(&self, validator: &V, indexer: &I) -> Result<Account<Self>, RpcError>
+    where
+        V: ValidatorBackend + ?Sized,
+        I: IndexerBackend + ?Sized,
+    {
+        self.account(validator, indexer, FAUCET_SEED, BlockHeight::from(TEST_WALLET_BIRTHDAY))
+            .await
+    }
+
+    /// A fresh recipient account built from [`RECIPIENT_SEED`].
+    async fn recipient<V, I>(&self, validator: &V, indexer: &I) -> Result<Account<Self>, RpcError>
+    where
+        V: ValidatorBackend + ?Sized,
+        I: IndexerBackend + ?Sized,
+    {
+        self.account(validator, indexer, RECIPIENT_SEED, BlockHeight::from(TEST_WALLET_BIRTHDAY))
+            .await
+    }
+
+    /// A faucet synced and holding one spendable shielded note.
+    async fn funded_faucet<V, I>(&self, validator: &V, indexer: &I) -> Result<Account<Self>, RpcError>
+    where
+        V: ValidatorBackend + ?Sized,
+        I: IndexerBackend + ?Sized,
+    {
+        self.funded_faucet_with_notes(validator, indexer, 1).await
+    }
+
+    /// A synced faucet holding at least `notes` independent spendable shielded
+    /// notes, funded from the validator's coinbase. Shielded coinbase
+    /// (zcashd/Sapling, or zebrad via `mine_to`) is spendable immediately, one
+    /// note per block. Transparent coinbase (zebrad default) is matured then
+    /// shielded into Orchard, once per requested note.
+    async fn funded_faucet_with_notes<V, I>(
+        &self,
+        validator: &V,
+        indexer: &I,
+        notes: u32,
+    ) -> Result<Account<Self>, RpcError>
+    where
+        V: ValidatorBackend + ?Sized,
+        I: IndexerBackend + ?Sized,
+    {
+        let faucet = self.faucet(validator, indexer).await?;
+        match validator.pool_support().coinbase {
+            Pool::Orchard | Pool::Sapling => {
+                mine_and_sync(validator, indexer, &faucet, notes, FAUCET_CONFIRM_TIMEOUT).await?;
+            }
+            Pool::Transparent => {
+                fund_via_shield(validator, indexer, &faucet, notes.max(1)).await?;
+            }
+        }
+        Ok(faucet)
+    }
+}
+
+impl<W: WalletBackend> WalletExt for W {}
+
+/// Mine `n` blocks, wait for the indexer to surface the new tip, then sync
+/// `faucet`. No-op when `n == 0`.
+async fn mine_and_sync<W, V, I>(
+    validator: &V,
+    indexer: &I,
+    faucet: &Account<W>,
+    n: u32,
+    timeout: Duration,
+) -> Result<(), RpcError>
+where
+    W: WalletBackend,
+    V: ValidatorBackend + ?Sized,
+    I: IndexerBackend + ?Sized,
+{
+    if n == 0 {
+        return Ok(());
+    }
+    let pre = validator.chain_height().await?;
+    validator.generate_blocks(n).await?;
+    indexer.wait_for_block_num(pre + n, timeout).await?;
+    faucet.sync().await?;
+    Ok(())
+}
+
+/// Fund `faucet` from a transparent coinbase: mature it, then shield into
+/// Orchard `notes` times for `notes` independent Orchard notes. A fresh
+/// maturity batch is mined before each shield so each note is independent.
+async fn fund_via_shield<W, V, I>(
+    validator: &V,
+    indexer: &I,
+    faucet: &Account<W>,
+    notes: u32,
+) -> Result<(), RpcError>
+where
+    W: WalletBackend,
+    V: ValidatorBackend + ?Sized,
+    I: IndexerBackend + ?Sized,
+{
+    for i in 0..notes {
+        let blocks = if i == 0 {
+            let height = u32::from(validator.chain_height().await?);
+            (COINBASE_MATURITY + 1).saturating_sub(height)
+        } else {
+            COINBASE_MATURITY
+        };
+        if blocks == 0 {
+            faucet.sync().await?;
+        } else {
+            mine_and_sync(validator, indexer, faucet, blocks, FAUCET_MATURITY_TIMEOUT).await?;
+        }
+        faucet.shield().await?;
+    }
+    mine_and_sync(validator, indexer, faucet, 1, FAUCET_CONFIRM_TIMEOUT).await?;
+    Ok(())
 }

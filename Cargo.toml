@@ -74,8 +74,12 @@ tonic-prost = "0.14"
 zingolib = { git = "https://github.com/zingolabs/zingolib.git", rev = "61418d6ecbc679a88da8268a2be5db3926501fc6", features = [
     "testutils",
 ], optional = true }
-zingolib_testutils = { git = "https://github.com/zingolabs/zingolib.git", rev = "61418d6ecbc679a88da8268a2be5db3926501fc6", optional = true }
 pepper-sync = { git = "https://github.com/zingolabs/zingolib.git", rev = "61418d6ecbc679a88da8268a2be5db3926501fc6", optional = true }
+# BIP-39 mnemonic type for `WalletBase::Mnemonic`, used by the inlined
+# `backends::zingo::client_builder` (replaces the one thing ztest used from
+# `zingolib_testutils`). Version MUST match zingolib rev 61418d6e's `bip0039`
+# pin so the `Mnemonic` type unifies into one copy.
+bip0039 = { version = "0.13", optional = true }
 zingo_test_vectors = { git = "https://github.com/zingolabs/infrastructure.git", tag = "zcash_local_net_v0.6.0", optional = true }
 # Only the `zingo` backend needs zebra-chain (zingolib's ConfiguredActivationHeights
 # param type); ztest core no longer links it. Pinned to 9.0.0 to match zingolib
@@ -84,6 +88,24 @@ zebra-chain = { version = "9.0.0", optional = true }
 # zingo-only (the in-process wallet backend); gated on the `zingo` feature.
 zip32 = { version = "0.2.1", optional = true }
 tempfile = { version = "3.2", optional = true }
+
+# librustzcash wallet backend (`backends::librustzcash`); gated on the
+# `librustzcash` feature. Pure-Rust zcash_client_backend reference stack; no
+# zebra / zcash_local_net / libstdc++. `sync` pulls the lightwalletd-tonic gRPC
+# client; `bundled-prover` compiles the Sapling params into the binary so
+# send/shield need no external files.
+zcash_client_backend = { version = "0.23", features = ["sync", "orchard", "transparent-inputs"], optional = true }
+# orchard + transparent-inputs MUST match the backend's features, else sqlite's
+# cfg-gated Orchard/EphemeralTransparent handling is compiled out and its
+# `Recipient`/`Note` matches go non-exhaustive against the backend enums.
+zcash_client_sqlite = { version = "0.21", features = ["orchard", "transparent-inputs"], optional = true }
+zcash_keys = { version = "0.14", features = ["sapling", "orchard"], optional = true }
+zcash_proofs = { version = "0.28", features = ["bundled-prover"], optional = true }
+zcash_primitives = { version = "0.28", optional = true }
+secrecy = { version = "0.8", optional = true }
+# Named to spell the `WalletDb<rusqlite::Connection, ..>` connection type;
+# version tracks zcash_client_sqlite 0.21.1's resolved rusqlite.
+rusqlite = { version = "0.37", optional = true }
 # Used by the generated proto client (`http::uri::PathAndQuery`).
 http = "1.1"
 
@@ -119,20 +141,50 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 nextest-metadata = "0.14"
 
 [features]
-default = []
+default = ["librustzcash"]
+# GUARD, not a feature to enable. ztest's console REQUIRES native terminal
+# scrollback, which ratatui's `insert_before` provides ONLY while its
+# `scrolling-regions` feature is OFF (with it on, `insert_before` scrolls through
+# a DECSTBM margin region most emulators exclude from scrollback — silently
+# breaking the core mechanism). Forwarding the feature here exists solely so that
+# enabling it anywhere trips the `compile_error!` in `src/cli/console/mod.rs`
+# instead of regressing at runtime. Leave it off.
+scrolling-regions = ["ratatui/scrolling-regions"]
+# In-process librustzcash wallet backend (`backends::librustzcash`,
+# `Wallet::librustzcash`) — ztest's default, batteries-included wallet. A
+# pure-Rust `zcash_client_backend` + `zcash_client_sqlite` wallet that syncs
+# over the indexer's lightwalletd gRPC and builds shielded txs with bundled
+# Sapling params (`zcash_proofs/bundled-prover`) + embedded Orchard params, so
+# it needs no external param files, no zingolib, no zcash_local_net, no zebra,
+# and no `libstdc++`. Unlike the eager-memo-parsing zingolib sync engine, its
+# scanner stores raw memo bytes, so it tolerates non-UTF-8 coinbase memos.
+# Walletless consumers can drop it with `default-features = false`.
+librustzcash = [
+    "dep:zcash_client_backend",
+    "dep:zcash_client_sqlite",
+    "dep:zcash_keys",
+    "dep:zcash_proofs",
+    "dep:zcash_primitives",
+    "dep:secrecy",
+    "dep:rusqlite",
+    "dep:zip32",
+    "dep:tempfile",
+    "dep:bip0039",
+]
 # In-process zingolib wallet backend (`backends::zingo`, `Wallet::zingo`).
 # OFF by default so consumers that only drive validators/indexers (e.g. zaino's
-# walletless-tests) don't link zingolib — and, transitively, zingolib_testutils
-# → zcash_local_net → the old zebra crates. Enable it in suites that exercise an
-# in-process wallet (e.g. zaino's wallet-tests).
+# walletless-tests) don't link zingolib. The backend links `zingolib` proper
+# only — NOT `zingolib_testutils`, whose sole use here (`ClientBuilder`) is
+# inlined in `backends::zingo::client_builder`, keeping `zcash_local_net` /
+# `zebra-consensus` / the C++ `libzcash_script` out of the graph entirely.
 zingo = [
     "dep:zingolib",
-    "dep:zingolib_testutils",
     "dep:pepper-sync",
     "dep:zingo_test_vectors",
     "dep:zebra-chain",
     "dep:zip32",
     "dep:tempfile",
+    "dep:bip0039",
 ]
 
 [dev-dependencies]

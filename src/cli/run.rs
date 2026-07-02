@@ -50,8 +50,11 @@ fn exit(code: i32) -> ExitCode {
 /// Exit code for a Ctrl-C-interrupted run: the shell convention `128 + SIGINT`.
 const CANCELLED: i32 = 130;
 use crate::preflight::{
-    self, ArchiveRow, ArchiveStatus, BannerState, ClusterState, SnapshotRow, Theme,
+    self, ArchiveRow, ArchiveStatus, BannerState, ClusterState, SnapshotRow, Theme, TransferKind,
+    TransferProgress, TransferRow, Transfers,
 };
+use crate::provisioning::NodeId;
+use crate::resource::NodeState;
 
 /// `ztest run` arguments.
 #[derive(Debug, Parser)]
@@ -363,7 +366,7 @@ pub fn execute(args: Args) -> ExitCode {
         (None, None)
     };
     if let Some(c) = &console {
-        push_preflight_scene(c, &state, "Preflight", &theme);
+        push_preflight_scene(c, &state, &Transfers::default(), "Preflight", &theme);
     }
 
     let code = run_inner(
@@ -490,7 +493,7 @@ fn run_inner(
 
     // Final panel refresh with all phases resolved.
     if let Some(c) = console {
-        push_preflight_scene(c, state, "Preflight", theme);
+        push_preflight_scene(c, state, &Transfers::default(), "Preflight", theme);
     }
 
     // In non-TTY mode print the full resolved banner so CI logs have a record.
@@ -567,16 +570,109 @@ fn run_inner(
 }
 
 /// Push a fresh preflight/build/image panel recipe to the render thread. Called
-/// after every `BannerState` mutation; the closure captures an immutable
-/// snapshot and re-renders it with the render thread's advancing clock so the
-/// spinner animates between updates. `label` is the right-aligned action word
-/// (`Preflight`, `Building`, `Loading`).
-fn push_preflight_scene(con: &Console, state: &BannerState, label: &'static str, theme: &Theme) {
+/// after every `BannerState` / `Transfers` mutation; the closure captures an
+/// immutable snapshot of both columns and re-renders them with the render
+/// thread's advancing clock so spinners animate between updates. `label` is the
+/// left column's right-aligned action word (`Preflight`, `Building`); `transfers`
+/// is the right column's live acquisition set.
+fn push_preflight_scene(
+    con: &Console,
+    state: &BannerState,
+    transfers: &Transfers,
+    label: &'static str,
+    theme: &Theme,
+) {
     let snap = state.clone();
+    let tx = transfers.clone();
     let theme = theme.clone();
     con.scene(move |elapsed| SceneFrame {
-        panel: preflight::render_preflight_panel(&snap, label, elapsed, &theme),
+        left: preflight::render_preflight_panel(&snap, label, elapsed, &theme),
+        right: preflight::render_transfers(&tx, elapsed, &theme),
+        // Live region mirrors the child's own output (cargo compile) via the avt
+        // grid during these phases.
+        live: None,
     });
+}
+
+/// A background-transfer state change destined for the right column. Merges the
+/// resource graph's coarse lifecycle (`on_change`) with each provider's finer
+/// sub-phase notes ([`ProgressSink`](crate::provisioning::ProgressSink)) onto one
+/// channel, so the work side folds both into the [`TransferRegistry`] in order.
+enum TransferEvent {
+    /// A node's lifecycle transition from the graph executor.
+    State(NodeId, NodeState),
+    /// A provider's sub-phase note (`building`, `load→kind`).
+    Note(NodeId, String),
+}
+
+/// The work-side model behind the right column: the in-flight (and failed)
+/// background acquisitions, keyed by resource node. [`snapshot`](Self::snapshot)
+/// renders it into the render-facing [`Transfers`].
+#[derive(Default)]
+struct TransferRegistry {
+    rows: BTreeMap<NodeId, TransferRow>,
+}
+
+impl TransferRegistry {
+    /// Fold one event into the registry: a node starts (Acquiring) as an active
+    /// row, updates its note, drops out on Ready, or is marked failed. Pending /
+    /// Blocked never surface (nothing to show or the dep's own failure is shown).
+    fn apply(&mut self, ev: TransferEvent) {
+        match ev {
+            TransferEvent::State(id, NodeState::Acquiring) => {
+                let (label, kind) = describe_node(&id);
+                self.rows.entry(id).or_insert_with(|| TransferRow {
+                    label,
+                    kind,
+                    progress: TransferProgress::Active {
+                        note: "acquiring".to_string(),
+                        bytes: None,
+                    },
+                });
+            }
+            TransferEvent::State(id, NodeState::Ready) => {
+                self.rows.remove(&id);
+            }
+            TransferEvent::State(id, NodeState::Failed(detail)) => {
+                if let Some(row) = self.rows.get_mut(&id) {
+                    row.progress = TransferProgress::Failed { detail };
+                }
+            }
+            // Pending: not yet started. Blocked: a dependency failed and this node
+            // was never attempted — its dependency's own Failed row is the signal.
+            TransferEvent::State(_, NodeState::Pending | NodeState::Blocked) => {}
+            TransferEvent::Note(id, note) => {
+                if let Some(TransferRow {
+                    progress: TransferProgress::Active { note: n, .. },
+                    ..
+                }) = self.rows.get_mut(&id)
+                {
+                    *n = note;
+                }
+            }
+        }
+    }
+
+    /// An immutable snapshot for the render thread.
+    fn snapshot(&self) -> Transfers {
+        Transfers {
+            rows: self.rows.values().cloned().collect(),
+        }
+    }
+}
+
+/// A short label + kind for a resource node's right-column row. Image tags
+/// (`<repo>:dev-<hash>`) collapse to `dev-<repo-leaf>`; seeds keep their
+/// `seed-<sha8>` id.
+fn describe_node(id: &NodeId) -> (String, TransferKind) {
+    match id {
+        NodeId::Image(tag) => {
+            let repo = tag.split(':').next().unwrap_or(tag);
+            let leaf = repo.rsplit('/').next().unwrap_or(repo);
+            (format!("dev-{leaf}"), TransferKind::Image)
+        }
+        NodeId::Seed(name) => (name.clone(), TransferKind::Seed),
+    }
 }
 
 /// Build the §8 scheduling plan for the preflight banner: fold the per-binary
@@ -695,7 +791,7 @@ fn pipeline_console(
         // (`index`) does the JSON inventory.
         let started_at = Instant::now();
         state.build = BuildState::Compiling { started_at };
-        push_preflight_scene(con, state, "Preflight", theme);
+        push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
 
         let mut args = vec![
             "nextest".to_string(),
@@ -718,7 +814,7 @@ fn pipeline_console(
             state.build = BuildState::Indexing {
                 started_at: Instant::now(),
             };
-            push_preflight_scene(con, state, "Preflight", theme);
+            push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
             drive_draining(
                 pipeline::build::index(list_args),
                 &mut upd_rx,
@@ -754,7 +850,7 @@ fn pipeline_console(
         while let Ok(u) = upd_rx.try_recv() {
             apply_update(state, u);
         }
-        push_preflight_scene(con, state, "Preflight", theme);
+        push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
 
         let probe = probe_handle
             .await
@@ -784,7 +880,7 @@ async fn run_child_draining(
             u = upd_rx.recv(), if upd_open => match u {
                 Some(u) => {
                     apply_update(state, u);
-                    push_preflight_scene(con, state, "Preflight", theme);
+                    push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
                 }
                 None => upd_open = false,
             },
@@ -810,7 +906,7 @@ async fn drive_draining<F: std::future::Future>(
             u = upd_rx.recv(), if upd_open => match u {
                 Some(u) => {
                     apply_update(state, u);
-                    push_preflight_scene(con, state, "Preflight", theme);
+                    push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
                 }
                 None => upd_open = false,
             },
@@ -1023,10 +1119,12 @@ struct ImagePhaseOutcome {
 /// edges and provisioned states the engine uses to gate/skip tests on resource
 /// readiness.
 ///
-/// Provisioning runs through the resource-graph executor with a concurrency cap
-/// of 1: each `docker build` / `kind load` streams through the console PTY (live
-/// BuildKit progress), and the console has a single live region, so builds are
-/// serial. The graph's `probe` skips images already in the cluster's containerd.
+/// On a TTY, provisioning runs concurrently (cap 4): each in-flight `docker
+/// build` / `kind load` / seed materialization is a live row in the console's
+/// right column, and providers capture their output (summary to scrollback)
+/// rather than fighting the single emulator grid. Off a TTY it stays serial
+/// (cap of one) with inherited stdio. The graph's `probe` skips images already
+/// in the cluster's containerd.
 fn run_image_phases(
     work_rt: &tokio::runtime::Runtime,
     binaries: &[pipeline::SelectedBinary],
@@ -1037,7 +1135,6 @@ fn run_image_phases(
 ) -> ImagePhaseOutcome {
     use crate::pipeline::images;
     use crate::provisioning;
-    use crate::resource::NodeState;
     use std::collections::HashMap;
 
     let cancelled = || console.is_some_and(Console::cancelled);
@@ -1070,11 +1167,14 @@ fn run_image_phases(
         };
     }
 
+    // The right-column tracker for this phase's background acquisitions.
+    let mut registry = TransferRegistry::default();
+
     // Commit the compile's final frame to scrollback and blank the live region so
-    // each build/load starts its emulated output on a clean grid.
+    // provisioning's captured summaries land on a clean grid.
     if let Some(c) = console {
         c.flush_live();
-        push_preflight_scene(c, state, "Building", theme);
+        push_preflight_scene(c, state, &registry.snapshot(), "Building", theme);
     }
 
     // Plan the resource graph (images + seeds) and provision it. `probe` skips
@@ -1093,11 +1193,61 @@ fn run_image_phases(
         }
     };
     let client = work_rt.block_on(crate::cluster::client()).ok();
-    let cx = provisioning::Cx {
-        console: console.cloned(),
-        client,
-    };
-    let resource_states = work_rt.block_on(graph.provision(&cx, 1, |_id, _state| {}));
+
+    // Provision concurrently. On a TTY every in-flight build/load is a right-column
+    // transfer row, fed by the graph's lifecycle transitions (`on_change`) merged
+    // with each provider's sub-phase notes onto one `TransferEvent` channel; the
+    // providers CAPTURE their output (a concise summary to scrollback) so N
+    // concurrent children don't fight the single emulator grid. Off a TTY: cap 1 +
+    // inherited stdio, the unchanged CI path. `probe` still skips warm resources.
+    let cap = if console.is_some() { 4 } else { 1 };
+    let resource_states = work_rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TransferEvent>();
+        let progress = console.map(|_| {
+            let tx = tx.clone();
+            provisioning::ProgressSink::new(move |id, note| {
+                let _ = tx.send(TransferEvent::Note(id, note));
+            })
+        });
+        let cx = provisioning::Cx {
+            console: console.cloned(),
+            client,
+            progress,
+        };
+        let on_change = {
+            let tx = tx.clone();
+            move |id: &NodeId, st: &NodeState| {
+                let _ = tx.send(TransferEvent::State(id.clone(), st.clone()));
+            }
+        };
+        // Only the `on_change` + sink clones keep the channel open, so it closes
+        // when provisioning finishes.
+        drop(tx);
+
+        let prov = graph.provision(&cx, cap, on_change);
+        tokio::pin!(prov);
+        loop {
+            tokio::select! {
+                states = &mut prov => {
+                    // Drain any notes queued after the last state transition, then
+                    // paint the final (usually empty) right column.
+                    while let Ok(ev) = rx.try_recv() {
+                        registry.apply(ev);
+                    }
+                    if let Some(c) = console {
+                        push_preflight_scene(c, state, &registry.snapshot(), "Building", theme);
+                    }
+                    break states;
+                }
+                Some(ev) = rx.recv() => {
+                    registry.apply(ev);
+                    if let Some(c) = console {
+                        push_preflight_scene(c, state, &registry.snapshot(), "Building", theme);
+                    }
+                }
+            }
+        }
+    });
 
     // Resolve the dependency edges to their node ids (the same ids the graph
     // provisioned), so the engine can gate each test on the states above. Image

@@ -45,6 +45,51 @@ impl ImageProvider {
         .map_err(|e| e.to_string())?;
         Ok(ImageProvider { entry, tag })
     }
+
+    /// Run one build/load step with its output captured (not streamed through the
+    /// emulator grid), so concurrent steps don't interleave on screen. On failure
+    /// the captured output is flushed to scrollback so the cause stays visible
+    /// above the panel; `kill_on_drop` lets a cancelled provision reap the child.
+    async fn run_captured(
+        &self,
+        cx: &Cx,
+        program: &str,
+        argv: &[String],
+        envs: &[(&str, String)],
+        step: &str,
+    ) -> Result<(), ResourceError> {
+        use tokio::process::Command;
+
+        let mut cmd = Command::new(program);
+        cmd.args(argv)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd
+            .output()
+            .await
+            .map_err(|e| ResourceError::Provision(format!("{step} {}: {e}", self.tag)))?;
+        if !out.status.success() {
+            // Surface the captured output so the failure is diagnosable.
+            if let Some(c) = &cx.console {
+                let mut dump = String::from_utf8_lossy(&out.stdout).into_owned();
+                dump.push_str(&String::from_utf8_lossy(&out.stderr));
+                if !dump.is_empty() {
+                    c.scrollback(dump);
+                }
+            }
+            return Err(ResourceError::Provision(format!(
+                "{step} {} exited {}",
+                self.tag,
+                out.status.code().unwrap_or(-1),
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -72,30 +117,61 @@ impl Provider<NodeId, Cx> for ImageProvider {
     async fn provision(&self, cx: &Cx) -> Result<(), ResourceError> {
         let dockerfile = Path::new(&self.entry.dockerfile);
         let context = Path::new(&self.entry.context);
+        let id = self.id();
 
-        let argv = image::docker_build_argv(dockerfile, context, &self.entry.features, &self.tag);
-        let envs = [("DOCKER_BUILDKIT", "1".to_string())];
-        let code = run_child(cx.console.as_ref(), "docker", &argv, &envs)
-            .await
-            .map_err(|e| ResourceError::Provision(format!("docker build {}: {e}", self.tag)))?;
-        if code != 0 {
-            return Err(ResourceError::Provision(format!(
-                "docker build {} exited {code}",
-                self.tag
-            )));
-        }
+        // Concurrent path (TTY): a progress sink is present, so several builds run
+        // at once. We can't stream them through the single emulator grid, so each
+        // captures its own output and reports sub-phase notes to the right column,
+        // flushing only a one-line summary (or, on failure, the captured tail) to
+        // scrollback. Serial path (no sink / non-TTY): stream through the console
+        // as before, so cargo/BuildKit progress stays live.
+        match &cx.progress {
+            Some(sink) => {
+                sink.note(&id, "building");
+                let argv =
+                    image::docker_build_argv(dockerfile, context, &self.entry.features, &self.tag);
+                let envs = [("DOCKER_BUILDKIT", "1".to_string())];
+                self.run_captured(cx, "docker", &argv, &envs, "docker build")
+                    .await?;
 
-        let argv = image::kind_load_argv(&self.tag);
-        let code = run_child(cx.console.as_ref(), "kind", &argv, &[])
-            .await
-            .map_err(|e| ResourceError::Provision(format!("kind load {}: {e}", self.tag)))?;
-        if code != 0 {
-            return Err(ResourceError::Provision(format!(
-                "kind load {} exited {code}",
-                self.tag
-            )));
+                sink.note(&id, "load→kind");
+                let argv = image::kind_load_argv(&self.tag);
+                self.run_captured(cx, "kind", &argv, &[], "kind load").await?;
+
+                if let Some(c) = &cx.console {
+                    c.scrollback(format!("       built + loaded {}\n", self.tag));
+                }
+                Ok(())
+            }
+            None => {
+                let argv =
+                    image::docker_build_argv(dockerfile, context, &self.entry.features, &self.tag);
+                let envs = [("DOCKER_BUILDKIT", "1".to_string())];
+                let code = run_child(cx.console.as_ref(), "docker", &argv, &envs)
+                    .await
+                    .map_err(|e| {
+                        ResourceError::Provision(format!("docker build {}: {e}", self.tag))
+                    })?;
+                if code != 0 {
+                    return Err(ResourceError::Provision(format!(
+                        "docker build {} exited {code}",
+                        self.tag
+                    )));
+                }
+
+                let argv = image::kind_load_argv(&self.tag);
+                let code = run_child(cx.console.as_ref(), "kind", &argv, &[])
+                    .await
+                    .map_err(|e| ResourceError::Provision(format!("kind load {}: {e}", self.tag)))?;
+                if code != 0 {
+                    return Err(ResourceError::Provision(format!(
+                        "kind load {} exited {code}",
+                        self.tag
+                    )));
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     async fn teardown(&self, _cx: &Cx) -> Result<(), ResourceError> {

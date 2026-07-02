@@ -29,7 +29,9 @@ mod theme;
 
 pub use self::render::{
     RunProgress, render, render_cancel_panel, render_live_panel, render_preflight_panel,
+    render_transfers,
 };
+pub(crate) use self::render::SPINNER_STEP_MS;
 pub use self::theme::Theme;
 pub use crate::qos::schedule::{QosPlan, TierPlan};
 
@@ -187,4 +189,63 @@ pub enum SnapshotStatus {
 #[derive(Debug, Clone)]
 pub struct FutureRow {
     pub label: &'static str,
+}
+
+// ─────────────────────────── transfers (right column) ─────────────────
+
+/// The right-column model: the set of heavy background acquisitions currently in
+/// flight (archive/seed downloads, dev-image build+load). Session-long and
+/// phase-independent — a transfer that starts during preflight can still be
+/// finishing while the left column has moved on to the build or run phase. Fed by
+/// the resource-graph executor's state transitions plus per-provider progress
+/// notes; rendered by [`render_transfers`](render::render_transfers).
+///
+/// Only *in-flight* and *failed* rows are retained: a completed transfer leaves
+/// the column (its result is a one-line summary in scrollback), so the column
+/// always reflects live work.
+#[derive(Debug, Clone, Default)]
+pub struct Transfers {
+    pub rows: Vec<TransferRow>,
+}
+
+impl Transfers {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+/// One background acquisition shown in the right column.
+#[derive(Debug, Clone)]
+pub struct TransferRow {
+    /// Short human label, e.g. `dev-zainod` or `testnet-3.1m`.
+    pub label: String,
+    /// What kind of transfer, for the direction glyph.
+    pub kind: TransferKind,
+    /// Live progress.
+    pub progress: TransferProgress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferKind {
+    /// Bytes coming down (archive/seed materialization).
+    Download,
+    /// A dev image being built and loaded into the cluster.
+    Image,
+    /// A data seed PVC being provisioned.
+    Seed,
+}
+
+/// Live state of a [`TransferRow`].
+#[derive(Debug, Clone)]
+pub enum TransferProgress {
+    /// In flight. `note` is the current sub-phase (`building`, `load→kind`,
+    /// `provisioning`); `bytes` is `Some((done, total))` when a byte count is
+    /// known (a real `%` bar), else `None` (spinner + note only).
+    Active {
+        note: String,
+        bytes: Option<(u64, u64)>,
+    },
+    /// Provisioning failed; kept in the column (with a warn marker) so the
+    /// failure is visible until the phase ends. Detail also goes to scrollback.
+    Failed { detail: String },
 }

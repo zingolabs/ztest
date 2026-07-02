@@ -58,11 +58,18 @@ The render thread is **domain-agnostic** — it knows nothing of `BannerState`,
 type SceneFn = Box<dyn Fn(Duration) -> SceneFrame + Send>;
 
 struct SceneFrame {
-    live: Live,      // Child  => use the emulated PTY grid
-                     // Lines  => explicit ANSI lines (the engine run phase)
-    panel: String,   // the pinned bottom panel, as an ANSI string
+    left: String,          // pinned bottom panel, left column (phase status)
+    right: String,         // pinned bottom panel, right column (transfer tracker)
+    live: Option<String>,  // None => paint the emulated PTY grid (compile/build);
+                           // Some => explicit ANSI lines (the engine run phase)
 }
 ```
+
+The panel is two side-by-side columns (each a constant `PANEL_ROWS` lines); the
+render thread splits the viewport into a live region above and the two-column
+panel below. `live: None` is the default — the live region mirrors the child's
+`avt` grid — and the run phase sets `Some(running-tests block)` because no child
+PTY feeds the grid then.
 
 A `Scene` is an **immutable, self-contained recipe for rendering the current
 data at any instant.** Whenever domain state changes, the work side mutates its
@@ -100,7 +107,7 @@ enum Msg {
     Output(Vec<u8>),      // raw PTY bytes from the current child → fed to avt
     Scrollback(String),   // pre-formatted completed lines (engine verdicts), ANSI
     FlushLive,            // commit the avt grid to scrollback, reset it (between children)
-    ChildStarted(Option<i32>), // foreground pgid, so the render thread forwards Ctrl-C
+    ChildStarted(Option<i32>), // child's pgid (== its pid; setsid'd), for Ctrl-C forwarding
     ChildExited,
     Shutdown,
 }
@@ -120,11 +127,27 @@ sends `Shutdown` and tears the viewport down).
    until PTY EOF, then exits) *before* the caller sends `FlushLive`. The join is
    the happens-before that puts all output ahead of the flush.
 
+   *Tail risk (known):* the reader sees EOF only when **all** slave fds close, so
+   a grandchild that outlives its parent while holding the PTY slave (a stray
+   daemon fork) would keep the reader blocked in `read()` and the join would hang
+   the phase. In practice the tools we run (cargo/rustc, docker/kind CLIs) don't
+   leave the slave open past exit, so this hasn't bitten — but it's a real edge if
+   that ever changes.
+
 1. **Liveness no longer needs "draining."** Because the render thread ticks
    independently, a plain `block_on(future)` on the work side keeps the panel
    live. The only reason a phase runs a future *concurrently with an update
    drain* is to fold concurrent **data** updates (the probe landing during the
    compile) into fresh scenes — a data concern, not a liveness one.
+
+1. **Native scrollback depends on `scrolling-regions` staying OFF.** Completed
+   lines reach the terminal's real scrollback via `ratatui`'s `insert_before`,
+   which only forwards to native scrollback while its `scrolling-regions` feature
+   is disabled; with it on, `insert_before` scrolls through a DECSTBM margin
+   region most emulators exclude from scrollback, silently breaking the design.
+   This is enforced, not just documented: a `compile_error!` in
+   `cli/console/mod.rs` (wired to a guard feature in `Cargo.toml`) fails the build
+   if anything enables it.
 
 ## Signals & cancellation (Ctrl-C)
 
@@ -173,11 +196,13 @@ stalls).
 
 ## What this deleted
 
-`run_child`'s and `drive`'s duplicated `select!` loops collapse into one render
-loop; `paint_panel` one-shots, the `runtime()` escape hatch, and the engine's
-`into_surface` / `commit_live` handoff dance are all gone — the render thread
-owns one bottom-anchored viewport for the entire session, so the run phase is
-"just another scene producer."
+The terminal-touching duplication is gone: `run_child`'s old `select!` render
+loop, `paint_panel` one-shots, the `runtime()` escape hatch, and the engine's
+`into_surface` / `commit_live` handoff dance. All painting now happens in the one
+render loop, so the render thread owns a single bottom-anchored viewport for the
+entire session and the run phase is "just another scene producer." (The engine's
+`drive` still exists — it folds run-loop events into fresh scenes — but it no
+longer touches the terminal; it only sends `Scene`/`Scrollback` messages.)
 
 ## Known POC limitations (follow-ups)
 

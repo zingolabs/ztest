@@ -165,6 +165,9 @@ fn run_tty(
         supports_unicode::on(supports_unicode::Stream::Stdout),
     );
     let plan = qos_plan.unwrap_or_else(empty_plan);
+    // The live region's height (the same rows the compile phase used for cargo);
+    // the run fills them with the running-tests block.
+    let live_rows = console.live_rows() as usize;
 
     // Commit the preflight/image phase's final emulated grid into native
     // scrollback before we switch the live region from the child PTY to our own
@@ -181,9 +184,20 @@ fn run_tty(
         // subprocess output. The pinned panel is the QoS/progress summary,
         // snapshotted into an immutable scene the render thread re-paints (and
         // animates the spinner) until the next tick.
-        let panel = render_live_panel(&frame.snapshot, &plan, &frame.free, &frame.progress, theme);
+        let left = render_live_panel(&frame.snapshot, &plan, &frame.free, &frame.progress, theme);
+        // The live region above the panel shows the running-tests block (the
+        // nextest-style live status), filling the same rows the compile phase used
+        // for cargo's output. The `avt` grid is idle during the run, so we drive
+        // the live region explicitly via the scene.
+        let live = reporter::render_running(&frame.running, live_rows, color).join("\n");
+        // By the run phase every background transfer has completed (provisioning
+        // is a pre-run barrier), so the right column is blank. The width-driven
+        // two-column split still holds, so the left column keeps the same width it
+        // had during preflight — the panel doesn't reflow at the handoff.
         console.scene(move |_elapsed| SceneFrame {
-            panel: panel.clone(),
+            left: left.clone(),
+            right: String::new(),
+            live: Some(live.clone()),
         });
     });
 

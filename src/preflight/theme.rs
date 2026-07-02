@@ -111,7 +111,10 @@ impl Styles {
 #[derive(Debug, Clone)]
 pub struct ThemeChars {
     pub ok: &'static str,
+    /// Download / incoming-transfer marker.
     pub progress: &'static str,
+    /// Upload / outgoing-transfer marker (dev-image build+load).
+    pub up: &'static str,
     pub warn: &'static str,
     pub fail: &'static str,
     /// Horizontal rule character.
@@ -129,6 +132,7 @@ impl ThemeChars {
         Self {
             ok: "✓",
             progress: "⇣",
+            up: "⇡",
             warn: "!",
             fail: "✗",
             hbar_char: '─',
@@ -142,6 +146,7 @@ impl ThemeChars {
         Self {
             ok: "OK",
             progress: "..",
+            up: "^^",
             warn: "WARN",
             fail: "FAIL",
             hbar_char: '-',

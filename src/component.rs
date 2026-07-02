@@ -268,6 +268,19 @@ impl<B: IndexerConfig> Indexer<B> {
     }
 }
 
+#[cfg(feature = "librustzcash")]
+impl Wallet<crate::backends::librustzcash::LrzBackend> {
+    /// ztest's default in-process wallet: a pure-Rust `zcash_client_backend`
+    /// wallet that syncs over the indexer's lightwalletd gRPC and builds
+    /// shielded txs with bundled Sapling params. No zingolib, no zebra, no
+    /// `libstdc++`. Hand the returned `Wallet` to
+    /// [`TestEnv::add_wallet`](crate::env::TestEnv::add_wallet), then build
+    /// accounts with [`WalletHandle::account`](crate::handles::WalletHandle).
+    pub fn librustzcash() -> Self {
+        Self::new(crate::backends::librustzcash::LrzBackend)
+    }
+}
+
 #[cfg(feature = "zingo")]
 impl Wallet<ZingoBackend> {
     /// In-process zingolib wallet, the batteries-included backend ztest ships.

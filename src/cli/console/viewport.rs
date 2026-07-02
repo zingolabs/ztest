@@ -15,14 +15,59 @@
 use std::io;
 
 use ratatui::backend::{Backend as _, ClearType, CrosstermBackend};
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
-use super::{Backend, PANEL_ROWS, bridge};
+use super::{Backend, LIVE_ROWS, PANEL_ROWS, bridge};
+
+/// Minimum terminal width for the two-column panel. Below this the right
+/// (transfer) column is dropped and the left column spans the full width — a
+/// narrow terminal can't fit both without mangling either.
+const TWO_COL_MIN: u16 = 90;
+
+/// Target right-column width as a percent of the terminal, clamped to
+/// `[RIGHT_COL_MIN, RIGHT_COL_MAX]`. Enough to hold `⠹ dev-zainod · load→kind`
+/// or a `%` bar with byte counts, without starving the left column.
+const RIGHT_COL_PERCENT: u16 = 38;
+const RIGHT_COL_MIN: u16 = 30;
+const RIGHT_COL_MAX: u16 = 48;
+
+/// Emulator width used to bridge each panel column: wide enough that no real
+/// panel line wraps, so each logical line stays one grid row. `ratatui` clips the
+/// resulting lines to the actual (narrower) column width when it renders them.
+const NOWRAP_COLS: usize = 512;
+
+/// Paint the two panel columns into the frame's (viewport) area. Extracted from
+/// [`Surface::draw_frame`] so it can be exercised against a `TestBackend`.
+///
+/// At or above [`TWO_COL_MIN`] the area is split into a left region plus a
+/// fixed-ish right region; below it, a single full-width left column. Each block
+/// is bridged through a *wide* emulator ([`NOWRAP_COLS`]) so a line longer than
+/// its column is never wrapped (which would consume rows and break the
+/// fixed-height grid); `ratatui`'s `Paragraph` then clips it to the column,
+/// keeping the labelled left side and dropping trailing detail. Trailing newlines
+/// are trimmed so a Vt sized to the line count wouldn't scroll the top row off.
+fn paint_panel(f: &mut ratatui::Frame, area: Rect, left: &str, right: &str) {
+    let left = left.trim_end_matches('\n');
+    let right = right.trim_end_matches('\n');
+    let rows = |s: &str, h: u16| bridge::text_from_ansi(s, NOWRAP_COLS, h as usize);
+    if area.width < TWO_COL_MIN {
+        f.render_widget(Paragraph::new(rows(left, area.height)), area);
+        return;
+    }
+    let right_w = (area.width * RIGHT_COL_PERCENT / 100).clamp(RIGHT_COL_MIN, RIGHT_COL_MAX);
+    let left_w = area.width - right_w;
+    let left_area = Rect::new(area.x, area.y, left_w, area.height);
+    let right_area = Rect::new(area.x + left_w, area.y, right_w, area.height);
+    f.render_widget(Paragraph::new(rows(left, area.height)), left_area);
+    if !right.is_empty() {
+        f.render_widget(Paragraph::new(rows(right, area.height)), right_area);
+    }
+}
 
 /// Restores the controlling terminal's line discipline on drop.
 ///
@@ -70,35 +115,38 @@ impl Drop for TtyGuard {
     }
 }
 
-/// An inline `ratatui` viewport that is *only* the pinned panel: a fixed
-/// [`PANEL_ROWS`]-tall region at the bottom, with `insert_before` forwarding
-/// everything else into native scrollback above. Owns the terminal and the
-/// current width; rendering is synchronous (no runtime).
+/// An inline `ratatui` viewport holding a live region atop the pinned panel: a
+/// fixed [`LIVE_ROWS`]-tall live region (the child's current output / the run's
+/// running-tests block) above a [`PANEL_ROWS`]-tall two-column status panel, with
+/// `insert_before` forwarding completed lines into native scrollback above. Owns
+/// the terminal and the current width; rendering is synchronous (no runtime).
 pub(crate) struct Surface {
     term: Terminal<Backend>,
     cols: u16,
+    /// The live-region rows this surface actually reserved (`viewport height −
+    /// PANEL_ROWS`). The single derived value the render thread sizes the `avt`
+    /// grid / child PTY / engine running-block from, so none of them restate
+    /// [`LIVE_ROWS`].
+    live_rows: u16,
     tty: TtyGuard,
 }
 
 impl Surface {
-    /// A panel-only surface used for the whole session (preflight build, image
-    /// phases, and the test run). The inline viewport is exactly [`PANEL_ROWS`]
-    /// tall and holds nothing but the panel; every subprocess and reporter line
-    /// scrolls above it into native scrollback via [`Surface::insert_scrollback`].
+    /// The session surface (preflight build, image phases, and the test run). The
+    /// inline viewport is [`LIVE_ROWS`] live rows + [`PANEL_ROWS`] panel rows;
+    /// completed subprocess/reporter lines scroll above it into native scrollback
+    /// via [`Surface::insert_scrollback`].
     ///
-    /// The cursor is left wherever the shell put it. `ratatui` anchors the
-    /// inline viewport to the cursor row at creation and reserves the panel's
-    /// rows with `append_lines` — but because the panel is small and always
-    /// painted in full on the first frame, no blank band appears: on a fresh
-    /// screen it opens right under the prompt and crawls to the bottom as
-    /// scrollback accumulates; on a full screen `ratatui` scrolls a few *real*
-    /// prior lines up (as any status widget must) and the panel paints over the
-    /// reserved rows immediately. No cursor-parking, so no reserved gap.
+    /// The cursor is left wherever the shell put it. `ratatui` anchors the inline
+    /// viewport to the cursor row at creation and reserves its rows with
+    /// `append_lines`. No cursor-parking. The live region sits blank until the
+    /// child produces output (the accepted startup-gap tradeoff of showing live
+    /// build/run activity), which is why [`LIVE_ROWS`] is kept modest.
     pub fn bottom_panel() -> io::Result<Surface> {
         let cols = terminal_size::terminal_size()
             .map(|(w, _)| w.0)
             .unwrap_or(80);
-        Surface::build(cols, PANEL_ROWS)
+        Surface::build(cols, LIVE_ROWS + PANEL_ROWS)
     }
 
     fn build(cols: u16, viewport_rows: u16) -> io::Result<Surface> {
@@ -111,6 +159,10 @@ impl Surface {
         Ok(Surface {
             term,
             cols,
+            // Derive the live-region height from the rows we actually reserved,
+            // so the grid/PTY/engine follow the viewport rather than restating
+            // LIVE_ROWS. Saturating so a (nonsensical) sub-panel viewport is 0.
+            live_rows: viewport_rows.saturating_sub(PANEL_ROWS),
             tty: TtyGuard::enter(),
         })
     }
@@ -119,19 +171,33 @@ impl Surface {
         self.cols
     }
 
+    /// The live-region height this surface reserved (`viewport height −
+    /// PANEL_ROWS`): the rows the render thread sizes the `avt` grid and child PTY
+    /// to, and that the engine fills with its running-tests block.
+    pub fn live_rows(&self) -> u16 {
+        self.live_rows
+    }
+
     /// Re-query and record the terminal width (after SIGWINCH).
     pub fn set_cols(&mut self, cols: u16) {
         self.cols = cols;
     }
 
     /// Present one frame atomically: flush `scrollback` above the viewport, then
-    /// repaint the `panel`, all inside one synchronized update.
-    pub fn present(&mut self, scrollback: &[Line<'static>], panel: &str) {
+    /// repaint the live region plus the two panel columns, all inside one
+    /// synchronized update.
+    pub fn present(
+        &mut self,
+        scrollback: &[Line<'static>],
+        live: &[Line<'static>],
+        left: &str,
+        right: &str,
+    ) {
         self.begin_sync();
         if !scrollback.is_empty() {
             let _ = self.insert_scrollback(scrollback);
         }
-        let _ = self.draw_frame(panel);
+        let _ = self.draw_frame(live, left, right);
         self.end_sync();
     }
 
@@ -176,7 +242,10 @@ impl Surface {
     /// only on the guard's `Drop`, is what makes that path safe.
     pub fn finish(&mut self, final_live: &[Line<'static>]) -> io::Result<()> {
         self.tty.restore();
-        self.insert_scrollback(final_live)?;
+        // Best-effort: if the final scrollback insert fails (e.g. the terminal is
+        // already closing / broken pipe) we must STILL fall through to restore the
+        // cursor below — leaving it hidden and mispositioned is the worse outcome.
+        let _ = self.insert_scrollback(final_live);
 
         let mut origin = Position::new(0, 0);
         self.term.draw(|f| {
@@ -191,17 +260,24 @@ impl Surface {
         Ok(())
     }
 
-    /// Render one frame: the `panel` filling the whole (panel-only) viewport,
-    /// top-aligned. The panel is a fixed [`PANEL_ROWS`] lines, so it fills the
-    /// region exactly; a shorter panel (the cancel overlay) leaves the trailing
-    /// rows blank. The trailing newline is trimmed so a Vt sized to the line
-    /// count wouldn't scroll the top rule off.
-    fn draw_frame(&mut self, panel: &str) -> io::Result<()> {
-        let panel = panel.trim_end_matches('\n');
+    /// Render one frame: the `live` region across the top rows of the viewport,
+    /// then the two-column status panel across the bottom [`PANEL_ROWS`]. The live
+    /// lines are already bridged (the child's `avt` grid, or the run's
+    /// running-tests block); more lines than fit are clipped, fewer are blank-
+    /// padded, so the split stays fixed. The panel columns themselves are laid out
+    /// by [`paint_panel`] (which owns the width-driven two-column split); this
+    /// method only carves the viewport into live-region and panel rects.
+    fn draw_frame(&mut self, live: &[Line<'static>], left: &str, right: &str) -> io::Result<()> {
         self.term.draw(|f| {
             let area = f.area();
-            let text = bridge::text_from_ansi(panel, area.width as usize, area.height as usize);
-            f.render_widget(Paragraph::new(text), area);
+            let panel_h = PANEL_ROWS.min(area.height);
+            let live_h = area.height - panel_h;
+            let live_area = Rect::new(area.x, area.y, area.width, live_h);
+            let panel_area = Rect::new(area.x, area.y + live_h, area.width, panel_h);
+            if live_h > 0 {
+                f.render_widget(Paragraph::new(live.to_vec()), live_area);
+            }
+            paint_panel(f, panel_area, left, right);
         })?;
         Ok(())
     }
@@ -219,5 +295,89 @@ impl Surface {
     fn end_sync(&mut self) {
         let _ = crossterm::queue!(self.term.backend_mut(), EndSynchronizedUpdate);
         let _ = io::Write::flush(self.term.backend_mut());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// Render a panel through `paint_panel` on a TestBackend and return the buffer
+    /// rows as trimmed strings.
+    fn render(width: u16, height: u16, left: &str, right: &str) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            paint_panel(f, area, left, right);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    const PREFLIGHT: &str = "\
+────────────
+   Preflight kind-zaino-local · 3 ready · 12/16 slots
+    capacity [██████░░░░░░] 50% · 6/12c · 28/48Gi free
+   Inventory compiling test binaries… · 34s
+  Scheduling 8 tests · 1 waves";
+
+    const TRANSFERS: &str = "
+dev-zainod · building
+dev-zebrad · load→kind
+testnet-3.1m · 63%";
+
+    #[test]
+    fn wide_terminal_shows_both_columns() {
+        let out = render(120, 5, PREFLIGHT, TRANSFERS);
+        let joined = out.join("\n");
+        // Left column content present.
+        assert!(joined.contains("Preflight"), "left col missing:\n{joined}");
+        assert!(joined.contains("Inventory"), "left col missing:\n{joined}");
+        assert!(joined.contains("Scheduling"), "left col missing:\n{joined}");
+        // Right column content present, to the right of the left column.
+        assert!(joined.contains("dev-zainod"), "right col missing:\n{joined}");
+        assert!(joined.contains("testnet-3.1m"), "right col missing:\n{joined}");
+        // The branded rule and the first transfer share the top row.
+        assert!(out[0].contains("────"), "top rule row:\n{joined}");
+    }
+
+    #[test]
+    fn narrow_terminal_shows_left_column_full_width() {
+        let out = render(80, 5, PREFLIGHT, TRANSFERS);
+        let joined = out.join("\n");
+        assert!(joined.contains("Preflight"), "left col missing:\n{joined}");
+        // Right column dropped on a narrow terminal.
+        assert!(!joined.contains("dev-zainod"), "right col leaked:\n{joined}");
+    }
+
+    #[test]
+    fn empty_right_column_still_renders_left() {
+        let out = render(120, 5, PREFLIGHT, "");
+        let joined = out.join("\n");
+        assert!(joined.contains("Preflight"), "left col missing:\n{joined}");
+        assert!(joined.contains("Scheduling"), "left col missing:\n{joined}");
+    }
+
+    #[test]
+    fn overlong_left_line_is_clipped_not_wrapped() {
+        // A left line far wider than its column must stay on one row (clipping),
+        // never wrap and push later rows off the fixed-height grid.
+        let long = format!("   Preflight {}", "x".repeat(400));
+        let panel = format!("────────────\n{long}\nline3\nline4\nline5");
+        let out = render(120, 5, &panel, TRANSFERS);
+        assert_eq!(out.len(), 5, "grid height preserved");
+        assert!(out[2].contains("line3"), "row 3 not pushed off:\n{out:?}");
+        assert!(out[4].contains("line5"), "row 5 not pushed off:\n{out:?}");
     }
 }
