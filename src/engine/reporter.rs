@@ -4,10 +4,11 @@
 //! Formats the engine's lifecycle events into the exact scrolling status lines
 //! nextest emits — `PASS`/`FAIL`/`XFAIL`/`SLOW`/`TRY n …` verdicts with
 //! right-aligned durations, failure-output replay under `output ───` headers,
-//! and the `Summary` block — matching nextest's indentation, capitalisation,
-//! and colours (`owo-colors`). We own every line, so there is no
-//! `nextest-runner` dependency; the goal is that a captured line is
-//! indistinguishable from nextest's (`reporter/displayer/imp.rs`).
+//! the `Summary` block, and the end-of-run failure recap (each failing test
+//! re-listed after the summary, nextest's `final-status-level = fail`) — matching
+//! nextest's indentation, capitalisation, and colours (`owo-colors`). We own
+//! every line, so there is no `nextest-runner` dependency; the goal is that a
+//! captured line is indistinguishable from nextest's (`reporter/displayer/imp.rs`).
 //!
 //! Ceiling: the engine's [`Verdict`] models only pass/fail/timeout/spawn-error,
 //! so nextest's leak/flaky/slow-pass/abort status words can't be produced —
@@ -46,6 +47,12 @@ pub struct StyledReporter {
     unicode: bool,
     buf: Vec<u8>,
     stats: RunStats,
+    /// Each failing test's already-styled status line (no trailing newline),
+    /// captured as it streams so the final [`summary`](Self::summary) can re-list
+    /// them after the `Summary` line — nextest's end-of-run failure recap
+    /// (`final-status-level = fail`). Without this, failures from a long run
+    /// scroll away at their inline point with no consolidated list.
+    failures: Vec<String>,
 }
 
 impl StyledReporter {
@@ -57,6 +64,7 @@ impl StyledReporter {
             unicode,
             buf: Vec::new(),
             stats: RunStats::default(),
+            failures: Vec::new(),
         }
     }
 
@@ -88,16 +96,24 @@ impl StyledReporter {
         instance_str(bin, test, self.color)
     }
 
-    /// One status line: `{status:>12} {bracket}{instance}`. `bracket` already
-    /// carries nextest's trailing space (`DisplayBracketedDuration` &c.), so the
-    /// only literal space here is the one after the status field.
-    fn line(&mut self, word: &str, ink: Ink, bracket: &str, bin: &str, test: &str) {
-        let _ = writeln!(
-            self.buf,
+    /// Format one status line (no trailing newline): `{status:>12} {bracket}{instance}`.
+    /// `bracket` already carries nextest's trailing space
+    /// (`DisplayBracketedDuration` &c.), so the only literal space here is the one
+    /// after the status field. Shared by the streaming [`line`](Self::line) writer
+    /// and the failure recap, so a recapped line is byte-identical to its inline
+    /// form.
+    fn format_line(&self, word: &str, ink: Ink, bracket: &str, bin: &str, test: &str) -> String {
+        format!(
             "{} {bracket}{}",
             self.status(word, ink),
             self.styled_instance(bin, test),
-        );
+        )
+    }
+
+    /// Write one status line to the scrollback buffer.
+    fn line(&mut self, word: &str, ink: Ink, bracket: &str, bin: &str, test: &str) {
+        let line = self.format_line(word, ink, bracket, bin, test);
+        let _ = writeln!(self.buf, "{line}");
     }
 
     /// Replay a failed test's captured output. Matches nextest's default
@@ -225,7 +241,11 @@ impl RunReporter for StyledReporter {
                         } else {
                             long_status(verdict).to_string()
                         };
-                        self.line(&word, Ink::Fail, &bracket, binary_id, test_name);
+                        // Stream the failure inline (with its output replay), and
+                        // capture the same line for the end-of-run recap.
+                        let line = self.format_line(&word, Ink::Fail, &bracket, binary_id, test_name);
+                        let _ = writeln!(self.buf, "{line}");
+                        self.failures.push(line);
                         self.replay_output(output);
                         self.stats.failed += 1;
                     }
@@ -273,7 +293,9 @@ impl StyledReporter {
     /// `Summary [   d.ddds] N tests run: X passed[, Y failed], Z skipped`,
     /// matching nextest's `RunFinished` line (`imp.rs`): the rule + a `Summary`
     /// label coloured by final status (green pass / red fail / yellow no-run),
-    /// the elapsed bracket, `finished[/total]`, then the shared counts tail.
+    /// the elapsed bracket, `finished[/total]`, then the shared counts tail —
+    /// followed by the failure recap (each failing test's status line re-listed),
+    /// present only when something failed.
     fn summary(&mut self, stats: &RunStats, elapsed: Duration) {
         let _ = writeln!(self.buf, "{}", self.hbar(12));
         // nextest colours "Summary" by outcome: fail if anything failed, skip
@@ -310,6 +332,14 @@ impl StyledReporter {
             bracket_dur(elapsed),
             counts_tail(stats, self.color),
         );
+        // nextest's end-of-run failure recap (`final-status-level = fail`):
+        // re-list each failing test's status line (no output replay) directly
+        // under the Summary, so a long run's failures are visible together
+        // instead of scrolled away at their inline point. Emitted only when
+        // something failed, exactly like nextest.
+        for line in std::mem::take(&mut self.failures) {
+            let _ = writeln!(self.buf, "{line}");
+        }
     }
 }
 
@@ -741,6 +771,82 @@ mod tests {
         });
         let out = String::from_utf8(r.take_scrollback()).unwrap();
         assert!(out.starts_with("------------\n"), "{out:?}");
+    }
+
+    #[test]
+    fn failures_are_recapped_after_summary() {
+        // The regression this guards: nextest re-lists every failing test after
+        // the `Summary` line (its `final-status-level = fail` recap). A day-one
+        // ztest got this free from the real `cargo nextest run` subprocess; the
+        // native engine must reproduce it.
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&finished(
+            "e2e::wallet",
+            "zebrad::send_to_orchard::case_1_fetch",
+            Verdict::Fail(101),
+            1,
+            b"boom\n",
+        ));
+        r.handle(&finished("e2e::wallet", "zebrad::z_get_treestate::case_1_fetch", Verdict::Pass, 1, b""));
+        r.handle(&finished(
+            "e2e::wallet",
+            "zebrad::send_to_sapling::case_2_state",
+            Verdict::Timeout,
+            1,
+            b"",
+        ));
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats { passed: 1, failed: 2, skipped: 0, total: 3 },
+            elapsed: Duration::from_secs(1),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+
+        // The exact end-of-run tail: rule, Summary, then both failures re-listed
+        // (final word preserved, no output replay), in the order they failed.
+        let expected_tail = "\
+────────────
+     Summary [   1.000s] 3 tests run: 1 passed, 2 failed, 0 skipped
+        FAIL [   0.234s] e2e::wallet zebrad::send_to_orchard::case_1_fetch
+     TIMEOUT [   0.234s] e2e::wallet zebrad::send_to_sapling::case_2_state
+";
+        assert!(out.ends_with(expected_tail), "recap tail wrong:\n{out}");
+
+        // The passing test is never recapped, and the failure's output replay
+        // stays inline (before the Summary), not in the recap.
+        let summary_pos = out.find("Summary").unwrap();
+        assert!(!out[summary_pos..].contains("z_get_treestate"), "pass recapped:\n{out}");
+        assert!(out[..summary_pos].contains("boom"), "inline output missing:\n{out}");
+    }
+
+    #[test]
+    fn clean_run_emits_no_recap() {
+        let mut r = StyledReporter::new(false, true);
+        r.handle(&finished("p::b", "ok", Verdict::Pass, 1, b""));
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats { passed: 1, failed: 0, skipped: 0, total: 1 },
+            elapsed: Duration::from_secs(1),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        // Nothing after the Summary line.
+        assert!(out.trim_end().ends_with("1 test run: 1 passed, 0 skipped"), "{out:?}");
+        assert!(!out.contains("FAIL"), "no failure recap on a clean run:\n{out}");
+    }
+
+    #[test]
+    fn recap_line_is_byte_identical_to_the_inline_line() {
+        // Whatever we streamed inline for a failure is exactly what the recap
+        // re-lists — including a post-retry `TRY n FAIL` word and colour.
+        let mut r = StyledReporter::new(true, true);
+        r.handle(&finished("p::b", "t", Verdict::Fail(1), 3, b""));
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats { passed: 0, failed: 1, skipped: 0, total: 1 },
+            elapsed: Duration::from_secs(1),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        // The `TRY 3 FAIL` line appears twice: once inline, once in the recap.
+        let inline = strip_ansi(&out);
+        let count = inline.matches("TRY 3 FAIL [   0.234s] p::b t").count();
+        assert_eq!(count, 2, "inline + recap:\n{inline}");
     }
 
     #[test]
