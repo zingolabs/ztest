@@ -1127,12 +1127,13 @@ struct ImagePhaseOutcome {
 /// edges and provisioned states the engine uses to gate/skip tests on resource
 /// readiness.
 ///
-/// On a TTY, provisioning runs concurrently (cap 4): each in-flight `docker
-/// build` / `kind load` / seed materialization is a live row in the console's
-/// right column, and providers capture their output (summary to scrollback)
-/// rather than fighting the single emulator grid. Off a TTY it stays serial
-/// (cap of one) with inherited stdio. The graph's `probe` skips images already
-/// in the cluster's containerd.
+/// Provisioning runs serially (cap 1): each `docker build` / `kind load` / seed
+/// materialization streams its native output live through the console's single
+/// emulator grid, one at a time, with its sub-phase shown as a row in the right
+/// column. Image builds are already disk/CPU/network bound, so serial costs
+/// little and keeps the live output coherent (no interleaving, no lock). Off a
+/// TTY children inherit stdio. The graph's `probe` skips images already in the
+/// cluster's containerd.
 fn run_image_phases(
     work_rt: &tokio::runtime::Runtime,
     binaries: &[pipeline::SelectedBinary],
@@ -1179,7 +1180,7 @@ fn run_image_phases(
     let mut registry = TransferRegistry::default();
 
     // Commit the compile's final frame to scrollback and blank the live region so
-    // provisioning's captured summaries land on a clean grid.
+    // provisioning's live build output lands on a clean grid.
     if let Some(c) = console {
         c.flush_live();
         push_preflight_scene(c, state, &registry.snapshot(), "Building", theme);
@@ -1215,13 +1216,15 @@ fn run_image_phases(
         }
     };
 
-    // Provision concurrently. On a TTY every in-flight build/load is a right-column
-    // transfer row, fed by the graph's lifecycle transitions (`on_change`) merged
-    // with each provider's sub-phase notes onto one `TransferEvent` channel; the
-    // providers CAPTURE their output (a concise summary to scrollback) so N
-    // concurrent children don't fight the single emulator grid. Off a TTY: cap 1 +
-    // inherited stdio, the unchanged CI path. `probe` still skips warm resources.
-    let cap = if console.is_some() { 4 } else { 1 };
+    // Provision sequentially (cap 1): a topological walk, `docker build && kind
+    // load && …`. Image builds are already disk/CPU/network bound, so building two
+    // at once mostly contends rather than helps — and serial order lets each stream
+    // its native BuildKit/kind output live through the single emulator grid with no
+    // interleaving and no lock. Each in-flight build/load is still a right-column
+    // transfer row, fed by the graph's lifecycle transitions (`on_change`) plus the
+    // provider's sub-phase notes on the `TransferEvent` channel. On a TTY the child
+    // streams to the grid; off it, it inherits stdio. `probe` skips warm resources.
+    let cap = 1;
     let resource_states = work_rt.block_on(async {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TransferEvent>();
         let progress = console.map(|_| {

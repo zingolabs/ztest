@@ -52,14 +52,12 @@ impl ImageProvider {
         Self::new(entry.clone()).map(|p| p.id())
     }
 
-    /// Run one build/load step with its output captured (not streamed
-    /// through the emulator grid), so concurrent steps don't interleave on
-    /// screen.
-    ///
-    /// On failure the captured output is flushed to scrollback so the cause
-    /// stays visible above the panel; `kill_on_drop` lets a cancelled
-    /// provision reap the child.
-    async fn run_captured(
+    /// Run one build/load step, streaming its output live through the console
+    /// PTY so BuildKit / kind progress renders in the panel. Provisioning runs
+    /// at cap 1 (see `cli::run`), so at most one such stream drives the emulator
+    /// grid at a time — no interleaving, no lock. Off a TTY `run_child` inherits
+    /// stdio for the plain CI log.
+    async fn run_streamed(
         &self,
         cx: &Cx,
         program: &str,
@@ -67,34 +65,13 @@ impl ImageProvider {
         envs: &[(&str, String)],
         step: &str,
     ) -> Result<(), ResourceError> {
-        use tokio::process::Command;
-
-        let mut cmd = Command::new(program);
-        cmd.args(argv)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-        let out = cmd
-            .output()
+        let code = run_child(cx.console.as_ref(), program, argv, envs)
             .await
             .map_err(|e| ResourceError::Provision(format!("{step} {}: {e}", self.tag)))?;
-        if !out.status.success() {
-            // Surface the captured output so the failure is diagnosable.
-            if let Some(c) = &cx.console {
-                let mut dump = String::from_utf8_lossy(&out.stdout).into_owned();
-                dump.push_str(&String::from_utf8_lossy(&out.stderr));
-                if !dump.is_empty() {
-                    c.scrollback(dump);
-                }
-            }
+        if code != 0 {
             return Err(ResourceError::Provision(format!(
-                "{step} {} exited {}",
-                self.tag,
-                out.status.code().unwrap_or(-1),
+                "{step} {} exited {code}",
+                self.tag
             )));
         }
         Ok(())
@@ -129,70 +106,26 @@ impl Provider for ImageProvider {
         let context = Path::new(&self.entry.context);
         let id = self.id();
 
-        // Concurrent path (TTY + progress sink): several builds run at once.
-        // Can't stream them all through the single emulator grid, so each
-        // captures its own output and reports sub-phase notes to the
-        // right-column tracker, flushing only a one-line summary (or, on
-        // failure, the captured tail) to scrollback.
-        //
-        // Serial path (no sink / non-TTY): stream through the console as
-        // before, so cargo/BuildKit progress stays live.
-        match &cx.progress {
-            Some(sink) => {
-                sink.note(&id, "building");
-                let argv = image::docker_build_argv(
-                    dockerfile,
-                    context,
-                    &self.entry.features,
-                    &self.tag,
-                );
-                let envs = [("DOCKER_BUILDKIT", "1".to_string())];
-                self.run_captured(cx, "docker", &argv, &envs, "docker build")
-                    .await?;
-
-                sink.note(&id, "load→kind");
-                let argv = image::kind_load_argv(&self.tag);
-                self.run_captured(cx, "kind", &argv, &[], "kind load").await?;
-
-                if let Some(c) = &cx.console {
-                    c.scrollback(format!("       built + loaded {}\n", self.tag));
-                }
-                Ok(())
-            }
-            None => {
-                let argv = image::docker_build_argv(
-                    dockerfile,
-                    context,
-                    &self.entry.features,
-                    &self.tag,
-                );
-                let envs = [("DOCKER_BUILDKIT", "1".to_string())];
-                let code = run_child(cx.console.as_ref(), "docker", &argv, &envs)
-                    .await
-                    .map_err(|e| {
-                        ResourceError::Provision(format!("docker build {}: {e}", self.tag))
-                    })?;
-                if code != 0 {
-                    return Err(ResourceError::Provision(format!(
-                        "docker build {} exited {code}",
-                        self.tag
-                    )));
-                }
-
-                let argv = image::kind_load_argv(&self.tag);
-                let code = run_child(cx.console.as_ref(), "kind", &argv, &[])
-                    .await
-                    .map_err(|e| {
-                        ResourceError::Provision(format!("kind load {}: {e}", self.tag))
-                    })?;
-                if code != 0 {
-                    return Err(ResourceError::Provision(format!(
-                        "kind load {} exited {code}",
-                        self.tag
-                    )));
-                }
-                Ok(())
-            }
+        // Provisioning runs at cap 1 (see `cli::run`), so image nodes build one
+        // at a time — each step streams its native `docker` / `kind` output live
+        // through the emulator grid with nothing else contending for it. The
+        // right-column tracker mirrors the current sub-phase via `progress`
+        // notes; off a TTY `run_child` inherits stdio for the plain CI log.
+        if let Some(sink) = &cx.progress {
+            sink.note(&id, "building");
         }
+        let argv = image::docker_build_argv(dockerfile, context, &self.entry.features, &self.tag);
+        let envs = [("DOCKER_BUILDKIT", "1".to_string())];
+        self.run_streamed(cx, "docker", &argv, &envs, "docker build")
+            .await?;
+
+        if let Some(sink) = &cx.progress {
+            sink.note(&id, "load→kind");
+        }
+        let argv = image::kind_load_argv(&self.tag);
+        self.run_streamed(cx, "kind", &argv, &[], "kind load")
+            .await?;
+
+        Ok(())
     }
 }
