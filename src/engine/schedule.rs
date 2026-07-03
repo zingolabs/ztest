@@ -22,11 +22,10 @@ use crate::engine::exec::TestOutcome;
 use crate::engine::panel::{live_snapshot, run_progress};
 use crate::engine::plan::WorkItem;
 use crate::preflight::RunProgress;
-use crate::provisioning::NodeId;
 use crate::qos::Resources;
 use crate::qos::live::LiveSnapshot;
 use crate::qos::scheduler::{Admission, LeaseId, RejectReason, Request, Scheduler};
-use crate::resource::NodeState;
+use crate::resource::{NodeId, NodeState};
 
 /// Tunables for the run loop.
 #[derive(Debug, Clone)]
@@ -1110,8 +1109,7 @@ mod tests {
     /// archive sidelines only its dependents" guarantee at the loop level.
     #[tokio::test]
     async fn dependency_failure_skips_only_dependent_tests() {
-        use crate::provisioning::NodeId;
-        use crate::resource::NodeState;
+        use crate::resource::{NodeId, NodeState};
 
         let dep = NodeId::Image("zebrad:dev-bad".into());
         let mut needs_img = item("needs_img", QosClass::Integration, 0);

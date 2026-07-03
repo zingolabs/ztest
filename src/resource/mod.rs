@@ -1,20 +1,42 @@
-//! The resource dependency graph: ztest's unified provisioning and teardown
-//! engine.
+//! Cluster resource management: the K8s objects ztest depends on to run
+//! tests, and the graph executor that provisions them in dependency order.
 //!
-//! Every resource a run depends on (dev images, content-addressed seed
-//! PVCs/snapshots, the per-run ephemeral scope) is a node with a [`Provider`].
-//! One [`Graph`] drives them: forward in dependency order to provision (each node
-//! runs the moment its deps are ready, so a slow node skips only its own
-//! dependents), and reverse to tear down (a node is reaped only once nothing
-//! depends on it).
+//! # Two entry points, one machine
 //!
-//! The crux is [`Lifetime`]: content-addressed nodes are `Cached` (a cross-run
-//! cache, kept through cancellation) while per-run nodes are `RunScoped` /
-//! `Shared` (reaped). That is why the same graph both schedules work and, on
-//! Ctrl-C, cleans up correctly. See `docs/resource-graph-design.md`.
+//! Both `ztest setup` (cluster infrastructure — CSI, snapshot controller,
+//! ServiceAccounts, RBAC) and `ztest run` (per-run test resources — dev
+//! images, seed PVCs) flow through the same [`Graph`] of the same
+//! [`Provider`] trait. What differs is which providers land in the graph:
+//!
+//! - [`initialize`] assembles the cluster-infrastructure graph and
+//!   provisions it. Called by `ztest setup`.
+//! - [`plan_runtime`] assembles the per-run resource graph from the
+//!   inventory dump; the caller provisions it against the live cluster.
+//!   Called by `ztest run`.
+//! - [`reap_run`] tears down per-run resources by their `zaino.io/run-id`
+//!   label. Called on Ctrl-C and normal-exit cleanup.
+//!
+//! # Extending
+//!
+//! Adding a new K8s resource is one variant in [`NodeId`] plus one
+//! [`Provider`] impl in [`impls`]. The graph, executor, and entry points
+//! don't change. See [`impls`] for the layout convention.
 
+mod context;
+mod entry;
 mod graph;
+mod kube;
 mod provider;
+mod state;
 
+pub(crate) mod impls;
+
+// ── Public API ────────────────────────────────────────────────────────
+
+pub use context::{Cx, CxBuilder, ProgressSink};
+pub use entry::{
+    image_node_id, initialize, plan_runtime, qos_tiers, reap_run, seed_node_id, InitializeOpts,
+};
 pub use graph::{Graph, GraphError};
-pub use provider::{Lifetime, NodeId, NodeState, Provider, Readiness, ResourceError};
+pub use provider::{NodeId, Provider};
+pub use state::{Lifetime, NodeState, Readiness, ResourceError};

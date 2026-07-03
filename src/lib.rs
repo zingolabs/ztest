@@ -33,7 +33,6 @@ pub mod pipeline;
 pub mod preflight;
 pub mod proto;
 pub mod protocol;
-pub(crate) mod provisioning;
 pub mod qos;
 pub mod regtest;
 pub mod regtest_conf;

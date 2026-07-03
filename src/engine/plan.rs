@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use crate::inventory::QosEntry;
 use crate::pipeline::SelectedBinary;
-use crate::provisioning::NodeId;
 use crate::qos::{QosClass, Resources};
+use crate::resource::NodeId;
 
 /// One schedulable test: a (binary, test) pair with its resolved tier shape.
 #[derive(Debug, Clone, PartialEq, Eq)]

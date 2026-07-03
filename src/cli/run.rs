@@ -53,7 +53,7 @@ use crate::preflight::{
     self, ArchiveRow, ArchiveStatus, BannerState, ClusterState, SnapshotRow, Theme, TransferKind,
     TransferProgress, TransferRow, Transfers,
 };
-use crate::provisioning::NodeId;
+use crate::resource::NodeId;
 use crate::resource::NodeState;
 
 /// `ztest run` arguments.
@@ -403,7 +403,7 @@ fn cancel_exit(work_rt: &tokio::runtime::Runtime, run_id: &str, no_cleanup: bool
                 Ok(client) => {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
-                        crate::provisioning::reap_run(&client, run_id),
+                        crate::resource::reap_run(&client, run_id),
                     )
                     .await
                     {
@@ -596,7 +596,7 @@ fn push_preflight_scene(
 
 /// A background-transfer state change destined for the right column. Merges the
 /// resource graph's coarse lifecycle (`on_change`) with each provider's finer
-/// sub-phase notes ([`ProgressSink`](crate::provisioning::ProgressSink)) onto one
+/// sub-phase notes ([`ProgressSink`](crate::resource::ProgressSink)) onto one
 /// channel, so the work side folds both into the [`TransferRegistry`] in order.
 enum TransferEvent {
     /// A node's lifecycle transition from the graph executor.
@@ -664,6 +664,13 @@ impl TransferRegistry {
 /// A short label + kind for a resource node's right-column row. Image tags
 /// (`<repo>:dev-<hash>`) collapse to `dev-<repo-leaf>`; seeds keep their
 /// `seed-<sha8>` id.
+///
+/// The runtime graph (`resource::plan_runtime`) emits only [`NodeId::Image`]
+/// and [`NodeId::Seed`]; every other variant is cluster infrastructure
+/// belonging to `ztest setup`. If one somehow shows up here we fall back
+/// to the node's canonical `display_label()` and treat it as an image row
+/// — better than panicking, and unambiguous in the UI (the label carries
+/// its own kind tag: `qos-sa/basic`, `csi-driver`, ...).
 fn describe_node(id: &NodeId) -> (String, TransferKind) {
     match id {
         NodeId::Image(tag) => {
@@ -672,6 +679,7 @@ fn describe_node(id: &NodeId) -> (String, TransferKind) {
             (format!("dev-{leaf}"), TransferKind::Image)
         }
         NodeId::Seed(name) => (name.clone(), TransferKind::Seed),
+        other => (other.display_label(), TransferKind::Image),
     }
 }
 
@@ -1108,12 +1116,12 @@ struct ImagePhaseOutcome {
     resource_deps: crate::engine::plan::ResourceDeps,
     /// Provisioned resource states (node → state) the engine gates admission on.
     resource_states:
-        std::collections::HashMap<crate::provisioning::NodeId, crate::resource::NodeState>,
+        std::collections::HashMap<crate::resource::NodeId, crate::resource::NodeState>,
 }
 
 /// Run the inventory-driven image phase. Discovery (Phase C, the dump) learns
 /// which dev images and archives the selected tests need; provisioning drives the
-/// resource graph ([`crate::provisioning`]) to ensure each is present
+/// resource graph ([`crate::resource`]) to ensure each is present
 /// (`docker build` + `kind load` / seed materialization, skipping anything already
 /// present). Returns the per-binary QoS declarations plus the resolved dependency
 /// edges and provisioned states the engine uses to gate/skip tests on resource
@@ -1134,7 +1142,7 @@ fn run_image_phases(
     _session_start: Instant,
 ) -> ImagePhaseOutcome {
     use crate::pipeline::images;
-    use crate::provisioning;
+    use crate::resource;
     use std::collections::HashMap;
 
     let cancelled = || console.is_some_and(Console::cancelled);
@@ -1182,8 +1190,8 @@ fn run_image_phases(
     // coherent across serial `docker`/`kind` children. Seeds need a cluster
     // client, built here (cheap, pooled) — the probe already validated the
     // cluster exists.
-    let graph = match provisioning::plan(&images, &seeds) {
-        Ok(p) => p.graph,
+    let graph = match resource::plan_runtime(&images, &seeds) {
+        Ok(g) => g,
         Err(e) => {
             return ImagePhaseOutcome {
                 failure: Some(e),
@@ -1192,7 +1200,20 @@ fn run_image_phases(
             };
         }
     };
-    let client = work_rt.block_on(crate::cluster::client()).ok();
+    // Runtime provisioning needs a live client (the seeds provider talks to
+    // the API server). If we can't reach the cluster the graph produces
+    // structured Failed states for every seed node — the caller renders
+    // and moves on rather than crashing here.
+    let client = match work_rt.block_on(crate::cluster::client()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ImagePhaseOutcome {
+                failure: Some(format!("connect to cluster for resource provisioning: {e}")),
+                qos_by_binary,
+                ..Default::default()
+            };
+        }
+    };
 
     // Provision concurrently. On a TTY every in-flight build/load is a right-column
     // transfer row, fed by the graph's lifecycle transitions (`on_change`) merged
@@ -1205,15 +1226,18 @@ fn run_image_phases(
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TransferEvent>();
         let progress = console.map(|_| {
             let tx = tx.clone();
-            provisioning::ProgressSink::new(move |id, note| {
+            resource::ProgressSink::new(move |id, note| {
                 let _ = tx.send(TransferEvent::Note(id, note));
             })
         });
-        let cx = provisioning::Cx {
-            console: console.cloned(),
-            client,
-            progress,
-        };
+        let mut builder = resource::Cx::builder(client);
+        if let Some(c) = console.cloned() {
+            builder = builder.console(c);
+        }
+        if let Some(p) = progress {
+            builder = builder.progress(p);
+        }
+        let cx = builder.build();
         let on_change = {
             let tx = tx.clone();
             move |id: &NodeId, st: &NodeState| {
@@ -1257,7 +1281,7 @@ fn run_image_phases(
     for (binary_id, entries) in &images_by_binary {
         let ids: Vec<_> = entries
             .iter()
-            .filter_map(|e| provisioning::image_node_id(e).ok())
+            .filter_map(|e| resource::image_node_id(e).ok())
             .collect();
         if !ids.is_empty() {
             resource_deps.images_by_binary.insert(binary_id.clone(), ids);
@@ -1266,9 +1290,9 @@ fn run_image_phases(
     // Source path → seed node id, from the seeds we planned. A test edge names its
     // resource by source path (identical to the `SeedDecl` the same macro submits),
     // so this map resolves it to the provisioned node with no re-derivation.
-    let seed_id_by_source: HashMap<&str, crate::provisioning::NodeId> = seeds
+    let seed_id_by_source: HashMap<&str, crate::resource::NodeId> = seeds
         .iter()
-        .filter_map(|e| provisioning::seed_node_id(e).ok().map(|id| (e.source.as_str(), id)))
+        .filter_map(|e| resource::seed_node_id(e).ok().map(|id| (e.source.as_str(), id)))
         .collect();
     for (binary_id, deps) in &deps_by_binary {
         for dep in deps {

@@ -1,23 +1,15 @@
-//! Shared host-tool plumbing for the cluster-lifecycle subcommands
+//! Host-tool plumbing for the cluster-lifecycle subcommands
 //! (`ztest setup` / `ztest cleanup`).
 //!
-//! These commands drive `kind` and `kubectl` as child processes rather than
-//! the kube client: cluster creation has no client, and `kubectl apply` is
-//! the canonical way to install the vendored CSI bundle. Every `kubectl` call
-//! is pinned to an explicit `--context kind-<name>` so the commands can never
-//! mutate whatever production cluster the developer has as their current
-//! context.
+//! Down to just `kind`: create / delete / exists. Every K8s operation
+//! goes through [`crate::resource`] and `kube-rs`; there is no subprocess
+//! kubectl anywhere in the tree.
 
-use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Conventional kube context for a kind cluster named `<name>`.
-pub(super) fn kind_context(cluster: &str) -> String {
-    format!("kind-{cluster}")
-}
-
-/// Verify a host tool is on `PATH`, returning an install hint when it isn't.
-/// ztest depends on the developer having these installed; we don't bundle them.
+/// Verify a host tool is on `PATH`, returning an install hint when it
+/// isn't. ztest depends on the developer having these installed — we
+/// don't bundle them.
 pub(super) fn require_tool(bin: &str, probe: &[&str], hint: &str) -> Result<(), String> {
     match Command::new(bin)
         .args(probe)
@@ -34,20 +26,21 @@ pub(super) fn require_tool(bin: &str, probe: &[&str], hint: &str) -> Result<(), 
     }
 }
 
-/// Require both tools the cluster commands depend on. `helm` is intentionally
-/// not required: the CSI bundle is applied with `kubectl`, not Helm.
-pub(super) fn require_cluster_tools() -> Result<(), String> {
+/// Require `kind` for cluster create/delete. `kubectl` is not required:
+/// every K8s operation ztest performs goes through `kube-rs`.
+pub(super) fn require_kind() -> Result<(), String> {
     require_tool(
         "kind",
         &["version"],
         "install it from https://kind.sigs.k8s.io (e.g. `go install sigs.k8s.io/kind@latest`, `brew install kind`, or your distro package).",
-    )?;
-    require_tool(
-        "kubectl",
-        &["version", "--client"],
-        "install it from https://kubernetes.io/docs/tasks/tools/ (e.g. `brew install kubectl` or your distro package).",
-    )?;
-    Ok(())
+    )
+}
+
+/// Conventional kube context for a kind cluster named `<name>`. Used in
+/// user-facing messages ("kubectl config use-context ..."); ztest itself
+/// never selects contexts.
+pub(super) fn kind_context(cluster: &str) -> String {
+    format!("kind-{cluster}")
 }
 
 /// `true` if a kind cluster named `cluster` already exists.
@@ -60,54 +53,35 @@ pub(super) fn kind_cluster_exists(cluster: &str) -> Result<bool, String> {
     Ok(list.lines().any(|l| l.trim() == cluster))
 }
 
-/// Run a `kubectl` subcommand against the kind context, inheriting stdio so
-/// the user sees progress. Errors carry the joined argv for context.
-pub(super) fn kubectl(cluster: &str, args: &[&str]) -> Result<(), String> {
-    let ctx = kind_context(cluster);
-    let status = Command::new("kubectl")
-        .args(["--context", &ctx])
-        .args(args)
+/// Create a kind cluster (inherits stdio so the user sees `kind`'s own
+/// progress UI, which is already excellent).
+pub(super) fn kind_create(cluster: &str) -> Result<(), String> {
+    let status = Command::new("kind")
+        .args(["create", "cluster", "--name", cluster])
         .status()
-        .map_err(|e| format!("kubectl {}: {e}", args.join(" ")))?;
+        .map_err(|e| format!("`kind create cluster` failed to start: {e}"))?;
     if status.success() {
         Ok(())
     } else {
         Err(format!(
-            "kubectl --context {ctx} {} exited with {}",
-            args.join(" "),
+            "`kind create cluster --name {cluster}` exited with {}",
             status.code().unwrap_or(-1)
         ))
     }
 }
 
-/// `kubectl apply -f -` against the kind context, piping `manifest` in on
-/// stdin. Installs the embedded CSI bundle without writing temp files.
-pub(super) fn kubectl_apply_stdin(
-    cluster: &str,
-    label: &str,
-    manifest: &str,
-) -> Result<(), String> {
-    let ctx = kind_context(cluster);
-    eprintln!("  • applying {label}");
-    let mut child = Command::new("kubectl")
-        .args(["--context", &ctx, "apply", "-f", "-"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawning kubectl apply ({label}): {e}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "kubectl apply did not expose stdin".to_string())?
-        .write_all(manifest.as_bytes())
-        .map_err(|e| format!("writing manifest to kubectl ({label}): {e}"))?;
-    let status = child
-        .wait()
-        .map_err(|e| format!("waiting on kubectl apply ({label}): {e}"))?;
+/// Delete a kind cluster (inherits stdio so the user sees `kind`'s
+/// progress).
+pub(super) fn kind_delete(cluster: &str) -> Result<(), String> {
+    let status = Command::new("kind")
+        .args(["delete", "cluster", "--name", cluster])
+        .status()
+        .map_err(|e| format!("`kind delete cluster` failed to start: {e}"))?;
     if status.success() {
         Ok(())
     } else {
         Err(format!(
-            "kubectl apply ({label}) exited with {}",
+            "`kind delete cluster --name {cluster}` exited with {}",
             status.code().unwrap_or(-1)
         ))
     }

@@ -1,54 +1,29 @@
 //! `ztest setup`: bring up a local kind cluster ready to run the ztest
 //! integration suites, in one command.
 //!
-//! A production Ceph cluster gives ztest's seed/archive machinery
-//! (`materialize.rs` -> `seeds.rs` -> `mounts.rs`) CSI VolumeSnapshot + clone
-//! support. A stock kind cluster has only the `standard` local-path
-//! provisioner, which can't snapshot, so archive-backed tests hang and time
-//! out. `ztest setup` closes that gap:
+//! Two phases:
+//! 1. Create the kind cluster (subprocess to `kind`, idempotent — skipped
+//!    if the cluster already exists). `kind`'s own progress UI is
+//!    inherited.
+//! 2. Provision every K8s resource ztest needs — CSI snapshot support,
+//!    ztest StorageClasses, QoS RBAC + per-tier ServiceAccounts, the
+//!    `zaino-{seeds,qos}` namespaces, the NVMe node label — through
+//!    [`resource::initialize`], which drives them through the same
+//!    dependency-ordered [`Graph`](crate::resource::Graph) `ztest run`
+//!    uses for runtime test resources.
 //!
-//! 1. Create the kind cluster (idempotent; skipped if it exists).
-//! 2. Install the vendored, version-pinned snapshot bundle (`fixtures/kind/`,
-//!    embedded via `include_str!`): external-snapshotter CRDs + controller,
-//!    the csi-driver-host-path driver + RBAC, and the StorageClasses /
-//!    VolumeSnapshotClass ztest's defaults expect.
-//! 3. Label the node for QoS NVMe placement and create the `zaino-seeds` /
-//!    `zaino-qos` namespaces.
-//!
-//! The StorageClass / VolumeSnapshotClass names match the production Ceph
-//! names, so the identical materialization code path runs on kind and Ceph
-//! (see `fixtures/kind/README.md`).
+//! Zero `kubectl` subprocess: every K8s call goes through `kube-rs`.
 
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 
+use crate::resource::{self, InitializeOpts, NodeId, NodeState};
+
 use super::cluster_tools::{
-    kind_cluster_exists, kind_context, kubectl, kubectl_apply_stdin, require_cluster_tools,
+    kind_cluster_exists, kind_context, kind_create, require_kind, require_tool,
 };
-
-/// Apply order matters: CRDs must be Established before the VolumeSnapshotClass
-/// in `40` and before the driver's snapshotter sidecar starts.
-const SNAPSHOT_CRDS: &str = include_str!("../../fixtures/kind/00-snapshot-crds.yaml");
-const SNAPSHOT_CONTROLLER: &str = include_str!("../../fixtures/kind/10-snapshot-controller.yaml");
-const CSI_RBAC: &str = include_str!("../../fixtures/kind/20-csi-hostpath-rbac.yaml");
-const CSI_DRIVER: &str = include_str!("../../fixtures/kind/30-csi-hostpath-driver.yaml");
-const ZTEST_CLASSES: &str = include_str!("../../fixtures/kind/40-ztest-classes.yaml");
-
-/// `zaino-seeds` holds the content-addressed seed PVCs; `zaino-qos` holds the
-/// QoS reservation/job bookkeeping. Both created up front so the first test
-/// run doesn't race their creation.
-const NAMESPACES: &str = "\
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: zaino-seeds
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: zaino-qos
-";
 
 #[derive(Debug, Parser)]
 pub struct Args {
@@ -56,17 +31,27 @@ pub struct Args {
     #[arg(long, default_value = "zkn")]
     name: String,
 
-    /// Skip waiting for the CSI driver + snapshot controller to roll out. The
-    /// first archive-backed test then blocks on them instead.
+    /// Skip waiting for Deployments/StatefulSets to become Ready. Faster
+    /// setup, but the first test run then blocks on their rollout instead.
     #[arg(long)]
     no_wait: bool,
 }
 
 pub fn execute(args: Args) -> ExitCode {
-    match run(&args) {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("ztest setup: tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(run(&args)) {
         Ok(()) => {
             eprintln!(
-                "\n✓ cluster `{}` ready. Context: {}\n  Run tests with: ztest run -E 'test(...)'",
+                "\n✓ cluster `{}` ready. Context: {}\n  Run tests with: ztest run",
                 args.name,
                 kind_context(&args.name),
             );
@@ -79,98 +64,99 @@ pub fn execute(args: Args) -> ExitCode {
     }
 }
 
-fn run(args: &Args) -> Result<(), String> {
-    require_cluster_tools()?;
+async fn run(args: &Args) -> Result<(), String> {
+    // Tool + cluster prerequisites.
+    require_kind()?;
+    // `docker` is what `kind` uses to run the node container. Fail up-front
+    // with a clean message rather than surfacing kind's own error.
+    require_tool(
+        "docker",
+        &["version"],
+        "install Docker Desktop or your distro's docker package; it's what `kind` uses to run its node container.",
+    )?;
 
     // 1. Cluster.
     if kind_cluster_exists(&args.name)? {
         eprintln!("• kind cluster `{}` already exists — reusing", args.name);
     } else {
         eprintln!("• creating kind cluster `{}`", args.name);
-        let status = std::process::Command::new("kind")
-            .args(["create", "cluster", "--name", &args.name])
-            .status()
-            .map_err(|e| format!("`kind create cluster` failed to start: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "`kind create cluster --name {}` exited with {}",
-                args.name,
-                status.code().unwrap_or(-1)
-            ));
-        }
+        kind_create(&args.name)?;
     }
 
-    // 2. Snapshot bundle, in dependency order.
-    eprintln!("• installing CSI snapshot support");
-    kubectl_apply_stdin(&args.name, "snapshot CRDs", SNAPSHOT_CRDS)?;
-    // The VolumeSnapshotClass in `40` and the driver's snapshotter sidecar
-    // both need the snapshot CRDs Established first.
-    kubectl(
-        &args.name,
-        &[
-            "wait",
-            "--for=condition=established",
-            "--timeout=60s",
-            "crd/volumesnapshots.snapshot.storage.k8s.io",
-            "crd/volumesnapshotcontents.snapshot.storage.k8s.io",
-            "crd/volumesnapshotclasses.snapshot.storage.k8s.io",
-        ],
-    )?;
-    kubectl_apply_stdin(&args.name, "snapshot controller", SNAPSHOT_CONTROLLER)?;
-    kubectl_apply_stdin(&args.name, "CSI driver RBAC", CSI_RBAC)?;
-    kubectl_apply_stdin(&args.name, "CSI hostpath driver", CSI_DRIVER)?;
-    kubectl_apply_stdin(&args.name, "storage + snapshot classes", ZTEST_CLASSES)?;
+    // 2. Provision the K8s infrastructure graph. Every provider is
+    //    idempotent, so this is safe to re-run against a partially-set-up
+    //    cluster.
+    eprintln!("• provisioning cluster infrastructure");
+    let client = crate::cluster::client()
+        .await
+        .map_err(|e| format!("connect to cluster: {e}"))?;
 
-    // 3. QoS node label + namespaces.
-    eprintln!("• labelling node + creating namespaces");
-    kubectl(
-        &args.name,
-        &[
-            "label",
-            "nodes",
-            "--all",
-            &format!(
-                "{}={}",
-                crate::qos::NVME_NODE_LABEL_KEY,
-                crate::qos::NVME_NODE_LABEL_VALUE
-            ),
-            "--overwrite",
-        ],
-    )?;
-    kubectl_apply_stdin(&args.name, "ztest namespaces", NAMESPACES)?;
+    // Track lifecycle transitions in insertion order for a compact
+    // human-readable summary at the end. Providers may emit multiple
+    // transitions per node (`Acquiring` → `Ready` / `Failed`); we key by
+    // node id so the final render shows one line per node.
+    let seen: Arc<Mutex<Vec<(NodeId, NodeState)>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_capture = Arc::clone(&seen);
+    let on_change = move |id: &NodeId, state: &NodeState| {
+        let mut s = seen_capture.lock().expect("progress mutex poisoned");
+        // Terminal states get printed live; interim `Acquiring` is quiet
+        // to keep the setup output tight.
+        match state {
+            NodeState::Acquiring => {
+                eprintln!("  • {}", id.display_label());
+            }
+            NodeState::Ready => {
+                eprintln!("  ✓ {}", id.display_label());
+                upsert(&mut s, id, state);
+            }
+            NodeState::Failed(msg) => {
+                eprintln!("  ✗ {}: {}", id.display_label(), msg);
+                upsert(&mut s, id, state);
+            }
+            NodeState::Blocked => {
+                eprintln!("  · {} (blocked by failed dep)", id.display_label());
+                upsert(&mut s, id, state);
+            }
+            NodeState::Pending => {} // never surfaced to `on_change`
+        }
+    };
 
-    // 4. Wait for the data plane so the first test doesn't race it.
-    if !args.no_wait {
-        eprintln!("• waiting for CSI driver + snapshot controller to be ready");
-        // Best-effort: surface a timeout, but the cluster is still usable once
-        // the pods settle, so don't hard-fail.
-        if let Err(e) = kubectl(
-            &args.name,
-            &[
-                "rollout",
-                "status",
-                "deploy/snapshot-controller",
-                "-n",
-                "kube-system",
-                "--timeout=180s",
-            ],
-        ) {
-            eprintln!("  ! {e} (continuing — it may still settle)");
-        }
-        if let Err(e) = kubectl(
-            &args.name,
-            &[
-                "rollout",
-                "status",
-                "statefulset/csi-hostpathplugin",
-                "-n",
-                "default",
-                "--timeout=180s",
-            ],
-        ) {
-            eprintln!("  ! {e} (continuing — it may still settle)");
-        }
+    let states = resource::initialize(
+        client,
+        InitializeOpts {
+            no_wait: args.no_wait,
+            ..Default::default()
+        },
+        on_change,
+    )
+    .await
+    .map_err(|e| format!("graph shape: {e}"))?;
+
+    // Determine outcome: any Failed/Blocked node ⇒ non-zero exit. The
+    // graph doesn't abort on a single failure (that's the point — one
+    // stuck subtree shouldn't strand the rest), so we scan the final
+    // state map here.
+    let (failed, blocked): (Vec<_>, Vec<_>) = states
+        .iter()
+        .filter(|(_, s)| !matches!(s, NodeState::Ready))
+        .partition(|(_, s)| matches!(s, NodeState::Failed(_)));
+
+    if !failed.is_empty() || !blocked.is_empty() {
+        return Err(format!(
+            "{} node(s) failed, {} node(s) blocked. See `  ✗ … / · …` lines above.",
+            failed.len(),
+            blocked.len(),
+        ));
     }
 
     Ok(())
+}
+
+/// Insert-or-replace, keeping the vec in insertion order.
+fn upsert(v: &mut Vec<(NodeId, NodeState)>, id: &NodeId, state: &NodeState) {
+    if let Some(existing) = v.iter_mut().find(|(k, _)| k == id) {
+        existing.1 = state.clone();
+    } else {
+        v.push((id.clone(), state.clone()));
+    }
 }

@@ -74,7 +74,7 @@ pub struct EngineInput<'a> {
     /// Provisioned resource states (node → state) the run loop gates admission
     /// on. Empty when the run declared no resources.
     pub resource_states:
-        std::collections::HashMap<crate::provisioning::NodeId, crate::resource::NodeState>,
+        std::collections::HashMap<crate::resource::NodeId, crate::resource::NodeState>,
     /// Run-behavior options.
     pub opts: EngineOpts,
 }
