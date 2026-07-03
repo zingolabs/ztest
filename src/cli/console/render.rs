@@ -622,8 +622,14 @@ mod tests {
         let mut vt = new_vt(10, 4);
         let _ = vt.feed_str("top\r\n\r\nmid\r\n");
         let trimmed = trimmed_view(&vt);
-        let texts: Vec<String> = trimmed.iter().map(|l| line_text(&bridge::avt_line(l))).collect();
-        assert_eq!(texts, vec!["top".to_string(), String::new(), "mid".to_string()]);
+        let texts: Vec<String> = trimmed
+            .iter()
+            .map(|l| line_text(&bridge::avt_line(l)))
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["top".to_string(), String::new(), "mid".to_string()]
+        );
     }
 
     #[test]

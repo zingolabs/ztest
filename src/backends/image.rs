@@ -5,14 +5,32 @@
 //!   - [`ImageSpec::Dev`]: a Dockerfile in the local checkout, declared via
 //!     the [`dev!`] test-author macro. The image is always pre-built by the
 //!     ztest preflight pipeline (nextest list, dump inventory, `docker build`,
-//!     `kind load`). At `env.build()` time [`resolve`] only computes the
-//!     content-addressed tag and verifies it exists in the kind node's
-//!     containerd; it never shells out to docker itself.
+//!     then either `kind load` or `docker push`). At `env.build()` time
+//!     [`resolve`] only computes the content-addressed reference and verifies
+//!     it exists (in the kind node's containerd, or in the registry); it never
+//!     shells out to `docker build` itself.
 //!
-//! If the image isn't present in the cluster (typically because the user ran
-//! `cargo test` / `cargo nextest run` directly instead of `ztest run`),
-//! resolution fails with [`ImageError::DevImageMissing`] pointing at the
-//! right entry point.
+//! # Distribution modes
+//!
+//! Dev images reach the cluster one of two ways, selected by
+//! [`Distribution::from_env`] from `ZTEST_IMAGE_REGISTRY`:
+//!
+//!   - **Kind** (unset — the local-dev default): `docker build` then
+//!     `kind load docker-image` into the local kind node's containerd. The pod
+//!     references the bare `<repo>:dev-<hash>` tag.
+//!   - **Registry** (`ZTEST_IMAGE_REGISTRY=<base>`, the remote/CI path):
+//!     `docker build` then `docker push <base>/<repo>:dev-<hash>`. The pod
+//!     references that registry-qualified tag and the cluster pulls it. This is
+//!     the only path that works against a cluster the runner reaches solely by
+//!     kubeconfig — no `kind load`, no `docker exec` of a node.
+//!
+//! The content-addressed `dev-<hash>` is identical in both modes, so a build is
+//! cache-shared across them and the poison-tag invariant (see the tests) holds
+//! regardless of where the image lands.
+//!
+//! If the image isn't present (typically because the user ran `cargo test` /
+//! `cargo nextest run` directly instead of `ztest run`), resolution fails with
+//! [`ImageError::DevImageMissing`] pointing at the right entry point.
 //!
 //! [`dev!`]: ztest_macros::dev
 
@@ -60,13 +78,74 @@ pub struct ResolvedImage {
     pub image: String,
 }
 
+/// How dev images reach the cluster for this invocation. Selected once from the
+/// environment via [`Distribution::from_env`]; every site that builds, pushes,
+/// probes, or references a dev image consults it so kind-mode and registry-mode
+/// can never diverge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Distribution {
+    /// Local kind: `kind load docker-image` into the node's containerd, pod
+    /// references the bare `<repo>:dev-<hash>` tag. The default when
+    /// `ZTEST_IMAGE_REGISTRY` is unset — local dev is unchanged.
+    Kind,
+    /// Remote registry: `docker push <base>/<repo>:dev-<hash>`, the cluster
+    /// pulls it. `base` is a registry host + optional repo prefix, e.g.
+    /// `ghcr.io/zingolabs`.
+    Registry { base: String },
+}
+
+impl Distribution {
+    /// Select the mode from `ZTEST_IMAGE_REGISTRY`: set (and non-empty) →
+    /// [`Registry`](Distribution::Registry); absent → [`Kind`](Distribution::Kind).
+    /// Explicit-config, not cluster sniffing: local kind runs never set it, CI
+    /// against a remote cluster always does.
+    pub fn from_env() -> Self {
+        match registry_base() {
+            Some(base) => Distribution::Registry { base },
+            None => Distribution::Kind,
+        }
+    }
+
+    /// The pod-manifest image reference for a bare `<repo>:dev-<hash>` tag.
+    /// Kind mode returns it unchanged; registry mode prefixes the base
+    /// (trimming a trailing `/` so a base with or without one behaves the same).
+    pub fn reference(&self, local_tag: &str) -> String {
+        match self {
+            Distribution::Kind => local_tag.to_string(),
+            Distribution::Registry { base } => {
+                format!("{}/{local_tag}", base.trim_end_matches('/'))
+            }
+        }
+    }
+}
+
+/// The configured registry base (`ZTEST_IMAGE_REGISTRY`), or `None` for local
+/// kind mode. Empty is treated as unset so `ZTEST_IMAGE_REGISTRY=` is harmless.
+fn registry_base() -> Option<String> {
+    std::env::var("ZTEST_IMAGE_REGISTRY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// An optional pull secret name (`ZTEST_IMAGE_PULL_SECRET`) to inject as a pod
+/// `imagePullSecrets` entry, for a private registry whose credentials aren't on
+/// the pods' ServiceAccount or node containerd config. `None` (the default)
+/// leaves pods relying on SA-level / node-level pull auth, which is the
+/// idiomatic k8s path and covers public registries with no secret at all.
+pub fn pull_secret() -> Option<String> {
+    std::env::var("ZTEST_IMAGE_PULL_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// Resolve an [`ImageSpec`] to the string that goes into a pod manifest.
 ///
 /// For [`ImageSpec::Published`] this is the fallback registry tag. For
-/// [`ImageSpec::Dev`] it computes the content-addressed `<repo>:dev-<hash>`
-/// and verifies the image is already loaded into the kind node's containerd;
-/// the preflight pipeline is the only thing that ever runs `docker build` /
-/// `kind load`. If the image isn't present, returns
+/// [`ImageSpec::Dev`] it computes the content-addressed `<repo>:dev-<hash>`,
+/// qualifies it for the active [`Distribution`], and verifies the image is
+/// already present (loaded into the kind node's containerd, or pushed to the
+/// registry); the preflight pipeline is the only thing that ever runs
+/// `docker build`. If the image isn't present, returns
 /// [`ImageError::DevImageMissing`] so the test fails loudly.
 pub fn resolve(spec: &ImageSpec, fallback_published: &str) -> Result<ResolvedImage, ImageError> {
     match spec {
@@ -80,14 +159,20 @@ pub fn resolve(spec: &ImageSpec, fallback_published: &str) -> Result<ResolvedIma
             repo,
         } => {
             let hash = hash_context(dockerfile, context, features)?;
-            let tag = format!("{repo}:dev-{hash}");
-            if !exists_in_kind(&tag)? {
+            let local_tag = format!("{repo}:dev-{hash}");
+            let dist = Distribution::from_env();
+            let reference = dist.reference(&local_tag);
+            let present = match &dist {
+                Distribution::Kind => exists_in_kind(&local_tag)?,
+                Distribution::Registry { .. } => exists_in_registry(&reference)?,
+            };
+            if !present {
                 return Err(ImageError::DevImageMissing {
-                    tag,
+                    tag: reference,
                     dockerfile: dockerfile.clone(),
                 });
             }
-            Ok(ResolvedImage { image: tag })
+            Ok(ResolvedImage { image: reference })
         }
     }
 }
@@ -117,6 +202,8 @@ pub enum ImageError {
     DockerBuild { stderr_tail: String },
     /// `kind load docker-image` exited non-zero.
     KindLoad { stderr_tail: String },
+    /// `docker push` to the registry exited non-zero.
+    DockerPush { stderr_tail: String },
     /// `crictl images` (or its `docker exec` wrapper) failed.
     KindImageQuery { stderr_tail: String },
     /// Spawning a subprocess failed (binary missing, etc).
@@ -140,6 +227,9 @@ impl std::fmt::Display for ImageError {
             }
             ImageError::KindLoad { stderr_tail } => {
                 write!(f, "image build: kind load failed:\n{stderr_tail}")
+            }
+            ImageError::DockerPush { stderr_tail } => {
+                write!(f, "image build: docker push failed:\n{stderr_tail}")
             }
             ImageError::KindImageQuery { stderr_tail } => {
                 write!(f, "image build: cluster image query failed:\n{stderr_tail}")
@@ -288,10 +378,36 @@ pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
     Ok(false)
 }
 
+/// Query the registry for a pushed manifest via `docker manifest inspect`.
+/// Exit 0 ⇒ present; any non-zero (absent, or an auth/network error) ⇒ `false`,
+/// mirroring [`exists_in_kind`]'s "query error means Absent" contract: a false
+/// negative just triggers a (re)build+push, whose own failure surfaces the real
+/// error. `reference` is the fully-qualified `<base>/<repo>:dev-<hash>`.
+pub fn exists_in_registry(reference: &str) -> Result<bool, ImageError> {
+    let out = Command::new("docker")
+        .args(["manifest", "inspect", reference])
+        .output()
+        .map_err(|err| ImageError::Spawn {
+            cmd: format!("docker manifest inspect {reference}"),
+            err,
+        })?;
+    Ok(out.status.success())
+}
+
+/// The `docker push` argv (the args after the `docker` program name) for a
+/// registry-qualified tag. Run through the console PTY like
+/// [`docker_build_argv`] so the push progress renders live.
+pub fn docker_push_argv(reference: &str) -> Vec<String> {
+    vec!["push".to_string(), reference.to_string()]
+}
+
 /// The `docker build` argv (the args after the `docker` program name) for a
 /// dev image. The caller runs it through the console PTY (`Console::run_child`)
 /// so BuildKit detects a TTY and renders its native in-place layer progress,
-/// with `DOCKER_BUILDKIT=1` set in the child env.
+/// with `DOCKER_BUILDKIT=1` set in the child env. `tag` is whichever reference
+/// the active [`Distribution`] wants baked in: the bare `<repo>:dev-<hash>` for
+/// kind mode, the registry-qualified reference for registry mode (so the built
+/// image is ready to `docker push` with no re-tag).
 pub fn docker_build_argv(
     dockerfile: &Path,
     context: &Path,
@@ -381,10 +497,7 @@ mod tests {
         fn new(dockerfile: &str, src_name: &str, src: &[u8]) -> Ctx {
             static SEQ: AtomicU32 = AtomicU32::new(0);
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "ztest-imgtag-{}-{n}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir().join(format!("ztest-imgtag-{}-{n}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("Dockerfile"), dockerfile).unwrap();
             std::fs::write(dir.join(src_name), src).unwrap();
@@ -447,5 +560,34 @@ mod tests {
         let a = Ctx::new("FROM scratch\nCOPY main.rs /\n", "main.rs", b"fn main() {}");
         let b = Ctx::new("FROM alpine\nCOPY main.rs /\n", "main.rs", b"fn main() {}");
         assert_ne!(a.tag(&[]), b.tag(&[]));
+    }
+
+    /// Kind mode is a pass-through: the pod references the bare local tag, so
+    /// nothing about the local-dev path changes when no registry is configured.
+    #[test]
+    fn kind_reference_is_the_bare_tag() {
+        let d = Distribution::Kind;
+        assert_eq!(d.reference("zainod:dev-abc123"), "zainod:dev-abc123");
+    }
+
+    /// Registry mode prefixes the base and preserves the content-addressed
+    /// `dev-<hash>` (so the image is cache-shared with a kind build of the same
+    /// bytes), and a trailing slash on the base is normalised away.
+    #[test]
+    fn registry_reference_prefixes_base_and_preserves_hash() {
+        let d = Distribution::Registry {
+            base: "ghcr.io/zingolabs".into(),
+        };
+        assert_eq!(
+            d.reference("zainod:dev-abc123"),
+            "ghcr.io/zingolabs/zainod:dev-abc123"
+        );
+        let trailing = Distribution::Registry {
+            base: "ghcr.io/zingolabs/".into(),
+        };
+        assert_eq!(
+            trailing.reference("zainod:dev-abc123"),
+            "ghcr.io/zingolabs/zainod:dev-abc123"
+        );
     }
 }

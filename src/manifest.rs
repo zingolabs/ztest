@@ -43,6 +43,12 @@ pub struct PodSpec {
     /// `General` and `None` schedule anywhere (the default). This is
     /// placement, not sizing; see [`crate::qos::Pool`].
     pub placement: Option<crate::qos::Pool>,
+    /// Optional `imagePullSecrets` entry name (`ZTEST_IMAGE_PULL_SECRET`), for a
+    /// private registry whose pull credentials aren't already on the pods'
+    /// ServiceAccount or node containerd config. `None` (the default, and every
+    /// kind-mode / public-registry run) omits the field entirely and relies on
+    /// SA-level / node-level pull auth. See [`crate::backends::image::pull_secret`].
+    pub image_pull_secret: Option<String>,
 }
 
 impl PodSpec {
@@ -115,6 +121,14 @@ impl PodSpec {
         }
         if !security_context.is_empty() {
             spec["securityContext"] = Value::Object(security_context);
+        }
+
+        // Private-registry pull creds, when the cluster expects them at the pod
+        // level rather than on the ServiceAccount. Omitted otherwise (kind mode,
+        // public registries, SA-/node-level auth) so the common path is
+        // untouched. The named secret must already exist in the test namespace.
+        if let Some(secret) = &self.image_pull_secret {
+            spec["imagePullSecrets"] = json!([{ "name": secret }]);
         }
 
         // Accumulate tolerations (NVMe placement + QoS fast-eviction).
@@ -235,6 +249,7 @@ pub fn pod_spec_for_validator(
     opts: &ComponentOpts,
     pod_name: String,
 ) -> PodSpec {
+    let image_pull_secret = backends::image::pull_secret();
     match label {
         "zebrad" => PodSpec {
             pod_name,
@@ -265,6 +280,7 @@ pub fn pod_spec_for_validator(
             run_as_user: opts.shared_state.as_ref().map(|_| 1000),
             placement: None,
             guaranteed: None,
+            image_pull_secret: image_pull_secret.clone(),
         },
         "zcashd" => PodSpec {
             pod_name,
@@ -284,6 +300,7 @@ pub fn pod_spec_for_validator(
             run_as_user: None,
             placement: None,
             guaranteed: None,
+            image_pull_secret,
         },
         other => panic!("pod_spec_for_validator: unknown validator backend label {other:?}"),
     }
@@ -294,6 +311,7 @@ pub fn pod_spec_for_indexer(
     opts: &ComponentOpts,
     pod_name: String,
 ) -> Result<PodSpec, EnvError> {
+    let image_pull_secret = backends::image::pull_secret();
     match label {
         "zainod" => {
             let resolved =
@@ -327,6 +345,7 @@ pub fn pod_spec_for_indexer(
                 run_as_user: None,
                 placement: None,
                 guaranteed: None,
+                image_pull_secret: image_pull_secret.clone(),
             })
         }
         "lightwalletd" => Ok(PodSpec {
@@ -347,6 +366,7 @@ pub fn pod_spec_for_indexer(
             run_as_user: None,
             placement: None,
             guaranteed: None,
+            image_pull_secret,
         }),
         other => panic!("pod_spec_for_indexer: unknown indexer backend label {other:?}"),
     }
@@ -382,6 +402,7 @@ mod tests {
             run_as_user: None,
             placement: None,
             guaranteed: None,
+            image_pull_secret: None,
         }
     }
 
@@ -511,6 +532,20 @@ mod tests {
         let c = container(&pod);
         assert!(c.get("resources").is_none());
         assert!(c.get("env").is_none());
+    }
+
+    #[test]
+    fn image_pull_secret_renders_only_when_set() {
+        // Default (kind mode / public registry): no imagePullSecrets key.
+        let s = pod_spec_json(&base_spec().render(&coords(), "t", &[]).unwrap());
+        assert!(s.get("imagePullSecrets").is_none());
+        // Private-registry mode: the named secret is injected pod-level.
+        let spec = PodSpec {
+            image_pull_secret: Some("ghcr-pull".into()),
+            ..base_spec()
+        };
+        let s = pod_spec_json(&spec.render(&coords(), "t", &[]).unwrap());
+        assert_eq!(s["imagePullSecrets"][0]["name"], "ghcr-pull");
     }
 
     fn pod_spec_json(pod: &Pod) -> Value {

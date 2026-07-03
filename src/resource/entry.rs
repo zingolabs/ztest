@@ -7,13 +7,14 @@
 use std::collections::HashMap;
 
 use k8s_openapi::api::core::v1::Namespace;
-use kube::api::{Api, DeleteParams, DynamicObject, ListParams};
 use kube::Client;
+use kube::api::{Api, DeleteParams, DynamicObject, ListParams};
 
 use crate::inventory::{DevImageEntry, SeedEntry};
 use crate::qos::{self, QosClass};
 use crate::resource::context::Cx;
 use crate::resource::graph::{Graph, GraphError};
+use crate::resource::impls::storage::StorageProfile;
 use crate::resource::impls::{image, qos as qos_impl, scaffolding, seed, storage};
 use crate::resource::provider::NodeId;
 use crate::resource::state::NodeState;
@@ -36,6 +37,13 @@ pub struct InitializeOpts {
     /// storage stack are parallel), so 8 comfortably covers the fanout. A
     /// TTY caller that wants a coherent single-line UI can pass 1.
     pub max_concurrent: usize,
+
+    /// Storage substrate to provision the ztest StorageClasses on.
+    pub storage: StorageProfile,
+
+    /// Blanket-label every node with the NVMe pool label. `false` on real
+    /// multi-node clusters, where the operator owns which nodes carry NVMe.
+    pub label_nvme_pool: bool,
 }
 
 impl Default for InitializeOpts {
@@ -43,6 +51,8 @@ impl Default for InitializeOpts {
         Self {
             no_wait: false,
             max_concurrent: 8,
+            storage: StorageProfile::HostpathFixtures,
+            label_nvme_pool: true,
         }
     }
 }
@@ -83,13 +93,15 @@ where
     )));
 
     // Node labeling (NVMe pool selector). Independent of everything else.
-    graph.add_dedup(Box::new(scaffolding::NodeLabelProvider::new(
-        qos::NVME_NODE_LABEL_KEY,
-        qos::NVME_NODE_LABEL_VALUE,
-    )));
+    if opts.label_nvme_pool {
+        graph.add_dedup(Box::new(scaffolding::NodeLabelProvider::new(
+            qos::NVME_NODE_LABEL_KEY,
+            qos::NVME_NODE_LABEL_VALUE,
+        )));
+    }
 
-    // Storage stack — CRDs, controller, RBAC, driver, StorageClasses.
-    for p in storage::providers() {
+    // Storage stack.
+    for p in storage::providers(&opts.storage) {
         graph.add_dedup(p);
     }
 
@@ -118,10 +130,7 @@ where
 ///
 /// Deduplicates content-addressed nodes: two tests declaring the same seed
 /// source share one node (the [`Graph::add_dedup`] contract).
-pub fn plan_runtime(
-    images: &[DevImageEntry],
-    seeds: &[SeedEntry],
-) -> Result<Graph, String> {
+pub fn plan_runtime(images: &[DevImageEntry], seeds: &[SeedEntry]) -> Result<Graph, String> {
     let mut graph = Graph::new();
     for entry in images {
         let provider = image::ImageProvider::new(entry.clone())?;

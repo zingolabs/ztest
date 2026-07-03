@@ -34,21 +34,21 @@ use zcash_client_backend::data_api::wallet::{
 use zcash_client_backend::data_api::{AccountBirthday, WalletRead, WalletWrite};
 use zcash_client_backend::fees::standard::SingleOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule};
+use zcash_client_backend::proto::compact_formats::CompactBlock;
+use zcash_client_backend::proto::service::BlockId;
+use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 use zcash_client_backend::wallet::OvkPolicy;
+use zcash_client_sqlite::util::SystemClock;
+use zcash_client_sqlite::wallet::init::init_wallet_db;
+use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_keys::address::Address;
+use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::ShieldedProtocol;
-use zcash_client_backend::proto::compact_formats::CompactBlock;
-use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
-use zcash_client_backend::proto::service::BlockId;
-use zcash_client_sqlite::util::SystemClock;
-use zcash_client_sqlite::{AccountUuid, WalletDb};
-use zcash_client_sqlite::wallet::init::init_wallet_db;
-use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
+use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::local_consensus::LocalNetwork;
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::TxId;
 
 use crate::handles::HandleInner;
 use crate::handles::wallet::{
@@ -127,12 +127,7 @@ impl LrzWallet {
 
 impl std::fmt::Debug for LrzWallet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let n = self
-            .inner
-            .accounts
-            .lock()
-            .map(|a| a.len())
-            .unwrap_or(0);
+        let n = self.inner.accounts.lock().map(|a| a.len()).unwrap_or(0);
         f.debug_struct("LrzWallet").field("accounts", &n).finish()
     }
 }
@@ -155,7 +150,9 @@ fn to_local_network(a: &ActivationHeights) -> LocalNetwork {
 }
 
 /// Connect a lightwalletd gRPC client to the indexer.
-async fn connect(indexer_uri: &str) -> Result<CompactTxStreamerClient<tonic::transport::Channel>, BoxError> {
+async fn connect(
+    indexer_uri: &str,
+) -> Result<CompactTxStreamerClient<tonic::transport::Channel>, BoxError> {
     let channel = tonic::transport::Channel::from_shared(indexer_uri.to_string())
         .map_err(|e| format!("librustzcash: bad indexer uri {indexer_uri:?}: {e}"))?
         .connect()
@@ -174,17 +171,18 @@ impl WalletBackend for LrzWallet {
         let params = to_local_network(spec.activation);
 
         // Seed from the BIP-39 mnemonic phrase.
-        let mnemonic = bip0039::Mnemonic::<bip0039::English>::from_phrase(spec.mnemonic.to_string())
-            .map_err(|e| format!("librustzcash: invalid mnemonic phrase: {e}"))?;
+        let mnemonic =
+            bip0039::Mnemonic::<bip0039::English>::from_phrase(spec.mnemonic.to_string())
+                .map_err(|e| format!("librustzcash: invalid mnemonic phrase: {e}"))?;
         let seed = SecretVec::new(mnemonic.to_seed("").to_vec());
 
         // Fresh SQLite wallet in a temp dir.
-        let dir = tempfile::tempdir().map_err(|e| format!("librustzcash: create wallet dir: {e}"))?;
+        let dir =
+            tempfile::tempdir().map_err(|e| format!("librustzcash: create wallet dir: {e}"))?;
         let db_path = dir.path().join("wallet.sqlite");
         let mut db = WalletDb::for_path(&db_path, params, SystemClock, OsRng)
             .map_err(|e| format!("librustzcash: open wallet db: {e}"))?;
-        init_wallet_db(&mut db, None)
-            .map_err(|e| format!("librustzcash: init wallet db: {e}"))?;
+        init_wallet_db(&mut db, None).map_err(|e| format!("librustzcash: init wallet db: {e}"))?;
 
         // Birthday: the tree state at the wallet birthday height, fetched from
         // the indexer. `from_treestate` reads the frontier so scanning resumes
@@ -192,7 +190,10 @@ impl WalletBackend for LrzWallet {
         let mut client = connect(spec.indexer_uri).await?;
         let birthday_height = u64::from(u32::from(spec.birthday));
         let treestate = client
-            .get_tree_state(BlockId { height: birthday_height, hash: vec![] })
+            .get_tree_state(BlockId {
+                height: birthday_height,
+                hash: vec![],
+            })
             .await
             .map_err(|e| format!("librustzcash: get_tree_state({birthday_height}): {e}"))?
             .into_inner();
@@ -268,10 +269,8 @@ impl WalletBackend for LrzWallet {
     async fn balances(&self, account: AccountId) -> Result<PoolBalances, BoxError> {
         let acct = self.account(account)?;
         let db = acct.db.lock().await;
-        let policy = ConfirmationsPolicy::new_symmetrical(
-            NonZeroU32::new(1).expect("1 is nonzero"),
-            false,
-        );
+        let policy =
+            ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false);
         let zats = |z: Zatoshis| u64::from(z);
         let summary = db
             .get_wallet_summary(policy)
@@ -312,34 +311,40 @@ impl WalletBackend for LrzWallet {
             .ok_or_else(|| format!("librustzcash: bad recipient address {to:?}"))?;
         let amount = Zatoshis::from_u64(zats)
             .map_err(|e| format!("librustzcash: bad send amount {zats}: {e:?}"))?;
-        let policy = ConfirmationsPolicy::new_symmetrical(
-            NonZeroU32::new(1).expect("1 is nonzero"),
-            false,
-        );
+        let policy =
+            ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false);
         let prover = LocalTxProver::bundled();
         let sk = SpendingKeys::from_unified_spending_key(acct.usk.clone());
         let mut db = acct.db.lock().await;
         // `CommitmentTreeErrT` is a free param appearing only in the error type
         // (proposal/selection never touches the commitment tree), so it can't be
         // inferred; `Infallible` marks it unreachable, matching librustzcash.
-        let proposal = propose_standard_transfer_to_address::<Db, LocalNetwork, std::convert::Infallible>(
-            &mut *db,
-            &acct.params,
-            StandardFeeRule::Zip317,
-            acct.account_id,
-            policy,
-            &to_addr,
-            amount,
-            None,
-            None,
-            ShieldedProtocol::Orchard,
-        )
-        .map_err(|e| format!("librustzcash: propose transfer: {e}"))?;
+        let proposal =
+            propose_standard_transfer_to_address::<Db, LocalNetwork, std::convert::Infallible>(
+                &mut *db,
+                &acct.params,
+                StandardFeeRule::Zip317,
+                acct.account_id,
+                policy,
+                &to_addr,
+                amount,
+                None,
+                None,
+                ShieldedProtocol::Orchard,
+            )
+            .map_err(|e| format!("librustzcash: propose transfer: {e}"))?;
         // `InputsErrT`/`ChangeErrT` appear only in the return error type, so the
         // compiler can't infer them; the proposal is already built, so no input
         // selection or change derivation happens here — both are `Infallible`
         // (matches librustzcash's own call sites).
-        let txids = create_proposed_transactions::<Db, LocalNetwork, std::convert::Infallible, _, std::convert::Infallible, _>(
+        let txids = create_proposed_transactions::<
+            Db,
+            LocalNetwork,
+            std::convert::Infallible,
+            _,
+            std::convert::Infallible,
+            _,
+        >(
             &mut *db,
             &acct.params,
             &prover,
@@ -354,10 +359,8 @@ impl WalletBackend for LrzWallet {
 
     async fn shield(&self, account: AccountId) -> Result<Vec<TxId>, BoxError> {
         let acct = self.account(account)?;
-        let policy = ConfirmationsPolicy::new_symmetrical(
-            NonZeroU32::new(1).expect("1 is nonzero"),
-            false,
-        );
+        let policy =
+            ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false);
         let prover = LocalTxProver::bundled();
         let input_selector = GreedyInputSelector::<Db>::new();
         let change_strategy = SingleOutputChangeStrategy::<Db>::new(
@@ -425,7 +428,10 @@ impl BlockSource for MemBlockCache {
 
 #[async_trait]
 impl BlockCache for MemBlockCache {
-    fn get_tip_height(&self, range: Option<&ScanRange>) -> Result<Option<BlockHeight>, Self::Error> {
+    fn get_tip_height(
+        &self,
+        range: Option<&ScanRange>,
+    ) -> Result<Option<BlockHeight>, Self::Error> {
         let blocks = self.blocks.lock().expect("mem block cache poisoned");
         let tip = match range {
             None => blocks.keys().next_back().copied(),

@@ -27,7 +27,7 @@ use k8s_openapi::api::rbac::v1::{ClusterRole, RoleBinding};
 use kube::api::{Api, Patch, PatchParams};
 use serde_json::json;
 
-use crate::qos::{self, QosClass, Resources, GIB, MIB};
+use crate::qos::{self, GIB, MIB, QosClass, Resources};
 use crate::resource::kube::FIELD_MANAGER;
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 
@@ -82,7 +82,9 @@ impl Provider for QosRbacProvider {
     }
 
     fn deps(&self) -> Vec<NodeId> {
-        vec![NodeId::Namespace(qos::kube_store::QOS_NAMESPACE.to_string())]
+        vec![NodeId::Namespace(
+            qos::kube_store::QOS_NAMESPACE.to_string(),
+        )]
     }
 
     fn lifetime(&self) -> Lifetime {

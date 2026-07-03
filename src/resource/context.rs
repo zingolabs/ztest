@@ -64,7 +64,12 @@ impl Cx {
     /// A minimal `Cx` for headless (non-TTY) runs and unit tests: just the
     /// client. No console, no progress sink, waits enabled.
     pub fn headless(client: Client) -> Self {
-        Self { client, console: None, progress: None, no_wait: false }
+        Self {
+            client,
+            console: None,
+            progress: None,
+            no_wait: false,
+        }
     }
 
     /// Start a builder for a `Cx` that carries a console and/or progress

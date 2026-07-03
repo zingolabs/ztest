@@ -27,11 +27,11 @@
 mod render;
 mod theme;
 
+pub(crate) use self::render::SPINNER_STEP_MS;
 pub use self::render::{
     RunProgress, render, render_cancel_panel, render_live_panel, render_preflight_panel,
     render_transfers,
 };
-pub(crate) use self::render::SPINNER_STEP_MS;
 pub use self::theme::Theme;
 pub use crate::qos::schedule::{QosPlan, TierPlan};
 

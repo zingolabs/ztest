@@ -62,6 +62,9 @@ pub enum NodeId {
     CsiRbac,
     /// CSI hostpath driver StatefulSet + `CSIDriver` object.
     CsiDriver,
+    /// The ztest `LVMCluster` under
+    /// [`StorageProfile::Lvms`](crate::resource::StorageProfile).
+    LvmCluster,
     /// ztest's `rook-ceph-block*` StorageClasses + the `ceph-rbd-snapclass`
     /// VolumeSnapshotClass.
     StorageClasses,
@@ -94,6 +97,7 @@ impl NodeId {
             Self::SnapshotController => "snapshot-controller".into(),
             Self::CsiRbac => "csi-rbac".into(),
             Self::CsiDriver => "csi-driver".into(),
+            Self::LvmCluster => "lvm-cluster".into(),
             Self::StorageClasses => "storage-classes".into(),
             Self::QosRbac => "qos-rbac".into(),
             Self::QosServiceAccount(c) => format!("qos-sa/{}", c.as_label()),

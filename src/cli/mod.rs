@@ -65,8 +65,9 @@ pub enum Command {
     #[command(name = "list-mounts")]
     ListMounts(list_mounts::Args),
 
-    /// Create a local kind cluster with the CSI snapshot support ztest
-    /// needs (one command). Idempotent.
+    /// Provision a cluster for the ztest suites (one command). Targets a
+    /// remote cluster (kubeconfig/ServiceAccount), a local `kind` cluster, or
+    /// local OpenShift Community (`crc`); see `--target`. Idempotent.
     Setup(setup::Args),
 
     /// Tear down the local kind cluster, or just its per-test

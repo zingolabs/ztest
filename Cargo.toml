@@ -140,6 +140,7 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 # inventory phase consumes. Version tracks the installed `cargo nextest`; shares
 # the single crossterm 0.29 in the lock — no skew with ratatui's crossterm.
 nextest-metadata = "0.14"
+dialoguer = { version = "0.12.0", default-features = false }
 
 [features]
 default = ["librustzcash"]

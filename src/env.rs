@@ -1332,7 +1332,12 @@ struct MaterializeCtx<'a> {
 
 /// One pod to materialize: `(id, spec, opts, optional validator backend)`.
 /// Shared by both materialization phases (validators, then dependents).
-type MaterializeItem = (u64, PodSpec, ComponentOpts, Option<Arc<dyn ValidatorBackend>>);
+type MaterializeItem = (
+    u64,
+    PodSpec,
+    ComponentOpts,
+    Option<Arc<dyn ValidatorBackend>>,
+);
 
 #[cfg(test)]
 mod tests {

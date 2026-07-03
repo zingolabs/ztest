@@ -1,11 +1,17 @@
 # Cluster Administration
 
-Bare-metal Kubernetes cluster hosting self-hosted GH Actions runners +
-the `ztest` orchestrator. Optimized for low-maintenance on a
-small team.
+Bare-metal Kubernetes cluster that runs the actual test workloads
+(validators, indexers, snapshots). CI runners are GitHub-hosted and reach
+it over kubeconfig + a container registry — nothing runner-side lives in
+the cluster. Optimized for low-maintenance on a small team.
 
 Data plane in the cluster; management plane over Tailscale. No public
 ports on any node.
+
+> **Local rehearsal.** For a single-node OpenShift (OKD) cluster on a
+> workstation — the local stand-in for validating ztest against OpenShift's
+> `restricted-v2` SCC and `topolvm.io` CSI before prod — see
+> [openshift-cluster-setup.md](openshift-cluster-setup.md).
 
 ## Hardware
 
@@ -47,7 +53,8 @@ needs an external Service (typically nothing).
 | CNI               | Cilium                                       |
 | Storage CSI       | Rook + Ceph (RBD)                            |
 | LB (optional)     | MetalLB, L2 mode                             |
-| Runner controller | ARC Scale Sets (`kubernetes` mode)           |
+| CI runners        | GitHub-hosted (external; kubeconfig + registry) |
+| Image registry    | `ghcr.io` (runner pushes, cluster pulls)     |
 | GitOps            | FluxCD                                       |
 | Observability     | Prometheus + Grafana + Loki                  |
 | Secrets           | sops-nix (host) + External Secrets (cluster) |
@@ -156,30 +163,47 @@ Kube API is reachable **only** over Tailscale. No public TLS, no
 `LoadBalancer` for the API. CI service accounts use OAuth clients with
 scoped tags, not engineer credentials.
 
-## Runners — ARC Scale Sets
+## Runners — GitHub-hosted
 
-GitHub-supported successor to ARC v1. Auto-scales 0 → N based on the
-GitHub-side queue.
+CI runs on **default GitHub-hosted runners**, not self-hosted / ARC pods.
+The integration job does no heavy work locally: it builds and pushes the
+dev image, then drives the test binary over kubeconfig while every
+expensive operation (validators, sync, snapshots) runs on this cluster. A
+stock 2-core / 7-GiB GitHub runner is enough, and it removes the ARC
+controller, its scaling, and its in-cluster runner pods from the cluster's
+maintenance surface entirely.
 
-```bash
-helm install arc \
-    --namespace arc-systems --create-namespace \
-    oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+The runner reaches the cluster two ways, both configured as repo secrets:
 
-helm install zaino-runners \
-    --namespace arc-runners --create-namespace \
-    --set githubConfigUrl="https://github.com/zingolabs/infrastructure" \
-    --set githubConfigSecret.github_token="<PAT or App token>" \
-    --set containerMode.type="kubernetes" \
-    --set minRunners=0 --set maxRunners=8 \
-    oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
-```
+- **Kube API — ServiceAccount token.** Create a SA with the run RBAC
+  (below), mint a token, embed it in a kubeconfig, store base64 as
+  `KUBECONFIG_B64`. `ztest` picks it up via `kube::Config::infer()`; the
+  SA token is the primary auth path. (If the API server is only reachable
+  over Tailscale, add the `tailscale/github-action` step to the job — not
+  a hard requirement of this model.)
+- **Images — registry.** The runner `docker push`es
+  `ghcr.io/<owner>/<repo>:dev-<hash>` (auth: the job's `GITHUB_TOKEN`); the
+  cluster pulls it over egress. `ghcr.io` needs no cluster ingress, which
+  is why it fits a cluster with no public API/LB. `ztest` is put in
+  registry mode by setting `ZTEST_IMAGE_REGISTRY` in the job env; see
+  [running-tests.md](running-tests.md#image-distribution).
 
-`containerMode.type=kubernetes` runs jobs as sibling pods via the kube
-API — not DinD. This is the model `ztest` is built against.
+### Registry pull auth
 
-Token: GitHub App with `Actions: read+write` scoped to infrastructure +
-consuming repos. Rotated via External Secrets.
+For **public** `ghcr.io` packages the cluster needs no pull creds. For
+**private** packages, give the pods' ServiceAccount an `imagePullSecrets`
+entry (replicated into ephemeral test namespaces by a reflector, or
+attached to the namespace default SA), or set `ZTEST_IMAGE_PULL_SECRET` to
+have `ztest` inject a pod-level `imagePullSecrets` referencing a
+namespace-local secret.
+
+### Run RBAC
+
+The CI ServiceAccount needs: create/delete namespaces; CRUD
+pods/services/configmaps/PVCs/leases within them; create `VolumeSnapshot`s
+and (cluster-scoped) `VolumeSnapshotContent`s; read nodes / `CSIDriver`s
+(capacity + snapclass probing). Scope it to the run and rotate the token
+via External Secrets.
 
 ## GitOps — FluxCD
 
@@ -193,7 +217,7 @@ infrastructure/cluster/
 │   ├── modules/
 │   └── tests/              # nixosTest fixtures
 ├── flux-system/
-├── apps/                   # rook-ceph, cilium, arc, observability, seeds-reconciler
+├── apps/                   # rook-ceph, cilium, observability, seeds-reconciler
 └── infrastructure/         # cert-manager, external-secrets, metallb
 ```
 
@@ -209,8 +233,8 @@ Standard stack:
 - Loki + Promtail, 7 days.
 - AlertManager → `#cluster-alerts` on Slack.
 
-Dashboards that matter: Ceph OSD/MON/PG health, ARC queue depth + pod
-startup latency, per-test artifact size, seed reconciler success rate.
+Dashboards that matter: Ceph OSD/MON/PG health, per-test pod startup
+latency, per-test artifact size, seed reconciler success rate.
 
 ## Bootstrap
 
@@ -257,8 +281,9 @@ flux bootstrap github --owner=zingolabs --repository=infrastructure \
 git tag cluster-bootstrap-$(date +%Y%m%d)
 ```
 
-After step 7, Flux installs ARC, MetalLB, cert-manager, External
-Secrets, observability, and the seed reconciler.
+After step 7, Flux installs MetalLB, cert-manager, External Secrets,
+observability, and the seed reconciler. (CI runners are GitHub-hosted, so
+there is no in-cluster runner controller to install.)
 
 ## Verify before declaring production
 
@@ -276,9 +301,8 @@ Secrets, observability, and the seed reconciler.
 
 ## Day-2 ops
 
-- **Weekly:** Grafana scan for slow leaks (disk trend, runner startup).
-- **Monthly:** bump Rook / Cilium / ARC chart versions; Flux applies on
-  merge.
+- **Weekly:** Grafana scan for slow leaks (disk trend, pod startup).
+- **Monthly:** bump Rook / Cilium chart versions; Flux applies on merge.
 - **Quarterly:** Kubernetes minor upgrade. One node at a time, 4–6 h.
 
 ### Adding a node
@@ -323,7 +347,7 @@ ssh nixos@node-1.zaino-cluster.ts.net sudo k3s server \
 # 3. Flux reconciles from git.
 # 4. Rook re-creates Ceph. If local disks were wiped, RBD data is gone —
 #    archives re-materialize from LFS; ephemerals were transient.
-# 5. ARC reconnects to GitHub.
+# 5. GitHub-hosted runners reconnect on the next CI run (nothing to restore).
 ```
 
 DR is rehearsed annually against a deliberately destroyed staging

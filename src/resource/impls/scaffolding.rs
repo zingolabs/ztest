@@ -133,7 +133,9 @@ impl Provider for NodeLabelProvider {
         let patch = json!({ "metadata": { "labels": { &self.key: &self.value } } });
         let params = PatchParams::default();
         for node in list.items {
-            let Some(name) = node.metadata.name else { continue };
+            let Some(name) = node.metadata.name else {
+                continue;
+            };
             api.patch(&name, &params, &Patch::Merge(&patch))
                 .await
                 .map_err(|e| {

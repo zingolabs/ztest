@@ -8,9 +8,38 @@ entry point.
 - `cargo nextest` **≥ 0.9.x** — the library reads
   `NEXTEST_TEST_GLOBAL_SLOT` from env, set by nextest when scheduling
   parallel test processes. Older nextest doesn't set it.
-- A reachable cluster API. CI: in-pod SA token (automatic). Dev: a
-  kubeconfig pointing at the cluster's tailnet API server (see
-  [architecture-overview.md](architecture-overview.md#cluster-access)).
+- A reachable cluster API, resolved by `kube::Config::infer()`. Two auth
+  paths, both automatic: a **ServiceAccount token** — either the in-pod
+  token when the runner is itself a cluster pod, or a SA-token
+  `KUBECONFIG` when the runner is external (a GitHub-hosted runner, see
+  CI below) — or a dev `KUBECONFIG` pointing at a local kind cluster.
+- **Dev-image distribution** (see [Image distribution](#image-distribution)):
+  local `kind load` by default, or `docker push` to a registry when
+  `ZTEST_IMAGE_REGISTRY` is set (the remote/CI path).
+
+## Image distribution
+
+A `dev!` image is built once by the preflight pipeline and made
+available to the cluster in one of two modes, chosen by
+`ZTEST_IMAGE_REGISTRY`:
+
+| Mode | `ZTEST_IMAGE_REGISTRY` | Build → make available | Pod image ref |
+| --- | --- | --- | --- |
+| **Kind** (dev default) | unset | `docker build` → `kind load docker-image` | `<repo>:dev-<hash>` |
+| **Registry** (remote/CI) | e.g. `ghcr.io/zingolabs` | `docker build` → `docker push` | `<base>/<repo>:dev-<hash>` |
+
+The content-addressed `dev-<hash>` is identical in both modes, so a build
+is cache-shared and a warm image is skipped (kind: containerd query;
+registry: `docker manifest inspect`). Registry mode is the only path that
+works against a cluster the runner reaches solely by kubeconfig — there is
+no local kind node to `kind load` into or `docker exec`.
+
+Pods pull the registry image via their ServiceAccount's / node's registry
+credentials (the idiomatic k8s path; nothing to configure for a public
+registry). For a private registry that instead expects **pod-level** pull
+creds, set `ZTEST_IMAGE_PULL_SECRET=<secret-name>` and ztest injects it as
+an `imagePullSecrets` entry; the named secret must already exist in each
+test namespace.
 
 ## Dev
 
@@ -40,30 +69,49 @@ kubectl delete ns -l zaino.io/owner=${USER}
 
 ## CI (GitHub Actions)
 
-One job. One ARC runner pod. One `cargo nextest` invocation. nextest
-fans out test processes across slots inside the pod; the cluster does
-the actual work via the slot-→-namespace model.
+One job on a **default GitHub-hosted runner**. The runner only builds and
+pushes the dev image and drives the test binary over kubeconfig — every
+expensive operation (validators, sync, snapshots) runs on the cluster, so
+the runner needs only a few cores and a few GiB of RAM. No self-hosted /
+ARC runners.
+
+Auth is a **ServiceAccount-token `KUBECONFIG`** stored as a repo secret:
+create a SA on the cluster with the run RBAC (namespace CRUD, VolumeSnapshot
+create, node/CSIDriver read), mint a token, embed it in a kubeconfig, store
+it as `KUBECONFIG_B64`. Images go to a registry both the runner and the
+cluster reach — `ghcr.io` is the natural fit (the runner pushes with
+`GITHUB_TOKEN`; the cluster pulls over egress, so no cluster ingress is
+needed).
 
 ```yaml
 env:
   ZTEST_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+  ZTEST_IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
 
 jobs:
   test:
-    runs-on: [self-hosted, zaino-arc]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { lfs: true }
 
-      - run: cargo nextest run -p zaino-integration-tests --test-threads 8
+      - name: kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+
+      - name: registry login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - run: ztest run -p clientless -p e2e --test-threads 8
 
       - if: always()
         run: kubectl delete ns -l zaino.io/run-id=$ZTEST_RUN_ID
 ```
 
-`ZTEST_RUN_ID` is the only env var the library reads in CI;
-test processes use it as the namespace name prefix and stamp it as a
-label on every resource (so observability queries can filter by run).
+`ZTEST_RUN_ID` prefixes each namespace name and is stamped as a label on
+every resource (so observability and the cleanup step can filter by run);
+`ZTEST_IMAGE_REGISTRY` selects registry-mode image distribution.
 
 No artifact collection — logs, events, and metrics are picked up
 continuously by cluster-resident observability (Promtail → Loki,
@@ -419,6 +467,6 @@ filters operate on cases too. See
 ## Open
 
 1. **Live log streaming in dev.** `env.handle(&ref).logs().subscribe()` on top of the kube `Pod/log` watch — deferred to v2 because in CI Loki already covers it.
-1. **`#[requires(cluster_capability)]`.** A capabilities probe at `TestEnv::build()` (e.g. Ceph snapshots present, ARC version, GPU nodes)
+1. **`#[requires(cluster_capability)]`.** A capabilities probe at `TestEnv::build()` (e.g. Ceph snapshots present, registry reachable, GPU nodes)
    so tests skip cleanly on incompatible clusters instead of failing opaquely.
 1. **Deterministic seed warmup in CI.** First test of a slot pays the archive-materialize cost on a cold node

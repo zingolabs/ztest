@@ -346,8 +346,14 @@ testnet-3.1m · 63%";
         assert!(joined.contains("Inventory"), "left col missing:\n{joined}");
         assert!(joined.contains("Scheduling"), "left col missing:\n{joined}");
         // Right column content present, to the right of the left column.
-        assert!(joined.contains("dev-zainod"), "right col missing:\n{joined}");
-        assert!(joined.contains("testnet-3.1m"), "right col missing:\n{joined}");
+        assert!(
+            joined.contains("dev-zainod"),
+            "right col missing:\n{joined}"
+        );
+        assert!(
+            joined.contains("testnet-3.1m"),
+            "right col missing:\n{joined}"
+        );
         // The branded rule and the first transfer share the top row.
         assert!(out[0].contains("────"), "top rule row:\n{joined}");
     }
@@ -358,7 +364,10 @@ testnet-3.1m · 63%";
         let joined = out.join("\n");
         assert!(joined.contains("Preflight"), "left col missing:\n{joined}");
         // Right column dropped on a narrow terminal.
-        assert!(!joined.contains("dev-zainod"), "right col leaked:\n{joined}");
+        assert!(
+            !joined.contains("dev-zainod"),
+            "right col leaked:\n{joined}"
+        );
     }
 
     #[test]

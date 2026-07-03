@@ -28,9 +28,17 @@ isolated, peerable Zcash topology in CI can depend on it.
    when a test breaks in a way the API docs don't explain.
 
 1. **[Cluster administration](cluster-administration.md)** — the
-   Kubernetes cluster the library targets: NixOS + k3s + Cilium +
-   Rook-Ceph + ARC Scale Sets, on bare metal behind Tailscale. Read if
-   you operate the cluster or are bootstrapping a new one.
+   production Kubernetes cluster the library targets: NixOS + k3s + Cilium +
+   Rook-Ceph on bare metal, with GitHub-hosted CI runners reaching it by
+   kubeconfig + registry. Read if you operate the cluster or are
+   bootstrapping a new one.
+
+1. **[Local OpenShift (crc) setup](openshift-cluster-setup.md)** — bringing
+   up a single-node OKD cluster on a workstation via `crc` as the local
+   rehearsal for the OpenShift target: the `oc`/`crc` commands, installing
+   LVMS storage from scratch (crc ships no snapshot substrate), and the
+   `restricted-v2` SCC caveat. Read if you're validating ztest on OpenShift
+   locally.
 
 TODO: Add quality of service annotations to tests. ServiceAccounts will have the authorized level of service it can provide
 

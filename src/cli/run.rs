@@ -1115,8 +1115,7 @@ struct ImagePhaseOutcome {
     /// Resource dependency edges (binary images + per-test seeds) for the engine.
     resource_deps: crate::engine::plan::ResourceDeps,
     /// Provisioned resource states (node → state) the engine gates admission on.
-    resource_states:
-        std::collections::HashMap<crate::resource::NodeId, crate::resource::NodeState>,
+    resource_states: std::collections::HashMap<crate::resource::NodeId, crate::resource::NodeState>,
 }
 
 /// Run the inventory-driven image phase. Discovery (Phase C, the dump) learns
@@ -1287,7 +1286,9 @@ fn run_image_phases(
             .filter_map(|e| resource::image_node_id(e).ok())
             .collect();
         if !ids.is_empty() {
-            resource_deps.images_by_binary.insert(binary_id.clone(), ids);
+            resource_deps
+                .images_by_binary
+                .insert(binary_id.clone(), ids);
         }
     }
     // Source path → seed node id, from the seeds we planned. A test edge names its
@@ -1295,12 +1296,19 @@ fn run_image_phases(
     // so this map resolves it to the provisioned node with no re-derivation.
     let seed_id_by_source: HashMap<&str, crate::resource::NodeId> = seeds
         .iter()
-        .filter_map(|e| resource::seed_node_id(e).ok().map(|id| (e.source.as_str(), id)))
+        .filter_map(|e| {
+            resource::seed_node_id(e)
+                .ok()
+                .map(|id| (e.source.as_str(), id))
+        })
         .collect();
     for (binary_id, deps) in &deps_by_binary {
         for dep in deps {
             if let Some(id) = seed_id_by_source.get(dep.resource.as_str()) {
-                let key = (binary_id.clone(), crate::engine::plan::libtest_name(&dep.test_id).to_string());
+                let key = (
+                    binary_id.clone(),
+                    crate::engine::plan::libtest_name(&dep.test_id).to_string(),
+                );
                 resource_deps
                     .seeds_by_test
                     .entry(key)

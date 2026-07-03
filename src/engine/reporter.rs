@@ -243,7 +243,8 @@ impl RunReporter for StyledReporter {
                         };
                         // Stream the failure inline (with its output replay), and
                         // capture the same line for the end-of-run recap.
-                        let line = self.format_line(&word, Ink::Fail, &bracket, binary_id, test_name);
+                        let line =
+                            self.format_line(&word, Ink::Fail, &bracket, binary_id, test_name);
                         let _ = writeln!(self.buf, "{line}");
                         self.failures.push(line);
                         self.replay_output(output);
@@ -787,7 +788,13 @@ mod tests {
             1,
             b"boom\n",
         ));
-        r.handle(&finished("e2e::wallet", "zebrad::z_get_treestate::case_1_fetch", Verdict::Pass, 1, b""));
+        r.handle(&finished(
+            "e2e::wallet",
+            "zebrad::z_get_treestate::case_1_fetch",
+            Verdict::Pass,
+            1,
+            b"",
+        ));
         r.handle(&finished(
             "e2e::wallet",
             "zebrad::send_to_sapling::case_2_state",
@@ -796,7 +803,12 @@ mod tests {
             b"",
         ));
         r.handle(&TestEvent::RunFinished {
-            stats: RunStats { passed: 1, failed: 2, skipped: 0, total: 3 },
+            stats: RunStats {
+                passed: 1,
+                failed: 2,
+                skipped: 0,
+                total: 3,
+            },
             elapsed: Duration::from_secs(1),
         });
         let out = String::from_utf8(r.take_scrollback()).unwrap();
@@ -814,8 +826,14 @@ mod tests {
         // The passing test is never recapped, and the failure's output replay
         // stays inline (before the Summary), not in the recap.
         let summary_pos = out.find("Summary").unwrap();
-        assert!(!out[summary_pos..].contains("z_get_treestate"), "pass recapped:\n{out}");
-        assert!(out[..summary_pos].contains("boom"), "inline output missing:\n{out}");
+        assert!(
+            !out[summary_pos..].contains("z_get_treestate"),
+            "pass recapped:\n{out}"
+        );
+        assert!(
+            out[..summary_pos].contains("boom"),
+            "inline output missing:\n{out}"
+        );
     }
 
     #[test]
@@ -823,13 +841,24 @@ mod tests {
         let mut r = StyledReporter::new(false, true);
         r.handle(&finished("p::b", "ok", Verdict::Pass, 1, b""));
         r.handle(&TestEvent::RunFinished {
-            stats: RunStats { passed: 1, failed: 0, skipped: 0, total: 1 },
+            stats: RunStats {
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+                total: 1,
+            },
             elapsed: Duration::from_secs(1),
         });
         let out = String::from_utf8(r.take_scrollback()).unwrap();
         // Nothing after the Summary line.
-        assert!(out.trim_end().ends_with("1 test run: 1 passed, 0 skipped"), "{out:?}");
-        assert!(!out.contains("FAIL"), "no failure recap on a clean run:\n{out}");
+        assert!(
+            out.trim_end().ends_with("1 test run: 1 passed, 0 skipped"),
+            "{out:?}"
+        );
+        assert!(
+            !out.contains("FAIL"),
+            "no failure recap on a clean run:\n{out}"
+        );
     }
 
     #[test]
@@ -839,7 +868,12 @@ mod tests {
         let mut r = StyledReporter::new(true, true);
         r.handle(&finished("p::b", "t", Verdict::Fail(1), 3, b""));
         r.handle(&TestEvent::RunFinished {
-            stats: RunStats { passed: 0, failed: 1, skipped: 0, total: 1 },
+            stats: RunStats {
+                passed: 0,
+                failed: 1,
+                skipped: 0,
+                total: 1,
+            },
             elapsed: Duration::from_secs(1),
         });
         let out = String::from_utf8(r.take_scrollback()).unwrap();

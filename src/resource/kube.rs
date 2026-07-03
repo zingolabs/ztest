@@ -25,11 +25,11 @@
 
 use std::time::Duration;
 
-use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, Patch, PatchParams};
 use kube::runtime::wait::{Condition, await_condition};
-use kube::Client;
 use serde::Deserialize;
 use serde_yaml::Value as YamlValue;
 
@@ -211,9 +211,7 @@ pub(crate) async fn wait_statefulset_ready(
     let cond = await_condition(api, name, is_statefulset_ready());
     tokio::time::timeout(timeout, cond)
         .await
-        .map_err(|_| {
-            format!("timeout waiting for StatefulSet {namespace}/{name} to become Ready")
-        })?
+        .map_err(|_| format!("timeout waiting for StatefulSet {namespace}/{name} to become Ready"))?
         .map_err(|e| format!("wait for StatefulSet {namespace}/{name}: {e}"))
         .map(|_| ())
 }
@@ -252,11 +250,7 @@ fn is_crd_established() -> impl Condition<CustomResourceDefinition> {
 fn is_deployment_available() -> impl Condition<Deployment> {
     |obj: Option<&Deployment>| {
         let Some(deploy) = obj else { return false };
-        let desired = deploy
-            .spec
-            .as_ref()
-            .and_then(|s| s.replicas)
-            .unwrap_or(1);
+        let desired = deploy.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
         let ready = deploy
             .status
             .as_ref()
@@ -285,4 +279,3 @@ fn is_statefulset_ready() -> impl Condition<StatefulSet> {
         ready >= desired && desired > 0
     }
 }
-

@@ -35,8 +35,9 @@ pub(crate) mod impls;
 
 pub use context::{Cx, CxBuilder, ProgressSink};
 pub use entry::{
-    image_node_id, initialize, plan_runtime, qos_tiers, reap_run, seed_node_id, InitializeOpts,
+    InitializeOpts, image_node_id, initialize, plan_runtime, qos_tiers, reap_run, seed_node_id,
 };
 pub use graph::{Graph, GraphError};
+pub use impls::storage::StorageProfile;
 pub use provider::{NodeId, Provider};
 pub use state::{Lifetime, NodeState, Readiness, ResourceError};

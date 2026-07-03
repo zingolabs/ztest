@@ -24,14 +24,18 @@ validated against this bundle before vendoring.
 | `10-snapshot-controller.yaml` | external-snapshotter `deploy/kubernetes/snapshot-controller/` (rbac + setup)                                                                                   | `v8.2.0`                                                                                                   |
 | `20-csi-hostpath-rbac.yaml`   | sidecar `rbac.yaml` from external-{provisioner,attacher,resizer,snapshotter,health-monitor} — the `external-*-runner`/`-cfg` roles the driver binds            | provisioner `v5.2.0`, attacher `v4.8.0`, resizer `v1.13.1`, snapshotter `v8.2.0`, health-monitor `v0.14.0` |
 | `30-csi-hostpath-driver.yaml` | kubernetes-csi/csi-driver-host-path `deploy/kubernetes-1.30/hostpath/` (driverinfo + plugin StatefulSet)                                                       | `v1.17.1`                                                                                                  |
-| `40-ztest-classes.yaml`       | ztest-authored: StorageClasses `rook-ceph-block` + `rook-ceph-block-archive` and VolumeSnapshotClass `ceph-rbd-snapclass`, all backed by `hostpath.csi.k8s.io` | —                                                                                                          |
 
-The class names in `40-ztest-classes.yaml` deliberately match the
-production Ceph names that `materialize.rs`/`mounts.rs` default to, so the
-*same* code path runs on kind and Ceph with no env overrides. The only
-value that can't be name-aliased — the CSI `driver` string in the shadow
-VolumeSnapshotContent — is resolved from the live VolumeSnapshotClass at
-runtime (`seeds::detect_driver`).
+The ztest StorageClasses (`rook-ceph-block` + `rook-ceph-block-archive`)
+and the `ceph-rbd-snapclass` VolumeSnapshotClass are **no longer vendored
+as a fixture** — they're rendered in code by
+`resource::impls::storage::render_storage_classes`, because the CSI driver
+they point at now varies per substrate (`hostpath.csi.k8s.io` under kind,
+the cluster's real driver under `StorageProfile::Existing`). The class
+*names* stay identical across substrates, so the *same*
+`materialize.rs`/`mounts.rs` code path runs on kind, Ceph, and LVMS with no
+env overrides. The only value that can't be name-aliased — the CSI `driver`
+string in the shadow VolumeSnapshotContent — is resolved from the live
+VolumeSnapshotClass at runtime (`seeds::detect_driver`).
 
 ## Regenerating / bumping versions
 

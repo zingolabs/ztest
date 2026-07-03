@@ -57,7 +57,9 @@ impl std::fmt::Debug for Graph {
 
 impl Default for Graph {
     fn default() -> Self {
-        Self { nodes: HashMap::new() }
+        Self {
+            nodes: HashMap::new(),
+        }
     }
 }
 
@@ -669,7 +671,10 @@ mod tests {
         let cx = test_cx().await;
         let state = g.provision(&cx, usize::MAX, |_, _| {}).await;
         assert_eq!(state[&img("a")], NodeState::Ready);
-        assert!(tcx.index_of("provision:a").is_none(), "should not provision");
+        assert!(
+            tcx.index_of("provision:a").is_none(),
+            "should not provision"
+        );
     }
 
     #[test]
@@ -720,7 +725,10 @@ mod tests {
         let state = g.provision(&cx, usize::MAX, |_, _| {}).await;
         g.teardown(&cx, &state, |_, _| {}).await;
         assert!(tcx.index_of("teardown:ns").is_some());
-        assert!(tcx.index_of("teardown:seed").is_none(), "cache must survive");
+        assert!(
+            tcx.index_of("teardown:seed").is_none(),
+            "cache must survive"
+        );
     }
 
     #[tokio::test]

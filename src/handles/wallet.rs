@@ -275,8 +275,13 @@ pub trait WalletExt: WalletBackend {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        self.account(validator, indexer, FAUCET_SEED, BlockHeight::from(TEST_WALLET_BIRTHDAY))
-            .await
+        self.account(
+            validator,
+            indexer,
+            FAUCET_SEED,
+            BlockHeight::from(TEST_WALLET_BIRTHDAY),
+        )
+        .await
     }
 
     /// A fresh recipient account built from [`RECIPIENT_SEED`].
@@ -285,12 +290,21 @@ pub trait WalletExt: WalletBackend {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        self.account(validator, indexer, RECIPIENT_SEED, BlockHeight::from(TEST_WALLET_BIRTHDAY))
-            .await
+        self.account(
+            validator,
+            indexer,
+            RECIPIENT_SEED,
+            BlockHeight::from(TEST_WALLET_BIRTHDAY),
+        )
+        .await
     }
 
     /// A faucet synced and holding one spendable shielded note.
-    async fn funded_faucet<V, I>(&self, validator: &V, indexer: &I) -> Result<Account<Self>, RpcError>
+    async fn funded_faucet<V, I>(
+        &self,
+        validator: &V,
+        indexer: &I,
+    ) -> Result<Account<Self>, RpcError>
     where
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,

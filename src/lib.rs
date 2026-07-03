@@ -52,12 +52,12 @@ mod seeds;
 
 // ─────────────────────────── top-level re-exports ──────────────────────
 
+#[cfg(feature = "librustzcash")]
+pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
 pub use crate::backends::lightwalletd::LightwalletdIndexer;
 pub use crate::backends::zainod::ZainoIndexer;
 pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::ZebraValidator;
-#[cfg(feature = "librustzcash")]
-pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
 #[cfg(feature = "zingo")]
 pub use crate::backends::zingo::{ZingoBackend, ZingoWallet};
 pub use crate::component::{
@@ -131,18 +131,18 @@ macro_rules! validator_tests {
 /// `Cargo.toml` line for a crate test code never sees) are rejected as SemVer
 /// noise that ties ztest's version to upstream churn for no benefit.
 pub mod prelude {
+    #[cfg(feature = "zingo")]
+    pub use super::ZingoWallet;
     pub use super::{
         Account, AccountId, ArchiveHandle, BlockHash, BlockHeight, BlockTip, BlockchainInfo,
         ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Endpoint,
-        EnvError, GetAddressUtxosReply, Indexer, IndexerBackend, JsonRpcClient, LightdInfo,
-        LightwalletdIndexer, MempoolInfo, Mount, MountKind, MountSource, Peer, PeerInfo, Pool,
-        PoolBalances, RawTransaction, RpcError, SendResponse, SharedVolume, ShieldedProtocol,
-        SnapshotRef, SubtreeRoot, TestEnv, TreeState, TxId, Validator, ValidatorBackend, Wallet,
-        WalletBackend, WalletExt, ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
-        FAUCET_SEED, RECIPIENT_SEED,
+        EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer, IndexerBackend, JsonRpcClient,
+        LightdInfo, LightwalletdIndexer, MempoolInfo, Mount, MountKind, MountSource, Peer,
+        PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction, RpcError, SendResponse,
+        SharedVolume, ShieldedProtocol, SnapshotRef, SubtreeRoot, TestEnv, TreeState, TxId,
+        Validator, ValidatorBackend, Wallet, WalletBackend, WalletExt, ZainoIndexer, ZatBalance,
+        ZcashdValidator, ZebraValidator,
     };
-    #[cfg(feature = "zingo")]
-    pub use super::ZingoWallet;
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
         REGTEST_FIXTURE_HEIGHTS_CLI_STRING, Regtest, RegtestState, Testnet, TestnetState,

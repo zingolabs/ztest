@@ -70,6 +70,21 @@ pub(super) fn kind_create(cluster: &str) -> Result<(), String> {
     }
 }
 
+/// Require `crc` (OpenShift Local) for the local-OKD target. ztest does not
+/// drive crc's lifecycle (`crc setup` mutates the host, a bad fit for
+/// declarative hosts like NixOS); the user brings the cluster up and ztest
+/// connects to it like any remote cluster.
+pub(super) fn require_crc() -> Result<(), String> {
+    require_tool(
+        "crc",
+        &["version"],
+        "install OpenShift Local (crc) from \
+         https://developers.redhat.com/products/openshift-local/overview and bring a cluster up \
+         yourself (`crc config set preset okd`, `crc setup`, `crc start`); ztest connects to the \
+         running crc, it does not drive its lifecycle.",
+    )
+}
+
 /// Delete a kind cluster (inherits stdio so the user sees `kind`'s
 /// progress).
 pub(super) fn kind_delete(cluster: &str) -> Result<(), String> {

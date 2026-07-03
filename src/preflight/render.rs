@@ -52,11 +52,7 @@ fn pad_to_panel(out: &mut String) {
             }
         }
         std::cmp::Ordering::Greater => {
-            let kept: String = out
-                .lines()
-                .take(PANEL_LINES)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let kept: String = out.lines().take(PANEL_LINES).collect::<Vec<_>>().join("\n");
             *out = kept;
         }
         std::cmp::Ordering::Equal => {}
@@ -704,12 +700,18 @@ pub fn render_preflight_panel(
         BuildState::Compiling { started_at } => (
             spin,
             theme.styles.count,
-            format!("compiling test binaries… {dot} {}", format_elapsed(started_at.elapsed())),
+            format!(
+                "compiling test binaries… {dot} {}",
+                format_elapsed(started_at.elapsed())
+            ),
         ),
         BuildState::Indexing { started_at } => (
             spin,
             theme.styles.count,
-            format!("indexing test selection… {dot} {}", format_elapsed(started_at.elapsed())),
+            format!(
+                "indexing test selection… {dot} {}",
+                format_elapsed(started_at.elapsed())
+            ),
         ),
         BuildState::Ok {
             test_count,
@@ -718,7 +720,10 @@ pub fn render_preflight_panel(
         } => (
             theme.chars.ok,
             theme.styles.pass,
-            format!("{test_count} tests / {binary_count} bins {dot} {}", format_elapsed(*elapsed)),
+            format!(
+                "{test_count} tests / {binary_count} bins {dot} {}",
+                format_elapsed(*elapsed)
+            ),
         ),
         BuildState::Failed { exit_code, .. } => (
             theme.chars.warn,
@@ -790,11 +795,7 @@ pub fn render_transfers(
         (show, 0)
     };
 
-    let name_col = column_width(
-        rows.iter().take(visible).map(|r| r.label.as_str()),
-        12,
-        18,
-    );
+    let name_col = column_width(rows.iter().take(visible).map(|r| r.label.as_str()), 12, 18);
     let dot = theme.chars.dot.style(theme.styles.dim);
     for row in rows.iter().take(visible) {
         write_transfer_row(&mut out, row, name_col, elapsed, &dot, theme);
@@ -849,7 +850,10 @@ fn write_transfer_row(
                         "{bar} {} {dot} {} / {}",
                         format_args!("{percent}%").style(theme.styles.count),
                         ByteSize::b(*done).display().iec().style(theme.styles.count),
-                        ByteSize::b(*total).display().iec().style(theme.styles.count),
+                        ByteSize::b(*total)
+                            .display()
+                            .iec()
+                            .style(theme.styles.count),
                     )
                     .expect("write to string");
                 }

@@ -35,8 +35,8 @@ pub(crate) fn ensure_crypto_provider() {
     });
 }
 
-/// Construct a kube client by inferring config: in-cluster SA token in CI,
-/// `~/.kube/config` (over Tailscale) on a dev laptop.
+/// Construct a kube client by inferring config: an in-cluster ServiceAccount
+/// token inside a pod, otherwise the current `KUBECONFIG` / `~/.kube/config`.
 pub async fn client() -> Result<Client, kube::Error> {
     ensure_crypto_provider();
     let cfg = kube::Config::infer()
