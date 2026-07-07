@@ -628,10 +628,125 @@ pub(crate) fn providers(profile: &StorageProfile) -> Vec<Box<dyn Provider>> {
     }
 }
 
+/// A snapshot-capable StorageClass found on the cluster: one whose
+/// `provisioner` is served by a `VolumeSnapshotClass`, so ztest's seed/clone
+/// model can use it. `ztest setup` points its own named classes at the chosen
+/// one's driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageOption {
+    pub class_name: String,
+    pub provisioner: String,
+    pub snapshot_driver: String,
+    pub is_default: bool,
+}
+
+const DEFAULT_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
+
+/// Discover snapshot-capable StorageClasses on the cluster: list every
+/// StorageClass and VolumeSnapshotClass, then keep the classes a snapshot
+/// driver actually backs.
+pub async fn discover(client: &kube::Client) -> Result<Vec<StorageOption>, String> {
+    let sc_api: Api<StorageClass> = Api::all(client.clone());
+    let classes = sc_api
+        .list(&Default::default())
+        .await
+        .map_err(|e| format!("list StorageClasses: {e}"))?;
+
+    let vsc_gvk = GroupVersionKind {
+        group: "snapshot.storage.k8s.io".into(),
+        version: "v1".into(),
+        kind: "VolumeSnapshotClass".into(),
+    };
+    let vsc_api: Api<DynamicObject> = Api::all_with(client.clone(), &ApiResource::from_gvk(&vsc_gvk));
+    let vsc_drivers: Vec<String> = match vsc_api.list(&Default::default()).await {
+        Ok(list) => list
+            .items
+            .iter()
+            .filter_map(|c| c.data.get("driver").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect(),
+        // A 403 means *this caller* can't see snapshot classes (RBAC), which is
+        // not the same as the cluster having none — don't mislabel it as "no
+        // storage". `ztest setup` provisions cluster infra, so it needs an admin
+        // context, not the least-privilege ztest run ServiceAccount.
+        Err(kube::Error::Api(e)) if e.code == 403 => {
+            return Err(format!(
+                "cannot list VolumeSnapshotClasses at cluster scope (forbidden: {}). Run \
+                 `ztest setup` with a cluster-admin kubeconfig, not the ztest run \
+                 ServiceAccount.",
+                e.message
+            ));
+        }
+        // Any other error (e.g. the snapshot CRDs aren't installed) means the
+        // cluster genuinely can't snapshot: no usable classes.
+        Err(_) => Vec::new(),
+    };
+
+    Ok(snapshot_capable(&classes.items, &vsc_drivers))
+}
+
+/// The snapshot-capable subset of `classes`: those whose provisioner appears
+/// among `vsc_drivers`. Pure, so the join is unit-testable without a cluster.
+fn snapshot_capable(classes: &[StorageClass], vsc_drivers: &[String]) -> Vec<StorageOption> {
+    classes
+        .iter()
+        .filter(|sc| vsc_drivers.iter().any(|d| d == &sc.provisioner))
+        .map(|sc| StorageOption {
+            class_name: sc.metadata.name.clone().unwrap_or_default(),
+            provisioner: sc.provisioner.clone(),
+            snapshot_driver: sc.provisioner.clone(),
+            is_default: sc
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(DEFAULT_CLASS_ANNOTATION))
+                .map(|v| v == "true")
+                .unwrap_or(false),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    fn sc(name: &str, provisioner: &str, default: bool) -> StorageClass {
+        let mut sc = StorageClass {
+            provisioner: provisioner.to_string(),
+            ..Default::default()
+        };
+        sc.metadata.name = Some(name.to_string());
+        if default {
+            sc.metadata.annotations = Some(
+                [(DEFAULT_CLASS_ANNOTATION.to_string(), "true".to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+        }
+        sc
+    }
+
+    #[test]
+    fn snapshot_capable_keeps_only_classes_a_snapshot_driver_backs() {
+        let classes = vec![
+            sc("lvms-vg1", "topolvm.io", true),
+            sc("standard", "kubernetes.io/no-provisioner", false),
+        ];
+        let opts = snapshot_capable(&classes, &["topolvm.io".to_string()]);
+        assert_eq!(opts.len(), 1, "only the snapshot-backed class qualifies");
+        assert_eq!(opts[0].class_name, "lvms-vg1");
+        assert_eq!(opts[0].provisioner, "topolvm.io");
+        assert_eq!(opts[0].snapshot_driver, "topolvm.io");
+        assert!(opts[0].is_default);
+    }
+
+    #[test]
+    fn snapshot_capable_is_empty_when_no_driver_matches() {
+        let classes = vec![sc("standard", "ebs.csi.aws.com", false)];
+        assert!(snapshot_capable(&classes, &[]).is_empty());
+        assert!(snapshot_capable(&classes, &["topolvm.io".to_string()]).is_empty());
+    }
 
     #[test]
     fn render_storage_classes_threads_driver_and_keeps_names() {

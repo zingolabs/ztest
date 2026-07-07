@@ -330,6 +330,16 @@ pub trait WalletExt: WalletBackend {
         let faucet = self.faucet(validator, indexer).await?;
         match validator.pool_support().coinbase {
             Pool::Orchard | Pool::Sapling => {
+                // An Orchard coinbase is invalid before NU5 — the miner cannot
+                // build an Orchard output "without an Orchard anchor" — and the
+                // faucet's miner address pins the coinbase pool at config time,
+                // so the first note-bearing block must land at height >= NU5.
+                // Advance past NU5 first, mirroring upstream `zcash_local_net`'s
+                // launch pre-mine. Sapling activates at height 1, so its coinbase
+                // needs no warmup.
+                if validator.pool_support().coinbase == Pool::Orchard {
+                    warmup_to_nu5(validator).await?;
+                }
                 mine_and_sync(validator, indexer, &faucet, notes, FAUCET_CONFIRM_TIMEOUT).await?;
             }
             Pool::Transparent => {
@@ -338,6 +348,27 @@ pub trait WalletExt: WalletBackend {
         }
         Ok(faucet)
     }
+}
+
+/// Advance the chain so the next mined block is at or after NU5 activation,
+/// making a subsequent Orchard coinbase valid. Mirrors upstream
+/// `zcash_local_net`'s launch pre-mine: the pre-NU5 blocks carry the miner
+/// address's lower-priority (transparent) receiver, and the faucet's Orchard
+/// notes come from the post-NU5 blocks `mine_and_sync` mines next. No-op once
+/// the chain already sits at NU5 - 1 or higher.
+async fn warmup_to_nu5<V>(validator: &V) -> Result<(), RpcError>
+where
+    V: ValidatorBackend + ?Sized,
+{
+    let nu5 = validator.activation_heights().await?.nu5().unwrap_or(1);
+    // The next mined block is `chain_height + 1`; it must be >= nu5, so the
+    // chain has to reach `nu5 - 1` before the note blocks are mined.
+    let target = nu5.saturating_sub(1);
+    let height = u32::from(validator.chain_height().await?);
+    if height < target {
+        validator.generate_blocks(target - height).await?;
+    }
+    Ok(())
 }
 
 impl<W: WalletBackend> WalletExt for W {}

@@ -19,6 +19,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 pub(crate) mod cleanup;
+pub(crate) mod cluster;
 pub(crate) mod cluster_tools;
 pub(crate) mod console;
 pub mod list_mounts;
@@ -70,13 +71,53 @@ pub enum Command {
     /// local OpenShift Community (`crc`); see `--target`. Idempotent.
     Setup(setup::Args),
 
-    /// Tear down the local kind cluster, or just its per-test
-    /// namespaces (`--namespaces-only`).
+    /// Reclaim your test resources (namespaces, snapshots, QoS leases);
+    /// `--all-users` for everyone's. Never touches the cluster itself.
     Cleanup(cleanup::Args),
 
     /// Manage the content-addressed seed cache (`list`, `prune`,
     /// `warm`).
     Snapshot(snapshot::Args),
+
+    /// Manage named cluster profiles (`list`, `add`, `set`, `current`,
+    /// `remove`) that bind kube-context + image distribution + the OpenShift
+    /// flag, so `ztest run --cluster <name>` selects a whole target at once.
+    Cluster(cluster::Args),
+}
+
+/// Tokio runtime flavor for [`block_on`]: the k8s-only subcommands are happy on
+/// a single thread, while `run`/`setup` want the multi-thread pool.
+pub(crate) enum Rt {
+    Multi,
+    Current,
+}
+
+/// Build a Tokio runtime, drive `fut` to completion, and map its result to an
+/// `ExitCode`, prefixing any error with `ztest {label}:`. The runtime-build and
+/// result-mapping boilerplate every simple subcommand shared.
+pub(crate) fn block_on(
+    label: &str,
+    rt: Rt,
+    fut: impl std::future::Future<Output = Result<(), String>>,
+) -> ExitCode {
+    let mut builder = match rt {
+        Rt::Multi => tokio::runtime::Builder::new_multi_thread(),
+        Rt::Current => tokio::runtime::Builder::new_current_thread(),
+    };
+    let rt = match builder.enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("ztest {label}: tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(fut) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("ztest {label}: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Entry point: parse argv and dispatch.
@@ -93,5 +134,6 @@ pub fn main() -> ExitCode {
         Command::Setup(args) => setup::execute(args),
         Command::Cleanup(args) => cleanup::execute(args),
         Command::Snapshot(args) => snapshot::execute(args),
+        Command::Cluster(args) => cluster::execute(args),
     }
 }

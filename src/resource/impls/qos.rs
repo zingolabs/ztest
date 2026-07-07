@@ -14,7 +14,7 @@
 //! # Dependency chain
 //!
 //! ```text
-//! zaino-qos namespace ─► QosRbac ─► QosServiceAccount(tier) ─┐
+//! ztest-qos namespace ─► QosRbac ─► QosServiceAccount(tier) ─┐
 //!                                        (one per QosClass)  ▶ ready to admit
 //! ```
 //!

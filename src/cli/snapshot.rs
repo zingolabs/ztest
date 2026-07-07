@@ -1,5 +1,5 @@
 //! `ztest snapshot {list,prune,warm}`: manage the content-addressed seed cache
-//! in the `zaino-seeds` namespace.
+//! in the `ztest-seeds` namespace.
 //!
 //! A "seed" is a `seed-<sha8>` PVC populated once from a local archive and
 //! paired with a `VolumeSnapshot`; tests clone it copy-on-write (see
@@ -18,7 +18,7 @@ use crate::materialize::Payload;
 use crate::seeds::{SEEDS_NAMESPACE, sha8};
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 
-const READY_LABEL: &str = "seeds.zaino.io/ready";
+const READY_LABEL: &str = "seeds.ztest.io/ready";
 const SEED_PREFIX: &str = "seed-";
 
 #[derive(Debug, Parser)]
@@ -61,17 +61,7 @@ struct WarmArgs {
 }
 
 pub fn execute(args: Args) -> ExitCode {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("ztest snapshot: tokio runtime: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let result = rt.block_on(async {
+    super::block_on("snapshot", super::Rt::Current, async {
         let client = crate::cluster::client()
             .await
             .map_err(|e| format!("connecting to cluster: {e}"))?;
@@ -80,14 +70,7 @@ pub fn execute(args: Args) -> ExitCode {
             SnapshotCmd::Prune(p) => prune(&client, &p).await,
             SnapshotCmd::Warm(w) => warm(&client, &w).await,
         }
-    });
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("ztest snapshot: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    })
 }
 
 fn volume_snapshot_ar() -> ApiResource {

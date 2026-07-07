@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::cancel::Cancel;
-use crate::engine::events::{RunReporter, RunStats, RunningView, SkipReason, TestEvent, Verdict};
+use crate::engine::events::{
+    CancelReason, RunReporter, RunStats, RunningView, SkipReason, TestEvent, Verdict,
+};
 use crate::engine::exec::TestOutcome;
 use crate::engine::panel::{live_snapshot, run_progress};
 use crate::engine::plan::WorkItem;
@@ -112,6 +114,7 @@ where
     let mut parked: HashMap<(String, String), (WorkItem, u32)> = HashMap::new();
     let mut futs: FuturesUnordered<BoxedRun> = FuturesUnordered::new();
     let mut fail_fast_tripped = false;
+    let mut cancelled: Option<CancelReason> = None;
 
     reporter.handle(&TestEvent::RunStarted {
         total,
@@ -182,12 +185,38 @@ where
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     while !futs.is_empty() {
+        // Ctrl-C: stop admitting new tests and retries, but DO NOT drop the
+        // in-flight futures — that would silently discard the tests that were
+        // running. Instead each `spawn_test` future observes the same cancel,
+        // SIGKILLs its process group, and resolves to `Verdict::Terminated`, so
+        // the loop keeps draining `futs` below and reports every in-flight test
+        // (nextest never fabricates results; it lets the real ones land).
+        // Parked/never-started tests are simply not run and show up as the short
+        // `finished/total` ratio in the summary.
+        //
+        // The notice is emitted synchronously here (not from a `select!` arm):
+        // once cancelled, the terminated futures are all immediately ready, so a
+        // `select!` arm might never be polled before `futs` drains — the loop-top
+        // check guarantees the single `RunCancelling` lands before `RunFinished`.
+        if cancelled.is_none() && cfg.cancel.is_cancelled() {
+            cancelled = Some(CancelReason::Interrupt);
+            reporter.handle(&TestEvent::RunCancelling {
+                reason: CancelReason::Interrupt,
+                running: inflight.len(),
+            });
+        }
         tokio::select! {
-            // Ctrl-C: stop admitting and drop the in-flight futures. Each test
-            // runs in its own process group with `kill_on_drop`, so dropping the
-            // `FuturesUnordered` reaps the child test binaries. Break to the
-            // RunFinished summary with whatever completed so far.
-            _ = cfg.cancel.cancelled() => break,
+            // Biased so the cancel waker is polled before `futs`: on the first
+            // signal the loop bounces straight back to the top-of-loop check with
+            // the full in-flight set intact, so the `RunCancelling` notice reports
+            // every running test rather than however many happened to drain first.
+            // When not cancelled this arm is `Pending`, so it never starves `futs`.
+            biased;
+
+            // Pure waker: bounce the loop back to the top-of-loop check promptly
+            // on the first signal (rather than waiting for the next tick). Disabled
+            // once noticed so it doesn't spin on the latched watch value.
+            _ = cfg.cancel.cancelled(), if cancelled.is_none() => {}
 
             Some((lease, outcome)) = futs.next() => {
                 let running = inflight.remove(&lease).expect("inflight entry for completed lease");
@@ -199,6 +228,7 @@ where
                 } else if retryable(&outcome.verdict)
                     && running.attempt <= running.item.retries
                     && !fail_fast_tripped
+                    && !cfg.cancel.is_cancelled()
                 {
                     // Retry: re-request a fresh lease at attempt+1.
                     let next = running.attempt + 1;
@@ -238,8 +268,12 @@ where
                 }
 
                 // Backfill the freed capacity with queued tests, unless fail-fast
-                // tripped, in which case we drain inflight and admit nothing more.
-                if !fail_fast_tripped {
+                // tripped or the run was cancelled, in which case we drain inflight
+                // and admit nothing more. Gated on the authoritative watch flag,
+                // not the local `cancelled`, so a terminated outcome processed in
+                // the same poll that cancel fired can't sneak a parked test in
+                // before the loop-top notice runs.
+                if !fail_fast_tripped && !cfg.cancel.is_cancelled() {
                     for g in grants {
                         if let Some((item, attempt)) = parked.remove(&(g.binary_id.clone(), g.test_name.clone())) {
                             spawn_granted(g.lease_id, item, attempt, &mut inflight, &mut futs, reporter);
@@ -869,6 +903,10 @@ mod tests {
             test_name: String,
             reason: SkipReason,
         },
+        Cancelling {
+            reason: CancelReason,
+            running: usize,
+        },
         RunFinished {
             stats: RunStats,
         },
@@ -882,7 +920,7 @@ mod tests {
             | Ev::Retrying { test_name, .. }
             | Ev::Finished { test_name, .. }
             | Ev::Skipped { test_name, .. } => Some(test_name),
-            Ev::RunStarted { .. } | Ev::RunFinished { .. } => None,
+            Ev::RunStarted { .. } | Ev::Cancelling { .. } | Ev::RunFinished { .. } => None,
         }
     }
 
@@ -947,6 +985,10 @@ mod tests {
                 } => Ev::Skipped {
                     test_name: test_name.to_string(),
                     reason: reason.clone(),
+                },
+                TestEvent::RunCancelling { reason, running } => Ev::Cancelling {
+                    reason: *reason,
+                    running: *running,
                 },
                 TestEvent::RunFinished { stats, .. } => Ev::RunFinished { stats: *stats },
             };
@@ -1198,5 +1240,96 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Ctrl-C mid-run: the tests that were in flight must be reported terminated
+    /// and counted (as failures) — not silently dropped — while tests that never
+    /// started are simply not run (short `finished/total`). This is the bug the
+    /// old `break` caused: in-flight tests vanished from the summary entirely.
+    #[tokio::test]
+    async fn cancel_reports_inflight_as_terminated_and_leaves_rest_unrun() {
+        use crate::cancel::CancelSource;
+
+        let (src, cancel) = CancelSource::new();
+        let mut c = cfg();
+        c.cancel = cancel.clone();
+
+        // Four Integration tests; the ceiling fits two → two run, two park.
+        let items: Vec<_> = (0..4)
+            .map(|i| item(&format!("t{i}"), QosClass::Integration, 0))
+            .collect();
+
+        let mut rep = RecordingReporter::default();
+        let mut fired = false;
+        let stats = run_loop(
+            items,
+            ceiling_two_integration(),
+            c,
+            &mut rep,
+            move |_it, _a| {
+                // A child that only ends when the run is cancelled — mirrors
+                // `spawn_test`, which SIGKILLs its group and returns `Terminated`.
+                let cancel = cancel.clone();
+                async move {
+                    cancel.cancelled().await;
+                    TestOutcome {
+                        verdict: Verdict::Terminated,
+                        output: vec![],
+                        duration: Duration::from_millis(1),
+                    }
+                }
+            },
+            // Fire cancel deterministically once both tests are confirmed in
+            // flight (rather than on a racy wall-clock delay): they only complete
+            // after cancellation, so the first tick sees exactly two running.
+            move |_rep, frame| {
+                if !fired && frame.running.len() == 2 {
+                    fired = true;
+                    src.cancel();
+                }
+            },
+        )
+        .await;
+
+        // The two in-flight tests are terminated and counted as failed; the two
+        // parked ones never ran, so the run closes short of its total.
+        assert_eq!(stats.failed, 2, "in-flight tests must be reported");
+        assert_eq!(stats.passed, 0);
+        assert_eq!(stats.finished(), 2);
+        assert_eq!(stats.total, 4);
+        assert!(stats.any_failed(), "a cancelled run exits non-zero");
+
+        // Exactly one cancellation notice, and it names the two running tests.
+        let cancels: Vec<_> = rep
+            .events
+            .iter()
+            .filter(|e| matches!(e, Ev::Cancelling { .. }))
+            .collect();
+        assert_eq!(cancels.len(), 1, "exactly one RunCancelling");
+        assert!(matches!(
+            cancels[0],
+            Ev::Cancelling {
+                reason: CancelReason::Interrupt,
+                running: 2
+            }
+        ));
+
+        // Both in-flight tests emitted a terminal Finished{Terminated}, and the
+        // run still closes with RunFinished last.
+        let terminated = rep
+            .events
+            .iter()
+            .filter(|e| matches!(e, Ev::Finished { verdict: Verdict::Terminated, .. }))
+            .count();
+        assert_eq!(terminated, 2, "each in-flight test reports terminated");
+        assert!(matches!(rep.events.last(), Some(Ev::RunFinished { .. })));
+
+        // No parked test was admitted after cancellation: exactly two ever started.
+        let started = rep
+            .events
+            .iter()
+            .filter(|e| matches!(e, Ev::Started { .. }))
+            .count();
+        assert_eq!(started, 2, "cancellation stops admitting new tests");
     }
 }

@@ -43,6 +43,7 @@ pub mod topology;
 // ─────────────────────────── internal modules ──────────────────────────
 pub mod cancel;
 mod cluster;
+pub mod cluster_config;
 mod manifest;
 mod materialize;
 mod mounts;
@@ -54,6 +55,7 @@ mod seeds;
 
 #[cfg(feature = "librustzcash")]
 pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
+pub use crate::backends::image::DevSource;
 pub use crate::backends::lightwalletd::LightwalletdIndexer;
 pub use crate::backends::zainod::ZainoIndexer;
 pub use crate::backends::zcashd::ZcashdValidator;

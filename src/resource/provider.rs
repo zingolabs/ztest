@@ -71,7 +71,7 @@ pub enum NodeId {
 
     // ── QoS infrastructure ────────────────────────────────────────────
     /// The ClusterRole granting the runtime QoS store its documented
-    /// permissions (Lease CRUD in `zaino-qos`, cluster-wide Job list; see
+    /// permissions (Lease CRUD in `ztest-qos`, cluster-wide Job list; see
     /// [`crate::qos::kube_store`]).
     QosRbac,
     /// Per-tier ServiceAccount, annotated with the tier's default CPU/RAM
@@ -79,6 +79,20 @@ pub enum NodeId {
     /// [`QosClass`]; the run charges reservations against these SAs via
     /// the `ZTEST_SA` env var.
     QosServiceAccount(QosClass),
+
+    // ── ztest run identity + policy ───────────────────────────────────
+    /// The `ztest` run ServiceAccount + its `ztest-remote` ClusterRole /
+    /// binding + non-expiring token Secret — the least-privilege credential
+    /// a workstation/CI builds a kubeconfig from for `ztest run`. Backend-
+    /// agnostic; provisioned on every target.
+    RunIdentity,
+    /// OpenShift SCC grant: binds `nonroot-v2` to the `system:serviceaccounts`
+    /// group so per-test pods (which pin `runAsUser`) pass `restricted-v2`
+    /// admission. OpenShift targets only.
+    SccGrant,
+    /// Dev-image registry project (`ztest-images`) + pull/push RBAC for the
+    /// OpenShift internal registry. OpenShift targets only.
+    RegistryProject,
 }
 
 impl NodeId {
@@ -101,6 +115,9 @@ impl NodeId {
             Self::StorageClasses => "storage-classes".into(),
             Self::QosRbac => "qos-rbac".into(),
             Self::QosServiceAccount(c) => format!("qos-sa/{}", c.as_label()),
+            Self::RunIdentity => "run-identity".into(),
+            Self::SccGrant => "scc-grant".into(),
+            Self::RegistryProject => "registry-project".into(),
         }
     }
 }
@@ -133,7 +150,7 @@ impl NodeId {
 /// # Label before populate
 ///
 /// `provision` MUST attach the run's identifying labels
-/// (`zaino.io/run-id=...`) to a resource *before* filling it, so a resource
+/// (`ztest.io/run-id=...`) to a resource *before* filling it, so a resource
 /// half-created by a crash is still findable — and reapable — by the
 /// [`reap_run`](super::reap_run) sweep.
 #[async_trait]

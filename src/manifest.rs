@@ -198,10 +198,10 @@ impl PodSpec {
             "metadata": {
                 "name": self.pod_name,
                 "labels": {
-                    "zaino.io/run-id": coords.run_id,
-                    "zaino.io/component": component_label,
-                    "zaino.io/test": test_name,
-                    "zaino.io/component-name": self.pod_name,
+                    "ztest.io/run-id": coords.run_id,
+                    "ztest.io/component": component_label,
+                    "ztest.io/test": test_name,
+                    "ztest.io/component-name": self.pod_name,
                 },
             },
             "spec": spec,
@@ -338,11 +338,12 @@ pub fn pod_spec_for_indexer(
                 resources: opts.resources.clone(),
                 env: opts.env.clone(),
                 fs_group: Some(1000),
-                // The zainod image refuses to run as root and defaults to
-                // uid 1000. For the shared-DB case the validator is pinned
-                // to the same uid (see the zebrad arm) so this reader owns
-                // the files it must read.
-                run_as_user: None,
+                // The zainod image's USER is a non-numeric name
+                // (container_user), which kubelet can't verify against
+                // runAsNonRoot; pin the numeric uid so the check passes.
+                // This is also the uid the shared-DB validator matches (see
+                // the zebrad arm) so this reader owns the files it reads.
+                run_as_user: Some(1000),
                 placement: None,
                 guaranteed: None,
                 image_pull_secret: image_pull_secret.clone(),
@@ -363,7 +364,9 @@ pub fn pod_spec_for_indexer(
             resources: opts.resources.clone(),
             env: opts.env.clone(),
             fs_group: Some(1000),
-            run_as_user: None,
+            // The upstream lightwalletd image sets no USER (defaults to
+            // root), which fails runAsNonRoot; pin a numeric non-root uid.
+            run_as_user: Some(1000),
             placement: None,
             guaranteed: None,
             image_pull_secret,

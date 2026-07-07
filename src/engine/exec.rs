@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
 
+use crate::cancel::Cancel;
 use crate::engine::events::Verdict;
 use crate::engine::plan::WorkItem;
 
@@ -46,7 +47,15 @@ pub struct TestOutcome {
 ///
 /// `hard_cap` is the kill deadline (the tier's hard cap); on hitting it the
 /// child's process group is SIGKILLed and the verdict is [`Verdict::Timeout`].
-pub async fn spawn_test(item: &WorkItem, env: &EngineEnv, hard_cap: Duration) -> TestOutcome {
+/// If `cancel` fires (run-wide Ctrl-C) while the test is in flight, the group is
+/// SIGKILLed and the verdict is [`Verdict::Terminated`], so the run loop can
+/// drain and report every in-flight test rather than dropping it silently.
+pub async fn spawn_test(
+    item: &WorkItem,
+    env: &EngineEnv,
+    hard_cap: Duration,
+    cancel: &Cancel,
+) -> TestOutcome {
     let started = Instant::now();
 
     let mut cmd = build_command(item, env);
@@ -91,6 +100,11 @@ pub async fn spawn_test(item: &WorkItem, env: &EngineEnv, hard_cap: Duration) ->
             kill_group(pid);
             let _ = child.wait().await;
             Verdict::Timeout
+        }
+        _ = cancel.cancelled() => {
+            kill_group(pid);
+            let _ = child.wait().await;
+            Verdict::Terminated
         }
     };
 
@@ -225,6 +239,7 @@ mod tests {
             &item(p.to_str().unwrap(), "x"),
             &env(),
             Duration::from_secs(5),
+            &Cancel::never(),
         )
         .await;
         let _ = std::fs::remove_file(&p);
@@ -240,6 +255,7 @@ mod tests {
             &item(p.to_str().unwrap(), "x"),
             &env(),
             Duration::from_secs(5),
+            &Cancel::never(),
         )
         .await;
         let _ = std::fs::remove_file(&p);
@@ -255,6 +271,7 @@ mod tests {
             &item(p.to_str().unwrap(), "x"),
             &env(),
             Duration::from_secs(5),
+            &Cancel::never(),
         )
         .await;
         let _ = std::fs::remove_file(&p);
@@ -268,7 +285,7 @@ mod tests {
     /// Children must run with the in-test k8s admission gate OFF (the parent owns
     /// admission). If `ZTEST_QOS` regressed to "1" or got dropped, every child
     /// would create a reservation Lease and leak it, so assert the child actually
-    /// sees `ZTEST_QOS=0`. This is what keeps `kubectl get leases -n zaino-qos` empty.
+    /// sees `ZTEST_QOS=0`. This is what keeps `kubectl get leases -n ztest-qos` empty.
     #[cfg(unix)]
     #[tokio::test]
     async fn children_run_with_qos_admission_disabled() {
@@ -278,6 +295,7 @@ mod tests {
             &item(p.to_str().unwrap(), "x"),
             &env(),
             Duration::from_secs(5),
+            &Cancel::never(),
         )
         .await;
         let _ = std::fs::remove_file(&p);
@@ -295,6 +313,7 @@ mod tests {
             &item("/nonexistent/zzz", "x"),
             &env(),
             Duration::from_secs(5),
+            &Cancel::never(),
         )
         .await;
         assert_eq!(out.verdict, Verdict::SpawnError);
@@ -319,7 +338,7 @@ mod tests {
         }
 
         let it = item(path.to_str().unwrap(), "x");
-        let out = spawn_test(&it, &env(), Duration::from_millis(300)).await;
+        let out = spawn_test(&it, &env(), Duration::from_millis(300), &Cancel::never()).await;
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(out.verdict, Verdict::Timeout);

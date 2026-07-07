@@ -140,19 +140,19 @@ fn opts_for(version: &str, default_name: &'static str) -> ComponentOpts {
 }
 
 fn opts_dev(
-    dockerfile: std::path::PathBuf,
-    context: std::path::PathBuf,
+    source: crate::backends::image::DevSource,
+    version: String,
     default_name: &'static str,
 ) -> ComponentOpts {
     use crate::backends::image::ImageSpec;
     ComponentOpts {
-        version: "dev".to_string(),
+        version,
         name: Some(default_name.to_string()),
         image: ImageSpec::Dev {
-            dockerfile,
-            context,
+            source,
             features: default_features_for(default_name),
             repo: default_repo_for(default_name).to_string(),
+            rust_version: None,
         },
         ..ComponentOpts::default()
     }
@@ -198,11 +198,16 @@ impl Validator<ZebraBackend> {
             opts: opts_for(&version.into(), "zebrad"),
         }
     }
+    /// A zebrad built from a local Dockerfile or a pinned git rev (see the
+    /// `dev!` macro). `version` is the release this build corresponds to (e.g.
+    /// the pinned commit's self-reported `5.2.0`); unlike zainod, the zebra
+    /// backend renders its regtest config and derives its NU ceiling from it,
+    /// so it must be a real semver rather than the `"dev"` sentinel.
     #[doc(hidden)]
-    pub fn zebrad_dev(dockerfile: std::path::PathBuf, context: std::path::PathBuf) -> Self {
+    pub fn zebrad_dev(source: crate::backends::image::DevSource, version: impl Into<String>) -> Self {
         Self {
             backend: ZebraBackend,
-            opts: opts_dev(dockerfile, context, "zebrad"),
+            opts: opts_dev(source, version.into(), "zebrad"),
         }
     }
 }
@@ -215,10 +220,10 @@ impl Validator<ZcashdBackend> {
         }
     }
     #[doc(hidden)]
-    pub fn zcashd_dev(dockerfile: std::path::PathBuf, context: std::path::PathBuf) -> Self {
+    pub fn zcashd_dev(source: crate::backends::image::DevSource, version: impl Into<String>) -> Self {
         Self {
             backend: ZcashdBackend,
-            opts: opts_dev(dockerfile, context, "zcashd"),
+            opts: opts_dev(source, version.into(), "zcashd"),
         }
     }
 }
@@ -239,10 +244,10 @@ impl Indexer<ZainoBackend> {
         }
     }
     #[doc(hidden)]
-    pub fn zainod_dev(dockerfile: std::path::PathBuf, context: std::path::PathBuf) -> Self {
+    pub fn zainod_dev(source: crate::backends::image::DevSource, version: impl Into<String>) -> Self {
         Self {
             backend: ZainoBackend,
-            opts: opts_dev(dockerfile, context, "zainod"),
+            opts: opts_dev(source, version.into(), "zainod"),
             regtest_backend: None,
         }
     }
@@ -378,6 +383,21 @@ pub trait ComponentBuilder: Sized {
         self.component_opts_mut()
             .env
             .push((name.into(), value.into()));
+        self
+    }
+
+    /// Pin the rust toolchain a `dev!` image is built with — the per-case
+    /// selector for a rust-version matrix (typically fed an rstest `#[case]`
+    /// value). The chosen version must be one the `dev!` call declared in
+    /// `rust_versions`, since only those are pre-built; a version that wasn't
+    /// built fails loud at `build()` with `DevImageMissing`. No effect on a
+    /// published image. See `docs/rust-version-matrix.md`.
+    fn rust_version(mut self, version: impl Into<String>) -> Self {
+        if let crate::backends::image::ImageSpec::Dev { rust_version, .. } =
+            &mut self.component_opts_mut().image
+        {
+            *rust_version = Some(version.into());
+        }
         self
     }
 }

@@ -5,10 +5,11 @@
 //! `InventoryLine` per line to stdout, then exits 0; we keep the `Dev` lines and
 //! ignore `Qos` ones (consumed elsewhere).
 //!
-//! Results are deduped by `(dockerfile, context, repo, features)`: the same
-//! `dev!` call linked into N binaries yields N submissions, only one needing a
-//! build. An empty inventory short-circuits, so the docker-build / kind-load
-//! phases become no-ops.
+//! Results are deduped by `(dockerfile, context, repo, features, rust_version)`:
+//! the same `dev!` call linked into N binaries yields N submissions, only one
+//! needing a build — but a `rust_versions` matrix fans one decl into one image
+//! per version, each a distinct build. An empty inventory short-circuits, so the
+//! docker-build / kind-load phases become no-ops.
 
 use std::collections::BTreeSet;
 use std::process::Stdio;
@@ -206,9 +207,14 @@ async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, String> {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DedupKey {
     repo: String,
-    dockerfile: String,
-    context: String,
+    /// Debug repr of the `DevSource` — fully discriminating (local paths or
+    /// git url+rev+paths) and `Ord`, so it keys the dedup set directly.
+    source: String,
     features: Vec<String>,
+    /// Different rust toolchains are different images (they fork the tag), so
+    /// the pinned version discriminates too — else the two variants collapse and
+    /// only one gets built.
+    rust_version: Option<String>,
 }
 
 impl From<&DevImageEntry> for DedupKey {
@@ -217,9 +223,9 @@ impl From<&DevImageEntry> for DedupKey {
         features.sort();
         DedupKey {
             repo: d.repo.clone(),
-            dockerfile: d.dockerfile.clone(),
-            context: d.context.clone(),
+            source: format!("{:?}", d.source),
             features,
+            rust_version: d.rust_version.clone(),
         }
     }
 }

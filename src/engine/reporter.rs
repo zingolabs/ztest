@@ -25,7 +25,9 @@ use std::time::Duration;
 
 use owo_colors::OwoColorize as _;
 
-use crate::engine::events::{RunReporter, RunStats, RunningView, TestEvent, Verdict};
+use crate::engine::events::{
+    CancelReason, RunReporter, RunStats, RunningView, TestEvent, Verdict,
+};
 
 /// Status-line colour intent, mirroring nextest's `Styles`
 /// (`reporter/helpers.rs`): pass = green·bold, fail = red·bold,
@@ -47,6 +49,10 @@ pub struct StyledReporter {
     unicode: bool,
     buf: Vec<u8>,
     stats: RunStats,
+    /// Set once cancellation is requested (Ctrl-C). Drives the mid-run
+    /// `Canceling …` notice and the `cancelled due to …` line under the summary,
+    /// mirroring nextest's `RunBeginCancel` / cancelled `FinalRunStats`.
+    cancelled: Option<CancelReason>,
     /// Each failing test's already-styled status line (no trailing newline),
     /// captured as it streams so the final [`summary`](Self::summary) can re-list
     /// them after the `Summary` line — nextest's end-of-run failure recap
@@ -64,6 +70,7 @@ impl StyledReporter {
             unicode,
             buf: Vec::new(),
             stats: RunStats::default(),
+            cancelled: None,
             failures: Vec::new(),
         }
     }
@@ -258,25 +265,43 @@ impl RunReporter for StyledReporter {
                 reason,
             } => {
                 // nextest's skip line: `SKIP` + the empty-duration placeholder
-                // `[         ] ` + instance (`imp.rs` → `write_skip_line`). The
-                // capacity skip *reasons* have no nextest analogue, so they're
-                // dropped to keep the line byte-identical. A
-                // `DependencyUnavailable` skip is a ztest-specific concept with no
-                // nextest form at all, so we append the reason — the test author
-                // needs to know *which* resource sidelined the test.
-                match reason {
-                    crate::engine::events::SkipReason::DependencyUnavailable { resource } => {
-                        let _ = writeln!(
-                            self.buf,
-                            "{} {BRACKET_SKIP}{} {}",
-                            self.status("SKIP", Ink::Skip),
-                            self.styled_instance(binary_id, test_name),
-                            self.paint(&format!("(resource unavailable: {resource})"), Ink::Skip),
-                        );
+                // `[         ] ` + instance (`imp.rs` → `write_skip_line`). Every
+                // ztest skip reason is a ztest-specific concept with no nextest
+                // analogue, so we always append it — a run that skips everything
+                // (a too-small cluster, an unavailable dependency) must say why,
+                // not leave the author guessing.
+                use crate::engine::events::SkipReason;
+                let note = match reason {
+                    SkipReason::DependencyUnavailable { resource } => {
+                        format!("resource unavailable: {resource}")
                     }
-                    _ => self.line("SKIP", Ink::Skip, BRACKET_SKIP, binary_id, test_name),
-                }
+                    SkipReason::ExceedsClusterCapacity => {
+                        "exceeds cluster capacity (raise the cluster ceiling or lower the tier)"
+                            .to_string()
+                    }
+                    SkipReason::ExceedsSaBudget => "exceeds ServiceAccount budget".to_string(),
+                };
+                let _ = writeln!(
+                    self.buf,
+                    "{} {BRACKET_SKIP}{} {}",
+                    self.status("SKIP", Ink::Skip),
+                    self.styled_instance(binary_id, test_name),
+                    self.paint(&format!("({note})"), Ink::Skip),
+                );
                 self.stats.skipped += 1;
+            }
+            TestEvent::RunCancelling { reason, running } => {
+                // nextest's `RunBeginCancel` notice: a fail-styled `Canceling`
+                // line naming the reason and how many tests are being terminated.
+                self.cancelled = Some(*reason);
+                let noun = if *running == 1 { "test" } else { "tests" };
+                let _ = writeln!(
+                    self.buf,
+                    "{} due to {}: {} {noun} still running",
+                    self.status("Canceling", Ink::Fail),
+                    reason.as_str(),
+                    bold_count(*running as u64, self.color),
+                );
             }
             TestEvent::RunFinished { stats, elapsed } => {
                 self.summary(stats, *elapsed);
@@ -299,9 +324,9 @@ impl StyledReporter {
     /// present only when something failed.
     fn summary(&mut self, stats: &RunStats, elapsed: Duration) {
         let _ = writeln!(self.buf, "{}", self.hbar(12));
-        // nextest colours "Summary" by outcome: fail if anything failed, skip
-        // if nothing ran, else pass.
-        let ink = if stats.failed > 0 {
+        // nextest colours "Summary" by outcome: fail if anything failed or the
+        // run was cancelled, skip if nothing ran, else pass.
+        let ink = if stats.failed > 0 || self.cancelled.is_some() {
             Ink::Fail
         } else if stats.finished() == 0 {
             Ink::Skip
@@ -341,6 +366,17 @@ impl StyledReporter {
         for line in std::mem::take(&mut self.failures) {
             let _ = writeln!(self.buf, "{line}");
         }
+        // nextest's cancelled `FinalRunStats`: a fail-styled `cancelled due to
+        // {reason}` line closing the summary. The short `finished/total` ratio
+        // above already conveys the tests that never ran.
+        if let Some(reason) = self.cancelled {
+            let _ = writeln!(
+                self.buf,
+                "{} due to {}",
+                self.status("Canceled", Ink::Fail),
+                reason.as_str(),
+            );
+        }
     }
 }
 
@@ -352,6 +388,10 @@ fn long_status(v: &Verdict) -> &'static str {
         Verdict::Timeout => "TIMEOUT",
         Verdict::SpawnError => "XFAIL",
         Verdict::Pass => "PASS",
+        // A test killed by the run's cancellation: we SIGKILL its process group,
+        // so the honest status word is the signal, matching nextest's per-test
+        // signal display (`SIG…`).
+        Verdict::Terminated => "SIGKILL",
     }
 }
 
@@ -363,6 +403,7 @@ fn short_status(v: &Verdict) -> &'static str {
         Verdict::Timeout => "TMT",
         Verdict::SpawnError => "XFAIL",
         Verdict::Pass => "PASS",
+        Verdict::Terminated => "SIGKILL",
     }
 }
 
@@ -680,7 +721,9 @@ mod tests {
     }
 
     #[test]
-    fn skip_line_shows_empty_bracket_no_reason() {
+    fn skip_line_names_the_capacity_reason() {
+        // A capacity skip must say why: a run that skips everything on a
+        // too-small cluster is otherwise indistinguishable from a no-op.
         let mut r = StyledReporter::new(false, true);
         r.handle(&TestEvent::TestSkipped {
             binary_id: "pkg::bin",
@@ -688,8 +731,8 @@ mod tests {
             reason: crate::engine::events::SkipReason::ExceedsClusterCapacity,
         });
         let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert_eq!(
-            out, "        SKIP [         ] pkg::bin mod::sk\n",
+        assert!(
+            out.starts_with("        SKIP [         ] pkg::bin mod::sk (exceeds cluster capacity"),
             "{out:?}"
         );
     }
@@ -881,6 +924,44 @@ mod tests {
         let inline = strip_ansi(&out);
         let count = inline.matches("TRY 3 FAIL [   0.234s] p::b t").count();
         assert_eq!(count, 2, "inline + recap:\n{inline}");
+    }
+
+    #[test]
+    fn cancel_notice_and_summary_line_match_nextest() {
+        let mut r = StyledReporter::new(false, true);
+        // A test terminated by the cancellation streams its status line inline...
+        r.handle(&finished("pkg::b", "mod::slow", Verdict::Terminated, 1, b""));
+        r.handle(&TestEvent::RunCancelling {
+            reason: CancelReason::Interrupt,
+            running: 2,
+        });
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats {
+                passed: 1,
+                failed: 1,
+                skipped: 0,
+                total: 5,
+            },
+            elapsed: Duration::from_secs(1),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+
+        // The terminated test renders with the signal word (counted as a failure).
+        assert!(
+            out.contains("     SIGKILL [   0.234s] pkg::b mod::slow"),
+            "{out:?}"
+        );
+        // The mid-run cancel notice names the reason and running count.
+        assert!(
+            out.contains("   Canceling due to interrupt: 2 tests still running"),
+            "{out:?}"
+        );
+        // The summary shows the short ratio and closes with the cancel line.
+        assert!(out.contains("2/5 tests run"), "{out:?}");
+        assert!(
+            out.trim_end().ends_with("    Canceled due to interrupt"),
+            "{out:?}"
+        );
     }
 
     #[test]

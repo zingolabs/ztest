@@ -22,6 +22,30 @@ pub enum Verdict {
     Timeout,
     /// The process could not be spawned at all.
     SpawnError,
+    /// Killed by the run's cancellation (Ctrl-C): the test was in flight when the
+    /// run was cancelled, so its process group was signalled and it never reached
+    /// its own verdict. Nextest reports this as a signal-abort failure
+    /// (`Fail{Abort(signal)}`); ztest models only the fact of termination.
+    Terminated,
+}
+
+/// Why a run was cancelled before every test reached a verdict. Mirrors the
+/// subset of nextest's `CancelReason` that ztest can actually produce: the
+/// console's render thread fires cooperative cancellation on Ctrl-C, so
+/// [`Interrupt`](CancelReason::Interrupt) is the only reason today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// Ctrl-C (SIGINT), caught by the console render thread.
+    Interrupt,
+}
+
+impl CancelReason {
+    /// The word nextest prints after "cancelled due to" (`to_static_str`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CancelReason::Interrupt => "interrupt",
+        }
+    }
 }
 
 impl Verdict {
@@ -134,6 +158,14 @@ pub enum TestEvent<'a> {
         binary_id: &'a str,
         test_name: &'a str,
         reason: SkipReason,
+    },
+    /// Cancellation was requested mid-run (nextest's `RunBeginCancel`): no new
+    /// tests will start, the `running` in-flight tests are being terminated, and
+    /// the run will close short. Emitted exactly once.
+    RunCancelling {
+        reason: CancelReason,
+        /// In-flight tests at the moment of cancellation (being terminated).
+        running: usize,
     },
     /// The run is finished.
     RunFinished {

@@ -14,10 +14,11 @@
 //!   the self-contained hostpath CSI + snapshot stack. Zero external deps
 //!   beyond `docker` + `kind`.
 //! - [`Target::Okd`]: attach to a local OpenShift Community cluster the user
-//!   brought up with `crc` (OpenShift Local) and provision the ztest
-//!   StorageClasses on LVMS. ztest connects but does not drive `crc` (see
-//!   [`require_crc`](super::cluster_tools::require_crc)). The single-node OKD
-//!   rehearsal for prod OpenShift: same `restricted-v2` SCC + `topolvm.io` CSI.
+//!   brought up with `crc` (OpenShift Local). ztest scans for snapshot-capable
+//!   storage and points its classes at what it finds; on bare crc with none,
+//!   `--storage-device` builds an LVMS pool instead. ztest connects but does
+//!   not drive `crc` (see [`require_crc`](super::cluster_tools::require_crc)).
+//!   The single-node OKD rehearsal for prod OpenShift: same `restricted-v2` SCC.
 //!
 //! # Phases
 //!
@@ -36,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use clap::{Parser, ValueEnum};
 use dialoguer::{Confirm, Select};
 
-use crate::resource::{self, InitializeOpts, NodeId, NodeState, StorageProfile};
+use crate::resource::{self, InitializeOpts, NodeId, NodeState, StorageOption, StorageProfile};
 
 use super::cluster_tools::{
     kind_cluster_exists, kind_context, kind_create, require_crc, require_kind, require_tool,
@@ -55,18 +56,27 @@ enum Target {
 
 #[derive(Debug, Parser)]
 pub struct Args {
+    /// Named cluster profile (`ztest cluster list`) to provision against: binds
+    /// its kube-context + kubeconfig before connecting, exactly as `ztest run
+    /// --cluster` does. Omitted, the persisted default (if any) is used, else
+    /// the ambient kube-context.
+    #[arg(long, value_name = "NAME")]
+    cluster: Option<String>,
+
     /// Cluster target. Omitted, `ztest setup` prompts interactively (TTY
     /// only); pass it (or `--non-interactive`) for scripted/CI use.
     #[arg(long, value_enum)]
     target: Option<Target>,
 
-    /// Name of the kind cluster to create / target (`--target kind` only).
-    #[arg(long, default_value = "zkn")]
-    name: String,
+    /// Name of the kind cluster to create / target (`--target kind` only). When
+    /// omitted, derives from the active kube-context (`kind-<name>`), else `kind`
+    /// — the name kind gives a cluster created with no `--name`.
+    #[arg(long)]
+    name: Option<String>,
 
-    /// CSI provisioner backing the ztest StorageClasses on a remote / OKD
-    /// cluster. Omitted, setup verifies the ztest classes already exist
-    /// (an operator like Rook-Ceph owns them) and fails if they don't.
+    /// Override: name the CSI provisioner to back the ztest StorageClasses on a
+    /// remote / OKD cluster, skipping the interactive scan. Omitted, setup
+    /// discovers the snapshot-capable classes on the cluster and you pick one.
     #[arg(long)]
     storage_provisioner: Option<String>,
 
@@ -75,9 +85,10 @@ pub struct Args {
     #[arg(long)]
     snapshot_driver: Option<String>,
 
-    /// Node-visible block device the LVMS pool carves from (`--target okd`
-    /// only, when not using `--storage-provisioner`). Repeatable. This is the
-    /// path *inside* the crc VM (e.g. `/dev/vdb`), not a host `lsblk` path.
+    /// Override (`--target okd` only): node-visible block device to build a
+    /// fresh LVMS pool from, for bare crc with no snapshot-capable storage yet.
+    /// Repeatable. The path *inside* the crc VM (e.g. `/dev/vdb`), not a host
+    /// `lsblk` path. Omitted, setup scans for existing storage first.
     #[arg(long = "storage-device", value_name = "PATH")]
     storage_devices: Vec<String>,
 
@@ -93,23 +104,17 @@ pub struct Args {
 }
 
 pub fn execute(args: Args) -> ExitCode {
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("ztest setup: tokio runtime: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match rt.block_on(run(&args)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("\nztest setup: {e}");
-            ExitCode::FAILURE
-        }
+    // Bind the selected profile's kube-context + kubeconfig before the runtime
+    // spins up worker threads, so the config resolution below targets it.
+    // Precedence: --cluster > ambient env > persisted default.
+    //
+    // SAFETY: still single-threaded here; `set_var` must precede thread creation.
+    if let Err(detail) = unsafe { crate::cluster_config::activate(args.cluster.as_deref()) } {
+        eprintln!("ztest setup: {detail}");
+        return ExitCode::FAILURE;
     }
+
+    super::block_on("setup", super::Rt::Multi, run(&args))
 }
 
 async fn run(args: &Args) -> Result<(), String> {
@@ -120,22 +125,24 @@ async fn run(args: &Args) -> Result<(), String> {
     backend.preflight()?;
     backend.ensure_cluster()?;
 
-    // Resolve the storage substrate before the (noisier) provisioning phase.
-    let storage = backend.resolve_storage()?;
-
-    // 2. Provision the K8s infrastructure graph. Every provider is
-    //    idempotent, so this is safe to re-run against a partially-set-up
-    //    cluster.
-    //
-    // Echo the resolved target cluster before mutating it, and (for a remote
-    // cluster ztest did not create) confirm on a TTY. Provisioning into the
-    // wrong (e.g. production) context is the one irreversible footgun here, so
-    // surface the API server first and gate a remote write on explicit assent.
-    crate::cluster::ensure_crypto_provider();
-    let cfg = kube::Config::infer()
+    // Connect before resolving storage: for a remote/OKD cluster, storage
+    // resolution scans the live cluster for snapshot-capable StorageClasses.
+    // Resolve the config honoring the active profile's kube-context (bound by
+    // `activate` above), and echo the target first — provisioning into the wrong
+    // (e.g. production) context is the one irreversible footgun here.
+    let cfg = crate::cluster::config()
         .await
-        .map_err(|e| format!("infer kube config: {e}"))?;
+        .map_err(|e| format!("resolve kube config: {e}"))?;
     eprintln!("• target cluster: {}", cfg.cluster_url);
+    let client = kube::Client::try_from(cfg).map_err(|e| format!("connect to cluster: {e}"))?;
+
+    // Resolve the storage substrate (discovery + prompt) before the noisier
+    // provisioning phase.
+    let storage = backend.resolve_storage(&client, args).await?;
+
+    // 2. Provision the K8s infrastructure graph. Every provider is idempotent,
+    //    so this is safe to re-run against a partially-set-up cluster. For a
+    //    remote cluster ztest did not create, gate the first write on assent.
     if backend.confirm_before_provision() && !args.non_interactive && std::io::stdin().is_terminal()
     {
         let ok = Confirm::new()
@@ -149,8 +156,6 @@ async fn run(args: &Args) -> Result<(), String> {
     }
 
     eprintln!("• provisioning cluster infrastructure");
-    let client =
-        kube::Client::try_from(cfg).map_err(|e| format!("connect to cluster: {e}"))?;
 
     // Track lifecycle transitions in insertion order for a compact
     // human-readable summary at the end. Providers may emit multiple
@@ -188,6 +193,7 @@ async fn run(args: &Args) -> Result<(), String> {
             no_wait: args.no_wait,
             storage,
             label_nvme_pool: backend.label_nvme_pool(),
+            openshift: backend.is_openshift(),
             ..Default::default()
         },
         on_change,
@@ -213,7 +219,8 @@ async fn run(args: &Args) -> Result<(), String> {
     }
 
     eprintln!(
-        "\n✓ cluster ready ({}).\n  Run tests with: ztest run",
+        "\n✓ cluster ready ({}).\n  Run tests with: ztest run\n  \
+         Save it as a named target so runs don't drift onto another cluster: ztest cluster add",
         backend.context_hint(),
     );
     Ok(())
@@ -276,7 +283,10 @@ impl Backend {
                 snapshot_driver: args.snapshot_driver.clone(),
             },
             Target::Kind => Backend::Kind {
-                name: args.name.clone(),
+                name: args
+                    .name
+                    .clone()
+                    .unwrap_or_else(crate::backends::image::kind_cluster_name),
             },
             Target::Okd => Backend::Okd {
                 provisioner: args.storage_provisioner.clone(),
@@ -324,30 +334,61 @@ impl Backend {
         }
     }
 
-    /// The storage substrate to provision on. kind uses its hostpath stack, a
-    /// cluster with an existing driver (remote, or OKD with
-    /// `--storage-provisioner`) just gets the named classes, and bare OKD backs
-    /// an `LVMCluster` with the `--storage-device` paths.
-    fn resolve_storage(&self) -> Result<StorageProfile, String> {
+    /// The storage substrate to provision on. kind installs its own hostpath
+    /// stack. A remote/OKD cluster is *scanned* for snapshot-capable
+    /// StorageClasses, which you pick from (see [`select_discovered`]); the
+    /// storage flags are overrides — `--storage-provisioner` names a driver
+    /// directly, and (OKD only) `--storage-device` builds an `LVMCluster` on
+    /// bare crc.
+    async fn resolve_storage(
+        &self,
+        client: &kube::Client,
+        args: &Args,
+    ) -> Result<StorageProfile, String> {
         match self {
+            // kind is bare by design and installs its own hostpath + snapshot
+            // stack; nothing to discover.
             Backend::Kind { .. } => Ok(StorageProfile::HostpathFixtures),
             Backend::Remote {
                 provisioner,
                 snapshot_driver,
-            } => Ok(existing_profile(provisioner, snapshot_driver)),
+            } => {
+                if provisioner.is_some() {
+                    return Ok(existing_profile(provisioner, snapshot_driver));
+                }
+                select_discovered(client, args.non_interactive)
+                    .await?
+                    .ok_or_else(|| {
+                        "no snapshot-capable storage found on this cluster; install a CSI \
+                         driver with a VolumeSnapshotClass, or pass --storage-provisioner"
+                            .to_string()
+                    })
+            }
             Backend::Okd {
                 provisioner,
                 snapshot_driver,
                 devices,
             } => {
-                // An explicit provisioner opts out of LVMS: point the classes
-                // at an already-provisioned CSI driver, as for a remote cluster.
                 if provisioner.is_some() {
                     return Ok(existing_profile(provisioner, snapshot_driver));
                 }
-                Ok(StorageProfile::Lvms {
-                    device_paths: resolve_devices(devices)?,
-                })
+                // An explicit device means "build LVMS from scratch" (bare crc).
+                if !devices.is_empty() {
+                    return Ok(StorageProfile::Lvms {
+                        device_paths: devices.clone(),
+                    });
+                }
+                match select_discovered(client, args.non_interactive).await? {
+                    Some(profile) => Ok(profile),
+                    // Bare crc: nothing snapshot-capable exists yet. Point at
+                    // the real bring-up path, not a confusing empty menu.
+                    None => Err(
+                        "no snapshot-capable storage found. On bare crc, pass --storage-device \
+                         <PATH> (e.g. /dev/vdb) to build LVMS, or --storage-provisioner for an \
+                         already-installed CSI driver"
+                            .to_string(),
+                    ),
+                }
             }
         }
     }
@@ -362,6 +403,14 @@ impl Backend {
     /// cluster, whose real NVMe nodes the operator labels.
     fn label_nvme_pool(&self) -> bool {
         !matches!(self, Backend::Remote { .. })
+    }
+
+    /// Provision the OpenShift-only policy (SCC grant, internal-registry
+    /// project). True for the crc/OKD target. A remote cluster may or may not
+    /// be OpenShift, so it's excluded here — grant those out-of-band (or via
+    /// `deploy/`-style manifests) until target detection exists.
+    fn is_openshift(&self) -> bool {
+        matches!(self, Backend::Okd { .. })
     }
 
     /// A short human-readable description of where tests will run, for the
@@ -390,17 +439,65 @@ fn existing_profile(
     }
 }
 
-/// The LVMS device paths from `--storage-device`. No host-disk picker: LVMS
-/// carves from disks inside the crc VM, which a host `lsblk` can't see.
-fn resolve_devices(preselected: &[String]) -> Result<Vec<String>, String> {
-    if preselected.is_empty() {
-        return Err(
-            "--target okd needs at least one --storage-device <PATH> (the node-visible path, e.g. \
-             /dev/vdb) or --storage-provisioner for an already-provisioned CSI driver"
-                .to_string(),
-        );
+/// Scan the cluster for snapshot-capable StorageClasses and resolve one into a
+/// [`StorageProfile::Existing`]. `Ok(None)` means the cluster has none — the
+/// caller decides what that implies (a bring-up path on OKD, an error on
+/// remote). On a TTY you pick from a menu (always shown, even for one option);
+/// non-interactively it takes the default class, else the sole option, else
+/// refuses rather than guess among peers.
+async fn select_discovered(
+    client: &kube::Client,
+    non_interactive: bool,
+) -> Result<Option<StorageProfile>, String> {
+    let mut options = resource::discover_storage(client).await?;
+    if options.is_empty() {
+        return Ok(None);
     }
-    Ok(preselected.to_vec())
+    options.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default)
+            .then_with(|| a.class_name.cmp(&b.class_name))
+    });
+
+    let choice = if non_interactive || !std::io::stdin().is_terminal() {
+        options
+            .iter()
+            .position(|o| o.is_default)
+            .or(if options.len() == 1 { Some(0) } else { None })
+            .ok_or_else(|| {
+                format!(
+                    "multiple snapshot-capable StorageClasses and no default; pass \
+                     --storage-provisioner <driver> to choose ({})",
+                    options
+                        .iter()
+                        .map(|o| o.provisioner.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?
+    } else {
+        let items: Vec<String> = options.iter().map(format_option).collect();
+        Select::new()
+            .with_prompt("Storage class for ztest volumes")
+            .items(&items)
+            .default(0)
+            .interact()
+            .map_err(|e| format!("storage selector: {e}"))?
+    };
+
+    let opt = &options[choice];
+    Ok(Some(StorageProfile::Existing {
+        provisioner: Some(opt.provisioner.clone()),
+        snapshot_driver: opt.snapshot_driver.clone(),
+    }))
+}
+
+fn format_option(o: &StorageOption) -> String {
+    let default = if o.is_default { "  [default]" } else { "" };
+    format!(
+        "{}  ·  {}  ·  snap: {}{}",
+        o.class_name, o.provisioner, o.snapshot_driver, default
+    )
 }
 
 /// Insert-or-replace, keeping the vec in insertion order.

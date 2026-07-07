@@ -2,7 +2,7 @@
 //! live half).
 //!
 //! Decentralized: there is no broker process, so the `ztest run` parent learns
-//! what's running by listing the `zaino-qos` reservation Leases while nextest
+//! what's running by listing the `ztest-qos` reservation Leases while nextest
 //! executes. This module is the pure summary `(reservations, now) -> snapshot`,
 //! unit-testable without a cluster; `cli/run.rs` does the kube list, feeds the
 //! result here, then renders the panel.

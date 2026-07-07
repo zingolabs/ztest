@@ -95,7 +95,7 @@ pub(crate) struct EnvInner {
     pub(crate) is_built: AtomicBool,
     /// The QoS capacity reservation Lease held for this env's life, if QoS
     /// admission was enabled and granted. `Some(name)` means a `qos-*` Lease in
-    /// the `zaino-qos` namespace must be released on teardown.
+    /// the `ztest-qos` namespace must be released on teardown.
     pub(crate) qos_reservation: std::sync::Mutex<Option<String>>,
     /// Background task heartbeating [`Self::qos_reservation`]. Aborted on Drop
     /// (the reservation is then released explicitly, not left to expiry).
@@ -518,8 +518,17 @@ impl TestEnv {
             }
         }
 
+        // `resolved` is the highest NU every component can support (the min of
+        // their capability ceilings). By default the env activates through it.
+        // `activate_through(nu)` on any validator PINS the env ceiling lower —
+        // to the highest requested NU, capped at `resolved` — so a test can
+        // stop the chain below an upgrade it must avoid (e.g. a shielded-coinbase
+        // test on a zebrad image whose bundled zcash_protocol can't validate a
+        // shielded coinbase at NU6.2 — see the `to_librustzcash` branch-id path
+        // in zebra's `coinbase_outputs_are_decryptable`). A request above
+        // `resolved` is still an error: the topology genuinely can't reach it.
         let resolved = resolve_ceiling(&ceilings);
-        let mut ceiling = resolved;
+        let mut requested_ceiling: Option<NetworkUpgrade> = None;
         for p in &self.pending_validators {
             if let Some(RegtestMode::ActivateThrough(requested)) = &p.opts.regtest_mode {
                 if *requested > resolved {
@@ -531,9 +540,11 @@ impl TestEnv {
                         ),
                     });
                 }
-                ceiling = ceiling.max(*requested);
+                requested_ceiling =
+                    Some(requested_ceiling.map_or(*requested, |c: NetworkUpgrade| c.max(*requested)));
             }
         }
+        let ceiling = requested_ceiling.unwrap_or(resolved);
 
         let activation = activation_heights_for_ceiling(ceiling);
         tracing::info!(
@@ -603,7 +614,7 @@ impl TestEnv {
     /// When QoS is enabled (`ztest run` set `ZTEST_QOS`), reserve this test's
     /// tier footprint against shared cluster capacity before any pod is
     /// created, via the decentralized in-process [`Allocator`] over the
-    /// `zaino-qos` Lease ledger. Blocks while the request is queued for
+    /// `ztest-qos` Lease ledger. Blocks while the request is queued for
     /// capacity (up to [`qos::ADMIT_BUDGET`]); fails fast if the footprint is
     /// unschedulable even on an empty cluster. On grant it stores the
     /// reservation name and spawns a heartbeat task that renews the Lease for
@@ -674,7 +685,8 @@ impl TestEnv {
             qos::LOCK_TICKS,
             qos::RESERVATION_TICKS,
             qos::GRACE,
-        );
+        )
+        .with_user(coords.user.clone());
 
         // ServiceAccount budget (§5.6): the run's reservations are charged to
         // its SA, identified by `ZTEST_SA` (the runner sets it, e.g. via the
@@ -776,7 +788,8 @@ impl TestEnv {
             qos::LOCK_TICKS,
             qos::RESERVATION_TICKS,
             qos::GRACE,
-        );
+        )
+        .with_user(coords.user.clone());
         let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(qos::RENEW_INTERVAL).await;
@@ -808,7 +821,7 @@ impl TestEnv {
         // DNS-safe slug (for every label value; `::` is illegal in labels).
         let test_raw = naming::current_test_name();
         let package = naming::current_package();
-        let test_slug = naming::slug(&test_raw, 63);
+        let test_slug = naming::slug(&test_raw, naming::DNS_LABEL_MAX);
         let test_id = naming::test_suffix();
         let namespace = naming::namespace_for(&package, &test_raw, &test_id);
         let client = cluster::client().await.map_err(env_err)?;

@@ -50,11 +50,11 @@ use serde::{Deserialize, Serialize};
 //
 // Reservation/Job objects encode identity in labels (selectable by `list`,
 // but DNS-1123-limited) and numeric payload in annotations (no charset/length
-// limit). Mirrors the split in `cluster.rs` (`zaino.io/test` slug vs
-// `zaino.io/test-full` annotation).
+// limit). Mirrors the split in `cluster.rs` (`ztest.io/test` slug vs
+// `ztest.io/test-full` annotation).
 
 /// Label marking an object's role; value [`ROLE_RESERVATION`].
-pub const LABEL_ROLE: &str = "zaino.io/role";
+pub const LABEL_ROLE: &str = "ztest.io/role";
 /// `LABEL_ROLE` value for a QoS capacity reservation Lease.
 pub const ROLE_RESERVATION: &str = "qos-reservation";
 /// `LABEL_ROLE` value for a QoS-accounted `batch/v1` Job (its pod requests
@@ -67,38 +67,47 @@ pub const ROLE_ALLOCATOR_LOCK: &str = "qos-allocator-lock";
 /// ztest's own pods from the non-ztest baseline (see
 /// [`ClusterCapacity::admission_ceiling`]).
 pub const ROLE_TEST_ENV: &str = "test-env";
+/// Label carrying the run identity (`GITHUB_RUN_ID` in CI, `${USER}-${PPID}` in
+/// dev), stamped on every resource a run owns so its envs group together and the
+/// Ctrl-C reaper can find what a crash left behind. See [`crate::naming::RunCoords`].
+pub const LABEL_RUN_ID: &str = "ztest.io/run-id";
+/// Label carrying the (slugged) invoking user, stamped on every resource a run
+/// owns — namespaces, shadow VolumeSnapshotContents, reservation Leases — so
+/// `ztest cleanup` can reclaim exactly one developer's resources. Value is
+/// `RunCoords::user` slugged; see [`crate::naming::RunCoords`].
+pub const LABEL_USER: &str = "ztest.io/user";
 /// Label carrying the pool (`general`/`nvme`); see [`Pool::as_label`].
-pub const LABEL_POOL: &str = "zaino.io/pool";
+pub const LABEL_POOL: &str = "ztest.io/pool";
 /// Label carrying the (slugged) ServiceAccount the reservation is charged to.
-pub const LABEL_SA: &str = "zaino.io/sa";
+pub const LABEL_SA: &str = "ztest.io/sa";
 /// Label linking a reservation and its Jobs to one accounting unit (a test's
 /// namespace). Capacity is deduplicated per unit (`max` of reservation vs
 /// Jobs); see [`ledger`].
-pub const LABEL_UNIT: &str = "zaino.io/unit";
+pub const LABEL_UNIT: &str = "ztest.io/unit";
 /// Label recording the [`QosClass`] tier a reservation was granted for. Carried
 /// for the live during-run panel (`qos::live`) so the parent can group active
 /// reservations by tier; the scheduler/ledger ignore it (admission keys on the
 /// footprint, not the tier).
-pub const LABEL_TIER: &str = "qos.zaino.io/tier";
+pub const LABEL_TIER: &str = "qos.ztest.io/tier";
 
 /// Annotation: footprint CPU in millicores (decimal `u64`).
-pub const ANN_CPU_MILLI: &str = "qos.zaino.io/cpu-milli";
+pub const ANN_CPU_MILLI: &str = "qos.ztest.io/cpu-milli";
 /// Annotation: footprint memory in bytes (decimal `u64`).
-pub const ANN_MEM_BYTES: &str = "qos.zaino.io/mem-bytes";
+pub const ANN_MEM_BYTES: &str = "qos.ztest.io/mem-bytes";
 /// Annotation: the logical tick at which the lease was last renewed.
-pub const ANN_RENEW_TICK: &str = "qos.zaino.io/renew-tick";
+pub const ANN_RENEW_TICK: &str = "qos.ztest.io/renew-tick";
 /// Annotation: the lease duration, in logical ticks.
-pub const ANN_LEASE_TICKS: &str = "qos.zaino.io/lease-ticks";
+pub const ANN_LEASE_TICKS: &str = "qos.ztest.io/lease-ticks";
 /// Annotation: the holder identity (run-id) of the allocator lock.
-pub const ANN_HOLDER: &str = "qos.zaino.io/holder";
+pub const ANN_HOLDER: &str = "qos.ztest.io/holder";
 
 /// Annotation on a ServiceAccount: that SA's total CPU budget, as a Kubernetes
 /// CPU quantity (`"16"`, `"16000m"`). The broker rejects/queues a run once its
 /// SA's concurrent reservations would exceed this (§5.6).
-pub const ANN_SA_BUDGET_CPU: &str = "qos.zaino.io/budget-cpu";
+pub const ANN_SA_BUDGET_CPU: &str = "qos.ztest.io/budget-cpu";
 /// Annotation on a ServiceAccount: that SA's total memory budget, as a
 /// Kubernetes memory quantity (`"32Gi"`). See [`ANN_SA_BUDGET_CPU`].
-pub const ANN_SA_BUDGET_MEM: &str = "qos.zaino.io/budget-mem";
+pub const ANN_SA_BUDGET_MEM: &str = "qos.ztest.io/budget-mem";
 
 // ── NVMe placement (node taint + nodeSelector) ─────────────────────────
 //
@@ -110,11 +119,11 @@ pub const ANN_SA_BUDGET_MEM: &str = "qos.zaino.io/budget-mem";
 // confirmation (§11); isolated here so the production value is a one-line swap.
 
 /// NodeSelector label key marking the NVMe node pool. §11 TBD.
-pub const NVME_NODE_LABEL_KEY: &str = "zaino.io/pool";
+pub const NVME_NODE_LABEL_KEY: &str = "ztest.io/pool";
 /// NodeSelector label value selecting the NVMe node pool. §11 TBD.
 pub const NVME_NODE_LABEL_VALUE: &str = "nvme";
 /// Taint key the NVMe nodes carry; a `sync` pod tolerates it. §11 TBD.
-pub const NVME_TAINT_KEY: &str = "zaino.io/pool";
+pub const NVME_TAINT_KEY: &str = "ztest.io/pool";
 
 // ── Runtime admission timing (wall-clock seconds) ──────────────────────
 //

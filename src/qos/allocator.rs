@@ -37,14 +37,14 @@
 
 use std::collections::BTreeMap;
 
-use crate::naming::slug;
+use crate::naming::{DNS_LABEL_MAX, slug};
 
 use super::ledger;
 use super::scheduler::{self, RejectReason, Verdict};
 use super::store::{Kind, LabelSelector, NewObject, ObjectPatch, ObjectStore, StoreError};
 use super::{
-    ANN_CPU_MILLI, ANN_HOLDER, ANN_LEASE_TICKS, ANN_MEM_BYTES, ANN_RENEW_TICK, LABEL_ROLE,
-    LABEL_SA, LABEL_TIER, LABEL_UNIT, QosClass, ROLE_ALLOCATOR_LOCK, ROLE_JOB, ROLE_RESERVATION,
+    ANN_CPU_MILLI, ANN_HOLDER, ANN_LEASE_TICKS, ANN_MEM_BYTES, ANN_RENEW_TICK, LABEL_ROLE, LABEL_SA,
+    LABEL_TIER, LABEL_UNIT, LABEL_USER, QosClass, ROLE_ALLOCATOR_LOCK, ROLE_JOB, ROLE_RESERVATION,
     Resources,
 };
 
@@ -97,6 +97,10 @@ pub struct Allocator<S> {
     budgets: BTreeMap<String, Resources>,
     /// This run's holder identity, stamped on the lock and reservations.
     identity: String,
+    /// This run's invoking user (slugged), stamped as [`LABEL_USER`] on
+    /// reservations so `ztest cleanup` can reclaim one developer's leases.
+    /// `None` in tests, which don't exercise by-user reaping.
+    user: Option<String>,
     /// Allocator-lock duration in logical ticks (short: the section is brief).
     lock_ticks: u64,
     /// Reservation Lease duration in logical ticks (the heartbeat TTL).
@@ -121,10 +125,18 @@ impl<S: ObjectStore> Allocator<S> {
             available,
             budgets: BTreeMap::new(),
             identity: identity.into(),
+            user: None,
             lock_ticks,
             reservation_ticks,
             grace,
         }
+    }
+
+    /// Stamp reservations this allocator creates with the invoking user, so
+    /// `ztest cleanup` can select one developer's leases by [`LABEL_USER`].
+    pub fn with_user(mut self, user: impl Into<String>) -> Self {
+        self.user = Some(user.into());
+        self
     }
 
     /// Register a ServiceAccount's total budget (policy/config).
@@ -364,12 +376,18 @@ impl<S: ObjectStore> Allocator<S> {
     fn reservation_object(&self, name: &str, req: &ReservationRequest, now: u64) -> NewObject {
         NewObject {
             name: name.to_string(),
-            labels: BTreeMap::from([
-                (LABEL_ROLE.to_string(), ROLE_RESERVATION.to_string()),
-                (LABEL_SA.to_string(), sa_key(&req.sa)),
-                (LABEL_UNIT.to_string(), unit_slug(&req.unit)),
-                (LABEL_TIER.to_string(), req.class.as_label().to_string()),
-            ]),
+            labels: {
+                let mut labels = BTreeMap::from([
+                    (LABEL_ROLE.to_string(), ROLE_RESERVATION.to_string()),
+                    (LABEL_SA.to_string(), sa_key(&req.sa)),
+                    (LABEL_UNIT.to_string(), unit_slug(&req.unit)),
+                    (LABEL_TIER.to_string(), req.class.as_label().to_string()),
+                ]);
+                if let Some(user) = &self.user {
+                    labels.insert(LABEL_USER.to_string(), user.clone());
+                }
+                labels
+            },
             annotations: BTreeMap::from([
                 (ANN_HOLDER.to_string(), self.identity.clone()),
                 (
@@ -396,21 +414,19 @@ pub fn reservation_name(unit: &str) -> String {
     format!("qos-{}", unit_slug(unit))
 }
 
-/// The canonical slug of an accounting unit, used for both the reservation
-/// Lease name ([`reservation_name`]) and its [`LABEL_UNIT`] label (the ledger's
-/// per-unit dedup key). Deriving both from one slug keeps name-uniqueness and
-/// label-uniqueness in lockstep: two units can never map to the same name while
-/// carrying distinct labels (or vice-versa). 56 chars leaves room for the
-/// `qos-` name prefix under the 63-char DNS/label limit; `unit` (a
-/// `namespace_for` string) is itself <=56, so no truncation occurs in practice.
+/// Canonical slug of an accounting unit, feeding both the reservation Lease name
+/// ([`reservation_name`]) and its [`LABEL_UNIT`] value — one slug keeps the two
+/// in lockstep. Bounded well under [`DNS_LABEL_MAX`] to leave room for the
+/// `qos-` name prefix; a `namespace_for` unit is already shorter, so it never
+/// truncates in practice.
 fn unit_slug(unit: &str) -> String {
     slug(unit, 56)
 }
 
-/// The label-safe key an SA is grouped/charged under. Must match between
-/// writing the reservation's [`LABEL_SA`] and reconstructing per-SA usage.
+/// The label-safe key an SA is grouped/charged under. Must match between writing
+/// the reservation's [`LABEL_SA`] and reconstructing per-SA usage.
 fn sa_key(sa: &str) -> String {
-    slug(sa, 63)
+    slug(sa, DNS_LABEL_MAX)
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use crate::handles::types::BlockHash;
 use crate::proto;
 use crate::proto::compact_tx_streamer_client::CompactTxStreamerClient;
 use crate::proto::{CompactBlock, CompactTx};
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool as ShieldedProtocol;
 use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::ZatBalance;
@@ -241,9 +241,19 @@ impl IndexerBackend for LightwalletdIndexer {
         use futures::StreamExt;
         let ep = self.plumbing.endpoint("grpc").await?;
         let endpoint = &ep;
+        // proto::ShieldedProtocol wire values: Sapling=0, Orchard=1. Route
+        // through the generated enum so they can't drift from the proto.
+        // Ironwood has no lightwalletd wire representation.
         let shielded_protocol = match protocol {
-            ShieldedProtocol::Sapling => 1,
-            ShieldedProtocol::Orchard => 2,
+            ShieldedProtocol::Sapling => proto::ShieldedProtocol::Sapling as i32,
+            ShieldedProtocol::Orchard => proto::ShieldedProtocol::Orchard as i32,
+            other => {
+                return Err(RpcError::decode(
+                    COMPONENT,
+                    "GetSubtreeRoots",
+                    format!("shielded pool {other:?} has no lightwalletd wire representation"),
+                ));
+            }
         };
         let mut client = connect(endpoint).await?;
         let mut stream = client

@@ -20,6 +20,14 @@ isolated, peerable Zcash topology in CI can depend on it.
    partitioning pattern. Read second if you're debugging *why* your
    test ran (or didn't) the way it did.
 
+1. **[Cluster profiles & the image registry](clusters.md)** — `ztest cluster`
+   profiles binding kube-context + image distribution + the OpenShift flag under
+   one name (`ztest run --cluster <name>`); the "one kubeconfig has everything"
+   model (the `ztest.io/registry` extension); and ztest's in-process push to the
+   OpenShift integrated registry (token + CA from the kubeconfig, no `docker
+   login` / `sudo`). Read if runs land on the wrong cluster, or to onboard a
+   developer to a shared/OpenShift cluster.
+
 1. **[Architecture](architecture-overview.md)** — what happens between
    the test calling `TestEnv::build()` and a pod being dialable: the
    per-slot namespace model, sentinel-ConfigMap ownership cascade,

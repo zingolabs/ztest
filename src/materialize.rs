@@ -15,7 +15,7 @@
 //! 3. Attach to the pod's stdin via `Api::<Pod>::attach` and stream the
 //!    local file. When stdin EOFs, the command finishes and the pod
 //!    transitions to `Succeeded`.
-//! 4. Label the PVC `seeds.zaino.io/ready=true` and create the paired
+//! 4. Label the PVC `seeds.ztest.io/ready=true` and create the paired
 //!    `VolumeSnapshot`. From here `seeds::read_seed_handle` can resolve the
 //!    CSI snapshot handle.
 //!
@@ -186,10 +186,10 @@ async fn create_seed_pvc(client: &Client, pvc_name: &str) -> Result<bool, EnvErr
         "metadata": {
             "name": pvc_name,
             "labels": {
-                "seeds.zaino.io/sha": pvc_name.trim_start_matches("seed-"),
-                "seeds.zaino.io/ready": "false",
+                "seeds.ztest.io/sha": pvc_name.trim_start_matches("seed-"),
+                "seeds.ztest.io/ready": "false",
             },
-            "annotations": { "seeds.zaino.io/last_accessed_at": "now" },
+            "annotations": { "seeds.ztest.io/last_accessed_at": "now" },
         },
         "spec": {
             "accessModes": ["ReadWriteOnce"],
@@ -213,7 +213,7 @@ async fn pvc_is_ready(client: &Client, pvc_name: &str) -> Result<bool, EnvError>
         .metadata
         .labels
         .as_ref()
-        .and_then(|m| m.get("seeds.zaino.io/ready"))
+        .and_then(|m| m.get("seeds.ztest.io/ready"))
         .map(|s| s == "true")
         .unwrap_or(false))
 }
@@ -221,7 +221,7 @@ async fn pvc_is_ready(client: &Client, pvc_name: &str) -> Result<bool, EnvError>
 async fn mark_ready(client: &Client, pvc_name: &str) -> Result<(), EnvError> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
     let patch = json!({
-        "metadata": { "labels": { "seeds.zaino.io/ready": "true" } }
+        "metadata": { "labels": { "seeds.ztest.io/ready": "true" } }
     });
     api.patch(pvc_name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
@@ -425,7 +425,7 @@ fn uploader_pod(name: &str, pvc_name: &str, cmd: &str) -> Pod {
         "kind": "Pod",
         "metadata": {
             "name": name,
-            "labels": { "seeds.zaino.io/uploader-for": pvc_name },
+            "labels": { "seeds.ztest.io/uploader-for": pvc_name },
         },
         "spec": {
             "restartPolicy": "Never",

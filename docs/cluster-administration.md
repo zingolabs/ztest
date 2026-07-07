@@ -46,20 +46,20 @@ needs an external Service (typically nothing).
 
 ## Stack
 
-| Layer             | Component                                    |
-| ----------------- | -------------------------------------------- |
-| Host OS           | NixOS                                        |
-| Kubernetes        | k3s (via `services.k3s`)                     |
-| CNI               | Cilium                                       |
-| Storage CSI       | Rook + Ceph (RBD)                            |
-| LB (optional)     | MetalLB, L2 mode                             |
-| CI runners        | GitHub-hosted (external; kubeconfig + registry) |
-| Image registry    | `ghcr.io` (runner pushes, cluster pulls)     |
-| GitOps            | FluxCD                                       |
-| Observability     | Prometheus + Grafana + Loki                  |
-| Secrets           | sops-nix (host) + External Secrets (cluster) |
-| Cert mgmt         | cert-manager                                 |
-| Admin plane       | Tailscale                                    |
+| Layer          | Component                                       |
+| -------------- | ----------------------------------------------- |
+| Host OS        | NixOS                                           |
+| Kubernetes     | k3s (via `services.k3s`)                        |
+| CNI            | Cilium                                          |
+| Storage CSI    | Rook + Ceph (RBD)                               |
+| LB (optional)  | MetalLB, L2 mode                                |
+| CI runners     | GitHub-hosted (external; kubeconfig + registry) |
+| Image registry | `ghcr.io` (runner pushes, cluster pulls)        |
+| GitOps         | FluxCD                                          |
+| Observability  | Prometheus + Grafana + Loki                     |
+| Secrets        | sops-nix (host) + External Secrets (cluster)    |
+| Cert mgmt      | cert-manager                                    |
+| Admin plane    | Tailscale                                       |
 
 ## OS — NixOS + k3s
 
@@ -199,11 +199,33 @@ namespace-local secret.
 
 ### Run RBAC
 
-The CI ServiceAccount needs: create/delete namespaces; CRUD
+The run ServiceAccount needs: create/delete namespaces; CRUD
 pods/services/configmaps/PVCs/leases within them; create `VolumeSnapshot`s
 and (cluster-scoped) `VolumeSnapshotContent`s; read nodes / `CSIDriver`s
-(capacity + snapclass probing). Scope it to the run and rotate the token
-via External Secrets.
+(capacity + snapclass probing). `ztest setup` provisions this SA + its
+least-privilege (run-only, no rbac/SCC/secrets) `ztest-remote` ClusterRole +
+a token (`src/resource/impls/policy.rs`); rotate the token via External
+Secrets if desired.
+
+## Provisioning boundary
+
+Cluster readiness spans two layers with different owners; keep them separate
+or they drift:
+
+- **Substrate** — operators, storage engine, snapshot controller. The
+  declarative cluster install (Flux here; the LVMS install for CRC). ztest
+  consumes it and deliberately refuses to install operators.
+- **ztest's contract** — everything ztest-specific and backend-agnostic:
+  `ztest-seeds`/`ztest-qos` namespaces, QoS RBAC + per-tier SAs, node labels,
+  `StorageClass` objects, the run identity (SA + RBAC + token), and — on
+  OpenShift — the `nonroot-v2` SCC grant and `ztest-images` registry project.
+  All owned by `ztest setup` (run once as admin); their shape lives in ztest's
+  source (`qos.rs`, `storage.rs`, `resource/impls/policy.rs`), so hand-writing
+  manifests for them duplicates the tool.
+
+On OpenShift the `restricted-v2` SCC rejects ztest's per-test pods
+(`runAsUser: 1000`); `ztest setup` grants `nonroot-v2` to
+`system:serviceaccounts` (group-scoped, since test namespaces are dynamic).
 
 ## GitOps — FluxCD
 
@@ -383,11 +405,20 @@ WD-Black 2TB NVMe SSD $250
 Pcie to 4x Nvme Adapter $100
 12TB Seagate Ironwolf Pro Sata HDD $460
 
-# AMD Milan Epyc 7xx3 Shopping List Priced 2026-06-24
+# AMD Milan Epyc 7xx3 Shopping List Priced 2026-07-2
 
-SuperMicro Dual Socket Epyc 7003 Motherboard $850 (Link)[https://www.newegg.com/p/1JW-0006-00R41]
+SuperMicro Epyc 7003 Motherboard $650 (Link)[https://www.newegg.com/supermicro-mbd-h12ssl-nt-o-supports-single-amd-epyc-7003-7002-series-processor/p/1B4-005W-00911]
+Gigabyte Dual-Socket 7003 Motherboard $850 (Link)[https://www.newegg.com/gigabyte-mz72-hb2-rev-3-x-amd-epyc-7002-series-amd-epyc-7003-series/p/N82E16813145535]
 AMD Epyc 7453 (28 cores, 2.75Ghz) $500
+AMD Epyc 7C13 (64 cores, 2.0Ghz, unlocked) $1099.00 (newegg)
 128GB DDR4 ECC 3200MHz (4x32GB) $1250
+256GB (8x32GB) DDR4-3200 2Rx4 ECC RDIMM kit (OWC, US) $2228.72 (newegg)
+256GB (8x32GB) DDR4-2666 2Rx4 ECC RDIMM kit (A-Tech) $1109.11 (newegg)
+512GB (8x64GB) DDR4-2400 4Rx4 ECC LRDIMM kit (A-Tech) $1694.36 (newegg)
+
 WD-Black 2TB NVMe SSD $250
 Pcie to 4x Nvme Adapter $100
-12TB Seagate Ironwolf Pro Sata HDD $460
+Pcie to 4x U.2 Adapter $50
+12TB Seagate Ironwolf Pro Sata HDD $440
+WD_BLACK 4TB SN850X NVMe SSD (no heatsink) $676.99 (newegg)
+Dell G14 7.68TB 1DWPD Gen3 x4 MLC U.2 NVMe Read Intensive Enterprise SSD $1715.00 -- from newegg

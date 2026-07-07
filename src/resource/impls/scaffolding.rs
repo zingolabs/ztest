@@ -1,8 +1,8 @@
 //! Generic Kubernetes scaffolding providers: namespaces and cluster-wide
 //! node labels.
 //!
-//! These are the primitives every setup call needs — `zaino-seeds` and
-//! `zaino-qos` namespaces, the NVMe node label — and are cleanly
+//! These are the primitives every setup call needs — `ztest-seeds` and
+//! `ztest-qos` namespaces, the NVMe node label — and are cleanly
 //! parameterized so they don't grow one file per constant. Both are
 //! [`Lifetime::Cached`]: created once by `ztest setup`, kept for the life
 //! of the cluster.
@@ -69,7 +69,7 @@ impl Provider for NamespaceProvider {
 /// One provider owns one label key (the [`NodeId::NodeLabel`] carries the
 /// key), so two independent providers can't fight over the same label.
 /// The value is a construction-time parameter — most calls use the
-/// `zaino.io/pool=nvme` label defined in [`crate::qos`].
+/// `ztest.io/pool=nvme` label defined in [`crate::qos`].
 #[derive(Debug)]
 pub(crate) struct NodeLabelProvider {
     key: String,

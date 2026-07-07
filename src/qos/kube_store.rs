@@ -15,7 +15,7 @@
 //!   `janitor/ttl` backstop, not namespace cascade.
 //! - [`Kind::Job`] becomes `batch/v1` `Job` objects, created by workloads in
 //!   per-test `ztest-*` namespaces, so the adapter lists them cluster-wide
-//!   (`Api::all`) filtered by `zaino.io/role=qos-job` and synthesizes each
+//!   (`Api::all`) filtered by `ztest.io/role=qos-job` and synthesizes each
 //!   Job's footprint annotations from its pod-template resource requests (so
 //!   the pure [`crate::qos::ledger`] stays kind-agnostic). The allocator never
 //!   creates/gets/deletes a Job through this trait (a `NewObject` can't carry a
@@ -71,7 +71,7 @@ use super::{ANN_CPU_MILLI, ANN_MEM_BYTES, Resources, units};
 /// Shared namespace holding the allocator-lock Lease and all reservation
 /// Leases. A single ztest-managed namespace acting as the global datastore for
 /// capacity.
-pub const QOS_NAMESPACE: &str = "zaino-qos";
+pub const QOS_NAMESPACE: &str = "ztest-qos";
 
 /// `kube`-backed [`ObjectStore`]. Cheap to clone (a `Client` is an
 /// `Arc`-backed handle).
@@ -501,13 +501,13 @@ mod tests {
     #[test]
     fn merge_patch_carries_resource_version_precondition() {
         let patch = ObjectPatch {
-            annotations: BTreeMap::from([("qos.zaino.io/renew-tick".into(), "5".into())]),
+            annotations: BTreeMap::from([("qos.ztest.io/renew-tick".into(), "5".into())]),
             ..Default::default()
         };
         let body = merge_patch(12, &patch);
         assert_eq!(body["metadata"]["resourceVersion"], "12");
         assert_eq!(
-            body["metadata"]["annotations"]["qos.zaino.io/renew-tick"],
+            body["metadata"]["annotations"]["qos.ztest.io/renew-tick"],
             "5"
         );
     }
@@ -520,9 +520,9 @@ mod tests {
             metadata: ObjectMeta {
                 name: Some("qos-u1".into()),
                 resource_version: Some("3".into()),
-                labels: Some(BTreeMap::from([("zaino.io/pool".into(), "general".into())])),
+                labels: Some(BTreeMap::from([("ztest.io/pool".into(), "general".into())])),
                 annotations: Some(BTreeMap::from([(
-                    "qos.zaino.io/cpu-milli".into(),
+                    "qos.ztest.io/cpu-milli".into(),
                     "500".into(),
                 )])),
                 ..Default::default()
@@ -532,8 +532,8 @@ mod tests {
         let s = lease_to_stored(&lease, true).unwrap();
         assert_eq!(s.name, "qos-u1");
         assert_eq!(s.resource_version, 3);
-        assert_eq!(s.labels.get("zaino.io/pool").unwrap(), "general");
-        assert_eq!(s.annotations.get("qos.zaino.io/cpu-milli").unwrap(), "500");
+        assert_eq!(s.labels.get("ztest.io/pool").unwrap(), "general");
+        assert_eq!(s.annotations.get("qos.ztest.io/cpu-milli").unwrap(), "500");
     }
 
     #[test]
@@ -572,7 +572,7 @@ mod tests {
             metadata: ObjectMeta {
                 name: Some("job-u1".into()),
                 resource_version: Some("9".into()),
-                labels: Some(BTreeMap::from([("zaino.io/unit".into(), "u1".into())])),
+                labels: Some(BTreeMap::from([("ztest.io/unit".into(), "u1".into())])),
                 ..Default::default()
             },
             spec: Some(JobSpec {
@@ -595,7 +595,7 @@ mod tests {
         let s = job_to_stored(&job).unwrap();
         assert_eq!(s.name, "job-u1");
         assert_eq!(s.resource_version, 9);
-        assert_eq!(s.labels.get("zaino.io/unit").unwrap(), "u1");
+        assert_eq!(s.labels.get("ztest.io/unit").unwrap(), "u1");
         assert_eq!(s.annotations.get(ANN_CPU_MILLI).unwrap(), "250");
         assert_eq!(
             s.annotations.get(ANN_MEM_BYTES).unwrap(),
@@ -609,12 +609,12 @@ mod tests {
     fn new_lease_sets_namespace_and_omits_empty_maps() {
         let obj = NewObject {
             name: "qos-u1".into(),
-            labels: BTreeMap::from([("zaino.io/role".into(), "qos-reservation".into())]),
+            labels: BTreeMap::from([("ztest.io/role".into(), "qos-reservation".into())]),
             annotations: BTreeMap::new(),
         };
-        let lease = new_lease("zaino-qos", obj);
+        let lease = new_lease("ztest-qos", obj);
         assert_eq!(lease.metadata.name.as_deref(), Some("qos-u1"));
-        assert_eq!(lease.metadata.namespace.as_deref(), Some("zaino-qos"));
+        assert_eq!(lease.metadata.namespace.as_deref(), Some("ztest-qos"));
         assert!(lease.metadata.labels.is_some());
         assert!(lease.metadata.annotations.is_none()); // empty becomes None
         assert!(lease.spec.is_none());
@@ -651,7 +651,7 @@ mod integration {
         let client = crate::cluster::client().await.ok()?;
         // Unique per (process, test) so concurrent ignored tests don't collide
         // and a fresh run never sees a previous run's leftovers.
-        let ns = format!("zaino-qos-it-{}-{}", tag, std::process::id());
+        let ns = format!("ztest-qos-it-{}-{}", tag, std::process::id());
         let store = KubeStore::new(client, ns.clone());
         store
             .ensure_namespace()

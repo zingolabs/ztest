@@ -2,6 +2,18 @@
 members = ["macros"]
 resolver = "2"
 
+# The librustzcash `main` wallet stack (git-sourced above for the orchard 0.15
+# alignment) needs shardtree/incrementalmerkletree methods (ensure_retained,
+# retained_checkpoints, remove_retained_checkpoint) that are unreleased on
+# crates.io — librustzcash `main` carries the identical patch. Cargo applies
+# `[patch.crates-io]` only from the crate being built, so we mirror it here or
+# `zcash_client_backend` fails to compile against the stale published shardtree.
+# Pinned to the same incrementalmerkletree rev librustzcash `main` uses. Remove
+# once a shardtree release carrying these methods is cut.
+[patch.crates-io]
+shardtree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
+incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
+
 [workspace.package]
 edition = "2024"
 license = "MIT"
@@ -20,7 +32,14 @@ serde_json = "1.0.132"
 hex = "0.4.3"
 reqwest = { version = "0.12", default-features = false }
 
-zcash_protocol = { version = "0.9.0", features = ["local-consensus"] }
+# librustzcash wallet stack, aligned to the orchard 0.15 line so the
+# librustzcash backend's in-process Orchard proofs validate against a zebra
+# 6.0.0-rc.0 validator (which links orchard 0.15). The leaf wallet crates
+# (zcash_client_backend, zcash_client_sqlite) are not published on the 0.15
+# line, so the whole stack is git-sourced from librustzcash `main` (pinned),
+# whose workspace resolves orchard 0.15.0-pre.2 / zcash_protocol 0.10 /
+# zcash_keys 0.15 / zcash_primitives 0.29. See the git deps in the crate below.
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", features = ["local-consensus"] }
 
 # ─────────────────────────── ztest crate ──────────────────────────────
 [package]
@@ -51,6 +70,7 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+toml = "0.8"
 rand = "0.8"
 sha2 = "0.10"
 hex = { workspace = true }
@@ -95,14 +115,14 @@ tempfile = { version = "3.2", optional = true }
 # zebra / zcash_local_net / libstdc++. `sync` pulls the lightwalletd-tonic gRPC
 # client; `bundled-prover` compiles the Sapling params into the binary so
 # send/shield need no external files.
-zcash_client_backend = { version = "0.23", features = ["sync", "orchard", "transparent-inputs"], optional = true }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", features = ["sync", "orchard", "transparent-inputs"], optional = true }
 # orchard + transparent-inputs MUST match the backend's features, else sqlite's
 # cfg-gated Orchard/EphemeralTransparent handling is compiled out and its
 # `Recipient`/`Note` matches go non-exhaustive against the backend enums.
-zcash_client_sqlite = { version = "0.21", features = ["orchard", "transparent-inputs"], optional = true }
-zcash_keys = { version = "0.14", features = ["sapling", "orchard"], optional = true }
-zcash_proofs = { version = "0.28", features = ["bundled-prover"], optional = true }
-zcash_primitives = { version = "0.28", optional = true }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", features = ["orchard", "transparent-inputs"], optional = true }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", features = ["sapling", "orchard"], optional = true }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", features = ["bundled-prover"], optional = true }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", optional = true }
 secrecy = { version = "0.8", optional = true }
 # Named to spell the `WalletDb<rusqlite::Connection, ..>` connection type;
 # version tracks zcash_client_sqlite 0.21.1's resolved rusqlite.
@@ -110,7 +130,8 @@ rusqlite = { version = "0.37", optional = true }
 # Used by the generated proto client (`http::uri::PathAndQuery`).
 http = "1.1"
 
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
+base64 = "0.22"
 jsonrpsee-types = "0.24"
 # `codegen` is required by the generated client in `src/proto/service.rs`
 # (`tonic::codegen`); `transport`/`channel` for the gRPC connection.

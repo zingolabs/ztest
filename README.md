@@ -3,6 +3,17 @@
 Boot Zcash topologies (validators, indexers, wallets) on Kubernetes and
 hand **typed RPC handles** back to test code.
 
+### Quickstart: run against a local kind cluster
+
+Create a kind cluster, register it as a ztest profile, and run — the profile
+binds the kube-context and image distribution so every `ztest run` lands there:
+
+```sh
+kind create cluster --name ztest
+ztest cluster add local --kind ztest --set-default
+ztest run
+```
+
 ## Usage
 
 `TestEnv::builder()` collects components; each `add_*` call returns the
@@ -74,6 +85,33 @@ let zai = t.add_indexer(dev!(Indexer::Zainod, "../packages/zainod/Dockerfile"));
 Accepted variants: `Validator::Zebrad`, `Validator::Zcashd`,
 `Indexer::Zainod`, `Wallet::Zingo`.
 
+### Rust-version matrix
+
+Run one test across several toolchains (e.g. MSRV vs latest) by declaring the
+build-set on `dev!` and selecting per case with [rstest](https://docs.rs/rstest):
+
+```rust
+const RUSTS: &[&str] = &["1.88", "1.91.0"];
+
+#[rstest]
+#[case(RUSTS[0])]
+#[case(RUSTS[1])]
+#[tokio::test(flavor = "multi_thread")]
+async fn builds_on_rust(#[case] rust: &str) {
+    let zeb = t.add_validator(
+        dev!(Validator::Zebrad, git = "…", rev = "…",
+             dockerfile = "docker/Dockerfile", rust_versions = RUSTS)
+            .rust_version(rust));
+    // ...
+}
+```
+
+The preflight pipeline pre-builds `zebrad:dev-<hash>` per version (the toolchain
+folds into the content-addressed tag); each case runs against its own image. To
+pin a single toolchain without a matrix, use the singular `rust_version = "1.91.0"`
+(no `.rust_version()` call needed). See [`docs/rust-version-matrix.md`](docs/rust-version-matrix.md)
+for how and why the test is written this way.
+
 ## CLI
 
 The `ztest` binary is the developer entry point for running ztest-managed
@@ -86,8 +124,7 @@ cargo run --bin ztest -- --help
 ## TODO
 
 - [ ] Cleanup TestEnv::regtest_state_in() API and ::persistent_state_in() APIs? Not a fan
-- [ ] MSRV as test parameterization target for test-matrix
-- [ ] Scroll terminal after starting tests to give rustc, docker, and nexttest full height
+- [x] MSRV as test parameterization target for test-matrix (see [`docs/rust-version-matrix.md`](docs/rust-version-matrix.md))
 - [ ] Cargo test compile fail UX
 - [ ] Docker image build fail UX
 - [ ] Test-config/manifest for enabling/disabling a set of cases? Ie, test mode without zcashd

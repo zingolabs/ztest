@@ -13,7 +13,7 @@
 //! - [`plan_runtime`] assembles the per-run resource graph from the
 //!   inventory dump; the caller provisions it against the live cluster.
 //!   Called by `ztest run`.
-//! - [`reap_run`] tears down per-run resources by their `zaino.io/run-id`
+//! - [`reap_run`] tears down per-run resources by their `ztest.io/run-id`
 //!   label. Called on Ctrl-C and normal-exit cleanup.
 //!
 //! # Extending
@@ -35,9 +35,11 @@ pub(crate) mod impls;
 
 pub use context::{Cx, CxBuilder, ProgressSink};
 pub use entry::{
-    InitializeOpts, image_node_id, initialize, plan_runtime, qos_tiers, reap_run, seed_node_id,
+    InitializeOpts, image_node_id, initialize, plan_runtime, qos_tiers, reap_all, reap_run,
+    reap_user, seed_node_id,
 };
 pub use graph::{Graph, GraphError};
-pub use impls::storage::StorageProfile;
+pub use impls::storage::{StorageOption, StorageProfile, discover as discover_storage};
+pub(crate) use impls::policy::{RUN_CLUSTER_ROLE, check_access as check_run_access};
 pub use provider::{NodeId, Provider};
 pub use state::{Lifetime, NodeState, Readiness, ResourceError};

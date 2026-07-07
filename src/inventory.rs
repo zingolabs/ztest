@@ -32,15 +32,43 @@ use crate::qos::QosClass;
 ///
 /// `repo` is the local image name (`zainod`, `zebrad`, ...); the preflight
 /// pipeline produces `<repo>:dev-<hash>` where `<hash>` is the SHA-256 over
-/// (dockerfile bytes ‖ context tree ‖ features), truncated to 12 hex chars.
+/// (dockerfile bytes ‖ context tree ‖ features ‖ pinned rust version), truncated
+/// to 12 hex chars.
 /// The same hash is recomputed at `env.build()` to look up the pre-built
 /// tag, so the tag never has to traverse the process boundary.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct DevImageDecl {
     pub repo: &'static str,
-    pub dockerfile: &'static str,
-    pub context: &'static str,
+    pub source: DevSourceDecl,
     pub features: &'static [&'static str],
+    /// Rust versions to pre-build this image at (the `rust_versions` / singular
+    /// `rust_version` key on `dev!`). Each becomes its own `<repo>:dev-<hash>`
+    /// image. Empty ⇒ one image with the Dockerfile's own `RUST_VERSION` default.
+    /// This is the *build-set*: because images are provisioned before any test
+    /// runs, the set of toolchains has to be statically declarable here — an
+    /// rstest `#[case]` value is a runtime arg the dump can't see. See
+    /// `docs/rust-version-matrix.md`.
+    pub rust_versions: &'static [&'static str],
+}
+
+/// Const-evaluable mirror of [`crate::backends::image::DevSource`], for the
+/// `inventory::submit!` static initializer. Serializes to the same JSON, so it
+/// round-trips into the owned `DevSource` on the read side.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub enum DevSourceDecl {
+    /// Dockerfile + context in the local checkout (absolute paths).
+    Local {
+        dockerfile: &'static str,
+        context: &'static str,
+    },
+    /// Dockerfile + context inside a git repo at a pinned rev (repo-relative
+    /// paths).
+    Git {
+        url: &'static str,
+        rev: &'static str,
+        dockerfile: &'static str,
+        context: &'static str,
+    },
 }
 
 inventory::collect!(DevImageDecl);
@@ -52,18 +80,57 @@ inventory::collect!(DevImageDecl);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevImageEntry {
     pub repo: String,
-    pub dockerfile: String,
-    pub context: String,
+    pub source: crate::backends::image::DevSource,
     pub features: Vec<String>,
+    /// The single rust version this image is built at, if any. `None` leaves the
+    /// Dockerfile's own `RUST_VERSION` default in place. A [`DevImageDecl`]
+    /// carrying N `rust_versions` expands to N entries (see [`expand_decl`]), so
+    /// downstream — tag, dedup, resource node — treats each variant as a
+    /// distinct image with no special-casing.
+    pub rust_version: Option<String>,
 }
 
-impl From<&DevImageDecl> for DevImageEntry {
-    fn from(d: &DevImageDecl) -> Self {
-        DevImageEntry {
-            repo: d.repo.to_string(),
-            dockerfile: d.dockerfile.to_string(),
-            context: d.context.to_string(),
-            features: d.features.iter().map(|s| s.to_string()).collect(),
+/// Expand one static [`DevImageDecl`] into the concrete images to build: one per
+/// declared rust version, or a single default-toolchain image when none.
+fn expand_decl(d: &DevImageDecl) -> Vec<DevImageEntry> {
+    let entry = |rust_version| DevImageEntry {
+        repo: d.repo.to_string(),
+        source: d.source.into(),
+        features: d.features.iter().map(|s| s.to_string()).collect(),
+        rust_version,
+    };
+    if d.rust_versions.is_empty() {
+        vec![entry(None)]
+    } else {
+        d.rust_versions
+            .iter()
+            .map(|v| entry(Some(v.to_string())))
+            .collect()
+    }
+}
+
+impl From<DevSourceDecl> for crate::backends::image::DevSource {
+    fn from(d: DevSourceDecl) -> Self {
+        use crate::backends::image::DevSource;
+        match d {
+            DevSourceDecl::Local {
+                dockerfile,
+                context,
+            } => DevSource::Local {
+                dockerfile: dockerfile.into(),
+                context: context.into(),
+            },
+            DevSourceDecl::Git {
+                url,
+                rev,
+                dockerfile,
+                context,
+            } => DevSource::Git {
+                url: url.to_string(),
+                rev: rev.to_string(),
+                dockerfile: dockerfile.to_string(),
+                context: context.to_string(),
+            },
         }
     }
 }
@@ -220,10 +287,13 @@ pub fn dep_iter() -> impl Iterator<Item = &'static TestDepDecl> {
 /// hook); [`InventoryLine`] is the owned read side. Internal serde tagging
 /// merges `"kind"` into the object, e.g. `{"kind":"dev","repo":...}` /
 /// `{"kind":"qos",...}` / `{"kind":"seed","source":...,"payload":...}`.
+///
+/// Dev images have no borrowed variant: one static [`DevImageDecl`] fans out
+/// (via [`expand_decl`]) into N owned [`DevImageEntry`] lines — one per rust
+/// version — so the hook serializes the owned [`InventoryLine::Dev`] directly.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum InventoryLineRef<'a> {
-    Dev(&'a DevImageDecl),
     Qos(&'a QosDecl),
     Seed(&'a SeedDecl),
     Dep(&'a TestDepDecl),
@@ -267,13 +337,15 @@ fn dump_hook() {
         }
     };
     for decl in iter() {
-        match serde_json::to_string(&InventoryLineRef::Dev(decl)) {
-            Ok(line) => emit(writeln!(stdout, "{line}")),
-            Err(err) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "ztest dump_inventory: serialize failed: {err}"
-                );
+        for entry in expand_decl(decl) {
+            match serde_json::to_string(&InventoryLine::Dev(entry)) {
+                Ok(line) => emit(writeln!(stdout, "{line}")),
+                Err(err) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ztest dump_inventory: serialize failed: {err}"
+                    );
+                }
             }
         }
     }
@@ -318,23 +390,93 @@ fn dump_hook() {
 mod tests {
     use super::*;
 
+    /// Serialize the one entry `expand_decl` yields for a no-`rust_versions`
+    /// decl, exactly as `dump_hook` does.
+    fn dev_line(decl: &DevImageDecl) -> String {
+        let entries = expand_decl(decl);
+        assert_eq!(entries.len(), 1, "one entry when rust_versions is empty");
+        serde_json::to_string(&InventoryLine::Dev(entries.into_iter().next().unwrap())).unwrap()
+    }
+
     #[test]
     fn dev_line_is_tagged_and_demuxes_to_dev_entry() {
         let decl = DevImageDecl {
             repo: "zainod",
-            dockerfile: "/df",
-            context: "/ctx",
+            source: DevSourceDecl::Local {
+                dockerfile: "/df",
+                context: "/ctx",
+            },
             features: &["f1"],
+            rust_versions: &[],
         };
-        let line = serde_json::to_string(&InventoryLineRef::Dev(&decl)).unwrap();
+        let line = dev_line(&decl);
         assert!(line.contains("\"kind\":\"dev\""), "missing dev tag: {line}");
         match serde_json::from_str::<InventoryLine>(&line).unwrap() {
             InventoryLine::Dev(e) => {
                 assert_eq!(e.repo, "zainod");
                 assert_eq!(e.features, vec!["f1".to_string()]);
+                assert_eq!(e.rust_version, None);
+                assert_eq!(
+                    e.source,
+                    crate::backends::image::DevSource::Local {
+                        dockerfile: "/df".into(),
+                        context: "/ctx".into(),
+                    }
+                );
             }
             other => panic!("dev line demuxed as {other:?}"),
         }
+    }
+
+    #[test]
+    fn git_dev_line_round_trips() {
+        let decl = DevImageDecl {
+            repo: "zebrad",
+            source: DevSourceDecl::Git {
+                url: "https://example.test/zebra.git",
+                rev: "9a27f886a5bf",
+                dockerfile: "docker/Dockerfile",
+                context: ".",
+            },
+            features: &["indexer"],
+            rust_versions: &[],
+        };
+        let line = dev_line(&decl);
+        match serde_json::from_str::<InventoryLine>(&line).unwrap() {
+            InventoryLine::Dev(e) => assert_eq!(
+                e.source,
+                crate::backends::image::DevSource::Git {
+                    url: "https://example.test/zebra.git".to_string(),
+                    rev: "9a27f886a5bf".to_string(),
+                    dockerfile: "docker/Dockerfile".to_string(),
+                    context: ".".to_string(),
+                }
+            ),
+            other => panic!("git dev line demuxed as {other:?}"),
+        }
+    }
+
+    /// A decl with N `rust_versions` fans out to N entries, each carrying its
+    /// single version — the build-set the preflight pipeline provisions.
+    #[test]
+    fn rust_versions_fan_out_one_entry_each() {
+        let decl = DevImageDecl {
+            repo: "zebrad",
+            source: DevSourceDecl::Git {
+                url: "https://example.test/zebra.git",
+                rev: "9a27f886a5bf",
+                dockerfile: "docker/Dockerfile",
+                context: ".",
+            },
+            features: &[],
+            rust_versions: &["1.88", "1.91.0"],
+        };
+        let versions: Vec<Option<String>> =
+            expand_decl(&decl).into_iter().map(|e| e.rust_version).collect();
+        assert_eq!(
+            versions,
+            vec![Some("1.88".to_string()), Some("1.91.0".to_string())]
+        );
     }
 
     #[test]

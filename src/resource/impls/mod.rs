@@ -15,6 +15,8 @@
 //! - [`storage`] — cluster-wide storage/CSI stack (CRDs, controller,
 //!   driver, StorageClasses).
 //! - [`qos`] — cluster-wide QoS RBAC + per-tier ServiceAccounts.
+//! - [`policy`] — run identity (SA + RBAC + token) and OpenShift policy
+//!   (SCC grant, registry project).
 //!
 //! # Adding a resource kind
 //!
@@ -25,6 +27,7 @@
 //!    [`plan_runtime`](super::plan_runtime) (per-run).
 
 pub(crate) mod image;
+pub(crate) mod policy;
 pub(crate) mod qos;
 pub(crate) mod scaffolding;
 pub(crate) mod seed;

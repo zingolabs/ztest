@@ -8,7 +8,7 @@
 //! re-runs and rstest `case_N` parametrizations from colliding. Slugs are
 //! truncated so the whole name stays inside the 63-char DNS-1123 label limit.
 //! Nothing functional keys on the name: cleanup, the janitor, and any RBAC
-//! select on the `zaino.io/role=test-env` label and `janitor/ttl` annotation,
+//! select on the `ztest.io/role=test-env` label and `janitor/ttl` annotation,
 //! not the prefix. Inside the namespace, components keep short stable names
 //! (`zebrad`, `zaino`, …) with a deterministic FQDN
 //! `{name}.{namespace}.svc.cluster.local`. Concurrent tests never collide
@@ -16,7 +16,7 @@
 //!
 //! Full, untruncated identity (package, `module::test`, user) is also stamped
 //! as namespace labels (queryable via `kubectl get ns -l`) and a
-//! `zaino.io/test-full` annotation (no length limit), so name truncation
+//! `ztest.io/test-full` annotation (no length limit), so name truncation
 //! never loses information.
 
 /// Where the test process thinks it is. Picked once at `TestEnv::build`.
@@ -27,7 +27,7 @@ pub struct RunCoords {
     /// dev session.
     pub run_id: String,
     /// The invoking user (`${USER}`, or `anon`). Stamped as the
-    /// `zaino.io/user` namespace label for per-developer filtering.
+    /// `ztest.io/user` namespace label for per-developer filtering.
     pub user: String,
 }
 
@@ -84,6 +84,10 @@ pub fn test_suffix() -> String {
 pub fn namespace_for(package: &str, test: &str, suffix: &str) -> String {
     format!("ztest-{}-{}-{}", slug(package, 16), slug(test, 24), suffix)
 }
+
+/// Maximum length of a DNS-1123 label: the ceiling for a Kubernetes object-name
+/// segment and for a label *value*. Slugs bound for either pass this as `max`.
+pub const DNS_LABEL_MAX: usize = 63;
 
 /// Slugify `s` into a DNS-1123-safe fragment of at most `max` chars:
 /// lowercase, every run of non-alphanumeric characters collapsed to a single

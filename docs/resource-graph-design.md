@@ -42,7 +42,7 @@ process being cancelled is the one that can't run its destructors.
    RAII-in-the-child (`TestEnv::Drop`) stays the fast path for *normal* exit.
 3. **Reconstructable from durable identity** — the parent must reap resources it
    never observed being created (a child SIGKILLed mid-provision). Everything is
-   labeled `zaino.io/run-id`, so run-scoped teardown is a **label-selector
+   labeled `ztest.io/run-id`, so run-scoped teardown is a **label-selector
    delete** needing no in-memory ledger. Providers must **label before populate**
    so partial work is findable.
 4. **Lifetime is per-node** (`Cached` / `RunScoped` / `Shared`) — decides what is
@@ -112,7 +112,7 @@ must be **unconditional**. It's therefore a direct label-delete
 (`provisioning/reap.rs`), not a `Provider`:
 
 - **`reap_run(client, run_id)`** — `delete_collection` on namespaces (cascading
-  all per-test resources) + shadow VSCs, both by `zaino.io/run-id`. Idempotent
+  all per-test resources) + shadow VSCs, both by `ztest.io/run-id`. Idempotent
   (404 = ok), failure-isolated. This is the Ctrl-C teardown, run with a 30 s
   deadline (respecting `--no-cleanup`); the janitor is the backstop past it.
 

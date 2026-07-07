@@ -45,12 +45,10 @@ pub(super) fn kind_context(cluster: &str) -> String {
 
 /// `true` if a kind cluster named `cluster` already exists.
 pub(super) fn kind_cluster_exists(cluster: &str) -> Result<bool, String> {
-    let out = Command::new("kind")
-        .args(["get", "clusters"])
-        .output()
-        .map_err(|e| format!("`kind get clusters` failed: {e}"))?;
-    let list = String::from_utf8_lossy(&out.stdout);
-    Ok(list.lines().any(|l| l.trim() == cluster))
+    Ok(crate::backends::image::kind_clusters()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|c| c == cluster))
 }
 
 /// Create a kind cluster (inherits stdio so the user sees `kind`'s own
@@ -83,21 +81,4 @@ pub(super) fn require_crc() -> Result<(), String> {
          yourself (`crc config set preset okd`, `crc setup`, `crc start`); ztest connects to the \
          running crc, it does not drive its lifecycle.",
     )
-}
-
-/// Delete a kind cluster (inherits stdio so the user sees `kind`'s
-/// progress).
-pub(super) fn kind_delete(cluster: &str) -> Result<(), String> {
-    let status = Command::new("kind")
-        .args(["delete", "cluster", "--name", cluster])
-        .status()
-        .map_err(|e| format!("`kind delete cluster` failed to start: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "`kind delete cluster --name {cluster}` exited with {}",
-            status.code().unwrap_or(-1)
-        ))
-    }
 }

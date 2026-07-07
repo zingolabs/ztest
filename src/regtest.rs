@@ -17,11 +17,11 @@ use crate::topology::ActivationHeights;
 /// [`NetworkUpgrade::HIGHEST`](crate::topology::NetworkUpgrade::HIGHEST), so
 /// this fixture and the topology-aware resolver
 /// ([`activation_heights_for_ceiling`](crate::topology::activation_heights_for_ceiling))
-/// can never disagree on a height. See `regtest_height` for why NU5 and
-/// later each get a distinct height (zebra's height-collision rule) and why
-/// NU7 stays off.
+/// can never disagree on a height. See `regtest_height` for the schedule
+/// (`all=1, nu5=2, nu6=2, nu6_1=5, nu6_2=5, nu7=off`, mirroring the upstream
+/// `zcash_local_net` fixture) and why NU7 stays off.
 ///
-/// Callers mining past height 6 must supply companion config: pair with
+/// Callers mining past height 5 must supply companion config: pair with
 /// [`regtest_test_lockbox_disbursements`] and
 /// [`regtest_test_post_nu6_funding_streams`]; the NU6.1 activation block is
 /// rejected without either.
@@ -30,7 +30,7 @@ pub fn regtest_test_activation_heights() -> ActivationHeights {
 }
 
 /// CLI string form for `clap` defaults that need a `&'static str`.
-pub const REGTEST_FIXTURE_HEIGHTS_CLI_STRING: &str = "all=1,nu5=2,nu6=3,nu6_1=6,nu6_2=7,nu7=off";
+pub const REGTEST_FIXTURE_HEIGHTS_CLI_STRING: &str = "all=1,nu5=2,nu6=2,nu6_1=5,nu6_2=5,nu7=off";
 
 /// One lockbox disbursement output for Zebra's regtest
 /// `[network.testnet_parameters]`. Mirrors Zebra's upstream
@@ -118,11 +118,11 @@ pub struct FundingStreams {
 
 /// Canonical regtest post-NU6 funding stream. A single `Deferred`
 /// recipient drawing 1% of block subsidy from the NU6 activation height
-/// (3), enough to fund the dummy disbursement at NU6.1. The start height
+/// (2), enough to fund the dummy disbursement at NU6.1. The start height
 /// tracks NU6: the deferred pool only exists once NU6 is active.
 pub fn regtest_test_post_nu6_funding_streams() -> FundingStreams {
     FundingStreams {
-        start_height: 3,
+        start_height: 2,
         end_height: 1_000_000,
         recipients: vec![FundingStreamRecipient {
             receiver: FundingStreamReceiver::Deferred,

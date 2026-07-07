@@ -198,7 +198,7 @@ async fn drive_real(
             async move {
                 conc.lock().unwrap().enter(fp, ceiling);
                 let cap = item.hard_cap;
-                let out = spawn_test(&item, &env, cap).await;
+                let out = spawn_test(&item, &env, cap, &crate::cancel::Cancel::never()).await;
                 conc.lock().unwrap().exit(fp);
                 out
             }

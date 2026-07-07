@@ -18,7 +18,7 @@ use crate::materialize::{self, Payload};
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 use crate::seeds;
 
-/// One data seed to ensure present in the `zaino-seeds` namespace.
+/// One data seed to ensure present in the `ztest-seeds` namespace.
 ///
 /// The content-addressed name (`seed-<sha8>`, hashed from the source bytes)
 /// is computed at construction so [`Provider::id`] is infallible and matches

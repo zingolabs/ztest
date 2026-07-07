@@ -23,7 +23,12 @@ pub use crate::proto::{
     CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo, RawTransaction, SendResponse,
     SubtreeRoot, TreeState,
 };
-pub use zcash_protocol::ShieldedProtocol;
+// ztest exposes the shielded-pool selector under the historical name
+// `ShieldedProtocol`; upstream renamed the enum to `ShieldedPool` (leaving a
+// deprecated `ShieldedProtocol` alias) in the orchard-0.15 line. Re-export the
+// live enum under the stable ztest name so the public API is unchanged and no
+// deprecation warning reaches consumers.
+pub use zcash_protocol::ShieldedPool as ShieldedProtocol;
 pub use zcash_protocol::TxId;
 pub use zcash_protocol::consensus::BlockHeight;
 pub use zcash_protocol::value::ZatBalance;

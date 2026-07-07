@@ -6,16 +6,18 @@
 
 use std::collections::HashMap;
 
+use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::Namespace;
 use kube::Client;
 use kube::api::{Api, DeleteParams, DynamicObject, ListParams};
 
 use crate::inventory::{DevImageEntry, SeedEntry};
+use crate::qos::kube_store::QOS_NAMESPACE;
 use crate::qos::{self, QosClass};
 use crate::resource::context::Cx;
 use crate::resource::graph::{Graph, GraphError};
 use crate::resource::impls::storage::StorageProfile;
-use crate::resource::impls::{image, qos as qos_impl, scaffolding, seed, storage};
+use crate::resource::impls::{image, policy, qos as qos_impl, scaffolding, seed, storage};
 use crate::resource::provider::NodeId;
 use crate::resource::state::NodeState;
 
@@ -44,6 +46,12 @@ pub struct InitializeOpts {
     /// Blanket-label every node with the NVMe pool label. `false` on real
     /// multi-node clusters, where the operator owns which nodes carry NVMe.
     pub label_nvme_pool: bool,
+
+    /// Provision the OpenShift-only policy nodes — the `nonroot-v2` SCC grant
+    /// and the internal-registry project. `true` on OpenShift targets (crc /
+    /// OKD). The run identity (SA + RBAC + token) is backend-agnostic and
+    /// provisioned regardless.
+    pub openshift: bool,
 }
 
 impl Default for InitializeOpts {
@@ -53,6 +61,7 @@ impl Default for InitializeOpts {
             max_concurrent: 8,
             storage: StorageProfile::HostpathFixtures,
             label_nvme_pool: true,
+            openshift: false,
         }
     }
 }
@@ -60,8 +69,8 @@ impl Default for InitializeOpts {
 /// Bring the cluster up to the state ztest requires.
 ///
 /// Assembles the cluster-infrastructure graph — snapshot CRDs + controller,
-/// CSI hostpath driver + RBAC, ztest StorageClasses, `zaino-seeds` /
-/// `zaino-qos` namespaces, NVMe node label, QoS RBAC + per-tier
+/// CSI hostpath driver + RBAC, ztest StorageClasses, `ztest-seeds` /
+/// `ztest-qos` namespaces, NVMe node label, QoS RBAC + per-tier
 /// ServiceAccounts — and provisions it in dependency order.
 ///
 /// **Idempotent.** Providers use [`probe`](crate::resource::Provider::probe)
@@ -107,6 +116,20 @@ where
 
     // QoS RBAC + per-tier ServiceAccounts.
     for p in qos_impl::providers() {
+        graph.add_dedup(p);
+    }
+
+    // Run identity (SA + RBAC + token) + OpenShift policy (SCC, registry).
+    // Namespaces the policy providers depend on:
+    graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(
+        policy::RUN_NAMESPACE,
+    )));
+    if opts.openshift {
+        graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(
+            policy::IMAGES_NAMESPACE,
+        )));
+    }
+    for p in policy::providers(opts.openshift) {
         graph.add_dedup(p);
     }
 
@@ -162,7 +185,7 @@ pub fn seed_node_id(entry: &SeedEntry) -> Result<NodeId, String> {
 
 /// Parent-side, by-identity teardown of a run's ephemeral resources.
 ///
-/// Deletes every resource labelled `zaino.io/run-id=<run_id>`: per-test
+/// Deletes every resource labelled `ztest.io/run-id=<run_id>`: per-test
 /// Namespaces (which cascade their contents) and cluster-scoped shadow
 /// [`VolumeSnapshotContent`]s. Leaves cluster infrastructure and content-
 /// addressed caches (images, seed PVCs) untouched.
@@ -170,14 +193,55 @@ pub fn seed_node_id(entry: &SeedEntry) -> Result<NodeId, String> {
 /// Called on Ctrl-C when the surviving parent must reap what a
 /// SIGKILL'd child left behind — the "label before populate" invariant
 /// means a resource half-created by a crash is still findable by its
-/// run-id label.
+/// run-id label. QoS reservation Leases are left to self-expire (their TTL
+/// heartbeat lapses when the run dies); `ztest cleanup` reclaims them
+/// eagerly, this path does not.
 ///
 /// Idempotent (404 counts as success). Errors are collected per-resource
 /// and returned rather than aborted on; the returned `Vec` is empty on a
 /// clean sweep.
 pub async fn reap_run(client: &Client, run_id: &str) -> Vec<String> {
-    let selector = format!("zaino.io/run-id={run_id}");
-    let lp = ListParams::default().labels(&selector);
+    let selector = format!("{}={run_id}", qos::LABEL_RUN_ID);
+    reap_envs(client, &selector, &selector).await
+}
+
+/// `ztest cleanup`: reclaim one developer's ephemeral resources — every
+/// per-test Namespace, shadow VolumeSnapshotContent, and QoS reservation Lease
+/// stamped [`LABEL_USER`](qos::LABEL_USER)`=<user>`. `user` is slugged to match
+/// the label as written. Cluster infrastructure and shared caches are untouched.
+pub async fn reap_user(client: &Client, user: &str) -> Vec<String> {
+    let user = crate::naming::slug(user, crate::naming::DNS_LABEL_MAX);
+    let owned = format!("{}={user}", qos::LABEL_USER);
+    let mut errors = reap_envs(client, &owned, &owned).await;
+    let leases = format!(
+        "{}={},{}={user}",
+        qos::LABEL_ROLE,
+        qos::ROLE_RESERVATION,
+        qos::LABEL_USER
+    );
+    errors.extend(reap_reservations(client, &leases).await);
+    errors
+}
+
+/// `ztest cleanup --all-users`: reclaim every developer's ephemeral resources.
+/// Requires an admin ServiceAccount able to list/delete across all namespaces;
+/// without it the individual deletes surface as RBAC errors in the returned
+/// `Vec`. Namespaces select on the role label; shadow VSCs (which carry only
+/// run-id + user) on the presence of the run-id label.
+pub async fn reap_all(client: &Client) -> Vec<String> {
+    let ns = format!("{}={}", qos::LABEL_ROLE, qos::ROLE_TEST_ENV);
+    let mut errors = reap_envs(client, &ns, qos::LABEL_RUN_ID).await;
+    let leases = format!("{}={}", qos::LABEL_ROLE, qos::ROLE_RESERVATION);
+    errors.extend(reap_reservations(client, &leases).await);
+    errors
+}
+
+/// Delete per-test Namespaces (cascading their contents) matching
+/// `ns_selector` and cluster-scoped shadow VolumeSnapshotContents matching
+/// `vsc_selector`. The two selectors differ for the cluster-wide sweep, where
+/// namespaces carry a role label the VSCs don't. Idempotent; per-resource
+/// errors are collected, never fatal.
+async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Vec<String> {
     let dp = DeleteParams::default();
     let mut errors = Vec::new();
 
@@ -186,7 +250,8 @@ pub async fn reap_run(client: &Client, run_id: &str) -> Vec<String> {
     // List by label and delete each individually — exactly what
     // `kubectl delete ns -l` does under the hood.
     let namespaces: Api<Namespace> = Api::all(client.clone());
-    match namespaces.list(&lp).await {
+    let ns_lp = ListParams::default().labels(ns_selector);
+    match namespaces.list(&ns_lp).await {
         Ok(list) => {
             for ns in list.items {
                 let Some(name) = ns.metadata.name.as_deref() else {
@@ -195,11 +260,11 @@ pub async fn reap_run(client: &Client, run_id: &str) -> Vec<String> {
                 if let Err(e) = namespaces.delete(name, &dp).await
                     && !crate::resource::kube::is_not_found(&e)
                 {
-                    errors.push(format!("reap namespace {name} (run-id={run_id}): {e}"));
+                    errors.push(format!("reap namespace {name} ({ns_selector}): {e}"));
                 }
             }
         }
-        Err(e) => errors.push(format!("list namespaces (run-id={run_id}): {e}")),
+        Err(e) => errors.push(format!("list namespaces ({ns_selector}): {e}")),
     }
 
     // Shadow VolumeSnapshotContents are cluster-scoped and don't cascade
@@ -207,13 +272,28 @@ pub async fn reap_run(client: &Client, run_id: &str) -> Vec<String> {
     // CRD simply has nothing to reap here — treat that as success.
     let vsc: Api<DynamicObject> =
         Api::all_with(client.clone(), &crate::seeds::volume_snapshot_content_gvk());
-    if let Err(e) = vsc.delete_collection(&dp, &lp).await
+    let vsc_lp = ListParams::default().labels(vsc_selector);
+    if let Err(e) = vsc.delete_collection(&dp, &vsc_lp).await
         && !crate::resource::kube::is_not_found(&e)
     {
-        errors.push(format!("reap shadow VSCs (run-id={run_id}): {e}"));
+        errors.push(format!("reap shadow VSCs ({vsc_selector}): {e}"));
     }
 
     errors
+}
+
+/// Delete QoS reservation Leases in the shared [`QOS_NAMESPACE`] matching
+/// `selector`. Leases self-expire on TTL lapse, so this is the eager path
+/// `ztest cleanup` takes; the run-exit reaper leaves them alone. A cluster
+/// where the QoS namespace was never provisioned simply has nothing to reap.
+async fn reap_reservations(client: &Client, selector: &str) -> Vec<String> {
+    let leases: Api<Lease> = Api::namespaced(client.clone(), QOS_NAMESPACE);
+    let lp = ListParams::default().labels(selector);
+    match leases.delete_collection(&DeleteParams::default(), &lp).await {
+        Ok(_) => Vec::new(),
+        Err(e) if crate::resource::kube::is_not_found(&e) => Vec::new(),
+        Err(e) => vec![format!("reap reservations ({selector}): {e}")],
+    }
 }
 
 /// A convenience helper: iterate the QoS tiers in a stable order. Used by

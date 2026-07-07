@@ -433,7 +433,7 @@ coarse-nextest to precise-2-D.
   CPU rounded up to whole cores for static-policy pinning; explicit
   `.resources()` overrides (see §7).
 - **SA budget annotation key** (§5.6): _Resolved_ —
-  `qos.zaino.io/budget-cpu` / `qos.zaino.io/budget-mem` (k8s quantities) on the
+  `qos.ztest.io/budget-cpu` / `qos.ztest.io/budget-mem` (k8s quantities) on the
   run's ServiceAccount, identified by the `ZTEST_SA` env var, read in-cluster
   (`qos::parse_sa_budget` + `TestEnv::build`).
 - **slow-timeout backstop value** (§5.2): _Resolved_ — no admission-anchored
@@ -445,7 +445,7 @@ coarse-nextest to precise-2-D.
   future in-process watchdog could anchor the cap at admission and demote this
   to a loose backstop.
 - **NVMe node identification**: exact label/taint key for the NVMe pool.
-  _(Placeholder `zaino.io/pool=nvme` in `qos::NVME_*`; node count sizes the
+  _(Placeholder `ztest.io/pool=nvme` in `qos::NVME_*`; node count sizes the
   `qos-sync` group via the probe.)_
 _Resolved during audit (§12):_ admission point = `TestEnv::build()` (not
 wrapper scripts), so topology-less tests reserve nothing and we take no

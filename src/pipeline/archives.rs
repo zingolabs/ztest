@@ -1,16 +1,16 @@
 //! Phase A3: archive discovery.
 //!
-//! Read-only walk of the `zaino-seeds` namespace, enumerating `seed-{sha8}` PVCs
-//! and classifying each as ready or pending based on the `seeds.zaino.io/ready`
+//! Read-only walk of the `ztest-seeds` namespace, enumerating `seed-{sha8}` PVCs
+//! and classifying each as ready or pending based on the `seeds.ztest.io/ready`
 //! label. Provisioning of missing archives (LFS pull, reconcile-Job, byte
 //! progress) is not yet implemented; tests needing a missing archive fail later
 //! at `TestEnv::build()`.
 //!
 //! PVC schema (`docs/architecture-overview.md#archive-pvcs`):
-//! - namespace: `zaino-seeds`
+//! - namespace: `ztest-seeds`
 //! - name: `seed-{sha[..8]}`
-//! - ready label: `seeds.zaino.io/ready=true`
-//! - sha label: `seeds.zaino.io/sha=<full-sha256>`
+//! - ready label: `seeds.ztest.io/ready=true`
+//! - sha label: `seeds.ztest.io/sha=<full-sha256>`
 //! - capacity: `spec.resources.requests.storage`
 
 use std::convert::TryInto;
@@ -22,13 +22,13 @@ use kube::{Api, Client};
 use super::events::EventTx;
 
 /// Namespace where seed archives live.
-const SEEDS_NAMESPACE: &str = "zaino-seeds";
+const SEEDS_NAMESPACE: &str = "ztest-seeds";
 
 /// PVC name prefix for archive seeds.
 const SEED_PVC_PREFIX: &str = "seed-";
 
 /// Label key indicating the archive is fully materialised.
-const READY_LABEL: &str = "seeds.zaino.io/ready";
+const READY_LABEL: &str = "seeds.ztest.io/ready";
 
 /// One enumerated seed PVC, classified by readiness.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +38,7 @@ pub struct ArchiveEntry {
     /// Storage requested from `spec.resources.requests.storage`, in bytes;
     /// `0` if unknown.
     pub size_bytes: u64,
-    /// `true` when `seeds.zaino.io/ready=true`, else pending materialisation.
+    /// `true` when `seeds.ztest.io/ready=true`, else pending materialisation.
     pub ready: bool,
 }
 
@@ -47,7 +47,7 @@ pub struct ArchiveEntry {
 pub enum ArchivesOutcome {
     /// PVCs enumerated.
     Discovered { entries: Vec<ArchiveEntry> },
-    /// The `zaino-seeds` namespace doesn't exist. Soft fail: likely a fresh
+    /// The `ztest-seeds` namespace doesn't exist. Soft fail: likely a fresh
     /// cluster that hasn't run any tests yet.
     NamespaceMissing,
     /// API call failed (RBAC, transient outage). Soft fail: the banner shows
@@ -56,7 +56,7 @@ pub enum ArchivesOutcome {
     Failed { detail: String },
 }
 
-/// Discover archive PVCs in the `zaino-seeds` namespace.
+/// Discover archive PVCs in the `ztest-seeds` namespace.
 ///
 /// Lifecycle events are emitted via [`EventTx`]. The function never
 /// panics; API errors are encoded in the [`ArchivesOutcome`] return.

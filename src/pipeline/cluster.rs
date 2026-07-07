@@ -22,7 +22,7 @@ use std::convert::TryFrom;
 
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
 use kube::api::ListParams;
-use kube::{Api, Client, Config};
+use kube::{Api, Client};
 
 use crate::qos::{
     ClusterCapacity, LABEL_ROLE, NVME_NODE_LABEL_KEY, NVME_NODE_LABEL_VALUE, ROLE_TEST_ENV,
@@ -67,9 +67,10 @@ pub enum ProbeOutcome {
 pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
     let _ = tx.send(Event::ProbeStarted);
 
-    crate::cluster::ensure_crypto_provider();
-
-    let config = match Config::infer().await {
+    // Honor the active profile's kube-context (`ZTEST_KUBE_CONTEXT`, set by
+    // `activate`), matching the client `ztest run` and the tests use — not the
+    // kubeconfig's current-context, which may point elsewhere.
+    let config = match crate::cluster::config().await {
         Ok(c) => c,
         Err(err) => {
             let detail = format!("{err}");
@@ -94,6 +95,25 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
             return (ProbeOutcome::Failed { detail }, None);
         }
     };
+
+    // Fail fast on a stale/insufficient run identity: name the exact missing
+    // grants here rather than letting a 403 surface deep in the probe (nodes) or
+    // mid-run (seed snapshot classes). Skipped silently if the SSAR call itself
+    // errors — the real work below will surface any genuine outage.
+    if let Ok(missing) = crate::resource::check_run_access(&client).await
+        && !missing.is_empty()
+    {
+        let detail = format!(
+            "run identity is missing cluster permissions: {}. Re-run `ztest setup` with an admin \
+             kubeconfig to update the `{}` role, or grant these to the run ServiceAccount.",
+            missing.join(", "),
+            crate::resource::RUN_CLUSTER_ROLE,
+        );
+        let _ = tx.send(Event::ProbeFailed {
+            detail: detail.clone(),
+        });
+        return (ProbeOutcome::Failed { detail }, None);
+    }
 
     let nodes_api: Api<Node> = Api::all(client.clone());
     let ns_api: Api<Namespace> = Api::all(client.clone());
@@ -273,7 +293,7 @@ fn cluster_requested(pods: &[Pod]) -> Resources {
 
 /// Names of the namespaces ztest manages: per-test environments (labelled
 /// [`LABEL_ROLE`]=[`ROLE_TEST_ENV`] by [`crate::cluster::ensure_namespace`])
-/// plus the QoS infra namespaces (`zaino-qos` ledger, `zaino-seeds` archive
+/// plus the QoS infra namespaces (`ztest-qos` ledger, `ztest-seeds` archive
 /// staging). Pods here are ztest's own load, accounted via the ledger; they are
 /// excluded from the baseline so they are never counted twice.
 fn ztest_namespaces(namespaces: &[Namespace]) -> BTreeSet<String> {
@@ -325,7 +345,7 @@ fn count_zaino_slots(namespaces: &[Namespace]) -> u32 {
             ns.metadata
                 .name
                 .as_deref()
-                .map(|n| n.starts_with("zaino-ci-") || n.starts_with("zaino-dev-"))
+                .map(|n| n.starts_with("ztest-ci-") || n.starts_with("ztest-dev-"))
                 .unwrap_or(false)
         })
         .count() as u32
@@ -487,29 +507,29 @@ mod tests {
     fn ztest_namespaces_picks_test_envs_and_infra() {
         let nss = vec![
             ns_with_role("ztest-foo-abc", Some(ROLE_TEST_ENV)), // labelled test-env
-            ns_with_role("zaino-qos", None),                    // infra by name
-            ns_with_role("zaino-seeds", None),                  // infra by name
+            ns_with_role("ztest-qos", None),                    // infra by name
+            ns_with_role("ztest-seeds", None),                  // infra by name
             ns_with_role("default", None),                      // unrelated
             ns_with_role("kube-system", Some("something-else")), // wrong role value
         ];
         let set = ztest_namespaces(&nss);
         assert!(set.contains("ztest-foo-abc"));
-        assert!(set.contains("zaino-qos"));
-        assert!(set.contains("zaino-seeds"));
+        assert!(set.contains("ztest-qos"));
+        assert!(set.contains("ztest-seeds"));
         assert!(!set.contains("default"));
         assert!(!set.contains("kube-system"));
     }
 
     #[test]
     fn baseline_excludes_ztest_pods_counts_only_non_ztest() {
-        let ztest_ns: BTreeSet<String> = ["ztest-foo-abc", "zaino-qos"]
+        let ztest_ns: BTreeSet<String> = ["ztest-foo-abc", "ztest-qos"]
             .into_iter()
             .map(String::from)
             .collect();
         let pods = vec![
             pod_in("kube-system", Some("n1"), "Running", "500m", "512Mi"), // baseline
             pod_in("ztest-foo-abc", Some("n1"), "Running", "4", "8Gi"),    // ztest → excluded
-            pod_in("zaino-qos", Some("n1"), "Running", "1", "1Gi"),        // ztest → excluded
+            pod_in("ztest-qos", Some("n1"), "Running", "1", "1Gi"),        // ztest → excluded
         ];
         let b = baseline_requested(&pods, &ztest_ns);
         assert_eq!(b.cpu_milli, 500); // only kube-system
@@ -548,12 +568,12 @@ mod tests {
             ..Default::default()
         };
         let nss = vec![
-            ns("zaino-ci-123-0"),
-            ns("zaino-dev-elicb-456-3"),
+            ns("ztest-ci-123-0"),
+            ns("ztest-dev-elicb-456-3"),
             ns("default"),
             ns("kube-system"),
-            ns("zaino-seeds"),
-            ns("zaino-system"),
+            ns("ztest-seeds"),
+            ns("ztest-system"),
         ];
         assert_eq!(count_zaino_slots(&nss), 2);
     }

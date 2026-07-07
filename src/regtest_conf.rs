@@ -616,7 +616,7 @@ mod tests {
             28232,
             SHIELDED_MINER_ADDRESS,
         );
-        assert!(conf.contains("nuparams=c8e71055:3 # NU6"));
+        assert!(conf.contains("nuparams=c8e71055:2 # NU6"));
         assert!(!conf.contains("4dec4df0"));
         assert!(!conf.contains("5437f330"));
         assert!(conf.contains(&format!("mineraddress={SHIELDED_MINER_ADDRESS}")));
@@ -638,8 +638,8 @@ mod tests {
             None,
             MINER_ADDRESS,
         );
-        assert!(toml.contains("NU6 = 3"));
-        assert!(toml.contains("\"NU6.1\" = 6"));
+        assert!(toml.contains("NU6 = 2"));
+        assert!(toml.contains("\"NU6.1\" = 5"));
         assert!(toml.contains(&format!("miner_address = \"{MINER_ADDRESS}\"")));
         assert!(toml.contains(&format!("address = \"{LOCKBOX_ADDRESS}\"")));
         assert!(toml.contains("initial_testnet_peers = []"));

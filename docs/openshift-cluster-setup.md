@@ -28,10 +28,11 @@ ztest setup --target okd --storage-device /dev/vdb
 - [ztest's role: connect, don't drive](#ztests-role-connect-dont-drive)
 - [Storage: LVMS from scratch](#storage-lvms-from-scratch)
 - [Running `ztest setup`](#running-ztest-setup)
+- [Remote access over Nebula](#remote-access-over-nebula)
 - [Verification](#verification)
 - [Known issues](#known-issues)
 - [Teardown / rebuild](#teardown--rebuild)
-- [Outstanding: the SCC grant](#outstanding-the-scc-grant)
+- [SCC admission](#scc-admission)
 
 ## Prerequisites
 
@@ -237,6 +238,82 @@ ztest setup --target okd --storage-device /dev/vdb
 
 Idempotent — skips anything already Ready.
 
+> `--storage-device` is only for **building** a fresh LVMS pool. On a cluster
+> that already has snapshot-capable storage (operator + `LVMCluster` up, or any
+> CSI driver with a `VolumeSnapshotClass`), run plain `ztest setup --target okd`:
+> it scans the cluster, lists what it finds, and you pick the class — no flag
+> needed. `--storage-provisioner topolvm.io` still works as a non-interactive
+> override.
+
+## Remote access over Nebula
+
+Local use talks to `https://api.crc.testing:6443` over libvirt. To drive the
+cluster from another machine (workstation/CI), crc's API + ingress are bridged
+onto a [Nebula](https://github.com/slackhq/nebula) mesh — no SSH tunnel, no
+public ports.
+
+**Cluster host (server side).** A specialization DNATs mesh traffic on
+`6443,80,443` to the crc node (`192.168.130.11`), so peers reach the API and the
+ingress routes (registry, oauth) at the host's mesh IP. See
+`modules/specializations/crc-nebula-exposure.nix` in the nixos-config.
+
+**Peer (client side).** Resolve the crc hostnames to the host's mesh IP so TLS
+verifies against crc's certs and `oc login`'s OAuth redirect resolves — the
+mirror of the host's split-DNS, pointed at the mesh IP:
+
+```
+address=/crc.testing/<mesh-ip>
+address=/apps-crc.testing/<mesh-ip>
+```
+
+Gate it behind a `kubernetes` specialisation (`crc-nebula-client.nix`) so it's
+active only during cluster-dev, not every boot:
+
+```bash
+sudo nixos-rebuild switch --flake <cfg>#<host> --specialisation kubernetes
+getent hosts api.crc.testing          # → <mesh-ip>
+```
+
+**Cluster policy** is provisioned by `ztest setup` itself (admin, once): on an
+OpenShift target it creates the run identity (`ztest` SA + `ztest-remote` RBAC +
+token), the `nonroot-v2` SCC grant, and the `ztest-images` registry project +
+pull/push RBAC (`src/resource/impls/policy.rs`). Nothing to apply by hand.
+
+**Run credential.** Build a kubeconfig from the SA token that `ztest setup`
+minted:
+
+```bash
+oc --kubeconfig=~/.kube/config-crc-remote config set-cluster crc \
+  --server=https://api.crc.testing:6443 \
+  --certificate-authority=<crc-ca.pem> --embed-certs
+oc --kubeconfig=~/.kube/config-crc-remote config set-credentials ztest \
+  --token="$(oc -n ztest get secret ztest-token -o jsonpath='{.data.token}' | base64 -d)"
+oc --kubeconfig=~/.kube/config-crc-remote config set-context crc \
+  --cluster=crc --user=ztest --namespace=ztest
+oc --kubeconfig=~/.kube/config-crc-remote config use-context crc
+```
+
+Without the client split-DNS active, target `--server=https://<mesh-ip>:6443`
+`--tls-server-name=api.crc.testing` (the SNI still selects the api cert). This is
+DNS-independent, so `ztest run`'s API access works regardless of the
+specialisation; only image push (below) needs the ingress hostname.
+
+**Image distribution** (the `ztest-images` project + RBAC are created by `ztest setup`):
+
+```bash
+docker login -u ztest -p "$(KUBECONFIG=~/.kube/config-crc-remote oc whoami -t)" \
+  default-route-openshift-image-registry.apps-crc.testing
+export ZTEST_IMAGE_REGISTRY=default-route-openshift-image-registry.apps-crc.testing/ztest-images
+KUBECONFIG=~/.kube/config-crc-remote ztest run -p <package>
+```
+
+The client module also marks that registry host `insecure` for the local Docker
+daemon (its Route cert is from the ingress CA, which Docker doesn't trust; the
+mesh already encrypts the hop).
+
+> **nushell:** `$HOME` is not expanded in external-command args — use `~` (or
+> `$env.HOME`). `--kubeconfig=$HOME/...` silently writes a literal `$HOME/` dir.
+
 ## Verification
 
 ```bash
@@ -277,14 +354,18 @@ oc get node crc -o jsonpath='{range .status.conditions[?(@.type=="DiskPressure")
   [running-tests.md](running-tests.md)); the LVMS operator + `LVMCluster` persist
   independently in `openshift-lvm-storage`.
 
-## Outstanding: the SCC grant
+## SCC admission
 
 `ztest setup` resources pass admission, but **per-test pods** (`ztest run`) set
 explicit `runAsUser: 1000` / `fsGroup: 1000/2001` (`manifest.rs`), which the
 default `restricted-v2` SCC (`MustRunAsRange`) rejects — they fail admission on
 OpenShift (crc *and* prod).
 
-**Planned fix:** from `cluster::ensure_namespace`, grant the per-test namespace's
-`default` SA the `nonroot-v2` SCC (explicit non-root UID/GID), gated to OpenShift.
-Not `anyuid` (permits root). Not yet implemented — the next milestone, and the
-reason this cluster exists.
+**Fix:** grant `nonroot-v2` (explicit non-root UID/GID — not `anyuid`, which
+permits root). `ztest setup` provisions this on OpenShift targets
+(`SccGrantProvider`, `src/resource/impls/policy.rs`), bound to the
+`system:serviceaccounts` group because test namespaces are created dynamically
+and the run identity is rbac-less (can't self-bind SCCs). A future refinement
+could move it into `cluster::ensure_namespace` as a per-namespace grant, but
+that requires giving the run identity rbac-write, so the group grant is the
+current answer.

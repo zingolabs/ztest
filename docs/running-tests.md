@@ -53,7 +53,7 @@ Each test process bootstraps its own namespace on first
 `TestEnv::build()`:
 
 ```
-zaino-dev-${USER}-${NEXTEST_PID}-${NEXTEST_TEST_GLOBAL_SLOT}
+ztest-dev-${USER}-${NEXTEST_PID}-${NEXTEST_TEST_GLOBAL_SLOT}
 ```
 
 Two parallel `cargo nextest` invocations have different `NEXTEST_PID`
@@ -64,7 +64,7 @@ until the cluster TTL controller GC's them (default 1h after
 `last_accessed_at`). To force cleanup:
 
 ```bash
-kubectl delete ns -l zaino.io/owner=${USER}
+kubectl delete ns -l ztest.io/owner=${USER}
 ```
 
 ## CI (GitHub Actions)
@@ -106,7 +106,7 @@ jobs:
       - run: ztest run -p clientless -p e2e --test-threads 8
 
       - if: always()
-        run: kubectl delete ns -l zaino.io/run-id=$ZTEST_RUN_ID
+        run: kubectl delete ns -l ztest.io/run-id=$ZTEST_RUN_ID
 ```
 
 `ZTEST_RUN_ID` prefixes each namespace name and is stamped as a label on
@@ -133,7 +133,7 @@ in slot 3 as a new process, inheriting the same slot number.
 ```
 nextest run --test-threads 4
 │
-├─ slot 0 ┬─ test_a (process pid 1001)  ─┐ same namespace zaino-ci-X-0
+├─ slot 0 ┬─ test_a (process pid 1001)  ─┐ same namespace ztest-ci-X-0
 │         └─ test_d (process pid 1009)  ─┘ across the slot's lifetime
 │
 ├─ slot 1 ┬─ test_b
@@ -229,8 +229,8 @@ session hands off to nextest.
    list nodes, count `zaino-{ci,dev}-*` namespaces as a proxy for
    current concurrency.
 3. **Resolve archives.** For each required `seed-{sha8}` PVC in
-   `zaino-seeds`:
-   - PVC labelled `seeds.zaino.io/ready=true` → `✓ cached`.
+   `ztest-seeds`:
+   - PVC labelled `seeds.ztest.io/ready=true` → `✓ cached`.
    - PVC exists but not ready → `⇣ provisioning`; attach to the
      in-flight reconcile Job's log stream and render byte-progress.
    - PVC absent + LFS blob local → create PVC + reconcile Job per
@@ -298,7 +298,7 @@ once the underlying primitive lands.
 Today the banner's `capacity` line reports `configured: N via
 --test-threads`. That's the *per-invocation* limit, not a cluster
 limit. A future `ClusterCapacity` CR (or a `ResourceQuota` on a
-`zaino-system` namespace) carries an authoritative
+`ztest-system` namespace) carries an authoritative
 `spec.maxConcurrentSessions`. Once present, the line reads:
 
 ```
@@ -396,7 +396,7 @@ shared cluster cache
 
 Today the LFS fetch in step 3 runs in the launcher's local working
 tree. On a fresh CI runner that's a cold fetch every time. Future
-work: a cluster-resident LFS cache pod in `zaino-system` that holds
+work: a cluster-resident LFS cache pod in `ztest-system` that holds
 recently-fetched blobs and is queried by hash before the launcher's
 local Git LFS is consulted. The banner gains:
 
@@ -458,7 +458,7 @@ filters operate on cases too. See
 
 |                     | Dev                                           | CI                                         |
 | ------------------- | --------------------------------------------- | ------------------------------------------ |
-| Namespace           | `zaino-dev-${user}-${nextest_pid}-${slot}`    | `zaino-ci-${run_id}-${slot}`               |
+| Namespace           | `ztest-dev-${user}-${nextest_pid}-${slot}`    | `ztest-ci-${run_id}-${slot}`               |
 | Created by          | Library, first `TestEnv::build()` in slot     | Same                                       |
 | Reused across tests | Within a slot, yes (sequential tests)         | Same                                       |
 | End-of-run cleanup  | None (TTL controller GC, default 1h idle)     | Workflow step deletes ns by `run-id` label |

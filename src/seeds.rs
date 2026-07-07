@@ -2,7 +2,7 @@
 //!
 //! See `docs/architecture-overview.md#seeds-content-addressed-archive-pvcs`.
 //!
-//! - The seed PVC lives in `zaino-seeds`, named `seed-{sha8}`, paired with
+//! - The seed PVC lives in `ztest-seeds`, named `seed-{sha8}`, paired with
 //!   a `VolumeSnapshot` of the same name.
 //! - To use a seed from a test namespace we mint a shadow VSC
 //!   (cluster-scoped) sharing the CSI snapshot handle, plus a shadow
@@ -24,7 +24,7 @@ use crate::EnvError;
 use crate::cluster::Sentinel;
 use crate::error::env_err;
 
-pub const SEEDS_NAMESPACE: &str = "zaino-seeds";
+pub const SEEDS_NAMESPACE: &str = "ztest-seeds";
 
 /// 8 lowercase-hex characters: the content-address prefix we name PVCs by.
 pub fn sha8(path: &Path) -> Result<String, std::io::Error> {
@@ -42,7 +42,7 @@ pub fn sha8(path: &Path) -> Result<String, std::io::Error> {
     Ok(hex::encode(&digest[..4]))
 }
 
-/// `(VolumeSnapshot in zaino-seeds, the CSI snapshot handle)`.
+/// `(VolumeSnapshot in ztest-seeds, the CSI snapshot handle)`.
 #[derive(Debug, Clone)]
 pub struct SeedHandle {
     pub sha8: String,
@@ -127,19 +127,25 @@ pub async fn mint_shadow_clone(
     // VSC first: cluster-scoped, no owner.
     let vsc_gvk = volume_snapshot_content_gvk();
     let vsc_api: Api<DynamicObject> = Api::all_with(client.clone(), &vsc_gvk);
-    // Label the cluster-scoped VSC with the run id so the preflight reaper can
-    // clean it up on Ctrl-C: it can't ownerRef the namespaced sentinel (k8s GC
-    // won't cross scopes) and so isn't cascaded by a namespace delete. The label
-    // is the only handle a parent-side, by-identity reap has on it.
-    let run_id = crate::naming::RunCoords::from_env()
-        .map(|c| c.run_id)
+    // A cluster-scoped VSC can't ownerRef the namespaced sentinel (k8s GC won't
+    // cross scopes) and so isn't cascaded by a namespace delete. Its run-id/user
+    // labels are the only handle the by-identity (Ctrl-C) and by-owner (`ztest
+    // cleanup`) reapers have on it.
+    let coords = crate::naming::RunCoords::from_env().ok();
+    let run_id = coords.as_ref().map(|c| c.run_id.clone()).unwrap_or_default();
+    let user = coords
+        .as_ref()
+        .map(|c| crate::naming::slug(&c.user, crate::naming::DNS_LABEL_MAX))
         .unwrap_or_default();
     let vsc_body: Value = json!({
         "apiVersion": "snapshot.storage.k8s.io/v1",
         "kind": "VolumeSnapshotContent",
         "metadata": {
             "name": shadow_vsc,
-            "labels": { "zaino.io/run-id": run_id },
+            "labels": {
+                "ztest.io/run-id": run_id,
+                "ztest.io/user": user,
+            },
         },
         "spec": {
             "deletionPolicy": "Retain",  // we don't own the backend snapshot

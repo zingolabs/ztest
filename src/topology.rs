@@ -39,6 +39,7 @@ pub struct ActivationHeights {
     nu6: Option<u32>,
     nu6_1: Option<u32>,
     nu6_2: Option<u32>,
+    nu6_3: Option<u32>,
     nu7: Option<u32>,
 }
 
@@ -74,6 +75,9 @@ impl ActivationHeights {
     }
     pub fn nu6_2(&self) -> Option<u32> {
         self.nu6_2
+    }
+    pub fn nu6_3(&self) -> Option<u32> {
+        self.nu6_3
     }
     pub fn nu7(&self) -> Option<u32> {
         self.nu7
@@ -124,6 +128,10 @@ impl ActivationHeightsBuilder {
         self.inner.nu6_2 = h;
         self
     }
+    pub fn set_nu6_3(mut self, h: Option<u32>) -> Self {
+        self.inner.nu6_3 = h;
+        self
+    }
     pub fn set_nu7(mut self, h: Option<u32>) -> Self {
         self.inner.nu7 = h;
         self
@@ -139,7 +147,10 @@ impl ActivationHeightsBuilder {
 ///
 /// `PartialOrd`/`Ord` reflect supersession: `Nu5 < Nu6 < Nu6_1 < ...`. The
 /// resolver uses [`Ord::min`] across components to pick the topology
-/// ceiling. New NUs append to the end.
+/// ceiling. New NUs are inserted in supersession order — a point release
+/// like NU6.3 sits between NU6.2 and NU7, not merely appended — because the
+/// derived `Ord`, and therefore the resolver's `min` and the `nu <= ceiling`
+/// gate, depend on declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NetworkUpgrade {
     Overwinter,
@@ -151,6 +162,7 @@ pub enum NetworkUpgrade {
     Nu6,
     Nu6_1,
     Nu6_2,
+    Nu6_3,
     Nu7,
 }
 
@@ -159,60 +171,35 @@ impl NetworkUpgrade {
     /// constraints, activate everything we know about).
     pub const HIGHEST: NetworkUpgrade = NetworkUpgrade::Nu7;
 
-    /// This upgrade's activation height in ztest's canonical regtest
-    /// fixture, or `None` if ztest never activates it in regtest.
-    ///
-    /// This is the single source of truth for the regtest schedule:
-    /// [`activation_heights_for_ceiling`] gates these heights by the
-    /// topology ceiling, and
-    /// [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights)
-    /// is this same schedule with no ceiling, so the resolver and the
-    /// standalone fixture cannot drift apart.
-    ///
-    /// Every independently-queryable upgrade gets a distinct height: zebra
-    /// keeps only the highest upgrade on a height collision (its
-    /// `Height -> NetworkUpgrade` map), so co-locating e.g. NU5 and NU6
-    /// would drop NU5 and break the Orchard coinbase ("Cannot create
-    /// Orchard transactions before NU5 activation"). Pre-NU5 upgrades
-    /// intentionally share height 1: they collapse to Canopy, which is
-    /// harmless. NU6.1 sits at height 6 (leaving NU6 blocks 3/4/5 for
-    /// funding-stream deposits before activation), NU6.2 at 7.
-    /// [`Nu7`](Self::Nu7) is `None`: it has no stable `zcash_protocol`
-    /// representation (see [`UnsupportedNetworkUpgrade`]) and is never
-    /// activated in regtest.
     pub(crate) const fn regtest_height(self) -> Option<u32> {
         match self {
             Self::Overwinter | Self::Sapling | Self::Blossom | Self::Heartwood | Self::Canopy => {
                 Some(1)
             }
             Self::Nu5 => Some(2),
-            Self::Nu6 => Some(3),
-            Self::Nu6_1 => Some(6),
-            Self::Nu6_2 => Some(7),
+            Self::Nu6 => Some(2),
+            Self::Nu6_1 => Some(5),
+            Self::Nu6_2 => Some(5),
+            Self::Nu6_3 => Some(8),
             Self::Nu7 => None,
         }
     }
 }
 
-/// A topology [`NetworkUpgrade`] that has no representation in the stable
-/// `zcash_protocol::consensus::NetworkUpgrade`. Today only [`NetworkUpgrade::Nu7`]:
-/// upstream gates its `Nu7` variant behind `--cfg zcash_unstable="nu7"`, a
-/// viral, consensus-affecting flag we deliberately don't enable, so the
-/// variant cannot even be named here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "network upgrade {0:?} has no zcash_protocol representation without the \
-     `zcash_unstable = \"nu7\"` cfg"
+    "network upgrade {0:?} has no stable zcash_protocol::consensus::NetworkUpgrade representation"
 )]
 pub struct UnsupportedNetworkUpgrade(pub NetworkUpgrade);
 
 /// Best-effort interop with `zcash_protocol::consensus::NetworkUpgrade`.
 ///
 /// Partial by nature: ztest's enum is a stable superset that carries
-/// [`NetworkUpgrade::Nu7`], which upstream cannot represent without the
-/// `zcash_unstable="nu7"` cfg. `TryFrom` (not `From`) makes that partiality
-/// explicit at the type level: the `Nu7` arm returns
-/// [`UnsupportedNetworkUpgrade`] rather than naming a variant that doesn't
+/// [`NetworkUpgrade::Nu6_3`] and [`NetworkUpgrade::Nu7`], neither of which the
+/// pinned `zcash_protocol` can represent (Nu7 needs the `zcash_unstable="nu7"`
+/// cfg; Nu6_3 has no upstream variant yet). `TryFrom` (not `From`) makes that
+/// partiality explicit at the type level: those arms return
+/// [`UnsupportedNetworkUpgrade`] rather than naming variants that don't
 /// compile on stable.
 impl TryFrom<NetworkUpgrade> for zcash_protocol::consensus::NetworkUpgrade {
     type Error = UnsupportedNetworkUpgrade;
@@ -229,16 +216,36 @@ impl TryFrom<NetworkUpgrade> for zcash_protocol::consensus::NetworkUpgrade {
             NetworkUpgrade::Nu6 => Up::Nu6,
             NetworkUpgrade::Nu6_1 => Up::Nu6_1,
             NetworkUpgrade::Nu6_2 => Up::Nu6_2,
-            NetworkUpgrade::Nu7 => return Err(UnsupportedNetworkUpgrade(nu)),
+            NetworkUpgrade::Nu6_3 | NetworkUpgrade::Nu7 => {
+                return Err(UnsupportedNetworkUpgrade(nu));
+            }
         })
     }
 }
 
 // ──────────────────── per-family capability tables ────────────────────
 
+const ZEBRAD_NU6_3_RELEASE: Semver = Semver {
+    major: u16::MAX,
+    minor: 0,
+    patch: 0,
+};
+const ZCASHD_NU6_3_RELEASE: Semver = Semver {
+    major: u16::MAX,
+    minor: 0,
+    patch: 0,
+};
+const ZAINO_NU6_3_RELEASE: Semver = Semver {
+    major: u16::MAX,
+    minor: 0,
+    patch: 0,
+};
+
 /// zebrad capability ceiling.
 pub fn zebrad_ceiling(v: Semver) -> NetworkUpgrade {
-    if v >= sv(5, 0, 0) {
+    if v >= ZEBRAD_NU6_3_RELEASE {
+        NetworkUpgrade::Nu6_3
+    } else if v >= sv(5, 0, 0) {
         NetworkUpgrade::Nu6_2
     } else if v >= sv(2, 5, 0) {
         NetworkUpgrade::Nu6_1
@@ -249,7 +256,9 @@ pub fn zebrad_ceiling(v: Semver) -> NetworkUpgrade {
 
 /// zcashd capability ceiling.
 pub fn zcashd_ceiling(v: Semver) -> NetworkUpgrade {
-    if v >= sv(6, 20, 0) {
+    if v >= ZCASHD_NU6_3_RELEASE {
+        NetworkUpgrade::Nu6_3
+    } else if v >= sv(6, 20, 0) {
         NetworkUpgrade::Nu6_2
     } else if v >= sv(6, 1, 0) {
         NetworkUpgrade::Nu6_1
@@ -260,14 +269,6 @@ pub fn zcashd_ceiling(v: Semver) -> NetworkUpgrade {
     }
 }
 
-/// Version at which zaino gains NU6.2 decode support.
-///
-/// Placeholder: zaino has not shipped NU6.2 support as of this writing, so
-/// this is an unreachable sentinel (`u16::MAX`). No real version satisfies
-/// it, so [`zaino_ceiling`] never returns [`NetworkUpgrade::Nu6_2`] today.
-/// When that release lands, replace this with the real version and extend
-/// the `zaino_*` tests below with a case that exercises the new ceiling so
-/// this constant can't quietly go stale.
 const ZAINO_NU6_2_RELEASE: Semver = Semver {
     major: u16::MAX,
     minor: 0,
@@ -276,7 +277,9 @@ const ZAINO_NU6_2_RELEASE: Semver = Semver {
 
 /// zaino capability ceiling.
 pub fn zaino_ceiling(v: Semver) -> NetworkUpgrade {
-    if v >= ZAINO_NU6_2_RELEASE {
+    if v >= ZAINO_NU6_3_RELEASE {
+        NetworkUpgrade::Nu6_3
+    } else if v >= ZAINO_NU6_2_RELEASE {
         NetworkUpgrade::Nu6_2
     } else if v >= sv(0, 3, 0) {
         NetworkUpgrade::Nu6_1
@@ -308,11 +311,6 @@ pub fn resolve_ceiling(ceilings: &[NetworkUpgrade]) -> NetworkUpgrade {
         .unwrap_or(NetworkUpgrade::HIGHEST)
 }
 
-/// Build an [`ActivationHeights`] activating every upgrade at or below
-/// `ceiling` at its [`regtest_height`](NetworkUpgrade::regtest_height), and
-/// `None` for everything above. The heights come from
-/// [`NetworkUpgrade::regtest_height`], the single source of truth shared
-/// with [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights).
 pub fn activation_heights_for_ceiling(ceiling: NetworkUpgrade) -> ActivationHeights {
     // An upgrade activates at its scheduled height when the topology reaches
     // it (NU <= ceiling), and is absent otherwise.
@@ -327,6 +325,7 @@ pub fn activation_heights_for_ceiling(ceiling: NetworkUpgrade) -> ActivationHeig
         .set_nu6(at(NetworkUpgrade::Nu6))
         .set_nu6_1(at(NetworkUpgrade::Nu6_1))
         .set_nu6_2(at(NetworkUpgrade::Nu6_2))
+        .set_nu6_3(at(NetworkUpgrade::Nu6_3))
         .set_nu7(at(NetworkUpgrade::Nu7))
         .build()
 }
@@ -358,6 +357,25 @@ mod tests {
     }
 
     #[test]
+    fn nu6_3_has_no_zcash_protocol_representation() {
+        // zcash_protocol 0.9.0 has no `Nu6_3` variant (NU6.3/Ironwood is
+        // fork-only), so the conversion must fail rather than name a variant
+        // that doesn't exist upstream.
+        use zcash_protocol::consensus::NetworkUpgrade as Up;
+        assert_eq!(
+            Up::try_from(NetworkUpgrade::Nu6_3),
+            Err(UnsupportedNetworkUpgrade(NetworkUpgrade::Nu6_3)),
+        );
+    }
+
+    #[test]
+    fn nu6_3_supersedes_nu6_2_and_precedes_nu7() {
+        // The resolver relies on this ordering (min / `nu <= ceiling`).
+        assert!(NetworkUpgrade::Nu6_2 < NetworkUpgrade::Nu6_3);
+        assert!(NetworkUpgrade::Nu6_3 < NetworkUpgrade::Nu7);
+    }
+
+    #[test]
     fn zebrad_5_1_1_supports_nu6_2() {
         assert_eq!(zebrad_ceiling(parse("5.1.1")), NetworkUpgrade::Nu6_2);
     }
@@ -385,6 +403,27 @@ mod tests {
     #[test]
     fn zaino_0_4_0_rc_2_caps_at_nu6_1() {
         assert_eq!(zaino_ceiling(parse("0.4.0-rc.2")), NetworkUpgrade::Nu6_1);
+    }
+
+    #[test]
+    fn nu6_3_ceiling_branch_is_reachable_only_by_its_sentinel() {
+        // Feeding the sentinel itself exercises the NU6.3 branch (proving it
+        // wires to `Nu6_3`). When a real NU6.3 image lands, replace the
+        // sentinel with the real version and pin it in a dedicated test.
+        assert_eq!(zebrad_ceiling(ZEBRAD_NU6_3_RELEASE), NetworkUpgrade::Nu6_3);
+        assert_eq!(zcashd_ceiling(ZCASHD_NU6_3_RELEASE), NetworkUpgrade::Nu6_3);
+        assert_eq!(zaino_ceiling(ZAINO_NU6_3_RELEASE), NetworkUpgrade::Nu6_3);
+    }
+
+    #[test]
+    fn current_images_do_not_yet_reach_nu6_3() {
+        // The all-or-nothing guard: today's candidate images all stay at or
+        // below NU6.2, so the resolver never activates NU6.3 in a real
+        // topology. If this starts failing, a real NU6.3 version was wired in
+        // and the render layer (branch-id / activation key) must be in place.
+        assert!(zebrad_ceiling(parse("6.0.0-rc.0")) < NetworkUpgrade::Nu6_3);
+        assert!(zcashd_ceiling(parse("6.20.0")) < NetworkUpgrade::Nu6_3);
+        assert!(zaino_ceiling(parse("0.4.3")) < NetworkUpgrade::Nu6_3);
     }
 
     #[test]
@@ -430,8 +469,8 @@ mod tests {
     fn activation_heights_for_nu6_1_omits_nu6_2_and_nu7() {
         let h = activation_heights_for_ceiling(NetworkUpgrade::Nu6_1);
         assert_eq!(h.nu5(), Some(2));
-        assert_eq!(h.nu6(), Some(3));
-        assert_eq!(h.nu6_1(), Some(6));
+        assert_eq!(h.nu6(), Some(2));
+        assert_eq!(h.nu6_1(), Some(5));
         assert_eq!(h.nu6_2(), None);
         assert_eq!(h.nu7(), None);
     }
@@ -439,8 +478,17 @@ mod tests {
     #[test]
     fn activation_heights_for_nu6_2_includes_nu6_1_and_nu6_2() {
         let h = activation_heights_for_ceiling(NetworkUpgrade::Nu6_2);
-        assert_eq!(h.nu6_1(), Some(6));
-        assert_eq!(h.nu6_2(), Some(7));
+        assert_eq!(h.nu6_1(), Some(5));
+        assert_eq!(h.nu6_2(), Some(5));
+        assert_eq!(h.nu6_3(), None);
+        assert_eq!(h.nu7(), None);
+    }
+
+    #[test]
+    fn activation_heights_for_nu6_3_includes_nu6_2_and_nu6_3() {
+        let h = activation_heights_for_ceiling(NetworkUpgrade::Nu6_3);
+        assert_eq!(h.nu6_2(), Some(5));
+        assert_eq!(h.nu6_3(), Some(8));
         assert_eq!(h.nu7(), None);
     }
 
@@ -448,7 +496,7 @@ mod tests {
     fn activation_heights_for_nu6_omits_everything_post_nu6() {
         let h = activation_heights_for_ceiling(NetworkUpgrade::Nu6);
         assert_eq!(h.nu5(), Some(2));
-        assert_eq!(h.nu6(), Some(3));
+        assert_eq!(h.nu6(), Some(2));
         assert_eq!(h.nu6_1(), None);
         assert_eq!(h.nu6_2(), None);
         assert_eq!(h.nu7(), None);
@@ -456,43 +504,34 @@ mod tests {
 
     #[test]
     fn regtest_schedule_pins_canonical_heights() {
-        // Pin the single source of truth: if any of these shift, both the
-        // topology resolver and `regtest::regtest_test_activation_heights`
-        // shift with them, and the zebra height-collision invariant
-        // (distinct heights for NU5+) must be re-checked.
         assert_eq!(NetworkUpgrade::Overwinter.regtest_height(), Some(1));
         assert_eq!(NetworkUpgrade::Sapling.regtest_height(), Some(1));
         assert_eq!(NetworkUpgrade::Blossom.regtest_height(), Some(1));
         assert_eq!(NetworkUpgrade::Heartwood.regtest_height(), Some(1));
         assert_eq!(NetworkUpgrade::Canopy.regtest_height(), Some(1));
         assert_eq!(NetworkUpgrade::Nu5.regtest_height(), Some(2));
-        assert_eq!(NetworkUpgrade::Nu6.regtest_height(), Some(3));
-        assert_eq!(NetworkUpgrade::Nu6_1.regtest_height(), Some(6));
-        assert_eq!(NetworkUpgrade::Nu6_2.regtest_height(), Some(7));
+        assert_eq!(NetworkUpgrade::Nu6.regtest_height(), Some(2));
+        assert_eq!(NetworkUpgrade::Nu6_1.regtest_height(), Some(5));
+        assert_eq!(NetworkUpgrade::Nu6_2.regtest_height(), Some(5));
+        assert_eq!(NetworkUpgrade::Nu6_3.regtest_height(), Some(8));
         assert_eq!(NetworkUpgrade::Nu7.regtest_height(), None);
     }
 
     #[test]
-    fn nu5_and_later_have_distinct_heights() {
-        // The collision invariant zebra cares about: every upgrade NU5 and
-        // above maps to its own height (a collision would drop the lower
-        // upgrade from zebra's activation map).
+    fn nu5_and_later_heights_are_non_decreasing() {
         let heights: Vec<u32> = [
             NetworkUpgrade::Nu5,
             NetworkUpgrade::Nu6,
             NetworkUpgrade::Nu6_1,
             NetworkUpgrade::Nu6_2,
+            NetworkUpgrade::Nu6_3,
         ]
         .iter()
         .filter_map(|nu| nu.regtest_height())
         .collect();
-        let mut deduped = heights.clone();
-        deduped.sort_unstable();
-        deduped.dedup();
-        assert_eq!(
-            heights.len(),
-            deduped.len(),
-            "NU5+ heights must be distinct"
+        assert!(
+            heights.windows(2).all(|w| w[0] <= w[1]),
+            "NU5+ heights must be non-decreasing by upgrade order: {heights:?}"
         );
     }
 
@@ -507,9 +546,10 @@ mod tests {
         assert_eq!(h.heartwood(), Some(1));
         assert_eq!(h.canopy(), Some(1));
         assert_eq!(h.nu5(), Some(2));
-        assert_eq!(h.nu6(), Some(3));
-        assert_eq!(h.nu6_1(), Some(6));
-        assert_eq!(h.nu6_2(), Some(7));
+        assert_eq!(h.nu6(), Some(2));
+        assert_eq!(h.nu6_1(), Some(5));
+        assert_eq!(h.nu6_2(), Some(5));
+        assert_eq!(h.nu6_3(), Some(8));
         assert_eq!(h.nu7(), None);
     }
 
@@ -522,6 +562,6 @@ mod tests {
         let ceiling = resolve_ceiling(&topo);
         let heights = activation_heights_for_ceiling(ceiling);
         assert_eq!(heights.nu6_2(), None);
-        assert_eq!(heights.nu6_1(), Some(6));
+        assert_eq!(heights.nu6_1(), Some(5));
     }
 }

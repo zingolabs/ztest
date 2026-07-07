@@ -50,7 +50,7 @@ permits:
   matching `zaino-{ci,dev}-*` via an admission policy (`ValidatingAdmissionPolicy`)
 - `volumesnapshotcontents` (cluster) — `create`, `delete`, `get` only
   (load-bearing for the shadow-VSC dance)
-- `pvc` in `zaino-seeds` — `get`, `list`, `patch` (read archives + bump
+- `pvc` in `ztest-seeds` — `get`, `list`, `patch` (read archives + bump
   `last_accessed_at`)
 
 ## Namespace model — per-slot
@@ -60,8 +60,8 @@ own process across N parallel slots (`--test-threads N`, capped at 16).
 The library computes a deterministic namespace name from the slot:
 
 ```
-CI:  zaino-ci-${GITHUB_RUN_ID}-${SLOT}              # e.g. zaino-ci-17234819-3
-Dev: zaino-dev-${USER}-${NEXTEST_PID}-${SLOT}        # e.g. zaino-dev-eli-48217-3
+CI:  ztest-ci-${GITHUB_RUN_ID}-${SLOT}              # e.g. ztest-ci-17234819-3
+Dev: ztest-dev-${USER}-${NEXTEST_PID}-${SLOT}        # e.g. ztest-dev-eli-48217-3
 ```
 
 - `RUN_ID` = `GITHUB_RUN_ID` in CI (set as `ZTEST_RUN_ID` env);
@@ -78,7 +78,7 @@ per-test suffix (random short token chosen by the library at
 same slot don't collide. Per-test resources are scoped via a sentinel:
 
 ```
-  Namespace: zaino-ci-${RUN_ID}-3       (lifetime ≈ slot 3's lifetime)
+  Namespace: ztest-ci-${RUN_ID}-3       (lifetime ≈ slot 3's lifetime)
   ┌──────────────────────────────────────────────────────────────┐
   │  sentinel-cm-${test_a_uid}                                   │
   │    ├─ Pod  zebrad-<suffix>                                   │
@@ -111,7 +111,7 @@ end-of-run (or by TTL backstop).
 | Test process starts         | Library, on first `TestEnv::build()`                        | Ensure namespace (idempotent); ensure SA RoleBinding; create sentinel |
 | Test creates components     | Library                                                     | Apply Pod/PVC/CM manifests with `ownerReferences` → sentinel          |
 | `TestEnv` drops             | Library, via `Drop` + tokio shutdown hook                   | Delete sentinel; resources cascade                                    |
-| `cargo nextest` exits (CI)  | CI workflow step (`kubectl delete ns -l zaino.io/run-id=…`) | Namespaces + everything in them                                       |
+| `cargo nextest` exits (CI)  | CI workflow step (`kubectl delete ns -l ztest.io/run-id=…`) | Namespaces + everything in them                                       |
 | `cargo nextest` exits (dev) | nothing immediate                                           | Namespace lives until TTL controller GC's it (default 1h idle)        |
 | Catastrophic failure        | Cluster-resident namespace janitor                          | Delete namespaces whose TTL annotation has expired                    |
 
@@ -256,8 +256,8 @@ streaming into a worker pod attached to the target PVC. Multiple tests
 racing to materialize the same SHA: optimistic-concurrency creation;
 loser falls through to "get existing."
 
-Archive PVC: namespace `zaino-seeds`, name `seed-{sha8}`, labels
-`seeds.zaino.io/{sha,ready}`, annotation `last_accessed_at` (bumped
+Archive PVC: namespace `ztest-seeds`, name `seed-{sha8}`, labels
+`seeds.ztest.io/{sha,ready}`, annotation `last_accessed_at` (bumped
 per clone). Backed by the Ceph archive pool (`size=1`, see
 [cluster-administration.md#cluster-shape](cluster-administration.md#cluster-shape))
 — archives are recreatable from LFS, no point paying 3× replication.
@@ -272,7 +272,7 @@ backend snapshot handle. This is the only piece of the seed story with
 real complexity, and k8s forces it on us.
 
 ```
-  zaino-seeds  (archive ns)              zaino-ci-X-N  (test ns)
+  ztest-seeds  (archive ns)              ztest-ci-X-N  (test ns)
   ─────────────────────────              ────────────────────────────
    archive PVC                             test PVC ◄── dataSource
        │                                       ▲
@@ -307,7 +307,7 @@ the namespace janitor as backstop (it sweeps orphan VSCs whose
 
 ### GC
 
-Daily `CronJob` in `zaino-seeds`: drop archive PVCs whose
+Daily `CronJob` in `ztest-seeds`: drop archive PVCs whose
 `last_accessed_at` > 30 days. Reconcile-failure stragglers (no
 `ready=true`, > 1h) also swept. Re-materialization on next use is cheap.
 
@@ -325,7 +325,7 @@ Daily `CronJob` in `zaino-seeds`: drop archive PVCs whose
 
       cleaned up by:
         • library — sentinel deleted on TestEnv drop
-        • CI       — `kubectl delete ns -l zaino.io/run-id=…`
+        • CI       — `kubectl delete ns -l ztest.io/run-id=…`
         • backstop — kube-janitor by TTL annotation
 
 
@@ -366,10 +366,10 @@ Every resource the library creates carries:
 
 ```
 labels:
-  zaino.io/run-id:    "${RUN_ID}"        # or dev-${USER}-${NEXTEST_PID}
-  zaino.io/slot:      "${SLOT}"
-  zaino.io/test:      "<test-name>"      # on pods only
-  zaino.io/component: "zebrad|zcashd|zaino|zingo"
+  ztest.io/run-id:    "${RUN_ID}"        # or dev-${USER}-${NEXTEST_PID}
+  ztest.io/slot:      "${SLOT}"
+  ztest.io/test:      "<test-name>"      # on pods only
+  ztest.io/component: "zebrad|zcashd|zaino|zingo"
 ```
 
 Promtail forwards every label as a Loki stream label; Prometheus
@@ -411,7 +411,7 @@ forecloses "let me upload one more thing" feature creep.
 ## Open
 
 1. **Per-developer SA isolation.** v1 ships one shared `engineer` SA
-   bound to all `zaino-dev-*` namespaces. Move to per-user SA + name
+   bound to all `ztest-dev-*` namespaces. Move to per-user SA + name
    prefix admission policy if audit becomes important.
 1. **Orchestrator image build cadence.** N/A under lib-only model — the
    library is published as a crate, no separate image needed.

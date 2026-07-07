@@ -133,7 +133,13 @@ pub(crate) fn run(
         }
     };
 
-    if stats.any_failed() {
+    // A cancelled run (Ctrl-C) is never a success: in-flight tests were killed
+    // and counted as failed, and tests past the cancellation point never ran, so
+    // the run is incomplete. Mirror nextest's non-zero cancel exit even in the
+    // (near-impossible) case where nothing had failed yet when cancel landed.
+    let cancelled = console.map(|c| c.cancel().is_cancelled()).unwrap_or(false);
+
+    if stats.any_failed() || cancelled {
         ExitCode::from(NextestExitCode::TEST_RUN_FAILED as u8)
     } else if stats.skipped > 0 {
         // Unschedulable tests are a setup-level problem.
@@ -245,6 +251,7 @@ fn drive(
     reporter: &mut dyn events::RunReporter,
     on_tick: impl FnMut(&mut dyn events::RunReporter, &PanelFrame),
 ) -> events::RunStats {
+    let cancel = cfg.cancel.clone();
     rt.block_on(run_loop(
         items,
         ceiling,
@@ -252,9 +259,10 @@ fn drive(
         reporter,
         move |item, _attempt| {
             let env = env.clone();
+            let cancel = cancel.clone();
             async move {
                 let cap = item.hard_cap;
-                exec::spawn_test(&item, &env, cap).await
+                exec::spawn_test(&item, &env, cap, &cancel).await
             }
         },
         on_tick,

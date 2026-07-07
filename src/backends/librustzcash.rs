@@ -44,7 +44,7 @@ use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_keys::address::Address;
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool as ShieldedProtocol;
 use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::local_consensus::LocalNetwork;
@@ -146,6 +146,7 @@ fn to_local_network(a: &ActivationHeights) -> LocalNetwork {
         nu6: a.nu6().map(BlockHeight::from_u32),
         nu6_1: a.nu6_1().map(BlockHeight::from_u32),
         nu6_2: a.nu6_2().map(BlockHeight::from_u32),
+        nu6_3: a.nu6_3().map(BlockHeight::from_u32),
     }
 }
 
@@ -159,6 +160,58 @@ async fn connect(
         .await
         .map_err(|e| format!("librustzcash: connect {indexer_uri}: {e}"))?;
     Ok(CompactTxStreamerClient::new(channel))
+}
+
+/// Serialize wallet-built transactions to their raw consensus bytes, ready to
+/// relay. Purely synchronous: `WalletDb` (rusqlite) is `!Send`, so all db
+/// access must finish before any `.await` — otherwise the caller's future
+/// stops being `Send` (required by the `#[async_trait]` `WalletBackend`).
+fn raw_txs(db: &Db, txids: &[TxId]) -> Result<Vec<Vec<u8>>, BoxError> {
+    txids
+        .iter()
+        .map(|txid| {
+            let tx = db
+                .get_transaction(*txid)
+                .map_err(|e| format!("librustzcash: get_transaction {txid}: {e}"))?
+                .ok_or_else(|| format!("librustzcash: built tx {txid} absent from wallet db"))?;
+            let mut data = Vec::new();
+            tx.write(&mut data)
+                .map_err(|e| format!("librustzcash: serialize tx {txid}: {e}"))?;
+            Ok(data)
+        })
+        .collect()
+}
+
+/// Relay raw transactions to the network through the indexer's lightwalletd
+/// `SendTransaction`.
+///
+/// `create_proposed_transactions` / `shield_transparent_funds` only *sign and
+/// store* the transaction in the wallet db (`store_transactions_to_be_sent`);
+/// nothing reaches the validator's mempool. Without this relay the next
+/// `generate_blocks` mines an empty block and the recipient never sees the
+/// funds — surfacing downstream as a spurious `Insufficient funds: … only 0
+/// zatoshis were available` on the following spend. Broadcasting the raw bytes
+/// here puts each tx in the mempool so the next mined block includes it.
+async fn broadcast(indexer_uri: &str, raw_txs: Vec<Vec<u8>>) -> Result<(), BoxError> {
+    let mut client = connect(indexer_uri).await?;
+    for data in raw_txs {
+        let resp = client
+            .send_transaction(zcash_client_backend::proto::service::RawTransaction {
+                data,
+                height: 0,
+            })
+            .await
+            .map_err(|e| format!("librustzcash: send_transaction: {e}"))?
+            .into_inner();
+        if resp.error_code != 0 {
+            return Err(format!(
+                "librustzcash: indexer rejected tx: code {} — {}",
+                resp.error_code, resp.error_message
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -354,7 +407,13 @@ impl WalletBackend for LrzWallet {
             &proposal,
         )
         .map_err(|e| format!("librustzcash: create transactions: {e}"))?;
-        Ok(txids.into_iter().collect())
+        let txids: Vec<TxId> = txids.into_iter().collect();
+        // Serialize under the db lock (rusqlite is `!Send`), then drop it before
+        // broadcasting — the created tx is only stored locally until relayed.
+        let raw = raw_txs(&db, &txids)?;
+        drop(db);
+        broadcast(&acct.indexer_uri, raw).await?;
+        Ok(txids)
     }
 
     async fn shield(&self, account: AccountId) -> Result<Vec<TxId>, BoxError> {
@@ -391,7 +450,13 @@ impl WalletBackend for LrzWallet {
             policy,
         )
         .map_err(|e| format!("librustzcash: shield: {e}"))?;
-        Ok(txids.into_iter().collect())
+        let txids: Vec<TxId> = txids.into_iter().collect();
+        // Serialize under the db lock (rusqlite is `!Send`), then drop it before
+        // broadcasting — the created tx is only stored locally until relayed.
+        let raw = raw_txs(&db, &txids)?;
+        drop(db);
+        broadcast(&acct.indexer_uri, raw).await?;
+        Ok(txids)
     }
 }
 

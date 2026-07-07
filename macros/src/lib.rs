@@ -195,17 +195,24 @@ pub fn mount_archive(input: TokenStream) -> TokenStream {
 
 // ───────────────────────────── dev! macro ─────────────────────────────
 
-/// `dev!(Indexer::Zainod, "rel/Dockerfile" [, context = "rel/ctx"])`
+/// Two forms:
 ///
-/// Block expression returning a `Validator` / `Indexer` / `Wallet` value
-/// whose container image was declared as a local-build dev image. At
-/// the same call site the macro injects an `inventory::submit!` for
-/// the corresponding [`DevImageDecl`], so the preflight image pipeline
-/// can discover and build the image before any test runs.
+/// - Local: `dev!(Indexer::Zainod, "rel/Dockerfile" [, context = "rel/ctx", version = "…", features = ["…"]])`
+///   — a Dockerfile in the local checkout, path resolved against the caller's
+///   `CARGO_MANIFEST_DIR` (same rule as the `mount_*` macros). Compile fails if
+///   the Dockerfile doesn't exist or the context isn't a directory.
+/// - Git: `dev!(Validator::Zebrad, git = "<url>", rev = "<sha>", dockerfile = "in/tree" [, context = "in/tree", version = "…", features = ["…"]])`
+///   — built from `<url>` checked out at `<rev>`, using an in-tree Dockerfile
+///   and context (paths relative to the repo root; context defaults to `"."`).
+///   The rev is the tag suffix (`<repo>:dev-<rev>`), so no fetch is needed to
+///   name the image.
 ///
-/// The path is resolved against the caller's `CARGO_MANIFEST_DIR`
-/// (same rule as the `mount_*` macros). Compile fails if the
-/// Dockerfile doesn't exist or the context isn't a directory.
+/// Block expression returning a `Validator` / `Indexer` / `Wallet` value whose
+/// container image was declared as a dev image. At the same call site the macro
+/// injects an `inventory::submit!` for the corresponding [`DevImageDecl`], so
+/// the preflight image pipeline can discover and build the image before any
+/// test runs. `version` names the release a build corresponds to for backends
+/// (zebra) that render config / derive a ceiling from it; it defaults to `"dev"`.
 ///
 /// Supported component variants: `Validator::Zebrad`, `Validator::Zcashd`,
 /// `Indexer::Zainod`, `Wallet::Zingo`. Any other path yields a compile
@@ -215,15 +222,28 @@ pub fn mount_archive(input: TokenStream) -> TokenStream {
 pub fn dev(input: TokenStream) -> TokenStream {
     let DevArgs {
         variant,
-        dockerfile,
-        context,
+        source,
+        version,
+        features,
+        rust_version,
+        rust_versions,
     } = parse_macro_input!(input as DevArgs);
+
+    if rust_version.is_some() && rust_versions.is_some() {
+        return syn::Error::new(
+            variant.span(),
+            "dev!: use either `rust_version = \"x\"` (pin one) or \
+             `rust_versions = [...]` (a matrix set), not both",
+        )
+        .to_compile_error()
+        .into();
+    }
 
     // Derive the kind label from the variant name itself — lowercased.
     // `Indexer::Zainod` → `"zainod"`, `Validator::Zebrad` → `"zebrad"`, etc.
     // The lowercased form is used three ways:
     //   - as the inventory `repo:` field (becomes the local image
-    //     repo name in the resolved `<repo>:dev-<hash>` tag),
+    //     repo name in the resolved `<repo>:dev-<suffix>` tag),
     //   - as the constructor ident (`Indexer::zainod_dev(...)`),
     //   - keyed lookup of default cargo features below.
     let (kind_str, default_features): (String, Vec<&'static str>) = match (
@@ -248,47 +268,118 @@ pub fn dev(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Resolve the Dockerfile path relative to CARGO_MANIFEST_DIR.
-    let df_abs = match resolve_source(&dockerfile) {
-        Ok(p) => p,
-        Err(e) => return e.to_compile_error().into(),
+    // Feature list: explicit override, else the per-kind default.
+    let feat_lits: Vec<String> = match features {
+        Some(fs) => fs.iter().map(LitStr::value).collect(),
+        None => default_features.into_iter().map(String::from).collect(),
     };
+    let repo_lit = kind_str.clone();
+    // The release this build corresponds to (validators render config / derive
+    // a ceiling from it); `"dev"` when the caller doesn't say.
+    let version_lit = version
+        .map(|v| v.value())
+        .unwrap_or_else(|| "dev".to_string());
 
-    // Context: caller-provided or the Dockerfile's parent dir.
-    let ctx_abs = match context {
-        Some(c) => match resolve_dir(&c) {
-            Ok(p) => p,
-            Err(e) => return e.to_compile_error().into(),
-        },
-        None => df_abs
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+    // Per source form, build the static `DevSourceDecl` (inventory) and the
+    // owned `DevSource` (constructor arg). Local paths resolve against
+    // `CARGO_MANIFEST_DIR` at compile time; git paths stay repo-relative (the
+    // pipeline resolves them against the fetched checkout).
+    let (decl_source, ctor_source) = match source {
+        DevSourceArg::Local {
+            dockerfile,
+            context,
+        } => {
+            let df_abs = match resolve_source(&dockerfile) {
+                Ok(p) => p,
+                Err(e) => return e.to_compile_error().into(),
+            };
+            let ctx_abs = match context {
+                Some(c) => match resolve_dir(&c) {
+                    Ok(p) => p,
+                    Err(e) => return e.to_compile_error().into(),
+                },
+                None => df_abs
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from(".")),
+            };
+            let df_lit = df_abs.to_string_lossy().into_owned();
+            let ctx_lit = ctx_abs.to_string_lossy().into_owned();
+            (
+                quote! {
+                    ::ztest::inventory::DevSourceDecl::Local {
+                        dockerfile: #df_lit,
+                        context: #ctx_lit,
+                    }
+                },
+                quote! {
+                    ::ztest::DevSource::Local {
+                        dockerfile: ::std::path::PathBuf::from(#df_lit),
+                        context: ::std::path::PathBuf::from(#ctx_lit),
+                    }
+                },
+            )
+        }
+        DevSourceArg::Git {
+            url,
+            rev,
+            dockerfile,
+            context,
+        } => {
+            let url_s = url.value();
+            let rev_s = rev.value();
+            let df_s = dockerfile.value();
+            let ctx_s = context.map(|c| c.value()).unwrap_or_else(|| ".".to_string());
+            (
+                quote! {
+                    ::ztest::inventory::DevSourceDecl::Git {
+                        url: #url_s,
+                        rev: #rev_s,
+                        dockerfile: #df_s,
+                        context: #ctx_s,
+                    }
+                },
+                quote! {
+                    ::ztest::DevSource::Git {
+                        url: #url_s.to_string(),
+                        rev: #rev_s.to_string(),
+                        dockerfile: #df_s.to_string(),
+                        context: #ctx_s.to_string(),
+                    }
+                },
+            )
+        }
     };
-
-    let df_lit = df_abs.to_string_lossy().into_owned();
-    let ctx_lit = ctx_abs.to_string_lossy().into_owned();
-    let repo_lit = kind_str.to_string();
-    let feat_lits: Vec<String> = default_features.into_iter().map(String::from).collect();
 
     let category_ident = &variant.category;
     let ctor_ident = syn::Ident::new(&format!("{kind_str}_dev"), variant.variant.span());
+
+    // The build-set for the inventory decl: an explicit plural set, or the
+    // singular pin as a one-element set, or empty (Dockerfile default).
+    let rust_versions_tokens = match (&rust_versions, &rust_version) {
+        (Some(set), _) => set.clone(),
+        (None, Some(v)) => quote! { &[ #v ] },
+        (None, None) => quote! { &[] },
+    };
+    // A singular pin also selects the version on the returned spec, so the test
+    // needs no `.rust_version()` call; a plural set leaves selection to the test.
+    let rust_version_chain = match &rust_version {
+        Some(v) => quote! { .rust_version(#v) },
+        None => quote! {},
+    };
 
     quote! {
         {
             ::ztest::__private::inventory::submit! {
                 ::ztest::inventory::DevImageDecl {
                     repo: #repo_lit,
-                    dockerfile: #df_lit,
-                    context: #ctx_lit,
+                    source: #decl_source,
                     features: &[ #( #feat_lits ),* ],
+                    rust_versions: #rust_versions_tokens,
                 }
             }
-            ::ztest::#category_ident::#ctor_ident(
-                ::std::path::PathBuf::from(#df_lit),
-                ::std::path::PathBuf::from(#ctx_lit),
-            )
+            ::ztest::#category_ident::#ctor_ident(#ctor_source, #version_lit) #rust_version_chain
         }
     }
     .into()
@@ -305,10 +396,38 @@ impl DevVariant {
     }
 }
 
+/// Where the dev image is built from, as parsed from the macro input.
+enum DevSourceArg {
+    /// Positional local form: `"rel/Dockerfile" [, context = "rel/ctx"]`.
+    /// Paths are caller-relative (resolved against `CARGO_MANIFEST_DIR`).
+    Local {
+        dockerfile: LitStr,
+        context: Option<LitStr>,
+    },
+    /// Keyword git form: `git = "…", rev = "…", dockerfile = "in/tree" [, context = "in/tree"]`.
+    /// Paths are relative to the fetched repo root (default context `"."`).
+    Git {
+        url: LitStr,
+        rev: LitStr,
+        dockerfile: LitStr,
+        context: Option<LitStr>,
+    },
+}
+
 struct DevArgs {
     variant: DevVariant,
-    dockerfile: LitStr,
-    context: Option<LitStr>,
+    source: DevSourceArg,
+    /// The release this build corresponds to; threaded to the `_dev`
+    /// constructor for backends (zebra) that render config / derive a ceiling
+    /// from a version. Defaults to `"dev"`.
+    version: Option<LitStr>,
+    /// Cargo features override; `None` uses the per-kind default.
+    features: Option<Vec<LitStr>>,
+    /// Singular `rust_version = "x"`: pins the built + selected toolchain.
+    rust_version: Option<LitStr>,
+    /// Plural `rust_versions = <expr>`: the pre-build set, lowered to decl-field
+    /// tokens. Mutually exclusive with `rust_version`.
+    rust_versions: Option<proc_macro2::TokenStream>,
 }
 
 impl Parse for DevArgs {
@@ -317,32 +436,161 @@ impl Parse for DevArgs {
         let _: Token![::] = input.parse()?;
         let variant: syn::Ident = input.parse()?;
         let _: Token![,] = input.parse()?;
-        let dockerfile: LitStr = input.parse()?;
-        let context = if input.peek(Token![,]) {
-            let _: Token![,] = input.parse()?;
-            if input.is_empty() {
-                None
-            } else {
-                let key: syn::Ident = input.parse()?;
-                if key != "context" {
-                    return Err(syn::Error::new(
-                        key.span(),
-                        "dev!: only `context = \"…\"` is recognized after the dockerfile",
-                    ));
-                }
-                let _: Token![=] = input.parse()?;
-                let ctx: LitStr = input.parse()?;
-                let _ = input.parse::<Option<Token![,]>>();
-                Some(ctx)
-            }
-        } else {
-            None
-        };
+
+        // A string literal here → the positional local form. An ident (e.g.
+        // `git`) → the keyword form. This is the one-token lookahead that
+        // disambiguates the two shapes.
+        if input.peek(LitStr) {
+            let dockerfile: LitStr = input.parse()?;
+            let mut kw = KwArgs::default();
+            kw.parse_trailing(
+                input,
+                &["context", "version", "features", "rust_version", "rust_versions"],
+            )?;
+            return Ok(DevArgs {
+                variant: DevVariant { category, variant },
+                source: DevSourceArg::Local {
+                    dockerfile,
+                    context: kw.context,
+                },
+                version: kw.version,
+                features: kw.features,
+                rust_version: kw.rust_version,
+                rust_versions: kw.rust_versions,
+            });
+        }
+
+        let mut kw = KwArgs::default();
+        kw.parse_all(
+            input,
+            &[
+                "git",
+                "rev",
+                "dockerfile",
+                "context",
+                "version",
+                "features",
+                "rust_version",
+                "rust_versions",
+            ],
+        )?;
+        let url = kw.git.ok_or_else(|| {
+            syn::Error::new(variant.span(), "dev!: git form requires `git = \"<url>\"`")
+        })?;
+        let rev = kw
+            .rev
+            .ok_or_else(|| syn::Error::new(variant.span(), "dev!: git form requires `rev = \"<sha>\"`"))?;
+        let dockerfile = kw.dockerfile.ok_or_else(|| {
+            syn::Error::new(variant.span(), "dev!: git form requires `dockerfile = \"<path>\"`")
+        })?;
         Ok(DevArgs {
             variant: DevVariant { category, variant },
-            dockerfile,
-            context,
+            source: DevSourceArg::Git {
+                url,
+                rev,
+                dockerfile,
+                context: kw.context,
+            },
+            version: kw.version,
+            features: kw.features,
+            rust_version: kw.rust_version,
+            rust_versions: kw.rust_versions,
         })
+    }
+}
+
+/// Accumulates `key = value` arguments for the `dev!` forms. Each key is
+/// optional and recognized against an allow-list; `features` takes a `[...]`
+/// array, the rest take a string literal.
+#[derive(Default)]
+struct KwArgs {
+    git: Option<LitStr>,
+    rev: Option<LitStr>,
+    dockerfile: Option<LitStr>,
+    context: Option<LitStr>,
+    version: Option<LitStr>,
+    features: Option<Vec<LitStr>>,
+    /// Singular `rust_version = "x"`: pin one toolchain.
+    rust_version: Option<LitStr>,
+    /// Plural `rust_versions = <expr>`: the build-set, already lowered to the
+    /// tokens for the `&'static [&'static str]` decl field (a bracket list is
+    /// wrapped `&[…]`; a bare path/const is passed through).
+    rust_versions: Option<proc_macro2::TokenStream>,
+}
+
+impl KwArgs {
+    /// Parse `, key = value` pairs that follow a positional argument, until the
+    /// input is exhausted. A leading comma is expected before each pair.
+    fn parse_trailing(&mut self, input: ParseStream, allowed: &[&str]) -> syn::Result<()> {
+        while input.peek(Token![,]) {
+            let _: Token![,] = input.parse()?;
+            if input.is_empty() {
+                break;
+            }
+            self.parse_one(input, allowed)?;
+        }
+        Ok(())
+    }
+
+    /// Parse a comma-separated list of `key = value` pairs (no leading comma).
+    fn parse_all(&mut self, input: ParseStream, allowed: &[&str]) -> syn::Result<()> {
+        loop {
+            self.parse_one(input, allowed)?;
+            if input.peek(Token![,]) {
+                let _: Token![,] = input.parse()?;
+                if input.is_empty() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_one(&mut self, input: ParseStream, allowed: &[&str]) -> syn::Result<()> {
+        let key: syn::Ident = input.parse()?;
+        let key_s = key.to_string();
+        if !allowed.contains(&key_s.as_str()) {
+            return Err(syn::Error::new(
+                key.span(),
+                format!("dev!: unexpected key `{key_s}`; allowed here: {}", allowed.join(", ")),
+            ));
+        }
+        let _: Token![=] = input.parse()?;
+        if key_s == "features" {
+            let content;
+            syn::bracketed!(content in input);
+            let list = content.parse_terminated(<LitStr as Parse>::parse, Token![,])?;
+            self.features = Some(list.into_iter().collect());
+            return Ok(());
+        }
+        if key_s == "rust_versions" {
+            // Either a literal `["1.88", …]` (lower to a `&[…]` slice) or a bare
+            // path/const like `RUSTS` (a `&[&str]`), passed through as-is.
+            if input.peek(syn::token::Bracket) {
+                let content;
+                syn::bracketed!(content in input);
+                let list = content.parse_terminated(<LitStr as Parse>::parse, Token![,])?;
+                let lits: Vec<LitStr> = list.into_iter().collect();
+                self.rust_versions = Some(quote! { &[ #( #lits ),* ] });
+            } else {
+                let expr: syn::Expr = input.parse()?;
+                self.rust_versions = Some(quote! { #expr });
+            }
+            return Ok(());
+        }
+        let val: LitStr = input.parse()?;
+        match key_s.as_str() {
+            "git" => self.git = Some(val),
+            "rev" => self.rev = Some(val),
+            "dockerfile" => self.dockerfile = Some(val),
+            "context" => self.context = Some(val),
+            "version" => self.version = Some(val),
+            "rust_version" => self.rust_version = Some(val),
+            _ => unreachable!("checked against allow-list above"),
+        }
+        Ok(())
     }
 }
 

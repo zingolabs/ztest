@@ -120,7 +120,7 @@ pub struct ArchiveRow {
 
 #[derive(Debug, Clone)]
 pub enum ArchiveStatus {
-    /// PVC labelled `seeds.zaino.io/ready=true`.
+    /// PVC labelled `seeds.ztest.io/ready=true`.
     Cached { size_bytes: u64 },
     /// PVC absent or not ready; bytes streaming in.
     ///

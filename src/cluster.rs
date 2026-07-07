@@ -35,14 +35,42 @@ pub(crate) fn ensure_crypto_provider() {
     });
 }
 
-/// Construct a kube client by inferring config: an in-cluster ServiceAccount
-/// token inside a pod, otherwise the current `KUBECONFIG` / `~/.kube/config`.
+/// Construct a kube client. In-cluster, uses the mounted ServiceAccount token.
+/// Otherwise, if a cluster profile pinned a context (`ZTEST_KUBE_CONTEXT`, set
+/// by `ztest run --cluster` / the persisted default, see
+/// [`crate::cluster_config`]), targets that named context in-memory without
+/// touching the kubeconfig; else infers from `KUBECONFIG` / `~/.kube/config`.
 pub async fn client() -> Result<Client, kube::Error> {
+    Client::try_from(config().await?)
+}
+
+/// Resolve the kube [`Config`](kube::Config) the same way [`client`] does, but
+/// hand back the config rather than a connected client — so a caller can read
+/// `cluster_url` (e.g. `ztest setup` echoing the target) before connecting.
+pub async fn config() -> Result<kube::Config, kube::Error> {
     ensure_crypto_provider();
-    let cfg = kube::Config::infer()
+    match std::env::var(crate::cluster_config::KUBE_CONTEXT_ENV) {
+        Ok(ctx) if !ctx.is_empty() && !in_cluster() => config_for_context(&ctx).await,
+        _ => kube::Config::infer()
+            .await
+            .map_err(kube::Error::InferConfig),
+    }
+}
+
+/// Build a config for a named kube-context from the kubeconfig, in-memory.
+/// `ztest run` has already verified the context exists (see
+/// [`crate::cluster_config::activate`]); a failure here is a kubeconfig-load or
+/// auth problem, surfaced through the transport error channel.
+async fn config_for_context(context: &str) -> Result<kube::Config, kube::Error> {
+    use kube::config::{KubeConfigOptions, Kubeconfig};
+    let kubeconfig = Kubeconfig::read().map_err(|e| kube::Error::Service(Box::new(e)))?;
+    let options = KubeConfigOptions {
+        context: Some(context.to_string()),
+        ..Default::default()
+    };
+    kube::Config::from_custom_kubeconfig(kubeconfig, &options)
         .await
-        .map_err(kube::Error::InferConfig)?;
-    Client::try_from(cfg)
+        .map_err(|e| kube::Error::Service(Box::new(e)))
 }
 
 /// `true` when the test binary is running inside a pod with a service
@@ -102,14 +130,14 @@ pub async fn ensure_namespace(
         "metadata": {
             "name": namespace,
             "labels": {
-                "zaino.io/run-id": coords.run_id,
-                "zaino.io/role": crate::qos::ROLE_TEST_ENV,
-                "zaino.io/user": crate::naming::slug(&coords.user, 63),
-                "zaino.io/package": crate::naming::slug(package, 63),
-                "zaino.io/test": crate::naming::slug(test, 63),
+                "ztest.io/run-id": coords.run_id,
+                "ztest.io/role": crate::qos::ROLE_TEST_ENV,
+                "ztest.io/user": crate::naming::slug(&coords.user, crate::naming::DNS_LABEL_MAX),
+                "ztest.io/package": crate::naming::slug(package, crate::naming::DNS_LABEL_MAX),
+                "ztest.io/test": crate::naming::slug(test, crate::naming::DNS_LABEL_MAX),
             },
             "annotations": {
-                "zaino.io/test-full": test,
+                "ztest.io/test-full": test,
                 "janitor/ttl": "1h",
             },
         }
@@ -199,10 +227,10 @@ pub async fn create_pod_service(
         "kind": "Service",
         "metadata": {
             "name": name,
-            "labels": { "zaino.io/component-name": name },
+            "labels": { "ztest.io/component-name": name },
         },
         "spec": {
-            "selector": { "zaino.io/component-name": name },
+            "selector": { "ztest.io/component-name": name },
             "ports": ports_json,
             // Lets peers resolve us before the pod is ready, handy during
             // the `wait_validators_rpc_ready` probe.

@@ -81,6 +81,13 @@ pub struct Args {
         value_name = "NEXTEST_ARGS"
     )]
     pub nextest_args: Vec<String>,
+
+    /// Select a named cluster profile (`ztest cluster list`): binds the
+    /// kube-context, image distribution, and OpenShift flag in one shot,
+    /// overriding the persisted default and the ambient `ZTEST_IMAGE_REGISTRY`
+    /// / `KIND_CLUSTER` / kube-context. Must appear before the nextest args.
+    #[arg(long, value_name = "NAME")]
+    pub cluster: Option<String>,
 }
 
 /// The flags `ztest run` pulls out of its `cargo nextest run`-style argv: the
@@ -305,12 +312,26 @@ pub fn execute(args: Args) -> ExitCode {
     }
     let theme = Theme::detect();
 
+    // Bind the target cluster (kube-context + image distribution + OpenShift)
+    // from the selected profile before any thread reads the env. Precedence:
+    // --cluster > ambient env > persisted default.
+    //
+    // SAFETY: still single-threaded here (before the work runtime and render
+    // thread below); set_var must precede thread creation.
+    match unsafe { crate::cluster_config::activate(args.cluster.as_deref()) } {
+        Ok(_) => {}
+        Err(detail) => {
+            eprintln!("ztest run: {detail}");
+            return exit(NextestExitCode::SETUP_ERROR);
+        }
+    }
+
     let mut state = build_initial_state(&opts);
     let session_start = Instant::now();
 
     // Establish a shared run id BEFORE any thread starts, so the parent's reaper
     // and every test child (which inherit this process's env) agree on the
-    // `zaino.io/run-id` label all resources are stamped with. Without a forced
+    // `ztest.io/run-id` label all resources are stamped with. Without a forced
     // value the parent and its children derive *different* `{user}-{ppid}` ids
     // (a child's ppid is us, ours is the shell), and label-reap can't target the
     // children's resources.
@@ -390,7 +411,7 @@ pub fn execute(args: Args) -> ExitCode {
 /// Run every phase and return the process exit code. Split from [`execute`] so
 /// the render thread's teardown is one unconditional step after it returns, no
 /// matter which path produced the code.
-/// Reap the current run's resources by `zaino.io/run-id` label and return the
+/// Reap the current run's resources by `ztest.io/run-id` label and return the
 /// conventional 130. This is the Ctrl-C teardown: a SIGKILLed test never ran its
 /// `Drop`, so the surviving parent reaps by label instead. Bounded by a deadline
 /// so a stuck apiserver can't hang the exit — the namespace janitor is the
@@ -465,6 +486,19 @@ fn run_inner(
         return cancel_exit();
     }
 
+    // A hard probe failure (auth/RBAC/outage) aborts before we waste an image
+    // build+push on a cluster we can't run on. Surface the detail into
+    // scrollback (TTY) or stderr — otherwise it dies with the torn-down banner
+    // and the run appears to exit for no reason.
+    if let ProbeOutcome::Failed { detail } = &outcome.probe {
+        let msg = format!("ztest run: cluster probe failed — {detail}");
+        match console {
+            Some(c) => c.scrollback(format!("{msg}\n")),
+            None => eprintln!("{msg}"),
+        }
+        return exit(NextestExitCode::SETUP_ERROR);
+    }
+
     // Image phases, only when Phase B succeeded. Their docker/kind output is
     // relayed through the same console, beneath the panel.
     let image_phase = if let BuildOutcome::Ok {
@@ -509,9 +543,9 @@ fn run_inner(
         eprintln!("ztest run: image preflight failed: {detail}");
         return exit(NextestExitCode::SETUP_ERROR);
     }
-    if matches!(outcome.probe, ProbeOutcome::Failed { .. }) {
-        return exit(NextestExitCode::SETUP_ERROR);
-    }
+    // A hard probe failure already aborted (with a visible message) before the
+    // image phase; a `Missing` probe is handled below where the engine needs the
+    // ceiling.
 
     // No tests selected: honor `--no-tests` (nextest default `fail` ⇒ exit 4).
     if let BuildOutcome::Ok { test_count: 0, .. } = outcome.build {
