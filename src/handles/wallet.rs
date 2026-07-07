@@ -34,6 +34,11 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pool {
     Orchard,
+    /// Ironwood — the NU6.3 shielded pool. Orchard-based (same note/action
+    /// structure, its own commitment tree); addressed via a unified address like
+    /// Orchard, and from NU6.3 unified-address receipts (and the Orchard-receiver
+    /// mining reward) route here rather than to Orchard.
+    Ironwood,
     Sapling,
     Transparent,
 }
@@ -42,6 +47,7 @@ pub enum Pool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PoolBalances {
     pub orchard: u64,
+    pub ironwood: u64,
     pub sapling: u64,
     pub transparent: u64,
 }
@@ -51,6 +57,7 @@ impl PoolBalances {
     pub fn get(&self, pool: Pool) -> u64 {
         match pool {
             Pool::Orchard => self.orchard,
+            Pool::Ironwood => self.ironwood,
             Pool::Sapling => self.sapling,
             Pool::Transparent => self.transparent,
         }
@@ -58,7 +65,7 @@ impl PoolBalances {
 
     /// Sum across all pools.
     pub fn total(&self) -> u64 {
-        self.orchard + self.sapling + self.transparent
+        self.orchard + self.ironwood + self.sapling + self.transparent
     }
 }
 
@@ -329,15 +336,21 @@ pub trait WalletExt: WalletBackend {
     {
         let faucet = self.faucet(validator, indexer).await?;
         match validator.pool_support().coinbase {
-            Pool::Orchard | Pool::Sapling => {
-                // An Orchard coinbase is invalid before NU5 — the miner cannot
-                // build an Orchard output "without an Orchard anchor" — and the
-                // faucet's miner address pins the coinbase pool at config time,
-                // so the first note-bearing block must land at height >= NU5.
+            Pool::Orchard | Pool::Ironwood | Pool::Sapling => {
+                // An Orchard/Ironwood coinbase is invalid before NU5 — the miner
+                // cannot build a shielded-pool output "without an Orchard anchor" —
+                // and the faucet's miner address pins the coinbase pool at config
+                // time, so the first note-bearing block must land at height >= NU5.
                 // Advance past NU5 first, mirroring upstream `zcash_local_net`'s
                 // launch pre-mine. Sapling activates at height 1, so its coinbase
-                // needs no warmup.
-                if validator.pool_support().coinbase == Pool::Orchard {
+                // needs no warmup. (Ironwood is Orchard-based: with NU6.3 active
+                // the Orchard-receiver coinbase reward is routed to the Ironwood
+                // pool, but the miner address and its NU5 anchor requirement are
+                // the Orchard path's.)
+                if matches!(
+                    validator.pool_support().coinbase,
+                    Pool::Orchard | Pool::Ironwood
+                ) {
                     warmup_to_nu5(validator).await?;
                 }
                 mine_and_sync(validator, indexer, &faucet, notes, FAUCET_CONFIRM_TIMEOUT).await?;

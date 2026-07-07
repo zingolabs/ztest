@@ -2,17 +2,12 @@
 members = ["macros"]
 resolver = "2"
 
-# The librustzcash `main` wallet stack (git-sourced above for the orchard 0.15
-# alignment) needs shardtree/incrementalmerkletree methods (ensure_retained,
-# retained_checkpoints, remove_retained_checkpoint) that are unreleased on
-# crates.io — librustzcash `main` carries the identical patch. Cargo applies
-# `[patch.crates-io]` only from the crate being built, so we mirror it here or
-# `zcash_client_backend` fails to compile against the stale published shardtree.
-# Pinned to the same incrementalmerkletree rev librustzcash `main` uses. Remove
-# once a shardtree release carrying these methods is cut.
-[patch.crates-io]
-shardtree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
-incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
+# The zingolabs/librustzcash `basic_ironwood` wallet stack resolves shardtree
+# 0.6.2 / incrementalmerkletree 0.8.2 from crates.io (its own lockfile), which
+# already carry the retained-checkpoint methods the wallet stack needs — so no
+# `[patch.crates-io]` override is required (the previous decefc46 git pin was a
+# stale pre-release API missing `add_retained_checkpoint` et al. and broke the
+# basic_ironwood zcash_client_sqlite build).
 
 [workspace.package]
 edition = "2024"
@@ -36,10 +31,12 @@ reqwest = { version = "0.12", default-features = false }
 # librustzcash backend's in-process Orchard proofs validate against a zebra
 # 6.0.0-rc.0 validator (which links orchard 0.15). The leaf wallet crates
 # (zcash_client_backend, zcash_client_sqlite) are not published on the 0.15
-# line, so the whole stack is git-sourced from librustzcash `main` (pinned),
-# whose workspace resolves orchard 0.15.0-pre.2 / zcash_protocol 0.10 /
-# zcash_keys 0.15 / zcash_primitives 0.29. See the git deps in the crate below.
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", features = ["local-consensus"] }
+# line, so the whole stack is git-sourced from the zingolabs/librustzcash
+# `basic_ironwood` branch (pinned), which adds NU6.3/Ironwood wallet support
+# (`AccountBalance::ironwood_balance`) on top of the orchard 0.15 line and
+# resolves zcash_protocol 0.10 / zcash_keys 0.15 / zcash_primitives 0.29. See
+# the git deps in the crate below.
+zcash_protocol = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", features = ["local-consensus"] }
 
 # ─────────────────────────── ztest crate ──────────────────────────────
 [package]
@@ -115,14 +112,14 @@ tempfile = { version = "3.2", optional = true }
 # zebra / zcash_local_net / libstdc++. `sync` pulls the lightwalletd-tonic gRPC
 # client; `bundled-prover` compiles the Sapling params into the binary so
 # send/shield need no external files.
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", features = ["sync", "orchard", "transparent-inputs"], optional = true }
+zcash_client_backend = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", features = ["sync", "orchard", "transparent-inputs"], optional = true }
 # orchard + transparent-inputs MUST match the backend's features, else sqlite's
 # cfg-gated Orchard/EphemeralTransparent handling is compiled out and its
 # `Recipient`/`Note` matches go non-exhaustive against the backend enums.
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", features = ["orchard", "transparent-inputs"], optional = true }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", features = ["sapling", "orchard"], optional = true }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", features = ["bundled-prover"], optional = true }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "ea2992595d944d2fddc0d38ef24e242be7e037ba", optional = true }
+zcash_client_sqlite = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", features = ["orchard", "transparent-inputs"], optional = true }
+zcash_keys = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", features = ["sapling", "orchard"], optional = true }
+zcash_proofs = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", features = ["bundled-prover"], optional = true }
+zcash_primitives = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", optional = true }
 secrecy = { version = "0.8", optional = true }
 # Named to spell the `WalletDb<rusqlite::Connection, ..>` connection type;
 # version tracks zcash_client_sqlite 0.21.1's resolved rusqlite.
