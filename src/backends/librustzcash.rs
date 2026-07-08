@@ -150,6 +150,21 @@ fn to_local_network(a: &ActivationHeights) -> LocalNetwork {
     }
 }
 
+/// The shielded pool a wallet routes change / shielded output into. From NU6.3
+/// (Ironwood) the Orchard pool is spend-locked — a transaction's Orchard value
+/// balance must be non-negative — so shielded value must land in Ironwood (the
+/// Orchard-based successor pool), not Orchard, or the tx is rejected with "the
+/// Orchard value balance must be non-negative from NU6.3 onward". Mirrors dev's
+/// devtool, which routes receipts/change to Ironwood once NU6.3 is active. On a
+/// pre-NU6.3 chain (`nu6_3` unset) Orchard is still the right target.
+fn shielded_change_pool(params: &LocalNetwork) -> ShieldedProtocol {
+    if params.nu6_3.is_some() {
+        ShieldedProtocol::Ironwood
+    } else {
+        ShieldedProtocol::Orchard
+    }
+}
+
 /// Connect a lightwalletd gRPC client to the indexer.
 async fn connect(
     indexer_uri: &str,
@@ -288,7 +303,10 @@ impl WalletBackend for LrzWallet {
         // receiver we extract to guarantee the UA carries it.
         use zcash_keys::keys::ReceiverRequirement::{Allow, Require};
         let request = match pool {
-            Pool::Orchard => UnifiedAddressRequest::custom(Require, Allow, Allow),
+            // Ironwood receipts arrive at the unified address's Orchard receiver
+            // (Ironwood is Orchard-based; from NU6.3 the receipt is routed to the
+            // Ironwood pool), so it uses the same UA request as Orchard.
+            Pool::Orchard | Pool::Ironwood => UnifiedAddressRequest::custom(Require, Allow, Allow),
             Pool::Sapling => UnifiedAddressRequest::custom(Allow, Require, Allow),
             Pool::Transparent => UnifiedAddressRequest::custom(Allow, Allow, Require),
         }
@@ -299,8 +317,9 @@ impl WalletBackend for LrzWallet {
             .default_address(request)
             .map_err(|e| format!("librustzcash: default_address: {e:?}"))?;
         let s = match pool {
-            // Unified address routes to the orchard receiver first.
-            Pool::Orchard => ua.encode(&acct.params),
+            // Unified address routes to the orchard receiver first; Ironwood
+            // shares it (Orchard-based receiver, NU6.3 routing chooses the pool).
+            Pool::Orchard | Pool::Ironwood => ua.encode(&acct.params),
             Pool::Sapling => ua
                 .sapling()
                 .map(|s| {
@@ -336,6 +355,7 @@ impl WalletBackend for LrzWallet {
         };
         Ok(PoolBalances {
             orchard: zats(bal.orchard_balance().spendable_value()),
+            ironwood: zats(bal.ironwood_balance().spendable_value()),
             sapling: zats(bal.sapling_balance().spendable_value()),
             transparent: zats(bal.unshielded_balance().spendable_value()),
         })
@@ -383,7 +403,7 @@ impl WalletBackend for LrzWallet {
                 amount,
                 None,
                 None,
-                ShieldedProtocol::Orchard,
+                shielded_change_pool(&acct.params),
             )
             .map_err(|e| format!("librustzcash: propose transfer: {e}"))?;
         // `InputsErrT`/`ChangeErrT` appear only in the return error type, so the
@@ -425,7 +445,7 @@ impl WalletBackend for LrzWallet {
         let change_strategy = SingleOutputChangeStrategy::<Db>::new(
             StandardFeeRule::Zip317,
             None,
-            ShieldedProtocol::Orchard,
+            shielded_change_pool(&acct.params),
             DustOutputPolicy::default(),
         );
         let sk = SpendingKeys::from_unified_spending_key(acct.usk.clone());

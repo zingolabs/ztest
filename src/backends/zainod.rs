@@ -37,14 +37,16 @@ const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Resolve the container image for a zaino pod. Used by
-/// `manifest::pod_spec_for_indexer`. Returns the published rc tag for a
-/// `Published` spec, or the `zainod:dev-<hash>` tag for a `Dev` spec (built
-/// and `kind load`ed by the preflight pipeline).
+/// `manifest::pod_spec_for_indexer`. The *default* is the published rc tag
+/// (`zingodevops/zainod:<version>`); a `Dev` spec *overrides* it with the
+/// `zainod:dev-<hash>` tag built + loaded by the preflight pipeline, or fails
+/// the test loudly via [`ImageError::DevImageMissing`] when the pipeline never
+/// built it.
 pub(crate) fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
-    let fallback = format!("zingodevops/zainod:{}", opts.version);
-    crate::backends::image::resolve(&opts.image, &fallback)
+    let default_image = format!("zingodevops/zainod:{}", opts.version);
+    crate::backends::image::resolve(&opts.image, &default_image)
 }
 
 /// Zaino-flavoured indexer config. ZST handed to the
@@ -138,6 +140,42 @@ pub struct ZainoIndexer {
 impl IndexerBackend for ZainoIndexer {
     fn label(&self) -> &'static str {
         COMPONENT
+    }
+
+    fn pod_spec(
+        &self,
+        opts: &crate::component::ComponentOpts,
+        pod_name: String,
+    ) -> Result<crate::manifest::PodSpec, EnvError> {
+        Ok(crate::manifest::PodSpec {
+            pod_name,
+            category: crate::component::ComponentCategory::Indexer,
+            label: COMPONENT,
+            image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
+            ports: crate::manifest::merge_ports(
+                &[
+                    ("grpc", crate::handles::ports::ZAINO_GRPC),
+                    ("jsonrpc", crate::handles::ports::ZAINO_JSONRPC),
+                    ("metrics", crate::handles::ports::ZAINO_METRICS),
+                ],
+                &opts.extra_ports,
+            ),
+            ready_port: crate::handles::ports::ZAINO_GRPC,
+            command: opts.command.clone(),
+            args: opts.args.clone(),
+            resources: opts.resources.clone(),
+            env: opts.env.clone(),
+            fs_group: Some(1000),
+            // The zainod image's USER is a non-numeric name (container_user),
+            // which kubelet can't verify against runAsNonRoot; pin the numeric
+            // uid so the check passes. This is also the uid the shared-DB
+            // validator matches (see zebra's `pod_spec`) so this reader owns
+            // the files it reads.
+            run_as_user: Some(1000),
+            placement: None,
+            guaranteed: None,
+            image_pull_secret: crate::backends::image::pull_secret(),
+        })
     }
 
     async fn endpoint(&self, name: &str) -> Result<Endpoint, EnvError> {

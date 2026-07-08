@@ -159,6 +159,13 @@ pub(crate) fn parse_activation_heights_from_rpc(
         .set_nu6(get_height("NU6"))
         .set_nu6_1(get_height("NU6.1"))
         .set_nu6_2(get_height("NU6.2"))
+        // NU6.3 (Ironwood) — zebra's `getblockchaininfo.upgrades` reports it as
+        // name "NU6.3" (branch id 0x37a5165b). Without this line the wallet
+        // reads `nu6_3 = None`, so its `LocalNetwork` never activates NU6.3 and
+        // librustzcash signs sends with the highest NU it *does* know (NU6.2); a
+        // node at an NU6.3 height then rejects them with "incorrect consensus
+        // branch id".
+        .set_nu6_3(get_height("NU6.3"))
         .set_nu7(get_height("NU7"))
         .build()
 }

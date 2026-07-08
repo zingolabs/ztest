@@ -185,6 +185,17 @@ pub mod versions {
         minor: 0,
         patch: 0,
     };
+
+    /// First zebrad release that understands the `"NU6.3"` (Ironwood)
+    /// activation-height key and accepts an Ironwood shielded coinbase on
+    /// regtest. `6.0.0-rc.0` is the verified tag (`zfnd/zebra:6.0.0-rc.0`);
+    /// `6.0.0` covers it since the `-rc.0` pre-release parses to `6.0.0`.
+    /// Earlier zebrad rejects the `"NU6.3"` nuparams as an unknown upgrade.
+    pub const ZEBRAD_NU6_3: Semver = Semver {
+        major: 6,
+        minor: 0,
+        patch: 0,
+    };
 }
 
 impl Semver {
@@ -210,6 +221,12 @@ impl Semver {
     /// height.
     pub fn zebrad_supports_nu6_2(&self) -> bool {
         *self >= versions::ZEBRAD_NU6_2
+    }
+
+    /// `true` if this zebrad version accepts the `"NU6.3"` (Ironwood)
+    /// activation height and can mine/validate an Ironwood coinbase.
+    pub fn zebrad_supports_nu6_3(&self) -> bool {
+        *self >= versions::ZEBRAD_NU6_3
     }
 }
 
@@ -431,7 +448,7 @@ miner_address = \"{miner_address}\""
     // rather than fed a value. NU6.1/NU6.2 additionally require a zebrad
     // build that understands them (`zebrad_supports_*`).
     out.push_str("\n\n[network.testnet_parameters.activation_heights]");
-    let activation_entries: [(&str, Option<u32>); 5] = [
+    let activation_entries: [(&str, Option<u32>); 6] = [
         ("Canopy", activation.canopy()),
         ("NU5", activation.nu5()),
         ("NU6", activation.nu6()),
@@ -446,6 +463,12 @@ miner_address = \"{miner_address}\""
             activation
                 .nu6_2()
                 .filter(|_| version.zebrad_supports_nu6_2()),
+        ),
+        (
+            "\"NU6.3\"",
+            activation
+                .nu6_3()
+                .filter(|_| version.zebrad_supports_nu6_3()),
         ),
     ];
     for (key, height) in activation_entries {

@@ -287,8 +287,11 @@ impl ZingoWallet {
     {
         let faucet = self.faucet(validator, indexer).await?;
         match validator.pool_support().coinbase {
-            // Shielded coinbase: one spendable note per mined block.
-            Pool::Orchard | Pool::Sapling => {
+            // Shielded coinbase: one spendable note per mined block. (Ironwood is
+            // Orchard-based; zingolib does not track it separately, so the zingo
+            // backend treats an Ironwood coinbase like an Orchard one — see the
+            // `ironwood: 0` note in `balances`.)
+            Pool::Orchard | Pool::Ironwood | Pool::Sapling => {
                 mine_and_sync(validator, indexer, &faucet, notes, FAUCET_CONFIRM_TIMEOUT).await?;
             }
             // Transparent coinbase: mature, then shield into Orchard.
@@ -401,7 +404,9 @@ impl WalletBackend for ZingoWallet {
         let client = self.client(account)?;
         let client = client.lock().await;
         let kind = match pool {
-            Pool::Orchard => "unified",
+            // zingolib has no distinct Ironwood receiver; it shares the unified
+            // (Orchard) address.
+            Pool::Orchard | Pool::Ironwood => "unified",
             Pool::Sapling => "sapling",
             Pool::Transparent => "transparent",
         };
@@ -418,6 +423,10 @@ impl WalletBackend for ZingoWallet {
         let zats = |v: Option<Zatoshis>| v.map(Zatoshis::into_u64).unwrap_or(0);
         Ok(PoolBalances {
             orchard: zats(b.total_orchard_balance),
+            // zingolib's WalletBalance has no Ironwood field (it does not track
+            // the NU6.3 pool); report 0. Ironwood assertions must use the
+            // librustzcash backend, not zingo.
+            ironwood: 0,
             sapling: zats(b.total_sapling_balance),
             transparent: zats(b.confirmed_transparent_balance),
         })

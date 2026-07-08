@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::EnvError;
 use crate::backends;
-use crate::component::{ComponentCategory, ComponentOpts, Resources};
+use crate::component::{ComponentCategory, Resources};
 use crate::mounts::ResolvedMount;
 use crate::naming::RunCoords;
 
@@ -231,7 +231,7 @@ fn pod_is_guaranteed(spec: &Value) -> bool {
         })
 }
 
-fn merge_ports(defaults: &[(&str, u16)], extra: &[(String, u16)]) -> Vec<(String, u16)> {
+pub(crate) fn merge_ports(defaults: &[(&str, u16)], extra: &[(String, u16)]) -> Vec<(String, u16)> {
     let mut out: Vec<(String, u16)> = defaults
         .iter()
         .map(|(n, p)| ((*n).to_string(), *p))
@@ -244,138 +244,26 @@ fn merge_ports(defaults: &[(&str, u16)], extra: &[(String, u16)]) -> Vec<(String
     out
 }
 
-pub fn pod_spec_for_validator(
-    label: &'static str,
-    opts: &ComponentOpts,
-    pod_name: String,
-) -> PodSpec {
-    let image_pull_secret = backends::image::pull_secret();
-    match label {
-        "zebrad" => PodSpec {
-            pod_name,
-            category: ComponentCategory::Validator,
-            label,
-            image: backends::zebra::image_uri(&opts.version),
-            ports: merge_ports(
-                &[
-                    ("rpc", crate::handles::ports::ZEBRAD_RPC),
-                    ("metrics", crate::handles::ports::ZEBRAD_METRICS),
-                    ("p2p", crate::handles::ports::ZEBRAD_P2P),
-                ],
-                &opts.extra_ports,
-            ),
-            ready_port: crate::handles::ports::ZEBRAD_RPC,
-            command: opts.command.clone(),
-            args: opts.args.clone(),
-            resources: opts.resources.clone(),
-            env: opts.env.clone(),
-            // When sharing its zebra-state DB, run zebrad as the same uid
-            // (1000) the zaino reader uses, so the DB files it writes
-            // (including the mode-0600 `version` file) are owned by 1000
-            // and readable by the colocated StateService that opens them
-            // as a secondary. fsGroup is ineffective here: hostPath /
-            // local-path volumes ignore it, and the zainod image refuses
-            // to run as root, so matching uids is the portable fix.
-            fs_group: opts.shared_state.as_ref().map(|_| 1000),
-            run_as_user: opts.shared_state.as_ref().map(|_| 1000),
-            placement: None,
-            guaranteed: None,
-            image_pull_secret: image_pull_secret.clone(),
-        },
-        "zcashd" => PodSpec {
-            pod_name,
-            category: ComponentCategory::Validator,
-            label,
-            image: backends::zcashd::image_uri(&opts.version),
-            ports: merge_ports(
-                &[("rpc", crate::handles::ports::ZCASHD_RPC)],
-                &opts.extra_ports,
-            ),
-            ready_port: crate::handles::ports::ZCASHD_RPC,
-            command: opts.command.clone(),
-            args: opts.args.clone(),
-            resources: opts.resources.clone(),
-            env: opts.env.clone(),
-            fs_group: Some(2001),
-            run_as_user: None,
-            placement: None,
-            guaranteed: None,
-            image_pull_secret,
-        },
-        other => panic!("pod_spec_for_validator: unknown validator backend label {other:?}"),
-    }
+/// Map a backend's resolved-image result into the pod image string, tagging any
+/// build/resolution failure with the component name for the surfaced
+/// [`EnvError`]. Shared by the per-backend `pod_spec` impls (see
+/// [`ValidatorBackend::pod_spec`](crate::handles::ValidatorBackend::pod_spec) /
+/// [`IndexerBackend::pod_spec`](crate::handles::IndexerBackend::pod_spec)), which
+/// replaced the former per-label `match` here: each backend now owns its image,
+/// ports, ready port, and security context in `backends/*.rs`.
+pub(crate) fn resolve_image(
+    resolved: Result<backends::image::ResolvedImage, backends::image::ImageError>,
+    component: &'static str,
+) -> Result<String, EnvError> {
+    resolved
+        .map(|r| r.image)
+        .map_err(|source| EnvError::ImageBuild {
+            component: component.into(),
+            source,
+        })
 }
 
-pub fn pod_spec_for_indexer(
-    label: &'static str,
-    opts: &ComponentOpts,
-    pod_name: String,
-) -> Result<PodSpec, EnvError> {
-    let image_pull_secret = backends::image::pull_secret();
-    match label {
-        "zainod" => {
-            let resolved =
-                backends::zainod::image_uri(opts).map_err(|source| EnvError::ImageBuild {
-                    component: "zainod".into(),
-                    source,
-                })?;
-            Ok(PodSpec {
-                pod_name,
-                category: ComponentCategory::Indexer,
-                label,
-                image: resolved.image,
-                ports: merge_ports(
-                    &[
-                        ("grpc", crate::handles::ports::ZAINO_GRPC),
-                        ("jsonrpc", crate::handles::ports::ZAINO_JSONRPC),
-                        ("metrics", crate::handles::ports::ZAINO_METRICS),
-                    ],
-                    &opts.extra_ports,
-                ),
-                ready_port: crate::handles::ports::ZAINO_GRPC,
-                command: opts.command.clone(),
-                args: opts.args.clone(),
-                resources: opts.resources.clone(),
-                env: opts.env.clone(),
-                fs_group: Some(1000),
-                // The zainod image's USER is a non-numeric name
-                // (container_user), which kubelet can't verify against
-                // runAsNonRoot; pin the numeric uid so the check passes.
-                // This is also the uid the shared-DB validator matches (see
-                // the zebrad arm) so this reader owns the files it reads.
-                run_as_user: Some(1000),
-                placement: None,
-                guaranteed: None,
-                image_pull_secret: image_pull_secret.clone(),
-            })
-        }
-        "lightwalletd" => Ok(PodSpec {
-            pod_name,
-            category: ComponentCategory::Indexer,
-            label,
-            image: backends::lightwalletd::image_uri(&opts.version),
-            ports: merge_ports(
-                &[("grpc", crate::handles::ports::LIGHTWALLETD_GRPC)],
-                &opts.extra_ports,
-            ),
-            ready_port: crate::handles::ports::LIGHTWALLETD_GRPC,
-            command: opts.command.clone(),
-            args: opts.args.clone(),
-            resources: opts.resources.clone(),
-            env: opts.env.clone(),
-            fs_group: Some(1000),
-            // The upstream lightwalletd image sets no USER (defaults to
-            // root), which fails runAsNonRoot; pin a numeric non-root uid.
-            run_as_user: Some(1000),
-            placement: None,
-            guaranteed: None,
-            image_pull_secret,
-        }),
-        other => panic!("pod_spec_for_indexer: unknown indexer backend label {other:?}"),
-    }
-}
-
-// No `pod_spec_for_wallet`: wallets run in-process (no pod). See
+// No pod spec for wallets: wallets run in-process (no pod). See
 // `crate::backends::zingo`.
 
 #[cfg(test)]

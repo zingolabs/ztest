@@ -132,6 +132,18 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     /// Stable label string for the backend behind this handle.
     fn label(&self) -> &'static str;
 
+    /// Build the Kubernetes [`PodSpec`](crate::manifest::PodSpec) for launching
+    /// this backend, given its resolved `opts` and assigned `pod_name`. Each
+    /// backend owns its image (resolved through its `image_uri`, honoring a
+    /// `dev!` override and failing loudly on a missing override), its ports,
+    /// ready port, and security context. This replaced the former
+    /// `manifest::pod_spec_for_validator` label `match`.
+    fn pod_spec(
+        &self,
+        opts: &crate::component::ComponentOpts,
+        pod_name: String,
+    ) -> Result<crate::manifest::PodSpec, crate::EnvError>;
+
     /// Resolve a named endpoint (e.g. `"rpc"`).
     async fn endpoint(&self, name: &str) -> Result<Endpoint, EnvError>;
 

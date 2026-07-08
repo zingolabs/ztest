@@ -56,14 +56,26 @@ const DEFAULT_COINBASE_POOL: Pool = Pool::Sapling;
 /// [`Validator::mine_to`](crate::component::Validator::mine_to).
 fn miner_address(pool: Pool) -> &'static str {
     match pool {
-        Pool::Orchard => crate::regtest_conf::ORCHARD_MINER_ADDRESS,
+        // zcashd has no NU6.3/Ironwood support; Ironwood maps to the Orchard
+        // miner address for exhaustiveness (a zcashd Ironwood mine is never
+        // requested — zebrad is the NU6.3 validator).
+        Pool::Orchard | Pool::Ironwood => crate::regtest_conf::ORCHARD_MINER_ADDRESS,
         Pool::Sapling => crate::regtest_conf::SHIELDED_MINER_ADDRESS,
         Pool::Transparent => crate::regtest_conf::MINER_ADDRESS,
     }
 }
 
-pub(crate) fn image_uri(version: &str) -> String {
-    format!("electriccoinco/zcashd:{version}")
+/// Resolve the container image for a zcashd pod. Mirrors
+/// [`zebra::image_uri`](crate::backends::zebra::image_uri): the *default* is the
+/// published `electriccoinco/zcashd:<version>` tag; a
+/// [`Dev`](crate::backends::image::ImageSpec::Dev) spec *overrides* it with a
+/// `zcashd:dev-<hash>` tag, or fails the test loudly via
+/// [`ImageError::DevImageMissing`] when the pipeline never built it.
+pub(crate) fn image_uri(
+    opts: &crate::component::ComponentOpts,
+) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
+    let default_image = format!("electriccoinco/zcashd:{}", opts.version);
+    crate::backends::image::resolve(&opts.image, &default_image)
 }
 
 /// Zcashd-flavoured validator spec. ZST handed to the
@@ -150,6 +162,33 @@ impl ZcashdValidator {
 impl ValidatorBackend for ZcashdValidator {
     fn label(&self) -> &'static str {
         COMPONENT
+    }
+
+    fn pod_spec(
+        &self,
+        opts: &crate::component::ComponentOpts,
+        pod_name: String,
+    ) -> Result<crate::manifest::PodSpec, EnvError> {
+        Ok(crate::manifest::PodSpec {
+            pod_name,
+            category: crate::component::ComponentCategory::Validator,
+            label: COMPONENT,
+            image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
+            ports: crate::manifest::merge_ports(
+                &[("rpc", crate::handles::ports::ZCASHD_RPC)],
+                &opts.extra_ports,
+            ),
+            ready_port: crate::handles::ports::ZCASHD_RPC,
+            command: opts.command.clone(),
+            args: opts.args.clone(),
+            resources: opts.resources.clone(),
+            env: opts.env.clone(),
+            fs_group: Some(2001),
+            run_as_user: None,
+            placement: None,
+            guaranteed: None,
+            image_pull_secret: crate::backends::image::pull_secret(),
+        })
     }
 
     async fn endpoint(&self, name: &str) -> Result<Endpoint, EnvError> {

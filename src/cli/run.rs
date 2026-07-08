@@ -1357,14 +1357,36 @@ fn run_image_phases(
     // declared it (`SkipReason::DependencyUnavailable`), and every unaffected test
     // still runs. We surface each failure into scrollback so the cause is visible
     // above the panel.
+    //
+    // Dev-image build failures are called out distinctly and ALWAYS printed to
+    // stderr (not just the live scrollback, which can scroll off): a failed dev
+    // image means the tests that declared it are skipped, and — critically —
+    // they do NOT silently fall back to a published image (`resolve` returns
+    // `DevImageMissing`, and `probe` never substitutes a different tag). A silent
+    // fallback is exactly how a `dev!(Validator::Zebrad, …)` build failure used
+    // to masquerade as a downstream consensus error (wrong branch id) instead of
+    // the real cause. The `{detail}` carries the underlying `ImageError`
+    // (docker-build stderr tail / git-fetch failure), so the reason is visible.
+    let image_node_ids: std::collections::BTreeSet<crate::resource::NodeId> = images_by_binary
+        .iter()
+        .flat_map(|(_, entries)| entries.iter().filter_map(|e| resource::image_node_id(e).ok()))
+        .collect();
     for (id, st) in &resource_states {
         if let NodeState::Failed(detail) = st {
-            let msg = format!(
-                "resource {id:?} failed to provision ({detail}); tests needing it will be skipped"
-            );
-            match console {
-                Some(c) => c.scrollback(format!("ztest: {msg}\n")),
-                None => eprintln!("ztest run: {msg}"),
+            let msg = if image_node_ids.contains(id) {
+                format!(
+                    "dev image {id:?} FAILED TO BUILD/LOAD:\n{detail}\n\
+                     → tests that declare this image are SKIPPED; they do NOT fall back to a \
+                     published image. Fix the build failure above and re-run `ztest run`."
+                )
+            } else {
+                format!(
+                    "resource {id:?} failed to provision ({detail}); tests needing it will be skipped"
+                )
+            };
+            eprintln!("ztest run: {msg}");
+            if let Some(c) = console {
+                c.scrollback(format!("ztest: {msg}\n"));
             }
         }
     }

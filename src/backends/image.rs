@@ -375,17 +375,18 @@ pub fn pull_secret() -> Option<String> {
 
 /// Resolve an [`ImageSpec`] to the string that goes into a pod manifest.
 ///
-/// For [`ImageSpec::Published`] this is the fallback registry tag. For
-/// [`ImageSpec::Dev`] it computes the content-addressed `<repo>:dev-<hash>`,
-/// qualifies it for the active [`Distribution`], and verifies the image is
-/// already present (loaded into the kind node's containerd, or pushed to the
-/// registry); the preflight pipeline is the only thing that ever runs
-/// `docker build`. If the image isn't present, returns
-/// [`ImageError::DevImageMissing`] so the test fails loudly.
-pub fn resolve(spec: &ImageSpec, fallback_published: &str) -> Result<ResolvedImage, ImageError> {
+/// [`ImageSpec::Published`] is the *default* image: the `default_published`
+/// registry tag, used verbatim. [`ImageSpec::Dev`] is an *override* of that
+/// default: it computes the content-addressed `<repo>:dev-<hash>`, qualifies it
+/// for the active [`Distribution`], and verifies the image is already present
+/// (loaded into the kind node's containerd, or pushed to the registry); the
+/// preflight pipeline is the only thing that ever runs `docker build`. If the
+/// override image isn't present, returns [`ImageError::DevImageMissing`] so the
+/// test FAILS — a declared override never silently degrades to the default.
+pub fn resolve(spec: &ImageSpec, default_published: &str) -> Result<ResolvedImage, ImageError> {
     match spec {
         ImageSpec::Published => Ok(ResolvedImage {
-            image: fallback_published.to_string(),
+            image: default_published.to_string(),
         }),
         ImageSpec::Dev {
             source,

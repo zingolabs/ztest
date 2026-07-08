@@ -38,7 +38,10 @@ fn miner_address(pool: Pool) -> &'static str {
     match pool {
         Pool::Transparent => crate::regtest_conf::MINER_ADDRESS,
         Pool::Sapling => crate::regtest_conf::SHIELDED_MINER_ADDRESS,
-        Pool::Orchard => crate::regtest_conf::ORCHARD_MINER_ADDRESS,
+        // Ironwood is Orchard-based: mining to the Orchard receiver yields an
+        // Ironwood coinbase once NU6.3 is active, so it uses the Orchard miner
+        // address.
+        Pool::Orchard | Pool::Ironwood => crate::regtest_conf::ORCHARD_MINER_ADDRESS,
     }
 }
 
@@ -48,9 +51,19 @@ const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOCK_GENERATION_DELAY: Duration = Duration::from_millis(1500);
 
-/// Docker image URI for a given `zebrad` version tag.
-pub(crate) fn image_uri(version: &str) -> String {
-    format!("zfnd/zebra:{version}")
+/// Resolve the container image for a zebrad pod. Used by
+/// `manifest::pod_spec_for_validator`. The *default* image is the published
+/// `zfnd/zebra:<version>` tag (an [`ImageSpec::Published`](crate::backends::image::ImageSpec)
+/// spec). A [`Dev`](crate::backends::image::ImageSpec::Dev) spec *overrides* that
+/// default with a `zebrad:dev-<hash>` image built + loaded by the preflight
+/// pipeline; if the pipeline never produced it, resolution yields
+/// [`ImageError::DevImageMissing`] and the test FAILS — an override never
+/// silently degrades back to the default published tag.
+pub(crate) fn image_uri(
+    opts: &crate::component::ComponentOpts,
+) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
+    let default_image = format!("zfnd/zebra:{}", opts.version);
+    crate::backends::image::resolve(&opts.image, &default_image)
 }
 
 /// Zebrad-flavoured validator spec. ZST handed to the
@@ -189,6 +202,44 @@ impl ValidatorBackend for ZebraValidator {
         COMPONENT
     }
 
+    fn pod_spec(
+        &self,
+        opts: &crate::component::ComponentOpts,
+        pod_name: String,
+    ) -> Result<crate::manifest::PodSpec, EnvError> {
+        Ok(crate::manifest::PodSpec {
+            pod_name,
+            category: crate::component::ComponentCategory::Validator,
+            label: COMPONENT,
+            image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
+            ports: crate::manifest::merge_ports(
+                &[
+                    ("rpc", crate::handles::ports::ZEBRAD_RPC),
+                    ("metrics", crate::handles::ports::ZEBRAD_METRICS),
+                    ("p2p", crate::handles::ports::ZEBRAD_P2P),
+                ],
+                &opts.extra_ports,
+            ),
+            ready_port: crate::handles::ports::ZEBRAD_RPC,
+            command: opts.command.clone(),
+            args: opts.args.clone(),
+            resources: opts.resources.clone(),
+            env: opts.env.clone(),
+            // When sharing its zebra-state DB, run zebrad as the same uid
+            // (1000) the zaino reader uses, so the DB files it writes
+            // (including the mode-0600 `version` file) are owned by 1000
+            // and readable by the colocated StateService that opens them
+            // as a secondary. fsGroup is ineffective here: hostPath /
+            // local-path volumes ignore it, and the zainod image refuses
+            // to run as root, so matching uids is the portable fix.
+            fs_group: opts.shared_state.as_ref().map(|_| 1000),
+            run_as_user: opts.shared_state.as_ref().map(|_| 1000),
+            placement: None,
+            guaranteed: None,
+            image_pull_secret: crate::backends::image::pull_secret(),
+        })
+    }
+
     async fn endpoint(&self, name: &str) -> Result<Endpoint, EnvError> {
         self.plumbing.endpoint(name).await
     }
@@ -247,7 +298,12 @@ impl ValidatorBackend for ZebraValidator {
         // zebrad validates every value pool on regtest; the pool its
         // coinbase pays into was chosen per-validator (default Transparent).
         PoolSupport {
-            supported: &[Pool::Orchard, Pool::Sapling, Pool::Transparent],
+            supported: &[
+                Pool::Orchard,
+                Pool::Ironwood,
+                Pool::Sapling,
+                Pool::Transparent,
+            ],
             coinbase: self
                 .plumbing
                 .coinbase_pool

@@ -44,7 +44,7 @@ type RegtestMaterializeFn = Box<
 /// host resolved at build time). Captured at `add_indexer`.
 type IndexerMaterializeFn =
     Box<dyn FnOnce(ComponentOpts, Option<&str>) -> Result<ComponentOpts, EnvError> + Send>;
-use crate::manifest::{self, PodSpec};
+use crate::manifest::PodSpec;
 use crate::mounts::{self, ResolvedMount};
 use crate::naming::{self, RunCoords};
 use crate::portforward::Forwarder;
@@ -233,9 +233,10 @@ struct PendingValidator {
 
 struct PendingIndexer {
     id: u64,
-    /// Pod label, captured from the handle at `add_indexer` (the concrete
-    /// backend isn't retained).
-    label: &'static str,
+    /// Type-erased backend handle, retained so `env.build()` can build the pod
+    /// spec via [`IndexerBackend::pod_spec`] (which owns image/ports/security
+    /// per backend) rather than matching on a label string.
+    handle: Arc<dyn IndexerBackend>,
     nu_ceiling: Option<NetworkUpgrade>,
     /// Regtest materialization closure; `Some` only for regtest indexers,
     /// `take`n when applied.
@@ -408,7 +409,7 @@ impl TestEnv {
             coinbase_pool: None,
         };
         let handle = i.backend.to_handle(plumbing);
-        let label = handle.label();
+        let dyn_handle: Arc<dyn IndexerBackend> = Arc::new(handle.clone());
         let nu_ceiling = match i.opts.image {
             crate::backends::image::ImageSpec::Dev { .. } => None,
             _ => i.backend.nu_ceiling(&i.opts.version),
@@ -423,7 +424,7 @@ impl TestEnv {
         });
         self.pending_indexers.push(PendingIndexer {
             id,
-            label,
+            handle: dyn_handle,
             nu_ceiling,
             materialize,
             opts: i.opts,
@@ -887,15 +888,14 @@ impl TestEnv {
             .drain(..)
             .map(|p| {
                 let pod_name = pod_name_of(&p.opts);
-                let mut spec =
-                    manifest::pod_spec_for_validator(p.handle.label(), &p.opts, pod_name);
+                let mut spec = p.handle.pod_spec(&p.opts, pod_name)?;
                 spec.placement = qos_placement;
                 if spec.resources.is_none() {
                     spec.guaranteed = qos_guaranteed.clone();
                 }
-                (p.id, spec, p.opts, Some(p.handle))
+                Ok::<_, EnvError>((p.id, spec, p.opts, Some(p.handle)))
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         self.materialize_phase(&ctx, &validators).await?;
         // The env's own readiness/warm probes drive the validators through
         // their handles, which gate endpoint resolution on `is_built`.
@@ -918,7 +918,7 @@ impl TestEnv {
             .drain(..)
             .map(|p| {
                 let pod_name = pod_name_of(&p.opts);
-                let mut spec = manifest::pod_spec_for_indexer(p.label, &p.opts, pod_name)?;
+                let mut spec = p.handle.pod_spec(&p.opts, pod_name)?;
                 spec.placement = qos_placement;
                 if spec.resources.is_none() {
                     spec.guaranteed = qos_guaranteed.clone();
