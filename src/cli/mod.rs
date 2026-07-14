@@ -23,6 +23,7 @@ pub(crate) mod cluster;
 pub(crate) mod cluster_tools;
 pub(crate) mod console;
 pub mod list_mounts;
+pub(crate) mod preview;
 pub mod run;
 pub(crate) mod setup;
 pub(crate) mod snapshot;
@@ -83,6 +84,11 @@ pub enum Command {
     /// `remove`) that bind kube-context + image distribution + the OpenShift
     /// flag, so `ztest run --cluster <name>` selects a whole target at once.
     Cluster(cluster::Args),
+
+    /// Drive the live bottom panel with a scripted, cluster-free transfer
+    /// timeline. A formatting harness for the right-column tracker.
+    #[command(hide = true)]
+    Preview,
 }
 
 /// Tokio runtime flavor for [`block_on`]: the k8s-only subcommands are happy on
@@ -135,5 +141,6 @@ pub fn main() -> ExitCode {
         Command::Cleanup(args) => cleanup::execute(args),
         Command::Snapshot(args) => snapshot::execute(args),
         Command::Cluster(args) => cluster::execute(args),
+        Command::Preview => preview::execute(),
     }
 }

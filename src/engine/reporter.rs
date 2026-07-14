@@ -25,9 +25,7 @@ use std::time::Duration;
 
 use owo_colors::OwoColorize as _;
 
-use crate::engine::events::{
-    CancelReason, RunReporter, RunStats, RunningView, TestEvent, Verdict,
-};
+use crate::engine::events::{CancelReason, RunReporter, RunStats, RunningView, TestEvent, Verdict};
 
 /// Status-line colour intent, mirroring nextest's `Styles`
 /// (`reporter/helpers.rs`): pass = green·bold, fail = red·bold,
@@ -930,7 +928,13 @@ mod tests {
     fn cancel_notice_and_summary_line_match_nextest() {
         let mut r = StyledReporter::new(false, true);
         // A test terminated by the cancellation streams its status line inline...
-        r.handle(&finished("pkg::b", "mod::slow", Verdict::Terminated, 1, b""));
+        r.handle(&finished(
+            "pkg::b",
+            "mod::slow",
+            Verdict::Terminated,
+            1,
+            b"",
+        ));
         r.handle(&TestEvent::RunCancelling {
             reason: CancelReason::Interrupt,
             running: 2,

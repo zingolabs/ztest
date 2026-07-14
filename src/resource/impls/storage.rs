@@ -657,7 +657,8 @@ pub async fn discover(client: &kube::Client) -> Result<Vec<StorageOption>, Strin
         version: "v1".into(),
         kind: "VolumeSnapshotClass".into(),
     };
-    let vsc_api: Api<DynamicObject> = Api::all_with(client.clone(), &ApiResource::from_gvk(&vsc_gvk));
+    let vsc_api: Api<DynamicObject> =
+        Api::all_with(client.clone(), &ApiResource::from_gvk(&vsc_gvk));
     let vsc_drivers: Vec<String> = match vsc_api.list(&Default::default()).await {
         Ok(list) => list
             .items

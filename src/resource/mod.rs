@@ -33,13 +33,13 @@ pub(crate) mod impls;
 
 // ── Public API ────────────────────────────────────────────────────────
 
-pub use context::{Cx, CxBuilder, ProgressSink};
+pub use context::{Cx, CxBuilder, Progress, ProgressSink};
 pub use entry::{
-    InitializeOpts, image_node_id, initialize, plan_runtime, qos_tiers, reap_all, reap_run,
-    reap_user, seed_node_id,
+    InitializeOpts, image_node_id, initialize, plan_runtime, reap_all, reap_run, reap_user,
+    seed_node_id,
 };
 pub use graph::{Graph, GraphError};
-pub use impls::storage::{StorageOption, StorageProfile, discover as discover_storage};
 pub(crate) use impls::policy::{RUN_CLUSTER_ROLE, check_access as check_run_access};
+pub use impls::storage::{StorageOption, StorageProfile, discover as discover_storage};
 pub use provider::{NodeId, Provider};
 pub use state::{Lifetime, NodeState, Readiness, ResourceError};

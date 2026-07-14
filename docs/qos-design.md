@@ -12,6 +12,31 @@ This doc is the working reference; it will move faster than the code.
 > tool-config `qos/lower.rs`), and the run has a native event stream. Read
 > those three sections as background only; `engine-design.md` is current.
 
+> **Admission model (current).** The **in-memory `qos::scheduler::Scheduler`**
+> owned by `ztest run` is the *sole* admission authority. The decentralized
+> k8s-`Lease` ledger (§5.3–§5.4: `qos::allocator` + `qos::kube_store`, the
+> `ztest-qos` namespace, per-SA budget annotations) has been **removed** —
+> read §5.3–§5.6 as background only.
+> - **Orchestration is mandatory.** `TestEnv::build()` refuses to run outside
+>   `ztest run` (`cluster::require_orchestrator`, keyed on `ZTEST_ENGINE`); a
+>   bare `cargo test`/`cargo nextest` gets a clear "run with `ztest run`" error
+>   instead of silently creating unbudgeted pods. Tier-based Guaranteed pod
+>   sizing (§7) is therefore always in effect under a run.
+> - **Cross-run coexistence** replaces the shared ledger: each run seeds its
+>   scheduler from `ClusterCapacity::free()` (`allocatable − Σ requested` over
+>   *all* pods, including other runs' Guaranteed pods) at startup, so a second
+>   concurrent `ztest run` packs against the remainder and queues on "Waiting
+>   for Cluster Capacity". It's a startup snapshot, not a hard cross-process
+>   lock — a small simultaneous-probe overcommit window is accepted.
+> - **Per-SA budgets are deferred.** The scheduler retains the enforcement seam
+>   (`Scheduler::set_sa_budget`, `RejectReason::ExceedsSaBudget`) but nothing
+>   wires cluster-side budgets into it yet, so every SA is effectively
+>   unlimited. Rebuild the annotation-reading path when true per-dev caps are
+>   needed.
+> - **Namespace `ResourceQuota`.** Each per-test namespace gets a requests- and
+>   pod-count-scoped `ResourceQuota` sized to the tier's deployed footprint
+>   (`cluster::apply_resource_quota`) as an API-server-enforced backstop.
+
 ## 1. Problem & mandate
 
 Tests on this harness range from sub-second pure-logic checks to 48-hour
@@ -43,23 +68,24 @@ pipeline pattern.
 ## 2. The tier ladder
 
 ```
-#[ztest::qos::basic]        #[ztest::qos::integration]
-#[ztest::qos::testnet]      #[ztest::qos::sync]
+#[ztest::qos::basic]        #[ztest::qos::wallet]
+#[ztest::qos::integration]  #[ztest::qos::testnet]
+#[ztest::qos::sync]
 ```
 
 Attribute path is snake_case (Rust convention for module + macro names).
 
 | Tier          | Hard cap | Reserve CPU | Reserve RAM | Scheduling                           |
 |---------------|----------|-------------|-------------|--------------------------------------|
-| `basic`       | 60 s     | **TBD**     | **TBD**     | general pool                         |
-| `integration` | 10 min   | **TBD**     | **TBD**     | general pool                         |
-| `testnet`     | 6 h      | **TBD**     | **TBD**     | general pool                         |
-| `sync`        | 48 h     | **TBD**     | **TBD**     | NVMe node-selector + NVMe toleration |
+| `basic`       | 60 s     | 1 core      | 512 MiB     | general pool                         |
+| `wallet`      | 10 min   | 4 cores     | 1 GiB       | general pool                         |
+| `integration` | 10 min   | 4 cores     | 2 GiB       | general pool                         |
+| `testnet`     | 6 h      | 8 cores     | 12 GiB      | general pool                         |
+| `sync`        | 48 h     | 16 cores    | 32 GiB      | NVMe node-selector + NVMe toleration |
 
-- Hard caps (timeouts) are **locked**. The per-test CPU/RAM reservations
-  are pending the definitive table — they are *smaller* than the
-  ServiceAccount **budgets** (§5.6); the 4/8 … 16/48 GiB figures discussed
-  earlier turned out to describe SA budgets, not per-test sizes.
+- Hard caps (timeouts) and the per-test CPU/RAM reserves are **locked** in
+  the `QosClass::profile` const table. (Priority ascends with the tier order
+  above; `wallet` sits between `basic` and `integration`.)
 - **Reserve** = the per-namespace *aggregate* budget the topology may
   consume. It is both the scheduling reservation (§5) and the default
   ceiling for pod `limits`. Per-component `.resources(cpu, mem)` (already
@@ -425,8 +451,8 @@ coarse-nextest to precise-2-D.
 
 ## 11. Open questions
 
-- **Per-test reservation table** (§2): _Resolved_ — `basic` 500m/512Mi,
-  `integration` 2c/2Gi, `testnet` 8c/18Gi, `sync` 16c/32Gi
+- **Per-test reservation table** (§2): _Resolved_ — `basic` 1c/512Mi,
+  `wallet` 4c/1Gi, `integration` 4c/2Gi, `testnet` 8c/12Gi, `sync` 16c/32Gi
   (`QosClass::profile`). Caps/timeouts remain locked.
 - **Tier budget vs per-pod resources** (§2, §7): _Resolved_ — split the
   aggregate footprint **evenly across the env's pods**, `requests == limits`,

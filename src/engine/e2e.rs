@@ -5,7 +5,7 @@
 //! each layer in isolation but never the **seams** between them. These tests wire
 //! the *real* layers together — [`build_work_list`](super::plan::build_work_list)
 //! → [`run_loop`](super::schedule::run_loop) driving the *real*
-//! [`spawn_test`](super::exec::spawn_test) over throwaway shell scripts → the
+//! [`spawn_test`](super::local_runner::spawn_test) over throwaway shell scripts → the
 //! *real* [`StyledReporter`](super::reporter::StyledReporter) and live
 //! [`PanelFrame`](super::schedule::PanelFrame) — and assert across plan +
 //! scheduler + exec + reporter + panel + events at once.
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::engine::events::RunReporter as _;
-use crate::engine::exec::{EngineEnv, spawn_test};
+use crate::engine::local_runner::{EngineEnv, spawn_test};
 use crate::engine::plan::{WorkItem, build_work_list};
 use crate::engine::reporter::StyledReporter;
 use crate::engine::schedule::{LoopConfig, PanelFrame, run_loop};

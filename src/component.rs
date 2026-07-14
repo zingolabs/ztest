@@ -160,7 +160,16 @@ fn opts_dev(
 
 fn default_features_for(component: &str) -> Vec<String> {
     match component {
-        "zainod" => vec!["no_tls_use_unencrypted_traffic".to_string()],
+        // `allow_unencrypted_public_json_rpc_bind`: pod-per-test runs the test
+        // client in a *separate* pod, so zaino's JSON-RPC must bind `0.0.0.0`
+        // (see `regtest_conf`); zaino otherwise refuses a non-loopback bind. The
+        // per-test namespace + private cluster network are the "trusted private
+        // network" the feature is gated for. Keep in sync with the `dev!` macro's
+        // zainod defaults (`macros/src/lib.rs`) — the tag `spec_key` must match.
+        "zainod" => vec![
+            "no_tls_use_unencrypted_traffic".to_string(),
+            "allow_unencrypted_public_json_rpc_bind".to_string(),
+        ],
         _ => Vec::new(),
     }
 }
@@ -204,7 +213,10 @@ impl Validator<ZebraBackend> {
     /// backend renders its regtest config and derives its NU ceiling from it,
     /// so it must be a real semver rather than the `"dev"` sentinel.
     #[doc(hidden)]
-    pub fn zebrad_dev(source: crate::backends::image::DevSource, version: impl Into<String>) -> Self {
+    pub fn zebrad_dev(
+        source: crate::backends::image::DevSource,
+        version: impl Into<String>,
+    ) -> Self {
         Self {
             backend: ZebraBackend,
             opts: opts_dev(source, version.into(), "zebrad"),
@@ -220,7 +232,10 @@ impl Validator<ZcashdBackend> {
         }
     }
     #[doc(hidden)]
-    pub fn zcashd_dev(source: crate::backends::image::DevSource, version: impl Into<String>) -> Self {
+    pub fn zcashd_dev(
+        source: crate::backends::image::DevSource,
+        version: impl Into<String>,
+    ) -> Self {
         Self {
             backend: ZcashdBackend,
             opts: opts_dev(source, version.into(), "zcashd"),
@@ -244,7 +259,10 @@ impl Indexer<ZainoBackend> {
         }
     }
     #[doc(hidden)]
-    pub fn zainod_dev(source: crate::backends::image::DevSource, version: impl Into<String>) -> Self {
+    pub fn zainod_dev(
+        source: crate::backends::image::DevSource,
+        version: impl Into<String>,
+    ) -> Self {
         Self {
             backend: ZainoBackend,
             opts: opts_dev(source, version.into(), "zainod"),
@@ -572,5 +590,58 @@ impl<B: IndexerConfig> Indexer<B> {
 impl<B: WalletConfig> Wallet<B> {
     pub fn opts(&self) -> &ComponentOpts {
         &self.opts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::image::{DevSource, ImageSpec, spec_key};
+
+    /// The laptop preflight keys its `ZTEST_IMAGE_REFS` map by the `spec_key` of
+    /// each *discovered* `DevImageDecl` (the `dev!` macro's repo/feature
+    /// defaults); the in-pod test looks it up by the `spec_key` of the *runtime*
+    /// `ImageSpec::Dev` that `zainod_dev` (→ `opts_dev`) builds. If those two
+    /// sources of the repo/feature/toolchain defaults ever drift apart, the key
+    /// misses and the in-pod resolve falls back to hashing a Dockerfile the baked
+    /// image doesn't have — exactly the failure this whole path exists to avoid.
+    /// This pins them together.
+    #[test]
+    fn zainod_dev_ctor_and_discovery_agree_on_spec_key() {
+        let src = DevSource::Local {
+            dockerfile: std::path::PathBuf::from("/w/live-tests/clientless/../../Dockerfile"),
+            context: std::path::PathBuf::from("/w/live-tests/clientless/../.."),
+        };
+
+        // Runtime side: what the in-pod test resolves.
+        let indexer = Indexer::zainod_dev(src.clone(), "dev");
+        let ImageSpec::Dev {
+            source,
+            features,
+            repo,
+            rust_version,
+        } = &indexer.opts().image
+        else {
+            panic!("zainod_dev must yield an ImageSpec::Dev");
+        };
+        let runtime_key = spec_key(source, features, repo, rust_version.as_deref());
+
+        // Discovery side: the `dev!(Indexer::Zainod, …)` decl the preflight dump
+        // emits — repo `zainod`, the macro's default zaino features, no pinned
+        // toolchain (verified against a live inventory dump).
+        let discovery_key = spec_key(
+            &src,
+            &[
+                "no_tls_use_unencrypted_traffic".to_string(),
+                "allow_unencrypted_public_json_rpc_bind".to_string(),
+            ],
+            "zainod",
+            None,
+        );
+
+        assert_eq!(
+            runtime_key, discovery_key,
+            "runtime ctor and discovery decl must produce the same image spec_key"
+        );
     }
 }

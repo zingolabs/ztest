@@ -45,7 +45,11 @@ pub enum OciError {
     Reference(String),
     Tls(String),
     Http(String),
-    Registry { what: String, status: u16, body: String },
+    Registry {
+        what: String,
+        status: u16,
+        body: String,
+    },
     Auth(String),
 }
 
@@ -237,7 +241,10 @@ impl Session {
     }
 
     fn blob_url(&self, digest: &str) -> String {
-        format!("{}/v2/{}/blobs/{digest}", self.reference.base, self.reference.repo)
+        format!(
+            "{}/v2/{}/blobs/{digest}",
+            self.reference.base, self.reference.repo
+        )
     }
 
     fn manifest_url(&self) -> String {
@@ -327,13 +334,27 @@ impl Session {
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json,\
 application/vnd.docker.distribution.manifest.v2+json";
 
+/// A push-progress report: the running aggregate byte count as each blob lands
+/// (`Blob`), then the manifest PUT once every blob is in (`Manifest`). The caller
+/// formats these for display; keeping them structured lets the panel drive a real
+/// `%` bar instead of parsing a preformatted string.
+pub enum PushProgress {
+    Blob {
+        n: usize,
+        total: usize,
+        pushed_bytes: u64,
+        total_bytes: u64,
+    },
+    Manifest,
+}
+
 /// Push a built OCI layout to `target`, reporting per-blob progress through
 /// `report`. Blobs already present in the registry are skipped (content-address
 /// dedup), so a rebuild that only changed one layer re-uploads just that layer.
 pub async fn push_layout(
     layout_dir: &Path,
     target: &Target,
-    report: &(dyn Fn(String) + Send + Sync),
+    report: &(dyn Fn(PushProgress) + Send + Sync),
 ) -> Result<(), OciError> {
     let layout = Layout::read(layout_dir)?;
     let session = Session::open(target).await?;
@@ -348,33 +369,28 @@ pub async fn push_layout(
     let mut pushed_bytes = 0u64;
     for (i, desc) in blobs.iter().enumerate() {
         let n = i + 1;
+        let blob = |pushed_bytes| PushProgress::Blob {
+            n,
+            total,
+            pushed_bytes,
+            total_bytes,
+        };
+        // Report before the (atomic) upload so the row shows this layer starting,
+        // then again after so the bar advances by the blob's size.
+        report(blob(pushed_bytes));
         if session.blob_exists(&desc.digest).await? {
             pushed_bytes += desc.size;
-            report(format!(
-                "layer {n}/{total} cached · {}/{}",
-                human(pushed_bytes),
-                human(total_bytes)
-            ));
+            report(blob(pushed_bytes));
             continue;
         }
-        report(format!(
-            "layer {n}/{total} · pushing {} · {}/{}",
-            human(desc.size),
-            human(pushed_bytes),
-            human(total_bytes)
-        ));
         let data = std::fs::read(layout.blob_path(&desc.digest))
             .map_err(|e| OciError::Layout(format!("read blob {}: {e}", desc.digest)))?;
         session.push_blob(&desc.digest, data).await?;
         pushed_bytes += desc.size;
-        report(format!(
-            "layer {n}/{total} done · {}/{}",
-            human(pushed_bytes),
-            human(total_bytes)
-        ));
+        report(blob(pushed_bytes));
     }
 
-    report("manifest".to_string());
+    report(PushProgress::Manifest);
     session
         .put_manifest(layout.manifest_bytes, &layout.manifest_media_type)
         .await
@@ -394,7 +410,9 @@ struct BearerChallenge {
 
 impl BearerChallenge {
     fn parse(header: &str) -> Option<BearerChallenge> {
-        let rest = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer "))?;
+        let rest = header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))?;
         let mut realm = None;
         let mut service = None;
         for part in rest.split(',') {
@@ -475,21 +493,6 @@ fn absolutize(base: &str, location: &str) -> String {
     }
 }
 
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -508,7 +511,10 @@ mod tests {
             "default-route-openshift-image-registry.apps-crc.testing/ztest-images/zainod:dev-abc",
         )
         .unwrap();
-        assert_eq!(r.base, "https://default-route-openshift-image-registry.apps-crc.testing");
+        assert_eq!(
+            r.base,
+            "https://default-route-openshift-image-registry.apps-crc.testing"
+        );
         assert_eq!(r.repo, "ztest-images/zainod");
         assert_eq!(r.tag, "dev-abc");
     }
@@ -538,15 +544,14 @@ mod tests {
 
     #[test]
     fn absolutize_relative_and_absolute() {
-        assert_eq!(absolutize("https://r.io", "/v2/x/uploads/1"), "https://r.io/v2/x/uploads/1");
-        assert_eq!(absolutize("https://r.io", "https://r.io/other"), "https://r.io/other");
-    }
-
-    #[test]
-    fn human_bytes() {
-        assert_eq!(human(512), "512 B");
-        assert_eq!(human(1024), "1.0 KiB");
-        assert_eq!(human(1024 * 1024 * 3), "3.0 MiB");
+        assert_eq!(
+            absolutize("https://r.io", "/v2/x/uploads/1"),
+            "https://r.io/v2/x/uploads/1"
+        );
+        assert_eq!(
+            absolutize("https://r.io", "https://r.io/other"),
+            "https://r.io/other"
+        );
     }
 
     #[test]

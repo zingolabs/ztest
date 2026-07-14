@@ -28,14 +28,11 @@ use std::collections::HashMap;
 
 use super::Resources;
 
-/// The verdict of a single-request fit check over reconstructed state.
+/// The verdict of a single-request fit check.
 ///
-/// The pure decision primitive shared by the resident [`Scheduler`] (which
-/// holds its own committed/usage) and the decentralized
-/// [`crate::qos::allocator`] (which reconstructs committed/usage from k8s
-/// objects on every admission). `LeaseId`-free: minting a lease is the caller's
-/// job (an in-memory counter for the resident scheduler, a k8s Lease for the
-/// allocator).
+/// The pure decision primitive used by the [`Scheduler`] over its own
+/// committed/usage state. `LeaseId`-free: minting a lease is the caller's job
+/// (an in-memory counter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     /// Fits live free capacity and SA remaining budget; admit.
@@ -548,15 +545,13 @@ mod tests {
         assert_eq!(s.queue_len(), 0);
     }
 
-    // decide(): the two ceilings are distinct (regression).
+    // decide(): reject vs queue is distinct (regression).
     //
-    // These pin the contract `env::admit` relies on: `available` is the
-    // empty-of-ztest ceiling (`ClusterCapacity::admission_ceiling`), checked
-    // for Reject; the queue/fit split is `available - committed`. A footprint
-    // that fits the ceiling but not the live free figure must queue, never
-    // reject. Feeding live-free (`ClusterCapacity::free`) in as `available`
-    // collapses this distinction under load and caused spurious
-    // `ExceedsClusterCapacity` rejections.
+    // `available` is the scheduler's seed capacity (`ClusterCapacity::free` at
+    // run startup); a footprint exceeding it is rejected (unschedulable however
+    // many tests finish). The queue/fit split is `available - committed`: a
+    // footprint that fits `available` but not the live remainder must queue,
+    // never reject.
 
     #[test]
     fn decide_queues_when_fits_ceiling_but_not_free() {

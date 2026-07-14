@@ -53,9 +53,9 @@ mod seeds;
 
 // ─────────────────────────── top-level re-exports ──────────────────────
 
+pub use crate::backends::image::DevSource;
 #[cfg(feature = "librustzcash")]
 pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
-pub use crate::backends::image::DevSource;
 pub use crate::backends::lightwalletd::LightwalletdIndexer;
 pub use crate::backends::zainod::ZainoIndexer;
 pub use crate::backends::zcashd::ZcashdValidator;

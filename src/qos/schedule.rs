@@ -166,42 +166,42 @@ mod tests {
 
     #[test]
     fn total_is_sum_of_count_times_footprint() {
-        // 3 basic (500m/512Mi) + 1 integration (2000m/2Gi).
+        // 3 basic (1000m/512Mi) + 1 integration (4000m/2Gi).
         let p = plan(
             &counts(&[(QosClass::Basic, 3), (QosClass::Integration, 1)]),
             None,
         );
-        assert_eq!(p.total.cpu_milli, 3 * 500 + 2000);
+        assert_eq!(p.total.cpu_milli, 3 * 1000 + 4000);
         assert_eq!(p.total.mem_bytes, 3 * 512 * crate::qos::MIB + 2 * GIB);
     }
 
     #[test]
     fn fits_in_one_wave_when_total_within_capacity() {
-        // 4 basic = 2 cores / 2 GiB total; cluster has 8/16 → one wave.
+        // 4 basic = 4 cores / 2 GiB total; cluster has 8/16 → one wave.
         let p = plan(
             &counts(&[(QosClass::Basic, 4)]),
             Some(Resources::new(8000, 16 * GIB)),
         );
         assert_eq!(p.waves, 1);
-        assert_eq!(p.peak, Resources::new(2000, 2 * GIB));
+        assert_eq!(p.peak, Resources::new(4000, 2 * GIB));
         assert!(p.unschedulable.is_empty());
     }
 
     #[test]
     fn spills_into_multiple_waves_when_total_exceeds_capacity() {
-        // 5 integration (2 cores / 2 GiB each) on a 4-core / 8-GiB cluster:
-        // CPU-bound → 2 fit per wave → ceil(5/2) = 3 waves.
+        // 5 integration (4 cores / 2 GiB each) on a 4-core / 8-GiB cluster:
+        // CPU-bound → 1 fits per wave → ceil(5/1) = 5 waves.
         let p = plan(
             &counts(&[(QosClass::Integration, 5)]),
             Some(Resources::new(4000, 8 * GIB)),
         );
-        assert_eq!(p.waves, 3);
-        assert_eq!(p.peak, Resources::new(4000, 4 * GIB));
+        assert_eq!(p.waves, 5);
+        assert_eq!(p.peak, Resources::new(4000, 2 * GIB));
     }
 
     #[test]
     fn unschedulable_tier_is_flagged_and_excluded_from_waves() {
-        // sync needs 8 cores / 16 GiB; cluster has 4/8 → can never fit.
+        // sync needs 16 cores / 32 GiB; cluster has 4/8 → can never fit.
         // A schedulable basic still plans normally around it.
         let p = plan(
             &counts(&[(QosClass::Sync, 2), (QosClass::Basic, 1)]),
@@ -210,7 +210,7 @@ mod tests {
         assert_eq!(p.unschedulable, vec![QosClass::Sync]);
         // Only the basic test entered the wave sim.
         assert_eq!(p.waves, 1);
-        assert_eq!(p.peak, Resources::new(500, 512 * crate::qos::MIB));
+        assert_eq!(p.peak, Resources::new(1000, 512 * crate::qos::MIB));
     }
 
     #[test]

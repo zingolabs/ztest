@@ -471,8 +471,10 @@ mod tests {
             features: &[],
             rust_versions: &["1.88", "1.91.0"],
         };
-        let versions: Vec<Option<String>> =
-            expand_decl(&decl).into_iter().map(|e| e.rust_version).collect();
+        let versions: Vec<Option<String>> = expand_decl(&decl)
+            .into_iter()
+            .map(|e| e.rust_version)
+            .collect();
         assert_eq!(
             versions,
             vec![Some("1.88".to_string()), Some("1.91.0".to_string())]

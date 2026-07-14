@@ -161,20 +161,53 @@ impl CxBuilder {
 /// not name the CLI's event type — it only knows there's *some* sink to
 /// forward notes to. `cli::run` constructs one with an mpsc-send closure.
 #[derive(Clone)]
-pub struct ProgressSink(Arc<dyn Fn(NodeId, String) + Send + Sync>);
+pub struct ProgressSink(Arc<dyn Fn(NodeId, Progress) + Send + Sync>);
+
+/// One sub-phase report for a resource node.
+///
+/// `Note` is spinner + free text (the coarse phase of most providers).
+/// `Bytes` carries an aggregate byte count that drives the right column's `%`
+/// bar (an in-process push knows `pushed / total`). `Finalizing` means the bytes
+/// are all in but a tail step is still running (the manifest PUT after the last
+/// blob), so the row shows a spinner rather than parking at a misleading 100%
+/// until the coarse `Ready` transition removes it.
+#[derive(Clone, Debug)]
+pub enum Progress {
+    Note(String),
+    Bytes { done: u64, total: u64, note: String },
+    Finalizing,
+}
 
 impl ProgressSink {
     /// Wrap a sink function (typically an mpsc send on the work side).
     pub fn new<F>(f: F) -> Self
     where
-        F: Fn(NodeId, String) + Send + Sync + 'static,
+        F: Fn(NodeId, Progress) + Send + Sync + 'static,
     {
         Self(Arc::new(f))
     }
 
     /// Report the current sub-phase note for `id`.
     pub fn note(&self, id: &NodeId, note: impl Into<String>) {
-        (self.0)(id.clone(), note.into());
+        (self.0)(id.clone(), Progress::Note(note.into()));
+    }
+
+    /// Report aggregate byte progress for `id` (lights the `%` bar). `note` is a
+    /// short qualifier shown after the byte counts (e.g. `layer 5/7`).
+    pub fn bytes(&self, id: &NodeId, done: u64, total: u64, note: impl Into<String>) {
+        (self.0)(
+            id.clone(),
+            Progress::Bytes {
+                done,
+                total,
+                note: note.into(),
+            },
+        );
+    }
+
+    /// Report that byte transfer is complete but a tail step is still running.
+    pub fn finalizing(&self, id: &NodeId) {
+        (self.0)(id.clone(), Progress::Finalizing);
     }
 }
 

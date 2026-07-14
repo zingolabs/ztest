@@ -82,47 +82,104 @@ struct Rule {
 
 const RUN_RULES: &[Rule] = &[
     // Cluster-scoped core.
-    Rule { group: "", resources: &["namespaces"],
-           verbs: &["get", "list", "watch", "create", "delete"], check_verb: Some("create") },
-    Rule { group: "", resources: &["nodes"],
-           verbs: &["get", "list"], check_verb: Some("list") },
-    Rule { group: "", resources: &["persistentvolumes"],
-           verbs: &["get", "list", "watch"], check_verb: Some("list") },
+    Rule {
+        group: "",
+        resources: &["namespaces"],
+        verbs: &["get", "list", "watch", "create", "delete"],
+        check_verb: Some("create"),
+    },
+    Rule {
+        group: "",
+        resources: &["nodes"],
+        verbs: &["get", "list"],
+        check_verb: Some("list"),
+    },
+    Rule {
+        group: "",
+        resources: &["persistentvolumes"],
+        verbs: &["get", "list", "watch"],
+        check_verb: Some("list"),
+    },
     // Namespaced core: the per-test environment objects. Bound cluster-wide via
     // ClusterRoleBinding, so they apply in every namespace ztest creates.
-    Rule { group: "", resources: &["pods", "services", "configmaps", "persistentvolumeclaims", "serviceaccounts"],
-           verbs: &["get", "list", "watch", "create", "update", "patch", "delete"], check_verb: None },
-    Rule { group: "", resources: &["events"],
-           verbs: &["get", "list", "watch"], check_verb: None },
+    Rule {
+        group: "",
+        resources: &[
+            "pods",
+            "services",
+            "configmaps",
+            "persistentvolumeclaims",
+            "serviceaccounts",
+            "resourcequotas",
+        ],
+        verbs: &[
+            "get", "list", "watch", "create", "update", "patch", "delete",
+        ],
+        check_verb: None,
+    },
+    Rule {
+        group: "",
+        resources: &["events"],
+        verbs: &["get", "list", "watch"],
+        check_verb: None,
+    },
     // Pod subresources: logs (diagnostics), port-forward (out-of-cluster dial),
     // exec + attach (seed uploader stdin streaming).
-    Rule { group: "", resources: &["pods/log", "pods/portforward", "pods/exec", "pods/attach"],
-           verbs: &["get", "list", "create"], check_verb: None },
-    Rule { group: "batch", resources: &["jobs"],
-           verbs: &["get", "list", "watch"], check_verb: Some("list") },
-    Rule { group: "coordination.k8s.io", resources: &["leases"],
-           verbs: &["get", "list", "watch", "create", "update", "patch", "delete"], check_verb: None },
+    Rule {
+        group: "",
+        resources: &["pods/log", "pods/portforward", "pods/exec", "pods/attach"],
+        verbs: &["get", "list", "create"],
+        check_verb: None,
+    },
+    Rule {
+        group: "batch",
+        resources: &["jobs"],
+        verbs: &["get", "list", "watch"],
+        check_verb: Some("list"),
+    },
+    Rule {
+        group: "coordination.k8s.io",
+        resources: &["leases"],
+        verbs: &[
+            "get", "list", "watch", "create", "update", "patch", "delete",
+        ],
+        check_verb: None,
+    },
     // Snapshot API: seed clone (namespaced VolumeSnapshots), the shadow clones
     // (cluster VolumeSnapshotContents), and reading the class (seeds).
-    Rule { group: "snapshot.storage.k8s.io", resources: &["volumesnapshots"],
-           verbs: &["get", "list", "watch", "create", "delete"], check_verb: None },
-    Rule { group: "snapshot.storage.k8s.io", resources: &["volumesnapshotcontents"],
-           verbs: &["get", "list", "watch", "create", "delete"], check_verb: Some("create") },
-    Rule { group: "snapshot.storage.k8s.io", resources: &["volumesnapshotclasses"],
-           verbs: &["get", "list"], check_verb: Some("get") },
+    Rule {
+        group: "snapshot.storage.k8s.io",
+        resources: &["volumesnapshots"],
+        verbs: &["get", "list", "watch", "create", "delete"],
+        check_verb: None,
+    },
+    Rule {
+        group: "snapshot.storage.k8s.io",
+        resources: &["volumesnapshotcontents"],
+        verbs: &["get", "list", "watch", "create", "delete"],
+        check_verb: Some("create"),
+    },
+    Rule {
+        group: "snapshot.storage.k8s.io",
+        resources: &["volumesnapshotclasses"],
+        verbs: &["get", "list"],
+        check_verb: Some("get"),
+    },
     // Storage API: seed materialization reads the class to fail fast on a
     // cluster with no snapshot-capable storage.
-    Rule { group: "storage.k8s.io", resources: &["storageclasses"],
-           verbs: &["get", "list"], check_verb: Some("get") },
+    Rule {
+        group: "storage.k8s.io",
+        resources: &["storageclasses"],
+        verbs: &["get", "list"],
+        check_verb: Some("get"),
+    },
 ];
 
 /// Render [`RUN_RULES`] as ClusterRole `rules` JSON.
 fn render_run_rules() -> Vec<serde_json::Value> {
     RUN_RULES
         .iter()
-        .map(|r| {
-            json!({ "apiGroups": [r.group], "resources": r.resources, "verbs": r.verbs })
-        })
+        .map(|r| json!({ "apiGroups": [r.group], "resources": r.resources, "verbs": r.verbs }))
         .collect()
 }
 
@@ -159,7 +216,9 @@ pub(crate) async fn check_access(client: &kube::Client) -> Result<Vec<String>, k
     let api: Api<SelfSubjectAccessReview> = Api::all(client.clone());
     let mut missing = Vec::new();
     for rule in RUN_RULES {
-        let Some(verb) = rule.check_verb else { continue };
+        let Some(verb) = rule.check_verb else {
+            continue;
+        };
         let resource = rule.resources[0];
         let review = SelfSubjectAccessReview {
             spec: SelfSubjectAccessReviewSpec {
@@ -175,7 +234,11 @@ pub(crate) async fn check_access(client: &kube::Client) -> Result<Vec<String>, k
         };
         let resp = api.create(&PostParams::default(), &review).await?;
         if !resp.status.map(|s| s.allowed).unwrap_or(false) {
-            let group = if rule.group.is_empty() { "core" } else { rule.group };
+            let group = if rule.group.is_empty() {
+                "core"
+            } else {
+                rule.group
+            };
             missing.push(format!("{verb} {resource} ({group})"));
         }
     }
@@ -243,7 +306,9 @@ impl Provider for RunIdentityProvider {
         Api::<ServiceAccount>::namespaced(cx.client.clone(), RUN_NAMESPACE)
             .patch(RUN_SERVICE_ACCOUNT, &params, &Patch::Apply(&sa))
             .await
-            .map_err(|e| ResourceError::Provision(format!("apply SA {RUN_SERVICE_ACCOUNT}: {e}")))?;
+            .map_err(|e| {
+                ResourceError::Provision(format!("apply SA {RUN_SERVICE_ACCOUNT}: {e}"))
+            })?;
 
         let role: ClusterRole = serde_json::from_value(json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -258,7 +323,9 @@ impl Provider for RunIdentityProvider {
         Api::<ClusterRole>::all(cx.client.clone())
             .patch(RUN_CLUSTER_ROLE, &params, &Patch::Apply(&role))
             .await
-            .map_err(|e| ResourceError::Provision(format!("apply ClusterRole {RUN_CLUSTER_ROLE}: {e}")))?;
+            .map_err(|e| {
+                ResourceError::Provision(format!("apply ClusterRole {RUN_CLUSTER_ROLE}: {e}"))
+            })?;
 
         let crb: ClusterRoleBinding = serde_json::from_value(json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -271,7 +338,11 @@ impl Provider for RunIdentityProvider {
         Api::<ClusterRoleBinding>::all(cx.client.clone())
             .patch(RUN_CLUSTER_ROLE, &params, &Patch::Apply(&crb))
             .await
-            .map_err(|e| ResourceError::Provision(format!("apply ClusterRoleBinding {RUN_CLUSTER_ROLE}: {e}")))?;
+            .map_err(|e| {
+                ResourceError::Provision(format!(
+                    "apply ClusterRoleBinding {RUN_CLUSTER_ROLE}: {e}"
+                ))
+            })?;
 
         // Bound token Secret: `oc create token` is short-lived on 4.11+, so a
         // typed service-account-token Secret gives a stable workstation/CI
@@ -290,7 +361,9 @@ impl Provider for RunIdentityProvider {
         Api::<Secret>::namespaced(cx.client.clone(), RUN_NAMESPACE)
             .patch(RUN_TOKEN_SECRET, &params, &Patch::Apply(&secret))
             .await
-            .map_err(|e| ResourceError::Provision(format!("apply Secret {RUN_TOKEN_SECRET}: {e}")))?;
+            .map_err(|e| {
+                ResourceError::Provision(format!("apply Secret {RUN_TOKEN_SECRET}: {e}"))
+            })?;
 
         Ok(())
     }
@@ -347,10 +420,16 @@ impl Provider for SccGrantProvider {
 
 // ── RegistryProject (OpenShift) ───────────────────────────────────────
 
-/// The `ztest-images` project's pull/push RBAC: any pod may pull the dev
-/// image (group `system:image-puller`), the run SA may push it
-/// (`system:image-pusher`). The namespace itself is a separate scaffolding
-/// node; this provider owns only the bindings.
+/// The `ztest-images` project's pull/push RBAC. Pulls are **anonymous**: the
+/// puller role is bound to `system:unauthenticated` so any in-cluster pod pulls
+/// the dev images with *no credential at all* — no pull secret, no SA token,
+/// nothing that can expire. The registry holds only ephemeral, content-addressed
+/// test images on a private single-user cluster, so authenticating pulls buys
+/// nothing and its one failure mode (a stale SA dockercfg token → 401) is exactly
+/// what bit us. Push stays authenticated: the run SA (`system:image-pusher` +
+/// imagestream create) pushes via the external route with the kubeconfig token.
+/// The namespace itself is a separate scaffolding node; this provider owns only
+/// the bindings.
 #[derive(Debug)]
 pub(crate) struct RegistryProjectProvider;
 
@@ -387,17 +466,31 @@ impl Provider for RegistryProjectProvider {
         let params = PatchParams::apply(FIELD_MANAGER).force();
         let api: Api<RoleBinding> = Api::namespaced(cx.client.clone(), IMAGES_NAMESPACE);
 
+        // Scoped as tightly as anonymous pull allows: the *only* subject is
+        // `system:unauthenticated`, and the role is the read-only `system:image-puller`
+        // bound to this one namespace (ztest-images) — not cluster-wide, not write, not
+        // sensitive. It grants exactly one capability: pull the ephemeral,
+        // content-addressed test images with no credential. This is a deliberate,
+        // reviewed trade-off (there is no per-SA-token path that avoids the token-expiry
+        // failure this replaces); acceptable because the images carry no secrets, the
+        // registry service is in-cluster only, and the cluster is single-tenant. If this
+        // is ever run on a shared/multi-tenant cluster, revisit: bind the run SA and
+        // provision a pull secret from the maintained `ztest-token` instead.
         let pullers: RoleBinding = serde_json::from_value(json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "RoleBinding",
             "metadata": { "name": "ztest-image-pullers", "namespace": IMAGES_NAMESPACE },
             "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:image-puller" },
-            "subjects": [{ "apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": "system:serviceaccounts" }],
+            "subjects": [
+                { "apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": "system:unauthenticated" },
+            ],
         }))
         .expect("static RoleBinding manifest is valid");
         api.patch("ztest-image-pullers", &params, &Patch::Apply(&pullers))
             .await
-            .map_err(|e| ResourceError::Provision(format!("apply RoleBinding ztest-image-pullers: {e}")))?;
+            .map_err(|e| {
+                ResourceError::Provision(format!("apply RoleBinding ztest-image-pullers: {e}"))
+            })?;
 
         // Push role. `system:image-pusher` only grants imagestreams/layers,
         // so the first push of a never-seen image (which must *create* the
@@ -417,7 +510,11 @@ impl Provider for RegistryProjectProvider {
         Api::<ClusterRole>::all(cx.client.clone())
             .patch(IMAGE_PUSH_CLUSTER_ROLE, &params, &Patch::Apply(&push_role))
             .await
-            .map_err(|e| ResourceError::Provision(format!("apply ClusterRole {IMAGE_PUSH_CLUSTER_ROLE}: {e}")))?;
+            .map_err(|e| {
+                ResourceError::Provision(format!(
+                    "apply ClusterRole {IMAGE_PUSH_CLUSTER_ROLE}: {e}"
+                ))
+            })?;
 
         let pusher: RoleBinding = serde_json::from_value(json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -429,11 +526,15 @@ impl Provider for RegistryProjectProvider {
         .expect("static RoleBinding manifest is valid");
         api.patch(IMAGE_PUSH_BINDING, &params, &Patch::Apply(&pusher))
             .await
-            .map_err(|e| ResourceError::Provision(format!("apply RoleBinding {IMAGE_PUSH_BINDING}: {e}")))?;
+            .map_err(|e| {
+                ResourceError::Provision(format!("apply RoleBinding {IMAGE_PUSH_BINDING}: {e}"))
+            })?;
 
         // Remove the superseded pusher binding (its immutable roleRef can't be
         // upgraded in place). Best-effort: absent is the desired end state.
-        let _ = api.delete(LEGACY_IMAGE_PUSH_BINDING, &Default::default()).await;
+        let _ = api
+            .delete(LEGACY_IMAGE_PUSH_BINDING, &Default::default())
+            .await;
 
         Ok(())
     }
@@ -482,7 +583,10 @@ mod tests {
             grants("storage.k8s.io", "storageclasses"),
             "materialize reads the storage class"
         );
-        assert!(grants("", "pods/attach"), "seed uploader streams via attach");
+        assert!(
+            grants("", "pods/attach"),
+            "seed uploader streams via attach"
+        );
     }
 
     #[test]

@@ -373,6 +373,55 @@ pub fn pull_secret() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// Env var carrying the laptop preflight's resolved dev-image references as a
+/// JSON `{spec_key: pull_reference}` map. `engine::pod_runner` sets it on every
+/// remote runner pod so an in-pod test resolves its component images to the
+/// already-built-and-pushed reference via [`resolve`] instead of recomputing the
+/// content hash — which it cannot, since the baked runner image carries no
+/// Dockerfile/context. Unset on the laptop and for local kind (source is mounted
+/// there), where [`resolve`] takes its normal hash-and-probe path.
+pub const IMAGE_REFS_ENV: &str = "ZTEST_IMAGE_REFS";
+
+/// Stable identity of a `Dev` image over everything that selects it *except* the
+/// build-context bytes: repo, features, toolchain, and the source's origin. Unlike
+/// [`dev_tag`], it reads no files, so the laptop (which has the context) and an
+/// in-pod test (which does not) derive the same key from identical inputs and so
+/// agree on the [`IMAGE_REFS_ENV`] reference.
+pub fn spec_key(
+    source: &DevSource,
+    features: &[String],
+    repo: &str,
+    rust_version: Option<&str>,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(repo.as_bytes());
+    h.update([0]);
+    for f in features {
+        h.update(f.as_bytes());
+        h.update(b",");
+    }
+    h.update([0]);
+    if let Some(rv) = rust_version {
+        h.update(rv.as_bytes());
+    }
+    h.update([0]);
+    h.update(source.describe().as_bytes());
+    hex::encode(&h.finalize()[..12])
+}
+
+/// Parsed [`IMAGE_REFS_ENV`], read once. Empty when the var is unset (laptop /
+/// local kind) or unparseable.
+fn prebuilt_refs() -> &'static std::collections::BTreeMap<String, String> {
+    use std::sync::OnceLock;
+    static REFS: OnceLock<std::collections::BTreeMap<String, String>> = OnceLock::new();
+    REFS.get_or_init(|| {
+        std::env::var(IMAGE_REFS_ENV)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    })
+}
+
 /// Resolve an [`ImageSpec`] to the string that goes into a pod manifest.
 ///
 /// [`ImageSpec::Published`] is the *default* image: the `default_published`
@@ -394,6 +443,17 @@ pub fn resolve(spec: &ImageSpec, default_published: &str) -> Result<ResolvedImag
             repo,
             rust_version,
         } => {
+            // Remote pod execution: the laptop preflight already resolved and
+            // pushed this image and handed the reference in via IMAGE_REFS_ENV.
+            // Short-circuit before touching the source — the baked runner image
+            // has no Dockerfile/context to hash, and `Distribution::from_env` is
+            // unset in-pod, so the laptop-computed reference is authoritative.
+            let key = spec_key(source, features, repo, rust_version.as_deref());
+            if let Some(reference) = prebuilt_refs().get(&key) {
+                return Ok(ResolvedImage {
+                    image: reference.clone(),
+                });
+            }
             let suffix = source.tag_suffix(features, rust_version.as_deref())?;
             let local_tag = format!("{repo}:dev-{suffix}");
             let dist = Distribution::from_env();
@@ -491,7 +551,10 @@ impl std::fmt::Display for ImageError {
             }
             ImageError::Spawn { cmd, err } => write!(f, "image build: spawn {cmd}: {err}"),
             ImageError::GitFetch { rev, stderr_tail } => {
-                write!(f, "image build: git fetch of rev {rev} failed:\n{stderr_tail}")
+                write!(
+                    f,
+                    "image build: git fetch of rev {rev} failed:\n{stderr_tail}"
+                )
             }
             ImageError::DevImageMissing { tag, source } => write!(
                 f,
@@ -518,7 +581,17 @@ fn hash_context(
     for entry in walkdir::WalkDir::new(context)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !is_ignored(e.path()))
+        // Ignore build-output dirs *within* the context — matched on the path
+        // relative to the context root, not the absolute path. The runner-image
+        // context itself lives under `<workspace>/target/.ztest-runner-ctx`, so
+        // matching the absolute path would treat every staged file as ignored and
+        // collapse the hash to a constant (a stale-tag/stale-image bug).
+        .filter_entry(|e| {
+            e.path()
+                .strip_prefix(context)
+                .map(|rel| !is_ignored(rel))
+                .unwrap_or(true)
+        })
     {
         let entry = entry.map_err(|e| ImageError::Walk(e.to_string()))?;
         if !entry.file_type().is_file() {
@@ -718,6 +791,7 @@ pub fn buildx_oci_argv(
     tag: &str,
     dest_tar: &Path,
     rust_version: Option<&str>,
+    build_contexts: &[(String, String)],
 ) -> Vec<String> {
     let mut argv = vec![
         "buildx".to_string(),
@@ -731,6 +805,13 @@ pub fn buildx_oci_argv(
         "--output".to_string(),
         format!("type=oci,dest={}", dest_tar.display()),
     ];
+    // Pin a `FROM <name>` to a locally-supplied source (e.g. an oci-layout of the
+    // nix runner base) so buildx resolves it without a registry pull — the
+    // isolated `docker-container` builder can't see the local docker daemon.
+    for (name, source) in build_contexts {
+        argv.push("--build-context".to_string());
+        argv.push(format!("{name}={source}"));
+    }
     if let Some(rv) = build_arg_rust_version(rust_version, context) {
         argv.push("--build-arg".to_string());
         argv.push(format!("RUST_VERSION={rv}"));
@@ -984,7 +1065,10 @@ mod tests {
     fn differing_rust_version_forks_the_tag() {
         let df = "FROM scratch\nCOPY main.rs /\n";
         let a = Ctx::new(df, "main.rs", b"fn main() {}");
-        assert_ne!(a.tag_rust(&[], Some("1.88")), a.tag_rust(&[], Some("1.91.0")));
+        assert_ne!(
+            a.tag_rust(&[], Some("1.88")),
+            a.tag_rust(&[], Some("1.91.0"))
+        );
         assert_ne!(a.tag_rust(&[], None), a.tag_rust(&[], Some("1.91.0")));
     }
 
@@ -1097,7 +1181,9 @@ mod tests {
         );
         assert_eq!(
             d.push_reference("zainod:dev-abc123").as_deref(),
-            Some("default-route-openshift-image-registry.apps-crc.testing/ztest-images/zainod:dev-abc123")
+            Some(
+                "default-route-openshift-image-registry.apps-crc.testing/ztest-images/zainod:dev-abc123"
+            )
         );
     }
 
@@ -1108,6 +1194,86 @@ mod tests {
         let r = Distribution::Registry {
             base: "ghcr.io/z".into(),
         };
-        assert_eq!(r.push_reference("x:dev-1").as_deref(), Some("ghcr.io/z/x:dev-1"));
+        assert_eq!(
+            r.push_reference("x:dev-1").as_deref(),
+            Some("ghcr.io/z/x:dev-1")
+        );
+    }
+
+    /// `spec_key` reads no files, is stable, and separates images that differ in
+    /// any tag-selecting dimension — so the laptop and an in-pod test (which
+    /// cannot hash the missing context) agree on the same [`IMAGE_REFS_ENV`] key.
+    #[test]
+    fn spec_key_is_file_free_and_discriminating() {
+        let src = DevSource::Local {
+            dockerfile: PathBuf::from("/nonexistent/Dockerfile"),
+            context: PathBuf::from("/nonexistent"),
+        };
+        let base = spec_key(&src, &["a".into()], "zainod", None);
+        // Deterministic across calls with no filesystem access.
+        assert_eq!(base, spec_key(&src, &["a".into()], "zainod", None));
+        // Every selecting dimension changes the key.
+        assert_ne!(base, spec_key(&src, &["b".into()], "zainod", None));
+        assert_ne!(base, spec_key(&src, &["a".into()], "zebrad", None));
+        assert_ne!(base, spec_key(&src, &["a".into()], "zainod", Some("1.90")));
+    }
+
+    /// The runner-image context lives under `<workspace>/target/.ztest-runner-ctx`.
+    /// `hash_context` must still hash the files inside it: `is_ignored` is matched
+    /// on the path *relative to the context root*, so a `target` component *above*
+    /// the context doesn't collapse the hash to a constant — the bug that froze the
+    /// runner-image tag and silently reused a stale image baked from old binaries.
+    #[test]
+    fn hash_reacts_to_files_under_a_target_context() {
+        let n = SEQ_HASH.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ztest-ctxhash-{}-{n}", std::process::id()));
+        let ctx = root.join("target").join(".ztest-runner-ctx");
+        std::fs::create_dir_all(ctx.join("deps")).unwrap();
+        let df = root.join("Dockerfile");
+        std::fs::write(&df, "FROM base\nCOPY . /out\n").unwrap();
+        let src = DevSource::Local {
+            dockerfile: df.clone(),
+            context: ctx.clone(),
+        };
+        let bin = ctx.join("deps").join("fetch_service-abc");
+
+        std::fs::write(&bin, b"BINARY-V1").unwrap();
+        let tag1 = dev_tag(&src, &[], "ztest-runner", None).unwrap();
+        std::fs::write(&bin, b"BINARY-V2-different").unwrap();
+        let tag2 = dev_tag(&src, &[], "ztest-runner", None).unwrap();
+
+        // A nested `target/` *inside* the context is still ignored.
+        std::fs::create_dir_all(ctx.join("target")).unwrap();
+        std::fs::write(ctx.join("target").join("junk"), b"ignore me").unwrap();
+        let tag3 = dev_tag(&src, &[], "ztest-runner", None).unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert_ne!(tag1, tag2, "changing a staged binary must change the tag");
+        assert_eq!(
+            tag2, tag3,
+            "a nested target/ inside the context stays ignored"
+        );
+    }
+
+    static SEQ_HASH: AtomicU32 = AtomicU32::new(0);
+
+    /// A JSON `{spec_key: reference}` map round-trips through the exact shape
+    /// `prebuilt_refs` parses out of [`IMAGE_REFS_ENV`], and the key computed
+    /// in-pod hits it.
+    #[test]
+    fn image_refs_map_round_trips_and_looks_up() {
+        let src = DevSource::Local {
+            dockerfile: PathBuf::from("/x/Dockerfile"),
+            context: PathBuf::from("/x"),
+        };
+        let key = spec_key(&src, &[], "zainod", None);
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(key.clone(), "reg.svc:5000/ns/zainod:dev-abc".to_string());
+        let json = serde_json::to_string(&map).unwrap();
+        let back: std::collections::BTreeMap<String, String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.get(&key).map(String::as_str),
+            Some("reg.svc:5000/ns/zainod:dev-abc")
+        );
     }
 }

@@ -10,10 +10,10 @@
 //! [`WalletBackend`](crate::handles::wallet::WalletBackend) trait keeps the
 //! door open for further in-process wallet impls.
 pub(crate) mod image;
-pub(crate) mod oci;
 #[cfg(feature = "librustzcash")]
 pub mod librustzcash;
 pub mod lightwalletd;
+pub(crate) mod oci;
 pub mod zainod;
 pub mod zcashd;
 pub mod zebra;

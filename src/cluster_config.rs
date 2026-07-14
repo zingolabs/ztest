@@ -133,17 +133,26 @@ pub const REGISTRY_EXTENSION: &str = "ztest.io/registry";
 /// both by `cluster add` (to derive a profile from a shipped kubeconfig) and by
 /// the in-process registry push (to authenticate with the same credentials the
 /// kube client uses).
-pub fn read_material(kubeconfig: Option<&Path>, context: Option<&str>) -> Result<KubeMaterial, String> {
+pub fn read_material(
+    kubeconfig: Option<&Path>,
+    context: Option<&str>,
+) -> Result<KubeMaterial, String> {
     let path = resolve_kubeconfig_path(kubeconfig)?;
     let dir = path.parent().unwrap_or(Path::new("."));
-    let body = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let body =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let raw: RawKubeconfig =
         serde_yaml::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?;
 
     let ctx_name = context
         .map(str::to_string)
         .or_else(|| raw.current_context.clone())
-        .ok_or_else(|| format!("{}: no context given and no current-context", path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "{}: no context given and no current-context",
+                path.display()
+            )
+        })?;
     let ctx = raw
         .contexts
         .iter()
@@ -189,7 +198,9 @@ fn resolve_kubeconfig_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
         let first = std::env::split_paths(&kc).next().unwrap_or_default();
         return Ok(first);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("HOME unset")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("HOME unset")?;
     Ok(home.join(".kube").join("config"))
 }
 
@@ -208,7 +219,8 @@ fn resolve_token(user: &RawUser, dir: &Path) -> Result<Option<String>, String> {
     }
     if let Some(file) = &user.token_file {
         let p = rel_to(dir, file);
-        let t = std::fs::read_to_string(&p).map_err(|e| format!("read tokenFile {}: {e}", p.display()))?;
+        let t = std::fs::read_to_string(&p)
+            .map_err(|e| format!("read tokenFile {}: {e}", p.display()))?;
         return Ok(Some(t.trim().to_string()));
     }
     Ok(None)
@@ -223,14 +235,19 @@ fn resolve_ca(cluster: &RawCluster, dir: &Path) -> Result<Option<Vec<u8>>, Strin
     }
     if let Some(file) = &cluster.ca_file {
         let p = rel_to(dir, file);
-        let pem = std::fs::read(&p).map_err(|e| format!("read certificate-authority {}: {e}", p.display()))?;
+        let pem = std::fs::read(&p)
+            .map_err(|e| format!("read certificate-authority {}: {e}", p.display()))?;
         return Ok(Some(pem));
     }
     Ok(None)
 }
 
 fn extract_registry(cluster: &RawCluster) -> Result<Option<RegistrySpec>, String> {
-    let Some(ext) = cluster.extensions.iter().find(|e| e.name == REGISTRY_EXTENSION) else {
+    let Some(ext) = cluster
+        .extensions
+        .iter()
+        .find(|e| e.name == REGISTRY_EXTENSION)
+    else {
         return Ok(None);
     };
     let spec: RegistrySpec = serde_yaml::from_value(ext.extension.clone())
@@ -325,7 +342,9 @@ pub fn config_path() -> PathBuf {
     if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         PathBuf::from(x).join("ztest").join("clusters.toml")
     } else {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
         home.join(".config").join("ztest").join("clusters.toml")
     }
 }
@@ -410,7 +429,10 @@ pub unsafe fn activate(flag: Option<&str>) -> Result<Option<String>, String> {
 /// their own fallback. Lets the kind-cluster resolver follow wherever kubectl is
 /// pointed instead of a hardcoded default.
 pub fn active_context() -> Option<String> {
-    if let Some(ctx) = std::env::var(KUBE_CONTEXT_ENV).ok().filter(|s| !s.is_empty()) {
+    if let Some(ctx) = std::env::var(KUBE_CONTEXT_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         return Some(ctx);
     }
     if crate::cluster::in_cluster() {
@@ -427,7 +449,11 @@ fn verify_context(context: &str) -> Result<(), String> {
     }
     let kubeconfig = kube::config::Kubeconfig::read()
         .map_err(|e| format!("reading kubeconfig to verify context `{context}`: {e}"))?;
-    let known: Vec<&str> = kubeconfig.contexts.iter().map(|c| c.name.as_str()).collect();
+    let known: Vec<&str> = kubeconfig
+        .contexts
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     if known.iter().any(|n| *n == context) {
         return Ok(());
     }

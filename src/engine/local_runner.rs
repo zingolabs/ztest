@@ -10,6 +10,8 @@
 //! per-test start times), so this module only handles the hard cap.
 
 use std::ffi::OsString;
+use std::future::Future;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -18,6 +20,34 @@ use tokio::io::AsyncReadExt;
 use crate::cancel::Cancel;
 use crate::engine::events::Verdict;
 use crate::engine::plan::WorkItem;
+
+/// A `'static` boxed future of one test's outcome — the unit the run loop
+/// awaits, independent of how the test was executed.
+pub type OutcomeFuture = Pin<Box<dyn Future<Output = TestOutcome> + Send + 'static>>;
+
+/// How a single test is executed. The run loop is agnostic to this: it only
+/// needs a [`TestOutcome`] back. [`LocalExecutor`] forks a child process (the
+/// default, and the only executor on local/kind runs); a remote executor runs
+/// the test in a sibling pod so both the compute and the test are hermetic.
+pub trait Executor: Send + Sync + 'static {
+    fn run(&self, item: WorkItem, cancel: Cancel) -> OutcomeFuture;
+}
+
+/// Executes each test as a local OS child process via [`spawn_test`].
+#[derive(Debug, Clone)]
+pub struct LocalExecutor {
+    pub env: EngineEnv,
+}
+
+impl Executor for LocalExecutor {
+    fn run(&self, item: WorkItem, cancel: Cancel) -> OutcomeFuture {
+        let env = self.env.clone();
+        Box::pin(async move {
+            let cap = item.hard_cap;
+            spawn_test(&item, &env, cap, &cancel).await
+        })
+    }
+}
 
 /// Per-run environment shared by every child, computed once.
 #[derive(Debug, Clone)]
@@ -139,9 +169,10 @@ fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
         .env("NEXTEST_EXECUTION_MODE", "process-per-test")
         .env("NEXTEST_RUN_ID", &env.run_id)
         .env("CARGO_MANIFEST_DIR", &item.cwd)
-        // Parent owns QoS admission, so disable the in-test gate (cluster::qos_enabled
-        // treats "0" as off; set explicitly to override any inherited "1").
-        .env("ZTEST_QOS", "0")
+        // Mark the child as orchestrated: the parent owns capacity admission,
+        // and a `TestEnv` refuses to provision outside a `ztest run`
+        // (cluster::require_orchestrator).
+        .env("ZTEST_ENGINE", "1")
         .env("ZTEST_SA", &env.sa);
     if env.no_cleanup {
         std_cmd.env("ZTEST_NO_CLEANUP", "1");
@@ -282,15 +313,15 @@ mod tests {
         );
     }
 
-    /// Children must run with the in-test k8s admission gate OFF (the parent owns
-    /// admission). If `ZTEST_QOS` regressed to "1" or got dropped, every child
-    /// would create a reservation Lease and leak it, so assert the child actually
-    /// sees `ZTEST_QOS=0`. This is what keeps `kubectl get leases -n ztest-qos` empty.
+    /// Children must run marked as orchestrated so `TestEnv::build` proceeds
+    /// (a bare test binary is refused by `cluster::require_orchestrator`). If
+    /// `ZTEST_ENGINE` regressed or got dropped, every cluster test would fail
+    /// fast, so assert the child actually sees `ZTEST_ENGINE=1`.
     #[cfg(unix)]
     #[tokio::test]
-    async fn children_run_with_qos_admission_disabled() {
+    async fn children_run_marked_as_orchestrated() {
         let _g = serial().lock().await;
-        let p = script("qosenv", "printf 'QOS=[%s]\\n' \"$ZTEST_QOS\"");
+        let p = script("engineenv", "printf 'ENGINE=[%s]\\n' \"$ZTEST_ENGINE\"");
         let out = spawn_test(
             &item(p.to_str().unwrap(), "x"),
             &env(),
@@ -301,8 +332,8 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         assert_eq!(out.verdict, Verdict::Pass);
         assert!(
-            String::from_utf8_lossy(&out.output).contains("QOS=[0]"),
-            "children must inherit ZTEST_QOS=0; got {:?}",
+            String::from_utf8_lossy(&out.output).contains("ENGINE=[1]"),
+            "children must inherit ZTEST_ENGINE=1; got {:?}",
             String::from_utf8_lossy(&out.output)
         );
     }

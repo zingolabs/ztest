@@ -20,7 +20,7 @@ use crate::cancel::Cancel;
 use crate::engine::events::{
     CancelReason, RunReporter, RunStats, RunningView, SkipReason, TestEvent, Verdict,
 };
-use crate::engine::exec::TestOutcome;
+use crate::engine::local_runner::TestOutcome;
 use crate::engine::panel::{live_snapshot, run_progress};
 use crate::engine::plan::WorkItem;
 use crate::preflight::RunProgress;
@@ -1319,7 +1319,15 @@ mod tests {
         let terminated = rep
             .events
             .iter()
-            .filter(|e| matches!(e, Ev::Finished { verdict: Verdict::Terminated, .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    Ev::Finished {
+                        verdict: Verdict::Terminated,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(terminated, 2, "each in-flight test reports terminated");
         assert!(matches!(rep.events.last(), Some(Ev::RunFinished { .. })));

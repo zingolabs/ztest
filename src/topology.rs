@@ -454,7 +454,10 @@ mod tests {
         // ZEBRAD_NU6_3_RELEASE) and zaino 0.4.3-ironwood.1 (>= ZAINO_NU6_3_RELEASE).
         // zcashd has no NU6.3 support, so it stays below.
         assert_eq!(zebrad_ceiling(parse("6.0.0-rc.0")), NetworkUpgrade::Nu6_3);
-        assert_eq!(zaino_ceiling(parse("0.4.3-ironwood.1")), NetworkUpgrade::Nu6_3);
+        assert_eq!(
+            zaino_ceiling(parse("0.4.3-ironwood.1")),
+            NetworkUpgrade::Nu6_3
+        );
         assert!(zcashd_ceiling(parse("6.20.0")) < NetworkUpgrade::Nu6_3);
     }
 

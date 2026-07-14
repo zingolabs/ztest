@@ -89,16 +89,75 @@ pub(crate) fn no_cleanup_requested() -> bool {
     std::env::var_os("ZTEST_NO_CLEANUP").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// Whether QoS admission is enabled for this run. Set by `ztest run` (which has
-/// done the cluster probe, or is talking to a QoS-provisioned cluster) as the
-/// `ZTEST_QOS` env var, forwarded by nextest to every test binary. When absent
-/// (a developer running `cargo nextest run` directly, often against a kind
-/// cluster with no NVMe nodes) `TestEnv::build()` skips admission and NVMe
-/// placement entirely, behaving as before QoS existed (graceful degradation,
-/// `docs/qos-design.md` §5.1). Any non-empty, non-`"0"` value counts as set,
-/// mirroring [`no_cleanup_requested`].
-pub(crate) fn qos_enabled() -> bool {
-    std::env::var_os("ZTEST_QOS").is_some_and(|v| !v.is_empty() && v != "0")
+/// Whether this test process is running under the `ztest run` orchestrator,
+/// signalled by the `ZTEST_ENGINE` env var the engine sets on every test child
+/// (`src/engine/{local,pod}_runner.rs`). A `TestEnv` provisions cluster pods
+/// against a capacity budget the orchestrator's scheduler owns; running a test
+/// binary directly (`cargo test`/`cargo nextest`) has no scheduler, so there is
+/// no admission, no NVMe-pool probe, and no capacity accounting — see
+/// [`require_orchestrator`].
+fn orchestrated() -> bool {
+    std::env::var_os("ZTEST_ENGINE").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Fail fast unless running under the `ztest run` orchestrator.
+///
+/// [`TestEnv::build`](crate::TestEnv::build) creates a namespace, Guaranteed
+/// pods sized against the tier budget, and a `ResourceQuota` — all of which the
+/// orchestrator's scheduler admits against shared cluster capacity. A bare
+/// `cargo test`/`cargo nextest` has no scheduler, so it would create unbudgeted
+/// pods against whatever kubeconfig is loaded. Refuse with a clear pointer
+/// rather than silently doing that.
+pub(crate) fn require_orchestrator() -> Result<(), crate::EnvError> {
+    if orchestrated() {
+        return Ok(());
+    }
+    Err(crate::EnvError::Config {
+        reason: format!(
+            "this test provisions a cluster environment and must run under the ztest \
+             orchestrator. Run it with:\n    ztest run -- {}\n(running the test binary directly \
+             via `cargo test`/`cargo nextest` is not supported for cluster tests).",
+            crate::naming::current_test_name(),
+        ),
+    })
+}
+
+/// Apply a namespace-scoped [`ResourceQuota`] capping aggregate `requests` at
+/// `footprint` (and pod count at `pods`): an API-server-enforced backstop to
+/// the orchestrator's soft admission. Idempotent (a 409 from a GC-lagged prior
+/// run counts as success). Requests-scoped, so it never rejects a pod the
+/// scheduler legitimately admitted; the namespace delete cascades it, so there
+/// is no separate teardown.
+pub async fn apply_resource_quota(
+    client: &Client,
+    namespace: &str,
+    footprint: crate::qos::Resources,
+    pods: usize,
+) -> Result<(), kube::Error> {
+    use k8s_openapi::api::core::v1::ResourceQuota;
+    let api: Api<ResourceQuota> = Api::namespaced(client.clone(), namespace);
+    let quota: ResourceQuota = serde_json::from_value(resource_quota_manifest(footprint, pods))
+        .map_err(kube::Error::SerdeError)?;
+    match api.create(&PostParams::default(), &quota).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The `ResourceQuota` manifest for [`apply_resource_quota`]. Pure so the
+/// rendered `hard` fields are unit-testable without a cluster.
+fn resource_quota_manifest(footprint: crate::qos::Resources, pods: usize) -> serde_json::Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": { "name": "ztest-tier" },
+        "spec": { "hard": {
+            "requests.cpu": format!("{}m", footprint.cpu_milli),
+            "requests.memory": footprint.mem_bytes.to_string(),
+            "pods": pods.to_string(),
+        } },
+    })
 }
 
 /// Create the per-test namespace. Idempotent: a 409 (namespace already exists,
@@ -242,5 +301,24 @@ pub async fn create_pod_service(
         Ok(_) => Ok(()),
         Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resource_quota_manifest;
+    use crate::qos::{GIB, QosClass};
+
+    #[test]
+    fn quota_manifest_caps_requests_and_pods_at_the_deployed_footprint() {
+        // Wallet tier (4c / 1 GiB) split across 2 pods → 2 cores each, so the
+        // deployed footprint is 4 cores / 1 GiB across 2 pods.
+        let fp = QosClass::Wallet.profile().footprint;
+        let m = resource_quota_manifest(fp, 2);
+        let hard = &m["spec"]["hard"];
+        assert_eq!(hard["requests.cpu"], "4000m");
+        assert_eq!(hard["requests.memory"], (GIB).to_string());
+        assert_eq!(hard["pods"], "2");
+        assert_eq!(m["metadata"]["name"], "ztest-tier");
     }
 }

@@ -89,9 +89,7 @@ pub fn execute(args: Args) -> ExitCode {
 fn list() -> Result<(), String> {
     let cfg = cluster_config::load()?;
     if cfg.clusters.is_empty() {
-        println!(
-            "no cluster profiles. Add one:\n  ztest cluster add zkn --kind"
-        );
+        println!("no cluster profiles. Add one:\n  ztest cluster add zkn --kind");
         return Ok(());
     }
     for (name, profile) in &cfg.clusters {
@@ -164,7 +162,10 @@ fn add(a: AddArgs) -> Result<(), String> {
 
     let mut cfg = cluster_config::load()?;
     let first = cfg.clusters.is_empty();
-    let existed = cfg.clusters.insert(a.name.clone(), profile.clone()).is_some();
+    let existed = cfg
+        .clusters
+        .insert(a.name.clone(), profile.clone())
+        .is_some();
     // The first profile becomes the default even without --set-default: with a
     // single profile there is no ambiguity, and it saves a second command.
     if a.set_default || first {
@@ -183,10 +184,7 @@ fn add(a: AddArgs) -> Result<(), String> {
 fn set(name: String) -> Result<(), String> {
     let mut cfg = cluster_config::load()?;
     if !cfg.clusters.contains_key(&name) {
-        return Err(format!(
-            "no profile `{name}`. Known: {}",
-            known(&cfg)
-        ));
+        return Err(format!("no profile `{name}`. Known: {}", known(&cfg)));
     }
     cfg.current = Some(name.clone());
     cfg.save()?;

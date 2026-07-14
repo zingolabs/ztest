@@ -132,7 +132,10 @@ pub async fn mint_shadow_clone(
     // labels are the only handle the by-identity (Ctrl-C) and by-owner (`ztest
     // cleanup`) reapers have on it.
     let coords = crate::naming::RunCoords::from_env().ok();
-    let run_id = coords.as_ref().map(|c| c.run_id.clone()).unwrap_or_default();
+    let run_id = coords
+        .as_ref()
+        .map(|c| c.run_id.clone())
+        .unwrap_or_default();
     let user = coords
         .as_ref()
         .map(|c| crate::naming::slug(&c.user, crate::naming::DNS_LABEL_MAX))

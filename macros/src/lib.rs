@@ -252,7 +252,16 @@ pub fn dev(input: TokenStream) -> TokenStream {
     ) {
         ("Validator", "Zebrad") => ("zebrad".to_string(), vec![]),
         ("Validator", "Zcashd") => ("zcashd".to_string(), vec![]),
-        ("Indexer", "Zainod") => ("zainod".to_string(), vec!["no_tls_use_unencrypted_traffic"]),
+        // `allow_unencrypted_public_json_rpc_bind`: pod-per-test needs zaino's
+        // JSON-RPC on 0.0.0.0 for cross-pod access; keep in sync with
+        // `component.rs::default_features_for` (the tag `spec_key` must match).
+        ("Indexer", "Zainod") => (
+            "zainod".to_string(),
+            vec![
+                "no_tls_use_unencrypted_traffic",
+                "allow_unencrypted_public_json_rpc_bind",
+            ],
+        ),
         ("Wallet", "Zingo") => ("zingo".to_string(), vec![]),
         (cat, var) => {
             return syn::Error::new(
@@ -330,7 +339,9 @@ pub fn dev(input: TokenStream) -> TokenStream {
             let url_s = url.value();
             let rev_s = rev.value();
             let df_s = dockerfile.value();
-            let ctx_s = context.map(|c| c.value()).unwrap_or_else(|| ".".to_string());
+            let ctx_s = context
+                .map(|c| c.value())
+                .unwrap_or_else(|| ".".to_string());
             (
                 quote! {
                     ::ztest::inventory::DevSourceDecl::Git {
@@ -445,7 +456,13 @@ impl Parse for DevArgs {
             let mut kw = KwArgs::default();
             kw.parse_trailing(
                 input,
-                &["context", "version", "features", "rust_version", "rust_versions"],
+                &[
+                    "context",
+                    "version",
+                    "features",
+                    "rust_version",
+                    "rust_versions",
+                ],
             )?;
             return Ok(DevArgs {
                 variant: DevVariant { category, variant },
@@ -477,11 +494,14 @@ impl Parse for DevArgs {
         let url = kw.git.ok_or_else(|| {
             syn::Error::new(variant.span(), "dev!: git form requires `git = \"<url>\"`")
         })?;
-        let rev = kw
-            .rev
-            .ok_or_else(|| syn::Error::new(variant.span(), "dev!: git form requires `rev = \"<sha>\"`"))?;
+        let rev = kw.rev.ok_or_else(|| {
+            syn::Error::new(variant.span(), "dev!: git form requires `rev = \"<sha>\"`")
+        })?;
         let dockerfile = kw.dockerfile.ok_or_else(|| {
-            syn::Error::new(variant.span(), "dev!: git form requires `dockerfile = \"<path>\"`")
+            syn::Error::new(
+                variant.span(),
+                "dev!: git form requires `dockerfile = \"<path>\"`",
+            )
         })?;
         Ok(DevArgs {
             variant: DevVariant { category, variant },
@@ -554,7 +574,10 @@ impl KwArgs {
         if !allowed.contains(&key_s.as_str()) {
             return Err(syn::Error::new(
                 key.span(),
-                format!("dev!: unexpected key `{key_s}`; allowed here: {}", allowed.join(", ")),
+                format!(
+                    "dev!: unexpected key `{key_s}`; allowed here: {}",
+                    allowed.join(", ")
+                ),
             ));
         }
         let _: Token![=] = input.parse()?;
@@ -720,9 +743,9 @@ pub fn archive(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// `#[ztest::qos::basic]` — declare a test's quality-of-service tier.
 ///
-/// The four tier attributes (`basic`, `integration`, `testnet`, `sync`) wrap
-/// a test, re-emit it intact (preserving any inner `#[tokio::test]` etc.), and
-/// inject two things — mirroring the `dev!` → inventory pattern:
+/// The tier attributes (`basic`, `wallet`, `integration`, `testnet`, `sync`)
+/// wrap a test, re-emit it intact (preserving any inner `#[tokio::test]` etc.),
+/// and inject two things — mirroring the `dev!` → inventory pattern:
 ///   1. an `inventory::submit!` of a [`ztest::inventory::QosDecl`] so
 ///      `ztest run` can group selected tests by tier (the out-of-process
 ///      bridge, dumped via `ZTEST_DUMP_INVENTORY`);
@@ -733,6 +756,12 @@ pub fn archive(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn basic(attr: TokenStream, item: TokenStream) -> TokenStream {
     qos_attr("Basic", attr, item)
+}
+
+/// `#[ztest::qos::wallet]` — see [`basic`].
+#[proc_macro_attribute]
+pub fn wallet(attr: TokenStream, item: TokenStream) -> TokenStream {
+    qos_attr("Wallet", attr, item)
 }
 
 /// `#[ztest::qos::integration]` — see [`basic`].

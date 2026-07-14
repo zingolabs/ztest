@@ -24,7 +24,7 @@ use super::{
     SnapshotRow, SnapshotStatus, TierPlan, TransferKind, TransferProgress, TransferRow, Transfers,
 };
 use crate::qos::live::LiveSnapshot;
-use crate::qos::{GIB, MIB, QosClass, Resources};
+use crate::qos::{GIB, MIB, Resources};
 
 /// Width of the action-label column, matching nextest's `{:>12}`.
 const LABEL_WIDTH: usize = 12;
@@ -365,20 +365,10 @@ fn render_future_block(out: &mut String, state: &BannerState, theme: &Theme) {
             out,
             "{INDENT}{:<width$} {dot} {}",
             row.label.style(theme.styles.dim),
-            "planned (allocator pending)".style(theme.styles.dim),
+            "planned (scheduler pending)".style(theme.styles.dim),
             width = name_col,
         )
         .expect("write to string");
-    }
-}
-
-/// The lowercase tier name shown in the scheduling block.
-fn tier_label(c: QosClass) -> &'static str {
-    match c {
-        QosClass::Basic => "basic",
-        QosClass::Integration => "integration",
-        QosClass::Testnet => "testnet",
-        QosClass::Sync => "sync",
     }
 }
 
@@ -455,7 +445,7 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
         .expect("write to string"),
     }
 
-    let name_col = column_width(plan.tiers.iter().map(|t| tier_label(t.class)), 12, 16);
+    let name_col = column_width(plan.tiers.iter().map(|t| t.class.as_label()), 12, 16);
     for TierPlan {
         class,
         count,
@@ -465,7 +455,7 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
         writeln!(
             out,
             "{INDENT}{:<width$} {} {dot} {} each",
-            tier_label(*class).style(theme.styles.dim),
+            class.as_label().style(theme.styles.dim),
             count.style(theme.styles.count),
             footprint_str(footprint),
             width = name_col,
@@ -480,7 +470,7 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
         writeln!(
             out,
             "{INDENT}{warn} {} needs {} {dot} exceeds cluster capacity — will be rejected",
-            tier_label(*class).style(theme.styles.skip),
+            class.as_label().style(theme.styles.skip),
             footprint_str(&class.profile().footprint),
         )
         .expect("write to string");
@@ -616,7 +606,7 @@ pub fn render_live_panel(
             .iter()
             .map(|t| {
                 let run = snapshot.running.get(&t.class).map(|x| x.count).unwrap_or(0);
-                format!("{} {}/{}", tier_label(t.class), run, t.count)
+                format!("{} {}/{}", t.class.as_label(), run, t.count)
             })
             .collect();
         writeln!(
@@ -845,7 +835,7 @@ fn write_transfer_row(
                         ((*done as u128 * 100) / *total as u128).min(100) as u8
                     };
                     let bar = render_progress_bar(percent, theme);
-                    writeln!(
+                    write!(
                         out,
                         "{bar} {} {dot} {} / {}",
                         format_args!("{percent}%").style(theme.styles.count),
@@ -856,6 +846,13 @@ fn write_transfer_row(
                             .style(theme.styles.count),
                     )
                     .expect("write to string");
+                    // A short qualifier after the counts (`layer 5/7`); the byte
+                    // bar already carries the primary signal, so this is dimmed.
+                    if !note.is_empty() {
+                        write!(out, " {dot} {}", note.style(theme.styles.dim))
+                            .expect("write to string");
+                    }
+                    out.push('\n');
                 }
                 None => {
                     writeln!(out, "{}", note.style(theme.styles.count)).expect("write to string");
@@ -1052,6 +1049,7 @@ fn column_width<'a>(names: impl IntoIterator<Item = &'a str>, min: usize, max: u
 mod tests {
     use super::super::*;
     use super::*;
+    use crate::qos::QosClass;
 
     fn sample_state() -> BannerState {
         BannerState {
@@ -1065,7 +1063,6 @@ mod tests {
                 capacity: crate::qos::ClusterCapacity {
                     allocatable: Resources::new(12_000, 48 * GIB),
                     requested: Resources::new(6_000, 20 * GIB),
-                    baseline: Resources::new(2_000, 8 * GIB),
                 },
             },
             build: BuildState::Ok {
@@ -1195,6 +1192,8 @@ mod tests {
         assert!(s.contains("building"), "image note:\n{s}");
         assert!(s.contains("testnet-3.1m"), "download row:\n{s}");
         assert!(s.contains('%'), "byte bar percent:\n{s}");
+        // A byte row still shows its note (e.g. `layer 5/7`) after the counts.
+        assert!(s.contains("downloading"), "byte-row note:\n{s}");
         // Upload vs download direction glyphs.
         assert!(s.contains(theme.chars.up), "upload glyph:\n{s}");
         assert!(s.contains(theme.chars.progress), "download glyph:\n{s}");
@@ -1317,7 +1316,7 @@ mod tests {
         assert!(s.contains("tier"), "got:\n{s}");
         assert!(s.contains("queue"), "got:\n{s}");
         assert!(s.contains("reservation"), "got:\n{s}");
-        assert!(s.contains("planned (allocator pending)"), "got:\n{s}");
+        assert!(s.contains("planned (scheduler pending)"), "got:\n{s}");
         // Blank line separator landed before the scheduling block.
         assert!(
             s.contains("\n\n  Scheduling"),

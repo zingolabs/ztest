@@ -17,17 +17,13 @@
 //! Node and namespace listing are independent, run via `tokio::try_join!` so
 //! wall-time is `max(nodes, namespaces)`, not the sum.
 
-use std::collections::BTreeSet;
 use std::convert::TryFrom;
 
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
 use kube::api::ListParams;
 use kube::{Api, Client};
 
-use crate::qos::{
-    ClusterCapacity, LABEL_ROLE, NVME_NODE_LABEL_KEY, NVME_NODE_LABEL_VALUE, ROLE_TEST_ENV,
-    Resources, units,
-};
+use crate::qos::{ClusterCapacity, NVME_NODE_LABEL_KEY, NVME_NODE_LABEL_VALUE, Resources, units};
 
 use super::events::{Event, EventTx};
 
@@ -136,11 +132,9 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
         };
 
     let (nodes_ready, nodes_cordoned) = count_nodes(&nodes.items);
-    let ztest_ns = ztest_namespaces(&namespaces.items);
     let capacity = ClusterCapacity {
         allocatable: cluster_allocatable(&nodes.items),
         requested: cluster_requested(&pods.items),
-        baseline: baseline_requested(&pods.items, &ztest_ns),
     };
     let nvme_nodes = count_nvme_nodes(&nodes.items);
     let slots_used = count_zaino_slots(&namespaces.items);
@@ -164,40 +158,6 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
         },
         Some(client),
     )
-}
-
-/// Live whole-cluster schedulable capacity (allocatable minus sum of requested)
-/// using an existing [`kube::Client`].
-///
-/// Same model [`run`] reports, factored out for the per-test re-probe in
-/// `TestEnv::build()`: a nextest-spawned test process (no access to the parent's
-/// probe result) calls this to size its allocator's `available` figure before
-/// requesting a reservation. Errors propagate so the caller fails the build
-/// rather than silently admitting against zero capacity.
-pub async fn capacity(client: &Client) -> Result<ClusterCapacity, kube::Error> {
-    let nodes_api: Api<Node> = Api::all(client.clone());
-    let ns_api: Api<Namespace> = Api::all(client.clone());
-    let pods_api: Api<Pod> = Api::all(client.clone());
-    let lp = ListParams::default();
-    let (nodes, namespaces, pods) =
-        tokio::try_join!(nodes_api.list(&lp), ns_api.list(&lp), pods_api.list(&lp))?;
-    let ztest_ns = ztest_namespaces(&namespaces.items);
-    Ok(ClusterCapacity {
-        allocatable: cluster_allocatable(&nodes.items),
-        requested: cluster_requested(&pods.items),
-        baseline: baseline_requested(&pods.items, &ztest_ns),
-    })
-}
-
-/// Count schedulable NVMe-pool nodes using an existing [`kube::Client`]: the
-/// per-test equivalent of the parent probe's `nvme_nodes`, which doesn't cross
-/// the nextest process boundary. `TestEnv::build()` calls this to fail a
-/// sync-tier admission fast when no NVMe node can host the pod, rather than
-/// letting it pend forever on an unsatisfiable nodeSelector.
-pub async fn nvme_node_count(client: &Client) -> Result<u32, kube::Error> {
-    let nodes_api: Api<Node> = Api::all(client.clone());
-    let nodes = nodes_api.list(&ListParams::default()).await?;
-    Ok(count_nvme_nodes(&nodes.items))
 }
 
 /// `true` if the node reports a `Ready` condition.
@@ -285,51 +245,6 @@ fn pod_consumes(pod: &Pod) -> bool {
 fn cluster_requested(pods: &[Pod]) -> Resources {
     pods.iter()
         .filter(|p| pod_consumes(p))
-        .filter_map(|p| p.spec.as_ref())
-        .fold(Resources::ZERO, |acc, spec| {
-            acc.saturating_add(&units::pod_effective_requests(spec))
-        })
-}
-
-/// Names of the namespaces ztest manages: per-test environments (labelled
-/// [`LABEL_ROLE`]=[`ROLE_TEST_ENV`] by [`crate::cluster::ensure_namespace`])
-/// plus the QoS infra namespaces (`ztest-qos` ledger, `ztest-seeds` archive
-/// staging). Pods here are ztest's own load, accounted via the ledger; they are
-/// excluded from the baseline so they are never counted twice.
-fn ztest_namespaces(namespaces: &[Namespace]) -> BTreeSet<String> {
-    namespaces
-        .iter()
-        .filter(|ns| {
-            let name = ns.metadata.name.as_deref().unwrap_or_default();
-            name == crate::qos::kube_store::QOS_NAMESPACE
-                || name == crate::seeds::SEEDS_NAMESPACE
-                || ns
-                    .metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|l| l.get(LABEL_ROLE))
-                    .map(|v| v == ROLE_TEST_ENV)
-                    .unwrap_or(false)
-        })
-        .filter_map(|ns| ns.metadata.name.clone())
-        .collect()
-}
-
-/// Sum of effective requests over scheduled, live pods that are not
-/// ztest-managed: the non-ztest baseline. Sizes
-/// [`ClusterCapacity::admission_ceiling`]: load ztest cannot shed by waiting,
-/// so a footprint exceeding `allocatable - baseline` is a hard reject. ztest's
-/// own load is tracked separately through the reservation ledger.
-fn baseline_requested(pods: &[Pod], ztest_ns: &BTreeSet<String>) -> Resources {
-    pods.iter()
-        .filter(|p| pod_consumes(p))
-        .filter(|p| {
-            !p.metadata
-                .namespace
-                .as_deref()
-                .map(|ns| ztest_ns.contains(ns))
-                .unwrap_or(false)
-        })
         .filter_map(|p| p.spec.as_ref())
         .fold(Resources::ZERO, |acc, spec| {
             acc.saturating_add(&units::pod_effective_requests(spec))
@@ -479,82 +394,9 @@ mod tests {
         let cap = ClusterCapacity {
             allocatable: cluster_allocatable(&nodes),
             requested: cluster_requested(&pods),
-            baseline: baseline_requested(&pods, &BTreeSet::new()),
         };
         assert_eq!(cap.free().cpu_milli, 6000);
         assert_eq!(cap.free().mem_bytes, 12 * crate::qos::GIB);
-    }
-
-    fn pod_in(ns: &str, node_name: Option<&str>, phase: &str, cpu: &str, mem: &str) -> Pod {
-        let mut p = pod(node_name, phase, cpu, mem);
-        p.metadata.namespace = Some(ns.to_string());
-        p
-    }
-
-    fn ns_with_role(name: &str, role: Option<&str>) -> Namespace {
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-        Namespace {
-            metadata: ObjectMeta {
-                name: Some(name.to_string()),
-                labels: role.map(|r| BTreeMap::from([(LABEL_ROLE.to_string(), r.to_string())])),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn ztest_namespaces_picks_test_envs_and_infra() {
-        let nss = vec![
-            ns_with_role("ztest-foo-abc", Some(ROLE_TEST_ENV)), // labelled test-env
-            ns_with_role("ztest-qos", None),                    // infra by name
-            ns_with_role("ztest-seeds", None),                  // infra by name
-            ns_with_role("default", None),                      // unrelated
-            ns_with_role("kube-system", Some("something-else")), // wrong role value
-        ];
-        let set = ztest_namespaces(&nss);
-        assert!(set.contains("ztest-foo-abc"));
-        assert!(set.contains("ztest-qos"));
-        assert!(set.contains("ztest-seeds"));
-        assert!(!set.contains("default"));
-        assert!(!set.contains("kube-system"));
-    }
-
-    #[test]
-    fn baseline_excludes_ztest_pods_counts_only_non_ztest() {
-        let ztest_ns: BTreeSet<String> = ["ztest-foo-abc", "ztest-qos"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let pods = vec![
-            pod_in("kube-system", Some("n1"), "Running", "500m", "512Mi"), // baseline
-            pod_in("ztest-foo-abc", Some("n1"), "Running", "4", "8Gi"),    // ztest → excluded
-            pod_in("ztest-qos", Some("n1"), "Running", "1", "1Gi"),        // ztest → excluded
-        ];
-        let b = baseline_requested(&pods, &ztest_ns);
-        assert_eq!(b.cpu_milli, 500); // only kube-system
-        assert_eq!(b.mem_bytes, 512 * 1024 * 1024);
-    }
-
-    #[test]
-    fn admission_ceiling_is_allocatable_minus_baseline_only() {
-        let nodes = vec![node(true, false, "8", "16Gi")];
-        let ztest_ns: BTreeSet<String> = ["ztest-foo"].into_iter().map(String::from).collect();
-        // A big ztest pod plus a small non-ztest baseline pod.
-        let pods = vec![
-            pod_in("ztest-foo", Some("n1"), "Running", "6", "12Gi"), // ztest load
-            pod_in("kube-system", Some("n1"), "Running", "1", "2Gi"), // baseline
-        ];
-        let cap = ClusterCapacity {
-            allocatable: cluster_allocatable(&nodes),
-            requested: cluster_requested(&pods),
-            baseline: baseline_requested(&pods, &ztest_ns),
-        };
-        // Ceiling ignores the 6-core ztest pod: 8 − 1 = 7 cores, 16 − 2 = 14Gi.
-        assert_eq!(cap.admission_ceiling().cpu_milli, 7000);
-        assert_eq!(cap.admission_ceiling().mem_bytes, 14 * crate::qos::GIB);
-        // free() still nets out everything: 8 − 7 = 1 core.
-        assert_eq!(cap.free().cpu_milli, 1000);
     }
 
     #[test]

@@ -6,18 +6,16 @@
 
 use std::collections::HashMap;
 
-use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::Namespace;
 use kube::Client;
 use kube::api::{Api, DeleteParams, DynamicObject, ListParams};
 
 use crate::inventory::{DevImageEntry, SeedEntry};
-use crate::qos::kube_store::QOS_NAMESPACE;
-use crate::qos::{self, QosClass};
+use crate::qos;
 use crate::resource::context::Cx;
 use crate::resource::graph::{Graph, GraphError};
 use crate::resource::impls::storage::StorageProfile;
-use crate::resource::impls::{image, policy, qos as qos_impl, scaffolding, seed, storage};
+use crate::resource::impls::{image, policy, scaffolding, seed, storage};
 use crate::resource::provider::NodeId;
 use crate::resource::state::NodeState;
 
@@ -97,9 +95,6 @@ where
     graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(
         crate::seeds::SEEDS_NAMESPACE,
     )));
-    graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(
-        qos::kube_store::QOS_NAMESPACE,
-    )));
 
     // Node labeling (NVMe pool selector). Independent of everything else.
     if opts.label_nvme_pool {
@@ -111,11 +106,6 @@ where
 
     // Storage stack.
     for p in storage::providers(&opts.storage) {
-        graph.add_dedup(p);
-    }
-
-    // QoS RBAC + per-tier ServiceAccounts.
-    for p in qos_impl::providers() {
         graph.add_dedup(p);
     }
 
@@ -206,21 +196,13 @@ pub async fn reap_run(client: &Client, run_id: &str) -> Vec<String> {
 }
 
 /// `ztest cleanup`: reclaim one developer's ephemeral resources — every
-/// per-test Namespace, shadow VolumeSnapshotContent, and QoS reservation Lease
-/// stamped [`LABEL_USER`](qos::LABEL_USER)`=<user>`. `user` is slugged to match
-/// the label as written. Cluster infrastructure and shared caches are untouched.
+/// per-test Namespace and shadow VolumeSnapshotContent stamped
+/// [`LABEL_USER`](qos::LABEL_USER)`=<user>`. `user` is slugged to match the
+/// label as written. Cluster infrastructure and shared caches are untouched.
 pub async fn reap_user(client: &Client, user: &str) -> Vec<String> {
     let user = crate::naming::slug(user, crate::naming::DNS_LABEL_MAX);
     let owned = format!("{}={user}", qos::LABEL_USER);
-    let mut errors = reap_envs(client, &owned, &owned).await;
-    let leases = format!(
-        "{}={},{}={user}",
-        qos::LABEL_ROLE,
-        qos::ROLE_RESERVATION,
-        qos::LABEL_USER
-    );
-    errors.extend(reap_reservations(client, &leases).await);
-    errors
+    reap_envs(client, &owned, &owned).await
 }
 
 /// `ztest cleanup --all-users`: reclaim every developer's ephemeral resources.
@@ -230,10 +212,7 @@ pub async fn reap_user(client: &Client, user: &str) -> Vec<String> {
 /// run-id + user) on the presence of the run-id label.
 pub async fn reap_all(client: &Client) -> Vec<String> {
     let ns = format!("{}={}", qos::LABEL_ROLE, qos::ROLE_TEST_ENV);
-    let mut errors = reap_envs(client, &ns, qos::LABEL_RUN_ID).await;
-    let leases = format!("{}={}", qos::LABEL_ROLE, qos::ROLE_RESERVATION);
-    errors.extend(reap_reservations(client, &leases).await);
-    errors
+    reap_envs(client, &ns, qos::LABEL_RUN_ID).await
 }
 
 /// Delete per-test Namespaces (cascading their contents) matching
@@ -280,30 +259,4 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
     }
 
     errors
-}
-
-/// Delete QoS reservation Leases in the shared [`QOS_NAMESPACE`] matching
-/// `selector`. Leases self-expire on TTL lapse, so this is the eager path
-/// `ztest cleanup` takes; the run-exit reaper leaves them alone. A cluster
-/// where the QoS namespace was never provisioned simply has nothing to reap.
-async fn reap_reservations(client: &Client, selector: &str) -> Vec<String> {
-    let leases: Api<Lease> = Api::namespaced(client.clone(), QOS_NAMESPACE);
-    let lp = ListParams::default().labels(selector);
-    match leases.delete_collection(&DeleteParams::default(), &lp).await {
-        Ok(_) => Vec::new(),
-        Err(e) if crate::resource::kube::is_not_found(&e) => Vec::new(),
-        Err(e) => vec![format!("reap reservations ({selector}): {e}")],
-    }
-}
-
-/// A convenience helper: iterate the QoS tiers in a stable order. Used by
-/// consumers that need to enumerate tier SAs (e.g. `ztest cleanup`
-/// diagnostics).
-pub fn qos_tiers() -> [QosClass; 4] {
-    [
-        QosClass::Basic,
-        QosClass::Integration,
-        QosClass::Testnet,
-        QosClass::Sync,
-    ]
 }

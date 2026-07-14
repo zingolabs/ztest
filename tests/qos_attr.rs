@@ -13,6 +13,10 @@ use ztest::qos::QosClass;
 #[test]
 fn marker_basic() {}
 
+#[ztest::qos::wallet]
+#[test]
+fn marker_wallet() {}
+
 #[ztest::qos::integration]
 #[test]
 fn marker_integration() {}
@@ -38,6 +42,7 @@ fn tier_attributes_register_in_inventory_with_the_right_class() {
     };
 
     assert_eq!(class_of("::marker_basic"), QosClass::Basic);
+    assert_eq!(class_of("::marker_wallet"), QosClass::Wallet);
     assert_eq!(class_of("::marker_integration"), QosClass::Integration);
     assert_eq!(class_of("::marker_testnet"), QosClass::Testnet);
     assert_eq!(class_of("::marker_sync"), QosClass::Sync);

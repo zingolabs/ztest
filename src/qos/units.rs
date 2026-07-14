@@ -1,11 +1,9 @@
 //! Kubernetes quantity parsing and pod resource accounting.
 //!
-//! Shared by the real store adapter ([`crate::qos::kube_store`], which
-//! synthesizes a Job's footprint) and the cluster probe
-//! ([`crate::pipeline::cluster`], which sums pod requests against node
-//! allocatable). One implementation, one set of tests, so no per-consumer
-//! drift in how a `"500m"` / `"2Gi"` quantity or a pod's effective request is
-//! computed.
+//! Used by the cluster probe ([`crate::pipeline::cluster`], which sums pod
+//! requests against node allocatable). One implementation, one set of tests,
+//! so there is no drift in how a `"500m"` / `"2Gi"` quantity or a pod's
+//! effective request is computed.
 
 use k8s_openapi::api::core::v1::{Container, PodSpec};
 

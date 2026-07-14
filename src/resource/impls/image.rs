@@ -162,11 +162,9 @@ impl Provider for ImageProvider {
             return self.provision_internal(cx).await;
         }
 
-        let (dockerfile, context) = self
-            .entry
-            .source
-            .materialize()
-            .map_err(|e| ResourceError::Provision(format!("resolve image source {}: {e}", self.tag)))?;
+        let (dockerfile, context) = self.entry.source.materialize().map_err(|e| {
+            ResourceError::Provision(format!("resolve image source {}: {e}", self.tag))
+        })?;
         let id = self.id();
         let reference = self.reference();
 
@@ -244,11 +242,9 @@ impl ImageProvider {
     /// `docker login`, no `/etc/docker/certs.d`, and no `sudo`.
     async fn provision_internal(&self, cx: &Cx) -> Result<(), ResourceError> {
         let id = self.id();
-        let (dockerfile, context) = self
-            .entry
-            .source
-            .materialize()
-            .map_err(|e| ResourceError::Provision(format!("resolve image source {}: {e}", self.tag)))?;
+        let (dockerfile, context) = self.entry.source.materialize().map_err(|e| {
+            ResourceError::Provision(format!("resolve image source {}: {e}", self.tag))
+        })?;
         let target = self
             .internal_target()
             .map_err(|e| ResourceError::Provision(format!("registry credentials: {e}")))?;
@@ -267,6 +263,13 @@ impl ImageProvider {
         if let Some(sink) = &cx.progress {
             sink.note(&id, "building");
         }
+        let build_contexts = match self.runner_base_context(cx, &work).await {
+            Ok(bc) => bc,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work);
+                return Err(e);
+            }
+        };
         let argv = image::buildx_oci_argv(
             &dockerfile,
             &context,
@@ -274,6 +277,7 @@ impl ImageProvider {
             &self.tag,
             &tar,
             self.entry.rust_version.as_deref(),
+            &build_contexts,
         );
         let envs = [("DOCKER_BUILDKIT", "1".to_string())];
         let build = self
@@ -292,14 +296,101 @@ impl ImageProvider {
 
         let sink = cx.progress.clone();
         let report_id = id.clone();
-        let report = move |note: String| {
-            if let Some(sink) = &sink {
-                sink.note(&report_id, format!("push · {note}"));
+        let report = move |ev: oci::PushProgress| {
+            let Some(sink) = &sink else { return };
+            match ev {
+                oci::PushProgress::Blob {
+                    n,
+                    total,
+                    pushed_bytes,
+                    total_bytes,
+                } => sink.bytes(&report_id, pushed_bytes, total_bytes, format!("layer {n}/{total}")),
+                oci::PushProgress::Manifest => sink.finalizing(&report_id),
             }
         };
         let result = oci::push_layout(&layout, &target, &report).await;
         let _ = std::fs::remove_dir_all(&work);
         result.map_err(|e| ResourceError::Provision(format!("push {}: {e}", self.tag)))
+    }
+
+    /// Build-contexts pinning `FROM` sources for this image. The baked tests
+    /// image ([`RUNNER_REPO`](crate::engine::pod_runner::RUNNER_REPO)) does
+    /// `FROM ztest-runner:dev`, a nix base that lives only in the local docker
+    /// daemon — invisible to the isolated `docker-container` buildx builder. Turn
+    /// it into a local OCI layout with skopeo and pin the `FROM` to that layout,
+    /// so buildx resolves it with no registry round-trip (which on OpenShift would
+    /// need docker-login auth + the self-signed-CA TLS the in-process push avoids).
+    /// Other images add nothing.
+    ///
+    /// skopeo is piped (not run under the console PTY): off a TTY it emits plain
+    /// `Copying blob … done` lines, which we parse into transfer-panel notes so
+    /// this shows up beside the push progress instead of fighting the live grid.
+    async fn runner_base_context(
+        &self,
+        cx: &Cx,
+        work: &std::path::Path,
+    ) -> Result<Vec<(String, String)>, ResourceError> {
+        if self.entry.repo != crate::engine::pod_runner::RUNNER_REPO {
+            return Ok(Vec::new());
+        }
+        let base_tag = crate::engine::pod_runner::RUNNER_BASE_LOCAL_TAG;
+        let layout = work.join("base-layout");
+
+        if let Some(sink) = &cx.progress {
+            sink.note(&self.id(), "runner base → oci");
+        }
+        let mut child = tokio::process::Command::new("skopeo")
+            .args([
+                "copy".to_string(),
+                "--insecure-policy".to_string(),
+                format!("docker-daemon:{base_tag}"),
+                format!("oci:{}:base", layout.display()),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| ResourceError::Provision(format!("skopeo (runner base → oci): {e}")))?;
+
+        // skopeo writes copy progress to stderr; drain stdout concurrently so a
+        // full pipe buffer can't deadlock the child.
+        if let Some(out) = child.stdout.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt as _;
+                let mut out = out;
+                let mut sink = Vec::new();
+                let _ = out.read_to_end(&mut sink).await;
+            });
+        }
+        if let (Some(err), Some(sink)) = (child.stderr.take(), cx.progress.clone()) {
+            use tokio::io::{AsyncBufReadExt as _, BufReader};
+            let id = self.id();
+            let mut lines = BufReader::new(err).lines();
+            let mut blobs = 0usize;
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("Copying blob") {
+                    blobs += 1;
+                    sink.note(&id, format!("runner base → oci · blob {blobs}"));
+                } else if line.contains("Copying config") {
+                    sink.note(&id, "runner base → oci · config");
+                } else if line.contains("Writing manifest") {
+                    sink.note(&id, "runner base → oci · manifest");
+                }
+            }
+        }
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| ResourceError::Provision(format!("skopeo (runner base → oci): {e}")))?;
+        if !status.success() {
+            return Err(ResourceError::Provision(
+                "skopeo copy of the nix runner base to an OCI layout failed".to_string(),
+            ));
+        }
+        Ok(vec![(
+            base_tag.to_string(),
+            format!("oci-layout://{}", layout.display()),
+        )])
     }
 
     /// Ensure the `docker-container` buildx builder ztest uses for OCI exports

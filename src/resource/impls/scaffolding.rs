@@ -1,11 +1,10 @@
 //! Generic Kubernetes scaffolding providers: namespaces and cluster-wide
 //! node labels.
 //!
-//! These are the primitives every setup call needs — `ztest-seeds` and
-//! `ztest-qos` namespaces, the NVMe node label — and are cleanly
-//! parameterized so they don't grow one file per constant. Both are
-//! [`Lifetime::Cached`]: created once by `ztest setup`, kept for the life
-//! of the cluster.
+//! These are the primitives every setup call needs — the `ztest-seeds`
+//! namespace, the NVMe node label — and are cleanly parameterized so they
+//! don't grow one file per constant. Both are [`Lifetime::Cached`]: created
+//! once by `ztest setup`, kept for the life of the cluster.
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Namespace, Node};

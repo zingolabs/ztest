@@ -567,7 +567,12 @@ network = 'Regtest'
 listen_address = '0.0.0.0:{grpc_listen_port}'
 
 [json_server_settings]
-json_rpc_listen_address = '127.0.0.1:{jsonrpc_listen_port}'
+# 0.0.0.0, not 127.0.0.1: under pod-per-test the client runs in a *separate* pod
+# and reaches this endpoint at zainod's pod IP, so a loopback bind (the
+# same-host `zcash_local_net` default) refuses every cross-pod JSON-RPC call
+# while gRPC — already bound 0.0.0.0 — works. Per-test namespace isolation stands
+# in for the loopback restriction.
+json_rpc_listen_address = '0.0.0.0:{jsonrpc_listen_port}'
 
 [validator_settings]
 validator_jsonrpc_listen_address = '{validator_host}:{validator_rpc_port}'{validator_grpc_line}

@@ -10,7 +10,6 @@
 
 use async_trait::async_trait;
 
-use crate::qos::QosClass;
 use crate::resource::context::Cx;
 use crate::resource::state::{Lifetime, Readiness, ResourceError};
 
@@ -69,17 +68,6 @@ pub enum NodeId {
     /// VolumeSnapshotClass.
     StorageClasses,
 
-    // ── QoS infrastructure ────────────────────────────────────────────
-    /// The ClusterRole granting the runtime QoS store its documented
-    /// permissions (Lease CRUD in `ztest-qos`, cluster-wide Job list; see
-    /// [`crate::qos::kube_store`]).
-    QosRbac,
-    /// Per-tier ServiceAccount, annotated with the tier's default CPU/RAM
-    /// budget and bound to [`QosRbac`](Self::QosRbac). One node per
-    /// [`QosClass`]; the run charges reservations against these SAs via
-    /// the `ZTEST_SA` env var.
-    QosServiceAccount(QosClass),
-
     // ── ztest run identity + policy ───────────────────────────────────
     /// The `ztest` run ServiceAccount + its `ztest-remote` ClusterRole /
     /// binding + non-expiring token Secret — the least-privilege credential
@@ -113,8 +101,6 @@ impl NodeId {
             Self::CsiDriver => "csi-driver".into(),
             Self::LvmCluster => "lvm-cluster".into(),
             Self::StorageClasses => "storage-classes".into(),
-            Self::QosRbac => "qos-rbac".into(),
-            Self::QosServiceAccount(c) => format!("qos-sa/{}", c.as_label()),
             Self::RunIdentity => "run-identity".into(),
             Self::SccGrant => "scc-grant".into(),
             Self::RegistryProject => "registry-project".into(),

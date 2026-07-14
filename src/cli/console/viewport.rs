@@ -29,12 +29,15 @@ use super::{Backend, LIVE_ROWS, PANEL_ROWS, bridge};
 /// narrow terminal can't fit both without mangling either.
 const TWO_COL_MIN: u16 = 90;
 
-/// Target right-column width as a percent of the terminal, clamped to
-/// `[RIGHT_COL_MIN, RIGHT_COL_MAX]`. Enough to hold `⠹ dev-zainod · load→kind`
-/// or a `%` bar with byte counts, without starving the left column.
-const RIGHT_COL_PERCENT: u16 = 38;
+/// The left column's target width. Its content is five fixed status lines whose
+/// widest (the capacity gauge) needs ~56 cols; 80 leaves headroom for a long
+/// kube-context. Held constant so every extra terminal column flows to the
+/// right (transfer) column, which is the one that wants the room — a full
+/// `⇡⠹ label · bar % · done / total` line runs ~60 cols.
+const LEFT_COL_TARGET: u16 = 80;
+/// Floor for the right column when the terminal is too narrow to grant the left
+/// its target: the left yields down to this so the transfer column stays legible.
 const RIGHT_COL_MIN: u16 = 30;
-const RIGHT_COL_MAX: u16 = 48;
 
 /// Emulator width used to bridge each panel column: wide enough that no real
 /// panel line wraps, so each logical line stays one grid row. `ratatui` clips the
@@ -44,8 +47,10 @@ const NOWRAP_COLS: usize = 512;
 /// Paint the two panel columns into the frame's (viewport) area. Extracted from
 /// [`Surface::draw_frame`] so it can be exercised against a `TestBackend`.
 ///
-/// At or above [`TWO_COL_MIN`] the area is split into a left region plus a
-/// fixed-ish right region; below it, a single full-width left column. Each block
+/// At or above [`TWO_COL_MIN`] the area is split into a left region pinned to
+/// [`LEFT_COL_TARGET`] (yielding toward [`RIGHT_COL_MIN`] on a tight terminal)
+/// with every remaining column given to the right region; below it, a single
+/// full-width left column. Each block
 /// is bridged through a *wide* emulator ([`NOWRAP_COLS`]) so a line longer than
 /// its column is never wrapped (which would consume rows and break the
 /// fixed-height grid); `ratatui`'s `Paragraph` then clips it to the column,
@@ -59,14 +64,22 @@ fn paint_panel(f: &mut ratatui::Frame, area: Rect, left: &str, right: &str) {
         f.render_widget(Paragraph::new(rows(left, area.height)), area);
         return;
     }
-    let right_w = (area.width * RIGHT_COL_PERCENT / 100).clamp(RIGHT_COL_MIN, RIGHT_COL_MAX);
-    let left_w = area.width - right_w;
+    let (left_w, right_w) = two_col_split(area.width);
     let left_area = Rect::new(area.x, area.y, left_w, area.height);
     let right_area = Rect::new(area.x + left_w, area.y, right_w, area.height);
     f.render_widget(Paragraph::new(rows(left, area.height)), left_area);
     if !right.is_empty() {
         f.render_widget(Paragraph::new(rows(right, area.height)), right_area);
     }
+}
+
+/// Split a two-column width into `(left, right)`: the left is pinned to
+/// [`LEFT_COL_TARGET`] but yields toward [`RIGHT_COL_MIN`] on a tight terminal;
+/// the right takes everything left over (uncapped, so it grows with the screen).
+/// Only called for `width >= TWO_COL_MIN`, so the subtraction can't underflow.
+fn two_col_split(width: u16) -> (u16, u16) {
+    let left = LEFT_COL_TARGET.min(width - RIGHT_COL_MIN);
+    (left, width - left)
 }
 
 /// Restores the controlling terminal's line discipline on drop.
@@ -356,6 +369,17 @@ testnet-3.1m · 63%";
         );
         // The branded rule and the first transfer share the top row.
         assert!(out[0].contains("────"), "top rule row:\n{joined}");
+    }
+
+    #[test]
+    fn split_pins_left_and_gives_the_rest_to_the_right() {
+        // Roomy terminal: left pinned to target, right absorbs everything extra.
+        assert_eq!(two_col_split(160), (LEFT_COL_TARGET, 160 - LEFT_COL_TARGET));
+        assert_eq!(two_col_split(240), (LEFT_COL_TARGET, 240 - LEFT_COL_TARGET));
+        // Right grows without bound as the terminal widens.
+        assert!(two_col_split(300).1 > two_col_split(200).1);
+        // Tight terminal: left yields so the right keeps its floor.
+        assert_eq!(two_col_split(TWO_COL_MIN), (TWO_COL_MIN - RIGHT_COL_MIN, RIGHT_COL_MIN));
     }
 
     #[test]
