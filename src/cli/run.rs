@@ -1257,24 +1257,25 @@ fn run_image_phases(
     // provisioning path (docker build → registry push, incl. the OpenShift
     // internal registry). On local kind the compute is already on this machine, so
     // we skip it and fall back to local-process execution.
-    let dist = crate::backends::image::Distribution::from_env();
-    let runner_entry = if is_remote(&dist) && !binaries.is_empty() && !cancelled() {
-        match prepare_runner_image(binaries) {
-            Ok(entry) => {
-                images.push(entry.clone());
-                Some(entry)
+    let backend = crate::backends::image::from_env();
+    let runner_entry =
+        if crate::backends::image::is_remote() && !binaries.is_empty() && !cancelled() {
+            match prepare_runner_image(binaries, backend.as_ref()) {
+                Ok(entry) => {
+                    images.push(entry.clone());
+                    Some(entry)
+                }
+                Err(e) => {
+                    return ImagePhaseOutcome {
+                        failure: Some(format!("runner image: {e}")),
+                        qos_by_binary,
+                        ..Default::default()
+                    };
+                }
             }
-            Err(e) => {
-                return ImagePhaseOutcome {
-                    failure: Some(format!("runner image: {e}")),
-                    qos_by_binary,
-                    ..Default::default()
-                };
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     if (images.is_empty() && seeds.is_empty()) || cancelled() {
         return ImagePhaseOutcome {
@@ -1476,7 +1477,7 @@ fn run_image_phases(
     // mounts the source tree and resolves directly. A component whose build failed
     // is omitted — its dependent tests are already skipped upstream.
     let mut image_refs = std::collections::BTreeMap::new();
-    if is_remote(&dist) {
+    if crate::backends::image::is_remote() {
         for entry in images_by_binary.iter().flat_map(|(_, entries)| entries) {
             if let Ok(id) = resource::image_node_id(entry)
                 && matches!(resource_states.get(&id), Some(NodeState::Failed(_)))
@@ -1495,7 +1496,7 @@ fn run_image_phases(
                 );
                 image_refs
                     .entry(key)
-                    .or_insert_with(|| dist.reference(&tag));
+                    .or_insert_with(|| backend.reference(&tag));
             }
         }
     }
@@ -1505,7 +1506,7 @@ fn run_image_phases(
     // execution would peg the laptop — the exact thing pod execution exists to
     // avoid — so surface it and abort.
     let runner_image = match &runner_entry {
-        Some(entry) => match resolve_runner_image(entry, &dist, &resource_states) {
+        Some(entry) => match resolve_runner_image(entry, backend.as_ref(), &resource_states) {
             Ok(reference) => Some(reference),
             Err(e) => {
                 return ImagePhaseOutcome {
@@ -1531,17 +1532,6 @@ fn run_image_phases(
     }
 }
 
-/// Whether the active distribution targets a real registry (remote cluster),
-/// where pod-per-test execution offloads compute — as opposed to local kind,
-/// where the cluster *is* this machine.
-fn is_remote(dist: &crate::backends::image::Distribution) -> bool {
-    use crate::backends::image::Distribution;
-    matches!(
-        dist,
-        Distribution::Registry { .. } | Distribution::Internal { .. }
-    )
-}
-
 /// Split a test-binary path `<workspace>/target/<profile>/deps/<bin>` into its
 /// workspace root and cargo profile.
 fn workspace_and_profile(binary_path: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
@@ -1562,6 +1552,7 @@ fn workspace_and_profile(binary_path: &std::path::Path) -> Option<(std::path::Pa
 /// hash stay small. Flows through the normal image graph (build → registry push).
 fn prepare_runner_image(
     binaries: &[pipeline::SelectedBinary],
+    backend: &dyn crate::backends::image::ImageProvider,
 ) -> Result<crate::inventory::DevImageEntry, String> {
     use crate::backends::image::DevSource;
     let first = binaries
@@ -1580,7 +1571,9 @@ fn prepare_runner_image(
         .to_string_lossy()
         .into_owned();
 
-    let base_id = ensure_runner_base(&workspace)?;
+    let base = backend
+        .prepare_runner_base(&workspace)
+        .map_err(|e| e.to_string())?;
 
     let context = workspace.join("target").join(".ztest-runner-ctx");
     stage_runner_context(&context.join("deps"), binaries)?;
@@ -1596,8 +1589,8 @@ fn prepare_runner_image(
     // The Dockerfile lives outside the context so it isn't folded into the hash.
     let dockerfile = workspace.join("target").join(".ztest-runner.Dockerfile");
     let contents = crate::engine::pod_runner::baked_dockerfile(
-        crate::engine::pod_runner::RUNNER_BASE_LOCAL_TAG,
-        &base_id,
+        &base.from_ref,
+        &base.base_id,
         &dest_abs,
         &name_refs,
     );
@@ -1651,64 +1644,11 @@ fn strip_binary(path: &std::path::Path) {
         .status();
 }
 
-/// Ensure the nix runner base (`ztest-runner:dev`) is in the local docker daemon
-/// so the baked image's `FROM` resolves at build time.
-///
-/// `ztest` runs from *consumer* repos (e.g. `zaino/live-tests`) whose flake has
-/// no `runner-image` output — so we can't unconditionally `nix build .#`. If the
-/// image is already loaded (a prior build), reuse it. Otherwise fall back to
-/// `nix build .#runner-image` in `workspace` (works only when run from ztest's
-/// own checkout) and, if that fails, return an actionable error rather than a
-/// bare nix failure. (Proper fix: publish a versioned base image `ztest setup`
-/// pulls — see `docs/remote-test-execution.md`.)
-/// Ensure the nix runner base is loaded into the local docker daemon, building it
-/// if absent, and return its content ID (`docker image inspect --format {{.Id}}`).
-/// The id folds into the baked image's tag ([`baked_dockerfile`]) so a rebuilt
-/// base can never be masked by a stale cached image.
-fn ensure_runner_base(workspace: &std::path::Path) -> Result<String, String> {
-    let tag = crate::engine::pod_runner::RUNNER_BASE_LOCAL_TAG;
-    if runner_base_id(tag).is_none_or(|id| id.is_empty()) {
-        let built = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("nix build .#runner-image && ./result | docker load")
-            .current_dir(workspace)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !built {
-            return Err(format!(
-                "runner base image `{tag}` is not loaded and could not be built here \
-                 (`nix build .#runner-image` needs ztest's own flake, not this repo's). \
-                 Build it once from the ztest checkout: \
-                 `nix build .#runner-image && ./result | docker load`.",
-            ));
-        }
-    }
-    runner_base_id(tag)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| {
-            format!("runner base image `{tag}` loaded but its image id could not be read")
-        })
-}
-
-/// The docker content ID of a local image tag, or `None` if absent/unreadable.
-fn runner_base_id(tag: &str) -> Option<String> {
-    let out = std::process::Command::new("docker")
-        .args(["image", "inspect", "--format", "{{.Id}}", tag])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!id.is_empty()).then_some(id)
-}
-
 /// The runner image's pull reference, once provisioned. Errors if its graph node
 /// failed to build/push.
 fn resolve_runner_image(
     entry: &crate::inventory::DevImageEntry,
-    dist: &crate::backends::image::Distribution,
+    backend: &dyn crate::backends::image::ImageProvider,
     states: &std::collections::HashMap<crate::resource::NodeId, crate::resource::NodeState>,
 ) -> Result<String, String> {
     let tag = crate::backends::image::dev_tag(&entry.source, &entry.features, &entry.repo, None)
@@ -1718,7 +1658,7 @@ fn resolve_runner_image(
         Some(crate::resource::NodeState::Failed(detail)) => {
             Err(format!("build/push failed: {detail}"))
         }
-        _ => Ok(dist.reference(&tag)),
+        _ => Ok(backend.reference(&tag)),
     }
 }
 

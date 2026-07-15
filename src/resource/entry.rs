@@ -146,7 +146,7 @@ where
 pub fn plan_runtime(images: &[DevImageEntry], seeds: &[SeedEntry]) -> Result<Graph, String> {
     let mut graph = Graph::new();
     for entry in images {
-        let provider = image::ImageProvider::new(entry.clone())?;
+        let provider = image::ImageNode::new(entry.clone())?;
         graph.add_dedup(Box::new(provider));
     }
     for entry in seeds {
@@ -162,7 +162,7 @@ pub fn plan_runtime(images: &[DevImageEntry], seeds: &[SeedEntry]) -> Result<Gra
 /// Used by `cli::run` to key each binary's image-dependency edge to the
 /// graph node that provisioned it, without duplicating the id derivation.
 pub fn image_node_id(entry: &DevImageEntry) -> Result<NodeId, String> {
-    image::ImageProvider::node_id(entry)
+    image::ImageNode::node_id(entry)
 }
 
 /// The content-addressed [`NodeId`] a seed resolves to.

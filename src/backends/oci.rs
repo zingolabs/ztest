@@ -1,6 +1,6 @@
 //! In-process OCI image push.
 //!
-//! For the OpenShift integrated registry ([`Distribution::Internal`]) ztest
+//! For the OpenShift integrated registry ([`OpenShift`]) ztest
 //! pushes the built image itself over HTTPS rather than shelling out to
 //! `docker push`. This is what makes "ship one kubeconfig" work end to end: the
 //! push reuses the **same** service-account bearer token and cluster CA that the
@@ -12,7 +12,7 @@
 //! registry-ready OCI layout — correct gzip + digests, unlike `docker save`),
 //! extracted to a directory. See [`push_layout`] and `docs/openshift-registry.md`.
 //!
-//! [`Distribution::Internal`]: crate::backends::image::Distribution::Internal
+//! [`OpenShift`]: crate::backends::image::openshift::OpenShift
 
 use std::path::{Path, PathBuf};
 

@@ -486,7 +486,7 @@ unsafe fn apply(profile: &Profile, force: bool) {
                 }
             }
             // kind mode requires both registry vars absent so
-            // Distribution::from_env resolves to Kind. Only an explicit flag
+            // image::from_env resolves to Kind. Only an explicit flag
             // clears a pre-set env; `current` leaves it (env wins).
             (None, _, kind) => {
                 if force {

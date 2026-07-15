@@ -379,7 +379,10 @@ testnet-3.1m · 63%";
         // Right grows without bound as the terminal widens.
         assert!(two_col_split(300).1 > two_col_split(200).1);
         // Tight terminal: left yields so the right keeps its floor.
-        assert_eq!(two_col_split(TWO_COL_MIN), (TWO_COL_MIN - RIGHT_COL_MIN, RIGHT_COL_MIN));
+        assert_eq!(
+            two_col_split(TWO_COL_MIN),
+            (TWO_COL_MIN - RIGHT_COL_MIN, RIGHT_COL_MIN)
+        );
     }
 
     #[test]

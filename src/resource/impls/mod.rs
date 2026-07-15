@@ -9,7 +9,8 @@
 //!
 //! # Layout
 //!
-//! - [`image`] — per-run dev image loader (`docker build` + `kind load`).
+//! - [`image`] — per-run dev image node delegating to an
+//!   [`image::ImageProvider`](crate::backends::image::ImageProvider) backend.
 //! - [`seed`] — per-run content-addressed data seed PVCs.
 //! - [`scaffolding`] — generic K8s primitives (Namespace, node labels).
 //! - [`storage`] — cluster-wide storage/CSI stack (CRDs, controller,

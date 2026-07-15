@@ -73,10 +73,38 @@ fn timeline(tick: u64) -> Option<Transfers> {
     let mut rows: Vec<TransferRow> = [
         // (label, kind, start_tick, total_bytes, per_tick, layers)
         push("dev-zebrad", TransferKind::Image, 0, 512 * MIB, 22 * MIB, 7),
-        push("dev-zainod", TransferKind::Image, 20, 190 * MIB, 18 * MIB, 5),
-        push("mainnet-9.0", TransferKind::Download, 45, 9 * GIB, 300 * MIB, 12),
-        push("dev-lightwalletd", TransferKind::Image, 70, 128 * MIB, 14 * MIB, 4),
-        push("dev-lightclient", TransferKind::Image, 95, 96 * MIB, 12 * MIB, 3),
+        push(
+            "dev-zainod",
+            TransferKind::Image,
+            20,
+            190 * MIB,
+            18 * MIB,
+            5,
+        ),
+        push(
+            "mainnet-9.0",
+            TransferKind::Download,
+            45,
+            9 * GIB,
+            300 * MIB,
+            12,
+        ),
+        push(
+            "dev-lightwalletd",
+            TransferKind::Image,
+            70,
+            128 * MIB,
+            14 * MIB,
+            4,
+        ),
+        push(
+            "dev-lightclient",
+            TransferKind::Image,
+            95,
+            96 * MIB,
+            12 * MIB,
+            3,
+        ),
     ]
     .into_iter()
     .filter_map(|f| f(tick))

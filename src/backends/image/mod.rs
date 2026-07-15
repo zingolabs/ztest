@@ -10,23 +10,26 @@
 //!     it exists (in the kind node's containerd, or in the registry); it never
 //!     shells out to `docker build` itself.
 //!
-//! # Distribution modes
+//! # Topologies
 //!
-//! Dev images reach the cluster one of two ways, selected by
-//! [`Distribution::from_env`] from `ZTEST_IMAGE_REGISTRY`:
+//! Dev images reach the cluster via one [`ImageProvider`] backend, selected by
+//! [`from_env`] from `ZTEST_IMAGE_REGISTRY` / `ZTEST_IMAGE_PUSH_REGISTRY`:
 //!
-//!   - **Kind** (unset — the local-dev default): `docker build` then
+//!   - [`Kind`](kind::Kind) (unset — the local-dev default): `docker build` then
 //!     `kind load docker-image` into the local kind node's containerd. The pod
 //!     references the bare `<repo>:dev-<hash>` tag.
-//!   - **Registry** (`ZTEST_IMAGE_REGISTRY=<base>`, the remote/CI path):
-//!     `docker build` then `docker push <base>/<repo>:dev-<hash>`. The pod
+//!   - [`Docker`](docker::Docker) (`ZTEST_IMAGE_REGISTRY=<base>`, the remote/CI
+//!     path): `docker build` then `docker push <base>/<repo>:dev-<hash>`. The pod
 //!     references that registry-qualified tag and the cluster pulls it. This is
 //!     the only path that works against a cluster the runner reaches solely by
 //!     kubeconfig — no `kind load`, no `docker exec` of a node.
+//!   - [`OpenShift`](openshift::OpenShift) (`ZTEST_IMAGE_PUSH_REGISTRY` set): a
+//!     buildx OCI-layout export pushed in-process to the integrated registry's
+//!     external route, while pods reference the in-cluster service.
 //!
-//! The content-addressed `dev-<hash>` is identical in both modes, so a build is
-//! cache-shared across them and the poison-tag invariant (see the tests) holds
-//! regardless of where the image lands.
+//! The content-addressed `dev-<hash>` is identical across topologies, so a build
+//! is cache-shared and the poison-tag invariant (see the tests) holds regardless
+//! of where the image lands.
 //!
 //! If the image isn't present (typically because the user ran `cargo test` /
 //! `cargo nextest run` directly instead of `ztest run`), resolution fails with
@@ -36,8 +39,20 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+
+use crate::cli::console::run_child;
+use crate::inventory::DevImageEntry;
+use crate::resource::{Cx, Readiness, ResourceError};
+
+pub(crate) mod docker;
+pub(crate) mod kind;
+pub(crate) mod openshift;
+
+pub use kind::{kind_cluster_name, kind_clusters};
 
 /// What image to use for a component's pod.
 #[derive(Debug, Clone, Default)]
@@ -263,76 +278,154 @@ pub struct ResolvedImage {
     pub image: String,
 }
 
-/// How dev images reach the cluster for this invocation. Selected once from the
-/// environment via [`Distribution::from_env`]; every site that builds, pushes,
-/// probes, or references a dev image consults it so kind-mode and registry-mode
-/// can never diverge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Distribution {
-    /// Local kind: `kind load docker-image` into the node's containerd, pod
-    /// references the bare `<repo>:dev-<hash>` tag. The default when
-    /// `ZTEST_IMAGE_REGISTRY` is unset — local dev is unchanged.
-    Kind,
-    /// Remote registry: `docker push <base>/<repo>:dev-<hash>`, the cluster
-    /// pulls it. `base` is a registry host + optional repo prefix, e.g.
-    /// `ghcr.io/zingolabs`. Push and pull address the same host.
-    Registry { base: String },
-    /// OpenShift integrated registry: push and pull addresses differ. Images are
-    /// pushed to the external route (`push`, e.g.
-    /// `default-route-openshift-image-registry.apps-crc.testing/ztest-images`)
-    /// but pods reference the in-cluster service (`pull`, e.g.
-    /// `image-registry.openshift-image-registry.svc:5000/ztest-images`) so the
-    /// kubelet pulls over cluster DNS with the pod SA's auto-injected creds — no
-    /// route cert on nodes, no pull secret. The push is ztest's in-process OCI
-    /// client (`backends::oci`), not `docker push`. See `docs/openshift-registry.md`.
-    Internal { push: String, pull: String },
-}
-
-impl Distribution {
-    /// Select the mode from the environment. `ZTEST_IMAGE_PUSH_REGISTRY` set (a
-    /// distinct push address) → [`Internal`](Distribution::Internal) with pull =
-    /// `ZTEST_IMAGE_REGISTRY`; else `ZTEST_IMAGE_REGISTRY` alone →
-    /// [`Registry`](Distribution::Registry); neither →
-    /// [`Kind`](Distribution::Kind). Explicit-config, not cluster sniffing:
-    /// `ztest cluster` / activation set these from the selected profile.
-    pub fn from_env() -> Self {
-        match (push_base(), pull_base()) {
-            (Some(push), Some(pull)) => Distribution::Internal { push, pull },
-            // A push address alone (no separate pull) is just a registry.
-            (Some(base), None) => Distribution::Registry { base },
-            (None, Some(base)) => Distribution::Registry { base },
-            (None, None) => Distribution::Kind,
-        }
-    }
-
-    /// The pod-manifest image reference (the *pull* address) for a bare
-    /// `<repo>:dev-<hash>` tag. Kind returns it unchanged; the registry modes
-    /// prefix their pull base (trailing `/` normalised away).
-    pub fn reference(&self, local_tag: &str) -> String {
-        match self {
-            Distribution::Kind => local_tag.to_string(),
-            Distribution::Registry { base } => join(base, local_tag),
-            Distribution::Internal { pull, .. } => join(pull, local_tag),
-        }
-    }
-
-    /// The *push* reference for a bare `<repo>:dev-<hash>` tag: where the build
-    /// output is uploaded. For [`Internal`](Distribution::Internal) this is the
-    /// external route, distinct from [`reference`](Self::reference)'s pull
-    /// address; for [`Registry`](Distribution::Registry) the two coincide.
-    /// `None` for kind, which loads into the node rather than pushing.
-    pub fn push_reference(&self, local_tag: &str) -> Option<String> {
-        match self {
-            Distribution::Kind => None,
-            Distribution::Registry { base } => Some(join(base, local_tag)),
-            Distribution::Internal { push, .. } => Some(join(push, local_tag)),
-        }
-    }
-}
-
 /// Prefix a bare `<repo>:tag` with a registry base, normalising a trailing `/`.
 fn join(base: &str, local_tag: &str) -> String {
     format!("{}/{local_tag}", base.trim_end_matches('/'))
+}
+
+/// What `prepare_runner_base` hands back to the runner-image Dockerfile writer:
+/// the `FROM` reference and the base image's content id (folded into the runner
+/// tag so a rebuilt base can't be masked by a stale cached runner image).
+#[derive(Debug, Clone)]
+pub struct RunnerBase {
+    /// The reference the runner Dockerfile's `FROM` must use.
+    pub from_ref: String,
+    /// The base image's docker content id, folded into the runner tag.
+    pub base_id: String,
+}
+
+/// The one axis of variation in producing a dev image: the cluster topology.
+/// Each implementation *is* a topology; [`from_env`] selects one. `reference`
+/// and `pull_secret` are pure and safe to call in-pod (no docker/build tooling);
+/// the rest run on the laptop preflight where docker exists.
+#[async_trait]
+pub trait ImageProvider: Send + Sync + std::fmt::Debug {
+    /// Pod-manifest *pull* reference for a bare `<repo>:dev-<hash>` tag. Kind
+    /// returns the bare tag; registry modes prefix their pull base.
+    fn reference(&self, tag: &str) -> String;
+
+    /// Optional `imagePullSecrets` entry for pods pulling a dev image. `None`
+    /// for kind and the OpenShift integrated registry (SA-injected creds).
+    fn pull_secret(&self) -> Option<String>;
+
+    /// Synchronous warm-cache check for the consume path ([`resolve`]), where no
+    /// `Cx`/entry is available. Propagates the query error (unlike [`probe`],
+    /// which maps it to Absent) so `resolve` can surface a real failure.
+    fn dev_present(&self, tag: &str) -> Result<bool, ImageError>;
+
+    /// Warm-cache check: is the content-addressed image already present? A query
+    /// error is reported as `Absent` so a (re)build is attempted rather than
+    /// silently skipped.
+    async fn probe(&self, cx: &Cx, tag: &str, entry: &DevImageEntry) -> Readiness;
+
+    /// Build `entry` and publish it so pods can pull/load `reference(tag)`.
+    /// Streams native build output through the console PTY.
+    async fn build(&self, cx: &Cx, entry: &DevImageEntry, tag: &str) -> Result<(), ResourceError>;
+
+    /// Ensure the nix runner base is available where THIS backend's build engine
+    /// can `FROM` it, and return the reference the runner Dockerfile must use.
+    /// Synchronous and client-less in Phase 1 — all topologies do the same local
+    /// nix load; Phase 2 gains cluster access for the OpenShift ImageStream path.
+    fn prepare_runner_base(&self, workspace: &Path) -> Result<RunnerBase, ResourceError>;
+}
+
+/// Single selection point. `ZTEST_IMAGE_PUSH_REGISTRY` set (push≠pull) →
+/// [`OpenShift`](openshift::OpenShift); else `ZTEST_IMAGE_REGISTRY` set →
+/// [`Docker`](docker::Docker); neither → [`Kind`](kind::Kind). Explicit-config,
+/// not cluster sniffing: `ztest cluster` / activation set these from the profile.
+pub fn from_env() -> Arc<dyn ImageProvider> {
+    match (push_base(), pull_base()) {
+        (Some(push), Some(pull)) => Arc::new(openshift::OpenShift { push, pull }),
+        // A push address alone (no separate pull) is just a registry.
+        (Some(base), None) => Arc::new(docker::Docker { registry: base }),
+        (None, Some(base)) => Arc::new(docker::Docker { registry: base }),
+        (None, None) => Arc::new(kind::Kind),
+    }
+}
+
+/// Whether the active topology targets a real registry (remote cluster), where
+/// pod-per-test execution offloads compute — as opposed to local kind, where the
+/// cluster *is* this machine. Kind is "neither registry env set"; anything else
+/// is remote.
+pub fn is_remote() -> bool {
+    pull_base().is_some() || push_base().is_some()
+}
+
+/// Run one build/load step through the console PTY so BuildKit / kind progress
+/// renders live. Provisioning runs at cap 1, so at most one stream drives the
+/// emulator grid at a time. Off a TTY `run_child` inherits stdio.
+pub(crate) async fn run_streamed(
+    cx: &Cx,
+    tag: &str,
+    program: &str,
+    argv: &[String],
+    envs: &[(&str, String)],
+    step: &str,
+) -> Result<(), ResourceError> {
+    let code = run_child(cx.console.as_ref(), program, argv, envs)
+        .await
+        .map_err(|e| ResourceError::Provision(format!("{step} {tag}: {e}")))?;
+    if code != 0 {
+        return Err(ResourceError::Provision(format!(
+            "{step} {tag} exited {code}"
+        )));
+    }
+    Ok(())
+}
+
+/// Ensure the nix runner base (`ztest-runner:dev`) is in the local docker daemon
+/// so a baked runner image's `FROM` resolves at build time, returning its
+/// [`RunnerBase`].
+///
+/// `ztest` runs from *consumer* repos whose flake has no `runner-image` output,
+/// so we can't unconditionally `nix build .#`. If the base is already loaded,
+/// reuse it; otherwise fall back to `nix build .#runner-image` in `workspace`
+/// (works only from ztest's own checkout) and, failing that, an actionable error.
+/// The base id folds into the baked image's tag so a rebuilt base can never be
+/// masked by a stale cached image.
+pub(crate) fn nix_runner_base(workspace: &Path) -> Result<RunnerBase, ResourceError> {
+    let tag = crate::engine::pod_runner::RUNNER_BASE_LOCAL_TAG;
+    if runner_base_id(tag).is_none_or(|id| id.is_empty()) {
+        let built = Command::new("sh")
+            .arg("-c")
+            .arg("nix build .#runner-image && ./result | docker load")
+            .current_dir(workspace)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !built {
+            return Err(ResourceError::Provision(format!(
+                "runner base image `{tag}` is not loaded and could not be built here \
+                 (`nix build .#runner-image` needs ztest's own flake, not this repo's). \
+                 Build it once from the ztest checkout: \
+                 `nix build .#runner-image && ./result | docker load`.",
+            )));
+        }
+    }
+    let base_id = runner_base_id(tag)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            ResourceError::Provision(format!(
+                "runner base image `{tag}` loaded but its image id could not be read"
+            ))
+        })?;
+    Ok(RunnerBase {
+        from_ref: tag.to_string(),
+        base_id,
+    })
+}
+
+/// The docker content ID of a local image tag, or `None` if absent/unreadable.
+fn runner_base_id(tag: &str) -> Option<String> {
+    let out = Command::new("docker")
+        .args(["image", "inspect", "--format", "{{.Id}}", tag])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
 }
 
 /// The pull base (`ZTEST_IMAGE_REGISTRY`) — the address pods reference — or
@@ -359,18 +452,15 @@ fn env_nonempty(key: &str) -> Option<String> {
 /// leaves pods relying on SA-level / node-level pull auth, which is the
 /// idiomatic k8s path and covers public registries with no secret at all.
 ///
-/// Always `None` for the OpenShift integrated registry
-/// ([`Distribution::Internal`]): pods reference the in-cluster service and pull
-/// with the pod SA's auto-injected registry creds (the `system:image-puller`
-/// grant), so a pull secret is never needed and injecting one meant for the
-/// external route would be wrong.
+/// Always `None` for the OpenShift integrated registry: pods reference the
+/// in-cluster service and pull with the pod SA's auto-injected registry creds
+/// (the `system:image-puller` grant), so a pull secret is never needed and
+/// injecting one meant for the external route would be wrong.
+///
+/// A free-fn facade over [`ImageProvider::pull_secret`] so the component
+/// backends keep calling `image::pull_secret()` unchanged.
 pub fn pull_secret() -> Option<String> {
-    if matches!(Distribution::from_env(), Distribution::Internal { .. }) {
-        return None;
-    }
-    std::env::var("ZTEST_IMAGE_PULL_SECRET")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    from_env().pull_secret()
 }
 
 /// Env var carrying the laptop preflight's resolved dev-image references as a
@@ -427,7 +517,7 @@ fn prebuilt_refs() -> &'static std::collections::BTreeMap<String, String> {
 /// [`ImageSpec::Published`] is the *default* image: the `default_published`
 /// registry tag, used verbatim. [`ImageSpec::Dev`] is an *override* of that
 /// default: it computes the content-addressed `<repo>:dev-<hash>`, qualifies it
-/// for the active [`Distribution`], and verifies the image is already present
+/// for the active [`ImageProvider`], and verifies the image is already present
 /// (loaded into the kind node's containerd, or pushed to the registry); the
 /// preflight pipeline is the only thing that ever runs `docker build`. If the
 /// override image isn't present, returns [`ImageError::DevImageMissing`] so the
@@ -446,8 +536,8 @@ pub fn resolve(spec: &ImageSpec, default_published: &str) -> Result<ResolvedImag
             // Remote pod execution: the laptop preflight already resolved and
             // pushed this image and handed the reference in via IMAGE_REFS_ENV.
             // Short-circuit before touching the source — the baked runner image
-            // has no Dockerfile/context to hash, and `Distribution::from_env` is
-            // unset in-pod, so the laptop-computed reference is authoritative.
+            // has no Dockerfile/context to hash, and the registry env is unset
+            // in-pod, so the laptop-computed reference is authoritative.
             let key = spec_key(source, features, repo, rust_version.as_deref());
             if let Some(reference) = prebuilt_refs().get(&key) {
                 return Ok(ResolvedImage {
@@ -456,17 +546,9 @@ pub fn resolve(spec: &ImageSpec, default_published: &str) -> Result<ResolvedImag
             }
             let suffix = source.tag_suffix(features, rust_version.as_deref())?;
             let local_tag = format!("{repo}:dev-{suffix}");
-            let dist = Distribution::from_env();
-            let reference = dist.reference(&local_tag);
-            let present = match &dist {
-                Distribution::Kind => exists_in_kind(&local_tag)?,
-                Distribution::Registry { .. } => exists_in_registry(&reference)?,
-                // The preflight push (run process) already ensured presence; a
-                // per-test re-probe would need the registry token+CA in every
-                // test binary. A genuine miss surfaces as the pod's
-                // ImagePullBackOff, which the run reports.
-                Distribution::Internal { .. } => true,
-            };
+            let backend = from_env();
+            let reference = backend.reference(&local_tag);
+            let present = backend.dev_present(&local_tag)?;
             if !present {
                 return Err(ImageError::DevImageMissing {
                     tag: reference,
@@ -651,97 +733,13 @@ fn is_ignored(p: &Path) -> bool {
     })
 }
 
-/// Query the kind node's containerd for a given image tag. Public so the
-/// preflight pipeline can skip rebuilds when an image is already loaded.
-///
-/// `crictl images -q REPO[:TAG]` on the cri-tools version shipped in the kind
-/// node image does not apply its positional argument as a filter; it returns
-/// every image's ID regardless. So we list the full table and look for a
-/// `REPOSITORY TAG` column pair matching the requested ref, with or without
-/// an implicit `docker.io/library/` prefix (since `kind load docker-image
-/// foo:bar` stores the image under that fully-qualified name).
-pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
-    let node = format!("{}-control-plane", kind_cluster_name());
-    let out = Command::new("docker")
-        .args(["exec", &node, "crictl", "images"])
-        .output()
-        .map_err(|err| ImageError::Spawn {
-            cmd: format!("docker exec {node} crictl images"),
-            err,
-        })?;
-    if !out.status.success() {
-        return Err(ImageError::KindImageQuery {
-            stderr_tail: tail(&out.stderr, 40),
-        });
-    }
-    // Parse `(repo, tag)` out of each line and look for a match. The
-    // first column is `REPOSITORY` (may include a registry prefix),
-    // the second is `TAG`. We accept both `tag` and
-    // `docker.io/library/<tag>` so callers don't need to know
-    // containerd's storage convention.
-    let needle_repo_tag: Vec<&str> = tag.splitn(2, ':').collect();
-    if needle_repo_tag.len() != 2 {
-        return Err(ImageError::KindImageQuery {
-            stderr_tail: format!("tag `{tag}` has no `:<tag>` component"),
-        });
-    }
-    let (n_repo, n_tag) = (needle_repo_tag[0], needle_repo_tag[1]);
-    let n_repo_qualified = format!("docker.io/library/{n_repo}");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut lines = stdout.lines();
-    // Skip header.
-    let _ = lines.next();
-    for line in lines {
-        let mut cols = line.split_whitespace();
-        let repo = match cols.next() {
-            Some(v) => v,
-            None => continue,
-        };
-        let tag_col = match cols.next() {
-            Some(v) => v,
-            None => continue,
-        };
-        if tag_col != n_tag {
-            continue;
-        }
-        if repo == n_repo || repo == n_repo_qualified {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Query the registry for a pushed manifest via `docker manifest inspect`.
-/// Exit 0 ⇒ present; any non-zero (absent, or an auth/network error) ⇒ `false`,
-/// mirroring [`exists_in_kind`]'s "query error means Absent" contract: a false
-/// negative just triggers a (re)build+push, whose own failure surfaces the real
-/// error. `reference` is the fully-qualified `<base>/<repo>:dev-<hash>`.
-pub fn exists_in_registry(reference: &str) -> Result<bool, ImageError> {
-    let out = Command::new("docker")
-        .args(["manifest", "inspect", reference])
-        .output()
-        .map_err(|err| ImageError::Spawn {
-            cmd: format!("docker manifest inspect {reference}"),
-            err,
-        })?;
-    Ok(out.status.success())
-}
-
-/// The `docker push` argv (the args after the `docker` program name) for a
-/// registry-qualified tag. Run through the console PTY like
-/// [`docker_build_argv`] so the push progress renders live.
-pub fn docker_push_argv(reference: &str) -> Vec<String> {
-    vec!["push".to_string(), reference.to_string()]
-}
-
 /// The `docker build` argv (the args after the `docker` program name) for a
 /// dev image. The caller runs it through the console PTY (`Console::run_child`)
 /// so BuildKit detects a TTY and renders its native in-place layer progress,
 /// with `DOCKER_BUILDKIT=1` set in the child env. `tag` is whichever reference
-/// the active [`Distribution`] wants baked in: the bare `<repo>:dev-<hash>` for
-/// kind mode, the registry-qualified reference for registry mode (so the built
-/// image is ready to `docker push` with no re-tag).
+/// the active backend wants baked in: the bare `<repo>:dev-<hash>` for kind
+/// mode, the registry-qualified reference for registry mode (so the built image
+/// is ready to `docker push` with no re-tag).
 pub fn docker_build_argv(
     dockerfile: &Path,
     context: &Path,
@@ -774,155 +772,6 @@ pub fn docker_build_argv(
     }
     argv.push(context.display().to_string());
     argv
-}
-
-/// Buildx builder name ztest owns for OCI-layout exports. The default `docker`
-/// driver can't `--output type=oci`; a `docker-container` driver builder can, so
-/// [`Distribution::Internal`] provisioning ensures one of these exists.
-pub const BUILDX_BUILDER: &str = "ztest";
-
-/// The `docker buildx build` argv that exports a registry-ready OCI layout
-/// (correct gzip + digests, unlike `docker save`) to `dest_tar`, for the
-/// in-process push. Runs through the console PTY like [`docker_build_argv`].
-pub fn buildx_oci_argv(
-    dockerfile: &Path,
-    context: &Path,
-    features: &[String],
-    tag: &str,
-    dest_tar: &Path,
-    rust_version: Option<&str>,
-    build_contexts: &[(String, String)],
-) -> Vec<String> {
-    let mut argv = vec![
-        "buildx".to_string(),
-        "build".to_string(),
-        "--builder".to_string(),
-        BUILDX_BUILDER.to_string(),
-        "-f".to_string(),
-        dockerfile.display().to_string(),
-        "-t".to_string(),
-        tag.to_string(),
-        "--output".to_string(),
-        format!("type=oci,dest={}", dest_tar.display()),
-    ];
-    // Pin a `FROM <name>` to a locally-supplied source (e.g. an oci-layout of the
-    // nix runner base) so buildx resolves it without a registry pull — the
-    // isolated `docker-container` builder can't see the local docker daemon.
-    for (name, source) in build_contexts {
-        argv.push("--build-context".to_string());
-        argv.push(format!("{name}={source}"));
-    }
-    if let Some(rv) = build_arg_rust_version(rust_version, context) {
-        argv.push("--build-arg".to_string());
-        argv.push(format!("RUST_VERSION={rv}"));
-    }
-    // Pass features under both the ztest convention (`CARGO_FEATURES`, read by
-    // our own Dockerfiles) and the upstream zcash convention (`FEATURES`, read
-    // by e.g. zebra's in-tree `docker/Dockerfile`). An undeclared build-arg is
-    // only a warning, so whichever the target Dockerfile reads gets set and the
-    // other is ignored.
-    if !features.is_empty() {
-        let joined = features.join(",");
-        argv.push("--build-arg".to_string());
-        argv.push(format!("CARGO_FEATURES={joined}"));
-        argv.push("--build-arg".to_string());
-        argv.push(format!("FEATURES={joined}"));
-    }
-    argv.push(context.display().to_string());
-    argv
-}
-
-/// Assemble the in-process push [`Target`](crate::backends::oci::Target) for an
-/// OpenShift integrated-registry push reference, reading the bearer token and CA
-/// from the same kubeconfig (`KUBECONFIG` / `ZTEST_KUBE_CONTEXT`) that
-/// authenticates the kube client — the "one file has everything" path.
-pub fn internal_push_target(
-    push_reference: String,
-) -> Result<crate::backends::oci::Target, String> {
-    use crate::backends::oci::{Auth, Target};
-    let context = std::env::var("ZTEST_KUBE_CONTEXT")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let kubeconfig = std::env::var_os("KUBECONFIG").map(std::path::PathBuf::from);
-    let material = crate::cluster_config::read_material(kubeconfig.as_deref(), context.as_deref())?;
-    let token = material
-        .token
-        .ok_or("the kubeconfig has no bearer token for the registry push")?;
-    Ok(Target {
-        reference: push_reference,
-        // OpenShift's token handshake ignores the username but requires one.
-        auth: Auth {
-            username: "ztest".to_string(),
-            token,
-        },
-        ca_pem: material.ca_pem,
-    })
-}
-
-/// The `kind load docker-image` argv (the args after the `kind` program name)
-/// for a built tag. Run through the console PTY like [`docker_build_argv`].
-pub fn kind_load_argv(tag: &str) -> Vec<String> {
-    vec![
-        "load".to_string(),
-        "docker-image".to_string(),
-        tag.to_string(),
-        "--name".to_string(),
-        kind_cluster_name(),
-    ]
-}
-
-/// The active kind cluster's name; its node is `<name>-control-plane` and
-/// `kind load --name <name>` targets it.
-///
-/// First hit wins: an explicit non-empty `KIND_CLUSTER`, else the active
-/// kube-context when it's a kind one (`kind-<name>` → `<name>`), else `kind`
-/// (kind's default). Deriving from the context is what keeps kind mode following
-/// wherever kubectl points instead of a stale hardcoded default.
-pub fn kind_cluster_name() -> String {
-    if let Some(name) = std::env::var("KIND_CLUSTER").ok().filter(|s| !s.is_empty()) {
-        return name;
-    }
-    crate::cluster_config::active_context()
-        .and_then(|ctx| ctx.strip_prefix("kind-").map(str::to_string))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "kind".to_string())
-}
-
-/// The names of every running kind cluster (`kind get clusters`). The single
-/// place that shells out to enumerate them.
-pub fn kind_clusters() -> Result<Vec<String>, ImageError> {
-    let out = Command::new("kind")
-        .args(["get", "clusters"])
-        .output()
-        .map_err(|err| ImageError::Spawn {
-            cmd: "kind get clusters".to_string(),
-            err,
-        })?;
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect())
-}
-
-/// Fail fast when the active kind cluster isn't up, so a missing cluster reports
-/// an actionable error before the build rather than a raw `kind load` failure
-/// after it.
-pub fn ensure_kind_cluster() -> Result<(), ImageError> {
-    let cluster = kind_cluster_name();
-    let available = kind_clusters()?;
-    if available.contains(&cluster) {
-        return Ok(());
-    }
-    Err(ImageError::KindClusterMissing {
-        cluster,
-        available: if available.is_empty() {
-            "(none)".to_string()
-        } else {
-            available.join(", ")
-        },
-    })
 }
 
 /// Read `rust-toolchain.toml` from the context dir and extract the `channel`,
@@ -1138,28 +987,31 @@ mod tests {
         assert_ne!(a.tag(&[]), b.tag(&[]));
     }
 
-    /// Kind mode is a pass-through: the pod references the bare local tag, so
-    /// nothing about the local-dev path changes when no registry is configured.
+    /// Kind is a pass-through: the pod references the bare local tag, so nothing
+    /// about the local-dev path changes when no registry is configured. And it
+    /// never injects a pull secret.
     #[test]
     fn kind_reference_is_the_bare_tag() {
-        let d = Distribution::Kind;
+        let d = kind::Kind;
         assert_eq!(d.reference("zainod:dev-abc123"), "zainod:dev-abc123");
+        assert_eq!(d.pull_secret(), None);
     }
 
-    /// Registry mode prefixes the base and preserves the content-addressed
-    /// `dev-<hash>` (so the image is cache-shared with a kind build of the same
-    /// bytes), and a trailing slash on the base is normalised away.
+    /// Docker (generic registry) prefixes the base and preserves the
+    /// content-addressed `dev-<hash>` (so the image is cache-shared with a kind
+    /// build of the same bytes), and a trailing slash on the base is normalised
+    /// away.
     #[test]
     fn registry_reference_prefixes_base_and_preserves_hash() {
-        let d = Distribution::Registry {
-            base: "ghcr.io/zingolabs".into(),
+        let d = docker::Docker {
+            registry: "ghcr.io/zingolabs".into(),
         };
         assert_eq!(
             d.reference("zainod:dev-abc123"),
             "ghcr.io/zingolabs/zainod:dev-abc123"
         );
-        let trailing = Distribution::Registry {
-            base: "ghcr.io/zingolabs/".into(),
+        let trailing = docker::Docker {
+            registry: "ghcr.io/zingolabs/".into(),
         };
         assert_eq!(
             trailing.reference("zainod:dev-abc123"),
@@ -1167,11 +1019,12 @@ mod tests {
         );
     }
 
-    /// Internal (OpenShift) mode: pods reference the in-cluster pull address
-    /// while the build is pushed to the external route — the two must differ.
+    /// OpenShift: pods reference the in-cluster pull address, distinct from the
+    /// external push route the build uploads to. `reference` must use *pull*, and
+    /// no pull secret is injected (SA-injected creds).
     #[test]
-    fn internal_splits_pull_and_push_addresses() {
-        let d = Distribution::Internal {
+    fn openshift_reference_uses_the_pull_address() {
+        let d = openshift::OpenShift {
             push: "default-route-openshift-image-registry.apps-crc.testing/ztest-images".into(),
             pull: "image-registry.openshift-image-registry.svc:5000/ztest-images".into(),
         };
@@ -1179,25 +1032,7 @@ mod tests {
             d.reference("zainod:dev-abc123"),
             "image-registry.openshift-image-registry.svc:5000/ztest-images/zainod:dev-abc123"
         );
-        assert_eq!(
-            d.push_reference("zainod:dev-abc123").as_deref(),
-            Some(
-                "default-route-openshift-image-registry.apps-crc.testing/ztest-images/zainod:dev-abc123"
-            )
-        );
-    }
-
-    /// Registry mode pushes and pulls the same address; kind never pushes.
-    #[test]
-    fn push_reference_matches_mode() {
-        assert_eq!(Distribution::Kind.push_reference("x:dev-1"), None);
-        let r = Distribution::Registry {
-            base: "ghcr.io/z".into(),
-        };
-        assert_eq!(
-            r.push_reference("x:dev-1").as_deref(),
-            Some("ghcr.io/z/x:dev-1")
-        );
+        assert_eq!(d.pull_secret(), None);
     }
 
     /// `spec_key` reads no files, is stable, and separates images that differ in
