@@ -121,6 +121,24 @@ async fn run(args: &Args) -> Result<(), String> {
     let target = resolve_target(args)?;
     let backend = Backend::from_target(target, args);
 
+    // The image backend the active profile selected (bound to env by `activate`
+    // in `execute`). This — not the setup `Target` — decides which OpenShift
+    // policy is provisioned, the same signal `ztest run` reads, so a remote
+    // cluster that is really OpenShift is no longer invisible to `setup`. A local
+    // OpenShift bring-up (`--target okd`) intends on-cluster builds, so its profile
+    // must select the `openshift` backend; fail here naming the fix, not deep at
+    // the `builder` node with an opaque "image reference unresolved".
+    let image_backend = crate::backends::image::selected_backend();
+    if backend.is_openshift() && !image_backend.is_openshift() {
+        return Err(
+            "target is OpenShift but the active profile does not select the `openshift` image \
+             backend (no integrated registry). Point `ztest cluster add <name> --kubeconfig \
+             <file>` at an integrated-registry kubeconfig, or set `backend = \"openshift\"` with \
+             push/pull under its entry in ~/.config/ztest/clusters.toml."
+                .to_string(),
+        );
+    }
+
     // 1. Host-tool prerequisites + cluster bring-up.
     backend.preflight()?;
     backend.ensure_cluster()?;
@@ -193,7 +211,7 @@ async fn run(args: &Args) -> Result<(), String> {
             no_wait: args.no_wait,
             storage,
             label_nvme_pool: backend.label_nvme_pool(),
-            openshift: backend.is_openshift(),
+            backend: image_backend,
             ..Default::default()
         },
         on_change,

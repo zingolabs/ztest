@@ -72,6 +72,8 @@ rand = "0.8"
 sha2 = "0.10"
 hex = { workspace = true }
 walkdir = "2"
+tar = "0.4"
+globset = "0.4"
 inventory = "0.3"
 ctor = "0.2"
 
@@ -128,6 +130,9 @@ rusqlite = { version = "0.37", optional = true }
 http = "1.1"
 
 reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
+# `io` gives `StreamReader`, wrapping a reqwest byte stream (the LFS blob GET)
+# as an `AsyncRead` we pipe into the seed uploader pod's stdin.
+tokio-util = { version = "0.7", features = ["io"] }
 base64 = "0.22"
 jsonrpsee-types = "0.24"
 # `codegen` is required by the generated client in `src/proto/service.rs`
@@ -140,14 +145,11 @@ supports-color = "3.0.2"
 supports-unicode = "3.0.0"
 bytesize = "2.3.1"
 terminal_size = "0.4"
-crossterm = "0.29"
 portable-pty = "0.9"
-# Inline-viewport TUI for the unified bottom console; `scrolling-regions` MUST
-# stay off (default) so output scrolls into native terminal scrollback rather
-# than a DECSTBM region. `avt` is an in-memory VT emulator whose `feed_str`
-# emits lines as they scroll off the top — the mechanism for forwarding child
-# output into native scrollback (see docs/engine-design.md).
-ratatui = "0.30"
+# `avt` is an in-memory VT emulator whose `feed_str` emits lines as they scroll
+# off the top — the mechanism the unified bottom console uses to forward child
+# output into native terminal scrollback while repainting a manual sticky footer
+# (see src/cli/console/mod.rs).
 avt = "0.18"
 libc = "0.2"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
@@ -155,21 +157,12 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 # `ztest run` shells out to `cargo nextest list` (inventory) and `cargo nextest
 # run` (the run, under the PTY console). `nextest-metadata` parses the
 # `cargo nextest list --json` summary into the `TestListSummary` the image
-# inventory phase consumes. Version tracks the installed `cargo nextest`; shares
-# the single crossterm 0.29 in the lock — no skew with ratatui's crossterm.
+# inventory phase consumes. Version tracks the installed `cargo nextest`.
 nextest-metadata = "0.14"
 dialoguer = { version = "0.12.0", default-features = false }
 
 [features]
 default = ["librustzcash"]
-# GUARD, not a feature to enable. ztest's console REQUIRES native terminal
-# scrollback, which ratatui's `insert_before` provides ONLY while its
-# `scrolling-regions` feature is OFF (with it on, `insert_before` scrolls through
-# a DECSTBM margin region most emulators exclude from scrollback — silently
-# breaking the core mechanism). Forwarding the feature here exists solely so that
-# enabling it anywhere trips the `compile_error!` in `src/cli/console/mod.rs`
-# instead of regressing at runtime. Leave it off.
-scrolling-regions = ["ratatui/scrolling-regions"]
 # In-process librustzcash wallet backend (`backends::librustzcash`,
 # `Wallet::librustzcash`) — ztest's default, batteries-included wallet. A
 # pure-Rust `zcash_client_backend` + `zcash_client_sqlite` wallet that syncs

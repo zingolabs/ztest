@@ -1,12 +1,11 @@
 //! Local kind topology: `docker build` → `kind load docker-image` into the
 //! node's containerd. Pods reference the bare `<repo>:dev-<hash>` tag.
 
-use std::path::Path;
 use std::process::Command;
 
 use async_trait::async_trait;
 
-use super::{ImageError, ImageProvider, RunnerBase, docker_build_argv, run_streamed, tail};
+use super::{ImageError, ImageProvider, docker_build_argv, run_streamed, tail};
 use crate::inventory::DevImageEntry;
 use crate::resource::{Cx, NodeId, Readiness, ResourceError};
 
@@ -15,21 +14,20 @@ use crate::resource::{Cx, NodeId, Readiness, ResourceError};
 #[derive(Debug)]
 pub(crate) struct Kind;
 
-#[async_trait]
-impl ImageProvider for Kind {
-    fn reference(&self, tag: &str) -> String {
+impl Kind {
+    /// The pod pull reference: the bare tag, held in the node's containerd.
+    pub(super) fn reference(&self, tag: &str) -> String {
         tag.to_string()
     }
+}
 
+#[async_trait]
+impl ImageProvider for Kind {
     fn pull_secret(&self) -> Option<String> {
-        None
+        super::pull_secret_env()
     }
 
-    fn dev_present(&self, tag: &str) -> Result<bool, ImageError> {
-        exists_in_kind(tag)
-    }
-
-    async fn probe(&self, _cx: &Cx, tag: &str, _entry: &DevImageEntry) -> Readiness {
+    async fn image_built(&self, _cx: &Cx, _entry: &DevImageEntry, tag: &str) -> Readiness {
         // A query error (node unreachable) means `Absent` so we (re)build rather
         // than silently treat the image as present. Shell-out kept off the async
         // worker.
@@ -45,7 +43,12 @@ impl ImageProvider for Kind {
         }
     }
 
-    async fn build(&self, cx: &Cx, entry: &DevImageEntry, tag: &str) -> Result<(), ResourceError> {
+    async fn build_image(
+        &self,
+        cx: &Cx,
+        entry: &DevImageEntry,
+        tag: &str,
+    ) -> Result<String, ResourceError> {
         let (dockerfile, context) = entry
             .source
             .materialize()
@@ -78,11 +81,8 @@ impl ImageProvider for Kind {
             sink.note(&id, format!("load → kind {}", kind_cluster_name()));
         }
         let argv = kind_load_argv(tag);
-        run_streamed(cx, tag, "kind", &argv, &[], "kind load").await
-    }
-
-    fn prepare_runner_base(&self, workspace: &Path) -> Result<RunnerBase, ResourceError> {
-        super::nix_runner_base(workspace)
+        run_streamed(cx, tag, "kind", &argv, &[], "kind load").await?;
+        Ok(self.reference(tag))
     }
 }
 

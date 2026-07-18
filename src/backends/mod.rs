@@ -13,7 +13,6 @@ pub(crate) mod image;
 #[cfg(feature = "librustzcash")]
 pub mod librustzcash;
 pub mod lightwalletd;
-pub(crate) mod oci;
 pub mod zainod;
 pub mod zcashd;
 pub mod zebra;

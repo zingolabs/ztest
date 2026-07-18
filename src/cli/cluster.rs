@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Args as ClapArgs, Subcommand};
 
-use crate::cluster_config::{self, Config, Profile};
+use crate::cluster_config::{self, Config, ImageBackend, Profile};
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -133,7 +133,7 @@ fn add(a: AddArgs) -> Result<(), String> {
     // extension. Nothing about distribution is typed on the command line.
     let mut push = None;
     let mut pull = None;
-    let mut openshift = false;
+    let mut backend = ImageBackend::Kind;
     let mut context = kind_cluster.as_ref().map(|k| format!("kind-{k}"));
     if kind_cluster.is_none()
         && let Some(kc) = &a.kubeconfig
@@ -141,8 +141,15 @@ fn add(a: AddArgs) -> Result<(), String> {
         let material = cluster_config::read_material(Some(std::path::Path::new(kc)), None)?;
         if let Some(spec) = material.registry {
             push = Some(spec.push);
-            pull = Some(spec.pull);
-            openshift = spec.openshift;
+            // The integrated-registry extension carries a distinct in-cluster
+            // pull address only for OpenShift; a generic registry pushes and
+            // pulls one address, so the pull is folded into `push`.
+            backend = if spec.openshift {
+                pull = Some(spec.pull);
+                ImageBackend::OpenShift
+            } else {
+                ImageBackend::Registry
+            };
         }
         // Record the resolved context so the profile is self-describing and
         // `ztest run` can verify it, rather than leaning on the file's
@@ -156,7 +163,7 @@ fn add(a: AddArgs) -> Result<(), String> {
         push,
         pull,
         kind_cluster,
-        openshift,
+        backend,
     };
     profile.validate()?;
 

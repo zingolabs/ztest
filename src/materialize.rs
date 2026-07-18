@@ -36,6 +36,7 @@ use tokio::io::AsyncWriteExt;
 use crate::EnvError;
 use crate::error::env_err;
 use crate::seeds::{self, SEEDS_NAMESPACE, SeedHandle, volume_snapshot_gvk};
+use crate::storage::{self, StorageBackend};
 
 const WAIT_INTERVAL: Duration = Duration::from_secs(2);
 const WAIT_BUDGET: Duration = Duration::from_secs(300);
@@ -268,7 +269,11 @@ async fn materialize(
     let pod_name = format!("uploader-{}", pvc_name.trim_start_matches("seed-"));
     let pods: Api<Pod> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
 
-    let cmd = uploader_cmd(payload, source)?;
+    // Resolve the byte source (local file or LFS pointer) and fix the uploader
+    // command up front. Compression is derived without transferring the bytes,
+    // so the pod is created before `open()` starts any download.
+    let backend = storage::for_source(source).map_err(|e| storage_fatal(source, e))?;
+    let cmd = uploader_cmd(payload, backend.as_ref()).map_err(|e| storage_fatal(source, e))?;
     let pod_body = uploader_pod(&pod_name, pvc_name, &cmd);
     match pods.create(&PostParams::default(), &pod_body).await {
         Ok(_) => {}
@@ -289,7 +294,7 @@ async fn materialize(
     .map_err(|_| uploader_stuck(source, &pod_name))?
     .map_err(env_err)?;
 
-    // 2. Stream the local file into the pod's stdin. When we drop stdin,
+    // 2. Stream the source bytes into the pod's stdin. When we drop stdin,
     //    the command sees EOF and exits.
     let mut attached = pods
         .attach(
@@ -304,13 +309,11 @@ async fn materialize(
     let mut stdin = attached
         .stdin()
         .ok_or_else(|| env_err(std::io::Error::other("uploader pod did not expose stdin")))?;
-    let mut file = tokio::fs::File::open(source).await.map_err(|e| {
-        env_err(std::io::Error::new(
-            e.kind(),
-            format!("opening {}: {e}", source.display()),
-        ))
-    })?;
-    tokio::io::copy(&mut file, &mut stdin)
+    // Open the bytes only now the pod can receive them: for LFS this is when the
+    // batch API resolves and the blob GET begins, so nothing is held open across
+    // pod scheduling. When stdin EOFs, the uploader command finishes.
+    let mut src = backend.open().await.map_err(|e| storage_fatal(source, e))?;
+    tokio::io::copy(&mut src, &mut stdin)
         .await
         .map_err(env_err)?;
     stdin.shutdown().await.ok();
@@ -354,68 +357,32 @@ fn uploader_stuck(source: &Path, pod: &str) -> MaterializeErr {
     })
 }
 
-/// The shell command the uploader runs to populate `/seed` from the
-/// streamed bytes.
-///
-/// For archives we pass an explicit decompression flag chosen from the
-/// source's magic bytes: GNU tar can't auto-detect compression when reading
-/// from a non-seekable stdin pipe (it errors "Use -z/-J option"), which is
-/// exactly how the uploader feeds it. The matching decompressor must exist
-/// in the uploader image: the default base image carries only `gzip`, so
-/// gzip-compressed archives work out of the box; xz/zstd require a
-/// `ZAINO_UPLOADER_IMAGE` that bundles those binaries.
-fn uploader_cmd(payload: Payload, source: &Path) -> Result<String, EnvError> {
+/// The shell command the uploader runs to populate `/seed` from the streamed
+/// bytes. Archives are extracted with an explicit decompression flag (GNU tar
+/// can't auto-detect on a non-seekable stdin pipe); files are copied verbatim.
+/// The flag's decompressor must exist in the uploader image — see
+/// [`detect_uploader_image`].
+fn uploader_cmd(
+    payload: Payload,
+    backend: &dyn StorageBackend,
+) -> Result<String, storage::StorageError> {
     match payload {
-        Payload::Archive => {
-            let decomp = match archive_compression(source)? {
-                Compression::Gzip => "-z ",
-                Compression::Xz => "-J ",
-                Compression::Bzip2 => "-j ",
-                Compression::Zstd => "--zstd ",
-                Compression::None => "",
-            };
-            Ok(format!("tar {decomp}-xf - -C /seed"))
-        }
+        Payload::Archive => Ok(format!(
+            "tar {}-xf - -C /seed",
+            backend.compression()?.tar_flag()
+        )),
         // File path inside the PVC is always `/seed/blob`; `read_seed_handle`
         // doesn't care, only the consumer's volumeMount path does.
         Payload::File => Ok("cat > /seed/blob".to_string()),
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Compression {
-    Gzip,
-    Xz,
-    Bzip2,
-    Zstd,
-    None,
-}
-
-/// Sniff the archive's compression from its leading magic bytes.
-fn archive_compression(source: &Path) -> Result<Compression, EnvError> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(source).map_err(|e| EnvError::ArchiveMaterializeFailed {
+/// A storage failure (bad pointer, unreachable LFS blob, unreadable file) as a
+/// fatal materialize error tagged with the source archive.
+fn storage_fatal(source: &Path, err: storage::StorageError) -> MaterializeErr {
+    MaterializeErr::Fatal(EnvError::ArchiveMaterializeFailed {
         archive: source.to_path_buf(),
-        reason: format!("opening to sniff compression: {e}"),
-    })?;
-    let mut magic = [0u8; 6];
-    let n = f
-        .read(&mut magic)
-        .map_err(|e| EnvError::ArchiveMaterializeFailed {
-            archive: source.to_path_buf(),
-            reason: format!("reading magic bytes: {e}"),
-        })?;
-    let m = &magic[..n];
-    Ok(if m.starts_with(&[0x1f, 0x8b]) {
-        Compression::Gzip
-    } else if m.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
-        Compression::Xz
-    } else if m.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        Compression::Zstd
-    } else if m.starts_with(b"BZh") {
-        Compression::Bzip2
-    } else {
-        Compression::None
+        reason: err.to_string(),
     })
 }
 

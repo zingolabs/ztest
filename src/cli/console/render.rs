@@ -17,7 +17,6 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use portable_pty::PtySize;
-use ratatui::text::Line;
 use tokio::signal::unix::{Signal, SignalKind};
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
@@ -38,11 +37,11 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 
 /// One frame's worth of content, produced on demand by a [`SceneFn`]: the two
 /// columns of the pinned bottom panel as ANSI strings, which the render thread
-/// splits into side-by-side `ratatui` regions. `left` is the phase-scoped status
-/// (cluster / build / run); `right` is the session-long transfer tracker. Both
-/// are a constant `PANEL_ROWS` lines so the panel never reflows. Everything else
-/// — subprocess output and the engine's reporter verdicts — reaches the terminal
-/// as native scrollback, not through the scene.
+/// composes into the side-by-side panel of the sticky footer. `left` is the
+/// phase-scoped status (cluster / build / run); `right` is the session-long
+/// transfer tracker. Both are up to `PANEL_ROWS` lines. Everything else —
+/// subprocess output and the engine's reporter verdicts — reaches the terminal as
+/// native scrollback, not through the scene.
 pub(crate) struct SceneFrame {
     pub left: String,
     pub right: String,
@@ -84,7 +83,6 @@ pub(crate) struct Console {
     tx: mpsc::UnboundedSender<Msg>,
     size: watch::Receiver<PtySize>,
     cancel: Cancel,
-    live_rows: u16,
 }
 
 /// Owns the render thread's join handle. Kept by the session's top-level flow;
@@ -111,7 +109,7 @@ impl Console {
 
         // The render thread reports startup success/failure here so `start`
         // can surface a terminal-setup error synchronously.
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u16>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<()>>();
 
         let join = std::thread::Builder::new()
             .name("ztest-render".to_string())
@@ -127,8 +125,8 @@ impl Console {
             })
             .map_err(io::Error::other)?;
 
-        let live_rows = match ready_rx.recv() {
-            Ok(Ok(rows)) => rows,
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 let _ = join.join();
                 return Err(e);
@@ -137,13 +135,12 @@ impl Console {
                 let _ = join.join();
                 return Err(io::Error::other("render thread died during startup"));
             }
-        };
+        }
 
         let console = Console {
             tx: tx.clone(),
             size: size_rx,
             cancel,
-            live_rows,
         };
         let guard = ConsoleGuard {
             tx,
@@ -206,12 +203,12 @@ impl Console {
         self.size.clone()
     }
 
-    /// Height of the live region — the `avt` emulator grid / child PTY, and the
-    /// row count the engine renders its running-tests block into. Derived from the
-    /// surface's reserved rows (see [`super::LIVE_ROWS`]); the child-runner sizes its PTY
-    /// to this.
+    /// Rows available for the live region above the pinned panel — the size of the
+    /// `avt` grid, each child PTY (build/compile), and the ceiling the engine's
+    /// running block grows to (see [`super::live_rows_for`]). Read fresh from the
+    /// size watch so a SIGWINCH resize reaches the child's PTY, not just the grid.
     pub fn live_rows(&self) -> u16 {
-        self.live_rows
+        super::live_rows_for(self.size.borrow().rows)
     }
 
     /// Whether the user has asked to abort (Ctrl-C). Phases check this between
@@ -254,7 +251,7 @@ fn render_thread(
     cancel: CancelSource,
     cancel_panel: CancelPanelFn,
     session_start: Instant,
-    ready_tx: std::sync::mpsc::Sender<io::Result<u16>>,
+    ready_tx: std::sync::mpsc::Sender<io::Result<()>>,
 ) {
     let surface = match Surface::bottom_panel() {
         Ok(s) => s,
@@ -263,7 +260,7 @@ fn render_thread(
             return;
         }
     };
-    let _ = ready_tx.send(Ok(surface.live_rows()));
+    let _ = ready_tx.send(Ok(()));
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -291,15 +288,16 @@ async fn render_loop(
     cancel_panel: CancelPanelFn,
     session_start: Instant,
 ) {
-    // The live-region height the surface reserved: the `avt` grid's row count, held
-    // for the session (the inline viewport can't resize, so only cols change on
-    // SIGWINCH). Single source, derived from the surface — no restated constant.
-    let live_rows = surface.live_rows();
+    // The `avt` grid's row count: the full height above the pinned panel, so a
+    // child's in-place progress block up to this tall stays live and repaints in
+    // place rather than being sliced into scrollback. The footer is drawn only as
+    // tall as the live content actually is (`trimmed_view`). Recomputed on resize.
+    let mut live_rows = surface.live_rows();
     let mut vt = new_vt(surface.cols(), live_rows);
     let mut carry: Vec<u8> = Vec::new();
-    // Scrollback awaiting the next atomic present (avt scroll-off + engine lines),
-    // already bridged to ratatui lines.
-    let mut pending: Vec<Line<'static>> = Vec::new();
+    // Committed lines awaiting the next atomic present (avt scroll-off + engine
+    // lines), as ready-to-write ANSI strings.
+    let mut pending: Vec<String> = Vec::new();
     let mut scene: Option<SceneFn> = None;
     let mut clock = FrameClock::new();
     let mut pgid: Option<i32> = None;
@@ -331,7 +329,9 @@ async fn render_loop(
                     clock.mark_dirty();
                 }
                 Some(Msg::Scrollback(ansi)) => {
-                    pending.extend(surface.scrollback_from_ansi(&ansi));
+                    // Already terminal-ready ANSI (engine verdicts / phase lines);
+                    // one committed line per text line.
+                    pending.extend(ansi.lines().map(str::to_string));
                     clock.mark_dirty();
                 }
                 Some(Msg::FlushLive) => {
@@ -369,9 +369,11 @@ async fn render_loop(
 
             _ = recv_signal(&mut sigwinch) => {
                 let size = current_pty_size();
-                surface.set_cols(size.cols);
+                surface.set_size(size.cols, size.rows);
+                // The grid follows the new terminal height; resize it to match.
                 // Floor to 1: a 0 dimension underflow-panics inside `avt::resize`
                 // (see `new_vt`); terminals can briefly report 0 during a resize.
+                live_rows = surface.live_rows();
                 let sb: Vec<avt::Line> = vt
                     .resize((size.cols.max(1)) as usize, (live_rows.max(1)) as usize)
                     .scrollback
@@ -403,10 +405,11 @@ async fn render_loop(
                 };
                 // Live region: the scene's explicit content (the run phase's
                 // running-tests block) when present, else the child's live `avt`
-                // grid (compile/build phases mirror the subprocess output).
-                let live_lines: Vec<Line<'static>> = match &live_src {
-                    Some(s) => surface.scrollback_from_ansi(s),
-                    None => vt.view().map(bridge::avt_line).collect(),
+                // grid trimmed to its used rows (compile/build phases) — so the
+                // footer is exactly as tall as the child's live output, no blanks.
+                let live_lines: Vec<String> = match &live_src {
+                    Some(s) => s.lines().map(str::to_string).collect(),
+                    None => bridged(&trimmed_view(&vt)),
                 };
                 surface.present(&pending, &live_lines, &left, &right);
                 pending.clear();
@@ -470,20 +473,20 @@ fn new_vt(cols: u16, rows: u16) -> Vt {
 }
 
 /// Fold a PTY chunk into the emulator: decode, feed `avt`, and accumulate
-/// scrolled-off lines (bridged) into `pending` for the next present.
-fn feed(vt: &mut Vt, carry: &mut Vec<u8>, pending: &mut Vec<Line<'static>>, bytes: &[u8]) {
+/// scrolled-off lines (as ANSI strings) into `pending` for the next present.
+fn feed(vt: &mut Vt, carry: &mut Vec<u8>, pending: &mut Vec<String>, bytes: &[u8]) {
     let text = decode(carry, bytes);
     if text.is_empty() {
         return;
     }
     for line in vt.feed_str(&text).scrollback {
-        pending.push(bridge::avt_line(&line));
+        pending.push(bridge::avt_line_to_ansi(&line));
     }
 }
 
-/// Bridge owned `avt` scrollback lines to ratatui lines.
-fn bridged(lines: &[avt::Line]) -> Vec<Line<'static>> {
-    lines.iter().map(bridge::avt_line).collect()
+/// Convert owned `avt` lines to ready-to-write ANSI strings.
+fn bridged(lines: &[avt::Line]) -> Vec<String> {
+    lines.iter().map(bridge::avt_line_to_ansi).collect()
 }
 
 /// The live grid trimmed of trailing blank rows (avt pads to full height).
@@ -609,23 +612,13 @@ mod tests {
         assert!(carry.is_empty());
     }
 
-    /// Concatenate a bridged line's span text — for asserting grid/scrollback
-    /// content without caring about styling.
-    fn line_text(line: &Line<'static>) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
     #[test]
     fn trimmed_view_drops_trailing_blanks_but_keeps_interior_ones() {
         // A 4-row grid: content on row 0 and row 2, an interior blank on row 1,
         // and a trailing blank on row 3. Only the trailing blank should go.
         let mut vt = new_vt(10, 4);
         let _ = vt.feed_str("top\r\n\r\nmid\r\n");
-        let trimmed = trimmed_view(&vt);
-        let texts: Vec<String> = trimmed
-            .iter()
-            .map(|l| line_text(&bridge::avt_line(l)))
-            .collect();
+        let texts = bridged(&trimmed_view(&vt));
         assert_eq!(
             texts,
             vec!["top".to_string(), String::new(), "mid".to_string()]
@@ -644,17 +637,11 @@ mod tests {
         // two off the top (oldest first) into `pending`; the third stays live.
         let mut vt = new_vt(10, 2);
         let mut carry = Vec::new();
-        let mut pending: Vec<Line<'static>> = Vec::new();
+        let mut pending: Vec<String> = Vec::new();
         feed(&mut vt, &mut carry, &mut pending, b"a\r\nb\r\nc\r\n");
 
-        let scrolled: Vec<String> = pending.iter().map(line_text).collect();
-        assert_eq!(scrolled, vec!["a".to_string(), "b".to_string()]);
-
-        let live: Vec<String> = trimmed_view(&vt)
-            .iter()
-            .map(|l| line_text(&bridge::avt_line(l)))
-            .collect();
-        assert_eq!(live, vec!["c".to_string()]);
+        assert_eq!(pending, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(bridged(&trimmed_view(&vt)), vec!["c".to_string()]);
     }
 
     #[test]
@@ -663,12 +650,12 @@ mod tests {
         // the first (partial) feed produces nothing, the second completes it.
         let mut vt = new_vt(10, 1);
         let mut carry = Vec::new();
-        let mut pending: Vec<Line<'static>> = Vec::new();
+        let mut pending: Vec<String> = Vec::new();
         feed(&mut vt, &mut carry, &mut pending, &[0xC3]); // lead byte of 'é'
         assert_eq!(carry, vec![0xC3], "partial char buffered, not fed");
         feed(&mut vt, &mut carry, &mut pending, &[0xA9]); // continuation
         assert!(carry.is_empty());
-        let live = line_text(&bridge::avt_line(&vt.view().next().unwrap().clone()));
+        let live = bridge::avt_line_to_ansi(&vt.view().next().unwrap().clone());
         assert_eq!(live, "é");
     }
 }

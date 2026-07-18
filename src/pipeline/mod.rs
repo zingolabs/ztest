@@ -27,6 +27,7 @@ pub mod build;
 pub mod cluster;
 pub mod events;
 pub mod images;
+pub mod remote_compile;
 
 pub use self::archives::{ArchiveEntry, ArchivesOutcome};
 pub use self::build::{BuildOutcome, SelectedBinary};

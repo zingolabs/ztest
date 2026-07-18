@@ -463,6 +463,15 @@ fn run_inner(
     let cancelled = || console.is_some_and(Console::cancelled);
     let cancel_exit = || cancel_exit(work_rt, &run.run_id, opts.no_cleanup);
 
+    // On-cluster-build targets (OpenShift) ship *source*, not artifacts: the test
+    // binaries compile in the builder pod, so the laptop's compile + runner-image
+    // build are replaced by a source rsync + remote compile + `crane` bake. Every
+    // other topology (local kind, generic remote docker) keeps the local-compile
+    // path below unchanged.
+    if crate::backends::image::builds_on_cluster() {
+        return run_inner_on_cluster(work_rt, opts, theme, state, console, run);
+    }
+
     let outcome = match pipeline_phase(
         work_rt,
         &opts.list_args,
@@ -516,6 +525,40 @@ fn run_inner(
     } else {
         ImagePhaseOutcome::default()
     };
+    launch_engine(
+        work_rt,
+        opts,
+        theme,
+        state,
+        console,
+        run,
+        &outcome.probe,
+        &outcome.build,
+        image_phase,
+    )
+}
+
+/// The shared tail of a run: fold the resolved build + image phases into the
+/// engine and execute. Both the local-compile path ([`run_inner`]) and the
+/// on-cluster-compile path ([`run_inner_on_cluster`]) converge here so the
+/// (delicate) [`engine::EngineInput`] assembly lives in exactly one place. The
+/// `build`/`probe` are borrowed (the caller keeps ownership); `image_phase` is
+/// consumed for its resource maps.
+#[allow(clippy::too_many_arguments)]
+fn launch_engine(
+    work_rt: &tokio::runtime::Runtime,
+    opts: &RunOptions,
+    theme: &Theme,
+    state: &mut BannerState,
+    console: Option<&Console>,
+    run: &crate::naming::RunCoords,
+    probe: &ProbeOutcome,
+    build: &BuildOutcome,
+    image_phase: ImagePhaseOutcome,
+) -> ExitCode {
+    let cancelled = || console.is_some_and(Console::cancelled);
+    let cancel_exit = || cancel_exit(work_rt, &run.run_id, opts.no_cleanup);
+
     let qos_by_binary = &image_phase.qos_by_binary;
     if cancelled() {
         return cancel_exit();
@@ -523,7 +566,7 @@ fn run_inner(
 
     // QoS scheduling plan (§8 planning pass): group the dumped tiers and estimate
     // the wave structure against probed capacity.
-    state.qos_plan = qos_plan_from(qos_by_binary, &outcome.probe);
+    state.qos_plan = qos_plan_from(qos_by_binary, probe);
 
     // Final panel refresh with all phases resolved.
     if let Some(c) = console {
@@ -535,7 +578,7 @@ fn run_inner(
         let _ = stdout().write_all(preflight::render(state, theme).as_bytes());
     }
 
-    if let BuildOutcome::Failed { .. } = outcome.build {
+    if let BuildOutcome::Failed { .. } = build {
         // Phase B is `cargo nextest list`; a non-zero exit is a build failure.
         return exit(NextestExitCode::BUILD_FAILED);
     }
@@ -556,7 +599,7 @@ fn run_inner(
 
     // No tests selected: honor `--no-tests` (nextest default `fail` ⇒ exit 4).
     // Route through the console so the message survives the render-thread teardown.
-    if let BuildOutcome::Ok { test_count: 0, .. } = outcome.build {
+    if let BuildOutcome::Ok { test_count: 0, .. } = build {
         let (msg, code) = if opts.no_tests_is_error() {
             (
                 "ztest run: no tests to run (--no-tests=fail)",
@@ -580,14 +623,14 @@ fn run_inner(
     // including other concurrent `ztest run`s' Guaranteed pods, so independent
     // runs coexist: whoever probes first packs, the next queues on the
     // remainder. A probed cluster is required.
-    let ceiling = match &outcome.probe {
+    let ceiling = match probe {
         ProbeOutcome::Ok { capacity, .. } => capacity.free(),
         _ => {
             eprintln!("ztest run: requires a probed cluster (no kubeconfig / probe unavailable)");
             return exit(NextestExitCode::SETUP_ERROR);
         }
     };
-    let (summary, selected_binaries) = match &outcome.build {
+    let (summary, selected_binaries) = match build {
         BuildOutcome::Ok {
             summary,
             selected_binaries,
@@ -623,12 +666,274 @@ fn run_inner(
     code
 }
 
+/// The on-cluster-compile path: for an OpenShift target the laptop ships *source*
+/// and the builder pod produces the binaries. Replaces [`run_inner`]'s local
+/// compile + Phase-C dump with a single drive of the
+/// builder ([`pipeline::remote_compile::compile_on_cluster`]): source rsync →
+/// `cargo nextest list` → per-binary inventory dump → `crane` bake of the runner
+/// image. Component dev images + data seeds still provision through the shared
+/// [`provision_and_resolve`]; the engine tail is the shared [`launch_engine`].
+fn run_inner_on_cluster(
+    work_rt: &tokio::runtime::Runtime,
+    opts: &RunOptions,
+    theme: &Theme,
+    state: &mut BannerState,
+    console: Option<&Console>,
+    run: &crate::naming::RunCoords,
+) -> ExitCode {
+    use crate::pipeline::images;
+    use crate::preflight::BuildState;
+
+    let cancelled = || console.is_some_and(Console::cancelled);
+    let cancel_exit = || cancel_exit(work_rt, &run.run_id, opts.no_cleanup);
+
+    // Phase A: probe (+ archives) — we need the client to drive the builder pod,
+    // and the probe's free-capacity ceiling for the engine. Archives feed the
+    // banner's snapshot row exactly as the local path does.
+    let (probe, client) = work_rt.block_on(async {
+        let ev_tx = pipeline::channel().0;
+        let (probe, client) = pipeline::cluster::run(&ev_tx).await;
+        if let Some(c) = &client {
+            let archives = pipeline::archives::discover(c, &ev_tx).await;
+            apply_update(state, Update::Archives(archives));
+        } else {
+            apply_update(state, Update::ArchivesSkipped);
+        }
+        apply_update(state, Update::Probe(probe.clone()));
+        (probe, client)
+    });
+    if cancelled() {
+        return cancel_exit();
+    }
+
+    // A hard probe failure aborts before we drive the builder (same as the local
+    // path): surface the detail into scrollback / stderr, then exit.
+    if let ProbeOutcome::Failed { detail } = &probe {
+        let msg = format!("ztest run: cluster probe failed — {detail}");
+        match console {
+            Some(c) => c.scrollback(format!("{msg}\n")),
+            None => eprintln!("{msg}"),
+        }
+        return exit(NextestExitCode::SETUP_ERROR);
+    }
+    let Some(client) = client else {
+        eprintln!(
+            "ztest run: on-cluster build requires a reachable cluster (no kubeconfig / probe unavailable)"
+        );
+        return exit(NextestExitCode::SETUP_ERROR);
+    };
+
+    // Registry coordinates for the in-pod `crane` bake: the seeded runner base to
+    // append onto and the repo to push into. These are the *in-cluster* pull
+    // addresses (`crane` runs in the pod), which is exactly `ZTEST_IMAGE_REGISTRY`.
+    let (Some(base_ref), Some(runner_repo_ref)) = (
+        crate::backends::image::runner_base_ref(),
+        crate::backends::image::runner_repo_ref(),
+    ) else {
+        eprintln!(
+            "ztest run: on-cluster build requires ZTEST_IMAGE_REGISTRY (the in-cluster pull address)"
+        );
+        return exit(NextestExitCode::SETUP_ERROR);
+    };
+    let refs = pipeline::remote_compile::BakeRefs {
+        base_ref,
+        runner_repo_ref,
+    };
+
+    // Phase B/C on the cluster. No local child streams output, so the panel's one
+    // live "Inventory" row names the *current* remote sub-phase (waiting → syncing
+    // → compiling → dumping → baking), its timer reset at each transition by the
+    // `on_phase` callback below; the render thread animates the spinner/clock
+    // between updates, independent of this `block_on`.
+    let started = Instant::now();
+
+    // Compile output: with a console, the builder compiles under a real PTY and
+    // its raw bytes (cargo's live, in-place progress bar) feed the console's
+    // terminal emulator — the bottom region a `live: None` scene shows — exactly
+    // as the local PTY reader does. CI (no console) has nothing to emulate, so the
+    // compile runs tty-free and each line goes to stderr.
+    let byte_sink = |bytes: &[u8]| {
+        if let Some(c) = console {
+            c.output(bytes.to_vec());
+        }
+    };
+    let line_sink = |line: &str| eprintln!("{line}");
+    let compile_out = match console {
+        Some(c) => pipeline::remote_compile::CompileOut::Pty {
+            size: (c.size().cols, c.live_rows()),
+            sink: &byte_sink,
+        },
+        None => pipeline::remote_compile::CompileOut::Lines { sink: &line_sink },
+    };
+
+    // Structured phase events: `remote_compile` reports transitions; here — where
+    // the theme lives — we colour each line and drive the live panel row.
+    let mut on_phase = |ev: pipeline::remote_compile::Phase<'_>| {
+        use owo_colors::OwoColorize as _;
+        use pipeline::remote_compile::Phase;
+        let (line, new_phase) = match ev {
+            Phase::Start(label) => (
+                format!("{} {label}…", "•".style(theme.styles.dim)),
+                Some(label.to_string()),
+            ),
+            Phase::Done { label, dur } => (
+                format!(
+                    "  {} {label} {}",
+                    theme.chars.ok.style(theme.styles.pass),
+                    format!("({})", fmt_dur(dur)).style(theme.styles.dim),
+                ),
+                None,
+            ),
+            Phase::Step { label, dur } => (
+                format!(
+                    "    {} {label} {}",
+                    theme.chars.ok.style(theme.styles.pass),
+                    format!("({})", fmt_dur(dur)).style(theme.styles.dim),
+                ),
+                None,
+            ),
+            Phase::Note(text) => (format!("{} {text}", "•".style(theme.styles.dim)), None),
+        };
+        match console {
+            Some(c) => {
+                // Commit any live-grid content (the compile's trailing crates)
+                // into scrollback before this boundary line, so history stays in
+                // order: compile output, then the `✓ compiled …` that follows it.
+                c.flush_live();
+                c.scrollback(format!("{line}\n"));
+            }
+            None => eprintln!("{line}"),
+        }
+        if let Some(phase) = new_phase {
+            state.build = BuildState::Compiling {
+                started_at: Instant::now(),
+                phase: Some(phase),
+            };
+            if let Some(c) = console {
+                push_preflight_scene(c, state, &Transfers::default(), "Compiling", theme);
+            }
+        }
+    };
+
+    let remote = work_rt.block_on(pipeline::remote_compile::compile_on_cluster(
+        &client,
+        &opts.list_args,
+        &refs,
+        Some(compile_out),
+        Some(&mut on_phase),
+    ));
+    drop(on_phase);
+    if cancelled() {
+        return cancel_exit();
+    }
+    let remote = match remote {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("ztest run: on-cluster compile failed — {e}");
+            match console {
+                Some(c) => {
+                    // Commit the live grid (a failing compile's own output) before
+                    // the error line, or teardown appends the grid's tail *after*
+                    // it — the error would land above the output that explains it.
+                    c.flush_live();
+                    c.scrollback(format!("{msg}\n"));
+                }
+                None => eprintln!("{msg}"),
+            }
+            return exit(NextestExitCode::BUILD_FAILED);
+        }
+    };
+
+    // Reflect the resolved build into the banner (counts + elapsed).
+    let build = remote.build;
+    state.build = match &build {
+        BuildOutcome::Ok {
+            test_count,
+            binary_count,
+            ..
+        } => BuildState::Ok {
+            test_count: *test_count,
+            binary_count: *binary_count,
+            elapsed: started.elapsed(),
+        },
+        BuildOutcome::Failed { exit_code, stage } => BuildState::Failed {
+            exit_code: *exit_code,
+            stage: *stage,
+            elapsed: started.elapsed(),
+        },
+    };
+
+    // Component dev images + data seeds still provision through the resource graph
+    // (the OpenShift backend builds them on-cluster too); only the runner image is
+    // already baked, so it rides in Prebaked.
+    let (images, seeds, images_by_binary, deps_by_binary) = match remote.dump {
+        images::DumpOutcome::Discovered {
+            images,
+            seeds,
+            images_by_binary,
+            deps_by_binary,
+        } => (images, seeds, images_by_binary, deps_by_binary),
+        // `compile_on_cluster` only ever returns `Discovered` (a dump failure
+        // surfaces as its `Err` above), but handle it rather than unwrap.
+        images::DumpOutcome::Failed { detail } => {
+            let msg = format!("ztest run: on-cluster inventory dump failed — {detail}");
+            match console {
+                Some(c) => {
+                    c.flush_live();
+                    c.scrollback(format!("{msg}\n"));
+                }
+                None => eprintln!("{msg}"),
+            }
+            return exit(NextestExitCode::SETUP_ERROR);
+        }
+    };
+    let image_phase = provision_and_resolve(
+        work_rt,
+        images,
+        seeds,
+        images_by_binary,
+        deps_by_binary,
+        remote.qos_by_binary,
+        RunnerSource::Prebaked(remote.runner_image_ref),
+        console,
+        state,
+        theme,
+    );
+    if cancelled() {
+        return cancel_exit();
+    }
+
+    launch_engine(
+        work_rt,
+        opts,
+        theme,
+        state,
+        console,
+        run,
+        &probe,
+        &build,
+        image_phase,
+    )
+}
+
 /// Push a fresh preflight/build/image panel recipe to the render thread. Called
 /// after every `BannerState` / `Transfers` mutation; the closure captures an
 /// immutable snapshot of both columns and re-renders them with the render
 /// thread's advancing clock so spinners animate between updates. `label` is the
 /// left column's right-aligned action word (`Preflight`, `Building`); `transfers`
 /// is the right column's live acquisition set.
+/// Format a phase duration for a `✓ … (…)` scrollback line: sub-second
+/// precision under a minute (`0.3s`, `25.4s`), `m`/`s` past it (`1m05s`).
+fn fmt_dur(d: std::time::Duration) -> String {
+    let s = d.as_secs_f64();
+    if s < 60.0 {
+        format!("{s:.1}s")
+    } else {
+        let t = d.as_secs();
+        format!("{}m{:02}s", t / 60, t % 60)
+    }
+}
+
 fn push_preflight_scene(
     con: &Console,
     state: &BannerState,
@@ -644,6 +949,22 @@ fn push_preflight_scene(
         right: preflight::render_transfers(&tx, elapsed, &theme),
         // Live region mirrors the child's own output (cargo compile) via the avt
         // grid during these phases.
+        live: None,
+    });
+}
+
+/// The `Building`-phase scene. The live region stays `None` so it derives from
+/// the avt grid, where every build streams its native output — local
+/// `docker`/`kind` builds and the on-cluster `oc start-build --follow` alike.
+/// Re-rendered each frame with the render thread's clock so the panel's spinners
+/// and per-step elapsed animate between events.
+fn push_building_scene(con: &Console, state: &BannerState, transfers: &Transfers, theme: &Theme) {
+    let snap = state.clone();
+    let tx = transfers.clone();
+    let theme = theme.clone();
+    con.scene(move |elapsed| SceneFrame {
+        left: preflight::render_preflight_panel(&snap, "Building", elapsed, &theme),
+        right: preflight::render_transfers(&tx, elapsed, &theme),
         live: None,
     });
 }
@@ -872,7 +1193,10 @@ fn pipeline_console(
         // whereas `run --no-run` emits only cargo's compile output. Pass 2
         // (`index`) does the JSON inventory.
         let started_at = Instant::now();
-        state.build = BuildState::Compiling { started_at };
+        state.build = BuildState::Compiling {
+            started_at,
+            phase: None,
+        };
         push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
 
         let mut args = vec![
@@ -1075,13 +1399,14 @@ fn apply_event(state: &mut BannerState, event: pipeline::events::Event) {
         Event::BuildStarted => {
             state.build = BuildState::Compiling {
                 started_at: std::time::Instant::now(),
+                phase: None,
             };
         }
         Event::BuildIndexing => {
             // Preserve the original `started_at` so the running clock
             // measures the whole Phase B, not just pass 2.
             let started_at = match &state.build {
-                BuildState::Compiling { started_at } => *started_at,
+                BuildState::Compiling { started_at, .. } => *started_at,
                 _ => std::time::Instant::now(),
             };
             state.build = BuildState::Indexing { started_at };
@@ -1116,7 +1441,7 @@ fn apply_event(state: &mut BannerState, event: pipeline::events::Event) {
 fn phase_b_elapsed(build: &crate::preflight::BuildState) -> std::time::Duration {
     use crate::preflight::BuildState;
     match build {
-        BuildState::Compiling { started_at } | BuildState::Indexing { started_at } => {
+        BuildState::Compiling { started_at, .. } | BuildState::Indexing { started_at } => {
             started_at.elapsed()
         }
         _ => std::time::Duration::ZERO,
@@ -1224,10 +1549,6 @@ fn run_image_phases(
     _session_start: Instant,
 ) -> ImagePhaseOutcome {
     use crate::pipeline::images;
-    use crate::resource;
-    use std::collections::HashMap;
-
-    let cancelled = || console.is_some_and(Console::cancelled);
 
     // Phase C, inventory dump (discovery). Spawns every test binary with
     // `ZTEST_DUMP_INVENTORY=1`; the render thread keeps the panel live on its own
@@ -1235,7 +1556,7 @@ fn run_image_phases(
     // data seeds the selection declares, plus the per-binary image and per-test
     // seed edges.
     let (outcome, qos_by_binary) = work_rt.block_on(images::discover(binaries));
-    let (mut images, seeds, images_by_binary, deps_by_binary) = match outcome {
+    let (images, seeds, images_by_binary, deps_by_binary) = match outcome {
         images::DumpOutcome::Discovered {
             images,
             seeds,
@@ -1251,35 +1572,71 @@ fn run_image_phases(
         }
     };
 
-    // Cluster (pod-per-test) execution — the default against a *remote* cluster —
-    // needs a "runner" image carrying the compiled test binaries in the registry.
-    // Build it here alongside the component images so it rides the same
-    // provisioning path (docker build → registry push, incl. the OpenShift
-    // internal registry). On local kind the compute is already on this machine, so
-    // we skip it and fall back to local-process execution.
-    let backend = crate::backends::image::from_env();
-    let runner_entry =
-        if crate::backends::image::is_remote() && !binaries.is_empty() && !cancelled() {
-            match prepare_runner_image(binaries, backend.as_ref()) {
-                Ok(entry) => {
-                    images.push(entry.clone());
-                    Some(entry)
-                }
-                Err(e) => {
-                    return ImagePhaseOutcome {
-                        failure: Some(format!("runner image: {e}")),
-                        qos_by_binary,
-                        ..Default::default()
-                    };
-                }
-            }
-        } else {
-            None
-        };
+    // This path is local kind only: the compute is on this machine, so tests run
+    // in-process — no runner image. (OpenShift compiles + bakes the runner via
+    // `crane` on the cluster in a separate path, short-circuited earlier in `run`.)
+
+    provision_and_resolve(
+        work_rt,
+        images,
+        seeds,
+        images_by_binary,
+        deps_by_binary,
+        qos_by_binary,
+        RunnerSource::None,
+        console,
+        state,
+        theme,
+    )
+}
+
+/// Where the runner image (the pod-per-test image carrying the compiled test
+/// binaries) comes from. Local kind runs tests in-process with no runner image;
+/// the on-cluster path has already baked + pushed it via `crane` in the builder
+/// pod, so it only needs its reference threaded through.
+enum RunnerSource {
+    /// No runner image — local kind runs tests in-process on this machine.
+    None,
+    /// Already pushed to the registry by the on-cluster builder; carries the pull
+    /// reference the runner pods use.
+    Prebaked(String),
+}
+
+/// Provision the component dev images + data seeds a selection declares and
+/// resolve the engine's admission inputs (dependency edges, provisioned states,
+/// component image refs, runner image ref). Shared by the local-compile path
+/// ([`run_image_phases`]) and the on-cluster-compile path
+/// ([`run_inner_on_cluster`]): both arrive here with the same dump-derived data,
+/// differing only in where the runner image came from ([`RunnerSource`]).
+#[allow(clippy::too_many_arguments)]
+fn provision_and_resolve(
+    work_rt: &tokio::runtime::Runtime,
+    images: Vec<crate::inventory::DevImageEntry>,
+    seeds: Vec<crate::inventory::SeedEntry>,
+    images_by_binary: Vec<(String, Vec<crate::inventory::DevImageEntry>)>,
+    deps_by_binary: Vec<(String, Vec<crate::inventory::TestDepEntry>)>,
+    qos_by_binary: Vec<(String, Vec<QosEntry>)>,
+    runner: RunnerSource,
+    console: Option<&Console>,
+    state: &mut BannerState,
+    theme: &Theme,
+) -> ImagePhaseOutcome {
+    use crate::resource;
+    use std::collections::HashMap;
+
+    let cancelled = || console.is_some_and(Console::cancelled);
+
+    // The prebaked ref survives even the no-resources short-circuit below: an
+    // on-cluster run with no component images / seeds still has a runner to run.
+    let prebaked = match &runner {
+        RunnerSource::Prebaked(r) => Some(r.clone()),
+        RunnerSource::None => None,
+    };
 
     if (images.is_empty() && seeds.is_empty()) || cancelled() {
         return ImagePhaseOutcome {
             qos_by_binary,
+            runner_image: prebaked,
             ..Default::default()
         };
     }
@@ -1291,7 +1648,7 @@ fn run_image_phases(
     // provisioning's live build output lands on a clean grid.
     if let Some(c) = console {
         c.flush_live();
-        push_preflight_scene(c, state, &registry.snapshot(), "Building", theme);
+        push_building_scene(c, state, &registry.snapshot(), theme);
     }
 
     // Plan the resource graph (images + seeds) and provision it. `probe` skips
@@ -1364,20 +1721,20 @@ fn run_image_phases(
         loop {
             tokio::select! {
                 states = &mut prov => {
-                    // Drain any notes queued after the last state transition, then
+                    // Drain any events queued after the last state transition, then
                     // paint the final (usually empty) right column.
                     while let Ok(ev) = rx.try_recv() {
                         registry.apply(ev);
                     }
                     if let Some(c) = console {
-                        push_preflight_scene(c, state, &registry.snapshot(), "Building", theme);
+                        push_building_scene(c, state, &registry.snapshot(), theme);
                     }
                     break states;
                 }
                 Some(ev) = rx.recv() => {
                     registry.apply(ev);
                     if let Some(c) = console {
-                        push_preflight_scene(c, state, &registry.snapshot(), "Building", theme);
+                        push_building_scene(c, state, &registry.snapshot(), theme);
                     }
                 }
             }
@@ -1463,63 +1820,50 @@ fn run_image_phases(
                     "resource {id:?} failed to provision ({detail}); tests needing it will be skipped"
                 )
             };
-            eprintln!("ztest run: {msg}");
-            if let Some(c) = console {
-                c.scrollback(format!("ztest: {msg}\n"));
+            // Route through the console's durable scrollback, never a raw
+            // `eprintln` — the render thread owns the terminal, so a direct
+            // stderr write smears across the live panel (and its teardown can
+            // wipe it). Off a TTY there's no render thread, so `eprintln` is right.
+            match console {
+                Some(c) => c.scrollback(format!("ztest: {msg}\n")),
+                None => eprintln!("ztest run: {msg}"),
             }
         }
     }
 
-    // Component dev-image references, keyed by their file-free `spec_key`, so an
-    // in-pod test (baked runner image, no Dockerfile) resolves them to the
-    // already-built-and-pushed reference instead of recomputing the content hash.
-    // Only meaningful for remote runs, where tests execute in pods; local kind
-    // mounts the source tree and resolves directly. A component whose build failed
-    // is omitted — its dependent tests are already skipped upstream.
+    // The build manifest: `DevImageId → pull reference` for every dev image
+    // present after provisioning. Keyed by the path-free `DevImageId` (not the
+    // build-context bytes) so a separately-compiled in-pod test derives the same
+    // key and resolves the already-built reference instead of rebuilding from a
+    // Dockerfile the baked runner image doesn't carry. Seeded process-globally
+    // here (for local kind, where preflight and tests share a process) and
+    // forwarded into each remote runner pod via `ZTEST_IMAGE_REFS`. A component
+    // whose build failed is omitted — its dependent tests are already skipped.
     let mut image_refs = std::collections::BTreeMap::new();
-    if crate::backends::image::is_remote() {
-        for entry in images_by_binary.iter().flat_map(|(_, entries)| entries) {
-            if let Ok(id) = resource::image_node_id(entry)
-                && matches!(resource_states.get(&id), Some(NodeState::Failed(_)))
-            {
-                continue;
-            }
-            let rv = entry.rust_version.as_deref();
-            if let Ok(tag) =
-                crate::backends::image::dev_tag(&entry.source, &entry.features, &entry.repo, rv)
-            {
-                let key = crate::backends::image::spec_key(
-                    &entry.source,
-                    &entry.features,
-                    &entry.repo,
-                    rv,
-                );
-                image_refs
-                    .entry(key)
-                    .or_insert_with(|| backend.reference(&tag));
-            }
+    for entry in images_by_binary.iter().flat_map(|(_, entries)| entries) {
+        if let Ok(id) = resource::image_node_id(entry)
+            && matches!(resource_states.get(&id), Some(NodeState::Failed(_)))
+        {
+            continue;
+        }
+        let rv = entry.rust_version.as_deref();
+        if let Ok(tag) =
+            crate::backends::image::dev_tag(&entry.source, &entry.features, &entry.repo, rv)
+        {
+            let key = crate::backends::image::DevImageId::of(&entry.repo, &entry.features, rv, &entry.source);
+            image_refs
+                .entry(key.as_str().to_string())
+                .or_insert_with(|| crate::backends::image::pod_reference(&tag));
         }
     }
+    crate::backends::image::seed_dev_images(&image_refs);
 
-    // Resolve the runner image's pull reference from its provisioned state. A
-    // failed build is fatal for a remote run: silently falling back to local
-    // execution would peg the laptop — the exact thing pod execution exists to
-    // avoid — so surface it and abort.
-    let runner_image = match &runner_entry {
-        Some(entry) => match resolve_runner_image(entry, backend.as_ref(), &resource_states) {
-            Ok(reference) => Some(reference),
-            Err(e) => {
-                return ImagePhaseOutcome {
-                    failure: Some(format!("runner image: {e}")),
-                    qos_by_binary,
-                    resource_deps,
-                    resource_states,
-                    runner_image: None,
-                    image_refs,
-                };
-            }
-        },
-        None => None,
+    // Resolve the runner image's pull reference. A prebaked (on-cluster) runner
+    // was already pushed by `crane`, so its ref passes straight through; local kind
+    // has no runner (tests run in-process).
+    let runner_image = match runner {
+        RunnerSource::Prebaked(r) => Some(r),
+        RunnerSource::None => None,
     };
 
     ImagePhaseOutcome {
@@ -1529,136 +1873,6 @@ fn run_image_phases(
         resource_states,
         runner_image,
         image_refs,
-    }
-}
-
-/// Split a test-binary path `<workspace>/target/<profile>/deps/<bin>` into its
-/// workspace root and cargo profile.
-fn workspace_and_profile(binary_path: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
-    let s = binary_path.to_str()?;
-    let idx = s.find("/target/")?;
-    let workspace = std::path::PathBuf::from(&s[..idx]);
-    let profile = s[idx + "/target/".len()..].split('/').next()?.to_string();
-    if profile.is_empty() {
-        return None;
-    }
-    Some((workspace, profile))
-}
-
-/// Load the nix runner base into the local docker daemon and generate the baked
-/// tests-image entry. The build context is a *staged* minimal tree — only the
-/// selected test binaries plus the `deps/` dynamic libs (`.so`), never the
-/// multi-GB `.rlib`/`.rmeta` compile artifacts — so the image and its content
-/// hash stay small. Flows through the normal image graph (build → registry push).
-fn prepare_runner_image(
-    binaries: &[pipeline::SelectedBinary],
-    backend: &dyn crate::backends::image::ImageProvider,
-) -> Result<crate::inventory::DevImageEntry, String> {
-    use crate::backends::image::DevSource;
-    let first = binaries
-        .first()
-        .ok_or("no test binaries to bake into a runner image")?;
-    let (workspace, profile) = workspace_and_profile(&first.binary_path).ok_or_else(|| {
-        format!(
-            "cannot derive workspace/profile from {}",
-            first.binary_path.display()
-        )
-    })?;
-    // Where the outputs must land in the image so `WorkItem::binary_path`
-    // resolves unchanged.
-    let dest_abs = workspace
-        .join(format!("target/{profile}"))
-        .to_string_lossy()
-        .into_owned();
-
-    let base = backend
-        .prepare_runner_base(&workspace)
-        .map_err(|e| e.to_string())?;
-
-    let context = workspace.join("target").join(".ztest-runner-ctx");
-    stage_runner_context(&context.join("deps"), binaries)?;
-
-    // Each selected binary is its own `COPY` layer (see `baked_dockerfile`).
-    let names: Vec<String> = binaries
-        .iter()
-        .filter_map(|b| b.binary_path.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .collect();
-    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-
-    // The Dockerfile lives outside the context so it isn't folded into the hash.
-    let dockerfile = workspace.join("target").join(".ztest-runner.Dockerfile");
-    let contents = crate::engine::pod_runner::baked_dockerfile(
-        &base.from_ref,
-        &base.base_id,
-        &dest_abs,
-        &name_refs,
-    );
-    std::fs::write(&dockerfile, contents).map_err(|e| format!("write Dockerfile: {e}"))?;
-
-    Ok(crate::inventory::DevImageEntry {
-        repo: crate::engine::pod_runner::RUNNER_REPO.to_string(),
-        source: DevSource::Local {
-            dockerfile,
-            context,
-        },
-        features: Vec::new(),
-        rust_version: None,
-    })
-}
-
-/// Stage the selected test binaries into a fresh `<ctx>/deps`, stripped.
-///
-/// Only the binaries are copied: a Rust test binary statically links its rlibs
-/// and dynamically needs only base-image libraries (glibc/libgcc/libstdc++/
-/// rocksdb — confirmed by `ldd`), so no `deps/*.so` ship. `--strip-all` drops
-/// both debuginfo and the symbol table, taking each debug binary from ~350 MB to
-/// ~30 MB. BuildKit keys each per-binary `COPY` layer on content, so an
-/// unchanged binary's layer is reused and `docker push` skips it.
-fn stage_runner_context(
-    staged_deps: &std::path::Path,
-    binaries: &[pipeline::SelectedBinary],
-) -> Result<(), String> {
-    // Fresh each run so a removed binary doesn't linger in the image.
-    let _ = std::fs::remove_dir_all(staged_deps);
-    std::fs::create_dir_all(staged_deps).map_err(|e| format!("stage dir: {e}"))?;
-
-    for b in binaries {
-        let name = b.binary_path.file_name().ok_or("staged file has no name")?;
-        let dest = staged_deps.join(name);
-        std::fs::copy(&b.binary_path, &dest)
-            .map_err(|e| format!("stage {}: {e}", b.binary_path.display()))?;
-        strip_binary(&dest);
-    }
-    Ok(())
-}
-
-/// Strip a staged copy in place (best-effort). `--strip-all` removes debuginfo
-/// and the symbol table; a remote panic still reports its message and test name,
-/// only symbolicated backtraces are lost. A missing/failed `strip` just leaves
-/// the copy larger.
-fn strip_binary(path: &std::path::Path) {
-    let _ = std::process::Command::new("strip")
-        .arg("--strip-all")
-        .arg(path)
-        .status();
-}
-
-/// The runner image's pull reference, once provisioned. Errors if its graph node
-/// failed to build/push.
-fn resolve_runner_image(
-    entry: &crate::inventory::DevImageEntry,
-    backend: &dyn crate::backends::image::ImageProvider,
-    states: &std::collections::HashMap<crate::resource::NodeId, crate::resource::NodeState>,
-) -> Result<String, String> {
-    let tag = crate::backends::image::dev_tag(&entry.source, &entry.features, &entry.repo, None)
-        .map_err(|e| format!("tag: {e}"))?;
-    let id = crate::resource::image_node_id(entry).map_err(|e| format!("node id: {e}"))?;
-    match states.get(&id) {
-        Some(crate::resource::NodeState::Failed(detail)) => {
-            Err(format!("build/push failed: {detail}"))
-        }
-        _ => Ok(backend.reference(&tag)),
     }
 }
 

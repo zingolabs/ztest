@@ -12,13 +12,11 @@
 //!   in `materialize`, not here. This file resolves against a
 //!   pre-published seed.
 
-use std::io::Read;
 use std::path::Path;
 
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, PostParams};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::EnvError;
 use crate::cluster::Sentinel;
@@ -27,19 +25,13 @@ use crate::error::env_err;
 pub const SEEDS_NAMESPACE: &str = "ztest-seeds";
 
 /// 8 lowercase-hex characters: the content-address prefix we name PVCs by.
+///
+/// Delegates to [`crate::storage::content_sha8`], which resolves the address
+/// without transferring the bytes: a real file is hashed, a Git LFS pointer
+/// yields its OID prefix (`sha256(.tar.*)` either way, so the id is stable
+/// whether the blob is on disk or still on the LFS server).
 pub fn sha8(path: &Path) -> Result<String, std::io::Error> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let digest = hasher.finalize();
-    Ok(hex::encode(&digest[..4]))
+    crate::storage::content_sha8(path).map_err(std::io::Error::other)
 }
 
 /// `(VolumeSnapshot in ztest-seeds, the CSI snapshot handle)`.

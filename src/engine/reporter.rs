@@ -455,24 +455,28 @@ fn hms(d: Duration) -> String {
     format!("{:0>2}:{:0>2}:{:0>2}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-/// Render the live "running" region (nextest's `--show-progress=running`
-/// block) as exactly `rows` lines: one per in-flight test —
-/// `{status} [HH:MM:SS] {binary} {test}` — longest-running first, sitting
-/// directly beneath the progress line, with a trailing `... and K more running`
-/// when the set overflows, then blank padding below so the region's height
-/// stays stable frame-to-frame.
+/// Render the live "running" region (nextest's `--show-progress=running` block):
+/// one line per in-flight test — `{status} [HH:MM:SS] {binary} {test}` —
+/// longest-running first, sitting directly beneath the progress line, with a
+/// trailing `... and K more running` when the set exceeds `max_rows` (the rows the
+/// live region can show above the panel).
+///
+/// The block is exactly as tall as its content — no blank padding. The sticky
+/// footer keeps the pinned panel bottom-anchored regardless, and clears the rows
+/// the block gives back as tests finish, so the region shrinks and grows with the
+/// live set instead of reserving a fixed height.
 ///
 /// `running` is assumed already sorted longest-first. Returns ANSI strings (one
-/// per line).
+/// per line); empty when nothing is running.
 #[allow(dead_code)] // see note on `hms`: retained for scrollback progress events
-pub(crate) fn render_running(running: &[RunningView], rows: usize, color: bool) -> Vec<String> {
-    if rows == 0 {
+pub(crate) fn render_running(running: &[RunningView], max_rows: usize, color: bool) -> Vec<String> {
+    if max_rows == 0 {
         return Vec::new();
     }
 
     // Reserve the last row for an overflow summary when the set doesn't fit.
-    let overflow = running.len() > rows;
-    let shown = if overflow { rows - 1 } else { running.len() };
+    let overflow = running.len() > max_rows;
+    let shown = if overflow { max_rows - 1 } else { running.len() };
 
     let mut content: Vec<String> = running[..shown]
         .iter()
@@ -500,13 +504,7 @@ pub(crate) fn render_running(running: &[RunningView], rows: usize, color: bool) 
         ));
     }
 
-    // Pad at the *bottom* (blanks between the list and the pinned panel) so the
-    // running rows sit directly beneath the progress line with no gap — matching
-    // nextest, which appends blank lines after the running set to keep the
-    // region's height stable.
-    let mut lines = content;
-    lines.resize(rows, String::new());
-    lines
+    content
 }
 
 /// The top-level live progress line, copied from nextest's `progress_str`
@@ -997,16 +995,16 @@ mod tests {
     }
 
     #[test]
-    fn running_block_hugs_label_and_pads_below() {
+    fn running_block_is_as_tall_as_the_live_set() {
+        // One running test under a 4-row ceiling → one line, no blank padding.
         let r = vec![running("pkg::b", "mod::a", 5, false)];
         let lines = render_running(&r, 4, false);
-        assert_eq!(lines.len(), 4, "padded to exactly `rows`");
+        assert_eq!(lines.len(), 1, "as tall as content, not padded to `max_rows`");
         assert_eq!(
             lines[0], "             [ 00:00:05] pkg::b mod::a",
             "{:?}",
             lines[0]
         );
-        assert_eq!(lines[3], "");
     }
 
     #[test]
@@ -1053,9 +1051,10 @@ mod tests {
     }
 
     #[test]
-    fn running_block_empty_is_all_blank() {
-        let lines = render_running(&[], 3, false);
-        assert_eq!(lines, vec!["".to_string(), "".to_string(), "".to_string()]);
+    fn running_block_empty_when_nothing_runs() {
+        // Nothing running → no live rows at all (the panel sits alone), not a block
+        // of blank padding.
+        assert!(render_running(&[], 3, false).is_empty());
     }
 
     /// Strip CSI SGR sequences so colour tests can assert on the text.

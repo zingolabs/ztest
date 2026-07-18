@@ -2,9 +2,11 @@
 //!
 //! Read-only walk of the `ztest-seeds` namespace, enumerating `seed-{sha8}` PVCs
 //! and classifying each as ready or pending based on the `seeds.ztest.io/ready`
-//! label. Provisioning of missing archives (LFS pull, reconcile-Job, byte
-//! progress) is not yet implemented; tests needing a missing archive fail later
-//! at `TestEnv::build()`.
+//! label. Provisioning of a missing archive is driven from the resource graph
+//! (`resource::impls::seed::SeedProvider` → `materialize::ensure_seed`), which
+//! sources bytes through `crate::storage` — a local file, or an LFS pointer
+//! fetched from the configured server. This module only *observes* the resulting
+//! PVCs for the preflight banner.
 //!
 //! PVC schema (`docs/architecture-overview.md#archive-pvcs`):
 //! - namespace: `ztest-seeds`

@@ -14,7 +14,6 @@
 use std::collections::BTreeSet;
 use std::process::Stdio;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::inventory::{
@@ -24,11 +23,31 @@ use crate::pipeline::build::SelectedBinary;
 
 /// All registries demuxed from one binary's tagged inventory dump stream.
 #[derive(Debug, Default)]
-struct Dumped {
+pub(crate) struct Dumped {
     dev: Vec<DevImageEntry>,
     qos: Vec<QosEntry>,
     seeds: Vec<SeedEntry>,
     deps: Vec<TestDepEntry>,
+}
+
+/// Demux one binary's `ZTEST_DUMP_INVENTORY=1` stdout (tagged JSON-lines) into
+/// the four registries. Pure — the transport (local subprocess vs a builder-pod
+/// `exec`, see [`crate::pipeline::remote_compile`]) is the caller's concern.
+pub(crate) fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
+    let mut dumped = Dumped::default();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<InventoryLine>(line) {
+            Ok(InventoryLine::Dev(d)) => dumped.dev.push(d),
+            Ok(InventoryLine::Qos(q)) => dumped.qos.push(q),
+            Ok(InventoryLine::Seed(s)) => dumped.seeds.push(s),
+            Ok(InventoryLine::Dep(d)) => dumped.deps.push(d),
+            Err(e) => return Err(format!("malformed inventory line `{line}`: {e}")),
+        }
+    }
+    Ok(dumped)
 }
 
 /// Result of Phase C: the deduped set of resources (dev images + data seeds) the
@@ -64,6 +83,32 @@ pub enum DumpOutcome {
 /// test from. All per-binary lists stay binary-scoped because the match is keyed
 /// by `binary_id` (exact test names can collide across binaries).
 pub async fn discover(binaries: &[SelectedBinary]) -> (DumpOutcome, Vec<(String, Vec<QosEntry>)>) {
+    let mut dumps: Vec<Dumped> = Vec::with_capacity(binaries.len());
+    for bin in binaries {
+        match dump_one(bin).await {
+            Ok(d) => dumps.push(d),
+            Err(detail) => {
+                return (
+                    DumpOutcome::Failed {
+                        detail: format!("{}: {detail}", bin.binary_id),
+                    },
+                    Vec::new(),
+                );
+            }
+        }
+    }
+    assemble(binaries, dumps)
+}
+
+/// Fold each binary's [`Dumped`] into the cross-selection deduped resource set
+/// plus the per-binary edges the engine gates on. Pure — the local
+/// (`discover`) and on-cluster ([`crate::pipeline::remote_compile`]) paths both
+/// call this once they have a `Dumped` per binary, so dedup/edge logic lives in
+/// exactly one place. `binaries` and `dumps` are index-aligned.
+pub(crate) fn assemble(
+    binaries: &[SelectedBinary],
+    dumps: Vec<Dumped>,
+) -> (DumpOutcome, Vec<(String, Vec<QosEntry>)>) {
     let mut seen_img: BTreeSet<DedupKey> = BTreeSet::new();
     let mut seen_seed: BTreeSet<(String, SeedPayload)> = BTreeSet::new();
     let mut images: Vec<DevImageEntry> = Vec::new();
@@ -72,50 +117,37 @@ pub async fn discover(binaries: &[SelectedBinary]) -> (DumpOutcome, Vec<(String,
     let mut images_by_binary: Vec<(String, Vec<DevImageEntry>)> = Vec::new();
     let mut deps_by_binary: Vec<(String, Vec<TestDepEntry>)> = Vec::new();
 
-    for bin in binaries {
-        match dump_one(bin).await {
-            Ok(Dumped {
-                dev,
-                qos,
-                seeds: s,
-                deps,
-            }) => {
-                // Per-binary images, deduped within the binary (the binary edge).
-                let mut seen_bin_img: BTreeSet<DedupKey> = BTreeSet::new();
-                let mut bin_images: Vec<DevImageEntry> = Vec::new();
-                for d in dev {
-                    if seen_bin_img.insert(DedupKey::from(&d)) {
-                        bin_images.push(d.clone());
-                    }
-                    if seen_img.insert(DedupKey::from(&d)) {
-                        images.push(d);
-                    }
-                }
-                if !bin_images.is_empty() {
-                    images_by_binary.push((bin.binary_id.clone(), bin_images));
-                }
-                for e in s {
-                    if seen_seed.insert((e.source.clone(), e.payload)) {
-                        seeds.push(e);
-                    }
-                }
-                if !qos.is_empty() {
-                    qos_by_binary.push((bin.binary_id.clone(), qos));
-                }
-                if !deps.is_empty() {
-                    deps_by_binary.push((bin.binary_id.clone(), deps));
-                }
+    for (bin, dumped) in binaries.iter().zip(dumps) {
+        let Dumped {
+            dev,
+            qos,
+            seeds: s,
+            deps,
+        } = dumped;
+        // Per-binary images, deduped within the binary (the binary edge).
+        let mut seen_bin_img: BTreeSet<DedupKey> = BTreeSet::new();
+        let mut bin_images: Vec<DevImageEntry> = Vec::new();
+        for d in dev {
+            if seen_bin_img.insert(DedupKey::from(&d)) {
+                bin_images.push(d.clone());
             }
-            Err(detail) => {
-                // On failure the caller aborts before lowering, so the
-                // partial QoS accumulation is moot.
-                return (
-                    DumpOutcome::Failed {
-                        detail: format!("{}: {detail}", bin.binary_id),
-                    },
-                    qos_by_binary,
-                );
+            if seen_img.insert(DedupKey::from(&d)) {
+                images.push(d);
             }
+        }
+        if !bin_images.is_empty() {
+            images_by_binary.push((bin.binary_id.clone(), bin_images));
+        }
+        for e in s {
+            if seen_seed.insert((e.source.clone(), e.payload)) {
+                seeds.push(e);
+            }
+        }
+        if !qos.is_empty() {
+            qos_by_binary.push((bin.binary_id.clone(), qos));
+        }
+        if !deps.is_empty() {
+            deps_by_binary.push((bin.binary_id.clone(), deps));
         }
     }
     (
@@ -140,56 +172,16 @@ async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, String> {
         .stdin(Stdio::null())
         .kill_on_drop(true);
 
-    let mut child = cmd
-        .spawn()
+    // Inventory dumps are tiny (sub-100ms binaries), so capture end-to-end and
+    // demux via the shared `parse_inventory` rather than streaming.
+    let out = cmd
+        .output()
+        .await
         .map_err(|e| format!("spawn `{}`: {e}", bin.binary_path.display()))?;
-
-    // Read stdout line-by-line so a binary with a huge inventory
-    // (unlikely) doesn't buffer end-to-end before we see anything.
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-
-    let stdout_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        let mut dumped = Dumped::default();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.is_empty() {
-                continue;
-            }
-            // Lines are tagged; demux the two registries onto one stream.
-            match serde_json::from_str::<InventoryLine>(&line) {
-                Ok(InventoryLine::Dev(d)) => dumped.dev.push(d),
-                Ok(InventoryLine::Qos(q)) => dumped.qos.push(q),
-                Ok(InventoryLine::Seed(s)) => dumped.seeds.push(s),
-                Ok(InventoryLine::Dep(d)) => dumped.deps.push(d),
-                Err(e) => {
-                    return Err(format!("malformed inventory line `{line}`: {e}"));
-                }
-            }
-        }
-        Ok(dumped)
-    });
-
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            buf.push_str(&line);
-            buf.push('\n');
-        }
-        buf
-    });
-
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("wait on `{}`: {e}", bin.binary_path.display()))?;
-
-    let stderr_tail = stderr_task.await.unwrap_or_default();
-    let dumped = stdout_task
-        .await
-        .map_err(|e| format!("stdout join: {e}"))?
+    let stderr_tail = String::from_utf8_lossy(&out.stderr).into_owned();
+    let dumped = parse_inventory(&String::from_utf8_lossy(&out.stdout))
         .map_err(|e| format!("{e}\nstderr:\n{}", tail(&stderr_tail, 20)))?;
+    let status = out.status;
 
     if !status.success() {
         return Err(format!(

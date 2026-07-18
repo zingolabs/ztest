@@ -149,6 +149,59 @@ No RPC, no daemon, no facade. The real `librustzcash` / `zingo` backend runs
 in-process inside the runner pod — faithful UX, and hermetically isolated (its own
 `TempDir` in its own pod).
 
+## On-cluster compilation (OpenShift targets)
+
+The delivery story in §2 still compiles on the **laptop** and ships the outputs as
+image layers. On an OpenShift target that means every `ztest run` pushes the
+runner image — tens to hundreds of MB up the remote mesh per edit — and pegs the
+laptop with the compile. Level 2 removes both: the laptop ships **source**, and
+the cluster produces the binaries.
+
+**The builder.** `ztest setup` provisions a long-lived builder Deployment
+(`resource/impls/builder.rs`) running the on-cluster-built builder image
+(`docker/builder.Dockerfile`, `stock rust:1.95.0-bookworm` + the compile deps —
+see `resource/impls/base_images.rs`). It pins `bookworm`, as does the runner base
+(`docker/runner-base.Dockerfile`), so a binary compiled there links the identical
+glibc the runner base ships. It idles (`sleep infinity`) with a persistent RWO
+cache PVC (`ztest-build-cache`) mounted at `/cache`, holding `CARGO_HOME`,
+`CARGO_TARGET_DIR`, and the synced `src/`, so a code change recompiles only what
+changed and the cache is shared across all runs.
+
+**The drive** (`pipeline/remote_compile.rs`, selected by
+`image::builds_on_cluster()` — an OpenShift push/pull registry, no
+`ZTEST_LOCAL_BUILD`):
+
+1. **Resolve + rsync the source subtree.** `cargo metadata` finds the workspace
+   root and every local (path) package; their common-ancestor directory is
+   rsynced into `/cache/src` via `oc rsync` (delta — an unchanged tree ships
+   ~nothing; `target/` and `.git/` are excluded). `oc rsync` is pinned to the same
+   `--context` the kube client resolved (`ZTEST_KUBE_CONTEXT`), since `oc` is a
+   separate process that otherwise honours only the kubeconfig's current-context.
+2. **Compile + list.** `exec` `cargo nextest list --message-format=json` in the
+   pod; the JSON reuses the laptop path's `build::parse_list_summary`, so the
+   `binary_path`/`cwd` in the result name the *pod's* paths (`/cache/target/…`),
+   which is exactly what the baked-image pod execution runs.
+3. **Inventory dump.** `exec` each binary with `ZTEST_DUMP_INVENTORY=1` and reuse
+   `images::parse_inventory` + `images::assemble` — the same dedup/edge logic the
+   local path uses.
+4. **Bake.** `exec` `crane` to append the compiled binaries as one layer onto the
+   seeded runner base and push the runner image — pure registry blob manipulation
+   authenticated with the pod's own ServiceAccount token, so the builder needs no
+   buildah, no user namespace, no privileged posture. The tag is content-addressed
+   on the binaries' bytes.
+
+Component `dev!` images (zebrad, zainod) and data seeds still provision through
+the resource graph (the OpenShift backend builds them on-cluster too); only the
+runner image comes prebaked. The engine then runs each test in a pod exactly as
+§1 describes. `ztest run` streams the builder's live stderr (cargo's
+`Compiling …`) and per-phase notes into scrollback, so an on-cluster compile
+shows progress rather than stalling silently.
+
+**exec transport gotcha.** stdout and stderr are multiplexed over one websocket,
+so `exec_streamed` drains both **concurrently**; reading stdout to EOF first then
+stderr deadlocks once a chatty compile fills the stderr channel (stdout can't
+reach EOF until the stderr-blocked stream closes).
+
 ## Linking: glibc-dynamic only, via nix
 
 `zingo` (C++/`libstdc++`) is required on remote, so the **glibc-dynamic** path is
@@ -175,10 +228,11 @@ matching to get wrong.
 
 ## Phasing / status
 
-1. **Nix runner image** — ✅ done. `packages.runner-image`
-   (`dockerTools.streamLayeredImage`) whose closure matches the dev shell. Verified
-   by running a real dev-shell-built nextest binary inside it (`docker run`); its
-   `/nix/store/…/ld-linux` interpreter + `libstdc++`/`librocksdb` resolve.
+1. **Runner base image** — ✅ done, *superseded by the on-cluster model above.*
+   Originally a nix `packages.runner-image` matching the dev-shell closure; now a
+   stock Debian `docker/runner-base.Dockerfile` built on the cluster (the workspace
+   links no rocksdb/OpenSSL, so glibc + CA roots suffice). The `crane` bake appends
+   the compiled binaries onto it. See `src/resource/impls/base_images.rs`.
 2. **Executor seam + `PodExecutor`** — ✅ done. `Executor` trait + `LocalExecutor`
    (`engine/exec.rs`); `PodExecutor` (`engine/pod_exec.rs`) with the kube
    create/poll/logs/delete lifecycle, verdict mapping (incl. image-error
@@ -186,22 +240,10 @@ matching to get wrong.
    `select_executor`). Proven green on `kind`: a real test ran in a pod via
    hostPath and exited 0.
 3. **Delivery** — ✅ done and verified green on crc. Modes: `hostpath` (kind) and
-   `baked` (remote). Preflight builds the runner image (`prepare_runner_image`),
-   injects it into the image graph, resolves its pull tag, and auto-selects
-   `PodExecutor(baked, sa/ns=ztest)` when the distribution is remote. Two issues
-   the crc run surfaced and fixed:
-   - **buildx can't see local images.** The OpenShift `Internal` distribution
-     builds in an isolated `docker-container` buildx driver, so `FROM
-     ztest-runner:dev` (a local `docker load`) failed. Fix: skopeo the base to a
-     local OCI layout and pin `FROM` via buildx `--build-context` — no registry
-     pull, no auth, no self-signed-CA TLS.
-   - **Image was multi-GB.** Staging copied all `deps/*.so` (~3 GB of build-time
-     proc-macro cdylibs) + unstripped debug binaries. Fix: stage only the
-     `ldd`-NEEDED runtime `.so` closure and `strip --strip-debug` — `api_surface`
-     3.4 GB → 34 MB. Base trimmed 115 MB → 103 MB (busybox instead of
-     bash+coreutils).
-   Result: `ztest run --cluster crc endpoint_url_format` → `PASS [9.064s]` in a
-   pod, exit 0, no leaks. Finer per-crate layering (crane) is a later optimization.
+   `baked` (remote). *The original local-bake path (docker buildx + skopeo +
+   `prepare_runner_image`) has since been replaced by on-cluster compilation +
+   `crane` bake — see the "On-cluster compilation" section above.* Auto-selects
+   `PodExecutor(baked, sa/ns=ztest)` when the distribution is remote.
 4. **Harden** — teardown ✅ (runner pods carry `qos::LABEL_RUN_ID`, so the existing
    `reap_run` Ctrl-C path deletes them by construction); logs captured into the
    outcome. *Remaining:* RBAC (runner SA + Role/RoleBinding in `ztest setup` so

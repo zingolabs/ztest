@@ -96,7 +96,8 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
     // grants here rather than letting a 403 surface deep in the probe (nodes) or
     // mid-run (seed snapshot classes). Skipped silently if the SSAR call itself
     // errors — the real work below will surface any genuine outage.
-    if let Ok(missing) = crate::resource::check_run_access(&client).await
+    if let Ok(missing) =
+        crate::resource::check_run_access(&client, crate::backends::image::selected_backend()).await
         && !missing.is_empty()
     {
         let detail = format!(

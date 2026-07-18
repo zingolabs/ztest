@@ -50,6 +50,7 @@ mod mounts;
 mod naming;
 mod portforward;
 mod seeds;
+pub mod storage;
 
 // ─────────────────────────── top-level re-exports ──────────────────────
 

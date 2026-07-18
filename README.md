@@ -128,4 +128,4 @@ cargo run --bin ztest -- --help
 - [ ] Cargo test compile fail UX
 - [ ] Docker image build fail UX
 - [ ] Test-config/manifest for enabling/disabling a set of cases? Ie, test mode without zcashd
-- [ ] Replace GitLFS stuff with a StorageBackend trait/abstraction, and then create a git-lfs.rs
+- [x] Replace GitLFS stuff with a StorageBackend trait/abstraction (`src/storage/`, see [`docs/storage-backend.md`](docs/storage-backend.md)): `local.rs` streams on-disk archives, `lfs.rs` fetches LFS pointers from a rudolfs server over the batch API

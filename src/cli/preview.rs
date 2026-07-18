@@ -191,6 +191,7 @@ fn demo_state() -> BannerState {
         },
         build: BuildState::Compiling {
             started_at: Instant::now(),
+            phase: None,
         },
         archives: Vec::new(),
         snapshots: Vec::new(),

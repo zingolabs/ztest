@@ -136,7 +136,17 @@ pub async fn index(list_args: &[String]) -> std::io::Result<BuildOutcome> {
         });
     }
 
-    let summary: TestListSummary = serde_json::from_slice(&pass2.stdout).map_err(|err| {
+    parse_list_summary(&pass2.stdout)
+}
+
+/// Parse `cargo nextest list --message-format=json` output into a
+/// [`BuildOutcome::Ok`]. Split from [`index`]'s local subprocess so the
+/// on-cluster compile path ([`crate::pipeline::remote_compile`]) can reuse the
+/// exact same parse on the JSON a builder pod returns — the `binary_path`/`cwd`
+/// in the summary are then the pod's paths, which is precisely what the
+/// baked-image pod execution needs.
+pub fn parse_list_summary(stdout: &[u8]) -> std::io::Result<BuildOutcome> {
+    let summary: TestListSummary = serde_json::from_slice(stdout).map_err(|err| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("failed to parse `cargo nextest list` JSON: {err}"),

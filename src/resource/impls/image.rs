@@ -74,10 +74,13 @@ impl Provider for ImageNode {
     }
 
     async fn probe(&self, cx: &Cx) -> Readiness {
-        self.backend.probe(cx, &self.tag, &self.entry).await
+        self.backend.image_built(cx, &self.entry, &self.tag).await
     }
 
     async fn provision(&self, cx: &Cx) -> Result<(), ResourceError> {
-        self.backend.build(cx, &self.entry, &self.tag).await
+        // The resolved reference is recorded into the build manifest by the run's
+        // image phase (which covers cached images too), so it is discarded here.
+        self.backend.build_image(cx, &self.entry, &self.tag).await?;
+        Ok(())
     }
 }

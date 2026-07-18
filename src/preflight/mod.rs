@@ -68,8 +68,14 @@ pub enum BuildState {
     /// Phase B hasn't started yet.
     Pending,
     /// First cargo invocation running (compile pass). `started_at` lets the
-    /// renderer display elapsed seconds.
-    Compiling { started_at: std::time::Instant },
+    /// renderer display elapsed seconds. `phase`, when set, overrides the
+    /// generic "compiling test binaries…" label so the on-cluster path can name
+    /// its current sub-phase (waiting / syncing / compiling / dumping / baking)
+    /// on the one live row, resetting the timer at each transition.
+    Compiling {
+        started_at: std::time::Instant,
+        phase: Option<String>,
+    },
     /// Compile pass succeeded; second cargo invocation
     /// (`--message-format=json`) running for the inventory parse.
     Indexing { started_at: std::time::Instant },
@@ -161,7 +167,8 @@ impl ArchiveStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadSource {
-    /// `git lfs pull` against the configured remote.
+    /// Fetched from the configured LFS server (rudolfs) over the batch API and
+    /// streamed into the seed uploader pod. See `crate::storage::lfs`.
     Lfs,
     /// F6: cluster-resident LFS cache.
     ClusterCache,

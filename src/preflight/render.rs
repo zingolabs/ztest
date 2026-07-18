@@ -245,11 +245,12 @@ fn render_inventory_block(out: &mut String, state: &BannerState, theme: &Theme) 
             )
             .expect("write to string");
         }
-        BuildState::Compiling { started_at } => {
+        BuildState::Compiling { started_at, phase } => {
             let elapsed = started_at.elapsed();
+            let label = phase.as_deref().unwrap_or("compiling test binaries");
             writeln!(
                 out,
-                "{:>width$} {} compiling test binaries… {dot} {}",
+                "{:>width$} {} {label}… {dot} {}",
                 "Inventory".style(theme.styles.pass),
                 spinner_glyph(elapsed).style(theme.styles.count),
                 format_elapsed(elapsed).style(theme.styles.count),
@@ -687,11 +688,12 @@ pub fn render_preflight_panel(
     // Line 3 — inventory / build state.
     let (build_marker, build_style, build_text) = match &state.build {
         BuildState::Pending => (theme.chars.dot, theme.styles.dim, "queued".to_string()),
-        BuildState::Compiling { started_at } => (
+        BuildState::Compiling { started_at, phase } => (
             spin,
             theme.styles.count,
             format!(
-                "compiling test binaries… {dot} {}",
+                "{}… {dot} {}",
+                phase.as_deref().unwrap_or("compiling test binaries"),
                 format_elapsed(started_at.elapsed())
             ),
         ),

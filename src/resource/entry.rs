@@ -15,7 +15,9 @@ use crate::qos;
 use crate::resource::context::Cx;
 use crate::resource::graph::{Graph, GraphError};
 use crate::resource::impls::storage::StorageProfile;
-use crate::resource::impls::{image, policy, scaffolding, seed, storage};
+use crate::resource::impls::{
+    base_images, buildah, builder, image, policy, scaffolding, seed, storage,
+};
 use crate::resource::provider::NodeId;
 use crate::resource::state::NodeState;
 
@@ -45,11 +47,12 @@ pub struct InitializeOpts {
     /// multi-node clusters, where the operator owns which nodes carry NVMe.
     pub label_nvme_pool: bool,
 
-    /// Provision the OpenShift-only policy nodes — the `nonroot-v2` SCC grant
-    /// and the internal-registry project. `true` on OpenShift targets (crc /
-    /// OKD). The run identity (SA + RBAC + token) is backend-agnostic and
-    /// provisioned regardless.
-    pub openshift: bool,
+    /// The active image backend. Selects which policy nodes are provisioned:
+    /// an OpenShift backend adds the `nonroot-v2` SCC grant, the internal-registry
+    /// project, and the on-cluster builder; it also gates the OpenShift-only run
+    /// rules ([`RuleScope`](crate::resource::impls::policy)). The run identity
+    /// itself (SA + token) is always provisioned.
+    pub backend: crate::cluster_config::ImageBackend,
 }
 
 impl Default for InitializeOpts {
@@ -59,7 +62,7 @@ impl Default for InitializeOpts {
             max_concurrent: 8,
             storage: StorageProfile::HostpathFixtures,
             label_nvme_pool: true,
-            openshift: false,
+            backend: crate::cluster_config::ImageBackend::Kind,
         }
     }
 }
@@ -114,13 +117,27 @@ where
     graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(
         policy::RUN_NAMESPACE,
     )));
-    if opts.openshift {
+    if opts.backend.is_openshift() {
         graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(
             policy::IMAGES_NAMESPACE,
         )));
     }
-    for p in policy::providers(opts.openshift) {
+    for p in policy::providers(opts.backend) {
         graph.add_dedup(p);
+    }
+
+    // On-cluster compilation build server (OpenShift targets): the base images
+    // (compile builder + runner base) built on-cluster from `docker/*.Dockerfile`,
+    // the persistent build-cache PVC, and the long-lived builder Deployment
+    // `ztest run` compiles in. Depends on the run identity + images namespace above.
+    if opts.backend.is_openshift() {
+        // The rootless-buildah build server must exist before the base images it
+        // builds; the base images before the compile builder that runs one of them.
+        graph.add_dedup(Box::new(buildah::BuildahProvider));
+        graph.add_dedup(Box::new(base_images::RunnerBaseImageProvider));
+        graph.add_dedup(Box::new(base_images::BuilderImageProvider));
+        graph.add_dedup(Box::new(builder::BuildCacheProvider));
+        graph.add_dedup(Box::new(builder::BuilderDeploymentProvider));
     }
 
     graph.validate()?;

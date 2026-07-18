@@ -25,7 +25,7 @@
 mod context;
 mod entry;
 mod graph;
-mod kube;
+pub(crate) mod kube;
 mod provider;
 mod state;
 

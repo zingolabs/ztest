@@ -17,38 +17,22 @@
 //! streaming a child's PTY bytes via [`run_child`] ([`child`]). See
 //! `docs/console-architecture.md` for the full rationale.
 //!
-//! All output reaches the real terminal through a [`ratatui`] inline viewport
-//! ([`Surface`]), whose `insert_before` forwards completed lines into native
-//! scrollback. A top DECSTBM region can't do this: lines scrolled off a margin
-//! region are discarded, not retained. The `scrolling-regions` cargo feature
-//! MUST stay off, or `insert_before` switches to a DECSTBM region most emulators
-//! exclude from scrollback.
+//! All output reaches the real terminal through a manual **sticky footer**
+//! ([`Surface`] + [`footer`]): completed lines are printed normally so the
+//! terminal scrolls them into its own native scrollback, and only the footer
+//! (live region + pinned panel) is repainted in place each frame. No reserved
+//! region, no DECSTBM scroll region (which would discard lines scrolled off an
+//! interior margin instead of saving them), no fixed height — the footer is
+//! exactly as tall as its content.
 //!
 //! The test run is just another scene producer: the engine ([`crate::engine`])
 //! owns process-per-test execution and ships a fresh [`SceneFrame`] panel +
-//! scrollback through the same [`Console`]. No special handoff; the one panel
-//! viewport persists across every phase.
-
-use std::io::Stdout;
-
-use ratatui::backend::CrosstermBackend;
-
-// The console's whole scrollback mechanism depends on ratatui's `insert_before`
-// forwarding completed lines into the terminal's NATIVE scrollback. That only
-// holds while ratatui's `scrolling-regions` feature is OFF; with it on,
-// `insert_before` scrolls content through a DECSTBM margin region most emulators
-// exclude from scrollback, silently breaking the design (verified against
-// ratatui-core 0.1.2 `terminal/inline.rs`). Fail the build loudly rather than
-// regress at runtime. See the `scrolling-regions` guard-feature in Cargo.toml.
-#[cfg(feature = "scrolling-regions")]
-compile_error!(
-    "ztest's console requires ratatui's `scrolling-regions` feature to stay OFF \
-     (it routes insert_before through a DECSTBM region and breaks native-scrollback \
-     forwarding). Remove whatever enabled `scrolling-regions`."
-);
+//! scrollback through the same [`Console`]. No special handoff; the pinned panel
+//! persists across every phase.
 
 mod bridge;
 mod child;
+mod footer;
 mod render;
 mod viewport;
 
@@ -62,24 +46,38 @@ pub(crate) use viewport::Surface;
 /// painted block pinned to the bottom of the inline viewport.
 pub(super) const PANEL_ROWS: u16 = 5;
 
-/// The on-screen **live region** height: the rows between native scrollback and
-/// the pinned panel. During the compile phase it shows the child's live output
-/// (cargo's `Compiling …` lines + progress bar); during the run the engine feeds
-/// it the live running-tests block instead. Completed lines scroll off the top
-/// into native scrollback above the live region, seamlessly. The inline viewport
-/// is therefore `LIVE_ROWS + PANEL_ROWS` tall for the whole session.
+/// Rows available for the live region above the pinned panel: the full terminal
+/// height minus [`PANEL_ROWS`]. **The single source** every live-region consumer
+/// derives from — the `avt` grid, each child PTY (build/compile), and the engine's
+/// running-tests block — so the live region is exactly as tall as the terminal
+/// allows and a child renders as it would in a bare shell, never clipped to a
+/// hard-coded row count. The footer is still drawn only as tall as its live content
+/// actually is (`trimmed_view` for the grid, the running list for the engine); this
+/// is the ceiling, not a reservation.
 ///
-/// This is the **single source of truth** for the live-region size. It's fixed
-/// because the inline viewport height is immutable once created (ratatui #984),
-/// so it must be chosen up front. Everything downstream that needs the live
-/// height — the `avt` grid, the child PTY, the engine's running-rows count — does
-/// not restate this number: it derives from [`Surface::live_rows`], which reports
-/// the rows the surface actually reserved (`viewport height − PANEL_ROWS`).
-///
-/// Modest by design: a taller live region reserves more rows that sit blank until
-/// the child produces output (the startup-gap tradeoff), so this is kept small.
-pub(super) const LIVE_ROWS: u16 = 8;
+/// Floored to 1: a terminal can momentarily report a height at or below the panel
+/// during a resize, and `avt` underflow-panics on a 0 dimension.
+pub(super) fn live_rows_for(total_rows: u16) -> u16 {
+    total_rows.saturating_sub(PANEL_ROWS).max(1)
+}
 
-/// The concrete `ratatui` backend both consoles drive: crossterm over the real
-/// stdout. Aliased so the loop signatures stay readable.
-pub(super) type Backend = CrosstermBackend<Stdout>;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_region_fills_the_terminal_above_the_panel() {
+        // No hard-coded cap: the live region is the whole terminal minus the panel,
+        // so a tall in-place progress block renders at real height.
+        assert_eq!(live_rows_for(50), 50 - PANEL_ROWS);
+        assert_eq!(live_rows_for(24), 24 - PANEL_ROWS);
+    }
+
+    #[test]
+    fn live_region_never_underflows_to_zero() {
+        // A terminal at or below the panel height (or a momentary 0 during resize)
+        // must floor to 1: `avt` underflow-panics on a 0 dimension.
+        assert_eq!(live_rows_for(PANEL_ROWS), 1);
+        assert_eq!(live_rows_for(0), 1);
+    }
+}

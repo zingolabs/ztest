@@ -79,13 +79,6 @@
           kubectl
           kubernetes-helm
 
-          # `skopeo copy docker-daemon:… oci:…` turns the docker-loaded nix runner
-          # base into a local OCI layout, so the baked tests image can resolve
-          # `FROM ztest-runner:dev` through buildx's `--build-context` without a
-          # registry round-trip (the OpenShift buildx builder can't see the local
-          # docker daemon's images).
-          skopeo
-
           # OpenShift tooling — `crc` (OpenShift Local) boots a single-node
           # OpenShift VM via libvirt/KVM for tests that exercise the
           # OpenShift API surface. `openshift` provides the `oc` client
@@ -111,39 +104,11 @@
         };
       in
       {
-        # Runner image for remote pod-per-test execution. Built from this same
-        # flake so its runtime closure (glibc, libstdc++/libgcc_s, rocksdb,
-        # rustc-std) is the *identical* store paths a dev-shell `cargo build`
-        # links against — a nix test binary's ELF interpreter is an absolute
-        # `/nix/store/…/ld-linux`, so parity must be exact or the kernel can't
-        # start it. `streamLayeredImage` splits the closure into
-        # content-addressed layers: the stable base pushes once, only changed
-        # layers move.
-        #
-        #   nix build .#runner-image && ./result | docker load
-        #
-        # Test binaries are delivered on top of this base (thin layers /
-        # bind-mount); this package is the runtime base only.
-        packages.runner-image = pkgs.dockerTools.streamLayeredImage {
-          name = "ztest-runner";
-          tag = "dev";
-          # The runner pod execs the test binary directly, so no shell is needed
-          # at runtime — `busybox` (a few MB) is only for `kubectl exec` debugging,
-          # replacing bash-interactive + coreutils (~86 MB). rocksdb + cc.cc.lib
-          # carry the runtime closure (glibc/libstdc++/librocksdb) the binaries link.
-          contents = [ pkgs.busybox ] ++ buildInputs;
-          # A nix layered image ships only the store closure — no FHS scratch
-          # dirs. Tests create their wallet/data dirs via `tempfile` (→ `/tmp`),
-          # which ENOENTs without this. World-writable + sticky, like a real /tmp.
-          extraCommands = "mkdir -m 1777 tmp";
-          config = {
-            # Same search path the dev shell exports (rocksdb + libstdc++/
-            # libgcc_s); glibc resolves via the binary's own interpreter, which
-            # is present at its real store path in the image closure.
-            Env = [ "LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath buildInputs}" ];
-            Cmd = [ "/bin/sh" ];
-          };
-        };
+        # No image packages: all cluster images are built where they run. Component
+        # images and the on-cluster compile **builder** + test-runner **base**
+        # (`docker/{builder,runner-base}.Dockerfile`) are built on the cluster by
+        # `ztest setup` in the ztest-owned rootless-buildah pod; local kind runs
+        # tests in-process (no runner image). See `src/resource/impls/base_images.rs`.
 
         devShells.default = pkgs.mkShell ({
           inherit nativeBuildInputs buildInputs;

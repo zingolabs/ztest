@@ -97,12 +97,12 @@ pub(crate) async fn run_child(
     let wait = tokio::task::spawn_blocking(move || child.wait());
     tokio::pin!(wait);
 
-    // While the child runs, forward terminal resizes to its PTY. We keep the
-    // child's row count pinned to the live region (`live_rows`) — the on-screen
-    // live window is a fixed height — and only propagate the new width, matching
-    // what the render thread does to its `avt` grid. `master.resize` ioctls
-    // TIOCSWINSZ, which makes the kernel deliver SIGWINCH to the child, so tools
-    // like cargo re-wrap to the new width instead of keeping their spawn-time size.
+    // While the child runs, forward terminal resizes to its PTY. Both dimensions
+    // track the terminal: the width, and the row count via `live_rows` (the rows
+    // above the pinned panel), matching what the render thread does to its `avt`
+    // grid — so a taller/shorter terminal re-lays-out the child's output.
+    // `master.resize` ioctls TIOCSWINSZ, which makes the kernel deliver SIGWINCH to
+    // the child, so tools like cargo re-wrap instead of keeping their spawn-time size.
     let mut size = console.size_watch();
     let status = loop {
         tokio::select! {

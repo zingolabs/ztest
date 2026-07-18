@@ -81,6 +81,21 @@ pub enum NodeId {
     /// Dev-image registry project (`ztest-images`) + pull/push RBAC for the
     /// OpenShift internal registry. OpenShift targets only.
     RegistryProject,
+
+    // ── On-cluster compilation (singletons) ───────────────────────────
+    /// The persistent `ztest-build-cache` PVC — `CARGO_HOME` + `target/` +
+    /// synced source for the on-cluster compile builder, so a code change
+    /// recompiles only what changed. On-cluster-build targets only.
+    BuildCache,
+    /// The long-lived `ztest-builder` Deployment: the compile build-server that
+    /// `ztest run` rsyncs source into and execs `cargo`/`crane` in. Mounts
+    /// [`BuildCache`](Self::BuildCache). On-cluster-build targets only.
+    Builder,
+    /// The long-lived `ztest-buildah` Deployment (+ its SCC, SA, storage PVC):
+    /// the rootless build server that builds every image via `buildah bud`,
+    /// replacing OpenShift's quay-pruning-prone Build subsystem. OpenShift targets
+    /// only.
+    Buildah,
 }
 
 impl NodeId {
@@ -104,6 +119,9 @@ impl NodeId {
             Self::RunIdentity => "run-identity".into(),
             Self::SccGrant => "scc-grant".into(),
             Self::RegistryProject => "registry-project".into(),
+            Self::BuildCache => "build-cache".into(),
+            Self::Builder => "builder".into(),
+            Self::Buildah => "buildah".into(),
         }
     }
 }

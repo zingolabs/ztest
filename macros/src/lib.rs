@@ -253,8 +253,8 @@ pub fn dev(input: TokenStream) -> TokenStream {
         ("Validator", "Zebrad") => ("zebrad".to_string(), vec![]),
         ("Validator", "Zcashd") => ("zcashd".to_string(), vec![]),
         // `allow_unencrypted_public_json_rpc_bind`: pod-per-test needs zaino's
-        // JSON-RPC on 0.0.0.0 for cross-pod access; keep in sync with
-        // `component.rs::default_features_for` (the tag `spec_key` must match).
+        // JSON-RPC on 0.0.0.0 for cross-pod access. These features are the single
+        // origin — threaded into both the inventory decl and the constructor below.
         ("Indexer", "Zainod") => (
             "zainod".to_string(),
             vec![
@@ -390,7 +390,11 @@ pub fn dev(input: TokenStream) -> TokenStream {
                     rust_versions: #rust_versions_tokens,
                 }
             }
-            ::ztest::#category_ident::#ctor_ident(#ctor_source, #version_lit) #rust_version_chain
+            ::ztest::#category_ident::#ctor_ident(
+                #ctor_source,
+                #version_lit,
+                ::std::vec![ #( ::std::string::String::from(#feat_lits) ),* ],
+            ) #rust_version_chain
         }
     }
     .into()

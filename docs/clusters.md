@@ -49,10 +49,14 @@ Profiles live in `$XDG_CONFIG_HOME/ztest/clusters.toml` (else
 |-------|---------|
 | `context` | kube-context to target — resolved **in-memory**; your kubeconfig is never modified |
 | `kubeconfig` | the file holding that context, when it isn't the default `~/.kube/config`; sets `KUBECONFIG` for the run |
-| `push` | registry base images are pushed to (a route, or e.g. `ghcr.io/zingolabs`) |
-| `pull` | in-cluster pull address, **only** for the OpenShift integrated registry (pods reference this, not `push`) |
-| `kind_cluster` | kind cluster name (mutually exclusive with `push`) — `kind load` into `<name>-control-plane` |
-| `openshift` | provision/expect the OpenShift-only policy (SCC grant, registry project) |
+| `backend` | image distribution: `kind` (`kind load`), `registry` (build + push to a generic registry), or `openshift` (on-cluster build into the integrated registry + SCC/registry policy). The single signal both `ztest setup` and `ztest run` read. |
+| `push` | registry base images are pushed to (a route, or e.g. `ghcr.io/zingolabs`); required for `registry`/`openshift` |
+| `pull` | in-cluster pull address, **only** for `backend = "openshift"` (pods reference this, not `push`) |
+| `kind_cluster` | kind cluster name (`kind` backend only) — `kind load` into `<name>-control-plane` |
+
+A profile written before `backend` existed (a legacy `openshift = true` bool, or
+a bare `push`) is migrated on read: `openshift = true` → `openshift`, a lone
+`push` → `registry`, otherwise `kind`.
 
 ### Selection precedence
 
@@ -105,11 +109,11 @@ The developer then runs, with no other flags:
 ztest cluster add crc --kubeconfig ~/.kube/crc.yaml
 ```
 
-`cluster add` reads the `ztest.io/registry` extension and derives `push`, `pull`,
-and `openshift`; it records the file's `current-context` so the profile is
-self-describing. A **generic** registry lives in the same extension — set
-`push` == `pull` and `openshift: false` — so registry config always has one home,
-the kubeconfig, never a command-line flag.
+`cluster add` reads the `ztest.io/registry` extension and derives the profile's
+`backend` (`openshift: true` → `openshift`, else `registry`) and its addresses;
+it records the file's `current-context` so the profile is self-describing. A
+**generic** registry lives in the same extension — set `openshift: false` — so
+registry config always has one home, the kubeconfig, never a command-line flag.
 
 Why one file suffices: the same SA **token** authenticates both the kube client
 and the registry push, and the same **CA** in `certificate-authority-data`
@@ -117,47 +121,57 @@ validates both the API server and the registry route (on CRC both are signed by
 the ingress CA). Nothing else is needed on the developer's machine — see the
 push mechanics below.
 
-## The OpenShift integrated-registry push
+## The OpenShift on-cluster build
 
-For a profile with a distinct `push`/`pull` (OpenShift), ztest pushes images
-**itself**, over HTTPS, rather than shelling out to `docker push`. This is what
-makes the one-file model real: no `docker login`, no `oc`, no
-`/etc/docker/certs.d`, no per-developer `sudo`.
+For a profile with a distinct `push`/`pull` (OpenShift), ztest builds images
+**on the cluster** in a long-lived, ztest-owned rootless-**buildah** pod
+(`ztest-buildah`), not through OpenShift's Build subsystem. The Build subsystem
+pins its build-pod init containers to `quay.io/okd/scos-content` by digest, and
+OKD prunes those digests from quay within ~72h on pre-release streams — so a
+day-old cluster's first build dies `ImagePullBackOff: manifest unknown`.
+Depending instead on a pinned, retained public image
+(`quay.io/buildah/stable`) removes that dependency on upstream retention.
 
-The flow, per image, during preflight (`ImageProvider` →
-`backends::oci`):
+The flow, per image, during preflight:
 
-1. **Build to an OCI layout.** `docker buildx build --output type=oci` produces
-   registry-ready blobs (correct gzip + digests, unlike `docker save`). The
-   default `docker` buildx driver can't export OCI, so ztest ensures a
-   `docker-container` driver builder named `ztest` exists (created once,
-   idempotently).
-2. **Push in-process.** ztest reads the OCI layout and uploads each blob +
-   the manifest with `reqwest`, authenticating via OpenShift's standard
-   `Basic(sa:token) → Bearer` registry token handshake. The **token and CA come
-   straight from the kubeconfig** (`KUBECONFIG` / `ZTEST_KUBE_CONTEXT`); the CA
-   is added as a trusted root for the route's TLS. Blobs already in the registry
-   are skipped (content-address dedup), and per-blob progress is reported to the
-   run's transfer panel.
-3. **Pods pull via the service.** Pod specs reference the `pull` address
+1. **Pack the context.** `bundle::pack` walks the build context once into a
+   deterministic, `.dockerignore`-aware tar with the chosen Dockerfile staged at
+   the root — the same bytes the `dev-<hash>` tag is content-addressed on.
+2. **Build in the pod.** The tar is `oc cp`'d into the buildah pod and built with
+   `buildah bud --isolation chroot --storage-driver vfs`. `chroot` isolation runs
+   RUN steps without a per-step OCI/user namespace: a locked-down pod has masked
+   `/proc` submounts, and the kernel's "procfs must be fully visible" rule makes
+   rootless OCI isolation need `procMount: Unmasked` + an unconfined seccomp
+   profile — strictly *more* privilege. `chroot` builds identically with less.
+   `oc exec -t` streams the build log live into the console.
+3. **Push over the in-cluster service.** The pod `buildah push`es to the `pull`
+   address, authenticating with its SA token (`--creds ztest:$TOKEN
+   --tls-verify=false`) — the same in-cluster registry the runner-image `crane`
+   bake pushes to. The first push auto-creates the imagestream.
+4. **Pods pull via the service.** Pod specs reference the `pull` address
    (`image-registry.openshift-image-registry.svc:5000/…`), so the kubelet pulls
    in-cluster using the pod SA's auto-injected registry credentials — **no pull
-   secret, no route cert on nodes.**
+   secret, no route cert on nodes.** The laptop probes presence via the `push`
+   route (same registry storage).
 
 ### Cluster-side prerequisites
 
 `ztest setup --target okd` (run once, with an admin kubeconfig) provisions the
-pieces the push and pull rely on:
+pieces the build, push, and pull rely on:
 
 - the `ztest-images` project (`policy::IMAGES_NAMESPACE`);
-- the `ztest-image-push` role on `ztest-images` for the run SA `ztest/ztest`,
-  bound as `ztest-image-builder` — it grants `imagestreams: create` plus
+- the **buildah build server** (`resource::impls::buildah`): a custom SCC
+  `ztest-buildah` (rootless caps `SETUID`/`SETGID`/`SYS_CHROOT`, no privileged
+  container), the `ztest-buildah` ServiceAccount, a storage PVC, and the
+  `ztest-buildah` Deployment running `quay.io/buildah/stable` idle;
+- the `ztest-image-push` role on `ztest-images`, bound to the run SA `ztest/ztest`
+  **and** `ztest/ztest-buildah` — it grants `imagestreams: create` plus
   `imagestreams/layers: get,update`. Plain `system:image-pusher` is *not* enough:
   it lacks imagestream **create**, so the first push of a never-seen image is
   denied (the registry must create the imagestream on first push);
 - `system:image-puller` on `ztest-images` for `system:serviceaccounts` (so every
   pod SA can pull — this is why no pull secret is needed);
-- the SCC grant.
+- the SCC grant for the per-test pods.
 
 The run SA's cluster read permissions (`nodes` for the QoS probe,
 `volumesnapshotclasses`/`storageclasses` for seeding) are part of the same
@@ -165,7 +179,8 @@ The run SA's cluster read permissions (`nodes` for the QoS probe,
 out-of-band. They come from a single source (`policy::RUN_RULES`) that also
 drives a run-start `SelfSubjectAccessReview` self-check: a stale grant makes
 `ztest run` fail fast naming the exact missing permission, rather than 403-ing
-deep in a run.
+deep in a run. The build path needs no OpenShift `build.openshift.io` grants —
+it `exec`s into the buildah pod (`pods/exec`).
 
 See **[Local OpenShift (crc) setup](openshift-cluster-setup.md)** for bringing
 up the cluster itself, and **[Cluster administration](cluster-administration.md)**
@@ -189,6 +204,7 @@ beats the persisted default), so CI and one-off overrides are unaffected:
 |-----|---------|
 | `ZTEST_KUBE_CONTEXT` | kube-context to target in-memory |
 | `KUBECONFIG` | kubeconfig file (also the token+CA source for the push) |
+| `ZTEST_IMAGE_BACKEND` | image backend: `kind` / `registry` / `openshift`. With no profile, inferred from the registry vars below |
 | `ZTEST_IMAGE_REGISTRY` | pull base (what pods reference) |
 | `ZTEST_IMAGE_PUSH_REGISTRY` | distinct push base → OpenShift integrated-registry mode |
 | `KIND_CLUSTER` | kind cluster name |

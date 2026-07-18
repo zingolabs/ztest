@@ -128,12 +128,14 @@ end. Use **LVMS** (`topolvm.io`, thin-pool snapshots) — same driver family as 
 ### 1. Attach a spare disk
 
 LVMS consumes unused devices as seen **inside the VM** (`/dev/vdb`), not host
-`lsblk` paths. The VM has only `/dev/vda` by default. Hypervisor op, needs `sudo`
-(system libvirt, root-owned disk files):
+`lsblk` paths. The VM has only `/dev/vda` by default. No `sudo` needed if you're in
+the `libvirt` group (on NixOS the `kubernetes` specialization adds you) — the disk
+file lives under your user-owned `~/.crc`, and `qemu:///system` is group-accessible.
+The disk is hot-plugged live, so the node sees `/dev/vdb` without a restart:
 
 ```bash
-sudo qemu-img create -f qcow2 ~/.crc/machines/crc/lvms.qcow2 50G
-sudo virsh -c qemu:///system attach-disk crc \
+qemu-img create -f qcow2 ~/.crc/machines/crc/lvms.qcow2 150G
+virsh -c qemu:///system attach-disk crc \
   ~/.crc/machines/crc/lvms.qcow2 vdb \
   --driver qemu --subdriver qcow2 --targetbus virtio --persistent --live
 ```
@@ -237,6 +239,37 @@ ztest setup --target okd --storage-device /dev/vdb
 ```
 
 Idempotent — skips anything already Ready.
+
+> **The setup kubeconfig must carry a bearer token, not only a client
+> certificate.** On an OpenShift target, setup builds the base images, and each
+> build pushes a source bundle to the integrated registry authenticated with the
+> kubeconfig's **token** (`internal_push_target` reads it). crc's default
+> `kubeadmin` context is **cert-only**, so it fails with `the kubeconfig has no
+> bearer token for the registry push`. Use a token-bearing admin context — mint a
+> non-expiring token from a cluster-admin ServiceAccount and point your setup
+> context's user at it:
+>
+> ```bash
+> oc create sa ztest-admin -n kube-system
+> oc create clusterrolebinding ztest-admin --clusterrole=cluster-admin \
+>   --serviceaccount=kube-system:ztest-admin
+> oc apply -f - <<'EOF'
+> apiVersion: v1
+> kind: Secret
+> metadata:
+>   name: ztest-admin-token
+>   namespace: kube-system
+>   annotations: { kubernetes.io/service-account.name: ztest-admin }
+> type: kubernetes.io/service-account-token
+> EOF
+> TOKEN=$(oc get secret ztest-admin-token -n kube-system -o jsonpath='{.data.token}' | base64 -d)
+> oc --kubeconfig=~/.kube/config-crc-admin config set-credentials ztest-admin --token="$TOKEN"
+> oc --kubeconfig=~/.kube/config-crc-admin config set-context <your-ctx> --user=ztest-admin
+> ```
+>
+> (The `ztest run` credential — [Remote access](#remote-access-over-nebula)'s
+> `config-crc-remote` — is already a token-based SA, so runs that build `dev!`
+> component images push their bundles fine.)
 
 > `--storage-device` is only for **building** a fresh LVMS pool. On a cluster
 > that already has snapshot-capable storage (operator + `LVMCluster` up, or any
@@ -342,8 +375,33 @@ oc get node crc -o jsonpath='{range .status.conditions[?(@.type=="DiskPressure")
 - **Kubeconfig missing mid-restart.** During `crc stop`/`start`, `~/.kube/config`
   may be absent until start completes. Meanwhile:
   `export KUBECONFIG=~/.crc/machines/crc/kubeconfig`.
-- **`crc status` fails from a subprocess** (`dial tcp: missing address`) even when
-  up — it needs the crc daemon socket. Don't gate automation on it; use the API.
+- **`401 Unauthorized` after a crc restart/recreate.** A restart that renews
+  expired cluster certs rotates the SA-token signing key (and a fresh `ztest setup`
+  mints a new run SA), so the token-based kubeconfigs go stale — `ztest run` fails
+  `cluster probe failed — ApiError: Unauthorized … 401`. Rebuild them from the
+  *current* SA tokens (via a working admin context, e.g. `crc oc-env`'s):
+  ```bash
+  # run credential (config-crc-remote → the `crc` profile)
+  oc -n ztest get secret ztest-token -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/crc-ca.crt
+  TOKEN=$(oc -n ztest get secret ztest-token -o jsonpath='{.data.token}' | base64 -d)
+  oc --kubeconfig=~/.kube/config-crc-remote config set-cluster crc \
+    --server=https://<mesh-ip>:6443 --tls-server-name=api.crc.testing \
+    --certificate-authority=/tmp/crc-ca.crt --embed-certs
+  oc --kubeconfig=~/.kube/config-crc-remote config set-credentials ztest --token="$TOKEN"
+  oc --kubeconfig=~/.kube/config-crc-remote config set-context crc-remote \
+    --cluster=crc --user=ztest --namespace=ztest
+  oc --kubeconfig=~/.kube/config-crc-remote config use-context crc-remote
+  ```
+  The setup credential (`config-crc-admin`) is refreshed the same way, pointed at
+  its cluster-admin SA token (see [Running `ztest setup`](#running-ztest-setup) — it
+  must be token-based, not cert-only).
+- **`crc status` misreports** even when the cluster is up — `dial tcp: missing
+  address` from a subprocess, or `crc does not seem to be setup correctly, have you
+  run 'crc setup'?` (a daemon-state quirk; `crc start` will still say the cluster is
+  running and hand you the console URL). Don't gate automation on `crc status`;
+  confirm with the API instead: `eval "$(crc oc-env)"; oc get nodes`.
+- **`oc` not on `PATH` in a fresh/non-interactive shell** — run `eval "$(crc
+  oc-env)"` first (it puts crc's bundled `oc` at `~/.crc/bin/oc/oc` on `PATH`).
 
 ## Teardown / rebuild
 
@@ -369,3 +427,68 @@ and the run identity is rbac-less (can't self-bind SCCs). A future refinement
 could move it into `cluster::ensure_namespace` as a per-namespace grant, but
 that requires giving the run identity rbac-write, so the group grant is the
 current answer.
+
+## On-cluster builds (default on OpenShift)
+
+On an OpenShift registry (distinct push route / pull service) ztest builds every
+image **on the cluster** in a long-lived, **ztest-owned rootless buildah pod**
+(`src/backends/image/openshift.rs`, `src/resource/impls/buildah.rs`). Per image it
+packs the Dockerfile + context into a deterministic, content-addressed tar
+(`bundle::pack`), `oc cp`s it into the buildah pod, runs `buildah bud`, and
+`buildah push`es the result to the integrated registry over the in-cluster
+service (authenticating with the pod SA's token). The build log is streamed live
+through the console PTY (`oc exec -t`), and success is the exec's exit status.
+
+Why not `oc start-build`: the native Build subsystem runs the build in the
+cluster's **release-managed** `docker-builder` image (`quay.io/okd/scos-content`),
+which on OKD-SCOS/CRC is pruned from quay when the release tag moves — breaking
+every build (`Init:ImagePullBackOff: manifest unknown`). Buildah builds from a
+**pinned, retained public** image (`quay.io/buildah/stable`), so a pruned release
+image can't break builds.
+
+Why `chroot` isolation (not `oci`/user namespaces): buildah runs each `RUN` via
+`chroot` — no per-step OCI runtime, no new namespaces — needing only
+`SETUID`/`SETGID`/`SYS_CHROOT`. Full `oci`/userns isolation can't run unprivileged
+on this OpenShift/CRI-O/kernel stack: a locked-down pod has masked `/proc`
+submounts, and the kernel's "procfs must be fully visible" rule makes it need
+`procMount: Unmasked` + an unconfined seccomp profile — strictly *more* privilege.
+`chroot` builds identically with less, under ztest's own narrow `ztest-buildah`
+SCC (not privileged, no host access; runs as uid 1000).
+
+**No fallback.** The cluster profile names the backend (an OpenShift registry ⇒
+this on-cluster builder); if it fails, the run fails — it never silently
+degrades to another build path.
+
+**Requirements.** No cluster operators to install — ztest owns the whole build
+path. `ztest setup` (with an admin kubeconfig, needed to create the SCC) provisions
+everything (`src/resource/impls/buildah.rs`, `policy.rs`, `base_images.rs`):
+- the **buildah build server** (`BuildahProvider`, `NodeId::Buildah`): the
+  `ztest-buildah` Deployment running `quay.io/buildah/stable` idle, its
+  `ztest-buildah` ServiceAccount, and a storage PVC (buildah's `vfs` graphroot +
+  the staged context; persists cached base layers across builds);
+- a **custom non-privileged SCC `ztest-buildah`**: allows `SETUID`/`SETGID`/
+  `SYS_CHROOT`, `allowPrivilegeEscalation`, and `RunAsAny` — no privileged
+  container, no host access. The pod runs as uid 1000 with SELinux type
+  `container_engine_t` (the domain that permits buildah's nested-container fs
+  setup);
+- **registry push authz**: the `ztest-image-push` role on `ztest-images` bound to
+  the `ztest-buildah` SA (`imagestreams: create` + `imagestreams/layers:
+  get,update`) — the push auto-creates the imagestream on first push. The buildah
+  pod pushes over the in-cluster service with its SA token
+  (`--tls-verify=false`, the registry's service-ca cert; pulls are unaffected —
+  the kubelet trusts the service-ca).
+
+**Base images — nothing to seed.** The compile **builder** and the test-runner
+**base** are built on the cluster by `ztest setup` from `docker/builder.Dockerfile`
+and `docker/runner-base.Dockerfile` (`src/resource/impls/base_images.rs`), through
+the same buildah-pod path as component images. They are **stock Debian**
+(`rust:1.95.0-bookworm` / `debian:bookworm-slim`) — the workspace links no
+rocksdb / no OpenSSL (rustls everywhere) and only statically-linked C (ring,
+aws-lc-sys, zstd-sys), so the runner base is just glibc + CA roots and both images
+pin `bookworm` for an identical glibc at compile and run time. No `nix build`, no
+`docker load`, no local image build — only the ~1 KB source bundle leaves the laptop.
+
+Each is content-addressed on its Dockerfile bytes (`<repo>:d-<hash>`): edit a
+Dockerfile and the tag forks, so the next `ztest setup` rebuilds it and the digest
+pin re-rolls the builder Deployment; leave it unchanged and setup finds the tag
+present and skips the build. The whole flow is `ztest setup` → `ztest run`.

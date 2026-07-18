@@ -1,10 +1,11 @@
 //! Named cluster profiles.
 //!
-//! A profile binds the three otherwise-independent knobs that decide where a
-//! `ztest run` actually lands — the kube-context, the image distribution
-//! (`kind load` vs registry push), and the OpenShift flag — under one name, so
-//! `ztest run --cluster <name>` (or a persisted default) selects all three at
-//! once. Without this, the target is ambient: the kube current-context drives
+//! A profile binds the otherwise-independent knobs that decide where a
+//! `ztest run` actually lands — the kube-context and the image
+//! [`backend`](Profile::backend) (kind / registry / OpenShift, with its
+//! addresses) — under one name, so `ztest run --cluster <name>` (or a persisted
+//! default) selects them together, and `ztest setup` provisions against the same
+//! signal. Without this, the target is ambient: the kube current-context drives
 //! API calls while `ZTEST_IMAGE_REGISTRY` / `KIND_CLUSTER` independently drive
 //! image loading, and it's easy to build into a kind node while pointed at a
 //! remote cluster (or vice versa) without noticing.
@@ -30,6 +31,11 @@ pub const KUBE_CONTEXT_ENV: &str = "ZTEST_KUBE_CONTEXT";
 const REGISTRY_ENV: &str = "ZTEST_IMAGE_REGISTRY";
 const PUSH_REGISTRY_ENV: &str = "ZTEST_IMAGE_PUSH_REGISTRY";
 const KIND_CLUSTER_ENV: &str = "KIND_CLUSTER";
+/// Env var carrying the profile's [`ImageBackend`] selection. The single signal
+/// both `ztest setup` (which OpenShift policy to provision) and `ztest run`
+/// (which [`ImageProvider`](crate::backends::image::ImageProvider) to build)
+/// read, so the two commands can never disagree about what a cluster is.
+pub const IMAGE_BACKEND_ENV: &str = "ZTEST_IMAGE_BACKEND";
 
 /// The on-disk store: a set of named profiles plus the active default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -41,11 +47,57 @@ pub struct Config {
     pub clusters: BTreeMap<String, Profile>,
 }
 
-/// One named cluster. Image distribution is one of: kind (`kind_cluster`),
-/// generic registry (`push`, pods pull the same address), or the OpenShift
-/// integrated registry (`push` is the external route and `pull` the in-cluster
-/// service). `push`/`pull` and `kind_cluster` are mutually exclusive.
+/// How a profile's images reach the cluster — the one signal that decides both
+/// which OpenShift policy `ztest setup` provisions and which
+/// [`ImageProvider`](crate::backends::image::ImageProvider) `ztest run` builds.
+/// Explicit rather than inferred from which of `push`/`pull`/`kind_cluster`
+/// happen to be set: an under-specified profile used to silently resolve to kind
+/// mode, and `setup` and `run` inferred OpenShift-ness from different places (a
+/// `Remote` target that is really OpenShift was invisible to `setup`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageBackend {
+    /// `kind load` into a local kind node. No registry.
+    #[default]
+    Kind,
+    /// Build locally, push to a generic registry; pods pull the same address.
+    Registry,
+    /// On-cluster build in a ztest-owned rootless-buildah pod, pushing to the
+    /// OpenShift integrated registry (`push` = external route, `pull` = in-cluster
+    /// service), plus the SCC grant + registry-project policy `setup` installs.
+    OpenShift,
+}
+
+impl ImageBackend {
+    /// Lowercase token used in `clusters.toml` and [`IMAGE_BACKEND_ENV`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageBackend::Kind => "kind",
+            ImageBackend::Registry => "registry",
+            ImageBackend::OpenShift => "openshift",
+        }
+    }
+
+    /// Parse the [`IMAGE_BACKEND_ENV`] token; `None` for an unknown/absent value.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "kind" => Some(ImageBackend::Kind),
+            "registry" => Some(ImageBackend::Registry),
+            "openshift" => Some(ImageBackend::OpenShift),
+            _ => None,
+        }
+    }
+
+    /// True for the on-cluster OpenShift build path (SCC + registry policy).
+    pub fn is_openshift(self) -> bool {
+        matches!(self, ImageBackend::OpenShift)
+    }
+}
+
+/// One named cluster. [`backend`](Profile::backend) selects image distribution;
+/// `push`/`pull`/`kind_cluster` carry the addresses that backend needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RawProfile")]
 pub struct Profile {
     /// Expected kube-context, targeted in-memory. `None` means "whatever the
     /// current kube-context is" (the natural choice for a local kind cluster).
@@ -69,45 +121,112 @@ pub struct Profile {
     /// kind cluster name → kind image mode (node `<name>-control-plane`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind_cluster: Option<String>,
-    /// Provision/expect the OpenShift-only policy (SCC grant, internal registry).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub openshift: bool,
+    /// The image-distribution backend. See [`ImageBackend`].
+    #[serde(default)]
+    pub backend: ImageBackend,
+}
+
+/// Deserialization shape accepting both the current `backend` key and the legacy
+/// `openshift` bool (pre-[`ImageBackend`] configs). A profile with no `backend`
+/// migrates from its addresses: `openshift = true` → OpenShift, a bare `push`
+/// → Registry, otherwise Kind — so an existing `clusters.toml` keeps working
+/// without a rewrite, and never silently downgrades an OpenShift profile to kind.
+#[derive(Deserialize)]
+struct RawProfile {
+    context: Option<String>,
+    kubeconfig: Option<String>,
+    push: Option<String>,
+    pull: Option<String>,
+    kind_cluster: Option<String>,
+    backend: Option<ImageBackend>,
+    #[serde(default)]
+    openshift: bool,
+}
+
+impl From<RawProfile> for Profile {
+    fn from(r: RawProfile) -> Self {
+        let backend = r.backend.unwrap_or_else(|| {
+            if r.openshift {
+                ImageBackend::OpenShift
+            } else if r.push.is_some() {
+                ImageBackend::Registry
+            } else {
+                ImageBackend::Kind
+            }
+        });
+        Profile {
+            context: r.context,
+            kubeconfig: r.kubeconfig,
+            push: r.push,
+            pull: r.pull,
+            kind_cluster: r.kind_cluster,
+            backend,
+        }
+    }
 }
 
 impl Profile {
-    /// Reject contradictory distribution settings.
+    /// Reject a `backend` that disagrees with the addresses it needs.
     pub fn validate(&self) -> Result<(), String> {
-        if self.push.is_some() && self.kind_cluster.is_some() {
-            return Err("a profile sets either a registry or --kind, not both".to_string());
-        }
-        if self.pull.is_some() && self.push.is_none() {
-            return Err("a pull address needs a push address (--registry)".to_string());
+        match self.backend {
+            ImageBackend::Kind => {
+                if self.push.is_some() || self.pull.is_some() {
+                    return Err(
+                        "a `kind` profile must not set a registry address (push/pull)".to_string(),
+                    );
+                }
+            }
+            ImageBackend::Registry => {
+                if self.push.is_none() {
+                    return Err("a `registry` profile needs a push address (--registry)".to_string());
+                }
+                if self.kind_cluster.is_some() {
+                    return Err("a profile sets either a registry or --kind, not both".to_string());
+                }
+                if self.pull.is_some() {
+                    return Err(
+                        "a `registry` profile pushes and pulls one address; a distinct pull \
+                         address is the OpenShift integrated registry — use backend `openshift`"
+                            .to_string(),
+                    );
+                }
+            }
+            ImageBackend::OpenShift => {
+                if self.push.is_none() || self.pull.is_none() {
+                    return Err(
+                        "an `openshift` profile needs both a push route (--registry) and an \
+                         in-cluster pull address (--pull)"
+                            .to_string(),
+                    );
+                }
+            }
         }
         Ok(())
-    }
-
-    /// True when this profile uses the OpenShift integrated registry (a distinct
-    /// in-cluster pull address).
-    pub fn is_internal_registry(&self) -> bool {
-        self.pull.is_some() && self.push.is_some()
     }
 
     /// One-line human summary for `ztest cluster list` / `current`.
     pub fn summary(&self) -> String {
         let ctx = self.context.as_deref().unwrap_or("(current kube-context)");
-        let images = match (&self.push, &self.pull, &self.kind_cluster) {
-            (Some(push), Some(pull), _) => format!("registry push={push} pull={pull}"),
-            (Some(base), None, _) => format!("registry {base}"),
-            (None, _, Some(name)) => format!("kind {name}"),
-            (None, _, None) => "kind (default)".to_string(),
+        let unset = "?";
+        let images = match self.backend {
+            ImageBackend::Kind => self
+                .kind_cluster
+                .as_deref()
+                .map(|n| format!("kind {n}"))
+                .unwrap_or_else(|| "kind (default)".to_string()),
+            ImageBackend::Registry => format!("registry {}", self.push.as_deref().unwrap_or(unset)),
+            ImageBackend::OpenShift => format!(
+                "openshift push={} pull={}",
+                self.push.as_deref().unwrap_or(unset),
+                self.pull.as_deref().unwrap_or(unset),
+            ),
         };
         let kc = self
             .kubeconfig
             .as_deref()
             .map(|p| format!(", kubeconfig={p}"))
             .unwrap_or_default();
-        let os = if self.openshift { ", openshift" } else { "" };
-        format!("context={ctx}, images={images}{kc}{os}")
+        format!("context={ctx}, images={images}{kc}")
     }
 }
 
@@ -400,17 +519,13 @@ pub unsafe fn activate(flag: Option<&str>) -> Result<Option<String>, String> {
         .get(&name)
         .ok_or_else(|| unknown_cluster(&name, &cfg))?;
 
-    // An openshift profile with no push registry silently resolves to kind mode
-    // (the exact ambient-drift footgun profiles exist to prevent). The usual
-    // cause is a config written before the push/pull split, whose legacy
-    // `registry` key serde now ignores. Fail loudly with the fix.
-    if profile.openshift && profile.push.is_none() {
-        return Err(format!(
-            "cluster profile `{name}` is `openshift` but has no push registry — likely a stale \
-             config predating the push/pull split (a legacy `registry` key is ignored). \
-             Re-create it: `ztest cluster add {name} --registry <route> --pull <svc>`."
-        ));
-    }
+    // A backend that disagrees with its addresses silently resolves to the wrong
+    // mode (e.g. an `openshift` profile with no push registry falls through to
+    // kind — the exact ambient-drift footgun profiles exist to prevent). Fail
+    // loudly at selection, naming the fix, rather than deep in a run.
+    profile
+        .validate()
+        .map_err(|e| format!("cluster profile `{name}`: {e}"))?;
 
     // Apply before verifying: apply may set KUBECONFIG to the profile's file, and
     // verify_context reads whatever KUBECONFIG now points at (so a context in a
@@ -471,16 +586,17 @@ unsafe fn apply(profile: &Profile, force: bool) {
     unsafe {
         set("KUBECONFIG", profile.kubeconfig.as_deref(), force);
         set(KUBE_CONTEXT_ENV, profile.context.as_deref(), force);
-        match (&profile.push, &profile.pull, &profile.kind_cluster) {
+        set(IMAGE_BACKEND_ENV, Some(profile.backend.as_str()), force);
+        match profile.backend {
             // OpenShift integrated registry: pods reference the pull (svc)
             // address; the build is pushed to the distinct push (route) address.
-            (Some(push), Some(pull), _) => {
-                set(REGISTRY_ENV, Some(pull), force);
-                set(PUSH_REGISTRY_ENV, Some(push), force);
+            ImageBackend::OpenShift => {
+                set(REGISTRY_ENV, profile.pull.as_deref(), force);
+                set(PUSH_REGISTRY_ENV, profile.push.as_deref(), force);
             }
             // Generic registry: one address for both push and pull.
-            (Some(base), None, _) => {
-                set(REGISTRY_ENV, Some(base), force);
+            ImageBackend::Registry => {
+                set(REGISTRY_ENV, profile.push.as_deref(), force);
                 if force {
                     std::env::remove_var(PUSH_REGISTRY_ENV);
                 }
@@ -488,12 +604,12 @@ unsafe fn apply(profile: &Profile, force: bool) {
             // kind mode requires both registry vars absent so
             // image::from_env resolves to Kind. Only an explicit flag
             // clears a pre-set env; `current` leaves it (env wins).
-            (None, _, kind) => {
+            ImageBackend::Kind => {
                 if force {
                     std::env::remove_var(REGISTRY_ENV);
                     std::env::remove_var(PUSH_REGISTRY_ENV);
                 }
-                set(KIND_CLUSTER_ENV, kind.as_deref(), force);
+                set(KIND_CLUSTER_ENV, profile.kind_cluster.as_deref(), force);
             }
         }
     }
@@ -542,7 +658,7 @@ mod tests {
                 context: Some("crc".to_string()),
                 push: Some("route.example/ztest-images".to_string()),
                 pull: Some("svc:5000/ztest-images".to_string()),
-                openshift: true,
+                backend: ImageBackend::OpenShift,
                 ..Default::default()
             },
         );
@@ -555,6 +671,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_openshift_bool_migrates_to_backend() {
+        // A config written before `backend` existed: the `openshift = true` bool
+        // must migrate to `ImageBackend::OpenShift`, never silently downgrade to
+        // the kind default (which would point a remote OpenShift run at kind).
+        let body = "[clusters.crc]\n\
+                    context = \"crc\"\n\
+                    push = \"route.example/img\"\n\
+                    pull = \"svc:5000/img\"\n\
+                    openshift = true\n";
+        let cfg: Config = toml::from_str(body).unwrap();
+        assert_eq!(cfg.clusters["crc"].backend, ImageBackend::OpenShift);
+
+        // A legacy bare-registry profile (push, no openshift) → Registry.
+        let body = "[clusters.gh]\npush = \"ghcr.io/z\"\n";
+        let cfg: Config = toml::from_str(body).unwrap();
+        assert_eq!(cfg.clusters["gh"].backend, ImageBackend::Registry);
+    }
+
+    #[test]
     fn absent_distribution_is_kind_default_summary() {
         let p = Profile::default();
         assert!(p.summary().contains("kind (default)"));
@@ -562,8 +697,9 @@ mod tests {
     }
 
     #[test]
-    fn both_distributions_is_rejected() {
+    fn registry_and_kind_together_is_rejected() {
         let p = Profile {
+            backend: ImageBackend::Registry,
             push: Some("r".into()),
             kind_cluster: Some("k".into()),
             ..Default::default()
@@ -572,8 +708,19 @@ mod tests {
     }
 
     #[test]
-    fn pull_without_push_is_rejected() {
+    fn openshift_without_addresses_is_rejected() {
         let p = Profile {
+            backend: ImageBackend::OpenShift,
+            push: Some("route/x".into()),
+            ..Default::default()
+        };
+        assert!(p.validate().is_err(), "openshift needs a pull address too");
+    }
+
+    #[test]
+    fn kind_with_registry_address_is_rejected() {
+        let p = Profile {
+            backend: ImageBackend::Kind,
             pull: Some("svc:5000/x".into()),
             ..Default::default()
         };

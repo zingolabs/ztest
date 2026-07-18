@@ -1,196 +1,208 @@
-//! Pure conversion from [`avt`]'s emulated terminal cells to [`ratatui`]
-//! styled text.
+//! Pure conversion from [`avt`]'s emulated terminal cells to ANSI strings.
 //!
-//! The unified run console feeds every subprocess's output through an `avt`
-//! virtual terminal, then renders the result two ways:
-//!
-//! - the live visible grid (`Vt::view`) into the inline viewport, and
-//! - lines that scroll off the top (`Changes::scrollback`) forwarded into the
-//!   terminal's native scrollback via `ratatui`'s `insert_before`.
-//!
-//! Both paths map avt cells (a glyph plus a [`Pen`]: fg/bg colour and SGR
-//! attributes) onto a `ratatui` [`Style`]/[`Span`]/[`Line`]. That mapping is
-//! the whole module: pure, no I/O, unit-tested against a real `avt` parser so
-//! the colour/attribute/wide-char handling can't silently drift.
+//! The console feeds every subprocess's output through an `avt` virtual terminal,
+//! then serializes the result back to ANSI for direct terminal output: lines that
+//! scroll off the top (`Changes::scrollback`) become committed scrollback, and the
+//! live grid (`Vt::view`) becomes the footer's live rows. This module is that
+//! serialization — pure, no I/O, unit-tested against a real `avt` parser (round-
+//! tripping through the emulator) so colour/attribute/wide-char handling can't
+//! silently drift.
 
 use avt::{Color as AvtColor, Line as AvtLine, Pen, Vt};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
 
-/// Map an avt colour to its `ratatui` equivalent. avt carries either a 256-
-/// colour palette index or a 24-bit RGB triple; both have direct `ratatui`
-/// counterparts.
-fn color(c: AvtColor) -> Color {
-    match c {
-        AvtColor::Indexed(i) => Color::Indexed(i),
-        AvtColor::RGB(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
-    }
-}
-
-/// Map an avt cell's [`Pen`] (foreground/background + SGR attributes) onto a
-/// `ratatui` [`Style`]. An unset fg/bg leaves the terminal default (we don't
-/// force a colour), and each SGR flag maps to the matching `ratatui` modifier.
-pub(crate) fn pen_style(pen: &Pen) -> Style {
-    let mut style = Style::default();
-    if let Some(fg) = pen.foreground() {
-        style = style.fg(color(fg));
-    }
-    if let Some(bg) = pen.background() {
-        style = style.bg(color(bg));
-    }
-    let mut m = Modifier::empty();
+/// The SGR parameter list for a [`Pen`] (e.g. `"1;38;5;1"` for bold + red), or an
+/// empty string for the terminal default. Colours use the always-valid extended
+/// forms (`38;5;i` / `38;2;r;g;b`); attributes precede them.
+fn sgr_params(pen: &Pen) -> String {
+    let mut p: Vec<String> = Vec::new();
     if pen.is_bold() {
-        m |= Modifier::BOLD;
+        p.push("1".into());
     }
     if pen.is_faint() {
-        m |= Modifier::DIM;
+        p.push("2".into());
     }
     if pen.is_italic() {
-        m |= Modifier::ITALIC;
+        p.push("3".into());
     }
     if pen.is_underline() {
-        m |= Modifier::UNDERLINED;
-    }
-    if pen.is_strikethrough() {
-        m |= Modifier::CROSSED_OUT;
+        p.push("4".into());
     }
     if pen.is_blink() {
-        m |= Modifier::SLOW_BLINK;
+        p.push("5".into());
     }
     if pen.is_inverse() {
-        m |= Modifier::REVERSED;
+        p.push("7".into());
     }
-    style.add_modifier(m)
+    if pen.is_strikethrough() {
+        p.push("9".into());
+    }
+    if let Some(fg) = pen.foreground() {
+        p.push(match fg {
+            AvtColor::Indexed(i) => format!("38;5;{i}"),
+            AvtColor::RGB(c) => format!("38;2;{};{};{}", c.r, c.g, c.b),
+        });
+    }
+    if let Some(bg) = pen.background() {
+        p.push(match bg {
+            AvtColor::Indexed(i) => format!("48;5;{i}"),
+            AvtColor::RGB(c) => format!("48;2;{};{};{}", c.r, c.g, c.b),
+        });
+    }
+    p.join(";")
 }
 
-/// Convert one emulated terminal line into an owned `ratatui` [`Line`].
+/// Convert one emulated terminal line into a self-contained ANSI string, clipped
+/// to at most `max_cols` display columns. Returns the string and the display
+/// width it uses (for side-by-side padding in the two-column panel).
 ///
 /// For fidelity and cost:
-/// - Runs are coalesced: consecutive cells sharing a pen become a single
-///   [`Span`], so a 200-column line of one colour is one span, not 200.
-/// - Trailing blanks are trimmed: avt pads every line to full width with
-///   default cells, and forwarding those into scrollback would tack ~180 spaces
-///   onto a short `Compiling foo` line. We cut at the last non-default cell. A
-///   cell with a non-default background (e.g. a highlighted row) is not
-///   "default", so genuine trailing colour is preserved.
-/// - Wide-char tails (width 0) are skipped: the head cell already carries the
-///   full glyph; the tail is a placeholder.
-pub(crate) fn avt_line(line: &AvtLine) -> Line<'static> {
+/// - Runs are coalesced: consecutive cells sharing a pen become one SGR span, so
+///   a 200-column line of one colour is one span, not 200.
+/// - Trailing blanks are trimmed: avt pads every line to full width with default
+///   cells; we cut at the last non-default cell (a non-default background is
+///   preserved).
+/// - Wide-char tails (width 0) are skipped; a wide glyph that would straddle the
+///   clip edge is dropped.
+/// - Each style change resets first (`ESC[0;…m`) so no attribute leaks from the
+///   previous run, and any trailing style is reset at line end so the line can be
+///   concatenated beside another without bleeding.
+pub(crate) fn avt_line_ansi_clipped(line: &AvtLine, max_cols: usize) -> (String, usize) {
     let cells = line.cells();
     let end = cells
         .iter()
         .rposition(|c| !c.is_default())
         .map_or(0, |i| i + 1);
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let mut cur: Option<Style> = None;
+    let mut out = String::new();
+    let mut cur = String::new(); // SGR params currently in effect ("" = default)
+    let mut used = 0usize;
     for cell in &cells[..end] {
-        if cell.width() == 0 {
-            continue; // wide-char tail: glyph already emitted by the head cell
+        let w = cell.width() as usize;
+        if w == 0 {
+            continue; // wide-char tail
         }
-        let style = pen_style(cell.pen());
-        match cur {
-            Some(s) if s == style => buf.push(cell.char()),
-            _ => {
-                if let Some(s) = cur.take() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), s));
-                }
-                cur = Some(style);
-                buf.push(cell.char());
+        if used + w > max_cols {
+            break;
+        }
+        let params = sgr_params(cell.pen());
+        if params != cur {
+            if params.is_empty() {
+                out.push_str("\x1b[0m");
+            } else {
+                out.push_str("\x1b[0;");
+                out.push_str(&params);
+                out.push('m');
             }
+            cur = params;
         }
+        out.push(cell.char());
+        used += w;
     }
-    if let Some(s) = cur {
-        spans.push(Span::styled(buf, s));
+    if !cur.is_empty() {
+        out.push_str("\x1b[0m");
     }
-    Line::from(spans)
+    (out, used)
 }
 
-/// Render an owo-colors/ANSI string (e.g. the QoS status panel produced by
-/// [`crate::preflight::render_live_panel`]) into `ratatui` styled [`Text`] by
-/// replaying it through a throwaway `avt` screen of the given size and
-/// converting each visible row with [`avt_line`].
+/// Unclipped [`avt_line_ansi_clipped`] — the whole line as an ANSI string.
+pub(crate) fn avt_line_to_ansi(line: &AvtLine) -> String {
+    avt_line_ansi_clipped(line, usize::MAX).0
+}
+
+/// Replay an owo-colors/ANSI string through a wide (non-wrapping) emulator and
+/// return each logical row clipped to `width` display columns, as
+/// `(ansi, display_width)`. Used to lay the two panel columns side by side: a
+/// line longer than its column is clipped (keeping the labelled head, dropping
+/// trailing detail) rather than wrapped, so it stays one physical row.
 ///
-/// This routes the panel through the same cell-to-span mapping the live child
-/// grid uses, so the two halves of the viewport can't drift in colour/attribute
-/// handling. The panel is generated with bare `\n` line breaks (`writeln!`), but
-/// `avt` is a raw VT: a lone line-feed moves down a row without returning to
-/// column 0, so we normalise `\n` to `\r\n` first, exactly as a terminal's
-/// `ONLCR` discipline would for a child's output.
-pub(crate) fn text_from_ansi(s: &str, cols: usize, rows: usize) -> Text<'static> {
-    let mut vt = Vt::new(cols.max(1), rows.max(1));
+/// The panel is generated with bare `\n` line breaks (`writeln!`), but `avt` is a
+/// raw VT: a lone line-feed moves down without returning to column 0, so we
+/// normalise `\n` to `\r\n` first, exactly as a terminal's `ONLCR` discipline
+/// would for a child's output.
+pub(crate) fn ansi_rows(s: &str, width: usize) -> Vec<(String, usize)> {
+    const NOWRAP: usize = 512;
+    let s = s.trim_end_matches('\n');
+    let h = s.lines().count().max(1);
+    let mut vt = Vt::new(NOWRAP, h);
     vt.feed_str(&s.replace('\n', "\r\n"));
-    let lines: Vec<Line<'static>> = vt.view().map(avt_line).collect();
-    Text::from(lines)
+    vt.view()
+        .map(|row| avt_line_ansi_clipped(&row, width))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use avt::Vt;
 
-    /// Feed bytes to a fresh emulator and return its single visible line,
-    /// converted. `cols`/`rows` size the virtual screen.
-    fn line_of(cols: usize, input: &str) -> Line<'static> {
+    /// avt line → ANSI → avt line must preserve the serialized form (a stable
+    /// round-trip proves text + per-cell style survive the emulator).
+    fn roundtrip(cols: usize, input: &str) {
         let mut vt = Vt::new(cols, 1);
         vt.feed_str(input);
-        let row = vt.view().next().expect("one row").clone();
-        avt_line(&row)
+        let orig = avt_line_to_ansi(&vt.view().next().expect("one row").clone());
+
+        let mut vt2 = Vt::new(cols, 1);
+        vt2.feed_str(&orig);
+        let round = avt_line_to_ansi(&vt2.view().next().expect("one row").clone());
+
+        assert_eq!(orig, round, "roundtrip drifted for {input:?}");
     }
 
     #[test]
-    fn plain_text_is_one_span_with_no_style_and_trimmed() {
-        let line = line_of(40, "Compiling ztest");
-        assert_eq!(line.spans.len(), 1, "one run: {line:?}");
-        assert_eq!(line.spans[0].content, "Compiling ztest");
-        // Trailing padding to 40 cols is trimmed away, not carried as spaces.
-        assert_eq!(line.spans[0].style, Style::default());
+    fn ansi_roundtrips_preserve_text_and_style() {
+        roundtrip(40, "Compiling ztest");
+        roundtrip(40, "\x1b[1;31mERR\x1b[0m ok");
+        roundtrip(40, "ok\x1b[32mgo\x1b[0m more");
+        roundtrip(40, "\x1b[38;2;10;20;30mtrue\x1b[0mcolor");
+        roundtrip(40, "\x1b[1mbold\x1b[0m \x1b[4munder\x1b[0m \x1b[7mrev\x1b[0m");
+    }
+
+    fn line_of(cols: usize, input: &str) -> AvtLine {
+        let mut vt = Vt::new(cols, 1);
+        vt.feed_str(input);
+        vt.view().next().unwrap().clone()
     }
 
     #[test]
-    fn sgr_bold_red_maps_to_modifier_and_indexed_color() {
-        // ESC[1;31m = bold + red(=indexed 1); then reset.
-        let line = line_of(20, "\x1b[1;31mERR\x1b[0m");
-        let span = &line.spans[0];
-        assert_eq!(span.content, "ERR");
-        assert!(span.style.add_modifier.contains(Modifier::BOLD), "{span:?}");
-        assert_eq!(span.style.fg, Some(Color::Indexed(1)));
+    fn plain_ansi_has_no_escape_codes() {
+        assert_eq!(avt_line_to_ansi(&line_of(40, "plain text")), "plain text");
     }
 
     #[test]
-    fn style_changes_split_into_separate_spans() {
-        // "ok" default, then green "go".
-        let line = line_of(20, "ok\x1b[32mgo\x1b[0m");
-        assert_eq!(line.spans.len(), 2, "two runs: {line:?}");
-        assert_eq!(line.spans[0].content, "ok");
-        assert_eq!(line.spans[0].style.fg, None);
-        assert_eq!(line.spans[1].content, "go");
-        assert_eq!(line.spans[1].style.fg, Some(Color::Indexed(2)));
+    fn styled_ansi_resets_at_end_for_safe_concatenation() {
+        let ansi = avt_line_to_ansi(&line_of(40, "\x1b[32mgreen\x1b[0m"));
+        assert!(ansi.ends_with("\x1b[0m"), "must reset trailing style: {ansi:?}");
+        assert!(ansi.contains("38;5;2"), "green as extended fg: {ansi:?}");
     }
 
     #[test]
-    fn truecolor_maps_to_rgb() {
-        // ESC[38;2;10;20;30m = 24-bit fg.
-        let line = line_of(10, "\x1b[38;2;10;20;30mx\x1b[0m");
-        assert_eq!(line.spans[0].style.fg, Some(Color::Rgb(10, 20, 30)));
+    fn clipped_ansi_stops_at_max_cols() {
+        let (s, used) = avt_line_ansi_clipped(&line_of(40, "abcdefghij"), 4);
+        assert_eq!(s, "abcd");
+        assert_eq!(used, 4);
     }
 
     #[test]
-    fn blank_line_yields_no_spans() {
-        let line = line_of(20, "");
-        assert!(line.spans.is_empty(), "empty: {line:?}");
+    fn ansi_rows_clips_each_row_and_reports_width() {
+        let rows = ansi_rows("short\nthis-one-is-long", 6);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("short".to_string(), 5));
+        assert_eq!(rows[1].1, 6, "long row clipped to width");
+        assert_eq!(rows[1].0, "this-o");
     }
 
     #[test]
-    fn text_from_ansi_splits_rows_on_newline_without_column_drift() {
-        // Two `writeln!`-style rows (bare `\n`): the second must start at
-        // column 0, not be shifted right by the first row's width.
-        let text = text_from_ansi("alpha\n\x1b[32mbeta\x1b[0m", 20, 3);
-        assert_eq!(text.lines.len(), 3, "padded to `rows`: {text:?}");
-        assert_eq!(text.lines[0].spans[0].content, "alpha");
-        assert_eq!(text.lines[1].spans[0].content, "beta");
-        assert_eq!(text.lines[1].spans[0].style.fg, Some(Color::Indexed(2)));
-        assert!(text.lines[2].spans.is_empty(), "trailing blank row");
+    fn ansi_rows_splits_on_newline_without_column_drift() {
+        // Two `writeln!`-style rows (bare `\n`): the second must start at column 0,
+        // not be shifted right by the first row's width.
+        let rows = ansi_rows("alpha\n\x1b[32mbeta\x1b[0m", 20);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "alpha");
+        assert!(rows[1].0.contains("beta"), "row 1: {:?}", rows[1].0);
+    }
+
+    #[test]
+    fn blank_line_is_empty() {
+        assert_eq!(avt_line_to_ansi(&line_of(20, "")), "");
     }
 }

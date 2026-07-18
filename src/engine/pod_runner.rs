@@ -1,10 +1,10 @@
 //! Execute one test in a sibling runner pod instead of a local child process.
 //!
-//! The runner pod runs the nix-built image (`flake.nix` `packages.runner-image`,
-//! whose runtime closure equals the dev shell's, so a test binary's absolute
-//! `/nix/store/…/ld-linux` interpreter resolves), with the build outputs
-//! delivered via [`PodRunConfig::volumes`] and the binary launched exactly as the
-//! local executor launches it (`--exact <name> --nocapture`). This gives the two
+//! The runner pod runs the on-cluster-baked runner image (the compiled test
+//! binaries `crane`-appended onto the Debian runner base,
+//! `docker/runner-base.Dockerfile`), with the build outputs delivered via
+//! [`PodRunConfig::volumes`] and the binary launched exactly as the local
+//! executor launches it (`--exact <name> --nocapture`). This gives the two
 //! properties the local executor can't on a remote cluster: the heavy wallet
 //! compute runs in-cluster, and the whole test is hermetic — it can only see its
 //! own per-test namespace, not the laptop's environment.
@@ -38,14 +38,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// [`pull_error_is_terminal`]); a genuinely absent image fails after the grace.
 const IMAGE_PULL_GRACE: Duration = Duration::from_secs(90);
 
-/// Image repo of the baked tests image (`docs/remote-test-execution.md`). Shared
-/// so the preflight builder, the base-image `--build-context` special-case in the
-/// OCI push path, and any future consumer agree on one name.
+/// Image repo of the baked tests image (`docs/remote-test-execution.md`). The
+/// on-cluster `crane` bake appends the compiled binaries onto the runner base and
+/// pushes under this repo.
 pub const RUNNER_REPO: &str = "ztest-runner";
-
-/// Local docker tag of the nix runner base (`flake.nix` `packages.runner-image`),
-/// loaded into the daemon before the baked image builds `FROM` it.
-pub const RUNNER_BASE_LOCAL_TAG: &str = "ztest-runner:dev";
 
 /// Everything the pod executor needs that isn't per-test: which cluster/namespace
 /// to run in, the runner image, and how build-output paths map from the laptop to
@@ -70,10 +66,10 @@ pub struct PodRunConfig {
     /// the cwd, and each `LD_LIBRARY_PATH` entry. Longest prefix wins; unmatched
     /// paths (e.g. `/nix/store/…`) pass through unchanged. Order does not matter.
     pub path_map: Vec<(String, String)>,
-    /// Resolved `spec_key → pull reference` for the run's dev component images,
-    /// serialized into the pod as [`image::IMAGE_REFS_ENV`] so an in-pod test
-    /// resolves them without recomputing the content hash from a Dockerfile the
-    /// baked image doesn't carry. Empty for local kind (source is mounted there).
+    /// Resolved `DevImageId → pull reference` (the build manifest) for the run's
+    /// dev component images, serialized into the pod as [`image::IMAGE_REFS_ENV`]
+    /// so an in-pod test resolves them by their path-free id without touching a
+    /// Dockerfile the baked image doesn't carry.
     pub image_refs: BTreeMap<String, String>,
     /// Shared per-run env (dylib search path, run id, SA, no-cleanup).
     pub env: EngineEnv,
@@ -364,21 +360,6 @@ fn pod_name(item: &WorkItem) -> String {
 /// `binaries` entry is a filename staged under the context's `deps/`; it lands
 /// at `<dest_abs>/deps/<name>`, matching `WorkItem::binary_path`.
 ///
-/// `base_id` is the base image's content ID (`docker image inspect --format
-/// {{.Id}}`), embedded as a comment so the content-addressed tag that names the
-/// baked image changes when the *base* changes — even if the staged binaries are
-/// byte-identical. Without it, rebuilding the nix base (e.g. to add `/tmp`)
-/// leaves the baked tag unchanged, `probe` finds the stale image, and the new
-/// base never reaches a pod.
-pub fn baked_dockerfile(base: &str, base_id: &str, dest_abs: &str, binaries: &[&str]) -> String {
-    let dest = dest_abs.trim_end_matches('/');
-    let mut df = format!("# base-id: {base_id}\nFROM {base}\n");
-    for name in binaries {
-        df.push_str(&format!("COPY deps/{name} {dest}/deps/{name}\n"));
-    }
-    df
-}
-
 /// Rewrite `path` by the longest matching prefix in `map`; unmatched paths (e.g.
 /// `/nix/store/…`, present in the image) pass through unchanged.
 fn remap(path: &str, map: &[(String, String)]) -> String {
@@ -480,31 +461,6 @@ mod tests {
 
     fn map() -> Vec<(String, String)> {
         vec![("/home/u/proj/target".into(), "/work/target".into())]
-    }
-
-    #[test]
-    fn baked_dockerfile_is_base_then_one_copy_per_binary() {
-        let df = baked_dockerfile(
-            "ztest-runner:dev",
-            "sha256:abc",
-            "/home/u/proj/target/debug/",
-            &["foo-abc", "bar-def"],
-        );
-        assert_eq!(
-            df,
-            "# base-id: sha256:abc\nFROM ztest-runner:dev\n\
-             COPY deps/foo-abc /home/u/proj/target/debug/deps/foo-abc\n\
-             COPY deps/bar-def /home/u/proj/target/debug/deps/bar-def\n"
-        );
-    }
-
-    #[test]
-    fn baked_dockerfile_tag_tracks_base_id() {
-        // A changed base id must change the Dockerfile bytes (hence the baked tag),
-        // so a rebuilt nix base is never masked by a stale cached image.
-        let a = baked_dockerfile("ztest-runner:dev", "sha256:aaa", "/t", &["b"]);
-        let b = baked_dockerfile("ztest-runner:dev", "sha256:bbb", "/t", &["b"]);
-        assert_ne!(a, b);
     }
 
     #[test]
