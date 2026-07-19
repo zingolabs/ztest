@@ -33,7 +33,7 @@
 //! / `ZTEST_IMAGE_PUSH_REGISTRY`: [`Kind`](kind::Kind) (`docker build` +
 //! `kind load`, bare-tag reference), [`Docker`](docker::Docker) (`docker build` +
 //! `docker push` to a generic registry), or [`OpenShift`](openshift::OpenShift)
-//! (on-cluster rootless-buildah build + push to the integrated registry). The
+//! (on-cluster rootless-BuildKit build + push to the integrated registry). The
 //! `dev-<hash>` content tag is identical across topologies, so builds are
 //! cache-shared and the poison-tag invariant (see the tests) holds.
 //!
@@ -412,7 +412,7 @@ pub fn selected_backend() -> ImageBackend {
 
 /// Single selection point, driven entirely by the activated cluster profile's
 /// [`ImageBackend`] — explicit config, not cluster sniffing. `OpenShift` builds
-/// *on the cluster* in a ztest-owned rootless-buildah pod, pushing to the
+/// *on the cluster* in a ztest-owned rootless-BuildKit pod, pushing to the
 /// integrated registry (push route + pull service); `Registry` →
 /// [`Docker`](docker::Docker) build-locally-and-push; `Kind` →
 /// [`Kind`](kind::Kind). There is **no fallback**: the profile names one backend
@@ -1080,7 +1080,7 @@ mod tests {
         );
     }
 
-    /// OpenShift integrated registry (buildah backend): pods reference the
+    /// OpenShift integrated registry (buildkit backend): pods reference the
     /// in-cluster pull address, distinct from the external push route the laptop
     /// probes. `reference` must use *pull*, and no pull secret is injected
     /// (SA-injected creds).

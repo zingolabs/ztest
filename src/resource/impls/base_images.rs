@@ -1,7 +1,7 @@
 //! On-cluster base images: the compile **builder** and the test-runner **base**.
 //!
 //! `ztest setup` builds both from repo Dockerfiles (`docker/*.Dockerfile`) in
-//! the ztest-owned buildah pod — the same path component images use
+//! the ztest-owned BuildKit pod — the same path component images use
 //! ([`crate::backends::image::openshift::build_base_image`]). This replaces the
 //! hand-seeded nix images: nothing is built or pushed from the laptop.
 //!
@@ -24,9 +24,9 @@ fn deps() -> Vec<NodeId> {
     vec![
         NodeId::Namespace(IMAGES_NAMESPACE.to_string()),
         NodeId::RegistryProject,
-        // The buildah build server does the build (`build_base_image` execs into
+        // The BuildKit build server does the build (`build_base_image` execs into
         // it) and pushes as its SA; both must exist first.
-        NodeId::Buildah,
+        NodeId::Buildkit,
     ]
 }
 
@@ -75,7 +75,7 @@ impl Provider for BuilderImageProvider {
 
     fn deps(&self) -> Vec<NodeId> {
         // Not a real content dependency — this serializes the two base-image
-        // builds so their live buildah logs stream one at a time onto the grid
+        // builds so their live BuildKit progress streams one at a time onto the grid
         // instead of interleaving. Runner base first (it's small and quick),
         // then the builder.
         let mut d = deps();

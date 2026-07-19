@@ -15,7 +15,7 @@
 //!    marker-delimited) → reuse [`images::parse_inventory`] + [`images::assemble`];
 //! 5. `exec` `crane` to append the freshly-compiled binaries as per-binary layers
 //!    onto the runner base and push the runner image — pure registry blob
-//!    manipulation, no daemon/buildah/privileged.
+//!    manipulation, no daemon/builder/privileged.
 //!
 //! The result is the same `(BuildOutcome, DumpOutcome, qos, runner-image-ref)`
 //! the laptop path produces, with `binary_path`/`cwd` naming the *pod's* paths

@@ -16,7 +16,7 @@ use crate::resource::context::Cx;
 use crate::resource::graph::{Graph, GraphError};
 use crate::resource::impls::storage::StorageProfile;
 use crate::resource::impls::{
-    base_images, buildah, builder, image, policy, scaffolding, seed, storage,
+    base_images, buildkit, builder, image, policy, scaffolding, seed, storage,
 };
 use crate::resource::provider::NodeId;
 use crate::resource::state::NodeState;
@@ -131,9 +131,9 @@ where
     // the persistent build-cache PVC, and the long-lived builder Deployment
     // `ztest run` compiles in. Depends on the run identity + images namespace above.
     if opts.backend.is_openshift() {
-        // The rootless-buildah build server must exist before the base images it
+        // The rootless-BuildKit build server must exist before the base images it
         // builds; the base images before the compile builder that runs one of them.
-        graph.add_dedup(Box::new(buildah::BuildahProvider));
+        graph.add_dedup(Box::new(buildkit::BuildkitProvider));
         graph.add_dedup(Box::new(base_images::RunnerBaseImageProvider));
         graph.add_dedup(Box::new(base_images::BuilderImageProvider));
         graph.add_dedup(Box::new(builder::BuildCacheProvider));

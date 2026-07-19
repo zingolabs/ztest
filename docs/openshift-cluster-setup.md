@@ -431,29 +431,33 @@ current answer.
 ## On-cluster builds (default on OpenShift)
 
 On an OpenShift registry (distinct push route / pull service) ztest builds every
-image **on the cluster** in a long-lived, **ztest-owned rootless buildah pod**
-(`src/backends/image/openshift.rs`, `src/resource/impls/buildah.rs`). Per image it
+image **on the cluster** in a long-lived, **ztest-owned privileged-in-userns
+BuildKit pod** (`src/backends/image/openshift.rs`, `src/resource/impls/buildkit.rs`). Per image it
 packs the Dockerfile + context into a deterministic, content-addressed tar
-(`bundle::pack`), `oc cp`s it into the buildah pod, runs `buildah bud`, and
-`buildah push`es the result to the integrated registry over the in-cluster
-service (authenticating with the pod SA's token). The build log is streamed live
-through the console PTY (`oc exec -t`), and success is the exec's exit status.
+(`bundle::pack`), `oc cp`s it into the BuildKit pod, and `oc exec`s `buildctl
+build` against the in-pod `buildkitd`, pushing the result to the integrated
+registry over the in-cluster service (authenticating with the pod SA's token). On
+a PTY (`oc exec -t`) `buildctl` renders its own collapsing progress UI live
+through the console, and success is the exec's exit status.
 
 Why not `oc start-build`: the native Build subsystem runs the build in the
 cluster's **release-managed** `docker-builder` image (`quay.io/okd/scos-content`),
 which on OKD-SCOS/CRC is pruned from quay when the release tag moves — breaking
-every build (`Init:ImagePullBackOff: manifest unknown`). Buildah builds from a
-**pinned, retained public** image (`quay.io/buildah/stable`), so a pruned release
+every build (`Init:ImagePullBackOff: manifest unknown`). BuildKit builds from a
+**pinned, retained public** image (`moby/buildkit:v0.18.2`), so a pruned release
 image can't break builds.
 
-Why `chroot` isolation (not `oci`/user namespaces): buildah runs each `RUN` via
-`chroot` — no per-step OCI runtime, no new namespaces — needing only
-`SETUID`/`SETGID`/`SYS_CHROOT`. Full `oci`/userns isolation can't run unprivileged
-on this OpenShift/CRI-O/kernel stack: a locked-down pod has masked `/proc`
-submounts, and the kernel's "procfs must be fully visible" rule makes it need
-`procMount: Unmasked` + an unconfined seccomp profile — strictly *more* privilege.
-`chroot` builds identically with less, under ztest's own narrow `ztest-buildah`
-SCC (not privileged, no host access; runs as uid 1000).
+Security posture: `buildkitd` runs as **in-pod-root (uid 0) with
+`privileged: true`, confined inside a Kubernetes pod user namespace**
+(`hostUsers: false`) under ztest's own `ztest-buildkit` SCC. This is "not really
+privileged": the userns maps that root to a kubelet-assigned unprivileged host
+uid, so `privileged` grants no authority over the host — but it *is* required.
+Rootless BuildKit cannot build on OKD/CRI-O: each `RUN` step's runc container
+needs `CAP_SYS_ADMIN` in the userns owning its mount ns and an unmasked `/proc`,
+and the kernel's `mount_capable` gate plus the API's `procMount: Unmasked` rule
+(permitted *only* under `hostUsers: false`) make the pod userns the only path
+that works. The relaxation buys real overlayfs layer caching and DAG-parallel
+builds. Verified end-to-end on CRC (kernel 6.12, `UserNamespacesSupport` on).
 
 **No fallback.** The cluster profile names the backend (an OpenShift registry ⇒
 this on-cluster builder); if it fails, the run fails — it never silently
@@ -461,27 +465,41 @@ degrades to another build path.
 
 **Requirements.** No cluster operators to install — ztest owns the whole build
 path. `ztest setup` (with an admin kubeconfig, needed to create the SCC) provisions
-everything (`src/resource/impls/buildah.rs`, `policy.rs`, `base_images.rs`):
-- the **buildah build server** (`BuildahProvider`, `NodeId::Buildah`): the
-  `ztest-buildah` Deployment running `quay.io/buildah/stable` idle, its
-  `ztest-buildah` ServiceAccount, and a storage PVC (buildah's `vfs` graphroot +
-  the staged context; persists cached base layers across builds);
-- a **custom non-privileged SCC `ztest-buildah`**: allows `SETUID`/`SETGID`/
-  `SYS_CHROOT`, `allowPrivilegeEscalation`, and `RunAsAny` — no privileged
-  container, no host access. The pod runs as uid 1000 with SELinux type
-  `container_engine_t` (the domain that permits buildah's nested-container fs
-  setup);
+everything (`src/resource/impls/buildkit.rs`, `policy.rs`, `base_images.rs`):
+- the **BuildKit build server** (`BuildkitProvider`, `NodeId::Buildkit`): the
+  `ztest-buildkit` Deployment running `buildkitd` (`moby/buildkit:v0.18.2`,
+  `--oci-worker-snapshotter=overlayfs`) as in-pod-root under `hostUsers: false` +
+  `privileged: true`, its `ztest-buildkit` ServiceAccount, a `buildkitd.toml`
+  ConfigMap, and a cache PVC at BuildKit's state dir (content store + overlayfs
+  snapshots; persists the layer cache across builds). Context is staged in a
+  per-build `emptyDir`. The `buildkitd.toml` (a) routes `docker.io` through the
+  `mirror.gcr.io` pull-through cache so cold-cache base `FROM` pulls dodge Docker
+  Hub's per-IP anonymous rate limit — BuildKit's content store is separate from the
+  node's CRI-O cache, so every cold base ref would otherwise re-resolve against
+  Docker Hub. BuildKit's resolver always tries the mirror first and keeps
+  `registry-1.docker.io` as the automatic final fallback, so Docker Hub still backs
+  anything the mirror lacks; and (b) marks the integrated registry insecure
+  (self-signed TLS);
+- a **custom SCC `ztest-buildkit`**: OKD's built-in `nested-container` SCC
+  (`SETUID`/`SETGID`, `seccompProfiles ['*']`, SELinux `container_engine_t`,
+  `userNamespaceLevel: RequirePodLevel`) plus `allowPrivilegedContainer` — the
+  pod userns is what keeps `privileged` host-safe. Its `runAsUser` range is pinned
+  to `0-65534` so in-pod-root (uid 0) admits without patching the namespace's
+  billion-based uid-range annotation;
 - **registry push authz**: the `ztest-image-push` role on `ztest-images` bound to
-  the `ztest-buildah` SA (`imagestreams: create` + `imagestreams/layers:
-  get,update`) — the push auto-creates the imagestream on first push. The buildah
-  pod pushes over the in-cluster service with its SA token
-  (`--tls-verify=false`, the registry's service-ca cert; pulls are unaffected —
-  the kubelet trusts the service-ca).
+  the `ztest-buildkit` SA (`imagestreams: create` + `imagestreams/layers:
+  get,update`) — the push auto-creates the imagestream on first push. `buildctl`
+  pushes over the in-cluster service using a docker `config.json` written from the
+  pod SA token; the registry's service-ca-signed serving cert is **verified** — the
+  pod mounts the auto-injected `openshift-service-ca.crt` bundle and its entrypoint
+  folds it into the container's system trust before starting `buildkitd` (the
+  push's OAuth token fetch honours only the system roots, not `buildkitd.toml`'s
+  per-registry `ca`/`insecure`).
 
 **Base images — nothing to seed.** The compile **builder** and the test-runner
 **base** are built on the cluster by `ztest setup` from `docker/builder.Dockerfile`
 and `docker/runner-base.Dockerfile` (`src/resource/impls/base_images.rs`), through
-the same buildah-pod path as component images. They are **stock Debian**
+the same BuildKit-pod path as component images. They are **stock Debian**
 (`rust:1.95.0-bookworm` / `debian:bookworm-slim`) — the workspace links no
 rocksdb / no OpenSSL (rustls everywhere) and only statically-linked C (ring,
 aws-lc-sys, zstd-sys), so the runner base is just glibc + CA roots and both images

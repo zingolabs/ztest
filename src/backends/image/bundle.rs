@@ -2,7 +2,7 @@
 //! a dev image's identity and the artifact the build consumes.
 //!
 //! [`pack`] walks a build context once and produces the uncompressed tar that
-//! the on-cluster buildah build consumes (unpacked into the build pod), with the
+//! the on-cluster BuildKit build consumes (unpacked into the build pod), with the
 //! chosen Dockerfile staged at the root. A dev image's `dev-<hash>` tag derives
 //! from this tar's digest, and the very same bytes are what the build reads — so
 //! the tag can never name a context the archive didn't stage. That shared
@@ -31,7 +31,7 @@ use super::ImageError;
 /// VCS / JS-dependency trees that are huge and never part of a source build.
 pub(crate) const DEFAULT_IGNORES: [&str; 3] = ["target", ".git", "node_modules"];
 
-/// Where the Dockerfile is staged inside the archive — `buildah bud -f
+/// Where the Dockerfile is staged inside the archive — `buildctl ... filename=
 /// Dockerfile`, and the one path that is never subject to `.dockerignore`.
 const DOCKERFILE: &str = "Dockerfile";
 

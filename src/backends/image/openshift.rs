@@ -1,10 +1,10 @@
-//! OpenShift backend: on-cluster image builds via a ztest-owned **rootless
-//! buildah pod** ([`crate::resource::impls::buildah`]).
+//! OpenShift backend: on-cluster image builds via a ztest-owned
+//! **privileged-in-userns BuildKit pod** ([`crate::resource::impls::buildkit`]).
 //!
 //! The only backend that builds *on the cluster* (kind loads into nodes; the
 //! generic/`docker` backend builds locally and pushes). Nothing is built on the
-//! laptop; images are built in the long-lived `ztest-buildah` pod with `buildah
-//! bud` and pushed to the integrated registry over the in-cluster service —
+//! laptop; images are built in the long-lived `ztest-buildkit` pod with `buildctl
+//! build` and pushed to the integrated registry over the in-cluster service —
 //! authenticating with the pod SA's token exactly like the runner-image `crane`
 //! bake ([`crate::pipeline::remote_compile`]).
 //!
@@ -22,15 +22,16 @@
 //! pod's init containers to `quay.io/okd/scos-content` by digest, and OKD prunes
 //! those digests from quay within ~72h on pre-release streams — so a day-old
 //! cluster's first build dies `ImagePullBackOff: manifest unknown`. Building with
-//! a pinned, retained public buildah image ([`buildah::BUILDAH_IMAGE`]) removes
+//! a pinned, retained public BuildKit image ([`buildkit::BUILDKIT_IMAGE`]) removes
 //! that dependency on upstream registry retention entirely.
 //!
 //! The build context is serialized by [`bundle::pack`](super::bundle), the same
 //! deterministic, symlink-safe, `.dockerignore`-aware packer that content-
 //! addresses the image tag — so the archive is exactly the bytes the tag names,
 //! and the chosen Dockerfile is staged at the archive root as `Dockerfile`.
-//! `oc exec -t` streams `buildah`'s build log through the console PTY exactly like
-//! a local `docker build`, so progress renders live in the grid.
+//! `oc exec -t` gives `buildctl` a PTY, so it renders its own collapsing BuildKit
+//! progress UI (the `--progress=auto` tty view) straight through the console
+//! emulator, exactly like a local `docker build`.
 //!
 //! This backend also builds the base images themselves ([`build_base_image`],
 //! driven by [`base_images`](crate::resource::impls::base_images) at `ztest
@@ -46,16 +47,16 @@ use kube::api::{Api, ListParams};
 
 use super::{DevSource, ImageProvider, bundle, docker, join};
 use crate::inventory::DevImageEntry;
-use crate::resource::impls::buildah::{BUILDAH_CONTAINER, BUILDAH_DEPLOYMENT, WORK_MOUNT};
+use crate::resource::impls::buildkit::{BUILDKIT_CONTAINER, BUILDKIT_DEPLOYMENT, WORK_MOUNT};
 use crate::resource::impls::policy;
 use crate::resource::{Cx, NodeId, Readiness, ResourceError};
 
-/// How long to wait for the buildah build pod to become Ready before giving up.
-const BUILDAH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How long to wait for the BuildKit build pod to become Ready before giving up.
+const BUILDKIT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Push and pull addresses differ: probes use the external `push` route (where
-/// the laptop authenticates), while the buildah pod pushes — and pods pull —
+/// the laptop authenticates), while the BuildKit pod pushes — and pods pull —
 /// through the in-cluster `pull` service. Both front the same registry storage.
 #[derive(Debug)]
 pub(crate) struct OpenShift {
@@ -108,7 +109,7 @@ impl ImageProvider for OpenShift {
 }
 
 impl OpenShift {
-    /// The in-cluster pull reference pods use and the buildah pod pushes to — the
+    /// The in-cluster pull reference pods use and the BuildKit pod pushes to — the
     /// same string the build manifest records.
     pub(super) fn reference(&self, tag: &str) -> String {
         join(&self.pull, tag)
@@ -116,7 +117,7 @@ impl OpenShift {
 }
 
 /// Build a base image (the compile **builder** or the runner **base**) from an
-/// embedded Dockerfile via the same buildah-pod path component images use. A base
+/// embedded Dockerfile via the same BuildKit-pod path component images use. A base
 /// image is pure `FROM` + `RUN`, so its context is just the staged Dockerfile.
 /// `tag` is content-addressed (`<repo>:d-<hash>`), so the caller's probe skips
 /// this when the Dockerfile is unchanged. Reused by
@@ -139,14 +140,14 @@ pub(crate) async fn build_base_image(
     result
 }
 
-/// The in-cluster push target for `tag`: the `pull` service address (the buildah
+/// The in-cluster push target for `tag`: the `pull` service address (the BuildKit
 /// pod pushes from inside the cluster; the same storage the external probe route
 /// reads).
 fn reference_for(tag: &str) -> Result<String, ResourceError> {
     Ok(join(
         &super::pull_base().ok_or_else(|| {
             ResourceError::Provision(
-                "no in-cluster registry (ZTEST_IMAGE_REGISTRY unset) for the buildah push".into(),
+                "no in-cluster registry (ZTEST_IMAGE_REGISTRY unset) for the buildkit push".into(),
             )
         })?,
         tag,
@@ -154,7 +155,7 @@ fn reference_for(tag: &str) -> Result<String, ResourceError> {
 }
 
 /// Build a **local** context: pack the working tree into a deterministic tar,
-/// `oc cp` it into a fresh per-build dir in the buildah pod, and build+push from
+/// `oc cp` it into a fresh per-build dir in the BuildKit pod, and build+push from
 /// there. Used by local `dev!` images and the base images.
 async fn run_build_local(
     cx: &Cx,
@@ -182,12 +183,12 @@ async fn run_build_local(
             .await
             .map_err(|e| ResourceError::Provision(format!("kube client: {e}")))?;
         if let Some(sink) = &cx.progress {
-            sink.note(&id, "waiting for the buildah build server");
+            sink.note(&id, "waiting for the buildkit build server");
         }
-        let pod = wait_for_buildah(&client).await?;
+        let pod = wait_for_buildkit(&client).await?;
 
         if let Some(sink) = &cx.progress {
-            sink.note(&id, "on-cluster build (buildah)");
+            sink.note(&id, "on-cluster build (buildkit)");
         }
         let mut mkdir = exec_argv(&pod, false);
         mkdir.extend(["--", "mkdir", "-p", &build_dir].map(String::from));
@@ -197,7 +198,7 @@ async fn run_build_local(
             tar.display().to_string(),
             format!("{}/{pod}:{build_dir}/ctx.tar", policy::RUN_NAMESPACE),
             "-c".to_string(),
-            BUILDAH_CONTAINER.to_string(),
+            BUILDKIT_CONTAINER.to_string(),
         ]);
         run_oc_quiet(&cp)?;
 
@@ -234,11 +235,11 @@ async fn run_build_git(
         .await
         .map_err(|e| ResourceError::Provision(format!("kube client: {e}")))?;
     if let Some(sink) = &cx.progress {
-        sink.note(&id, "waiting for the buildah build server");
+        sink.note(&id, "waiting for the buildkit build server");
     }
-    let pod = wait_for_buildah(&client).await?;
+    let pod = wait_for_buildkit(&client).await?;
     if let Some(sink) = &cx.progress {
-        sink.note(&id, "on-cluster build (buildah, git clone)");
+        sink.note(&id, "on-cluster build (buildkit, git clone)");
     }
 
     // Shallow single-rev fetch — the same init/fetch/checkout the laptop cache used
@@ -261,12 +262,14 @@ async fn run_build_git(
     .await
 }
 
-/// Find the `ztest-buildah` pod and wait until it reports Ready, returning its
+/// Find the `ztest-buildkit` pod and wait until it reports Ready, returning its
 /// name. Mirrors the compile builder's wait: the Deployment is applied at setup
-/// and its image pull/rollout is asynchronous, so the first build blocks here.
-async fn wait_for_buildah(client: &kube::Client) -> Result<String, ResourceError> {
+/// and its image pull/rollout is asynchronous, so the first build blocks here. The
+/// pod's readiness probe (`buildctl debug workers`) means Ready ⇒ the daemon
+/// answers, so the subsequent `exec buildctl` connects.
+async fn wait_for_buildkit(client: &kube::Client) -> Result<String, ResourceError> {
     let api: Api<Pod> = Api::namespaced(client.clone(), policy::RUN_NAMESPACE);
-    let selector = "ztest.io/component=buildah";
+    let selector = "ztest.io/component=buildkit";
     let start = std::time::Instant::now();
     loop {
         if let Ok(list) = api.list(&ListParams::default().labels(selector)).await {
@@ -276,11 +279,11 @@ async fn wait_for_buildah(client: &kube::Client) -> Result<String, ResourceError
                 }
             }
         }
-        if start.elapsed() >= BUILDAH_READY_TIMEOUT {
+        if start.elapsed() >= BUILDKIT_READY_TIMEOUT {
             return Err(ResourceError::Provision(format!(
-                "buildah pod ({BUILDAH_DEPLOYMENT}) not Ready within {}s — is it provisioned \
-                 (`ztest setup`) and its image pulled? Check `oc -n {} get pods -l ztest.io/component=buildah`",
-                BUILDAH_READY_TIMEOUT.as_secs(),
+                "buildkit pod ({BUILDKIT_DEPLOYMENT}) not Ready within {}s — is it provisioned \
+                 (`ztest setup`) and its image pulled? Check `oc -n {} get pods -l ztest.io/component=buildkit`",
+                BUILDKIT_READY_TIMEOUT.as_secs(),
                 policy::RUN_NAMESPACE,
             )));
         }
@@ -303,11 +306,16 @@ fn pod_ready(p: &Pod) -> bool {
         .unwrap_or(false)
 }
 
-/// `buildah bud` the prepared build dir (streaming the log through the console
-/// PTY) and push to `reference`. `prep` is the shell that populates and `cd`s into
-/// `build_dir` (untar an uploaded context, or a git clone); `dockerfile`/`context`
-/// are the `-f` and context args relative to it. The per-build dir + the built
-/// image are reaped afterward so the `vfs` graphroot keeps only cached base layers.
+/// `buildctl build` the prepared build dir (rendering BuildKit's own collapsing
+/// progress through the console PTY) and push to `reference`. `prep` is the shell
+/// that populates and `cd`s into `build_dir` (untar an uploaded context, or a git
+/// clone); `dockerfile`/`context` are relative to it — `dockerfile` becomes the
+/// `--local dockerfile=` dir plus `filename=`, `context` the `--local context=`
+/// dir. Push authenticates via a docker `config.json` written from the pod SA's
+/// token; the registry's service-ca-signed TLS is verified via the `ca` entry in
+/// the daemon's buildkitd.toml (trusting the mounted service-ca bundle). Only the
+/// per-build context dir is reaped afterward — the BuildKit layer cache is the
+/// whole point of the persistent state PVC, so it stays.
 async fn build_and_push(
     cx: &Cx,
     tag: &str,
@@ -319,36 +327,57 @@ async fn build_and_push(
     context: &str,
     build_args: &[(String, String)],
 ) -> Result<(), ResourceError> {
-    // The SA token is read in-pod; `--tls-verify=false` accepts the registry
-    // service's self-signed serving cert (in-cluster, single-tenant), matching the
-    // crane bake's `--insecure`. `chroot` isolation needs no network flag — it
-    // shares the pod netns, so RUN steps reach cluster DNS + egress to fetch
-    // crates/packages (and the git clone in `prep` does too).
-    let ba: String = build_args
+    let df = Path::new(dockerfile);
+    let df_name = df.file_name().and_then(|s| s.to_str()).unwrap_or("Dockerfile");
+    let df_dir = df
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(".");
+    // The registry host (no path) the push target names — the docker config.json
+    // auth key below must match it. Its service-ca-signed serving cert is verified
+    // (pull and push) via the `ca` entry for this host in the daemon's buildkitd.toml.
+    let host = reference.split('/').next().unwrap_or(reference);
+
+    let opts: String = build_args
         .iter()
-        .map(|(k, v)| format!(" --build-arg {}", shell_quote(&format!("{k}={v}"))))
+        .map(|(k, v)| format!(" --opt {}", shell_quote(&format!("build-arg:{k}={v}"))))
         .collect();
+    // BuildKit reads registry creds from a docker config.json; write one from the
+    // in-pod SA token (user `ztest`, the imagestream-push identity). `DOCKER_CONFIG`
+    // pins the dir explicitly — the daemon runs as uid 0 with no guaranteed `$HOME`,
+    // so `~/.docker` would be unreliable. `base64 | tr -d '\n'` strips any wrapping
+    // the pod's base64 applies, so the JSON stays one line. RUN steps share the pod
+    // netns, so they reach cluster DNS + egress to fetch crates/packages (and the
+    // git clone in `prep` does too).
     let script = format!(
         "set -eu\n\
+         export DOCKER_CONFIG=/tmp/.docker\n\
          {prep}\n\
-         buildah bud --isolation chroot --storage-driver vfs{ba} -f {df} -t {ref_} {ctx}\n\
+         mkdir -p \"$DOCKER_CONFIG\"\n\
          TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\n\
-         buildah push --tls-verify=false --creds ztest:$TOKEN {ref_}\n",
-        df = shell_quote(dockerfile),
-        ref_ = shell_quote(reference),
+         AUTH=$(printf 'ztest:%s' \"$TOKEN\" | base64 | tr -d '\\n')\n\
+         printf '{{\"auths\":{{\"%s\":{{\"auth\":\"%s\"}}}}}}' {host} \"$AUTH\" > \"$DOCKER_CONFIG/config.json\"\n\
+         buildctl build \
+           --frontend dockerfile.v0 \
+           --local context={ctx} \
+           --local dockerfile={df_dir} \
+           --opt filename={df_name}{opts} \
+           --output type=image,name={ref_},push=true \
+           --progress=auto\n",
+        host = shell_quote(host),
         ctx = shell_quote(context),
+        df_dir = shell_quote(df_dir),
+        df_name = shell_quote(df_name),
+        ref_ = shell_quote(reference),
     );
     let mut argv = exec_argv(pod, true);
     argv.extend(["--".to_string(), "sh".to_string(), "-c".to_string(), script]);
-    let result = super::run_streamed(cx, tag, "oc", &argv, &[], "on-cluster buildah build").await;
+    let result = super::run_streamed(cx, tag, "oc", &argv, &[], "on-cluster buildkit build").await;
 
-    // Reap the build dir and the built image (best-effort). Cached base layers
-    // (the `FROM` images) stay, so a rebuild reuses them.
-    let cleanup = format!(
-        "rm -rf {dir}; buildah rmi {ref_} >/dev/null 2>&1 || true",
-        dir = shell_quote(build_dir),
-        ref_ = shell_quote(reference),
-    );
+    // Reap the per-build context dir (best-effort). The layer cache in the state
+    // PVC stays, so a rebuild reuses it.
+    let cleanup = format!("rm -rf {dir}", dir = shell_quote(build_dir));
     let mut cargv = exec_argv(pod, false);
     cargv.extend(["--".to_string(), "sh".to_string(), "-c".to_string(), cleanup]);
     let _ = std::process::Command::new("oc")
@@ -376,10 +405,10 @@ fn oc_base(sub: &str) -> Vec<String> {
     argv
 }
 
-/// `oc exec [-t] [--context <ctx>] <pod> -c buildah -n ztest` — the prefix a
+/// `oc exec [-t] [--context <ctx>] <pod> -c buildkit -n ztest` — the prefix a
 /// command appends its `-- <argv>` to. All oc-level flags precede the `--` the
 /// caller adds, so they reach `oc`, not the exec'd command. `tty` allocates a PTY
-/// so `buildah` streams its live build output into the console emulator.
+/// so `buildctl` renders its collapsing progress UI into the console emulator.
 fn exec_argv(pod: &str, tty: bool) -> Vec<String> {
     let mut argv = oc_base("exec");
     if tty {
@@ -388,7 +417,7 @@ fn exec_argv(pod: &str, tty: bool) -> Vec<String> {
     argv.extend([
         pod.to_string(),
         "-c".to_string(),
-        BUILDAH_CONTAINER.to_string(),
+        BUILDKIT_CONTAINER.to_string(),
         "-n".to_string(),
         policy::RUN_NAMESPACE.to_string(),
     ]);
@@ -413,7 +442,7 @@ fn run_oc_quiet(argv: &[String]) -> Result<(), ResourceError> {
 }
 
 /// Write the deterministic source-bundle tar (via [`bundle::pack`]) for the
-/// buildah build. Reusing the same packer that content-addresses the image tag
+/// BuildKit build. Reusing the same packer that content-addresses the image tag
 /// guarantees the archive is exactly the bytes the tag names; its symlink-safe,
 /// `.dockerignore`-aware walk removes the `tar -h` dangling-symlink break. The
 /// Dockerfile is staged at the archive root as `Dockerfile`.

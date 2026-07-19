@@ -91,11 +91,11 @@ pub enum NodeId {
     /// `ztest run` rsyncs source into and execs `cargo`/`crane` in. Mounts
     /// [`BuildCache`](Self::BuildCache). On-cluster-build targets only.
     Builder,
-    /// The long-lived `ztest-buildah` Deployment (+ its SCC, SA, storage PVC):
-    /// the rootless build server that builds every image via `buildah bud`,
+    /// The long-lived `ztest-buildkit` Deployment (+ its SCC, SA, cache PVC):
+    /// the rootless build server that builds every image via `buildctl build`,
     /// replacing OpenShift's quay-pruning-prone Build subsystem. OpenShift targets
     /// only.
-    Buildah,
+    Buildkit,
 }
 
 impl NodeId {
@@ -121,7 +121,7 @@ impl NodeId {
             Self::RegistryProject => "registry-project".into(),
             Self::BuildCache => "build-cache".into(),
             Self::Builder => "builder".into(),
-            Self::Buildah => "buildah".into(),
+            Self::Buildkit => "buildkit".into(),
         }
     }
 }

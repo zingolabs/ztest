@@ -134,8 +134,8 @@ fn deployment_manifest(image: &str) -> Value {
                     // Force the plain restricted SCC so admission injects a
                     // non-root uid + fsGroup from the namespace range; fsGroup is
                     // what makes the mounted cache PVC writable by the pod. The
-                    // builder needs no userns/privileged posture (crane, not
-                    // buildah), so restricted-v2 is exactly right.
+                    // builder needs no userns/unconfined posture (crane, not
+                    // BuildKit), so restricted-v2 is exactly right.
                     "annotations": { "openshift.io/required-scc": "restricted-v2" },
                 },
                 "spec": {

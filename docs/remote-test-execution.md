@@ -186,9 +186,10 @@ changed and the cache is shared across all runs.
    local path uses.
 4. **Bake.** `exec` `crane` to append the compiled binaries as one layer onto the
    seeded runner base and push the runner image — pure registry blob manipulation
-   authenticated with the pod's own ServiceAccount token, so the builder needs no
-   buildah, no user namespace, no privileged posture. The tag is content-addressed
-   on the binaries' bytes.
+   authenticated with the pod's own ServiceAccount token, so the compile builder
+   needs no build daemon, no user namespace, no unconfined/privileged posture
+   (unlike the BuildKit image builder). The tag is content-addressed on the
+   binaries' bytes.
 
 Component `dev!` images (zebrad, zainod) and data seeds still provision through
 the resource graph (the OpenShift backend builds them on-cluster too); only the

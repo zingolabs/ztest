@@ -27,7 +27,7 @@
 //!    [`plan_runtime`](super::plan_runtime) (per-run).
 
 pub(crate) mod base_images;
-pub(crate) mod buildah;
+pub(crate) mod buildkit;
 pub(crate) mod builder;
 pub(crate) mod image;
 pub(crate) mod policy;

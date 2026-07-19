@@ -124,30 +124,37 @@ push mechanics below.
 ## The OpenShift on-cluster build
 
 For a profile with a distinct `push`/`pull` (OpenShift), ztest builds images
-**on the cluster** in a long-lived, ztest-owned rootless-**buildah** pod
-(`ztest-buildah`), not through OpenShift's Build subsystem. The Build subsystem
+**on the cluster** in a long-lived, ztest-owned privileged-in-userns **BuildKit**
+pod (`ztest-buildkit`), not through OpenShift's Build subsystem. The Build subsystem
 pins its build-pod init containers to `quay.io/okd/scos-content` by digest, and
 OKD prunes those digests from quay within ~72h on pre-release streams — so a
 day-old cluster's first build dies `ImagePullBackOff: manifest unknown`.
 Depending instead on a pinned, retained public image
-(`quay.io/buildah/stable`) removes that dependency on upstream retention.
+(`moby/buildkit:v0.18.2`) removes that dependency on upstream retention.
 
 The flow, per image, during preflight:
 
 1. **Pack the context.** `bundle::pack` walks the build context once into a
    deterministic, `.dockerignore`-aware tar with the chosen Dockerfile staged at
    the root — the same bytes the `dev-<hash>` tag is content-addressed on.
-2. **Build in the pod.** The tar is `oc cp`'d into the buildah pod and built with
-   `buildah bud --isolation chroot --storage-driver vfs`. `chroot` isolation runs
-   RUN steps without a per-step OCI/user namespace: a locked-down pod has masked
-   `/proc` submounts, and the kernel's "procfs must be fully visible" rule makes
-   rootless OCI isolation need `procMount: Unmasked` + an unconfined seccomp
-   profile — strictly *more* privilege. `chroot` builds identically with less.
-   `oc exec -t` streams the build log live into the console.
-3. **Push over the in-cluster service.** The pod `buildah push`es to the `pull`
-   address, authenticating with its SA token (`--creds ztest:$TOKEN
-   --tls-verify=false`) — the same in-cluster registry the runner-image `crane`
-   bake pushes to. The first push auto-creates the imagestream.
+2. **Build in the pod.** The tar is `oc cp`'d into the BuildKit pod and built by
+   `oc exec`ing `buildctl build` against the in-pod `buildkitd`. The daemon runs
+   as in-pod-root with `privileged: true` **inside a pod user namespace**
+   (`hostUsers: false`) — the only posture that works on OKD/CRI-O, where rootless
+   RUN steps can't mount `/proc` (kernel `mount_capable` + API-gated
+   `procMount: Unmasked`); the userns keeps `privileged` host-safe. That buys real
+   overlayfs layer caching and DAG-parallel builds. `buildkitd.toml` also routes
+   `docker.io` through the `mirror.gcr.io` pull-through cache so cold base `FROM`
+   pulls skip Docker Hub's per-IP rate limit; BuildKit's resolver tries the mirror
+   first and keeps Docker Hub as the automatic fallback. On a PTY (`oc exec -t`)
+   `buildctl` renders its own collapsing progress UI live into the console.
+3. **Push over the in-cluster service.** `buildctl` pushes to the `pull` address
+   via `--output type=image,push=true`, authenticating with a docker `config.json`
+   written in-pod from the SA token; the registry's service-ca-signed serving cert
+   is verified via the auto-injected `openshift-service-ca.crt` bundle, which the
+   pod entrypoint installs into the container's system trust (the push's token
+   fetch trusts only the system roots) — the same in-cluster registry the
+   runner-image `crane` bake pushes to. The first push auto-creates the imagestream.
 4. **Pods pull via the service.** Pod specs reference the `pull` address
    (`image-registry.openshift-image-registry.svc:5000/…`), so the kubelet pulls
    in-cluster using the pod SA's auto-injected registry credentials — **no pull
@@ -160,12 +167,15 @@ The flow, per image, during preflight:
 pieces the build, push, and pull rely on:
 
 - the `ztest-images` project (`policy::IMAGES_NAMESPACE`);
-- the **buildah build server** (`resource::impls::buildah`): a custom SCC
-  `ztest-buildah` (rootless caps `SETUID`/`SETGID`/`SYS_CHROOT`, no privileged
-  container), the `ztest-buildah` ServiceAccount, a storage PVC, and the
-  `ztest-buildah` Deployment running `quay.io/buildah/stable` idle;
+- the **BuildKit build server** (`resource::impls::buildkit`): a custom SCC
+  `ztest-buildkit` (OKD `nested-container` + `allowPrivilegedContainer`, uid range
+  `0-65534`), the `ztest-buildkit` ServiceAccount, a `buildkitd.toml` ConfigMap
+  (docker.io pull-through mirror), a cache PVC, and the `ztest-buildkit` Deployment
+  running `buildkitd` (`moby/buildkit:v0.18.2`, `hostUsers: false` + `privileged:
+  true`), which mounts the `openshift-service-ca.crt` bundle and installs it into
+  the container's system trust so registry-push TLS verifies;
 - the `ztest-image-push` role on `ztest-images`, bound to the run SA `ztest/ztest`
-  **and** `ztest/ztest-buildah` — it grants `imagestreams: create` plus
+  **and** `ztest/ztest-buildkit` — it grants `imagestreams: create` plus
   `imagestreams/layers: get,update`. Plain `system:image-pusher` is *not* enough:
   it lacks imagestream **create**, so the first push of a never-seen image is
   denied (the registry must create the imagestream on first push);
@@ -180,7 +190,7 @@ out-of-band. They come from a single source (`policy::RUN_RULES`) that also
 drives a run-start `SelfSubjectAccessReview` self-check: a stale grant makes
 `ztest run` fail fast naming the exact missing permission, rather than 403-ing
 deep in a run. The build path needs no OpenShift `build.openshift.io` grants —
-it `exec`s into the buildah pod (`pods/exec`).
+it `exec`s into the BuildKit pod (`pods/exec`).
 
 See **[Local OpenShift (crc) setup](openshift-cluster-setup.md)** for bringing
 up the cluster itself, and **[Cluster administration](cluster-administration.md)**

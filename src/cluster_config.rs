@@ -62,7 +62,7 @@ pub enum ImageBackend {
     Kind,
     /// Build locally, push to a generic registry; pods pull the same address.
     Registry,
-    /// On-cluster build in a ztest-owned rootless-buildah pod, pushing to the
+    /// On-cluster build in a ztest-owned rootless-BuildKit pod, pushing to the
     /// OpenShift integrated registry (`push` = external route, `pull` = in-cluster
     /// service), plus the SCC grant + registry-project policy `setup` installs.
     OpenShift,

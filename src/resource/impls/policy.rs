@@ -40,11 +40,11 @@ pub const RUN_TOKEN_SECRET: &str = "ztest-token";
 /// Namespace holding pushed dev images (OpenShift internal registry).
 pub const IMAGES_NAMESPACE: &str = "ztest-images";
 
-/// The ServiceAccount the ztest-owned buildah build pod
-/// ([`crate::backends::image::openshift`], [`crate::resource::impls::buildah`])
+/// The ServiceAccount the ztest-owned BuildKit build pod
+/// ([`crate::backends::image::openshift`], [`crate::resource::impls::buildkit`])
 /// runs as. It — not the run SA — is what pushes the built images into
 /// [`IMAGES_NAMESPACE`], so it (not the run SA alone) needs the push role.
-pub(crate) const BUILDAH_SERVICE_ACCOUNT: &str = "ztest-buildah";
+pub(crate) const BUILDKIT_SERVICE_ACCOUNT: &str = "ztest-buildkit";
 
 /// OpenShift SCC granted to per-test pods, and the auto-generated ClusterRole
 /// that grants "use" of it (the RBAC handle for an SCC).
@@ -85,7 +85,7 @@ enum RuleScope {
     All,
     /// Applies only when the profile selects this image backend. No rule needs
     /// this today (the OpenShift build grants that did were removed when builds
-    /// moved to the ztest-owned buildah pod), but the scope stays so a future
+    /// moved to the ztest-owned BuildKit pod), but the scope stays so a future
     /// backend-specific grant has a home — the reason rules are annotated
     /// per-rule rather than split into arrays.
     #[allow(dead_code)]
@@ -221,11 +221,11 @@ const RUN_RULES: &[Rule] = &[
         scope: RuleScope::All,
     },
     // On-cluster image builds no longer use OpenShift's Build subsystem: ztest runs
-    // its own rootless-buildah pod ([`crate::backends::image::openshift`]) and
+    // its own rootless-BuildKit pod ([`crate::backends::image::openshift`]) and
     // `exec`s into it (covered by the `pods/exec` rule above), so the run identity
     // needs no `build.openshift.io`/`image.openshift.io` grants. Pushing to the
     // integrated registry (which auto-creates the imagestream on first push) is
-    // done by the buildah pod's own SA via `RegistryProjectProvider`, not this
+    // done by the BuildKit pod's own SA via `RegistryProjectProvider`, not this
     // identity. Backend-specific rules still live here keyed by `RuleScope` when a
     // future backend needs one.
 ];
@@ -552,11 +552,11 @@ fn registry_manifests() -> (serde_json::Value, serde_json::Value, serde_json::Va
         "metadata": { "name": IMAGE_PUSH_BINDING, "namespace": IMAGES_NAMESPACE },
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": IMAGE_PUSH_CLUSTER_ROLE },
         "subjects": [
-            // The run SA pushes the runner image (crane bake); the `ztest-buildah`
-            // SA is what the buildah build pod runs as and pushes the base +
+            // The run SA pushes the runner image (crane bake); the `ztest-buildkit`
+            // SA is what the BuildKit build pod runs as and pushes the base +
             // component images through.
             { "kind": "ServiceAccount", "name": RUN_SERVICE_ACCOUNT, "namespace": RUN_NAMESPACE },
-            { "kind": "ServiceAccount", "name": BUILDAH_SERVICE_ACCOUNT, "namespace": RUN_NAMESPACE },
+            { "kind": "ServiceAccount", "name": BUILDKIT_SERVICE_ACCOUNT, "namespace": RUN_NAMESPACE },
         ],
     });
     (pullers, push_role, pusher)
@@ -709,9 +709,9 @@ mod tests {
             grants(b, "", "pods/attach"),
             "seed uploader streams via attach"
         );
-        // The buildah build path `exec`s into its pod; the run identity drives it
+        // The BuildKit build path `exec`s into its pod; the run identity drives it
         // through `pods/exec`, not any `build.openshift.io` grant.
-        assert!(grants(b, "", "pods/exec"), "buildah build execs into the pod");
+        assert!(grants(b, "", "pods/exec"), "buildkit build execs into the pod");
     }
 
     #[test]
