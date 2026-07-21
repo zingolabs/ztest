@@ -1,13 +1,7 @@
-//! Spawn one test as its own OS process and capture its result.
-//!
-//! Mirrors nextest's process-per-test model: run the test binary with
-//! `--exact <name> --nocapture`, pipe and capture stdout+stderr, enforce a hard
-//! kill deadline, and run the child in its own process group so the kill reaches
-//! the pods/port-forwards a ztest test spawns (a bare `child.kill()` would leak
-//! them, same reasoning as the Ctrl-C path in `cli/console/pty.rs`).
-//!
-//! The soft "slow" signal is emitted by the run loop on its render tick (it owns
-//! per-test start times), so this module only handles the hard cap.
+//! Spawn one test as its own OS process (nextest's process-per-test model) and
+//! capture its result. The child runs in its own process group so a hard-cap kill
+//! reaches the pods/port-forwards it spawned — a bare `child.kill()` would leak
+//! them. Only the hard cap lives here; the run loop owns the soft "slow" signal.
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -25,10 +19,9 @@ use crate::engine::plan::WorkItem;
 /// awaits, independent of how the test was executed.
 pub type OutcomeFuture = Pin<Box<dyn Future<Output = TestOutcome> + Send + 'static>>;
 
-/// How a single test is executed. The run loop is agnostic to this: it only
-/// needs a [`TestOutcome`] back. [`LocalExecutor`] forks a child process (the
-/// default, and the only executor on local/kind runs); a remote executor runs
-/// the test in a sibling pod so both the compute and the test are hermetic.
+/// How a single test is executed; the run loop only needs a [`TestOutcome`] back.
+/// [`LocalExecutor`] forks a child process (the default); a remote executor runs
+/// the test in a sibling pod so both compute and test are hermetic.
 pub trait Executor: Send + Sync + 'static {
     fn run(&self, item: WorkItem, cancel: Cancel) -> OutcomeFuture;
 }
@@ -60,6 +53,10 @@ pub struct EngineEnv {
     pub sa: String,
     /// Whether `ZTEST_NO_CLEANUP=1` should be set.
     pub no_cleanup: bool,
+    /// Whether the child's output is piped and replayed by the reporter. `false`
+    /// under `--no-capture`: the child inherits this process's stdio and streams
+    /// straight to the terminal (which also forces a serial run).
+    pub capture: bool,
 }
 
 /// The outcome of one test process.
@@ -73,13 +70,10 @@ pub struct TestOutcome {
     pub duration: Duration,
 }
 
-/// Run a single test to completion (or hard-cap kill), capturing its output.
-///
-/// `hard_cap` is the kill deadline (the tier's hard cap); on hitting it the
-/// child's process group is SIGKILLed and the verdict is [`Verdict::Timeout`].
-/// If `cancel` fires (run-wide Ctrl-C) while the test is in flight, the group is
-/// SIGKILLed and the verdict is [`Verdict::Terminated`], so the run loop can
-/// drain and report every in-flight test rather than dropping it silently.
+/// Run a single test to completion, capturing its output. On `hard_cap` the
+/// child's process group is SIGKILLed → [`Verdict::Timeout`]; on `cancel`
+/// (run-wide Ctrl-C) it's SIGKILLed → [`Verdict::Terminated`], so the run loop
+/// can still report every in-flight test rather than dropping it.
 pub async fn spawn_test(
     item: &WorkItem,
     env: &EngineEnv,
@@ -153,6 +147,13 @@ pub async fn spawn_test(
 /// Build the `tokio` command: argv, cwd, stdio, env, and (Unix) a dedicated
 /// process group so the whole tree can be killed at the hard cap.
 fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
+    // `--no-capture`: inherit stdio so the child streams live; otherwise pipe
+    // both for capture and reporter replay.
+    let (out, err) = if env.capture {
+        (Stdio::piped(), Stdio::piped())
+    } else {
+        (Stdio::inherit(), Stdio::inherit())
+    };
     let mut std_cmd = std::process::Command::new(&item.binary_path);
     std_cmd
         .arg("--exact")
@@ -160,18 +161,16 @@ fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
         .arg("--nocapture")
         .current_dir(&item.cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(out)
+        .stderr(err)
         // Dynamic-library path (the libstdc++-exit-127 fix).
         .env(super::dylib::dylib_path_envvar(), &env.dylib_path)
-        // nextest-compat vars some ecosystem crates read.
         .env("NEXTEST", "1")
         .env("NEXTEST_EXECUTION_MODE", "process-per-test")
         .env("NEXTEST_RUN_ID", &env.run_id)
         .env("CARGO_MANIFEST_DIR", &item.cwd)
-        // Mark the child as orchestrated: the parent owns capacity admission,
-        // and a `TestEnv` refuses to provision outside a `ztest run`
-        // (cluster::require_orchestrator).
+        // Mark the child orchestrated; a `TestEnv` refuses to provision outside a
+        // `ztest run` (cluster::require_orchestrator).
         .env("ZTEST_ENGINE", "1")
         .env("ZTEST_SA", &env.sa);
     if env.no_cleanup {
@@ -181,8 +180,7 @@ fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        // New process group (pgid == child pid) so `kill(-pgid, ...)` reaches the
-        // test's spawned helpers.
+        // New process group so `kill(-pgid, ...)` reaches the test's spawned helpers.
         std_cmd.process_group(0);
     }
 
@@ -226,6 +224,7 @@ mod tests {
             run_id: "run-test".into(),
             sa: "ztest-local".into(),
             no_cleanup: false,
+            capture: true,
         }
     }
 
@@ -313,10 +312,8 @@ mod tests {
         );
     }
 
-    /// Children must run marked as orchestrated so `TestEnv::build` proceeds
-    /// (a bare test binary is refused by `cluster::require_orchestrator`). If
-    /// `ZTEST_ENGINE` regressed or got dropped, every cluster test would fail
-    /// fast, so assert the child actually sees `ZTEST_ENGINE=1`.
+    /// A dropped `ZTEST_ENGINE` would make every cluster test fail fast at
+    /// `require_orchestrator`, so assert the child sees `ZTEST_ENGINE=1`.
     #[cfg(unix)]
     #[tokio::test]
     async fn children_run_marked_as_orchestrated() {
@@ -357,8 +354,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let _g = serial().lock().await;
 
-        // A script that ignores its argv (so the fixed `--exact ... --nocapture`
-        // don't matter) and sleeps far past the cap.
+        // A script that sleeps far past the cap.
         let path = std::env::temp_dir().join(format!("ztest-sleeper-{}.sh", std::process::id()));
         {
             let mut f = std::fs::File::create(&path).unwrap();

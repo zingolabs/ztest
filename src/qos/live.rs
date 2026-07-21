@@ -1,10 +1,7 @@
-//! Live during-run snapshot of QoS admission (`docs/qos-design.md` §8, the
-//! live half).
+//! Live during-run snapshot of QoS admission (`docs/qos-design.md` §8).
 //!
-//! Plain data: the [`Scheduler`](super::scheduler::Scheduler) is the ground
-//! truth for what's running, so `engine::panel` folds its live leases into a
-//! [`LiveSnapshot`] and the run panel renders it. This module owns only the
-//! summary types, unit-testable without a cluster or scheduler.
+//! Plain summary types: `engine::panel` folds the [`Scheduler`](super::scheduler::Scheduler)'s
+//! live leases into a [`LiveSnapshot`] for the run panel to render.
 
 use std::collections::BTreeMap;
 

@@ -1,25 +1,18 @@
-//! The pure sticky-footer renderer.
+//! The pure sticky-footer renderer: given the lines to commit into scrollback and
+//! the footer to repaint, produce the exact terminal byte sequence and the
+//! footer's new height. No I/O; unit-tested against an in-memory terminal model.
 //!
-//! This is the load-bearing primitive of the console: given the lines to commit
-//! into native scrollback and the footer (panel + live region) to repaint, it
-//! produces the exact terminal byte sequence and the footer's new height — with
-//! no I/O, no ratatui, no fixed reservation. The render thread wraps each call in
-//! synchronized-output + cursor-hide and writes the bytes; everything else about
-//! the frame is decided here and unit-tested against an in-memory terminal model.
-//!
-//! Model (the one all mainstream progress UIs use — indicatif, BuildKit, Bubble
-//! Tea): completed lines are printed *normally* so the terminal scrolls them into
-//! its own scrollback for free; only the live footer is repainted in place via
-//! cursor-up + overwrite. A DECSTBM scroll region is never used — it discards
-//! lines scrolled past an interior top margin instead of saving them.
+//! Completed lines are printed normally so the terminal scrolls them into its own
+//! scrollback; only the live footer is repainted in place via cursor-up +
+//! overwrite. A DECSTBM scroll region is never used — it discards lines scrolled
+//! past an interior top margin instead of saving them.
 //!
 //! Invariants:
 //! - The cursor rests at column 0 of the footer's last row on entry and exit
-//!   (on the first call `prev_rows` is 0 and the cursor is on a fresh line).
-//! - Every `footer` line is at most `cols` display columns, so it occupies
-//!   exactly one physical row. The caller guarantees this (avt grid rows are
-//!   already `cols`-wide; panel lines are clipped), which is what keeps the
-//!   `prev_rows`-based cursor arithmetic in logical == physical rows.
+//!   (`prev_rows` is 0 on the first call, cursor on a fresh line).
+//! - Every `footer` line is at most `cols` columns, so it occupies exactly one
+//!   physical row (caller-guaranteed) — that keeps the `prev_rows` cursor
+//!   arithmetic in logical == physical rows.
 
 use std::fmt::Write as _;
 
@@ -32,8 +25,7 @@ pub(super) fn render(
     footer: &[String],
     prev_rows: usize,
 ) -> usize {
-    // Move to the top of the old footer. The cursor sits at column 0 of the old
-    // footer's *last* row, so step up `prev_rows - 1`.
+    // Move to the top of the old footer. The cursor sits at its *last* row.
     if prev_rows > 1 {
         let _ = write!(out, "\x1b[{}A", prev_rows - 1);
     }
@@ -41,9 +33,9 @@ pub(super) fn render(
         out.push('\r');
     }
 
-    // Committed lines overwrite the old footer top and, with each `\r\n`, push the
-    // footer down; they become ordinary content above it and scroll into native
-    // scrollback as the screen fills. `\x1b[K` wipes any longer old-footer tail.
+    // Committed lines overwrite the old footer top and push it down with each
+    // `\r\n`, becoming ordinary scrollback content. `\x1b[K` wipes any longer
+    // old-footer tail.
     for line in committed {
         out.push_str(line);
         out.push_str("\x1b[K\r\n");
@@ -58,14 +50,11 @@ pub(super) fn render(
         }
     }
 
-    // If the new block occupies fewer rows than the old footer did, wipe the
-    // leftover old rows below the cursor.
+    // Wipe leftover old rows below the cursor when the new block is shorter.
     if committed.len() + f < prev_rows {
         out.push_str("\x1b[J");
     }
 
-    // Park at column 0 of the last written row (the footer's last line, or the
-    // fresh line below the committed lines when the footer is empty).
     out.push('\r');
     f
 }
@@ -75,8 +64,7 @@ mod tests {
     use super::*;
 
     /// A minimal VT good enough to prove the renderer: printable glyphs, `\r`,
-    /// `\n` (scrolling the top line into scrollback at the bottom), `CUU`
-    /// (`ESC[nA`), `EL` (`ESC[K`), `ED` (`ESC[J`), and SGR (`ESC[…m`, ignored).
+    /// `\n`, `CUU` (`ESC[nA`), `EL` (`ESC[K`), `ED` (`ESC[J`), SGR (ignored).
     struct Term {
         cols: usize,
         rows: usize,

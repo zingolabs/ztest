@@ -1,9 +1,6 @@
 //! Pipeline event channel: the single source of truth for what the banner
-//! displays.
-//!
-//! Each phase pushes [`Event`]s onto an [`EventTx`]; the renderer (Phase C)
-//! drains the other end. The channel is unbounded: events are small and the
-//! consumer drains continuously, so back-pressure isn't a concern.
+//! displays. Each phase pushes [`Event`]s; the renderer drains them. Unbounded —
+//! events are small and drained continuously, so back-pressure isn't a concern.
 
 use tokio::sync::mpsc;
 
@@ -18,11 +15,9 @@ pub fn channel() -> (EventTx, EventRx) {
     mpsc::unbounded_channel()
 }
 
-/// Every observable transition the banner cares about.
-///
-/// Phase B emits the `Build*` variants; Phase A1+ emit `Probe*`. The variant set
-/// is flat (no nested enums) to keep the renderer's match expressions readable
-/// and the payloads small.
+/// Every observable transition the banner cares about. Phase B emits `Build*`;
+/// Phase A1+ emit `Probe*`. Flat (no nesting) to keep the renderer's match
+/// readable.
 #[derive(Debug, Clone)]
 pub enum Event {
     // Phase B: build / inventory.

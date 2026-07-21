@@ -4,13 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
 use kube::api::{Api, ListParams, LogParams, PostParams};
-use kube::runtime::wait::await_condition;
 use tokio::sync::Mutex;
 
 use std::net::{IpAddr, Ipv4Addr};
@@ -28,9 +27,8 @@ use crate::handles::{Endpoint, ForwardRegistry, HandleInner};
 use crate::topology::NetworkUpgrade;
 
 /// Config-time regtest materialization, captured per validator at
-/// `add_validator` so the build-time topology resolver can apply it once
-/// the activation heights are known, without retaining the concrete
-/// backend or a dyn-erased config trait.
+/// `add_validator` so the topology resolver can apply it once the activation
+/// heights are known, without retaining the concrete backend.
 type RegtestMaterializeFn = Box<
     dyn FnOnce(
             ComponentOpts,
@@ -59,8 +57,8 @@ pub(crate) struct ComponentState {
     pub(crate) category: ComponentCategory,
     pub(crate) label: &'static str,
     pub(crate) named_ports: Vec<(String, u16)>,
-    /// Live handle for a validator component (used by the env's own
-    /// readiness/warm probes during `build`). `None` for non-validators.
+    /// Live handle for a validator, driving the env's readiness/warm probes
+    /// during `build`. `None` for non-validators.
     pub(crate) validator_handle: Option<Arc<dyn ValidatorBackend>>,
 }
 
@@ -204,23 +202,20 @@ impl EnvInner {
 
 struct PendingValidator {
     id: u64,
-    /// This backend's NU ceiling (already dev-image-skipped), fed to the
-    /// topology resolver. `None` opts out.
+    /// This backend's NU ceiling (already dev-image-skipped). `None` opts out.
     nu_ceiling: Option<NetworkUpgrade>,
-    /// This backend's regtest materialization, applied once the resolver
-    /// has chosen the activation heights. `take`n when applied.
+    /// Regtest materialization, applied once the resolver has chosen the
+    /// activation heights. `take`n when applied.
     materialize: Option<RegtestMaterializeFn>,
-    /// Live handle, threaded into the component's `ComponentState` so the
-    /// env can drive readiness/warm probes through it during `build`.
+    /// Live handle, threaded into `ComponentState` for the env's probes.
     handle: Arc<dyn ValidatorBackend>,
     opts: ComponentOpts,
 }
 
 struct PendingIndexer {
     id: u64,
-    /// Type-erased backend handle, retained so `env.build()` can build the pod
-    /// spec via [`IndexerBackend::pod_spec`] (which owns image/ports/security
-    /// per backend) rather than matching on a label string.
+    /// Type-erased backend handle, retained so `env.build()` builds the pod spec
+    /// via [`IndexerBackend::pod_spec`] rather than matching on a label string.
     handle: Arc<dyn IndexerBackend>,
     nu_ceiling: Option<NetworkUpgrade>,
     /// Regtest materialization closure; `Some` only for regtest indexers,
@@ -236,13 +231,12 @@ struct PendingWallet {
 
 // ──────────────────────────── shared volume ───────────────────────────
 
-/// Handle to an env-scoped `ReadWriteOnce` PVC shared between two
-/// co-scheduled pods. Created via [`TestEnv::shared_volume`]; the PVC is
-/// provisioned during [`TestEnv::build`]. Hand the same handle to a validator's
-/// [`Validator::persistent_state_in`](crate::Validator::persistent_state_in)
-/// and a zaino indexer's
-/// [`Indexer::regtest_state_in`](crate::Indexer::regtest_state_in) so both
-/// mount the same on-disk zebra-state database.
+/// Handle to an env-scoped `ReadWriteOnce` PVC shared between two co-scheduled
+/// pods. Created via [`TestEnv::shared_volume`], provisioned during
+/// [`TestEnv::build`]. Hand the same handle to a validator's
+/// [`Validator::persistent_state_in`](crate::Validator::persistent_state_in) and
+/// a zaino indexer's [`Indexer::regtest_state_in`](crate::Indexer::regtest_state_in)
+/// so both mount the same on-disk zebra-state database.
 #[derive(Debug, Clone)]
 pub struct SharedVolume {
     claim: String,
@@ -254,9 +248,8 @@ impl SharedVolume {
     pub fn claim(&self) -> &str {
         &self.claim
     }
-    /// In-pod path the shared volume is mounted at. Both sharing pods use
-    /// this identical path so zebra's `db_path` resolves to the same
-    /// directory on each side.
+    /// In-pod path the shared volume is mounted at. Both sharing pods use this
+    /// identical path so zebra's `db_path` resolves to the same directory.
     pub fn mount_path(&self) -> &str {
         &self.mount_path
     }
@@ -272,9 +265,8 @@ pub struct TestEnv {
     pending_shared_volumes: Vec<String>,
     next_id: u64,
     /// Per-component readiness/RPC-probe budget applied during
-    /// [`build`](Self::build). A plain build-time knob: set it any time before
-    /// `build` via [`ready_timeout`](Self::ready_timeout); it never touches the
-    /// shared [`EnvInner`], so issued handles are unaffected.
+    /// [`build`](Self::build). Set any time before `build` via
+    /// [`ready_timeout`](Self::ready_timeout).
     ready_timeout: Duration,
 }
 
@@ -305,23 +297,19 @@ impl TestEnv {
     }
 
     /// Override the per-component readiness/RPC-probe budget used during
-    /// [`build`](Self::build). Order-independent: may be called before or after
-    /// `add_*`, since it sets a plain field rather than rebuilding the shared
-    /// env state.
+    /// [`build`](Self::build). Order-independent relative to `add_*`.
     pub fn ready_timeout(mut self, timeout: Duration) -> Self {
         self.ready_timeout = timeout;
         self
     }
 
-    /// Declare an env-scoped shared volume named `name`. Returns a
-    /// [`SharedVolume`] handle to hand to a validator's
+    /// Declare an env-scoped shared volume, returning a [`SharedVolume`] handle
+    /// to hand to a validator's
     /// [`Validator::persistent_state_in`](crate::Validator::persistent_state_in)
     /// and a zaino indexer's
-    /// [`Indexer::regtest_state_in`](crate::Indexer::regtest_state_in).
-    /// The backing `ReadWriteOnce` PVC is provisioned during
-    /// [`TestEnv::build`]. Both consumers mount it at the same in-pod
-    /// path so zebrad and a colocated zaino StateService address one
-    /// on-disk database.
+    /// [`Indexer::regtest_state_in`](crate::Indexer::regtest_state_in). The
+    /// backing `ReadWriteOnce` PVC is provisioned during [`TestEnv::build`];
+    /// both consumers mount it at the same in-pod path.
     pub fn shared_volume(&mut self, name: &str) -> SharedVolume {
         let slug = short_kind(name);
         let claim = format!("shared-{slug}");
@@ -597,6 +585,10 @@ impl TestEnv {
     }
 
     pub async fn build(&mut self) -> Result<(), EnvError> {
+        // Render this test process's diagnostics (the `ztest::build` phase timing
+        // below) to stdout when orchestrated, so they ride the pod-log capture
+        // path and the reporter can show them per `--success-output`.
+        crate::observ::init_in_pod();
         cluster::require_orchestrator()?;
         self.validate_topology()?;
         self.materialize_regtest_configs()?;
@@ -631,10 +623,21 @@ impl TestEnv {
         let pod_count = self.pending_validators.len() + self.pending_indexers.len();
         if pod_count > 0 {
             let footprint = deployed_footprint(qos::current().profile().footprint, pod_count);
+            // The invariant that matters: the component pods this test is about
+            // to deploy must never reserve more than the tier's component budget
+            // the parent scheduler admitted it for. `deployed_footprint` sums the
+            // whole-core-rounded per-pod share, which can exceed the raw tier
+            // footprint when `pod_count` doesn't divide the tier's cores evenly —
+            // that surplus is capacity the scheduler never reserved, so the pods
+            // would silently wedge Pending. Fail loudly instead (hard panic, all
+            // builds): a tripped guard means this topology is mispriced for its
+            // tier — raise the tier so its cores divide across the topology.
+            assert_deployed_within_tier(qos::current(), footprint, pod_count);
             cluster::apply_resource_quota(&client, &namespace, footprint, pod_count)
                 .await
                 .map_err(env_err)?;
         }
+        build_phase("namespace_quota", started);
         let sentinel = Sentinel::new(namespace.clone());
         let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
         let test_name = test_slug;
@@ -648,6 +651,9 @@ impl TestEnv {
 
         // The tier's node placement, stamped on every pod spec below.
         let qos_placement = Some(qos::current().profile().pool);
+        // The whole-test tier footprint, the ceiling a single pod's explicit
+        // `.resources()` override may not exceed (asserted per spec below).
+        let tier_footprint = qos::current().profile().footprint;
         // QoS-default pod sizing (§7): split the tier footprint evenly across
         // the env's pods (validators + indexers; wallets are in-process) as
         // requests==limits, i.e. Guaranteed QoS. A test's explicit
@@ -680,16 +686,20 @@ impl TestEnv {
                 if spec.resources.is_none() {
                     spec.guaranteed = qos_guaranteed.clone();
                 }
+                assert_override_within_tier(&spec, tier_footprint);
                 Ok::<_, EnvError>((p.id, spec, p.opts, Some(p.handle)))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let t_phase = std::time::Instant::now();
         self.materialize_phase(&ctx, &validators).await?;
+        build_phase("validators_materialize", t_phase);
         // The env's own readiness/warm probes drive the validators through
         // their handles, which gate endpoint resolution on `is_built`.
         // Flip it on for the probe window, then back off until the whole build
         // completes, so a Phase-2 failure still leaves test-side handle calls
         // reporting `NotBuilt`.
         self.inner.is_built.store(true, Ordering::Release);
+        let t_phase = std::time::Instant::now();
         let warmup = async {
             self.wait_validators_rpc_ready().await?;
             self.warm_validators().await?;
@@ -697,6 +707,7 @@ impl TestEnv {
         }
         .await;
         self.inner.is_built.store(false, Ordering::Release);
+        build_phase("validators_ready_warm", t_phase);
         warmup?;
 
         // Phase 2: indexers. (Wallets run in-process; see below.)
@@ -710,6 +721,7 @@ impl TestEnv {
                 if spec.resources.is_none() {
                     spec.guaranteed = qos_guaranteed.clone();
                 }
+                assert_override_within_tier(&spec, tier_footprint);
                 Ok::<_, EnvError>((p.id, spec, p.opts, None))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -720,11 +732,14 @@ impl TestEnv {
         // Account construction happens lazily, on demand, via
         // `WalletHandle::account`.
         self.pending_wallets.clear();
+        let t_phase = std::time::Instant::now();
         self.materialize_phase(&ctx, &dependents).await?;
+        build_phase("indexers_materialize", t_phase);
 
         self.inner.is_built.store(true, Ordering::Release);
 
         tracing::info!(
+            target: "ztest::build",
             namespace = %namespace,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "TestEnv ready"
@@ -823,19 +838,7 @@ impl TestEnv {
         let waits = items.iter().map(|(_, spec, _, _)| {
             let pods = ctx.pods.clone();
             let name = spec.pod_name.clone();
-            async move {
-                match tokio::time::timeout(timeout, await_condition(pods, &name, is_pod_ready()))
-                    .await
-                {
-                    Ok(Ok(_)) => Ok::<(), EnvError>(()),
-                    Ok(Err(e)) => Err(EnvError::Transient(Box::new(e))),
-                    Err(_) => Err(EnvError::RpcTimeout {
-                        component: name,
-                        op: "pod_ready",
-                        elapsed: timeout,
-                    }),
-                }
-            }
+            async move { await_pod_ready(&pods, &name, timeout).await }
         });
         for res in join_all(waits).await {
             res?;
@@ -1032,12 +1035,89 @@ async fn report_dead_component_pods(client: &Client, namespace: &str) {
     }
 }
 
-fn is_pod_ready() -> impl kube::runtime::wait::Condition<Pod> {
-    |pod: Option<&Pod>| {
-        pod.and_then(|p| p.status.as_ref())
-            .and_then(|s| s.conditions.as_ref())
-            .map(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
-            .unwrap_or(false)
+/// Wait for a dependency pod to become ready on the harness's "no flaky tests"
+/// terms.
+///
+/// The load-bearing rule: a pod parked `Pending` on scheduling capacity is the
+/// broker's backlog to clear, not a test failure, so it is waited on
+/// indefinitely — the outer per-test hard cap (enforced by the parent
+/// `ztest run` scheduler, which SIGKILLs the runner pod) is the only bound.
+/// Over-allocation therefore never reddens a test. The `ready_timeout` clock
+/// starts only once the pod is confirmed `Running`; from that point time-to-ready
+/// is the application's responsibility and a blown deadline is a real signal. A
+/// pod that enters an unrecoverable state (`CrashLoopBackOff`, `OOMKilled`, a
+/// terminal image-pull error, or a `Failed` phase) fails fast rather than
+/// waiting out the deadline.
+///
+/// Transient kube-API `get` errors are ignored (retry on the next poll), like
+/// [`crate::engine`]'s runner-pod loop — a single API blip must not fail a test.
+/// Emit one `TestEnv::build` phase's elapsed time on the `ztest::build`
+/// diagnostics target. In-pod this reaches stdout (captured as the test's
+/// output, shown per `--success-output`); it isolates which provisioning
+/// step — namespace/quota, validator pod materialization, validator
+/// readiness+warm (block-gen), or indexer materialization — a slow build spent
+/// its time in, most of which is waiting on the cluster (pod schedule, image
+/// pull, readiness probes) rather than compute.
+fn build_phase(phase: &str, since: std::time::Instant) {
+    tracing::info!(
+        target: "ztest::build",
+        phase,
+        elapsed_ms = since.elapsed().as_millis() as u64,
+        "build phase"
+    );
+}
+
+async fn await_pod_ready(
+    pods: &Api<Pod>,
+    name: &str,
+    ready_timeout: Duration,
+) -> Result<(), EnvError> {
+    use crate::pod_status as ps;
+
+    let mut running_since: Option<Instant> = None;
+    let mut pull_error_since: Option<Instant> = None;
+    loop {
+        if let Ok(pod) = pods.get(name).await
+            && let Some(status) = pod.status.as_ref()
+        {
+            if ps::is_ready(status) {
+                return Ok(());
+            }
+            if let Some(reason) = ps::fault(status) {
+                return Err(EnvError::PodFailed {
+                    component: name.to_string(),
+                    reason,
+                });
+            }
+            match ps::image_error(status) {
+                Some(reason) => {
+                    let first = *pull_error_since.get_or_insert_with(Instant::now);
+                    if ps::pull_error_is_terminal(
+                        &reason,
+                        first,
+                        Instant::now(),
+                        ps::IMAGE_PULL_GRACE,
+                    ) {
+                        return Err(EnvError::PodFailed {
+                            component: name.to_string(),
+                            reason,
+                        });
+                    }
+                }
+                None => pull_error_since = None,
+            }
+            if ps::is_running(status) {
+                let since = *running_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= ready_timeout {
+                    return Err(EnvError::RpcTimeout {
+                        component: name.to_string(),
+                        op: "pod_ready",
+                        elapsed: ready_timeout,
+                    });
+                }
+            }
+        }
+        tokio::time::sleep(ps::POLL_INTERVAL).await;
     }
 }
 
@@ -1077,6 +1157,43 @@ fn pod_name_of(opts: &ComponentOpts) -> String {
     short_kind(opts.name.as_deref().unwrap_or("x"))
 }
 
+/// NASA-style guard on an explicit `.resources()` override: a single pod may
+/// never request more than the test's whole tier footprint. That is capacity
+/// the parent scheduler never admitted the test for, so such a pod would wedge
+/// `Pending` forever behind a quota it can't satisfy. A hard `panic!` in every
+/// build — a test author sizing a pod past its tier is an authoring error we
+/// surface immediately, never a silent hang. No-op when the test set no
+/// override (the QoS reserve is tier-derived and fits by construction).
+fn assert_override_within_tier(spec: &PodSpec, tier: crate::qos::Resources) {
+    let Some(res) = spec.resources.as_ref() else {
+        return;
+    };
+    use crate::qos::units::{parse_cpu_milli_opt, parse_mem_bytes_opt};
+    let cpu = parse_cpu_milli_opt(&res.cpu).unwrap_or_else(|| {
+        panic!(
+            "pod {} .resources() cpu {:?} is not a valid Kubernetes quantity",
+            spec.pod_name, res.cpu
+        )
+    });
+    let mem = parse_mem_bytes_opt(&res.memory).unwrap_or_else(|| {
+        panic!(
+            "pod {} .resources() memory {:?} is not a valid Kubernetes quantity",
+            spec.pod_name, res.memory
+        )
+    });
+    let requested = crate::qos::Resources::new(cpu, mem, 0, 0);
+    assert!(
+        requested.fits_within(&tier),
+        "pod {} .resources() override ({}m cpu / {} B) exceeds its tier footprint \
+         ({}m cpu / {} B) — raise the test's QoS tier or lower the override",
+        spec.pod_name,
+        cpu,
+        mem,
+        tier.cpu_milli,
+        tier.mem_bytes,
+    );
+}
+
 /// The per-pod Guaranteed reserve when a tier's footprint is split evenly
 /// across `pods` pods (§7), shaped for maximum performance.
 ///
@@ -1103,12 +1220,51 @@ fn even_share(
     })
 }
 
+/// The load-bearing "no over-schedule" guard: the component pods a test deploys
+/// (`deployed`, the whole-core-rounded per-pod share summed over `pod_count`)
+/// must fit within the tier's component `footprint` — the budget the parent
+/// scheduler admitted the test against ([`crate::qos::QosProfile::admitted`] =
+/// this footprint plus the separately-reserved runner pod). If it doesn't, the
+/// test would place more CPU/memory on the cluster than was ever reserved for
+/// it, and the surplus pods wedge `Pending` behind capacity the ledger already
+/// handed out.
+///
+/// Hard panic in every build: a violation is a mispriced tier for this topology,
+/// which we must surface immediately, not diagnose later from a silent hang.
+/// Whole-core rounding is the usual cause (e.g. a 3-component-pod topology on a
+/// tier whose CPU doesn't divide into 3 whole cores) — the fix is to raise the
+/// tier footprint so its cores divide evenly across the topology's pods.
+fn assert_deployed_within_tier(
+    class: crate::qos::QosClass,
+    deployed: crate::qos::Resources,
+    pod_count: usize,
+) {
+    let footprint = class.profile().footprint;
+    assert!(
+        deployed.fits_within(&footprint),
+        "QoS over-schedule: tier {class:?} deploys {}m cpu / {} B across {pod_count} \
+         component pods, exceeding the tier's component budget of {}m cpu / {} B that \
+         the scheduler admitted — raise the tier footprint so its cores divide evenly \
+         across this topology",
+        deployed.cpu_milli,
+        deployed.mem_bytes,
+        footprint.cpu_milli,
+        footprint.mem_bytes,
+    );
+}
+
 /// The per-pod `(whole CPU cores, memory bytes)` an even footprint split
 /// yields. Shared by [`even_share`] (what each pod requests) and
 /// [`deployed_footprint`] (what admission reserves) so the two agree exactly:
 /// CPU is the even share rounded up to whole cores (static-policy pinning; min
 /// 1), memory is the exact even share.
 fn per_pod_share(footprint: crate::qos::Resources, pods: u64) -> (u64, u64) {
+    // Guard the divisor and the input: a zero pod count divides by zero, and a
+    // degenerate tier footprint would size a BestEffort pod. Both are harness
+    // bugs (callers gate `pods == 0` before reaching here, and every tier
+    // footprint is positive), so panic loudly rather than emit a bad pod.
+    assert!(pods > 0, "per_pod_share: pod count must be > 0");
+    footprint.assert_pod_schedulable("per_pod_share tier footprint");
     let cores = (footprint.cpu_milli / pods).div_ceil(1000).max(1);
     let mem_bytes = (footprint.mem_bytes / pods).max(1);
     (cores, mem_bytes)
@@ -1133,6 +1289,8 @@ fn deployed_footprint(footprint: crate::qos::Resources, pods: usize) -> crate::q
     crate::qos::Resources::new(
         cores.saturating_mul(1000).saturating_mul(p),
         mem_bytes.saturating_mul(p),
+        0,
+        0,
     )
 }
 
@@ -1155,28 +1313,47 @@ type MaterializeItem = (
 
 #[cfg(test)]
 mod tests {
-    use super::{deployed_footprint, even_share};
+    use super::{assert_deployed_within_tier, deployed_footprint, even_share};
     use crate::qos::{GIB, MIB, Resources};
+
+    #[test]
+    fn deployed_within_tier_passes_when_pods_divide_the_cores_evenly() {
+        use crate::qos::QosClass;
+        // Integration (2c/2Gi) with the 2-pod topology it was sized for: each
+        // pod gets 1 whole core, deploying exactly the 2c budget.
+        let deployed = deployed_footprint(QosClass::Integration.profile().footprint, 2);
+        assert_deployed_within_tier(QosClass::Integration, deployed, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "over-schedule")]
+    fn deployed_within_tier_panics_when_whole_core_rounding_overshoots() {
+        use crate::qos::QosClass;
+        // Integration's 2c over 3 pods rounds each up to 1 whole core → 3c
+        // deployed against a 2c budget: the over-schedule the guard must catch.
+        let deployed = deployed_footprint(QosClass::Integration.profile().footprint, 3);
+        assert_deployed_within_tier(QosClass::Integration, deployed, 3);
+    }
 
     #[test]
     fn even_share_rounds_cpu_up_to_whole_cores_and_splits_memory() {
         // sync 16c/32Gi across 2 pods → 8 cores / 16 GiB each (exact).
-        let s = even_share(Resources::new(16_000, 32 * GIB), 2).unwrap();
+        let s = even_share(Resources::new(16_000, 32 * GIB, 0, 0), 2).unwrap();
         assert_eq!(s.cpu, "8");
         assert_eq!(s.memory, (16 * GIB).to_string());
 
         // basic 500m/512Mi on 1 pod → rounds up to 1 whole core (pinning needs
         // an integer); memory is the exact share.
-        let s = even_share(Resources::new(500, 512 * MIB), 1).unwrap();
+        let s = even_share(Resources::new(500, 512 * MIB, 0, 0), 1).unwrap();
         assert_eq!(s.cpu, "1");
         assert_eq!(s.memory, (512 * MIB).to_string());
 
         // testnet 8c/18Gi across 3 pods → 2667m/pod → ceil to 3 cores.
-        let s = even_share(Resources::new(8_000, 18 * GIB), 3).unwrap();
+        let s = even_share(Resources::new(8_000, 18 * GIB, 0, 0), 3).unwrap();
         assert_eq!(s.cpu, "3");
 
         // No pods → nothing to size.
-        assert!(even_share(Resources::new(8_000, 8 * GIB), 0).is_none());
+        assert!(even_share(Resources::new(8_000, 8 * GIB, 0, 0), 0).is_none());
     }
 
     #[test]
@@ -1185,18 +1362,102 @@ mod tests {
         // admission must reserve 9 cores (not the raw 8) or the 3rd pod could
         // pend on capacity the ledger under-counted. Memory is the floored
         // share × pods.
-        let fp = deployed_footprint(Resources::new(8_000, 18 * GIB), 3);
+        let fp = deployed_footprint(Resources::new(8_000, 18 * GIB, 0, 0), 3);
         let mem_per_pod = (18 * GIB) / 3;
         assert_eq!(fp.cpu_milli, 9_000, "3 pods × ceil(2667m)=3c → 9 cores");
         assert_eq!(fp.mem_bytes, mem_per_pod * 3);
 
         // Even split (16c/2 pods = 8 each) reserves exactly the footprint.
-        let fp = deployed_footprint(Resources::new(16_000, 32 * GIB), 2);
+        let fp = deployed_footprint(Resources::new(16_000, 32 * GIB, 0, 0), 2);
         assert_eq!(fp.cpu_milli, 16_000);
         assert_eq!(fp.mem_bytes, 32 * GIB);
 
         // No QoS pods (wallet-only env) → reserve the raw tier footprint.
-        let raw = Resources::new(8_000, 8 * GIB);
+        let raw = Resources::new(8_000, 8 * GIB, 0, 0);
         assert_eq!(deployed_footprint(raw, 0), raw);
+    }
+
+    // ── Reproduction: the residual whole-core-rounding over-schedule ────
+    //
+    // Admission now reserves the tier's `admitted()` total (component footprint
+    // + runner), so the runner pod is accounted and `engine::plan` no longer
+    // under-reserves by ignoring it. What remains is the whole-core rounding:
+    // the child (`TestEnv::build` → `per_pod_share`) rounds each component pod's
+    // CPU UP to a whole core, so the pods that actually land sum to
+    // `deployed_footprint`, which exceeds the component `footprint` whenever the
+    // pod count doesn't divide the tier's cores evenly (e.g. 2c over 3 pods →
+    // 1+1+1 = 3c). `TestEnv::build`'s `assert_deployed_within_tier` guard now
+    // catches this at deploy time (a hard panic, no more silent Pending), but the
+    // *scheduler* still admits against the un-rounded total, so a full wave can
+    // still be granted more tests than will physically fit.
+    //
+    // `#[ignore]`d because it fails under the current (still-deferred) accounting;
+    // run with `cargo test -- --ignored`. Making admission pod-count-aware (round
+    // each request to its deployed footprint) turns it green.
+    #[test]
+    #[ignore = "reproduces the deferred whole-core-rounding over-admission: the \
+                scheduler admits against the un-rounded tier total, but pods deploy \
+                the whole-core-rounded deployed_footprint; a full wave overcommits \
+                when pod count doesn't divide the tier's cores evenly. Run with --ignored."]
+    fn admission_overcommits_when_deployed_footprint_exceeds_reserved() {
+        use crate::qos::QosClass;
+        use crate::qos::scheduler::{Admission, Request, Scheduler};
+
+        let profile = QosClass::Integration.profile();
+
+        // The 3-pod zaino topology (zebrad + zaino-fetch + zaino-state): the
+        // component footprint is 2c, but those 3 pods deploy 3c (each core
+        // rounded up) — the rounding the scheduler is blind to.
+        let deployed = deployed_footprint(profile.footprint, 3);
+        assert_eq!(profile.footprint.cpu_milli, 2_000);
+        assert_eq!(
+            deployed.cpu_milli, 3_000,
+            "3 pods × ceil(2000m/3)=1c → 3 cores deployed vs 2 in the component footprint"
+        );
+        // What the test really places: the deployed components plus the runner.
+        let per_test_real = deployed.cpu_milli + profile.runner.cpu_milli; // 3c + 1c = 4c
+        // What the scheduler reserves per test: the un-rounded admitted total.
+        let per_test_reserved = profile.admitted().cpu_milli; // 2c + 1c = 3c
+        assert!(per_test_real > per_test_reserved, "rounding makes real > reserved");
+
+        // Memory sized non-binding so CPU governs the wave count (21 × 3c = 63c).
+        let free = Resources::new(63_000, 63 * GIB, 0, 0);
+        let mut sched = Scheduler::new(free);
+
+        // Admit a wave exactly as `engine::plan` does now: one request per test at
+        // the tier's `admitted()` total (pod-count-unaware).
+        let mut admitted = 0u64;
+        for i in 0..64 {
+            let req = Request {
+                binary_id: "zaino".into(),
+                test_name: format!("t{i}"),
+                sa: "ci".into(),
+                footprint: profile.admitted(),
+                priority: profile.priority,
+            };
+            match sched.request(req) {
+                Admission::Granted(_) => admitted += 1,
+                _ => break,
+            }
+        }
+
+        // The scheduler is convinced the wave fits: 21 × 3c = 63c ≤ 63c free.
+        assert_eq!(admitted, 21);
+        assert!(sched.committed().fits_within(&free));
+
+        // But what actually lands is `admitted × per_test_real`.
+        let real = Resources::new(per_test_real.saturating_mul(admitted), 0, 0, 0);
+
+        // The invariant admission owes the cluster: what deploys must fit what was
+        // reserved. It does NOT — 21 × 4c = 84c against 63c free. The surplus
+        // tests' pods go Pending. This assertion is the (deferred) bug.
+        assert!(
+            real.cpu_milli <= free.cpu_milli,
+            "over-admission: scheduler reserved {:?} but the admitted wave deploys \
+             {}c, exceeding the {}c of free capacity — the surplus pods go Pending",
+            sched.committed(),
+            real.cpu_milli / 1000,
+            free.cpu_milli / 1000,
+        );
     }
 }

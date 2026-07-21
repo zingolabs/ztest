@@ -1,13 +1,11 @@
 //! [`SeedProvider`] — a content-addressed data seed (`seed-<sha8>` PVC + its
 //! paired `VolumeSnapshot`) as a resource-graph node.
 //!
-//! Parent-side counterpart of the lazy test-side
-//! [`materialize::ensure_seed`](crate::materialize::ensure_seed): the same
-//! idempotent entry point, driven from the preflight graph so the seed and
-//! its snapshot exist *before* any test reaches `TestEnv::build()`. Seeds
-//! are [`Lifetime::Cached`] — content-addressed and reused across runs — so
-//! [`teardown`](Provider::teardown) is the trait default no-op (pruning is
-//! an explicit, separate operation).
+//! Parent-side counterpart of the test-side
+//! [`materialize::ensure_seed`](crate::materialize::ensure_seed), driven from the
+//! preflight graph so the seed exists *before* any test reaches
+//! `TestEnv::build()`. Seeds are [`Lifetime::Cached`], so
+//! [`teardown`](Provider::teardown) is the trait default no-op.
 
 use std::path::Path;
 
@@ -64,11 +62,8 @@ impl Provider for SeedProvider {
     }
 
     async fn probe(&self, _cx: &Cx) -> Readiness {
-        // `ensure_seed` is itself idempotent and short-circuits on a ready
-        // PVC with a couple of GETs, so we let `provision` handle the warm
-        // path rather than duplicating the readiness query here. A dedicated
-        // label-check probe is a cheap future optimization; today the cost
-        // is one extra round-trip per warm seed, well below noise.
+        // `ensure_seed` is idempotent and short-circuits on a ready PVC, so we let
+        // `provision` handle the warm path rather than duplicating the query here.
         Readiness::Absent
     }
 

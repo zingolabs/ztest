@@ -1,13 +1,6 @@
-//! Work-side subprocess runner: spawn a child under a PTY and pipe its output to
-//! the render thread.
-//!
-//! This is the producer half of the console split. The render thread
-//! ([`super::render`]) owns the terminal and the `avt` grid; here we only spawn
-//! the child, stream its raw PTY bytes to the render thread as `Msg::Output`,
-//! and return the exit code. Running under a PTY (not a pipe) keeps the child's
-//! native colour + in-place progress bars (cargo, docker BuildKit, kind) intact:
-//! they only emit those when they detect a TTY.
-//!
+//! Work-side subprocess runner: spawn a child under a PTY and stream its raw
+//! bytes to the render thread. A PTY (not a pipe) keeps the child's native colour
+//! + in-place progress bars intact, since those emit only when a TTY is detected.
 //! Off a TTY (no [`Console`]), the child inherits stdio for the plain CI log.
 
 use std::io::{self, Read};
@@ -20,11 +13,9 @@ use super::Console;
 /// PTY emulated into the session's live region; without one, it inherits stdio.
 /// Returns the child's exit code (`130` when a forwarded Ctrl-C killed it).
 ///
-/// Output ordering: a reader thread streams the child's PTY bytes to the render
-/// thread until PTY EOF, then exits. We join it before returning, so by the time
-/// the caller sends a `FlushLive` / phase transition every `Output` is already
-/// enqueued ahead of it. That happens-before keeps native scrollback in order
-/// across the two producers (see `docs/console-architecture.md`).
+/// The reader thread is joined before returning, so every `Output` is enqueued
+/// ahead of the caller's next `FlushLive` / phase transition — that happens-before
+/// keeps native scrollback ordered across the two producers.
 pub(crate) async fn run_child(
     console: Option<&Console>,
     program: &str,
@@ -65,12 +56,9 @@ pub(crate) async fn run_child(
         .map_err(|e| io::Error::other(format!("spawn {program}: {e}")))?;
     drop(pair.slave);
 
-    // The render thread forwards Ctrl-C to this group. portable-pty runs the
-    // child under `setsid` (its own session + process group), so the child's PID
-    // *is* its process-group id — use it directly. `master.process_group_leader()`
-    // (a `tcgetpgrp` on the pty) races the child's not-yet-completed `setsid` and
-    // can latch `None` or a stale group for the whole run, silently dropping the
-    // first Ctrl-Cs.
+    // portable-pty `setsid`s the child, so its PID *is* its process-group id — use
+    // it directly. `master.process_group_leader()` races the not-yet-completed
+    // `setsid` and can latch a stale group, silently dropping the first Ctrl-Cs.
     console.child_started(child.process_id().map(|pid| pid as i32));
 
     let mut reader = pair
@@ -92,17 +80,13 @@ pub(crate) async fn run_child(
         }
     });
 
-    // `Child::wait` blocks; keep it off the async worker. The reader thread sees
-    // PTY EOF when the child exits and the master's last fd closes.
+    // `Child::wait` blocks; keep it off the async worker.
     let wait = tokio::task::spawn_blocking(move || child.wait());
     tokio::pin!(wait);
 
-    // While the child runs, forward terminal resizes to its PTY. Both dimensions
-    // track the terminal: the width, and the row count via `live_rows` (the rows
-    // above the pinned panel), matching what the render thread does to its `avt`
-    // grid — so a taller/shorter terminal re-lays-out the child's output.
-    // `master.resize` ioctls TIOCSWINSZ, which makes the kernel deliver SIGWINCH to
-    // the child, so tools like cargo re-wrap instead of keeping their spawn-time size.
+    // Forward terminal resizes to the child's PTY (width + `live_rows`), matching
+    // the render thread's `avt` grid. `master.resize` delivers SIGWINCH so tools
+    // re-wrap instead of keeping their spawn-time size.
     let mut size = console.size_watch();
     let status = loop {
         tokio::select! {
@@ -128,10 +112,7 @@ pub(crate) async fn run_child(
 }
 
 /// Non-TTY fallback: inherit stdio, run synchronously, return the exit code.
-///
-/// A signal death maps to the shell convention `128 + signo` (so a Ctrl-C'd
-/// child reports 130, matching the PTY path's [`code_for`]) rather than a
-/// generic `1` that reads as an ordinary failure.
+/// A signal death maps to `128 + signo` (Ctrl-C → 130, as in [`code_for`]).
 fn run_inherited(program: &str, args: &[String], envs: &[(&str, String)]) -> io::Result<i32> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
@@ -148,8 +129,7 @@ fn run_inherited(program: &str, args: &[String], envs: &[(&str, String)]) -> io:
     })
 }
 
-/// Map a finished PTY child status to an exit code. Clean exits propagate their
-/// code; a signal death reports `130` when a Ctrl-C was in flight, else `1`.
+/// Map a finished PTY child status to an exit code.
 fn exit_code_from(status: io::Result<portable_pty::ExitStatus>, interrupted: bool) -> i32 {
     match status {
         Ok(s) => code_for(&s, interrupted) as i32,

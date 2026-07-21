@@ -1,10 +1,8 @@
 //! Lightwalletd indexer backend.
 //!
-//! Speaks the upstream `CompactTxStreamer` gRPC protocol via the generated
-//! bindings in `zcash_client_backend::proto::service`. Each call opens a
-//! fresh tonic connection. Intentionally self-contained, with no shared
-//! helpers with `zaino`: today the two backends speak the same RPCs, but when
-//! one diverges in framing, changes land here.
+//! Speaks the `CompactTxStreamer` gRPC protocol; each call opens a fresh tonic
+//! connection. Deliberately shares no helpers with `zaino` so the two can
+//! diverge in framing independently.
 
 use std::time::Duration;
 
@@ -28,18 +26,17 @@ use crate::{Endpoint, EnvError, RpcError};
 
 const COMPONENT: &str = "lightwalletd";
 
-/// Readiness / block-poll cadence and the default ceiling for this
-/// backend's `ready`, `poll_*`, and `wait_for_block_num` loops.
+/// Readiness / block-poll cadence and default timeout for this backend's
+/// `ready`, `poll_*`, and `wait_for_block_num` loops.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Resolve the container image for a lightwalletd pod. Used by
-/// `manifest::pod_spec_for_indexer`. The *default* is the published
+/// Resolve the container image for a lightwalletd pod. Default is the published
 /// `electriccoinco/lightwalletd:<version>` tag; a
-/// [`Dev`](crate::backends::image::ImageSpec::Dev) spec *overrides* it with a
-/// `lightwalletd:dev-<hash>` tag, or fails the test loudly via
-/// [`ImageError::DevImageMissing`] when the pipeline never built it.
+/// [`Dev`](crate::backends::image::ImageSpec::Dev) spec overrides it with a
+/// `lightwalletd:dev-<hash>` tag, or fails via
+/// [`ImageError::DevImageMissing`] if the pipeline never built it.
 pub(crate) fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
@@ -47,7 +44,7 @@ pub(crate) fn image_uri(
     crate::backends::image::resolve(&opts.image, &default_image)
 }
 
-/// Lightwalletd-flavoured indexer config. ZST handed to the
+/// Lightwalletd-flavoured indexer config. ZST for the
 /// [`Indexer`](crate::component::Indexer) builder; produces a
 /// [`LightwalletdIndexer`] handle at `add_indexer` time.
 #[derive(Debug, Clone)]
@@ -61,16 +58,15 @@ impl IndexerConfig for LightwalletdBackend {
     }
 
     fn nu_ceiling(&self, _version: &str) -> Option<NetworkUpgrade> {
-        // Lightwalletd doesn't decode NUs; opt into the resolver with
-        // `HIGHEST` so it doesn't impose a ceiling on the topology.
+        // Lightwalletd doesn't decode NUs, so it imposes no ceiling.
         Some(NetworkUpgrade::HIGHEST)
     }
 }
 
 // ─────────────────────────── LightwalletdIndexer ──────────────────────
 
-/// Live lightwalletd indexer handle. Holds only the env plumbing; all state
-/// is remote, reached over gRPC.
+/// Live lightwalletd indexer handle. Holds only the env plumbing; state is
+/// remote, reached over gRPC.
 #[derive(Debug, Clone)]
 pub struct LightwalletdIndexer {
     plumbing: HandleInner,
@@ -102,8 +98,8 @@ impl IndexerBackend for LightwalletdIndexer {
             resources: opts.resources.clone(),
             env: opts.env.clone(),
             fs_group: Some(1000),
-            // The upstream lightwalletd image sets no USER (defaults to root),
-            // which fails runAsNonRoot; pin a numeric non-root uid.
+            // Upstream image sets no USER (defaults to root) and fails
+            // runAsNonRoot; pin a numeric non-root uid.
             run_as_user: Some(1000),
             placement: None,
             guaranteed: None,
@@ -277,9 +273,8 @@ impl IndexerBackend for LightwalletdIndexer {
         use futures::StreamExt;
         let ep = self.plumbing.endpoint("grpc").await?;
         let endpoint = &ep;
-        // proto::ShieldedProtocol wire values: Sapling=0, Orchard=1. Route
-        // through the generated enum so they can't drift from the proto.
-        // Ironwood has no lightwalletd wire representation.
+        // Route through the generated enum so wire values can't drift from the
+        // proto. Ironwood has no lightwalletd wire representation.
         let shielded_protocol = match protocol {
             ShieldedProtocol::Sapling => proto::ShieldedProtocol::Sapling as i32,
             ShieldedProtocol::Orchard => proto::ShieldedProtocol::Orchard as i32,

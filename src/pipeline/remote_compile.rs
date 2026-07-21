@@ -1,26 +1,7 @@
-//! On-cluster compilation: the laptop ships *source*, the cluster produces the
-//! binaries.
-//!
-//! On an on-cluster-build target `ztest run` does not compile locally. Instead
-//! it drives the long-lived builder pod ([`crate::resource::impls::builder`]):
-//!
-//! 1. resolve the local first-party source set (`cargo metadata`, no compile)
-//!    and its common-ancestor subtree;
-//! 2. **rsync the delta** of that subtree into the builder's cache PVC
-//!    (`oc rsync`, which handles the `kubectl exec` transport) — an unchanged
-//!    tree transfers ~nothing;
-//! 3. `exec` `cargo nextest list --message-format=json` (incremental compile on
-//!    the cache) → reuse [`build::parse_list_summary`];
-//! 4. one `exec` running every binary with `ZTEST_DUMP_INVENTORY=1` (batched,
-//!    marker-delimited) → reuse [`images::parse_inventory`] + [`images::assemble`];
-//! 5. `exec` `crane` to append the freshly-compiled binaries as per-binary layers
-//!    onto the runner base and push the runner image — pure registry blob
-//!    manipulation, no daemon/builder/privileged.
-//!
-//! The result is the same `(BuildOutcome, DumpOutcome, qos, runner-image-ref)`
-//! the laptop path produces, with `binary_path`/`cwd` naming the *pod's* paths
-//! (`/cache/target/…`, `/cache/src/…`) — exactly what the baked-image
-//! pod-per-test execution runs.
+//! On-cluster compilation: the laptop ships *source*, the builder pod produces
+//! the binaries. It rsyncs the source delta into the cache PVC, then `exec`s the
+//! compile, JSON list, batched inventory dump, and `crane` bake/push. The result
+//! matches the laptop path but with `binary_path`/`cwd` naming the pod's paths.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -33,7 +14,9 @@ use tokio::io::AsyncReadExt as _;
 
 use crate::pipeline::build::{self, BuildOutcome};
 use crate::pipeline::images::{self, Dumped};
+use crate::qos::build::{BUILDER_BUILD, BUILDER_REST};
 use crate::resource::impls::builder::BUILDER_CONTAINER;
+use crate::resource::{grow_to, shrink_to};
 use crate::resource::impls::policy::RUN_NAMESPACE;
 
 /// Where the synced source lands on the cache PVC (mirrors the local
@@ -63,10 +46,9 @@ pub struct BakeRefs {
     pub runner_repo_ref: String,
 }
 
-/// A remote-compile progress transition. `compile_on_cluster` emits these; the
-/// caller ([`crate::cli::run`]) owns all formatting, colour, and panel updates —
-/// keeping this module free of theme/terminal concerns. Timing is measured here
-/// (only this side knows each phase's boundaries) and reported as a `Duration`.
+/// A remote-compile progress transition. `compile_on_cluster` emits these and
+/// measures the timing; the caller ([`crate::cli::run`]) owns all formatting and
+/// panel updates, keeping this module free of terminal concerns.
 #[derive(Debug)]
 pub enum Phase<'a> {
     /// A new phase began; `label` names it for the live panel row (which resets
@@ -112,6 +94,19 @@ pub async fn compile_on_cluster(
         dur: t.elapsed(),
     });
 
+    // Grow the builder to build size in place, then shrink back to rest on every
+    // path. The grow WAITS for the kubelet to actuate it: a heavy `cargo` link at
+    // the rest limit OOMs, so a grow that can't actuate fails the compile cleanly
+    // rather than proceeding into that OOM. The post-grow body is an `async move`
+    // block so every `?`/`return` resolves to it, letting the shrink always run.
+    let (build_cpu, build_mem) = BUILDER_BUILD.guaranteed_cpu_mem("builder build footprint");
+    let (rest_cpu, rest_mem) = BUILDER_REST.guaranteed_cpu_mem("builder rest footprint");
+    if let Err(e) = grow_to(client, &pod, BUILDER_CONTAINER, &build_cpu, &build_mem).await {
+        let _ = shrink_to(client, &pod, BUILDER_CONTAINER, &rest_cpu, &rest_mem).await;
+        return Err(format!("builder grow: {e}"));
+    }
+    let shrink_pod = pod.clone();
+    let outcome: Result<RemoteCompileOutcome, String> = async move {
     // 1–2. Resolve + sync the source subtree; derive where the workspace lands
     // in the pod so cargo runs from the right dir.
     let src = SourceLayout::resolve()?;
@@ -124,16 +119,9 @@ pub async fn compile_on_cluster(
     });
     let pod_workspace = format!("{SRC_ROOT}/{}", src.workspace_rel.display());
 
-    // 3. Compile, then list. Two passes so the compile can run under a PTY (its
-    // real progress bar streams live) while the JSON list keeps a clean, tty-free
-    // stdout — mirroring the laptop path's `run --no-run` + `list` split.
-    //
-    // `CARGO_PROFILE_TEST_STRIP=debuginfo`: the test binaries are baked into the
-    // runner image and pulled by every pod, so their DWARF (the bulk of an
-    // `opt-level=3, debug=true` binary — gigabytes across a suite) is dead weight
-    // on the cluster. Stripping it at link keeps symbol *names* (backtraces still
-    // name functions) while cutting the baked layer ~5-8x. It MUST be identical on
-    // both passes, or pass 2 sees a different profile and recompiles.
+    // 3. Compile (under a PTY, live progress), then list (clean JSON stdout).
+    // The DWARF-trimming profile overrides MUST be byte-identical on both passes
+    // or pass 2 sees a different profile and recompiles.
     emit(Phase::Start("compiling test binaries on the cluster"));
     let t = Instant::now();
     let args = list_args
@@ -141,14 +129,15 @@ pub async fn compile_on_cluster(
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
-    const CARGO_ENV: &str = "CARGO_PROFILE_TEST_STRIP=debuginfo";
+    const CARGO_ENV: &str =
+        "CARGO_PROFILE_TEST_DEBUG=line-tables-only CARGO_PROFILE_TEST_STRIP=debuginfo";
 
-    // Pass 1: compile only. Under a PTY cargo is unbuffered and emits its in-place
-    // progress bar; `run --no-run` writes nothing machine-readable to stdout, so
-    // it can share the PTY's merged stream. `TERM` gives cargo the capabilities
-    // the emulator understands.
+    // Pass 1: compile only, under a PTY so cargo streams its progress bar;
+    // `run --no-run` puts nothing machine-readable on stdout. `mold -run` isn't
+    // part of cargo's fingerprint, so it needn't match pass 2 nor invalidates
+    // the incremental cache.
     let compile_cmd = format!(
-        "cd {ws} && {CARGO_ENV} TERM=xterm-256color cargo nextest run --no-run {args}",
+        "cd {ws} && {CARGO_ENV} TERM=xterm-256color mold -run cargo nextest run --no-run {args}",
         ws = shell_quote(&pod_workspace),
     );
     let (compile_tail, compile_code) = match compile_out {
@@ -201,9 +190,8 @@ pub async fn compile_on_cluster(
         dur: t.elapsed(),
     });
 
-    // 4. Inventory dump — every binary in ONE `exec`. A dump is sub-100ms, so N
-    // separate execs pay N websocket setups for nothing; a single shell brackets
-    // each binary's stdout with begin/end markers (carrying its exit code) that
+    // 4. Inventory dump — every binary in ONE `exec` (N execs would pay N
+    // websocket setups). A shell brackets each binary's stdout with markers that
     // `split_dumps` demuxes back into per-binary chunks.
     emit(Phase::Start("dumping test inventory"));
     let t = Instant::now();
@@ -228,30 +216,38 @@ pub async fn compile_on_cluster(
         label: "inventory dumped",
         dur: t.elapsed(),
     });
-    // The compiled test binaries run in a pod, so their `/cache/target` paths are
-    // correct as-is — but component `dev!` images and data seeds are still hashed
-    // + provisioned laptop-side (the pre-existing local-build path), and the dump
-    // captured their contexts as the pod's `/cache/src/…` paths. Re-home those to
-    // the laptop's source ancestor (the identical tree — it was the rsync source),
-    // so context hashing + build staging resolve.
+    // Binary paths stay pod-side (they execute in a pod), but `dev!` images and
+    // seeds are still hashed + provisioned laptop-side, so re-home their captured
+    // `/cache/src/…` contexts back to the laptop's source ancestor.
     rehome_dump(&mut dump, &src.ancestor);
 
     // 5. Bake + push the runner image from the compiled binaries.
     emit(Phase::Start("baking + pushing the runner image (crane)"));
     let t = Instant::now();
     let (runner_image_ref, bake) = bake_runner(&api, &pod, selected_binaries, refs).await?;
-    emit(Phase::Step {
-        label: &format!("tar + pigz, {}", human_bytes(bake.bytes)),
-        dur: Duration::from_secs(bake.tar_secs),
-    });
-    emit(Phase::Step {
-        label: "push layer",
-        dur: Duration::from_secs(bake.push_secs),
-    });
-    emit(Phase::Done {
-        label: "runner image baked + pushed",
-        dur: t.elapsed(),
-    });
+    if bake.skipped {
+        emit(Phase::Step {
+            label: "unchanged — reused pushed image",
+            dur: Duration::from_secs(bake.fingerprint_secs),
+        });
+        emit(Phase::Done {
+            label: "runner image up to date",
+            dur: t.elapsed(),
+        });
+    } else {
+        emit(Phase::Step {
+            label: &format!("tar + pigz, {}", human_bytes(bake.bytes)),
+            dur: Duration::from_secs(bake.tar_secs),
+        });
+        emit(Phase::Step {
+            label: "push layer",
+            dur: Duration::from_secs(bake.push_secs),
+        });
+        emit(Phase::Done {
+            label: "runner image baked + pushed",
+            dur: t.elapsed(),
+        });
+    }
     emit(Phase::Note(&format!(
         "runner image ready: {runner_image_ref}"
     )));
@@ -262,6 +258,14 @@ pub async fn compile_on_cluster(
         qos_by_binary,
         runner_image_ref,
     })
+    }
+    .await;
+
+    // Shrink back to rest on every path; `shrink_to` drops the page cache first
+    // so the resize-down isn't refused. Silent — a failed shrink just leaves the
+    // pod oversized until the next run resizes it.
+    let _ = shrink_to(client, &shrink_pod, BUILDER_CONTAINER, &rest_cpu, &rest_mem).await;
+    outcome
 }
 
 /// Find the builder pod and wait until it reports Ready. Returns its name.
@@ -295,11 +299,9 @@ fn pod_ready(p: &Pod) -> bool {
         .unwrap_or(false)
 }
 
-/// The outer shell wrapping every builder `exec`: it runs the real command in a
-/// nested `sh` (a distinct argv, so no quoting is needed and its `set -e` cannot
-/// skip the marker) and prints a `ZTEST_EXIT=<n>` sentinel. That sentinel — not
-/// the k8s `exec` Status object, whose Rust shape is version-fragile — is the
-/// exit-code source.
+/// The outer shell wrapping every builder `exec`: runs the real command in a
+/// nested `sh` and prints a `ZTEST_EXIT=<n>` sentinel. That sentinel is the
+/// exit-code source, not the k8s `exec` Status, whose Rust shape is version-fragile.
 const OUTER: &str = r#"sh -c "$1"; printf '\nZTEST_EXIT=%s\n' "$?""#;
 
 /// A live line sink for a remote command's stderr (cargo's `Compiling …`
@@ -336,14 +338,11 @@ impl std::fmt::Debug for CompileOut<'_> {
     }
 }
 
-/// `exec` a command in the builder container and capture `(stdout, stderr,
-/// exit_code)`, forwarding each stderr line to `on_line` as it arrives (when set).
-///
-/// No TTY: stdout and stderr stay separate (JSON on stdout stays clean) but are
-/// multiplexed over ONE websocket, so they MUST be drained concurrently — a
-/// compile that floods stderr fills that channel's buffer while an unread reader
-/// blocks the shared stream; draining stdout to EOF first deadlocks, since stdout
-/// never reaches EOF until the whole (stderr-blocked) stream closes.
+/// `exec` a command in the builder, capturing `(stdout, stderr, exit_code)` and
+/// forwarding each stderr line to `on_line` (when set). No TTY, so stdout/stderr
+/// stay separate but share ONE websocket and MUST be drained concurrently:
+/// draining stdout to EOF first deadlocks, since it never reaches EOF until the
+/// whole (possibly stderr-blocked) stream closes.
 async fn exec_streamed(
     api: &Api<Pod>,
     pod: &str,
@@ -399,13 +398,10 @@ async fn exec_streamed(
     Ok((clean, err, code))
 }
 
-/// `exec` a command under a remote **PTY** (`tty: true`, à la `kubectl exec -it`)
-/// and stream the merged output raw to `on_bytes` as it arrives. The PTY makes
-/// cargo behave interactively — unbuffered, coloured, emitting its in-place
-/// progress bar — and the bytes (cursor control included) feed straight into the
-/// caller's terminal emulator. `size` sets the remote (cols, rows) so the bar
-/// matches the live grid. With a TTY stdout and stderr are one stream, so this is
-/// only for passes that put no machine-readable data on stdout.
+/// `exec` a command under a remote **PTY** and stream the merged raw output to
+/// `on_bytes`, so cargo runs interactively and its bytes feed the caller's
+/// terminal emulator. `size` sets the remote (cols, rows). A TTY merges stdout
+/// and stderr, so this is only for passes with no machine-readable stdout.
 async fn exec_tty(
     api: &Api<Pod>,
     pod: &str,
@@ -707,13 +703,9 @@ fn rsync_source(src: &SourceLayout, pod: &str) -> Result<(), String> {
     cmd.args(["rsync", "--no-perms", "--delete", "--compress"])
         .args(["--exclude", "target", "--exclude", ".git"])
         .args(["-n", RUN_NAMESPACE, "-c", BUILDER_CONTAINER]);
-    // The kube *client* (exec) targets the profile's `ZTEST_KUBE_CONTEXT`
-    // in-memory, ignoring the kubeconfig's current-context — but `oc` is a
-    // separate process that honours only the kubeconfig. Without pinning
-    // `--context` here, `oc rsync` would fall back to whatever current-context
-    // the pinned kubeconfig happens to carry (frequently a stale local `kind`),
-    // silently syncing into the wrong cluster. Pass the same context the client
-    // resolved so exec and rsync always hit one cluster.
+    // `oc` is a separate process honouring only the kubeconfig's current-context,
+    // whereas the exec client targets the profile's context in-memory. Pin
+    // `--context` here so `oc rsync` can't silently sync into the wrong cluster.
     if let Some(ctx) =
         std::env::var_os(crate::cluster_config::KUBE_CONTEXT_ENV).filter(|v| !v.is_empty())
     {
@@ -737,27 +729,26 @@ fn rsync_source(src: &SourceLayout, pod: &str) -> Result<(), String> {
 
 // ── Runner-image bake (crane) ─────────────────────────────────────────
 
-/// Append the compiled test binaries onto the runner base and push the runner
-/// image, all in-pod via `crane`. Each binary is its **own** layer, placed at its
-/// exact compile path (`/cache/target/<profile>/deps/<bin>`) so the baked image's
-/// absolute paths match `WorkItem::binary_path`. Per-binary layers (not one
-/// monolith) mean an edit to a single test re-pushes only that binary's blob —
-/// crane skips the layers the registry already has. Returns the pushed pull ref
-/// (content-addressed on the whole binary set).
-/// Where the "baking + pushing" time actually goes, split so a regression in
-/// either half (a fat layer to tar, a slow registry push) is visible rather than
-/// hidden behind one total.
+/// Split timing of a runner-image bake, so a regression in either half (tar vs
+/// registry push) is visible rather than hidden behind one total.
 #[derive(Debug)]
 pub struct BakeStats {
-    /// Uncompressed size of the binaries layers.
+    /// Uncompressed size of the binaries layers; 0 when skipped.
     pub bytes: u64,
-    /// Seconds spent tarring the binaries into layers.
+    /// Seconds fingerprinting the raw binaries to derive the tag — the only work
+    /// a no-change run pays before the `crane manifest` guard short-circuits it.
+    pub fingerprint_secs: u64,
+    /// Seconds tarring + compressing the binaries into layers; 0 when skipped.
     pub tar_secs: u64,
-    /// Seconds spent in `crane append` (the registry push); 0 when the
-    /// content-addressed ref already existed and the bake was skipped.
+    /// Seconds in `crane append` (the registry push); 0 when skipped.
     pub push_secs: u64,
+    /// The content-addressed ref already existed, so only the fingerprint ran.
+    pub skipped: bool,
 }
 
+/// Append the compiled binaries onto the runner base and push, in-pod via
+/// `crane`. Each binary is its own layer at its exact compile path, so an edit to
+/// one test re-pushes only that blob. Returns the content-addressed pull ref.
 async fn bake_runner(
     api: &Api<Pod>,
     pod: &str,
@@ -777,18 +768,14 @@ async fn bake_runner(
         .collect();
     let quoted: Vec<String> = rel_paths.iter().map(|p| shell_quote(p)).collect();
 
-    // One layer per binary: an edit to a single test changes only that binary's
-    // blob, so crane re-pushes just it and skips the layers the registry already
-    // has. Two determinism choices make that cross-run skip actually fire:
-    // reproducible tar (fixed mtime/owner) and `pigz -n` (no header timestamp,
-    // and pigz's output is independent of thread count) → identical binary bytes
-    // yield an identical compressed blob digest, which crane finds already
-    // present. `pigz` also moves the gzip off crane's single stdlib thread onto
-    // all cores. The tag is content-addressed on the *set* of uncompressed layer
-    // digests (combining per-layer hashes, not re-reading the bytes), so an
-    // unchanged suite yields the same ref — which the `crane manifest` guard
-    // detects to skip tar+compress+push entirely. `date +%s` (integer, portable —
-    // no GNU `%N`) brackets the phases so the laptop can attribute the time.
+    // The tag is content-addressed on the *raw* binary bytes, NOT the compressed
+    // layers, so the `crane manifest` guard can skip tar+compress+push after only
+    // a cheap hash pass instead of compressing every run just to learn the tag.
+    //
+    // Reproducible tar (fixed mtime/owner) and `pigz -n` (no header timestamp,
+    // output independent of thread count) keep identical binaries → identical
+    // blob digests, so the per-layer skip fires; `pigz` also spreads gzip across
+    // all cores. `date +%s` (integer, portable) brackets the phases for timing.
     let script = format!(
         r#"set -eu
 cd /
@@ -796,27 +783,30 @@ TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 crane auth login "{registry}" -u ztest -p "$TOKEN" --insecure >/dev/null 2>&1
 T0=$(date +%s)
 HASHES=
+for P in {paths}; do
+  HASHES="$HASHES$(sha256sum "$P" | cut -c1-64)"
+done
+TAG="dev-$(printf '%s' "$HASHES" | sha256sum | cut -c1-16)"
+REF="{repo}:$TAG"
+T1=$(date +%s)
+if crane manifest --insecure "$REF" >/dev/null 2>&1; then
+  echo "ZTEST_BAKE=$T0 $T1 $T1 $T1 0 1"
+  echo "ZTEST_RUNNER_REF=$REF"
+  exit 0
+fi
 BYTES=0
 LAYERS=
 for P in {paths}; do
   L=$(mktemp /tmp/runner-layer.XXXXXX.tar)
   tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf "$L" "$P"
-  HASHES="$HASHES$(sha256sum "$L" | cut -c1-64)"
   BYTES=$((BYTES + $(wc -c < "$L")))
   pigz -n "$L"
   LAYERS="$LAYERS -f $L.gz"
 done
-T1=$(date +%s)
-TAG="dev-$(printf '%s' "$HASHES" | sha256sum | cut -c1-16)"
-REF="{repo}:$TAG"
-if crane manifest --insecure "$REF" >/dev/null 2>&1; then
-  echo "ZTEST_BAKE=$T0 $T1 $T1 $BYTES"
-  echo "ZTEST_RUNNER_REF=$REF"
-  exit 0
-fi
-crane append --insecure -b "{base}" $LAYERS -t "$REF" >/dev/null
 T2=$(date +%s)
-echo "ZTEST_BAKE=$T0 $T1 $T2 $BYTES"
+crane append --insecure -b "{base}" $LAYERS -t "$REF" >/dev/null
+T3=$(date +%s)
+echo "ZTEST_BAKE=$T0 $T1 $T2 $T3 $BYTES 0"
 echo "ZTEST_RUNNER_REF=$REF"
 "#,
         paths = quoted.join(" "),
@@ -837,24 +827,31 @@ echo "ZTEST_RUNNER_REF=$REF"
         .ok_or_else(|| format!("bake produced no runner ref; output:\n{}", tail(&out, 20)))?;
     let stats = parse_bake_stats(&out).unwrap_or(BakeStats {
         bytes: 0,
+        fingerprint_secs: 0,
         tar_secs: 0,
         push_secs: 0,
+        skipped: false,
     });
     Ok((reference, stats))
 }
 
-/// Parse the `ZTEST_BAKE=<t0> <t1> <t2> <bytes>` marker into split durations.
+/// Parse the `ZTEST_BAKE=<t0> <t1> <t2> <t3> <bytes> <skipped>` marker into split
+/// durations: `[t0,t1]` fingerprint, `[t1,t2]` tar+compress, `[t2,t3]` push.
 fn parse_bake_stats(out: &str) -> Option<BakeStats> {
     let rest = out.lines().find_map(|l| l.strip_prefix("ZTEST_BAKE="))?;
     let mut it = rest.split_whitespace();
     let t0: u64 = it.next()?.parse().ok()?;
     let t1: u64 = it.next()?.parse().ok()?;
     let t2: u64 = it.next()?.parse().ok()?;
+    let t3: u64 = it.next()?.parse().ok()?;
     let bytes: u64 = it.next()?.parse().ok()?;
+    let skipped: bool = it.next()? == "1";
     Some(BakeStats {
         bytes,
-        tar_secs: t1.saturating_sub(t0),
-        push_secs: t2.saturating_sub(t1),
+        fingerprint_secs: t1.saturating_sub(t0),
+        tar_secs: t2.saturating_sub(t1),
+        push_secs: t3.saturating_sub(t2),
+        skipped,
     })
 }
 

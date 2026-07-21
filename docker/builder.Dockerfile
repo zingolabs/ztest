@@ -33,6 +33,17 @@ RUN curl -fsSL "https://github.com/google/go-containerregistry/releases/download
     && curl -fsSL https://get.nexte.st/latest/linux \
       | tar -xz -C /usr/local/bin
 
+# mold: the compile relinks 5 large test binaries (all-static native deps:
+# aws-lc-sys, secp256k1, ring, bundled sqlite, zstd) on every incremental
+# change, and stock `bfd` is the slowest step in that edit→link loop. The
+# compile pass runs under `mold -run`, which redirects the default linker to
+# mold with no `.cargo/config.toml` or `RUSTFLAGS` change — so it can't clobber
+# the workspace's own flags. Extract preserving the bin/ + lib/ tree so
+# `mold -run` finds its `mold-wrapper.so` relative to the binary.
+ARG MOLD_VERSION=2.32.1
+RUN curl -fsSL "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-x86_64-linux.tar.gz" \
+      | tar -xz -C /usr/local --strip-components=1
+
 ENV CARGO_HOME=/cache/cargo \
     CARGO_TARGET_DIR=/cache/target \
     LIBCLANG_PATH=/usr/lib/llvm-14/lib

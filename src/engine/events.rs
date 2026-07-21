@@ -1,11 +1,7 @@
-//! The lifecycle events the run loop emits, plus the [`RunReporter`] trait the
-//! loop drives.
-//!
-//! A small ztest-native vocabulary mapping one-to-one onto nextest's
-//! `TestEventKind` (started, slow, retrying, finished, skipped, plus run
-//! started/finished). The concrete reporter that turns them into nextest-style
-//! output is [`StyledReporter`](crate::engine::reporter::StyledReporter);
-//! [`NullReporter`] is a discard sink for tests.
+//! The lifecycle events the run loop emits and the [`RunReporter`] trait it
+//! drives — a ztest-native vocabulary mapping one-to-one onto nextest's
+//! `TestEventKind`. [`StyledReporter`](crate::engine::reporter::StyledReporter)
+//! renders them; [`NullReporter`] discards them.
 
 use std::time::Duration;
 
@@ -22,17 +18,13 @@ pub enum Verdict {
     Timeout,
     /// The process could not be spawned at all.
     SpawnError,
-    /// Killed by the run's cancellation (Ctrl-C): the test was in flight when the
-    /// run was cancelled, so its process group was signalled and it never reached
-    /// its own verdict. Nextest reports this as a signal-abort failure
-    /// (`Fail{Abort(signal)}`); ztest models only the fact of termination.
+    /// Killed by the run's cancellation (Ctrl-C) while in flight, before reaching
+    /// its own verdict. ztest models only the fact of termination.
     Terminated,
 }
 
-/// Why a run was cancelled before every test reached a verdict. Mirrors the
-/// subset of nextest's `CancelReason` that ztest can actually produce: the
-/// console's render thread fires cooperative cancellation on Ctrl-C, so
-/// [`Interrupt`](CancelReason::Interrupt) is the only reason today.
+/// Why a run was cancelled before every test reached a verdict. Ctrl-C is the
+/// only cause today, so [`Interrupt`](CancelReason::Interrupt) is the only variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelReason {
     /// Ctrl-C (SIGINT), caught by the console render thread.
@@ -63,9 +55,8 @@ pub enum SkipReason {
     /// Footprint exceeds the ServiceAccount budget.
     ExceedsSaBudget,
     /// A resource the test declared (`#[ztest::archive]`/`dev!`) failed to
-    /// provision (or is unreachable), so the test can't run — skipped cleanly
-    /// rather than failing at `TestEnv::build()`. Carries a human-readable
-    /// description of the unavailable resource.
+    /// provision, so it's skipped cleanly rather than failing at
+    /// `TestEnv::build()`. Carries a description of the unavailable resource.
     DependencyUnavailable { resource: String },
 }
 
@@ -175,14 +166,11 @@ pub enum TestEvent<'a> {
     },
 }
 
-/// The run-phase reporter. Implemented by
-/// [`StyledReporter`](crate::engine::reporter::StyledReporter) (nextest-style
-/// output) and [`NullReporter`] (a discard sink for tests).
-///
-/// Scroll-lines (PASS/FAIL/summary) accumulate as bytes drained by
-/// [`take_scrollback`](RunReporter::take_scrollback). The live element (the
-/// nextest-style progress line plus running list) is rendered separately by the
-/// run loop from [`PanelFrame`](crate::engine::schedule::PanelFrame) data.
+/// The run-phase reporter. It produces only scroll-lines (PASS/FAIL/summary),
+/// accumulated as bytes drained by
+/// [`take_scrollback`](RunReporter::take_scrollback); the live progress element
+/// is rendered separately by the run loop from
+/// [`PanelFrame`](crate::engine::schedule::PanelFrame) data.
 pub trait RunReporter {
     /// Consume one lifecycle event.
     fn handle(&mut self, ev: &TestEvent<'_>);

@@ -1,14 +1,8 @@
-//! Bundled backend impls. Third parties write their own validator (a
-//! `ValidatorConfig` config ZST plus its `ValidatorBackend`),
-//! `IndexerBackend`, or `WalletBackend` in their own crates; these are
-//! the defaults shipped with ztest.
+//! Bundled backend impls shipped with ztest. Third parties can supply their
+//! own validator, indexer, or wallet backends from their own crates.
 //!
-//! Wallet backends run in-process (no pod), so consumers get a
-//! batteries-included wallet API with no wallet glue in their tests. The
-//! default is [`librustzcash`] (a pure-Rust `zcash_client_backend` wallet,
-//! `Wallet::librustzcash`); [`zingo`] is an opt-in zingolib backend. The
-//! [`WalletBackend`](crate::handles::wallet::WalletBackend) trait keeps the
-//! door open for further in-process wallet impls.
+//! Wallet backends run in-process (no pod). Default is [`librustzcash`];
+//! [`zingo`] is an opt-in zingolib backend.
 pub(crate) mod image;
 #[cfg(feature = "librustzcash")]
 pub mod librustzcash;

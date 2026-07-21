@@ -1,44 +1,21 @@
-//! Image resolution for component pod specs.
+//! Image resolution for component pod specs: [`ImageSpec::Published`] (a registry
+//! tag used as-is) or [`ImageSpec::Dev`] (a Dockerfile / pinned git rev via the
+//! [`dev!`] macro).
 //!
-//! A component's image is either:
-//!   - [`ImageSpec::Published`]: a registry tag pulled as-is, the rc/release path.
-//!   - [`ImageSpec::Dev`]: a Dockerfile in the local checkout or a pinned git rev,
-//!     declared via the [`dev!`] test-author macro.
+//! A `Dev` image has two phases split by what they need. **Build** (preflight
+//! only) content-addresses the `<repo>:dev-<hash>` tag, builds+publishes it, and
+//! records `DevImageId → reference` in the manifest. **Resolve** (anywhere,
+//! including in-pod) looks the tag up by its **path-free** [`DevImageId`] — no
+//! file read, no hashing — so the laptop preflight and the separately-compiled
+//! in-pod binary agree despite different `CARGO_MANIFEST_DIR`s. A miss is
+//! [`ImageError::DevImageMissing`], never a silent fall back to the default.
 //!
-//! # Build vs resolve
-//!
-//! `Dev` images have two strictly separate phases, split by what they need:
-//!
-//!   - **Build** (preflight only): [`ImageProvider::build_image`] computes the
-//!     content-addressed `<repo>:dev-<hash>` tag from the source, builds+publishes
-//!     it, and the preflight records `DevImageId → reference` in the build
-//!     manifest. This needs the source tree and a builder, so it runs on the
-//!     laptop / on the cluster, never in a test.
-//!   - **Resolve** (anywhere, including in-pod): [`resolve`] looks the image up in
-//!     the manifest by its **path-free** [`DevImageId`] and returns the recorded
-//!     reference. It reads no files and computes no content hash — an in-pod test,
-//!     whose baked runner image has no Dockerfile, resolves purely from the
-//!     manifest ([`IMAGE_REFS_ENV`], injected by [`engine::pod_runner`]); local
-//!     kind seeds the same manifest process-globally ([`seed_dev_images`]).
-//!
-//! Because the resolve key is path-free, the laptop preflight and the
-//! separately-compiled in-pod binary agree on it despite different
-//! `CARGO_MANIFEST_DIR`s — the class of bug the old path-derived key created.
-//! A manifest miss is [`ImageError::DevImageMissing`] (never a silent fall back to
-//! the published default, never a Dockerfile read).
-//!
-//! # Topologies
-//!
-//! [`from_env`] selects one [`ImageProvider`] backend from `ZTEST_IMAGE_REGISTRY`
-//! / `ZTEST_IMAGE_PUSH_REGISTRY`: [`Kind`](kind::Kind) (`docker build` +
-//! `kind load`, bare-tag reference), [`Docker`](docker::Docker) (`docker build` +
-//! `docker push` to a generic registry), or [`OpenShift`](openshift::OpenShift)
-//! (on-cluster rootless-BuildKit build + push to the integrated registry). The
-//! `dev-<hash>` content tag is identical across topologies, so builds are
-//! cache-shared and the poison-tag invariant (see the tests) holds.
+//! [`from_env`] selects the [`ImageProvider`]: [`Kind`](kind::Kind),
+//! [`Docker`](docker::Docker) (generic registry), or
+//! [`OpenShift`](openshift::OpenShift) (on-cluster BuildKit build). The
+//! `dev-<hash>` tag is identical across topologies, so builds are cache-shared.
 //!
 //! [`dev!`]: ztest_macros::dev
-//! [`engine::pod_runner`]: crate::engine::pod_runner
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -131,16 +108,14 @@ fn sanitize_rev(rev: &str) -> String {
 }
 
 impl DevSource {
-    /// The `dev-<suffix>` tag component, computable without any network I/O so
-    /// `env.build()` can look up the pre-built tag. `Local` hashes the working
-    /// tree (files exist locally); `Git` uses the rev — itself a content hash —
-    /// plus a short fold of the feature list so differing features don't collide.
+    /// The `dev-<suffix>` tag component, computable without network I/O. `Local`
+    /// hashes the working tree; `Git` uses the rev (itself a content hash) plus a
+    /// fold of the feature list.
     ///
-    /// `rust_version` is the *pinned* toolchain (from `dev!`/`.rust_version()`),
-    /// folded in so each toolchain forks the tag. It must be the same value the
-    /// build side ([`docker_build_argv`]) folds, or `resolve` computes a tag that
-    /// was never built. A `None` (Dockerfile-default, or a `rust-toolchain.toml`
-    /// version) is deliberately *not* folded — that preserves today's tags.
+    /// `rust_version` is the *pinned* toolchain, folded in so each toolchain forks
+    /// the tag. It must fold identically to the build side ([`docker_build_argv`])
+    /// or `resolve` computes a tag that was never built. A `None` is deliberately
+    /// not folded, preserving existing tags.
     pub(crate) fn tag_suffix(
         &self,
         features: &[String],
@@ -206,15 +181,13 @@ impl DevSource {
     }
 }
 
-/// Shallow-fetch a single git `rev` into a content-addressed cache directory
-/// (`$XDG_CACHE_HOME/ztest/git-src/<sanitized-rev>`, or `~/.cache/...`) and
-/// return the checkout path. Cached by rev, so the fetch runs once across all
-/// runs. A rev is immutable, so a present checkout is never re-fetched.
+/// Shallow-fetch a single git `rev` into a content-addressed cache directory and
+/// return the checkout path. Cached by rev (immutable), so it fetches once.
 ///
-/// The checkout is built in a sibling scratch dir and `rename`d into its final
-/// path only once `checkout` succeeds, so the final path exists iff it holds a
-/// complete worktree — an interrupted fetch leaves only the scratch dir, never a
-/// "done"-looking empty entry that would poison the cache.
+/// The checkout is built in a sibling scratch dir and `rename`d into place only
+/// once `checkout` succeeds, so the final path exists iff it holds a complete
+/// worktree — an interrupted fetch never poisons the cache with a "done"-looking
+/// empty entry.
 fn fetch_git_rev(url: &str, rev: &str) -> Result<PathBuf, ImageError> {
     let cache_root = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -278,11 +251,9 @@ fn fetch_git_rev(url: &str, rev: &str) -> Result<PathBuf, ImageError> {
     Ok(dir)
 }
 
-/// Resolved image reference for a pod manifest. `imagePullPolicy` is left
-/// to the manifest default (`IfNotPresent`), which is correct for both
-/// modes: published tags rely on registry caching; `dev-<hash>` tags are
-/// unique per content so the local store is authoritative once
-/// `kind load` has run.
+/// Resolved image reference for a pod manifest. `imagePullPolicy` is left at the
+/// default `IfNotPresent`: published tags rely on registry caching, and
+/// `dev-<hash>` tags are unique per content so the local store is authoritative.
 #[derive(Debug, Clone)]
 pub struct ResolvedImage {
     pub image: String,
@@ -293,26 +264,87 @@ fn join(base: &str, local_tag: &str) -> String {
     format!("{}/{local_tag}", base.trim_end_matches('/'))
 }
 
-/// The one axis of variation in producing a dev image: the cluster topology.
-/// Each implementation *is* a topology; [`from_env`] selects one.
+/// Env var listing the published component images to mirror into the internal
+/// registry — comma-separated Hub refs (`repo:tag`). Unset/empty ⇒ no mirroring
+/// (pull from upstream). Explicit rather than auto-discovered because each
+/// downstream suite pins its own versions imperatively, unknown to the preflight.
+pub(crate) const MIRROR_IMAGES_ENV: &str = "ZTEST_MIRROR_IMAGES";
+
+/// The core published component images configured for mirroring, verbatim Hub
+/// refs. Read the same way in the preflight (which copies them) and in-pod
+/// (where [`resolve`] redirects a pod's pull to the mirror) — one source of truth.
+pub(crate) fn mirror_set() -> Vec<String> {
+    std::env::var(MIRROR_IMAGES_ENV)
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Split a curated Hub ref into `(repo, tag)`. `zfnd/zebra:6.2.0` →
+/// `("zfnd/zebra", "6.2.0")`; a tagless ref → `(repo, "latest")`. The mirror set
+/// is always short tag refs, so a `:` never denotes a host port here.
+fn split_repo_tag(hub_ref: &str) -> (&str, &str) {
+    match hub_ref.rsplit_once(':') {
+        Some((repo, tag)) if !tag.contains('/') => (repo, tag),
+        _ => (hub_ref, "latest"),
+    }
+}
+
+/// `true` if a leading path segment is a registry host (has a `.`/`:`, or is
+/// `localhost`) rather than a Docker Hub short-name namespace — the same
+/// heuristic the containers libraries use to normalize short names.
+fn is_registry_host(seg: &str) -> bool {
+    seg == "localhost" || seg.contains('.') || seg.contains(':')
+}
+
+/// The fully-qualified **source repository** for an `ImageTagMirrorSet` rule: the
+/// Hub ref's repo with its implicit `docker.io` host made explicit, so it matches
+/// how CRI-O normalizes a short pull spec. `zfnd/zebra:6.2.0` → `docker.io/zfnd/zebra`.
+pub(crate) fn mirror_source(hub_ref: &str) -> String {
+    let (repo, _) = split_repo_tag(hub_ref);
+    if is_registry_host(repo.split('/').next().unwrap_or_default()) {
+        repo.to_string()
+    } else {
+        format!("docker.io/{repo}")
+    }
+}
+
+/// The internal-registry mirror **repository** (no tag) for a source, path-
+/// preserving under `base` (`<registry>/ztest-images`): repo `zfnd/zebra` →
+/// `<base>/zfnd/zebra`. ITMS does prefix substitution, so the mirror must carry
+/// the same repo tail. Used as the ITMS `mirrors` entry (with the pull-side
+/// service base) and as the crane copy destination repo (with the push route base).
+pub(crate) fn mirror_repo(base: &str, hub_ref: &str) -> String {
+    let (repo, _) = split_repo_tag(hub_ref);
+    join(base, repo)
+}
+
+/// The full internal mirror ref (`repo:tag`) the populate step copies each
+/// curated image to.
+pub(crate) fn mirror_dest(base: &str, hub_ref: &str) -> String {
+    let (_, tag) = split_repo_tag(hub_ref);
+    format!("{}:{tag}", mirror_repo(base, hub_ref))
+}
+
+/// One cluster topology for producing a dev image; [`from_env`] selects one.
 ///
-/// The two sides are strictly separated by what they need. **Resolve**
-/// ([`image_reference`](ImageProvider::image_reference), [`pull_secret`]) is
-/// pure — no build tooling, no source, no content hashing — so it is the only
-/// side an in-pod test reaches. **Build**
-/// ([`image_built`](ImageProvider::image_built),
-/// [`build_image`](ImageProvider::build_image)) needs the source and a builder,
-/// so it runs only in the laptop/on-cluster preflight.
+/// The two sides are separated by what they need. **Resolve**
+/// ([`image_reference`](ImageProvider::image_reference), [`pull_secret`]) is pure
+/// — no build tooling, source, or hashing — so it is the only side an in-pod test
+/// reaches. **Build** ([`image_built`](ImageProvider::image_built),
+/// [`build_image`](ImageProvider::build_image)) needs source and a builder, so it
+/// runs only in the preflight.
 #[async_trait]
 pub trait ImageProvider: Send + Sync + std::fmt::Debug {
-    /// Pull reference for an **already-built** dev image, resolved without reading
-    /// source or building: the preflight recorded `DevImageId → reference` in the
-    /// [build manifest](seed_dev_images) (injected into runner pods via
-    /// [`IMAGE_REFS_ENV`], process-global for local kind), and this looks it up by
-    /// the entry's path-free [`DevImageId`]. Returns [`ImageError::DevImageMissing`]
-    /// on a miss — it never falls back to hashing a Dockerfile, so an in-pod test
-    /// (which has none) fails loud rather than confusingly. Topology-independent;
-    /// backends share the default.
+    /// Pull reference for an **already-built** dev image: a lookup in the [build
+    /// manifest](seed_dev_images) by the entry's path-free [`DevImageId`], reading
+    /// no source. A miss is [`ImageError::DevImageMissing`], never a Dockerfile
+    /// hash, so an in-pod test (which has none) fails loud. Backends share this default.
     fn image_reference(&self, entry: &DevImageEntry) -> Result<String, ImageError> {
         let id = DevImageId::of(
             &entry.repo,
@@ -347,17 +379,15 @@ pub trait ImageProvider: Send + Sync + std::fmt::Debug {
     ) -> Result<String, ResourceError>;
 }
 
-/// Path-free, file-free identity of a `Dev` image: everything that selects it
-/// *except* the build-context bytes — repo, features, toolchain, and the source's
-/// *origin kind* (a `Git` rev, or the constant `"local"`; **never** a filesystem
-/// path). This is the key the [build manifest](seed_dev_images) is keyed by.
+/// Path-free identity of a `Dev` image and the [build manifest](seed_dev_images)
+/// key: repo, features, toolchain, and the source's *origin kind* (a `Git` rev,
+/// or the constant `"local"`) — never a filesystem path.
 ///
-/// Path-free is load-bearing. The laptop preflight and the in-pod test are
-/// separately-compiled binaries with different `CARGO_MANIFEST_DIR`s, so a
-/// `Local` source's absolute Dockerfile path differs between them; keying on it
-/// (as the old `spec_key` did) meant the in-pod lookup always missed. Since a run
-/// never builds two different images for one `(repo, features, rust_version)`, the
-/// origin kind is enough to disambiguate without the path.
+/// Path-free is load-bearing: the laptop preflight and the in-pod test are
+/// separately-compiled binaries with different `CARGO_MANIFEST_DIR`s, so keying
+/// on a `Local` source's absolute path made the in-pod lookup always miss. A run
+/// never builds two images for one `(repo, features, rust_version)`, so the
+/// origin kind disambiguates without the path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevImageId(String);
 
@@ -410,14 +440,11 @@ pub fn selected_backend() -> ImageBackend {
     }
 }
 
-/// Single selection point, driven entirely by the activated cluster profile's
-/// [`ImageBackend`] — explicit config, not cluster sniffing. `OpenShift` builds
-/// *on the cluster* in a ztest-owned rootless-BuildKit pod, pushing to the
-/// integrated registry (push route + pull service); `Registry` →
-/// [`Docker`](docker::Docker) build-locally-and-push; `Kind` →
-/// [`Kind`](kind::Kind). There is **no fallback**: the profile names one backend
-/// and a failure of that backend fails the run (never silently degrades to
-/// another path).
+/// Single selection point, driven by the profile's [`ImageBackend`] (explicit
+/// config, not cluster sniffing): `OpenShift` → on-cluster BuildKit build,
+/// `Registry` → [`Docker`](docker::Docker) build-and-push, `Kind` →
+/// [`Kind`](kind::Kind). There is **no fallback** — a failure of the named
+/// backend fails the run, never silently degrading to another path.
 pub fn from_env() -> Arc<dyn ImageProvider> {
     match selected_backend() {
         ImageBackend::OpenShift => match (push_base(), pull_base()) {
@@ -477,10 +504,9 @@ fn env_nonempty(key: &str) -> Option<String> {
 }
 
 /// The `builder` / `runner-base` Dockerfiles, embedded so their bytes are the
-/// content-address for the on-cluster-built base images. `ztest setup` builds
-/// these via the OpenShift Build subsystem (see
-/// [`base_images`](crate::resource::impls::base_images)); editing one forks its
-/// tag and setup rebuilds it.
+/// content-address for the on-cluster-built base images (built by
+/// [`base_images`](crate::resource::impls::base_images) at `ztest setup`; editing
+/// one forks its tag and triggers a rebuild).
 pub(crate) const BUILDER_DOCKERFILE: &str = include_str!("../../../docker/builder.Dockerfile");
 pub(crate) const RUNNER_BASE_DOCKERFILE: &str =
     include_str!("../../../docker/runner-base.Dockerfile");
@@ -501,14 +527,10 @@ pub(crate) fn runner_base_tag() -> String {
     dockerfile_tag("ztest-runner-base", RUNNER_BASE_DOCKERFILE)
 }
 
-/// Pull reference of the on-cluster **builder** image the long-lived compile
-/// Deployment runs. `None` for local kind (no on-cluster compile).
-/// `ZTEST_BUILDER_IMAGE` overrides (pin a specific digest); otherwise it's the
-/// pull-base-qualified content tag built from [`BUILDER_DOCKERFILE`].
-///
-/// The Deployment does not run this tag directly — it resolves it to an immutable
-/// digest ([`pinned_builder_image`]) so a rebuilt tag is observable to `ztest
-/// setup`'s drift check.
+/// Pull reference of the on-cluster **builder** image. `None` for local kind.
+/// `ZTEST_BUILDER_IMAGE` overrides; otherwise the pull-base-qualified content tag
+/// from [`BUILDER_DOCKERFILE`]. The Deployment runs the digest-pinned form
+/// ([`pinned_builder_image`]), not this mutable tag.
 pub(crate) fn builder_image() -> Option<String> {
     if let Some(explicit) = env_nonempty("ZTEST_BUILDER_IMAGE") {
         return Some(explicit);
@@ -524,13 +546,11 @@ pub(crate) fn builder_push_ref() -> Option<String> {
     push_base().map(|base| join(&base, &builder_image_tag()))
 }
 
-/// The builder Deployment's image reference pinned to an immutable digest.
-/// Resolves the mutable `:dev` tag (via the push route — see [`builder_push_ref`])
-/// to `…/ztest-builder@sha256:…`. Pinning by digest makes a reseed observable to
-/// `ztest setup`'s drift check (the deployment hash changes with the digest) and
-/// lets the default `IfNotPresent` pull policy be correct — an immutable ref
-/// never goes stale. `None` when there is no builder image (kind) or the tag is
-/// not yet in the registry (the caller treats that as "seed the builder first").
+/// The builder Deployment's image reference pinned to an immutable digest,
+/// resolving the mutable `:dev` tag via the push route ([`builder_push_ref`]).
+/// Digest-pinning makes a reseed observable to `ztest setup`'s drift check and
+/// keeps the default `IfNotPresent` pull policy correct. `None` when there is no
+/// builder image (kind) or the tag is not yet in the registry.
 pub(crate) async fn pinned_builder_image() -> Option<String> {
     let tag_ref = builder_image()?;
     if tag_ref.contains("@sha256:") {
@@ -541,11 +561,9 @@ pub(crate) async fn pinned_builder_image() -> Option<String> {
     Some(format!("{repo}@{digest}"))
 }
 
-/// Whether the test binaries are compiled *on the cluster* (in the builder pod),
-/// so the laptop ships source, not compiled artifacts. True when the selected
-/// [`ImageBackend`] is OpenShift (the [`OpenShift`](openshift::OpenShift) backend).
-/// Kept as a standalone predicate so `ztest run` can branch on it before
-/// constructing a backend.
+/// Whether test binaries are compiled *on the cluster* (OpenShift backend), so
+/// the laptop ships source, not artifacts. A standalone predicate so `ztest run`
+/// can branch on it before constructing a backend.
 pub fn builds_on_cluster() -> bool {
     selected_backend().is_openshift()
 }
@@ -570,44 +588,30 @@ pub(crate) fn runner_repo_ref() -> Option<String> {
 }
 
 /// The `ZTEST_IMAGE_PULL_SECRET` value, if set. Shared by the [`kind::Kind`] and
-/// [`docker::Docker`] backends, which both inject it as a pod `imagePullSecrets`
-/// entry for a private registry (a kind pod still pulls an
-/// [`ImageSpec::Published`] image, so kind honors it too). OpenShift returns
-/// `None` — its pods use SA-injected creds.
+/// [`docker::Docker`] backends, which inject it as a pod `imagePullSecrets` entry
+/// for a private registry. OpenShift returns `None` (SA-injected creds).
 pub(super) fn pull_secret_env() -> Option<String> {
     env_nonempty("ZTEST_IMAGE_PULL_SECRET")
 }
 
-/// An optional pull secret name (`ZTEST_IMAGE_PULL_SECRET`) to inject as a pod
-/// `imagePullSecrets` entry, for a private registry whose credentials aren't on
-/// the pods' ServiceAccount or node containerd config. `None` (the default)
-/// leaves pods relying on SA-level / node-level pull auth, which is the
-/// idiomatic k8s path and covers public registries with no secret at all.
-///
-/// Always `None` for the OpenShift integrated registry: pods reference the
-/// in-cluster service and pull with the pod SA's auto-injected registry creds
-/// (the `system:image-puller` grant), so a pull secret is never needed and
-/// injecting one meant for the external route would be wrong.
-///
-/// A free-fn facade over [`ImageProvider::pull_secret`] so the component
-/// backends keep calling `image::pull_secret()` unchanged.
+/// Free-fn facade over [`ImageProvider::pull_secret`] (so component backends
+/// call `image::pull_secret()` unchanged): the optional `imagePullSecrets` name
+/// for a private registry, or `None` to rely on SA-/node-level pull auth. Always
+/// `None` for OpenShift, whose pods pull with SA-injected creds.
 pub fn pull_secret() -> Option<String> {
     from_env().pull_secret()
 }
 
 /// Env var carrying the preflight's resolved dev-image references as a JSON
-/// `{DevImageId: pull_reference}` map. `engine::pod_runner` sets it on every
-/// remote runner pod so an in-pod test resolves its component images to the
-/// already-built-and-pushed reference (the baked runner image carries no
-/// Dockerfile to rebuild from). Local kind seeds the same map process-globally
-/// instead ([`seed_dev_images`]), so [`resolve`] has one uniform lookup path.
+/// `{DevImageId: pull_reference}` map, set by `engine::pod_runner` on every runner
+/// pod so an in-pod test (whose baked image has no Dockerfile) resolves to the
+/// already-pushed reference. Local kind seeds the same map process-globally
+/// ([`seed_dev_images`]), so [`resolve`] has one lookup path.
 pub const IMAGE_REFS_ENV: &str = "ZTEST_IMAGE_REFS";
 
-/// The build manifest: `DevImageId → pull reference` for every dev image the
-/// preflight built or found present. Seeded once from [`IMAGE_REFS_ENV`] (set on
-/// runner pods) and extendable in-process ([`seed_dev_images`], for local kind
-/// where preflight and tests share a process). The single source [`resolve`]
-/// consults — there is no other way a `Dev` image resolves.
+/// The build manifest: `DevImageId → pull reference`, the single source
+/// [`resolve`] consults. Seeded from [`IMAGE_REFS_ENV`] (runner pods) and
+/// extendable in-process ([`seed_dev_images`], for local kind).
 fn manifest() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, String>> {
     use std::sync::{Mutex, OnceLock};
     static M: OnceLock<Mutex<std::collections::BTreeMap<String, String>>> = OnceLock::new();
@@ -639,11 +643,10 @@ fn lookup_dev_image(id: &str) -> Option<String> {
         .cloned()
 }
 
-/// Pull reference for a built `<repo>:dev-<hash>` tag: bare for kind (the node's
-/// containerd holds it), pull-base-qualified for the registry / OpenShift
-/// integrated registry. The preflight ([`crate::cli::run`]) uses this to build
-/// the manifest, and each backend's `build_image` uses it to name what it pushes,
-/// so the recorded reference and the pushed image always agree.
+/// Pull reference for a built `<repo>:dev-<hash>` tag: bare for kind,
+/// pull-base-qualified for the registry / OpenShift. Used by both the preflight
+/// (to build the manifest) and each backend's `build_image` (to name what it
+/// pushes), so the recorded reference and the pushed image always agree.
 pub fn pod_reference(tag: &str) -> String {
     let base = match selected_backend() {
         ImageBackend::Kind => return tag.to_string(),
@@ -654,16 +657,17 @@ pub fn pod_reference(tag: &str) -> String {
 }
 
 /// Resolve an [`ImageSpec`] to the string that goes into a pod manifest.
-///
-/// [`ImageSpec::Published`] is the *default* image: the `default_published`
-/// registry tag, used verbatim. [`ImageSpec::Dev`] is an *override* of that
-/// default, resolved purely from the [build manifest](seed_dev_images) by its
-/// path-free [`DevImageId`] — the preflight is the only thing that ever builds.
-/// A miss returns [`ImageError::DevImageMissing`] (typically because the user ran
-/// `cargo test` directly, so nothing populated the manifest); a declared override
-/// never silently degrades to the default, and this never reads a Dockerfile.
+/// [`ImageSpec::Published`] uses `default_published` verbatim; [`ImageSpec::Dev`]
+/// resolves purely from the [build manifest](seed_dev_images) by its path-free
+/// [`DevImageId`] (never reads a Dockerfile). A miss returns
+/// [`ImageError::DevImageMissing`] — typically `cargo test` was run directly, so
+/// nothing populated the manifest — never a silent degrade to the default.
 pub fn resolve(spec: &ImageSpec, default_published: &str) -> Result<ResolvedImage, ImageError> {
     match spec {
+        // A published tag is used verbatim; when component-image mirroring is
+        // configured, the node's CRI-O transparently redirects the pull to the
+        // internal registry via an ImageTagMirrorSet (see
+        // `resource::impls::mirror`), so nothing is rewritten here.
         ImageSpec::Published => Ok(ResolvedImage {
             image: default_published.to_string(),
         }),
@@ -725,11 +729,9 @@ pub enum ImageError {
     Spawn { cmd: String, err: std::io::Error },
     /// Fetching a pinned git rev for a [`DevSource::Git`] image failed.
     GitFetch { rev: String, stderr_tail: String },
-    /// A dev image was referenced by a test but the preflight pipeline never
-    /// built it (so it's absent from the build manifest), almost always because
-    /// the user invoked `cargo test` / `cargo nextest run` directly instead of
-    /// `ztest run`. `image` is the component repo; `source` describes where the
-    /// image would have been built from (a Dockerfile path or a git rev).
+    /// A dev image referenced by a test is absent from the build manifest —
+    /// almost always because `cargo test` / `cargo nextest run` was invoked
+    /// directly instead of `ztest run`. `image` is the repo; `source` its origin.
     DevImageMissing { image: String, source: String },
 }
 
@@ -797,13 +799,10 @@ fn fold_suffix(base: &[u8], features: &[String], rust_version: Option<&str>) -> 
     hex::encode(&h.finalize()[..6])
 }
 
-/// The `docker build` argv (the args after the `docker` program name) for a
-/// dev image. The caller runs it through the console PTY (`Console::run_child`)
-/// so BuildKit detects a TTY and renders its native in-place layer progress,
-/// with `DOCKER_BUILDKIT=1` set in the child env. `tag` is whichever reference
-/// the active backend wants baked in: the bare `<repo>:dev-<hash>` for kind
-/// mode, the registry-qualified reference for registry mode (so the built image
-/// is ready to `docker push` with no re-tag).
+/// The `docker build` argv for a dev image, run through the console PTY (with
+/// `DOCKER_BUILDKIT=1`) so BuildKit renders its native progress. `tag` is the
+/// reference the active backend bakes in: the bare `<repo>:dev-<hash>` for kind,
+/// the registry-qualified reference for registry mode (so the push needs no re-tag).
 pub fn docker_build_argv(
     dockerfile: &Path,
     context: &Path,
@@ -822,11 +821,9 @@ pub fn docker_build_argv(
         argv.push("--build-arg".to_string());
         argv.push(format!("RUST_VERSION={rv}"));
     }
-    // Pass features under both the ztest convention (`CARGO_FEATURES`, read by
-    // our own Dockerfiles) and the upstream zcash convention (`FEATURES`, read
-    // by e.g. zebra's in-tree `docker/Dockerfile`). An undeclared build-arg is
-    // only a warning, so whichever the target Dockerfile reads gets set and the
-    // other is ignored.
+    // Pass features under both the ztest (`CARGO_FEATURES`) and upstream zcash
+    // (`FEATURES`) conventions; an undeclared build-arg is only a warning, so the
+    // Dockerfile reads whichever it wants and ignores the other.
     if !features.is_empty() {
         let joined = features.join(",");
         argv.push("--build-arg".to_string());
@@ -838,15 +835,11 @@ pub fn docker_build_argv(
     argv
 }
 
-/// Read `rust-toolchain.toml` from the context dir and extract the `channel`,
-/// or `None` when the file is absent, has no channel, or names a rustup channel
-/// rather than a concrete version. `None` means "say nothing" — the Dockerfile's
-/// own `ARG RUST_VERSION` default wins.
-///
-/// The concrete-version guard matters: `channel = "stable"` (as e.g. zebra pins)
-/// is valid for rustup but **not** a rust docker image tag — `rust:stable` does
-/// not exist on Docker Hub, only `rust:1.91.0` and the like. Passing a channel
-/// name straight through as `rust:<tag>` is the exact break this avoids.
+/// The `channel` from the context's `rust-toolchain.toml`, or `None` (let the
+/// Dockerfile's `ARG RUST_VERSION` default win) when absent/channel-less. A
+/// non-concrete channel like `stable` is also `None`: it is a valid rustup
+/// channel but not a Docker Hub tag (`rust:stable` doesn't exist), so passing it
+/// through as `rust:<tag>` would break the build.
 fn toolchain_rust_version(context: &Path) -> Option<String> {
     let s = std::fs::read_to_string(context.join("rust-toolchain.toml")).ok()?;
     for line in s.lines() {
@@ -865,11 +858,9 @@ fn toolchain_rust_version(context: &Path) -> Option<String> {
     None
 }
 
-/// The `RUST_VERSION` build-arg for a build, or `None` to pass none and let the
-/// Dockerfile's own default stand. Resolution: the explicitly pinned version
-/// (from `dev!`/`.rust_version()`) → a `rust-toolchain.toml` channel in the
-/// context → nothing. The final "nothing" branch is what stops ztest from
-/// clobbering a Dockerfile that already declares a valid `ARG RUST_VERSION`.
+/// The `RUST_VERSION` build-arg, or `None` to let the Dockerfile's own default
+/// stand. Resolution: the pinned version → a `rust-toolchain.toml` channel →
+/// nothing (the last branch avoids clobbering a Dockerfile's valid `ARG`).
 pub(crate) fn build_arg_rust_version(pinned: Option<&str>, context: &Path) -> Option<String> {
     pinned
         .map(str::to_owned)
@@ -885,14 +876,12 @@ fn tail(bytes: &[u8], lines: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! The dev-image tag is the first line of defence against the "poisoned
-    //! `:dev-*` tag" failure: two concurrent runs on one cluster (a long-lived
-    //! session + a Claude agent doing `ztest run --no-cleanup` for one test)
-    //! share the *same* content-addressed tag *iff and only iff* they build
-    //! byte-identical images. These tests pin that invariant so a refactor of
-    //! the tag derivation can never silently make it lossy — which is the only
-    //! way run B could overwrite the image run A's pods are pulling. The bundle
-    //! serialization itself is covered in [`bundle`]'s tests.
+    //! The dev-image tag guards against the "poisoned `:dev-*` tag" failure: two
+    //! concurrent runs on one cluster share the *same* content-addressed tag iff
+    //! they build byte-identical images. These tests pin that invariant so a
+    //! refactor can never make the tag derivation lossy — the only way run B could
+    //! overwrite the image run A's pods are pulling. Bundle serialization is
+    //! covered in [`bundle`]'s tests.
 
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -941,6 +930,31 @@ mod tests {
     /// Byte-identical contexts must resolve to the *same* tag. This is what
     /// makes concurrent sharing safe: same tag ⟹ same bytes, so whoever
     /// `kind load`s "wins" but the winner is identical to the loser.
+    #[test]
+    fn mirror_refs_are_path_preserving_with_docker_io_source() {
+        // ITMS source: implicit docker.io made explicit so CRI-O's normalized
+        // short-name pull matches.
+        assert_eq!(mirror_source("zfnd/zebra:6.2.0"), "docker.io/zfnd/zebra");
+        assert_eq!(
+            mirror_source("electriccoinco/lightwalletd:v0.4.17"),
+            "docker.io/electriccoinco/lightwalletd"
+        );
+        // Mirror repo (ITMS `mirrors` entry / crane dest repo) preserves the repo
+        // tail under the registry base — ITMS substitutes only the source prefix.
+        let base = "image-registry.openshift-image-registry.svc:5000/ztest-images";
+        assert_eq!(
+            mirror_repo(base, "zfnd/zebra:6.2.0"),
+            "image-registry.openshift-image-registry.svc:5000/ztest-images/zfnd/zebra"
+        );
+        // Full copy destination keeps the tag.
+        assert_eq!(
+            mirror_dest(base, "zfnd/zebra:6.2.0"),
+            "image-registry.openshift-image-registry.svc:5000/ztest-images/zfnd/zebra:6.2.0"
+        );
+        // A tagless ref defaults to `latest`, never silently dropped.
+        assert_eq!(mirror_dest(base, "zfnd/zebra"), format!("{base}/zfnd/zebra:latest"));
+    }
+
     #[test]
     fn identical_context_yields_identical_tag() {
         let df = "FROM scratch\nCOPY main.rs /\n";

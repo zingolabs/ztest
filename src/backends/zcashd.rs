@@ -23,14 +23,12 @@ use crate::{EnvError, RpcError};
 const COMPONENT: &str = "zcashd";
 
 // Fixed HTTP Basic Auth credentials for zcashd's regtest JSON-RPC. Not a
-// secret: zcashd rejects unauthed calls, so ztest writes these throwaway
-// values into the generated regtest `zcash.conf` (`rpcuser`/`rpcpassword`)
-// and presents them here. The node is reachable only inside the test's
-// ephemeral namespace.
+// secret: throwaway values written into the generated `zcash.conf`; the node
+// is reachable only inside the test's ephemeral namespace.
 pub(crate) const RPC_USER: &str = "test";
 pub(crate) const RPC_PASSWORD: &str = "test";
 
-/// Chain-poll cadence and default ceiling for this backend's `poll_*` /
+/// Chain-poll cadence and default timeout for this backend's `poll_*` /
 /// `wait_for_block_num` loops, plus the inter-block mining delay.
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -39,38 +37,29 @@ const BLOCK_GENERATION_DELAY: Duration = Duration::from_millis(1500);
 const CONTAINER_CONF_PATH: &str = "/etc/zcash/zcash.conf";
 const CONTAINER_DATA_DIR: &str = "/var/lib/zcashd";
 
-/// The pool zcashd mines its coinbase into when a test doesn't override
-/// via [`Validator::mine_to`](crate::component::Validator::mine_to):
-/// Sapling, its historical shielded `mineraddress`
-/// ([`SHIELDED_MINER_ADDRESS`](crate::regtest_conf::SHIELDED_MINER_ADDRESS)).
+/// Default pool zcashd mines its coinbase into, absent
+/// [`Validator::mine_to`](crate::component::Validator::mine_to). Sapling avoids
+/// the per-block Halo2 proof an Orchard coinbase costs.
 const DEFAULT_COINBASE_POOL: Pool = Pool::Sapling;
 
-/// Resolve the regtest miner address zcashd mines its coinbase to for
-/// `pool`. All three pools are mineable. The Orchard recipient is the
-/// abandon-art unified address
-/// ([`ORCHARD_MINER_ADDRESS`](crate::regtest_conf::ORCHARD_MINER_ADDRESS)),
-/// which pins the coinbase to Orchard once NU5 is active (height 2 under
-/// [`regtest_test_activation_heights`](crate::regtest::regtest_test_activation_heights)).
-/// Sapling stays the default (see [`DEFAULT_COINBASE_POOL`]) because an
-/// Orchard coinbase costs a Halo2 proof per block; opt in via
-/// [`Validator::mine_to`](crate::component::Validator::mine_to).
+/// Regtest miner address zcashd mines its coinbase to for `pool`. All three
+/// pools are mineable; the Orchard recipient pins the coinbase to Orchard once
+/// NU5 is active.
 fn miner_address(pool: Pool) -> &'static str {
     match pool {
-        // zcashd has no NU6.3/Ironwood support; Ironwood maps to the Orchard
-        // miner address for exhaustiveness (a zcashd Ironwood mine is never
-        // requested — zebrad is the NU6.3 validator).
+        // zcashd has no NU6.3/Ironwood support; Ironwood maps to Orchard only
+        // for exhaustiveness — a zcashd Ironwood mine is never requested.
         Pool::Orchard | Pool::Ironwood => crate::regtest_conf::ORCHARD_MINER_ADDRESS,
         Pool::Sapling => crate::regtest_conf::SHIELDED_MINER_ADDRESS,
         Pool::Transparent => crate::regtest_conf::MINER_ADDRESS,
     }
 }
 
-/// Resolve the container image for a zcashd pod. Mirrors
-/// [`zebra::image_uri`](crate::backends::zebra::image_uri): the *default* is the
-/// published `electriccoinco/zcashd:<version>` tag; a
-/// [`Dev`](crate::backends::image::ImageSpec::Dev) spec *overrides* it with a
-/// `zcashd:dev-<hash>` tag, or fails the test loudly via
-/// [`ImageError::DevImageMissing`] when the pipeline never built it.
+/// Resolve the container image for a zcashd pod. Default is the published
+/// `electriccoinco/zcashd:<version>` tag; a
+/// [`Dev`](crate::backends::image::ImageSpec::Dev) spec overrides it with a
+/// `zcashd:dev-<hash>` tag, or fails via [`ImageError::DevImageMissing`] if the
+/// pipeline never built it.
 pub(crate) fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
@@ -78,7 +67,7 @@ pub(crate) fn image_uri(
     crate::backends::image::resolve(&opts.image, &default_image)
 }
 
-/// Zcashd-flavoured validator spec. ZST handed to the
+/// Zcashd-flavoured validator spec. ZST for the
 /// [`Validator`](crate::component::Validator) builder; produces a
 /// [`ZcashdValidator`] handle at `add_validator` time.
 #[derive(Debug, Clone)]
@@ -119,36 +108,31 @@ impl ValidatorConfig for ZcashdBackend {
             version,
             activation,
             RPC_PORT,
-            // Coinbase recipient for the resolved pool (set in
-            // `add_validator`; falls back to the backend default).
             miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
         );
         opts.mounts.push(crate::regtest::config_mount_inline(
             conf,
             CONTAINER_CONF_PATH,
         ));
-        // `opts.regtest_cache` is intentionally ignored: zcashd's default
-        // coinbase is a shielded (Sapling) coinbase with no maturity gap, so
-        // a chain cache (whose purpose is to skip a transparent coinbase's
-        // ~100-block maturity mine) buys nothing here. The opt exists for the
-        // generic `Validator<B>` test helpers, where zebrad consumes it and
-        // zcashd no-ops.
+        // `opts.regtest_cache` is ignored: zcashd's default shielded coinbase
+        // has no maturity gap, so a chain cache (which skips a transparent
+        // coinbase's maturity mine) buys nothing. The opt exists for the
+        // generic `Validator<B>` helpers, where zebrad consumes it.
         Ok(opts)
     }
 }
 
 // ─────────────────────────── ZcashdValidator ──────────────────────────
 
-/// Live zcashd validator handle. Holds only the env plumbing; all node state
-/// is remote, reached over (Basic-Auth'd) JSON-RPC.
+/// Live zcashd validator handle. Holds only the env plumbing; node state is
+/// remote, reached over (Basic-Auth'd) JSON-RPC.
 #[derive(Debug, Clone)]
 pub struct ZcashdValidator {
     plumbing: HandleInner,
 }
 
 impl ZcashdValidator {
-    /// JSON-RPC transport with HTTP Basic Auth; zcashd rejects every unauthed
-    /// call with HTTP 401.
+    /// JSON-RPC transport with HTTP Basic Auth; zcashd 401s unauthed calls.
     async fn rpc_client(&self) -> Result<AuthedRpc, EnvError> {
         Ok(json_rpc_with_basic_auth(
             &self.plumbing.endpoint("rpc").await?,
@@ -209,10 +193,8 @@ impl ValidatorBackend for ZcashdValidator {
     }
 
     async fn ready(&self, timeout: std::time::Duration) -> Result<(), RpcError> {
-        // zcashd's `getblocktemplate` is gated by `IsInitialBlockDownload`,
-        // which never clears on a peer-less regtest chain, so probe with
-        // `getinfo`. Basic Auth matches `rpc_client`, else every probe would
-        // 401 and burn the whole timeout budget.
+        // `getblocktemplate` is gated by `IsInitialBlockDownload`, which never
+        // clears on a peer-less regtest chain, so probe with `getinfo`.
         let ep = self.plumbing.endpoint("rpc").await?;
         let client = json_rpc_with_basic_auth(&ep, RPC_USER, RPC_PASSWORD);
         wait_for_rpc_ready(&client, ep.socket_addr(), timeout, "getinfo", &json!([]))
@@ -237,9 +219,7 @@ impl ValidatorBackend for ZcashdValidator {
     }
 
     fn pool_support(&self) -> PoolSupport {
-        // zcashd v6.20.0 validates all three pools and mines an Orchard
-        // coinbase to a unified `mineraddress` once NU5 is active (see
-        // `miner_address`). The pool its coinbase pays into was chosen
+        // zcashd validates all three pools; the coinbase pool is chosen
         // per-validator (default Sapling).
         PoolSupport {
             supported: &[Pool::Orchard, Pool::Sapling, Pool::Transparent],
@@ -319,9 +299,8 @@ impl ValidatorBackend for ZcashdValidator {
                 .await?
                 .chain
         };
-        // ztest sets no `nSubsidyHalvingInterval` for zcashd, so the
-        // binary's regtest default governs the halving schedule and ztest
-        // does not model it.
+        // ztest sets no `nSubsidyHalvingInterval` for zcashd, so the binary's
+        // regtest default governs the halving schedule; ztest doesn't model it.
         Ok(ChainConfig {
             network,
             first_halving_height: None,
@@ -385,8 +364,8 @@ const RPC_PORT: u16 = crate::handles::ports::ZCASHD_RPC;
 
 // ──────────────────── zcashd-only typed JSON-RPC views ─────────────────
 //
-// Backend-specific RPCs as inherent methods on the concrete handle:
-// `get_block_deltas` simply doesn't exist on `ZebraValidator`.
+// Inherent methods on the concrete handle: `get_block_deltas` doesn't exist on
+// `ZebraValidator`.
 
 impl ZcashdValidator {
     /// Chain identity + tip summary. See [`BlockchainInfo`].

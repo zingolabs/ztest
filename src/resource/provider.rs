@@ -1,10 +1,7 @@
 //! [`NodeId`] — the closed identity set — and [`Provider`] — the contract every
-//! managed cluster resource implements.
-//!
-//! One trait, one identity type, no generics. The graph specializes on this
-//! concrete `NodeId`, so every place in the codebase that references a
-//! resource identity uses the same type: [`engine::plan::WorkItem::deps`]
-//! carries the same variants the graph provisioned.
+//! managed cluster resource implements. One concrete `NodeId` (no generics), so
+//! every resource-identity reference across the codebase shares one type
+//! (e.g. [`engine::plan::WorkItem::deps`]).
 //!
 //! [`engine::plan::WorkItem::deps`]: crate::engine::plan::WorkItem::deps
 
@@ -13,19 +10,15 @@ use async_trait::async_trait;
 use crate::resource::context::Cx;
 use crate::resource::state::{Lifetime, Readiness, ResourceError};
 
-/// The identity of a resource in the graph. A closed set — one variant per
-/// K8s resource kind ztest owns — so the graph stays typed and equal ids
-/// denote the same underlying resource. Content-addressed where practical
-/// (image tag carries its build hash, seed name carries its source-file
-/// hash), so identical declarations from different call sites collapse to
-/// one node for free.
+/// The identity of a resource in the graph: a closed set, one variant per K8s
+/// resource kind ztest owns, so equal ids denote the same resource.
+/// Content-addressed where practical (image tag carries its build hash, seed
+/// name its source hash), so identical declarations from different call sites
+/// collapse to one node.
 ///
-/// Two axes of grouping in the variant list, for the human reader:
-/// **per-run resources** (assembled by [`plan_runtime`] and provisioned each
-/// `ztest run`) vs. **cluster scaffolding + infrastructure** (assembled by
-/// [`initialize`] and provisioned once per `ztest setup`). The graph
-/// executor treats them identically — the distinction is one of *when* they
-/// enter a graph, not *how* they're driven.
+/// The variants are grouped for the reader into per-run resources ([`plan_runtime`])
+/// and cluster scaffolding + infrastructure ([`initialize`]); the executor
+/// treats both identically — the split is *when* they enter a graph, not *how*.
 ///
 /// [`plan_runtime`]: crate::resource::plan_runtime
 /// [`initialize`]: crate::resource::initialize
@@ -96,6 +89,11 @@ pub enum NodeId {
     /// replacing OpenShift's quay-pruning-prone Build subsystem. OpenShift targets
     /// only.
     Buildkit,
+    /// The core-component image mirror: an `ImageTagMirrorSet` redirecting the
+    /// published component repos (`zfnd/zebra`, …) to the internal registry, plus
+    /// the crane copy that populates it. Keeps a wide test wave off slow /
+    /// rate-limited Docker Hub pulls. OpenShift targets only.
+    ImageMirror,
 }
 
 impl NodeId {
@@ -122,41 +120,26 @@ impl NodeId {
             Self::BuildCache => "build-cache".into(),
             Self::Builder => "builder".into(),
             Self::Buildkit => "buildkit".into(),
+            Self::ImageMirror => "image-mirror".into(),
         }
     }
 }
 
-/// A managed cluster resource with a well-defined lifecycle.
+/// A managed cluster resource with a well-defined lifecycle. The
+/// [`Graph`](super::Graph) executor drives every provider through
+/// [`probe`](Provider::probe) (a `Ready` hit skips the rest),
+/// [`provision`](Provider::provision), and — for
+/// [`is_reaped`](Lifetime::is_reaped) lifetimes — [`teardown`](Provider::teardown).
 ///
-/// The [`Graph`](super::Graph) executor drives every provider through:
-///
-/// 1. [`probe`](Provider::probe) — cheap "already Ready?" check.
-///    A hit skips provision entirely (cross-run cache).
-/// 2. [`provision`](Provider::provision) — bring the resource from absent
-///    to Ready.
-/// 3. [`teardown`](Provider::teardown) — return the cluster to its
-///    pre-provision state. Only called for
-///    [`is_reaped`](Lifetime::is_reaped) lifetimes.
-///
-/// # Idempotence
-///
-/// Both `provision` and `teardown` MUST be idempotent. `provision` may run
-/// against a partial prior state after a crash-restart; `teardown` may run
-/// against a resource that no longer exists. Treat a 404 as success.
-///
-/// # Failure isolation
-///
-/// A provider that returns `Err` (or a `probe` that panics — but don't
-/// panic) blocks its own dependents but never propagates to siblings. The
-/// executor records [`NodeState::Failed`](super::NodeState::Failed) and
-/// moves on.
-///
-/// # Label before populate
-///
-/// `provision` MUST attach the run's identifying labels
-/// (`ztest.io/run-id=...`) to a resource *before* filling it, so a resource
-/// half-created by a crash is still findable — and reapable — by the
-/// [`reap_run`](super::reap_run) sweep.
+/// Invariants every impl MUST uphold:
+/// - **Idempotence.** `provision` may run against partial prior state and
+///   `teardown` against an already-gone resource; treat a 404 as success.
+/// - **Failure isolation.** Return `Err` (never panic); the executor records
+///   [`NodeState::Failed`](super::NodeState::Failed), blocking dependents but
+///   not siblings.
+/// - **Label before populate.** Attach `ztest.io/run-id=...` *before* filling a
+///   resource, so a crash-orphaned one is still findable by the
+///   [`reap_run`](super::reap_run) sweep.
 #[async_trait]
 pub trait Provider: Send + Sync + std::fmt::Debug {
     /// This provider's identity in the graph. Two providers with equal ids
@@ -175,26 +158,18 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// Teardown policy. See [`Lifetime`] for what each variant means.
     fn lifetime(&self) -> Lifetime;
 
-    /// Is the resource already present and Ready?
-    ///
-    /// Called before every [`provision`](Provider::provision); a `Ready`
-    /// result skips it entirely. Any uncertainty MUST return
-    /// [`Readiness::Absent`] — re-provisioning is idempotent (cheap), but
-    /// treating a broken resource as Ready is a silent bug that surfaces
-    /// only as a downstream test failure.
+    /// Is the resource already present and Ready? A `Ready` result skips
+    /// [`provision`](Provider::provision). Any uncertainty MUST return
+    /// [`Readiness::Absent`] — re-provisioning is cheap and idempotent, but a
+    /// false `Ready` is a silent bug that surfaces only as a downstream failure.
     async fn probe(&self, cx: &Cx) -> Readiness;
 
-    /// Drive the resource from absent to Ready.
-    ///
-    /// May be called against a partial prior state — must converge
-    /// idempotently. May assume every declared dep is already `Ready`.
+    /// Drive the resource from absent to Ready. May run against partial prior
+    /// state (must converge idempotently); may assume every dep is `Ready`.
     async fn provision(&self, cx: &Cx) -> Result<(), ResourceError>;
 
-    /// Drive the resource from Ready to absent.
-    ///
-    /// Default: no-op. Correct for every [`Lifetime::Cached`] node — the
-    /// graph won't call this anyway, and the trivial default keeps the
-    /// impls of cached resources uncluttered.
+    /// Drive the resource from Ready to absent. Default no-op: correct for
+    /// [`Lifetime::Cached`] nodes, which the graph never tears down anyway.
     async fn teardown(&self, _cx: &Cx) -> Result<(), ResourceError> {
         Ok(())
     }

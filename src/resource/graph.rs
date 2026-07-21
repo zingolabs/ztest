@@ -1,19 +1,11 @@
-//! [`Graph`]: the dependency-ordered executor that drives providers.
+//! [`Graph`]: the dependency-ordered executor that drives providers. Forward
+//! provisioning runs a node once its deps are `Ready` (siblings concurrent up to
+//! `max_concurrent`, a failed dep leaves a node `Blocked`); reverse teardown
+//! reaps a node only once its dependents are gone, skipping [`Lifetime::Cached`].
 //!
-//! Forward-provisioning walks the graph in topological order: a node runs the
-//! moment all its deps are `Ready`; independent siblings run concurrently up
-//! to `max_concurrent`; a node whose dep failed is `Blocked` (never
-//! attempted) while its siblings proceed.
-//!
-//! Reverse-teardown walks the graph the other way: a node is reaped only
-//! once every node that depends on it is gone. [`Lifetime::Cached`] nodes
-//! are skipped entirely (the cross-run cache); failures are isolated so one
-//! stuck delete can't strand the rest.
-//!
-//! The executor contains no Kubernetes code — every K8s interaction is
-//! delegated to the [`Provider`] impl. That keeps the ordering / concurrency
-//! / failure-isolation logic unit-testable against fake providers (see the
-//! test module below).
+//! The executor holds no Kubernetes code — every K8s interaction is delegated to
+//! the [`Provider`] impl, keeping the ordering/concurrency/failure-isolation
+//! logic unit-testable against fake providers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -120,12 +112,8 @@ impl Graph {
                 }
             }
         }
-        // Kahn's algorithm: if we can't peel every node, there's a cycle.
-        //
-        // `indegree[n]` = number of nodes n depends ON (not the other way).
-        // We seed the queue with the roots (indegree 0), peel each one, and
-        // decrement the indegree of every node that depends on it. Anything
-        // left with a non-zero indegree is in a cycle.
+        // Kahn's algorithm: `indegree[n]` = number of nodes n depends ON. Peel
+        // the roots, decrement dependents; a non-zero remainder is a cycle.
         let mut indegree: HashMap<NodeId, usize> = self
             .nodes
             .iter()
@@ -158,19 +146,14 @@ impl Graph {
     }
 
     /// Provision every node, forward in dependency order, up to
-    /// `max_concurrent` at a time. Returns the terminal
-    /// [`NodeState`](NodeState) of every node in the graph.
+    /// `max_concurrent` (clamped to ≥1) at a time. Returns each node's terminal
+    /// [`NodeState`](NodeState).
     ///
-    /// `max_concurrent` is clamped to at least 1. Pass a small value (or 1)
-    /// when providers share a serial resource — the console PTY's live
-    /// region can't render two concurrent `docker build`s coherently. Pass a
-    /// larger cap for independent network work.
-    ///
-    /// `on_change` fires on every [`NodeState`] transition; the CLI uses it
-    /// to render live progress. A [`probe`](Provider::probe) reporting
-    /// [`Readiness::Ready`] short-circuits [`provision`](Provider::provision)
-    /// (the node still transitions
-    /// `Pending → Acquiring → Ready`).
+    /// Pass a small cap (or 1) when providers share a serial resource — the
+    /// console PTY can't render two concurrent `docker build`s coherently.
+    /// `on_change` fires on every transition; a [`probe`](Provider::probe)
+    /// reporting [`Readiness::Ready`] short-circuits provision (the node still
+    /// transitions `Pending → Acquiring → Ready`).
     pub async fn provision<F>(
         &self,
         cx: &Cx,
@@ -189,11 +172,8 @@ impl Graph {
         let mut inflight = FuturesUnordered::new();
 
         loop {
-            // Classify every still-Pending node against its deps' current
-            // state:
-            //   - any dep unavailable → Blocked
-            //   - all deps Ready       → runnable
-            //   - otherwise            → still Pending, reclassify next round
+            // Classify each still-Pending node: any dep unavailable → Blocked;
+            // all deps Ready → runnable; otherwise reclassify next round.
             let mut to_block: Vec<NodeId> = Vec::new();
             let mut to_run: Vec<NodeId> = Vec::new();
             for (id, node) in &self.nodes {
@@ -231,9 +211,8 @@ impl Graph {
             }
 
             if inflight.is_empty() {
-                // Nothing running. If we blocked a node this pass, loop
-                // again so `Blocked` propagates transitively to its
-                // dependents before we call it done.
+                // If we blocked a node this pass, loop again so `Blocked`
+                // propagates transitively before we call it done.
                 if blocked_any {
                     continue;
                 }
@@ -249,17 +228,11 @@ impl Graph {
         state
     }
 
-    /// Teardown every provisioned, non-[`Cached`](super::Lifetime::Cached)
-    /// node, reverse in dependency order: a node is torn down only after
-    /// every node that depends on it is gone.
-    ///
-    /// Independent subtrees are reaped concurrently. Idempotent and failure-
-    /// isolated: a teardown error is recorded and its siblings still run.
-    ///
-    /// `states` is the report from [`provision`](Self::provision); only
-    /// nodes that reached `Ready` are candidates for teardown (a
-    /// `Failed`/`Blocked` node was never fully materialized, so there is
-    /// nothing to reap).
+    /// Teardown every provisioned, non-[`Cached`](super::Lifetime::Cached) node,
+    /// reverse in dependency order: a node is reaped only after every dependent
+    /// is gone. Independent subtrees run concurrently; idempotent and
+    /// failure-isolated. Only nodes that reached `Ready` in `states` are
+    /// candidates — a `Failed`/`Blocked` node was never materialized.
     pub async fn teardown<F>(
         &self,
         cx: &Cx,
@@ -361,20 +334,11 @@ pub enum GraphError {
     Cycle { count: usize },
 }
 
-// ─────────────────────────── unit tests ────────────────────────────────
-//
-// Every executor invariant we care about is testable without a cluster —
-// the trait is object-safe, so a hand-rolled `Fake` provider with a shared
-// event log is enough to assert ordering, concurrency capping, blocking,
-// short-circuit-on-Ready, and teardown behavior. These tests belong here
-// (in `graph.rs`) rather than in a separate file because they exercise
-// only the executor, and putting them beside the code they test keeps the
-// invariant statements and the code that upholds them next to each other.
-//
-// The `Fake` provider satisfies `Provider` (K8s-typed) by constructing its
-// `NodeId` via `NodeId::Image` — a valid enum variant that carries a
-// `String`, which lets us keep the identity string-based for readable test
-// assertions.
+// Every executor invariant is testable without a cluster: the trait is
+// object-safe, so a hand-rolled `Fake` provider with a shared event log covers
+// ordering, concurrency capping, blocking, short-circuit-on-Ready, and
+// teardown. `Fake` carries its identity as `NodeId::Image(String)` — an
+// arbitrary variant choice that keeps ids readable in assertions.
 
 #[cfg(test)]
 mod tests {
@@ -385,32 +349,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    // A concrete `Cx` for the tests is *not* what these executor tests
-    // need — the fake provider never touches `client`/`console`/`progress`.
-    // But `Provider::probe`/`provision`/`teardown` take `&Cx`, and `Cx`
-    // holds a `kube::Client` we can't construct out of thin air. So the
-    // tests use a wrapper `Provider` with its own shared state (event log +
-    // concurrency counters) and expect `Cx` only at the trait boundary,
-    // via a hand-rolled `unsafe` shim in `mk_cx()` that produces a `Cx`
-    // whose `client` is never dereferenced. This is safe because:
-    //   1. Every `Fake::provision`/`teardown` reads only the shared state
-    //      captured in `self`, never `cx.client`.
-    //   2. The pointer is not dereferenced. It exists purely to satisfy
-    //      the `Cx` layout.
-    //
-    // The cleaner alternative — making `Cx::client` an `Option<Client>` or
-    // trait-abstracting it — costs a permanent None-check on every real
-    // provision path just for testability. Keeping the client required
-    // (documented invariant of the public API) and paying this local
-    // opt-out here is the right trade.
+    // `Fake` keeps its own shared state (event log + concurrency counters) in a
+    // `TestCx`, never touching `cx.client`; the real `Cx` at the trait boundary
+    // is the offline stub from `test_cx()`. This avoids making `Cx::client`
+    // optional just for testability.
     fn mk_cx(log: SharedLog) -> TestCx {
         TestCx { log }
     }
 
-    /// A shim `Cx`-like context used only by the executor unit tests. Not
-    /// a `resource::Cx`; the tests take advantage of the fact that
-    /// `Provider` is a trait, and use their own trait-object-compatible
-    /// context via the `TestProvider` extension trait below.
     type SharedLog = Arc<Mutex<TestState>>;
 
     #[derive(Default, Debug)]
@@ -450,9 +396,6 @@ mod tests {
         }
     }
 
-    // The executor tests use the `Provider` trait directly. To keep the
-    // ergonomics of "id is a short string", we use `NodeId::Image(String)`
-    // as the id carrier — arbitrary choice; any variant would do.
     fn img(s: &str) -> NodeId {
         NodeId::Image(s.to_string())
     }
@@ -529,9 +472,8 @@ mod tests {
         }
         async fn provision(&self, _cx: &Cx) -> Result<(), ResourceError> {
             self.cx.record(format!("provision:{}", self.label));
-            // Straddle a yield so concurrent provisions actually overlap,
-            // letting the peak-in-flight counter witness the concurrency
-            // cap.
+            // Straddle a yield so concurrent provisions overlap and the
+            // peak-in-flight counter witnesses the concurrency cap.
             self.cx.enter();
             tokio::task::yield_now().await;
             self.cx.leave();
@@ -559,14 +501,9 @@ mod tests {
         g
     }
 
-    /// Construct a real `Cx` for tests. We build a client dangling from an
-    /// invalid config — the `Fake` provider never touches it, so this is
-    /// safe in practice. `Cx::headless` requires a `Client`; the cheapest
-    /// way is to construct one from a config that will never be used.
+    /// A real `Cx` whose client points at a non-existent server; the `Fake`
+    /// provider never calls through it, so no request is ever issued.
     async fn test_cx() -> Cx {
-        // Build a Client from an in-memory config that points at a
-        // non-existent server. Nothing in these tests actually calls
-        // through the client, so no request is ever issued.
         let cfg = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
         let client = kube::Client::try_from(cfg).expect("build offline client");
         Cx::headless(client)

@@ -1,34 +1,17 @@
-//! Unified bottom-pinned run console: a persistent render thread.
+//! Unified bottom-pinned run console. A compact status panel stays pinned to the
+//! bottom of the terminal for the whole `ztest run` session while subprocess
+//! output scrolls above it into native scrollback.
 //!
-//! A single compact status panel stays pinned to the bottom of the terminal for
-//! the entire `ztest run` session (preflight, image build, and the test run)
-//! while every subprocess's output scrolls above it into the terminal's native
-//! scrollback.
+//! A dedicated render thread ([`render`]) owns the terminal, the `avt` emulator,
+//! and the frame clock on its own tokio runtime, so its 33 ms redraw tick fires
+//! independently of the work side — the panel stays live even while a phase
+//! blocks on a silent subprocess. The work side never touches the terminal: it
+//! holds a cheap clonable [`Console`] and talks by value, pushing immutable
+//! [`SceneFrame`] recipes and streaming child PTY bytes via [`run_child`].
 //!
-//! The split: a dedicated render thread ([`render`]) owns the terminal, the
-//! `avt` virtual terminal, and the frame clock, and runs its own current-thread
-//! tokio runtime so its 33 ms redraw tick fires independently of the work side.
-//! That independence is the point: the panel stays live (spinner, clocks) even
-//! while a phase blocks on a silent multi-second subprocess.
-//!
-//! The work side never touches the terminal. It holds a cheap, clonable
-//! [`Console`] handle and talks to the render thread purely by value: pushing
-//! immutable [`SceneFrame`] render-recipes on every domain-state change, and
-//! streaming a child's PTY bytes via [`run_child`] ([`child`]). See
-//! `docs/console-architecture.md` for the full rationale.
-//!
-//! All output reaches the real terminal through a manual **sticky footer**
-//! ([`Surface`] + [`footer`]): completed lines are printed normally so the
-//! terminal scrolls them into its own native scrollback, and only the footer
-//! (live region + pinned panel) is repainted in place each frame. No reserved
-//! region, no DECSTBM scroll region (which would discard lines scrolled off an
-//! interior margin instead of saving them), no fixed height — the footer is
-//! exactly as tall as its content.
-//!
-//! The test run is just another scene producer: the engine ([`crate::engine`])
-//! owns process-per-test execution and ships a fresh [`SceneFrame`] panel +
-//! scrollback through the same [`Console`]. No special handoff; the pinned panel
-//! persists across every phase.
+//! Output reaches the terminal through a manual sticky footer ([`Surface`] +
+//! [`footer`]): completed lines print normally into native scrollback, only the
+//! footer repaints in place. See `docs/console-architecture.md` for the rationale.
 
 mod bridge;
 mod child;
@@ -41,22 +24,18 @@ pub(crate) use render::{Console, SceneFrame};
 pub(crate) use viewport::Surface;
 
 /// The pinned status panel's fixed height in rows: a branded rule plus four
-/// content lines (the two-column cluster/build/run status + transfer tracker).
-/// Held constant across every phase so the panel is a stable, always-fully-
-/// painted block pinned to the bottom of the inline viewport.
+/// content lines. Held constant across every phase so the panel is a stable,
+/// always-fully-painted block.
 pub(super) const PANEL_ROWS: u16 = 5;
 
-/// Rows available for the live region above the pinned panel: the full terminal
-/// height minus [`PANEL_ROWS`]. **The single source** every live-region consumer
-/// derives from — the `avt` grid, each child PTY (build/compile), and the engine's
-/// running-tests block — so the live region is exactly as tall as the terminal
-/// allows and a child renders as it would in a bare shell, never clipped to a
-/// hard-coded row count. The footer is still drawn only as tall as its live content
-/// actually is (`trimmed_view` for the grid, the running list for the engine); this
-/// is the ceiling, not a reservation.
+/// Rows available for the live region above the pinned panel: terminal height
+/// minus [`PANEL_ROWS`]. The single source every live-region consumer derives
+/// from, so a child renders at real height rather than a hard-coded row count.
+/// This is a ceiling, not a reservation — the footer is drawn only as tall as the
+/// live content actually is.
 ///
-/// Floored to 1: a terminal can momentarily report a height at or below the panel
-/// during a resize, and `avt` underflow-panics on a 0 dimension.
+/// Floored to 1: a resize can momentarily report a height at or below the panel,
+/// and `avt` underflow-panics on a 0 dimension.
 pub(super) fn live_rows_for(total_rows: u16) -> u16 {
     total_rows.saturating_sub(PANEL_ROWS).max(1)
 }

@@ -1,19 +1,11 @@
-//! ztest run-identity and OpenShift policy providers.
+//! ztest run-identity and OpenShift policy providers: the least-privilege run
+//! ServiceAccount + RBAC + token (all targets), and — on OpenShift — the
+//! `nonroot-v2` SCC grant and the dev-image registry project.
 //!
-//! These are the ztest-specific, backend-agnostic cluster objects that used
-//! to be hand-applied as manifests: the least-privilege run ServiceAccount +
-//! RBAC + token (all targets), and — on OpenShift — the `nonroot-v2` SCC
-//! grant and the dev-image registry project. The *substrate* (storage
-//! engine, operators) stays a manual/declarative install; ztest owns only
-//! what is defined by ztest.
-//!
-//! # What lives here vs. elsewhere
-//!
-//! [`qos`](super::qos) owns the QoS RBAC/SAs; [`scaffolding`](super::scaffolding)
-//! owns bare namespaces + node labels. This file owns the run *identity* (the
-//! credential a remote `ztest run` authenticates as) and the OpenShift-only
-//! policy (SCC admission, registry project) that a run needs but that isn't
-//! part of ztest's QoS/storage contract.
+//! [`scaffolding`](super::scaffolding) owns bare namespaces + node labels; the
+//! substrate (storage engine, operators) stays a manual install. This file owns
+//! the credential a remote `ztest run` authenticates as, plus the OpenShift-only
+//! policy a run needs.
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
@@ -66,14 +58,10 @@ const LEGACY_IMAGE_PUSH_BINDING: &str = "ztest-image-pusher";
 
 // ── Run identity permissions (single source of truth) ─────────────────
 //
-// This one list drives BOTH the `ztest-remote` ClusterRole rendered in
-// `RunIdentityProvider` AND the run-start self-check ([`check_access`]). The
-// rule this project keeps relearning: adding a cluster call to a runtime path
-// (cluster.rs / seeds.rs / materialize.rs / qos / pipeline) means adding its
-// verb *here*. Then a cluster whose grant is stale fails fast at run start,
-// naming the exact permission, instead of a cryptic mid-run 403 or a silent
-// capability degrade (the QoS probe quietly seeing zero nodes). Derived from
-// the runtime API surface, evidence-mapped resource by resource.
+// This one list drives BOTH the `ztest-remote` ClusterRole and the run-start
+// self-check ([`check_access`]). Adding a cluster call to a runtime path means
+// adding its verb here, so a stale grant fails fast at run start naming the
+// permission, instead of a cryptic mid-run 403 or a silent capability degrade.
 
 /// Which image backends a [`Rule`] applies to. The run role granted — and the
 /// self-check probed — includes a rule only when the active backend matches, so
@@ -83,11 +71,8 @@ const LEGACY_IMAGE_PUSH_BINDING: &str = "ztest-image-pusher";
 enum RuleScope {
     /// Applies on every backend.
     All,
-    /// Applies only when the profile selects this image backend. No rule needs
-    /// this today (the OpenShift build grants that did were removed when builds
-    /// moved to the ztest-owned BuildKit pod), but the scope stays so a future
-    /// backend-specific grant has a home — the reason rules are annotated
-    /// per-rule rather than split into arrays.
+    /// Applies only when the profile selects this image backend. Unused today,
+    /// but kept so a future backend-specific grant has a home.
     #[allow(dead_code)]
     Only(ImageBackend),
 }
@@ -172,6 +157,26 @@ const RUN_RULES: &[Rule] = &[
         check_verb: None,
         scope: RuleScope::All,
     },
+    // Pod resize subresource: the build-pod resizer grows/shrinks buildkit and
+    // builder in place (KEP-1287) via a PATCH on `pods/resize`.
+    Rule {
+        group: "",
+        resources: &["pods/resize"],
+        verbs: &["get", "patch", "update"],
+        check_verb: None,
+        scope: RuleScope::All,
+    },
+    // Pod metrics: the capacity probe reserves each pod at `max(request,
+    // observed_usage)`; the usage term reads `metrics.k8s.io`. Best-effort — no
+    // `check_verb`, so a cluster without the metrics API (or this grant) just
+    // falls back to request-only accounting rather than failing the run.
+    Rule {
+        group: "metrics.k8s.io",
+        resources: &["pods"],
+        verbs: &["get", "list"],
+        check_verb: None,
+        scope: RuleScope::All,
+    },
     Rule {
         group: "batch",
         resources: &["jobs"],
@@ -220,14 +225,9 @@ const RUN_RULES: &[Rule] = &[
         check_verb: Some("get"),
         scope: RuleScope::All,
     },
-    // On-cluster image builds no longer use OpenShift's Build subsystem: ztest runs
-    // its own rootless-BuildKit pod ([`crate::backends::image::openshift`]) and
-    // `exec`s into it (covered by the `pods/exec` rule above), so the run identity
-    // needs no `build.openshift.io`/`image.openshift.io` grants. Pushing to the
-    // integrated registry (which auto-creates the imagestream on first push) is
-    // done by the BuildKit pod's own SA via `RegistryProjectProvider`, not this
-    // identity. Backend-specific rules still live here keyed by `RuleScope` when a
-    // future backend needs one.
+    // On-cluster builds `exec` into the BuildKit pod (covered by `pods/exec`
+    // above), so the run identity needs no `build`/`image.openshift.io` grants;
+    // the push is done by the BuildKit pod's own SA (`RegistryProjectProvider`).
 ];
 
 /// Render the rules applicable to `backend` as ClusterRole `rules` JSON.
@@ -239,18 +239,14 @@ fn render_run_rules(backend: ImageBackend) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Annotation recording which `RUN_RULES` revision an applied ClusterRole was
-/// rendered from, so [`RunIdentityProvider::probe`] can tell a *current* role
-/// from a *stale* one. Without this, probe checks only existence: an old role
-/// from a prior ztest version reads as Ready and its rules are never
-/// reconciled — the drift bug this whole module fights, one layer down.
+/// Annotation recording which revision an applied object was rendered from, so a
+/// probe can tell a *current* object from a *stale* one and reconcile it rather
+/// than reading a prior ztest's object as Ready.
 pub(crate) const RULES_HASH_ANNOTATION: &str = "ztest.io/rules-hash";
 
 /// Stable (build-independent) content hash of a rendered manifest fragment.
-/// `DefaultHasher` uses fixed keys, so the same input hashes identically across
-/// processes — all we need to detect "this changed since it was applied". Stamped
-/// as [`RULES_HASH_ANNOTATION`] so a probe can tell a present-but-stale object
-/// (an older ztest wrote it) from an up-to-date one and reconcile the difference.
+/// `DefaultHasher`'s fixed keys hash identically across processes — enough to
+/// detect "this changed since it was applied". Stamped as [`RULES_HASH_ANNOTATION`].
 pub(crate) fn manifest_hash(v: &serde_json::Value) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -265,12 +261,9 @@ fn run_rules_hash(backend: ImageBackend) -> String {
 }
 
 /// Self-check the run identity's cluster-scoped permissions via
-/// SelfSubjectAccessReview. Returns the human-readable list of missing grants
-/// (empty ⇒ all present). Any authenticated identity may create an SSAR, so the
-/// check needs no privilege of its own. Only rules with a `check_verb` are
-/// probed: the cluster-scoped ones prone to drift and to failing deep in a run.
-/// `backend` gates the backend-specific rules so a kind/registry run never
-/// probes (and fails on) OpenShift-only API groups.
+/// SelfSubjectAccessReview (any authenticated identity may create one). Returns
+/// the list of missing grants (empty ⇒ all present). Only rules with a
+/// `check_verb` are probed; `backend` gates the backend-specific ones.
 pub(crate) async fn check_access(
     client: &kube::Client,
     backend: ImageBackend,
@@ -326,10 +319,8 @@ pub(crate) async fn check_access(
 // ── RunIdentity ───────────────────────────────────────────────────────
 
 /// The run ServiceAccount, its `ztest-remote` ClusterRole + binding, and a
-/// non-expiring token Secret. Least-privilege and RUN-only: no rbac-write,
-/// no SCC-write, no secrets read — the token cannot escalate. Mirrors the
-/// footprint the engine exercises at run time (`src/env.rs`, `cluster.rs`,
-/// `resource/`).
+/// non-expiring token Secret. Least-privilege and RUN-only: no rbac-write, no
+/// SCC-write, no secrets read — the token cannot escalate.
 #[derive(Debug)]
 pub(crate) struct RunIdentityProvider {
     /// The active image backend, gating the backend-specific run rules (e.g. the
@@ -502,26 +493,19 @@ impl Provider for SccGrantProvider {
 
 // ── RegistryProject (OpenShift) ───────────────────────────────────────
 
-/// The `ztest-images` project's pull/push RBAC. The read-only puller role is
-/// bound to `system:serviceaccounts` — every in-cluster SA — because each test
-/// runs in a fresh, dynamically-named namespace whose pods pull as that
-/// namespace's `default` SA, and RBAC groups can't wildcard a namespace prefix.
-/// A truly *anonymous* grant (`system:unauthenticated`) does not work: the
-/// integrated registry always challenges for credentials, and a pod pulls with
-/// its auto-injected SA dockercfg (i.e. authenticated), so the anonymous subject
-/// is never matched. Scoping the puller to this one ephemeral-image namespace on
-/// a single-user cluster is the right trade. Push stays authenticated: the run SA
-/// (`system:image-pusher` + imagestream create) pushes via the external route
-/// with the kubeconfig token. The namespace itself is a separate scaffolding
-/// node; this provider owns only the bindings.
+/// The `ztest-images` project's pull/push RBAC. The read-only puller is bound to
+/// `system:serviceaccounts` (every in-cluster SA), because each test's pods pull
+/// as their namespace's `default` SA and RBAC groups can't wildcard a namespace
+/// prefix. An anonymous grant does not work: the registry always challenges and a
+/// pod pulls authenticated with its SA dockercfg, so `system:unauthenticated` is
+/// never matched. Push stays authenticated (run SA via the external route). The
+/// namespace is a separate scaffolding node; this provider owns only the bindings.
 #[derive(Debug)]
 pub(crate) struct RegistryProjectProvider;
 
 /// The registry project's RBAC as `(pullers, push_role, pusher)` manifests.
 /// Factored out so provision applies them and probe can hash them for drift
-/// detection — the same reconcile discipline the SCC/run-role use, so adding a
-/// push subject (e.g. the build SA) actually reaches a cluster set up by an
-/// older ztest instead of being masked by the binding's mere existence.
+/// detection, so adding a push subject reaches a cluster set up by an older ztest.
 fn registry_manifests() -> (serde_json::Value, serde_json::Value, serde_json::Value) {
     let pullers = json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -661,11 +645,8 @@ impl Provider for RegistryProjectProvider {
 }
 
 /// Run identity + policy providers for `backend`. The run identity is always
-/// included (its rules are gated per-backend by [`RuleScope`]); an OpenShift
-/// backend additionally installs the SCC grant for test pods and the registry
-/// project push/pull RBAC. Callers add these alongside the namespace providers
-/// via [`Graph::add_dedup`](crate::resource::Graph::add_dedup); the
-/// `ztest`/`ztest-images` namespaces are added by the caller.
+/// included; an OpenShift backend additionally installs the SCC grant and the
+/// registry project push/pull RBAC. Callers add the namespaces separately.
 pub(crate) fn providers(backend: ImageBackend) -> Vec<Box<dyn Provider>> {
     let mut out: Vec<Box<dyn Provider>> = vec![Box::new(RunIdentityProvider { backend })];
     if backend.is_openshift() {

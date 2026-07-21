@@ -1,10 +1,6 @@
-//! Generic Kubernetes scaffolding providers: namespaces and cluster-wide
-//! node labels.
-//!
-//! These are the primitives every setup call needs — the `ztest-seeds`
-//! namespace, the NVMe node label — and are cleanly parameterized so they
-//! don't grow one file per constant. Both are [`Lifetime::Cached`]: created
-//! once by `ztest setup`, kept for the life of the cluster.
+//! Generic Kubernetes scaffolding providers: namespaces and cluster-wide node
+//! labels. Parameterized primitives every setup call needs, both
+//! [`Lifetime::Cached`] for the life of the cluster.
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Namespace, Node};
@@ -63,12 +59,9 @@ impl Provider for NamespaceProvider {
     }
 }
 
-/// A cluster-wide node label applied to all schedulable nodes.
-///
-/// One provider owns one label key (the [`NodeId::NodeLabel`] carries the
-/// key), so two independent providers can't fight over the same label.
-/// The value is a construction-time parameter — most calls use the
-/// `ztest.io/pool=nvme` label defined in [`crate::qos`].
+/// A cluster-wide node label applied to all schedulable nodes. One provider owns
+/// one label key (carried by [`NodeId::NodeLabel`]), so two providers can't fight
+/// over the same label.
 #[derive(Debug)]
 pub(crate) struct NodeLabelProvider {
     key: String,

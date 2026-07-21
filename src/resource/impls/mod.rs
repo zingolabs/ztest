@@ -1,35 +1,17 @@
-//! Concrete [`Provider`](super::Provider) implementations, organized by
-//! K8s domain.
+//! Concrete [`Provider`](super::Provider) implementations, organized by K8s
+//! domain. All `pub(crate)`; external callers reach them through the entry-point
+//! verbs ([`initialize`](super::initialize), [`plan_runtime`](super::plan_runtime),
+//! [`reap_run`](super::reap_run)), never by name.
 //!
-//! Everything here is `pub(crate)` — external callers reach these through
-//! the entry-point verbs ([`initialize`](super::initialize),
-//! [`plan_runtime`](super::plan_runtime), [`reap_run`](super::reap_run)),
-//! never by name. The trait boundary is the API; the impls are free to
-//! change shape.
-//!
-//! # Layout
-//!
-//! - [`image`] — per-run dev image node delegating to an
-//!   [`image::ImageProvider`](crate::backends::image::ImageProvider) backend.
-//! - [`seed`] — per-run content-addressed data seed PVCs.
-//! - [`scaffolding`] — generic K8s primitives (Namespace, node labels).
-//! - [`storage`] — cluster-wide storage/CSI stack (CRDs, controller,
-//!   driver, StorageClasses).
-//! - [`policy`] — run identity (SA + RBAC + token) and OpenShift policy
-//!   (SCC grant, registry project).
-//!
-//! # Adding a resource kind
-//!
-//! 1. Add a variant to [`NodeId`](super::NodeId).
-//! 2. Add a [`Provider`](super::Provider) impl in the appropriate submodule
-//!    (or create a new one for a fresh domain).
-//! 3. Register it in [`initialize`](super::initialize) (setup) or
-//!    [`plan_runtime`](super::plan_runtime) (per-run).
+//! To add a resource kind: add a [`NodeId`](super::NodeId) variant, a
+//! [`Provider`](super::Provider) impl in the right submodule, and register it in
+//! [`initialize`](super::initialize) or [`plan_runtime`](super::plan_runtime).
 
 pub(crate) mod base_images;
 pub(crate) mod buildkit;
 pub(crate) mod builder;
 pub(crate) mod image;
+pub(crate) mod mirror;
 pub(crate) mod policy;
 pub(crate) mod scaffolding;
 pub(crate) mod seed;

@@ -1,13 +1,7 @@
-//! Indexer backends: two traits.
-//!
-//!  - [`IndexerConfig`]: what a config ZST implements (e.g. `ZainoBackend`).
-//!    Config-time behaviour (NU ceiling, regtest materialization) plus the
-//!    factory that produces a live handle.
-//!  - [`IndexerBackend`]: what a live handle implements (e.g. `ZainoIndexer`),
-//!    the gRPC contract a test drives the indexer with. Backend-specific RPCs
-//!    (zaino's `get_block_nullifiers`, JSON-RPC proxy) are inherent methods on
-//!    the concrete handle, so calling one on the wrong backend is a compile
-//!    error.
+//! Indexer backends: [`IndexerConfig`] is the config ZST (config-time behaviour
+//! plus the factory for a live handle); [`IndexerBackend`] is the live handle's
+//! gRPC contract. Backend-specific RPCs are inherent methods on the concrete
+//! handle, so calling one on the wrong backend is a compile error.
 
 use std::time::Duration;
 
@@ -23,11 +17,9 @@ pub use crate::proto::{
     CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo, RawTransaction, SendResponse,
     SubtreeRoot, TreeState,
 };
-// ztest exposes the shielded-pool selector under the historical name
-// `ShieldedProtocol`; upstream renamed the enum to `ShieldedPool` (leaving a
-// deprecated `ShieldedProtocol` alias) in the orchard-0.15 line. Re-export the
-// live enum under the stable ztest name so the public API is unchanged and no
-// deprecation warning reaches consumers.
+// Upstream renamed `ShieldedProtocol` to `ShieldedPool` (deprecated alias) in
+// orchard-0.15; re-export the live enum under the historical name to keep the
+// public API stable and dodge the deprecation warning.
 pub use zcash_protocol::ShieldedPool as ShieldedProtocol;
 pub use zcash_protocol::TxId;
 pub use zcash_protocol::consensus::BlockHeight;
@@ -36,9 +28,8 @@ pub use zcash_protocol::value::ZatBalance;
 // ─────────────────────────── IndexerConfig ──────────────────────────
 
 /// The config ZST handed to the [`Indexer`](crate::component::Indexer)
-/// builder (e.g. `ZainoBackend`). Carries config-time behaviour (NU
-/// ceiling, regtest materialization) and the factory that produces a
-/// live [`IndexerBackend`].
+/// builder (e.g. `ZainoBackend`): config-time behaviour plus the factory that
+/// produces a live [`IndexerBackend`].
 pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
     /// The live handle type this backend produces.
     type Handle: IndexerBackend + Clone;
@@ -69,22 +60,17 @@ pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
 
 // ─────────────────────────── IndexerBackend ─────────────────────────
 
-/// The live indexer: every gRPC call a test drives it with.
-///
-/// The gRPC methods are all required: each backend implements the whole
-/// surface against its own endpoint. The convenience methods at the bottom are
-/// pure composition over those calls, provided once.
+/// The live indexer: every gRPC call a test drives it with. The gRPC methods
+/// are all required; the convenience methods at the bottom are composition over
+/// them.
 #[async_trait]
 pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
     /// Stable label string for the backend behind this handle.
     fn label(&self) -> &'static str;
 
     /// Build the Kubernetes [`PodSpec`](crate::manifest::PodSpec) for launching
-    /// this backend, given its resolved `opts` and assigned `pod_name`. Each
-    /// backend owns its image (resolved through its `image_uri`, honoring a
-    /// `dev!` override and failing loudly on a missing override), its ports,
-    /// ready port, and security context. This replaced the former
-    /// `manifest::pod_spec_for_indexer` label `match`.
+    /// this backend from its resolved `opts` and assigned `pod_name`. Each
+    /// backend owns its image, ports, ready port, and security context.
     fn pod_spec(
         &self,
         opts: &crate::component::ComponentOpts,
@@ -145,15 +131,13 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
         exclude_txid_suffixes: Vec<Vec<u8>>,
     ) -> Result<Vec<CompactTx>, RpcError>;
     async fn get_mempool_stream(&self) -> Result<Vec<RawTransaction>, RpcError>;
-    /// Submit a fully-serialized transaction (raw consensus bytes). ztest
-    /// relays the bytes as-is to the indexer's `SendTransaction` RPC. Building
-    /// and serializing a transaction is the wallet integration's job, so the
-    /// harness needn't link a transaction type.
+    /// Submit a fully-serialized transaction (raw consensus bytes), relayed
+    /// as-is to the indexer's `SendTransaction` RPC. Serializing the tx is the
+    /// wallet integration's job, so the harness needn't link a transaction type.
     async fn send_transaction(&self, raw_tx: &[u8]) -> Result<SendResponse, RpcError>;
     async fn get_transaction(&self, txid: TxId) -> Result<RawTransaction, RpcError>;
 
-    // Conveniences: composition over the methods above, implemented per
-    // backend (no default bodies, each handle spells its own).
+    // Conveniences: composition over the methods above, implemented per backend.
 
     /// The indexer's gRPC URI as a string (`http://host:port`).
     async fn grpc_uri(&self) -> Result<String, EnvError>;

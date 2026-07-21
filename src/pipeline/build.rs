@@ -1,23 +1,7 @@
-//! Phase B: `cargo nextest list`, run in two passes.
-//!
-//! Two cargo invocations are the compromise between showing the user cargo's
-//! compile output and parsing a stable JSON test list:
-//!
-//! 1. Compile pass: `cargo nextest list [args]` with stderr inherited and
-//!    stdout discarded. Cargo's stderr (`Fetching`, `Compiling foo`, warnings,
-//!    errors) flows to the terminal while test binaries build; the stdout text
-//!    listing is discarded to keep the scroll region clean.
-//! 2. Index pass: `cargo nextest list --message-format=json [args]` with stdout
-//!    piped and stderr discarded. The compile cache is warm from pass 1 so this
-//!    is sub-second (and JSON mode emits no progress). We parse the JSON for the
-//!    resolved test selection.
-//!
-//! On warm caches pass 1 is silent too. The banner's `Inventory` row carries the
-//! rolled-up status either way.
-//!
-//! Event timeline: [`Event::BuildStarted`] at entry, [`Event::BuildIndexing`]
-//! between passes, [`Event::BuildComplete`] on pass 2 OK with counts,
-//! [`Event::BuildFailed`] on either pass's non-zero exit (with the [`BuildStage`]).
+//! Phase B: `cargo nextest list`, run in two passes — a chatty compile pass
+//! (stderr inherited/relayed, stdout dropped) then a silent JSON index pass
+//! (stdout captured) — so the user sees compile output and we still parse a
+//! stable test list off a warm cache.
 
 use std::process::Stdio;
 
@@ -43,15 +27,11 @@ pub async fn run(
 ) -> std::io::Result<BuildOutcome> {
     let _ = tx.send(Event::BuildStarted);
 
-    // `list_args` is already the `cargo nextest list` argv: the caller
-    // (`cli::run::RunOptions`) stripped the engine-owned run-behavior flags
-    // (`--retries`, `--no-fail-fast`, `--no-cleanup`, …) that `list` would reject,
-    // leaving the selection / filter / build flags.
+    // `list_args` is already the `cargo nextest list` argv: the caller stripped
+    // the run-behavior flags (`--retries`, …) that `list` would reject.
 
-    // Pass 1: chatty compile. Cargo's stderr is what the user watches while test
-    // binaries build; stdout=null drops the human-readable listing. With `lines`
-    // set we pipe stderr and relay it line-by-line into scrollback; otherwise it's
-    // inherited.
+    // Pass 1: chatty compile. With `lines` set, stderr is piped and relayed into
+    // scrollback line-by-line; otherwise inherited.
     let pass1 = if let Some(lines) = lines {
         let mut child = Command::new("cargo")
             .arg("nextest")
@@ -139,12 +119,10 @@ pub async fn index(list_args: &[String]) -> std::io::Result<BuildOutcome> {
     parse_list_summary(&pass2.stdout)
 }
 
-/// Parse `cargo nextest list --message-format=json` output into a
-/// [`BuildOutcome::Ok`]. Split from [`index`]'s local subprocess so the
-/// on-cluster compile path ([`crate::pipeline::remote_compile`]) can reuse the
-/// exact same parse on the JSON a builder pod returns — the `binary_path`/`cwd`
-/// in the summary are then the pod's paths, which is precisely what the
-/// baked-image pod execution needs.
+/// Parse `cargo nextest list --message-format=json` into a [`BuildOutcome::Ok`].
+/// Split from [`index`] so the on-cluster path ([`crate::pipeline::remote_compile`])
+/// reuses the same parse on a builder pod's JSON, where `binary_path`/`cwd` are
+/// the pod's paths.
 pub fn parse_list_summary(stdout: &[u8]) -> std::io::Result<BuildOutcome> {
     let summary: TestListSummary = serde_json::from_slice(stdout).map_err(|err| {
         std::io::Error::new(
@@ -162,15 +140,10 @@ pub fn parse_list_summary(stdout: &[u8]) -> std::io::Result<BuildOutcome> {
     })
 }
 
-/// Walk the resolved test list once, picking out the binaries with at least one
-/// selected test (and their selected test names) plus the total selected-test
-/// count.
-///
-/// A test case is selected when its `filter_match` `is_match`; filtered-out tests
-/// are present in the JSON but flagged non-matching. Empty suites are dropped, so
-/// the caller derives the binary count from the vec. Each binary carries the
-/// `cwd` nextest reports (so the inventory-dump subprocess inherits the right
-/// working directory) and the `<bin> --exact <name>` targets the engine runs.
+/// Pick out the binaries with at least one selected test (`filter_match.is_match`)
+/// plus their test names and the total selected-test count. Empty suites are
+/// dropped. Each binary carries the `cwd` nextest reports, so the inventory-dump
+/// subprocess inherits the right working directory.
 fn summarize_selection(summary: &TestListSummary) -> (usize, Vec<SelectedBinary>) {
     let mut test_count = 0;
     let mut binaries = Vec::new();
@@ -202,14 +175,10 @@ pub enum BuildOutcome {
     Ok {
         test_count: usize,
         binary_count: usize,
-        /// Test binaries with at least one selected test, in the order nextest
-        /// reported them. The image-inventory phase spawns each with
-        /// `ZTEST_DUMP_INVENTORY=1`.
+        /// Test binaries with at least one selected test, in nextest's order.
         selected_binaries: Vec<SelectedBinary>,
-        /// Full parsed `cargo nextest list` summary. The engine
-        /// (`engine::nextest`) reconstructs an owned `TestList` from it
-        /// (`TestList::from_summary`) to resolve per-test config (retries,
-        /// slow-timeout) and drive nextest's reporter. Boxed because it dwarfs
+        /// Full parsed summary; the engine rebuilds an owned `TestList` from it
+        /// to resolve per-test config and drive the reporter. Boxed as it dwarfs
         /// the other fields.
         summary: Box<TestListSummary>,
     },
@@ -219,22 +188,16 @@ pub enum BuildOutcome {
     },
 }
 
-/// One test binary with at least one selected test. Carries what the
-/// image-inventory phase needs to spawn the dump.
+/// One test binary with at least one selected test.
 #[derive(Debug, Clone)]
 pub struct SelectedBinary {
-    /// Absolute path to the test binary on disk.
     pub binary_path: std::path::PathBuf,
-    /// Working directory nextest would run this binary in. Keeps the `dev!`
-    /// macro's compile-time absolute paths and the dump-time `current_dir` in
-    /// agreement.
+    /// Working directory nextest runs this binary in; keeps the `dev!` macro's
+    /// compile-time absolute paths and the dump-time `current_dir` in agreement.
     pub cwd: std::path::PathBuf,
-    /// Nextest's binary identifier (`<package>::<bin>`). Also the key the QoS
-    /// dump (`pipeline::images::discover`) groups by, so the engine can match a
-    /// test's tier to its binary.
+    /// Nextest's binary identifier (`<package>::<bin>`); also the key the QoS
+    /// dump groups by, so the engine can match a test's tier to its binary.
     pub binary_id: String,
-    /// Selected test names in this binary (`filter_match` true): the
-    /// `<bin> --exact <name>` targets. Populated for the engine (`src/engine`);
-    /// the nextest path ignores it.
+    /// Selected test names: the `<bin> --exact <name>` targets the engine runs.
     pub selected_tests: Vec<String>,
 }

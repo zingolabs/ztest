@@ -28,6 +28,13 @@ pub enum EnvError {
         elapsed: Duration,
     },
 
+    /// A dependency pod entered an unrecoverable state, so the readiness wait
+    /// fails fast rather than waiting out its deadline. Distinct from
+    /// [`RpcTimeout`](Self::RpcTimeout) (pod ran but never opened its port) and
+    /// from a merely-`Pending` pod (queued on capacity, never a failure).
+    #[error("{component} pod failed to start: {reason}")]
+    PodFailed { component: String, reason: String },
+
     #[error("archive materialize failed for {}: {reason}", archive.display())]
     ArchiveMaterializeFailed { archive: PathBuf, reason: String },
 
@@ -57,22 +64,18 @@ pub enum EnvError {
         source: crate::backends::image::ImageError,
     },
 
-    /// A handle method was called before `env.build()`. Components only
-    /// exist in the cluster after `build()` returns, so handle RPCs
-    /// before that point are programming errors.
+    /// A handle method was called before `env.build()`; components only exist
+    /// after `build()` returns.
     #[error("TestEnv has not been built yet; call env.build().await before using handles")]
     NotBuilt,
 
-    /// A handle's underlying `TestEnv` was dropped (or explicit
-    /// `teardown()` ran) before the handle was used. Holding a handle
-    /// across the env's lifetime is the test author's responsibility.
+    /// A handle's underlying `TestEnv` was dropped before the handle was used.
     #[error("TestEnv was dropped or torn down; handle is no longer usable")]
     EnvDropped,
 
-    /// A handle referenced a component id the (live, built) env has no record
-    /// of. Every issued handle's component is registered during `build`, so
-    /// this is an internal invariant violation, not a user error. Distinct from
-    /// [`EnvDropped`](Self::EnvDropped), where the env is gone entirely.
+    /// A handle referenced a component id the built env has no record of — an
+    /// internal invariant violation (every issued handle is registered during
+    /// `build`), not a user error.
     #[error("internal error: no component registered for handle id {id}")]
     UnknownComponent { id: u64 },
 
@@ -82,9 +85,8 @@ pub enum EnvError {
 
 /// Errors raised by typed RPC sugar (`generate_blocks`, `tip`, etc.).
 ///
-/// Variants carry structured `component` / `op` fields so test code can match
-/// on the kind of failure (network vs. decode vs. timeout) without parsing
-/// strings, and surface the underlying wire error via `source()`.
+/// Structured `component` / `op` fields let test code match on the failure kind
+/// without parsing strings; the wire error is available via `source()`.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
     /// A backend RPC call failed at the wire level. `source` is the

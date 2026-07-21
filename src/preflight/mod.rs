@@ -1,24 +1,12 @@
 //! Preflight banner: session-startup status surface for the ztest harness.
 //!
-//! Drives the bottom status panel [`cli::run`](crate::cli::run) keeps pinned
-//! through a `ztest run` session: the compact [`render_preflight_panel`] /
-//! [`render_live_panel`] panels on a TTY, and the full [`render`](render())
-//! banner printed once for the log on a non-TTY (CI) run. Output style is
-//! aligned with `cargo nextest`'s own reporter (same colour palette, glyph set,
-//! and right-aligned 12-column action-label convention) so the block reads as a
-//! continuation of nextest's startup banner rather than a parallel UI.
-//!
-//! Layers:
-//! - [`theme`]: colour palette and glyph table; one `Theme::detect()`
-//!   constructor handles `NO_COLOR` / TTY / Unicode-support gating.
-//! - [`render`]: pure formatters. Take a fully-known [`BannerState`] (plus, for
-//!   the panels, live run state) and a [`Theme`], produce a `String`. No I/O, no
-//!   async. [`render`](render()) is the full banner; [`render_preflight_panel`]
-//!   and [`render_live_panel`] are the compact bottom-console panels for the
-//!   preflight and run phases.
-//!
-//! The terminal mechanics that display these strings (pinning a panel, forwarding
-//! output into native scrollback) live in [`cli::console`](crate::cli::console).
+//! [`theme`] holds the palette and glyph table; [`render`] holds pure
+//! formatters that turn a [`BannerState`] and [`Theme`] into a `String` (the
+//! full [`render`](render()) banner for non-TTY/CI logs, the compact
+//! [`render_preflight_panel`] / [`render_live_panel`] panels for a TTY). Output
+//! is aligned with `cargo nextest`'s reporter so it reads as a continuation of
+//! its banner. The terminal mechanics that display these strings live in
+//! [`cli::console`](crate::cli::console).
 //!
 //! Spec: [`docs/running-tests.md#preflight`].
 //!
@@ -37,11 +25,8 @@ pub use crate::qos::schedule::{QosPlan, TierPlan};
 
 // ─────────────────────────── data model ───────────────────────────────
 
-/// Everything the banner needs to produce one frame.
-///
-/// Built up by the live preflight loop and passed by value to [`render`].
-/// Future-feature rows (tier, queue, reservation) are [`FutureRow`] entries so
-/// they render as `not yet implemented` placeholders without changing the layout.
+/// Everything the banner needs to produce one frame. Built up by the live
+/// preflight loop and passed by value to [`render`].
 #[derive(Debug, Clone)]
 pub struct BannerState {
     pub cluster: ClusterState,
@@ -51,27 +36,24 @@ pub struct BannerState {
     /// F1–F5 placeholder rows, rendered between snapshots and the
     /// bottom rule.
     pub future: Vec<FutureRow>,
-    /// The QoS scheduling plan (per-tier counts, wave estimate vs capacity,
-    /// unschedulable warnings); `Some` once the inventory dump and probe have
-    /// landed. Rendered as the `Scheduling` block. The live during-run
-    /// reservation view is a deferred follow-up (noted in the block).
+    /// The QoS scheduling plan; `Some` once the inventory dump and probe have
+    /// landed. Rendered as the `Scheduling` block.
     pub qos_plan: Option<QosPlan>,
 }
 
 /// Phase-B status. Owns the `Inventory` row of the banner.
 ///
-/// Two passes of `cargo nextest list`: a chatty compile pass (`Compiling`) where
-/// cargo's stderr is inherited so the user sees fetch / compile / warning output,
-/// then a silent JSON parse pass (`Indexing`) that yields the test count.
+/// Two passes of `cargo nextest list`: a chatty compile pass (`Compiling`, with
+/// cargo's stderr inherited) then a silent JSON parse pass (`Indexing`) that
+/// yields the test count.
 #[derive(Debug, Clone)]
 pub enum BuildState {
     /// Phase B hasn't started yet.
     Pending,
-    /// First cargo invocation running (compile pass). `started_at` lets the
-    /// renderer display elapsed seconds. `phase`, when set, overrides the
-    /// generic "compiling test binaries…" label so the on-cluster path can name
-    /// its current sub-phase (waiting / syncing / compiling / dumping / baking)
-    /// on the one live row, resetting the timer at each transition.
+    /// First cargo invocation running (compile pass). `started_at` drives the
+    /// elapsed display. `phase`, when set, overrides the generic label so the
+    /// on-cluster path can name its current sub-phase on the one live row,
+    /// resetting the timer at each transition.
     Compiling {
         started_at: std::time::Instant,
         phase: Option<String>,
@@ -128,11 +110,9 @@ pub struct ArchiveRow {
 pub enum ArchiveStatus {
     /// PVC labelled `seeds.ztest.io/ready=true`.
     Cached { size_bytes: u64 },
-    /// PVC absent or not ready; bytes streaming in.
-    ///
-    /// `bytes_total` is the LFS pointer's `size=` value, known up front.
-    /// `bytes_done` is the running byte count from the reconcile-Job's log stream.
-    /// Percent is derived for display; callers need not keep it in sync.
+    /// PVC absent or not ready; bytes streaming in. `bytes_total` is the LFS
+    /// pointer's `size=`; `bytes_done` is the running count from the
+    /// reconcile-Job's log stream. Percent is derived for display.
     Downloading {
         source: DownloadSource,
         bytes_done: u64,
@@ -200,16 +180,10 @@ pub struct FutureRow {
 
 // ─────────────────────────── transfers (right column) ─────────────────
 
-/// The right-column model: the set of heavy background acquisitions currently in
-/// flight (archive/seed downloads, dev-image build+load). Session-long and
-/// phase-independent — a transfer that starts during preflight can still be
-/// finishing while the left column has moved on to the build or run phase. Fed by
-/// the resource-graph executor's state transitions plus per-provider progress
-/// notes; rendered by [`render_transfers`](render::render_transfers).
-///
-/// Only *in-flight* and *failed* rows are retained: a completed transfer leaves
-/// the column (its result is a one-line summary in scrollback), so the column
-/// always reflects live work.
+/// The right-column model: background acquisitions in flight (archive/seed
+/// downloads, dev-image build+load). Session-long and phase-independent. Only
+/// *in-flight* and *failed* rows are retained; a completed transfer leaves the
+/// column (its result becomes a one-line summary in scrollback).
 #[derive(Debug, Clone, Default)]
 pub struct Transfers {
     pub rows: Vec<TransferRow>,

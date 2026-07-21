@@ -1,28 +1,19 @@
 //! The broker's pure admission/scheduling core.
 //!
-//! [`Scheduler`] owns the live capacity model and decides what to admit. It is
-//! pure: no async, no sockets, no kube, no clock, no randomness. The queue
-//! tiebreak of "request_time asc" is a monotonic [`Scheduler`]-owned sequence
-//! counter, and lease ids are a monotonic counter too, so the whole engine is
-//! a deterministic function of its inputs, unit-testable without a cluster.
+//! [`Scheduler`] owns the live capacity model (one whole-cluster 4-D figure; no
+//! per-pool partition) and decides what to admit. Pure — no async/kube/clock/
+//! randomness, both the queue tiebreak and lease ids are monotonic counters — so
+//! the engine is a deterministic function of its inputs, testable without a
+//! cluster.
 //!
-//! Capacity is a single whole-cluster figure (CPU × RAM). There is no per-pool
-//! partition: the general/NVMe distinction is Kubernetes placement (node
-//! taints + pod tolerations applied to pod specs); the scheduler admits
-//! against the one global capacity and lets k8s place the pods.
-//!
-//! Policy is greedy priority admission with backfill (`docs/qos-design.md`
-//! §5.5): on every schedule pass, scan the queue in `(priority desc, seq asc)`
-//! order and admit each request that fits both the live 2-D capacity and its
-//! ServiceAccount's remaining budget, continuing past a non-fitting request so
-//! a smaller, lower-priority one can backfill the gap. A request that cannot
-//! fit even an empty cluster, or that alone exceeds its SA's total budget, is
-//! rejected (fail fast, §5.5/§5.6/§8); one blocked only by current contention
-//! or an SA at quota is queued.
-//!
-//! Deadlock-free: a queued request reserves nothing until a single atomic
-//! [`Grant`] of its whole footprint (no hold-and-wait, hence no circular wait,
-//! §5.5). Queueing a request never changes [`Scheduler::free`].
+//! Policy (`docs/qos-design.md` §5.5): greedy priority admission with backfill.
+//! Each pass scans the queue `(priority desc, seq asc)` and admits every request
+//! that fits live 4-D capacity and its SA's remaining budget, continuing past a
+//! non-fitting one so a smaller request backfills. A request that can't fit an
+//! empty cluster or exceeds its SA's whole budget is rejected (fail fast); one
+//! blocked only by contention or an SA at quota is queued. Deadlock-free: a
+//! queued request reserves nothing until one atomic [`Grant`] of its whole
+//! footprint (no hold-and-wait).
 
 use std::collections::HashMap;
 
@@ -231,7 +222,7 @@ impl Scheduler {
         // yields at most this grant. Match by identity in case that invariant
         // ever changes.
         let grants = self.schedule_pass();
-        debug_assert!(grants.len() <= 1, "fresh enqueue admitted >1 request");
+        assert!(grants.len() <= 1, "fresh enqueue admitted >1 request");
         match grants
             .into_iter()
             .find(|g| g.binary_id == binary_id && g.test_name == test_name)
@@ -277,7 +268,7 @@ impl Scheduler {
 
     // ── Inspection (tests + future live display) ───────────────────────
 
-    /// Free 2-D capacity: `available - committed`, floored at zero per
+    /// Free capacity: `available - committed`, floored at zero per
     /// dimension.
     pub fn free(&self) -> Resources {
         self.available.saturating_sub(&self.committed)
@@ -346,6 +337,16 @@ impl Scheduler {
     /// Commit a request: mint a lease, charge capacity and the SA, return the
     /// grant. The caller has already verified [`fits_now`].
     fn admit(&mut self, req: Request) -> Grant {
+        // The "no overload" safety property: admitting must never push committed
+        // past the ceiling. `fits_now` (the only caller) guarantees it; guarded
+        // live so a regression aborts rather than overcommits a real cluster.
+        assert!(
+            req.footprint.fits_within(&self.available.saturating_sub(&self.committed)),
+            "admit: footprint {:?} does not fit free capacity {:?} — fits_now precondition violated",
+            req.footprint,
+            self.available.saturating_sub(&self.committed),
+        );
+
         let lease_id = LeaseId(self.next_lease_id);
         self.next_lease_id += 1;
 
@@ -378,7 +379,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qos::GIB;
+    use crate::qos::{GIB, MIB};
 
     // ── Test helpers ───────────────────────────────────────────────────
 
@@ -388,7 +389,7 @@ mod tests {
             binary_id: "bin".into(),
             test_name: name.into(),
             sa: "acme".into(),
-            footprint: Resources::new(cpu_milli, mem_bytes),
+            footprint: Resources::new(cpu_milli, mem_bytes, 0, 0),
             priority,
         }
     }
@@ -402,7 +403,7 @@ mod tests {
 
     /// A roomy 8-CPU / 16Gi cluster.
     fn sched() -> Scheduler {
-        Scheduler::new(Resources::new(8_000, 16 * GIB))
+        Scheduler::new(Resources::new(8_000, 16 * GIB, 0, 0))
     }
 
     // ── Single fit ─────────────────────────────────────────────────────
@@ -414,10 +415,10 @@ mod tests {
         let a = s.request(req("t", 1_000, GIB, 0));
         assert!(matches!(a, Admission::Granted(_)));
         assert_eq!(s.active_leases(), 1);
-        assert_eq!(s.committed(), Resources::new(1_000, GIB));
+        assert_eq!(s.committed(), Resources::new(1_000, GIB, 0, 0));
         assert_eq!(
             s.free(),
-            before.checked_sub(&Resources::new(1_000, GIB)).unwrap()
+            before.checked_sub(&Resources::new(1_000, GIB, 0, 0)).unwrap()
         );
     }
 
@@ -435,7 +436,7 @@ mod tests {
         assert_eq!(s.active_leases(), 0);
     }
 
-    // ── 2-D gating (both dimensions independently) ─────────────────────
+    // ── Per-dimension gating (each dimension independently) ────────────
 
     #[test]
     fn request_fitting_cpu_but_not_memory_queues() {
@@ -451,9 +452,48 @@ mod tests {
     fn request_fitting_memory_but_not_cpu_queues() {
         // 16 CPU / 16Gi. Occupy 10 CPU so only 6 remain; a 16 CPU ask
         // exceeds free CPU but not available, so it queues.
-        let mut s = Scheduler::new(Resources::new(16_000, 16 * GIB));
+        let mut s = Scheduler::new(Resources::new(16_000, 16 * GIB, 0, 0));
         let _occ = lease_of(s.request(req("occ", 10_000, GIB, 0)));
         assert_eq!(s.request(req("t", 16_000, GIB, 0)), Admission::Queued);
+    }
+
+    #[test]
+    fn request_fitting_cpu_and_memory_but_not_io_bandwidth_queues() {
+        // A footprint that fits CPU and memory with room to spare must still
+        // queue when the I/O-bandwidth dimension is exhausted — the dimension
+        // the 2-D packer could not see.
+        let io_req = |name: &str, io_bps: u64| Request {
+            binary_id: "bin".into(),
+            test_name: name.into(),
+            sa: "acme".into(),
+            footprint: Resources::new(1_000, GIB, io_bps, 0),
+            priority: 0,
+        };
+        // 8 CPU / 16Gi / 500 MB/s. Occupy 400 MB/s; only 100 free.
+        let mut s = Scheduler::new(Resources::new(8_000, 16 * GIB, 500 * MIB, 0));
+        let _occ = lease_of(s.request(io_req("occ", 400 * MIB)));
+        assert_eq!(s.request(io_req("t", 300 * MIB)), Admission::Queued);
+        assert_eq!(s.queue_len(), 1);
+        // A request within the remaining 100 MB/s still fits.
+        assert!(matches!(
+            s.request(io_req("small", 100 * MIB)),
+            Admission::Granted(_)
+        ));
+    }
+
+    #[test]
+    fn request_fitting_all_else_but_not_io_iops_queues() {
+        // The IOPS dimension gates independently of bandwidth.
+        let iops_req = |name: &str, io_iops: u64| Request {
+            binary_id: "bin".into(),
+            test_name: name.into(),
+            sa: "acme".into(),
+            footprint: Resources::new(1_000, GIB, 0, io_iops),
+            priority: 0,
+        };
+        let mut s = Scheduler::new(Resources::new(8_000, 16 * GIB, 0, 10_000));
+        let _occ = lease_of(s.request(iops_req("occ", 8_000)));
+        assert_eq!(s.request(iops_req("t", 5_000)), Admission::Queued);
     }
 
     // ── Atomic, whole-footprint grant ──────────────────────────────────
@@ -461,7 +501,7 @@ mod tests {
     #[test]
     fn grant_consumes_whole_footprint_atomically() {
         let mut s = sched();
-        let fp = Resources::new(3_000, 5 * GIB);
+        let fp = Resources::new(3_000, 5 * GIB, 0, 0);
         let before = s.free();
         lease_of(s.request(req("t", fp.cpu_milli, fp.mem_bytes, 0)));
         assert_eq!(s.free(), before.checked_sub(&fp).unwrap());
@@ -528,7 +568,7 @@ mod tests {
 
     #[test]
     fn release_backfills_multiple_queued_requests() {
-        let mut s = Scheduler::new(Resources::new(6_000, 12 * GIB));
+        let mut s = Scheduler::new(Resources::new(6_000, 12 * GIB, 0, 0));
         let big = lease_of(s.request(req("testnet", 6_000, 12 * GIB, 2)));
         assert_eq!(
             s.request(req("basic-a", 3_000, 6 * GIB, 0)),
@@ -558,11 +598,11 @@ mod tests {
         // Ceiling 8 CPU; 6 already committed, 2 free. A 4-CPU footprint fits
         // the ceiling but not free-right-now: it must wait, not fail fast.
         let v = decide(
-            Resources::new(8_000, 16 * GIB), // available = ceiling
-            Resources::new(6_000, 12 * GIB), // committed
+            Resources::new(8_000, 16 * GIB, 0, 0), // available = ceiling
+            Resources::new(6_000, 12 * GIB, 0, 0), // committed
             Resources::ZERO,                 // sa_usage
             None,                            // sa_budget
-            Resources::new(4_000, 8 * GIB),  // footprint
+            Resources::new(4_000, 8 * GIB, 0, 0),  // footprint
         );
         assert_eq!(v, Verdict::Queue);
     }
@@ -572,11 +612,11 @@ mod tests {
         // Same footprint, ceiling now too small in the memory dimension:
         // genuinely unschedulable however many committed leases finish.
         let v = decide(
-            Resources::new(8_000, 4 * GIB),
+            Resources::new(8_000, 4 * GIB, 0, 0),
             Resources::ZERO,
             Resources::ZERO,
             None,
-            Resources::new(4_000, 8 * GIB),
+            Resources::new(4_000, 8 * GIB, 0, 0),
         );
         assert_eq!(v, Verdict::Reject(RejectReason::ExceedsClusterCapacity));
     }
@@ -584,11 +624,11 @@ mod tests {
     #[test]
     fn decide_fits_on_empty_ceiling() {
         let v = decide(
-            Resources::new(8_000, 16 * GIB),
+            Resources::new(8_000, 16 * GIB, 0, 0),
             Resources::ZERO,
             Resources::ZERO,
             None,
-            Resources::new(4_000, 8 * GIB),
+            Resources::new(4_000, 8 * GIB, 0, 0),
         );
         assert_eq!(v, Verdict::Fits);
     }
@@ -610,7 +650,7 @@ mod tests {
     #[test]
     fn request_larger_than_sa_budget_is_rejected() {
         let mut s = sched();
-        s.set_sa_budget("acme", Resources::new(2_000, 2 * GIB));
+        s.set_sa_budget("acme", Resources::new(2_000, 2 * GIB, 0, 0));
         assert_eq!(
             s.request(req("t", 4_000, GIB, 0)),
             Admission::Rejected(RejectReason::ExceedsSaBudget)
@@ -622,7 +662,7 @@ mod tests {
     #[test]
     fn request_within_budget_but_sa_at_quota_queues_then_admits_on_release() {
         let mut s = sched();
-        s.set_sa_budget("acme", Resources::new(4_000, 8 * GIB));
+        s.set_sa_budget("acme", Resources::new(4_000, 8 * GIB, 0, 0));
         let first = lease_of(s.request(req("first", 3_000, 6 * GIB, 0)));
         assert_eq!(
             s.request(req("second", 3_000, 6 * GIB, 0)),
@@ -638,8 +678,8 @@ mod tests {
     #[test]
     fn admission_requires_both_cluster_and_sa_budget() {
         // Cluster: 10 CPU. SA budget: 5 CPU.
-        let mut s = Scheduler::new(Resources::new(10_000, 20 * GIB));
-        s.set_sa_budget("acme", Resources::new(5_000, 10 * GIB));
+        let mut s = Scheduler::new(Resources::new(10_000, 20 * GIB, 0, 0));
+        s.set_sa_budget("acme", Resources::new(5_000, 10 * GIB, 0, 0));
         // Fits SA but not cluster free: another SA hogs 8 CPU first.
         let hog = Request {
             sa: "other".into(),
@@ -657,7 +697,7 @@ mod tests {
 
     #[test]
     fn disconnect_reclaims_capacity_like_release() {
-        let mut s = Scheduler::new(Resources::new(4_000, 8 * GIB));
+        let mut s = Scheduler::new(Resources::new(4_000, 8 * GIB, 0, 0));
         let id = lease_of(s.request(req("dies", 4_000, 8 * GIB, 0)));
         assert_eq!(
             s.request(req("waits", 4_000, 8 * GIB, 0)),
@@ -677,11 +717,11 @@ mod tests {
         let _occ = lease_of(s.request(req("occ", 6_000, 12 * GIB, 0)));
         assert_eq!(s.request(req("t", 4_000, 8 * GIB, 0)), Admission::Queued);
         // No-op reconcile (same value) admits nothing.
-        assert!(s.reconcile(Resources::new(8_000, 16 * GIB)).is_empty());
+        assert!(s.reconcile(Resources::new(8_000, 16 * GIB, 0, 0)).is_empty());
         assert_eq!(s.queue_len(), 1);
         // External capacity appears, available grows, and the queued request
         // backfills without any lease releasing.
-        let grants = s.reconcile(Resources::new(16_000, 32 * GIB));
+        let grants = s.reconcile(Resources::new(16_000, 32 * GIB, 0, 0));
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].test_name, "t");
     }
@@ -690,7 +730,7 @@ mod tests {
     fn reconcile_shrink_does_not_preempt_running_leases() {
         let mut s = sched();
         let _id = lease_of(s.request(req("running", 6_000, 12 * GIB, 0)));
-        let grants = s.reconcile(Resources::new(4_000, 8 * GIB));
+        let grants = s.reconcile(Resources::new(4_000, 8 * GIB, 0, 0));
         assert!(grants.is_empty());
         assert_eq!(s.active_leases(), 1, "running lease is not preempted");
         assert_eq!(s.free(), Resources::ZERO);
@@ -717,7 +757,7 @@ mod tests {
     #[test]
     fn identical_op_sequences_yield_identical_results() {
         fn run() -> (Vec<Admission>, Vec<String>) {
-            let mut s = Scheduler::new(Resources::new(8_000, 16 * GIB));
+            let mut s = Scheduler::new(Resources::new(8_000, 16 * GIB, 0, 0));
             let admissions = vec![
                 s.request(req("a", 4_000, 4 * GIB, 0)),
                 s.request(req("b", 4_000, 4 * GIB, 2)),
@@ -747,17 +787,29 @@ mod props {
     /// lease when one exists.
     #[derive(Debug, Clone)]
     enum Op {
-        Request { cpu: u64, mem_mib: u64, prio: u8 },
-        Release { which: usize },
+        Request {
+            cpu: u64,
+            mem_mib: u64,
+            io_mbps: u64,
+            io_kiops: u64,
+            prio: u8,
+        },
+        Release {
+            which: usize,
+        },
     }
 
     fn op() -> impl Strategy<Value = Op> {
         prop_oneof![
-            (1u64..=4_000, 1u64..=8_192, 0u8..=3).prop_map(|(cpu, mem_mib, prio)| Op::Request {
-                cpu,
-                mem_mib,
-                prio
-            }),
+            (1u64..=4_000, 1u64..=8_192, 0u64..=400, 0u64..=50, 0u8..=3).prop_map(
+                |(cpu, mem_mib, io_mbps, io_kiops, prio)| Op::Request {
+                    cpu,
+                    mem_mib,
+                    io_mbps,
+                    io_kiops,
+                    prio
+                }
+            ),
             (0usize..256).prop_map(|which| Op::Release { which }),
         ]
     }
@@ -767,13 +819,16 @@ mod props {
 
         /// The headline safety property (A/B "no overload", machine-checked):
         /// for *any* sequence of request/release ops, committed capacity never
-        /// exceeds the ceiling in either dimension, and the scheduler's own
-        /// accounting stays exactly consistent with the set of live leases.
+        /// exceeds the ceiling in *any* of the four dimensions (CPU, memory,
+        /// disk bandwidth, disk IOPS), and the scheduler's own accounting stays
+        /// exactly consistent with the set of live leases. The ceiling is finite
+        /// in every dimension and the generator emits I/O demands, so the
+        /// invariant genuinely exercises I/O gating, not just CPU×memory.
         #[test]
         fn committed_never_exceeds_ceiling_under_any_op_sequence(
             ops in proptest::collection::vec(op(), 1..80)
         ) {
-            let ceiling = Resources::new(8_000, 16 * 1024 * MIB);
+            let ceiling = Resources::new(8_000, 16 * 1024 * MIB, 800 * MIB, 100_000);
             let mut s = Scheduler::new(ceiling);
 
             // Independent mirror of what *should* be committed, rebuilt from the
@@ -785,10 +840,10 @@ mod props {
 
             for o in ops {
                 match o {
-                    Op::Request { cpu, mem_mib, prio } => {
+                    Op::Request { cpu, mem_mib, io_mbps, io_kiops, prio } => {
                         let name = format!("t{seq}");
                         seq += 1;
-                        let fp = Resources::new(cpu, mem_mib * MIB);
+                        let fp = Resources::new(cpu, mem_mib * MIB, io_mbps * MIB, io_kiops * 1_000);
                         footprint_of.insert(name.clone(), fp);
                         let req = Request {
                             binary_id: "b".into(),

@@ -1,14 +1,8 @@
-//! Wallet backends: two traits.
-//!
-//!  - [`WalletConfig`]: what a config ZST implements (e.g. `ZingoBackend`).
-//!    The factory that produces a live handle, plus the (usually trivial) NU
-//!    ceiling.
-//!  - [`WalletBackend`]: what a live handle implements (e.g. `ZingoWallet`),
-//!    the in-process wallet contract. Backends run in-process in the test
-//!    binary (libraries that connect to the indexer over its gRPC endpoint),
-//!    so a wallet component gets no pod. The concrete wallet implementation
-//!    (zingolib, etc.) lives in the consumer crate, so no wallet-library types
-//!    enter ztest.
+//! Wallet backends: [`WalletConfig`] is the config ZST (factory plus NU
+//! ceiling); [`WalletBackend`] is the live in-process wallet contract. Backends
+//! run in-process in the test binary, so a wallet component gets no pod, and
+//! the concrete impl (zingolib, etc.) lives in the consumer crate, so no
+//! wallet-library types enter ztest.
 
 use std::time::Duration;
 
@@ -25,9 +19,9 @@ use crate::handles::validator::ValidatorBackend;
 use crate::topology::NetworkUpgrade;
 
 /// Boxed error reported by a [`WalletBackend`] method. Third-party backends
-/// live in other crates and can't construct ztest's `pub(crate)` `RpcError`
-/// variants, so they report failures as a boxed `std::error::Error`; ztest
-/// re-wraps them into [`RpcError::Backend`] at the handle boundary.
+/// can't construct ztest's `pub(crate)` `RpcError` variants, so they report a
+/// boxed `std::error::Error`; ztest re-wraps it into [`RpcError::Backend`] at
+/// the handle boundary.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Value-pool selector.
@@ -35,9 +29,9 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub enum Pool {
     Orchard,
     /// Ironwood — the NU6.3 shielded pool. Orchard-based (same note/action
-    /// structure, its own commitment tree); addressed via a unified address like
-    /// Orchard, and from NU6.3 unified-address receipts (and the Orchard-receiver
-    /// mining reward) route here rather than to Orchard.
+    /// structure, its own commitment tree); from NU6.3, unified-address
+    /// receipts and the Orchard-receiver mining reward route here rather than
+    /// to Orchard.
     Ironwood,
     Sapling,
     Transparent,
@@ -69,8 +63,8 @@ impl PoolBalances {
     }
 }
 
-/// Opaque per-backend account identifier. One account is one lightclient
-/// wallet; the backend assigns the id when [`WalletBackend::add_account`]
+/// Opaque per-backend account identifier (one account = one lightclient
+/// wallet), assigned by the backend when [`WalletBackend::add_account`]
 /// succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AccountId(pub u32);
@@ -241,10 +235,8 @@ const COINBASE_MATURITY: u32 = 100;
 const FAUCET_MATURITY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Backend-agnostic wallet conveniences, built purely on [`WalletBackend`]
-/// primitives (`add_account` / `sync` / `send` / `shield` / `balances`) plus the
-/// running validator and indexer: the well-known seeds, a synced recipient, and
-/// a funded faucet. Auto-implemented for every wallet backend, so a test drives
-/// any backend through the same API.
+/// primitives plus the running validator and indexer: the well-known seeds, a
+/// synced recipient, and a funded faucet. Auto-implemented for every backend.
 #[async_trait]
 pub trait WalletExt: WalletBackend {
     /// Build an account from `mnemonic`: derive activation heights from
@@ -320,10 +312,9 @@ pub trait WalletExt: WalletBackend {
     }
 
     /// A synced faucet holding at least `notes` independent spendable shielded
-    /// notes, funded from the validator's coinbase. Shielded coinbase
-    /// (zcashd/Sapling, or zebrad via `mine_to`) is spendable immediately, one
-    /// note per block. Transparent coinbase (zebrad default) is matured then
-    /// shielded into Orchard, once per requested note.
+    /// notes, funded from the validator's coinbase. A shielded coinbase is
+    /// spendable immediately (one note per block); a transparent coinbase
+    /// (zebrad default) is matured then shielded into Orchard, once per note.
     async fn funded_faucet_with_notes<V, I>(
         &self,
         validator: &V,
@@ -337,16 +328,10 @@ pub trait WalletExt: WalletBackend {
         let faucet = self.faucet(validator, indexer).await?;
         match validator.pool_support().coinbase {
             Pool::Orchard | Pool::Ironwood | Pool::Sapling => {
-                // An Orchard/Ironwood coinbase is invalid before NU5 — the miner
-                // cannot build a shielded-pool output "without an Orchard anchor" —
-                // and the faucet's miner address pins the coinbase pool at config
-                // time, so the first note-bearing block must land at height >= NU5.
-                // Advance past NU5 first, mirroring upstream `zcash_local_net`'s
-                // launch pre-mine. Sapling activates at height 1, so its coinbase
-                // needs no warmup. (Ironwood is Orchard-based: with NU6.3 active
-                // the Orchard-receiver coinbase reward is routed to the Ironwood
-                // pool, but the miner address and its NU5 anchor requirement are
-                // the Orchard path's.)
+                // An Orchard/Ironwood coinbase is invalid before NU5 (no anchor),
+                // so warm up past NU5 before mining note-bearing blocks. Sapling
+                // activates at height 1 and needs no warmup. Ironwood rides the
+                // Orchard path (same NU5 anchor requirement).
                 if matches!(
                     validator.pool_support().coinbase,
                     Pool::Orchard | Pool::Ironwood
@@ -364,18 +349,14 @@ pub trait WalletExt: WalletBackend {
 }
 
 /// Advance the chain so the next mined block is at or after NU5 activation,
-/// making a subsequent Orchard coinbase valid. Mirrors upstream
-/// `zcash_local_net`'s launch pre-mine: the pre-NU5 blocks carry the miner
-/// address's lower-priority (transparent) receiver, and the faucet's Orchard
-/// notes come from the post-NU5 blocks `mine_and_sync` mines next. No-op once
-/// the chain already sits at NU5 - 1 or higher.
+/// making a subsequent Orchard coinbase valid. No-op once the chain already
+/// sits at NU5 - 1 or higher.
 async fn warmup_to_nu5<V>(validator: &V) -> Result<(), RpcError>
 where
     V: ValidatorBackend + ?Sized,
 {
     let nu5 = validator.activation_heights().await?.nu5().unwrap_or(1);
-    // The next mined block is `chain_height + 1`; it must be >= nu5, so the
-    // chain has to reach `nu5 - 1` before the note blocks are mined.
+    // Next mined block is `chain_height + 1` and must be >= nu5, so reach nu5-1.
     let target = nu5.saturating_sub(1);
     let height = u32::from(validator.chain_height().await?);
     if height < target {

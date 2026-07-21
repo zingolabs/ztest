@@ -1,7 +1,5 @@
-//! Cluster storage infrastructure: the external-snapshotter, the CSI
-//! hostpath driver, and ztest's own StorageClasses / VolumeSnapshotClass.
-//!
-//! # Dependency chain
+//! Cluster storage infrastructure: the external-snapshotter, the CSI hostpath
+//! driver, and ztest's own StorageClasses / VolumeSnapshotClass.
 //!
 //! ```text
 //! SnapshotCrds ──┬─► SnapshotController
@@ -11,22 +9,11 @@
 //!                └──────────────────────────────┘
 //! ```
 //!
-//! The CRDs are the foundation — everything else depends on them being
-//! [`Established`]. `StorageClasses` needs both the CRDs (for the
-//! `VolumeSnapshotClass`) and the CSI driver (whose `provisioner` the
-//! StorageClasses name).
-//!
-//! # Manifests
-//!
-//! CRD/controller/driver bundles are vendored under `fixtures/kind/*.yaml` and
-//! applied via [`apply_yaml_bundle`]. The ztest StorageClasses /
-//! VolumeSnapshotClass are rendered in code ([`render_storage_classes`])
-//! because their CSI driver varies per substrate.
-//!
-//! # Profiles
-//!
-//! [`providers`] returns a substrate-specific set (see [`StorageProfile`]).
-//! Every provider is [`Lifetime::Cached`].
+//! The CRDs are the foundation; `StorageClasses` needs both them (for the
+//! `VolumeSnapshotClass`) and the CSI driver (whose `provisioner` they name).
+//! CRD/controller/driver bundles are vendored under `fixtures/kind/*.yaml`; the
+//! ztest classes are rendered in code because their driver varies per substrate.
+//! [`providers`] returns a substrate-specific, all-[`Lifetime::Cached`] set.
 
 use std::time::Duration;
 
@@ -43,9 +30,8 @@ use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 
 // ── Embedded manifests ─────────────────────────────────────────────────
 //
-// Documented order matches the file numbering in `fixtures/kind/` and the
-// dependency chain above. The numeric prefix communicates the intended
-// apply order for humans; the resource graph enforces it via `deps()`.
+// The `fixtures/kind/` numeric prefixes document apply order for humans; the
+// resource graph enforces it via `deps()`.
 
 const SNAPSHOT_CRDS_YAML: &str = include_str!("../../../fixtures/kind/00-snapshot-crds.yaml");
 const SNAPSHOT_CONTROLLER_YAML: &str =
@@ -271,11 +257,8 @@ impl Provider for CsiRbacProvider {
     }
 
     fn deps(&self) -> Vec<NodeId> {
-        // The RBAC references ClusterRoles that don't depend on CRDs, so
-        // strictly speaking this could run in parallel with SnapshotCrds.
-        // We serialize on SnapshotCrds anyway because the CSI driver
-        // depends on both, and this keeps the graph's failure-attribution
-        // clean (a CRD failure blocks the whole storage subtree).
+        // This RBAC needn't wait on the CRDs, but serializing on them keeps the
+        // graph's failure-attribution clean (a CRD failure blocks the subtree).
         vec![NodeId::SnapshotCrds]
     }
 

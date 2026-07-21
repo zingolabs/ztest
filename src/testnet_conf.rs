@@ -2,25 +2,13 @@
 //!
 //! Companion to [`crate::regtest_conf`]. Renders `zebrad.toml` and
 //! `zainod.toml` for the testnet network, paired with a pre-synced chain
-//! archive mounted via [`crate::regtest::testnet_chain_archive`]. The
-//! `variant` argument selects which archive, not which config.
-//!
-//! All testnet variants (`orchard`, `sapling`, ...) share the same TOML
-//! body; they differ only in which chain snapshot is mounted at the pod's
-//! cache path. The generator is parameterised by `version` plus path-only
-//! knobs, with no per-variant branches.
-//!
-//! To add a release: extend the [`crate::regtest_conf::Semver`] capability
-//! predicates (or add new ones) and switch on them in the generator. The
-//! shared `Semver` / `versions` constants cover both networks.
+//! archive mounted via [`crate::regtest::testnet_chain_archive`]. All
+//! variants (`orchard`, `sapling`, ...) share the same TOML body; the
+//! `variant` selects only which chain snapshot is mounted.
 
 use crate::regtest_conf::Semver;
 
 /// Which zaino backend the rendered `zainod.toml` configures.
-///
-/// `Fetch` and `State` differ in one TOML line (`backend = ...`) but map
-/// to distinct test invocations. Kept as an enum so the call site records
-/// intent and a future per-backend schema split is one match arm away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZainodBackend {
     /// Pull blocks through the validator's JSON-RPC. Pairs with
@@ -32,7 +20,6 @@ pub enum ZainodBackend {
 }
 
 impl ZainodBackend {
-    /// The literal that lands in `backend = '…'` inside `zainod.toml`.
     fn as_toml(self) -> &'static str {
         match self {
             ZainodBackend::Fetch => "fetch",
@@ -45,16 +32,12 @@ impl ZainodBackend {
 
 /// Render the testnet `zebrad.toml`.
 ///
-/// `rpc_port` is the JSON-RPC listen port (testnet canonical: 18232).
 /// `cache_dir` is the container path the chain-archive PVC is mounted at;
-/// both `[network] cache_dir` and `[state] cache_dir` point at it so
-/// zebrad reads the pre-synced snapshot and writes back into the same
-/// volume. The path is the generator's knob, not the snapshot's; variant
-/// selection happens at the mount layer.
+/// both `[network]` and `[state]` point at it so zebrad reads the
+/// pre-synced snapshot and writes back into the same volume.
 ///
-/// No version gates fire yet: the testnet TOML schema is stable across the
-/// zebrad releases we exercise. The `_version` parameter is plumbed
-/// through so a future schema change is one predicate away.
+/// No version gates fire yet; `_version` is plumbed so a future schema
+/// change is one predicate away.
 pub fn testnet_zebrad_conf(_version: Semver, rpc_port: u16, cache_dir: &str) -> String {
     format!(
         "\
@@ -108,13 +91,9 @@ use_journald = false
 
 /// Render `zainod.toml` for a testnet pod.
 ///
-/// `backend` picks fetch vs. state (a single-line difference in the TOML,
-/// kept typed so the call site records intent). `grpc_listen_port` and
-/// `jsonrpc_listen_port` are zainod's own listeners; `validator_host` is
-/// the in-cluster DNS name of the paired zebrad pod and
-/// `validator_rpc_port` its JSON-RPC port. `zebra_db_path` and
-/// `zaino_db_path` are container-side paths the snapshot/scratch mounts
-/// land at.
+/// `backend` picks fetch vs. state; `validator_host` / `validator_rpc_port`
+/// locate the paired zebrad pod; `zebra_db_path` / `zaino_db_path` are the
+/// container-side mount paths.
 #[allow(clippy::too_many_arguments)]
 pub fn testnet_zainod_conf(
     _version: Semver,

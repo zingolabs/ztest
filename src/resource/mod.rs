@@ -1,27 +1,17 @@
-//! Cluster resource management: the K8s objects ztest depends on to run
-//! tests, and the graph executor that provisions them in dependency order.
+//! Cluster resource management: the K8s objects ztest depends on and the graph
+//! executor that provisions them in dependency order. Both `ztest setup`
+//! (cluster infrastructure) and `ztest run` (per-run resources) flow through the
+//! same [`Graph`] of the same [`Provider`] trait, differing only in which
+//! providers land in the graph:
 //!
-//! # Two entry points, one machine
+//! - [`initialize`] — the cluster-infrastructure graph (`ztest setup`).
+//! - [`plan_runtime`] — the per-run graph from the inventory dump (`ztest run`).
+//! - [`reap_run`] — tears down per-run resources by `ztest.io/run-id` label.
 //!
-//! Both `ztest setup` (cluster infrastructure — CSI, snapshot controller,
-//! ServiceAccounts, RBAC) and `ztest run` (per-run test resources — dev
-//! images, seed PVCs) flow through the same [`Graph`] of the same
-//! [`Provider`] trait. What differs is which providers land in the graph:
-//!
-//! - [`initialize`] assembles the cluster-infrastructure graph and
-//!   provisions it. Called by `ztest setup`.
-//! - [`plan_runtime`] assembles the per-run resource graph from the
-//!   inventory dump; the caller provisions it against the live cluster.
-//!   Called by `ztest run`.
-//! - [`reap_run`] tears down per-run resources by their `ztest.io/run-id`
-//!   label. Called on Ctrl-C and normal-exit cleanup.
-//!
-//! # Extending
-//!
-//! Adding a new K8s resource is one variant in [`NodeId`] plus one
-//! [`Provider`] impl in [`impls`]. The graph, executor, and entry points
-//! don't change. See [`impls`] for the layout convention.
+//! Adding a resource is one [`NodeId`] variant plus one [`Provider`] impl in
+//! [`impls`]; the graph, executor, and entry points don't change.
 
+mod build_scale;
 mod context;
 mod entry;
 mod graph;
@@ -33,6 +23,7 @@ pub(crate) mod impls;
 
 // ── Public API ────────────────────────────────────────────────────────
 
+pub(crate) use build_scale::{grow_to, shrink_to};
 pub use context::{Cx, CxBuilder, Progress, ProgressSink};
 pub use entry::{
     InitializeOpts, image_node_id, initialize, plan_runtime, reap_all, reap_run, reap_user,

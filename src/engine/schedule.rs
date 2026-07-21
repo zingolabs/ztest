@@ -9,7 +9,7 @@
 //! retry / fail-fast) is unit-tested with a fake spawn: no processes, no
 //! cluster.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -51,6 +51,13 @@ pub struct LoopConfig {
     /// (unit tests, or a run that declared no resources). Provisioning completes
     /// before the run, so every tracked node is terminal here.
     pub resources: HashMap<NodeId, NodeState>,
+    /// Hard cap on concurrently-running tests, on top of the scheduler's
+    /// capacity admission. `None` = unlimited (the default: concurrency scales
+    /// with cluster capacity). `Some(1)` serializes the run, which `--no-capture`
+    /// requires so a test's streamed output isn't interleaved with another's
+    /// (mirroring nextest's `test_threads = 1` coupling). Scheduler-granted but
+    /// not-yet-spawned tests wait in an ordered ready-queue.
+    pub max_inflight: Option<usize>,
 }
 
 /// The live state handed to the per-tick render callback.
@@ -112,6 +119,11 @@ where
     // a grant. The attempt rides along so a retry that has to wait for capacity
     // resumes at the right attempt when backfilled (not reset to 1).
     let mut parked: HashMap<(String, String), (WorkItem, u32)> = HashMap::new();
+    // Scheduler-granted tests holding a lease but not yet spawned, because the
+    // `max_inflight` concurrency cap is currently reached. Ordered so a
+    // serialized run (`--no-capture`) preserves priority/submission order.
+    let mut ready: VecDeque<(LeaseId, WorkItem, u32)> = VecDeque::new();
+    let cap = cfg.max_inflight.unwrap_or(usize::MAX);
     let mut futs: FuturesUnordered<BoxedRun> = FuturesUnordered::new();
     let mut fail_fast_tripped = false;
     let mut cancelled: Option<CancelReason> = None;
@@ -147,6 +159,22 @@ where
         );
     };
 
+    // Spawn granted-but-queued tests (FIFO) up to the `max_inflight` cap. A no-op
+    // when uncapped and `ready` was drained on enqueue; the sole gate for a
+    // serialized (`--no-capture`) run.
+    macro_rules! pump {
+        () => {
+            while inflight.len() < cap {
+                match ready.pop_front() {
+                    Some((lease, item, attempt)) => {
+                        spawn_granted(lease, item, attempt, &mut inflight, &mut futs, reporter)
+                    }
+                    None => break,
+                }
+            }
+        };
+    }
+
     // Initial admission sweep (priority order already baked into `items`).
     for item in items {
         // Resource gate: a test whose declared dependency failed to provision is
@@ -164,9 +192,7 @@ where
             continue;
         }
         match sched.request(to_request(&item, &cfg.sa)) {
-            Admission::Granted(lease) => {
-                spawn_granted(lease, item, 1, &mut inflight, &mut futs, reporter)
-            }
+            Admission::Granted(lease) => ready.push_back((lease, item, 1)),
             Admission::Queued => {
                 parked.insert(key(&item), (item, 1));
             }
@@ -180,6 +206,7 @@ where
             }
         }
     }
+    pump!();
 
     let mut tick = tokio::time::interval(cfg.redraw);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -241,9 +268,7 @@ where
                         duration: outcome.duration,
                     });
                     match sched.request(to_request(&running.item, &cfg.sa)) {
-                        Admission::Granted(l) => {
-                            spawn_granted(l, running.item, next, &mut inflight, &mut futs, reporter)
-                        }
+                        Admission::Granted(l) => ready.push_back((l, running.item, next)),
                         Admission::Queued => {
                             // Re-park carrying the attempt, so when capacity frees
                             // the retry resumes at `next`, not reset to 1, which
@@ -276,9 +301,10 @@ where
                 if !fail_fast_tripped && !cfg.cancel.is_cancelled() {
                     for g in grants {
                         if let Some((item, attempt)) = parked.remove(&(g.binary_id.clone(), g.test_name.clone())) {
-                            spawn_granted(g.lease_id, item, attempt, &mut inflight, &mut futs, reporter);
+                            ready.push_back((g.lease_id, item, attempt));
                         }
                     }
+                    pump!();
                 }
 
                 render_tick(reporter, &inflight, &sched, ceiling, stats, start, &cfg, &mut on_tick);
@@ -457,6 +483,7 @@ mod tests {
             run_id: "run".into(),
             cancel: Cancel::never(),
             resources: HashMap::new(),
+            max_inflight: None,
         }
     }
 
@@ -477,7 +504,7 @@ mod tests {
 
     // A ceiling that fits exactly two Integration tests (2000m each).
     fn ceiling_two_integration() -> Resources {
-        Resources::new(4_000, 4 * crate::qos::GIB)
+        Resources::new(4_000, 4 * crate::qos::GIB, 0, 0)
     }
 
     #[tokio::test]
@@ -539,6 +566,48 @@ mod tests {
         assert_eq!(stats.passed, 6);
         // Ceiling fits exactly 2 → never more than 2 running concurrently.
         assert!(*peak.lock().unwrap() <= 2, "peak={}", peak.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn max_inflight_one_serializes_despite_capacity() {
+        // A ceiling that fits two Integration tests, but `max_inflight: Some(1)`
+        // (the `--no-capture` coupling) must hold concurrency to one regardless.
+        let items: Vec<_> = (0..5)
+            .map(|i| item(&format!("t{i}"), QosClass::Integration, 0))
+            .collect();
+        let peak = Arc::new(Mutex::new(0usize));
+        let live = Arc::new(Mutex::new(0usize));
+        let (peak2, live2) = (peak.clone(), live.clone());
+        let mut c = cfg();
+        c.max_inflight = Some(1);
+        let mut rep = NullReporter;
+        let stats = run_loop(
+            items,
+            ceiling_two_integration(),
+            c,
+            &mut rep,
+            move |_item, _attempt| {
+                let (peak2, live2) = (peak2.clone(), live2.clone());
+                async move {
+                    {
+                        let mut n = live2.lock().unwrap();
+                        *n += 1;
+                        *peak2.lock().unwrap() = (*peak2.lock().unwrap()).max(*n);
+                    }
+                    tokio::task::yield_now().await;
+                    *live2.lock().unwrap() -= 1;
+                    pass()
+                }
+            },
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(stats.passed, 5, "every test still runs, just serially");
+        assert_eq!(
+            *peak.lock().unwrap(),
+            1,
+            "max_inflight=1 must never run two at once"
+        );
     }
 
     #[tokio::test]
@@ -631,7 +700,7 @@ mod tests {
         let mut rep = NullReporter;
         let stats = run_loop(
             vec![item("huge", QosClass::Sync, 0)],
-            Resources::new(1_000, crate::qos::GIB),
+            Resources::new(1_000, crate::qos::GIB, 0, 0),
             cfg(),
             &mut rep,
             |_item, _attempt| async { pass() },
@@ -718,7 +787,7 @@ mod tests {
         let i = QosClass::Integration.profile().footprint;
         // Room for 3 Testnet + 1 Integration: a few heavy tests, with one light
         // test backfilling the leftover capacity.
-        let ceiling = Resources::new(3 * t.cpu_milli + i.cpu_milli, 3 * t.mem_bytes + i.mem_bytes);
+        let ceiling = Resources::new(3 * t.cpu_milli + i.cpu_milli, 3 * t.mem_bytes + i.mem_bytes, 0, 0);
 
         // Submitted heavy-first (as `build_work_list` orders them in production).
         let mut items = vec![
@@ -1118,7 +1187,7 @@ mod tests {
         let mut rep = RecordingReporter::default();
         run_loop(
             vec![item("huge", QosClass::Sync, 0)],
-            Resources::new(1_000, crate::qos::GIB),
+            Resources::new(1_000, crate::qos::GIB, 0, 0),
             cfg(),
             &mut rep,
             |_it, _a| async { pass() },

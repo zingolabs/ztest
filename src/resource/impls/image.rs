@@ -2,15 +2,12 @@
 //!
 //! A thin adapter between the graph's [`Provider`] lifecycle and the
 //! [`image::ImageProvider`] backend selected by [`image::from_env`]: `probe`
-//! asks whether the content-addressed image is already present (a warm cache
-//! skips the build); `provision` builds and publishes it, streaming native
-//! build output through the console PTY. Which topology (kind `kind load`,
-//! generic-registry `docker push`, or the OpenShift in-process OCI push) is the
-//! backend's concern, not this node's.
+//! asks whether the content-addressed image is present (a warm cache skips the
+//! build); `provision` builds and publishes it. The topology is the backend's
+//! concern, not this node's.
 //!
-//! Dev images are [`Lifetime::Cached`] — reused across runs and never reaped on
-//! cancel, so [`teardown`](Provider::teardown) is the trait's default no-op
-//! (eviction is a separate, explicit prune).
+//! Dev images are [`Lifetime::Cached`], so [`teardown`](Provider::teardown) is
+//! the trait's default no-op (eviction is a separate, explicit prune).
 
 use std::sync::Arc;
 
@@ -79,7 +76,7 @@ impl Provider for ImageNode {
 
     async fn provision(&self, cx: &Cx) -> Result<(), ResourceError> {
         // The resolved reference is recorded into the build manifest by the run's
-        // image phase (which covers cached images too), so it is discarded here.
+        // image phase, so it is discarded here.
         self.backend.build_image(cx, &self.entry, &self.tag).await?;
         Ok(())
     }

@@ -1,24 +1,13 @@
 //! Node state and error vocabulary shared by [`Provider`](super::Provider) and
-//! [`Graph`](super::Graph).
-//!
-//! Four small types, one file: [`NodeState`] (the observable state each node
-//! moves through), [`Lifetime`] (teardown policy), [`Readiness`] (the two-state
-//! result of a probe), and [`ResourceError`] (the structured failure a provider
-//! returns). All are `pub` — the executor's state machine is a public contract:
-//! `cli::run` reads `NodeState` to gate test admission, the preflight panel
-//! renders it, and the QoS runtime consumes it. Change these types and you
-//! change the observable contract.
+//! [`Graph`](super::Graph): [`NodeState`], [`Lifetime`], [`Readiness`], and
+//! [`ResourceError`]. All `pub` — the executor's state machine is a public
+//! contract that `cli::run`, the preflight panel, and the QoS runtime consume.
 
 use thiserror::Error;
 
-/// Observable state of a node as the executor drives it.
-///
-/// The state machine is monotonic and terminal-safe: `Ready`, `Failed`, and
-/// `Blocked` are absorbing states. `Pending` and `Acquiring` only ever advance
-/// to a terminal state and never regress.
-///
-/// Consumers (the run scheduler, the preflight panel) read this to gate test
-/// admission and to render live progress.
+/// Observable state of a node as the executor drives it. Monotonic: `Ready`,
+/// `Failed`, and `Blocked` are absorbing; `Pending`/`Acquiring` only advance
+/// toward a terminal state, never regress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeState {
     /// Not started: one or more deps are not yet `Ready`.
@@ -58,13 +47,10 @@ impl NodeState {
     }
 }
 
-/// Teardown policy for a provisioned node. Decides whether
-/// [`Graph::teardown`](super::Graph::teardown) touches this node.
-///
-/// The crux of the model: content-addressed resources (images, seed PVCs,
-/// cluster infrastructure) are a cross-run cache and must survive
-/// cancellation; per-run resources must be reaped. Per-node, not per-graph,
-/// so the same graph handles both cases correctly in one traversal.
+/// Teardown policy: whether [`Graph::teardown`](super::Graph::teardown) touches
+/// this node. Content-addressed resources are a cross-run cache that must
+/// survive cancellation; per-run resources must be reaped. Per-node, not
+/// per-graph, so one traversal handles both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lifetime {
     /// Cross-run cache — dev images, seed PVCs, cluster infrastructure.
@@ -100,14 +86,10 @@ pub enum Readiness {
     Absent,
 }
 
-/// A provisioning or teardown failure surfaced by a
-/// [`Provider`](super::Provider).
-///
-/// Not an aggregate error — carries one human-facing message. The graph
-/// records the message into [`NodeState::Failed`] (for the panel) or the
-/// teardown report (for the CLI). Errors block the failing node's dependents
-/// but never abort sibling work; propagation is the graph's job, not the
-/// error type's.
+/// A provisioning or teardown failure from a [`Provider`](super::Provider):
+/// one human-facing message, which the graph records into
+/// [`NodeState::Failed`] or the teardown report. Propagation is the graph's
+/// job — the error type carries no aggregation.
 #[derive(Debug, Error)]
 pub enum ResourceError {
     #[error("provision failed: {0}")]

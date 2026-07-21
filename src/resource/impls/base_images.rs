@@ -1,17 +1,9 @@
-//! On-cluster base images: the compile **builder** and the test-runner **base**.
+//! On-cluster base images: the compile **builder** and the test-runner **base**,
+//! both built by `ztest setup` from repo Dockerfiles in the BuildKit pod.
 //!
-//! `ztest setup` builds both from repo Dockerfiles (`docker/*.Dockerfile`) in
-//! the ztest-owned BuildKit pod — the same path component images use
-//! ([`crate::backends::image::openshift::build_base_image`]). This replaces the
-//! hand-seeded nix images: nothing is built or pushed from the laptop.
-//!
-//! Both are content-addressed on their Dockerfile bytes (`<repo>:d-<hash>`), so
-//! an edit forks the tag and setup rebuilds; an unchanged Dockerfile resolves the
-//! existing tag and `probe` reports it present, skipping the build. The builder
-//! image is a dependency of the builder Deployment
-//! ([`super::builder::BuilderDeploymentProvider`]); the runner base has no
-//! in-graph dependents — it must exist before a run's `crane` bake appends the
-//! compiled binaries onto it.
+//! Content-addressed on their Dockerfile bytes (`<repo>:d-<hash>`), so an edit
+//! forks the tag and setup rebuilds while an unchanged Dockerfile resolves the
+//! existing tag and skips.
 
 use async_trait::async_trait;
 
@@ -24,8 +16,7 @@ fn deps() -> Vec<NodeId> {
     vec![
         NodeId::Namespace(IMAGES_NAMESPACE.to_string()),
         NodeId::RegistryProject,
-        // The BuildKit build server does the build (`build_base_image` execs into
-        // it) and pushes as its SA; both must exist first.
+        // The BuildKit build server runs the build and pushes as its SA.
         NodeId::Buildkit,
     ]
 }
@@ -74,10 +65,8 @@ impl Provider for BuilderImageProvider {
     }
 
     fn deps(&self) -> Vec<NodeId> {
-        // Not a real content dependency — this serializes the two base-image
-        // builds so their live BuildKit progress streams one at a time onto the grid
-        // instead of interleaving. Runner base first (it's small and quick),
-        // then the builder.
+        // Not a content dependency: serializes the two base-image builds so their
+        // live BuildKit progress streams one at a time instead of interleaving.
         let mut d = deps();
         d.push(NodeId::Image(image::runner_base_tag()));
         d

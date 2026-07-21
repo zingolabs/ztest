@@ -1,33 +1,22 @@
 //! Topology-aware activation-height resolver.
 //!
-//! Every Zcash component in a regtest topology (zebrad, zcashd, zaino,
-//! zingo) knows about some prefix of the network-upgrade sequence (Sapling,
-//! Blossom, Heartwood, Canopy, NU5, NU6, NU6.1, NU6.2, NU7, ...). If the
+//! Each component knows some prefix of the network-upgrade sequence; if the
 //! validator activates an NU the indexer can't decode, the chain syncer
-//! fails with `"parse error: invalid consensus branch id"` and the topology
-//! is dead.
-//!
-//! Activation heights are a property of the topology, not of any single
-//! component. This module computes the ceiling (the highest NU every
-//! component in the topology can handle) and renders an
-//! [`ActivationHeights`] that activates exactly the prefix up to that
-//! ceiling.
-//!
-//! Each backend reports its own `nu_ceiling()` via its `*Backend` trait;
-//! the env collects them and feeds them into [`resolve_ceiling`].
+//! dies with `"parse error: invalid consensus branch id"`. This module
+//! computes the ceiling (the highest NU every component in the topology can
+//! handle) and renders an [`ActivationHeights`] activating exactly the
+//! prefix up to it. Backends report their ceiling via `nu_ceiling()`; the
+//! env feeds them into [`resolve_ceiling`].
 
 use crate::regtest_conf::Semver;
 
 // ────────────────────────── ActivationHeights ─────────────────────────
 
 /// Per-network-upgrade activation heights for a regtest chain. `None` means
-/// the upgrade is not activated. Build with [`ActivationHeights::builder`];
-/// read with the per-upgrade getters.
+/// the upgrade is not activated.
 ///
-/// ztest owns this type rather than borrowing
-/// `zingo_common_components::protocol::ActivationHeights` (a Zingo crate that
-/// re-implements librustzcash types): the harness defines the interfaces its
-/// callers consume and depends only on the canonical `zcash_protocol`.
+/// ztest owns this type rather than borrowing Zingo's re-implementation, so
+/// the harness depends only on the canonical `zcash_protocol`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct ActivationHeights {
     overwinter: Option<u32>,
@@ -145,12 +134,9 @@ impl ActivationHeightsBuilder {
 
 /// Ordered enum of Zcash network upgrades.
 ///
-/// `PartialOrd`/`Ord` reflect supersession: `Nu5 < Nu6 < Nu6_1 < ...`. The
-/// resolver uses [`Ord::min`] across components to pick the topology
-/// ceiling. New NUs are inserted in supersession order — a point release
-/// like NU6.3 sits between NU6.2 and NU7, not merely appended — because the
-/// derived `Ord`, and therefore the resolver's `min` and the `nu <= ceiling`
-/// gate, depend on declaration order.
+/// `Ord` reflects supersession (`Nu5 < Nu6 < Nu6_1 < ...`) and the resolver
+/// depends on it (`min`, `nu <= ceiling`), so a new NU must be inserted in
+/// supersession order — NU6.3 sits between NU6.2 and NU7, not appended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NetworkUpgrade {
     Overwinter,
@@ -194,13 +180,10 @@ pub struct UnsupportedNetworkUpgrade(pub NetworkUpgrade);
 
 /// Best-effort interop with `zcash_protocol::consensus::NetworkUpgrade`.
 ///
-/// Partial by nature: ztest's enum is a stable superset that carries
-/// [`NetworkUpgrade::Nu6_3`] and [`NetworkUpgrade::Nu7`], neither of which the
-/// pinned `zcash_protocol` can represent (Nu7 needs the `zcash_unstable="nu7"`
-/// cfg; Nu6_3 has no upstream variant yet). `TryFrom` (not `From`) makes that
-/// partiality explicit at the type level: those arms return
-/// [`UnsupportedNetworkUpgrade`] rather than naming variants that don't
-/// compile on stable.
+/// Partial by nature: the pinned `zcash_protocol` can represent neither
+/// [`NetworkUpgrade::Nu6_3`] nor [`NetworkUpgrade::Nu7`], so `TryFrom` (not
+/// `From`) returns [`UnsupportedNetworkUpgrade`] for those arms rather than
+/// naming variants that don't compile on stable.
 impl TryFrom<NetworkUpgrade> for zcash_protocol::consensus::NetworkUpgrade {
     type Error = UnsupportedNetworkUpgrade;
 
@@ -225,22 +208,20 @@ impl TryFrom<NetworkUpgrade> for zcash_protocol::consensus::NetworkUpgrade {
 
 // ──────────────────── per-family capability tables ────────────────────
 
-// First zebrad with NU6.3 (Ironwood): tag `6.0.0-rc.0` (`zfnd/zebra:6.0.0-rc.0`),
-// which parses to `6.0.0`. Earlier zebrad caps below Nu6_3.
+// First zebrad with NU6.3 (Ironwood): tag `6.0.0-rc.0`, parses to `6.0.0`.
 const ZEBRAD_NU6_3_RELEASE: Semver = Semver {
     major: 6,
     minor: 0,
     patch: 0,
 };
-// zcashd has no NU6.3/Ironwood support yet; keep the gate unreachable so zcashd
-// topologies never activate NU6.3.
+// zcashd has no NU6.3 support; unreachable sentinel keeps zcashd topologies
+// below NU6.3.
 const ZCASHD_NU6_3_RELEASE: Semver = Semver {
     major: u16::MAX,
     minor: 0,
     patch: 0,
 };
-// First zaino with the Ironwood pipeline (proto `ironwood_actions`, Ironwood
-// tree/subtree reads): `0.4.3-ironwood.1`, which parses to `0.4.3`.
+// First zaino with the Ironwood pipeline: `0.4.3-ironwood.1`, parses to `0.4.3`.
 const ZAINO_NU6_3_RELEASE: Semver = Semver {
     major: 0,
     minor: 4,
@@ -318,20 +299,11 @@ pub fn resolve_ceiling(ceilings: &[NetworkUpgrade]) -> NetworkUpgrade {
 }
 
 pub fn activation_heights_for_ceiling(ceiling: NetworkUpgrade) -> ActivationHeights {
-    // When NU6.3 (Ironwood) is active, use zaino origin/dev's canonical NU6.3
-    // regtest schedule — `nu5 = nu6 = nu6_1 = nu6_2 = nu6_3 = 2`
-    // (`NU6_3_ACTIVE_ACTIVATION_HEIGHTS`). This is required, not cosmetic:
-    //   1. Parity — the e2e/state tests must launch 1:1 with dev, which activates
-    //      NU6.3 at height 2 (its faucet coinbase and every send are NU6.3-era
-    //      from the first block).
-    //   2. Correctness — below NU6.3 the Ironwood note-commitment tree does not
-    //      exist, and the StateService's `get_commitment_tree_roots` fetches it
-    //      unconditionally; activating NU6.3 at height 2 keeps every synced block
-    //      at or above NU6.3 so that read never hits the pre-NU6.3 gap (which
-    //      otherwise stalls the state syncer at genesis).
-    //   3. Monotonicity — NU6.3 at height 2 forces its predecessors to height 2.
-    // Below NU6.3 the default spaced schedule (`regtest_height`) applies, leaving
-    // every non-Ironwood topology unchanged.
+    // With NU6.3 active, collapse the shielded NUs to height 2 (dev's
+    // canonical NU6.3 schedule). Required, not cosmetic: the StateService's
+    // `get_commitment_tree_roots` reads the Ironwood tree unconditionally,
+    // so any block below NU6.3 hits a pre-NU6.3 gap and stalls the syncer at
+    // genesis. Below NU6.3 the default spaced schedule applies.
     let nu6_3_active = ceiling >= NetworkUpgrade::Nu6_3;
     let scheduled = |nu: NetworkUpgrade| -> Option<u32> {
         if nu6_3_active
@@ -345,8 +317,6 @@ pub fn activation_heights_for_ceiling(ceiling: NetworkUpgrade) -> ActivationHeig
             nu.regtest_height()
         }
     };
-    // An upgrade activates at its scheduled height when the topology reaches
-    // it (NU <= ceiling), and is absent otherwise.
     let at = |nu: NetworkUpgrade| scheduled(nu).filter(|_| nu <= ceiling);
     ActivationHeights::builder()
         .set_overwinter(at(NetworkUpgrade::Overwinter))

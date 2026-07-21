@@ -1,31 +1,17 @@
 //! Quality-of-service: cluster resource allocation, job scheduling, and
-//! priority.
+//! priority. A test declares a tier at the call site; the harness lowers that
+//! into pod requests/limits and a scheduling footprint, and the in-memory
+//! [`scheduler::Scheduler`] admits it against probed cluster capacity. The core
+//! holds no clock/randomness/I/O, so admission is a deterministic function over
+//! in-memory state, unit-testable without a cluster. See `docs/qos-design.md`.
 //!
-//! Tests span sub-second logic checks to 48-hour chain syncs. A test author
-//! declares a tier at the call site (`basic`, `integration`, `testnet`,
-//! `sync`); the harness lowers that into pod requests/limits and a scheduling
-//! footprint. `ztest run`'s in-memory [`scheduler::Scheduler`] is the sole
-//! admission authority: it admits tests against probed cluster capacity with
-//! priority ordering, backfill, and NVMe placement. See `docs/qos-design.md`.
-//!
-//! This module is the scheduler's pure decision core: given the live capacity,
-//! the queue, and the active leases, decide what to admit. It holds no clock,
-//! no randomness, and no I/O; the queue's "request_time" tiebreak is a
-//! monotonic sequence counter ([`scheduler::Scheduler`]), so every operation
-//! is a deterministic function over in-memory state, unit-testable without a
-//! cluster.
-//!
-//! Model:
-//! - [`Resources`]: a 2-D (CPU × RAM) amount in k8s-native integer units
-//!   (millicpu, bytes). Integer-only, so arithmetic is exact.
-//! - [`Pool`]: `General` vs the dedicated `Nvme` pool that `sync` targets so
-//!   it never contends with the other tiers.
-//! - [`QosClass`] / [`QosProfile`]: the four tiers and their const profile
-//!   table (footprint, pool, priority, hard cap). The scheduler never reads
-//!   these numbers directly: callers resolve a class to a [`QosProfile`] and
-//!   hand the scheduler an explicit [`scheduler::Request`], keeping the engine
-//!   decoupled from the still-TBD reserve table (`docs/qos-design.md` §11).
+//! Model: [`Resources`] (a 4-D CPU × RAM × disk-bandwidth × disk-IOPS amount in
+//! integer k8s/cgroup units); [`Pool`] (general vs the dedicated NVMe pool
+//! `sync` targets); [`QosClass`]/[`QosProfile`] (the tiers and their const
+//! profile table). Callers resolve a class to a [`QosProfile`] and hand the
+//! scheduler an explicit [`scheduler::Request`], decoupling it from the table.
 
+pub mod ledger;
 pub mod live;
 pub mod schedule;
 pub mod scheduler;
@@ -58,14 +44,26 @@ pub const LABEL_RUN_ID: &str = "ztest.io/run-id";
 /// slugged; see [`crate::naming::RunCoords`].
 pub const LABEL_USER: &str = "ztest.io/user";
 
+// ── Disk-I/O reservation (declared on the PVC / storage request) ────────
+//
+// Kubernetes has no disk-I/O field in pod `resources`, so the per-volume cap
+// rides these PVC annotations, enforced via a cgroup `io.max` (CRI-O blockio).
+// Migrates to a `VolumeAttributesClass` once a backend's CSI can honor one.
+// See `docs/qos-io-dimension-design.md`.
+
+/// PVC annotation carrying the volume's disk-bandwidth cap (k8s quantity,
+/// bytes/sec); mirrors the cgroup `io.max` `{r,w}bps` the harness enforces.
+pub const ANNOTATION_IO_BPS: &str = "qos.ztest.io/io-bps";
+/// PVC annotation carrying the volume's disk-IOPS cap (plain integer, ops/sec);
+/// mirrors cgroup `io.max` `{r,w}iops`.
+pub const ANNOTATION_IO_IOPS: &str = "qos.ztest.io/io-iops";
+
 // ── NVMe placement (node taint + nodeSelector) ─────────────────────────
 //
-// `sync` pods must land on the dedicated NVMe nodes; other tiers must not.
-// Realised as Kubernetes placement (a tainted node pool + a matching pod
-// toleration and nodeSelector), not a capacity partition (see [`Pool`]).
-// Applied to `sync` pod specs at materialize time (`manifest::PodSpec::render`).
-// The exact label/taint key the NVMe nodes carry is TBD pending cluster-admin
-// confirmation (§11); isolated here so the production value is a one-line swap.
+// `sync` pods land on the dedicated NVMe nodes via k8s placement (tainted node
+// pool + matching toleration/nodeSelector), not a capacity partition (see
+// [`Pool`]). The exact label/taint key is TBD (§11); isolated here for a
+// one-line production swap.
 
 /// NodeSelector label key marking the NVMe node pool. §11 TBD.
 pub const NVME_NODE_LABEL_KEY: &str = "ztest.io/pool";
@@ -79,55 +77,79 @@ pub const MIB: u64 = 1024 * 1024;
 /// One gibibyte, in bytes.
 pub const GIB: u64 = 1024 * MIB;
 
-/// A two-dimensional resource amount: CPU in millicores and memory in bytes,
-/// matching the units Kubernetes uses for `requests`/`limits`.
+/// A four-dimensional resource amount: CPU millicores, memory bytes, and disk
+/// I/O bandwidth (bytes/sec) + operations (IOPS). CPU/memory match k8s
+/// `requests`/`limits` units; the I/O pair matches cgroup v2 `io.max`. Integer-
+/// only, so packing is exact; all dimensions independent ("fits" = fits in
+/// every one).
 ///
-/// Integer-only, so packing decisions are exact (k8s quantities are themselves
-/// integer: `500m`, `512Mi`). Both dimensions are independent; "fits" means
-/// fits in both (see [`Resources::fits_within`]).
+/// The I/O dimensions are inert until calibrated: k8s exposes no I/O
+/// `allocatable`, so an uncalibrated node's ceiling is seeded [`u64::MAX`] and
+/// admission matches the CPU×memory model. See `docs/qos-io-dimension-design.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Resources {
     /// CPU in millicores (`1000` == one core).
     pub cpu_milli: u64,
     /// Memory in bytes.
     pub mem_bytes: u64,
+    /// Disk bandwidth in bytes/sec (cgroup `io.max` `rbps`+`wbps`).
+    pub io_bps: u64,
+    /// Disk operations per second (cgroup `io.max` `riops`+`wiops`).
+    pub io_iops: u64,
 }
 
 impl Resources {
-    /// The empty amount: both dimensions zero.
+    /// The empty amount: every dimension zero.
     pub const ZERO: Resources = Resources {
         cpu_milli: 0,
         mem_bytes: 0,
+        io_bps: 0,
+        io_iops: 0,
     };
 
-    /// Construct an amount from millicpu and bytes.
-    pub const fn new(cpu_milli: u64, mem_bytes: u64) -> Self {
+    /// Construct an amount from all four dimensions.
+    pub const fn new(cpu_milli: u64, mem_bytes: u64, io_bps: u64, io_iops: u64) -> Self {
         Resources {
             cpu_milli,
             mem_bytes,
+            io_bps,
+            io_iops,
         }
     }
 
-    /// `true` iff `self` fits within `cap` in both dimensions: a request is
-    /// grantable only when its CPU and its memory both fit.
-    pub fn fits_within(&self, cap: &Resources) -> bool {
-        self.cpu_milli <= cap.cpu_milli && self.mem_bytes <= cap.mem_bytes
+    /// A CPU×memory amount whose I/O dimensions are unconstrained: `io_bps` and
+    /// `io_iops` set to [`u64::MAX`]. For a *ceiling* on a node whose I/O has
+    /// not been benchmarked, so the I/O dimensions never gate admission.
+    pub const fn cpu_mem_unbounded_io(cpu_milli: u64, mem_bytes: u64) -> Self {
+        Resources::new(cpu_milli, mem_bytes, u64::MAX, u64::MAX)
     }
 
-    /// Dimension-wise sum, `None` on overflow of either dimension.
+    /// `true` iff `self` fits within `cap` in every dimension: a request is
+    /// grantable only when CPU, memory, and both I/O dimensions all fit.
+    pub fn fits_within(&self, cap: &Resources) -> bool {
+        self.cpu_milli <= cap.cpu_milli
+            && self.mem_bytes <= cap.mem_bytes
+            && self.io_bps <= cap.io_bps
+            && self.io_iops <= cap.io_iops
+    }
+
+    /// Dimension-wise sum, `None` on overflow of any dimension.
     pub fn checked_add(&self, other: &Resources) -> Option<Resources> {
         Some(Resources {
             cpu_milli: self.cpu_milli.checked_add(other.cpu_milli)?,
             mem_bytes: self.mem_bytes.checked_add(other.mem_bytes)?,
+            io_bps: self.io_bps.checked_add(other.io_bps)?,
+            io_iops: self.io_iops.checked_add(other.io_iops)?,
         })
     }
 
-    /// Dimension-wise difference, `None` if either dimension would go
-    /// negative.
+    /// Dimension-wise difference, `None` if any dimension would go negative.
     pub fn checked_sub(&self, other: &Resources) -> Option<Resources> {
         Some(Resources {
             cpu_milli: self.cpu_milli.checked_sub(other.cpu_milli)?,
             mem_bytes: self.mem_bytes.checked_sub(other.mem_bytes)?,
+            io_bps: self.io_bps.checked_sub(other.io_bps)?,
+            io_iops: self.io_iops.checked_sub(other.io_iops)?,
         })
     }
 
@@ -139,6 +161,8 @@ impl Resources {
         Resources {
             cpu_milli: self.cpu_milli.saturating_sub(other.cpu_milli),
             mem_bytes: self.mem_bytes.saturating_sub(other.mem_bytes),
+            io_bps: self.io_bps.saturating_sub(other.io_bps),
+            io_iops: self.io_iops.saturating_sub(other.io_iops),
         }
     }
 
@@ -147,6 +171,8 @@ impl Resources {
         Resources {
             cpu_milli: self.cpu_milli.saturating_add(other.cpu_milli),
             mem_bytes: self.mem_bytes.saturating_add(other.mem_bytes),
+            io_bps: self.io_bps.saturating_add(other.io_bps),
+            io_iops: self.io_iops.saturating_add(other.io_iops),
         }
     }
 
@@ -157,45 +183,99 @@ impl Resources {
         Resources {
             cpu_milli: self.cpu_milli.max(other.cpu_milli),
             mem_bytes: self.mem_bytes.max(other.mem_bytes),
+            io_bps: self.io_bps.max(other.io_bps),
+            io_iops: self.io_iops.max(other.io_iops),
         }
+    }
+
+    /// Guard for any footprint about to size a real pod: a zero-CPU or
+    /// zero-memory reserve renders a container k8s treats as BestEffort (the
+    /// class this harness forbids), so panic rather than emit it. `ctx` names
+    /// the call site.
+    pub fn assert_pod_schedulable(&self, ctx: &str) {
+        assert!(
+            self.cpu_milli > 0,
+            "{ctx}: pod footprint has zero CPU — would not be Guaranteed",
+        );
+        assert!(
+            self.mem_bytes > 0,
+            "{ctx}: pod footprint has zero memory — would not be Guaranteed",
+        );
+    }
+
+    /// The `(cpu, memory)` k8s quantity strings for a Guaranteed container at
+    /// this footprint: whole-core CPU (rounded up, min 1) and exact-byte memory.
+    /// The single canonical lowering every ztest pod renders through, so no site
+    /// drifts into a fractional-CPU or Burstable shape.
+    ///
+    /// Whole cores because the kubelet CPU-manager `static` policy pins exclusive
+    /// CPUs only to an integer-core Guaranteed pod; a fractional request falls to
+    /// the shared pool. Panics on a degenerate footprint.
+    pub fn guaranteed_cpu_mem(&self, ctx: &str) -> (String, String) {
+        self.assert_pod_schedulable(ctx);
+        let cores = self.cpu_milli.div_ceil(1000).max(1);
+        (cores.to_string(), self.mem_bytes.to_string())
     }
 }
 
+/// Footprints for the long-lived on-cluster build infrastructure pods and the
+/// ephemeral seed uploader, in the QoS [`Resources`] model so they share its
+/// units, whole-core rendering, and the Guaranteed invariant with the tier pods.
+///
+/// The build-server and compile builder ship at their `*_REST` size and resize
+/// in place to `*_BUILD` for a build, then shrink back. Never statically pinned:
+/// a pod holding exclusive cores under the static CPU-manager policy cannot be
+/// resized in place.
+pub mod build {
+    use super::{GIB, MIB, Resources};
+
+    /// Idle buildkit daemon: enough to serve `buildctl debug workers` and hold
+    /// the content store open, no more.
+    pub const BUILDKIT_REST: Resources = Resources::new(1_000, 500 * MIB, 0, 0);
+    /// buildkit grown for a build: memory is the Guaranteed hard cap and must
+    /// clear the heaviest layer step's peak or the build OOMs, yet stay under
+    /// actuatable node headroom or the kubelet defers the grow forever. Polled
+    /// to actuation before the build starts (`build_scale::grow_to`).
+    pub const BUILDKIT_BUILD: Resources = Resources::new(32_000, 20 * GIB, 0, 0);
+    /// Idle compile builder (`sleep infinity` with the cache PVC mounted).
+    pub const BUILDER_REST: Resources = Resources::new(1_000, 500 * MIB, 0, 0);
+    /// Builder grown for a `cargo` compile: memory must clear the link-step peak.
+    pub const BUILDER_BUILD: Resources = Resources::new(16_000, 12 * GIB, 0, 0);
+    /// The ephemeral seed-uploader pod: a trivial `sh` streaming seed bytes into
+    /// a PVC. A small fixed Guaranteed reserve so it is never BestEffort.
+    pub const UPLOADER: Resources = Resources::new(1_000, 256 * MIB, 0, 0);
+}
+
 /// Whole-cluster schedulable capacity: total node `allocatable` minus the
-/// requests of scheduled workloads. One global pool: NVMe vs general is a
-/// Kubernetes placement concern (node taints + pod tolerations), not a capacity
-/// partition (see `docs/qos-design.md`). Produced by the cluster probe
-/// (`pipeline::cluster`), shown by the preflight banner, and (once wired) the
-/// input to admission.
+/// reservation of scheduled workloads. One global pool; general/NVMe is k8s
+/// placement, not a capacity partition. Produced by the cluster probe, shown by
+/// the preflight banner, and the input to admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClusterCapacity {
     /// Σ `node.status.allocatable` over schedulable nodes.
     pub allocatable: Resources,
-    /// Σ effective requests of all scheduled, live pods (ztest and non-ztest
-    /// alike). Drives the preflight banner's free-headroom display.
-    pub requested: Resources,
+    /// Σ over all live pods (ztest and not) of `max(effective_request,
+    /// observed_usage)` per CPU/memory, plus each pod's PVC I/O. Reserving the
+    /// request keeps admission scheduler-safe; observed usage catches a Burstable
+    /// co-tenant running above its request. Reserving the *limit* instead would
+    /// sterilize the node — a real non-ztest burst is handled by k8s eviction
+    /// ordering, not by pre-reserving a ceiling.
+    pub reserved: Resources,
 }
 
 impl ClusterCapacity {
-    /// Schedulable headroom right now: `allocatable - requested`, floored at
-    /// zero per dimension. Nets out every pod — including other concurrent
-    /// `ztest run`s' Guaranteed pods — so a run seeded from this at startup
-    /// coexists with the load already on the cluster. Also the preflight
-    /// banner's "free" figure.
+    /// Schedulable headroom now: `allocatable - reserved`, floored at zero per
+    /// dimension. Nets out every pod (including other concurrent runs'), so a run
+    /// seeded from this at startup coexists with existing cluster load.
     pub fn free(&self) -> Resources {
-        self.allocatable.saturating_sub(&self.requested)
+        self.allocatable.saturating_sub(&self.reserved)
     }
 }
 
-/// A tier's node placement target, not a capacity partition.
-///
-/// Capacity is one global figure ([`ClusterCapacity`]); the broker admits
-/// against it and never accounts per-pool. The general/NVMe split is Kubernetes
-/// placement: NVMe nodes are tainted, and a `sync` pod carries the matching
-/// toleration (+ nodeSelector) so it lands on an NVMe node while other tiers
-/// don't. This enum records which placement a tier wants ([`QosProfile::pool`]),
-/// applied to pod specs at materialize time; unused by
-/// `scheduler`/`ledger`/`allocator`.
+/// A tier's node placement target, not a capacity partition. Capacity is one
+/// global figure; the general/NVMe split is k8s placement (tainted NVMe nodes +
+/// a matching toleration/nodeSelector on `sync` pods). Recorded on
+/// [`QosProfile::pool`], applied at materialize time; unused by the scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Pool {
     /// Default placement: any general node.
@@ -252,10 +332,17 @@ pub enum QosClass {
 /// stays decoupled from the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QosProfile {
-    /// Per-test namespace aggregate reserve: the amount the broker schedules
-    /// against, and (split across the env's pods) the default pod
-    /// requests/limits when a test doesn't call `.resources()` (§7).
+    /// The component-pod aggregate reserve: split (`even_share`) across the
+    /// validator/indexer pods the test spawns as the default `requests == limits`
+    /// and the size of the per-test namespace's `ResourceQuota`. Excludes the
+    /// runner pod (separate namespace); the whole reserve is [`admitted`](Self::admitted).
     pub footprint: Resources,
+    /// The runner pod's own Guaranteed reserve, distinct from
+    /// [`footprint`](Self::footprint). The runner runs the test binary and any
+    /// in-process wallet, so `wallet` keeps real compute here while the
+    /// orchestration-only tiers keep one core. Summed into
+    /// [`admitted`](Self::admitted) so the scheduler accounts it.
+    pub runner: Resources,
     /// Which pool the tier schedules on.
     pub pool: Pool,
     /// Scheduling priority; higher is admitted first. `sync`/`testnet` are
@@ -263,6 +350,17 @@ pub struct QosProfile {
     pub priority: u8,
     /// The locked execution hard cap (broker exec-cap timer, §5.5).
     pub hard_cap: Duration,
+}
+
+impl QosProfile {
+    /// The whole-cluster reserve the scheduler admits a test against: the
+    /// component-pod aggregate ([`footprint`](Self::footprint)) plus the runner
+    /// pod's own reserve ([`runner`](Self::runner)). Both are real pods the test
+    /// places (in two different namespaces), so admission reserves their sum or
+    /// the runner pod is unbudgeted cluster load.
+    pub fn admitted(&self) -> Resources {
+        self.footprint.saturating_add(&self.runner)
+    }
 }
 
 impl QosClass {
@@ -289,37 +387,49 @@ impl QosClass {
         }
     }
 
-    /// The const profile table. One source of truth for every tier's
+    /// The const profile table: one source of truth for every tier's
     /// schedulable shape.
+    ///
+    /// The I/O reserves are `0` pending calibration: a test's I/O demand isn't
+    /// known a priori, so it must come from measured per-tier `io.stat`, never a
+    /// guess (which would re-introduce the mispricing this dimension exists to
+    /// fix). Left `0`, the I/O dimensions never gate. See
+    /// `docs/qos-io-dimension-design.md`.
     pub const fn profile(self) -> QosProfile {
         match self {
-            // Caps locked at 60 s / 10 min / 10 min / 6 h / 48 h; footprints per §11.
             QosClass::Basic => QosProfile {
-                footprint: Resources::new(1_000, 512 * MIB),
+                footprint: Resources::new(1_000, 512 * MIB, 0, 0),
+                runner: Resources::new(1_000, 512 * MIB, 0, 0),
                 pool: Pool::General,
                 priority: 0,
                 hard_cap: Duration::from_secs(60),
             },
             QosClass::Wallet => QosProfile {
-                footprint: Resources::new(4_000, GIB),
+                footprint: Resources::new(2_000, GIB, 0, 0),
+                // In-process wallet lives in the runner pod, so it carries real
+                // compute, not just orchestration.
+                runner: Resources::new(4_000, GIB, 0, 0),
                 pool: Pool::General,
                 priority: 1,
                 hard_cap: Duration::from_secs(10 * 60),
             },
             QosClass::Integration => QosProfile {
-                footprint: Resources::new(4_000, 2 * GIB),
+                footprint: Resources::new(2_000, 2 * GIB, 0, 0),
+                runner: Resources::new(1_000, GIB, 0, 0),
                 pool: Pool::General,
                 priority: 2,
                 hard_cap: Duration::from_secs(10 * 60),
             },
             QosClass::Testnet => QosProfile {
-                footprint: Resources::new(8_000, 12 * GIB),
+                footprint: Resources::new(8_000, 10 * GIB, 0, 0),
+                runner: Resources::new(1_000, GIB, 0, 0),
                 pool: Pool::General,
                 priority: 3,
                 hard_cap: Duration::from_secs(6 * 60 * 60),
             },
             QosClass::Sync => QosProfile {
-                footprint: Resources::new(16_000, 32 * GIB),
+                footprint: Resources::new(16_000, 16 * GIB, 0, 0),
+                runner: Resources::new(1_000, 2 * GIB, 0, 0),
                 pool: Pool::Nvme,
                 priority: 4,
                 hard_cap: Duration::from_secs(48 * 60 * 60),
@@ -330,13 +440,10 @@ impl QosClass {
 
 // ── Runtime tier (the in-process bridge) ───────────────────────────────
 //
-// The `#[ztest::qos::*]` attribute injects `__enter(class)` as a test's first
-// statement; `TestEnv::build()` reads `current()` to size pods and request a
-// reservation. A thread-local (not a tokio task-local): nextest runs
-// process-per-test, so there is no cross-test leakage within a process, and
-// `build()` reads the tier at its start, before any `.await` could migrate the
-// test future to another worker thread. Mirrors the thread-name reliance in
-// `naming::current_test_name`.
+// The `#[ztest::qos::*]` attribute injects `__enter(class)` first; `build()`
+// reads `current()` at its start (before any `.await` could migrate the future
+// off-thread) to size pods. A thread-local, not a task-local: nextest runs
+// process-per-test, mirroring `naming::current_test_name`.
 
 thread_local! {
     static CURRENT: Cell<QosClass> = const { Cell::new(QosClass::Basic) };
@@ -359,34 +466,46 @@ pub fn current() -> QosClass {
 mod tests {
     use super::*;
 
-    // Resources: the 2-D packing primitive.
+    // Resources: the 4-D packing primitive (CPU × memory × disk-bandwidth ×
+    // disk-IOPS). Every dimension gates and arithmetic is exact per dimension.
 
     #[test]
-    fn fits_within_requires_both_dimensions() {
-        let cap = Resources::new(1000, GIB);
-        // Both fit.
-        assert!(Resources::new(1000, GIB).fits_within(&cap));
-        assert!(Resources::new(500, 512 * MIB).fits_within(&cap));
-        // CPU fits, memory doesn't.
-        assert!(!Resources::new(500, 2 * GIB).fits_within(&cap));
-        // Memory fits, CPU doesn't.
-        assert!(!Resources::new(2000, 512 * MIB).fits_within(&cap));
+    fn fits_within_requires_every_dimension() {
+        let cap = Resources::new(1_000, GIB, 100 * MIB, 5_000);
+        // All four fit (equal is fine).
+        assert!(cap.fits_within(&cap));
+        assert!(Resources::new(500, 512 * MIB, 50 * MIB, 2_000).fits_within(&cap));
+        // Exceeding any single dimension fails, the other three fitting.
+        assert!(!Resources::new(2_000, GIB, 100 * MIB, 5_000).fits_within(&cap));
+        assert!(!Resources::new(1_000, 2 * GIB, 100 * MIB, 5_000).fits_within(&cap));
+        assert!(
+            !Resources::new(1_000, GIB, 200 * MIB, 5_000).fits_within(&cap),
+            "disk bandwidth gates independently"
+        );
+        assert!(
+            !Resources::new(1_000, GIB, 100 * MIB, 9_000).fits_within(&cap),
+            "disk IOPS gates independently"
+        );
     }
 
     #[test]
     fn checked_arithmetic_is_dimension_wise_and_guards_overflow() {
-        let a = Resources::new(1000, GIB);
-        let b = Resources::new(500, 512 * MIB);
+        let a = Resources::new(1_000, GIB, 100 * MIB, 5_000);
+        let b = Resources::new(500, 512 * MIB, 40 * MIB, 2_000);
         assert_eq!(
             a.checked_add(&b),
-            Some(Resources::new(1500, GIB + 512 * MIB))
+            Some(Resources::new(1_500, GIB + 512 * MIB, 140 * MIB, 7_000))
         );
-        assert_eq!(a.checked_sub(&b), Some(Resources::new(500, 512 * MIB)));
-        // Under-subtraction in either dimension is None.
-        assert_eq!(b.checked_sub(&a), None);
-        // Overflow in either dimension is None.
         assert_eq!(
-            Resources::new(u64::MAX, 0).checked_add(&Resources::new(1, 0)),
+            a.checked_sub(&b),
+            Some(Resources::new(500, 512 * MIB, 60 * MIB, 3_000))
+        );
+        // Under-subtraction in any dimension is None.
+        assert_eq!(b.checked_sub(&a), None);
+        // Overflow in any dimension is None — checked here in the IOPS
+        // dimension to prove the guard is not CPU/memory-only.
+        assert_eq!(
+            Resources::new(0, 0, 0, u64::MAX).checked_add(&Resources::new(0, 0, 0, 1)),
             None
         );
     }
@@ -394,9 +513,10 @@ mod tests {
     #[test]
     fn saturating_sub_clamps_at_zero_per_dimension() {
         // Models free = available − committed after a reconcile shrinks
-        // available below committed: free floors at zero, never wraps.
-        let available = Resources::new(1000, GIB);
-        let committed = Resources::new(4000, 8 * GIB);
+        // available below committed: free floors at zero, never wraps — in
+        // every dimension, including the I/O pair.
+        let available = Resources::new(1_000, GIB, 50 * MIB, 1_000);
+        let committed = Resources::new(4_000, 8 * GIB, 200 * MIB, 9_000);
         assert_eq!(available.saturating_sub(&committed), Resources::ZERO);
     }
 
@@ -428,9 +548,14 @@ mod tests {
     }
 
     #[test]
-    fn wallet_tier_reserves_four_cores_one_gib() {
+    fn wallet_tier_puts_its_compute_in_the_runner() {
+        // The in-process wallet lives in the runner pod, so the wallet tier's
+        // runner reserve (4c) dwarfs its component aggregate (2c); the whole
+        // admitted total is their sum (6c / 2Gi).
         let p = QosClass::Wallet.profile();
-        assert_eq!(p.footprint, Resources::new(4_000, GIB));
+        assert_eq!(p.footprint, Resources::new(2_000, GIB, 0, 0));
+        assert_eq!(p.runner, Resources::new(4_000, GIB, 0, 0));
+        assert_eq!(p.admitted(), Resources::new(6_000, 2 * GIB, 0, 0));
         assert_eq!(p.pool, Pool::General);
         assert_eq!(p.hard_cap, Duration::from_secs(10 * 60));
     }
@@ -461,6 +586,76 @@ mod tests {
         QosClass::Testnet,
         QosClass::Sync,
     ];
+
+    #[test]
+    fn every_tier_reserves_zero_io_pending_calibration() {
+        // The I/O dimensions are structurally present but numerically dormant:
+        // a per-tier I/O reserve must come from measured `io.stat`, never a
+        // hand-set guess (which would re-introduce the mispricing the dimension
+        // exists to fix). This guards that invariant — flip it deliberately when
+        // calibration lands (docs/qos-io-dimension-design.md §6).
+        for c in ALL_TIERS {
+            let fp = c.profile().footprint;
+            assert_eq!(fp.io_bps, 0, "{c:?} has a fabricated io_bps reserve");
+            assert_eq!(fp.io_iops, 0, "{c:?} has a fabricated io_iops reserve");
+        }
+    }
+
+    #[test]
+    fn guaranteed_cpu_mem_rounds_cpu_up_to_whole_cores_and_keeps_bytes() {
+        // 4 whole cores exact; memory verbatim in bytes.
+        let (cpu, mem) = Resources::new(4_000, 2 * GIB, 0, 0).guaranteed_cpu_mem("t");
+        assert_eq!(cpu, "4");
+        assert_eq!(mem, (2 * GIB).to_string());
+        // Fractional millicores round UP to a whole core (static-policy pinning).
+        let (cpu, _) = Resources::new(2_500, GIB, 0, 0).guaranteed_cpu_mem("t");
+        assert_eq!(cpu, "3");
+        // Sub-core rounds up to 1.
+        let (cpu, _) = Resources::new(500, 512 * MIB, 0, 0).guaranteed_cpu_mem("t");
+        assert_eq!(cpu, "1");
+    }
+
+    #[test]
+    #[should_panic(expected = "zero CPU")]
+    fn guaranteed_cpu_mem_panics_on_zero_cpu() {
+        let _ = Resources::new(0, GIB, 0, 0).guaranteed_cpu_mem("t");
+    }
+
+    #[test]
+    #[should_panic(expected = "zero memory")]
+    fn guaranteed_cpu_mem_panics_on_zero_memory() {
+        let _ = Resources::new(1_000, 0, 0, 0).guaranteed_cpu_mem("t");
+    }
+
+    #[test]
+    fn every_tier_and_build_pod_footprint_is_pod_schedulable() {
+        // No ztest-spawned pod may be sized at a degenerate footprint (would be
+        // BestEffort/unschedulable). Guards the runner reserves and the build
+        // infra footprints as a set.
+        for c in ALL_TIERS {
+            c.profile().footprint.assert_pod_schedulable("tier footprint");
+            c.profile().runner.assert_pod_schedulable("tier runner");
+        }
+        for fp in [
+            build::BUILDKIT_REST,
+            build::BUILDKIT_BUILD,
+            build::BUILDER_REST,
+            build::BUILDER_BUILD,
+            build::UPLOADER,
+        ] {
+            fp.assert_pod_schedulable("build pod footprint");
+        }
+    }
+
+    #[test]
+    fn wallet_runner_keeps_the_in_process_wallet_compute() {
+        // The wallet runs in-process in the runner pod, so its runner reserve is
+        // ≥4 cores; the orchestration-only tiers keep one core.
+        assert!(QosClass::Wallet.profile().runner.cpu_milli >= 4_000);
+        assert_eq!(QosClass::Integration.profile().runner.cpu_milli, 1_000);
+        assert_eq!(QosClass::Testnet.profile().runner.cpu_milli, 1_000);
+        assert_eq!(QosClass::Sync.profile().runner.cpu_milli, 1_000);
+    }
 
     #[test]
     fn qos_class_label_round_trips() {

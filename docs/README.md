@@ -1,53 +1,31 @@
-# `ztest` — Design Docs
+# ztest documentation
 
-A Rust library that boots Zcash network topologies (validators, indexers,
-wallets) on Kubernetes and hands typed RPC handles back to test code.
-Linked into test binaries as a `dev-dependency` and driven by `cargo nextest`; there is no daemon, no CLI, no IDL. Sibling to
-`infrastructure/zcash_local_net/`, which runs the same shape in-process —
-tests written against one port to the other with cosmetic changes.
+`ztest` is a Rust library that boots isolated Zcash topologies on Kubernetes.
+Test binaries link it as a dev-dependency and run under `cargo nextest`; each
+test gets a fresh, peerable set of `zebrad`/`zaino`/wallet pods and tears them
+down on exit.
 
-The library is the integration-test backend for `zaino` and related
-crates today. It is not bound to that role: anything wanting a fresh,
-isolated, peerable Zcash topology in CI can depend on it.
+## Guides — writing and running tests
 
-1. **[Test-author API](test-author-api.md)** — the Rust surface: how to
-   declare components (`Validator::zebrad(...)`), attach configs and
-   seeded data dirs (`mount_config!` / `mount_archive!`), wire peers,
-   and dial endpoints. Start here if you're writing a test.
+| Doc | Read it to |
+|-----|------------|
+| [guide-writing-tests.md](guide-writing-tests.md) | Write a test: `TestEnv` builder, components, handles, peering, `dev!`, multi-Rust-version matrices |
+| [guide-running-tests.md](guide-running-tests.md) | Invoke the suite in dev and CI, slots, filtering, failure modes |
 
-1. **[Running tests](running-tests.md)** — invocation: `cargo nextest`
-   in dev and CI, slot semantics, namespace naming, the `hash:N/M`
-   partitioning pattern. Read second if you're debugging *why* your
-   test ran (or didn't) the way it did.
+## Operations — running clusters
 
-1. **[Cluster profiles & the image registry](clusters.md)** — `ztest cluster`
-   profiles binding kube-context + image distribution + the OpenShift flag under
-   one name (`ztest run --cluster <name>`); the "one kubeconfig has everything"
-   model (the `ztest.io/registry` extension); and ztest's in-process push to the
-   OpenShift integrated registry (token + CA from the kubeconfig, no `docker
-   login` / `sudo`). Read if runs land on the wrong cluster, or to onboard a
-   developer to a shared/OpenShift cluster.
+| Doc | Read it to |
+|-----|------------|
+| [ops-clusters.md](ops-clusters.md) | Bind a kube-context + image backend under a named `ztest cluster` profile; image distribution |
+| [ops-production-cluster.md](ops-production-cluster.md) | Stand up and operate the bare-metal NixOS/k3s/Ceph cluster |
+| [ops-openshift-setup.md](ops-openshift-setup.md) | Bring up a local CRC/OKD rehearsal cluster; troubleshooting |
 
-1. **[Architecture](architecture-overview.md)** — what happens between
-   the test calling `TestEnv::build()` and a pod being dialable: the
-   per-slot namespace model, sentinel-ConfigMap ownership cascade,
-   content-addressed archive PVCs, the cross-namespace shadow-VSC
-   clone, in-cluster-direct vs port-forward endpoint routing. Read
-   when a test breaks in a way the API docs don't explain.
+## Design — how it works
 
-1. **[Cluster administration](cluster-administration.md)** — the
-   production Kubernetes cluster the library targets: NixOS + k3s + Cilium +
-   Rook-Ceph on bare metal, with GitHub-hosted CI runners reaching it by
-   kubeconfig + registry. Read if you operate the cluster or are
-   bootstrapping a new one.
-
-1. **[Local OpenShift (crc) setup](openshift-cluster-setup.md)** — bringing
-   up a single-node OKD cluster on a workstation via `crc` as the local
-   rehearsal for the OpenShift target: the `oc`/`crc` commands, installing
-   LVMS storage from scratch (crc ships no snapshot substrate), and the
-   `restricted-v2` SCC caveat. Read if you're validating ztest on OpenShift
-   locally.
-
-TODO: Add quality of service annotations to tests. ServiceAccounts will have the authorized level of service it can provide
-
-All pods should have requests and limits. Limits will be tiered based on QOS classes
+| Doc | Covers |
+|-----|--------|
+| [design-architecture.md](design-architecture.md) | K8s substrate: namespaces, ownership/cleanup, networking, seed→snapshot→CoW, observability |
+| [design-execution-engine.md](design-execution-engine.md) | Run-loop scheduler and console render thread |
+| [design-resources.md](design-resources.md) | Provider DAG, resource lifetimes, teardown, storage byte-source |
+| [design-qos.md](design-qos.md) | Tiers, capacity model, scheduler, cross-run ledger, calibration |
+| [design-remote-execution.md](design-remote-execution.md) | Pod-per-test, on-cluster compilation, on-cluster image builds |

@@ -387,6 +387,10 @@ fn storage_fatal(source: &Path, err: storage::StorageError) -> MaterializeErr {
 }
 
 fn uploader_pod(name: &str, pvc_name: &str, cmd: &str) -> Pod {
+    // Guaranteed QoS (requests == limits) at the fixed uploader footprint, via
+    // the single QoS lowering — this pod streams seed bytes through `sh` and
+    // must never be BestEffort.
+    let (cpu, mem) = crate::qos::build::UPLOADER.guaranteed_cpu_mem("seed uploader pod");
     let body = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -407,6 +411,10 @@ fn uploader_pod(name: &str, pvc_name: &str, cmd: &str) -> Pod {
                 "stdin": true,
                 "stdinOnce": true,
                 "volumeMounts": [{ "name": "seed", "mountPath": "/seed" }],
+                "resources": {
+                    "requests": { "cpu": cpu, "memory": mem },
+                    "limits": { "cpu": cpu, "memory": mem },
+                },
             }],
         }
     });

@@ -1,17 +1,11 @@
 //! In-process zingolib wallet backend.
 //!
-//! Implements ztest's backend-agnostic
-//! [`WalletBackend`](crate::handles::wallet::WalletBackend) by running
-//! zingolib `LightClient`s directly in the test binary against a pod-hosted
-//! indexer's gRPC endpoint. [`Wallet::zingo`](crate::component::Wallet::zingo)
-//! hands a test a `ZingoWallet` with the full account / send / shield / sync
-//! API and no wallet glue in the test body.
-//!
-//! Activation heights arrive from the running validator as ztest's
-//! [`ActivationHeights`]; [`to_configured`] crosses them into zingolib's
-//! `ChainType::Regtest` representation. zingolib reads each upgrade height
-//! directly with no implicit fill-in, so every pre-Canopy height the chain
-//! activates must be carried across explicitly.
+//! Implements ztest's
+//! [`WalletBackend`](crate::handles::wallet::WalletBackend) by running zingolib
+//! `LightClient`s in the test binary against a pod-hosted indexer's gRPC.
+//! [`to_configured`] crosses the validator's [`ActivationHeights`] into
+//! zingolib's `ChainType::Regtest`; zingolib does no implicit fill-in, so every
+//! activated height is carried across explicitly.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -46,17 +40,15 @@ use zcash_protocol::consensus::BlockHeight;
 
 const LABEL: &str = "zingo";
 
-/// BIP-39 mnemonic for the regtest faucet, the wallet the validator mines to.
-/// Each validator's miner address (resolved from its `default_coinbase_pool`,
-/// overridable via `Validator::mine_to`) is derived from this seed, so a
-/// faucet account built from it receives the coinbase rewards after a sync.
+/// BIP-39 mnemonic for the regtest faucet. Each validator's miner address is
+/// derived from this seed, so a faucet account built from it receives the
+/// coinbase rewards after a sync.
 pub const FAUCET_SEED: &str = zingo_test_vectors::seeds::ABANDON_ART_SEED;
 
-/// A second well-known test seed, distinct from the faucet. Handy for the
-/// recipient side of a transfer test.
+/// A second well-known test seed, for the recipient side of a transfer.
 pub const RECIPIENT_SEED: &str = zingo_test_vectors::seeds::HOSPITAL_MUSEUM_SEED;
 
-/// In-process zingolib wallet config. ZST handed to the
+/// In-process zingolib wallet config. ZST for the
 /// [`Wallet`](crate::component::Wallet) builder; produces a
 /// [`ZingoWallet`] handle at `add_wallet` time.
 #[derive(Debug, Clone, Default)]
@@ -72,16 +64,14 @@ impl WalletConfig for ZingoBackend {
     type Handle = ZingoWallet;
 
     fn to_handle(&self, _plumbing: HandleInner) -> ZingoWallet {
-        // Wallets run in-process with no pod, so the plumbing back-reference
-        // is unused; the handle owns its own in-process state.
+        // Wallets run in-process; the handle owns its own state, no plumbing.
         ZingoWallet::new()
     }
 }
 
 /// Live in-process zingolib wallet handle. Holds one [`ClientEntry`] per
-/// account; methods dispatch to the matching client. Cheaply cloneable:
-/// clones share the same in-process state, so an account built through one
-/// clone is visible through all of them.
+/// account; methods dispatch to the matching client. Cheaply cloneable: clones
+/// share the same state.
 #[derive(Clone, Default)]
 pub struct ZingoWallet {
     inner: Arc<ZingoInner>,
@@ -90,16 +80,14 @@ pub struct ZingoWallet {
 #[derive(Default)]
 struct ZingoInner {
     /// One [`ClientEntry`] per ztest [`AccountId`]. Each client wraps a
-    /// single-seed wallet, so per-account ops address zingolib sub-account
-    /// `zip32::AccountId::ZERO`: ztest maps one ztest account to one wallet,
-    /// not to a zip32 sub-account index.
+    /// single-seed wallet addressed at `zip32::AccountId::ZERO`: ztest maps one
+    /// account to one wallet, not to a zip32 sub-account index.
     clients: StdMutex<HashMap<u32, ClientEntry>>,
     next_id: AtomicU32,
 }
 
-/// One in-process account: its `LightClient` and the temporary wallet-data
-/// dir held alive for the client's lifetime. Dropping the entry deletes the
-/// dir (and the wallet files under it).
+/// One in-process account: its `LightClient` and the temp wallet-data dir held
+/// alive for the client's lifetime (dropped with the entry).
 struct ClientEntry {
     client: Arc<AsyncMutex<LightClient>>,
     _datadir: TempDir,
@@ -128,10 +116,9 @@ impl ZingoWallet {
     }
 }
 
-/// Cross ztest's [`ActivationHeights`] into zingolib's
-/// `ChainType::Regtest` parameter type. Mirrors `zcash_local_net`'s
-/// `utils::type_conversions`: zingolib reads each upgrade height directly,
-/// so every height the validator activates is carried across verbatim.
+/// Cross ztest's [`ActivationHeights`] into zingolib's `ChainType::Regtest`
+/// parameter type. zingolib does no implicit fill-in, so every activated height
+/// is carried across verbatim.
 fn to_configured(a: &ActivationHeights) -> ConfiguredActivationHeights {
     ConfiguredActivationHeights {
         overwinter: a.overwinter(),
@@ -148,27 +135,22 @@ fn to_configured(a: &ActivationHeights) -> ConfiguredActivationHeights {
 }
 
 /// Birthday for the well-known regtest test wallets. Height 1 is Sapling
-/// activation under the standard regtest fixture, so the wallet's commitment
-/// trees are valid from its first scanned block.
+/// activation under the standard fixture, so commitment trees are valid from
+/// the first scanned block.
 const TEST_WALLET_BIRTHDAY: u32 = 1;
 
-/// How long [`ZingoWallet::funded_faucet`] waits for the indexer to surface
-/// the freshly mined coinbase blocks that fund the faucet.
 const FAUCET_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Regtest coinbase maturity: a coinbase reward is spendable
-/// `COINBASE_MATURITY` blocks after it is mined. A transparent-coinbase faucet
-/// must mine this many extra blocks before its funds are spendable; a shielded
-/// coinbase (Orchard/Sapling) is spendable immediately.
+/// Regtest coinbase maturity: a transparent coinbase is spendable this many
+/// blocks after mining; a shielded coinbase (Orchard/Sapling) is spendable
+/// immediately.
 const COINBASE_MATURITY: u32 = 100;
 
-/// Longer confirm timeout for the transparent-maturity path, which mines
-/// ~100 extra blocks.
+/// Longer confirm timeout for the transparent-maturity path.
 const FAUCET_MATURITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Zingo-specific conveniences on the wallet handle. ztest ships the
-/// well-known regtest seeds, so a test gets a funded faucet or a fresh
-/// recipient without naming a mnemonic.
+/// Zingo-specific conveniences: ztest ships the well-known regtest seeds, so a
+/// test gets a funded faucet or fresh recipient without naming a mnemonic.
 impl ZingoWallet {
     /// Build an in-process wallet account: derive the regtest activation
     /// heights from `validator` (the single source of truth) and point

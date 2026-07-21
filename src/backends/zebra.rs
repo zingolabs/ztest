@@ -20,45 +20,35 @@ use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zebrad";
 
-/// The pool zebrad mines its coinbase into when a test doesn't override
-/// via [`Validator::mine_to`](crate::component::Validator::mine_to).
-/// Transparent is the cheapest block template (no shielded proof per
-/// block), so it is the default for sessions that don't fund from a
-/// shielded coinbase.
+/// Default pool zebrad mines its coinbase into, absent
+/// [`Validator::mine_to`](crate::component::Validator::mine_to). Transparent is
+/// the cheapest template (no per-block shielded proof).
 const DEFAULT_COINBASE_POOL: Pool = Pool::Transparent;
 
-/// The regtest miner address that pins zebrad's coinbase to `pool`.
-///
-/// zebrad fills a unified address's receivers in the order orchard →
-/// sapling → transparent, paying the highest-priority receiver whose pool
-/// is active at the block being mined; a bare transparent address pins the
-/// coinbase to the transparent pool. So each address here resolves the
-/// coinbase to exactly one pool.
+/// The regtest miner address that pins zebrad's coinbase to `pool`. zebrad pays
+/// the highest-priority active receiver of a unified address (orchard →
+/// sapling → transparent), so each address here resolves to exactly one pool.
 fn miner_address(pool: Pool) -> &'static str {
     match pool {
         Pool::Transparent => crate::regtest_conf::MINER_ADDRESS,
         Pool::Sapling => crate::regtest_conf::SHIELDED_MINER_ADDRESS,
         // Ironwood is Orchard-based: mining to the Orchard receiver yields an
-        // Ironwood coinbase once NU6.3 is active, so it uses the Orchard miner
-        // address.
+        // Ironwood coinbase once NU6.3 is active.
         Pool::Orchard | Pool::Ironwood => crate::regtest_conf::ORCHARD_MINER_ADDRESS,
     }
 }
 
-/// Chain-poll cadence and default ceiling for this backend's `poll_*` /
+/// Chain-poll cadence and default timeout for this backend's `poll_*` /
 /// `wait_for_block_num` loops, plus the inter-block mining delay.
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOCK_GENERATION_DELAY: Duration = Duration::from_millis(1500);
 
-/// Resolve the container image for a zebrad pod. Used by
-/// `manifest::pod_spec_for_validator`. The *default* image is the published
-/// `zfnd/zebra:<version>` tag (an [`ImageSpec::Published`](crate::backends::image::ImageSpec)
-/// spec). A [`Dev`](crate::backends::image::ImageSpec::Dev) spec *overrides* that
-/// default with a `zebrad:dev-<hash>` image built + loaded by the preflight
-/// pipeline; if the pipeline never produced it, resolution yields
-/// [`ImageError::DevImageMissing`] and the test FAILS — an override never
-/// silently degrades back to the default published tag.
+/// Resolve the container image for a zebrad pod. Default is the published
+/// `zfnd/zebra:<version>` tag; a [`Dev`](crate::backends::image::ImageSpec::Dev)
+/// spec overrides it with a `zebrad:dev-<hash>` image, or fails via
+/// [`ImageError::DevImageMissing`] if the pipeline never built it — an override
+/// never silently degrades to the published tag.
 pub(crate) fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
@@ -66,7 +56,7 @@ pub(crate) fn image_uri(
     crate::backends::image::resolve(&opts.image, &default_image)
 }
 
-/// Zebrad-flavoured validator spec. ZST handed to the
+/// Zebrad-flavoured validator spec. ZST for the
 /// [`Validator`](crate::component::Validator) builder; produces a
 /// [`ZebraValidator`] handle at `add_validator` time.
 #[derive(Debug, Clone)]
@@ -112,15 +102,12 @@ impl ValidatorConfig for ZebraBackend {
         let default_streams = crate::regtest::regtest_test_post_nu6_funding_streams();
         let funding_streams = opts.funding_streams.as_ref().unwrap_or(&default_streams);
 
-        // Persistent on-disk state comes from one of two sources, never
-        // both:
-        //  - `shared_state`: this validator shares its zebra-state DB with a
-        //    colocated zaino StateService; persist to the shared mount and
-        //    serve the indexer gRPC the syncer connects to.
-        //  - `regtest_cache`: boot from (or generate) a chain-cache at
-        //    `ZEBRAD_REGTEST_CACHE_DIR`; persistent, but no StateService, so
-        //    no indexer gRPC.
-        // `shared_state` wins if a caller somehow sets both.
+        // Persistent on-disk state comes from one of two sources (shared_state
+        // wins if both are set):
+        //  - `shared_state`: share the zebra-state DB with a colocated zaino
+        //    StateService and serve the indexer gRPC its syncer connects to.
+        //  - `regtest_cache`: boot from a chain-cache at
+        //    `ZEBRAD_REGTEST_CACHE_DIR`; no StateService, so no indexer gRPC.
         let persistent = if let Some(s) = opts.shared_state.as_ref() {
             Some(crate::regtest_conf::ZebradPersistentState {
                 cache_dir: &s.mount_path,
@@ -144,8 +131,6 @@ impl ValidatorConfig for ZebraBackend {
             lockbox,
             Some(funding_streams),
             persistent,
-            // Coinbase recipient for the resolved pool (set in
-            // `add_validator`; falls back to the backend default).
             miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
         );
         opts.mounts.push(crate::regtest::config_mount_inline(
@@ -153,9 +138,9 @@ impl ValidatorConfig for ZebraBackend {
             CONTAINER_CONFIG_PATH,
         ));
 
-        // Back the persistent `cache_dir` with a volume. The shared-state
-        // path mounts its own shared PVC (in `persistent_state_in`), so
-        // only wire the cache mount when `shared_state` is absent.
+        // Back the persistent `cache_dir` with a volume. The shared-state path
+        // mounts its own PVC (in `persistent_state_in`), so only wire the cache
+        // mount when `shared_state` is absent.
         if opts.shared_state.is_none() {
             match &opts.regtest_cache {
                 Some(crate::component::RegtestCacheSource::Archive(path)) => {
@@ -173,24 +158,22 @@ impl ValidatorConfig for ZebraBackend {
     }
 }
 
-/// Container path the regtest chain-cache (persistent zebra-state) is
-/// mounted at, and where `zebrad.toml`'s `[state] cache_dir` points when a
-/// validator boots from a cache. Mirrors the testnet cache dir; kept
-/// distinct so the two paths can diverge.
+/// Mount path for the regtest chain-cache (persistent zebra-state), and where
+/// `zebrad.toml`'s `[state] cache_dir` points when booting from a cache. Kept
+/// distinct from the testnet cache dir so the two can diverge.
 const ZEBRAD_REGTEST_CACHE_DIR: &str = "/var/cache/zebrad";
 
 // ──────────────────────────── ZebraValidator ──────────────────────────
 
-/// Live zebrad validator handle. Holds only the env plumbing; all node state
-/// is remote, reached over JSON-RPC.
+/// Live zebrad validator handle. Holds only the env plumbing; node state is
+/// remote, reached over JSON-RPC.
 #[derive(Debug, Clone)]
 pub struct ZebraValidator {
     plumbing: HandleInner,
 }
 
 impl ZebraValidator {
-    /// Unauthed JSON-RPC transport for this validator's `rpc` endpoint.
-    /// zebrad does not gate calls on auth, so `auth = None`.
+    /// Unauthed JSON-RPC transport; zebrad does not gate calls on auth.
     async fn rpc_client(&self) -> Result<AuthedRpc, EnvError> {
         Ok(json_rpc(&self.plumbing.endpoint("rpc").await?))
     }
@@ -225,13 +208,11 @@ impl ValidatorBackend for ZebraValidator {
             args: opts.args.clone(),
             resources: opts.resources.clone(),
             env: opts.env.clone(),
-            // When sharing its zebra-state DB, run zebrad as the same uid
-            // (1000) the zaino reader uses, so the DB files it writes
-            // (including the mode-0600 `version` file) are owned by 1000
-            // and readable by the colocated StateService that opens them
-            // as a secondary. fsGroup is ineffective here: hostPath /
-            // local-path volumes ignore it, and the zainod image refuses
-            // to run as root, so matching uids is the portable fix.
+            // When sharing its zebra-state DB, run zebrad as the same uid the
+            // zaino reader uses so the DB files it writes (incl. the mode-0600
+            // `version` file) are readable by the colocated StateService.
+            // fsGroup can't fix this: hostPath/local-path volumes ignore it and
+            // the zainod image refuses to run as root, so uids must match.
             fs_group: opts.shared_state.as_ref().map(|_| 1000),
             run_as_user: opts.shared_state.as_ref().map(|_| 1000),
             placement: None,
@@ -256,8 +237,8 @@ impl ValidatorBackend for ZebraValidator {
     }
 
     async fn ready(&self, timeout: std::time::Duration) -> Result<(), RpcError> {
-        // zebrad's strongest "ready to drive tests" probe on regtest is
-        // `getblocktemplate`; unauthed, matching `rpc_client`.
+        // `getblocktemplate` is zebrad's strongest "ready to drive tests"
+        // probe on regtest.
         let ep = self.plumbing.endpoint("rpc").await?;
         let client = json_rpc(&ep);
         wait_for_rpc_ready(
@@ -279,13 +260,10 @@ impl ValidatorBackend for ZebraValidator {
     }
 
     async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError> {
-        // zebrad's `generate` RPC mines `n` blocks server-side, gated on
-        // `Network::Regtest` / `disable_pow()`. It runs the full
-        // get_block_template, proposal_block_from_template, submit_block path
-        // internally but over RPC, keeping the entire Zebra node tree out of
-        // our dependency graph. The call is synchronous: it returns the mined
-        // block hashes only after the chain advances, so no client-side retry
-        // loop is needed.
+        // zebrad's `generate` RPC mines `n` blocks server-side (gated on
+        // regtest / `disable_pow()`), keeping the Zebra node tree out of our
+        // dependency graph. Synchronous: it returns only after the chain
+        // advances, so no client-side retry loop is needed.
         let client = self.rpc_client().await?;
         let _: Value = client
             .json_result_from_call("generate", &json!([n]))
@@ -295,8 +273,8 @@ impl ValidatorBackend for ZebraValidator {
     }
 
     fn pool_support(&self) -> PoolSupport {
-        // zebrad validates every value pool on regtest; the pool its
-        // coinbase pays into was chosen per-validator (default Transparent).
+        // zebrad validates every value pool; the coinbase pool is chosen
+        // per-validator (default Transparent).
         PoolSupport {
             supported: &[
                 Pool::Orchard,
@@ -372,20 +350,17 @@ impl ValidatorBackend for ZebraValidator {
     }
 
     async fn chain_config(&self) -> Result<ChainConfig, RpcError> {
-        // First-halving height is a fixed per-network consensus constant. We
-        // carry the three values directly rather than linking `zebra-chain`
-        // (which drags in the full ~250-crate Orchard/Halo2 proving stack) for
-        // three integers. These match zebra-chain's
-        // `ParameterSubsidy::height_for_first_halving`: mainnet first halving is
-        // at Canopy. <https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams>
+        // First-halving height is a fixed per-network consensus constant,
+        // carried directly rather than linking `zebra-chain` for three
+        // integers. Matches its `ParameterSubsidy::height_for_first_halving`.
+        // <https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams>
         const REGTEST_FIRST_HALVING: u32 = 287;
         const TESTNET_FIRST_HALVING: u32 = 1_116_000;
         const MAINNET_FIRST_HALVING: u32 = 1_046_400;
 
         // Regtest is known from config, not RPC: zebra models it as a
-        // Testnet-kind network whose `getblockchaininfo.chain` reports
-        // `"test"`, so it can't be told apart from a real testnet by RPC.
-        // For testnet/mainnet the `chain` string is unambiguous.
+        // Testnet-kind network whose `getblockchaininfo.chain` reports `"test"`,
+        // so RPC can't tell it apart from a real testnet.
         let (network, first_halving) = if self.plumbing.regtest {
             ("regtest".to_string(), Some(REGTEST_FIRST_HALVING))
         } else {
@@ -492,9 +467,8 @@ const ZEBRAD_TESTNET_CACHE_DIR: &str = "/var/cache/zebrad";
 
 // ──────────────────── zebrad-only typed JSON-RPC views ─────────────────
 //
-// Backend-specific RPCs as inherent methods on the concrete handle: they
-// simply don't exist on `ZcashdValidator`, so calling them on the wrong
-// backend is a compile error.
+// Inherent methods on the concrete handle: they don't exist on
+// `ZcashdValidator`, so calling one on the wrong backend is a compile error.
 
 impl ZebraValidator {
     /// Chain identity + tip summary. See [`BlockchainInfo`].

@@ -1,12 +1,8 @@
-//! Compute the dynamic-library search path (`LD_LIBRARY_PATH` on Linux) that
-//! every test child must inherit, from the `cargo nextest list` build-meta.
-//!
-//! Without this, test binaries that link libstd dynamically fail to start with
-//! a libstdc++ "exit 127". Reproduces `RustBuildMeta::dylib_paths`
-//! (nextest-runner `list/rust_build_meta.rs`): linked paths (that exist) first,
-//! then each base output directory plus its `deps` subdir, then the host and
-//! target rustc libdirs, deduped preserving order, prepended to the inherited
-//! value. The on-disk existence check is injectable, so this stays pure.
+//! The dynamic-library search path (`LD_LIBRARY_PATH` on Linux) every test child
+//! must inherit, from the `cargo nextest list` build-meta. Without it, binaries
+//! that link libstd dynamically fail to start with a libstdc++ "exit 127".
+//! Reproduces nextest's `RustBuildMeta::dylib_paths`; the existence check is
+//! injectable so this stays pure.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -24,10 +20,9 @@ pub const fn dylib_path_envvar() -> &'static str {
     }
 }
 
-/// Build the full env value to set: computed dirs prepended to `inherited`.
-///
-/// Reads the live filesystem for the linked-path existence check and the
-/// process's current value of [`dylib_path_envvar`] as `inherited`.
+/// Build the full env value to set: computed dirs prepended to the process's
+/// current [`dylib_path_envvar`] value, reading the live filesystem for the
+/// linked-path existence check.
 pub fn dylib_path_value(meta: &RustBuildMetaSummary) -> OsString {
     let inherited = std::env::var_os(dylib_path_envvar());
     join(dylib_dirs(meta, &|p| p.exists()), inherited)
@@ -37,7 +32,7 @@ pub fn dylib_path_value(meta: &RustBuildMetaSummary) -> OsString {
 /// `exists` gates only the relative linked paths, matching nextest.
 fn dylib_dirs(meta: &RustBuildMetaSummary, exists: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
     // Cargo joins build-relative paths against the build directory; fall back to
-    // the target directory on summaries from older nextest (pre-0.9.131).
+    // the target directory for pre-0.9.131 nextest summaries lacking it.
     let build_dir = meta
         .build_directory
         .as_ref()
@@ -46,7 +41,7 @@ fn dylib_dirs(meta: &RustBuildMetaSummary, exists: &dyn Fn(&Path) -> bool) -> Ve
 
     let mut dirs: Vec<PathBuf> = Vec::new();
 
-    // 1. Linked paths (relative), only if present on disk (Cargo's order).
+    // Linked paths (relative), only if present on disk.
     for rel in &meta.linked_paths {
         let p = build_dir.join(rel.as_str());
         if exists(&p) {
@@ -54,15 +49,14 @@ fn dylib_dirs(meta: &RustBuildMetaSummary, exists: &dyn Fn(&Path) -> bool) -> Ve
         }
     }
 
-    // 2. Each base output directory, then its `deps` subdir. Cargo's order is
-    //    deps-first.
+    // Each base output directory, deps subdir first (Cargo's order).
     for base in &meta.base_output_directories {
         let abs = build_dir.join(base.as_str());
         dirs.push(abs.join("deps"));
         dirs.push(abs);
     }
 
-    // 3. Host + target rustc libdirs (so binaries find libstd).
+    // Host + target rustc libdirs (so binaries find libstd).
     if let Some(platforms) = &meta.platforms {
         if let Some(p) = libdir_path(&platforms.host.libdir) {
             dirs.push(p);
@@ -101,8 +95,8 @@ fn join(dirs: Vec<PathBuf>, inherited: Option<OsString>) -> OsString {
     if let Some(inherited) = inherited {
         all.extend(std::env::split_paths(&inherited));
     }
-    // `join_paths` only errors if a path contains the separator char; our paths
-    // come from cargo metadata and won't, but fall back gracefully anyway.
+    // `join_paths` only errors on a path containing the separator char; fall
+    // back gracefully anyway.
     std::env::join_paths(&all).unwrap_or_else(|_| {
         all.first()
             .map(|p| p.as_os_str().to_os_string())
@@ -119,9 +113,8 @@ mod tests {
         PlatformLibdirSummary::Available { path: path.into() }
     }
 
-    // `PlatformSummary` lives in `target-spec`, not nextest-metadata, so the
-    // tests exercise path ordering with `platforms = None` and cover libdir
-    // extraction directly via `libdir_path`.
+    // `PlatformSummary` isn't constructible from nextest-metadata, so tests use
+    // `platforms = None` and cover libdir extraction directly via `libdir_path`.
     fn meta(build_dir: &str, base: &[&str], linked: &[&str]) -> RustBuildMetaSummary {
         RustBuildMetaSummary {
             target_directory: build_dir.into(),
@@ -153,7 +146,6 @@ mod tests {
     #[test]
     fn linked_paths_filtered_by_existence_and_come_first() {
         let m = meta("/build", &["debug"], &["extra/a", "extra/b"]);
-        // Only /build/extra/a exists.
         let dirs = dylib_dirs(&m, &|p| p == Path::new("/build/extra/a"));
         assert_eq!(dirs[0], PathBuf::from("/build/extra/a"));
         assert!(!dirs.contains(&PathBuf::from("/build/extra/b")));

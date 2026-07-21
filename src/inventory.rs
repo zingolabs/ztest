@@ -1,24 +1,15 @@
 //! Link-time inventory of dev-image declarations.
 //!
-//! The [`dev!`] macro (`ztest_macros`) emits a hidden
-//! `::ztest::__private::inventory::submit!` for every call site. The
-//! `inventory` crate aggregates submissions across the binary's full
-//! reachable graph at link time and exposes them via `iter()`.
+//! The [`dev!`] macro submits declarations via the `inventory` crate, which
+//! aggregates them across the binary's reachable graph at link time. The CLI
+//! spawns each test binary with `ZTEST_DUMP_INVENTORY=1`; [`dump_hook`] then
+//! serializes the inventory to stdout (one JSON object per line) and exits
+//! before any test runs, so the tag never crosses the process boundary as a
+//! linked dependency.
 //!
-//! The ztest CLI doesn't link the test binaries' inventory directly;
-//! instead it spawns each selected test binary with
-//! `ZTEST_DUMP_INVENTORY=1`. The [`dump_hook`] `#[ctor::ctor]` below runs
-//! before libtest sees `argv`, serializes the inventory to stdout as one
-//! JSON object per line, and exits with status `0`. No test runs in that
-//! mode; the cost on normal runs is one `env::var_os` check at process
-//! start.
-//!
-//! Two types share one schema. [`DevImageDecl`] is the registration type:
-//! its fields are `&'static str` / `&'static [&'static str]` so the value
-//! is fully const-evaluable, as required by `inventory::submit!`'s static
-//! initializer. [`DevImageEntry`] is the read type carrying owned
-//! [`String`] / [`Vec<String>`], into which the dumped JSON deserializes.
-//! Both serialize to the same JSON shape, so either type round-trips.
+//! Each declaration kind pairs a const-evaluable `*Decl` (fields are `&'static`,
+//! as `inventory::submit!`'s static initializer requires) with an owned `*Entry`
+//! read type; both serialize to the same JSON, so either round-trips.
 //!
 //! [`dev!`]: ztest_macros::dev
 
@@ -26,34 +17,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::qos::QosClass;
 
-/// One dev-image declaration, ready for `inventory::submit!`. Fields are
-/// `&'static` so the struct value can be constructed in a static
-/// initializer.
+/// One dev-image declaration, ready for `inventory::submit!`.
 ///
 /// `repo` is the local image name (`zainod`, `zebrad`, ...); the preflight
-/// pipeline produces `<repo>:dev-<hash>` where `<hash>` is the SHA-256 over
-/// (dockerfile bytes ‖ context tree ‖ features ‖ pinned rust version), truncated
-/// to 12 hex chars.
-/// The same hash is recomputed at `env.build()` to look up the pre-built
-/// tag, so the tag never has to traverse the process boundary.
+/// pipeline produces `<repo>:dev-<hash>`, the SHA-256 over (dockerfile bytes ‖
+/// context tree ‖ features ‖ pinned rust version) truncated to 12 hex chars.
+/// The same hash is recomputed at `env.build()` to look up the pre-built tag.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct DevImageDecl {
     pub repo: &'static str,
     pub source: DevSourceDecl,
     pub features: &'static [&'static str],
-    /// Rust versions to pre-build this image at (the `rust_versions` / singular
-    /// `rust_version` key on `dev!`). Each becomes its own `<repo>:dev-<hash>`
-    /// image. Empty ⇒ one image with the Dockerfile's own `RUST_VERSION` default.
-    /// This is the *build-set*: because images are provisioned before any test
-    /// runs, the set of toolchains has to be statically declarable here — an
-    /// rstest `#[case]` value is a runtime arg the dump can't see. See
-    /// `docs/rust-version-matrix.md`.
+    /// Rust versions to pre-build this image at. Each becomes its own
+    /// `<repo>:dev-<hash>` image; empty ⇒ one image with the Dockerfile's own
+    /// `RUST_VERSION` default. Must be statically declarable here because images
+    /// are provisioned before any test runs, so a runtime rstest `#[case]` value
+    /// can't reach it. See `docs/rust-version-matrix.md`.
     pub rust_versions: &'static [&'static str],
 }
 
-/// Const-evaluable mirror of [`crate::backends::image::DevSource`], for the
-/// `inventory::submit!` static initializer. Serializes to the same JSON, so it
-/// round-trips into the owned `DevSource` on the read side.
+/// Const-evaluable mirror of [`crate::backends::image::DevSource`] for the
+/// `inventory::submit!` static initializer; serializes to the same JSON so it
+/// round-trips into the owned `DevSource`.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub enum DevSourceDecl {
     /// Dockerfile + context in the local checkout (absolute paths).
@@ -73,20 +58,17 @@ pub enum DevSourceDecl {
 
 inventory::collect!(DevImageDecl);
 
-/// Owned counterpart of [`DevImageDecl`] used on the read side of the
-/// dump-and-parse boundary. Pipeline modules pass `DevImageEntry` values
-/// around because they need the values to outlive the originating binary's
-/// process.
+/// Owned counterpart of [`DevImageDecl`] for the read side of the dump-and-parse
+/// boundary; the values must outlive the originating binary's process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevImageEntry {
     pub repo: String,
     pub source: crate::backends::image::DevSource,
     pub features: Vec<String>,
-    /// The single rust version this image is built at, if any. `None` leaves the
-    /// Dockerfile's own `RUST_VERSION` default in place. A [`DevImageDecl`]
-    /// carrying N `rust_versions` expands to N entries (see [`expand_decl`]), so
-    /// downstream — tag, dedup, resource node — treats each variant as a
-    /// distinct image with no special-casing.
+    /// The single rust version this image is built at; `None` leaves the
+    /// Dockerfile's own `RUST_VERSION` default. A [`DevImageDecl`] with N
+    /// `rust_versions` expands to N entries (see [`expand_decl`]), each a
+    /// distinct image downstream.
     pub rust_version: Option<String>,
 }
 
@@ -143,13 +125,11 @@ pub fn iter() -> impl Iterator<Item = &'static DevImageDecl> {
 
 // ─────────────────────────── QOS tier inventory ───────────────────────
 //
-// Mirrors the `DevImageDecl`/`DevImageEntry` split. The `#[ztest::qos::*]`
-// attribute submits a `QosDecl`; the dump hook emits it (tagged) on the
-// same stream, and `ztest run` reads `QosEntry` to group selected tests by
-// tier.
+// The `#[ztest::qos::*]` attribute submits a `QosDecl`; `ztest run` reads
+// `QosEntry` off the dump stream to group selected tests by tier.
 
 /// One QOS tier declaration, ready for `inventory::submit!`. `test_id` is
-/// `concat!(module_path!(), "::", test_fn)` from the attribute's call site.
+/// `concat!(module_path!(), "::", test_fn)` from the call site.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct QosDecl {
     pub test_id: &'static str,
@@ -181,19 +161,16 @@ pub fn qos_iter() -> impl Iterator<Item = &'static QosDecl> {
 
 // ─────────────────────────── seed inventory ───────────────────────────
 //
-// Mirrors the `DevImageDecl`/`DevImageEntry` split for the data seeds a test
-// declares via `mount_archive!` / `mount_file!`. Declaring the seed at the call
-// site (a static `SeedDecl`, dumped like `dev!`) lets the preflight resource
-// graph **pre-provision** it (`materialize::ensure_seed`) before any test runs,
-// instead of the first test to reach `TestEnv::build()` materializing it lazily.
-// A seed is content-addressed by the SHA-256 of its source bytes — the same hash
-// `materialize`/`env` recompute at `build()` — so the id never crosses the
-// process boundary; only the source path does.
+// Data seeds a test declares via `mount_archive!` / `mount_file!`. Declaring the
+// seed as a static `SeedDecl` at the call site lets the preflight resource graph
+// pre-provision it before any test runs, instead of the first test to reach
+// `TestEnv::build()` materializing it lazily. A seed is content-addressed by the
+// SHA-256 of its source bytes (recomputed at `build()`), so only the source path
+// crosses the process boundary.
 
 /// How a seed's source is loaded into its PVC: extracted (archive) or copied
-/// byte-for-byte (file). Mirrors `materialize::Payload`, kept here so the wire
-/// declaration stays independent of the kube-side type. (Field name is `payload`,
-/// not `kind`, to avoid colliding with the `InventoryLine` serde tag.)
+/// byte-for-byte (file). The field is named `payload`, not `kind`, to avoid
+/// colliding with the `InventoryLine` serde tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SeedPayload {
@@ -203,10 +180,9 @@ pub enum SeedPayload {
     File,
 }
 
-/// One seed declaration, ready for `inventory::submit!`. `source` is the
-/// caller-relative path already resolved to an absolute path by the macro at
-/// compile time (same rule as `dev!`), so the preflight process can read and
-/// hash it directly.
+/// One seed declaration, ready for `inventory::submit!`. `source` is resolved
+/// to an absolute path by the macro at compile time, so the preflight process
+/// can read and hash it directly.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SeedDecl {
     pub source: &'static str,
@@ -238,16 +214,13 @@ pub fn seed_iter() -> impl Iterator<Item = &'static SeedDecl> {
 
 // ───────────────────────── test→resource edges ────────────────────────
 //
-// The sound, per-test dependency edge. `#[ztest::archive(NAME = "path")]` (and
-// the `#[ztest::needs(NAME)]` companion) submit a `TestDepDecl` alongside the
-// `SeedDecl` that makes the resource provisionable. Where `SeedDecl` says "this
-// resource exists and can be built", `TestDepDecl` says "this specific test needs
-// it" — so `ztest run` can gate admission and cleanly SKIP only the tests whose
-// resource failed (or is still provisioning), rather than letting them fail at
-// `TestEnv::build()`. `test_id` is crate-rooted like `QosDecl` (the engine strips
-// the crate segment the same way); `resource` is the absolute source path, the
-// SAME string carried by the paired `SeedDecl`, so the engine can key the edge to
-// the resource's content-addressed node.
+// The per-test dependency edge. `#[ztest::archive(NAME = "path")]` (and the
+// `#[ztest::needs(NAME)]` companion) submit a `TestDepDecl` alongside the
+// `SeedDecl` that makes the resource provisionable: where `SeedDecl` says the
+// resource can be built, `TestDepDecl` says which test needs it, so `ztest run`
+// can gate admission and cleanly SKIP only the tests whose resource failed
+// rather than let them fail at `TestEnv::build()`. `resource` is the SAME string
+// as the paired `SeedDecl::source`, keying the edge to the resource's node.
 
 /// One test→resource dependency edge, ready for `inventory::submit!`.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -282,15 +255,11 @@ pub fn dep_iter() -> impl Iterator<Item = &'static TestDepDecl> {
     inventory::iter::<TestDepDecl>()
 }
 
-/// One dump line, tagged so the declaration kinds share one stream.
-/// `InventoryLineRef` is the borrowed write side (serialized by the dump
-/// hook); [`InventoryLine`] is the owned read side. Internal serde tagging
-/// merges `"kind"` into the object, e.g. `{"kind":"dev","repo":...}` /
-/// `{"kind":"qos",...}` / `{"kind":"seed","source":...,"payload":...}`.
-///
-/// Dev images have no borrowed variant: one static [`DevImageDecl`] fans out
-/// (via [`expand_decl`]) into N owned [`DevImageEntry`] lines — one per rust
-/// version — so the hook serializes the owned [`InventoryLine::Dev`] directly.
+/// Borrowed write side of a dump line (serialized by the dump hook), tagged with
+/// `"kind"` so the declaration kinds share one stream; [`InventoryLine`] is the
+/// owned read side. Dev images have no borrowed variant: one static
+/// [`DevImageDecl`] fans out (via [`expand_decl`]) into N owned
+/// [`DevImageEntry`] lines, serialized as [`InventoryLine::Dev`] directly.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum InventoryLineRef<'a> {
@@ -309,16 +278,11 @@ pub enum InventoryLine {
     Dep(TestDepEntry),
 }
 
-/// Pre-main dump hook.
-///
-/// When the surrounding test binary is spawned with
-/// `ZTEST_DUMP_INVENTORY=1`, this constructor runs before libtest (or any
-/// other harness) sees `argv`. We serialize every linked-in
-/// [`DevImageDecl`] to stdout as one JSON object per line, then `exit(0)`.
-/// No tests run; the process never returns to `main`.
-///
-/// Normal test runs hit a single `env::var_os` check and return without
-/// doing anything else, at negligible cost next to process startup.
+/// Pre-main dump hook. When the test binary is spawned with
+/// `ZTEST_DUMP_INVENTORY=1`, this constructor runs before the harness sees
+/// `argv`, serializes every linked-in declaration to stdout (one JSON object per
+/// line), and `exit(0)`s without running any test. Normal runs hit a single
+/// `env::var_os` check and return.
 #[ctor::ctor]
 fn dump_hook() {
     if std::env::var_os("ZTEST_DUMP_INVENTORY").is_none() {
@@ -326,8 +290,6 @@ fn dump_hook() {
     }
     let mut stdout = std::io::stdout().lock();
     use std::io::Write;
-    // One tagged JSON object per line; dev-image and QOS declarations share
-    // the stream and are demuxed by `"kind"` on the read side.
     let emit = |line: std::io::Result<()>| {
         if let Err(err) = line {
             let _ = writeln!(

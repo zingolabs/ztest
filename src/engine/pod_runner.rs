@@ -1,22 +1,11 @@
-//! Execute one test in a sibling runner pod instead of a local child process.
-//!
-//! The runner pod runs the on-cluster-baked runner image (the compiled test
-//! binaries `crane`-appended onto the Debian runner base,
-//! `docker/runner-base.Dockerfile`), with the build outputs delivered via
-//! [`PodRunConfig::volumes`] and the binary launched exactly as the local
-//! executor launches it (`--exact <name> --nocapture`). This gives the two
-//! properties the local executor can't on a remote cluster: the heavy wallet
-//! compute runs in-cluster, and the whole test is hermetic — it can only see its
-//! own per-test namespace, not the laptop's environment.
-//!
-//! Delivery is decoupled: this module takes ready volumes/mounts plus a
-//! local→pod [`PodRunConfig::path_map`], so the same code serves a `kind`
-//! hostPath mount and a remote image-layer/PVC without change. Paths under a
-//! mapped prefix are rewritten; `/nix/store` paths pass through (present in the
-//! image).
+//! Execute one test in a sibling runner pod instead of a local child process, so
+//! the heavy wallet compute runs in-cluster and the test is hermetic (it sees
+//! only its own per-test namespace). Delivery is decoupled: this module takes
+//! ready volumes/mounts plus a local→pod [`PodRunConfig::path_map`], so the same
+//! code serves a `kind` hostPath mount and a remote image-layer/PVC unchanged.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use k8s_openapi::api::core::v1 as corev1;
 use kube::api::{Api, DeleteParams, LogParams, ObjectMeta, PostParams};
@@ -26,21 +15,12 @@ use crate::engine::events::Verdict;
 use crate::engine::local_runner::{EngineEnv, Executor, OutcomeFuture, TestOutcome};
 use crate::engine::plan::WorkItem;
 
-/// How often the pod's phase is polled while awaiting a terminal state.
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
+use crate::pod_status::{
+    IMAGE_PULL_GRACE, POLL_INTERVAL, PodPhases, exit_code, image_error, pod_phases,
+    pull_error_is_terminal,
+};
 
-/// How long a pod may sit in a *transient* image-pull error before it's declared
-/// terminal. The kubelet retries pulls with backoff, so a transient cause — most
-/// visibly a `pull QPS exceeded` storm when many pods launch at once on a single
-/// node, which clears the moment the first pod warms the node's image cache
-/// (`imagePullPolicy: IfNotPresent`) — self-heals well within this window.
-/// `InvalidImageName` is never transient and ignores the grace (see
-/// [`pull_error_is_terminal`]); a genuinely absent image fails after the grace.
-const IMAGE_PULL_GRACE: Duration = Duration::from_secs(90);
-
-/// Image repo of the baked tests image (`docs/remote-test-execution.md`). The
-/// on-cluster `crane` bake appends the compiled binaries onto the runner base and
-/// pushes under this repo.
+/// Image repo of the baked tests image (`docs/remote-test-execution.md`).
 pub const RUNNER_REPO: &str = "ztest-runner";
 
 /// Everything the pod executor needs that isn't per-test: which cluster/namespace
@@ -91,13 +71,10 @@ impl std::fmt::Debug for PodExecutor {
 }
 
 impl PodRunConfig {
-    /// A hostPath-delivery config for local (`kind`) runs. The workspace tree is
-    /// visible on the node at `node_workspace` (for `kind`, via the cluster's
-    /// `extraMounts`) and mounted into the pod at the *same* absolute path it has
-    /// on the laptop (`local_workspace`) — so the binary, cwd, and build-output
-    /// search paths all resolve unchanged (empty `path_map`), and `/nix/store`
-    /// comes from the image. Read-only: tests write to their own `TempDir`s, not
-    /// the source tree.
+    /// A hostPath-delivery config for local (`kind`) runs: the node's workspace at
+    /// `node_workspace` is mounted read-only into the pod at the *same* absolute
+    /// path it has on the laptop (`local_workspace`), so binary/cwd/search paths
+    /// resolve unchanged (empty `path_map`) and `/nix/store` comes from the image.
     #[allow(clippy::too_many_arguments)]
     pub fn hostpath(
         env: EngineEnv,
@@ -135,11 +112,9 @@ impl PodRunConfig {
         }
     }
 
-    /// A baked-delivery config for remote runs: the build outputs are already
-    /// inside `image` at their original absolute paths (a thin layer over the nix
-    /// base — see `docs/remote-test-execution.md` §2), so no volume is mounted and
-    /// paths resolve unchanged. This is the delivery the remote cluster uses;
-    /// [`Self::hostpath`] is the local-`kind` shortcut.
+    /// A baked-delivery config for remote runs: the build outputs are already in
+    /// `image` at their original absolute paths (`docs/remote-test-execution.md`
+    /// §2), so no volume is mounted and paths resolve unchanged.
     pub fn baked(
         env: EngineEnv,
         image: String,
@@ -198,14 +173,20 @@ async fn run_in_pod(
     // When this pod's containers first entered an image-pull error, so a transient
     // storm can be waited out for `IMAGE_PULL_GRACE` before it's declared terminal.
     let mut pull_error_since: Option<Instant> = None;
+    // The most recent full pod observation, retained so the terminal timing
+    // breakdown can read the kube-server phase timestamps (`pod_phases`).
+    let mut last_pod: Option<corev1::Pod> = None;
     let done = loop {
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {
                 if let Ok(p) = api.get(&name).await {
-                    if let Some(st) = terminal_state(&p) {
+                    let terminal = terminal_state(&p);
+                    last_pod = Some(p);
+                    if let Some(st) = terminal {
                         break Done::Reached(st);
                     }
-                    match p.status.as_ref().and_then(image_error) {
+                    let status = last_pod.as_ref().and_then(|p| p.status.as_ref());
+                    match status.and_then(image_error) {
                         Some(reason) => {
                             let first = *pull_error_since.get_or_insert_with(Instant::now);
                             if pull_error_is_terminal(&reason, first, Instant::now(), IMAGE_PULL_GRACE) {
@@ -223,6 +204,8 @@ async fn run_in_pod(
             _ = cancel.cancelled() => break Done::Cancelled,
         }
     };
+    let total = started.elapsed();
+    emit_timing(&item.test_name, last_pod.as_ref(), total);
 
     // Fetch logs before deleting; a running pod (timeout/cancel) still serves
     // them. Best-effort — a pod that never started has none.
@@ -272,11 +255,11 @@ enum TerminalState {
     ImageError(String),
 }
 
-/// Map a pod's observed *settled* state (Succeeded/Failed) to a terminal state,
-/// or `None` while it is still pending/running. Image-pull errors are handled
-/// separately with a grace window (see [`pull_error_is_terminal`]) because they
-/// are frequently transient — treating them as terminal here would fail a test on
-/// a recoverable pull-throttle storm.
+/// Map a pod's *settled* state (Succeeded/Failed) to a terminal state, or `None`
+/// while pending/running. Image-pull errors are handled separately with a grace
+/// window (see [`pull_error_is_terminal`](crate::pod_status::pull_error_is_terminal)):
+/// they are frequently transient, so treating them as terminal here would fail a
+/// test on a recoverable pull-throttle storm.
 fn terminal_state(pod: &corev1::Pod) -> Option<TerminalState> {
     let status = pod.status.as_ref()?;
     match status.phase.as_deref() {
@@ -284,40 +267,6 @@ fn terminal_state(pod: &corev1::Pod) -> Option<TerminalState> {
         Some("Failed") => Some(TerminalState::Failed(exit_code(status).unwrap_or(-1))),
         _ => None,
     }
-}
-
-/// Whether an observed image-pull error should end the run. `InvalidImageName`
-/// can never resolve, so it's terminal immediately; a pull *failure*
-/// (`ErrImagePull`/`ImagePullBackOff`) is transient until it has persisted for
-/// `grace`, giving the kubelet's backoff time to clear a `pull QPS exceeded`
-/// storm before the test is failed. `first_seen` is when this pod's pull error
-/// was first observed.
-fn pull_error_is_terminal(
-    reason: &str,
-    first_seen: Instant,
-    now: Instant,
-    grace: Duration,
-) -> bool {
-    reason == "InvalidImageName" || now.duration_since(first_seen) >= grace
-}
-
-/// The container's terminated exit code, if it has one.
-fn exit_code(status: &corev1::PodStatus) -> Option<i32> {
-    status
-        .container_statuses
-        .as_ref()?
-        .iter()
-        .find_map(|cs| cs.state.as_ref()?.terminated.as_ref().map(|t| t.exit_code))
-}
-
-/// An unrecoverable image-pull waiting reason, if any container is stuck on one.
-fn image_error(status: &corev1::PodStatus) -> Option<String> {
-    let stuck = ["ImagePullBackOff", "ErrImagePull", "InvalidImageName"];
-    status.container_statuses.as_ref()?.iter().find_map(|cs| {
-        let w = cs.state.as_ref()?.waiting.as_ref()?;
-        let reason = w.reason.as_deref()?;
-        stuck.contains(&reason).then(|| reason.to_string())
-    })
 }
 
 /// A DNS-safe runner-pod name, unique per *creation*. libtest names contain `::`
@@ -412,6 +361,11 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem) -> corev1::Pod {
     // pod is cleaned up even if this process is killed mid-run.
     let labels = BTreeMap::from([(crate::qos::LABEL_RUN_ID.to_string(), cfg.env.run_id.clone())]);
 
+    // Guaranteed QoS: the runner pod (the test binary + any in-process wallet)
+    // is sized at its tier's runner footprint, rendered `requests == limits`
+    // with whole-core CPU — never BestEffort. See `qos::QosProfile::runner`.
+    let resources = guaranteed_resources(item.class.profile().runner);
+
     let container = corev1::Container {
         name: "test".to_string(),
         image: Some(cfg.image.clone()),
@@ -425,6 +379,7 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem) -> corev1::Pod {
         working_dir: Some(cwd),
         env: Some(env),
         volume_mounts: Some(cfg.volume_mounts.clone()),
+        resources: Some(resources),
         ..Default::default()
     };
 
@@ -440,10 +395,82 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem) -> corev1::Pod {
             service_account_name: cfg.service_account.clone(),
             containers: vec![container],
             volumes: Some(cfg.volumes.clone()),
+            // Pinned Guaranteed pod on a bare `restartPolicy: Never` Pod: a lost
+            // node must delete it immediately (it can't migrate without losing
+            // its pinned CPUs), not sit through the default 300 s grace.
+            tolerations: Some(fast_evict_tolerations()),
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+/// A Guaranteed (`requests == limits`) container `resources` block sized at
+/// `footprint`, via the single QoS lowering ([`Resources::guaranteed_cpu_mem`]).
+/// Panics on a degenerate footprint (that lowering's guard).
+fn guaranteed_resources(footprint: crate::qos::Resources) -> corev1::ResourceRequirements {
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+    let (cpu, mem) = footprint.guaranteed_cpu_mem("runner pod footprint");
+    let amounts = BTreeMap::from([
+        ("cpu".to_string(), Quantity(cpu)),
+        ("memory".to_string(), Quantity(mem)),
+    ]);
+    corev1::ResourceRequirements {
+        requests: Some(amounts.clone()),
+        limits: Some(amounts),
+        ..Default::default()
+    }
+}
+
+/// The immediate-eviction tolerations a pinned Guaranteed pod carries so a lost
+/// node deletes it at once (`tolerationSeconds: 0`) rather than after the 300 s
+/// default. Mirrors [`crate::manifest::PodSpec::render`]'s component-pod path.
+fn fast_evict_tolerations() -> Vec<corev1::Toleration> {
+    [
+        "node.kubernetes.io/not-ready",
+        "node.kubernetes.io/unreachable",
+    ]
+    .into_iter()
+    .map(|key| corev1::Toleration {
+        key: Some(key.to_string()),
+        operator: Some("Exists".to_string()),
+        effect: Some("NoExecute".to_string()),
+        toleration_seconds: Some(0),
+        ..Default::default()
+    })
+    .collect()
+}
+
+/// Emit the runner pod's lifecycle latency breakdown on the `ztest::pod`
+/// diagnostics target (see [`observ`](crate::observ)). The kube-server phase
+/// timestamps isolate scheduler-queue wait, image pull + container init, and the
+/// test body itself; `overhead_ms` is the remainder of the laptop-observed wall
+/// — create-call latency plus the ≤`POLL_INTERVAL` lag before a settled state is
+/// noticed. This is the signal for "test slow but cluster idle": a large
+/// `pull_init_ms`/`schedule_ms` with a small `body_ms` is time spent waiting on
+/// the cluster, not computing.
+fn emit_timing(test: &str, pod: Option<&corev1::Pod>, total: std::time::Duration) {
+    let phases = pod.map(pod_phases).unwrap_or(PodPhases {
+        created: None,
+        scheduled: None,
+        container_started: None,
+        container_finished: None,
+    });
+    let ms = |d: Option<std::time::Duration>| d.unwrap_or_default().as_millis() as u64;
+    let accounted: std::time::Duration = [phases.schedule(), phases.pull_init(), phases.body()]
+        .into_iter()
+        .flatten()
+        .sum();
+    tracing::info!(
+        target: "ztest::pod",
+        test = %test,
+        total_ms = total.as_millis() as u64,
+        schedule_ms = ms(phases.schedule()),
+        pull_init_ms = ms(phases.pull_init()),
+        body_ms = ms(phases.body()),
+        overhead_ms = total.saturating_sub(accounted).as_millis() as u64,
+        "runner pod lifecycle"
+    );
 }
 
 fn env_var(name: &str, value: &str) -> corev1::EnvVar {
@@ -457,6 +484,7 @@ fn env_var(name: &str, value: &str) -> corev1::EnvVar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use std::path::PathBuf;
 
     fn map() -> Vec<(String, String)> {
@@ -514,6 +542,62 @@ mod tests {
             retries: 0,
             deps: Vec::new(),
         }
+    }
+
+    fn work_in_tier(class: crate::qos::QosClass) -> WorkItem {
+        WorkItem {
+            class,
+            ..work("crate::b", "t")
+        }
+    }
+
+    #[test]
+    fn runner_pod_is_guaranteed_and_sized_from_the_tier_runner_footprint() {
+        use crate::qos::QosClass;
+        let env = EngineEnv {
+            dylib_path: std::ffi::OsString::from("/x"),
+            run_id: "r".into(),
+            sa: "ztest".into(),
+            no_cleanup: false,
+            capture: true,
+        };
+        let cfg = PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
+
+        // A regtest/integration tier runner: one whole core (orchestration).
+        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Integration));
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let res = c.resources.as_ref().expect("runner pod must be sized");
+        let req = res.requests.as_ref().unwrap();
+        let lim = res.limits.as_ref().unwrap();
+        // Guaranteed: requests == limits, in every dimension present.
+        assert_eq!(req, lim, "runner pod must be Guaranteed (requests == limits)");
+        assert_eq!(req["cpu"].0, "1");
+
+        // A wallet tier keeps the in-process wallet's compute here (≥4 cores).
+        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Wallet));
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let req = c.resources.as_ref().unwrap().requests.as_ref().unwrap();
+        assert_eq!(req["cpu"].0, "4");
+    }
+
+    #[test]
+    fn runner_pod_evicts_immediately_on_node_loss() {
+        let env = EngineEnv {
+            dylib_path: std::ffi::OsString::from("/x"),
+            run_id: "r".into(),
+            sa: "ztest".into(),
+            no_cleanup: false,
+            capture: true,
+        };
+        let cfg = PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"));
+        let tols = pod.spec.unwrap().tolerations.unwrap();
+        let nr = tols
+            .iter()
+            .find(|t| t.key.as_deref() == Some("node.kubernetes.io/not-ready"))
+            .expect("not-ready toleration");
+        assert_eq!(nr.effect.as_deref(), Some("NoExecute"));
+        assert_eq!(nr.toleration_seconds, Some(0));
     }
 
     #[test]
@@ -595,40 +679,13 @@ mod tests {
     }
 
     #[test]
-    fn transient_pull_error_terminal_only_after_grace() {
-        let t0 = Instant::now();
-        let grace = Duration::from_secs(90);
-        // Within the window a pull failure is transient — keep waiting.
-        assert!(!pull_error_is_terminal(
-            "ErrImagePull",
-            t0,
-            t0 + Duration::from_secs(30),
-            grace
-        ));
-        assert!(!pull_error_is_terminal(
-            "ImagePullBackOff",
-            t0,
-            t0 + Duration::from_secs(89),
-            grace
-        ));
-        // Past the window it is terminal.
-        assert!(pull_error_is_terminal(
-            "ErrImagePull",
-            t0,
-            t0 + Duration::from_secs(91),
-            grace
-        ));
-        // A malformed reference can never resolve — terminal at once.
-        assert!(pull_error_is_terminal("InvalidImageName", t0, t0, grace));
-    }
-
-    #[test]
     fn build_pod_carries_image_refs_env() {
         let env = EngineEnv {
             dylib_path: std::ffi::OsString::from("/x"),
             run_id: "r".into(),
             sa: "ztest".into(),
             no_cleanup: false,
+            capture: true,
         };
         let mut refs = BTreeMap::new();
         refs.insert(
@@ -658,6 +715,7 @@ mod tests {
             run_id: "r".into(),
             sa: "ztest".into(),
             no_cleanup: false,
+            capture: true,
         };
         let cfg = PodRunConfig::baked(
             env,

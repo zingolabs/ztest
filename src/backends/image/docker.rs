@@ -1,14 +1,10 @@
-//! Build-locally-then-push backend for a generic registry — every cluster ztest
-//! reaches purely by kubeconfig (no `kind load`, no `docker exec` of a node):
-//! `docker build` → `docker push`. Push and pull are the same address; a private
-//! registry needs a `docker login` / credential helper on the host.
+//! Build-locally-then-push backend for a generic registry (`docker build` →
+//! `docker push`; push and pull are the same address).
 //!
-//! This file also hosts the authenticated OCI manifest probes over HTTPS
-//! (bottom, private helpers) that reuse the kubeconfig's SA bearer token +
-//! cluster CA — no `docker login`, no `/etc/docker/certs.d`, no `sudo`. The
-//! [`openshift`](super::openshift) backend borrows them to HEAD-probe an image's
-//! presence ([`openshift_manifest_present`]) and resolve its digest
-//! ([`openshift_manifest_digest`]).
+//! Also hosts the authenticated OCI manifest probes over HTTPS (bottom) that
+//! reuse the kubeconfig's SA bearer token + cluster CA; the
+//! [`openshift`](super::openshift) backend borrows them to probe an image's
+//! presence ([`openshift_manifest_present`]) and digest ([`openshift_manifest_digest`]).
 
 use std::process::Command;
 
@@ -28,7 +24,6 @@ pub(crate) struct Docker {
 }
 
 impl Docker {
-    /// Generic registry — `docker build`/`docker push`.
     pub(crate) fn registry(registry: String) -> Docker {
         Docker { registry }
     }
@@ -72,7 +67,7 @@ impl Docker {
     }
 
     /// `docker build` tagged directly with the registry-qualified reference (so
-    /// the push is a plain `docker push` with no intermediate re-tag), then push.
+    /// the push needs no intermediate re-tag), then push.
     async fn build_registry(
         &self,
         cx: &Cx,
@@ -108,11 +103,9 @@ impl Docker {
 }
 
 /// Query the registry for a pushed manifest via `docker manifest inspect`.
-/// Exit 0 ⇒ present; any non-zero (absent, or an auth/network error) ⇒ `false`,
-/// mirroring [`exists_in_kind`](super::kind::exists_in_kind)'s "query error
-/// means Absent" contract: a false negative just triggers a (re)build+push,
-/// whose own failure surfaces the real error. `reference` is the fully-qualified
-/// `<base>/<repo>:dev-<hash>`.
+/// Exit 0 ⇒ present; any non-zero (absent, or an auth/network error) ⇒ `false`:
+/// a false negative just triggers a (re)build+push, whose own failure surfaces
+/// the real error.
 pub(crate) fn exists_in_registry(reference: &str) -> Result<bool, ImageError> {
     let out = Command::new("docker")
         .args(["manifest", "inspect", reference])
@@ -124,24 +117,18 @@ pub(crate) fn exists_in_registry(reference: &str) -> Result<bool, ImageError> {
     Ok(out.status.success())
 }
 
-/// The `docker push` argv (the args after the `docker` program name) for a
-/// registry-qualified tag. Run through the console PTY like
-/// [`docker_build_argv`] so the push progress renders live.
+/// The `docker push` argv for a registry-qualified tag. Run through the console
+/// PTY so the push progress renders live.
 pub(crate) fn docker_push_argv(reference: &str) -> Vec<String> {
     vec!["push".to_string(), reference.to_string()]
 }
 
-// ---------------------------------------------------------------------------
-// Authenticated OCI manifest probes over HTTPS.
-//
-// Manifests are HEAD-probed with the kubeconfig's SA token + cluster CA. No
-// `docker login`, no cert on nodes, no `sudo`.
-// ---------------------------------------------------------------------------
+// Authenticated OCI manifest probes over HTTPS: HEAD-probed with the
+// kubeconfig's SA token + cluster CA (no `docker login`, no cert on nodes).
 
 /// Assemble the in-process push [`Target`] for an OpenShift integrated-registry
 /// push reference, reading the bearer token and CA from the same kubeconfig
-/// (`KUBECONFIG` / `ZTEST_KUBE_CONTEXT`) that authenticates the kube client —
-/// the "one file has everything" path.
+/// (`KUBECONFIG` / `ZTEST_KUBE_CONTEXT`) that authenticates the kube client.
 fn internal_push_target(push_reference: String) -> Result<Target, String> {
     let context = std::env::var("ZTEST_KUBE_CONTEXT")
         .ok()
@@ -162,13 +149,11 @@ fn internal_push_target(push_reference: String) -> Result<Target, String> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // OCI registry protocol: authenticated blob/manifest push over HTTPS.
-// ---------------------------------------------------------------------------
 
 /// The registry credential: an OpenShift bearer token (the SA token from the
-/// kubeconfig) and the username to present in the token handshake (the registry
-/// ignores it for token auth, but it must be non-empty).
+/// kubeconfig) and the username for the token handshake (ignored for token auth,
+/// but must be non-empty).
 #[derive(Clone)]
 struct Auth {
     username: String,

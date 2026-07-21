@@ -1,27 +1,7 @@
-//! K8s primitives shared by every [`Provider`](super::Provider) impl:
-//! manifest application and condition-waiting.
-//!
-//! A thin, purpose-built surface over `kube-rs` and `k8s-openapi`. The goal
-//! is that each provider is a small amount of policy — "these YAML files
-//! define this resource; wait for it to become Ready" — with all the
-//! ceremony lifted here.
-//!
-//! # Design choices
-//!
-//! - **Server-side apply.** Every manifest lands as
-//!   [`kube::Api::patch`] with [`PatchParams::apply("ztest")`]. Server-side
-//!   apply is idempotent by construction (managed-fields track ownership),
-//!   handles CRDs the client-side merge can't reason about, and multiple
-//!   providers can overlap on the same object without stomping each other.
-//! - **Multi-doc YAML.** Applied documents are parsed one-by-one via
-//!   [`serde_yaml::from_str_multi_document`], deserialized into
-//!   [`DynamicObject`], and dispatched by GVK. No typed structs for the
-//!   ~80KB of vendored CRD fixtures.
-//! - **404 = success on delete.** Idempotence for teardown/reap paths.
-//! - **`no_wait`.** Every wait helper takes a `no_wait` flag; callers pass
-//!   [`Cx::no_wait`](crate::resource::Cx::no_wait) through so
-//!   `ztest setup --no-wait` short-circuits without duplicating the
-//!   plumbing per provider.
+//! K8s primitives shared by every [`Provider`](super::Provider) impl: manifest
+//! application (server-side apply, dispatched by GVK from multi-doc YAML) and
+//! condition-waiting. A thin surface over `kube-rs`/`k8s-openapi` so each
+//! provider stays small policy — "apply these YAML files, wait for Ready".
 
 use std::time::Duration;
 
@@ -33,39 +13,22 @@ use kube::runtime::wait::{Condition, await_condition};
 use serde::Deserialize;
 use serde_yaml::Value as YamlValue;
 
-/// Field-manager identity for every server-side apply ztest emits.
-///
-/// Documented here rather than as a private constant so future consumers
-/// that need to co-manage a field with ztest (e.g. an admin patching
-/// annotations on a ztest-owned ServiceAccount) can adopt a distinct
-/// manager and avoid conflicts.
+/// Field-manager identity for every server-side apply ztest emits. Public so a
+/// consumer co-managing a field can adopt a distinct manager and avoid conflicts.
 pub const FIELD_MANAGER: &str = "ztest";
 
-/// Apply a multi-document YAML string.
-///
-/// Each `---`-separated document is parsed into a [`DynamicObject`], its GVK
-/// resolved from `apiVersion`/`kind`, and applied via server-side apply. The
-/// server-side apply approach means:
-/// - Repeated calls converge (the field manager owns exactly what it
-///   declares; no drift).
-/// - CRDs, StatefulSets, and other objects that don't merge cleanly on the
-///   client are handled by the API server.
-/// - Two providers can overlap in what they apply (e.g. both declaring a
-///   ServiceAccount) without a stomp, as long as they use the same
-///   [`FIELD_MANAGER`].
-///
-/// The `apply_error_context` argument prefixes any failure message so the
-/// caller doesn't have to `map_err` at every call site.
+/// Apply a multi-document YAML string: each `---`-separated document is parsed
+/// into a [`DynamicObject`], its GVK resolved from `apiVersion`/`kind`, and
+/// applied via server-side apply (idempotent, and two providers sharing
+/// [`FIELD_MANAGER`] can overlap without a stomp). `apply_error_context`
+/// prefixes any failure message.
 pub(crate) async fn apply_yaml_bundle(
     client: &Client,
     yaml: &str,
     apply_error_context: &str,
 ) -> Result<(), String> {
-    // Parse every document to an owned `Vec<YamlValue>` up front. The
-    // multi-doc `Deserializer` iterator holds a borrow of the input string
-    // and internal pointers that aren't `Send`; collecting first frees us
-    // to `.await` between applies without carrying the iterator across the
-    // await point.
+    // Collect to owned values up front: the multi-doc `Deserializer` iterator
+    // isn't `Send`, so it can't be held across the `.await` between applies.
     let documents: Vec<(usize, YamlValue)> = serde_yaml::Deserializer::from_str(yaml)
         .enumerate()
         .map(|(idx, doc)| {
@@ -75,8 +38,7 @@ pub(crate) async fn apply_yaml_bundle(
         })
         .collect::<Result<_, _>>()?;
     for (idx, value) in documents {
-        // Empty leading/trailing docs (a `---` at the top of a file) come
-        // through as `null` values; skip them cleanly.
+        // A leading/trailing `---` deserializes to `null`; skip it.
         if value.is_null() {
             continue;
         }
@@ -85,17 +47,14 @@ pub(crate) async fn apply_yaml_bundle(
     Ok(())
 }
 
-/// Apply one YAML value. Shared by the multi-doc and single-doc entry
-/// points.
+/// Apply one YAML value.
 async fn apply_one_document(
     client: &Client,
     value: YamlValue,
     context: &str,
     idx: usize,
 ) -> Result<(), String> {
-    // Extract GVK from `apiVersion` + `kind` before deserializing into
-    // `DynamicObject` — the DynamicObject can't be constructed without
-    // knowing its ApiResource.
+    // A `DynamicObject` needs its `ApiResource`, so resolve the GVK first.
     let (group, version) = {
         let api_version = value
             .get("apiVersion")
@@ -126,9 +85,8 @@ async fn apply_one_document(
         .ok_or_else(|| format!("{context}: doc {idx}: object has no metadata.name"))?;
     let namespace = obj.metadata.namespace.clone();
 
-    // Namespaced vs cluster-scoped is a property of the CRD; we can't
-    // discover it without a live API call. Fall back on `metadata.namespace`
-    // being present: if the manifest set it, we treat it as namespaced.
+    // Discovering namespaced-vs-cluster-scoped needs a live API call; instead
+    // treat the object as namespaced iff the manifest set `metadata.namespace`.
     let api: Api<DynamicObject> = match namespace.as_deref() {
         Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
         None => Api::all_with(client.clone(), &ar),
@@ -141,8 +99,8 @@ async fn apply_one_document(
     Ok(())
 }
 
-/// Split an `apiVersion` string into `(group, version)`. Core resources use
-/// `v1` (empty group); everything else uses `<group>/<version>`.
+/// Split an `apiVersion` into `(group, version)`; core resources (`v1`) have an
+/// empty group.
 fn parse_api_version(api_version: &str) -> (String, String) {
     match api_version.split_once('/') {
         Some((g, v)) => (g.to_string(), v.to_string()),
@@ -150,12 +108,9 @@ fn parse_api_version(api_version: &str) -> (String, String) {
     }
 }
 
-/// Wait for a CRD to reach `Established=True`.
-///
-/// If `no_wait` is set, returns immediately after confirming the CRD
-/// exists (or immediately with success even if it doesn't yet — the caller
-/// accepts the risk that a subsequent apply against the CRD may briefly
-/// fail until the API server catches up).
+/// Wait for a CRD to reach `Established=True`. `no_wait` returns immediately
+/// (the caller accepts that a subsequent apply may briefly fail until the API
+/// server catches up).
 pub(crate) async fn wait_crd_established(
     client: &Client,
     name: &str,
@@ -229,10 +184,7 @@ pub(crate) fn is_not_found(err: &kube::Error) -> bool {
 }
 
 // ── Conditions ─────────────────────────────────────────────────────────
-//
-// One condition per k8s wait we care about, each an `impl Condition<K>` so
-// the async `await_condition` helper can drive it. Closures rather than
-// separate types: fewer public names, keeps the intent inline.
+// One `impl Condition<K>` per k8s wait, as closures rather than named types.
 
 fn is_crd_established() -> impl Condition<CustomResourceDefinition> {
     |obj: Option<&CustomResourceDefinition>| {

@@ -1,15 +1,7 @@
-//! Phase C: dev-image inventory discovery.
-//!
-//! For each test binary with a selected test, spawn it with
-//! `ZTEST_DUMP_INVENTORY=1`. Each binary writes one `"kind"`-tagged JSON
-//! `InventoryLine` per line to stdout, then exits 0; we keep the `Dev` lines and
-//! ignore `Qos` ones (consumed elsewhere).
-//!
-//! Results are deduped by `(dockerfile, context, repo, features, rust_version)`:
-//! the same `dev!` call linked into N binaries yields N submissions, only one
-//! needing a build — but a `rust_versions` matrix fans one decl into one image
-//! per version, each a distinct build. An empty inventory short-circuits, so the
-//! docker-build / kind-load phases become no-ops.
+//! Phase C: dev-image inventory discovery. Each selected test binary is spawned
+//! with `ZTEST_DUMP_INVENTORY=1` and emits `"kind"`-tagged JSON `InventoryLine`s.
+//! Results are deduped across binaries so a `dev!` linked into N binaries builds
+//! once (a `rust_versions` matrix still forks one image per version).
 
 use std::collections::BTreeSet;
 use std::process::Stdio;
@@ -50,10 +42,9 @@ pub(crate) fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
     Ok(dumped)
 }
 
-/// Result of Phase C: the deduped set of resources (dev images + data seeds) the
-/// currently-selected test set declares, ready to become resource-graph nodes,
-/// plus the per-binary associations the engine needs to gate admission on
-/// resource readiness.
+/// Result of Phase C: the deduped resources (dev images + data seeds) the
+/// selection declares, ready to become resource-graph nodes, plus the per-binary
+/// associations the engine gates admission on.
 #[derive(Debug, Clone)]
 pub enum DumpOutcome {
     /// Inventory was successfully dumped from every selected binary.
@@ -75,13 +66,9 @@ pub enum DumpOutcome {
     Failed { detail: String },
 }
 
-/// Run the inventory dump for each selected binary in turn (each is sub-100ms,
-/// and serial keeps the output legible). The dump stream carries every registry:
-/// returns the deduped dev-image + seed lists for the resource graph, the
-/// per-binary image and test→resource edges the engine gates admission on, and
-/// the per-binary QoS tier declarations the engine (`engine::plan`) assigns each
-/// test from. All per-binary lists stay binary-scoped because the match is keyed
-/// by `binary_id` (exact test names can collide across binaries).
+/// Dump each selected binary's inventory (serial; each is sub-100ms), then
+/// [`assemble`] the deduped resource lists and per-binary edges. Per-binary lists
+/// stay binary-scoped because test names can collide across binaries.
 pub async fn discover(binaries: &[SelectedBinary]) -> (DumpOutcome, Vec<(String, Vec<QosEntry>)>) {
     let mut dumps: Vec<Dumped> = Vec::with_capacity(binaries.len());
     for bin in binaries {
@@ -100,11 +87,10 @@ pub async fn discover(binaries: &[SelectedBinary]) -> (DumpOutcome, Vec<(String,
     assemble(binaries, dumps)
 }
 
-/// Fold each binary's [`Dumped`] into the cross-selection deduped resource set
-/// plus the per-binary edges the engine gates on. Pure — the local
-/// (`discover`) and on-cluster ([`crate::pipeline::remote_compile`]) paths both
-/// call this once they have a `Dumped` per binary, so dedup/edge logic lives in
-/// exactly one place. `binaries` and `dumps` are index-aligned.
+/// Fold each binary's [`Dumped`] into the deduped resource set plus per-binary
+/// edges. Shared by the local ([`discover`]) and on-cluster
+/// ([`crate::pipeline::remote_compile`]) paths so dedup lives in one place.
+/// `binaries` and `dumps` are index-aligned.
 pub(crate) fn assemble(
     binaries: &[SelectedBinary],
     dumps: Vec<Dumped>,
@@ -203,9 +189,8 @@ struct DedupKey {
     /// git url+rev+paths) and `Ord`, so it keys the dedup set directly.
     source: String,
     features: Vec<String>,
-    /// Different rust toolchains are different images (they fork the tag), so
-    /// the pinned version discriminates too — else the two variants collapse and
-    /// only one gets built.
+    /// Different rust toolchains fork the tag, so the pinned version must
+    /// discriminate too — else the variants collapse and only one gets built.
     rust_version: Option<String>,
 }
 

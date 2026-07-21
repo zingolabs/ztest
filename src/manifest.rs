@@ -24,30 +24,26 @@ pub struct PodSpec {
     pub resources: Option<Resources>,
     /// QoS-default per-pod reserve (the tier footprint split across the env's
     /// pods, §7), injected by `TestEnv::build` when the test didn't call
-    /// `.resources()`. Rendered as `requests == limits`, giving k8s
-    /// "Guaranteed" QoS.
+    /// `.resources()`. Rendered as `requests == limits` (Guaranteed QoS).
     pub guaranteed: Option<Resources>,
     /// Container environment variables, in declaration order.
     pub env: Vec<(String, String)>,
     pub fs_group: Option<i64>,
-    /// `securityContext.runAsUser` override. Set when a pod must read
-    /// another pod's files on a shared volume whose ownership can't be
-    /// reconciled via `fsGroup` (hostPath/local-path volumes ignore
-    /// `fsGroup`), e.g. a zaino StateService reading the root-owned
-    /// zebra-state DB written by the validator. `None` keeps the image
-    /// default user.
+    /// `securityContext.runAsUser` override. Set when a pod must read another
+    /// pod's files on a shared volume whose ownership can't be reconciled via
+    /// `fsGroup` (hostPath/local-path volumes ignore it), e.g. a zaino
+    /// StateService reading the root-owned zebra-state DB the validator wrote.
+    /// `None` keeps the image default user.
     pub run_as_user: Option<i64>,
-    /// The QoS tier's node placement target, injected by `TestEnv::build()`
-    /// when QoS is enabled. `Some(Pool::Nvme)` renders the NVMe nodeSelector
-    /// and toleration so a `sync` pod lands on the dedicated NVMe pool;
-    /// `General` and `None` schedule anywhere (the default). This is
-    /// placement, not sizing; see [`crate::qos::Pool`].
+    /// The QoS tier's node placement target. `Some(Pool::Nvme)` renders the
+    /// NVMe nodeSelector and toleration so a `sync` pod lands on the dedicated
+    /// NVMe pool; `General` and `None` schedule anywhere. Placement, not sizing;
+    /// see [`crate::qos::Pool`].
     pub placement: Option<crate::qos::Pool>,
-    /// Optional `imagePullSecrets` entry name (`ZTEST_IMAGE_PULL_SECRET`), for a
-    /// private registry whose pull credentials aren't already on the pods'
-    /// ServiceAccount or node containerd config. `None` (the default, and every
-    /// kind-mode / public-registry run) omits the field entirely and relies on
-    /// SA-level / node-level pull auth. See [`crate::backends::image::pull_secret`].
+    /// Optional `imagePullSecrets` entry name, for a private registry whose pull
+    /// credentials aren't already on the pods' ServiceAccount or node config.
+    /// `None` (kind mode, public registries) omits the field and relies on
+    /// SA-/node-level auth. See [`crate::backends::image::pull_secret`].
     pub image_pull_secret: Option<String>,
 }
 
@@ -85,13 +81,11 @@ impl PodSpec {
         if let Some(args) = &self.args {
             container["args"] = json!(args);
         }
-        // Explicit `.resources()` (requests only) wins; otherwise the QoS
-        // per-pod reserve renders as requests==limits (Guaranteed QoS, §7).
-        if let Some(res) = &self.resources {
-            container["resources"] = json!({
-                "requests": { "cpu": res.cpu, "memory": res.memory },
-            });
-        } else if let Some(res) = &self.guaranteed {
+        // Every ztest pod is Guaranteed QoS (§7): render `requests == limits`,
+        // explicit `.resources()` winning over the QoS per-pod reserve. The
+        // completeness guard below fails the render if neither is present.
+        let sizing = self.resources.as_ref().or(self.guaranteed.as_ref());
+        if let Some(res) = sizing {
             container["resources"] = json!({
                 "requests": { "cpu": res.cpu, "memory": res.memory },
                 "limits": { "cpu": res.cpu, "memory": res.memory },
@@ -123,10 +117,9 @@ impl PodSpec {
             spec["securityContext"] = Value::Object(security_context);
         }
 
-        // Private-registry pull creds, when the cluster expects them at the pod
-        // level rather than on the ServiceAccount. Omitted otherwise (kind mode,
-        // public registries, SA-/node-level auth) so the common path is
-        // untouched. The named secret must already exist in the test namespace.
+        // Pod-level pull creds, when the cluster expects them there rather than
+        // on the ServiceAccount. The named secret must already exist in the test
+        // namespace.
         if let Some(secret) = &self.image_pull_secret {
             spec["imagePullSecrets"] = json!([{ "name": secret }]);
         }
@@ -134,11 +127,9 @@ impl PodSpec {
         // Accumulate tolerations (NVMe placement + QoS fast-eviction).
         let mut tolerations: Vec<Value> = Vec::new();
 
-        // NVMe placement (the `sync` tier): pin the pod to the tainted NVMe
-        // node pool. `nodeSelector` keeps it off general nodes; the matching
-        // toleration lets it past the taint that keeps other tiers off NVMe.
-        // `General`/`None` add nothing (default scheduling), so dev/kind
-        // clusters (no NVMe pool, QoS disabled) are unaffected.
+        // NVMe placement (the `sync` tier): the `nodeSelector` keeps the pod off
+        // general nodes, the matching toleration lets it past the NVMe taint.
+        // `General`/`None` add nothing (default scheduling).
         if let Some(crate::qos::Pool::Nvme) = self.placement {
             spec["nodeSelector"] =
                 json!({ crate::qos::NVME_NODE_LABEL_KEY: crate::qos::NVME_NODE_LABEL_VALUE });
@@ -149,17 +140,11 @@ impl PodSpec {
             }));
         }
 
-        // QoS performance pods (those given a Guaranteed reserve) must be
-        // killed, not migrated, when their node goes offline: a moved pod
-        // loses its pinned CPUs and any node-local state, so we never want a
-        // reschedule. These are bare `Pod`s with `restartPolicy: Never`, so
-        // k8s never recreates them; we additionally override the auto-added
+        // A lost node must kill these pods, not migrate them: a moved pod loses
+        // its pinned CPUs and node-local state. Override the auto-added
         // not-ready/unreachable tolerations (default `tolerationSeconds: 300`)
-        // to `0` so a lost node deletes the pod immediately rather than after
-        // the 5-minute grace. (Exclusive-CPU pinning itself is the kubelet's
-        // `static` CPU-manager policy, which this pod is eligible for by being
-        // Guaranteed with integer-core CPU; see `env::even_share`.)
-        if self.guaranteed.is_some() {
+        // to `0` so a lost node deletes the pod immediately.
+        if sizing.is_some() {
             for cond in [
                 "node.kubernetes.io/not-ready",
                 "node.kubernetes.io/unreachable",
@@ -177,17 +162,19 @@ impl PodSpec {
             spec["tolerations"] = Value::Array(tolerations);
         }
 
-        // Guaranteed-QoS completeness guard (§7). Exclusive static-policy CPU
-        // pinning requires the whole pod to be Guaranteed: every container
-        // (regular and any init/sidecar) must carry cpu+memory limits; one
-        // missing limit silently downgrades the pod to Burstable and forfeits
-        // pinning. This pod is single-container today, so the guard holds; it
-        // fences a future init/sidecar addition that forgets its limits. Skip
-        // it when an explicit `.resources()` override is in effect (that path
-        // is intentionally requests-only / Burstable, see above).
-        debug_assert!(
-            self.guaranteed.is_none() || self.resources.is_some() || pod_is_guaranteed(&spec),
-            "QoS Guaranteed pod {} has a container without cpu+memory limits — \
+        // Guaranteed-QoS completeness guard (§7), a hard invariant: EVERY
+        // ztest-spawned pod must be Guaranteed, else it forfeits static-policy
+        // CPU pinning. A `panic!` (not `debug_assert!`) so a violation surfaces
+        // in release builds too — never shipped silently.
+        assert!(
+            sizing.is_some(),
+            "ztest pod {} has no resource sizing — would be BestEffort QoS; \
+             every ztest pod must be Guaranteed",
+            self.pod_name,
+        );
+        assert!(
+            pod_is_guaranteed(&spec),
+            "ztest pod {} is not Guaranteed (a container lacks cpu+memory limits) — \
              would downgrade to Burstable and lose CPU pinning",
             self.pod_name,
         );
@@ -212,10 +199,9 @@ impl PodSpec {
     }
 }
 
-/// `true` if every container (regular and init) in a pod spec carries both
-/// cpu and memory `limits`: the necessary condition for the whole pod to be
-/// Guaranteed QoS and thus eligible for the kubelet's `static` CPU-manager
-/// pinning. Containers without a resources block fail the check.
+/// `true` if every container (regular and init) carries both cpu and memory
+/// `limits`: the necessary condition for the whole pod to be Guaranteed QoS and
+/// eligible for `static` CPU-manager pinning.
 fn pod_is_guaranteed(spec: &Value) -> bool {
     let has_cpu_mem_limits = |c: &Value| {
         let limits = &c["resources"]["limits"];
@@ -246,11 +232,8 @@ pub(crate) fn merge_ports(defaults: &[(&str, u16)], extra: &[(String, u16)]) -> 
 
 /// Map a backend's resolved-image result into the pod image string, tagging any
 /// build/resolution failure with the component name for the surfaced
-/// [`EnvError`]. Shared by the per-backend `pod_spec` impls (see
-/// [`ValidatorBackend::pod_spec`](crate::handles::ValidatorBackend::pod_spec) /
-/// [`IndexerBackend::pod_spec`](crate::handles::IndexerBackend::pod_spec)), which
-/// replaced the former per-label `match` here: each backend now owns its image,
-/// ports, ready port, and security context in `backends/*.rs`.
+/// [`EnvError`]. Shared by the per-backend `pod_spec` impls, each of which owns
+/// its image, ports, ready port, and security context in `backends/*.rs`.
 pub(crate) fn resolve_image(
     resolved: Result<backends::image::ResolvedImage, backends::image::ImageError>,
     component: &'static str,
@@ -292,20 +275,27 @@ mod tests {
             fs_group: None,
             run_as_user: None,
             placement: None,
-            guaranteed: None,
+            // render() requires every pod to be Guaranteed, so the shared
+            // fixture carries a reserve; explicit-`.resources()` tests override.
+            guaranteed: Some(Resources {
+                cpu: "1".into(),
+                memory: "536870912".into(),
+            }),
             image_pull_secret: None,
         }
     }
 
     fn container(pod: &Pod) -> Value {
-        // Round-trip through JSON so the test reads the rendered shape
-        // exactly as the API server would receive it.
+        // Round-trip through JSON so the test reads the shape the API server
+        // would receive.
         let v = serde_json::to_value(pod).unwrap();
         v["spec"]["containers"][0].clone()
     }
 
     #[test]
-    fn resources_render_into_requests() {
+    fn explicit_resources_render_guaranteed_requests_equal_limits() {
+        // An explicit `.resources()` override is Guaranteed too (requests ==
+        // limits), never requests-only Burstable.
         let spec = PodSpec {
             resources: Some(Resources {
                 cpu: "500m".into(),
@@ -317,6 +307,8 @@ mod tests {
         let c = container(&pod);
         assert_eq!(c["resources"]["requests"]["cpu"], "500m");
         assert_eq!(c["resources"]["requests"]["memory"], "512Mi");
+        assert_eq!(c["resources"]["limits"]["cpu"], "500m");
+        assert_eq!(c["resources"]["limits"]["memory"], "512Mi");
     }
 
     #[test]
@@ -378,9 +370,8 @@ mod tests {
 
     #[test]
     fn explicit_resources_take_precedence_over_guaranteed() {
-        // A test that called `.resources()` keeps requests-only (no limits);
-        // env.rs leaves `guaranteed` unset in that case, but assert the render
-        // precedence directly too.
+        // When both are set the explicit `.resources()` override wins; it still
+        // renders Guaranteed (requests == limits at the override's values).
         let spec = PodSpec {
             resources: Some(Resources {
                 cpu: "750m".into(),
@@ -394,10 +385,22 @@ mod tests {
         };
         let c = container(&spec.render(&coords(), "t", &[]).unwrap());
         assert_eq!(c["resources"]["requests"]["cpu"], "750m");
-        assert!(
-            c["resources"].get("limits").is_none(),
-            "explicit ⇒ requests only"
-        );
+        assert_eq!(c["resources"]["limits"]["cpu"], "750m");
+        assert_eq!(c["resources"]["requests"]["memory"], "1Gi");
+        assert_eq!(c["resources"]["limits"]["memory"], "1Gi");
+    }
+
+    #[test]
+    #[should_panic(expected = "must be Guaranteed")]
+    fn render_panics_on_a_besteffort_pod() {
+        // A pod with neither an explicit override nor a QoS reserve is
+        // BestEffort — the render-time guard must reject it in every build.
+        let spec = PodSpec {
+            guaranteed: None,
+            resources: None,
+            ..base_spec()
+        };
+        let _ = spec.render(&coords(), "t", &[]);
     }
 
     #[test]
@@ -418,11 +421,13 @@ mod tests {
     }
 
     #[test]
-    fn no_resources_or_env_omits_the_keys() {
+    fn no_env_omits_the_env_key() {
+        // With no env vars the `env` key is omitted. (Resources is always
+        // present now — every pod is Guaranteed.)
         let pod = base_spec().render(&coords(), "t", &[]).unwrap();
         let c = container(&pod);
-        assert!(c.get("resources").is_none());
         assert!(c.get("env").is_none());
+        assert!(c.get("resources").is_some());
     }
 
     #[test]
@@ -462,18 +467,26 @@ mod tests {
     }
 
     #[test]
-    fn general_and_none_placement_omit_scheduling_keys() {
+    fn general_and_none_placement_omit_nvme_scheduling_keys() {
+        // A Guaranteed pod (base_spec is one) always carries the fast-eviction
+        // NoExecute tolerations; General/None placement must add NEITHER the NVMe
+        // nodeSelector NOR the NVMe NoSchedule toleration.
+        let no_nvme = |s: &Value| {
+            assert!(s.get("nodeSelector").is_none());
+            let has_nvme_tol = s["tolerations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|t| t["effect"] == "NoSchedule" || t["key"] == crate::qos::NVME_TAINT_KEY);
+            assert!(!has_nvme_tol, "no NVMe toleration for general/none: {s}");
+        };
         // None (default).
-        let s = pod_spec_json(&base_spec().render(&coords(), "t", &[]).unwrap());
-        assert!(s.get("nodeSelector").is_none());
-        assert!(s.get("tolerations").is_none());
+        no_nvme(&pod_spec_json(&base_spec().render(&coords(), "t", &[]).unwrap()));
         // Explicit General is also a no-op (schedules anywhere).
         let spec = PodSpec {
             placement: Some(crate::qos::Pool::General),
             ..base_spec()
         };
-        let s = pod_spec_json(&spec.render(&coords(), "t", &[]).unwrap());
-        assert!(s.get("nodeSelector").is_none());
-        assert!(s.get("tolerations").is_none());
+        no_nvme(&pod_spec_json(&spec.render(&coords(), "t", &[]).unwrap()));
     }
 }

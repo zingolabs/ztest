@@ -1,19 +1,6 @@
-//! Phase A3: archive discovery.
-//!
-//! Read-only walk of the `ztest-seeds` namespace, enumerating `seed-{sha8}` PVCs
-//! and classifying each as ready or pending based on the `seeds.ztest.io/ready`
-//! label. Provisioning of a missing archive is driven from the resource graph
-//! (`resource::impls::seed::SeedProvider` → `materialize::ensure_seed`), which
-//! sources bytes through `crate::storage` — a local file, or an LFS pointer
-//! fetched from the configured server. This module only *observes* the resulting
-//! PVCs for the preflight banner.
-//!
-//! PVC schema (`docs/architecture-overview.md#archive-pvcs`):
-//! - namespace: `ztest-seeds`
-//! - name: `seed-{sha[..8]}`
-//! - ready label: `seeds.ztest.io/ready=true`
-//! - sha label: `seeds.ztest.io/sha=<full-sha256>`
-//! - capacity: `spec.resources.requests.storage`
+//! Phase A3: archive discovery. Read-only walk of the `ztest-seeds` namespace,
+//! classifying `seed-{sha8}` PVCs as ready or pending. Provisioning happens in
+//! the resource graph; this module only observes for the preflight banner.
 
 use std::convert::TryInto;
 
@@ -67,9 +54,8 @@ pub async fn discover(client: &Client, _tx: &EventTx) -> ArchivesOutcome {
     let pvcs = match api.list(&ListParams::default()).await {
         Ok(p) => p,
         Err(err) => {
-            // 404 is the "namespace doesn't exist" signal. String-match rather
-            // than the typed error-kind pattern, which is fragile across kube
-            // versions.
+            // String-match the 404 rather than the typed error-kind, which is
+            // fragile across kube versions.
             let s = err.to_string();
             if s.contains("not found") || s.contains("404") {
                 return ArchivesOutcome::NamespaceMissing;

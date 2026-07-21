@@ -1,10 +1,9 @@
 //! Shared RPC transport primitives.
 //!
-//! Uses a thin HTTP client ([`AuthedRpc`]) rather than
-//! `zebra_node_services::RpcRequestClient`, which has no way to attach an
-//! `Authorization` header. zcashd's JSON-RPC requires HTTP Basic Auth on every
-//! call; zebrad does not. Both backends route through the same struct (zebrad
-//! leaves `auth = None`).
+//! Uses a thin HTTP client ([`AuthedRpc`]) instead of
+//! `zebra_node_services::RpcRequestClient`, which can't attach an
+//! `Authorization` header — zcashd's JSON-RPC requires HTTP Basic Auth, zebrad
+//! doesn't (it leaves `auth = None`).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -14,16 +13,10 @@ use serde_json::Value;
 
 use crate::{Endpoint, RpcError};
 
-/// Boxed transport/decode error, mirroring `zebra_node_services::BoxError` so
-/// `RpcError::backend_boxed(...)` call sites keep compiling.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// HTTP JSON-RPC client with optional Basic Auth.
-///
-/// Mirrors `zebra_node_services::RpcRequestClient`'s `text_from_call` /
-/// `json_result_from_call` so it slots into the per-RPC parsers in
-/// [`crate::handles::jsonrpc`]. Adds `auth: Option<(user, password)>` for
-/// zcashd, which rejects unauthed calls with HTTP 401.
+/// HTTP JSON-RPC client with optional Basic Auth (`auth` is `Some` for zcashd,
+/// which rejects unauthed calls with HTTP 401).
 #[derive(Debug, Clone)]
 pub struct AuthedRpc {
     client: reqwest::Client,
@@ -32,8 +25,7 @@ pub struct AuthedRpc {
 }
 
 impl AuthedRpc {
-    /// Plain unauthenticated client. Use for zebrad and indexer JSON-RPC that
-    /// doesn't gate on auth.
+    /// Plain unauthenticated client. Use for zebrad and indexer JSON-RPC.
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -42,8 +34,7 @@ impl AuthedRpc {
         }
     }
 
-    /// Client that attaches `Authorization: Basic base64(user:password)`
-    /// to every request. Use for zcashd.
+    /// Client that attaches HTTP Basic Auth to every request. Use for zcashd.
     pub fn with_basic_auth(addr: SocketAddr, user: &str, password: &str) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -53,10 +44,7 @@ impl AuthedRpc {
     }
 
     fn build(&self, method: &str, params: &Value) -> reqwest::RequestBuilder {
-        /// JSON-RPC request envelope, serialized by serde so the method name
-        /// and params are always correctly escaped (never spliced into a
-        /// format string). Always tags `"jsonrpc":"2.0"`; zcashd (JSON-RPC 1.0)
-        /// ignores the field.
+        /// Always tags `"jsonrpc":"2.0"`; zcashd (JSON-RPC 1.0) ignores it.
         #[derive(serde::Serialize)]
         struct Request<'a> {
             jsonrpc: &'static str,
@@ -92,15 +80,8 @@ impl AuthedRpc {
         params: &Value,
     ) -> std::result::Result<T, BoxError> {
         let text = self.text_from_call(method, params).await?;
-        // Permissive parse: accept both JSON-RPC 2.0 (zebrad, zaino:
-        // `{"jsonrpc":"2.0","result":...,"id":...}`) and JSON-RPC 1.0 (zcashd:
-        // `{"result":...,"error":null,"id":...}`, no `jsonrpc` field, both
-        // `result` and `error` present with one `null`).
-        //
-        // Parse into a `Value`, then route by which of `result`/`error` carries
-        // a non-null payload. Both shapes encode success as result-set with
-        // error-null (1.0) or no error key (2.0), so this distinguishes them
-        // without a version-sniff branch.
+        // Route by which of `result`/`error` is non-null: distinguishes
+        // JSON-RPC 2.0 (zebrad/zaino) from 1.0 (zcashd) without a version sniff.
         let value: serde_json::Value = serde_json::from_str(&text)?;
         let error = value.get("error");
         let has_error = matches!(error, Some(e) if !e.is_null());
@@ -121,8 +102,8 @@ impl AuthedRpc {
     }
 }
 
-/// Build an unauthed JSON-RPC client pointed at an `Endpoint`. Cheap; rebuilt
-/// per call site. Use for zebrad and indexer JSON-RPC endpoints.
+/// Build an unauthed JSON-RPC client pointed at an `Endpoint`. Use for zebrad
+/// and indexer JSON-RPC endpoints.
 pub fn json_rpc(endpoint: &Endpoint) -> AuthedRpc {
     AuthedRpc::new(endpoint.socket_addr())
 }
@@ -136,11 +117,9 @@ pub fn json_rpc_with_basic_auth(endpoint: &Endpoint, user: &str, password: &str)
 /// Poll a JSON-RPC endpoint until `method` returns a successful result
 /// (deserialized as `serde_json::Value` and discarded) or the budget elapses.
 ///
-/// Generic over the method name because the readiness probe varies by backend:
-/// zebrad uses `getblocktemplate` (its strongest "ready to drive tests" signal
-/// on regtest); zcashd uses `getinfo` because its `getblocktemplate` is gated
-/// by `IsInitialBlockDownload`, which never clears on a peer-less regtest
-/// chain. Each `ValidatorConfig` impl picks its probe.
+/// Generic over the method name because the probe varies by backend: zebrad
+/// uses `getblocktemplate`, but zcashd's is gated by `IsInitialBlockDownload`
+/// (never clears on a peer-less regtest chain) so it uses `getinfo`.
 pub async fn wait_for_rpc_ready(
     client: &AuthedRpc,
     address: SocketAddr,
@@ -181,12 +160,8 @@ pub struct RpcReadinessTimeout {
 /// `IndexerHandle::json_rpc()`.
 ///
 /// Wraps an [`AuthedRpc`] with error attribution (component label) and a
-/// typed-call convenience (`call::<T>`). Identical type for both validator and
+/// typed-call convenience ([`call`]). Identical type for both validator and
 /// indexer handles, so tests can write generic "compare two clients" logic.
-///
-/// For RPCs without a convenience method, deserialize into a caller-supplied
-/// type via [`call`]: `client.call::<MyResponse>("getinfo", "[]").await?`. For
-/// raw `serde_json::Value` access, use [`call_value`].
 #[derive(Debug, Clone)]
 pub struct JsonRpcClient {
     inner: AuthedRpc,
@@ -217,8 +192,7 @@ impl JsonRpcClient {
         }
     }
 
-    /// Component label this client attributes errors to (e.g. `"zebrad"`,
-    /// `"zcashd"`, `"zaino"`).
+    /// Component label this client attributes errors to.
     pub fn component(&self) -> &'static str {
         self.component
     }
@@ -226,10 +200,7 @@ impl JsonRpcClient {
     /// Issue a JSON-RPC call and deserialize the result into `T`.
     ///
     /// `params` is a [`serde_json::Value`], typically an array built with the
-    /// [`json!`](serde_json::json) macro: `json!([])` for a no-arg method or
-    /// `json!(["abc", 0])` for positional args. The request envelope is
-    /// serialized by serde, so values are escaped correctly with no raw-string
-    /// splicing.
+    /// [`json!`](serde_json::json) macro: `json!([])` or `json!(["abc", 0])`.
     pub async fn call<T: DeserializeOwned>(
         &self,
         method: &'static str,

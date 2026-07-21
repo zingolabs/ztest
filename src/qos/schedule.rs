@@ -1,24 +1,17 @@
-//! Pre-run scheduling plan for the preflight banner (`docs/qos-design.md` §8,
-//! planning half).
+//! Pre-run scheduling plan for the preflight banner (`docs/qos-design.md` §8).
 //!
-//! Distinct from [`super::scheduler`] (one letter apart, deliberately):
-//! - `scheduler` is the broker's live, authoritative admission decision core
-//!   (one [`Request`](super::scheduler::Request) to fit/queue/reject).
-//! - `schedule` (this module) is a static estimate shown before the run: given
-//!   the selected tests grouped by tier and the probed cluster capacity, how
-//!   many concurrency waves it will take, the peak reserve, and whether any
-//!   tier's footprint exceeds the cluster outright (fail-fast).
-//!
-//! Pure: `(tier counts, capacity) -> plan`, so it's unit-testable without a
-//! cluster, and consumes only what the `ztest run` parent already has in hand
-//! (the QoS inventory dump + the cluster probe). No I/O, no ledger.
+//! Distinct from [`super::scheduler`] (one letter apart, deliberately): that is
+//! the live admission core; this is a pure `(tier counts, capacity) -> plan`
+//! estimate shown before the run — concurrency waves, peak reserve, and any
+//! tier whose footprint exceeds the cluster outright (fail-fast).
 
 use std::collections::BTreeMap;
 
 use super::{QosClass, Resources};
 
 /// One tier's contribution to the plan: how many selected tests declared it,
-/// and the per-test reserve ([`QosClass::profile`]'s footprint).
+/// and the per-test reserve ([`QosProfile::admitted`](crate::qos::QosProfile::admitted):
+/// component pods plus the runner pod).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierPlan {
     pub class: QosClass,
@@ -54,6 +47,8 @@ fn scaled(fp: Resources, n: u32) -> Resources {
     Resources::new(
         fp.cpu_milli.saturating_mul(n as u64),
         fp.mem_bytes.saturating_mul(n as u64),
+        fp.io_bps.saturating_mul(n as u64),
+        fp.io_iops.saturating_mul(n as u64),
     )
 }
 
@@ -68,7 +63,10 @@ pub fn plan(tier_counts: &BTreeMap<QosClass, u32>, free: Option<Resources>) -> Q
         .map(|(&class, &count)| TierPlan {
             class,
             count,
-            footprint: class.profile().footprint,
+            // The whole reserve a test of this tier admits against — components
+            // plus the runner pod — matching what `engine::plan` submits, so the
+            // preflight wave estimate agrees with live admission.
+            footprint: class.profile().admitted(),
         })
         .collect();
     tiers.sort_by_key(|t| std::cmp::Reverse(t.class.profile().priority));
@@ -165,52 +163,53 @@ mod tests {
     }
 
     #[test]
-    fn total_is_sum_of_count_times_footprint() {
-        // 3 basic (1000m/512Mi) + 1 integration (4000m/2Gi).
+    fn total_is_sum_of_count_times_admitted() {
+        // Admitted totals (components + runner): basic 2c/1Gi, integration 3c/3Gi.
+        // 3 basic + 1 integration → 9c, 6Gi.
         let p = plan(
             &counts(&[(QosClass::Basic, 3), (QosClass::Integration, 1)]),
             None,
         );
-        assert_eq!(p.total.cpu_milli, 3 * 1000 + 4000);
-        assert_eq!(p.total.mem_bytes, 3 * 512 * crate::qos::MIB + 2 * GIB);
+        assert_eq!(p.total.cpu_milli, 3 * 2000 + 3000);
+        assert_eq!(p.total.mem_bytes, 3 * GIB + 3 * GIB);
     }
 
     #[test]
     fn fits_in_one_wave_when_total_within_capacity() {
-        // 4 basic = 4 cores / 2 GiB total; cluster has 8/16 → one wave.
+        // 4 basic = 4 × 2c/1Gi admitted = 8c / 4 GiB total; cluster has 8/16 → one wave.
         let p = plan(
             &counts(&[(QosClass::Basic, 4)]),
-            Some(Resources::new(8000, 16 * GIB)),
+            Some(Resources::new(8000, 16 * GIB, 0, 0)),
         );
         assert_eq!(p.waves, 1);
-        assert_eq!(p.peak, Resources::new(4000, 2 * GIB));
+        assert_eq!(p.peak, Resources::new(8000, 4 * GIB, 0, 0));
         assert!(p.unschedulable.is_empty());
     }
 
     #[test]
     fn spills_into_multiple_waves_when_total_exceeds_capacity() {
-        // 5 integration (4 cores / 2 GiB each) on a 4-core / 8-GiB cluster:
+        // 5 integration (3c/3Gi admitted each) on a 4-core / 8-GiB cluster:
         // CPU-bound → 1 fits per wave → ceil(5/1) = 5 waves.
         let p = plan(
             &counts(&[(QosClass::Integration, 5)]),
-            Some(Resources::new(4000, 8 * GIB)),
+            Some(Resources::new(4000, 8 * GIB, 0, 0)),
         );
         assert_eq!(p.waves, 5);
-        assert_eq!(p.peak, Resources::new(4000, 2 * GIB));
+        assert_eq!(p.peak, Resources::new(3000, 3 * GIB, 0, 0));
     }
 
     #[test]
     fn unschedulable_tier_is_flagged_and_excluded_from_waves() {
-        // sync needs 16 cores / 32 GiB; cluster has 4/8 → can never fit.
-        // A schedulable basic still plans normally around it.
+        // sync admits 17c / 18 GiB; cluster has 4/8 → can never fit.
+        // A schedulable basic (2c/1Gi admitted) still plans normally around it.
         let p = plan(
             &counts(&[(QosClass::Sync, 2), (QosClass::Basic, 1)]),
-            Some(Resources::new(4000, 8 * GIB)),
+            Some(Resources::new(4000, 8 * GIB, 0, 0)),
         );
         assert_eq!(p.unschedulable, vec![QosClass::Sync]);
         // Only the basic test entered the wave sim.
         assert_eq!(p.waves, 1);
-        assert_eq!(p.peak, Resources::new(1000, 512 * crate::qos::MIB));
+        assert_eq!(p.peak, Resources::new(2000, GIB, 0, 0));
     }
 
     #[test]
@@ -226,7 +225,7 @@ mod tests {
 
     #[test]
     fn empty_input_is_an_empty_plan() {
-        let p = plan(&BTreeMap::new(), Some(Resources::new(8000, 16 * GIB)));
+        let p = plan(&BTreeMap::new(), Some(Resources::new(8000, 16 * GIB, 0, 0)));
         assert!(p.tiers.is_empty());
         assert_eq!(p.total, Resources::ZERO);
         assert_eq!(p.waves, 0);

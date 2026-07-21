@@ -1,7 +1,5 @@
-//! The public entry points into the resource layer.
-//!
-//! Three verbs, three functions, one place. Every caller — `ztest setup`,
-//! `ztest run`, the Ctrl-C reaper — flows through one of these. The
+//! The public entry points into the resource layer: every caller (`ztest
+//! setup`, `ztest run`, the Ctrl-C reaper) flows through one of these; the
 //! providers and graph mechanics are implementation details behind them.
 
 use std::collections::HashMap;
@@ -16,7 +14,7 @@ use crate::resource::context::Cx;
 use crate::resource::graph::{Graph, GraphError};
 use crate::resource::impls::storage::StorageProfile;
 use crate::resource::impls::{
-    base_images, buildkit, builder, image, policy, scaffolding, seed, storage,
+    base_images, buildkit, builder, image, mirror, policy, scaffolding, seed, storage,
 };
 use crate::resource::provider::NodeId;
 use crate::resource::state::NodeState;
@@ -27,17 +25,12 @@ use crate::resource::state::NodeState;
 #[non_exhaustive]
 pub struct InitializeOpts {
     /// Return as soon as objects exist rather than wait for Deployments /
-    /// StatefulSets to become Ready. Default: `false`.
-    ///
-    /// Fast setup at the cost of the first test run blocking on rollout;
-    /// use it on a re-provision where the data plane is already spinning.
+    /// StatefulSets to become Ready (default `false`); the first test run then
+    /// blocks on the rollout instead.
     pub no_wait: bool,
 
-    /// Concurrency cap for provider execution. Default: 8.
-    ///
-    /// The setup graph has ~11 nodes with independent subtrees (QoS RBAC +
-    /// storage stack are parallel), so 8 comfortably covers the fanout. A
-    /// TTY caller that wants a coherent single-line UI can pass 1.
+    /// Concurrency cap for provider execution (default 8). A TTY caller that
+    /// wants a coherent single-line UI can pass 1.
     pub max_concurrent: usize,
 
     /// Storage substrate to provision the ztest StorageClasses on.
@@ -47,11 +40,10 @@ pub struct InitializeOpts {
     /// multi-node clusters, where the operator owns which nodes carry NVMe.
     pub label_nvme_pool: bool,
 
-    /// The active image backend. Selects which policy nodes are provisioned:
-    /// an OpenShift backend adds the `nonroot-v2` SCC grant, the internal-registry
-    /// project, and the on-cluster builder; it also gates the OpenShift-only run
-    /// rules ([`RuleScope`](crate::resource::impls::policy)). The run identity
-    /// itself (SA + token) is always provisioned.
+    /// The active image backend. Selects which policy nodes are provisioned: an
+    /// OpenShift backend adds the SCC grant, the internal-registry project, and
+    /// the on-cluster builder, and gates the OpenShift-only run rules. The run
+    /// identity (SA + token) is always provisioned.
     pub backend: crate::cluster_config::ImageBackend,
 }
 
@@ -67,23 +59,15 @@ impl Default for InitializeOpts {
     }
 }
 
-/// Bring the cluster up to the state ztest requires.
+/// Bring the cluster up to the state ztest requires: assembles the
+/// cluster-infrastructure graph and provisions it in dependency order.
 ///
-/// Assembles the cluster-infrastructure graph — snapshot CRDs + controller,
-/// CSI hostpath driver + RBAC, ztest StorageClasses, `ztest-seeds` /
-/// `ztest-qos` namespaces, NVMe node label, QoS RBAC + per-tier
-/// ServiceAccounts — and provisions it in dependency order.
+/// **Idempotent** — providers probe and skip resources already Ready, so it is
+/// safe to re-run against a partially-set-up cluster. **Failure-isolated** — a
+/// failed provider blocks its dependents but not its siblings; the returned
+/// [`NodeState`] map lets the caller decide the exit code.
 ///
-/// **Idempotent.** Providers use [`probe`](crate::resource::Provider::probe)
-/// to skip resources already at Ready; safe to re-run against a partially-
-/// set-up cluster.
-///
-/// **Failure-isolated.** A failed provider blocks its dependents but not
-/// its siblings; the returned [`NodeState`] map lets the caller decide the
-/// process exit code (any `Failed`/`Blocked` node ⇒ non-zero exit).
-///
-/// `on_change` fires on every state transition so the CLI can render live
-/// progress; pass `|_,_| {}` for a silent run.
+/// `on_change` fires on every state transition; pass `|_,_| {}` for a silent run.
 pub async fn initialize<F>(
     client: Client,
     opts: InitializeOpts,
@@ -126,18 +110,18 @@ where
         graph.add_dedup(p);
     }
 
-    // On-cluster compilation build server (OpenShift targets): the base images
-    // (compile builder + runner base) built on-cluster from `docker/*.Dockerfile`,
-    // the persistent build-cache PVC, and the long-lived builder Deployment
-    // `ztest run` compiles in. Depends on the run identity + images namespace above.
+    // On-cluster compilation build server (OpenShift targets).
     if opts.backend.is_openshift() {
-        // The rootless-BuildKit build server must exist before the base images it
-        // builds; the base images before the compile builder that runs one of them.
+        // Ordering: the BuildKit server before the base images it builds; the
+        // base images before the compile builder that runs one of them.
         graph.add_dedup(Box::new(buildkit::BuildkitProvider));
         graph.add_dedup(Box::new(base_images::RunnerBaseImageProvider));
         graph.add_dedup(Box::new(base_images::BuilderImageProvider));
         graph.add_dedup(Box::new(builder::BuildCacheProvider));
         graph.add_dedup(Box::new(builder::BuilderDeploymentProvider));
+        // Mirror the component images into the internal registry so topology
+        // pods pull them LAN-local; depends on the builder (crane) + registry.
+        graph.add_dedup(Box::new(mirror::ImageMirrorProvider));
     }
 
     graph.validate()?;
@@ -190,23 +174,15 @@ pub fn seed_node_id(entry: &SeedEntry) -> Result<NodeId, String> {
     seed::SeedProvider::node_id(entry)
 }
 
-/// Parent-side, by-identity teardown of a run's ephemeral resources.
+/// Parent-side, by-identity teardown of a run's ephemeral resources: deletes
+/// everything labelled `ztest.io/run-id=<run_id>` (per-test Namespaces, which
+/// cascade, and cluster-scoped shadow [`VolumeSnapshotContent`]s), leaving
+/// cluster infrastructure and content-addressed caches untouched.
 ///
-/// Deletes every resource labelled `ztest.io/run-id=<run_id>`: per-test
-/// Namespaces (which cascade their contents) and cluster-scoped shadow
-/// [`VolumeSnapshotContent`]s. Leaves cluster infrastructure and content-
-/// addressed caches (images, seed PVCs) untouched.
-///
-/// Called on Ctrl-C when the surviving parent must reap what a
-/// SIGKILL'd child left behind — the "label before populate" invariant
-/// means a resource half-created by a crash is still findable by its
-/// run-id label. QoS reservation Leases are left to self-expire (their TTL
-/// heartbeat lapses when the run dies); `ztest cleanup` reclaims them
-/// eagerly, this path does not.
-///
-/// Idempotent (404 counts as success). Errors are collected per-resource
-/// and returned rather than aborted on; the returned `Vec` is empty on a
-/// clean sweep.
+/// Called on Ctrl-C so the surviving parent reaps what a SIGKILL'd child left
+/// behind — the "label before populate" invariant means a resource half-created
+/// by a crash is still findable by its run-id label. Idempotent (404 = success);
+/// per-resource errors are collected and returned, never fatal.
 pub async fn reap_run(client: &Client, run_id: &str) -> Vec<String> {
     let selector = format!("{}={run_id}", qos::LABEL_RUN_ID);
     reap_envs(client, &selector, &selector).await
@@ -241,10 +217,8 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
     let dp = DeleteParams::default();
     let mut errors = Vec::new();
 
-    // Namespaces advertise only the `delete` verb, never `deletecollection`
-    // (unlike pods/PVCs), so a collection-delete 405s at the REST layer.
-    // List by label and delete each individually — exactly what
-    // `kubectl delete ns -l` does under the hood.
+    // Namespaces advertise only `delete`, never `deletecollection`, so a
+    // collection-delete 405s; list by label and delete each individually.
     let namespaces: Api<Namespace> = Api::all(client.clone());
     let ns_lp = ListParams::default().labels(ns_selector);
     match namespaces.list(&ns_lp).await {

@@ -1,9 +1,6 @@
 //! Component category types (`Validator<B>`, `Indexer<B>`, `Wallet<B>`) plus
-//! their shared configuration (`ComponentOpts`, `Resources`).
-//!
-//! Each component is generic in its backend type. Constructors like
-//! `Validator::zebrad(version)` return a typed `Validator<ZebraBackend>`; the
-//! returned type lets backend-specific builder methods and handle RPCs be
+//! their shared configuration (`ComponentOpts`, `Resources`). Each is generic
+//! in its backend so backend-specific builder methods and handle RPCs are
 //! enforced at compile time.
 
 use crate::handles::indexer::IndexerConfig;
@@ -19,10 +16,8 @@ pub enum ComponentCategory {
     Wallet,
 }
 
-/// A validator component, generic in its backend.
-///
-/// Fields are `pub(crate)`: build them through the constructors
-/// ([`Validator::zebrad`], [`Validator::custom`], …) and the
+/// A validator component, generic in its backend. Build it through the
+/// constructors ([`Validator::zebrad`], [`Validator::custom`], …) and the
 /// [`ComponentBuilder`] chain methods, not by struct literal.
 #[derive(Debug, Clone)]
 pub struct Validator<B: ValidatorConfig> {
@@ -35,8 +30,8 @@ pub struct Validator<B: ValidatorConfig> {
 pub struct Indexer<B: IndexerConfig> {
     pub(crate) backend: B,
     pub(crate) opts: ComponentOpts,
-    /// Set by `.regtest()` / `.regtest_state()`. Picks the `backend =`
-    /// line in the rendered TOML for zaino; ignored by other backends.
+    /// Picks the `backend =` line in zaino's rendered TOML; ignored by other
+    /// backends. Set by `.regtest()` / `.regtest_state()`.
     pub(crate) regtest_backend: Option<crate::testnet_conf::ZainodBackend>,
 }
 
@@ -47,12 +42,9 @@ pub struct Wallet<B: WalletConfig> {
     pub(crate) opts: ComponentOpts,
 }
 
-/// Configuration shared by every component variant.
-///
-/// Fields are `pub(crate)`: construct externally via
-/// [`ComponentOpts::builder`] (for [`Validator::custom`] and friends), and
-/// mutate through the [`ComponentBuilder`] chain methods. This keeps the
-/// field set free to evolve without breaking downstream struct literals.
+/// Configuration shared by every component variant. Construct externally via
+/// [`ComponentOpts::builder`] and mutate through the [`ComponentBuilder`] chain
+/// methods, so the field set can evolve without breaking downstream literals.
 #[derive(Debug, Clone, Default)]
 pub struct ComponentOpts {
     pub(crate) name: Option<String>,
@@ -63,8 +55,7 @@ pub struct ComponentOpts {
     pub(crate) extra_ports: Vec<(String, u16)>,
     pub(crate) command: Option<Vec<String>>,
     pub(crate) args: Option<Vec<String>>,
-    /// Environment variables set on the container, in declaration order.
-    /// Set via [`ComponentBuilder::env`].
+    /// Container environment variables, in declaration order.
     pub(crate) env: Vec<(String, String)>,
     pub(crate) regtest_mode: Option<RegtestMode>,
     pub(crate) peers: Vec<String>,
@@ -74,20 +65,15 @@ pub struct ComponentOpts {
     /// (see [`crate::SharedVolume`]). On a validator it flips zebrad to
     /// persistent state at `mount_path` and turns on the indexer gRPC; on a
     /// zaino indexer it points the StateService's `zebra_db_path` at the same
-    /// `mount_path`. `None` for the common pod-local (ephemeral / fetch) case.
+    /// `mount_path`. `None` for the common pod-local case.
     pub(crate) shared_state: Option<SharedState>,
-    /// Which value pool this validator mines its coinbase into. `None` means
-    /// use the backend default ([`ValidatorConfig::default_coinbase_pool`]); set
-    /// explicitly via [`Validator::mine_to`]. Resolved to a concrete pool (and a
-    /// regtest miner address) at `env.build()` time. Ignored for non-validator
-    /// components.
+    /// Which value pool this validator mines its coinbase into. `None` uses the
+    /// backend default; set explicitly via [`Validator::mine_to`]. Resolved to a
+    /// concrete pool (and regtest miner address) at `env.build()`.
     pub(crate) coinbase_pool: Option<Pool>,
     /// Pre-mined chain to boot this validator from, instead of a cold chain.
-    /// `Archive` loads a committed chain-cache tarball; `Blank` boots fresh
-    /// persistent on-disk state (used to generate the tarball). Consumed by the
-    /// zebrad backend (skips the slow coinbase-maturity mine in funded tests);
-    /// a no-op on zcashd, whose shielded-coinbase funding needs no cache. `None`
-    /// for the common ephemeral case.
+    /// Consumed by the zebrad backend (skips the slow coinbase-maturity mine in
+    /// funded tests); a no-op on zcashd. `None` for the common ephemeral case.
     pub(crate) regtest_cache: Option<RegtestCacheSource>,
 }
 
@@ -97,20 +83,18 @@ pub struct ComponentOpts {
 pub enum RegtestCacheSource {
     /// Load a committed chain-cache archive (the production test path).
     Archive(std::path::PathBuf),
-    /// Boot fresh persistent on-disk state (no archive) so a cache asset can be
-    /// mined and extracted. See [`Validator::with_blank_persistent_state`].
+    /// Boot fresh persistent on-disk state so a cache asset can be mined and
+    /// extracted. See [`Validator::with_blank_persistent_state`].
     Blank,
 }
 
-/// One side of a shared zebra-state DB: the in-pod path the shared PVC is
-/// mounted at, plus the claim backing it. Both the validator and the
-/// colocated zaino indexer carry a copy referencing the same claim and
-/// path (sourced from a single [`crate::SharedVolume`]).
+/// One side of a shared zebra-state DB. Both the validator and the colocated
+/// zaino indexer carry a copy referencing the same on-disk directory (sourced
+/// from a single [`crate::SharedVolume`]).
 #[derive(Debug, Clone)]
 pub struct SharedState {
     /// In-pod path the shared PVC is mounted at. The PVC itself is wired in as a
-    /// `Mount::shared` at builder time, so only the path needs to ride along
-    /// here (both sharing pods address the same on-disk directory).
+    /// `Mount::shared` at builder time, so only the path rides along here.
     pub(crate) mount_path: String,
 }
 
@@ -140,8 +124,8 @@ fn opts_for(version: &str, default_name: &'static str) -> ComponentOpts {
 }
 
 /// `features` come from the `dev!` macro (the single origin) so the runtime
-/// `ImageSpec` and the inventory decl always carry the same set — the two must
-/// agree for the build manifest's [`DevImageId`](crate::backends::image::DevImageId)
+/// `ImageSpec` and the inventory decl carry the same set — they must agree for
+/// the build manifest's [`DevImageId`](crate::backends::image::DevImageId)
 /// lookup to hit.
 fn opts_dev(
     source: crate::backends::image::DevSource,
@@ -197,10 +181,9 @@ impl Validator<ZebraBackend> {
         }
     }
     /// A zebrad built from a local Dockerfile or a pinned git rev (see the
-    /// `dev!` macro). `version` is the release this build corresponds to (e.g.
-    /// the pinned commit's self-reported `5.2.0`); unlike zainod, the zebra
-    /// backend renders its regtest config and derives its NU ceiling from it,
-    /// so it must be a real semver rather than the `"dev"` sentinel.
+    /// `dev!` macro). `version` must be a real semver, not the `"dev"` sentinel:
+    /// the zebra backend renders its regtest config and derives its NU ceiling
+    /// from it.
     #[doc(hidden)]
     pub fn zebrad_dev(
         source: crate::backends::image::DevSource,
@@ -287,8 +270,7 @@ impl<B: IndexerConfig> Indexer<B> {
 impl Wallet<crate::backends::librustzcash::LrzBackend> {
     /// ztest's default in-process wallet: a pure-Rust `zcash_client_backend`
     /// wallet that syncs over the indexer's lightwalletd gRPC and builds
-    /// shielded txs with bundled Sapling params. No zingolib, no zebra, no
-    /// `libstdc++`. Hand the returned `Wallet` to
+    /// shielded txs with bundled Sapling params. Hand the returned `Wallet` to
     /// [`TestEnv::add_wallet`](crate::env::TestEnv::add_wallet), then build
     /// accounts with [`WalletHandle::account`](crate::handles::WalletHandle).
     pub fn librustzcash() -> Self {
@@ -298,9 +280,8 @@ impl Wallet<crate::backends::librustzcash::LrzBackend> {
 
 #[cfg(feature = "zingo")]
 impl Wallet<ZingoBackend> {
-    /// In-process zingolib wallet, the batteries-included backend ztest ships.
-    /// Runs `LightClient`s in the test binary against the indexer's gRPC; there
-    /// is no pod. Hand the returned `Wallet` to
+    /// In-process zingolib wallet: runs `LightClient`s in the test binary
+    /// against the indexer's gRPC, with no pod. Hand the returned `Wallet` to
     /// [`TestEnv::add_wallet`](crate::env::TestEnv::add_wallet), then build
     /// accounts with [`WalletHandle::account`](crate::handles::WalletHandle).
     pub fn zingo() -> Self {
@@ -330,16 +311,13 @@ impl<B: WalletConfig> Wallet<B> {
 
 // ───────────────────────────── builders ───────────────────────────────
 
-/// The chain-style configuration methods shared by every component type
-/// (`Validator`, `Indexer`, `Wallet`) and by [`ComponentOptsBuilder`].
-///
-/// Defined once over a single `&mut ComponentOpts` hook so the six methods
-/// can't drift across the four implementors. Bring it into scope
+/// The chain-style configuration methods shared by every component type and by
+/// [`ComponentOptsBuilder`], defined once over a single `&mut ComponentOpts`
+/// hook so they can't drift across implementors. Bring it into scope
 /// (`use ztest::prelude::*`) to call `.named(...)`, `.mount(...)`, etc.
 pub trait ComponentBuilder: Sized {
-    /// The `ComponentOpts` the chain methods mutate. Not part of the
-    /// stable surface; implementors expose it so the provided methods can
-    /// reach the shared config.
+    /// The `ComponentOpts` the chain methods mutate. Not part of the stable
+    /// surface.
     #[doc(hidden)]
     fn component_opts_mut(&mut self) -> &mut ComponentOpts;
 
@@ -387,8 +365,8 @@ pub trait ComponentBuilder: Sized {
         self.component_opts_mut().args = Some(args.into_iter().map(Into::into).collect());
         self
     }
-    /// Set an environment variable on the container. Repeated calls append;
-    /// they're rendered into the container's `env` in declaration order.
+    /// Set an environment variable on the container. Repeated calls append, in
+    /// declaration order.
     fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.component_opts_mut()
             .env
@@ -397,10 +375,9 @@ pub trait ComponentBuilder: Sized {
     }
 
     /// Pin the rust toolchain a `dev!` image is built with — the per-case
-    /// selector for a rust-version matrix (typically fed an rstest `#[case]`
-    /// value). The chosen version must be one the `dev!` call declared in
-    /// `rust_versions`, since only those are pre-built; a version that wasn't
-    /// built fails loud at `build()` with `DevImageMissing`. No effect on a
+    /// selector for a rust-version matrix. The version must be one the `dev!`
+    /// call declared in `rust_versions` (only those are pre-built); an unbuilt
+    /// version fails loud at `build()` with `DevImageMissing`. No effect on a
     /// published image. See `docs/rust-version-matrix.md`.
     fn rust_version(mut self, version: impl Into<String>) -> Self {
         if let crate::backends::image::ImageSpec::Dev { rust_version, .. } =
@@ -431,10 +408,9 @@ impl<B: WalletConfig> ComponentBuilder for Wallet<B> {
 }
 
 /// Builder for a [`ComponentOpts`] to hand to [`Validator::custom`],
-/// [`Indexer::custom`], or [`Wallet::custom`] from outside the crate (the
-/// fields are `pub(crate)`). Gets the [`ComponentBuilder`] chain methods
-/// (`named`, `mount`, …) for free; adds `version` / `image` and a terminal
-/// [`build`](Self::build).
+/// [`Indexer::custom`], or [`Wallet::custom`] from outside the crate. Gets the
+/// [`ComponentBuilder`] chain methods for free; adds `version` / `image` and a
+/// terminal [`build`](Self::build).
 #[derive(Debug, Clone, Default)]
 pub struct ComponentOptsBuilder {
     opts: ComponentOpts,
@@ -474,48 +450,40 @@ impl<B: ValidatorConfig> Validator<B> {
     pub fn opts(&self) -> &ComponentOpts {
         &self.opts
     }
-    /// Stable label for the backend (`"zcashd"` / `"zebrad"`), available on
-    /// the builder before launch. Lets a backend-generic test branch its
-    /// [`mine_to`](Self::mine_to) coinbase pool without a live handle. See
-    /// [`ValidatorConfig::label`].
+    /// Stable label for the backend (`"zcashd"` / `"zebrad"`), available before
+    /// launch so a backend-generic test can branch its
+    /// [`mine_to`](Self::mine_to) coinbase pool without a live handle.
     pub fn label(&self) -> &'static str {
         self.backend.label()
     }
 
     /// Choose which value pool this validator mines its coinbase into,
-    /// overriding the backend default
-    /// ([`ValidatorConfig::default_coinbase_pool`]). The pool is resolved to a
-    /// regtest miner address at `env.build()`. Both backends validate and mine
-    /// all three pools (see
-    /// [`PoolSupport`](crate::handles::validator::PoolSupport)); a shielded pool
-    /// is only mineable once its network upgrade is active at the height being
-    /// mined (Sapling from height 1, Orchard from NU5), which the regtest
-    /// activation fixture guarantees for any block past genesis.
+    /// overriding the backend default. The pool is resolved to a regtest miner
+    /// address at `env.build()`. A shielded pool is only mineable once its
+    /// network upgrade is active at the mined height (Sapling from height 1,
+    /// Orchard from NU5), which the regtest activation fixture guarantees for
+    /// any block past genesis.
     pub fn mine_to(mut self, pool: Pool) -> Self {
         self.opts.coinbase_pool = Some(pool);
         self
     }
     /// Boot this validator from a committed chain-cache archive instead of a
     /// cold chain. On zebrad this loads a pre-mined, matured regtest chain so
-    /// funded tests skip the ~100-block coinbase-maturity mine; a no-op on
-    /// zcashd. Generic over the backend so it composes with the `Validator<B>`
-    /// test helpers; pass [`Self::with_blank_persistent_state`] at generation
-    /// time to mine the asset in the first place.
+    /// funded tests skip the slow coinbase-maturity mine; a no-op on zcashd.
     ///
     /// Takes a typed [`ArchiveHandle`](crate::ArchiveHandle) from
-    /// `#[ztest::archive(NAME = "path")]` (or `ztest::archive!`), not a loose
-    /// path: the handle is what registers the archive with preflight (so it's
-    /// pre-provisioned) and records the per-test dependency edge (so a test whose
-    /// archive fails is cleanly SKIPPED, not failed here). A typo'd handle name is
-    /// a compile error.
+    /// `#[ztest::archive(NAME = "path")]`, not a loose path: the handle
+    /// registers the archive with preflight (so it's pre-provisioned) and
+    /// records the per-test dependency edge (so a test whose archive fails is
+    /// cleanly SKIPPED, not failed here).
     pub fn with_regtest_cache(mut self, archive: crate::ArchiveHandle) -> Self {
         self.opts.regtest_cache = Some(RegtestCacheSource::Archive(archive.into()));
         self
     }
-    /// Boot this validator with fresh persistent on-disk state (rather than the
-    /// default ephemeral state). Used to generate a chain-cache asset: mine
-    /// blocks, then extract the persisted state directory. Not for ordinary
-    /// tests; pair with [`Self::with_regtest_cache`] there.
+    /// Boot this validator with fresh persistent on-disk state, to generate a
+    /// chain-cache asset: mine blocks, then extract the persisted state
+    /// directory. Not for ordinary tests; pair with [`Self::with_regtest_cache`]
+    /// there.
     pub fn with_blank_persistent_state(mut self) -> Self {
         self.opts.regtest_cache = Some(RegtestCacheSource::Blank);
         self
@@ -557,11 +525,10 @@ impl<B: ValidatorConfig> Validator<B> {
         self
     }
 
-    /// Persist this validator's on-disk state to the shared volume `vol`
-    /// (instead of the default ephemeral state) and enable its indexer
-    /// gRPC, so a colocated zaino StateService can open the same database
-    /// as a RocksDB secondary and sync the non-finalized tip over gRPC.
-    /// Pair with [`crate::Indexer::regtest_state_in`] on the same `vol`.
+    /// Persist this validator's on-disk state to the shared volume `vol` and
+    /// enable its indexer gRPC, so a colocated zaino StateService can open the
+    /// same database as a RocksDB secondary and sync the non-finalized tip over
+    /// gRPC. Pair with [`crate::Indexer::regtest_state_in`] on the same `vol`.
     pub fn persistent_state_in(mut self, vol: &crate::SharedVolume) -> Self {
         self.opts.shared_state = Some(SharedState {
             mount_path: vol.mount_path().to_string(),
@@ -593,9 +560,8 @@ mod tests {
     /// The laptop preflight and the in-pod test are separately-compiled binaries
     /// with different `CARGO_MANIFEST_DIR`s, so a `Local` source's absolute
     /// Dockerfile path differs between them. The build-manifest key
-    /// ([`DevImageId`]) must therefore be **path-independent**, or the in-pod
-    /// lookup misses (the bug this whole path exists to avoid). This pins that a
-    /// `zainod_dev` built from two different paths yields one identity.
+    /// ([`DevImageId`]) must therefore be path-independent, or the in-pod lookup
+    /// misses.
     #[test]
     fn zainod_dev_id_is_path_independent() {
         let features = vec![

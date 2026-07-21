@@ -1,8 +1,5 @@
-//! The work-list: one schedulable [`WorkItem`] per selected test, joined with
-//! its declared QoS tier (footprint / priority / hard cap).
-//!
-//! Pure and cluster-free: a deterministic function of the inventory and QoS
-//! dump, unit-tested with fixtures.
+//! The work-list: one schedulable [`WorkItem`] per selected test, joined with its
+//! declared QoS tier. A pure, cluster-free function of the inventory and QoS dump.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,7 +23,9 @@ pub struct WorkItem {
     pub cwd: PathBuf,
     /// Declared tier (defaults to [`QosClass::Basic`] when undeclared).
     pub class: QosClass,
-    /// Per-test reserve packed against cluster capacity.
+    /// Per-test reserve packed against cluster capacity: the tier's
+    /// [`admitted`](crate::qos::QosProfile::admitted) total (component pods plus
+    /// the runner pod), so the scheduler accounts every pod the test places.
     pub footprint: Resources,
     /// Scheduling priority (higher admitted first).
     pub priority: u8,
@@ -42,9 +41,7 @@ pub struct WorkItem {
 }
 
 /// Resolved resource dependencies, keyed for attachment to each [`WorkItem`].
-/// Built by `cli::run` from the inventory dump + the provisioned graph; the
-/// default (empty) makes every item depend on nothing — the unit-test /
-/// no-resource case.
+/// Built by `cli::run`; the default (empty) makes every item depend on nothing.
 #[derive(Debug, Default)]
 pub struct ResourceDeps {
     /// `binary_id` → image node ids. The binary-level edge: every test in a
@@ -74,14 +71,10 @@ impl ResourceDeps {
     }
 }
 
-/// Strip the leading crate segment from a QoS `test_id` to recover the libtest
-/// test name. `qos_attr::marker_basic` becomes `marker_basic`; `crate::m::t`
-/// becomes `m::t`.
-///
-/// `test_id` is `concat!(module_path!(),"::",fn)` (crate-rooted) while nextest's
-/// `selected_tests` are the crate-relative libtest names. The QoS dump is
-/// grouped per binary, so the first `::`-segment is always that binary's crate:
-/// the strip is exact and unambiguous within a binary.
+/// Strip the leading crate segment from a crate-rooted QoS `test_id` to recover
+/// the crate-relative libtest name (`qos_attr::marker_basic` → `marker_basic`).
+/// The dump is grouped per binary, so the first `::`-segment is always that
+/// binary's crate — the strip is exact and unambiguous within a binary.
 pub(crate) fn libtest_name(test_id: &str) -> &str {
     test_id
         .split_once("::")
@@ -89,18 +82,14 @@ pub(crate) fn libtest_name(test_id: &str) -> &str {
 }
 
 /// Build the work-list from the selected binaries and the per-binary QoS dump.
-///
-/// Tests without a QoS declaration default to [`QosClass::Basic`] (matching the
-/// in-test default at `qos::current`). `retries` is applied uniformly from the
-/// run options. `deps` attaches each item's resource dependency nodes (empty when
-/// no resources were declared).
+/// Undeclared tests default to [`QosClass::Basic`] (matching `qos::current`);
+/// `retries` is applied uniformly; `deps` attaches each item's resource nodes.
 pub fn build_work_list(
     selected_binaries: &[SelectedBinary],
     qos_by_binary: &[(String, Vec<QosEntry>)],
     retries: u32,
     deps: &ResourceDeps,
 ) -> Vec<WorkItem> {
-    // binary_id to (libtest_name to class), built once.
     let tiers: HashMap<&str, HashMap<&str, QosClass>> = qos_by_binary
         .iter()
         .map(|(binary_id, entries)| {
@@ -127,7 +116,7 @@ pub fn build_work_list(
                 binary_path: bin.binary_path.clone(),
                 cwd: bin.cwd.clone(),
                 class,
-                footprint: profile.footprint,
+                footprint: profile.admitted(),
                 priority: profile.priority,
                 hard_cap: profile.hard_cap,
                 retries,
@@ -140,11 +129,10 @@ pub fn build_work_list(
     items
 }
 
-/// Order the work-list for request submission: highest priority first, then
-/// smallest footprint first within a priority (so small tests pack into the
-/// initial capacity and large ones backfill as room appears), with a stable
-/// id tiebreak. The [`Scheduler`](crate::qos::scheduler::Scheduler) re-sorts by
-/// `(priority desc, seq asc)`, so this only governs the seq tiebreak itself.
+/// Order the work-list for submission: highest priority first, then smallest
+/// footprint first within a priority, with a stable id tiebreak. The
+/// [`Scheduler`](crate::qos::scheduler::Scheduler) re-sorts by `(priority desc,
+/// seq asc)`, so this only governs the seq tiebreak itself.
 fn sort_for_admission(items: &mut [WorkItem]) {
     items.sort_by(|a, b| {
         b.priority
@@ -199,9 +187,11 @@ mod tests {
         let by_name: HashMap<_, _> = items.iter().map(|w| (w.test_name.as_str(), w)).collect();
         assert_eq!(by_name["marker_basic"].class, QosClass::Basic);
         assert_eq!(by_name["marker_sync"].class, QosClass::Sync);
+        // The work item reserves the tier's whole admitted total (components +
+        // runner), so the scheduler accounts the runner pod too.
         assert_eq!(
             by_name["marker_sync"].footprint,
-            QosClass::Sync.profile().footprint
+            QosClass::Sync.profile().admitted()
         );
     }
 

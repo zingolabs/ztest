@@ -1,42 +1,26 @@
-//! OpenShift backend: on-cluster image builds via a ztest-owned
-//! **privileged-in-userns BuildKit pod** ([`crate::resource::impls::buildkit`]).
+//! OpenShift backend: the only backend that builds *on the cluster* — in a
+//! long-lived ztest-owned BuildKit pod ([`crate::resource::impls::buildkit`]),
+//! pushing to the integrated registry over the in-cluster service and
+//! authenticating with the pod SA's token. Nothing is built on the laptop.
 //!
-//! The only backend that builds *on the cluster* (kind loads into nodes; the
-//! generic/`docker` backend builds locally and pushes). Nothing is built on the
-//! laptop; images are built in the long-lived `ztest-buildkit` pod with `buildctl
-//! build` and pushed to the integrated registry over the in-cluster service —
-//! authenticating with the pod SA's token exactly like the runner-image `crane`
-//! bake ([`crate::pipeline::remote_compile`]).
+//! Two source shapes ([`DevSource`]): **Git** (`run_build_git`) shallow-fetches
+//! the pinned rev in the pod (it has `git` + egress), so only the build-args
+//! cross the wire; **Local** (`run_build_local`, and the base images) packs the
+//! working tree and `oc cp`s it in, to test local changes.
 //!
-//! Two source shapes ([`DevSource`]):
-//!   - **Git** (`run_build_git`): the pod shallow-fetches the pinned rev straight
-//!     from the upstream repo (it has `git` + egress) and builds the checkout — no
-//!     laptop clone, no context upload. Only the pinned build-args cross the wire.
-//!   - **Local** (`run_build_local`, also the base images): the working tree is
-//!     packed into a deterministic archive and `oc cp`'d into the pod — there is
-//!     no ref to clone, the point being to test local changes.
+//! The context is serialized by [`bundle::pack`](super::bundle), the same packer
+//! that content-addresses the tag, so the archive is exactly the bytes the tag
+//! names. `oc exec -t` gives `buildctl` a PTY so its `--progress=auto` UI renders
+//! through the console emulator.
 //!
-//! ## Why not OpenShift's Build subsystem
+//! Not OpenShift's own Build subsystem: its docker-strategy `BuildConfig` pins
+//! init containers to `quay.io/okd/scos-content` digests that OKD prunes from
+//! quay on pre-release streams, so a day-old cluster's first build dies
+//! `ImagePullBackOff`. A pinned public BuildKit image removes that dependency.
 //!
-//! The native docker-strategy `BuildConfig` (`oc start-build`) pins its build
-//! pod's init containers to `quay.io/okd/scos-content` by digest, and OKD prunes
-//! those digests from quay within ~72h on pre-release streams — so a day-old
-//! cluster's first build dies `ImagePullBackOff: manifest unknown`. Building with
-//! a pinned, retained public BuildKit image ([`buildkit::BUILDKIT_IMAGE`]) removes
-//! that dependency on upstream registry retention entirely.
-//!
-//! The build context is serialized by [`bundle::pack`](super::bundle), the same
-//! deterministic, symlink-safe, `.dockerignore`-aware packer that content-
-//! addresses the image tag — so the archive is exactly the bytes the tag names,
-//! and the chosen Dockerfile is staged at the archive root as `Dockerfile`.
-//! `oc exec -t` gives `buildctl` a PTY, so it renders its own collapsing BuildKit
-//! progress UI (the `--progress=auto` tty view) straight through the console
-//! emulator, exactly like a local `docker build`.
-//!
-//! This backend also builds the base images themselves ([`build_base_image`],
-//! driven by [`base_images`](crate::resource::impls::base_images) at `ztest
-//! setup`) — the compile builder and the runner base, from `docker/*.Dockerfile`
-//! — through the identical path.
+//! Also builds the base images ([`build_base_image`], driven by
+//! [`base_images`](crate::resource::impls::base_images) at `ztest setup`) through
+//! the identical path.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -47,9 +31,10 @@ use kube::api::{Api, ListParams};
 
 use super::{DevSource, ImageProvider, bundle, docker, join};
 use crate::inventory::DevImageEntry;
+use crate::qos::build::{BUILDKIT_BUILD, BUILDKIT_REST};
 use crate::resource::impls::buildkit::{BUILDKIT_CONTAINER, BUILDKIT_DEPLOYMENT, WORK_MOUNT};
 use crate::resource::impls::policy;
-use crate::resource::{Cx, NodeId, Readiness, ResourceError};
+use crate::resource::{Cx, NodeId, Readiness, ResourceError, grow_to, shrink_to};
 
 /// How long to wait for the BuildKit build pod to become Ready before giving up.
 const BUILDKIT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
@@ -87,18 +72,15 @@ impl ImageProvider for OpenShift {
         tag: &str,
     ) -> Result<String, ResourceError> {
         match &entry.source {
-            // A git dev image clones ON the cluster — the build pod has `git` and
-            // egress, so nothing but the pinned build-args crosses the wire. No
-            // laptop clone, no context upload (the vestige of `oc start-build`,
-            // whose binary source *required* uploading an archive).
+            // Git clones ON the cluster (the pod has `git` + egress), so only the
+            // pinned build-args cross the wire — no laptop clone, no upload.
             DevSource::Git {
                 url,
                 rev,
                 dockerfile,
                 context,
             } => run_build_git(cx, tag, url, rev, dockerfile, context, &build_args_git(entry)).await?,
-            // A local dev image is the working tree: pack it and upload it (there
-            // is no ref to clone — the point is testing local changes).
+            // Local is the working tree: pack and upload it (no ref to clone).
             DevSource::Local {
                 dockerfile,
                 context,
@@ -116,12 +98,10 @@ impl OpenShift {
     }
 }
 
-/// Build a base image (the compile **builder** or the runner **base**) from an
-/// embedded Dockerfile via the same BuildKit-pod path component images use. A base
-/// image is pure `FROM` + `RUN`, so its context is just the staged Dockerfile.
-/// `tag` is content-addressed (`<repo>:d-<hash>`), so the caller's probe skips
-/// this when the Dockerfile is unchanged. Reused by
-/// [`base_images`](crate::resource::impls::base_images) at `ztest setup`.
+/// Build a base image (compile **builder** or runner **base**) from an embedded
+/// Dockerfile via the same BuildKit-pod path component images use — its context
+/// is just the staged Dockerfile. `tag` is content-addressed, so the caller's
+/// probe skips this when the Dockerfile is unchanged.
 pub(crate) async fn build_base_image(
     cx: &Cx,
     tag: &str,
@@ -138,6 +118,41 @@ pub(crate) async fn build_base_image(
     let result = run_build_local(cx, tag, &df, &work, &[]).await;
     let _ = std::fs::remove_dir_all(&work);
     result
+}
+
+/// Mirror one published Hub image into the internal registry via `crane` in the
+/// **builder** pod (which carries `crane` + the SA push creds). `crane copy` is
+/// idempotent, so a re-run is cheap. `dest_ref` is the full path-preserving
+/// internal ref so an [`ImageTagMirrorSet`] prefix-substitution resolves to it.
+pub(crate) async fn mirror_image(
+    cx: &Cx,
+    hub_ref: &str,
+    dest_ref: &str,
+) -> Result<(), ResourceError> {
+    use crate::resource::impls::builder::{BUILDER_CONTAINER, BUILDER_DEPLOYMENT};
+    let registry = dest_ref.split('/').next().unwrap_or_default();
+    let script = format!(
+        "set -eu\n\
+         TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\n\
+         crane auth login {reg} -u ztest -p \"$TOKEN\" --insecure >/dev/null 2>&1\n\
+         crane copy --insecure {src} {dst}\n",
+        reg = shell_quote(registry),
+        src = shell_quote(hub_ref),
+        dst = shell_quote(dest_ref),
+    );
+    let mut argv = oc_base("exec");
+    argv.extend([
+        format!("deployment/{BUILDER_DEPLOYMENT}"),
+        "-c".to_string(),
+        BUILDER_CONTAINER.to_string(),
+        "-n".to_string(),
+        policy::RUN_NAMESPACE.to_string(),
+        "--".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        script,
+    ]);
+    super::run_streamed(cx, hub_ref, "oc", &argv, &[], "mirror component image").await
 }
 
 /// The in-cluster push target for `tag`: the `pull` service address (the BuildKit
@@ -262,10 +277,9 @@ async fn run_build_git(
     .await
 }
 
-/// Find the `ztest-buildkit` pod and wait until it reports Ready, returning its
-/// name. Mirrors the compile builder's wait: the Deployment is applied at setup
-/// and its image pull/rollout is asynchronous, so the first build blocks here. The
-/// pod's readiness probe (`buildctl debug workers`) means Ready ⇒ the daemon
+/// Find the `ztest-buildkit` pod and wait until Ready, returning its name. The
+/// Deployment's image pull/rollout is asynchronous, so the first build blocks
+/// here. Its readiness probe (`buildctl debug workers`) means Ready ⇒ the daemon
 /// answers, so the subsequent `exec buildctl` connects.
 async fn wait_for_buildkit(client: &kube::Client) -> Result<String, ResourceError> {
     let api: Api<Pod> = Api::namespaced(client.clone(), policy::RUN_NAMESPACE);
@@ -292,9 +306,8 @@ async fn wait_for_buildkit(client: &kube::Client) -> Result<String, ResourceErro
 }
 
 fn pod_ready(p: &Pod) -> bool {
-    // A terminating pod (Recreate rollout after a spec change) keeps its
-    // `Ready=True` condition for a moment after deletion starts; exec'ing into
-    // it races the teardown and fails "container is not created or running".
+    // A terminating pod keeps `Ready=True` briefly after deletion starts;
+    // exec'ing into it races teardown ("container is not created or running").
     // Skip it so the wait blocks for the replacement pod.
     if p.metadata.deletion_timestamp.is_some() {
         return false;
@@ -306,16 +319,12 @@ fn pod_ready(p: &Pod) -> bool {
         .unwrap_or(false)
 }
 
-/// `buildctl build` the prepared build dir (rendering BuildKit's own collapsing
-/// progress through the console PTY) and push to `reference`. `prep` is the shell
-/// that populates and `cd`s into `build_dir` (untar an uploaded context, or a git
-/// clone); `dockerfile`/`context` are relative to it — `dockerfile` becomes the
-/// `--local dockerfile=` dir plus `filename=`, `context` the `--local context=`
-/// dir. Push authenticates via a docker `config.json` written from the pod SA's
-/// token; the registry's service-ca-signed TLS is verified via the `ca` entry in
-/// the daemon's buildkitd.toml (trusting the mounted service-ca bundle). Only the
-/// per-build context dir is reaped afterward — the BuildKit layer cache is the
-/// whole point of the persistent state PVC, so it stays.
+/// `buildctl build` the prepared build dir (streaming BuildKit's progress through
+/// the console PTY) and push to `reference`. `prep` is the shell that populates
+/// and `cd`s into `build_dir` (untar an uploaded context, or a git clone);
+/// `dockerfile`/`context` are relative to it. Push authenticates via a docker
+/// `config.json` written from the pod SA's token. Only the per-build context dir
+/// is reaped afterward — the layer cache on the state PVC stays.
 async fn build_and_push(
     cx: &Cx,
     tag: &str,
@@ -343,13 +352,10 @@ async fn build_and_push(
         .iter()
         .map(|(k, v)| format!(" --opt {}", shell_quote(&format!("build-arg:{k}={v}"))))
         .collect();
-    // BuildKit reads registry creds from a docker config.json; write one from the
-    // in-pod SA token (user `ztest`, the imagestream-push identity). `DOCKER_CONFIG`
-    // pins the dir explicitly — the daemon runs as uid 0 with no guaranteed `$HOME`,
-    // so `~/.docker` would be unreliable. `base64 | tr -d '\n'` strips any wrapping
-    // the pod's base64 applies, so the JSON stays one line. RUN steps share the pod
-    // netns, so they reach cluster DNS + egress to fetch crates/packages (and the
-    // git clone in `prep` does too).
+    // BuildKit reads registry creds from a docker config.json written from the
+    // in-pod SA token. `DOCKER_CONFIG` pins the dir explicitly — the daemon runs
+    // as uid 0 with no guaranteed `$HOME`. `base64 | tr -d '\n'` keeps the JSON on
+    // one line. RUN steps share the pod netns, reaching cluster DNS + egress.
     let script = format!(
         "set -eu\n\
          export DOCKER_CONFIG=/tmp/.docker\n\
@@ -373,7 +379,27 @@ async fn build_and_push(
     );
     let mut argv = exec_argv(pod, true);
     argv.extend(["--".to_string(), "sh".to_string(), "-c".to_string(), script]);
+
+    // Grow buildkit to its build size and WAIT for the kubelet to actuate it
+    // before building, then shrink back to rest. Blocking, not fire-and-forget:
+    // the heavy compile layer would OOM-kill (exit 137) at the rest limit, and a
+    // grow that can't actuate must fail with a clear message rather than proceed
+    // into that OOM. The shrink is best-effort on every path.
+    let id = NodeId::Image(tag.to_string());
+    let (build_cpu, build_mem) = BUILDKIT_BUILD.guaranteed_cpu_mem("buildkit build footprint");
+    let (rest_cpu, rest_mem) = BUILDKIT_REST.guaranteed_cpu_mem("buildkit rest footprint");
+    if let Err(e) = grow_to(&cx.client, pod, BUILDKIT_CONTAINER, &build_cpu, &build_mem).await {
+        let _ = shrink_to(&cx.client, pod, BUILDKIT_CONTAINER, &rest_cpu, &rest_mem).await;
+        return Err(ResourceError::Provision(format!(
+            "buildkit build {tag}: {e}"
+        )));
+    }
     let result = super::run_streamed(cx, tag, "oc", &argv, &[], "on-cluster buildkit build").await;
+    if let Err(e) = shrink_to(&cx.client, pod, BUILDKIT_CONTAINER, &rest_cpu, &rest_mem).await
+        && let Some(sink) = &cx.progress
+    {
+        sink.note(&id, format!("buildkit shrink failed: {e}"));
+    }
 
     // Reap the per-build context dir (best-effort). The layer cache in the state
     // PVC stays, so a rebuild reuses it.
@@ -390,10 +416,9 @@ async fn build_and_push(
 }
 
 /// `oc <sub> [--context <ctx>]` — the base argv every `oc` subcommand starts
-/// with. The kube *client* targets the profile's context in-memory, but `oc` is a
-/// separate process honouring only the kubeconfig's current-context — without
-/// pinning it here `oc` could act against a stale local context (the same footgun
-/// `oc rsync` guards in [`remote_compile`](crate::pipeline::remote_compile)).
+/// with. `oc` is a separate process honouring only the kubeconfig's
+/// current-context, so without pinning `--context` here it could act against a
+/// stale local context (unlike the in-memory kube client).
 fn oc_base(sub: &str) -> Vec<String> {
     let mut argv = vec![sub.to_string()];
     if let Ok(ctx) = std::env::var(crate::cluster_config::KUBE_CONTEXT_ENV)
@@ -405,13 +430,23 @@ fn oc_base(sub: &str) -> Vec<String> {
     argv
 }
 
-/// `oc exec [-t] [--context <ctx>] <pod> -c buildkit -n ztest` — the prefix a
+/// `oc exec [-i -t] [--context <ctx>] <pod> -c buildkit -n ztest` — the prefix a
 /// command appends its `-- <argv>` to. All oc-level flags precede the `--` the
 /// caller adds, so they reach `oc`, not the exec'd command. `tty` allocates a PTY
-/// so `buildctl` renders its collapsing progress UI into the console emulator.
+/// so `buildctl` renders its collapsing progress UI (`--progress=auto`) into the
+/// console emulator instead of degrading to plain line output.
+///
+/// `-t` alone is not enough: kubectl's `SetupTTY` early-returns with `TTY=false`
+/// (silently, no warning) unless stdin is also attached, so the container process
+/// never sees a PTY. Passing `-i` alongside `-t` — with `oc` running under the
+/// console's own PTY, so its stdin *is* a terminal — is what makes kubectl set
+/// `t.Raw`, allocate the container TTY, and open the resize stream that forwards
+/// SIGWINCH so `buildctl` re-wraps its UI when the terminal resizes. Nothing ever
+/// writes to that stdin; it exists only to unlock the interactive TTY path.
 fn exec_argv(pod: &str, tty: bool) -> Vec<String> {
     let mut argv = oc_base("exec");
     if tty {
+        argv.push("-i".to_string());
         argv.push("-t".to_string());
     }
     argv.extend([

@@ -3,19 +3,6 @@
 //!
 //! See `docs/test-author-api.md` for the user-facing API and
 //! `docs/architecture-overview.md` for what runs under the hood.
-//!
-//! Module map (public, test-author-facing):
-//!  - [`component`]: `Validator` / `Indexer` / `Wallet` builders.
-//!  - [`mount`]: `Mount`, `MountSource`, `MountKind`, `SnapshotRef`.
-//!  - [`env`]: `TestEnv` (builder + live).
-//!  - [`handles`]: `*Handle` types, `Endpoint`, per-category RPC methods,
-//!    named-port tables, and the per-binary backend call sites.
-//!  - [`regtest`]: activation-height fixtures, parsing helpers.
-//!  - [`error`]: `EnvError`, `RpcError`.
-//!
-//! Internal kube plumbing (not part of the public API): `cluster`, `manifest`,
-//! `materialize`, `mounts` (resolver), `naming`, `portforward`, `seeds`,
-//! `grpc`, `utils`.
 
 #![deny(missing_debug_implementations)]
 
@@ -48,6 +35,8 @@ mod manifest;
 mod materialize;
 mod mounts;
 mod naming;
+pub mod observ;
+pub(crate) mod pod_status;
 mod portforward;
 mod seeds;
 pub mod storage;
@@ -88,10 +77,8 @@ pub use crate::handles::{
 pub use crate::mount::{ArchiveHandle, Mount, MountKind, MountSource, SnapshotRef};
 pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file};
 
-/// Internal re-exports so test-author proc macros can reach their
-/// runtime support code from crates that depend on `ztest`. Not part
-/// of the public API; paths under `__private` may change without
-/// notice.
+/// Internal re-exports so test-author proc macros can reach their runtime
+/// support code. Not part of the public API; paths may change without notice.
 #[doc(hidden)]
 pub mod __private {
     pub use inventory;
@@ -102,9 +89,8 @@ pub mod __private {
 /// Generate one `#[tokio::test(flavor = "multi_thread")]` wrapper per
 /// `name => helper` pair, each calling `helper::<$validator>(&$kind).await`.
 ///
-/// Collapses the per-validator boilerplate when a test module wants the same
-/// generic test function run once against each backend. A macro (not a fn)
-/// because each wrapper must be a discoverable `#[tokio::test]` item.
+/// A macro, not a fn, because each wrapper must be a discoverable
+/// `#[tokio::test]` item.
 ///
 /// ```ignore
 /// validator_tests!(
@@ -129,10 +115,9 @@ macro_rules! validator_tests {
 
 /// One-shot import for test code. `use ztest::prelude::*;`.
 ///
-/// Curation principle: prelude items must appear in a public signature that
-/// test authors interact with. Convenience-only re-exports (saving a
-/// `Cargo.toml` line for a crate test code never sees) are rejected as SemVer
-/// noise that ties ztest's version to upstream churn for no benefit.
+/// Curation principle: prelude items must appear in a public signature test
+/// authors interact with. Convenience-only re-exports are rejected as SemVer
+/// noise that ties ztest's version to upstream churn.
 pub mod prelude {
     #[cfg(feature = "zingo")]
     pub use super::ZingoWallet;
@@ -152,11 +137,9 @@ pub mod prelude {
         regtest_test_activation_heights, regtest_test_lockbox_disbursements,
         regtest_test_post_nu6_funding_streams,
     };
-    /// `ActivationHeights` appears in ztest's public signatures
-    /// ([`ValidatorBackend::activation_heights`],
-    /// [`regtest_test_activation_heights`], etc.), so callers need the type to
-    /// consume what ztest returns. It's ztest's own type
-    /// ([`crate::topology::ActivationHeights`]).
+    /// `ActivationHeights` appears in ztest's public signatures (e.g.
+    /// [`ValidatorBackend::activation_heights`]), so callers need the type to
+    /// consume what ztest returns.
     pub use crate::topology::ActivationHeights;
     pub use crate::topology::NetworkUpgrade;
     pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file};

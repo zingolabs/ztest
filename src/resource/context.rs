@@ -1,12 +1,7 @@
 //! [`Cx`]: the shared, read-only context every [`Provider`](super::Provider)
-//! method receives.
-//!
-//! One `Cx` for the whole graph — same shape whether the graph is provisioning
-//! runtime test resources (during `ztest run`) or cluster infrastructure
-//! (during `ztest setup`). A provider ignores fields it doesn't need
-//! (a `NamespaceProvider` has no use for `console`; an `ImageProvider` has no
-//! use for `no_wait`) — the marginal cost of a few unused `Option`s is well
-//! worth the single-type simplicity across the two entry-point graphs.
+//! method receives — one shape for both entry-point graphs (`run` and `setup`).
+//! A provider ignores the fields it doesn't need; the unused `Option`s buy
+//! single-type simplicity.
 
 use std::sync::Arc;
 
@@ -16,53 +11,29 @@ use crate::cli::console::Console;
 use crate::resource::provider::NodeId;
 
 /// Shared context handed to every [`Provider`](super::Provider) method.
-///
-/// # Fields
-///
-/// - [`client`](Self::client) is always present; the resource layer is
-///   K8s-native and providers can rely on it. Constructed by
-///   [`crate::cluster::client`] after the cluster probe succeeds.
-/// - [`console`](Self::console) is `None` off a TTY or in headless test
-///   contexts. Only providers that stream child-process output (dev image
-///   build/load) touch it directly.
-/// - [`progress`](Self::progress) is the sink for per-provider sub-phase
-///   notes ("building" → "load→kind", "waiting for CRDs Established", ...).
-///   `None` off a TTY. Providers that report sub-phases call
-///   [`ProgressSink::note`] on this.
-/// - [`no_wait`](Self::no_wait) tells wait-heavy providers (Deployments,
-///   StatefulSets) to return as soon as the object exists rather than block
-///   on Ready. Set by `ztest setup --no-wait`. Providers without waits
-///   ignore it.
-///
 /// Construct with [`Cx::builder`] for graph runs; [`Cx::headless`] for tests
 /// and non-TTY CI paths that only need a client.
 pub struct Cx {
     /// Kubernetes API client. Every provider talks through this.
     pub client: Client,
 
-    /// The bottom-panel console (TTY runs only). Providers that stream child
-    /// PTY output attach to it directly; others use
-    /// [`progress`](Self::progress). Crate-internal because [`Console`] is
-    /// itself a crate-internal type; external callers get a `None` here via
-    /// [`Cx::headless`].
+    /// The bottom-panel console (TTY runs only); `None` otherwise. Providers
+    /// that stream child PTY output attach directly, others use
+    /// [`progress`](Self::progress). Crate-internal because [`Console`] is.
     pub(crate) console: Option<Console>,
 
-    /// Per-provider sub-phase reporter. Feeds the right-column transfer
-    /// tracker in the preflight panel. `None` off a TTY. Crate-internal
-    /// for the same reason as [`console`](Self::console): only the CLI
-    /// glue builds one.
+    /// Per-provider sub-phase reporter feeding the preflight panel's transfer
+    /// tracker; `None` off a TTY. Crate-internal: only the CLI glue builds one.
     pub(crate) progress: Option<ProgressSink>,
 
-    /// Skip Deployment / StatefulSet rollout waits when set. Used by
-    /// `ztest setup --no-wait` to return control quickly; the first test
-    /// run then blocks on the rollout instead. Providers without waits
-    /// ignore this.
+    /// Skip Deployment / StatefulSet rollout waits (`ztest setup --no-wait`);
+    /// the first test run then blocks on the rollout instead.
     pub no_wait: bool,
 }
 
 impl Cx {
-    /// A minimal `Cx` for headless (non-TTY) runs and unit tests: just the
-    /// client. No console, no progress sink, waits enabled.
+    /// A minimal `Cx` for headless (non-TTY) runs and unit tests: client only,
+    /// no console/progress, waits enabled.
     pub fn headless(client: Client) -> Self {
         Self {
             client,
@@ -86,10 +57,7 @@ impl Cx {
 
 impl std::fmt::Debug for Cx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `kube::Client` wraps a hyper connector and its own auth store;
-        // dumping it into a Debug string leaks nothing security-relevant but
-        // makes debug output enormous. Report presence only, consistent
-        // across `Cx`/`Graph`/`ProgressSink`.
+        // A full `kube::Client` dump is enormous; report presence only.
         f.debug_struct("Cx")
             .field("console", &self.console.is_some())
             .field("progress", &self.progress.is_some())
@@ -117,17 +85,13 @@ impl std::fmt::Debug for CxBuilder {
 }
 
 impl CxBuilder {
-    /// Attach a console (TTY runs). Crate-internal: [`Console`] itself is
-    /// a crate-internal type; external callers stick to
-    /// [`Cx::headless`].
+    /// Attach a console (TTY runs). Crate-internal, as [`Console`] is.
     pub(crate) fn console(mut self, console: Console) -> Self {
         self.console = Some(console);
         self
     }
 
     /// Attach a progress sink (TTY runs with sub-phase reporting).
-    /// Crate-internal for the same reason as [`console`](Self::console):
-    /// only the CLI glue builds a sink.
     pub(crate) fn progress(mut self, sink: ProgressSink) -> Self {
         self.progress = Some(sink);
         self
@@ -149,28 +113,18 @@ impl CxBuilder {
     }
 }
 
-/// Callback for a provider to report its current sub-phase to the CLI.
-///
-/// The coarse lifecycle (`Acquiring` → `Ready`/`Failed`) reaches the CLI
-/// through [`Graph::provision`](super::Graph::provision)'s `on_change`;
-/// `ProgressSink` adds finer sub-phase text (e.g. `docker build` progress
-/// → `kind load` progress on an image, or `waiting for CRDs Established`
-/// on the snapshot bundle).
-///
-/// The type is opaque (a closure behind `Arc<dyn Fn>`) so `resource/` need
-/// not name the CLI's event type — it only knows there's *some* sink to
-/// forward notes to. `cli::run` constructs one with an mpsc-send closure.
+/// Callback for a provider to report finer sub-phase text to the CLI, alongside
+/// the coarse lifecycle that reaches it through
+/// [`Graph::provision`](super::Graph::provision)'s `on_change`. Opaque (a
+/// closure behind `Arc<dyn Fn>`) so `resource/` need not name the CLI's event
+/// type; `cli::run` wraps an mpsc-send closure.
 #[derive(Clone)]
 pub struct ProgressSink(Arc<dyn Fn(NodeId, Progress) + Send + Sync>);
 
-/// One sub-phase report for a resource node.
-///
-/// `Note` is spinner + free text (the coarse phase of most providers).
-/// `Bytes` carries an aggregate byte count that drives the right column's `%`
-/// bar (an in-process push knows `pushed / total`). `Finalizing` means the bytes
-/// are all in but a tail step is still running (the manifest PUT after the last
-/// blob), so the row shows a spinner rather than parking at a misleading 100%
-/// until the coarse `Ready` transition removes it.
+/// One sub-phase report for a resource node. `Note` is spinner + free text;
+/// `Bytes` drives the `%` bar; `Finalizing` means the bytes are all in but a
+/// tail step (e.g. the manifest PUT) is still running, so the row keeps a
+/// spinner rather than parking at a misleading 100%.
 #[derive(Clone, Debug)]
 pub enum Progress {
     Note(String),

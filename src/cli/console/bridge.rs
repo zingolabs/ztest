@@ -1,18 +1,11 @@
 //! Pure conversion from [`avt`]'s emulated terminal cells to ANSI strings.
-//!
-//! The console feeds every subprocess's output through an `avt` virtual terminal,
-//! then serializes the result back to ANSI for direct terminal output: lines that
-//! scroll off the top (`Changes::scrollback`) become committed scrollback, and the
-//! live grid (`Vt::view`) becomes the footer's live rows. This module is that
-//! serialization — pure, no I/O, unit-tested against a real `avt` parser (round-
-//! tripping through the emulator) so colour/attribute/wide-char handling can't
-//! silently drift.
+//! No I/O; round-trip-tested through a real `avt` parser so colour/attribute/
+//! wide-char handling can't silently drift.
 
 use avt::{Color as AvtColor, Line as AvtLine, Pen, Vt};
 
 /// The SGR parameter list for a [`Pen`] (e.g. `"1;38;5;1"` for bold + red), or an
-/// empty string for the terminal default. Colours use the always-valid extended
-/// forms (`38;5;i` / `38;2;r;g;b`); attributes precede them.
+/// empty string for the terminal default.
 fn sgr_params(pen: &Pen) -> String {
     let mut p: Vec<String> = Vec::new();
     if pen.is_bold() {
@@ -55,17 +48,9 @@ fn sgr_params(pen: &Pen) -> String {
 /// to at most `max_cols` display columns. Returns the string and the display
 /// width it uses (for side-by-side padding in the two-column panel).
 ///
-/// For fidelity and cost:
-/// - Runs are coalesced: consecutive cells sharing a pen become one SGR span, so
-///   a 200-column line of one colour is one span, not 200.
-/// - Trailing blanks are trimmed: avt pads every line to full width with default
-///   cells; we cut at the last non-default cell (a non-default background is
-///   preserved).
-/// - Wide-char tails (width 0) are skipped; a wide glyph that would straddle the
-///   clip edge is dropped.
-/// - Each style change resets first (`ESC[0;…m`) so no attribute leaks from the
-///   previous run, and any trailing style is reset at line end so the line can be
-///   concatenated beside another without bleeding.
+/// Same-pen runs coalesce into one SGR span; trailing default cells are trimmed;
+/// each style change and the line end reset first so nothing bleeds when lines
+/// are concatenated side by side.
 pub(crate) fn avt_line_ansi_clipped(line: &AvtLine, max_cols: usize) -> (String, usize) {
     let cells = line.cells();
     let end = cells
@@ -109,16 +94,13 @@ pub(crate) fn avt_line_to_ansi(line: &AvtLine) -> String {
     avt_line_ansi_clipped(line, usize::MAX).0
 }
 
-/// Replay an owo-colors/ANSI string through a wide (non-wrapping) emulator and
-/// return each logical row clipped to `width` display columns, as
-/// `(ansi, display_width)`. Used to lay the two panel columns side by side: a
-/// line longer than its column is clipped (keeping the labelled head, dropping
-/// trailing detail) rather than wrapped, so it stays one physical row.
+/// Replay an ANSI string through a wide (non-wrapping) emulator and return each
+/// logical row clipped to `width` display columns, as `(ansi, display_width)`.
+/// Lays the two panel columns side by side: an overlong line is clipped, not
+/// wrapped, so it stays one physical row.
 ///
-/// The panel is generated with bare `\n` line breaks (`writeln!`), but `avt` is a
-/// raw VT: a lone line-feed moves down without returning to column 0, so we
-/// normalise `\n` to `\r\n` first, exactly as a terminal's `ONLCR` discipline
-/// would for a child's output.
+/// `\n` is normalised to `\r\n` first: `avt` is a raw VT where a lone line-feed
+/// moves down without returning to column 0.
 pub(crate) fn ansi_rows(s: &str, width: usize) -> Vec<(String, usize)> {
     const NOWRAP: usize = 512;
     let s = s.trim_end_matches('\n');
@@ -134,8 +116,6 @@ pub(crate) fn ansi_rows(s: &str, width: usize) -> Vec<(String, usize)> {
 mod tests {
     use super::*;
 
-    /// avt line → ANSI → avt line must preserve the serialized form (a stable
-    /// round-trip proves text + per-cell style survive the emulator).
     fn roundtrip(cols: usize, input: &str) {
         let mut vt = Vt::new(cols, 1);
         vt.feed_str(input);
@@ -193,8 +173,7 @@ mod tests {
 
     #[test]
     fn ansi_rows_splits_on_newline_without_column_drift() {
-        // Two `writeln!`-style rows (bare `\n`): the second must start at column 0,
-        // not be shifted right by the first row's width.
+        // Bare-`\n` rows: the second must start at column 0, not be shifted right.
         let rows = ansi_rows("alpha\n\x1b[32mbeta\x1b[0m", 20);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, "alpha");

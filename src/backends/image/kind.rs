@@ -86,15 +86,13 @@ impl ImageProvider for Kind {
     }
 }
 
-/// Query the kind node's containerd for a given image tag. Public so the
-/// preflight pipeline can skip rebuilds when an image is already loaded.
+/// Query the kind node's containerd for a given image tag, so the preflight can
+/// skip rebuilds when an image is already loaded.
 ///
-/// `crictl images -q REPO[:TAG]` on the cri-tools version shipped in the kind
-/// node image does not apply its positional argument as a filter; it returns
-/// every image's ID regardless. So we list the full table and look for a
-/// `REPOSITORY TAG` column pair matching the requested ref, with or without
-/// an implicit `docker.io/library/` prefix (since `kind load docker-image
-/// foo:bar` stores the image under that fully-qualified name).
+/// `crictl images REPO[:TAG]` on the kind node's cri-tools version ignores its
+/// positional filter and returns every image, so we list the full table and
+/// match the `REPOSITORY TAG` columns, accepting the implicit
+/// `docker.io/library/` prefix `kind load docker-image` stores under.
 pub(crate) fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
     let node = format!("{}-control-plane", kind_cluster_name());
     let out = Command::new("docker")
@@ -109,11 +107,8 @@ pub(crate) fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
             stderr_tail: tail(&out.stderr, 40),
         });
     }
-    // Parse `(repo, tag)` out of each line and look for a match. The
-    // first column is `REPOSITORY` (may include a registry prefix),
-    // the second is `TAG`. We accept both `tag` and
-    // `docker.io/library/<tag>` so callers don't need to know
-    // containerd's storage convention.
+    // Columns are `REPOSITORY` (may carry a registry prefix) then `TAG`; accept
+    // both `<repo>` and `docker.io/library/<repo>`.
     let needle_repo_tag: Vec<&str> = tag.splitn(2, ':').collect();
     if needle_repo_tag.len() != 2 {
         return Err(ImageError::KindImageQuery {
@@ -159,13 +154,10 @@ pub(crate) fn kind_load_argv(tag: &str) -> Vec<String> {
     ]
 }
 
-/// The active kind cluster's name; its node is `<name>-control-plane` and
-/// `kind load --name <name>` targets it.
-///
-/// First hit wins: an explicit non-empty `KIND_CLUSTER`, else the active
-/// kube-context when it's a kind one (`kind-<name>` → `<name>`), else `kind`
-/// (kind's default). Deriving from the context is what keeps kind mode following
-/// wherever kubectl points instead of a stale hardcoded default.
+/// The active kind cluster's name (node `<name>-control-plane`, `kind load
+/// --name <name>`). First hit wins: `KIND_CLUSTER`, else the active kube-context
+/// when it's a kind one (`kind-<name>` → `<name>`), else `kind`. Deriving from
+/// the context keeps kind mode following wherever kubectl points.
 pub fn kind_cluster_name() -> String {
     if let Some(name) = std::env::var("KIND_CLUSTER").ok().filter(|s| !s.is_empty()) {
         return name;

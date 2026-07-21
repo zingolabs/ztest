@@ -1,13 +1,7 @@
-//! `Surface`: the terminal-owning render primitive.
-//!
-//! The render thread (`super::render`) owns the single instance. `Surface` speaks
-//! only in already-composed ANSI strings — the lines to commit into scrollback,
-//! the live rows, and the two panel column strings — and drives the terminal with
-//! a manual **sticky footer** ([`super::footer`]): completed lines are printed
-//! normally so the terminal scrolls them into its own native scrollback, and only
-//! the footer (live region + pinned panel) is repainted in place. There is no
-//! reserved region and no fixed height — the footer is exactly as tall as its
-//! content each frame.
+//! `Surface`: the terminal-owning render primitive (one instance, owned by the
+//! render thread). Speaks only in already-composed ANSI strings and drives a
+//! manual sticky footer ([`super::footer`]): completed lines print into native
+//! scrollback, only the footer is repainted in place.
 //!
 //! Each frame is wrapped in a DEC private mode 2026 synchronized update so the
 //! cursor-up + repaint present atomically (terminals without 2026 ignore it), and
@@ -22,24 +16,17 @@ use super::{bridge, footer};
 /// narrow terminal can't fit both without mangling either.
 const TWO_COL_MIN: u16 = 90;
 
-/// The left column's target width. Its content is fixed status lines whose widest
-/// (the capacity gauge) needs ~56 cols; 80 leaves headroom for a long
-/// kube-context. Held constant so every extra terminal column flows to the right
-/// (transfer) column, which is the one that wants the room.
+/// The left column's target width, held constant so every extra terminal column
+/// flows to the right (transfer) column, which is the one that wants the room.
 const LEFT_COL_TARGET: u16 = 80;
 /// Floor for the right column when the terminal is too narrow to grant the left
 /// its target: the left yields down to this so the transfer column stays legible.
 const RIGHT_COL_MIN: u16 = 30;
 
 /// Compose the two-column panel into ANSI rows, each clipped to `cols` so it
-/// stays exactly one physical row.
-///
-/// At or above [`TWO_COL_MIN`] (and with a non-empty right column) the width is
-/// split into a left column pinned to [`LEFT_COL_TARGET`] (yielding toward
-/// [`RIGHT_COL_MIN`] on a tight terminal) and a right column taking the rest;
-/// each left row is padded to the left width and the right row appended. Below
-/// that, a single full-width left column. A line longer than its column is
-/// clipped (keeping the labelled head), never wrapped.
+/// stays exactly one physical row. At or above [`TWO_COL_MIN`] (with a non-empty
+/// right column) the width splits per [`two_col_split`]; below that, a single
+/// full-width left column. Overlong lines are clipped, never wrapped.
 fn compose_panel(left: &str, right: &str, cols: u16) -> Vec<String> {
     let right = right.trim_end_matches('\n');
     if cols < TWO_COL_MIN || right.is_empty() {
@@ -73,13 +60,10 @@ fn two_col_split(width: u16) -> (u16, u16) {
 
 /// Restores the controlling terminal's line discipline on drop.
 ///
-/// A TUI must not run under cooked mode: the kernel would echo the user's
-/// keystrokes (most visibly the `^C` from Ctrl-C) straight onto the drawn panel,
-/// corrupting it. We disable `ECHO` + `ICANON` (no echo, no line buffering) but
-/// keep `ISIG`, so Ctrl-C still raises `SIGINT` (which the render thread turns
-/// into cooperative cancellation) rather than arriving as a raw byte we'd have to
-/// read. The original attributes are restored by [`Surface::finish`] and, as a
-/// panic/`exit` backstop, by this guard's `Drop`.
+/// Under cooked mode the kernel would echo keystrokes (most visibly `^C`) onto
+/// the drawn panel. We disable `ECHO` + `ICANON` but keep `ISIG`, so Ctrl-C still
+/// raises `SIGINT` rather than arriving as a raw byte. Restored by
+/// [`Surface::finish`] and, as a panic/`exit` backstop, by this guard's `Drop`.
 struct TtyGuard {
     fd: std::os::fd::RawFd,
     original: Option<libc::termios>,
@@ -161,9 +145,8 @@ impl Surface {
         self.cols
     }
 
-    /// Rows available for the live region above the pinned panel — the height the
-    /// render thread sizes the `avt` grid and each child PTY to, and the ceiling the
-    /// engine's running block grows to (see [`super::live_rows_for`]).
+    /// Rows available for the live region above the pinned panel (see
+    /// [`super::live_rows_for`]).
     pub fn live_rows(&self) -> u16 {
         super::live_rows_for(self.rows)
     }
@@ -180,8 +163,8 @@ impl Surface {
     pub fn present(&mut self, committed: &[String], live: &[String], left: &str, right: &str) {
         let mut footer_lines: Vec<String> = live.to_vec();
         footer_lines.extend(compose_panel(left, right, self.cols));
-        // Never let the footer exceed the screen: the cursor can't be walked up
-        // into scrollback, so drop from the top (oldest live rows) if it would.
+        // The cursor can't be walked up into scrollback, so a footer taller than
+        // the screen drops its oldest live rows.
         let max = self.rows as usize;
         if footer_lines.len() > max {
             footer_lines.drain(0..footer_lines.len() - max);
@@ -204,8 +187,7 @@ impl Surface {
     pub fn finish(&mut self, final_live: &[String]) {
         self.tty.restore();
         let mut frame = String::new();
-        // Commit the final live rows as scrollback and draw an empty footer, which
-        // erases the panel and leaves the cursor on a fresh line below.
+        // An empty footer erases the panel, leaving the cursor on a fresh line.
         footer::render(&mut frame, final_live, &[], self.prev_footer_rows);
         self.prev_footer_rows = 0;
         frame.push_str(CURSOR_SHOW);
@@ -216,8 +198,7 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        // Backstop for a normal drop that skipped `finish` (the hard-exit path
-        // calls `finish` explicitly): make sure the cursor comes back.
+        // Backstop for a drop that skipped `finish`: bring the cursor back.
         let _ = self.stdout.write_all(CURSOR_SHOW.as_bytes());
         let _ = self.stdout.flush();
     }

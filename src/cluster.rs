@@ -1,13 +1,9 @@
 //! Kube client + namespace lifecycle.
 //!
-//! Every `TestEnv` lives inside its own namespace
-//! (`ztest-{package}-{test}-{suffix}`), created on `build()` and deleted
-//! when the `TestEnv` is dropped. Deleting the namespace cascades every
-//! namespaced object (no per-object owner references needed).
-//!
-//! Cluster-scoped resources we mint (VolumeSnapshotContent shadows in
-//! `seeds.rs`) survive the namespace delete and must be reaped explicitly.
-//! See `docs/architecture-overview.md#ownership-cascade`.
+//! Every `TestEnv` lives in its own namespace, created on `build()` and
+//! deleted on drop, which cascades every namespaced object. Cluster-scoped
+//! resources we mint (VolumeSnapshotContent shadows in `seeds.rs`) survive
+//! that delete and must be reaped explicitly.
 
 use k8s_openapi::api::core::v1::{Namespace, Service, ServiceAccount};
 use kube::Client;
@@ -18,15 +14,10 @@ use crate::naming::RunCoords;
 
 /// Install the process-wide rustls crypto provider exactly once.
 ///
-/// kube, tonic, and reqwest all pull rustls 0.23, which treats the crypto
-/// provider as a process-level choice rather than a compile-time default, so
-/// something must install one before the first TLS handshake or rustls panics
-/// ("could not automatically determine the process-level CryptoProvider").
-/// ztest owns the transport on the test author's behalf, so it picks `ring`,
-/// matching what the (now-removed) `zebra-*` stack supplied transitively.
-///
-/// Guarded by a `Once`, and `install_default` is a no-op if a provider is
-/// already set, so a test binary that installs its own provider first wins.
+/// rustls 0.23 (pulled by kube/tonic/reqwest) needs a process-level provider
+/// installed before the first TLS handshake or it panics. `install_default`
+/// is a no-op if one is already set, so a test binary that installs its own
+/// first wins.
 pub(crate) fn ensure_crypto_provider() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -35,18 +26,15 @@ pub(crate) fn ensure_crypto_provider() {
     });
 }
 
-/// Construct a kube client. In-cluster, uses the mounted ServiceAccount token.
-/// Otherwise, if a cluster profile pinned a context (`ZTEST_KUBE_CONTEXT`, set
-/// by `ztest run --cluster` / the persisted default, see
-/// [`crate::cluster_config`]), targets that named context in-memory without
-/// touching the kubeconfig; else infers from `KUBECONFIG` / `~/.kube/config`.
+/// Construct a kube client. In-cluster, uses the mounted ServiceAccount
+/// token. Otherwise targets the profile-pinned context ([`KUBE_CONTEXT_ENV`])
+/// in-memory if set, else infers from `KUBECONFIG` / `~/.kube/config`.
 pub async fn client() -> Result<Client, kube::Error> {
     Client::try_from(config().await?)
 }
 
-/// Resolve the kube [`Config`](kube::Config) the same way [`client`] does, but
-/// hand back the config rather than a connected client — so a caller can read
-/// `cluster_url` (e.g. `ztest setup` echoing the target) before connecting.
+/// Like [`client`] but returns the [`Config`](kube::Config) rather than a
+/// connected client, so a caller can read `cluster_url` before connecting.
 pub async fn config() -> Result<kube::Config, kube::Error> {
     ensure_crypto_provider();
     match std::env::var(crate::cluster_config::KUBE_CONTEXT_ENV) {
@@ -58,9 +46,6 @@ pub async fn config() -> Result<kube::Config, kube::Error> {
 }
 
 /// Build a config for a named kube-context from the kubeconfig, in-memory.
-/// `ztest run` has already verified the context exists (see
-/// [`crate::cluster_config::activate`]); a failure here is a kubeconfig-load or
-/// auth problem, surfaced through the transport error channel.
 async fn config_for_context(context: &str) -> Result<kube::Config, kube::Error> {
     use kube::config::{KubeConfigOptions, Kubeconfig};
     let kubeconfig = Kubeconfig::read().map_err(|e| kube::Error::Service(Box::new(e)))?;
@@ -73,41 +58,30 @@ async fn config_for_context(context: &str) -> Result<kube::Config, kube::Error> 
         .map_err(|e| kube::Error::Service(Box::new(e)))
 }
 
-/// `true` when the test binary is running inside a pod with a service
-/// account token mounted. We use this to choose direct pod-IP dial vs
-/// kube-rs portforward.
+/// `true` when running inside a pod with a service account token mounted.
+/// Chooses direct pod-IP dial vs kube-rs portforward.
 pub fn in_cluster() -> bool {
     std::env::var("KUBERNETES_SERVICE_HOST").is_ok()
 }
 
 /// Whether `ztest run --no-cleanup` asked us to leave per-test namespaces
-/// behind for post-mortem inspection. The CLI flag can't reach the test
-/// process directly (Drop runs inside the test binary, not the `ztest`
-/// process), so it propagates as the `ZTEST_NO_CLEANUP` env var, which nextest
-/// forwards to every test binary. Any non-empty, non-`"0"` value counts as set.
+/// behind. Propagated as `ZTEST_NO_CLEANUP` because Drop runs in the test
+/// binary, not the `ztest` process; any non-empty, non-`"0"` value counts.
 pub(crate) fn no_cleanup_requested() -> bool {
     std::env::var_os("ZTEST_NO_CLEANUP").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// Whether this test process is running under the `ztest run` orchestrator,
-/// signalled by the `ZTEST_ENGINE` env var the engine sets on every test child
-/// (`src/engine/{local,pod}_runner.rs`). A `TestEnv` provisions cluster pods
-/// against a capacity budget the orchestrator's scheduler owns; running a test
-/// binary directly (`cargo test`/`cargo nextest`) has no scheduler, so there is
-/// no admission, no NVMe-pool probe, and no capacity accounting — see
+/// Whether this test process runs under the `ztest run` orchestrator,
+/// signalled by `ZTEST_ENGINE`. A `TestEnv` provisions pods against a
+/// capacity budget the scheduler owns; running the test binary directly has
+/// no scheduler, so no admission or capacity accounting — see
 /// [`require_orchestrator`].
 fn orchestrated() -> bool {
     std::env::var_os("ZTEST_ENGINE").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// Fail fast unless running under the `ztest run` orchestrator.
-///
-/// [`TestEnv::build`](crate::TestEnv::build) creates a namespace, Guaranteed
-/// pods sized against the tier budget, and a `ResourceQuota` — all of which the
-/// orchestrator's scheduler admits against shared cluster capacity. A bare
-/// `cargo test`/`cargo nextest` has no scheduler, so it would create unbudgeted
-/// pods against whatever kubeconfig is loaded. Refuse with a clear pointer
-/// rather than silently doing that.
+/// Fail fast unless running under the `ztest run` orchestrator, which would
+/// otherwise create unbudgeted pods against whatever kubeconfig is loaded.
 pub(crate) fn require_orchestrator() -> Result<(), crate::EnvError> {
     if orchestrated() {
         return Ok(());
@@ -122,12 +96,9 @@ pub(crate) fn require_orchestrator() -> Result<(), crate::EnvError> {
     })
 }
 
-/// Apply a namespace-scoped [`ResourceQuota`] capping aggregate `requests` at
-/// `footprint` (and pod count at `pods`): an API-server-enforced backstop to
-/// the orchestrator's soft admission. Idempotent (a 409 from a GC-lagged prior
-/// run counts as success). Requests-scoped, so it never rejects a pod the
-/// scheduler legitimately admitted; the namespace delete cascades it, so there
-/// is no separate teardown.
+/// Apply a namespace-scoped [`ResourceQuota`] capping aggregate `requests`
+/// at `footprint` and pod count at `pods`: an API-server-enforced backstop
+/// to the orchestrator's soft admission. Idempotent (409 counts as success).
 pub async fn apply_resource_quota(
     client: &Client,
     namespace: &str,
@@ -171,18 +142,12 @@ pub async fn ensure_namespace(
 ) -> Result<(), kube::Error> {
     let api: Api<Namespace> = Api::all(client.clone());
     if api.get_opt(namespace).await?.is_some() {
-        // Already exists (idempotent retry); still confirm the default SA
-        // landed before any pod is created against it.
         return wait_for_default_sa(client, namespace).await;
     }
-    // Label values must be DNS-1123 (≤63, no `:`); the raw `module::test` path
-    // is slugged for the label and kept verbatim in an annotation (annotations
-    // have no charset/length limit) so nothing is lost.
-    //
-    // `janitor/ttl` is always set, even under `--no-cleanup`: the flag only
-    // suppresses immediate teardown in Drop so a developer can inspect the
-    // pods. The 1h janitor backstop still reaps the namespace afterwards, so
-    // `--no-cleanup` never leaks namespaces permanently.
+    // Label values must be DNS-1123, so the `module::test` path is slugged
+    // for the label and kept verbatim in an annotation. `janitor/ttl` is set
+    // even under `--no-cleanup` (which only suppresses Drop teardown), so a
+    // stale namespace is still reaped and never leaks permanently.
     let ns: Namespace = serde_json::from_value(json!({
         "apiVersion": "v1",
         "kind": "Namespace",
@@ -211,14 +176,9 @@ pub async fn ensure_namespace(
 }
 
 /// Block until the namespace's auto-provisioned `default` ServiceAccount
-/// exists.
-///
-/// Kubernetes' ServiceAccount controller creates the `default` SA
-/// asynchronously after a namespace appears. A pod created in that gap
-/// implicitly references `default` and is rejected with
-/// `serviceaccount "default" not found` (403), a flaky failure that scales with
-/// how fast we create pods after the namespace. Polling for the SA here closes
-/// the race; a clear timeout error beats the cryptic pod-create 403.
+/// exists. The SA controller creates it asynchronously; a pod created in that
+/// gap is rejected with `serviceaccount "default" not found` (403). Polling
+/// here closes the race with a clear timeout instead of that cryptic 403.
 async fn wait_for_default_sa(client: &Client, namespace: &str) -> Result<(), kube::Error> {
     const ATTEMPTS: u32 = 150;
     const INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
@@ -311,12 +271,10 @@ mod tests {
 
     #[test]
     fn quota_manifest_caps_requests_and_pods_at_the_deployed_footprint() {
-        // Wallet tier (4c / 1 GiB) split across 2 pods → 2 cores each, so the
-        // deployed footprint is 4 cores / 1 GiB across 2 pods.
         let fp = QosClass::Wallet.profile().footprint;
         let m = resource_quota_manifest(fp, 2);
         let hard = &m["spec"]["hard"];
-        assert_eq!(hard["requests.cpu"], "4000m");
+        assert_eq!(hard["requests.cpu"], "2000m");
         assert_eq!(hard["requests.memory"], (GIB).to_string());
         assert_eq!(hard["pods"], "2");
         assert_eq!(m["metadata"]["name"], "ztest-tier");

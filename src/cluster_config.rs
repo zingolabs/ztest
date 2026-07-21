@@ -1,22 +1,17 @@
 //! Named cluster profiles.
 //!
-//! A profile binds the otherwise-independent knobs that decide where a
-//! `ztest run` actually lands — the kube-context and the image
-//! [`backend`](Profile::backend) (kind / registry / OpenShift, with its
-//! addresses) — under one name, so `ztest run --cluster <name>` (or a persisted
-//! default) selects them together, and `ztest setup` provisions against the same
-//! signal. Without this, the target is ambient: the kube current-context drives
-//! API calls while `ZTEST_IMAGE_REGISTRY` / `KIND_CLUSTER` independently drive
-//! image loading, and it's easy to build into a kind node while pointed at a
-//! remote cluster (or vice versa) without noticing.
+//! A profile binds the kube-context and the image
+//! [`backend`](Profile::backend) under one name, so `ztest run --cluster
+//! <name>` (or a persisted default) and `ztest setup` select them together
+//! rather than from independent ambient signals (kube current-context vs
+//! `ZTEST_IMAGE_REGISTRY` / `KIND_CLUSTER`), which made it easy to build into
+//! a kind node while pointed at a remote cluster.
 //!
 //! Store: `$XDG_CONFIG_HOME/ztest/clusters.toml`, else `~/.config/ztest/clusters.toml`.
 //!
-//! Selection precedence at run time (see [`activate`]): `--cluster` flag >
-//! environment variables already set > the persisted `current` profile >
-//! built-in kind defaults. The profile records the *expected* kube-context;
-//! ztest targets it in-memory when building the client (see
-//! [`crate::cluster::client`]) and never writes to the kubeconfig.
+//! Selection precedence (see [`activate`]): `--cluster` flag > pre-set env >
+//! persisted `current` profile > built-in kind defaults. ztest targets the
+//! profile's kube-context in-memory and never writes to the kubeconfig.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,35 +20,30 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// Env var carrying the kube-context a profile selected. Honored by
-/// [`crate::cluster::client`] (in this process and, via nextest env
-/// forwarding, in every test child) and by `Config::infer`'s fallback.
+/// [`crate::cluster::client`] and by `Config::infer`'s fallback.
 pub const KUBE_CONTEXT_ENV: &str = "ZTEST_KUBE_CONTEXT";
 const REGISTRY_ENV: &str = "ZTEST_IMAGE_REGISTRY";
 const PUSH_REGISTRY_ENV: &str = "ZTEST_IMAGE_PUSH_REGISTRY";
 const KIND_CLUSTER_ENV: &str = "KIND_CLUSTER";
-/// Env var carrying the profile's [`ImageBackend`] selection. The single signal
-/// both `ztest setup` (which OpenShift policy to provision) and `ztest run`
-/// (which [`ImageProvider`](crate::backends::image::ImageProvider) to build)
-/// read, so the two commands can never disagree about what a cluster is.
+/// Env var carrying the profile's [`ImageBackend`] selection. Read by both
+/// `ztest setup` and `ztest run` so the two can never disagree about what a
+/// cluster is.
 pub const IMAGE_BACKEND_ENV: &str = "ZTEST_IMAGE_BACKEND";
 
 /// The on-disk store: a set of named profiles plus the active default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// Name of the profile used when `ztest run` gets no `--cluster` flag.
+    /// Profile used when `ztest run` gets no `--cluster` flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<String>,
     #[serde(default)]
     pub clusters: BTreeMap<String, Profile>,
 }
 
-/// How a profile's images reach the cluster — the one signal that decides both
-/// which OpenShift policy `ztest setup` provisions and which
-/// [`ImageProvider`](crate::backends::image::ImageProvider) `ztest run` builds.
-/// Explicit rather than inferred from which of `push`/`pull`/`kind_cluster`
-/// happen to be set: an under-specified profile used to silently resolve to kind
-/// mode, and `setup` and `run` inferred OpenShift-ness from different places (a
-/// `Remote` target that is really OpenShift was invisible to `setup`).
+/// How a profile's images reach the cluster. Explicit rather than inferred
+/// from which of `push`/`pull`/`kind_cluster` happen to be set: inference let
+/// an under-specified profile silently resolve to kind, and let `setup` and
+/// `run` disagree about whether a target was really OpenShift.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageBackend {
@@ -63,8 +53,8 @@ pub enum ImageBackend {
     /// Build locally, push to a generic registry; pods pull the same address.
     Registry,
     /// On-cluster build in a ztest-owned rootless-BuildKit pod, pushing to the
-    /// OpenShift integrated registry (`push` = external route, `pull` = in-cluster
-    /// service), plus the SCC grant + registry-project policy `setup` installs.
+    /// OpenShift integrated registry (`push` = external route, `pull` =
+    /// in-cluster service), plus the SCC + registry policy `setup` installs.
     OpenShift,
 }
 
@@ -94,43 +84,41 @@ impl ImageBackend {
     }
 }
 
-/// One named cluster. [`backend`](Profile::backend) selects image distribution;
-/// `push`/`pull`/`kind_cluster` carry the addresses that backend needs.
+/// One named cluster. [`backend`](Profile::backend) selects image
+/// distribution; `push`/`pull`/`kind_cluster` carry the addresses it needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "RawProfile")]
 pub struct Profile {
-    /// Expected kube-context, targeted in-memory. `None` means "whatever the
-    /// current kube-context is" (the natural choice for a local kind cluster).
+    /// Expected kube-context, targeted in-memory. `None` means the current
+    /// kube-context (the natural choice for a local kind cluster).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    /// Kubeconfig file holding this context, when it isn't in the default
-    /// `~/.kube/config` (e.g. a standalone `~/.kube/config-crc-remote`). Sets
-    /// `KUBECONFIG` for the run so context lookup, the client, the registry push
-    /// (token + CA), and any `kubectl` the tests shell out to all read the same
-    /// file. `None` uses the ambient `KUBECONFIG` / `~/.kube/config`.
+    /// Kubeconfig file holding this context when it isn't in the default
+    /// `~/.kube/config`. Sets `KUBECONFIG` for the run so context lookup, the
+    /// client, the registry push, and any `kubectl` the tests shell out to
+    /// read the same file. `None` uses the ambient `KUBECONFIG`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kubeconfig: Option<String>,
-    /// Push registry base (e.g. `ghcr.io/zingolabs`, or an OpenShift route). For
-    /// a generic registry this is also the pull address.
+    /// Push registry base (e.g. `ghcr.io/zingolabs`, or an OpenShift route).
+    /// For a generic registry this is also the pull address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub push: Option<String>,
     /// Distinct in-cluster pull base — set only for the OpenShift integrated
     /// registry, where pods reference the service address, not the route.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull: Option<String>,
-    /// kind cluster name → kind image mode (node `<name>-control-plane`).
+    /// kind cluster name (node `<name>-control-plane`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind_cluster: Option<String>,
-    /// The image-distribution backend. See [`ImageBackend`].
     #[serde(default)]
     pub backend: ImageBackend,
 }
 
-/// Deserialization shape accepting both the current `backend` key and the legacy
-/// `openshift` bool (pre-[`ImageBackend`] configs). A profile with no `backend`
-/// migrates from its addresses: `openshift = true` → OpenShift, a bare `push`
-/// → Registry, otherwise Kind — so an existing `clusters.toml` keeps working
-/// without a rewrite, and never silently downgrades an OpenShift profile to kind.
+/// Deserialization shape accepting both the current `backend` key and the
+/// legacy `openshift` bool. A profile with no `backend` migrates from its
+/// addresses (`openshift = true` → OpenShift, bare `push` → Registry, else
+/// Kind), so an existing `clusters.toml` keeps working without a rewrite and
+/// never silently downgrades an OpenShift profile to kind.
 #[derive(Deserialize)]
 struct RawProfile {
     context: Option<String>,

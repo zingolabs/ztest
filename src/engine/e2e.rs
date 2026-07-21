@@ -1,18 +1,8 @@
-//! End-to-end engine stories.
-//!
-//! The per-module tests each fake out their neighbour: `schedule` injects a fake
-//! spawn, `exec` bypasses the loop, `reporter` hand-builds events. That proves
-//! each layer in isolation but never the **seams** between them. These tests wire
-//! the *real* layers together — [`build_work_list`](super::plan::build_work_list)
-//! → [`run_loop`](super::schedule::run_loop) driving the *real*
-//! [`spawn_test`](super::local_runner::spawn_test) over throwaway shell scripts → the
-//! *real* [`StyledReporter`](super::reporter::StyledReporter) and live
-//! [`PanelFrame`](super::schedule::PanelFrame) — and assert across plan +
-//! scheduler + exec + reporter + panel + events at once.
-//!
-//! Each test reads as one operator-facing user story. They stay hermetic and
-//! fast (no cluster, no kind, no apiserver): the "tests" are tiny `#!/bin/sh`
-//! scripts and the only real resources are short-lived child processes.
+//! End-to-end engine stories: wire the real plan → scheduler → `spawn_test` →
+//! reporter → panel layers together and assert across their seams at once (the
+//! per-module tests each fake out a neighbour, so nothing else covers the seams).
+//! Hermetic and fast — the "tests" are tiny `#!/bin/sh` scripts run as
+//! short-lived child processes, no cluster.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -29,11 +19,9 @@ use crate::qos::{QosClass, Resources};
 
 // ── Fixture scaffolding ────────────────────────────────────────────────────
 
-/// A throwaway directory of executable `#!/bin/sh` "test binaries". Each script
-/// ignores its argv (so the fixed `--exact … --nocapture` the engine appends
-/// don't matter). All scripts are written *before* the run starts, so no
-/// write-fd is open across a concurrent `fork`+`exec` — sidestepping the
-/// `ETXTBSY` race `exec.rs` serializes around. Removed on drop.
+/// A throwaway directory of executable `#!/bin/sh` "test binaries", removed on
+/// drop. Scripts are all written before the run starts, so no write-fd is open
+/// across a concurrent `fork`+`exec` (the `ETXTBSY` race).
 struct Fixture {
     dir: PathBuf,
 }
@@ -59,8 +47,7 @@ impl Fixture {
         path
     }
 
-    /// A path inside the fixture for cross-process scratch (e.g. an attempt
-    /// counter a script reads/writes across reruns).
+    /// A path inside the fixture for cross-process scratch (e.g. a rerun counter).
     fn scratch(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
@@ -72,9 +59,7 @@ impl Drop for Fixture {
     }
 }
 
-/// One selected binary = one script, exposing a single libtest test `test_name`.
-/// The QoS dump's `test_id` is crate-rooted (`<crate>::<name>`), so we prefix a
-/// dummy crate segment — exercising the real strip/join in `build_work_list`.
+/// One selected binary = one script exposing a single libtest test `test_name`.
 fn binary(binary_id: &str, script: &Path, test_name: &str) -> SelectedBinary {
     SelectedBinary {
         binary_path: script.to_path_buf(),
@@ -84,7 +69,8 @@ fn binary(binary_id: &str, script: &Path, test_name: &str) -> SelectedBinary {
     }
 }
 
-/// A per-binary QoS dump entry: `(binary_id, [crate::<name> → class])`.
+/// A per-binary QoS dump entry. `test_id` is crate-rooted (`<crate>::<name>`),
+/// so the dummy crate prefix exercises the real strip/join in `build_work_list`.
 fn qos(binary_id: &str, test_name: &str, class: QosClass) -> (String, Vec<QosEntry>) {
     (
         binary_id.to_string(),
@@ -101,6 +87,7 @@ fn env() -> EngineEnv {
         run_id: "e2e-run".into(),
         sa: "ztest-local".into(),
         no_cleanup: false,
+        capture: true,
     }
 }
 
@@ -113,13 +100,13 @@ fn cfg(fail_fast: bool, slow_after: Option<Duration>) -> LoopConfig {
         run_id: "e2e-run".into(),
         cancel: crate::cancel::Cancel::never(),
         resources: std::collections::HashMap::new(),
+        max_inflight: None,
     }
 }
 
-/// Live concurrency witness, bumped by the *real* spawn closure as each child
-/// starts and finishes. Records the peak number of concurrent children and
-/// flags any moment where the running footprint exceeded the ceiling — the
-/// no-overload guarantee, observed against real processes rather than a fake.
+/// Live concurrency witness, bumped by the real spawn closure as each child
+/// starts and finishes: records peak concurrency and flags any moment the
+/// running footprint exceeded the ceiling (the no-overload guarantee).
 #[derive(Debug, Default)]
 struct Concurrency {
     live: usize,
@@ -152,12 +139,9 @@ struct PanelWitness {
     saw_running: bool,
 }
 
-/// Drive a real run: `build_work_list` → `run_loop` over the real `spawn_test`,
-/// wrapped in the concurrency witness, with the real `StyledReporter` and a
-/// panel observer. Returns (stats, scrollback string, concurrency, panel).
-///
-/// `tweak` lets a story adjust the work-list after planning (e.g. shorten a hard
-/// cap) while still exercising the real planner.
+/// Drive a real run and return (stats, scrollback, concurrency, panel). `tweak`
+/// adjusts the work-list after planning (e.g. shorten a hard cap) while still
+/// exercising the real planner.
 async fn drive_real(
     binaries: &[SelectedBinary],
     qos_by_binary: &[(String, Vec<QosEntry>)],
@@ -182,7 +166,7 @@ async fn drive_real(
     let conc = Arc::new(Mutex::new(Concurrency::default()));
     let conc_spawn = conc.clone();
 
-    let mut reporter = StyledReporter::new(false, true);
+    let mut reporter = StyledReporter::new(false, true, crate::engine::output::OutputConfig::default());
     let panel = Arc::new(Mutex::new(PanelWitness::default()));
     let panel_tick = panel.clone();
 
@@ -203,9 +187,8 @@ async fn drive_real(
                 out
             }
         },
-        // The panel observer never drains the reporter (so the full scrollback
-        // survives for one post-run assertion); it only records what the pinned
-        // QoS panel would have shown each frame.
+        // Never drain the reporter here, so the full scrollback survives for one
+        // post-run assertion; only record what the panel would have shown.
         move |_rep, frame: &PanelFrame| {
             let mut w = panel_tick.lock().unwrap();
             w.frames += 1;
@@ -228,19 +211,15 @@ async fn drive_real(
 
 // ── Story 1 ─────────────────────────────────────────────────────────────────
 
-/// **A mixed suite packs the cluster, runs to completion, and the report tells
-/// the whole story.** Three Integration tests share a ceiling that fits two at
-/// a time; two pass, one fails loudly. The operator should see: every test
-/// reaches a verdict (nothing abandoned), the scheduler never ran more than two
-/// real processes at once, the failing test's output is replayed, and the
-/// summary tallies 2 passed / 1 failed. This is the spine of the engine —
-/// planner, scheduler, real process exec, reporter, and live panel — proven in
+/// A mixed suite packs the cluster and runs to completion: three Integration
+/// tests share a ceiling fitting two at a time; two pass, one fails. Asserts
+/// every test reaches a verdict, concurrency never exceeds two, the failure's
+/// output replays, and the summary tallies correctly — the engine's spine in
 /// one path.
 #[tokio::test]
 async fn mixed_suite_packs_runs_to_completion_and_reports_each_verdict() {
     let fx = Fixture::new("mixed");
-    // Short dwell so two children genuinely overlap (the panel + concurrency
-    // witness have something to observe) without slowing the suite.
+    // Short dwell so two children genuinely overlap without slowing the suite.
     let pass_a = fx.script("alpha", "sleep 0.06; echo alpha-ok; exit 0");
     let pass_b = fx.script("beta", "sleep 0.06; echo beta-ok; exit 0");
     let fail_c = fx.script("gamma", "echo kaboom-from-gamma 1>&2; exit 1");
@@ -256,7 +235,7 @@ async fn mixed_suite_packs_runs_to_completion_and_reports_each_verdict() {
         qos("pkg::gamma", "blows_up", QosClass::Integration),
     ];
     let i = QosClass::Integration.profile().footprint;
-    let ceiling = Resources::new(2 * i.cpu_milli, 2 * i.mem_bytes); // fits exactly 2
+    let ceiling = Resources::new(2 * i.cpu_milli, 2 * i.mem_bytes, 0, 0); // fits exactly 2
 
     let (stats, out, conc, panel) =
         drive_real(&binaries, &qos_dump, 0, ceiling, cfg(false, None), |w| w).await;
@@ -306,12 +285,10 @@ async fn mixed_suite_packs_runs_to_completion_and_reports_each_verdict() {
 
 // ── Story 2 ─────────────────────────────────────────────────────────────────
 
-/// **A flaky test recovers on retry, and the operator sees the retry in the
-/// log.** A real child fails its first process, then passes its second (it
-/// counts attempts through a file on disk, so the retry is a genuinely separate
-/// process). With `retries = 1` the engine should rerun it and finish green —
-/// and the scrollback should show the `TRY 2` retry line but *no* `FAIL` line
-/// (a retried attempt is superseded, not reported as a failure).
+/// A flaky test recovers on retry: a child fails its first process then passes
+/// its second (counting attempts through a file, so the retry is a genuinely
+/// separate process). With `retries = 1` the run finishes green and the
+/// scrollback shows `TRY 2` but no `FAIL` (a superseded attempt isn't a failure).
 #[tokio::test]
 async fn flaky_test_recovers_on_retry_and_retry_is_logged() {
     let fx = Fixture::new("flaky");
@@ -326,17 +303,15 @@ async fn flaky_test_recovers_on_retry_and_retry_is_logged() {
     let binaries = [binary("pkg::flaky", &flaky, "sometimes_fails")];
     let qos_dump = [qos("pkg::flaky", "sometimes_fails", QosClass::Integration)];
     let i = QosClass::Integration.profile().footprint;
-    let ceiling = Resources::new(i.cpu_milli, i.mem_bytes);
+    let ceiling = Resources::new(i.cpu_milli, i.mem_bytes, 0, 0);
 
     let (stats, out, _conc, _panel) =
         drive_real(&binaries, &qos_dump, 1, ceiling, cfg(false, None), |w| w).await;
 
     assert_eq!(stats.passed, 1, "the retry must pass; {out}");
     assert_eq!(stats.failed, 0, "a recovered flake is not a failure; {out}");
-    // Exactly two real processes ran (attempt 1 failed, attempt 2 passed).
     let attempts = std::fs::read_to_string(&counter).unwrap();
     assert_eq!(attempts.trim(), "2", "should have run exactly twice");
-    // The operator sees the retry but not a FAIL verdict for the superseded run.
     assert!(out.contains("TRY 2"), "retry line must show; {out}");
     assert!(out.contains("PASS"), "{out}");
     assert!(
@@ -347,12 +322,10 @@ async fn flaky_test_recovers_on_retry_and_retry_is_logged() {
 
 // ── Story 3 ─────────────────────────────────────────────────────────────────
 
-/// **An oversized test is reported as skipped — not silently dropped — and the
-/// rest of the suite still runs.** A Sync-tier test (16 CPU) can't fit a small
-/// ceiling even on an empty cluster, so it's unschedulable. The engine must skip
-/// it with a reason the operator can see, still run the Basic test alongside it,
-/// and record the skip in both the stats and the summary. Silent loss of a
-/// selected test is the failure mode this guards against.
+/// An oversized (Sync-tier) test that can't fit a small ceiling even on an empty
+/// cluster is skipped with a visible reason and recorded in stats + summary,
+/// while the Basic test alongside it still runs. Guards against silently
+/// dropping a selected test.
 #[tokio::test]
 async fn oversized_test_is_skipped_with_reason_while_the_rest_runs() {
     let fx = Fixture::new("skip");
@@ -369,7 +342,7 @@ async fn oversized_test_is_skipped_with_reason_while_the_rest_runs() {
     ];
     // Ceiling fits Basic but is far below a Sync footprint → Sync is rejected.
     let b = QosClass::Basic.profile().footprint;
-    let ceiling = Resources::new(b.cpu_milli * 2, b.mem_bytes * 2);
+    let ceiling = Resources::new(b.cpu_milli * 2, b.mem_bytes * 2, 0, 0);
 
     let (stats, out, _conc, _panel) =
         drive_real(&binaries, &qos_dump, 0, ceiling, cfg(false, None), |w| w).await;
@@ -403,13 +376,10 @@ async fn oversized_test_is_skipped_with_reason_while_the_rest_runs() {
 
 // ── Story 4 ─────────────────────────────────────────────────────────────────
 
-/// **A hung test goes SLOW, is killed at its hard cap as TIMEOUT, and frees its
-/// slot for the queued test.** With a one-slot ceiling, a sleeper occupies the
-/// cluster; it crosses the soft slow threshold (logged `SLOW`), then is killed
-/// at its hard cap (`TIMEOUT`). Releasing its lease must backfill the queued
-/// second test, which runs and passes. This is the only path that exercises the
-/// soft-slow signal, the hard-cap kill through the loop, and capacity-driven
-/// backfill after a non-clean exit — all against real processes.
+/// A hung test goes SLOW, is killed at its hard cap as TIMEOUT, and frees its
+/// one-slot ceiling to backfill the queued test, which runs and passes. The only
+/// path exercising the soft-slow signal, the hard-cap kill through the loop, and
+/// capacity-driven backfill after a non-clean exit.
 #[tokio::test]
 async fn hung_test_goes_slow_then_times_out_and_frees_the_slot() {
     let fx = Fixture::new("timeout");
@@ -425,10 +395,10 @@ async fn hung_test_goes_slow_then_times_out_and_frees_the_slot() {
         qos("pkg::ok", "waits_its_turn", QosClass::Integration),
     ];
     let i = QosClass::Integration.profile().footprint;
-    let ceiling = Resources::new(i.cpu_milli, i.mem_bytes); // one slot → ok queues
+    let ceiling = Resources::new(i.cpu_milli, i.mem_bytes, 0, 0); // one slot → ok queues
 
-    // Shorten the hung test's hard cap so the story runs in a fraction of a
-    // second; the slow threshold sits below it so SLOW fires first.
+    // Shorten the hung test's hard cap so the story runs fast; the slow threshold
+    // sits below it so SLOW fires first.
     let tweak = |items: Vec<WorkItem>| {
         items
             .into_iter()

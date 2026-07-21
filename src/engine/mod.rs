@@ -1,18 +1,13 @@
-//! The native test-execution engine: ztest's 2D QoS [`Scheduler`] owns test
-//! execution, spawning each test as its own process and packing them into live
-//! cluster capacity. Replaces the old `cargo nextest run` subprocess.
-//!
-//! [`plan`] is the work-list (test x footprint x tier). [`dylib`] is the
-//! `LD_LIBRARY_PATH` the children inherit. [`local_runner`] spawns one test process.
-//! [`schedule`] is the capacity-bounded run loop. [`events`] holds the lifecycle
-//! events and the [`RunReporter`](events::RunReporter) trait. [`panel`] builds
-//! the live QoS panel inputs.
+//! The native test-execution engine: ztest's 2D QoS [`Scheduler`] spawns each
+//! test as its own process and packs them into live cluster capacity, replacing
+//! the old `cargo nextest run` subprocess.
 //!
 //! [`Scheduler`]: crate::qos::scheduler::Scheduler
 
 pub mod dylib;
 pub mod events;
 pub mod local_runner;
+pub mod output;
 pub mod panel;
 pub mod plan;
 pub mod pod_runner;
@@ -55,6 +50,9 @@ pub struct EngineOpts {
     pub no_cleanup: bool,
     /// Shared `NEXTEST_RUN_ID`.
     pub run_id: String,
+    /// Captured-output display policy (`--success-output`/`--failure-output`)
+    /// and capture strategy (`--no-capture`). See [`output`](crate::engine::output).
+    pub output: crate::engine::output::OutputConfig,
 }
 
 /// Everything the engine needs, already extracted from preflight outcomes by
@@ -88,14 +86,10 @@ pub struct EngineInput<'a> {
     pub opts: EngineOpts,
 }
 
-/// Run the engine to completion and map the result to a process exit code
-/// (mirroring `NextestExitCode`).
-///
-/// With a [`Console`] (TTY), the run produces scenes plus scrollback through the
-/// session's render thread: nextest-style verdict lines scroll into native
-/// scrollback while the QoS panel ([`render_live_panel`]) stays pinned beneath.
-/// Without one (CI / piped), it renders plain lines to stdout. Either way it runs
-/// on the caller's `work_rt`; the render thread is entirely separate.
+/// Run the engine to completion and map the result to a `NextestExitCode`. With
+/// a [`Console`] (TTY) it ships scenes through the render thread — verdict lines
+/// scroll into native scrollback, the QoS panel stays pinned beneath; without one
+/// (CI / piped) it renders plain lines to stdout. Either way it runs on `work_rt`.
 pub(crate) fn run(
     work_rt: &tokio::runtime::Runtime,
     input: EngineInput<'_>,
@@ -115,6 +109,7 @@ pub(crate) fn run(
         run_id: input.opts.run_id.clone(),
         sa: input.opts.sa.clone(),
         no_cleanup: input.opts.no_cleanup,
+        capture: input.opts.output.captures(),
     };
     let executor = match select_executor(work_rt, &input, env) {
         Ok(e) => e,
@@ -133,12 +128,34 @@ pub(crate) fn run(
         // render thread, so the process dies on the default SIGINT disposition.
         cancel: console.map(Console::cancel).unwrap_or_else(Cancel::never),
         resources: input.resource_states,
+        // `--no-capture` serializes the run (nextest's `test_threads = 1`
+        // coupling) so streamed output doesn't interleave.
+        max_inflight: input.opts.output.is_serial().then_some(1),
     };
     let ceiling = input.ceiling;
+    let output = input.opts.output;
 
+    // A capturing TTY run hands the terminal to the render thread, so diagnostics
+    // go to a per-run file (surfaced for `tail -f`) rather than tearing the panel;
+    // otherwise they write to stderr like nextest.
+    let log_path = std::path::Path::new(input.summary.rust_build_meta.target_directory.as_str())
+        .join("ztest")
+        .join(format!("{}.log", input.opts.run_id));
+    match console {
+        Some(_) if output.captures() => {
+            crate::observ::init(crate::observ::Sink::File(log_path.clone()));
+            eprintln!("ztest: diagnostics → {} (filter via ZTEST_LOG)", log_path.display());
+        }
+        _ => crate::observ::init(crate::observ::Sink::Stderr),
+    }
+
+    // `--no-capture` streams output live and serially; the pinned TTY panel can't
+    // coexist, so even on a terminal it takes the plain inherited path.
     let stats = match console {
-        Some(c) => run_tty(work_rt, items, ceiling, cfg, executor, c, theme, qos_plan),
-        None => run_inherited(work_rt, items, ceiling, cfg, executor),
+        Some(c) if output.captures() => {
+            run_tty(work_rt, items, ceiling, cfg, executor, c, theme, qos_plan, output)
+        }
+        _ => run_inherited(work_rt, items, ceiling, cfg, executor, output),
     };
 
     let stats = match stats {
@@ -149,10 +166,8 @@ pub(crate) fn run(
         }
     };
 
-    // A cancelled run (Ctrl-C) is never a success: in-flight tests were killed
-    // and counted as failed, and tests past the cancellation point never ran, so
-    // the run is incomplete. Mirror nextest's non-zero cancel exit even in the
-    // (near-impossible) case where nothing had failed yet when cancel landed.
+    // A cancelled run is never a success: it's incomplete even in the
+    // near-impossible case where nothing had failed yet when cancel landed.
     let cancelled = console.map(|c| c.cancel().is_cancelled()).unwrap_or(false);
 
     if stats.any_failed() || cancelled {
@@ -165,11 +180,9 @@ pub(crate) fn run(
     }
 }
 
-/// The TTY path: produce scenes plus scrollback through the session's render
-/// thread. Verdict lines go to native scrollback; each tick ships a fresh scene
-/// whose live region is the nextest-style progress line plus running-tests list
-/// and whose panel is the QoS [`render_live_panel`]. The render thread owns all
-/// painting.
+/// The TTY path: verdict lines go to native scrollback while each tick ships a
+/// fresh scene (running-tests live region + QoS [`render_live_panel`]) to the
+/// render thread, which owns all painting.
 #[allow(clippy::too_many_arguments)]
 fn run_tty(
     rt: &tokio::runtime::Runtime,
@@ -180,20 +193,19 @@ fn run_tty(
     console: &Console,
     theme: &Theme,
     qos_plan: Option<QosPlan>,
+    output: crate::engine::output::OutputConfig,
 ) -> std::io::Result<events::RunStats> {
     let color = supports_color::on(supports_color::Stream::Stdout).is_some();
     let mut reporter = StyledReporter::new(
         color,
         supports_unicode::on(supports_unicode::Stream::Stdout),
+        output,
     );
     let plan = qos_plan.unwrap_or_else(empty_plan);
-    // The live region's height (the same rows the compile phase used for cargo);
-    // the run fills them with the running-tests block.
     let live_rows = console.live_rows() as usize;
 
-    // Commit the preflight/image phase's final emulated grid into native
-    // scrollback before we switch the live region from the child PTY to our own
-    // engine-rendered lines.
+    // Commit the preflight/image phase's final grid into scrollback before we
+    // switch the live region from the child PTY to our engine-rendered lines.
     console.flush_live();
 
     let stats = drive(
@@ -208,22 +220,15 @@ fn run_tty(
             if !bytes.is_empty() {
                 console.scrollback(String::from_utf8_lossy(&bytes).into_owned());
             }
-            // The reporter's per-test verdict lines scroll into native scrollback
-            // (above), following nextest conventions just like the build/image
-            // subprocess output. The pinned panel is the QoS/progress summary,
-            // snapshotted into an immutable scene the render thread re-paints (and
-            // animates the spinner) until the next tick.
+            // The panel is snapshotted into an immutable scene the render thread
+            // re-paints (and animates the spinner) until the next tick.
             let left =
                 render_live_panel(&frame.snapshot, &plan, &frame.free, &frame.progress, theme);
-            // The live region above the panel shows the running-tests block (the
-            // nextest-style live status), filling the same rows the compile phase used
-            // for cargo's output. The `avt` grid is idle during the run, so we drive
-            // the live region explicitly via the scene.
+            // The `avt` grid is idle during the run, so drive the live region
+            // explicitly via the scene.
             let live = reporter::render_running(&frame.running, live_rows, color).join("\n");
-            // By the run phase every background transfer has completed (provisioning
-            // is a pre-run barrier), so the right column is blank. The width-driven
-            // two-column split still holds, so the left column keeps the same width it
-            // had during preflight — the panel doesn't reflow at the handoff.
+            // Provisioning is a pre-run barrier, so the right column is blank; the
+            // width-driven split still holds, so the panel doesn't reflow here.
             console.scene(move |_elapsed| SceneFrame {
                 left: left.clone(),
                 right: String::new(),
@@ -232,8 +237,8 @@ fn run_tty(
         },
     );
 
-    // Commit any leftover scroll-lines (including the final summary, emitted
-    // after the last tick). The render thread's teardown restores the terminal.
+    // Commit any leftover scroll-lines (including the final summary, emitted after
+    // the last tick).
     let leftover = reporter.take_scrollback();
     if !leftover.is_empty() {
         console.scrollback(String::from_utf8_lossy(&leftover).into_owned());
@@ -248,10 +253,12 @@ fn run_inherited(
     ceiling: Resources,
     cfg: LoopConfig,
     executor: std::sync::Arc<dyn local_runner::Executor>,
+    output: crate::engine::output::OutputConfig,
 ) -> std::io::Result<events::RunStats> {
     let mut reporter = StyledReporter::new(
         false,
         supports_unicode::on(supports_unicode::Stream::Stdout),
+        output,
     );
     let stats = drive(
         items,
@@ -287,25 +294,19 @@ fn drive(
     ))
 }
 
-/// Choose how tests execute. Default is the local child-process
-/// [`LocalExecutor`](local_runner::LocalExecutor). Setting `ZTEST_RUNNER_IMAGE` selects
-/// the pod-per-test [`PodExecutor`](pod_runner::PodExecutor): each test runs in a
-/// runner pod built from that image (the nix `ztest-runner`), with the workspace
-/// delivered via a hostPath mount (kind), so compute leaves the laptop and the
-/// test is hermetic. Env knobs (kind demo; a cluster profile will drive these
-/// later):
-///   ZTEST_RUNNER_IMAGE      runner image ref; presence enables pod execution
-///   ZTEST_RUNNER_NAMESPACE  namespace for runner pods (default "default")
-///   ZTEST_RUNNER_HOSTPATH   node path holding the workspace (default: the
-///                           workspace path itself, i.e. an identical mount)
-///   ZTEST_RUNNER_SA         ServiceAccount for the runner pod (default: none)
+/// Choose how tests execute: the local child-process
+/// [`LocalExecutor`](local_runner::LocalExecutor) by default, or the pod-per-test
+/// [`PodExecutor`](pod_runner::PodExecutor) when a runner image is present (from
+/// preflight, or the `ZTEST_RUNNER_IMAGE` override). The `ZTEST_RUNNER_*` env
+/// knobs (namespace, hostpath, SA, delivery) are a kind demo shim until a cluster
+/// profile drives them.
 fn select_executor(
     work_rt: &tokio::runtime::Runtime,
     input: &EngineInput<'_>,
     env: EngineEnv,
 ) -> Result<std::sync::Arc<dyn local_runner::Executor>, String> {
-    // The preflight-built runner image (remote runs) takes precedence; the env var
-    // is a manual override (e.g. local kind hostPath testing). Neither → local.
+    // Preflight image (remote runs) takes precedence; the env var is a manual
+    // override. Neither → local.
     let from_preflight = input.runner_image.clone();
     let image = match from_preflight.clone().or_else(|| {
         std::env::var("ZTEST_RUNNER_IMAGE")
@@ -316,11 +317,9 @@ fn select_executor(
         None => return Ok(std::sync::Arc::new(local_runner::LocalExecutor { env })),
     };
 
-    // `ztest setup` provisions the `ztest` namespace + `ztest` SA (bound to the
-    // `ztest-remote` ClusterRole: namespaces/pods/pvcs/… create, + the nonroot-v2
-    // SCC on OpenShift) on every target. Running the runner pod as that identity
-    // means a component-spawning test in-pod can create its per-test namespace and
-    // pods with no extra RBAC. Overridable, but this is the right default.
+    // `ztest setup` provisions the `ztest` namespace + SA with the RBAC a
+    // component-spawning in-pod test needs, so running the runner pod as that
+    // identity requires no extra grants. The right default; overridable.
     let namespace = std::env::var("ZTEST_RUNNER_NAMESPACE").unwrap_or_else(|_| "ztest".into());
     let service_account = Some(
         std::env::var("ZTEST_RUNNER_SA")
@@ -333,9 +332,8 @@ fn select_executor(
         .block_on(crate::cluster::client())
         .map_err(|e| format!("pod executor: connect to cluster: {e}"))?;
 
-    // A preflight-built image is baked (outputs inside it). Otherwise honor the
-    // manual delivery knob: `baked`, or `hostpath` (local kind) mounting the
-    // workspace from the node at its laptop path.
+    // A preflight image is baked (outputs inside it); otherwise honor the manual
+    // delivery knob (`baked`, or `hostpath` mounting the workspace from the node).
     let baked = from_preflight.is_some()
         || std::env::var("ZTEST_RUNNER_DELIVERY").as_deref() == Ok("baked");
     let image_refs = input.image_refs.clone();
