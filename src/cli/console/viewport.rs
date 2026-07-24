@@ -27,6 +27,30 @@ const RIGHT_COL_MIN: u16 = 30;
 /// stays exactly one physical row. At or above [`TWO_COL_MIN`] (with a non-empty
 /// right column) the width splits per [`two_col_split`]; below that, a single
 /// full-width left column. Overlong lines are clipped, never wrapped.
+/// The footer's physical rows: the live region (running-tests block) stacked
+/// above the two-column panel, with **every** line clipped to `cols` display
+/// columns so each occupies exactly one physical row.
+///
+/// This is the invariant [`super::footer::render`] relies on for its `prev_rows`
+/// cursor arithmetic. `compose_panel` already clips the panel; the live lines
+/// (e.g. a long `binary::test` running line from `engine::reporter::render_running`)
+/// arrive un-clipped, so a name wider than the terminal would otherwise wrap into
+/// a second physical row, desync `prev_rows`, and leak stale rows into scrollback.
+/// Clipping here — the one place that knows `cols` and owns the footer — protects
+/// every scene producer.
+fn compose_footer(live: &[String], left: &str, right: &str, cols: u16) -> Vec<String> {
+    let mut lines: Vec<String> = live
+        .iter()
+        .flat_map(|l| {
+            bridge::ansi_rows(l, cols as usize)
+                .into_iter()
+                .map(|(s, _)| s)
+        })
+        .collect();
+    lines.extend(compose_panel(left, right, cols));
+    lines
+}
+
 fn compose_panel(left: &str, right: &str, cols: u16) -> Vec<String> {
     let right = right.trim_end_matches('\n');
     if cols < TWO_COL_MIN || right.is_empty() {
@@ -161,8 +185,7 @@ impl Surface {
     /// the footer (the `live` rows above the two-column panel) in place. The whole
     /// frame is one synchronized-update write.
     pub fn present(&mut self, committed: &[String], live: &[String], left: &str, right: &str) {
-        let mut footer_lines: Vec<String> = live.to_vec();
-        footer_lines.extend(compose_panel(left, right, self.cols));
+        let mut footer_lines = compose_footer(live, left, right, self.cols);
         // The cursor can't be walked up into scrollback, so a footer taller than
         // the screen drops its oldest live rows.
         let max = self.rows as usize;
@@ -284,5 +307,36 @@ testnet-3.1m · 63%";
         assert_eq!(out.len(), 5, "one row per logical line");
         let w = bridge::ansi_rows(&out[1], usize::MAX)[0].1;
         assert!(w <= 120, "clipped row width {w} <= 120");
+    }
+
+    #[test]
+    fn overlong_live_line_stays_one_physical_row() {
+        // A running-test line wider than the terminal must be clipped, not wrapped:
+        // a second physical row would desync `footer::render`'s `prev_rows` cursor
+        // math and leak stale live rows into scrollback.
+        let live = vec![
+            "PASS [  24.882s] clientless::chain_cache chain_query_interface::\
+             ephemeral_serves_finalised_blocks_zebrad"
+                .to_string(),
+            "     [ 00:00:41] clientless::chain_cache chain_query_interface::\
+             get_mempool_stream_fresh_snapshot_repeated_zebrad"
+                .to_string(),
+        ];
+        for cols in [80u16, 100, 120] {
+            let out = compose_footer(&live, PREFLIGHT, TRANSFERS, cols);
+            // Every row — the two live lines plus the panel — must fit in one
+            // physical row.
+            for row in &out {
+                let w = bridge::ansi_rows(row, usize::MAX)[0].1;
+                assert!(w <= cols as usize, "row {w} > {cols}: {row:?}");
+            }
+            // The two live lines contribute exactly two rows (clipped, not wrapped).
+            let panel_rows = compose_panel(PREFLIGHT, TRANSFERS, cols).len();
+            assert_eq!(
+                out.len(),
+                2 + panel_rows,
+                "live lines wrapped into extra rows at cols={cols}"
+            );
+        }
     }
 }

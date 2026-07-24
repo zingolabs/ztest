@@ -481,7 +481,9 @@ mod tests {
             assert!(!has_nvme_tol, "no NVMe toleration for general/none: {s}");
         };
         // None (default).
-        no_nvme(&pod_spec_json(&base_spec().render(&coords(), "t", &[]).unwrap()));
+        no_nvme(&pod_spec_json(
+            &base_spec().render(&coords(), "t", &[]).unwrap(),
+        ));
         // Explicit General is also a no-op (schedules anywhere).
         let spec = PodSpec {
             placement: Some(crate::qos::Pool::General),

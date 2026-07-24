@@ -8,7 +8,6 @@ use std::convert::TryFrom;
 
 use k8s_openapi::api::core::v1::{Namespace, Node, PersistentVolumeClaim, Pod};
 use kube::api::ListParams;
-use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::{Api, Client};
 
 use crate::qos::{ClusterCapacity, NVME_NODE_LABEL_KEY, NVME_NODE_LABEL_VALUE, Resources, units};
@@ -101,19 +100,12 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
     let pvcs_api: Api<PersistentVolumeClaim> = Api::all(client.clone());
 
     let lp = ListParams::default();
-    // Usage is a plain `join!`, outside the core `try_join!`: a missing metrics
-    // API must not fail the probe, just drop the usage term (request-only
-    // accounting — safe, less tight).
-    let core = async {
-        tokio::try_join!(
-            nodes_api.list(&lp),
-            ns_api.list(&lp),
-            pods_api.list(&lp),
-            pvcs_api.list(&lp)
-        )
-    };
-    let (core, usage) = tokio::join!(core, observed_usage(&client));
-    let (nodes, namespaces, pods, pvcs) = match core {
+    let (nodes, namespaces, pods, pvcs) = match tokio::try_join!(
+        nodes_api.list(&lp),
+        ns_api.list(&lp),
+        pods_api.list(&lp),
+        pvcs_api.list(&lp)
+    ) {
         Ok(quad) => quad,
         Err(err) => {
             let detail = format!("{err}");
@@ -125,10 +117,7 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
     };
 
     let (nodes_ready, nodes_cordoned) = count_nodes(&nodes.items);
-    let capacity = ClusterCapacity {
-        allocatable: cluster_allocatable(&nodes.items),
-        reserved: cluster_reserved(&pods.items, &pvcs.items, &usage),
-    };
+    let capacity = capacity_from(&nodes.items, &pods.items, &pvcs.items);
     let nvme_nodes = count_nvme_nodes(&nodes.items);
     let slots_used = count_zaino_slots(&namespaces.items);
 
@@ -213,10 +202,12 @@ fn node_allocatable(node: &Node) -> Resources {
     Resources::cpu_mem_unbounded_io(cpu, mem)
 }
 
-/// Total allocatable across schedulable nodes (Ready and not cordoned).
-fn cluster_allocatable(nodes: &[Node]) -> Resources {
+/// Total allocatable across schedulable nodes (Ready and not cordoned). Generic
+/// over the item source so the one-shot probe (`&[Node]`) and the reflector-backed
+/// watcher (`Vec<Arc<Node>>`) share one fold without cloning.
+fn cluster_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Resources {
     nodes
-        .iter()
+        .into_iter()
         .filter(|n| node_ready(n) && !node_cordoned(n))
         .fold(Resources::ZERO, |acc, n| {
             acc.saturating_add(&node_allocatable(n))
@@ -235,25 +226,37 @@ fn pod_consumes(pod: &Pod) -> bool {
     scheduled && !matches!(phase, Some("Succeeded") | Some("Failed"))
 }
 
-/// Sum over scheduled, live pods of `max(effective_request, observed_usage)` per
-/// CPU/memory dimension, plus each pod's PVC I/O — what's subtracted from
-/// allocatable to yield schedulable headroom.
+/// The fold shared by the one-shot probe and [`super::capacity_watch`], so both
+/// derive the banner figure identically.
+pub(crate) fn capacity_from<'a>(
+    nodes: impl IntoIterator<Item = &'a Node>,
+    pods: impl IntoIterator<Item = &'a Pod>,
+    pvcs: impl IntoIterator<Item = &'a PersistentVolumeClaim>,
+) -> ClusterCapacity {
+    ClusterCapacity {
+        allocatable: cluster_allocatable(nodes),
+        reserved: cluster_reserved(pods, pvcs),
+    }
+}
+
+/// Sum over scheduled, live pods of their effective CPU/memory request, plus each
+/// pod's PVC I/O — what's subtracted from allocatable to yield schedulable
+/// headroom.
 ///
-/// The max, not the limit: reserving the limit would sterilize the node for a
-/// pod that merely *could* burst. The request floor keeps ztest from admitting
-/// past what the scheduler will place; observed usage catches a Burstable
-/// co-tenant consuming above its request. Disk I/O is summed separately from the
-/// PVCs each pod mounts, since it's declared on the storage request.
-fn cluster_reserved(
-    pods: &[Pod],
-    pvcs: &[PersistentVolumeClaim],
-    usage: &HashMap<(String, String), Resources>,
+/// The request, not the limit: reserving the limit would sterilize the node for a
+/// pod that merely *could* burst, and the request is exactly what the kube
+/// scheduler packs against, so this mirrors what will actually place. Disk I/O is
+/// summed separately from the PVCs each pod mounts, since it's declared on the
+/// storage request.
+fn cluster_reserved<'a>(
+    pods: impl IntoIterator<Item = &'a Pod>,
+    pvcs: impl IntoIterator<Item = &'a PersistentVolumeClaim>,
 ) -> Resources {
     let by_name: HashMap<&str, &PersistentVolumeClaim> = pvcs
-        .iter()
+        .into_iter()
         .filter_map(|p| Some((p.metadata.name.as_deref()?, p)))
         .collect();
-    pods.iter()
+    pods.into_iter()
         .filter(|p| pod_consumes(p))
         .fold(Resources::ZERO, |acc, pod| {
             let request = pod
@@ -261,57 +264,9 @@ fn cluster_reserved(
                 .as_ref()
                 .map(units::pod_effective_request)
                 .unwrap_or(Resources::ZERO);
-            let observed = pod_usage(pod, usage);
-            let cpu_mem = request.max(&observed);
-            acc.saturating_add(&cpu_mem)
+            acc.saturating_add(&request)
                 .saturating_add(&pod_io_reservation(pod, &by_name))
         })
-}
-
-/// A pod's observed CPU/memory usage from the metrics map, `ZERO` when the pod
-/// isn't reported (metrics unavailable, or a just-started pod not yet scraped).
-fn pod_usage(pod: &Pod, usage: &HashMap<(String, String), Resources>) -> Resources {
-    let ns = pod.metadata.namespace.clone().unwrap_or_default();
-    let Some(name) = pod.metadata.name.clone() else {
-        return Resources::ZERO;
-    };
-    usage.get(&(ns, name)).copied().unwrap_or(Resources::ZERO)
-}
-
-/// Observed per-pod CPU/memory usage from `metrics.k8s.io/v1beta1`, keyed
-/// `(namespace, name)`. Best-effort: any error yields an empty map and
-/// [`cluster_reserved`] falls back to request-only accounting. I/O is always zero
-/// here; metrics reports only CPU and memory.
-async fn observed_usage(client: &Client) -> HashMap<(String, String), Resources> {
-    let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics");
-    let ar = ApiResource::from_gvk(&gvk);
-    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
-    let Ok(list) = api.list(&ListParams::default()).await else {
-        return HashMap::new();
-    };
-    let mut map = HashMap::new();
-    for item in list {
-        let Some(name) = item.metadata.name.clone() else {
-            continue;
-        };
-        let ns = item.metadata.namespace.clone().unwrap_or_default();
-        let usage = item
-            .data
-            .get("containers")
-            .and_then(|c| c.as_array())
-            .map(|cs| {
-                cs.iter().fold(Resources::ZERO, |acc, c| {
-                    let u = c.get("usage");
-                    let field = |k: &str| u.and_then(|u| u.get(k)).and_then(|v| v.as_str());
-                    let cpu = field("cpu").map(units::parse_cpu_milli).unwrap_or(0);
-                    let mem = field("memory").map(units::parse_mem_bytes).unwrap_or(0);
-                    acc.saturating_add(&Resources::new(cpu, mem, 0, 0))
-                })
-            })
-            .unwrap_or(Resources::ZERO);
-        map.insert((ns, name), usage);
-    }
-    map
 }
 
 /// Sum of the I/O reservations of the PVCs a pod mounts. Storage is RWO, so a
@@ -354,28 +309,6 @@ mod tests {
 
     // Quantity parsing lives in `qos::units`; here we test the node/pod
     // aggregation over hand-built objects, no cluster needed.
-
-    /// The empty metrics map — the metrics-unavailable path, where the probe
-    /// falls back to request-only accounting.
-    fn no_usage() -> HashMap<(String, String), Resources> {
-        HashMap::new()
-    }
-
-    /// A metrics map with one pod's observed CPU/memory usage, keyed the way the
-    /// probe keys it: `(namespace, name)`. `pod()`-built pods default to the
-    /// empty namespace.
-    fn usage_of(name: &str, cpu_milli: u64, mem_bytes: u64) -> HashMap<(String, String), Resources> {
-        HashMap::from([(
-            (String::new(), name.to_string()),
-            Resources::new(cpu_milli, mem_bytes, 0, 0),
-        )])
-    }
-
-    /// Stamp a name on a pod so the metrics map (keyed by name) can match it.
-    fn named(mut p: Pod, name: &str) -> Pod {
-        p.metadata.name = Some(name.to_string());
-        p
-    }
 
     fn node(ready: bool, cordoned: bool, cpu: &str, mem: &str) -> Node {
         Node {
@@ -527,7 +460,7 @@ mod tests {
             pod(Some("n1"), "Succeeded", "1", "1Gi"),    // finished → excluded
             pod(Some("n1"), "Failed", "1", "1Gi"),       // finished → excluded
         ];
-        let r = cluster_reserved(&pods, &[], &no_usage());
+        let r = cluster_reserved(&pods, &[]);
         // Request-only pods reserve their request, so the counted ones sum
         // exactly: 500m + 500m, 512Mi + 512Mi.
         assert_eq!(r.cpu_milli, 1000);
@@ -535,29 +468,12 @@ mod tests {
     }
 
     #[test]
-    fn reserved_counts_an_idle_burstable_pod_at_its_request_not_its_limit() {
-        // A Burstable co-tenant idling below its request is charged its request
-        // (the scheduler floor), not its larger limit.
-        let pods = vec![named(burstable_pod("n1", BUILDKIT_REQ, BUILDKIT_LIM), "buildkit")];
-        let r = cluster_reserved(&pods, &[], &no_usage());
+    fn reserved_counts_a_burstable_pod_at_its_request_not_its_limit() {
+        // A Burstable co-tenant is charged its request (what the scheduler packs
+        // against), not its larger limit.
+        let pods = vec![burstable_pod("n1", BUILDKIT_REQ, BUILDKIT_LIM)];
+        let r = cluster_reserved(&pods, &[]);
         assert_eq!(r.cpu_milli, BUILDKIT_REQ.cpu_milli);
-        assert_eq!(r.mem_bytes, BUILDKIT_REQ.mem_bytes);
-    }
-
-    #[test]
-    fn reserved_raises_a_burstable_pod_to_its_observed_usage() {
-        // When the co-tenant consumes above its request, observed usage — not the
-        // limit — sets the reservation: max(request, usage), per dimension.
-        let pods = vec![named(burstable_pod("n1", BUILDKIT_REQ, BUILDKIT_LIM), "buildkit")];
-        let usage = usage_of("buildkit", 12_000, 10 * GIB);
-        let r = cluster_reserved(&pods, &[], &usage);
-        assert_eq!(r.cpu_milli, 12_000, "usage exceeds request → usage wins");
-        assert_eq!(r.mem_bytes, 10 * GIB);
-        // Never above the limit in normal operation, and never below the request:
-        // a pod using *below* its request is still charged its request.
-        let low = usage_of("buildkit", 1_000, GIB);
-        let r = cluster_reserved(&pods, &[], &low);
-        assert_eq!(r.cpu_milli, BUILDKIT_REQ.cpu_milli, "usage < request → request floor");
         assert_eq!(r.mem_bytes, BUILDKIT_REQ.mem_bytes);
     }
 
@@ -567,31 +483,42 @@ mod tests {
         // the pod spec: the probe joins pod → PVC and sums the PVC's cap.
         let pods = vec![pod_mounting("n1", "Running", "1", "1Gi", "chain-data")];
         let pvcs = vec![pvc_with_io("chain-data", "100Mi", "5000")];
-        let r = cluster_reserved(&pods, &pvcs, &no_usage());
+        let r = cluster_reserved(&pods, &pvcs);
         assert_eq!(r.cpu_milli, 1000, "cpu from the pod");
         assert_eq!(r.mem_bytes, crate::qos::GIB, "mem from the pod");
         assert_eq!(r.io_bps, 100 * crate::qos::MIB, "io from the PVC");
         assert_eq!(r.io_iops, 5000, "io from the PVC");
         // An uncapped volume (no annotation) contributes no I/O reservation.
         let bare = vec![pvc_with_io_opt("chain-data", None, None)];
-        assert_eq!(cluster_reserved(&pods, &bare, &no_usage()).io_bps, 0);
+        assert_eq!(cluster_reserved(&pods, &bare).io_bps, 0);
+    }
+
+    #[test]
+    fn capacity_from_subtracts_a_scheduled_build_pod() {
+        // Regression: a scheduled 16c/24Gi build pod must lower free capacity by
+        // its request. The one-shot probe missed this only because it ran before
+        // the pod was created — the fold itself always counts it.
+        let nodes = vec![node(true, false, "72", "48Gi")];
+        let build = crate::qos::build::BUILDKIT_BUILD;
+        let pods = vec![burstable_pod("n1", build, build)];
+        let cap = capacity_from(&nodes, &pods, &[]);
+        let expected = cap.allocatable.saturating_sub(&build);
+        assert_eq!(cap.free().cpu_milli, expected.cpu_milli);
+        assert_eq!(cap.free().mem_bytes, expected.mem_bytes);
     }
 
     #[test]
     fn cluster_capacity_free_is_allocatable_minus_reserved() {
         let nodes = vec![node(true, false, "8", "16Gi")];
         let pods = vec![pod(Some("n1"), "Running", "2", "4Gi")];
-        let cap = ClusterCapacity {
-            allocatable: cluster_allocatable(&nodes),
-            reserved: cluster_reserved(&pods, &[], &no_usage()),
-        };
+        let cap = capacity_from(&nodes, &pods, &[]);
         assert_eq!(cap.free().cpu_milli, 6000);
         assert_eq!(cap.free().mem_bytes, 12 * crate::qos::GIB);
     }
 
-    // Idle build-pod headroom: a build pod reserved at its burst *limit* would
-    // sterilize the node, so it's reserved at `max(request, usage)` instead. A
-    // real burst is bounded by k8s QoS eviction, not by pre-reserving the ceiling.
+    // A build pod reserved at its burst *limit* would sterilize the node, so it's
+    // reserved at its request — what the scheduler packs against. A real burst is
+    // bounded by k8s QoS eviction, not by pre-reserving the ceiling.
 
     use crate::qos::GIB;
     use crate::qos::Resources;
@@ -636,11 +563,8 @@ mod tests {
     /// wave after the build finished.
     fn crc_with_idle_buildkit() -> ClusterCapacity {
         let nodes = vec![node(true, false, "72", "48Gi")];
-        let pods = vec![named(burstable_pod("n1", BUILDKIT_REQ, BUILDKIT_LIM), "buildkit")];
-        ClusterCapacity {
-            allocatable: cluster_allocatable(&nodes),
-            reserved: cluster_reserved(&pods, &[], &no_usage()),
-        }
+        let pods = vec![burstable_pod("n1", BUILDKIT_REQ, BUILDKIT_LIM)];
+        capacity_from(&nodes, &pods, &[])
     }
 
     #[test]

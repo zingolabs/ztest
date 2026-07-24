@@ -15,7 +15,6 @@ use crate::handles::validator::{
 use crate::handles::wallet::Pool;
 use crate::handles::{Endpoint, HandleInner};
 use crate::protocol::zcash_rpc::ZcashRpc;
-use crate::topology::{self, NetworkUpgrade};
 use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zebrad";
@@ -64,6 +63,7 @@ pub struct ZebraBackend;
 
 impl ValidatorConfig for ZebraBackend {
     type Handle = ZebraValidator;
+    type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, plumbing: HandleInner) -> ZebraValidator {
         ZebraValidator { plumbing }
@@ -75,10 +75,6 @@ impl ValidatorConfig for ZebraBackend {
 
     fn label(&self) -> &'static str {
         COMPONENT
-    }
-
-    fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
-        version.parse().ok().map(topology::zebrad_ceiling)
     }
 
     fn materialize_regtest_opts(
@@ -132,6 +128,9 @@ impl ValidatorConfig for ZebraBackend {
             Some(funding_streams),
             persistent,
             miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
+            opts.image
+                .metrics_enabled()
+                .then_some(crate::handles::ports::ZEBRAD_METRICS),
         );
         opts.mounts.push(crate::regtest::config_mount_inline(
             toml,
@@ -139,8 +138,8 @@ impl ValidatorConfig for ZebraBackend {
         ));
 
         // Back the persistent `cache_dir` with a volume. The shared-state path
-        // mounts its own PVC (in `persistent_state_in`), so only wire the cache
-        // mount when `shared_state` is absent.
+        // already mounts its PVC (the caller's `.mount(&vol)`), so only wire the
+        // cache mount when `shared_state` is absent.
         if opts.shared_state.is_none() {
             match &opts.regtest_cache {
                 Some(crate::component::RegtestCacheSource::Archive(path)) => {
@@ -195,14 +194,20 @@ impl ValidatorBackend for ZebraValidator {
             category: crate::component::ComponentCategory::Validator,
             label: COMPONENT,
             image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
-            ports: crate::manifest::merge_ports(
-                &[
+            ports: {
+                let mut base = vec![
                     ("rpc", crate::handles::ports::ZEBRAD_RPC),
                     ("metrics", crate::handles::ports::ZEBRAD_METRICS),
                     ("p2p", crate::handles::ports::ZEBRAD_P2P),
-                ],
-                &opts.extra_ports,
-            ),
+                ];
+                // Sharing its state DB (a `Shared` mount sets `shared_state`)
+                // means also serving the indexer gRPC the colocated zaino
+                // StateService's syncer dials — so expose that port too.
+                if opts.shared_state.is_some() {
+                    base.push(("indexer", crate::handles::ports::ZEBRAD_INDEXER));
+                }
+                crate::manifest::merge_ports(&base, &opts.extra_ports)
+            },
             ready_port: crate::handles::ports::ZEBRAD_RPC,
             command: opts.command.clone(),
             args: opts.args.clone(),
@@ -423,8 +428,7 @@ impl ValidatorBackend for ZebraValidator {
 
 impl crate::regtest::Regtest for crate::component::Validator<ZebraBackend> {
     fn regtest(self) -> Self {
-        use crate::component::RegtestMode;
-        self.with_regtest_mode(RegtestMode::Default)
+        self.with_regtest()
             .command(["zebrad"])
             .args(["-c", CONTAINER_CONFIG_PATH, "start"])
     }
@@ -447,6 +451,10 @@ impl crate::regtest::Testnet for crate::component::Validator<ZebraBackend> {
             version,
             ZEBRAD_TESTNET_RPC_PORT,
             ZEBRAD_TESTNET_CACHE_DIR,
+            self.opts()
+                .image
+                .metrics_enabled()
+                .then_some(crate::handles::ports::ZEBRAD_METRICS),
         );
         self.mount(crate::regtest::config_mount_inline(
             toml,

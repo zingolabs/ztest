@@ -19,10 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use tokio_util::io::StreamReader;
 
-use super::{
-    ByteSource, Compression, Pointer, SourceKind, StorageBackend, StorageError,
-    compression_from_ext,
-};
+use super::{ByteSource, Compression, Pointer, StorageBackend, StorageError, compression_from_ext};
 
 /// The LFS content-type for both the batch request and response.
 const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
@@ -108,10 +105,6 @@ impl Lfs {
 
 #[async_trait]
 impl StorageBackend for Lfs {
-    fn kind(&self) -> SourceKind {
-        SourceKind::Lfs
-    }
-
     fn compression(&self) -> Result<Compression, StorageError> {
         // The pointer file keeps the archive's real name, so the extension is
         // authoritative. There's no on-disk blob to sniff magic bytes from.

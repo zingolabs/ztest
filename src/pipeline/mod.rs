@@ -24,6 +24,7 @@
 
 pub mod archives;
 pub mod build;
+pub mod capacity_watch;
 pub mod cluster;
 pub mod events;
 pub mod images;

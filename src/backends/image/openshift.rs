@@ -1,5 +1,5 @@
-//! OpenShift backend: the only backend that builds *on the cluster* — in a
-//! long-lived ztest-owned BuildKit pod ([`crate::resource::impls::buildkit`]),
+//! OpenShift backend: the only backend that builds *on the cluster* — in the
+//! ephemeral ztest-owned BuildKit pod ([`crate::resource::impls::buildkit`]),
 //! pushing to the integrated registry over the in-cluster service and
 //! authenticating with the pod SA's token. Nothing is built on the laptop.
 //!
@@ -17,28 +17,17 @@
 //! init containers to `quay.io/okd/scos-content` digests that OKD prunes from
 //! quay on pre-release streams, so a day-old cluster's first build dies
 //! `ImagePullBackOff`. A pinned public BuildKit image removes that dependency.
-//!
-//! Also builds the base images ([`build_base_image`], driven by
-//! [`base_images`](crate::resource::impls::base_images) at `ztest setup`) through
-//! the identical path.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, ListParams};
 
 use super::{DevSource, ImageProvider, bundle, docker, join};
 use crate::inventory::DevImageEntry;
-use crate::qos::build::{BUILDKIT_BUILD, BUILDKIT_REST};
-use crate::resource::impls::buildkit::{BUILDKIT_CONTAINER, BUILDKIT_DEPLOYMENT, WORK_MOUNT};
+use crate::resource::impls::buildkit::{BUILDKIT_CONTAINER, WORK_MOUNT};
 use crate::resource::impls::policy;
-use crate::resource::{Cx, NodeId, Readiness, ResourceError, grow_to, shrink_to};
-
-/// How long to wait for the BuildKit build pod to become Ready before giving up.
-const BUILDKIT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-const POLL: std::time::Duration = std::time::Duration::from_secs(2);
+use crate::resource::{Cx, NodeId, Readiness, ResourceError};
 
 /// Push and pull addresses differ: probes use the external `push` route (where
 /// the laptop authenticates), while the BuildKit pod pushes — and pods pull —
@@ -79,7 +68,18 @@ impl ImageProvider for OpenShift {
                 rev,
                 dockerfile,
                 context,
-            } => run_build_git(cx, tag, url, rev, dockerfile, context, &build_args_git(entry)).await?,
+            } => {
+                run_build_git(
+                    cx,
+                    tag,
+                    url,
+                    rev,
+                    dockerfile,
+                    context,
+                    &build_args_git(entry),
+                )
+                .await?
+            }
             // Local is the working tree: pack and upload it (no ref to clone).
             DevSource::Local {
                 dockerfile,
@@ -98,60 +98,43 @@ impl OpenShift {
     }
 }
 
-/// Build a base image (compile **builder** or runner **base**) from an embedded
-/// Dockerfile via the same BuildKit-pod path component images use — its context
-/// is just the staged Dockerfile. `tag` is content-addressed, so the caller's
-/// probe skips this when the Dockerfile is unchanged.
-pub(crate) async fn build_base_image(
-    cx: &Cx,
-    tag: &str,
-    dockerfile: &str,
-) -> Result<(), ResourceError> {
-    let work = std::env::temp_dir().join(format!("ztest-baseimg-{}", slug(tag)));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work)
-        .map_err(|e| ResourceError::Provision(format!("scratch dir: {e}")))?;
-    let df = work.join("Dockerfile");
-    std::fs::write(&df, dockerfile)
-        .map_err(|e| ResourceError::Provision(format!("stage Dockerfile: {e}")))?;
-
-    let result = run_build_local(cx, tag, &df, &work, &[]).await;
-    let _ = std::fs::remove_dir_all(&work);
-    result
-}
-
-/// Mirror one published Hub image into the internal registry via `crane` in the
-/// **builder** pod (which carries `crane` + the SA push creds). `crane copy` is
-/// idempotent, so a re-run is cheap. `dest_ref` is the full path-preserving
-/// internal ref so an [`ImageTagMirrorSet`] prefix-substitution resolves to it.
+/// Mirror one published Hub image into the internal registry with a buildkit-native
+/// `FROM <hub>` build in the ephemeral build pod (see the body — no `crane`). A
+/// re-run is cheap: an unchanged image no-ops in the content store. `dest_ref` is
+/// the full path-preserving internal ref so an [`ImageTagMirrorSet`]
+/// prefix-substitution resolves to it.
 pub(crate) async fn mirror_image(
     cx: &Cx,
     hub_ref: &str,
     dest_ref: &str,
 ) -> Result<(), ResourceError> {
-    use crate::resource::impls::builder::{BUILDER_CONTAINER, BUILDER_DEPLOYMENT};
+    let pod = build_pod_name(cx)?;
     let registry = dest_ref.split('/').next().unwrap_or_default();
+    let build_dir = format!("{WORK_MOUNT}/mirror-{}", slug(dest_ref));
+    // buildkit-native mirror (no crane): build a one-line `FROM <hub>` image and
+    // push it to `dest`. Pull of the public `hub_ref` is anonymous; push to the
+    // internal registry authenticates via the pod SA token in a docker
+    // config.json (its service-ca TLS is trusted through the system store).
     let script = format!(
         "set -eu\n\
+         export DOCKER_CONFIG=/tmp/.docker\n\
+         mkdir -p {dir} \"$DOCKER_CONFIG\"\n\
+         cd {dir}\n\
+         printf 'FROM %s\\n' {hub} > Dockerfile\n\
          TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\n\
-         crane auth login {reg} -u ztest -p \"$TOKEN\" --insecure >/dev/null 2>&1\n\
-         crane copy --insecure {src} {dst}\n",
+         AUTH=$(printf 'ztest:%s' \"$TOKEN\" | base64 | tr -d '\\n')\n\
+         printf '{{\"auths\":{{\"%s\":{{\"auth\":\"%s\"}}}}}}' {reg} \"$AUTH\" > \"$DOCKER_CONFIG/config.json\"\n\
+         buildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+           --opt filename=Dockerfile --output type=image,name={dst},push=true,{comp} --progress=auto\n\
+         rm -rf {dir}\n",
+        dir = shell_quote(&build_dir),
+        hub = shell_quote(hub_ref),
         reg = shell_quote(registry),
-        src = shell_quote(hub_ref),
         dst = shell_quote(dest_ref),
+        comp = super::IMAGE_OUTPUT_COMPRESSION,
     );
-    let mut argv = oc_base("exec");
-    argv.extend([
-        format!("deployment/{BUILDER_DEPLOYMENT}"),
-        "-c".to_string(),
-        BUILDER_CONTAINER.to_string(),
-        "-n".to_string(),
-        policy::RUN_NAMESPACE.to_string(),
-        "--".to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        script,
-    ]);
+    let mut argv = exec_argv(&pod, true);
+    argv.extend(["--".to_string(), "sh".to_string(), "-c".to_string(), script]);
     super::run_streamed(cx, hub_ref, "oc", &argv, &[], "mirror component image").await
 }
 
@@ -194,14 +177,7 @@ async fn run_build_local(
         }
         let tar = stage_archive(dockerfile, context, &work)?;
 
-        let client = crate::cluster::client()
-            .await
-            .map_err(|e| ResourceError::Provision(format!("kube client: {e}")))?;
-        if let Some(sink) = &cx.progress {
-            sink.note(&id, "waiting for the buildkit build server");
-        }
-        let pod = wait_for_buildkit(&client).await?;
-
+        let pod = build_pod_name(cx)?;
         if let Some(sink) = &cx.progress {
             sink.note(&id, "on-cluster build (buildkit)");
         }
@@ -221,8 +197,20 @@ async fn run_build_local(
             "cd {dir}\ntar -xf ctx.tar && rm -f ctx.tar",
             dir = shell_quote(&build_dir),
         );
-        build_and_push(cx, tag, &pod, &reference, &build_dir, &prep, "Dockerfile", ".", build_args)
-            .await
+        build_and_push(
+            cx,
+            BuildJob {
+                tag,
+                pod: &pod,
+                reference: &reference,
+                build_dir: &build_dir,
+                prep: &prep,
+                dockerfile: "Dockerfile",
+                context: ".",
+                build_args,
+            },
+        )
+        .await
     }
     .await;
 
@@ -246,13 +234,7 @@ async fn run_build_git(
     let reference = reference_for(tag)?;
     let build_dir = format!("{WORK_MOUNT}/git-{}", slug(tag));
 
-    let client = crate::cluster::client()
-        .await
-        .map_err(|e| ResourceError::Provision(format!("kube client: {e}")))?;
-    if let Some(sink) = &cx.progress {
-        sink.note(&id, "waiting for the buildkit build server");
-    }
-    let pod = wait_for_buildkit(&client).await?;
+    let pod = build_pod_name(cx)?;
     if let Some(sink) = &cx.progress {
         sink.note(&id, "on-cluster build (buildkit, git clone)");
     }
@@ -272,51 +254,32 @@ async fn run_build_git(
         rev = shell_quote(rev),
     );
     build_and_push(
-        cx, tag, &pod, &reference, &build_dir, &prep, dockerfile, context, build_args,
+        cx,
+        BuildJob {
+            tag,
+            pod: &pod,
+            reference: &reference,
+            build_dir: &build_dir,
+            prep: &prep,
+            dockerfile,
+            context,
+            build_args,
+        },
     )
     .await
 }
 
-/// Find the `ztest-buildkit` pod and wait until Ready, returning its name. The
-/// Deployment's image pull/rollout is asynchronous, so the first build blocks
-/// here. Its readiness probe (`buildctl debug workers`) means Ready ⇒ the daemon
-/// answers, so the subsequent `exec buildctl` connects.
-async fn wait_for_buildkit(client: &kube::Client) -> Result<String, ResourceError> {
-    let api: Api<Pod> = Api::namespaced(client.clone(), policy::RUN_NAMESPACE);
-    let selector = "ztest.io/component=buildkit";
-    let start = std::time::Instant::now();
-    loop {
-        if let Ok(list) = api.list(&ListParams::default().labels(selector)).await {
-            for p in &list.items {
-                if pod_ready(p) {
-                    return Ok(p.metadata.name.clone().expect("a listed pod has a name"));
-                }
-            }
-        }
-        if start.elapsed() >= BUILDKIT_READY_TIMEOUT {
-            return Err(ResourceError::Provision(format!(
-                "buildkit pod ({BUILDKIT_DEPLOYMENT}) not Ready within {}s — is it provisioned \
-                 (`ztest setup`) and its image pulled? Check `oc -n {} get pods -l ztest.io/component=buildkit`",
-                BUILDKIT_READY_TIMEOUT.as_secs(),
-                policy::RUN_NAMESPACE,
-            )));
-        }
-        tokio::time::sleep(POLL).await;
-    }
-}
-
-fn pod_ready(p: &Pod) -> bool {
-    // A terminating pod keeps `Ready=True` briefly after deletion starts;
-    // exec'ing into it races teardown ("container is not created or running").
-    // Skip it so the wait blocks for the replacement pod.
-    if p.metadata.deletion_timestamp.is_some() {
-        return false;
-    }
-    p.status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-        .map(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
-        .unwrap_or(false)
+/// The ephemeral BuildKit pod this invocation stood up (`cx.build_pod`), which
+/// every on-cluster build `exec`s `buildctl` against. `None` means the build
+/// phase ran without provisioning a pod — a harness bug on the build path.
+fn build_pod_name(cx: &Cx) -> Result<String, ResourceError> {
+    cx.build_pod.clone().ok_or_else(|| {
+        ResourceError::Provision(
+            "no ephemeral BuildKit pod for this invocation (cx.build_pod unset) — the build \
+             phase must create one before any image build"
+                .into(),
+        )
+    })
 }
 
 /// `buildctl build` the prepared build dir (streaming BuildKit's progress through
@@ -325,19 +288,40 @@ fn pod_ready(p: &Pod) -> bool {
 /// `dockerfile`/`context` are relative to it. Push authenticates via a docker
 /// `config.json` written from the pod SA's token. Only the per-build context dir
 /// is reaped afterward — the layer cache on the state PVC stays.
-async fn build_and_push(
-    cx: &Cx,
-    tag: &str,
-    pod: &str,
-    reference: &str,
-    build_dir: &str,
-    prep: &str,
-    dockerfile: &str,
-    context: &str,
-    build_args: &[(String, String)],
-) -> Result<(), ResourceError> {
+/// One on-cluster image build, beyond the ambient [`Cx`]. A struct so the call
+/// sites name each field — `dockerfile` and `context` are both bare relative
+/// paths, trivial to transpose as positional args.
+struct BuildJob<'a> {
+    tag: &'a str,
+    pod: &'a str,
+    reference: &'a str,
+    /// Per-build context dir in the pod; reaped after the build.
+    build_dir: &'a str,
+    /// Shell that populates and `cd`s into `build_dir` (untar, or git clone).
+    prep: &'a str,
+    /// Dockerfile path, relative to `build_dir`.
+    dockerfile: &'a str,
+    /// Build-context path, relative to `build_dir`.
+    context: &'a str,
+    build_args: &'a [(String, String)],
+}
+
+async fn build_and_push(cx: &Cx, job: BuildJob<'_>) -> Result<(), ResourceError> {
+    let BuildJob {
+        tag,
+        pod,
+        reference,
+        build_dir,
+        prep,
+        dockerfile,
+        context,
+        build_args,
+    } = job;
     let df = Path::new(dockerfile);
-    let df_name = df.file_name().and_then(|s| s.to_str()).unwrap_or("Dockerfile");
+    let df_name = df
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Dockerfile");
     let df_dir = df
         .parent()
         .and_then(|p| p.to_str())
@@ -369,43 +353,32 @@ async fn build_and_push(
            --local context={ctx} \
            --local dockerfile={df_dir} \
            --opt filename={df_name}{opts} \
-           --output type=image,name={ref_},push=true \
+           --output type=image,name={ref_},push=true,{comp} \
            --progress=auto\n",
         host = shell_quote(host),
         ctx = shell_quote(context),
         df_dir = shell_quote(df_dir),
         df_name = shell_quote(df_name),
         ref_ = shell_quote(reference),
+        comp = super::IMAGE_OUTPUT_COMPRESSION,
     );
     let mut argv = exec_argv(pod, true);
     argv.extend(["--".to_string(), "sh".to_string(), "-c".to_string(), script]);
 
-    // Grow buildkit to its build size and WAIT for the kubelet to actuate it
-    // before building, then shrink back to rest. Blocking, not fire-and-forget:
-    // the heavy compile layer would OOM-kill (exit 137) at the rest limit, and a
-    // grow that can't actuate must fail with a clear message rather than proceed
-    // into that OOM. The shrink is best-effort on every path.
-    let id = NodeId::Image(tag.to_string());
-    let (build_cpu, build_mem) = BUILDKIT_BUILD.guaranteed_cpu_mem("buildkit build footprint");
-    let (rest_cpu, rest_mem) = BUILDKIT_REST.guaranteed_cpu_mem("buildkit rest footprint");
-    if let Err(e) = grow_to(&cx.client, pod, BUILDKIT_CONTAINER, &build_cpu, &build_mem).await {
-        let _ = shrink_to(&cx.client, pod, BUILDKIT_CONTAINER, &rest_cpu, &rest_mem).await;
-        return Err(ResourceError::Provision(format!(
-            "buildkit build {tag}: {e}"
-        )));
-    }
+    // The pod is already at its Guaranteed build footprint (created ephemeral at
+    // that size), so the build runs directly — no in-place resize.
     let result = super::run_streamed(cx, tag, "oc", &argv, &[], "on-cluster buildkit build").await;
-    if let Err(e) = shrink_to(&cx.client, pod, BUILDKIT_CONTAINER, &rest_cpu, &rest_mem).await
-        && let Some(sink) = &cx.progress
-    {
-        sink.note(&id, format!("buildkit shrink failed: {e}"));
-    }
 
     // Reap the per-build context dir (best-effort). The layer cache in the state
     // PVC stays, so a rebuild reuses it.
     let cleanup = format!("rm -rf {dir}", dir = shell_quote(build_dir));
     let mut cargv = exec_argv(pod, false);
-    cargv.extend(["--".to_string(), "sh".to_string(), "-c".to_string(), cleanup]);
+    cargv.extend([
+        "--".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        cleanup,
+    ]);
     let _ = std::process::Command::new("oc")
         .args(&cargv)
         .stdout(Stdio::null())

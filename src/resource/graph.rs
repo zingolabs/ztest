@@ -35,6 +35,7 @@ use crate::resource::state::{NodeState, Readiness, ResourceError};
 /// }).await;
 /// let errors = g.teardown(&cx, &states, |id, r| { .. }).await;
 /// ```
+#[derive(Default)]
 pub struct Graph {
     nodes: HashMap<NodeId, Box<dyn Provider>>,
 }
@@ -44,14 +45,6 @@ impl std::fmt::Debug for Graph {
         f.debug_struct("Graph")
             .field("nodes", &self.nodes.keys().collect::<Vec<_>>())
             .finish()
-    }
-}
-
-impl Default for Graph {
-    fn default() -> Self {
-        Self {
-            nodes: HashMap::new(),
-        }
     }
 }
 

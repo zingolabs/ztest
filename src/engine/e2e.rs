@@ -88,6 +88,7 @@ fn env() -> EngineEnv {
         sa: "ztest-local".into(),
         no_cleanup: false,
         capture: true,
+        ztest_log: None,
     }
 }
 
@@ -101,6 +102,8 @@ fn cfg(fail_fast: bool, slow_after: Option<Duration>) -> LoopConfig {
         cancel: crate::cancel::Cancel::never(),
         resources: std::collections::HashMap::new(),
         max_inflight: None,
+        cap_rx: None,
+        demand_tx: None,
     }
 }
 
@@ -166,7 +169,8 @@ async fn drive_real(
     let conc = Arc::new(Mutex::new(Concurrency::default()));
     let conc_spawn = conc.clone();
 
-    let mut reporter = StyledReporter::new(false, true, crate::engine::output::OutputConfig::default());
+    let mut reporter =
+        StyledReporter::new(false, true, crate::engine::output::OutputConfig::default());
     let panel = Arc::new(Mutex::new(PanelWitness::default()));
     let panel_tick = panel.clone();
 
@@ -234,7 +238,10 @@ async fn mixed_suite_packs_runs_to_completion_and_reports_each_verdict() {
         qos("pkg::beta", "also_fine", QosClass::Integration),
         qos("pkg::gamma", "blows_up", QosClass::Integration),
     ];
-    let i = QosClass::Integration.profile().footprint;
+    // The scheduler charges each test its admitted footprint (tier footprint +
+    // per-test runner reserve), so the ceiling must be sized from `admitted()`,
+    // not the bare tier footprint, or fewer than two tests are admitted.
+    let i = QosClass::Integration.profile().admitted();
     let ceiling = Resources::new(2 * i.cpu_milli, 2 * i.mem_bytes, 0, 0); // fits exactly 2
 
     let (stats, out, conc, panel) =
@@ -287,8 +294,10 @@ async fn mixed_suite_packs_runs_to_completion_and_reports_each_verdict() {
 
 /// A flaky test recovers on retry: a child fails its first process then passes
 /// its second (counting attempts through a file, so the retry is a genuinely
-/// separate process). With `retries = 1` the run finishes green and the
-/// scrollback shows `TRY 2` but no `FAIL` (a superseded attempt isn't a failure).
+/// separate process). With `retries = 1` the run finishes green: the scrollback
+/// shows the failed first attempt as `TRY 1 FAIL` (nextest labels the retry line
+/// with the attempt that just failed) and the final `PASS`, and the summary
+/// reports no failure (a superseded attempt isn't counted).
 #[tokio::test]
 async fn flaky_test_recovers_on_retry_and_retry_is_logged() {
     let fx = Fixture::new("flaky");
@@ -302,7 +311,7 @@ async fn flaky_test_recovers_on_retry_and_retry_is_logged() {
 
     let binaries = [binary("pkg::flaky", &flaky, "sometimes_fails")];
     let qos_dump = [qos("pkg::flaky", "sometimes_fails", QosClass::Integration)];
-    let i = QosClass::Integration.profile().footprint;
+    let i = QosClass::Integration.profile().admitted();
     let ceiling = Resources::new(i.cpu_milli, i.mem_bytes, 0, 0);
 
     let (stats, out, _conc, _panel) =
@@ -312,11 +321,17 @@ async fn flaky_test_recovers_on_retry_and_retry_is_logged() {
     assert_eq!(stats.failed, 0, "a recovered flake is not a failure; {out}");
     let attempts = std::fs::read_to_string(&counter).unwrap();
     assert_eq!(attempts.trim(), "2", "should have run exactly twice");
-    assert!(out.contains("TRY 2"), "retry line must show; {out}");
-    assert!(out.contains("PASS"), "{out}");
     assert!(
-        !out.contains("FAIL"),
-        "a retried attempt must not be reported as FAIL; {out}"
+        out.contains("TRY 1 FAIL"),
+        "the failed first attempt must show as TRY 1 FAIL; {out}"
+    );
+    assert!(out.contains("PASS"), "{out}");
+    // The inline retry line legitimately carries the uppercase verdict word
+    // `FAIL`; a recovered flake must simply not be counted as a failure in the
+    // summary (lowercase `failed`, present only when a test ends failed).
+    assert!(
+        !out.contains("failed"),
+        "a recovered flake must not be tallied as failed; {out}"
     );
 }
 
@@ -394,7 +409,7 @@ async fn hung_test_goes_slow_then_times_out_and_frees_the_slot() {
         qos("pkg::hang", "never_returns", QosClass::Integration),
         qos("pkg::ok", "waits_its_turn", QosClass::Integration),
     ];
-    let i = QosClass::Integration.profile().footprint;
+    let i = QosClass::Integration.profile().admitted();
     let ceiling = Resources::new(i.cpu_milli, i.mem_bytes, 0, 0); // one slot → ok queues
 
     // Shorten the hung test's hard cap so the story runs fast; the slow threshold

@@ -1,7 +1,8 @@
 //! Work-side subprocess runner: spawn a child under a PTY and stream its raw
-//! bytes to the render thread. A PTY (not a pipe) keeps the child's native colour
-//! + in-place progress bars intact, since those emit only when a TTY is detected.
-//! Off a TTY (no [`Console`]), the child inherits stdio for the plain CI log.
+//! bytes to the render thread. A PTY (not a pipe) keeps the child's native
+//! colour + in-place progress bars intact, since those emit only when a TTY is
+//! detected. Off a TTY (no [`Console`]), the child inherits stdio for the plain
+//! CI log.
 
 use std::io::{self, Read};
 

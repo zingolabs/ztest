@@ -279,6 +279,16 @@ impl Scheduler {
         self.committed
     }
 
+    /// This run's total appetite: committed leases plus every queued request's
+    /// footprint. The cross-run governor sizes the run's live reservation to this
+    /// (capped by fair share and headroom) so a run reserves what it can actually
+    /// use — no more — leaving the rest for concurrent runs.
+    pub fn demand(&self) -> Resources {
+        self.queue.iter().fold(self.committed, |acc, p| {
+            acc.saturating_add(&p.req.footprint)
+        })
+    }
+
     /// Number of requests currently waiting for capacity.
     pub fn queue_len(&self) -> usize {
         self.queue.len()
@@ -341,7 +351,8 @@ impl Scheduler {
         // past the ceiling. `fits_now` (the only caller) guarantees it; guarded
         // live so a regression aborts rather than overcommits a real cluster.
         assert!(
-            req.footprint.fits_within(&self.available.saturating_sub(&self.committed)),
+            req.footprint
+                .fits_within(&self.available.saturating_sub(&self.committed)),
             "admit: footprint {:?} does not fit free capacity {:?} — fits_now precondition violated",
             req.footprint,
             self.available.saturating_sub(&self.committed),
@@ -418,7 +429,9 @@ mod tests {
         assert_eq!(s.committed(), Resources::new(1_000, GIB, 0, 0));
         assert_eq!(
             s.free(),
-            before.checked_sub(&Resources::new(1_000, GIB, 0, 0)).unwrap()
+            before
+                .checked_sub(&Resources::new(1_000, GIB, 0, 0))
+                .unwrap()
         );
     }
 
@@ -600,8 +613,8 @@ mod tests {
         let v = decide(
             Resources::new(8_000, 16 * GIB, 0, 0), // available = ceiling
             Resources::new(6_000, 12 * GIB, 0, 0), // committed
-            Resources::ZERO,                 // sa_usage
-            None,                            // sa_budget
+            Resources::ZERO,                       // sa_usage
+            None,                                  // sa_budget
             Resources::new(4_000, 8 * GIB, 0, 0),  // footprint
         );
         assert_eq!(v, Verdict::Queue);
@@ -717,7 +730,10 @@ mod tests {
         let _occ = lease_of(s.request(req("occ", 6_000, 12 * GIB, 0)));
         assert_eq!(s.request(req("t", 4_000, 8 * GIB, 0)), Admission::Queued);
         // No-op reconcile (same value) admits nothing.
-        assert!(s.reconcile(Resources::new(8_000, 16 * GIB, 0, 0)).is_empty());
+        assert!(
+            s.reconcile(Resources::new(8_000, 16 * GIB, 0, 0))
+                .is_empty()
+        );
         assert_eq!(s.queue_len(), 1);
         // External capacity appears, available grows, and the queued request
         // backfills without any lease releasing.
@@ -734,6 +750,20 @@ mod tests {
         assert!(grants.is_empty());
         assert_eq!(s.active_leases(), 1, "running lease is not preempted");
         assert_eq!(s.free(), Resources::ZERO);
+    }
+
+    // ── Demand: committed plus queued footprints ───────────────────────
+
+    #[test]
+    fn demand_sums_committed_and_queued_footprints() {
+        // 8 CPU cluster. Admit 6 CPU, then queue two 4-CPU asks (neither fits
+        // the 2 CPU free). Demand is the whole appetite: 6 committed + 4 + 4.
+        let mut s = sched();
+        lease_of(s.request(req("run", 6_000, 4 * GIB, 0)));
+        assert_eq!(s.request(req("q1", 4_000, GIB, 0)), Admission::Queued);
+        assert_eq!(s.request(req("q2", 4_000, GIB, 0)), Admission::Queued);
+        assert_eq!(s.demand(), Resources::new(14_000, 6 * GIB, 0, 0));
+        assert_eq!(s.committed(), Resources::new(6_000, 4 * GIB, 0, 0));
     }
 
     // ── Deadlock-free: queueing reserves nothing ───────────────────────

@@ -226,7 +226,7 @@ fn is_statefulset_ready() -> impl Condition<StatefulSet> {
         let ready = sts
             .status
             .as_ref()
-            .and_then(|s| Some(s.ready_replicas.unwrap_or(0)))
+            .map(|s| s.ready_replicas.unwrap_or(0))
             .unwrap_or(0);
         ready >= desired && desired > 0
     }

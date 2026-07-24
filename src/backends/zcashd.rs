@@ -17,7 +17,6 @@ use crate::handles::validator::{
 use crate::handles::wallet::Pool;
 use crate::handles::{Endpoint, HandleInner};
 use crate::protocol::zcash_rpc::ZcashRpc;
-use crate::topology::{self, NetworkUpgrade};
 use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zcashd";
@@ -75,6 +74,7 @@ pub struct ZcashdBackend;
 
 impl ValidatorConfig for ZcashdBackend {
     type Handle = ZcashdValidator;
+    type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, plumbing: HandleInner) -> ZcashdValidator {
         ZcashdValidator { plumbing }
@@ -86,10 +86,6 @@ impl ValidatorConfig for ZcashdBackend {
 
     fn label(&self) -> &'static str {
         COMPONENT
-    }
-
-    fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
-        version.parse().ok().map(topology::zcashd_ceiling)
     }
 
     fn materialize_regtest_opts(
@@ -348,8 +344,7 @@ impl ValidatorBackend for ZcashdValidator {
 
 impl crate::regtest::Regtest for crate::component::Validator<ZcashdBackend> {
     fn regtest(self) -> Self {
-        use crate::component::RegtestMode;
-        self.with_regtest_mode(RegtestMode::Default)
+        self.with_regtest()
             .mount(crate::regtest::scratch_mount(CONTAINER_DATA_DIR))
             .command(["zcashd"])
             .args([

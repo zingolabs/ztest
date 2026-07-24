@@ -25,9 +25,11 @@ use crate::engine::panel::{live_snapshot, run_progress};
 use crate::engine::plan::WorkItem;
 use crate::preflight::RunProgress;
 use crate::qos::Resources;
+use crate::qos::governor::RunDemand;
 use crate::qos::live::LiveSnapshot;
 use crate::qos::scheduler::{Admission, LeaseId, RejectReason, Request, Scheduler};
 use crate::resource::{NodeId, NodeState};
+use tokio::sync::watch;
 
 /// Tunables for the run loop.
 #[derive(Debug, Clone)]
@@ -58,6 +60,25 @@ pub struct LoopConfig {
     /// (mirroring nextest's `test_threads = 1` coupling). Scheduler-granted but
     /// not-yet-spawned tests wait in an ordered ready-queue.
     pub max_inflight: Option<usize>,
+    /// Live admission ceiling from the cross-run
+    /// [`CapacityGovernor`](crate::qos::governor::CapacityGovernor). Each update
+    /// reconciles the scheduler, so concurrency tracks the cluster as other runs
+    /// and the build pod come and go. `None` (local runs, unit tests) pins the
+    /// ceiling at its seed.
+    pub cap_rx: Option<watch::Receiver<Resources>>,
+    /// Publishes this run's live demand (committed + queued) to the governor after
+    /// every admission and release, so it can size the run's reservation. `None`
+    /// when there is no governor.
+    pub demand_tx: Option<watch::Sender<RunDemand>>,
+}
+
+/// The cross-run governor's two channels, bundled for the `engine::run`
+/// boundary: the live ceiling the scheduler reconciles from and the demand sink
+/// it feeds back. Absent for local runs and unit tests.
+#[derive(Debug)]
+pub struct CapacityChannels {
+    pub ceiling_rx: watch::Receiver<Resources>,
+    pub demand_tx: watch::Sender<RunDemand>,
 }
 
 /// The live state handed to the per-tick render callback.
@@ -175,6 +196,24 @@ where
         };
     }
 
+    // Publish this run's live appetite to the cross-run governor so it can size
+    // the reservation. A no-op when there is no governor (local runs, tests).
+    macro_rules! publish_demand {
+        () => {
+            if let Some(tx) = &cfg.demand_tx {
+                let _ = tx.send(RunDemand {
+                    committed: sched.committed(),
+                    demand: sched.demand(),
+                });
+            }
+        };
+    }
+
+    // The governor's live ceiling. Cloned so the loop can await changes while the
+    // config keeps its own handle; `None` (no governor) makes the ceiling arm
+    // idle forever.
+    let mut cap_rx = cfg.cap_rx.clone();
+
     // Initial admission sweep (priority order already baked into `items`).
     for item in items {
         // Resource gate: a test whose declared dependency failed to provision is
@@ -207,6 +246,7 @@ where
         }
     }
     pump!();
+    publish_demand!();
 
     let mut tick = tokio::time::interval(cfg.redraw);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -306,7 +346,25 @@ where
                     }
                     pump!();
                 }
+                publish_demand!();
 
+                render_tick(reporter, &inflight, &sched, ceiling, stats, start, &cfg, &mut on_tick);
+            }
+            // The governor grew or shrank this run's live ceiling. Reconcile the
+            // scheduler: a grow backfills parked tests into the new headroom; a
+            // shrink stops further admission without preempting running leases
+            // (`Scheduler::reconcile`). Idle forever when there is no governor.
+            new_ceiling = next_ceiling(&mut cap_rx) => {
+                let grants = sched.reconcile(new_ceiling);
+                if !fail_fast_tripped && !cfg.cancel.is_cancelled() {
+                    for g in grants {
+                        if let Some((item, attempt)) = parked.remove(&(g.binary_id.clone(), g.test_name.clone())) {
+                            ready.push_back((g.lease_id, item, attempt));
+                        }
+                    }
+                    pump!();
+                }
+                publish_demand!();
                 render_tick(reporter, &inflight, &sched, ceiling, stats, start, &cfg, &mut on_tick);
             }
             _ = tick.tick() => {
@@ -330,6 +388,23 @@ where
         elapsed: start.elapsed(),
     });
     stats
+}
+
+/// Await the next value from the governor's live-ceiling channel. Resolves with
+/// the new ceiling on change; pends forever when there is no governor, or once the
+/// governor has gone (a closed channel), so the `select!` arm simply never fires
+/// rather than spinning.
+async fn next_ceiling(rx: &mut Option<watch::Receiver<Resources>>) -> Resources {
+    match rx {
+        Some(r) => {
+            if r.changed().await.is_ok() {
+                *r.borrow()
+            } else {
+                std::future::pending().await
+            }
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn emit_finished(reporter: &mut dyn RunReporter, running: &Running, outcome: &TestOutcome) {
@@ -484,6 +559,8 @@ mod tests {
             cancel: Cancel::never(),
             resources: HashMap::new(),
             max_inflight: None,
+            cap_rx: None,
+            demand_tx: None,
         }
     }
 
@@ -502,9 +579,9 @@ mod tests {
         }
     }
 
-    // A ceiling that fits exactly two Integration tests (2000m each).
+    // A ceiling that fits exactly two Integration tests (3000m each).
     fn ceiling_two_integration() -> Resources {
-        Resources::new(4_000, 4 * crate::qos::GIB, 0, 0)
+        Resources::new(6_000, 6 * crate::qos::GIB, 0, 0)
     }
 
     #[tokio::test]
@@ -531,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn never_overcommits_capacity() {
-        // 6 Integration tests (2000m each), ceiling fits 2 at a time.
+        // 6 Integration tests (3000m each), ceiling fits 2 at a time.
         let items: Vec<_> = (0..6)
             .map(|i| item(&format!("t{i}"), QosClass::Integration, 0))
             .collect();
@@ -592,7 +669,8 @@ mod tests {
                     {
                         let mut n = live2.lock().unwrap();
                         *n += 1;
-                        *peak2.lock().unwrap() = (*peak2.lock().unwrap()).max(*n);
+                        let mut p = peak2.lock().unwrap();
+                        *p = (*p).max(*n);
                     }
                     tokio::task::yield_now().await;
                     *live2.lock().unwrap() -= 1;
@@ -787,7 +865,12 @@ mod tests {
         let i = QosClass::Integration.profile().footprint;
         // Room for 3 Testnet + 1 Integration: a few heavy tests, with one light
         // test backfilling the leftover capacity.
-        let ceiling = Resources::new(3 * t.cpu_milli + i.cpu_milli, 3 * t.mem_bytes + i.mem_bytes, 0, 0);
+        let ceiling = Resources::new(
+            3 * t.cpu_milli + i.cpu_milli,
+            3 * t.mem_bytes + i.mem_bytes,
+            0,
+            0,
+        );
 
         // Submitted heavy-first (as `build_work_list` orders them in production).
         let mut items = vec![

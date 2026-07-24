@@ -122,10 +122,7 @@ mod tests {
 
     #[test]
     fn parses_all_display_values() {
-        assert_eq!(
-            "immediate".parse(),
-            Ok(TestOutputDisplay::Immediate)
-        );
+        assert_eq!("immediate".parse(), Ok(TestOutputDisplay::Immediate));
         assert_eq!(
             "immediate-final".parse(),
             Ok(TestOutputDisplay::ImmediateFinal)

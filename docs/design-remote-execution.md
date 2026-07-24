@@ -74,59 +74,61 @@ milliseconds. See [design-architecture.md](design-architecture.md).
 ## Linking: glibc-dynamic only
 
 `zingo` links `libstdc++` at runtime, so static musl is a non-starter; the
-glibc-dynamic path is mandatory. The compile builder and runner base both pin
-Debian `bookworm`, so a binary compiled in the builder links the identical
-glibc the runner base ships — no version matching to get wrong.
+glibc-dynamic path is mandatory. The compile stage (`rust:1.95.0-bookworm`) and
+the runtime stage (`debian:bookworm-slim`) both pin Debian `bookworm`, so a
+binary compiled in the toolchain image links the identical glibc the runtime
+image ships — no version matching to get wrong.
 
 ## On-cluster compilation
 
 On an OpenShift target the laptop ships **source** and the cluster produces the
 binaries; no compile runs on the laptop and no runner image is pushed per edit.
-
-**The builder.** `ztest setup` provisions a long-lived builder Deployment
-(`resource/impls/builder.rs`) running the on-cluster-built builder image
-(`docker/builder.Dockerfile`, `rust:1.95.0-bookworm` + compile deps). It idles
-(`sleep infinity`) with a persistent RWO cache PVC (`ztest-build-cache`)
-mounted at `/cache`, holding `CARGO_HOME`, `CARGO_TARGET_DIR`, and the synced
-`src/`, so a code change recompiles only what changed and the cache is shared
-across runs.
+The whole compile + assemble is one multi-stage `buildctl` build of
+`docker/runner.Dockerfile` in the ephemeral BuildKit pod `ztest run` creates for
+the run (see [the image-build section](#openshift-on-cluster-image-build-canonical)).
 
 **The drive** (`pipeline/remote_compile.rs`, selected by
 `image::builds_on_cluster()`):
 
-1. **Resolve + rsync source.** `cargo metadata` finds the workspace root and
-   every local (path) package; their common-ancestor directory is `oc rsync`'d
-   (delta) into `/cache/src`, excluding `target/` and `.git/`. `oc rsync` is
-   pinned to the kube client's `--context` (`ZTEST_KUBE_CONTEXT`), since `oc`
-   otherwise honours only the kubeconfig's current-context.
-2. **Compile + list.** `exec` `cargo nextest list --message-format=json` in the
-   pod; the JSON reuses `build::parse_list_summary`, so `binary_path`/`cwd` name
-   the pod's paths (`/cache/target/…`) — exactly what the baked-image pod runs.
-3. **Inventory dump.** `exec` each binary with `ZTEST_DUMP_INVENTORY=1`, reusing
-   `images::parse_inventory` + `images::assemble` (same dedup/edge logic as the
-   local path).
-4. **Bake.** `exec` `crane` to append the compiled binaries as one layer onto
-   the seeded runner base and push the runner image — pure registry blob
-   manipulation authenticated with the pod's SA token, so the compile builder
-   needs no build daemon or privileged posture. The tag is content-addressed on
-   the binaries' bytes.
+1. **Ship source.** `cargo metadata` finds the workspace root and every local
+   (path) package; the git repos backing them are enumerated with `git ls-files`
+   (so each repo's `.gitignore` prunes `target/` and VCS metadata, no
+   hand-maintained exclude list) and streamed as a local `tar` into the pod's
+   `tar -x` under `/build/ctx`, at their ancestor-relative paths. `oc rsync` is
+   avoided: the BuildKit image ships no `rsync`, and its tar fallback walks the
+   excluded `target/` trees instead of pruning them.
+2. **Build + push the runner image.** A `buildctl build --opt target=runner`
+   compiles the selected binaries (`cargo nextest run --no-run`, `compile`
+   stage), assembles the runtime image (`runner` stage), and pushes it — one
+   build, authenticated with the pod SA token. Cargo's registry/git and target
+   dirs are `--mount=type=cache` mounts persisted in the BuildKit content store
+   on the cache PVC, so recompiles are incremental across runs. The tag is
+   content-addressed on the run id.
+3. **Export the inventory.** A second `buildctl build --opt
+   target=inventory-export` (`FROM scratch`, carrying only `/out`) reuses the
+   first build's layer/mount cache — so the compile does not re-run — and emits
+   `list.json` (`cargo nextest list --json`) plus a framed `inventory.jsonl`
+   (each binary run under `ZTEST_DUMP_INVENTORY=1`). `--output type=local`
+   exports just those two files, `oc cp`'d back and parsed by the same
+   `build::parse_list_summary` / `images::parse_inventory` + `images::assemble`
+   the local path uses.
 
 Component `dev!` images and data seeds still provision through the resource
-graph (built on-cluster too); only the runner image comes prebaked. `ztest run`
-streams the builder's live stderr (`Compiling …`) and per-phase notes into
-scrollback.
+graph (built on-cluster too); only the runner image comes from this build.
+`ztest run` streams BuildKit's live progress and per-phase notes into scrollback.
 
-> **exec transport gotcha.** stdout and stderr are multiplexed over one
-> websocket, so `exec_streamed` must drain both concurrently. Reading stdout to
-> EOF then stderr deadlocks once a chatty compile fills the stderr channel:
-> stdout can't reach EOF until the stderr-blocked stream closes.
+> **exec transport gotcha.** On the non-PTY path stdout and stderr are
+> multiplexed over one websocket, so `exec_streamed` must drain both
+> concurrently. Reading stdout to EOF then stderr deadlocks once a chatty compile
+> fills the stderr channel: stdout can't reach EOF until the stderr-blocked
+> stream closes.
 
 ## OpenShift on-cluster image build (canonical)
 
 For a profile with distinct `push`/`pull` addresses (OpenShift), ztest builds
-every image on the cluster in a long-lived, ztest-owned privileged-in-userns
+every image on the cluster in an ephemeral, ztest-owned privileged-in-userns
 BuildKit pod (`ztest-buildkit`), not through OpenShift's Build subsystem. This
-covers `dev!` component images and the builder/runner base images alike.
+covers `dev!` component images and the runner image alike.
 
 Per image, during preflight:
 
@@ -205,20 +207,15 @@ a run-start `SelfSubjectAccessReview` self-check: a stale grant makes
 `build.openshift.io` grants — it only `exec`s into the BuildKit pod
 (`pods/exec`).
 
-### Base images
+### Runtime images
 
-The compile **builder** (`docker/builder.Dockerfile`, `rust:1.95.0-bookworm`)
-and the test-runner **base** (`docker/runner-base.Dockerfile`,
-`debian:bookworm-slim`) are built on the cluster by `ztest setup` through the
-same BuildKit-pod path (`resource::impls::base_images`). Both are stock Debian:
-the workspace links no rocksdb and no OpenSSL (rustls everywhere), only
-statically-linked C (ring, aws-lc-sys, zstd-sys), so the runner base is just
-glibc + CA roots.
-
-Each base is content-addressed on its Dockerfile bytes (`<repo>:d-<hash>`):
-edit a Dockerfile and the tag forks, so the next `ztest setup` rebuilds it and
-the digest pin re-rolls the builder Deployment; leave it unchanged and setup
-finds the tag present and skips.
+The runner build pulls its stage base images directly from upstream — the
+compile stage `FROM rust:1.95.0-bookworm`, the runtime stage
+`FROM debian:bookworm-slim` — so there are no ztest-built base images to
+provision at `ztest setup`. The runtime closure is just glibc + CA roots: the
+workspace links no rocksdb and no OpenSSL (rustls everywhere), only
+statically-linked C (ring, aws-lc-sys, zstd-sys). See
+`docker/runner.Dockerfile`.
 
 No fallback: the cluster profile names the backend, and if the on-cluster build
 fails the run fails — it never degrades to another build path.

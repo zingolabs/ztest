@@ -10,6 +10,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rand::rngs::OsRng;
@@ -54,6 +55,13 @@ const LABEL: &str = "librustzcash";
 /// zcash_client_backend blocks per download/scan batch during sync.
 const SYNC_BATCH_SIZE: u32 = 100;
 
+/// Bound TCP connection establishment to an indexer's gRPC endpoint. Applies to
+/// every `connect()` caller; only the connect handshake is bounded, so it never
+/// interferes with a long-running sync stream on the same channel. A fast-fail
+/// floor for a dead endpoint; the overall relay deadline is the caller's
+/// per-send `timeout`.
+const INDEXER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, OsRng>;
 
 /// Config ZST for the [`Wallet`](crate::component::Wallet) builder; produces a
@@ -63,6 +71,7 @@ pub struct LrzBackend;
 
 impl WalletConfig for LrzBackend {
     type Handle = LrzWallet;
+    type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, _plumbing: HandleInner) -> LrzWallet {
         // Wallets run in-process; the handle owns its own state, no plumbing.
@@ -153,6 +162,7 @@ async fn connect(
 ) -> Result<CompactTxStreamerClient<tonic::transport::Channel>, BoxError> {
     let channel = tonic::transport::Channel::from_shared(indexer_uri.to_string())
         .map_err(|e| format!("librustzcash: bad indexer uri {indexer_uri:?}: {e}"))?
+        .connect_timeout(INDEXER_CONNECT_TIMEOUT)
         .connect()
         .await
         .map_err(|e| format!("librustzcash: connect {indexer_uri}: {e}"))?;
@@ -182,26 +192,40 @@ fn raw_txs(db: &Db, txids: &[TxId]) -> Result<Vec<Vec<u8>>, BoxError> {
 /// `create_proposed_transactions` / `shield_transparent_funds` only sign and
 /// store the tx locally; without this relay it never reaches the mempool and
 /// the next mined block excludes it.
-async fn broadcast(indexer_uri: &str, raw_txs: Vec<Vec<u8>>) -> Result<(), BoxError> {
-    let mut client = connect(indexer_uri).await?;
-    for data in raw_txs {
-        let resp = client
-            .send_transaction(zcash_client_backend::proto::service::RawTransaction {
-                data,
-                height: 0,
-            })
-            .await
-            .map_err(|e| format!("librustzcash: send_transaction: {e}"))?
-            .into_inner();
-        if resp.error_code != 0 {
-            return Err(format!(
-                "librustzcash: indexer rejected tx: code {} — {}",
-                resp.error_code, resp.error_message
-            )
-            .into());
+async fn broadcast(
+    indexer_uri: &str,
+    raw_txs: Vec<Vec<u8>>,
+    timeout: Duration,
+) -> Result<(), BoxError> {
+    let relay = async move {
+        let mut client = connect(indexer_uri).await?;
+        for data in raw_txs {
+            let resp = client
+                .send_transaction(zcash_client_backend::proto::service::RawTransaction {
+                    data,
+                    height: 0,
+                })
+                .await
+                .map_err(|e| format!("librustzcash: send_transaction: {e}"))?
+                .into_inner();
+            if resp.error_code != 0 {
+                return Err(format!(
+                    "librustzcash: indexer rejected tx: code {} — {}",
+                    resp.error_code, resp.error_message
+                )
+                .into());
+            }
         }
+        Ok::<(), BoxError>(())
+    };
+    match tokio::time::timeout(timeout, relay).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "librustzcash: send relay: no response within {timeout:?} \
+             (indexer likely cannot reach its backing node)"
+        )
+        .into()),
     }
-    Ok(())
 }
 
 #[async_trait]
@@ -344,7 +368,13 @@ impl WalletBackend for LrzWallet {
         Ok(())
     }
 
-    async fn send(&self, from: AccountId, to: &str, zats: u64) -> Result<Vec<TxId>, BoxError> {
+    async fn send(
+        &self,
+        from: AccountId,
+        to: &str,
+        zats: u64,
+        timeout: Duration,
+    ) -> Result<Vec<TxId>, BoxError> {
         let acct = self.account(from)?;
         let to_addr = Address::decode(&acct.params, to)
             .ok_or_else(|| format!("librustzcash: bad recipient address {to:?}"))?;
@@ -395,11 +425,11 @@ impl WalletBackend for LrzWallet {
         // broadcasting.
         let raw = raw_txs(&db, &txids)?;
         drop(db);
-        broadcast(&acct.indexer_uri, raw).await?;
+        broadcast(&acct.indexer_uri, raw, timeout).await?;
         Ok(txids)
     }
 
-    async fn shield(&self, account: AccountId) -> Result<Vec<TxId>, BoxError> {
+    async fn shield(&self, account: AccountId, timeout: Duration) -> Result<Vec<TxId>, BoxError> {
         let acct = self.account(account)?;
         let policy =
             ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false);
@@ -437,7 +467,7 @@ impl WalletBackend for LrzWallet {
         // broadcasting.
         let raw = raw_txs(&db, &txids)?;
         drop(db);
-        broadcast(&acct.indexer_uri, raw).await?;
+        broadcast(&acct.indexer_uri, raw, timeout).await?;
         Ok(txids)
     }
 }
@@ -462,7 +492,7 @@ impl BlockSource for MemBlockCache {
     where
         F: FnMut(CompactBlock) -> Result<(), ChainError<WalletErrT, Self::Error>>,
     {
-        let from = from_height.map(|h| u64::from(h)).unwrap_or(0);
+        let from = from_height.map(u64::from).unwrap_or(0);
         let blocks = self.blocks.lock().expect("mem block cache poisoned");
         for (_, block) in blocks.range(from..).take(limit.unwrap_or(usize::MAX)) {
             with_block(block.clone())?;

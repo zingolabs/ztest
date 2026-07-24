@@ -513,7 +513,11 @@ pub(crate) fn render_running(running: &[RunningView], max_rows: usize, color: bo
 
     // Reserve the last row for an overflow summary when the set doesn't fit.
     let overflow = running.len() > max_rows;
-    let shown = if overflow { max_rows - 1 } else { running.len() };
+    let shown = if overflow {
+        max_rows - 1
+    } else {
+        running.len()
+    };
 
     let mut content: Vec<String> = running[..shown]
         .iter()
@@ -1036,7 +1040,11 @@ mod tests {
         // One running test under a 4-row ceiling → one line, no blank padding.
         let r = vec![running("pkg::b", "mod::a", 5, false)];
         let lines = render_running(&r, 4, false);
-        assert_eq!(lines.len(), 1, "as tall as content, not padded to `max_rows`");
+        assert_eq!(
+            lines.len(),
+            1,
+            "as tall as content, not padded to `max_rows`"
+        );
         assert_eq!(
             lines[0], "             [ 00:00:05] pkg::b mod::a",
             "{:?}",

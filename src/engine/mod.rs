@@ -33,6 +33,7 @@ use crate::pipeline::SelectedBinary;
 use crate::preflight::{Theme, render_live_panel};
 use crate::qos::Resources;
 use crate::qos::schedule::QosPlan;
+use crate::resource::impls::policy::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
 
 /// Run-behavior options (parsed from `ztest run` flags).
 #[derive(Debug, Clone)]
@@ -84,6 +85,11 @@ pub struct EngineInput<'a> {
     pub image_refs: std::collections::BTreeMap<String, String>,
     /// Run-behavior options.
     pub opts: EngineOpts,
+    /// Live cross-run capacity channels from the
+    /// [`CapacityGovernor`](crate::qos::governor::CapacityGovernor): the ceiling
+    /// the scheduler reconciles from and the demand sink it feeds. `None` for
+    /// local runs and tests, where the ceiling stays at its seed.
+    pub capacity: Option<crate::engine::schedule::CapacityChannels>,
 }
 
 /// Run the engine to completion and map the result to a `NextestExitCode`. With
@@ -110,6 +116,9 @@ pub(crate) fn run(
         sa: input.opts.sa.clone(),
         no_cleanup: input.opts.no_cleanup,
         capture: input.opts.output.captures(),
+        ztest_log: std::env::var("ZTEST_LOG")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
     };
     let executor = match select_executor(work_rt, &input, env) {
         Ok(e) => e,
@@ -117,6 +126,10 @@ pub(crate) fn run(
             eprintln!("ztest engine: {e}");
             return ExitCode::from(NextestExitCode::SETUP_ERROR as u8);
         }
+    };
+    let (cap_rx, demand_tx) = match input.capacity {
+        Some(c) => (Some(c.ceiling_rx), Some(c.demand_tx)),
+        None => (None, None),
     };
     let cfg = LoopConfig {
         fail_fast: input.opts.fail_fast,
@@ -131,6 +144,8 @@ pub(crate) fn run(
         // `--no-capture` serializes the run (nextest's `test_threads = 1`
         // coupling) so streamed output doesn't interleave.
         max_inflight: input.opts.output.is_serial().then_some(1),
+        cap_rx,
+        demand_tx,
     };
     let ceiling = input.ceiling;
     let output = input.opts.output;
@@ -138,13 +153,25 @@ pub(crate) fn run(
     // A capturing TTY run hands the terminal to the render thread, so diagnostics
     // go to a per-run file (surfaced for `tail -f`) rather than tearing the panel;
     // otherwise they write to stderr like nextest.
-    let log_path = std::path::Path::new(input.summary.rust_build_meta.target_directory.as_str())
-        .join("ztest")
+    //
+    // The file MUST be a local, writable path. The build summary's
+    // `target_directory` is unusable here: on the on-cluster path it is the
+    // builder pod's `CARGO_TARGET_DIR=/cache/target`, absent on the laptop, so
+    // opening the log there fails and the subscriber falls back to stderr —
+    // which then spews `ztest::pod` events onto the terminal and desyncs the
+    // pinned footer. The local temp dir always exists and is writable.
+    let log_path = std::env::temp_dir()
+        .join("ztest-logs")
         .join(format!("{}.log", input.opts.run_id));
     match console {
-        Some(_) if output.captures() => {
+        Some(c) if output.captures() => {
             crate::observ::init(crate::observ::Sink::File(log_path.clone()));
-            eprintln!("ztest: diagnostics → {} (filter via ZTEST_LOG)", log_path.display());
+            // Through the console, never a raw `eprintln!`: a direct stderr write
+            // here would corrupt the very panel this File sink exists to protect.
+            c.scrollback(format!(
+                "ztest: diagnostics → {} (filter via ZTEST_LOG)\n",
+                log_path.display()
+            ));
         }
         _ => crate::observ::init(crate::observ::Sink::Stderr),
     }
@@ -152,9 +179,9 @@ pub(crate) fn run(
     // `--no-capture` streams output live and serially; the pinned TTY panel can't
     // coexist, so even on a terminal it takes the plain inherited path.
     let stats = match console {
-        Some(c) if output.captures() => {
-            run_tty(work_rt, items, ceiling, cfg, executor, c, theme, qos_plan, output)
-        }
+        Some(c) if output.captures() => run_tty(
+            work_rt, items, ceiling, cfg, executor, c, theme, qos_plan, output,
+        ),
         _ => run_inherited(work_rt, items, ceiling, cfg, executor, output),
     };
 
@@ -320,12 +347,13 @@ fn select_executor(
     // `ztest setup` provisions the `ztest` namespace + SA with the RBAC a
     // component-spawning in-pod test needs, so running the runner pod as that
     // identity requires no extra grants. The right default; overridable.
-    let namespace = std::env::var("ZTEST_RUNNER_NAMESPACE").unwrap_or_else(|_| "ztest".into());
+    let namespace =
+        std::env::var("ZTEST_RUNNER_NAMESPACE").unwrap_or_else(|_| RUN_NAMESPACE.to_string());
     let service_account = Some(
         std::env::var("ZTEST_RUNNER_SA")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "ztest".into()),
+            .unwrap_or_else(|| RUN_SERVICE_ACCOUNT.to_string()),
     );
 
     let client = work_rt

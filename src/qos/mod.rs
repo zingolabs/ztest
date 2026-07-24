@@ -11,6 +11,7 @@
 //! profile table). Callers resolve a class to a [`QosProfile`] and hand the
 //! scheduler an explicit [`scheduler::Request`], decoupling it from the table.
 
+pub mod governor;
 pub mod ledger;
 pub mod live;
 pub mod schedule;
@@ -188,6 +189,17 @@ impl Resources {
         }
     }
 
+    /// Dimension-wise minimum. The tighter of two per-dimension bounds — e.g. a
+    /// reservation capped by both an SA budget and live headroom.
+    pub fn min(&self, other: &Resources) -> Resources {
+        Resources {
+            cpu_milli: self.cpu_milli.min(other.cpu_milli),
+            mem_bytes: self.mem_bytes.min(other.mem_bytes),
+            io_bps: self.io_bps.min(other.io_bps),
+            io_iops: self.io_iops.min(other.io_iops),
+        }
+    }
+
     /// Guard for any footprint about to size a real pod: a zero-CPU or
     /// zero-memory reserve renders a container k8s treats as BestEffort (the
     /// class this harness forbids), so panic rather than emit it. `ctx` names
@@ -218,29 +230,39 @@ impl Resources {
     }
 }
 
-/// Footprints for the long-lived on-cluster build infrastructure pods and the
-/// ephemeral seed uploader, in the QoS [`Resources`] model so they share its
-/// units, whole-core rendering, and the Guaranteed invariant with the tier pods.
-///
-/// The build-server and compile builder ship at their `*_REST` size and resize
-/// in place to `*_BUILD` for a build, then shrink back. Never statically pinned:
-/// a pod holding exclusive cores under the static CPU-manager policy cannot be
-/// resized in place.
+/// A footprint's CPU / memory in exact tier units (`3c / 3 GiB`, `500m / 512
+/// MiB`). The I/O dimensions are omitted: they are `0` pending calibration and
+/// carry no signal in a human summary.
+impl std::fmt::Display for Resources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cpu = if self.cpu_milli != 0 && self.cpu_milli.is_multiple_of(1000) {
+            format!("{}c", self.cpu_milli / 1000)
+        } else {
+            format!("{}m", self.cpu_milli)
+        };
+        let mem = if self.mem_bytes != 0 && self.mem_bytes.is_multiple_of(GIB) {
+            format!("{} GiB", self.mem_bytes / GIB)
+        } else {
+            format!("{} MiB", self.mem_bytes / MIB)
+        };
+        write!(f, "{cpu} / {mem}")
+    }
+}
+
+/// Footprints for the ephemeral on-cluster build pods (the BuildKit build pod and
+/// the seed uploader), in the QoS [`Resources`] model so they share its units,
+/// whole-core rendering, and the Guaranteed invariant with the tier pods. Each is
+/// created at its footprint for one job and deleted after — no idle reservation
+/// and no in-place resize.
 pub mod build {
     use super::{GIB, MIB, Resources};
 
-    /// Idle buildkit daemon: enough to serve `buildctl debug workers` and hold
-    /// the content store open, no more.
-    pub const BUILDKIT_REST: Resources = Resources::new(1_000, 500 * MIB, 0, 0);
-    /// buildkit grown for a build: memory is the Guaranteed hard cap and must
-    /// clear the heaviest layer step's peak or the build OOMs, yet stay under
-    /// actuatable node headroom or the kubelet defers the grow forever. Polled
-    /// to actuation before the build starts (`build_scale::grow_to`).
-    pub const BUILDKIT_BUILD: Resources = Resources::new(32_000, 20 * GIB, 0, 0);
-    /// Idle compile builder (`sleep infinity` with the cache PVC mounted).
-    pub const BUILDER_REST: Resources = Resources::new(1_000, 500 * MIB, 0, 0);
-    /// Builder grown for a `cargo` compile: memory must clear the link-step peak.
-    pub const BUILDER_BUILD: Resources = Resources::new(16_000, 12 * GIB, 0, 0);
+    /// The ephemeral BuildKit build pod's Guaranteed footprint. It is created at
+    /// this size for a build and deleted after (no idle/rest reservation), so the
+    /// memory need only clear the heaviest layer step's peak while staying under
+    /// actuatable node headroom. The compile (folded into the buildkit Dockerfile
+    /// build) links the workspace here.
+    pub const BUILDKIT_BUILD: Resources = Resources::new(16_000, 24 * GIB, 0, 0);
     /// The ephemeral seed-uploader pod: a trivial `sh` streaming seed bytes into
     /// a PVC. A small fixed Guaranteed reserve so it is never BestEffort.
     pub const UPLOADER: Resources = Resources::new(1_000, 256 * MIB, 0, 0);
@@ -332,10 +354,14 @@ pub enum QosClass {
 /// stays decoupled from the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QosProfile {
-    /// The component-pod aggregate reserve: split (`even_share`) across the
-    /// validator/indexer pods the test spawns as the default `requests == limits`
-    /// and the size of the per-test namespace's `ResourceQuota`. Excludes the
-    /// runner pod (separate namespace); the whole reserve is [`admitted`](Self::admitted).
+    /// The component-pod aggregate reserve *and ceiling*: divided across the
+    /// validator/indexer pods the test spawns — one whole core each
+    /// (`per_pod_share`/`even_share`) — as the default `requests == limits` and
+    /// the size of the per-test namespace's `ResourceQuota`. Its core count is
+    /// the maximum number of component pods the tier admits (each pod takes a
+    /// whole core, floored), so `pods × per-pod ≤ footprint` always holds and the
+    /// deploy never exceeds what the scheduler reserved. Excludes the runner pod
+    /// (separate namespace); the whole reserve is [`admitted`](Self::admitted).
     pub footprint: Resources,
     /// The runner pod's own Guaranteed reserve, distinct from
     /// [`footprint`](Self::footprint). The runner runs the test binary and any
@@ -414,7 +440,11 @@ impl QosClass {
                 hard_cap: Duration::from_secs(10 * 60),
             },
             QosClass::Integration => QosProfile {
-                footprint: Resources::new(2_000, 2 * GIB, 0, 0),
+                // 3 component cores / 3 GiB: one whole core + 1 GiB per pod for
+                // the up-to-3-pod zaino topology (zebrad + zaino-fetch +
+                // zaino-state). The core count is the max component pods the tier
+                // admits; each pod deploys exactly one core (`per_pod_share`).
+                footprint: Resources::new(3_000, 3 * GIB, 0, 0),
                 runner: Resources::new(1_000, GIB, 0, 0),
                 pool: Pool::General,
                 priority: 2,
@@ -468,6 +498,19 @@ mod tests {
 
     // Resources: the 4-D packing primitive (CPU × memory × disk-bandwidth ×
     // disk-IOPS). Every dimension gates and arithmetic is exact per dimension.
+
+    #[test]
+    fn display_renders_whole_and_fractional_units() {
+        assert_eq!(
+            Resources::new(3_000, 3 * GIB, 0, 0).to_string(),
+            "3c / 3 GiB"
+        );
+        assert_eq!(
+            Resources::new(500, 512 * MIB, 0, 0).to_string(),
+            "500m / 512 MiB"
+        );
+        assert_eq!(Resources::ZERO.to_string(), "0m / 0 MiB");
+    }
 
     #[test]
     fn fits_within_requires_every_dimension() {
@@ -633,16 +676,12 @@ mod tests {
         // BestEffort/unschedulable). Guards the runner reserves and the build
         // infra footprints as a set.
         for c in ALL_TIERS {
-            c.profile().footprint.assert_pod_schedulable("tier footprint");
+            c.profile()
+                .footprint
+                .assert_pod_schedulable("tier footprint");
             c.profile().runner.assert_pod_schedulable("tier runner");
         }
-        for fp in [
-            build::BUILDKIT_REST,
-            build::BUILDKIT_BUILD,
-            build::BUILDER_REST,
-            build::BUILDER_BUILD,
-            build::UPLOADER,
-        ] {
+        for fp in [build::BUILDKIT_BUILD, build::UPLOADER] {
             fp.assert_pod_schedulable("build pod footprint");
         }
     }

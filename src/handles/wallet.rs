@@ -16,7 +16,6 @@ use crate::RpcError;
 use crate::handles::HandleInner;
 use crate::handles::indexer::IndexerBackend;
 use crate::handles::validator::ValidatorBackend;
-use crate::topology::NetworkUpgrade;
 
 /// Boxed error reported by a [`WalletBackend`] method. Third-party backends
 /// can't construct ztest's `pub(crate)` `RpcError` variants, so they report a
@@ -89,22 +88,25 @@ pub struct AccountSpec<'a> {
 
 /// The config ZST handed to the [`Wallet`](crate::component::Wallet) builder
 /// (e.g. `ZingoBackend`). A factory for the live handle (wallets carry no
-/// pod-config), plus the NU ceiling.
+/// pod-config).
 pub trait WalletConfig: Send + Sync + std::fmt::Debug + 'static {
     /// The live handle type this backend produces.
     type Handle: WalletBackend + Clone;
 
+    /// Backend-specific tuning tokens (see [`ComponentBuilder::tuning`]).
+    /// [`NoTuning`](crate::component::NoTuning) for wallets with no knobs.
+    type Tuning: Clone + std::fmt::Debug + Send + Sync + 'static;
+
     /// Build the runtime handle. Wallets have no pod, so `plumbing` is usually
     /// ignored; the handle owns its in-process state.
     fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
-
-    /// Highest NU this wallet pin can speak. `None` opts out of the topology
-    /// resolver (the common case: a wallet imposes no ceiling).
-    fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
-        let _ = version;
-        None
-    }
 }
+
+/// Default relay bound for [`Account::send`] / [`Account::shield`]. Generous
+/// enough never to trip a healthy regtest relay, tight enough that a wedged
+/// indexer→backing-node link surfaces as a timeout rather than a multi-minute
+/// apparent hang. Override per call with the `*_with_timeout` variants.
+pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ──────────────────────────── WalletBackend ───────────────────────────
 
@@ -129,10 +131,22 @@ pub trait WalletBackend: Send + Sync + std::fmt::Debug + Clone + 'static {
     async fn sync(&self, account: AccountId) -> Result<(), BoxError>;
 
     /// Send `zats` from `account` to address `to`. Returns the txid(s).
-    async fn send(&self, from: AccountId, to: &str, zats: u64) -> Result<Vec<TxId>, BoxError>;
+    ///
+    /// `timeout` bounds the network relay of the signed transaction to the
+    /// indexer, so a wedged indexer→backing-node link surfaces as a timeout
+    /// error instead of an apparent hang. A backend that cannot isolate the
+    /// relay bounds the whole send.
+    async fn send(
+        &self,
+        from: AccountId,
+        to: &str,
+        zats: u64,
+        timeout: Duration,
+    ) -> Result<Vec<TxId>, BoxError>;
 
-    /// Shield `account`'s transparent funds into its shielded pool.
-    async fn shield(&self, account: AccountId) -> Result<Vec<TxId>, BoxError>;
+    /// Shield `account`'s transparent funds into its shielded pool. `timeout`
+    /// bounds the relay as in [`send`](Self::send).
+    async fn shield(&self, account: AccountId, timeout: Duration) -> Result<Vec<TxId>, BoxError>;
 }
 
 // ──────────────────────────────── account ─────────────────────────────
@@ -184,18 +198,36 @@ impl<W: WalletBackend> Account<W> {
             .map_err(|e| RpcError::backend_boxed(self.label, "sync", e))
     }
 
-    /// Send `zats` to address `to`.
+    /// Send `zats` to address `to`, bounding the indexer relay by
+    /// [`DEFAULT_SEND_TIMEOUT`]. Use [`send_with_timeout`](Self::send_with_timeout)
+    /// to override.
     pub async fn send(&self, to: &str, zats: u64) -> Result<Vec<TxId>, RpcError> {
+        self.send_with_timeout(to, zats, DEFAULT_SEND_TIMEOUT).await
+    }
+
+    /// Send `zats` to address `to`, bounding the indexer relay by `timeout`.
+    pub async fn send_with_timeout(
+        &self,
+        to: &str,
+        zats: u64,
+        timeout: Duration,
+    ) -> Result<Vec<TxId>, RpcError> {
         self.wallet
-            .send(self.id, to, zats)
+            .send(self.id, to, zats, timeout)
             .await
             .map_err(|e| RpcError::backend_boxed(self.label, "send", e))
     }
 
-    /// Shield this account's transparent funds into its shielded pool.
+    /// Shield this account's transparent funds into its shielded pool, bounding
+    /// the indexer relay by [`DEFAULT_SEND_TIMEOUT`].
     pub async fn shield(&self) -> Result<Vec<TxId>, RpcError> {
+        self.shield_with_timeout(DEFAULT_SEND_TIMEOUT).await
+    }
+
+    /// Shield this account's transparent funds, bounding the relay by `timeout`.
+    pub async fn shield_with_timeout(&self, timeout: Duration) -> Result<Vec<TxId>, RpcError> {
         self.wallet
-            .shield(self.id)
+            .shield(self.id, timeout)
             .await
             .map_err(|e| RpcError::backend_boxed(self.label, "shield", e))
     }

@@ -166,7 +166,9 @@ impl Profile {
             }
             ImageBackend::Registry => {
                 if self.push.is_none() {
-                    return Err("a `registry` profile needs a push address (--registry)".to_string());
+                    return Err(
+                        "a `registry` profile needs a push address (--registry)".to_string()
+                    );
                 }
                 if self.kind_cluster.is_some() {
                     return Err("a profile sets either a registry or --kind, not both".to_string());
@@ -557,7 +559,7 @@ fn verify_context(context: &str) -> Result<(), String> {
         .iter()
         .map(|c| c.name.as_str())
         .collect();
-    if known.iter().any(|n| *n == context) {
+    if known.contains(&context) {
         return Ok(());
     }
     Err(format!(

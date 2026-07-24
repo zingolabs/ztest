@@ -102,9 +102,8 @@ pub mod ports {
     pub const ZEBRAD_METRICS: u16 = 9999;
     pub const ZEBRAD_P2P: u16 = 18233;
     /// zebrad's indexer gRPC (`rpc.indexer_listen_addr`). Only served when a
-    /// validator is configured for shared-state via
-    /// `Validator::persistent_state_in`; consumed by a colocated zaino
-    /// StateService for non-finalized-state sync.
+    /// validator shares its state DB (a `Shared`-volume `.mount(&vol)`);
+    /// consumed by a colocated zaino StateService for non-finalized-state sync.
     pub const ZEBRAD_INDEXER: u16 = 18230;
     pub const ZCASHD_RPC: u16 = 28232;
     pub const ZAINO_GRPC: u16 = 8137;

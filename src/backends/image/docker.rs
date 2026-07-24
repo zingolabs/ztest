@@ -130,7 +130,7 @@ pub(crate) fn docker_push_argv(reference: &str) -> Vec<String> {
 /// push reference, reading the bearer token and CA from the same kubeconfig
 /// (`KUBECONFIG` / `ZTEST_KUBE_CONTEXT`) that authenticates the kube client.
 fn internal_push_target(push_reference: String) -> Result<Target, String> {
-    let context = std::env::var("ZTEST_KUBE_CONTEXT")
+    let context = std::env::var(crate::cluster_config::KUBE_CONTEXT_ENV)
         .ok()
         .filter(|s| !s.is_empty());
     let kubeconfig = std::env::var_os("KUBECONFIG").map(std::path::PathBuf::from);
@@ -314,30 +314,6 @@ impl Session {
             .map_err(|e| OciError::Http(format!("HEAD manifest: {e}")))?;
         Ok(resp.status().is_success())
     }
-
-    /// The immutable `sha256:…` a tag currently resolves to, from the
-    /// `Docker-Content-Digest` response header (OpenShift's registry is
-    /// distribution-based and always sets it on a manifest HEAD). `None` if the
-    /// tag does not resolve or the header is absent.
-    async fn manifest_digest(&self) -> Result<Option<String>, OciError> {
-        let resp = self
-            .auth(
-                self.client
-                    .head(self.manifest_url())
-                    .header(reqwest::header::ACCEPT, MANIFEST_ACCEPT),
-            )
-            .send()
-            .await
-            .map_err(|e| OciError::Http(format!("HEAD manifest: {e}")))?;
-        if !resp.status().is_success() {
-            return Ok(None);
-        }
-        Ok(resp
-            .headers()
-            .get("docker-content-digest")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string))
-    }
 }
 
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json,\
@@ -358,20 +334,6 @@ pub(crate) async fn openshift_manifest_present(push_reference: String) -> bool {
         Ok(target) => manifest_exists(&target).await.unwrap_or(false),
         Err(_) => false,
     }
-}
-
-/// Resolve a push-reference tag to the immutable `sha256:…` digest it currently
-/// points at, reading the token+CA from the kubeconfig. Used to pin a deployment
-/// by digest instead of a mutable `:dev` tag. `None` if the tag does not resolve.
-pub(crate) async fn openshift_manifest_digest(push_reference: String) -> Option<String> {
-    let target = internal_push_target(push_reference).ok()?;
-    Session::open(&target)
-        .await
-        .ok()?
-        .manifest_digest()
-        .await
-        .ok()
-        .flatten()
 }
 
 /// A parsed `WWW-Authenticate: Bearer realm=..,service=..` challenge.

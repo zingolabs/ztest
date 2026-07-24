@@ -86,20 +86,31 @@ fn collect(context: &Path, ignore: &Ignore) -> Result<Vec<Entry>, ImageError> {
         if ignore.excludes(rel, entry.file_type().is_dir()) {
             continue;
         }
-        let path = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        let path = rel
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         let file_type = entry.file_type();
 
         if file_type.is_dir() {
-            entries.push(Entry { path, kind: Kind::Dir });
+            entries.push(Entry {
+                path,
+                kind: Kind::Dir,
+            });
         } else if file_type.is_file() {
-            entries.push(Entry { path, kind: Kind::File(read(entry.path())?) });
+            entries.push(Entry {
+                path,
+                kind: Kind::File(read(entry.path())?),
+            });
         } else if file_type.is_symlink() {
             // A symlink to a regular file is inlined at the link's own path;
             // anything else (broken, or a link to a dir/device) is dropped, so a
             // stale symlink can never abort the build.
             match std::fs::metadata(entry.path()) {
                 Ok(target) if target.is_file() => {
-                    entries.push(Entry { path, kind: Kind::File(read(entry.path())?) });
+                    entries.push(Entry {
+                        path,
+                        kind: Kind::File(read(entry.path())?),
+                    });
                 }
                 Ok(_) => tracing::debug!(link = %path, "bundle: skipping symlink to non-file"),
                 Err(_) => tracing::debug!(link = %path, "bundle: skipping broken symlink"),
@@ -226,7 +237,11 @@ impl Pattern {
             .build()
             .ok()?
             .compile_matcher();
-        Some(Pattern { matcher, negated, dir_only })
+        Some(Pattern {
+            matcher,
+            negated,
+            dir_only,
+        })
     }
 
     fn matches(&self, rel: &Path, is_dir: bool) -> bool {
@@ -340,7 +355,10 @@ mod tests {
     #[test]
     fn dockerignore_semantics() {
         let c = Ctx::new();
-        c.write(".dockerignore", b"*.log\n**/*.tmp\nbuild/\n!build/keep\nresult\n");
+        c.write(
+            ".dockerignore",
+            b"*.log\n**/*.tmp\nbuild/\n!build/keep\nresult\n",
+        );
         c.write("app.log", b"x"); // *.log at root → excluded
         c.write("logs/deep.log", b"x"); // *.log does not cross `/` → kept
         c.write("a/b/c.tmp", b"x"); // **/*.tmp → excluded at depth
@@ -353,8 +371,10 @@ mod tests {
         let has = |p: &str| paths.contains(&p.to_string());
         assert!(has("keep.rs") && has("logs/deep.log"));
         assert!(has("build/keep"), "negation must re-include: {paths:?}");
-        assert!(!has("app.log") && !has("a/b/c.tmp") && !has("build/out") && !has("result"),
-            "{paths:?}");
+        assert!(
+            !has("app.log") && !has("a/b/c.tmp") && !has("build/out") && !has("result"),
+            "{paths:?}"
+        );
     }
 
     /// The Dockerfile is immune to `.dockerignore`, and ztest's staged copy wins

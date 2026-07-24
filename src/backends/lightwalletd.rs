@@ -21,7 +21,6 @@ use zcash_protocol::value::ZatBalance;
 use crate::handles::HandleInner;
 use crate::handles::client::JsonRpcClient;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
-use crate::topology::NetworkUpgrade;
 use crate::{Endpoint, EnvError, RpcError};
 
 const COMPONENT: &str = "lightwalletd";
@@ -52,14 +51,10 @@ pub struct LightwalletdBackend;
 
 impl IndexerConfig for LightwalletdBackend {
     type Handle = LightwalletdIndexer;
+    type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, plumbing: HandleInner) -> LightwalletdIndexer {
         LightwalletdIndexer { plumbing }
-    }
-
-    fn nu_ceiling(&self, _version: &str) -> Option<NetworkUpgrade> {
-        // Lightwalletd doesn't decode NUs, so it imposes no ceiling.
-        Some(NetworkUpgrade::HIGHEST)
     }
 }
 

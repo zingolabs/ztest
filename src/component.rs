@@ -23,6 +23,32 @@ pub enum ComponentCategory {
 pub struct Validator<B: ValidatorConfig> {
     pub(crate) backend: B,
     pub(crate) opts: ComponentOpts,
+    pub(crate) tunings: Vec<B::Tuning>,
+}
+
+/// The tuning token for a backend that has no configurable knobs. An
+/// uninhabited enum: [`ComponentBuilder::tuning`] exists uniformly on every
+/// component, but a backend whose `Tuning` is `NoTuning` can never be handed
+/// one — a wrong call is a compile error, not a runtime no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoTuning {}
+
+/// The network fixture an indexer runs against. Orthogonal to the backend
+/// [`tuning`](ComponentBuilder::tuning): the mode picks which `zainod.toml` is
+/// rendered at build time, the tunings pick knobs inside it. Set by the
+/// [`Regtest`](crate::regtest::Regtest) / [`Testnet`](crate::regtest::Testnet)
+/// builder methods. `None` means no fixture (config supplied manually).
+///
+/// `Testnet` / `Mainnet` name a curated snapshot under
+/// `fixtures/<net>/<variant>/`. `Regtest` carries no variant: it mines its own
+/// chain in-process rather than loading a snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum IndexerMode {
+    #[default]
+    None,
+    Regtest,
+    Testnet(String),
+    Mainnet(String),
 }
 
 /// An indexer component, generic in its backend.
@@ -30,9 +56,12 @@ pub struct Validator<B: ValidatorConfig> {
 pub struct Indexer<B: IndexerConfig> {
     pub(crate) backend: B,
     pub(crate) opts: ComponentOpts,
-    /// Picks the `backend =` line in zaino's rendered TOML; ignored by other
-    /// backends. Set by `.regtest()` / `.regtest_state()`.
-    pub(crate) regtest_backend: Option<crate::testnet_conf::ZainodBackend>,
+    /// Backend tuning tokens (e.g. [`ZainoTuning`](crate::testnet_conf::ZainoTuning)),
+    /// applied by the backend at materialize time. Set via
+    /// [`ComponentBuilder::tuning`].
+    pub(crate) tunings: Vec<B::Tuning>,
+    /// Network fixture; drives which config is materialized at build time.
+    pub(crate) mode: IndexerMode,
 }
 
 /// A wallet component, generic in its backend.
@@ -40,6 +69,7 @@ pub struct Indexer<B: IndexerConfig> {
 pub struct Wallet<B: WalletConfig> {
     pub(crate) backend: B,
     pub(crate) opts: ComponentOpts,
+    pub(crate) tunings: Vec<B::Tuning>,
 }
 
 /// Configuration shared by every component variant. Construct externally via
@@ -57,7 +87,8 @@ pub struct ComponentOpts {
     pub(crate) args: Option<Vec<String>>,
     /// Container environment variables, in declaration order.
     pub(crate) env: Vec<(String, String)>,
-    pub(crate) regtest_mode: Option<RegtestMode>,
+    /// Whether this component is configured for regtest (set by `.regtest()`).
+    pub(crate) regtest: bool,
     pub(crate) peers: Vec<String>,
     pub(crate) funding_streams: Option<crate::regtest::FundingStreams>,
     pub(crate) lockbox_disbursements: Option<Vec<crate::regtest::LockboxDisbursement>>,
@@ -96,13 +127,6 @@ pub struct SharedState {
     /// In-pod path the shared PVC is mounted at. The PVC itself is wired in as a
     /// `Mount::shared` at builder time, so only the path rides along here.
     pub(crate) mount_path: String,
-}
-
-/// How a component should be configured for regtest.
-#[derive(Debug, Clone)]
-pub enum RegtestMode {
-    Default,
-    ActivateThrough(crate::topology::NetworkUpgrade),
 }
 
 /// Kubernetes container resource requests, rendered into the pod spec's
@@ -178,6 +202,7 @@ impl Validator<ZebraBackend> {
         Self {
             backend: ZebraBackend,
             opts: opts_for(&version.into(), "zebrad"),
+            tunings: Vec::new(),
         }
     }
     /// A zebrad built from a local Dockerfile or a pinned git rev (see the
@@ -193,6 +218,7 @@ impl Validator<ZebraBackend> {
         Self {
             backend: ZebraBackend,
             opts: opts_dev(source, version.into(), features, "zebrad"),
+            tunings: Vec::new(),
         }
     }
 }
@@ -202,6 +228,7 @@ impl Validator<ZcashdBackend> {
         Self {
             backend: ZcashdBackend,
             opts: opts_for(&version.into(), "zcashd"),
+            tunings: Vec::new(),
         }
     }
     #[doc(hidden)]
@@ -213,6 +240,7 @@ impl Validator<ZcashdBackend> {
         Self {
             backend: ZcashdBackend,
             opts: opts_dev(source, version.into(), features, "zcashd"),
+            tunings: Vec::new(),
         }
     }
 }
@@ -220,7 +248,11 @@ impl Validator<ZcashdBackend> {
 impl<B: ValidatorConfig> Validator<B> {
     /// Construct from a third-party backend impl.
     pub fn custom(backend: B, opts: ComponentOpts) -> Self {
-        Self { backend, opts }
+        Self {
+            backend,
+            opts,
+            tunings: Vec::new(),
+        }
     }
 }
 
@@ -229,9 +261,11 @@ impl Indexer<ZainoBackend> {
         Self {
             backend: ZainoBackend,
             opts: opts_for(&version.into(), "zainod"),
-            regtest_backend: None,
+            tunings: Vec::new(),
+            mode: IndexerMode::None,
         }
     }
+
     #[doc(hidden)]
     pub fn zainod_dev(
         source: crate::backends::image::DevSource,
@@ -241,7 +275,8 @@ impl Indexer<ZainoBackend> {
         Self {
             backend: ZainoBackend,
             opts: opts_dev(source, version.into(), features, "zainod"),
-            regtest_backend: None,
+            tunings: Vec::new(),
+            mode: IndexerMode::None,
         }
     }
 }
@@ -251,7 +286,8 @@ impl Indexer<LightwalletdBackend> {
         Self {
             backend: LightwalletdBackend,
             opts: opts_for(&version.into(), "lightwalletd"),
-            regtest_backend: None,
+            tunings: Vec::new(),
+            mode: IndexerMode::None,
         }
     }
 }
@@ -261,7 +297,8 @@ impl<B: IndexerConfig> Indexer<B> {
         Self {
             backend,
             opts,
-            regtest_backend: None,
+            tunings: Vec::new(),
+            mode: IndexerMode::None,
         }
     }
 }
@@ -293,7 +330,11 @@ impl<B: WalletConfig> Wallet<B> {
     /// Construct a wallet from a custom in-process `WalletConfig` impl,
     /// with explicit opts.
     pub fn custom(backend: B, opts: ComponentOpts) -> Self {
-        Self { backend, opts }
+        Self {
+            backend,
+            opts,
+            tunings: Vec::new(),
+        }
     }
 
     /// Convenience constructor for an in-process wallet that needs no pod
@@ -305,6 +346,7 @@ impl<B: WalletConfig> Wallet<B> {
                 name: Some("wallet".to_string()),
                 ..ComponentOpts::default()
             },
+            tunings: Vec::new(),
         }
     }
 }
@@ -321,13 +363,43 @@ pub trait ComponentBuilder: Sized {
     #[doc(hidden)]
     fn component_opts_mut(&mut self) -> &mut ComponentOpts;
 
+    /// This component's backend tuning-token type. `NoTuning` (uninhabited) for
+    /// backends with no knobs, which makes [`tuning`](Self::tuning) uncallable.
+    type Tuning;
+
+    /// Append a tuning token. Not part of the stable surface — call
+    /// [`tuning`](Self::tuning).
+    #[doc(hidden)]
+    fn push_tuning(&mut self, tuning: Self::Tuning);
+
+    /// Apply a backend tuning token, interpreted by the backend at build time
+    /// (e.g. `ZainoTuning::State`). Composable — call repeatedly to stack knobs.
+    /// A backend whose `Tuning` is [`NoTuning`](crate::component::NoTuning)
+    /// accepts no value, so this cannot be called on it.
+    fn tuning(mut self, tuning: Self::Tuning) -> Self {
+        self.push_tuning(tuning);
+        self
+    }
+
     /// Set the component / pod name (used for peering and lookup).
     fn named(mut self, name: impl Into<String>) -> Self {
         self.component_opts_mut().name = Some(name.into());
         self
     }
-    /// Mount a file or directory into the component at startup.
-    fn mount(mut self, m: Mount) -> Self {
+    /// Mount a file, directory, archive, or shared volume into the component at
+    /// startup. Accepts anything `Into<Mount>` — a [`Mount`], or a
+    /// `(&SharedVolume, path)` for a shared on-disk store (see
+    /// [`SharedVolume::at`](crate::SharedVolume::at)). A shared mount is also
+    /// recorded as this component's shared state directory, so two components
+    /// mounting the same volume at the same path share one store (e.g. a zebrad
+    /// persisting its state DB and a zaino reading it via `ZainoTuning::State`).
+    fn mount(mut self, m: impl Into<Mount>) -> Self {
+        let m = m.into();
+        if matches!(m.kind, crate::mount::MountKind::Shared) {
+            self.component_opts_mut().shared_state = Some(SharedState {
+                mount_path: m.destination.to_string_lossy().into_owned(),
+            });
+        }
         self.component_opts_mut().mounts.push(m);
         self
     }
@@ -390,20 +462,32 @@ pub trait ComponentBuilder: Sized {
 }
 
 impl<B: ValidatorConfig> ComponentBuilder for Validator<B> {
+    type Tuning = B::Tuning;
     fn component_opts_mut(&mut self) -> &mut ComponentOpts {
         &mut self.opts
+    }
+    fn push_tuning(&mut self, tuning: B::Tuning) {
+        self.tunings.push(tuning);
     }
 }
 
 impl<B: IndexerConfig> ComponentBuilder for Indexer<B> {
+    type Tuning = B::Tuning;
     fn component_opts_mut(&mut self) -> &mut ComponentOpts {
         &mut self.opts
+    }
+    fn push_tuning(&mut self, tuning: B::Tuning) {
+        self.tunings.push(tuning);
     }
 }
 
 impl<B: WalletConfig> ComponentBuilder for Wallet<B> {
+    type Tuning = B::Tuning;
     fn component_opts_mut(&mut self) -> &mut ComponentOpts {
         &mut self.opts
+    }
+    fn push_tuning(&mut self, tuning: B::Tuning) {
+        self.tunings.push(tuning);
     }
 }
 
@@ -424,8 +508,12 @@ impl ComponentOpts {
 }
 
 impl ComponentBuilder for ComponentOptsBuilder {
+    type Tuning = NoTuning;
     fn component_opts_mut(&mut self) -> &mut ComponentOpts {
         &mut self.opts
+    }
+    fn push_tuning(&mut self, tuning: NoTuning) {
+        match tuning {}
     }
 }
 
@@ -488,13 +576,8 @@ impl<B: ValidatorConfig> Validator<B> {
         self.opts.regtest_cache = Some(RegtestCacheSource::Blank);
         self
     }
-    pub(crate) fn with_regtest_mode(mut self, mode: RegtestMode) -> Self {
-        self.opts.regtest_mode = Some(mode);
-        self
-    }
-
-    pub fn activate_through(mut self, nu: crate::topology::NetworkUpgrade) -> Self {
-        self.opts.regtest_mode = Some(RegtestMode::ActivateThrough(nu));
+    pub(crate) fn with_regtest(mut self) -> Self {
+        self.opts.regtest = true;
         self
     }
 
@@ -523,20 +606,6 @@ impl<B: ValidatorConfig> Validator<B> {
     ) -> Self {
         self.opts.lockbox_disbursements = Some(disbursements);
         self
-    }
-
-    /// Persist this validator's on-disk state to the shared volume `vol` and
-    /// enable its indexer gRPC, so a colocated zaino StateService can open the
-    /// same database as a RocksDB secondary and sync the non-finalized tip over
-    /// gRPC. Pair with [`crate::Indexer::regtest_state_in`] on the same `vol`.
-    pub fn persistent_state_in(mut self, vol: &crate::SharedVolume) -> Self {
-        self.opts.shared_state = Some(SharedState {
-            mount_path: vol.mount_path().to_string(),
-        });
-        self.opts
-            .mounts
-            .push(Mount::shared(vol.claim(), vol.mount_path()));
-        self.expose("indexer", crate::handles::ports::ZEBRAD_INDEXER)
     }
 }
 

@@ -348,6 +348,12 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem) -> corev1::Pod {
     if cfg.env.no_cleanup {
         env.push(env_var("ZTEST_NO_CLEANUP", "1"));
     }
+    // Forward the laptop's diagnostics filter so the in-pod subscriber
+    // (`observ::init_in_pod`) honours the same `ZTEST_LOG` the operator set,
+    // mirroring nextest's `NEXTEST_LOG`. Unset → the pod keeps its own default.
+    if let Some(filter) = &cfg.env.ztest_log {
+        env.push(env_var("ZTEST_LOG", filter));
+    }
     // Hand the in-pod test the laptop's resolved component-image references so it
     // resolves them without a Dockerfile it doesn't have (see `image::resolve`).
     if !cfg.image_refs.is_empty()
@@ -461,7 +467,7 @@ fn emit_timing(test: &str, pod: Option<&corev1::Pod>, total: std::time::Duration
         .into_iter()
         .flatten()
         .sum();
-    tracing::info!(
+    tracing::debug!(
         target: "ztest::pod",
         test = %test,
         total_ms = total.as_millis() as u64,
@@ -484,8 +490,8 @@ fn env_var(name: &str, value: &str) -> corev1::EnvVar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn map() -> Vec<(String, String)> {
         vec![("/home/u/proj/target".into(), "/work/target".into())]
@@ -560,8 +566,15 @@ mod tests {
             sa: "ztest".into(),
             no_cleanup: false,
             capture: true,
+            ztest_log: None,
         };
-        let cfg = PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
+        let cfg = PodRunConfig::baked(
+            env,
+            "runner:dev".into(),
+            "ztest".into(),
+            None,
+            BTreeMap::new(),
+        );
 
         // A regtest/integration tier runner: one whole core (orchestration).
         let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Integration));
@@ -570,7 +583,10 @@ mod tests {
         let req = res.requests.as_ref().unwrap();
         let lim = res.limits.as_ref().unwrap();
         // Guaranteed: requests == limits, in every dimension present.
-        assert_eq!(req, lim, "runner pod must be Guaranteed (requests == limits)");
+        assert_eq!(
+            req, lim,
+            "runner pod must be Guaranteed (requests == limits)"
+        );
         assert_eq!(req["cpu"].0, "1");
 
         // A wallet tier keeps the in-process wallet's compute here (≥4 cores).
@@ -588,8 +604,15 @@ mod tests {
             sa: "ztest".into(),
             no_cleanup: false,
             capture: true,
+            ztest_log: None,
         };
-        let cfg = PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
+        let cfg = PodRunConfig::baked(
+            env,
+            "runner:dev".into(),
+            "ztest".into(),
+            None,
+            BTreeMap::new(),
+        );
         let pod = build_pod("p", &cfg, &work("crate::b", "t"));
         let tols = pod.spec.unwrap().tolerations.unwrap();
         let nr = tols
@@ -686,6 +709,7 @@ mod tests {
             sa: "ztest".into(),
             no_cleanup: false,
             capture: true,
+            ztest_log: None,
         };
         let mut refs = BTreeMap::new();
         refs.insert(
@@ -716,6 +740,7 @@ mod tests {
             sa: "ztest".into(),
             no_cleanup: false,
             capture: true,
+            ztest_log: None,
         };
         let cfg = PodRunConfig::baked(
             env,
@@ -731,5 +756,53 @@ mod tests {
                 .iter()
                 .any(|v| v.name == crate::backends::image::IMAGE_REFS_ENV)
         );
+    }
+
+    #[test]
+    fn build_pod_forwards_ztest_log_when_set() {
+        let env = EngineEnv {
+            dylib_path: std::ffi::OsString::from("/x"),
+            run_id: "r".into(),
+            sa: "ztest".into(),
+            no_cleanup: false,
+            capture: true,
+            ztest_log: Some("ztest::build=debug".into()),
+        };
+        let cfg = PodRunConfig::baked(
+            env,
+            "runner:dev".into(),
+            "ztest".into(),
+            None,
+            BTreeMap::new(),
+        );
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"));
+        let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let log = vars
+            .iter()
+            .find(|v| v.name == "ZTEST_LOG")
+            .expect("ZTEST_LOG forwarded");
+        assert_eq!(log.value.as_deref(), Some("ztest::build=debug"));
+    }
+
+    #[test]
+    fn build_pod_omits_ztest_log_when_unset() {
+        let env = EngineEnv {
+            dylib_path: std::ffi::OsString::from("/x"),
+            run_id: "r".into(),
+            sa: "ztest".into(),
+            no_cleanup: false,
+            capture: true,
+            ztest_log: None,
+        };
+        let cfg = PodRunConfig::baked(
+            env,
+            "runner:dev".into(),
+            "ztest".into(),
+            None,
+            BTreeMap::new(),
+        );
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"));
+        let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        assert!(!vars.iter().any(|v| v.name == "ZTEST_LOG"));
     }
 }

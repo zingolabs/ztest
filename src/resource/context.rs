@@ -29,6 +29,12 @@ pub struct Cx {
     /// Skip Deployment / StatefulSet rollout waits (`ztest setup --no-wait`);
     /// the first test run then blocks on the rollout instead.
     pub no_wait: bool,
+
+    /// Name of the ephemeral BuildKit pod this invocation created for its image
+    /// builds, if any. The image-build path (`backends::image::openshift`) execs
+    /// `buildctl` against it; `None` when no build pod was stood up (a run/setup
+    /// that builds nothing). Created once per invocation and torn down after.
+    pub build_pod: Option<String>,
 }
 
 impl Cx {
@@ -40,6 +46,7 @@ impl Cx {
             console: None,
             progress: None,
             no_wait: false,
+            build_pod: None,
         }
     }
 
@@ -51,6 +58,7 @@ impl Cx {
             console: None,
             progress: None,
             no_wait: false,
+            build_pod: None,
         }
     }
 }
@@ -72,6 +80,7 @@ pub struct CxBuilder {
     console: Option<Console>,
     progress: Option<ProgressSink>,
     no_wait: bool,
+    build_pod: Option<String>,
 }
 
 impl std::fmt::Debug for CxBuilder {
@@ -103,12 +112,19 @@ impl CxBuilder {
         self
     }
 
+    /// The ephemeral BuildKit pod name image builds exec against.
+    pub fn build_pod(mut self, pod: impl Into<String>) -> Self {
+        self.build_pod = Some(pod.into());
+        self
+    }
+
     pub fn build(self) -> Cx {
         Cx {
             client: self.client,
             console: self.console,
             progress: self.progress,
             no_wait: self.no_wait,
+            build_pod: self.build_pod,
         }
     }
 }

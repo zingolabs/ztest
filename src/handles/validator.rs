@@ -12,7 +12,6 @@ use crate::component::ComponentOpts;
 use crate::handles::client::JsonRpcClient;
 use crate::handles::wallet::Pool;
 use crate::handles::{Endpoint, HandleInner};
-use crate::topology::NetworkUpgrade;
 use crate::{EnvError, RpcError};
 
 pub use zcash_protocol::consensus::BlockHeight;
@@ -41,6 +40,10 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     /// The live handle type this backend produces.
     type Handle: ValidatorBackend + Clone;
 
+    /// Backend-specific tuning tokens (see [`ComponentBuilder::tuning`]).
+    /// [`NoTuning`](crate::component::NoTuning) for validators with no knobs.
+    type Tuning: Clone + std::fmt::Debug + Send + Sync + 'static;
+
     /// Build the runtime handle once the env has assigned `plumbing`.
     fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
 
@@ -55,13 +58,6 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     /// Stable label for this backend (`"zcashd"` / `"zebrad"`). Available on
     /// the spec before launch, so a backend-generic test can branch on it.
     fn label(&self) -> &'static str;
-
-    /// Highest network upgrade this backend, at the given pinned version, can
-    /// decode. `None` opts out of the topology resolver.
-    fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
-        let _ = version;
-        None
-    }
 
     /// Apply this backend's regtest-time, height-dependent mounts / flags to a
     /// `ComponentOpts`. Called from `env.build()` after the topology resolver

@@ -7,9 +7,7 @@
 //! [`Provider`](super::Provider) impl in the right submodule, and register it in
 //! [`initialize`](super::initialize) or [`plan_runtime`](super::plan_runtime).
 
-pub(crate) mod base_images;
 pub(crate) mod buildkit;
-pub(crate) mod builder;
 pub(crate) mod image;
 pub(crate) mod mirror;
 pub(crate) mod policy;

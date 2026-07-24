@@ -10,8 +10,8 @@
 //!    registry with Hub fallback (`AllowContactingSource`). CRI-O redirects
 //!    transparently, so pod specs are untouched. Applying an ITMS drains +
 //!    reboots the node (MCO) — a one-time setup cost; the config is stable.
-//! 2. A path-preserving `crane copy` of each curated image (from
-//!    [`image::mirror_set`]) into the registry, so the mirror actually resolves.
+//! 2. A path-preserving buildkit-native `FROM <hub> + push` of each curated image
+//!    (from [`image::mirror_set`]) into the registry, so the mirror resolves.
 //!
 //! Curated (not auto-discovered) because each downstream suite pins its own
 //! component versions imperatively. An image absent from the set still works via
@@ -43,12 +43,15 @@ impl Provider for ImageMirrorProvider {
     }
 
     fn deps(&self) -> Vec<NodeId> {
-        // The registry project must exist to push into; the builder pod carries
-        // the `crane` + push creds the copy uses.
+        // The registry project must exist to push into; the mirror is a
+        // buildkit-native `FROM <hub> + push` (see `openshift::mirror_image`), so
+        // it needs the BuildKit scaffolding (SCC/SA/config/cache), not the retired
+        // builder pod. The ephemeral build pod itself is created by the setup
+        // entrypoint, not a graph node.
         vec![
             NodeId::Namespace(RUN_NAMESPACE.to_string()),
             NodeId::RegistryProject,
-            NodeId::Builder,
+            NodeId::Buildkit,
         ]
     }
 
@@ -84,15 +87,18 @@ impl Provider for ImageMirrorProvider {
         }
         apply_itms(&cx.client, &set).await?;
 
-        let base = image::push_base().or_else(image::pull_base).ok_or_else(|| {
-            ResourceError::Provision(
-                "no registry (ZTEST_IMAGE_REGISTRY unset) for the component-image mirror".into(),
-            )
-        })?;
+        let base = image::push_base()
+            .or_else(image::pull_base)
+            .ok_or_else(|| {
+                ResourceError::Provision(
+                    "no registry (ZTEST_IMAGE_REGISTRY unset) for the component-image mirror"
+                        .into(),
+                )
+            })?;
         for hub in &set {
             let dest = image::mirror_dest(&base, hub);
-            // Idempotent: skip an image already in the mirror (crane would no-op
-            // anyway, but the probe avoids the exec round-trip entirely).
+            // Idempotent: skip an image already in the mirror (the buildkit push
+            // would no-op anyway, but the probe avoids the exec round-trip entirely).
             if docker::openshift_manifest_present(dest.clone()).await {
                 continue;
             }

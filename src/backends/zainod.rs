@@ -24,7 +24,6 @@ use crate::handles::client::JsonRpcClient;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
 use crate::handles::validator::{BlockchainInfo, PeerInfo};
 use crate::protocol::zcash_rpc::ZcashRpc;
-use crate::topology::{self, NetworkUpgrade};
 use crate::{Endpoint, EnvError, RpcError};
 
 const COMPONENT: &str = "zainod";
@@ -52,69 +51,131 @@ pub(crate) fn image_uri(
 #[derive(Debug, Clone)]
 pub struct ZainoBackend;
 
+/// Zaino's chain-data source, selected via `.tuning(ZainoTuning::State)`.
+/// Orthogonal to the network mode ([`IndexerMode`](crate::component::IndexerMode))
+/// and composable with `.regtest()` / `.testnet(variant)` in any order. The
+/// default (no tuning token) is [`Fetch`](ZainoTuning::Fetch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZainoTuning {
+    /// Pull blocks over the validator's JSON-RPC. Works remotely; compatible
+    /// with zebrad, zcashd, or another zaino. The default.
+    Fetch,
+    /// Read the validator's on-disk state DB directly (zebra-only, colocated).
+    /// Requires a shared state volume — mount one with `.mount(&shared_volume)`.
+    State,
+}
+
+impl ZainoTuning {
+    /// The `backend =` literal this token renders to in `zainod.toml`.
+    fn as_toml(self) -> &'static str {
+        match self {
+            ZainoTuning::Fetch => "fetch",
+            ZainoTuning::State => "state",
+        }
+    }
+}
+
 impl IndexerConfig for ZainoBackend {
     type Handle = ZainoIndexer;
+    type Tuning = ZainoTuning;
 
     fn to_handle(&self, plumbing: HandleInner) -> ZainoIndexer {
         ZainoIndexer { plumbing }
     }
 
-    fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
-        version.parse().ok().map(topology::zaino_ceiling)
-    }
-
-    fn materialize_regtest_opts(
+    fn materialize_opts(
         &self,
         mut opts: crate::component::ComponentOpts,
-        regtest_backend: Option<crate::testnet_conf::ZainodBackend>,
+        tunings: &[ZainoTuning],
+        mode: &crate::component::IndexerMode,
         validator_host: Option<&str>,
     ) -> Result<crate::component::ComponentOpts, EnvError> {
-        // The env only installs this closure for regtest indexers, so
-        // `regtest_backend` is always `Some` here.
-        let backend = regtest_backend
-            .expect("materialize_regtest_opts called on a non-regtest zaino indexer");
-        let validator_host = validator_host.ok_or_else(|| EnvError::Config {
-            reason: "zaino indexer opted in to regtest but no validator is registered in \
-                     this env"
-                .to_string(),
-        })?;
-        let version = match opts.image {
-            crate::backends::image::ImageSpec::Dev { .. } => crate::regtest_conf::Semver {
-                major: u16::MAX,
-                minor: 0,
-                patch: 0,
-            },
-            crate::backends::image::ImageSpec::Published => opts
-                .version
-                .parse::<crate::regtest_conf::Semver>()
-                .map_err(|_| EnvError::Config {
-                    reason: format!("zaino version {:?} is not valid semver", opts.version),
-                })?,
-        };
-        // State backend sharing the validator's DB: point zebra_db_path at the
-        // shared mount and connect the syncer to the validator's indexer gRPC.
-        // Otherwise zebra_db_path is pod-local scratch and no gRPC is set.
-        let validator_grpc = opts
-            .shared_state
-            .as_ref()
-            .map(|_| format!("{validator_host}:{}", crate::handles::ports::ZEBRAD_INDEXER));
-        let zebra_db_path = opts
-            .shared_state
-            .as_ref()
-            .map(|s| s.mount_path.as_str())
-            .unwrap_or(ZAINO_REGTEST_ZEBRA_DB);
+        use crate::component::IndexerMode;
 
-        let toml = crate::regtest_conf::regtest_zainod_conf(
-            version,
-            backend,
-            ZAINO_REGTEST_GRPC_PORT,
-            ZAINO_REGTEST_JSONRPC_PORT,
-            validator_host,
-            ZAINO_REGTEST_VALIDATOR_RPC_PORT,
-            zebra_db_path,
-            ZAINO_REGTEST_DB,
-            validator_grpc.as_deref(),
-        );
+        // `State` reads the validator's on-disk DB, so it needs a shared state
+        // volume mounted (`.mount(&vol)`); a shared volume paired with the
+        // default `Fetch` is incoherent. Absence of any token means `Fetch`.
+        let state = tunings.iter().any(|t| matches!(t, ZainoTuning::State));
+        let backend_literal = if state {
+            ZainoTuning::State
+        } else {
+            ZainoTuning::Fetch
+        }
+        .as_toml();
+        match (state, opts.shared_state.is_some()) {
+            (true, false) => {
+                return Err(EnvError::Config {
+                    reason: "ZainoTuning::State needs a shared state volume; \
+                             mount one with .mount(&shared_volume)"
+                        .to_string(),
+                });
+            }
+            (false, true) => {
+                return Err(EnvError::Config {
+                    reason: "a shared state volume is mounted but ZainoTuning::State \
+                             is not set"
+                        .to_string(),
+                });
+            }
+            _ => {}
+        }
+
+        let version = zaino_semver(&opts)?;
+        let toml = match mode {
+            IndexerMode::None => return Ok(opts),
+            IndexerMode::Regtest => {
+                let validator_host = validator_host.ok_or_else(|| EnvError::Config {
+                    reason: "zaino indexer opted in to regtest but no validator is \
+                             registered in this env"
+                        .to_string(),
+                })?;
+                // State backend sharing the validator's DB: point zebra_db_path at
+                // the shared mount and connect the syncer to the validator's
+                // indexer gRPC. Otherwise zebra_db_path is pod-local scratch and no
+                // gRPC is set.
+                let validator_grpc = opts
+                    .shared_state
+                    .as_ref()
+                    .map(|_| format!("{validator_host}:{}", crate::handles::ports::ZEBRAD_INDEXER));
+                let zebra_db_path = opts
+                    .shared_state
+                    .as_ref()
+                    .map(|s| s.mount_path.as_str())
+                    .unwrap_or(ZAINO_REGTEST_ZEBRA_DB);
+                crate::regtest_conf::regtest_zainod_conf(
+                    version,
+                    backend_literal,
+                    ZAINO_REGTEST_GRPC_PORT,
+                    ZAINO_REGTEST_JSONRPC_PORT,
+                    validator_host,
+                    ZAINO_REGTEST_VALIDATOR_RPC_PORT,
+                    zebra_db_path,
+                    ZAINO_REGTEST_DB,
+                    validator_grpc.as_deref(),
+                    opts.image
+                        .metrics_enabled()
+                        .then_some(crate::handles::ports::ZAINO_METRICS),
+                )
+            }
+            IndexerMode::Testnet(_) => crate::testnet_conf::testnet_zainod_conf(
+                version,
+                backend_literal,
+                ZAINO_TESTNET_GRPC_PORT,
+                ZAINO_TESTNET_JSONRPC_PORT,
+                validator_host.unwrap_or(ZAINO_TESTNET_VALIDATOR_HOST),
+                ZAINO_TESTNET_VALIDATOR_RPC_PORT,
+                ZAINO_TESTNET_ZEBRA_DB,
+                ZAINO_TESTNET_DB,
+                opts.image
+                    .metrics_enabled()
+                    .then_some(crate::handles::ports::ZAINO_METRICS),
+            ),
+            IndexerMode::Mainnet(_) => {
+                return Err(EnvError::Config {
+                    reason: "zaino mainnet mode is not yet supported".to_string(),
+                });
+            }
+        };
         opts.mounts.push(crate::regtest::config_mount_inline(
             toml,
             "/etc/zaino/zainod.toml",
@@ -656,46 +717,18 @@ fn u32_height(component: &'static str, op: &'static str, height: u64) -> Result<
 
 impl crate::regtest::Regtest for crate::component::Indexer<ZainoBackend> {
     fn regtest(self) -> Self {
-        apply_regtest(self, crate::testnet_conf::ZainodBackend::Fetch)
-    }
-}
-
-impl crate::regtest::RegtestState for crate::component::Indexer<ZainoBackend> {
-    fn regtest_state(self) -> Self {
-        apply_regtest(self, crate::testnet_conf::ZainodBackend::State)
+        apply_regtest(self)
     }
 }
 
 fn apply_regtest(
     indexer: crate::component::Indexer<ZainoBackend>,
-    backend: crate::testnet_conf::ZainodBackend,
 ) -> crate::component::Indexer<ZainoBackend> {
     let mut indexer = indexer
         .mount(crate::regtest::scratch_mount("/var/lib/zaino"))
         .args(["start", "--config", "/etc/zaino/zainod.toml"]);
-    indexer.regtest_backend = Some(backend);
+    indexer.mode = crate::component::IndexerMode::Regtest;
     indexer
-}
-
-impl crate::component::Indexer<ZainoBackend> {
-    /// Apply the regtest state backend, sharing the validator's on-disk
-    /// zebra-state DB via `vol`. The StateService opens it as a RocksDB
-    /// secondary and syncs the non-finalized tip from the validator's indexer
-    /// gRPC, so the paired validator must be built with
-    /// [`crate::Validator::persistent_state_in`] on the same `vol`. Unlike the
-    /// bare [`crate::regtest::RegtestState::regtest_state`], this wires a real
-    /// shared database.
-    pub fn regtest_state_in<V: crate::handles::validator::ValidatorBackend + ?Sized>(
-        self,
-        vol: &crate::SharedVolume,
-        _validator: &V,
-    ) -> Self {
-        let mut indexer = apply_regtest(self, crate::testnet_conf::ZainodBackend::State);
-        indexer.opts.shared_state = Some(crate::component::SharedState {
-            mount_path: vol.mount_path().to_string(),
-        });
-        indexer.mount(crate::mount::Mount::shared(vol.claim(), vol.mount_path()))
-    }
 }
 
 /// zaino gRPC listen port (regtest). Matches the generator's
@@ -717,61 +750,49 @@ const ZAINO_REGTEST_ZEBRA_DB: &str = "/var/lib/zaino/zebra-db";
 const ZAINO_REGTEST_DB: &str = "/var/lib/zaino/db";
 
 impl crate::regtest::Testnet for crate::component::Indexer<ZainoBackend> {
-    /// Apply the testnet fixture for zainod (fetch backend). The variant's
-    /// pre-synced zebra state lands at [`ZAINO_TESTNET_ZEBRA_DB`] via a
-    /// snapshot mount.
+    /// Apply the named testnet fixture. The variant's pre-synced zebra state
+    /// lands at [`ZAINO_TESTNET_ZEBRA_DB`] via a snapshot mount; the
+    /// backend-dependent `zainod.toml` is rendered at build time (see
+    /// [`ZainoBackend::materialize_opts`]).
     fn testnet(self, variant: &str) -> Self {
-        apply_testnet(self, variant, crate::testnet_conf::ZainodBackend::Fetch)
-    }
-}
-
-impl crate::regtest::TestnetState for crate::component::Indexer<ZainoBackend> {
-    /// Apply the testnet fixture for zainod (state backend).
-    fn testnet_state(self, variant: &str) -> Self {
-        apply_testnet(self, variant, crate::testnet_conf::ZainodBackend::State)
+        apply_testnet(self, variant)
     }
 }
 
 fn apply_testnet(
     indexer: crate::component::Indexer<ZainoBackend>,
     variant: &str,
-    backend: crate::testnet_conf::ZainodBackend,
 ) -> crate::component::Indexer<ZainoBackend> {
-    // For `ImageSpec::Dev` the `version` field holds a Dockerfile path, not a
-    // semver, so feed a sentinel "newest" semver for from-source builds.
-    let version = match indexer.opts().image {
-        crate::backends::image::ImageSpec::Dev { .. } => crate::regtest_conf::Semver {
-            major: u16::MAX,
-            minor: 0,
-            patch: 0,
-        },
-        crate::backends::image::ImageSpec::Published => indexer
-            .opts()
-            .version
-            .parse::<crate::regtest_conf::Semver>()
-            .expect("zaino version on Indexer builder must be a valid semver"),
-    };
-    let toml = crate::testnet_conf::testnet_zainod_conf(
-        version,
-        backend,
-        ZAINO_TESTNET_GRPC_PORT,
-        ZAINO_TESTNET_JSONRPC_PORT,
-        ZAINO_TESTNET_VALIDATOR_HOST,
-        ZAINO_TESTNET_VALIDATOR_RPC_PORT,
-        ZAINO_TESTNET_ZEBRA_DB,
-        ZAINO_TESTNET_DB,
-    );
-    indexer
-        .mount(crate::regtest::config_mount_inline(
-            toml,
-            "/etc/zaino/zainod.toml",
-        ))
+    let mut indexer = indexer
         .mount(crate::regtest::testnet_chain_archive(
             variant,
             crate::regtest::TestnetChainKind::Zebra,
             ZAINO_TESTNET_ZEBRA_DB,
         ))
-        .args(["start", "--config", "/etc/zaino/zainod.toml"])
+        .args(["start", "--config", "/etc/zaino/zainod.toml"]);
+    indexer.mode = crate::component::IndexerMode::Testnet(variant.to_string());
+    indexer
+}
+
+/// Resolve the zaino image's semver for config rendering. For `ImageSpec::Dev`
+/// the `version` field holds a Dockerfile path, not a semver, so feed a
+/// sentinel "newest" semver for from-source builds.
+fn zaino_semver(
+    opts: &crate::component::ComponentOpts,
+) -> Result<crate::regtest_conf::Semver, EnvError> {
+    match opts.image {
+        crate::backends::image::ImageSpec::Dev { .. } => Ok(crate::regtest_conf::Semver {
+            major: u16::MAX,
+            minor: 0,
+            patch: 0,
+        }),
+        crate::backends::image::ImageSpec::Published => opts
+            .version
+            .parse::<crate::regtest_conf::Semver>()
+            .map_err(|_| EnvError::Config {
+                reason: format!("zaino version {:?} is not valid semver", opts.version),
+            }),
+    }
 }
 
 /// zaino gRPC listen port. Matches the generator's

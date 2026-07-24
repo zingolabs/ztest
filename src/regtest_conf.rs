@@ -303,9 +303,14 @@ pub fn zebrad_conf(
     post_nu6_funding_streams: Option<&FundingStreams>,
     persistent: Option<ZebradPersistentState<'_>>,
     miner_address: &str,
+    metrics_port: Option<u16>,
 ) -> String {
     let indexer_line = match persistent.and_then(|p| p.indexer_listen_port) {
         Some(port) => format!("\nindexer_listen_addr = \"0.0.0.0:{port}\""),
+        None => String::new(),
+    };
+    let metrics_block = match metrics_port {
+        Some(port) => format!("\n\n[metrics]\nendpoint_addr = \"0.0.0.0:{port}\""),
         None => String::new(),
     };
     let state_block = match &persistent {
@@ -369,7 +374,7 @@ filter = \"info\"
 use_journald = false
 
 [mining]
-miner_address = \"{miner_address}\""
+miner_address = \"{miner_address}\"{metrics_block}"
     );
 
     // One entry per activated upgrade. A `None` height means the topology
@@ -459,7 +464,7 @@ miner_address = \"{miner_address}\""
 #[allow(clippy::too_many_arguments)]
 pub fn regtest_zainod_conf(
     _version: Semver,
-    backend: crate::testnet_conf::ZainodBackend,
+    backend_literal: &str,
     grpc_listen_port: u16,
     jsonrpc_listen_port: u16,
     validator_host: &str,
@@ -467,16 +472,17 @@ pub fn regtest_zainod_conf(
     zebra_db_path: &str,
     zaino_db_path: &str,
     validator_grpc: Option<&str>,
+    metrics_port: Option<u16>,
 ) -> String {
-    let backend_literal = match backend {
-        crate::testnet_conf::ZainodBackend::Fetch => "fetch",
-        crate::testnet_conf::ZainodBackend::State => "state",
-    };
     // Only the `state` backend's syncer uses this (to pull the
     // non-finalized tip from the validator's indexer gRPC), so it's emitted
     // only when supplied.
     let validator_grpc_line = match validator_grpc {
         Some(addr) => format!("\nvalidator_grpc_listen_address = '{addr}'"),
+        None => String::new(),
+    };
+    let metrics_line = match metrics_port {
+        Some(port) => format!("\nmetrics_endpoint = '0.0.0.0:{port}'"),
         None => String::new(),
     };
     format!(
@@ -485,7 +491,7 @@ pub fn regtest_zainod_conf(
 
 backend = '{backend_literal}'
 zebra_db_path = '{zebra_db_path}'
-network = 'Regtest'
+network = 'Regtest'{metrics_line}
 
 [grpc_settings]
 listen_address = '0.0.0.0:{grpc_listen_port}'
@@ -575,13 +581,18 @@ mod tests {
     }
 
     #[test]
-    fn zebrad_v5_1_1_emits_nu6_1_activation_heights() {
-        // zebrad 5.1.1 is well past the NU6.1 cutoff (gate is dormant at
-        // version 1.0.0), so NU6.1 lands in the rendered TOML.
-        let v: Semver = "5.1.1".parse().unwrap();
-        let toml = zebrad_conf(
-            v,
-            &regtest_test_activation_heights(),
+    fn zebrad_nu6_1_activation_is_version_gated() {
+        // The gate is the whole reason this generator is version-aware: a
+        // zebrad past the NU6.1 cutoff must emit the activation-height keys,
+        // while one before it must omit them (older zebrad rejects the unknown
+        // key and refuses to start). Heights are read back from the fixture, so
+        // the assertion tracks the canonical schedule, not a magic number.
+        // `"NU6.1"` is TOML-quoted (the dot); `NU6` is bare.
+        let heights = regtest_test_activation_heights();
+
+        let supported = zebrad_conf(
+            "5.1.1".parse().unwrap(),
+            &heights,
             28232,
             18233,
             &[],
@@ -589,23 +600,16 @@ mod tests {
             Some(&regtest_test_post_nu6_funding_streams()),
             None,
             MINER_ADDRESS,
+            None,
         );
-        assert!(toml.contains("NU6 = 2"));
-        assert!(toml.contains("\"NU6.1\" = 5"));
-        assert!(toml.contains(&format!("miner_address = \"{MINER_ADDRESS}\"")));
-        assert!(toml.contains(&format!("address = \"{LOCKBOX_ADDRESS}\"")));
-        assert!(toml.contains("initial_testnet_peers = []"));
-        assert!(toml.contains("listen_addr = \"0.0.0.0:18233\""));
-    }
+        assert!(supported.contains(&format!("NU6 = {}", heights.nu6().unwrap())));
+        assert!(supported.contains(&format!("\"NU6.1\" = {}", heights.nu6_1().unwrap())));
+        assert!(supported.contains(&format!("miner_address = \"{MINER_ADDRESS}\"")));
+        assert!(supported.contains(&format!("address = \"{LOCKBOX_ADDRESS}\"")));
 
-    #[test]
-    fn zebrad_pre_nu6_1_version_omits_nu6_1() {
-        // Synthetic pre-1.0 build: exercises the version gate so the
-        // predicate doesn't bit-rot if `ZEBRAD_NU6_1` is later bumped.
-        let v: Semver = "0.5.0".parse().unwrap();
-        let toml = zebrad_conf(
-            v,
-            &regtest_test_activation_heights(),
+        let pre_cutoff = zebrad_conf(
+            "0.5.0".parse().unwrap(),
+            &heights,
             28232,
             18233,
             &[],
@@ -613,9 +617,11 @@ mod tests {
             None,
             None,
             MINER_ADDRESS,
+            None,
         );
-        assert!(!toml.contains("\"NU6.1\""));
-        assert!(!toml.contains("\"NU6.2\""));
+        assert!(!pre_cutoff.contains("\"NU6.1\""));
+        assert!(!pre_cutoff.contains("\"NU6.2\""));
+        assert!(pre_cutoff.contains("initial_testnet_peers = []"));
     }
 
     #[test]
@@ -631,70 +637,96 @@ mod tests {
             Some(&regtest_test_post_nu6_funding_streams()),
             None,
             MINER_ADDRESS,
+            None,
         );
         assert!(toml.contains("initial_testnet_peers = [\"alice:18233\", \"bob:18233\"]"));
     }
 
     #[test]
-    fn zebrad_conf_renders_orchard_unified_miner_address() {
-        let v: Semver = "5.1.1".parse().unwrap();
-        let toml = zebrad_conf(
-            v,
-            &regtest_test_activation_heights(),
-            28232,
-            18233,
-            &[],
-            &regtest_test_lockbox_disbursements(),
-            Some(&regtest_test_post_nu6_funding_streams()),
-            None,
-            ORCHARD_MINER_ADDRESS,
-        );
-        assert!(toml.contains(&format!("miner_address = \"{ORCHARD_MINER_ADDRESS}\"")));
+    fn zebrad_persistent_state_emits_indexer_line_only_with_a_port() {
+        // Both branches of the persistent-state conditional: a shared-state pod
+        // exposes the indexer gRPC (the StateService syncer connects to it); a
+        // chain-cache pod persists the DB but runs no StateService, so it must
+        // omit the indexer line. Both persist (`ephemeral = false`).
+        let render = |persistent| {
+            zebrad_conf(
+                "5.1.1".parse().unwrap(),
+                &regtest_test_activation_heights(),
+                28232,
+                18233,
+                &[],
+                &[],
+                None,
+                Some(persistent),
+                MINER_ADDRESS,
+                None,
+            )
+        };
+
+        let with_indexer = render(ZebradPersistentState {
+            cache_dir: "/shared/zebra-db",
+            indexer_listen_port: Some(8233),
+        });
+        assert!(with_indexer.contains("ephemeral = false"));
+        assert!(with_indexer.contains("cache_dir = \"/shared/zebra-db\""));
+        assert!(with_indexer.contains("indexer_listen_addr = \"0.0.0.0:8233\""));
+
+        let without_indexer = render(ZebradPersistentState {
+            cache_dir: "/var/cache/zebrad",
+            indexer_listen_port: None,
+        });
+        assert!(without_indexer.contains("ephemeral = false"));
+        assert!(without_indexer.contains("cache_dir = \"/var/cache/zebrad\""));
+        assert!(!without_indexer.contains("indexer_listen_addr"));
     }
 
     #[test]
-    fn zebrad_conf_persistent_with_indexer_emits_cache_dir_and_indexer_line() {
-        let v: Semver = "5.1.1".parse().unwrap();
-        let toml = zebrad_conf(
-            v,
-            &regtest_test_activation_heights(),
-            28232,
-            18233,
-            &[],
-            &[],
-            None,
-            Some(ZebradPersistentState {
-                cache_dir: "/shared/zebra-db",
-                indexer_listen_port: Some(8233),
-            }),
-            MINER_ADDRESS,
+    fn regtest_metrics_stanzas_are_gated_on_metrics_port() {
+        // The listener is rendered only for a prometheus-compiled image
+        // (`metrics_port.is_some()`), and it must land where TOML expects:
+        // zebrad's `[metrics]` table before the testnet-parameters subtables,
+        // zaino's `metrics_endpoint` key before the first `[section]`.
+        let zeb = |metrics_port| {
+            zebrad_conf(
+                "5.1.1".parse().unwrap(),
+                &regtest_test_activation_heights(),
+                28232,
+                18233,
+                &[],
+                &[],
+                None,
+                None,
+                MINER_ADDRESS,
+                metrics_port,
+            )
+        };
+        assert!(!zeb(None).contains("[metrics]"));
+        let zeb_on = zeb(Some(9999));
+        assert!(zeb_on.contains("endpoint_addr = \"0.0.0.0:9999\""));
+        assert!(
+            zeb_on.find("[metrics]").unwrap()
+                < zeb_on
+                    .find("[network.testnet_parameters.activation_heights]")
+                    .unwrap()
         );
-        assert!(toml.contains("ephemeral = false"));
-        assert!(toml.contains("cache_dir = \"/shared/zebra-db\""));
-        assert!(toml.contains("indexer_listen_addr = \"0.0.0.0:8233\""));
-    }
 
-    #[test]
-    fn zebrad_conf_chain_cache_persists_without_indexer() {
-        // The chain-cache path persists state to load a pre-mined chain
-        // but runs no StateService, so it must not emit the indexer line.
-        let v: Semver = "5.1.1".parse().unwrap();
-        let toml = zebrad_conf(
-            v,
-            &regtest_test_activation_heights(),
-            28232,
-            18233,
-            &[],
-            &[],
-            None,
-            Some(ZebradPersistentState {
-                cache_dir: "/var/cache/zebrad",
-                indexer_listen_port: None,
-            }),
-            MINER_ADDRESS,
-        );
-        assert!(toml.contains("ephemeral = false"));
-        assert!(toml.contains("cache_dir = \"/var/cache/zebrad\""));
-        assert!(!toml.contains("indexer_listen_addr"));
+        let zai = |metrics_port| {
+            regtest_zainod_conf(
+                "0.1.0".parse().unwrap(),
+                "fetch",
+                8137,
+                8232,
+                "zebrad",
+                28232,
+                "/var/lib/zaino/zebra-db",
+                "/var/lib/zaino/db",
+                None,
+                metrics_port,
+            )
+        };
+        assert!(!zai(None).contains("metrics_endpoint"));
+        let zai_on = zai(Some(9998));
+        assert!(zai_on.contains("metrics_endpoint = '0.0.0.0:9998'"));
+        assert!(zai_on.find("metrics_endpoint").unwrap() < zai_on.find("[grpc_settings]").unwrap());
     }
 }

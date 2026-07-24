@@ -109,10 +109,12 @@ const RUN_RULES: &[Rule] = &[
         check_verb: Some("create"),
         scope: RuleScope::All,
     },
+    // `watch` feeds `pipeline::capacity_watch`; best-effort, so the check verb
+    // stays `list` and a role predating this grant degrades rather than failing.
     Rule {
         group: "",
         resources: &["nodes"],
-        verbs: &["get", "list"],
+        verbs: &["get", "list", "watch"],
         check_verb: Some("list"),
         scope: RuleScope::All,
     },
@@ -132,12 +134,22 @@ const RUN_RULES: &[Rule] = &[
             "services",
             "configmaps",
             "persistentvolumeclaims",
-            "serviceaccounts",
             "resourcequotas",
         ],
         verbs: &[
             "get", "list", "watch", "create", "update", "patch", "delete",
         ],
+        check_verb: None,
+        scope: RuleScope::All,
+    },
+    // ServiceAccounts are read-only on the run path: it only waits for the
+    // per-test namespace's auto-created `default` SA and reads SA budget
+    // annotations. Every SA *write* is on the setup path (under admin creds), so
+    // the run identity needs no create/patch here.
+    Rule {
+        group: "",
+        resources: &["serviceaccounts"],
+        verbs: &["get", "list", "watch"],
         check_verb: None,
         scope: RuleScope::All,
     },
@@ -166,13 +178,16 @@ const RUN_RULES: &[Rule] = &[
         check_verb: None,
         scope: RuleScope::All,
     },
-    // Pod metrics: the capacity probe reserves each pod at `max(request,
-    // observed_usage)`; the usage term reads `metrics.k8s.io`. Best-effort — no
-    // `check_verb`, so a cluster without the metrics API (or this grant) just
-    // falls back to request-only accounting rather than failing the run.
+    // Metrics API. ztest no longer reads metrics itself — capacity is now
+    // request-based, folded from the pod/node watch. This grant is what k9s (and
+    // any live-metrics UI) points at through this SA needs for its cluster gauges
+    // and per-pod %-of-node denominators; without it k9s blanks the whole CPU/MEM
+    // path, not just the node view. Together `pods`+`nodes` mirror the built-in
+    // `system:aggregated-metrics-reader`. Best-effort — no `check_verb`, so a
+    // cluster without the metrics API doesn't fail the run.
     Rule {
         group: "metrics.k8s.io",
-        resources: &["pods"],
+        resources: &["pods", "nodes"],
         verbs: &["get", "list"],
         check_verb: None,
         scope: RuleScope::All,
@@ -536,9 +551,10 @@ fn registry_manifests() -> (serde_json::Value, serde_json::Value, serde_json::Va
         "metadata": { "name": IMAGE_PUSH_BINDING, "namespace": IMAGES_NAMESPACE },
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": IMAGE_PUSH_CLUSTER_ROLE },
         "subjects": [
-            // The run SA pushes the runner image (crane bake); the `ztest-buildkit`
-            // SA is what the BuildKit build pod runs as and pushes the base +
-            // component images through.
+            // The `ztest-buildkit` SA the BuildKit pod runs as pushes every image
+            // it builds (runner + component + mirror). The run SA — the laptop's
+            // kubeconfig identity — holds push for the pre-build manifest probe's
+            // `pull,push`-scoped token request (`openshift_manifest_present`).
             { "kind": "ServiceAccount", "name": RUN_SERVICE_ACCOUNT, "namespace": RUN_NAMESPACE },
             { "kind": "ServiceAccount", "name": BUILDKIT_SERVICE_ACCOUNT, "namespace": RUN_NAMESPACE },
         ],
@@ -679,6 +695,10 @@ mod tests {
         let b = ImageBackend::OpenShift;
         assert!(grants(b, "", "nodes"), "QoS probe lists nodes");
         assert!(
+            grants(b, "metrics.k8s.io", "nodes"),
+            "k9s live metrics need node usage or it blanks the whole CPU/MEM path"
+        );
+        assert!(
             grants(b, "snapshot.storage.k8s.io", "volumesnapshotclasses"),
             "seeds read the snapshot class"
         );
@@ -692,7 +712,10 @@ mod tests {
         );
         // The BuildKit build path `exec`s into its pod; the run identity drives it
         // through `pods/exec`, not any `build.openshift.io` grant.
-        assert!(grants(b, "", "pods/exec"), "buildkit build execs into the pod");
+        assert!(
+            grants(b, "", "pods/exec"),
+            "buildkit build execs into the pod"
+        );
     }
 
     #[test]

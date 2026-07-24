@@ -29,6 +29,21 @@ use crate::cluster_config::ImageBackend;
 use crate::inventory::DevImageEntry;
 use crate::resource::{Cx, Readiness, ResourceError};
 
+/// Layer-compression options appended to every ztest `buildctl --output
+/// type=image` (the runner build and both component-image builds), so all images
+/// ztest pushes to the internal registry share one format.
+///
+/// zstd, not BuildKit's default gzip: the gzip exporter is Go's single-threaded
+/// `compress/gzip` (no parallel knob — the ~1 GiB runner layer was costing ~45s
+/// at ~21 MB/s), whereas the zstd exporter (`klauspost/compress`) fans out across
+/// the build pod's cores. `oci-mediatypes` is required for zstd layer
+/// descriptors. Level 1 because the push target is a same-node registry, so the
+/// ratio buys little and speed is everything. No `force-compression`, so cached
+/// base layers keep their existing blobs — only fresh layers are (re)compressed.
+/// Every consumer is the cluster's own CRI-O, which reads zstd+OCI natively.
+pub(crate) const IMAGE_OUTPUT_COMPRESSION: &str =
+    "compression=zstd,compression-level=1,oci-mediatypes=true";
+
 pub(crate) mod bundle;
 pub(crate) mod docker;
 pub(crate) mod kind;
@@ -64,6 +79,25 @@ pub enum ImageSpec {
         /// toolchain is a distinct image; `None` leaves the Dockerfile default.
         rust_version: Option<String>,
     },
+}
+
+impl ImageSpec {
+    /// Whether this image was compiled with a Prometheus-metrics feature, and so
+    /// can accept a metrics-listener stanza in its config. A `Published` tag
+    /// carries whatever its publisher built and cannot opt a feature in, so it is
+    /// always `false`; only a `dev!` build with `prometheus` (or zaino's
+    /// `no_tls_with_prometheus`, which subsumes it) in its feature set qualifies.
+    /// Rendering the stanza against a binary built without the feature can be a
+    /// hard startup rejection, so the config generators gate on this.
+    pub(crate) fn metrics_enabled(&self) -> bool {
+        matches!(
+            self,
+            ImageSpec::Dev { features, .. }
+                if features
+                    .iter()
+                    .any(|f| f == "prometheus" || f == "no_tls_with_prometheus")
+        )
+    }
 }
 
 /// Where a [`ImageSpec::Dev`] image is built from.
@@ -127,14 +161,21 @@ impl DevSource {
                 context,
             } => {
                 let bundle = bundle::pack(context, dockerfile)?;
-                Ok(fold_suffix(bundle.digest.as_bytes(), features, rust_version))
+                Ok(fold_suffix(
+                    bundle.digest.as_bytes(),
+                    features,
+                    rust_version,
+                ))
             }
             DevSource::Git { rev, .. } => {
                 let base = sanitize_rev(rev);
                 if features.is_empty() && rust_version.is_none() {
                     Ok(base)
                 } else {
-                    Ok(format!("{base}-{}", fold_suffix(&[], features, rust_version)))
+                    Ok(format!(
+                        "{base}-{}",
+                        fold_suffix(&[], features, rust_version)
+                    ))
                 }
             }
         }
@@ -318,7 +359,7 @@ pub(crate) fn mirror_source(hub_ref: &str) -> String {
 /// preserving under `base` (`<registry>/ztest-images`): repo `zfnd/zebra` →
 /// `<base>/zfnd/zebra`. ITMS does prefix substitution, so the mirror must carry
 /// the same repo tail. Used as the ITMS `mirrors` entry (with the pull-side
-/// service base) and as the crane copy destination repo (with the push route base).
+/// service base) and as the buildkit push destination repo (with the push route base).
 pub(crate) fn mirror_repo(base: &str, hub_ref: &str) -> String {
     let (repo, _) = split_repo_tag(hub_ref);
     join(base, repo)
@@ -503,64 +544,6 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
 
-/// The `builder` / `runner-base` Dockerfiles, embedded so their bytes are the
-/// content-address for the on-cluster-built base images (built by
-/// [`base_images`](crate::resource::impls::base_images) at `ztest setup`; editing
-/// one forks its tag and triggers a rebuild).
-pub(crate) const BUILDER_DOCKERFILE: &str = include_str!("../../../docker/builder.Dockerfile");
-pub(crate) const RUNNER_BASE_DOCKERFILE: &str =
-    include_str!("../../../docker/runner-base.Dockerfile");
-
-/// Content-addressed tag (`<repo>:d-<hash>`) for a Dockerfile-built base image —
-/// the ImageStreamTag the on-cluster build outputs and every consumer references.
-fn dockerfile_tag(repo: &str, dockerfile: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(dockerfile.as_bytes());
-    format!("{repo}:d-{}", &format!("{:x}", h.finalize())[..16])
-}
-
-pub(crate) fn builder_image_tag() -> String {
-    dockerfile_tag("ztest-builder", BUILDER_DOCKERFILE)
-}
-
-pub(crate) fn runner_base_tag() -> String {
-    dockerfile_tag("ztest-runner-base", RUNNER_BASE_DOCKERFILE)
-}
-
-/// Pull reference of the on-cluster **builder** image. `None` for local kind.
-/// `ZTEST_BUILDER_IMAGE` overrides; otherwise the pull-base-qualified content tag
-/// from [`BUILDER_DOCKERFILE`]. The Deployment runs the digest-pinned form
-/// ([`pinned_builder_image`]), not this mutable tag.
-pub(crate) fn builder_image() -> Option<String> {
-    if let Some(explicit) = env_nonempty("ZTEST_BUILDER_IMAGE") {
-        return Some(explicit);
-    }
-    pull_base().map(|base| join(&base, &builder_image_tag()))
-}
-
-/// Route-side reference of the builder image, used to resolve its digest at setup
-/// time. The pull ref ([`builder_image`]) is the in-cluster registry *service*,
-/// unreachable from the laptop; the push route fronts the same storage, so the
-/// digest it returns is identical and pins the pull ref.
-pub(crate) fn builder_push_ref() -> Option<String> {
-    push_base().map(|base| join(&base, &builder_image_tag()))
-}
-
-/// The builder Deployment's image reference pinned to an immutable digest,
-/// resolving the mutable `:dev` tag via the push route ([`builder_push_ref`]).
-/// Digest-pinning makes a reseed observable to `ztest setup`'s drift check and
-/// keeps the default `IfNotPresent` pull policy correct. `None` when there is no
-/// builder image (kind) or the tag is not yet in the registry.
-pub(crate) async fn pinned_builder_image() -> Option<String> {
-    let tag_ref = builder_image()?;
-    if tag_ref.contains("@sha256:") {
-        return Some(tag_ref);
-    }
-    let digest = docker::openshift_manifest_digest(builder_push_ref()?).await?;
-    let repo = tag_ref.rsplit_once(':').map_or(tag_ref.as_str(), |(r, _)| r);
-    Some(format!("{repo}@{digest}"))
-}
-
 /// Whether test binaries are compiled *on the cluster* (OpenShift backend), so
 /// the laptop ships source, not artifacts. A standalone predicate so `ztest run`
 /// can branch on it before constructing a backend.
@@ -568,21 +551,8 @@ pub fn builds_on_cluster() -> bool {
     selected_backend().is_openshift()
 }
 
-/// In-cluster pull ref of the on-cluster-built runner base — the `FROM` the
-/// `crane` bake appends onto. Content-addressed on [`RUNNER_BASE_DOCKERFILE`].
-/// `None` off an OpenShift target (no on-cluster build).
-pub(crate) fn runner_base_ref() -> Option<String> {
-    pull_base().map(|base| join(&base, &runner_base_tag()))
-}
-
-/// Route-side reference of the runner base, used to probe its presence at setup
-/// (the pull-side service is laptop-unreachable; same registry storage).
-pub(crate) fn runner_base_push_ref() -> Option<String> {
-    push_base().map(|base| join(&base, &runner_base_tag()))
-}
-
-/// In-cluster repo (no tag) the on-cluster builder pushes the baked runner image
-/// to; `crane` appends the content-addressed `:dev-<hash>` tag.
+/// In-cluster repo (no tag) the runner image is pushed to; the on-cluster build
+/// appends the per-run `:dev-<run-id>` tag.
 pub(crate) fn runner_repo_ref() -> Option<String> {
     pull_base().map(|base| join(&base, crate::engine::pod_runner::RUNNER_REPO))
 }
@@ -653,7 +623,8 @@ pub fn pod_reference(tag: &str) -> String {
         ImageBackend::Registry => push_base().or_else(pull_base),
         ImageBackend::OpenShift => pull_base(),
     };
-    base.map(|b| join(&b, tag)).unwrap_or_else(|| tag.to_string())
+    base.map(|b| join(&b, tag))
+        .unwrap_or_else(|| tag.to_string())
 }
 
 /// Resolve an [`ImageSpec`] to the string that goes into a pod manifest.
@@ -939,7 +910,7 @@ mod tests {
             mirror_source("electriccoinco/lightwalletd:v0.4.17"),
             "docker.io/electriccoinco/lightwalletd"
         );
-        // Mirror repo (ITMS `mirrors` entry / crane dest repo) preserves the repo
+        // Mirror repo (ITMS `mirrors` entry / buildkit push dest repo) preserves the repo
         // tail under the registry base — ITMS substitutes only the source prefix.
         let base = "image-registry.openshift-image-registry.svc:5000/ztest-images";
         assert_eq!(
@@ -952,7 +923,10 @@ mod tests {
             "image-registry.openshift-image-registry.svc:5000/ztest-images/zfnd/zebra:6.2.0"
         );
         // A tagless ref defaults to `latest`, never silently dropped.
-        assert_eq!(mirror_dest(base, "zfnd/zebra"), format!("{base}/zfnd/zebra:latest"));
+        assert_eq!(
+            mirror_dest(base, "zfnd/zebra"),
+            format!("{base}/zfnd/zebra:latest")
+        );
     }
 
     #[test]
@@ -1127,7 +1101,15 @@ mod tests {
         };
         let base = id("zainod", &["a"], None, &local("/laptop/x/../../Dockerfile"));
         // Path-independent: a different absolute Dockerfile path is the same id.
-        assert_eq!(base, id("zainod", &["a"], None, &local("/cache/src/x/../../Dockerfile")));
+        assert_eq!(
+            base,
+            id(
+                "zainod",
+                &["a"],
+                None,
+                &local("/cache/src/x/../../Dockerfile")
+            )
+        );
         // Feature order-independent.
         assert_eq!(
             id("zainod", &["a", "b"], None, &local("/x")),
@@ -1144,7 +1126,10 @@ mod tests {
             dockerfile: "d".into(),
             context: ".".into(),
         };
-        assert_ne!(id("zebrad", &[], None, &git), id("zebrad", &[], None, &local("/x")));
+        assert_ne!(
+            id("zebrad", &[], None, &git),
+            id("zebrad", &[], None, &local("/x"))
+        );
     }
 
     /// A build context can itself live under a `target/` dir. The tag must still
@@ -1209,7 +1194,10 @@ mod tests {
         // Seed the manifest by the spec's id, then it resolves to that reference.
         let id = DevImageId::of("manifesttest", &["x".to_string()], None, &src);
         let mut map = std::collections::BTreeMap::new();
-        map.insert(id.as_str().to_string(), "reg.svc:5000/ns/manifesttest:dev-abc".to_string());
+        map.insert(
+            id.as_str().to_string(),
+            "reg.svc:5000/ns/manifesttest:dev-abc".to_string(),
+        );
         seed_dev_images(&map);
         assert_eq!(
             resolve(&spec, "unused").unwrap().image,

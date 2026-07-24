@@ -176,7 +176,10 @@ pub(crate) fn pvc_io_reservation(pvc: &PersistentVolumeClaim) -> Resources {
     let Some(a) = pvc.metadata.annotations.as_ref() else {
         return Resources::ZERO;
     };
-    let io_bps = a.get(ANNOTATION_IO_BPS).map(|s| parse_mem_bytes(s)).unwrap_or(0);
+    let io_bps = a
+        .get(ANNOTATION_IO_BPS)
+        .map(|s| parse_mem_bytes(s))
+        .unwrap_or(0);
     let io_iops = a
         .get(ANNOTATION_IO_IOPS)
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -332,7 +335,10 @@ mod tests {
         assert_eq!(fp.mem_bytes, 4 * GIB);
         // A Guaranteed pod (requests == limits) reserves exactly that.
         let g = pod(vec![burstable("2", "2Gi", "2", "2Gi")], vec![]);
-        assert_eq!(pod_effective_request(&g), Resources::new(2_000, 2 * GIB, 0, 0));
+        assert_eq!(
+            pod_effective_request(&g),
+            Resources::new(2_000, 2 * GIB, 0, 0)
+        );
     }
 
     #[test]
@@ -367,10 +373,7 @@ mod tests {
 
     #[test]
     fn pvc_io_reservation_reads_the_storage_request_annotations() {
-        let p = pvc(&[
-            (ANNOTATION_IO_BPS, "100Mi"),
-            (ANNOTATION_IO_IOPS, "5000"),
-        ]);
+        let p = pvc(&[(ANNOTATION_IO_BPS, "100Mi"), (ANNOTATION_IO_IOPS, "5000")]);
         let fp = pvc_io_reservation(&p);
         assert_eq!(fp.io_bps, 100 * crate::qos::MIB);
         assert_eq!(fp.io_iops, 5_000);

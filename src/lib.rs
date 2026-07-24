@@ -131,16 +131,15 @@ pub mod prelude {
         Validator, ValidatorBackend, Wallet, WalletBackend, WalletExt, ZainoIndexer, ZatBalance,
         ZcashdValidator, ZebraValidator,
     };
+    pub use crate::backends::zainod::ZainoTuning;
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
-        REGTEST_FIXTURE_HEIGHTS_CLI_STRING, Regtest, RegtestState, Testnet, TestnetState,
-        regtest_test_activation_heights, regtest_test_lockbox_disbursements,
+        Regtest, Testnet, regtest_test_activation_heights, regtest_test_lockbox_disbursements,
         regtest_test_post_nu6_funding_streams,
     };
     /// `ActivationHeights` appears in ztest's public signatures (e.g.
     /// [`ValidatorBackend::activation_heights`]), so callers need the type to
     /// consume what ztest returns.
     pub use crate::topology::ActivationHeights;
-    pub use crate::topology::NetworkUpgrade;
     pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file};
 }

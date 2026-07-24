@@ -167,11 +167,16 @@ fn delta(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Option<Dur
 /// The `lastTransitionTime` of the pod condition of `type_` whose status is
 /// `"True"`.
 fn condition_true_at(pod: &Pod, type_: &str) -> Option<DateTime<Utc>> {
-    pod.status.as_ref()?.conditions.as_ref()?.iter().find_map(|c| {
-        (c.type_ == type_ && c.status == "True")
-            .then(|| c.last_transition_time.as_ref().map(|t| t.0))
-            .flatten()
-    })
+    pod.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find_map(|c| {
+            (c.type_ == type_ && c.status == "True")
+                .then(|| c.last_transition_time.as_ref().map(|t| t.0))
+                .flatten()
+        })
 }
 
 /// Extract the [`PodPhases`] lifecycle boundaries from an observed pod. Reads

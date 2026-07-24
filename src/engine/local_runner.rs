@@ -53,6 +53,10 @@ pub struct EngineEnv {
     pub sa: String,
     /// Whether `ZTEST_NO_CLEANUP=1` should be set.
     pub no_cleanup: bool,
+    /// The operator's `ZTEST_LOG` diagnostics filter, captured once at run start
+    /// and forwarded verbatim into each test pod so the in-pod subscriber
+    /// matches the laptop's. `None` when unset (the pod keeps its own default).
+    pub ztest_log: Option<String>,
     /// Whether the child's output is piped and replayed by the reporter. `false`
     /// under `--no-capture`: the child inherits this process's stdio and streams
     /// straight to the terminal (which also forces a serial run).
@@ -225,6 +229,7 @@ mod tests {
             sa: "ztest-local".into(),
             no_cleanup: false,
             capture: true,
+            ztest_log: None,
         }
     }
 

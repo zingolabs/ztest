@@ -3,22 +3,16 @@
 
 use crate::topology::ActivationHeights;
 
-/// The regtest fixture activation heights: the schedule at the
-/// [`NetworkUpgrade::HIGHEST`](crate::topology::NetworkUpgrade::HIGHEST)
-/// ceiling, so this fixture and
-/// [`activation_heights_for_ceiling`](crate::topology::activation_heights_for_ceiling)
-/// can never disagree on a height.
+/// The regtest fixture activation heights: the canonical default schedule
+/// ([`ActivationHeights::regtest_default`]), with NU6.3/Ironwood active.
 ///
 /// Callers mining past NU6.1 must pair this with
 /// [`regtest_test_lockbox_disbursements`] and
 /// [`regtest_test_post_nu6_funding_streams`], or the NU6.1 activation block
 /// is rejected.
 pub fn regtest_test_activation_heights() -> ActivationHeights {
-    crate::topology::activation_heights_for_ceiling(crate::topology::NetworkUpgrade::HIGHEST)
+    crate::topology::ActivationHeights::regtest_default()
 }
-
-/// CLI string form for `clap` defaults that need a `&'static str`.
-pub const REGTEST_FIXTURE_HEIGHTS_CLI_STRING: &str = "all=1,nu5=2,nu6=2,nu6_1=5,nu6_2=5,nu7=off";
 
 /// One lockbox disbursement output for Zebra's regtest
 /// `[network.testnet_parameters]`. Required for any regtest chain that
@@ -153,16 +147,9 @@ pub(crate) fn parse_activation_heights_from_rpc(
 /// let zaino  = env.add_indexer(Indexer::zainod("0.4.0-rc.2-no-tls").regtest());
 /// ```
 pub trait Regtest: Sized {
-    /// For indexers this is the fetch backend by default; pair with
-    /// [`RegtestState::regtest_state`] for the state backend.
+    /// Apply the standard regtest fixture. The fetch/state backend is an
+    /// orthogonal choice — see [`Indexer::backend`](crate::component::Indexer::backend).
     fn regtest(self) -> Self;
-}
-
-/// Companion to [`Regtest`] for components that have a "state" variant
-/// of the regtest config (currently zainod).
-pub trait RegtestState: Sized {
-    /// Apply the standard regtest fixture with the state backend.
-    fn regtest_state(self) -> Self;
 }
 
 /// Builder shortcut: apply a named testnet fixture to a component.
@@ -178,13 +165,9 @@ pub trait RegtestState: Sized {
 /// let zaino  = env.add_indexer(Indexer::zainod("0.4.0-rc.2-no-tls").testnet("orchard"));
 /// ```
 pub trait Testnet: Sized {
+    /// Apply the named testnet fixture. The fetch/state backend is an
+    /// orthogonal choice — see [`Indexer::backend`](crate::component::Indexer::backend).
     fn testnet(self, variant: &str) -> Self;
-}
-
-/// Companion to [`Testnet`] for components that have a "state" variant
-/// of the testnet config (currently zainod).
-pub trait TestnetState: Sized {
-    fn testnet_state(self, variant: &str) -> Self;
 }
 
 /// Which on-disk chain layout a testnet archive carries; drives the

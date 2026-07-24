@@ -164,14 +164,14 @@ mod tests {
 
     #[test]
     fn total_is_sum_of_count_times_admitted() {
-        // Admitted totals (components + runner): basic 2c/1Gi, integration 3c/3Gi.
-        // 3 basic + 1 integration → 9c, 6Gi.
+        // Admitted totals (components + runner): basic 2c/1Gi, integration 4c/4Gi.
+        // 3 basic + 1 integration → 10c, 7Gi.
         let p = plan(
             &counts(&[(QosClass::Basic, 3), (QosClass::Integration, 1)]),
             None,
         );
-        assert_eq!(p.total.cpu_milli, 3 * 2000 + 3000);
-        assert_eq!(p.total.mem_bytes, 3 * GIB + 3 * GIB);
+        assert_eq!(p.total.cpu_milli, 3 * 2000 + 4000);
+        assert_eq!(p.total.mem_bytes, 3 * GIB + 4 * GIB);
     }
 
     #[test]
@@ -188,14 +188,14 @@ mod tests {
 
     #[test]
     fn spills_into_multiple_waves_when_total_exceeds_capacity() {
-        // 5 integration (3c/3Gi admitted each) on a 4-core / 8-GiB cluster:
+        // 5 integration (4c/4Gi admitted each) on a 4-core / 8-GiB cluster:
         // CPU-bound → 1 fits per wave → ceil(5/1) = 5 waves.
         let p = plan(
             &counts(&[(QosClass::Integration, 5)]),
             Some(Resources::new(4000, 8 * GIB, 0, 0)),
         );
         assert_eq!(p.waves, 5);
-        assert_eq!(p.peak, Resources::new(3000, 3 * GIB, 0, 0));
+        assert_eq!(p.peak, Resources::new(4000, 4 * GIB, 0, 0));
     }
 
     #[test]

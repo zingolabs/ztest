@@ -2,6 +2,7 @@
 //! persistent render thread (`cli::console`) pins a status panel to the bottom
 //! while each phase's output scrolls above it; non-TTY runs linearly, no panel.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write, stdout};
 use std::process::ExitCode;
@@ -19,6 +20,56 @@ use crate::pipeline::{self, ArchivesOutcome, BuildOutcome, ProbeOutcome};
 /// nextest's documented exit codes so CI can cross-reference them.
 fn exit(code: i32) -> ExitCode {
     ExitCode::from(code as u8)
+}
+
+/// The single fatal-exit path: emit `msg` durably and return `code`.
+///
+/// With a console the message goes through [`Console::fatal`], which the render
+/// thread reprints on a clean line once the pinned panel is torn down. A raw
+/// `eprintln!` here would instead be overwritten by the footer's in-place
+/// repaint and vanish behind a frozen frame — the failure mode that made setup
+/// errors look like silent stalls. Without a console (non-TTY) stderr is already
+/// durable, so it prints directly.
+fn fatal(console: Option<&Console>, msg: impl std::fmt::Display, code: i32) -> ExitCode {
+    match console {
+        Some(c) => c.fatal(msg.to_string()),
+        None => eprintln!("{msg}"),
+    }
+    exit(code)
+}
+
+/// Route panics through the durable fatal surface. The default panic hook writes
+/// to stderr while the render thread is still repainting the footer, so its
+/// message is clobbered; instead capture the panic and hand it to the render
+/// thread, which reprints it on teardown (see [`Console::fatal`]). Installed only
+/// with a console — non-TTY keeps the default hook, whose stderr is already
+/// durable and carries the standard backtrace.
+fn install_panic_surface(console: &Console) {
+    let sink = console.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        sink.fatal(format_panic(info));
+    }));
+}
+
+/// Format a panic for the fatal surface: message, source location, and — when
+/// `RUST_BACKTRACE` is set — the captured backtrace.
+fn format_panic(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = info
+        .payload()
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>");
+    let loc = info
+        .location()
+        .map(|l| format!(" at {}:{}", l.file(), l.line()))
+        .unwrap_or_default();
+    let mut out = format!("ztest run: internal error (panic){loc}: {payload}");
+    let bt = std::backtrace::Backtrace::capture();
+    if matches!(bt.status(), std::backtrace::BacktraceStatus::Captured) {
+        out.push_str(&format!("\nbacktrace:\n{bt}"));
+    }
+    out
 }
 
 /// Exit code for a Ctrl-C-interrupted run: the shell convention `128 + SIGINT`.
@@ -395,7 +446,10 @@ pub fn execute(args: Args) -> ExitCode {
         (None, None)
     };
     if let Some(c) = &console {
-        push_preflight_scene(c, &state, &Transfers::default(), "Preflight", &theme);
+        // Route panics to the render thread so a crash surfaces on teardown
+        // instead of being wiped by the live footer.
+        install_panic_surface(c);
+        push_preflight_scene(c, &state, &Transfers::default(), "Preflight", &theme, None);
     }
 
     let code = run_inner(
@@ -485,8 +539,12 @@ fn run_inner(
             if cancelled() {
                 return cancel_exit();
             }
-            eprintln!("ztest run: pipeline phase crashed: {err}");
-            return ExitCode::FAILURE; // unexpected: nextest maps unknown failures to 1
+            // unexpected: nextest maps unknown failures to 1
+            return fatal(
+                console,
+                format!("ztest run: pipeline phase crashed: {err}"),
+                1,
+            );
         }
     };
     if cancelled() {
@@ -497,12 +555,11 @@ fn run_inner(
     // cluster we can't run on. Surface the detail, or it dies with the
     // torn-down banner and the run appears to exit for no reason.
     if let ProbeOutcome::Failed { detail } = &outcome.probe {
-        let msg = format!("ztest run: cluster probe failed — {detail}");
-        match console {
-            Some(c) => c.scrollback(format!("{msg}\n")),
-            None => eprintln!("{msg}"),
-        }
-        return exit(NextestExitCode::SETUP_ERROR);
+        return fatal(
+            console,
+            format!("ztest run: cluster probe failed — {detail}"),
+            NextestExitCode::SETUP_ERROR,
+        );
     }
 
     // Image phases, only when Phase B succeeded.
@@ -562,7 +619,7 @@ fn launch_engine(
 
     // Final panel refresh with all phases resolved.
     if let Some(c) = console {
-        push_preflight_scene(c, state, &Transfers::default(), "Preflight", theme);
+        push_preflight_scene(c, state, &Transfers::default(), "Preflight", theme, None);
     }
 
     // In non-TTY mode print the full resolved banner so CI logs have a record.
@@ -575,17 +632,13 @@ fn launch_engine(
         return exit(NextestExitCode::BUILD_FAILED);
     }
     if let Some(detail) = &image_phase.failure {
-        // Route through the console's durable scrollback, not `eprintln`: the
-        // render thread's teardown would otherwise wipe a raw stderr write.
-        let msg = format!("ztest run: image preflight failed: {detail}");
-        match console {
-            Some(c) => c.scrollback(format!("{msg}\n")),
-            None => eprintln!("{msg}"),
-        }
-        return exit(NextestExitCode::SETUP_ERROR);
+        return fatal(
+            console,
+            format!("ztest run: image preflight failed: {detail}"),
+            NextestExitCode::SETUP_ERROR,
+        );
     }
     // No tests selected: honor `--no-tests` (nextest default `fail` ⇒ exit 4).
-    // Route through the console so the message survives the render-thread teardown.
     if let BuildOutcome::Ok { test_count: 0, .. } = build {
         let (msg, code) = if opts.no_tests_is_error() {
             (
@@ -595,11 +648,7 @@ fn launch_engine(
         } else {
             ("ztest run: no tests to run", NextestExitCode::OK)
         };
-        match console {
-            Some(c) => c.scrollback(format!("{msg}\n")),
-            None => eprintln!("{msg}"),
-        }
-        return exit(code);
+        return fatal(console, msg, code);
     }
 
     // The engine's 2D scheduler is seeded from the cluster's free capacity
@@ -609,8 +658,11 @@ fn launch_engine(
     let capacity = match probe {
         ProbeOutcome::Ok { capacity, .. } => capacity,
         _ => {
-            eprintln!("ztest run: requires a probed cluster (no kubeconfig / probe unavailable)");
-            return exit(NextestExitCode::SETUP_ERROR);
+            return fatal(
+                console,
+                "ztest run: requires a probed cluster (no kubeconfig / probe unavailable)",
+                NextestExitCode::SETUP_ERROR,
+            );
         }
     };
     let (summary, selected_binaries) = match build {
@@ -629,26 +681,58 @@ fn launch_engine(
     let run_id = format!("ztest-run-{}", std::process::id());
 
     // Acquire this run's cross-run capacity reservation. The granted slice — not
-    // a raw `free()` snapshot — is the scheduler ceiling, so concurrent runs
+    // a raw `free()` snapshot — seeds the scheduler ceiling, so concurrent runs
     // carve the node up instead of all claiming the same headroom
-    // (`docs/qos-cross-run-ledger-design.md`). A renewal task keeps the lease
-    // live; it is released after the engine exits.
-    let grant = match work_rt.block_on(async {
-        let client = crate::cluster::client()
-            .await
-            .map_err(|e| format!("cluster client: {e}"))?;
-        crate::qos::ledger::acquire(&client, &run_id, &sa, &run.user, capacity.allocatable)
-            .await
-            .map_err(|e| e.to_string())
-    }) {
+    // (`docs/design-qos.md`).
+    let client = match work_rt.block_on(crate::cluster::client()) {
+        Ok(c) => c,
+        Err(e) => {
+            return fatal(
+                console,
+                format!("cluster client: {e}"),
+                NextestExitCode::SETUP_ERROR,
+            );
+        }
+    };
+    let grant = match work_rt.block_on(crate::qos::ledger::acquire(
+        &client,
+        &run_id,
+        &sa,
+        &run.user,
+        capacity.allocatable,
+    )) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("ztest run: reservation ledger: {e}");
-            return exit(NextestExitCode::SETUP_ERROR);
+            return fatal(
+                console,
+                format!("ztest run: {e}"),
+                NextestExitCode::SETUP_ERROR,
+            );
         }
     };
     let ceiling = grant.slice;
-    let renew_task = work_rt.spawn(grant.renewer.clone().renew_forever());
+
+    // The cross-run governor drives this run's reservation and the scheduler
+    // ceiling live for the whole run — a lone run expands to fill the cluster, a
+    // busy one cedes its fair share to peers — and its reconcile heartbeat renews
+    // the Lease, so there is no separate renewal task. The demand channel carries
+    // the scheduler's live appetite back to it. Dropped (aborted) before the
+    // Lease is released so it cannot re-create the Lease after release.
+    let (demand_tx, demand_rx) =
+        tokio::sync::watch::channel(crate::qos::governor::RunDemand::default());
+    let (governor, ceiling_rx) = work_rt.block_on(async {
+        crate::qos::governor::spawn(
+            crate::qos::governor::GovernorConfig {
+                client: client.clone(),
+                run_id: run_id.clone(),
+                allocatable: capacity.allocatable,
+                budget: grant.budget,
+                initial: grant.slice,
+                renewer: grant.renewer.clone(),
+            },
+            demand_rx,
+        )
+    });
 
     let input = engine::EngineInput {
         summary,
@@ -668,11 +752,16 @@ fn launch_engine(
             run_id,
             output: opts.output_config(),
         },
+        capacity: Some(engine::schedule::CapacityChannels {
+            ceiling_rx,
+            demand_tx,
+        }),
     };
     let code = engine::run(work_rt, input, console, theme, state.qos_plan.clone());
-    // Release the reservation on every exit path so the freed capacity is
-    // available to the next run immediately (the TTL is only the crash backstop).
-    renew_task.abort();
+    // Stop the governor before releasing, then release the reservation on every
+    // exit path so freed capacity is available to the next run immediately (the
+    // TTL is only the crash backstop).
+    drop(governor);
     work_rt.block_on(grant.renewer.release());
     if cancelled() {
         return cancel_exit();
@@ -680,10 +769,11 @@ fn launch_engine(
     code
 }
 
-/// The on-cluster-compile path: the laptop ships source and the builder pod
-/// produces the binaries via [`pipeline::remote_compile::compile_on_cluster`]
-/// (source rsync → `cargo nextest list` → inventory dump → `crane` bake of the
-/// runner image). Provisioning and the engine tail are the shared paths.
+/// The on-cluster-compile path: probe the cluster, start the ephemeral BuildKit
+/// builder pod, then ship source and have that pod produce the binaries via
+/// [`pipeline::remote_compile::compile_on_cluster`] (source stream → BuildKit
+/// runner build → inventory export). Provisioning and the engine tail are the
+/// shared paths. The probe, builder startup, and compile are distinct phases.
 fn run_inner_on_cluster(
     work_rt: &tokio::runtime::Runtime,
     opts: &RunOptions,
@@ -716,41 +806,55 @@ fn run_inner_on_cluster(
         return cancel_exit();
     }
 
-    // A hard probe failure aborts before we drive the builder.
+    // A hard probe failure aborts before we drive the builder. A `Missing` probe
+    // (unresolved kubeconfig/context) falls through to the no-client guard below.
     if let ProbeOutcome::Failed { detail } = &probe {
-        let msg = format!("ztest run: cluster probe failed — {detail}");
-        match console {
-            Some(c) => c.scrollback(format!("{msg}\n")),
-            None => eprintln!("{msg}"),
-        }
-        return exit(NextestExitCode::SETUP_ERROR);
+        return fatal(
+            console,
+            format!("ztest run: cluster probe failed — {detail}"),
+            NextestExitCode::SETUP_ERROR,
+        );
     }
     let Some(client) = client else {
-        eprintln!(
-            "ztest run: on-cluster build requires a reachable cluster (no kubeconfig / probe unavailable)"
+        return fatal(
+            console,
+            "ztest run: on-cluster build requires a reachable cluster (no kubeconfig / probe unavailable)",
+            NextestExitCode::SETUP_ERROR,
         );
-        return exit(NextestExitCode::SETUP_ERROR);
     };
 
-    // Registry coordinates for the in-pod `crane` bake (runner base + push repo).
-    // These are the in-cluster pull addresses, i.e. `ZTEST_IMAGE_REGISTRY`.
-    let (Some(base_ref), Some(runner_repo_ref)) = (
-        crate::backends::image::runner_base_ref(),
-        crate::backends::image::runner_repo_ref(),
-    ) else {
-        eprintln!(
-            "ztest run: on-cluster build requires ZTEST_IMAGE_REGISTRY (the in-cluster pull address)"
+    // Registry repo the runner build pushes to (the in-cluster pull address,
+    // i.e. `ZTEST_IMAGE_REGISTRY`).
+    let Some(runner_repo_ref) = crate::backends::image::runner_repo_ref() else {
+        return fatal(
+            console,
+            "ztest run: on-cluster build requires ZTEST_IMAGE_REGISTRY (the in-cluster pull address)",
+            NextestExitCode::SETUP_ERROR,
         );
-        return exit(NextestExitCode::SETUP_ERROR);
     };
-    let refs = pipeline::remote_compile::BakeRefs {
-        base_ref,
-        runner_repo_ref,
+    let refs = pipeline::remote_compile::BakeRefs { runner_repo_ref };
+
+    // The probe is a pre-build snapshot; watch capacity so the panel reflects the
+    // build pod and test churn instead of stale pre-build headroom.
+    let initial_cap = match &probe {
+        ProbeOutcome::Ok { capacity, .. } => *capacity,
+        _ => Default::default(),
     };
+    // `spawn` schedules its watch tasks with `tokio::spawn`, so it must be called
+    // within a runtime context. Enter `work_rt` (multi-thread) so those tasks run
+    // on its workers and keep capacity current while this thread blocks on the
+    // build; without the guard `tokio::spawn` finds no reactor and panics.
+    let cap_watch = {
+        let _enter = work_rt.enter();
+        pipeline::capacity_watch::spawn(client.clone(), initial_cap)
+    };
+    let cap_rx = cap_watch.receiver();
 
     // Phase B/C on the cluster. No local child streams output, so the panel's
     // one live row names the current remote sub-phase, its timer reset at each
-    // transition by the `on_phase` callback below.
+    // transition by the `on_phase` callback below. Defined before the build pod
+    // so its startup (below) reports as the first sub-phase, rather than an
+    // invisible wait that looks like the probe hanging.
     let started = Instant::now();
 
     // With a console the builder compiles under a PTY and its raw bytes feed the
@@ -813,36 +917,90 @@ fn run_inner_on_cluster(
                 phase: Some(phase),
             };
             if let Some(c) = console {
-                push_preflight_scene(c, state, &Transfers::default(), "Compiling", theme);
+                push_preflight_scene(
+                    c,
+                    state,
+                    &Transfers::default(),
+                    "Compiling",
+                    theme,
+                    Some(cap_rx.clone()),
+                );
             }
         }
     };
 
+    // Startup builder: create the ephemeral BuildKit pod this run builds in and
+    // wait it Ready. It holds the build footprint (Guaranteed) so it's torn down
+    // after the build phase and must not linger into the test run; labeled with
+    // the run id so `reap_run` removes it on Ctrl-C / cleanup. Reported as its own
+    // phase (with a live timer) rather than a silent wait — a build pod that can't
+    // schedule is otherwise indistinguishable from a hung probe.
+    use pipeline::remote_compile::Phase;
+    on_phase(Phase::Start("startup builder"));
+    let t_builder = Instant::now();
+    let build_pod = match work_rt.block_on(async {
+        let p = crate::resource::impls::buildkit::create_build_pod(&client, &run.run_id).await?;
+        if let Err(e) = crate::resource::impls::buildkit::wait_build_pod_ready(&client, &p).await {
+            // Created but never came Ready (crashed / unschedulable): reap it here
+            // so a failed startup can't leak its 32c/20GiB Guaranteed footprint.
+            crate::resource::impls::buildkit::delete_build_pod(&client, &p).await;
+            return Err(e);
+        }
+        Ok::<_, crate::resource::ResourceError>(p)
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(c) = console {
+                c.flush_live();
+            }
+            return fatal(
+                console,
+                format!("ztest run: startup builder failed — {e}"),
+                NextestExitCode::SETUP_ERROR,
+            );
+        }
+    };
+    on_phase(Phase::Done {
+        label: "builder pod ready",
+        dur: t_builder.elapsed(),
+    });
+    if cancelled() {
+        work_rt.block_on(crate::resource::impls::buildkit::delete_build_pod(
+            &client, &build_pod,
+        ));
+        return cancel_exit();
+    }
+
     let remote = work_rt.block_on(pipeline::remote_compile::compile_on_cluster(
         &client,
+        &build_pod,
         &opts.list_args,
         &refs,
+        &run.run_id,
         Some(compile_out),
         Some(&mut on_phase),
     ));
-    drop(on_phase);
     if cancelled() {
         return cancel_exit();
     }
     let remote = match remote {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("ztest run: on-cluster compile failed — {e}");
-            match console {
-                Some(c) => {
-                    // Commit the failing compile's output before the error line,
-                    // or the error lands above the output that explains it.
-                    c.flush_live();
-                    c.scrollback(format!("{msg}\n"));
-                }
-                None => eprintln!("{msg}"),
+            // Drop the ephemeral build pod before bailing — a failed build must
+            // not leak its 32c/20GiB Guaranteed footprint until the janitor.
+            work_rt.block_on(crate::resource::impls::buildkit::delete_build_pod(
+                &client, &build_pod,
+            ));
+            // Commit the failing compile's output before the error line, so the
+            // error lands after (not above) the output that explains it.
+            if let Some(c) = console {
+                c.flush_live();
             }
-            return exit(NextestExitCode::BUILD_FAILED);
+            return fatal(
+                console,
+                format!("ztest run: on-cluster compile failed — {e}"),
+                NextestExitCode::BUILD_FAILED,
+            );
         }
     };
 
@@ -877,15 +1035,17 @@ fn run_inner_on_cluster(
         // `compile_on_cluster` only ever returns `Discovered`, but handle the
         // failure variant rather than unwrap.
         images::DumpOutcome::Failed { detail } => {
-            let msg = format!("ztest run: on-cluster inventory dump failed — {detail}");
-            match console {
-                Some(c) => {
-                    c.flush_live();
-                    c.scrollback(format!("{msg}\n"));
-                }
-                None => eprintln!("{msg}"),
+            work_rt.block_on(crate::resource::impls::buildkit::delete_build_pod(
+                &client, &build_pod,
+            ));
+            if let Some(c) = console {
+                c.flush_live();
             }
-            return exit(NextestExitCode::SETUP_ERROR);
+            return fatal(
+                console,
+                format!("ztest run: on-cluster inventory dump failed — {detail}"),
+                NextestExitCode::SETUP_ERROR,
+            );
         }
     };
     let image_phase = provision_and_resolve(
@@ -896,10 +1056,17 @@ fn run_inner_on_cluster(
         deps_by_binary,
         remote.qos_by_binary,
         RunnerSource::Prebaked(remote.runner_image_ref),
+        Some(build_pod.clone()),
         console,
         state,
         theme,
+        Some(cap_rx.clone()),
     );
+    // Build phase done — drop the ephemeral build pod so its footprint isn't held
+    // through the test run (reap_run is the backstop on the error/cancel paths).
+    work_rt.block_on(crate::resource::impls::buildkit::delete_build_pod(
+        &client, &build_pod,
+    ));
     if cancelled() {
         return cancel_exit();
     }
@@ -929,18 +1096,40 @@ fn fmt_dur(d: std::time::Duration) -> String {
     }
 }
 
+/// A scene closure reads this each frame to paint live capacity; `None` uses the
+/// state's static Phase-A figure.
+type CapRx = tokio::sync::watch::Receiver<crate::qos::ClusterCapacity>;
+
+/// Clones only on the live path, so the static path stays borrow-only.
+fn with_live_capacity<'a>(snap: &'a BannerState, cap: Option<&CapRx>) -> Cow<'a, BannerState> {
+    match cap {
+        Some(rx) => {
+            let mut s = snap.clone();
+            s.cluster.capacity = *rx.borrow();
+            Cow::Owned(s)
+        }
+        None => Cow::Borrowed(snap),
+    }
+}
+
 fn push_preflight_scene(
     con: &Console,
     state: &BannerState,
     transfers: &Transfers,
     label: &'static str,
     theme: &Theme,
+    cap: Option<CapRx>,
 ) {
     let snap = state.clone();
     let tx = transfers.clone();
     let theme = theme.clone();
     con.scene(move |elapsed| SceneFrame {
-        left: preflight::render_preflight_panel(&snap, label, elapsed, &theme),
+        left: preflight::render_preflight_panel(
+            &with_live_capacity(&snap, cap.as_ref()),
+            label,
+            elapsed,
+            &theme,
+        ),
         right: preflight::render_transfers(&tx, elapsed, &theme),
         // `None` → the live region derives from the avt grid (the child's output).
         live: None,
@@ -949,12 +1138,23 @@ fn push_preflight_scene(
 
 /// The `Building`-phase scene; `live: None` so the region derives from the avt
 /// grid where every build streams its native output.
-fn push_building_scene(con: &Console, state: &BannerState, transfers: &Transfers, theme: &Theme) {
+fn push_building_scene(
+    con: &Console,
+    state: &BannerState,
+    transfers: &Transfers,
+    theme: &Theme,
+    cap: Option<CapRx>,
+) {
     let snap = state.clone();
     let tx = transfers.clone();
     let theme = theme.clone();
     con.scene(move |elapsed| SceneFrame {
-        left: preflight::render_preflight_panel(&snap, "Building", elapsed, &theme),
+        left: preflight::render_preflight_panel(
+            &with_live_capacity(&snap, cap.as_ref()),
+            "Building",
+            elapsed,
+            &theme,
+        ),
         right: preflight::render_transfers(&tx, elapsed, &theme),
         live: None,
     });
@@ -1165,7 +1365,7 @@ fn pipeline_console(
             started_at,
             phase: None,
         };
-        push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
+        push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme, None);
 
         let mut args = vec![
             "nextest".to_string(),
@@ -1187,7 +1387,7 @@ fn pipeline_console(
             state.build = BuildState::Indexing {
                 started_at: Instant::now(),
             };
-            push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
+            push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme, None);
             drive_draining(
                 pipeline::build::index(list_args),
                 &mut upd_rx,
@@ -1222,7 +1422,7 @@ fn pipeline_console(
         while let Ok(u) = upd_rx.try_recv() {
             apply_update(state, u);
         }
-        push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
+        push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme, None);
 
         let probe = probe_handle
             .await
@@ -1251,7 +1451,7 @@ async fn run_child_draining(
             u = upd_rx.recv(), if upd_open => match u {
                 Some(u) => {
                     apply_update(state, u);
-                    push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
+                    push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme, None);
                 }
                 None => upd_open = false,
             },
@@ -1276,7 +1476,7 @@ async fn drive_draining<F: std::future::Future>(
             u = upd_rx.recv(), if upd_open => match u {
                 Some(u) => {
                     apply_update(state, u);
-                    push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme);
+                    push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme, None);
                 }
                 None => upd_open = false,
             },
@@ -1529,9 +1729,11 @@ fn run_image_phases(
         deps_by_binary,
         qos_by_binary,
         RunnerSource::None,
+        None,
         console,
         state,
         theme,
+        None,
     )
 }
 
@@ -1558,9 +1760,14 @@ fn provision_and_resolve(
     deps_by_binary: Vec<(String, Vec<crate::inventory::TestDepEntry>)>,
     qos_by_binary: Vec<(String, Vec<QosEntry>)>,
     runner: RunnerSource,
+    // The ephemeral BuildKit pod component-image builds exec against (on-cluster
+    // path); `None` on the local/kind path, which builds no images on a pod.
+    build_pod: Option<String>,
     console: Option<&Console>,
     state: &mut BannerState,
     theme: &Theme,
+    // `Some` on the on-cluster path, where the build pod is still scheduled here.
+    cap_rx: Option<CapRx>,
 ) -> ImagePhaseOutcome {
     use crate::resource;
     use std::collections::HashMap;
@@ -1589,7 +1796,7 @@ fn provision_and_resolve(
     // provisioning's build output lands on a clean grid.
     if let Some(c) = console {
         c.flush_live();
-        push_building_scene(c, state, &registry.snapshot(), theme);
+        push_building_scene(c, state, &registry.snapshot(), theme, cap_rx.clone());
     }
 
     // Plan the resource graph (images + seeds) and provision it. `probe` skips
@@ -1646,6 +1853,9 @@ fn provision_and_resolve(
         if let Some(p) = progress {
             builder = builder.progress(p);
         }
+        if let Some(pod) = build_pod {
+            builder = builder.build_pod(pod);
+        }
         let cx = builder.build();
         let on_change = {
             let tx = tx.clone();
@@ -1668,14 +1878,14 @@ fn provision_and_resolve(
                         registry.apply(ev);
                     }
                     if let Some(c) = console {
-                        push_building_scene(c, state, &registry.snapshot(), theme);
+                        push_building_scene(c, state, &registry.snapshot(), theme, cap_rx.clone());
                     }
                     break states;
                 }
                 Some(ev) = rx.recv() => {
                     registry.apply(ev);
                     if let Some(c) = console {
-                        push_building_scene(c, state, &registry.snapshot(), theme);
+                        push_building_scene(c, state, &registry.snapshot(), theme, cap_rx.clone());
                     }
                 }
             }
@@ -1791,7 +2001,12 @@ fn provision_and_resolve(
         if let Ok(tag) =
             crate::backends::image::dev_tag(&entry.source, &entry.features, &entry.repo, rv)
         {
-            let key = crate::backends::image::DevImageId::of(&entry.repo, &entry.features, rv, &entry.source);
+            let key = crate::backends::image::DevImageId::of(
+                &entry.repo,
+                &entry.features,
+                rv,
+                &entry.source,
+            );
             image_refs
                 .entry(key.as_str().to_string())
                 .or_insert_with(|| crate::backends::image::pod_reference(&tag));
@@ -1800,8 +2015,8 @@ fn provision_and_resolve(
     crate::backends::image::seed_dev_images(&image_refs);
 
     // Resolve the runner image's pull reference. A prebaked (on-cluster) runner
-    // was already pushed by `crane`, so its ref passes straight through; local kind
-    // has no runner (tests run in-process).
+    // was already built + pushed by the on-cluster buildkit build, so its ref
+    // passes straight through; local kind has no runner (tests run in-process).
     let runner_image = match runner {
         RunnerSource::Prebaked(r) => Some(r),
         RunnerSource::None => None,
@@ -1906,7 +2121,14 @@ mod tests {
     #[test]
     fn output_flags_parse_into_display_policy() {
         use crate::engine::output::TestOutputDisplay;
-        let o = parse(&["-p", "wt", "--success-output", "final", "--failure-output", "never"]);
+        let o = parse(&[
+            "-p",
+            "wt",
+            "--success-output",
+            "final",
+            "--failure-output",
+            "never",
+        ]);
         // Stripped from the list argv (nextest `list` rejects run-only flags).
         assert_eq!(o.list_args, v(&["-p", "wt"]));
         let cfg = o.output_config();

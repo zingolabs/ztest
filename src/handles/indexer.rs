@@ -9,7 +9,6 @@ use async_trait::async_trait;
 
 use crate::handles::client::JsonRpcClient;
 use crate::handles::{Endpoint, HandleInner};
-use crate::topology::NetworkUpgrade;
 use crate::{EnvError, RpcError};
 
 pub use crate::handles::types::BlockHash;
@@ -34,26 +33,30 @@ pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
     /// The live handle type this backend produces.
     type Handle: IndexerBackend + Clone;
 
+    /// Backend-specific tuning tokens handed to [`ComponentBuilder::tuning`]
+    /// (e.g. [`ZainoTuning`](crate::testnet_conf::ZainoTuning)). Backends with
+    /// no knobs use [`NoTuning`](crate::component::NoTuning), whose uninhabited
+    /// type makes `.tuning(..)` uncallable at compile time.
+    type Tuning: Clone + std::fmt::Debug + Send + Sync + 'static;
+
     /// Build the runtime handle once the env has assigned `plumbing`.
     fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
 
-    /// Highest network upgrade this backend's pinned version can decode.
-    /// `None` opts out of the topology resolver.
-    fn nu_ceiling(&self, version: &str) -> Option<NetworkUpgrade> {
-        let _ = version;
-        None
-    }
-
-    /// Apply regtest-time mounts / flags. Returns
-    /// [`EnvError::Config`](crate::EnvError::Config) for invalid
-    /// configuration (e.g. an unparseable pinned version). Default: no-op.
-    fn materialize_regtest_opts(
+    /// Render the config at build time, once the env has resolved the validator
+    /// host. `tunings` are the tokens the test applied (interpreted per
+    /// backend); `mode` is the network fixture. Called only when `mode` is not
+    /// [`IndexerMode::None`](crate::component::IndexerMode::None). Returns
+    /// [`EnvError::Config`](crate::EnvError::Config) for invalid configuration
+    /// (e.g. an unparseable pinned version, or a tuning the backend rejects).
+    /// Default: no-op.
+    fn materialize_opts(
         &self,
         opts: crate::component::ComponentOpts,
-        regtest_backend: Option<crate::testnet_conf::ZainodBackend>,
+        tunings: &[Self::Tuning],
+        mode: &crate::component::IndexerMode,
         validator_host: Option<&str>,
     ) -> Result<crate::component::ComponentOpts, EnvError> {
-        let _ = (regtest_backend, validator_host);
+        let _ = (tunings, mode, validator_host);
         Ok(opts)
     }
 }

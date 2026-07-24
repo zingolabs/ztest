@@ -108,7 +108,7 @@ pub(crate) fn ansi_rows(s: &str, width: usize) -> Vec<(String, usize)> {
     let mut vt = Vt::new(NOWRAP, h);
     vt.feed_str(&s.replace('\n', "\r\n"));
     vt.view()
-        .map(|row| avt_line_ansi_clipped(&row, width))
+        .map(|row| avt_line_ansi_clipped(row, width))
         .collect()
 }
 
@@ -134,7 +134,10 @@ mod tests {
         roundtrip(40, "\x1b[1;31mERR\x1b[0m ok");
         roundtrip(40, "ok\x1b[32mgo\x1b[0m more");
         roundtrip(40, "\x1b[38;2;10;20;30mtrue\x1b[0mcolor");
-        roundtrip(40, "\x1b[1mbold\x1b[0m \x1b[4munder\x1b[0m \x1b[7mrev\x1b[0m");
+        roundtrip(
+            40,
+            "\x1b[1mbold\x1b[0m \x1b[4munder\x1b[0m \x1b[7mrev\x1b[0m",
+        );
     }
 
     fn line_of(cols: usize, input: &str) -> AvtLine {
@@ -151,7 +154,10 @@ mod tests {
     #[test]
     fn styled_ansi_resets_at_end_for_safe_concatenation() {
         let ansi = avt_line_to_ansi(&line_of(40, "\x1b[32mgreen\x1b[0m"));
-        assert!(ansi.ends_with("\x1b[0m"), "must reset trailing style: {ansi:?}");
+        assert!(
+            ansi.ends_with("\x1b[0m"),
+            "must reset trailing style: {ansi:?}"
+        );
         assert!(ansi.contains("38;5;2"), "green as extended fg: {ansi:?}");
     }
 

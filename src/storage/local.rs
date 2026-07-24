@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use super::{
-    ByteSource, Compression, SourceKind, StorageBackend, StorageError, compression_from_ext,
-};
+use super::{ByteSource, Compression, StorageBackend, StorageError, compression_from_ext};
 
 #[derive(Debug)]
 pub struct Local {
@@ -29,10 +27,6 @@ impl Local {
 
 #[async_trait]
 impl StorageBackend for Local {
-    fn kind(&self) -> SourceKind {
-        SourceKind::Local
-    }
-
     fn compression(&self) -> Result<Compression, StorageError> {
         // Filename first (matches the LFS path); magic bytes are the on-disk
         // fallback for an oddly-named archive, which only a local file affords.

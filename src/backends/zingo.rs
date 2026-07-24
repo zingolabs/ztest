@@ -62,6 +62,7 @@ impl ZingoBackend {
 
 impl WalletConfig for ZingoBackend {
     type Handle = ZingoWallet;
+    type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, _plumbing: HandleInner) -> ZingoWallet {
         // Wallets run in-process; the handle owns its own state, no plumbing.
@@ -426,25 +427,52 @@ impl WalletBackend for ZingoWallet {
         Ok(())
     }
 
-    async fn send(&self, from: AccountId, to: &str, zats: u64) -> Result<Vec<TxId>, BoxError> {
+    async fn send(
+        &self,
+        from: AccountId,
+        to: &str,
+        zats: u64,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<TxId>, BoxError> {
         let client = self.client(from)?;
         let mut client = client.lock().await;
-        let txids = zingolib::testutils::lightclient::from_inputs::quick_send(
+        // zingolib's `quick_send` builds and relays atomically, so the relay
+        // cannot be isolated; bound the whole call.
+        let send = zingolib::testutils::lightclient::from_inputs::quick_send(
             &mut client,
             vec![(to, zats, None)],
-        )
-        .await
-        .map_err(|e| Box::new(e) as BoxError)?;
+        );
+        let txids = match tokio::time::timeout(timeout, send).await {
+            Ok(r) => r.map_err(|e| Box::new(e) as BoxError)?,
+            Err(_) => {
+                return Err(format!(
+                    "zingo: send did not complete within {timeout:?} \
+                     (indexer likely cannot reach its backing node)"
+                )
+                .into());
+            }
+        };
         Ok(txids.into_iter().collect())
     }
 
-    async fn shield(&self, account: AccountId) -> Result<Vec<TxId>, BoxError> {
+    async fn shield(
+        &self,
+        account: AccountId,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<TxId>, BoxError> {
         let client = self.client(account)?;
         let mut client = client.lock().await;
-        let txids = client
-            .quick_shield(zip32::AccountId::ZERO)
-            .await
-            .map_err(|e| Box::new(e) as BoxError)?;
+        let shield = client.quick_shield(zip32::AccountId::ZERO);
+        let txids = match tokio::time::timeout(timeout, shield).await {
+            Ok(r) => r.map_err(|e| Box::new(e) as BoxError)?,
+            Err(_) => {
+                return Err(format!(
+                    "zingo: shield did not complete within {timeout:?} \
+                     (indexer likely cannot reach its backing node)"
+                )
+                .into());
+            }
+        };
         Ok(txids.into_iter().collect())
     }
 }

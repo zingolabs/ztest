@@ -14,13 +14,6 @@ pub enum EnvError {
         elapsed: Duration,
     },
 
-    #[error("{component} exited uncleanly (exit {exit_code}) after {elapsed:?}")]
-    UncleanExit {
-        component: String,
-        elapsed: Duration,
-        exit_code: i32,
-    },
-
     #[error("{component} RPC '{op}' timed out after {elapsed:?}")]
     RpcTimeout {
         component: String,
@@ -47,9 +40,6 @@ pub enum EnvError {
         port: u16,
         reason: String,
     },
-
-    #[error("kube API call failed: {reason}")]
-    KubeApi { reason: String },
 
     #[error("manifest serialization failed: {reason}")]
     Manifest { reason: String },

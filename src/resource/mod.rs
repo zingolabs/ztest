@@ -11,7 +11,6 @@
 //! Adding a resource is one [`NodeId`] variant plus one [`Provider`] impl in
 //! [`impls`]; the graph, executor, and entry points don't change.
 
-mod build_scale;
 mod context;
 mod entry;
 mod graph;
@@ -23,7 +22,6 @@ pub(crate) mod impls;
 
 // ── Public API ────────────────────────────────────────────────────────
 
-pub(crate) use build_scale::{grow_to, shrink_to};
 pub use context::{Cx, CxBuilder, Progress, ProgressSink};
 pub use entry::{
     InitializeOpts, image_node_id, initialize, plan_runtime, reap_all, reap_run, reap_user,

@@ -15,7 +15,7 @@ use super::{
     SnapshotRow, SnapshotStatus, TierPlan, TransferKind, TransferProgress, TransferRow, Transfers,
 };
 use crate::qos::live::LiveSnapshot;
-use crate::qos::{GIB, MIB, Resources};
+use crate::qos::{GIB, Resources};
 
 /// Width of the action-label column, matching nextest's `{:>12}`.
 const LABEL_WIDTH: usize = 12;
@@ -361,31 +361,6 @@ fn render_future_block(out: &mut String, state: &BannerState, theme: &Theme) {
     }
 }
 
-/// A footprint's CPU as `Nc` (whole cores) or `Nm` (millicpu), so a half-core
-/// `basic` reads `500m`, not `0 cores`.
-fn cpu_str(milli: u64) -> String {
-    if milli != 0 && milli.is_multiple_of(1000) {
-        format!("{}c", milli / 1000)
-    } else {
-        format!("{milli}m")
-    }
-}
-
-/// A footprint's memory as a clean `N GiB` / `N MiB` (exact for the
-/// power-of-two tier reserves).
-fn mem_str(bytes: u64) -> String {
-    if bytes != 0 && bytes.is_multiple_of(GIB) {
-        format!("{} GiB", bytes / GIB)
-    } else {
-        format!("{} MiB", bytes / MIB)
-    }
-}
-
-/// `<cpu> / <mem>` for a single-test footprint (exact units: `500m`, `16 GiB`).
-fn footprint_str(r: &Resources) -> String {
-    format!("{} / {}", cpu_str(r.cpu_milli), mem_str(r.mem_bytes))
-}
-
 /// `<cpu> / <mem>` for an aggregate (peak / total) reserve, in decimal cores and
 /// GiB: `11.5c / 19.5 GiB` reads better than `11500m / 19968 MiB` for summed
 /// figures.
@@ -446,7 +421,7 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
             "{INDENT}{:<width$} {} {dot} {} each",
             class.as_label().style(theme.styles.dim),
             count.style(theme.styles.count),
-            footprint_str(footprint),
+            footprint,
             width = name_col,
         )
         .expect("write to string");
@@ -461,7 +436,7 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
             out,
             "{INDENT}{warn} {} needs {} {dot} exceeds cluster capacity — will be rejected",
             class.as_label().style(theme.styles.skip),
-            footprint_str(&class.profile().admitted()),
+            class.profile().admitted(),
         )
         .expect("write to string");
     }
@@ -1319,10 +1294,7 @@ mod tests {
         // basic renders as `1c`, never a fractional `500m`.
         assert!(s.contains("integration"), "got:\n{s}");
         // Admitted total (components + runner): basic is 2c / 1 GiB.
-        assert!(
-            s.contains("2c / 1 GiB"),
-            "missing basic footprint:\n{s}"
-        );
+        assert!(s.contains("2c / 1 GiB"), "missing basic footprint:\n{s}");
         // Unschedulable warning for sync (17c/18Gi admitted can't fit a 4c/8Gi cluster).
         assert!(
             s.contains("sync needs 17c / 18 GiB") && s.contains("will be rejected"),

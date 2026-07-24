@@ -271,7 +271,12 @@ mod tests {
         t.apply(&out);
         for i in 0..10 {
             out.clear();
-            rows = render(&mut out, &strings(&[&format!("line{i}")]), &strings(&["panel"]), rows);
+            rows = render(
+                &mut out,
+                &strings(&[&format!("line{i}")]),
+                &strings(&["panel"]),
+                rows,
+            );
             t.apply(&out);
         }
         // Everything committed is preserved: earliest in scrollback, panel pinned.
@@ -281,6 +286,51 @@ mod tests {
             .chain(std::iter::once("panel".to_string()))
             .collect();
         assert_eq!(all, expected);
+    }
+
+    #[test]
+    fn live_running_lines_never_leak_into_scrollback() {
+        // Reproduce the run panel: a live "running" block (which changes content
+        // and height as tests start/finish) above a fixed 5-line panel, with a
+        // verdict committed on some frames. Only committed verdicts may reach
+        // scrollback; a live running line must never.
+        let panel = ["p1", "p2", "p3", "p4", "p5"].map(String::from).to_vec();
+        let footer = |running: &[&str]| {
+            let mut f: Vec<String> = running.iter().map(|s| s.to_string()).collect();
+            f.extend(panel.clone());
+            f
+        };
+        let mut t = Term::new(40, 10); // footer (2 running + 5 panel = 7) nearly fills 10 rows
+        let mut out = String::new();
+        let mut rows = render(&mut out, &[], &footer(&["run_A 1s", "run_B 1s"]), 0);
+        t.apply(&out);
+
+        // Frames: timer ticks, verdicts committing, and the running set changing.
+        let frames: &[(&[&str], &[&str])] = &[
+            (&[], &["run_A 2s", "run_B 2s"]),             // tick
+            (&["PASS run_B"], &["run_A 3s", "run_C 1s"]), // B done, C starts
+            (&[], &["run_A 4s", "run_C 2s"]),             // tick
+            (&["PASS run_C"], &["run_A 5s", "run_D 1s"]), // C done, D starts
+            (&["PASS run_A"], &["run_D 2s"]),             // A done, footer shrinks
+            (&["PASS run_D"], &[]),                       // D done, footer = panel only
+        ];
+        for (committed, running) in frames {
+            out.clear();
+            let c: Vec<String> = committed.iter().map(|s| s.to_string()).collect();
+            rows = render(&mut out, &c, &footer(running), rows);
+            t.apply(&out);
+        }
+        let _ = rows;
+
+        // Everything that ever scrolled off, plus what's still visible.
+        let seen: Vec<String> = t.scrollback.iter().cloned().chain(t.visible()).collect();
+        for line in &seen {
+            assert!(
+                !line.starts_with("run_"),
+                "live running line leaked into output: {line:?}\nall:\n{}",
+                seen.join("\n")
+            );
+        }
     }
 
     #[test]

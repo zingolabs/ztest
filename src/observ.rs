@@ -16,9 +16,12 @@
 //!     TTY run routes them to a per-run file ([`Sink::File`]); a non-TTY run
 //!     (CI/piped) writes to stderr like nextest ([`Sink::Stderr`]).
 //!
-//! Useful target filters (`ZTEST_LOG=…`): `ztest::pod=info` (runner-pod
-//! lifecycle timing), `ztest::build=info` (in-pod `TestEnv::build` phase
-//! timing), `ztest=debug` (everything ztest).
+//! By default (`warn,ztest=info`) ztest emits one INFO line per test env —
+//! what tier/topology/reservation it is provisioning — and nothing else; the
+//! per-phase timings and struct dumps are DEBUG, off unless asked for. Useful
+//! filters (`ZTEST_LOG=…`): `ztest::pod=debug` (runner-pod lifecycle timing),
+//! `ztest::build=debug` (in-pod `TestEnv::build` phase timing), `ztest=debug`
+//! (everything ztest, including the regtest activation-height dump).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -92,12 +95,13 @@ fn install(sink: Sink) {
                     .with_writer(FileMaker(Arc::new(Mutex::new(file))))
                     .try_init();
             }
-            // No file (e.g. unwritable target dir) → fall back to stderr rather
-            // than lose diagnostics entirely; on a TTY this is imperfect but
-            // strictly better than silence, and the path is chosen under a dir
-            // we just created.
+            // No file → DROP diagnostics (a null writer), never fall back to
+            // stderr. `Sink::File` is chosen precisely to keep output off a
+            // terminal the console render thread owns; a stderr fallback would
+            // spew onto and corrupt the pinned panel. Losing best-effort
+            // diagnostics is strictly better than a garbled panel.
             Err(_) => {
-                let _ = builder.with_writer(std::io::stderr).try_init();
+                let _ = builder.with_writer(|| std::io::sink()).try_init();
             }
         },
     }

@@ -58,6 +58,7 @@ enum Msg {
     FlushLive,
     ChildStarted(Option<i32>),
     ChildExited,
+    Fatal(String),
     Shutdown,
 }
 
@@ -174,6 +175,18 @@ impl Console {
         let _ = self.tx.send(Msg::ChildExited);
     }
 
+    /// Record a fatal message to print once, on a clean line, after the panel is
+    /// torn down. Durable where a mid-run `eprintln!` is not: the render thread
+    /// repaints the footer in place every tick, so a raw stderr write lands under
+    /// the panel and is overwritten by the next repaint. This instead rides the
+    /// render thread's own teardown — emitted after the footer is erased and the
+    /// terminal restored — so a fatal error or panic survives instead of vanishing
+    /// behind a frozen frame. Only the first message is kept (the root cause; later
+    /// ones are usually cascade). The fatal-exit path and the panic hook feed this.
+    pub fn fatal(&self, msg: String) {
+        let _ = self.tx.send(Msg::Fatal(msg));
+    }
+
     /// The current terminal size, read by `child::run_child` when it opens a PTY.
     pub fn size(&self) -> PtySize {
         *self.size.borrow()
@@ -283,6 +296,10 @@ async fn render_loop(
     let mut interrupts: u32 = 0;
     // On the first Ctrl-C the panel switches to the `cancel_panel` overlay.
     let mut cancelling = false;
+    // A fatal message to print on the clean line left after teardown; see
+    // [`Console::fatal`]. Kept until the loop breaks so it survives the footer's
+    // in-place repaints.
+    let mut fatal: Option<String> = None;
 
     let mut sigint = signal(SignalKind::interrupt());
     let mut sigwinch = signal(SignalKind::window_change());
@@ -316,6 +333,11 @@ async fn render_loop(
                 }
                 Some(Msg::ChildStarted(p)) => pgid = p,
                 Some(Msg::ChildExited) => pgid = None,
+                Some(Msg::Fatal(m)) => {
+                    if fatal.is_none() {
+                        fatal = Some(m);
+                    }
+                }
                 Some(Msg::Shutdown) | None => break,
             },
 
@@ -331,7 +353,7 @@ async fn render_loop(
                 if interrupts >= 3 {
                     // Ctrl-C mashed: restore the terminal in place (Drop is skipped
                     // by `exit`) and hard-quit.
-                    let _ = surface.finish(&std::mem::take(&mut pending));
+                    surface.finish(&std::mem::take(&mut pending));
                     std::process::exit(130);
                 }
                 clock.mark_dirty();
@@ -385,7 +407,14 @@ async fn render_loop(
     // subprocess's output, not yet scrolled off).
     let mut final_lines = std::mem::take(&mut pending);
     final_lines.extend(bridged(&trimmed_view(&vt)));
-    let _ = surface.finish(&final_lines);
+    surface.finish(&final_lines);
+
+    // The footer is erased and the cursor is on a fresh line; a fatal message
+    // written now lands durably instead of under the next (never-coming) footer
+    // repaint. This is the one place a fatal error/panic is emitted to the user.
+    if let Some(msg) = fatal {
+        eprintln!("{msg}");
+    }
 }
 
 /// The redraw decision: repaint when state changed (`dirty`) or the spinner frame

@@ -34,16 +34,6 @@ pub use local::Local;
 /// backend yields the HTTP download body.
 pub type ByteSource = std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>;
 
-/// Which backend a source resolves to. Drives the preflight banner's download
-/// column ([`crate::preflight::DownloadSource`]) without materialising anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceKind {
-    /// Bytes already present on disk — streamed directly.
-    Local,
-    /// A Git LFS pointer — bytes fetched from the LFS server.
-    Lfs,
-}
-
 /// Compression of a `tar` archive seed. Detected without reading the bytes
 /// (filename first, then magic bytes for on-disk files), so the uploader pod's
 /// `tar` command is fixed before the byte stream opens.
@@ -79,9 +69,6 @@ impl Compression {
 /// [`for_source`] selects one per file by sniffing for an LFS pointer.
 #[async_trait]
 pub trait StorageBackend: Send + Sync + std::fmt::Debug {
-    /// Which kind this is, for the preflight banner.
-    fn kind(&self) -> SourceKind;
-
     /// The archive's compression, resolved without transferring any bytes so the
     /// uploader command can be built before [`open`](Self::open). Meaningful only
     /// for `tar` archives; file seeds ignore it.
@@ -110,16 +97,6 @@ pub fn content_sha8(source: &Path) -> Result<String, StorageError> {
     match read_pointer(source)? {
         Some(pointer) => Ok(pointer.oid[..8].to_string()),
         None => Ok(local::sha256_hex(source)?[..8].to_string()),
-    }
-}
-
-/// Which backend a source *would* use, for banner classification. Cheap: sniffs
-/// the pointer only, never touches the LFS server. Defaults to [`SourceKind::Local`]
-/// on a read error (the same source will surface the error when actually used).
-pub fn source_kind(source: &Path) -> SourceKind {
-    match read_pointer(source) {
-        Ok(Some(_)) => SourceKind::Lfs,
-        _ => SourceKind::Local,
     }
 }
 
