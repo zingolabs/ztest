@@ -95,6 +95,65 @@ The live stream the reporter consumes: `RunStarted`, `TestStarted`, `TestSlow`,
 `TestFinished`, `TestSkipped`, `RunFinished`. JUnit XML (for CI) is a second
 consumer of the same stream.
 
+### Reporter output (`reporter.rs`)
+
+`StyledReporter` formats the event stream into `cargo nextest run`'s default
+human output: verdict lines (`PASS`/`FAIL`/`SLOW`/`TRY n …`), the `output ───`
+block, the `Summary` line, the failure recap. No `nextest-runner` dependency —
+we generate every line, and the invariant is that each one is byte-identical to
+nextest's. Change a status or summary line only against a diff with nextest.
+
+`Verdict` models pass/fail/timeout/spawn-error only, so nextest's
+leak/flaky/slow-pass/abort words are unreachable by construction.
+
+#### Divergence: the captured-output block is de-framed
+
+The one place we diverge, and it's confined to the bytes *inside* the
+`output ───` block — never a line we generate.
+
+Tests run as `<binary> --exact <name> --nocapture` (`local_runner.rs`,
+`pod_runner.rs`), so the captured stream is wrapped in libtest's per-run framing:
+
+```
+running 1 test
+test <name> ... <first log glued here — --nocapture holds the line open>
+<logs>
+FAILED
+
+failures:
+
+failures:
+    <name>
+
+test result: FAILED. 0 passed; 1 failed; …
+```
+
+nextest replays that verbatim. For a one-test process it's all noise we already
+render better elsewhere: `running 1 test` is a constant, `test <name> ... `
+restates our `FAIL […] <name>` line (and is what the first log glues onto), and
+the footer restates our `Summary` and recap. So we strip it and show only the
+test's own stdout/stderr:
+
+```
+        FAIL [  83.222s] clientless::… value_pools_respect_the_boundary_on_the_pub_testnet
+  output ───
+    2026-07-27T20:56:31 INFO ztest::env: starting test run …
+    2026-07-27T20:56:32 INFO ztest::env: provisioning validator …
+    Error: archive materialize failed for …/zebra.tar.xz: No such file or directory
+```
+
+`strip_libtest_frame(output, test_name)` does this before replay: drop through
+the `test <name> ... ` marker (which also un-glues the first log line), then peel
+the footer from the trailing `test result: ` line, consuming exactly one verdict
+token so a log line that merely reads `FAILED` survives. Panic output
+(`thread … panicked`, backtrace notes) precedes the verdict on stderr and is
+kept. Each cut is anchored on a marker; a stream missing either anchor is left
+uncut on that side, falling back to verbatim replay rather than risk eating
+output.
+
+New divergences go in this section with their rationale — the point is that
+byte-identity stays the default and every exception is on the record.
+
 ## Console (render thread)
 
 The bottom status panel is live for the whole session — spinner and clocks keep

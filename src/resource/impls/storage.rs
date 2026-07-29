@@ -101,12 +101,16 @@ fn render_storage_classes(provisioner: &str, snapshot_driver: &str) -> String {
         // `Immediate`: the seed workflow snapshots a PVC without a consumer
         // pod, so it must bind eagerly. A future multi-node topolvm.io cluster
         // wants `WaitForFirstConsumer`; make it per-substrate when that exists.
+        // `allowVolumeExpansion`: the buildkit cache PVC grows-on-reconcile
+        // (buildkit.rs) as the cache footprint climbs; the CSI resizer sidecar
+        // (CsiRbac) backs it. One-way — CSI can only grow a bound volume.
         out.push_str(&format!(
             "apiVersion: storage.k8s.io/v1\n\
              kind: StorageClass\n\
              metadata:\n  name: {name}\n\
              provisioner: {provisioner}\n\
              reclaimPolicy: Delete\n\
+             allowVolumeExpansion: true\n\
              volumeBindingMode: Immediate\n---\n"
         ));
     }

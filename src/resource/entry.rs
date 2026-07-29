@@ -169,8 +169,7 @@ pub fn plan_runtime(images: &[DevImageEntry], seeds: &[SeedEntry]) -> Result<Gra
         graph.add_dedup(Box::new(provider));
     }
     for entry in seeds {
-        let provider = seed::SeedProvider::new(entry.clone())?;
-        graph.add_dedup(Box::new(provider));
+        graph.add_dedup(Box::new(seed::SeedProvider::new(entry.clone())));
     }
     graph.validate().map_err(|e| e.to_string())?;
     Ok(graph)
@@ -184,11 +183,12 @@ pub fn image_node_id(entry: &DevImageEntry) -> Result<NodeId, String> {
     image::ImageNode::node_id(entry)
 }
 
-/// The content-addressed [`NodeId`] a seed resolves to.
+/// The [`NodeId`] a seed resolves to (content-addressed on the bytes, or
+/// path-addressed when they're unreadable — see [`seed::SeedProvider`]).
 ///
 /// Used by `cli::run` to key each test's seed-dependency edge to the graph
 /// node that provisioned it.
-pub fn seed_node_id(entry: &SeedEntry) -> Result<NodeId, String> {
+pub fn seed_node_id(entry: &SeedEntry) -> NodeId {
     seed::SeedProvider::node_id(entry)
 }
 
@@ -306,4 +306,28 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
     }
 
     errors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::SeedPayload;
+
+    fn seed(source: &str) -> SeedEntry {
+        SeedEntry {
+            source: source.to_string(),
+            payload: SeedPayload::Archive,
+        }
+    }
+
+    #[test]
+    fn a_missing_seed_source_does_not_abort_planning() {
+        // A declared archive absent from the tree must yield a graph node (which
+        // provisions to `Failed` → the declaring tests SKIP as
+        // `DependencyUnavailable`), never a planning error that aborts the whole
+        // run before any test starts.
+        let graph = plan_runtime(&[], &[seed("/does/not/exist.tar.xz")])
+            .expect("a missing seed source must not fail plan_runtime");
+        assert_eq!(graph.len(), 1);
+    }
 }

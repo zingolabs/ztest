@@ -1913,11 +1913,7 @@ fn provision_and_resolve(
     // so this map resolves it to the provisioned node with no re-derivation.
     let seed_id_by_source: HashMap<&str, crate::resource::NodeId> = seeds
         .iter()
-        .filter_map(|e| {
-            resource::seed_node_id(e)
-                .ok()
-                .map(|id| (e.source.as_str(), id))
-        })
+        .map(|e| (e.source.as_str(), resource::seed_node_id(e)))
         .collect();
     for (binary_id, deps) in &deps_by_binary {
         for dep in deps {

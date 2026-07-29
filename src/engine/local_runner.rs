@@ -61,6 +61,11 @@ pub struct EngineEnv {
     /// under `--no-capture`: the child inherits this process's stdio and streams
     /// straight to the terminal (which also forces a serial run).
     pub capture: bool,
+    /// The reporter's colour decision, forwarded as `ZTEST_COLOR` so a child's
+    /// teardown diagnostics (the streamed component-log timeline) colourize
+    /// exactly when the reporter would render colour — the child's own stderr is
+    /// piped, so it can't decide this itself.
+    pub color: bool,
 }
 
 /// The outcome of one test process.
@@ -68,7 +73,9 @@ pub struct EngineEnv {
 pub struct TestOutcome {
     /// Terminal verdict.
     pub verdict: Verdict,
-    /// Merged stdout+stderr captured from the child.
+    /// Merged stdout+stderr captured from the child. On the pod path this is the
+    /// laptop-assembled unified timeline (`logstream::unified_output`): the runner
+    /// pod's own output woven with the component-pod logs, panic pinned at the end.
     pub output: Vec<u8>,
     /// Wall time the process ran.
     pub duration: Duration,
@@ -176,7 +183,8 @@ fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
         // Mark the child orchestrated; a `TestEnv` refuses to provision outside a
         // `ztest run` (cluster::require_orchestrator).
         .env("ZTEST_ENGINE", "1")
-        .env("ZTEST_SA", &env.sa);
+        .env("ZTEST_SA", &env.sa)
+        .env("ZTEST_COLOR", if env.color { "1" } else { "0" });
     if env.no_cleanup {
         std_cmd.env("ZTEST_NO_CLEANUP", "1");
     }
@@ -229,6 +237,7 @@ mod tests {
             sa: "ztest-local".into(),
             no_cleanup: false,
             capture: true,
+            color: false,
             ztest_log: None,
         }
     }

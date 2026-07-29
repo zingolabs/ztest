@@ -20,7 +20,7 @@ use crate::pod_status::{
     pull_error_is_terminal,
 };
 
-/// Image repo of the baked tests image (`docs/remote-test-execution.md`).
+/// Image repo of the baked tests image (`docs/design-remote-execution.md`).
 pub const RUNNER_REPO: &str = "ztest-runner";
 
 /// Everything the pod executor needs that isn't per-test: which cluster/namespace
@@ -30,7 +30,8 @@ pub const RUNNER_REPO: &str = "ztest-runner";
 pub struct PodRunConfig {
     /// Namespace runner pods are created in (the per-test/per-run namespace).
     pub namespace: String,
-    /// Runner image reference (the nix `ztest-runner` image).
+    /// Runner image reference (the buildkit-built `ztest-runner` image; see
+    /// `docker/runner.Dockerfile`).
     pub image: String,
     /// `imagePullPolicy` — `"Never"` for a `kind`-loaded image, `"IfNotPresent"`
     /// for a registry-hosted one. `None` leaves the cluster default.
@@ -113,7 +114,7 @@ impl PodRunConfig {
     }
 
     /// A baked-delivery config for remote runs: the build outputs are already in
-    /// `image` at their original absolute paths (`docs/remote-test-execution.md`
+    /// `image` at their original absolute paths (`docs/design-remote-execution.md`
     /// §2), so no volume is mounted and paths resolve unchanged.
     pub fn baked(
         env: EngineEnv,
@@ -158,10 +159,44 @@ async fn run_in_pod(
 ) -> TestOutcome {
     let started = Instant::now();
     let name = pod_name(&item);
-    let api: Api<corev1::Pod> = Api::namespaced(client, &cfg.namespace);
-    let pod = build_pod(&name, &cfg, &item);
 
-    if let Err(e) = api.create(&PostParams::default(), &pod).await {
+    // The laptop owns the per-test namespace on the pod path: it picks the name,
+    // creates it here, fetches every pod's logs at the test's terminal, and tears
+    // it down after — so a definitive `api.logs` fetch (no live follow) can't race
+    // an in-pod delete. The in-pod `TestEnv::build` reads `ZTEST_TEST_NAMESPACE`
+    // (injected below) and skips its own namespace create + teardown.
+    let coords = match crate::naming::RunCoords::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            return TestOutcome {
+                verdict: Verdict::SpawnError,
+                output: format!("resolve run coords: {e}").into_bytes(),
+                duration: started.elapsed(),
+            };
+        }
+    };
+    let test_ns = crate::naming::namespace_for(
+        &item.binary_id,
+        &item.test_name,
+        &crate::naming::test_suffix(),
+    );
+
+    let runner_api: Api<corev1::Pod> = Api::namespaced(client.clone(), &cfg.namespace);
+
+    if let Err(e) =
+        crate::cluster::ensure_namespace(&client, &test_ns, &coords, &item.binary_id, &item.test_name)
+            .await
+    {
+        return TestOutcome {
+            verdict: Verdict::SpawnError,
+            output: format!("create test namespace {test_ns}: {e}").into_bytes(),
+            duration: started.elapsed(),
+        };
+    }
+
+    let pod = build_pod(&name, &cfg, &item, &test_ns);
+    if let Err(e) = runner_api.create(&PostParams::default(), &pod).await {
+        teardown(&client, &cfg, &test_ns, &name).await;
         return TestOutcome {
             verdict: Verdict::SpawnError,
             output: format!("create runner pod {name}: {e}").into_bytes(),
@@ -179,7 +214,7 @@ async fn run_in_pod(
     let done = loop {
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {
-                if let Ok(p) = api.get(&name).await {
+                if let Ok(p) = runner_api.get(&name).await {
                     let terminal = terminal_state(&p);
                     last_pod = Some(p);
                     if let Some(st) = terminal {
@@ -207,29 +242,54 @@ async fn run_in_pod(
     let total = started.elapsed();
     emit_timing(&item.test_name, last_pod.as_ref(), total);
 
-    // Fetch logs before deleting; a running pod (timeout/cancel) still serves
-    // them. Best-effort — a pod that never started has none.
-    let mut output = api
+    // Fetch every log definitively, before anything is deleted, while the
+    // namespace and its pods still exist: the runner pod's own libtest-framed
+    // stdout+stderr (a running pod on the timeout/cancel path still serves it),
+    // the component-pod lines (timestamped), and any dead component pod's terminal
+    // reason (OOMKilled/Evicted vs a panic). `unified_output` weaves them into one
+    // timeline with the assertion pinned at the end; teardown follows.
+    let runner_raw = runner_api
         .logs(&name, &LogParams::default())
         .await
         .unwrap_or_default()
         .into_bytes();
+    let dead = crate::cluster::dead_pod_report(&client, &test_ns).await;
+    let components = crate::logstream::fetch_component_lines(&client, &test_ns).await;
+    let unified = crate::logstream::unified_output(
+        &runner_raw,
+        &item.test_name,
+        components,
+        &dead,
+        cfg.env.color,
+    );
 
     if !cfg.env.no_cleanup {
-        let _ = api.delete(&name, &DeleteParams::default()).await;
+        teardown(&client, &cfg, &test_ns, &name).await;
+    } else {
+        // Mirror the local path's `--no-cleanup` behaviour: leave the namespace,
+        // its pods, and the runner pod for a post-mortem. The 1h `janitor/ttl`
+        // annotation still reaps the namespace, so this never leaks permanently.
+        tracing::warn!(
+            target: "ztest::pod",
+            namespace = %test_ns,
+            runner_pod = %name,
+            "--no-cleanup: preserving per-test namespace and runner pod for inspection (janitor reaps in ~1h)"
+        );
     }
 
-    let verdict = match done {
-        Done::Reached(TerminalState::Passed) => Verdict::Pass,
-        Done::Reached(TerminalState::Failed(code)) => Verdict::Fail(code),
+    let (verdict, output) = match done {
+        Done::Reached(TerminalState::Passed) => (Verdict::Pass, unified),
+        Done::Reached(TerminalState::Failed(code)) => (Verdict::Fail(code), unified),
         Done::Reached(TerminalState::ImageError(reason)) => {
             // The pod produced no logs; surface the pull failure as the output so
             // the reporter shows why, not a blank SpawnError.
-            output = format!("runner image error: {reason}").into_bytes();
-            Verdict::SpawnError
+            (
+                Verdict::SpawnError,
+                format!("runner image error: {reason}").into_bytes(),
+            )
         }
-        Done::Timeout => Verdict::Timeout,
-        Done::Cancelled => Verdict::Terminated,
+        Done::Timeout => (Verdict::Timeout, unified),
+        Done::Cancelled => (Verdict::Terminated, unified),
     };
 
     TestOutcome {
@@ -237,6 +297,19 @@ async fn run_in_pod(
         output,
         duration: started.elapsed(),
     }
+}
+
+/// Tear down one test's cluster footprint (pod path): the cluster-scoped shadow
+/// VSCs it minted (by the per-test-ns label — they don't cascade with the
+/// namespace), then the per-test namespace (cascading its component pods, PVCs,
+/// and quota), then the runner pod itself (it lives in the run namespace, not the
+/// per-test one, so the namespace delete doesn't reach it). All best-effort;
+/// `reap_run` by `run-id` is the crash-safety net if this process dies first.
+async fn teardown(client: &kube::Client, cfg: &PodRunConfig, test_ns: &str, runner_pod: &str) {
+    crate::cluster::delete_shadow_vscs_for_ns(client, test_ns).await;
+    let _ = crate::cluster::delete_namespace(client, test_ns).await;
+    let api: Api<corev1::Pod> = Api::namespaced(client.clone(), &cfg.namespace);
+    let _ = api.delete(runner_pod, &DeleteParams::default()).await;
 }
 
 /// How the pod-await loop finished.
@@ -329,7 +402,7 @@ fn remap_search_path(value: &str, map: &[(String, String)]) -> String {
         .join(":")
 }
 
-fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem) -> corev1::Pod {
+fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> corev1::Pod {
     let bin = remap(&item.binary_path.to_string_lossy(), &cfg.path_map);
     let cwd = remap(&item.cwd.to_string_lossy(), &cfg.path_map);
     let ld = remap_search_path(&cfg.env.dylib_path.to_string_lossy(), &cfg.path_map);
@@ -344,6 +417,10 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem) -> corev1::Pod {
         // a `TestEnv` refuses to provision outside a `ztest run`.
         env_var("ZTEST_ENGINE", "1"),
         env_var("ZTEST_SA", &cfg.env.sa),
+        // The laptop-created per-test namespace this pod's `TestEnv` provisions
+        // into; it reads this instead of inventing a name, and skips namespace
+        // create + teardown (the laptop owns both). See `naming::TEST_NAMESPACE_ENV`.
+        env_var(crate::naming::TEST_NAMESPACE_ENV, test_ns),
     ];
     if cfg.env.no_cleanup {
         env.push(env_var("ZTEST_NO_CLEANUP", "1"));
@@ -566,6 +643,7 @@ mod tests {
             sa: "ztest".into(),
             no_cleanup: false,
             capture: true,
+            color: false,
             ztest_log: None,
         };
         let cfg = PodRunConfig::baked(
@@ -577,7 +655,7 @@ mod tests {
         );
 
         // A regtest/integration tier runner: one whole core (orchestration).
-        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Integration));
+        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Integration), "ztest-test-ns");
         let c = &pod.spec.as_ref().unwrap().containers[0];
         let res = c.resources.as_ref().expect("runner pod must be sized");
         let req = res.requests.as_ref().unwrap();
@@ -590,7 +668,7 @@ mod tests {
         assert_eq!(req["cpu"].0, "1");
 
         // A wallet tier keeps the in-process wallet's compute here (≥4 cores).
-        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Wallet));
+        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Wallet), "ztest-test-ns");
         let c = &pod.spec.as_ref().unwrap().containers[0];
         let req = c.resources.as_ref().unwrap().requests.as_ref().unwrap();
         assert_eq!(req["cpu"].0, "4");
@@ -604,6 +682,7 @@ mod tests {
             sa: "ztest".into(),
             no_cleanup: false,
             capture: true,
+            color: false,
             ztest_log: None,
         };
         let cfg = PodRunConfig::baked(
@@ -613,7 +692,7 @@ mod tests {
             None,
             BTreeMap::new(),
         );
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"));
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
         let tols = pod.spec.unwrap().tolerations.unwrap();
         let nr = tols
             .iter()
@@ -709,6 +788,7 @@ mod tests {
             sa: "ztest".into(),
             no_cleanup: false,
             capture: true,
+            color: false,
             ztest_log: None,
         };
         let mut refs = BTreeMap::new();
@@ -717,7 +797,7 @@ mod tests {
             "reg.svc:5000/ns/zainod:dev-abc".to_string(),
         );
         let cfg = PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, refs);
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"));
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
         let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
         let refs_var = vars
             .iter()
@@ -740,6 +820,7 @@ mod tests {
             sa: "ztest".into(),
             no_cleanup: false,
             capture: true,
+            color: false,
             ztest_log: None,
         };
         let cfg = PodRunConfig::baked(
@@ -749,7 +830,7 @@ mod tests {
             None,
             BTreeMap::new(),
         );
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"));
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
         let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
         assert!(
             !vars
@@ -766,6 +847,7 @@ mod tests {
             sa: "ztest".into(),
             no_cleanup: false,
             capture: true,
+            color: false,
             ztest_log: Some("ztest::build=debug".into()),
         };
         let cfg = PodRunConfig::baked(
@@ -775,7 +857,7 @@ mod tests {
             None,
             BTreeMap::new(),
         );
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"));
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
         let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
         let log = vars
             .iter()
@@ -792,6 +874,7 @@ mod tests {
             sa: "ztest".into(),
             no_cleanup: false,
             capture: true,
+            color: false,
             ztest_log: None,
         };
         let cfg = PodRunConfig::baked(
@@ -801,8 +884,32 @@ mod tests {
             None,
             BTreeMap::new(),
         );
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"));
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
         let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
         assert!(!vars.iter().any(|v| v.name == "ZTEST_LOG"));
+    }
+
+    #[test]
+    fn build_pod_injects_the_laptop_chosen_test_namespace() {
+        // The parent picks the per-test namespace name and injects it; the in-pod
+        // `TestEnv` reads exactly this instead of inventing its own, so the pod
+        // provisions into the same namespace the parent follows and tears down.
+        let env = EngineEnv {
+            dylib_path: std::ffi::OsString::from("/x"),
+            run_id: "r".into(),
+            sa: "ztest".into(),
+            no_cleanup: false,
+            capture: true,
+            color: false,
+            ztest_log: None,
+        };
+        let cfg = PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-pkg-t-abcd1234");
+        let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let ns = vars
+            .iter()
+            .find(|v| v.name == crate::naming::TEST_NAMESPACE_ENV)
+            .expect("ZTEST_TEST_NAMESPACE injected");
+        assert_eq!(ns.value.as_deref(), Some("ztest-pkg-t-abcd1234"));
     }
 }

@@ -1,224 +1,97 @@
-# Remote execution — pod-per-test, on-cluster compile, on-cluster image build
+# Remote execution — pod-per-test, on-cluster compile + build
 
-On a remote cluster a `ztest` test runs inside a sibling pod rather than as a
-local child process; the cluster compiles the test binaries and builds every
-image.
+On a remote cluster a test runs inside a sibling **runner pod** instead of a
+local child process. The cluster compiles the binaries and builds every image;
+the laptop only ships source, arbitrates admission, and renders progress. One
+engine and one `Executor` seam serve both targets — the cluster profile picks
+the delivery.
 
-## Executor seam
-
-`Executor` has two implementations, selected by cluster profile
-(`engine/mod.rs::select_executor`):
-
-| Executor | Target | Mechanism |
+| | kind (local) | remote (OpenShift/OKD) |
 | --- | --- | --- |
-| `LocalExecutor` (`engine/exec.rs`) | local / kind | local child process per test |
-| `PodExecutor` (`engine/pod_exec.rs`) | remote cluster | runner pod per test |
+| compile | laptop (`cargo nextest --no-run`) | on-cluster BuildKit pod |
+| binary delivery | `hostPath` mount | baked into the runner image |
+| `PodRunConfig` | `::hostpath` | `::baked` |
+| images | `docker build` + `kind load` | on-cluster BuildKit build + push |
 
-`PodExecutor` is auto-selected (`ZTEST_RUNNER_IMAGE`-gated) when the
-distribution is remote. Per `WorkItem` it:
+## The run, in order
 
-- creates a runner pod in the test's own per-test namespace (see
-  [design-architecture.md](design-architecture.md) for namespace lifecycle and
-  teardown),
-- mounts the test binary (`baked` remote image, or `hostpath` on kind),
-- runs `<binary> --exact <test_name> --nocapture`,
-- sets `LD_LIBRARY_PATH` (from `engine/dylib.rs`, remapped to pod mount paths)
-  plus the ztest env: `NEXTEST_*`, in-cluster SA token, and `ZTEST_ENGINE=1`
-  (marks the child orchestrated so `TestEnv::build` proceeds; the parent
-  scheduler owns capacity admission),
-- streams pod logs into the reporter, maps pod exit code → test result,
-- relies on `qos::LABEL_RUN_ID` on the pod for label-selector teardown
-  (see [design-resources.md](design-resources.md)).
+1. **Prologue** (`cli/run.rs`). Parse flags; `cluster_config::activate` sets the
+   kube context, backend, and push/pull registries from the profile; force one
+   `ZTEST_RUN_ID` (the teardown selector); start the console thread.
+2. **Probe** → `ClusterCapacity` (`qos`), kept live by `pipeline/capacity_watch`.
+3. **Admit across runs** — a k8s-Lease `ledger` reserves this run's fair-share
+   slice; a 2 s `governor` keeps the scheduler ceiling in step with peers.
+4. **Compile on-cluster** (`pipeline/remote_compile.rs`, OpenShift). Stand up an
+   ephemeral BuildKit pod; ship source as a `git ls-files` tar; one multi-stage
+   `buildctl` build of `docker/runner.Dockerfile` compiles + pushes the runner
+   image and exports the inventory (`list.json` + per-binary
+   `ZTEST_DUMP_INVENTORY` dump), parsed the same way the local path parses it.
+5. **Resource graph** (`resource/`, `plan_runtime`). A DAG builds/pushes component
+   `dev!` images and materializes seeds (content-addressed PVC + snapshot →
+   CoW shadow-clone per test). Idempotent, label-before-populate, reverse-topo
+   teardown.
+6. **Run loop** (`engine/schedule.rs`) — the sole admission authority. The pure
+   `qos::Scheduler` packs tests by CPU×memory footprint with priority + backfill,
+   gated on resource-dep readiness, reconciled from the governor ceiling.
+7. **Pod-per-test** (`engine/pod_runner.rs`). The laptop creates the per-test
+   namespace, then a Guaranteed single-container runner pod running
+   `<bin> --exact <test> --nocapture` (labeled `ztest.io/run-id`), injecting the
+   namespace name via `ZTEST_TEST_NAMESPACE`. It polls the pod's phase until
+   Succeeded/Failed (exit code = verdict), timeout, or cancel.
+8. **In-pod `TestEnv::build`** (`env.rs`). The body provisions its own hermetic
+   topology as sibling pods in the **laptop-provided** namespace (quota-capped):
+   validators (warmed one block), then indexers. The **wallet is in-process** —
+   no pod. It reads `ZTEST_TEST_NAMESPACE` and skips namespace create + teardown;
+   `Drop` is a no-op on the pod path (the laptop owns that).
+9. **Logs & report** (`logstream.rs`, `engine/reporter.rs`). At the test's terminal
+   the laptop fetches every log definitively over the kube API — *before* deleting
+   anything — and `unified_output` weaves them into **one timeline**: the runner
+   pod's own tracing and each component pod's lines, tagged `[runner]`/`[<pod>]` and
+   merged by timestamp, capped to the most recent 40 lines *total*; the runner's
+   panic/assertion is pinned verbatim at the end (never capped — it's the failure
+   reason). A plain fetch, not a live follow: since the laptop owns teardown
+   ordering, the pods still exist at fetch time, so there's no attach-timing or
+   mid-stream-EOF race. The reporter is byte-identical to `cargo nextest run` (no
+   `nextest-runner` dep) and replays this timeline only for FAILED tests
+   (`--success-output`/`--failure-output` policy).
+10. **Teardown** (`engine/pod_runner.rs`). After the collector drains, the laptop
+    deletes this test's shadow VSCs (by the `ztest.io/test-ns` label — cluster-
+    scoped, so no namespace cascade), the per-test namespace (cascading its pods,
+    PVCs, quota), and the runner pod. `reap_run` by `run-id` is the crash-safety
+    net; admission + lease release on exit.
 
-The runner pod's ServiceAccount has RBAC to create its sibling component pods.
+## Decisions that aren't obvious from the code
 
-**In-cluster networking.** `env.rs`'s `in_cluster` branch of `resolve_port`
-returns a direct pod-IP (no port-forward); a test reaches the validator/indexer
-pods it creates natively.
+- **Baked binaries sit at their compile-time absolute path** (`runner` stage
+  `COPY`s into `/cache/target/debug/deps/`), so the engine execs each by the exact
+  `binary_path` inventory reported — `::baked` needs no volume and no path map.
+- **`ZTEST_ENGINE=1`** on the pod marks the child orchestrated; a `TestEnv`
+  refuses to provision outside a `ztest run` (the parent owns capacity admission).
+- **`ZTEST_IMAGE_REFS`** carries a `DevImageId → pull ref` map into the pod: the
+  baked image has no source tree, so an in-pod test can't recompute a `dev-<hash>`
+  and resolves component images by this map instead.
+- **ErrImagePull is terminal only after a grace window** — a run's pods pull the
+  same image at once and the kubelet throttles concurrent pulls; it self-heals.
+- **Pending is never a failure.** A pod parked on capacity waits indefinitely; the
+  only bound is the per-test hard cap. Over-allocation never reddens a test.
+- **The laptop owns per-test teardown *because* it owns the logs.** Collecting logs
+  laptop-side while the pod deletes its own namespace would race the fetch, so
+  namespace lifecycle moved to the laptop too: it creates the namespace, and at
+  the test's terminal fetches every pod's logs, then deletes. The in-pod `Drop`'s
+  historical reason (a `?`-return skipping teardown) is moot — the laptop tears
+  down unconditionally after the pod finishes, and `reap_run` covers a laptop
+  crash. This is why the runner image no longer carries `kubectl`.
+- **glibc-dynamic only.** `zingo` links `libstdc++` at runtime, so musl is out;
+  the compile and runtime stages both pin Debian `bookworm` for one glibc.
+- **On-cluster BuildKit runs privileged-in-userns** (`hostUsers: false` +
+  `privileged: true`, custom `ztest-buildkit` SCC): OKD/CRI-O needs `CAP_SYS_ADMIN`
+  + unmasked `/proc` per `RUN` step, and the userns maps root to an unprivileged
+  host uid. See [ops-openshift-setup.md](ops-openshift-setup.md).
+- **No fallback.** The profile names the backend; a failed build/push fails the
+  run — it never degrades to another path.
 
-**The wallet is the real in-process library** (`librustzcash` / `zingo`),
-running in the runner pod with its own `TempDir`. No RPC, no daemon, no facade.
-
-### ErrImagePull grace window
-
-Launching a run's worth of test pods together has them pull the same runner
-image at once; a single node's kubelet throttles concurrent pulls
-(`registryPullQPS`) and rejects the excess as `ErrImagePull`. This self-heals —
-the kubelet retries with backoff, and once the first pod warms the node cache
-`imagePullPolicy: IfNotPresent` stops the rest. The executor therefore treats
-`ErrImagePull`/`ImagePullBackOff` as terminal only after `IMAGE_PULL_GRACE`.
-`InvalidImageName` is immediately terminal.
-
-### Component image references
-
-A `dev!` component image is normally resolved by hashing its Dockerfile +
-context to `<repo>:dev-<hash>`. The baked runner image carries no source tree,
-so an in-pod test cannot recompute that hash, and `Distribution::from_env` is
-unset in-pod. Instead the laptop preflight (which built and pushed every
-component image) serializes a `spec_key → pull reference` map into each runner
-pod as `ZTEST_IMAGE_REFS`, and `image::resolve` returns the pre-resolved
-reference before touching the source. `spec_key` is a file-free hash over
-repo/features/toolchain/source-origin, so laptop and pod derive the same key
-from the same `dev!` declaration. (Image distribution env vars:
-[ops-clusters.md](ops-clusters.md).)
-
-## Storage constraint
-
-All cluster storage is RWO Ceph RBD block (`rook-ceph-block`) plus CSI
-VolumeSnapshots; there is no RWX/NFS/CephFS (`mounts.rs` hardcodes
-`ReadWriteOnce`; kind uses the hostpath CSI driver). A live "laptop writes, pod
-reads" mount is unavailable. Seed data is delivered via
-archive → snapshot → CoW-clone-per-test: materialize once, clone per test in
-milliseconds. See [design-architecture.md](design-architecture.md).
-
-## Linking: glibc-dynamic only
-
-`zingo` links `libstdc++` at runtime, so static musl is a non-starter; the
-glibc-dynamic path is mandatory. The compile stage (`rust:1.95.0-bookworm`) and
-the runtime stage (`debian:bookworm-slim`) both pin Debian `bookworm`, so a
-binary compiled in the toolchain image links the identical glibc the runtime
-image ships — no version matching to get wrong.
-
-## On-cluster compilation
-
-On an OpenShift target the laptop ships **source** and the cluster produces the
-binaries; no compile runs on the laptop and no runner image is pushed per edit.
-The whole compile + assemble is one multi-stage `buildctl` build of
-`docker/runner.Dockerfile` in the ephemeral BuildKit pod `ztest run` creates for
-the run (see [the image-build section](#openshift-on-cluster-image-build-canonical)).
-
-**The drive** (`pipeline/remote_compile.rs`, selected by
-`image::builds_on_cluster()`):
-
-1. **Ship source.** `cargo metadata` finds the workspace root and every local
-   (path) package; the git repos backing them are enumerated with `git ls-files`
-   (so each repo's `.gitignore` prunes `target/` and VCS metadata, no
-   hand-maintained exclude list) and streamed as a local `tar` into the pod's
-   `tar -x` under `/build/ctx`, at their ancestor-relative paths. `oc rsync` is
-   avoided: the BuildKit image ships no `rsync`, and its tar fallback walks the
-   excluded `target/` trees instead of pruning them.
-2. **Build + push the runner image.** A `buildctl build --opt target=runner`
-   compiles the selected binaries (`cargo nextest run --no-run`, `compile`
-   stage), assembles the runtime image (`runner` stage), and pushes it — one
-   build, authenticated with the pod SA token. Cargo's registry/git and target
-   dirs are `--mount=type=cache` mounts persisted in the BuildKit content store
-   on the cache PVC, so recompiles are incremental across runs. The tag is
-   content-addressed on the run id.
-3. **Export the inventory.** A second `buildctl build --opt
-   target=inventory-export` (`FROM scratch`, carrying only `/out`) reuses the
-   first build's layer/mount cache — so the compile does not re-run — and emits
-   `list.json` (`cargo nextest list --json`) plus a framed `inventory.jsonl`
-   (each binary run under `ZTEST_DUMP_INVENTORY=1`). `--output type=local`
-   exports just those two files, `oc cp`'d back and parsed by the same
-   `build::parse_list_summary` / `images::parse_inventory` + `images::assemble`
-   the local path uses.
-
-Component `dev!` images and data seeds still provision through the resource
-graph (built on-cluster too); only the runner image comes from this build.
-`ztest run` streams BuildKit's live progress and per-phase notes into scrollback.
-
-> **exec transport gotcha.** On the non-PTY path stdout and stderr are
-> multiplexed over one websocket, so `exec_streamed` must drain both
-> concurrently. Reading stdout to EOF then stderr deadlocks once a chatty compile
-> fills the stderr channel: stdout can't reach EOF until the stderr-blocked
-> stream closes.
-
-## OpenShift on-cluster image build (canonical)
-
-For a profile with distinct `push`/`pull` addresses (OpenShift), ztest builds
-every image on the cluster in an ephemeral, ztest-owned privileged-in-userns
-BuildKit pod (`ztest-buildkit`), not through OpenShift's Build subsystem. This
-covers `dev!` component images and the runner image alike.
-
-Per image, during preflight:
-
-1. **Pack the context.** `bundle::pack` walks the build context once into a
-   deterministic, `.dockerignore`-aware tar with the chosen Dockerfile at the
-   root — the same bytes the `dev-<hash>` tag is content-addressed on.
-2. **Build in the pod.** The tar is `oc cp`'d into the BuildKit pod and built by
-   `oc exec`ing `buildctl build` against the in-pod `buildkitd`. On a PTY
-   (`oc exec -t`) `buildctl` renders its own collapsing progress UI live into
-   the console.
-3. **Push over the in-cluster service.** `buildctl` pushes to the `pull` address
-   via `--output type=image,push=true`, authenticating with a docker
-   `config.json` written in-pod from the SA token. The registry's
-   service-ca-signed serving cert is verified via the auto-injected
-   `openshift-service-ca.crt` bundle, which the pod entrypoint folds into the
-   container's system trust before starting `buildkitd` (the push's OAuth token
-   fetch honours only system roots, not `buildkitd.toml`'s per-registry
-   `ca`/`insecure`). The first push auto-creates the imagestream.
-4. **Pods pull via the service.** Pod specs reference the `pull` address
-   (`image-registry.openshift-image-registry.svc:5000/…`); the kubelet pulls
-   in-cluster using the pod SA's auto-injected registry credentials — no pull
-   secret, no route cert on nodes. The laptop probes image presence via the
-   `push` route (same registry storage).
-
-### Security posture
-
-`buildkitd` runs as in-pod-root (uid 0) with `privileged: true`, confined
-inside a Kubernetes pod user namespace (`hostUsers: false`) under ztest's own
-`ztest-buildkit` SCC. The userns maps that root to a kubelet-assigned
-unprivileged host uid, so `privileged` grants no authority over the host. It is
-required: on OKD/CRI-O each `RUN` step's runc container needs `CAP_SYS_ADMIN` in
-the userns owning its mount ns and an unmasked `/proc`; the kernel's
-`mount_capable` gate plus the API's `procMount: Unmasked` rule (permitted only
-under `hostUsers: false`) make the pod userns the only working path. This buys
-overlayfs layer caching and DAG-parallel builds.
-
-### Cluster-side prerequisites
-
-`ztest setup --target okd` (run once, with an admin kubeconfig — needed to
-create the SCC) provisions everything; there are no cluster operators to
-install.
-
-- **BuildKit build server** (`resource::impls::buildkit`, `NodeId::Buildkit`):
-  the `ztest-buildkit` Deployment running `buildkitd`
-  (`moby/buildkit:v0.18.2`, `--oci-worker-snapshotter=overlayfs`) as in-pod-root
-  under `hostUsers: false` + `privileged: true`; its `ztest-buildkit`
-  ServiceAccount; a `buildkitd.toml` ConfigMap; and a cache PVC at BuildKit's
-  state dir (content store + overlayfs snapshots, persisting the layer cache
-  across builds). Context is staged in a per-build `emptyDir`. `buildkitd.toml`
-  routes `docker.io` through the `mirror.gcr.io` pull-through cache (BuildKit's
-  content store is separate from CRI-O's, so cold base `FROM` pulls would
-  otherwise re-resolve against Docker Hub and hit its per-IP anonymous rate
-  limit; the resolver tries the mirror first and keeps `registry-1.docker.io`
-  as automatic fallback), and marks the integrated registry insecure
-  (self-signed TLS).
-- **Custom SCC `ztest-buildkit`**: OKD's built-in `nested-container` SCC
-  (`SETUID`/`SETGID`, `seccompProfiles ['*']`, SELinux `container_engine_t`,
-  `userNamespaceLevel: RequirePodLevel`) plus `allowPrivilegedContainer`. Its
-  `runAsUser` range is pinned to `0-65534` so in-pod-root (uid 0) admits without
-  patching the namespace's billion-based uid-range annotation.
-- **Registry push authz**: the `ztest-image-push` role on `ztest-images`
-  (`policy::IMAGES_NAMESPACE`), bound to the run SA `ztest/ztest` **and**
-  `ztest/ztest-buildkit`. It grants `imagestreams: create` plus
-  `imagestreams/layers: get,update` — plain `system:image-pusher` lacks
-  imagestream **create**, so the first push of a never-seen image is denied.
-- **Pull authz**: `system:image-puller` on `ztest-images` for
-  `system:serviceaccounts`, so every pod SA can pull (why no pull secret is
-  needed).
-- **Per-test pod SCC grant.**
-
-The run SA's cluster read permissions (`nodes` for the QoS probe,
-`volumesnapshotclasses`/`storageclasses` for seeding) come from the same
-`ztest-remote` ClusterRole, sourced from `policy::RUN_RULES`, which also drives
-a run-start `SelfSubjectAccessReview` self-check: a stale grant makes
-`ztest run` fail fast naming the missing permission. The build path needs no
-`build.openshift.io` grants — it only `exec`s into the BuildKit pod
-(`pods/exec`).
-
-### Runtime images
-
-The runner build pulls its stage base images directly from upstream — the
-compile stage `FROM rust:1.95.0-bookworm`, the runtime stage
-`FROM debian:bookworm-slim` — so there are no ztest-built base images to
-provision at `ztest setup`. The runtime closure is just glibc + CA roots: the
-workspace links no rocksdb and no OpenSSL (rustls everywhere), only
-statically-linked C (ring, aws-lc-sys, zstd-sys). See
-`docker/runner.Dockerfile`.
-
-No fallback: the cluster profile names the backend, and if the on-cluster build
-fails the run fails — it never degrades to another build path.
-
-See [ops-openshift-setup.md](ops-openshift-setup.md) for cluster bring-up and
-[ops-clusters.md](ops-clusters.md) for the `ztest cluster` profile model.
+See [design-execution-engine.md](design-execution-engine.md) (engine/console),
+[design-qos.md](design-qos.md) (scheduler/ledger/governor),
+[design-resources.md](design-resources.md) (the DAG),
+[design-architecture.md](design-architecture.md) (namespaces/seeds).
+</content>

@@ -88,6 +88,7 @@ fn env() -> EngineEnv {
         sa: "ztest-local".into(),
         no_cleanup: false,
         capture: true,
+        color: false,
         ztest_log: None,
     }
 }

@@ -120,9 +120,11 @@ pub async fn mint_shadow_clone(
     let vsc_gvk = volume_snapshot_content_gvk();
     let vsc_api: Api<DynamicObject> = Api::all_with(client.clone(), &vsc_gvk);
     // A cluster-scoped VSC can't ownerRef the namespaced sentinel (k8s GC won't
-    // cross scopes) and so isn't cascaded by a namespace delete. Its run-id/user
-    // labels are the only handle the by-identity (Ctrl-C) and by-owner (`ztest
-    // cleanup`) reapers have on it.
+    // cross scopes) and so isn't cascaded by a namespace delete. Its labels are
+    // the only handle its reapers have: run-id/user for the by-identity (Ctrl-C)
+    // and by-owner (`ztest cleanup`) sweeps, and `test-ns` so the parent
+    // `ztest run` can delete exactly this test's VSCs at per-test teardown
+    // (the pod path no longer deletes them itself — see `pod_runner`).
     let coords = crate::naming::RunCoords::from_env().ok();
     let run_id = coords
         .as_ref()
@@ -140,6 +142,7 @@ pub async fn mint_shadow_clone(
             "labels": {
                 "ztest.io/run-id": run_id,
                 "ztest.io/user": user,
+                "ztest.io/test-ns": sentinel.namespace,
             },
         },
         "spec": {

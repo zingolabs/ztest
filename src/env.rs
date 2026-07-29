@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use futures::future::join_all;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
-use kube::api::{Api, ListParams, LogParams, PostParams};
+use kube::api::{Api, PostParams};
 use tokio::sync::Mutex;
 
 use std::net::{IpAddr, Ipv4Addr};
@@ -88,6 +88,11 @@ pub(crate) struct EnvInner {
     pub(crate) forwards: ForwardRegistry,
     pub(crate) shadow_clones: std::sync::Mutex<Vec<ShadowClone>>,
     pub(crate) is_built: AtomicBool,
+    /// One `kubectl logs -f` follow of every component pod for this test's
+    /// lifetime, buffered and rendered into the teardown diagnostic on failure
+    /// (see [`crate::logstream`]). Spawned once at the end of `build`, so it is
+    /// present only for a successfully-built env.
+    pub(crate) log_capture: std::sync::OnceLock<crate::logstream::LogCapture>,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -113,6 +118,7 @@ impl EnvInner {
             forwards: Arc::new(Mutex::new(HashMap::new())),
             shadow_clones: std::sync::Mutex::new(Vec::new()),
             is_built: AtomicBool::new(false),
+            log_capture: std::sync::OnceLock::new(),
         }
     }
 
@@ -558,8 +564,17 @@ impl TestEnv {
         let test_raw = naming::current_test_name();
         let package = naming::current_package();
         let test_slug = naming::slug(&test_raw, naming::DNS_LABEL_MAX);
-        let test_id = naming::test_suffix();
-        let namespace = naming::namespace_for(&package, &test_raw, &test_id);
+        // On the pod path the parent `ztest run` created (and will tear down) the
+        // per-test namespace and injected its name here, so it can follow every
+        // pod in it over the kube API — the single laptop-owned log path. We reuse
+        // that name and skip creation + teardown. Unset ⇒ local path: invent the
+        // name and own the namespace's whole lifecycle in-process (as before).
+        let laptop_owned = std::env::var(naming::TEST_NAMESPACE_ENV)
+            .ok()
+            .filter(|v| !v.is_empty());
+        let namespace = laptop_owned
+            .clone()
+            .unwrap_or_else(|| naming::namespace_for(&package, &test_raw, &naming::test_suffix()));
         let client = cluster::client().await.map_err(env_err)?;
 
         let tier = qos::current();
@@ -571,12 +586,18 @@ impl TestEnv {
             indexers = self.pending_indexers.len(),
             wallets = self.pending_wallets.len(),
             namespace = %namespace,
-            "provisioning TestEnv"
+            "starting test run"
         );
 
-        cluster::ensure_namespace(&client, &namespace, &coords, &package, &test_raw)
-            .await
-            .map_err(env_err)?;
+        // Local path creates the namespace here; on the pod path the laptop
+        // already created it (and waited for its default SA), so we go straight
+        // to the quota, which we still own (it's sized from the topology only
+        // known in-pod).
+        if laptop_owned.is_none() {
+            cluster::ensure_namespace(&client, &namespace, &coords, &package, &test_raw)
+                .await
+                .map_err(env_err)?;
+        }
         // Cap the namespace at the tier's deployed footprint: a hard,
         // API-server-enforced backstop to the parent scheduler's soft admission
         // (§7). Sized to exactly what the pods below request, so it never
@@ -695,6 +716,24 @@ impl TestEnv {
         self.materialize_phase(&ctx, &dependents).await?;
         build_phase("indexers_materialize", t_phase);
 
+        // Local path only: follow every component pod as one arrival-ordered,
+        // pod-prefixed stream in-process for the rest of the test (`--tail=-1`
+        // backfills the Phase-1 validators' history). On failure it becomes the
+        // interleaved timeline rendered in `Drop`; on success it is discarded.
+        // On the pod path the parent `ztest run` owns this capture over the kube
+        // API instead (see `logstream::Collector`), so we skip it here — the
+        // runner image carries no `kubectl` for it to shell.
+        if laptop_owned.is_none() {
+            let component_pods = self.inner.components.read().await.len();
+            let _ = self
+                .inner
+                .log_capture
+                .set(crate::logstream::LogCapture::spawn(
+                    &namespace,
+                    component_pods,
+                ));
+        }
+
         self.inner.is_built.store(true, Ordering::Release);
 
         tracing::debug!(
@@ -769,6 +808,24 @@ impl TestEnv {
         items: &[MaterializeItem],
     ) -> Result<(), EnvError> {
         for (id, spec, opts, validator_handle) in items {
+            // The per-component companion to the run-level "starting test run"
+            // line above: one INFO per pod as it is provisioned, naming its
+            // category, identity, image, and the reservation it will run under.
+            // Both build phases (validators, then indexers) funnel through here,
+            // so this is the single place that covers every pod.
+            let reservation = spec
+                .resources
+                .as_ref()
+                .or(spec.guaranteed.as_ref())
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "unset".to_string());
+            tracing::info!(
+                component = spec.category.as_str(),
+                name = %spec.pod_name,
+                image = %image_summary(&spec.image),
+                reservation = %reservation,
+                "provisioning component"
+            );
             let state = ComponentState::new(
                 spec,
                 ctx.sentinel.namespace.clone(),
@@ -807,7 +864,12 @@ impl TestEnv {
 }
 
 impl Drop for TestEnv {
-    /// Teardown is Drop-only and runs to completion here, pass or fail.
+    /// Teardown for the **local path**, Drop-only and running to completion here,
+    /// pass or fail. On the **pod path** (a laptop-created namespace, signalled by
+    /// `ZTEST_TEST_NAMESPACE`) this is a no-op: the parent `ztest run` owns log
+    /// collection, dead-pod reporting, and teardown over the kube API, precisely
+    /// so that capture can't race an in-pod namespace delete. The guard below
+    /// short-circuits before any teardown work in that case.
     ///
     /// There is deliberately no `teardown().await` method. An explicit call is
     /// skipped by any early `?`-return on a test's failure path, which leaks
@@ -834,6 +896,26 @@ impl Drop for TestEnv {
     /// this never leaks permanently. Capacity accounting lives in the parent
     /// `ztest run` scheduler and is released when this test process exits.
     fn drop(&mut self) {
+        // Pod path: the parent `ztest run` owns the namespace's lifecycle, the
+        // log capture, and the dead-pod report (all over the kube API). Nothing
+        // to do here — and deleting the namespace would race the parent's
+        // still-draining collector, the very bug this split exists to remove.
+        if std::env::var(naming::TEST_NAMESPACE_ENV)
+            .is_ok_and(|v| !v.is_empty())
+        {
+            return;
+        }
+
+        // Stop the follow child and snapshot the interleaved component-log
+        // timeline; it's emitted in the teardown thread below, after the
+        // dead-pod headers. Colour is the reporter's own decision, propagated by
+        // the engine as `ZTEST_COLOR`.
+        let color = std::env::var("ZTEST_COLOR").ok().as_deref() == Some("1");
+        let timeline = self.inner.log_capture.get().and_then(|c| {
+            c.stop();
+            c.render(color)
+        });
+
         let ns = self.inner.namespace.lock().ok().and_then(|mut g| g.take());
         let shadows: Vec<_> = self
             .inner
@@ -891,7 +973,14 @@ impl Drop for TestEnv {
                 // can't tell an Evicted/OOMKilled pod (contention) from a
                 // panicked one (a real component bug).
                 if let Some(ns) = &ns_for_diag {
-                    report_dead_component_pods(&client, ns).await;
+                    let headers = cluster::dead_pod_report(&client, ns).await;
+                    if !headers.is_empty() {
+                        eprint!("{headers}");
+                    }
+                }
+                if let Some(timeline) = &timeline {
+                    eprintln!("ztest: component logs (interleaved, by arrival):");
+                    eprint!("{timeline}");
                 }
                 if let Some(ns) = ns_to_delete {
                     cluster::delete_namespace(&client, &ns)
@@ -920,79 +1009,6 @@ impl Drop for TestEnv {
 }
 
 // ─────────────────────────────── helpers ──────────────────────────────
-
-/// Post-mortem for component pods that died during a test.
-///
-/// Runs in teardown, before the namespace is deleted. A component pod is bare
-/// (`restartPolicy: Never`), so any death is terminal and — by design — a real
-/// failure to root-cause, never a transient to retry. The test only ever sees a
-/// client-side "connection refused"; this recovers the pod-side verdict that
-/// distinguishes the causes: pod `Failed`/`reason=Evicted` or a container
-/// `OOMKilled` (resource contention) versus exit 101 + a panic tail (a genuine
-/// component bug). Best-effort: never fails teardown, emits nothing when every
-/// pod is healthy (the passing-test case).
-async fn report_dead_component_pods(client: &Client, namespace: &str) {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let list = match pods.list(&ListParams::default()).await {
-        Ok(l) => l,
-        Err(_) => return,
-    };
-    for pod in list {
-        let name = pod.metadata.name.clone().unwrap_or_default();
-        let Some(status) = pod.status.as_ref() else {
-            continue;
-        };
-        let phase = status.phase.as_deref().unwrap_or("");
-        let terminated: Vec<_> = status
-            .container_statuses
-            .iter()
-            .flatten()
-            .filter_map(|cs| {
-                let t = cs.state.as_ref()?.terminated.as_ref()?;
-                (t.exit_code != 0).then(|| (cs.name.clone(), t.clone()))
-            })
-            .collect();
-        if phase != "Failed" && terminated.is_empty() {
-            continue;
-        }
-
-        let mut report = format!("ztest: component pod `{name}` died (phase {phase})");
-        if let Some(reason) = status.reason.as_deref() {
-            report.push_str(&format!(", reason {reason}"));
-        }
-        if let Some(msg) = status.message.as_deref() {
-            report.push_str(&format!(": {msg}"));
-        }
-        for (container, t) in &terminated {
-            report.push_str(&format!("\n  container `{container}` exit {}", t.exit_code));
-            if let Some(reason) = t.reason.as_deref() {
-                report.push_str(&format!(" ({reason})"));
-            }
-            if let Some(sig) = t.signal {
-                report.push_str(&format!(" signal {sig}"));
-            }
-        }
-        let logs = pods
-            .logs(
-                &name,
-                &LogParams {
-                    tail_lines: Some(40),
-                    ..LogParams::default()
-                },
-            )
-            .await
-            .unwrap_or_default();
-        if !logs.trim().is_empty() {
-            report.push_str("\n  --- last 40 log lines ---\n");
-            for line in logs.lines() {
-                report.push_str("  ");
-                report.push_str(line);
-                report.push('\n');
-            }
-        }
-        eprintln!("{report}");
-    }
-}
 
 /// Wait for a dependency pod to become ready on the harness's "no flaky tests"
 /// terms.
@@ -1024,6 +1040,14 @@ fn build_phase(phase: &str, since: std::time::Instant) {
         elapsed_ms = since.elapsed().as_millis() as u64,
         "build phase"
     );
+}
+
+/// Shorten a fully-qualified image reference to its human-readable tail for the
+/// provisioning diagnostics: the final path segment (`repo:tag`), dropping the
+/// registry host and any leading path. `registry.example.com/lib/zebra:v6.2.0`
+/// → `zebra:v6.2.0`; a bare `zebra:v6.2.0` is returned unchanged.
+fn image_summary(image: &str) -> &str {
+    image.rsplit('/').next().unwrap_or(image)
 }
 
 async fn await_pod_ready(

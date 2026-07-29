@@ -89,6 +89,14 @@ pub fn namespace_for(package: &str, test: &str, suffix: &str) -> String {
 /// segment and for a label *value*. Slugs bound for either pass this as `max`.
 pub const DNS_LABEL_MAX: usize = 63;
 
+/// Env var carrying the per-test namespace the parent `ztest run` created for a
+/// runner pod. On the pod path the laptop owns the namespace's lifecycle (create,
+/// follow, teardown), so it picks the name and injects it here; the in-pod
+/// [`TestEnv::build`](crate::TestEnv::build) reads it instead of inventing its
+/// own, and skips namespace creation and teardown. Unset on the local path,
+/// where `TestEnv` runs in-process and owns the namespace itself.
+pub const TEST_NAMESPACE_ENV: &str = "ZTEST_TEST_NAMESPACE";
+
 /// Slugify `s` into a DNS-1123-safe fragment of at most `max` chars:
 /// lowercase, every run of non-alphanumeric characters collapsed to a single
 /// `-`, then trimmed of leading/trailing `-`. Empty input (or input that slugs

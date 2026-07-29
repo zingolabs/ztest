@@ -146,6 +146,7 @@ jsonrpsee-types = "0.24"
 tonic = { version = "0.14", default-features = false, features = ["transport", "channel", "codegen"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
+console = "0.16.4"
 owo-colors = "4.3.0"
 supports-color = "3.0.2"
 supports-unicode = "3.0.0"

@@ -9671,6 +9671,7 @@ dependencies = [
  "bytesize",
  "chrono",
  "clap",
+ "console",
  "ctor",
  "dialoguer",
  "futures",

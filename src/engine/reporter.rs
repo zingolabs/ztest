@@ -1,5 +1,5 @@
 //! A ztest-owned run reporter that reproduces `cargo nextest run`'s default
-//! human output byte-for-byte.
+//! human output.
 //!
 //! Formats the engine's lifecycle events into the exact scrolling status lines
 //! nextest emits — `PASS`/`FAIL`/`XFAIL`/`SLOW`/`TRY n …` verdicts with
@@ -7,8 +7,18 @@
 //! the `Summary` block, and the end-of-run failure recap (each failing test
 //! re-listed after the summary, nextest's `final-status-level = fail`) — matching
 //! nextest's indentation, capitalisation, and colours (`owo-colors`). We own
-//! every line, so there is no `nextest-runner` dependency; the goal is that a
-//! captured line is indistinguishable from nextest's (`reporter/displayer/imp.rs`).
+//! every line, so there is no `nextest-runner` dependency; each status line is
+//! indistinguishable from nextest's (`reporter/displayer/imp.rs`).
+//!
+//! One deliberate divergence: the captured-output block. nextest replays the
+//! child's bytes verbatim, so its `output ───` block inherits libtest's per-run
+//! framing (`running 1 test`, the `test <name> ... ` prefix — held open under
+//! `--nocapture` so the first log line glues onto it — and the trailing
+//! `failures:` / `test result:` summary). For a single `--exact` process that
+//! framing is pure noise, redundant with the `FAIL […] name` line and `Summary`
+//! block we already render. So [`strip_libtest_frame`] removes it and we replay
+//! only the test's own stdout/stderr and panic/`Error:` output. See it for the
+//! grammar and its fidelity fallbacks.
 //!
 //! Ceiling: the engine's [`Verdict`] models only pass/fail/timeout/spawn-error,
 //! so nextest's leak/flaky/slow-pass/abort status words can't be produced —
@@ -133,13 +143,14 @@ impl StyledReporter {
         let _ = writeln!(self.buf, "{line}");
     }
 
-    /// Replay a test's captured output. Matches nextest's default (indented)
+    /// Replay a test's captured output under nextest's default (indented)
     /// combined-stream layout (`unit_output.rs`): a `  output ───` header
     /// coloured by `ink` (fail-red for a failing test, pass-green for a passing
-    /// one shown via `success-output`), then the raw bytes indented four spaces,
-    /// with no closing rule. The engine captures a merged stdout+stderr stream,
-    /// so nextest's combined `output` header is the faithful choice (vs the
-    /// split `stdout`/`stderr` headers).
+    /// one shown via `success-output`), then `output` indented four spaces, with
+    /// no closing rule. The engine captures a merged stdout+stderr stream, so
+    /// nextest's combined `output` header is the faithful choice (vs the split
+    /// `stdout`/`stderr` headers). `output` is expected to already have had its
+    /// libtest framing removed by [`strip_libtest_frame`].
     fn replay_output(&mut self, output: &[u8], ink: Ink) {
         if output.is_empty() {
             return;
@@ -174,6 +185,95 @@ impl StyledReporter {
             let _ = self.buf.write_all(b"\n");
         }
     }
+}
+
+/// Strip a single `--exact <test> --nocapture` libtest run's framing from its
+/// captured stdout+stderr, leaving only the test's own output (its logs, and any
+/// panic message or `Result::Err` the harness printed).
+///
+/// libtest wraps every run in boilerplate that, for a one-test process, is pure
+/// noise duplicated by our own reporter frame:
+///
+/// ```text
+/// running 1 test
+/// test <name> ... <first log glued here under --nocapture>
+/// <more logs>
+/// FAILED                                    // or `ok`
+///
+/// failures:
+///
+/// failures:
+///     <name>
+///
+/// test result: FAILED. 0 passed; 1 failed; …
+/// ```
+///
+/// The head is removed by cutting everything up to and including the exact
+/// `test <name> ... ` marker (which also un-glues the first log line). The tail
+/// is anchored on the final `test result: ` line — everything from the verdict
+/// token (`ok`/`FAILED`/`ignored`) through that line is dropped bottom-up over
+/// libtest's summary grammar, consuming exactly one verdict so a user line that
+/// merely reads `FAILED` survives. Both anchors are fidelity fallbacks: a stream
+/// missing the marker or the `test result:` line is left un-cut on that side, so
+/// an unrecognised format degrades to nextest's verbatim replay rather than
+/// silently eating output.
+pub(crate) fn strip_libtest_frame(output: &[u8], test_name: &str) -> Vec<u8> {
+    let marker = format!("test {test_name} ... ");
+    let body = match find_subslice(output, marker.as_bytes()) {
+        Some(i) => &output[i + marker.len()..],
+        None => output,
+    };
+
+    let mut lines: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
+
+    if let Some(r) = lines.iter().rposition(|l| l.starts_with(b"test result: ")) {
+        lines.truncate(r);
+        strip_footer_grammar(&mut lines);
+    }
+
+    // Drop the blank lines the framing leaves at either edge, then re-join.
+    while lines.first().is_some_and(|l| l.is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.join(&b'\n')
+}
+
+/// Pop libtest's end-of-run summary grammar off the end of `lines`: trailing
+/// blanks, `failures:` headers, indented failure names / `---- … ----` capture
+/// headers, and finally exactly one verdict token. Stops at the first line that
+/// is real test output. The caller has already dropped the `test result:` line.
+fn strip_footer_grammar(lines: &mut Vec<&[u8]>) {
+    while let Some(&last) = lines.last() {
+        if last.is_empty()
+            || last == b"failures:"
+            || last.starts_with(b"    ")
+            || (last.starts_with(b"---- ") && last.ends_with(b" ----"))
+        {
+            lines.pop();
+            continue;
+        }
+        if is_verdict(last) {
+            lines.pop();
+        }
+        break;
+    }
+}
+
+/// Whether a line is a libtest per-test verdict token (`ok`, `ignored`, or
+/// `FAILED` optionally carrying a `should_panic` note like `FAILED (…)`).
+fn is_verdict(line: &[u8]) -> bool {
+    line == b"ok" || line == b"ignored" || line == b"FAILED" || line.starts_with(b"FAILED (")
+}
+
+/// The first index at which `needle` occurs in `haystack`, or `None`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 impl RunReporter for StyledReporter {
@@ -269,13 +369,19 @@ impl RunReporter for StyledReporter {
                 }
                 // Captured-output display, per verdict (`success-output` /
                 // `failure-output`): replay inline now if `immediate`, and/or
-                // defer to the end-of-run block if `final`.
+                // defer to the end-of-run block if `final`. The child's libtest
+                // framing is stripped once here so both paths show the same
+                // signal-only bytes.
                 let display = self.output.display_for(passed);
+                // On the pod path `output` is already the laptop-assembled unified
+                // timeline (frame-free), so the strip is a no-op; on the local path
+                // it removes the child's libtest framing.
+                let shown = strip_libtest_frame(output, test_name);
                 if display.is_immediate() {
-                    self.replay_output(output, ink);
+                    self.replay_output(&shown, ink);
                 }
-                if display.is_final() && !output.is_empty() {
-                    self.final_outputs.push((line, output.to_vec(), passed));
+                if display.is_final() && !shown.is_empty() {
+                    self.final_outputs.push((line, shown, passed));
                 }
             }
             TestEvent::TestSkipped {
@@ -1100,6 +1206,68 @@ mod tests {
         // Nothing running → no live rows at all (the panel sits alone), not a block
         // of blank padding.
         assert!(render_running(&[], 3, false).is_empty());
+    }
+
+    #[test]
+    fn strip_frame_removes_libtest_scaffolding_from_result_err_run() {
+        // A real `--exact <t> --nocapture` capture: libtest header, the held-open
+        // `test <t> ... ` prefix with the first log glued to it, the merged
+        // stdout/stderr body, then the verdict + summary footer.
+        let raw = b"\nrunning 1 test\ntest t ... 2026 INFO starting\n2026 INFO provisioning\nError: archive materialize failed\nFAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s\n\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(
+            got, "2026 INFO starting\n2026 INFO provisioning\nError: archive materialize failed",
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn strip_frame_removes_scaffolding_from_passing_run() {
+        let raw = b"\nrunning 1 test\ntest t ... hello from the test\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s\n\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(got, "hello from the test", "{got:?}");
+    }
+
+    #[test]
+    fn strip_frame_keeps_user_line_that_reads_failed() {
+        // Only the single trailing verdict token is consumed, so a log line whose
+        // text is literally `FAILED` must survive.
+        let raw = b"\nrunning 1 test\ntest t ... step one\nFAILED\nstep two\nFAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(got, "step one\nFAILED\nstep two", "{got:?}");
+    }
+
+    #[test]
+    fn strip_frame_preserves_panic_body() {
+        // A panic prints the `thread … panicked` block to stderr inline, before
+        // the verdict; it is signal and must be kept.
+        let raw = b"\nrunning 1 test\ntest t ... \nthread 't' panicked at src/x.rs:9:5:\nassertion failed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(
+            got,
+            "thread 't' panicked at src/x.rs:9:5:\nassertion failed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn strip_frame_falls_back_to_verbatim_when_marker_absent() {
+        // No recognizable `test <t> ... ` marker and no `test result:` anchor →
+        // no head/tail scaffolding is cut (only edge blank lines are trimmed), so
+        // an unexpected format keeps all its content rather than risk eating it.
+        let raw = b"some unexpected output shape\nwith two lines\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(
+            got, "some unexpected output shape\nwith two lines",
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn strip_frame_handles_module_qualified_test_name() {
+        let raw = b"\nrunning 1 test\ntest mod::sub::it ... log line\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "mod::sub::it")).unwrap();
+        assert_eq!(got, "log line", "{got:?}");
     }
 
     /// Strip CSI SGR sequences so colour tests can assert on the text.

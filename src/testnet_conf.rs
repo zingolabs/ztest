@@ -68,7 +68,7 @@ parallel_cpu_threads = 0
 
 [tracing]
 buffer_limit = 128000
-force_use_color = false
+force_use_color = true
 use_color = true
 filter = \"info\"
 use_journald = false{metrics_block}

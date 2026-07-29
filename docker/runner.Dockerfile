@@ -94,8 +94,14 @@ ARG NEXTEST_ARGS=""
 # takes the single highest-precedence rustflags source rather than merging them,
 # so a compiled repo's own rustflags would silently drop mold — `mold -run`
 # cannot be overridden. Copy the compiled test binaries OUT of the target cache
-# mount into a real layer (cache-mount contents don't survive into the image);
-# the executables directly under deps/ are the test binaries.
+# mount into a real layer (cache-mount contents don't survive into the image).
+# `/cache/target` is a *persistent* cache mount cargo never GCs, so deps/
+# accumulates every stale hash-suffixed binary from prior compiles; globbing it
+# would bake all of them — multi-GiB that ENOSPCs the runner COPY, and binaries
+# the engine never execs. Copy exactly the suites `nextest list` reports for this
+# selection instead: the same binary-paths the inventory stage dumps and the
+# engine runs, so /bins holds only the current, selected binaries and its layer
+# digest stays stable (unchanged suites ⇒ no re-push/re-pull).
 RUN --mount=type=cache,target=/cache/cargo \
     --mount=type=cache,target=/cache/target \
     set -eu; \
@@ -103,9 +109,12 @@ RUN --mount=type=cache,target=/cache/cargo \
     cd "/src/${WORKSPACE_REL}"; \
     mold -run cargo nextest run --no-run ${NEXTEST_ARGS}; \
     mkdir -p /bins/deps; \
-    for f in /cache/target/debug/deps/*; do \
-        [ -f "$f" ] && [ -x "$f" ] && cp -p "$f" /bins/deps/; \
-    done; true
+    cargo nextest list --message-format json ${NEXTEST_ARGS} \
+    | jq -r '.["rust-suites"][]["binary-path"]' \
+    | while IFS= read -r binpath; do \
+        [ -n "$binpath" ] || { echo "compile: nextest list gave an empty binary-path (schema drift?)" >&2; exit 1; }; \
+        cp -p "$binpath" /bins/deps/; \
+    done
 
 # ── inventory ─────────────────────────────────────────────────────────────────
 # `nextest list --json` (the selection + per-binary paths/cwds the laptop parses
@@ -146,6 +155,9 @@ FROM scratch AS inventory-export
 COPY --from=inventory /out/ /
 
 # ── runner ────────────────────────────────────────────────────────────────────
+# No `kubectl`: component-pod log capture is owned by the parent `ztest run` over
+# the kube API (src/logstream.rs `Collector`), not shelled from inside the pod, so
+# the runtime closure is just glibc + CA roots.
 FROM debian:bookworm-slim AS runner
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

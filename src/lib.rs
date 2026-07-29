@@ -31,6 +31,7 @@ pub mod topology;
 pub mod cancel;
 mod cluster;
 pub mod cluster_config;
+mod logstream;
 mod manifest;
 mod materialize;
 mod mounts;

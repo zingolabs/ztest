@@ -16,6 +16,18 @@ pub enum ComponentCategory {
     Wallet,
 }
 
+impl ComponentCategory {
+    /// The lowercase category tag used as the `component=` field in the
+    /// provisioning diagnostics (see [`crate::env`]).
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            ComponentCategory::Validator => "validator",
+            ComponentCategory::Indexer => "indexer",
+            ComponentCategory::Wallet => "wallet",
+        }
+    }
+}
+
 /// A validator component, generic in its backend. Build it through the
 /// constructors ([`Validator::zebrad`], [`Validator::custom`], …) and the
 /// [`ComponentBuilder`] chain methods, not by struct literal.
@@ -135,6 +147,31 @@ pub struct SharedState {
 pub struct Resources {
     pub(crate) cpu: String,
     pub(crate) memory: String,
+}
+
+/// A human-readable reservation summary for the provisioning diagnostics (see
+/// [`crate::env`]), matching the tier-unit style of [`crate::qos::Resources`]'s
+/// `Display` (`8c / 10 GiB`). The stored fields are raw k8s quantity strings:
+/// the QoS even-share writes bare integers (whole cores; exact bytes), while an
+/// explicit [`ComponentBuilder::resources`] override may carry unit suffixes
+/// (`500m`, `2Gi`). So each field is humanized only when it is a bare integer
+/// and otherwise passed through verbatim — no lossy re-parse of a value that
+/// already carries its own unit.
+impl std::fmt::Display for Resources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.cpu.parse::<u64>() {
+            Ok(cores) => write!(f, "{cores}c")?,
+            Err(_) => write!(f, "{}", self.cpu)?,
+        }
+        write!(f, " / ")?;
+        match self.memory.parse::<u64>() {
+            Ok(bytes) if bytes != 0 && bytes.is_multiple_of(crate::qos::GIB) => {
+                write!(f, "{} GiB", bytes / crate::qos::GIB)
+            }
+            Ok(bytes) => write!(f, "{} MiB", bytes / crate::qos::MIB),
+            Err(_) => write!(f, "{}", self.memory),
+        }
+    }
 }
 
 fn opts_for(version: &str, default_name: &'static str) -> ComponentOpts {

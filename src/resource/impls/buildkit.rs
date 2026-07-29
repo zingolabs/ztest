@@ -102,11 +102,73 @@ fn cache_size() -> String {
     std::env::var("ZTEST_BUILDKIT_CACHE_SIZE")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "50Gi".to_string())
+        .unwrap_or_else(|| "100Gi".to_string())
+}
+
+/// Parse a k8s storage quantity (`…Ki/Mi/Gi/Ti` or plain bytes) into bytes, for
+/// the grow-only size comparison in [`reconcile_cache_pvc_size`]. Returns `None`
+/// on any shape we don't recognise so the caller skips the resize rather than
+/// acting on a misread size.
+fn quantity_bytes(q: &str) -> Option<u128> {
+    let q = q.trim();
+    for (suffix, mult) in [
+        ("Ti", 1u128 << 40),
+        ("Gi", 1 << 30),
+        ("Mi", 1 << 20),
+        ("Ki", 1 << 10),
+    ] {
+        if let Some(n) = q.strip_suffix(suffix) {
+            return n.trim().parse::<u128>().ok().map(|n| n * mult);
+        }
+    }
+    q.parse::<u128>().ok()
 }
 
 fn is_already_exists(e: &kube::Error) -> bool {
     matches!(e, kube::Error::Api(r) if r.code == 409)
+}
+
+/// Grow the existing cache PVC toward [`cache_size`] when the target is larger
+/// than its current request; a no-op otherwise. Read via `serde_json` to stay
+/// off `k8s-openapi`'s version-fragile `resources` field shape. A merge patch of
+/// only the storage request is the standard CSI expansion trigger (the resizer
+/// sidecar acts on it asynchronously). Best-effort: a cluster whose StorageClass
+/// forbids expansion should not fail `setup` — the create-time size may still be
+/// enough — so a rejected patch is surfaced as a warning, not an error.
+async fn reconcile_cache_pvc_size(
+    api: &Api<PersistentVolumeClaim>,
+) -> Result<(), ResourceError> {
+    let desired = cache_size();
+    let Some(desired_b) = quantity_bytes(&desired) else {
+        return Ok(());
+    };
+    let existing = api.get(BUILDKIT_CACHE_PVC).await.map_err(|e| {
+        ResourceError::Provision(format!("get buildkit cache PVC {BUILDKIT_CACHE_PVC}: {e}"))
+    })?;
+    let current_b = serde_json::to_value(&existing)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.pointer("/spec/resources/requests/storage"))
+        .and_then(|q| q.as_str())
+        .and_then(quantity_bytes);
+    if current_b.is_some_and(|cur| cur >= desired_b) {
+        return Ok(());
+    }
+    let patch = json!({ "spec": { "resources": { "requests": { "storage": desired } } } });
+    if let Err(e) = api
+        .patch(
+            BUILDKIT_CACHE_PVC,
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await
+    {
+        eprintln!(
+            "warning: could not expand buildkit cache PVC {BUILDKIT_CACHE_PVC} to {desired} \
+             (is allowVolumeExpansion enabled on {STORAGE_CLASS}?): {e}"
+        );
+    }
+    Ok(())
 }
 
 /// Pull-through cache for `docker.io`, to dodge Docker Hub's per-IP anonymous
@@ -484,7 +546,10 @@ impl Provider for BuildkitProvider {
                 ResourceError::Provision(format!("apply buildkit ConfigMap {BUILDKIT_CONFIG}: {e}"))
             })?;
 
-        // Cache PVC: create-only — a bound PVC's size/class are immutable.
+        // Cache PVC: create if absent, else grow toward `cache_size()`. A bound
+        // PVC's class is immutable and CSI can only ever expand it (never shrink),
+        // so raising the default (or `ZTEST_BUILDKIT_CACHE_SIZE`) reconciles onto
+        // an existing cluster instead of stranding it at its create-time size.
         let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
         let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
             "apiVersion": "v1",
@@ -499,7 +564,7 @@ impl Provider for BuildkitProvider {
         .expect("static PVC manifest is valid");
         match pvc_api.create(&PostParams::default(), &pvc).await {
             Ok(_) => {}
-            Err(e) if is_already_exists(&e) => {}
+            Err(e) if is_already_exists(&e) => reconcile_cache_pvc_size(&pvc_api).await?,
             Err(e) => {
                 return Err(ResourceError::Provision(format!(
                     "create buildkit cache PVC {BUILDKIT_CACHE_PVC}: {e}"
@@ -507,5 +572,27 @@ impl Provider for BuildkitProvider {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quantity_bytes;
+
+    #[test]
+    fn quantity_bytes_parses_binary_suffixes_and_orders() {
+        assert_eq!(quantity_bytes("50Gi"), Some(50 * (1 << 30)));
+        assert_eq!(quantity_bytes("100Gi"), Some(100u128 * (1 << 30)));
+        assert_eq!(quantity_bytes("1Ti"), Some(1u128 << 40));
+        assert_eq!(quantity_bytes(" 512Mi "), Some(512 * (1 << 20)));
+        assert_eq!(quantity_bytes("1048576"), Some(1_048_576));
+        assert!(quantity_bytes("100Gi").unwrap() > quantity_bytes("50Gi").unwrap());
+    }
+
+    #[test]
+    fn quantity_bytes_rejects_unknown_shapes() {
+        assert_eq!(quantity_bytes("lots"), None);
+        assert_eq!(quantity_bytes("10Gb"), None);
+        assert_eq!(quantity_bytes(""), None);
     }
 }

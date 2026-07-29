@@ -116,6 +116,7 @@ pub(crate) fn run(
         sa: input.opts.sa.clone(),
         no_cleanup: input.opts.no_cleanup,
         capture: input.opts.output.captures(),
+        color: supports_color::on(supports_color::Stream::Stdout).is_some(),
         ztest_log: std::env::var("ZTEST_LOG")
             .ok()
             .filter(|v| !v.trim().is_empty()),

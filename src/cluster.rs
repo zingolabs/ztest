@@ -212,6 +212,90 @@ pub async fn delete_namespace(client: &Client, namespace: &str) -> Result<(), ku
     }
 }
 
+/// Recover the terminal reason of any component pod in `namespace` that *died*
+/// before teardown — the pod-side verdict a test only ever saw as a client-side
+/// "connection refused" — and distinguish `OOMKilled`/`Evicted` contention from
+/// an exit-101 component panic. Returns the rendered headers (empty when nothing
+/// died). Best-effort: a failed list yields an empty string, never an error.
+///
+/// The parent `ztest run` calls this from the runner-pod executor *before*
+/// deleting the namespace (whose delete would take the dead pods' status with
+/// it). The per-container log *body* comes from the log collector, not here.
+pub async fn dead_pod_report(client: &Client, namespace: &str) -> String {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::ListParams;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let Ok(list) = pods.list(&ListParams::default()).await else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for pod in list {
+        let name = pod.metadata.name.clone().unwrap_or_default();
+        let Some(status) = pod.status.as_ref() else {
+            continue;
+        };
+        let phase = status.phase.as_deref().unwrap_or("");
+        let terminated: Vec<_> = status
+            .container_statuses
+            .iter()
+            .flatten()
+            .filter_map(|cs| {
+                let t = cs.state.as_ref()?.terminated.as_ref()?;
+                (t.exit_code != 0).then(|| (cs.name.clone(), t.clone()))
+            })
+            .collect();
+        if phase != "Failed" && terminated.is_empty() {
+            continue;
+        }
+
+        out.push_str(&format!("ztest: component pod `{name}` died (phase {phase})"));
+        if let Some(reason) = status.reason.as_deref() {
+            out.push_str(&format!(", reason {reason}"));
+        }
+        if let Some(msg) = status.message.as_deref() {
+            out.push_str(&format!(": {msg}"));
+        }
+        for (container, t) in &terminated {
+            out.push_str(&format!("\n  container `{container}` exit {}", t.exit_code));
+            if let Some(reason) = t.reason.as_deref() {
+                out.push_str(&format!(" ({reason})"));
+            }
+            if let Some(sig) = t.signal {
+                out.push_str(&format!(" signal {sig}"));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Delete the cluster-scoped shadow VolumeSnapshotContents serving `namespace`,
+/// selected by [`LABEL_TEST_NS`](crate::qos::LABEL_TEST_NS). They can't cascade
+/// with the namespace delete (they're cluster-scoped), so the parent `ztest run`
+/// deletes them here at per-test teardown. Best-effort: a cluster without the
+/// snapshot CRD, or a VSC already gone, counts as success. Mirrors the
+/// list-then-delete-each of [`crate::resource::entry`]'s reaper (the run role
+/// advertises only `delete`, not `deletecollection`, on this resource).
+pub async fn delete_shadow_vscs_for_ns(client: &Client, namespace: &str) {
+    use kube::api::{DeleteParams, DynamicObject, ListParams};
+    let vsc: Api<DynamicObject> =
+        Api::all_with(client.clone(), &crate::seeds::volume_snapshot_content_gvk());
+    let lp = ListParams::default().labels(&format!("{}={namespace}", crate::qos::LABEL_TEST_NS));
+    let Ok(list) = vsc.list(&lp).await else {
+        return;
+    };
+    for obj in list.items {
+        let Some(name) = obj.metadata.name.as_deref() else {
+            continue;
+        };
+        if let Err(e) = vsc.delete(name, &DeleteParams::default()).await
+            && !crate::resource::kube::is_not_found(&e)
+        {
+            tracing::warn!(vsc = %name, namespace, error = %e, "shadow VSC delete failed");
+        }
+    }
+}
+
 /// Namespace handle threaded into the resource-creation helpers in `mounts.rs`
 /// and `seeds.rs`. With per-test namespaces, deleting the namespace cascades
 /// every namespaced resource (no owner-references needed).

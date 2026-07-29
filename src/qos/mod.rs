@@ -44,6 +44,11 @@ pub const LABEL_RUN_ID: &str = "ztest.io/run-id";
 /// reclaim exactly one developer's resources. Value is `RunCoords::user`
 /// slugged; see [`crate::naming::RunCoords`].
 pub const LABEL_USER: &str = "ztest.io/user";
+/// Label tying a cluster-scoped shadow VolumeSnapshotContent to the per-test
+/// namespace it serves. A shadow VSC can't be cascaded by the namespace delete
+/// (it's cluster-scoped), so the parent `ztest run` deletes it by this selector
+/// at per-test teardown — prompt cleanup, no run-long accumulation.
+pub const LABEL_TEST_NS: &str = "ztest.io/test-ns";
 
 // ── Disk-I/O reservation (declared on the PVC / storage request) ────────
 //
