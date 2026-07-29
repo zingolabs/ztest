@@ -358,8 +358,9 @@ mod tests {
         let fp = QosClass::Wallet.profile().footprint;
         let m = resource_quota_manifest(fp, 2);
         let hard = &m["spec"]["hard"];
-        assert_eq!(hard["requests.cpu"], "2000m");
-        assert_eq!(hard["requests.memory"], (GIB).to_string());
+        // 4c / 2 GiB even-split across 2 pods → 2c / 1 GiB each, summed back.
+        assert_eq!(hard["requests.cpu"], "4000m");
+        assert_eq!(hard["requests.memory"], (2 * GIB).to_string());
         assert_eq!(hard["pods"], "2");
         assert_eq!(m["metadata"]["name"], "ztest-tier");
     }

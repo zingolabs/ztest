@@ -436,7 +436,11 @@ impl QosClass {
                 hard_cap: Duration::from_secs(60),
             },
             QosClass::Wallet => QosProfile {
-                footprint: Resources::new(2_000, GIB, 0, 0),
+                // 4 component cores / 2 GiB: 2 cores + 1 GiB per pod for the
+                // validator + indexer topology (even-split across 2 pods). 1 GiB
+                // per pod is what a regtest zebrad needs for Orchard proving and
+                // the NU6 boundary work; the old 512 MiB even-share OOM-killed it.
+                footprint: Resources::new(4_000, 2 * GIB, 0, 0),
                 // In-process wallet lives in the runner pod, so it carries real
                 // compute, not just orchestration.
                 runner: Resources::new(4_000, GIB, 0, 0),
@@ -597,13 +601,14 @@ mod tests {
 
     #[test]
     fn wallet_tier_puts_its_compute_in_the_runner() {
-        // The in-process wallet lives in the runner pod, so the wallet tier's
-        // runner reserve (4c) dwarfs its component aggregate (2c); the whole
-        // admitted total is their sum (6c / 2Gi).
+        // Components: 4c / 2 GiB, even-split across the validator+indexer topology
+        // → 2c / 1 GiB each (1 GiB clears the Orchard/boundary work that OOM-killed
+        // zebrad at the old 512 MiB share). Runner carries the in-process wallet's
+        // real compute (4c). Admitted total is their sum, 8c / 3 GiB.
         let p = QosClass::Wallet.profile();
-        assert_eq!(p.footprint, Resources::new(2_000, GIB, 0, 0));
+        assert_eq!(p.footprint, Resources::new(4_000, 2 * GIB, 0, 0));
         assert_eq!(p.runner, Resources::new(4_000, GIB, 0, 0));
-        assert_eq!(p.admitted(), Resources::new(6_000, 2 * GIB, 0, 0));
+        assert_eq!(p.admitted(), Resources::new(8_000, 3 * GIB, 0, 0));
         assert_eq!(p.pool, Pool::General);
         assert_eq!(p.hard_cap, Duration::from_secs(10 * 60));
     }

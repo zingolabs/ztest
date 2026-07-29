@@ -224,17 +224,17 @@ pub(crate) async fn fetch_component_lines(client: &kube::Client, namespace: &str
     lines
 }
 
-/// Build the pod-path FAIL diagnostic: one `[runner]`/`[component]` timeline
-/// merged by timestamp and capped to the most recent [`MAX_LINES`], then the
-/// runner's panic / assertion block pinned verbatim (never capped), then any
-/// dead-pod terminal reasons.
+/// Build the pod-path FAIL diagnostic as two sections: the runner pod's own
+/// output in full (uncapped), then the supporting component logs (capped to the
+/// most recent [`MAX_LINES`]), then any dead-pod terminal reasons.
 ///
-/// `runner_raw` is the runner pod's libtest-framed stdout+stderr (no timestamps).
-/// Its frame is stripped, and the result split into the test's tracing (which
-/// carries its own RFC3339 stamps, so it interleaves with the components) and the
-/// panic/assertion tail (untimestamped — it is the conclusion, pinned at the end
-/// so the cap can never drop it). Pure, so the assembly is unit-tested without a
-/// cluster.
+/// `runner_raw` is the runner pod's libtest-framed stdout+stderr; its frame is
+/// stripped and the remainder — the test's own tracing followed by any
+/// panic/assertion — is shown verbatim and never capped. This is the test's
+/// primary voice: a high-volume component (zaino health-checks every ~100 ms)
+/// must never be able to evict it, so the runner output and the component
+/// timeline draw from separate budgets rather than one merged pool. Pure, so the
+/// assembly is unit-tested without a cluster.
 pub(crate) fn unified_output(
     runner_raw: &[u8],
     test_name: &str,
@@ -244,72 +244,32 @@ pub(crate) fn unified_output(
 ) -> Vec<u8> {
     let stripped = crate::engine::reporter::strip_libtest_frame(runner_raw, test_name);
     let stripped = String::from_utf8_lossy(&stripped);
-    let (tracing, pinned) = split_assertion(&stripped);
-
-    // Runner tracing joins the merge pool, tagged and keyed by its own leading
-    // timestamp; a continuation line (no stamp) inherits the previous key so a
-    // multi-line entry stays put.
-    let mut pool = component_lines;
-    let mut last = String::new();
-    for line in tracing {
-        let key = line_timestamp(&line)
-            .map(str::to_string)
-            .unwrap_or_else(|| last.clone());
-        last.clone_from(&key);
-        pool.push((key, format!("[runner] {line}")));
-    }
 
     let mut out = String::new();
-    if let Some(timeline) = render_recent(pool, color) {
+    let emit = |out: &mut String, line: &str| {
+        out.push_str("  ");
+        out.push_str(&if color {
+            line.to_string()
+        } else {
+            console::strip_ansi_codes(line).into_owned()
+        });
+        out.push('\n');
+    };
+
+    for line in stripped.lines() {
+        emit(&mut out, line);
+    }
+    // Supporting cast: the most recent component lines, under their own cap. The
+    // render carries its own "N dropped / showing the most recent MAX_LINES" note
+    // when it truncates, so the header stays accurate whether or not it capped.
+    if let Some(timeline) = render_recent(component_lines, color) {
+        out.push_str("  ── component logs ──\n");
         out.push_str(&timeline);
     }
-    // Pinned, verbatim, always shown — indented to match the timeline lines.
-    for block in [pinned.as_str(), dead] {
-        for line in block.lines() {
-            out.push_str("  ");
-            out.push_str(&if color {
-                line.to_string()
-            } else {
-                console::strip_ansi_codes(line).into_owned()
-            });
-            out.push('\n');
-        }
+    for line in dead.lines() {
+        emit(&mut out, line);
     }
     out.into_bytes()
-}
-
-/// Split a frame-stripped runner body into `(tracing lines, pinned tail)`. The
-/// tail is everything from the first failure marker — a Rust panic
-/// (`thread '…' panicked`) or a libtest `Error:` return — to the end; it is the
-/// assertion/error, pinned so the timeline cap never drops it. No marker (e.g. a
-/// timeout with no panic) ⇒ all tracing, empty tail.
-fn split_assertion(body: &str) -> (Vec<String>, String) {
-    let lines: Vec<&str> = body.lines().collect();
-    let cut = lines.iter().position(|l| {
-        (l.starts_with("thread ") && l.contains("panicked")) || l.starts_with("Error: ")
-    });
-    match cut {
-        Some(i) => (
-            lines[..i].iter().map(|s| s.to_string()).collect(),
-            lines[i..].join("\n"),
-        ),
-        None => (lines.iter().map(|s| s.to_string()).collect(), String::new()),
-    }
-}
-
-/// The leading RFC3339 timestamp token of a tracing line (the merge key), or
-/// `None` for a line that doesn't begin with one (a continuation line). Structural
-/// check only — no date parsing / chrono dep: `YYYY-MM-DDT…` with the `-`/`-`/`T`
-/// separators in place is enough to distinguish a stamp from ordinary text.
-fn line_timestamp(line: &str) -> Option<&str> {
-    let tok = line.split_whitespace().next()?;
-    let b = tok.as_bytes();
-    (b.len() >= 20
-        && b[0].is_ascii_digit()
-        && b[4] == b'-'
-        && b[7] == b'-'
-        && b[10] == b'T')
-        .then_some(tok)
 }
 
 /// Merge `(timestamp, body)` lines chronologically and render the most recent
@@ -514,44 +474,10 @@ mod tests {
     }
 
     #[test]
-    fn line_timestamp_recognizes_rfc3339_prefix_only() {
-        assert_eq!(
-            line_timestamp("2026-07-29T16:54:40.454305Z  INFO ztest::env: hi"),
-            Some("2026-07-29T16:54:40.454305Z"),
-        );
-        // A continuation / non-timestamped line has no key.
-        assert_eq!(line_timestamp("    at packages/zaino-state/src/lib.rs:12"), None);
-        assert_eq!(line_timestamp(""), None);
-    }
-
-    #[test]
-    fn split_assertion_pins_from_the_panic_or_error_marker() {
-        let (tracing, pinned) = split_assertion(
-            "2026-07-29T00:00:01Z INFO starting\n\
-             thread 'my::test' panicked at src/foo.rs:1:1:\n\
-             values disagree\n\
-             note: run with RUST_BACKTRACE=1",
-        );
-        assert_eq!(tracing, ["2026-07-29T00:00:01Z INFO starting"]);
-        assert!(pinned.starts_with("thread 'my::test' panicked"));
-        assert!(pinned.contains("values disagree"));
-
-        // A libtest `Error:` return is also a pin point.
-        let (tracing, pinned) = split_assertion("log line\nError: archive missing");
-        assert_eq!(tracing, ["log line"]);
-        assert_eq!(pinned, "Error: archive missing");
-
-        // No failure marker (e.g. a timeout) ⇒ everything is tracing.
-        let (tracing, pinned) = split_assertion("a\nb");
-        assert_eq!(tracing, ["a", "b"]);
-        assert!(pinned.is_empty());
-    }
-
-    #[test]
-    fn unified_output_interleaves_runner_with_components_and_pins_the_panic() {
-        // Runner tracing (its own RFC3339 stamps) at :01 and :03; one component
-        // line at :02 — so the merge must weave the component between the two
-        // runner lines, and the panic must land last, after the timeline.
+    fn unified_output_shows_runner_in_full_then_capped_components() {
+        // Runner output (tracing + panic) is small and primary; the components
+        // emit far more than MAX_LINES. The runner section must survive in full
+        // even though the component section is capped.
         let runner_raw = b"running 1 test\n\
 test my::test ... 2026-07-29T00:00:01Z  INFO ztest::env: starting\n\
 2026-07-29T00:00:03Z  INFO ztest::env: calling getdifficulty\n\
@@ -565,35 +491,51 @@ failures:\n\
 \n\
 test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n"
             .to_vec();
-        let components = vec![(
-            "2026-07-29T00:00:02Z".to_string(),
-            "[zebrad] block 1".to_string(),
-        )];
+        let components: Vec<TsLine> = (0..MAX_LINES + 10)
+            .map(|i| (format!("{i:04}"), format!("[zaino] status check {i}")))
+            .collect();
 
         let out = String::from_utf8(unified_output(
             &runner_raw,
             "my::test",
             components,
-            "",
+            "container `zebrad` exit 137 (OOMKilled)",
             false,
         ))
         .unwrap();
-        let body: Vec<&str> = out.lines().map(str::trim).collect();
 
-        // Interleaved by timestamp: runner :01, component :02, runner :03.
-        assert_eq!(
-            body[0],
-            "[runner] 2026-07-29T00:00:01Z  INFO ztest::env: starting"
-        );
-        assert_eq!(body[1], "[zebrad] block 1");
-        assert_eq!(
-            body[2],
-            "[runner] 2026-07-29T00:00:03Z  INFO ztest::env: calling getdifficulty"
-        );
-        // The panic/assertion is pinned after the timeline, in full.
-        assert_eq!(body[3], "thread 'my::test' panicked at json.rs:22:5:");
+        // Runner tracing AND the panic both survive verbatim — never evicted by
+        // the high-volume component stream.
+        assert!(out.contains("INFO ztest::env: starting"));
+        assert!(out.contains("INFO ztest::env: calling getdifficulty"));
+        assert!(out.contains("thread 'my::test' panicked at json.rs:22:5:"));
         assert!(out.contains("responses disagree: left 1.0 right 1.19"));
-        // The libtest footer (FAILED / failures / test result) is gone.
+        // The libtest footer is stripped.
         assert!(!out.contains("test result:"));
+
+        // The runner section precedes the component section; the components are
+        // capped (drop note present) while the runner content is not.
+        let runner_at = out.find("panicked").unwrap();
+        let header_at = out.find("── component logs ──").unwrap();
+        assert!(runner_at < header_at, "runner output must come first");
+        assert!(out.contains("earlier line(s) dropped"));
+        assert!(out.contains(&format!("showing the most recent {MAX_LINES}")));
+
+        // The dead-pod terminal reason is shown last.
+        assert!(out.contains("exit 137 (OOMKilled)"));
+        assert!(header_at < out.find("OOMKilled").unwrap());
+    }
+
+    #[test]
+    fn unified_output_omits_component_section_when_none_captured() {
+        let runner_raw = b"running 1 test\n\
+test my::test ... Error: archive missing\n\
+test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n"
+            .to_vec();
+        let out =
+            String::from_utf8(unified_output(&runner_raw, "my::test", Vec::new(), "", false))
+                .unwrap();
+        assert!(out.contains("Error: archive missing"));
+        assert!(!out.contains("── component logs ──"));
     }
 }

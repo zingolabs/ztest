@@ -45,14 +45,17 @@ the delivery.
    `Drop` is a no-op on the pod path (the laptop owns that).
 9. **Logs & report** (`logstream.rs`, `engine/reporter.rs`). At the test's terminal
    the laptop fetches every log definitively over the kube API — *before* deleting
-   anything — and `unified_output` weaves them into **one timeline**: the runner
-   pod's own tracing and each component pod's lines, tagged `[runner]`/`[<pod>]` and
-   merged by timestamp, capped to the most recent 40 lines *total*; the runner's
-   panic/assertion is pinned verbatim at the end (never capped — it's the failure
-   reason). A plain fetch, not a live follow: since the laptop owns teardown
-   ordering, the pods still exist at fetch time, so there's no attach-timing or
+   anything — and `unified_output` assembles **two sections**: first the runner
+   pod's own frame-stripped output (its tracing *and* the panic/assertion) in full,
+   uncapped; then the supporting component logs (each pod's kube-timestamped tail,
+   merged chronologically and capped to the most recent 40 lines total); then any
+   dead-pod terminal reason (OOMKilled/Evicted). The runner and component sections
+   draw from separate budgets on purpose: the runner is the test's primary voice,
+   so a high-volume component (zaino health-checks every ~100 ms) can never evict
+   it. A plain fetch, not a live follow: since the laptop owns teardown ordering,
+   the pods still exist at fetch time, so there's no attach-timing or
    mid-stream-EOF race. The reporter is byte-identical to `cargo nextest run` (no
-   `nextest-runner` dep) and replays this timeline only for FAILED tests
+   `nextest-runner` dep) and replays this block only for FAILED tests
    (`--success-output`/`--failure-output` policy).
 10. **Teardown** (`engine/pod_runner.rs`). After the collector drains, the laptop
     deletes this test's shadow VSCs (by the `ztest.io/test-ns` label — cluster-
