@@ -77,6 +77,20 @@ impl ValidatorConfig for ZebraBackend {
         COMPONENT
     }
 
+    fn regtest_opts(
+        &self,
+        mut opts: crate::component::ComponentOpts,
+    ) -> crate::component::ComponentOpts {
+        opts.regtest = true;
+        opts.command = Some(vec!["zebrad".to_string()]);
+        opts.args = Some(vec![
+            "-c".to_string(),
+            CONTAINER_CONFIG_PATH.to_string(),
+            "start".to_string(),
+        ]);
+        opts
+    }
+
     fn materialize_regtest_opts(
         &self,
         mut opts: crate::component::ComponentOpts,
@@ -425,14 +439,6 @@ impl ValidatorBackend for ZebraValidator {
 }
 
 // ─────────────────────────────── Regtest ──────────────────────────────
-
-impl crate::regtest::Regtest for crate::component::Validator<ZebraBackend> {
-    fn regtest(self) -> Self {
-        self.with_regtest()
-            .command(["zebrad"])
-            .args(["-c", CONTAINER_CONFIG_PATH, "start"])
-    }
-}
 
 /// Container-side path the rendered `zebrad.toml` is mounted at.
 const CONTAINER_CONFIG_PATH: &str = "/etc/zebrad/zebrad.toml";

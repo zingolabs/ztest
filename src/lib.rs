@@ -48,7 +48,7 @@ pub use crate::backends::image::DevSource;
 #[cfg(feature = "librustzcash")]
 pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
 pub use crate::backends::lightwalletd::LightwalletdIndexer;
-pub use crate::backends::zainod::ZainoIndexer;
+pub use crate::backends::zainod::{ZainoBackend, ZainoIndexer};
 pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::ZebraValidator;
 #[cfg(feature = "zingo")]
@@ -129,8 +129,8 @@ pub mod prelude {
         LightdInfo, LightwalletdIndexer, MempoolInfo, Mount, MountKind, MountSource, Peer,
         PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction, RpcError, SendResponse,
         SharedVolume, ShieldedProtocol, SnapshotRef, SubtreeRoot, TestEnv, TreeState, TxId,
-        Validator, ValidatorBackend, Wallet, WalletBackend, WalletExt, ZainoIndexer, ZatBalance,
-        ZcashdValidator, ZebraValidator,
+        Validator, ValidatorBackend, ValidatorConfig, Wallet, WalletBackend, WalletExt,
+        ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
     };
     pub use crate::backends::zainod::ZainoTuning;
     pub use crate::regtest::{

@@ -40,7 +40,7 @@ use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::ShieldedPool as ShieldedProtocol;
 use zcash_protocol::TxId;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 use zcash_protocol::local_consensus::LocalNetwork;
 use zcash_protocol::value::Zatoshis;
 
@@ -144,16 +144,33 @@ fn to_local_network(a: &ActivationHeights) -> LocalNetwork {
     }
 }
 
-/// Pool a wallet routes change / shielded output into. From NU6.3 the Orchard
-/// pool is spend-locked (its value balance must be non-negative), so shielded
-/// value must land in Ironwood, not Orchard, or the tx is rejected. Pre-NU6.3
-/// (`nu6_3` unset), Orchard is the right target.
-fn shielded_change_pool(params: &LocalNetwork) -> ShieldedProtocol {
-    if params.nu6_3.is_some() {
+/// Pool a wallet routes change / shielded output into for a transaction built
+/// at `target_height`. From NU6.3 the Orchard pool is spend-locked (its value
+/// balance must be non-negative), so shielded value must land in Ironwood. The
+/// gate is whether NU6.3 is *active at the target height*, not merely
+/// scheduled: the builder only exposes the Ironwood pool once the target height
+/// reaches NU6.3 (`create_proposed_transactions` uses the same `is_nu_active`
+/// check), so targeting Ironwood before then is rejected as
+/// `IronwoodBuilderNotAvailable`. Below the boundary Orchard is the only valid
+/// target.
+fn shielded_change_pool(params: &LocalNetwork, target_height: BlockHeight) -> ShieldedProtocol {
+    if params.is_nu_active(NetworkUpgrade::Nu6_3, target_height) {
         ShieldedProtocol::Ironwood
     } else {
         ShieldedProtocol::Orchard
     }
+}
+
+/// Height librustzcash targets for a newly built transaction: one past the
+/// wallet's synced chain tip, mirroring `create_proposed_transactions`'
+/// `chain_tip_height + 1`. The shielded pool must be chosen for this height, or
+/// it disagrees with the pool the builder actually makes available.
+fn tx_target_height(db: &Db) -> Result<BlockHeight, BoxError> {
+    let tip = db
+        .chain_height()
+        .map_err(|e| format!("librustzcash: chain_height: {e}"))?
+        .ok_or_else(|| "librustzcash: wallet has no synced chain tip".to_string())?;
+    Ok(tip + 1)
 }
 
 /// Connect a lightwalletd gRPC client to the indexer.
@@ -385,6 +402,7 @@ impl WalletBackend for LrzWallet {
         let prover = LocalTxProver::bundled();
         let sk = SpendingKeys::from_unified_spending_key(acct.usk.clone());
         let mut db = acct.db.lock().await;
+        let target = tx_target_height(&db)?;
         // `CommitmentTreeErrT` appears only in the error type and can't be
         // inferred; `Infallible` marks it unreachable, matching librustzcash.
         let proposal =
@@ -398,7 +416,7 @@ impl WalletBackend for LrzWallet {
                 amount,
                 None,
                 None,
-                shielded_change_pool(&acct.params),
+                shielded_change_pool(&acct.params, target),
             )
             .map_err(|e| format!("librustzcash: propose transfer: {e}"))?;
         // `InputsErrT`/`ChangeErrT` appear only in the error type and can't be
@@ -435,14 +453,15 @@ impl WalletBackend for LrzWallet {
             ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false);
         let prover = LocalTxProver::bundled();
         let input_selector = GreedyInputSelector::<Db>::new();
+        let sk = SpendingKeys::from_unified_spending_key(acct.usk.clone());
+        let mut db = acct.db.lock().await;
+        let target = tx_target_height(&db)?;
         let change_strategy = SingleOutputChangeStrategy::<Db>::new(
             StandardFeeRule::Zip317,
             None,
-            shielded_change_pool(&acct.params),
+            shielded_change_pool(&acct.params, target),
             DustOutputPolicy::default(),
         );
-        let sk = SpendingKeys::from_unified_spending_key(acct.usk.clone());
-        let mut db = acct.db.lock().await;
         let from_addrs: Vec<_> = db
             .get_transparent_receivers(acct.account_id, true, true)
             .map_err(|e| format!("librustzcash: get_transparent_receivers: {e}"))?

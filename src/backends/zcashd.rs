@@ -6,7 +6,6 @@ use crate::topology::ActivationHeights;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::component::ComponentBuilder;
 use crate::handles::client::{
     AuthedRpc, JsonRpcClient, json_rpc_with_basic_auth, wait_for_rpc_ready,
 };
@@ -86,6 +85,22 @@ impl ValidatorConfig for ZcashdBackend {
 
     fn label(&self) -> &'static str {
         COMPONENT
+    }
+
+    fn regtest_opts(
+        &self,
+        mut opts: crate::component::ComponentOpts,
+    ) -> crate::component::ComponentOpts {
+        opts.regtest = true;
+        opts.mounts
+            .push(crate::regtest::scratch_mount(CONTAINER_DATA_DIR));
+        opts.command = Some(vec!["zcashd".to_string()]);
+        opts.args = Some(vec![
+            format!("-conf={CONTAINER_CONF_PATH}"),
+            format!("-datadir={CONTAINER_DATA_DIR}"),
+            "-printtoconsole".to_string(),
+        ]);
+        opts
     }
 
     fn materialize_regtest_opts(
@@ -337,21 +352,6 @@ impl ValidatorBackend for ZcashdValidator {
             }
             tokio::time::sleep(CHAIN_POLL_INTERVAL).await;
         }
-    }
-}
-
-// ─────────────────────────────── Regtest ──────────────────────────────
-
-impl crate::regtest::Regtest for crate::component::Validator<ZcashdBackend> {
-    fn regtest(self) -> Self {
-        self.with_regtest()
-            .mount(crate::regtest::scratch_mount(CONTAINER_DATA_DIR))
-            .command(["zcashd"])
-            .args([
-                &format!("-conf={CONTAINER_CONF_PATH}"),
-                &format!("-datadir={CONTAINER_DATA_DIR}"),
-                "-printtoconsole",
-            ])
     }
 }
 

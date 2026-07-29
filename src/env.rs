@@ -900,9 +900,7 @@ impl Drop for TestEnv {
         // log capture, and the dead-pod report (all over the kube API). Nothing
         // to do here — and deleting the namespace would race the parent's
         // still-draining collector, the very bug this split exists to remove.
-        if std::env::var(naming::TEST_NAMESPACE_ENV)
-            .is_ok_and(|v| !v.is_empty())
-        {
+        if std::env::var(naming::TEST_NAMESPACE_ENV).is_ok_and(|v| !v.is_empty()) {
             return;
         }
 

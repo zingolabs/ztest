@@ -12,8 +12,7 @@
 //!
 //! One deliberate divergence: the captured-output block. nextest replays the
 //! child's bytes verbatim, so its `output ───` block inherits libtest's per-run
-//! framing (`running 1 test`, the `test <name> ... ` prefix — held open under
-//! `--nocapture` so the first log line glues onto it — and the trailing
+//! framing (`running 1 test`, the `test <name> ... ` prefix, and the trailing
 //! `failures:` / `test result:` summary). For a single `--exact` process that
 //! framing is pure noise, redundant with the `FAIL […] name` line and `Summary`
 //! block we already render. So [`strip_libtest_frame`] removes it and we replay
@@ -208,28 +207,53 @@ impl StyledReporter {
 /// test result: FAILED. 0 passed; 1 failed; …
 /// ```
 ///
-/// The head is removed by cutting everything up to and including the exact
-/// `test <name> ... ` marker (which also un-glues the first log line). The tail
-/// is anchored on the final `test result: ` line — everything from the verdict
-/// token (`ok`/`FAILED`/`ignored`) through that line is dropped bottom-up over
-/// libtest's summary grammar, consuming exactly one verdict so a user line that
-/// merely reads `FAILED` survives. Both anchors are fidelity fallbacks: a stream
-/// missing the marker or the `test result:` line is left un-cut on that side, so
-/// an unrecognised format degrades to nextest's verbatim replay rather than
-/// silently eating output.
+/// The shape above is what a TTY produces, where stdout and stderr interleave in
+/// write order and the body glues after the marker. The remote pod path does
+/// **not** hold to it: under `--nocapture` the test body (panic / `Error:`) is
+/// written to stderr while libtest's own `running`/marker/verdict lines go to
+/// stdout, and the container runtime merges the two pipes by read-arrival — so
+/// the body routinely lands *before* the `test <name> ... ` marker, not after it.
+/// Slicing at the marker would then discard the entire failure body (the whole
+/// point of the block). So we do not slice: we drop libtest's framing lines
+/// wherever they merged and keep every other line in place.
+///
+/// The framing is: the `running N tests` header (dropped anywhere it appears);
+/// the `test <name> ... ` line (dropped when only a bare verdict trails it — the
+/// pod case — else un-glued to keep the body glued after it, the TTY case); and
+/// the trailing summary, which libtest always flushes last so it sits at the end
+/// of the merged log — anchored on the final `test result: ` line and popped
+/// bottom-up over libtest's grammar, consuming exactly one verdict so a user line
+/// that merely reads `FAILED` survives. The `test result:` anchor is a fidelity
+/// fallback: a stream missing it is left un-cut on the tail, so an unrecognised
+/// format degrades to nextest's verbatim replay rather than silently eating
+/// output.
 pub(crate) fn strip_libtest_frame(output: &[u8], test_name: &str) -> Vec<u8> {
     let marker = format!("test {test_name} ... ");
-    let body = match find_subslice(output, marker.as_bytes()) {
-        Some(i) => &output[i + marker.len()..],
-        None => output,
-    };
+    let marker = marker.as_bytes();
 
-    let mut lines: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
+    let mut lines: Vec<&[u8]> = output.split(|&b| b == b'\n').collect();
 
     if let Some(r) = lines.iter().rposition(|l| l.starts_with(b"test result: ")) {
         lines.truncate(r);
         strip_footer_grammar(&mut lines);
     }
+
+    let mut kept: Vec<&[u8]> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if is_run_header(line) {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(marker) {
+            // TTY: the first body line is glued after the marker — keep it. Pod:
+            // only a bare verdict trails the marker — drop the whole line.
+            if !rest.is_empty() && !is_verdict(rest) {
+                kept.push(rest);
+            }
+            continue;
+        }
+        kept.push(line);
+    }
+    let mut lines = kept;
 
     // Drop the blank lines the framing leaves at either edge, then re-join.
     while lines.first().is_some_and(|l| l.is_empty()) {
@@ -239,6 +263,17 @@ pub(crate) fn strip_libtest_frame(output: &[u8], test_name: &str) -> Vec<u8> {
         lines.pop();
     }
     lines.join(&b'\n')
+}
+
+/// Whether `line` is libtest's `running N tests` run header.
+fn is_run_header(line: &[u8]) -> bool {
+    let Some(rest) = line.strip_prefix(b"running ") else {
+        return false;
+    };
+    let count = rest
+        .strip_suffix(b" tests")
+        .or_else(|| rest.strip_suffix(b" test"));
+    count.is_some_and(|c| !c.is_empty() && c.iter().all(u8::is_ascii_digit))
 }
 
 /// Pop libtest's end-of-run summary grammar off the end of `lines`: trailing
@@ -266,14 +301,6 @@ fn strip_footer_grammar(lines: &mut Vec<&[u8]>) {
 /// `FAILED` optionally carrying a `should_panic` note like `FAILED (…)`).
 fn is_verdict(line: &[u8]) -> bool {
     line == b"ok" || line == b"ignored" || line == b"FAILED" || line.starts_with(b"FAILED (")
-}
-
-/// The first index at which `needle` occurs in `haystack`, or `None`.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 impl RunReporter for StyledReporter {
@@ -1246,6 +1273,22 @@ mod tests {
         assert_eq!(
             got,
             "thread 't' panicked at src/x.rs:9:5:\nassertion failed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn strip_frame_recovers_panic_that_merged_before_the_marker() {
+        // The remote pod path writes the test body (panic) to stderr and libtest's
+        // `test <t> ... ` marker to stdout; the container runtime merges the panic
+        // *ahead* of the marker, so the body precedes the marker instead of gluing
+        // after it. Slicing at the marker would drop the whole failure — it must
+        // survive, and the marker (now carrying only the bare verdict) must go.
+        let raw = b"\nrunning 1 test\nthread 't' panicked at src/x.rs:9:5:\nassertion `left == right` failed\n  left: 1\n  right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest t ... FAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(
+            got,
+            "thread 't' panicked at src/x.rs:9:5:\nassertion `left == right` failed\n  left: 1\n  right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
             "{got:?}"
         );
     }

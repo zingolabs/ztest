@@ -218,7 +218,10 @@ pub(crate) async fn fetch_component_lines(client: &kube::Client, namespace: &str
             // split it off as the merge key, show the original body (which already
             // carries the component's own timestamp).
             let (ts, body) = line.split_once(' ').unwrap_or(("", line));
-            lines.push((ts.to_string(), format!("[{name}] {}", decode(body.as_bytes()))));
+            lines.push((
+                ts.to_string(),
+                format!("[{name}] {}", decode(body.as_bytes())),
+            ));
         }
     }
     lines
@@ -532,9 +535,14 @@ test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n"
 test my::test ... Error: archive missing\n\
 test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n"
             .to_vec();
-        let out =
-            String::from_utf8(unified_output(&runner_raw, "my::test", Vec::new(), "", false))
-                .unwrap();
+        let out = String::from_utf8(unified_output(
+            &runner_raw,
+            "my::test",
+            Vec::new(),
+            "",
+            false,
+        ))
+        .unwrap();
         assert!(out.contains("Error: archive missing"));
         assert!(!out.contains("── component logs ──"));
     }

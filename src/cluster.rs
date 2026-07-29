@@ -248,7 +248,9 @@ pub async fn dead_pod_report(client: &Client, namespace: &str) -> String {
             continue;
         }
 
-        out.push_str(&format!("ztest: component pod `{name}` died (phase {phase})"));
+        out.push_str(&format!(
+            "ztest: component pod `{name}` died (phase {phase})"
+        ));
         if let Some(reason) = status.reason.as_deref() {
             out.push_str(&format!(", reason {reason}"));
         }

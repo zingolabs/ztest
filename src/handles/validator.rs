@@ -59,6 +59,15 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     /// the spec before launch, so a backend-generic test can branch on it.
     fn label(&self) -> &'static str;
 
+    /// Apply this backend's regtest launch configuration (entrypoint argv and
+    /// any backend-local scratch mounts) to `opts`, and flag it regtest. Called
+    /// once from the blanket [`Regtest`](crate::regtest::Regtest) impl on
+    /// [`Validator`](crate::component::Validator), so a single generic
+    /// `.regtest()` covers every backend — new backends get it for free.
+    /// Height-dependent config is rendered later in
+    /// [`Self::materialize_regtest_opts`].
+    fn regtest_opts(&self, opts: ComponentOpts) -> ComponentOpts;
+
     /// Apply this backend's regtest-time, height-dependent mounts / flags to a
     /// `ComponentOpts`. Called from `env.build()` after the topology resolver
     /// has chosen `activation`. Returns

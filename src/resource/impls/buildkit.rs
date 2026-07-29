@@ -135,9 +135,7 @@ fn is_already_exists(e: &kube::Error) -> bool {
 /// sidecar acts on it asynchronously). Best-effort: a cluster whose StorageClass
 /// forbids expansion should not fail `setup` — the create-time size may still be
 /// enough — so a rejected patch is surfaced as a warning, not an error.
-async fn reconcile_cache_pvc_size(
-    api: &Api<PersistentVolumeClaim>,
-) -> Result<(), ResourceError> {
+async fn reconcile_cache_pvc_size(api: &Api<PersistentVolumeClaim>) -> Result<(), ResourceError> {
     let desired = cache_size();
     let Some(desired_b) = quantity_bytes(&desired) else {
         return Ok(());

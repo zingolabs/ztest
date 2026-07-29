@@ -183,9 +183,14 @@ async fn run_in_pod(
 
     let runner_api: Api<corev1::Pod> = Api::namespaced(client.clone(), &cfg.namespace);
 
-    if let Err(e) =
-        crate::cluster::ensure_namespace(&client, &test_ns, &coords, &item.binary_id, &item.test_name)
-            .await
+    if let Err(e) = crate::cluster::ensure_namespace(
+        &client,
+        &test_ns,
+        &coords,
+        &item.binary_id,
+        &item.test_name,
+    )
+    .await
     {
         return TestOutcome {
             verdict: Verdict::SpawnError,
@@ -655,7 +660,12 @@ mod tests {
         );
 
         // A regtest/integration tier runner: one whole core (orchestration).
-        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Integration), "ztest-test-ns");
+        let pod = build_pod(
+            "p",
+            &cfg,
+            &work_in_tier(QosClass::Integration),
+            "ztest-test-ns",
+        );
         let c = &pod.spec.as_ref().unwrap().containers[0];
         let res = c.resources.as_ref().expect("runner pod must be sized");
         let req = res.requests.as_ref().unwrap();
@@ -903,7 +913,13 @@ mod tests {
             color: false,
             ztest_log: None,
         };
-        let cfg = PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
+        let cfg = PodRunConfig::baked(
+            env,
+            "runner:dev".into(),
+            "ztest".into(),
+            None,
+            BTreeMap::new(),
+        );
         let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-pkg-t-abcd1234");
         let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
         let ns = vars

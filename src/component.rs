@@ -508,6 +508,19 @@ impl<B: ValidatorConfig> ComponentBuilder for Validator<B> {
     }
 }
 
+/// One `.regtest()` for every validator backend. Each backend contributes its
+/// launch argv / scratch mounts through
+/// [`ValidatorConfig::regtest_opts`](crate::handles::ValidatorConfig::regtest_opts),
+/// so a generic `<B: ValidatorConfig>` test can call `.regtest()` uniformly and
+/// a new backend gets it for free — no per-backend impl. (Testnet stays
+/// per-backend: only zebrad has a fixture.)
+impl<B: ValidatorConfig> crate::regtest::Regtest for Validator<B> {
+    fn regtest(mut self) -> Self {
+        self.opts = self.backend.regtest_opts(self.opts);
+        self
+    }
+}
+
 impl<B: IndexerConfig> ComponentBuilder for Indexer<B> {
     type Tuning = B::Tuning;
     fn component_opts_mut(&mut self) -> &mut ComponentOpts {
@@ -613,11 +626,6 @@ impl<B: ValidatorConfig> Validator<B> {
         self.opts.regtest_cache = Some(RegtestCacheSource::Blank);
         self
     }
-    pub(crate) fn with_regtest(mut self) -> Self {
-        self.opts.regtest = true;
-        self
-    }
-
     pub fn peer(mut self, name: impl Into<String>) -> Self {
         self.opts.peers.push(name.into());
         self
