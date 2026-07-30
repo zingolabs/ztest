@@ -145,6 +145,26 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
     /// The indexer's gRPC URI as a string (`http://host:port`).
     async fn grpc_uri(&self) -> Result<String, EnvError>;
 
+    /// A raw, persistent gRPC [`Channel`](tonic::transport::Channel) to the
+    /// `grpc` endpoint — opened once and HTTP/2-multiplexed. Every per-RPC method
+    /// on this trait dials a fresh channel per call, which is fine for a one-shot
+    /// assertion but measures connection setup rather than the RPC under load;
+    /// the load harness drives this instead.
+    async fn grpc_channel(&self) -> Result<tonic::transport::Channel, EnvError> {
+        tonic::transport::Channel::from_shared(self.grpc_uri().await?)
+            .map_err(crate::error::env_err)?
+            .connect()
+            .await
+            .map_err(crate::error::env_err)
+    }
+
+    /// A cheap-clone [`LwdClient`](crate::loadtest::LwdClient) over a persistent
+    /// channel — the entry point for the load / stress / differential harness in
+    /// [`crate::loadtest`].
+    async fn grpc_client(&self) -> Result<crate::loadtest::LwdClient, EnvError> {
+        crate::loadtest::LwdClient::connect(self.grpc_uri().await?).await
+    }
+
     /// Typed JSON-RPC client for this indexer's `jsonrpc` endpoint.
     async fn json_rpc(&self) -> Result<JsonRpcClient, EnvError>;
 

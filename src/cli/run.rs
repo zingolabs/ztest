@@ -13,6 +13,7 @@ use nextest_metadata::NextestExitCode;
 
 use crate::cli::console::{Console, SceneFrame};
 use crate::engine;
+use crate::engine::record::RunSelector;
 use crate::inventory::QosEntry;
 use crate::pipeline::{self, ArchivesOutcome, BuildOutcome, ProbeOutcome};
 
@@ -113,6 +114,13 @@ pub struct Args {
     /// / `KIND_CLUSTER` / kube-context. Must appear before the nextest args.
     #[arg(long, value_name = "NAME")]
     pub cluster: Option<String>,
+
+    /// Rerun only the tests that did not pass in a previous recorded run:
+    /// `latest`, a run-id or unambiguous prefix, or a recording path. Tests new
+    /// since that run are included too. Mirrors `cargo nextest run --rerun`.
+    /// Must appear before the nextest args.
+    #[arg(short = 'R', long = "rerun", value_name = "RUN_ID_OR_RECORDING")]
+    pub rerun: Option<RunSelector>,
 }
 
 /// The flags `ztest run` pulls out of its `cargo nextest run`-style argv: the
@@ -150,6 +158,10 @@ struct RunOptions {
     /// Run-only flags the user passed that ztest drops (e.g. `--archive-file`,
     /// `--debugger`), surfaced as a warning. Display-only flags aren't listed.
     unsupported: Vec<String>,
+    /// `-R/--rerun`: the prior run whose non-passing tests to re-execute. Not
+    /// parsed from the passthrough argv — it's a real `ztest run` flag copied in
+    /// from [`Args`] after classification.
+    rerun: Option<RunSelector>,
 }
 
 impl RunOptions {
@@ -357,6 +369,14 @@ fn split_eq(arg: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Resolve a `--rerun` selector to the set of `(binary_id, test_name)` that
+/// passed in that run — the tests this run will exclude.
+fn resolve_rerun(sel: &RunSelector) -> Result<std::collections::HashSet<(String, String)>, String> {
+    let workspace = engine::record::locate::current_workspace().map_err(|e| e.to_string())?;
+    let dir = engine::record::locate::resolve(&workspace, sel).map_err(|e| e.to_string())?;
+    engine::record::passed_tests(&dir).map_err(|e| e.to_string())
+}
+
 pub fn execute(args: Args) -> ExitCode {
     // Bail before any UI is drawn if we're not in a cargo workspace: cargo's
     // own error would otherwise land in the pinned-banner scroll region and be
@@ -369,7 +389,8 @@ pub fn execute(args: Args) -> ExitCode {
         return exit(NextestExitCode::SETUP_ERROR);
     }
 
-    let opts = RunOptions::parse(&args.nextest_args);
+    let mut opts = RunOptions::parse(&args.nextest_args);
+    opts.rerun = args.rerun.clone();
     if !opts.unsupported.is_empty() {
         eprintln!(
             "ztest run: ignoring flag(s) the ztest engine doesn't support: {}",
@@ -734,6 +755,22 @@ fn launch_engine(
         )
     });
 
+    // `--rerun`: resolve the prior run to the set of tests that passed, which the
+    // engine excludes from this run's work-list. A bad selector is a setup error.
+    let rerun_passed = match &opts.rerun {
+        Some(sel) => match resolve_rerun(sel) {
+            Ok(set) => set,
+            Err(e) => {
+                return fatal(
+                    console,
+                    format!("ztest run: --rerun: {e}"),
+                    NextestExitCode::SETUP_ERROR,
+                );
+            }
+        },
+        None => std::collections::HashSet::new(),
+    };
+
     let input = engine::EngineInput {
         summary,
         selected_binaries,
@@ -743,6 +780,7 @@ fn launch_engine(
         resource_states: image_phase.resource_states,
         runner_image: image_phase.runner_image,
         image_refs: image_phase.image_refs,
+        rerun_passed,
         opts: engine::EngineOpts {
             retries: opts.retries,
             fail_fast: opts.fail_fast,

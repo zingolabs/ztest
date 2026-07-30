@@ -15,6 +15,7 @@ pub mod env;
 pub mod error;
 pub mod handles;
 pub mod inventory;
+pub mod loadtest;
 pub mod mount;
 pub mod pipeline;
 pub mod preflight;
@@ -48,7 +49,7 @@ pub use crate::backends::image::DevSource;
 #[cfg(feature = "librustzcash")]
 pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
 pub use crate::backends::lightwalletd::LightwalletdIndexer;
-pub use crate::backends::zainod::{ZainoBackend, ZainoIndexer};
+pub use crate::backends::zainod::ZainoIndexer;
 pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::ZebraValidator;
 #[cfg(feature = "zingo")]
@@ -60,6 +61,10 @@ pub use crate::component::{
 pub use crate::env::{SharedVolume, TestEnv};
 pub use crate::error::{EnvError, RpcError};
 pub use crate::handles::client::JsonRpcClient;
+pub use crate::loadtest::{
+    ChainLinkOracle, ConnMode, DiffLoadDriver, Distribution, LoadDriver, LoadReport, LwdClient,
+    Oracle, Rel, Scenario, Slo, Until,
+};
 pub use crate::handles::indexer::{
     BlockHash, BlockHeight, CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo,
     RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, TreeState, TxId, ZatBalance,
@@ -133,6 +138,10 @@ pub mod prelude {
         ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
     };
     pub use crate::backends::zainod::ZainoTuning;
+    pub use crate::loadtest::{
+        ChainLinkOracle, ConnMode, DiffLoadDriver, Distribution, LoadDriver, LoadReport, LwdClient,
+        Oracle, Rel, Scenario, Slo, Until,
+    };
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
         Regtest, Testnet, regtest_test_activation_heights, regtest_test_lockbox_disbursements,

@@ -5,10 +5,12 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::qos::QosClass;
 
 /// Terminal result of a single test process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     /// Exited 0.
     Pass,
@@ -25,7 +27,7 @@ pub enum Verdict {
 
 /// Why a run was cancelled before every test reached a verdict. Ctrl-C is the
 /// only cause today, so [`Interrupt`](CancelReason::Interrupt) is the only variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CancelReason {
     /// Ctrl-C (SIGINT), caught by the console render thread.
     Interrupt,
@@ -48,7 +50,7 @@ impl Verdict {
 }
 
 /// Why a test was never run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkipReason {
     /// Footprint exceeds the empty-of-ztest cluster ceiling: unschedulable.
     ExceedsClusterCapacity,
@@ -76,7 +78,7 @@ pub struct RunningView {
 }
 
 /// Running tally of a run, fed into the panel and the final summary.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunStats {
     /// Tests that finished passing (after any retries).
     pub passed: u32,

@@ -24,9 +24,11 @@ pub(crate) mod cluster_tools;
 pub(crate) mod console;
 pub mod list_mounts;
 pub(crate) mod preview;
+pub mod replay;
 pub mod run;
 pub(crate) mod setup;
 pub(crate) mod snapshot;
+pub mod store;
 
 /// Top-level CLI surface.
 ///
@@ -61,6 +63,17 @@ pub enum Command {
     /// `cargo nextest run [args]` is a literal rename to
     /// `ztest run [args]`.
     Run(run::Args),
+
+    /// Replay a previously recorded run's output without re-executing it.
+    ///
+    /// Selects the run with `-R/--run-id` (`latest` by default, or a run-id /
+    /// unambiguous prefix / recording path) and re-renders it through the same
+    /// reporter a live run uses. Mirrors `cargo nextest replay`.
+    Replay(replay::Args),
+
+    /// Manage recorded runs (`list`, `info`, `export`, `prune`) — the
+    /// recordings that `ztest replay` and `ztest run --rerun` read.
+    Store(store::Args),
 
     /// Dump the resolved mount inventory for the current workspace
     /// as JSON.
@@ -136,6 +149,8 @@ pub fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Command::Run(args) => run::execute(args),
+        Command::Replay(args) => replay::execute(args),
+        Command::Store(args) => store::execute(args),
         Command::ListMounts(args) => list_mounts::execute(args),
         Command::Setup(args) => setup::execute(args),
         Command::Cleanup(args) => cleanup::execute(args),

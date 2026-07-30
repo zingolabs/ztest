@@ -11,6 +11,7 @@ pub mod output;
 pub mod panel;
 pub mod plan;
 pub mod pod_runner;
+pub mod record;
 pub mod reporter;
 pub mod schedule;
 
@@ -24,7 +25,6 @@ use nextest_metadata::{NextestExitCode, TestListSummary};
 
 use crate::cancel::Cancel;
 use crate::cli::console::{Console, SceneFrame};
-use crate::engine::events::RunReporter as _;
 use crate::engine::local_runner::EngineEnv;
 use crate::engine::reporter::StyledReporter;
 use crate::engine::schedule::{LoopConfig, PanelFrame, run_loop};
@@ -85,6 +85,10 @@ pub struct EngineInput<'a> {
     pub image_refs: std::collections::BTreeMap<String, String>,
     /// Run-behavior options.
     pub opts: EngineOpts,
+    /// Test identities that passed in a prior run selected by `--rerun`. They are
+    /// excluded from this run's work-list, so only tests that did not pass (and
+    /// tests new since that run) execute. Empty on a normal run.
+    pub rerun_passed: std::collections::HashSet<(String, String)>,
     /// Live cross-run capacity channels from the
     /// [`CapacityGovernor`](crate::qos::governor::CapacityGovernor): the ceiling
     /// the scheduler reconciles from and the demand sink it feeds. `None` for
@@ -103,12 +107,33 @@ pub(crate) fn run(
     theme: &Theme,
     qos_plan: Option<QosPlan>,
 ) -> ExitCode {
-    let items = plan::build_work_list(
+    let mut items = plan::build_work_list(
         input.selected_binaries,
         input.qos_by_binary,
         input.opts.retries,
         &input.resource_deps,
     );
+
+    // `--rerun`: drop the tests that already passed in the selected run, so only
+    // not-passed (and new) tests run. The note lands in scrollback before the
+    // first verdict.
+    if !input.rerun_passed.is_empty() {
+        let before = items.len();
+        items.retain(|it| {
+            !input
+                .rerun_passed
+                .contains(&(it.binary_id.clone(), it.test_name.clone()))
+        });
+        let skipped = before - items.len();
+        let note = format!(
+            "Rerunning {} test(s); {skipped} passed previously and were skipped\n",
+            items.len()
+        );
+        match console {
+            Some(c) => c.scrollback(note),
+            None => print!("{note}"),
+        }
+    }
 
     let env = EngineEnv {
         dylib_path: dylib::dylib_path_value(&input.summary.rust_build_meta),
@@ -177,13 +202,22 @@ pub(crate) fn run(
         _ => crate::observ::init(crate::observ::Sink::Stderr),
     }
 
+    // The recording sink (on by default; `ZTEST_NO_RECORD=1` opts out). Best
+    // effort: a setup failure disables recording with a warning rather than
+    // aborting the run — the replay feature is auxiliary to running tests.
+    let recorder = if record::recording_enabled() {
+        build_recorder(&input.opts.run_id, output.captures())
+    } else {
+        None
+    };
+
     // `--no-capture` streams output live and serially; the pinned TTY panel can't
     // coexist, so even on a terminal it takes the plain inherited path.
     let stats = match console {
         Some(c) if output.captures() => run_tty(
-            work_rt, items, ceiling, cfg, executor, c, theme, qos_plan, output,
+            work_rt, items, ceiling, cfg, executor, c, theme, qos_plan, output, recorder,
         ),
-        _ => run_inherited(work_rt, items, ceiling, cfg, executor, output),
+        _ => run_inherited(work_rt, items, ceiling, cfg, executor, output, recorder),
     };
 
     let stats = match stats {
@@ -222,13 +256,15 @@ fn run_tty(
     theme: &Theme,
     qos_plan: Option<QosPlan>,
     output: crate::engine::output::OutputConfig,
+    recorder: Option<record::RunRecorder>,
 ) -> std::io::Result<events::RunStats> {
     let color = supports_color::on(supports_color::Stream::Stdout).is_some();
-    let mut reporter = StyledReporter::new(
+    let styled = StyledReporter::new(
         color,
         supports_unicode::on(supports_unicode::Stream::Stdout),
         output,
     );
+    let mut reporter = wrap_reporter(styled, recorder);
     let plan = qos_plan.unwrap_or_else(empty_plan);
     let live_rows = console.live_rows() as usize;
 
@@ -242,7 +278,7 @@ fn run_tty(
         cfg,
         executor,
         rt,
-        &mut reporter,
+        reporter.as_mut(),
         |rep, frame| {
             let bytes = rep.take_scrollback();
             if !bytes.is_empty() {
@@ -282,23 +318,65 @@ fn run_inherited(
     cfg: LoopConfig,
     executor: std::sync::Arc<dyn local_runner::Executor>,
     output: crate::engine::output::OutputConfig,
+    recorder: Option<record::RunRecorder>,
 ) -> std::io::Result<events::RunStats> {
-    let mut reporter = StyledReporter::new(
+    let styled = StyledReporter::new(
         false,
         supports_unicode::on(supports_unicode::Stream::Stdout),
         output,
     );
+    let mut reporter = wrap_reporter(styled, recorder);
     let stats = drive(
         items,
         ceiling,
         cfg,
         executor,
         rt,
-        &mut reporter,
+        reporter.as_mut(),
         |rep, _frame| flush_stdout(rep),
     );
-    flush_stdout(&mut reporter);
+    flush_stdout(reporter.as_mut());
     Ok(stats)
+}
+
+/// Wrap the styled reporter in a [`RecordingReporter`] when recording is active,
+/// so the run loop records every event before it's rendered. Without a recorder
+/// the styled reporter is used directly. The returned box owns the recorder, so
+/// dropping it (at the end of the render path) finalizes the event log.
+fn wrap_reporter(
+    styled: StyledReporter,
+    recorder: Option<record::RunRecorder>,
+) -> Box<dyn events::RunReporter> {
+    match recorder {
+        Some(rec) => Box::new(record::RecordingReporter::new(Box::new(styled), rec)),
+        None => Box::new(styled),
+    }
+}
+
+/// Build the recording sink for a run, keyed by workspace and `run_id` under the
+/// per-user cache dir. Returns `None` (with a `tracing` warning) if the cache dir
+/// or log can't be created — recording is best-effort.
+fn build_recorder(run_id: &str, captured: bool) -> Option<record::RunRecorder> {
+    let workspace = record::locate::current_workspace().ok()?;
+    let dir = record::locate::run_dir(&workspace, run_id).ok()?;
+    let meta = record::RunMeta {
+        format_version: record::FORMAT_VERSION,
+        run_id: run_id.to_string(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        args: std::env::args().collect(),
+        captured,
+    };
+    let recorder = match record::RunRecorder::create(&dir, &meta) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("ztest: recording disabled: {e}");
+            return None;
+        }
+    };
+    // Prune old recordings for this workspace best-effort, so the cache stays
+    // bounded without a separate maintenance command.
+    record::retention::gc(&workspace, record::retention::RetentionPolicy::default());
+    Some(recorder)
 }
 
 /// Build the spawn closure and drive [`run_loop`] on `rt`.
