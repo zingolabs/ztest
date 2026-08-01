@@ -26,6 +26,17 @@ pub(crate) fn ensure_crypto_provider() {
     });
 }
 
+/// Install the provider process-wide before `main`. Under the `zingo` feature
+/// zingolib pulls rustls's `aws-lc-rs` backend alongside ztest's `ring`, so
+/// rustls can no longer auto-pick a default and any TLS client built off the
+/// `client()`/`config()` path (e.g. a kube client constructed directly in a
+/// unit test) would panic. Installing `ring` here resolves the ambiguity for
+/// every code path; `install_default` is a no-op once one is set.
+#[ctor::ctor]
+fn install_crypto_provider_ctor() {
+    ensure_crypto_provider();
+}
+
 /// Construct a kube client. In-cluster, uses the mounted ServiceAccount
 /// token. Otherwise targets the profile-pinned context ([`KUBE_CONTEXT_ENV`])
 /// in-memory if set, else infers from `KUBECONFIG` / `~/.kube/config`.

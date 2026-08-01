@@ -36,6 +36,9 @@ pub(crate) fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
             Ok(InventoryLine::Qos(q)) => dumped.qos.push(q),
             Ok(InventoryLine::Seed(s)) => dumped.seeds.push(s),
             Ok(InventoryLine::Dep(d)) => dumped.deps.push(d),
+            // Sync-test declarations are consumed by the `ztest sync` path, not
+            // by `ztest run`'s image/seed/qos discovery.
+            Ok(InventoryLine::SyncTest(_)) => {}
             Err(e) => return Err(format!("malformed inventory line `{line}`: {e}")),
         }
     }

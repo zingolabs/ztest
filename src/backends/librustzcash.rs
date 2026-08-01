@@ -20,11 +20,12 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use zcash_client_backend::data_api::chain::{BlockCache, BlockSource, error::Error as ChainError};
 use zcash_client_backend::data_api::scanning::ScanRange;
-use zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelector;
+use zcash_client_backend::data_api::wallet::input_selection::{GreedyInputSelector, SpendPolicy};
 use zcash_client_backend::data_api::wallet::{
-    ConfirmationsPolicy, SpendingKeys, create_proposed_transactions,
-    propose_standard_transfer_to_address, shield_transparent_funds,
+    ConfirmationsPolicy, SpendingKeys, create_proposed_transactions, propose_transfer,
+    shield_transparent_funds,
 };
+use zcash_client_backend::zip321::{Payment, TransactionRequest};
 use zcash_client_backend::data_api::{AccountBirthday, WalletRead, WalletWrite};
 use zcash_client_backend::fees::standard::SingleOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule};
@@ -153,6 +154,29 @@ fn to_local_network(a: &ActivationHeights) -> LocalNetwork {
 /// check), so targeting Ironwood before then is rejected as
 /// `IronwoodBuilderNotAvailable`. Below the boundary Orchard is the only valid
 /// target.
+/// The [`SpendPolicy`] for a send restricted to `from_pools`. An empty slice is
+/// the fully-shielded default (any pool); a non-empty slice restricts input
+/// selection to exactly those shielded pools, so the wallet cannot reach into
+/// same-pool liquidity to avoid a pool-crossing migration (e.g. forcing an
+/// Orchard note to be spent into an Ironwood receipt across the NU6.3 boundary).
+fn spend_policy_for(from_pools: &[Pool]) -> Result<SpendPolicy, BoxError> {
+    if from_pools.is_empty() {
+        return Ok(SpendPolicy::default());
+    }
+    let mut shielded = Vec::with_capacity(from_pools.len());
+    for &pool in from_pools {
+        shielded.push(match pool {
+            Pool::Sapling => ShieldedProtocol::Sapling,
+            Pool::Orchard => ShieldedProtocol::Orchard,
+            Pool::Ironwood => ShieldedProtocol::Ironwood,
+            Pool::Transparent => {
+                return Err("librustzcash: transparent is not a shielded spend source".into());
+            }
+        });
+    }
+    Ok(SpendPolicy::shielded_pools(shielded))
+}
+
 fn shielded_change_pool(params: &LocalNetwork, target_height: BlockHeight) -> ShieldedProtocol {
     if params.is_nu_active(NetworkUpgrade::Nu6_3, target_height) {
         ShieldedProtocol::Ironwood
@@ -390,6 +414,7 @@ impl WalletBackend for LrzWallet {
         from: AccountId,
         to: &str,
         zats: u64,
+        from_pools: &[Pool],
         timeout: Duration,
     ) -> Result<Vec<TxId>, BoxError> {
         let acct = self.account(from)?;
@@ -400,25 +425,45 @@ impl WalletBackend for LrzWallet {
         let policy =
             ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false);
         let prover = LocalTxProver::bundled();
+        let input_selector = GreedyInputSelector::<Db>::new();
+        let spend_policy = spend_policy_for(from_pools)?;
         let sk = SpendingKeys::from_unified_spending_key(acct.usk.clone());
         let mut db = acct.db.lock().await;
         let target = tx_target_height(&db)?;
+        let change_strategy = SingleOutputChangeStrategy::<Db>::new(
+            StandardFeeRule::Zip317,
+            None,
+            shielded_change_pool(&acct.params, target),
+            DustOutputPolicy::default(),
+        );
+        let request = TransactionRequest::new(vec![
+            Payment::new(
+                to_addr.to_zcash_address(&acct.params),
+                Some(amount),
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .map_err(|e| format!("librustzcash: build payment: {e:?}"))?,
+        ])
+        .map_err(|e| format!("librustzcash: build request: {e:?}"))?;
         // `CommitmentTreeErrT` appears only in the error type and can't be
         // inferred; `Infallible` marks it unreachable, matching librustzcash.
-        let proposal =
-            propose_standard_transfer_to_address::<Db, LocalNetwork, std::convert::Infallible>(
-                &mut *db,
-                &acct.params,
-                StandardFeeRule::Zip317,
-                acct.account_id,
-                policy,
-                &to_addr,
-                amount,
-                None,
-                None,
-                shielded_change_pool(&acct.params, target),
-            )
-            .map_err(|e| format!("librustzcash: propose transfer: {e}"))?;
+        let proposal = propose_transfer::<Db, LocalNetwork, _, _, std::convert::Infallible>(
+            &mut *db,
+            &acct.params,
+            acct.account_id,
+            &input_selector,
+            &change_strategy,
+            request,
+            policy,
+            &spend_policy,
+            // `proposed_version`: let the builder pick the consensus-branch
+            // default tx version for the target height.
+            None,
+        )
+        .map_err(|e| format!("librustzcash: propose transfer: {e}"))?;
         // `InputsErrT`/`ChangeErrT` appear only in the error type and can't be
         // inferred; the proposal is already built, so both are `Infallible`.
         let txids = create_proposed_transactions::<

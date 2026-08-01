@@ -25,6 +25,7 @@ pub mod qos;
 pub mod regtest;
 pub mod regtest_conf;
 pub mod resource;
+pub mod sync;
 pub mod testnet_conf;
 pub mod topology;
 
@@ -81,7 +82,7 @@ pub use crate::handles::{
     WalletBackend, WalletConfig,
 };
 pub use crate::mount::{ArchiveHandle, Mount, MountKind, MountSource, SnapshotRef};
-pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file};
+pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file, sync_test};
 
 /// Internal re-exports so test-author proc macros can reach their runtime
 /// support code. Not part of the public API; paths may change without notice.
@@ -151,5 +152,5 @@ pub mod prelude {
     /// [`ValidatorBackend::activation_heights`]), so callers need the type to
     /// consume what ztest returns.
     pub use crate::topology::ActivationHeights;
-    pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file};
+    pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file, sync_test};
 }

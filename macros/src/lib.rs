@@ -826,3 +826,143 @@ fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream 
     }
     .into()
 }
+
+// ─────────────────────────── sync_test attribute ──────────────────────
+
+/// Static metadata parsed from `#[ztest::sync_test(...)]`. `name`/`subject`/
+/// `qos` are required; `description` defaults to empty, `timeout` to `"48h"`,
+/// `tags` to none.
+struct SyncTestArgs {
+    name: LitStr,
+    description: LitStr,
+    subject: syn::Ident,
+    timeout: LitStr,
+    qos: syn::Ident,
+    tags: Vec<LitStr>,
+}
+
+impl Parse for SyncTestArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut name: Option<LitStr> = None;
+        let mut description: Option<LitStr> = None;
+        let mut subject: Option<syn::Ident> = None;
+        let mut timeout: Option<LitStr> = None;
+        let mut qos: Option<syn::Ident> = None;
+        let mut tags: Vec<LitStr> = Vec::new();
+
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            let _: Token![=] = input.parse()?;
+            match key.to_string().as_str() {
+                "name" => name = Some(input.parse()?),
+                "description" => description = Some(input.parse()?),
+                "timeout" => timeout = Some(input.parse()?),
+                "subject" => subject = Some(input.parse()?),
+                "qos" => qos = Some(input.parse()?),
+                "tags" => {
+                    let content;
+                    syn::bracketed!(content in input);
+                    let items =
+                        content.parse_terminated(<LitStr as Parse>::parse, Token![,])?;
+                    tags = items.into_iter().collect();
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!(
+                            "unknown sync_test key `{other}` \
+                             (expected name/description/subject/timeout/qos/tags)"
+                        ),
+                    ));
+                }
+            }
+            if input.peek(Token![,]) {
+                let _: Token![,] = input.parse()?;
+            }
+        }
+
+        let name = name
+            .ok_or_else(|| syn::Error::new(Span::call_site(), "sync_test requires `name = \"..\"`"))?;
+        let subject = subject.ok_or_else(|| {
+            syn::Error::new(Span::call_site(), "sync_test requires `subject = wallet|indexer|validator`")
+        })?;
+        let qos = qos
+            .ok_or_else(|| syn::Error::new(Span::call_site(), "sync_test requires `qos = <tier>`"))?;
+        let subj = subject.to_string();
+        if !matches!(subj.as_str(), "wallet" | "indexer" | "validator") {
+            return Err(syn::Error::new(
+                subject.span(),
+                "sync_test `subject` must be wallet, indexer, or validator",
+            ));
+        }
+        Ok(SyncTestArgs {
+            name,
+            description: description
+                .unwrap_or_else(|| LitStr::new("", Span::call_site())),
+            subject,
+            timeout: timeout.unwrap_or_else(|| LitStr::new("48h", Span::call_site())),
+            qos,
+            tags,
+        })
+    }
+}
+
+/// `#[ztest::sync_test(name = "..", subject = wallet, qos = sync, ..)]` on
+/// `async fn(mut run: SyncRunner) -> SyncOutcome`.
+///
+/// Emits two things (mirroring the QoS attribute's out-of-process bridge):
+/// 1. an `inventory::submit!` of a [`SyncTestDecl`](ztest::inventory::SyncTestDecl)
+///    carrying the static metadata, so `ztest sync list`/`describe` and QoS
+///    admission can see the profile without running its body;
+/// 2. a `#[tokio::test]` wrapper that constructs a `SyncRunner`, runs the body,
+///    and asserts the outcome passed — the CI-gating (pod-per-test) owner. The
+///    `ztest sync start` owner runs the same body detached (see the CLI).
+#[proc_macro_attribute]
+pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as SyncTestArgs);
+    let mut body_fn = match syn::parse::<ItemFn>(item) {
+        Ok(f) => f,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    let test_ident = body_fn.sig.ident.clone();
+    // Nest the author's body under a fixed name inside the generated wrapper.
+    body_fn.sig.ident = syn::Ident::new("__ztest_sync_body", test_ident.span());
+
+    let SyncTestArgs {
+        name,
+        description,
+        subject,
+        timeout,
+        qos,
+        tags,
+    } = args;
+    let subject_str = LitStr::new(&subject.to_string(), subject.span());
+    let qos_str = LitStr::new(&qos.to_string(), qos.span());
+
+    quote! {
+        ::ztest::__private::inventory::submit! {
+            ::ztest::inventory::SyncTestDecl {
+                test_id: concat!(module_path!(), "::", stringify!(#test_ident)),
+                name: #name,
+                description: #description,
+                subject: #subject_str,
+                timeout: #timeout,
+                qos: #qos_str,
+                tags: &[#(#tags),*],
+            }
+        }
+
+        #[::tokio::test(flavor = "multi_thread")]
+        async fn #test_ident() {
+            #body_fn
+            let __outcome = __ztest_sync_body(::ztest::sync::SyncRunner::new()).await;
+            assert!(
+                __outcome.verdict.is_pass(),
+                "sync_test failed: {:?}",
+                __outcome
+            );
+        }
+    }
+    .into()
+}

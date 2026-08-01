@@ -2,12 +2,12 @@
 members = ["macros"]
 resolver = "2"
 
-# The zingolabs/librustzcash `basic_ironwood` wallet stack resolves shardtree
-# 0.6.2 / incrementalmerkletree 0.8.2 from crates.io (its own lockfile), which
-# already carry the retained-checkpoint methods the wallet stack needs — so no
-# `[patch.crates-io]` override is required (the previous decefc46 git pin was a
-# stale pre-release API missing `add_retained_checkpoint` et al. and broke the
-# basic_ironwood zcash_client_sqlite build).
+# Post-ironwood dependency line. The whole zcash_* wallet stack now resolves
+# from crates.io at the ironwood versions zingolib `dev` pins (zcash_protocol
+# 0.10, zcash_client_backend 0.24.0-rc.1, zcash_keys 0.15, zcash_primitives
+# 0.29), so the librustzcash backend and the zingo backend share one copy of
+# each crate. The one required source override lives in `[patch.crates-io]` at
+# the end of this file (see there for why).
 
 [workspace.package]
 edition = "2024"
@@ -27,16 +27,11 @@ serde_json = "1.0.132"
 hex = "0.4.3"
 reqwest = { version = "0.12", default-features = false }
 
-# librustzcash wallet stack, aligned to the orchard 0.15 line so the
-# librustzcash backend's in-process Orchard proofs validate against a zebra
-# 6.0.0-rc.0 validator (which links orchard 0.15). The leaf wallet crates
-# (zcash_client_backend, zcash_client_sqlite) are not published on the 0.15
-# line, so the whole stack is git-sourced from the zingolabs/librustzcash
-# `basic_ironwood` branch (pinned), which adds NU6.3/Ironwood wallet support
-# (`AccountBalance::ironwood_balance`) on top of the orchard 0.15 line and
-# resolves zcash_protocol 0.10 / zcash_keys 0.15 / zcash_primitives 0.29. See
-# the git deps in the crate below.
-zcash_protocol = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", features = ["local-consensus"] }
+# Shared by ztest core (non-optional) and both wallet backends; the version
+# line must match zingolib dev's so `zcash_protocol` unifies to one copy across
+# the whole graph. `local-consensus` gives the `LocalNetwork` params type the
+# librustzcash backend runs regtest against.
+zcash_protocol = { version = "0.10.0", features = ["local-consensus"] }
 
 # ─────────────────────────── ztest crate ──────────────────────────────
 [package]
@@ -94,26 +89,30 @@ zcash_protocol = { workspace = true }
 prost = "0.14"
 tonic-prost = "0.14"
 
-# In-process wallet backend (`backends::zingo`). zingolib runs as a library
-# in the test binary against the pod-hosted indexer's gRPC. Git pins MUST
-# match the consumer crates' pins so the resolved zcash_* / zebra-chain /
-# nonempty / TxId copies unify into single versions in the lockfile.
-zingolib = { git = "https://github.com/zingolabs/zingolib.git", rev = "61418d6ecbc679a88da8268a2be5db3926501fc6", features = [
+# In-process wallet backend (`backends::zingo`). zingolib runs as a library in
+# the test binary against the pod-hosted indexer's gRPC. Pinned to `dev` (post-
+# ironwood); its crates.io zcash_* version lines are matched above so every
+# zcash_* / TxId copy unifies into a single version in the lockfile.
+zingolib = { git = "https://github.com/zingolabs/zingolib.git", rev = "b1fb8b1d57695e815ee64aa19ad0c09e3044e9f3", features = [
     "testutils",
 ], optional = true }
-pepper-sync = { git = "https://github.com/zingolabs/zingolib.git", rev = "61418d6ecbc679a88da8268a2be5db3926501fc6", optional = true }
+pepper-sync = { git = "https://github.com/zingolabs/zingolib.git", rev = "b1fb8b1d57695e815ee64aa19ad0c09e3044e9f3", optional = true }
 # BIP-39 mnemonic type for `WalletBase::Mnemonic`, used by the inlined
 # `backends::zingo::client_builder` (replaces the one thing ztest used from
-# `zingolib_testutils`). Version MUST match zingolib rev 61418d6e's `bip0039`
-# pin so the `Mnemonic` type unifies into one copy.
-bip0039 = { version = "0.13", optional = true }
+# `zingolib_testutils`). Version MUST match zingolib dev's `bip0039` pin so the
+# `Mnemonic` type unifies into one copy.
+bip0039 = { version = "0.14", optional = true }
+# `ChainType::Regtest`'s `ActivationHeights` carrier: dev moved it out of
+# `zebra-chain` into this crate. Version tracks zingolib dev's `= "0.4.0"`.
+zingo_common_components = { version = "0.4.0", optional = true }
+# The gRPC `Indexer`/`TransparentIndexer` client the sync driver hands to
+# `pepper_sync::sync` (dev's `sync` is generic over the client trait). Same
+# zingolib repo/rev so its `CompactTxStreamerClient`/proto types unify.
+zingo-netutils = { git = "https://github.com/zingolabs/zingolib.git", rev = "b1fb8b1d57695e815ee64aa19ad0c09e3044e9f3", optional = true }
 zingo_test_vectors = { git = "https://github.com/zingolabs/infrastructure.git", tag = "zcash_local_net_v0.6.0", optional = true }
-# Only the `zingo` backend needs zebra-chain (zingolib's ConfiguredActivationHeights
-# param type); ztest core no longer links it. Pinned to 9.0.0 to match zingolib
-# rev 61418d6e's resolved zebra so the type unifies. Optional + gated on `zingo`.
-zebra-chain = { version = "9.0.0", optional = true }
 # zingo-only (the in-process wallet backend); gated on the `zingo` feature.
-zip32 = { version = "0.2.1", optional = true }
+# `0.2` so it unifies with zingolib dev's `zip32 = "0.2.0"`.
+zip32 = { version = "0.2", optional = true }
 tempfile = { version = "3.2", optional = true }
 
 # librustzcash wallet backend (`backends::librustzcash`); gated on the
@@ -121,14 +120,17 @@ tempfile = { version = "3.2", optional = true }
 # zebra / zcash_local_net / libstdc++. `sync` pulls the lightwalletd-tonic gRPC
 # client; `bundled-prover` compiles the Sapling params into the binary so
 # send/shield need no external files.
-zcash_client_backend = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", features = ["sync", "orchard", "transparent-inputs"], optional = true }
+# Pinned exactly to `rc.1`: later rc's (up to rc.6) bump `zcash_keys` to 0.16,
+# which would split against zingolib dev's `zcash_keys = 0.15`. dev's own lock
+# pins `rc.1`, so ztest matches to keep one `zcash_keys`/`zcash_protocol` copy.
+zcash_client_backend = { version = "=0.24.0-rc.1", features = ["sync", "orchard", "transparent-inputs"], optional = true }
 # orchard + transparent-inputs MUST match the backend's features, else sqlite's
 # cfg-gated Orchard/EphemeralTransparent handling is compiled out and its
 # `Recipient`/`Note` matches go non-exhaustive against the backend enums.
-zcash_client_sqlite = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", features = ["orchard", "transparent-inputs"], optional = true }
-zcash_keys = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", features = ["sapling", "orchard"], optional = true }
-zcash_proofs = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", features = ["bundled-prover"], optional = true }
-zcash_primitives = { git = "https://github.com/zingolabs/librustzcash", rev = "d7270910dd46d9e16e9c3a6f4a1704d7511db36e", optional = true }
+zcash_client_sqlite = { version = "=0.22.0-rc.1", features = ["orchard", "transparent-inputs"], optional = true }
+zcash_keys = { version = "0.15.0", features = ["sapling", "orchard"], optional = true }
+zcash_proofs = { version = "0.29.0", features = ["bundled-prover"], optional = true }
+zcash_primitives = { version = "0.29.0", optional = true }
 secrecy = { version = "0.8", optional = true }
 # Named to spell the `WalletDb<rusqlite::Connection, ..>` connection type;
 # version tracks zcash_client_sqlite 0.21.1's resolved rusqlite.
@@ -212,8 +214,9 @@ librustzcash = [
 zingo = [
     "dep:zingolib",
     "dep:pepper-sync",
+    "dep:zingo_common_components",
+    "dep:zingo-netutils",
     "dep:zingo_test_vectors",
-    "dep:zebra-chain",
     "dep:zip32",
     "dep:tempfile",
     "dep:bip0039",
@@ -226,8 +229,22 @@ zingo = [
 # committed == Σ live leases) far past what hand-picked cases reach. Kept fast
 # and hermetic — no cluster, in line with the FakeStore/logical-clock suite.
 proptest = "1"
+# `test-util` gives the paused/auto-advancing clock the sync-runner probe tests
+# use to exercise cadences/windows deterministically without real waiting.
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 
 [build-dependencies]
 # Codegen for the vendored lightwalletd proto in `proto/` → `src/proto`.
 # Needs `protoc` at build time (provided by the dev shell, see flake.nix).
 tonic-prost-build = "0.14"
+
+# zingolib/pepper-sync (the `zingo` backend) reference `lightwallet-protocol`
+# from crates.io, but rely on a `[patch.crates-io]` in their own workspace to
+# pull a git rev carrying the Ironwood (NU6.3) proto fields
+# (`CompactTx.ironwoodActions`, `TreeState.ironwoodTree`, etc.). A `[patch]` only
+# takes effect from the root workspace, so ztest — the root — must replicate it,
+# or pepper-sync fails to compile against the field-less published crate. The
+# `rebuild-proto` feature (enabled transitively by the workspace) regenerates the
+# bindings from the Ironwood `.proto` files at build time (needs `protoc`).
+[patch.crates-io]
+lightwallet-protocol = { git = "https://github.com/zingolabs/lightwallet-protocol-rust", rev = "9bdfdc77eb283f2a3d26c27100cc2ac90148cd93" }

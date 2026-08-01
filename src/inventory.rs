@@ -255,6 +255,67 @@ pub fn dep_iter() -> impl Iterator<Item = &'static TestDepDecl> {
     inventory::iter::<TestDepDecl>()
 }
 
+// ─────────────────────────── sync-test inventory ──────────────────────
+//
+// The `#[ztest::sync_test]` attribute submits a `SyncTestDecl` carrying the
+// static metadata known before the body runs (name/subject/timeout/qos/tags).
+// `ztest sync list`/`describe` read `SyncTestEntry` off the dump stream, and QoS
+// admission sizes the pod from `qos` without executing the registration body.
+
+/// One `#[ztest::sync_test]` declaration, ready for `inventory::submit!`. All
+/// fields are the annotation's static metadata; the invariant/nemesis manifest
+/// comes from running the body in Collect mode, not from here.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SyncTestDecl {
+    /// `concat!(module_path!(), "::", test_fn)` — crate-rooted, matching `QosDecl`.
+    pub test_id: &'static str,
+    /// The profile name (`ztest sync start <name>`).
+    pub name: &'static str,
+    /// One-line description.
+    pub description: &'static str,
+    /// Subject kind: `"wallet"` | `"indexer"` | `"validator"`.
+    pub subject: &'static str,
+    /// Timeout string (e.g. `"48h"`), matching the QoS tier cap.
+    pub timeout: &'static str,
+    /// QoS tier name (e.g. `"sync"`).
+    pub qos: &'static str,
+    /// Free-form tags for filtering in `list`.
+    pub tags: &'static [&'static str],
+}
+
+inventory::collect!(SyncTestDecl);
+
+/// Owned counterpart of [`SyncTestDecl`] for the read side of the dump.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncTestEntry {
+    pub test_id: String,
+    pub name: String,
+    pub description: String,
+    pub subject: String,
+    pub timeout: String,
+    pub qos: String,
+    pub tags: Vec<String>,
+}
+
+impl From<&SyncTestDecl> for SyncTestEntry {
+    fn from(d: &SyncTestDecl) -> Self {
+        SyncTestEntry {
+            test_id: d.test_id.to_string(),
+            name: d.name.to_string(),
+            description: d.description.to_string(),
+            subject: d.subject.to_string(),
+            timeout: d.timeout.to_string(),
+            qos: d.qos.to_string(),
+            tags: d.tags.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+}
+
+/// Iterate every sync-test declaration linked into the current binary.
+pub fn sync_test_iter() -> impl Iterator<Item = &'static SyncTestDecl> {
+    inventory::iter::<SyncTestDecl>()
+}
+
 /// Borrowed write side of a dump line (serialized by the dump hook), tagged with
 /// `"kind"` so the declaration kinds share one stream; [`InventoryLine`] is the
 /// owned read side. Dev images have no borrowed variant: one static
@@ -266,6 +327,7 @@ pub enum InventoryLineRef<'a> {
     Qos(&'a QosDecl),
     Seed(&'a SeedDecl),
     Dep(&'a TestDepDecl),
+    SyncTest(&'a SyncTestDecl),
 }
 
 /// Owned read side of a dump line; see [`InventoryLineRef`].
@@ -276,6 +338,7 @@ pub enum InventoryLine {
     Qos(QosEntry),
     Seed(SeedEntry),
     Dep(TestDepEntry),
+    SyncTest(SyncTestEntry),
 }
 
 /// Pre-main dump hook. When the test binary is spawned with
@@ -335,6 +398,17 @@ fn dump_hook() {
     }
     for decl in dep_iter() {
         match serde_json::to_string(&InventoryLineRef::Dep(decl)) {
+            Ok(line) => emit(writeln!(stdout, "{line}")),
+            Err(err) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ztest dump_inventory: serialize failed: {err}"
+                );
+            }
+        }
+    }
+    for decl in sync_test_iter() {
+        match serde_json::to_string(&InventoryLineRef::SyncTest(decl)) {
             Ok(line) => emit(writeln!(stdout, "{line}")),
             Err(err) => {
                 let _ = writeln!(

@@ -16,7 +16,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use crate::EnvError;
 use crate::cluster::{self, Sentinel};
-use crate::component::{ComponentCategory, ComponentOpts, Indexer, Validator, Wallet};
+use crate::component::{ComponentOpts, Indexer, Validator, Wallet};
 use crate::error::env_err;
 use crate::topology::ActivationHeights;
 
@@ -48,32 +48,39 @@ use crate::portforward::Forwarder;
 use crate::qos;
 use crate::seeds::{self, ShadowClone};
 
+/// The live backend handle behind a materialized pod. Every pod that reaches
+/// [`TestEnv::materialize_phase`] carries exactly one — validators and indexers
+/// are the only categories that materialize (wallets run in-process), and the
+/// variant is the pod's category. This is what the
+/// env-level readiness (and, for validators, warm) probes drive during
+/// [`TestEnv::build`].
+#[derive(Debug, Clone)]
+pub(crate) enum ComponentHandle {
+    Validator(Arc<dyn ValidatorBackend>),
+    Indexer(Arc<dyn IndexerBackend>),
+}
+
 /// Per-component bookkeeping captured at `build` time.
 #[derive(Debug, Clone)]
 pub(crate) struct ComponentState {
     pub(crate) namespace: String,
     pub(crate) pod_name: String,
-    pub(crate) category: ComponentCategory,
     pub(crate) label: &'static str,
     pub(crate) named_ports: Vec<(String, u16)>,
-    /// Live handle for a validator, driving the env's readiness/warm probes
-    /// during `build`. `None` for non-validators.
-    pub(crate) validator_handle: Option<Arc<dyn ValidatorBackend>>,
+    /// Live backend handle for this pod, driving the env's readiness (and, for
+    /// validators, warm) probes during `build`. Its variant (validator vs
+    /// indexer) is the pod's category — the single source of truth for it.
+    pub(crate) handle: ComponentHandle,
 }
 
 impl ComponentState {
-    fn new(
-        spec: &PodSpec,
-        namespace: String,
-        validator_handle: Option<Arc<dyn ValidatorBackend>>,
-    ) -> Self {
+    fn new(spec: &PodSpec, namespace: String, handle: ComponentHandle) -> Self {
         ComponentState {
             namespace,
             pod_name: spec.pod_name.clone(),
-            category: spec.category,
             label: spec.label,
             named_ports: spec.ports.clone(),
-            validator_handle,
+            handle,
         }
     }
 }
@@ -669,7 +676,7 @@ impl TestEnv {
                     spec.guaranteed = qos_guaranteed.clone();
                 }
                 assert_override_within_tier(&spec, tier_footprint);
-                Ok::<_, EnvError>((p.id, spec, p.opts, Some(p.handle)))
+                Ok::<_, EnvError>((p.id, spec, p.opts, ComponentHandle::Validator(p.handle)))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let t_phase = std::time::Instant::now();
@@ -704,7 +711,7 @@ impl TestEnv {
                     spec.guaranteed = qos_guaranteed.clone();
                 }
                 assert_override_within_tier(&spec, tier_footprint);
-                Ok::<_, EnvError>((p.id, spec, p.opts, None))
+                Ok::<_, EnvError>((p.id, spec, p.opts, ComponentHandle::Indexer(p.handle)))
             })
             .collect::<Result<Vec<_>, _>>()?;
         // Wallets run in-process in the test binary (libraries that connect to
@@ -734,6 +741,22 @@ impl TestEnv {
                 ));
         }
 
+        // The indexer-phase analogue of `wait_validators_rpc_ready` above: a
+        // pod reaching the Kubernetes Ready condition does not mean its gRPC
+        // listener is bound — zainod only begins serving once its initial
+        // chain-index build completes, which can lag pod-Ready by well over a
+        // minute under load. Gate on a live `GetLightdInfo` so `build`
+        // returning means every indexer is reachable, not merely scheduled.
+        // `is_built` is flipped on for the probe window (endpoint resolution
+        // gates on it) and back off, exactly as the validator phase does, so a
+        // gate failure leaves test-side handle calls reporting `NotBuilt`.
+        self.inner.is_built.store(true, Ordering::Release);
+        let t_phase = std::time::Instant::now();
+        let ready = self.wait_indexers_rpc_ready().await;
+        self.inner.is_built.store(false, Ordering::Release);
+        build_phase("indexers_ready", t_phase);
+        ready?;
+
         self.inner.is_built.store(true, Ordering::Release);
 
         tracing::debug!(
@@ -753,11 +776,9 @@ impl TestEnv {
             let comps = self.inner.components.read().await;
             comps
                 .values()
-                .filter(|s| matches!(s.category, ComponentCategory::Validator))
-                .filter_map(|s| {
-                    s.validator_handle
-                        .as_ref()
-                        .map(|h| (s.pod_name.clone(), Arc::clone(h)))
+                .filter_map(|s| match &s.handle {
+                    ComponentHandle::Validator(h) => Some((s.pod_name.clone(), Arc::clone(h))),
+                    ComponentHandle::Indexer(_) => None,
                 })
                 .collect()
         };
@@ -782,6 +803,42 @@ impl TestEnv {
         Ok(())
     }
 
+    /// The indexer-phase counterpart of [`Self::wait_validators_rpc_ready`]:
+    /// block until every indexer answers its gRPC `GetLightdInfo`, or
+    /// `ready_timeout` elapses. See the call site in `build` for why pod-Ready
+    /// is not a sufficient signal for indexers.
+    async fn wait_indexers_rpc_ready(&self) -> Result<(), EnvError> {
+        let indexers: Vec<(String, Arc<dyn IndexerBackend>)> = {
+            let comps = self.inner.components.read().await;
+            comps
+                .values()
+                .filter_map(|s| match &s.handle {
+                    ComponentHandle::Indexer(h) => Some((s.pod_name.clone(), Arc::clone(h))),
+                    ComponentHandle::Validator(_) => None,
+                })
+                .collect()
+        };
+        if indexers.is_empty() {
+            return Ok(());
+        }
+
+        let timeout = self.ready_timeout;
+        let probes = indexers.into_iter().map(|(pod_name, handle)| async move {
+            handle
+                .ready(timeout)
+                .await
+                .map_err(|_| EnvError::RpcTimeout {
+                    component: pod_name,
+                    op: "wait_for_ready",
+                    elapsed: timeout,
+                })
+        });
+        for res in join_all(probes).await {
+            res?;
+        }
+        Ok(())
+    }
+
     async fn warm_validators(&self) -> Result<(), EnvError> {
         // Mine one block per validator so dependents (indexers) sync
         // against a non-genesis tip. Drives each validator's handle.
@@ -789,8 +846,10 @@ impl TestEnv {
             let comps = self.inner.components.read().await;
             comps
                 .values()
-                .filter(|s| matches!(s.category, ComponentCategory::Validator))
-                .filter_map(|s| s.validator_handle.as_ref().map(Arc::clone))
+                .filter_map(|s| match &s.handle {
+                    ComponentHandle::Validator(h) => Some(Arc::clone(h)),
+                    ComponentHandle::Indexer(_) => None,
+                })
                 .collect()
         };
         for handle in handles {
@@ -807,7 +866,7 @@ impl TestEnv {
         ctx: &MaterializeCtx<'_>,
         items: &[MaterializeItem],
     ) -> Result<(), EnvError> {
-        for (id, spec, opts, validator_handle) in items {
+        for (id, spec, opts, handle) in items {
             // The per-component companion to the run-level "starting test run"
             // line above: one INFO per pod as it is provisioned, naming its
             // category, identity, image, and the reservation it will run under.
@@ -826,11 +885,8 @@ impl TestEnv {
                 reservation = %reservation,
                 "provisioning component"
             );
-            let state = ComponentState::new(
-                spec,
-                ctx.sentinel.namespace.clone(),
-                validator_handle.clone(),
-            );
+            let state =
+                ComponentState::new(spec, ctx.sentinel.namespace.clone(), handle.clone());
             cluster::create_pod_service(
                 ctx.client,
                 &ctx.sentinel.namespace,
@@ -1291,14 +1347,10 @@ struct MaterializeCtx<'a> {
     test_name: &'a str,
 }
 
-/// One pod to materialize: `(id, spec, opts, optional validator backend)`.
-/// Shared by both materialization phases (validators, then dependents).
-type MaterializeItem = (
-    u64,
-    PodSpec,
-    ComponentOpts,
-    Option<Arc<dyn ValidatorBackend>>,
-);
+/// One pod to materialize: `(id, spec, opts, backend handle)`. Shared by both
+/// materialization phases (validators, then dependents); the handle's variant
+/// distinguishes them.
+type MaterializeItem = (u64, PodSpec, ComponentOpts, ComponentHandle);
 
 #[cfg(test)]
 mod tests {

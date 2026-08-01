@@ -29,6 +29,7 @@ pub mod run;
 pub(crate) mod setup;
 pub(crate) mod snapshot;
 pub mod store;
+pub(crate) mod sync;
 
 /// Top-level CLI surface.
 ///
@@ -98,6 +99,11 @@ pub enum Command {
     /// flag, so `ztest run --cluster <name>` selects a whole target at once.
     Cluster(cluster::Args),
 
+    /// Manage detached, ztest-owned chain syncs (`list`, `describe`, `start`,
+    /// `watch`, `status`, `report`, `stop`, `rm`) — the long-running sync-test
+    /// profiles that outlive the launching terminal.
+    Sync(sync::Args),
+
     /// Drive the live bottom panel with a scripted, cluster-free transfer
     /// timeline. A formatting harness for the right-column tracker.
     #[command(hide = true)]
@@ -156,6 +162,7 @@ pub fn main() -> ExitCode {
         Command::Cleanup(args) => cleanup::execute(args),
         Command::Snapshot(args) => snapshot::execute(args),
         Command::Cluster(args) => cluster::execute(args),
+        Command::Sync(args) => sync::execute(args),
         Command::Preview => preview::execute(),
     }
 }

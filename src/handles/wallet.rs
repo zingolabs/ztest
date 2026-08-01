@@ -130,7 +130,18 @@ pub trait WalletBackend: Send + Sync + std::fmt::Debug + Clone + 'static {
     /// Sync `account` against its indexer.
     async fn sync(&self, account: AccountId) -> Result<(), BoxError>;
 
-    /// Send `zats` from `account` to address `to`. Returns the txid(s).
+    /// Send `zats` from `account` to `to`. Returns the txid(s).
+    ///
+    /// `from_pools` restricts which shielded pools the spent notes may come
+    /// from. An empty slice imposes no restriction — spend from any pool, the
+    /// normal fully-shielded behavior. Naming pools forbids the wallet from
+    /// crossing pools during input selection: `[Pool::Orchard]` forces an
+    /// Orchard note to be spent even when the account also holds notes in
+    /// another pool, driving the ZIP-318 Orchard→Ironwood migration a wallet
+    /// would otherwise sidestep by spending same-pool liquidity. `from_pools`
+    /// names *shielded* pools only; a backend rejects `Pool::Transparent` (a
+    /// transparent balance is spent via [`shield`](Self::shield)), and a backend
+    /// that cannot constrain input selection at all rejects any non-empty set.
     ///
     /// `timeout` bounds the network relay of the signed transaction to the
     /// indexer, so a wedged indexer→backing-node link surfaces as a timeout
@@ -141,6 +152,7 @@ pub trait WalletBackend: Send + Sync + std::fmt::Debug + Clone + 'static {
         from: AccountId,
         to: &str,
         zats: u64,
+        from_pools: &[Pool],
         timeout: Duration,
     ) -> Result<Vec<TxId>, BoxError>;
 
@@ -172,6 +184,12 @@ impl<W: WalletBackend> Account<W> {
 
     pub fn id(&self) -> AccountId {
         self.id
+    }
+
+    /// The backend handle this account lives in. Lets the sync harness build a
+    /// subject (driver) from a bound account.
+    pub fn wallet(&self) -> &W {
+        &self.wallet
     }
 
     /// A receiving address in `pool`.
@@ -213,7 +231,34 @@ impl<W: WalletBackend> Account<W> {
         timeout: Duration,
     ) -> Result<Vec<TxId>, RpcError> {
         self.wallet
-            .send(self.id, to, zats, timeout)
+            .send(self.id, to, zats, &[], timeout)
+            .await
+            .map_err(|e| RpcError::backend_boxed(self.label, "send", e))
+    }
+
+    /// Send `zats` to `to`, restricting the spent notes to `from_pools` (empty =
+    /// any pool). See [`WalletBackend::send`] for the pool-restriction contract.
+    pub async fn send_from(
+        &self,
+        from_pools: &[Pool],
+        to: &str,
+        zats: u64,
+    ) -> Result<Vec<TxId>, RpcError> {
+        self.send_from_with_timeout(from_pools, to, zats, DEFAULT_SEND_TIMEOUT)
+            .await
+    }
+
+    /// Send `zats` to `to` restricted to `from_pools`, bounding the relay by
+    /// `timeout`.
+    pub async fn send_from_with_timeout(
+        &self,
+        from_pools: &[Pool],
+        to: &str,
+        zats: u64,
+        timeout: Duration,
+    ) -> Result<Vec<TxId>, RpcError> {
+        self.wallet
+            .send(self.id, to, zats, from_pools, timeout)
             .await
             .map_err(|e| RpcError::backend_boxed(self.label, "send", e))
     }
