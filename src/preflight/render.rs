@@ -11,14 +11,20 @@ use owo_colors::OwoColorize;
 
 use super::theme::Theme;
 use super::{
-    ArchiveRow, ArchiveStatus, BannerState, BuildStage, BuildState, DownloadSource, QosPlan,
-    SnapshotRow, SnapshotStatus, TierPlan, TransferKind, TransferProgress, TransferRow, Transfers,
+    ArchiveRow, ArchiveStatus, BannerState, BuildStage, BuildState, DownloadSource,
+    MetricsAvailability, QosPlan, SnapshotRow, SnapshotStatus, SyncVitals, SyncWatchState,
+    TierPlan, TransferKind, TransferProgress, TransferRow, Transfers,
 };
 use crate::qos::live::LiveSnapshot;
 use crate::qos::{GIB, Resources};
 
 /// Width of the action-label column, matching nextest's `{:>12}`.
 const LABEL_WIDTH: usize = 12;
+
+/// Label column for the right-hand metrics block. Narrower than [`LABEL_WIDTH`]
+/// because the right column is the one starved for width (it gets whatever the
+/// terminal has past the left column's fixed 80).
+const METRIC_LABEL_WIDTH: usize = 7;
 
 /// The pinned panel's fixed line count (must equal `cli::console::PANEL_ROWS`).
 /// Every left/right block formatter returns exactly this many lines so the
@@ -630,7 +636,43 @@ pub fn render_preflight_panel(
     .expect("write to string");
 
     // Line 3 — inventory / build state.
-    let (build_marker, build_style, build_text) = match &state.build {
+    render_build_line(&mut out, &state.build, spin, theme);
+
+    // Line 4 — scheduling summary (blank when no QoS plan yet).
+    if let Some(plan) = &state.qos_plan {
+        let total_tests: u32 = plan.tiers.iter().map(|t| t.count).sum();
+        match plan.free {
+            Some(_) => writeln!(
+                out,
+                "{:>width$} {} tests {dot} {} waves {dot} peak {}",
+                "Scheduling".style(theme.styles.pass),
+                total_tests.style(theme.styles.count),
+                plan.waves.style(theme.styles.count),
+                agg_str(&plan.peak).style(theme.styles.count),
+                width = LABEL_WIDTH,
+            ),
+            None => writeln!(
+                out,
+                "{:>width$} {} tests {dot} capacity unknown",
+                "Scheduling".style(theme.styles.pass),
+                total_tests.style(theme.styles.count),
+                width = LABEL_WIDTH,
+            ),
+        }
+        .expect("write to string");
+    }
+
+    pad_to_panel(&mut out);
+    out
+}
+
+/// The shared `Inventory` line: build-phase marker + status text. Factored out
+/// of [`render_preflight_panel`] so `ztest sync start`'s panel
+/// ([`render_sync_build_panel`]) shows the identical build state. `spin` is the
+/// caller's per-frame spinner glyph (used for the in-progress markers).
+fn render_build_line(out: &mut String, build: &BuildState, spin: &str, theme: &Theme) {
+    let dot = theme.chars.dot.style(theme.styles.dim);
+    let (build_marker, build_style, build_text) = match build {
         BuildState::Pending => (theme.chars.dot, theme.styles.dim, "queued".to_string()),
         BuildState::Compiling { started_at, phase } => (
             spin,
@@ -675,33 +717,382 @@ pub fn render_preflight_panel(
         width = LABEL_WIDTH,
     )
     .expect("write to string");
+}
 
-    // Line 4 — scheduling summary (blank when no QoS plan yet).
-    if let Some(plan) = &state.qos_plan {
-        let total_tests: u32 = plan.tiers.iter().map(|t| t.count).sum();
-        match plan.free {
-            Some(_) => writeln!(
-                out,
-                "{:>width$} {} tests {dot} {} waves {dot} peak {}",
-                "Scheduling".style(theme.styles.pass),
-                total_tests.style(theme.styles.count),
-                plan.waves.style(theme.styles.count),
-                agg_str(&plan.peak).style(theme.styles.count),
-                width = LABEL_WIDTH,
-            ),
-            None => writeln!(
-                out,
-                "{:>width$} {} tests {dot} capacity unknown",
-                "Scheduling".style(theme.styles.pass),
-                total_tests.style(theme.styles.count),
-                width = LABEL_WIDTH,
-            ),
-        }
-        .expect("write to string");
+/// The **left column** during `ztest sync start`'s on-cluster build+provision.
+/// Mirrors [`render_preflight_panel`]'s frame — the branded rule and the shared
+/// `Inventory` build line — but shows the detached sync's own context (profile,
+/// id, target cluster) in place of the run's probe/scheduling rows, which a
+/// detached sync has no equivalent of. Held to [`PANEL_LINES`] like every panel.
+pub fn render_sync_build_panel(
+    profile: &str,
+    sync_id: &str,
+    context: &str,
+    build: &BuildState,
+    phase: &str,
+    elapsed: std::time::Duration,
+    theme: &Theme,
+) -> String {
+    let mut out = String::with_capacity(320);
+    let dot = theme.chars.dot.style(theme.styles.dim);
+    let spin = spinner_glyph(elapsed);
+
+    render_label_rule(&mut out, theme);
+
+    // Line 1 — phase + profile + sync id.
+    writeln!(
+        out,
+        "{:>width$} {} {} {dot} {}",
+        phase.style(theme.styles.pass),
+        spin.style(theme.styles.count),
+        profile.style(theme.styles.count),
+        sync_id.style(theme.styles.dim),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+
+    // Line 2 — target cluster context.
+    writeln!(
+        out,
+        "{:>width$} {}",
+        "cluster".style(theme.styles.dim),
+        context,
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+
+    // Line 3 — inventory / build state (shared with the run banner).
+    render_build_line(&mut out, build, spin, theme);
+
+    pad_to_panel(&mut out);
+    out
+}
+
+/// The left column while `ztest sync watch` tails a detached sync: the sync's
+/// live vitals, or — before the driver's first tick — the pod phase that explains
+/// the silence. Reuses the shared panel frame so a watched sync looks like the
+/// build that launched it; only the rows differ.
+pub fn render_sync_watch_panel(
+    state: &SyncWatchState,
+    elapsed: std::time::Duration,
+    theme: &Theme,
+) -> String {
+    let mut out = String::with_capacity(384);
+    let dot = theme.chars.dot.style(theme.styles.dim);
+    let spin = spinner_glyph(elapsed);
+
+    render_label_rule(&mut out, theme);
+
+    writeln!(
+        out,
+        "{:>width$} {} {} {dot} {}",
+        "Watching".style(theme.styles.pass),
+        spin.style(theme.styles.count),
+        state.profile.style(theme.styles.count),
+        state.sync_id.style(theme.styles.dim),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+
+    match &state.vitals {
+        Some(v) => render_sync_vitals(&mut out, state, v, elapsed, theme),
+        None => render_sync_waiting(&mut out, state, elapsed, theme),
     }
 
     pad_to_panel(&mut out);
     out
+}
+
+/// The three vitals rows: chain position, pace, and the probe board summary.
+fn render_sync_vitals(
+    out: &mut String,
+    state: &SyncWatchState,
+    v: &SyncVitals,
+    elapsed: std::time::Duration,
+    theme: &Theme,
+) {
+    let dot = theme.chars.dot.style(theme.styles.dim);
+
+    let target = match v.target {
+        Some(t) => format!("{} / {}", thousands(v.height as u64), thousands(t as u64)),
+        None => thousands(v.height as u64),
+    };
+    writeln!(
+        out,
+        "{:>width$} {} {dot} {} {}",
+        "height".style(theme.styles.dim),
+        target.style(theme.styles.count),
+        format_args!("{:.1}%", v.pct).style(theme.styles.count),
+        render_progress_bar(v.pct.clamp(0.0, 100.0) as u8, theme),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+
+    // Tick age, not wall-clock elapsed: a driver that has stopped publishing is
+    // the failure this row exists to make visible.
+    let age = elapsed.saturating_sub(v.received_at);
+    let rate = match v.blocks_per_sec {
+        Some(r) => format!("{r:.1} blk/s"),
+        None => "—".to_string(),
+    };
+    let mut pace = format!("{rate} {dot} {}", v.phase.style(theme.styles.count));
+    if let Some(eta) = v.eta {
+        pace.push_str(&format!(" {dot} eta {}", format_elapsed(eta)));
+    }
+    if v.reorg_depth > 0 {
+        pace.push_str(&format!(
+            " {dot} {}",
+            format_args!("reorg -{}", v.reorg_depth).style(theme.styles.skip),
+        ));
+    }
+    writeln!(
+        out,
+        "{:>width$} {pace} {dot} {}",
+        "pace".style(theme.styles.dim),
+        format_args!("tick {}", format_elapsed(age)).style(theme.styles.dim),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+
+    render_probe_summary(out, state, theme);
+}
+
+/// The probe board on one line: the satisfied tally, then whichever probe is
+/// nearest to failing, with its window countdown when it has one.
+fn render_probe_summary(out: &mut String, state: &SyncWatchState, theme: &Theme) {
+    let dot = theme.chars.dot.style(theme.styles.dim);
+    let (ok, total) = state.probe_tally();
+    let tally_style = if ok == total {
+        theme.styles.pass
+    } else {
+        theme.styles.count
+    };
+
+    let detail = match state.worst_probe() {
+        Some(row) => {
+            let marker = match row.state {
+                crate::sync::ProbeState::Violating => theme.chars.fail,
+                _ => theme.chars.warn,
+            };
+            let style = match row.state {
+                crate::sync::ProbeState::Violating => theme.styles.fail,
+                _ => theme.styles.skip,
+            };
+            let countdown = match (row.since_satisfied, row.window) {
+                (Some(since), Some(window)) => {
+                    format!(" {}/{}", format_elapsed(since), format_elapsed(window))
+                }
+                _ => String::new(),
+            };
+            format!(
+                "{dot} {} {}{}",
+                marker.style(style),
+                row.name.style(style),
+                countdown.style(theme.styles.dim),
+            )
+        }
+        None => String::new(),
+    };
+    let violations = if state.violations > 0 {
+        format!(
+            "{dot} {}",
+            format_args!("{} violation(s)", state.violations).style(theme.styles.fail),
+        )
+    } else {
+        String::new()
+    };
+
+    writeln!(
+        out,
+        "{:>width$} {} {detail}{violations}",
+        "probes".style(theme.styles.dim),
+        format_args!("{ok}/{total} ok").style(tally_style),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+}
+
+/// The pre-first-tick rows: cluster, driver-pod phase, and the provisioning gate
+/// the driver is currently in.
+///
+/// A sync spends the great majority of its wall-clock here — image pull, chain
+/// provisioning, indexer index-build — so these rows are not a placeholder for the
+/// vitals, they are the run's only progress display for minutes at a time. The
+/// setup row in particular is what separates a slow gate from a hung one: its age
+/// is time in *that* gate, not time since launch.
+fn render_sync_waiting(
+    out: &mut String,
+    state: &SyncWatchState,
+    elapsed: std::time::Duration,
+    theme: &Theme,
+) {
+    let dot = theme.chars.dot.style(theme.styles.dim);
+    writeln!(
+        out,
+        "{:>width$} {}",
+        "cluster".style(theme.styles.dim),
+        state.context,
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+    writeln!(
+        out,
+        "{:>width$} {} {dot} {}",
+        "driver".style(theme.styles.dim),
+        state.pod_phase.style(theme.styles.count),
+        format_elapsed(elapsed).style(theme.styles.dim),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+
+    let step = match &state.setup {
+        Some(s) => format!(
+            "{} {dot} {} {dot} {}",
+            s.subject.style(theme.styles.count),
+            s.detail,
+            format_elapsed(elapsed.saturating_sub(s.received_at)).style(theme.styles.dim),
+        ),
+        // Before the driver's first report there is genuinely nothing to say about
+        // provisioning; say that, rather than leaving a row that looks like a
+        // finished step.
+        None => format!(
+            "{}",
+            "waiting for the driver's first report".style(theme.styles.dim)
+        ),
+    };
+    writeln!(
+        out,
+        "{:>width$} {step}",
+        "setup".style(theme.styles.dim),
+        width = LABEL_WIDTH,
+    )
+    .expect("write to string");
+}
+
+/// The **right column** of the `ztest sync watch` panel: the newest metrics
+/// reading, one label per row. Held to [`PANEL_LINES`] with the top row blank,
+/// matching [`render_transfers`].
+///
+/// Fed by the direct exporter scrape (`metrics::live`), not by thanos — a column
+/// that repaints once per scrape interval is not a live display. Four blank rows
+/// read as "everything is zero", so when there are no values the *reason* is named.
+pub fn render_sync_metrics(state: &SyncWatchState, theme: &Theme) -> String {
+    let mut out = String::with_capacity(320);
+    out.push('\n');
+    let dot = theme.chars.dot.style(theme.styles.dim);
+
+    if state.metrics_state != MetricsAvailability::Sampled || state.metrics.is_empty() {
+        // Naming the cause is the point: "no samples" sent a reader hunting a
+        // broken exporter when nothing was broken at all.
+        let reason = match &state.metrics_state {
+            // Nothing exposes a metrics port yet: the components are still being
+            // provisioned. Not a fault, and not a statement about the engine.
+            MetricsAvailability::Idle => "no metrics-exposing pod yet".to_string(),
+            MetricsAvailability::AwaitingScrape => format!(
+                "scraping every {} · no series published yet",
+                format_elapsed(crate::metrics::live::LIVE_SCRAPE_PERIOD)
+            ),
+            MetricsAvailability::Unavailable(why) => format!("unavailable · {why}"),
+            MetricsAvailability::Sampled => "no values returned".to_string(),
+        };
+        writeln!(
+            out,
+            "{:>width$} {}",
+            "metrics".style(theme.styles.dim),
+            reason.style(theme.styles.dim),
+            width = METRIC_LABEL_WIDTH,
+        )
+        .expect("write to string");
+        pad_to_panel(&mut out);
+        return out;
+    }
+
+    let row = |out: &mut String, label: &str, body: String| {
+        writeln!(
+            out,
+            "{:>width$} {body}",
+            label.style(theme.styles.dim),
+            width = METRIC_LABEL_WIDTH,
+        )
+        .expect("write to string");
+    };
+    let num = |name: &str| {
+        state
+            .metric(name)
+            .map(compact_count)
+            .unwrap_or_else(|| "—".to_string())
+    };
+
+    row(
+        &mut out,
+        "lag",
+        format!(
+            "{} blk {dot} reorgs {}",
+            num("sync lag (blocks)").style(theme.styles.count),
+            num("reorgs").style(theme.styles.count),
+        ),
+    );
+    // Grouped in full, not abbreviated: the tip is read against the `height` row
+    // opposite it, and `1.5M` can't be compared with `1,284,901`.
+    let tip = state
+        .metric("chain tip height")
+        .map(|h| thousands(h.max(0.0) as u64))
+        .unwrap_or_else(|| "—".to_string());
+    row(&mut out, "tip", tip.style(theme.styles.count).to_string());
+    row(
+        &mut out,
+        "indexed",
+        format!(
+            "{} tx",
+            num("transactions indexed").style(theme.styles.count)
+        ),
+    );
+    let latency = state
+        .metric("gRPC mean latency (ms)")
+        .map(|ms| format!("{ms:.1} ms"))
+        .unwrap_or_else(|| "—".to_string());
+    row(
+        &mut out,
+        "gRPC",
+        format!(
+            "{} req {dot} {}",
+            num("gRPC requests").style(theme.styles.count),
+            latency.style(theme.styles.count),
+        ),
+    );
+
+    pad_to_panel(&mut out);
+    out
+}
+
+/// Group a count with thin separators: heights and totals in the millions are
+/// unreadable as a bare digit run at a glance.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Abbreviate a metric value to fit the narrow right column: `918`, `18.2k`,
+/// `1.4M`. Sub-unit values keep one decimal so a fractional gauge isn't shown
+/// as `0`.
+fn compact_count(v: f64) -> String {
+    let a = v.abs();
+    if a >= 1_000_000.0 {
+        format!("{:.1}M", v / 1_000_000.0)
+    } else if a >= 1_000.0 {
+        format!("{:.1}k", v / 1_000.0)
+    } else if a >= 1.0 || a == 0.0 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.1}")
+    }
 }
 
 /// The **right column** of the pinned bottom console: the live set of background
@@ -1459,5 +1850,280 @@ mod tests {
         assert_eq!(bar100, "[████████████]");
         let bar250 = render_progress_bar(250, &theme);
         assert_eq!(bar250, "[████████████]", "should clamp at 100%");
+    }
+
+    // ─────────────────────── sync watch panel ─────────────────────────
+
+    fn watching(vitals: Option<SyncVitals>) -> SyncWatchState {
+        SyncWatchState {
+            profile: "zaino_state_sync".into(),
+            sync_id: "zaino-state-sync-a52f9ec9".into(),
+            context: "crc-remote".into(),
+            pod_phase: "Running".into(),
+            setup: None,
+            vitals,
+            probes: Vec::new(),
+            metrics: Vec::new(),
+            metrics_state: MetricsAvailability::Sampled,
+            violations: 0,
+        }
+    }
+
+    fn sample_vitals() -> SyncVitals {
+        SyncVitals {
+            height: 901,
+            target: Some(1024),
+            pct: 88.1,
+            phase: "Historic".into(),
+            reorg_depth: 0,
+            blocks_per_sec: Some(12.4),
+            eta: Some(std::time::Duration::from_secs(10)),
+            received_at: std::time::Duration::from_secs(210),
+        }
+    }
+
+    fn probe(name: &str, state: crate::sync::ProbeState) -> ProbeRow {
+        ProbeRow {
+            name: name.into(),
+            state,
+            since_satisfied: None,
+            window: None,
+        }
+    }
+
+    #[test]
+    fn sync_watch_panel_shows_vitals_at_constant_height() {
+        let mut state = watching(Some(sample_vitals()));
+        state.probes = vec![
+            probe("height_monotonic", crate::sync::ProbeState::Ok),
+            probe("reached_tip", crate::sync::ProbeState::NotYet),
+        ];
+        let s = render_sync_watch_panel(
+            &state,
+            std::time::Duration::from_secs(212),
+            &plain_unicode_theme(),
+        );
+        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
+        assert!(s.contains("zaino_state_sync"), "profile:\n{s}");
+        assert!(s.contains("901 / 1,024"), "height vs target:\n{s}");
+        assert!(s.contains("88.1%"), "percentage:\n{s}");
+        assert!(s.contains("12.4 blk/s"), "scan rate:\n{s}");
+        assert!(s.contains("Historic"), "phase:\n{s}");
+        assert!(s.contains("eta 10s"), "eta:\n{s}");
+        // 212s frame - 210s tick = 2s of tick age.
+        assert!(s.contains("tick 2s"), "tick age:\n{s}");
+        assert!(s.contains("1/2 ok"), "probe tally:\n{s}");
+        assert!(s.contains("reached_tip"), "worst probe named:\n{s}");
+    }
+
+    #[test]
+    fn sync_watch_panel_falls_back_to_pod_phase_before_the_first_tick() {
+        let s = render_sync_watch_panel(
+            &watching(None),
+            std::time::Duration::from_secs(45),
+            &plain_unicode_theme(),
+        );
+        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
+        assert!(s.contains("Running"), "pod phase:\n{s}");
+        assert!(s.contains("crc-remote"), "cluster context:\n{s}");
+        assert!(
+            s.contains("waiting for the driver's first report"),
+            "explains silence:\n{s}"
+        );
+    }
+
+    /// The whole point of the setup row: a reader must be able to see which gate
+    /// the minutes are going into, and how long *that gate* has been open —
+    /// otherwise a slow provisioning step is indistinguishable from a hang.
+    #[test]
+    fn the_setup_row_names_the_current_gate_and_its_own_age() {
+        let mut state = watching(None);
+        state.setup = Some(SetupStep {
+            subject: "zainod".into(),
+            detail: "waiting for gRPC GetLightdInfo".into(),
+            received_at: std::time::Duration::from_secs(60),
+        });
+        let s = render_sync_watch_panel(
+            &state,
+            std::time::Duration::from_secs(9 * 60),
+            &plain_unicode_theme(),
+        );
+        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
+        assert!(s.contains("zainod"), "names the component:\n{s}");
+        assert!(s.contains("GetLightdInfo"), "names the gate:\n{s}");
+        assert!(
+            s.contains("8m"),
+            "ages the gate, not the session (9m elapsed, gate opened at 1m):\n{s}"
+        );
+    }
+
+    /// Once ticks arrive the vitals own those rows; a stale provisioning step must
+    /// not linger beside live chain progress.
+    #[test]
+    fn the_setup_row_gives_way_to_the_vitals() {
+        let mut state = watching(Some(sample_vitals()));
+        state.setup = Some(SetupStep {
+            subject: "zainod".into(),
+            detail: "waiting for gRPC GetLightdInfo".into(),
+            received_at: std::time::Duration::from_secs(60),
+        });
+        let s = render_sync_watch_panel(
+            &state,
+            std::time::Duration::from_secs(9 * 60),
+            &plain_unicode_theme(),
+        );
+        assert!(!s.contains("GetLightdInfo"), "setup row persisted:\n{s}");
+        assert!(s.contains("height"), "vitals absent:\n{s}");
+    }
+
+    #[test]
+    fn a_reorg_and_violations_surface_on_the_panel() {
+        let mut vitals = sample_vitals();
+        vitals.reorg_depth = 7;
+        let mut state = watching(Some(vitals));
+        state.violations = 2;
+        state.probes = vec![probe(
+            "chain_continuity",
+            crate::sync::ProbeState::Violating,
+        )];
+        let s = render_sync_watch_panel(
+            &state,
+            std::time::Duration::from_secs(212),
+            &plain_unicode_theme(),
+        );
+        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
+        assert!(s.contains("reorg -7"), "reorg depth:\n{s}");
+        assert!(s.contains("2 violation(s)"), "violation count:\n{s}");
+        assert!(s.contains("chain_continuity"), "violating probe:\n{s}");
+    }
+
+    #[test]
+    fn a_draining_liveness_window_is_shown_as_a_countdown() {
+        let mut state = watching(Some(sample_vitals()));
+        state.probes = vec![ProbeRow {
+            name: "no_stall".into(),
+            state: crate::sync::ProbeState::Pending,
+            since_satisfied: Some(std::time::Duration::from_secs(25)),
+            window: Some(std::time::Duration::from_secs(30)),
+        }];
+        let s = render_sync_watch_panel(
+            &state,
+            std::time::Duration::from_secs(212),
+            &plain_unicode_theme(),
+        );
+        assert!(s.contains("no_stall 25s/30s"), "window countdown:\n{s}");
+    }
+
+    /// Each empty-column cause must name itself. A single "no samples yet" for all
+    /// of them sends the reader hunting a broken exporter when the truth may be
+    /// that the engine simply has not started.
+    #[test]
+    fn the_metrics_column_distinguishes_why_it_is_empty() {
+        let theme = plain_unicode_theme();
+        let render = |state: &SyncWatchState| {
+            let s = render_sync_metrics(state, &theme);
+            assert_eq!(s.lines().count(), PANEL_LINES, "fixed height:\n{s}");
+            s
+        };
+
+        // Nothing exposes a metrics port yet: still provisioning, nothing wrong.
+        let mut state = watching(None);
+        state.metrics_state = MetricsAvailability::Idle;
+        let s = render(&state);
+        assert!(
+            s.contains("no metrics-exposing pod"),
+            "pre-target cause:\n{s}"
+        );
+
+        // Targets answered, but none of the live families exist yet.
+        let mut state = watching(Some(sample_vitals()));
+        state.metrics_state = MetricsAvailability::AwaitingScrape;
+        let s = render(&state);
+        assert!(
+            s.contains("no series published yet"),
+            "unscraped cause:\n{s}"
+        );
+        // Quoting a period the scraper does not use would send a reader waiting the
+        // wrong length of time, so the row is checked against the constant itself.
+        assert!(
+            s.contains(&format_elapsed(crate::metrics::live::LIVE_SCRAPE_PERIOD)),
+            "quotes the real scrape period:\n{s}"
+        );
+
+        // The exporters could not be read at all.
+        let mut state = watching(Some(sample_vitals()));
+        state.metrics_state = MetricsAvailability::Unavailable("connection refused".into());
+        let s = render(&state);
+        assert!(s.contains("unavailable"), "unreachable cause:\n{s}");
+        assert!(s.contains("connection refused"), "carries the reason:\n{s}");
+    }
+
+    #[test]
+    fn sync_metrics_column_shows_values_at_constant_height() {
+        let theme = plain_unicode_theme();
+        let mut state = watching(Some(sample_vitals()));
+        state.metrics = vec![
+            MetricRow {
+                name: "sync lag (blocks)".into(),
+                value: Some(0.0),
+            },
+            MetricRow {
+                name: "reorgs".into(),
+                value: Some(1.0),
+            },
+            MetricRow {
+                name: "chain tip height".into(),
+                value: Some(1024.0),
+            },
+            MetricRow {
+                name: "transactions indexed".into(),
+                value: Some(18_204.0),
+            },
+            MetricRow {
+                name: "gRPC requests".into(),
+                value: Some(12_400.0),
+            },
+            MetricRow {
+                name: "gRPC mean latency (ms)".into(),
+                value: Some(4.13),
+            },
+        ];
+        let s = render_sync_metrics(&state, &theme);
+        assert_eq!(s.lines().count(), PANEL_LINES, "sampled height:\n{s}");
+        assert!(s.contains("18.2k tx"), "compact totals:\n{s}");
+        assert!(s.contains("4.1 ms"), "latency:\n{s}");
+        assert!(s.contains("1,024"), "tip height grouped in full:\n{s}");
+    }
+
+    #[test]
+    fn a_missing_metric_reads_as_absent_not_zero() {
+        let mut state = watching(None);
+        state.metrics = vec![
+            MetricRow {
+                name: "sync lag (blocks)".into(),
+                value: None,
+            },
+            MetricRow {
+                name: "reorgs".into(),
+                value: Some(0.0),
+            },
+        ];
+        let s = render_sync_metrics(&state, &plain_unicode_theme());
+        assert!(s.contains("\u{2014}"), "absent value is an em dash:\n{s}");
+    }
+
+    #[test]
+    fn thousands_groups_and_compact_abbreviates() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(901), "901");
+        assert_eq!(thousands(1_024), "1,024");
+        assert_eq!(thousands(3_120_455), "3,120,455");
+
+        assert_eq!(compact_count(0.0), "0");
+        assert_eq!(compact_count(918.0), "918");
+        assert_eq!(compact_count(18_204.0), "18.2k");
+        assert_eq!(compact_count(1_400_000.0), "1.4M");
+        // A fractional gauge must not collapse to "0".
+        assert_eq!(compact_count(0.4), "0.4");
     }
 }

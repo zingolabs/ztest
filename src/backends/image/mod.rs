@@ -98,6 +98,19 @@ impl ImageSpec {
                     .any(|f| f == "prometheus" || f == "no_tls_with_prometheus")
         )
     }
+
+    /// Whether this image was compiled with the `profile` feature (the
+    /// zero-privilege pprof contract, `docs/how-to-profile.md`), so a
+    /// `ProfilerGuard` is *linkable* and `ZTEST_PROFILE` will activate sampling.
+    /// Like [`metrics_enabled`](Self::metrics_enabled), only a `dev!` build can
+    /// opt this in — a `Published` tag always returns `false`. Gates the
+    /// profiling env + artifact-volume + grace-period injection.
+    pub(crate) fn profile_enabled(&self) -> bool {
+        matches!(
+            self,
+            ImageSpec::Dev { features, .. } if features.iter().any(|f| f == "profile")
+        )
+    }
 }
 
 /// Where a [`ImageSpec::Dev`] image is built from.

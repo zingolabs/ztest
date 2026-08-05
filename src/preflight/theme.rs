@@ -121,6 +121,8 @@ pub struct ThemeChars {
     pub hbar_char: char,
     /// Separator dot (between metadata fields on a line).
     pub dot: &'static str,
+    /// Vertical separator, between a log line's source prefix and its text.
+    pub vbar: &'static str,
     /// Progress-bar fill and empty cells. ASCII fallback uses `#` / `-`
     /// so a `[####------] 40%` reads cleanly in any terminal.
     pub bar_fill: &'static str,
@@ -137,6 +139,7 @@ impl ThemeChars {
             fail: "✗",
             hbar_char: '─',
             dot: "·",
+            vbar: "│",
             bar_fill: "█",
             bar_empty: "░",
         }
@@ -151,6 +154,7 @@ impl ThemeChars {
             fail: "FAIL",
             hbar_char: '-',
             dot: "*",
+            vbar: "|",
             bar_fill: "#",
             bar_empty: "-",
         }

@@ -35,6 +35,24 @@ pub enum Phase {
     Done,
 }
 
+impl Phase {
+    /// The display/wire tag. Explicit rather than `Debug`, because it crosses the
+    /// driver→controller event stream, where a rename would silently change what
+    /// a running sync publishes.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Phase::Starting => "Starting",
+            Phase::Verifying => "Verifying",
+            Phase::ChainTip => "ChainTip",
+            Phase::FoundNote => "FoundNote",
+            Phase::Historic => "Historic",
+            Phase::Finalizing => "Finalizing",
+            Phase::Downloading => "Downloading",
+            Phase::Done => "Done",
+        }
+    }
+}
+
 /// The common progress columns every subject exposes — enough for the
 /// subject-agnostic probes (monotonic height, no-stall, reached-target). Pool
 /// outputs and balance are wallet extras (`None`/`0` for observer subjects).
@@ -59,14 +77,31 @@ pub trait ProgressView: Send + std::fmt::Debug {
     }
 }
 
+/// The subject's note-commitment-tree roots at the completion tip, as raw
+/// 32-byte encodings so this stays free of the `sapling-crypto`/`orchard` hash
+/// types (kept in the `zingo`-gated wallet subject). `None` for a pool the
+/// subject does not track, or for an observer subject. The `at_completion`
+/// oracle compares these against the indexer's `TreeState` frontier root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeRoots {
+    /// Sapling commitment-tree root at the tip.
+    pub sapling: Option<[u8; 32]>,
+    /// Orchard commitment-tree root at the tip.
+    pub orchard: Option<[u8; 32]>,
+}
+
 /// One sync subject. The runner drives its lifecycle: [`launch`](Self::launch)
 /// once, [`progress`](Self::progress) each tick, [`is_complete`](Self::is_complete)
 /// as the completion predicate, [`stop`](Self::stop) on a fatal violation or
 /// cancellation. For a wallet ztest owns the engine (launch spawns
 /// `pepper_sync::sync`); for a self-syncing indexer/validator `launch`/`stop`
 /// are no-ops and the runner is a pure observer.
+// `Sync` (not just `Send`): the default `async fn terminal_roots(&self)` borrows
+// `&self` across an await, so `async_trait` requires the subject be shareable
+// for that future to be `Send`. Every subject already is (the wallet is driven
+// through a shared `Arc<RwLock<LightWallet>>`).
 #[async_trait]
-pub trait SyncSubject: Send {
+pub trait SyncSubject: Send + Sync {
     /// The per-tick reading this subject produces.
     type Progress: ProgressView;
 
@@ -83,5 +118,13 @@ pub trait SyncSubject: Send {
     /// have nothing to stop.
     async fn stop(&mut self) -> Result<(), RpcError> {
         Ok(())
+    }
+
+    /// The subject's commitment-tree roots at the completion tip, folded into
+    /// the terminal [`Snapshot`](crate::sync::Snapshot) for the `at_completion`
+    /// oracle. Read once, after [`is_complete`](Self::is_complete); the default
+    /// is empty (observer subjects expose no wallet tree).
+    async fn terminal_roots(&self) -> Result<TreeRoots, RpcError> {
+        Ok(TreeRoots::default())
     }
 }

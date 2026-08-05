@@ -24,8 +24,8 @@ pub(crate) mod impls;
 
 pub use context::{Cx, CxBuilder, Progress, ProgressSink};
 pub use entry::{
-    InitializeOpts, image_node_id, initialize, plan_runtime, reap_all, reap_run, reap_user,
-    seed_node_id,
+    InitializeOpts, dev_image_refs, image_node_id, initialize, plan_runtime, reap_all, reap_run,
+    reap_user, seed_node_id,
 };
 pub use graph::{Graph, GraphError};
 pub(crate) use impls::policy::{RUN_CLUSTER_ROLE, check_access as check_run_access};

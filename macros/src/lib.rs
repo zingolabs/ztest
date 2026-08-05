@@ -939,6 +939,19 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     } = args;
     let subject_str = LitStr::new(&subject.to_string(), subject.span());
     let qos_str = LitStr::new(&qos.to_string(), qos.span());
+    // The tier ident (`sync`) → the `QosClass` variant (`Sync`), so the wrapper
+    // can enter the tier at runtime exactly as `#[ztest::qos::*]` does. Without
+    // this the in-pod `TestEnv` would size the topology's component pods at the
+    // default `Basic` tier — not the sync tier the profile declared.
+    let qos_variant = {
+        let s = qos.to_string();
+        let mut chars = s.chars();
+        let capitalized = match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => s,
+        };
+        syn::Ident::new(&capitalized, qos.span())
+    };
 
     quote! {
         ::ztest::__private::inventory::submit! {
@@ -955,6 +968,11 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[::tokio::test(flavor = "multi_thread")]
         async fn #test_ident() {
+            // Enter the declared tier before any `.await` (mirrors the
+            // `#[ztest::qos::*]` attribute) so `TestEnv::build()` sizes the
+            // topology at this profile's tier, whether run by the CI engine or
+            // detached via `ztest sync start`.
+            ::ztest::qos::__enter(::ztest::qos::QosClass::#qos_variant);
             #body_fn
             let __outcome = __ztest_sync_body(::ztest::sync::SyncRunner::new()).await;
             assert!(

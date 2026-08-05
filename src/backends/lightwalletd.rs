@@ -99,6 +99,7 @@ impl IndexerBackend for LightwalletdIndexer {
             placement: None,
             guaranteed: None,
             image_pull_secret: crate::backends::image::pull_secret(),
+            termination_grace_period: None,
         })
     }
 
