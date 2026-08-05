@@ -102,7 +102,11 @@ The full contract lives in [how-to-profile.md](how-to-profile.md); the shape:
   for the whole process lifetime; `ZTEST_PROFILE_OUT` is the dump directory. On
   graceful `SIGTERM` (pod teardown) the component builds the report *off the
   signal handler* (pprof report-building is not async-signal-safe) and writes
-  `flamegraph.svg` + `profile.pb`.
+  `profile.pb` — the pprof protobuf, from which speedscope / pprof.me /
+  `go tool pprof` render the flamegraph on demand (source-of-truth, ~10× smaller
+  than a stored SVG, and interactive/diffable). Sample rate is
+  `ZTEST_PROFILE_HZ` (default 100 Hz), the real lever on overhead + size over a
+  10–600 min run.
 - **ztest owns**: setting the two env vars on the component pods, pointing
   `ZTEST_PROFILE_OUT` at a writable volume, collecting the artifact after the
   test, and surfacing the flamegraph in the report. A `#[ztest::profile]`
@@ -115,7 +119,7 @@ the entirety of the test.
 per-test artifact collection today — only runner-pod stdout is captured. Two
 facts force the shape:
 
-- The component writes the flamegraph **only on `SIGTERM`** (pod teardown), so
+- The component writes `profile.pb` **only on `SIGTERM`** (pod teardown), so
   an `emptyDir` is destroyed before the file can be read. `ZTEST_PROFILE_OUT`
   must be a **per-test PVC** that outlives the component pod and is reclaimed at
   namespace teardown.

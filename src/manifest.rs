@@ -45,6 +45,10 @@ pub struct PodSpec {
     /// `None` (kind mode, public registries) omits the field and relies on
     /// SA-/node-level auth. See [`crate::backends::image::pull_secret`].
     pub image_pull_secret: Option<String>,
+    /// `terminationGracePeriodSeconds` for the pod. `None` uses the k8s default
+    /// (30 s). Raised for a profiled component so its `SIGTERM` shutdown has
+    /// time to flush the flamegraph before the kubelet `SIGKILL`s it.
+    pub termination_grace_period: Option<i64>,
 }
 
 impl PodSpec {
@@ -106,6 +110,9 @@ impl PodSpec {
             "volumes": volumes,
             "containers": [container],
         });
+        if let Some(grace) = self.termination_grace_period {
+            spec["terminationGracePeriodSeconds"] = json!(grace);
+        }
         let mut security_context = serde_json::Map::new();
         if let Some(fs_group) = self.fs_group {
             security_context.insert("fsGroup".into(), json!(fs_group));
@@ -187,6 +194,10 @@ impl PodSpec {
                 "labels": {
                     "ztest.io/run-id": coords.run_id,
                     "ztest.io/component": component_label,
+                    // The backend-independent role, so a consumer can select
+                    // "the indexer" without knowing whether the profile runs
+                    // zainod or lightwalletd (`ztest sync watch` follows it).
+                    "ztest.io/component-category": self.category.as_str(),
                     "ztest.io/test": test_name,
                     "ztest.io/component-name": self.pod_name,
                 },
@@ -282,6 +293,7 @@ mod tests {
                 memory: "536870912".into(),
             }),
             image_pull_secret: None,
+            termination_grace_period: None,
         }
     }
 
@@ -438,6 +450,7 @@ mod tests {
         // Private-registry mode: the named secret is injected pod-level.
         let spec = PodSpec {
             image_pull_secret: Some("ghcr-pull".into()),
+            termination_grace_period: None,
             ..base_spec()
         };
         let s = pod_spec_json(&spec.render(&coords(), "t", &[]).unwrap());

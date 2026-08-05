@@ -94,6 +94,10 @@ pub(crate) struct EnvInner {
     pub(crate) in_cluster: bool,
     pub(crate) forwards: ForwardRegistry,
     pub(crate) shadow_clones: std::sync::Mutex<Vec<ShadowClone>>,
+    /// Pod names of profiled components (`profile`-feature image), captured at
+    /// materialize so a post-run [`TestEnv::collect_profiles`] can drain each and
+    /// tar its flamegraph out.
+    pub(crate) profiled_pods: std::sync::Mutex<Vec<String>>,
     pub(crate) is_built: AtomicBool,
     /// One `kubectl logs -f` follow of every component pod for this test's
     /// lifetime, buffered and rendered into the teardown diagnostic on failure
@@ -124,6 +128,7 @@ impl EnvInner {
             in_cluster: cluster::in_cluster(),
             forwards: Arc::new(Mutex::new(HashMap::new())),
             shadow_clones: std::sync::Mutex::new(Vec::new()),
+            profiled_pods: std::sync::Mutex::new(Vec::new()),
             is_built: AtomicBool::new(false),
             log_capture: std::sync::OnceLock::new(),
         }
@@ -622,9 +627,17 @@ impl TestEnv {
             // builds): a tripped guard means this topology is mispriced for its
             // tier — raise the tier so its cores divide across the topology.
             assert_deployed_within_tier(qos::current(), footprint, pod_count);
-            cluster::apply_resource_quota(&client, &namespace, footprint, pod_count)
-                .await
-                .map_err(env_err)?;
+            // A detached sync (`ztest sync start`) owns its whole namespace and
+            // shares it with its own driver pod, which this component-sized quota
+            // knows nothing about — applying it here would count the driver's
+            // reserve against the components and wedge them `Pending`. Every pod
+            // is explicitly Guaranteed-sized and admitted k8s-natively on the
+            // NVMe pool, so that is the real bound; skip the backstop quota.
+            if crate::sync::active_sync_id().is_none() {
+                cluster::apply_resource_quota(&client, &namespace, footprint, pod_count)
+                    .await
+                    .map_err(env_err)?;
+            }
         }
         build_phase("namespace_quota", started);
         let sentinel = Sentinel::new(namespace.clone());
@@ -758,6 +771,7 @@ impl TestEnv {
         ready?;
 
         self.inner.is_built.store(true, Ordering::Release);
+        crate::sync::note_setup("topology", None, "ready — starting the engine");
 
         tracing::debug!(
             target: "ztest::build",
@@ -785,6 +799,7 @@ impl TestEnv {
         if validators.is_empty() {
             return Ok(());
         }
+        crate::sync::note_setup("validator", None, "waiting for RPC readiness");
 
         let timeout = self.ready_timeout;
         let probes = validators.into_iter().map(|(pod_name, handle)| async move {
@@ -821,6 +836,7 @@ impl TestEnv {
         if indexers.is_empty() {
             return Ok(());
         }
+        crate::sync::note_setup("indexer", None, "waiting for gRPC GetLightdInfo");
 
         let timeout = self.ready_timeout;
         let probes = indexers.into_iter().map(|(pod_name, handle)| async move {
@@ -839,6 +855,71 @@ impl TestEnv {
         Ok(())
     }
 
+    /// The single indexer bound in this topology, type-erased for use as the
+    /// independent correctness oracle in a sync run's [`SyncCtx`]. Errors if
+    /// zero or more than one indexer is present — a sync oracle must be
+    /// unambiguous (a differential ≤2-indexer topology is a load-test shape, not
+    /// a sync-oracle one).
+    /// The kube client, once [`build`](Self::build) has connected. Used by the
+    /// post-run metrics query to fetch the service CA and reach thanos.
+    #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
+    pub(crate) fn kube_client(&self) -> Option<Client> {
+        self.inner.client.get().cloned()
+    }
+
+    /// The test namespace this env provisioned into, once [`build`](Self::build)
+    /// has run. Used to scope the post-run thanos metrics query to this run.
+    #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
+    pub(crate) fn namespace(&self) -> Option<String> {
+        self.inner
+            .namespace
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    /// Drain each profiled component (graceful SIGTERM so its profiler flushes)
+    /// and tar its profile artifacts into `dest_dir`, returning the collected
+    /// paths. Best-effort per component; call after the run, before teardown.
+    #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
+    pub(crate) async fn collect_profiles(
+        &self,
+        dest_dir: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        let (Some(client), Some(ns)) = (self.inner.client.get().cloned(), self.namespace()) else {
+            return Vec::new();
+        };
+        let pods = self
+            .inner
+            .profiled_pods
+            .lock()
+            .expect("profiled_pods mutex poisoned")
+            .clone();
+        let mut collected = Vec::new();
+        for pod in pods {
+            collected.extend(crate::profiling::collect(&client, &ns, &pod, dest_dir).await);
+        }
+        collected
+    }
+
+    #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
+    pub(crate) async fn single_indexer(&self) -> Result<Arc<dyn IndexerBackend>, EnvError> {
+        let comps = self.inner.components.read().await;
+        let mut indexers = comps.values().filter_map(|s| match &s.handle {
+            ComponentHandle::Indexer(h) => Some(Arc::clone(h)),
+            ComponentHandle::Validator(_) => None,
+        });
+        match (indexers.next(), indexers.next()) {
+            (Some(h), None) => Ok(h),
+            (None, _) => Err(EnvError::Config {
+                reason: "sync oracle needs an indexer, but the topology has none".into(),
+            }),
+            (Some(_), Some(_)) => Err(EnvError::Config {
+                reason: "sync oracle is ambiguous: topology has more than one indexer".into(),
+            }),
+        }
+    }
+
     async fn warm_validators(&self) -> Result<(), EnvError> {
         // Mine one block per validator so dependents (indexers) sync
         // against a non-genesis tip. Drives each validator's handle.
@@ -852,6 +933,9 @@ impl TestEnv {
                 })
                 .collect()
         };
+        if !handles.is_empty() {
+            crate::sync::note_setup("validator", None, "mining the warm-up block");
+        }
         for handle in handles {
             handle
                 .generate_blocks(1)
@@ -885,6 +969,7 @@ impl TestEnv {
                 reservation = %reservation,
                 "provisioning component"
             );
+            crate::sync::note_setup(spec.category.as_str(), Some(&spec.pod_name), "creating pod");
             let state =
                 ComponentState::new(spec, ctx.sentinel.namespace.clone(), handle.clone());
             cluster::create_pod_service(
@@ -895,15 +980,70 @@ impl TestEnv {
             )
             .await
             .map_err(env_err)?;
-            let resolved =
+            // Its own step because resolving a seed mount can fetch an archive
+            // through the storage backend — minutes of network, not a local call.
+            if !opts.mounts.is_empty() {
+                crate::sync::note_setup(
+                    spec.category.as_str(),
+                    Some(&spec.pod_name),
+                    "resolving mounts and seeds",
+                );
+            }
+            let mut resolved =
                 mounts::resolve_all(ctx.client, ctx.sentinel, &spec.pod_name, &opts.mounts).await?;
             self.inner
                 .shadow_clones
                 .lock()
                 .expect("shadow_clones mutex poisoned")
                 .extend(resolved.shadow_clones);
+            // Profiled component → give it a per-test artifact PVC at
+            // `ZTEST_PROFILE_OUT` (which its pod spec set) so the flamegraph
+            // written on graceful SIGTERM outlives the pod for collection.
+            if opts.image.profile_enabled() {
+                let claim = crate::profiling::artifact_pvc_name(&spec.pod_name);
+                crate::profiling::ensure_artifact_pvc(ctx.client, ctx.sentinel, &claim).await?;
+                resolved
+                    .mounts
+                    .push(crate::profiling::artifact_resolved_mount(&claim));
+                self.inner
+                    .profiled_pods
+                    .lock()
+                    .expect("profiled_pods mutex poisoned")
+                    .push(spec.pod_name.clone());
+            }
             apply_pod(ctx, spec, &resolved.mounts).await?;
+            // Metrics-enabled component → emit a PodMonitor so OpenShift UWM
+            // scrapes its `/metrics`. Non-fatal: a cluster without the
+            // Prometheus-operator CRDs (or with UWM off) must not fail the test,
+            // it just yields no server-side metrics for this run.
+            if opts.image.metrics_enabled() {
+                if let Err(e) = crate::metrics::emit_pod_monitor(
+                    ctx.client,
+                    &ctx.sentinel.namespace,
+                    &spec.pod_name,
+                    &ctx.coords.run_id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        component = %spec.pod_name,
+                        error = %e,
+                        "PodMonitor emit failed; this component's metrics will not be scraped"
+                    );
+                }
+            }
             self.inner.components.write().await.insert(*id, state);
+        }
+
+        // One event for the whole gate rather than one per pod: the waits below run
+        // concurrently, so "which pod are we on" has no answer — the honest live
+        // statement is which gate is open and how long it has been.
+        if let Some((_, spec, _, _)) = items.first() {
+            crate::sync::note_setup(
+                spec.category.as_str(),
+                None,
+                &format!("waiting for {} pod(s) to reach Ready", items.len()),
+            );
         }
 
         let timeout = self.ready_timeout;

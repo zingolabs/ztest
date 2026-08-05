@@ -10,6 +10,7 @@
 pub(crate) mod buildkit;
 pub(crate) mod image;
 pub(crate) mod mirror;
+pub(crate) mod monitoring;
 pub(crate) mod policy;
 pub(crate) mod scaffolding;
 pub(crate) mod seed;

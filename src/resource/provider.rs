@@ -86,6 +86,10 @@ pub enum NodeId {
     /// the buildkit-native `FROM <hub> + push` that populates it. Keeps a wide test
     /// wave off slow / rate-limited Docker Hub pulls. OpenShift targets only.
     ImageMirror,
+    /// User Workload Monitoring enablement (`enableUserWorkload: true` in the
+    /// `cluster-monitoring-config`) + the run-SA thanos-querier read grant — the
+    /// precondition for scraping per-test component `/metrics`. OpenShift targets only.
+    UserWorkloadMonitoring,
 }
 
 impl NodeId {
@@ -111,6 +115,7 @@ impl NodeId {
             Self::RegistryProject => "registry-project".into(),
             Self::Buildkit => "buildkit".into(),
             Self::ImageMirror => "image-mirror".into(),
+            Self::UserWorkloadMonitoring => "user-workload-monitoring".into(),
         }
     }
 }

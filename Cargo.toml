@@ -131,6 +131,13 @@ zcash_client_sqlite = { version = "=0.22.0-rc.1", features = ["orchard", "transp
 zcash_keys = { version = "0.15.0", features = ["sapling", "orchard"], optional = true }
 zcash_proofs = { version = "0.29.0", features = ["bundled-prover"], optional = true }
 zcash_primitives = { version = "0.29.0", optional = true }
+# The note-commitment-tree hash types (`sapling_crypto::Node`,
+# `orchard::tree::MerkleHashOrchard`) the sync tree-root oracle compares: the
+# wallet's `shard_trees` root against zaino's `TreeState` frontier, both parsed
+# with these exact crates. Versions track zingolib dev's lock so they unify to
+# one copy (no duplicate-type mismatch on the `==`).
+sapling-crypto = { version = "0.7", optional = true }
+orchard = { version = "0.15", optional = true }
 secrecy = { version = "0.8", optional = true }
 # Named to spell the `WalletDb<rusqlite::Connection, ..>` connection type;
 # version tracks zcash_client_sqlite 0.21.1's resolved rusqlite.
@@ -181,6 +188,7 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 # inventory phase consumes. Version tracks the installed `cargo nextest`.
 nextest-metadata = "0.14"
 dialoguer = { version = "0.12.0", default-features = false }
+prometheus-parse = "0.2.5"
 
 [features]
 default = ["librustzcash"]
@@ -204,6 +212,11 @@ librustzcash = [
     "dep:zip32",
     "dep:tempfile",
     "dep:bip0039",
+    # Observable sync harness (src/sync): the at-completion tree-root oracle
+    # parses zaino's `TreeState` frontier with these exact hash types, matched
+    # against the wallet's own shard-tree root.
+    "dep:sapling-crypto",
+    "dep:orchard",
 ]
 # In-process zingolib wallet backend (`backends::zingo`, `Wallet::zingo`).
 # OFF by default so consumers that only drive validators/indexers (e.g. zaino's

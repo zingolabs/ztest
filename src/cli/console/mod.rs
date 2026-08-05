@@ -14,11 +14,13 @@
 //! footer repaints in place. See `docs/console-architecture.md` for the rationale.
 
 mod bridge;
+mod buildphase;
 mod child;
 mod footer;
 mod render;
 mod viewport;
 
+pub(crate) use buildphase::{commit_phase, provision_with_tracker, CapRx};
 pub(crate) use child::run_child;
 pub(crate) use render::{Console, SceneFrame};
 pub(crate) use viewport::Surface;

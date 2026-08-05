@@ -243,6 +243,18 @@ const RUN_RULES: &[Rule] = &[
     // On-cluster builds `exec` into the BuildKit pod (covered by `pods/exec`
     // above), so the run identity needs no `build`/`image.openshift.io` grants;
     // the push is done by the BuildKit pod's own SA (`RegistryProjectProvider`).
+    //
+    // PodMonitors: the metrics plane emits one per metrics-enabled component into
+    // the test namespace for OpenShift UWM to scrape (`crate::metrics`). Inert on
+    // a cluster without the Prometheus-operator CRD (the resource simply doesn't
+    // exist there), so it stays `RuleScope::All`.
+    Rule {
+        group: "monitoring.coreos.com",
+        resources: &["podmonitors"],
+        verbs: &["get", "list", "create", "patch", "delete"],
+        check_verb: None,
+        scope: RuleScope::All,
+    },
 ];
 
 /// Render the rules applicable to `backend` as ClusterRole `rules` JSON.

@@ -204,6 +204,20 @@ impl IndexerBackend for ZainoIndexer {
         opts: &crate::component::ComponentOpts,
         pod_name: String,
     ) -> Result<crate::manifest::PodSpec, EnvError> {
+        // A `profile`-built image runs profiled when `ZTEST_PROFILE` is set; it
+        // writes the flamegraph to `ZTEST_PROFILE_OUT` on graceful SIGTERM, so
+        // the pod needs a longer grace period than the k8s 30 s default to flush
+        // before the kubelet SIGKILLs it. The out dir is a ztest-owned artifact
+        // volume (mounted at build; see `profiling::artifact_mount`).
+        let profiled = opts.image.profile_enabled();
+        let mut env = opts.env.clone();
+        if profiled {
+            env.push(("ZTEST_PROFILE".to_string(), "1".to_string()));
+            env.push((
+                "ZTEST_PROFILE_OUT".to_string(),
+                crate::profiling::ARTIFACT_DIR.to_string(),
+            ));
+        }
         Ok(crate::manifest::PodSpec {
             pod_name,
             category: crate::component::ComponentCategory::Indexer,
@@ -221,7 +235,7 @@ impl IndexerBackend for ZainoIndexer {
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources.clone(),
-            env: opts.env.clone(),
+            env,
             fs_group: Some(1000),
             // The zainod image's USER is a non-numeric name kubelet can't
             // verify against runAsNonRoot; pin the numeric uid. It also matches
@@ -231,6 +245,7 @@ impl IndexerBackend for ZainoIndexer {
             placement: None,
             guaranteed: None,
             image_pull_secret: crate::backends::image::pull_secret(),
+            termination_grace_period: profiled.then_some(crate::profiling::GRACE_SECS),
         })
     }
 

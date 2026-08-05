@@ -18,7 +18,8 @@ different decisions:
 | --- | --- | --- | --- |
 | `profile` cargo feature | build-time | whether `pprof-rs` is **linked** | Docker build `ARG` |
 | `ZTEST_PROFILE` | run-time | whether the profiler **samples** | ztest, per test |
-| `ZTEST_PROFILE_OUT` | run-time | **where** the flame graph is written | ztest (an artifact dir) |
+| `ZTEST_PROFILE_OUT` | run-time | **where** `profile.pb` is written | ztest (an artifact dir) |
+| `ZTEST_PROFILE_HZ` | run-time | **sample rate** (Hz); default 100 | ztest (optional, per run length) |
 
 A single image built `--features profile` runs **unprofiled** when `ZTEST_PROFILE`
 is unset (no `ProfilerGuard` is created, so there is zero overhead) and
@@ -32,11 +33,14 @@ is unset (no `ProfilerGuard` is created, so there is zero overhead) and
 
 ```toml
 [dependencies]
-pprof = { version = "0.13", features = ["flamegraph", "protobuf-codec"], optional = true }
+pprof = { version = "0.13", features = ["protobuf-codec"], optional = true }
 
 [features]
 profile = ["dep:pprof"]
 ```
+
+`protobuf-codec` only: you emit the pprof `profile.pb` (the source-of-truth
+artifact), not a rendered SVG, so the `flamegraph`/inferno backend is not needed.
 
 Keeping `pprof` optional and off by default means production builds never carry
 it. (Making it an unconditional dependency gated only by `ZTEST_PROFILE` at
@@ -66,8 +70,17 @@ fn start_profiler() -> Option<pprof::ProfilerGuard<'static>> {
     if std::env::var_os("ZTEST_PROFILE").is_none() {
         return None;
     }
+    // The sample RATE is the lever on overhead and artifact size over a long run
+    // — not any after-the-fact compression. 100 Hz resolves the hot Rust paths at
+    // ~1% overhead over a multi-hour test; `ZTEST_PROFILE_HZ` overrides it.
+    // (pprof's own default is 99 Hz; 1000 Hz is wasteful for a 10–600 min run.)
+    let hz = std::env::var("ZTEST_PROFILE_HZ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&h| h > 0)
+        .unwrap_or(100);
     pprof::ProfilerGuardBuilder::default()
-        .frequency(1000)
+        .frequency(hz)
         // Mandatory: SIGPROF-unwind is not safe through these; omitting risks deadlock.
         .blocklist(&["libc", "libgcc", "pthread", "vdso"])
         .build()
@@ -78,14 +91,16 @@ fn start_profiler() -> Option<pprof::ProfilerGuard<'static>> {
 fn write_profile(guard: pprof::ProfilerGuard<'_>) {
     let Ok(report) = guard.report().build() else { return };
     let dir = std::env::var("ZTEST_PROFILE_OUT").unwrap_or_else(|_| ".".into());
-    if let Ok(f) = std::fs::File::create(format!("{dir}/flamegraph.svg")) {
-        let _ = report.flamegraph(f);
-    }
-    // pprof protobuf for Speedscope / Pyroscope, if you also want interactive analysis.
+    // Write only the pprof protobuf. It is the source-of-truth artifact —
+    // string-interned and ~10× smaller than a rendered SVG — and speedscope.app,
+    // pprof.me, and `go tool pprof` all render the flamegraph from it on demand,
+    // interactively and diffably. `write_to_bytes()` is the rust-protobuf
+    // serializer the `protobuf-codec` feature provides; `.encode()` is prost's
+    // API and does not exist under this feature. The bytes are raw protobuf —
+    // pprof consumers sniff the format, so no gzip layer is needed.
     if let Ok(profile) = report.pprof() {
         use pprof::protos::Message;
-        let mut buf = Vec::new();
-        if profile.encode(&mut buf).is_ok() {
+        if let Ok(buf) = profile.write_to_bytes() {
             let _ = std::fs::write(format!("{dir}/profile.pb"), &buf);
         }
     }

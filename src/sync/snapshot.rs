@@ -14,7 +14,7 @@ use tokio::time::Instant;
 
 use crate::handles::wallet::Pool;
 
-use super::subject::{Phase, ProgressView};
+use super::subject::{Phase, ProgressView, TreeRoots};
 
 /// `[sapling, orchard, ironwood]` output counts, indexed by [`pool_idx`].
 type PoolOutputs = [u64; 3];
@@ -63,6 +63,9 @@ pub struct Snapshot {
     observed_reorg: bool,
     observed_reconnect: bool,
     last_fault_at: Option<Instant>,
+    /// Wallet commitment-tree roots — populated only on the terminal snapshot
+    /// (empty on every per-tick snapshot); read by the `at_completion` oracle.
+    tree_roots: TreeRoots,
 }
 
 impl Snapshot {
@@ -129,6 +132,18 @@ impl Snapshot {
     pub fn observed_reconnect(&self) -> bool {
         self.observed_reconnect
     }
+    /// The wallet's commitment-tree root for `pool` at this snapshot's height,
+    /// as a 32-byte encoding. Populated only on the terminal snapshot and only
+    /// for Sapling/Orchard (Ironwood/Transparent have no `TreeState` wire
+    /// representation to check against); `None` otherwise. The `at_completion`
+    /// oracle compares this against the indexer's `TreeState` frontier root.
+    pub fn tree_root(&self, pool: Pool) -> Option<[u8; 32]> {
+        match pool {
+            Pool::Sapling => self.tree_roots.sapling,
+            Pool::Orchard => self.tree_roots.orchard,
+            Pool::Ironwood | Pool::Transparent => None,
+        }
+    }
 }
 
 /// Rolling state the runner threads across ticks to build each [`Snapshot`].
@@ -165,6 +180,7 @@ impl SnapshotBuilder {
         p: &P,
         now: Instant,
         last_fault_at: Option<Instant>,
+        tree_roots: TreeRoots,
     ) -> Snapshot {
         let height = p.height();
         let outputs = [
@@ -202,6 +218,7 @@ impl SnapshotBuilder {
             observed_reorg: self.observed_reorg,
             observed_reconnect: self.observed_reconnect,
             last_fault_at,
+            tree_roots,
         };
 
         self.seq += 1;

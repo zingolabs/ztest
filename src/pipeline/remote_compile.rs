@@ -660,6 +660,7 @@ fn rehome_dump(dump: &mut images::DumpOutcome, ancestor: &Path) {
         seeds,
         images_by_binary,
         deps_by_binary,
+        sync_tests: _,
     } = dump
     else {
         return;

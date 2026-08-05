@@ -71,6 +71,50 @@ pub enum Class {
     AtCompletion,
 }
 
+/// A probe's live state as of one tick — the standing board `ztest sync watch`
+/// renders. Derived from the rolling scheduler state on [`ProbeSpec`], which is
+/// otherwise private to the runner, so a watcher can see a liveness window
+/// draining *before* it fires as a violation.
+#[derive(Clone, Debug)]
+pub struct ProbeStatus {
+    pub name: String,
+    pub class: Class,
+    pub severity: Severity,
+    pub state: ProbeState,
+    /// `eventually` only: time since the probe was last satisfied, against the
+    /// `window` it must beat.
+    pub since_satisfied: Option<Duration>,
+    /// `eventually` only: the satisfy-deadline. `None` for an unbounded window.
+    pub window: Option<Duration>,
+}
+
+/// Where a probe stands. Not a verdict — [`Verdict`] is one evaluation's result,
+/// this is the probe's accumulated position across the run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeState {
+    /// Satisfied at its most recent evaluation.
+    Ok,
+    /// Evaluated and not satisfied, but still inside its allowance — an
+    /// `eventually` probe that has missed an evaluation without exhausting its
+    /// window.
+    Pending,
+    /// Recording consecutive violations. Past `hold_for` this becomes a fired
+    /// violation; below it the probe is already failing but has not fired.
+    Violating,
+    /// Not yet evaluated: a `sometimes` probe still waiting to latch, an
+    /// `at_completion` probe (evaluated only at tip), or any probe before its
+    /// first due tick.
+    NotYet,
+}
+
+impl ProbeState {
+    /// Whether this state counts toward the panel's "N ok" tally.
+    pub fn is_ok(&self) -> bool {
+        matches!(self, ProbeState::Ok)
+    }
+}
+
 /// How often a probe is evaluated. `window` belongs to `eventually` (the
 /// satisfy-deadline), the rest are evaluation cadences.
 #[derive(Clone, Copy, Debug)]
@@ -196,6 +240,57 @@ impl ProbeSpec {
                 (hold.as_secs_f64() / d.as_secs_f64()).ceil() as u32
             }
             _ => 1,
+        }
+    }
+
+    /// This probe's live board entry at `now`, given the engine's base `tick`.
+    ///
+    /// `eventually` stores only *when* it was last satisfied, not the last
+    /// verdict, so its state is read off that age: still within one tick means
+    /// it was satisfied at the most recent evaluation, past the window means the
+    /// stall has already fired, and in between it is draining its allowance.
+    pub(crate) fn status(&self, now: tokio::time::Instant, tick: Duration) -> ProbeStatus {
+        let window = match self.cadence {
+            Cadence::Window(d) if d != Duration::MAX => Some(d),
+            _ => None,
+        };
+        let since = self
+            .last_satisfied
+            .map(|last| now.saturating_duration_since(last));
+
+        let state = match self.class {
+            Class::Always => {
+                if self.violation_streak > 0 {
+                    ProbeState::Violating
+                } else if self.last_fired_seq.is_some() {
+                    ProbeState::Ok
+                } else {
+                    ProbeState::NotYet
+                }
+            }
+            Class::Eventually => match (since, window) {
+                (None, _) => ProbeState::NotYet,
+                (Some(since), Some(w)) if since > w => ProbeState::Violating,
+                (Some(since), _) if since > tick => ProbeState::Pending,
+                (Some(_), _) => ProbeState::Ok,
+            },
+            Class::Sometimes => {
+                if self.ever_satisfied {
+                    ProbeState::Ok
+                } else {
+                    ProbeState::NotYet
+                }
+            }
+            Class::AtCompletion => ProbeState::NotYet,
+        };
+
+        ProbeStatus {
+            name: self.name.clone(),
+            class: self.class,
+            severity: self.severity,
+            state,
+            since_satisfied: since.filter(|_| self.class == Class::Eventually),
+            window,
         }
     }
 }

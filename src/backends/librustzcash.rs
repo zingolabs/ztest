@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,6 +18,7 @@ use rand::rngs::OsRng;
 use secrecy::SecretVec;
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
 
 use zcash_client_backend::data_api::chain::{BlockCache, BlockSource, error::Error as ChainError};
 use zcash_client_backend::data_api::scanning::ScanRange;
@@ -26,7 +28,9 @@ use zcash_client_backend::data_api::wallet::{
     shield_transparent_funds,
 };
 use zcash_client_backend::zip321::{Payment, TransactionRequest};
-use zcash_client_backend::data_api::{AccountBirthday, WalletRead, WalletWrite};
+use zcash_client_backend::data_api::{
+    AccountBirthday, WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite,
+};
 use zcash_client_backend::fees::standard::SingleOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
@@ -45,10 +49,12 @@ use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 use zcash_protocol::local_consensus::LocalNetwork;
 use zcash_protocol::value::Zatoshis;
 
+use crate::RpcError;
 use crate::handles::HandleInner;
 use crate::handles::wallet::{
     AccountId, AccountSpec, BoxError, Pool, PoolBalances, WalletBackend, WalletConfig,
 };
+use crate::sync::{PerformanceLevel, Phase, ProgressView, SyncSubject, TreeRoots};
 use crate::topology::ActivationHeights;
 
 const LABEL: &str = "librustzcash";
@@ -94,9 +100,12 @@ struct LrzInner {
 }
 
 /// One in-process account. The `WalletDb` is behind an async mutex since
-/// `WalletWrite`/sync take `&mut`; `_dir` holds the SQLite file alive.
+/// `WalletWrite`/sync take `&mut`; `_dir` holds the SQLite file alive. `db_path`
+/// lets the observable sync harness open a second (WAL) reader connection to
+/// poll scan progress while the sync task writes through `db`.
 struct WalletAccount {
     db: AsyncMutex<Db>,
+    db_path: PathBuf,
     usk: UnifiedSpendingKey,
     account_id: AccountUuid,
     params: LocalNetwork,
@@ -286,8 +295,7 @@ impl WalletBackend for LrzWallet {
         let dir =
             tempfile::tempdir().map_err(|e| format!("librustzcash: create wallet dir: {e}"))?;
         let db_path = dir.path().join("wallet.sqlite");
-        let mut db = WalletDb::for_path(&db_path, params, SystemClock, OsRng)
-            .map_err(|e| format!("librustzcash: open wallet db: {e}"))?;
+        let mut db = open_wallet_db(&db_path, params)?;
         init_wallet_db(&mut db, None).map_err(|e| format!("librustzcash: init wallet db: {e}"))?;
 
         // Birthday treestate from the indexer: `from_treestate` reads the
@@ -318,6 +326,7 @@ impl WalletBackend for LrzWallet {
                 id,
                 Arc::new(WalletAccount {
                     db: AsyncMutex::new(db),
+                    db_path,
                     usk,
                     account_id,
                     params,
@@ -533,6 +542,231 @@ impl WalletBackend for LrzWallet {
         drop(db);
         broadcast(&acct.indexer_uri, raw, timeout).await?;
         Ok(txids)
+    }
+}
+
+/// Open the wallet SQLite db in WAL mode. WAL lets the observable sync harness
+/// read scan progress from a second connection while the sync task holds the
+/// primary connection writing — default rollback-journal mode blocks a
+/// concurrent reader for the whole write transaction. `load_module` installs the
+/// `rarray` virtual table `zcash_client_sqlite` requires, matching what
+/// `WalletDb::for_path` does before handing back the connection.
+fn open_wallet_db(path: &Path, params: LocalNetwork) -> Result<Db, BoxError> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|e| format!("librustzcash: open sqlite {}: {e}", path.display()))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| format!("librustzcash: enable WAL on {}: {e}", path.display()))?;
+    rusqlite::vtab::array::load_module(&conn)
+        .map_err(|e| format!("librustzcash: load rarray module: {e}"))?;
+    Ok(WalletDb::from_connection(conn, params, SystemClock, OsRng))
+}
+
+/// One-confirmation wallet-summary policy (matches [`WalletBackend::balances`]).
+fn one_conf_policy() -> ConfirmationsPolicy {
+    ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false)
+}
+
+impl LrzWallet {
+    /// Build the observable [`SyncSubject`] the `#[ztest::sync_test]` facade
+    /// binds via `Subject::wallet(account)`. It drives `account`'s sync to tip
+    /// through `zcash_client_backend::sync` in a background task and exposes
+    /// per-tick scan progress plus the terminal commitment-tree roots.
+    /// `performance` sets the compact-block batch size.
+    pub async fn sync_subject(
+        &self,
+        account: AccountId,
+        performance: Option<PerformanceLevel>,
+    ) -> Result<LrzSyncSubject, BoxError> {
+        let acct = self.account(account)?;
+        let reader = open_wallet_db(&acct.db_path, acct.params)?;
+        let batch_size = performance.map_or(SYNC_BATCH_SIZE, PerformanceLevel::batch_size);
+        Ok(LrzSyncSubject {
+            account: acct,
+            batch_size,
+            reader: AsyncMutex::new(reader),
+            running: None,
+        })
+    }
+}
+
+/// One progress reading of a librustzcash wallet sync, derived from its
+/// `WalletSummary`.
+#[derive(Clone, Debug)]
+pub struct LrzProgress {
+    height: u32,
+    target: Option<u32>,
+    pct: f32,
+    phase: Phase,
+    balance_total: i64,
+}
+
+impl LrzProgress {
+    fn from_summary(summary: Option<&WalletSummary<AccountUuid>>, account: &AccountUuid) -> Self {
+        let Some(s) = summary else {
+            return Self {
+                height: 0,
+                target: None,
+                pct: 0.0,
+                phase: Phase::Starting,
+                balance_total: 0,
+            };
+        };
+        let scan = s.progress().scan();
+        let (num, den) = (*scan.numerator(), *scan.denominator());
+        let pct = if den == 0 {
+            0.0
+        } else {
+            100.0 * num as f32 / den as f32
+        };
+        let balance_total = s
+            .account_balances()
+            .get(account)
+            .map_or(0, |b| u64::from(b.total()) as i64);
+        Self {
+            height: u32::from(s.fully_scanned_height()),
+            target: Some(u32::from(s.chain_tip_height())),
+            pct,
+            phase: if s.is_synced() {
+                Phase::Done
+            } else {
+                Phase::Historic
+            },
+            balance_total,
+        }
+    }
+}
+
+impl ProgressView for LrzProgress {
+    fn height(&self) -> u32 {
+        self.height
+    }
+    fn target(&self) -> Option<u32> {
+        self.target
+    }
+    fn pct(&self) -> f32 {
+        self.pct
+    }
+    fn phase(&self) -> Phase {
+        self.phase
+    }
+    fn balance_total(&self) -> i64 {
+        self.balance_total
+    }
+    // `outputs(pool)` stays the trait default (0): librustzcash's `WalletSummary`
+    // exposes scan progress as a height/ratio, not per-pool cumulative output
+    // counters, so there is no source for a `pool_outputs_monotonic` probe here.
+    // Height monotonicity (`Snapshot::reorg_depth`) covers the same rollback
+    // safety the output counter would.
+}
+
+/// Observable librustzcash wallet-sync subject. `launch` spawns the drive-to-tip
+/// as a background task holding the primary db connection; `progress` and
+/// `terminal_roots` read through a second WAL connection (`reader`) so they never
+/// block on the writer.
+pub struct LrzSyncSubject {
+    account: Arc<WalletAccount>,
+    batch_size: u32,
+    reader: AsyncMutex<Db>,
+    running: Option<JoinHandle<Result<(), BoxError>>>,
+}
+
+impl std::fmt::Debug for LrzSyncSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LrzSyncSubject")
+            .field("indexer_uri", &self.account.indexer_uri)
+            .field("batch_size", &self.batch_size)
+            .field("launched", &self.running.is_some())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl SyncSubject for LrzSyncSubject {
+    type Progress = LrzProgress;
+
+    async fn launch(&mut self) -> Result<(), RpcError> {
+        if self.running.is_some() {
+            return Err(RpcError::decode(
+                LABEL,
+                "launch",
+                "sync already launched",
+            ));
+        }
+        let account = self.account.clone();
+        let batch = self.batch_size;
+        let handle = tokio::spawn(async move {
+            let mut client = connect(&account.indexer_uri).await?;
+            let cache = MemBlockCache::default();
+            let params = account.params;
+            // Holds the primary connection for the whole drive-to-tip; the
+            // monitor reads the second (WAL) connection meanwhile.
+            let mut db = account.db.lock().await;
+            zcash_client_backend::sync::run(&mut client, &params, &cache, &mut *db, batch)
+                .await
+                .map_err(|e| format!("librustzcash: sync: {e}"))?;
+            Ok::<(), BoxError>(())
+        });
+        self.running = Some(handle);
+        Ok(())
+    }
+
+    async fn progress(&self) -> Result<LrzProgress, RpcError> {
+        let db = self.reader.lock().await;
+        let summary = db
+            .get_wallet_summary(one_conf_policy())
+            .map_err(|e| RpcError::decode(LABEL, "get_wallet_summary", format!("{e}")))?;
+        Ok(LrzProgress::from_summary(
+            summary.as_ref(),
+            &self.account.account_id,
+        ))
+    }
+
+    async fn is_complete(&self) -> bool {
+        self.running.as_ref().is_some_and(|h| h.is_finished())
+    }
+
+    async fn stop(&mut self) -> Result<(), RpcError> {
+        if let Some(h) = &self.running {
+            // `zcash_client_backend::sync::run` has no cooperative checkpoint, so
+            // cancel by aborting at the next await. Each scanned batch already
+            // committed as its own transaction, so the db stays consistent.
+            h.abort();
+        }
+        Ok(())
+    }
+
+    async fn terminal_roots(&self) -> Result<TreeRoots, RpcError> {
+        let mut db = self.reader.lock().await;
+        let height = match db
+            .get_wallet_summary(one_conf_policy())
+            .map_err(|e| RpcError::decode(LABEL, "get_wallet_summary", format!("{e}")))?
+        {
+            Some(s) => s.fully_scanned_height(),
+            None => return Ok(TreeRoots::default()),
+        };
+        // `root_at_checkpoint_id(height)` is the precise anchor to compare
+        // against `get_tree_state(height)`; fall back to the all-leaves root when
+        // no checkpoint sits exactly at the scanned tip. At completion both
+        // resolve to the same anchor.
+        let sapling = db
+            .with_sapling_tree_mut(|tree| -> Result<Option<_>, BoxError> {
+                Ok(match tree.root_at_checkpoint_id(&height)? {
+                    Some(r) => Some(r),
+                    None => tree.root_at_checkpoint_depth(None)?,
+                })
+            })
+            .map_err(|e| RpcError::decode(LABEL, "sapling_root", format!("{e}")))?
+            .map(|n| n.to_bytes());
+        let orchard = db
+            .with_orchard_tree_mut(|tree| -> Result<Option<_>, BoxError> {
+                Ok(match tree.root_at_checkpoint_id(&height)? {
+                    Some(r) => Some(r),
+                    None => tree.root_at_checkpoint_depth(None)?,
+                })
+            })
+            .map_err(|e| RpcError::decode(LABEL, "orchard_root", format!("{e}")))?
+            .map(|n| n.to_bytes());
+        Ok(TreeRoots { sapling, orchard })
     }
 }
 

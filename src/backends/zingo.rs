@@ -12,7 +12,7 @@ use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use tempfile::TempDir;
@@ -28,8 +28,10 @@ use zingolib::lightclient::LightClient;
 use zingolib::wallet::WalletSettings;
 use zingolib::wallet::keys::unified::ReceiverSelection;
 
+use pepper_sync::wallet::SyncMode;
+use zingo_netutils::GrpcIndexer;
+
 use crate::RpcError;
-use crate::sync::{SyncTarget, WalletSyncDriver};
 use crate::handles::HandleInner;
 use crate::handles::indexer::IndexerBackend;
 use crate::handles::validator::ValidatorBackend;
@@ -148,32 +150,6 @@ impl ZingoWallet {
             .ok_or_else(|| format!("zingo: unknown account {account:?}").into())
     }
 
-    /// Build a [`WalletSubject`](crate::sync::WalletSubject) driving `account`'s
-    /// sync — the seam the `#[ztest::sync_test]` facade binds via
-    /// `Subject::wallet(account)`. `performance` overrides the tier default.
-    pub async fn sync_subject(
-        &self,
-        account: AccountId,
-        performance: Option<PerformanceLevel>,
-    ) -> Result<crate::sync::WalletSubject, BoxError> {
-        let SyncInputs {
-            client,
-            params,
-            mut sync_config,
-            indexer_uri,
-        } = self.sync_inputs(account)?;
-        if let Some(level) = performance {
-            sync_config.performance_level = level;
-        }
-        let wallet = client.lock().await.wallet().clone();
-        let driver = WalletSyncDriver::new(
-            wallet,
-            SyncTarget::in_topology(indexer_uri.as_ref()),
-            params,
-            sync_config,
-        );
-        Ok(crate::sync::WalletSubject::new(driver))
-    }
 }
 
 /// Cross ztest's [`ActivationHeights`] into zingolib's `ChainType::Regtest`
@@ -486,20 +462,24 @@ impl WalletBackend for ZingoWallet {
             sync_config,
             indexer_uri,
         } = self.sync_inputs(account)?;
-        // Rent the `LightWallet` the `LightClient` owns. pepper-sync writes it
-        // in place, so the client's later balance/send/shield reads observe the
+        // Rent the `LightWallet` the `LightClient` owns. pepper-sync writes it in
+        // place, so the client's later balance/send/shield reads observe the
         // synced state without a second wallet impl. The lock is held only long
-        // enough to clone the wallet Arc, not for the whole sync (which drives
-        // through ztest's own `sync_mode`, not the client's).
+        // enough to clone the wallet Arc, not for the whole sync.
         let wallet = client.lock().await.wallet().clone();
-        WalletSyncDriver::new(
-            wallet,
-            SyncTarget::in_topology(indexer_uri.as_ref()),
-            params,
-            sync_config,
-        )
-        .run_to_tip()
-        .await?;
+        let uri = indexer_uri
+            .parse::<http::Uri>()
+            .map_err(|e| format!("zingo: bad indexer uri {:?}: {e}", indexer_uri.as_ref()))?;
+        let indexer = GrpcIndexer::new(uri)
+            .await
+            .map_err(|e| format!("zingo: dial indexer: {e}"))?;
+        // pepper-sync leaves `sync_mode` `Running` on return and requires its
+        // consumer to reset it to `NotRunning`; a to-tip drive owns a fresh one.
+        let sync_mode = Arc::new(AtomicU8::new(SyncMode::NotRunning as u8));
+        pepper_sync::sync(indexer, &params, wallet, sync_mode.clone(), sync_config)
+            .await
+            .map_err(|e| format!("zingo: pepper-sync: {e}"))?;
+        sync_mode.store(SyncMode::NotRunning as u8, Ordering::Release);
         Ok(())
     }
 

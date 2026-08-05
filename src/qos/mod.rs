@@ -479,26 +479,62 @@ impl QosClass {
 
 // ── Runtime tier (the in-process bridge) ───────────────────────────────
 //
-// The `#[ztest::qos::*]` attribute injects `__enter(class)` first; `build()`
-// reads `current()` at its start (before any `.await` could migrate the future
-// off-thread) to size pods. A thread-local, not a task-local: nextest runs
-// process-per-test, mirroring `naming::current_test_name`.
+// The `#[ztest::qos::*]` / `#[ztest::sync_test]` attributes inject
+// `__enter(class)` as the body's first statement; `build()` reads `current()`
+// to size pods. The thread-local is the fast path, but a `flavor =
+// "multi_thread"` test (e.g. a sync profile) can migrate off the entering thread
+// across an `.await` before `build()` reads the tier — so `__enter` also stamps
+// a process-global backstop. That is sound because ztest runs strictly one test
+// per process (`process-per-test`, mirroring `naming::current_test_name`): the
+// last-entered tier is unambiguous process-wide.
 
 thread_local! {
-    static CURRENT: Cell<QosClass> = const { Cell::new(QosClass::Basic) };
+    static CURRENT: Cell<Option<QosClass>> = const { Cell::new(None) };
+}
+/// Process-global backstop for the thread-local (see the module note). `u8::MAX`
+/// sentinel = "no tier entered" (→ `Basic`).
+static CURRENT_GLOBAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Total, stable mapping to/from the global's `u8` (fieldless enum; kept explicit
+/// rather than a `repr(u8)` cast so adding a variant is a compile error here).
+fn tier_to_u8(class: QosClass) -> u8 {
+    match class {
+        QosClass::Basic => 0,
+        QosClass::Wallet => 1,
+        QosClass::Integration => 2,
+        QosClass::Testnet => 3,
+        QosClass::Sync => 4,
+    }
+}
+fn tier_from_u8(v: u8) -> Option<QosClass> {
+    Some(match v {
+        0 => QosClass::Basic,
+        1 => QosClass::Wallet,
+        2 => QosClass::Integration,
+        3 => QosClass::Testnet,
+        4 => QosClass::Sync,
+        _ => return None,
+    })
 }
 
-/// Set the current test's tier. Called by the `#[ztest::qos::*]` attribute as
-/// the test body's first statement; not meant to be called directly.
+/// Set the current test's tier. Called by the `#[ztest::qos::*]` /
+/// `#[ztest::sync_test]` attributes as the test body's first statement; not
+/// meant to be called directly.
 #[doc(hidden)]
 pub fn __enter(class: QosClass) {
-    CURRENT.with(|c| c.set(class));
+    CURRENT.with(|c| c.set(Some(class)));
+    CURRENT_GLOBAL.store(tier_to_u8(class), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The tier declared by the running test, or [`QosClass::Basic`] if none was
-/// declared. Read by `TestEnv::build()`.
+/// declared. Read by `TestEnv::build()`. Prefers the thread-local; falls back to
+/// the process-global backstop for off-thread reads.
 pub fn current() -> QosClass {
-    CURRENT.with(|c| c.get())
+    if let Some(c) = CURRENT.with(|c| c.get()) {
+        return c;
+    }
+    tier_from_u8(CURRENT_GLOBAL.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(QosClass::Basic)
 }
 
 #[cfg(test)]
@@ -725,12 +761,23 @@ mod tests {
     }
 
     #[test]
-    fn current_defaults_to_basic_and_enter_sets_it() {
-        // Default before any `__enter` on this thread.
-        assert_eq!(current(), QosClass::Basic);
+    fn enter_sets_current_tier_on_this_thread() {
+        // The thread-local fast path: entering a tier makes `current()` return
+        // it on the entering thread. (The cross-thread process-global backstop is
+        // a documented one-test-per-process invariant; asserting it under the
+        // parallel test harness would race other tests' `__enter`, so it is left
+        // to the mapping round-trip below plus the module contract.)
         __enter(QosClass::Testnet);
         assert_eq!(current(), QosClass::Testnet);
         __enter(QosClass::Sync);
         assert_eq!(current(), QosClass::Sync);
+    }
+
+    #[test]
+    fn tier_u8_mapping_round_trips_and_rejects_unknown() {
+        for c in ALL_TIERS {
+            assert_eq!(tier_from_u8(tier_to_u8(c)), Some(c));
+        }
+        assert_eq!(tier_from_u8(u8::MAX), None);
     }
 }

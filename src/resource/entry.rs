@@ -13,7 +13,9 @@ use crate::qos;
 use crate::resource::context::Cx;
 use crate::resource::graph::{Graph, GraphError};
 use crate::resource::impls::storage::StorageProfile;
-use crate::resource::impls::{buildkit, image, mirror, policy, scaffolding, seed, storage};
+use crate::resource::impls::{
+    buildkit, image, mirror, monitoring, policy, scaffolding, seed, storage,
+};
 use crate::resource::provider::{NodeId, Provider};
 use crate::resource::state::NodeState;
 
@@ -120,6 +122,9 @@ where
     if opts.backend.is_openshift() {
         graph.add_dedup(Box::new(buildkit::BuildkitProvider));
         graph.add_dedup(Box::new(mirror::ImageMirrorProvider));
+        // The metrics plane's cluster precondition: UWM must be enabled to scrape
+        // per-test component `/metrics`, and the run SA needs thanos read access.
+        graph.add_dedup(Box::new(monitoring::UserWorkloadMonitoringProvider));
     }
 
     graph.validate()?;
@@ -190,6 +195,44 @@ pub fn image_node_id(entry: &DevImageEntry) -> Result<NodeId, String> {
 /// node that provisioned it.
 pub fn seed_node_id(entry: &SeedEntry) -> NodeId {
     seed::SeedProvider::node_id(entry)
+}
+
+/// The build manifest `DevImageId → pull-reference` for a selection's dev
+/// images, given the post-provision node `states`.
+///
+/// Keyed by the path-free [`DevImageId`](crate::backends::image::DevImageId) —
+/// not the build-context bytes — so a separately-compiled in-pod test derives
+/// the same key and resolves the already-built reference instead of rebuilding
+/// from a Dockerfile the baked runner image doesn't carry. A component whose
+/// build FAILED is omitted (its dependent tests are already skipped). Shared by
+/// `ztest run` and the `ztest sync` controller so both forward an identical map
+/// via `ZTEST_IMAGE_REFS`.
+pub fn dev_image_refs(
+    images_by_binary: &[(String, Vec<DevImageEntry>)],
+    states: &std::collections::HashMap<NodeId, NodeState>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut refs = std::collections::BTreeMap::new();
+    for entry in images_by_binary.iter().flat_map(|(_, entries)| entries) {
+        if let Ok(id) = image_node_id(entry)
+            && matches!(states.get(&id), Some(NodeState::Failed(_)))
+        {
+            continue;
+        }
+        let rv = entry.rust_version.as_deref();
+        if let Ok(tag) =
+            crate::backends::image::dev_tag(&entry.source, &entry.features, &entry.repo, rv)
+        {
+            let key = crate::backends::image::DevImageId::of(
+                &entry.repo,
+                &entry.features,
+                rv,
+                &entry.source,
+            );
+            refs.entry(key.as_str().to_string())
+                .or_insert_with(|| crate::backends::image::pod_reference(&tag));
+        }
+    }
+    refs
 }
 
 /// Parent-side, by-identity teardown of a run's ephemeral resources: deletes

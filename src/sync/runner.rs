@@ -14,9 +14,11 @@ use tokio::time::{Instant, MissedTickBehavior, interval};
 
 use crate::cancel::Cancel;
 
-use super::probe::{Cadence, Class, ProbeBuilder, ProbeSpec, Severity, SyncCtx, Verdict, Violation};
+use super::probe::{
+    Cadence, Class, ProbeBuilder, ProbeSpec, ProbeStatus, Severity, SyncCtx, Verdict, Violation,
+};
 use super::snapshot::{History, Snapshot, SnapshotBuilder};
-use super::subject::SyncSubject;
+use super::subject::{SyncSubject, TreeRoots};
 
 /// The terminal result of a run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +61,10 @@ pub struct SyncOutcome {
     pub ticks: u64,
     /// Snapshots evicted by the history cap (a visible, non-silent truncation).
     pub dropped_snapshots: u64,
+    /// Server-side metrics read from thanos-querier at end-of-run (empty when
+    /// the metrics plane was unavailable). Populated by the facade after the
+    /// engine returns — the engine has no cluster handle of its own.
+    pub metrics: crate::metrics::MetricsSummary,
 }
 
 impl SyncOutcome {
@@ -70,6 +76,7 @@ impl SyncOutcome {
             error: Some(msg),
             ticks: 0,
             dropped_snapshots: 0,
+            metrics: crate::metrics::MetricsSummary::default(),
         }
     }
 }
@@ -98,6 +105,9 @@ pub trait SyncReporter: Send {
     fn on_tick(&mut self, _snap: &Snapshot) {}
     /// A probe evaluated to a non-`Satisfied` verdict worth surfacing.
     fn on_probe(&mut self, _name: &str, _verdict: &Verdict) {}
+    /// Every registered probe's live state, once per tick after evaluation — the
+    /// standing board, as opposed to [`on_probe`](Self::on_probe)'s edge events.
+    fn on_probes(&mut self, _snap: &Snapshot, _board: &[ProbeStatus]) {}
     /// The run finished.
     fn on_finish(&mut self, _outcome: &SyncOutcome) {}
 }
@@ -210,7 +220,7 @@ impl<S: SyncSubject> SyncEngine<S> {
 
     /// Replace the probe set (the facade registers probes on itself, then hands
     /// the whole set to the engine at run time).
-    #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
+    #[cfg_attr(not(feature = "librustzcash"), allow(dead_code))]
     pub(crate) fn with_probes(mut self, probes: Vec<ProbeSpec>) -> Self {
         self.probes = probes;
         self
@@ -306,7 +316,7 @@ impl<S: SyncSubject> SyncEngine<S> {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            let snap = Arc::new(builder.build(&progress, now, None));
+            let snap = Arc::new(builder.build(&progress, now, None, TreeRoots::default()));
             history.push(snap.clone());
             self.reporter.on_tick(&snap);
 
@@ -325,10 +335,21 @@ impl<S: SyncSubject> SyncEngine<S> {
                 }
             }
 
+            // The board is built before the reporter call so it holds no borrow
+            // of `self.probes` while `self.reporter` is borrowed mutably.
+            let board: Vec<ProbeStatus> =
+                self.probes.iter().map(|p| p.status(now, self.tick)).collect();
+            self.reporter.on_probes(&snap, &board);
+
             if self.subject.is_complete().await {
-                // Terminal: at_completion probes over a final snapshot.
+                // Terminal: at_completion probes over a final snapshot, enriched
+                // with the wallet's commitment-tree roots (the sync task has
+                // finished, so the wallet is static — the read cannot race the
+                // scan). A roots-read failure degrades to empty roots rather
+                // than aborting the whole run at the finish line.
                 if let Ok(p) = self.subject.progress().await {
-                    let final_snap = Arc::new(builder.build(&p, Instant::now(), None));
+                    let roots = self.subject.terminal_roots().await.unwrap_or_default();
+                    let final_snap = Arc::new(builder.build(&p, Instant::now(), None, roots));
                     if let Some(msg) = self.eval_at_completion(&final_snap, &mut violations).await {
                         error = Some(msg);
                     }
@@ -477,6 +498,8 @@ impl<S: SyncSubject> SyncEngine<S> {
             error,
             ticks,
             dropped_snapshots,
+            // Filled in by the facade after the engine returns.
+            metrics: crate::metrics::MetricsSummary::default(),
         };
         self.reporter.on_finish(&outcome);
         outcome

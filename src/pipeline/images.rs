@@ -9,7 +9,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use crate::inventory::{
-    DevImageEntry, InventoryLine, QosEntry, SeedEntry, SeedPayload, TestDepEntry,
+    DevImageEntry, InventoryLine, QosEntry, SeedEntry, SeedPayload, SyncTestEntry, TestDepEntry,
 };
 use crate::pipeline::build::SelectedBinary;
 
@@ -20,6 +20,7 @@ pub(crate) struct Dumped {
     qos: Vec<QosEntry>,
     seeds: Vec<SeedEntry>,
     deps: Vec<TestDepEntry>,
+    sync_tests: Vec<SyncTestEntry>,
 }
 
 /// Demux one binary's `ZTEST_DUMP_INVENTORY=1` stdout (tagged JSON-lines) into
@@ -36,9 +37,11 @@ pub(crate) fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
             Ok(InventoryLine::Qos(q)) => dumped.qos.push(q),
             Ok(InventoryLine::Seed(s)) => dumped.seeds.push(s),
             Ok(InventoryLine::Dep(d)) => dumped.deps.push(d),
-            // Sync-test declarations are consumed by the `ztest sync` path, not
-            // by `ztest run`'s image/seed/qos discovery.
-            Ok(InventoryLine::SyncTest(_)) => {}
+            // Sync-test declarations feed the `ztest sync` controller: `start`
+            // resolves a profile name → its `test_id` (hence binary + libtest
+            // test) from these; `ztest run`'s image/seed/qos discovery ignores
+            // them (they carry no resources).
+            Ok(InventoryLine::SyncTest(s)) => dumped.sync_tests.push(s),
             Err(e) => return Err(format!("malformed inventory line `{line}`: {e}")),
         }
     }
@@ -63,6 +66,10 @@ pub enum DumpOutcome {
         /// sound per-test seed edge. Binary-scoped because `test_id`s can collide
         /// across binaries.
         deps_by_binary: Vec<(String, Vec<TestDepEntry>)>,
+        /// `#[ztest::sync_test]` profiles across the selection (deduped by
+        /// `test_id`). The `ztest sync` controller resolves a profile name to its
+        /// binary + libtest test from these; `ztest run` ignores them.
+        sync_tests: Vec<SyncTestEntry>,
     },
     /// One or more binaries failed to dump (non-zero exit, stderr captured). The
     /// CLI surfaces this and aborts before provisioning.
@@ -105,6 +112,8 @@ pub(crate) fn assemble(
     let mut qos_by_binary: Vec<(String, Vec<QosEntry>)> = Vec::new();
     let mut images_by_binary: Vec<(String, Vec<DevImageEntry>)> = Vec::new();
     let mut deps_by_binary: Vec<(String, Vec<TestDepEntry>)> = Vec::new();
+    let mut seen_sync: BTreeSet<String> = BTreeSet::new();
+    let mut sync_tests: Vec<SyncTestEntry> = Vec::new();
 
     for (bin, dumped) in binaries.iter().zip(dumps) {
         let Dumped {
@@ -112,6 +121,7 @@ pub(crate) fn assemble(
             qos,
             seeds: s,
             deps,
+            sync_tests: syncs,
         } = dumped;
         // Per-binary images, deduped within the binary (the binary edge).
         let mut seen_bin_img: BTreeSet<DedupKey> = BTreeSet::new();
@@ -138,6 +148,13 @@ pub(crate) fn assemble(
         if !deps.is_empty() {
             deps_by_binary.push((bin.binary_id.clone(), deps));
         }
+        // Sync profiles dedup by `test_id` across binaries (a profile is defined
+        // once, but a shared helper crate could link it into several binaries).
+        for st in syncs {
+            if seen_sync.insert(st.test_id.clone()) {
+                sync_tests.push(st);
+            }
+        }
     }
     (
         DumpOutcome::Discovered {
@@ -145,6 +162,7 @@ pub(crate) fn assemble(
             seeds,
             images_by_binary,
             deps_by_binary,
+            sync_tests,
         },
         qos_by_binary,
     )
