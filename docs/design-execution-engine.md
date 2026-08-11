@@ -19,7 +19,7 @@ snapshots; the render thread owns all terminal bridging.
 | `exec.rs` | process-per-test spawn, capture, timeout/termination, verdict |
 | `loop.rs` | the run loop: `Scheduler` ↔ exec workers ↔ events |
 | `event.rs` | `EngineEvent` — the live stream |
-| `report.rs` | `EngineEvent` → render (built on `preflight/render.rs` + `theme.rs`) |
+| `report.rs` | `EngineEvent` → render (built on `ui/render.rs` + `ui/theme.rs`) |
 
 The pure scheduling core lives in `qos/scheduler.rs` (`Scheduler`); the engine
 is the I/O shell around it. See [design-qos.md](design-qos.md) for the
@@ -84,8 +84,7 @@ forked-but-blocked OS processes.
 
 The engine `Scheduler` is a local pre-gate: it won't spawn a test it doesn't
 expect to fit, so the `TestEnv::build()` admit usually succeeds immediately. The
-authoritative cross-run ledger (the k8s-Lease `Allocator`, `qos/allocator.rs` /
-`qos/kube_store.rs`) still arbitrates between concurrent `ztest run` invocations
+authoritative cross-run ledger (the k8s-Lease reservation in `qos/ledger.rs`) still arbitrates between concurrent `ztest run` invocations
 — see [design-qos.md](design-qos.md). Test identity (`NEXTEST_BINARY_ID` /
 `NEXTEST_TEST_NAME`) is set by the engine at spawn; `env.rs` consumes those vars.
 

@@ -1,18 +1,22 @@
-//! Content-addressed archive PVCs and the cross-namespace clone.
+//! Content-addressed archive PVCs and the cross-namespace binding.
 //!
-//! See `docs/architecture-overview.md#seeds-content-addressed-archive-pvcs`.
+//! See `docs/design-architecture.md#seeds-content-addressed-archive-pvcs`.
 //!
 //! - The seed PVC lives in `ztest-seeds`, named `seed-{sha8}`, paired with
 //!   a `VolumeSnapshot` of the same name.
-//! - To use a seed from a test namespace we mint a shadow VSC
-//!   (cluster-scoped) sharing the CSI snapshot handle, plus a shadow
-//!   VolumeSnapshot (namespaced) referencing it. The test's PVC
-//!   `dataSource` points at the shadow snapshot.
+//! - To use a seed from a test namespace we bind it there: a
+//!   `VolumeSnapshotContent` (cluster-scoped) pre-provisioned around the
+//!   seed's existing CSI snapshot handle, plus a `VolumeSnapshot`
+//!   (namespaced) bound to it. The test's PVC `dataSource` points at that
+//!   namespaced snapshot. This is the static-provisioning half of the same
+//!   bind that `PersistentVolume` / `PersistentVolumeClaim` perform: the two
+//!   objects are a name pair over storage that already exists. No data is
+//!   copied here — every binding for a given seed shares one backend
+//!   snapshot, which is why the content carries `deletionPolicy: Retain`.
+//!   The copy happens one layer down, when a PVC clones from the binding.
 //! - Materialization (uploading bytes to the seed PVC on first use) lives
 //!   in `materialize`, not here. This file resolves against a
 //!   pre-published seed.
-
-use std::path::Path;
 
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, PostParams};
@@ -24,15 +28,14 @@ use crate::error::env_err;
 
 pub const SEEDS_NAMESPACE: &str = "ztest-seeds";
 
-/// 8 lowercase-hex characters: the content-address prefix we name PVCs by.
+/// Name prefix shared by both halves of a seed binding.
 ///
-/// Delegates to [`crate::storage::content_sha8`], which resolves the address
-/// without transferring the bytes: a real file is hashed, a Git LFS pointer
-/// yields its OID prefix (`sha256(.tar.*)` either way, so the id is stable
-/// whether the blob is on disk or still on the LFS server).
-pub fn sha8(path: &Path) -> Result<String, std::io::Error> {
-    crate::storage::content_sha8(path).map_err(std::io::Error::other)
-}
+/// The cluster-scoped content half is `Retain` and owner-ref-less, so a run
+/// killed mid-test strands it; `ztest snapshot prune` sweeps those orphans by
+/// this prefix when their labels are the only other handle. A constant rather
+/// than an inline literal because the sweep and the constructor going out of
+/// sync is exactly the bug that makes an orphan unreapable forever.
+pub(crate) const BINDING_PREFIX: &str = "seed-binding-";
 
 /// `(VolumeSnapshot in ztest-seeds, the CSI snapshot handle)`.
 #[derive(Debug, Clone)]
@@ -41,14 +44,22 @@ pub struct SeedHandle {
     pub seed_pvc: String,
     pub seed_snapshot: String,
     pub csi_handle: String,
+    /// The snapshot's `status.restoreSize` — the floor for any PVC restored
+    /// from it. A clone that requests less is rejected outright by the CSI
+    /// driver (`OutOfRange: requested size is smaller than the size of the
+    /// source`), so this travels with the handle rather than being restated
+    /// at the call site: the two values must agree, and the only way to keep
+    /// them agreeing is for there to be one of them.
+    pub restore_size: String,
 }
 
 /// Read the CSI snapshot handle for an already-published seed. Assumes the
 /// PVC is `ready=true` and the paired VolumeSnapshot is bound;
-/// `materialize::ensure_seed` guarantees both before calling this.
+/// `materialize::provision_seed` / `await_seed` guarantee both before calling
+/// this. `archive` names the artifact for diagnostics only.
 pub async fn read_seed_handle(
     client: &Client,
-    source: &Path,
+    archive: &str,
     sha8: &str,
 ) -> Result<SeedHandle, EnvError> {
     let pvc_name = format!("seed-{sha8}");
@@ -60,13 +71,13 @@ pub async fn read_seed_handle(
         .await
         .map_err(env_err)?
         .ok_or_else(|| EnvError::ArchiveMaterializeFailed {
-            archive: source.to_path_buf(),
+            archive: archive.to_string(),
             reason: format!("seed VolumeSnapshot {SEEDS_NAMESPACE}/{pvc_name} missing"),
         })?;
     let bound_vsc_name = snap.data["status"]["boundVolumeSnapshotContentName"]
         .as_str()
         .ok_or_else(|| EnvError::ArchiveMaterializeFailed {
-            archive: source.to_path_buf(),
+            archive: archive.to_string(),
             reason: "seed snapshot not yet bound to content".into(),
         })?
         .to_string();
@@ -77,44 +88,71 @@ pub async fn read_seed_handle(
     let csi_handle = vsc.data["status"]["snapshotHandle"]
         .as_str()
         .ok_or_else(|| EnvError::ArchiveMaterializeFailed {
-            archive: source.to_path_buf(),
+            archive: archive.to_string(),
             reason: "bound content has no snapshotHandle".into(),
         })?
         .to_string();
+
+    // The provisioned seed volume, as the driver will report it when a clone
+    // asks to restore from this snapshot. Falling back to the configured seed
+    // size keeps a driver that omits `restoreSize` working, since that is the
+    // size the seed PVC was requested at in the first place.
+    let restore_size = snap.data["status"]["restoreSize"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(crate::materialize::seed_size);
 
     let handle = SeedHandle {
         sha8: sha8.to_string(),
         seed_pvc: pvc_name.clone(),
         seed_snapshot: pvc_name,
         csi_handle,
+        restore_size,
     };
     tracing::info!(
         sha8 = %handle.sha8,
         seed_pvc = %handle.seed_pvc,
         seed_snapshot = %handle.seed_snapshot,
         csi_handle = %handle.csi_handle,
+        restore_size = %handle.restore_size,
         "resolved seed handle"
     );
     Ok(handle)
 }
 
-/// Create the shadow VolumeSnapshotContent (cluster-scoped) + the
-/// in-namespace VolumeSnapshot that references it. Returns the
-/// in-namespace snapshot name, which is the `dataSource` for the test PVC.
+/// Bind a published seed into a test namespace: a pre-provisioned
+/// VolumeSnapshotContent (cluster-scoped) around the seed's CSI snapshot
+/// handle, plus the in-namespace VolumeSnapshot bound to it. The returned
+/// snapshot name is the `dataSource` for the test's PVC.
 ///
-/// The cluster-scoped VSC cannot ownerRef back to the namespaced sentinel
+/// The cluster-scoped content cannot ownerRef back to the namespaced sentinel
 /// (k8s GC won't cross scopes), so the library deletes it explicitly on
-/// teardown; see `delete_shadow`.
-pub async fn mint_shadow_clone(
+/// teardown; see [`delete_binding`].
+pub async fn bind_seed(
     client: &Client,
     sentinel: &Sentinel,
     seed: &SeedHandle,
     suffix: &str,
-) -> Result<ShadowClone, EnvError> {
-    // Unique-per-test to avoid collisions across slots and concurrent
-    // tests in the same slot.
-    let shadow_vsc = format!("shadow-vsc-{}-{}", seed.sha8, suffix);
-    let shadow_snap = format!("shadow-snap-{}-{}", seed.sha8, suffix);
+) -> Result<SeedBinding, EnvError> {
+    // `suffix` is the consuming pod's prefix and ordinal (`zebrad-1`) — it
+    // disambiguates mounts *within* one test and nothing more. The namespace is
+    // what makes the content name unique, and it is load-bearing rather than
+    // decorative: a VolumeSnapshotContent is cluster-scoped, so two concurrent
+    // tests mounting the same fixture on a like-named pod would otherwise
+    // collide on one global name and the loser would fail with a 409
+    // `AlreadyExists`. That is deterministic for any parallel run sharing a
+    // fixture, not a race that needs bad luck. The namespace already carries a
+    // per-test random suffix (see `naming::namespace_for`), so it supplies the
+    // uniqueness for free — and it makes a stranded content self-describing:
+    // its name says which test leaked it even if the labels are unreadable.
+    //
+    // The snapshot half needs no namespace in its name: it *is* namespaced, so
+    // the scope that the content has to encode is already implicit.
+    let binding_content = format!(
+        "{BINDING_PREFIX}{}-{}-{}",
+        seed.sha8, sentinel.namespace, suffix
+    );
+    let binding_snapshot = format!("{BINDING_PREFIX}{}-{}", seed.sha8, suffix);
 
     // VSC first: cluster-scoped, no owner.
     let vsc_gvk = volume_snapshot_content_gvk();
@@ -138,7 +176,7 @@ pub async fn mint_shadow_clone(
         "apiVersion": "snapshot.storage.k8s.io/v1",
         "kind": "VolumeSnapshotContent",
         "metadata": {
-            "name": shadow_vsc,
+            "name": binding_content,
             "labels": {
                 "ztest.io/run-id": run_id,
                 "ztest.io/user": user,
@@ -151,7 +189,7 @@ pub async fn mint_shadow_clone(
             "source": { "snapshotHandle": seed.csi_handle },
             "sourceVolumeMode": "Filesystem",
             "volumeSnapshotRef": {
-                "name": shadow_snap,
+                "name": binding_snapshot,
                 "namespace": sentinel.namespace,
             },
             "volumeSnapshotClassName": detect_snapshot_class(),
@@ -172,10 +210,10 @@ pub async fn mint_shadow_clone(
         "apiVersion": "snapshot.storage.k8s.io/v1",
         "kind": "VolumeSnapshot",
         "metadata": {
-            "name": shadow_snap,
+            "name": binding_snapshot,
         },
         "spec": {
-            "source": { "volumeSnapshotContentName": shadow_vsc },
+            "source": { "volumeSnapshotContentName": binding_content },
             "volumeSnapshotClassName": detect_snapshot_class(),
         }
     });
@@ -185,53 +223,62 @@ pub async fn mint_shadow_clone(
         .await
         .map_err(env_err)?;
 
-    let clone = ShadowClone {
-        shadow_vsc_name: shadow_vsc,
-        shadow_snapshot_name: shadow_snap,
+    let binding = SeedBinding {
+        binding_content,
+        binding_snapshot,
         namespace: sentinel.namespace.clone(),
     };
     tracing::info!(
         seed_sha8 = %seed.sha8,
-        vsc = %clone.shadow_vsc_name,
-        snapshot = %clone.shadow_snapshot_name,
-        namespace = %clone.namespace,
-        "minted shadow clone"
+        content = %binding.binding_content,
+        snapshot = %binding.binding_snapshot,
+        namespace = %binding.namespace,
+        "bound seed into test namespace"
     );
-    Ok(clone)
+    Ok(binding)
 }
 
-/// What `mint_shadow_clone` hands back. The library tracks these in
-/// `TestEnv` so the shadow VSC can be deleted explicitly on teardown.
+/// What [`bind_seed`] hands back: the two objects that together bind one
+/// published seed into one test namespace. The library tracks these in
+/// `TestEnv` so the cluster-scoped content half can be deleted explicitly at
+/// teardown — the namespaced half goes with the namespace.
 #[derive(Debug, Clone)]
-pub struct ShadowClone {
-    pub shadow_vsc_name: String,
-    pub shadow_snapshot_name: String,
+pub struct SeedBinding {
+    /// The cluster-scoped `VolumeSnapshotContent`, pre-provisioned around the
+    /// snapshot handle the seed already owns.
+    pub binding_content: String,
+    /// The namespaced `VolumeSnapshot` bound to it — the test PVC's
+    /// `dataSource`.
+    pub binding_snapshot: String,
     pub namespace: String,
 }
 
-/// Best-effort deletion of the cluster-scoped shadow VSC. The namespaced
-/// shadow VolumeSnapshot cascades via the sentinel ownerRef.
-pub async fn delete_shadow(client: &Client, shadow: &ShadowClone) -> Result<(), EnvError> {
+/// Best-effort deletion of the cluster-scoped content half. The namespaced
+/// snapshot half cascades with the test namespace.
+///
+/// This never destroys data: the content is `deletionPolicy: Retain`, so the
+/// backend snapshot the seed owns outlives every binding taken against it.
+pub async fn delete_binding(client: &Client, binding: &SeedBinding) -> Result<(), EnvError> {
     let vsc_gvk = volume_snapshot_content_gvk();
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &vsc_gvk);
     match api
-        .delete(&shadow.shadow_vsc_name, &Default::default())
+        .delete(&binding.binding_content, &Default::default())
         .await
     {
         Ok(_) => {
             tracing::info!(
-                vsc = %shadow.shadow_vsc_name,
-                snapshot = %shadow.shadow_snapshot_name,
-                namespace = %shadow.namespace,
-                "deleted shadow clone"
+                content = %binding.binding_content,
+                snapshot = %binding.binding_snapshot,
+                namespace = %binding.namespace,
+                "deleted seed binding"
             );
             Ok(())
         }
         Err(kube::Error::Api(e)) if e.code == 404 => {
             tracing::debug!(
-                vsc = %shadow.shadow_vsc_name,
-                namespace = %shadow.namespace,
-                "shadow VSC already gone"
+                content = %binding.binding_content,
+                namespace = %binding.namespace,
+                "seed binding content already gone"
             );
             Ok(())
         }
@@ -255,7 +302,7 @@ pub(crate) fn volume_snapshot_content_gvk() -> ApiResource {
     })
 }
 
-/// CSI driver name for the shadow `VolumeSnapshotContent`. This must equal
+/// CSI driver name for a binding's `VolumeSnapshotContent`. This must equal
 /// the driver that backs the seed's snapshot; it's the one value we can't
 /// alias by name (the StorageClass / VolumeSnapshotClass names we do keep
 /// identical across Ceph and kind).

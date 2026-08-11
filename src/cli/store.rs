@@ -73,10 +73,7 @@ fn list() -> Result<(), String> {
             .map(|m| m.started_at)
             .unwrap_or_else(|_| "?".to_string());
         let summary = match record::final_stats(&run.dir) {
-            Ok(Some(s)) => format!(
-                "{} passed, {} failed, {} skipped",
-                s.passed, s.failed, s.skipped
-            ),
+            Ok(Some(s)) => plain_tally(&s),
             Ok(None) => "incomplete".to_string(),
             Err(_) => "unreadable".to_string(),
         };
@@ -99,16 +96,24 @@ fn info(sel: &RunSelector) -> Result<(), String> {
     println!("path:       {}", dir.display());
     match record::final_stats(&dir).map_err(|e| e.to_string())? {
         Some(s) => println!(
-            "result:     {} passed, {} failed, {} skipped ({} of {} run)",
-            s.passed,
-            s.failed,
-            s.skipped,
-            s.finished(),
+            "result:     {} ({} of {} run)",
+            plain_tally(&s),
+            s.ran(),
             s.total
         ),
         None => println!("result:     incomplete (no RunFinished recorded)"),
     }
     Ok(())
+}
+
+/// The run's tally, un-styled — the same terms and omit-rule the live summary
+/// line uses ([`RunStats::tally`]).
+fn plain_tally(s: &crate::engine::events::RunStats) -> String {
+    s.tally()
+        .into_iter()
+        .map(|(n, word)| format!("{n} {word}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn export(sel: &RunSelector, out: &std::path::Path) -> Result<(), String> {

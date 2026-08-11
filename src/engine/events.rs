@@ -1,7 +1,6 @@
 //! The lifecycle events the run loop emits and the [`RunReporter`] trait it
 //! drives — a ztest-native vocabulary mapping one-to-one onto nextest's
 //! `TestEventKind`. [`StyledReporter`](crate::engine::reporter::StyledReporter)
-//! renders them; [`NullReporter`] discards them.
 
 use std::time::Duration;
 
@@ -84,21 +83,71 @@ pub struct RunStats {
     pub passed: u32,
     /// Tests that finished failing (after exhausting retries).
     pub failed: u32,
-    /// Tests skipped without running (e.g. unschedulable).
+    /// Tests killed in flight by the run's cancellation
+    /// ([`Verdict::Terminated`]).
+    ///
+    /// nextest has no equivalent: it renders a signal death as
+    /// `Fail { Abort { UnixSignal } }` and folds it into `failed`. That is right
+    /// for a test the *kernel* killed (SIGSEGV, SIGABRT) but wrong for one the
+    /// operator killed — the test never reached a verdict, so calling it a
+    /// failure blames the code for the Ctrl-C. nextest's own tally already
+    /// splits `exec failed` and `timed out` out of `failed` on exactly this
+    /// principle; this is the same split for the cause nextest lacks a verdict
+    /// for.
+    #[serde(default)]
+    pub terminated: u32,
+    /// Tests skipped without running (e.g. unschedulable). As in nextest, this
+    /// does *not* include tests that were still queued when a run was cancelled
+    /// — those are `total - ran()`, reported by the not-run warning.
     pub skipped: u32,
     /// Total tests in the work-list.
     pub total: usize,
 }
 
 impl RunStats {
-    /// Tests that have reached a terminal state (passed, failed, or skipped).
+    /// Tests that have reached a terminal state (ran to a verdict, or skipped).
     pub fn finished(&self) -> u32 {
-        self.passed + self.failed + self.skipped
+        self.ran() + self.skipped
     }
 
-    /// Whether the run should exit non-zero (any test failed).
+    /// Tests that actually executed — the numerator of the summary's
+    /// `ran/total` ratio, matching nextest's `finished_count` (which likewise
+    /// excludes skips, since nextest filters them out of its initial count).
+    pub fn ran(&self) -> u32 {
+        self.passed + self.failed + self.terminated
+    }
+
+    /// Tests that never started: the work-list minus everything that ran or was
+    /// skipped. Non-zero only when a run closed short (cancellation, fail-fast).
+    pub fn not_run(&self) -> u32 {
+        (self.total as u32).saturating_sub(self.finished())
+    }
+
+    /// Whether the run should exit non-zero.
+    ///
+    /// A terminated test counts: it never reached a verdict, so the run cannot
+    /// be called green just because nothing had failed yet when Ctrl-C landed.
     pub fn any_failed(&self) -> bool {
-        self.failed > 0
+        self.failed > 0 || self.terminated > 0
+    }
+
+    /// The summary tally terms, in display order.
+    ///
+    /// `passed` and `skipped` are always present; `failed` and `sigkilled` only
+    /// when non-zero — nextest's `write_summary_str` convention
+    /// (`displayer/progress.rs`), which omits its own zero-valued `failed` /
+    /// `exec failed` / `timed out` terms. Shared by the styled reporter tail and
+    /// the plain `ztest store` listings so the omit-rule lives in one place.
+    pub fn tally(&self) -> Vec<(u32, &'static str)> {
+        let mut terms = vec![(self.passed, "passed")];
+        if self.failed > 0 {
+            terms.push((self.failed, "failed"));
+        }
+        if self.terminated > 0 {
+            terms.push((self.terminated, "sigkilled"));
+        }
+        terms.push((self.skipped, "skipped"));
+        terms
     }
 }
 
@@ -180,11 +229,13 @@ pub trait RunReporter {
     fn take_scrollback(&mut self) -> Vec<u8>;
 }
 
-/// A reporter that discards everything: a sink for tests and a safe default.
-/// The real output reporter is [`StyledReporter`](crate::engine::reporter::StyledReporter).
+/// A reporter that discards everything: the sink the scheduler tests drive.
+/// The shipping reporter is [`StyledReporter`](crate::engine::reporter::StyledReporter).
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct NullReporter;
 
+#[cfg(test)]
 impl RunReporter for NullReporter {
     fn handle(&mut self, _ev: &TestEvent<'_>) {}
     fn take_scrollback(&mut self) -> Vec<u8> {
@@ -201,6 +252,7 @@ mod tests {
         let s = RunStats {
             passed: 3,
             failed: 1,
+            terminated: 0,
             skipped: 2,
             total: 6,
         };

@@ -35,15 +35,13 @@ impl Fixture {
     }
 
     /// Write `body` as an executable script and return its path.
+    ///
+    /// Atomic via [`write_script`]: these tests run many children concurrently,
+    /// and a fork landing inside a plain write would leave the child holding a
+    /// write handle to a script some other test is about to execute.
     fn script(&self, name: &str, body: &str) -> PathBuf {
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
         let path = self.dir.join(format!("{name}.sh"));
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(f, "#!/bin/sh\n{body}\n").unwrap();
-        let mut perms = f.metadata().unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        crate::engine::local_runner::write_script(&path, body);
         path
     }
 

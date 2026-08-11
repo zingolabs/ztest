@@ -1,46 +1,45 @@
-//! Where a seed's bytes come from, decoupled from how they're materialised.
+//! Where a seed's bytes come from: the snapshot bucket, addressed by OID.
 //!
-//! A seed source (the macro-baked absolute path from `#[ztest::archive]` /
-//! `mount_file!`) is one of two things, decided **per file by content**, not by
-//! configuration:
-//!   - a real archive/blob on disk — dev-authored, or already `git lfs pull`ed —
-//!     handled by [`local::Local`], streamed straight off disk;
-//!   - a Git LFS pointer whose blob is absent, handled by [`lfs::Lfs`], fetched
-//!     from the configured LFS server (rudolfs) over the batch API.
+//! There is one source. A seed is a Git LFS object, its identity is the OID
+//! baked into the [`ArchiveHandle`](crate::ArchiveHandle) at compile time, and
+//! its bytes live at `lfs/<oid>` in [`r2::Bucket`]. Nothing here takes a path,
+//! reads a local file, or sniffs content to decide what kind of thing it is
+//! looking at.
 //!
-//! The content address is the same either way: `seeds::sha8` names the PVC by
-//! the SHA-256 of the `.tar.*` bytes, and an LFS pointer's OID *is* that
-//! SHA-256. So [`content_sha8`] resolves a pointer's seed id with no transfer,
-//! and a laptop that has run `git lfs pull` takes the [`local`] path to the very
-//! same `seed-{sha8}` a cold CI run fetches from LFS. Env only says *where* the
-//! LFS server is, never *whether* to use LFS — that's the pointer's own doing.
+//! # Why the bytes never pass through this process
 //!
-//! The one axis of variation is the byte source; [`for_source`] selects it.
-//! Materialisation (uploader pod, snapshot, shadow clone) is downstream in
-//! [`crate::materialize`] and never sees which backend produced the bytes.
+//! They used to: a `Local` backend streamed an on-disk archive, and the client
+//! copied it into the uploader pod's stdin. That made the *caller* responsible
+//! for holding the bytes — which works on a laptop and fails everywhere else.
+//! The runner pod that actually reaches `TestEnv::build()` has no checkout, no
+//! archive, and no business holding bucket credentials, so a client-mediated
+//! transfer could not work there by construction.
+//!
+//! So this module hands out a **presigned GET URL** ([`r2::Bucket::presigned_get`])
+//! and nothing else. The puller Job in [`crate::materialize`] fetches that URL
+//! itself, node-local, at cluster bandwidth. Credentials stay with the process
+//! that has them; the multi-GB stream never enters ztest's address space, in
+//! either direction.
 
-use std::path::Path;
+pub(crate) mod r2;
 
-use async_trait::async_trait;
-
-mod lfs;
-mod local;
-
-pub use lfs::Lfs;
-pub use local::Local;
-
-/// The archive/blob bytes as an owned async stream: what `materialize` pipes
-/// into the seed uploader pod's stdin. Local backends yield a file; the LFS
-/// backend yields the HTTP download body.
+/// A blob's bytes as an owned async stream.
+///
+/// Used only by `ztest lfs-transfer` — the Git LFS custom transfer agent, which
+/// runs on a machine that is *supposed* to hold the bytes because the user
+/// asked for `git lfs pull`. Seed materialisation deliberately does not use it:
+/// there, the bytes go R2 → node without passing through this process.
 pub type ByteSource = std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>;
 
-/// Compression of a `tar` archive seed. Detected without reading the bytes
-/// (filename first, then magic bytes for on-disk files), so the uploader pod's
-/// `tar` command is fixed before the byte stream opens.
+/// Compression of a `tar` archive seed, derived from the artifact's filename.
 ///
-/// GNU `tar` can't auto-detect compression on a non-seekable stdin pipe (it
-/// errors `Use -z/-J option`), which is exactly how the uploader is fed — hence
-/// we resolve it here and pass the explicit flag.
+/// GNU `tar` can't auto-detect compression on a non-seekable pipe (it errors
+/// `Use -z/-J option`), and the puller feeds it exactly that — a `curl` body —
+/// so the flag is resolved here and spliced into the command.
+///
+/// The name is authoritative because it is the *manifest's* record of the
+/// artifact, not a guess: there is no local blob to sniff magic bytes from, by
+/// design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     Gzip,
@@ -52,8 +51,8 @@ pub enum Compression {
 
 impl Compression {
     /// The `tar` decompression flag (with trailing space), for splicing into the
-    /// uploader command. The matching decompressor binary must exist in the
-    /// uploader image; see `materialize::detect_uploader_image`.
+    /// puller command. The matching decompressor binary must exist in the
+    /// puller image; see `materialize::detect_puller_image`.
     pub fn tar_flag(self) -> &'static str {
         match self {
             Compression::Gzip => "-z ",
@@ -65,103 +64,23 @@ impl Compression {
     }
 }
 
-/// The one axis of variation in producing a seed's bytes: the source backend.
-/// [`for_source`] selects one per file by sniffing for an LFS pointer.
-#[async_trait]
-pub trait StorageBackend: Send + Sync + std::fmt::Debug {
-    /// The archive's compression, resolved without transferring any bytes so the
-    /// uploader command can be built before [`open`](Self::open). Meaningful only
-    /// for `tar` archives; file seeds ignore it.
-    fn compression(&self) -> Result<Compression, StorageError>;
-
-    /// Open the seed's real (still-compressed) bytes for streaming. For LFS this
-    /// runs the batch API and starts the blob GET, so it is deferred until the
-    /// uploader pod is scheduled and ready to receive on stdin.
-    async fn open(&self) -> Result<ByteSource, StorageError>;
+/// The 8-hex content address a seed's PVC and VolumeSnapshot are named for
+/// (`seed-<this>`): the first 8 characters of the archive's OID.
+///
+/// A pure function of data already baked into the handle — no I/O, no
+/// fallibility. Every process in a run derives the same name from the same
+/// compile-time constant, which is the property the old path-hashing version
+/// could not offer.
+pub fn seed_sha8(oid: &str) -> &str {
+    &oid[..8]
 }
 
-/// Select the backend for a seed source by content: an LFS pointer routes to
-/// [`Lfs`] (resolving the server endpoint now, so a pointer with no configured
-/// server fails fast), anything else to [`Local`].
-pub fn for_source(source: &Path) -> Result<Box<dyn StorageBackend>, StorageError> {
-    match read_pointer(source)? {
-        Some(pointer) => Ok(Box::new(Lfs::resolve(source, pointer)?)),
-        None => Ok(Box::new(Local::new(source))),
-    }
-}
-
-/// The 8-hex content address (`seed-<this>`) of a source **without** fetching
-/// it: an LFS pointer's OID prefix, else the SHA-256 of the on-disk bytes. Both
-/// are `sha256(.tar.*)`, so the id is stable across backends.
-pub fn content_sha8(source: &Path) -> Result<String, StorageError> {
-    match read_pointer(source)? {
-        Some(pointer) => Ok(pointer.oid[..8].to_string()),
-        None => Ok(local::sha256_hex(source)?[..8].to_string()),
-    }
-}
-
-// ─────────────────────────── LFS pointer ────────────────────────────
-
-/// The first line of every Git LFS pointer file (the v1 spec). Its presence is
-/// how we tell a pointer from a real archive whose first bytes are binary magic.
-const POINTER_MAGIC: &[u8] = b"version https://git-lfs.github.com/spec/v1";
-
-/// A parsed Git LFS pointer: the content OID (SHA-256 of the real bytes) and the
-/// real byte length. Both come straight from the committed pointer file.
-#[derive(Debug, Clone)]
-pub struct Pointer {
-    /// 64-hex SHA-256 of the archive bytes — identical to `seeds::sha8`'s digest.
-    pub oid: String,
-    /// The real (post-fetch) size in bytes, from the pointer's `size` line.
-    pub size: u64,
-}
-
-/// Read `source` as an LFS pointer, or `None` if it's a real file. Only the
-/// leading bytes are read; a multi-GB archive is never slurped to classify it.
-fn read_pointer(source: &Path) -> Result<Option<Pointer>, StorageError> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(source).map_err(|e| StorageError::io(source, e))?;
-    // A valid pointer is small (~130 bytes); a real archive's first KiB is
-    // binary and won't parse. Reading a fixed prefix bounds both.
-    let mut head = [0u8; 1024];
-    let n = f.read(&mut head).map_err(|e| StorageError::io(source, e))?;
-    let head = &head[..n];
-    if !head.starts_with(POINTER_MAGIC) {
-        return Ok(None);
-    }
-    let text = std::str::from_utf8(head)
-        .map_err(|_| StorageError::PointerParse(source.display().to_string()))?;
-    parse_pointer(text)
-        .map(Some)
-        .ok_or_else(|| StorageError::PointerParse(source.display().to_string()))
-}
-
-/// Parse the `oid sha256:<hex>` and `size <n>` lines of a pointer body. Returns
-/// `None` if either is absent or malformed.
-fn parse_pointer(text: &str) -> Option<Pointer> {
-    let mut oid = None;
-    let mut size = None;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("oid sha256:") {
-            let hex = rest.trim();
-            if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                oid = Some(hex.to_ascii_lowercase());
-            }
-        } else if let Some(rest) = line.strip_prefix("size ") {
-            size = rest.trim().parse::<u64>().ok();
-        }
-    }
-    Some(Pointer {
-        oid: oid?,
-        size: size?,
-    })
-}
-
-/// Compression from a filename extension — backend-independent and byte-free.
-/// The seed source keeps its real name even as an LFS pointer, so this is the
-/// primary detector; on-disk files add a magic-byte fallback in [`Local`].
-pub(crate) fn compression_from_ext(source: &Path) -> Option<Compression> {
-    let name = source.file_name()?.to_str()?.to_ascii_lowercase();
+/// Compression from the artifact's filename — the only detector there is.
+///
+/// There is no magic-byte fallback because there is no local blob to sniff:
+/// the name comes from the manifest, and the bytes are in the bucket.
+pub(crate) fn compression_from_name(name: &str) -> Option<Compression> {
+    let name = name.to_ascii_lowercase();
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         Some(Compression::Gzip)
     } else if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
@@ -179,51 +98,35 @@ pub(crate) fn compression_from_ext(source: &Path) -> Option<Compression> {
 
 // ─────────────────────────── errors ─────────────────────────────────
 
-/// Failures resolving or reading a seed's bytes. Mapped to
-/// `EnvError::ArchiveMaterializeFailed` (with the source path) at the
-/// `materialize` call sites, and to `io::Error` by `seeds::sha8`.
+/// Failures resolving a seed's bytes. Mapped to
+/// `EnvError::ArchiveMaterializeFailed` (naming the artifact) at the
+/// `materialize` call sites.
 #[derive(Debug)]
 pub enum StorageError {
-    /// Reading the source file (or its pointer prefix) failed.
-    Io { path: String, err: std::io::Error },
-    /// A file looked like an LFS pointer but its `oid`/`size` didn't parse.
-    PointerParse(String),
-    /// The source is an LFS pointer but no LFS server is configured, so the blob
-    /// can't be fetched. Actionable: set `ZTEST_LFS_URL` or add `.lfsconfig`.
-    NoEndpoint { source: String },
-    /// The LFS batch API rejected the object, or the blob download failed.
-    Lfs(String),
-    /// An archive with no recognisable compression extension, where one is
-    /// required (the LFS path can't fall back to magic-byte sniffing).
-    UnknownCompression { source: String },
-}
-
-impl StorageError {
-    fn io(path: &Path, err: std::io::Error) -> Self {
-        StorageError::Io {
-            path: path.display().to_string(),
-            err,
-        }
-    }
+    /// The snapshot bucket isn't configured. Only the process that provisions
+    /// seeds needs this — a runner pod never touches the bucket — so the fix is
+    /// to export the AWS environment wherever `ztest run` itself is invoked.
+    R2Config { detail: String },
+    /// A request against the snapshot bucket failed.
+    R2(String),
+    /// An archive with no recognisable compression extension. There is no
+    /// magic-byte fallback: the bytes are in the bucket, not on this machine.
+    UnknownCompression { name: String },
 }
 
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StorageError::Io { path, err } => write!(f, "read {path}: {err}"),
-            StorageError::PointerParse(p) => {
-                write!(f, "{p} looks like a Git LFS pointer but did not parse")
-            }
-            StorageError::NoEndpoint { source } => write!(
+            StorageError::R2Config { detail } => write!(
                 f,
-                "{source} is a Git LFS pointer but its blob is absent and no LFS \
-                 server is configured — set `ZTEST_LFS_URL` (rudolfs base), add an \
-                 `[lfs] url` to `.lfsconfig`, or run `git lfs pull` to fetch it locally",
+                "the chain-snapshot bucket is not configured ({detail}) — export \
+                 AWS_BUCKET_NAME / AWS_ENDPOINT / AWS_ACCESS_KEY_ID / \
+                 AWS_SECRET_ACCESS_KEY in the environment running `ztest run`",
             ),
-            StorageError::Lfs(m) => write!(f, "git-lfs: {m}"),
-            StorageError::UnknownCompression { source } => write!(
+            StorageError::R2(m) => write!(f, "chain-snapshot bucket: {m}"),
+            StorageError::UnknownCompression { name } => write!(
                 f,
-                "{source}: cannot determine archive compression from its name \
+                "{name}: cannot determine archive compression from its name \
                  (expected .tar / .tar.gz / .tar.zst / .tar.xz / .tar.bz2)",
             ),
         }
@@ -236,26 +139,18 @@ impl std::error::Error for StorageError {}
 mod tests {
     use super::*;
 
+    /// The PVC name is a pure function of the OID, so every process in a run
+    /// derives the same one without I/O — the property that makes a seed
+    /// nameable from a pod that cannot read the archive.
     #[test]
-    fn parses_a_well_formed_pointer() {
-        let text = "version https://git-lfs.github.com/spec/v1\n\
-                    oid sha256:1111111111111111111111111111111111111111111111111111111111111111\n\
-                    size 4096\n";
-        let p = parse_pointer(text).unwrap();
-        assert_eq!(p.oid.len(), 64);
-        assert!(p.oid.starts_with("1111"));
-        assert_eq!(p.size, 4096);
-    }
-
-    #[test]
-    fn rejects_pointer_missing_size_or_oid() {
-        assert!(parse_pointer("version x\noid sha256:deadbeef\n").is_none());
-        assert!(parse_pointer("version x\nsize 10\n").is_none());
+    fn seed_sha8_is_the_oid_prefix() {
+        let oid = "c6f8cc7e93de9981bc0934ea1560c003ba82130802e5c66aa07a685eaf1c80a3";
+        assert_eq!(seed_sha8(oid), "c6f8cc7e");
     }
 
     #[test]
     fn compression_from_common_extensions() {
-        let c = |n: &str| compression_from_ext(Path::new(n));
+        let c = compression_from_name;
         assert_eq!(c("chain.tar.zst"), Some(Compression::Zstd));
         assert_eq!(c("chain.tar.gz"), Some(Compression::Gzip));
         assert_eq!(c("chain.tgz"), Some(Compression::Gzip));

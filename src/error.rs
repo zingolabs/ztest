@@ -1,7 +1,6 @@
 //! Error types.
 
 use std::error::Error as StdError;
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// Errors raised by the test-env machinery (cluster, port-forward,
@@ -28,8 +27,12 @@ pub enum EnvError {
     #[error("{component} pod failed to start: {reason}")]
     PodFailed { component: String, reason: String },
 
-    #[error("archive materialize failed for {}: {reason}", archive.display())]
-    ArchiveMaterializeFailed { archive: PathBuf, reason: String },
+    /// `archive` is the artifact's *filename*, not a path: a seed is identified
+    /// by its OID, and the only process that could resolve a path to it is one
+    /// that happens to hold a checkout. Naming the file keeps the message
+    /// actionable everywhere without implying the reader can open it.
+    #[error("archive materialize failed for {archive}: {reason}")]
+    ArchiveMaterializeFailed { archive: String, reason: String },
 
     #[error("{component} does not expose endpoint '{name}'")]
     UnknownEndpoint { component: String, name: String },
@@ -46,6 +49,18 @@ pub enum EnvError {
 
     #[error("invalid test environment: {reason}")]
     Config { reason: String },
+
+    /// The chain a restored archive actually serves is not the one its
+    /// manifest describes.
+    ///
+    /// Distinct from [`Config`](Self::Config), which is a static
+    /// misconfiguration knowable before anything runs: this is a live
+    /// disagreement between a manifest and mounted data, and it means a
+    /// swapped, truncated, re-pinned, or partially-populated artifact. Without
+    /// it the difference surfaces much later as an unrelated parity failure,
+    /// or — worse — as a boundary test quietly passing over empty results.
+    #[error("restored archive {archive} does not serve the chain its manifest describes: {reason}")]
+    ArchiveMismatch { archive: String, reason: String },
 
     #[error("image build failed for {component}: {source}")]
     ImageBuild {

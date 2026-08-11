@@ -122,8 +122,9 @@ async fn enable_uwm(cx: &Cx) -> Result<(), ResourceError> {
                 serde_yaml::Value::String(UWM_KEY.to_string()),
                 serde_yaml::Value::Bool(true),
             );
-            let merged = serde_yaml::to_string(&doc)
-                .map_err(|e| ResourceError::Provision(format!("serialize monitoring config: {e}")))?;
+            let merged = serde_yaml::to_string(&doc).map_err(|e| {
+                ResourceError::Provision(format!("serialize monitoring config: {e}"))
+            })?;
             let patch = json!({ "data": { CONFIG_KEY: merged } });
             cms.patch(CONFIG_MAP, &PatchParams::default(), &Patch::Merge(&patch))
                 .await
@@ -141,7 +142,9 @@ async fn enable_uwm(cx: &Cx) -> Result<(), ResourceError> {
             match cms.create(&PostParams::default(), &cm).await {
                 Ok(_) => Ok(()),
                 Err(e) if is_conflict(&e) => Ok(()),
-                Err(e) => Err(ResourceError::Provision(format!("create {CONFIG_MAP}: {e}"))),
+                Err(e) => Err(ResourceError::Provision(format!(
+                    "create {CONFIG_MAP}: {e}"
+                ))),
             }
         }
         Err(e) => Err(ResourceError::Provision(format!("get {CONFIG_MAP}: {e}"))),

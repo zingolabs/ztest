@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::preflight::BuildStage;
+use crate::ui::BuildStage;
 
 use super::events::{Event, EventTx};
 

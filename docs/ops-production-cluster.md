@@ -104,7 +104,7 @@ The run ServiceAccount needs: create/delete namespaces; CRUD pods/services/confi
 ### Provisioning boundary
 
 - **Substrate** (operators, storage engine, snapshot controller): installed by Flux. ztest consumes it and refuses to install operators.
-- **ztest's contract**: `ztest-seeds`/`ztest-qos` namespaces, QoS RBAC + per-tier SAs, node labels, `StorageClass` objects, the run identity, and on OpenShift the `nonroot-v2` SCC grant + `ztest-images` registry project. Owned by `ztest setup` (run once as admin); shapes in `qos.rs`, `storage.rs`, `resource/impls/policy.rs`.
+- **ztest's contract**: `ztest-seeds` namespace, QoS RBAC + per-tier SAs, node labels, `StorageClass` objects, the run identity, and on OpenShift the `nonroot-v2` SCC grant + `ztest-images` registry project. Owned by `ztest setup` (run once as admin); shapes in `qos.rs`, `storage.rs`, `resource/impls/policy.rs`.
 
 ## Observability
 

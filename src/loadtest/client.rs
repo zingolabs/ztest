@@ -5,8 +5,8 @@
 //! fatal for load generation: you would measure TCP + HTTP/2 + TLS setup, not
 //! the RPC. [`LwdClient`] wraps one already-connected [`Channel`]; tonic channels
 //! multiplex over a single connection and clone cheaply, so every virtual
-//! connection in [`ConnMode::Shared`](super::ConnMode) shares one socket, while
-//! [`ConnMode::PerTask`](super::ConnMode) dials a channel per task for genuine
+//! shared connection mode reuses one socket across tasks, while per-task mode
+//! dials a channel per task for genuine
 //! socket fan-out.
 
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use crate::proto::{BlockId, BlockRange, ChainSpec, CompactBlock};
 
 /// A persistent lightwalletd/zainod gRPC client. Clone is cheap — clones share
 /// the underlying multiplexed channel. The origin URI is retained so
-/// [`ConnMode::PerTask`](super::ConnMode) can [`dial`](LwdClient::dial) a fresh
+/// Per-task mode can [`dial`](LwdClient::dial) a fresh
 /// channel per connection.
 #[derive(Debug, Clone)]
 pub struct LwdClient {
@@ -83,11 +83,7 @@ impl LwdClient {
     /// `GetBlockRange` drained into a height-sorted `Vec`. This is the primary
     /// load op — a server-streaming call the driver issues per virtual
     /// connection.
-    pub async fn block_range(
-        &self,
-        start: u64,
-        end: u64,
-    ) -> Result<Vec<CompactBlock>, Status> {
+    pub async fn block_range(&self, start: u64, end: u64) -> Result<Vec<CompactBlock>, Status> {
         let mut c = self.inner.clone();
         let stream = c
             .get_block_range(BlockRange {

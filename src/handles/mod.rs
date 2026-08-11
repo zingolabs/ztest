@@ -110,4 +110,19 @@ pub mod ports {
     pub const ZAINO_JSONRPC: u16 = 8232;
     pub const ZAINO_METRICS: u16 = 9998;
     pub const LIGHTWALLETD_GRPC: u16 = 9067;
+
+    /// The address every ztest component must bind its listeners to.
+    ///
+    /// Not a preference — a requirement of pod-per-test. The client runs in a
+    /// *separate* pod and reaches a component at its pod IP, so a loopback bind
+    /// (the same-host `zcash_local_net` default that several upstream configs
+    /// ship) refuses every cross-pod call. Per-test namespace isolation stands
+    /// in for the loopback restriction.
+    ///
+    /// It lives here, next to the ports, because a listener is an address *and*
+    /// a port and the two drifted apart once already: the testnet zainod
+    /// generator bound its JSON-RPC to `127.0.0.1` while its gRPC bound
+    /// `0.0.0.0`, so gRPC worked, JSON-RPC refused every connection, and the
+    /// failure looked like a dead indexer rather than a bind address.
+    pub const LISTEN_ALL: &str = "0.0.0.0";
 }

@@ -38,9 +38,8 @@ pub fn workspace_id(workspace: &Path) -> String {
 
 /// The root of all recordings for `workspace`.
 pub fn workspace_records_dir(workspace: &Path) -> io::Result<PathBuf> {
-    let dirs = ProjectDirs::from("io", "ztest", "ztest").ok_or_else(|| {
-        io::Error::other("cannot determine a cache directory for recordings")
-    })?;
+    let dirs = ProjectDirs::from("io", "ztest", "ztest")
+        .ok_or_else(|| io::Error::other("cannot determine a cache directory for recordings"))?;
     Ok(dirs
         .cache_dir()
         .join("records")
@@ -123,7 +122,12 @@ fn latest(workspace: &Path) -> io::Result<PathBuf> {
         .into_iter()
         .next()
         .map(|r| r.dir)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no recorded runs for this workspace"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no recorded runs for this workspace",
+            )
+        })
 }
 
 /// The unique run whose id begins with `prefix`; errors when zero or several

@@ -19,7 +19,10 @@ pub fn export(run_dir: &Path, out: &Path) -> io::Result<()> {
     let mut zip = zip::ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
-    for entry in walkdir::WalkDir::new(run_dir).into_iter().filter_map(Result::ok) {
+    for entry in walkdir::WalkDir::new(run_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         let rel = match entry.path().strip_prefix(run_dir) {
             Ok(r) if !r.as_os_str().is_empty() => r,
             _ => continue,
@@ -72,7 +75,9 @@ mod tests {
         assert!(names.iter().any(|n| n == "meta.json"), "{names:?}");
         assert!(names.iter().any(|n| n == "run.log.zst"), "{names:?}");
         assert!(
-            names.iter().any(|n| n.replace('\\', "/") == "out/abc-combined"),
+            names
+                .iter()
+                .any(|n| n.replace('\\', "/") == "out/abc-combined"),
             "{names:?}"
         );
     }

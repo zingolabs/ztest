@@ -10,7 +10,7 @@
 //! The governor closes that loop. Each reconcile it re-reads the ledger and the
 //! cluster's pods, folds in this run's live demand (from the scheduler, over
 //! [`RunDemand`]), and recomputes the fair-share elastic reservation
-//! ([`ledger::reserve_from_state`](super::ledger::reserve_from_state)). It then
+//! (`ledger::reserve_from_state`). It then
 //! updates *both* sinks that must stay consistent — the run's Lease (what other
 //! runs subtract) and the scheduler's ceiling (what this run may admit into) — so
 //! the cross-run invariant `committed ≤ Σ reservations` holds continuously.

@@ -4,7 +4,7 @@
 //! `FrameClock`, and the scrollback buffer, on its own current-thread tokio
 //! runtime so its 33 ms redraw tick fires independently of the work side. The
 //! work side talks by value over one mpsc channel ([`Msg`]) — a single channel
-//! gives total ordering of all display events. See `docs/console-architecture.md`.
+//! gives total ordering of all display events. See `docs/design-execution-engine.md`.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -19,7 +19,7 @@ use avt::Vt;
 use crate::cancel::{Cancel, CancelSource};
 // Shared with `preflight`'s `spinner_glyph` so the redraw gate and glyph table
 // can't drift apart.
-use crate::preflight::SPINNER_STEP_MS;
+use crate::ui::SPINNER_STEP_MS;
 
 use super::{Surface, bridge};
 

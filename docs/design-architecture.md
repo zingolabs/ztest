@@ -53,7 +53,7 @@ Port-forwards are **lazy** (established on first `endpoint()` per pod+port), bou
 
 ## Snapshot / clone
 
-Ceph RBD snapshots the live PVC in place — no SIGTERM, no restart; clones boot crash-recovery-style, which regtest validators tolerate. `test.snapshot()` creates a `VolumeSnapshot` and returns a `SnapshotRef` while the source pod keeps running; a later `spawn(mount(from snap))` creates a PVC with `dataSource` = the snapshot plus its pod. A `SnapshotRef` is owned by the creating test's sentinel and cascades on drop.
+Ceph RBD snapshots the live PVC in place — no SIGTERM, no restart; clones boot crash-recovery-style, which regtest validators tolerate. Mid-test cloning of a *running* component is not implemented: the snapshot machinery ztest ships today is the seed pipeline below, which clones a pre-provisioned, immutable seed rather than a live PVC.
 
 ## Seeds — content-addressed archive PVCs
 

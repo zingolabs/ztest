@@ -54,7 +54,7 @@ use kube::api::{
 use kube::runtime::wait::await_condition;
 use serde_json::{Value, json};
 
-use crate::qos::LABEL_RUN_ID;
+use crate::qos::{LABEL_RUN_ID, LABEL_USER};
 use crate::resource::impls::policy::{BUILDKIT_SERVICE_ACCOUNT, RUN_NAMESPACE, manifest_hash};
 use crate::resource::kube::FIELD_MANAGER;
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
@@ -325,12 +325,20 @@ fn pod_spec(cpu: &str, mem: &str) -> Value {
 /// Create the ephemeral BuildKit pod at the build footprint and return its name.
 /// Sized at [`BUILDKIT_BUILD`](crate::qos::build::BUILDKIT_BUILD) (Guaranteed),
 /// labelled with the run id so a crashed run's reaper (`reap_run`) also removes
-/// it, and stamped with the required-SCC annotation so admission accepts the
+/// it, labelled with the owning user so `ztest cleanup` (which scopes by
+/// [`LABEL_USER`](crate::qos::LABEL_USER)) reaps it like every other run-owned
+/// object, and stamped with the required-SCC annotation so admission accepts the
 /// privileged-in-userns posture. The caller waits it Ready
 /// ([`wait_build_pod_ready`]) and deletes it ([`delete_build_pod`]) on every path.
+///
+/// The footprint this pod occupies must already be covered by a ledger
+/// reservation — see [`Reserve::Fixed`](crate::qos::ledger::Reserve::Fixed).
+/// Creating it unbudgeted is what let a builder land on a node whose memory
+/// admission had already promised to tests.
 pub(crate) async fn create_build_pod(
     client: &kube::Client,
     run_id: &str,
+    user: &str,
 ) -> Result<String, ResourceError> {
     let (cpu, mem) =
         crate::qos::build::BUILDKIT_BUILD.guaranteed_cpu_mem("buildkit build footprint");
@@ -344,6 +352,7 @@ pub(crate) async fn create_build_pod(
             "labels": {
                 BUILDKIT_COMPONENT: "buildkit",
                 LABEL_RUN_ID: run_id,
+                LABEL_USER: crate::naming::slug(user, crate::naming::DNS_LABEL_MAX),
             },
             "annotations": {
                 "openshift.io/required-scc": BUILDKIT_SCC,

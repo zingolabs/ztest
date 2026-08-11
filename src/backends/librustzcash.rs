@@ -27,7 +27,6 @@ use zcash_client_backend::data_api::wallet::{
     ConfirmationsPolicy, SpendingKeys, create_proposed_transactions, propose_transfer,
     shield_transparent_funds,
 };
-use zcash_client_backend::zip321::{Payment, TransactionRequest};
 use zcash_client_backend::data_api::{
     AccountBirthday, WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite,
 };
@@ -37,6 +36,7 @@ use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::BlockId;
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 use zcash_client_backend::wallet::OvkPolicy;
+use zcash_client_backend::zip321::{Payment, TransactionRequest};
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::init_wallet_db;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
@@ -381,24 +381,10 @@ impl WalletBackend for LrzWallet {
     async fn balances(&self, account: AccountId) -> Result<PoolBalances, BoxError> {
         let acct = self.account(account)?;
         let db = acct.db.lock().await;
-        let policy =
-            ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false);
-        let zats = |z: Zatoshis| u64::from(z);
         let summary = db
-            .get_wallet_summary(policy)
+            .get_wallet_summary(one_conf_policy())
             .map_err(|e| format!("librustzcash: get_wallet_summary: {e}"))?;
-        let Some(summary) = summary else {
-            return Ok(PoolBalances::default());
-        };
-        let Some(bal) = summary.account_balances().get(&acct.account_id) else {
-            return Ok(PoolBalances::default());
-        };
-        Ok(PoolBalances {
-            orchard: zats(bal.orchard_balance().spendable_value()),
-            ironwood: zats(bal.ironwood_balance().spendable_value()),
-            sapling: zats(bal.sapling_balance().spendable_value()),
-            transparent: zats(bal.unshielded_balance().spendable_value()),
-        })
+        Ok(pool_balances(summary.as_ref(), acct.account_id))
     }
 
     async fn sync(&self, account: AccountId) -> Result<(), BoxError> {
@@ -566,6 +552,29 @@ fn one_conf_policy() -> ConfirmationsPolicy {
     ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false)
 }
 
+/// Spendable per-pool balances for `account` out of a wallet summary. Shared by
+/// the [`WalletBackend::balances`] handle and the sync subject's per-tick
+/// [`ProgressView::balances`], so a balance probe and an assertion after a send
+/// can never disagree about what "balance" means.
+///
+/// A wallet with no summary yet (nothing scanned) or no row for the account
+/// holds nothing, which is zero — not an error.
+fn pool_balances(
+    summary: Option<&WalletSummary<AccountUuid>>,
+    account_id: AccountUuid,
+) -> PoolBalances {
+    let Some(bal) = summary.and_then(|s| s.account_balances().get(&account_id)) else {
+        return PoolBalances::default();
+    };
+    let zats = |z: Zatoshis| u64::from(z);
+    PoolBalances {
+        orchard: zats(bal.orchard_balance().spendable_value()),
+        ironwood: zats(bal.ironwood_balance().spendable_value()),
+        sapling: zats(bal.sapling_balance().spendable_value()),
+        transparent: zats(bal.unshielded_balance().spendable_value()),
+    }
+}
+
 impl LrzWallet {
     /// Build the observable [`SyncSubject`] the `#[ztest::sync_test]` facade
     /// binds via `Subject::wallet(account)`. It drives `account`'s sync to tip
@@ -590,25 +599,31 @@ impl LrzWallet {
 }
 
 /// One progress reading of a librustzcash wallet sync, derived from its
-/// `WalletSummary`.
+/// `WalletSummary` plus the wallet's own note commitment trees.
 #[derive(Clone, Debug)]
 pub struct LrzProgress {
     height: u32,
     target: Option<u32>,
     pct: f32,
     phase: Phase,
-    balance_total: i64,
+    balances: PoolBalances,
+    tree_roots: TreeRoots,
 }
 
 impl LrzProgress {
-    fn from_summary(summary: Option<&WalletSummary<AccountUuid>>, account: &AccountUuid) -> Self {
+    fn from_summary(summary: Option<&WalletSummary<AccountUuid>>, account_id: AccountUuid) -> Self {
+        let balances = pool_balances(summary, account_id);
         let Some(s) = summary else {
             return Self {
                 height: 0,
                 target: None,
                 pct: 0.0,
                 phase: Phase::Starting,
-                balance_total: 0,
+                balances,
+                // Reported, not unreported: this *is* a wallet, it simply has
+                // no tree yet. A probe must see "no root at this height", not
+                // "nobody maintains trees".
+                tree_roots: TreeRoots::reported(),
             };
         };
         let scan = s.progress().scan();
@@ -618,10 +633,6 @@ impl LrzProgress {
         } else {
             100.0 * num as f32 / den as f32
         };
-        let balance_total = s
-            .account_balances()
-            .get(account)
-            .map_or(0, |b| u64::from(b.total()) as i64);
         Self {
             height: u32::from(s.fully_scanned_height()),
             target: Some(u32::from(s.chain_tip_height())),
@@ -631,8 +642,17 @@ impl LrzProgress {
             } else {
                 Phase::Historic
             },
-            balance_total,
+            balances,
+            // Filled in by `progress`, which holds the db handle the trees live
+            // behind; the summary alone cannot answer it.
+            tree_roots: TreeRoots::reported(),
         }
+    }
+
+    /// Attach the note-commitment-tree roots read alongside this summary.
+    fn with_tree_roots(mut self, tree_roots: TreeRoots) -> Self {
+        self.tree_roots = tree_roots;
+        self
     }
 }
 
@@ -649,20 +669,65 @@ impl ProgressView for LrzProgress {
     fn phase(&self) -> Phase {
         self.phase
     }
-    fn balance_total(&self) -> i64 {
-        self.balance_total
+    // `work()` stays the trait default (`None`), so the harness derives work
+    // from `height` via `ChainWork`. librustzcash's `WalletSummary` reports scan
+    // progress as a height and a ratio, not as per-pool cumulative counters, so
+    // there is nothing truer to override with here.
+    fn balances(&self) -> Option<PoolBalances> {
+        Some(self.balances)
     }
-    // `outputs(pool)` stays the trait default (0): librustzcash's `WalletSummary`
-    // exposes scan progress as a height/ratio, not per-pool cumulative output
-    // counters, so there is no source for a `pool_outputs_monotonic` probe here.
-    // Height monotonicity (`Snapshot::reorg_depth`) covers the same rollback
-    // safety the output counter would.
+    fn tree_roots(&self) -> TreeRoots {
+        self.tree_roots
+    }
+}
+
+/// The wallet's own note-commitment-tree root per shielded pool, as of the
+/// checkpoint at `height` — the wallet half of the tree-root oracle.
+///
+/// Checkpoints in a `zcash_client_sqlite` shard tree are keyed by block height,
+/// the same key an indexer's `GetTreeState` takes, so the two sides line up
+/// without any interpolation: both answer "the tree after block `height`".
+///
+/// Every failure here is `None` for that pool, and deliberately so — mid-scan
+/// the shard tree is legitimately incomplete over most of its range and
+/// `root_at_checkpoint_id` says so by erroring. That is a normal reading, not a
+/// harness fault, and it resolves itself as the scan closes. What must *not*
+/// collapse into `None` is "this subject has no trees at all"; that distinction
+/// is carried by [`TreeRoots::reported`] one level up, so a `None` here always
+/// means "this wallet, this pool, this height — no root", which is exactly what
+/// a probe needs to reason about.
+fn wallet_tree_roots(db: &mut Db, height: BlockHeight) -> TreeRoots {
+    TreeRoots::reported()
+        .with(
+            Pool::Sapling,
+            db.with_sapling_tree_mut(|tree| tree.root_at_checkpoint_id(&height))
+                .ok()
+                .flatten()
+                .map(|root| root.to_bytes()),
+        )
+        .with(
+            Pool::Orchard,
+            db.with_orchard_tree_mut(|tree| tree.root_at_checkpoint_id(&height))
+                .ok()
+                .flatten()
+                .map(|root| root.to_bytes()),
+        )
+        .with(
+            Pool::Ironwood,
+            // Doubly optional: the outer `Option` is "this backend keeps no
+            // separate Ironwood tree" (the trait's default), the inner one is
+            // "no root at this checkpoint".
+            db.with_ironwood_tree_mut(|tree| tree.root_at_checkpoint_id(&height))
+                .ok()
+                .flatten()
+                .flatten()
+                .map(|root| root.to_bytes()),
+        )
 }
 
 /// Observable librustzcash wallet-sync subject. `launch` spawns the drive-to-tip
-/// as a background task holding the primary db connection; `progress` and
-/// `terminal_roots` read through a second WAL connection (`reader`) so they never
-/// block on the writer.
+/// as a background task holding the primary db connection; `progress` reads
+/// through a second WAL connection (`reader`) so it never blocks on the writer.
 pub struct LrzSyncSubject {
     account: Arc<WalletAccount>,
     batch_size: u32,
@@ -686,11 +751,7 @@ impl SyncSubject for LrzSyncSubject {
 
     async fn launch(&mut self) -> Result<(), RpcError> {
         if self.running.is_some() {
-            return Err(RpcError::decode(
-                LABEL,
-                "launch",
-                "sync already launched",
-            ));
+            return Err(RpcError::decode(LABEL, "launch", "sync already launched"));
         }
         let account = self.account.clone();
         let batch = self.batch_size;
@@ -711,14 +772,18 @@ impl SyncSubject for LrzSyncSubject {
     }
 
     async fn progress(&self) -> Result<LrzProgress, RpcError> {
-        let db = self.reader.lock().await;
+        // `with_*_tree_mut` needs `&mut` on the db, so the reader guard is
+        // taken mutably. It is the second (WAL) connection, and the tree reads
+        // below only ever open a DEFERRED transaction that never writes — so
+        // this never contends with the sync task holding the primary
+        // connection.
+        let mut db = self.reader.lock().await;
         let summary = db
             .get_wallet_summary(one_conf_policy())
             .map_err(|e| RpcError::decode(LABEL, "get_wallet_summary", format!("{e}")))?;
-        Ok(LrzProgress::from_summary(
-            summary.as_ref(),
-            &self.account.account_id,
-        ))
+        let progress = LrzProgress::from_summary(summary.as_ref(), self.account.account_id);
+        let scanned = BlockHeight::from(progress.height);
+        Ok(progress.with_tree_roots(wallet_tree_roots(&mut db, scanned)))
     }
 
     async fn is_complete(&self) -> bool {
@@ -733,40 +798,6 @@ impl SyncSubject for LrzSyncSubject {
             h.abort();
         }
         Ok(())
-    }
-
-    async fn terminal_roots(&self) -> Result<TreeRoots, RpcError> {
-        let mut db = self.reader.lock().await;
-        let height = match db
-            .get_wallet_summary(one_conf_policy())
-            .map_err(|e| RpcError::decode(LABEL, "get_wallet_summary", format!("{e}")))?
-        {
-            Some(s) => s.fully_scanned_height(),
-            None => return Ok(TreeRoots::default()),
-        };
-        // `root_at_checkpoint_id(height)` is the precise anchor to compare
-        // against `get_tree_state(height)`; fall back to the all-leaves root when
-        // no checkpoint sits exactly at the scanned tip. At completion both
-        // resolve to the same anchor.
-        let sapling = db
-            .with_sapling_tree_mut(|tree| -> Result<Option<_>, BoxError> {
-                Ok(match tree.root_at_checkpoint_id(&height)? {
-                    Some(r) => Some(r),
-                    None => tree.root_at_checkpoint_depth(None)?,
-                })
-            })
-            .map_err(|e| RpcError::decode(LABEL, "sapling_root", format!("{e}")))?
-            .map(|n| n.to_bytes());
-        let orchard = db
-            .with_orchard_tree_mut(|tree| -> Result<Option<_>, BoxError> {
-                Ok(match tree.root_at_checkpoint_id(&height)? {
-                    Some(r) => Some(r),
-                    None => tree.root_at_checkpoint_depth(None)?,
-                })
-            })
-            .map_err(|e| RpcError::decode(LABEL, "orchard_root", format!("{e}")))?
-            .map(|n| n.to_bytes());
-        Ok(TreeRoots { sapling, orchard })
     }
 }
 

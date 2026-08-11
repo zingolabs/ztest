@@ -15,10 +15,10 @@ license = "MIT"
 authors = ["Zingolabs <zingo@zingolabs.org>"]
 repository = "https://github.com/zingolabs/ztest"
 homepage = "https://github.com/zingolabs/ztest"
-version = "0.0.0"
+version = "0.1.0"
 
 [workspace.dependencies]
-ztest_macros = { path = "macros", version = "0.0.0" }
+ztest_macros = { path = "macros", version = "0.1.0" }
 
 thiserror = "1.0.64"
 tokio = "1.42.0"
@@ -52,7 +52,9 @@ path = "src/lib.rs"
 ztest_macros = { workspace = true }
 
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "fs", "process", "signal"] }
+# `io-std` is for `ztest lfs-transfer`: the git-lfs custom transfer protocol is
+# a newline-delimited JSON conversation on this process's own stdin/stdout.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "io-std", "time", "fs", "process", "signal"] }
 tracing = { workspace = true }
 # ztest's own diagnostics subscriber (pod-lifecycle timing etc). `env-filter`
 # parses the `ZTEST_LOG` target syntax, mirroring nextest's `NEXTEST_LOG`.
@@ -189,6 +191,21 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 nextest-metadata = "0.14"
 dialoguer = { version = "0.12.0", default-features = false }
 prometheus-parse = "0.2.5"
+# S3 client for the Cloudflare R2 bucket holding `fixtures/chains/*.tar.zst`:
+# `storage::r2` reads seeds from it, and `ztest lfs-transfer` (the git-lfs
+# custom transfer agent) reads and writes it. `aws` is the only backend we
+# want; `fs` (the default) would just shadow `storage::local`.
+#
+# PINNED TO 0.13 ON PURPOSE — do not bump to 0.14 without reading this:
+#   * 0.14 requires `md-5 ^0.11` → `digest ^0.11`, which cannot coexist with
+#     the exact `digest = "=0.11.0-pre.9"` that bip32 0.6.0-pre.1 pins via
+#     pepper-sync ← zingolib. Cargo cannot resolve it at all.
+#   * 0.14 also moves to `reqwest ^0.13`, which would put a *second* reqwest
+#     in the graph alongside the 0.12 the rest of ztest uses.
+# 0.13 takes `md-5 ^0.10.6` and `reqwest ^0.12`, so it unified into the
+# existing tree at a cost of four crates total. Revisit when zingolib's
+# wallet stack leaves the `digest` pre-releases behind.
+object_store = { version = "0.13.1", default-features = false, features = ["aws"] }
 
 [features]
 default = ["librustzcash"]

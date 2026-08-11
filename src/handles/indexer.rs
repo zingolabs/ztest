@@ -33,8 +33,9 @@ pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
     /// The live handle type this backend produces.
     type Handle: IndexerBackend + Clone;
 
-    /// Backend-specific tuning tokens handed to [`ComponentBuilder::tuning`]
-    /// (e.g. [`ZainoTuning`](crate::testnet_conf::ZainoTuning)). Backends with
+    /// Backend-specific tuning tokens handed to
+    /// [`ComponentBuilder::tuning`](crate::ComponentBuilder::tuning) (e.g.
+    /// [`ZainoTuning`](crate::backends::zainod::ZainoTuning)). Backends with
     /// no knobs use [`NoTuning`](crate::component::NoTuning), whose uninhabited
     /// type makes `.tuning(..)` uncallable at compile time.
     type Tuning: Clone + std::fmt::Debug + Send + Sync + 'static;
@@ -45,8 +46,8 @@ pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
     /// Render the config at build time, once the env has resolved the validator
     /// host. `tunings` are the tokens the test applied (interpreted per
     /// backend); `mode` is the network fixture. Called only when `mode` is not
-    /// [`IndexerMode::None`](crate::component::IndexerMode::None). Returns
-    /// [`EnvError::Config`](crate::EnvError::Config) for invalid configuration
+    /// [`IndexerMode::None`](crate::component::IndexerMode). Returns
+    /// [`EnvError::Config`] for invalid configuration
     /// (e.g. an unparseable pinned version, or a tuning the backend rejects).
     /// Default: no-op.
     fn materialize_opts(
@@ -71,7 +72,7 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
     /// Stable label string for the backend behind this handle.
     fn label(&self) -> &'static str;
 
-    /// Build the Kubernetes [`PodSpec`](crate::manifest::PodSpec) for launching
+    /// Build the Kubernetes `PodSpec` for launching
     /// this backend from its resolved `opts` and assigned `pod_name`. Each
     /// backend owns its image, ports, ready port, and security context.
     fn pod_spec(

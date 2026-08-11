@@ -7,7 +7,7 @@
 //! seeing it, (1) watches its own pod for the [`STOP_ANNOTATION`] and turns a
 //! set annotation into engine cancellation (`sync_mode = Shutdown` →
 //! checkpoint), and (2) mirrors the final report to a ConfigMap that outlives
-//! the pod so `ztest sync report`/`status` work after it is gone.
+//! the pod so `ztest sync status` works after it is gone.
 //!
 //! Everything the controller needs to *find* and *read* a detached sync — the
 //! labels, the stop annotation, the per-sync namespace, the report ConfigMap
@@ -29,13 +29,15 @@ pub const POD_NAME_ENV: &str = "ZTEST_POD_NAME";
 
 /// Label key marking a ztest-owned detached-sync driver pod (value
 /// [`KIND_LABEL_VALUE`]); also stamped on the per-sync namespace + report CM.
+///
+/// Ownership is *not* recorded here: a sync carries the same
+/// [`LABEL_USER`](crate::qos::LABEL_USER) every other ztest resource does, so
+/// `sync list` and `ztest cleanup` cannot disagree about whose it is.
 pub const KIND_LABEL_KEY: &str = "ztest.io/kind";
 /// The [`KIND_LABEL_KEY`] value a detached sync carries.
 pub const KIND_LABEL_VALUE: &str = "sync";
 /// Per-sync id label key (on the driver pod, its namespace, and its report CM).
 pub const SYNC_ID_KEY: &str = "ztest.io/sync-id";
-/// Launching-user label key (for `list --all-users` filtering).
-pub const OWNER_KEY: &str = "ztest.io/owner";
 /// Annotation the controller sets on the driver pod to request a graceful stop.
 /// The in-pod runner watches it and drives `sync_mode = Shutdown` via engine
 /// cancellation — this is a checkpoint, not a kill (design §stop).
@@ -49,8 +51,9 @@ pub fn kind_selector() -> String {
 /// The hermetic per-sync namespace for a sync id. Each detached sync gets its
 /// own namespace: it isolates the component-pod names and the ResourceQuota
 /// `TestEnv` applies, exactly as an ephemeral `ztest run` isolates each test,
-/// while the namespace's persistence + `kind=sync` label keep it out of
-/// `ztest cleanup`'s reach. `rm` deletes the namespace and cascades everything.
+/// but it persists past the driver pod so `report`/`status` still answer.
+/// `ztest cleanup` deletes the namespace and cascades everything once the driver
+/// pod is no longer Running.
 pub fn namespace_for(sync_id: &str) -> String {
     format!("ztest-sync-{sync_id}")
 }
@@ -85,7 +88,7 @@ pub(crate) fn note_setup(phase: &str, component: Option<&str>, detail: &str) {
 }
 
 /// A serialized, self-describing final report, stored in the report ConfigMap so
-/// it survives the pod (`ztest sync report`/`status` read it back). A plain DTO
+/// it survives the pod (`ztest sync status` reads it back). A plain DTO
 /// — the live [`SyncOutcome`](crate::sync::SyncOutcome) types aren't `Serialize`
 /// and shouldn't be (they carry live handles); this is their durable projection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,8 +101,13 @@ pub struct SyncReportMirror {
     pub dropped_snapshots: u64,
     pub violations: Vec<ReportViolation>,
     pub coverage_gaps: Vec<String>,
-    pub metrics: Vec<ReportMetric>,
     pub error: Option<String>,
+    /// The span of chain the run covered. Absent on a report written by a
+    /// driver predating segments, which `perf --base` treats the same way it
+    /// treats a run to tip: not comparable, and it says so rather than
+    /// comparing anyway.
+    #[serde(default)]
+    pub segment: Option<crate::sync::Segment>,
 }
 
 /// A recorded violation, projected for the durable report.
@@ -110,24 +118,14 @@ pub struct ReportViolation {
     pub detail: String,
 }
 
-/// One server-side metric sample, projected for the durable report.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReportMetric {
-    pub name: String,
-    pub value: Option<f64>,
-}
-
 impl SyncReportMirror {
     /// Project a finished run into its durable report.
-    pub fn from_outcome(
-        sync_id: &str,
-        profile: &str,
-        outcome: &crate::sync::SyncOutcome,
-    ) -> Self {
+    pub fn from_outcome(sync_id: &str, profile: &str, outcome: &crate::sync::SyncOutcome) -> Self {
         SyncReportMirror {
             sync_id: sync_id.to_string(),
             profile: profile.to_string(),
             verdict: format!("{:?}", outcome.verdict),
+            segment: outcome.segment.clone(),
             ticks: outcome.ticks,
             dropped_snapshots: outcome.dropped_snapshots,
             violations: outcome
@@ -140,15 +138,6 @@ impl SyncReportMirror {
                 })
                 .collect(),
             coverage_gaps: outcome.coverage_gaps.clone(),
-            metrics: outcome
-                .metrics
-                .samples
-                .iter()
-                .map(|s| ReportMetric {
-                    name: s.name.clone(),
-                    value: s.value,
-                })
-                .collect(),
             error: outcome.error.clone(),
         }
     }
@@ -183,13 +172,13 @@ mod runtime {
     use std::time::Duration;
 
     use k8s_openapi::api::core::v1::{ConfigMap, Pod};
-    use kube::api::{Api, Patch, PatchParams};
     use kube::Client;
+    use kube::api::{Api, Patch, PatchParams};
     use serde_json::json;
 
     use crate::cancel::{Cancel, CancelSource};
 
-    use super::{SyncReportMirror, POD_NAME_ENV, STOP_ANNOTATION, SYNC_ID_KEY};
+    use super::{POD_NAME_ENV, STOP_ANNOTATION, SYNC_ID_KEY, SyncReportMirror};
 
     /// How often the stop-watch re-reads its own pod's annotations. Coarse on
     /// purpose — a detached sync is a minutes-to-days job and a stop is not
@@ -303,7 +292,11 @@ mod runtime {
         .expect("static ConfigMap manifest is valid");
         let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
         if let Err(e) = api
-            .patch(&name, &PatchParams::apply("ztest-sync").force(), &Patch::Apply(&cm))
+            .patch(
+                &name,
+                &PatchParams::apply("ztest-sync").force(),
+                &Patch::Apply(&cm),
+            )
             .await
         {
             tracing::warn!(error = %e, cm = %name, "sync report: ConfigMap mirror failed");

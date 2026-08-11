@@ -1,25 +1,43 @@
-//! Preflight banner: session-startup status surface for the ztest harness.
+//! Every status surface the harness draws: the preflight banner, the live run
+//! panels, and the sync dashboard.
 //!
-//! [`theme`] holds the palette and glyph table; [`render`] holds pure
-//! formatters that turn a [`BannerState`] and [`Theme`] into a `String` (the
-//! full [`render`](render()) banner for non-TTY/CI logs, the compact
-//! [`render_preflight_panel`] / [`render_live_panel`] panels for a TTY). Output
-//! is aligned with `cargo nextest`'s reporter so it reads as a continuation of
-//! its banner. The terminal mechanics that display these strings live in
-//! [`cli::console`](crate::cli::console).
+//! Everything here is a **pure formatter** — state and a [`Theme`] in, a
+//! `String` out, no terminal touched. The mechanics that put these strings on a
+//! terminal (the render thread, the viewport, the PTY) live in
+//! [`cli::console`](crate::cli::console), and that separation is what lets the
+//! whole surface be tested by comparing strings.
 //!
-//! Spec: [`docs/running-tests.md#preflight`].
+//! - [`theme`] — palette and glyph table, gated on terminal capability.
+//! - [`layout`] — panel geometry, rules, spinner, resource formatters.
+//! - [`text`] — the shared number, duration, and gauge vocabulary.
+//! - [`plot`] — time-series plotting primitives.
+//! - [`render`] — the banner and panel formatters, over the model below.
+//! - [`status`] — the sync dashboard.
 //!
-//! [`docs/running-tests.md#preflight`]: https://github.com/zingolabs/ztest/blob/dev/docs/running-tests.md#preflight
+//! The bottom three layers exist so the surfaces cannot drift apart: two panels
+//! that disagreed about the line budget would tear the frame, and a magnitude
+//! abbreviated two ways reads as two different numbers.
+//!
+//! Output is aligned with `cargo nextest`'s reporter so it reads as a
+//! continuation of its banner.
+//!
+//! Spec: [`docs/guide-running-tests.md#preflight`].
+//!
+//! [`docs/guide-running-tests.md#preflight`]: https://github.com/zingolabs/ztest/blob/dev/docs/guide-running-tests.md#preflight
 
+mod layout;
+pub mod plot;
 mod render;
+mod status;
+pub mod text;
 mod theme;
 
-pub(crate) use self::render::SPINNER_STEP_MS;
+pub(crate) use self::layout::SPINNER_STEP_MS;
 pub use self::render::{
     RunProgress, render, render_cancel_panel, render_live_panel, render_preflight_panel,
     render_sync_build_panel, render_sync_metrics, render_sync_watch_panel, render_transfers,
 };
+pub use self::status::render_sync_status;
 pub use self::theme::Theme;
 pub use crate::qos::schedule::{QosPlan, TierPlan};
 
@@ -32,10 +50,6 @@ pub struct BannerState {
     pub cluster: ClusterState,
     pub build: BuildState,
     pub archives: Vec<ArchiveRow>,
-    pub snapshots: Vec<SnapshotRow>,
-    /// F1–F5 placeholder rows, rendered between snapshots and the
-    /// bottom rule.
-    pub future: Vec<FutureRow>,
     /// The QoS scheduling plan; `Some` once the inventory dump and probe have
     /// landed. Rendered as the `Scheduling` block.
     pub qos_plan: Option<QosPlan>,
@@ -110,72 +124,8 @@ pub struct ArchiveRow {
 pub enum ArchiveStatus {
     /// PVC labelled `seeds.ztest.io/ready=true`.
     Cached { size_bytes: u64 },
-    /// PVC absent or not ready; bytes streaming in. `bytes_total` is the LFS
-    /// pointer's `size=`; `bytes_done` is the running count from the
-    /// reconcile-Job's log stream. Percent is derived for display.
-    Downloading {
-        source: DownloadSource,
-        bytes_done: u64,
-        bytes_total: u64,
-    },
     /// LFS pointer present, blob unreachable; soft fail.
     Missing { detail: String },
-}
-
-impl ArchiveStatus {
-    /// Convenience for the downloading state. Returns
-    /// `(percent in 0..=100, bytes_done, bytes_total)` for the
-    /// downloading variant; `None` otherwise.
-    pub fn download_progress(&self) -> Option<(u8, u64, u64)> {
-        match self {
-            Self::Downloading {
-                bytes_done,
-                bytes_total,
-                ..
-            } => {
-                let percent = if *bytes_total == 0 {
-                    0
-                } else {
-                    ((*bytes_done as u128 * 100) / *bytes_total as u128).min(100) as u8
-                };
-                Some((percent, *bytes_done, *bytes_total))
-            }
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DownloadSource {
-    /// Fetched from the configured LFS server (rudolfs) over the batch API and
-    /// streamed into the seed uploader pod. See `crate::storage::lfs`.
-    Lfs,
-    /// F6: cluster-resident LFS cache.
-    ClusterCache,
-}
-
-#[derive(Debug, Clone)]
-pub struct SnapshotRow {
-    /// PVC reference, e.g. `pvc/zebra-testnet-cache`.
-    pub pvc: String,
-    pub status: SnapshotStatus,
-}
-
-#[derive(Debug, Clone)]
-pub enum SnapshotStatus {
-    BoundReady,
-    Provisioning {
-        /// Name of the archive whose materialization this snapshot is
-        /// waiting on.
-        from_archive: String,
-    },
-}
-
-/// A future-feature row that has reserved layout but no live data
-/// yet. Renders as `<label>  not yet implemented`.
-#[derive(Debug, Clone)]
-pub struct FutureRow {
-    pub label: &'static str,
 }
 
 // ─────────────────────────── transfers (right column) ─────────────────
@@ -187,12 +137,6 @@ pub struct FutureRow {
 #[derive(Debug, Clone, Default)]
 pub struct Transfers {
     pub rows: Vec<TransferRow>,
-}
-
-impl Transfers {
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
 }
 
 /// One background acquisition shown in the right column.
@@ -255,15 +199,15 @@ pub struct SyncWatchState {
     pub vitals: Option<SyncVitals>,
     /// The probe board, in registration order.
     pub probes: Vec<ProbeRow>,
-    /// Latest server-side metrics sample.
-    pub metrics: Vec<MetricRow>,
-    /// Why [`metrics`](Self::metrics) holds what it does. An empty column has
-    /// several distinct causes and the panel must name the one in force rather
-    /// than leaving the reader to guess whether anything is wrong.
-    pub metrics_state: MetricsAvailability,
     /// Violations published so far — a count the panel shows even when the
     /// detail has already scrolled out of the terminal.
     pub violations: usize,
+    /// The run's shape so far, every channel on one shared time axis.
+    ///
+    /// `None` until the driver publishes its first series — which includes the
+    /// whole of a sync launched by a driver predating the event, where the
+    /// panel falls back to instantaneous values with no graph.
+    pub timeline: Option<crate::sync::Timeline>,
 }
 
 /// One provisioning milestone as the panel shows it.
@@ -291,6 +235,15 @@ pub struct SyncVitals {
     /// Projected time to `target` at the current rate. `None` without a target
     /// or a rate, or when the rate is too near zero to project honestly.
     pub eta: Option<std::time::Duration>,
+    /// Protocol work per second, total and by pool, as the driver measured it.
+    ///
+    /// `None` entries mean **unmeasured**, not idle: a tier-B op nobody counted
+    /// and a pool with no activity are different facts and the panel renders
+    /// them differently (`—` against `0`).
+    pub work_rate: Option<f64>,
+    /// Per-pool rates in [`CHANNELS`](crate::sync::CHANNELS) order, which is
+    /// also the order they stack in the graph.
+    pub pool_rates: Vec<(&'static str, Option<f64>)>,
     /// Session-elapsed reading when this tick arrived. The renderer subtracts it
     /// from the frame's `elapsed` to show tick age — the "is it still alive"
     /// signal — while staying a pure function of its inputs.
@@ -306,37 +259,6 @@ pub struct ProbeRow {
     /// Together they're the countdown that shows a stall coming.
     pub since_satisfied: Option<std::time::Duration>,
     pub window: Option<std::time::Duration>,
-}
-
-/// Why the metrics column is showing what it is. An empty column has three
-/// distinguishable causes, and a reader who cannot tell them apart goes hunting a
-/// broken exporter: there is nothing to scrape yet, the exporters answered with
-/// nothing, or they could not be read.
-///
-/// The view-model counterpart of [`crate::metrics::live::State`], kept separate
-/// because this is what a renderer is allowed to know — the panel must not depend
-/// on how the reading was obtained.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum MetricsAvailability {
-    /// No pod in the run's namespace exposes a metrics port yet — the components
-    /// are still being provisioned. Not a statement about the engine.
-    #[default]
-    Idle,
-    /// The exporters answered, but none of the live families are present. Normal
-    /// briefly at startup; past that it means the component publishes nothing.
-    AwaitingScrape,
-    /// The exporters could not be read, with the scrape's own reason.
-    Unavailable(String),
-    /// Live values are present.
-    Sampled,
-}
-
-/// One server-side metric on the right column. The label carries its own unit
-/// (see [`crate::metrics::MetricSample`]).
-#[derive(Debug, Clone)]
-pub struct MetricRow {
-    pub name: String,
-    pub value: Option<f64>,
 }
 
 impl SyncWatchState {
@@ -372,13 +294,5 @@ impl SyncWatchState {
             self.probes.iter().filter(|r| r.state.is_ok()).count(),
             self.probes.len(),
         )
-    }
-
-    /// Look up one metric by its label.
-    pub fn metric(&self, name: &str) -> Option<f64> {
-        self.metrics
-            .iter()
-            .find(|m| m.name == name)
-            .and_then(|m| m.value)
     }
 }

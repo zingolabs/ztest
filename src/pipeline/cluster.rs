@@ -10,7 +10,7 @@ use k8s_openapi::api::core::v1::{Namespace, Node, PersistentVolumeClaim, Pod};
 use kube::api::ListParams;
 use kube::{Api, Client};
 
-use crate::qos::{ClusterCapacity, NVME_NODE_LABEL_KEY, NVME_NODE_LABEL_VALUE, Resources, units};
+use crate::qos::{ClusterCapacity, Resources, units};
 
 use super::events::{Event, EventTx};
 
@@ -27,9 +27,6 @@ pub enum ProbeOutcome {
         nodes_cordoned: u32,
         /// Whole-cluster schedulable capacity (allocatable minus sum of reserved).
         capacity: ClusterCapacity,
-        /// Count of schedulable NVMe-pool nodes; sizes the `qos-sync` nextest
-        /// test-group so `sync` tests run at most one per NVMe node (§11).
-        nvme_nodes: u32,
     },
     /// No kubeconfig found, or the inferred config can't be read. Soft fail; the
     /// run continues without cluster data.
@@ -50,9 +47,7 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
         Ok(c) => c,
         Err(err) => {
             let detail = format!("{err}");
-            let _ = tx.send(Event::ProbeFailed {
-                detail: detail.clone(),
-            });
+            let _ = tx.send(Event::ProbeFailed);
             return (ProbeOutcome::Missing { detail }, None);
         }
     };
@@ -65,9 +60,7 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
         Ok(c) => c,
         Err(err) => {
             let detail = format!("{err}");
-            let _ = tx.send(Event::ProbeFailed {
-                detail: detail.clone(),
-            });
+            let _ = tx.send(Event::ProbeFailed);
             return (ProbeOutcome::Failed { detail }, None);
         }
     };
@@ -85,9 +78,7 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
             missing.join(", "),
             crate::resource::RUN_CLUSTER_ROLE,
         );
-        let _ = tx.send(Event::ProbeFailed {
-            detail: detail.clone(),
-        });
+        let _ = tx.send(Event::ProbeFailed);
         return (ProbeOutcome::Failed { detail }, None);
     }
 
@@ -109,25 +100,16 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
         Ok(quad) => quad,
         Err(err) => {
             let detail = format!("{err}");
-            let _ = tx.send(Event::ProbeFailed {
-                detail: detail.clone(),
-            });
+            let _ = tx.send(Event::ProbeFailed);
             return (ProbeOutcome::Failed { detail }, None);
         }
     };
 
     let (nodes_ready, nodes_cordoned) = count_nodes(&nodes.items);
     let capacity = capacity_from(&nodes.items, &pods.items, &pvcs.items);
-    let nvme_nodes = count_nvme_nodes(&nodes.items);
     let slots_used = count_zaino_slots(&namespaces.items);
 
-    let _ = tx.send(Event::ProbeComplete {
-        context: context.clone(),
-        slots_used,
-        nodes_ready,
-        nodes_cordoned,
-        capacity,
-    });
+    let _ = tx.send(Event::ProbeComplete);
 
     (
         ProbeOutcome::Ok {
@@ -136,7 +118,6 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
             nodes_ready,
             nodes_cordoned,
             capacity,
-            nvme_nodes,
         },
         Some(client),
     )
@@ -169,22 +150,6 @@ fn count_nodes(nodes: &[Node]) -> (u32, u32) {
 /// Count schedulable NVMe-pool nodes: Ready, not cordoned, and carrying the NVMe
 /// pool label ([`NVME_NODE_LABEL_KEY`]=[`NVME_NODE_LABEL_VALUE`]). Sizes the
 /// `qos-sync` test-group; `0` on a cluster with no NVMe pool (dev / kind), which
-/// the lowering floors back to 1.
-fn count_nvme_nodes(nodes: &[Node]) -> u32 {
-    nodes
-        .iter()
-        .filter(|n| node_ready(n) && !node_cordoned(n))
-        .filter(|n| {
-            n.metadata
-                .labels
-                .as_ref()
-                .and_then(|l| l.get(NVME_NODE_LABEL_KEY))
-                .map(|v| v == NVME_NODE_LABEL_VALUE)
-                .unwrap_or(false)
-        })
-        .count() as u32
-}
-
 /// A node's `status.allocatable` as [`Resources`] (millicpu + bytes).
 fn node_allocatable(node: &Node) -> Resources {
     let Some(alloc) = node.status.as_ref().and_then(|s| s.allocatable.as_ref()) else {
@@ -198,7 +163,7 @@ fn node_allocatable(node: &Node) -> Resources {
         .get("memory")
         .map(|q| units::parse_mem_bytes(&q.0))
         .unwrap_or(0);
-    // I/O ceiling is unbounded until the node is benchmarked (docs/qos-io-dimension-design.md).
+    // I/O ceiling is unbounded until the node is benchmarked (docs/design-qos.md).
     Resources::cpu_mem_unbounded_io(cpu, mem)
 }
 
@@ -400,33 +365,6 @@ mod tests {
             },
             ..Default::default()
         }
-    }
-
-    /// A node carrying the NVMe pool label, with the given ready/cordoned state.
-    fn nvme_node(ready: bool, cordoned: bool) -> Node {
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-        let mut n = node(ready, cordoned, "4", "8Gi");
-        n.metadata = ObjectMeta {
-            labels: Some(BTreeMap::from([(
-                NVME_NODE_LABEL_KEY.to_string(),
-                NVME_NODE_LABEL_VALUE.to_string(),
-            )])),
-            ..Default::default()
-        };
-        n
-    }
-
-    #[test]
-    fn count_nvme_nodes_counts_only_labeled_schedulable_nodes() {
-        let nodes = vec![
-            nvme_node(true, false),        // counted
-            nvme_node(true, true),         // labeled but cordoned → excluded
-            nvme_node(false, false),       // labeled but not ready → excluded
-            node(true, false, "4", "8Gi"), // schedulable but unlabeled → excluded
-        ];
-        assert_eq!(count_nvme_nodes(&nodes), 1);
-        // A cluster with no NVMe pool → 0 (lowering floors it back to 1).
-        assert_eq!(count_nvme_nodes(&[node(true, false, "4", "8Gi")]), 0);
     }
 
     #[test]

@@ -2,8 +2,6 @@
 //! classifying `seed-{sha8}` PVCs as ready or pending. Provisioning happens in
 //! the resource graph; this module only observes for the preflight banner.
 
-use std::convert::TryInto;
-
 use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use kube::api::ListParams;
 use kube::{Api, Client};
@@ -126,17 +124,6 @@ fn parse_storage_bytes(q: &k8s_openapi::apimachinery::pkg::api::resource::Quanti
     num.parse::<u64>().unwrap_or(0).saturating_mul(mult)
 }
 
-/// Convenience for the banner: split discovered entries into
-/// `(ready, pending)` counts.
-pub fn ready_pending_counts(entries: &[ArchiveEntry]) -> (u32, u32) {
-    let ready = entries.iter().filter(|e| e.ready).count();
-    let pending = entries.len() - ready;
-    (
-        ready.try_into().unwrap_or(u32::MAX),
-        pending.try_into().unwrap_or(u32::MAX),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,29 +188,5 @@ mod tests {
         let p = pvc("seed-12345678", true, None);
         let entry = classify_pvc(&p).unwrap();
         assert_eq!(entry.size_bytes, 0);
-    }
-
-    #[test]
-    fn ready_pending_counts_partitions_correctly() {
-        let entries = vec![
-            ArchiveEntry {
-                name: "seed-a".into(),
-                size_bytes: 1,
-                ready: true,
-            },
-            ArchiveEntry {
-                name: "seed-b".into(),
-                size_bytes: 2,
-                ready: false,
-            },
-            ArchiveEntry {
-                name: "seed-c".into(),
-                size_bytes: 3,
-                ready: true,
-            },
-        ];
-        let (ready, pending) = ready_pending_counts(&entries);
-        assert_eq!(ready, 2);
-        assert_eq!(pending, 1);
     }
 }

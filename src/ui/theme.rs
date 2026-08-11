@@ -127,6 +127,11 @@ pub struct ThemeChars {
     /// so a `[####------] 40%` reads cleanly in any terminal.
     pub bar_fill: &'static str,
     pub bar_empty: &'static str,
+    /// Sub-cell resolution available for time-series graphs.
+    pub graph: super::plot::GraphMode,
+    /// Box-drawing frame for a graph panel: corners then edges, in the order
+    /// top-left, top-right, bottom-left, bottom-right, horizontal, vertical.
+    pub frame: [&'static str; 6],
 }
 
 impl ThemeChars {
@@ -142,6 +147,8 @@ impl ThemeChars {
             vbar: "│",
             bar_fill: "█",
             bar_empty: "░",
+            graph: super::plot::GraphMode::Braille,
+            frame: ["╭", "╮", "╰", "╯", "─", "│"],
         }
     }
 
@@ -157,6 +164,8 @@ impl ThemeChars {
             vbar: "|",
             bar_fill: "#",
             bar_empty: "-",
+            graph: super::plot::GraphMode::Ascii,
+            frame: ["+", "+", "+", "+", "-", "|"],
         }
     }
 

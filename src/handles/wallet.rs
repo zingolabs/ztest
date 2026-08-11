@@ -93,7 +93,8 @@ pub trait WalletConfig: Send + Sync + std::fmt::Debug + 'static {
     /// The live handle type this backend produces.
     type Handle: WalletBackend + Clone;
 
-    /// Backend-specific tuning tokens (see [`ComponentBuilder::tuning`]).
+    /// Backend-specific tuning tokens (see
+    /// [`ComponentBuilder::tuning`](crate::ComponentBuilder::tuning)).
     /// [`NoTuning`](crate::component::NoTuning) for wallets with no knobs.
     type Tuning: Clone + std::fmt::Debug + Send + Sync + 'static;
 

@@ -148,63 +148,57 @@ pub(crate) fn parse_activation_heights_from_rpc(
 /// ```
 pub trait Regtest: Sized {
     /// Apply the standard regtest fixture. The fetch/state backend is an
-    /// orthogonal choice — see [`Indexer::backend`](crate::component::Indexer::backend).
+    /// orthogonal choice — see `Indexer::backend`.
     fn regtest(self) -> Self;
 }
 
-/// Builder shortcut: apply a named testnet fixture to a component.
+/// Builder shortcut: boot a component from an archived state directory.
 ///
-/// Each `variant` resolves to a curated chain snapshot at
-/// `fixtures/testnet/<variant>/`, one archive per validator backend
-/// (`zebra.tar.xz`, `zcashd.tar.xz`). Component configs are generated
-/// in-process by [`crate::testnet_conf`]. Variants are named for the pool /
-/// scenario, e.g. `"orchard"`, `"sapling"`.
+/// One method for the two cases that used to have their own: an immutable,
+/// height-pinned snapshot of The Public Testnet, and a pre-mined regtest
+/// chain-cache. They are the same operation — restore a state directory — and
+/// the archive itself records which chain it holds, so the *caller* no longer
+/// chooses. Restoring a testnet archive configures the component for testnet;
+/// restoring a regtest cache configures it for regtest. Saying the wrong one is
+/// not expressible.
+///
+/// The handle is one of the named consts in [`crate::snapshots`], or one
+/// declared locally with [`archive!`](macro@crate::archive). Component configs are
+/// generated in-process by [`crate::testnet_conf`].
 ///
 /// ```ignore
-/// let zebrad = env.add_validator(Validator::zebrad("5.1.1").testnet("orchard"));
-/// let zaino  = env.add_indexer(Indexer::zainod("0.4.0-rc.2-no-tls").testnet("orchard"));
+/// use ztest::prelude::*;   // brings ORCHARD, SAPLING, … into scope
+///
+/// #[ztest::needs(ORCHARD)]
+/// #[tokio::test]
+/// async fn t() {
+///     let zebrad = env.add_validator(Validator::zebrad("6.2.3").restore(ORCHARD));
+///     let zaino  = env.add_indexer(Indexer::zainod("0.4.0").restore(ORCHARD));
+/// }
 /// ```
-pub trait Testnet: Sized {
-    /// Apply the named testnet fixture. The fetch/state backend is an
-    /// orthogonal choice — see [`Indexer::backend`](crate::component::Indexer::backend).
-    fn testnet(self, variant: &str) -> Self;
+///
+/// The validator's builder version and the archive's producer version must
+/// agree, and every component in an env must name the same artifact; both are
+/// enforced at `env.build()` rather than here, because a builder method cannot
+/// fail and the second check needs the whole env in view.
+pub trait Restore: Sized {
+    /// Boot from `archive`. The fetch/state backend is an orthogonal choice —
+    /// see `Indexer::backend`.
+    fn restore(self, archive: crate::ArchiveHandle) -> Self;
 }
 
-/// Which on-disk chain layout a testnet archive carries; drives the
-/// filename inside `fixtures/testnet/<variant>/`. zebrad and zcashd
-/// serialise their state directories incompatibly, so each backend has its
-/// own archive per variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TestnetChainKind {
-    Zebra,
-    #[allow(dead_code)] // wired in once Validator::zcashd(_).testnet(_) lands.
-    Zcashd,
-}
-
-impl TestnetChainKind {
-    fn filename(self) -> &'static str {
-        match self {
-            TestnetChainKind::Zebra => "zebra.tar.xz",
-            TestnetChainKind::Zcashd => "zcashd.tar.xz",
-        }
-    }
-}
-
-/// Mount a chain-cache archive at `destination`, from
-/// `fixtures/testnet/<variant>/<kind>.tar.xz`. Fails at materialization
-/// (not compile time) if the archive is missing, since variant directories
-/// without a chain-cache are still useful for config-only iteration.
-pub(crate) fn testnet_chain_archive(
-    variant: &str,
-    kind: TestnetChainKind,
+/// Mount an archive at `destination`.
+///
+/// The identity comes from the handle, which the macro read out of the
+/// artifact's manifest at compile time and submitted as a
+/// [`SeedDecl`](crate::inventory::SeedDecl) for preflight to pre-provision — so
+/// unlike the runtime-`format!` path this replaced, a missing artifact cannot
+/// first surface as a materialization failure on a cluster.
+pub(crate) fn archive_mount(
+    archive: crate::ArchiveHandle,
     destination: &str,
 ) -> crate::mount::Mount {
-    let rel = format!("testnet/{variant}/{}", kind.filename());
-    crate::mount::Mount {
-        source: crate::mount::MountSource::ArchiveAbs(fixture(&rel)),
-        destination: std::path::PathBuf::from(destination),
-        kind: crate::mount::MountKind::DirArchive,
-    }
+    crate::mount::Mount::archive(archive, destination)
 }
 
 // ──────────────────────────── Fixture helpers ──────────────────────────
@@ -212,12 +206,6 @@ pub(crate) fn testnet_chain_archive(
 use std::path::PathBuf;
 
 use crate::mount::{Mount, MountKind, MountSource};
-
-pub(crate) fn fixture(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
-        .join(rel)
-}
 
 pub(crate) fn scratch_mount(dest: &str) -> Mount {
     Mount::scratch(PathBuf::from(dest))

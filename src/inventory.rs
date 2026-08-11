@@ -2,7 +2,7 @@
 //!
 //! The [`dev!`] macro submits declarations via the `inventory` crate, which
 //! aggregates them across the binary's reachable graph at link time. The CLI
-//! spawns each test binary with `ZTEST_DUMP_INVENTORY=1`; [`dump_hook`] then
+//! spawns each test binary with `ZTEST_DUMP_INVENTORY=1`; `dump_hook` then
 //! serializes the inventory to stdout (one JSON object per line) and exits
 //! before any test runs, so the tag never crosses the process boundary as a
 //! linked dependency.
@@ -32,7 +32,7 @@ pub struct DevImageDecl {
     /// `<repo>:dev-<hash>` image; empty ⇒ one image with the Dockerfile's own
     /// `RUST_VERSION` default. Must be statically declarable here because images
     /// are provisioned before any test runs, so a runtime rstest `#[case]` value
-    /// can't reach it. See `docs/rust-version-matrix.md`.
+    /// can't reach it. See `docs/guide-writing-tests.md`.
     pub rust_versions: &'static [&'static str],
 }
 
@@ -67,7 +67,7 @@ pub struct DevImageEntry {
     pub features: Vec<String>,
     /// The single rust version this image is built at; `None` leaves the
     /// Dockerfile's own `RUST_VERSION` default. A [`DevImageDecl`] with N
-    /// `rust_versions` expands to N entries (see [`expand_decl`]), each a
+    /// `rust_versions` expands to N entries (see `expand_decl`), each a
     /// distinct image downstream.
     pub rust_version: Option<String>,
 }
@@ -161,12 +161,19 @@ pub fn qos_iter() -> impl Iterator<Item = &'static QosDecl> {
 
 // ─────────────────────────── seed inventory ───────────────────────────
 //
-// Data seeds a test declares via `mount_archive!` / `mount_file!`. Declaring the
-// seed as a static `SeedDecl` at the call site lets the preflight resource graph
-// pre-provision it before any test runs, instead of the first test to reach
-// `TestEnv::build()` materializing it lazily. A seed is content-addressed by the
-// SHA-256 of its source bytes (recomputed at `build()`), so only the source path
-// crosses the process boundary.
+// Data seeds a test declares via `mount_archive!` / `mount_file!` /
+// `#[ztest::needs]`. Declaring the seed as a static `SeedDecl` at the call site
+// lets the preflight resource graph pre-provision it before any test runs,
+// instead of the first test to reach `TestEnv::build()` materializing it
+// lazily.
+//
+// A seed is identified by its Git LFS object id — the SHA-256 of the archive
+// bytes — baked from the sidecar manifest at compile time. Nothing here is a
+// path. That is what lets the identity cross every boundary in a run: the
+// laptop that declares the archive, the build pod that compiles the test, the
+// runner pod that requests the mount and the puller Job that fetches
+// `lfs/<oid>` all name the same seed, and none of them has to be able to read
+// the file.
 
 /// How a seed's source is loaded into its PVC: extracted (archive) or copied
 /// byte-for-byte (file). The field is named `payload`, not `kind`, to avoid
@@ -180,12 +187,19 @@ pub enum SeedPayload {
     File,
 }
 
-/// One seed declaration, ready for `inventory::submit!`. `source` is resolved
-/// to an absolute path by the macro at compile time, so the preflight process
-/// can read and hash it directly.
+/// One seed declaration, ready for `inventory::submit!`.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SeedDecl {
-    pub source: &'static str,
+    /// The artifact's filename. Not an identity — carried so the puller can
+    /// derive decompression from the extension and so diagnostics name
+    /// something a human can find rather than a 64-hex digest.
+    pub name: &'static str,
+    /// Git LFS object id (SHA-256 of the bytes): the seed's identity, the PVC
+    /// name `seed-<oid[..8]>`, and the bucket key `lfs/<oid>`.
+    pub oid: &'static str,
+    /// Compressed size in bytes, from the manifest's `size_bytes`. Sizes the
+    /// puller's transfer budget without fetching anything.
+    pub size: u64,
     pub payload: SeedPayload,
 }
 
@@ -194,14 +208,18 @@ inventory::collect!(SeedDecl);
 /// Owned counterpart of [`SeedDecl`] for the read side of the dump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeedEntry {
-    pub source: String,
+    pub name: String,
+    pub oid: String,
+    pub size: u64,
     pub payload: SeedPayload,
 }
 
 impl From<&SeedDecl> for SeedEntry {
     fn from(d: &SeedDecl) -> Self {
         SeedEntry {
-            source: d.source.to_string(),
+            name: d.name.to_string(),
+            oid: d.oid.to_string(),
+            size: d.size,
             payload: d.payload,
         }
     }
@@ -214,21 +232,21 @@ pub fn seed_iter() -> impl Iterator<Item = &'static SeedDecl> {
 
 // ───────────────────────── test→resource edges ────────────────────────
 //
-// The per-test dependency edge. `#[ztest::archive(NAME = "path")]` (and the
-// `#[ztest::needs(NAME)]` companion) submit a `TestDepDecl` alongside the
-// `SeedDecl` that makes the resource provisionable: where `SeedDecl` says the
-// resource can be built, `TestDepDecl` says which test needs it, so `ztest run`
-// can gate admission and cleanly SKIP only the tests whose resource failed
-// rather than let them fail at `TestEnv::build()`. `resource` is the SAME string
-// as the paired `SeedDecl::source`, keying the edge to the resource's node.
+// The per-test dependency edge. `#[ztest::needs(NAME)]` submits a `TestDepDecl`
+// alongside the `SeedDecl` that makes the resource provisionable: where
+// `SeedDecl` says the resource can be built, `TestDepDecl` says which test needs
+// it, so `ztest run` can gate admission and cleanly SKIP only the tests whose
+// resource failed rather than let them fail at `TestEnv::build()`. `resource` is
+// the SAME string as the paired `SeedDecl::oid`, keying the edge to the
+// resource's node.
 
 /// One test→resource dependency edge, ready for `inventory::submit!`.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct TestDepDecl {
     /// `concat!(module_path!(), "::", test_fn)` — crate-rooted, matching `QosDecl`.
     pub test_id: &'static str,
-    /// Absolute source path of the needed resource — identical to the paired
-    /// [`SeedDecl::source`], so the engine resolves both to the same node.
+    /// Git LFS object id of the needed resource — identical to the paired
+    /// [`SeedDecl::oid`], so the engine resolves both to the same node.
     pub resource: &'static str,
 }
 
@@ -319,7 +337,7 @@ pub fn sync_test_iter() -> impl Iterator<Item = &'static SyncTestDecl> {
 /// Borrowed write side of a dump line (serialized by the dump hook), tagged with
 /// `"kind"` so the declaration kinds share one stream; [`InventoryLine`] is the
 /// owned read side. Dev images have no borrowed variant: one static
-/// [`DevImageDecl`] fans out (via [`expand_decl`]) into N owned
+/// [`DevImageDecl`] fans out (via `expand_decl`) into N owned
 /// [`DevImageEntry`] lines, serialized as [`InventoryLine::Dev`] directly.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -537,7 +555,9 @@ mod tests {
     #[test]
     fn seed_line_is_tagged_and_demuxes_to_seed_entry() {
         let decl = SeedDecl {
-            source: "/abs/data.tar.zst",
+            name: "data.tar.zst",
+            oid: "d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00",
+            size: 4096,
             payload: SeedPayload::Archive,
         };
         let line = serde_json::to_string(&InventoryLineRef::Seed(&decl)).unwrap();
@@ -552,7 +572,9 @@ mod tests {
         );
         match serde_json::from_str::<InventoryLine>(&line).unwrap() {
             InventoryLine::Seed(e) => {
-                assert_eq!(e.source, "/abs/data.tar.zst");
+                assert_eq!(e.name, "data.tar.zst");
+                assert_eq!(e.oid, "d47a1e00".repeat(8));
+                assert_eq!(e.size, 4096);
                 assert_eq!(e.payload, SeedPayload::Archive);
             }
             other => panic!("seed line demuxed as {other:?}"),

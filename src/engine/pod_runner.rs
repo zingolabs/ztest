@@ -304,14 +304,14 @@ async fn run_in_pod(
     }
 }
 
-/// Tear down one test's cluster footprint (pod path): the cluster-scoped shadow
+/// Tear down one test's cluster footprint (pod path): the cluster-scoped seed-binding
 /// VSCs it minted (by the per-test-ns label — they don't cascade with the
 /// namespace), then the per-test namespace (cascading its component pods, PVCs,
 /// and quota), then the runner pod itself (it lives in the run namespace, not the
 /// per-test one, so the namespace delete doesn't reach it). All best-effort;
 /// `reap_run` by `run-id` is the crash-safety net if this process dies first.
 async fn teardown(client: &kube::Client, cfg: &PodRunConfig, test_ns: &str, runner_pod: &str) {
-    crate::cluster::delete_shadow_vscs_for_ns(client, test_ns).await;
+    crate::cluster::delete_seed_binding_contents_for_ns(client, test_ns).await;
     let _ = crate::cluster::delete_namespace(client, test_ns).await;
     let api: Api<corev1::Pod> = Api::namespaced(client.clone(), &cfg.namespace);
     let _ = api.delete(runner_pod, &DeleteParams::default()).await;
@@ -447,7 +447,21 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> 
     // The run-id label is load-bearing: the parent's `reap_run` teardown
     // (`cli/run.rs` Ctrl-C path) deletes every resource matching it, so a runner
     // pod is cleaned up even if this process is killed mid-run.
-    let labels = BTreeMap::from([(crate::qos::LABEL_RUN_ID.to_string(), cfg.env.run_id.clone())]);
+    //
+    // The user label is the backstop for when that teardown never runs at all —
+    // the parent SIGKILLed, the terminal closed. `ztest cleanup` scopes by
+    // [`LABEL_USER`](crate::qos::LABEL_USER) by default, so without it a runner
+    // pod survives every reap the operator can reach for and holds its Guaranteed
+    // footprint until someone deletes it by name. Read from the environment
+    // rather than plumbed through `EngineEnv`: this pod is created in-process by
+    // the same operator the engine runs as.
+    let labels = BTreeMap::from([
+        (crate::qos::LABEL_RUN_ID.to_string(), cfg.env.run_id.clone()),
+        (
+            crate::qos::LABEL_USER.to_string(),
+            crate::naming::current_user(),
+        ),
+    ]);
 
     // Guaranteed QoS: the runner pod (the test binary + any in-process wallet)
     // is sized at its tier's runner footprint, rendered `requests == limits`

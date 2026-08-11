@@ -48,18 +48,19 @@ pub enum NoTuning {}
 /// The network fixture an indexer runs against. Orthogonal to the backend
 /// [`tuning`](ComponentBuilder::tuning): the mode picks which `zainod.toml` is
 /// rendered at build time, the tunings pick knobs inside it. Set by the
-/// [`Regtest`](crate::regtest::Regtest) / [`Testnet`](crate::regtest::Testnet)
+/// [`Regtest`](crate::regtest::Regtest) / [`Restore`](crate::regtest::Restore)
 /// builder methods. `None` means no fixture (config supplied manually).
 ///
-/// `Testnet` / `Mainnet` name a curated snapshot under
-/// `fixtures/<net>/<variant>/`. `Regtest` carries no variant: it mines its own
-/// chain in-process rather than loading a snapshot.
+/// `Testnet` carries the typed handle to the immutable, height-pinned artifact
+/// it runs against, so the producer version and pin travel with the mode
+/// instead of being re-derived from a variant name. `Regtest` carries nothing:
+/// it mines its own chain in-process rather than restoring an archive.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum IndexerMode {
     #[default]
     None,
     Regtest,
-    Testnet(String),
+    Testnet(crate::ArchiveHandle),
     Mainnet(String),
 }
 
@@ -114,18 +115,28 @@ pub struct ComponentOpts {
     /// backend default; set explicitly via [`Validator::mine_to`]. Resolved to a
     /// concrete pool (and regtest miner address) at `env.build()`.
     pub(crate) coinbase_pool: Option<Pool>,
-    /// Pre-mined chain to boot this validator from, instead of a cold chain.
-    /// Consumed by the zebrad backend (skips the slow coinbase-maturity mine in
-    /// funded tests); a no-op on zcashd. `None` for the common ephemeral case.
-    pub(crate) regtest_cache: Option<RegtestCacheSource>,
+    /// What this component's on-disk state is restored from, if anything.
+    ///
+    /// Recorded on the opts — not only in [`IndexerMode`] — because validators
+    /// have no mode field, and `env.build()` needs every participant's pin in
+    /// view at once to reject an env whose components disagree about which
+    /// chain they are serving. `None` for the common ephemeral case.
+    pub(crate) restore: Option<RestoreSource>,
 }
 
-/// Where a validator's pre-mined regtest chain comes from. See
-/// [`ComponentOpts::regtest_cache`] and [`Validator::with_regtest_cache`].
+/// Where a component's pre-existing on-disk state comes from. See
+/// [`Restore::restore`](crate::regtest::Restore::restore).
 #[derive(Debug, Clone)]
-pub enum RegtestCacheSource {
-    /// Load a committed chain-cache archive (the production test path).
-    Archive(std::path::PathBuf),
+pub enum RestoreSource {
+    /// Restore from a content-addressed archive.
+    ///
+    /// One variant covers a pre-synced testnet chain and a pre-mined regtest
+    /// cache, because they are one thing: an archived state directory. Which it
+    /// is — and therefore which network the component boots on — is read from
+    /// the handle's [`ChainInfo`](crate::ChainInfo) rather than encoded in the
+    /// variant. A state directory knows what chain it holds, and asking it is
+    /// what makes booting a testnet archive as regtest unrepresentable.
+    Archive(crate::ArchiveHandle),
     /// Boot fresh persistent on-disk state so a cache asset can be mined and
     /// extracted. See [`Validator::with_blank_persistent_state`].
     Blank,
@@ -346,7 +357,7 @@ impl Wallet<crate::backends::librustzcash::LrzBackend> {
     /// wallet that syncs over the indexer's lightwalletd gRPC and builds
     /// shielded txs with bundled Sapling params. Hand the returned `Wallet` to
     /// [`TestEnv::add_wallet`](crate::env::TestEnv::add_wallet), then build
-    /// accounts with [`WalletHandle::account`](crate::handles::WalletHandle).
+    /// accounts with [`WalletExt::account`](crate::handles::wallet::WalletExt::account).
     pub fn librustzcash() -> Self {
         Self::new(crate::backends::librustzcash::LrzBackend)
     }
@@ -357,7 +368,7 @@ impl Wallet<ZingoBackend> {
     /// In-process zingolib wallet: runs `LightClient`s in the test binary
     /// against the indexer's gRPC, with no pod. Hand the returned `Wallet` to
     /// [`TestEnv::add_wallet`](crate::env::TestEnv::add_wallet), then build
-    /// accounts with [`WalletHandle::account`](crate::handles::WalletHandle).
+    /// accounts with [`WalletExt::account`](crate::handles::wallet::WalletExt::account).
     pub fn zingo() -> Self {
         Self::new(ZingoBackend)
     }
@@ -411,7 +422,7 @@ pub trait ComponentBuilder: Sized {
 
     /// Apply a backend tuning token, interpreted by the backend at build time
     /// (e.g. `ZainoTuning::State`). Composable — call repeatedly to stack knobs.
-    /// A backend whose `Tuning` is [`NoTuning`](crate::component::NoTuning)
+    /// A backend whose `Tuning` is [`NoTuning`]
     /// accepts no value, so this cannot be called on it.
     fn tuning(mut self, tuning: Self::Tuning) -> Self {
         self.push_tuning(tuning);
@@ -425,8 +436,9 @@ pub trait ComponentBuilder: Sized {
     }
     /// Mount a file, directory, archive, or shared volume into the component at
     /// startup. Accepts anything `Into<Mount>` — a [`Mount`], or a
-    /// `(&SharedVolume, path)` for a shared on-disk store (see
-    /// [`SharedVolume::at`](crate::SharedVolume::at)). A shared mount is also
+    /// `&SharedVolume` for a shared on-disk store, which carries its own
+    /// canonical path (see [`SharedVolume`](crate::SharedVolume)). A shared
+    /// mount is also
     /// recorded as this component's shared state directory, so two components
     /// mounting the same volume at the same path share one store (e.g. a zebrad
     /// persisting its state DB and a zaino reading it via `ZainoTuning::State`).
@@ -487,7 +499,7 @@ pub trait ComponentBuilder: Sized {
     /// selector for a rust-version matrix. The version must be one the `dev!`
     /// call declared in `rust_versions` (only those are pre-built); an unbuilt
     /// version fails loud at `build()` with `DevImageMissing`. No effect on a
-    /// published image. See `docs/rust-version-matrix.md`.
+    /// published image. See `docs/guide-writing-tests.md`.
     fn rust_version(mut self, version: impl Into<String>) -> Self {
         if let crate::backends::image::ImageSpec::Dev { rust_version, .. } =
             &mut self.component_opts_mut().image
@@ -510,7 +522,7 @@ impl<B: ValidatorConfig> ComponentBuilder for Validator<B> {
 
 /// One `.regtest()` for every validator backend. Each backend contributes its
 /// launch argv / scratch mounts through
-/// [`ValidatorConfig::regtest_opts`](crate::handles::ValidatorConfig::regtest_opts),
+/// [`ValidatorConfig::regtest_opts`],
 /// so a generic `<B: ValidatorConfig>` test can call `.regtest()` uniformly and
 /// a new backend gets it for free — no per-backend impl. (Testnet stays
 /// per-backend: only zebrad has a fixture.)
@@ -605,25 +617,12 @@ impl<B: ValidatorConfig> Validator<B> {
         self.opts.coinbase_pool = Some(pool);
         self
     }
-    /// Boot this validator from a committed chain-cache archive instead of a
-    /// cold chain. On zebrad this loads a pre-mined, matured regtest chain so
-    /// funded tests skip the slow coinbase-maturity mine; a no-op on zcashd.
-    ///
-    /// Takes a typed [`ArchiveHandle`](crate::ArchiveHandle) from
-    /// `#[ztest::archive(NAME = "path")]`, not a loose path: the handle
-    /// registers the archive with preflight (so it's pre-provisioned) and
-    /// records the per-test dependency edge (so a test whose archive fails is
-    /// cleanly SKIPPED, not failed here).
-    pub fn with_regtest_cache(mut self, archive: crate::ArchiveHandle) -> Self {
-        self.opts.regtest_cache = Some(RegtestCacheSource::Archive(archive.into()));
-        self
-    }
     /// Boot this validator with fresh persistent on-disk state, to generate a
     /// chain-cache asset: mine blocks, then extract the persisted state
-    /// directory. Not for ordinary tests; pair with [`Self::with_regtest_cache`]
-    /// there.
+    /// directory. Not for ordinary tests; pair with
+    /// [`restore`](crate::regtest::Restore::restore) there.
     pub fn with_blank_persistent_state(mut self) -> Self {
-        self.opts.regtest_cache = Some(RegtestCacheSource::Blank);
+        self.opts.restore = Some(RestoreSource::Blank);
         self
     }
     pub fn peer(mut self, name: impl Into<String>) -> Self {

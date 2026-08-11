@@ -27,8 +27,13 @@ ztest-dev-${USER}-${NEXTEST_PID}-${NEXTEST_TEST_GLOBAL_SLOT}
 Dev namespaces are **not** cleaned up at exit; the cluster TTL controller GCs them (default 1h after `last_accessed_at`). To force cleanup:
 
 ```bash
-kubectl delete ns -l ztest.io/owner=${USER}
+ztest cleanup            # your finished runs and syncs; --dry-run to preview
+ztest cleanup --all-users
 ```
+
+`cleanup` skips anything still live (an in-flight run, a `Running` sync) and
+never touches the cluster itself or the seed cache; `--force` overrides the
+liveness gate.
 
 ## CI (GitHub Actions)
 

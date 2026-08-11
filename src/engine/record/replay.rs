@@ -12,8 +12,8 @@ use std::process::ExitCode;
 
 use nextest_metadata::NextestExitCode;
 
-use super::store::OutputStore;
 use super::RecordedEvent;
+use super::store::OutputStore;
 use crate::engine::events::{RunReporter, RunStats, TestEvent};
 use crate::engine::output::OutputConfig;
 use crate::engine::reporter::StyledReporter;
@@ -49,7 +49,9 @@ pub fn replay_into<W: Write>(
     // a finished test has no stored bytes, and replay shows `(output not
     // captured)` where the output block would be — as nextest does. Missing meta
     // (an older recording) is treated as captured.
-    let captured = super::read_meta(run_dir).map(|m| m.captured).unwrap_or(true);
+    let captured = super::read_meta(run_dir)
+        .map(|m| m.captured)
+        .unwrap_or(true);
     let store = OutputStore::open(run_dir);
     let log = File::open(run_dir.join("run.log.zst")).map_err(|e| {
         io::Error::new(
@@ -248,6 +250,7 @@ mod tests {
                 stats: RunStats {
                     passed: 1,
                     failed: 1,
+                    terminated: 0,
                     skipped: 0,
                     total: 2,
                 },
@@ -264,7 +267,10 @@ mod tests {
         assert!(out.contains("Starting 2 tests"), "{out}");
         assert!(out.contains("PASS [   0.100s] pkg::bin mod::ok"), "{out}");
         assert!(out.contains("FAIL [   0.200s] pkg::bin mod::boom"), "{out}");
-        assert!(out.contains("panic: boom"), "failure output must replay:\n{out}");
+        assert!(
+            out.contains("panic: boom"),
+            "failure output must replay:\n{out}"
+        );
         assert!(
             out.contains("Summary [   1.000s] 2 tests run: 1 passed, 1 failed, 0 skipped"),
             "{out}"
@@ -276,12 +282,14 @@ mod tests {
         let failed = Some(RunStats {
             passed: 0,
             failed: 1,
+            terminated: 0,
             skipped: 0,
             total: 1,
         });
         let skipped = Some(RunStats {
             passed: 0,
             failed: 0,
+            terminated: 0,
             skipped: 1,
             total: 1,
         });

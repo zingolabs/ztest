@@ -7,7 +7,10 @@
 use async_trait::async_trait;
 
 use crate::RpcError;
-use crate::handles::wallet::Pool;
+use crate::handles::wallet::PoolBalances;
+
+use super::tree::TreeRoots;
+use super::work::Work;
 
 /// The live phase of a sync, surfaced in `watch` and observable by probes. For
 /// a wallet it derives from pepper-sync's `ScanPriority`; for a validator from
@@ -54,40 +57,75 @@ impl Phase {
 }
 
 /// The common progress columns every subject exposes — enough for the
-/// subject-agnostic probes (monotonic height, no-stall, reached-target). Pool
-/// outputs and balance are wallet extras (`None`/`0` for observer subjects).
+/// subject-agnostic probes (monotonic height, no-stall, reached-target).
+/// Balances and note-commitment-tree roots are wallet extras: an observer
+/// subject (an indexer or validator being watched) has no wallet and reports
+/// neither, which the defaults below say explicitly rather than by returning a
+/// zero that a probe would read as a passing observation.
 pub trait ProgressView: Send + std::fmt::Debug {
     /// Highest height this subject has synced/scanned through.
     fn height(&self) -> u32;
     /// The chain tip this sync targets, if known.
     fn target(&self) -> Option<u32>;
-    /// Fraction complete in `0.0..=100.0`. For a wallet this is
-    /// `percentage_total_outputs_scanned` (scanning is non-linear in height).
-    fn pct(&self) -> f32;
+    /// Fraction complete in `0.0..=100.0`.
+    ///
+    /// Defaults to `height / target`, which is the honest answer for any
+    /// subject that advances linearly through the chain — an observer has
+    /// nothing to add to that arithmetic and should not restate it.
+    ///
+    /// Override where progress is *not* linear in height: a wallet scans
+    /// chain-tip-first over tree shards, so its true fraction is
+    /// `percentage_total_outputs_scanned` and its height understates it badly
+    /// mid-scan.
+    ///
+    /// Note the denominator is a per-tick reading, not a constant. On a chain
+    /// still producing blocks this can move **backwards** — the subject gained
+    /// ground while the tip gained more. That is a true reading, and nothing
+    /// downstream may assume it rises monotonically.
+    fn pct(&self) -> f32 {
+        match self.target() {
+            Some(target) if target > 0 => {
+                (100.0 * f64::from(self.height()) / f64::from(target)) as f32
+            }
+            _ => 0.0,
+        }
+    }
     /// The live phase.
     fn phase(&self) -> Phase;
-    /// Cumulative outputs scanned in `pool` (wallet subjects); `0` otherwise.
-    fn outputs(&self, pool: Pool) -> u64 {
-        let _ = pool;
-        0
+    /// The subject's own count of cumulative protocol work completed, when it
+    /// has a truer one than the chain-derived index.
+    ///
+    /// `None` — the default, and what every observer subject uses — means the
+    /// harness derives work from [`height`](Self::height) via
+    /// [`ChainWork`](crate::sync::ChainWork). That path needs nothing from the
+    /// component beyond a height, which is what keeps the metric available for
+    /// a Go lightwalletd or a C++ zcashd on the same terms as a Rust zaino.
+    ///
+    /// Override only where height genuinely misreports progress: a wallet
+    /// scans non-linearly (chain-tip-first, shard-based), so its height is not
+    /// its progress and its own counters are the honest source.
+    fn work(&self) -> Option<Work> {
+        None
     }
-    /// Total wallet balance in zatoshis (wallet subjects); `0` otherwise.
-    fn balance_total(&self) -> i64 {
-        0
+    /// The subject's confirmed per-pool balances, for subjects that hold funds.
+    ///
+    /// `None` — the default — means this subject is not a wallet and has no
+    /// balance to report. It is *not* "zero": a probe reading it through
+    /// [`Snapshot::balances`](crate::sync::Snapshot::balances) panics rather
+    /// than comparing zeroes that can never fail.
+    fn balances(&self) -> Option<PoolBalances> {
+        None
     }
-}
-
-/// The subject's note-commitment-tree roots at the completion tip, as raw
-/// 32-byte encodings so this stays free of the `sapling-crypto`/`orchard` hash
-/// types (kept in the `zingo`-gated wallet subject). `None` for a pool the
-/// subject does not track, or for an observer subject. The `at_completion`
-/// oracle compares these against the indexer's `TreeState` frontier root.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TreeRoots {
-    /// Sapling commitment-tree root at the tip.
-    pub sapling: Option<[u8; 32]>,
-    /// Orchard commitment-tree root at the tip.
-    pub orchard: Option<[u8; 32]>,
+    /// The subject's note-commitment-tree roots at this tick — the wallet side
+    /// of the independent-authority check against an indexer's `GetTreeState`.
+    ///
+    /// Defaults to [`TreeRoots::UNREPORTED`] for every subject that maintains
+    /// no trees. A wallet returns [`TreeRoots::reported`], whose per-pool
+    /// `None` then carries real information (the pool is empty at this height,
+    /// or its shard tree is still incomplete mid-scan).
+    fn tree_roots(&self) -> TreeRoots {
+        TreeRoots::UNREPORTED
+    }
 }
 
 /// One sync subject. The runner drives its lifecycle: [`launch`](Self::launch)
@@ -96,10 +134,10 @@ pub struct TreeRoots {
 /// cancellation. For a wallet ztest owns the engine (launch spawns
 /// `pepper_sync::sync`); for a self-syncing indexer/validator `launch`/`stop`
 /// are no-ops and the runner is a pure observer.
-// `Sync` (not just `Send`): the default `async fn terminal_roots(&self)` borrows
-// `&self` across an await, so `async_trait` requires the subject be shareable
-// for that future to be `Send`. Every subject already is (the wallet is driven
-// through a shared `Arc<RwLock<LightWallet>>`).
+// `Sync` (not just `Send`): `progress(&self)` borrows `&self` across an await,
+// so `async_trait` requires the subject be shareable for that future to be
+// `Send`. Every subject already is (the wallet is driven through a shared
+// `Arc<RwLock<LightWallet>>`).
 #[async_trait]
 pub trait SyncSubject: Send + Sync {
     /// The per-tick reading this subject produces.
@@ -118,13 +156,5 @@ pub trait SyncSubject: Send + Sync {
     /// have nothing to stop.
     async fn stop(&mut self) -> Result<(), RpcError> {
         Ok(())
-    }
-
-    /// The subject's commitment-tree roots at the completion tip, folded into
-    /// the terminal [`Snapshot`](crate::sync::Snapshot) for the `at_completion`
-    /// oracle. Read once, after [`is_complete`](Self::is_complete); the default
-    /// is empty (observer subjects expose no wallet tree).
-    async fn terminal_roots(&self) -> Result<TreeRoots, RpcError> {
-        Ok(TreeRoots::default())
     }
 }

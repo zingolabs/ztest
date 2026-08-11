@@ -5,7 +5,7 @@
 //! is the single canonical default (NU6.3/Ironwood active); a test that needs a
 //! different schedule supplies a full explicit one via
 //! [`crate::TestEnv::activation_heights`], which is checked by
-//! [`ActivationHeights::validate_schedule`].
+//! `ActivationHeights::validate_schedule`.
 
 // ────────────────────────── ActivationHeights ─────────────────────────
 

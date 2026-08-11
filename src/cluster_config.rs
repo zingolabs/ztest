@@ -448,13 +448,25 @@ pub struct KubeMaterial {
 
 /// Path to the profile store, honoring `$XDG_CONFIG_HOME`.
 pub fn config_path() -> PathBuf {
+    config_dir().join("clusters.toml")
+}
+
+/// ztest's user config directory, honoring `$XDG_CONFIG_HOME`.
+///
+/// Shared by [`config_path`] and the snapshot-bucket credentials
+/// (`storage::r2::credentials_path`). Both describe the ztest *installation*,
+/// not the directory it was invoked from — which is the whole reason the
+/// bucket credentials cannot live in a repo's `.envrc`: `ztest run` is invoked
+/// from whichever repo holds the tests, and that is routinely not the repo that
+/// holds the fixtures.
+pub fn config_dir() -> PathBuf {
     if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        PathBuf::from(x).join("ztest").join("clusters.toml")
+        PathBuf::from(x).join("ztest")
     } else {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
-        home.join(".config").join("ztest").join("clusters.toml")
+        home.join(".config").join("ztest")
     }
 }
 

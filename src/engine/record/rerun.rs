@@ -50,9 +50,9 @@ pub fn passed_tests(run_dir: &Path) -> io::Result<HashSet<TestId>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::events::TestEvent;
     use crate::engine::record::recorder::RunRecorder;
     use crate::engine::record::{FORMAT_VERSION, RunMeta};
-    use crate::engine::events::TestEvent;
     use crate::qos::QosClass;
     use std::time::Duration;
 

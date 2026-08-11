@@ -49,12 +49,93 @@ pub(crate) fn image_uri(
 #[derive(Debug, Clone)]
 pub struct LightwalletdBackend;
 
+/// Where the generated `zcash.conf` is mounted in the pod. lightwalletd reads
+/// the validator's RPC host/port/credentials from it.
+const ZCASH_CONF_PATH: &str = "/etc/lightwalletd/zcash.conf";
+/// Pod-local scratch for lightwalletd's own block cache.
+const DATA_DIR: &str = "/var/lib/lightwalletd";
+
 impl IndexerConfig for LightwalletdBackend {
     type Handle = LightwalletdIndexer;
     type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, plumbing: HandleInner) -> LightwalletdIndexer {
         LightwalletdIndexer { plumbing }
+    }
+
+    /// Render the `zcash.conf` lightwalletd needs, and the flags pointing it at
+    /// that file.
+    ///
+    /// lightwalletd has no config file of its own — everything is CLI flags,
+    /// plus a bitcoind-style `zcash.conf` naming the validator's RPC endpoint.
+    /// `rpcuser` / `rpcpassword` are required by lightwalletd's parser but are
+    /// placeholders on the wire here: ztest's regtest zebrad runs with
+    /// `enable_cookie_auth = false`, so they satisfy the client rather than
+    /// authenticating anything.
+    fn materialize_opts(
+        &self,
+        mut opts: crate::component::ComponentOpts,
+        _tunings: &[Self::Tuning],
+        mode: &crate::component::IndexerMode,
+        validator_host: Option<&str>,
+    ) -> Result<crate::component::ComponentOpts, EnvError> {
+        use crate::component::IndexerMode;
+
+        match mode {
+            IndexerMode::None => return Ok(opts),
+            IndexerMode::Regtest => {}
+            other => {
+                return Err(EnvError::Config {
+                    reason: format!(
+                        "lightwalletd supports only regtest in ztest today (got {other:?})"
+                    ),
+                });
+            }
+        }
+
+        let validator_host = validator_host.ok_or_else(|| EnvError::Config {
+            reason: "lightwalletd indexer opted in to regtest but no validator is \
+                     registered in this env"
+                .to_string(),
+        })?;
+
+        let conf = format!(
+            "\
+rpcuser=test
+rpcpassword=test
+rpcbind={validator_host}
+rpcport={}
+",
+            crate::handles::ports::ZEBRAD_RPC,
+        );
+        opts.mounts
+            .push(crate::regtest::config_mount_inline(conf, ZCASH_CONF_PATH));
+        Ok(opts)
+    }
+}
+
+// ─────────────────────────────── Regtest ──────────────────────────────
+
+impl crate::regtest::Regtest for crate::component::Indexer<LightwalletdBackend> {
+    fn regtest(self) -> Self {
+        use crate::component::ComponentBuilder;
+
+        let mut indexer = self.mount(crate::regtest::scratch_mount(DATA_DIR)).args([
+            // No TLS: pods talk over the cluster network and the load harness
+            // dials plain h2c.
+            "--no-tls-very-insecure",
+            "--zcash-conf-path",
+            ZCASH_CONF_PATH,
+            "--data-dir",
+            DATA_DIR,
+            "--grpc-bind-addr",
+            &format!("0.0.0.0:{}", crate::handles::ports::LIGHTWALLETD_GRPC),
+            // Container stdout, so the engine's log capture sees it.
+            "--log-file",
+            "/dev/stdout",
+        ]);
+        indexer.mode = crate::component::IndexerMode::Regtest;
+        indexer
     }
 }
 
@@ -96,6 +177,7 @@ impl IndexerBackend for LightwalletdIndexer {
             // Upstream image sets no USER (defaults to root) and fails
             // runAsNonRoot; pin a numeric non-root uid.
             run_as_user: Some(1000),
+            supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
             guaranteed: None,
             image_pull_secret: crate::backends::image::pull_secret(),

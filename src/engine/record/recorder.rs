@@ -49,7 +49,8 @@ impl RunRecorder {
         fs::write(run_dir.join("meta.json"), serde_json::to_vec_pretty(meta)?)?;
         let store = OutputStore::create(run_dir)?;
         let file = File::create(run_dir.join("run.log.zst"))?;
-        let log = zstd::stream::write::Encoder::new(BufWriter::new(file), ZSTD_LEVEL)?.auto_finish();
+        let log =
+            zstd::stream::write::Encoder::new(BufWriter::new(file), ZSTD_LEVEL)?.auto_finish();
         Ok(Self {
             log,
             store,

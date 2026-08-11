@@ -19,7 +19,7 @@
 //!
 //! Each phase is a `pub async fn` taking an [`events::EventTx`] and the args /
 //! config it needs. `cli::run::pipeline_phase` is the single consumer of the
-//! channel: it folds events into the [`crate::preflight`] banner state and
+//! channel: it folds events into the [`crate::ui`] banner state and
 //! repaints the [`crate::cli::console`] panel.
 
 pub mod archives;
@@ -30,8 +30,7 @@ pub mod events;
 pub mod images;
 pub mod remote_compile;
 
-pub use self::archives::{ArchiveEntry, ArchivesOutcome};
+pub use self::archives::ArchivesOutcome;
 pub use self::build::{BuildOutcome, SelectedBinary};
 pub use self::cluster::ProbeOutcome;
-pub use self::events::{Event, EventRx, EventTx, channel};
-pub use self::images::DumpOutcome;
+pub use self::events::channel;

@@ -113,7 +113,7 @@ impl ImageSpec {
     }
 }
 
-/// Where a [`ImageSpec::Dev`] image is built from.
+/// Where a `dev!(..)` image is built from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DevSource {
     /// A Dockerfile + context in the local checkout. Paths are absolute — the

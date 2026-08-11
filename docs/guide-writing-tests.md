@@ -104,12 +104,13 @@ rebuild with `docker image rm <tag>` or `ZTEST_REBUILD_IMAGES=1`.
 pub struct Mount { pub source: MountSource, pub destination: PathBuf, pub kind: MountKind }
 
 pub enum MountSource {
-    ConfigAbs(PathBuf),      // mount_config!
-    FileAbs(PathBuf),        // mount_file!
-    ArchiveAbs(PathBuf),     // mount_archive!
-    Snapshot(SnapshotRef),   // Mount::from_snapshot
+    ConfigAbs(PathBuf),          // mount_config!
+    ConfigInline(String),        // generated config bytes (regtest_conf)
+    Seed(ArchiveHandle),         // mount_file! and mount_archive!
+    Empty,                       // Mount::scratch
+    SharedClaim { claim: String },// TestEnv::shared_volume
 }
-pub enum MountKind { Config, File, DirArchive }
+pub enum MountKind { Config, File, DirArchive, Scratch, Shared }
 ```
 
 | Macro                      | Materialized as                                        | Templated | Compile-time rules                        |
@@ -117,18 +118,6 @@ pub enum MountKind { Config, File, DirArchive }
 | `mount_config!(rel, dst)`  | `ConfigMap` at `dst`                                   | Yes       | Must exist, UTF-8, < 1 MiB                |
 | `mount_file!(rel, dst)`    | Content-addressed single-file PVC                      | No        | Must exist                                |
 | `mount_archive!(rel, dst)` | Content-addressed extracted-tar PVC; CoW clone per use | No        | Must exist (`.tar.zst` recommended)       |
-
-Mid-test snapshot clones:
-
-```rust
-let snap   = env.handle(&zebra).snapshot().await?;
-let cloned = env.spawn(Validator::zebrad("1.9.1")
-    .mount(Mount::from_snapshot(&snap, "/data"))).await?;
-```
-
-Snapshots are crash-consistent — a clone boots as if the source crashed at
-snapshot time (regtest validators tolerate this). A `SnapshotRef` is owned by the
-orchestrator pod and lives until namespace teardown.
 
 ## Handles and endpoints
 
@@ -167,7 +156,6 @@ impl ValidatorHandle {
     pub async fn mine_blocks(&self, n: u32) -> Result<(), RpcError>;
     pub async fn tip(&self) -> Result<BlockTip, RpcError>;
     pub async fn block_at(&self, height: u32) -> Result<Block, RpcError>;
-    pub async fn snapshot(&self) -> Result<SnapshotRef, EnvError>;
     pub fn rpc(&self) -> &dyn ValidatorRpc;
 }
 ```

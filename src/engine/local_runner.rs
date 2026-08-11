@@ -215,6 +215,37 @@ fn kill_group(pid: Option<u32>) {
 #[cfg(not(unix))]
 fn kill_group(_pid: Option<u32>) {}
 
+/// Write `body` as an executable `#!/bin/sh` script at `path`, atomically.
+///
+/// The atomicity is not cosmetic — it is the difference between a stable suite
+/// and an intermittent one. A child forked by *any* thread inherits every fd
+/// open at the moment of the fork, so while a script is being written the
+/// engine's own concurrent `spawn_test` children can end up holding a write
+/// handle to it. Executing a file that anyone still holds open for writing
+/// fails with `ETXTBSY`, which surfaces as a `SpawnError` carrying **empty**
+/// output — a test then fails asserting on output that was never captured,
+/// intermittently and only under load.
+///
+/// Writing to a scratch name and renaming closes the window completely: the
+/// path that gets executed is only ever created by `rename`, so no write
+/// handle to it can exist. Dropping the file **before** the rename is the load-
+/// bearing step, since rename keeps the same inode and an open handle would
+/// follow it to the new name.
+#[cfg(all(test, unix))]
+pub(super) fn write_script(path: &std::path::Path, body: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let scratch = path.with_extension("sh.partial");
+    let mut f = std::fs::File::create(&scratch).unwrap();
+    write!(f, "#!/bin/sh\n{body}\n").unwrap();
+    let mut perms = f.metadata().unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&scratch, perms).unwrap();
+    drop(f);
+    std::fs::rename(&scratch, path).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,9 +253,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
-    /// Serialize the process-spawning tests. They write-then-exec temp scripts;
-    /// running them concurrently lets one test's `fork` inherit another's open
-    /// write-fd, producing a transient `ETXTBSY` (spurious `SpawnError`).
+    /// Serialize the process-spawning tests in *this* module.
+    ///
+    /// Note this cannot prevent the `ETXTBSY` hazard on its own — `engine::e2e`
+    /// spawns children too and has no way to take this lock — which is why
+    /// [`write_script`](super::write_script) closes the write handle before the
+    /// executable path exists at all.
     fn serial() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -263,14 +297,8 @@ mod tests {
     /// even where coreutils `/bin/true`/`/bin/false` don't (e.g. NixOS).
     #[cfg(unix)]
     fn script(tag: &str, body: &str) -> PathBuf {
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
         let path = std::env::temp_dir().join(format!("ztest-{tag}-{}.sh", std::process::id()));
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(f, "#!/bin/sh\n{body}\n").unwrap();
-        let mut perms = f.metadata().unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        super::write_script(&path, body);
         path
     }
 

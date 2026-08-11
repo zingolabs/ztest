@@ -34,19 +34,11 @@ pub enum Event {
     /// One of the two cargo invocations failed; the run is aborting.
     BuildFailed {
         exit_code: i32,
-        stage: crate::preflight::BuildStage,
+        stage: crate::ui::BuildStage,
     },
 
     // Phase A: cluster.
     ProbeStarted,
-    ProbeComplete {
-        context: String,
-        slots_used: u32,
-        nodes_ready: u32,
-        nodes_cordoned: u32,
-        capacity: crate::qos::ClusterCapacity,
-    },
-    ProbeFailed {
-        detail: String,
-    },
+    ProbeComplete,
+    ProbeFailed,
 }

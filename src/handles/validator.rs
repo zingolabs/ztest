@@ -40,7 +40,8 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     /// The live handle type this backend produces.
     type Handle: ValidatorBackend + Clone;
 
-    /// Backend-specific tuning tokens (see [`ComponentBuilder::tuning`]).
+    /// Backend-specific tuning tokens (see
+    /// [`ComponentBuilder::tuning`](crate::ComponentBuilder::tuning)).
     /// [`NoTuning`](crate::component::NoTuning) for validators with no knobs.
     type Tuning: Clone + std::fmt::Debug + Send + Sync + 'static;
 
@@ -71,7 +72,7 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     /// Apply this backend's regtest-time, height-dependent mounts / flags to a
     /// `ComponentOpts`. Called from `env.build()` after the topology resolver
     /// has chosen `activation`. Returns
-    /// [`EnvError::Config`](crate::EnvError::Config) on invalid config. Default:
+    /// [`EnvError::Config`] on invalid config. Default:
     /// no-op.
     fn materialize_regtest_opts(
         &self,
@@ -113,7 +114,7 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     /// Stable label string for the backend behind this handle.
     fn label(&self) -> &'static str;
 
-    /// Build the Kubernetes [`PodSpec`](crate::manifest::PodSpec) for launching
+    /// Build the Kubernetes `PodSpec` for launching
     /// this backend from its resolved `opts` and assigned `pod_name`. Each
     /// backend owns its image, ports, ready port, and security context.
     fn pod_spec(
@@ -159,6 +160,19 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     /// Tip block hash.
     async fn best_block_hash(&self) -> Result<BlockHash, RpcError>;
 
+    /// Mark `hash` invalid, forcing a re-org: the node disconnects that block
+    /// and every descendant and settles on the best remaining chain.
+    ///
+    /// The deterministic re-org primitive. A test forks the chain by capturing
+    /// a hash at the intended fork point, invalidating it, and mining a
+    /// competing branch — no second miner or network partition required. The
+    /// call may return before the chain settles; poll [`tip`](Self::tip).
+    async fn invalidate_block(&self, hash: &BlockHash) -> Result<(), RpcError>;
+
+    /// Clear a previous [`invalidate_block`](Self::invalidate_block), letting
+    /// the node reconsider that block and its descendants.
+    async fn reconsider_block(&self, hash: &BlockHash) -> Result<(), RpcError>;
+
     /// Current block count.
     async fn block_count(&self) -> Result<BlockHeight, RpcError>;
 
@@ -182,6 +196,15 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     /// [`ChainConfig`]. Distinct from [`Self::activation_heights`] (what the
     /// node enforces) and [`BlockchainInfo`] (live tip state).
     async fn chain_config(&self) -> Result<ChainConfig, RpcError>;
+
+    /// Whether the env configured this validator for regtest.
+    ///
+    /// Answered from the env's own plumbing rather than over RPC, because RPC
+    /// cannot recover it: zebra models regtest as a Testnet-kind network, so
+    /// `getblockchaininfo.chain` reports `"test"` either way. Callers use it to
+    /// tell "a chain we created, start it at genesis, and may mine on" from "a
+    /// chain we restored, already at its tip, and can only read".
+    fn is_regtest(&self) -> bool;
 
     // Conveniences: loops over the methods above, implemented per backend.
 

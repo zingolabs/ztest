@@ -55,8 +55,6 @@ pub enum Phase<'a> {
     Start(&'a str),
     /// The current phase finished after `dur` → a top-level `✓` line.
     Done { label: &'a str, dur: Duration },
-    /// A sub-step result under the current phase → an indented `✓` line.
-    Step { label: &'a str, dur: Duration },
     /// A terminal informational line (the pushed runner ref).
     Note(&'a str),
 }
@@ -654,13 +652,21 @@ fn git_repo_root(dir: &Path) -> Result<PathBuf, String> {
 /// Re-home a dump's laptop-provisioned source paths from the build's in-image
 /// source root ([`IMAGE_SRC_ROOT`]) back to the laptop's source `ancestor`. Only
 /// local (path) sources need it; per-binary test paths stay pod-side.
+///
+/// Seeds and their per-test dependency edges are **not** re-homed, because they
+/// no longer carry paths: a seed is named by its Git LFS OID, which means the
+/// same thing in a build pod, on a laptop and in the cluster. Re-homing them was
+/// the load-bearing half of the old design's bug — an `/src/…` path that only
+/// ever existed inside a build container, patched into something the laptop
+/// might be able to open, and unopenable again by the time a runner pod read it.
 fn rehome_dump(dump: &mut images::DumpOutcome, ancestor: &Path) {
     let images::DumpOutcome::Discovered {
         images,
-        seeds,
+        seeds: _,
         images_by_binary,
-        deps_by_binary,
+        deps_by_binary: _,
         sync_tests: _,
+        sync_by_binary: _,
     } = dump
     else {
         return;
@@ -671,14 +677,6 @@ fn rehome_dump(dump: &mut images::DumpOutcome, ancestor: &Path) {
     for (_, es) in images_by_binary.iter_mut() {
         for e in es.iter_mut() {
             rehome_dev(e, ancestor);
-        }
-    }
-    for s in seeds.iter_mut() {
-        s.source = rehome_str(&s.source, ancestor);
-    }
-    for (_, ds) in deps_by_binary.iter_mut() {
-        for d in ds.iter_mut() {
-            d.resource = rehome_str(&d.resource, ancestor);
         }
     }
 }
@@ -699,12 +697,6 @@ fn rehome_path(p: &Path, ancestor: &Path) -> PathBuf {
         Ok(rel) => ancestor.join(rel),
         Err(_) => p.to_path_buf(),
     }
-}
-
-fn rehome_str(s: &str, ancestor: &Path) -> String {
-    rehome_path(Path::new(s), ancestor)
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn cargo_metadata() -> Result<serde_json::Value, String> {
@@ -743,12 +735,50 @@ fn common_ancestor(dirs: &BTreeSet<PathBuf>) -> Option<PathBuf> {
 /// that back the build go up. Files keep their ancestor-relative layout, so the
 /// tree under `/src` matches the laptop's — cargo's path-deps and the `dev!`
 /// macros' `CARGO_MANIFEST_DIR`-relative mount paths resolve identically.
+///
+/// Two things `.gitignore` alone does not decide, both enforced here:
+///
+/// * **LFS payloads ship as their pointers, never as their bytes**
+///   ([`lfs_names`], [`lfs_pointer`]). A multi-GB artifact that a repo legitimately
+///   carries — `ztest`'s own `fixtures/chains/*.tar.zst` — is not a compile input:
+///   the build reads the plaintext manifest beside it, and the archive reaches the
+///   cluster through the seed uploader straight off the laptop, never through the
+///   build context. `.gitattributes` already draws that payload/source line for
+///   review, so it draws it here too rather than a second hand-maintained list
+///   drifting against the first. Ignoring the archives is not an option: they are
+///   `filter=lfs`, i.e. *tracked*, and a smudged working tree holds the full
+///   content that `--cached` would otherwise hand to `tar`.
+///
+///   The ~135-byte pointer, however, *must* ship, and dropping the path entirely
+///   was a bug: a test resolves its seed PVC by content address
+///   ([`crate::seeds::sha8`]), and an LFS pointer yields that address with no
+///   transfer and no credentials. Without the pointer the in-pod binary sees
+///   nothing at all where its seed should be and fails at provisioning time with
+///   "the seed is neither a real archive nor a committed Git LFS pointer" — the
+///   file being absent for exactly the reason this function made it absent. So we
+///   substitute the index's blob (which *is* the pointer, since the clean filter
+///   ran on `git add`) for the working tree's smudged bytes.
+/// * **The total is bounded** ([`CONTEXT_MAX_BYTES`]). Exclusion rules only cover
+///   the payloads someone already thought about; an unignored stray blob is
+///   exactly the case nobody did. Overshooting is a hard, offender-naming error —
+///   the failure mode it replaces is a silent multi-GB stall at "syncing source"
+///   that reads as a hung cluster.
 fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), String> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt as _;
 
-    // Enumerate the files to ship as one NUL-delimited, ancestor-relative list.
+    // Enumerate the files to ship as one NUL-delimited, ancestor-relative list,
+    // sizing each as we go so the context ceiling below can name its offenders.
+    // The temp dir outlives `tar` (we wait on it below). It holds both file lists
+    // and the staged LFS pointers, which have no working-tree representation —
+    // on this laptop those paths hold the smudged multi-GB payload.
+    let tmp = TempDir::new("ztest-ship")?;
+    let pointer_root = tmp.path().join("pointers");
+
     let mut list: Vec<u8> = Vec::new();
+    let mut pointers: Vec<u8> = Vec::new();
+    let mut total: u64 = 0;
+    let mut sized: Vec<(u64, PathBuf)> = Vec::new();
     for repo in &src.repos {
         let repo_rel = repo
             .strip_prefix(&src.ancestor)
@@ -774,17 +804,54 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
                 tail(&String::from_utf8_lossy(&out.stderr), 20)
             ));
         }
-        for name in out.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let names: Vec<&[u8]> = out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|n| !n.is_empty())
+            .collect();
+        let lfs = lfs_names(repo, &names)?;
+        for name in names {
             let mut rel = Vec::with_capacity(repo_rel.len() + 1 + name.len());
             if !repo_rel.is_empty() {
                 rel.extend_from_slice(repo_rel);
                 rel.push(b'/');
             }
             rel.extend_from_slice(name);
+
+            // An LFS-tracked path ships as its pointer, staged out of the index,
+            // never as the payload the working tree holds (see the fn docs).
+            if lfs.contains(name) {
+                let Some(blob) = lfs_pointer(repo, name)? else {
+                    // Matches the LFS attribute but has no index or HEAD blob:
+                    // an artifact nobody committed. There is no pointer to
+                    // substitute, and shipping the payload is the whole thing
+                    // this branch exists to avoid.
+                    continue;
+                };
+                let dest = pointer_root.join(OsStr::from_bytes(&rel));
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("stage LFS pointer dir {}: {e}", parent.display()))?;
+                }
+                std::fs::write(&dest, &blob)
+                    .map_err(|e| format!("stage LFS pointer {}: {e}", dest.display()))?;
+                total += blob.len() as u64;
+                pointers.extend_from_slice(&rel);
+                pointers.push(0);
+                continue;
+            }
+
             // `--cached` lists a tracked-but-locally-deleted file too; skip any
             // missing path so `tar` can't hard-fail mid-stream on it.
-            if !src.ancestor.join(OsStr::from_bytes(&rel)).exists() {
+            let abs = src.ancestor.join(OsStr::from_bytes(&rel));
+            let Ok(md) = std::fs::metadata(&abs) else {
                 continue;
+            };
+            // Only regular files carry bytes in the stream; `tar` stores a symlink
+            // as the link itself, so charging it its target's size would overcount.
+            if md.is_file() {
+                total += md.len();
+                sized.push((md.len(), abs));
             }
             list.extend_from_slice(&rel);
             list.push(0);
@@ -793,11 +860,13 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
     if list.is_empty() {
         return Err("no source files to ship (git ls-files returned nothing)".to_string());
     }
+    if total > context_max_bytes() {
+        return Err(oversized_context(total, sized));
+    }
 
     // `tar --null -T <file>` reads the list from a file, leaving its stdin free —
     // simpler and deadlock-free versus feeding the list over stdin while `oc`
-    // drains stdout. The temp dir outlives `tar` (we wait on it below).
-    let tmp = TempDir::new("ztest-ship")?;
+    // drains stdout.
     let list_path = tmp.path().join("files.0");
     std::fs::write(&list_path, &list).map_err(|e| format!("write tar file list: {e}"))?;
 
@@ -806,8 +875,22 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
         .arg(&src.ancestor)
         .arg("--null")
         .arg("-T")
-        .arg(&list_path)
-        .arg("-cf")
+        .arg(&list_path);
+    // A second `-C`/`-T` pair splices the staged pointers into the same archive
+    // at their ancestor-relative paths. `tar` applies these in order, so the
+    // extracted tree is indistinguishable from one where the pointers had been
+    // sitting in the working tree all along.
+    let pointer_list_path = tmp.path().join("files.1");
+    if !pointers.is_empty() {
+        std::fs::write(&pointer_list_path, &pointers)
+            .map_err(|e| format!("write LFS pointer list: {e}"))?;
+        tar.arg("-C")
+            .arg(&pointer_root)
+            .arg("--null")
+            .arg("-T")
+            .arg(&pointer_list_path);
+    }
+    tar.arg("-cf")
         .arg("-")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -866,6 +949,182 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// The repo-relative `names` that git resolves to `filter=lfs`, i.e. the LFS
+/// payloads [`ship_source`] must not put in the build context.
+///
+/// One `git check-attr --stdin -z filter` per repo rather than a path glob of our
+/// own: `.gitattributes` is the file that already decides payload-vs-source for
+/// review, its precedence rules (later patterns win, nested `.gitattributes`,
+/// negations) are git's to implement, and asking git means a repo that starts
+/// LFS-tracking something new needs no change here.
+///
+/// The list is fed on stdin while stdout is drained on this thread — a writer
+/// thread, because a repo's list is far larger than a pipe buffer and writing it
+/// all before reading would deadlock against git blocking on its own full stdout.
+fn lfs_names(repo: &Path, names: &[&[u8]]) -> Result<BTreeSet<Vec<u8>>, String> {
+    use std::io::Write as _;
+
+    if names.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-attr", "--stdin", "-z", "filter"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("run `git check-attr` (is `git` on PATH?): {e}"))?;
+    let mut stdin = child.stdin.take().expect("check-attr stdin is piped");
+    let mut payload: Vec<u8> = Vec::new();
+    for n in names {
+        payload.extend_from_slice(n);
+        payload.push(0);
+    }
+    let writer = std::thread::spawn(move || {
+        // A write error here is not itself diagnostic — git exiting early is the
+        // real fault, and its stderr says why — so surface that instead.
+        let _ = stdin.write_all(&payload);
+        let _ = stdin.flush();
+        drop(stdin);
+    });
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait for `git check-attr`: {e}"))?;
+    let _ = writer.join();
+    if !out.status.success() {
+        return Err(format!(
+            "git check-attr in {} failed:\n{}",
+            repo.display(),
+            tail(&String::from_utf8_lossy(&out.stderr), 20)
+        ));
+    }
+    // `-z` output is a flat NUL-delimited stream of <path> <attr> <value> triples.
+    let mut fields = out.stdout.split(|b| *b == 0);
+    let mut lfs = BTreeSet::new();
+    while let (Some(path), Some(_attr), Some(value)) = (fields.next(), fields.next(), fields.next())
+    {
+        if value == b"lfs" {
+            lfs.insert(path.to_vec());
+        }
+    }
+    Ok(lfs)
+}
+
+/// A Git LFS pointer is ~135 bytes. Anything materially larger under an LFS
+/// attribute is not a pointer at all but the payload itself, committed raw —
+/// which happens when `git add` runs without `git-lfs` installed, because a
+/// clean filter whose binary is missing fails *open*. Shipping that is the exact
+/// multi-GB stall this module exists to prevent, so it is a named error.
+const MAX_POINTER_BYTES: usize = 4096;
+
+/// The committed pointer for an LFS-tracked path, or `None` when the path has no
+/// blob in either the index or `HEAD`.
+///
+/// The index is consulted first: that is where a freshly `git add`ed artifact's
+/// pointer lives, written by the clean filter before any commit exists, and a
+/// fixture is usable on a cluster well before anyone commits it. `HEAD` covers
+/// the committed-but-unstaged case.
+///
+/// The working tree is deliberately never read. On a laptop that has run
+/// `git lfs pull` those paths hold the full payload — reading them here is
+/// precisely the mistake being avoided.
+fn lfs_pointer(repo: &Path, name: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    for prefix in [b":".as_slice(), b"HEAD:".as_slice()] {
+        let mut spec = prefix.to_vec();
+        spec.extend_from_slice(name);
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "blob"])
+            .arg(OsStr::from_bytes(&spec))
+            .output()
+            .map_err(|e| format!("run `git cat-file` (is `git` on PATH?): {e}"))?;
+        if !out.status.success() {
+            continue;
+        }
+        if out.stdout.len() > MAX_POINTER_BYTES {
+            return Err(format!(
+                "{} in {} is `filter=lfs` but its committed blob is {} bytes — that is \
+                 the payload itself, not a pointer. It was almost certainly `git add`ed \
+                 on a machine without `git-lfs` on PATH, where the clean filter silently \
+                 does nothing. Install git-lfs and re-add the file.",
+                String::from_utf8_lossy(name),
+                repo.display(),
+                out.stdout.len(),
+            ));
+        }
+        return Ok(Some(out.stdout));
+    }
+    Ok(None)
+}
+
+/// Ceiling on the shipped build context. First-party source across the backing
+/// repos is a few MiB; 256 MiB is orders of magnitude of headroom while still
+/// catching a stray artifact long before it reads as a hung cluster.
+const CONTEXT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Env override for [`CONTEXT_MAX_BYTES`], as a k8s-style quantity (`512Mi`,
+/// `2Gi`) — an escape hatch for a tree that genuinely must ship more, so the
+/// ceiling never becomes a reason to disable the check outright.
+const CONTEXT_MAX_ENV: &str = "ZTEST_CONTEXT_MAX";
+
+fn context_max_bytes() -> u64 {
+    std::env::var(CONTEXT_MAX_ENV)
+        .ok()
+        .and_then(|v| crate::qos::units::parse_mem_bytes_opt(&v))
+        .unwrap_or(CONTEXT_MAX_BYTES)
+}
+
+/// The over-ceiling error, naming the largest offenders: the whole point of the
+/// guard is that the operator learns *which* file to exclude without going and
+/// measuring the tree by hand.
+fn oversized_context(total: u64, mut sized: Vec<(u64, PathBuf)>) -> String {
+    const SHOWN: usize = 5;
+    sized.sort_unstable_by_key(|(n, _)| std::cmp::Reverse(*n));
+    let mut msg = format!(
+        "build context is {} (ceiling {}); refusing to ship it.\nLargest files:\n",
+        gib(total),
+        gib(context_max_bytes())
+    );
+    for (n, p) in sized.iter().take(SHOWN) {
+        msg.push_str(&format!("  {:>10}  {}\n", gib(*n), p.display()));
+    }
+    msg.push_str(
+        "\nOnly first-party source belongs in the context. LFS-track a large \
+         artifact (`filter=lfs` in .gitattributes) or .gitignore it to drop it \
+         from the ship set; raise the ceiling with ",
+    );
+    msg.push_str(CONTEXT_MAX_ENV);
+    msg.push_str(" (e.g. 1Gi) only if the tree really must ship this much.");
+    msg
+}
+
+/// Bytes as a binary-prefixed quantity, matching the `Mi`/`Gi` units the rest of
+/// ztest reports sizes in.
+fn gib(n: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [
+        ("GiB", 1 << 30),
+        ("MiB", 1 << 20),
+        ("KiB", 1 << 10),
+        ("B", 1),
+    ];
+    for (suffix, mult) in UNITS {
+        if n >= mult {
+            return if mult == 1 {
+                format!("{n} B")
+            } else {
+                format!("{:.1} {suffix}", n as f64 / mult as f64)
+            };
+        }
+    }
+    "0 B".to_string()
+}
+
 // ── small helpers ─────────────────────────────────────────────────────
 
 /// The registry host[:port] of a `host[:port]/project/repo[:tag]` reference.
@@ -896,6 +1155,101 @@ mod tests {
             cwd: PathBuf::from("/src"),
             selected_tests: vec![],
         }
+    }
+
+    /// A throwaway git repo with `.gitattributes` declaring the same
+    /// payload-vs-manifest split as `fixtures/chains/`, so the LFS filter is
+    /// exercised against real `git check-attr` precedence rather than a stub.
+    fn chains_repo() -> TempDir {
+        let dir = TempDir::new("ztest-lfs-test").expect("temp dir");
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(st.status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(
+            root.join(".gitattributes"),
+            "fixtures/chains/*.tar.zst filter=lfs diff=lfs merge=lfs -text\n\
+             fixtures/chains/*.toml -filter -diff -merge text\n",
+        )
+        .expect("write attrs");
+        for f in [
+            "fixtures/chains/zebra-v6.2.3-testnet-286000.tar.zst",
+            "fixtures/chains/zebra-v6.2.3-testnet-286000.toml",
+            "fixtures/chains/README.md",
+            "src/lib.rs",
+        ] {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().expect("file has a parent")).expect("mkdir");
+            std::fs::write(p, b"x").expect("write file");
+        }
+        dir
+    }
+
+    #[test]
+    fn lfs_names_selects_payloads_and_spares_manifests() {
+        let repo = chains_repo();
+        let names: Vec<&[u8]> = vec![
+            b"fixtures/chains/zebra-v6.2.3-testnet-286000.tar.zst".as_slice(),
+            b"fixtures/chains/zebra-v6.2.3-testnet-286000.toml".as_slice(),
+            b"fixtures/chains/README.md".as_slice(),
+            b"src/lib.rs".as_slice(),
+        ];
+        let lfs = lfs_names(repo.path(), &names).expect("check-attr runs");
+        // The archive is the payload; everything the compile actually reads —
+        // above all the manifest `archive!` parses — must survive.
+        assert_eq!(
+            lfs,
+            BTreeSet::from([b"fixtures/chains/zebra-v6.2.3-testnet-286000.tar.zst".to_vec()])
+        );
+    }
+
+    #[test]
+    fn lfs_names_is_empty_without_attributes() {
+        let repo = chains_repo();
+        std::fs::remove_file(repo.path().join(".gitattributes")).expect("rm attrs");
+        let names: Vec<&[u8]> = vec![b"fixtures/chains/x.tar.zst".as_slice()];
+        assert!(
+            lfs_names(repo.path(), &names)
+                .expect("check-attr runs")
+                .is_empty()
+        );
+        // No paths at all must not spawn a doomed `git check-attr --stdin`.
+        assert!(lfs_names(repo.path(), &[]).expect("no-op").is_empty());
+    }
+
+    #[test]
+    fn context_ceiling_names_the_biggest_offenders() {
+        let total = 13 * (1 << 30);
+        let msg = oversized_context(
+            total,
+            vec![
+                (3 << 30, PathBuf::from("ztest/fixtures/chains/b.tar.zst")),
+                (1 << 10, PathBuf::from("ztest/src/lib.rs")),
+                (8 << 30, PathBuf::from("ztest/fixtures/chains/a.tar.zst")),
+            ],
+        );
+        assert!(msg.contains("13.0 GiB"), "reports the total: {msg}");
+        // Descending by size, so the file worth excluding is the first one read.
+        let a = msg.find("a.tar.zst").expect("largest listed");
+        let b = msg.find("b.tar.zst").expect("second listed");
+        assert!(a < b, "offenders are ordered largest-first: {msg}");
+        assert!(msg.contains(CONTEXT_MAX_ENV), "names the override: {msg}");
+    }
+
+    #[test]
+    fn byte_quantities_use_binary_prefixes() {
+        assert_eq!(gib(8_751_733_052), "8.2 GiB");
+        assert_eq!(gib(649_866_689), "619.8 MiB");
+        assert_eq!(gib(1 << 10), "1.0 KiB");
+        assert_eq!(gib(512), "512 B");
+        assert_eq!(gib(0), "0 B");
     }
 
     #[test]

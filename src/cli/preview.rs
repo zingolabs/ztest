@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use crate::cli::console::{Console, SceneFrame};
-use crate::preflight::{
+use crate::ui::{
     self, BannerState, BuildState, ClusterState, Theme, TransferKind, TransferProgress,
     TransferRow, Transfers,
 };
@@ -22,8 +22,7 @@ pub fn execute() -> std::process::ExitCode {
     let session_start = Instant::now();
 
     let cancel_theme = theme.clone();
-    let cancel_panel =
-        Box::new(move |elapsed| preflight::render_cancel_panel(elapsed, &cancel_theme));
+    let cancel_panel = Box::new(move |elapsed| ui::render_cancel_panel(elapsed, &cancel_theme));
     let (console, guard) = match Console::start(session_start, cancel_panel) {
         Ok(pair) => pair,
         Err(e) => {
@@ -57,8 +56,8 @@ fn push_scene(con: &Console, state: &BannerState, transfers: &Transfers, theme: 
     let tx = transfers.clone();
     let theme = theme.clone();
     con.scene(move |elapsed| SceneFrame {
-        left: preflight::render_preflight_panel(&snap, "Building", elapsed, &theme),
-        right: preflight::render_transfers(&tx, elapsed, &theme),
+        left: ui::render_preflight_panel(&snap, "Building", elapsed, &theme),
+        right: ui::render_transfers(&tx, elapsed, &theme),
         live: None,
     });
 }
@@ -109,6 +108,11 @@ fn timeline(tick: u64) -> Option<Transfers> {
     .into_iter()
     .filter_map(|f| f(tick))
     .collect();
+
+    // A seed pull walking the lifecycle `materialize::provision_seed` reports:
+    // parent-observed stages while nothing is moving yet, then the puller's own
+    // meter driving the bar, then the snapshot tail.
+    rows.extend(pull("seed-a1b2c3d4", 10, 4 * GIB, 90 * MIB)(tick));
 
     // A seed provisioning that fails and lingers with a warn marker (failures
     // aren't auto-removed the way completions are), until the phase ends.
@@ -166,6 +170,58 @@ fn push(
     }
 }
 
+/// The stages a seed reports before its first byte moves, as
+/// `(ticks_to_dwell, note)`. Only the puller's own phases can stall visibly, so
+/// they get the longer dwells.
+const SEED_PRELUDE: [(u64, &str); 4] = [
+    (4, "checking seed support"),
+    (6, "creating seed volume"),
+    (10, "scheduling puller"),
+    (8, "starting puller"),
+];
+
+/// Ticks a seed row shows `snapshotting` after its bytes are in — the
+/// `VolumeSnapshot` create plus its `readyToUse` wait.
+const SNAPSHOT_TICKS: u64 = 20;
+
+/// A closure yielding one seed row's state at a given tick, spinner-only through
+/// [`SEED_PRELUDE`], then a climbing byte bar, then the post-transfer tail.
+fn pull(
+    label: &'static str,
+    start: u64,
+    total_bytes: u64,
+    per_tick: u64,
+) -> impl Fn(u64) -> Option<TransferRow> {
+    move |tick| {
+        let mut elapsed = tick.checked_sub(start)?;
+        for (dwell, note) in SEED_PRELUDE {
+            if elapsed < dwell {
+                return Some(active(label, TransferKind::Seed, note, None));
+            }
+            elapsed -= dwell;
+        }
+        let done = (elapsed * per_tick).min(total_bytes);
+        if done < total_bytes {
+            return Some(active(
+                label,
+                TransferKind::Seed,
+                "transferring",
+                Some((done, total_bytes)),
+            ));
+        }
+        // Bytes in: the extract tail, then the snapshot, then the node goes
+        // Ready and the row is removed.
+        let tail = elapsed - total_bytes.div_ceil(per_tick);
+        match tail {
+            t if t < FINALIZE_TICKS => Some(active(label, TransferKind::Seed, "finalizing…", None)),
+            t if t < FINALIZE_TICKS + SNAPSHOT_TICKS => {
+                Some(active(label, TransferKind::Seed, "snapshotting", None))
+            }
+            _ => None,
+        }
+    }
+}
+
 fn active(label: &str, kind: TransferKind, note: &str, bytes: Option<(u64, u64)>) -> TransferRow {
     TransferRow {
         label: label.to_string(),
@@ -194,8 +250,6 @@ fn demo_state() -> BannerState {
             phase: None,
         },
         archives: Vec::new(),
-        snapshots: Vec::new(),
-        future: Vec::new(),
         qos_plan: None,
     }
 }

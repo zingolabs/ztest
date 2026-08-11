@@ -23,7 +23,9 @@ use crate::handles::HandleInner;
 use crate::handles::client::JsonRpcClient;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
 use crate::handles::validator::{BlockchainInfo, PeerInfo};
+use crate::metrics::{AT_REST, Exporter, Exposition, LIVE, Reduce, Row, row};
 use crate::protocol::zcash_rpc::ZcashRpc;
+use crate::sync::{Op, Phase, ProgressView, SyncSubject, Work};
 use crate::{Endpoint, EnvError, RpcError};
 
 const COMPONENT: &str = "zainod";
@@ -51,17 +53,33 @@ pub(crate) fn image_uri(
 #[derive(Debug, Clone)]
 pub struct ZainoBackend;
 
-/// Zaino's chain-data source, selected via `.tuning(ZainoTuning::State)`.
+/// How zaino reaches its validator, selected via `.tuning(..)`.
+///
+/// **This chooses the ingest path, not whether an index is built.** Both arms
+/// are served by zaino's single `NodeBackedIndexerService`, which constructs the
+/// same chain index from whichever `BlockchainSource` the connection yields —
+/// so two pods differing only in this tuning build two indexes that must agree,
+/// which is exactly what a differential profile asserts. (Zaino's own config
+/// names these `direct` / `rpc`; `state` / `fetch` are its legacy aliases, kept
+/// here because they are the names the tuning token has always used.)
+///
 /// Orthogonal to the network mode ([`IndexerMode`](crate::component::IndexerMode))
-/// and composable with `.regtest()` / `.testnet(variant)` in any order. The
+/// and composable with `.regtest()` / `.restore(archive)` in any order. The
 /// default (no tuning token) is [`Fetch`](ZainoTuning::Fetch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZainoTuning {
-    /// Pull blocks over the validator's JSON-RPC. Works remotely; compatible
-    /// with zebrad, zcashd, or another zaino. The default.
+    /// Pull blocks over the validator's JSON-RPC (`backend = "rpc"`). Works
+    /// remotely; compatible with zebrad, zcashd, or another zaino. The default.
+    ///
+    /// Needs no state DB of its own, which is why a `.restore(_)` pod on this
+    /// tuning is not given a clone of the archive — it reads the chain from the
+    /// validator, not from disk.
     Fetch,
-    /// Read the validator's on-disk state DB directly (zebra-only, colocated).
-    /// Requires a shared state volume — mount one with `.mount(&shared_volume)`.
+    /// Read a zebra state DB directly off local disk (`backend = "direct"`,
+    /// zebra-only). What supplies that DB depends on the mode: under
+    /// `.regtest()` it is the live validator's own DB, shared with
+    /// `.mount(&shared_volume)`; under `.restore(_)` it is the pod's own CoW
+    /// clone of the frozen snapshot archive, mounted automatically.
     State,
 }
 
@@ -92,9 +110,21 @@ impl IndexerConfig for ZainoBackend {
     ) -> Result<crate::component::ComponentOpts, EnvError> {
         use crate::component::IndexerMode;
 
-        // `State` reads the validator's on-disk DB, so it needs a shared state
-        // volume mounted (`.mount(&vol)`); a shared volume paired with the
-        // default `Fetch` is incoherent. Absence of any token means `Fetch`.
+        // `State` reads a zebra state DB off local disk. *What supplies that DB*
+        // is mode-dependent, so the precondition belongs inside the mode
+        // dispatch below rather than ahead of it:
+        //
+        //   - Regtest — the validator is live and mining, so the only coherent
+        //     source is the validator's own DB, shared through a co-scheduled
+        //     RWO PVC (`.mount(&shared_volume)`).
+        //   - Testnet — the chain is a frozen snapshot with no writer to share
+        //     with. Each pod extracts its own CoW clone of the archive at
+        //     `ZAINO_ZEBRA_DB`, which is exactly what the config
+        //     rendered in that arm points `zebra_db_path` at.
+        //
+        // Hoisting the regtest form of the check out of the match is what made
+        // every `.restore(_).tuning(State)` env unbuildable. Absence of any
+        // tuning token means `Fetch`.
         let state = tunings.iter().any(|t| matches!(t, ZainoTuning::State));
         let backend_literal = if state {
             ZainoTuning::State
@@ -102,22 +132,14 @@ impl IndexerConfig for ZainoBackend {
             ZainoTuning::Fetch
         }
         .as_toml();
-        match (state, opts.shared_state.is_some()) {
-            (true, false) => {
-                return Err(EnvError::Config {
-                    reason: "ZainoTuning::State needs a shared state volume; \
-                             mount one with .mount(&shared_volume)"
-                        .to_string(),
-                });
-            }
-            (false, true) => {
-                return Err(EnvError::Config {
-                    reason: "a shared state volume is mounted but ZainoTuning::State \
-                             is not set"
-                        .to_string(),
-                });
-            }
-            _ => {}
+
+        // Mode-independent: a shared state volume is only ever meaningful to
+        // `State`, so pairing one with `Fetch` is incoherent under every mode.
+        if !state && opts.shared_state.is_some() {
+            return Err(EnvError::Config {
+                reason: "a shared state volume is mounted but ZainoTuning::State is not set"
+                    .to_string(),
+            });
         }
 
         let version = zaino_semver(&opts)?;
@@ -129,6 +151,13 @@ impl IndexerConfig for ZainoBackend {
                              registered in this env"
                         .to_string(),
                 })?;
+                if state && opts.shared_state.is_none() {
+                    return Err(EnvError::Config {
+                        reason: "ZainoTuning::State on regtest reads the validator's live \
+                                 on-disk DB; mount one with .mount(&shared_volume)"
+                            .to_string(),
+                    });
+                }
                 // State backend sharing the validator's DB: point zebra_db_path at
                 // the shared mount and connect the syncer to the validator's
                 // indexer gRPC. Otherwise zebra_db_path is pod-local scratch and no
@@ -141,7 +170,7 @@ impl IndexerConfig for ZainoBackend {
                     .shared_state
                     .as_ref()
                     .map(|s| s.mount_path.as_str())
-                    .unwrap_or(ZAINO_REGTEST_ZEBRA_DB);
+                    .unwrap_or(ZAINO_ZEBRA_DB);
                 crate::regtest_conf::regtest_zainod_conf(
                     version,
                     backend_literal,
@@ -150,36 +179,66 @@ impl IndexerConfig for ZainoBackend {
                     validator_host,
                     ZAINO_REGTEST_VALIDATOR_RPC_PORT,
                     zebra_db_path,
-                    ZAINO_REGTEST_DB,
+                    ZAINO_DB,
                     validator_grpc.as_deref(),
                     opts.image
                         .metrics_enabled()
                         .then_some(crate::handles::ports::ZAINO_METRICS),
                 )
             }
-            IndexerMode::Testnet(_) => crate::testnet_conf::testnet_zainod_conf(
-                version,
-                backend_literal,
-                ZAINO_TESTNET_GRPC_PORT,
-                ZAINO_TESTNET_JSONRPC_PORT,
-                validator_host.unwrap_or(ZAINO_TESTNET_VALIDATOR_HOST),
-                ZAINO_TESTNET_VALIDATOR_RPC_PORT,
-                ZAINO_TESTNET_ZEBRA_DB,
-                ZAINO_TESTNET_DB,
-                opts.image
-                    .metrics_enabled()
-                    .then_some(crate::handles::ports::ZAINO_METRICS),
-            ),
+            IndexerMode::Testnet(archive) => {
+                // The archive is frozen and there is no writer to share with,
+                // so a shared volume here is a regtest topology applied to the
+                // wrong mode. Naming it beats letting the pod fail on an empty
+                // mount path.
+                if opts.shared_state.is_some() {
+                    return Err(EnvError::Config {
+                        reason: "a restored testnet chain supplies zaino's state DB as the \
+                                 pod's own CoW clone of the archive; a shared state volume \
+                                 is a regtest-only topology and cannot be combined with \
+                                 .restore"
+                            .to_string(),
+                    });
+                }
+                // Only the `State` backend opens the DB. `Fetch` indexes the same
+                // chain, but sources its blocks from the validator over JSON-RPC
+                // and never reads a state directory. The archive is multi-GB, so
+                // attaching it to a fetch pod costs a CoW clone and a volume
+                // attach per test for a mount nothing would open.
+                if state {
+                    opts.mounts
+                        .push(crate::regtest::archive_mount(*archive, ZAINO_ZEBRA_DB));
+                }
+                let host = validator_host.unwrap_or(ZAINO_TESTNET_VALIDATOR_HOST);
+                // `backend = 'direct'` (the State tuning) opens the CoW clone
+                // above through zebra's `ReadStateService`, and its config is
+                // rejected outright without a gRPC address to drive the syncer.
+                // Fetch never opens a DB, so it gets none.
+                let validator_grpc =
+                    state.then(|| format!("{host}:{}", crate::handles::ports::ZEBRAD_INDEXER));
+                crate::testnet_conf::testnet_zainod_conf(
+                    version,
+                    backend_literal,
+                    ZAINO_TESTNET_GRPC_PORT,
+                    ZAINO_TESTNET_JSONRPC_PORT,
+                    host,
+                    ZAINO_TESTNET_VALIDATOR_RPC_PORT,
+                    ZAINO_ZEBRA_DB,
+                    ZAINO_DB,
+                    validator_grpc.as_deref(),
+                    opts.image
+                        .metrics_enabled()
+                        .then_some(crate::handles::ports::ZAINO_METRICS),
+                )
+            }
             IndexerMode::Mainnet(_) => {
                 return Err(EnvError::Config {
                     reason: "zaino mainnet mode is not yet supported".to_string(),
                 });
             }
         };
-        opts.mounts.push(crate::regtest::config_mount_inline(
-            toml,
-            "/etc/zaino/zainod.toml",
-        ));
+        opts.mounts
+            .push(crate::regtest::config_mount_inline(toml, ZAINO_CONFIG));
         Ok(opts)
     }
 }
@@ -242,6 +301,11 @@ impl IndexerBackend for ZainoIndexer {
             // the shared-DB validator's uid (see zebra's `pod_spec`) so this
             // reader owns the files it reads.
             run_as_user: Some(1000),
+            // Pinning the uid says nothing about the gid: the image's `USER`
+            // supplies a non-zero primary group, which is precisely what locks
+            // this pod out of a restored seed until `seed_groups` lets it back
+            // in.
+            supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
             guaranteed: None,
             image_pull_secret: crate::backends::image::pull_secret(),
@@ -656,6 +720,268 @@ impl IndexerBackend for ZainoIndexer {
     }
 }
 
+// ────────────────────────────── SyncSubject ───────────────────────────
+//
+// Zaino syncs itself from its validator, so the harness observes and drives
+// nothing: `launch` and `stop` are no-ops and the engine is a pure watcher.
+//
+// Implemented on the handle itself rather than on a `ZainoSync` newtype: an
+// observer holds no state, so a wrapper would carry exactly one field — this
+// handle — and buy nothing. (Contrast `LrzSyncSubject`, which owns a batch
+// size, a reader connection and the running scan task; that one is a driver and
+// earns its type.)
+
+/// The exposed families zaino publishes. Names are zaino's dotted
+/// `metric_names` constants after scrape — `metrics-exporter-prometheus`
+/// sanitizes them to the Prometheus charset, so `zaino.sync.finalized_height` is
+/// exposed as `zaino_sync_finalized_height`.
+///
+/// Named once here and referenced by both [`ROWS`] and the [`SyncSubject`] impl,
+/// so the families a reader displays and the families a probe gates on cannot
+/// drift apart.
+mod family {
+    pub(super) const GRPC_REQUESTS: &str = "zaino_grpc_requests_total";
+    pub(super) const GRPC_ERRORS: &str = "zaino_grpc_errors_total";
+    pub(super) const GRPC_LATENCY: &str = "zaino_grpc_request_duration_seconds";
+    pub(super) const RPC_OUTBOUND: &str = "zaino_rpc_outbound_requests_total";
+    pub(super) const RPC_RETRIES: &str = "zaino_rpc_outbound_retries_total";
+    pub(super) const SYNC_LAG: &str = "zaino_sync_lag_blocks";
+    pub(super) const REORGS: &str = "zaino_sync_reorg_total";
+    pub(super) const SYNC_ERRORS: &str = "zaino_sync_errors_total";
+    pub(super) const REACHED_TIP: &str = "zaino_sync_has_reached_tip";
+    pub(super) const TRANSACTIONS: &str = "zaino_sync_transactions_total";
+    /// The height zaino's finalised index has been written up to. Set by the
+    /// write path as each batch commits.
+    pub(super) const FINALIZED_HEIGHT: &str = "zaino_sync_finalized_height";
+    /// The height that write path is working towards.
+    pub(super) const TARGET_HEIGHT: &str = "zaino_sync_target_height";
+    pub(super) const CHAIN_TIP: &str = "zaino_chain_tip_height";
+    /// Cumulative per-op work the index has absorbed.
+    pub(super) const SAPLING_OUTPUTS: &str = "zaino_sync_sapling_outputs_total";
+    pub(super) const ORCHARD_ACTIONS: &str = "zaino_sync_orchard_actions_total";
+}
+
+/// What zaino publishes, in report order.
+///
+/// Kept as a table on purpose: rustfmt's argument-list width would give each row
+/// six lines, and eighty lines of vertical `row(` calls is unreadable for the one
+/// thing a reader comes here to do — scan the columns.
+#[rustfmt::skip]
+pub const ROWS: [Row; 14] = [
+    // Inbound gRPC — zaino's serving surface.
+    row("gRPC requests", family::GRPC_REQUESTS, Reduce::Sum, LIVE),
+    row("gRPC errors", family::GRPC_ERRORS, Reduce::Sum, AT_REST),
+    row("gRPC mean latency (ms)", family::GRPC_LATENCY, Reduce::MeanMs, LIVE),
+    // Outbound JSON-RPC — zaino → validator.
+    row("outbound RPC requests", family::RPC_OUTBOUND, Reduce::Sum, AT_REST),
+    row("outbound RPC retries", family::RPC_RETRIES, Reduce::Sum, AT_REST),
+    // Sync health.
+    row("sync lag (blocks)", family::SYNC_LAG, Reduce::Max, LIVE),
+    row("reorgs", family::REORGS, Reduce::Sum, LIVE),
+    row("sync errors", family::SYNC_ERRORS, Reduce::Sum, AT_REST),
+    row("reached tip (1=yes)", family::REACHED_TIP, Reduce::Max, AT_REST),
+    // Indexed work — throughput evidence, and the per-op vector the sync subject
+    // below reports as its `Work`. Sapling sits beside orchard because a `Work`
+    // that measures one pool and not the other reads as a chain with no sapling
+    // activity rather than as a metric nobody wired.
+    row("transactions indexed", family::TRANSACTIONS, Reduce::Sum, LIVE),
+    row("sapling outputs", family::SAPLING_OUTPUTS, Reduce::Sum, AT_REST),
+    row("orchard actions", family::ORCHARD_ACTIONS, Reduce::Sum, AT_REST),
+    // Chain position. `finalized_height` is live because it is the *only*
+    // trustworthy read of how far zaino's own index has got: every other height
+    // it serves can be answered by the validator it proxies while indexing, so
+    // none of them can gate on the index.
+    row("finalized height", family::FINALIZED_HEIGHT, Reduce::Max, LIVE),
+    row("chain tip height", family::CHAIN_TIP, Reduce::Max, LIVE),
+];
+
+/// Per-tick scrape bound. A probe's reading must not outlive the tick that
+/// asked for it, and the engine's base tick is seconds — so a target that has
+/// not answered in one second is wedged, and holding the tick open for it only
+/// delays the next honest reading.
+const EXPORTER_SCRAPE_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[async_trait]
+impl Exporter for ZainoIndexer {
+    async fn endpoint(&self) -> Result<Endpoint, EnvError> {
+        self.endpoint_for(crate::handles::ports::ZAINO_METRICS)
+            .await
+    }
+
+    fn rows(&self) -> &'static [Row] {
+        &ROWS
+    }
+}
+
+impl ZainoIndexer {
+    /// Read this pod's exporter — the one surface only the indexer itself can
+    /// answer for.
+    async fn exporter(&self) -> Result<Exposition, RpcError> {
+        self.read(EXPORTER_SCRAPE_TIMEOUT)
+            .await
+            .map_err(|e| RpcError::decode(COMPONENT, "scrape /metrics", e))
+    }
+
+    /// How far this pod's finalised index has been written.
+    ///
+    /// The public form of what the [`SyncSubject`] impl reads each tick, for a
+    /// test holding **more than one** zaino: the harness binds a single subject,
+    /// so a profile comparing two indexers reaches the unbound one through this.
+    ///
+    /// It answers the one question no other surface can. Every height zaino
+    /// *serves* can be answered by the validator it proxies while indexing (see
+    /// the [`SyncSubject`] impl below), so `latest_block_height` reports the
+    /// chain tip from this pod's first second alive whether it has indexed
+    /// anything or not. This gauge is set by the write path as each batch
+    /// commits.
+    ///
+    /// # Errors
+    ///
+    /// When the gauge is absent — this pod publishes no metrics, or was built
+    /// without a Prometheus feature. Never `0`: a zero frontier and an
+    /// unobservable one are different facts, and a caller comparing two
+    /// indexers must not read the second as "has indexed nothing".
+    pub async fn index_frontier(&self) -> Result<u32, RpcError> {
+        frontier_of(&self.exporter().await?, "index_frontier")
+    }
+}
+
+/// The finalised-index frontier in one already-scraped exposition.
+///
+/// Shared by [`ZainoIndexer::index_frontier`] and the per-tick
+/// [`SyncSubject::progress`] read, which cannot call it — `progress` needs the
+/// work counters and the target from the *same* scrape, and a second round trip
+/// for the height would read a different instant than the counters beside it.
+fn frontier_of(exporter: &Exposition, op: &'static str) -> Result<u32, RpcError> {
+    // An absent gauge is not height zero. It means this pod publishes no index
+    // metrics — an image built without a Prometheus feature — and answering with
+    // a zero would report an unobservable index as an empty one: a subject would
+    // start at the bottom of a chain it will never climb, and a comparison would
+    // read the other indexer as having stored nothing.
+    exporter
+        .height_gauge(family::FINALIZED_HEIGHT)
+        .ok_or_else(|| {
+            RpcError::decode(
+                COMPONENT,
+                op,
+                format!(
+                    "{} is absent from this pod's exporter, so how far its index has been \
+                     written cannot be observed: build the image with a Prometheus-metrics \
+                     feature",
+                    family::FINALIZED_HEIGHT
+                ),
+            )
+        })
+}
+
+/// Observing zaino means watching how fast it **ingests** the chain behind it,
+/// and how far its own index has actually got.
+///
+/// Not how fast it serves: request throughput has no height axis, and
+/// [`loadtest`](crate::loadtest) is what asks that question.
+///
+/// **Progress is read from zaino's exporter, not from `GetLightdInfo`, and that
+/// is the whole correctness of this subject.** Until its finalised state is
+/// built, the state backend *forwards* queries to its validator rather than
+/// erroring — including the query for its own height. So `GetLightdInfo`
+/// reports the validator's tip from zaino's first second alive: against a
+/// pre-synced snapshot the subject would open at 100 %, satisfy
+/// [`is_complete`](SyncSubject::is_complete) on tick one, and end a run that
+/// observed none of the index being built. The `finalized_height` gauge is set
+/// by the write path itself as each batch commits, so it is the one reading no
+/// proxy can answer on zaino's behalf.
+#[async_trait]
+impl SyncSubject for ZainoIndexer {
+    type Progress = ZainoSyncProgress;
+
+    async fn launch(&mut self) -> Result<(), RpcError> {
+        Ok(())
+    }
+
+    async fn progress(&self) -> Result<ZainoSyncProgress, RpcError> {
+        let exporter = self.exporter().await?;
+        let height = frontier_of(&exporter, "progress")?;
+        let mut work = Work::ZERO;
+        // Only the ops zaino counts are `set`, so a probe reading one it does
+        // not publish panics via `Work::require` rather than comparing zeroes.
+        if let Some(n) = exporter.counter_total(family::SAPLING_OUTPUTS) {
+            work.set(Op::SaplingOutput, n);
+        }
+        if let Some(n) = exporter.counter_total(family::ORCHARD_ACTIONS) {
+            work.set(Op::OrchardAction, n);
+        }
+        Ok(ZainoSyncProgress {
+            height,
+            // The target the write path is working towards. A zero is zaino not
+            // knowing the tip yet, not a chain of length zero; reporting it
+            // would render 100 % complete at height 0.
+            target: exporter
+                .height_gauge(family::TARGET_HEIGHT)
+                .filter(|&t| t > 0),
+            work,
+        })
+    }
+
+    /// The index has been written up to the tip it is working towards.
+    ///
+    /// On a static chain (regtest, or a restored snapshot whose validator has
+    /// no peers) this is exactly "finished". On a live network it is
+    /// **transient** — mainnet mints a block every ~75 s, so the subject falls
+    /// behind again shortly after satisfying this. That is why a measurement run
+    /// declares `run.until_height(..)`: the engine completes on the declared
+    /// height ahead of this predicate, giving a span that does not depend on
+    /// where the tip happened to be.
+    async fn is_complete(&self) -> bool {
+        match SyncSubject::progress(self).await {
+            Ok(p) => p.target.is_some_and(|t| p.height >= t),
+            Err(_) => false,
+        }
+    }
+}
+
+// ────────────────────────────── ProgressView ──────────────────────────
+
+/// One tick of zaino's index construction, read from its own exporter.
+#[derive(Clone, Copy, Debug)]
+pub struct ZainoSyncProgress {
+    height: u32,
+    target: Option<u32>,
+    work: Work,
+}
+
+impl ProgressView for ZainoSyncProgress {
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn target(&self) -> Option<u32> {
+        self.target
+    }
+
+    fn phase(&self) -> Phase {
+        match self.target {
+            None => Phase::Starting,
+            Some(t) if self.height >= t => Phase::Done,
+            Some(_) => Phase::Downloading,
+        }
+    }
+
+    /// Zaino's own cumulative per-op counters, incremented by the write path as
+    /// it indexes each block.
+    ///
+    /// Overriding the default matters here for the same reason it does for a
+    /// wallet: the chain-derived fallback turns a *height* into a work vector,
+    /// which measures the chain rather than the indexer. Real history is wildly
+    /// non-uniform — a hundred thousand pre-Sapling blocks and a hundred
+    /// thousand post-NU5 blocks are the same height delta and nothing like the
+    /// same work — so ops/s derived from height is a statement about which part
+    /// of the chain the run happened to cover, not about how fast zaino indexed
+    /// it.
+    fn work(&self) -> Option<Work> {
+        Some(self.work)
+    }
+}
+
 async fn connect(endpoint: &Endpoint) -> Result<CompactTxStreamerClient<Channel>, RpcError> {
     let url = endpoint.url("http");
     let channel = Channel::from_shared(url)
@@ -739,11 +1065,27 @@ impl crate::regtest::Regtest for crate::component::Indexer<ZainoBackend> {
 fn apply_regtest(
     indexer: crate::component::Indexer<ZainoBackend>,
 ) -> crate::component::Indexer<ZainoBackend> {
-    let mut indexer = indexer
-        .mount(crate::regtest::scratch_mount("/var/lib/zaino"))
-        .args(["start", "--config", "/etc/zaino/zainod.toml"]);
+    let mut indexer = apply_pod_layout(indexer);
     indexer.mode = crate::component::IndexerMode::Regtest;
     indexer
+}
+
+/// The launch shape every zaino pod has, whichever chain it runs against: boot
+/// from the rendered config, and mount the scratch root both DB paths live
+/// under.
+///
+/// Shared by both mode entry points because neither is optional. The scratch
+/// mount used to hang off the regtest path alone, so a restored pod got config
+/// pointing at [`ZAINO_DB`] with nothing mounted there — `FinalisedState` then
+/// tried to create its RocksDB inside the image filesystem, which the pod's uid
+/// owns no part of, and the pod died on `Permission denied` before serving a
+/// single query.
+fn apply_pod_layout(
+    indexer: crate::component::Indexer<ZainoBackend>,
+) -> crate::component::Indexer<ZainoBackend> {
+    indexer
+        .mount(crate::regtest::scratch_mount(ZAINO_SCRATCH))
+        .args(["start", "--config", ZAINO_CONFIG])
 }
 
 /// zaino gRPC listen port (regtest). Matches the generator's
@@ -757,35 +1099,47 @@ const ZAINO_REGTEST_JSONRPC_PORT: u16 = crate::handles::ports::ZAINO_JSONRPC;
 /// zcashd.rs serve their regtest JSON-RPC on.
 const ZAINO_REGTEST_VALIDATOR_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_RPC;
 
-/// Path the validator state directory is mounted at inside the zaino
-/// pod (used by the `state` backend; harmless when unused by `fetch`).
-const ZAINO_REGTEST_ZEBRA_DB: &str = "/var/lib/zaino/zebra-db";
+/// In-pod path the rendered `zainod.toml` is mounted at, and the `--config`
+/// every zaino pod boots from.
+const ZAINO_CONFIG: &str = "/etc/zaino/zainod.toml";
 
-/// Path zaino writes its own state database to (pod-level scratch).
-const ZAINO_REGTEST_DB: &str = "/var/lib/zaino/db";
+/// The pod's writable root, mounted as scratch by [`apply_pod_layout`]. Nothing
+/// else in the pod is writable: the image filesystem belongs to a uid this
+/// container does not run as, so every path zaino writes has to live under here.
+const ZAINO_SCRATCH: &str = "/var/lib/zaino";
 
-impl crate::regtest::Testnet for crate::component::Indexer<ZainoBackend> {
-    /// Apply the named testnet fixture. The variant's pre-synced zebra state
-    /// lands at [`ZAINO_TESTNET_ZEBRA_DB`] via a snapshot mount; the
-    /// backend-dependent `zainod.toml` is rendered at build time (see
-    /// [`ZainoBackend::materialize_opts`]).
-    fn testnet(self, variant: &str) -> Self {
-        apply_testnet(self, variant)
+/// Path the validator state directory lands at inside the zaino pod: the
+/// validator's shared DB on regtest, a CoW clone of the chain archive on
+/// testnet. Used by the `state` backend; harmless when unused by `fetch`.
+///
+/// One constant, not one per mode: the paths were per-mode and identical, which
+/// is duplication that reads as a distinction and hides drift between the two.
+const ZAINO_ZEBRA_DB: &str = "/var/lib/zaino/zebra-db";
+
+/// Path zaino writes its own index database to. Pod-local scratch under
+/// [`ZAINO_SCRATCH`] — the snapshot machinery doesn't touch it.
+const ZAINO_DB: &str = "/var/lib/zaino/db";
+
+impl crate::regtest::Restore for crate::component::Indexer<ZainoBackend> {
+    /// Apply the named testnet fixture. The backend-dependent `zainod.toml` is
+    /// rendered at build time, and — for the `State` backend only — the
+    /// variant's pre-synced zebra state is mounted at
+    /// `ZAINO_ZEBRA_DB`. Both happen in
+    /// [`ZainoBackend::materialize_opts`], which is the first point that knows
+    /// the tuning: `.restore(_)` and `.tuning(_)` compose in either order, so a
+    /// builder method cannot see it.
+    fn restore(self, archive: crate::ArchiveHandle) -> Self {
+        apply_restore(self, archive)
     }
 }
 
-fn apply_testnet(
+fn apply_restore(
     indexer: crate::component::Indexer<ZainoBackend>,
-    variant: &str,
+    archive: crate::ArchiveHandle,
 ) -> crate::component::Indexer<ZainoBackend> {
-    let mut indexer = indexer
-        .mount(crate::regtest::testnet_chain_archive(
-            variant,
-            crate::regtest::TestnetChainKind::Zebra,
-            ZAINO_TESTNET_ZEBRA_DB,
-        ))
-        .args(["start", "--config", "/etc/zaino/zainod.toml"]);
-    indexer.mode = crate::component::IndexerMode::Testnet(variant.to_string());
+    let mut indexer = apply_pod_layout(indexer);
+    indexer.opts.restore = Some(crate::component::RestoreSource::Archive(archive));
+    indexer.mode = crate::component::IndexerMode::Testnet(archive);
     indexer
 }
 
@@ -818,20 +1172,13 @@ const ZAINO_TESTNET_GRPC_PORT: u16 = crate::handles::ports::ZAINO_GRPC;
 const ZAINO_TESTNET_JSONRPC_PORT: u16 = crate::handles::ports::ZAINO_JSONRPC;
 
 /// In-cluster DNS name of the paired zebrad pod. Matches the default pod name
-/// `Validator::zebrad(…).testnet(variant)` assigns; override on both sides if
+/// `Validator::zebrad(…).restore(archive)` assigns; override on both sides if
 /// you `.named(…)` differently.
 const ZAINO_TESTNET_VALIDATOR_HOST: &str = "zebrad";
 
 /// Testnet zebrad's JSON-RPC port: the same canonical testnet port the
 /// zebrad backend serves on.
 const ZAINO_TESTNET_VALIDATOR_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_TESTNET_RPC;
-
-/// Path the chain-archive snapshot lands at inside the zaino pod.
-const ZAINO_TESTNET_ZEBRA_DB: &str = "/var/lib/zaino/zebra-db";
-
-/// Path zaino writes its own state database to (pod-level scratch); the
-/// snapshot machinery doesn't touch this.
-const ZAINO_TESTNET_DB: &str = "/var/lib/zaino/db";
 
 // ──────────────────────────── Zaino-only RPCs ─────────────────────────
 //
@@ -866,5 +1213,124 @@ impl ZainoIndexer {
     pub async fn peer_info(&self) -> Result<PeerInfo, RpcError> {
         let client = crate::handles::client::json_rpc(&self.plumbing.endpoint("jsonrpc").await?);
         ZcashRpc::new(COMPONENT, &client).peer_info().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn progress(height: u32, target: Option<u32>) -> ZainoSyncProgress {
+        ZainoSyncProgress {
+            height,
+            target,
+            work: Work::ZERO,
+        }
+    }
+
+    #[test]
+    fn progress_is_linear_in_height() {
+        assert_eq!(progress(500, Some(1_000)).pct(), 50.0);
+        assert_eq!(progress(1_000, Some(1_000)).pct(), 100.0);
+    }
+
+    /// The denominator is the live tip, so on a chain still producing blocks a
+    /// subject that gained ground can still lose percentage. That is a true
+    /// reading and nothing downstream may assume `pct` only rises.
+    #[test]
+    fn progress_can_fall_while_height_rises() {
+        let earlier = progress(900, Some(1_000));
+        let later = progress(950, Some(1_200));
+        assert!(later.height() > earlier.height());
+        assert!(
+            later.pct() < earlier.pct(),
+            "{} !< {}",
+            later.pct(),
+            earlier.pct()
+        );
+    }
+
+    /// Zaino reports a zero estimate before it knows the tip. Treating that as
+    /// a target would divide by zero and render 100% complete at height 0.
+    #[test]
+    fn an_unknown_tip_is_no_target_rather_than_zero() {
+        let p = progress(0, None);
+        assert_eq!(p.target(), None);
+        assert_eq!(p.pct(), 0.0);
+        assert_eq!(p.phase(), Phase::Starting);
+    }
+
+    #[test]
+    fn phase_tracks_the_gap_to_the_tip() {
+        assert_eq!(progress(10, Some(1_000)).phase(), Phase::Downloading);
+        assert_eq!(progress(1_000, Some(1_000)).phase(), Phase::Done);
+    }
+
+    /// Zaino counts its own indexed outputs and actions, so `Work` is reported
+    /// rather than derived from height. Only the ops it publishes are `set`:
+    /// the rest stay unmeasured, so a probe reading one panics via
+    /// `Work::require` instead of comparing zeroes that can never fail.
+    #[test]
+    fn zaino_reports_the_ops_it_counts_and_marks_the_rest_unmeasured() {
+        let mut work = Work::ZERO;
+        work.set(Op::SaplingOutput, 12).set(Op::OrchardAction, 7);
+        let reported = ZainoSyncProgress {
+            height: 500,
+            target: Some(1_000),
+            work,
+        }
+        .work()
+        .expect("zaino reports its own work");
+
+        assert_eq!(reported.get(Op::SaplingOutput), Some(12));
+        assert_eq!(reported.get(Op::OrchardAction), Some(7));
+        assert_eq!(
+            reported.get(Op::TransparentOut),
+            None,
+            "zaino publishes no transparent counter; an unmeasured op must not read as zero"
+        );
+    }
+
+    fn mounts_scratch(indexer: &crate::component::Indexer<super::ZainoBackend>) -> bool {
+        indexer
+            .opts
+            .mounts
+            .iter()
+            .any(|m| m.destination == std::path::Path::new(super::ZAINO_SCRATCH))
+    }
+
+    /// The regression: only `.regtest()` mounted the scratch root, so a
+    /// `.restore(_)` pod booted with config pointing `[storage.database] path`
+    /// at a directory that existed nowhere it could write. `FinalisedState`
+    /// died creating its RocksDB — after a clean startup and a successful chain
+    /// sync, which is what made it read as a zaino bug rather than a missing
+    /// mount.
+    #[test]
+    fn both_mode_entry_points_mount_the_scratch_root() {
+        let zaino = || crate::component::Indexer::zaino("1.0.0");
+        assert!(mounts_scratch(&super::apply_regtest(zaino())));
+        assert!(mounts_scratch(&super::apply_restore(
+            zaino(),
+            crate::archive::ArchiveHandle::__new(
+                "zebra-v6.2.3-test.tar.zst",
+                "0".repeat(64).leak(),
+                1,
+                None,
+            ),
+        )));
+    }
+
+    /// Both DB paths are pod-writable only by virtue of living under the
+    /// scratch root; a path that escaped it would fail exactly the way the bug
+    /// above did.
+    #[test]
+    fn every_db_path_lives_under_the_scratch_root() {
+        for path in [super::ZAINO_ZEBRA_DB, super::ZAINO_DB] {
+            assert!(
+                std::path::Path::new(path).starts_with(super::ZAINO_SCRATCH),
+                "{path} is not under {}",
+                super::ZAINO_SCRATCH
+            );
+        }
     }
 }

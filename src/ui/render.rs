@@ -1,66 +1,18 @@
-//! Pure formatter for the preflight banner: takes a [`BannerState`] and a
-//! [`Theme`], returns a `String` (no I/O, no async). Follows nextest's reporter
-//! conventions — a 12-column right-aligned action label, a 12-char horizontal
-//! rule, `·` metadata separators, `✓ ⇣ !` markers — so it reads as another
-//! group of action lines in nextest's banner rather than a separate UI.
-
 use std::fmt::Write as _;
 
 use bytesize::ByteSize;
 use owo_colors::OwoColorize;
 
+use super::layout::*;
+use super::text::{column_width, compact, format_elapsed, meter, thousands};
 use super::theme::Theme;
 use super::{
-    ArchiveRow, ArchiveStatus, BannerState, BuildStage, BuildState, DownloadSource,
-    MetricsAvailability, QosPlan, SnapshotRow, SnapshotStatus, SyncVitals, SyncWatchState,
-    TierPlan, TransferKind, TransferProgress, TransferRow, Transfers,
+    ArchiveRow, ArchiveStatus, BannerState, BuildStage, BuildState, QosPlan, SyncVitals,
+    SyncWatchState, TierPlan, TransferKind, TransferProgress, TransferRow, Transfers,
 };
+use crate::qos::Resources;
 use crate::qos::live::LiveSnapshot;
-use crate::qos::{GIB, Resources};
 
-/// Width of the action-label column, matching nextest's `{:>12}`.
-const LABEL_WIDTH: usize = 12;
-
-/// Label column for the right-hand metrics block. Narrower than [`LABEL_WIDTH`]
-/// because the right column is the one starved for width (it gets whatever the
-/// terminal has past the left column's fixed 80).
-const METRIC_LABEL_WIDTH: usize = 7;
-
-/// The pinned panel's fixed line count (must equal `cli::console::PANEL_ROWS`).
-/// Every left/right block formatter returns exactly this many lines so the
-/// two-column panel is a constant, non-reflowing block for the whole session.
-const PANEL_LINES: usize = 5;
-
-/// The most transfer rows the right column can show at once; a longer list
-/// collapses its tail into a `+N more` line. `PANEL_LINES - 1` because the right
-/// column's top row is left blank to align with the left column's branded rule.
-const MAX_TRANSFER_ROWS: usize = PANEL_LINES - 1;
-
-/// Force `out` to exactly [`PANEL_LINES`] lines: pad short blocks with blank
-/// lines, truncate an over-long one, so the fixed-height panel viewport doesn't
-/// drift.
-fn pad_to_panel(out: &mut String) {
-    let n = out.lines().count();
-    match n.cmp(&PANEL_LINES) {
-        std::cmp::Ordering::Less => {
-            for _ in n..PANEL_LINES {
-                out.push('\n');
-            }
-        }
-        std::cmp::Ordering::Greater => {
-            let kept: String = out.lines().take(PANEL_LINES).collect::<Vec<_>>().join("\n");
-            *out = kept;
-        }
-        std::cmp::Ordering::Equal => {}
-    }
-}
-
-/// Width of the bracketed progress bar in [`render_progress_bar`].
-const PROGRESS_BAR_WIDTH: usize = 12;
-
-/// Render one frame of the banner to a `String`. The result ends in `\n`; ANSI
-/// escape codes are present iff `theme.is_colorized()`. Produces one frame, so
-/// a caller doing in-place refresh must emit its own cursor-up sequences.
 pub fn render(state: &BannerState, theme: &Theme) -> String {
     let mut out = String::with_capacity(2048);
 
@@ -72,15 +24,9 @@ pub fn render(state: &BannerState, theme: &Theme) -> String {
     render_inventory_block(&mut out, state, theme);
     blank_line(&mut out);
     render_archive_block(&mut out, state, theme);
-    blank_line(&mut out);
-    render_snapshot_block(&mut out, state, theme);
     if let Some(plan) = &state.qos_plan {
         blank_line(&mut out);
         render_qos_block(&mut out, plan, theme);
-    }
-    if !state.future.is_empty() {
-        blank_line(&mut out);
-        render_future_block(&mut out, state, theme);
     }
     render_bottom_rule(&mut out, theme);
 
@@ -89,37 +35,6 @@ pub fn render(state: &BannerState, theme: &Theme) -> String {
 
 /// One blank line, the section separator. A single `\n` so the live-renderer's
 /// line counter doesn't double-count.
-fn blank_line(out: &mut String) {
-    out.push('\n');
-}
-
-// ─────────────────────────── line writers ─────────────────────────────
-
-/// Indent for `{:>12} ` action labels, used on lines that continue the previous
-/// label (e.g. the cluster block's node line).
-const INDENT: &str = "             "; // 12 spaces + 1 separator = label column width + 1
-
-fn render_top_rule(out: &mut String, theme: &Theme) {
-    writeln!(out, "{}", theme.chars.hbar(LABEL_WIDTH)).expect("write to string");
-}
-
-fn render_bottom_rule(out: &mut String, theme: &Theme) {
-    writeln!(out, "{}", theme.chars.hbar(LABEL_WIDTH)).expect("write to string");
-}
-
-/// The branded divider between scrolled output above and a pinned status panel
-/// below: `───── Ztest ─────`. Reuses `hbar` so it follows the theme's glyph
-/// (`-----` under the ASCII fallback).
-fn render_label_rule(out: &mut String, theme: &Theme) {
-    let side = theme.chars.hbar(5);
-    writeln!(
-        out,
-        "{side} {} {side}",
-        "Ztest".style(theme.styles.script_id)
-    )
-    .expect("write to string");
-}
-
 fn render_header_line(out: &mut String, _state: &BannerState, theme: &Theme) {
     let label = "Preflight";
     writeln!(
@@ -161,7 +76,7 @@ fn render_cluster_block(out: &mut String, state: &BannerState, theme: &Theme) {
     let alloc = c.capacity.allocatable;
     let free = c.capacity.free();
     let pct = free_percent(&free, &alloc);
-    let bar = render_progress_bar(pct, theme);
+    let bar = meter(pct, theme);
     writeln!(
         out,
         "{INDENT}capacity {dot} {} / {} cores {dot} {} / {} GiB free {bar} {}",
@@ -175,57 +90,6 @@ fn render_cluster_block(out: &mut String, state: &BannerState, theme: &Theme) {
 }
 
 /// Whole CPU cores in a [`Resources`] (millicpu / 1000, rounded down).
-fn cores_of(r: &Resources) -> u64 {
-    r.cpu_milli / 1000
-}
-
-/// Whole GiB in a [`Resources`].
-fn gib_of(r: &Resources) -> u64 {
-    r.mem_bytes / GIB
-}
-
-/// Percent of capacity free, the tighter (min) of the CPU and memory free
-/// fractions: the binding constraint for packing more work. Zero allocatable
-/// (e.g. before the probe lands) gives 0%.
-fn free_percent(free: &Resources, alloc: &Resources) -> u8 {
-    let frac = |f: u64, a: u64| -> u64 {
-        if a == 0 {
-            0
-        } else {
-            ((f as u128 * 100) / a as u128).min(100) as u64
-        }
-    };
-    frac(free.cpu_milli, alloc.cpu_milli).min(frac(free.mem_bytes, alloc.mem_bytes)) as u8
-}
-
-/// Spinner glyph table: the braille frames `indicatif` uses for its default
-/// spinner. The frame index is derived from elapsed time so a ~200ms redraw
-/// cadence cycles smoothly.
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Milliseconds per spinner frame. The single source of truth for the animation
-/// cadence: the console's render thread gates its redraw on this same step (so it
-/// repaints exactly when the frame advances) — see `cli::console`'s `FrameClock`.
-pub(crate) const SPINNER_STEP_MS: u128 = 100;
-
-/// Pick a spinner frame from `elapsed`. One frame per [`SPINNER_STEP_MS`], so a
-/// 200ms redraw cadence advances ~2 frames per tick.
-fn spinner_glyph(elapsed: std::time::Duration) -> &'static str {
-    let idx = (elapsed.as_millis() / SPINNER_STEP_MS) as usize % SPINNER_FRAMES.len();
-    SPINNER_FRAMES[idx]
-}
-
-/// Format an elapsed duration as `12s` / `1m23s`, matching nextest's `[NNs]` /
-/// `[Nm NNs]` timestamp vocabulary.
-fn format_elapsed(d: std::time::Duration) -> String {
-    let total = d.as_secs();
-    if total < 60 {
-        format!("{total}s")
-    } else {
-        format!("{}m{:02}s", total / 60, total % 60)
-    }
-}
-
 fn render_inventory_block(out: &mut String, state: &BannerState, theme: &Theme) {
     let dot = theme.chars.dot.style(theme.styles.dim);
     match &state.build {
@@ -322,72 +186,9 @@ fn render_archive_block(out: &mut String, state: &BannerState, theme: &Theme) {
     }
 }
 
-fn render_snapshot_block(out: &mut String, state: &BannerState, theme: &Theme) {
-    let snapshots = &state.snapshots;
-    writeln!(
-        out,
-        "{:>width$} {} selected",
-        "Snapshots".style(theme.styles.pass),
-        snapshots.len().style(theme.styles.count),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
-
-    let name_col = column_width(snapshots.iter().map(|r| r.pvc.as_str()), 24, 36);
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    for row in snapshots {
-        write_snapshot_row(out, row, name_col, &dot, theme);
-    }
-}
-
-fn render_future_block(out: &mut String, state: &BannerState, theme: &Theme) {
-    if state.future.is_empty() {
-        return;
-    }
-    writeln!(
-        out,
-        "{:>width$} {} planned",
-        "Scheduling".style(theme.styles.dim),
-        state.future.len().style(theme.styles.dim),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
-
-    let name_col = column_width(state.future.iter().map(|r| r.label), 12, 16);
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    for row in &state.future {
-        writeln!(
-            out,
-            "{INDENT}{:<width$} {dot} {}",
-            row.label.style(theme.styles.dim),
-            "planned (scheduler pending)".style(theme.styles.dim),
-            width = name_col,
-        )
-        .expect("write to string");
-    }
-}
-
 /// `<cpu> / <mem>` for an aggregate (peak / total) reserve, in decimal cores and
 /// GiB: `11.5c / 19.5 GiB` reads better than `11500m / 19968 MiB` for summed
 /// figures.
-fn agg_str(r: &Resources) -> String {
-    let cpu = if r.cpu_milli.is_multiple_of(1000) {
-        format!("{}c", r.cpu_milli / 1000)
-    } else {
-        format!("{:.1}c", r.cpu_milli as f64 / 1000.0)
-    };
-    let mem = if r.mem_bytes.is_multiple_of(GIB) {
-        format!("{} GiB", r.mem_bytes / GIB)
-    } else {
-        format!("{:.1} GiB", r.mem_bytes as f64 / GIB as f64)
-    };
-    format!("{cpu} / {mem}")
-}
-
-/// The QoS scheduling plan (`docs/qos-design.md` §8 planning pass): per-tier
-/// selected counts and footprints, the wave/peak estimate against probed
-/// capacity, and any unschedulable-tier warnings. The live during-run
-/// reservation view is a deferred follow-up, noted as the final dim line.
 fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
     let dot = theme.chars.dot.style(theme.styles.dim);
     let total_tests: u32 = plan.tiers.iter().map(|t| t.count).sum();
@@ -461,17 +262,6 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
 
 /// Utilization percent of `part` within `whole`, the tighter (max) of the CPU
 /// and memory fractions: how full the binding dimension is. Zero `whole` gives 0%.
-fn used_percent(part: &Resources, whole: &Resources) -> u8 {
-    let frac = |p: u64, w: u64| -> u64 {
-        if w == 0 {
-            0
-        } else {
-            ((p as u128 * 100) / w as u128).min(100) as u64
-        }
-    };
-    frac(part.cpu_milli, whole.cpu_milli).max(frac(part.mem_bytes, whole.mem_bytes)) as u8
-}
-
 /// Live test-run progress for the during-run panel, populated by the run loop
 /// (`cli::console`): `elapsed` drives the spinner/clock heartbeat, the counts
 /// are tallied from relayed per-test result lines, and `total` (`0` = unknown)
@@ -521,7 +311,7 @@ pub fn render_live_panel(
     let capacity = if free.cpu_milli == 0 && free.mem_bytes == 0 {
         "capacity unknown (probe unavailable)".to_string()
     } else {
-        let bar = render_progress_bar(used_percent(&snapshot.committed, free), theme);
+        let bar = meter(used_percent(&snapshot.committed, free), theme);
         format!("{bar} of {} free", agg_str(free).style(theme.styles.count))
     };
     writeln!(
@@ -621,7 +411,7 @@ pub fn render_preflight_panel(
     let alloc = c.capacity.allocatable;
     let free = c.capacity.free();
     let pct = free_percent(&free, &alloc);
-    let bar = render_progress_bar(pct, theme);
+    let bar = meter(pct, theme);
     writeln!(
         out,
         "{:>width$} {bar} {} {dot} {}/{}c {dot} {}/{}Gi free",
@@ -823,7 +613,7 @@ fn render_sync_vitals(
         "height".style(theme.styles.dim),
         target.style(theme.styles.count),
         format_args!("{:.1}%", v.pct).style(theme.styles.count),
-        render_progress_bar(v.pct.clamp(0.0, 100.0) as u8, theme),
+        meter(v.pct.clamp(0.0, 100.0) as u8, theme),
         width = LABEL_WIDTH,
     )
     .expect("write to string");
@@ -973,33 +763,22 @@ fn render_sync_waiting(
 /// reading, one label per row. Held to [`PANEL_LINES`] with the top row blank,
 /// matching [`render_transfers`].
 ///
-/// Fed by the direct exporter scrape (`metrics::live`), not by thanos — a column
-/// that repaints once per scrape interval is not a live display. Four blank rows
-/// read as "everything is zero", so when there are no values the *reason* is named.
-pub fn render_sync_metrics(state: &SyncWatchState, theme: &Theme) -> String {
+/// Fed by a direct exporter scrape, not by a monitoring stack — a column that
+/// repaints once per scrape interval is not a live display. Four blank rows read
+/// as "everything is zero", so when there are no values the *reason* is named.
+pub fn render_sync_metrics(reading: &crate::metrics::Reading, theme: &Theme) -> String {
     let mut out = String::with_capacity(320);
     out.push('\n');
     let dot = theme.chars.dot.style(theme.styles.dim);
 
-    if state.metrics_state != MetricsAvailability::Sampled || state.metrics.is_empty() {
-        // Naming the cause is the point: "no samples" sent a reader hunting a
-        // broken exporter when nothing was broken at all.
-        let reason = match &state.metrics_state {
-            // Nothing exposes a metrics port yet: the components are still being
-            // provisioned. Not a fault, and not a statement about the engine.
-            MetricsAvailability::Idle => "no metrics-exposing pod yet".to_string(),
-            MetricsAvailability::AwaitingScrape => format!(
-                "scraping every {} · no series published yet",
-                format_elapsed(crate::metrics::live::LIVE_SCRAPE_PERIOD)
-            ),
-            MetricsAvailability::Unavailable(why) => format!("unavailable · {why}"),
-            MetricsAvailability::Sampled => "no values returned".to_string(),
-        };
+    // Naming the cause is the point: "no samples" sent a reader hunting a broken
+    // exporter when nothing was broken at all.
+    if let Some(note) = &reading.note {
         writeln!(
             out,
             "{:>width$} {}",
             "metrics".style(theme.styles.dim),
-            reason.style(theme.styles.dim),
+            note.style(theme.styles.dim),
             width = METRIC_LABEL_WIDTH,
         )
         .expect("write to string");
@@ -1016,10 +795,10 @@ pub fn render_sync_metrics(state: &SyncWatchState, theme: &Theme) -> String {
         )
         .expect("write to string");
     };
-    let num = |name: &str| {
-        state
-            .metric(name)
-            .map(compact_count)
+    let num = |label: &str| {
+        reading
+            .get(label)
+            .map(compact)
             .unwrap_or_else(|| "—".to_string())
     };
 
@@ -1034,8 +813,8 @@ pub fn render_sync_metrics(state: &SyncWatchState, theme: &Theme) -> String {
     );
     // Grouped in full, not abbreviated: the tip is read against the `height` row
     // opposite it, and `1.5M` can't be compared with `1,284,901`.
-    let tip = state
-        .metric("chain tip height")
+    let tip = reading
+        .get("chain tip height")
         .map(|h| thousands(h.max(0.0) as u64))
         .unwrap_or_else(|| "—".to_string());
     row(&mut out, "tip", tip.style(theme.styles.count).to_string());
@@ -1047,8 +826,8 @@ pub fn render_sync_metrics(state: &SyncWatchState, theme: &Theme) -> String {
             num("transactions indexed").style(theme.styles.count)
         ),
     );
-    let latency = state
-        .metric("gRPC mean latency (ms)")
+    let latency = reading
+        .get("gRPC mean latency (ms)")
         .map(|ms| format!("{ms:.1} ms"))
         .unwrap_or_else(|| "—".to_string());
     row(
@@ -1067,34 +846,6 @@ pub fn render_sync_metrics(state: &SyncWatchState, theme: &Theme) -> String {
 
 /// Group a count with thin separators: heights and totals in the millions are
 /// unreadable as a bare digit run at a glance.
-fn thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Abbreviate a metric value to fit the narrow right column: `918`, `18.2k`,
-/// `1.4M`. Sub-unit values keep one decimal so a fractional gauge isn't shown
-/// as `0`.
-fn compact_count(v: f64) -> String {
-    let a = v.abs();
-    if a >= 1_000_000.0 {
-        format!("{:.1}M", v / 1_000_000.0)
-    } else if a >= 1_000.0 {
-        format!("{:.1}k", v / 1_000.0)
-    } else if a >= 1.0 || a == 0.0 {
-        format!("{}", v.round() as i64)
-    } else {
-        format!("{v:.1}")
-    }
-}
-
 /// The **right column** of the pinned bottom console: the live set of background
 /// acquisitions (dev-image build+load, archive/seed downloads) tracked
 /// independently of the scrolling main output. Exactly [`PANEL_LINES`] lines:
@@ -1171,7 +922,7 @@ fn write_transfer_row(
                     } else {
                         ((*done as u128 * 100) / *total as u128).min(100) as u8
                     };
-                    let bar = render_progress_bar(percent, theme);
+                    let bar = meter(percent, theme);
                     write!(
                         out,
                         "{bar} {} {dot} {} / {}",
@@ -1251,7 +1002,6 @@ fn write_archive_row(
 ) {
     let (marker, marker_style) = match &row.status {
         ArchiveStatus::Cached { .. } => (theme.chars.ok, theme.styles.pass),
-        ArchiveStatus::Downloading { .. } => (theme.chars.progress, theme.styles.count),
         ArchiveStatus::Missing { .. } => (theme.chars.warn, theme.styles.skip),
     };
     write!(
@@ -1281,32 +1031,6 @@ fn write_archive_detail(out: &mut String, status: &ArchiveStatus, theme: &Theme)
             )
             .expect("write to string");
         }
-        ArchiveStatus::Downloading {
-            source,
-            bytes_done,
-            bytes_total,
-        } => {
-            let source_label = match source {
-                DownloadSource::Lfs => "LFS",
-                DownloadSource::ClusterCache => "cluster cache",
-            };
-            let percent = status.download_progress().map(|(p, _, _)| p).unwrap_or(0);
-            let bar = render_progress_bar(percent, theme);
-            write!(
-                out,
-                "downloading from {source_label} {bar} {} {dot} {} / {}",
-                format_args!("{percent}%").style(theme.styles.count),
-                ByteSize::b(*bytes_done)
-                    .display()
-                    .iec()
-                    .style(theme.styles.count),
-                ByteSize::b(*bytes_total)
-                    .display()
-                    .iec()
-                    .style(theme.styles.count),
-            )
-            .expect("write to string");
-        }
         ArchiveStatus::Missing { detail } => {
             write!(out, "missing {dot} {}", detail.style(theme.styles.dim),)
                 .expect("write to string");
@@ -1314,71 +1038,7 @@ fn write_archive_detail(out: &mut String, status: &ArchiveStatus, theme: &Theme)
     }
 }
 
-fn write_snapshot_row(
-    out: &mut String,
-    row: &SnapshotRow,
-    name_col: usize,
-    dot: &impl std::fmt::Display,
-    theme: &Theme,
-) {
-    let (marker, marker_style) = match &row.status {
-        SnapshotStatus::BoundReady => (theme.chars.ok, theme.styles.pass),
-        SnapshotStatus::Provisioning { .. } => (theme.chars.progress, theme.styles.count),
-    };
-    write!(
-        out,
-        "{INDENT}{} {:<width$} {dot} ",
-        marker.style(marker_style),
-        row.pvc,
-        width = name_col,
-    )
-    .expect("write to string");
-    match &row.status {
-        SnapshotStatus::BoundReady => {
-            write!(
-                out,
-                "{} {dot} {}",
-                "bound".style(theme.styles.pass),
-                "ready".style(theme.styles.pass),
-            )
-            .expect("write to string");
-        }
-        SnapshotStatus::Provisioning { from_archive } => {
-            write!(out, "provisioning from {from_archive}").expect("write to string");
-        }
-    }
-    out.push('\n');
-}
-
 // ─────────────────────────── helpers ──────────────────────────────────
-
-fn render_progress_bar(percent: u8, theme: &Theme) -> String {
-    let pct = percent.min(100) as usize;
-    let filled = pct * PROGRESS_BAR_WIDTH / 100;
-    let empty = PROGRESS_BAR_WIDTH - filled;
-    format!(
-        "{}{}{}{}",
-        "[".style(theme.styles.dim),
-        theme
-            .chars
-            .bar_fill
-            .repeat(filled)
-            .style(theme.styles.count),
-        theme.chars.bar_empty.repeat(empty).style(theme.styles.dim),
-        "]".style(theme.styles.dim),
-    )
-}
-
-/// Column width for a name column: max(items) clamped to a sane range so one
-/// very-long name can't push detail off the right.
-fn column_width<'a>(names: impl IntoIterator<Item = &'a str>, min: usize, max: usize) -> usize {
-    names
-        .into_iter()
-        .map(|n| n.len())
-        .max()
-        .unwrap_or(0)
-        .clamp(min, max)
-}
 
 // ─────────────────────────── tests ────────────────────────────────────
 
@@ -1386,6 +1046,7 @@ fn column_width<'a>(names: impl IntoIterator<Item = &'a str>, min: usize, max: u
 mod tests {
     use super::super::*;
     use super::*;
+    use crate::qos::GIB;
     use crate::qos::QosClass;
 
     fn sample_state() -> BannerState {
@@ -1421,33 +1082,12 @@ mod tests {
                     },
                 },
                 ArchiveRow {
-                    name: "testnet-3.1m".to_string(),
-                    status: ArchiveStatus::Downloading {
-                        source: DownloadSource::Lfs,
-                        bytes_done: 19_241_454_485,
-                        bytes_total: 30_064_771_072,
-                    },
-                },
-                ArchiveRow {
                     name: "mainnet-snapshot-9.0".to_string(),
                     status: ArchiveStatus::Missing {
                         detail: "LFS pointer present, blob absent".to_string(),
                     },
                 },
             ],
-            snapshots: vec![
-                SnapshotRow {
-                    pvc: "pvc/zebra-testnet-cache".to_string(),
-                    status: SnapshotStatus::BoundReady,
-                },
-                SnapshotRow {
-                    pvc: "pvc/zebra-mainnet-cache".to_string(),
-                    status: SnapshotStatus::Provisioning {
-                        from_archive: "testnet-3.1m".to_string(),
-                    },
-                },
-            ],
-            future: vec![],
             qos_plan: None,
         }
     }
@@ -1582,15 +1222,10 @@ mod tests {
 
    Inventory ✓ 47 tests across 8 binaries · 18s
 
-    Archives 4 selected
+    Archives 3 selected
              ✓ regtest-nu5-h128     · cached · 412.0 MiB
              ✓ testnet-2.6m         · cached · 18.4 GiB
-             ⇣ testnet-3.1m         · downloading from LFS [███████░░░░░] 64% · 17.9 GiB / 28.0 GiB
              ! mainnet-snapshot-9.0 · missing · LFS pointer present, blob absent
-
-   Snapshots 2 selected
-             ✓ pvc/zebra-testnet-cache  · bound · ready
-             ⇣ pvc/zebra-mainnet-cache  · provisioning from testnet-3.1m
 ────────────
 ";
         assert_eq!(
@@ -1607,7 +1242,6 @@ mod tests {
         assert!(!s.contains('·'), "ascii leaked dot:\n{s}");
         assert!(s.contains("------------"), "ascii hbar missing:\n{s}");
         assert!(s.contains("OK regtest-nu5-h128"), "ascii ok marker:\n{s}");
-        assert!(s.contains(".. testnet-3.1m"), "ascii progress marker:\n{s}");
         assert!(
             s.contains("WARN mainnet-snapshot-9.0"),
             "ascii warn marker:\n{s}"
@@ -1627,38 +1261,8 @@ mod tests {
     fn empty_lists_render_zero_count() {
         let mut state = sample_state();
         state.archives.clear();
-        state.snapshots.clear();
         let s = render(&state, &plain_unicode_theme());
         assert!(s.contains("Archives 0 selected"), "got:\n{s}");
-        assert!(s.contains("Snapshots 0 selected"), "got:\n{s}");
-    }
-
-    #[test]
-    fn future_rows_render_as_a_labeled_section() {
-        let mut state = sample_state();
-        state.future = vec![
-            FutureRow { label: "tier" },
-            FutureRow { label: "queue" },
-            FutureRow {
-                label: "reservation",
-            },
-        ];
-        let s = render(&state, &plain_unicode_theme());
-        // Section header.
-        assert!(
-            s.contains("Scheduling 3 planned"),
-            "missing scheduling header:\n{s}"
-        );
-        // Rows are dot-separated and tagged planned.
-        assert!(s.contains("tier"), "got:\n{s}");
-        assert!(s.contains("queue"), "got:\n{s}");
-        assert!(s.contains("reservation"), "got:\n{s}");
-        assert!(s.contains("planned (scheduler pending)"), "got:\n{s}");
-        // Blank line separator landed before the scheduling block.
-        assert!(
-            s.contains("\n\n  Scheduling"),
-            "missing blank separator:\n{s}"
-        );
     }
 
     #[test]
@@ -1793,7 +1397,6 @@ mod tests {
     fn no_qos_plan_renders_no_scheduling_block() {
         let mut state = sample_state();
         state.qos_plan = None;
-        state.future = vec![]; // also no placeholder rows
         let s = render(&state, &plain_unicode_theme());
         assert!(
             !s.contains("Scheduling"),
@@ -1841,17 +1444,6 @@ mod tests {
         assert_eq!(free_percent(&Resources::ZERO, &Resources::ZERO), 0);
     }
 
-    #[test]
-    fn progress_bar_clamps_overflow() {
-        let theme = plain_unicode_theme();
-        let bar0 = render_progress_bar(0, &theme);
-        assert_eq!(bar0, "[░░░░░░░░░░░░]");
-        let bar100 = render_progress_bar(100, &theme);
-        assert_eq!(bar100, "[████████████]");
-        let bar250 = render_progress_bar(250, &theme);
-        assert_eq!(bar250, "[████████████]", "should clamp at 100%");
-    }
-
     // ─────────────────────── sync watch panel ─────────────────────────
 
     fn watching(vitals: Option<SyncVitals>) -> SyncWatchState {
@@ -1863,9 +1455,8 @@ mod tests {
             setup: None,
             vitals,
             probes: Vec::new(),
-            metrics: Vec::new(),
-            metrics_state: MetricsAvailability::Sampled,
             violations: 0,
+            timeline: None,
         }
     }
 
@@ -1878,6 +1469,17 @@ mod tests {
             reorg_depth: 0,
             blocks_per_sec: Some(12.4),
             eta: Some(std::time::Duration::from_secs(10)),
+            // Transparent and sprout are tier B and nobody counted them;
+            // Ironwood was counted and is genuinely idle. The panel has to
+            // render that difference.
+            work_rate: Some(23_600.0),
+            pool_rates: vec![
+                ("transparent", None),
+                ("sprout", None),
+                ("sapling", Some(19_400.0)),
+                ("orchard", Some(4_200.0)),
+                ("ironwood", Some(0.0)),
+            ],
             received_at: std::time::Duration::from_secs(210),
         }
     }
@@ -2020,40 +1622,31 @@ mod tests {
     #[test]
     fn the_metrics_column_distinguishes_why_it_is_empty() {
         let theme = plain_unicode_theme();
-        let render = |state: &SyncWatchState| {
-            let s = render_sync_metrics(state, &theme);
+        let render = |reading: &crate::metrics::Reading| {
+            let s = render_sync_metrics(reading, &theme);
             assert_eq!(s.lines().count(), PANEL_LINES, "fixed height:\n{s}");
             s
         };
 
-        // Nothing exposes a metrics port yet: still provisioning, nothing wrong.
-        let mut state = watching(None);
-        state.metrics_state = MetricsAvailability::Idle;
-        let s = render(&state);
+        // Whatever the cause, the column states it instead of showing blank rows.
+        // The causes themselves are derived where the reading is taken; this is
+        // the renderer's half of that contract.
+        let s = render(&reading_note("no metrics-exposing pod yet".into()));
         assert!(
             s.contains("no metrics-exposing pod"),
             "pre-target cause:\n{s}"
         );
 
-        // Targets answered, but none of the live families exist yet.
-        let mut state = watching(Some(sample_vitals()));
-        state.metrics_state = MetricsAvailability::AwaitingScrape;
-        let s = render(&state);
+        let s = render(&reading_note(format!(
+            "scraping every {} · no series published yet",
+            format_elapsed(crate::metrics::LIVE_PERIOD)
+        )));
         assert!(
             s.contains("no series published yet"),
             "unscraped cause:\n{s}"
         );
-        // Quoting a period the scraper does not use would send a reader waiting the
-        // wrong length of time, so the row is checked against the constant itself.
-        assert!(
-            s.contains(&format_elapsed(crate::metrics::live::LIVE_SCRAPE_PERIOD)),
-            "quotes the real scrape period:\n{s}"
-        );
 
-        // The exporters could not be read at all.
-        let mut state = watching(Some(sample_vitals()));
-        state.metrics_state = MetricsAvailability::Unavailable("connection refused".into());
-        let s = render(&state);
+        let s = render(&reading_note("unavailable · connection refused".into()));
         assert!(s.contains("unavailable"), "unreachable cause:\n{s}");
         assert!(s.contains("connection refused"), "carries the reason:\n{s}");
     }
@@ -2061,34 +1654,17 @@ mod tests {
     #[test]
     fn sync_metrics_column_shows_values_at_constant_height() {
         let theme = plain_unicode_theme();
-        let mut state = watching(Some(sample_vitals()));
-        state.metrics = vec![
-            MetricRow {
-                name: "sync lag (blocks)".into(),
-                value: Some(0.0),
-            },
-            MetricRow {
-                name: "reorgs".into(),
-                value: Some(1.0),
-            },
-            MetricRow {
-                name: "chain tip height".into(),
-                value: Some(1024.0),
-            },
-            MetricRow {
-                name: "transactions indexed".into(),
-                value: Some(18_204.0),
-            },
-            MetricRow {
-                name: "gRPC requests".into(),
-                value: Some(12_400.0),
-            },
-            MetricRow {
-                name: "gRPC mean latency (ms)".into(),
-                value: Some(4.13),
-            },
-        ];
-        let s = render_sync_metrics(&state, &theme);
+        let s = render_sync_metrics(
+            &reading(&[
+                ("sync lag (blocks)", 0.0),
+                ("reorgs", 1.0),
+                ("chain tip height", 1024.0),
+                ("transactions indexed", 18_204.0),
+                ("gRPC requests", 12_400.0),
+                ("gRPC mean latency (ms)", 4.13),
+            ]),
+            &theme,
+        );
         assert_eq!(s.lines().count(), PANEL_LINES, "sampled height:\n{s}");
         assert!(s.contains("18.2k tx"), "compact totals:\n{s}");
         assert!(s.contains("4.1 ms"), "latency:\n{s}");
@@ -2097,33 +1673,34 @@ mod tests {
 
     #[test]
     fn a_missing_metric_reads_as_absent_not_zero() {
-        let mut state = watching(None);
-        state.metrics = vec![
-            MetricRow {
-                name: "sync lag (blocks)".into(),
-                value: None,
-            },
-            MetricRow {
-                name: "reorgs".into(),
-                value: Some(0.0),
-            },
-        ];
-        let s = render_sync_metrics(&state, &plain_unicode_theme());
+        let mut r = reading(&[("reorgs", 0.0)]);
+        r.values.push(crate::metrics::Value {
+            label: "sync lag (blocks)",
+            value: None,
+        });
+        let s = render_sync_metrics(&r, &plain_unicode_theme());
         assert!(s.contains("\u{2014}"), "absent value is an em dash:\n{s}");
     }
 
-    #[test]
-    fn thousands_groups_and_compact_abbreviates() {
-        assert_eq!(thousands(0), "0");
-        assert_eq!(thousands(901), "901");
-        assert_eq!(thousands(1_024), "1,024");
-        assert_eq!(thousands(3_120_455), "3,120,455");
+    /// A reading carrying values, as the poller projects one.
+    fn reading(values: &[(&'static str, f64)]) -> crate::metrics::Reading {
+        crate::metrics::Reading {
+            values: values
+                .iter()
+                .map(|(label, v)| crate::metrics::Value {
+                    label,
+                    value: Some(*v),
+                })
+                .collect(),
+            note: None,
+        }
+    }
 
-        assert_eq!(compact_count(0.0), "0");
-        assert_eq!(compact_count(918.0), "918");
-        assert_eq!(compact_count(18_204.0), "18.2k");
-        assert_eq!(compact_count(1_400_000.0), "1.4M");
-        // A fractional gauge must not collapse to "0".
-        assert_eq!(compact_count(0.4), "0.4");
+    /// A reading with nothing to show and a stated reason.
+    fn reading_note(note: String) -> crate::metrics::Reading {
+        crate::metrics::Reading {
+            values: Vec::new(),
+            note: Some(note),
+        }
     }
 }

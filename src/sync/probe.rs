@@ -72,7 +72,7 @@ pub enum Class {
 }
 
 /// A probe's live state as of one tick — the standing board `ztest sync watch`
-/// renders. Derived from the rolling scheduler state on [`ProbeSpec`], which is
+/// renders. Derived from the rolling scheduler state on `ProbeSpec`, which is
 /// otherwise private to the runner, so a watcher can see a liveness window
 /// draining *before* it fires as a violation.
 #[derive(Clone, Debug)]
@@ -380,7 +380,9 @@ impl<'r> ProbeBuilder<'r> {
     }
 
     fn finish(self, check: Check) {
-        let name = self.name.unwrap_or_else(|| format!("probe_{}", self.sink.len()));
+        let name = self
+            .name
+            .unwrap_or_else(|| format!("probe_{}", self.sink.len()));
         self.sink.push(ProbeSpec {
             name,
             class: self.class,
@@ -400,15 +402,20 @@ impl<'r> ProbeBuilder<'r> {
 }
 
 /// Convenience constructors for durations used in cadences.
-pub fn secs(n: u64) -> Duration {
+///
+/// `const` so a profile can name its cadences as `const` items — which is where
+/// a cadence belongs, since it is a property of the profile rather than
+/// something computed per run — instead of being pushed into re-stating
+/// `Duration::from_secs` and losing the unit at the same time.
+pub const fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 /// Minutes.
-pub fn mins(n: u64) -> Duration {
+pub const fn mins(n: u64) -> Duration {
     Duration::from_secs(n * 60)
 }
 /// Hours.
-pub fn hours(n: u64) -> Duration {
+pub const fn hours(n: u64) -> Duration {
     Duration::from_secs(n * 3600)
 }
 

@@ -76,8 +76,9 @@ pub struct RunMeta {
 /// Read a run's `meta.json`.
 pub fn read_meta(run_dir: &std::path::Path) -> std::io::Result<RunMeta> {
     let bytes = std::fs::read(run_dir.join("meta.json"))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("meta.json: {e}")))
+    serde_json::from_slice(&bytes).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("meta.json: {e}"))
+    })
 }
 
 /// The final [`RunStats`] recorded for a run, or `None` if it never reached
@@ -204,14 +205,8 @@ mod tests {
             Ok(RunSelector::Id("ztest-run-1234".into()))
         );
         assert_eq!("b0b".parse(), Ok(RunSelector::Id("b0b".into())));
-        assert_eq!(
-            "/tmp/rec".parse(),
-            Ok(RunSelector::Path("/tmp/rec".into()))
-        );
-        assert_eq!(
-            "./rec".parse(),
-            Ok(RunSelector::Path("./rec".into()))
-        );
+        assert_eq!("/tmp/rec".parse(), Ok(RunSelector::Path("/tmp/rec".into())));
+        assert_eq!("./rec".parse(), Ok(RunSelector::Path("./rec".into())));
     }
 
     #[test]

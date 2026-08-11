@@ -13,13 +13,17 @@
 //! nemesis (step 5), pod lifecycle + `ztest sync` CLI (step 6), and the indexer
 //! proxy (step 7) build on top.
 
+mod chainwork;
 mod detached;
 mod event;
 mod nemesis;
 mod probe;
 mod runner;
+mod series;
 mod snapshot;
 mod subject;
+mod tree;
+mod work;
 
 pub(crate) use detached::note_setup;
 pub(crate) use event::{SyncEvent, decode as decode_event};
@@ -29,11 +33,12 @@ pub(crate) use event::{SyncEvent, decode as decode_event};
 pub(crate) use event::{Tick as SyncTick, encode as encode_event};
 
 pub use detached::{
-    active_sync_id, kind_selector, namespace_for, report_cm_name, ReportMetric, ReportViolation,
-    SyncReportMirror, KIND_LABEL_KEY, KIND_LABEL_VALUE, OWNER_KEY, POD_NAME_ENV, STOP_ANNOTATION,
-    SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV,
+    KIND_LABEL_KEY, KIND_LABEL_VALUE, POD_NAME_ENV, ReportViolation, STOP_ANNOTATION, SYNC_ID_ENV,
+    SYNC_ID_KEY, SYNC_PROFILE_ENV, SyncReportMirror, active_sync_id, kind_selector, namespace_for,
+    report_cm_name,
 };
 
+pub use chainwork::{ChainWork, Support};
 pub use nemesis::{
     Buggify, BuggifyRule, Delay, Fault, FaultKind, Nemesis, NemesisBuilder, NetemSpec,
     ScheduledFault,
@@ -45,17 +50,22 @@ pub use probe::{
 pub use runner::{
     NullReporter, StderrReporter, SyncEngine, SyncOutcome, SyncReporter, SyncVerdict,
 };
-pub use snapshot::{Balances, History, Snapshot};
-pub use subject::{Phase, ProgressView, SyncSubject, TreeRoots};
+pub use series::{CAPACITY as SERIES_CAPACITY, Cell, Channel, Timeline};
+pub use snapshot::{History, Snapshot};
+pub use subject::{Phase, ProgressView, SyncSubject};
+pub use tree::{TreeRoot, TreeRootError, TreeRoots};
+// The `GetTreeState` frontier parser needs the `sapling_crypto` / `orchard`
+// hash types, which ride the `librustzcash` feature. The `TreeRoots` half above
+// is plain data and stays available to every consumer.
+#[cfg(feature = "librustzcash")]
+pub use tree::commitment_tree_root;
+pub use work::{CHANNELS, Mismatch, Op, OpSet, Rate, Segment, Work};
 
 // The observable wallet-sync harness drives ztest's default in-process wallet
 // (`backends::librustzcash`); its subject impl (`LrzSyncSubject`) lives in that
-// backend. The `oracle` (indexer-side `TreeState` frontier parse) is
-// wallet-agnostic but needs the same feature's `sapling-crypto`/`orchard`.
+// backend.
 #[cfg(feature = "librustzcash")]
 mod facade;
-#[cfg(feature = "librustzcash")]
-mod oracle;
 // The event-publishing reporter is only reachable through the facade's run path,
 // which is where a detached driver is launched from.
 #[cfg(feature = "librustzcash")]
@@ -63,5 +73,3 @@ mod reporter;
 
 #[cfg(feature = "librustzcash")]
 pub use facade::{PerformanceLevel, Subject, SyncManifest, SyncRunner};
-#[cfg(feature = "librustzcash")]
-pub use oracle::commitment_tree_root;

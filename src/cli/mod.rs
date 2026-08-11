@@ -2,7 +2,7 @@
 //!
 //! `ztest` is the primary developer entry point for ztest-managed integration
 //! testing (see
-//! [`docs/running-tests.md`](https://github.com/zingolabs/ztest/blob/dev/docs/running-tests.md)).
+//! [`docs/guide-running-tests.md`](https://github.com/zingolabs/ztest/blob/dev/docs/guide-running-tests.md)).
 //! Subcommands:
 //!
 //! - [`run`]: preflight + cluster orchestration + `cargo nextest run`.
@@ -22,6 +22,7 @@ pub(crate) mod cleanup;
 pub(crate) mod cluster;
 pub(crate) mod cluster_tools;
 pub(crate) mod console;
+pub(crate) mod lfs_transfer;
 pub mod list_mounts;
 pub(crate) mod preview;
 pub mod replay;
@@ -47,7 +48,7 @@ volume snapshot binding) around `cargo nextest run`. It is the primary \
 developer entry point for the ztest-managed integration suites in this \
 repository.
 
-See docs/running-tests.md for the full developer guide.",
+See docs/guide-running-tests.md for the full developer guide.",
     propagate_version = true
 )]
 pub struct Cli {
@@ -86,8 +87,11 @@ pub enum Command {
     /// local OpenShift Community (`crc`); see `--target`. Idempotent.
     Setup(setup::Args),
 
-    /// Reclaim your test resources (namespaces, snapshots, QoS leases);
-    /// `--all-users` for everyone's. Never touches the cluster itself.
+    /// Reclaim your finished test resources — leftover `--no-cleanup`
+    /// namespaces, finished detached syncs, build pods, seed bindings, and
+    /// QoS reservations. Live runs and Running syncs are skipped unless
+    /// `--force`; `--all-users` widens the scope to everyone's. Never touches
+    /// the cluster itself or the seed cache.
     Cleanup(cleanup::Args),
 
     /// Manage the content-addressed seed cache (`list`, `prune`,
@@ -100,7 +104,7 @@ pub enum Command {
     Cluster(cluster::Args),
 
     /// Manage detached, ztest-owned chain syncs (`list`, `describe`, `start`,
-    /// `watch`, `status`, `report`, `stop`, `rm`) — the long-running sync-test
+    /// `watch`, `status`, `report`, `stop`) — the long-running sync-test
     /// profiles that outlive the launching terminal.
     Sync(sync::Args),
 
@@ -108,6 +112,13 @@ pub enum Command {
     /// timeline. A formatting harness for the right-column tracker.
     #[command(hide = true)]
     Preview,
+
+    /// Git LFS custom transfer agent: speaks the custom-transfer JSON protocol
+    /// on stdin/stdout, moving `fixtures/chains/*` to and from the snapshot
+    /// bucket. Machine-invoked — git-lfs runs it via
+    /// `lfs.standalonetransferagent`; a human never types it.
+    #[command(name = "lfs-transfer", hide = true)]
+    LfsTransfer,
 }
 
 /// Tokio runtime flavor for [`block_on`]: the k8s-only subcommands are happy on
@@ -164,5 +175,6 @@ pub fn main() -> ExitCode {
         Command::Cluster(args) => cluster::execute(args),
         Command::Sync(args) => sync::execute(args),
         Command::Preview => preview::execute(),
+        Command::LfsTransfer => lfs_transfer::execute(),
     }
 }

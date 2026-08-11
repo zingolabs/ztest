@@ -1,0 +1,12 @@
+# Manifest for a compile-shape test asset, hand-written.
+#
+# Only the identity fields, which is the minimum every archive must carry: the
+# `sha256`/`size_bytes` that are its Git LFS `oid`/`size`. No `tip_height`, so
+# `archive!` bakes `chain: None` — this is an opaque tarball, not a validator
+# state directory, and the handle says so.
+#
+# These 19 bytes exist to prove the API's shape compiles. They are LFS-tracked
+# like every other seed, because one rule for all archives is cheaper than an
+# exemption for small ones.
+sha256     = "75cf3ec7023cf430a92326ba02554dfc1c7b5abc605e6d11bcb18470c8156783"
+size_bytes = 19

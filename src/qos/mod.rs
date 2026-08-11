@@ -3,7 +3,7 @@
 //! into pod requests/limits and a scheduling footprint, and the in-memory
 //! [`scheduler::Scheduler`] admits it against probed cluster capacity. The core
 //! holds no clock/randomness/I/O, so admission is a deterministic function over
-//! in-memory state, unit-testable without a cluster. See `docs/qos-design.md`.
+//! in-memory state, unit-testable without a cluster. See `docs/design-qos.md`.
 //!
 //! Model: [`Resources`] (a 4-D CPU × RAM × disk-bandwidth × disk-IOPS amount in
 //! integer k8s/cgroup units); [`Pool`] (general vs the dedicated NVMe pool
@@ -37,15 +37,15 @@ pub const LABEL_ROLE: &str = "ztest.io/role";
 pub const ROLE_TEST_ENV: &str = "test-env";
 /// Label carrying the run identity (`GITHUB_RUN_ID` in CI, `${USER}-${PPID}` in
 /// dev), stamped on every resource a run owns so its envs group together and the
-/// Ctrl-C reaper can find what a crash left behind. See [`crate::naming::RunCoords`].
+/// Ctrl-C reaper can find what a crash left behind. See `RunCoords`.
 pub const LABEL_RUN_ID: &str = "ztest.io/run-id";
 /// Label carrying the (slugged) invoking user, stamped on every resource a run
-/// owns — namespaces, shadow VolumeSnapshotContents — so `ztest cleanup` can
+/// owns — namespaces, seed-binding VolumeSnapshotContents — so `ztest cleanup` can
 /// reclaim exactly one developer's resources. Value is `RunCoords::user`
-/// slugged; see [`crate::naming::RunCoords`].
+/// slugged; see `RunCoords`.
 pub const LABEL_USER: &str = "ztest.io/user";
-/// Label tying a cluster-scoped shadow VolumeSnapshotContent to the per-test
-/// namespace it serves. A shadow VSC can't be cascaded by the namespace delete
+/// Label tying a cluster-scoped seed-binding VolumeSnapshotContent to the per-test
+/// namespace it serves. It can't be cascaded by the namespace delete
 /// (it's cluster-scoped), so the parent `ztest run` deletes it by this selector
 /// at per-test teardown — prompt cleanup, no run-long accumulation.
 pub const LABEL_TEST_NS: &str = "ztest.io/test-ns";
@@ -55,7 +55,7 @@ pub const LABEL_TEST_NS: &str = "ztest.io/test-ns";
 // Kubernetes has no disk-I/O field in pod `resources`, so the per-volume cap
 // rides these PVC annotations, enforced via a cgroup `io.max` (CRI-O blockio).
 // Migrates to a `VolumeAttributesClass` once a backend's CSI can honor one.
-// See `docs/qos-io-dimension-design.md`.
+// See `docs/design-qos.md`.
 
 /// PVC annotation carrying the volume's disk-bandwidth cap (k8s quantity,
 /// bytes/sec); mirrors the cgroup `io.max` `{r,w}bps` the harness enforces.
@@ -91,7 +91,7 @@ pub const GIB: u64 = 1024 * MIB;
 ///
 /// The I/O dimensions are inert until calibrated: k8s exposes no I/O
 /// `allocatable`, so an uncalibrated node's ceiling is seeded [`u64::MAX`] and
-/// admission matches the CPU×memory model. See `docs/qos-io-dimension-design.md`.
+/// admission matches the CPU×memory model. See `docs/design-qos.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Resources {
     /// CPU in millicores (`1000` == one core).
@@ -354,7 +354,7 @@ pub enum QosClass {
 /// size a tier.
 ///
 /// Caps, pool, priority order, and per-tier footprint reserves are all fixed
-/// (`docs/qos-design.md` §2/§11). The scheduler doesn't read the footprint
+/// (`docs/design-qos.md` §2/§11). The scheduler doesn't read the footprint
 /// directly (callers pass an explicit [`scheduler::Request`]), so the engine
 /// stays decoupled from the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,7 +425,7 @@ impl QosClass {
     /// known a priori, so it must come from measured per-tier `io.stat`, never a
     /// guess (which would re-introduce the mispricing this dimension exists to
     /// fix). Left `0`, the I/O dimensions never gate. See
-    /// `docs/qos-io-dimension-design.md`.
+    /// `docs/design-qos.md`.
     pub const fn profile(self) -> QosProfile {
         match self {
             QosClass::Basic => QosProfile {
@@ -682,7 +682,7 @@ mod tests {
         // a per-tier I/O reserve must come from measured `io.stat`, never a
         // hand-set guess (which would re-introduce the mispricing the dimension
         // exists to fix). This guards that invariant — flip it deliberately when
-        // calibration lands (docs/qos-io-dimension-design.md §6).
+        // calibration lands (docs/design-qos.md §6).
         for c in ALL_TIERS {
             let fp = c.profile().footprint;
             assert_eq!(fp.io_bps, 0, "{c:?} has a fabricated io_bps reserve");

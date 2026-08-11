@@ -11,7 +11,7 @@ use std::time::Instant;
 use clap::Parser;
 use nextest_metadata::NextestExitCode;
 
-use crate::cli::console::{provision_with_tracker, CapRx, Console, SceneFrame};
+use crate::cli::console::{CapRx, Console, SceneFrame, provision_with_tracker};
 use crate::engine;
 use crate::engine::record::RunSelector;
 use crate::inventory::QosEntry;
@@ -75,10 +75,8 @@ fn format_panic(info: &std::panic::PanicHookInfo<'_>) -> String {
 
 /// Exit code for a Ctrl-C-interrupted run: the shell convention `128 + SIGINT`.
 const CANCELLED: i32 = 130;
-use crate::preflight::{
-    self, ArchiveRow, ArchiveStatus, BannerState, ClusterState, SnapshotRow, Theme, Transfers,
-};
 use crate::resource::NodeState;
+use crate::ui::{self, ArchiveRow, ArchiveStatus, BannerState, ClusterState, Theme, Transfers};
 
 /// `ztest run` arguments.
 #[derive(Debug, Parser)]
@@ -455,8 +453,7 @@ pub fn execute(args: Args) -> ExitCode {
         // The render thread paints this the instant Ctrl-C arrives, before the
         // work side has a chance to react.
         let cancel_theme = theme.clone();
-        let cancel_panel =
-            Box::new(move |elapsed| preflight::render_cancel_panel(elapsed, &cancel_theme));
+        let cancel_panel = Box::new(move |elapsed| ui::render_cancel_panel(elapsed, &cancel_theme));
         match Console::start(session_start, cancel_panel) {
             Ok((c, g)) => (Some(c), Some(g)),
             Err(_) => (None, None),
@@ -604,9 +601,11 @@ fn run_inner(
         state,
         console,
         run,
-        &outcome.probe,
-        &outcome.build,
-        image_phase,
+        Preflight {
+            probe: &outcome.probe,
+            build: &outcome.build,
+            images: image_phase,
+        },
     )
 }
 
@@ -614,6 +613,100 @@ fn run_inner(
 /// engine and execute. Both the local-compile and on-cluster-compile paths
 /// converge here so the [`engine::EngineInput`] assembly lives in one place.
 #[allow(clippy::too_many_arguments)]
+/// The ServiceAccount this run charges its reservations to. Both the build lease
+/// and the run lease bill the same identity, so they read it from one place.
+fn service_account() -> String {
+    std::env::var("ZTEST_SA").unwrap_or_else(|_| "ztest-local".to_string())
+}
+
+/// The build phase's BuildKit pod together with the ledger reservation that
+/// covers it: the pod name, the `Renewer` holding its Lease, and the heartbeat
+/// keeping that Lease alive across a long compile.
+///
+/// They travel as one object because they must die as one. The pod's footprint
+/// ([`BUILDKIT_BUILD`](crate::qos::build::BUILDKIT_BUILD)) is the largest ztest
+/// places, so a path that dropped the pod but leaked the Lease would sterilise
+/// that capacity until the TTL, and one that dropped the Lease but leaked the pod
+/// would put unbudgeted memory back under a node admission believes is free —
+/// precisely the failure this reservation exists to prevent. With a single
+/// [`teardown`](Self::teardown) there is no exit path that can do either.
+struct ReservedBuilder {
+    pod: String,
+    renewer: crate::qos::ledger::Renewer,
+    /// Aborted on drop, which stops the renewals; the Lease is deleted explicitly
+    /// in `teardown` rather than left to expire.
+    _heartbeat: crate::qos::ledger::Heartbeat,
+}
+
+impl ReservedBuilder {
+    /// Reserve the build footprint, then create the pod it covers.
+    ///
+    /// The reservation is taken *first* and named after the run-id the pod
+    /// carries, so the ledger attributes the pod to it (`usage_by_leased_run`)
+    /// and peers subtract it (`sum_reservations`) for the pod's whole life. The
+    /// wait inside `acquire` is what replaces the old behaviour of creating the
+    /// pod unconditionally and failing the run outright when no node could place
+    /// it.
+    async fn acquire(
+        client: &kube::Client,
+        run: &crate::naming::RunCoords,
+        allocatable: crate::qos::Resources,
+    ) -> Result<Self, String> {
+        let grant = crate::qos::ledger::acquire(
+            client,
+            &run.run_id,
+            &service_account(),
+            &run.user,
+            allocatable,
+            crate::qos::ledger::Reserve::Fixed(crate::qos::build::BUILDKIT_BUILD),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let heartbeat = grant.renewer.spawn_heartbeat();
+        let pod = match crate::resource::impls::buildkit::create_build_pod(
+            client,
+            &run.run_id,
+            &run.user,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                grant.renewer.release().await;
+                return Err(e.to_string());
+            }
+        };
+        if let Err(e) = crate::resource::impls::buildkit::wait_build_pod_ready(client, &pod).await {
+            crate::resource::impls::buildkit::delete_build_pod(client, &pod).await;
+            grant.renewer.release().await;
+            return Err(e.to_string());
+        }
+        Ok(ReservedBuilder {
+            pod,
+            renewer: grant.renewer,
+            _heartbeat: heartbeat,
+        })
+    }
+
+    /// Delete the pod, then release its reservation. In that order: the capacity
+    /// must not be advertised as free while the pod is still terminating on it.
+    fn teardown(self, work_rt: &tokio::runtime::Runtime, client: &kube::Client) {
+        work_rt.block_on(async {
+            crate::resource::impls::buildkit::delete_build_pod(client, &self.pod).await;
+            self.renewer.release().await;
+        });
+    }
+}
+
+/// Everything the preflight phases resolved, travelling as one value into the
+/// engine launch. Grouped because the three are only ever produced together and
+/// consumed together, and both call sites forward all of them unchanged.
+struct Preflight<'a> {
+    probe: &'a ProbeOutcome,
+    build: &'a BuildOutcome,
+    images: ImagePhaseOutcome,
+}
+
 fn launch_engine(
     work_rt: &tokio::runtime::Runtime,
     opts: &RunOptions,
@@ -621,20 +714,57 @@ fn launch_engine(
     state: &mut BannerState,
     console: Option<&Console>,
     run: &crate::naming::RunCoords,
-    probe: &ProbeOutcome,
-    build: &BuildOutcome,
-    image_phase: ImagePhaseOutcome,
+    preflight: Preflight<'_>,
 ) -> ExitCode {
+    let Preflight {
+        probe,
+        build,
+        images: image_phase,
+    } = preflight;
     let cancelled = || console.is_some_and(Console::cancelled);
     let cancel_exit = || cancel_exit(work_rt, &run.run_id, opts.no_cleanup);
 
-    let qos_by_binary = &image_phase.qos_by_binary;
     if cancelled() {
         return cancel_exit();
     }
 
+    // `cargo nextest list` cannot tell a `#[ztest::sync_test]` profile from an
+    // ordinary test — only the Phase-C dump can — so the selection is pruned
+    // here, before anything downstream sizes a wave or admits an item against
+    // it. Both the QoS plan and the work-list are then built from the same
+    // pruned selection.
+    let mut selected_binaries = match build {
+        BuildOutcome::Ok {
+            selected_binaries, ..
+        } => selected_binaries.clone(),
+        BuildOutcome::Failed { .. } => Vec::new(),
+    };
+    let excluded_sync = engine::plan::drop_sync_tests(
+        &mut selected_binaries,
+        &image_phase.sync_by_binary,
+        &image_phase.qos_by_binary,
+    );
+    let qos_by_binary = prune_qos(&image_phase.qos_by_binary, &excluded_sync);
+    let selected_count: usize = selected_binaries
+        .iter()
+        .map(|b| b.selected_tests.len())
+        .sum();
+
     // Group the dumped tiers and estimate the wave structure against capacity.
-    state.qos_plan = qos_plan_from(qos_by_binary, probe);
+    state.qos_plan = qos_plan_from(&qos_by_binary, probe);
+
+    // Phase B counted the sync profiles it could not recognise; correct the
+    // banner before it is rendered so it states what will actually run.
+    if !excluded_sync.is_empty()
+        && let crate::ui::BuildState::Ok {
+            test_count,
+            binary_count,
+            ..
+        } = &mut state.build
+    {
+        *test_count = selected_count;
+        *binary_count = selected_binaries.len();
+    }
 
     // Final panel refresh with all phases resolved.
     if let Some(c) = console {
@@ -643,7 +773,7 @@ fn launch_engine(
 
     // In non-TTY mode print the full resolved banner so CI logs have a record.
     if console.is_none() {
-        let _ = stdout().write_all(preflight::render(state, theme).as_bytes());
+        let _ = stdout().write_all(ui::render(state, theme).as_bytes());
     }
 
     if let BuildOutcome::Failed { .. } = build {
@@ -657,15 +787,35 @@ fn launch_engine(
             NextestExitCode::SETUP_ERROR,
         );
     }
+    // Name what the filter matched but the engine will not run, so an absent
+    // test is never a silent absence.
+    if !excluded_sync.is_empty() {
+        let note = sync_exclusion_notice(&excluded_sync);
+        match console {
+            Some(c) => c.scrollback(note),
+            None => print!("{note}"),
+        }
+    }
     // No tests selected: honor `--no-tests` (nextest default `fail` ⇒ exit 4).
-    if let BuildOutcome::Ok { test_count: 0, .. } = build {
-        let (msg, code) = if opts.no_tests_is_error() {
-            (
-                "ztest run: no tests to run (--no-tests=fail)",
+    // Counted after the sync prune, so a filter that matched only sync profiles
+    // lands here rather than starting an empty run.
+    if selected_count == 0 {
+        let only_sync = !excluded_sync.is_empty();
+        let (msg, code) = match (only_sync, opts.no_tests_is_error()) {
+            (true, _) => (
+                "ztest run: no tests to run — the filter matched only sync-tier tests, \
+                 which run detached (`ztest sync start <name>`)"
+                    .to_string(),
+                NextestExitCode::OK,
+            ),
+            (false, true) => (
+                "ztest run: no tests to run (--no-tests=fail)".to_string(),
                 NextestExitCode::NO_TESTS_RUN,
-            )
-        } else {
-            ("ztest run: no tests to run", NextestExitCode::OK)
+            ),
+            (false, false) => (
+                "ztest run: no tests to run".to_string(),
+                NextestExitCode::OK,
+            ),
         };
         return fatal(console, msg, code);
     }
@@ -684,17 +834,14 @@ fn launch_engine(
             );
         }
     };
-    let (summary, selected_binaries) = match build {
-        BuildOutcome::Ok {
-            summary,
-            selected_binaries,
-            ..
-        } => (summary.as_ref(), selected_binaries.as_slice()),
+    let summary = match build {
+        BuildOutcome::Ok { summary, .. } => summary.as_ref(),
         // A build failure already returned `BUILD_FAILED` above.
         BuildOutcome::Failed { .. } => unreachable!("build failure handled above"),
     };
+    let selected_binaries = selected_binaries.as_slice();
 
-    let sa = std::env::var("ZTEST_SA").unwrap_or_else(|_| "ztest-local".to_string());
+    let sa = service_account();
     // Shared with the reservation lease so the ledger's per-run invariant groups
     // the runner pods together.
     let run_id = format!("ztest-run-{}", std::process::id());
@@ -719,6 +866,7 @@ fn launch_engine(
         &sa,
         &run.user,
         capacity.allocatable,
+        crate::qos::ledger::Reserve::Elastic,
     )) {
         Ok(g) => g,
         Err(e) => {
@@ -772,7 +920,7 @@ fn launch_engine(
     let input = engine::EngineInput {
         summary,
         selected_binaries,
-        qos_by_binary,
+        qos_by_binary: &qos_by_binary,
         ceiling,
         resource_deps: image_phase.resource_deps,
         resource_states: image_phase.resource_states,
@@ -819,7 +967,7 @@ fn run_inner_on_cluster(
     run: &crate::naming::RunCoords,
 ) -> ExitCode {
     use crate::pipeline::images;
-    use crate::preflight::BuildState;
+    use crate::ui::BuildState;
 
     let cancelled = || console.is_some_and(Console::cancelled);
     let cancel_exit = || cancel_exit(work_rt, &run.run_id, opts.no_cleanup);
@@ -932,26 +1080,24 @@ fn run_inner_on_cluster(
         }
     };
 
-    // Startup builder: create the ephemeral BuildKit pod this run builds in and
-    // wait it Ready. It holds the build footprint (Guaranteed) so it's torn down
-    // after the build phase and must not linger into the test run; labeled with
-    // the run id so `reap_run` removes it on Ctrl-C / cleanup. Reported as its own
-    // phase (with a live timer) rather than a silent wait — a build pod that can't
-    // schedule is otherwise indistinguishable from a hung probe.
+    // Startup builder: reserve the build footprint in the cross-run ledger, then
+    // create the ephemeral BuildKit pod it covers and wait it Ready. Reserving
+    // first is what keeps admission honest — the pod is Guaranteed and the largest
+    // ztest places, so a peer run must subtract it for its whole life or it will
+    // hand the same memory to tests. It is torn down after the build phase and
+    // must not linger into the test run; labelled with the run id so `reap_run`
+    // removes it on Ctrl-C / cleanup. Reported as its own phase (with a live
+    // timer) rather than a silent wait — a build pod waiting on capacity is
+    // otherwise indistinguishable from a hung probe.
     use pipeline::remote_compile::Phase;
     on_phase(Phase::Start("startup builder"));
     let t_builder = Instant::now();
-    let build_pod = match work_rt.block_on(async {
-        let p = crate::resource::impls::buildkit::create_build_pod(&client, &run.run_id).await?;
-        if let Err(e) = crate::resource::impls::buildkit::wait_build_pod_ready(&client, &p).await {
-            // Created but never came Ready (crashed / unschedulable): reap it here
-            // so a failed startup can't leak its 32c/20GiB Guaranteed footprint.
-            crate::resource::impls::buildkit::delete_build_pod(&client, &p).await;
-            return Err(e);
-        }
-        Ok::<_, crate::resource::ResourceError>(p)
-    }) {
-        Ok(p) => p,
+    let builder = match work_rt.block_on(ReservedBuilder::acquire(
+        &client,
+        run,
+        initial_cap.allocatable,
+    )) {
+        Ok(b) => b,
         Err(e) => {
             if let Some(c) = console {
                 c.flush_live();
@@ -968,15 +1114,13 @@ fn run_inner_on_cluster(
         dur: t_builder.elapsed(),
     });
     if cancelled() {
-        work_rt.block_on(crate::resource::impls::buildkit::delete_build_pod(
-            &client, &build_pod,
-        ));
+        builder.teardown(work_rt, &client);
         return cancel_exit();
     }
 
     let remote = work_rt.block_on(pipeline::remote_compile::compile_on_cluster(
         &client,
-        &build_pod,
+        &builder.pod,
         &opts.list_args,
         &refs,
         &run.run_id,
@@ -984,16 +1128,16 @@ fn run_inner_on_cluster(
         Some(&mut on_phase),
     ));
     if cancelled() {
+        builder.teardown(work_rt, &client);
         return cancel_exit();
     }
     let remote = match remote {
         Ok(r) => r,
         Err(e) => {
-            // Drop the ephemeral build pod before bailing — a failed build must
-            // not leak its 32c/20GiB Guaranteed footprint until the janitor.
-            work_rt.block_on(crate::resource::impls::buildkit::delete_build_pod(
-                &client, &build_pod,
-            ));
+            // Drop the ephemeral builder before bailing — a failed build must not
+            // leak its Guaranteed footprint, nor the reservation covering it,
+            // until the janitor.
+            builder.teardown(work_rt, &client);
             // Commit the failing compile's output before the error line, so the
             // error lands after (not above) the output that explains it.
             if let Some(c) = console {
@@ -1028,20 +1172,25 @@ fn run_inner_on_cluster(
 
     // Component dev images + data seeds still provision through the resource
     // graph; only the runner image is already baked, so it rides in Prebaked.
-    let (images, seeds, images_by_binary, deps_by_binary) = match remote.dump {
+    let (images, seeds, images_by_binary, deps_by_binary, sync_by_binary) = match remote.dump {
         images::DumpOutcome::Discovered {
             images,
             seeds,
             images_by_binary,
             deps_by_binary,
             sync_tests: _,
-        } => (images, seeds, images_by_binary, deps_by_binary),
+            sync_by_binary,
+        } => (
+            images,
+            seeds,
+            images_by_binary,
+            deps_by_binary,
+            sync_by_binary,
+        ),
         // `compile_on_cluster` only ever returns `Discovered`, but handle the
         // failure variant rather than unwrap.
         images::DumpOutcome::Failed { detail } => {
-            work_rt.block_on(crate::resource::impls::buildkit::delete_build_pod(
-                &client, &build_pod,
-            ));
+            builder.teardown(work_rt, &client);
             if let Some(c) = console {
                 c.flush_live();
             }
@@ -1052,7 +1201,7 @@ fn run_inner_on_cluster(
             );
         }
     };
-    let image_phase = provision_and_resolve(
+    let mut image_phase = provision_and_resolve(
         work_rt,
         images,
         seeds,
@@ -1060,17 +1209,20 @@ fn run_inner_on_cluster(
         deps_by_binary,
         remote.qos_by_binary,
         RunnerSource::Prebaked(remote.runner_image_ref),
-        Some(build_pod.clone()),
+        Some(builder.pod.clone()),
         console,
         state,
         theme,
         Some(cap_rx.clone()),
     );
-    // Build phase done — drop the ephemeral build pod so its footprint isn't held
-    // through the test run (reap_run is the backstop on the error/cancel paths).
-    work_rt.block_on(crate::resource::impls::buildkit::delete_build_pod(
-        &client, &build_pod,
-    ));
+    // Set here rather than passed through `provision_and_resolve` (which has no
+    // use for it and several early returns): the edge then rides every path out.
+    image_phase.sync_by_binary = sync_by_binary;
+    // Build phase done — drop the builder so neither its footprint nor the
+    // reservation covering it is held through the test run. Releasing here is what
+    // lets `launch_engine`'s own acquire see that capacity as free (reap_run is the
+    // backstop on the error/cancel paths).
+    builder.teardown(work_rt, &client);
     if cancelled() {
         return cancel_exit();
     }
@@ -1082,9 +1234,11 @@ fn run_inner_on_cluster(
         state,
         console,
         run,
-        &probe,
-        &build,
-        image_phase,
+        Preflight {
+            probe: &probe,
+            build: &build,
+            images: image_phase,
+        },
     )
 }
 
@@ -1112,13 +1266,13 @@ fn push_preflight_scene(
     let tx = transfers.clone();
     let theme = theme.clone();
     con.scene(move |elapsed| SceneFrame {
-        left: preflight::render_preflight_panel(
+        left: ui::render_preflight_panel(
             &with_live_capacity(&snap, cap.as_ref()),
             label,
             elapsed,
             &theme,
         ),
-        right: preflight::render_transfers(&tx, elapsed, &theme),
+        right: ui::render_transfers(&tx, elapsed, &theme),
         // `None` → the live region derives from the avt grid (the child's output).
         live: None,
     });
@@ -1137,13 +1291,13 @@ fn push_building_scene(
     let tx = transfers.clone();
     let theme = theme.clone();
     con.scene(move |elapsed| SceneFrame {
-        left: preflight::render_preflight_panel(
+        left: ui::render_preflight_panel(
             &with_live_capacity(&snap, cap.as_ref()),
             "Building",
             elapsed,
             &theme,
         ),
-        right: preflight::render_transfers(&tx, elapsed, &theme),
+        right: ui::render_transfers(&tx, elapsed, &theme),
         live: None,
     });
 }
@@ -1151,6 +1305,57 @@ fn push_building_scene(
 /// Build the scheduling plan for the preflight banner: fold the per-binary QoS
 /// dump into per-tier counts and estimate the wave structure against probed
 /// capacity. `None` when no QoS tests were declared.
+/// Drop the QoS declarations of tests that were excluded from the selection, so
+/// the wave estimate is a function of what will actually run. Sync profiles wear
+/// the top-priority `sync` tier, so leaving them in would shape the whole plan
+/// around a test the engine never admits.
+fn prune_qos(
+    qos_by_binary: &[(String, Vec<QosEntry>)],
+    excluded: &[engine::plan::ExcludedSync],
+) -> Vec<(String, Vec<QosEntry>)> {
+    if excluded.is_empty() {
+        return qos_by_binary.to_vec();
+    }
+    let dropped: std::collections::HashSet<(&str, &str)> = excluded
+        .iter()
+        .map(|e| (e.binary_id.as_str(), e.test_name.as_str()))
+        .collect();
+    qos_by_binary
+        .iter()
+        .map(|(binary_id, entries)| {
+            let kept: Vec<QosEntry> = entries
+                .iter()
+                .filter(|e| {
+                    !dropped.contains(&(binary_id.as_str(), engine::plan::libtest_name(&e.test_id)))
+                })
+                .cloned()
+                .collect();
+            (binary_id.clone(), kept)
+        })
+        .filter(|(_, entries)| !entries.is_empty())
+        .collect()
+}
+
+/// The scrollback note naming each sync-tier test the run declined to execute
+/// and, for a profile, the command that does run it.
+fn sync_exclusion_notice(excluded: &[engine::plan::ExcludedSync]) -> String {
+    use engine::plan::SyncExclusion;
+
+    let mut note = format!(
+        "Excluded {} sync-tier test(s) from this run — the `sync` tier is owned by \
+         `ztest sync start`, not the engine:\n",
+        excluded.len()
+    );
+    for e in excluded {
+        let tail = match &e.reason {
+            SyncExclusion::Profile(profile) => format!("→ ztest sync start {profile}"),
+            SyncExclusion::TierOnly => "(declares the sync tier, no sync profile)".to_string(),
+        };
+        note.push_str(&format!("  {} ({}) {tail}\n", e.test_name, e.binary_id));
+    }
+    note
+}
+
 fn qos_plan_from(
     qos_by_binary: &[(String, Vec<QosEntry>)],
     probe: &ProbeOutcome,
@@ -1216,7 +1421,7 @@ fn pipeline_console(
     con: &Console,
     _session_start: Instant,
 ) -> std::io::Result<PipelineOutcome> {
-    use crate::preflight::{BuildStage, BuildState};
+    use crate::ui::{BuildStage, BuildState};
 
     work_rt.block_on(async {
         // Probe + archives feed the panel via the `Update` channel; the throwaway
@@ -1439,7 +1644,7 @@ fn pipeline_inherited(
 /// Translate a build-lifecycle [`pipeline::events::Event`] into a mutation on
 /// `state.build`, reusing the `BuildStarted` `started_at` for elapsed time.
 fn apply_event(state: &mut BannerState, event: pipeline::events::Event) {
-    use crate::preflight::BuildState;
+    use crate::ui::BuildState;
     use pipeline::events::Event;
 
     match event {
@@ -1479,13 +1684,13 @@ fn apply_event(state: &mut BannerState, event: pipeline::events::Event) {
         }
         // Phase A events flow through the `Update` channel; duplicates here are
         // ignored.
-        Event::ProbeStarted | Event::ProbeComplete { .. } | Event::ProbeFailed { .. } => {}
+        Event::ProbeStarted | Event::ProbeComplete | Event::ProbeFailed => {}
     }
 }
 
 /// Phase B elapsed time from whichever ticking variant the state is in.
-fn phase_b_elapsed(build: &crate::preflight::BuildState) -> std::time::Duration {
-    use crate::preflight::BuildState;
+fn phase_b_elapsed(build: &crate::ui::BuildState) -> std::time::Duration {
+    use crate::ui::BuildState;
     match build {
         BuildState::Compiling { started_at, .. } | BuildState::Indexing { started_at } => {
             started_at.elapsed()
@@ -1502,7 +1707,6 @@ fn apply_update(state: &mut BannerState, upd: Update) {
             nodes_cordoned,
             capacity,
             slots_used,
-            nvme_nodes: _,
         }) => {
             state.cluster.context = context;
             state.cluster.nodes_ready = nodes_ready;
@@ -1556,6 +1760,10 @@ struct ImagePhaseOutcome {
     failure: Option<String>,
     /// Per-binary QoS tier declarations harvested from the same dump.
     qos_by_binary: Vec<(String, Vec<QosEntry>)>,
+    /// Per-binary `#[ztest::sync_test]` profiles from the same dump. `ztest run`
+    /// subtracts these — and everything else wearing the `sync` tier — from the
+    /// selection: their lifecycle owner is `ztest sync start`, never the engine.
+    sync_by_binary: Vec<(String, Vec<crate::inventory::SyncTestEntry>)>,
     /// Resource dependency edges (binary images + per-test seeds) for the engine.
     resource_deps: crate::engine::plan::ResourceDeps,
     /// Provisioned resource states (node → state) the engine gates admission on.
@@ -1588,14 +1796,21 @@ fn run_image_phases(
     // `ZTEST_DUMP_INVENTORY=1`, yielding the deduped dev images and seeds the
     // selection declares plus the per-binary/per-test edges.
     let (outcome, qos_by_binary) = work_rt.block_on(images::discover(binaries));
-    let (images, seeds, images_by_binary, deps_by_binary) = match outcome {
+    let (images, seeds, images_by_binary, deps_by_binary, sync_by_binary) = match outcome {
         images::DumpOutcome::Discovered {
             images,
             seeds,
             images_by_binary,
             deps_by_binary,
             sync_tests: _,
-        } => (images, seeds, images_by_binary, deps_by_binary),
+            sync_by_binary,
+        } => (
+            images,
+            seeds,
+            images_by_binary,
+            deps_by_binary,
+            sync_by_binary,
+        ),
         images::DumpOutcome::Failed { detail } => {
             return ImagePhaseOutcome {
                 failure: Some(detail),
@@ -1607,7 +1822,7 @@ fn run_image_phases(
 
     // Local kind only: compute is on this machine, so tests run in-process —
     // no runner image. (OpenShift bakes the runner in a separate path.)
-    provision_and_resolve(
+    let mut phase = provision_and_resolve(
         work_rt,
         images,
         seeds,
@@ -1620,7 +1835,9 @@ fn run_image_phases(
         state,
         theme,
         None,
-    )
+    );
+    phase.sync_by_binary = sync_by_binary;
+    phase
 }
 
 /// Where the runner image (the pod-per-test image carrying the compiled test
@@ -1744,12 +1961,12 @@ fn provision_and_resolve(
                 .insert(binary_id.clone(), ids);
         }
     }
-    // Source path → seed node id, from the seeds we planned. A test edge names its
-    // resource by source path (identical to the `SeedDecl` the same macro submits),
-    // so this map resolves it to the provisioned node with no re-derivation.
+    // OID → seed node id, from the seeds we planned. A test edge names its
+    // resource by OID (identical to the `SeedDecl` the same macro submits), so
+    // this map resolves it to the provisioned node with no re-derivation.
     let seed_id_by_source: HashMap<&str, crate::resource::NodeId> = seeds
         .iter()
-        .map(|e| (e.source.as_str(), resource::seed_node_id(e)))
+        .map(|e| (e.oid.as_str(), resource::seed_node_id(e)))
         .collect();
     for (binary_id, deps) in &deps_by_binary {
         for dep in deps {
@@ -1833,6 +2050,7 @@ fn provision_and_resolve(
     ImagePhaseOutcome {
         failure: None,
         qos_by_binary,
+        sync_by_binary: Vec::new(),
         resource_deps,
         resource_states,
         runner_image,
@@ -1872,13 +2090,8 @@ fn build_initial_state(opts: &RunOptions) -> BannerState {
             nodes_cordoned: 0,
             capacity: crate::qos::ClusterCapacity::default(),
         },
-        build: crate::preflight::BuildState::Pending,
+        build: crate::ui::BuildState::Pending,
         archives: Vec::<ArchiveRow>::new(),
-        snapshots: Vec::<SnapshotRow>::new(),
-        // QoS tier/queue/reservation rows render as the `Scheduling` block from
-        // `qos_plan` once the inventory dump + probe land. (The live during-run
-        // reservation view is a deferred §8 half, noted inside that block.)
-        future: vec![],
         qos_plan: None,
     }
 }

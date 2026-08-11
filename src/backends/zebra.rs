@@ -116,14 +116,14 @@ impl ValidatorConfig for ZebraBackend {
         // wins if both are set):
         //  - `shared_state`: share the zebra-state DB with a colocated zaino
         //    StateService and serve the indexer gRPC its syncer connects to.
-        //  - `regtest_cache`: boot from a chain-cache at
+        //  - `restore`: boot from an archived chain at
         //    `ZEBRAD_REGTEST_CACHE_DIR`; no StateService, so no indexer gRPC.
         let persistent = if let Some(s) = opts.shared_state.as_ref() {
             Some(crate::regtest_conf::ZebradPersistentState {
                 cache_dir: &s.mount_path,
                 indexer_listen_port: Some(crate::handles::ports::ZEBRAD_INDEXER),
             })
-        } else if opts.regtest_cache.is_some() {
+        } else if opts.restore.is_some() {
             Some(crate::regtest_conf::ZebradPersistentState {
                 cache_dir: ZEBRAD_REGTEST_CACHE_DIR,
                 indexer_listen_port: None,
@@ -155,12 +155,14 @@ impl ValidatorConfig for ZebraBackend {
         // already mounts its PVC (the caller's `.mount(&vol)`), so only wire the
         // cache mount when `shared_state` is absent.
         if opts.shared_state.is_none() {
-            match &opts.regtest_cache {
-                Some(crate::component::RegtestCacheSource::Archive(path)) => {
-                    opts.mounts
-                        .push(crate::mount::Mount::archive(path, ZEBRAD_REGTEST_CACHE_DIR));
+            match &opts.restore {
+                Some(crate::component::RestoreSource::Archive(archive)) => {
+                    opts.mounts.push(crate::mount::Mount::archive(
+                        *archive,
+                        ZEBRAD_REGTEST_CACHE_DIR,
+                    ));
                 }
-                Some(crate::component::RegtestCacheSource::Blank) => {
+                Some(crate::component::RestoreSource::Blank) => {
                     opts.mounts
                         .push(crate::regtest::scratch_mount(ZEBRAD_REGTEST_CACHE_DIR));
                 }
@@ -185,6 +187,30 @@ pub struct ZebraValidator {
     plumbing: HandleInner,
 }
 
+/// The exposed families zebrad publishes, in report order.
+///
+/// All `AT_REST`: a validator's serving counters answer "what did this run do to
+/// it", which is a whole-run question. What a live reader wants from a chain is
+/// height, and that comes from the subject being observed, not from the node
+/// underneath it.
+#[rustfmt::skip]
+pub const ROWS: [crate::metrics::Row; 3] = [
+    crate::metrics::row("validator best height", "zebrad_chain_verified_block_height", crate::metrics::Reduce::Max, crate::metrics::AT_REST),
+    crate::metrics::row("blocks verified", "zebrad_chain_verified_block_total", crate::metrics::Reduce::Sum, crate::metrics::AT_REST),
+    crate::metrics::row("connected peers", "zebrad_network_peers", crate::metrics::Reduce::Max, crate::metrics::AT_REST),
+];
+
+#[async_trait]
+impl crate::metrics::Exporter for ZebraValidator {
+    async fn endpoint(&self) -> Result<Endpoint, EnvError> {
+        self.plumbing.endpoint(crate::metrics::PORT_NAME).await
+    }
+
+    fn rows(&self) -> &'static [crate::metrics::Row] {
+        &ROWS
+    }
+}
+
 impl ZebraValidator {
     /// Unauthed JSON-RPC transport; zebrad does not gate calls on auth.
     async fn rpc_client(&self) -> Result<AuthedRpc, EnvError> {
@@ -198,6 +224,10 @@ impl ValidatorBackend for ZebraValidator {
         COMPONENT
     }
 
+    fn is_regtest(&self) -> bool {
+        self.plumbing.regtest
+    }
+
     fn pod_spec(
         &self,
         opts: &crate::component::ComponentOpts,
@@ -209,20 +239,23 @@ impl ValidatorBackend for ZebraValidator {
             label: COMPONENT,
             image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
             ports: {
+                // Both the declared port and the readiness probe below come from
+                // `rpc_port`, the same derivation the config generator uses, so a
+                // testnet topology can't end up probing the regtest port.
                 let mut base = vec![
-                    ("rpc", crate::handles::ports::ZEBRAD_RPC),
+                    ("rpc", rpc_port(opts)),
                     ("metrics", crate::handles::ports::ZEBRAD_METRICS),
                     ("p2p", crate::handles::ports::ZEBRAD_P2P),
                 ];
-                // Sharing its state DB (a `Shared` mount sets `shared_state`)
-                // means also serving the indexer gRPC the colocated zaino
-                // StateService's syncer dials — so expose that port too.
-                if opts.shared_state.is_some() {
+                // Serving the indexer gRPC a colocated zaino `Direct` backend
+                // dials — a shared state DB, or a restored testnet chain — means
+                // exposing that port too.
+                if serves_indexer_grpc(opts) {
                     base.push(("indexer", crate::handles::ports::ZEBRAD_INDEXER));
                 }
                 crate::manifest::merge_ports(&base, &opts.extra_ports)
             },
-            ready_port: crate::handles::ports::ZEBRAD_RPC,
+            ready_port: rpc_port(opts),
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources.clone(),
@@ -234,6 +267,7 @@ impl ValidatorBackend for ZebraValidator {
             // the zainod image refuses to run as root, so uids must match.
             fs_group: opts.shared_state.as_ref().map(|_| 1000),
             run_as_user: opts.shared_state.as_ref().map(|_| 1000),
+            supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
             guaranteed: None,
             image_pull_secret: crate::backends::image::pull_secret(),
@@ -257,26 +291,39 @@ impl ValidatorBackend for ZebraValidator {
     }
 
     async fn ready(&self, timeout: std::time::Duration) -> Result<(), RpcError> {
-        // `getblocktemplate` is zebrad's strongest "ready to drive tests"
-        // probe on regtest.
+        // What "ready" means depends on what the node is for, so the probe does
+        // too — and `regtest` is the only place that distinction survives, since
+        // zebra reports a regtest chain as `"test"` over RPC.
+        //
+        // Regtest: `getblocktemplate` is the strongest signal, because these
+        // tests go on to *mine*, and a node that can build on its own tip can do
+        // everything weaker too.
+        //
+        // A restored chain: `getblocktemplate` is the wrong question and never
+        // succeeds. zebra refuses to build a template while it believes it is
+        // mid-initial-sync, and a frozen archive with no peers can never reach
+        // the real network tip — it sits at the snapshot height reporting a few
+        // percent synced, forever (`remaining_sync_blocks=3038813` on the 286k
+        // Sapling fixture). Nothing here mines; the question is whether the node
+        // serves the chain it restored, which `getblockchaininfo` answers
+        // immediately from local state.
+        let (method, params) = if self.plumbing.regtest {
+            ("getblocktemplate", json!([]))
+        } else {
+            ("getblockchaininfo", json!([]))
+        };
         let ep = self.plumbing.endpoint("rpc").await?;
         let client = json_rpc(&ep);
-        wait_for_rpc_ready(
-            &client,
-            ep.socket_addr(),
-            timeout,
-            "getblocktemplate",
-            &json!([]),
-        )
-        .await
-        .map_err(|e| {
-            RpcError::timeout(
-                COMPONENT,
-                "ready",
-                timeout,
-                format!("validator JSON-RPC not ready: {}", e.last_error),
-            )
-        })
+        wait_for_rpc_ready(&client, ep.socket_addr(), timeout, method, &params)
+            .await
+            .map_err(|e| {
+                RpcError::timeout(
+                    COMPONENT,
+                    "ready",
+                    timeout,
+                    format!("validator JSON-RPC not ready: {}", e.last_error),
+                )
+            })
     }
 
     async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError> {
@@ -336,6 +383,18 @@ impl ValidatorBackend for ZebraValidator {
     async fn best_block_hash(&self) -> Result<BlockHash, RpcError> {
         ZcashRpc::new(COMPONENT, &self.rpc_client().await?)
             .best_block_hash()
+            .await
+    }
+
+    async fn invalidate_block(&self, hash: &BlockHash) -> Result<(), RpcError> {
+        ZcashRpc::new(COMPONENT, &self.rpc_client().await?)
+            .invalidate_block(hash)
+            .await
+    }
+
+    async fn reconsider_block(&self, hash: &BlockHash) -> Result<(), RpcError> {
+        ZcashRpc::new(COMPONENT, &self.rpc_client().await?)
+            .reconsider_block(hash)
             .await
     }
 
@@ -447,8 +506,71 @@ const CONTAINER_CONFIG_PATH: &str = "/etc/zebrad/zebrad.toml";
 /// Container-side JSON-RPC port. Sourced from the canonical port table.
 const ZEBRAD_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_RPC;
 
-impl crate::regtest::Testnet for crate::component::Validator<ZebraBackend> {
-    fn testnet(self, variant: &str) -> Self {
+/// Whether this validator boots from a **testnet** archive — the one topology
+/// whose config is rendered by [`testnet_conf`](crate::testnet_conf) rather than
+/// [`regtest_conf`](crate::regtest_conf).
+///
+/// Derived from `opts.restore` rather than a separate flag, so exactly one fact
+/// — the archive's own recorded network — decides which config path a validator
+/// is on, and every consumer reads that same fact.
+fn is_testnet_restore(opts: &crate::component::ComponentOpts) -> bool {
+    matches!(
+        &opts.restore,
+        Some(crate::component::RestoreSource::Archive(archive))
+            if archive.chain().map(|c| c.network()) == Some(crate::ArchiveNetwork::Testnet)
+    )
+}
+
+/// The JSON-RPC port this validator listens on, derived from its topology.
+///
+/// The rendered `zebrad.toml` and the pod spec **must** agree: zebrad opens only
+/// the port its config names, while the pod declares that port and TCP
+/// readiness-probes it. Deriving both from this one function is what stops them
+/// drifting — they did drift, and a testnet pod probing the regtest port never
+/// went Ready, presenting as a hung validator rather than as the config
+/// mismatch it was.
+fn rpc_port(opts: &crate::component::ComponentOpts) -> u16 {
+    if is_testnet_restore(opts) {
+        crate::handles::ports::ZEBRAD_TESTNET_RPC
+    } else {
+        ZEBRAD_RPC_PORT
+    }
+}
+
+/// Whether this validator serves zebra's indexer gRPC
+/// (`rpc.indexer_listen_addr`), which a colocated zaino `Direct` backend
+/// requires in order to construct at all.
+///
+/// Two topologies need it: a shared state DB (regtest), and a restored testnet
+/// chain where zaino reads its own CoW clone of the same archive. Omitting it on
+/// the testnet path left `BackendType::Direct` unconfigurable there, so the
+/// state indexer could never start.
+fn serves_indexer_grpc(opts: &crate::component::ComponentOpts) -> bool {
+    opts.shared_state.is_some() || is_testnet_restore(opts)
+}
+
+impl crate::regtest::Restore for crate::component::Validator<ZebraBackend> {
+    /// Dispatch on the archive's own network.
+    ///
+    /// A testnet snapshot needs a testnet `zebrad.toml` and its own cache dir;
+    /// a regtest cache rides the regtest config path that
+    /// [`materialize_regtest_opts`](ZebraBackend::materialize_regtest_opts)
+    /// already builds. The
+    /// archive records which it is, so this is a `match` on data rather than a
+    /// choice the caller could get wrong.
+    fn restore(mut self, archive: crate::ArchiveHandle) -> Self {
+        // Recorded for the whole-env agreement checks in `TestEnv::build()`:
+        // this builder cannot fail, and one component's pin says nothing about
+        // whether its peers agree with it.
+        self.opts.restore = Some(crate::component::RestoreSource::Archive(archive));
+
+        let network = archive.chain().map(|c| c.network());
+        if network != Some(crate::ArchiveNetwork::Testnet) {
+            // Regtest cache (or a bare archive): the regtest config path in
+            // `materialize_opts` mounts it and sets `cache_dir` itself.
+            return self;
+        }
+
         let version = self
             .opts()
             .version
@@ -458,6 +580,11 @@ impl crate::regtest::Testnet for crate::component::Validator<ZebraBackend> {
             version,
             ZEBRAD_TESTNET_RPC_PORT,
             ZEBRAD_TESTNET_CACHE_DIR,
+            // Always served on a testnet restore: a colocated zaino `Direct`
+            // backend cannot construct without an address to dial, and the pod
+            // spec exposes the port for exactly this topology
+            // (`serves_indexer_grpc`).
+            Some(crate::handles::ports::ZEBRAD_INDEXER),
             self.opts()
                 .image
                 .metrics_enabled()
@@ -467,9 +594,8 @@ impl crate::regtest::Testnet for crate::component::Validator<ZebraBackend> {
             toml,
             "/etc/zebrad/zebrad.toml",
         ))
-        .mount(crate::regtest::testnet_chain_archive(
-            variant,
-            crate::regtest::TestnetChainKind::Zebra,
+        .mount(crate::regtest::archive_mount(
+            archive,
             ZEBRAD_TESTNET_CACHE_DIR,
         ))
         .command(["zebrad"])
@@ -498,5 +624,78 @@ impl ZebraValidator {
         ZcashRpc::new(COMPONENT, &self.rpc_client().await?)
             .peer_info()
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::{ArchiveBackend, ArchiveHandle, ChainInfo};
+    use crate::component::{ComponentOpts, RestoreSource};
+
+    fn archive(network: crate::ArchiveNetwork) -> ArchiveHandle {
+        ArchiveHandle::__new(
+            "zebra-v6.2.3-test.tar.zst",
+            "0".repeat(64).leak(),
+            1,
+            Some(ChainInfo::__new(
+                ArchiveBackend::Zebra,
+                network,
+                "6.2.3",
+                286_000,
+                "00",
+                28,
+                1,
+                &[],
+                &[],
+                None,
+            )),
+        )
+    }
+
+    fn opts_restoring(network: crate::ArchiveNetwork) -> ComponentOpts {
+        let mut opts = ComponentOpts::builder().version("6.2.3").build();
+        opts.restore = Some(RestoreSource::Archive(archive(network)));
+        opts
+    }
+
+    /// The regression that hung the whole testnet suite: `pod_spec` declared and
+    /// readiness-probed [`ZEBRAD_RPC`](crate::handles::ports::ZEBRAD_RPC) on every
+    /// topology, while a testnet restore renders its config with
+    /// [`ZEBRAD_TESTNET_RPC`](crate::handles::ports::ZEBRAD_TESTNET_RPC). zebrad
+    /// opened 18232, the probe waited on 28232, and the pod never went Ready —
+    /// indistinguishable from a validator that failed to start.
+    #[test]
+    fn a_testnet_restore_probes_the_port_its_config_opens() {
+        assert_eq!(
+            rpc_port(&opts_restoring(crate::ArchiveNetwork::Testnet)),
+            ZEBRAD_TESTNET_RPC_PORT,
+            "a testnet restore must use the port testnet_zebrad_conf writes"
+        );
+        assert_ne!(
+            ZEBRAD_TESTNET_RPC_PORT, ZEBRAD_RPC_PORT,
+            "the two ports differ, which is what made the drift silent"
+        );
+    }
+
+    #[test]
+    fn regtest_and_a_regtest_cache_keep_the_regtest_rpc_port() {
+        assert_eq!(rpc_port(&ComponentOpts::default()), ZEBRAD_RPC_PORT);
+        assert_eq!(
+            rpc_port(&opts_restoring(crate::ArchiveNetwork::Regtest)),
+            ZEBRAD_RPC_PORT,
+            "a regtest cache rides the regtest config path, so it keeps that port"
+        );
+    }
+
+    /// `Direct` refuses to construct without a gRPC address to dial, so the
+    /// testnet topology has to serve one — it previously did not, which is why the
+    /// state indexer could never start there.
+    #[test]
+    fn the_indexer_grpc_is_served_wherever_a_direct_backend_could_dial_it() {
+        assert!(serves_indexer_grpc(&opts_restoring(
+            crate::ArchiveNetwork::Testnet
+        )));
+        assert!(!serves_indexer_grpc(&ComponentOpts::default()));
     }
 }

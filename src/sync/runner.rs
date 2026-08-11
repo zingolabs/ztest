@@ -14,11 +14,14 @@ use tokio::time::{Instant, MissedTickBehavior, interval};
 
 use crate::cancel::Cancel;
 
+use super::chainwork::ChainWork;
 use super::probe::{
     Cadence, Class, ProbeBuilder, ProbeSpec, ProbeStatus, Severity, SyncCtx, Verdict, Violation,
 };
 use super::snapshot::{History, Snapshot, SnapshotBuilder};
-use super::subject::{SyncSubject, TreeRoots};
+use super::subject::{ProgressView, SyncSubject};
+use super::work::{Segment, Work};
+use crate::handles::indexer::BlockHeight;
 
 /// The terminal result of a run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,10 +64,22 @@ pub struct SyncOutcome {
     pub ticks: u64,
     /// Snapshots evicted by the history cap (a visible, non-silent truncation).
     pub dropped_snapshots: u64,
-    /// Server-side metrics read from thanos-querier at end-of-run (empty when
-    /// the metrics plane was unavailable). Populated by the facade after the
-    /// engine returns — the engine has no cluster handle of its own.
-    pub metrics: crate::metrics::MetricsSummary,
+    /// The span of chain this run covered, and the work it contained.
+    ///
+    /// Carried into the durable report because it is the precondition
+    /// `perf --base` checks: two runs may only be compared when their segments
+    /// match. `None` when no tick ever landed and there is nothing to describe.
+    pub segment: Option<Segment>,
+}
+
+/// One end of the span a run covered: where it had reached, the cumulative work
+/// standing behind that height, and when the reading was taken. A [`Segment`]
+/// is the difference between the run's first mark and its last.
+#[derive(Clone, Copy)]
+struct Mark {
+    height: u32,
+    work: Work,
+    at: Instant,
 }
 
 impl SyncOutcome {
@@ -76,7 +91,7 @@ impl SyncOutcome {
             error: Some(msg),
             ticks: 0,
             dropped_snapshots: 0,
-            metrics: crate::metrics::MetricsSummary::default(),
+            segment: None,
         }
     }
 }
@@ -96,7 +111,7 @@ impl From<crate::RpcError> for SyncOutcome {
 }
 
 /// Sink for live progress + probe events. Modeled on
-/// [`crate::engine`]'s `RunReporter`; the pod log-stream `EmitSink` for
+/// `crate::engine`'s `RunReporter`; the pod log-stream `EmitSink` for
 /// `ztest sync watch` (step 6) is a future impl of this trait.
 pub trait SyncReporter: Send {
     /// The run started.
@@ -165,6 +180,7 @@ pub struct SyncEngine<S: SyncSubject> {
     tick: Duration,
     history_cap: usize,
     timeout: Option<Duration>,
+    stop_height: Option<u32>,
     reporter: Box<dyn SyncReporter>,
 }
 
@@ -181,6 +197,7 @@ impl<S: SyncSubject> SyncEngine<S> {
             tick: Duration::from_secs(5),
             history_cap: 20_000,
             timeout: None,
+            stop_height: None,
             reporter: Box::new(NullReporter),
         }
     }
@@ -207,6 +224,19 @@ impl<S: SyncSubject> SyncEngine<S> {
         self.timeout = Some(timeout);
         self
     }
+    /// Complete once the subject reaches `height`, instead of running to tip.
+    ///
+    /// This is what makes two runs comparable. A run to tip covers whatever
+    /// chain existed while it ran — a different, growing span every time — so
+    /// its throughput is not a measurement of the code. A declared stop height
+    /// fixes the work vector to a constant, at which point a difference in
+    /// `ops/s` between two runs is a difference in the software and nothing
+    /// else. It is also what turns a 16-hour signal into a minutes-long one.
+    pub fn with_stop_height(mut self, height: u32) -> Self {
+        self.stop_height = Some(height);
+        self
+    }
+
     /// Bounded snapshot history size.
     pub fn with_history_cap(mut self, cap: usize) -> Self {
         self.history_cap = cap;
@@ -272,7 +302,15 @@ impl<S: SyncSubject> SyncEngine<S> {
         self.reporter.on_start();
 
         if let Err(e) = self.subject.launch().await {
-            return self.finish(SyncVerdict::Errored, Vec::new(), Vec::new(), Some(format!("launch: {e}")), 0, 0);
+            return self.finish(
+                SyncVerdict::Errored,
+                Vec::new(),
+                Vec::new(),
+                Some(format!("launch: {e}")),
+                0,
+                0,
+                None,
+            );
         }
 
         let started = Instant::now();
@@ -280,6 +318,15 @@ impl<S: SyncSubject> SyncEngine<S> {
         let mut builder = SnapshotBuilder::new(started);
         let mut history = History::new(self.history_cap);
         let mut violations: Vec<Violation> = Vec::new();
+        let mut chain_work = ChainWork::new();
+        let mut last_work = Work::ZERO;
+        // The segment accumulates as the run goes: its origin is the first
+        // tick's reading and its head is the most recent one, so it survives a
+        // run that is cancelled or times out rather than existing only on the
+        // success path — and it reports where such a run actually got to.
+        let mut origin: Option<Mark> = None;
+        let mut head: Option<Mark> = None;
+        let network = self.network().await;
 
         let mut ticker = interval(self.tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -316,7 +363,15 @@ impl<S: SyncSubject> SyncEngine<S> {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            let snap = Arc::new(builder.build(&progress, now, None, TreeRoots::default()));
+            last_work = self.read_work(&mut chain_work, &progress, last_work).await;
+            let snap = Arc::new(builder.build(&progress, now, last_work, None));
+            let mark = Mark {
+                height: snap.height(),
+                work: last_work,
+                at: now,
+            };
+            origin.get_or_insert(mark);
+            head = Some(mark);
             history.push(snap.clone());
             self.reporter.on_tick(&snap);
 
@@ -337,19 +392,32 @@ impl<S: SyncSubject> SyncEngine<S> {
 
             // The board is built before the reporter call so it holds no borrow
             // of `self.probes` while `self.reporter` is borrowed mutably.
-            let board: Vec<ProbeStatus> =
-                self.probes.iter().map(|p| p.status(now, self.tick)).collect();
+            let board: Vec<ProbeStatus> = self
+                .probes
+                .iter()
+                .map(|p| p.status(now, self.tick))
+                .collect();
             self.reporter.on_probes(&snap, &board);
 
-            if self.subject.is_complete().await {
+            // A declared stop height completes the run on its own, ahead of the
+            // subject's own predicate: the point of a segment is that the run
+            // ends where it said it would, whether or not the chain has more.
+            let reached_stop = self.stop_height.is_some_and(|h| snap.height() >= h);
+            if reached_stop || self.subject.is_complete().await {
                 // Terminal: at_completion probes over a final snapshot, enriched
                 // with the wallet's commitment-tree roots (the sync task has
                 // finished, so the wallet is static — the read cannot race the
                 // scan). A roots-read failure degrades to empty roots rather
                 // than aborting the whole run at the finish line.
                 if let Ok(p) = self.subject.progress().await {
-                    let roots = self.subject.terminal_roots().await.unwrap_or_default();
-                    let final_snap = Arc::new(builder.build(&p, Instant::now(), None, roots));
+                    let work = self.read_work(&mut chain_work, &p, last_work).await;
+                    let at = Instant::now();
+                    let final_snap = Arc::new(builder.build(&p, at, work, None));
+                    head = Some(Mark {
+                        height: final_snap.height(),
+                        work,
+                        at,
+                    });
                     if let Some(msg) = self.eval_at_completion(&final_snap, &mut violations).await {
                         error = Some(msg);
                     }
@@ -368,7 +436,64 @@ impl<S: SyncSubject> SyncEngine<S> {
         let gaps = coverage_gaps(&self.probes);
         let ticks = builder.seq();
         let dropped = history.dropped();
-        self.finish(verdict, violations, gaps, error, ticks, dropped)
+        // The span between the first reading and the last: the work is what
+        // this run performed, not the cumulative totals a seeded datadir
+        // brought with it, and `to` is where the run truly reached rather than
+        // where it was aimed. A run that traversed nothing has no span to
+        // compare and reports none.
+        let segment = origin
+            .zip(head)
+            .filter(|(origin, head)| head.height > origin.height)
+            .map(|(origin, head)| Segment {
+                network,
+                from: origin.height,
+                to: head.height,
+                work: head.work.delta(&origin.work),
+                elapsed_ms: head.at.saturating_duration_since(origin.at).as_millis() as u64,
+            });
+        self.finish(verdict, violations, gaps, error, ticks, dropped, segment)
+    }
+
+    /// The chain this run is against, as the indexer names it (`main`, `test`,
+    /// `regtest`).
+    ///
+    /// Part of a segment's identity because a height range means nothing
+    /// without it — block 840,000 is different work on every network, and
+    /// comparing across two would be comparing unrelated chains. `None` when
+    /// there is no indexer to ask; `Segment::comparable_with` refuses two
+    /// unknowns rather than letting them match each other.
+    async fn network(&self) -> Option<String> {
+        let indexer = self.ctx.indexer()?;
+        let name = indexer.indexer_info().await.ok()?.chain_name;
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The cumulative work behind this tick's progress reading.
+    ///
+    /// Prefers the subject's own count where it has one (a wallet scans
+    /// non-linearly, so its height understates it), and otherwise derives it
+    /// from the chain at the subject's height — the path that needs nothing
+    /// from the component and so works for any backend.
+    ///
+    /// A failed read holds `last` rather than reporting zero. The counters are
+    /// cumulative, so a missed reading costs one tick's resolution and nothing
+    /// more: the next successful read still includes the work done during the
+    /// gap. Zeroing instead would print a rate spike on recovery that never
+    /// happened.
+    async fn read_work<P: ProgressView>(
+        &self,
+        chain_work: &mut ChainWork,
+        progress: &P,
+        last: Work,
+    ) -> Work {
+        if let Some(own) = progress.work() {
+            return own;
+        }
+        let Some(indexer) = self.ctx.indexer() else {
+            return last;
+        };
+        let height = BlockHeight::from_u32(progress.height());
+        chain_work.observe_at(indexer, height).await.unwrap_or(last)
     }
 
     /// Evaluate the `at_completion` probes once against the final snapshot.
@@ -378,12 +503,17 @@ impl<S: SyncSubject> SyncEngine<S> {
         snap: &Snapshot,
         violations: &mut Vec<Violation>,
     ) -> Option<String> {
-        for spec in self.probes.iter_mut().filter(|s| s.class == Class::AtCompletion) {
+        for spec in self
+            .probes
+            .iter_mut()
+            .filter(|s| s.class == Class::AtCompletion)
+        {
             match spec.check.evaluate(snap, &self.ctx).await {
                 Verdict::Satisfied | Verdict::Pending => {}
                 Verdict::Violated(mut v) => {
                     v.probe = spec.name.clone();
-                    self.reporter.on_probe(&spec.name, &Verdict::Violated(v.clone()));
+                    self.reporter
+                        .on_probe(&spec.name, &Verdict::Violated(v.clone()));
                     violations.push(v);
                 }
                 Verdict::ProbeError(e) => return Some(format!("{}: {e}", spec.name)),
@@ -427,14 +557,17 @@ impl<S: SyncSubject> SyncEngine<S> {
                             spec.violation_streak += 1;
                             if spec.violation_streak >= spec.violation_threshold() {
                                 v.probe = spec.name.clone();
-                                self.reporter.on_probe(&spec.name, &Verdict::Violated(v.clone()));
+                                self.reporter
+                                    .on_probe(&spec.name, &Verdict::Violated(v.clone()));
                                 violations.push(v);
                                 if spec.severity == Severity::Fatal {
                                     return Flow::FailFast;
                                 }
                             }
                         }
-                        Verdict::ProbeError(e) => return Flow::Abort(format!("{}: {e}", spec.name)),
+                        Verdict::ProbeError(e) => {
+                            return Flow::Abort(format!("{}: {e}", spec.name));
+                        }
                     }
                 }
                 Class::Eventually => {
@@ -456,7 +589,9 @@ impl<S: SyncSubject> SyncEngine<S> {
                     };
                     match verdict {
                         Verdict::Satisfied => spec.last_satisfied = Some(now),
-                        Verdict::ProbeError(e) => return Flow::Abort(format!("{}: {e}", spec.name)),
+                        Verdict::ProbeError(e) => {
+                            return Flow::Abort(format!("{}: {e}", spec.name));
+                        }
                         Verdict::Pending | Verdict::Violated(_) => {
                             let since = now.duration_since(spec.last_satisfied.unwrap_or(now));
                             if since > window {
@@ -467,7 +602,8 @@ impl<S: SyncSubject> SyncEngine<S> {
                                         "liveness stall: not satisfied for {since:?} (window {window:?})"
                                     ),
                                 };
-                                self.reporter.on_probe(&spec.name, &Verdict::Violated(v.clone()));
+                                self.reporter
+                                    .on_probe(&spec.name, &Verdict::Violated(v.clone()));
                                 violations.push(v);
                                 if spec.severity == Severity::Fatal {
                                     return Flow::FailFast;
@@ -490,6 +626,7 @@ impl<S: SyncSubject> SyncEngine<S> {
         error: Option<String>,
         ticks: u64,
         dropped_snapshots: u64,
+        segment: Option<Segment>,
     ) -> SyncOutcome {
         let outcome = SyncOutcome {
             verdict,
@@ -498,8 +635,8 @@ impl<S: SyncSubject> SyncEngine<S> {
             error,
             ticks,
             dropped_snapshots,
+            segment,
             // Filled in by the facade after the engine returns.
-            metrics: crate::metrics::MetricsSummary::default(),
         };
         self.reporter.on_finish(&outcome);
         outcome
@@ -524,11 +661,11 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::cancel::CancelSource;
-    use crate::handles::wallet::Pool;
 
     use super::super::probe::{Verdict, Violation};
     use super::super::snapshot::Snapshot;
-    use super::super::subject::{Phase, ProgressView, SyncSubject};
+    use super::super::subject::{Phase, SyncSubject};
+    use super::super::work::Op;
     use super::*;
 
     /// A scripted progress reading.
@@ -552,12 +689,11 @@ mod tests {
         fn phase(&self) -> Phase {
             Phase::Historic
         }
-        fn outputs(&self, pool: Pool) -> u64 {
-            match pool {
-                Pool::Sapling => self.sapling,
-                Pool::Orchard => self.orchard,
-                _ => 0,
-            }
+        fn work(&self) -> Option<Work> {
+            let mut w = Work::ZERO;
+            w.set(Op::SaplingOutput, self.sapling)
+                .set(Op::OrchardAction, self.orchard);
+            Some(w)
         }
     }
 
@@ -632,7 +768,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn passes_when_height_monotonic_to_tip() {
         let mut run = fast_runner(FakeSubject::new(vec![p(1, 3), p(2, 3), p(3, 3)]));
-        run.always(Severity::Fatal).each_tick().check(height_monotonic);
+        run.always(Severity::Fatal)
+            .each_tick()
+            .check(height_monotonic);
         run.at_completion(Severity::Fatal).check(|s: &Snapshot| {
             if s.target() == Some(s.height()) {
                 Verdict::Satisfied
@@ -655,7 +793,9 @@ mod tests {
         let subject = FakeSubject::new(vec![p(1, 5), p(2, 5), p(1, 5), p(3, 5), p(5, 5)]);
         let stopped = subject.stopped.clone();
         let mut run = fast_runner(subject);
-        run.always(Severity::Fatal).each_tick().check(height_monotonic);
+        run.always(Severity::Fatal)
+            .each_tick()
+            .check(height_monotonic);
         let out = run.run().await;
         assert_eq!(out.verdict, SyncVerdict::Failed, "{out:?}");
         assert_eq!(out.violations.len(), 1);
@@ -668,17 +808,19 @@ mod tests {
         let subject = FakeSubject::new(vec![p(1, 3), p(1, 3), p(3, 3)]);
         // pool outputs decrease is a Recorded (non-fatal) violation here.
         let mut run = fast_runner(subject);
-        run.always(Severity::Recorded).each_tick().check(|s: &Snapshot| {
-            if s.outputs(Pool::Orchard) >= s.prev_outputs(Pool::Orchard) {
-                Verdict::Satisfied
-            } else {
-                Verdict::Violated(Violation {
-                    probe: String::new(),
-                    height: None,
-                    detail: "orchard outputs went backwards".into(),
-                })
-            }
-        });
+        run.always(Severity::Recorded)
+            .each_tick()
+            .check(|s: &Snapshot| {
+                if s.work().require(Op::OrchardAction) >= s.prev_work().require(Op::OrchardAction) {
+                    Verdict::Satisfied
+                } else {
+                    Verdict::Violated(Violation {
+                        probe: String::new(),
+                        height: None,
+                        detail: "orchard outputs went backwards".into(),
+                    })
+                }
+            });
         // orchard is always 0 here → never violated; run should pass and reach tip.
         let out = run.run().await;
         assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
@@ -773,7 +915,9 @@ mod tests {
         let (src, cancel) = CancelSource::new();
         let subject = FakeSubject::new(vec![p(1, 9)]).never_complete();
         let mut run = fast_runner(subject).with_cancel(cancel);
-        run.always(Severity::Fatal).each_tick().check(height_monotonic);
+        run.always(Severity::Fatal)
+            .each_tick()
+            .check(height_monotonic);
         // Fire cancellation from another task shortly after start.
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;

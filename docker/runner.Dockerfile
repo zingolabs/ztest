@@ -34,6 +34,16 @@
 
 ARG RUST_VERSION=1.95.0
 
+# NEXTEST_ARGS arrives already shell-quoted by the laptop (`shell_quote` in
+# `pipeline/remote_compile.rs`), so every use of it below goes through `eval`.
+# A bare `${NEXTEST_ARGS}` is a *variable expansion*: the shell word-splits it
+# but does not re-parse the quotes, so `-E 'test(=x)'` reaches nextest as two
+# tokens containing literal `'` characters. nextest then reads them as a
+# positional filter, matches nothing, and exits 0 — the whole run silently
+# selects zero tests. Anything with a shell metacharacter hits this, `::`
+# included, which is every meaningful filter. `eval` re-parses the quoting the
+# laptop applied, which is the point of applying it.
+
 # ── compile ─────────────────────────────────────────────────────────────────
 FROM rust:${RUST_VERSION}-bookworm AS compile
 # CARGO_TARGET_DIR stays an env — not the config file below — so it outranks any
@@ -107,14 +117,15 @@ RUN --mount=type=cache,target=/cache/cargo \
     set -eu; \
     install -Dm644 /etc/ztest/cargo-config.toml "$CARGO_HOME/config.toml"; \
     cd "/src/${WORKSPACE_REL}"; \
-    mold -run cargo nextest run --no-run ${NEXTEST_ARGS}; \
+    eval "mold -run cargo nextest run --no-run ${NEXTEST_ARGS}"; \
     mkdir -p /bins/deps; \
-    cargo nextest list --message-format json ${NEXTEST_ARGS} \
+    eval "cargo nextest list --message-format json ${NEXTEST_ARGS}" \
     | jq -r '.["rust-suites"][]["binary-path"]' \
     | while IFS= read -r binpath; do \
         [ -n "$binpath" ] || { echo "compile: nextest list gave an empty binary-path (schema drift?)" >&2; exit 1; }; \
         cp -p "$binpath" /bins/deps/; \
-    done
+    done; \
+    [ -n "$(ls -A /bins/deps)" ] || { echo "compile: the selection matched no test binaries — check the filter reached nextest intact (NEXTEST_ARGS=${NEXTEST_ARGS})" >&2; exit 1; }
 
 # ── inventory ─────────────────────────────────────────────────────────────────
 # `nextest list --json` (the selection + per-binary paths/cwds the laptop parses
@@ -135,7 +146,7 @@ RUN --mount=type=cache,target=/cache/cargo \
     install -Dm644 /etc/ztest/cargo-config.toml "$CARGO_HOME/config.toml"; \
     mkdir -p /out; \
     cd "/src/${WORKSPACE_REL}"; \
-    cargo nextest list --message-format json ${NEXTEST_ARGS} > /out/list.json; \
+    eval "cargo nextest list --message-format json ${NEXTEST_ARGS}" > /out/list.json; \
     : > /out/inventory.jsonl; \
     TAB=$(printf '\t'); \
     jq -r '.["rust-suites"] | to_entries[] | [.value["binary-path"], .value.cwd] | @tsv' /out/list.json \

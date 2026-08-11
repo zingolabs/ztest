@@ -1,28 +1,28 @@
-//! L3 — correctness under load. An [`Oracle`] validates responses, which is what
-//! makes this a *test* rather than a benchmark.
+//! L3 — correctness under load. [`BlockOracle`] validates every response the
+//! driver receives, which is what makes this a *test* rather than a benchmark.
 //!
-//! Two oracles ship here:
-//! - [`ChainLinkOracle`] — the invariant `zaino-admin`'s `check`/`concurrent`
-//!   enforced: genesis `prev_hash` is all-zeros, hashes are 32 bytes, blocks are
-//!   strictly height-ordered, and `prev_hash == prior.hash`.
-//! - [`diff_compact_block`] — the field-level differential from `zaino-admin`'s
-//!   `block_compare`, used by [`DiffLoadDriver`](super::DiffLoadDriver) to prove
-//!   two backends agree byte-for-byte.
+//! One type, three invariants — they are always wanted together, so composing
+//! them at the call site bought nothing but ceremony:
+//!
+//! 1. **Chain link** — genesis `prev_hash` is all-zeros, hashes are 32 bytes,
+//!    blocks are strictly height-ordered, and `prev_hash == prior.hash`. The
+//!    invariant `zaino-admin`'s `check`/`concurrent` enforced. Per-response.
+//! 2. **Completeness** — the heights served are exactly those requested. A
+//!    stream truncated at block 12 of 40, or one skipping 20–25, is still
+//!    perfectly self-linked, so nothing else here would notice.
+//! 3. **Stable history** — a height below [`stable_below`](BlockOracle::stable_below)
+//!    keeps the same hash for the whole run. Cross-response, opt-in, and the
+//!    only check that can see a re-org rewriting blocks it should not have.
+
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Mutex;
 
 use crate::loadtest::client::copy_hash;
-use crate::proto::{ChainMetadata, CompactBlock, CompactTx};
-
-/// A batch of blocks observed from one streamed response, tagged with the range
-/// that produced it, handed to an [`Oracle`] for validation.
-#[derive(Debug)]
-pub struct Observed<'a> {
-    pub start: u64,
-    pub end: u64,
-    pub blocks: &'a [CompactBlock],
-}
+use crate::proto::CompactBlock;
 
 /// A single correctness failure, carrying enough to fingerprint the defect:
-/// which height, which field, and the offending values.
+/// which height, which field, and what went wrong.
 #[derive(Debug, Clone)]
 pub struct Violation {
     pub height: u64,
@@ -32,199 +32,184 @@ pub struct Violation {
 
 impl std::fmt::Display for Violation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "height {} [{}]: {}", self.height, self.field, self.detail)
+        write!(
+            f,
+            "height {} [{}]: {}",
+            self.height, self.field, self.detail
+        )
     }
 }
 
-/// Validates observed responses. Implemented by correctness checks the driver
-/// runs inline as each response arrives.
-pub trait Oracle: Send + Sync + std::fmt::Debug {
-    fn observe(&self, obs: &Observed<'_>) -> Vec<Violation>;
+fn violation(height: u64, field: &str, detail: String) -> Violation {
+    Violation {
+        height,
+        field: field.into(),
+        detail,
+    }
 }
-
-/// Enforces the block-chain-link invariant across a streamed range.
-///
-/// Ported from `zaino-admin`'s `check.rs` and `concurrent.rs::verify_chain`.
-/// Blocks are validated in the order streamed; the caller sorts by height first
-/// (see [`LwdClient::block_range`](super::LwdClient::block_range)).
-#[derive(Debug, Clone, Copy)]
-pub struct ChainLinkOracle;
 
 const GENESIS_PREV: [u8; 32] = [0u8; 32];
 
-impl Oracle for ChainLinkOracle {
-    fn observe(&self, obs: &Observed<'_>) -> Vec<Violation> {
+/// The correctness checks the driver runs inline as each response arrives.
+///
+/// Shared across every connection in a run: the stable-history baseline is
+/// global on purpose, since one connection observing a height another already
+/// saw is exactly the cross-check being made.
+#[derive(Debug, Default)]
+pub struct BlockOracle {
+    stable_below: Option<u64>,
+    seen: Mutex<HashMap<u64, [u8; 32]>>,
+}
+
+impl BlockOracle {
+    /// Chain-link and completeness checks only.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Additionally hold every height strictly below `height` immutable for the
+    /// run: its hash must never change once observed.
+    ///
+    /// A re-org legitimately rewrites blocks near the tip, so this is a ceiling,
+    /// not a blanket rule — set it to the deepest height the test's re-org can
+    /// reach. Heights at or above it are recorded but never flagged, keeping the
+    /// check useful on a growing chain.
+    pub fn stable_below(mut self, height: u64) -> Self {
+        self.stable_below = Some(height);
+        self
+    }
+
+    /// Validate one streamed response covering the inclusive range `start..=end`.
+    pub(crate) fn observe(&self, start: u64, end: u64, blocks: &[CompactBlock]) -> Vec<Violation> {
         let mut v = Vec::new();
-        let mut prev_hash: Option<[u8; 32]> = None;
-        let mut last_height: Option<u64> = None;
-
-        for block in obs.blocks {
-            let height = block.height;
-
-            if let Some(last) = last_height {
-                if height <= last {
-                    v.push(Violation {
-                        height,
-                        field: "order".into(),
-                        detail: format!("height {height} is not strictly after {last}"),
-                    });
-                }
-            }
-            last_height = Some(height);
-
-            let Some(hash) = copy_hash(&block.hash) else {
-                v.push(Violation {
-                    height,
-                    field: "hash".into(),
-                    detail: format!("hash is {} bytes, expected 32", block.hash.len()),
-                });
-                prev_hash = None;
-                continue;
-            };
-            let Some(prev) = copy_hash(&block.prev_hash) else {
-                v.push(Violation {
-                    height,
-                    field: "prev_hash".into(),
-                    detail: format!("prev_hash is {} bytes, expected 32", block.prev_hash.len()),
-                });
-                prev_hash = None;
-                continue;
-            };
-
-            if height == 0 && prev != GENESIS_PREV {
-                v.push(Violation {
-                    height,
-                    field: "prev_hash".into(),
-                    detail: "genesis block must have all-zero prev_hash".into(),
-                });
-            }
-
-            if let Some(expected) = prev_hash {
-                if prev != expected {
-                    v.push(Violation {
-                        height,
-                        field: "prev_hash".into(),
-                        detail: format!(
-                            "prev_hash {} does not link to prior block hash {}",
-                            hex::encode(prev),
-                            hex::encode(expected),
-                        ),
-                    });
-                }
-            }
-            prev_hash = Some(hash);
-        }
+        check_links(blocks, &mut v);
+        check_complete(start, end, blocks, &mut v);
+        self.check_stable(blocks, &mut v);
         v
     }
-}
 
-// ─────────────────────────── differential diff ──────────────────────────────
-
-/// A field-level difference between two blocks at the same height.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FieldDiff {
-    pub field: String,
-    pub value_a: String,
-    pub value_b: String,
-}
-
-/// Compare two compact blocks at the same height field-by-field. Empty result ⇒
-/// byte-identical. Ported from `zaino-admin`'s `block_compare::diff_compact_block`.
-pub fn diff_compact_block(a: &CompactBlock, b: &CompactBlock) -> Vec<FieldDiff> {
-    let mut d = Vec::new();
-    scalar(&mut d, "proto_version", a.proto_version, b.proto_version);
-    scalar(&mut d, "height", a.height, b.height);
-    bytes(&mut d, "hash", &a.hash, &b.hash);
-    bytes(&mut d, "prev_hash", &a.prev_hash, &b.prev_hash);
-    scalar(&mut d, "time", a.time, b.time);
-    bytes(&mut d, "header", &a.header, &b.header);
-    diff_vtx(&mut d, &a.vtx, &b.vtx);
-    diff_chain_metadata(&mut d, &a.chain_metadata, &b.chain_metadata);
-    d
-}
-
-fn scalar<T: std::fmt::Display + PartialEq>(d: &mut Vec<FieldDiff>, field: &str, a: T, b: T) {
-    if a != b {
-        d.push(FieldDiff {
-            field: field.into(),
-            value_a: a.to_string(),
-            value_b: b.to_string(),
-        });
-    }
-}
-
-fn bytes(d: &mut Vec<FieldDiff>, field: &str, a: &[u8], b: &[u8]) {
-    if a != b {
-        d.push(FieldDiff {
-            field: field.into(),
-            value_a: hex::encode(a),
-            value_b: hex::encode(b),
-        });
-    }
-}
-
-fn diff_vtx(d: &mut Vec<FieldDiff>, a: &[CompactTx], b: &[CompactTx]) {
-    if a.len() != b.len() {
-        scalar(d, "vtx.len", a.len(), b.len());
-    }
-    for i in 0..a.len().max(b.len()) {
-        match (a.get(i), b.get(i)) {
-            (Some(ta), Some(tb)) => {
-                scalar(d, &format!("vtx[{i}].index"), ta.index, tb.index);
-                bytes(d, &format!("vtx[{i}].txid"), &ta.txid, &tb.txid);
-                scalar(d, &format!("vtx[{i}].fee"), ta.fee, tb.fee);
-                scalar(d, &format!("vtx[{i}].spends.len"), ta.spends.len(), tb.spends.len());
-                scalar(d, &format!("vtx[{i}].outputs.len"), ta.outputs.len(), tb.outputs.len());
-                scalar(d, &format!("vtx[{i}].actions.len"), ta.actions.len(), tb.actions.len());
-                scalar(d, &format!("vtx[{i}].vin.len"), ta.vin.len(), tb.vin.len());
-                scalar(d, &format!("vtx[{i}].vout.len"), ta.vout.len(), tb.vout.len());
+    fn check_stable(&self, blocks: &[CompactBlock], v: &mut Vec<Violation>) {
+        let Some(ceiling) = self.stable_below else {
+            return;
+        };
+        let mut seen = self.seen.lock().expect("BlockOracle::seen mutex poisoned");
+        for block in blocks {
+            let Some(hash) = copy_hash(&block.hash) else {
+                // Malformed hashes are the chain-link check's business;
+                // recording one here would poison the baseline with garbage.
+                continue;
+            };
+            match seen.entry(block.height) {
+                Entry::Vacant(slot) => {
+                    slot.insert(hash);
+                }
+                Entry::Occupied(prior) => {
+                    if *prior.get() != hash && block.height < ceiling {
+                        v.push(violation(
+                            block.height,
+                            "hash",
+                            format!(
+                                "settled history changed: was {}, now {} (stable below {ceiling})",
+                                hex::encode(prior.get()),
+                                hex::encode(hash),
+                            ),
+                        ));
+                    }
+                }
             }
-            (Some(_), None) => d.push(FieldDiff {
-                field: format!("vtx[{i}]"),
-                value_a: "present".into(),
-                value_b: "missing".into(),
-            }),
-            (None, Some(_)) => d.push(FieldDiff {
-                field: format!("vtx[{i}]"),
-                value_a: "missing".into(),
-                value_b: "present".into(),
-            }),
-            (None, None) => unreachable!(),
         }
     }
 }
 
-fn diff_chain_metadata(
-    d: &mut Vec<FieldDiff>,
-    a: &Option<ChainMetadata>,
-    b: &Option<ChainMetadata>,
-) {
-    match (a, b) {
-        (Some(ma), Some(mb)) => {
-            scalar(
-                d,
-                "chain_metadata.sapling_commitment_tree_size",
-                ma.sapling_commitment_tree_size,
-                mb.sapling_commitment_tree_size,
-            );
-            scalar(
-                d,
-                "chain_metadata.orchard_commitment_tree_size",
-                ma.orchard_commitment_tree_size,
-                mb.orchard_commitment_tree_size,
-            );
+/// Blocks are validated in the order streamed; the caller sorts by height first
+/// (see [`LwdClient::block_range`](super::LwdClient::block_range)).
+fn check_links(blocks: &[CompactBlock], v: &mut Vec<Violation>) {
+    let mut prev_hash: Option<[u8; 32]> = None;
+    let mut last_height: Option<u64> = None;
+
+    for block in blocks {
+        let height = block.height;
+
+        if let Some(last) = last_height
+            && height <= last
+        {
+            v.push(violation(
+                height,
+                "order",
+                format!("height {height} is not strictly after {last}"),
+            ));
         }
-        (Some(_), None) => d.push(FieldDiff {
-            field: "chain_metadata".into(),
-            value_a: "present".into(),
-            value_b: "missing".into(),
-        }),
-        (None, Some(_)) => d.push(FieldDiff {
-            field: "chain_metadata".into(),
-            value_a: "missing".into(),
-            value_b: "present".into(),
-        }),
-        (None, None) => {}
+        last_height = Some(height);
+
+        let Some(hash) = copy_hash(&block.hash) else {
+            v.push(violation(
+                height,
+                "hash",
+                format!("hash is {} bytes, expected 32", block.hash.len()),
+            ));
+            prev_hash = None;
+            continue;
+        };
+        let Some(prev) = copy_hash(&block.prev_hash) else {
+            v.push(violation(
+                height,
+                "prev_hash",
+                format!("prev_hash is {} bytes, expected 32", block.prev_hash.len()),
+            ));
+            prev_hash = None;
+            continue;
+        };
+
+        if height == 0 && prev != GENESIS_PREV {
+            v.push(violation(
+                height,
+                "prev_hash",
+                "genesis block must have all-zero prev_hash".into(),
+            ));
+        }
+
+        if let Some(expected) = prev_hash
+            && prev != expected
+        {
+            v.push(violation(
+                height,
+                "prev_hash",
+                format!(
+                    "prev_hash {} does not link to prior block hash {}",
+                    hex::encode(prev),
+                    hex::encode(expected),
+                ),
+            ));
+        }
+        prev_hash = Some(hash);
+    }
+}
+
+/// Reports at most two findings — the first missing height and the first
+/// unexpected one — because a wholly empty response would otherwise emit one
+/// violation per requested height and bury the signal.
+fn check_complete(start: u64, end: u64, blocks: &[CompactBlock], v: &mut Vec<Violation>) {
+    let served: BTreeSet<u64> = blocks.iter().map(|b| b.height).collect();
+
+    if let Some(missing) = (start..=end).find(|h| !served.contains(h)) {
+        let want = end.saturating_sub(start) + 1;
+        v.push(violation(
+            missing,
+            "missing",
+            format!(
+                "range {start}..={end} requested {want} block(s), served {}; \
+                 first missing at {missing}",
+                blocks.len(),
+            ),
+        ));
+    }
+
+    if let Some(&extra) = served.iter().find(|h| **h < start || **h > end) {
+        v.push(violation(
+            extra,
+            "unexpected",
+            format!("height {extra} is outside the requested range {start}..={end}"),
+        ));
     }
 }
 
@@ -245,71 +230,144 @@ mod tests {
         }
     }
 
+    /// A well-formed run over `start..=end`, each block linking to the last.
+    fn linked(start: u64, end: u64) -> Vec<CompactBlock> {
+        (start..=end)
+            .map(|h| block(h, [h as u8; 32], [(h - 1) as u8; 32]))
+            .collect()
+    }
+
+    // ── chain link ──────────────────────────────────────────────────────
+
     #[test]
-    fn chain_link_accepts_a_linked_run() {
-        let blocks = vec![
-            block(10, [1u8; 32], [0u8; 32]),
-            block(11, [2u8; 32], [1u8; 32]),
-            block(12, [3u8; 32], [2u8; 32]),
-        ];
-        let v = ChainLinkOracle.observe(&Observed {
-            start: 10,
-            end: 12,
-            blocks: &blocks,
-        });
-        assert!(v.is_empty(), "linked run must produce no violations: {v:?}");
+    fn accepts_a_linked_run() {
+        let blocks = linked(10, 12);
+        assert!(BlockOracle::new().observe(10, 12, &blocks).is_empty());
     }
 
     #[test]
-    fn chain_link_flags_a_broken_link() {
-        let blocks = vec![
-            block(10, [1u8; 32], [0u8; 32]),
-            block(11, [2u8; 32], [9u8; 32]), // prev should be [1;32]
-        ];
-        let v = ChainLinkOracle.observe(&Observed {
-            start: 10,
-            end: 11,
-            blocks: &blocks,
-        });
+    fn flags_a_broken_link() {
+        let mut blocks = linked(10, 12);
+        blocks[2].prev_hash = vec![0xAA; 32];
+        let v = BlockOracle::new().observe(10, 12, &blocks);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].height, 11);
+        assert_eq!(v[0].height, 12);
         assert_eq!(v[0].field, "prev_hash");
     }
 
     #[test]
-    fn chain_link_flags_bad_hash_length() {
-        let mut b = block(10, [1u8; 32], [0u8; 32]);
-        b.hash = vec![0u8; 31];
-        let v = ChainLinkOracle.observe(&Observed {
-            start: 10,
-            end: 10,
-            blocks: &[b],
-        });
+    fn flags_bad_hash_length() {
+        let mut blocks = linked(10, 10);
+        blocks[0].hash = vec![0u8; 31];
+        let v = BlockOracle::new().observe(10, 10, &blocks);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].field, "hash");
     }
 
+    // ── completeness ────────────────────────────────────────────────────
+
     #[test]
-    fn identical_blocks_have_no_diff() {
-        let a = block(100, [1u8; 32], [0u8; 32]);
-        assert!(diff_compact_block(&a, &a.clone()).is_empty());
+    fn accepts_the_exact_requested_range() {
+        let blocks = linked(5, 8);
+        assert!(BlockOracle::new().observe(5, 8, &blocks).is_empty());
+    }
+
+    /// The check that exists because nothing else can see this: a truncated
+    /// stream is still perfectly self-linked, so the chain-link check passes.
+    #[test]
+    fn flags_a_truncated_stream() {
+        let blocks = linked(5, 6);
+        let mut links = Vec::new();
+        check_links(&blocks, &mut links);
+        assert!(
+            links.is_empty(),
+            "precondition: truncation stays self-linked"
+        );
+
+        let v = BlockOracle::new().observe(5, 8, &blocks);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].field, "missing");
+        assert_eq!(v[0].height, 7);
     }
 
     #[test]
-    fn differing_hash_is_reported() {
-        let a = block(100, [1u8; 32], [0u8; 32]);
-        let b = block(100, [2u8; 32], [0u8; 32]);
-        let d = diff_compact_block(&a, &b);
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].field, "hash");
+    fn flags_a_gap_in_the_middle() {
+        let mut blocks = linked(5, 8);
+        blocks.remove(1); // drop height 6
+        let v = BlockOracle::new().observe(5, 8, &blocks);
+        assert!(v.iter().any(|x| x.field == "missing" && x.height == 6));
     }
 
     #[test]
-    fn differing_vtx_count_is_reported() {
-        let a = block(100, [1u8; 32], [0u8; 32]);
-        let mut b = a.clone();
-        b.vtx = vec![CompactTx::default()];
-        let d = diff_compact_block(&a, &b);
-        assert!(d.iter().any(|f| f.field == "vtx.len"));
+    fn flags_a_height_outside_the_request() {
+        let blocks = linked(5, 8);
+        let v = BlockOracle::new().observe(5, 7, &blocks);
+        assert!(v.iter().any(|x| x.field == "unexpected" && x.height == 8));
+    }
+
+    /// An empty response must not emit one violation per requested height.
+    #[test]
+    fn stays_terse_on_an_empty_response() {
+        let v = BlockOracle::new().observe(1, 500, &[]);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].field, "missing");
+    }
+
+    // ── stable history ──────────────────────────────────────────────────
+
+    #[test]
+    fn stable_history_is_off_unless_requested() {
+        let oracle = BlockOracle::new();
+        let first = linked(10, 10);
+        let rewritten = vec![block(10, [0xFF; 32], [9u8; 32])];
+        assert!(oracle.observe(10, 10, &first).is_empty());
+        assert!(oracle.observe(10, 10, &rewritten).is_empty());
+    }
+
+    #[test]
+    fn accepts_a_repeated_identical_observation() {
+        let oracle = BlockOracle::new().stable_below(100);
+        let blocks = linked(10, 12);
+        assert!(oracle.observe(10, 12, &blocks).is_empty());
+        assert!(oracle.observe(10, 12, &blocks).is_empty());
+    }
+
+    #[test]
+    fn flags_a_rewritten_settled_block() {
+        let oracle = BlockOracle::new().stable_below(100);
+        assert!(oracle.observe(10, 10, &linked(10, 10)).is_empty());
+
+        let rewritten = vec![block(10, [0xFF; 32], [9u8; 32])];
+        let v = oracle.observe(10, 10, &rewritten);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].height, 10);
+        assert_eq!(v[0].field, "hash");
+    }
+
+    /// Above the ceiling a re-org is legitimate, so a changed hash is not a
+    /// defect — otherwise the check would fire on every growing chain.
+    #[test]
+    fn tolerates_a_rewrite_above_the_ceiling() {
+        let oracle = BlockOracle::new().stable_below(10);
+        assert!(oracle.observe(10, 10, &linked(10, 10)).is_empty());
+
+        let rewritten = vec![block(10, [0xFF; 32], [9u8; 32])];
+        assert!(oracle.observe(10, 10, &rewritten).is_empty());
+    }
+
+    #[test]
+    fn malformed_hashes_do_not_poison_the_baseline() {
+        let oracle = BlockOracle::new().stable_below(100);
+
+        let mut bad = linked(10, 10);
+        bad[0].hash = vec![0u8; 31];
+        // Reported by the chain-link check, but not recorded as the baseline.
+        assert_eq!(oracle.observe(10, 10, &bad).len(), 1);
+
+        // The first *well-formed* observation becomes the baseline, and
+        // matching it later is clean.
+        let good = linked(10, 10);
+        assert!(oracle.observe(10, 10, &good).is_empty());
+        assert!(oracle.observe(10, 10, &good).is_empty());
     }
 }

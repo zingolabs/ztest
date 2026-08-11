@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use crate::engine::events::RunStats;
 use crate::engine::plan::WorkItem;
-use crate::preflight::RunProgress;
 use crate::qos::Resources;
 use crate::qos::live::{LiveSnapshot, TierLive};
+use crate::ui::RunProgress;
 
 /// Fold the currently-running work-items into a [`LiveSnapshot`] for
-/// [`render_live_panel`](crate::preflight::render::render_live_panel).
+/// [`render_live_panel`](crate::ui::render::render_live_panel).
 /// `committed` is the scheduler's committed total (= sum of running footprints).
 pub fn live_snapshot<'a>(
     running: impl Iterator<Item = &'a WorkItem>,

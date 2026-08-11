@@ -11,7 +11,7 @@
 //!
 //! Output reaches the terminal through a manual sticky footer ([`Surface`] +
 //! [`footer`]): completed lines print normally into native scrollback, only the
-//! footer repaints in place. See `docs/console-architecture.md` for the rationale.
+//! footer repaints in place. See `docs/design-execution-engine.md` for the rationale.
 
 mod bridge;
 mod buildphase;
@@ -20,7 +20,7 @@ mod footer;
 mod render;
 mod viewport;
 
-pub(crate) use buildphase::{commit_phase, provision_with_tracker, CapRx};
+pub(crate) use buildphase::{CapRx, commit_phase, provision_with_tracker};
 pub(crate) use child::run_child;
 pub(crate) use render::{Console, SceneFrame};
 pub(crate) use viewport::Surface;

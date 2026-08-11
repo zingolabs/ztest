@@ -35,6 +35,16 @@ pub struct PodSpec {
     /// StateService reading the root-owned zebra-state DB the validator wrote.
     /// `None` keeps the image default user.
     pub run_as_user: Option<i64>,
+    /// `securityContext.supplementalGroups`: extra gids added to the container's
+    /// group set, on top of its primary gid.
+    ///
+    /// The reason this exists is the seed group. A pod's primary gid comes from
+    /// the image's `USER` when nothing pins `runAsGroup`, so it says nothing
+    /// about the volumes the pod mounts; a group it must hold to read shared
+    /// storage has to be named here. See
+    /// [`SEED_GID`](crate::materialize::SEED_GID) and
+    /// [`seed_groups`](crate::backends::seed_groups). Empty renders no field.
+    pub supplemental_groups: Vec<i64>,
     /// The QoS tier's node placement target. `Some(Pool::Nvme)` renders the
     /// NVMe nodeSelector and toleration so a `sync` pod lands on the dedicated
     /// NVMe pool; `General` and `None` schedule anywhere. Placement, not sizing;
@@ -119,6 +129,9 @@ impl PodSpec {
         }
         if let Some(uid) = self.run_as_user {
             security_context.insert("runAsUser".into(), json!(uid));
+        }
+        if !self.supplemental_groups.is_empty() {
+            security_context.insert("supplementalGroups".into(), json!(self.supplemental_groups));
         }
         if !security_context.is_empty() {
             spec["securityContext"] = Value::Object(security_context);
@@ -285,6 +298,7 @@ mod tests {
             env: Vec::new(),
             fs_group: None,
             run_as_user: None,
+            supplemental_groups: Vec::new(),
             placement: None,
             // render() requires every pod to be Guaranteed, so the shared
             // fixture carries a reserve; explicit-`.resources()` tests override.
@@ -413,6 +427,27 @@ mod tests {
             ..base_spec()
         };
         let _ = spec.render(&coords(), "t", &[]);
+    }
+
+    #[test]
+    fn supplemental_groups_render_alongside_the_pinned_uid() {
+        let spec = PodSpec {
+            run_as_user: Some(1000),
+            supplemental_groups: vec![0],
+            ..base_spec()
+        };
+        let pod = spec.render(&coords(), "t", &[]).unwrap();
+        let sc = &pod_spec_json(&pod)["securityContext"];
+        // Both, not either: a pinned uid is what makes the extra group the only
+        // way into a seed the pod does not own.
+        assert_eq!(sc["runAsUser"], 1000);
+        assert_eq!(sc["supplementalGroups"], serde_json::json!([0]));
+    }
+
+    #[test]
+    fn an_empty_group_set_renders_no_field() {
+        let pod = base_spec().render(&coords(), "t", &[]).unwrap();
+        assert!(pod_spec_json(&pod)["securityContext"]["supplementalGroups"].is_null());
     }
 
     #[test]

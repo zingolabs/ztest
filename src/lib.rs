@@ -1,53 +1,76 @@
 //! `ztest`: boot Zcash topologies (validators, indexers, wallets) on
 //! Kubernetes and hand typed RPC handles back to test code.
 //!
-//! See `docs/test-author-api.md` for the user-facing API and
-//! `docs/architecture-overview.md` for what runs under the hood.
+//! See [`docs/guide-writing-tests.md`] for the user-facing API and
+//! [`docs/design-architecture.md`] for what runs under the hood.
+//!
+//! [`docs/guide-writing-tests.md`]: https://github.com/zingolabs/ztest/blob/master/docs/guide-writing-tests.md
+//! [`docs/design-architecture.md`]: https://github.com/zingolabs/ztest/blob/master/docs/design-architecture.md
 
 #![deny(missing_debug_implementations)]
 
-// ─────────────────────────── public modules ────────────────────────────
+// `archive!` expands to `::ztest::…` paths, and `crate::snapshots` invokes it
+// from inside ztest itself. This makes that absolute path resolve here as it
+// does in a consuming crate, so the macro needs no in-crate special case.
+extern crate self as ztest;
+
+// ───────────────────────── test-author API ─────────────────────────────
+// The supported surface. Everything here is covered by ztest's SemVer.
+pub mod archive;
 pub mod backends;
-pub mod cli;
 pub mod component;
-pub mod engine;
 pub mod env;
 pub mod error;
 pub mod handles;
-pub mod inventory;
 pub mod loadtest;
 pub mod mount;
-pub mod pipeline;
-pub mod preflight;
-pub mod proto;
 pub mod protocol;
-pub mod qos;
 pub mod regtest;
 pub mod regtest_conf;
-pub mod resource;
-pub mod sync;
+pub mod snapshots;
 pub mod testnet_conf;
 pub mod topology;
 
-// ─────────────────────────── internal modules ──────────────────────────
-pub mod cancel;
+// ───────────────────────── internal machinery ──────────────────────────
+// `pub` only because something outside the library reaches it: the `ztest`
+// binary (`cli`), or a proc-macro expansion in a *consumer* crate, which can
+// only name `::ztest::` paths (`inventory`, `qos`, `sync`). Hidden from the
+// docs and excluded from ztest's SemVer — treat as private.
+#[doc(hidden)]
+pub mod cli;
+#[doc(hidden)]
+pub mod inventory;
+#[doc(hidden)]
+pub mod qos;
+#[doc(hidden)]
+pub mod sync;
+
+mod cancel;
 mod cluster;
-pub mod cluster_config;
+mod cluster_config;
+mod engine;
 mod logstream;
 mod manifest;
 mod materialize;
-pub mod metrics;
+mod metrics;
 mod mounts;
-mod profiling;
 mod naming;
-pub mod observ;
-pub(crate) mod pod_status;
+mod observ;
+mod pipeline;
+mod pod_status;
 mod portforward;
+mod profiling;
+mod proto;
+mod resource;
 mod seeds;
-pub mod storage;
+mod storage;
+mod ui;
 
 // ─────────────────────────── top-level re-exports ──────────────────────
 
+pub use crate::archive::{
+    Activation, ArchiveBackend, ArchiveHandle, ArchiveNetwork, BoundaryCheck, ChainInfo,
+};
 pub use crate::backends::image::DevSource;
 #[cfg(feature = "librustzcash")]
 pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
@@ -63,11 +86,7 @@ pub use crate::component::{
 };
 pub use crate::env::{SharedVolume, TestEnv};
 pub use crate::error::{EnvError, RpcError};
-pub use crate::handles::client::JsonRpcClient;
-pub use crate::loadtest::{
-    ChainLinkOracle, ConnMode, DiffLoadDriver, Distribution, LoadDriver, LoadReport, LwdClient,
-    Oracle, Rel, Scenario, Slo, Until,
-};
+pub use crate::handles::client::{BlockSample, JsonRpcClient};
 pub use crate::handles::indexer::{
     BlockHash, BlockHeight, CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo,
     RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, TreeState, TxId, ZatBalance,
@@ -83,8 +102,11 @@ pub use crate::handles::{
     Endpoint, HandleInner, IndexerBackend, IndexerConfig, ValidatorBackend, ValidatorConfig,
     WalletBackend, WalletConfig,
 };
-pub use crate::mount::{ArchiveHandle, Mount, MountKind, MountSource, SnapshotRef};
-pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file, sync_test};
+pub use crate::loadtest::{
+    BlockOracle, Distribution, LoadDriver, LoadReport, LwdClient, Rel, Scenario,
+};
+pub use crate::mount::{Mount, MountKind, MountSource};
+pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file, needs, sync_test};
 
 /// Internal re-exports so test-author proc macros can reach their runtime
 /// support code. Not part of the public API; paths may change without notice.
@@ -131,28 +153,42 @@ pub mod prelude {
     #[cfg(feature = "zingo")]
     pub use super::ZingoWallet;
     pub use super::{
-        Account, AccountId, ArchiveHandle, BlockHash, BlockHeight, BlockTip, BlockchainInfo,
-        ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Endpoint,
-        EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer, IndexerBackend, JsonRpcClient,
-        LightdInfo, LightwalletdIndexer, MempoolInfo, Mount, MountKind, MountSource, Peer,
-        PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction, RpcError, SendResponse,
-        SharedVolume, ShieldedProtocol, SnapshotRef, SubtreeRoot, TestEnv, TreeState, TxId,
-        Validator, ValidatorBackend, ValidatorConfig, Wallet, WalletBackend, WalletExt,
+        Account, AccountId, ArchiveHandle, BlockHash, BlockHeight, BlockSample, BlockTip,
+        BlockchainInfo, ChainConfig, CompactBlock, CompactTx, ComponentBuilder,
+        ComponentOptsBuilder, Endpoint, EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer,
+        IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, MempoolInfo, Mount,
+        MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction,
+        RpcError, SendResponse, SharedVolume, ShieldedProtocol, SubtreeRoot, TestEnv, TreeState,
+        TxId, Validator, ValidatorBackend, ValidatorConfig, Wallet, WalletBackend, WalletExt,
         ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
+    };
+    /// `Activation` / `BoundaryCheck` / `ChainInfo` are what test bodies read
+    /// off [`TestEnv::chain`] — the pin, the straddled upgrade, the heights
+    /// worth querying — instead of hardcoding them. (`ArchiveHandle` itself
+    /// comes from the top-level re-export above; it names an artifact and
+    /// nothing more.)
+    ///
+    /// [`TestEnv::chain`]: crate::TestEnv::chain
+    pub use crate::archive::{
+        Activation, ArchiveBackend, ArchiveNetwork, BoundaryCheck, ChainInfo,
     };
     pub use crate::backends::zainod::ZainoTuning;
     pub use crate::loadtest::{
-        ChainLinkOracle, ConnMode, DiffLoadDriver, Distribution, LoadDriver, LoadReport, LwdClient,
-        Oracle, Rel, Scenario, Slo, Until,
+        BlockOracle, Distribution, LoadDriver, LoadReport, LwdClient, Rel, Scenario,
     };
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
-        Regtest, Testnet, regtest_test_activation_heights, regtest_test_lockbox_disbursements,
+        Regtest, Restore, regtest_test_activation_heights, regtest_test_lockbox_disbursements,
         regtest_test_post_nu6_funding_streams,
     };
+    /// The named snapshots themselves — `.restore(ORCHARD)`. In the prelude
+    /// because they are the entire test-author surface for chain fixtures.
+    pub use crate::snapshots::{BLOSSOM, IRONWOOD, ORCHARD, SAPLING};
     /// `ActivationHeights` appears in ztest's public signatures (e.g.
     /// [`ValidatorBackend::activation_heights`]), so callers need the type to
     /// consume what ztest returns.
     pub use crate::topology::ActivationHeights;
-    pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file, sync_test};
+    pub use ztest_macros::{
+        archive, dev, mount_archive, mount_config, mount_file, needs, sync_test,
+    };
 }

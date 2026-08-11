@@ -104,6 +104,33 @@ impl<'a> ZcashRpc<'a> {
         self.parse_block(v)
     }
 
+    /// `invalidateblock <hash>` — mark a block invalid, forcing the node to
+    /// disconnect it and every descendant and re-org onto the best remaining
+    /// chain.
+    ///
+    /// This is the only way to produce a *deterministic* re-org in regtest: a
+    /// natural fork needs two competing miners and a partition, which no
+    /// single-validator fixture can arrange. Both backends serve the
+    /// bitcoind-derived name — `zebrad` maps it to the `InvalidateBlock` state
+    /// request, `zcashd` inherits the upstream implementation.
+    ///
+    /// The chain does not necessarily settle by the time this returns; poll
+    /// [`tip`](Self::tip) for the expected height before asserting.
+    pub async fn invalidate_block(&self, hash: &BlockHash) -> Result<(), RpcError> {
+        self.call("invalidateblock", json!([hex::encode(hash.0)]))
+            .await
+            .map(|_| ())
+    }
+
+    /// `reconsiderblock <hash>` — clear a previous
+    /// [`invalidate_block`](Self::invalidate_block), letting the node
+    /// reconsider the block and its descendants.
+    pub async fn reconsider_block(&self, hash: &BlockHash) -> Result<(), RpcError> {
+        self.call("reconsiderblock", json!([hex::encode(hash.0)]))
+            .await
+            .map(|_| ())
+    }
+
     /// `getmempoolinfo` → typed [`MempoolInfo`].
     pub async fn mempool_info(&self) -> Result<MempoolInfo, RpcError> {
         let v = self.call("getmempoolinfo", json!([])).await?;

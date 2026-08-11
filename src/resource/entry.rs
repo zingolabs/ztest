@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::Client;
 use kube::api::{Api, DeleteParams, DynamicObject, ListParams};
@@ -143,7 +144,8 @@ where
     // fail cleanly through the normal failed-node path — no need to abort setup.
     if opts.backend.is_openshift()
         && buildkit::BuildkitProvider.provision(&cx).await.is_ok()
-        && let Ok(pod) = buildkit::create_build_pod(&client, "setup").await
+        && let Ok(pod) =
+            buildkit::create_build_pod(&client, "setup", &crate::naming::current_user()).await
     {
         if buildkit::wait_build_pod_ready(&client, &pod).await.is_ok() {
             cx.build_pod = Some(pod);
@@ -237,7 +239,7 @@ pub fn dev_image_refs(
 
 /// Parent-side, by-identity teardown of a run's ephemeral resources: deletes
 /// everything labelled `ztest.io/run-id=<run_id>` (per-test Namespaces, which
-/// cascade, the ephemeral build/uploader pods, and cluster-scoped shadow
+/// cascade, the ephemeral build/uploader pods, and cluster-scoped seed-binding
 /// [`VolumeSnapshotContent`]s), leaving cluster infrastructure and
 /// content-addressed caches untouched.
 ///
@@ -250,32 +252,16 @@ pub async fn reap_run(client: &Client, run_id: &str) -> Vec<String> {
     reap_envs(client, &selector, &selector).await
 }
 
-/// `ztest cleanup`: reclaim one developer's ephemeral resources — every
-/// per-test Namespace and shadow VolumeSnapshotContent stamped
-/// [`LABEL_USER`](qos::LABEL_USER)`=<user>`. `user` is slugged to match the
-/// label as written. Cluster infrastructure and shared caches are untouched.
-pub async fn reap_user(client: &Client, user: &str) -> Vec<String> {
-    let user = crate::naming::slug(user, crate::naming::DNS_LABEL_MAX);
-    let owned = format!("{}={user}", qos::LABEL_USER);
-    reap_envs(client, &owned, &owned).await
-}
-
-/// `ztest cleanup --all-users`: reclaim every developer's ephemeral resources.
-/// Requires an admin ServiceAccount able to list/delete across all namespaces;
-/// without it the individual deletes surface as RBAC errors in the returned
-/// `Vec`. Namespaces select on the role label; shadow VSCs (which carry only
-/// run-id + user) on the presence of the run-id label.
-pub async fn reap_all(client: &Client) -> Vec<String> {
-    let ns = format!("{}={}", qos::LABEL_ROLE, qos::ROLE_TEST_ENV);
-    reap_envs(client, &ns, qos::LABEL_RUN_ID).await
-}
-
 /// Delete per-test Namespaces (cascading their contents) matching `ns_selector`,
-/// the ephemeral build/uploader pods in [`RUN_NAMESPACE`](policy::RUN_NAMESPACE)
-/// matching `vsc_selector`, and cluster-scoped shadow VolumeSnapshotContents
-/// matching `vsc_selector`. The two selectors differ for the cluster-wide sweep,
-/// where namespaces carry a role label the run-scoped objects don't. Idempotent;
+/// and the ephemeral build/uploader pods, seed-binding VolumeSnapshotContents, and
+/// reservation Leases matching `vsc_selector`. The two selectors differ where
+/// namespaces carry a role label the run-scoped objects don't. Idempotent;
 /// per-resource errors are collected, never fatal.
+///
+/// This is the *run-scoped* reaper, and it deliberately deletes without
+/// consulting liveness — its one caller already knows the run is over.
+/// User-facing reclaim (`ztest cleanup`), which cannot assume that, goes through
+/// [`reclaim`](crate::resource::reclaim) instead.
 async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Vec<String> {
     let dp = DeleteParams::default();
     let mut errors = Vec::new();
@@ -322,7 +308,7 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
         Err(e) => errors.push(format!("list pods ({vsc_selector}): {e}")),
     }
 
-    // Shadow VolumeSnapshotContents are cluster-scoped and don't cascade
+    // Seed-binding VolumeSnapshotContents are cluster-scoped and don't cascade
     // with the namespace; delete by label. List + delete each individually
     // (like namespaces above) rather than `deletecollection`: the run role
     // advertises only `delete` on this cluster-scoped resource, keeping the run
@@ -340,12 +326,37 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
                 if let Err(e) = vsc.delete(name, &dp).await
                     && !crate::resource::kube::is_not_found(&e)
                 {
-                    errors.push(format!("reap shadow VSC {name} ({vsc_selector}): {e}"));
+                    errors.push(format!(
+                        "reap seed binding content {name} ({vsc_selector}): {e}"
+                    ));
                 }
             }
         }
         Err(e) if crate::resource::kube::is_not_found(&e) => {}
-        Err(e) => errors.push(format!("list shadow VSCs ({vsc_selector}): {e}")),
+        Err(e) => errors.push(format!("list seed binding contents ({vsc_selector}): {e}")),
+    }
+
+    // Deleted last, after the pods it reserves for are gone: the Lease *is* the
+    // admission reservation, so releasing it while the dying pods still hold
+    // node capacity would let a concurrent run admit against capacity that isn't
+    // free yet. A cluster with no ledger namespace has nothing to reap here.
+    let leases: Api<Lease> = Api::namespaced(client.clone(), qos::ledger::META_NAMESPACE);
+    let lease_lp = ListParams::default().labels(vsc_selector);
+    match leases.list(&lease_lp).await {
+        Ok(list) => {
+            for lease in list.items {
+                let Some(name) = lease.metadata.name.as_deref() else {
+                    continue;
+                };
+                if let Err(e) = leases.delete(name, &dp).await
+                    && !crate::resource::kube::is_not_found(&e)
+                {
+                    errors.push(format!("reap reservation {name} ({vsc_selector}): {e}"));
+                }
+            }
+        }
+        Err(e) if crate::resource::kube::is_not_found(&e) => {}
+        Err(e) => errors.push(format!("list reservations ({vsc_selector}): {e}")),
     }
 
     errors
@@ -356,21 +367,24 @@ mod tests {
     use super::*;
     use crate::inventory::SeedPayload;
 
-    fn seed(source: &str) -> SeedEntry {
+    fn seed(oid: &str) -> SeedEntry {
         SeedEntry {
-            source: source.to_string(),
+            name: "data.tar.zst".to_string(),
+            oid: oid.to_string(),
+            size: 4096,
             payload: SeedPayload::Archive,
         }
     }
 
     #[test]
-    fn a_missing_seed_source_does_not_abort_planning() {
-        // A declared archive absent from the tree must yield a graph node (which
-        // provisions to `Failed` → the declaring tests SKIP as
-        // `DependencyUnavailable`), never a planning error that aborts the whole
-        // run before any test starts.
-        let graph = plan_runtime(&[], &[seed("/does/not/exist.tar.xz")])
-            .expect("a missing seed source must not fail plan_runtime");
+    fn a_seed_whose_bytes_are_absent_locally_still_plans() {
+        // Planning must never depend on the archive being readable here. It
+        // routinely is not: the OID is declared at compile time and the bytes
+        // live in the bucket, so an un-pulled checkout plans exactly like a
+        // warm one. A failure to *fetch* surfaces later, as a provision error
+        // that SKIPs only the declaring tests.
+        let graph = plan_runtime(&[], &[seed(&"ab".repeat(32))])
+            .expect("planning must not require local bytes");
         assert_eq!(graph.len(), 1);
     }
 }

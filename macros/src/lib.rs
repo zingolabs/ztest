@@ -56,49 +56,54 @@ fn resolve_source(rel: &LitStr) -> Result<std::path::PathBuf, syn::Error> {
     Ok(p)
 }
 
-fn emit(
+/// A `ConfigMap`-backed mount: templated from a path at build time, with no
+/// seed and no content addressing.
+fn emit_config_mount(
     source_abs: &std::path::Path,
     destination: &LitStr,
-    kind_ident: &str,
-    source_variant: &str,
-    seed_payload: Option<&str>,
 ) -> proc_macro2::TokenStream {
     let abs = source_abs.to_string_lossy().into_owned();
     let dst = destination.value();
-    let kind = syn::Ident::new(kind_ident, Span::call_site());
-    let src_variant = syn::Ident::new(source_variant, Span::call_site());
-    let mount = quote! {
+    quote! {
         ::ztest::Mount {
-            source: ::ztest::MountSource::#src_variant(
+            source: ::ztest::MountSource::ConfigAbs(
                 ::std::path::PathBuf::from(#abs),
             ),
             destination: ::std::path::PathBuf::from(#dst),
-            kind: ::ztest::MountKind::#kind,
+            kind: ::ztest::MountKind::Config,
         }
-    };
-    // For PVC-backed mounts (archive/file), also register a static `SeedDecl` in
-    // the link-time inventory — same pattern as `dev!`. This lets the preflight
-    // resource graph pre-provision the content-addressed seed before any test
-    // runs (`materialize::ensure_seed`), instead of the first test materializing
-    // it lazily at `build()`. The author writes `mount_archive!` exactly as
-    // before; the declaration is invisible. `ConfigMap` mounts have no seed, so
-    // they pass `None` and emit the bare value.
-    match seed_payload {
-        Some(payload) => {
-            let payload = syn::Ident::new(payload, Span::call_site());
-            quote! {
-                {
-                    ::ztest::__private::inventory::submit! {
-                        ::ztest::inventory::SeedDecl {
-                            source: #abs,
-                            payload: ::ztest::inventory::SeedPayload::#payload,
-                        }
-                    }
-                    #mount
-                }
+    }
+}
+
+/// A PVC-backed mount: a content-addressed seed, identified by the archive's
+/// Git LFS OID and mounted at `destination`.
+///
+/// Also registers a static `SeedDecl` in the link-time inventory — same pattern
+/// as `dev!` — so the preflight resource graph pre-provisions the seed before
+/// any test runs, instead of the first test to reach `build()` materializing a
+/// multi-GB artifact lazily inside its own `ready_timeout`.
+///
+/// `kind_ident` decides what the puller does with the bytes once they land:
+/// `DirArchive` extracts the tar, `File` copies the blob verbatim.
+fn emit_seed_mount(
+    baked: &BakedArchive,
+    destination: &LitStr,
+    kind_ident: &str,
+    payload_ident: &str,
+) -> proc_macro2::TokenStream {
+    let dst = destination.value();
+    let kind = syn::Ident::new(kind_ident, Span::call_site());
+    let handle = &baked.handle;
+    let seed = seed_decl_submit(baked, payload_ident);
+    quote! {
+        {
+            #seed
+            ::ztest::Mount {
+                source: ::ztest::MountSource::Seed(#handle),
+                destination: ::std::path::PathBuf::from(#dst),
+                kind: ::ztest::MountKind::#kind,
             }
         }
-        None => mount,
     }
 }
 
@@ -149,13 +154,14 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
-    emit(&abs, &destination, "Config", "ConfigAbs", None).into()
+    emit_config_mount(&abs, &destination).into()
 }
 
 /// `mount_file!("rel/blob.bin", "/path/in/container")`
 ///
-/// Materializes as a content-addressed single-file PVC. Compile-time check:
-/// file exists.
+/// Materializes as a content-addressed single-file PVC, copied verbatim.
+/// Requires a sidecar manifest carrying the blob's `sha256`/`size_bytes` — the
+/// source must be a Git LFS object, like every seed.
 #[proc_macro]
 pub fn mount_file(input: TokenStream) -> TokenStream {
     let MountArgs {
@@ -166,13 +172,18 @@ pub fn mount_file(input: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
     };
-    emit(&abs, &destination, "File", "FileAbs", Some("File")).into()
+    let baked = match bake_archive(&abs, source.span()) {
+        Ok(b) => b,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    emit_seed_mount(&baked, &destination, "File", "File").into()
 }
 
 /// `mount_archive!("rel/data.tar.zst", "/data")`
 ///
 /// Materializes as a content-addressed extracted-tar PVC (CoW clone per use).
-/// Compile-time check: file exists. `.tar.zst` suffix recommended.
+/// Requires a sidecar manifest carrying the archive's `sha256`/`size_bytes` —
+/// the source must be a Git LFS object, like every seed.
 #[proc_macro]
 pub fn mount_archive(input: TokenStream) -> TokenStream {
     let MountArgs {
@@ -183,14 +194,11 @@ pub fn mount_archive(input: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
     };
-    emit(
-        &abs,
-        &destination,
-        "DirArchive",
-        "ArchiveAbs",
-        Some("Archive"),
-    )
-    .into()
+    let baked = match bake_archive(&abs, source.span()) {
+        Ok(b) => b,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    emit_seed_mount(&baked, &destination, "DirArchive", "Archive").into()
 }
 
 // ───────────────────────────── dev! macro ─────────────────────────────
@@ -209,7 +217,7 @@ pub fn mount_archive(input: TokenStream) -> TokenStream {
 ///
 /// Block expression returning a `Validator` / `Indexer` / `Wallet` value whose
 /// container image was declared as a dev image. At the same call site the macro
-/// injects an `inventory::submit!` for the corresponding [`DevImageDecl`], so
+/// injects an `inventory::submit!` for the corresponding `DevImageDecl`, so
 /// the preflight image pipeline can discover and build the image before any
 /// test runs. `version` names the release a build corresponds to for backends
 /// (zebra) that render config / derive a ceiling from it; it defaults to `"dev"`.
@@ -646,51 +654,61 @@ fn resolve_dir(rel: &LitStr) -> Result<std::path::PathBuf, syn::Error> {
 
 // ─────────────────────── typed resource handles ───────────────────────
 //
-// The sound, per-test resource-dependency surface. `#[ztest::archive(NAME =
-// "path")]` on a test both (a) makes the archive provisionable (a `SeedDecl`,
-// same as `mount_archive!`) and (b) records a per-test dependency edge (a
-// `TestDepDecl`), so `ztest run` can pre-provision it and cleanly SKIP only the
-// tests whose archive failed. It also binds a fn-local `const NAME:
-// ArchiveHandle` the body passes to `Validator::with_regtest_cache` — a real
-// `const`, so a typo is a compile error.
+// Two macros, one meaning each:
 //
-// When the archive is consumed through a helper (the helper can't see a fn-local
-// const), the test still owns the declaration: pass the `NAME` handle into the
-// helper as a value (e.g. carried by a backend enum variant), rather than
-// declaring the handle out-of-line.
+//   ztest::archive!(pub SAPLING = "fixtures/chains/….tar.zst")
+//       binds a module-level `const SAPLING: ArchiveHandle` from the sidecar
+//       manifest. Declaration only.
+//
+//   #[ztest::needs(SAPLING)]
+//       on a test, submits the `SeedDecl` that makes it provisionable and the
+//       `TestDepDecl` that binds it to this test, so `ztest run` pre-provisions
+//       the seed and cleanly SKIPs only the tests whose archive failed.
+//
+// There is deliberately no combined declare-and-depend attribute. It would be
+// these two spelled together, and a third spelling of the same two facts is how
+// the old `testnet_snapshot!`/`#[archive]` split happened in the first place.
+// A handle is a real `const`, so naming an undeclared one is a compile error.
 
-/// `NAME = "rel/path"` — the shared parse for the archive macros.
-struct HandleDecl {
-    name: syn::Ident,
-    source: LitStr,
-}
-
-impl Parse for HandleDecl {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let name: syn::Ident = input.parse()?;
-        let _: Token![=] = input.parse()?;
-        let source: LitStr = input.parse()?;
-        let _ = input.parse::<Option<Token![,]>>();
-        Ok(HandleDecl { name, source })
-    }
-}
-
-/// The `inventory::submit!` that makes an archive provisionable — a `SeedDecl`
-/// with `Archive` payload, keyed by its absolute source path.
-fn seed_decl_submit(abs: &str) -> proc_macro2::TokenStream {
+/// The `inventory::submit!` that makes an archive provisionable.
+///
+/// Every field is a const expression, so this works equally from a string
+/// literal baked by `mount_archive!` and from `HANDLE.oid()` in `#[needs]` —
+/// no path is stored and no manifest is re-read at runtime.
+fn seed_decl_submit_expr(
+    name: &proc_macro2::TokenStream,
+    oid: &proc_macro2::TokenStream,
+    size: &proc_macro2::TokenStream,
+    payload_ident: &str,
+) -> proc_macro2::TokenStream {
+    let payload = syn::Ident::new(payload_ident, Span::call_site());
     quote! {
         ::ztest::__private::inventory::submit! {
             ::ztest::inventory::SeedDecl {
-                source: #abs,
-                payload: ::ztest::inventory::SeedPayload::Archive,
+                name: #name,
+                oid: #oid,
+                size: #size,
+                payload: ::ztest::inventory::SeedPayload::#payload,
             }
         }
     }
 }
 
+/// [`seed_decl_submit_expr`] for an archive whose manifest was read at this
+/// call site, so the values are literals rather than handle accessors.
+fn seed_decl_submit(baked: &BakedArchive, payload_ident: &str) -> proc_macro2::TokenStream {
+    let (name, oid, size) = (&baked.name, &baked.oid, baked.size);
+    seed_decl_submit_expr(
+        &quote! { #name },
+        &quote! { #oid },
+        &quote! { #size },
+        payload_ident,
+    )
+}
+
 /// The `inventory::submit!` for one test→resource edge. `resource` is a const
-/// expression yielding the absolute source path (a string literal for
-/// `#[archive]`, or `HANDLE.source()` for `#[needs]`).
+/// expression yielding the archive's OID — the same identity the paired
+/// `SeedDecl` carries, so both resolve to one node in the resource graph.
 fn test_dep_submit(
     fn_ident: &syn::Ident,
     resource: &proc_macro2::TokenStream,
@@ -705,44 +723,6 @@ fn test_dep_submit(
     }
 }
 
-/// `#[ztest::archive(NAME = "rel/path.tar.gz")]` — declare + depend + bind, on one
-/// test. Resolves the path against the caller's `CARGO_MANIFEST_DIR` at compile
-/// time (same rule as `mount_archive!`), submits the provisionable `SeedDecl` and
-/// the per-test `TestDepDecl`, and binds a fn-local `const NAME: ArchiveHandle` the
-/// body passes to `with_regtest_cache`. Stacks with `#[ztest::qos::*]`.
-#[proc_macro_attribute]
-pub fn archive(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let HandleDecl { name, source } = parse_macro_input!(attr as HandleDecl);
-    let abs = match resolve_source(&source) {
-        Ok(p) => p,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let abs = abs.to_string_lossy().into_owned();
-
-    let mut func = match syn::parse::<ItemFn>(item) {
-        Ok(f) => f,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let ident = func.sig.ident.clone();
-
-    // fn-local typed handle, bound before the body runs. `dead_code` allowed so a
-    // declared-but-unused handle is a (harmless) over-provision, not a build error.
-    let bind: syn::Stmt = syn::parse_quote! {
-        #[allow(dead_code)]
-        const #name: ::ztest::ArchiveHandle = ::ztest::ArchiveHandle::__new(#abs);
-    };
-    func.block.stmts.insert(0, bind);
-
-    let seed = seed_decl_submit(&abs);
-    let dep = test_dep_submit(&ident, &quote! { #abs });
-    quote! {
-        #seed
-        #dep
-        #func
-    }
-    .into()
-}
-
 // ───────────────────────── qos tier attributes ────────────────────────
 
 /// `#[ztest::qos::basic]` — declare a test's quality-of-service tier.
@@ -750,7 +730,7 @@ pub fn archive(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// The tier attributes (`basic`, `wallet`, `integration`, `testnet`, `sync`)
 /// wrap a test, re-emit it intact (preserving any inner `#[tokio::test]` etc.),
 /// and inject two things — mirroring the `dev!` → inventory pattern:
-///   1. an `inventory::submit!` of a [`ztest::inventory::QosDecl`] so
+///   1. an `inventory::submit!` of a `ztest::inventory::QosDecl` so
 ///      `ztest run` can group selected tests by tier (the out-of-process
 ///      bridge, dumped via `ZTEST_DUMP_INVENTORY`);
 ///   2. a `::ztest::qos::__enter(class)` first statement so the runtime can
@@ -862,8 +842,7 @@ impl Parse for SyncTestArgs {
                 "tags" => {
                     let content;
                     syn::bracketed!(content in input);
-                    let items =
-                        content.parse_terminated(<LitStr as Parse>::parse, Token![,])?;
+                    let items = content.parse_terminated(<LitStr as Parse>::parse, Token![,])?;
                     tags = items.into_iter().collect();
                 }
                 other => {
@@ -881,13 +860,18 @@ impl Parse for SyncTestArgs {
             }
         }
 
-        let name = name
-            .ok_or_else(|| syn::Error::new(Span::call_site(), "sync_test requires `name = \"..\"`"))?;
-        let subject = subject.ok_or_else(|| {
-            syn::Error::new(Span::call_site(), "sync_test requires `subject = wallet|indexer|validator`")
+        let name = name.ok_or_else(|| {
+            syn::Error::new(Span::call_site(), "sync_test requires `name = \"..\"`")
         })?;
-        let qos = qos
-            .ok_or_else(|| syn::Error::new(Span::call_site(), "sync_test requires `qos = <tier>`"))?;
+        let subject = subject.ok_or_else(|| {
+            syn::Error::new(
+                Span::call_site(),
+                "sync_test requires `subject = wallet|indexer|validator`",
+            )
+        })?;
+        let qos = qos.ok_or_else(|| {
+            syn::Error::new(Span::call_site(), "sync_test requires `qos = <tier>`")
+        })?;
         let subj = subject.to_string();
         if !matches!(subj.as_str(), "wallet" | "indexer" | "validator") {
             return Err(syn::Error::new(
@@ -897,8 +881,7 @@ impl Parse for SyncTestArgs {
         }
         Ok(SyncTestArgs {
             name,
-            description: description
-                .unwrap_or_else(|| LitStr::new("", Span::call_site())),
+            description: description.unwrap_or_else(|| LitStr::new("", Span::call_site())),
             subject,
             timeout: timeout.unwrap_or_else(|| LitStr::new("48h", Span::call_site())),
             qos,
@@ -911,12 +894,17 @@ impl Parse for SyncTestArgs {
 /// `async fn(mut run: SyncRunner) -> SyncOutcome`.
 ///
 /// Emits two things (mirroring the QoS attribute's out-of-process bridge):
-/// 1. an `inventory::submit!` of a [`SyncTestDecl`](ztest::inventory::SyncTestDecl)
+/// 1. an `inventory::submit!` of a `ztest::inventory::SyncTestDecl`
 ///    carrying the static metadata, so `ztest sync list`/`describe` and QoS
 ///    admission can see the profile without running its body;
 /// 2. a `#[tokio::test]` wrapper that constructs a `SyncRunner`, runs the body,
-///    and asserts the outcome passed — the CI-gating (pod-per-test) owner. The
-///    `ztest sync start` owner runs the same body detached (see the CLI).
+///    and asserts the outcome passed.
+///
+/// The wrapper is a real libtest test only because that is how `ztest sync
+/// start` invokes it in the detached pod (`<bin> --exact <test>`), and it is the
+/// *only* thing that runs it: `ztest run` subtracts every profile from its
+/// selection using the declaration in (1). A sync profile has a 48 h cap and a
+/// PVC-backed datadir, so the engine is not its lifecycle owner.
 #[proc_macro_attribute]
 pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as SyncTestArgs);
@@ -981,6 +969,417 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __outcome
             );
         }
+    }
+    .into()
+}
+
+// ───────────────────── archive manifests ─────────────────────
+//
+// Every archive resource — a pre-synced testnet chain, a regtest chain cache,
+// an opaque fixture tarball — is declared the same way and carries the same
+// identity. The sidecar `<stem>.toml` is what makes that possible: it records
+// the archive's `sha256` and `size_bytes`, which are *exactly* the committed
+// Git LFS pointer's `oid` and `size` (an LFS object id is the SHA-256 of the
+// file). The manifest is plaintext and never LFS-tracked, so it is readable in
+// every checkout and every build context, and the identity bakes with no `git`
+// invocation and no access to the archive bytes.
+//
+// This is the whole reason there is one macro here instead of two. The old
+// `testnet_snapshot!` derived a filename from typed arguments and parsed the
+// manifest; `#[archive]` took a literal path and did not. Both were "declare an
+// archive"; the manifest was always the source of truth for what the archive
+// *is*.
+
+/// Compound suffixes that name a tar stream. Longest-first: `.tar.zst` must win
+/// over `.zst`, or the manifest for `chain.tar.zst` is looked for at
+/// `chain.tar.toml`.
+const ARCHIVE_SUFFIXES: &[&str] = &[".tar.zst", ".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".tar"];
+
+/// The sidecar manifest path for a source: same directory, archive suffix
+/// replaced with `.toml`.
+///
+/// A filename is not a reliable place to split on `.` — the chain fixtures are
+/// named `zebra-v6.2.3-testnet-286000.tar.zst`, whose *first* dot is inside the
+/// version. So the known compound suffixes are stripped explicitly, and
+/// anything else falls back to dropping one final extension (`blob.bin` →
+/// `blob.toml`).
+fn manifest_path(source_abs: &std::path::Path) -> std::path::PathBuf {
+    let name = source_abs
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = ARCHIVE_SUFFIXES
+        .iter()
+        .find_map(|suf| name.strip_suffix(suf))
+        .map(str::to_owned)
+        .unwrap_or_else(|| match name.rsplit_once('.') {
+            Some((s, _)) => s.to_owned(),
+            None => name.clone(),
+        });
+    source_abs.with_file_name(format!("{stem}.toml"))
+}
+
+/// Read `key` from `table` as a `u64`, or produce a located error naming the
+/// manifest — a manifest missing a field is a producer bug, and the consumer
+/// should say which file and which field rather than defaulting.
+fn manifest_int(
+    table: &toml::Value,
+    key: &str,
+    manifest: &std::path::Path,
+    span: Span,
+) -> Result<u64, syn::Error> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_integer)
+        .and_then(|v| u64::try_from(v).ok())
+        .ok_or_else(|| {
+            syn::Error::new(
+                span,
+                format!(
+                    "manifest {} is missing a non-negative integer `{key}`",
+                    manifest.display()
+                ),
+            )
+        })
+}
+
+/// Read `key` from `table` as a string, with the same contract as
+/// [`manifest_int`].
+fn manifest_str(
+    table: &toml::Value,
+    key: &str,
+    manifest: &std::path::Path,
+    span: Span,
+) -> Result<String, syn::Error> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            syn::Error::new(
+                span,
+                format!(
+                    "manifest {} is missing a string `{key}`",
+                    manifest.display()
+                ),
+            )
+        })
+}
+
+/// Collect the integer-valued entries of a `[activations]`-shaped table into
+/// `(key, height)` pairs, ascending by height.
+///
+/// Non-integer entries are skipped rather than rejected: `[activations]`
+/// carries the nested `above_tip` table alongside its scalars, and that nesting
+/// is the manifest's shape, not a defect.
+fn activation_pairs(table: Option<&toml::Value>) -> Vec<(String, u32)> {
+    let Some(table) = table.and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u32)> = table
+        .iter()
+        .filter_map(|(k, v)| {
+            let h = v.as_integer().and_then(|i| u32::try_from(i).ok())?;
+            Some((k.clone(), h))
+        })
+        .collect();
+    out.sort_by_key(|(_, h)| *h);
+    out
+}
+
+/// Render `(key, height)` pairs as a `&'static [Activation]` literal.
+fn activation_slice(pairs: &[(String, u32)]) -> proc_macro2::TokenStream {
+    let entries = pairs.iter().map(|(k, h)| {
+        quote! { ::ztest::Activation { key: #k, height: #h } }
+    });
+    quote! { &[ #(#entries),* ] }
+}
+
+/// An archive's baked identity: the tokens for its `ArchiveHandle` plus the
+/// pieces the inventory declarations need as separate values.
+struct BakedArchive {
+    /// A const expression evaluating to `::ztest::ArchiveHandle`.
+    handle: proc_macro2::TokenStream,
+    name: String,
+    oid: String,
+    size: u64,
+}
+
+/// Parse `source_abs`'s sidecar manifest and bake it into an `ArchiveHandle`.
+///
+/// Required of every archive: `sha256` and `size_bytes`, the identity. The
+/// `[chain]`-shaped fields (`backend`, `network`, `version`, `tip_height`, …)
+/// are required as a *set* — present together on a validator state snapshot,
+/// absent together on an opaque blob — so a manifest that lists half of them is
+/// a producer bug reported by name rather than a handle that silently claims
+/// less than the artifact carries.
+fn bake_archive(source_abs: &std::path::Path, span: Span) -> Result<BakedArchive, syn::Error> {
+    let manifest_abs = manifest_path(source_abs);
+    if !manifest_abs.is_file() {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "archive {} has no sidecar manifest at {}\n\
+                 every archive needs one: it carries the `sha256`/`size_bytes` that are \
+                 the archive's Git LFS identity, and it is the only part of the artifact \
+                 readable in a build pod or a checkout that has not run `git lfs pull`. \
+                 Produce it with scripts/produce-chain-fixture.sh, or hand-write one with \
+                 just those two fields for a non-chain archive.",
+                source_abs.display(),
+                manifest_abs.display()
+            ),
+        ));
+    }
+    let text = std::fs::read_to_string(&manifest_abs).map_err(|e| {
+        syn::Error::new(
+            span,
+            format!("reading manifest {}: {e}", manifest_abs.display()),
+        )
+    })?;
+    let doc: toml::Value = toml::from_str(&text).map_err(|e| {
+        syn::Error::new(
+            span,
+            format!("manifest {} is not valid TOML: {e}", manifest_abs.display()),
+        )
+    })?;
+
+    let oid = manifest_str(&doc, "sha256", &manifest_abs, span)?;
+    if oid.len() != 64 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "manifest {} records sha256 = {oid:?}, which is not a 64-character hex \
+                 digest; it must be the SHA-256 of the archive, which is also its Git LFS \
+                 object id",
+                manifest_abs.display()
+            ),
+        ));
+    }
+    let oid = oid.to_ascii_lowercase();
+    let size = manifest_int(&doc, "size_bytes", &manifest_abs, span)?;
+
+    let name = source_abs
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let chain = bake_chain_info(&doc, &manifest_abs, span)?;
+    let handle = quote! {
+        ::ztest::ArchiveHandle::__new(#name, #oid, #size, #chain)
+    };
+    Ok(BakedArchive {
+        handle,
+        name,
+        oid,
+        size,
+    })
+}
+
+/// The `Option<ChainInfo>` literal for a manifest: `Some` when it describes a
+/// validator state directory, `None` when the archive is an opaque blob.
+///
+/// `tip_height` is the discriminator — an archive either is a chain pinned at a
+/// height or it is not — and once it is present every other chain field is
+/// required, so a half-filled manifest fails at the producer rather than at the
+/// consumer that reads a field the archive never recorded.
+fn bake_chain_info(
+    doc: &toml::Value,
+    manifest_abs: &std::path::Path,
+    span: Span,
+) -> Result<proc_macro2::TokenStream, syn::Error> {
+    if doc.get("tip_height").is_none() {
+        return Ok(quote! { ::core::option::Option::None });
+    }
+
+    let backend = manifest_str(doc, "backend", manifest_abs, span)?;
+    let backend_variant = match backend.as_str() {
+        "zebra" => "Zebra",
+        "zcashd" => "Zcashd",
+        other => {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "manifest {} records backend = {other:?}; expected \"zebra\" or \"zcashd\"",
+                    manifest_abs.display()
+                ),
+            ));
+        }
+    };
+    let network = manifest_str(doc, "network", manifest_abs, span)?;
+    let network_variant = match network.as_str() {
+        "mainnet" => "Mainnet",
+        "testnet" => "Testnet",
+        "regtest" => "Regtest",
+        other => {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "manifest {} records network = {other:?}; expected \"mainnet\", \
+                     \"testnet\" or \"regtest\"",
+                    manifest_abs.display()
+                ),
+            ));
+        }
+    };
+    let backend_ident = syn::Ident::new(backend_variant, Span::call_site());
+    let network_ident = syn::Ident::new(network_variant, Span::call_site());
+
+    let version = manifest_str(doc, "version", manifest_abs, span)?;
+    let tip_height = manifest_int(doc, "tip_height", manifest_abs, span)? as u32;
+    let tip_hash = manifest_str(doc, "tip_hash", manifest_abs, span)?;
+    let db_format = manifest_int(doc, "db_format", manifest_abs, span)? as u32;
+    let uncompressed_bytes = manifest_int(doc, "uncompressed_bytes", manifest_abs, span)?;
+
+    let activations = activation_slice(&activation_pairs(doc.get("activations")));
+    let above_tip = activation_slice(&activation_pairs(
+        doc.get("activations").and_then(|a| a.get("above_tip")),
+    ));
+    let boundary = bake_boundary_check(doc, manifest_abs, span)?;
+
+    Ok(quote! {
+        ::core::option::Option::Some(::ztest::ChainInfo::__new(
+            ::ztest::ArchiveBackend::#backend_ident,
+            ::ztest::ArchiveNetwork::#network_ident,
+            #version,
+            #tip_height,
+            #tip_hash,
+            #db_format,
+            #uncompressed_bytes,
+            #activations,
+            #above_tip,
+            #boundary,
+        ))
+    })
+}
+
+/// The `Option<BoundaryCheck>` literal for a manifest's `[boundary_check]`.
+///
+/// Absent is legitimate — an upgrade that introduces no value pool (Blossom)
+/// has nothing to prove non-vacuous — but a *partial* table is a producer bug.
+fn bake_boundary_check(
+    doc: &toml::Value,
+    manifest_abs: &std::path::Path,
+    span: Span,
+) -> Result<proc_macro2::TokenStream, syn::Error> {
+    let Some(b) = doc.get("boundary_check") else {
+        return Ok(quote! { ::core::option::Option::None });
+    };
+    let pool = manifest_str(b, "pool", manifest_abs, span)?;
+    let from_height = manifest_int(b, "from_height", manifest_abs, span)? as u32;
+    let to_height = manifest_int(b, "to_height", manifest_abs, span)? as u32;
+    let (Some(value_before), Some(value_after)) = (
+        b.get("value_before").and_then(toml::Value::as_integer),
+        b.get("value_after").and_then(toml::Value::as_integer),
+    ) else {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "manifest {} has a [boundary_check] table missing an integer \
+                 `value_before` or `value_after`",
+                manifest_abs.display()
+            ),
+        ));
+    };
+    Ok(quote! {
+        ::core::option::Option::Some(::ztest::BoundaryCheck {
+            pool: #pool,
+            from_height: #from_height,
+            to_height: #to_height,
+            value_before: #value_before,
+            value_after: #value_after,
+        })
+    })
+}
+
+/// `ztest::archive!([pub] NAME = "rel/path.tar.zst")` — bind a module-level
+/// `const NAME: ArchiveHandle`.
+///
+/// The out-of-line form, for an archive consumed through a shared helper or
+/// shipped as a named default (see `ztest::snapshots`). It binds the handle and
+/// nothing else: no `SeedDecl`. When this is invoked from a module of nothing
+/// but `const`s, the linker has no reason to keep the object file holding
+/// `inventory::submit!`'s constructor, so the declaration would compile, link,
+/// and contribute nothing. The test crate submits the seed and its per-test
+/// edge with `#[ztest::needs(NAME)]`, which also gives preflight the
+/// granularity to provision only the archives the selected tests need.
+#[proc_macro]
+pub fn archive(input: TokenStream) -> TokenStream {
+    let ConstDecl {
+        attrs,
+        vis,
+        name,
+        source,
+    } = parse_macro_input!(input as ConstDecl);
+    let abs = match resolve_source(&source) {
+        Ok(p) => p,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let baked = match bake_archive(&abs, name.span()) {
+        Ok(b) => b,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let handle = baked.handle;
+    quote! {
+        #(#attrs)*
+        #vis const #name: ::ztest::ArchiveHandle = #handle;
+    }
+    .into()
+}
+
+/// `[#attrs] [pub] NAME = "rel/path"` — the module-level const form.
+struct ConstDecl {
+    attrs: Vec<syn::Attribute>,
+    vis: syn::Visibility,
+    name: syn::Ident,
+    source: LitStr,
+}
+
+impl Parse for ConstDecl {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let attrs = input.call(syn::Attribute::parse_outer)?;
+        let vis: syn::Visibility = input.parse()?;
+        let name: syn::Ident = input.parse()?;
+        let _: Token![=] = input.parse()?;
+        let source: LitStr = input.parse()?;
+        let _ = input.parse::<Option<Token![,]>>();
+        Ok(ConstDecl {
+            attrs,
+            vis,
+            name,
+            source,
+        })
+    }
+}
+
+/// `#[ztest::needs(NAME)]` — depend on an archive declared out of line.
+///
+/// The companion to [`archive`]: the handle is already bound (by
+/// `ztest::archive!`, in this crate or in `ztest::snapshots`), and this
+/// attribute contributes the two inventory declarations that make it
+/// provisionable and bind it to *this* test — so `ztest run` pre-provisions the
+/// seed and cleanly SKIPs only the tests whose archive failed.
+///
+/// Every field the `SeedDecl` needs is a `const fn` on the handle, so the
+/// submission is a const expression and no path or manifest is re-read here.
+#[proc_macro_attribute]
+pub fn needs(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let handle = parse_macro_input!(attr as syn::Path);
+    let func = match syn::parse::<ItemFn>(item) {
+        Ok(f) => f,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let ident = func.sig.ident.clone();
+    let seed = seed_decl_submit_expr(
+        &quote! { #handle.name() },
+        &quote! { #handle.oid() },
+        &quote! { #handle.size() },
+        "Archive",
+    );
+    let dep = test_dep_submit(&ident, &quote! { #handle.oid() });
+    quote! {
+        #seed
+        #dep
+        #func
     }
     .into()
 }

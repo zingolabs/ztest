@@ -1,4 +1,4 @@
-//! Live during-run snapshot of QoS admission (`docs/qos-design.md` §8).
+//! Live during-run snapshot of QoS admission (`docs/design-qos.md` §8).
 //!
 //! Plain summary types: `engine::panel` folds the [`Scheduler`](super::scheduler::Scheduler)'s
 //! live leases into a [`LiveSnapshot`] for the run panel to render.

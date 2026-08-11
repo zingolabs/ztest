@@ -159,6 +159,10 @@ impl ValidatorBackend for ZcashdValidator {
         COMPONENT
     }
 
+    fn is_regtest(&self) -> bool {
+        self.plumbing.regtest
+    }
+
     fn pod_spec(
         &self,
         opts: &crate::component::ComponentOpts,
@@ -180,6 +184,7 @@ impl ValidatorBackend for ZcashdValidator {
             env: opts.env.clone(),
             fs_group: Some(2001),
             run_as_user: None,
+            supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
             guaranteed: None,
             image_pull_secret: crate::backends::image::pull_secret(),
@@ -269,6 +274,18 @@ impl ValidatorBackend for ZcashdValidator {
     async fn best_block_hash(&self) -> Result<BlockHash, RpcError> {
         ZcashRpc::new(COMPONENT, &self.rpc_client().await?)
             .best_block_hash()
+            .await
+    }
+
+    async fn invalidate_block(&self, hash: &BlockHash) -> Result<(), RpcError> {
+        ZcashRpc::new(COMPONENT, &self.rpc_client().await?)
+            .invalidate_block(hash)
+            .await
+    }
+
+    async fn reconsider_block(&self, hash: &BlockHash) -> Result<(), RpcError> {
+        ZcashRpc::new(COMPONENT, &self.rpc_client().await?)
+            .reconsider_block(hash)
             .await
     }
 

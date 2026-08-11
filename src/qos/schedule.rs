@@ -1,4 +1,4 @@
-//! Pre-run scheduling plan for the preflight banner (`docs/qos-design.md` §8).
+//! Pre-run scheduling plan for the preflight banner (`docs/design-qos.md` §8).
 //!
 //! Distinct from [`super::scheduler`] (one letter apart, deliberately): that is
 //! the live admission core; this is a pure `(tier counts, capacity) -> plan`

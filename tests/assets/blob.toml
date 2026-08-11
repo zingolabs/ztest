@@ -1,0 +1,6 @@
+# Manifest for a compile-shape test asset, hand-written. See archive.toml.
+#
+# A `mount_file!` seed: copied verbatim rather than extracted, which is
+# `MountKind`'s business — the identity fields here are identical either way.
+sha256     = "328975f24457d58da82eb3d42151ced7f78a04209724bc41f20c51ce49e45c0b"
+size_bytes = 7

@@ -37,10 +37,10 @@ pub(crate) fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
             Ok(InventoryLine::Qos(q)) => dumped.qos.push(q),
             Ok(InventoryLine::Seed(s)) => dumped.seeds.push(s),
             Ok(InventoryLine::Dep(d)) => dumped.deps.push(d),
-            // Sync-test declarations feed the `ztest sync` controller: `start`
-            // resolves a profile name → its `test_id` (hence binary + libtest
-            // test) from these; `ztest run`'s image/seed/qos discovery ignores
-            // them (they carry no resources).
+            // Sync-test declarations feed the `ztest sync` controller (`start`
+            // resolves a profile name → its `test_id`, hence binary + libtest
+            // test) and `ztest run`'s selection prune, which is the only way the
+            // engine can tell a profile from an ordinary `#[tokio::test]`.
             Ok(InventoryLine::SyncTest(s)) => dumped.sync_tests.push(s),
             Err(e) => return Err(format!("malformed inventory line `{line}`: {e}")),
         }
@@ -68,8 +68,14 @@ pub enum DumpOutcome {
         deps_by_binary: Vec<(String, Vec<TestDepEntry>)>,
         /// `#[ztest::sync_test]` profiles across the selection (deduped by
         /// `test_id`). The `ztest sync` controller resolves a profile name to its
-        /// binary + libtest test from these; `ztest run` ignores them.
+        /// binary + libtest test from these.
         sync_tests: Vec<SyncTestEntry>,
+        /// Per-binary sync profiles, undeduped: the exclusion edge `ztest run`
+        /// subtracts from its work-list. Binary-scoped for the same reason as
+        /// `deps_by_binary` — a profile's libtest name can collide with an
+        /// ordinary test in another binary, and dropping that one would silently
+        /// shrink the run.
+        sync_by_binary: Vec<(String, Vec<SyncTestEntry>)>,
     },
     /// One or more binaries failed to dump (non-zero exit, stderr captured). The
     /// CLI surfaces this and aborts before provisioning.
@@ -114,6 +120,7 @@ pub(crate) fn assemble(
     let mut deps_by_binary: Vec<(String, Vec<TestDepEntry>)> = Vec::new();
     let mut seen_sync: BTreeSet<String> = BTreeSet::new();
     let mut sync_tests: Vec<SyncTestEntry> = Vec::new();
+    let mut sync_by_binary: Vec<(String, Vec<SyncTestEntry>)> = Vec::new();
 
     for (bin, dumped) in binaries.iter().zip(dumps) {
         let Dumped {
@@ -138,7 +145,10 @@ pub(crate) fn assemble(
             images_by_binary.push((bin.binary_id.clone(), bin_images));
         }
         for e in s {
-            if seen_seed.insert((e.source.clone(), e.payload)) {
+            // Dedup on the OID: the same artifact declared from two binaries is
+            // one seed, and content addressing makes that true without the two
+            // needing to agree on where the file lives.
+            if seen_seed.insert((e.oid.clone(), e.payload)) {
                 seeds.push(e);
             }
         }
@@ -150,6 +160,11 @@ pub(crate) fn assemble(
         }
         // Sync profiles dedup by `test_id` across binaries (a profile is defined
         // once, but a shared helper crate could link it into several binaries).
+        // The per-binary edge keeps every copy: each binary that links a profile
+        // must have it excluded from that binary's selection.
+        if !syncs.is_empty() {
+            sync_by_binary.push((bin.binary_id.clone(), syncs.clone()));
+        }
         for st in syncs {
             if seen_sync.insert(st.test_id.clone()) {
                 sync_tests.push(st);
@@ -163,6 +178,7 @@ pub(crate) fn assemble(
             images_by_binary,
             deps_by_binary,
             sync_tests,
+            sync_by_binary,
         },
         qos_by_binary,
     )

@@ -55,7 +55,7 @@ Kubernetes code, and walks the DAG both directions:
 | Provider | probe | provision | lifetime | teardown |
 |---|---|---|---|---|
 | `ImageProvider` | `exists_in_kind(tag)` | build + kind load | `Cached` | no-op |
-| `SeedProvider` | seed PVC label `ready=true` | uploader-pod materialize | `Cached` | no-op |
+| `SeedProvider` | seed PVC label `ready=true` | puller-Job materialize | `Cached` | no-op |
 | `SnapshotProvider` | snapshot `readyToUse` | create from seed | `Cached` | no-op |
 
 New resource kind = new `Provider` impl, not a new phase.
@@ -131,75 +131,53 @@ scheduler ([design-qos.md](design-qos.md)) decides *what fits*.
 
 ## Storage byte-source (`src/storage/`)
 
-`storage` abstracts **where a seed's bytes come from**, decoupled from how they
-are materialised into a `seed-{sha8}` PVC. Same shape as `ImageProvider`: one
-trait, file-per-backend, one selection point.
+`storage` answers **where a seed's bytes come from**. There is one answer: the
+snapshot bucket (`r2.rs`), addressed by OID.
 
-Two orthogonal axes:
+### Identity is the OID
 
-- **LFS blob storage** — where multi-GB `.tar.zst` blobs live off the git object
-  store: Git LFS + `.lfsconfig` pointing at a self-hosted rudolfs server. Pure
-  git-layer config, no ztest code.
-- **Provision-time byte production** — how ztest gets a seed's real bytes into a
-  PVC when the working tree holds only an LFS pointer. This module.
+A seed is a Git LFS object. Its identity is the `sha256`/`size_bytes` recorded in
+the artifact's sidecar `.toml`, which are *exactly* the committed LFS pointer's
+`oid`/`size` — an LFS object id is the SHA-256 of the file. The manifest is
+plaintext, never LFS-tracked, and present in every checkout and every build
+context, so `archive!` bakes the identity at expansion time with no `git` and no
+access to the archive bytes.
 
-### Dispatch by content-sniffing
+`storage::seed_sha8(oid)` names the PVC `seed-{oid[..8]}`. It is a pure function
+of a compile-time constant, so the laptop, the build pod, the runner pod and the
+puller Job all derive the same name without any of them reading the file.
 
-A seed source (the macro-baked absolute path from `#[ztest::archive]` /
-`mount_file!`) is classified per file by sniffing for an LFS pointer, not by an
-env var:
+> **What this replaced.** Identity used to be the archive's *path*, hashed at
+> runtime, with a `Local` backend for a real file and an `Lfs` backend for a
+> pointer. That works on a laptop and nowhere else: under on-cluster compile the
+> path is `/src/…` inside a build container, which exists on no other machine —
+> so every seeded test failed with "does not exist", naming a path that had never
+> been openable where the error was raised. `Local`, the pointer sniffing, and
+> the path-addressed `seed-unresolved-*` placeholder are all gone with it.
 
-- real archive/blob on disk → `Local` — streamed straight off disk.
-- Git LFS pointer, blob absent → `Lfs` — fetched from the server.
+### Who moves bytes
 
-`git lfs pull` turns a pointer into a real file, which then takes the `Local`
-path. `ZTEST_LFS_URL` configures only *where* the server is, never *whether* to
-use LFS.
+Only the side holding credentials, and never through this process:
 
-### Content address (sha8 == oid == SHA-256)
+| | `provision_seed` (parent) | `await_seed` (test) |
+|---|---|---|
+| runs in | `ztest run` preflight | the runner pod, at `TestEnv::build` |
+| needs bucket creds | yes — the only thing that does | no |
+| needs the archive | no (only its OID) | no |
+| creates the PVC / Job | yes | no |
 
-`seeds::sha8` names a PVC `seed-{sha8}` by the SHA-256 of the `.tar.*` bytes. An
-LFS pointer's `oid` **is** that SHA-256, so:
+`provision_seed` presigns a GET for `lfs/<oid>` and hands the URL to a puller
+Job; the pod `curl`s it into `tar -x -C /seed` itself, so the transfer is R2 →
+node at cluster bandwidth. The URL is scoped to one object and one verb and
+expires, which is why no credential Secret is mounted into the cluster at all.
 
-- `storage::content_sha8` resolves a pointer's seed id from the pointer text
-  alone — no transfer needed to name the seed.
-- a cold CI run (fetches from LFS) and a warm laptop (`git lfs pull`ed) produce
-  the same `seed-{sha8}`, sharing the same content-addressed seed and snapshot.
+`await_seed` only waits. A seed missing there is a preflight bug — a test
+mounting an archive it never declared with `#[ztest::needs]` — and the error says
+so rather than timing out.
 
-`seeds::sha8` delegates to `content_sha8`, so every call site (materialize, the
-`SeedProvider` node, `cli snapshot`) is pointer-aware.
+### Compression
 
-### The `materialize::ensure_seed` seam
-
-`ensure_seed` couples to the byte source in two places, both routed through the
-backend:
-
-1. content address — `seeds::sha8` → `content_sha8`.
-2. byte production — the uploader-pod path uses
-   `storage::for_source(source)?.open()`, a `dyn AsyncRead`, in place of
-   `tokio::fs::File::open`.
-
-Compression is resolved by `backend.compression()` **before** `open()`, from the
-filename extension (both backends) with a magic-byte fallback for on-disk files.
-The uploader `tar` command is fixed before any download starts, and the LFS
-`open()` is deferred until the uploader pod is scheduled and ready on stdin — no
-HTTP connection is held across pod scheduling. Everything downstream (uploader
-pod, stdin attach, `ready` label, VolumeSnapshot, shadow clone) never learns which
-backend produced the bytes.
-
-### LFS backend (`lfs.rs`)
-
-Speaks the Git LFS batch API over HTTP to rudolfs, not the `git lfs` binary:
-
-```
-POST {endpoint}/objects/batch   {operation:"download", objects:[{oid,size}]}
-  → {objects:[{actions:{download:{href, header}}}]}
-GET  href                        (streamed into the uploader pod's stdin)
-```
-
-No git checkout, no `git-lfs` binary, so it runs anywhere the orchestrator does.
-
-**Endpoint resolution order:** `ZTEST_LFS_URL` (with optional `ZTEST_LFS_TOKEN` →
-`Authorization: Bearer`), else the `[lfs] url` of the nearest `.lfsconfig` walking
-up from the source. A pointer with neither configured fails fast with an
-actionable error before any pod is created.
+Derived from the artifact's filename (`compression_from_name`), which the
+manifest records. There is no magic-byte fallback because there are no local
+bytes to sniff, and GNU `tar` cannot auto-detect on the non-seekable pipe the
+puller feeds it — so the flag is resolved before the Job is created.

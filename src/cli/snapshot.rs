@@ -14,8 +14,7 @@ use clap::{Parser, Subcommand};
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams};
 use kube::{Client, ResourceExt};
 
-use crate::materialize::Payload;
-use crate::seeds::{SEEDS_NAMESPACE, sha8};
+use crate::seeds::SEEDS_NAMESPACE;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 
 const READY_LABEL: &str = "seeds.ztest.io/ready";
@@ -33,7 +32,7 @@ enum SnapshotCmd {
     List,
 
     /// Delete cached seeds (PVCs + paired VolumeSnapshots) and any
-    /// orphaned cluster-scoped shadow VolumeSnapshotContents.
+    /// orphaned cluster-scoped seed-binding VolumeSnapshotContents.
     Prune(PruneArgs),
 
     /// Pre-materialize one or more local archives into seeds without
@@ -197,13 +196,17 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
         println!("pruned {name}");
     }
 
-    // Sweep orphaned cluster-scoped shadow VolumeSnapshotContents: their
-    // `Retain` policy means a crashed test can leave them behind.
+    // Sweep orphaned cluster-scoped seed-binding VolumeSnapshotContents: their
+    // `Retain` policy means a crashed test can leave them behind. Matched by
+    // name prefix rather than by label, because this is the sweep of last
+    // resort — it has to catch a content whose labels never landed. Deleting
+    // one is always safe: `Retain` means the backend snapshot it points at
+    // belongs to the seed, not to the binding.
     let vsc_api: Api<DynamicObject> = Api::all_with(client.clone(), &volume_snapshot_content_ar());
     if let Ok(vscs) = vsc_api.list(&ListParams::default()).await {
         for vsc in vscs.items {
             let n = vsc.name_any();
-            if n.starts_with("shadow-vsc-") {
+            if n.starts_with(crate::seeds::BINDING_PREFIX) {
                 match vsc_api.delete(&n, &dp).await {
                     Ok(_) => println!("pruned orphan {n}"),
                     Err(kube::Error::Api(e)) if e.code == 404 => {}
@@ -215,16 +218,28 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Pre-provision the seeds for the archives named on the command line.
+///
+/// The archive file itself is never opened: its identity comes from the sidecar
+/// manifest and its bytes come from the bucket. So this works in a checkout that
+/// has never run `git lfs pull` — the same property that lets a build pod
+/// declare a seed it has no way to read.
 async fn warm(client: &Client, args: &WarmArgs) -> Result<(), String> {
     for archive in &args.archives {
-        if !archive.exists() {
-            return Err(format!("archive not found: {}", archive.display()));
-        }
-        let sha = sha8(archive).map_err(|e| format!("hashing {}: {e}", archive.display()))?;
-        eprintln!("• warming seed-{sha} from {}", archive.display());
-        crate::materialize::ensure_seed(client, archive, Payload::Archive)
+        let (name, oid, size) = crate::archive::identity_from_manifest(archive)?;
+        let entry = crate::inventory::SeedEntry {
+            name,
+            oid,
+            size,
+            payload: crate::inventory::SeedPayload::Archive,
+        };
+        let sha = crate::storage::seed_sha8(&entry.oid).to_string();
+        eprintln!("• warming seed-{sha} from {}", entry.name);
+        // Line-based output with no panel to paint: the pull's sub-phases have
+        // nowhere to land here, and `warm` already brackets each seed.
+        crate::materialize::provision_seed(client, &entry, &crate::materialize::Silent)
             .await
-            .map_err(|e| format!("materializing {}: {e}", archive.display()))?;
+            .map_err(|e| format!("materializing {}: {e}", entry.name))?;
         println!("ready seed-{sha}");
     }
     Ok(())

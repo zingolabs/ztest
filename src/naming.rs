@@ -70,6 +70,19 @@ fn ppid() -> u32 {
     0
 }
 
+/// The invoking developer, slugged for use as a label *value*. The single
+/// source of truth for the `ztest.io/user` label: engine runs, detached syncs,
+/// and `ztest cleanup`'s "mine" filter must all derive the value the same way,
+/// or cleanup silently misses resources it owns.
+///
+/// Deliberately *not* `ZTEST_SA`: a shared remote ServiceAccount identifies the
+/// credential, not the person, so two developers on one SA would reap each
+/// other's namespaces.
+pub fn current_user() -> String {
+    let raw = std::env::var("USER").unwrap_or_else(|_| "anon".into());
+    slug(&raw, DNS_LABEL_MAX)
+}
+
 /// Short random token used as the namespace suffix. 8 hex chars; collision
 /// probability across realistic concurrent test counts is negligible.
 pub fn test_suffix() -> String {
@@ -103,22 +116,34 @@ pub const TEST_NAMESPACE_ENV: &str = "ZTEST_TEST_NAMESPACE";
 /// to nothing) yields `"x"` so the result is always a valid label that starts
 /// and ends alphanumeric. Used for both name fragments and label values (label
 /// values forbid `:`, so a raw `module::test` path must be slugged first).
+///
+/// `max` is a hard postcondition — `slug(s, n).len() <= n` for every `s` and
+/// every `n >= 1` — because callers feed the result straight to the API server,
+/// where one byte over the limit is a 422 and not a truncation.
 pub fn slug(s: &str, max: usize) -> String {
     let mut out = String::with_capacity(s.len().min(max));
     let mut pending_dash = false;
     for c in s.chars() {
-        if c.is_ascii_alphanumeric() {
-            if pending_dash && !out.is_empty() {
-                out.push('-');
-            }
-            pending_dash = false;
-            out.push(c.to_ascii_lowercase());
-            if out.len() >= max {
-                break;
-            }
-        } else {
+        if !c.is_ascii_alphanumeric() {
             pending_dash = true;
+            continue;
         }
+        // Reserve the separator together with the character it precedes, and
+        // check *before* writing either. Bounding only the alphanumeric — or
+        // testing the length after the push — lets the pair overshoot `max` by
+        // the separator's byte whenever truncation lands on a word boundary,
+        // which is how a 63-char cap once emitted a 64-byte label value and the
+        // API server rejected the whole namespace. Emitting the separator only
+        // as part of a pair is also what makes a trailing `-` unrepresentable.
+        let needed = usize::from(pending_dash && !out.is_empty()) + 1;
+        if out.len() + needed > max {
+            break;
+        }
+        if needed == 2 {
+            out.push('-');
+        }
+        pending_dash = false;
+        out.push(c.to_ascii_lowercase());
     }
     if out.is_empty() { "x".to_string() } else { out }
 }
@@ -169,6 +194,58 @@ mod tests {
         // empty / all-separator input never yields an empty (invalid) label
         assert_eq!(slug("", 8), "x");
         assert_eq!(slug("::__::", 8), "x");
+    }
+
+    /// The separator used to be written without a bounds check, so a slug whose
+    /// truncation point landed on a word boundary came back one byte over `max`.
+    /// At `DNS_LABEL_MAX` that is a 64-byte label value, which the API server
+    /// rejects with a 422 that fails the test rather than the name.
+    #[test]
+    fn slug_never_exceeds_max_when_truncating_on_a_word_boundary() {
+        // The exact input that produced a 64-byte value: `...scriptpubkey`
+        // fills the slug to 62, so the next word costs a separator plus a
+        // character and lands on 64.
+        let s = slug(
+            "testnet::tests::output_addresses_are_read_from_both_scriptpubkey_shapes",
+            DNS_LABEL_MAX,
+        );
+        assert!(s.len() <= DNS_LABEL_MAX, "{} bytes: {s}", s.len());
+    }
+
+    /// The postcondition is the whole point of the `max` parameter, so assert it
+    /// as one — over every cap a caller could pass, against inputs whose word
+    /// boundaries fall at different offsets. A single hand-picked case only
+    /// covers the one offset it happens to hit.
+    #[test]
+    fn slug_postconditions_hold_at_every_cap() {
+        let inputs = [
+            "testnet::tests::output_addresses_are_read_from_both_scriptpubkey_shapes",
+            "fetch_service::get_block_range_no_pools_returns_sapling_orchard::case_2_zcashd",
+            "a_bb_ccc_dddd_eeeee_ffffff_ggggggg_hhhhhhhh_iiiiiiiii_jjjjjjjjjj",
+            "x",
+            "::__::",
+            "",
+        ];
+        for input in inputs {
+            for max in 1..=80 {
+                let s = slug(input, max);
+                assert!(
+                    s.len() <= max,
+                    "slug({input:?}, {max}) returned {} bytes: {s}",
+                    s.len()
+                );
+                assert!(!s.is_empty(), "slug({input:?}, {max}) was empty");
+                assert!(
+                    s.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                    "slug({input:?}, {max}) is not DNS-1123 safe: {s}"
+                );
+                assert!(
+                    !s.starts_with('-') && !s.ends_with('-'),
+                    "slug({input:?}, {max}) has a bare separator at an end: {s}"
+                );
+            }
+        }
     }
 
     #[test]

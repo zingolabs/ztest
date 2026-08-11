@@ -1,9 +1,9 @@
 //! In-process zingolib wallet backend.
 //!
 //! Implements ztest's
-//! [`WalletBackend`](crate::handles::wallet::WalletBackend) by running zingolib
+//! [`WalletBackend`] by running zingolib
 //! `LightClient`s in the test binary against a pod-hosted indexer's gRPC.
-//! [`to_configured`] crosses the validator's [`ActivationHeights`] into
+//! The backend crosses the validator's [`ActivationHeights`] into
 //! zingolib's `ChainType::Regtest`; zingolib does no implicit fill-in, so every
 //! activated height is carried across explicitly.
 
@@ -72,7 +72,7 @@ impl WalletConfig for ZingoBackend {
     }
 }
 
-/// Live in-process zingolib wallet handle. Holds one [`ClientEntry`] per
+/// Live in-process zingolib wallet handle. Holds one client entry per
 /// account; methods dispatch to the matching client. Cheaply cloneable: clones
 /// share the same state.
 #[derive(Clone, Default)]
@@ -149,7 +149,6 @@ impl ZingoWallet {
             })
             .ok_or_else(|| format!("zingo: unknown account {account:?}").into())
     }
-
 }
 
 /// Cross ztest's [`ActivationHeights`] into zingolib's `ChainType::Regtest`
@@ -284,7 +283,7 @@ impl ZingoWallet {
     ///   one, so funding is just "mine `notes` blocks" with no maturity wait
     ///   and no shield round.
     /// - Transparent coinbase (zebrad, Transparent): a transparent coinbase
-    ///   is subject to [`COINBASE_MATURITY`], and zingo cannot spend one
+    ///   is subject to the 100-block coinbase maturity, and zingo cannot spend one
     ///   directly, only shield it. So mature the coinbase, then shield it into
     ///   Orchard, once per requested note. Each shield consolidates the
     ///   currently-matured transparent coinbase into one independent Orchard
@@ -370,7 +369,7 @@ where
     //
     // The first round mines only the deficit to maturity: a cold chain mines
     // the full `COINBASE_MATURITY + 1`, while a chain-cache booted past
-    // maturity (see `Validator::with_regtest_cache`) mines nothing and only
+    // maturity (see `Restore::restore`) mines nothing and only
     // re-syncs. Subsequent rounds always mine a fresh `COINBASE_MATURITY`
     // batch.
     for i in 0..notes {

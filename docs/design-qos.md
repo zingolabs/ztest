@@ -163,7 +163,7 @@ pass that backfills the next-fitting requests.
 - For `sync`, `build()` fails fast if no NVMe-pool node is schedulable rather
   than leaving the pod Pending on an unsatisfiable selector.
 
-Preflight (`preflight/render.rs` + a `qos::schedule` planning pass) fills the
+Preflight (`ui/render.rs` + a `qos::schedule` planning pass) fills the
 `tier`/`queue`/`reservation` banner rows: group selected tests by tier, compute
 peak concurrent namespaces and the wave structure against probed capacity, and
 warn if any single tier's footprint exceeds the pool. Live lease state updates
@@ -244,7 +244,7 @@ panic — the cluster can legitimately shrink; it is logged and the run waits.
 
 ### Build-pod in-place grow
 
-The `buildkit`/`builder` grow (`build_scale`) is a checked operation:
+Growing the build pod is a checked operation:
 
 ```
 grow_to(pod, container, cpu, mem):

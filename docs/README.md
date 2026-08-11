@@ -29,3 +29,12 @@ down on exit.
 | [design-resources.md](design-resources.md) | Provider DAG, resource lifetimes, teardown, storage byte-source |
 | [design-qos.md](design-qos.md) | Tiers, capacity model, scheduler, cross-run ledger, calibration |
 | [design-remote-execution.md](design-remote-execution.md) | Pod-per-test, on-cluster compilation, on-cluster image builds |
+| [design-observability.md](design-observability.md) | Metrics pipeline, PodMonitor/Thanos wiring, what a run records |
+| [design-load-testing.md](design-load-testing.md) | Load driver, scenarios, oracles, parity checking |
+| [design-sync.md](design-sync.md) | Observable chain-sync harness, probe taxonomy, nemesis/chaos layer |
+
+## How-to
+
+| Doc | Read it to |
+|-----|------------|
+| [how-to-profile.md](how-to-profile.md) | Collect and read a flamegraph from a component under test |

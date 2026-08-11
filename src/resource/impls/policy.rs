@@ -161,10 +161,14 @@ const RUN_RULES: &[Rule] = &[
         scope: RuleScope::All,
     },
     // Pod subresources: logs (diagnostics), port-forward (out-of-cluster dial),
-    // exec + attach (seed uploader stdin streaming).
+    // exec (the on-cluster build pod and the profiler).
+    //
+    // `pods/attach` was dropped with the seed uploader: streaming an archive
+    // into a pod's stdin was the only thing that ever used it, and the puller
+    // Job fetches its own bytes instead.
     Rule {
         group: "",
-        resources: &["pods/log", "pods/portforward", "pods/exec", "pods/attach"],
+        resources: &["pods/log", "pods/portforward", "pods/exec"],
         verbs: &["get", "list", "create"],
         check_verb: None,
         scope: RuleScope::All,
@@ -192,10 +196,15 @@ const RUN_RULES: &[Rule] = &[
         check_verb: None,
         scope: RuleScope::All,
     },
+    // Jobs: read for capacity accounting, write for the seed puller
+    // (`materialize::puller_job`). The puller is a Job rather than a bare Pod so
+    // a transient bucket or network error retries under `backoffLimit` instead
+    // of failing a whole run — which is what makes `create`/`delete` necessary
+    // here and not just `list`.
     Rule {
         group: "batch",
         resources: &["jobs"],
-        verbs: &["get", "list", "watch"],
+        verbs: &["get", "list", "watch", "create", "delete"],
         check_verb: Some("list"),
         scope: RuleScope::All,
     },
@@ -208,7 +217,7 @@ const RUN_RULES: &[Rule] = &[
         check_verb: None,
         scope: RuleScope::All,
     },
-    // Snapshot API: seed clone (namespaced VolumeSnapshots), the shadow clones
+    // Snapshot API: seed clone (namespaced VolumeSnapshots), the seed bindings
     // (cluster VolumeSnapshotContents), and reading the class (seeds).
     Rule {
         group: "snapshot.storage.k8s.io",
@@ -700,6 +709,24 @@ mod tests {
         })
     }
 
+    /// Like [`grants`], but also checks the verb.
+    ///
+    /// Naming a resource is not the same as being allowed to write it: the
+    /// puller regression was a rule that already listed `batch/jobs` with
+    /// read-only verbs, which a resource-only assertion would have called
+    /// covered while every run 403'd on `create`.
+    fn grants_verb(backend: ImageBackend, group: &str, resource: &str, verb: &str) -> bool {
+        render_run_rules(backend).iter().any(|r| {
+            let has = |k: &str, v: &str| {
+                r[k].as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|x| x.as_str() == Some(v))
+            };
+            has("apiGroups", group) && has("resources", resource) && has("verbs", verb)
+        })
+    }
+
     #[test]
     fn run_role_covers_the_runtime_cluster_surface() {
         // Regressions: each of these was a real mid-run 403 traced to a missing
@@ -719,8 +746,8 @@ mod tests {
             "materialize reads the storage class"
         );
         assert!(
-            grants(b, "", "pods/attach"),
-            "seed uploader streams via attach"
+            grants_verb(b, "batch", "jobs", "create"),
+            "the seed puller is a Job, so the run identity must be able to create one"
         );
         // The BuildKit build path `exec`s into its pod; the run identity drives it
         // through `pods/exec`, not any `build.openshift.io` grant.

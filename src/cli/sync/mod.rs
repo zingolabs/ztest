@@ -4,7 +4,7 @@
 //! A detached sync outlives the launching terminal: state lives in k8s, not a
 //! local daemon. Each sync gets a hermetic, persistent namespace
 //! `ztest-sync-<id>` holding its driver pod (labelled `ztest.io/{kind=sync,
-//! sync-id,owner}`) and, once the driver's in-pod `TestEnv` provisions them, its
+//! sync-id,user}`) and, once the driver's in-pod `TestEnv` provisions them, its
 //! `zebrad`/`zaino` component pods. Any machine with the kubeconfig can
 //! `list`/`watch`/`stop` — the controller is stateless, finding syncs by the
 //! `kind=sync` label. `watch` is a read-only tail; ending a sync is only `stop`
@@ -14,17 +14,18 @@
 //! runs the *same* compiled `#[ztest::sync_test]` body, distinguished only by
 //! the `ZTEST_SYNC_ID` env it carries (see [`crate::sync::detached`]).
 
+mod perf;
 mod watch;
 
 use std::collections::BTreeMap;
-use std::io::{stdout, IsTerminal};
+use std::io::{IsTerminal, stdout};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, ServiceAccount};
 use k8s_openapi::api::rbac::v1::RoleBinding;
-use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::Client;
+use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
 use serde_json::json;
 
 use clap::{Args as ClapArgs, Subcommand};
@@ -33,14 +34,13 @@ use crate::cli::console::{Console, SceneFrame};
 use crate::pipeline::build::BuildOutcome;
 use crate::pipeline::images::DumpOutcome;
 use crate::pipeline::remote_compile::{self, BakeRefs, RemoteCompileOutcome};
-use crate::preflight::{Theme, Transfers};
 use crate::resource::impls::buildkit;
 use crate::resource::impls::policy::RUN_CLUSTER_ROLE;
 use crate::sync::{
-    kind_selector, namespace_for, report_cm_name, SyncReportMirror, KIND_LABEL_KEY,
-    KIND_LABEL_VALUE, OWNER_KEY, POD_NAME_ENV, STOP_ANNOTATION, SYNC_ID_ENV, SYNC_ID_KEY,
-    SYNC_PROFILE_ENV,
+    KIND_LABEL_KEY, KIND_LABEL_VALUE, POD_NAME_ENV, STOP_ANNOTATION, SYNC_ID_ENV, SYNC_ID_KEY,
+    SYNC_PROFILE_ENV, SyncReportMirror, kind_selector, namespace_for, report_cm_name,
 };
+use crate::ui::{Theme, Transfers};
 
 /// The single driver pod's name within a sync's namespace (one sync ⇒ one
 /// namespace ⇒ one driver, so a fixed name is unambiguous).
@@ -70,7 +70,7 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// List detached syncs (cluster-wide `kind=sync` query): id, namespace, phase, owner.
+    /// List detached syncs (cluster-wide `kind=sync` query): id, namespace, phase, user.
     List {
         /// Include every user's syncs, not just your own.
         #[arg(long)]
@@ -98,7 +98,8 @@ enum Cmd {
         /// Sync id.
         id: String,
     },
-    /// One-shot status: the final report if the run has finished, else pod phase.
+    /// One-shot status: the final report if the run has finished (read from the
+    /// mirror ConfigMap, so it works after the pod is gone), else live progress.
     Status {
         /// Sync id.
         id: String,
@@ -106,26 +107,42 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Final `SyncReport` (works after the pod is gone; read from the mirror CM).
-    Report {
+    /// Retrieve a sync's CPU profiles and open them in a flame-graph viewer.
+    Perf {
         /// Sync id.
         id: String,
-        /// Emit JSON.
+        /// Directory to write the artifacts to (default `ztest-perf-<id>`).
         #[arg(long)]
-        json: bool,
+        out: Option<std::path::PathBuf>,
+        /// Retrieve only; do not launch a viewer.
+        #[arg(long)]
+        no_open: bool,
+        /// List the periodic snapshots available, without opening one.
+        #[arg(long)]
+        list: bool,
+        /// View one slice of a long run, e.g. `11h..12h` (needs periodic
+        /// snapshots; see `ZTEST_PROFILE_INTERVAL` in docs/how-to-profile.md).
+        #[arg(long, value_name = "FROM..TO")]
+        window: Option<String>,
+        /// Which profiled component to view. Required only when a topology
+        /// profiled more than one — their profiles are not comparable.
+        #[arg(long, value_name = "NAME")]
+        component: Option<String>,
+        /// Compare against an earlier sync: per-op rate deltas, and a
+        /// differential flame graph of this run against that one. Both runs
+        /// must have covered the same declared height segment.
+        #[arg(long, value_name = "SYNC_ID")]
+        base: Option<String>,
+        /// Keep every frame, including the thread/tokio scaffolding that precedes
+        /// the first line of application code in every stack. Off by default:
+        /// that prefix is identical on every sample and is over half the graph.
+        #[arg(long)]
+        raw: bool,
     },
     /// Graceful stop: `sync_mode = Shutdown` → checkpoint → exit.
     Stop {
         /// Sync id.
         id: String,
-    },
-    /// Delete a sync: removes its whole namespace (driver + components + PVCs).
-    Rm {
-        /// Sync id.
-        id: String,
-        /// Accepted for symmetry; the namespace delete already cascades PVCs.
-        #[arg(long)]
-        purge: bool,
     },
 }
 
@@ -156,13 +173,35 @@ async fn run(args: Args) -> Result<(), String> {
         Cmd::List { all_users, json } => list(all_users, json).await,
         Cmd::Status { id, json } => status(&id, json).await,
         Cmd::Stop { id } => stop(&id).await,
-        Cmd::Rm { id, purge } => rm(&id, purge).await,
+        // Retrieval is inspection, like `report`: it reads artifacts the run left
+        // behind and never touches the run itself.
+        Cmd::Perf {
+            id,
+            out,
+            no_open,
+            list,
+            window,
+            component,
+            base,
+            raw,
+        } => {
+            perf::perf(perf::Request {
+                id,
+                out,
+                open: !no_open,
+                list,
+                window,
+                component,
+                base,
+                raw,
+            })
+            .await
+        }
         // Attaching to a sync is inspection, like `status`/`report`: it succeeds
         // when it managed to observe, whatever the run's own verdict was.
         Cmd::Watch { id } => watch::watch(&id).await.map(drop),
         Cmd::Describe { name } => describe(&name).await,
         Cmd::Start { name, watch } => start(&name, watch).await,
-        Cmd::Report { id, json } => report(&id, json).await,
     }
 }
 
@@ -172,8 +211,13 @@ async fn client() -> Result<Client, String> {
         .map_err(|e| format!("kube client: {e}"))
 }
 
-/// The launching user, slugged for a label value.
-fn owner() -> String {
+/// The ServiceAccount a detached sync charges its QoS budget against — the
+/// *credential*, not the person. Ownership is [`naming::current_user`]
+/// (`ztest.io/user`); keeping the two apart is what lets several developers
+/// share one remote SA without inheriting each other's syncs.
+///
+/// [`naming::current_user`]: crate::naming::current_user
+fn service_account() -> String {
     let raw = std::env::var("ZTEST_SA")
         .ok()
         .filter(|s| !s.is_empty())
@@ -193,7 +237,7 @@ async fn start(name: &str, watch_after: bool) -> Result<(), String> {
                 .into(),
         );
     }
-    let owner = owner();
+    let sa = service_account();
     let sync_id = new_sync_id(name);
     let ns = namespace_for(&sync_id);
     let client = client().await?;
@@ -213,7 +257,7 @@ async fn start(name: &str, watch_after: bool) -> Result<(), String> {
     let (console, guard) = if stdout().is_terminal() {
         let cancel_theme = theme.clone();
         let cancel_panel =
-            Box::new(move |elapsed| crate::preflight::render_cancel_panel(elapsed, &cancel_theme));
+            Box::new(move |elapsed| crate::ui::render_cancel_panel(elapsed, &cancel_theme));
         match Console::start(session_start, cancel_panel) {
             Ok((c, g)) => (Some(c), Some(g)),
             Err(_) => (None, None),
@@ -237,8 +281,8 @@ async fn start(name: &str, watch_after: bool) -> Result<(), String> {
 
     // Provision the hermetic per-sync namespace + its driver RBAC, then create the
     // detached driver pod.
-    ensure_sync_namespace(&client, &ns, &sync_id, &owner).await?;
-    let pod = build_driver_pod(&sync_id, name, &ns, &owner, &compiled, &target, &image_refs);
+    ensure_sync_namespace(&client, &ns, &sync_id).await?;
+    let pod = build_driver_pod(&sync_id, name, &ns, &sa, &compiled, &target, &image_refs);
     Api::<Pod>::namespaced(client.clone(), &ns)
         .create(&PostParams::default(), &pod)
         .await
@@ -301,7 +345,7 @@ async fn build_and_provision(
 ) -> Result<(RemoteCompileOutcome, BTreeMap<String, String>), String> {
     use crate::cli::console::commit_phase;
     use crate::pipeline::remote_compile::Phase;
-    use crate::preflight::{render_sync_build_panel, render_transfers, BuildState};
+    use crate::ui::{BuildState, render_sync_build_panel, render_transfers};
 
     let context = crate::cluster_config::active_context().unwrap_or_else(|| "(cluster)".into());
     let started = Instant::now();
@@ -347,7 +391,7 @@ async fn build_and_provision(
     on_phase(Phase::Start("startup builder"));
     let t_builder = Instant::now();
     let build_pod = {
-        let p = buildkit::create_build_pod(client, sync_id)
+        let p = buildkit::create_build_pod(client, sync_id, &crate::naming::current_user())
             .await
             .map_err(|e| format!("create build pod: {e}"))?;
         if let Err(e) = buildkit::wait_build_pod_ready(client, &p).await {
@@ -514,7 +558,10 @@ fn resolve_target(compiled: &RemoteCompileOutcome, name: &str) -> Result<Target,
         if have.is_empty() {
             format!("no sync profiles found in the compiled selection (looked for `{name}`)")
         } else {
-            format!("no sync profile named `{name}`; available: {}", have.join(", "))
+            format!(
+                "no sync profile named `{name}`; available: {}",
+                have.join(", ")
+            )
         }
     })?;
     // `test_id` is `crate::module::fn`; the in-binary libtest name drops the
@@ -559,13 +606,9 @@ fn new_sync_id(name: &str) -> String {
 /// Create (idempotently) the sync's persistent namespace, its driver SA, and the
 /// RoleBinding granting that SA the `ztest-remote` ClusterRole *within* the
 /// namespace — enough to provision its own topology. The namespace carries no
-/// `janitor/ttl` and the `kind=sync` label, so `ztest cleanup` leaves it alone.
-async fn ensure_sync_namespace(
-    client: &Client,
-    ns: &str,
-    sync_id: &str,
-    owner: &str,
-) -> Result<(), String> {
+/// `janitor/ttl`: a sync outlives the 1h test-namespace TTL by design, and is
+/// reclaimed by `ztest cleanup` once it finishes.
+async fn ensure_sync_namespace(client: &Client, ns: &str, sync_id: &str) -> Result<(), String> {
     let params = PatchParams::apply("ztest-sync").force();
 
     let namespace: Namespace = serde_json::from_value(json!({
@@ -576,7 +619,7 @@ async fn ensure_sync_namespace(
             "labels": {
                 KIND_LABEL_KEY: KIND_LABEL_VALUE,
                 SYNC_ID_KEY: sync_id,
-                OWNER_KEY: owner,
+                crate::qos::LABEL_USER: crate::naming::current_user(),
             },
         },
     }))
@@ -632,7 +675,9 @@ async fn wait_for_sa(client: &Client, ns: &str, sa: &str) -> Result<(), String> 
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    Err(format!("ServiceAccount {sa} not provisioned in {ns} within 30s"))
+    Err(format!(
+        "ServiceAccount {sa} not provisioned in {ns} within 30s"
+    ))
 }
 
 /// The detached driver pod: the baked runner image, running the profile's test
@@ -644,7 +689,7 @@ fn build_driver_pod(
     sync_id: &str,
     profile: &str,
     ns: &str,
-    owner: &str,
+    sa: &str,
     compiled: &RemoteCompileOutcome,
     target: &Target,
     image_refs: &BTreeMap<String, String>,
@@ -667,10 +712,13 @@ fn build_driver_pod(
 
     let mut env = vec![
         json!({ "name": "ZTEST_ENGINE", "value": "1" }),
-        json!({ "name": "ZTEST_SA", "value": owner }),
+        json!({ "name": "ZTEST_SA", "value": sa }),
         json!({ "name": crate::naming::TEST_NAMESPACE_ENV, "value": ns }),
         json!({ "name": "ZTEST_RUN_ID", "value": format!("sync-{sync_id}") }),
-        json!({ "name": "USER", "value": owner }),
+        // The launching *person*, not the SA: everything the in-pod `TestEnv`
+        // creates derives `ztest.io/user` from this, so charging the sync to a
+        // shared SA must not relabel its resources as that SA's.
+        json!({ "name": "USER", "value": crate::naming::current_user() }),
         json!({ "name": SYNC_ID_ENV, "value": sync_id }),
         json!({ "name": SYNC_PROFILE_ENV, "value": profile }),
         json!({ "name": crate::backends::image::IMAGE_REFS_ENV, "value": image_refs_json }),
@@ -694,7 +742,7 @@ fn build_driver_pod(
             "labels": {
                 KIND_LABEL_KEY: KIND_LABEL_VALUE,
                 SYNC_ID_KEY: sync_id,
-                OWNER_KEY: owner,
+                crate::qos::LABEL_USER: crate::naming::current_user(),
             },
         },
         "spec": {
@@ -725,7 +773,7 @@ fn build_driver_pod(
 
 // ─────────────────────────── list / status ────────────────────────────
 
-/// A driver pod's `sync-id`, namespace, phase, and owner.
+/// A driver pod's `sync-id`, namespace, phase, and owning user.
 fn row_of(p: &Pod) -> (String, String, String, String) {
     let label = |k: &str| {
         p.metadata
@@ -744,7 +792,7 @@ fn row_of(p: &Pod) -> (String, String, String, String) {
         label(SYNC_ID_KEY),
         p.metadata.namespace.clone().unwrap_or_else(|| "-".into()),
         phase,
-        label(OWNER_KEY),
+        label(crate::qos::LABEL_USER),
     )
 }
 
@@ -758,7 +806,7 @@ async fn list(all_users: bool, json_out: bool) -> Result<(), String> {
         .map_err(|e| format!("list sync pods: {e}"))?
         .items;
     if !all_users {
-        let me = owner();
+        let me = crate::naming::current_user();
         items.retain(|p| row_of(p).3 == me);
     }
 
@@ -766,8 +814,8 @@ async fn list(all_users: bool, json_out: bool) -> Result<(), String> {
         let rows: Vec<_> = items
             .iter()
             .map(|p| {
-                let (id, ns, phase, owner) = row_of(p);
-                json!({ "id": id, "namespace": ns, "phase": phase, "owner": owner })
+                let (id, ns, phase, user) = row_of(p);
+                json!({ "id": id, "namespace": ns, "phase": phase, "user": user })
             })
             .collect();
         println!(
@@ -777,13 +825,19 @@ async fn list(all_users: bool, json_out: bool) -> Result<(), String> {
         return Ok(());
     }
     if items.is_empty() {
-        println!("no detached syncs{}", if all_users { "" } else { " (yours)" });
+        println!(
+            "no detached syncs{}",
+            if all_users { "" } else { " (yours)" }
+        );
         return Ok(());
     }
-    println!("{:<28} {:<24} {:<12} {:<12}", "SYNC-ID", "NAMESPACE", "PHASE", "OWNER");
+    println!(
+        "{:<28} {:<24} {:<12} {:<12}",
+        "SYNC-ID", "NAMESPACE", "PHASE", "USER"
+    );
     for p in &items {
-        let (id, ns, phase, owner) = row_of(p);
-        println!("{id:<28} {ns:<24} {phase:<12} {owner:<12}");
+        let (id, ns, phase, user) = row_of(p);
+        println!("{id:<28} {ns:<24} {phase:<12} {user:<12}");
     }
     Ok(())
 }
@@ -799,7 +853,12 @@ async fn status(id: &str, json_out: bool) -> Result<(), String> {
                 serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
             );
         } else {
-            println!("{}", report_headline(&Theme::detect(), &report));
+            let theme = Theme::detect();
+            println!("{}", report_headline(&theme, &report));
+            // The violations and coverage gaps too: this is the only command that
+            // reads a finished run, so a headline alone would leave the detail of
+            // *why* it failed with nowhere to be printed.
+            print_report_details(&theme, &report);
         }
         return Ok(());
     }
@@ -836,56 +895,39 @@ async fn status(id: &str, json_out: bool) -> Result<(), String> {
     use owo_colors::OwoColorize as _;
     let theme = Theme::detect();
     let dot = theme.chars.dot.style(theme.styles.dim);
-    let detail = match (vitals, &live) {
-        (Some(v), Some(state)) => {
-            let (ok, total) = state.probe_tally();
-            let target = v
-                .target
-                .map(|t| format!("/{t}"))
-                .unwrap_or_default();
-            let rate = v
-                .blocks_per_sec
-                .map(|r| format!(" {dot} {r:.1} blk/s"))
-                .unwrap_or_default();
-            format!(
-                "{phase} {dot} height {}{target} {dot} {:.1}% {dot} {}{rate} {dot} probes {ok}/{total} ok",
-                v.height, v.pct, v.phase,
-            )
-        }
-        _ => format!("{phase} (starting; no tick published yet)"),
+    let Some(mut state) = live else {
+        println!(
+            "{} sync {} {dot} {}",
+            theme.chars.dot.style(theme.styles.count),
+            id.style(theme.styles.count),
+            format!("{phase} (starting; no tick published yet)").style(theme.styles.dim),
+        );
+        return Ok(());
     };
-    println!(
-        "{} sync {} {dot} {}",
-        theme.chars.dot.style(theme.styles.count),
-        id.style(theme.styles.count),
-        detail.style(theme.styles.dim),
+    // The log tail carries no pod phase of its own — it is a property of the
+    // cluster, which only this side has read.
+    state.pod_phase = phase;
+    state.sync_id = id.to_string();
+    print!(
+        "{}",
+        crate::ui::render_sync_status(&state, &theme, terminal_width())
     );
     Ok(())
 }
 
-async fn report(id: &str, json_out: bool) -> Result<(), String> {
-    let client = client().await?;
-    let ns = namespace_for(id);
-    let Some(report) = read_report(&client, &ns, id).await? else {
-        return Err(format!(
-            "sync {id}: no report yet — it is still running or never completed \
-             (`ztest sync status {id}` for the live phase)"
-        ));
-    };
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
-        );
-    } else {
-        let theme = Theme::detect();
-        println!("{}", report_headline(&theme, &report));
-        print_report_details(&theme, &report);
-    }
-    Ok(())
+/// Columns available for the status view.
+///
+/// A non-TTY (a pipe, a CI log) reports nothing, and the view's own default is
+/// the right answer there: the layout is designed to fit a conventional
+/// terminal, so a redirected `status` stays diffable rather than stretching to
+/// whatever the last interactive session happened to be.
+fn terminal_width() -> usize {
+    console::Term::stdout()
+        .size_checked()
+        .map_or(80, |(_, cols)| usize::from(cols))
 }
 
-/// The themed one-line verdict headline shared by `status` and `report`: a
+/// The themed one-line verdict headline shared by `status` and `watch`: a
 /// pass/fail mark, the sync id + profile, and the tick/violation/gap counts,
 /// coloured like `ztest run`'s end-of-run banner.
 fn report_headline(theme: &Theme, r: &SyncReportMirror) -> String {
@@ -900,7 +942,10 @@ fn report_headline(theme: &Theme, r: &SyncReportMirror) -> String {
     let gaps = if r.coverage_gaps.is_empty() {
         String::new()
     } else {
-        format!(" {dot} {} gaps", r.coverage_gaps.len().style(theme.styles.count))
+        format!(
+            " {dot} {} gaps",
+            r.coverage_gaps.len().style(theme.styles.count)
+        )
     };
     format!(
         "{} {} {} {dot} {} {dot} {} ticks {dot} {} violations{gaps}",
@@ -918,6 +963,21 @@ fn report_headline(theme: &Theme, r: &SyncReportMirror) -> String {
 fn print_report_details(theme: &Theme, r: &SyncReportMirror) {
     use owo_colors::OwoColorize as _;
     let dot = theme.chars.dot.style(theme.styles.dim);
+    // The span comes first because it is what decides whether this run's
+    // numbers can be compared with any other's — a reader reaching for
+    // `perf --base` needs to know before they try.
+    if let Some(segment) = &r.segment {
+        let work = segment
+            .work
+            .total()
+            .map(|t| format!(" {dot} {} ops", crate::ui::text::thousands(t)))
+            .unwrap_or_default();
+        println!(
+            "  {} segment {dot} {}{work}",
+            theme.chars.dot.style(theme.styles.dim),
+            segment.describe().style(theme.styles.count),
+        );
+    }
     for v in &r.violations {
         let at = v.height.map(|h| format!(" @{h}")).unwrap_or_default();
         println!(
@@ -932,15 +992,6 @@ fn print_report_details(theme: &Theme, r: &SyncReportMirror) {
             "  {} coverage gap {dot} {g}",
             theme.chars.dot.style(theme.styles.dim),
         );
-    }
-    for m in &r.metrics {
-        if let Some(val) = m.value {
-            println!(
-                "  {} {} {dot} {val}",
-                theme.chars.dot.style(theme.styles.dim),
-                m.name.style(theme.styles.dim),
-            );
-        }
     }
     if let Some(e) = &r.error {
         println!(
@@ -980,30 +1031,14 @@ async fn stop(id: &str) -> Result<(), String> {
     let _ = find_driver(&client, &ns, id).await?; // 404s clearly if unknown
     let api: Api<Pod> = Api::namespaced(client, &ns);
     let patch = json!({ "metadata": { "annotations": { STOP_ANNOTATION: "true" } } });
-    api.patch(DRIVER_POD, &PatchParams::apply("ztest-sync"), &Patch::Merge(&patch))
-        .await
-        .map_err(|e| format!("signal stop: {e}"))?;
+    api.patch(
+        DRIVER_POD,
+        &PatchParams::apply("ztest-sync"),
+        &Patch::Merge(&patch),
+    )
+    .await
+    .map_err(|e| format!("signal stop: {e}"))?;
     println!("sync {id}: stop signalled (graceful checkpoint → report → exit)");
-    Ok(())
-}
-
-async fn rm(id: &str, _purge: bool) -> Result<(), String> {
-    let client = client().await?;
-    let ns = namespace_for(id);
-    // Guard a live sync: deleting the namespace mid-run is an ungraceful kill.
-    if let Ok(pod) = find_driver(&client, &ns, id).await
-        && pod.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
-    {
-        return Err(format!(
-            "sync {id} is Running — `ztest sync stop {id}` first (it checkpoints), \
-             then `ztest sync rm {id}`"
-        ));
-    }
-    Api::<Namespace>::all(client)
-        .delete(&ns, &DeleteParams::default())
-        .await
-        .map_err(|e| format!("delete sync namespace {ns}: {e}"))?;
-    println!("sync {id}: deleted (namespace {ns} removed)");
     Ok(())
 }
 

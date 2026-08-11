@@ -6,7 +6,7 @@
 //! the engine is a deterministic function of its inputs, testable without a
 //! cluster.
 //!
-//! Policy (`docs/qos-design.md` §5.5): greedy priority admission with backfill.
+//! Policy (`docs/design-qos.md` §5.5): greedy priority admission with backfill.
 //! Each pass scans the queue `(priority desc, seq asc)` and admits every request
 //! that fits live 4-D capacity and its SA's remaining budget, continuing past a
 //! non-fitting one so a smaller request backfills. A request that can't fit an
@@ -41,7 +41,7 @@ pub enum Verdict {
 ///
 /// Reject conditions are checked against the maxima (independent of current
 /// load); the queue/fit split is checked against live free capacity and the
-/// SA's remaining budget: the two nested constraints of `docs/qos-design.md`
+/// SA's remaining budget: the two nested constraints of `docs/design-qos.md`
 /// §5.6.
 pub fn decide(
     available: Resources,
@@ -78,7 +78,7 @@ pub struct LeaseId(pub u64);
 /// A resolved admission request. The caller (the shell) has already lowered a
 /// [`super::QosClass`] to its `footprint`/`priority` via
 /// [`super::QosClass::profile`]; the scheduler operates on these resolved
-/// numbers, decoupled from the still-TBD reserve table (`docs/qos-design.md`
+/// numbers, decoupled from the still-TBD reserve table (`docs/design-qos.md`
 /// §11). The tier's NVMe-vs-general placement rides on the pod specs
 /// (toleration/nodeSelector), not here. Identity (`binary_id`/`test_name`)
 /// comes from nextest's env vars (§5.4) and is echoed back in the [`Grant`] so

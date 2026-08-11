@@ -65,63 +65,101 @@ A thin library over primitives ztest already owns (the generated tonic
   channel, which is fatal for load generation.
 - **L1 — `Scenario`**: what each virtual connection does (deterministic range
   distribution by default; reproducible without an RNG).
-- **L2 — `LoadDriver` / `DiffLoadDriver`**: fan out to N connections, record
-  per-op latency into an hdrhistogram (true p50/p90/p99, fixing `zaino-admin`'s
-  min/mean/max-only reporting). The differential driver issues each request to
-  A *and* B in the same task.
-- **L3 — `Oracle`**: validates responses (this is what makes it a *test*, not a
-  benchmark). `ChainLinkOracle` (genesis zeros, 32-byte hashes,
-  `prev_hash == prior.hash`) + a built-in differential compact-block diff.
-- **L4 — result**: `LoadReport` with per-op `LatencyStats`, throughput, error
-  and oracle-violation counts; assertion helpers gate the test.
+- **L2 — `LoadDriver`**: fan out to N connections, record per-op latency into an
+  hdrhistogram (true p50/p90/p99, fixing `zaino-admin`'s min/mean/max-only
+  reporting). `LoadDriver::pair` is the differential mode — each request goes to
+  A *and* B from the same task, so their latencies are comparable and their
+  responses can be compared for equality. Every connection dials its own
+  channel; the handshake is timed as `OpKind::Connect` and excluded from
+  throughput.
+- **L3 — `BlockOracle`**: validates responses (this is what makes it a *test*,
+  not a benchmark). One type carrying three invariants — chain link (genesis
+  zeros, 32-byte hashes, `prev_hash == prior.hash`), completeness (the heights
+  served are exactly those requested), and opt-in stable history (a settled
+  height never changes hash).
+- **L4 — result**: `LoadReport` with one `Side` per backend driven (latency,
+  throughput, ops, errors, violations) plus the heights at which A and B
+  diverged; assertion helpers gate the test.
 
-The three `zaino-admin` modes collapse onto shared substrate: **stress** =
-`LoadDriver` + `ChainLinkOracle`; **differential** = two `add_indexer` handles
-(the ≤2-indexer cap fits exactly) + `DiffLoadDriver`; **conformance** = a
-`Conformance` sweep over every RPC with an explicit per-RPC oracle strength.
+The `zaino-admin` modes collapse onto one driver: **stress** = `LoadDriver::new`;
+**differential** = two `add_indexer` handles (the ≤2-indexer cap fits exactly) +
+`LoadDriver::pair`. `zaino-admin`'s third mode, the `grpc-test` RPC sweep, is
+deliberately **not** ported — the ~150 existing live tests already assert each
+RPC individually, and far more strictly than a sweep that treated `Err` as a
+pass on eight of its twenty arms.
+
+**On parity depth.** A/B comparison is prost's derived `PartialEq` over the whole
+`CompactBlock`, and the report names the diverging *height*. An earlier revision
+also carried a hand-written field-by-field differ so the report could name the
+field. It was removed: equality was always the actual gate, the differ only
+decorated the message, and a hand-maintained walker goes stale every time the
+proto grows a field — exactly the blind spot a parity test exists to prevent. A
+divergence reproduces with one `GetBlock` per backend.
+
+**On absolute SLOs.** There is deliberately no `assert_slo`. It would need a
+calibrated cluster (static CPU policy, fio-calibrated I/O) to mean anything, and
+the load generator itself runs in a resource-capped runner pod — so a latency
+number here partly measures the harness. Correctness and A/B ratios gate;
+absolute numbers are printed for humans only. See the measurement-model section.
 
 ## API
 
 ```rust
 // L0 — on IndexerBackend
-async fn grpc_client(&self)  -> Result<LwdClient, EnvError>; // shared multiplexed channel, cheap Clone
+async fn grpc_client(&self)  -> Result<LwdClient, EnvError>; // persistent multiplexed channel, cheap Clone
 async fn grpc_channel(&self) -> Result<Channel, EnvError>;   // raw, for per-connection dialing
 
 #[derive(Clone)]
 pub struct LwdClient { /* CompactTxStreamerClient<Channel> */ }
 
 // L1 — what a connection does
-pub enum Distribution { Even, Random }
+pub enum Distribution { Even, Scatter }
 pub enum Scenario {
     BlockRangeSweep { pool: Range<u64>, blocks: usize, dist: Distribution },
-    Mixed(Vec<(u32 /*weight*/, Op)>),
 }
 
 // L2 — how load is applied
-pub enum ConnMode { Shared, PerTask } // one channel for all conns, or one per conn (zaino-admin style)
-pub enum Until { Duration(Duration), Count(u64) }
+impl LoadDriver {
+    pub fn new(client: LwdClient) -> Self;                  // single endpoint
+    pub fn pair(a: LwdClient, b: LwdClient) -> Self;        // differential
+
+    pub fn label(self, label: impl Into<String>) -> Self;
+    pub fn connections(self, n: usize) -> Self;
+    pub fn spawn_stagger(self, d: Duration) -> Self;
+    pub fn scenario(self, s: Scenario) -> Self;
+    pub fn stable_below(self, height: u64) -> Self;         // enable the stable-history check
+    pub fn duration(self, d: Duration) -> Self;
+
+    pub async fn run(self) -> Result<LoadReport, EnvError>;
+}
 
 // L3 — correctness under load
-pub trait Oracle: Send + Sync {
-    fn observe(&self, obs: &Observed) -> Result<(), Violation>;
-}
-pub struct ChainLinkOracle; // genesis zeros, 32-byte hashes, prev_hash == prior.hash
+pub struct BlockOracle;                 // built by the driver; `stable_below` is its one knob
+pub struct Violation { pub height: u64, pub field: String, pub detail: String }
 
 // L4 — result
-pub struct LatencyStats { pub p50: Duration, pub p90: Duration, pub p99: Duration, pub max: Duration, pub count: u64 }
-pub struct LoadReport {
+pub struct LatencyStats { pub p50: Duration, pub p90: Duration, pub p99: Duration, pub p999: Duration, pub max: Duration, pub count: u64 }
+pub struct Side {
     pub by_op: BTreeMap<OpKind, LatencyStats>,
     pub throughput: f64,          // successful ops/sec
+    pub total_ops: u64,
     pub errors: u64,
-    pub violations: u64,
+    pub violations: Vec<Violation>,
+}
+pub struct LoadReport {
+    pub label: String,
+    pub wall: Duration,
+    pub connections: usize,
+    pub a: Side,
+    pub b: Option<Side>,          // Some(..) only for a differential run
+    pub parity_diffs: Vec<ParityRecord>,
 }
 impl LoadReport {
     pub fn print(&self);
-    pub fn assert_slo(&self, slo: Slo) -> Result<(), SloError>;        // absolute
-    pub fn assert_parity(&self) -> Result<(), ParityError>;           // A == B (DiffLoadDriver)
-    pub fn assert_relative(&self, rel: Rel) -> Result<(), RelError>;  // A/B ratio
+    pub fn assert_correct(&self) -> Result<(), CorrectnessError>;    // every side: zero violations, zero errors
+    pub fn assert_parity(&self) -> Result<(), ParityError>;          // A == B; errors on a single-endpoint run
+    pub fn assert_relative(&self, rel: Rel) -> Result<(), RelError>; // A/B ratio; ditto
 }
-pub struct Slo { pub max_p99: Duration, pub min_throughput: f64, pub max_error_rate: f64, pub zero_violations: bool }
 pub struct Rel { pub p99_ratio_max: f64, pub throughput_ratio_min: f64 }
 ```
 
@@ -139,21 +177,14 @@ async fn zaino_block_range_stays_consistent_under_load() -> Result<()> {
 
     let report = LoadDriver::new(zai.grpc_client().await?)
         .connections(256)
-        .conn_mode(ConnMode::PerTask)
         .spawn_stagger(Duration::from_millis(1))
         .scenario(Scenario::BlockRangeSweep { pool: LO..HI, blocks: 1000, dist: Distribution::Even })
-        .oracle(ChainLinkOracle)
-        .until(Until::Duration(Duration::from_secs(30)))
+        .duration(Duration::from_secs(30))
         .run()
         .await?;
 
-    report.print(); // absolute histograms → captured by the engine reporter, non-gating
-    report.assert_slo(Slo {
-        max_p99: Duration::from_millis(200),
-        min_throughput: 100_000.0,
-        max_error_rate: 0.0,
-        zero_violations: true,
-    })?;
+    report.print();            // absolute histograms → engine reporter, non-gating
+    report.assert_correct()?;  // zero violations, zero errors  (gate)
     Ok(())
 }
 ```
@@ -175,38 +206,17 @@ async fn fetch_and_state_backends_agree_under_load() -> Result<()> {
     a.wait_for_block_num(H).await?;
     b.wait_for_block_num(H).await?;
 
-    let report = DiffLoadDriver::pair(a.grpc_client().await?, b.grpc_client().await?)
+    let report = LoadDriver::pair(a.grpc_client().await?, b.grpc_client().await?)
         .connections(256)
         .scenario(Scenario::BlockRangeSweep { pool: LO..HI, blocks: 1000, dist: Distribution::Even })
-        .oracle(ChainLinkOracle) // correctness enforced on BOTH endpoints
-        .until(Until::Duration(Duration::from_secs(30)))
+        .duration(Duration::from_secs(30))
         .run() // each request issued to A and B in the same task
         .await?;
 
-    report.assert_parity()?; // A ≡ B, field + per-tx-count level  (gate)
+    report.assert_parity()?;   // A ≡ B, byte-identical  (gate)
+    report.assert_correct()?;  // oracle clean on BOTH endpoints  (gate)
     report.assert_relative(Rel { p99_ratio_max: 1.3, throughput_ratio_min: 0.8 })?; // gate
-    report.print();          // absolute numbers for both, non-gating
-    Ok(())
-}
-```
-
-### Example — conformance sweep (every RPC)
-
-```rust
-#[ztest::qos::basic]
-#[tokio::test]
-async fn zaino_grpc_surface_is_wired() -> Result<()> {
-    let mut t = TestEnv::builder();
-    let _zeb = t.add_validator(Validator::zebrad("1.9.1"));
-    let zai  = t.add_indexer(Indexer::zaino("0.4.0").peer("zeb"));
-    t.build().await?;
-
-    Conformance::new(zai.grpc_client().await?)
-        .discover_from_chain()               // tip + a sample txid from the live chain
-        .strength(OracleStrength::ContentValid) // stricter than zaino-admin's "Ok-or-Err passes"
-        .run()
-        .await?
-        .assert_all_ok()?;
+    report.print();            // absolute numbers for both, non-gating
     Ok(())
 }
 ```
@@ -214,12 +224,30 @@ async fn zaino_grpc_surface_is_wired() -> Result<()> {
 ## Build order
 
 1. **`LwdClient` + `grpc_client()`** — the reusable multiplexed client. Small,
-   unblocks everything, useful beyond load tests.
-1. **`ChainLinkOracle` + `LoadDriver` + hdrhistogram `LoadReport`** — correctness
-   under load and absolute numbers (goals: correctness, exploratory).
-1. **`DiffLoadDriver` + `assert_parity` / `assert_relative`** — parity and
-   relative perf gating on the shared backbone.
-1. **`Conformance` sweep** — the wiring/liveness net over every RPC.
+   unblocks everything, useful beyond load tests. *(done)*
+1. **`BlockOracle` + `LoadDriver` + hdrhistogram `LoadReport`** — correctness
+   under load and absolute numbers (goals: correctness, exploratory). *(done)*
+1. **`LoadDriver::pair` + `assert_parity` / `assert_relative`** — parity and
+   relative perf gating on the shared backbone. *(done)*
+1. **Re-org under load** (`stable_below`) — the only check that sees settled
+   history being rewritten. Needs the `invalidateblock` / `reconsiderblock`
+   validator primitives. *(done)*
+
+Not planned: a `Conformance` RPC sweep. It was in the original design as the
+third `zaino-admin` mode, but the ~150 existing live tests already cover the RPC
+surface individually and assert response *content*, where the sweep only checked
+that a call returned.
+
+Open, in rough priority order:
+
+1. **Verify the lightwalletd differential on a cluster.** It is the only test
+   here with a genuinely independent oracle, and it has never run.
+1. **Write load concurrent with read load** — every scenario today drives a
+   quiesced chain except the re-org test.
+1. **Widen the scenario beyond `GetBlockRange`** — the `CompactTxStreamer`
+   surface is ~20 RPCs; load covers one.
+1. **Reads spanning the fork point during a re-org** — the current test reads
+   strictly below it.
 
 ## Dependencies
 

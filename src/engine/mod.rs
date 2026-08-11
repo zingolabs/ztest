@@ -30,10 +30,10 @@ use crate::engine::reporter::StyledReporter;
 use crate::engine::schedule::{LoopConfig, PanelFrame, run_loop};
 use crate::inventory::QosEntry;
 use crate::pipeline::SelectedBinary;
-use crate::preflight::{Theme, render_live_panel};
 use crate::qos::Resources;
 use crate::qos::schedule::QosPlan;
 use crate::resource::impls::policy::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
+use crate::ui::{Theme, render_live_panel};
 
 /// Run-behavior options (parsed from `ztest run` flags).
 #[derive(Debug, Clone)]

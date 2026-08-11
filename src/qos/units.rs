@@ -2,7 +2,7 @@
 //!
 //! The cluster probe reserves each scheduled pod at `max(effective_request,
 //! observed_usage)`. This module supplies the spec-derived request footprint
-//! ([`pod_effective_request`]); the probe adds the metrics-derived usage term.
+//! (`pod_effective_request`); the probe adds the metrics-derived usage term.
 
 use std::collections::BTreeMap;
 
@@ -111,7 +111,7 @@ pub(crate) fn container_requests(c: &Container) -> Resources {
 
 /// Parse a `requests`/`limits` quantity map into [`Resources`]. I/O has no k8s
 /// request/limit field, so the I/O dimensions are always zero here — the harness
-/// enforces I/O per pod via cgroup `io.max` (see `docs/qos-io-dimension-design.md`),
+/// enforces I/O per pod via cgroup `io.max` (see `docs/design-qos.md`),
 /// not through the k8s resource model.
 fn container_amount(map: Option<&BTreeMap<String, Quantity>>) -> Resources {
     let Some(map) = map else {

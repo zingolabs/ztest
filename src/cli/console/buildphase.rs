@@ -9,7 +9,7 @@
 //! boundary lines ([`commit_phase`]) and the right-column background-transfer
 //! tracker ([`provision_with_tracker`]). The *left* panel content stays with
 //! each caller (its scene differs: `run` shows the preflight banner, `sync`
-//! shows the sync context), reusing the shared [`crate::preflight`] primitives.
+//! shows the sync context), reusing the shared [`crate::ui`] primitives.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -19,8 +19,8 @@ use owo_colors::OwoColorize as _;
 
 use crate::cli::console::Console;
 use crate::pipeline::remote_compile::Phase;
-use crate::preflight::{Theme, TransferKind, TransferProgress, TransferRow, Transfers};
 use crate::resource::{self, Graph, NodeId, NodeState};
+use crate::ui::{Theme, TransferKind, TransferProgress, TransferRow, Transfers};
 
 /// A scene closure reads this each frame to paint live cluster capacity; `None`
 /// pins the panel to its last static figure.
@@ -55,14 +55,6 @@ pub(crate) fn commit_phase(
         Phase::Done { label, dur } => (
             format!(
                 "  {} {label} {}",
-                theme.chars.ok.style(theme.styles.pass),
-                format!("({})", fmt_dur(dur)).style(theme.styles.dim),
-            ),
-            None,
-        ),
-        Phase::Step { label, dur } => (
-            format!(
-                "    {} {label} {}",
                 theme.chars.ok.style(theme.styles.pass),
                 format!("({})", fmt_dur(dur)).style(theme.styles.dim),
             ),

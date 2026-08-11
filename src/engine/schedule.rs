@@ -23,12 +23,12 @@ use crate::engine::events::{
 use crate::engine::local_runner::TestOutcome;
 use crate::engine::panel::{live_snapshot, run_progress};
 use crate::engine::plan::WorkItem;
-use crate::preflight::RunProgress;
 use crate::qos::Resources;
 use crate::qos::governor::RunDemand;
 use crate::qos::live::LiveSnapshot;
 use crate::qos::scheduler::{Admission, LeaseId, RejectReason, Request, Scheduler};
 use crate::resource::{NodeId, NodeState};
+use crate::ui::RunProgress;
 use tokio::sync::watch;
 
 /// Tunables for the run loop.
@@ -88,8 +88,6 @@ pub struct PanelFrame {
     pub snapshot: LiveSnapshot,
     /// Pass/fail/elapsed for the QoS panel's progress line.
     pub progress: RunProgress,
-    /// Full tally (including skipped) for the nextest-style top progress line.
-    pub stats: RunStats,
     /// Free cluster capacity (ceiling minus committed).
     pub free: Resources,
     /// In-flight tests, longest-running first, for the live running region.
@@ -324,6 +322,13 @@ where
                             stats.skipped += 1;
                         }
                     }
+                } else if matches!(outcome.verdict, Verdict::Terminated) {
+                    // Killed in flight by the cancellation, not by anything the
+                    // test did — tallied apart from `failed`, and never allowed
+                    // to trip fail-fast (which exists to stop a run on a real
+                    // failure; the run is already stopping).
+                    emit_finished(reporter, &running, &outcome);
+                    stats.terminated += 1;
                 } else {
                     emit_finished(reporter, &running, &outcome);
                     stats.failed += 1;
@@ -477,7 +482,6 @@ fn render_tick(
     let frame = PanelFrame {
         snapshot,
         progress: run_progress(stats, start.elapsed()),
-        stats,
         free: sched.free(),
         running,
     };
@@ -1443,13 +1447,16 @@ mod tests {
         )
         .await;
 
-        // The two in-flight tests are terminated and counted as failed; the two
-        // parked ones never ran, so the run closes short of its total.
-        assert_eq!(stats.failed, 2, "in-flight tests must be reported");
+        // The two in-flight tests are terminated, tallied apart from `failed`
+        // (nobody's code failed — the operator hit Ctrl-C); the two parked ones
+        // never ran, so the run closes short of its total.
+        assert_eq!(stats.terminated, 2, "in-flight tests must be reported");
+        assert_eq!(stats.failed, 0, "a kill is not a failure");
         assert_eq!(stats.passed, 0);
-        assert_eq!(stats.finished(), 2);
+        assert_eq!(stats.ran(), 2);
         assert_eq!(stats.total, 4);
-        assert!(stats.any_failed(), "a cancelled run exits non-zero");
+        assert_eq!(stats.not_run(), 2, "the parked tests are accounted for");
+        assert!(stats.any_failed(), "a cancelled run still exits non-zero");
 
         // Exactly one cancellation notice, and it names the two running tests.
         let cancels: Vec<_> = rep

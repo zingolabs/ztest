@@ -17,12 +17,12 @@ use kube::api::{Api, ListParams, LogParams};
 use owo_colors::OwoColorize as _;
 
 use crate::cli::console::{Console, SceneFrame};
-use crate::metrics::live::{self, LiveMetrics};
-use crate::preflight::{
-    MetricRow, MetricsAvailability, ProbeRow, SetupStep, SyncVitals, SyncWatchState, Theme,
-    render_sync_metrics, render_sync_watch_panel,
-};
+use crate::metrics::{PodExporter, Poller, Reading};
 use crate::sync::{SyncEvent, decode_event, namespace_for};
+use crate::ui::{
+    ProbeRow, SetupStep, SyncVitals, SyncWatchState, Theme, render_sync_metrics,
+    render_sync_watch_panel,
+};
 
 use super::{
     DRIVER_CONTAINER, DRIVER_POD, driver_profile, find_driver, print_report_details, read_report,
@@ -77,7 +77,7 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
 
     let cancel_theme = theme.clone();
     let cancel_panel =
-        Box::new(move |elapsed| crate::preflight::render_cancel_panel(elapsed, &cancel_theme));
+        Box::new(move |elapsed| crate::ui::render_cancel_panel(elapsed, &cancel_theme));
     // The console's session clock. Shared with the feed so a tick's `received_at`
     // is on the same origin as the `elapsed` each frame is rendered against.
     let session_start = Instant::now();
@@ -93,20 +93,34 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
         row_of(&driver).2,
     );
 
-    let render = |feed: &Feed| {
-        let (state, theme) = (feed.state.clone(), theme.clone());
+    // Two independent views on one screen: the sync feed drives the left panel,
+    // the metrics poller the right. Neither reads the other's state.
+    let render = |feed: &Feed, metrics: &Reading| {
+        let (state, theme, metrics) = (feed.state.clone(), theme.clone(), metrics.clone());
         console.scene(move |elapsed| SceneFrame {
             left: render_sync_watch_panel(&state, elapsed, &theme),
-            right: render_sync_metrics(&state, &theme),
+            right: render_sync_metrics(&metrics, &theme),
             live: None,
         });
     };
-    render(&feed);
+    render(&feed, &Reading::default());
 
-    // Scraped controller-side, for as long as this attach lasts: the exporters are
-    // the only source with sub-scrape-interval resolution, and a watcher that walks
-    // away should stop dialing them.
-    let mut metrics = LiveMetrics::spawn(client.clone(), ns.clone());
+    // Scraped controller-side, for as long as this attach lasts: the exporter is
+    // the only source with sub-scrape-interval resolution, and a watcher that
+    // walks away should stop dialing it.
+    //
+    // Built here and not by the sync machinery: metrics and sync are independent
+    // systems that this command composes. The poller needs no driver, and would
+    // work against any namespace with a metrics-exposing pod in it.
+    let mut metrics = Poller::spawn(
+        PodExporter::new(
+            client.clone(),
+            ns.clone(),
+            crate::component::ComponentCategory::Indexer.as_str(),
+            crate::backends::metrics_rows,
+        ),
+        crate::metrics::LIVE_PERIOD,
+    );
 
     let tail = tail_loop(
         &api,
@@ -170,16 +184,22 @@ async fn settled(
 /// driver's stream ends or the user detaches.
 async fn tail_loop(
     api: &Api<Pod>,
-    metrics: &mut LiveMetrics,
+    metrics: &mut Poller,
     console: &Console,
     session_start: Instant,
     feed: &mut Feed,
     theme: &Theme,
-    render: impl Fn(&Feed),
+    render: impl Fn(&Feed, &Reading),
 ) -> Result<(), String> {
+    // The metrics view, held beside the sync feed and folded independently of it.
+    let mut metrics_view = Reading::default();
+    // The last cause shown, so a standing condition is stated once rather than
+    // once a second.
+    let mut last_note: Option<String> = None;
+
     let started = open_driver_log(api, &|| console.cancelled(), |phase| {
         feed.state.pod_phase = phase;
-        render(feed);
+        render(feed, &Reading::default());
     })
     .await?;
     let Some(mut driver) = started else {
@@ -206,6 +226,7 @@ async fn tail_loop(
         // Set by the stream branches; applied after the `select!` so no handler
         // mutates what another branch is borrowing.
         let (mut close_sut, mut lost_driver) = (false, false);
+        let mut next_reading: Option<Reading> = None;
         tokio::select! {
             line = driver.next() => match line {
                 Some(Ok(l)) => {
@@ -213,7 +234,7 @@ async fn tail_loop(
                     if let Some(text) = feed.absorb(&l, session_start.elapsed(), theme) {
                         console.scrollback(prefixed("driver", &text, theme));
                     }
-                    render(feed);
+                    render(feed, &metrics_view);
                 }
                 Some(Err(_)) | None => lost_driver = true,
             },
@@ -227,17 +248,17 @@ async fn tail_loop(
                 Some(Err(_)) | None => close_sut = true,
             },
             reading = metrics.changed() => {
-                if let Some(text) = feed.absorb_metrics(reading) {
-                    console.scrollback(prefixed("ztest", &text, theme));
-                }
-                render(feed);
+                // Applied after the `select!` for the same reason the flags above
+                // are: `metrics` is borrowed by this arm's future, so the render
+                // that consumes it cannot run inside the arm.
+                next_reading = Some(reading);
             }
             _ = ticker.tick() => {
                 if let Ok(Some(pod)) = api.get_opt(DRIVER_POD).await {
                     let phase = driver_phase(&pod);
                     if phase != feed.state.pod_phase {
                         feed.state.pod_phase = phase;
-                        render(feed);
+                        render(feed, &metrics_view);
                     }
                 }
                 if sut.is_none()
@@ -259,6 +280,18 @@ async fn tail_loop(
                     }
                 }
             }
+        }
+        if let Some(reading) = next_reading {
+            // The panel names the cause itself; scrollback carries it too, once,
+            // so a condition that later clears still left a trace in the log.
+            if reading.note != last_note
+                && let Some(note) = &reading.note
+            {
+                console.scrollback(prefixed("ztest", &format!("live metrics: {note}"), theme));
+            }
+            last_note = reading.note.clone();
+            metrics_view = reading;
+            render(feed, &metrics_view);
         }
         if close_sut {
             sut = None;
@@ -559,37 +592,6 @@ impl Feed {
         self.record(&env.event, elapsed, theme, verbose)
     }
 
-    /// Take one live metrics reading. Returns a line for scrollback only when the
-    /// plane's *availability* changed — at panel refresh rate a per-reading line
-    /// would bury the log, but silently swallowing a plane that broke would leave a
-    /// column emptying itself for no stated reason.
-    fn absorb_metrics(&mut self, reading: live::Reading) -> Option<String> {
-        self.state.metrics = reading
-            .samples
-            .samples
-            .iter()
-            .map(|s| MetricRow {
-                name: s.name.clone(),
-                value: s.value,
-            })
-            .collect();
-        let was = std::mem::replace(
-            &mut self.state.metrics_state,
-            match &reading.state {
-                live::State::NoTargets => MetricsAvailability::Idle,
-                live::State::NoSeries => MetricsAvailability::AwaitingScrape,
-                live::State::Sampled => MetricsAvailability::Sampled,
-                live::State::Failing(why) => MetricsAvailability::Unavailable(why.clone()),
-            },
-        );
-        match &self.state.metrics_state {
-            MetricsAvailability::Unavailable(why) if was != self.state.metrics_state => {
-                Some(format!("live metrics unavailable: {why}"))
-            }
-            _ => None,
-        }
-    }
-
     /// Whether this event has been folded before, as it has after a resumed
     /// stream replays it. An unnumbered event (an older driver) cannot be judged,
     /// so it is folded — losing an observation is worse than repeating one.
@@ -657,6 +659,8 @@ impl Feed {
                     reorg_depth: t.reorg_depth,
                     blocks_per_sec: rate,
                     eta: eta(t.height, t.target, rate),
+                    work_rate: t.rate.total(),
+                    pool_rates: t.rate.channels().to_vec(),
                     received_at: elapsed,
                 });
                 verbose.then(|| {
@@ -666,6 +670,14 @@ impl Feed {
                         t.seq, t.height, t.pct, t.phase
                     )
                 })
+            }
+            // Replaced wholesale rather than merged: the driver owns the
+            // bucketing, and a controller stitching two publications together
+            // would have to re-derive the coarsening it deliberately does not
+            // own. A later publication is always the more complete one.
+            SyncEvent::Series { timeline } => {
+                self.state.timeline = Some(timeline.clone());
+                None
             }
             SyncEvent::Probes { board } => {
                 self.state.probes = board
@@ -751,6 +763,7 @@ impl RateMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::Op;
     use crate::sync::ProbeState;
 
     fn feed() -> Feed {
@@ -780,11 +793,70 @@ mod tests {
             pct: 0.0,
             phase: "Historic".into(),
             reorg_depth: 0,
-            sapling_outputs: 0,
-            orchard_outputs: 0,
-            ironwood_outputs: 0,
-            balance: 0,
+            rate: Default::default(),
         })
+    }
+
+    /// A tick carrying measured work, for the rows that have to distinguish an
+    /// unmeasured pool from an idle one.
+    fn tick_with_work(seq: u64, sapling: f64, orchard: f64) -> SyncEvent {
+        let SyncEvent::Tick(mut t) = tick_at(seq, 100, seq * 1000) else {
+            unreachable!("tick_at builds a tick")
+        };
+        // Counted over ten seconds so a fractional rate survives the integer
+        // counts a `Work` holds.
+        let window = std::time::Duration::from_secs(10);
+        let mut work = crate::sync::Work::ZERO;
+        work.set(Op::SaplingOutput, (sapling * 10.0) as u64)
+            .set(Op::OrchardAction, (orchard * 10.0) as u64);
+        t.rate = work.rate(window);
+        SyncEvent::Tick(t)
+    }
+
+    /// The distinction the work map exists to carry, all the way from the wire
+    /// to the panel's view model: Sapling and Orchard were counted, Ironwood
+    /// was counted and is idle, and the tier-B pools were never measured at all.
+    #[test]
+    fn an_unmeasured_pool_reaches_the_panel_as_absent_not_zero() {
+        let mut f = feed();
+        f.absorb(
+            &crate::sync::encode_event(&tick_with_work(1, 19.4, 4.2)),
+            Duration::ZERO,
+            &theme(),
+        );
+        let vitals = f.state.vitals.expect("a tick landed");
+        let rate = |name: &str| {
+            vitals
+                .pool_rates
+                .iter()
+                .find(|(n, _)| *n == name)
+                .and_then(|(_, r)| *r)
+        };
+        assert_eq!(rate("sapling"), Some(19.4));
+        assert_eq!(rate("orchard"), Some(4.2));
+        assert_eq!(rate("transparent"), None, "tier B was never counted");
+        assert_eq!(rate("sprout"), None);
+        let total = vitals.work_rate.expect("a measured total");
+        assert!((total - 23.6).abs() < 1e-9, "{total}");
+    }
+
+    /// A driver that never published a series leaves no graph, and the panel
+    /// has to cope rather than assume one is always there.
+    #[test]
+    fn a_series_event_becomes_the_panels_timeline() {
+        let mut f = feed();
+        assert!(f.state.timeline.is_none());
+
+        let mut timeline = crate::sync::Timeline::new(["work"], Duration::from_secs(5));
+        timeline.push(Duration::ZERO, &[Some(100.0)]);
+        f.absorb(
+            &crate::sync::encode_event(&SyncEvent::Series {
+                timeline: timeline.clone(),
+            }),
+            Duration::ZERO,
+            &theme(),
+        );
+        assert_eq!(f.state.timeline, Some(timeline));
     }
 
     #[test]
@@ -996,60 +1068,6 @@ mod tests {
             Duration::from_secs(30),
             "the age must restart with the gate, not run from launch"
         );
-    }
-
-    /// At panel refresh rate the log cannot carry a line per reading, but a plane
-    /// that breaks must still say so once — and must not keep saying it.
-    #[test]
-    fn a_broken_metrics_plane_is_reported_once_per_transition() {
-        let mut f = feed();
-        let reading = |state: live::State| live::Reading {
-            samples: crate::metrics::MetricsSummary::default(),
-            state,
-        };
-
-        assert!(f.absorb_metrics(reading(live::State::NoTargets)).is_none());
-        assert_eq!(f.state.metrics_state, MetricsAvailability::Idle);
-
-        let line = f
-            .absorb_metrics(reading(live::State::Failing("connection refused".into())))
-            .expect("a plane that broke must reach scrollback");
-        assert!(line.contains("connection refused"), "{line}");
-        assert_eq!(
-            f.state.metrics_state,
-            MetricsAvailability::Unavailable("connection refused".into())
-        );
-
-        assert!(
-            f.absorb_metrics(reading(live::State::Failing("connection refused".into())))
-                .is_none(),
-            "the same failure must not be reprinted every second"
-        );
-    }
-
-    /// The values a scrape produced have to reach the panel, and a later reading
-    /// must replace them rather than accumulate.
-    #[test]
-    fn a_sampled_reading_replaces_the_panels_values() {
-        let mut f = feed();
-        let sampled = |height: f64| live::Reading {
-            samples: crate::metrics::MetricsSummary {
-                samples: vec![crate::metrics::MetricSample {
-                    name: "chain tip height".into(),
-                    query: String::new(),
-                    value: Some(height),
-                }],
-            },
-            state: live::State::Sampled,
-        };
-
-        f.absorb_metrics(sampled(304.0));
-        assert_eq!(f.state.metric("chain tip height"), Some(304.0));
-
-        f.absorb_metrics(sampled(305.0));
-        assert_eq!(f.state.metrics.len(), 1, "readings must not accumulate");
-        assert_eq!(f.state.metric("chain tip height"), Some(305.0));
-        assert_eq!(f.state.metrics_state, MetricsAvailability::Sampled);
     }
 
     /// A resumed stream replays by time, so the overlap is delivered twice. The

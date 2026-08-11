@@ -14,8 +14,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::probe::{Class, ProbeState, ProbeStatus};
+use super::series::Timeline;
+#[cfg(feature = "librustzcash")]
 use super::snapshot::Snapshot;
-use crate::handles::wallet::Pool;
+use super::work::Rate;
 
 /// Tags a driver stdout line as a serialized [`SyncEvent`]. Deliberately not a
 /// plausible log-line opening, so no component's output can be mistaken for an
@@ -55,6 +57,14 @@ pub(crate) enum SyncEvent {
     },
     /// One captured snapshot.
     Tick(Tick),
+    /// The run's whole shape so far, bucketed on one shared time axis.
+    ///
+    /// Republished periodically rather than accumulated controller-side,
+    /// because `ztest sync status` folds a bounded log *tail* and would
+    /// otherwise only ever see the last few minutes of a 48-hour run. The
+    /// timeline self-coarsens to a fixed bucket count, so this event's size is
+    /// constant however long the sync runs.
+    Series { timeline: Timeline },
     /// Every probe's live state, as of the tick just evaluated.
     Probes { board: Vec<Probe> },
     /// A probe fired — recorded whether or not it ends the run.
@@ -86,13 +96,26 @@ pub(crate) struct Tick {
     pub pct: f32,
     pub phase: String,
     pub reorg_depth: u32,
-    pub sapling_outputs: u64,
-    pub orchard_outputs: u64,
-    pub ironwood_outputs: u64,
-    pub balance: i64,
+    /// Per-second work over the interval since the previous tick.
+    ///
+    /// The typed [`Rate`] itself rather than a parallel map of numbers: it
+    /// already answers per-op, per-channel and total, and carries which ops
+    /// were measured, so the controller needs no accessors of its own. It
+    /// travels keyed by [`Op::label`], so an op absent from the wire is
+    /// unmeasured and renders as `—` rather than zero.
+    ///
+    /// Published rather than left for the controller to difference, because a
+    /// resumed stream replays and drops events: a rate computed from whichever
+    /// ticks happened to arrive would be wrong exactly when the connection was
+    /// worst, which is when a reader is most likely watching.
+    #[serde(default)]
+    pub rate: Rate,
 }
 
 impl Tick {
+    // Only the event-publishing reporter builds one, and that is gated on the
+    // wallet backend the sync harness drives.
+    #[cfg(feature = "librustzcash")]
     pub(crate) fn from_snapshot(snap: &Snapshot, elapsed: std::time::Duration) -> Self {
         Tick {
             seq: snap.seq(),
@@ -102,10 +125,7 @@ impl Tick {
             pct: snap.pct(),
             phase: snap.phase().as_str().to_string(),
             reorg_depth: snap.reorg_depth(),
-            sapling_outputs: snap.outputs(Pool::Sapling),
-            orchard_outputs: snap.outputs(Pool::Orchard),
-            ironwood_outputs: snap.outputs(Pool::Ironwood),
-            balance: snap.balances().total(),
+            rate: snap.rate(),
         }
     }
 }
@@ -162,9 +182,9 @@ pub(crate) struct Envelope {
 }
 
 /// The driver's event counter. Process-global rather than owned by the reporter
-/// because the metrics poller publishes on its own task; [`encode`] is the single
-/// point every event passes through, so stamping here is the only way the numbers
-/// can be monotonic across both.
+/// so that any task publishing an event draws from one sequence: [`encode`] is
+/// the single point every event passes through, and stamping there is the only
+/// way the numbers stay monotonic across more than one publisher.
 static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Serialize `event` as one tagged, sequenced line, newline-terminated.
@@ -211,6 +231,7 @@ pub(crate) fn decode(line: &str) -> Option<Envelope> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::work::{Op, Work};
     use super::*;
 
     fn tick() -> Tick {
@@ -222,10 +243,11 @@ mod tests {
             pct: 88.1,
             phase: "Scanning".into(),
             reorg_depth: 0,
-            sapling_outputs: 12,
-            orchard_outputs: 34,
-            ironwood_outputs: 0,
-            balance: 1_000_000,
+            rate: {
+                let mut r = Work::ZERO;
+                r.set(Op::SaplingOutput, 5);
+                r.rate(std::time::Duration::from_secs(2))
+            },
         }
     }
 
@@ -256,8 +278,14 @@ mod tests {
         );
     }
 
-    /// A sync outliving the build that launched it means unnumbered lines can
-    /// still arrive; they must fold, not vanish.
+    /// A sync outliving the build that launched it means unnumbered lines from
+    /// an older driver can still arrive; they must fold, not vanish.
+    ///
+    /// The literal is a genuine pre-work-vector tick: its retired
+    /// `*_outputs` fields are ignored and the work map defaults to empty, which
+    /// reads downstream as *unmeasured*. That is the honest answer — the driver
+    /// that produced this line never counted protocol work — and it is why the
+    /// panel distinguishes `—` from `0` rather than showing zeros here.
     #[test]
     fn an_unnumbered_event_from_an_older_driver_still_decodes() {
         let line = format!(
@@ -265,7 +293,13 @@ mod tests {
         );
         let env = decode(&line).expect("an unnumbered event is still an event");
         assert_eq!(env.n, None);
-        assert!(matches!(env.event, SyncEvent::Tick(_)));
+        let SyncEvent::Tick(t) = env.event else {
+            panic!("did not decode as a tick");
+        };
+        assert_eq!(t.height, 5);
+        assert_eq!(t.reorg_depth, 0, "an absent field decodes to its default");
+        assert_eq!(t.rate.get(Op::SaplingOutput), None);
+        assert_eq!(t.rate.total(), None);
     }
 
     /// The gates that report no single component omit `component` entirely, so the

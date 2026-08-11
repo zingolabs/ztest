@@ -193,10 +193,7 @@ impl<'n> NemesisBuilder<'n> {
     /// Add a probabilistic per-RPC fault rule on the channel selected by
     /// [`channel`](Self::channel).
     pub fn buggify(self, prob: f64, fault: Fault) -> Self {
-        debug_assert!(
-            self.pending_channel,
-            "buggify() must follow channel(..)"
-        );
+        debug_assert!(self.pending_channel, "buggify() must follow channel(..)");
         self.nemesis.buggify.push(BuggifyRule { prob, fault });
         self
     }
@@ -333,13 +330,31 @@ mod tests {
 
     #[test]
     fn buggify_probability_bounds() {
-        let mut never = Buggify::new(1, vec![BuggifyRule { prob: 0.0, fault: Fault::DropConnection }]);
+        let mut never = Buggify::new(
+            1,
+            vec![BuggifyRule {
+                prob: 0.0,
+                fault: Fault::DropConnection,
+            }],
+        );
         assert!((0..1000).all(|_| never.next_fault().is_none()));
 
-        let mut always = Buggify::new(1, vec![BuggifyRule { prob: 1.0, fault: Fault::DropConnection }]);
+        let mut always = Buggify::new(
+            1,
+            vec![BuggifyRule {
+                prob: 1.0,
+                fault: Fault::DropConnection,
+            }],
+        );
         assert!((0..1000).all(|_| always.next_fault() == Some(Fault::DropConnection)));
 
-        let mut n = Buggify::new(7, vec![BuggifyRule { prob: 0.1, fault: Fault::DropConnection }]);
+        let mut n = Buggify::new(
+            7,
+            vec![BuggifyRule {
+                prob: 0.1,
+                fault: Fault::DropConnection,
+            }],
+        );
         let hits = (0..10_000).filter(|_| n.next_fault().is_some()).count();
         assert!((700..=1300).contains(&hits), "~10% of 10k, got {hits}");
     }

@@ -72,6 +72,21 @@
           cargo-deny
           rust-analyzer
 
+          # Chain-snapshot artifact tooling (`fixtures/chains/`).
+          #
+          # `git-lfs` is NOT optional: `.gitattributes` declares
+          # `fixtures/chains/*.tar.zst filter=lfs`, and a clean/smudge filter
+          # whose binary is absent fails *open* — `git add` would commit the
+          # multi-GB archives themselves into the object database with no
+          # warning. Pinning it here makes the filter's presence a property of
+          # the shell rather than of whoever's laptop it is.
+          #
+          # The transfer agent that actually moves those blobs is `ztest
+          # lfs-transfer` (see src/cli/lfs_transfer.rs), so there is nothing
+          # else to install: `lfs.standalonetransferagent` points git-lfs at
+          # this repo's own binary and no LFS server is involved.
+          git-lfs
+
           # Cluster tooling — `kind` brings up a local k8s cluster on
           # top of Docker/Podman; `kubectl` talks to it; `kubernetes-helm`
           # is here for the eventual observability stack.

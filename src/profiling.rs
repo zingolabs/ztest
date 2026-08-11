@@ -11,11 +11,14 @@
 //! mounts the same PVC and streams its contents out.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
-use kube::api::{Api, DeleteParams, LogParams, PostParams};
+use kube::api::{Api, AttachParams, DeleteParams, PostParams};
+use kube::runtime::wait::await_condition;
 use serde_json::json;
+use tokio::io::AsyncReadExt as _;
 
 use crate::cluster::Sentinel;
 use crate::error::{EnvError, env_err};
@@ -104,6 +107,62 @@ pub(crate) async fn collect(
     }
 }
 
+/// Every profiled component in `namespace`, recovered from its artifact PVC.
+///
+/// The driver holds the profiled-pod list in memory and takes it to the grave, so
+/// an after-the-fact reader (`ztest sync perf`, run from a laptop long after the
+/// driver exited) has to rediscover it. The PVC naming convention is the record
+/// that survives: one claim per profiled pod, so the claims *are* the list.
+pub(crate) async fn profiled_components(
+    client: &Client,
+    namespace: &str,
+) -> Result<Vec<String>, EnvError> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+    let list = claims
+        .list(&kube::api::ListParams::default())
+        .await
+        .map_err(env_err)?;
+    let mut pods: Vec<String> = list
+        .items
+        .iter()
+        .filter_map(|c| c.metadata.name.as_deref())
+        .filter_map(|name| name.strip_prefix("ztest-profile-"))
+        .map(str::to_string)
+        .collect();
+    pods.sort();
+    Ok(pods)
+}
+
+/// Retrieve one component's profile artifacts **without disturbing the run**.
+///
+/// Prefers the live component pod, which is both faster (no collector pod, no PVC
+/// remount) and the only option while the pod holds the RWO claim. Falls back to
+/// the PVC once the component is gone, which is the state a finished sync is left
+/// in. Neither path stops, drains, or signals anything: a diagnostic command that
+/// can end a multi-hour run is a footgun, so `perf` is strictly a reader.
+///
+/// The live path yields whatever the component has flushed *so far*. Under the
+/// current write-on-SIGTERM contract that is nothing until shutdown — see the
+/// cadence discussion in `docs/how-to-profile.md`.
+pub(crate) async fn retrieve(
+    client: &Client,
+    namespace: &str,
+    pod_name: &str,
+    dest_dir: &Path,
+) -> Result<Vec<PathBuf>, EnvError> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let live = matches!(pods.get_opt(pod_name).await, Ok(Some(p))
+        if p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"));
+
+    let tarball = match live {
+        true => exec_tar(&pods, pod_name).await?,
+        false => run_collector(client, namespace, pod_name, &artifact_pvc_name(pod_name)).await?,
+    };
+    unpack_artifacts(&tarball, dest_dir, pod_name)
+}
+
 /// Delete the component pod with the profiling grace period and wait for it to
 /// disappear, so the RWO artifact PVC is free for the collector to mount.
 async fn drain_pod(client: &Client, namespace: &str, pod_name: &str) -> Result<(), EnvError> {
@@ -131,9 +190,79 @@ async fn drain_pod(client: &Client, namespace: &str, pod_name: &str) -> Result<(
     })
 }
 
-/// Run a one-shot collector pod that tars the artifact PVC to stdout (base64, so
-/// it survives the log channel), wait for completion, and return the raw
-/// (uncompressed) tar bytes.
+/// How long the collector pod idles waiting to be exec'd into. Bounds the mess a
+/// crashed `ztest` leaves behind: the pod deletes itself once this elapses, so a
+/// lost collector cannot pin the RWO artifact PVC indefinitely.
+const COLLECTOR_IDLE_SECS: u32 = 300;
+/// How long to wait for a previous collector to leave the API before forcing it.
+const COLLECTOR_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait for a fresh collector to reach `Running`.
+const COLLECTOR_START_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Stream `ARTIFACT_DIR` out of a **running** pod as tar bytes, over `exec`.
+///
+/// The transport is deliberately `exec` rather than the pod log. Tarring to
+/// stdout and reading it back as a log line requires base64 (+33%) and rides a
+/// channel the kubelet *rotates*: a profile larger than the container log cap
+/// comes back silently truncated, and profile size grows with a process's unique
+/// stack count — precisely the artifact that outgrows it. The exec websocket has
+/// no rotation and needs no re-encoding, and `pods/exec` is already granted to
+/// the run role alongside `pods/log`.
+async fn exec_tar(pods: &Api<Pod>, pod_name: &str) -> Result<Vec<u8>, EnvError> {
+    let mut proc = pods
+        .exec(
+            pod_name,
+            ["tar", "cf", "-", "-C", ARTIFACT_DIR, "."],
+            &AttachParams::default().stdout(true).stderr(false),
+        )
+        .await
+        .map_err(env_err)?;
+    // Taken before the read, because `join` consumes the process. `join` only
+    // reports whether the *websocket* survived; the command's own exit code
+    // arrives on this channel. Ignoring it would let a `tar` that died partway
+    // — "file changed as we read it" is reachable here, since the component
+    // renames snapshots into this directory while we read it — return a
+    // truncated archive that unpacks without complaint into a short profile.
+    let status = proc.take_status().ok_or_else(|| EnvError::Config {
+        reason: format!("exec into {pod_name} returned no status channel"),
+    })?;
+    let mut stdout = proc.stdout().ok_or_else(|| EnvError::Config {
+        reason: format!("exec into {pod_name} returned no stdout stream"),
+    })?;
+    let mut tarball = Vec::new();
+    stdout
+        .read_to_end(&mut tarball)
+        .await
+        .map_err(|e| EnvError::Config {
+            reason: format!("read tar stream from {pod_name}: {e}"),
+        })?;
+    // Awaited after the read: the far end only closes once `tar` has exited, so
+    // waiting first would deadlock against the bytes still in flight.
+    let exit = status.await;
+    proc.join().await.map_err(env_err)?;
+
+    if let Some(failure) = exit.filter(|s| s.status.as_deref() != Some("Success")) {
+        return Err(EnvError::Config {
+            reason: format!(
+                "tar in {pod_name} failed: {}",
+                failure.message.as_deref().unwrap_or("no detail")
+            ),
+        });
+    }
+    if tarball.is_empty() {
+        return Err(EnvError::Config {
+            reason: format!("{pod_name} produced no profile artifacts at {ARTIFACT_DIR}"),
+        });
+    }
+    Ok(tarball)
+}
+
+/// Mount the artifact PVC in a short-lived collector pod and stream it out.
+///
+/// Used when the component that owns the profile is gone — the artifact outlives
+/// it on the PVC, but nothing is left to `exec` into. The pod idles rather than
+/// running `tar` as its entrypoint so the tar can be an `exec` (see
+/// [`exec_tar`]); `Running`, not `Succeeded`, is therefore the state to wait for.
 async fn run_collector(
     client: &Client,
     namespace: &str,
@@ -152,8 +281,7 @@ async fn run_collector(
             "containers": [{
                 "name": "collect",
                 "image": COLLECTOR_IMAGE,
-                "command": ["sh", "-c",
-                    format!("tar cf - -C {ARTIFACT_DIR} . | base64 -w0")],
+                "command": ["sleep", COLLECTOR_IDLE_SECS.to_string()],
                 "volumeMounts": [{ "name": "artifact", "mountPath": ARTIFACT_DIR, "readOnly": true }],
             }],
             "volumes": [{
@@ -164,45 +292,79 @@ async fn run_collector(
     }))
     .expect("static collector pod manifest is valid");
 
-    // Best-effort clean of a stale collector from a prior attempt.
-    let _ = pods.delete(&collector, &DeleteParams::default()).await;
+    remove_collector(&pods, &collector).await;
     pods.create(&PostParams::default(), &manifest)
         .await
         .map_err(env_err)?;
 
-    // Wait for it to reach a terminal phase.
-    let mut b64 = String::new();
-    for _ in 0..120 {
-        if let Ok(Some(p)) = pods.get_opt(&collector).await {
-            let phase = p
-                .status
-                .as_ref()
-                .and_then(|s| s.phase.as_deref())
-                .unwrap_or("");
-            if phase == "Succeeded" {
-                b64 = pods
-                    .logs(&collector, &LogParams::default())
-                    .await
-                    .map_err(env_err)?;
-                break;
-            }
-            if phase == "Failed" {
-                let _ = pods.delete(&collector, &DeleteParams::default()).await;
-                return Err(EnvError::Config {
-                    reason: format!("collector pod for {pod_name} failed"),
-                });
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    let _ = pods.delete(&collector, &DeleteParams::default()).await;
+    let ready = wait_running(&pods, &collector).await;
+    let result = match ready {
+        Ok(()) => exec_tar(&pods, &collector).await,
+        Err(e) => Err(e),
+    };
+    remove_collector(&pods, &collector).await;
+    result
+}
 
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .map_err(|e| EnvError::Config {
-            reason: format!("decode collector output for {pod_name}: {e}"),
+/// Delete the collector and wait for it to actually leave the API.
+///
+/// `delete` returns once the deletion is *accepted*; the object keeps its name
+/// until the kubelet has stopped the container and unmounted the PVC. Creating
+/// the replacement inside that window fails with a 409 that no retry of the
+/// create can clear (`object is being deleted: … already exists`), so waiting
+/// for the name to free is what makes `ztest sync perf` re-runnable.
+async fn remove_collector(pods: &Api<Pod>, name: &str) {
+    if pods.delete(name, &DeleteParams::default()).await.is_err() {
+        return;
+    }
+    let gone = await_condition(pods.clone(), name, |p: Option<&Pod>| p.is_none());
+    if !matches!(
+        tokio::time::timeout(COLLECTOR_TEARDOWN_TIMEOUT, gone).await,
+        Ok(Ok(_))
+    ) {
+        let _ = pods
+            .delete(name, &DeleteParams::default().grace_period(0))
+            .await;
+    }
+}
+
+/// Wait for a pod to reach `Running`, the state in which it can be `exec`'d.
+///
+/// Settles on `Failed` as well: under `restartPolicy: Never` a collector that
+/// cannot start never recovers — usually because the RWO artifact volume is
+/// still attached to a component pod that has not finished terminating — so
+/// waking for it reports the cause instead of spinning to the timeout.
+async fn wait_running(pods: &Api<Pod>, name: &str) -> Result<(), EnvError> {
+    let settled = await_condition(pods.clone(), name, |p: Option<&Pod>| {
+        p.is_some_and(|p| {
+            matches!(
+                p.status.as_ref().and_then(|s| s.phase.as_deref()),
+                Some("Running" | "Failed")
+            )
         })
+    });
+    match tokio::time::timeout(COLLECTOR_START_TIMEOUT, settled).await {
+        Err(_) => Err(EnvError::Config {
+            reason: format!(
+                "collector pod {name} was not Running within {}s — its artifact \
+                 volume is likely still attached to a terminating pod",
+                COLLECTOR_START_TIMEOUT.as_secs()
+            ),
+        }),
+        Ok(Err(e)) => Err(EnvError::Config {
+            reason: format!("watching collector pod {name}: {e}"),
+        }),
+        Ok(Ok(pod)) => match pod
+            .as_ref()
+            .and_then(|p| p.status.as_ref())
+            .and_then(|s| s.phase.as_deref())
+        {
+            Some("Failed") => Err(EnvError::Config {
+                reason: format!("collector pod {name} failed to start"),
+            }),
+            _ => Ok(()),
+        },
+    }
 }
 
 /// Unpack every profile artifact (`flamegraph.svg`, `profile.pb`, …) from the
@@ -238,6 +400,13 @@ fn unpack_artifacts(
         let Some(file) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
             continue;
         };
+        // A leading dot is a snapshot mid-write: the contract writes to `.<name>.tmp`
+        // and renames, so anything still dotted was caught in flight and is a
+        // partial protobuf. Unpacking it would litter the output with files that
+        // look like profiles and parse as nothing.
+        if file.starts_with('.') {
+            continue;
+        }
         let out = dest_dir.join(format!("{pod_name}-{file}"));
         entry.unpack(&out).map_err(|e| EnvError::Config {
             reason: format!("unpack {file}: {e}"),
@@ -246,7 +415,11 @@ fn unpack_artifacts(
     }
     if written.is_empty() {
         return Err(EnvError::Config {
-            reason: format!("no profile artifacts in {pod_name}'s collected tar"),
+            reason: format!(
+                "{pod_name}'s artifact volume holds no profile — without \
+                 ZTEST_PROFILE_INTERVAL one is written only on graceful shutdown, \
+                 so a component still running has none yet"
+            ),
         });
     }
     Ok(written)

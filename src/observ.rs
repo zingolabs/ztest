@@ -101,7 +101,7 @@ fn install(sink: Sink) {
             // spew onto and corrupt the pinned panel. Losing best-effort
             // diagnostics is strictly better than a garbled panel.
             Err(_) => {
-                let _ = builder.with_writer(|| std::io::sink()).try_init();
+                let _ = builder.with_writer(std::io::sink).try_init();
             }
         },
     }

@@ -1,27 +1,36 @@
-//! L4 — the result. [`LoadReport`] carries per-op latency percentiles (true
-//! p50/p90/p99/p99.9 from an `hdrhistogram`, the actionable upgrade over
-//! `zaino-admin`'s min/mean/max), throughput, error and oracle-violation counts,
-//! and — for a differential run — the second backend's numbers plus the exact
-//! field-level parity diffs.
+//! L4 — the result. [`LoadReport`] carries each backend's latency percentiles
+//! (true p50/p90/p99/p99.9 from an `hdrhistogram`, the actionable upgrade over
+//! `zaino-admin`'s min/mean/max), throughput, error and violation counts — and,
+//! for a differential run, the heights at which the two backends disagreed.
 //!
-//! Three gates, matching the design doc's measurement model:
-//! - [`assert_slo`](LoadReport::assert_slo) — **absolute** p99 / throughput.
-//!   Trust only on a calibrated cluster (static CPU policy + fio-calibrated I/O).
-//! - [`assert_parity`](LoadReport::assert_parity) — A ≡ B, field-identical.
+//! Two gates:
+//! - [`assert_correct`](LoadReport::assert_correct) — zero violations, zero
+//!   errors, on **every** backend driven. Always safe: a broken chain link or a
+//!   failed RPC is a defect, not a timing artifact.
+//! - [`assert_parity`](LoadReport::assert_parity) — A ≡ B, byte-identical.
 //! - [`assert_relative`](LoadReport::assert_relative) — A/B **ratio**, robust
 //!   even on an uncalibrated cluster because both backends share the node.
+//!
+//! There is deliberately no *absolute* latency gate. It would need a calibrated
+//! cluster (static CPU policy, fio-calibrated I/O) to mean anything, and until
+//! that exists a number here would be false confidence.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
 
-use crate::loadtest::oracle::{FieldDiff, Violation};
+use crate::loadtest::oracle::Violation;
 
 /// The operation a latency sample is attributed to, so a report can point at the
 /// slow RPC rather than reporting one blended number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OpKind {
+    /// Dialing this connection's channel. Separated from the RPC it precedes
+    /// because the accept path degrades independently — a server that stalls on
+    /// a spawn burst shows it here and nowhere else. Connect samples never count
+    /// toward throughput.
+    Connect,
     GetLatestBlock,
     GetBlock,
     GetBlockRange,
@@ -30,6 +39,7 @@ pub enum OpKind {
 impl std::fmt::Display for OpKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            OpKind::Connect => "Connect",
             OpKind::GetLatestBlock => "GetLatestBlock",
             OpKind::GetBlock => "GetBlock",
             OpKind::GetBlockRange => "GetBlockRange",
@@ -65,51 +75,63 @@ impl LatencyStats {
     }
 }
 
-/// A field-level divergence between backend A and B at a given height.
+/// One backend's results.
+///
+/// A differential run fills two of these rather than prefixing a second set of
+/// fields onto the report, so a failure always names the backend that produced
+/// it — parity alone cannot, since two backends broken identically agree
+/// perfectly.
 #[derive(Debug, Clone)]
-pub struct ParityRecord {
-    pub height: u64,
-    pub diff: FieldDiff,
-}
-
-impl std::fmt::Display for ParityRecord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "height {} [{}]: A={} B={}",
-            self.height, self.diff.field, self.diff.value_a, self.diff.value_b
-        )
-    }
-}
-
-/// The verdict of a load run. Single-backend runs leave the `b_*` fields empty;
-/// [`DiffLoadDriver`](super::DiffLoadDriver) populates them.
-#[derive(Debug, Clone)]
-pub struct LoadReport {
-    pub label: String,
+pub struct Side {
     pub by_op: BTreeMap<OpKind, LatencyStats>,
     /// Successful ops per second across the whole run (wall-clock).
     pub throughput: f64,
     pub total_ops: u64,
     pub errors: u64,
-    pub wall: Duration,
-    pub connections: usize,
     /// Correctness failures the oracle raised while the run was in flight.
     pub violations: Vec<Violation>,
-    /// Backend B's latency, present only for a differential run.
-    pub b_by_op: BTreeMap<OpKind, LatencyStats>,
-    pub b_throughput: f64,
-    /// Field-level A-vs-B divergences, present only for a differential run.
-    pub parity_diffs: Vec<ParityRecord>,
 }
 
-/// Absolute service-level objective. Trustworthy only on a calibrated cluster.
-#[derive(Debug, Clone, Copy)]
-pub struct Slo {
-    pub max_p99: Duration,
-    pub min_throughput: f64,
-    pub max_error_rate: f64,
-    pub zero_violations: bool,
+/// A height at which the two backends disagreed.
+///
+/// Byte inequality is the whole gate: `CompactBlock` derives `PartialEq`, so it
+/// is exhaustive by construction and cannot miss a field the way a hand-written
+/// field-by-field differ drifts as the proto evolves. The height is the
+/// fingerprint; reproduce it with a single `GetBlock` against each backend.
+#[derive(Debug, Clone)]
+pub struct ParityRecord {
+    pub height: u64,
+    pub detail: &'static str,
+}
+
+impl ParityRecord {
+    pub(crate) const DIFFERS: &'static str = "blocks differ";
+    pub(crate) const MISSING_FROM_B: &'static str = "present in A, missing from B";
+    pub(crate) const MISSING_FROM_A: &'static str = "missing from A, present in B";
+}
+
+impl std::fmt::Display for ParityRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "height {}: {}", self.height, self.detail)
+    }
+}
+
+/// The verdict of a load run.
+#[derive(Debug, Clone)]
+pub struct LoadReport {
+    pub label: String,
+    pub wall: Duration,
+    pub connections: usize,
+    /// The endpoint driven by [`LoadDriver::new`](super::LoadDriver::new), or
+    /// the first of the pair.
+    pub a: Side,
+    /// The second endpoint, present only for a differential run
+    /// ([`LoadDriver::pair`](super::LoadDriver::pair)).
+    pub b: Option<Side>,
+    /// Heights where A and B disagreed. Empty for a single-endpoint run — which
+    /// is why [`assert_parity`](Self::assert_parity) rejects one outright rather
+    /// than reading emptiness as success.
+    pub parity_diffs: Vec<ParityRecord>,
 }
 
 /// A/B-relative budget: ratios of B against A. Robust on any cluster.
@@ -121,9 +143,7 @@ pub struct Rel {
     pub throughput_ratio_min: f64,
 }
 
-/// The always-on gate: a correctness failure that no amount of load should
-/// excuse. Kept separate from [`SloError`] so perf and correctness gate
-/// independently.
+/// The always-on gate: a correctness failure that no amount of load excuses.
 #[derive(Debug, thiserror::Error)]
 pub enum CorrectnessError {
     #[error("{label}: {count} oracle violation(s); first: {first}")]
@@ -141,184 +161,160 @@ pub enum CorrectnessError {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("SLO breached ({label}): {reasons:?}")]
-pub struct SloError {
-    pub label: String,
-    pub reasons: Vec<String>,
+pub enum ParityError {
+    #[error("parity failed ({label}): {count} height(s) diverged; first: {first}")]
+    Diverged {
+        label: String,
+        count: usize,
+        first: String,
+    },
+    /// Guards against a vacuous pass: a single-endpoint run has nothing to
+    /// compare, so an empty diff list is not evidence of agreement.
+    #[error("{label}: assert_parity needs a differential run (LoadDriver::pair)")]
+    NotDifferential { label: String },
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("parity failed ({label}): {} field di(s) across {} height(s); first: {first}", count, heights)]
-pub struct ParityError {
-    pub label: String,
-    pub count: usize,
-    pub heights: usize,
-    pub first: String,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("relative budget breached ({label}): {reasons:?}")]
-pub struct RelError {
-    pub label: String,
-    pub reasons: Vec<String>,
+pub enum RelError {
+    #[error("relative budget breached ({label}): {reasons:?}")]
+    Breached { label: String, reasons: Vec<String> },
+    #[error("{label}: assert_relative needs a differential run (LoadDriver::pair)")]
+    NotDifferential { label: String },
 }
 
 impl LoadReport {
-    fn error_rate(&self) -> f64 {
-        let attempts = self.total_ops + self.errors;
-        if attempts == 0 {
-            0.0
-        } else {
-            self.errors as f64 / attempts as f64
+    /// Each backend paired with a label naming it, so every message is
+    /// attributable.
+    fn sides(&self) -> Vec<(String, &Side)> {
+        let mut sides = vec![(self.label.clone(), &self.a)];
+        if let Some(b) = &self.b {
+            sides.push((format!("{} [backend B]", self.label), b));
         }
-    }
-
-    fn worst_p99(stats: &BTreeMap<OpKind, LatencyStats>) -> Option<(OpKind, Duration)> {
-        stats
-            .iter()
-            .map(|(k, s)| (*k, s.p99))
-            .max_by_key(|(_, d)| *d)
+        sides
     }
 
     /// Human-readable summary. Printed unconditionally; the engine's reporter
     /// captures it and surfaces it on failure.
     pub fn print(&self) {
         eprintln!("── load report: {} ──", self.label);
-        eprintln!(
-            "  {} conns · {} ops · {} errors · {:.0} ops/s · {:.1}s wall",
-            self.connections,
-            self.total_ops,
-            self.errors,
-            self.throughput,
-            self.wall.as_secs_f64(),
-        );
-        for (op, s) in &self.by_op {
-            eprint!(
-                "  {op:<16} n={:<8} p50={:>8.2}ms p90={:>8.2}ms p99={:>8.2}ms p99.9={:>8.2}ms max={:>8.2}ms",
-                s.count,
-                ms(s.p50),
-                ms(s.p90),
-                ms(s.p99),
-                ms(s.p999),
-                ms(s.max),
+        for (name, side) in self.sides() {
+            eprintln!(
+                "  {name}: {} conns · {} ops · {} errors · {:.0} ops/s · {:.1}s wall",
+                self.connections,
+                side.total_ops,
+                side.errors,
+                side.throughput,
+                self.wall.as_secs_f64(),
             );
-            if let Some(b) = self.b_by_op.get(op) {
-                eprint!("  | B p99={:>8.2}ms", ms(b.p99));
+            for (op, s) in &side.by_op {
+                eprintln!(
+                    "    {op:<16} n={:<8} p50={:>8.2}ms p90={:>8.2}ms p99={:>8.2}ms \
+                     p99.9={:>8.2}ms max={:>8.2}ms",
+                    s.count,
+                    ms(s.p50),
+                    ms(s.p90),
+                    ms(s.p99),
+                    ms(s.p999),
+                    ms(s.max),
+                );
             }
-            eprintln!();
+            if !side.violations.is_empty() {
+                eprintln!("    ⚠ {} oracle violation(s):", side.violations.len());
+                for v in side.violations.iter().take(10) {
+                    eprintln!("        {v}");
+                }
+            }
         }
-        if !self.violations.is_empty() {
-            eprintln!("  ⚠ {} oracle violation(s):", self.violations.len());
-            for v in self.violations.iter().take(10) {
-                eprintln!("      {v}");
+        if let Some(b) = &self.b {
+            eprintln!("  B/A ratios:");
+            for (op, a) in &self.a.by_op {
+                if let Some(bs) = b.by_op.get(op) {
+                    eprintln!("    {op:<16} p99 ×{:.2}", ratio(bs.p99, a.p99));
+                }
             }
+            eprintln!(
+                "    {:<16} ×{:.2}",
+                "throughput",
+                if self.a.throughput > 0.0 {
+                    b.throughput / self.a.throughput
+                } else {
+                    0.0
+                },
+            );
         }
         if !self.parity_diffs.is_empty() {
-            eprintln!("  ⚠ {} parity diff(s):", self.parity_diffs.len());
+            eprintln!("  ⚠ {} height(s) diverged:", self.parity_diffs.len());
             for p in self.parity_diffs.iter().take(10) {
                 eprintln!("      {p}");
             }
         }
     }
 
-    /// The correctness gate: zero oracle violations and zero request errors.
-    /// This holds regardless of cluster calibration — a broken chain link or a
-    /// failed RPC is a defect, not a timing artifact — so it is always safe to
-    /// gate on, unlike [`assert_slo`](Self::assert_slo).
+    /// The correctness gate: zero oracle violations and zero request errors, on
+    /// every backend driven. A differential run that checked only A would miss a
+    /// defect B alone exhibits.
     pub fn assert_correct(&self) -> Result<(), CorrectnessError> {
-        if let Some(first) = self.violations.first() {
-            return Err(CorrectnessError::Violations {
-                label: self.label.clone(),
-                count: self.violations.len(),
-                first: first.to_string(),
-            });
+        // Violations first across both sides, then errors: a chain-link failure
+        // is a more specific diagnosis than "the RPC failed".
+        for (name, side) in self.sides() {
+            if let Some(first) = side.violations.first() {
+                return Err(CorrectnessError::Violations {
+                    label: name,
+                    count: side.violations.len(),
+                    first: first.to_string(),
+                });
+            }
         }
-        if self.errors > 0 {
-            return Err(CorrectnessError::Errors {
-                label: self.label.clone(),
-                errors: self.errors,
-                attempts: self.total_ops + self.errors,
-            });
+        for (name, side) in self.sides() {
+            if side.errors > 0 {
+                return Err(CorrectnessError::Errors {
+                    label: name,
+                    errors: side.errors,
+                    attempts: side.total_ops + side.errors,
+                });
+            }
         }
         Ok(())
     }
 
-    /// Gate on an absolute SLO. See the caveat on cluster calibration.
-    pub fn assert_slo(&self, slo: Slo) -> Result<(), SloError> {
-        let mut reasons = Vec::new();
-        if let Some((op, p99)) = Self::worst_p99(&self.by_op) {
-            if p99 > slo.max_p99 {
-                reasons.push(format!(
-                    "{op} p99 {:.2}ms > {:.2}ms",
-                    ms(p99),
-                    ms(slo.max_p99)
-                ));
-            }
-        }
-        if self.throughput < slo.min_throughput {
-            reasons.push(format!(
-                "throughput {:.0} < {:.0} ops/s",
-                self.throughput, slo.min_throughput
-            ));
-        }
-        let rate = self.error_rate();
-        if rate > slo.max_error_rate {
-            reasons.push(format!(
-                "error rate {:.4} > {:.4}",
-                rate, slo.max_error_rate
-            ));
-        }
-        if slo.zero_violations && !self.violations.is_empty() {
-            reasons.push(format!("{} oracle violation(s)", self.violations.len()));
-        }
-        if reasons.is_empty() {
-            Ok(())
-        } else {
-            Err(SloError {
-                label: self.label.clone(),
-                reasons,
-            })
-        }
-    }
-
-    /// Gate on A ≡ B — no field-level divergence between the two backends.
+    /// Gate on A ≡ B — no height at which the two backends disagreed.
     pub fn assert_parity(&self) -> Result<(), ParityError> {
-        if self.parity_diffs.is_empty() {
-            return Ok(());
+        if self.b.is_none() {
+            return Err(ParityError::NotDifferential {
+                label: self.label.clone(),
+            });
         }
-        let mut heights: Vec<u64> = self.parity_diffs.iter().map(|p| p.height).collect();
-        heights.sort_unstable();
-        heights.dedup();
-        Err(ParityError {
-            label: self.label.clone(),
-            count: self.parity_diffs.len(),
-            heights: heights.len(),
-            first: self.parity_diffs[0].to_string(),
-        })
+        match self.parity_diffs.first() {
+            None => Ok(()),
+            Some(first) => Err(ParityError::Diverged {
+                label: self.label.clone(),
+                count: self.parity_diffs.len(),
+                first: first.to_string(),
+            }),
+        }
     }
 
     /// Gate on the A/B ratio budget.
     pub fn assert_relative(&self, rel: Rel) -> Result<(), RelError> {
+        let Some(b) = &self.b else {
+            return Err(RelError::NotDifferential {
+                label: self.label.clone(),
+            });
+        };
         let mut reasons = Vec::new();
-        for (op, a) in &self.by_op {
-            if let Some(b) = self.b_by_op.get(op) {
-                let a_us = a.p99.as_secs_f64();
-                if a_us > 0.0 {
-                    let ratio = b.p99.as_secs_f64() / a_us;
-                    if ratio > rel.p99_ratio_max {
-                        reasons.push(format!(
-                            "{op} p99 ratio {ratio:.2} > {:.2}",
-                            rel.p99_ratio_max
-                        ));
-                    }
+        for (op, a) in &self.a.by_op {
+            if let Some(bs) = b.by_op.get(op) {
+                let r = ratio(bs.p99, a.p99);
+                if r > rel.p99_ratio_max {
+                    reasons.push(format!("{op} p99 ratio {r:.2} > {:.2}", rel.p99_ratio_max));
                 }
             }
         }
-        if self.throughput > 0.0 {
-            let ratio = self.b_throughput / self.throughput;
-            if ratio < rel.throughput_ratio_min {
+        if self.a.throughput > 0.0 {
+            let r = b.throughput / self.a.throughput;
+            if r < rel.throughput_ratio_min {
                 reasons.push(format!(
-                    "throughput ratio {ratio:.2} < {:.2}",
+                    "throughput ratio {r:.2} < {:.2}",
                     rel.throughput_ratio_min
                 ));
             }
@@ -326,7 +322,7 @@ impl LoadReport {
         if reasons.is_empty() {
             Ok(())
         } else {
-            Err(RelError {
+            Err(RelError::Breached {
                 label: self.label.clone(),
                 reasons,
             })
@@ -336,4 +332,83 @@ impl LoadReport {
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
+}
+
+/// `b / a`, or `0.0` when `a` is zero (no samples — nothing to compare).
+fn ratio(b: Duration, a: Duration) -> f64 {
+    let a = a.as_secs_f64();
+    if a > 0.0 { b.as_secs_f64() / a } else { 0.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn side() -> Side {
+        Side {
+            by_op: BTreeMap::new(),
+            throughput: 100.0,
+            total_ops: 10,
+            errors: 0,
+            violations: Vec::new(),
+        }
+    }
+
+    fn report(a: Side, b: Option<Side>) -> LoadReport {
+        LoadReport {
+            label: "t".into(),
+            wall: Duration::from_secs(1),
+            connections: 1,
+            a,
+            b,
+            parity_diffs: Vec::new(),
+        }
+    }
+
+    /// The regression this shape exists to prevent: B's errors used to be summed
+    /// into A's count, so a failure could not name the backend that produced it.
+    #[test]
+    fn errors_are_attributed_to_the_backend_that_produced_them() {
+        let mut b = side();
+        b.errors = 3;
+        let err = report(side(), Some(b)).assert_correct().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("[backend B]"), "{msg}");
+        assert!(msg.contains("3 request error"), "{msg}");
+    }
+
+    #[test]
+    fn violations_are_attributed_to_the_backend_that_produced_them() {
+        let mut b = side();
+        b.violations.push(Violation {
+            height: 7,
+            field: "hash".into(),
+            detail: "boom".into(),
+        });
+        let err = report(side(), Some(b)).assert_correct().unwrap_err();
+        assert!(err.to_string().contains("[backend B]"));
+    }
+
+    /// A single-endpoint run has an empty diff list; reading that as agreement
+    /// would let a mis-authored test pass while comparing nothing.
+    #[test]
+    fn parity_and_relative_reject_a_single_endpoint_run() {
+        let r = report(side(), None);
+        assert!(matches!(
+            r.assert_parity(),
+            Err(ParityError::NotDifferential { .. })
+        ));
+        assert!(matches!(
+            r.assert_relative(Rel {
+                p99_ratio_max: 5.0,
+                throughput_ratio_min: 0.1,
+            }),
+            Err(RelError::NotDifferential { .. })
+        ));
+    }
+
+    #[test]
+    fn a_differential_run_with_no_diffs_passes_parity() {
+        assert!(report(side(), Some(side())).assert_parity().is_ok());
+    }
 }

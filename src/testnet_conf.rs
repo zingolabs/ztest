@@ -2,7 +2,7 @@
 //!
 //! Companion to [`crate::regtest_conf`]. Renders `zebrad.toml` and
 //! `zainod.toml` for the testnet network, paired with a pre-synced chain
-//! archive mounted via [`crate::regtest::testnet_chain_archive`]. All
+//! archive mounted via `testnet_chain_archive`. All
 //! variants (`orchard`, `sapling`, ...) share the same TOML body; the
 //! `variant` selects only which chain snapshot is mounted.
 
@@ -22,10 +22,19 @@ pub fn testnet_zebrad_conf(
     _version: Semver,
     rpc_port: u16,
     cache_dir: &str,
+    indexer_listen_port: Option<u16>,
     metrics_port: Option<u16>,
 ) -> String {
     let metrics_block = match metrics_port {
         Some(port) => format!("\n\n[metrics]\nendpoint_addr = \"0.0.0.0:{port}\""),
+        None => String::new(),
+    };
+    // zebra starts its indexer gRPC server only when this key is present. Without
+    // it a colocated zaino `Direct` backend has no address to dial and refuses to
+    // construct at all ("Missing validator_grpc_listen_address"), which is why the
+    // testnet state topology could never start.
+    let indexer_line = match indexer_listen_port {
+        Some(port) => format!("\nindexer_listen_addr = \"0.0.0.0:{port}\""),
         None => String::new(),
     };
     format!(
@@ -53,7 +62,7 @@ peerset_initial_target_size = 25
 debug_force_finished_sync = false
 enable_cookie_auth = false
 parallel_cpu_threads = 0
-listen_addr = \"0.0.0.0:{rpc_port}\"
+listen_addr = \"0.0.0.0:{rpc_port}\"{indexer_line}
 
 [state]
 cache_dir = \"{cache_dir}\"
@@ -93,10 +102,21 @@ pub fn testnet_zainod_conf(
     validator_rpc_port: u16,
     zebra_db_path: &str,
     zaino_db_path: &str,
+    validator_grpc: Option<&str>,
     metrics_port: Option<u16>,
 ) -> String {
+    // Every listener binds `LISTEN_ALL`; see that constant for why loopback
+    // cannot work under pod-per-test.
+    let listen_all = crate::handles::ports::LISTEN_ALL;
     let metrics_line = match metrics_port {
-        Some(port) => format!("\nmetrics_endpoint = '0.0.0.0:{port}'"),
+        Some(port) => format!("\nmetrics_endpoint = '{listen_all}:{port}'"),
+        None => String::new(),
+    };
+    // `backend = 'direct'` is rejected at config load without this key, so it is
+    // required for the state backend and meaningless for fetch (which forwards
+    // every query over JSON-RPC and never opens a DB).
+    let validator_grpc_line = match validator_grpc {
+        Some(addr) => format!("\nvalidator_grpc_listen_address = '{addr}'"),
         None => String::new(),
     };
     format!(
@@ -108,13 +128,13 @@ zebra_db_path = '{zebra_db_path}'
 network = 'Testnet'{metrics_line}
 
 [grpc_settings]
-listen_address = '0.0.0.0:{grpc_listen_port}'
+listen_address = '{listen_all}:{grpc_listen_port}'
 
 [json_server_settings]
-json_rpc_listen_address = '127.0.0.1:{jsonrpc_listen_port}'
+json_rpc_listen_address = '{listen_all}:{jsonrpc_listen_port}'
 
 [validator_settings]
-validator_jsonrpc_listen_address = '{validator_host}:{validator_rpc_port}'
+validator_jsonrpc_listen_address = '{validator_host}:{validator_rpc_port}'{validator_grpc_line}
 validator_user = 'xxxxxx'
 validator_password = 'xxxxxx'
 
@@ -143,7 +163,7 @@ mod tests {
 
     #[test]
     fn zebrad_renders_with_cache_dir_in_both_state_and_network() {
-        let toml = testnet_zebrad_conf(v(), 18232, "/var/cache/zebrad", None);
+        let toml = testnet_zebrad_conf(v(), 18232, "/var/cache/zebrad", None, None);
         // Both [network] and [state] must point at the snapshot mount, or
         // zebrad re-syncs from genesis and ignores the archive.
         assert_eq!(toml.matches("cache_dir = \"/var/cache/zebrad\"").count(), 2);
@@ -151,44 +171,111 @@ mod tests {
         assert!(toml.contains("network = \"Testnet\""));
     }
 
+    /// zebra starts its indexer gRPC only when the key is present. Its absence on
+    /// the testnet path left `backend = 'direct'` unconfigurable, so the state
+    /// indexer could not start at all.
     #[test]
-    fn zainod_fetch_vs_state_differ_only_in_backend_line() {
+    fn zebrad_indexer_listen_addr_is_gated_on_the_port() {
+        let off = testnet_zebrad_conf(v(), 18232, "/var/cache/zebrad", None, None);
+        let on = testnet_zebrad_conf(v(), 18232, "/var/cache/zebrad", Some(18230), None);
+        assert!(!off.contains("indexer_listen_addr"));
+        assert!(on.contains("indexer_listen_addr = \"0.0.0.0:18230\""));
+        // Must land on `[rpc]`, beside `listen_addr`, not in the next table.
+        let rpc = on.find("[rpc]").expect("[rpc] table");
+        let state = on.find("[state]").expect("[state] table");
+        let indexer = on.find("indexer_listen_addr").expect("indexer key");
+        assert!(rpc < indexer && indexer < state);
+    }
+
+    /// The regression: the testnet zainod generator bound gRPC to `0.0.0.0` and
+    /// JSON-RPC to `127.0.0.1`. gRPC worked, so the indexer looked alive and
+    /// `env.build()` passed — while every JSON-RPC call from the test pod got
+    /// `Connection refused`, which read as a dead indexer rather than a bind
+    /// address. Checked across *both* generators, since one having the right
+    /// address is exactly the state that hid this.
+    #[test]
+    fn no_generator_binds_a_listener_to_loopback() {
+        let confs = [
+            testnet_zainod_conf(
+                v(),
+                "fetch",
+                8137,
+                8232,
+                "zebrad",
+                18232,
+                "/db/zebra",
+                "/db/zaino",
+                None,
+                Some(9998),
+            ),
+            crate::regtest_conf::regtest_zainod_conf(
+                v(),
+                "fetch",
+                8137,
+                8232,
+                "zebrad",
+                28232,
+                "/db/zebra",
+                "/db/zaino",
+                None,
+                Some(9998),
+            ),
+            testnet_zebrad_conf(v(), 18232, "/var/cache/zebrad", Some(18230), Some(9999)),
+        ];
+        for conf in confs {
+            for line in conf.lines().filter(|l| {
+                !l.trim_start().starts_with('#')
+                    && (l.contains("listen_add") || l.contains("_endpoint"))
+                    // `validator_*` names a peer to dial, not a socket to bind.
+                    && !l.contains("validator_")
+            }) {
+                assert!(
+                    line.contains(crate::handles::ports::LISTEN_ALL),
+                    "listener does not bind LISTEN_ALL and is unreachable across pods: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zainod_fetch_and_state_differ_only_where_the_backend_requires_it() {
         let v = v();
-        let fetch = testnet_zainod_conf(
-            v,
-            "fetch",
-            8137,
-            8232,
-            "zebrad",
-            18232,
-            "/var/lib/zaino/zebra-db",
-            "/var/lib/zaino/db",
-            None,
-        );
-        let state = testnet_zainod_conf(
-            v,
-            "state",
-            8137,
-            8232,
-            "zebrad",
-            18232,
-            "/var/lib/zaino/zebra-db",
-            "/var/lib/zaino/db",
-            None,
-        );
+        let conf = |backend, grpc| {
+            testnet_zainod_conf(
+                v,
+                backend,
+                8137,
+                8232,
+                "zebrad",
+                18232,
+                "/var/lib/zaino/zebra-db",
+                "/var/lib/zaino/db",
+                grpc,
+                None,
+            )
+        };
+        let fetch = conf("fetch", None);
+        // `direct` opens the DB through zebra's ReadStateService and is rejected
+        // at config load without a gRPC address to drive its syncer; `fetch`
+        // forwards over JSON-RPC and must not carry one.
+        let state = conf("direct", Some("zebrad:18230"));
         assert!(fetch.contains("backend = 'fetch'"));
-        assert!(state.contains("backend = 'state'"));
-        // Everything else must match: the two are sibling TOMLs.
+        assert!(state.contains("backend = 'direct'"));
+        assert!(!fetch.contains("validator_grpc_listen_address"));
+        assert!(state.contains("validator_grpc_listen_address = 'zebrad:18230'"));
+        // Beyond those two keys the pair are sibling TOMLs.
         assert_eq!(
             fetch.replace("backend = 'fetch'", ""),
-            state.replace("backend = 'state'", "")
+            state
+                .replace("backend = 'direct'", "")
+                .replace("\nvalidator_grpc_listen_address = 'zebrad:18230'", "")
         );
     }
 
     #[test]
     fn testnet_metrics_stanzas_are_gated_on_metrics_port() {
-        let zeb_off = testnet_zebrad_conf(v(), 18232, "/var/cache/zebrad", None);
-        let zeb_on = testnet_zebrad_conf(v(), 18232, "/var/cache/zebrad", Some(9999));
+        let zeb_off = testnet_zebrad_conf(v(), 18232, "/var/cache/zebrad", None, None);
+        let zeb_on = testnet_zebrad_conf(v(), 18232, "/var/cache/zebrad", None, Some(9999));
         assert!(!zeb_off.contains("[metrics]"));
         assert!(zeb_on.contains("[metrics]"));
         assert!(zeb_on.contains("endpoint_addr = \"0.0.0.0:9999\""));
@@ -203,6 +290,7 @@ mod tests {
                 18232,
                 "/var/lib/zaino/zebra-db",
                 "/var/lib/zaino/db",
+                None,
                 metrics_port,
             )
         };

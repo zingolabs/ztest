@@ -46,7 +46,7 @@ use crate::mounts::{self, ResolvedMount};
 use crate::naming::{self, RunCoords};
 use crate::portforward::Forwarder;
 use crate::qos;
-use crate::seeds::{self, ShadowClone};
+use crate::seeds::{self, SeedBinding};
 
 /// The live backend handle behind a materialized pod. Every pod that reaches
 /// [`TestEnv::materialize_phase`] carries exactly one — validators and indexers
@@ -93,7 +93,7 @@ pub(crate) struct EnvInner {
     pub(crate) components: tokio::sync::RwLock<HashMap<u64, ComponentState>>,
     pub(crate) in_cluster: bool,
     pub(crate) forwards: ForwardRegistry,
-    pub(crate) shadow_clones: std::sync::Mutex<Vec<ShadowClone>>,
+    pub(crate) seed_bindings: std::sync::Mutex<Vec<SeedBinding>>,
     /// Pod names of profiled components (`profile`-feature image), captured at
     /// materialize so a post-run [`TestEnv::collect_profiles`] can drain each and
     /// tar its flamegraph out.
@@ -127,7 +127,7 @@ impl EnvInner {
             components: tokio::sync::RwLock::new(HashMap::new()),
             in_cluster: cluster::in_cluster(),
             forwards: Arc::new(Mutex::new(HashMap::new())),
-            shadow_clones: std::sync::Mutex::new(Vec::new()),
+            seed_bindings: std::sync::Mutex::new(Vec::new()),
             profiled_pods: std::sync::Mutex::new(Vec::new()),
             is_built: AtomicBool::new(false),
             log_capture: std::sync::OnceLock::new(),
@@ -296,7 +296,17 @@ pub struct TestEnv {
     /// An explicit regtest activation-height schedule for this env, if set via
     /// [`activation_heights`](Self::activation_heights). `None` uses the
     /// canonical default ([`ActivationHeights::regtest_default`]).
+    ///
+    /// Unrelated to [`chain_pin`](Self::chain_pin) below: this configures the
+    /// schedule of a *regtest* chain this env is about to mine, while a pin
+    /// records the schedule an archived chain already has.
     activation_override: Option<ActivationHeights>,
+    /// The one chain archive every restoring component in this env names, and
+    /// what its manifest says the archive contains. Resolved during
+    /// [`build`](Self::build) by [`resolve_snapshot_pin`](Self::resolve_snapshot_pin);
+    /// `None` when nothing was restored, or when what was restored is an
+    /// opaque archive carrying no chain metadata.
+    chain_pin: Option<(crate::ArchiveHandle, crate::ChainInfo)>,
 }
 
 impl std::fmt::Debug for TestEnv {
@@ -323,6 +333,7 @@ impl TestEnv {
             next_id: 0,
             ready_timeout: Self::DEFAULT_READY_TIMEOUT,
             activation_override: None,
+            chain_pin: None,
         }
     }
 
@@ -489,7 +500,177 @@ impl TestEnv {
                 });
             }
         }
+
         Ok(())
+    }
+
+    /// Resolve the one chain archive this env restores, and reject an env
+    /// whose components disagree about which chain they serve.
+    ///
+    /// Both halves at once, because they are the same question asked twice:
+    /// the checks below establish that *at most one* chain is in play, which
+    /// is exactly what makes [`chain`](Self::chain) — a single answer for the
+    /// whole env — well-defined. The resolved pin is recorded here so that
+    /// tests read chain facts from the env that is actually running, never
+    /// from a handle that merely names an artifact.
+    ///
+    /// Three ways an env goes wrong, all silent without this check and all
+    /// baffling when they surface:
+    ///
+    /// 1. **Builder version ≠ producer version.** A zebra state DB is tied to
+    ///    the release that wrote it. Point a different zebrad at it and it
+    ///    either upgrades the database in place — mutating the CoW clone, so it
+    ///    stops being the artifact the name promises — or fails to open it. The
+    ///    version on the builder is the only place that mismatch is visible
+    ///    before a pod starts.
+    /// 2. **Components pinned to different artifacts.** A state-backend zaino
+    ///    reads the same chain the validator serves. Give them different pins
+    ///    and every parity assertion in the test compares two different
+    ///    histories, failing as an unrelated data mismatch hundreds of lines
+    ///    from the cause.
+    /// 3. **A testnet archive that cannot support the questions asked of it.**
+    ///    A snapshot pinned *at* an activation, or with no activation recorded
+    ///    at all, holds essentially none of the data it is named for, and every
+    ///    boundary assertion drawn from it passes over empty results. Rejecting
+    ///    it here is also what makes [`ChainInfo::activation`] and its
+    ///    neighbours total for every chain a test can reach.
+    fn resolve_snapshot_pin(&mut self) -> Result<(), EnvError> {
+        // Only archives carrying chain metadata participate. A bare fixture
+        // tarball pins no history and names no producer, so there is nothing
+        // for its peers to disagree with.
+        let pinned: Vec<(String, crate::ArchiveHandle, crate::ChainInfo, &str)> = self
+            .pending_validators
+            .iter()
+            .map(|p| &p.opts)
+            .chain(self.pending_indexers.iter().map(|p| &p.opts))
+            .filter_map(|opts| match opts.restore.as_ref() {
+                Some(crate::component::RestoreSource::Archive(h)) => {
+                    Some((pod_name_of(opts), *h, h.chain()?, opts.version.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        for (name, handle, chain, version) in &pinned {
+            // Only validators write or read the state DB at a version of their
+            // own; an indexer's `version` is zaino's, which has no bearing on
+            // the zebra on-disk format.
+            let is_validator = self
+                .pending_validators
+                .iter()
+                .any(|p| &pod_name_of(&p.opts) == name);
+            if is_validator && *version != chain.version() {
+                return Err(EnvError::Config {
+                    reason: format!(
+                        "{name} runs version {version} but is pinned to snapshot {}, \
+                         produced by {}; a validator reading a state DB written by a \
+                         different release either upgrades it in place or fails to open it",
+                        handle.name(),
+                        chain.version(),
+                    ),
+                });
+            }
+        }
+
+        // Identity is the OID, so "the same artifact" is an exact comparison
+        // rather than a path or name match — two declarations of one archive
+        // from different call sites agree here by construction.
+        if let Some(((first_name, first, ..), (other_name, other, ..))) = pinned.first().zip(
+            pinned
+                .iter()
+                .find(|(_, h, ..)| h.oid() != pinned[0].1.oid()),
+        ) {
+            return Err(EnvError::Config {
+                reason: format!(
+                    "components in this env are pinned to different chain snapshots: \
+                     {first_name} serves {} and {other_name} serves {}; they must name \
+                     the same artifact or every comparison between them is measuring two \
+                     different histories",
+                    first.name(),
+                    other.name(),
+                ),
+            });
+        }
+
+        let Some((_, handle, chain, _)) = pinned.first() else {
+            return Ok(()); // Nothing restored; this env has no chain pin.
+        };
+
+        // A testnet archive is an immutable, height-pinned artifact: the
+        // restored validator runs with an empty peer set, so its tip never
+        // moves and every derived height is a fact for the whole test. A
+        // regtest cache is the opposite — a starting point tests mine onto —
+        // so none of the claims below are meant to hold for one.
+        if chain.network() == crate::ArchiveNetwork::Testnet {
+            let reason = match chain.straddled_activation_opt() {
+                None => Some("its manifest records no activation at all".to_owned()),
+                Some(straddled) if straddled.upgrade_name().is_none() => Some(format!(
+                    "its newest activation is `{}`, which no RPC reports as an upgrade",
+                    straddled.key,
+                )),
+                Some(_) if chain.mature_height() <= chain.activation() => Some(format!(
+                    "it is pinned at {}, which leaves no mature history above its {} \
+                     activation at {}",
+                    chain.tip_height(),
+                    chain.upgrade_name(),
+                    chain.activation(),
+                )),
+                Some(_) => None,
+            };
+            if let Some(reason) = reason {
+                return Err(EnvError::Config {
+                    reason: format!(
+                        "{} cannot serve as a chain fixture: {reason}; a snapshot that \
+                         does not straddle an upgrade with room to spare holds \
+                         essentially none of the data it is named for, and every \
+                         assertion drawn from it passes while proving nothing",
+                        handle.name(),
+                    ),
+                });
+            }
+        }
+
+        self.chain_pin = Some((*handle, *chain));
+        Ok(())
+    }
+
+    /// What the chain this env restored actually contains.
+    ///
+    /// The tip it is pinned at, the upgrade it straddles, the activation
+    /// schedule it carries, and the heights worth querying it at — read from
+    /// the artifact's manifest at compile time, and verified against the
+    /// running validator during [`build`](Self::build), so a test asserting on
+    /// these is asserting about data that is really mounted.
+    ///
+    /// # Panics
+    ///
+    /// If no component in this env restored an archive, or the archive it
+    /// restored is an opaque blob with no chain metadata. Both are statements
+    /// about a chain that is not there, and neither is recoverable at the
+    /// point a test asks the question.
+    pub fn chain(&self) -> crate::ChainInfo {
+        match self.chain_pin {
+            Some((_, chain)) => chain,
+            None => panic!(
+                "this env restored no chain archive, so it has no chain to describe; \
+                 `TestEnv::chain` answers for the artifact a component was built with \
+                 `.restore(..)`",
+            ),
+        }
+    }
+
+    /// The archive [`chain`](Self::chain) describes — for diagnostics that
+    /// want to name the artifact a failure came from.
+    ///
+    /// Panics on the same conditions as [`chain`](Self::chain).
+    pub fn chain_archive(&self) -> crate::ArchiveHandle {
+        match self.chain_pin {
+            Some((handle, _)) => handle,
+            None => panic!(
+                "this env restored no chain archive; `TestEnv::chain_archive` names the \
+                 artifact a component was built with `.restore(..)`",
+            ),
+        }
     }
 
     fn materialize_configs(&mut self) -> Result<(), EnvError> {
@@ -567,6 +748,7 @@ impl TestEnv {
         crate::observ::init_in_pod();
         cluster::require_orchestrator()?;
         self.validate_topology()?;
+        self.resolve_snapshot_pin()?;
         self.materialize_configs()?;
 
         let started = std::time::Instant::now();
@@ -705,6 +887,7 @@ impl TestEnv {
         let warmup = async {
             self.wait_validators_rpc_ready().await?;
             self.warm_validators().await?;
+            self.verify_restored_chain().await?;
             Ok::<(), EnvError>(())
         }
         .await;
@@ -778,6 +961,115 @@ impl TestEnv {
             namespace = %namespace,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "TestEnv ready"
+        );
+        Ok(())
+    }
+
+    /// Prove the validator is serving the chain its archive's manifest claims.
+    ///
+    /// Runs in the validator phase of [`build`](Self::build) — after the
+    /// validator answers RPCs, before a single indexer is deployed. A wrong
+    /// archive therefore costs seconds and fails by name, instead of costing a
+    /// multi-minute indexer sync and then failing as a parity mismatch
+    /// hundreds of lines into a test.
+    ///
+    /// Three claims, each closing a way the manifest and the mounted data
+    /// diverge:
+    ///
+    /// 1. **Tip.** The blunt check: a swapped or truncated archive fails here.
+    /// 2. **The whole activation schedule**, not just the straddled upgrade. A
+    ///    chain whose tip and boundary both match can still be the wrong
+    ///    chain, and the manifest is the only place the full schedule is
+    ///    written down.
+    /// 3. **The producer's boundary evidence**, re-asserted against the
+    ///    *mounted* data. The producer proved at production time that the
+    ///    introduced pool holds value past the activation; this proves the
+    ///    bytes now on disk still carry it. The two diverge on a truncated
+    ///    extraction or a partially-populated seed PVC, and without this the
+    ///    difference shows up only as a boundary test passing over empty data.
+    ///
+    /// Testnet only. A regtest cache is a starting point tests mine onto: its
+    /// tip is *meant* to move, and its activation schedule comes from
+    /// [`activation_heights`](Self::activation_heights) rather than from the
+    /// manifest, so none of these claims are meant to hold for one.
+    async fn verify_restored_chain(&self) -> Result<(), EnvError> {
+        let Some((handle, chain)) = self.chain_pin else {
+            return Ok(());
+        };
+        if chain.network() != crate::ArchiveNetwork::Testnet {
+            return Ok(());
+        }
+        // Any validator in the env will do: `resolve_snapshot_pin` has already
+        // established they all serve the same artifact.
+        let validator = {
+            let comps = self.inner.components.read().await;
+            comps.values().find_map(|s| match &s.handle {
+                ComponentHandle::Validator(h) => Some(Arc::clone(h)),
+                ComponentHandle::Indexer(_) => None,
+            })
+        };
+        let Some(validator) = validator else {
+            return Ok(()); // Indexer-only env; nothing authoritative to ask.
+        };
+
+        crate::sync::note_setup("validator", None, "verifying the restored chain");
+        let rpc = validator.json_rpc().await?;
+        let mismatch = |reason: String| EnvError::ArchiveMismatch {
+            archive: handle.name().to_owned(),
+            reason,
+        };
+        let transport = |e: crate::RpcError| EnvError::Transient(Box::new(e));
+
+        let tip = rpc.tip_height().await.map_err(transport)?;
+        if tip != chain.tip_height() {
+            return Err(mismatch(format!(
+                "its manifest pins the tip at {}, but the validator serves {tip}",
+                chain.tip_height(),
+            )));
+        }
+
+        for activation in chain.activations() {
+            // `before_overwinter` is the absence of an upgrade, so the RPC
+            // never reports it and looking for it would fail every fixture.
+            let Some(name) = activation.upgrade_name() else {
+                continue;
+            };
+            let reported = rpc.activation_height(name).await.map_err(transport)?;
+            if reported != activation.height {
+                return Err(mismatch(format!(
+                    "its manifest records {name} activating at {}, but the validator \
+                     reports {reported}",
+                    activation.height,
+                )));
+            }
+        }
+
+        if let Some(check) = chain.boundary_check() {
+            // One height below the activation and one at the pinned tip: the
+            // pool must be empty before the upgrade that introduces it and
+            // hold the producer's recorded value after.
+            for (height, expected, position) in [
+                (check.from_height - 1, check.value_before, "below"),
+                (check.to_height, check.value_after, "at the tip above"),
+            ] {
+                let observed = rpc.pool_zats(height, check.pool).await.map_err(transport)?;
+                if observed != expected {
+                    return Err(mismatch(format!(
+                        "the {} pool holds {observed} zats at height {height}, {position} \
+                         the {} activation, where its producer recorded {expected}",
+                        check.pool,
+                        chain.upgrade_name(),
+                    )));
+                }
+            }
+        }
+
+        tracing::debug!(
+            target: "ztest::build",
+            archive = handle.name(),
+            tip,
+            activations = chain.activations().len(),
+            "restored chain verified against its manifest"
         );
         Ok(())
     }
@@ -861,21 +1153,17 @@ impl TestEnv {
     /// unambiguous (a differential ≤2-indexer topology is a load-test shape, not
     /// a sync-oracle one).
     /// The kube client, once [`build`](Self::build) has connected. Used by the
-    /// post-run metrics query to fetch the service CA and reach thanos.
+    /// facade's run tail: the detach stop-watch and the mirrored durable report.
     #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
     pub(crate) fn kube_client(&self) -> Option<Client> {
         self.inner.client.get().cloned()
     }
 
     /// The test namespace this env provisioned into, once [`build`](Self::build)
-    /// has run. Used to scope the post-run thanos metrics query to this run.
+    /// has run. Used to locate this run's stop-watch and report ConfigMaps.
     #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
     pub(crate) fn namespace(&self) -> Option<String> {
-        self.inner
-            .namespace
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
+        self.inner.namespace.lock().ok().and_then(|g| g.clone())
     }
 
     /// Drain each profiled component (graceful SIGTERM so its profiler flushes)
@@ -923,13 +1211,21 @@ impl TestEnv {
     async fn warm_validators(&self) -> Result<(), EnvError> {
         // Mine one block per validator so dependents (indexers) sync
         // against a non-genesis tip. Drives each validator's handle.
+        //
+        // Regtest only. The warm-up exists because a freshly-created regtest
+        // chain sits at genesis, which is not a useful tip to sync against; a
+        // restored chain is already at its snapshot height and needs nothing.
+        // On a real network mining is not merely redundant but impossible —
+        // PoW is live, and zebrad answers `generate` with "generate is only
+        // supported on networks where PoW is disabled", failing the whole build
+        // before any indexer is provisioned.
         let handles: Vec<Arc<dyn ValidatorBackend>> = {
             let comps = self.inner.components.read().await;
             comps
                 .values()
                 .filter_map(|s| match &s.handle {
-                    ComponentHandle::Validator(h) => Some(Arc::clone(h)),
-                    ComponentHandle::Indexer(_) => None,
+                    ComponentHandle::Validator(h) if h.is_regtest() => Some(Arc::clone(h)),
+                    ComponentHandle::Validator(_) | ComponentHandle::Indexer(_) => None,
                 })
                 .collect()
         };
@@ -970,8 +1266,7 @@ impl TestEnv {
                 "provisioning component"
             );
             crate::sync::note_setup(spec.category.as_str(), Some(&spec.pod_name), "creating pod");
-            let state =
-                ComponentState::new(spec, ctx.sentinel.namespace.clone(), handle.clone());
+            let state = ComponentState::new(spec, ctx.sentinel.namespace.clone(), handle.clone());
             cluster::create_pod_service(
                 ctx.client,
                 &ctx.sentinel.namespace,
@@ -992,10 +1287,10 @@ impl TestEnv {
             let mut resolved =
                 mounts::resolve_all(ctx.client, ctx.sentinel, &spec.pod_name, &opts.mounts).await?;
             self.inner
-                .shadow_clones
+                .seed_bindings
                 .lock()
-                .expect("shadow_clones mutex poisoned")
-                .extend(resolved.shadow_clones);
+                .expect("seed_bindings mutex poisoned")
+                .extend(resolved.seed_bindings);
             // Profiled component → give it a per-test artifact PVC at
             // `ZTEST_PROFILE_OUT` (which its pod spec set) so the flamegraph
             // written on graceful SIGTERM outlives the pod for collection.
@@ -1016,21 +1311,20 @@ impl TestEnv {
             // scrapes its `/metrics`. Non-fatal: a cluster without the
             // Prometheus-operator CRDs (or with UWM off) must not fail the test,
             // it just yields no server-side metrics for this run.
-            if opts.image.metrics_enabled() {
-                if let Err(e) = crate::metrics::emit_pod_monitor(
+            if opts.image.metrics_enabled()
+                && let Err(e) = crate::metrics::emit_pod_monitor(
                     ctx.client,
                     &ctx.sentinel.namespace,
                     &spec.pod_name,
                     &ctx.coords.run_id,
                 )
                 .await
-                {
-                    tracing::warn!(
-                        component = %spec.pod_name,
-                        error = %e,
-                        "PodMonitor emit failed; this component's metrics will not be scraped"
-                    );
-                }
+            {
+                tracing::warn!(
+                    component = %spec.pod_name,
+                    error = %e,
+                    "PodMonitor emit failed; this component's metrics will not be scraped"
+                );
             }
             self.inner.components.write().await.insert(*id, state);
         }
@@ -1111,21 +1405,21 @@ impl Drop for TestEnv {
         });
 
         let ns = self.inner.namespace.lock().ok().and_then(|mut g| g.take());
-        let shadows: Vec<_> = self
+        let bindings: Vec<_> = self
             .inner
-            .shadow_clones
+            .seed_bindings
             .lock()
             .ok()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
-        if ns.is_none() && shadows.is_empty() {
+        if ns.is_none() && bindings.is_empty() {
             return;
         }
 
-        // `--no-cleanup` preserves the namespace + shadows for inspection.
+        // `--no-cleanup` preserves the namespace + seed bindings for inspection.
         let cleanup = !cluster::no_cleanup_requested();
-        let (ns_to_delete, shadows_to_delete) = if cleanup {
-            (ns.clone(), shadows)
+        let (ns_to_delete, bindings_to_delete) = if cleanup {
+            (ns.clone(), bindings)
         } else {
             if let Some(ns) = &ns {
                 // eprintln (not just tracing) so the hint shows in captured
@@ -1140,7 +1434,7 @@ impl Drop for TestEnv {
             }
             tracing::warn!(
                 namespace = ?ns,
-                shadow_clones = shadows.len(),
+                seed_bindings = bindings.len(),
                 "ZTEST_NO_CLEANUP set — leaving TestEnv namespace for inspection"
             );
             (None, Vec::new())
@@ -1148,7 +1442,7 @@ impl Drop for TestEnv {
 
         tracing::debug!(
             namespace = ?ns_to_delete,
-            shadow_clones = shadows_to_delete.len(),
+            seed_bindings = bindings_to_delete.len(),
             "tearing down TestEnv (Drop)"
         );
         let ns_for_diag = ns.clone();
@@ -1181,12 +1475,12 @@ impl Drop for TestEnv {
                         .await
                         .map_err(|e| format!("delete namespace {ns}: {e}"))?;
                 }
-                for shadow in shadows_to_delete {
-                    if let Err(e) = seeds::delete_shadow(&client, &shadow).await {
+                for binding in bindings_to_delete {
+                    if let Err(e) = seeds::delete_binding(&client, &binding).await {
                         tracing::warn!(
                             error = %e,
-                            vsc = %shadow.shadow_vsc_name,
-                            "shadow VSC delete failed"
+                            content = %binding.binding_content,
+                            "seed binding content delete failed"
                         );
                     }
                 }

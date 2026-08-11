@@ -12,34 +12,11 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::handles::wallet::Pool;
+use crate::handles::wallet::{Pool, PoolBalances};
 
-use super::subject::{Phase, ProgressView, TreeRoots};
-
-/// `[sapling, orchard, ironwood]` output counts, indexed by [`pool_idx`].
-type PoolOutputs = [u64; 3];
-
-fn pool_idx(pool: Pool) -> Option<usize> {
-    match pool {
-        Pool::Sapling => Some(0),
-        Pool::Orchard => Some(1),
-        Pool::Ironwood => Some(2),
-        Pool::Transparent => None,
-    }
-}
-
-/// Total wallet balance, as the design's `s.balances().total()` surface.
-#[derive(Clone, Copy, Debug)]
-pub struct Balances {
-    total: i64,
-}
-
-impl Balances {
-    /// Total balance across pools, in zatoshis.
-    pub fn total(&self) -> i64 {
-        self.total
-    }
-}
+use super::subject::{Phase, ProgressView};
+use super::tree::{TreeRoot, TreeRoots};
+use super::work::{Rate, Work};
 
 /// One immutable observation of the sync at a tick. All probe predicates read
 /// this and nothing else (RPC-backed probes additionally get a
@@ -53,9 +30,19 @@ pub struct Snapshot {
     target: Option<u32>,
     pct: f32,
     phase: Phase,
-    outputs: PoolOutputs,
-    prev_outputs: PoolOutputs,
-    balance_total: i64,
+    /// Cumulative protocol work at this tick, and at the previous one. Their
+    /// difference is the work this tick actually did, which — divided by
+    /// `since_prev` — is every throughput number the harness reports.
+    work: Work,
+    prev_work: Work,
+    /// Interval since the previous snapshot, measured on the driver's clock.
+    since_prev: Duration,
+    /// Wallet extras: confirmed balances at this tick and the previous one, and
+    /// the note-commitment-tree roots. `None`/[`TreeRoots::UNREPORTED`] for
+    /// every observer subject; see [`ProgressView::balances`].
+    balances: Option<PoolBalances>,
+    prev_balances: Option<PoolBalances>,
+    tree_roots: TreeRoots,
     /// Deepest height reached so far; `> height` means a reorg rolled back.
     max_height_seen: u32,
     /// When height last increased — the basis for [`progressed_within`].
@@ -63,9 +50,6 @@ pub struct Snapshot {
     observed_reorg: bool,
     observed_reconnect: bool,
     last_fault_at: Option<Instant>,
-    /// Wallet commitment-tree roots — populated only on the terminal snapshot
-    /// (empty on every per-tick snapshot); read by the `at_completion` oracle.
-    tree_roots: TreeRoots,
 }
 
 impl Snapshot {
@@ -98,19 +82,26 @@ impl Snapshot {
     pub fn reorg_depth(&self) -> u32 {
         self.max_height_seen.saturating_sub(self.height)
     }
-    /// Cumulative outputs scanned in `pool` (`0` for `Transparent`/observers).
-    pub fn outputs(&self, pool: Pool) -> u64 {
-        pool_idx(pool).map_or(0, |i| self.outputs[i])
+    /// Cumulative protocol work as of this tick.
+    pub fn work(&self) -> Work {
+        self.work
     }
-    /// `outputs(pool)` at the previous tick.
-    pub fn prev_outputs(&self, pool: Pool) -> u64 {
-        pool_idx(pool).map_or(0, |i| self.prev_outputs[i])
+    /// Work completed since the previous tick.
+    pub fn work_done(&self) -> Work {
+        self.work.delta(&self.prev_work)
     }
-    /// Wallet balances.
-    pub fn balances(&self) -> Balances {
-        Balances {
-            total: self.balance_total,
-        }
+    /// Per-second work rate over the interval since the previous tick.
+    pub fn rate(&self) -> Rate {
+        self.work_done().rate(self.since_prev)
+    }
+    /// Cumulative protocol work at the previous tick.
+    ///
+    /// Paired with [`work`](Self::work) for probes that compare across ticks.
+    /// Both carry which ops were measured, so a predicate reading an op nobody
+    /// counted panics via [`Work::require`] rather than silently comparing two
+    /// zeroes and passing.
+    pub fn prev_work(&self) -> Work {
+        self.prev_work
     }
     /// Whether height increased within the last `window`.
     pub fn progressed_within(&self, window: Duration) -> bool {
@@ -132,18 +123,53 @@ impl Snapshot {
     pub fn observed_reconnect(&self) -> bool {
         self.observed_reconnect
     }
-    /// The wallet's commitment-tree root for `pool` at this snapshot's height,
-    /// as a 32-byte encoding. Populated only on the terminal snapshot and only
-    /// for Sapling/Orchard (Ironwood/Transparent have no `TreeState` wire
-    /// representation to check against); `None` otherwise. The `at_completion`
-    /// oracle compares this against the indexer's `TreeState` frontier root.
-    pub fn tree_root(&self, pool: Pool) -> Option<[u8; 32]> {
-        match pool {
-            Pool::Sapling => self.tree_roots.sapling,
-            Pool::Orchard => self.tree_roots.orchard,
-            Pool::Ironwood | Pool::Transparent => None,
-        }
+
+    /// Confirmed per-pool balances at this tick, panicking when the subject
+    /// reports none.
+    ///
+    /// Carries [`Work::require`](crate::sync::Work::require)'s contract: a
+    /// balance probe pointed at a non-wallet subject is a bug in the *test*,
+    /// and answering it with a zeroed [`PoolBalances`] would make that probe
+    /// unfailable — green forever, checking nothing. Use
+    /// [`try_balances`](Self::try_balances) where absence is a legitimate
+    /// answer.
+    pub fn balances(&self) -> PoolBalances {
+        self.balances
+            .unwrap_or_else(|| missing_balances("balances"))
     }
+    /// Confirmed per-pool balances at the previous tick (this tick's at
+    /// `seq == 0`, so the opening tick never reads as a change). Paired with
+    /// [`balances`](Self::balances) for probes that compare across ticks, and
+    /// panicking on the same terms.
+    pub fn prev_balances(&self) -> PoolBalances {
+        self.prev_balances
+            .unwrap_or_else(|| missing_balances("prev_balances"))
+    }
+    /// Confirmed per-pool balances, or `None` when this subject holds no funds.
+    pub fn try_balances(&self) -> Option<PoolBalances> {
+        self.balances
+    }
+    /// `pool`'s note-commitment-tree root at this tick, panicking when the
+    /// subject maintains no trees.
+    ///
+    /// `None` is a real observation — the pool is empty at this height, or the
+    /// wallet's shard tree is still incomplete there mid-scan — which is why
+    /// only the *unreported* case panics. See [`TreeRoots`].
+    pub fn tree_root(&self, pool: Pool) -> Option<TreeRoot> {
+        self.tree_roots.require(pool)
+    }
+    /// Every pool's root at this tick, including whether any were reported.
+    pub fn tree_roots(&self) -> TreeRoots {
+        self.tree_roots
+    }
+}
+
+/// Panic message for a balance read on a subject that holds no funds.
+fn missing_balances(accessor: &str) -> ! {
+    panic!(
+        "probe read `Snapshot::{accessor}`, but this sync subject reports no \
+         balances (only a wallet subject does)"
+    )
 }
 
 /// Rolling state the runner threads across ticks to build each [`Snapshot`].
@@ -152,7 +178,9 @@ impl Snapshot {
 pub(crate) struct SnapshotBuilder {
     seq: u64,
     prev_height: u32,
-    prev_outputs: PoolOutputs,
+    prev_work: Work,
+    prev_balances: Option<PoolBalances>,
+    prev_at: Instant,
     max_height_seen: u32,
     last_progress_at: Instant,
     observed_reorg: bool,
@@ -164,7 +192,9 @@ impl SnapshotBuilder {
         Self {
             seq: 0,
             prev_height: 0,
-            prev_outputs: [0; 3],
+            prev_work: Work::ZERO,
+            prev_balances: None,
+            prev_at: started_at,
             max_height_seen: 0,
             last_progress_at: started_at,
             observed_reorg: false,
@@ -179,18 +209,24 @@ impl SnapshotBuilder {
         &mut self,
         p: &P,
         now: Instant,
+        work: Work,
         last_fault_at: Option<Instant>,
-        tree_roots: TreeRoots,
     ) -> Snapshot {
         let height = p.height();
-        let outputs = [
-            p.outputs(Pool::Sapling),
-            p.outputs(Pool::Orchard),
-            p.outputs(Pool::Ironwood),
-        ];
+        let balances = p.balances();
         if self.seq == 0 {
             self.prev_height = height;
-            self.prev_outputs = outputs;
+            // Same reasoning as `prev_work`: the opening reading is a baseline,
+            // not a change this run produced. A wallet resuming from a seeded
+            // datadir opens with its whole balance already there, and calling
+            // that a one-tick gain would misreport every delta probe.
+            self.prev_balances = balances;
+            // The first tick's cumulative reading is a baseline, not work this
+            // run performed: a subject resuming from a seeded datadir starts
+            // with millions of outputs already behind it, and counting them as
+            // one tick's work would report an absurd opening rate.
+            self.prev_work = work;
+            self.prev_at = now;
             self.max_height_seen = height;
             self.last_progress_at = now;
         }
@@ -210,20 +246,24 @@ impl SnapshotBuilder {
             target: p.target(),
             pct: p.pct(),
             phase: p.phase(),
-            outputs,
-            prev_outputs: self.prev_outputs,
-            balance_total: p.balance_total(),
+            work,
+            prev_work: self.prev_work,
+            since_prev: now.saturating_duration_since(self.prev_at),
+            balances,
+            prev_balances: self.prev_balances,
+            tree_roots: p.tree_roots(),
             max_height_seen: self.max_height_seen.max(height),
             last_progress_at: self.last_progress_at,
             observed_reorg: self.observed_reorg,
             observed_reconnect: self.observed_reconnect,
             last_fault_at,
-            tree_roots,
         };
 
         self.seq += 1;
         self.prev_height = height;
-        self.prev_outputs = outputs;
+        self.prev_work = work;
+        self.prev_balances = balances;
+        self.prev_at = now;
         self.max_height_seen = self.max_height_seen.max(height);
         snap
     }

@@ -10,7 +10,17 @@
 //! every line, so there is no `nextest-runner` dependency; each status line is
 //! indistinguishable from nextest's (`reporter/displayer/imp.rs`).
 //!
-//! One deliberate divergence: the captured-output block. nextest replays the
+//! Three deliberate divergences, each documented at its site:
+//!
+//! 1. A Ctrl-C-terminated test gets its own `sigkilled` tally term and is kept
+//!    out of the failure recap, where nextest folds signal deaths into `failed`
+//!    ([`RunStats::terminated`]).
+//! 2. Its captured output is never replayed
+//!    ([`handle`](StyledReporter::handle)).
+//! 3. The captured-output block strips libtest's framing
+//!    ([`strip_libtest_frame`]), described next.
+//!
+//! nextest replays the
 //! child's bytes verbatim, so its `output ───` block inherits libtest's per-run
 //! framing (`running 1 test`, the `test <name> ... ` prefix, and the trailing
 //! `failures:` / `test result:` summary). For a single `--exact` process that
@@ -388,9 +398,15 @@ impl RunReporter for StyledReporter {
                 };
                 let line = self.format_line(&word, ink, &bracket, binary_id, test_name);
                 let _ = writeln!(self.buf, "{line}");
+                let terminated = matches!(verdict, Verdict::Terminated);
                 if passed {
                     self.stats.passed += 1;
+                } else if terminated {
+                    self.stats.terminated += 1;
                 } else {
+                    // Only real failures join the end-of-run recap: a recap is a
+                    // to-do list, and a test the operator killed asks nothing of
+                    // them. The `sigkilled` tally term carries the count.
                     self.failures.push(line.clone());
                     self.stats.failed += 1;
                 }
@@ -399,16 +415,29 @@ impl RunReporter for StyledReporter {
                 // defer to the end-of-run block if `final`. The child's libtest
                 // framing is stripped once here so both paths show the same
                 // signal-only bytes.
-                let display = self.output.display_for(passed);
-                // On the pod path `output` is already the laptop-assembled unified
-                // timeline (frame-free), so the strip is a no-op; on the local path
-                // it removes the child's libtest framing.
-                let shown = strip_libtest_frame(output, test_name);
-                if display.is_immediate() {
-                    self.replay_output(&shown, ink);
-                }
-                if display.is_final() && !shown.is_empty() {
-                    self.final_outputs.push((line, shown, passed));
+                //
+                // A terminated test is exempt, and this is a deliberate
+                // divergence: nextest routes every `Fail{..}` — signal aborts
+                // included — through `failure_output`
+                // (`displayer/unit_output.rs`), so a Ctrl-C with N tests in
+                // flight replays N full component-log streams over the summary
+                // the operator pressed Ctrl-C to reach. The bytes are the
+                // mid-provision log of a test that was interrupted, not a
+                // diagnosis of anything, and they remain in the run record for
+                // `ztest replay`. The `SIGKILL` status line still prints, so
+                // which tests were killed is never hidden.
+                if !terminated {
+                    let display = self.output.display_for(passed);
+                    // On the pod path `output` is already the laptop-assembled
+                    // unified timeline (frame-free), so the strip is a no-op; on
+                    // the local path it removes the child's libtest framing.
+                    let shown = strip_libtest_frame(output, test_name);
+                    if display.is_immediate() {
+                        self.replay_output(&shown, ink);
+                    }
+                    if display.is_final() && !shown.is_empty() {
+                        self.final_outputs.push((line, shown, passed));
+                    }
                 }
             }
             TestEvent::TestSkipped {
@@ -502,20 +531,23 @@ impl StyledReporter {
             Ink::Pass
         };
         let label = self.paint(&format!("{:>12}", "Summary"), ink);
-        // `9/122` when the run stopped short, else just the finished count.
-        let finished = stats.finished();
-        let ran = if (finished as usize) != stats.total {
+        // `29/132` when the run stopped short, else just the count. The
+        // numerator is tests that actually executed, so skips sit in the tally
+        // rather than inflating the ratio — nextest's `finished_count`, which
+        // likewise excludes skips (it filters them out of `initial_run_count`).
+        let executed = stats.ran();
+        let ran = if (executed as usize) != stats.total {
             format!(
                 "{}/{}",
-                bold_count(finished as u64, self.color),
+                bold_count(executed as u64, self.color),
                 bold_count(stats.total as u64, self.color),
             )
         } else {
-            bold_count(finished as u64, self.color)
+            bold_count(executed as u64, self.color)
         };
         // Singular "test run" only when both counts are 1 (nextest's
         // `tests_plural_if(initial != 1 || finished != 1)`).
-        let tests = if stats.total != 1 || finished != 1 {
+        let tests = if stats.total != 1 || executed != 1 {
             "tests"
         } else {
             "test"
@@ -535,8 +567,7 @@ impl StyledReporter {
             let _ = writeln!(self.buf, "{line}");
         }
         // nextest's cancelled `FinalRunStats`: a fail-styled `cancelled due to
-        // {reason}` line closing the summary. The short `finished/total` ratio
-        // above already conveys the tests that never ran.
+        // {reason}` line closing the summary.
         if let Some(reason) = self.cancelled {
             let _ = writeln!(
                 self.buf,
@@ -545,6 +576,41 @@ impl StyledReporter {
                 reason.as_str(),
             );
         }
+        self.not_run_warning(stats);
+    }
+
+    /// nextest's final not-run warning (`displayer/formatters.rs`
+    /// `write_final_warnings_for_failure`): `warning: 103/132 tests were not run
+    /// due to interrupt`.
+    ///
+    /// This is the accounting for tests still queued when a run closed short.
+    /// They are deliberately *not* folded into `skipped`, which across ztest
+    /// means "reached a terminal state without running" — unschedulable
+    /// footprint, unavailable dependency — and gates a setup-error exit. A
+    /// Ctrl-C is not a setup error, so it gets its own line rather than
+    /// overloading that word.
+    ///
+    /// The reason clause is present only for a cancelled run; a run that closed
+    /// short for any other reason takes nextest's own unattributed branch.
+    fn not_run_warning(&mut self, stats: &RunStats) {
+        let not_run = stats.not_run();
+        if not_run == 0 {
+            return;
+        }
+        let plural = stats.total != 1 || not_run != 1;
+        let due_to = match self.cancelled {
+            Some(reason) => format!(" due to {}", self.paint(reason.as_str(), Ink::Skip),),
+            None => String::new(),
+        };
+        let _ = writeln!(
+            self.buf,
+            "{}: {}/{} {} {} not run{due_to}",
+            self.paint("warning", Ink::Skip),
+            bold_count(not_run as u64, self.color),
+            bold_count(stats.total as u64, self.color),
+            if plural { "tests" } else { "test" },
+            if plural { "were" } else { "was" },
+        );
     }
 }
 
@@ -716,24 +782,29 @@ pub(crate) fn progress_line(
     )
 }
 
-/// The shared `{p} passed[, {f} failed], {s} skipped` tail used by both the
-/// live [`progress_line`] and the final [`StyledReporter::summary`], matching
-/// nextest's `write_summary_str` (progress.rs): `passed` and `skipped` are
-/// always shown, `failed` only when non-zero.
+/// The shared `{p} passed[, {f} failed][, {t} sigkilled], {s} skipped` tail used
+/// by both the live [`progress_line`] and the final
+/// [`StyledReporter::summary`]. Which terms appear is
+/// [`RunStats::tally`]'s call (nextest's `write_summary_str` convention); this
+/// only inks them.
 fn counts_tail(stats: &RunStats, color: bool) -> String {
-    let tally = |n: u32, word: &str, ink: Ink| {
-        format!(
-            "{} {}",
-            bold_count(n as u64, color),
-            paint_word(word, ink, color)
-        )
-    };
-    let mut s = format!("{}, ", tally(stats.passed, "passed", Ink::Pass));
-    if stats.failed > 0 {
-        s.push_str(&format!("{}, ", tally(stats.failed, "failed", Ink::Fail)));
-    }
-    s.push_str(&tally(stats.skipped, "skipped", Ink::Skip));
-    s
+    stats
+        .tally()
+        .into_iter()
+        .map(|(n, word)| {
+            let ink = match word {
+                "passed" => Ink::Pass,
+                "failed" | "sigkilled" => Ink::Fail,
+                _ => Ink::Skip,
+            };
+            format!(
+                "{} {}",
+                bold_count(n as u64, color),
+                paint_word(word, ink, color)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A bold count number (nextest's `count` style), no-op when colour is off.
@@ -922,6 +993,7 @@ mod tests {
             stats: RunStats {
                 passed: 8,
                 failed: 2,
+                terminated: 0,
                 skipped: 1,
                 total: 11,
             },
@@ -930,7 +1002,7 @@ mod tests {
         let out = String::from_utf8(r.take_scrollback()).unwrap();
         assert_eq!(
             out,
-            "────────────\n     Summary [   2.000s] 11 tests run: 8 passed, 2 failed, 1 skipped\n",
+            "────────────\n     Summary [   2.000s] 10/11 tests run: 8 passed, 2 failed, 1 skipped\n",
             "{out:?}"
         );
     }
@@ -942,6 +1014,7 @@ mod tests {
             stats: RunStats {
                 passed: 1,
                 failed: 0,
+                terminated: 0,
                 skipped: 0,
                 total: 1,
             },
@@ -962,13 +1035,22 @@ mod tests {
             stats: RunStats {
                 passed: 5,
                 failed: 0,
+                terminated: 0,
                 skipped: 2,
                 total: 10,
             },
             elapsed: Duration::from_secs(1),
         });
         let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.contains("7/10 tests run"), "{out:?}");
+        // The ratio numerator counts tests that executed; the two skips are
+        // reported by the tally, not folded into it.
+        assert!(out.contains("5/10 tests run"), "{out:?}");
+        assert!(out.contains("5 passed, 2 skipped"), "{out:?}");
+        // The remaining three never started at all.
+        assert!(
+            out.contains("warning: 3/10 tests were not run\n"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -978,6 +1060,7 @@ mod tests {
             stats: RunStats {
                 passed: 1,
                 failed: 0,
+                terminated: 0,
                 skipped: 0,
                 total: 1,
             },
@@ -1019,6 +1102,7 @@ mod tests {
             stats: RunStats {
                 passed: 1,
                 failed: 2,
+                terminated: 0,
                 skipped: 0,
                 total: 3,
             },
@@ -1057,6 +1141,7 @@ mod tests {
             stats: RunStats {
                 passed: 1,
                 failed: 0,
+                terminated: 0,
                 skipped: 0,
                 total: 1,
             },
@@ -1084,6 +1169,7 @@ mod tests {
             stats: RunStats {
                 passed: 0,
                 failed: 1,
+                terminated: 0,
                 skipped: 0,
                 total: 1,
             },
@@ -1114,7 +1200,8 @@ mod tests {
         r.handle(&TestEvent::RunFinished {
             stats: RunStats {
                 passed: 1,
-                failed: 1,
+                failed: 0,
+                terminated: 1,
                 skipped: 0,
                 total: 5,
             },
@@ -1122,7 +1209,7 @@ mod tests {
         });
         let out = String::from_utf8(r.take_scrollback()).unwrap();
 
-        // The terminated test renders with the signal word (counted as a failure).
+        // The terminated test renders with the signal word.
         assert!(
             out.contains("     SIGKILL [   0.234s] pkg::b mod::slow"),
             "{out:?}"
@@ -1132,11 +1219,141 @@ mod tests {
             out.contains("   Canceling due to interrupt: 2 tests still running"),
             "{out:?}"
         );
-        // The summary shows the short ratio and closes with the cancel line.
+        // The summary shows the short ratio, tallies the kill apart from
+        // `failed`, closes with the cancel line, then accounts for the three
+        // tests that never started.
         assert!(out.contains("2/5 tests run"), "{out:?}");
+        assert!(out.contains("1 passed, 1 sigkilled, 0 skipped"), "{out:?}");
+        assert!(!out.contains("failed"), "a kill is not a failure:\n{out}");
         assert!(
-            out.trim_end().ends_with("    Canceled due to interrupt"),
+            out.trim_end()
+                .ends_with("warning: 3/5 tests were not run due to interrupt"),
             "{out:?}"
+        );
+        assert!(out.contains("    Canceled due to interrupt\n"), "{out:?}");
+    }
+
+    #[test]
+    fn sigkilled_output_is_never_replayed_or_recapped() {
+        // The UX regression this guards: Ctrl-C with N tests in flight replayed
+        // N full component-log streams over the summary the operator pressed
+        // Ctrl-C to reach. nextest does replay them (every `Fail{..}`, signal
+        // aborts included, routes to `failure-output`); ztest deliberately does
+        // not. The one-line verdict must survive — which tests were killed is
+        // never hidden — and the kill must stay out of the failure recap.
+        let mut r = StyledReporter::new(false, true, OutputConfig::default());
+        r.handle(&finished(
+            "pkg::b",
+            "mod::killed",
+            Verdict::Terminated,
+            1,
+            b"[zebrad] INFO spawning syncer task\n[zainod] INFO syncing block\n",
+        ));
+        r.handle(&finished(
+            "pkg::b",
+            "mod::broke",
+            Verdict::Fail(101),
+            1,
+            b"boom\n",
+        ));
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats {
+                passed: 0,
+                failed: 1,
+                terminated: 1,
+                skipped: 0,
+                total: 2,
+            },
+            elapsed: Duration::from_secs(1),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+
+        assert!(
+            out.contains("SIGKILL [   0.234s] pkg::b mod::killed"),
+            "{out}"
+        );
+        assert!(!out.contains("zebrad"), "kill output replayed:\n{out}");
+        assert!(!out.contains("output ───\n    [zainod"), "{out}");
+        // A real failure in the same run keeps both its output and its recap.
+        assert!(out.contains("boom"), "{out}");
+        let summary = out.find("Summary").unwrap();
+        assert!(out[summary..].contains("mod::broke"), "{out}");
+        assert!(
+            !out[summary..].contains("mod::killed"),
+            "a kill is not a to-do item:\n{out}"
+        );
+    }
+
+    #[test]
+    fn final_output_policy_also_exempts_a_kill() {
+        // The deferred (`--failure-output=final`) path must make the same call
+        // as the immediate one, or the logs simply reappear in the end block.
+        let cfg = OutputConfig {
+            failure: crate::engine::output::TestOutputDisplay::Final,
+            ..OutputConfig::default()
+        };
+        let mut r = StyledReporter::new(false, true, cfg);
+        r.handle(&finished(
+            "p::b",
+            "t",
+            Verdict::Terminated,
+            1,
+            b"component noise\n",
+        ));
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats {
+                passed: 0,
+                failed: 0,
+                terminated: 1,
+                skipped: 0,
+                total: 1,
+            },
+            elapsed: Duration::from_secs(1),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert!(!out.contains("component noise"), "{out}");
+    }
+
+    #[test]
+    fn a_complete_run_emits_no_not_run_warning() {
+        let mut r = StyledReporter::new(false, true, OutputConfig::default());
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats {
+                passed: 2,
+                failed: 0,
+                terminated: 0,
+                skipped: 1,
+                total: 3,
+            },
+            elapsed: Duration::from_secs(1),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        // Skips are accounted for; nothing is unaccounted for.
+        assert!(!out.contains("warning"), "{out}");
+        assert!(out.contains("2/3 tests run: 2 passed, 1 skipped"), "{out}");
+    }
+
+    #[test]
+    fn not_run_warning_singularizes() {
+        let mut r = StyledReporter::new(false, true, OutputConfig::default());
+        r.handle(&TestEvent::RunCancelling {
+            reason: CancelReason::Interrupt,
+            running: 1,
+        });
+        r.handle(&TestEvent::RunFinished {
+            stats: RunStats {
+                passed: 0,
+                failed: 0,
+                terminated: 0,
+                skipped: 0,
+                total: 1,
+            },
+            elapsed: Duration::from_secs(1),
+        });
+        let out = String::from_utf8(r.take_scrollback()).unwrap();
+        assert!(
+            out.contains("warning: 1/1 test was not run due to interrupt"),
+            "{out}"
         );
     }
 
@@ -1204,6 +1421,7 @@ mod tests {
         let stats = RunStats {
             passed: 30,
             failed: 6,
+            terminated: 0,
             skipped: 1,
             total: 122,
         };
@@ -1220,6 +1438,7 @@ mod tests {
         let stats = RunStats {
             passed: 5,
             failed: 0,
+            terminated: 0,
             skipped: 2,
             total: 10,
         };

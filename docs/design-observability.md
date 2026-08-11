@@ -55,11 +55,11 @@ The mechanism differs by cluster, because the discovery contract does:
 - **OpenShift/OKD — User Workload Monitoring (UWM).** The supported path for
   scraping *user* workloads. UWM **ignores `prometheus.io/scrape` annotations**;
   it discovers targets via `ServiceMonitor`/`PodMonitor` CRs
-  (`monitoring.coreos.com`). ztest emits one **`PodMonitor` per profiled
-  component**, carrying the run-id label, and reads back from the
-  **thanos-querier** endpoint keyed on that label. No ztest-owned Prometheus,
-  no Grafana (OKD ships neither for user workloads by default — query via the
-  console or thanos-querier).
+  (`monitoring.coreos.com`). ztest emits one **`PodMonitor` per metrics-enabled
+  component** into the run namespace and **never reads it back**: the
+  time-series database is the durable record, and one namespace per run makes
+  the namespace the query scope. Query it from the console or thanos-querier.
+  No ztest-owned Prometheus, no Grafana, and no query client inside ztest.
   - **Precondition:** UWM must be enabled (`enableUserWorkload: true` in the
     `cluster-monitoring-config` ConfigMap). Platform monitoring being on does
     **not** imply UWM is on. Confirm before relying on this plane.
@@ -81,10 +81,35 @@ on OKD the cluster owns Prometheus and the annotation scheme does not apply.
 
 ### Division of labor
 
-- **Server-side durable record** (all testnet/sync tests): UWM, queried by
-  run-id. This is the "track zaino/zebrad for every testnet and sync test" ask.
+Three readers, and only one of them is ztest:
+
+- **Server-side durable record** (all testnet/sync tests): UWM, scoped by
+  namespace. This is the "track zaino/zebrad for every testnet and sync test"
+  ask. Read by a human, through the console — not by ztest.
+- **Live read** (`ztest sync watch`): `metrics::Poller` scrapes the component's
+  exporter directly, once a second, over a portforward. Direct because UWM's
+  ~15 s floor makes anything read through it useless for a live display. The
+  poller needs no sync driver and works against any namespace with a
+  metrics-exposing pod in it.
+- **Probe read** (`SyncSubject::progress`): the subject scrapes *itself* each
+  tick. This is the only load-bearing one — see `zaino_sync_finalized_height`
+  in `backends/zainod.rs`, which is the sole reading a proxying indexer cannot
+  answer on its own behalf.
 - **Load-test perf gate** (30 s bursts): client-side hdrhistogram in the
   `LoadReport`. Independent of scrape cadence.
+
+### The contract a component implements
+
+One port name and one trait:
+
+- declare a container port named `metrics` in `pod_spec` and serve Prometheus
+  text exposition at `/metrics` on it;
+- `impl metrics::Exporter` — `endpoint()` and `rows()`, where `rows()` is the
+  component's own table of `(label, family, reduction, live?)`.
+
+That is the whole surface. `metrics` names no component; which backend
+publishes which families is the backends' knowledge (`backends::metrics_rows`),
+so a new ecosystem component joins without editing the metrics module.
 
 ## Profiling plane
 
@@ -154,9 +179,8 @@ is proven to be the hot spot — not part of the default plane.
 1. **Exporters on** — `prometheus`-feature builds + `[metrics]`/`metrics_endpoint`
    config render for zaino (9998) and zebrad (9999). Smallest step; unblocks the
    whole metrics plane.
-2. **`PodMonitor` resource + RBAC + run-id label** — wire components into OKD
-   UWM; add the thanos-querier read path keyed by run-id. (Annotations field on
-   `PodSpec` for the kind/plain-Prometheus path.)
+2. **`PodMonitor` resource + RBAC** — wire components into OKD UWM.
+   (Annotations field on `PodSpec` for the kind/plain-Prometheus path.)
 3. **Profiling contract** — publish [how-to-profile.md](how-to-profile.md);
    `#[ztest::profile]`/`ZTEST_PROFILE` env wiring + artifact collection on the
    ztest side. Component-side integration is owned by each component team.
@@ -170,6 +194,6 @@ is proven to be the hot spot — not part of the default plane.
 
 ## Dependencies
 
-- No new ztest runtime crate for the metrics plane (query is HTTP against
-  thanos-querier / Prometheus).
+- `prometheus-parse` for exposition text. No query client: ztest writes the
+  `PodMonitor` and reads exporters directly, so it never speaks PromQL.
 - Profiling adds `pprof` **to the component images only**, never to ztest.

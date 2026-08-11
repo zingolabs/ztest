@@ -1,5 +1,5 @@
 //! Translate `Mount`s into per-pod `volumes` + `volumeMounts`. Side-effecting:
-//! creates ConfigMaps for `mount_config!` / `mount_file!`, plus shadow
+//! creates ConfigMaps for `mount_config!` / `mount_file!`, plus the seed
 //! VSCs and PVCs for `mount_archive!`.
 //!
 //! Everything created in the slot namespace carries the sentinel's ownerRef
@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 
 use crate::cluster::Sentinel;
 use crate::error::env_err;
-use crate::materialize::{self, Payload};
-use crate::seeds::{self, ShadowClone};
+use crate::materialize;
+use crate::seeds::{self, SeedBinding};
 use crate::{EnvError, Mount, MountKind, MountSource};
 
 /// Cap on `mount_config!` size. Re-checked at runtime in case the bytes
@@ -32,12 +32,12 @@ pub struct ResolvedMount {
     pub volume_mount: Value, // pod.spec.containers[*].volumeMounts[i]
 }
 
-/// One `ResolvedMount` per input, plus the shadow clones minted here so
-/// `TestEnv` can delete the cluster-scoped VSCs on teardown.
+/// One `ResolvedMount` per input, plus the seed bindings created here so
+/// `TestEnv` can delete their cluster-scoped content halves on teardown.
 #[derive(Debug, Default)]
 pub struct ResolveOutput {
     pub mounts: Vec<ResolvedMount>,
-    pub shadow_clones: Vec<ShadowClone>,
+    pub seed_bindings: Vec<SeedBinding>,
 }
 
 pub async fn resolve_all(
@@ -74,40 +74,27 @@ pub async fn resolve_all(
                 )
                 .await?
             }
-            (MountKind::File, MountSource::FileAbs(path)) => {
+            (MountKind::File, MountSource::Seed(handle)) => {
                 resolve_file(
                     client,
                     sentinel,
                     pod_prefix,
                     i,
                     &volume_name,
-                    path,
+                    *handle,
                     &m.destination,
                     &mut out,
                 )
                 .await?
             }
-            (MountKind::DirArchive, MountSource::ArchiveAbs(path)) => {
+            (MountKind::DirArchive, MountSource::Seed(handle)) => {
                 resolve_archive(
                     client,
                     sentinel,
                     pod_prefix,
                     i,
                     &volume_name,
-                    path,
-                    &m.destination,
-                    &mut out,
-                )
-                .await?
-            }
-            (MountKind::DirArchive, MountSource::Snapshot(snap)) => {
-                resolve_snapshot_mount(
-                    client,
-                    sentinel,
-                    pod_prefix,
-                    i,
-                    &volume_name,
-                    snap,
+                    *handle,
                     &m.destination,
                     &mut out,
                 )
@@ -141,7 +128,7 @@ async fn resolve_config(
 ) -> Result<ResolvedMount, EnvError> {
     let bytes = read_capped(source, CONFIG_BYTES_MAX)?;
     let text = String::from_utf8(bytes).map_err(|_| EnvError::ArchiveMaterializeFailed {
-        archive: source.to_path_buf(),
+        archive: source.display().to_string(),
         reason: "mount_config! source is not valid UTF-8".into(),
     })?;
     let cm_name = format!("{pod_prefix}-cfg-{index}");
@@ -160,7 +147,7 @@ async fn resolve_config_inline(
 ) -> Result<ResolvedMount, EnvError> {
     if (text.len() as u64) > CONFIG_BYTES_MAX {
         return Err(EnvError::ArchiveMaterializeFailed {
-            archive: destination.to_path_buf(),
+            archive: destination.display().to_string(),
             reason: format!(
                 "inline config is {} bytes; cap is {CONFIG_BYTES_MAX}",
                 text.len()
@@ -174,7 +161,7 @@ async fn resolve_config_inline(
 
 // ───────── mount_file! ─────────
 //
-// Same content-addressed-PVC + shadow-VSC machinery as `mount_archive!`, but
+// Same content-addressed-PVC + seed-binding machinery as `mount_archive!`, but
 // the uploader writes a single blob into `/seed/blob` (no extraction) and the
 // consuming Pod mounts that blob at the destination via subPath.
 
@@ -185,16 +172,23 @@ async fn resolve_file(
     pod_prefix: &str,
     index: usize,
     volume_name: &str,
-    source: &Path,
+    archive: crate::ArchiveHandle,
     destination: &Path,
     out: &mut ResolveOutput,
 ) -> Result<ResolvedMount, EnvError> {
-    let seed = materialize::ensure_seed(client, source, Payload::File).await?;
-    let shadow =
-        seeds::mint_shadow_clone(client, sentinel, &seed, &format!("{pod_prefix}-{index}")).await?;
+    let seed = materialize::await_seed(client, archive).await?;
+    let binding =
+        seeds::bind_seed(client, sentinel, &seed, &format!("{pod_prefix}-{index}")).await?;
     let pvc_name = format!("{pod_prefix}-file-{index}");
-    create_pvc_from_snapshot(client, sentinel, &pvc_name, &shadow.shadow_snapshot_name).await?;
-    out.shadow_clones.push(shadow);
+    create_pvc_from_snapshot(
+        client,
+        sentinel,
+        &pvc_name,
+        &binding.binding_snapshot,
+        &seed.restore_size,
+    )
+    .await?;
+    out.seed_bindings.push(binding);
     Ok(file_volume_from_pvc(volume_name, &pvc_name, destination))
 }
 
@@ -207,56 +201,48 @@ async fn resolve_archive(
     pod_prefix: &str,
     index: usize,
     volume_name: &str,
-    source: &Path,
+    archive: crate::ArchiveHandle,
     destination: &Path,
     out: &mut ResolveOutput,
 ) -> Result<ResolvedMount, EnvError> {
-    // 1. Materialize on first use (no-op if already published), then read the
-    //    CSI snapshot handle. Idempotent and race-safe; see materialize.rs.
-    let seed = materialize::ensure_seed(client, source, Payload::Archive).await?;
+    // 1. Resolve the seed preflight already published, then read its CSI
+    //    snapshot handle. This waits; it never pulls. See materialize.rs.
+    let seed = materialize::await_seed(client, archive).await?;
 
-    // 2. Mint shadow VSC + namespaced VolumeSnapshot in the test ns.
-    let shadow =
-        seeds::mint_shadow_clone(client, sentinel, &seed, &format!("{pod_prefix}-{index}")).await?;
+    // 2. Bind the seed into the test ns: pre-provisioned VSC + VolumeSnapshot.
+    let binding =
+        seeds::bind_seed(client, sentinel, &seed, &format!("{pod_prefix}-{index}")).await?;
 
-    // 3. Create a fresh PVC in the test ns with dataSource = shadow snapshot.
+    // 3. Create a fresh PVC in the test ns with dataSource = the bound snapshot.
     let pvc_name = format!("{pod_prefix}-arch-{index}");
-    create_pvc_from_snapshot(client, sentinel, &pvc_name, &shadow.shadow_snapshot_name).await?;
+    create_pvc_from_snapshot(
+        client,
+        sentinel,
+        &pvc_name,
+        &binding.binding_snapshot,
+        &seed.restore_size,
+    )
+    .await?;
 
-    out.shadow_clones.push(shadow);
+    out.seed_bindings.push(binding);
     Ok(dir_volume_from_pvc(volume_name, &pvc_name, destination))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn resolve_snapshot_mount(
-    _client: &Client,
-    _sentinel: &Sentinel,
-    _pod_prefix: &str,
-    _index: usize,
-    _volume_name: &str,
-    _snap: &crate::SnapshotRef,
-    _destination: &Path,
-    _out: &mut ResolveOutput,
-) -> Result<ResolvedMount, EnvError> {
-    // Mid-test snapshot clone path. Lands with ValidatorBackend::snapshot.
-    unimplemented!("Mount::from_snapshot not yet wired")
 }
 
 // ───────── helpers ─────────
 
 fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, EnvError> {
     let md = std::fs::metadata(path).map_err(|e| EnvError::ArchiveMaterializeFailed {
-        archive: path.to_path_buf(),
+        archive: path.display().to_string(),
         reason: format!("stat: {e}"),
     })?;
     if md.len() > max {
         return Err(EnvError::ArchiveMaterializeFailed {
-            archive: path.to_path_buf(),
+            archive: path.display().to_string(),
             reason: format!("source is {} bytes; cap is {max}", md.len()),
         });
     }
     std::fs::read(path).map_err(|e| EnvError::ArchiveMaterializeFailed {
-        archive: path.to_path_buf(),
+        archive: path.display().to_string(),
         reason: format!("read: {e}"),
     })
 }
@@ -282,11 +268,21 @@ async fn create_cm(
     Ok(())
 }
 
+/// Create the test's writable PVC, restored from a seed binding's snapshot.
+///
+/// `size` is the source snapshot's own `restoreSize`, threaded down from the
+/// [`SeedBinding`]'s seed rather than written here. A restore may not request
+/// less than its source: the CSI driver rejects it with `OutOfRange`, the PVC
+/// never binds, and the pod sits `Pending` on an unbound claim until the test
+/// times out — a failure that names neither the size nor the snapshot. A
+/// literal here is a second copy of a number that lives on the seed, and the
+/// two silently drift the moment `ZAINO_SEED_SIZE` or a fixture changes.
 async fn create_pvc_from_snapshot(
     client: &Client,
     sentinel: &Sentinel,
     name: &str,
     snapshot_name: &str,
+    size: &str,
 ) -> Result<(), EnvError> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &sentinel.namespace);
     let pvc_json = json!({
@@ -302,7 +298,7 @@ async fn create_pvc_from_snapshot(
                 "kind": "VolumeSnapshot",
                 "name": snapshot_name,
             },
-            "resources": { "requests": { "storage": "8Gi" } },
+            "resources": { "requests": { "storage": size } },
             "storageClassName": detect_storage_class(),
         }
     });

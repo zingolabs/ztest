@@ -1,78 +1,52 @@
 //! [`SeedProvider`] — a content-addressed data seed (`seed-<sha8>` PVC + its
 //! paired `VolumeSnapshot`) as a resource-graph node.
 //!
-//! Parent-side counterpart of the test-side
-//! [`materialize::ensure_seed`](crate::materialize::ensure_seed), driven from the
-//! preflight graph so the seed exists *before* any test reaches
-//! `TestEnv::build()`. Seeds are [`Lifetime::Cached`], so
+//! The parent side of seed provisioning, driven from the preflight graph so the
+//! seed exists *before* any test reaches `TestEnv::build()` — where the test
+//! side ([`materialize::await_seed`](crate::materialize::await_seed)) can only
+//! wait for it. Seeds are [`Lifetime::Cached`], so
 //! [`teardown`](Provider::teardown) is the trait default no-op.
-
-use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::inventory::{SeedEntry, SeedPayload};
-use crate::materialize::{self, Payload};
+use crate::inventory::SeedEntry;
+use crate::materialize;
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
-use crate::seeds;
+use crate::storage;
 
 /// One data seed to ensure present in the `ztest-seeds` namespace.
-///
-/// The content-addressed name (`seed-<sha8>`, hashed from the source bytes)
-/// is computed at construction so [`Provider::id`] is infallible and matches
-/// the name `materialize`/`env` recompute at test `build()` time.
 #[derive(Debug)]
 pub(crate) struct SeedProvider {
-    source: String,
-    payload: SeedPayload,
+    entry: SeedEntry,
     /// `seed-<sha8>` — the PVC name and this node's identity.
     name: String,
 }
 
 impl SeedProvider {
-    /// Build a provider for `entry`, deriving its node name from the source.
-    ///
-    /// Infallible by design: a source that can't be read or hashed at plan
-    /// time (the archive isn't in the tree yet) must NOT abort the whole run.
-    /// Instead the node takes a path-addressed placeholder name and
-    /// [`provision`](Provider::provision) fails it fast — `ensure_seed`
-    /// re-reads the source and errors before any cluster contact — which the
-    /// engine turns into a `DependencyUnavailable` SKIP of only the declaring
-    /// tests, with no runner pod ever scheduled. See [`seed_name`].
     pub(crate) fn new(entry: SeedEntry) -> Self {
         Self {
-            name: seed_name(&entry.source),
-            source: entry.source,
-            payload: entry.payload,
+            name: seed_name(&entry),
+            entry,
         }
     }
 
-    /// The [`NodeId`] a seed entry resolves to. Public so `cli::run` can key
-    /// per-test seed dependency edges to the provisioned node id without
-    /// re-derivation; keyed by source path, it matches whether or not the
-    /// source is currently readable (see [`seed_name`]).
+    /// The [`NodeId`] a seed entry resolves to. Visible so `cli::run` can key
+    /// per-test dependency edges to the provisioned node without re-derivation.
     pub(crate) fn node_id(entry: &SeedEntry) -> NodeId {
-        NodeId::Seed(seed_name(&entry.source))
+        NodeId::Seed(seed_name(entry))
     }
 }
 
-/// The node name for a seed source: `seed-<sha8>` content-addressed on the
-/// bytes when readable, else `seed-unresolved-<sha8-of-path>` when they aren't.
+/// The node name for a seed: `seed-<oid[..8]>`.
 ///
-/// The placeholder is per-source (hashes the path, which is always available),
-/// so two tests declaring the same absent archive still dedup to one node and
-/// two different absent archives fail their own dependents with their own
-/// reason. A placeholder node always provisions to `Failed`; it is never a live
-/// PVC name, since `provision` errors before creating one.
-fn seed_name(source: &str) -> String {
-    match seeds::sha8(Path::new(source)) {
-        Ok(sha8) => format!("seed-{sha8}"),
-        Err(_) => {
-            use sha2::{Digest, Sha256};
-            let path_sha8 = &hex::encode(Sha256::digest(source.as_bytes()))[..8];
-            format!("seed-unresolved-{path_sha8}")
-        }
-    }
+/// Total, and equal to the name every other process derives — the OID is baked
+/// into the declaration at compile time, so there is nothing to read and
+/// nothing that can fail. The previous version hashed the source *file*, which
+/// meant a machine without the bytes (any build or runner pod) fell back to a
+/// `seed-unresolved-*` placeholder that could never match the real PVC. That
+/// whole failure mode is gone with the path.
+fn seed_name(entry: &SeedEntry) -> String {
+    format!("seed-{}", storage::seed_sha8(&entry.oid))
 }
 
 #[async_trait]
@@ -86,20 +60,50 @@ impl Provider for SeedProvider {
     }
 
     async fn probe(&self, _cx: &Cx) -> Readiness {
-        // `ensure_seed` is idempotent and short-circuits on a ready PVC, so we let
-        // `provision` handle the warm path rather than duplicating the query here.
+        // `provision_seed` is idempotent and short-circuits on a ready PVC, so we
+        // let `provision` handle the warm path rather than duplicating the query.
         Readiness::Absent
     }
 
     async fn provision(&self, cx: &Cx) -> Result<(), ResourceError> {
-        let payload = match self.payload {
-            SeedPayload::Archive => Payload::Archive,
-            SeedPayload::File => Payload::File,
+        let reporter = NodeProgress {
+            sink: cx.progress.clone(),
+            id: self.id(),
         };
-        materialize::ensure_seed(&cx.client, Path::new(&self.source), payload)
+        materialize::provision_seed(&cx.client, &self.entry, &reporter)
             .await
             .map(|_handle| ())
             .map_err(|e| ResourceError::Provision(format!("materialize {}: {e}", self.name)))
+    }
+}
+
+/// Binds [`materialize`]'s node-agnostic progress reports onto this node's row
+/// in the console's transfer tracker. Absent off a TTY, where the whole reporter
+/// degrades to the no-op every call already tolerates.
+struct NodeProgress {
+    sink: Option<crate::resource::ProgressSink>,
+    id: NodeId,
+}
+
+impl materialize::SeedProgress for NodeProgress {
+    fn stage(&self, note: &str) {
+        if let Some(sink) = &self.sink {
+            sink.note(&self.id, note);
+        }
+    }
+
+    /// The qualifier is fixed: the bar is only ever lit by the puller's meter,
+    /// and the row's stage text is what varies around it.
+    fn bytes(&self, done: u64, total: u64) {
+        if let Some(sink) = &self.sink {
+            sink.bytes(&self.id, done, total, "transferring");
+        }
+    }
+
+    fn finalizing(&self) {
+        if let Some(sink) = &self.sink {
+            sink.finalizing(&self.id);
+        }
     }
 }
 
@@ -107,46 +111,52 @@ impl Provider for SeedProvider {
 mod tests {
     use super::*;
 
-    fn entry(source: &str) -> SeedEntry {
+    use crate::inventory::SeedPayload;
+
+    fn entry(oid: &str) -> SeedEntry {
         SeedEntry {
-            source: source.to_string(),
+            name: "chain.tar.zst".to_string(),
+            oid: oid.to_string(),
+            size: 4096,
             payload: SeedPayload::Archive,
         }
     }
 
     #[test]
-    fn readable_source_is_content_addressed() {
-        let existing = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-        let NodeId::Seed(name) = SeedProvider::node_id(&entry(existing)) else {
+    fn the_node_is_named_for_the_oid() {
+        let NodeId::Seed(name) = SeedProvider::node_id(&entry(&"a1b2c3d4".repeat(8))) else {
             panic!("expected a Seed node id");
         };
-        assert!(name.starts_with("seed-"), "{name}");
-        assert!(!name.starts_with("seed-unresolved-"), "{name}");
-    }
-
-    #[test]
-    fn missing_source_falls_back_to_a_path_addressed_placeholder() {
-        let NodeId::Seed(name) = SeedProvider::node_id(&entry("/does/not/exist.tar.xz")) else {
-            panic!("expected a Seed node id");
-        };
-        assert!(name.starts_with("seed-unresolved-"), "{name}");
+        assert_eq!(name, "seed-a1b2c3d4");
     }
 
     #[test]
     fn node_id_and_provider_agree_so_the_skip_edge_attaches() {
-        // The engine keys a test's dependency edge on `seed_node_id` and the
-        // graph node on `SeedProvider::new().id()`; if they disagreed for a
-        // missing source the edge wouldn't attach and the test would run (and
-        // pay the runner-pod cost) instead of skipping.
-        let e = entry("/does/not/exist.tar.xz");
+        // The engine keys a test's dependency edge on `node_id` and the graph
+        // node on `SeedProvider::new().id()`; if they disagreed the edge
+        // wouldn't attach and the test would run (and pay the runner-pod cost)
+        // instead of skipping when its seed failed.
+        let e = entry(&"f".repeat(64));
         assert_eq!(SeedProvider::node_id(&e), SeedProvider::new(e.clone()).id());
     }
 
     #[test]
-    fn distinct_missing_sources_get_distinct_nodes() {
+    fn distinct_archives_get_distinct_nodes() {
         assert_ne!(
-            SeedProvider::node_id(&entry("/missing/a.tar.xz")),
-            SeedProvider::node_id(&entry("/missing/b.tar.xz")),
+            SeedProvider::node_id(&entry(&"a".repeat(64))),
+            SeedProvider::node_id(&entry(&"b".repeat(64))),
         );
+    }
+
+    /// The same artifact declared from two call sites is one seed. Content
+    /// addressing is what makes that automatic — and it now holds even between
+    /// processes that disagree about where (or whether) the file is on disk.
+    #[test]
+    fn the_same_oid_dedups_to_one_node() {
+        let oid = "c6f8cc7e".repeat(8);
+        let mut a = entry(&oid);
+        a.name = "declared-over-here.tar.zst".into();
+        let b = entry(&oid);
+        assert_eq!(SeedProvider::node_id(&a), SeedProvider::node_id(&b));
     }
 }

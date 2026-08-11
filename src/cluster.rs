@@ -2,7 +2,7 @@
 //!
 //! Every `TestEnv` lives in its own namespace, created on `build()` and
 //! deleted on drop, which cascades every namespaced object. Cluster-scoped
-//! resources we mint (VolumeSnapshotContent shadows in `seeds.rs`) survive
+//! resources we mint (seed-binding VolumeSnapshotContents in `seeds.rs`) survive
 //! that delete and must be reaped explicitly.
 
 use k8s_openapi::api::core::v1::{Namespace, Service, ServiceAccount};
@@ -282,14 +282,14 @@ pub async fn dead_pod_report(client: &Client, namespace: &str) -> String {
     out
 }
 
-/// Delete the cluster-scoped shadow VolumeSnapshotContents serving `namespace`,
+/// Delete the cluster-scoped seed-binding VolumeSnapshotContents serving `namespace`,
 /// selected by [`LABEL_TEST_NS`](crate::qos::LABEL_TEST_NS). They can't cascade
 /// with the namespace delete (they're cluster-scoped), so the parent `ztest run`
 /// deletes them here at per-test teardown. Best-effort: a cluster without the
 /// snapshot CRD, or a VSC already gone, counts as success. Mirrors the
 /// list-then-delete-each of [`crate::resource::entry`]'s reaper (the run role
 /// advertises only `delete`, not `deletecollection`, on this resource).
-pub async fn delete_shadow_vscs_for_ns(client: &Client, namespace: &str) {
+pub async fn delete_seed_binding_contents_for_ns(client: &Client, namespace: &str) {
     use kube::api::{DeleteParams, DynamicObject, ListParams};
     let vsc: Api<DynamicObject> =
         Api::all_with(client.clone(), &crate::seeds::volume_snapshot_content_gvk());
@@ -304,7 +304,7 @@ pub async fn delete_shadow_vscs_for_ns(client: &Client, namespace: &str) {
         if let Err(e) = vsc.delete(name, &DeleteParams::default()).await
             && !crate::resource::kube::is_not_found(&e)
         {
-            tracing::warn!(vsc = %name, namespace, error = %e, "shadow VSC delete failed");
+            tracing::warn!(content = %name, namespace, error = %e, "seed binding content delete failed");
         }
     }
 }
