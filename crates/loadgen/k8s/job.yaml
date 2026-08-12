@@ -1,0 +1,52 @@
+# In-cluster load run: a plain Job that hits the LOCAL zaino service directly.
+#
+# Nothing here is target-specific — apply it into whichever namespace's zaino
+# you want to test; the target is derived from the pod's own namespace, and the
+# height window is auto-discovered from the chain tip:
+#
+#   kubectl --context zingo-infra -n preview-070-rc1b apply -f job.yaml
+#   kubectl --context zingo-infra -n preview-070-rc1b logs -f job/loadgen
+#
+# The Job runs in the target namespace so in-cluster DNS resolves and no
+# cross-namespace NetworkPolicy is in the way.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loadgen
+  labels:
+    app: loadgen
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: loadgen
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: zingodevops/loadgen:dev
+          imagePullPolicy: Always
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ZTEST_LOG
+              value: loadgen=info,ztest=info
+          args:
+            - --target=http://zaino.$(POD_NAMESPACE).svc.cluster.local:8137
+            - --connections=64
+            - --tip-window=50000
+            - --blocks=100
+            - --conn-mode=per-task
+            - --duration=30
+            - --json
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi

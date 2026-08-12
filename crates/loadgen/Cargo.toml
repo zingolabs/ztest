@@ -1,0 +1,27 @@
+[package]
+name = "loadgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "loadgen"
+path = "src/main.rs"
+
+[dependencies]
+# The whole point: reuse ztest's load-test library (LwdClient / LoadDriver /
+# ChainLinkOracle / LoadReport). default-features off drops the wallet backends
+# (librustzcash/zingo) we don't need; kube/k8s-openapi remain non-optional but
+# we never touch them — we only speak gRPC to an already-running zainod.
+ztest = { path = "../..", default-features = false }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = "1"

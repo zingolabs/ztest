@@ -18,7 +18,7 @@ use crate::EnvError;
 use crate::loadtest::client::LwdClient;
 use crate::loadtest::oracle::{FieldDiff, Observed, Oracle, Violation, diff_compact_block};
 use crate::loadtest::report::{LatencyStats, LoadReport, OpKind, ParityRecord};
-use crate::loadtest::scenario::Scenario;
+use crate::loadtest::scenario::{Op, Scenario};
 use crate::proto::CompactBlock;
 
 /// Whether every connection shares one multiplexed channel, or dials its own.
@@ -151,7 +151,6 @@ impl LoadDriver {
 
     pub async fn run(self) -> Result<LoadReport, EnvError> {
         let scenario = Arc::new(self.scenario);
-        let op_kind = scenario.op_kind();
         let stop = StopCond::from(self.until);
         let wall = Instant::now();
 
@@ -161,7 +160,7 @@ impl LoadDriver {
                 ConnMode::Shared => self.client.clone(),
                 ConnMode::PerTask => self.client.dial().await?,
             };
-            let (start, end) = scenario.range_for(i, self.connections);
+            let op = scenario.op(i, self.connections);
             let oracle = self.oracle.clone();
             handles.push(tokio::spawn(async move {
                 let mut tally = Tally::new();
@@ -169,10 +168,17 @@ impl LoadDriver {
                 let mut done = stop.starter();
                 while !done.reached() {
                     let t = Instant::now();
-                    match client.block_range(start, end).await {
+                    let (result, window) = match op {
+                        Op::LatestBlock => (client.latest_height().await.map(|_| Vec::new()), None),
+                        Op::Block(h) => (client.block_at(h).await.map(|b| vec![b]), Some((h, h))),
+                        Op::BlockRange(start, end) => {
+                            (client.block_range(start, end).await, Some((start, end)))
+                        }
+                    };
+                    match result {
                         Ok(blocks) => {
-                            tally.record(op_kind, t.elapsed());
-                            if let Some(o) = &oracle {
+                            tally.record(op.kind(), t.elapsed());
+                            if let (Some(o), Some((start, end))) = (&oracle, window) {
                                 for v in o.observe(&Observed {
                                     start,
                                     end,
