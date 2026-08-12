@@ -1,0 +1,25 @@
+# Multi-stage build for the `loadgen` zainod load generator.
+#
+# Build context MUST be the ztest repo root (loadgen depends on the ztest lib
+# via `path = "../.."` and inherits the workspace `[patch.crates-io]`):
+#
+#   podman build -f crates/loadgen/Containerfile -t loadgen:dev .
+#
+# `ztest` is pulled with default-features off (see crates/loadgen/Cargo.toml),
+# so the optional zingolib/pepper-sync/test-vector git deps are NOT fetched —
+# only crates.io + the public lightwallet-protocol patch. No build creds needed.
+
+FROM docker.io/library/rust:1.95-slim-bookworm AS builder
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends protobuf-compiler pkg-config git \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p loadgen
+
+FROM docker.io/library/debian:bookworm-slim AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/loadgen /usr/local/bin/loadgen
+ENTRYPOINT ["/usr/local/bin/loadgen"]
