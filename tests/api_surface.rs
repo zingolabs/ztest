@@ -60,14 +60,14 @@ fn an_archive_handle_carries_its_manifest_identity() {
         "75cf3ec7023cf430a92326ba02554dfc1c7b5abc605e6d11bcb18470c8156783"
     );
     assert_eq!(MATURED_CHAIN.size(), 19);
-    let _restored = Validator::zebrad("1.9.1").restore(MATURED_CHAIN);
+    let _validator = Validator::zebrad("1.9.1").testnet(MATURED_CHAIN);
 }
 
 /// A shipped snapshot is the same `ArchiveHandle` type as a locally declared
-/// archive — the property that lets one `restore` serve both.
+/// archive — the property that lets one `testnet` serve both.
 #[test]
 fn a_shipped_snapshot_is_the_same_handle_type() {
-    let _restored = Validator::zebrad("6.2.3").restore(ORCHARD);
+    let _validator = Validator::zebrad("6.2.3").testnet(testnet::ORCHARD);
 }
 
 #[test]

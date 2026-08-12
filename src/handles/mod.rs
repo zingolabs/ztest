@@ -96,9 +96,17 @@ impl HandleInner {
 /// drift.
 pub mod ports {
     pub const ZEBRAD_RPC: u16 = 28232;
-    /// zebrad's JSON-RPC port on a testnet topology (distinct from the regtest
+    /// zebrad's JSON-RPC port on a public-network topology — mainnet or testnet
+    /// — restored from a pinned archive (distinct from the regtest
     /// [`ZEBRAD_RPC`]).
-    pub const ZEBRAD_TESTNET_RPC: u16 = 18232;
+    ///
+    /// One port for both public networks, not zcash's canonical 8232/18232
+    /// split. Pods are namespace-isolated and addressed by name, so the number
+    /// is ztest's own convention; mainnet's canonical 8232 would additionally
+    /// collide with [`ZAINO_JSONRPC`]. What the port has to distinguish is
+    /// which *config generator* rendered the node, and that is
+    /// public-vs-regtest.
+    pub const ZEBRAD_PUBLIC_RPC: u16 = 18232;
     pub const ZEBRAD_METRICS: u16 = 9999;
     pub const ZEBRAD_P2P: u16 = 18233;
     /// zebrad's indexer gRPC (`rpc.indexer_listen_addr`). Only served when a

@@ -34,6 +34,14 @@ pub(super) const PANEL_LINES: usize = 5;
 /// column's top row is left blank to align with the left column's branded rule.
 pub(super) const MAX_TRANSFER_ROWS: usize = PANEL_LINES - 1;
 
+/// Character width of a per-pool sparkline in the panel's work column.
+///
+/// Fixed rather than derived: a panel block is rendered without knowing the
+/// width it will be clipped to (the console splits columns at present time), and
+/// a sparkline whose length tracked the terminal would make two runs
+/// un-comparable at a glance. Twelve characters is 24 braille sub-columns.
+pub(super) const SPARK_WIDTH: usize = 12;
+
 /// Force `out` to exactly [`PANEL_LINES`] lines: pad short blocks with blank
 /// lines, truncate an over-long one, so the fixed-height panel viewport doesn't
 pub(super) fn pad_to_panel(out: &mut String) {

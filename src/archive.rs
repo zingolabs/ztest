@@ -3,7 +3,7 @@
 //! One concept, one macro. An *archive* is an immutable `.tar.*` artifact
 //! stored in Git LFS alongside a plaintext `.toml` manifest, declared with
 //! [`archive!`](macro@crate::archive) / `#[ztest::archive]`
-//! and consumed by [`Restore::restore`](crate::regtest::Restore::restore). A
+//! and consumed by [`RestoreSource`](crate::component::RestoreSource). A
 //! pre-synced testnet chain is not a separate kind of thing — it is an archive
 //! whose manifest happens to describe a validator state directory, which is
 //! what [`ChainInfo`] carries.
@@ -61,6 +61,42 @@ impl ArchiveNetwork {
             ArchiveNetwork::Mainnet => "mainnet",
             ArchiveNetwork::Testnet => "testnet",
             ArchiveNetwork::Regtest => "regtest",
+        }
+    }
+
+    /// Whether this is a public network — one whose chain ztest restores from a
+    /// pinned archive rather than mines itself.
+    ///
+    /// The distinction that matters to a config generator is not
+    /// mainnet-vs-testnet but *restored-and-frozen* vs *regtest*: a public-network
+    /// validator runs peerless against an immutable pin, so its tip never moves
+    /// and it must never chase the live network. Regtest is the opposite.
+    pub const fn is_public(self) -> bool {
+        matches!(self, ArchiveNetwork::Mainnet | ArchiveNetwork::Testnet)
+    }
+
+    /// The value zebrad's `[network] network` key takes.
+    ///
+    /// Zebra spells these capitalised and ztest spells them lowercase; this is
+    /// the one place the two conventions meet.
+    pub const fn zebra_name(self) -> &'static str {
+        match self {
+            ArchiveNetwork::Mainnet => "Mainnet",
+            ArchiveNetwork::Testnet => "Testnet",
+            ArchiveNetwork::Regtest => "Regtest",
+        }
+    }
+
+    /// zebrad's per-network initial-peers key.
+    ///
+    /// Network-specific by name, not just by value: setting `initial_testnet_peers`
+    /// on a mainnet node leaves the *mainnet* seed list at its default, and the
+    /// node dials out and syncs its tip off the pin.
+    pub const fn initial_peers_key(self) -> &'static str {
+        match self {
+            ArchiveNetwork::Mainnet => "initial_mainnet_peers",
+            ArchiveNetwork::Testnet => "initial_testnet_peers",
+            ArchiveNetwork::Regtest => "initial_testnet_peers",
         }
     }
 }

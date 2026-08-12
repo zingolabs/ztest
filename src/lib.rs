@@ -25,10 +25,10 @@ pub mod handles;
 pub mod loadtest;
 pub mod mount;
 pub mod protocol;
+pub mod public_conf;
 pub mod regtest;
 pub mod regtest_conf;
 pub mod snapshots;
-pub mod testnet_conf;
 pub mod topology;
 
 // ───────────────────────── internal machinery ──────────────────────────
@@ -178,12 +178,17 @@ pub mod prelude {
     };
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
-        Regtest, Restore, regtest_test_activation_heights, regtest_test_lockbox_disbursements,
+        Regtest, Testnet, regtest_test_activation_heights, regtest_test_lockbox_disbursements,
         regtest_test_post_nu6_funding_streams,
     };
-    /// The named snapshots themselves — `.restore(ORCHARD)`. In the prelude
-    /// because they are the entire test-author surface for chain fixtures.
-    pub use crate::snapshots::{BLOSSOM, IRONWOOD, ORCHARD, SAPLING};
+    /// The named snapshots, by network — `testnet::ORCHARD`,
+    /// `mainnet::BLOSSOM`. In the prelude because they are the entire
+    /// test-author surface for chain fixtures.
+    ///
+    /// The modules rather than the consts: both networks pin the same upgrade
+    /// names, so a bare `ORCHARD` in scope would silently mean whichever one
+    /// the prelude happened to pick.
+    pub use crate::snapshots::{mainnet, testnet};
     /// `ActivationHeights` appears in ztest's public signatures (e.g.
     /// [`ValidatorBackend::activation_heights`]), so callers need the type to
     /// consume what ztest returns.

@@ -759,6 +759,111 @@ fn render_sync_waiting(
     .expect("write to string");
 }
 
+/// The **middle column** of the `ztest sync watch` panel: one row per pool,
+/// each with its own rate and its own sparkline of that rate over the run.
+///
+/// Per-pool rather than one stacked plot (which is what `ztest sync status`
+/// draws, and still the right shape for a full-height box) because at one row
+/// per channel a stack has nowhere to stack: four bands sharing four rows
+/// resolves nothing. Separate sparklines trade the composition view for a
+/// per-pool trend, which is the question a live watcher asks — *is sapling
+/// keeping up?* — and the composition is recoverable from the rates beside them.
+///
+/// Rows are the measured channels, then `total`, capped at the panel budget.
+/// Unmeasured channels are dropped rather than drawn flat: a channel nobody
+/// counted and a channel that is idle are different facts, and an empty
+/// sparkline states the second one.
+///
+/// Braille via the shared [`plot_stacked`](super::plot::plot_stacked) with a
+/// height of one, so these and the status box are the same renderer at different
+/// geometries — a sparkline here cannot disagree with the plot there.
+pub fn render_sync_work(state: &SyncWatchState, theme: &Theme) -> String {
+    use super::plot::{Palette, PlotOpts, plot_stacked};
+
+    let mut out = String::with_capacity(320);
+    out.push('\n');
+
+    let (Some(timeline), Some(vitals)) = (&state.timeline, state.vitals.as_ref()) else {
+        writeln!(
+            out,
+            "{:>width$} {}",
+            "work".style(theme.styles.dim),
+            match state.vitals {
+                None => "awaiting first tick",
+                Some(_) => "awaiting first series",
+            }
+            .style(theme.styles.dim),
+            width = METRIC_LABEL_WIDTH,
+        )
+        .expect("write to string");
+        pad_to_panel(&mut out);
+        return out;
+    };
+
+    let palette = Palette::pools(theme.is_colorized());
+    let opts = PlotOpts::new(SPARK_WIDTH, 1, theme.chars.graph);
+    // Measured channels only, in `CHANNELS` (oldest-pool-first) order, leaving a
+    // row for the total.
+    // Filtered *before* the row budget is applied: taking first would spend the
+    // budget on tier-B channels that are then skipped, and the pools that were
+    // actually measured would fall off the bottom.
+    let measured = vitals
+        .pool_rates
+        .iter()
+        .map(|(name, rate)| (*name, rate, timeline.bands(name)))
+        .filter(|(_, _, bands)| bands.iter().any(Option::is_some));
+
+    let mut drawn = 0;
+    for (name, rate, bands) in measured.take(MAX_TRANSFER_ROWS.saturating_sub(1)) {
+        let spark = plot_stacked(&[(name, bands)], &opts, &palette)
+            .pop()
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "{:>width$} {:>8} {spark}",
+            name.style(theme.styles.dim),
+            match rate {
+                Some(r) => format!("{}/s", compact(*r)),
+                None => "—".to_string(),
+            }
+            .style(theme.styles.count),
+            width = METRIC_LABEL_WIDTH,
+        )
+        .expect("write to string");
+        drawn += 1;
+    }
+    if drawn == 0 {
+        writeln!(
+            out,
+            "{:>width$} {}",
+            "work".style(theme.styles.dim),
+            "no pool measured".style(theme.styles.dim),
+            width = METRIC_LABEL_WIDTH,
+        )
+        .expect("write to string");
+    }
+
+    // The total last, under the pools that compose it, with the span the
+    // sparklines cover — without it a reader cannot tell ten minutes from two
+    // days of history.
+    writeln!(
+        out,
+        "{:>width$} {:>8} {}",
+        "total".style(theme.styles.dim),
+        match vitals.work_rate {
+            Some(r) => format!("{}/s", compact(r)),
+            None => "—".to_string(),
+        }
+        .style(theme.styles.count),
+        format_elapsed(timeline.span()).style(theme.styles.dim),
+        width = METRIC_LABEL_WIDTH,
+    )
+    .expect("write to string");
+
+    pad_to_panel(&mut out);
+    out
+}
+
 /// The **right column** of the `ztest sync watch` panel: the newest metrics
 /// reading, one label per row. Held to [`PANEL_LINES`] with the top row blank,
 /// matching [`render_transfers`].
@@ -766,6 +871,10 @@ fn render_sync_waiting(
 /// Fed by a direct exporter scrape, not by a monitoring stack — a column that
 /// repaints once per scrape interval is not a live display. Four blank rows read
 /// as "everything is zero", so when there are no values the *reason* is named.
+///
+/// Counters and steady-state facts only. Anything with a *rate* belongs in
+/// [`render_sync_work`], which is fed by the driver's own differencing rather
+/// than by a scrape that can be dropped.
 pub fn render_sync_metrics(reading: &crate::metrics::Reading, theme: &Theme) -> String {
     let mut out = String::with_capacity(320);
     out.push('\n');
@@ -1482,6 +1591,82 @@ mod tests {
             ],
             received_at: std::time::Duration::from_secs(210),
         }
+    }
+
+    /// A timeline carrying every channel `sample_vitals` reports a rate for, so
+    /// the work column has something to draw.
+    fn sample_timeline() -> crate::sync::Timeline {
+        let names: Vec<&str> = crate::sync::CHANNELS.iter().map(|(n, _)| *n).collect();
+        let mut timeline =
+            crate::sync::Timeline::new(names.clone(), std::time::Duration::from_secs(60));
+        for step in 0..6u64 {
+            let samples: Vec<Option<f64>> = names
+                .iter()
+                .map(|n| match *n {
+                    "sapling" => Some(19_400.0 + step as f64 * 100.0),
+                    "orchard" => Some(4_200.0),
+                    "ironwood" => Some(0.0),
+                    // Tier B: nobody counted it.
+                    _ => None,
+                })
+                .collect();
+            timeline.push(std::time::Duration::from_secs(step * 60), &samples);
+        }
+        timeline
+    }
+
+    /// A pool nobody measured gets no row at all, rather than a flat line at
+    /// zero. A flat sparkline is a claim that the pool was idle, which is the one
+    /// thing an unmeasured channel does not say.
+    #[test]
+    fn the_work_column_draws_only_measured_pools() {
+        let mut state = watching(Some(sample_vitals()));
+        state.timeline = Some(sample_timeline());
+        let out = render_sync_work(&state, &plain_unicode_theme());
+
+        for measured in ["sapling", "orchard", "ironwood"] {
+            assert!(out.contains(measured), "`{measured}` row missing:\n{out}");
+        }
+        for unmeasured in ["transparent", "sprout"] {
+            assert!(
+                !out.contains(unmeasured),
+                "`{unmeasured}` was never counted and must not get a row:\n{out}"
+            );
+        }
+        assert!(out.contains("total"), "total row missing:\n{out}");
+    }
+
+    /// The column is height-critical: the panel is a fixed block, and a column
+    /// returning a different line count than its neighbours shears the frame.
+    #[test]
+    fn the_work_column_is_always_panel_height() {
+        let theme = plain_unicode_theme();
+        let mut full = watching(Some(sample_vitals()));
+        full.timeline = Some(sample_timeline());
+        for state in [watching(None), watching(Some(sample_vitals())), full] {
+            let out = render_sync_work(&state, &theme);
+            assert_eq!(
+                out.lines().count(),
+                PANEL_LINES,
+                "work column must be exactly {PANEL_LINES} lines:\n{out}"
+            );
+        }
+    }
+
+    /// Before the first series lands there is nothing to plot, and an empty
+    /// column reads as "no work happened" — the one thing it does not mean.
+    #[test]
+    fn the_work_column_names_why_it_is_empty() {
+        let theme = plain_unicode_theme();
+        assert!(
+            render_sync_work(&watching(None), &theme).contains("awaiting first tick"),
+            "a pre-tick column must say so"
+        );
+        assert!(
+            render_sync_work(&watching(Some(sample_vitals())), &theme)
+                .contains("awaiting first series"),
+            "a ticked-but-unplotted column must distinguish itself from a pre-tick one"
+        );
     }
 
     fn probe(name: &str, state: crate::sync::ProbeState) -> ProbeRow {

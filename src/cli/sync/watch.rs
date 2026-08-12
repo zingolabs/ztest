@@ -18,16 +18,53 @@ use owo_colors::OwoColorize as _;
 
 use crate::cli::console::{Console, SceneFrame};
 use crate::metrics::{PodExporter, Poller, Reading};
-use crate::sync::{SyncEvent, decode_event, namespace_for};
+use crate::resource::impls::policy::RUN_NAMESPACE;
+use crate::sync::{SyncEvent, decode_event, driver_pod_for, namespace_for};
 use crate::ui::{
     ProbeRow, SetupStep, SyncVitals, SyncWatchState, Theme, render_sync_metrics,
-    render_sync_watch_panel,
+    render_sync_watch_panel, render_sync_work,
 };
 
 use super::{
-    DRIVER_CONTAINER, DRIVER_POD, driver_profile, find_driver, print_report_details, read_report,
+    DRIVER_CONTAINER, driver_profile, find_driver, print_report_details, read_report,
     report_headline, row_of,
 };
+
+/// A driver pod's address: an API handle scoped to the run namespace, plus the
+/// pod's name.
+///
+/// The halves travel together because neither implies the other. A driver is a
+/// *runner* pod — it lives in [`RUN_NAMESPACE`] with every other runner, not in
+/// the sync namespace it deploys into — so a call site holding only the sync's
+/// `Api<Pod>` would quietly read the wrong namespace, and one holding only the
+/// sync id would have to re-derive the name. Every driver-side read in this file
+/// goes through here; the SUT reads keep their own sync-namespace handle.
+pub(super) struct DriverPod {
+    api: Api<Pod>,
+    name: String,
+}
+
+impl DriverPod {
+    pub(super) fn new(client: &kube::Client, sync_id: &str) -> Self {
+        DriverPod {
+            api: Api::namespaced(client.clone(), RUN_NAMESPACE),
+            name: driver_pod_for(sync_id),
+        }
+    }
+
+    async fn get(&self) -> Result<Option<Pod>, kube::Error> {
+        self.api.get_opt(&self.name).await
+    }
+}
+
+/// The two logs an attach merges, each with the handle its own namespace needs:
+/// the driver in [`RUN_NAMESPACE`], the subject under test in the sync's
+/// namespace. Bundled because they are always wanted together, and because a
+/// pair is harder to mix up than two bare `Api<Pod>` parameters would be.
+pub(super) struct Followed<'a> {
+    driver: &'a DriverPod,
+    sut: &'a Api<Pod>,
+}
 
 /// How often the driver pod's phase is re-read. Only matters before the first
 /// event lands (and after the last), so it stays slow.
@@ -64,15 +101,18 @@ pub(super) enum WatchEnd {
 pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
     let client = super::client().await?;
     let ns = namespace_for(id);
-    let driver = find_driver(&client, &ns, id).await?;
-    let profile = driver_profile(&driver).unwrap_or_else(|| id.to_string());
+    let pod = find_driver(&client, id).await?;
+    let profile = driver_profile(&pod).unwrap_or_else(|| id.to_string());
+    // Two handles, two namespaces: the driver in the run namespace, the topology
+    // it deploys (the SUT followed below, and the metrics poller) in the sync's.
+    let driver = DriverPod::new(&client, id);
     let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
     let theme = Theme::detect();
 
     // Non-TTY (CI / piped): a plain linear tail — no panel to pin, so the events
     // that would have driven it are rendered as ordinary lines instead.
     if !stdout().is_terminal() {
-        return linear(&api, &client, &ns, id, &theme).await;
+        return linear(&driver, &client, &ns, id, &theme).await;
     }
 
     let cancel_theme = theme.clone();
@@ -83,22 +123,26 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
     let session_start = Instant::now();
     let (console, guard) = match Console::start(session_start, cancel_panel) {
         Ok(cg) => cg,
-        Err(_) => return linear(&api, &client, &ns, id, &theme).await,
+        Err(_) => return linear(&driver, &client, &ns, id, &theme).await,
     };
 
     let mut feed = Feed::new(
         profile,
         id.to_string(),
         crate::cluster_config::active_context().unwrap_or_else(|| "(cluster)".into()),
-        row_of(&driver).2,
+        row_of(&pod).2,
     );
 
-    // Two independent views on one screen: the sync feed drives the left panel,
-    // the metrics poller the right. Neither reads the other's state.
+    // Three views on one screen, in decreasing liveness: the sync feed (left),
+    // the driver's own per-pool work rates (middle), and the exporter's counters
+    // (right). The first two come from the driver's event stream and the third
+    // from a controller-side scrape — none reads another's state, and on a
+    // terminal too narrow for three the counters are the column that goes.
     let render = |feed: &Feed, metrics: &Reading| {
         let (state, theme, metrics) = (feed.state.clone(), theme.clone(), metrics.clone());
         console.scene(move |elapsed| SceneFrame {
             left: render_sync_watch_panel(&state, elapsed, &theme),
+            mid: Some(render_sync_work(&state, &theme)),
             right: render_sync_metrics(&metrics, &theme),
             live: None,
         });
@@ -123,7 +167,10 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
     );
 
     let tail = tail_loop(
-        &api,
+        Followed {
+            driver: &driver,
+            sut: &api,
+        },
         &mut metrics,
         &console,
         session_start,
@@ -147,13 +194,13 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
 /// The panel-less attach: tail the driver log linearly, then report what the sync
 /// settled as. Used off a TTY and when the console cannot start.
 async fn linear(
-    api: &Api<Pod>,
+    driver: &DriverPod,
     client: &kube::Client,
     ns: &str,
     id: &str,
     theme: &Theme,
 ) -> Result<WatchEnd, String> {
-    plain_tail(api, theme).await?;
+    plain_tail(driver, theme).await?;
     settled(client, ns, id, theme).await
 }
 
@@ -183,7 +230,7 @@ async fn settled(
 /// Merge the driver log, the SUT log, and the pod-phase poll until either the
 /// driver's stream ends or the user detaches.
 async fn tail_loop(
-    api: &Api<Pod>,
+    followed: Followed<'_>,
     metrics: &mut Poller,
     console: &Console,
     session_start: Instant,
@@ -191,18 +238,19 @@ async fn tail_loop(
     theme: &Theme,
     render: impl Fn(&Feed, &Reading),
 ) -> Result<(), String> {
+    let Followed { driver, sut: api } = followed;
     // The metrics view, held beside the sync feed and folded independently of it.
     let mut metrics_view = Reading::default();
     // The last cause shown, so a standing condition is stated once rather than
     // once a second.
     let mut last_note: Option<String> = None;
 
-    let started = open_driver_log(api, &|| console.cancelled(), |phase| {
+    let started = open_driver_log(driver, &|| console.cancelled(), |phase| {
         feed.state.pod_phase = phase;
         render(feed, &Reading::default());
     })
     .await?;
-    let Some(mut driver) = started else {
+    let Some(mut driver_log) = started else {
         return Ok(());
     };
     // The SUT pod does not exist yet on an early attach — the driver provisions
@@ -228,7 +276,7 @@ async fn tail_loop(
         let (mut close_sut, mut lost_driver) = (false, false);
         let mut next_reading: Option<Reading> = None;
         tokio::select! {
-            line = driver.next() => match line {
+            line = driver_log.next() => match line {
                 Some(Ok(l)) => {
                     driver_seen = Instant::now();
                     if let Some(text) = feed.absorb(&l, session_start.elapsed(), theme) {
@@ -254,7 +302,7 @@ async fn tail_loop(
                 next_reading = Some(reading);
             }
             _ = ticker.tick() => {
-                if let Ok(Some(pod)) = api.get_opt(DRIVER_POD).await {
+                if let Ok(Some(pod)) = driver.get().await {
                     let phase = driver_phase(&pod);
                     if phase != feed.state.pod_phase {
                         feed.state.pod_phase = phase;
@@ -297,9 +345,9 @@ async fn tail_loop(
             sut = None;
         }
         if lost_driver {
-            match reattach_driver(api, driver_seen).await? {
+            match reattach_driver(driver, driver_seen).await? {
                 Some(stream) => {
-                    driver = stream;
+                    driver_log = stream;
                     console.scrollback(prefixed("ztest", "reattached to the driver log", theme));
                 }
                 None => break,
@@ -315,12 +363,15 @@ async fn tail_loop(
 /// API-server timeout, a proxy hop, a rebalanced connection — and taking that for
 /// the end of the run leaves a live sync unwatched with no way back short of
 /// re-running the command. `None` means the driver really has finished.
-async fn reattach_driver(api: &Api<Pod>, last_seen: Instant) -> Result<Option<LineStream>, String> {
+async fn reattach_driver(
+    driver: &DriverPod,
+    last_seen: Instant,
+) -> Result<Option<LineStream>, String> {
     // A stream that fails immediately would otherwise spin here; this also gives
     // a driver mid-exit time to write its last lines.
     tokio::time::sleep(POD_POLL).await;
-    let Some(pod) = api
-        .get_opt(DRIVER_POD)
+    let Some(pod) = driver
+        .get()
         .await
         .map_err(|e| format!("read driver pod: {e}"))?
     else {
@@ -329,10 +380,14 @@ async fn reattach_driver(api: &Api<Pod>, last_seen: Instant) -> Result<Option<Li
     if !running(&pod, DRIVER_CONTAINER) {
         return Ok(None);
     }
-    open_log(api, DRIVER_POD, Backfill::Seconds(gap_since(last_seen)))
-        .await
-        .map(Some)
-        .map_err(|e| format!("reattach to sync log: {e}"))
+    open_log(
+        &driver.api,
+        &driver.name,
+        Backfill::Seconds(gap_since(last_seen)),
+    )
+    .await
+    .map(Some)
+    .map_err(|e| format!("reattach to sync log: {e}"))
 }
 
 /// The window a resumed stream must replay to leave no gap: everything since the
@@ -352,7 +407,7 @@ fn gap_since(last_seen: Instant) -> i64 {
 ///
 /// `Ok(None)` means the caller asked to stop waiting.
 async fn open_driver_log(
-    api: &Api<Pod>,
+    driver: &DriverPod,
     stop: &dyn Fn() -> bool,
     mut observe: impl FnMut(String),
 ) -> Result<Option<LineStream>, String> {
@@ -360,14 +415,14 @@ async fn open_driver_log(
         if stop() {
             return Ok(None);
         }
-        let pod = api
-            .get_opt(DRIVER_POD)
+        let pod = driver
+            .get()
             .await
             .map_err(|e| format!("read driver pod: {e}"))?
-            .ok_or_else(|| format!("driver pod {DRIVER_POD} no longer exists"))?;
+            .ok_or_else(|| format!("driver pod {} no longer exists", driver.name))?;
         observe(driver_phase(&pod));
         if logs_available(&pod, DRIVER_CONTAINER) {
-            return open_log(api, DRIVER_POD, Backfill::Lines(TAIL_LINES))
+            return open_log(&driver.api, &driver.name, Backfill::Lines(TAIL_LINES))
                 .await
                 .map(Some)
                 .map_err(|e| format!("stream sync log: {e}"));
@@ -480,8 +535,8 @@ fn prefixed(source: &str, line: &str, theme: &Theme) -> String {
 /// A plain, linear follow-tail of the driver log (non-TTY, or when the terminal
 /// console can't start). No panel, so every event — ticks included — is rendered
 /// as a line: a piped `watch` is a progress log.
-async fn plain_tail(api: &Api<Pod>, theme: &Theme) -> Result<(), String> {
-    let mut lines = open_driver_log(api, &|| false, |phase| {
+async fn plain_tail(driver: &DriverPod, theme: &Theme) -> Result<(), String> {
+    let mut lines = open_driver_log(driver, &|| false, |phase| {
         println!("ztest sync: driver {phase}");
     })
     .await?
@@ -499,7 +554,7 @@ async fn plain_tail(api: &Api<Pod>, theme: &Theme) -> Result<(), String> {
                 println!("{text}");
             }
         }
-        match reattach_driver(api, seen).await? {
+        match reattach_driver(driver, seen).await? {
             Some(stream) => {
                 lines = stream;
                 println!("ztest sync: reattached to the driver log");
@@ -516,12 +571,12 @@ async fn plain_tail(api: &Api<Pod>, theme: &Theme) -> Result<(), String> {
 ///
 /// `None` when no tick has been published yet (still provisioning), or the log is
 /// unreadable.
-pub(super) async fn latest_progress(api: &Api<Pod>) -> Option<SyncWatchState> {
+pub(super) async fn latest_progress(driver: &DriverPod) -> Option<SyncWatchState> {
     let lp = LogParams {
         tail_lines: Some(STATUS_TAIL_LINES),
         ..Default::default()
     };
-    let logs = api.logs(DRIVER_POD, &lp).await.ok()?;
+    let logs = driver.api.logs(&driver.name, &lp).await.ok()?;
     let theme = Theme::for_capabilities(false, true);
     let mut feed = Feed::new(String::new(), String::new(), String::new(), String::new());
     for line in logs.lines() {
@@ -970,7 +1025,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": { "name": DRIVER_POD },
+            "metadata": { "name": driver_pod_for("a-sync-id") },
             "spec": { "containers": [{ "name": DRIVER_CONTAINER }] },
             "status": {
                 "phase": phase,

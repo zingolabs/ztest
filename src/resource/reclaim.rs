@@ -7,7 +7,7 @@
 //! | class | object | why it needs explicit handling |
 //! |---|---|---|
 //! | per-test env | `Namespace ztest-*` | cascades its pods/PVCs/quota |
-//! | detached sync | `Namespace ztest-sync-*` | persistent *by design*; cascades |
+//! | detached sync | `Namespace ztest-sync-*` **+ its driver Pod** | persistent *by design*; the namespace cascades the topology, but the driver is a runner pod in [`RUN_NAMESPACE`] and cascades from nothing |
 //! | ephemeral run pods | `Pod` in [`RUN_NAMESPACE`] | build/uploader pods live outside the test namespace, so nothing cascades them |
 //! | seed binding    | `VolumeSnapshotContent` | cluster-scoped, no owner ref |
 //! | QoS reservation | `Lease` in [`META_NAMESPACE`] | holds admission capacity until deleted |
@@ -211,10 +211,33 @@ async fn delete(client: &Client, target: &Target) -> Result<(), kube::Error> {
     let result = match target.kind {
         // Namespaces advertise only `delete`, never `deletecollection`, so each
         // is deleted individually.
-        Kind::TestEnv | Kind::Sync => Api::<Namespace>::all(client.clone())
+        Kind::TestEnv => Api::<Namespace>::all(client.clone())
             .delete(&target.name, &dp)
             .await
             .map(|_| ()),
+        // A sync is two objects: the namespace holding its topology, and the
+        // driver pod running it — which lives in `RUN_NAMESPACE` as the run
+        // identity, like every other runner pod, and so is cascaded by nothing.
+        // Reaping one without the other leaves either an orphaned driver still
+        // holding its tier's footprint, or a namespace whose driver is gone.
+        //
+        // The namespace goes first: a driver mid-teardown keeps working against
+        // the topology it is checkpointing until it is itself removed.
+        Kind::Sync => {
+            let ns = ignore_not_found(
+                Api::<Namespace>::all(client.clone())
+                    .delete(&target.name, &dp)
+                    .await
+                    .map(|_| ()),
+            );
+            let driver = ignore_not_found(
+                Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
+                    .delete(&driver_pod_of(target), &dp)
+                    .await
+                    .map(|_| ()),
+            );
+            ns.and(driver)
+        }
         Kind::RunPod => Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
             .delete(&target.name, &dp)
             .await
@@ -225,9 +248,27 @@ async fn delete(client: &Client, target: &Target) -> Result<(), kube::Error> {
             .await
             .map(|_| ()),
     };
+    ignore_not_found(result)
+}
+
+/// A 404 is success: the janitor or a concurrent cleanup may have won the race.
+fn ignore_not_found(result: Result<(), kube::Error>) -> Result<(), kube::Error> {
     match result {
         Err(e) if crate::resource::kube::is_not_found(&e) => Ok(()),
         other => other,
+    }
+}
+
+/// The driver pod name for a sync [`Target`].
+///
+/// Prefers the sync id the discovery pass read off the namespace's label; falls
+/// back to the namespace name, which is what the id is derived from anyway. A
+/// namespace with no readable id is one nothing else can name either, so the
+/// fallback fails to *find* a pod rather than deleting the wrong one.
+fn driver_pod_of(target: &Target) -> String {
+    match &target.id {
+        Some(id) => crate::sync::driver_pod_for(id),
+        None => target.name.clone(),
     }
 }
 
@@ -359,9 +400,13 @@ async fn discover_syncs(client: &Client, scope: &Scope, plan: &mut Plan) {
 }
 
 async fn discover_run_pods(client: &Client, scope: &Scope, live_runs: &[String], plan: &mut Plan) {
+    // `!kind` excludes detached-sync drivers, which also live in `RUN_NAMESPACE`
+    // and carry the user label. They belong to [`discover_syncs`], which knows a
+    // Running one is live; claimed here they would be judged by a run-id they do
+    // not carry and reaped mid-sync.
     let selector = match scope {
-        Scope::User(u) => format!("{}={u}", qos::LABEL_USER),
-        Scope::AllUsers => qos::LABEL_RUN_ID.to_string(),
+        Scope::User(u) => format!("{}={u},!{KIND_LABEL_KEY}", qos::LABEL_USER),
+        Scope::AllUsers => format!("{},!{KIND_LABEL_KEY}", qos::LABEL_RUN_ID),
     };
     let api: Api<Pod> = Api::namespaced(client.clone(), RUN_NAMESPACE);
     let list = match api.list(&ListParams::default().labels(&selector)).await {

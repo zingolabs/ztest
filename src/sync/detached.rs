@@ -26,6 +26,17 @@ pub const SYNC_PROFILE_ENV: &str = "ZTEST_SYNC_PROFILE";
 /// Downward-API env carrying the pod's own name (set in the detached pod spec),
 /// so the in-pod runner can watch itself without guessing its generated name.
 pub const POD_NAME_ENV: &str = "ZTEST_POD_NAME";
+/// Downward-API env carrying the pod's own *namespace* — the other half of
+/// [`POD_NAME_ENV`].
+///
+/// Load-bearing rather than symmetric: the driver runs in the run namespace as
+/// the run identity (it *is* a runner pod), while the topology it provisions
+/// lives in the sync namespace it was handed. The in-pod stop-watch must poll
+/// the former; every other in-pod client works against the latter. Reading its
+/// own address from the downward API is what makes a stop-watch that quietly
+/// polls the wrong namespace — annotation never seen, `ztest sync stop` a silent
+/// no-op — impossible to write.
+pub const POD_NAMESPACE_ENV: &str = "ZTEST_POD_NAMESPACE";
 
 /// Label key marking a ztest-owned detached-sync driver pod (value
 /// [`KIND_LABEL_VALUE`]); also stamped on the per-sync namespace + report CM.
@@ -54,7 +65,21 @@ pub fn kind_selector() -> String {
 /// but it persists past the driver pod so `report`/`status` still answer.
 /// `ztest cleanup` deletes the namespace and cascades everything once the driver
 /// pod is no longer Running.
+///
+/// The driver pod itself is *not* in here — see [`driver_pod_for`].
 pub fn namespace_for(sync_id: &str) -> String {
+    format!("ztest-sync-{sync_id}")
+}
+
+/// The driver pod's name for a sync id.
+///
+/// The driver is a runner pod: it lives in the shared run namespace as the run
+/// identity, like every other in-pod test runner, rather than inside the sync
+/// namespace it deploys into. The run namespace is shared, so the sync id has to
+/// be *in the name* — a fixed name would let only one sync exist cluster-wide.
+/// `ztest cleanup` reaps this pod alongside the namespace, since cross-namespace
+/// means nothing cascades it.
+pub fn driver_pod_for(sync_id: &str) -> String {
     format!("ztest-sync-{sync_id}")
 }
 
@@ -178,7 +203,7 @@ mod runtime {
 
     use crate::cancel::{Cancel, CancelSource};
 
-    use super::{POD_NAME_ENV, STOP_ANNOTATION, SYNC_ID_KEY, SyncReportMirror};
+    use super::{POD_NAME_ENV, POD_NAMESPACE_ENV, STOP_ANNOTATION, SYNC_ID_KEY, SyncReportMirror};
 
     /// How often the stop-watch re-reads its own pod's annotations. Coarse on
     /// purpose — a detached sync is a minutes-to-days job and a stop is not
@@ -190,11 +215,32 @@ mod runtime {
     /// It fires on either the controller setting [`STOP_ANNOTATION`] on this pod
     /// (`ztest sync stop`) or a `SIGTERM` (node loss / `rm`) — both mean "wind
     /// down gracefully now", which the engine turns into `subject.stop()` →
-    /// checkpoint. The pod name comes from the downward-API [`POD_NAME_ENV`].
-    pub async fn watch_stop(client: &Client, namespace: &str) -> Cancel {
+    /// checkpoint.
+    ///
+    /// The pod's own address comes from the downward API ([`POD_NAME_ENV`] +
+    /// [`POD_NAMESPACE_ENV`]) rather than from the caller: the driver does not
+    /// run in the sync namespace its `TestEnv` is pointed at, so the env's
+    /// namespace is the wrong one to poll and passing it in would have made that
+    /// mistake spellable.
+    pub async fn watch_stop(client: &Client) -> Cancel {
         let (source, cancel) = CancelSource::new();
         let pod_name = std::env::var(POD_NAME_ENV).unwrap_or_default();
-        let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+        let namespace = std::env::var(POD_NAMESPACE_ENV).unwrap_or_default();
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+        // Either half missing ⇒ this pod cannot address itself, so the annotation
+        // path is dead and only SIGTERM remains. Say so once, loudly: a silent
+        // stop-watch makes `ztest sync stop` look like it worked while the sync
+        // runs on for hours.
+        let addressable = !pod_name.is_empty() && !namespace.is_empty();
+        if !addressable {
+            tracing::warn!(
+                pod = %pod_name,
+                namespace = %namespace,
+                "sync stop-watch: incomplete pod address ({POD_NAME_ENV} / \
+                 {POD_NAMESPACE_ENV}) — `ztest sync stop` cannot be observed; \
+                 SIGTERM only"
+            );
+        }
 
         tokio::spawn(async move {
             let mut sigterm = match tokio::signal::unix::signal(
@@ -204,7 +250,7 @@ mod runtime {
                 Err(e) => {
                     tracing::warn!(error = %e, "sync stop-watch: cannot install SIGTERM handler");
                     // Fall back to annotation-only watching.
-                    poll_forever(&pods, &pod_name, &source).await;
+                    poll_forever(&pods, &pod_name, addressable, &source).await;
                     return;
                 }
             };
@@ -217,7 +263,7 @@ mod runtime {
                         return;
                     }
                     _ = ticker.tick() => {
-                        if pod_name.is_empty() {
+                        if !addressable {
                             continue;
                         }
                         if stop_requested(&pods, &pod_name).await {
@@ -234,8 +280,13 @@ mod runtime {
     }
 
     /// Annotation-only fallback loop (no SIGTERM handler available).
-    async fn poll_forever(pods: &Api<Pod>, pod_name: &str, source: &CancelSource) {
-        if pod_name.is_empty() {
+    async fn poll_forever(
+        pods: &Api<Pod>,
+        pod_name: &str,
+        addressable: bool,
+        source: &CancelSource,
+    ) {
+        if !addressable {
             return;
         }
         let mut ticker = tokio::time::interval(STOP_POLL);

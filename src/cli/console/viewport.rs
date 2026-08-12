@@ -23,6 +23,16 @@ const LEFT_COL_TARGET: u16 = 80;
 /// its target: the left yields down to this so the transfer column stays legible.
 const RIGHT_COL_MIN: u16 = 30;
 
+/// Minimum terminal width for the three-column panel: the left at its target,
+/// plus a middle and a right each at [`RIGHT_COL_MIN`]. Below this a scene that
+/// offered a middle column composes as two — left and *middle* — since a phase
+/// asks for a middle column precisely because that content is its live one.
+const THREE_COL_MIN: u16 = LEFT_COL_TARGET + RIGHT_COL_MIN * 2;
+
+/// Width of the middle column when three are shown. Fixed, so the extra columns
+/// of a wide terminal keep flowing to the right column as they do at two.
+const MID_COL_WIDTH: u16 = 34;
+
 /// Compose the two-column panel into ANSI rows, each clipped to `cols` so it
 /// stays exactly one physical row. At or above [`TWO_COL_MIN`] (with a non-empty
 /// right column) the width splits per [`two_col_split`]; below that, a single
@@ -38,7 +48,13 @@ const RIGHT_COL_MIN: u16 = 30;
 /// a second physical row, desync `prev_rows`, and leak stale rows into scrollback.
 /// Clipping here — the one place that knows `cols` and owns the footer — protects
 /// every scene producer.
-fn compose_footer(live: &[String], left: &str, right: &str, cols: u16) -> Vec<String> {
+fn compose_footer(
+    live: &[String],
+    left: &str,
+    mid: Option<&str>,
+    right: &str,
+    cols: u16,
+) -> Vec<String> {
     let mut lines: Vec<String> = live
         .iter()
         .flat_map(|l| {
@@ -47,28 +63,66 @@ fn compose_footer(live: &[String], left: &str, right: &str, cols: u16) -> Vec<St
                 .map(|(s, _)| s)
         })
         .collect();
-    lines.extend(compose_panel(left, right, cols));
+    lines.extend(compose_panel(left, mid, right, cols));
     lines
 }
 
-fn compose_panel(left: &str, right: &str, cols: u16) -> Vec<String> {
+fn compose_panel(left: &str, mid: Option<&str>, right: &str, cols: u16) -> Vec<String> {
     let right = right.trim_end_matches('\n');
-    if cols < TWO_COL_MIN || right.is_empty() {
-        return bridge::ansi_rows(left, cols as usize)
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-    }
-    let (left_w, right_w) = two_col_split(cols);
-    let lrows = bridge::ansi_rows(left, left_w as usize);
-    let rrows = bridge::ansi_rows(right, right_w as usize);
-    let n = lrows.len().max(rrows.len());
+    let mid = mid
+        .map(|m| m.trim_end_matches('\n'))
+        .filter(|m| !m.is_empty());
+
+    // Three columns when one was offered and the terminal can seat it; otherwise
+    // two, keeping the middle over the right (see [`THREE_COL_MIN`]); otherwise
+    // one.
+    let columns: Vec<(&str, u16)> = match mid {
+        Some(mid) if cols >= THREE_COL_MIN => {
+            let right_w = cols - LEFT_COL_TARGET - MID_COL_WIDTH;
+            vec![
+                (left, LEFT_COL_TARGET),
+                (mid, MID_COL_WIDTH),
+                (right, right_w),
+            ]
+        }
+        Some(mid) if cols >= TWO_COL_MIN => {
+            let (left_w, mid_w) = two_col_split(cols);
+            vec![(left, left_w), (mid, mid_w)]
+        }
+        None if cols >= TWO_COL_MIN && !right.is_empty() => {
+            let (left_w, right_w) = two_col_split(cols);
+            vec![(left, left_w), (right, right_w)]
+        }
+        _ => {
+            return bridge::ansi_rows(left, cols as usize)
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect();
+        }
+    };
+
+    let rows: Vec<Vec<(String, usize)>> = columns
+        .iter()
+        .map(|(text, w)| bridge::ansi_rows(text, *w as usize))
+        .collect();
+    let n = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let last = rows.len() - 1;
     (0..n)
         .map(|i| {
-            let (l, used) = lrows.get(i).cloned().unwrap_or_default();
-            let r = rrows.get(i).map(|(s, _)| s.clone()).unwrap_or_default();
-            let pad = (left_w as usize).saturating_sub(used);
-            format!("{l}{}{r}", " ".repeat(pad))
+            let mut line = String::new();
+            for (col_ix, (col, (_, w))) in rows.iter().zip(columns.iter()).enumerate() {
+                let (text, used) = col.get(i).cloned().unwrap_or_default();
+                line.push_str(&text);
+                // Padded to its full width so the next column starts at a fixed
+                // offset and the panel cannot shear when one column's row is
+                // shorter than its neighbour's. The last needs none: every
+                // column is already clipped to its width, and trailing spaces to
+                // the screen edge only risk a wrap.
+                if col_ix != last {
+                    line.push_str(&" ".repeat((*w as usize).saturating_sub(used)));
+                }
+            }
+            line
         })
         .collect()
 }
@@ -184,8 +238,15 @@ impl Surface {
     /// Present one frame: commit `committed` into native scrollback, then repaint
     /// the footer (the `live` rows above the two-column panel) in place. The whole
     /// frame is one synchronized-update write.
-    pub fn present(&mut self, committed: &[String], live: &[String], left: &str, right: &str) {
-        let mut footer_lines = compose_footer(live, left, right, self.cols);
+    pub fn present(
+        &mut self,
+        committed: &[String],
+        live: &[String],
+        left: &str,
+        mid: Option<&str>,
+        right: &str,
+    ) {
+        let mut footer_lines = compose_footer(live, left, mid, right, self.cols);
         // The cursor can't be walked up into scrollback, so a footer taller than
         // the screen drops its oldest live rows.
         let max = self.rows as usize;
@@ -249,7 +310,7 @@ testnet-3.1m · 63%";
 
     #[test]
     fn wide_terminal_shows_both_columns() {
-        let out = compose_panel(PREFLIGHT, TRANSFERS, 120);
+        let out = compose_panel(PREFLIGHT, None, TRANSFERS, 120);
         let j = joined(&out);
         assert!(j.contains("Preflight"), "left col missing:\n{j}");
         assert!(j.contains("Inventory"), "left col missing:\n{j}");
@@ -271,9 +332,49 @@ testnet-3.1m · 63%";
         );
     }
 
+    const WORK: &str = "
+    sap  12.1k/s ⣠⣤⣶⣿⣷⣤
+   orch   8.4k/s ⣶⣿⣷⣤⣀⣠
+  total  23.6k/s 30m";
+
+    #[test]
+    fn a_wide_terminal_seats_all_three_columns() {
+        let out = compose_panel(PREFLIGHT, Some(WORK), TRANSFERS, 200);
+        let j = joined(&out);
+        assert!(j.contains("Preflight"), "left col missing:\n{j}");
+        assert!(j.contains("total"), "mid col missing:\n{j}");
+        assert!(j.contains("dev-zainod"), "right col missing:\n{j}");
+    }
+
+    /// Which column goes when only two fit. The middle is offered by a phase
+    /// precisely because it is that phase's live content, so the static right
+    /// column is the one to shed — dropping the middle instead would leave the
+    /// watcher staring at counters while the rates went off-screen.
+    #[test]
+    fn a_two_column_terminal_keeps_the_middle_over_the_right() {
+        let out = compose_panel(PREFLIGHT, Some(WORK), TRANSFERS, THREE_COL_MIN - 1);
+        let j = joined(&out);
+        assert!(j.contains("Preflight"), "left col missing:\n{j}");
+        assert!(j.contains("total"), "mid col dropped:\n{j}");
+        assert!(
+            !j.contains("dev-zainod"),
+            "right col should have gone:\n{j}"
+        );
+    }
+
+    #[test]
+    fn three_columns_never_exceed_the_terminal_width() {
+        for cols in [THREE_COL_MIN, 160u16, 200, 300] {
+            for row in compose_panel(PREFLIGHT, Some(WORK), TRANSFERS, cols) {
+                let w = bridge::ansi_rows(&row, usize::MAX)[0].1;
+                assert!(w <= cols as usize, "row {w} > {cols}: {row:?}");
+            }
+        }
+    }
+
     #[test]
     fn narrow_terminal_shows_left_column_full_width() {
-        let out = compose_panel(PREFLIGHT, TRANSFERS, 80);
+        let out = compose_panel(PREFLIGHT, None, TRANSFERS, 80);
         let j = joined(&out);
         assert!(j.contains("Preflight"), "left col missing:\n{j}");
         assert!(!j.contains("dev-zainod"), "right col leaked:\n{j}");
@@ -281,7 +382,7 @@ testnet-3.1m · 63%";
 
     #[test]
     fn empty_right_column_still_renders_left() {
-        let out = compose_panel(PREFLIGHT, "", 120);
+        let out = compose_panel(PREFLIGHT, None, "", 120);
         let j = joined(&out);
         assert!(j.contains("Preflight"), "left col missing:\n{j}");
         assert!(j.contains("Scheduling"), "left col missing:\n{j}");
@@ -292,7 +393,7 @@ testnet-3.1m · 63%";
         // The one invariant the footer's cursor math depends on: no composed row
         // exceeds the terminal width (which would wrap into a second physical row).
         for cols in [80u16, 90, 120, 200] {
-            for row in compose_panel(PREFLIGHT, TRANSFERS, cols) {
+            for row in compose_panel(PREFLIGHT, None, TRANSFERS, cols) {
                 let w = bridge::ansi_rows(&row, usize::MAX)[0].1;
                 assert!(w <= cols as usize, "row {w} > {cols}: {row:?}");
             }
@@ -303,7 +404,7 @@ testnet-3.1m · 63%";
     fn overlong_left_line_is_clipped_to_one_row() {
         let long = format!("   Preflight {}", "x".repeat(400));
         let panel = format!("────────────\n{long}\nline3\nline4\nline5");
-        let out = compose_panel(&panel, TRANSFERS, 120);
+        let out = compose_panel(&panel, None, TRANSFERS, 120);
         assert_eq!(out.len(), 5, "one row per logical line");
         let w = bridge::ansi_rows(&out[1], usize::MAX)[0].1;
         assert!(w <= 120, "clipped row width {w} <= 120");
@@ -323,7 +424,7 @@ testnet-3.1m · 63%";
                 .to_string(),
         ];
         for cols in [80u16, 100, 120] {
-            let out = compose_footer(&live, PREFLIGHT, TRANSFERS, cols);
+            let out = compose_footer(&live, PREFLIGHT, None, TRANSFERS, cols);
             // Every row — the two live lines plus the panel — must fit in one
             // physical row.
             for row in &out {
@@ -331,7 +432,7 @@ testnet-3.1m · 63%";
                 assert!(w <= cols as usize, "row {w} > {cols}: {row:?}");
             }
             // The two live lines contribute exactly two rows (clipped, not wrapped).
-            let panel_rows = compose_panel(PREFLIGHT, TRANSFERS, cols).len();
+            let panel_rows = compose_panel(PREFLIGHT, None, TRANSFERS, cols).len();
             assert_eq!(
                 out.len(),
                 2 + panel_rows,

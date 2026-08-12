@@ -389,8 +389,12 @@ async fn drive<S: SyncSubject>(
     // `ztest sync stop` (or a SIGTERM on node loss / `rm`) must checkpoint
     // gracefully, not kill. Arm the in-pod stop-watch and route it into the
     // engine's cancellation.
-    if let (Some(sync_id), Some(kube), Some(ns)) = (&detached, env.kube_client(), env.namespace()) {
-        let cancel = super::detached::watch_stop(&kube, &ns).await;
+    // It takes no namespace: the stop-watch polls the driver's *own* pod, whose
+    // address comes from the downward API. That is deliberately not the env's
+    // namespace — the driver is a runner pod in the run namespace, deploying into
+    // the sync namespace rather than living in it.
+    if let (Some(sync_id), Some(kube)) = (&detached, env.kube_client()) {
+        let cancel = super::detached::watch_stop(&kube).await;
         engine = engine.with_cancel(cancel);
         tracing::info!(sync_id = %sync_id, "detached sync: stop-watch armed");
     }

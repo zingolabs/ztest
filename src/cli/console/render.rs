@@ -33,6 +33,14 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 /// the terminal as native scrollback, not through the scene.
 pub(crate) struct SceneFrame {
     pub left: String,
+    /// Optional middle column, shown only when the terminal is wide enough for
+    /// three. `None` — every phase but a sync watch — composes as two columns
+    /// exactly as before.
+    ///
+    /// When only two fit, this is the column that *survives* and `right` is
+    /// dropped: a phase asks for a middle column because that content is its
+    /// live one, so the panel sheds the static half first.
+    pub mid: Option<String>,
     pub right: String,
     /// Explicit live-region content (the run phase's running-tests block). `None`
     /// means "use the child's `avt` grid" — the default for the compile/build
@@ -381,14 +389,19 @@ async fn render_loop(
                 }
                 // While cancelling, the overlay replaces the left column and clears
                 // transfers + live region; completed output is already in `pending`.
-                let (left, right, live_src) = match scene.as_ref() {
-                    _ if cancelling => (cancel_panel(elapsed), String::new(), Some(String::new())),
+                let (left, mid, right, live_src) = match scene.as_ref() {
+                    _ if cancelling => (
+                        cancel_panel(elapsed),
+                        None,
+                        String::new(),
+                        Some(String::new()),
+                    ),
                     Some(scene) => {
                         let f = scene(elapsed);
-                        (f.left, f.right, f.live)
+                        (f.left, f.mid, f.right, f.live)
                     }
                     // No scene yet: still flush queued scrollback, painting an empty panel.
-                    None if !pending.is_empty() => (String::new(), String::new(), None),
+                    None if !pending.is_empty() => (String::new(), None, String::new(), None),
                     None => continue,
                 };
                 // The scene's explicit live content when present, else the child's
@@ -397,7 +410,7 @@ async fn render_loop(
                     Some(s) => s.lines().map(str::to_string).collect(),
                     None => bridged(&trimmed_view(&vt)),
                 };
-                surface.present(&pending, &live_lines, &left, &right);
+                surface.present(&pending, &live_lines, &left, mid.as_deref(), &right);
                 pending.clear();
             }
         }

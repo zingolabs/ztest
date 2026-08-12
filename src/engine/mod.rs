@@ -295,6 +295,7 @@ fn run_tty(
             // width-driven split still holds, so the panel doesn't reflow here.
             console.scene(move |_elapsed| SceneFrame {
                 left: left.clone(),
+                mid: None,
                 right: String::new(),
                 live: Some(live.clone()),
             });

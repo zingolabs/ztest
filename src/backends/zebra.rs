@@ -46,7 +46,7 @@ const BLOCK_GENERATION_DELAY: Duration = Duration::from_millis(1500);
 /// Resolve the container image for a zebrad pod. Default is the published
 /// `zfnd/zebra:<version>` tag; a [`Dev`](crate::backends::image::ImageSpec::Dev)
 /// spec overrides it with a `zebrad:dev-<hash>` image, or fails via
-/// [`ImageError::DevImageMissing`] if the pipeline never built it — an override
+/// [`ImageError::DevImageMissing`](crate::backends::image::ImageError::DevImageMissing) if the pipeline never built it — an override
 /// never silently degrades to the published tag.
 pub(crate) fn image_uri(
     opts: &crate::component::ComponentOpts,
@@ -506,19 +506,27 @@ const CONTAINER_CONFIG_PATH: &str = "/etc/zebrad/zebrad.toml";
 /// Container-side JSON-RPC port. Sourced from the canonical port table.
 const ZEBRAD_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_RPC;
 
-/// Whether this validator boots from a **testnet** archive — the one topology
-/// whose config is rendered by [`testnet_conf`](crate::testnet_conf) rather than
+/// The public network this validator boots from, if it boots from a public-network
+/// archive at all — the topologies whose config is rendered by
+/// [`public_conf`](crate::public_conf) rather than
 /// [`regtest_conf`](crate::regtest_conf).
+///
+/// `None` covers both a regtest cache and a bare archive with no chain metadata;
+/// each rides the regtest config path.
 ///
 /// Derived from `opts.restore` rather than a separate flag, so exactly one fact
 /// — the archive's own recorded network — decides which config path a validator
 /// is on, and every consumer reads that same fact.
-fn is_testnet_restore(opts: &crate::component::ComponentOpts) -> bool {
-    matches!(
-        &opts.restore,
-        Some(crate::component::RestoreSource::Archive(archive))
-            if archive.chain().map(|c| c.network()) == Some(crate::ArchiveNetwork::Testnet)
-    )
+fn public_restore_network(
+    opts: &crate::component::ComponentOpts,
+) -> Option<crate::ArchiveNetwork> {
+    match &opts.restore {
+        Some(crate::component::RestoreSource::Archive(archive)) => archive
+            .chain()
+            .map(|c| c.network())
+            .filter(|n| n.is_public()),
+        _ => None,
+    }
 }
 
 /// The JSON-RPC port this validator listens on, derived from its topology.
@@ -530,8 +538,8 @@ fn is_testnet_restore(opts: &crate::component::ComponentOpts) -> bool {
 /// went Ready, presenting as a hung validator rather than as the config
 /// mismatch it was.
 fn rpc_port(opts: &crate::component::ComponentOpts) -> u16 {
-    if is_testnet_restore(opts) {
-        crate::handles::ports::ZEBRAD_TESTNET_RPC
+    if public_restore_network(opts).is_some() {
+        crate::handles::ports::ZEBRAD_PUBLIC_RPC
     } else {
         ZEBRAD_RPC_PORT
     }
@@ -541,70 +549,89 @@ fn rpc_port(opts: &crate::component::ComponentOpts) -> u16 {
 /// (`rpc.indexer_listen_addr`), which a colocated zaino `Direct` backend
 /// requires in order to construct at all.
 ///
-/// Two topologies need it: a shared state DB (regtest), and a restored testnet
-/// chain where zaino reads its own CoW clone of the same archive. Omitting it on
-/// the testnet path left `BackendType::Direct` unconfigurable there, so the
-/// state indexer could never start.
+/// Two topologies need it: a shared state DB (regtest), and a restored
+/// public-network chain where zaino reads its own CoW clone of the same archive.
+/// Omitting it on the restored-chain path left `BackendType::Direct`
+/// unconfigurable there, so the state indexer could never start.
 fn serves_indexer_grpc(opts: &crate::component::ComponentOpts) -> bool {
-    opts.shared_state.is_some() || is_testnet_restore(opts)
+    opts.shared_state.is_some() || public_restore_network(opts).is_some()
 }
 
-impl crate::regtest::Restore for crate::component::Validator<ZebraBackend> {
-    /// Dispatch on the archive's own network.
-    ///
-    /// A testnet snapshot needs a testnet `zebrad.toml` and its own cache dir;
-    /// a regtest cache rides the regtest config path that
-    /// [`materialize_regtest_opts`](ZebraBackend::materialize_regtest_opts)
-    /// already builds. The
-    /// archive records which it is, so this is a `match` on data rather than a
-    /// choice the caller could get wrong.
-    fn restore(mut self, archive: crate::ArchiveHandle) -> Self {
-        // Recorded for the whole-env agreement checks in `TestEnv::build()`:
-        // this builder cannot fail, and one component's pin says nothing about
-        // whether its peers agree with it.
-        self.opts.restore = Some(crate::component::RestoreSource::Archive(archive));
+impl crate::regtest::Testnet for crate::component::Validator<ZebraBackend> {
+    fn testnet(self, archive: crate::ArchiveHandle) -> Self {
+        restore_public(self, archive, crate::ArchiveNetwork::Testnet)
+    }
 
-        let network = archive.chain().map(|c| c.network());
-        if network != Some(crate::ArchiveNetwork::Testnet) {
-            // Regtest cache (or a bare archive): the regtest config path in
-            // `materialize_opts` mounts it and sets `cache_dir` itself.
-            return self;
-        }
+    fn mainnet(self, archive: crate::ArchiveHandle) -> Self {
+        restore_public(self, archive, crate::ArchiveNetwork::Mainnet)
+    }
+}
 
-        let version = self
+/// Boot this validator from `archive`: it *is* the chain the snapshot pins.
+///
+/// Shared by `.testnet()` and `.mainnet()`, because the two differ only in
+/// which network the caller *claims* — and the claim is checked against the
+/// archive's own record at `env.build()`, not here. What actually varies
+/// between the networks is confined to the rendered TOML, which
+/// [`public_conf`](crate::public_conf) derives from the same recorded network.
+///
+/// An archive that is not a public-network chain (a regtest cache, or a bare tar
+/// with no chain metadata) rides the regtest config path that
+/// [`materialize_regtest_opts`](ZebraBackend::materialize_regtest_opts) already
+/// builds. The archive records which it is, so this is a `match` on data rather
+/// than a choice the caller could get wrong.
+fn restore_public(
+    mut validator: crate::component::Validator<ZebraBackend>,
+    archive: crate::ArchiveHandle,
+    claimed: crate::ArchiveNetwork,
+) -> crate::component::Validator<ZebraBackend> {
+    // Recorded for the whole-env agreement checks in `TestEnv::build()`: this
+    // builder cannot fail, and one component's pin says nothing about whether
+    // its peers agree with it.
+    validator.opts.restore = Some(crate::component::RestoreSource::Archive(archive));
+    validator.opts.claimed_network = Some(claimed);
+
+    let Some(network) = archive.chain().map(|c| c.network()).filter(|n| n.is_public()) else {
+        // Regtest cache (or a bare archive): the regtest config path in
+        // `materialize_opts` mounts it and sets `cache_dir` itself.
+        return validator;
+    };
+
+    let version = validator
+        .opts()
+        .version
+        .parse::<crate::regtest_conf::Semver>()
+        .expect("zebrad version on Validator builder must be a valid semver");
+    let toml = crate::public_conf::public_zebrad_conf(
+        network,
+        version,
+        ZEBRAD_PUBLIC_RPC_PORT,
+        ZEBRAD_PUBLIC_CACHE_DIR,
+        // Always served on a public-network restore: a colocated zaino `Direct`
+        // backend cannot construct without an address to dial, and the pod spec
+        // exposes the port for exactly this topology (`serves_indexer_grpc`).
+        Some(crate::handles::ports::ZEBRAD_INDEXER),
+        validator
             .opts()
-            .version
-            .parse::<crate::regtest_conf::Semver>()
-            .expect("zebrad version on Validator builder must be a valid semver");
-        let toml = crate::testnet_conf::testnet_zebrad_conf(
-            version,
-            ZEBRAD_TESTNET_RPC_PORT,
-            ZEBRAD_TESTNET_CACHE_DIR,
-            // Always served on a testnet restore: a colocated zaino `Direct`
-            // backend cannot construct without an address to dial, and the pod
-            // spec exposes the port for exactly this topology
-            // (`serves_indexer_grpc`).
-            Some(crate::handles::ports::ZEBRAD_INDEXER),
-            self.opts()
-                .image
-                .metrics_enabled()
-                .then_some(crate::handles::ports::ZEBRAD_METRICS),
-        );
-        self.mount(crate::regtest::config_mount_inline(
+            .image
+            .metrics_enabled()
+            .then_some(crate::handles::ports::ZEBRAD_METRICS),
+    );
+    validator
+        .mount(crate::regtest::config_mount_inline(
             toml,
             "/etc/zebrad/zebrad.toml",
         ))
         .mount(crate::regtest::archive_mount(
             archive,
-            ZEBRAD_TESTNET_CACHE_DIR,
+            ZEBRAD_PUBLIC_CACHE_DIR,
         ))
         .command(["zebrad"])
         .args(["-c", "/etc/zebrad/zebrad.toml", "start"])
-    }
 }
 
-const ZEBRAD_TESTNET_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_TESTNET_RPC;
-const ZEBRAD_TESTNET_CACHE_DIR: &str = "/var/cache/zebrad";
+const ZEBRAD_PUBLIC_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_PUBLIC_RPC;
+const ZEBRAD_PUBLIC_CACHE_DIR: &str = "/var/cache/zebrad";
 
 // ──────────────────── zebrad-only typed JSON-RPC views ─────────────────
 //
@@ -662,18 +689,18 @@ mod tests {
     /// The regression that hung the whole testnet suite: `pod_spec` declared and
     /// readiness-probed [`ZEBRAD_RPC`](crate::handles::ports::ZEBRAD_RPC) on every
     /// topology, while a testnet restore renders its config with
-    /// [`ZEBRAD_TESTNET_RPC`](crate::handles::ports::ZEBRAD_TESTNET_RPC). zebrad
+    /// [`ZEBRAD_PUBLIC_RPC`](crate::handles::ports::ZEBRAD_PUBLIC_RPC). zebrad
     /// opened 18232, the probe waited on 28232, and the pod never went Ready —
     /// indistinguishable from a validator that failed to start.
     #[test]
     fn a_testnet_restore_probes_the_port_its_config_opens() {
         assert_eq!(
             rpc_port(&opts_restoring(crate::ArchiveNetwork::Testnet)),
-            ZEBRAD_TESTNET_RPC_PORT,
+            ZEBRAD_PUBLIC_RPC_PORT,
             "a testnet restore must use the port testnet_zebrad_conf writes"
         );
         assert_ne!(
-            ZEBRAD_TESTNET_RPC_PORT, ZEBRAD_RPC_PORT,
+            ZEBRAD_PUBLIC_RPC_PORT, ZEBRAD_RPC_PORT,
             "the two ports differ, which is what made the drift silent"
         );
     }

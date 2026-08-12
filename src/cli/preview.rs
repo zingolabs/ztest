@@ -57,6 +57,7 @@ fn push_scene(con: &Console, state: &BannerState, transfers: &Transfers, theme: 
     let theme = theme.clone();
     con.scene(move |elapsed| SceneFrame {
         left: ui::render_preflight_panel(&snap, "Building", elapsed, &theme),
+        mid: None,
         right: ui::render_transfers(&tx, elapsed, &theme),
         live: None,
     });

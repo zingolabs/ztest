@@ -1,9 +1,16 @@
-# Testnet chain snapshots
+# Chain snapshots
 
-Immutable, height-pinned snapshots of The Public Testnet, consumed through the
-named consts in `ztest::snapshots` — `.testnet(ORCHARD)`. Nothing here is
+Immutable, height-pinned snapshots of the public Zcash networks, consumed
+through the named consts in `ztest::snapshots::{testnet, mainnet}` —
+`.testnet(testnet::ORCHARD)`, `.mainnet(mainnet::BLOSSOM)`. Nothing here is
 resolved by string at runtime; see `src/snapshots.rs` for the declarations and
-`src/snapshot.rs` for why the handle is typed.
+`src/archive.rs` for why the handle is typed.
+
+The verb and the handle must name the same network. That is redundant on
+purpose — the config generator reads the network off the artifact, so the verb
+cannot steer it — and the redundancy is checked at `env.build()`, because
+`.mainnet(testnet::ORCHARD)` would otherwise run green against a chain the test
+never asked for.
 
 Supersedes the old `fixtures/testnet/<variant>/{zebra,zcashd}.tar.xz` layout,
 which resolved paths with a runtime `format!` and so could not be declared as a
@@ -30,6 +37,15 @@ compile error rather than a convention nobody checked.
 | `zebra-v6.2.3-testnet-590000` | 1.2 GiB | 1.5 GB | Blossom (584,000) |
 | `zebra-v6.2.3-testnet-1848420` | 3.3 GiB | 4.0 GB | NU5 / Orchard (1,842,420) |
 | `zebra-v6.2.3-testnet-4140000` | 8.2 GiB | 9.7 GB | NU6.3 / Ironwood (4,134,000) |
+| `zebra-v6.2.3-mainnet-425200` | 11.4 GB | 18.7 GB | Sapling (419,200) |
+| `zebra-v6.2.3-mainnet-659600` | 14.0 GB | 22.5 GB | Blossom (653,600) |
+| `zebra-v6.2.3-mainnet-1693104` | 21.8 GB | 32.8 GB | NU5 / Orchard (1,687,104) |
+
+Mainnet is roughly an order of magnitude past testnet at every rung: the
+*smallest* mainnet artifact is larger than the deepest testnet one. Prefer
+testnet unless the test specifically needs mainnet's transaction density, and
+note that fetching the mainnet set is a ~47 GB `git lfs pull` — use
+`git lfs pull --include=<path>` rather than the bare form.
 
 Each is pinned **6,000 blocks past** its activation. A snapshot pinned *at* an
 activation holds essentially none of the data it is named for, and every
@@ -90,12 +106,25 @@ from crates.io already have it.
 
 [custom transfer agent]: https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md
 
-## Known limit
+## Decompression on the cluster
 
-`zebra-v6.2.3-testnet-4140000` does not currently mount: streaming 8.2 GiB
-through the uploader pod's stdin cannot finish inside
-`materialize::WAIT_BUDGET` (300 s), which covers every wait including the
-upload. That is a harness limit, not a property of the artifact.
+The archives are `zstd -19 --long=27`. Two properties make that safe for the
+puller, and both are load-bearing:
+
+- **Level does not affect decode.** zstd decompresses at essentially the same
+  speed regardless of compression level, so `-19` is paid once here and costs
+  the cluster nothing. Measured on the 11 GB mainnet Sapling artifact inside a
+  container capped exactly like the puller pod: 24 s, and the output matched
+  the manifest's `uncompressed_bytes` byte for byte.
+- **`--long=27` is a ceiling, not a knob.** A 128 MiB window is exactly zstd's
+  default decoder memory limit, and `materialize`'s puller decodes with a bare
+  `tar --zstd` — no `--long`, no `--memory` — in a 256 MiB pod (measured peak:
+  135.6 MiB). Widening the window to `--long=28` costs nothing at production
+  time and makes every seed fail to materialize with "Frame requires too much
+  memory for decoding".
+
+Decompression memory therefore depends on the window, not the artifact, so the
+mainnet rungs cost the puller no more memory than the 620 MiB testnet one.
 
 ## Producing one
 

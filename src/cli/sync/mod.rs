@@ -22,8 +22,7 @@ use std::io::{IsTerminal, stdout};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, ServiceAccount};
-use k8s_openapi::api::rbac::v1::RoleBinding;
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod};
 use kube::Client;
 use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
 use serde_json::json;
@@ -35,23 +34,17 @@ use crate::pipeline::build::BuildOutcome;
 use crate::pipeline::images::DumpOutcome;
 use crate::pipeline::remote_compile::{self, BakeRefs, RemoteCompileOutcome};
 use crate::resource::impls::buildkit;
-use crate::resource::impls::policy::RUN_CLUSTER_ROLE;
+use crate::resource::impls::policy::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
 use crate::sync::{
-    KIND_LABEL_KEY, KIND_LABEL_VALUE, POD_NAME_ENV, STOP_ANNOTATION, SYNC_ID_ENV, SYNC_ID_KEY,
-    SYNC_PROFILE_ENV, SyncReportMirror, kind_selector, namespace_for, report_cm_name,
+    KIND_LABEL_KEY, KIND_LABEL_VALUE, POD_NAME_ENV, POD_NAMESPACE_ENV, STOP_ANNOTATION,
+    SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV, SyncReportMirror, driver_pod_for, kind_selector,
+    namespace_for, report_cm_name,
 };
 use crate::ui::{Theme, Transfers};
 
-/// The single driver pod's name within a sync's namespace (one sync ⇒ one
-/// namespace ⇒ one driver, so a fixed name is unambiguous).
-const DRIVER_POD: &str = "ztest-sync-driver";
 /// The driver pod's sole container. Named because a log request has to gate on
 /// *that* container's state, not the pod's phase.
 const DRIVER_CONTAINER: &str = "sync";
-/// The ServiceAccount the driver runs as, created per-sync-namespace and bound
-/// (RoleBinding → the `ztest-remote` ClusterRole) so it can provision its own
-/// topology within its namespace.
-const DRIVER_SA: &str = "ztest-sync";
 /// Grace window for the driver's cooperative shutdown: `sync_mode = Shutdown` →
 /// wallet checkpoint → report mirror, before the kubelet `SIGKILL`s it.
 const STOP_GRACE_SECS: i64 = 120;
@@ -279,11 +272,11 @@ async fn start(name: &str, watch_after: bool) -> Result<(), String> {
     // `<bin> --exact <test>` command) from the inventory the compile dumped.
     let target = resolve_target(&compiled, name)?;
 
-    // Provision the hermetic per-sync namespace + its driver RBAC, then create the
-    // detached driver pod.
+    // Provision the hermetic per-sync namespace the driver deploys into, then
+    // create the driver itself — a runner pod in `ztest`, not in that namespace.
     ensure_sync_namespace(&client, &ns, &sync_id).await?;
     let pod = build_driver_pod(&sync_id, name, &ns, &sa, &compiled, &target, &image_refs);
-    Api::<Pod>::namespaced(client.clone(), &ns)
+    Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
         .create(&PostParams::default(), &pod)
         .await
         .map_err(|e| format!("create driver pod: {e}"))?;
@@ -365,6 +358,7 @@ async fn build_and_provision(
                 left: render_sync_build_panel(
                     &profile, &sync_id, &context, &build, phase, elapsed, &theme,
                 ),
+                mid: None,
                 right: render_transfers(&transfers, elapsed, &theme),
                 live: None,
             });
@@ -603,14 +597,22 @@ fn new_sync_id(name: &str) -> String {
     )
 }
 
-/// Create (idempotently) the sync's persistent namespace, its driver SA, and the
-/// RoleBinding granting that SA the `ztest-remote` ClusterRole *within* the
-/// namespace — enough to provision its own topology. The namespace carries no
-/// `janitor/ttl`: a sync outlives the 1h test-namespace TTL by design, and is
-/// reclaimed by `ztest cleanup` once it finishes.
+/// Create (idempotently) the sync's persistent namespace — the topology the
+/// driver provisions, nothing else. The namespace carries no `janitor/ttl`: a
+/// sync outlives the 1h test-namespace TTL by design, and is reclaimed by
+/// `ztest cleanup` once it finishes.
+///
+/// Deliberately RBAC-free. A ztest-created namespace never carries an identity:
+/// there is exactly one run identity, provisioned by `ztest setup` under admin
+/// credentials, and the run role grants no `rbac` verbs and no `serviceaccounts`
+/// write precisely so a run cannot mint itself authority
+/// ([`policy`](crate::resource::impls::policy)). A per-sync SA + RoleBinding
+/// therefore could not be created by the credential `ztest sync start` is meant
+/// to authenticate as — and, being a RoleBinding, would silently have dropped
+/// every cluster-scoped and cross-namespace rule in the role anyway, failing on
+/// the first seed mount. The driver runs as the run identity instead; see
+/// [`build_driver_pod`].
 async fn ensure_sync_namespace(client: &Client, ns: &str, sync_id: &str) -> Result<(), String> {
-    let params = PatchParams::apply("ztest-sync").force();
-
     let namespace: Namespace = serde_json::from_value(json!({
         "apiVersion": "v1",
         "kind": "Namespace",
@@ -625,66 +627,28 @@ async fn ensure_sync_namespace(client: &Client, ns: &str, sync_id: &str) -> Resu
     }))
     .expect("static Namespace manifest is valid");
     Api::<Namespace>::all(client.clone())
-        .patch(ns, &params, &Patch::Apply(&namespace))
+        .patch(
+            ns,
+            &PatchParams::apply("ztest-sync").force(),
+            &Patch::Apply(&namespace),
+        )
         .await
-        .map_err(|e| format!("create sync namespace {ns}: {e}"))?;
-
-    let sa: ServiceAccount = serde_json::from_value(json!({
-        "apiVersion": "v1",
-        "kind": "ServiceAccount",
-        "metadata": { "name": DRIVER_SA, "namespace": ns },
-    }))
-    .expect("static ServiceAccount manifest is valid");
-    Api::<ServiceAccount>::namespaced(client.clone(), ns)
-        .patch(DRIVER_SA, &params, &Patch::Apply(&sa))
-        .await
-        .map_err(|e| format!("create driver SA: {e}"))?;
-
-    let rb: RoleBinding = serde_json::from_value(json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "RoleBinding",
-        "metadata": { "name": "ztest-sync-remote", "namespace": ns },
-        "roleRef": {
-            "apiGroup": "rbac.authorization.k8s.io",
-            "kind": "ClusterRole",
-            "name": RUN_CLUSTER_ROLE,
-        },
-        "subjects": [{ "kind": "ServiceAccount", "name": DRIVER_SA, "namespace": ns }],
-    }))
-    .expect("static RoleBinding manifest is valid");
-    Api::<RoleBinding>::namespaced(client.clone(), ns)
-        .patch("ztest-sync-remote", &params, &Patch::Apply(&rb))
-        .await
-        .map_err(|e| format!("bind driver SA: {e}"))?;
-
-    wait_for_sa(client, ns, DRIVER_SA).await
-}
-
-/// Block until a ServiceAccount exists (the SA controller creates the token
-/// asynchronously; a pod scheduled in that gap is rejected).
-async fn wait_for_sa(client: &Client, ns: &str, sa: &str) -> Result<(), String> {
-    let api: Api<ServiceAccount> = Api::namespaced(client.clone(), ns);
-    for _ in 0..150 {
-        if api
-            .get_opt(sa)
-            .await
-            .map_err(|e| format!("poll SA {sa}: {e}"))?
-            .is_some()
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    Err(format!(
-        "ServiceAccount {sa} not provisioned in {ns} within 30s"
-    ))
+        .map_err(|e| format!("create sync namespace {ns}: {e}"))
+        .map(|_| ())
 }
 
 /// The detached driver pod: the baked runner image, running the profile's test
-/// via `<bin> --exact <test>` exactly as a `ztest run` runner pod does, but in
-/// the persistent per-sync namespace, `kind=sync`-labelled, sized at the sync
-/// tier + placed on the NVMe pool, with the detached-mode env wired and no
-/// reaper/timeout.
+/// via `<bin> --exact <test>` exactly as a `ztest run` runner pod does —
+/// including *where* and *as whom*. Like every other in-pod test runner
+/// ([`crate::engine`]), it lives in [`RUN_NAMESPACE`] as [`RUN_SERVICE_ACCOUNT`],
+/// the one identity `ztest setup` provisions with the RBAC a component-spawning
+/// test needs. The topology it provisions lives in the sync's own namespace,
+/// injected as [`TEST_NAMESPACE_ENV`](crate::naming::TEST_NAMESPACE_ENV) — the
+/// same decoupling `ztest run` uses, and the reason the driver needs no identity
+/// of its own.
+///
+/// `kind=sync`-labelled, sized at the sync tier + placed on the NVMe pool, with
+/// the detached-mode env wired and no reaper/timeout.
 fn build_driver_pod(
     sync_id: &str,
     profile: &str,
@@ -712,6 +676,9 @@ fn build_driver_pod(
 
     let mut env = vec![
         json!({ "name": "ZTEST_ENGINE", "value": "1" }),
+        // The *billing* SA (`ztest.io/sa`, the QoS ledger's cost centre), not the
+        // credential: the driver authenticates as `RUN_SERVICE_ACCOUNT` like any
+        // runner pod, while its footprint is charged to whoever launched it.
         json!({ "name": "ZTEST_SA", "value": sa }),
         json!({ "name": crate::naming::TEST_NAMESPACE_ENV, "value": ns }),
         json!({ "name": "ZTEST_RUN_ID", "value": format!("sync-{sync_id}") }),
@@ -723,10 +690,16 @@ fn build_driver_pod(
         json!({ "name": SYNC_PROFILE_ENV, "value": profile }),
         json!({ "name": crate::backends::image::IMAGE_REFS_ENV, "value": image_refs_json }),
         json!({ "name": crate::engine::dylib::dylib_path_envvar(), "value": ld }),
-        // The downward-API pod name, so the in-pod stop-watch can find itself.
+        // The downward-API pod identity, so the in-pod stop-watch can find
+        // itself. Both halves: the driver's namespace is *not* the sync namespace
+        // it provisions into, so the name alone no longer locates it.
         json!({
             "name": POD_NAME_ENV,
             "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } },
+        }),
+        json!({
+            "name": POD_NAMESPACE_ENV,
+            "valueFrom": { "fieldRef": { "fieldPath": "metadata.namespace" } },
         }),
     ];
     if let Some(secret) = crate::backends::image::pull_secret() {
@@ -737,8 +710,8 @@ fn build_driver_pod(
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
-            "name": DRIVER_POD,
-            "namespace": ns,
+            "name": driver_pod_for(sync_id),
+            "namespace": RUN_NAMESPACE,
             "labels": {
                 KIND_LABEL_KEY: KIND_LABEL_VALUE,
                 SYNC_ID_KEY: sync_id,
@@ -747,7 +720,7 @@ fn build_driver_pod(
         },
         "spec": {
             "restartPolicy": "Never",
-            "serviceAccountName": DRIVER_SA,
+            "serviceAccountName": RUN_SERVICE_ACCOUNT,
             "enableServiceLinks": false,
             "terminationGracePeriodSeconds": STOP_GRACE_SECS,
             "nodeSelector": { crate::qos::NVME_NODE_LABEL_KEY: crate::qos::NVME_NODE_LABEL_VALUE },
@@ -862,12 +835,11 @@ async fn status(id: &str, json_out: bool) -> Result<(), String> {
         }
         return Ok(());
     }
-    let pod = find_driver(&client, &ns, id).await?;
+    let pod = find_driver(&client, id).await?;
     let (_, _, phase, _) = row_of(&pod);
     // No report yet, but a running engine publishes its state to the driver log —
     // so recover the newest tick rather than reporting only the pod phase.
-    let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
-    let live = watch::latest_progress(&api).await;
+    let live = watch::latest_progress(&watch::DriverPod::new(&client, id)).await;
     let vitals = live.as_ref().and_then(|s| s.vitals.as_ref());
 
     if json_out {
@@ -1027,12 +999,11 @@ async fn read_report(
 
 async fn stop(id: &str) -> Result<(), String> {
     let client = client().await?;
-    let ns = namespace_for(id);
-    let _ = find_driver(&client, &ns, id).await?; // 404s clearly if unknown
-    let api: Api<Pod> = Api::namespaced(client, &ns);
+    let _ = find_driver(&client, id).await?; // 404s clearly if unknown
+    let api: Api<Pod> = Api::namespaced(client, RUN_NAMESPACE);
     let patch = json!({ "metadata": { "annotations": { STOP_ANNOTATION: "true" } } });
     api.patch(
-        DRIVER_POD,
+        &driver_pod_for(id),
         &PatchParams::apply("ztest-sync"),
         &Patch::Merge(&patch),
     )
@@ -1058,12 +1029,17 @@ fn driver_profile(pod: &Pod) -> Option<String> {
 }
 
 /// Find the driver pod for a sync id, with a clear not-found error.
-async fn find_driver(client: &Client, ns: &str, id: &str) -> Result<Pod, String> {
-    Api::<Pod>::namespaced(client.clone(), ns)
-        .get_opt(DRIVER_POD)
+///
+/// The driver lives in [`RUN_NAMESPACE`] alongside every other runner pod, so
+/// its name — not its namespace — is what a sync id resolves to
+/// ([`driver_pod_for`]).
+pub(super) async fn find_driver(client: &Client, id: &str) -> Result<Pod, String> {
+    let pod = driver_pod_for(id);
+    Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
+        .get_opt(&pod)
         .await
         .map_err(|e| format!("get sync pod: {e}"))?
-        .ok_or_else(|| format!("no sync with id `{id}` (namespace `{ns}` has no driver pod)"))
+        .ok_or_else(|| format!("no sync with id `{id}` ({RUN_NAMESPACE} has no pod `{pod}`)"))
 }
 
 // ─────────────────────────────── describe ─────────────────────────────

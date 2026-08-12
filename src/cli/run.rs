@@ -1272,6 +1272,7 @@ fn push_preflight_scene(
             elapsed,
             &theme,
         ),
+        mid: None,
         right: ui::render_transfers(&tx, elapsed, &theme),
         // `None` → the live region derives from the avt grid (the child's output).
         live: None,
@@ -1297,6 +1298,7 @@ fn push_building_scene(
             elapsed,
             &theme,
         ),
+        mid: None,
         right: ui::render_transfers(&tx, elapsed, &theme),
         live: None,
     });

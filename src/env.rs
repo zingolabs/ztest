@@ -532,26 +532,38 @@ impl TestEnv {
     ///    A snapshot pinned *at* an activation, or with no activation recorded
     ///    at all, holds essentially none of the data it is named for, and every
     ///    boundary assertion drawn from it passes over empty results. Rejecting
-    ///    it here is also what makes [`ChainInfo::activation`] and its
+    ///    it here is also what makes `ChainInfo::activation` and its
     ///    neighbours total for every chain a test can reach.
     fn resolve_snapshot_pin(&mut self) -> Result<(), EnvError> {
         // Only archives carrying chain metadata participate. A bare fixture
         // tarball pins no history and names no producer, so there is nothing
         // for its peers to disagree with.
-        let pinned: Vec<(String, crate::ArchiveHandle, crate::ChainInfo, &str)> = self
+        let pinned: Vec<(
+            String,
+            crate::ArchiveHandle,
+            crate::ChainInfo,
+            &str,
+            Option<crate::ArchiveNetwork>,
+        )> = self
             .pending_validators
             .iter()
             .map(|p| &p.opts)
             .chain(self.pending_indexers.iter().map(|p| &p.opts))
             .filter_map(|opts| match opts.restore.as_ref() {
-                Some(crate::component::RestoreSource::Archive(h)) => {
-                    Some((pod_name_of(opts), *h, h.chain()?, opts.version.as_str()))
-                }
+                Some(crate::component::RestoreSource::Archive(h)) => Some((
+                    pod_name_of(opts),
+                    *h,
+                    h.chain()?,
+                    opts.version.as_str(),
+                    opts.claimed_network,
+                )),
                 _ => None,
             })
             .collect();
 
-        for (name, handle, chain, version) in &pinned {
+        assert_claims_match_artifacts(&pinned)?;
+
+        for (name, handle, chain, version, _) in &pinned {
             // Only validators write or read the state DB at a version of their
             // own; an indexer's `version` is zaino's, which has no bearing on
             // the zebra on-disk format.
@@ -592,16 +604,16 @@ impl TestEnv {
             });
         }
 
-        let Some((_, handle, chain, _)) = pinned.first() else {
+        let Some((_, handle, chain, _, _)) = pinned.first() else {
             return Ok(()); // Nothing restored; this env has no chain pin.
         };
 
-        // A testnet archive is an immutable, height-pinned artifact: the
+        // A public-network archive is an immutable, height-pinned artifact: the
         // restored validator runs with an empty peer set, so its tip never
         // moves and every derived height is a fact for the whole test. A
         // regtest cache is the opposite — a starting point tests mine onto —
         // so none of the claims below are meant to hold for one.
-        if chain.network() == crate::ArchiveNetwork::Testnet {
+        if chain.network().is_public() {
             let reason = match chain.straddled_activation_opt() {
                 None => Some("its manifest records no activation at all".to_owned()),
                 Some(straddled) if straddled.upgrade_name().is_none() => Some(format!(
@@ -652,9 +664,9 @@ impl TestEnv {
         match self.chain_pin {
             Some((_, chain)) => chain,
             None => panic!(
-                "this env restored no chain archive, so it has no chain to describe; \
+                "this env names no chain archive, so it has no chain to describe; \
                  `TestEnv::chain` answers for the artifact a component was built with \
-                 `.restore(..)`",
+                 `.testnet(..)`",
             ),
         }
     }
@@ -667,8 +679,8 @@ impl TestEnv {
         match self.chain_pin {
             Some((handle, _)) => handle,
             None => panic!(
-                "this env restored no chain archive; `TestEnv::chain_archive` names the \
-                 artifact a component was built with `.restore(..)`",
+                "this env names no chain archive; `TestEnv::chain_archive` names the \
+                 artifact a component was built with `.testnet(..)`",
             ),
         }
     }
@@ -809,12 +821,16 @@ impl TestEnv {
             // builds): a tripped guard means this topology is mispriced for its
             // tier — raise the tier so its cores divide across the topology.
             assert_deployed_within_tier(qos::current(), footprint, pod_count);
-            // A detached sync (`ztest sync start`) owns its whole namespace and
-            // shares it with its own driver pod, which this component-sized quota
-            // knows nothing about — applying it here would count the driver's
-            // reserve against the components and wedge them `Pending`. Every pod
-            // is explicitly Guaranteed-sized and admitted k8s-natively on the
-            // NVMe pool, so that is the real bound; skip the backstop quota.
+            // A detached sync's namespace outlives its components and hosts
+            // ztest's own auxiliary pods — the profile collector
+            // (`profiling::collect`) is created there after the run, and a quota
+            // sized to exactly the components rejects any pod that declares no
+            // requests at all. Every component pod is explicitly Guaranteed-sized
+            // and admitted k8s-natively on the NVMe pool, so that is the real
+            // bound; skip the backstop quota rather than price every auxiliary.
+            //
+            // Not about the driver pod, which lives in the run namespace with
+            // every other runner and was never counted here.
             if crate::sync::active_sync_id().is_none() {
                 cluster::apply_resource_quota(&client, &namespace, footprint, pod_count)
                     .await
@@ -988,15 +1004,15 @@ impl TestEnv {
     ///    extraction or a partially-populated seed PVC, and without this the
     ///    difference shows up only as a boundary test passing over empty data.
     ///
-    /// Testnet only. A regtest cache is a starting point tests mine onto: its
-    /// tip is *meant* to move, and its activation schedule comes from
+    /// Public networks only. A regtest cache is a starting point tests mine
+    /// onto: its tip is *meant* to move, and its activation schedule comes from
     /// [`activation_heights`](Self::activation_heights) rather than from the
     /// manifest, so none of these claims are meant to hold for one.
     async fn verify_restored_chain(&self) -> Result<(), EnvError> {
         let Some((handle, chain)) = self.chain_pin else {
             return Ok(());
         };
-        if chain.network() != crate::ArchiveNetwork::Testnet {
+        if !chain.network().is_public() {
             return Ok(());
         }
         // Any validator in the env will do: `resolve_snapshot_pin` has already
@@ -1148,7 +1164,7 @@ impl TestEnv {
     }
 
     /// The single indexer bound in this topology, type-erased for use as the
-    /// independent correctness oracle in a sync run's [`SyncCtx`]. Errors if
+    /// independent correctness oracle in a sync run's `SyncCtx`. Errors if
     /// zero or more than one indexer is present — a sync oracle must be
     /// unambiguous (a differential ≤2-indexer topology is a load-test shape, not
     /// a sync-oracle one).
@@ -1674,8 +1690,46 @@ fn assert_override_within_tier(spec: &PodSpec, tier: crate::qos::Resources) {
 /// even share rounded *down* to whole cores (min 1) — see [`per_pod_share`] for
 /// why down, not up — still pinnable, and never summing past the tier reserve.
 /// Memory is the floored even share (no integer rule). Rendered by
-/// [`manifest::PodSpec`] as `requests == limits`, i.e. Guaranteed.
+/// [`PodSpec`] as `requests == limits`, i.e. Guaranteed.
 ///
+/// Reject any component whose `.testnet(_)` / `.mainnet(_)` verb disagrees with
+/// the network its archive records.
+///
+/// The verb is redundant by construction — the config generator reads the
+/// network off the artifact, so the call site cannot actually steer it. That
+/// redundancy is the point: `.mainnet(testnet::ORCHARD)` would otherwise boot
+/// the testnet chain under a call site that says mainnet, and every number the
+/// test reports would describe a chain nobody asked for. A green run against
+/// the wrong history is the one failure a snapshot suite must never produce, so
+/// the disagreement is surfaced here rather than tolerated.
+fn assert_claims_match_artifacts(
+    pinned: &[(
+        String,
+        crate::ArchiveHandle,
+        crate::ChainInfo,
+        &str,
+        Option<crate::ArchiveNetwork>,
+    )],
+) -> Result<(), EnvError> {
+    for (name, handle, chain, _, claimed) in pinned {
+        if let Some(claimed) = claimed
+            && *claimed != chain.network()
+        {
+            return Err(EnvError::Config {
+                reason: format!(
+                    "{name} was built with .{}(…) but {} is a {} archive; the verb and the \
+                     artifact must name the same network, or the test runs green against a \
+                     chain it never asked for",
+                    claimed.as_str(),
+                    handle.name(),
+                    chain.network().as_str(),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// `None` when there are no pods to size.
 fn even_share(
     footprint: crate::qos::Resources,
@@ -1788,8 +1842,80 @@ type MaterializeItem = (u64, PodSpec, ComponentOpts, ComponentHandle);
 
 #[cfg(test)]
 mod tests {
-    use super::{assert_deployed_within_tier, deployed_footprint, even_share};
+    use super::{
+        assert_claims_match_artifacts, assert_deployed_within_tier, deployed_footprint, even_share,
+    };
     use crate::qos::{GIB, MIB, Resources};
+
+    fn pin(
+        handle: crate::ArchiveHandle,
+        claimed: crate::ArchiveNetwork,
+    ) -> (
+        String,
+        crate::ArchiveHandle,
+        crate::ChainInfo,
+        &'static str,
+        Option<crate::ArchiveNetwork>,
+    ) {
+        let chain = handle.chain().expect("shipped snapshot carries chain info");
+        (
+            "zebrad".to_string(),
+            handle,
+            chain,
+            "6.2.3",
+            Some(claimed),
+        )
+    }
+
+    /// The verb and the artifact must name the same network. Both directions,
+    /// because a check that only caught one would leave the other silently
+    /// booting the wrong chain.
+    #[test]
+    fn a_network_verb_that_contradicts_its_archive_is_rejected() {
+        use crate::ArchiveNetwork::{Mainnet, Testnet};
+        use crate::snapshots::{mainnet, testnet};
+
+        let err = assert_claims_match_artifacts(&[pin(mainnet::SAPLING, Testnet)])
+            .expect_err("mainnet archive named with .testnet must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains(".testnet"), "{msg}");
+        assert!(msg.contains("is a mainnet archive"), "{msg}");
+
+        assert!(
+            assert_claims_match_artifacts(&[pin(testnet::ORCHARD, Mainnet)]).is_err(),
+            "testnet archive named with .mainnet must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_network_verb_matching_its_archive_is_accepted() {
+        use crate::ArchiveNetwork::{Mainnet, Testnet};
+        use crate::snapshots::{mainnet, testnet};
+
+        assert_claims_match_artifacts(&[
+            pin(mainnet::BLOSSOM, Mainnet),
+            pin(testnet::BLOSSOM, Testnet),
+        ])
+        .expect("verbs agreeing with their artifacts must build");
+    }
+
+    /// A regtest cache or bare tarball is reached through `.regtest()` /
+    /// `.mount(_)`, which record no claim. Those must pass untouched rather than
+    /// be compared against a network they never named.
+    #[test]
+    fn an_unclaimed_restore_is_not_network_checked() {
+        let chain = crate::snapshots::mainnet::SAPLING
+            .chain()
+            .expect("chain info");
+        assert_claims_match_artifacts(&[(
+            "zebrad".to_string(),
+            crate::snapshots::mainnet::SAPLING,
+            chain,
+            "6.2.3",
+            None,
+        )])
+        .expect("a restore with no verb claim is not checked");
+    }
 
     #[test]
     fn deployed_within_tier_passes_for_every_topology_up_to_the_core_count() {

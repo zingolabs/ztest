@@ -103,7 +103,7 @@ pub fn regtest_test_post_nu6_funding_streams() -> FundingStreams {
 }
 
 /// Parse activation heights from a `getblockchaininfo`-style `upgrades`
-/// object. Used by [`crate::rpc::ValidatorRpc::activation_heights`].
+/// object. Used by `ValidatorRpc::activation_heights`.
 pub(crate) fn parse_activation_heights_from_rpc(
     upgrades: &serde_json::Map<String, serde_json::Value>,
 ) -> ActivationHeights {
@@ -152,39 +152,84 @@ pub trait Regtest: Sized {
     fn regtest(self) -> Self;
 }
 
-/// Builder shortcut: boot a component from an archived state directory.
+// ─────────────────────────── Testnet builder trait ─────────────────────
+
+/// Builder shortcut: run this component on The Public Testnet, at the height
+/// `archive` pins.
 ///
-/// One method for the two cases that used to have their own: an immutable,
-/// height-pinned snapshot of The Public Testnet, and a pre-mined regtest
-/// chain-cache. They are the same operation — restore a state directory — and
-/// the archive itself records which chain it holds, so the *caller* no longer
-/// chooses. Restoring a testnet archive configures the component for testnet;
-/// restoring a regtest cache configures it for regtest. Saying the wrong one is
-/// not expressible.
+/// The twin of [`Regtest`], and the single verb for both component kinds — one
+/// call does everything that running on a pinned snapshot entails, because
+/// those parts are not independently choosable:
+///
+/// - the component's config is rendered for testnet;
+/// - its state directory is mounted as a private CoW clone of `archive`, at
+///   whatever path *that backend* reads a chain from (a validator's own state
+///   DB; a zaino `State` backend's `zebra_db_path`);
+/// - the archive is recorded on the component so preflight materializes the
+///   seed and the pod is given the GID that can read it.
+///
+/// A backend that reads no chain DB — zaino's `Fetch`, which forwards to the
+/// validator — takes the config and skips the mount, since a multi-GB clone
+/// nothing opens is pure cost.
+///
+/// ```ignore
+/// use ztest::prelude::*;              // brings the `testnet` / `mainnet` modules
+/// use ztest::snapshots::testnet::IRONWOOD;
+///
+/// #[ztest::needs(IRONWOOD)]
+/// #[tokio::test]
+/// async fn t() {
+///     let zebra       = env.add_validator(Validator::zebrad("6.2.3").testnet(IRONWOOD));
+///     let zaino_state = env.add_indexer(Indexer::zainod("0.4.0").testnet(IRONWOOD)
+///                                           .tuning(ZainoTuning::State));
+/// }
+/// ```
+///
+/// The same shape on mainnet — import the handle from the other module and use
+/// the matching verb:
+///
+/// ```ignore
+/// use ztest::snapshots::mainnet::BLOSSOM;
+///
+/// #[ztest::needs(BLOSSOM)]
+/// #[tokio::test]
+/// async fn t() {
+///     let zebra = env.add_validator(Validator::zebrad("6.2.3").mainnet(BLOSSOM));
+/// }
+/// ```
+///
+/// **This is not a restore of an indexer's index.** A validator *is* the chain
+/// and boots from the clone; an indexer *reads* the clone and builds its own
+/// index into pod-local scratch, empty at start. That construction is precisely
+/// what an index-construction profile watches happen, and calling the verb
+/// `restore` is what made it look otherwise.
 ///
 /// The handle is one of the named consts in [`crate::snapshots`], or one
 /// declared locally with [`archive!`](macro@crate::archive). Component configs are
-/// generated in-process by [`crate::testnet_conf`].
-///
-/// ```ignore
-/// use ztest::prelude::*;   // brings ORCHARD, SAPLING, … into scope
-///
-/// #[ztest::needs(ORCHARD)]
-/// #[tokio::test]
-/// async fn t() {
-///     let zebrad = env.add_validator(Validator::zebrad("6.2.3").restore(ORCHARD));
-///     let zaino  = env.add_indexer(Indexer::zainod("0.4.0").restore(ORCHARD));
-/// }
-/// ```
+/// generated in-process by [`crate::public_conf`].
 ///
 /// The validator's builder version and the archive's producer version must
 /// agree, and every component in an env must name the same artifact; both are
 /// enforced at `env.build()` rather than here, because a builder method cannot
 /// fail and the second check needs the whole env in view.
-pub trait Restore: Sized {
-    /// Boot from `archive`. The fetch/state backend is an orthogonal choice —
-    /// see `Indexer::backend`.
-    fn restore(self, archive: crate::ArchiveHandle) -> Self;
+pub trait Testnet: Sized {
+    /// Run on the testnet chain `archive` pins. The fetch/state backend is an
+    /// orthogonal choice — see `Indexer::backend`.
+    fn testnet(self, archive: crate::ArchiveHandle) -> Self;
+
+    /// Run on the mainnet chain `archive` pins.
+    ///
+    /// Identical machinery to [`testnet`](Self::testnet) — the archive records
+    /// its own network and the config generator reads it from there, so the two
+    /// verbs do not select behaviour. What the verb buys is a *statement of
+    /// intent at the call site* that is then checked: naming the wrong network
+    /// for a handle is rejected at `env.build()` rather than quietly booting the
+    /// other chain.
+    ///
+    /// Mainnet artifacts are an order of magnitude larger than their testnet
+    /// counterparts (the smallest exceeds the deepest testnet rung), so reach
+    /// for this only when the test needs mainnet's transaction density.
+    fn mainnet(self, archive: crate::ArchiveHandle) -> Self;
 }
 
 /// Mount an archive at `destination`.

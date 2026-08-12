@@ -48,20 +48,32 @@ pub enum NoTuning {}
 /// The network fixture an indexer runs against. Orthogonal to the backend
 /// [`tuning`](ComponentBuilder::tuning): the mode picks which `zainod.toml` is
 /// rendered at build time, the tunings pick knobs inside it. Set by the
-/// [`Regtest`](crate::regtest::Regtest) / [`Restore`](crate::regtest::Restore)
+/// [`Regtest`](crate::regtest::Regtest) / [`Testnet`](crate::regtest::Testnet)
 /// builder methods. `None` means no fixture (config supplied manually).
 ///
-/// `Testnet` carries the typed handle to the immutable, height-pinned artifact
-/// it runs against, so the producer version and pin travel with the mode
-/// instead of being re-derived from a variant name. `Regtest` carries nothing:
-/// it mines its own chain in-process rather than restoring an archive.
+/// Every variant is data-free: the mode says *which network's config to render*
+/// and nothing else. Where an indexer's chain data comes from is a separate
+/// question with a separate answer per mode — the validator's live DB shared
+/// through a PVC on `Regtest`, a private clone of a pinned archive on `Testnet`
+/// — and lives in `ComponentOpts::restore` / `ComponentOpts::shared_state`
+/// where a reader can see it at the call site.
+///
+/// `Testnet` used to carry the [`ArchiveHandle`](crate::ArchiveHandle) itself,
+/// which made one builder call mean two different things depending on the
+/// backend tuning: on `State` it selected the network *and* mounted a chain DB,
+/// on `Fetch` only the former. Same call, invisible difference.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum IndexerMode {
     #[default]
     None,
     Regtest,
-    Testnet(crate::ArchiveHandle),
-    Mainnet(String),
+    /// Mainnet or testnet, restored from a pinned archive.
+    ///
+    /// One variant for both, and payload-free for the same reason `Testnet`
+    /// stopped carrying its handle: *which* public network is already recorded
+    /// on the archive in this struct's `restore` field, and a second copy here
+    /// would be a fact that can disagree with itself.
+    Public,
 }
 
 /// An indexer component, generic in its backend.
@@ -69,7 +81,7 @@ pub enum IndexerMode {
 pub struct Indexer<B: IndexerConfig> {
     pub(crate) backend: B,
     pub(crate) opts: ComponentOpts,
-    /// Backend tuning tokens (e.g. [`ZainoTuning`](crate::testnet_conf::ZainoTuning)),
+    /// Backend tuning tokens (e.g. [`ZainoTuning`](crate::backends::zainod::ZainoTuning)),
     /// applied by the backend at materialize time. Set via
     /// [`ComponentBuilder::tuning`].
     pub(crate) tunings: Vec<B::Tuning>,
@@ -122,10 +134,20 @@ pub struct ComponentOpts {
     /// view at once to reject an env whose components disagree about which
     /// chain they are serving. `None` for the common ephemeral case.
     pub(crate) restore: Option<RestoreSource>,
+    /// Which public network the *caller* said this component runs on, via
+    /// `.testnet(_)` / `.mainnet(_)`. `None` for every other topology.
+    ///
+    /// Deliberately redundant with the archive's own recorded network, and kept
+    /// precisely so the two can be compared: the verb is the call site's
+    /// statement of intent, and an intent that disagrees with the artifact is a
+    /// test that would otherwise run green against the wrong chain. Checked in
+    /// [`TestEnv::build`](crate::TestEnv::build), not here, because a builder
+    /// method cannot fail.
+    pub(crate) claimed_network: Option<crate::ArchiveNetwork>,
 }
 
 /// Where a component's pre-existing on-disk state comes from. See
-/// [`Restore::restore`](crate::regtest::Restore::restore).
+/// [`RestoreSource`].
 #[derive(Debug, Clone)]
 pub enum RestoreSource {
     /// Restore from a content-addressed archive.
@@ -620,7 +642,7 @@ impl<B: ValidatorConfig> Validator<B> {
     /// Boot this validator with fresh persistent on-disk state, to generate a
     /// chain-cache asset: mine blocks, then extract the persisted state
     /// directory. Not for ordinary tests; pair with
-    /// [`restore`](crate::regtest::Restore::restore) there.
+    /// [`RestoreSource`] there.
     pub fn with_blank_persistent_state(mut self) -> Self {
         self.opts.restore = Some(RestoreSource::Blank);
         self

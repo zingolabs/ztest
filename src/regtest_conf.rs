@@ -454,7 +454,7 @@ miner_address = \"{miner_address}\"{metrics_block}"
 
 /// Render `zainod.toml` for a regtest pod.
 ///
-/// Mirrors [`crate::testnet_conf::testnet_zainod_conf`]; the only semantic
+/// Mirrors [`crate::public_conf::public_zainod_conf`]; the only semantic
 /// difference is `network = 'Regtest'`. `backend` picks fetch vs. state;
 /// `validator_host` / `validator_rpc_port` locate the paired validator pod;
 /// `zebra_db_path` / `zaino_db_path` are the container-side mount paths.

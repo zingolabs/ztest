@@ -38,7 +38,7 @@ const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Resolve the container image for a zaino pod. Default is the published tag
 /// (`zingodevops/zainod:<version>`); a `Dev` spec overrides it with the
-/// `zainod:dev-<hash>` tag, or fails via [`ImageError::DevImageMissing`] if the
+/// `zainod:dev-<hash>` tag, or fails via [`ImageError::DevImageMissing`](crate::backends::image::ImageError::DevImageMissing) if the
 /// pipeline never built it.
 pub(crate) fn image_uri(
     opts: &crate::component::ComponentOpts,
@@ -64,21 +64,21 @@ pub struct ZainoBackend;
 /// here because they are the names the tuning token has always used.)
 ///
 /// Orthogonal to the network mode ([`IndexerMode`](crate::component::IndexerMode))
-/// and composable with `.regtest()` / `.restore(archive)` in any order. The
+/// and composable with `.regtest()` / `.testnet(archive)` in any order. The
 /// default (no tuning token) is [`Fetch`](ZainoTuning::Fetch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZainoTuning {
     /// Pull blocks over the validator's JSON-RPC (`backend = "rpc"`). Works
     /// remotely; compatible with zebrad, zcashd, or another zaino. The default.
     ///
-    /// Needs no state DB of its own, which is why a `.restore(_)` pod on this
+    /// Needs no state DB of its own, which is why a `.testnet(_)` pod on this
     /// tuning is not given a clone of the archive — it reads the chain from the
     /// validator, not from disk.
     Fetch,
     /// Read a zebra state DB directly off local disk (`backend = "direct"`,
     /// zebra-only). What supplies that DB depends on the mode: under
     /// `.regtest()` it is the live validator's own DB, shared with
-    /// `.mount(&shared_volume)`; under `.restore(_)` it is the pod's own CoW
+    /// `.mount(&shared_volume)`; under `.testnet(_)` it is the pod's own CoW
     /// clone of the frozen snapshot archive, mounted automatically.
     State,
 }
@@ -123,7 +123,7 @@ impl IndexerConfig for ZainoBackend {
         //     rendered in that arm points `zebra_db_path` at.
         //
         // Hoisting the regtest form of the check out of the match is what made
-        // every `.restore(_).tuning(State)` env unbuildable. Absence of any
+        // every `.testnet(_).tuning(State)` env unbuildable. Absence of any
         // tuning token means `Fetch`.
         let state = tunings.iter().any(|t| matches!(t, ZainoTuning::State));
         let backend_literal = if state {
@@ -186,20 +186,48 @@ impl IndexerConfig for ZainoBackend {
                         .then_some(crate::handles::ports::ZAINO_METRICS),
                 )
             }
-            IndexerMode::Testnet(archive) => {
+            IndexerMode::Public => {
                 // The archive is frozen and there is no writer to share with,
                 // so a shared volume here is a regtest topology applied to the
                 // wrong mode. Naming it beats letting the pod fail on an empty
                 // mount path.
                 if opts.shared_state.is_some() {
                     return Err(EnvError::Config {
-                        reason: "a restored testnet chain supplies zaino's state DB as the \
-                                 pod's own CoW clone of the archive; a shared state volume \
-                                 is a regtest-only topology and cannot be combined with \
-                                 .restore"
+                        reason: "a restored chain supplies zaino's state DB as the pod's own \
+                                 CoW clone of the archive; a shared state volume is a \
+                                 regtest-only topology and cannot be combined with \
+                                 .testnet/.mainnet"
                             .to_string(),
                     });
                 }
+                // Which chain, read from the component rather than from the mode:
+                // the mode says only *that* this is a public network, and the
+                // archive is what this pod was pointed at — including which
+                // network it is. `.testnet(_)`/`.mainnet(_)` set both, so an
+                // absent archive here means the mode was reached some other way
+                // — a config bug, not a topology a user can express.
+                let archive = match opts.restore {
+                    Some(crate::component::RestoreSource::Archive(handle)) => handle,
+                    _ => {
+                        return Err(EnvError::Config {
+                            reason: "zaino is in public-network mode but names no chain \
+                                     archive; select the chain with .testnet(<ARCHIVE>) or \
+                                     .mainnet(<ARCHIVE>)"
+                                .to_string(),
+                        });
+                    }
+                };
+                let network = archive
+                    .chain()
+                    .map(|c| c.network())
+                    .filter(|n| n.is_public())
+                    .ok_or_else(|| EnvError::Config {
+                        reason: format!(
+                            "{} is not a public-network chain archive, so zaino cannot be \
+                             pointed at it with .testnet/.mainnet",
+                            archive.name(),
+                        ),
+                    })?;
                 // Only the `State` backend opens the DB. `Fetch` indexes the same
                 // chain, but sources its blocks from the validator over JSON-RPC
                 // and never reads a state directory. The archive is multi-GB, so
@@ -207,22 +235,23 @@ impl IndexerConfig for ZainoBackend {
                 // attach per test for a mount nothing would open.
                 if state {
                     opts.mounts
-                        .push(crate::regtest::archive_mount(*archive, ZAINO_ZEBRA_DB));
+                        .push(crate::regtest::archive_mount(archive, ZAINO_ZEBRA_DB));
                 }
-                let host = validator_host.unwrap_or(ZAINO_TESTNET_VALIDATOR_HOST);
+                let host = validator_host.unwrap_or(ZAINO_PUBLIC_VALIDATOR_HOST);
                 // `backend = 'direct'` (the State tuning) opens the CoW clone
                 // above through zebra's `ReadStateService`, and its config is
                 // rejected outright without a gRPC address to drive the syncer.
                 // Fetch never opens a DB, so it gets none.
                 let validator_grpc =
                     state.then(|| format!("{host}:{}", crate::handles::ports::ZEBRAD_INDEXER));
-                crate::testnet_conf::testnet_zainod_conf(
+                crate::public_conf::public_zainod_conf(
+                    network,
                     version,
                     backend_literal,
-                    ZAINO_TESTNET_GRPC_PORT,
-                    ZAINO_TESTNET_JSONRPC_PORT,
+                    ZAINO_PUBLIC_GRPC_PORT,
+                    ZAINO_PUBLIC_JSONRPC_PORT,
                     host,
-                    ZAINO_TESTNET_VALIDATOR_RPC_PORT,
+                    ZAINO_PUBLIC_VALIDATOR_RPC_PORT,
                     ZAINO_ZEBRA_DB,
                     ZAINO_DB,
                     validator_grpc.as_deref(),
@@ -230,11 +259,6 @@ impl IndexerConfig for ZainoBackend {
                         .metrics_enabled()
                         .then_some(crate::handles::ports::ZAINO_METRICS),
                 )
-            }
-            IndexerMode::Mainnet(_) => {
-                return Err(EnvError::Config {
-                    reason: "zaino mainnet mode is not yet supported".to_string(),
-                });
             }
         };
         opts.mounts
@@ -750,9 +774,12 @@ mod family {
     pub(super) const SYNC_ERRORS: &str = "zaino_sync_errors_total";
     pub(super) const REACHED_TIP: &str = "zaino_sync_has_reached_tip";
     pub(super) const TRANSACTIONS: &str = "zaino_sync_transactions_total";
-    /// The height zaino's finalised index has been written up to. Set by the
-    /// write path as each batch commits.
+    /// The height zaino's finalised index has been **committed** to — written
+    /// and fsynced. Set by the write path as each batch commits.
     pub(super) const FINALIZED_HEIGHT: &str = "zaino_sync_finalized_height";
+    /// The height zaino's sync loop has fetched and built to in memory, ahead of
+    /// the next commit by up to a full batch.
+    pub(super) const FETCHED_HEIGHT: &str = "zaino_sync_fetched_height";
     /// The height that write path is working towards.
     pub(super) const TARGET_HEIGHT: &str = "zaino_sync_target_height";
     pub(super) const CHAIN_TIP: &str = "zaino_chain_tip_height";
@@ -767,7 +794,7 @@ mod family {
 /// six lines, and eighty lines of vertical `row(` calls is unreadable for the one
 /// thing a reader comes here to do — scan the columns.
 #[rustfmt::skip]
-pub const ROWS: [Row; 14] = [
+pub const ROWS: [Row; 15] = [
     // Inbound gRPC — zaino's serving surface.
     row("gRPC requests", family::GRPC_REQUESTS, Reduce::Sum, LIVE),
     row("gRPC errors", family::GRPC_ERRORS, Reduce::Sum, AT_REST),
@@ -792,6 +819,11 @@ pub const ROWS: [Row; 14] = [
     // it serves can be answered by the validator it proxies while indexing, so
     // none of them can gate on the index.
     row("finalized height", family::FINALIZED_HEIGHT, Reduce::Max, LIVE),
+    // Beside it because the *gap* is the diagnostic: zaino commits in batches of
+    // ~100k blocks, so this runs up to a whole batch ahead of what is durably
+    // indexed. A report showing only one of the two cannot distinguish "slow to
+    // fetch" from "fetching fine, not committing".
+    row("fetched height", family::FETCHED_HEIGHT, Reduce::Max, LIVE),
     row("chain tip height", family::CHAIN_TIP, Reduce::Max, LIVE),
 ];
 
@@ -1076,7 +1108,7 @@ fn apply_regtest(
 ///
 /// Shared by both mode entry points because neither is optional. The scratch
 /// mount used to hang off the regtest path alone, so a restored pod got config
-/// pointing at [`ZAINO_DB`] with nothing mounted there — `FinalisedState` then
+/// pointing at `ZAINO_DB` with nothing mounted there — `FinalisedState` then
 /// tried to create its RocksDB inside the image filesystem, which the pod's uid
 /// owns no part of, and the pod died on `Permission denied` before serving a
 /// single query.
@@ -1120,26 +1152,47 @@ const ZAINO_ZEBRA_DB: &str = "/var/lib/zaino/zebra-db";
 /// [`ZAINO_SCRATCH`] — the snapshot machinery doesn't touch it.
 const ZAINO_DB: &str = "/var/lib/zaino/db";
 
-impl crate::regtest::Restore for crate::component::Indexer<ZainoBackend> {
-    /// Apply the named testnet fixture. The backend-dependent `zainod.toml` is
-    /// rendered at build time, and — for the `State` backend only — the
-    /// variant's pre-synced zebra state is mounted at
-    /// `ZAINO_ZEBRA_DB`. Both happen in
+impl crate::regtest::Testnet for crate::component::Indexer<ZainoBackend> {
+    /// Run this zaino against the testnet chain `archive` pins.
+    ///
+    /// Renders the `zainod.toml` for testnet and — for the `State` backend only
+    /// — mounts a private CoW clone of `archive` at `ZAINO_ZEBRA_DB` for it to
+    /// read blocks out of. Both happen in
     /// [`ZainoBackend::materialize_opts`], which is the first point that knows
-    /// the tuning: `.restore(_)` and `.tuning(_)` compose in either order, so a
+    /// the tuning: `.testnet(_)` and `.tuning(_)` compose in either order, so a
     /// builder method cannot see it.
-    fn restore(self, archive: crate::ArchiveHandle) -> Self {
-        apply_restore(self, archive)
+    ///
+    /// The clone is an *input*. Zaino's own index lives in pod-local scratch
+    /// (`ZAINO_DB`) and starts empty; watching it fill is the whole subject of
+    /// an index-construction profile.
+    ///
+    /// The archive is recorded in `ComponentOpts::restore` because that field
+    /// already drives the three things a seed consumer needs: materialization of
+    /// the artifact, the supplemental GID that makes the clone readable
+    /// (`seed_groups`), and the whole-env check
+    /// that every component names the *same* chain.
+    fn testnet(self, archive: crate::ArchiveHandle) -> Self {
+        read_public_chain(self, archive, crate::ArchiveNetwork::Testnet)
+    }
+
+    fn mainnet(self, archive: crate::ArchiveHandle) -> Self {
+        read_public_chain(self, archive, crate::ArchiveNetwork::Mainnet)
     }
 }
 
-fn apply_restore(
+/// Point this indexer at the public-network chain `archive` pins.
+///
+/// Shared by both verbs: which network it is comes off the archive, and the
+/// caller's claim is checked against that record at `env.build()`.
+fn read_public_chain(
     indexer: crate::component::Indexer<ZainoBackend>,
     archive: crate::ArchiveHandle,
+    claimed: crate::ArchiveNetwork,
 ) -> crate::component::Indexer<ZainoBackend> {
     let mut indexer = apply_pod_layout(indexer);
     indexer.opts.restore = Some(crate::component::RestoreSource::Archive(archive));
-    indexer.mode = crate::component::IndexerMode::Testnet(archive);
+    indexer.opts.claimed_network = Some(claimed);
+    indexer.mode = crate::component::IndexerMode::Public;
     indexer
 }
 
@@ -1166,19 +1219,19 @@ fn zaino_semver(
 
 /// zaino gRPC listen port. Matches the generator's
 /// `[grpc_settings] listen_address` and the named port in `manifest.rs`.
-const ZAINO_TESTNET_GRPC_PORT: u16 = crate::handles::ports::ZAINO_GRPC;
+const ZAINO_PUBLIC_GRPC_PORT: u16 = crate::handles::ports::ZAINO_GRPC;
 
 /// zaino's own JSON-RPC port (testnet canonical 8232).
-const ZAINO_TESTNET_JSONRPC_PORT: u16 = crate::handles::ports::ZAINO_JSONRPC;
+const ZAINO_PUBLIC_JSONRPC_PORT: u16 = crate::handles::ports::ZAINO_JSONRPC;
 
 /// In-cluster DNS name of the paired zebrad pod. Matches the default pod name
-/// `Validator::zebrad(…).restore(archive)` assigns; override on both sides if
+/// `Validator::zebrad(…).testnet(archive)` assigns; override on both sides if
 /// you `.named(…)` differently.
-const ZAINO_TESTNET_VALIDATOR_HOST: &str = "zebrad";
+const ZAINO_PUBLIC_VALIDATOR_HOST: &str = "zebrad";
 
 /// Testnet zebrad's JSON-RPC port: the same canonical testnet port the
 /// zebrad backend serves on.
-const ZAINO_TESTNET_VALIDATOR_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_TESTNET_RPC;
+const ZAINO_PUBLIC_VALIDATOR_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_PUBLIC_RPC;
 
 // ──────────────────────────── Zaino-only RPCs ─────────────────────────
 //
@@ -1300,17 +1353,18 @@ mod tests {
     }
 
     /// The regression: only `.regtest()` mounted the scratch root, so a
-    /// `.restore(_)` pod booted with config pointing `[storage.database] path`
+    /// `.testnet(_)` pod booted with config pointing `[storage.database] path`
     /// at a directory that existed nowhere it could write. `FinalisedState`
     /// died creating its RocksDB — after a clean startup and a successful chain
     /// sync, which is what made it read as a zaino bug rather than a missing
     /// mount.
     #[test]
     fn both_mode_entry_points_mount_the_scratch_root() {
+        use crate::regtest::Testnet as _;
+
         let zaino = || crate::component::Indexer::zaino("1.0.0");
         assert!(mounts_scratch(&super::apply_regtest(zaino())));
-        assert!(mounts_scratch(&super::apply_restore(
-            zaino(),
+        assert!(mounts_scratch(&zaino().testnet(
             crate::archive::ArchiveHandle::__new(
                 "zebra-v6.2.3-test.tar.zst",
                 "0".repeat(64).leak(),

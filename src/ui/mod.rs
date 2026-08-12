@@ -35,7 +35,8 @@ mod theme;
 pub(crate) use self::layout::SPINNER_STEP_MS;
 pub use self::render::{
     RunProgress, render, render_cancel_panel, render_live_panel, render_preflight_panel,
-    render_sync_build_panel, render_sync_metrics, render_sync_watch_panel, render_transfers,
+    render_sync_build_panel, render_sync_metrics, render_sync_watch_panel, render_sync_work,
+    render_transfers,
 };
 pub use self::status::render_sync_status;
 pub use self::theme::Theme;
