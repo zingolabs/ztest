@@ -35,7 +35,7 @@ mod theme;
 pub(crate) use self::layout::SPINNER_STEP_MS;
 pub use self::render::{
     RunProgress, render, render_cancel_panel, render_live_panel, render_preflight_panel,
-    render_sync_build_panel, render_sync_metrics, render_sync_watch_panel, render_sync_work,
+    render_sync_build_panel, render_sync_cost, render_sync_watch_panel, render_sync_work,
     render_transfers,
 };
 pub use self::status::render_sync_status;
@@ -196,8 +196,13 @@ pub struct SyncWatchState {
     /// majority of its wall-clock in `TestEnv::build`, before any tick exists, so
     /// this is the row that distinguishes a slow gate from a hung one.
     pub setup: Option<SetupStep>,
-    /// `None` until the first tick arrives.
+    /// `None` until the first scrape of the subject's exporter lands.
     pub vitals: Option<SyncVitals>,
+    /// Why [`vitals`](Self::vitals) is empty, in the metrics plane's own words —
+    /// "no metrics-exposing pod yet" against "unavailable · connection refused"
+    /// are a normal warm-up and a broken subject, and four blank rows state
+    /// neither.
+    pub metrics_note: Option<String>,
     /// The probe board, in registration order.
     pub probes: Vec<ProbeRow>,
     /// Violations published so far — a count the panel shows even when the
@@ -223,7 +228,14 @@ pub struct SetupStep {
     pub received_at: std::time::Duration,
 }
 
-/// Live sync vitals, from the most recent tick.
+/// Live sync vitals.
+///
+/// Every number here is derived from the watcher's own once-a-second scrape of
+/// the subject's exporter, not from the driver's five-second tick: a panel whose
+/// rates lag its heights by a tick shows two different truths side by side, and
+/// the exporter is the only source with sub-tick resolution. [`phase`](Self::phase)
+/// and [`reorg_depth`](Self::reorg_depth) are the exceptions and have to be —
+/// they are the engine's own state, published nowhere else.
 #[derive(Debug, Clone)]
 pub struct SyncVitals {
     pub height: u32,
@@ -231,23 +243,29 @@ pub struct SyncVitals {
     pub pct: f32,
     pub phase: String,
     pub reorg_depth: u32,
-    /// Smoothed scan rate. `None` until two ticks have been seen.
+    /// Scan rate over the trailing rate window. `None` until two scrapes have
+    /// landed, and while the frontier is going backwards.
     pub blocks_per_sec: Option<f64>,
     /// Projected time to `target` at the current rate. `None` without a target
     /// or a rate, or when the rate is too near zero to project honestly.
     pub eta: Option<std::time::Duration>,
-    /// Protocol work per second, total and by pool, as the driver measured it.
+    /// Protocol work per second, total and by pool.
     ///
-    /// `None` entries mean **unmeasured**, not idle: a tier-B op nobody counted
-    /// and a pool with no activity are different facts and the panel renders
-    /// them differently (`—` against `0`).
+    /// `None` entries mean **unmeasured**, not idle: a pool nobody counted and a
+    /// pool with no activity are different facts and the panel renders them
+    /// differently (`—` against `0`).
     pub work_rate: Option<f64>,
     /// Per-pool rates in [`CHANNELS`](crate::sync::CHANNELS) order, which is
     /// also the order they stack in the graph.
     pub pool_rates: Vec<(&'static str, Option<f64>)>,
-    /// Session-elapsed reading when this tick arrived. The renderer subtracts it
-    /// from the frame's `elapsed` to show tick age — the "is it still alive"
-    /// signal — while staying a pure function of its inputs.
+    /// Where the per-block time goes.
+    pub cost: crate::sync::Cost,
+    /// Session-elapsed reading when the scrape behind these numbers landed.
+    ///
+    /// Not displayed. The renderer subtracts it from the frame's `elapsed` and
+    /// blanks the rates once they are older than the staleness bound, so a
+    /// wedged exporter reads as "unknown" rather than as a rate that has
+    /// silently frozen — while the renderer stays a pure function of its inputs.
     pub received_at: std::time::Duration,
 }
 
@@ -263,32 +281,6 @@ pub struct ProbeRow {
 }
 
 impl SyncWatchState {
-    /// The probe nearest to failing, for the one-line board summary: an already
-    /// violating probe outranks a draining `eventually` window, which outranks
-    /// one that hasn't reported. `None` when every probe is satisfied.
-    pub fn worst_probe(&self) -> Option<&ProbeRow> {
-        use crate::sync::ProbeState;
-        // Fraction of its window an `eventually` probe has burned; a probe with
-        // no window ranks below any that has one, so a real countdown wins the
-        // slot over a merely-pending probe.
-        let drain = |r: &ProbeRow| match (r.since_satisfied, r.window) {
-            (Some(since), Some(window)) if !window.is_zero() => {
-                since.as_secs_f64() / window.as_secs_f64()
-            }
-            _ => 0.0,
-        };
-        let rank = |r: &ProbeRow| match r.state {
-            ProbeState::Violating => 3,
-            ProbeState::Pending => 2,
-            ProbeState::NotYet => 1,
-            ProbeState::Ok => 0,
-        };
-        self.probes
-            .iter()
-            .filter(|r| !r.state.is_ok())
-            .max_by(|a, b| rank(a).cmp(&rank(b)).then(drain(a).total_cmp(&drain(b))))
-    }
-
     /// How many probes are satisfied, of how many registered.
     pub fn probe_tally(&self) -> (usize, usize) {
         (

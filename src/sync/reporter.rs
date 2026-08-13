@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use super::event::{self, Probe, SyncEvent, Tick};
 use super::probe::{ProbeStatus, Verdict};
 use super::runner::{SyncOutcome, SyncReporter};
-use super::series::Timeline;
+use super::series::{Timeline, plot_channels};
 use super::snapshot::Snapshot;
 
 /// How often the whole timeline is republished.
@@ -22,18 +22,6 @@ use super::snapshot::Snapshot;
 /// run. A minute is short enough that a status read is never meaningfully
 /// stale, and long enough that the series costs a fraction of the tick stream.
 const SERIES_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Blocks are not protocol work, but they are the axis a reader recognises, and
-/// plotting them beside work is what distinguishes a range that is cheap per
-/// block from one that is merely being scanned slowly.
-const BLOCKS: &str = "blocks";
-
-/// Channels the driver records, in stacking order: blocks, then the protocol
-/// work channels exactly as [`work::CHANNELS`](super::work::CHANNELS) defines
-/// them, so the graph's stack order cannot drift from the panel's legend.
-fn channels() -> impl Iterator<Item = &'static str> {
-    std::iter::once(BLOCKS).chain(super::work::CHANNELS.iter().map(|(name, _)| *name))
-}
 
 /// Publishes engine state as [`SyncEvent`] lines on stdout.
 #[derive(Debug)]
@@ -62,7 +50,7 @@ impl EventReporter {
             profile: profile.into(),
             // Start the timeline one bucket per tick: the finest the data
             // supports, and it coarsens itself from there as the run grows.
-            timeline: Timeline::new(channels(), tick),
+            timeline: Timeline::new(plot_channels(), tick),
             tick,
             probes,
             started: None,

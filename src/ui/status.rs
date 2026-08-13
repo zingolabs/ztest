@@ -261,8 +261,18 @@ fn probes_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String
                 crate::sync::ProbeState::Ok => (theme.chars.ok, theme.styles.pass),
                 _ => (theme.chars.warn, theme.styles.skip),
             };
-            let name: String = p.name.chars().take(inner.saturating_sub(3)).collect();
-            format!("{} {}", mark.style(style), name)
+            // The countdown is the whole value of an `eventually` probe on a
+            // live board: a name alone says a probe is unsatisfied, where
+            // `18s/30s` says whether it is about to fail.
+            let countdown = match (p.since_satisfied, p.window) {
+                (Some(since), Some(window)) => {
+                    format!(" {}/{}", format_elapsed(since), format_elapsed(window))
+                }
+                _ => String::new(),
+            };
+            let room = inner.saturating_sub(3 + countdown.chars().count());
+            let name: String = p.name.chars().take(room).collect();
+            format!("{} {name}{}", mark.style(style), dim(&countdown, theme))
         })
         .collect();
     // Silent truncation would read as a shorter board than the run actually
@@ -396,6 +406,7 @@ mod tests {
                 ("orchard", Some(4_200.0)),
                 ("ironwood", Some(0.0)),
             ],
+            cost: crate::sync::Cost::default(),
             received_at: Duration::from_secs(0),
         }
     }
@@ -435,6 +446,7 @@ mod tests {
             pod_phase: "Running".into(),
             setup: None,
             vitals: Some(vitals()),
+            metrics_note: None,
             probes: Vec::new(),
             violations: 0,
             timeline: Some(timeline()),

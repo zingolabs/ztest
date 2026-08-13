@@ -17,6 +17,7 @@ mod chainwork;
 mod detached;
 mod event;
 mod nemesis;
+mod observe;
 mod probe;
 mod runner;
 mod series;
@@ -43,6 +44,7 @@ pub use nemesis::{
     Buggify, BuggifyRule, Delay, Fault, FaultKind, Nemesis, NemesisBuilder, NetemSpec,
     ScheduledFault,
 };
+pub use observe::{Cost, Observation, Observe, Window};
 pub use probe::{
     Cadence, Class, ProbeBuilder, ProbeState, ProbeStatus, Severity, SyncCtx, Verdict, Violation,
     hours, mins, secs,
@@ -50,7 +52,7 @@ pub use probe::{
 pub use runner::{
     NullReporter, StderrReporter, SyncEngine, SyncOutcome, SyncReporter, SyncVerdict,
 };
-pub use series::{CAPACITY as SERIES_CAPACITY, Cell, Channel, Timeline};
+pub use series::{BLOCKS, CAPACITY as SERIES_CAPACITY, Cell, Channel, Timeline, plot_channels};
 pub use snapshot::{History, Snapshot};
 pub use subject::{Phase, ProgressView, SyncSubject};
 pub use tree::{TreeRoot, TreeRootError, TreeRoots};

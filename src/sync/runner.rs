@@ -336,6 +336,8 @@ impl<S: SyncSubject> SyncEngine<S> {
         // args while also taking `&mut self`.
         let verdict: SyncVerdict;
         let mut error: Option<String> = None;
+        // Consecutive failed `progress()` reads, reset by any success.
+        let mut progress_errors: u32 = 0;
         loop {
             tokio::select! {
                 biased;
@@ -359,9 +361,28 @@ impl<S: SyncSubject> SyncEngine<S> {
             // Snapshot-then-evaluate. A transient progress-read error holds the
             // prior state and retries next tick (governor.rs pattern), rather
             // than aborting — only a *probe* error aborts.
+            //
+            // Transient is the assumption, so it has to be checked. A subject
+            // that never answers produces no snapshot, and every downstream
+            // display reads that as "not started yet" — indistinguishable, for
+            // the whole run, from a subject that is genuinely wedged. Logging
+            // the first failure and then on a widening interval keeps a normal
+            // warm-up quiet without letting a permanent fault stay silent.
             let progress = match self.subject.progress().await {
-                Ok(p) => p,
-                Err(_) => continue,
+                Ok(p) => {
+                    progress_errors = 0;
+                    p
+                }
+                Err(e) => {
+                    progress_errors += 1;
+                    if progress_errors.is_power_of_two() {
+                        tracing::warn!(
+                            consecutive = progress_errors,
+                            "sync: progress read failed; no snapshot captured this tick: {e}"
+                        );
+                    }
+                    continue;
+                }
             };
             last_work = self.read_work(&mut chain_work, &progress, last_work).await;
             let snap = Arc::new(builder.build(&progress, now, last_work, None));

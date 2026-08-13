@@ -33,6 +33,24 @@ pub(crate) fn metrics_rows(component_label: &str) -> &'static [crate::metrics::R
     }
 }
 
+/// Resolve one scrape of `component_label` into the live columns a watcher
+/// draws, when that backend can be observed from outside.
+///
+/// The dispatch [`metrics_rows`] already establishes: a reader holds a component
+/// label and an exposition, and no reader should learn a metric family name to
+/// use either. `None` for a backend that implements no
+/// [`Observe`](crate::sync::Observe) — a display shows what it has and says so.
+pub(crate) fn observe(
+    component_label: &str,
+    exposition: &crate::metrics::Exposition,
+) -> Option<crate::sync::Observation> {
+    use crate::sync::Observe as _;
+    match component_label {
+        "zainod" => zainod::ZainoIndexer::observe(exposition),
+        _ => None,
+    }
+}
+
 /// The group set a component needs in order to *read* what it mounts.
 ///
 /// A component that restores from an archive gets a clone of a materialized

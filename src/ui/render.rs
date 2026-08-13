@@ -593,7 +593,32 @@ pub fn render_sync_watch_panel(
     out
 }
 
-/// The three vitals rows: chain position, pace, and the probe board summary.
+/// How long a scrape stays believable.
+///
+/// Three periods, so a single dropped scrape does not blink the panel while a
+/// wedged exporter still resolves within a few seconds. Past it the derived
+/// numbers blank rather than hold: a rate frozen at its last value is the one
+/// failure a live display must never render as a healthy reading.
+const STALE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(crate::metrics::LIVE_PERIOD.as_secs() * 3);
+
+/// Whether the scrape behind these vitals is too old to quote.
+fn stale(v: &SyncVitals, elapsed: std::time::Duration) -> bool {
+    elapsed.saturating_sub(v.received_at) > STALE_AFTER
+}
+
+/// A rate as text: `—` when unmeasured, and `—` when the reading behind it has
+/// gone stale, which are the same statement to a reader — this is not known
+/// right now.
+fn rate_text(rate: Option<f64>, stale: bool, unit: &str) -> String {
+    match rate.filter(|_| !stale) {
+        Some(r) if unit == "blk/s" => format!("{r:.1} {unit}"),
+        Some(r) => format!("{}{unit}", compact(r)),
+        None => "—".to_string(),
+    }
+}
+
+/// The three vitals rows: chain position, pace, and the scan-rate trend.
 fn render_sync_vitals(
     out: &mut String,
     state: &SyncWatchState,
@@ -618,15 +643,16 @@ fn render_sync_vitals(
     )
     .expect("write to string");
 
-    // Tick age, not wall-clock elapsed: a driver that has stopped publishing is
-    // the failure this row exists to make visible.
-    let age = elapsed.saturating_sub(v.received_at);
-    let rate = match v.blocks_per_sec {
-        Some(r) => format!("{r:.1} blk/s"),
-        None => "—".to_string(),
-    };
-    let mut pace = format!("{rate} {dot} {}", v.phase.style(theme.styles.count));
-    if let Some(eta) = v.eta {
+    let stale = stale(v, elapsed);
+    let mut pace = format!(
+        "{} {dot} {}",
+        rate_text(v.blocks_per_sec, stale, "blk/s"),
+        v.phase.style(theme.styles.count),
+    );
+    // Suppressed once the reading is stale along with the rate it is derived
+    // from: a projection off a frozen rate counts down towards a finish that is
+    // not happening.
+    if let Some(eta) = v.eta.filter(|_| !stale) {
         pace.push_str(&format!(" {dot} eta {}", format_elapsed(eta)));
     }
     if v.reorg_depth > 0 {
@@ -637,66 +663,52 @@ fn render_sync_vitals(
     }
     writeln!(
         out,
-        "{:>width$} {pace} {dot} {}",
+        "{:>width$} {pace}",
         "pace".style(theme.styles.dim),
-        format_args!("tick {}", format_elapsed(age)).style(theme.styles.dim),
         width = LABEL_WIDTH,
     )
     .expect("write to string");
 
-    render_probe_summary(out, state, theme);
+    render_scan_trend(out, state, theme);
 }
 
-/// The probe board on one line: the satisfied tally, then whichever probe is
-/// nearest to failing, with its window countdown when it has one.
-fn render_probe_summary(out: &mut String, state: &SyncWatchState, theme: &Theme) {
+/// The scan rate over the run, as a sparkline with the span it covers and the
+/// best rate seen.
+///
+/// The peak is what makes the trend actionable rather than decorative: a scan
+/// holding at half of what it has already demonstrated is a regression, and
+/// nothing else on the panel can state that.
+fn render_scan_trend(out: &mut String, state: &SyncWatchState, theme: &Theme) {
+    use super::plot::{Palette, PlotOpts, plot_stacked};
     let dot = theme.chars.dot.style(theme.styles.dim);
-    let (ok, total) = state.probe_tally();
-    let tally_style = if ok == total {
-        theme.styles.pass
-    } else {
-        theme.styles.count
-    };
 
-    let detail = match state.worst_probe() {
-        Some(row) => {
-            let marker = match row.state {
-                crate::sync::ProbeState::Violating => theme.chars.fail,
-                _ => theme.chars.warn,
-            };
-            let style = match row.state {
-                crate::sync::ProbeState::Violating => theme.styles.fail,
-                _ => theme.styles.skip,
-            };
-            let countdown = match (row.since_satisfied, row.window) {
-                (Some(since), Some(window)) => {
-                    format!(" {}/{}", format_elapsed(since), format_elapsed(window))
-                }
-                _ => String::new(),
+    let body = match &state.timeline {
+        Some(timeline) => {
+            let bands = timeline.bands(crate::sync::BLOCKS);
+            let opts = PlotOpts::new(SPARK_WIDTH, 1, theme.chars.graph);
+            let spark = plot_stacked(
+                &[(crate::sync::BLOCKS, bands)],
+                &opts,
+                &Palette::pools(theme.is_colorized()),
+            )
+            .pop()
+            .unwrap_or_default();
+            let peak = match timeline.peak(&[crate::sync::BLOCKS]) {
+                Some(p) => format!(" {dot} peak {p:.0} blk/s"),
+                None => String::new(),
             };
             format!(
-                "{dot} {} {}{}",
-                marker.style(style),
-                row.name.style(style),
-                countdown.style(theme.styles.dim),
+                "{spark} {}{}",
+                format_elapsed(timeline.span()).style(theme.styles.dim),
+                peak.style(theme.styles.dim),
             )
         }
-        None => String::new(),
+        None => "gathering".style(theme.styles.dim).to_string(),
     };
-    let violations = if state.violations > 0 {
-        format!(
-            "{dot} {}",
-            format_args!("{} violation(s)", state.violations).style(theme.styles.fail),
-        )
-    } else {
-        String::new()
-    };
-
     writeln!(
         out,
-        "{:>width$} {} {detail}{violations}",
-        "probes".style(theme.styles.dim),
-        format_args!("{ok}/{total} ok").style(tally_style),
+        "{:>width$} {body}",
+        "blocks".style(theme.styles.dim),
         width = LABEL_WIDTH,
     )
     .expect("write to string");
@@ -777,7 +789,11 @@ fn render_sync_waiting(
 /// Braille via the shared [`plot_stacked`](super::plot::plot_stacked) with a
 /// height of one, so these and the status box are the same renderer at different
 /// geometries — a sparkline here cannot disagree with the plot there.
-pub fn render_sync_work(state: &SyncWatchState, theme: &Theme) -> String {
+pub fn render_sync_work(
+    state: &SyncWatchState,
+    elapsed: std::time::Duration,
+    theme: &Theme,
+) -> String {
     use super::plot::{Palette, PlotOpts, plot_stacked};
 
     let mut out = String::with_capacity(320);
@@ -788,17 +804,14 @@ pub fn render_sync_work(state: &SyncWatchState, theme: &Theme) -> String {
             out,
             "{:>width$} {}",
             "work".style(theme.styles.dim),
-            match state.vitals {
-                None => "awaiting first tick",
-                Some(_) => "awaiting first series",
-            }
-            .style(theme.styles.dim),
+            "awaiting first scrape".style(theme.styles.dim),
             width = METRIC_LABEL_WIDTH,
         )
         .expect("write to string");
         pad_to_panel(&mut out);
         return out;
     };
+    let stale = stale(vitals, elapsed);
 
     let palette = Palette::pools(theme.is_colorized());
     let opts = PlotOpts::new(SPARK_WIDTH, 1, theme.chars.graph);
@@ -822,11 +835,7 @@ pub fn render_sync_work(state: &SyncWatchState, theme: &Theme) -> String {
             out,
             "{:>width$} {:>8} {spark}",
             name.style(theme.styles.dim),
-            match rate {
-                Some(r) => format!("{}/s", compact(*r)),
-                None => "—".to_string(),
-            }
-            .style(theme.styles.count),
+            rate_text(*rate, stale, "/s").style(theme.styles.count),
             width = METRIC_LABEL_WIDTH,
         )
         .expect("write to string");
@@ -850,11 +859,7 @@ pub fn render_sync_work(state: &SyncWatchState, theme: &Theme) -> String {
         out,
         "{:>width$} {:>8} {}",
         "total".style(theme.styles.dim),
-        match vitals.work_rate {
-            Some(r) => format!("{}/s", compact(r)),
-            None => "—".to_string(),
-        }
-        .style(theme.styles.count),
+        rate_text(vitals.work_rate, stale, "/s").style(theme.styles.count),
         format_elapsed(timeline.span()).style(theme.styles.dim),
         width = METRIC_LABEL_WIDTH,
     )
@@ -864,90 +869,63 @@ pub fn render_sync_work(state: &SyncWatchState, theme: &Theme) -> String {
     out
 }
 
-/// The **right column** of the `ztest sync watch` panel: the newest metrics
-/// reading, one label per row. Held to [`PANEL_LINES`] with the top row blank,
+/// The **right column** of the `ztest sync watch` panel: where the subject's
+/// per-block time goes. Held to [`PANEL_LINES`] with the top row blank,
 /// matching [`render_transfers`].
+///
+/// Latencies, not throughput: a rate belongs in [`render_sync_work`] beside the
+/// pools that compose it, and the question this column exists to answer is the
+/// one no rate can — *whose* time is it. `fetch` is the upstream validator's,
+/// `parse` is the subject's own, and their ratio is what says which of the two
+/// to go and fix.
 ///
 /// Fed by a direct exporter scrape, not by a monitoring stack — a column that
 /// repaints once per scrape interval is not a live display. Four blank rows read
 /// as "everything is zero", so when there are no values the *reason* is named.
-///
-/// Counters and steady-state facts only. Anything with a *rate* belongs in
-/// [`render_sync_work`], which is fed by the driver's own differencing rather
-/// than by a scrape that can be dropped.
-pub fn render_sync_metrics(reading: &crate::metrics::Reading, theme: &Theme) -> String {
+pub fn render_sync_cost(state: &SyncWatchState, theme: &Theme) -> String {
     let mut out = String::with_capacity(320);
     out.push('\n');
-    let dot = theme.chars.dot.style(theme.styles.dim);
 
-    // Naming the cause is the point: "no samples" sent a reader hunting a broken
-    // exporter when nothing was broken at all.
-    if let Some(note) = &reading.note {
+    let row = |out: &mut String, label: &str, value: Option<f64>| {
+        let body = match value {
+            Some(ms) => format!("{ms:.1} ms"),
+            None => "—".to_string(),
+        };
         writeln!(
             out,
             "{:>width$} {}",
-            "metrics".style(theme.styles.dim),
-            note.style(theme.styles.dim),
+            label.style(theme.styles.dim),
+            body.style(theme.styles.count),
+            width = METRIC_LABEL_WIDTH,
+        )
+        .expect("write to string");
+    };
+
+    // Naming the cause is the point: "no samples" sent a reader hunting a broken
+    // exporter when nothing was broken at all.
+    let Some(vitals) = state.vitals.as_ref() else {
+        writeln!(
+            out,
+            "{:>width$} {}",
+            "cost".style(theme.styles.dim),
+            state
+                .metrics_note
+                .as_deref()
+                .unwrap_or("awaiting first scrape")
+                .style(theme.styles.dim),
             width = METRIC_LABEL_WIDTH,
         )
         .expect("write to string");
         pad_to_panel(&mut out);
         return out;
-    }
-
-    let row = |out: &mut String, label: &str, body: String| {
-        writeln!(
-            out,
-            "{:>width$} {body}",
-            label.style(theme.styles.dim),
-            width = METRIC_LABEL_WIDTH,
-        )
-        .expect("write to string");
-    };
-    let num = |label: &str| {
-        reading
-            .get(label)
-            .map(compact)
-            .unwrap_or_else(|| "—".to_string())
     };
 
-    row(
-        &mut out,
-        "lag",
-        format!(
-            "{} blk {dot} reorgs {}",
-            num("sync lag (blocks)").style(theme.styles.count),
-            num("reorgs").style(theme.styles.count),
-        ),
-    );
-    // Grouped in full, not abbreviated: the tip is read against the `height` row
-    // opposite it, and `1.5M` can't be compared with `1,284,901`.
-    let tip = reading
-        .get("chain tip height")
-        .map(|h| thousands(h.max(0.0) as u64))
-        .unwrap_or_else(|| "—".to_string());
-    row(&mut out, "tip", tip.style(theme.styles.count).to_string());
-    row(
-        &mut out,
-        "indexed",
-        format!(
-            "{} tx",
-            num("transactions indexed").style(theme.styles.count)
-        ),
-    );
-    let latency = reading
-        .get("gRPC mean latency (ms)")
-        .map(|ms| format!("{ms:.1} ms"))
-        .unwrap_or_else(|| "—".to_string());
-    row(
-        &mut out,
-        "gRPC",
-        format!(
-            "{} req {dot} {}",
-            num("gRPC requests").style(theme.styles.count),
-            latency.style(theme.styles.count),
-        ),
-    );
+    // Held through a stale patch rather than blanked as the rates are: these are
+    // means over the subject's whole run, so the newest reading stays true of
+    // the run whether or not a scrape landed this second.
+    row(&mut out, "fetch", vitals.cost.fetch_ms);
+    row(&mut out, "parse", vitals.cost.parse_ms);
+    row(&mut out, "gRPC", vitals.cost.grpc_ms);
 
     pad_to_panel(&mut out);
     out
@@ -1563,11 +1541,16 @@ mod tests {
             pod_phase: "Running".into(),
             setup: None,
             vitals,
+            metrics_note: None,
             probes: Vec::new(),
             violations: 0,
             timeline: None,
         }
     }
+
+    /// The session-elapsed frame these tests render at: two seconds after the
+    /// scrape behind [`sample_vitals`], i.e. comfortably fresh.
+    const FRAME: std::time::Duration = std::time::Duration::from_secs(212);
 
     fn sample_vitals() -> SyncVitals {
         SyncVitals {
@@ -1589,20 +1572,28 @@ mod tests {
                 ("orchard", Some(4_200.0)),
                 ("ironwood", Some(0.0)),
             ],
+            cost: crate::sync::Cost {
+                fetch_ms: Some(41.2),
+                parse_ms: Some(6.8),
+                grpc_ms: Some(4.13),
+            },
             received_at: std::time::Duration::from_secs(210),
         }
     }
 
-    /// A timeline carrying every channel `sample_vitals` reports a rate for, so
-    /// the work column has something to draw.
+    /// A timeline carrying the scan rate and every channel `sample_vitals`
+    /// reports a rate for, so both the trend row and the work column have
+    /// something to draw. Built over [`plot_channels`](crate::sync::plot_channels)
+    /// so its channel set is the one the watcher actually records.
     fn sample_timeline() -> crate::sync::Timeline {
-        let names: Vec<&str> = crate::sync::CHANNELS.iter().map(|(n, _)| *n).collect();
+        let names: Vec<&str> = crate::sync::plot_channels().collect();
         let mut timeline =
             crate::sync::Timeline::new(names.clone(), std::time::Duration::from_secs(60));
         for step in 0..6u64 {
             let samples: Vec<Option<f64>> = names
                 .iter()
                 .map(|n| match *n {
+                    "blocks" => Some(400.0 + step as f64 * 40.0),
                     "sapling" => Some(19_400.0 + step as f64 * 100.0),
                     "orchard" => Some(4_200.0),
                     "ironwood" => Some(0.0),
@@ -1622,7 +1613,7 @@ mod tests {
     fn the_work_column_draws_only_measured_pools() {
         let mut state = watching(Some(sample_vitals()));
         state.timeline = Some(sample_timeline());
-        let out = render_sync_work(&state, &plain_unicode_theme());
+        let out = render_sync_work(&state, FRAME, &plain_unicode_theme());
 
         for measured in ["sapling", "orchard", "ironwood"] {
             assert!(out.contains(measured), "`{measured}` row missing:\n{out}");
@@ -1644,7 +1635,7 @@ mod tests {
         let mut full = watching(Some(sample_vitals()));
         full.timeline = Some(sample_timeline());
         for state in [watching(None), watching(Some(sample_vitals())), full] {
-            let out = render_sync_work(&state, &theme);
+            let out = render_sync_work(&state, FRAME, &theme);
             assert_eq!(
                 out.lines().count(),
                 PANEL_LINES,
@@ -1659,233 +1650,57 @@ mod tests {
     fn the_work_column_names_why_it_is_empty() {
         let theme = plain_unicode_theme();
         assert!(
-            render_sync_work(&watching(None), &theme).contains("awaiting first tick"),
-            "a pre-tick column must say so"
-        );
-        assert!(
-            render_sync_work(&watching(Some(sample_vitals())), &theme)
-                .contains("awaiting first series"),
-            "a ticked-but-unplotted column must distinguish itself from a pre-tick one"
+            render_sync_work(&watching(None), FRAME, &theme).contains("awaiting first scrape"),
+            "a pre-scrape column must say so"
         );
     }
 
-    fn probe(name: &str, state: crate::sync::ProbeState) -> ProbeRow {
-        ProbeRow {
-            name: name.into(),
-            state,
-            since_satisfied: None,
-            window: None,
-        }
-    }
-
+    /// Each empty-column cause must name itself. A single "no samples yet" for
+    /// all of them sends the reader hunting a broken exporter when the truth may
+    /// be that the subject simply has not started.
     #[test]
-    fn sync_watch_panel_shows_vitals_at_constant_height() {
-        let mut state = watching(Some(sample_vitals()));
-        state.probes = vec![
-            probe("height_monotonic", crate::sync::ProbeState::Ok),
-            probe("reached_tip", crate::sync::ProbeState::NotYet),
-        ];
-        let s = render_sync_watch_panel(
-            &state,
-            std::time::Duration::from_secs(212),
-            &plain_unicode_theme(),
-        );
-        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
-        assert!(s.contains("zaino_state_sync"), "profile:\n{s}");
-        assert!(s.contains("901 / 1,024"), "height vs target:\n{s}");
-        assert!(s.contains("88.1%"), "percentage:\n{s}");
-        assert!(s.contains("12.4 blk/s"), "scan rate:\n{s}");
-        assert!(s.contains("Historic"), "phase:\n{s}");
-        assert!(s.contains("eta 10s"), "eta:\n{s}");
-        // 212s frame - 210s tick = 2s of tick age.
-        assert!(s.contains("tick 2s"), "tick age:\n{s}");
-        assert!(s.contains("1/2 ok"), "probe tally:\n{s}");
-        assert!(s.contains("reached_tip"), "worst probe named:\n{s}");
-    }
-
-    #[test]
-    fn sync_watch_panel_falls_back_to_pod_phase_before_the_first_tick() {
-        let s = render_sync_watch_panel(
-            &watching(None),
-            std::time::Duration::from_secs(45),
-            &plain_unicode_theme(),
-        );
-        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
-        assert!(s.contains("Running"), "pod phase:\n{s}");
-        assert!(s.contains("crc-remote"), "cluster context:\n{s}");
-        assert!(
-            s.contains("waiting for the driver's first report"),
-            "explains silence:\n{s}"
-        );
-    }
-
-    /// The whole point of the setup row: a reader must be able to see which gate
-    /// the minutes are going into, and how long *that gate* has been open —
-    /// otherwise a slow provisioning step is indistinguishable from a hang.
-    #[test]
-    fn the_setup_row_names_the_current_gate_and_its_own_age() {
-        let mut state = watching(None);
-        state.setup = Some(SetupStep {
-            subject: "zainod".into(),
-            detail: "waiting for gRPC GetLightdInfo".into(),
-            received_at: std::time::Duration::from_secs(60),
-        });
-        let s = render_sync_watch_panel(
-            &state,
-            std::time::Duration::from_secs(9 * 60),
-            &plain_unicode_theme(),
-        );
-        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
-        assert!(s.contains("zainod"), "names the component:\n{s}");
-        assert!(s.contains("GetLightdInfo"), "names the gate:\n{s}");
-        assert!(
-            s.contains("8m"),
-            "ages the gate, not the session (9m elapsed, gate opened at 1m):\n{s}"
-        );
-    }
-
-    /// Once ticks arrive the vitals own those rows; a stale provisioning step must
-    /// not linger beside live chain progress.
-    #[test]
-    fn the_setup_row_gives_way_to_the_vitals() {
-        let mut state = watching(Some(sample_vitals()));
-        state.setup = Some(SetupStep {
-            subject: "zainod".into(),
-            detail: "waiting for gRPC GetLightdInfo".into(),
-            received_at: std::time::Duration::from_secs(60),
-        });
-        let s = render_sync_watch_panel(
-            &state,
-            std::time::Duration::from_secs(9 * 60),
-            &plain_unicode_theme(),
-        );
-        assert!(!s.contains("GetLightdInfo"), "setup row persisted:\n{s}");
-        assert!(s.contains("height"), "vitals absent:\n{s}");
-    }
-
-    #[test]
-    fn a_reorg_and_violations_surface_on_the_panel() {
-        let mut vitals = sample_vitals();
-        vitals.reorg_depth = 7;
-        let mut state = watching(Some(vitals));
-        state.violations = 2;
-        state.probes = vec![probe(
-            "chain_continuity",
-            crate::sync::ProbeState::Violating,
-        )];
-        let s = render_sync_watch_panel(
-            &state,
-            std::time::Duration::from_secs(212),
-            &plain_unicode_theme(),
-        );
-        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
-        assert!(s.contains("reorg -7"), "reorg depth:\n{s}");
-        assert!(s.contains("2 violation(s)"), "violation count:\n{s}");
-        assert!(s.contains("chain_continuity"), "violating probe:\n{s}");
-    }
-
-    #[test]
-    fn a_draining_liveness_window_is_shown_as_a_countdown() {
-        let mut state = watching(Some(sample_vitals()));
-        state.probes = vec![ProbeRow {
-            name: "no_stall".into(),
-            state: crate::sync::ProbeState::Pending,
-            since_satisfied: Some(std::time::Duration::from_secs(25)),
-            window: Some(std::time::Duration::from_secs(30)),
-        }];
-        let s = render_sync_watch_panel(
-            &state,
-            std::time::Duration::from_secs(212),
-            &plain_unicode_theme(),
-        );
-        assert!(s.contains("no_stall 25s/30s"), "window countdown:\n{s}");
-    }
-
-    /// Each empty-column cause must name itself. A single "no samples yet" for all
-    /// of them sends the reader hunting a broken exporter when the truth may be
-    /// that the engine simply has not started.
-    #[test]
-    fn the_metrics_column_distinguishes_why_it_is_empty() {
+    fn the_cost_column_distinguishes_why_it_is_empty() {
         let theme = plain_unicode_theme();
-        let render = |reading: &crate::metrics::Reading| {
-            let s = render_sync_metrics(reading, &theme);
+        let render = |note: &str| {
+            let mut state = watching(None);
+            state.metrics_note = Some(note.to_string());
+            let s = render_sync_cost(&state, &theme);
             assert_eq!(s.lines().count(), PANEL_LINES, "fixed height:\n{s}");
             s
         };
 
         // Whatever the cause, the column states it instead of showing blank rows.
-        // The causes themselves are derived where the reading is taken; this is
+        // The causes themselves are derived where the sample is taken; this is
         // the renderer's half of that contract.
-        let s = render(&reading_note("no metrics-exposing pod yet".into()));
+        let s = render("no metrics-exposing pod yet");
         assert!(
             s.contains("no metrics-exposing pod"),
             "pre-target cause:\n{s}"
         );
 
-        let s = render(&reading_note(format!(
-            "scraping every {} · no series published yet",
-            format_elapsed(crate::metrics::LIVE_PERIOD)
-        )));
-        assert!(
-            s.contains("no series published yet"),
-            "unscraped cause:\n{s}"
-        );
-
-        let s = render(&reading_note("unavailable · connection refused".into()));
+        let s = render("unavailable · connection refused");
         assert!(s.contains("unavailable"), "unreachable cause:\n{s}");
         assert!(s.contains("connection refused"), "carries the reason:\n{s}");
     }
 
     #[test]
-    fn sync_metrics_column_shows_values_at_constant_height() {
-        let theme = plain_unicode_theme();
-        let s = render_sync_metrics(
-            &reading(&[
-                ("sync lag (blocks)", 0.0),
-                ("reorgs", 1.0),
-                ("chain tip height", 1024.0),
-                ("transactions indexed", 18_204.0),
-                ("gRPC requests", 12_400.0),
-                ("gRPC mean latency (ms)", 4.13),
-            ]),
-            &theme,
-        );
-        assert_eq!(s.lines().count(), PANEL_LINES, "sampled height:\n{s}");
-        assert!(s.contains("18.2k tx"), "compact totals:\n{s}");
-        assert!(s.contains("4.1 ms"), "latency:\n{s}");
-        assert!(s.contains("1,024"), "tip height grouped in full:\n{s}");
+    fn the_cost_column_splits_upstream_time_from_the_subjects_own() {
+        let s = render_sync_cost(&watching(Some(sample_vitals())), &plain_unicode_theme());
+        assert_eq!(s.lines().count(), PANEL_LINES, "fixed height:\n{s}");
+        assert!(s.contains("41.2 ms"), "validator round trip:\n{s}");
+        assert!(s.contains("6.8 ms"), "the subject's own parse cost:\n{s}");
+        assert!(s.contains("4.1 ms"), "service latency:\n{s}");
     }
 
+    /// An unpublished summary reads as absent, never as a zero — a component
+    /// that reports no fetch time and one that fetches instantly are different
+    /// claims, and only one of them is ever true.
     #[test]
-    fn a_missing_metric_reads_as_absent_not_zero() {
-        let mut r = reading(&[("reorgs", 0.0)]);
-        r.values.push(crate::metrics::Value {
-            label: "sync lag (blocks)",
-            value: None,
-        });
-        let s = render_sync_metrics(&r, &plain_unicode_theme());
+    fn an_unpublished_cost_reads_as_absent_not_zero() {
+        let mut vitals = sample_vitals();
+        vitals.cost = crate::sync::Cost::default();
+        let s = render_sync_cost(&watching(Some(vitals)), &plain_unicode_theme());
         assert!(s.contains("\u{2014}"), "absent value is an em dash:\n{s}");
-    }
-
-    /// A reading carrying values, as the poller projects one.
-    fn reading(values: &[(&'static str, f64)]) -> crate::metrics::Reading {
-        crate::metrics::Reading {
-            values: values
-                .iter()
-                .map(|(label, v)| crate::metrics::Value {
-                    label,
-                    value: Some(*v),
-                })
-                .collect(),
-            note: None,
-        }
-    }
-
-    /// A reading with nothing to show and a stated reason.
-    fn reading_note(note: String) -> crate::metrics::Reading {
-        crate::metrics::Reading {
-            values: Vec::new(),
-            note: Some(note),
-        }
+        assert!(!s.contains("0.0 ms"), "and never a zero:\n{s}");
     }
 }

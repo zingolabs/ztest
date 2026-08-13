@@ -88,6 +88,22 @@ pub struct Channel {
     pub cells: Vec<Cell>,
 }
 
+/// Blocks are not protocol work, but they are the axis a reader recognises, and
+/// plotting them beside work is what distinguishes a range that is cheap per
+/// block from one that is merely being scanned slowly.
+pub const BLOCKS: &str = "blocks";
+
+/// The channels a sync plots, in stacking order: blocks, then the protocol work
+/// channels exactly as [`CHANNELS`](super::work::CHANNELS) defines them.
+///
+/// Stated once because two timelines are built from it — the driver's, published
+/// as `Series` for `ztest sync status`, and the watcher's own second-by-second
+/// one — and a graph whose stack order depended on which built it would be
+/// unreadable across the two.
+pub fn plot_channels() -> impl Iterator<Item = &'static str> {
+    std::iter::once(BLOCKS).chain(super::work::CHANNELS.iter().map(|(name, _)| *name))
+}
+
 /// A fixed-capacity multi-channel timeline over a shared, self-coarsening time
 /// axis.
 ///

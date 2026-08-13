@@ -25,7 +25,7 @@ use crate::handles::indexer::{IndexerBackend, IndexerConfig};
 use crate::handles::validator::{BlockchainInfo, PeerInfo};
 use crate::metrics::{AT_REST, Exporter, Exposition, LIVE, Reduce, Row, row};
 use crate::protocol::zcash_rpc::ZcashRpc;
-use crate::sync::{Op, Phase, ProgressView, SyncSubject, Work};
+use crate::sync::{Cost, Observation, Observe, Op, Phase, ProgressView, SyncSubject, Work};
 use crate::{Endpoint, EnvError, RpcError};
 
 const COMPONENT: &str = "zainod";
@@ -764,28 +764,49 @@ impl IndexerBackend for ZainoIndexer {
 /// so the families a reader displays and the families a probe gates on cannot
 /// drift apart.
 mod family {
-    pub(super) const GRPC_REQUESTS: &str = "zaino_grpc_requests_total";
+    // Serving surface. The latency histogram's `_count` is the request volume,
+    // so zaino publishes no `requests_total` beside it.
     pub(super) const GRPC_ERRORS: &str = "zaino_grpc_errors_total";
     pub(super) const GRPC_LATENCY: &str = "zaino_grpc_request_duration_seconds";
-    pub(super) const RPC_OUTBOUND: &str = "zaino_rpc_outbound_requests_total";
+    /// Retries forced by the validator's work queue being full — the one
+    /// upstream signal `block_fetch_seconds` does not already carry, and the
+    /// one that is directly actionable.
     pub(super) const RPC_RETRIES: &str = "zaino_rpc_outbound_retries_total";
-    pub(super) const SYNC_LAG: &str = "zaino_sync_lag_blocks";
-    pub(super) const REORGS: &str = "zaino_sync_reorg_total";
-    pub(super) const SYNC_ERRORS: &str = "zaino_sync_errors_total";
-    pub(super) const REACHED_TIP: &str = "zaino_sync_has_reached_tip";
-    pub(super) const TRANSACTIONS: &str = "zaino_sync_transactions_total";
+    /// Reorg depth. Its `_count` is the reorg event total, so no separate
+    /// counter exists.
+    pub(super) const REORG_DEPTH: &str = "zaino_sync_reorg_depth";
+
     /// The height zaino's finalised index has been **committed** to — written
     /// and fsynced. Set by the write path as each batch commits.
     pub(super) const FINALIZED_HEIGHT: &str = "zaino_sync_finalized_height";
-    /// The height zaino's sync loop has fetched and built to in memory, ahead of
-    /// the next commit by up to a full batch.
+    /// The height zaino's sync loop has built to in memory, ahead of the next
+    /// commit. Advances per block, so it moves between commits.
     pub(super) const FETCHED_HEIGHT: &str = "zaino_sync_fetched_height";
-    /// The height that write path is working towards.
+    /// What the write path is working towards: the tip minus zaino's
+    /// non-finalised reorg buffer. Completion is measured against this, never
+    /// the raw tip — the finalised index is *designed* to trail it.
     pub(super) const TARGET_HEIGHT: &str = "zaino_sync_target_height";
     pub(super) const CHAIN_TIP: &str = "zaino_chain_tip_height";
-    /// Cumulative per-op work the index has absorbed.
-    pub(super) const SAPLING_OUTPUTS: &str = "zaino_sync_sapling_outputs_total";
+
+    // Throughput, per value pool. Cumulative on the wire so a rate can be
+    // derived over any window; every ztest surface differences before rendering.
+    pub(super) const TRANSACTIONS: &str = "zaino_sync_transactions_total";
+    pub(super) const TRANSPARENT_OPS: &str = "zaino_sync_transparent_ops_total";
+    pub(super) const SAPLING_OPS: &str = "zaino_sync_sapling_ops_total";
     pub(super) const ORCHARD_ACTIONS: &str = "zaino_sync_orchard_actions_total";
+    pub(super) const IRONWOOD_ACTIONS: &str = "zaino_sync_ironwood_actions_total";
+
+    /// Wall-clock per block, end to end (validator round trips + parse).
+    pub(super) const BLOCK_BUILD: &str = "zaino_sync_block_build_seconds";
+    /// The validator round trips alone. `build - fetch` is zaino's own parse
+    /// cost, which is the number that says whether a slow sync is zaino's fault.
+    pub(super) const BLOCK_FETCH: &str = "zaino_sync_block_fetch_seconds";
+    /// Per committed batch, including the fsync.
+    pub(super) const BATCH_WRITE: &str = "zaino_sync_batch_write_seconds";
+
+    /// Bytes the LMDB environment occupies. Against host RAM this is where the
+    /// write path's B-tree behaviour changes character.
+    pub(super) const DB_USED_BYTES: &str = "zaino_db_used_bytes";
 }
 
 /// What zaino publishes, in report order.
@@ -794,38 +815,124 @@ mod family {
 /// six lines, and eighty lines of vertical `row(` calls is unreadable for the one
 /// thing a reader comes here to do — scan the columns.
 #[rustfmt::skip]
-pub const ROWS: [Row; 15] = [
-    // Inbound gRPC — zaino's serving surface.
-    row("gRPC requests", family::GRPC_REQUESTS, Reduce::Sum, LIVE),
+pub const ROWS: [Row; 11] = [
+    // Inbound gRPC — zaino's serving surface. No request-count row: the latency
+    // histogram's `_count` already is the volume.
     row("gRPC errors", family::GRPC_ERRORS, Reduce::Sum, AT_REST),
     row("gRPC mean latency (ms)", family::GRPC_LATENCY, Reduce::MeanMs, LIVE),
-    // Outbound JSON-RPC — zaino → validator.
-    row("outbound RPC requests", family::RPC_OUTBOUND, Reduce::Sum, AT_REST),
+    // The one upstream signal `block fetch` does not already carry, and the one
+    // that is directly actionable: rising retries mean the validator is saturated,
+    // so adding concurrency makes throughput worse rather than better.
     row("outbound RPC retries", family::RPC_RETRIES, Reduce::Sum, AT_REST),
-    // Sync health.
-    row("sync lag (blocks)", family::SYNC_LAG, Reduce::Max, LIVE),
-    row("reorgs", family::REORGS, Reduce::Sum, LIVE),
-    row("sync errors", family::SYNC_ERRORS, Reduce::Sum, AT_REST),
-    row("reached tip (1=yes)", family::REACHED_TIP, Reduce::Max, AT_REST),
-    // Indexed work — throughput evidence, and the per-op vector the sync subject
-    // below reports as its `Work`. Sapling sits beside orchard because a `Work`
-    // that measures one pool and not the other reads as a chain with no sapling
-    // activity rather than as a metric nobody wired.
-    row("transactions indexed", family::TRANSACTIONS, Reduce::Sum, LIVE),
-    row("sapling outputs", family::SAPLING_OUTPUTS, Reduce::Sum, AT_REST),
-    row("orchard actions", family::ORCHARD_ACTIONS, Reduce::Sum, AT_REST),
+    // Sync health. How far the index is behind is `chain tip - finalized height`,
+    // derived from the two rows below: zaino deliberately exports no pre-derived
+    // lag gauge, because the scope that knows the tip does not know the committed
+    // height and the gauge that used to live there reported a constant.
+    row("reorg depth (blocks)", family::REORG_DEPTH, Reduce::Max, LIVE),
+    // Per-block cost, which is what a tuning pass acts on. The cumulative per-pool
+    // op totals are deliberately *not* rows: zaino publishes them as counters so a
+    // rate can be derived, and the derived rate is what the work column and the
+    // `perf` table already show. A "42,910,338 sapling outputs" line answers no
+    // question a reader has — it is the integral of the number they wanted.
+    //
+    // `fetch` is broken out of `build` because they have different remedies: the
+    // fetch is the validator's time, `build - fetch` is zaino's own parse cost.
+    row("block build mean (ms)", family::BLOCK_BUILD, Reduce::MeanMs, LIVE),
+    row("block fetch mean (ms)", family::BLOCK_FETCH, Reduce::MeanMs, LIVE),
+    row("batch write mean (ms)", family::BATCH_WRITE, Reduce::MeanMs, AT_REST),
+    // Where the database is against host RAM — the write path is built around
+    // B-tree behaviour once it no longer fits, and nothing else sees that crossing.
+    row("db used (bytes)", family::DB_USED_BYTES, Reduce::Max, AT_REST),
     // Chain position. `finalized_height` is live because it is the *only*
     // trustworthy read of how far zaino's own index has got: every other height
     // it serves can be answered by the validator it proxies while indexing, so
     // none of them can gate on the index.
     row("finalized height", family::FINALIZED_HEIGHT, Reduce::Max, LIVE),
-    // Beside it because the *gap* is the diagnostic: zaino commits in batches of
-    // ~100k blocks, so this runs up to a whole batch ahead of what is durably
-    // indexed. A report showing only one of the two cannot distinguish "slow to
-    // fetch" from "fetching fine, not committing".
+    // Beside it because the *gap* is the diagnostic: zaino commits at most once
+    // per `sync_checkpoint_interval` (120 s by default), so this runs ahead of
+    // what is durably indexed. A report showing only one of the two cannot
+    // distinguish "slow to fetch" from "fetching fine, not committing".
     row("fetched height", family::FETCHED_HEIGHT, Reduce::Max, LIVE),
     row("chain tip height", family::CHAIN_TIP, Reduce::Max, LIVE),
 ];
+
+/// The op each pool's counter stands for.
+///
+/// Zaino counts per *pool*, not per op (see the [`SyncSubject`] impl), so each
+/// pool total is carried on the op that stands for its channel and the pool's
+/// other ops are left unmeasured. Stated once, and read by both the per-tick
+/// [`progress`](SyncSubject::progress) and the [`Observe`] impl below, so the
+/// work a probe gates on and the work a panel draws cannot come from different
+/// families.
+const POOL_OPS: [(Op, &str); 4] = [
+    (Op::TransparentOut, family::TRANSPARENT_OPS),
+    (Op::SaplingOutput, family::SAPLING_OPS),
+    (Op::OrchardAction, family::ORCHARD_ACTIONS),
+    (Op::IronwoodAction, family::IRONWOOD_ACTIONS),
+];
+
+/// Cumulative per-pool work in one already-scraped exposition.
+///
+/// Only the ops zaino counts are `set`, so a probe reading one it does not
+/// publish panics via [`Work::require`] rather than comparing zeroes.
+/// `Op::SproutJoinSplit` is absent on purpose and must stay absent: the compact
+/// model zaino indexes carries no JoinSplits, so a pre-Sapling range has
+/// *unmeasured* sprout work, not zero sprout work.
+fn work_of(exposition: &Exposition) -> Work {
+    let mut work = Work::ZERO;
+    for (op, family) in POOL_OPS {
+        if let Some(n) = exposition.counter_total(family) {
+            work.set(op, n);
+        }
+    }
+    work
+}
+
+/// Zaino as a live display sees it, from outside the cluster.
+///
+/// The panel used to reach into a [`Reading`](crate::metrics::Reading) by
+/// display label, which let it ask for labels [`ROWS`] does not publish: the
+/// lookup returned `None` and rendered as an em-dash indistinguishable from a
+/// value that had not arrived yet. Resolving the families here, in the module
+/// that owns them, makes that class of mistake a compile error instead.
+impl Observe for ZainoIndexer {
+    fn observe(exposition: &Exposition) -> Option<Observation> {
+        let work = work_of(exposition);
+        // The counters are pre-created at zero by zaino's exporter, so their
+        // presence is what separates this component's exposition from another's
+        // — before a single block has been indexed and before any gauge is set.
+        if work.known().is_empty() {
+            return None;
+        }
+        let mean = |family| exposition.reduce(family, Reduce::MeanMs);
+        let (fetch_ms, build_ms) = (mean(family::BLOCK_FETCH), mean(family::BLOCK_BUILD));
+        // Clamped at zero rather than reported negative: the two summaries are
+        // scraped together but observed by different code paths, so a fetch that
+        // straddles the scrape can exceed the build it belongs to.
+        let parse_ms = build_ms
+            .zip(fetch_ms)
+            .map(|(build, fetch)| (build - fetch).max(0.0));
+        Some(Observation {
+            // Fetched first, where `progress` below prefers finalized: a probe
+            // must gate on what is durable, and a display must move per block.
+            // `finalized` advances only as a batch commits — 120 s by default —
+            // and a frontier that steps once a minute cannot carry a
+            // per-second rate.
+            height: exposition
+                .height_gauge(family::FETCHED_HEIGHT)
+                .or_else(|| exposition.height_gauge(family::FINALIZED_HEIGHT)),
+            target: exposition
+                .height_gauge(family::TARGET_HEIGHT)
+                .filter(|&t| t > 0),
+            work,
+            cost: Cost {
+                fetch_ms,
+                parse_ms,
+                grpc_ms: mean(family::GRPC_LATENCY),
+            },
+        })
+    }
+}
 
 /// Per-tick scrape bound. A probe's reading must not outlive the tick that
 /// asked for it, and the engine's base tick is seconds — so a target that has
@@ -885,25 +992,44 @@ impl ZainoIndexer {
 /// work counters and the target from the *same* scrape, and a second round trip
 /// for the height would read a different instant than the counters beside it.
 fn frontier_of(exporter: &Exposition, op: &'static str) -> Result<u32, RpcError> {
-    // An absent gauge is not height zero. It means this pod publishes no index
-    // metrics — an image built without a Prometheus feature — and answering with
-    // a zero would report an unobservable index as an empty one: a subject would
-    // start at the bottom of a chain it will never climb, and a comparison would
-    // read the other indexer as having stored nothing.
-    exporter
-        .height_gauge(family::FINALIZED_HEIGHT)
-        .ok_or_else(|| {
-            RpcError::decode(
-                COMPONENT,
-                op,
-                format!(
-                    "{} is absent from this pod's exporter, so how far its index has been \
-                     written cannot be observed: build the image with a Prometheus-metrics \
-                     feature",
-                    family::FINALIZED_HEIGHT
-                ),
+    if let Some(h) = exporter.height_gauge(family::FINALIZED_HEIGHT) {
+        return Ok(h);
+    }
+    // No commit has landed yet. Zaino sets `finalized_height` only as a batch
+    // commits — at most once per `sync_checkpoint_interval` (120 s by default) —
+    // and deliberately does not pre-zero its gauges, because a zeroed height
+    // claims a tip at genesis. So for the first minutes of any sync the gauge is
+    // simply absent while the index is being built perfectly normally.
+    //
+    // `fetched_height` is the frontier in that window: set per block on the
+    // ingest path, so it is present from the first block and is still a reading
+    // no proxied validator can answer on zaino's behalf. It runs ahead of what
+    // is durable, which is the honest answer to "how far has this got".
+    if let Some(h) = exporter.height_gauge(family::FETCHED_HEIGHT) {
+        return Ok(h);
+    }
+    // Both absent. Counters *are* pre-created at zero by zaino's exporter
+    // (gauges are not), so a present counter proves the metrics feature is on
+    // and separates a genuinely unobservable pod from one that is merely early.
+    let has_metrics = exporter.counter_total(family::TRANSACTIONS).is_some();
+    Err(RpcError::decode(
+        COMPONENT,
+        op,
+        if has_metrics {
+            format!(
+                "this pod publishes work counters but neither {} nor {}, so how far its index \
+                 has got cannot be observed — the sync loop has not built a single block yet, \
+                 or this build sets neither gauge",
+                family::FINALIZED_HEIGHT,
+                family::FETCHED_HEIGHT,
             )
-        })
+        } else {
+            format!(
+                "{COMPONENT} publishes no index metrics at all, so how far its index has been \
+                 written cannot be observed: build the image with a Prometheus-metrics feature"
+            )
+        },
+    ))
 }
 
 /// Observing zaino means watching how fast it **ingests** the chain behind it,
@@ -933,15 +1059,14 @@ impl SyncSubject for ZainoIndexer {
     async fn progress(&self) -> Result<ZainoSyncProgress, RpcError> {
         let exporter = self.exporter().await?;
         let height = frontier_of(&exporter, "progress")?;
-        let mut work = Work::ZERO;
-        // Only the ops zaino counts are `set`, so a probe reading one it does
-        // not publish panics via `Work::require` rather than comparing zeroes.
-        if let Some(n) = exporter.counter_total(family::SAPLING_OUTPUTS) {
-            work.set(Op::SaplingOutput, n);
-        }
-        if let Some(n) = exporter.counter_total(family::ORCHARD_ACTIONS) {
-            work.set(Op::OrchardAction, n);
-        }
+        // Zaino counts per *pool*, not per op: it stores operations rather than
+        // verifying them, so a transparent input and output cost it the same and
+        // it publishes one counter for the pair. The cost is that a single op is
+        // *not* separately readable for this subject — `Op::SaplingOutput` here
+        // means "all Sapling operations", so it must not be compared op-for-op
+        // against a wallet subject that really does count trial-decryption
+        // targets. Compare these at channel granularity.
+        let work = work_of(&exporter);
         Ok(ZainoSyncProgress {
             height,
             // The target the write path is working towards. A zero is zaino not

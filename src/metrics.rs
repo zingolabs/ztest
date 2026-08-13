@@ -307,6 +307,16 @@ pub trait Exporter: Send + Sync + 'static {
         &[]
     }
 
+    /// Which component this is scraping — its `ztest.io/component` label.
+    ///
+    /// `None` until a target has been resolved. A caller needs it to ask the
+    /// backends what one of this component's expositions *means*, which is the
+    /// same dispatch [`rows`](Self::rows) is resolved through and the reason
+    /// neither is a table in this module.
+    fn component(&self) -> Option<String> {
+        None
+    }
+
     /// Scrape this component once, now.
     ///
     /// For a caller that needs a reading synchronously rather than a stream of
@@ -338,10 +348,11 @@ pub struct PodExporter {
     category: String,
     rows_for: fn(&str) -> &'static [Row],
     target: Mutex<Option<Target>>,
-    /// Latched at first resolve. `rows()` is sync (a renderer calls it per
-    /// frame) so it cannot await the lock; the component behind a category does
-    /// not change within a run, which is what makes latching correct.
-    latched: std::sync::RwLock<&'static [Row]>,
+    /// Latched at first resolve: the component behind the category, and the
+    /// rows it publishes. Both reads are sync (a renderer makes them per frame)
+    /// so neither can await the target lock; the component behind a category
+    /// does not change within a run, which is what makes latching correct.
+    latched: std::sync::RwLock<(Option<String>, &'static [Row])>,
 }
 
 /// The pod currently being scraped and the forwarder that reaches it.
@@ -372,7 +383,7 @@ impl PodExporter {
             category: category.into(),
             rows_for,
             target: Mutex::new(None),
-            latched: std::sync::RwLock::new(&[]),
+            latched: std::sync::RwLock::new((None, &[])),
         }
     }
 
@@ -425,7 +436,8 @@ impl Exporter for PodExporter {
                 reason: format!("portforward to {pod}:{port}: {e}"),
             })?;
             *target = Some(Target { pod, forwarder });
-            *self.latched.write().expect("rows lock poisoned") = (self.rows_for)(&component);
+            *self.latched.write().expect("latch poisoned") =
+                (Some(component.clone()), (self.rows_for)(&component));
         }
         let local = target
             .as_ref()
@@ -439,7 +451,11 @@ impl Exporter for PodExporter {
     }
 
     fn rows(&self) -> &'static [Row] {
-        *self.latched.read().expect("rows lock poisoned")
+        self.latched.read().expect("latch poisoned").1
+    }
+
+    fn component(&self) -> Option<String> {
+        self.latched.read().expect("latch poisoned").0.clone()
     }
 }
 
@@ -506,22 +522,28 @@ impl Sample {
                 value: self.value(r),
             })
             .collect();
-        // Why the values are missing is this plane's own knowledge — only the
-        // reader knows whether it never resolved a target, could not reach one,
-        // or reached one that publishes nothing. A renderer handed blank rows
-        // would have to guess, and a caller asked to classify it would be
-        // re-deriving what is already known here.
-        let note = match (&self.error, self.at) {
+        let note = self.note(values.iter().any(|v| v.value.is_some()));
+        Reading { values, note }
+    }
+
+    /// Why this sample carries nothing a reader can show, when it doesn't.
+    ///
+    /// Only this plane can tell "never resolved a target" from "could not reach
+    /// one" from "reached one that publishes nothing", so a renderer handed
+    /// blank rows must not be left to guess. `published` is the caller's own
+    /// answer to whether it found any value it wanted — the families a reader
+    /// asks for are its business, not this type's.
+    pub fn note(&self, published: bool) -> Option<String> {
+        match (&self.error, self.at) {
             (None, None) => Some("no metrics-exposing pod yet".to_string()),
             (Some(why), None) => Some(format!("resolving target · {why}")),
             (Some(why), Some(_)) => Some(format!("unavailable · {why}")),
-            (None, Some(_)) if values.iter().all(|v| v.value.is_none()) => Some(format!(
+            (None, Some(_)) if !published => Some(format!(
                 "scraping every {}s · no series published yet",
                 LIVE_PERIOD.as_secs()
             )),
             (None, Some(_)) => None,
-        };
-        Reading { values, note }
+        }
     }
 }
 
@@ -597,19 +619,27 @@ impl Poller {
         self.exporter.rows()
     }
 
-    /// Wait for the next reading — always the newest: a caller that falls behind
-    /// skips stale readings rather than working through a backlog, which is what
+    /// The component being scraped, once resolved. See
+    /// [`Exporter::component`].
+    pub fn component(&self) -> Option<String> {
+        self.exporter.component()
+    }
+
+    /// Wait for the next sample — always the newest: a caller that falls behind
+    /// skips stale samples rather than working through a backlog, which is what
     /// a live reader wants.
+    ///
+    /// The whole sample, not a [`Reading`] of it: a rate is a function of two
+    /// samples, so a caller deriving one needs both the exposition and the
+    /// instant it was taken. Callers that want the labelled projection call
+    /// [`Sample::reading`] with [`rows`](Self::rows).
     ///
     /// Cancel-safe, so it can sit in a `select!` arm. Once the poll task is gone
     /// this never completes, deliberately: an arm that resolved instantly
     /// forever would spin its loop.
-    pub async fn changed(&mut self) -> Reading {
+    pub async fn changed(&mut self) -> Sample {
         match self.rx.changed().await {
-            Ok(()) => {
-                let sample = self.rx.borrow_and_update().clone();
-                sample.reading(self.exporter.rows())
-            }
+            Ok(()) => self.rx.borrow_and_update().clone(),
             Err(_) => std::future::pending().await,
         }
     }

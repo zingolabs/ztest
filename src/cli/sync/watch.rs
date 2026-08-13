@@ -17,11 +17,11 @@ use kube::api::{Api, ListParams, LogParams};
 use owo_colors::OwoColorize as _;
 
 use crate::cli::console::{Console, SceneFrame};
-use crate::metrics::{PodExporter, Poller, Reading};
+use crate::metrics::{PodExporter, Poller, Sample};
 use crate::resource::impls::policy::RUN_NAMESPACE;
-use crate::sync::{SyncEvent, decode_event, driver_pod_for, namespace_for};
+use crate::sync::{SyncEvent, Window, decode_event, driver_pod_for, namespace_for, plot_channels};
 use crate::ui::{
-    ProbeRow, SetupStep, SyncVitals, SyncWatchState, Theme, render_sync_metrics,
+    ProbeRow, SetupStep, SyncVitals, SyncWatchState, Theme, render_sync_cost,
     render_sync_watch_panel, render_sync_work,
 };
 
@@ -133,21 +133,21 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
         row_of(&pod).2,
     );
 
-    // Three views on one screen, in decreasing liveness: the sync feed (left),
-    // the driver's own per-pool work rates (middle), and the exporter's counters
-    // (right). The first two come from the driver's event stream and the third
-    // from a controller-side scrape — none reads another's state, and on a
-    // terminal too narrow for three the counters are the column that goes.
-    let render = |feed: &Feed, metrics: &Reading| {
-        let (state, theme, metrics) = (feed.state.clone(), theme.clone(), metrics.clone());
+    // Three views on one screen over one clock: chain position and pace (left),
+    // per-pool work rates (middle), and where the per-block time goes (right).
+    // All three are derived from the same once-a-second scrape, so no two
+    // columns can describe different instants — and on a terminal too narrow for
+    // three, the cost column is the one that goes.
+    let render = |feed: &Feed| {
+        let (state, theme) = (feed.state.clone(), theme.clone());
         console.scene(move |elapsed| SceneFrame {
             left: render_sync_watch_panel(&state, elapsed, &theme),
-            mid: Some(render_sync_work(&state, &theme)),
-            right: render_sync_metrics(&metrics, &theme),
+            mid: Some(render_sync_work(&state, elapsed, &theme)),
+            right: render_sync_cost(&state, &theme),
             live: None,
         });
     };
-    render(&feed, &Reading::default());
+    render(&feed);
 
     // Scraped controller-side, for as long as this attach lasts: the exporter is
     // the only source with sub-scrape-interval resolution, and a watcher that
@@ -166,6 +166,7 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
         crate::metrics::LIVE_PERIOD,
     );
 
+    feed.observed = true;
     let tail = tail_loop(
         Followed {
             driver: &driver,
@@ -236,18 +237,16 @@ async fn tail_loop(
     session_start: Instant,
     feed: &mut Feed,
     theme: &Theme,
-    render: impl Fn(&Feed, &Reading),
+    render: impl Fn(&Feed),
 ) -> Result<(), String> {
     let Followed { driver, sut: api } = followed;
-    // The metrics view, held beside the sync feed and folded independently of it.
-    let mut metrics_view = Reading::default();
     // The last cause shown, so a standing condition is stated once rather than
     // once a second.
     let mut last_note: Option<String> = None;
 
     let started = open_driver_log(driver, &|| console.cancelled(), |phase| {
         feed.state.pod_phase = phase;
-        render(feed, &Reading::default());
+        render(feed);
     })
     .await?;
     let Some(mut driver_log) = started else {
@@ -274,7 +273,7 @@ async fn tail_loop(
         // Set by the stream branches; applied after the `select!` so no handler
         // mutates what another branch is borrowing.
         let (mut close_sut, mut lost_driver) = (false, false);
-        let mut next_reading: Option<Reading> = None;
+        let mut next_sample: Option<Sample> = None;
         tokio::select! {
             line = driver_log.next() => match line {
                 Some(Ok(l)) => {
@@ -282,7 +281,7 @@ async fn tail_loop(
                     if let Some(text) = feed.absorb(&l, session_start.elapsed(), theme) {
                         console.scrollback(prefixed("driver", &text, theme));
                     }
-                    render(feed, &metrics_view);
+                    render(feed);
                 }
                 Some(Err(_)) | None => lost_driver = true,
             },
@@ -295,18 +294,18 @@ async fn tail_loop(
                 // or one still being replaced): drop it and let the poll reopen.
                 Some(Err(_)) | None => close_sut = true,
             },
-            reading = metrics.changed() => {
+            sample = metrics.changed() => {
                 // Applied after the `select!` for the same reason the flags above
-                // are: `metrics` is borrowed by this arm's future, so the render
+                // are: `metrics` is borrowed by this arm's future, so the fold
                 // that consumes it cannot run inside the arm.
-                next_reading = Some(reading);
+                next_sample = Some(sample);
             }
             _ = ticker.tick() => {
                 if let Ok(Some(pod)) = driver.get().await {
                     let phase = driver_phase(&pod);
                     if phase != feed.state.pod_phase {
                         feed.state.pod_phase = phase;
-                        render(feed, &metrics_view);
+                        render(feed);
                     }
                 }
                 if sut.is_none()
@@ -329,17 +328,19 @@ async fn tail_loop(
                 }
             }
         }
-        if let Some(reading) = next_reading {
+        if let Some(sample) = next_sample {
+            let component = metrics.component();
+            feed.observe(&sample, component.as_deref(), session_start.elapsed());
             // The panel names the cause itself; scrollback carries it too, once,
             // so a condition that later clears still left a trace in the log.
-            if reading.note != last_note
-                && let Some(note) = &reading.note
+            let note = feed.state.metrics_note.clone();
+            if note != last_note
+                && let Some(note) = &note
             {
                 console.scrollback(prefixed("ztest", &format!("live metrics: {note}"), theme));
             }
-            last_note = reading.note.clone();
-            metrics_view = reading;
-            render(feed, &metrics_view);
+            last_note = note;
+            render(feed);
         }
         if close_sut {
             sut = None;
@@ -596,6 +597,30 @@ const STATUS_TAIL_LINES: i64 = 400;
 pub(super) struct Feed {
     pub(super) state: SyncWatchState,
     rate: RateMeter,
+    /// Whether a live scrape of the subject is feeding this panel.
+    ///
+    /// When it is, the driver's five-second tick stops writing the vitals and
+    /// contributes only what the exporter cannot know — the engine's phase and
+    /// reorg depth. Two writers on one set of numbers would flip the panel
+    /// between a 1 s reading and a 5 s one every tick, and the reader would have
+    /// no way to tell which they were looking at. `ztest sync status` folds the
+    /// same events with nothing to scrape, and keeps the tick-fed path.
+    pub(super) observed: bool,
+    /// The trailing window every displayed rate is measured across.
+    window: Window,
+    /// Second-by-second rates, for the panel's sparklines. Built here rather
+    /// than taken from the driver's `Series` event, which republishes once a
+    /// minute — a sparkline 60× coarser than the number beside it is a different
+    /// measurement wearing the same label.
+    series: crate::sync::Timeline,
+    /// The instant of the newest scrape folded. The window only ever moves
+    /// forward: a failed scrape re-sends the last good exposition, which must
+    /// not be differenced against itself as if it were new data and read as a
+    /// stall that never happened.
+    observed_at: Option<Instant>,
+    /// Engine state the exporter does not publish, carried across ticks.
+    phase: String,
+    reorg_depth: u32,
     /// Sequence of the newest event folded. A stream resumed after a dropped
     /// connection replays by time, so it can hand back events already counted;
     /// this is what keeps the fold exactly-once across that overlap.
@@ -613,8 +638,72 @@ impl Feed {
                 ..Default::default()
             },
             rate: RateMeter::default(),
+            observed: false,
+            window: Window::new(crate::metrics::LIVE_PERIOD),
+            series: crate::sync::Timeline::new(plot_channels(), crate::metrics::LIVE_PERIOD),
+            observed_at: None,
+            phase: String::new(),
+            reorg_depth: 0,
             folded_through: None,
         }
+    }
+
+    /// Fold one scrape of the subject's exporter into the panel's vitals.
+    ///
+    /// The whole live display hangs off this: heights, pace, per-pool rates and
+    /// per-block cost all come from the same exposition, so the panel cannot
+    /// show two columns describing different instants.
+    fn observe(&mut self, sample: &Sample, component: Option<&str>, elapsed: Duration) {
+        let fresh = sample
+            .at
+            .filter(|at| self.observed_at.is_none_or(|folded| *at > folded))
+            .zip(component)
+            .and_then(|(at, name)| Some((at, crate::backends::observe(name, &sample.exposition)?)));
+
+        if let Some((at, observation)) = fresh {
+            self.observed_at = Some(at);
+            self.window.push(at, observation);
+            self.state.vitals = self.vitals(elapsed);
+            self.record_series(elapsed);
+        }
+        self.state.metrics_note = sample.note(self.state.vitals.is_some());
+    }
+
+    /// The vitals as the newest scrape and the window over it report them.
+    fn vitals(&self, elapsed: Duration) -> Option<SyncVitals> {
+        let observation = self.window.latest()?;
+        let rate = self.window.work_rate();
+        let blocks_per_sec = self.window.blocks_per_sec();
+        Some(SyncVitals {
+            height: observation.height.unwrap_or(0),
+            target: observation.target,
+            pct: observation.pct(),
+            phase: self.phase.clone(),
+            reorg_depth: self.reorg_depth,
+            blocks_per_sec,
+            eta: eta(
+                observation.height.unwrap_or(0),
+                observation.target,
+                blocks_per_sec,
+            ),
+            work_rate: rate.and_then(|r| r.total()),
+            pool_rates: rate.map(|r| r.channels().to_vec()).unwrap_or_default(),
+            cost: observation.cost,
+            received_at: elapsed,
+        })
+    }
+
+    /// Append this second's rates to the sparkline series. Unmeasured channels
+    /// contribute a gap rather than a zero: a pool nobody counted must not draw
+    /// a floor through the graph.
+    fn record_series(&mut self, elapsed: Duration) {
+        let Some(vitals) = &self.state.vitals else {
+            return;
+        };
+        let mut values = vec![vitals.blocks_per_sec];
+        values.extend(vitals.pool_rates.iter().map(|(_, rate)| *rate));
+        self.series.push(elapsed, &values);
+        self.state.timeline = Some(self.series.clone());
     }
 
     /// Take one driver log line. Returns the text to commit to scrollback, or
@@ -700,24 +789,35 @@ impl Feed {
                 ))
             }
             SyncEvent::Tick(t) => {
+                // The engine's own state, which no exporter publishes and every
+                // path therefore needs from here.
+                self.phase = t.phase.clone();
+                self.reorg_depth = t.reorg_depth;
+                if let Some(vitals) = &mut self.state.vitals {
+                    vitals.phase = t.phase.clone();
+                    vitals.reorg_depth = t.reorg_depth;
+                }
                 // Rate is measured on the *driver's* clock, not arrival time: the
                 // 200-line backfill on attach arrives in milliseconds, which as a
                 // wall-clock delta would read as a preposterous scan rate.
                 let rate = self
                     .rate
                     .sample(Duration::from_millis(t.elapsed_ms), t.height);
-                self.state.vitals = Some(SyncVitals {
-                    height: t.height,
-                    target: t.target,
-                    pct: t.pct,
-                    phase: t.phase.clone(),
-                    reorg_depth: t.reorg_depth,
-                    blocks_per_sec: rate,
-                    eta: eta(t.height, t.target, rate),
-                    work_rate: t.rate.total(),
-                    pool_rates: t.rate.channels().to_vec(),
-                    received_at: elapsed,
-                });
+                if !self.observed {
+                    self.state.vitals = Some(SyncVitals {
+                        height: t.height,
+                        target: t.target,
+                        pct: t.pct,
+                        phase: t.phase.clone(),
+                        reorg_depth: t.reorg_depth,
+                        blocks_per_sec: rate,
+                        eta: eta(t.height, t.target, rate),
+                        work_rate: t.rate.total(),
+                        pool_rates: t.rate.channels().to_vec(),
+                        cost: crate::sync::Cost::default(),
+                        received_at: elapsed,
+                    });
+                }
                 verbose.then(|| {
                     let of = t.target.map(|t| format!("/{t}")).unwrap_or_default();
                     format!(
@@ -730,8 +830,14 @@ impl Feed {
             // bucketing, and a controller stitching two publications together
             // would have to re-derive the coarsening it deliberately does not
             // own. A later publication is always the more complete one.
+            // Ignored while a live scrape is feeding the panel, which builds a
+            // second-by-second series of its own: the driver republishes this
+            // once a minute, and letting the two take turns would make the
+            // sparklines change resolution under the reader.
             SyncEvent::Series { timeline } => {
-                self.state.timeline = Some(timeline.clone());
+                if !self.observed {
+                    self.state.timeline = Some(timeline.clone());
+                }
                 None
             }
             SyncEvent::Probes { board } => {
@@ -819,7 +925,6 @@ impl RateMeter {
 mod tests {
     use super::*;
     use crate::sync::Op;
-    use crate::sync::ProbeState;
 
     fn feed() -> Feed {
         Feed::new(
@@ -828,6 +933,134 @@ mod tests {
             "crc".into(),
             "Running".into(),
         )
+    }
+
+    /// A zaino exposition at `height`, with `transparent` cumulative ops and a
+    /// per-block timing summary — the subset the panel resolves.
+    fn exposition(height: u32, transparent: u64) -> std::sync::Arc<crate::metrics::Exposition> {
+        let text = format!(
+            "# TYPE zaino_sync_fetched_height gauge\n\
+             zaino_sync_fetched_height {height}\n\
+             # TYPE zaino_sync_target_height gauge\n\
+             zaino_sync_target_height 1024\n\
+             # TYPE zaino_sync_transparent_ops_total counter\n\
+             zaino_sync_transparent_ops_total {transparent}\n\
+             # TYPE zaino_sync_block_build_seconds summary\n\
+             zaino_sync_block_build_seconds_sum 1.0\n\
+             zaino_sync_block_build_seconds_count 100\n\
+             # TYPE zaino_sync_block_fetch_seconds summary\n\
+             zaino_sync_block_fetch_seconds_sum 0.6\n\
+             zaino_sync_block_fetch_seconds_count 100\n"
+        );
+        let mut e = crate::metrics::Exposition::default();
+        e.absorb(&text);
+        std::sync::Arc::new(e)
+    }
+
+    fn sample(at: Instant, height: u32, transparent: u64) -> Sample {
+        Sample {
+            at: Some(at),
+            exposition: exposition(height, transparent),
+            error: None,
+        }
+    }
+
+    /// The whole live display in one path: two scrapes of a zaino exporter land,
+    /// and the panel gets a height, a scan rate, per-pool rates and the cost
+    /// split — none of it touching a metric name outside the backend.
+    #[test]
+    fn two_scrapes_become_the_panels_vitals() {
+        let mut f = feed();
+        f.observed = true;
+        let origin = Instant::now();
+
+        f.observe(&sample(origin, 900, 1_000), Some("zainod"), Duration::ZERO);
+        let first = f.state.vitals.as_ref().expect("a scrape is a reading");
+        assert_eq!(first.height, 900);
+        assert_eq!(first.target, Some(1024));
+        assert_eq!(
+            first.blocks_per_sec, None,
+            "one scrape cannot be a rate, and must not be shown as a zero"
+        );
+        assert_eq!(first.cost.fetch_ms, Some(6.0));
+        assert_eq!(
+            first.cost.parse_ms,
+            Some(4.0),
+            "build 10ms minus fetch 6ms is zaino's own per-block cost"
+        );
+
+        f.observe(
+            &sample(origin + Duration::from_secs(2), 1_000, 3_000),
+            Some("zainod"),
+            Duration::from_secs(2),
+        );
+        let v = f.state.vitals.as_ref().expect("still reading");
+        assert_eq!(v.height, 1_000);
+        assert_eq!(v.blocks_per_sec, Some(50.0), "100 blocks over 2s");
+        assert_eq!(
+            v.pool_rates
+                .iter()
+                .find(|(name, _)| *name == "transparent")
+                .map(|(_, r)| *r),
+            Some(Some(1_000.0)),
+            "2,000 transparent ops over 2s"
+        );
+        assert_eq!(
+            v.pool_rates
+                .iter()
+                .find(|(name, _)| *name == "orchard")
+                .map(|(_, r)| *r),
+            Some(None),
+            "a pool this exposition never published stays unmeasured"
+        );
+        assert!(f.state.timeline.is_some(), "the trend series is recorded");
+        assert!(f.state.metrics_note.is_none(), "nothing to explain away");
+    }
+
+    /// A failed scrape re-sends the last good exposition under its original
+    /// timestamp. Folding it again would difference a reading against itself and
+    /// report a stall that never happened.
+    #[test]
+    fn a_repeated_sample_is_not_folded_twice() {
+        let mut f = feed();
+        f.observed = true;
+        let origin = Instant::now();
+        let first = sample(origin, 900, 1_000);
+        f.observe(&first, Some("zainod"), Duration::ZERO);
+        f.observe(
+            &sample(origin + Duration::from_secs(1), 1_000, 2_000),
+            Some("zainod"),
+            Duration::from_secs(1),
+        );
+        let rate = f.state.vitals.as_ref().unwrap().blocks_per_sec;
+
+        // The poller re-sends the newest sample it holds, unchanged.
+        f.observe(&first, Some("zainod"), Duration::from_secs(2));
+        assert_eq!(
+            f.state.vitals.as_ref().unwrap().blocks_per_sec,
+            rate,
+            "a re-sent sample must leave the window untouched"
+        );
+    }
+
+    /// A driver tick must not write the vitals out from under the scrape that
+    /// owns them — the two are measured five seconds apart, and a panel that
+    /// alternated between them would show two different heights per tick.
+    #[test]
+    fn a_tick_contributes_only_what_the_exporter_cannot_publish() {
+        let mut f = feed();
+        f.observed = true;
+        f.observe(
+            &sample(Instant::now(), 900, 1_000),
+            Some("zainod"),
+            Duration::ZERO,
+        );
+        let tick = crate::sync::encode_event(&tick_at(1, 5, 0));
+        f.absorb(tick.trim_end(), Duration::ZERO, &theme());
+
+        let v = f.state.vitals.as_ref().expect("vitals");
+        assert_eq!(v.height, 900, "the scrape still owns the height");
+        assert_eq!(v.phase, "Historic", "the tick still owns the phase");
     }
 
     fn theme() -> Theme {
@@ -943,82 +1176,6 @@ mod tests {
         assert_eq!(v.blocks_per_sec, Some(10.0), "50 blocks in 5s");
         // 874 blocks left at 10 blk/s.
         assert_eq!(v.eta, Some(Duration::from_secs_f64(87.4)));
-    }
-
-    /// Backfilled lines all arrive at once, so a rate measured on arrival time
-    /// would be absurd; the driver's own tick clock is the only sound basis.
-    #[test]
-    fn rate_uses_the_drivers_clock_not_the_watchers() {
-        let mut f = feed();
-        let theme = theme();
-        // Two ticks 10s apart on the driver, delivered in the same instant here.
-        f.record(&tick_at(0, 100, 0), Duration::ZERO, &theme, false);
-        f.record(&tick_at(1, 200, 10_000), Duration::ZERO, &theme, false);
-        assert_eq!(
-            f.state.vitals.as_ref().unwrap().blocks_per_sec,
-            Some(10.0),
-            "100 blocks over the driver's 10s"
-        );
-    }
-
-    #[test]
-    fn a_reorg_does_not_produce_a_negative_rate() {
-        let mut f = feed();
-        let theme = theme();
-        f.record(&tick_at(0, 100, 0), Duration::ZERO, &theme, false);
-        f.record(&tick_at(1, 200, 5_000), Duration::ZERO, &theme, false);
-        f.record(&tick_at(2, 150, 10_000), Duration::ZERO, &theme, false);
-        let rate = f.state.vitals.as_ref().unwrap().blocks_per_sec.unwrap();
-        assert!(rate > 0.0, "rolled-back height yielded rate {rate}");
-    }
-
-    #[test]
-    fn a_violation_is_counted_and_kept_in_history() {
-        let mut f = feed();
-        let theme = theme();
-        let line = f.record(
-            &SyncEvent::Violation {
-                probe: "no_stall".into(),
-                height: Some(901),
-                detail: "liveness stall".into(),
-            },
-            Duration::ZERO,
-            &theme,
-            false,
-        );
-        assert_eq!(f.state.violations, 1);
-        let line = line.expect("a violation must reach scrollback");
-        assert!(line.contains("no_stall") && line.contains("901"), "{line}");
-    }
-
-    #[test]
-    fn the_worst_probe_is_the_one_nearest_failing() {
-        let mut f = feed();
-        f.state.probes = vec![
-            ProbeRow {
-                name: "height_monotonic".into(),
-                state: ProbeState::Ok,
-                since_satisfied: None,
-                window: None,
-            },
-            ProbeRow {
-                name: "nearly_stalled".into(),
-                state: ProbeState::Pending,
-                since_satisfied: Some(Duration::from_secs(25)),
-                window: Some(Duration::from_secs(30)),
-            },
-            ProbeRow {
-                name: "barely_late".into(),
-                state: ProbeState::Pending,
-                since_satisfied: Some(Duration::from_secs(6)),
-                window: Some(Duration::from_secs(300)),
-            },
-        ];
-        assert_eq!(f.state.probe_tally(), (1, 3));
-        assert_eq!(
-            f.state.worst_probe().map(|p| p.name.as_str()),
-            Some("nearly_stalled"),
-        );
     }
 
     fn driver_pod(phase: &str, state: serde_json::Value) -> Pod {
@@ -1211,17 +1368,5 @@ mod tests {
             serde_json::json!({ "running": { "startedAt": "2026-08-04T00:00:00Z" } }),
         );
         assert!(running(&live, DRIVER_CONTAINER));
-    }
-
-    #[test]
-    fn every_probe_satisfied_leaves_no_worst() {
-        let mut f = feed();
-        f.state.probes = vec![ProbeRow {
-            name: "ok".into(),
-            state: ProbeState::Ok,
-            since_satisfied: None,
-            window: None,
-        }];
-        assert!(f.state.worst_probe().is_none());
     }
 }
