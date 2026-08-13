@@ -1,7 +1,8 @@
-//! Keeping the recordings cache bounded. A best-effort GC runs after each new
-//! recording is created, pruning runs that exceed an age, count, or total-size
-//! budget — nextest's default retention (30 days / 100 runs / 1 GiB), newest
-//! kept. Also drives `ztest store prune`.
+//! Keeping the recordings cache bounded.
+//!
+//! - Best-effort GC after each new recording, pruning past an age/count/total-size budget
+//! - nextest's defaults (30 days / 100 runs / 1 GiB), newest kept
+//! - Also drives `ztest store prune`
 
 use std::fs;
 use std::path::Path;
@@ -9,14 +10,11 @@ use std::time::{Duration, SystemTime};
 
 use super::locate::{list_runs_in, workspace_records_dir};
 
-/// The retention budget. `None` on a field disables that limit.
+/// Retention budget; `None` on a field disables that limit
 #[derive(Debug, Clone)]
 pub struct RetentionPolicy {
-    /// Delete runs older than this.
     pub max_age: Option<Duration>,
-    /// Keep at most this many runs (newest).
     pub max_runs: Option<usize>,
-    /// Keep total compressed size under this.
     pub max_bytes: Option<u64>,
 }
 
@@ -30,9 +28,8 @@ impl Default for RetentionPolicy {
     }
 }
 
-/// Prune recordings for `workspace` that exceed `policy`, keeping the newest.
-/// Best-effort: a failure to list or delete is ignored (a stale run simply
-/// reappears in the next sweep). Returns the number of runs deleted.
+/// Prune recordings for `workspace` past `policy`, newest kept; returns the delete count.
+/// Best-effort — a failed list or delete is ignored (the stale run reappears next sweep)
 pub fn gc(workspace: &Path, policy: RetentionPolicy) -> usize {
     match workspace_records_dir(workspace) {
         Ok(root) => gc_in(&root, policy),
@@ -40,8 +37,7 @@ pub fn gc(workspace: &Path, policy: RetentionPolicy) -> usize {
     }
 }
 
-/// [`gc`] against a specific records-root directory. Factored out so tests can
-/// point at a temp directory instead of the real user cache.
+/// [`gc`] against a specific records-root → tests point at a temp dir, not the user cache
 pub fn gc_in(root: &Path, policy: RetentionPolicy) -> usize {
     let Ok(runs) = list_runs_in(root) else {
         return 0;
@@ -49,17 +45,14 @@ pub fn gc_in(root: &Path, policy: RetentionPolicy) -> usize {
     let now = SystemTime::now();
     let mut kept_bytes = 0u64;
     let mut deleted = 0;
-    // `runs` is newest-first, so index is the newest-rank and the size budget
-    // fills from the newest end.
+    // `runs` newest-first → index = newest-rank, and the size budget fills from that end
     for (rank, run) in runs.iter().enumerate() {
         let too_old = policy
             .max_age
             .is_some_and(|age| now.duration_since(run.modified).is_ok_and(|d| d > age));
         let over_count = policy.max_runs.is_some_and(|n| rank >= n);
         let size = dir_size(&run.dir);
-        let over_bytes = policy
-            .max_bytes
-            .is_some_and(|cap| kept_bytes.saturating_add(size) > cap);
+        let over_bytes = policy.max_bytes.is_some_and(|cap| kept_bytes.saturating_add(size) > cap);
 
         if too_old || over_count || over_bytes {
             if fs::remove_dir_all(&run.dir).is_ok() {
@@ -72,7 +65,7 @@ pub fn gc_in(root: &Path, policy: RetentionPolicy) -> usize {
     deleted
 }
 
-/// Total size in bytes of all files under `dir`.
+/// Total size in bytes of every file under `dir`
 pub fn dir_size(dir: &Path) -> u64 {
     walkdir::WalkDir::new(dir)
         .into_iter()
@@ -87,8 +80,7 @@ pub fn dir_size(dir: &Path) -> u64 {
 mod tests {
     use super::*;
 
-    /// A temp records-root with `n` complete run directories. A temp dir — NOT
-    /// the real user cache — so the suite never pollutes `~/.cache`.
+    /// Rooted in a temp dir, never the real user cache → the suite can't touch `~/.cache`
     fn root_with_runs(tag: &str, n: usize) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "ztest-retention-{tag}-{}-{}",
@@ -106,11 +98,7 @@ mod tests {
     #[test]
     fn max_runs_keeps_the_budget() {
         let root = root_with_runs("count", 5);
-        let policy = RetentionPolicy {
-            max_age: None,
-            max_runs: Some(2),
-            max_bytes: None,
-        };
+        let policy = RetentionPolicy { max_age: None, max_runs: Some(2), max_bytes: None };
         let deleted = gc_in(&root, policy);
         assert_eq!(deleted, 3, "5 runs, keep 2 → delete 3");
         assert_eq!(list_runs_in(&root).unwrap().len(), 2);
@@ -119,11 +107,7 @@ mod tests {
     #[test]
     fn no_limits_deletes_nothing() {
         let root = root_with_runs("nolimit", 3);
-        let policy = RetentionPolicy {
-            max_age: None,
-            max_runs: None,
-            max_bytes: None,
-        };
+        let policy = RetentionPolicy { max_age: None, max_runs: None, max_bytes: None };
         assert_eq!(gc_in(&root, policy), 0);
         assert_eq!(list_runs_in(&root).unwrap().len(), 3);
         fs::remove_dir_all(&root).ok();

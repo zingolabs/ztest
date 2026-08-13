@@ -1,142 +1,96 @@
-//! The broker's pure admission/scheduling core.
+//! The broker's pure admission core.
 //!
-//! [`Scheduler`] owns the live capacity model (one whole-cluster 4-D figure; no
-//! per-pool partition) and decides what to admit. Pure — no async/kube/clock/
-//! randomness, both the queue tiebreak and lease ids are monotonic counters — so
-//! the engine is a deterministic function of its inputs, testable without a
-//! cluster.
-//!
-//! Policy (`docs/design-qos.md` §5.5): greedy priority admission with backfill.
-//! Each pass scans the queue `(priority desc, seq asc)` and admits every request
-//! that fits live 4-D capacity and its SA's remaining budget, continuing past a
-//! non-fitting one so a smaller request backfills. A request that can't fit an
-//! empty cluster or exceeds its SA's whole budget is rejected (fail fast); one
-//! blocked only by contention or an SA at quota is queued. Deadlock-free: a
-//! queued request reserves nothing until one atomic [`Grant`] of its whole
-//! footprint (no hold-and-wait).
+//! - [`Scheduler`] owns one whole-cluster 4-D capacity figure (no per-pool partition)
+//! - Pure: no async/kube/clock/randomness (queue tiebreak + lease ids = monotonic counters)
+//!   → a deterministic function of its inputs, testable without a cluster
+//! - Policy (§5.5) = greedy priority admission with backfill: each pass scans
+//!   `(priority desc, seq asc)`, admitting what fits live capacity + the SA's remaining
+//!   budget and continuing past a non-fitting one so a smaller request backfills
+//! - Over empty-cluster capacity or over the SA's whole budget → rejected; blocked only by
+//!   contention or an SA at quota → queued
+//! - Deadlock-free: a queued request reserves nothing until one atomic [`Admitted`] of its
+//!   whole footprint (no hold-and-wait)
 
 use std::collections::HashMap;
 
 use super::Resources;
 
-/// The verdict of a single-request fit check.
+/// Pure single-request admission decision (`sa_budget` `None` = unlimited).
 ///
-/// The pure decision primitive used by the [`Scheduler`] over its own
-/// committed/usage state. `LeaseId`-free: minting a lease is the caller's job
-/// (an in-memory counter).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// Fits live free capacity and SA remaining budget; admit.
-    Fits,
-    /// Fits the cluster/SA maxima but not right now; wait.
-    Queue,
-    /// Unschedulable even on an empty cluster / against the whole SA budget.
-    Reject(RejectReason),
-}
-
-/// Pure single-request admission decision. `available` is the whole-cluster
-/// capacity, `committed` the sum of active leases, `sa_usage` the requesting
-/// SA's active usage, `sa_budget` its total budget (`None` = unlimited),
-/// `footprint` the request's reserve.
-///
-/// Reject conditions are checked against the maxima (independent of current
-/// load); the queue/fit split is checked against live free capacity and the
-/// SA's remaining budget: the two nested constraints of `docs/design-qos.md`
-/// §5.6.
+/// - Rejects checked against the maxima, independent of current load
+/// - Queue/fit split against live free capacity + the SA's remaining budget (§5.6)
 pub fn decide(
     available: Resources,
     committed: Resources,
     sa_usage: Resources,
     sa_budget: Option<Resources>,
     footprint: Resources,
-) -> Verdict {
+) -> Admission<()> {
     if !footprint.fits_within(&available) {
-        return Verdict::Reject(RejectReason::ExceedsClusterCapacity);
+        return Admission::Rejected(RejectReason::ExceedsClusterCapacity);
     }
     if let Some(budget) = sa_budget
         && !footprint.fits_within(&budget)
     {
-        return Verdict::Reject(RejectReason::ExceedsSaBudget);
+        return Admission::Rejected(RejectReason::ExceedsSaBudget);
     }
     if !footprint.fits_within(&available.saturating_sub(&committed)) {
-        return Verdict::Queue;
+        return Admission::Queued;
     }
     if let Some(budget) = sa_budget
         && !footprint.fits_within(&budget.saturating_sub(&sa_usage))
     {
-        return Verdict::Queue;
+        return Admission::Queued;
     }
-    Verdict::Fits
+    Admission::Granted(())
 }
 
-/// An opaque, monotonically-assigned lease handle. Bound to one admitted
-/// test for the life of its topology; returned to the broker on release
-/// or disconnect.
+/// Opaque, monotonically-assigned lease handle, bound to one admitted test for the life
+/// of its topology
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LeaseId(pub u64);
+pub struct SlotId(pub u64);
 
-/// A resolved admission request. The caller (the shell) has already lowered a
-/// [`super::QosClass`] to its `footprint`/`priority` via
-/// [`super::QosClass::profile`]; the scheduler operates on these resolved
-/// numbers, decoupled from the still-TBD reserve table (`docs/design-qos.md`
-/// §11). The tier's NVMe-vs-general placement rides on the pod specs
-/// (toleration/nodeSelector), not here. Identity (`binary_id`/`test_name`)
-/// comes from nextest's env vars (§5.4) and is echoed back in the [`Grant`] so
-/// the shell can message the right client on backfill.
+/// Resolved admission request: the caller already lowered a [`super::QosClass`] via
+/// [`super::QosClass::profile`], keeping the scheduler decoupled from the reserve table
+/// (§11). Pool placement rides on the pod specs, not here
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
-    /// nextest `NEXTEST_BINARY_ID`.
     pub binary_id: String,
-    /// nextest `NEXTEST_TEST_NAME`.
     pub test_name: String,
-    /// The ServiceAccount the run authenticated as (authz scope, §5.6).
     pub sa: String,
-    /// The namespace-aggregate reserve to schedule against.
     pub footprint: Resources,
-    /// Scheduling priority; higher admitted first.
     pub priority: u8,
 }
 
-/// A successful admission: the lease plus the test identity it belongs to, so
-/// the shell can send the grant to the correct client even when the admission
-/// happened during a backfill pass (not in direct reply to the test's own
-/// request).
+/// A successful admission. Carries the test identity so the shell routes a grant from a
+/// backfill pass — not a direct reply to that test's own request — to the right client
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Grant {
-    /// The lease the test now holds.
-    pub lease_id: LeaseId,
-    /// `NEXTEST_BINARY_ID` of the admitted test.
+pub struct Admitted {
+    pub slot_id: SlotId,
     pub binary_id: String,
-    /// `NEXTEST_TEST_NAME` of the admitted test.
     pub test_name: String,
 }
 
-/// The outcome the broker replies with for a [`Scheduler::request`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Admission {
-    /// Admitted now; the test may boot its topology.
-    Granted(LeaseId),
-    /// Fits in principle but blocked by current contention or an SA at quota;
-    /// the test waits and is admitted by a later backfill pass.
+/// Admission decision
+///
+/// - `Queued` = fits in principle, blocked by contention / SA at quota → backfilled later
+/// - Payload: slot from [`Scheduler::request`], `()` from [`decide`] (no identity minted)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission<T = SlotId> {
+    Granted(T),
     Queued,
-    /// Unschedulable; fail fast rather than park forever (§5.5/§5.6/§8).
     Rejected(RejectReason),
 }
 
-/// Why a request was rejected outright rather than queued.
+/// Rejected outright, not queued: the footprint alone tops the maximum, so no waiting
+/// drains it. `ExceedsSaBudget` extends §5.6's fail-fast to the budget dimension (the doc
+/// frames only the at-quota case, which stays a queue)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
-    /// The footprint exceeds the cluster's entire capacity in some dimension:
-    /// it could not fit even on an empty cluster.
     ExceedsClusterCapacity,
-    /// The footprint alone exceeds the ServiceAccount's total budget: it could
-    /// never fit even at zero usage. Extends §5.6's fail-fast principle to the
-    /// budget dimension (the doc frames the at-quota case as a queue, but an ask
-    /// larger than the whole budget can never drain).
     ExceedsSaBudget,
 }
 
-/// An active reservation tracked by the broker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Lease {
     binary_id: String,
@@ -145,37 +99,33 @@ struct Lease {
     footprint: Resources,
 }
 
-/// A pending request awaiting capacity, tagged with its arrival sequence for
-/// the FIFO tiebreak within a priority level.
+/// Request awaiting capacity; `seq` = arrival order, the FIFO tiebreak within a priority
 #[derive(Debug, Clone)]
 struct Pending {
     seq: u64,
     req: Request,
 }
 
-/// The broker's pure admission core. See the module docs for the policy.
+/// The broker's pure admission core; policy in the module docs.
+///
+/// - `available` = allocatable − external usage, as `reconcile` last set it
+/// - `committed` = Σ active-lease footprints
+/// - SA absent from `sa_budgets` = unlimited (the shell registers every authorized SA at
+///   startup, so an unregistered one is outside this core's authz scope, not denied)
 #[derive(Debug)]
 pub struct Scheduler {
-    /// Whole-cluster capacity: `available` is allocatable minus external
-    /// (non-ztest) usage (what `reconcile` updates); `committed` is the sum of
-    /// this broker's active-lease footprints.
     available: Resources,
     committed: Resources,
-    leases: HashMap<LeaseId, Lease>,
+    leases: HashMap<SlotId, Lease>,
     queue: Vec<Pending>,
-    /// Per-SA total budgets. An SA absent from this map is unlimited: the shell
-    /// registers every authorized SA at startup (§5.6), so an unregistered SA
-    /// is outside this core's authz scope rather than implicitly denied.
     sa_budgets: HashMap<String, Resources>,
     sa_usage: HashMap<String, Resources>,
     next_seq: u64,
-    next_lease_id: u64,
+    next_slot_id: u64,
 }
 
 impl Scheduler {
-    /// Build a scheduler over the cluster's initially-available capacity.
-    /// SA budgets default to empty (unlimited); register them with
-    /// [`Scheduler::set_sa_budget`].
+    /// SA budgets start empty (unlimited); register via [`Scheduler::set_sa_budget`]
     pub fn new(available: Resources) -> Self {
         Scheduler {
             available,
@@ -185,24 +135,19 @@ impl Scheduler {
             sa_budgets: HashMap::new(),
             sa_usage: HashMap::new(),
             next_seq: 0,
-            next_lease_id: 0,
+            next_slot_id: 0,
         }
     }
 
-    /// Register (or replace) a ServiceAccount's total budget (§5.6).
     pub fn set_sa_budget(&mut self, sa: impl Into<String>, budget: Resources) {
         self.sa_budgets.insert(sa.into(), budget);
     }
 
-    /// Submit a request. Rejects unschedulable asks outright; otherwise
-    /// enqueues and runs a schedule pass, returning [`Admission::Granted`]
-    /// if the request itself was admitted in that pass, else
-    /// [`Admission::Queued`].
+    /// Reject an unschedulable ask outright; else enqueue + run a pass, granting only if
+    /// *this* request was admitted in it
     pub fn request(&mut self, req: Request) -> Admission {
-        // Fail-fast checks against the theoretical maxima, before the request
-        // joins the queue. Shares the pure `decide` primitive with the
-        // decentralized allocator.
-        if let Verdict::Reject(reason) = decide(
+        // Fail-fast against the theoretical maxima, before joining the queue
+        if let Admission::Rejected(reason) = decide(
             self.available,
             self.committed,
             self.sa_usage(&req.sa),
@@ -217,27 +162,20 @@ impl Scheduler {
         let (binary_id, test_name) = (req.binary_id.clone(), req.test_name.clone());
         self.queue.push(Pending { seq, req });
 
-        // On a fresh enqueue, capacity has only shrunk (or held) since the last
-        // pass, so the only request that can newly fit is this one: a pass
-        // yields at most this grant. Match by identity in case that invariant
-        // ever changes.
+        // Capacity has only shrunk (or held) since the last pass → this is the only request
+        // that can newly fit. Matched by identity in case that invariant ever changes
         let grants = self.schedule_pass();
         assert!(grants.len() <= 1, "fresh enqueue admitted >1 request");
-        match grants
-            .into_iter()
-            .find(|g| g.binary_id == binary_id && g.test_name == test_name)
-        {
-            Some(g) => Admission::Granted(g.lease_id),
+        match grants.into_iter().find(|g| g.binary_id == binary_id && g.test_name == test_name) {
+            Some(g) => Admission::Granted(g.slot_id),
             None => Admission::Queued,
         }
     }
 
-    /// Release a lease on normal teardown, returning capacity to the cluster
-    /// and SA, then backfilling freed capacity. Returns the grants the freed
-    /// capacity newly admitted (e.g. testnet finishes, launch 2 basic). An
-    /// unknown lease id is a no-op.
-    pub fn release(&mut self, lease_id: LeaseId) -> Vec<Grant> {
-        let Some(lease) = self.leases.remove(&lease_id) else {
+    /// Return capacity to the cluster + SA, then backfill; returns the grants the freed
+    /// capacity newly admitted. Unknown lease id = no-op
+    pub fn release(&mut self, slot_id: SlotId) -> Vec<Admitted> {
+        let Some(lease) = self.leases.remove(&slot_id) else {
             return Vec::new();
         };
         self.committed = self.committed.saturating_sub(&lease.footprint);
@@ -250,65 +188,51 @@ impl Scheduler {
         self.schedule_pass()
     }
 
-    /// Crash-safety path (§5.4): a dropped socket means the test died without a
-    /// clean teardown. Identical to [`Scheduler::release`]: disconnect is
-    /// treated as release and capacity is reclaimed, so no reservation leaks.
-    pub fn disconnect(&mut self, lease_id: LeaseId) -> Vec<Grant> {
-        self.release(lease_id)
+    /// Crash-safety path (§5.4): a dropped socket = the test died without teardown, so
+    /// disconnect is a release and no reservation leaks
+    pub fn disconnect(&mut self, slot_id: SlotId) -> Vec<Admitted> {
+        self.release(slot_id)
     }
 
-    /// Update the cluster's available capacity from a fresh probe (§5.3
-    /// reconcile), then backfill if capacity grew. Capacity that shrank below
-    /// what is committed does not preempt running leases (no preemption in v1);
-    /// free floors at zero until they release.
-    pub fn reconcile(&mut self, new_available: Resources) -> Vec<Grant> {
+    /// Update available capacity from a fresh probe (§5.3), then backfill if it grew. A
+    /// shrink below `committed` never preempts; free floors at zero until leases release
+    pub fn reconcile(&mut self, new_available: Resources) -> Vec<Admitted> {
         self.available = new_available;
         self.schedule_pass()
     }
 
     // ── Inspection (tests + future live display) ───────────────────────
 
-    /// Free capacity: `available - committed`, floored at zero per
-    /// dimension.
     pub fn free(&self) -> Resources {
         self.available.saturating_sub(&self.committed)
     }
 
-    /// Sum of active-lease footprints currently committed.
     pub fn committed(&self) -> Resources {
         self.committed
     }
 
-    /// This run's total appetite: committed leases plus every queued request's
-    /// footprint. The cross-run governor sizes the run's live reservation to this
-    /// (capped by fair share and headroom) so a run reserves what it can actually
-    /// use — no more — leaving the rest for concurrent runs.
+    /// Committed leases + every queued request's footprint. The cross-run reconcile loop
+    /// caps the live reservation by this → a run reserves only what it can use
     pub fn demand(&self) -> Resources {
-        self.queue.iter().fold(self.committed, |acc, p| {
-            acc.saturating_add(&p.req.footprint)
-        })
+        self.queue.iter().fold(self.committed, |acc, p| acc.saturating_add(&p.req.footprint))
     }
 
-    /// Number of requests currently waiting for capacity.
     pub fn queue_len(&self) -> usize {
         self.queue.len()
     }
 
-    /// Number of active leases.
     pub fn active_leases(&self) -> usize {
         self.leases.len()
     }
 
-    /// An SA's current committed usage (zero if it holds nothing).
     pub fn sa_usage(&self, sa: &str) -> Resources {
         self.sa_usage.get(sa).copied().unwrap_or(Resources::ZERO)
     }
 
     // ── Internals ──────────────────────────────────────────────────────
 
-    /// `true` iff the request fits both live free capacity and its SA's
-    /// remaining budget right now. Delegates to [`decide`] so the resident and
-    /// decentralized paths never diverge.
+    /// Fits live free capacity *and* the SA's remaining budget. Via [`decide`], so the
+    /// resident and decentralized paths never diverge
     fn fits_now(&self, req: &Request) -> bool {
         matches!(
             decide(
@@ -318,18 +242,15 @@ impl Scheduler {
                 self.sa_budgets.get(&req.sa).copied(),
                 req.footprint,
             ),
-            Verdict::Fits
+            Admission::Granted(())
         )
     }
 
-    /// One greedy priority-with-backfill pass over the queue. Admits every
-    /// request that fits in `(priority desc, seq asc)` order, continuing past
-    /// non-fitting requests so lower-priority ones backfill. A single pass
-    /// suffices: admission only consumes capacity, so no admission can enable
-    /// an earlier-skipped one.
-    fn schedule_pass(&mut self) -> Vec<Grant> {
-        self.queue
-            .sort_by(|a, b| b.req.priority.cmp(&a.req.priority).then(a.seq.cmp(&b.seq)));
+    /// One greedy priority-with-backfill pass in `(priority desc, seq asc)` order,
+    /// continuing past non-fitting requests so lower-priority ones backfill. One pass
+    /// suffices (admission only consumes capacity → no grant can enable a skipped one)
+    fn schedule_pass(&mut self) -> Vec<Admitted> {
+        self.queue.sort_by(|a, b| b.req.priority.cmp(&a.req.priority).then(a.seq.cmp(&b.seq)));
 
         let mut grants = Vec::new();
         let mut still_queued = Vec::new();
@@ -344,38 +265,32 @@ impl Scheduler {
         grants
     }
 
-    /// Commit a request: mint a lease, charge capacity and the SA, return the
-    /// grant. The caller has already verified [`fits_now`].
-    fn admit(&mut self, req: Request) -> Grant {
-        // The "no overload" safety property: admitting must never push committed
-        // past the ceiling. `fits_now` (the only caller) guarantees it; guarded
-        // live so a regression aborts rather than overcommits a real cluster.
+    /// Precondition: the caller has verified [`fits_now`]
+    fn admit(&mut self, req: Request) -> Admitted {
+        // "No overload": admitting must never push committed past the ceiling. Guarded
+        // live so a regression aborts rather than overcommitting a real cluster
         assert!(
-            req.footprint
-                .fits_within(&self.available.saturating_sub(&self.committed)),
+            req.footprint.fits_within(&self.available.saturating_sub(&self.committed)),
             "admit: footprint {:?} does not fit free capacity {:?} — fits_now precondition violated",
             req.footprint,
             self.available.saturating_sub(&self.committed),
         );
 
-        let lease_id = LeaseId(self.next_lease_id);
-        self.next_lease_id += 1;
+        let slot_id = SlotId(self.next_slot_id);
+        self.next_slot_id += 1;
 
         self.committed = self.committed.saturating_add(&req.footprint);
 
-        let usage = self
-            .sa_usage
-            .entry(req.sa.clone())
-            .or_insert(Resources::ZERO);
+        let usage = self.sa_usage.entry(req.sa.clone()).or_insert(Resources::ZERO);
         *usage = usage.saturating_add(&req.footprint);
 
-        let grant = Grant {
-            lease_id,
+        let grant = Admitted {
+            slot_id,
             binary_id: req.binary_id.clone(),
             test_name: req.test_name.clone(),
         };
         self.leases.insert(
-            lease_id,
+            slot_id,
             Lease {
                 binary_id: req.binary_id,
                 test_name: req.test_name,
@@ -394,7 +309,7 @@ mod tests {
 
     // ── Test helpers ───────────────────────────────────────────────────
 
-    /// A request at a given priority, uniquely named, charged to SA `acme`.
+    /// Request at a given priority, uniquely named, charged to SA `acme`
     fn req(name: &str, cpu_milli: u64, mem_bytes: u64, priority: u8) -> Request {
         Request {
             binary_id: "bin".into(),
@@ -405,14 +320,13 @@ mod tests {
         }
     }
 
-    fn lease_of(a: Admission) -> LeaseId {
+    fn lease_of(a: Admission) -> SlotId {
         match a {
             Admission::Granted(id) => id,
             other => panic!("expected Granted, got {other:?}"),
         }
     }
 
-    /// A roomy 8-CPU / 16Gi cluster.
     fn sched() -> Scheduler {
         Scheduler::new(Resources::new(8_000, 16 * GIB, 0, 0))
     }
@@ -427,12 +341,7 @@ mod tests {
         assert!(matches!(a, Admission::Granted(_)));
         assert_eq!(s.active_leases(), 1);
         assert_eq!(s.committed(), Resources::new(1_000, GIB, 0, 0));
-        assert_eq!(
-            s.free(),
-            before
-                .checked_sub(&Resources::new(1_000, GIB, 0, 0))
-                .unwrap()
-        );
+        assert_eq!(s.free(), before.checked_sub(&Resources::new(1_000, GIB, 0, 0)).unwrap());
     }
 
     // ── Release returns capacity ───────────────────────────────────────
@@ -453,8 +362,7 @@ mod tests {
 
     #[test]
     fn request_fitting_cpu_but_not_memory_queues() {
-        // 8 CPU / 16Gi. Occupy 12Gi so only 4Gi is free; a 1 CPU / 8Gi ask
-        // fits available (so it isn't rejected) but exceeds free memory.
+        // Occupy 12Gi of 16 → a 1 CPU / 8Gi ask fits `available` (not rejected) but not free
         let mut s = sched();
         let _occ = lease_of(s.request(req("occ", 1_000, 12 * GIB, 0)));
         assert_eq!(s.request(req("t", 1_000, 8 * GIB, 0)), Admission::Queued);
@@ -463,8 +371,7 @@ mod tests {
 
     #[test]
     fn request_fitting_memory_but_not_cpu_queues() {
-        // 16 CPU / 16Gi. Occupy 10 CPU so only 6 remain; a 16 CPU ask
-        // exceeds free CPU but not available, so it queues.
+        // Occupy 10 of 16 CPU → a 16 CPU ask tops free CPU but not `available` → queues
         let mut s = Scheduler::new(Resources::new(16_000, 16 * GIB, 0, 0));
         let _occ = lease_of(s.request(req("occ", 10_000, GIB, 0)));
         assert_eq!(s.request(req("t", 16_000, GIB, 0)), Admission::Queued);
@@ -472,9 +379,8 @@ mod tests {
 
     #[test]
     fn request_fitting_cpu_and_memory_but_not_io_bandwidth_queues() {
-        // A footprint that fits CPU and memory with room to spare must still
-        // queue when the I/O-bandwidth dimension is exhausted — the dimension
-        // the 2-D packer could not see.
+        // Fitting CPU + memory with room to spare must still queue on exhausted I/O
+        // bandwidth — the dimension the 2-D packer could not see
         let io_req = |name: &str, io_bps: u64| Request {
             binary_id: "bin".into(),
             test_name: name.into(),
@@ -482,21 +388,18 @@ mod tests {
             footprint: Resources::new(1_000, GIB, io_bps, 0),
             priority: 0,
         };
-        // 8 CPU / 16Gi / 500 MB/s. Occupy 400 MB/s; only 100 free.
+        // Occupy 400 of 500 MB/s → 100 free
         let mut s = Scheduler::new(Resources::new(8_000, 16 * GIB, 500 * MIB, 0));
         let _occ = lease_of(s.request(io_req("occ", 400 * MIB)));
         assert_eq!(s.request(io_req("t", 300 * MIB)), Admission::Queued);
         assert_eq!(s.queue_len(), 1);
-        // A request within the remaining 100 MB/s still fits.
-        assert!(matches!(
-            s.request(io_req("small", 100 * MIB)),
-            Admission::Granted(_)
-        ));
+        // Within the remaining 100 MB/s still fits
+        assert!(matches!(s.request(io_req("small", 100 * MIB)), Admission::Granted(_)));
     }
 
     #[test]
     fn request_fitting_all_else_but_not_io_iops_queues() {
-        // The IOPS dimension gates independently of bandwidth.
+        // IOPS gates independently of bandwidth
         let iops_req = |name: &str, io_iops: u64| Request {
             binary_id: "bin".into(),
             test_name: name.into(),
@@ -525,10 +428,8 @@ mod tests {
 
     #[test]
     fn higher_priority_is_admitted_first_despite_later_arrival() {
-        // An occupier fills the whole 8-CPU cluster. Two contenders each
-        // need 5 CPU, so after the occupier frees, only ONE fits. A
-        // low-prio job arrives first, then a high-prio one; the high-prio
-        // must win the single slot despite arriving later.
+        // An occupier fills the 8-CPU cluster; two 5-CPU contenders → only ONE fits on
+        // release. Low-prio arrives first, so the later high-prio must win the slot
         let mut s = sched();
         let occ = lease_of(s.request(req("occ", 8_000, 16 * GIB, 0)));
         assert_eq!(s.request(req("low", 5_000, 8 * GIB, 0)), Admission::Queued);
@@ -545,14 +446,8 @@ mod tests {
     fn equal_priority_breaks_ties_fifo_by_arrival() {
         let mut s = sched();
         let occ = lease_of(s.request(req("occ", 8_000, 16 * GIB, 0)));
-        assert_eq!(
-            s.request(req("first", 5_000, 8 * GIB, 1)),
-            Admission::Queued
-        );
-        assert_eq!(
-            s.request(req("second", 5_000, 8 * GIB, 1)),
-            Admission::Queued
-        );
+        assert_eq!(s.request(req("first", 5_000, 8 * GIB, 1)), Admission::Queued);
+        assert_eq!(s.request(req("second", 5_000, 8 * GIB, 1)), Admission::Queued);
         let grants = s.release(occ);
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].test_name, "first");
@@ -562,35 +457,22 @@ mod tests {
 
     #[test]
     fn lower_priority_backfills_when_top_does_not_fit() {
-        // 8 CPU, 6 free. A high-prio job needs 8 (doesn't fit free), a
-        // low-prio job needs 4 (fits), so the low-prio backfills.
+        // 6 of 8 CPU free: high-prio needs 8 (no fit), low-prio needs 4 → low-prio backfills
         let mut s = sched();
         let _occ = s.request(req("occ", 2_000, 2 * GIB, 0)); // 6 CPU free
-        assert_eq!(
-            s.request(req("big-hi", 8_000, 8 * GIB, 9)),
-            Admission::Queued
-        );
-        assert_eq!(
-            s.request(req("small-lo", 4_000, 4 * GIB, 0)),
-            Admission::Granted(LeaseId(1))
-        );
+        assert_eq!(s.request(req("big-hi", 8_000, 8 * GIB, 9)), Admission::Queued);
+        assert_eq!(s.request(req("small-lo", 4_000, 4 * GIB, 0)), Admission::Granted(SlotId(1)));
         assert_eq!(s.queue_len(), 1, "big-hi still waiting");
     }
 
-    // Release-backfill: one big finishes, several small launch.
+    // Release-backfill: one big finishes, several small launch
 
     #[test]
     fn release_backfills_multiple_queued_requests() {
         let mut s = Scheduler::new(Resources::new(6_000, 12 * GIB, 0, 0));
         let big = lease_of(s.request(req("testnet", 6_000, 12 * GIB, 2)));
-        assert_eq!(
-            s.request(req("basic-a", 3_000, 6 * GIB, 0)),
-            Admission::Queued
-        );
-        assert_eq!(
-            s.request(req("basic-b", 3_000, 6 * GIB, 0)),
-            Admission::Queued
-        );
+        assert_eq!(s.request(req("basic-a", 3_000, 6 * GIB, 0)), Admission::Queued);
+        assert_eq!(s.request(req("basic-b", 3_000, 6 * GIB, 0)), Admission::Queued);
         let grants = s.release(big);
         let mut names: Vec<_> = grants.iter().map(|g| g.test_name.as_str()).collect();
         names.sort();
@@ -598,18 +480,16 @@ mod tests {
         assert_eq!(s.queue_len(), 0);
     }
 
-    // decide(): reject vs queue is distinct (regression).
+    // decide(): reject vs queue stays distinct (regression).
     //
-    // `available` is the scheduler's seed capacity (`ClusterCapacity::free` at
-    // run startup); a footprint exceeding it is rejected (unschedulable however
-    // many tests finish). The queue/fit split is `available - committed`: a
-    // footprint that fits `available` but not the live remainder must queue,
-    // never reject.
+    // `available` = seed capacity (`ClusterCapacity::free` at run startup); over it →
+    // rejected (unschedulable however many tests finish). Queue/fit split is
+    // `available - committed`: fitting `available` but not the live remainder must queue.
 
     #[test]
     fn decide_queues_when_fits_ceiling_but_not_free() {
-        // Ceiling 8 CPU; 6 already committed, 2 free. A 4-CPU footprint fits
-        // the ceiling but not free-right-now: it must wait, not fail fast.
+        // 6 of an 8-CPU ceiling committed: a 4-CPU footprint fits the ceiling but not free
+        // right now → must wait, not fail fast
         let v = decide(
             Resources::new(8_000, 16 * GIB, 0, 0), // available = ceiling
             Resources::new(6_000, 12 * GIB, 0, 0), // committed
@@ -617,13 +497,13 @@ mod tests {
             None,                                  // sa_budget
             Resources::new(4_000, 8 * GIB, 0, 0),  // footprint
         );
-        assert_eq!(v, Verdict::Queue);
+        assert_eq!(v, Admission::Queued);
     }
 
     #[test]
     fn decide_rejects_only_when_footprint_exceeds_ceiling() {
-        // Same footprint, ceiling now too small in the memory dimension:
-        // genuinely unschedulable however many committed leases finish.
+        // Same footprint, ceiling now too small in memory → unschedulable however many
+        // committed leases finish
         let v = decide(
             Resources::new(8_000, 4 * GIB, 0, 0),
             Resources::ZERO,
@@ -631,7 +511,7 @@ mod tests {
             None,
             Resources::new(4_000, 8 * GIB, 0, 0),
         );
-        assert_eq!(v, Verdict::Reject(RejectReason::ExceedsClusterCapacity));
+        assert_eq!(v, Admission::Rejected(RejectReason::ExceedsClusterCapacity));
     }
 
     #[test]
@@ -643,7 +523,7 @@ mod tests {
             None,
             Resources::new(4_000, 8 * GIB, 0, 0),
         );
-        assert_eq!(v, Verdict::Fits);
+        assert_eq!(v, Admission::Granted(()));
     }
 
     // ── Reject: exceeds empty-cluster capacity (fail fast) ─────────────
@@ -677,10 +557,7 @@ mod tests {
         let mut s = sched();
         s.set_sa_budget("acme", Resources::new(4_000, 8 * GIB, 0, 0));
         let first = lease_of(s.request(req("first", 3_000, 6 * GIB, 0)));
-        assert_eq!(
-            s.request(req("second", 3_000, 6 * GIB, 0)),
-            Admission::Queued
-        );
+        assert_eq!(s.request(req("second", 3_000, 6 * GIB, 0)), Admission::Queued);
         let grants = s.release(first);
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].test_name, "second");
@@ -690,17 +567,14 @@ mod tests {
 
     #[test]
     fn admission_requires_both_cluster_and_sa_budget() {
-        // Cluster: 10 CPU. SA budget: 5 CPU.
+        // Cluster 10 CPU, SA budget 5 CPU
         let mut s = Scheduler::new(Resources::new(10_000, 20 * GIB, 0, 0));
         s.set_sa_budget("acme", Resources::new(5_000, 10 * GIB, 0, 0));
-        // Fits SA but not cluster free: another SA hogs 8 CPU first.
-        let hog = Request {
-            sa: "other".into(),
-            ..req("hog", 8_000, 8 * GIB, 0)
-        };
+        // Fits the SA but not cluster free: another SA hogs 8 CPU first
+        let hog = Request { sa: "other".into(), ..req("hog", 8_000, 8 * GIB, 0) };
         let hog_id = lease_of(s.request(hog));
         assert_eq!(s.request(req("a", 3_000, 4 * GIB, 0)), Admission::Queued);
-        // Free the cluster; now it fits both, so it's granted.
+        // Freed → fits both → granted
         let grants = s.release(hog_id);
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].test_name, "a");
@@ -712,10 +586,7 @@ mod tests {
     fn disconnect_reclaims_capacity_like_release() {
         let mut s = Scheduler::new(Resources::new(4_000, 8 * GIB, 0, 0));
         let id = lease_of(s.request(req("dies", 4_000, 8 * GIB, 0)));
-        assert_eq!(
-            s.request(req("waits", 4_000, 8 * GIB, 0)),
-            Admission::Queued
-        );
+        assert_eq!(s.request(req("waits", 4_000, 8 * GIB, 0)), Admission::Queued);
         let grants = s.disconnect(id);
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].test_name, "waits");
@@ -729,14 +600,10 @@ mod tests {
         let mut s = sched();
         let _occ = lease_of(s.request(req("occ", 6_000, 12 * GIB, 0)));
         assert_eq!(s.request(req("t", 4_000, 8 * GIB, 0)), Admission::Queued);
-        // No-op reconcile (same value) admits nothing.
-        assert!(
-            s.reconcile(Resources::new(8_000, 16 * GIB, 0, 0))
-                .is_empty()
-        );
+        // No-op reconcile (same value) admits nothing
+        assert!(s.reconcile(Resources::new(8_000, 16 * GIB, 0, 0)).is_empty());
         assert_eq!(s.queue_len(), 1);
-        // External capacity appears, available grows, and the queued request
-        // backfills without any lease releasing.
+        // External capacity appears → the queued request backfills with no lease releasing
         let grants = s.reconcile(Resources::new(16_000, 32 * GIB, 0, 0));
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].test_name, "t");
@@ -756,8 +623,8 @@ mod tests {
 
     #[test]
     fn demand_sums_committed_and_queued_footprints() {
-        // 8 CPU cluster. Admit 6 CPU, then queue two 4-CPU asks (neither fits
-        // the 2 CPU free). Demand is the whole appetite: 6 committed + 4 + 4.
+        // Admit 6 of 8 CPU, then queue two 4-CPU asks (neither fits the 2 free) → demand is
+        // the whole appetite, 6 committed + 4 + 4
         let mut s = sched();
         lease_of(s.request(req("run", 6_000, 4 * GIB, 0)));
         assert_eq!(s.request(req("q1", 4_000, GIB, 0)), Admission::Queued);
@@ -774,10 +641,7 @@ mod tests {
         let _occ = lease_of(s.request(req("occ", 8_000, 8 * GIB, 0)));
         let free_before = s.free();
         let committed_before = s.committed();
-        assert_eq!(
-            s.request(req("waiter", 4_000, 4 * GIB, 0)),
-            Admission::Queued
-        );
+        assert_eq!(s.request(req("waiter", 4_000, 4 * GIB, 0)), Admission::Queued);
         assert_eq!(s.free(), free_before);
         assert_eq!(s.committed(), committed_before);
     }
@@ -793,7 +657,7 @@ mod tests {
                 s.request(req("b", 4_000, 4 * GIB, 2)),
                 s.request(req("c", 4_000, 4 * GIB, 1)),
             ];
-            let grants = s.release(LeaseId(0));
+            let grants = s.release(SlotId(0));
             let names = grants.into_iter().map(|g| g.test_name).collect();
             (admissions, names)
         }
@@ -801,10 +665,8 @@ mod tests {
     }
 }
 
-/// Property tests: the invariants the hand-picked cases above pin pointwise,
-/// asserted over randomized op-sequences. The scheduler is pure and
-/// deterministic, so this needs no cluster and no clock; it hammers the
-/// admission core and checks it never overcommits.
+/// The invariants the cases above pin pointwise, over randomized op-sequences. Pure +
+/// deterministic → no cluster, no clock
 #[cfg(test)]
 mod props {
     use super::*;
@@ -812,21 +674,12 @@ mod props {
     use proptest::prelude::*;
     use std::collections::{BTreeMap, HashMap};
 
-    /// A scripted operation against the scheduler. `Release` indexes into the
-    /// currently-held leases (modulo their count), so it always targets a real
-    /// lease when one exists.
+    /// Scripted op. `Release` indexes into the held leases modulo their count → always
+    /// targets a real lease when one exists
     #[derive(Debug, Clone)]
     enum Op {
-        Request {
-            cpu: u64,
-            mem_mib: u64,
-            io_mbps: u64,
-            io_kiops: u64,
-            prio: u8,
-        },
-        Release {
-            which: usize,
-        },
+        Request { cpu: u64, mem_mib: u64, io_mbps: u64, io_kiops: u64, prio: u8 },
+        Release { which: usize },
     }
 
     fn op() -> impl Strategy<Value = Op> {
@@ -847,13 +700,10 @@ mod props {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
-        /// The headline safety property (A/B "no overload", machine-checked):
-        /// for *any* sequence of request/release ops, committed capacity never
-        /// exceeds the ceiling in *any* of the four dimensions (CPU, memory,
-        /// disk bandwidth, disk IOPS), and the scheduler's own accounting stays
-        /// exactly consistent with the set of live leases. The ceiling is finite
-        /// in every dimension and the generator emits I/O demands, so the
-        /// invariant genuinely exercises I/O gating, not just CPU×memory.
+        /// Headline "no overload" property, machine-checked: over *any* request/release
+        /// sequence, committed never tops the ceiling in *any* of the four dimensions and
+        /// the accounting stays exact against the live leases. The ceiling is finite
+        /// everywhere and the generator emits I/O demands → I/O gating is exercised too
         #[test]
         fn committed_never_exceeds_ceiling_under_any_op_sequence(
             ops in proptest::collection::vec(op(), 1..80)
@@ -861,10 +711,10 @@ mod props {
             let ceiling = Resources::new(8_000, 16 * 1024 * MIB, 800 * MIB, 100_000);
             let mut s = Scheduler::new(ceiling);
 
-            // Independent mirror of what *should* be committed, rebuilt from the
-            // grants/releases the scheduler reports, never read back from it.
-            // BTreeMap keeps `Release` indexing deterministic for shrinking.
-            let mut live: BTreeMap<LeaseId, Resources> = BTreeMap::new();
+            // Independent mirror of what *should* be committed, rebuilt from reported
+            // grants/releases, never read back. BTreeMap keeps `Release` indexing
+            // deterministic for shrinking
+            let mut live: BTreeMap<SlotId, Resources> = BTreeMap::new();
             let mut footprint_of: HashMap<String, Resources> = HashMap::new();
             let mut seq = 0u64;
 
@@ -883,7 +733,6 @@ mod props {
                             priority: prio,
                         };
                         // A fresh enqueue grants at most the request itself
-                        // (capacity only shrank since the last pass).
                         if let Admission::Granted(id) = s.request(req) {
                             live.insert(id, fp);
                         }
@@ -892,14 +741,13 @@ mod props {
                         if live.is_empty() {
                             continue;
                         }
-                        let ids: Vec<LeaseId> = live.keys().copied().collect();
+                        let ids: Vec<SlotId> = live.keys().copied().collect();
                         let id = ids[which % ids.len()];
                         live.remove(&id);
-                        // Releasing frees capacity, which may backfill queued
-                        // requests; fold each newly-admitted grant into the mirror.
+                        // A release may backfill queued requests → fold each grant in
                         for g in s.release(id) {
                             let fp = footprint_of[&g.test_name];
-                            live.insert(g.lease_id, fp);
+                            live.insert(g.slot_id, fp);
                         }
                     }
                 }

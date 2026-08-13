@@ -1,20 +1,11 @@
-//! Zcash JSON-RPC client.
+//! Zcash JSON-RPC client. [`ZcashRpc`] = authed transport + per-component
+//! attribution label + typed methods over the bitcoind-derived envelope.
 //!
-//! [`ZcashRpc`] pairs an authenticated transport with a per-component attribution
-//! label and exposes typed methods for the bitcoind-derived JSON-RPC envelope.
-//! Both `zebrad` and `zcashd` serve it natively; `zaino` proxies the same wire
-//! format on its `jsonrpc` port. All three backends consume this client.
-//!
-//! Owned in ztest rather than borrowed from an external crate: an ecosystem
-//! review (`docs/architecture-decisions/`) found none covering ztest's surface.
-//! `zaino-fetch` omits the mining RPCs (`getblocktemplate`, `submitblock`,
-//! `generate`) needed for regtest block generation, calls `std::process::exit`
-//! on connect failure, and hides response fields without accessors. `zebra-rpc`
-//! ships only server-side types and would drag the full Zebra tree. And
-//! `bitcoincore-rpc` is archived and Bitcoin-shaped (no `upgrades` activation
-//! map, no shielded fields, no `getblocksubsidy`). Surface area is small (~12
-//! methods, ~5 envelope types) and the wire format stable, so owning it keeps
-//! the transport and error attribution under ztest's control.
+//! - Served natively by `zebrad`/`zcashd`, proxied by `zaino` on its `jsonrpc` port
+//! - ztest-owned: no ecosystem crate covers the surface
+//!   (`docs/architecture-decisions/`) — `zaino-fetch` drops the mining RPCs and
+//!   `process::exit`s, `zebra-rpc` is server-side + drags Zebra,
+//!   `bitcoincore-rpc` archived & Bitcoin-shaped
 
 use crate::topology::ActivationHeights;
 use serde_json::{Value, json};
@@ -22,15 +13,14 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::RpcError;
 use crate::handles::client::AuthedRpc;
-// The typed RPC-response envelopes are interface types owned by `handles::types`;
-// this transport imports and produces them.
+// Response envelopes are interface types owned by `handles::types`
 use crate::handles::types::{BlockHash, BlockTip, BlockchainInfo, MempoolInfo, Peer, PeerInfo};
 use crate::regtest::parse_activation_heights_from_rpc;
 
 // ──────────────────────────────── client ───────────────────────────────
 
-/// Typed Zcash JSON-RPC client. Borrows its transport; construct on demand at a
-/// call site rather than caching.
+/// Typed Zcash JSON-RPC client. Borrows its transport — construct per call site,
+/// never cache
 #[derive(Debug)]
 pub struct ZcashRpc<'a> {
     component: &'static str,
@@ -38,19 +28,18 @@ pub struct ZcashRpc<'a> {
 }
 
 impl<'a> ZcashRpc<'a> {
-    /// Pair a transport with the component-attribution label used by any
-    /// [`RpcError`] this client emits.
+    /// Pair a transport with the attribution label every [`RpcError`] here carries
     pub fn new(component: &'static str, client: &'a AuthedRpc) -> Self {
         Self { component, client }
     }
 
-    /// `getblockchaininfo.blocks` → current chain-tip height.
+    /// `getblockchaininfo.blocks` → current chain-tip height
     pub async fn chain_height(&self) -> Result<BlockHeight, RpcError> {
         let v = self.call("getblockchaininfo", json!([])).await?;
         self.parse_height("getblockchaininfo", &v, "blocks")
     }
 
-    /// `getblockchaininfo.upgrades` → typed [`ActivationHeights`].
+    /// `getblockchaininfo.upgrades` → typed [`ActivationHeights`]
     pub async fn activation_heights(&self) -> Result<ActivationHeights, RpcError> {
         let v = self.call("getblockchaininfo", json!([])).await?;
         let upgrades = v
@@ -60,7 +49,7 @@ impl<'a> ZcashRpc<'a> {
         Ok(parse_activation_heights_from_rpc(upgrades))
     }
 
-    /// `getblockchaininfo.{blocks,bestblockhash}` → tip.
+    /// `getblockchaininfo.{blocks,bestblockhash}` → tip
     pub async fn tip(&self) -> Result<BlockTip, RpcError> {
         let v = self.call("getblockchaininfo", json!([])).await?;
         let height = self.parse_height("getblockchaininfo", &v, "blocks")?;
@@ -68,16 +57,15 @@ impl<'a> ZcashRpc<'a> {
         Ok((height, hash))
     }
 
-    /// `getbestblockhash` → tip block hash.
+    /// `getbestblockhash` → tip block hash
     pub async fn best_block_hash(&self) -> Result<BlockHash, RpcError> {
         let v = self.call("getbestblockhash", json!([])).await?;
-        let hex_str = v
-            .as_str()
-            .ok_or_else(|| self.decode_err("getbestblockhash", "expected string"))?;
+        let hex_str =
+            v.as_str().ok_or_else(|| self.decode_err("getbestblockhash", "expected string"))?;
         decode_hash(self.component, "getbestblockhash", hex_str)
     }
 
-    /// `getblockcount` → current block count.
+    /// `getblockcount` → current block count
     pub async fn block_count(&self) -> Result<BlockHeight, RpcError> {
         let v = self.call("getblockcount", json!([])).await?;
         v.as_u64()
@@ -86,52 +74,36 @@ impl<'a> ZcashRpc<'a> {
             .ok_or_else(|| self.decode_err("getblockcount", "expected u32"))
     }
 
-    /// `getblock <height> 1` → `(height, hash)`. Both `zebrad` and
-    /// `zcashd` accept a stringified height as the first parameter.
+    /// `getblock <height> 1` → `(height, hash)`; both backends take a stringified height
     pub async fn get_block(&self, height: BlockHeight) -> Result<BlockTip, RpcError> {
-        let v = self
-            .call("getblock", json!([u32::from(height).to_string(), 1]))
-            .await?;
+        let v = self.call("getblock", json!([u32::from(height).to_string(), 1])).await?;
         self.parse_block(v)
     }
 
-    /// `getblock <hash> 1` → `(height, hash)`. The hash bytes are passed in
-    /// display (big-endian) order, which is how [`BlockHash`] already stores
-    /// them, so chaining `get_block_by_hash(&tip_hash)` works directly.
+    /// `getblock <hash> 1` → `(height, hash)`. Hash sent in display (big-endian)
+    /// order = how [`BlockHash`] stores it, so chaining off a tip hash works
     pub async fn get_block_by_hash(&self, hash: &BlockHash) -> Result<BlockTip, RpcError> {
         let hex_str = hex::encode(hash.0);
         let v = self.call("getblock", json!([hex_str, 1])).await?;
         self.parse_block(v)
     }
 
-    /// `invalidateblock <hash>` — mark a block invalid, forcing the node to
-    /// disconnect it and every descendant and re-org onto the best remaining
-    /// chain.
+    /// `invalidateblock <hash>` — disconnect block + descendants, re-org onto the
+    /// best remaining chain.
     ///
-    /// This is the only way to produce a *deterministic* re-org in regtest: a
-    /// natural fork needs two competing miners and a partition, which no
-    /// single-validator fixture can arrange. Both backends serve the
-    /// bitcoind-derived name — `zebrad` maps it to the `InvalidateBlock` state
-    /// request, `zcashd` inherits the upstream implementation.
-    ///
-    /// The chain does not necessarily settle by the time this returns; poll
-    /// [`tip`](Self::tip) for the expected height before asserting.
+    /// - Only deterministic regtest re-org (a natural fork needs 2 miners + a partition)
+    /// - May return before the chain settles; poll [`tip`](Self::tip) first
     pub async fn invalidate_block(&self, hash: &BlockHash) -> Result<(), RpcError> {
-        self.call("invalidateblock", json!([hex::encode(hash.0)]))
-            .await
-            .map(|_| ())
+        self.call("invalidateblock", json!([hex::encode(hash.0)])).await.map(|_| ())
     }
 
-    /// `reconsiderblock <hash>` — clear a previous
-    /// [`invalidate_block`](Self::invalidate_block), letting the node
-    /// reconsider the block and its descendants.
+    /// `reconsiderblock <hash>` — clear a prior
+    /// [`invalidate_block`](Self::invalidate_block); node reconsiders it + descendants
     pub async fn reconsider_block(&self, hash: &BlockHash) -> Result<(), RpcError> {
-        self.call("reconsiderblock", json!([hex::encode(hash.0)]))
-            .await
-            .map(|_| ())
+        self.call("reconsiderblock", json!([hex::encode(hash.0)])).await.map(|_| ())
     }
 
-    /// `getmempoolinfo` → typed [`MempoolInfo`].
+    /// `getmempoolinfo` → typed [`MempoolInfo`]
     pub async fn mempool_info(&self) -> Result<MempoolInfo, RpcError> {
         let v = self.call("getmempoolinfo", json!([])).await?;
         Ok(MempoolInfo {
@@ -141,7 +113,7 @@ impl<'a> ZcashRpc<'a> {
         })
     }
 
-    /// `getblockchaininfo` → typed [`BlockchainInfo`].
+    /// `getblockchaininfo` → typed [`BlockchainInfo`]
     pub async fn blockchain_info(&self) -> Result<BlockchainInfo, RpcError> {
         let v = self.call("getblockchaininfo", json!([])).await?;
         Ok(BlockchainInfo {
@@ -158,39 +130,28 @@ impl<'a> ZcashRpc<'a> {
         })
     }
 
-    /// `getpeerinfo` → typed [`PeerInfo`]. Carries the field subset shared across
-    /// `zebrad` and `zcashd`; per-peer extras (banscore, syncedheaders, etc.)
-    /// remain reachable via [`Self::call_raw`].
+    /// `getpeerinfo` → typed [`PeerInfo`]: the `zebrad` ∩ `zcashd` field subset.
+    /// Per-peer extras stay reachable via [`Self::call_raw`]
     pub async fn peer_info(&self) -> Result<PeerInfo, RpcError> {
         let v = self.call("getpeerinfo", json!([])).await?;
-        let arr = v
-            .as_array()
-            .ok_or_else(|| self.decode_err("getpeerinfo", "expected array"))?;
-        let peers = arr
-            .iter()
-            .map(|p| self.parse_peer(p))
-            .collect::<Result<Vec<_>, _>>()?;
+        let arr = v.as_array().ok_or_else(|| self.decode_err("getpeerinfo", "expected array"))?;
+        let peers = arr.iter().map(|p| self.parse_peer(p)).collect::<Result<Vec<_>, _>>()?;
         Ok(PeerInfo { peers })
     }
 
-    /// `getblocksubsidy <height>` → raw JSON envelope. The shape is
-    /// network/branch dependent (NU6 splits funding streams differently from
-    /// Canopy), so this stays untyped; callers project the fields they need.
+    /// `getblocksubsidy <height>` → raw JSON. Untyped: shape is network/branch
+    /// dependent (NU6 splits funding streams unlike Canopy)
     pub async fn block_subsidy(&self, height: BlockHeight) -> Result<Value, RpcError> {
-        self.call("getblocksubsidy", json!([u32::from(height)]))
-            .await
+        self.call("getblocksubsidy", json!([u32::from(height)])).await
     }
 
-    /// `getblockheader <hash> <verbose>` → raw JSON. `verbose=true` returns the
-    /// object form; `verbose=false` returns the serialized header as a hex string
-    /// wrapped in a JSON string. Untyped so callers can branch on the parity-test
-    /// shape they want.
+    /// `getblockheader <hash> <verbose>` → raw JSON. `verbose` picks object form
+    /// vs hex-string header; untyped so parity tests branch on either
     pub async fn block_header(&self, hash: &str, verbose: bool) -> Result<Value, RpcError> {
         self.call("getblockheader", json!([hash, verbose])).await
     }
 
-    /// Escape hatch for RPCs not yet modelled by a typed method. Prefer
-    /// the typed methods above when one fits.
+    /// Escape hatch for unmodelled RPCs; prefer a typed method where one fits
     pub async fn call_raw(&self, method: &'static str, params: Value) -> Result<Value, RpcError> {
         self.call(method, params).await
     }
@@ -288,8 +249,7 @@ fn decode_hash(
 ) -> Result<BlockHash, RpcError> {
     let bytes = hex::decode(hex_str)
         .map_err(|e| RpcError::decode(component, op, format!("hash hex decode: {e}")))?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| RpcError::decode(component, op, "hash is not 32 bytes"))?;
+    let arr: [u8; 32] =
+        bytes.try_into().map_err(|_| RpcError::decode(component, op, "hash is not 32 bytes"))?;
     Ok(BlockHash(arr))
 }

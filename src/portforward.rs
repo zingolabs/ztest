@@ -1,9 +1,7 @@
 //! Lazy local-port forwarders for out-of-cluster runs.
 //!
-//! A `Forwarder` binds `127.0.0.1:0`, accepts connections, and bridges
-//! each one to `pod:remote_port` via `kube::Api::<Pod>::portforward`.
-//! The accept loop is a detached tokio task; it exits when the
-//! `_shutdown` oneshot drops, which happens on `Forwarder::drop`.
+//! - `Forwarder` binds `127.0.0.1:0` → bridges each conn to `pod:remote_port`
+//! - Detached accept loop, exits when the `_shutdown` oneshot drops (`Forwarder::drop`)
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -57,10 +55,7 @@ impl Forwarder {
             }
         });
 
-        Ok(Forwarder {
-            local_port,
-            _shutdown: tx,
-        })
+        Ok(Forwarder { local_port, _shutdown: tx })
     }
 }
 
@@ -71,12 +66,9 @@ async fn bridge(
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut pf = api.portforward(pod, &[port]).await?;
-    let mut upstream = pf
-        .take_stream(port)
-        .ok_or("portforward did not return a stream for the requested port")?;
+    let mut upstream =
+        pf.take_stream(port).ok_or("portforward did not return a stream for the requested port")?;
     let _ = copy_bidirectional(&mut sock, &mut upstream).await?;
-    pf.join()
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    pf.join().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     Ok(())
 }

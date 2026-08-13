@@ -1,5 +1,5 @@
-//! `ztest store`: manage recorded runs — list them, inspect one, export a
-//! portable `.zip`, or prune old ones. Mirrors `cargo nextest store`.
+//! `ztest store`: list / inspect / export-`.zip` / prune recorded runs. Mirrors
+//! `cargo nextest store`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -69,9 +69,8 @@ fn list() -> Result<(), String> {
         return Ok(());
     }
     for run in runs {
-        let started = record::read_meta(&run.dir)
-            .map(|m| m.started_at)
-            .unwrap_or_else(|_| "?".to_string());
+        let started =
+            record::read_meta(&run.dir).map(|m| m.started_at).unwrap_or_else(|_| "?".to_string());
         let summary = match record::final_stats(&run.dir) {
             Ok(Some(s)) => plain_tally(&s),
             Ok(None) => "incomplete".to_string(),
@@ -95,25 +94,15 @@ fn info(sel: &RunSelector) -> Result<(), String> {
     println!("size:       {size} bytes");
     println!("path:       {}", dir.display());
     match record::final_stats(&dir).map_err(|e| e.to_string())? {
-        Some(s) => println!(
-            "result:     {} ({} of {} run)",
-            plain_tally(&s),
-            s.ran(),
-            s.total
-        ),
+        Some(s) => println!("result:     {} ({} of {} run)", plain_tally(&s), s.ran(), s.total),
         None => println!("result:     incomplete (no RunFinished recorded)"),
     }
     Ok(())
 }
 
-/// The run's tally, un-styled — the same terms and omit-rule the live summary
-/// line uses ([`RunStats::tally`]).
+/// Un-styled tally, same terms + omit-rule as the live summary line ([`RunStats::tally`])
 fn plain_tally(s: &crate::engine::events::RunStats) -> String {
-    s.tally()
-        .into_iter()
-        .map(|(n, word)| format!("{n} {word}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    s.tally().into_iter().map(|(n, word)| format!("{n} {word}")).collect::<Vec<_>>().join(", ")
 }
 
 fn export(sel: &RunSelector, out: &std::path::Path) -> Result<(), String> {

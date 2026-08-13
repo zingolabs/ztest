@@ -1,5 +1,5 @@
-//! `ztest`: boot Zcash topologies (validators, indexers, wallets) on
-//! Kubernetes and hand typed RPC handles back to test code.
+//! `ztest`: boot Zcash topologies (validators, indexers, wallets) on Kubernetes,
+//! hand typed RPC handles back to test code.
 //!
 //! See [`docs/guide-writing-tests.md`] for the user-facing API and
 //! [`docs/design-architecture.md`] for what runs under the hood.
@@ -9,13 +9,12 @@
 
 #![deny(missing_debug_implementations)]
 
-// `archive!` expands to `::ztest::…` paths, and `crate::snapshots` invokes it
-// from inside ztest itself. This makes that absolute path resolve here as it
-// does in a consuming crate, so the macro needs no in-crate special case.
+// `archive!` expands to `::ztest::…`, and `crate::snapshots` invokes it from inside
+// ztest → resolves here as in a consuming crate, no in-crate special case
 extern crate self as ztest;
 
 // ───────────────────────── test-author API ─────────────────────────────
-// The supported surface. Everything here is covered by ztest's SemVer.
+// Supported surface, covered by ztest's SemVer
 pub mod archive;
 pub mod backends;
 pub mod component;
@@ -32,10 +31,9 @@ pub mod snapshots;
 pub mod topology;
 
 // ───────────────────────── internal machinery ──────────────────────────
-// `pub` only because something outside the library reaches it: the `ztest`
-// binary (`cli`), or a proc-macro expansion in a *consumer* crate, which can
-// only name `::ztest::` paths (`inventory`, `qos`, `sync`). Hidden from the
-// docs and excluded from ztest's SemVer — treat as private.
+// `pub` only for reach from outside the library: the `ztest` binary (`cli`), or a
+// consumer-crate proc-macro expansion, which can only name `::ztest::` paths
+// (`inventory`, `qos`, `sync`). Doc-hidden, outside SemVer — treat as private
 #[doc(hidden)]
 pub mod cli;
 #[doc(hidden)]
@@ -46,6 +44,7 @@ pub mod qos;
 pub mod sync;
 
 mod cancel;
+mod capability;
 mod cluster;
 mod cluster_config;
 mod engine;
@@ -57,10 +56,13 @@ mod mounts;
 mod naming;
 mod observ;
 mod pipeline;
+mod plan;
 mod pod_status;
 mod portforward;
 mod profiling;
 mod proto;
+pub mod rate;
+mod record;
 mod resource;
 mod seeds;
 mod storage;
@@ -81,8 +83,8 @@ pub use crate::backends::zebra::ZebraValidator;
 #[cfg(feature = "zingo")]
 pub use crate::backends::zingo::{ZingoBackend, ZingoWallet};
 pub use crate::component::{
-    ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Indexer, Resources,
-    Validator, Wallet,
+    ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Cpu, Indexer, Mem,
+    Resources, Validator, Wallet,
 };
 pub use crate::env::{SharedVolume, TestEnv};
 pub use crate::error::{EnvError, RpcError};
@@ -108,8 +110,7 @@ pub use crate::loadtest::{
 pub use crate::mount::{Mount, MountKind, MountSource};
 pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file, needs, sync_test};
 
-/// Internal re-exports so test-author proc macros can reach their runtime
-/// support code. Not part of the public API; paths may change without notice.
+/// Runtime support for test-author proc macros. Not public API, paths may move
 #[doc(hidden)]
 pub mod __private {
     pub use inventory;
@@ -117,11 +118,10 @@ pub mod __private {
 
 // ─────────────────────────── test-author macros ────────────────────────
 
-/// Generate one `#[tokio::test(flavor = "multi_thread")]` wrapper per
-/// `name => helper` pair, each calling `helper::<$validator>(&$kind).await`.
+/// One `#[tokio::test(flavor = "multi_thread")]` wrapper per `name => helper` pair,
+/// each calling `helper::<$validator>(&$kind).await`.
 ///
-/// A macro, not a fn, because each wrapper must be a discoverable
-/// `#[tokio::test]` item.
+/// Macro not fn (each wrapper must be a discoverable `#[tokio::test]` item).
 ///
 /// ```ignore
 /// validator_tests!(
@@ -144,29 +144,25 @@ macro_rules! validator_tests {
 
 // ─────────────────────────── prelude ───────────────────────────────────
 
-/// One-shot import for test code. `use ztest::prelude::*;`.
+/// One-shot import for test code: `use ztest::prelude::*;`.
 ///
-/// Curation principle: prelude items must appear in a public signature test
-/// authors interact with. Convenience-only re-exports are rejected as SemVer
-/// noise that ties ztest's version to upstream churn.
+/// Entry bar: the item appears in a public signature test authors touch.
+/// Convenience-only re-exports = SemVer noise tying ztest's version to upstream churn
 pub mod prelude {
     #[cfg(feature = "zingo")]
     pub use super::ZingoWallet;
     pub use super::{
         Account, AccountId, ArchiveHandle, BlockHash, BlockHeight, BlockSample, BlockTip,
         BlockchainInfo, ChainConfig, CompactBlock, CompactTx, ComponentBuilder,
-        ComponentOptsBuilder, Endpoint, EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer,
-        IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, MempoolInfo, Mount,
+        ComponentOptsBuilder, Cpu, Endpoint, EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer,
+        IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo, Mount,
         MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction,
         RpcError, SendResponse, SharedVolume, ShieldedProtocol, SubtreeRoot, TestEnv, TreeState,
         TxId, Validator, ValidatorBackend, ValidatorConfig, Wallet, WalletBackend, WalletExt,
         ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
     };
-    /// `Activation` / `BoundaryCheck` / `ChainInfo` are what test bodies read
-    /// off [`TestEnv::chain`] — the pin, the straddled upgrade, the heights
-    /// worth querying — instead of hardcoding them. (`ArchiveHandle` itself
-    /// comes from the top-level re-export above; it names an artifact and
-    /// nothing more.)
+    /// What test bodies read off [`TestEnv::chain`] instead of hardcoding: the pin,
+    /// the straddled upgrade, the heights worth querying
     ///
     /// [`TestEnv::chain`]: crate::TestEnv::chain
     pub use crate::archive::{
@@ -181,17 +177,12 @@ pub mod prelude {
         Regtest, Testnet, regtest_test_activation_heights, regtest_test_lockbox_disbursements,
         regtest_test_post_nu6_funding_streams,
     };
-    /// The named snapshots, by network — `testnet::ORCHARD`,
-    /// `mainnet::BLOSSOM`. In the prelude because they are the entire
-    /// test-author surface for chain fixtures.
-    ///
-    /// The modules rather than the consts: both networks pin the same upgrade
-    /// names, so a bare `ORCHARD` in scope would silently mean whichever one
-    /// the prelude happened to pick.
+    /// Named snapshots by network (`testnet::ORCHARD`, `mainnet::BLOSSOM`) = the whole
+    /// test-author surface for chain fixtures. Modules not consts: both networks pin
+    /// the same upgrade names, so a bare `ORCHARD` would mean whichever one won
     pub use crate::snapshots::{mainnet, testnet};
-    /// `ActivationHeights` appears in ztest's public signatures (e.g.
-    /// [`ValidatorBackend::activation_heights`]), so callers need the type to
-    /// consume what ztest returns.
+    /// In public signatures (e.g. [`ValidatorBackend::activation_heights`]) → callers
+    /// need the type to consume what ztest returns
     pub use crate::topology::ActivationHeights;
     pub use ztest_macros::{
         archive, dev, mount_archive, mount_config, mount_file, needs, sync_test,

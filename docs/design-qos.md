@@ -44,6 +44,55 @@ Authors annotate a test with one of five attribute macros (snake_case path):
   terminate-after = 2`): flagged SLOW at one cap, hard-killed at 2×. Teardown on
   a timeout-kill relies on the janitor/ttl backstop.
 
+## Per-test footprint override
+
+A tier's reserve is a default, not a fixed allotment. A test whose topology does
+not fit its tier's component reserve declares its own:
+
+```rust
+#[ztest::qos::sync(footprint = "15c/29Gi")]
+
+#[ztest::sync_test(name = "…", subject = indexer, qos = sync, footprint = "15c/29Gi")]
+```
+
+- Replaces `QosProfile::footprint` — the **component** half — and nothing else.
+  `runner`, `pool`, `priority` and `hard_cap` still come from the tier: a test
+  that could raise its own priority or cap would starve its peers.
+- Grammar `"<cpu>/<mem>"`, parsed by `ztest_attr::footprint`, shared by the
+  proc-macro, the CLI's pre-compile source scan and `qos::units`. Units are
+  mandatory on both halves and CPU must be whole cores — a bare `29` would
+  otherwise become a 29-byte reserve, and a fractional core renders (rounded up)
+  as a pod larger than the reserve it was admitted against.
+- No I/O dimensions: those reserves are `0` pending calibration and nothing
+  charges them, so the grammar has no syntax for a promise no accounting collects.
+
+Lowering is `QosClass::profile_with(Option<Resources>)` → an *effective*
+`QosProfile`, and that is the single point the override takes effect. Everything
+downstream reads `profile.footprint` / `profile.admitted()`:
+
+| Consumer                              | Reads                    |
+|---------------------------------------|--------------------------|
+| namespace `ResourceQuota`             | `footprint`              |
+| default per-pod share (`share(n)`)     | `footprint`              |
+| `DeployBudget` ceiling                | `footprint`              |
+| ledger reservation, scheduler request | `admitted()`             |
+
+The reserve therefore stays honest in both directions: pods are never sized from
+one number and admitted against another, and `DeployBudget` still refuses a
+topology whose pods sum past the declared footprint. A test that declares more
+than it uses *holds* the difference for the life of the run — the amount is a
+promise to the rest of the cluster, so it is the author's job to keep it close to
+what the pods request.
+
+In-process, the override rides beside the tier through `qos::__enter` and is read
+back as `qos::current_profile()`. Out-of-process it travels pre-parsed in the
+link-time inventory (`FootprintDecl`), so no reader re-parses a quantity string.
+
+`ztest sync` resolves both tier and override from the profile's own declaration
+(`SyncTestEntry::profile`) rather than assuming the `sync` tier from the
+subcommand, and refuses a reserve larger than cluster `allocatable` up front
+instead of polling the ledger until it times out.
+
 ## The attribute macro — dual emission
 
 Each tier macro is the outer attribute on a test. It re-emits the item intact
@@ -136,7 +185,7 @@ v3.18 + k8s 1.34). So today the cap is:
 
 ### Node I/O ceiling — fio benchmark → annotation
 
-`ztest setup` runs one fio job per node and writes:
+`ztest cluster setup` runs one fio job per node and writes:
 
 - `ztest.io/io-bps` — aggregate sequential bandwidth (bytes/sec).
 - `ztest.io/io-iops` — random-4k IOPS ceiling (ops/sec).
@@ -262,7 +311,7 @@ grow_to(pod, container, cpu, mem):
 compile peak).
 
 `ztest-meta`, the run SA's `Lease` CRUD, and its `nodes`/`pods` read RBAC are
-provisioned by the resource graph (`resource::impls::policy`) during `ztest setup`.
+provisioned by the resource graph (`resource::impls::policy`) during `ztest cluster setup`.
 
 ## Calibration & metrics
 

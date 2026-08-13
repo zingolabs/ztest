@@ -2,21 +2,18 @@
 //!
 //! See `docs/design-architecture.md#seeds-content-addressed-archive-pvcs`.
 //!
-//! - The seed PVC lives in `ztest-seeds`, named `seed-{sha8}`, paired with
-//!   a `VolumeSnapshot` of the same name.
-//! - To use a seed from a test namespace we bind it there: a
-//!   `VolumeSnapshotContent` (cluster-scoped) pre-provisioned around the
-//!   seed's existing CSI snapshot handle, plus a `VolumeSnapshot`
-//!   (namespaced) bound to it. The test's PVC `dataSource` points at that
-//!   namespaced snapshot. This is the static-provisioning half of the same
-//!   bind that `PersistentVolume` / `PersistentVolumeClaim` perform: the two
-//!   objects are a name pair over storage that already exists. No data is
-//!   copied here — every binding for a given seed shares one backend
-//!   snapshot, which is why the content carries `deletionPolicy: Retain`.
-//!   The copy happens one layer down, when a PVC clones from the binding.
-//! - Materialization (uploading bytes to the seed PVC on first use) lives
-//!   in `materialize`, not here. This file resolves against a
-//!   pre-published seed.
+//! - Seed PVC in `ztest-seeds`, named `seed-{sha8}-{driver}`
+//!   ([`storage::seed_pvc_name`](crate::storage::seed_pvc_name)), paired with a
+//!   same-named `VolumeSnapshot`
+//! - Binding into a test namespace = cluster-scoped `VolumeSnapshotContent`
+//!   pre-provisioned around the seed's CSI handle + namespaced `VolumeSnapshot` bound
+//!   to it; the test PVC's `dataSource` points at the latter
+//! - Static-provisioning half of the `PersistentVolume`/`PersistentVolumeClaim` bind:
+//!   a name pair over storage that already exists, zero copying (hence
+//!   `deletionPolicy: Retain` — every binding shares one backend snapshot)
+//! - Copying happens one layer down, when a PVC clones from the binding
+//! - Materialization (first-use upload) lives in `materialize`; this file resolves
+//!   against an already-published seed
 
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, PostParams};
@@ -30,50 +27,46 @@ pub const SEEDS_NAMESPACE: &str = "ztest-seeds";
 
 /// Name prefix shared by both halves of a seed binding.
 ///
-/// The cluster-scoped content half is `Retain` and owner-ref-less, so a run
-/// killed mid-test strands it; `ztest snapshot prune` sweeps those orphans by
-/// this prefix when their labels are the only other handle. A constant rather
-/// than an inline literal because the sweep and the constructor going out of
-/// sync is exactly the bug that makes an orphan unreapable forever.
+/// - Content half = `Retain` + owner-ref-less → a run killed mid-test strands it
+/// - `ztest snapshot prune` sweeps orphans by this prefix
+/// - Constant, not a literal: sweep/constructor drift leaves an orphan unreapable forever
 pub(crate) const BINDING_PREFIX: &str = "seed-binding-";
 
-/// `(VolumeSnapshot in ztest-seeds, the CSI snapshot handle)`.
+/// `(VolumeSnapshot in ztest-seeds, CSI snapshot handle)`.
+///
+/// - `csi_driver` rides along (a handle resolves only under its creating driver)
+/// - `restore_size` = `status.restoreSize`, the floor for any restored PVC (a smaller
+///   clone request is rejected `OutOfRange`)
 #[derive(Debug, Clone)]
 pub struct SeedHandle {
     pub sha8: String,
     pub seed_pvc: String,
     pub seed_snapshot: String,
     pub csi_handle: String,
-    /// The snapshot's `status.restoreSize` — the floor for any PVC restored
-    /// from it. A clone that requests less is rejected outright by the CSI
-    /// driver (`OutOfRange: requested size is smaller than the size of the
-    /// source`), so this travels with the handle rather than being restated
-    /// at the call site: the two values must agree, and the only way to keep
-    /// them agreeing is for there to be one of them.
+    pub csi_driver: String,
     pub restore_size: String,
 }
 
-/// Read the CSI snapshot handle for an already-published seed. Assumes the
-/// PVC is `ready=true` and the paired VolumeSnapshot is bound;
-/// `materialize::provision_seed` / `await_seed` guarantee both before calling
-/// this. `archive` names the artifact for diagnostics only.
+/// CSI snapshot handle for an already-published seed. Callers must have a
+/// `ready=true` PVC and a bound VolumeSnapshot (`materialize::provision_seed` /
+/// `await_seed` guarantee both). `archive` = diagnostics only
 pub async fn read_seed_handle(
     client: &Client,
     archive: &str,
-    sha8: &str,
+    oid: &str,
+    driver: &str,
 ) -> Result<SeedHandle, EnvError> {
-    let pvc_name = format!("seed-{sha8}");
+    let sha8 = crate::storage::seed_sha8(oid);
+    let pvc_name = crate::storage::seed_pvc_name(oid, driver);
     let snap_gvk = volume_snapshot_gvk();
     let snap_api: Api<DynamicObject> =
         Api::namespaced_with(client.clone(), SEEDS_NAMESPACE, &snap_gvk);
-    let snap = snap_api
-        .get_opt(&pvc_name)
-        .await
-        .map_err(env_err)?
-        .ok_or_else(|| EnvError::ArchiveMaterializeFailed {
+    let snap = snap_api.get_opt(&pvc_name).await.map_err(env_err)?.ok_or_else(|| {
+        EnvError::ArchiveMaterializeFailed {
             archive: archive.to_string(),
             reason: format!("seed VolumeSnapshot {SEEDS_NAMESPACE}/{pvc_name} missing"),
-        })?;
+        }
+    })?;
     let bound_vsc_name = snap.data["status"]["boundVolumeSnapshotContentName"]
         .as_str()
         .ok_or_else(|| EnvError::ArchiveMaterializeFailed {
@@ -92,11 +85,16 @@ pub async fn read_seed_handle(
             reason: "bound content has no snapshotHandle".into(),
         })?
         .to_string();
+    let csi_driver = vsc.data["spec"]["driver"]
+        .as_str()
+        .ok_or_else(|| EnvError::ArchiveMaterializeFailed {
+            archive: archive.to_string(),
+            reason: format!("bound content {bound_vsc_name} declares no spec.driver"),
+        })?
+        .to_string();
 
-    // The provisioned seed volume, as the driver will report it when a clone
-    // asks to restore from this snapshot. Falling back to the configured seed
-    // size keeps a driver that omits `restoreSize` working, since that is the
-    // size the seed PVC was requested at in the first place.
+    // As the driver reports it to a restoring clone. Fallback = the configured seed
+    // size, which is what the seed PVC was requested at (covers drivers omitting it)
     let restore_size = snap.data["status"]["restoreSize"]
         .as_str()
         .map(str::to_string)
@@ -107,6 +105,7 @@ pub async fn read_seed_handle(
         seed_pvc: pvc_name.clone(),
         seed_snapshot: pvc_name,
         csi_handle,
+        csi_driver,
         restore_size,
     };
     tracing::info!(
@@ -114,60 +113,62 @@ pub async fn read_seed_handle(
         seed_pvc = %handle.seed_pvc,
         seed_snapshot = %handle.seed_snapshot,
         csi_handle = %handle.csi_handle,
+        csi_driver = %handle.csi_driver,
         restore_size = %handle.restore_size,
         "resolved seed handle"
     );
     Ok(handle)
 }
 
-/// Bind a published seed into a test namespace: a pre-provisioned
-/// VolumeSnapshotContent (cluster-scoped) around the seed's CSI snapshot
-/// handle, plus the in-namespace VolumeSnapshot bound to it. The returned
-/// snapshot name is the `dataSource` for the test's PVC.
+/// Bind a published seed into a test namespace → the `dataSource` for the test's PVC.
 ///
-/// The cluster-scoped content cannot ownerRef back to the namespaced sentinel
-/// (k8s GC won't cross scopes), so the library deletes it explicitly on
-/// teardown; see [`delete_binding`].
+/// - Cluster-scoped VolumeSnapshotContent around the seed's CSI handle + in-namespace
+///   VolumeSnapshot bound to it
+/// - Content cannot ownerRef the namespaced sentinel (k8s GC won't cross scopes) →
+///   deleted explicitly at teardown, see [`delete_binding`]
 pub async fn bind_seed(
     client: &Client,
     sentinel: &Sentinel,
     seed: &SeedHandle,
     suffix: &str,
 ) -> Result<SeedBinding, EnvError> {
-    // `suffix` is the consuming pod's prefix and ordinal (`zebrad-1`) — it
-    // disambiguates mounts *within* one test and nothing more. The namespace is
-    // what makes the content name unique, and it is load-bearing rather than
-    // decorative: a VolumeSnapshotContent is cluster-scoped, so two concurrent
-    // tests mounting the same fixture on a like-named pod would otherwise
-    // collide on one global name and the loser would fail with a 409
-    // `AlreadyExists`. That is deterministic for any parallel run sharing a
-    // fixture, not a race that needs bad luck. The namespace already carries a
-    // per-test random suffix (see `naming::namespace_for`), so it supplies the
-    // uniqueness for free — and it makes a stranded content self-describing:
-    // its name says which test leaked it even if the labels are unreadable.
-    //
-    // The snapshot half needs no namespace in its name: it *is* namespaced, so
-    // the scope that the content has to encode is already implicit.
-    let binding_content = format!(
-        "{BINDING_PREFIX}{}-{}-{}",
-        seed.sha8, sentinel.namespace, suffix
-    );
+    // `suffix` = consuming pod prefix + ordinal (`zebrad-1`), disambiguating mounts
+    // *within* one test only. The namespace is what makes the content name unique:
+    // VolumeSnapshotContent is cluster-scoped, so two concurrent tests mounting one
+    // fixture on a like-named pod collide 409 `AlreadyExists` — deterministic for any
+    // parallel run sharing a fixture, not a race. The namespace's per-test random
+    // suffix (`naming::namespace_for`) supplies that for free, and makes a stranded
+    // content name say which test leaked it.
+    // The snapshot half is itself namespaced → no namespace needed in its name
+    let storage = crate::resource::selected_storage(client)
+        .await
+        .map_err(|e| EnvError::Manifest { reason: e })?;
+
+    // Pre-provisioned content is taken on trust: a mismatched (driver, handle) reports
+    // `readyToUse` and fails later in the provisioner, as a PVC that never binds
+    if storage.provisioner != seed.csi_driver {
+        return Err(EnvError::ArchiveMaterializeFailed {
+            archive: seed.sha8.clone(),
+            reason: format!(
+                "seed was published on driver `{}`, but this cluster uses `{}` \
+                 (StorageClass {}) — snapshots cannot be restored across drivers",
+                seed.csi_driver, storage.provisioner, storage.class_name,
+            ),
+        });
+    }
+
+    let binding_content =
+        format!("{BINDING_PREFIX}{}-{}-{}", seed.sha8, sentinel.namespace, suffix);
     let binding_snapshot = format!("{BINDING_PREFIX}{}-{}", seed.sha8, suffix);
 
-    // VSC first: cluster-scoped, no owner.
+    // VSC first: cluster-scoped, no owner
     let vsc_gvk = volume_snapshot_content_gvk();
     let vsc_api: Api<DynamicObject> = Api::all_with(client.clone(), &vsc_gvk);
-    // A cluster-scoped VSC can't ownerRef the namespaced sentinel (k8s GC won't
-    // cross scopes) and so isn't cascaded by a namespace delete. Its labels are
-    // the only handle its reapers have: run-id/user for the by-identity (Ctrl-C)
-    // and by-owner (`ztest cleanup`) sweeps, and `test-ns` so the parent
-    // `ztest run` can delete exactly this test's VSCs at per-test teardown
-    // (the pod path no longer deletes them itself — see `pod_runner`).
+    // No ownerRef (GC won't cross scopes) → no namespace-delete cascade, so labels are
+    // the reapers' only handle: run-id/user for the by-identity (Ctrl-C) and by-owner
+    // (`ztest cleanup`) sweeps, `test-ns` for the parent's per-test teardown
     let coords = crate::naming::RunCoords::from_env().ok();
-    let run_id = coords
-        .as_ref()
-        .map(|c| c.run_id.clone())
-        .unwrap_or_default();
+    let run_id = coords.as_ref().map(|c| c.run_id.clone()).unwrap_or_default();
     let user = coords
         .as_ref()
         .map(|c| crate::naming::slug(&c.user, crate::naming::DNS_LABEL_MAX))
@@ -184,25 +185,21 @@ pub async fn bind_seed(
             },
         },
         "spec": {
-            "deletionPolicy": "Retain",  // we don't own the backend snapshot
-            "driver": detect_driver(client).await,
+            "deletionPolicy": "Retain",  // backend snapshot is not ours
+            "driver": storage.provisioner,
             "source": { "snapshotHandle": seed.csi_handle },
             "sourceVolumeMode": "Filesystem",
             "volumeSnapshotRef": {
                 "name": binding_snapshot,
                 "namespace": sentinel.namespace,
             },
-            "volumeSnapshotClassName": detect_snapshot_class(),
+            "volumeSnapshotClassName": storage.snapshot_class,
         }
     });
     let vsc_obj: DynamicObject = serde_json::from_value(vsc_body).expect("static manifest");
-    vsc_api
-        .create(&PostParams::default(), &vsc_obj)
-        .await
-        .map_err(env_err)?;
+    vsc_api.create(&PostParams::default(), &vsc_obj).await.map_err(env_err)?;
 
-    // In-namespace VolumeSnapshot. Namespace cascade reaps it on
-    // teardown; no owner-ref required.
+    // In-namespace: the namespace cascade reaps it, no owner-ref needed
     let snap_gvk = volume_snapshot_gvk();
     let snap_api: Api<DynamicObject> =
         Api::namespaced_with(client.clone(), &sentinel.namespace, &snap_gvk);
@@ -214,20 +211,14 @@ pub async fn bind_seed(
         },
         "spec": {
             "source": { "volumeSnapshotContentName": binding_content },
-            "volumeSnapshotClassName": detect_snapshot_class(),
+            "volumeSnapshotClassName": storage.snapshot_class,
         }
     });
     let snap_obj: DynamicObject = serde_json::from_value(snap_body).expect("static manifest");
-    snap_api
-        .create(&PostParams::default(), &snap_obj)
-        .await
-        .map_err(env_err)?;
+    snap_api.create(&PostParams::default(), &snap_obj).await.map_err(env_err)?;
 
-    let binding = SeedBinding {
-        binding_content,
-        binding_snapshot,
-        namespace: sentinel.namespace.clone(),
-    };
+    let binding =
+        SeedBinding { binding_content, binding_snapshot, namespace: sentinel.namespace.clone() };
     tracing::info!(
         seed_sha8 = %seed.sha8,
         content = %binding.binding_content,
@@ -238,33 +229,23 @@ pub async fn bind_seed(
     Ok(binding)
 }
 
-/// What [`bind_seed`] hands back: the two objects that together bind one
-/// published seed into one test namespace. The library tracks these in
-/// `TestEnv` so the cluster-scoped content half can be deleted explicitly at
-/// teardown — the namespaced half goes with the namespace.
+/// [`bind_seed`]'s two objects, binding one published seed into one test namespace.
+/// Tracked in `TestEnv` to delete the cluster-scoped half explicitly (the namespaced
+/// half goes with the namespace)
 #[derive(Debug, Clone)]
 pub struct SeedBinding {
-    /// The cluster-scoped `VolumeSnapshotContent`, pre-provisioned around the
-    /// snapshot handle the seed already owns.
     pub binding_content: String,
-    /// The namespaced `VolumeSnapshot` bound to it — the test PVC's
-    /// `dataSource`.
     pub binding_snapshot: String,
     pub namespace: String,
 }
 
-/// Best-effort deletion of the cluster-scoped content half. The namespaced
-/// snapshot half cascades with the test namespace.
-///
-/// This never destroys data: the content is `deletionPolicy: Retain`, so the
-/// backend snapshot the seed owns outlives every binding taken against it.
+/// Best-effort delete of the cluster-scoped content half (the namespaced snapshot
+/// cascades with the test namespace). Never destroys data — `deletionPolicy: Retain`
+/// keeps the seed's backend snapshot past every binding
 pub async fn delete_binding(client: &Client, binding: &SeedBinding) -> Result<(), EnvError> {
     let vsc_gvk = volume_snapshot_content_gvk();
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &vsc_gvk);
-    match api
-        .delete(&binding.binding_content, &Default::default())
-        .await
-    {
+    match api.delete(&binding.binding_content, &Default::default()).await {
         Ok(_) => {
             tracing::info!(
                 content = %binding.binding_content,
@@ -300,38 +281,4 @@ pub(crate) fn volume_snapshot_content_gvk() -> ApiResource {
         version: "v1".into(),
         kind: "VolumeSnapshotContent".into(),
     })
-}
-
-/// CSI driver name for a binding's `VolumeSnapshotContent`. This must equal
-/// the driver that backs the seed's snapshot; it's the one value we can't
-/// alias by name (the StorageClass / VolumeSnapshotClass names we do keep
-/// identical across Ceph and kind).
-///
-/// Resolution order:
-/// 1. `ZAINO_CSI_DRIVER` env override (explicit operator control).
-/// 2. The `driver` field of the live `VolumeSnapshotClass` we're using.
-///    This makes `ztest setup` turnkey: on kind the class is backed by
-///    `hostpath.csi.k8s.io`, on Ceph by `rook-ceph.rbd.csi.ceph.com`, and
-///    we read whichever is installed.
-/// 3. The Ceph default, as a last resort if the class can't be read.
-async fn detect_driver(client: &Client) -> String {
-    if let Ok(d) = std::env::var("ZAINO_CSI_DRIVER") {
-        return d;
-    }
-    let class = detect_snapshot_class();
-    let gvk = GroupVersionKind {
-        group: "snapshot.storage.k8s.io".into(),
-        version: "v1".into(),
-        kind: "VolumeSnapshotClass".into(),
-    };
-    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ApiResource::from_gvk(&gvk));
-    if let Ok(Some(c)) = api.get_opt(&class).await
-        && let Some(d) = c.data.get("driver").and_then(Value::as_str)
-    {
-        return d.to_string();
-    }
-    "rook-ceph.rbd.csi.ceph.com".into()
-}
-fn detect_snapshot_class() -> String {
-    std::env::var("ZAINO_VOLUMESNAPSHOTCLASS").unwrap_or_else(|_| "ceph-rbd-snapclass".into())
 }

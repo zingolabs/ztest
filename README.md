@@ -3,16 +3,17 @@
 Boot Zcash topologies (validators, indexers, wallets) on Kubernetes and
 hand **typed RPC handles** back to test code.
 
-### Quickstart: run against a local kind cluster
-
-Create a kind cluster, register it as a ztest profile, and run — the profile
-binds the kube-context and image distribution so every `ztest run` lands there:
+### Quickstart
 
 ```sh
-kind create cluster --name ztest
-ztest cluster add local --kind ztest --set-default
+kind create cluster
+ztest cluster add kind --kind kind --set-default
+ztest cluster setup
 ztest run
 ```
+
+A stock kind cluster cannot snapshot, so seeded tests will fail — `ztest cluster check` says so. See [docs/ops-local-cluster.md](docs/ops-local-cluster.md) to fix
+that; [docs/ops-clusters.md](docs/ops-clusters.md) covers remote clusters.
 
 ## Usage
 
@@ -95,3 +96,9 @@ cargo run --bin ztest -- --help
 ```
 
 ## TODO
+
+- [ ] Review config rendering path (Use rust structs instead of toml? How to handle version matrix w/ config migrations?) -> Put this into a trait?
+
+  - That way zaino developers can define the function to generate the config toml based on the version? Need a clear example of how this would look
+
+- [ ] Migrate src/backends/zainod.rs to src/backends/zainod/{config,backend,sync}.rs

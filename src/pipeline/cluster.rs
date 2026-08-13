@@ -1,7 +1,8 @@
-//! Phase A1: cluster probe. Discovers the kube context, sums schedulable node
-//! capacity, and counts `ztest-{ci,dev}-*` namespaces as a slot-utilisation
-//! proxy. [`ProbeOutcome`] separates a clean probe (`Ok`), no reachable cluster
-//! (`Missing`, soft fail), and a reached-but-failing cluster (`Failed`, abort).
+//! Phase A1 cluster probe: kube context, schedulable node capacity, and
+//! `ztest-{ci,dev}-*` namespace count as a slot-utilisation proxy.
+//!
+//! [`ProbeOutcome`] separates `Ok`, `Missing` (no reachable cluster, soft fail) and
+//! `Failed` (reached but failing, abort)
 
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -14,10 +15,9 @@ use crate::qos::{ClusterCapacity, Resources, units};
 
 use super::events::{Event, EventTx};
 
-/// Outcome of one Phase-A1 run.
-///
-/// Mirrors the [`super::BuildOutcome`] shape so the caller can write a single
-/// `match outcome` per phase rather than juggling `Result<Option<_>, _>`.
+/// Outcome of one Phase-A1 run, shaped like [`super::BuildOutcome`] → one `match
+/// outcome` per phase, no `Result<Option<_>, _>` juggling. `Missing` (no readable
+/// kubeconfig) is a soft fail
 #[derive(Debug, Clone)]
 pub enum ProbeOutcome {
     Ok {
@@ -25,24 +25,22 @@ pub enum ProbeOutcome {
         slots_used: u32,
         nodes_ready: u32,
         nodes_cordoned: u32,
-        /// Whole-cluster schedulable capacity (allocatable minus sum of reserved).
         capacity: ClusterCapacity,
     },
-    /// No kubeconfig found, or the inferred config can't be read. Soft fail; the
-    /// run continues without cluster data.
-    Missing { detail: String },
-    /// Cluster reached but the probe couldn't complete. Hard fail; abort the run.
-    Failed { detail: String },
+    Missing {
+        detail: String,
+    },
+    Failed {
+        detail: String,
+    },
 }
 
-/// Run the probe, emit lifecycle events, and return the outcome plus (on success)
-/// the [`kube::Client`] for downstream A-sub-phases, so they don't re-pay
-/// kubeconfig resolution. Never panics; errors are encoded in [`ProbeOutcome`].
+/// Returned [`kube::Client`] passes to the downstream A-sub-phases (no second
+/// kubeconfig resolution). Never panics; errors ride in the outcome
 pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
     let _ = tx.send(Event::ProbeStarted);
 
-    // Honor the profile's kube-context, not the kubeconfig's current-context,
-    // which may point elsewhere.
+    // Profile's kube-context, not the kubeconfig's current-context (may point elsewhere)
     let config = match crate::cluster::config().await {
         Ok(c) => c,
         Err(err) => {
@@ -52,8 +50,7 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
         }
     };
 
-    // `kube::Config` doesn't expose the context name; the cluster URL host is
-    // the closest stable identifier.
+    // `kube::Config` exposes no context name; cluster URL host = closest stable id
     let context = config.cluster_url.host().unwrap_or("(unknown)").to_string();
 
     let client = match Client::try_from(config) {
@@ -65,15 +62,14 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
         }
     };
 
-    // Fail fast naming the exact missing grants, rather than letting a 403
-    // surface deep in the probe or mid-run. A failing SSAR call is ignored — the
-    // real work below surfaces any genuine outage.
+    // Fail fast naming the exact missing grants, not a 403 deep in the probe or
+    // mid-run. A failing SSAR is ignored (the real work below surfaces an outage)
     if let Ok(missing) =
-        crate::resource::check_run_access(&client, crate::backends::image::selected_backend()).await
+        crate::resource::check_run_access(&client, crate::backends::image::selected_class()).await
         && !missing.is_empty()
     {
         let detail = format!(
-            "run identity is missing cluster permissions: {}. Re-run `ztest setup` with an admin \
+            "run identity is missing cluster permissions: {}. Re-run `ztest cluster setup` with an admin \
              kubeconfig to update the `{}` role, or grant these to the run ServiceAccount.",
             missing.join(", "),
             crate::resource::RUN_CLUSTER_ROLE,
@@ -84,9 +80,8 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
 
     let nodes_api: Api<Node> = Api::all(client.clone());
     let ns_api: Api<Namespace> = Api::all(client.clone());
-    // Pods (CPU/memory) and PVCs (disk-I/O, declared on the storage request, not
-    // the pod) are listed cluster-wide so scheduled load subtracts from node
-    // allocatable.
+    // Pods (CPU/memory) + PVCs (disk-I/O, declared on the storage request) listed
+    // cluster-wide → scheduled load subtracts from node allocatable
     let pods_api: Api<Pod> = Api::all(client.clone());
     let pvcs_api: Api<PersistentVolumeClaim> = Api::all(client.clone());
 
@@ -111,19 +106,9 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
 
     let _ = tx.send(Event::ProbeComplete);
 
-    (
-        ProbeOutcome::Ok {
-            context,
-            slots_used,
-            nodes_ready,
-            nodes_cordoned,
-            capacity,
-        },
-        Some(client),
-    )
+    (ProbeOutcome::Ok { context, slots_used, nodes_ready, nodes_cordoned, capacity }, Some(client))
 }
 
-/// `true` if the node reports a `Ready` condition.
 fn node_ready(node: &Node) -> bool {
     node.status
         .as_ref()
@@ -132,67 +117,56 @@ fn node_ready(node: &Node) -> bool {
         .unwrap_or(false)
 }
 
-/// `true` if the node is cordoned (`spec.unschedulable`).
 fn node_cordoned(node: &Node) -> bool {
-    node.spec
-        .as_ref()
-        .and_then(|s| s.unschedulable)
-        .unwrap_or(false)
+    node.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false)
 }
 
-/// `(ready, cordoned)` node counts for the banner.
 fn count_nodes(nodes: &[Node]) -> (u32, u32) {
     let ready = nodes.iter().filter(|n| node_ready(n)).count() as u32;
     let cordoned = nodes.iter().filter(|n| node_cordoned(n)).count() as u32;
     (ready, cordoned)
 }
 
-/// Count schedulable NVMe-pool nodes: Ready, not cordoned, and carrying the NVMe
-/// pool label ([`NVME_NODE_LABEL_KEY`]=[`NVME_NODE_LABEL_VALUE`]). Sizes the
-/// `qos-sync` test-group; `0` on a cluster with no NVMe pool (dev / kind), which
-/// A node's `status.allocatable` as [`Resources`] (millicpu + bytes).
+/// `status.allocatable` as [`Resources`]: millicpu and bytes
 fn node_allocatable(node: &Node) -> Resources {
     let Some(alloc) = node.status.as_ref().and_then(|s| s.allocatable.as_ref()) else {
         return Resources::ZERO;
     };
-    let cpu = alloc
-        .get("cpu")
-        .map(|q| units::parse_cpu_milli(&q.0))
-        .unwrap_or(0);
-    let mem = alloc
-        .get("memory")
-        .map(|q| units::parse_mem_bytes(&q.0))
-        .unwrap_or(0);
-    // I/O ceiling is unbounded until the node is benchmarked (docs/design-qos.md).
+    let cpu = alloc.get("cpu").map(|q| units::parse_cpu_milli(&q.0)).unwrap_or(0);
+    let mem = alloc.get("memory").map(|q| units::parse_mem_bytes(&q.0)).unwrap_or(0);
+    // I/O ceiling unbounded until the node is benchmarked (docs/design-qos.md)
     Resources::cpu_mem_unbounded_io(cpu, mem)
 }
 
-/// Total allocatable across schedulable nodes (Ready and not cordoned). Generic
-/// over the item source so the one-shot probe (`&[Node]`) and the reflector-backed
-/// watcher (`Vec<Arc<Node>>`) share one fold without cloning.
+/// Total allocatable across schedulable (Ready, uncordoned) nodes. Generic over the
+/// item source so the one-shot probe and the reflector-backed watcher share one fold
 fn cluster_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Resources {
     nodes
         .into_iter()
         .filter(|n| node_ready(n) && !node_cordoned(n))
-        .fold(Resources::ZERO, |acc, n| {
-            acc.saturating_add(&node_allocatable(n))
-        })
+        .fold(Resources::ZERO, |acc, n| acc.saturating_add(&node_allocatable(n)))
 }
 
-/// `true` if a pod is scheduled (has a node) and still consuming capacity
-/// (not `Succeeded`/`Failed`).
+/// Sole source of a [`ClusterCapacity`] — probe banner, scheduler ceiling and ledger
+/// all admit against this one reading
+pub(crate) async fn probe_capacity(client: &Client) -> Result<ClusterCapacity, String> {
+    let lp = ListParams::default();
+    let (nodes_api, pods_api, pvcs_api): (Api<Node>, Api<Pod>, Api<PersistentVolumeClaim>) =
+        (Api::all(client.clone()), Api::all(client.clone()), Api::all(client.clone()));
+    let (nodes, pods, pvcs) =
+        tokio::try_join!(nodes_api.list(&lp), pods_api.list(&lp), pvcs_api.list(&lp))
+            .map_err(|e| format!("probe cluster capacity: {e}"))?;
+    Ok(capacity_from(&nodes.items, &pods.items, &pvcs.items))
+}
+
+/// Scheduled and not yet `Succeeded`/`Failed`, so still holding capacity
 fn pod_consumes(pod: &Pod) -> bool {
-    let scheduled = pod
-        .spec
-        .as_ref()
-        .and_then(|s| s.node_name.as_ref())
-        .is_some();
+    let scheduled = pod.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_some();
     let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
     scheduled && !matches!(phase, Some("Succeeded") | Some("Failed"))
 }
 
-/// The fold shared by the one-shot probe and [`super::capacity_watch`], so both
-/// derive the banner figure identically.
+/// Shared by the one-shot probe and [`super::capacity_watch`] → identical banner figure
 pub(crate) fn capacity_from<'a>(
     nodes: impl IntoIterator<Item = &'a Node>,
     pods: impl IntoIterator<Item = &'a Pod>,
@@ -204,38 +178,25 @@ pub(crate) fn capacity_from<'a>(
     }
 }
 
-/// Sum over scheduled, live pods of their effective CPU/memory request, plus each
-/// pod's PVC I/O — what's subtracted from allocatable to yield schedulable
-/// headroom.
+/// Subtracted from allocatable to yield schedulable headroom.
 ///
-/// The request, not the limit: reserving the limit would sterilize the node for a
-/// pod that merely *could* burst, and the request is exactly what the kube
-/// scheduler packs against, so this mirrors what will actually place. Disk I/O is
-/// summed separately from the PVCs each pod mounts, since it's declared on the
-/// storage request.
+/// - The *request*, not the limit (reserving a limit sterilizes a node for a pod that
+///   merely *could* burst; request = what the kube scheduler packs against)
+/// - Disk I/O summed separately from mounted PVCs (declared on the storage request)
 fn cluster_reserved<'a>(
     pods: impl IntoIterator<Item = &'a Pod>,
     pvcs: impl IntoIterator<Item = &'a PersistentVolumeClaim>,
 ) -> Resources {
-    let by_name: HashMap<&str, &PersistentVolumeClaim> = pvcs
-        .into_iter()
-        .filter_map(|p| Some((p.metadata.name.as_deref()?, p)))
-        .collect();
-    pods.into_iter()
-        .filter(|p| pod_consumes(p))
-        .fold(Resources::ZERO, |acc, pod| {
-            let request = pod
-                .spec
-                .as_ref()
-                .map(units::pod_effective_request)
-                .unwrap_or(Resources::ZERO);
-            acc.saturating_add(&request)
-                .saturating_add(&pod_io_reservation(pod, &by_name))
-        })
+    let by_name: HashMap<&str, &PersistentVolumeClaim> =
+        pvcs.into_iter().filter_map(|p| Some((p.metadata.name.as_deref()?, p))).collect();
+    pods.into_iter().filter(|p| pod_consumes(p)).fold(Resources::ZERO, |acc, pod| {
+        let request =
+            pod.spec.as_ref().map(units::pod_effective_request).unwrap_or(Resources::ZERO);
+        acc.saturating_add(&request).saturating_add(&pod_io_reservation(pod, &by_name))
+    })
 }
 
-/// Sum of the I/O reservations of the PVCs a pod mounts. Storage is RWO, so a
-/// PVC binds to at most one pod — no double counting across pods.
+/// I/O reservations of a pod's mounted PVCs. RWO → one PVC binds one pod, no double count
 fn pod_io_reservation(pod: &Pod, by_name: &HashMap<&str, &PersistentVolumeClaim>) -> Resources {
     let Some(spec) = pod.spec.as_ref() else {
         return Resources::ZERO;
@@ -245,13 +206,11 @@ fn pod_io_reservation(pod: &Pod, by_name: &HashMap<&str, &PersistentVolumeClaim>
         .flatten()
         .filter_map(|v| v.persistent_volume_claim.as_ref())
         .filter_map(|c| by_name.get(c.claim_name.as_str()))
-        .fold(Resources::ZERO, |acc, pvc| {
-            acc.saturating_add(&units::pvc_io_reservation(pvc))
-        })
+        .fold(Resources::ZERO, |acc, pvc| acc.saturating_add(&units::pvc_io_reservation(pvc)))
 }
 
-/// Count `zaino-{ci,dev}-*` namespaces as the proxy for current concurrency.
-/// To be replaced by an authoritative `Session` CR count once F1/F2 land.
+/// `zaino-{ci,dev}-*` namespaces proxy current concurrency (no authoritative session
+/// record to count yet)
 fn count_zaino_slots(namespaces: &[Namespace]) -> u32 {
     namespaces
         .iter()
@@ -272,15 +231,12 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use std::collections::BTreeMap;
 
-    // Quantity parsing lives in `qos::units`; here we test the node/pod
-    // aggregation over hand-built objects, no cluster needed.
+    // Quantity parsing = `qos::units`; here it's node/pod aggregation over hand-built
+    // objects, no cluster
 
     fn node(ready: bool, cordoned: bool, cpu: &str, mem: &str) -> Node {
         Node {
-            spec: Some(NodeSpec {
-                unschedulable: Some(cordoned),
-                ..Default::default()
-            }),
+            spec: Some(NodeSpec { unschedulable: Some(cordoned), ..Default::default() }),
             status: Some(NodeStatus {
                 conditions: Some(vec![NodeCondition {
                     type_: "Ready".into(),
@@ -315,16 +271,12 @@ mod tests {
                 }],
                 ..Default::default()
             }),
-            status: Some(PodStatus {
-                phase: Some(phase.to_string()),
-                ..Default::default()
-            }),
+            status: Some(PodStatus { phase: Some(phase.to_string()), ..Default::default() }),
             ..Default::default()
         }
     }
 
-    /// Like [`pod`], but also mounting the named PVC (the pod→PVC join the probe
-    /// walks to reserve disk I/O).
+    /// [`pod`] + the named PVC mounted (the pod→PVC join the probe walks for disk I/O)
     fn pod_mounting(node_name: &str, phase: &str, cpu: &str, mem: &str, claim: &str) -> Pod {
         use k8s_openapi::api::core::v1::{PersistentVolumeClaimVolumeSource, Volume};
         let mut p = pod(Some(node_name), phase, cpu, mem);
@@ -339,7 +291,6 @@ mod tests {
         p
     }
 
-    /// A PVC carrying the ztest disk-I/O annotations (the storage-request cap).
     fn pvc_with_io(name: &str, io_bps: &str, io_iops: &str) -> PersistentVolumeClaim {
         pvc_with_io_opt(name, Some(io_bps), Some(io_iops))
     }
@@ -399,16 +350,14 @@ mod tests {
             pod(Some("n1"), "Failed", "1", "1Gi"),       // finished → excluded
         ];
         let r = cluster_reserved(&pods, &[]);
-        // Request-only pods reserve their request, so the counted ones sum
-        // exactly: 500m + 500m, 512Mi + 512Mi.
+        // Request-only pods reserve their request → counted ones sum exactly
         assert_eq!(r.cpu_milli, 1000);
         assert_eq!(r.mem_bytes, 1024 * 1024 * 1024);
     }
 
     #[test]
     fn reserved_counts_a_burstable_pod_at_its_request_not_its_limit() {
-        // A Burstable co-tenant is charged its request (what the scheduler packs
-        // against), not its larger limit.
+        // Burstable co-tenant charged its request (what the scheduler packs against)
         let pods = vec![burstable_pod("n1", BUILDKIT_REQ, BUILDKIT_LIM)];
         let r = cluster_reserved(&pods, &[]);
         assert_eq!(r.cpu_milli, BUILDKIT_REQ.cpu_milli);
@@ -417,8 +366,8 @@ mod tests {
 
     #[test]
     fn reserved_counts_disk_io_declared_on_the_pods_pvc() {
-        // Disk I/O is reserved from the storage request the pod mounts, not from
-        // the pod spec: the probe joins pod → PVC and sums the PVC's cap.
+        // Disk I/O comes off the mounted storage request, not the pod spec: probe joins
+        // pod → PVC and sums the PVC's cap
         let pods = vec![pod_mounting("n1", "Running", "1", "1Gi", "chain-data")];
         let pvcs = vec![pvc_with_io("chain-data", "100Mi", "5000")];
         let r = cluster_reserved(&pods, &pvcs);
@@ -426,16 +375,15 @@ mod tests {
         assert_eq!(r.mem_bytes, crate::qos::GIB, "mem from the pod");
         assert_eq!(r.io_bps, 100 * crate::qos::MIB, "io from the PVC");
         assert_eq!(r.io_iops, 5000, "io from the PVC");
-        // An uncapped volume (no annotation) contributes no I/O reservation.
+        // Uncapped volume (no annotation) reserves no I/O
         let bare = vec![pvc_with_io_opt("chain-data", None, None)];
         assert_eq!(cluster_reserved(&pods, &bare).io_bps, 0);
     }
 
     #[test]
     fn capacity_from_subtracts_a_scheduled_build_pod() {
-        // Regression: a scheduled 16c/24Gi build pod must lower free capacity by
-        // its request. The one-shot probe missed this only because it ran before
-        // the pod was created — the fold itself always counts it.
+        // Regression: a scheduled 16c/24Gi build pod lowers free by its request (the
+        // one-shot probe missed it only by running first — the fold always counts it)
         let nodes = vec![node(true, false, "72", "48Gi")];
         let build = crate::qos::build::BUILDKIT_BUILD;
         let pods = vec![burstable_pod("n1", build, build)];
@@ -454,19 +402,17 @@ mod tests {
         assert_eq!(cap.free().mem_bytes, 12 * crate::qos::GIB);
     }
 
-    // A build pod reserved at its burst *limit* would sterilize the node, so it's
-    // reserved at its request — what the scheduler packs against. A real burst is
-    // bounded by k8s QoS eviction, not by pre-reserving the ceiling.
+    // Reserving a build pod's burst *limit* sterilizes the node → reserve its request,
+    // what the scheduler packs against; a real burst is bounded by QoS eviction
 
     use crate::qos::GIB;
     use crate::qos::Resources;
 
-    /// A build co-tenant with burst room: request well below limit.
+    /// Build co-tenant with burst room: request well below limit
     const BUILDKIT_REQ: Resources = Resources::new(8_000, 4 * GIB, 0, 0);
     const BUILDKIT_LIM: Resources = Resources::new(24_000, 16 * GIB, 0, 0);
 
-    /// A Burstable pod: `requests` below `limits`, so k8s schedules it at
-    /// `requests` yet lets it grow to `limits`.
+    /// Burstable: `requests` < `limits`, scheduled at `requests`, grows to `limits`
     fn burstable_pod(node_name: &str, req: Resources, lim: Resources) -> Pod {
         use k8s_openapi::api::core::v1::{Container, ResourceRequirements};
         let quantities = |r: &Resources| {
@@ -489,16 +435,12 @@ mod tests {
                 }],
                 ..Default::default()
             }),
-            status: Some(PodStatus {
-                phase: Some("Running".to_string()),
-                ..Default::default()
-            }),
+            status: Some(PodStatus { phase: Some("Running".to_string()), ..Default::default() }),
             ..Default::default()
         }
     }
 
-    /// One node with an idle build co-tenant (usage ≤ request), as during a test
-    /// wave after the build finished.
+    /// One node, idle build co-tenant (usage ≤ request), as in a post-build test wave
     fn crc_with_idle_buildkit() -> ClusterCapacity {
         let nodes = vec![node(true, false, "72", "48Gi")];
         let pods = vec![burstable_pod("n1", BUILDKIT_REQ, BUILDKIT_LIM)];
@@ -509,7 +451,7 @@ mod tests {
     fn free_credits_idle_build_pod_at_request_not_limit() {
         let cap = crc_with_idle_buildkit();
         let free = cap.free();
-        // Free is allocatable − request, not allocatable − limit.
+        // Free = allocatable − request, not − limit
         let expected = cap.allocatable.saturating_sub(&BUILDKIT_REQ);
         assert_eq!(free.cpu_milli, expected.cpu_milli);
         assert_eq!(free.mem_bytes, expected.mem_bytes);
@@ -525,8 +467,8 @@ mod tests {
         use crate::qos::scheduler::{Admission, Request, Scheduler};
 
         let cap = crc_with_idle_buildkit();
-        // Seed exactly as `ztest run` does: `qos_plan_from` and the engine
-        // scheduler both take `ClusterCapacity::free()` as the ceiling.
+        // Seeded as `ztest run` does: `qos_plan_from` + the engine scheduler both take
+        // `ClusterCapacity::free()` as the ceiling
         let mut sched = Scheduler::new(cap.free());
         let profile = QosClass::Integration.profile();
 
@@ -546,14 +488,10 @@ mod tests {
                 _ => break,
             }
         }
-        assert!(
-            sched.active_leases() > 0,
-            "the wave should admit at least one test"
-        );
+        assert!(sched.active_leases() > 0, "the wave should admit at least one test");
 
-        // The scheduler packs by request, so the admitted wave plus the build
-        // pod's request must fit allocatable — that's what actually gets
-        // scheduled. A burst above request is bounded by kubelet eviction.
+        // Scheduler packs by request → admitted wave + build pod's request must fit
+        // allocatable; a burst above request is bounded by kubelet eviction
         let packed = committed.checked_add(&BUILDKIT_REQ).unwrap();
         assert!(
             packed.fits_within(&cap.allocatable),
@@ -567,10 +505,7 @@ mod tests {
     fn count_zaino_slots_matches_only_zaino_namespaces() {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
         let ns = |name: &str| Namespace {
-            metadata: ObjectMeta {
-                name: Some(name.to_string()),
-                ..Default::default()
-            },
+            metadata: ObjectMeta { name: Some(name.to_string()), ..Default::default() },
             ..Default::default()
         };
         let nss = vec![

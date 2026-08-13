@@ -25,19 +25,13 @@ impl Parse for MountArgs {
         let destination: LitStr = input.parse()?;
         // Allow trailing comma.
         let _ = input.parse::<Option<Token![,]>>();
-        Ok(MountArgs {
-            source,
-            destination,
-        })
+        Ok(MountArgs { source, destination })
     }
 }
 
 fn resolve_source(rel: &LitStr) -> Result<std::path::PathBuf, syn::Error> {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
-        syn::Error::new(
-            rel.span(),
-            "CARGO_MANIFEST_DIR not set; cannot resolve mount source",
-        )
+        syn::Error::new(rel.span(), "CARGO_MANIFEST_DIR not set; cannot resolve mount source")
     })?;
     let value = rel.value();
     let p = std::path::Path::new(&manifest).join(&value);
@@ -113,10 +107,7 @@ fn emit_seed_mount(
 /// is valid UTF-8, and is `< 1 MiB`.
 #[proc_macro]
 pub fn mount_config(input: TokenStream) -> TokenStream {
-    let MountArgs {
-        source,
-        destination,
-    } = parse_macro_input!(input as MountArgs);
+    let MountArgs { source, destination } = parse_macro_input!(input as MountArgs);
     let abs = match resolve_source(&source) {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
@@ -146,10 +137,7 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
     {
         return syn::Error::new(
             source.span(),
-            format!(
-                "mount_config! requires UTF-8 source; {} is not UTF-8",
-                abs.display()
-            ),
+            format!("mount_config! requires UTF-8 source; {} is not UTF-8", abs.display()),
         )
         .to_compile_error()
         .into();
@@ -164,10 +152,7 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
 /// source must be a Git LFS object, like every seed.
 #[proc_macro]
 pub fn mount_file(input: TokenStream) -> TokenStream {
-    let MountArgs {
-        source,
-        destination,
-    } = parse_macro_input!(input as MountArgs);
+    let MountArgs { source, destination } = parse_macro_input!(input as MountArgs);
     let abs = match resolve_source(&source) {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
@@ -186,10 +171,7 @@ pub fn mount_file(input: TokenStream) -> TokenStream {
 /// the source must be a Git LFS object, like every seed.
 #[proc_macro]
 pub fn mount_archive(input: TokenStream) -> TokenStream {
-    let MountArgs {
-        source,
-        destination,
-    } = parse_macro_input!(input as MountArgs);
+    let MountArgs { source, destination } = parse_macro_input!(input as MountArgs);
     let abs = match resolve_source(&source) {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
@@ -228,14 +210,8 @@ pub fn mount_archive(input: TokenStream) -> TokenStream {
 /// small.
 #[proc_macro]
 pub fn dev(input: TokenStream) -> TokenStream {
-    let DevArgs {
-        variant,
-        source,
-        version,
-        features,
-        rust_version,
-        rust_versions,
-    } = parse_macro_input!(input as DevArgs);
+    let DevArgs { variant, source, version, features, rust_version, rust_versions } =
+        parse_macro_input!(input as DevArgs);
 
     if rust_version.is_some() && rust_versions.is_some() {
         return syn::Error::new(
@@ -254,36 +230,31 @@ pub fn dev(input: TokenStream) -> TokenStream {
     //     repo name in the resolved `<repo>:dev-<suffix>` tag),
     //   - as the constructor ident (`Indexer::zainod_dev(...)`),
     //   - keyed lookup of default cargo features below.
-    let (kind_str, default_features): (String, Vec<&'static str>) = match (
-        variant.category.to_string().as_str(),
-        variant.variant.to_string().as_str(),
-    ) {
-        ("Validator", "Zebrad") => ("zebrad".to_string(), vec![]),
-        ("Validator", "Zcashd") => ("zcashd".to_string(), vec![]),
-        // `allow_unencrypted_public_json_rpc_bind`: pod-per-test needs zaino's
-        // JSON-RPC on 0.0.0.0 for cross-pod access. These features are the single
-        // origin — threaded into both the inventory decl and the constructor below.
-        ("Indexer", "Zainod") => (
-            "zainod".to_string(),
-            vec![
-                "no_tls_use_unencrypted_traffic",
-                "allow_unencrypted_public_json_rpc_bind",
-            ],
-        ),
-        ("Wallet", "Zingo") => ("zingo".to_string(), vec![]),
-        (cat, var) => {
-            return syn::Error::new(
-                variant.span(),
-                format!(
-                    "dev!: unsupported component variant `{cat}::{var}`; \
+    let (kind_str, default_features): (String, Vec<&'static str>) =
+        match (variant.category.to_string().as_str(), variant.variant.to_string().as_str()) {
+            ("Validator", "Zebrad") => ("zebrad".to_string(), vec![]),
+            ("Validator", "Zcashd") => ("zcashd".to_string(), vec![]),
+            // `allow_unencrypted_public_json_rpc_bind`: pod-per-test needs zaino's
+            // JSON-RPC on 0.0.0.0 for cross-pod access. These features are the single
+            // origin — threaded into both the inventory decl and the constructor below.
+            ("Indexer", "Zainod") => (
+                "zainod".to_string(),
+                vec!["no_tls_use_unencrypted_traffic", "allow_unencrypted_public_json_rpc_bind"],
+            ),
+            ("Wallet", "Zingo") => ("zingo".to_string(), vec![]),
+            (cat, var) => {
+                return syn::Error::new(
+                    variant.span(),
+                    format!(
+                        "dev!: unsupported component variant `{cat}::{var}`; \
                      expected one of `Validator::Zebrad`, `Validator::Zcashd`, \
                      `Indexer::Zainod`, `Wallet::Zingo`"
-                ),
-            )
-            .to_compile_error()
-            .into();
-        }
-    };
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+        };
 
     // Feature list: explicit override, else the per-kind default.
     let feat_lits: Vec<String> = match features {
@@ -293,19 +264,14 @@ pub fn dev(input: TokenStream) -> TokenStream {
     let repo_lit = kind_str.clone();
     // The release this build corresponds to (validators render config / derive
     // a ceiling from it); `"dev"` when the caller doesn't say.
-    let version_lit = version
-        .map(|v| v.value())
-        .unwrap_or_else(|| "dev".to_string());
+    let version_lit = version.map(|v| v.value()).unwrap_or_else(|| "dev".to_string());
 
     // Per source form, build the static `DevSourceDecl` (inventory) and the
     // owned `DevSource` (constructor arg). Local paths resolve against
     // `CARGO_MANIFEST_DIR` at compile time; git paths stay repo-relative (the
     // pipeline resolves them against the fetched checkout).
     let (decl_source, ctor_source) = match source {
-        DevSourceArg::Local {
-            dockerfile,
-            context,
-        } => {
+        DevSourceArg::Local { dockerfile, context } => {
             let df_abs = match resolve_source(&dockerfile) {
                 Ok(p) => p,
                 Err(e) => return e.to_compile_error().into(),
@@ -338,18 +304,11 @@ pub fn dev(input: TokenStream) -> TokenStream {
                 },
             )
         }
-        DevSourceArg::Git {
-            url,
-            rev,
-            dockerfile,
-            context,
-        } => {
+        DevSourceArg::Git { url, rev, dockerfile, context } => {
             let url_s = url.value();
             let rev_s = rev.value();
             let df_s = dockerfile.value();
-            let ctx_s = context
-                .map(|c| c.value())
-                .unwrap_or_else(|| ".".to_string());
+            let ctx_s = context.map(|c| c.value()).unwrap_or_else(|| ".".to_string());
             (
                 quote! {
                     ::ztest::inventory::DevSourceDecl::Git {
@@ -423,18 +382,10 @@ impl DevVariant {
 enum DevSourceArg {
     /// Positional local form: `"rel/Dockerfile" [, context = "rel/ctx"]`.
     /// Paths are caller-relative (resolved against `CARGO_MANIFEST_DIR`).
-    Local {
-        dockerfile: LitStr,
-        context: Option<LitStr>,
-    },
+    Local { dockerfile: LitStr, context: Option<LitStr> },
     /// Keyword git form: `git = "…", rev = "…", dockerfile = "in/tree" [, context = "in/tree"]`.
     /// Paths are relative to the fetched repo root (default context `"."`).
-    Git {
-        url: LitStr,
-        rev: LitStr,
-        dockerfile: LitStr,
-        context: Option<LitStr>,
-    },
+    Git { url: LitStr, rev: LitStr, dockerfile: LitStr, context: Option<LitStr> },
 }
 
 struct DevArgs {
@@ -468,20 +419,11 @@ impl Parse for DevArgs {
             let mut kw = KwArgs::default();
             kw.parse_trailing(
                 input,
-                &[
-                    "context",
-                    "version",
-                    "features",
-                    "rust_version",
-                    "rust_versions",
-                ],
+                &["context", "version", "features", "rust_version", "rust_versions"],
             )?;
             return Ok(DevArgs {
                 variant: DevVariant { category, variant },
-                source: DevSourceArg::Local {
-                    dockerfile,
-                    context: kw.context,
-                },
+                source: DevSourceArg::Local { dockerfile, context: kw.context },
                 version: kw.version,
                 features: kw.features,
                 rust_version: kw.rust_version,
@@ -510,19 +452,11 @@ impl Parse for DevArgs {
             syn::Error::new(variant.span(), "dev!: git form requires `rev = \"<sha>\"`")
         })?;
         let dockerfile = kw.dockerfile.ok_or_else(|| {
-            syn::Error::new(
-                variant.span(),
-                "dev!: git form requires `dockerfile = \"<path>\"`",
-            )
+            syn::Error::new(variant.span(), "dev!: git form requires `dockerfile = \"<path>\"`")
         })?;
         Ok(DevArgs {
             variant: DevVariant { category, variant },
-            source: DevSourceArg::Git {
-                url,
-                rev,
-                dockerfile,
-                context: kw.context,
-            },
+            source: DevSourceArg::Git { url, rev, dockerfile, context: kw.context },
             version: kw.version,
             features: kw.features,
             rust_version: kw.rust_version,
@@ -586,10 +520,7 @@ impl KwArgs {
         if !allowed.contains(&key_s.as_str()) {
             return Err(syn::Error::new(
                 key.span(),
-                format!(
-                    "dev!: unexpected key `{key_s}`; allowed here: {}",
-                    allowed.join(", ")
-                ),
+                format!("dev!: unexpected key `{key_s}`; allowed here: {}", allowed.join(", ")),
             ));
         }
         let _: Token![=] = input.parse()?;
@@ -631,10 +562,7 @@ impl KwArgs {
 
 fn resolve_dir(rel: &LitStr) -> Result<std::path::PathBuf, syn::Error> {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
-        syn::Error::new(
-            rel.span(),
-            "CARGO_MANIFEST_DIR not set; cannot resolve dev! context",
-        )
+        syn::Error::new(rel.span(), "CARGO_MANIFEST_DIR not set; cannot resolve dev! context")
     })?;
     let p = std::path::Path::new(&manifest).join(rel.value());
     if !p.exists() {
@@ -698,12 +626,7 @@ fn seed_decl_submit_expr(
 /// call site, so the values are literals rather than handle accessors.
 fn seed_decl_submit(baked: &BakedArchive, payload_ident: &str) -> proc_macro2::TokenStream {
     let (name, oid, size) = (&baked.name, &baked.oid, baked.size);
-    seed_decl_submit_expr(
-        &quote! { #name },
-        &quote! { #oid },
-        &quote! { #size },
-        payload_ident,
-    )
+    seed_decl_submit_expr(&quote! { #name }, &quote! { #oid }, &quote! { #size }, payload_ident)
 }
 
 /// The `inventory::submit!` for one test→resource edge. `resource` is a const
@@ -736,7 +659,8 @@ fn test_dep_submit(
 ///   2. a `::ztest::qos::__enter(class)` first statement so the runtime can
 ///      read the tier in `TestEnv::build()` (the in-process bridge).
 ///
-/// The attribute takes no arguments.
+/// One optional argument, `footprint = "15c/29Gi"`: replaces this test's component
+/// reserve only (tier still supplies priority/pool/hard cap). Omitted → tier default.
 #[proc_macro_attribute]
 pub fn basic(attr: TokenStream, item: TokenStream) -> TokenStream {
     qos_attr("Basic", attr, item)
@@ -766,17 +690,44 @@ pub fn sync(attr: TokenStream, item: TokenStream) -> TokenStream {
     qos_attr("Sync", attr, item)
 }
 
+/// Parsed `footprint = ".."` → the const the inventory decl stores
+///
+/// - Two integers, not the string (CLI never re-parses what the macro validated)
+fn footprint_decl_tokens(f: Option<ztest_attr::Footprint>) -> proc_macro2::TokenStream {
+    match f {
+        Some(f) => {
+            let (cpu, mem) = (f.cpu_milli, f.mem_bytes);
+            quote! {
+                ::core::option::Option::Some(::ztest::inventory::FootprintDecl {
+                    cpu_milli: #cpu,
+                    mem_bytes: #mem,
+                })
+            }
+        }
+        None => quote! { ::core::option::Option::None },
+    }
+}
+
+/// Same override as the `Resources` argument `__enter` takes
+fn footprint_resources_tokens(f: Option<ztest_attr::Footprint>) -> proc_macro2::TokenStream {
+    match f {
+        Some(f) => {
+            let (cpu, mem) = (f.cpu_milli, f.mem_bytes);
+            quote! {
+                ::core::option::Option::Some(::ztest::qos::Resources::new(#cpu, #mem, 0, 0))
+            }
+        }
+        None => quote! { ::core::option::Option::None },
+    }
+}
+
 /// Shared body of the four tier attributes. `variant` is the [`QosClass`]
 /// variant ident (`"Basic"` …).
 fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return syn::Error::new(
-            Span::call_site(),
-            "ztest qos tier attribute takes no arguments, e.g. `#[ztest::qos::sync]`",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let args = match syn::parse::<ztest_attr::QosAttrArgs>(attr) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
     let mut func = match syn::parse::<ItemFn>(item) {
         Ok(f) => f,
         Err(e) => return e.to_compile_error().into(),
@@ -784,11 +735,13 @@ fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream 
 
     let variant = syn::Ident::new(variant, Span::call_site());
     let ident = &func.sig.ident;
+    let footprint_decl = footprint_decl_tokens(args.footprint);
+    let footprint_res = footprint_resources_tokens(args.footprint);
 
-    // (b) in-process bridge: set the task-local tier as the first statement,
-    // before any `.await` can migrate the test future across threads.
+    // (b) in-process bridge: set the task-local tier + override as the first
+    // statement, before any `.await` can migrate the test future across threads.
     let enter: syn::Stmt = syn::parse_quote! {
-        ::ztest::qos::__enter(::ztest::qos::QosClass::#variant);
+        ::ztest::qos::__enter(::ztest::qos::QosClass::#variant, #footprint_res);
     };
     func.block.stmts.insert(0, enter);
 
@@ -800,6 +753,7 @@ fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream 
             ::ztest::inventory::QosDecl {
                 test_id: concat!(module_path!(), "::", stringify!(#ident)),
                 class: ::ztest::qos::QosClass::#variant,
+                footprint: #footprint_decl,
             }
         }
         #func
@@ -812,83 +766,10 @@ fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream 
 /// Static metadata parsed from `#[ztest::sync_test(...)]`. `name`/`subject`/
 /// `qos` are required; `description` defaults to empty, `timeout` to `"48h"`,
 /// `tags` to none.
-struct SyncTestArgs {
-    name: LitStr,
-    description: LitStr,
-    subject: syn::Ident,
-    timeout: LitStr,
-    qos: syn::Ident,
-    tags: Vec<LitStr>,
-}
-
-impl Parse for SyncTestArgs {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut name: Option<LitStr> = None;
-        let mut description: Option<LitStr> = None;
-        let mut subject: Option<syn::Ident> = None;
-        let mut timeout: Option<LitStr> = None;
-        let mut qos: Option<syn::Ident> = None;
-        let mut tags: Vec<LitStr> = Vec::new();
-
-        while !input.is_empty() {
-            let key: syn::Ident = input.parse()?;
-            let _: Token![=] = input.parse()?;
-            match key.to_string().as_str() {
-                "name" => name = Some(input.parse()?),
-                "description" => description = Some(input.parse()?),
-                "timeout" => timeout = Some(input.parse()?),
-                "subject" => subject = Some(input.parse()?),
-                "qos" => qos = Some(input.parse()?),
-                "tags" => {
-                    let content;
-                    syn::bracketed!(content in input);
-                    let items = content.parse_terminated(<LitStr as Parse>::parse, Token![,])?;
-                    tags = items.into_iter().collect();
-                }
-                other => {
-                    return Err(syn::Error::new(
-                        key.span(),
-                        format!(
-                            "unknown sync_test key `{other}` \
-                             (expected name/description/subject/timeout/qos/tags)"
-                        ),
-                    ));
-                }
-            }
-            if input.peek(Token![,]) {
-                let _: Token![,] = input.parse()?;
-            }
-        }
-
-        let name = name.ok_or_else(|| {
-            syn::Error::new(Span::call_site(), "sync_test requires `name = \"..\"`")
-        })?;
-        let subject = subject.ok_or_else(|| {
-            syn::Error::new(
-                Span::call_site(),
-                "sync_test requires `subject = wallet|indexer|validator`",
-            )
-        })?;
-        let qos = qos.ok_or_else(|| {
-            syn::Error::new(Span::call_site(), "sync_test requires `qos = <tier>`")
-        })?;
-        let subj = subject.to_string();
-        if !matches!(subj.as_str(), "wallet" | "indexer" | "validator") {
-            return Err(syn::Error::new(
-                subject.span(),
-                "sync_test `subject` must be wallet, indexer, or validator",
-            ));
-        }
-        Ok(SyncTestArgs {
-            name,
-            description: description.unwrap_or_else(|| LitStr::new("", Span::call_site())),
-            subject,
-            timeout: timeout.unwrap_or_else(|| LitStr::new("48h", Span::call_site())),
-            qos,
-            tags,
-        })
-    }
-}
+///
+/// Grammar in `ztest_attr`: second reader = `ztest sync`'s source scan (two parsers would drift,
+/// and a drifting scanner rejects valid profiles).
+use ztest_attr::SyncTestArgs;
 
 /// `#[ztest::sync_test(name = "..", subject = wallet, qos = sync, ..)]` on
 /// `async fn(mut run: SyncRunner) -> SyncOutcome`.
@@ -917,16 +798,11 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Nest the author's body under a fixed name inside the generated wrapper.
     body_fn.sig.ident = syn::Ident::new("__ztest_sync_body", test_ident.span());
 
-    let SyncTestArgs {
-        name,
-        description,
-        subject,
-        timeout,
-        qos,
-        tags,
-    } = args;
+    let SyncTestArgs { name, description, subject, timeout, qos, footprint, tags } = args;
     let subject_str = LitStr::new(&subject.to_string(), subject.span());
     let qos_str = LitStr::new(&qos.to_string(), qos.span());
+    let footprint_decl = footprint_decl_tokens(footprint);
+    let footprint_res = footprint_resources_tokens(footprint);
     // The tier ident (`sync`) → the `QosClass` variant (`Sync`), so the wrapper
     // can enter the tier at runtime exactly as `#[ztest::qos::*]` does. Without
     // this the in-pod `TestEnv` would size the topology's component pods at the
@@ -950,6 +826,7 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 subject: #subject_str,
                 timeout: #timeout,
                 qos: #qos_str,
+                footprint: #footprint_decl,
                 tags: &[#(#tags),*],
             }
         }
@@ -960,7 +837,7 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `#[ztest::qos::*]` attribute) so `TestEnv::build()` sizes the
             // topology at this profile's tier, whether run by the CI engine or
             // detached via `ztest sync start`.
-            ::ztest::qos::__enter(::ztest::qos::QosClass::#qos_variant);
+            ::ztest::qos::__enter(::ztest::qos::QosClass::#qos_variant, #footprint_res);
             #body_fn
             let __outcome = __ztest_sync_body(::ztest::sync::SyncRunner::new()).await;
             assert!(
@@ -1004,10 +881,7 @@ const ARCHIVE_SUFFIXES: &[&str] = &[".tar.zst", ".tar.gz", ".tar.xz", ".tar.bz2"
 /// anything else falls back to dropping one final extension (`blob.bin` →
 /// `blob.toml`).
 fn manifest_path(source_abs: &std::path::Path) -> std::path::PathBuf {
-    let name = source_abs
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let name = source_abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let stem = ARCHIVE_SUFFIXES
         .iter()
         .find_map(|suf| name.strip_suffix(suf))
@@ -1028,11 +902,8 @@ fn manifest_int(
     manifest: &std::path::Path,
     span: Span,
 ) -> Result<u64, syn::Error> {
-    table
-        .get(key)
-        .and_then(toml::Value::as_integer)
-        .and_then(|v| u64::try_from(v).ok())
-        .ok_or_else(|| {
+    table.get(key).and_then(toml::Value::as_integer).and_then(|v| u64::try_from(v).ok()).ok_or_else(
+        || {
             syn::Error::new(
                 span,
                 format!(
@@ -1040,7 +911,8 @@ fn manifest_int(
                     manifest.display()
                 ),
             )
-        })
+        },
+    )
 }
 
 /// Read `key` from `table` as a string, with the same contract as
@@ -1051,19 +923,12 @@ fn manifest_str(
     manifest: &std::path::Path,
     span: Span,
 ) -> Result<String, syn::Error> {
-    table
-        .get(key)
-        .and_then(toml::Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            syn::Error::new(
-                span,
-                format!(
-                    "manifest {} is missing a string `{key}`",
-                    manifest.display()
-                ),
-            )
-        })
+    table.get(key).and_then(toml::Value::as_str).map(str::to_owned).ok_or_else(|| {
+        syn::Error::new(
+            span,
+            format!("manifest {} is missing a string `{key}`", manifest.display()),
+        )
+    })
 }
 
 /// Collect the integer-valued entries of a `[activations]`-shaped table into
@@ -1131,16 +996,10 @@ fn bake_archive(source_abs: &std::path::Path, span: Span) -> Result<BakedArchive
         ));
     }
     let text = std::fs::read_to_string(&manifest_abs).map_err(|e| {
-        syn::Error::new(
-            span,
-            format!("reading manifest {}: {e}", manifest_abs.display()),
-        )
+        syn::Error::new(span, format!("reading manifest {}: {e}", manifest_abs.display()))
     })?;
     let doc: toml::Value = toml::from_str(&text).map_err(|e| {
-        syn::Error::new(
-            span,
-            format!("manifest {} is not valid TOML: {e}", manifest_abs.display()),
-        )
+        syn::Error::new(span, format!("manifest {} is not valid TOML: {e}", manifest_abs.display()))
     })?;
 
     let oid = manifest_str(&doc, "sha256", &manifest_abs, span)?;
@@ -1158,21 +1017,13 @@ fn bake_archive(source_abs: &std::path::Path, span: Span) -> Result<BakedArchive
     let oid = oid.to_ascii_lowercase();
     let size = manifest_int(&doc, "size_bytes", &manifest_abs, span)?;
 
-    let name = source_abs
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let name = source_abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
     let chain = bake_chain_info(&doc, &manifest_abs, span)?;
     let handle = quote! {
         ::ztest::ArchiveHandle::__new(#name, #oid, #size, #chain)
     };
-    Ok(BakedArchive {
-        handle,
-        name,
-        oid,
-        size,
-    })
+    Ok(BakedArchive { handle, name, oid, size })
 }
 
 /// The `Option<ChainInfo>` literal for a manifest: `Some` when it describes a
@@ -1304,12 +1155,7 @@ fn bake_boundary_check(
 /// granularity to provision only the archives the selected tests need.
 #[proc_macro]
 pub fn archive(input: TokenStream) -> TokenStream {
-    let ConstDecl {
-        attrs,
-        vis,
-        name,
-        source,
-    } = parse_macro_input!(input as ConstDecl);
+    let ConstDecl { attrs, vis, name, source } = parse_macro_input!(input as ConstDecl);
     let abs = match resolve_source(&source) {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
@@ -1342,12 +1188,7 @@ impl Parse for ConstDecl {
         let _: Token![=] = input.parse()?;
         let source: LitStr = input.parse()?;
         let _ = input.parse::<Option<Token![,]>>();
-        Ok(ConstDecl {
-            attrs,
-            vis,
-            name,
-            source,
-        })
+        Ok(ConstDecl { attrs, vis, name, source })
     }
 }
 

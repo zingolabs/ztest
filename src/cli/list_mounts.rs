@@ -1,11 +1,8 @@
 //! `ztest list-mounts`: dump the resolved mount inventory as JSON.
 //!
-//! Debug helper. Once the `--zkn-list-mounts` per-binary contract lands,
-//! this subcommand walks the workspace's test binaries, asks each for its
-//! mount declarations, and prints the union as JSON to stdout.
-//!
-//! Currently stubbed: prints a not-yet-implemented JSON object and exits 0.
-//! Reserves the subcommand on the CLI surface.
+//! Debug helper, stubbed: prints a not-yet-implemented JSON object, exits 0, and reserves
+//! the subcommand. Once the `--zkn-list-mounts` per-binary contract lands it walks the
+//! workspace's test binaries and prints the union of their mount declarations
 
 use std::process::ExitCode;
 

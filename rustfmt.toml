@@ -1,0 +1,16 @@
+# Matches rust-lang/rust's own configuration.
+#
+# `use_small_heuristics = "Max"` raises every derived sub-width to `max_width`.
+# The default profile caps struct variants at 35 columns and struct literals at
+# 18, which forces short single-field variants onto four lines apiece.
+#
+# `max_width` stays at the default 100: no major Rust project raises it, and
+# ripgrep deliberately runs narrower.
+#
+# `wrap_comments` / `comment_width` are deliberately NOT set. Both are
+# nightly-only, and they reflow comment bodies as prose, which would flatten the
+# bulleted comment style CLAUDE.md mandates. Comment width is a convention here,
+# not a tool setting.
+style_edition = "2024"
+use_small_heuristics = "Max"
+merge_derives = false

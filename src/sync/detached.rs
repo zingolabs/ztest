@@ -1,106 +1,72 @@
 //! Detached-sync runtime + the vocabulary the stateless `ztest sync` controller
-//! and the in-pod runner agree on (design §"Execution model: ztest-owned pods").
+//! and the in-pod runner share (design §"Execution model: ztest-owned pods").
 //!
-//! A `ztest sync start` pod runs the *ordinary* sync-test body — the same
-//! compiled `#[ztest::sync_test]` — but as a detached, ztest-owned sync rather
-//! than a CI-gating engine run. The pod carries [`SYNC_ID_ENV`]; the body, on
-//! seeing it, (1) watches its own pod for the [`STOP_ANNOTATION`] and turns a
-//! set annotation into engine cancellation (`sync_mode = Shutdown` →
-//! checkpoint), and (2) mirrors the final report to a ConfigMap that outlives
-//! the pod so `ztest sync status` works after it is gone.
-//!
-//! Everything the controller needs to *find* and *read* a detached sync — the
-//! labels, the stop annotation, the per-sync namespace, the report ConfigMap
-//! name — is defined here, so the two sides never drift. This module is compiled
-//! unconditionally (the CLI controller uses the constants; the in-pod runtime
-//! functions are exercised only in the `zingo` test binary).
+//! - Driver pod runs the ordinary `#[ztest::sync_test]` body, detached, marked by
+//!   [`SYNC_ID_ENV`]
+//! - Body then watches [`STOP_ANNOTATION`] → engine cancel (checkpoint, not kill),
+//!   and mirrors its report to a ConfigMap outliving the pod
+//! - Every locator (labels, annotation, namespace, CM name) lives here, so the two
+//!   sides cannot drift
+//! - Compiled unconditionally; the in-pod runtime runs only in the `zingo` binary
 
 use serde::{Deserialize, Serialize};
 
-/// Env var carrying the sync id into the detached pod. Its presence is the
-/// switch: set ⇒ "you are a detached sync, wire the stop-watch + report mirror";
-/// absent ⇒ an ordinary engine / `cargo test` run.
+/// Sync id into the detached pod; presence = the switch (set ⇒ wire the stop-watch
+/// + report mirror, absent ⇒ ordinary engine / `cargo test` run)
 pub const SYNC_ID_ENV: &str = "ZTEST_SYNC_ID";
-/// Env var carrying the profile *name* (`#[sync_test(name = ..)]`) for the report.
+/// Profile *name* (`#[sync_test(name = ..)]`), for the report
 pub const SYNC_PROFILE_ENV: &str = "ZTEST_SYNC_PROFILE";
-/// Downward-API env carrying the pod's own name (set in the detached pod spec),
-/// so the in-pod runner can watch itself without guessing its generated name.
+/// Downward-API pod name, so the in-pod runner watches itself without guessing
 pub const POD_NAME_ENV: &str = "ZTEST_POD_NAME";
-/// Downward-API env carrying the pod's own *namespace* — the other half of
-/// [`POD_NAME_ENV`].
-///
-/// Load-bearing rather than symmetric: the driver runs in the run namespace as
-/// the run identity (it *is* a runner pod), while the topology it provisions
-/// lives in the sync namespace it was handed. The in-pod stop-watch must poll
-/// the former; every other in-pod client works against the latter. Reading its
-/// own address from the downward API is what makes a stop-watch that quietly
-/// polls the wrong namespace — annotation never seen, `ztest sync stop` a silent
-/// no-op — impossible to write.
+/// Downward-API pod namespace, other half of [`POD_NAME_ENV`]. Driver runs in the
+/// *run* namespace, its topology in the *sync* one — stop-watch polls the former only
 pub const POD_NAMESPACE_ENV: &str = "ZTEST_POD_NAMESPACE";
 
-/// Label key marking a ztest-owned detached-sync driver pod (value
-/// [`KIND_LABEL_VALUE`]); also stamped on the per-sync namespace + report CM.
-///
-/// Ownership is *not* recorded here: a sync carries the same
-/// [`LABEL_USER`](crate::qos::LABEL_USER) every other ztest resource does, so
-/// `sync list` and `ztest cleanup` cannot disagree about whose it is.
+/// Marks a detached-sync driver pod ([`KIND_LABEL_VALUE`]); also on the per-sync
+/// namespace + report CM. Ownership stays on
+/// [`LABEL_USER`](crate::qos::LABEL_USER), as for every ztest resource
 pub const KIND_LABEL_KEY: &str = "ztest.io/kind";
-/// The [`KIND_LABEL_KEY`] value a detached sync carries.
+/// [`KIND_LABEL_KEY`] value a detached sync carries
 pub const KIND_LABEL_VALUE: &str = "sync";
-/// Per-sync id label key (on the driver pod, its namespace, and its report CM).
+/// Per-sync id key, on the driver pod, its namespace and its report CM
 pub const SYNC_ID_KEY: &str = "ztest.io/sync-id";
-/// Annotation the controller sets on the driver pod to request a graceful stop.
-/// The in-pod runner watches it and drives `sync_mode = Shutdown` via engine
-/// cancellation — this is a checkpoint, not a kill (design §stop).
+/// Controller → driver pod graceful-stop request. In-pod runner drives
+/// `sync_mode = Shutdown` via engine cancel: checkpoint, not kill (design §stop)
 pub const STOP_ANNOTATION: &str = "ztest.io/sync-stop";
 
-/// The `ztest.io/kind=sync` label selector the controller lists by.
+/// `ztest.io/kind=sync` selector the controller lists by
 pub fn kind_selector() -> String {
     format!("{KIND_LABEL_KEY}={KIND_LABEL_VALUE}")
 }
 
-/// The hermetic per-sync namespace for a sync id. Each detached sync gets its
-/// own namespace: it isolates the component-pod names and the ResourceQuota
-/// `TestEnv` applies, exactly as an ephemeral `ztest run` isolates each test,
-/// but it persists past the driver pod so `report`/`status` still answer.
-/// `ztest cleanup` deletes the namespace and cascades everything once the driver
-/// pod is no longer Running.
+/// Hermetic per-sync namespace, isolating component-pod names + `TestEnv`'s
+/// ResourceQuota.
 ///
-/// The driver pod itself is *not* in here — see [`driver_pod_for`].
+/// - Outlives the driver pod so `report`/`status` still answer; `ztest cleanup`
+///   deletes it once that pod stops Running
+/// - Excludes the driver pod itself, see [`driver_pod_for`]
 pub fn namespace_for(sync_id: &str) -> String {
     format!("ztest-sync-{sync_id}")
 }
 
-/// The driver pod's name for a sync id.
-///
-/// The driver is a runner pod: it lives in the shared run namespace as the run
-/// identity, like every other in-pod test runner, rather than inside the sync
-/// namespace it deploys into. The run namespace is shared, so the sync id has to
-/// be *in the name* — a fixed name would let only one sync exist cluster-wide.
-/// `ztest cleanup` reaps this pod alongside the namespace, since cross-namespace
-/// means nothing cascades it.
+/// Driver pod name. Sync id must be in it — the driver lives in the *shared* run
+/// namespace, so nothing cascades and `ztest cleanup` reaps it beside the namespace
 pub fn driver_pod_for(sync_id: &str) -> String {
     format!("ztest-sync-{sync_id}")
 }
 
-/// The report-mirror ConfigMap name for a sync id.
 pub fn report_cm_name(sync_id: &str) -> String {
     format!("ztest-sync-report-{sync_id}")
 }
 
-/// The active sync id if this process is a detached sync, else `None`.
+/// Active sync id, `None` unless this process is a detached sync
 pub fn active_sync_id() -> Option<String> {
     std::env::var(SYNC_ID_ENV).ok().filter(|s| !s.is_empty())
 }
 
-/// Publish a provisioning milestone to whoever is watching this sync — a no-op
-/// unless this process *is* a detached sync, since a local `cargo test` run has
-/// nobody tailing it and its `tracing` output already says the same thing.
-///
-/// Deliberately not a [`SyncReporter`](crate::sync::SyncReporter) hook: the
-/// minutes these report on are spent inside `TestEnv::build`, before an engine or
-/// a reporter exists — which is precisely why that window used to be a blank
-/// panel indistinguishable from a hang.
+/// Publish a provisioning milestone; no-op off a detached sync. Not a
+/// [`SyncReporter`](crate::sync::SyncReporter) hook — these minutes are spent
+/// inside `TestEnv::build`, before any engine or reporter exists
 pub(crate) fn note_setup(phase: &str, component: Option<&str>, detail: &str) {
     if active_sync_id().is_none() {
         return;
@@ -112,30 +78,26 @@ pub(crate) fn note_setup(phase: &str, component: Option<&str>, detail: &str) {
     });
 }
 
-/// A serialized, self-describing final report, stored in the report ConfigMap so
-/// it survives the pod (`ztest sync status` reads it back). A plain DTO
-/// — the live [`SyncOutcome`](crate::sync::SyncOutcome) types aren't `Serialize`
-/// and shouldn't be (they carry live handles); this is their durable projection.
+/// Durable projection of [`SyncOutcome`](crate::sync::SyncOutcome), stored in the
+/// report ConfigMap so it survives the pod.
+///
+/// - Plain DTO (the live types carry handles and must not be `Serialize`)
+/// - `segment` absent from a pre-segment driver → `perf --base` calls it incomparable
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncReportMirror {
     pub sync_id: String,
     pub profile: String,
-    /// `SyncVerdict` rendered as its debug name (`Passed`/`Failed`/…).
     pub verdict: String,
     pub ticks: u64,
     pub dropped_snapshots: u64,
     pub violations: Vec<ReportViolation>,
     pub coverage_gaps: Vec<String>,
     pub error: Option<String>,
-    /// The span of chain the run covered. Absent on a report written by a
-    /// driver predating segments, which `perf --base` treats the same way it
-    /// treats a run to tip: not comparable, and it says so rather than
-    /// comparing anyway.
     #[serde(default)]
     pub segment: Option<crate::sync::Segment>,
 }
 
-/// A recorded violation, projected for the durable report.
+/// Recorded violation, projected for the durable report
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportViolation {
     pub probe: String,
@@ -144,7 +106,6 @@ pub struct ReportViolation {
 }
 
 impl SyncReportMirror {
-    /// Project a finished run into its durable report.
     pub fn from_outcome(sync_id: &str, profile: &str, outcome: &crate::sync::SyncOutcome) -> Self {
         SyncReportMirror {
             sync_id: sync_id.to_string(),
@@ -167,13 +128,13 @@ impl SyncReportMirror {
         }
     }
 
-    /// Whether the run met every invariant. The verdict is carried as its debug
-    /// name, so the one place that knows which name means success is here.
+    /// Every invariant met. Verdict travels as its debug name → sole place that
+    /// knows which name means success
     pub fn passed(&self) -> bool {
         self.verdict == format!("{:?}", crate::sync::SyncVerdict::Passed)
     }
 
-    /// A compact human summary line (for `status`/`report` non-JSON output).
+    /// Compact human line, for `status`/`report` non-JSON output
     pub fn summary(&self) -> String {
         format!(
             "{} [{}]: {} — {} ticks, {} violations, {} coverage gaps",
@@ -205,32 +166,23 @@ mod runtime {
 
     use super::{POD_NAME_ENV, POD_NAMESPACE_ENV, STOP_ANNOTATION, SYNC_ID_KEY, SyncReportMirror};
 
-    /// How often the stop-watch re-reads its own pod's annotations. Coarse on
-    /// purpose — a detached sync is a minutes-to-days job and a stop is not
-    /// latency-critical; a light poll is simpler and more robust than a watch
-    /// stream that must be re-established across API hiccups.
+    /// Stop-watch re-read interval. Coarse — a poll beats a watch stream needing
+    /// re-establishment across API hiccups, and a stop is not latency-critical
     const STOP_POLL: Duration = Duration::from_secs(5);
 
-    /// Spawn the in-pod stop-watch and return a [`Cancel`] the engine observes.
-    /// It fires on either the controller setting [`STOP_ANNOTATION`] on this pod
-    /// (`ztest sync stop`) or a `SIGTERM` (node loss / `rm`) — both mean "wind
-    /// down gracefully now", which the engine turns into `subject.stop()` →
-    /// checkpoint.
+    /// Spawn the in-pod stop-watch → a [`Cancel`] the engine observes.
     ///
-    /// The pod's own address comes from the downward API ([`POD_NAME_ENV`] +
-    /// [`POD_NAMESPACE_ENV`]) rather than from the caller: the driver does not
-    /// run in the sync namespace its `TestEnv` is pointed at, so the env's
-    /// namespace is the wrong one to poll and passing it in would have made that
-    /// mistake spellable.
+    /// - Fires on [`STOP_ANNOTATION`] or `SIGTERM`; both = checkpoint, not kill
+    /// - Pod address from the downward API, not the caller (the driver is not in
+    ///   the sync namespace its `TestEnv` points at)
     pub async fn watch_stop(client: &Client) -> Cancel {
         let (source, cancel) = CancelSource::new();
         let pod_name = std::env::var(POD_NAME_ENV).unwrap_or_default();
         let namespace = std::env::var(POD_NAMESPACE_ENV).unwrap_or_default();
         let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
-        // Either half missing ⇒ this pod cannot address itself, so the annotation
-        // path is dead and only SIGTERM remains. Say so once, loudly: a silent
-        // stop-watch makes `ztest sync stop` look like it worked while the sync
-        // runs on for hours.
+        // Either half missing ⇒ unaddressable pod, annotation path dead, SIGTERM
+        // only. Said loudly: a silent stop-watch makes `ztest sync stop` look like
+        // it worked while the sync runs on for hours.
         let addressable = !pod_name.is_empty() && !namespace.is_empty();
         if !addressable {
             tracing::warn!(
@@ -249,7 +201,6 @@ mod runtime {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(error = %e, "sync stop-watch: cannot install SIGTERM handler");
-                    // Fall back to annotation-only watching.
                     poll_forever(&pods, &pod_name, addressable, &source).await;
                     return;
                 }
@@ -279,7 +230,7 @@ mod runtime {
         cancel
     }
 
-    /// Annotation-only fallback loop (no SIGTERM handler available).
+    /// Annotation-only fallback, for when no SIGTERM handler could be installed
     async fn poll_forever(
         pods: &Api<Pod>,
         pod_name: &str,
@@ -299,9 +250,8 @@ mod runtime {
         }
     }
 
-    /// Whether this pod carries a truthy [`STOP_ANNOTATION`]. A transient read
-    /// error is treated as "not yet" — the sync keeps running rather than
-    /// stopping on a blip.
+    /// Truthy [`STOP_ANNOTATION`] on this pod? Read error = "not yet" (no stopping
+    /// on a blip)
     async fn stop_requested(pods: &Api<Pod>, pod_name: &str) -> bool {
         match pods.get_opt(pod_name).await {
             Ok(Some(p)) => p
@@ -315,9 +265,8 @@ mod runtime {
         }
     }
 
-    /// Mirror the final report to its ConfigMap (server-side apply, idempotent),
-    /// so it outlives the pod. Best-effort: a write failure is logged, never
-    /// fatal — the run already finished; losing the mirror only costs `report`.
+    /// Mirror the final report to its ConfigMap (SSA, idempotent) so it outlives
+    /// the pod. Best-effort — the run already finished; a lost mirror costs only `report`
     pub async fn write_report(client: &Client, namespace: &str, report: &SyncReportMirror) {
         let name = super::report_cm_name(&report.sync_id);
         let body = match serde_json::to_string_pretty(report) {
@@ -342,13 +291,8 @@ mod runtime {
         }))
         .expect("static ConfigMap manifest is valid");
         let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-        if let Err(e) = api
-            .patch(
-                &name,
-                &PatchParams::apply("ztest-sync").force(),
-                &Patch::Apply(&cm),
-            )
-            .await
+        if let Err(e) =
+            api.patch(&name, &PatchParams::apply("ztest-sync").force(), &Patch::Apply(&cm)).await
         {
             tracing::warn!(error = %e, cm = %name, "sync report: ConfigMap mirror failed");
         }

@@ -1,7 +1,6 @@
-//! [`Cx`]: the shared, read-only context every [`Provider`](super::Provider)
-//! method receives — one shape for both entry-point graphs (`run` and `setup`).
-//! A provider ignores the fields it doesn't need; the unused `Option`s buy
-//! single-type simplicity.
+//! [`Cx`]: read-only context every [`Provider`](super::Provider) method receives.
+//! One shape across both entry graphs (`run`, `setup`); providers ignore the
+//! fields they don't need.
 
 use std::sync::Arc;
 
@@ -10,62 +9,40 @@ use kube::Client;
 use crate::cli::console::Console;
 use crate::resource::provider::NodeId;
 
-/// Shared context handed to every [`Provider`](super::Provider) method.
-/// Construct with [`Cx::builder`] for graph runs; [`Cx::headless`] for tests
-/// and non-TTY CI paths that only need a client.
+/// Context handed to every [`Provider`](super::Provider) method.
+///
+/// - [`Cx::builder`] for graph runs, [`Cx::headless`] for tests / non-TTY CI
+/// - `console` + `progress` both `None` off a TTY
+/// - `no_wait` skips rollout waits, pushing them onto the first test run
+/// - `build_pod` = the ephemeral BuildKit pod, `None` when nothing is built
 pub struct Cx {
-    /// Kubernetes API client. Every provider talks through this.
     pub client: Client,
-
-    /// The bottom-panel console (TTY runs only); `None` otherwise. Providers
-    /// that stream child PTY output attach directly, others use
-    /// [`progress`](Self::progress). Crate-internal because [`Console`] is.
     pub(crate) console: Option<Console>,
-
-    /// Per-provider sub-phase reporter feeding the preflight panel's transfer
-    /// tracker; `None` off a TTY. Crate-internal: only the CLI glue builds one.
     pub(crate) progress: Option<ProgressSink>,
-
-    /// Skip Deployment / StatefulSet rollout waits (`ztest setup --no-wait`);
-    /// the first test run then blocks on the rollout instead.
     pub no_wait: bool,
-
-    /// Name of the ephemeral BuildKit pod this invocation created for its image
-    /// builds, if any. The image-build path (`backends::image::openshift`) execs
-    /// `buildctl` against it; `None` when no build pod was stood up (a run/setup
-    /// that builds nothing). Created once per invocation and torn down after.
     pub build_pod: Option<String>,
 }
 
 impl Cx {
-    /// A minimal `Cx` for headless (non-TTY) runs and unit tests: client only,
-    /// no console/progress, waits enabled.
+    /// Headless (non-TTY) runs + unit tests: client only, waits enabled
     pub fn headless(client: Client) -> Self {
-        Self {
-            client,
-            console: None,
-            progress: None,
-            no_wait: false,
-            build_pod: None,
-        }
+        Self { client, console: None, progress: None, no_wait: false, build_pod: None }
     }
 
-    /// Start a builder for a `Cx` that carries a console and/or progress
-    /// sink. `Cx::builder(client).console(c).progress(s).no_wait(true).build()`.
+    /// `Cx::builder(client).console(c).progress(s).no_wait(true).build()`.
+    /// This node's progress channel, silent off a TTY
+    pub fn progress_for(&self, id: NodeId) -> NodeProgress {
+        self.progress.as_ref().map(|s| s.bind(id)).unwrap_or_default()
+    }
+
     pub fn builder(client: Client) -> CxBuilder {
-        CxBuilder {
-            client,
-            console: None,
-            progress: None,
-            no_wait: false,
-            build_pod: None,
-        }
+        CxBuilder { client, console: None, progress: None, no_wait: false, build_pod: None }
     }
 }
 
 impl std::fmt::Debug for Cx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // A full `kube::Client` dump is enormous; report presence only.
+        // Presence only — a full `kube::Client` dump is enormous.
         f.debug_struct("Cx")
             .field("console", &self.console.is_some())
             .field("progress", &self.progress.is_some())
@@ -94,25 +71,21 @@ impl std::fmt::Debug for CxBuilder {
 }
 
 impl CxBuilder {
-    /// Attach a console (TTY runs). Crate-internal, as [`Console`] is.
     pub(crate) fn console(mut self, console: Console) -> Self {
         self.console = Some(console);
         self
     }
 
-    /// Attach a progress sink (TTY runs with sub-phase reporting).
     pub(crate) fn progress(mut self, sink: ProgressSink) -> Self {
         self.progress = Some(sink);
         self
     }
 
-    /// Skip Deployment / StatefulSet rollout waits.
     pub fn no_wait(mut self, no_wait: bool) -> Self {
         self.no_wait = no_wait;
         self
     }
 
-    /// The ephemeral BuildKit pod name image builds exec against.
     pub fn build_pod(mut self, pod: impl Into<String>) -> Self {
         self.build_pod = Some(pod.into());
         self
@@ -129,27 +102,24 @@ impl CxBuilder {
     }
 }
 
-/// Callback for a provider to report finer sub-phase text to the CLI, alongside
-/// the coarse lifecycle that reaches it through
-/// [`Graph::provision`](super::Graph::provision)'s `on_change`. Opaque (a
-/// closure behind `Arc<dyn Fn>`) so `resource/` need not name the CLI's event
-/// type; `cli::run` wraps an mpsc-send closure.
+/// Provider → CLI sub-phase text, finer than
+/// [`Graph::provision`](super::Graph::provision)'s `on_change` lifecycle. Opaque
+/// closure so `resource/` never names the CLI's event type.
 #[derive(Clone)]
 pub struct ProgressSink(Arc<dyn Fn(NodeId, Progress) + Send + Sync>);
 
-/// One sub-phase report for a resource node. `Note` is spinner + free text;
-/// `Bytes` drives the `%` bar; `Finalizing` means the bytes are all in but a
-/// tail step (e.g. the manifest PUT) is still running, so the row keeps a
-/// spinner rather than parking at a misleading 100%.
+/// One sub-phase report for a resource node.
+///
+/// - `Note` = spinner + free text, `Bytes` = `%` bar
+/// - `Finalizing` = bytes in, tail step still running (row spins, no misleading 100%)
 #[derive(Clone, Debug)]
 pub enum Progress {
     Note(String),
-    Bytes { done: u64, total: u64, note: String },
+    Bytes { done: u64, total: u64 },
     Finalizing,
 }
 
 impl ProgressSink {
-    /// Wrap a sink function (typically an mpsc send on the work side).
     pub fn new<F>(f: F) -> Self
     where
         F: Fn(NodeId, Progress) + Send + Sync + 'static,
@@ -157,27 +127,50 @@ impl ProgressSink {
         Self(Arc::new(f))
     }
 
-    /// Report the current sub-phase note for `id`.
     pub fn note(&self, id: &NodeId, note: impl Into<String>) {
         (self.0)(id.clone(), Progress::Note(note.into()));
     }
 
-    /// Report aggregate byte progress for `id` (lights the `%` bar). `note` is a
-    /// short qualifier shown after the byte counts (e.g. `layer 5/7`).
-    pub fn bytes(&self, id: &NodeId, done: u64, total: u64, note: impl Into<String>) {
-        (self.0)(
-            id.clone(),
-            Progress::Bytes {
-                done,
-                total,
-                note: note.into(),
-            },
-        );
+    /// Light the `%` bar
+    pub fn bytes(&self, id: &NodeId, done: u64, total: u64) {
+        (self.0)(id.clone(), Progress::Bytes { done, total });
     }
 
-    /// Report that byte transfer is complete but a tail step is still running.
+    /// Bytes all in, tail step still running
     pub fn finalizing(&self, id: &NodeId) {
         (self.0)(id.clone(), Progress::Finalizing);
+    }
+
+    /// Bind to one node, for work that reports progress but has no business naming the
+    /// graph ([`materialize`](crate::materialize) pulls bytes; which node asked is the
+    /// provider's concern)
+    pub fn bind(&self, id: NodeId) -> NodeProgress {
+        NodeProgress(Some((self.clone(), id)))
+    }
+}
+
+/// [`ProgressSink`] with its node already bound. `Default` reports nowhere — the test
+/// side and non-TTY runs need no second no-op type
+#[derive(Clone, Debug, Default)]
+pub struct NodeProgress(Option<(ProgressSink, NodeId)>);
+
+impl NodeProgress {
+    pub fn note(&self, note: impl Into<String>) {
+        if let Some((sink, id)) = &self.0 {
+            sink.note(id, note);
+        }
+    }
+
+    pub fn bytes(&self, done: u64, total: u64) {
+        if let Some((sink, id)) = &self.0 {
+            sink.bytes(id, done, total);
+        }
+    }
+
+    pub fn finalizing(&self) {
+        if let Some((sink, id)) = &self.0 {
+            sink.finalizing(id);
+        }
     }
 }
 

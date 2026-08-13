@@ -6256,6 +6256,7 @@ dependencies = [
  "owo-colors",
  "pepper-sync",
  "portable-pty",
+ "proc-macro2",
  "prometheus-parse",
  "proptest",
  "prost",
@@ -6271,6 +6272,7 @@ dependencies = [
  "sha2 0.10.9",
  "supports-color",
  "supports-unicode",
+ "syn 2.0.119",
  "tar",
  "tempfile",
  "terminal_size",
@@ -6297,7 +6299,16 @@ dependencies = [
  "zip",
  "zip32",
  "zstd",
+ "ztest_attr",
  "ztest_macros",
+]
+
+[[package]]
+name = "ztest_attr"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -6308,4 +6319,5 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "toml 0.9.12+spec-1.1.0",
+ "ztest_attr",
 ]

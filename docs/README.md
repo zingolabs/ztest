@@ -7,34 +7,36 @@ down on exit.
 
 ## Guides — writing and running tests
 
-| Doc | Read it to |
-|-----|------------|
+| Doc                                              | Read it to                                                                                         |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
 | [guide-writing-tests.md](guide-writing-tests.md) | Write a test: `TestEnv` builder, components, handles, peering, `dev!`, multi-Rust-version matrices |
-| [guide-running-tests.md](guide-running-tests.md) | Invoke the suite in dev and CI, slots, filtering, failure modes |
+| [guide-running-tests.md](guide-running-tests.md) | Invoke the suite in dev and CI, slots, filtering, failure modes                                    |
 
 ## Operations — running clusters
 
-| Doc | Read it to |
-|-----|------------|
-| [ops-clusters.md](ops-clusters.md) | Bind a kube-context + image backend under a named `ztest cluster` profile; image distribution |
-| [ops-production-cluster.md](ops-production-cluster.md) | Stand up and operate the bare-metal NixOS/k3s/Ceph cluster |
-| [ops-openshift-setup.md](ops-openshift-setup.md) | Bring up a local CRC/OKD rehearsal cluster; troubleshooting |
+| Doc                                                        | Read it to                                                                                       |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| [ops-cluster-requirements.md](ops-cluster-requirements.md) | What a cluster must provide before ztest can run on it, and how `ztest cluster check` reports it |
+| [ops-local-cluster.md](ops-local-cluster.md)               | Give a local kind cluster snapshot-capable storage (CSI hostpath, or TopoLVM for fast seeds)     |
+| [ops-clusters.md](ops-clusters.md)                         | Bind a kube-context + cluster class + registry under a named `ztest cluster` profile             |
+| [ops-production-cluster.md](ops-production-cluster.md)     | Stand up and operate the bare-metal NixOS/k3s/Ceph cluster                                       |
 
 ## Design — how it works
 
-| Doc | Covers |
-|-----|--------|
-| [design-architecture.md](design-architecture.md) | K8s substrate: namespaces, ownership/cleanup, networking, seed→snapshot→CoW, observability |
-| [design-execution-engine.md](design-execution-engine.md) | Run-loop scheduler and console render thread |
-| [design-resources.md](design-resources.md) | Provider DAG, resource lifetimes, teardown, storage byte-source |
-| [design-qos.md](design-qos.md) | Tiers, capacity model, scheduler, cross-run ledger, calibration |
-| [design-remote-execution.md](design-remote-execution.md) | Pod-per-test, on-cluster compilation, on-cluster image builds |
-| [design-observability.md](design-observability.md) | Metrics pipeline, PodMonitor/Thanos wiring, what a run records |
-| [design-load-testing.md](design-load-testing.md) | Load driver, scenarios, oracles, parity checking |
-| [design-sync.md](design-sync.md) | Observable chain-sync harness, probe taxonomy, nemesis/chaos layer |
+| Doc                                                        | Covers                                                                                     |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| [design-architecture.md](design-architecture.md)           | K8s substrate: namespaces, ownership/cleanup, networking, seed→snapshot→CoW, observability |
+| [design-execution-engine.md](design-execution-engine.md)   | Run-loop scheduler and console render thread                                               |
+| [design-resources.md](design-resources.md)                 | Provider DAG, resource lifetimes, teardown, storage byte-source                            |
+| [design-qos.md](design-qos.md)                             | Tiers, capacity model, scheduler, cross-run ledger, calibration                            |
+| [design-remote-execution.md](design-remote-execution.md)   | Pod-per-test, on-cluster compilation, on-cluster image builds                              |
+| [design-observability.md](design-observability.md)         | Metrics & profiling planes, Prometheus discovery, what a run records                       |
+| [design-load-testing.md](design-load-testing.md)           | Load driver, scenarios, oracles, parity checking                                           |
+| [design-sync.md](design-sync.md)                           | Observable chain-sync harness, probe taxonomy, nemesis/chaos layer                         |
+| [design-platform-collapse.md](design-platform-collapse.md) | Why ztest asserts cluster capabilities instead of installing them, and what that deleted   |
 
 ## How-to
 
-| Doc | Read it to |
-|-----|------------|
+| Doc                                    | Read it to                                                |
+| -------------------------------------- | --------------------------------------------------------- |
 | [how-to-profile.md](how-to-profile.md) | Collect and read a flamegraph from a component under test |

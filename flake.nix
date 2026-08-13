@@ -122,7 +122,7 @@
         # No image packages: all cluster images are built where they run. Component
         # images and the on-cluster compile **builder** + test-runner **base**
         # (`docker/{builder,runner-base}.Dockerfile`) are built on the cluster by
-        # `ztest setup` in the ztest-owned rootless-buildah pod; local kind runs
+        # `ztest cluster setup` in the ztest-owned rootless-buildah pod; local kind runs
         # tests in-process (no runner image). See `src/resource/impls/base_images.rs`.
 
         devShells.default = pkgs.mkShell ({

@@ -1,10 +1,7 @@
-//! Wire-protocol clients ztest speaks.
+//! Wire-protocol clients. One module per protocol end-to-end (transport + typed
+//! methods + envelopes); backends consume them, never reimplement them.
 //!
-//! Each module owns one wire protocol end-to-end: the transport wrapper, the
-//! typed methods, and the envelope types that come back. Backends consume these
-//! clients; they do not reimplement the protocols.
-//!
-//! - [`zcash_rpc`]: bitcoind-derived JSON-RPC envelope spoken by `zebrad` and
-//!   `zcashd` natively, and proxied by `zaino` on its `jsonrpc` port.
+//! - [`zcash_rpc`]: bitcoind-derived JSON-RPC, native on `zebrad`/`zcashd`,
+//!   proxied by `zaino` on its `jsonrpc` port
 
 pub mod zcash_rpc;

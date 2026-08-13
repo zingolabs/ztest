@@ -1,16 +1,9 @@
-//! The `ztest sync status` view: a run's shape and vitals, in boxes.
+//! `ztest sync status`: a run's shape and vitals, in boxes.
 //!
-//! Two columns by default, deliberately. `status` is a command a developer runs
-//! repeatedly in a terminal they are also using for other things, so a view that
-//! claimed the whole width would push their scrollback away every time they
-//! checked on a sync. Two narrow columns fit an 80-column terminal, leave the
-//! rest of the screen alone, and still carry the graph — which is the part that
-//! makes the answer glanceable rather than a wall of figures.
-//!
-//! Every box in a column shares one width and every graph one time axis, because
-//! the whole reason to show work beside pace beside probes is to read them
-//! against each other. A misaligned column would make that correlation an
-//! artefact of the layout.
+//! - Two narrow columns by default (repeat-run command; full width would evict the
+//!   developer's own scrollback each check), still carrying the graph
+//! - One width per column, one time axis per graph — work/pace/probes are shown
+//!   together to be read against each other, which misalignment would falsify
 
 use std::fmt::Write as _;
 
@@ -20,25 +13,19 @@ use super::plot::{self, Palette, PlotOpts};
 use super::text::{compact, format_elapsed, thousands, y_axis};
 use super::{SyncWatchState, Theme};
 
-/// Total width the view occupies.
-///
-/// One column short of the classic 80 so a terminal at exactly 80 does not wrap
-/// the last cell onto its own line, which would break every box.
+/// One short of 80 (an exactly-80 terminal would wrap the last cell, shearing
+/// every box)
 const WIDTH: usize = 79;
 
-/// Width of the left (graph) column. The graph gets the larger share because a
-/// time series needs horizontal room to say anything, whereas the right column
-/// holds short labelled rows.
+/// Left (graph) column, the larger share (time series needs horizontal room;
+/// the right column holds short rows)
 const LEFT: usize = 46;
 
-/// Below this the two columns cannot both hold readable content, so the layout
-/// stacks instead of truncating.
+/// Below this the layout stacks — neither column would hold readable content
 const MIN_TWO_COLUMN: usize = 72;
 
-/// Rows of plot inside the work box.
 const PLOT_ROWS: usize = 5;
 
-/// Render the status view for `state` at `width` columns.
 pub fn render_sync_status(state: &SyncWatchState, theme: &Theme, width: usize) -> String {
     let width = width.min(WIDTH);
     let mut out = String::with_capacity(1024);
@@ -68,7 +55,6 @@ pub fn render_sync_status(state: &SyncWatchState, theme: &Theme, width: usize) -
     out
 }
 
-/// The identifying line above the boxes: which sync, which profile, how long.
 fn header(out: &mut String, state: &SyncWatchState, theme: &Theme) {
     let dot = theme.chars.dot.style(theme.styles.dim);
     let _ = writeln!(
@@ -80,8 +66,7 @@ fn header(out: &mut String, state: &SyncWatchState, theme: &Theme) {
     );
 }
 
-/// Lay two boxes side by side, padding the shorter with blank lines so the
-/// second column starts level however tall each happens to be.
+/// Two boxes side by side, shorter padded with blank lines so both start level
 fn beside(out: &mut String, left: &[String], right: &[String], left_w: usize) {
     let rows = left.len().max(right.len());
     for i in 0..rows {
@@ -94,30 +79,20 @@ fn beside(out: &mut String, left: &[String], right: &[String], left_w: usize) {
     }
 }
 
-/// The work graph: the run's whole shape, stacked by pool.
 fn work_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String> {
     let inner = interior(width);
     let gutter = 6;
     let plot_w = inner.saturating_sub(gutter + 1);
 
     let Some(timeline) = &state.timeline else {
-        // An empty frame would read as "no work happened". The cause is that
-        // this driver has not published a series yet, which is a fact about the
-        // run's age or its build, not about its throughput.
-        return boxed(
-            "work",
-            "",
-            &[dim("no series published yet", theme)],
-            width,
-            theme,
-        );
+        // Stated, not blank — an empty frame reads as "no work happened", when
+        // the fact is the run's age or build, not its throughput.
+        return boxed("work", "", &[dim("no series published yet", theme)], width, theme);
     };
 
-    // A pool nobody measured is absent from the decomposition, not a layer of
-    // unknown height. Left in, it would sit at the bottom of the stack with no
-    // placeable floor and invalidate every pool above it — hatching the entire
-    // graph as unplaceable in the ordinary case where tier B is simply not
-    // collected. The `pools` box is where its absence is stated, as `—`.
+    // Unmeasured pool = absent, not a layer of unknown height. Left in, it floors
+    // the stack with no placeable base and hatches the whole graph unplaceable
+    // whenever tier B goes uncollected. Absence is stated in the `pools` box, as `—`.
     let channels: Vec<plot::Channel<'_>> = crate::sync::CHANNELS
         .iter()
         .map(|(name, _)| (*name, timeline.bands(name)))
@@ -134,15 +109,10 @@ fn work_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String> 
         .zip(rows.iter())
         .map(|(label, row)| format!("{} {row}", label.style(theme.styles.dim)))
         .collect();
-    // The span the graph covers, so a reader knows whether they are looking at
-    // ten minutes or two days — which the graph itself cannot say.
+    // Span covered — ten minutes vs two days, which the graph itself cannot say.
     let span = format_elapsed(timeline.span());
     let gap = plot_w.saturating_sub(span.len() + 7);
-    body.push(format!(
-        "{:>gutter$} {}",
-        "",
-        dim(&format!("{span} ago{:>gap$}now", ""), theme),
-    ));
+    body.push(format!("{:>gutter$} {}", "", dim(&format!("{span} ago{:>gap$}now", ""), theme),));
 
     let now = state
         .vitals
@@ -153,21 +123,12 @@ fn work_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String> 
     boxed("work · ops/s", &now, &body, width, theme)
 }
 
-/// The per-pool rate breakdown.
-///
-/// Always shown beside the total, never instead of it: a total alone cannot
-/// distinguish a throughput change from a change in what the range contained,
-/// and the breakdown is what makes that visible.
+/// Per-pool rate breakdown, always beside the total, never instead of it (a total
+/// alone can't separate a throughput change from a change in range contents)
 fn pools_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String> {
     let inner = interior(width);
     let Some(vitals) = &state.vitals else {
-        return boxed(
-            "pools",
-            "",
-            &[dim("awaiting first tick", theme)],
-            width,
-            theme,
-        );
+        return boxed("pools", "", &[dim("awaiting first tick", theme)], width, theme);
     };
 
     let body: Vec<String> = vitals
@@ -175,9 +136,8 @@ fn pools_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String>
         .iter()
         .map(|(name, rate)| {
             let value = match rate {
-                // Unmeasured, not idle. Rendering `0` here would state that the
-                // range holds no transparent activity when in truth nothing
-                // counted it — the single most misleading cell on the screen.
+                // Unmeasured, not idle — `0` here would be the most misleading
+                // cell on the screen.
                 None => "—".to_string(),
                 Some(r) => format!("{}/s", compact(*r)),
             };
@@ -192,26 +152,15 @@ fn pools_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String>
     boxed("pools", "", &body, width, theme)
 }
 
-/// Chain position, pace, and projection.
 fn progress_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String> {
     let inner = interior(width);
     let dot = theme.chars.dot.style(theme.styles.dim);
     let Some(v) = &state.vitals else {
-        return boxed(
-            "progress",
-            "",
-            &[dim("awaiting first tick", theme)],
-            width,
-            theme,
-        );
+        return boxed("progress", "", &[dim("awaiting first tick", theme)], width, theme);
     };
 
     let target = match v.target {
-        Some(t) => format!(
-            "{} / {}",
-            thousands(u64::from(v.height)),
-            thousands(u64::from(t))
-        ),
+        Some(t) => format!("{} / {}", thousands(u64::from(v.height)), thousands(u64::from(t))),
         None => thousands(u64::from(v.height)),
     };
     let bar_w = inner.saturating_sub(8);
@@ -229,16 +178,14 @@ fn progress_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<Stri
             "pace",
             &format!(
                 "{} {dot} {}",
-                v.blocks_per_sec
-                    .map(|r| format!("{r:.1} blk/s"))
-                    .unwrap_or_else(|| "—".into()),
+                v.pace.map(|p| format!("{:.1} blk/s", p.per_sec)).unwrap_or_else(|| "—".into()),
                 v.phase
             ),
             inner,
             theme,
         ),
     ];
-    if let Some(eta) = v.eta {
+    if let Some(eta) = v.pace.and_then(|p| p.eta) {
         body.push(row("eta", &format_elapsed(eta), inner, theme));
     }
     if v.reorg_depth > 0 {
@@ -247,7 +194,6 @@ fn progress_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<Stri
     boxed("progress", "", &body, width, theme)
 }
 
-/// The probe board, summarised.
 fn probes_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String> {
     let inner = interior(width);
     let (ok, total) = state.probe_tally();
@@ -261,9 +207,8 @@ fn probes_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String
                 crate::sync::ProbeState::Ok => (theme.chars.ok, theme.styles.pass),
                 _ => (theme.chars.warn, theme.styles.skip),
             };
-            // The countdown is the whole value of an `eventually` probe on a
-            // live board: a name alone says a probe is unsatisfied, where
-            // `18s/30s` says whether it is about to fail.
+            // Countdown = the whole value of a live `eventually` probe (a name
+            // says unsatisfied; `18s/30s` says about-to-fail).
             let countdown = match (p.since_satisfied, p.window) {
                 (Some(since), Some(window)) => {
                     format!(" {}/{}", format_elapsed(since), format_elapsed(window))
@@ -275,8 +220,7 @@ fn probes_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String
             format!("{} {name}{}", mark.style(style), dim(&countdown, theme))
         })
         .collect();
-    // Silent truncation would read as a shorter board than the run actually
-    // has, so what was dropped is stated rather than merely omitted.
+    // State what was dropped — silent truncation reads as a shorter board.
     if state.probes.len() > 4 {
         body.push(dim(&format!("… {} more", state.probes.len() - 4), theme));
     }
@@ -285,9 +229,7 @@ fn probes_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String
     }
     if state.violations > 0 {
         body.push(
-            format!("{} violation(s)", state.violations)
-                .style(theme.styles.fail)
-                .to_string(),
+            format!("{} violation(s)", state.violations).style(theme.styles.fail).to_string(),
         );
     }
     boxed(&format!("probes {ok}/{total} ok"), "", &body, width, theme)
@@ -295,17 +237,13 @@ fn probes_box(state: &SyncWatchState, theme: &Theme, width: usize) -> Vec<String
 
 // ───────────────────────────── box drawing ─────────────────────────────
 
-/// Content width inside a box of `width` columns: two borders and two spaces of
-/// padding.
+/// Content width inside a `width`-column box: less two borders, two pad spaces
 fn interior(width: usize) -> usize {
     width.saturating_sub(4)
 }
 
-/// Frame `body` in a titled box exactly `width` columns wide.
-///
-/// Width is enforced by padding and truncation here rather than trusted from
-/// callers: a single over-long line wraps in the terminal and shears every box
-/// below it, so the invariant has to hold at the one place that draws them.
+/// Frame `body` in a titled box of exactly `width` columns. Enforced by padding +
+/// truncation here, never trusted from callers (one long line shears every box below)
 fn boxed(title: &str, right: &str, body: &[String], width: usize, theme: &Theme) -> Vec<String> {
     let [tl, tr, bl, br, h, v] = theme.chars.frame;
     let inner = interior(width);
@@ -316,9 +254,8 @@ fn boxed(title: &str, right: &str, body: &[String], width: usize, theme: &Theme)
         true => String::new(),
         false => format!(" {right} "),
     };
-    // Display width, not byte length: the frame glyphs and the separator dot in
-    // a title are multibyte, and measuring bytes would shorten every rule by
-    // however many of them the title happened to contain.
+    // Display width, not bytes — frame glyphs and the title's separator dot are
+    // multibyte, and byte-measuring shortens the rule per glyph.
     let rule = width.saturating_sub(2 + display_width(&head) + display_width(&tail));
 
     let mut out = vec![format!(
@@ -332,12 +269,7 @@ fn boxed(title: &str, right: &str, body: &[String], width: usize, theme: &Theme)
     for line in body {
         let shown = truncate(line, inner);
         let pad = inner.saturating_sub(display_width(&shown));
-        out.push(format!(
-            "{} {shown}{:pad$} {}",
-            v.style(dim),
-            "",
-            v.style(dim)
-        ));
+        out.push(format!("{} {shown}{:pad$} {}", v.style(dim), "", v.style(dim)));
     }
     out.push(format!(
         "{}{}{}",
@@ -348,29 +280,23 @@ fn boxed(title: &str, right: &str, body: &[String], width: usize, theme: &Theme)
     out
 }
 
-/// A `label   value` row, right-aligned to the box interior.
+/// `label   value` row, right-aligned to the box interior
 fn row(label: &str, value: &str, inner: usize, theme: &Theme) -> String {
     let pad = inner.saturating_sub(label.len() + display_width(value));
-    format!(
-        "{}{:pad$}{}",
-        label.style(theme.styles.dim),
-        "",
-        value.style(theme.styles.count)
-    )
+    format!("{}{:pad$}{}", label.style(theme.styles.dim), "", value.style(theme.styles.count))
 }
 
 fn dim(text: &str, theme: &Theme) -> String {
     text.style(theme.styles.dim).to_string()
 }
 
-/// Printable width, ignoring ANSI escapes — the styled string is longer than
-/// what the terminal shows, and padding against its byte length would leave
-/// every coloured box ragged.
+/// Printable width, ANSI escapes ignored (padding against byte length leaves
+/// every coloured box ragged)
 fn display_width(s: &str) -> usize {
     console::measure_text_width(s)
 }
 
-/// Cut `s` to `width` printable columns, preserving escapes.
+/// Cut `s` to `width` printable columns, escapes preserved
 fn truncate(s: &str, width: usize) -> String {
     match display_width(s) <= width {
         true => s.to_string(),
@@ -396,8 +322,7 @@ mod tests {
             pct: 70.9,
             phase: "Historic".into(),
             reorg_depth: 0,
-            blocks_per_sec: Some(412.0),
-            eta: Some(Duration::from_secs(4_320)),
+            pace: Some(crate::rate::Pace { per_sec: 412.0, eta: Some(Duration::from_secs(4_320)) }),
             work_rate: Some(23_600.0),
             pool_rates: vec![
                 ("transparent", None),
@@ -412,13 +337,11 @@ mod tests {
     }
 
     fn timeline() -> Timeline {
-        let mut t = Timeline::new(
-            crate::sync::CHANNELS.map(|(name, _)| name),
-            Duration::from_secs(5),
-        );
+        let mut t =
+            Timeline::new(crate::sync::CHANNELS.map(|(name, _)| name), Duration::from_secs(5));
         for i in 0..200u64 {
-            // A wave with a stall dropped into it, so a visual check exercises
-            // both the shape and the band rather than a flat block.
+            // Wave + a dropped-in stall, so a visual check exercises shape and
+            // band, not a flat block.
             let phase = (i as f64 / 12.0).sin();
             let sapling = match i {
                 90..=96 => 400.0,
@@ -426,13 +349,7 @@ mod tests {
             };
             t.push(
                 Duration::from_secs(i * 5),
-                &[
-                    None,
-                    None,
-                    Some(sapling),
-                    Some(4_000.0 + 1_500.0 * phase),
-                    Some(0.0),
-                ],
+                &[None, None, Some(sapling), Some(4_000.0 + 1_500.0 * phase), Some(0.0)],
             );
         }
         t
@@ -454,15 +371,11 @@ mod tests {
     }
 
     fn lines(width: usize) -> Vec<String> {
-        render_sync_status(&state(), &theme(), width)
-            .lines()
-            .map(str::to_string)
-            .collect()
+        render_sync_status(&state(), &theme(), width).lines().map(str::to_string).collect()
     }
 
-    /// The invariant the whole layout rests on. One over-long line wraps and
-    /// shears every box below it, so no rendering may exceed its width — at any
-    /// terminal size, including ones narrower than the layout wants.
+    /// Layout's founding invariant: one over-long line wraps and shears every box
+    /// below, at any terminal size incl. narrower than the layout wants
     #[test]
     fn no_line_ever_exceeds_the_requested_width() {
         for width in [40, 60, 72, 79, 100, 200] {
@@ -477,41 +390,33 @@ mod tests {
         }
     }
 
-    /// The point of the two-column default: `status` must not take the whole
-    /// screen, and both columns have to actually appear side by side.
+    /// Point of the two-column default: no whole-screen takeover, columns really adjacent
     #[test]
     fn a_normal_terminal_gets_two_columns() {
         let rendered = lines(79);
         assert!(
-            rendered
-                .iter()
-                .any(|l| l.contains("work") && l.contains("pools")),
+            rendered.iter().any(|l| l.contains("work") && l.contains("pools")),
             "work and pools must share a line: {rendered:#?}"
         );
         assert!(
-            rendered
-                .iter()
-                .any(|l| l.contains("progress") && l.contains("probes")),
+            rendered.iter().any(|l| l.contains("progress") && l.contains("probes")),
             "progress and probes must share a line"
         );
     }
 
-    /// Narrow terminals stack rather than truncate: half a box is worse than a
-    /// taller view.
+    /// Stack, never truncate (half a box is worse than a taller view)
     #[test]
     fn a_narrow_terminal_stacks_the_columns() {
         let rendered = lines(50);
         assert!(rendered.iter().any(|l| l.contains("work")));
         assert!(rendered.iter().any(|l| l.contains("pools")));
         assert!(
-            !rendered
-                .iter()
-                .any(|l| l.contains("work") && l.contains("pools")),
+            !rendered.iter().any(|l| l.contains("work") && l.contains("pools")),
             "a narrow terminal must not try to fit both: {rendered:#?}"
         );
     }
 
-    /// The distinction carried all the way from the wire to the screen.
+    /// Unmeasured-vs-idle, carried wire → screen
     #[test]
     fn an_unmeasured_pool_renders_as_absent_and_an_idle_one_as_zero() {
         let rendered = lines(79).join("\n");
@@ -532,8 +437,8 @@ mod tests {
         assert!(line_with("sapling").contains("19.4k"));
     }
 
-    /// An empty frame reads as "no work happened". The real cause is that the
-    /// driver has published no series, which is a fact about the run's age.
+    /// Empty frame reads as "no work happened"; real cause = no series yet, a fact
+    /// about the run's age
     #[test]
     fn a_run_with_no_series_says_so_rather_than_drawing_an_empty_graph() {
         let mut s = state();
@@ -542,8 +447,7 @@ mod tests {
         assert!(rendered.contains("no series published yet"), "{rendered}");
     }
 
-    /// Before the first tick there are no vitals at all, and every box has to
-    /// cope rather than panicking on an unwrap.
+    /// Pre-first-tick = no vitals at all; every box must cope, not unwrap-panic
     #[test]
     fn a_sync_before_its_first_tick_still_renders() {
         let mut s = state();
@@ -556,7 +460,7 @@ mod tests {
         }
     }
 
-    /// Boxes in a column must align, or the layout shears.
+    /// Misalignment within a column shears the layout
     #[test]
     fn every_box_in_a_column_is_the_same_width() {
         let widths: Vec<usize> = boxed("t", "", &["a".into(), "bb".into()], 40, &theme())
@@ -566,8 +470,7 @@ mod tests {
         assert!(widths.iter().all(|&w| w == 40), "{widths:?}");
     }
 
-    /// A body line longer than the box is truncated rather than allowed to
-    /// break the frame.
+    /// Over-long body line truncates; it never breaks the frame
     #[test]
     fn an_over_long_body_line_is_cut_to_fit() {
         let long = "x".repeat(200);
@@ -576,16 +479,12 @@ mod tests {
         }
     }
 
-    /// The header names which sync is being reported on — `status` is run
-    /// against several and an unlabelled answer is ambiguous.
+    /// `status` runs against several syncs → an unlabelled answer is ambiguous
     #[test]
     fn the_header_names_the_sync_and_its_profile() {
         let rendered = render_sync_status(&state(), &theme(), 79);
         let first = rendered.lines().next().expect("a header");
-        assert!(
-            first.contains("sync-7f3a") && first.contains("zaino_ingest"),
-            "{first}"
-        );
+        assert!(first.contains("sync-7f3a") && first.contains("zaino_ingest"), "{first}");
     }
 }
 

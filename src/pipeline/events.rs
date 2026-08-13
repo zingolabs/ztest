@@ -1,43 +1,28 @@
-//! Pipeline event channel: the single source of truth for what the banner
-//! displays. Each phase pushes [`Event`]s; the renderer drains them. Unbounded —
-//! events are small and drained continuously, so back-pressure isn't a concern.
+//! Pipeline event channel — sole source of what the banner displays. Phases push
+//! [`Event`]s, the renderer drains. Unbounded (small, continuously drained)
 
 use tokio::sync::mpsc;
 
-/// Sender half; phases push events here.
 pub type EventTx = mpsc::UnboundedSender<Event>;
 
-/// Receiver half; Phase C drains events from here.
 pub type EventRx = mpsc::UnboundedReceiver<Event>;
 
-/// Construct a fresh event channel.
 pub fn channel() -> (EventTx, EventRx) {
     mpsc::unbounded_channel()
 }
 
-/// Every observable transition the banner cares about. Phase B emits `Build*`;
-/// Phase A1+ emit `Probe*`. Flat (no nesting) to keep the renderer's match
-/// readable.
+/// Observable transitions the banner cares about: Phase B → `Build*`, Phase A1+ →
+/// `Probe*`. `BuildIndexing` = compile passed, the `--message-format=json` inventory
+/// pass is starting
 #[derive(Debug, Clone)]
 pub enum Event {
-    // Phase B: build / inventory.
-    /// First cargo invocation (chatty compile pass) started.
+    // Phase B: build / inventory
     BuildStarted,
-    /// Compile pass succeeded; second invocation
-    /// (`--message-format=json`) starting for the JSON inventory parse.
     BuildIndexing,
-    /// `cargo nextest list` succeeded with the given test selection.
-    BuildComplete {
-        test_count: usize,
-        binary_count: usize,
-    },
-    /// One of the two cargo invocations failed; the run is aborting.
-    BuildFailed {
-        exit_code: i32,
-        stage: crate::ui::BuildStage,
-    },
+    BuildComplete { test_count: usize, binary_count: usize },
+    BuildFailed { exit_code: i32, stage: crate::ui::BuildStage },
 
-    // Phase A: cluster.
+    // Phase A: cluster
     ProbeStarted,
     ProbeComplete,
     ProbeFailed,

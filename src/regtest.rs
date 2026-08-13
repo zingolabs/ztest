@@ -1,119 +1,101 @@
-//! Regtest fixture helpers: single source of truth for activation
-//! heights, lockbox disbursements, and post-NU6 funding streams.
+//! Regtest fixture helpers: sole source for activation heights, lockbox disbursements,
+//! post-NU6 funding streams.
+
+use std::ops::Range;
 
 use crate::topology::ActivationHeights;
 
-/// The regtest fixture activation heights: the canonical default schedule
-/// ([`ActivationHeights::regtest_default`]), with NU6.3/Ironwood active.
+/// Canonical default schedule ([`ActivationHeights::regtest_default`]), NU6.3/Ironwood active.
 ///
-/// Callers mining past NU6.1 must pair this with
-/// [`regtest_test_lockbox_disbursements`] and
-/// [`regtest_test_post_nu6_funding_streams`], or the NU6.1 activation block
-/// is rejected.
+/// Mining past NU6.1 must pair this with [`regtest_test_lockbox_disbursements`] +
+/// [`regtest_test_post_nu6_funding_streams`], else the NU6.1 activation block is rejected
 pub fn regtest_test_activation_heights() -> ActivationHeights {
     crate::topology::ActivationHeights::regtest_default()
 }
 
-/// One lockbox disbursement output for Zebra's regtest
-/// `[network.testnet_parameters]`. Required for any regtest chain that
-/// crosses NU6.1, or `subsidy_is_valid` rejects the activation block.
+/// Lockbox disbursement output for Zebra's regtest `[network.testnet_parameters]`.
+///
+/// - Required on any regtest chain crossing NU6.1 (`subsidy_is_valid` rejects the block)
+/// - `address` must be regtest P2SH `t2...` (`subsidy_is_valid` asserts `is_script_hash()`)
 #[derive(Clone, Debug)]
 pub struct LockboxDisbursement {
-    /// Must be a regtest P2SH (`t2...`): `subsidy_is_valid` asserts
-    /// `addr.is_script_hash()`, so a P2PKH (`tm...`) is rejected.
     pub address: String,
     pub amount_zats: u64,
 }
 
 impl LockboxDisbursement {
-    /// One zatoshi to Zebra's reference testnet NU6.1 disbursement
-    /// address: a P2SH that decodes under any Testnet-class network.
+    /// 1 zat to Zebra's reference NU6.1 address (P2SH, decodes under any Testnet-class net)
     pub fn dummy() -> Self {
-        Self {
-            address: "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8".to_string(),
-            amount_zats: 1,
-        }
+        Self { address: "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8".to_string(), amount_zats: 1 }
     }
 }
 
-/// Canonical regtest disbursement list: the minimum sufficient set for
-/// zebrad's `is_empty()` gate at the NU6.1 activation block.
+/// Minimum set satisfying zebrad's `is_empty()` gate at the NU6.1 activation block
 pub fn regtest_test_lockbox_disbursements() -> Vec<LockboxDisbursement> {
     vec![LockboxDisbursement::dummy()]
 }
 
-/// Funding-stream receiver category. Serialized form matches Zebra's
-/// TOML: PascalCase except `Ecc` → `"ECC"`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Funding-stream receiver + the addresses its subsidy pays. `Deferred` takes none (accrues
+/// into Zebra's `deferred` pool, which NU6.1 disbursements draw from)
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FundingStreamReceiver {
-    Ecc,
-    ZcashFoundation,
-    MajorGrants,
-    /// Deferred / lockbox pool: subsidy here accumulates in Zebra's
-    /// `deferred` value pool from which NU6.1 disbursements are drawn.
+    Ecc(Vec<String>),
+    ZcashFoundation(Vec<String>),
+    MajorGrants(Vec<String>),
     Deferred,
 }
 
 impl FundingStreamReceiver {
+    /// PascalCase, except `Ecc` → Zebra's `"ECC"`
     pub fn as_toml(&self) -> &'static str {
         match self {
-            Self::Ecc => "ECC",
-            Self::ZcashFoundation => "ZcashFoundation",
-            Self::MajorGrants => "MajorGrants",
+            Self::Ecc(_) => "ECC",
+            Self::ZcashFoundation(_) => "ZcashFoundation",
+            Self::MajorGrants(_) => "MajorGrants",
             Self::Deferred => "Deferred",
+        }
+    }
+
+    pub fn addresses(&self) -> &[String] {
+        match self {
+            Self::Ecc(a) | Self::ZcashFoundation(a) | Self::MajorGrants(a) => a,
+            Self::Deferred => &[],
         }
     }
 }
 
-/// One recipient of a funding stream.
 #[derive(Clone, Debug)]
 pub struct FundingStreamRecipient {
     pub receiver: FundingStreamReceiver,
-    /// Numerator of the block-subsidy fraction (denominator 100, per ZIP-1015).
-    pub numerator: u64,
-    /// Addresses for non-`Deferred` recipients. Ignored for `Deferred`.
-    pub addresses: Option<Vec<String>>,
+    pub percent: u64,
 }
 
-/// Funding-stream configuration, written into Zebra's TOML at
-/// `[network.testnet_parameters.<post_nu6_>funding_streams]`.
+/// Written to Zebra's `[network.testnet_parameters.<post_nu6_>funding_streams]`
 #[derive(Clone, Debug)]
 pub struct FundingStreams {
-    /// Inclusive.
-    pub start_height: u32,
-    /// Exclusive.
-    pub end_height: u32,
+    pub heights: Range<u32>,
     pub recipients: Vec<FundingStreamRecipient>,
 }
 
-/// Canonical regtest post-NU6 funding stream: a single `Deferred`
-/// recipient drawing 1% of block subsidy from NU6 activation, enough to
-/// fund the dummy disbursement at NU6.1. Starts at NU6 because the
-/// deferred pool only exists once NU6 is active.
+/// One `Deferred` recipient, 1% of subsidy, enough to fund the NU6.1 dummy disbursement.
+/// Starts at NU6 (the deferred pool exists only once NU6 is active)
 pub fn regtest_test_post_nu6_funding_streams() -> FundingStreams {
     FundingStreams {
-        start_height: 2,
-        end_height: 1_000_000,
+        heights: 2..1_000_000,
         recipients: vec![FundingStreamRecipient {
             receiver: FundingStreamReceiver::Deferred,
-            numerator: 1,
-            addresses: None,
+            percent: 1,
         }],
     }
 }
 
-/// Parse activation heights from a `getblockchaininfo`-style `upgrades`
-/// object. Used by `ValidatorRpc::activation_heights`.
 pub(crate) fn parse_activation_heights_from_rpc(
     upgrades: &serde_json::Map<String, serde_json::Value>,
 ) -> ActivationHeights {
     let get_height = |name: &str| -> Option<u32> {
         upgrades.values().find_map(|upgrade| {
             if upgrade.get("name")?.as_str()?.eq_ignore_ascii_case(name) {
-                upgrade
-                    .get("activationheight")?
-                    .as_u64()
-                    .and_then(|h| u32::try_from(h).ok())
+                upgrade.get("activationheight")?.as_u64().and_then(|h| u32::try_from(h).ok())
             } else {
                 None
             }
@@ -129,9 +111,8 @@ pub(crate) fn parse_activation_heights_from_rpc(
         .set_nu6(get_height("NU6"))
         .set_nu6_1(get_height("NU6.1"))
         .set_nu6_2(get_height("NU6.2"))
-        // Without this the wallet reads `nu6_3 = None`, signs sends at NU6.2,
-        // and a node at an NU6.3 height rejects them ("incorrect consensus
-        // branch id").
+        // Missing → wallet reads `nu6_3 = None`, signs at NU6.2, node at an NU6.3 height
+        // rejects ("incorrect consensus branch id")
         .set_nu6_3(get_height("NU6.3"))
         .set_nu7(get_height("NU7"))
         .build()
@@ -139,41 +120,29 @@ pub(crate) fn parse_activation_heights_from_rpc(
 
 // ─────────────────────────── Regtest builder trait ─────────────────────
 
-/// Builder shortcut: apply the standard regtest configuration to a
-/// component. Backend-aware; dispatches by enum variant.
+/// Builder shortcut: standard regtest config for a component, dispatched by enum variant.
 ///
 /// ```ignore
 /// let zebrad = env.add_validator(Validator::zebrad("5.1.1").regtest());
 /// let zaino  = env.add_indexer(Indexer::zainod("0.4.0-rc.2-no-tls").regtest());
 /// ```
 pub trait Regtest: Sized {
-    /// Apply the standard regtest fixture. The fetch/state backend is an
-    /// orthogonal choice — see `Indexer::backend`.
+    /// Standard regtest fixture. Fetch/state backend stays orthogonal (`Indexer::backend`)
     fn regtest(self) -> Self;
 }
 
 // ─────────────────────────── Testnet builder trait ─────────────────────
 
-/// Builder shortcut: run this component on The Public Testnet, at the height
-/// `archive` pins.
+/// Builder shortcut: run this component on The Public Testnet at the height `archive` pins.
 ///
-/// The twin of [`Regtest`], and the single verb for both component kinds — one
-/// call does everything that running on a pinned snapshot entails, because
-/// those parts are not independently choosable:
-///
-/// - the component's config is rendered for testnet;
-/// - its state directory is mounted as a private CoW clone of `archive`, at
-///   whatever path *that backend* reads a chain from (a validator's own state
-///   DB; a zaino `State` backend's `zebra_db_path`);
-/// - the archive is recorded on the component so preflight materializes the
-///   seed and the pod is given the GID that can read it.
-///
-/// A backend that reads no chain DB — zaino's `Fetch`, which forwards to the
-/// validator — takes the config and skips the mount, since a multi-GB clone
-/// nothing opens is pure cost.
+/// - One verb, parts not independently choosable: renders the config, mounts a private CoW
+///   clone at the backend's chain path, records the archive (preflight materializes the
+///   seed + grants a readable GID)
+/// - Backend opening no chain DB (zaino `Fetch`) takes the config, skips the multi-GB clone
+/// - **Not** an index restore: validator *is* the chain, indexer *reads* it and builds its
+///   own index into empty pod-local scratch
 ///
 /// ```ignore
-/// use ztest::prelude::*;              // brings the `testnet` / `mainnet` modules
 /// use ztest::snapshots::testnet::IRONWOOD;
 ///
 /// #[ztest::needs(IRONWOOD)]
@@ -185,60 +154,23 @@ pub trait Regtest: Sized {
 /// }
 /// ```
 ///
-/// The same shape on mainnet — import the handle from the other module and use
-/// the matching verb:
-///
-/// ```ignore
-/// use ztest::snapshots::mainnet::BLOSSOM;
-///
-/// #[ztest::needs(BLOSSOM)]
-/// #[tokio::test]
-/// async fn t() {
-///     let zebra = env.add_validator(Validator::zebrad("6.2.3").mainnet(BLOSSOM));
-/// }
-/// ```
-///
-/// **This is not a restore of an indexer's index.** A validator *is* the chain
-/// and boots from the clone; an indexer *reads* the clone and builds its own
-/// index into pod-local scratch, empty at start. That construction is precisely
-/// what an index-construction profile watches happen, and calling the verb
-/// `restore` is what made it look otherwise.
-///
-/// The handle is one of the named consts in [`crate::snapshots`], or one
-/// declared locally with [`archive!`](macro@crate::archive). Component configs are
-/// generated in-process by [`crate::public_conf`].
-///
-/// The validator's builder version and the archive's producer version must
-/// agree, and every component in an env must name the same artifact; both are
-/// enforced at `env.build()` rather than here, because a builder method cannot
-/// fail and the second check needs the whole env in view.
+/// Version + whole-env artifact agreement enforced at `env.build()` (a builder cannot fail)
 pub trait Testnet: Sized {
-    /// Run on the testnet chain `archive` pins. The fetch/state backend is an
-    /// orthogonal choice — see `Indexer::backend`.
+    /// Run on the testnet chain `archive` pins. Fetch/state backend stays orthogonal
+    /// (`Indexer::backend`)
     fn testnet(self, archive: crate::ArchiveHandle) -> Self;
 
     /// Run on the mainnet chain `archive` pins.
     ///
-    /// Identical machinery to [`testnet`](Self::testnet) — the archive records
-    /// its own network and the config generator reads it from there, so the two
-    /// verbs do not select behaviour. What the verb buys is a *statement of
-    /// intent at the call site* that is then checked: naming the wrong network
-    /// for a handle is rejected at `env.build()` rather than quietly booting the
-    /// other chain.
-    ///
-    /// Mainnet artifacts are an order of magnitude larger than their testnet
-    /// counterparts (the smallest exceeds the deepest testnet rung), so reach
-    /// for this only when the test needs mainnet's transaction density.
+    /// - Machinery identical to [`testnet`](Self::testnet) (archive records its own network)
+    /// - Verb buys a checked statement of intent: wrong network → rejected at `env.build()`
+    /// - Mainnet artifacts ~10× testnet's, so only when the test needs mainnet's tx density
     fn mainnet(self, archive: crate::ArchiveHandle) -> Self;
 }
 
-/// Mount an archive at `destination`.
-///
-/// The identity comes from the handle, which the macro read out of the
-/// artifact's manifest at compile time and submitted as a
-/// [`SeedDecl`](crate::inventory::SeedDecl) for preflight to pre-provision — so
-/// unlike the runtime-`format!` path this replaced, a missing artifact cannot
-/// first surface as a materialization failure on a cluster.
+/// Mount an archive at `destination`. Identity from the handle, baked at compile time as a
+/// [`SeedDecl`](crate::inventory::SeedDecl) → a missing artifact cannot first surface as an
+/// on-cluster materialization failure
 pub(crate) fn archive_mount(
     archive: crate::ArchiveHandle,
     destination: &str,
@@ -256,9 +188,8 @@ pub(crate) fn scratch_mount(dest: &str) -> Mount {
     Mount::scratch(PathBuf::from(dest))
 }
 
-/// Mount a string of pre-rendered config content at `dest` inside the pod.
-/// The conf body is produced in-process and lands in a ConfigMap without
-/// touching a fixture file. Same `<=1 MiB` UTF-8 cap as `mount_config!`.
+/// Pre-rendered config `content` → ConfigMap at `dest`, no fixture file. Same `<=1 MiB`
+/// UTF-8 cap as `mount_config!`
 pub(crate) fn config_mount_inline(content: String, dest: &str) -> Mount {
     Mount {
         source: MountSource::ConfigInline(content),

@@ -1,5 +1,5 @@
 [workspace]
-members = ["macros"]
+members = ["macros", "attr"]
 resolver = "2"
 
 # Post-ironwood dependency line. The whole zcash_* wallet stack now resolves
@@ -19,6 +19,14 @@ version = "0.1.0"
 
 [workspace.dependencies]
 ztest_macros = { path = "macros", version = "0.1.0" }
+# The `#[ztest::sync_test]` grammar, shared by the proc-macro that expands it
+# and the CLI that scans source for it. A plain lib, so both can link it.
+ztest_attr = { path = "attr", version = "0.1.0" }
+
+# One `syn` for the whole workspace: the proc-macro expands the attribute, the
+# CLI scans source for it, and `ztest_attr` passes `syn` types between them.
+syn = { version = "2", features = ["full"] }
+proc-macro2 = "1"
 
 thiserror = "1.0.64"
 tokio = "1.42.0"
@@ -206,6 +214,14 @@ prometheus-parse = "0.2.5"
 # existing tree at a cost of four crates total. Revisit when zingolib's
 # wallet stack leaves the `digest` pre-releases behind.
 object_store = { version = "0.13.1", default-features = false, features = ["aws"] }
+ztest_attr.workspace = true
+# Source scanning for `#[ztest::sync_test]` (`pipeline::profiles`). The version
+# line is workspace-wide because `ztest_attr` hands this crate a `syn::Path` —
+# a major-version split between the two would be a type error, not a warning.
+# `span-locations` is what turns a matched attribute into a `file:line` the
+# listing can print.
+syn = { workspace = true }
+proc-macro2 = { workspace = true, features = ["span-locations"] }
 
 [features]
 default = ["librustzcash"]

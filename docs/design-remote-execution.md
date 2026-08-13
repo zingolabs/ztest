@@ -6,7 +6,7 @@ the laptop only ships source, arbitrates admission, and renders progress. One
 engine and one `Executor` seam serve both targets — the cluster profile picks
 the delivery.
 
-| | kind (local) | remote (OpenShift/OKD) |
+| | local (kind) | remote |
 | --- | --- | --- |
 | compile | laptop (`cargo nextest --no-run`) | on-cluster BuildKit pod |
 | binary delivery | `hostPath` mount | baked into the runner image |
@@ -21,7 +21,7 @@ the delivery.
 2. **Probe** → `ClusterCapacity` (`qos`), kept live by `pipeline/capacity_watch`.
 3. **Admit across runs** — a k8s-Lease `ledger` reserves this run's fair-share
    slice; a 2 s `governor` keeps the scheduler ceiling in step with peers.
-4. **Compile on-cluster** (`pipeline/remote_compile.rs`, OpenShift). Stand up an
+4. **Compile on-cluster** (`pipeline/remote_compile.rs`, remote clusters). Stand up an
    ephemeral BuildKit pod; ship source as a `git ls-files` tar; one multi-stage
    `buildctl` build of `docker/runner.Dockerfile` compiles + pushes the runner
    image and exports the inventory (`list.json` + per-binary
@@ -86,12 +86,17 @@ the delivery.
   crash. This is why the runner image no longer carries `kubectl`.
 - **glibc-dynamic only.** `zingo` links `libstdc++` at runtime, so musl is out;
   the compile and runtime stages both pin Debian `bookworm` for one glibc.
-- **On-cluster BuildKit runs privileged-in-userns** (`hostUsers: false` +
-  `privileged: true`, custom `ztest-buildkit` SCC): OKD/CRI-O needs `CAP_SYS_ADMIN`
-  + unmasked `/proc` per `RUN` step, and the userns maps root to an unprivileged
-  host uid. See [ops-openshift-setup.md](ops-openshift-setup.md).
-- **No fallback.** The profile names the backend; a failed build/push fails the
-  run — it never degrades to another path.
+- **On-cluster BuildKit runs rootless**, on upstream's documented Kubernetes
+  posture: the `-rootless` image, uid 1000, `--oci-worker-no-process-sandbox`,
+  and Unconfined seccomp/AppArmor. No `privileged`, no `hostUsers: false`, no
+  `CAP_SYS_ADMIN`. An earlier design took `RUN` steps to be impossible rootless
+  on CRI-O; that was measured and disproved — `RUN` succeeds, and the
+  snapshotter selects `overlayfs`. Unconfined seccomp is the one thing a default
+  `restricted` policy still rejects, so a cluster needs a narrowed SCC (or PSA
+  label) admitting exactly that. See
+  [ops-cluster-requirements.md](ops-cluster-requirements.md#builder).
+- **No fallback.** A failed build/push fails the run — it never degrades to
+  another path.
 
 See [design-execution-engine.md](design-execution-engine.md) (engine/console),
 [design-qos.md](design-qos.md) (scheduler/ledger/governor),

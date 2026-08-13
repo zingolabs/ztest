@@ -1,10 +1,10 @@
-//! On-cluster compilation, buildkit-native: the runner image (compiled test
-//! binaries + inventory) is produced by a single multi-stage `buildctl` build of
-//! [`docker/runner.Dockerfile`](RUNNER_DOCKERFILE) in the ephemeral BuildKit pod
-//! `ztest run` created. The laptop ships *source* as the build context; the
-//! build compiles, assembles the runtime image (pushed), and exports the test
-//! inventory (`list.json` + framed `inventory.jsonl`) via `--output type=local`,
-//! which is `oc cp`'d back and parsed exactly as the laptop path parses a dump.
+//! On-cluster compilation, buildkit-native.
+//!
+//! - Runner image (test binaries + inventory) = one multi-stage `buildctl` build of
+//!   [`docker/runner.Dockerfile`](RUNNER_DOCKERFILE) in the ephemeral BuildKit pod
+//! - Laptop ships *source* as the build context; build compiles, assembles + pushes the image
+//! - Inventory (`list.json` + framed `inventory.jsonl`) exported `--output type=local`,
+//!   `oc cp`'d back, parsed exactly as the laptop path parses a dump
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -20,53 +20,51 @@ use crate::pipeline::images::{self, Dumped};
 use crate::resource::impls::buildkit::{BUILDKIT_CONTAINER, WORK_MOUNT};
 use crate::resource::impls::policy::RUN_NAMESPACE;
 
-/// The buildkit-native runner build recipe (compile → inventory → runner).
-const RUNNER_DOCKERFILE: &str = include_str!("../../docker/runner.Dockerfile");
+/// Runner build recipe (compile → inventory → runner)
+pub(super) const RUNNER_DOCKERFILE: &str = include_str!("../../docker/runner.Dockerfile");
 
-/// The in-image source root the runner Dockerfile compiles under
-/// (`WORKDIR /src` + `COPY . .`). A binary's inventory ctor resolves `dev!`/seed
-/// paths relative to its manifest dir under here, so they come back rooted at
-/// `/src` and are re-homed to the laptop's source ancestor ([`rehome_dump`]).
+/// In-image source root (`WORKDIR /src` + `COPY . .`). Inventory ctors resolve `dev!`/seed
+/// paths under here → come back `/src`-rooted, re-homed by [`rehome_dump`]
 const IMAGE_SRC_ROOT: &str = "/src";
 
-/// Everything the run pipeline needs from an on-cluster compile — the same
-/// shapes the laptop compile + Phase-C dump produce, plus the pushed runner ref.
+/// Same shapes as the laptop compile + Phase-C dump, plus the pushed runner ref
 #[derive(Debug)]
 pub struct RemoteCompileOutcome {
     pub build: BuildOutcome,
     pub dump: images::DumpOutcome,
     pub qos_by_binary: Vec<(String, Vec<crate::inventory::QosEntry>)>,
-    /// Pull reference of the runner image the build pushed.
     pub runner_image_ref: String,
 }
 
-/// Registry coordinates for the runner build's push target.
+impl RemoteCompileOutcome {
+    fn binary_count(&self) -> usize {
+        match &self.build {
+            BuildOutcome::Ok { selected_binaries, .. } => selected_binaries.len(),
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct BakeRefs {
-    /// In-cluster registry repo the runner image is pushed to (`<reg>/<project>/<repo>`).
     pub runner_repo_ref: String,
 }
 
-/// A remote-compile progress transition. `compile_on_cluster` emits these and
-/// measures the timing; the caller ([`crate::cli::run`]) owns all formatting.
+/// Remote-compile progress transition. `compile_on_cluster` emits + times; caller
+/// ([`crate::cli::run`]) owns all formatting
 #[derive(Debug)]
 pub enum Phase<'a> {
-    /// A new phase began; `label` names it for the live panel row and `•` line.
     Start(&'a str),
-    /// The current phase finished after `dur` → a top-level `✓` line.
     Done { label: &'a str, dur: Duration },
-    /// A terminal informational line (the pushed runner ref).
     Note(&'a str),
 }
 
-/// A phase-transition sink. Held mutably because the caller updates panel state.
+/// Phase-transition sink. `mut` (callers update panel state)
 pub type PhaseSink<'a> = &'a mut dyn FnMut(Phase<'_>);
 
-/// Drive an on-cluster compile end to end against the ephemeral BuildKit `pod`.
-/// `list_args` is the same `cargo nextest list` argv the laptop path uses;
-/// `run_id` tags the pushed runner image uniquely per run. `compile_out` selects
-/// how the runner build's BuildKit progress streams (a remote PTY into the
-/// caller's emulator, or CI lines).
+/// - `list_args` = the laptop path's `cargo nextest list` argv
+/// - `run_id` tags the pushed runner image per run
+/// - `compile_out` = BuildKit progress route (remote PTY → caller's emulator, or CI lines)
 pub async fn compile_on_cluster(
     client: &kube::Client,
     pod: &str,
@@ -84,29 +82,22 @@ pub async fn compile_on_cluster(
     };
     let api: Api<Pod> = Api::namespaced(client.clone(), RUN_NAMESPACE);
 
-    // 1. Resolve + ship the first-party source as the build context, plus the
-    //    runner Dockerfile (embedded, so it need not be found in the synced tree).
+    // 1. Ship first-party source as build context + the embedded runner Dockerfile
+    //    (embedded → need not be found in the synced tree)
     let src = SourceLayout::resolve()?;
     let ctx_dir = format!("{WORK_MOUNT}/ctx");
     emit(Phase::Start("syncing source to the build pod"));
     let t = Instant::now();
     ship_source(&src, pod, &ctx_dir)?;
     stage_dockerfile(&api, pod, &ctx_dir).await?;
-    emit(Phase::Done {
-        label: "source synced",
-        dur: t.elapsed(),
-    });
+    emit(Phase::Done { label: "source synced", dur: t.elapsed() });
 
     let runner_ref = format!("{}:dev-{run_id}", refs.runner_repo_ref);
     let workspace_rel = src.workspace_rel.to_string_lossy().into_owned();
-    let nextest_args = list_args
-        .iter()
-        .map(|a| shell_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let nextest_args = list_args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
 
-    // 2. Build + push the runner image (compile + assemble), streaming BuildKit's
-    //    progress. The compile happens inside this build's `compile` stage.
+    // 2. Build + push the runner image, streaming BuildKit progress (compile happens
+    //    inside this build's `compile` stage)
     emit(Phase::Start("building the runner image on the cluster"));
     let t = Instant::now();
     let build_cmd = buildctl_cmd(
@@ -138,15 +129,10 @@ pub async fn compile_on_cluster(
             tail(&tail_out, 40)
         ));
     }
-    emit(Phase::Done {
-        label: "runner image built + pushed",
-        dur: t.elapsed(),
-    });
+    emit(Phase::Done { label: "runner image built + pushed", dur: t.elapsed() });
 
-    // 3. Export the inventory: a second build of the `inventory-export` stage
-    //    (reusing this build's layer + cache-mount cache, so the compile does not
-    //    re-run) writes list.json + inventory.jsonl into the pod, then `oc cp`
-    //    brings them to the laptop.
+    // 3. Second build of the `inventory-export` stage writes list.json + inventory.jsonl
+    //    into the pod, `oc cp` brings them back (layer + cache-mount reuse → no re-compile)
     emit(Phase::Start("dumping test inventory"));
     let t = Instant::now();
     let inv_dir = format!("{WORK_MOUNT}/inv");
@@ -171,24 +157,38 @@ pub async fn compile_on_cluster(
     let inventory = std::fs::read_to_string(local.path().join("inventory.jsonl"))
         .map_err(|e| format!("read exported inventory.jsonl: {e}"))?;
 
+    let outcome = assemble_outcome(&list_json, &inventory, &src.ancestor, runner_ref.clone())?;
+    emit(Phase::Done {
+        label: &format!("inventory dumped ({} binaries)", outcome.binary_count()),
+        dur: t.elapsed(),
+    });
+    emit(Phase::Note(&format!("runner image ready: {runner_ref}")));
+    Ok(outcome)
+}
+
+/// Fold a bake's `list.json` + framed `inventory.jsonl` into the run pipeline's outcome.
+/// Shared by both bakes of [`RUNNER_DOCKERFILE`] (same files, same stage, only *where* differs)
+pub(super) fn assemble_outcome(
+    list_json: &str,
+    inventory: &str,
+    ancestor: &Path,
+    runner_image_ref: String,
+) -> Result<RemoteCompileOutcome, String> {
     let build = build::parse_list_summary(list_json.as_bytes())
-        .map_err(|e| format!("parse on-cluster nextest list: {e}"))?;
-    let BuildOutcome::Ok {
-        selected_binaries, ..
-    } = &build
-    else {
-        return Err("on-cluster nextest list produced no selection".to_string());
+        .map_err(|e| format!("parse nextest list: {e}"))?;
+    let BuildOutcome::Ok { selected_binaries, .. } = &build else {
+        return Err("nextest list produced no selection".to_string());
     };
     if selected_binaries.is_empty() {
-        return Err("on-cluster nextest list selected no test binaries".to_string());
+        return Err("nextest list selected no test binaries".to_string());
     }
 
-    let sections = split_dumps_by_name(&inventory, selected_binaries)?;
+    let sections = split_dumps_by_name(inventory, selected_binaries)?;
     let mut dumps: Vec<Dumped> = Vec::with_capacity(selected_binaries.len());
     for (bin, (chunk, rc)) in selected_binaries.iter().zip(sections) {
         if rc != 0 {
             return Err(format!(
-                "on-cluster inventory dump of {} failed (exit {rc}):\n{}",
+                "inventory dump of {} failed (exit {rc}):\n{}",
                 bin.binary_id,
                 tail(&chunk, 40)
             ));
@@ -198,29 +198,17 @@ pub async fn compile_on_cluster(
         dumps.push(dumped);
     }
     let (mut dump, qos_by_binary) = images::assemble(selected_binaries, dumps);
-    // `dev!` images + seeds are provisioned laptop-side, so re-home their captured
-    // in-image `/src/…` contexts back to the laptop's source ancestor.
-    rehome_dump(&mut dump, &src.ancestor);
-    emit(Phase::Done {
-        label: &format!("inventory dumped ({} binaries)", selected_binaries.len()),
-        dur: t.elapsed(),
-    });
-    emit(Phase::Note(&format!("runner image ready: {runner_ref}")));
+    // `dev!` images + seeds provisioned laptop-side → re-home captured `/src/…` contexts
+    rehome_dump(&mut dump, ancestor);
 
-    Ok(RemoteCompileOutcome {
-        build,
-        dump,
-        qos_by_binary,
-        runner_image_ref: runner_ref,
-    })
+    Ok(RemoteCompileOutcome { build, dump, qos_by_binary, runner_image_ref })
 }
 
-/// The `buildctl build` shell for a Dockerfile stage in the build pod. Writes a
-/// docker `config.json` from the pod SA token when `push_host` is set (the push
-/// authenticates to the internal registry; its service-ca TLS is trusted through
-/// the system store), then builds `target` with the shared source `ctx` and the
-/// `NEXTEST_ARGS`/`WORKSPACE_REL` build-args. `output` is the caller's
-/// `--output …` spec.
+/// `buildctl build` shell for one Dockerfile stage in the build pod.
+///
+/// - `push_host` set → docker `config.json` written from the pod SA token (service-ca TLS
+///   already trusted through the system store)
+/// - Builds `target` from `ctx` with `NEXTEST_ARGS`/`WORKSPACE_REL` build-args
 fn buildctl_cmd(
     ctx: &str,
     target: &str,
@@ -255,11 +243,9 @@ fn buildctl_cmd(
     )
 }
 
-/// Write the embedded runner Dockerfile into the pod's context dir at
-/// `<ctx>/Dockerfile`, so the build need not locate it in the synced tree.
+/// Lands at `<ctx>/Dockerfile`, so the build need not locate it in the synced tree.
 async fn stage_dockerfile(api: &Api<Pod>, pod: &str, ctx_dir: &str) -> Result<(), String> {
-    // A heredoc keeps the (multi-line, special-char) Dockerfile intact through the
-    // single `sh -c`; the sentinel is unlikely to collide with Dockerfile text.
+    // Heredoc keeps the multi-line, special-char Dockerfile intact through one `sh -c`
     let cmd = format!(
         "mkdir -p {dir}\ncat > {dir}/Dockerfile <<'ZTEST_DF_EOF'\n{df}\nZTEST_DF_EOF\n",
         dir = shell_quote(ctx_dir),
@@ -267,16 +253,11 @@ async fn stage_dockerfile(api: &Api<Pod>, pod: &str, ctx_dir: &str) -> Result<()
     );
     let (_o, err, code) = exec_capture(api, pod, &cmd).await?;
     if code != 0 {
-        return Err(format!(
-            "stage runner Dockerfile in pod:\n{}",
-            tail(&err, 20)
-        ));
+        return Err(format!("stage runner Dockerfile in pod:\n{}", tail(&err, 20)));
     }
     Ok(())
 }
 
-/// `oc cp <pod>:<dir>` the exported inventory to a fresh local temp dir, returned
-/// as a self-cleaning handle.
 fn oc_cp_from_pod(pod: &str, dir: &str) -> Result<TempDir, String> {
     let local = TempDir::new("ztest-inv")?;
     let mut cmd = std::process::Command::new("oc");
@@ -296,9 +277,7 @@ fn oc_cp_from_pod(pod: &str, dir: &str) -> Result<TempDir, String> {
     ])
     .stdout(Stdio::null())
     .stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .map_err(|e| format!("spawn `oc cp` (is `oc` on PATH?): {e}"))?;
+    let out = cmd.output().map_err(|e| format!("spawn `oc cp` (is `oc` on PATH?): {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "oc cp of exported inventory failed:\n{}",
@@ -308,16 +287,15 @@ fn oc_cp_from_pod(pod: &str, dir: &str) -> Result<TempDir, String> {
     Ok(local)
 }
 
-/// A temp dir removed on drop.
-struct TempDir(PathBuf);
+pub(super) struct TempDir(PathBuf);
 
 impl TempDir {
-    fn new(tag: &str) -> Result<Self, String> {
+    pub(super) fn new(tag: &str) -> Result<Self, String> {
         let base = std::env::temp_dir().join(format!("{tag}-{:08x}", rand::random::<u32>()));
         std::fs::create_dir_all(&base).map_err(|e| format!("create temp dir: {e}"))?;
         Ok(Self(base))
     }
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -328,46 +306,36 @@ impl Drop for TempDir {
     }
 }
 
-/// The outer shell wrapping every `exec`: runs the real command in a nested `sh`
-/// and prints a `ZTEST_EXIT=<n>` sentinel — the exit-code source, not the k8s
-/// `exec` Status (whose Rust shape is version-fragile).
+/// Outer shell wrapping every `exec`: nested `sh` + a `ZTEST_EXIT=<n>` sentinel =
+/// the exit-code source (k8s `exec` Status has a version-fragile Rust shape)
 const OUTER: &str = r#"sh -c "$1"; printf '\nZTEST_EXIT=%s\n' "$?""#;
 
-/// A live line sink for a remote command's stderr on the non-interactive (CI)
-/// path — one line per call. `ztest run` points it at stderr.
+/// Live stderr sink for the non-interactive (CI) path, one line per call
 pub type LineSink<'a> = &'a dyn Fn(&str);
 
-/// A raw-bytes sink for the interactive PTY stream. The bytes carry ANSI + cursor
-/// control verbatim; `ztest run` feeds them into the console emulator.
+/// Raw-bytes sink for the PTY stream (ANSI + cursor control verbatim → console emulator)
 pub type ByteSink<'a> = &'a dyn Fn(&[u8]);
 
-/// Where the build's output goes, and thus whether it runs under a PTY.
+/// Build-output route, hence whether it runs under a PTY. `Pty.size` = (cols, rows) of the
+/// remote terminal BuildKit renders `--progress=auto` into
 pub enum CompileOut<'a> {
-    /// Interactive: a remote PTY of `size` (cols, rows) so BuildKit streams its
-    /// `--progress=auto` UI; the raw bytes go to `sink`.
-    Pty {
-        size: (u16, u16),
-        sink: ByteSink<'a>,
-    },
-    /// Non-interactive (CI): no PTY; each stderr line to `sink`.
+    Pty { size: (u16, u16), sink: ByteSink<'a> },
     Lines { sink: LineSink<'a> },
 }
 
 impl std::fmt::Debug for CompileOut<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CompileOut::Pty { size, .. } => f
-                .debug_struct("Pty")
-                .field("size", size)
-                .finish_non_exhaustive(),
+            CompileOut::Pty { size, .. } => {
+                f.debug_struct("Pty").field("size", size).finish_non_exhaustive()
+            }
             CompileOut::Lines { .. } => f.write_str("Lines"),
         }
     }
 }
 
-/// `exec` a command in the build pod, capturing `(stdout, stderr, exit_code)` and
-/// forwarding each stderr line to `on_line` (when set). No TTY, so the two
-/// streams share ONE websocket and MUST be drained concurrently.
+/// `exec` in the build pod → `(stdout, stderr, exit_code)`, each stderr line to `on_line`.
+/// No TTY → both streams share ONE websocket and MUST be drained concurrently
 async fn exec_streamed(
     api: &Api<Pod>,
     pod: &str,
@@ -423,8 +391,8 @@ async fn exec_streamed(
     Ok((clean, err, code))
 }
 
-/// `exec` under a remote **PTY** and stream the merged raw output to `on_bytes`,
-/// so BuildKit renders its progress UI into the caller's terminal emulator.
+/// `exec` under a remote **PTY**, merged raw output → `on_bytes` (BuildKit's progress UI
+/// lands in the caller's terminal emulator)
 async fn exec_tty(
     api: &Api<Pod>,
     pod: &str,
@@ -468,8 +436,8 @@ async fn exec_tty(
     Ok((out, code))
 }
 
-/// The chunk up to the `ZTEST_EXIT=` marker (dropping a preceding newline), so the
-/// sentinel never reaches the terminal emulator.
+/// Chunk up to the `ZTEST_EXIT=` marker, dropping a preceding newline (sentinel never
+/// reaches the emulator)
 fn visible_prefix(chunk: &[u8]) -> &[u8] {
     const M: &[u8] = b"ZTEST_EXIT=";
     match chunk.windows(M.len()).position(|w| w == M) {
@@ -479,8 +447,7 @@ fn visible_prefix(chunk: &[u8]) -> &[u8] {
     }
 }
 
-/// Buffered [`exec_streamed`] with no live sink — for the quick, quiet steps whose
-/// output is only interesting on failure.
+/// Buffered [`exec_streamed`], no live sink — quick quiet steps, output interesting only on failure
 async fn exec_capture(
     api: &Api<Pod>,
     pod: &str,
@@ -489,9 +456,8 @@ async fn exec_capture(
     exec_streamed(api, pod, cmd, None).await
 }
 
-/// Split the trailing `ZTEST_EXIT=<n>` marker off captured stdout, returning the
-/// clean output and the exit code (absent marker ⇒ died before the outer shell's
-/// `printf`, treated as failure).
+/// Split the trailing `ZTEST_EXIT=<n>` off captured stdout → (clean output, code).
+/// Marker absent ⇒ died before the outer shell's `printf` → failure
 fn split_exit_sentinel(out: &str) -> (String, i32) {
     const MARKER: &str = "ZTEST_EXIT=";
     for (idx, _) in out.match_indices(MARKER) {
@@ -508,11 +474,11 @@ fn split_exit_sentinel(out: &str) -> (String, i32) {
     (out.to_string(), 1)
 }
 
-/// Demux the exported `inventory.jsonl` into `(stdout, exit_code)` per selected
-/// binary, keyed by binary FILENAME (the Dockerfile frames each block
-/// `ZTEST_DUMP_BEGIN <name>` / `ZTEST_DUMP_END <name> rc=<code>` where `<name>` is
-/// the binary's file name). Returned in `selected` order. Errors if a selected
-/// binary has no block — a truncated export must fail loud, not drop a binary.
+/// Demux exported `inventory.jsonl` → `(stdout, exit_code)` per selected binary, in
+/// `selected` order.
+///
+/// - Keyed by binary FILENAME (Dockerfile frames `ZTEST_DUMP_BEGIN/END <name> rc=<code>`)
+/// - Missing block = error (truncated export must fail loud, never drop a binary)
 fn split_dumps_by_name(
     out: &str,
     selected: &[SelectedBinary],
@@ -525,10 +491,8 @@ fn split_dumps_by_name(
             cur = Some((rest.trim().to_string(), String::new()));
         } else if let Some(rest) = line.strip_prefix("ZTEST_DUMP_END ") {
             let mut it = rest.split_whitespace();
-            let name = it
-                .next()
-                .ok_or_else(|| format!("bad dump end marker: {line:?}"))?
-                .to_string();
+            let name =
+                it.next().ok_or_else(|| format!("bad dump end marker: {line:?}"))?.to_string();
             let rc: i32 = it
                 .next()
                 .and_then(|s| s.strip_prefix("rc="))
@@ -562,30 +526,22 @@ fn split_dumps_by_name(
 
 // ── Source set resolution + sync ──────────────────────────────────────
 
-/// The local first-party source topology: the common-ancestor directory of the
-/// git `repos` backing the build (the tar root and re-home base), the workspace's
-/// path relative to it, and those repo roots.
+/// `ancestor` = common-ancestor dir of the backing git `repos` = tar root & re-home base.
 ///
-/// Shipping whole repos — not just the cargo package subtrees — is required for
-/// correctness, not thrift: a `dev!`/`mount_*`/seed path is resolved against the
-/// invoking crate's `CARGO_MANIFEST_DIR` and routinely escapes the crate into its
-/// repo (e.g. `dev!(Indexer::Zainod, "../../Dockerfile")` from
-/// `zaino/live-tests/clientless` points at `zaino/Dockerfile`). Those files must
-/// exist in the shipped tree at compile time. The git repo is the natural,
-/// well-defined boundary that contains every such in-repo reference; scoping to
-/// the repos that actually hold packages also keeps unrelated sibling repos out.
-struct SourceLayout {
-    ancestor: PathBuf,
-    workspace_rel: PathBuf,
+/// - Whole repos ship, not package subtrees: `dev!`/`mount_*`/seed paths resolve against
+///   `CARGO_MANIFEST_DIR` and routinely escape the crate into its repo
+/// - Scoping to repos that hold packages keeps sibling repos out
+pub(super) struct SourceLayout {
+    pub(super) ancestor: PathBuf,
+    pub(super) workspace_rel: PathBuf,
     repos: Vec<PathBuf>,
 }
 
 impl SourceLayout {
-    fn resolve() -> Result<Self, String> {
+    pub(super) fn resolve() -> Result<Self, String> {
         let meta = cargo_metadata()?;
-        let workspace_root = meta["workspace_root"]
-            .as_str()
-            .ok_or("cargo metadata: no workspace_root")?;
+        let workspace_root =
+            meta["workspace_root"].as_str().ok_or("cargo metadata: no workspace_root")?;
         let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
         dirs.insert(PathBuf::from(workspace_root));
         if let Some(pkgs) = meta["packages"].as_array() {
@@ -600,8 +556,7 @@ impl SourceLayout {
                 }
             }
         }
-        // Collapse the package dirs onto the git repos that contain them; the
-        // repo is the unit we ship (see the struct docs).
+        // Repo, not package dir, is the shipping unit (see struct docs)
         let mut repos: BTreeSet<PathBuf> = BTreeSet::new();
         for d in &dirs {
             repos.insert(git_repo_root(d)?);
@@ -618,18 +573,12 @@ impl SourceLayout {
             .strip_prefix(&ancestor)
             .map_err(|_| "workspace root not under the source ancestor")?
             .to_path_buf();
-        Ok(Self {
-            ancestor,
-            workspace_rel,
-            repos: repos.into_iter().collect(),
-        })
+        Ok(Self { ancestor, workspace_rel, repos: repos.into_iter().collect() })
     }
 }
 
-/// The git repository root containing `dir` (`git rev-parse --show-toplevel`).
-/// The on-cluster compile requires the source to be a git checkout — that's how
-/// [`ship_source`] enumerates the files to send (honouring each repo's
-/// `.gitignore`) — so a non-git `dir` is a hard, clearly-named error.
+/// Git repo root containing `dir` (`git rev-parse --show-toplevel`). Non-git `dir` = hard
+/// named error ([`ship_source`] enumerates via git, honouring each repo's `.gitignore`)
 fn git_repo_root(dir: &Path) -> Result<PathBuf, String> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -644,21 +593,13 @@ fn git_repo_root(dir: &Path) -> Result<PathBuf, String> {
             tail(&String::from_utf8_lossy(&out.stderr), 5)
         ));
     }
-    Ok(PathBuf::from(
-        String::from_utf8_lossy(&out.stdout).trim_end(),
-    ))
+    Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim_end()))
 }
 
-/// Re-home a dump's laptop-provisioned source paths from the build's in-image
-/// source root ([`IMAGE_SRC_ROOT`]) back to the laptop's source `ancestor`. Only
-/// local (path) sources need it; per-binary test paths stay pod-side.
+/// [`IMAGE_SRC_ROOT`] → laptop `ancestor` for laptop-provisioned source paths.
 ///
-/// Seeds and their per-test dependency edges are **not** re-homed, because they
-/// no longer carry paths: a seed is named by its Git LFS OID, which means the
-/// same thing in a build pod, on a laptop and in the cluster. Re-homing them was
-/// the load-bearing half of the old design's bug — an `/src/…` path that only
-/// ever existed inside a build container, patched into something the laptop
-/// might be able to open, and unopenable again by the time a runner pod read it.
+/// - Local (path) sources only; per-binary test paths stay pod-side
+/// - Seeds + their dep edges **never** re-homed (named by LFS OID = same everywhere)
 fn rehome_dump(dump: &mut images::DumpOutcome, ancestor: &Path) {
     let images::DumpOutcome::Discovered {
         images,
@@ -682,11 +623,7 @@ fn rehome_dump(dump: &mut images::DumpOutcome, ancestor: &Path) {
 }
 
 fn rehome_dev(e: &mut crate::inventory::DevImageEntry, ancestor: &Path) {
-    if let crate::backends::image::DevSource::Local {
-        dockerfile,
-        context,
-    } = &mut e.source
-    {
+    if let crate::backends::image::DevSource::Local { dockerfile, context } = &mut e.source {
         *dockerfile = rehome_path(dockerfile, ancestor);
         *context = rehome_path(context, ancestor);
     }
@@ -722,56 +659,23 @@ fn common_ancestor(dirs: &BTreeSet<PathBuf>) -> Option<PathBuf> {
     Some(acc)
 }
 
-/// Ship the first-party source into the build pod's context dir by streaming a
-/// local `tar` of the git-tracked (and untracked-but-unignored) files of the
-/// backing [`repos`](SourceLayout::repos) into the pod's `tar -x`.
+/// Build context = per-repo `git ls-files` streamed as a local tar, ancestor-relative
+/// (cargo path-deps + `CARGO_MANIFEST_DIR` mounts resolve identically under `/src`).
 ///
-/// `oc rsync` is unusable here: the buildkit image ([`BUILDKIT_IMAGE`]) ships no
-/// `rsync`, and `oc rsync`'s tar fallback *walks* the excluded `target/` trees
-/// rather than pruning them — so it grinds through hundreds of GiB of build
-/// artifacts for a source tree of a few MiB. Instead each repo's own `.gitignore`
-/// (via `git ls-files`) decides what ships: build artifacts (`target/`) and VCS
-/// metadata drop out with no hand-maintained exclude list, and only the repos
-/// that back the build go up. Files keep their ancestor-relative layout, so the
-/// tree under `/src` matches the laptop's — cargo's path-deps and the `dev!`
-/// macros' `CARGO_MANIFEST_DIR`-relative mount paths resolve identically.
-///
-/// Two things `.gitignore` alone does not decide, both enforced here:
-///
-/// * **LFS payloads ship as their pointers, never as their bytes**
-///   ([`lfs_names`], [`lfs_pointer`]). A multi-GB artifact that a repo legitimately
-///   carries — `ztest`'s own `fixtures/chains/*.tar.zst` — is not a compile input:
-///   the build reads the plaintext manifest beside it, and the archive reaches the
-///   cluster through the seed uploader straight off the laptop, never through the
-///   build context. `.gitattributes` already draws that payload/source line for
-///   review, so it draws it here too rather than a second hand-maintained list
-///   drifting against the first. Ignoring the archives is not an option: they are
-///   `filter=lfs`, i.e. *tracked*, and a smudged working tree holds the full
-///   content that `--cached` would otherwise hand to `tar`.
-///
-///   The ~135-byte pointer, however, *must* ship, and dropping the path entirely
-///   was a bug: a test resolves its seed PVC by content address
-///   ([`crate::seeds::sha8`]), and an LFS pointer yields that address with no
-///   transfer and no credentials. Without the pointer the in-pod binary sees
-///   nothing at all where its seed should be and fails at provisioning time with
-///   "the seed is neither a real archive nor a committed Git LFS pointer" — the
-///   file being absent for exactly the reason this function made it absent. So we
-///   substitute the index's blob (which *is* the pointer, since the clean filter
-///   ran on `git add`) for the working tree's smudged bytes.
-/// * **The total is bounded** ([`CONTEXT_MAX_BYTES`]). Exclusion rules only cover
-///   the payloads someone already thought about; an unignored stray blob is
-///   exactly the case nobody did. Overshooting is a hard, offender-naming error —
-///   the failure mode it replaces is a silent multi-GB stall at "syncing source"
-///   that reads as a hung cluster.
-fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), String> {
+/// - `oc rsync` unusable: buildkit image ships no `rsync`, its tar fallback *walks* the
+///   excluded `target/` trees instead of pruning
+/// - LFS payloads ship as index-blob pointers, never bytes ([`lfs_names`], [`lfs_pointer`]):
+///   tracked, so a smudged tree would hand `tar` multi-GB; ~135B pointer still yields the
+///   content address a seed PVC is named by, with no transfer and no credentials
+/// - Total bounded by [`CONTEXT_MAX_BYTES`], offender-naming error (a silent multi-GB stall
+///   reads as a hung cluster)
+fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, String> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt as _;
 
-    // Enumerate the files to ship as one NUL-delimited, ancestor-relative list,
-    // sizing each as we go so the context ceiling below can name its offenders.
-    // The temp dir outlives `tar` (we wait on it below). It holds both file lists
-    // and the staged LFS pointers, which have no working-tree representation —
-    // on this laptop those paths hold the smudged multi-GB payload.
+    // One NUL-delimited ancestor-relative list, sized as we go (ceiling below names offenders).
+    // Temp dir outlives `tar`: holds the lists + staged LFS pointers, which have no
+    // working-tree form here (those paths hold the smudged payload)
     let tmp = TempDir::new("ztest-ship")?;
     let pointer_root = tmp.path().join("pointers");
 
@@ -788,13 +692,7 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(repo)
-            .args([
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ])
+            .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
             .output()
             .map_err(|e| format!("run `git ls-files` (is `git` on PATH?): {e}"))?;
         if !out.status.success() {
@@ -804,11 +702,7 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
                 tail(&String::from_utf8_lossy(&out.stderr), 20)
             ));
         }
-        let names: Vec<&[u8]> = out
-            .stdout
-            .split(|b| *b == 0)
-            .filter(|n| !n.is_empty())
-            .collect();
+        let names: Vec<&[u8]> = out.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()).collect();
         let lfs = lfs_names(repo, &names)?;
         for name in names {
             let mut rel = Vec::with_capacity(repo_rel.len() + 1 + name.len());
@@ -818,14 +712,11 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
             }
             rel.extend_from_slice(name);
 
-            // An LFS-tracked path ships as its pointer, staged out of the index,
-            // never as the payload the working tree holds (see the fn docs).
+            // LFS-tracked → ship the index's pointer, never the working tree's payload
             if lfs.contains(name) {
                 let Some(blob) = lfs_pointer(repo, name)? else {
-                    // Matches the LFS attribute but has no index or HEAD blob:
-                    // an artifact nobody committed. There is no pointer to
-                    // substitute, and shipping the payload is the whole thing
-                    // this branch exists to avoid.
+                    // LFS attribute but no index/HEAD blob = uncommitted artifact; no
+                    // pointer to substitute, and the payload must not ship
                     continue;
                 };
                 let dest = pointer_root.join(OsStr::from_bytes(&rel));
@@ -841,14 +732,14 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
                 continue;
             }
 
-            // `--cached` lists a tracked-but-locally-deleted file too; skip any
-            // missing path so `tar` can't hard-fail mid-stream on it.
+            // `--cached` also lists locally-deleted files; skip missing paths (`tar` would
+            // hard-fail mid-stream)
             let abs = src.ancestor.join(OsStr::from_bytes(&rel));
             let Ok(md) = std::fs::metadata(&abs) else {
                 continue;
             };
-            // Only regular files carry bytes in the stream; `tar` stores a symlink
-            // as the link itself, so charging it its target's size would overcount.
+            // Regular files only: `tar` stores a symlink as the link, so charging its
+            // target's size would overcount
             if md.is_file() {
                 total += md.len();
                 sized.push((md.len(), abs));
@@ -864,43 +755,39 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
         return Err(oversized_context(total, sized));
     }
 
-    // `tar --null -T <file>` reads the list from a file, leaving its stdin free —
-    // simpler and deadlock-free versus feeding the list over stdin while `oc`
-    // drains stdout.
+    // `-T <file>` leaves tar's stdin free (feeding the list over stdin while `oc` drains
+    // stdout can deadlock)
     let list_path = tmp.path().join("files.0");
     std::fs::write(&list_path, &list).map_err(|e| format!("write tar file list: {e}"))?;
 
     let mut tar = std::process::Command::new("tar");
-    tar.arg("-C")
-        .arg(&src.ancestor)
-        .arg("--null")
-        .arg("-T")
-        .arg(&list_path);
-    // A second `-C`/`-T` pair splices the staged pointers into the same archive
-    // at their ancestor-relative paths. `tar` applies these in order, so the
-    // extracted tree is indistinguishable from one where the pointers had been
-    // sitting in the working tree all along.
+    tar.arg("-C").arg(&src.ancestor).arg("--null").arg("-T").arg(&list_path);
+    // Second `-C`/`-T` pair splices the staged pointers in at their ancestor-relative
+    // paths; `tar` applies in order → extracted tree looks as if they were checked out
     let pointer_list_path = tmp.path().join("files.1");
     if !pointers.is_empty() {
         std::fs::write(&pointer_list_path, &pointers)
             .map_err(|e| format!("write LFS pointer list: {e}"))?;
-        tar.arg("-C")
-            .arg(&pointer_root)
-            .arg("--null")
-            .arg("-T")
-            .arg(&pointer_list_path);
+        tar.arg("-C").arg(&pointer_root).arg("--null").arg("-T").arg(&pointer_list_path);
     }
-    tar.arg("-cf")
-        .arg("-")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut tar_child = tar
-        .spawn()
-        .map_err(|e| format!("spawn local `tar` (is `tar` on PATH?): {e}"))?;
+    tar.arg("-cf").arg("-").stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = tar.spawn().map_err(|e| format!("spawn local `tar` (is `tar` on PATH?): {e}"))?;
+    Ok(SourceStream { child, _tmp: tmp })
+}
+
+/// Spawned `tar` streaming the build context on stdout. Temp dir held so the file lists +
+/// staged pointers outlive [`spawn_source_tar`]
+struct SourceStream {
+    child: std::process::Child,
+    _tmp: TempDir,
+}
+
+fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), String> {
+    let mut stream = spawn_source_tar(src)?;
+    let tar_child = &mut stream.child;
     let tar_stdout = tar_child.stdout.take().expect("tar stdout is piped");
     let mut tar_stderr = tar_child.stderr.take().expect("tar stderr is piped");
-    // Drain tar's stderr on a thread so a chatty tar can never fill its pipe and
-    // deadlock against `oc` (which we block on below).
+    // Drain tar's stderr on a thread (a full pipe would deadlock against the `oc` we block on)
     let tar_err = std::thread::spawn(move || {
         let mut s = String::new();
         let _ = std::io::Read::read_to_string(&mut tar_stderr, &mut s);
@@ -908,9 +795,7 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
     });
 
     let mut oc = std::process::Command::new("oc");
-    oc.arg("exec")
-        .arg("-i")
-        .args(["-n", RUN_NAMESPACE, "-c", BUILDKIT_CONTAINER]);
+    oc.arg("exec").arg("-i").args(["-n", RUN_NAMESPACE, "-c", BUILDKIT_CONTAINER]);
     if let Some(ctx) =
         std::env::var_os(crate::cluster_config::KUBE_CONTEXT_ENV).filter(|v| !v.is_empty())
     {
@@ -919,20 +804,13 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
     oc.arg(pod)
         .arg("--")
         .args(["sh", "-c"])
-        .arg(format!(
-            "mkdir -p {c} && exec tar -xf - -C {c}",
-            c = shell_quote(ctx_dir)
-        ))
+        .arg(format!("mkdir -p {c} && exec tar -xf - -C {c}", c = shell_quote(ctx_dir)))
         .stdin(Stdio::from(tar_stdout))
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let oc_out = oc
-        .output()
-        .map_err(|e| format!("spawn `oc exec` (is `oc` on PATH?): {e}"))?;
+    let oc_out = oc.output().map_err(|e| format!("spawn `oc exec` (is `oc` on PATH?): {e}"))?;
 
-    let tar_status = tar_child
-        .wait()
-        .map_err(|e| format!("wait for local `tar`: {e}"))?;
+    let tar_status = tar_child.wait().map_err(|e| format!("wait for local `tar`: {e}"))?;
     let tar_err = tar_err.join().unwrap_or_default();
     if !tar_status.success() {
         return Err(format!(
@@ -949,18 +827,39 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// The repo-relative `names` that git resolves to `filter=lfs`, i.e. the LFS
-/// payloads [`ship_source`] must not put in the build context.
+/// Same build context into a local dir, for the laptop-side bake
+/// ([`crate::pipeline::local_bake`]). Staged rather than handing `docker build` the source
+/// ancestor (what keeps LFS payloads out — see [`spawn_source_tar`])
+pub(super) fn extract_source_to(src: &SourceLayout, dest: &Path) -> Result<(), String> {
+    let mut stream = spawn_source_tar(src)?;
+    let tar_stdout = stream.child.stdout.take().expect("tar stdout is piped");
+    let out = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg("-")
+        .arg("-C")
+        .arg(dest)
+        .stdin(Stdio::from(tar_stdout))
+        .output()
+        .map_err(|e| format!("spawn local `tar -x`: {e}"))?;
+    let status = stream.child.wait().map_err(|e| format!("wait for local `tar`: {e}"))?;
+    if !status.success() {
+        return Err(format!("local `tar` of source failed ({status})"));
+    }
+    if !out.status.success() {
+        return Err(format!(
+            "staging the build context failed:\n{}",
+            tail(&String::from_utf8_lossy(&out.stderr), 40)
+        ));
+    }
+    Ok(())
+}
+
+/// Repo-relative `names` git resolves to `filter=lfs` = the payloads [`ship_source`] must
+/// keep out of the build context.
 ///
-/// One `git check-attr --stdin -z filter` per repo rather than a path glob of our
-/// own: `.gitattributes` is the file that already decides payload-vs-source for
-/// review, its precedence rules (later patterns win, nested `.gitattributes`,
-/// negations) are git's to implement, and asking git means a repo that starts
-/// LFS-tracking something new needs no change here.
-///
-/// The list is fed on stdin while stdout is drained on this thread — a writer
-/// thread, because a repo's list is far larger than a pipe buffer and writing it
-/// all before reading would deadlock against git blocking on its own full stdout.
+/// - Ask git (`check-attr`), not our own glob (`.gitattributes` precedence is git's to
+///   implement; new LFS tracking then needs no change here)
+/// - Writer thread: a repo's list exceeds the pipe buffer, write-then-read deadlocks
 fn lfs_names(repo: &Path, names: &[&[u8]]) -> Result<BTreeSet<Vec<u8>>, String> {
     use std::io::Write as _;
 
@@ -983,15 +882,12 @@ fn lfs_names(repo: &Path, names: &[&[u8]]) -> Result<BTreeSet<Vec<u8>>, String> 
         payload.push(0);
     }
     let writer = std::thread::spawn(move || {
-        // A write error here is not itself diagnostic — git exiting early is the
-        // real fault, and its stderr says why — so surface that instead.
+        // Write errors aren't diagnostic; git's early exit + stderr is the real fault
         let _ = stdin.write_all(&payload);
         let _ = stdin.flush();
         drop(stdin);
     });
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("wait for `git check-attr`: {e}"))?;
+    let out = child.wait_with_output().map_err(|e| format!("wait for `git check-attr`: {e}"))?;
     let _ = writer.join();
     if !out.status.success() {
         return Err(format!(
@@ -1000,7 +896,7 @@ fn lfs_names(repo: &Path, names: &[&[u8]]) -> Result<BTreeSet<Vec<u8>>, String> 
             tail(&String::from_utf8_lossy(&out.stderr), 20)
         ));
     }
-    // `-z` output is a flat NUL-delimited stream of <path> <attr> <value> triples.
+    // `-z` output = flat NUL-delimited <path> <attr> <value> triples
     let mut fields = out.stdout.split(|b| *b == 0);
     let mut lfs = BTreeSet::new();
     while let (Some(path), Some(_attr), Some(value)) = (fields.next(), fields.next(), fields.next())
@@ -1012,24 +908,14 @@ fn lfs_names(repo: &Path, names: &[&[u8]]) -> Result<BTreeSet<Vec<u8>>, String> 
     Ok(lfs)
 }
 
-/// A Git LFS pointer is ~135 bytes. Anything materially larger under an LFS
-/// attribute is not a pointer at all but the payload itself, committed raw —
-/// which happens when `git add` runs without `git-lfs` installed, because a
-/// clean filter whose binary is missing fails *open*. Shipping that is the exact
-/// multi-GB stall this module exists to prevent, so it is a named error.
+/// LFS pointer ≈135B; materially larger under an LFS attribute = the raw payload, committed
+/// by a `git add` without `git-lfs` on PATH (missing clean filter fails *open*) → named error
 const MAX_POINTER_BYTES: usize = 4096;
 
-/// The committed pointer for an LFS-tracked path, or `None` when the path has no
-/// blob in either the index or `HEAD`.
+/// `None` = no blob in index or `HEAD`.
 ///
-/// The index is consulted first: that is where a freshly `git add`ed artifact's
-/// pointer lives, written by the clean filter before any commit exists, and a
-/// fixture is usable on a cluster well before anyone commits it. `HEAD` covers
-/// the committed-but-unstaged case.
-///
-/// The working tree is deliberately never read. On a laptop that has run
-/// `git lfs pull` those paths hold the full payload — reading them here is
-/// precisely the mistake being avoided.
+/// - Index first (a freshly `git add`ed fixture's pointer lives there, usable pre-commit)
+/// - Working tree never read (after `git lfs pull` those paths hold the full payload)
 fn lfs_pointer(repo: &Path, name: &[u8]) -> Result<Option<Vec<u8>>, String> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt as _;
@@ -1063,14 +949,12 @@ fn lfs_pointer(repo: &Path, name: &[u8]) -> Result<Option<Vec<u8>>, String> {
     Ok(None)
 }
 
-/// Ceiling on the shipped build context. First-party source across the backing
-/// repos is a few MiB; 256 MiB is orders of magnitude of headroom while still
-/// catching a stray artifact long before it reads as a hung cluster.
+/// Ceiling on the shipped build context (first-party source = a few MiB, so orders of
+/// headroom while still catching a stray artifact before it reads as a hung cluster)
 const CONTEXT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Env override for [`CONTEXT_MAX_BYTES`], as a k8s-style quantity (`512Mi`,
-/// `2Gi`) — an escape hatch for a tree that genuinely must ship more, so the
-/// ceiling never becomes a reason to disable the check outright.
+/// Env override for [`CONTEXT_MAX_BYTES`], k8s-style quantity (`512Mi`, `2Gi`) — escape
+/// hatch so the ceiling never becomes a reason to disable the check
 const CONTEXT_MAX_ENV: &str = "ZTEST_CONTEXT_MAX";
 
 fn context_max_bytes() -> u64 {
@@ -1080,9 +964,8 @@ fn context_max_bytes() -> u64 {
         .unwrap_or(CONTEXT_MAX_BYTES)
 }
 
-/// The over-ceiling error, naming the largest offenders: the whole point of the
-/// guard is that the operator learns *which* file to exclude without going and
-/// measuring the tree by hand.
+/// Over-ceiling error naming the largest offenders (operator learns *which* file to exclude
+/// without measuring the tree by hand)
 fn oversized_context(total: u64, mut sized: Vec<(u64, PathBuf)>) -> String {
     const SHOWN: usize = 5;
     sized.sort_unstable_by_key(|(n, _)| std::cmp::Reverse(*n));
@@ -1104,15 +987,10 @@ fn oversized_context(total: u64, mut sized: Vec<(u64, PathBuf)>) -> String {
     msg
 }
 
-/// Bytes as a binary-prefixed quantity, matching the `Mi`/`Gi` units the rest of
-/// ztest reports sizes in.
+/// Bytes as a binary-prefixed quantity, matching ztest's `Mi`/`Gi` reporting
 fn gib(n: u64) -> String {
-    const UNITS: [(&str, u64); 4] = [
-        ("GiB", 1 << 30),
-        ("MiB", 1 << 20),
-        ("KiB", 1 << 10),
-        ("B", 1),
-    ];
+    const UNITS: [(&str, u64); 4] =
+        [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10), ("B", 1)];
     for (suffix, mult) in UNITS {
         if n >= mult {
             return if mult == 1 {
@@ -1127,17 +1005,16 @@ fn gib(n: u64) -> String {
 
 // ── small helpers ─────────────────────────────────────────────────────
 
-/// The registry host[:port] of a `host[:port]/project/repo[:tag]` reference.
+/// Leading `host[:port]` of `host[:port]/project/repo[:tag]`
 fn registry_host(reference: &str) -> String {
     reference.split('/').next().unwrap_or(reference).to_string()
 }
 
-/// Single-quote a value for `/bin/sh`, escaping embedded single quotes.
-fn shell_quote(s: &str) -> String {
+pub(super) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn tail(s: &str, n: usize) -> String {
+pub(super) fn tail(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
@@ -1157,9 +1034,8 @@ mod tests {
         }
     }
 
-    /// A throwaway git repo with `.gitattributes` declaring the same
-    /// payload-vs-manifest split as `fixtures/chains/`, so the LFS filter is
-    /// exercised against real `git check-attr` precedence rather than a stub.
+    /// Throwaway repo with `fixtures/chains/`'s payload-vs-manifest `.gitattributes` split
+    /// (exercises real `git check-attr` precedence, not a stub)
     fn chains_repo() -> TempDir {
         let dir = TempDir::new("ztest-lfs-test").expect("temp dir");
         let root = dir.path();
@@ -1202,8 +1078,7 @@ mod tests {
             b"src/lib.rs".as_slice(),
         ];
         let lfs = lfs_names(repo.path(), &names).expect("check-attr runs");
-        // The archive is the payload; everything the compile actually reads —
-        // above all the manifest `archive!` parses — must survive.
+        // Archive = payload; what the compile reads (above all the `archive!` manifest) survives
         assert_eq!(
             lfs,
             BTreeSet::from([b"fixtures/chains/zebra-v6.2.3-testnet-286000.tar.zst".to_vec()])
@@ -1215,12 +1090,8 @@ mod tests {
         let repo = chains_repo();
         std::fs::remove_file(repo.path().join(".gitattributes")).expect("rm attrs");
         let names: Vec<&[u8]> = vec![b"fixtures/chains/x.tar.zst".as_slice()];
-        assert!(
-            lfs_names(repo.path(), &names)
-                .expect("check-attr runs")
-                .is_empty()
-        );
-        // No paths at all must not spawn a doomed `git check-attr --stdin`.
+        assert!(lfs_names(repo.path(), &names).expect("check-attr runs").is_empty());
+        // Zero paths must not spawn a doomed `git check-attr --stdin`
         assert!(lfs_names(repo.path(), &[]).expect("no-op").is_empty());
     }
 
@@ -1236,7 +1107,7 @@ mod tests {
             ],
         );
         assert!(msg.contains("13.0 GiB"), "reports the total: {msg}");
-        // Descending by size, so the file worth excluding is the first one read.
+        // Descending by size → the file worth excluding reads first
         let a = msg.find("a.tar.zst").expect("largest listed");
         let b = msg.find("b.tar.zst").expect("second listed");
         assert!(a < b, "offenders are ordered largest-first: {msg}");
@@ -1263,8 +1134,7 @@ mod tests {
 
     #[test]
     fn split_dumps_by_name_maps_blocks_to_selected_order() {
-        // Emitted out of order; demux returns them in `selected` order, keyed by
-        // binary file name.
+        // Emitted out of order; demux returns `selected` order, keyed by binary file name
         let out = "\nZTEST_DUMP_BEGIN beta-xyz\nB\nZTEST_DUMP_END beta-xyz rc=0\n\
                    \nZTEST_DUMP_BEGIN alpha-abc\n{}\nZTEST_DUMP_END alpha-abc rc=0\n";
         let selected = [
@@ -1279,10 +1149,7 @@ mod tests {
     #[test]
     fn split_dumps_by_name_errors_on_missing_binary() {
         let out = "\nZTEST_DUMP_BEGIN alpha-abc\n{}\nZTEST_DUMP_END alpha-abc rc=0\n";
-        let selected = [
-            bin("pkg::alpha", "/x/alpha-abc"),
-            bin("pkg::beta", "/x/beta-xyz"),
-        ];
+        let selected = [bin("pkg::alpha", "/x/alpha-abc"), bin("pkg::beta", "/x/beta-xyz")];
         assert!(split_dumps_by_name(out, &selected).is_err());
     }
 
@@ -1294,12 +1161,10 @@ mod tests {
 
     #[test]
     fn common_ancestor_of_sibling_repos() {
-        let dirs = [
-            PathBuf::from("/home/u/proj/zaino/live-tests"),
-            PathBuf::from("/home/u/proj/ztest"),
-        ]
-        .into_iter()
-        .collect();
+        let dirs =
+            [PathBuf::from("/home/u/proj/zaino/live-tests"), PathBuf::from("/home/u/proj/ztest")]
+                .into_iter()
+                .collect();
         assert_eq!(common_ancestor(&dirs), Some(PathBuf::from("/home/u/proj")));
     }
 

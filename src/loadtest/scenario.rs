@@ -1,34 +1,25 @@
-//! L1 — what each virtual connection does. Kept deterministic: the range a
-//! connection targets is a pure function of its index, so a run is reproducible
-//! without an RNG (a load test that can't be re-run doesn't help a developer
-//! bisect a regression).
+//! L1 — what each virtual connection does. Target range = pure function of connection index,
+//! so a run reproduces with no RNG state (un-re-runnable load tests can't bisect a regression).
 
 use std::ops::Range;
 
 use crate::loadtest::report::OpKind;
 
-/// How connection windows are spread across the block pool.
+/// Window spread across the block pool.
+///
+/// - `Even` — conn 0 at `pool.start`, last at `pool.end`
+/// - `Scatter` — positioned by a hash of the conn index (reproducible, no RNG state)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Distribution {
-    /// Windows spread evenly: connection 0 starts at `pool.start`, the last
-    /// connection ends at `pool.end`. Ported from `zaino-admin`'s `concurrent`.
     Even,
-    /// Windows scattered by a deterministic hash of the connection index —
-    /// reproducible pseudo-randomness, no RNG state.
     Scatter,
 }
 
-/// What a connection fetches. Extensible; today the block-range sweep covers the
-/// three `zaino-admin` load modes.
+/// What a connection fetches. `BlockRangeSweep` = repeated `blocks`-sized window in `pool`,
+/// positioned per [`Distribution`]
 #[derive(Debug, Clone)]
 pub enum Scenario {
-    /// Each connection repeatedly fetches a `blocks`-sized window somewhere in
-    /// `pool`, positioned per [`Distribution`].
-    BlockRangeSweep {
-        pool: Range<u64>,
-        blocks: u64,
-        dist: Distribution,
-    },
+    BlockRangeSweep { pool: Range<u64>, blocks: u64, dist: Distribution },
 }
 
 impl Scenario {
@@ -38,9 +29,8 @@ impl Scenario {
         }
     }
 
-    /// The inclusive `(start, end)` range connection `index` of `count` targets.
-    /// Windows may overlap when `blocks * count` exceeds the pool — fine for
-    /// load; the point is concurrent readers, not disjoint coverage.
+    /// Inclusive `(start, end)` for connection `index` of `count`. Windows may overlap when
+    /// `blocks * count` > pool (the point is concurrent readers, not disjoint coverage)
     pub(crate) fn range_for(&self, index: usize, count: usize) -> (u64, u64) {
         match self {
             Scenario::BlockRangeSweep { pool, blocks, dist } => {
@@ -71,7 +61,7 @@ impl Scenario {
     }
 }
 
-/// A deterministic bit-mixer — reproducible scatter without RNG state.
+/// Deterministic bit-mixer: reproducible scatter, no RNG state
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E3779B97F4A7C15);
     let mut z = x;
@@ -85,11 +75,7 @@ mod tests {
     use super::*;
 
     fn sweep(dist: Distribution) -> Scenario {
-        Scenario::BlockRangeSweep {
-            pool: 0..1000,
-            blocks: 100,
-            dist,
-        }
+        Scenario::BlockRangeSweep { pool: 0..1000, blocks: 100, dist }
     }
 
     #[test]

@@ -1,12 +1,10 @@
 //! `ztest sync watch` — the live view of a detached sync.
 //!
-//! Two streams merge into one terminal: the driver pod's log, from which the
-//! [`SyncEvent`](crate::sync::SyncEvent) lines are lifted out to drive the pinned
-//! panel, and the indexer-under-test's log, which scrolls above it verbatim. Both
-//! are read over the kube API, so nothing here needs `kubectl` on the laptop.
-//!
-//! Read-only throughout: Ctrl-C detaches the terminal and never stops the sync
-//! (only `ztest sync stop` does that).
+//! - Two streams, one terminal: driver-pod log ([`SyncEvent`](crate::sync::SyncEvent)
+//!   lines lifted out to drive the pinned panel) + the indexer-under-test's log,
+//!   scrolling above it verbatim
+//! - Both read over the kube API (no `kubectl` on the laptop)
+//! - Read-only: Ctrl-C detaches, never stops the sync (only `ztest sync stop` does)
 
 use std::io::{IsTerminal, stdout};
 use std::time::{Duration, Instant};
@@ -30,15 +28,12 @@ use super::{
     report_headline, row_of,
 };
 
-/// A driver pod's address: an API handle scoped to the run namespace, plus the
-/// pod's name.
+/// Driver-pod address: run-namespace API handle + pod name.
 ///
-/// The halves travel together because neither implies the other. A driver is a
-/// *runner* pod — it lives in [`RUN_NAMESPACE`] with every other runner, not in
-/// the sync namespace it deploys into — so a call site holding only the sync's
-/// `Api<Pod>` would quietly read the wrong namespace, and one holding only the
-/// sync id would have to re-derive the name. Every driver-side read in this file
-/// goes through here; the SUT reads keep their own sync-namespace handle.
+/// - Neither half implies the other, so they travel together
+/// - Driver = a *runner* pod, in [`RUN_NAMESPACE`], not the sync namespace it
+///   deploys into (a sync-scoped `Api<Pod>` would silently read the wrong one)
+/// - Every driver-side read here goes through this; SUT reads keep their own handle
 pub(super) struct DriverPod {
     api: Api<Pod>,
     name: String,
@@ -57,44 +52,39 @@ impl DriverPod {
     }
 }
 
-/// The two logs an attach merges, each with the handle its own namespace needs:
-/// the driver in [`RUN_NAMESPACE`], the subject under test in the sync's
-/// namespace. Bundled because they are always wanted together, and because a
-/// pair is harder to mix up than two bare `Api<Pod>` parameters would be.
+/// The two logs an attach merges, each with its own namespace's handle: driver in
+/// [`RUN_NAMESPACE`], subject under test in the sync's (a pair is harder to mix up
+/// than two bare `Api<Pod>` parameters)
 pub(super) struct Followed<'a> {
     driver: &'a DriverPod,
     sut: &'a Api<Pod>,
 }
 
-/// How often the driver pod's phase is re-read. Only matters before the first
-/// event lands (and after the last), so it stays slow.
+/// Driver-pod phase re-read interval; slow, since it only matters before the
+/// first event (and after the last)
 const POD_POLL: Duration = Duration::from_secs(2);
 
-/// Backfill requested from each stream. Deep enough to explain what just happened
-/// on attach, shallow enough not to flood the terminal on a days-old sync.
+/// Per-stream backfill: deep enough to explain the attach, shallow enough not to
+/// flood on a days-old sync
 const TAIL_LINES: i64 = 200;
 
-/// The label of the component whose log rides alongside the driver's: the
-/// indexer, which is the subject under test in a sync profile. Selected by
-/// category rather than backend name so a profile running `lightwalletd` instead
-/// of `zainod` is followed just the same.
+/// Component whose log rides alongside the driver's = the indexer (a sync
+/// profile's subject). By category, not backend name, so `lightwalletd` is
+/// followed like `zainod`
 const SUT_SELECTOR: &str = "ztest.io/component-category=indexer";
 
-/// A boxed line stream over one pod's log.
 type LineStream = std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<String>> + Send>>;
 
-/// How an attach ended. `watch` reports; the *caller* decides what it means for
-/// the process's exit status — `ztest sync watch` is an inspection command that
-/// always succeeds, whereas `ztest sync start --watch` stands in for a foreground
-/// run and must fail its pipeline on a failing verdict.
+/// How an attach ended. `watch` reports; the *caller* maps it to an exit status
+/// (`ztest sync watch` always succeeds; `ztest sync start --watch` stands in for a
+/// foreground run and must fail its pipeline on a failing verdict)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum WatchEnd {
-    /// The user detached (Ctrl-C). The sync is still running.
     Detached,
-    /// The driver's log ended and its durable report was read back.
-    Finished { passed: bool },
-    /// The log ended with no report: the driver was killed, evicted, or crashed
-    /// before it could mirror one.
+    Finished {
+        passed: bool,
+    },
+    /// Log ended with no report (driver killed, evicted, or crashed before mirroring one)
     Unresolved,
 }
 
@@ -103,14 +93,13 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
     let ns = namespace_for(id);
     let pod = find_driver(&client, id).await?;
     let profile = driver_profile(&pod).unwrap_or_else(|| id.to_string());
-    // Two handles, two namespaces: the driver in the run namespace, the topology
-    // it deploys (the SUT followed below, and the metrics poller) in the sync's.
+    // Two namespaces: driver in the run namespace, the topology it deploys (SUT +
+    // metrics poller) in the sync's
     let driver = DriverPod::new(&client, id);
     let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
     let theme = Theme::detect();
 
-    // Non-TTY (CI / piped): a plain linear tail — no panel to pin, so the events
-    // that would have driven it are rendered as ordinary lines instead.
+    // Non-TTY: no panel to pin, so the events that would drive it render as lines
     if !stdout().is_terminal() {
         return linear(&driver, &client, &ns, id, &theme).await;
     }
@@ -118,8 +107,8 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
     let cancel_theme = theme.clone();
     let cancel_panel =
         Box::new(move |elapsed| crate::ui::render_cancel_panel(elapsed, &cancel_theme));
-    // The console's session clock. Shared with the feed so a tick's `received_at`
-    // is on the same origin as the `elapsed` each frame is rendered against.
+    // Shared with the feed so a tick's `received_at` and each frame's `elapsed`
+    // share an origin
     let session_start = Instant::now();
     let (console, guard) = match Console::start(session_start, cancel_panel) {
         Ok(cg) => cg,
@@ -133,11 +122,9 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
         row_of(&pod).2,
     );
 
-    // Three views on one screen over one clock: chain position and pace (left),
-    // per-pool work rates (middle), and where the per-block time goes (right).
-    // All three are derived from the same once-a-second scrape, so no two
-    // columns can describe different instants — and on a terminal too narrow for
-    // three, the cost column is the one that goes.
+    // Three views on one clock: position+pace / per-pool rates / per-block cost.
+    // All off the same 1s scrape → no two columns describe different instants.
+    // Too narrow for three → cost is the column that goes
     let render = |feed: &Feed| {
         let (state, theme) = (feed.state.clone(), theme.clone());
         console.scene(move |elapsed| SceneFrame {
@@ -149,13 +136,10 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
     };
     render(&feed);
 
-    // Scraped controller-side, for as long as this attach lasts: the exporter is
-    // the only source with sub-scrape-interval resolution, and a watcher that
-    // walks away should stop dialing it.
-    //
-    // Built here and not by the sync machinery: metrics and sync are independent
-    // systems that this command composes. The poller needs no driver, and would
-    // work against any namespace with a metrics-exposing pod in it.
+    // Controller-side, only while this attach lasts (exporter = the only
+    // sub-scrape-interval source; a departed watcher should stop dialing it).
+    // Built here, not by the sync machinery: this command composes two independent
+    // systems, and the poller needs no driver
     let mut metrics = Poller::spawn(
         PodExporter::new(
             client.clone(),
@@ -168,10 +152,7 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
 
     feed.observed = true;
     let tail = tail_loop(
-        Followed {
-            driver: &driver,
-            sut: &api,
-        },
+        Followed { driver: &driver, sut: &api },
         &mut metrics,
         &console,
         session_start,
@@ -192,8 +173,8 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
     settled(&client, &ns, id, &theme).await
 }
 
-/// The panel-less attach: tail the driver log linearly, then report what the sync
-/// settled as. Used off a TTY and when the console cannot start.
+/// Panel-less attach: linear driver-log tail, then the settled verdict. Off a TTY,
+/// or when the console cannot start
 async fn linear(
     driver: &DriverPod,
     client: &kube::Client,
@@ -205,8 +186,7 @@ async fn linear(
     settled(client, ns, id, theme).await
 }
 
-/// Report what the sync settled as, once its log has ended: the durable report if
-/// the driver mirrored one, else an honest "no report".
+/// Post-log verdict: the durable report if the driver mirrored one, else "no report"
 async fn settled(
     client: &kube::Client,
     ns: &str,
@@ -217,9 +197,7 @@ async fn settled(
         Some(report) => {
             println!("{}", report_headline(theme, &report));
             print_report_details(theme, &report);
-            Ok(WatchEnd::Finished {
-                passed: report.passed(),
-            })
+            Ok(WatchEnd::Finished { passed: report.passed() })
         }
         None => {
             println!("sync {id}: tail ended — no report yet (`ztest sync status {id}`)");
@@ -228,8 +206,8 @@ async fn settled(
     }
 }
 
-/// Merge the driver log, the SUT log, and the pod-phase poll until either the
-/// driver's stream ends or the user detaches.
+/// Merge driver log + SUT log + pod-phase poll until the driver's stream ends or
+/// the user detaches
 async fn tail_loop(
     followed: Followed<'_>,
     metrics: &mut Poller,
@@ -240,8 +218,7 @@ async fn tail_loop(
     render: impl Fn(&Feed),
 ) -> Result<(), String> {
     let Followed { driver, sut: api } = followed;
-    // The last cause shown, so a standing condition is stated once rather than
-    // once a second.
+    // Last cause shown → a standing condition is stated once, not once a second
     let mut last_note: Option<String> = None;
 
     let started = open_driver_log(driver, &|| console.cancelled(), |phase| {
@@ -252,16 +229,14 @@ async fn tail_loop(
     let Some(mut driver_log) = started else {
         return Ok(());
     };
-    // The SUT pod does not exist yet on an early attach — the driver provisions
-    // its own topology — so its stream is opened lazily by the poll below. Name
-    // and stream are held apart so a line's prefix can be read in a `select!`
-    // handler that may also be replacing the stream.
+    // SUT pod absent on an early attach (the driver provisions its own topology) →
+    // stream opened lazily by the poll below. Name held apart from stream so a
+    // line's prefix reads in a `select!` arm that may be replacing the stream
     let mut sut: Option<LineStream> = None;
     let mut sut_name = String::new();
-    // The pod last followed, so a reopened SUT stream can tell a resumed follow of
-    // the same pod from a fresh one that replaced it.
+    // Last pod followed → a reopened stream tells a resumed follow from a replacement
     let mut sut_prev: Option<String> = None;
-    // When each stream last yielded, which is where a resumed one must pick up.
+    // Where a resumed stream must pick up
     let (mut driver_seen, mut sut_seen) = (Instant::now(), Instant::now());
     let mut ticker = tokio::time::interval(POD_POLL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -270,8 +245,7 @@ async fn tail_loop(
         if console.cancelled() {
             break;
         }
-        // Set by the stream branches; applied after the `select!` so no handler
-        // mutates what another branch is borrowing.
+        // Applied after the `select!`: no handler may mutate what another borrows
         let (mut close_sut, mut lost_driver) = (false, false);
         let mut next_sample: Option<Sample> = None;
         tokio::select! {
@@ -290,14 +264,13 @@ async fn tail_loop(
                     sut_seen = Instant::now();
                     console.scrollback(prefixed(&sut_name, &l, theme));
                 }
-                // The SUT's stream ending is not the run ending (a restarted pod,
-                // or one still being replaced): drop it and let the poll reopen.
+                // SUT stream ending != run ending (restarted/replaced pod): drop and
+                // let the poll reopen
                 Some(Err(_)) | None => close_sut = true,
             },
             sample = metrics.changed() => {
-                // Applied after the `select!` for the same reason the flags above
-                // are: `metrics` is borrowed by this arm's future, so the fold
-                // that consumes it cannot run inside the arm.
+                // `metrics` borrowed by this arm's future → the fold consuming it
+                // cannot run inside the arm
                 next_sample = Some(sample);
             }
             _ = ticker.tick() => {
@@ -311,9 +284,8 @@ async fn tail_loop(
                 if sut.is_none()
                     && let Some(name) = find_sut(api).await
                 {
-                    // Same pod as before ⇒ a resumed follow, which replays only the
-                    // gap; a different pod is a fresh subject and gets the usual
-                    // context tail.
+                    // Same pod → resumed follow, replay the gap only; a different pod
+                    // is a fresh subject and gets the context tail
                     let backfill = match sut_prev.as_deref() == Some(name.as_str()) {
                         true => Backfill::Seconds(gap_since(sut_seen)),
                         false => Backfill::Lines(TAIL_LINES),
@@ -331,8 +303,8 @@ async fn tail_loop(
         if let Some(sample) = next_sample {
             let component = metrics.component();
             feed.observe(&sample, component.as_deref(), session_start.elapsed());
-            // The panel names the cause itself; scrollback carries it too, once,
-            // so a condition that later clears still left a trace in the log.
+            // Panel names the cause; scrollback echoes it once, so a condition that
+            // later clears still left a trace
             let note = feed.state.metrics_note.clone();
             if note != last_note
                 && let Some(note) = &note
@@ -358,55 +330,44 @@ async fn tail_loop(
     Ok(())
 }
 
-/// Reopen the driver log after its stream ended but the run did not.
+/// Reopen the driver log when its stream ended but the run did not.
 ///
-/// A follow-stream over a log that lives for hours is routinely cut — an idle
-/// API-server timeout, a proxy hop, a rebalanced connection — and taking that for
-/// the end of the run leaves a live sync unwatched with no way back short of
-/// re-running the command. `None` means the driver really has finished.
+/// - Hours-long follow-streams are routinely cut (idle API-server timeout, proxy
+///   hop, rebalanced connection); reading that as the run's end strands a live sync
+/// - `None` = the driver really finished
 async fn reattach_driver(
     driver: &DriverPod,
     last_seen: Instant,
 ) -> Result<Option<LineStream>, String> {
-    // A stream that fails immediately would otherwise spin here; this also gives
-    // a driver mid-exit time to write its last lines.
+    // Backs off a stream that fails immediately; also lets a driver mid-exit finish
+    // writing
     tokio::time::sleep(POD_POLL).await;
-    let Some(pod) = driver
-        .get()
-        .await
-        .map_err(|e| format!("read driver pod: {e}"))?
-    else {
+    let Some(pod) = driver.get().await.map_err(|e| format!("read driver pod: {e}"))? else {
         return Ok(None);
     };
     if !running(&pod, DRIVER_CONTAINER) {
         return Ok(None);
     }
-    open_log(
-        &driver.api,
-        &driver.name,
-        Backfill::Seconds(gap_since(last_seen)),
-    )
-    .await
-    .map(Some)
-    .map_err(|e| format!("reattach to sync log: {e}"))
+    open_log(&driver.api, &driver.name, Backfill::Seconds(gap_since(last_seen)))
+        .await
+        .map(Some)
+        .map_err(|e| format!("reattach to sync log: {e}"))
 }
 
-/// The window a resumed stream must replay to leave no gap: everything since the
-/// last line read, rounded up, since the API's resolution is one second.
+/// Replay window leaving no gap: since the last line read, rounded up (API
+/// resolution = 1s)
 fn gap_since(last_seen: Instant) -> i64 {
     last_seen.elapsed().as_secs().saturating_add(1) as i64
 }
 
-/// Wait for the driver container to start, then open a follow-stream over its log.
+/// Await the driver container's start, then follow its log.
 ///
-/// The kube API answers a log request for a container that has not started with a
-/// 400, and `--watch` attaches the instant the pod is created — an image pull
-/// holds it in `ContainerCreating` for minutes. Gating on the container's own
-/// state rather than retrying the error means the wait also *reports* itself:
-/// `observe` receives every phase change, so `ImagePullBackOff` shows on the panel
-/// instead of looking like a hang.
-///
-/// `Ok(None)` means the caller asked to stop waiting.
+/// - Log request before start = a 400, and `--watch` attaches at pod creation (an
+///   image pull holds `ContainerCreating` for minutes)
+/// - Gating on container state, not retrying the error, makes the wait report
+///   itself: `observe` sees every phase change, so `ImagePullBackOff` reaches the
+///   panel instead of reading as a hang
+/// - `Ok(None)` = caller asked to stop waiting
 async fn open_driver_log(
     driver: &DriverPod,
     stop: &dyn Fn() -> bool,
@@ -432,14 +393,12 @@ async fn open_driver_log(
     }
 }
 
-/// Whether `container`'s log can be read: the kubelet keeps one only once the
-/// container has started, and keeps it after it exits.
+/// Log readable? The kubelet keeps one from container start, and after exit
 fn logs_available(pod: &Pod, container: &str) -> bool {
     container_state(pod, container).is_some_and(|s| s.running.is_some() || s.terminated.is_some())
 }
 
-/// Whether `container` is still executing — the question that separates a dropped
-/// connection from a finished run.
+/// Still executing? Separates a dropped connection from a finished run
 fn running(pod: &Pod, container: &str) -> bool {
     container_state(pod, container).is_some_and(|s| s.running.is_some())
 }
@@ -455,8 +414,8 @@ fn container_state(pod: &Pod, container: &str) -> Option<ContainerState> {
         .clone()
 }
 
-/// The driver's phase, refined by the container's waiting reason when it has one:
-/// a bare `Pending` cannot distinguish scheduling from `ImagePullBackOff`.
+/// Phase + the container's waiting reason (bare `Pending` cannot separate
+/// scheduling from `ImagePullBackOff`)
 fn driver_phase(pod: &Pod) -> String {
     let phase = row_of(pod).2;
     let reason = pod
@@ -471,28 +430,22 @@ fn driver_phase(pod: &Pod) -> String {
     }
 }
 
-/// How much history a freshly-opened log stream replays.
+/// History a freshly-opened log stream replays.
+///
+/// `Seconds` = a resumed attach, which takes overlap over a gap (driver events
+/// de-dupe on their sequence; a repeated component line is only cosmetic)
 #[derive(Debug, Clone, Copy)]
 enum Backfill {
-    /// The last N lines — a first attach, which wants context.
     Lines(i64),
-    /// Everything from N seconds ago — a resumed attach, which must not leave a
-    /// gap and so accepts a small overlap instead. Driver events carry a sequence
-    /// and are de-duplicated on the fold; a repeated component log line is only
-    /// cosmetic, and preferable to a lost one.
     Seconds(i64),
 }
 
-/// Open a follow-stream over one pod's log.
 async fn open_log(
     api: &Api<Pod>,
     pod: &str,
     backfill: Backfill,
 ) -> Result<LineStream, kube::Error> {
-    let mut lp = LogParams {
-        follow: true,
-        ..Default::default()
-    };
+    let mut lp = LogParams { follow: true, ..Default::default() };
     match backfill {
         Backfill::Lines(n) => lp.tail_lines = Some(n),
         Backfill::Seconds(s) => lp.since_seconds = Some(s),
@@ -500,13 +453,9 @@ async fn open_log(
     Ok(Box::pin(api.log_stream(pod, &lp).await?.lines()))
 }
 
-/// The name of the running indexer pod. `None` while the driver has yet to
-/// provision one — the caller retries.
+/// Running indexer pod's name; `None` until the driver provisions one (caller retries)
 async fn find_sut(api: &Api<Pod>) -> Option<String> {
-    let pods = api
-        .list(&ListParams::default().labels(SUT_SELECTOR))
-        .await
-        .ok()?;
+    let pods = api.list(&ListParams::default().labels(SUT_SELECTOR)).await.ok()?;
     pods.items
         .into_iter()
         .find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))?
@@ -514,8 +463,8 @@ async fn find_sut(api: &Api<Pod>) -> Option<String> {
         .name
 }
 
-/// Await the next line of an optional stream. A `None` stream parks forever, so
-/// `select!` simply ignores that branch until one is opened.
+/// Next line of an optional stream; `None` parks forever, so `select!` ignores that
+/// branch until one opens
 async fn next_line(stream: &mut Option<LineStream>) -> Option<std::io::Result<String>> {
     match stream {
         Some(s) => s.next().await,
@@ -533,9 +482,8 @@ fn prefixed(source: &str, line: &str, theme: &Theme) -> String {
     )
 }
 
-/// A plain, linear follow-tail of the driver log (non-TTY, or when the terminal
-/// console can't start). No panel, so every event — ticks included — is rendered
-/// as a line: a piped `watch` is a progress log.
+/// Linear follow-tail of the driver log (non-TTY, or console won't start). No
+/// panel, so every event including ticks renders as a line = a progress log
 async fn plain_tail(driver: &DriverPod, theme: &Theme) -> Result<(), String> {
     let mut lines = open_driver_log(driver, &|| false, |phase| {
         println!("ztest sync: driver {phase}");
@@ -545,8 +493,8 @@ async fn plain_tail(driver: &DriverPod, theme: &Theme) -> Result<(), String> {
     let mut feed = Feed::new(String::new(), String::new(), String::new(), String::new());
     let started = Instant::now();
     let mut seen = Instant::now();
-    // Reattaches on a dropped connection exactly as the panel path does: a piped
-    // `--watch` in CI follows the same hours-long log.
+    // Reattaches like the panel path: a piped `--watch` in CI follows the same
+    // hours-long log
     loop {
         while let Some(line) = lines.next().await {
             let line = line.map_err(|e| format!("read sync log: {e}"))?;
@@ -565,18 +513,13 @@ async fn plain_tail(driver: &DriverPod, theme: &Theme) -> Result<(), String> {
     }
 }
 
-/// The newest live progress a *one-shot* command can recover, by folding the
-/// driver log's tail rather than following it. This is what makes `ztest sync
-/// status` truthful mid-run: the durable report only exists once the run ends, so
-/// without this the only answer between start and finish is the pod phase.
+/// Newest live progress recoverable one-shot, by folding the driver log's tail.
 ///
-/// `None` when no tick has been published yet (still provisioning), or the log is
-/// unreadable.
+/// - Makes `ztest sync status` truthful mid-run (the durable report exists only
+///   after the run ends; without this the only mid-run answer is the pod phase)
+/// - `None` = no tick published yet (provisioning) or the log is unreadable
 pub(super) async fn latest_progress(driver: &DriverPod) -> Option<SyncWatchState> {
-    let lp = LogParams {
-        tail_lines: Some(STATUS_TAIL_LINES),
-        ..Default::default()
-    };
+    let lp = LogParams { tail_lines: Some(STATUS_TAIL_LINES), ..Default::default() };
     let logs = driver.api.logs(&driver.name, &lp).await.ok()?;
     let theme = Theme::for_capabilities(false, true);
     let mut feed = Feed::new(String::new(), String::new(), String::new(), String::new());
@@ -586,60 +529,48 @@ pub(super) async fn latest_progress(driver: &DriverPod) -> Option<SyncWatchState
     feed.state.vitals.is_some().then_some(feed.state)
 }
 
-/// Log tail `status` folds. Deeper than [`TAIL_LINES`] because two events land per
-/// tick and the tail must still contain one after a burst of component logging.
+/// Deeper than [`TAIL_LINES`]: two events per tick, and the tail must still hold
+/// one after a burst of component logging
 const STATUS_TAIL_LINES: i64 = 400;
 
 // ─────────────────────────── event folding ────────────────────────────
 
-/// Folds the driver's event stream into the panel's view model, keeping the
-/// derived quantities (scan rate, ETA) that no single event carries.
+/// Folds the driver's event stream into the panel's view model, holding the
+/// derived quantities (scan rate, ETA) no single event carries.
 pub(super) struct Feed {
     pub(super) state: SyncWatchState,
-    rate: RateMeter,
-    /// Whether a live scrape of the subject is feeding this panel.
-    ///
-    /// When it is, the driver's five-second tick stops writing the vitals and
-    /// contributes only what the exporter cannot know — the engine's phase and
-    /// reorg depth. Two writers on one set of numbers would flip the panel
-    /// between a 1 s reading and a 5 s one every tick, and the reader would have
-    /// no way to tell which they were looking at. `ztest sync status` folds the
-    /// same events with nothing to scrape, and keeps the tick-fed path.
+    /// Live scrape feeding the panel → the 5s tick stops writing vitals and
+    /// contributes only phase + reorg depth (two writers would flip the panel
+    /// between a 1s and a 5s reading); `ztest sync status` keeps the tick-fed path
     pub(super) observed: bool,
-    /// The trailing window every displayed rate is measured across.
-    window: Window,
-    /// Second-by-second rates, for the panel's sparklines. Built here rather
-    /// than taken from the driver's `Series` event, which republishes once a
-    /// minute — a sparkline 60× coarser than the number beside it is a different
-    /// measurement wearing the same label.
+    /// One estimator, two clocks: scrapes stamped as observed here, driver ticks on
+    /// the driver's own elapsed (a resumed stream replays a minute in milliseconds)
+    scraped: Window,
+    ticked: Window<Duration>,
+    /// Driver's cadence, sizing `ticked`. A window narrower than the gap between ticks
+    /// clears on every push and can never measure
+    tick: Duration,
+    /// Second-by-second, not the driver's once-a-minute `Series` (a sparkline 60×
+    /// coarser than the number beside it is a different measurement)
     series: crate::sync::Timeline,
-    /// The instant of the newest scrape folded. The window only ever moves
-    /// forward: a failed scrape re-sends the last good exposition, which must
-    /// not be differenced against itself as if it were new data and read as a
-    /// stall that never happened.
+    /// Newest scrape folded; moves forward only (a failed scrape re-sends the last
+    /// exposition, which differenced against itself reads as a phantom stall)
     observed_at: Option<Instant>,
-    /// Engine state the exporter does not publish, carried across ticks.
     phase: String,
     reorg_depth: u32,
-    /// Sequence of the newest event folded. A stream resumed after a dropped
-    /// connection replays by time, so it can hand back events already counted;
-    /// this is what keeps the fold exactly-once across that overlap.
+    /// Newest event folded; keeps the fold exactly-once across a resumed stream's
+    /// by-time replay
     folded_through: Option<u64>,
 }
 
 impl Feed {
     fn new(profile: String, sync_id: String, context: String, pod_phase: String) -> Feed {
         Feed {
-            state: SyncWatchState {
-                profile,
-                sync_id,
-                context,
-                pod_phase,
-                ..Default::default()
-            },
-            rate: RateMeter::default(),
+            state: SyncWatchState { profile, sync_id, context, pod_phase, ..Default::default() },
             observed: false,
-            window: Window::new(crate::metrics::LIVE_PERIOD),
+            scraped: Window::new(crate::metrics::LIVE_PERIOD),
+            ticked: Window::new(crate::sync::DEFAULT_TICK),
+            tick: crate::sync::DEFAULT_TICK,
             series: crate::sync::Timeline::new(plot_channels(), crate::metrics::LIVE_PERIOD),
             observed_at: None,
             phase: String::new(),
@@ -648,11 +579,9 @@ impl Feed {
         }
     }
 
-    /// Fold one scrape of the subject's exporter into the panel's vitals.
-    ///
-    /// The whole live display hangs off this: heights, pace, per-pool rates and
-    /// per-block cost all come from the same exposition, so the panel cannot
-    /// show two columns describing different instants.
+    /// Fold one exporter scrape into the panel's vitals. Heights, pace, per-pool
+    /// rates and per-block cost all come off one exposition → no two columns can
+    /// describe different instants
     fn observe(&mut self, sample: &Sample, component: Option<&str>, elapsed: Duration) {
         let fresh = sample
             .at
@@ -662,59 +591,56 @@ impl Feed {
 
         if let Some((at, observation)) = fresh {
             self.observed_at = Some(at);
-            self.window.push(at, observation);
-            self.state.vitals = self.vitals(elapsed);
+            self.scraped.push(at, observation);
+            self.state.vitals = self.vitals_of(&self.scraped, elapsed);
             self.record_series(elapsed);
         }
         self.state.metrics_note = sample.note(self.state.vitals.is_some());
     }
 
-    /// The vitals as the newest scrape and the window over it report them.
-    fn vitals(&self, elapsed: Duration) -> Option<SyncVitals> {
-        let observation = self.window.latest()?;
-        let rate = self.window.work_rate();
-        let blocks_per_sec = self.window.blocks_per_sec();
+    /// One window → the panel's vitals. Same fold whichever clock fed it, so no column
+    /// means one thing under a live scrape and another off the driver's ticks
+    fn vitals_of<S: crate::rate::Stamp>(
+        &self,
+        window: &Window<S>,
+        elapsed: Duration,
+    ) -> Option<SyncVitals> {
+        let observation = window.latest()?;
+        let work = window.work_rate();
         Some(SyncVitals {
             height: observation.height.unwrap_or(0),
             target: observation.target,
             pct: observation.pct(),
             phase: self.phase.clone(),
             reorg_depth: self.reorg_depth,
-            blocks_per_sec,
-            eta: eta(
-                observation.height.unwrap_or(0),
-                observation.target,
-                blocks_per_sec,
-            ),
-            work_rate: rate.and_then(|r| r.total()),
-            pool_rates: rate.map(|r| r.channels().to_vec()).unwrap_or_default(),
+            pace: window.block_pace(),
+            work_rate: work.and_then(|r| r.total()),
+            pool_rates: work.map(|r| r.channels().to_vec()).unwrap_or_default(),
             cost: observation.cost,
             received_at: elapsed,
         })
     }
 
-    /// Append this second's rates to the sparkline series. Unmeasured channels
-    /// contribute a gap rather than a zero: a pool nobody counted must not draw
-    /// a floor through the graph.
+    /// This second's rates → the sparkline series; unmeasured channels contribute
+    /// a gap, never a zero (an uncounted pool must not draw a floor)
     fn record_series(&mut self, elapsed: Duration) {
         let Some(vitals) = &self.state.vitals else {
             return;
         };
-        let mut values = vec![vitals.blocks_per_sec];
+        let mut values = vec![vitals.pace.map(|p| p.per_sec)];
         values.extend(vitals.pool_rates.iter().map(|(_, rate)| *rate));
         self.series.push(elapsed, &values);
         self.state.timeline = Some(self.series.clone());
     }
 
-    /// Take one driver log line. Returns the text to commit to scrollback, or
-    /// `None` when the line was an event that belongs only in the panel — or one
-    /// this feed has already folded.
+    /// One driver log line → text for scrollback; `None` for a panel-only event or
+    /// one already folded
     fn absorb(&mut self, line: &str, elapsed: Duration, theme: &Theme) -> Option<String> {
         self.fold(line, elapsed, theme, false)
     }
 
-    /// As [`absorb`](Self::absorb), for the panel-less path: with nowhere to pin
-    /// live state, per-tick progress has to be rendered as ordinary lines.
+    /// [`absorb`](Self::absorb) for the panel-less path: nowhere to pin live state,
+    /// so per-tick progress renders as ordinary lines
     fn absorb_verbose(&mut self, line: &str, elapsed: Duration, theme: &Theme) -> Option<String> {
         self.fold(line, elapsed, theme, true)
     }
@@ -736,9 +662,8 @@ impl Feed {
         self.record(&env.event, elapsed, theme, verbose)
     }
 
-    /// Whether this event has been folded before, as it has after a resumed
-    /// stream replays it. An unnumbered event (an older driver) cannot be judged,
-    /// so it is folded — losing an observation is worse than repeating one.
+    /// Already folded (as a resumed stream's replay is)? An unnumbered event (older
+    /// driver) is folded — repeating an observation beats losing one
     fn already_folded(&self, n: Option<u64>) -> bool {
         match (n, self.folded_through) {
             (Some(n), Some(through)) => n <= through,
@@ -746,9 +671,8 @@ impl Feed {
         }
     }
 
-    /// Fold one event into the view model, returning any line worth keeping in
-    /// history. `verbose` (the panel-less path) also renders per-tick progress,
-    /// which would otherwise be redundant with the panel.
+    /// Fold one event, returning any line worth keeping in history. `verbose` (the
+    /// panel-less path) also renders per-tick progress, redundant with a panel
     fn record(
         &mut self,
         event: &SyncEvent,
@@ -757,66 +681,42 @@ impl Feed {
         verbose: bool,
     ) -> Option<String> {
         match event {
-            SyncEvent::Setup {
-                phase,
-                detail,
-                component,
-            } => {
+            SyncEvent::Setup { phase, detail, component } => {
                 let subject = component.clone().unwrap_or_else(|| phase.clone());
                 self.state.setup = Some(SetupStep {
                     subject: subject.clone(),
                     detail: detail.clone(),
                     received_at: elapsed,
                 });
-                // Panel-only on the panel path: the driver's own `provisioning
-                // component` log lines already carry this through to scrollback,
-                // and repeating them as ztest lines would double every step.
+                // Panel-only here: the driver's own `provisioning component` lines
+                // already reach scrollback, so ztest lines would double every step
                 verbose.then(|| format!("setup · {subject} · {detail}"))
             }
-            SyncEvent::Started {
-                profile,
-                sync_id,
-                tick_ms,
-                probes,
-            } => {
+            SyncEvent::Started { profile, sync_id, tick_ms, probes } => {
+                let tick = Duration::from_millis(*tick_ms);
+                // Re-published on a resumed stream; resizing to the same width would
+                // throw away the samples already folded
+                if self.tick != tick {
+                    self.tick = tick;
+                    self.ticked = Window::new(tick);
+                }
                 if self.state.profile.is_empty() {
                     self.state.profile = profile.clone();
                     self.state.sync_id = sync_id.clone();
                 }
-                Some(format!(
-                    "sync engine started · {probes} probes · {}s tick",
-                    tick_ms / 1000
-                ))
+                Some(format!("sync engine started · {probes} probes · {}s tick", tick_ms / 1000))
             }
             SyncEvent::Tick(t) => {
-                // The engine's own state, which no exporter publishes and every
-                // path therefore needs from here.
+                // Engine state; no exporter publishes it, so every path needs it here
                 self.phase = t.phase.clone();
                 self.reorg_depth = t.reorg_depth;
                 if let Some(vitals) = &mut self.state.vitals {
                     vitals.phase = t.phase.clone();
                     vitals.reorg_depth = t.reorg_depth;
                 }
-                // Rate is measured on the *driver's* clock, not arrival time: the
-                // 200-line backfill on attach arrives in milliseconds, which as a
-                // wall-clock delta would read as a preposterous scan rate.
-                let rate = self
-                    .rate
-                    .sample(Duration::from_millis(t.elapsed_ms), t.height);
+                self.ticked.push(t.at(), t.into());
                 if !self.observed {
-                    self.state.vitals = Some(SyncVitals {
-                        height: t.height,
-                        target: t.target,
-                        pct: t.pct,
-                        phase: t.phase.clone(),
-                        reorg_depth: t.reorg_depth,
-                        blocks_per_sec: rate,
-                        eta: eta(t.height, t.target, rate),
-                        work_rate: t.rate.total(),
-                        pool_rates: t.rate.channels().to_vec(),
-                        cost: crate::sync::Cost::default(),
-                        received_at: elapsed,
-                    });
+                    self.state.vitals = self.vitals_of(&self.ticked, elapsed);
                 }
                 verbose.then(|| {
                     let of = t.target.map(|t| format!("/{t}")).unwrap_or_default();
@@ -826,14 +726,10 @@ impl Feed {
                     )
                 })
             }
-            // Replaced wholesale rather than merged: the driver owns the
-            // bucketing, and a controller stitching two publications together
-            // would have to re-derive the coarsening it deliberately does not
-            // own. A later publication is always the more complete one.
-            // Ignored while a live scrape is feeding the panel, which builds a
-            // second-by-second series of its own: the driver republishes this
-            // once a minute, and letting the two take turns would make the
-            // sparklines change resolution under the reader.
+            // Replaced wholesale, never merged: the driver owns the bucketing, and a
+            // later publication is always the more complete one.
+            // Ignored under a live scrape, which builds its own second-by-second
+            // series (taking turns would change sparkline resolution mid-read)
             SyncEvent::Series { timeline } => {
                 if !self.observed {
                     self.state.timeline = Some(timeline.clone());
@@ -852,11 +748,7 @@ impl Feed {
                     .collect();
                 None
             }
-            SyncEvent::Violation {
-                probe,
-                height,
-                detail,
-            } => {
+            SyncEvent::Violation { probe, height, detail } => {
                 self.state.violations += 1;
                 let at = height.map(|h| format!(" at {h}")).unwrap_or_default();
                 Some(format!(
@@ -865,59 +757,12 @@ impl Feed {
                     probe.style(theme.styles.fail),
                 ))
             }
-            SyncEvent::Finished {
-                verdict,
-                violations,
-                coverage_gaps,
-                ticks,
-            } => Some(format!(
+            SyncEvent::Finished { verdict, violations, coverage_gaps, ticks } => Some(format!(
                 "sync finished · {verdict} · {ticks} ticks · {violations} violation(s) · \
                  {coverage_gaps} coverage gap(s)"
             )),
             SyncEvent::Unknown => None,
         }
-    }
-}
-
-/// Projected time to `target` at `rate`. `None` without both, or when the rate is
-/// too near zero to project honestly rather than as a wild number.
-fn eta(height: u32, target: Option<u32>, rate: Option<f64>) -> Option<Duration> {
-    let (target, rate) = (target?, rate?);
-    let remaining = target.saturating_sub(height);
-    (rate > 0.05 && remaining > 0).then(|| Duration::from_secs_f64(remaining as f64 / rate))
-}
-
-/// A smoothed blocks-per-second meter over successive ticks.
-///
-/// Exponentially smoothed rather than a raw per-tick delta: scanning is bursty
-/// (batch boundaries, tree completions), and a rate that swings by 10× between
-/// frames is unreadable and makes the ETA jump.
-#[derive(Debug, Default)]
-struct RateMeter {
-    prev: Option<(Duration, u32)>,
-    ema: Option<f64>,
-}
-
-/// Weight of the newest sample. Low enough to ride out one slow batch, high
-/// enough to react within a few ticks when the pace genuinely changes.
-const RATE_ALPHA: f64 = 0.3;
-
-impl RateMeter {
-    fn sample(&mut self, at: Duration, height: u32) -> Option<f64> {
-        if let Some((prev_at, prev_height)) = self.prev {
-            let dt = at.saturating_sub(prev_at).as_secs_f64();
-            // A reorg (height going backwards) is not a negative scan rate, and a
-            // zero interval is not an infinite one: hold the previous estimate.
-            if dt > 0.0 && height >= prev_height {
-                let instant = (height - prev_height) as f64 / dt;
-                self.ema = Some(match self.ema {
-                    Some(prev) => prev * (1.0 - RATE_ALPHA) + instant * RATE_ALPHA,
-                    None => instant,
-                });
-            }
-        }
-        self.prev = Some((at, height));
-        self.ema
     }
 }
 
@@ -935,8 +780,8 @@ mod tests {
         )
     }
 
-    /// A zaino exposition at `height`, with `transparent` cumulative ops and a
-    /// per-block timing summary — the subset the panel resolves.
+    /// zaino exposition at `height`: `transparent` cumulative ops + per-block
+    /// timing summary = the subset the panel resolves
     fn exposition(height: u32, transparent: u64) -> std::sync::Arc<crate::metrics::Exposition> {
         let text = format!(
             "# TYPE zaino_sync_fetched_height gauge\n\
@@ -958,16 +803,11 @@ mod tests {
     }
 
     fn sample(at: Instant, height: u32, transparent: u64) -> Sample {
-        Sample {
-            at: Some(at),
-            exposition: exposition(height, transparent),
-            error: None,
-        }
+        Sample { at: Some(at), exposition: exposition(height, transparent), error: None }
     }
 
-    /// The whole live display in one path: two scrapes of a zaino exporter land,
-    /// and the panel gets a height, a scan rate, per-pool rates and the cost
-    /// split — none of it touching a metric name outside the backend.
+    /// Whole live display in one path: two zaino scrapes → height, scan rate,
+    /// per-pool rates, cost split, no metric name touched outside the backend
     #[test]
     fn two_scrapes_become_the_panels_vitals() {
         let mut f = feed();
@@ -979,7 +819,7 @@ mod tests {
         assert_eq!(first.height, 900);
         assert_eq!(first.target, Some(1024));
         assert_eq!(
-            first.blocks_per_sec, None,
+            first.pace, None,
             "one scrape cannot be a rate, and must not be shown as a zero"
         );
         assert_eq!(first.cost.fetch_ms, Some(6.0));
@@ -996,20 +836,14 @@ mod tests {
         );
         let v = f.state.vitals.as_ref().expect("still reading");
         assert_eq!(v.height, 1_000);
-        assert_eq!(v.blocks_per_sec, Some(50.0), "100 blocks over 2s");
+        assert_eq!(v.pace.map(|p| p.per_sec), Some(50.0), "100 blocks over 2s");
         assert_eq!(
-            v.pool_rates
-                .iter()
-                .find(|(name, _)| *name == "transparent")
-                .map(|(_, r)| *r),
+            v.pool_rates.iter().find(|(name, _)| *name == "transparent").map(|(_, r)| *r),
             Some(Some(1_000.0)),
             "2,000 transparent ops over 2s"
         );
         assert_eq!(
-            v.pool_rates
-                .iter()
-                .find(|(name, _)| *name == "orchard")
-                .map(|(_, r)| *r),
+            v.pool_rates.iter().find(|(name, _)| *name == "orchard").map(|(_, r)| *r),
             Some(None),
             "a pool this exposition never published stays unmeasured"
         );
@@ -1017,9 +851,8 @@ mod tests {
         assert!(f.state.metrics_note.is_none(), "nothing to explain away");
     }
 
-    /// A failed scrape re-sends the last good exposition under its original
-    /// timestamp. Folding it again would difference a reading against itself and
-    /// report a stall that never happened.
+    /// Failed scrape re-sends the last exposition under its original timestamp;
+    /// re-folding differences a reading against itself = a phantom stall
     #[test]
     fn a_repeated_sample_is_not_folded_twice() {
         let mut f = feed();
@@ -1032,29 +865,24 @@ mod tests {
             Some("zainod"),
             Duration::from_secs(1),
         );
-        let rate = f.state.vitals.as_ref().unwrap().blocks_per_sec;
+        let rate = f.state.vitals.as_ref().unwrap().pace;
 
-        // The poller re-sends the newest sample it holds, unchanged.
+        // Poller re-sends its newest sample unchanged
         f.observe(&first, Some("zainod"), Duration::from_secs(2));
         assert_eq!(
-            f.state.vitals.as_ref().unwrap().blocks_per_sec,
+            f.state.vitals.as_ref().unwrap().pace,
             rate,
             "a re-sent sample must leave the window untouched"
         );
     }
 
-    /// A driver tick must not write the vitals out from under the scrape that
-    /// owns them — the two are measured five seconds apart, and a panel that
-    /// alternated between them would show two different heights per tick.
+    /// Driver tick must not write vitals out from under the owning scrape (measured
+    /// 5s apart → alternating shows two heights per tick)
     #[test]
     fn a_tick_contributes_only_what_the_exporter_cannot_publish() {
         let mut f = feed();
         f.observed = true;
-        f.observe(
-            &sample(Instant::now(), 900, 1_000),
-            Some("zainod"),
-            Duration::ZERO,
-        );
+        f.observe(&sample(Instant::now(), 900, 1_000), Some("zainod"), Duration::ZERO);
         let tick = crate::sync::encode_event(&tick_at(1, 5, 0));
         f.absorb(tick.trim_end(), Duration::ZERO, &theme());
 
@@ -1071,7 +899,7 @@ mod tests {
         tick_at(seq, height, 0)
     }
 
-    /// A tick published `elapsed_ms` into the driver's run.
+    /// Tick published `elapsed_ms` into the driver's run
     fn tick_at(seq: u64, height: u32, elapsed_ms: u64) -> SyncEvent {
         SyncEvent::Tick(crate::sync::SyncTick {
             seq,
@@ -1081,45 +909,36 @@ mod tests {
             pct: 0.0,
             phase: "Historic".into(),
             reorg_depth: 0,
-            rate: Default::default(),
+            work: crate::sync::Work::ZERO,
         })
     }
 
-    /// A tick carrying measured work, for the rows that have to distinguish an
-    /// unmeasured pool from an idle one.
-    fn tick_with_work(seq: u64, sapling: f64, orchard: f64) -> SyncEvent {
-        let SyncEvent::Tick(mut t) = tick_at(seq, 100, seq * 1000) else {
+    /// Tick carrying cumulative work at `elapsed_ms`, for rows that separate an
+    /// unmeasured pool from an idle one
+    fn tick_with_work(seq: u64, elapsed_ms: u64, sapling: u64, orchard: u64) -> SyncEvent {
+        let SyncEvent::Tick(mut t) = tick_at(seq, 100, elapsed_ms) else {
             unreachable!("tick_at builds a tick")
         };
-        // Counted over ten seconds so a fractional rate survives the integer
-        // counts a `Work` holds.
-        let window = std::time::Duration::from_secs(10);
-        let mut work = crate::sync::Work::ZERO;
-        work.set(Op::SaplingOutput, (sapling * 10.0) as u64)
-            .set(Op::OrchardAction, (orchard * 10.0) as u64);
-        t.rate = work.rate(window);
+        t.work.set(Op::SaplingOutput, sapling).set(Op::OrchardAction, orchard);
         SyncEvent::Tick(t)
     }
 
-    /// The distinction the work map exists to carry, all the way from the wire
-    /// to the panel's view model: Sapling and Orchard were counted, Ironwood
-    /// was counted and is idle, and the tier-B pools were never measured at all.
+    /// Wire → view model, the distinction the work map exists for: sapling/orchard
+    /// counted, ironwood counted & idle, tier-B never measured
     #[test]
     fn an_unmeasured_pool_reaches_the_panel_as_absent_not_zero() {
         let mut f = feed();
-        f.absorb(
-            &crate::sync::encode_event(&tick_with_work(1, 19.4, 4.2)),
-            Duration::ZERO,
-            &theme(),
-        );
+        // Ten seconds apart, so a fractional rate survives `Work`'s integer counts
+        for (seq, ms, sapling, orchard) in [(1, 0, 0, 0), (2, 10_000, 194, 42)] {
+            f.absorb(
+                &crate::sync::encode_event(&tick_with_work(seq, ms, sapling, orchard)),
+                Duration::ZERO,
+                &theme(),
+            );
+        }
         let vitals = f.state.vitals.expect("a tick landed");
-        let rate = |name: &str| {
-            vitals
-                .pool_rates
-                .iter()
-                .find(|(n, _)| *n == name)
-                .and_then(|(_, r)| *r)
-        };
+        let rate =
+            |name: &str| vitals.pool_rates.iter().find(|(n, _)| *n == name).and_then(|(_, r)| *r);
         assert_eq!(rate("sapling"), Some(19.4));
         assert_eq!(rate("orchard"), Some(4.2));
         assert_eq!(rate("transparent"), None, "tier B was never counted");
@@ -1128,8 +947,7 @@ mod tests {
         assert!((total - 23.6).abs() < 1e-9, "{total}");
     }
 
-    /// A driver that never published a series leaves no graph, and the panel
-    /// has to cope rather than assume one is always there.
+    /// No published series = no graph; the panel must cope, not assume one
     #[test]
     fn a_series_event_becomes_the_panels_timeline() {
         let mut f = feed();
@@ -1138,9 +956,7 @@ mod tests {
         let mut timeline = crate::sync::Timeline::new(["work"], Duration::from_secs(5));
         timeline.push(Duration::ZERO, &[Some(100.0)]);
         f.absorb(
-            &crate::sync::encode_event(&SyncEvent::Series {
-                timeline: timeline.clone(),
-            }),
+            &crate::sync::encode_event(&SyncEvent::Series { timeline: timeline.clone() }),
             Duration::ZERO,
             &theme(),
         );
@@ -1160,22 +976,42 @@ mod tests {
         assert_eq!(f.state.vitals.as_ref().map(|v| v.height), Some(100));
     }
 
+    /// A rate needs two ticks; the countdown off it waits for the window to agree
+    /// with itself, so a burst mid-scan never publishes a number that walks backwards
     #[test]
-    fn rate_and_eta_appear_once_two_ticks_have_landed() {
+    fn the_rate_appears_before_the_eta_it_supports() {
         let mut f = feed();
         let theme = theme();
 
         f.record(&tick_at(0, 100, 0), Duration::ZERO, &theme, false);
-        assert!(
-            f.state.vitals.as_ref().unwrap().blocks_per_sec.is_none(),
-            "one tick cannot establish a rate"
-        );
+        assert!(f.state.vitals.as_ref().unwrap().pace.is_none(), "one tick is not a rate");
 
         f.record(&tick_at(1, 150, 5_000), Duration::ZERO, &theme, false);
-        let v = f.state.vitals.as_ref().unwrap();
-        assert_eq!(v.blocks_per_sec, Some(10.0), "50 blocks in 5s");
-        // 874 blocks left at 10 blk/s.
-        assert_eq!(v.eta, Some(Duration::from_secs_f64(87.4)));
+        let pace = f.state.vitals.as_ref().unwrap().pace.expect("two ticks measure");
+        assert_eq!(pace.per_sec, 10.0, "50 blocks in 5s");
+        assert_eq!(pace.eta, None, "one interval is a measurement, not a trend");
+
+        for (seq, height, ms) in [(2, 200, 10_000), (3, 250, 15_000)] {
+            f.record(&tick_at(seq, height, ms), Duration::ZERO, &theme, false);
+        }
+        let pace = f.state.vitals.as_ref().unwrap().pace.expect("still measuring");
+        assert_eq!(pace.per_sec, 10.0);
+        // 774 blocks left at 10 blk/s
+        assert_eq!(pace.eta, Some(Duration::from_secs_f64(77.4)));
+    }
+
+    /// Same total, delivered in one burst: the rate publishes, the countdown does not
+    #[test]
+    fn a_bursty_scan_publishes_a_rate_but_no_eta() {
+        let mut f = feed();
+        let theme = theme();
+        for (seq, height, ms) in [(0, 100, 0), (1, 100, 5_000), (2, 100, 10_000), (3, 250, 15_000)]
+        {
+            f.record(&tick_at(seq, height, ms), Duration::ZERO, &theme, false);
+        }
+        let pace = f.state.vitals.as_ref().unwrap().pace.expect("a measured rate");
+        assert_eq!(pace.per_sec, 10.0, "150 blocks over 15s");
+        assert_eq!(pace.eta, None, "three idle ticks then a burst is no trend");
     }
 
     fn driver_pod(phase: &str, state: serde_json::Value) -> Pod {
@@ -1199,8 +1035,8 @@ mod tests {
         .expect("driver pod fixture is valid")
     }
 
-    /// Attaching on the heels of `sync start` finds the container still being
-    /// created; asking the kubelet for its log there is the 400 this gate avoids.
+    /// Attaching right after `sync start` finds the container still creating;
+    /// asking the kubelet for its log there is the 400 this gate avoids
     #[test]
     fn a_container_that_has_not_started_has_no_log_and_says_why() {
         let pod = driver_pod(
@@ -1221,8 +1057,8 @@ mod tests {
         assert_eq!(driver_phase(&pod), "Pending · ImagePullBackOff");
     }
 
-    /// A finished driver still has the log that holds the whole event stream, so
-    /// `watch` on a completed sync must not wait forever for a restart.
+    /// Finished driver still holds the whole event stream → `watch` on a completed
+    /// sync must not wait for a restart
     #[test]
     fn a_running_or_exited_container_has_a_log() {
         let running = driver_pod(
@@ -1241,9 +1077,8 @@ mod tests {
         assert!(logs_available(&exited, DRIVER_CONTAINER));
     }
 
-    /// Provisioning is most of a sync's wall-clock, so the gate the driver is in
-    /// has to reach the panel — and each new gate has to replace the last, since a
-    /// stale one reads as progress that isn't happening.
+    /// Provisioning = most of a sync's wall-clock, so the driver's gate must reach
+    /// the panel, each replacing the last (a stale gate reads as false progress)
     #[test]
     fn a_setup_event_becomes_the_panels_current_gate() {
         let mut f = feed();
@@ -1255,8 +1090,7 @@ mod tests {
             component: Some("zainod".into()),
         });
         assert!(
-            f.absorb(creating.trim_end(), Duration::from_secs(5), &theme)
-                .is_none(),
+            f.absorb(creating.trim_end(), Duration::from_secs(5), &theme).is_none(),
             "a setup event belongs to the panel, not scrollback"
         );
         let step = f.state.setup.as_ref().expect("a setup step");
@@ -1282,9 +1116,8 @@ mod tests {
         );
     }
 
-    /// A resumed stream replays by time, so the overlap is delivered twice. The
-    /// panel must not count those events twice — a doubled violation tally is a
-    /// wrong answer, not a cosmetic repeat.
+    /// Resumed streams replay by time, delivering the overlap twice; a doubled
+    /// violation tally is a wrong answer, not a cosmetic repeat
     #[test]
     fn a_replayed_event_is_folded_only_once() {
         let mut f = feed();
@@ -1304,17 +1137,13 @@ mod tests {
         assert_eq!(f.state.violations, 1, "a replay must not be counted again");
     }
 
-    /// Sequences only order events from one driver; an ordinary log line carries
-    /// none and must always pass through, however many arrive.
+    /// Sequences order events from one driver only; an ordinary log line carries
+    /// none and must always pass through
     #[test]
     fn ordinary_log_lines_are_never_deduplicated() {
         let mut f = feed();
         let theme = theme();
-        f.absorb(
-            crate::sync::encode_event(&tick_event(0, 100)).trim_end(),
-            Duration::ZERO,
-            &theme,
-        );
+        f.absorb(crate::sync::encode_event(&tick_event(0, 100)).trim_end(), Duration::ZERO, &theme);
         for _ in 0..3 {
             assert_eq!(
                 f.absorb("INFO zebrad: committed block", Duration::ZERO, &theme),
@@ -1323,8 +1152,7 @@ mod tests {
         }
     }
 
-    /// An event newer than everything folded so far is still folded after a
-    /// replay: the guard is a watermark, not a one-shot.
+    /// Guard is a watermark, not a one-shot: a newer event still folds after a replay
     #[test]
     fn folding_resumes_past_the_replayed_overlap() {
         let mut f = feed();
@@ -1336,8 +1164,7 @@ mod tests {
         for line in &lines {
             f.absorb(line.trim_end(), Duration::ZERO, &theme);
         }
-        // The stream drops and resumes one second back, replaying the last tick
-        // before delivering the next.
+        // Stream drops, resumes 1s back, replays the last tick before the next
         f.absorb(lines[2].trim_end(), Duration::ZERO, &theme);
         let resumed = crate::sync::encode_event(&tick_at(3, 300, 15_000));
         f.absorb(resumed.trim_end(), Duration::ZERO, &theme);
@@ -1350,8 +1177,7 @@ mod tests {
         assert!(gap_since(Instant::now()) >= 1, "kube rejects a zero window");
     }
 
-    /// The tail loop must be able to tell a dropped connection (reattach) from a
-    /// finished run (stop), which is exactly this distinction.
+    /// Tail loop must tell a dropped connection (reattach) from a finished run (stop)
     #[test]
     fn a_terminated_container_has_a_log_but_is_not_running() {
         let exited = driver_pod(

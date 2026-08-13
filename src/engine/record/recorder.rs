@@ -1,9 +1,8 @@
-//! Writing a recording: [`RunRecorder`] is the sink that converts each live
-//! [`TestEvent`] to its owned [`RecordedEvent`] form — spilling captured output
-//! into the [`OutputStore`] and replacing it with a [`StoreRef`] — then appends
-//! it as one JSON line to the zstd event log. [`RecordingReporter`] wires that
-//! sink into the run loop as a [`RunReporter`] decorator: it records each event,
-//! then forwards it to the real reporter, so nothing in the loop changes.
+//! Recording writer.
+//!
+//! - [`RunRecorder`]: [`TestEvent`] → owned [`RecordedEvent`], one JSON line per
+//!   event into the zstd log (output spilled to [`OutputStore`], left as a [`StoreRef`])
+//! - [`RecordingReporter`]: [`RunReporter`] decorator, records then forwards (run loop unchanged)
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -16,16 +15,14 @@ use super::store::OutputStore;
 use super::{RecordedEvent, RunMeta, StoreRef};
 use crate::engine::events::{RunReporter, TestEvent};
 
-/// The per-test captured-output cap before head/tail truncation kicks in (4 MiB).
+/// Per-test output cap before head/tail truncation
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 
-/// Writes one run's recording: the zstd JSON-Lines event log plus the
-/// content-addressed output store. Best-effort — a write error disables further
-/// recording rather than failing the run (see [`RecordingReporter`]).
+/// One run's recording: zstd JSON-Lines event log + content-addressed output store.
+/// Best-effort (write error disables recording, never fails the run — see [`RecordingReporter`])
 pub struct RunRecorder {
     log: AutoFinishEncoder<'static, BufWriter<File>>,
     store: OutputStore,
-    /// Blobs already written this run, so identical output isn't rewritten.
     seen: HashSet<String>,
     max_output: usize,
 }
@@ -41,9 +38,8 @@ impl std::fmt::Debug for RunRecorder {
 }
 
 impl RunRecorder {
-    /// Create a recording under `run_dir`: write `meta.json`, make the output
-    /// store, and open the event-log encoder. The encoder auto-finishes on drop,
-    /// so a recording is finalized simply by dropping the [`RecordingReporter`].
+    /// `meta.json` + output store + event-log encoder under `run_dir`.
+    /// Encoder auto-finishes on drop (dropping [`RecordingReporter`] finalizes)
     pub fn create(run_dir: &Path, meta: &RunMeta) -> io::Result<Self> {
         fs::create_dir_all(run_dir)?;
         fs::write(run_dir.join("meta.json"), serde_json::to_vec_pretty(meta)?)?;
@@ -51,16 +47,9 @@ impl RunRecorder {
         let file = File::create(run_dir.join("run.log.zst"))?;
         let log =
             zstd::stream::write::Encoder::new(BufWriter::new(file), ZSTD_LEVEL)?.auto_finish();
-        Ok(Self {
-            log,
-            store,
-            seen: HashSet::new(),
-            max_output: MAX_OUTPUT,
-        })
+        Ok(Self { log, store, seen: HashSet::new(), max_output: MAX_OUTPUT })
     }
 
-    /// Record one event: convert to the owned form (storing output for
-    /// `TestFinished`) and append it as a JSON line.
     pub fn record(&mut self, ev: &TestEvent<'_>) -> io::Result<()> {
         let rec = self.build_recorded(ev)?;
         serde_json::to_writer(&mut self.log, &rec)?;
@@ -68,39 +57,29 @@ impl RunRecorder {
         Ok(())
     }
 
-    /// Convert a borrowed live event to its owned recorded form. The only event
-    /// that touches the store is `TestFinished`, whose output bytes become a
-    /// [`StoreRef`].
+    /// `TestFinished` = only event touching the store (its bytes → [`StoreRef`])
     fn build_recorded(&mut self, ev: &TestEvent<'_>) -> io::Result<RecordedEvent> {
         Ok(match *ev {
-            TestEvent::RunStarted { total, run_id } => RecordedEvent::RunStarted {
-                total,
-                run_id: run_id.to_string(),
-            },
-            TestEvent::TestStarted {
-                binary_id,
-                test_name,
-                class,
-                attempt,
-            } => RecordedEvent::TestStarted {
-                binary_id: binary_id.to_string(),
-                test_name: test_name.to_string(),
-                class,
-                attempt,
-            },
-            TestEvent::TestSlow {
-                binary_id,
-                test_name,
-                elapsed,
-                will_terminate,
-                attempt,
-            } => RecordedEvent::TestSlow {
-                binary_id: binary_id.to_string(),
-                test_name: test_name.to_string(),
-                elapsed,
-                will_terminate,
-                attempt,
-            },
+            TestEvent::RunStarted { total, run_id } => {
+                RecordedEvent::RunStarted { total, run_id: run_id.to_string() }
+            }
+            TestEvent::TestStarted { binary_id, test_name, class, attempt } => {
+                RecordedEvent::TestStarted {
+                    binary_id: binary_id.to_string(),
+                    test_name: test_name.to_string(),
+                    class,
+                    attempt,
+                }
+            }
+            TestEvent::TestSlow { binary_id, test_name, elapsed, will_terminate, attempt } => {
+                RecordedEvent::TestSlow {
+                    binary_id: binary_id.to_string(),
+                    test_name: test_name.to_string(),
+                    elapsed,
+                    will_terminate,
+                    attempt,
+                }
+            }
             TestEvent::TestRetrying {
                 binary_id,
                 test_name,
@@ -134,15 +113,13 @@ impl RunRecorder {
                     output: stored,
                 }
             }
-            TestEvent::TestSkipped {
-                binary_id,
-                test_name,
-                ref reason,
-            } => RecordedEvent::TestSkipped {
-                binary_id: binary_id.to_string(),
-                test_name: test_name.to_string(),
-                reason: reason.clone(),
-            },
+            TestEvent::TestSkipped { binary_id, test_name, ref reason } => {
+                RecordedEvent::TestSkipped {
+                    binary_id: binary_id.to_string(),
+                    test_name: test_name.to_string(),
+                    reason: reason.clone(),
+                }
+            }
             TestEvent::RunCancelling { reason, running } => {
                 RecordedEvent::RunCancelling { reason, running }
             }
@@ -153,16 +130,12 @@ impl RunRecorder {
     }
 }
 
-/// zstd level for the event log — level 3, nextest's default.
+/// nextest's default
 const ZSTD_LEVEL: i32 = 3;
 
-/// A [`RunReporter`] that records each event to a [`RunRecorder`] before
-/// forwarding it to the wrapped reporter. This is the whole wiring: the run loop
-/// still sees one `&mut dyn RunReporter`.
+/// [`RunReporter`] decorator: record to [`RunRecorder`], then forward.
 ///
-/// Recording is best-effort — the first write error is logged (via `tracing`, so
-/// it never corrupts a live TTY panel) and recording is disabled for the rest of
-/// the run; rendering continues untouched.
+/// - First write error → `tracing::warn` (never the TTY panel) + recording off for the run
 pub struct RecordingReporter {
     inner: Box<dyn RunReporter>,
     recorder: Option<RunRecorder>,
@@ -177,12 +150,8 @@ impl std::fmt::Debug for RecordingReporter {
 }
 
 impl RecordingReporter {
-    /// Wrap `inner`, recording into `recorder`.
     pub fn new(inner: Box<dyn RunReporter>, recorder: RunRecorder) -> Self {
-        Self {
-            inner,
-            recorder: Some(recorder),
-        }
+        Self { inner, recorder: Some(recorder) }
     }
 }
 

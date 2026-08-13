@@ -1,26 +1,38 @@
-//! Generic Kubernetes scaffolding providers: namespaces and cluster-wide node
-//! labels. Parameterized primitives every setup call needs, both
-//! [`Lifetime::Cached`] for the life of the cluster.
+//! Generic K8s scaffolding providers — namespaces + cluster-wide node labels.
+//! Both [`Lifetime::Cached`] for the life of the cluster.
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Namespace, Node};
-use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{Api, ListParams, Patch, PatchParams};
 use serde_json::json;
 
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 
-/// A Kubernetes Namespace, created if absent. Idempotent; 409 counts as
-/// success (a namespace that already exists satisfies the invariant).
 #[derive(Debug)]
 pub(crate) struct NamespaceProvider {
     name: String,
+    psa_privileged: bool,
 }
 
 impl NamespaceProvider {
     pub(crate) fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self { name: name.into(), psa_privileged: false }
+    }
+
+    /// Required by the BuildKit pod (unconfined seccomp/AppArmor exceeds
+    /// *baseline*); without it the pod dies at admission, far from BuildKit
+    pub(crate) fn pod_security_privileged(mut self) -> Self {
+        self.psa_privileged = true;
+        self
+    }
+
+    fn labels(&self) -> serde_json::Value {
+        if self.psa_privileged { json!({ PSA_ENFORCE_LABEL: PSA_PRIVILEGED }) } else { json!({}) }
     }
 }
+
+const PSA_ENFORCE_LABEL: &str = "pod-security.kubernetes.io/enforce";
+const PSA_PRIVILEGED: &str = "privileged";
 
 #[async_trait]
 impl Provider for NamespaceProvider {
@@ -34,10 +46,23 @@ impl Provider for NamespaceProvider {
 
     async fn probe(&self, cx: &Cx) -> Readiness {
         let api: Api<Namespace> = Api::all(cx.client.clone());
-        match api.get(&self.name).await {
-            Ok(_) => Readiness::Ready,
-            Err(_) => Readiness::Absent,
+        let Ok(ns) = api.get(&self.name).await else {
+            return Readiness::Absent;
+        };
+        // Existence != readiness under a required PSA level (a pre-existing ns would
+        // report Ready, then reject the BuildKit pod at admission)
+        if self.psa_privileged
+            && ns
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(PSA_ENFORCE_LABEL))
+                .map(String::as_str)
+                != Some(PSA_PRIVILEGED)
+        {
+            return Readiness::Absent;
         }
+        Readiness::Ready
     }
 
     async fn provision(&self, cx: &Cx) -> Result<(), ResourceError> {
@@ -45,23 +70,24 @@ impl Provider for NamespaceProvider {
         let ns: Namespace = serde_json::from_value(json!({
             "apiVersion": "v1",
             "kind": "Namespace",
-            "metadata": { "name": self.name },
+            "metadata": { "name": self.name, "labels": self.labels() },
         }))
         .expect("static namespace manifest is valid");
-        match api.create(&PostParams::default(), &ns).await {
-            Ok(_) => Ok(()),
-            Err(e) if e_is_conflict_or_exists(&e) => Ok(()),
-            Err(e) => Err(ResourceError::Provision(format!(
-                "create namespace {}: {e}",
-                self.name
-            ))),
-        }
+        // SSA, not create: an existing ns may lack the PSA label, and 409-is-success
+        // would leave it that way forever
+        api.patch(
+            &self.name,
+            &PatchParams::apply(crate::resource::kube::FIELD_MANAGER).force(),
+            &Patch::Apply(&ns),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| ResourceError::Provision(format!("apply namespace {}: {e}", self.name)))
     }
 }
 
-/// A cluster-wide node label applied to all schedulable nodes. One provider owns
-/// one label key (carried by [`NodeId::NodeLabel`]), so two providers can't fight
-/// over the same label.
+/// One cluster-wide label over all schedulable nodes. One provider per label key
+/// ([`NodeId::NodeLabel`]) → no two can fight over it
 #[derive(Debug)]
 pub(crate) struct NodeLabelProvider {
     key: String,
@@ -70,10 +96,7 @@ pub(crate) struct NodeLabelProvider {
 
 impl NodeLabelProvider {
     pub(crate) fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            key: key.into(),
-            value: value.into(),
-        }
+        Self { key: key.into(), value: value.into() }
     }
 }
 
@@ -88,8 +111,7 @@ impl Provider for NodeLabelProvider {
     }
 
     async fn probe(&self, cx: &Cx) -> Readiness {
-        // Ready when every node already carries the label with the desired
-        // value. One drift → Absent (re-apply).
+        // One drifted node → Absent (re-apply across all)
         let api: Api<Node> = Api::all(cx.client.clone());
         let list = match api.list(&ListParams::default()).await {
             Ok(l) => l,
@@ -99,13 +121,9 @@ impl Provider for NodeLabelProvider {
             return Readiness::Absent;
         }
         for node in &list.items {
-            let matches = node
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|m| m.get(&self.key))
-                .map(String::as_str)
-                == Some(self.value.as_str());
+            let matches =
+                node.metadata.labels.as_ref().and_then(|m| m.get(&self.key)).map(String::as_str)
+                    == Some(self.value.as_str());
             if !matches {
                 return Readiness::Absent;
             }
@@ -119,35 +137,30 @@ impl Provider for NodeLabelProvider {
             .list(&ListParams::default())
             .await
             .map_err(|e| ResourceError::Provision(format!("list nodes: {e}")))?;
-        // Merge-patch each node individually. `kubectl label nodes --all`
-        // does the same under the hood; server-side apply would over-claim
-        // ownership of node labels we don't manage.
+        // Merge-patch per node (as `kubectl label nodes --all` does); SSA would
+        // over-claim ownership of labels ztest does not manage
         let patch = json!({ "metadata": { "labels": { &self.key: &self.value } } });
         let params = PatchParams::default();
         for node in list.items {
             let Some(name) = node.metadata.name else {
                 continue;
             };
-            api.patch(&name, &params, &Patch::Merge(&patch))
-                .await
-                .map_err(|e| {
-                    ResourceError::Provision(format!(
-                        "label node {name} with {}={}: {e}",
-                        self.key, self.value
-                    ))
-                })?;
+            api.patch(&name, &params, &Patch::Merge(&patch)).await.map_err(|e| {
+                ResourceError::Provision(format!(
+                    "label node {name} with {}={}: {e}",
+                    self.key, self.value
+                ))
+            })?;
         }
         Ok(())
     }
 }
 
-/// A 409 (AlreadyExists) on create-only paths counts as success — the
-/// invariant a create-then-noop guarantees is already met.
+/// 409 AlreadyExists on a create-only path = success (invariant already met)
 fn e_is_conflict_or_exists(e: &kube::Error) -> bool {
     match e {
         kube::Error::Api(resp) => resp.code == 409,
-        // Some wrapper variants stringify these differently across kube
-        // versions; fall back to a substring check for portability.
+        // Wrapper variants stringify differently across kube versions
         other => {
             let s = other.to_string();
             s.contains("AlreadyExists") || s.contains("409")

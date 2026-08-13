@@ -1,22 +1,11 @@
 //! Component-pod log capture for test-failure diagnostics.
 //!
-//! Each [`TestEnv`](crate::env::TestEnv) spawns one `kubectl logs` child that
-//! follows every component pod in the test's namespace
-//! (`-l ztest.io/component --all-containers --follow`), prefixing each line
-//! with its source pod via `--prefix`. Its stdout is drained verbatim into a
-//! byte-bounded ring for the test's lifetime. On teardown the ring is rendered
-//! into the diagnostic the engine reporter replays only for *failed* tests — a
-//! passing test discards the whole buffer, a failing one gets the merged
-//! component history that explains it.
-//!
-//! The capture is *faithful*: kubectl streams each component's own bytes and
-//! merges the pods in arrival order, and the components own their formatting
-//! and colour — zebrad via `force_use_color`, zaino via a single-line, coloured
-//! source config (`ZAINOLOG_FORMAT=stream`). So ztest neither parses, reassembles,
-//! nor recolours the stream: it buffers, and on a non-colour sink strips ANSI
-//! once at the display boundary. A single follow started after both deploy
-//! phases uses `--tail=-1` to backfill each pod's full history, so nothing
-//! earlier is lost.
+//! - One `kubectl logs -f --prefix -l ztest.io/component` child per
+//!   [`TestEnv`](crate::env::TestEnv) → byte-bounded ring, replayed on failure only
+//! - Faithful: components own formatting + colour (zebrad `force_use_color`, zaino
+//!   `ZAINOLOG_FORMAT=stream`); ztest buffers, never parses/reassembles/recolours
+//! - ANSI stripped once at the display boundary, only for a non-colour sink
+//! - Single follow after both deploy phases, `--tail=-1` backfilling full history
 
 use std::collections::VecDeque;
 use std::io::{BufReader, Read};
@@ -24,26 +13,22 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-/// Total buffered bytes retained per test. Past this the oldest lines are
-/// evicted (a failure post-mortem wants the tail nearest the failure); the
-/// count of dropped lines is surfaced in the render so truncation is never
-/// silent.
+/// Bytes retained per test; past this the oldest evict (a post-mortem wants the
+/// tail nearest the failure). Drop count reaches the render — truncation is never silent
 const CAP_BYTES: usize = 1024 * 1024;
 
-/// Total component-log lines shown across *all* component pods: the most recent
-/// `MAX_LINES` by timestamp, merged. Also the per-pod server-side tail requested
-/// from the kube API (`kubectl logs --tail`), which is exactly enough to recover
-/// that global tail. The failure diagnostic is a short recent-history summary, not
-/// the full stream — and not `MAX_LINES` per pod. The runner pod's own output (the
-/// panic / error) is the primary signal and is fetched in full, separately.
+/// Component-log lines shown across *all* pods, most recent by timestamp — not
+/// per pod.
+///
+/// - Doubles as the per-pod `kubectl logs --tail`, exactly enough to recover that
+///   global tail
+/// - Runner output (panic/error) = primary signal, fetched in full separately
 const MAX_LINES: usize = 40;
 
-/// The label every component pod carries (see [`crate::manifest`]). One
-/// existence selector follows exactly this test's components — the per-test
-/// namespace scopes it to this run.
+/// Carried by every component pod (see [`crate::manifest`]). Existence selector,
+/// scoped to this run by the per-test namespace
 const COMPONENT_SELECTOR: &str = "ztest.io/component";
 
-/// A byte-bounded, arrival-ordered ring of captured log lines.
 struct Ring {
     lines: VecDeque<String>,
     bytes: usize,
@@ -52,11 +37,7 @@ struct Ring {
 
 impl Ring {
     fn new() -> Self {
-        Ring {
-            lines: VecDeque::new(),
-            bytes: 0,
-            dropped: 0,
-        }
+        Ring { lines: VecDeque::new(), bytes: 0, dropped: 0 }
     }
 
     fn push(&mut self, line: String) {
@@ -72,10 +53,9 @@ impl Ring {
     }
 }
 
-/// A live `kubectl logs -f` capture: the child process and the thread draining
-/// its stdout into [`ring`](Self::ring). Stopped in [`TestEnv`](crate::env)'s
-/// `Drop`; the [`Drop`] impl below is a backstop so a dropped capture never
-/// leaks the child.
+/// Live `kubectl logs -f` capture: child + the thread draining its stdout into
+/// [`ring`](Self::ring). Stopped in [`TestEnv`](crate::env)'s `Drop`; the [`Drop`]
+/// below is a backstop against leaking the child
 pub(crate) struct LogCapture {
     child: Mutex<Option<Child>>,
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -83,18 +63,17 @@ pub(crate) struct LogCapture {
 }
 
 impl LogCapture {
-    /// Follow every component pod in `namespace`. `pods` sets
-    /// `--max-log-requests` (kubectl's default of 5 errors past that many
-    /// concurrent follows). Best-effort: if `kubectl` can't be spawned the
-    /// capture is inert and renders nothing, never failing the test.
+    /// Follow every component pod in `namespace`.
+    ///
+    /// - `pods` → `--max-log-requests` (kubectl's default 5 errors past that many)
+    /// - Best-effort: unspawnable `kubectl` = inert capture, never a failed test
     pub(crate) fn spawn(namespace: &str, pods: usize) -> Self {
         let ring = Arc::new(Mutex::new(Ring::new()));
 
         let mut cmd = Command::new("kubectl");
-        // kubectl honours only the kubeconfig's current-context, so pin the
-        // profile's context (as the `oc` shellouts do) or a stale local context
-        // could be streamed from. In-cluster the mounted ServiceAccount config
-        // is used and no context applies.
+        // kubectl honours only the kubeconfig's current-context → pin the profile's
+        // (as the `oc` shellouts do), else a stale local context gets streamed.
+        // In-cluster uses the mounted ServiceAccount config, no context applies.
         if !crate::cluster::in_cluster()
             && let Ok(ctx) = std::env::var(crate::cluster_config::KUBE_CONTEXT_ENV)
             && !ctx.is_empty()
@@ -126,11 +105,7 @@ impl LogCapture {
                     path = %std::env::var("PATH").unwrap_or_default(),
                     "component-log capture unavailable: `kubectl` not on this process's PATH"
                 );
-                return LogCapture {
-                    child: Mutex::new(None),
-                    reader: Mutex::new(None),
-                    ring,
-                };
+                return LogCapture { child: Mutex::new(None), reader: Mutex::new(None), ring };
             }
         };
 
@@ -139,14 +114,10 @@ impl LogCapture {
             std::thread::spawn(move || drain(out, &ring))
         });
 
-        LogCapture {
-            child: Mutex::new(Some(child)),
-            reader: Mutex::new(reader),
-            ring,
-        }
+        LogCapture { child: Mutex::new(Some(child)), reader: Mutex::new(reader), ring }
     }
 
-    /// Kill the follow child and join its reader. Idempotent.
+    /// Kill the follow child, join its reader. Idempotent
     pub(crate) fn stop(&self) {
         if let Some(mut child) = lock(&self.child).take() {
             let _ = child.kill();
@@ -157,9 +128,8 @@ impl LogCapture {
         }
     }
 
-    /// Render the buffered lines as one block, or `None` when nothing was
-    /// captured. The bytes are the components' own: emitted verbatim when
-    /// `color`, ANSI-stripped once here when the sink can't render colour.
+    /// Buffered lines as one block, `None` when nothing was captured. Components'
+    /// own bytes: verbatim under `color`, ANSI-stripped once here otherwise
     pub(crate) fn render(&self, color: bool) -> Option<String> {
         render_ring(&lock(&self.ring), color)
     }
@@ -173,21 +143,15 @@ impl Drop for LogCapture {
 
 // ───────────────────── laptop-side unified FAIL diagnostic ────────────────────
 
-/// A timestamped log line staged for the merge: `(RFC3339 key, display body)`.
-/// Keys come from the kube-injected timestamp for component pods and from the
-/// runner's own tracing timestamp; both are UTC RFC3339, so they sort together.
+/// One line staged for the merge: `(RFC3339 key, display body)`. Keys are
+/// kube-injected for pods, tracing's for the runner — both UTC, so they sort together
 type TsLine = (String, String);
 
-/// Fetch each component pod's last [`MAX_LINES`] in `namespace`, with server-side
-/// timestamps, as `(timestamp, "[pod] body")` lines for the unified timeline.
-/// Fetching each pod's tail is exactly enough to recover the global tail (any
-/// line in the merged last-`MAX_LINES` is within its own pod's tail).
+/// Each pod's last [`MAX_LINES`], as `(RFC3339 timestamp, "[pod] body")`.
 ///
-/// A plain definitive fetch — not a live follow — is correct *because* the parent
-/// `ztest run` owns teardown: it calls this at the test's terminal, while every
-/// component pod still exists, and only then deletes the namespace. That ordering
-/// removes the attach-timing and mid-stream-EOF races a `log_stream` follow is
-/// prone to. Empty when the namespace has no component pods or none logged.
+/// - Per-pod tail recovers the global tail (any merged survivor is within its own)
+/// - One-shot fetch, not a follow — correct only because `ztest run` calls this at
+///   the test's terminal, before it deletes the namespace
 pub(crate) async fn fetch_component_lines(client: &kube::Client, namespace: &str) -> Vec<TsLine> {
     use k8s_openapi::api::core::v1::Pod;
     use kube::Api;
@@ -214,30 +178,20 @@ pub(crate) async fn fetch_component_lines(client: &kube::Client, namespace: &str
             .await
             .unwrap_or_default();
         for line in logs.lines() {
-            // `timestamps: true` prefixes each line with an RFC3339 stamp + space:
-            // split it off as the merge key, show the original body (which already
-            // carries the component's own timestamp).
+            // `timestamps: true` prefixes an RFC3339 stamp + space — split off as
+            // the merge key; the body already carries the component's own stamp.
             let (ts, body) = line.split_once(' ').unwrap_or(("", line));
-            lines.push((
-                ts.to_string(),
-                format!("[{name}] {}", decode(body.as_bytes())),
-            ));
+            lines.push((ts.to_string(), format!("[{name}] {}", decode(body.as_bytes()))));
         }
     }
     lines
 }
 
-/// Build the pod-path FAIL diagnostic as two sections: the runner pod's own
-/// output in full (uncapped), then the supporting component logs (capped to the
-/// most recent [`MAX_LINES`]), then any dead-pod terminal reasons.
+/// Pod-path FAIL diagnostic: runner output (unframed, uncapped), then components
+/// capped to [`MAX_LINES`], then dead-pod terminal reasons.
 ///
-/// `runner_raw` is the runner pod's libtest-framed stdout+stderr; its frame is
-/// stripped and the remainder — the test's own tracing followed by any
-/// panic/assertion — is shown verbatim and never capped. This is the test's
-/// primary voice: a high-volume component (zaino health-checks every ~100 ms)
-/// must never be able to evict it, so the runner output and the component
-/// timeline draw from separate budgets rather than one merged pool. Pure, so the
-/// assembly is unit-tested without a cluster.
+/// Separate budgets, never one pool — zaino health-checks every ~100 ms and would
+/// evict the test's own panic
 pub(crate) fn unified_output(
     runner_raw: &[u8],
     test_name: &str,
@@ -262,9 +216,8 @@ pub(crate) fn unified_output(
     for line in stripped.lines() {
         emit(&mut out, line);
     }
-    // Supporting cast: the most recent component lines, under their own cap. The
-    // render carries its own "N dropped / showing the most recent MAX_LINES" note
-    // when it truncates, so the header stays accurate whether or not it capped.
+    // Recent component lines, own cap. The render emits its own drop note, so the
+    // header stays accurate capped or not.
     if let Some(timeline) = render_recent(component_lines, color) {
         out.push_str("  ── component logs ──\n");
         out.push_str(&timeline);
@@ -275,15 +228,14 @@ pub(crate) fn unified_output(
     out.into_bytes()
 }
 
-/// Merge `(timestamp, body)` lines chronologically and render the most recent
-/// [`MAX_LINES`] as one block (the earlier count reported). Pure — the fetch is
-/// separate — so the merge/cap is unit-tested without a cluster.
+/// Merge `(timestamp, body)` chronologically → most recent [`MAX_LINES`] as one
+/// block, earlier count reported. Pure (fetch is separate), so unit-testable clusterless
 fn render_recent(mut lines: Vec<TsLine>, color: bool) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
-    // RFC3339 sorts lexically; the sort is stable, so a multi-line entry's
-    // same-timestamp continuation lines keep their order.
+    // RFC3339 sorts lexically, and stably → same-timestamp continuation lines of
+    // a multi-line entry keep their order.
     lines.sort_by(|a, b| a.0.cmp(&b.0));
     let keep = MAX_LINES.min(lines.len());
     let mut ring = Ring::new();
@@ -294,9 +246,8 @@ fn render_recent(mut lines: Vec<TsLine>, color: bool) -> Option<String> {
     render_ring(&ring, color)
 }
 
-/// Drain one child's stdout into `ring`, one line per entry, verbatim. Decodes
-/// lossily so a stray non-UTF-8 byte can't kill the capture; component ANSI is
-/// ASCII and survives untouched.
+/// Child stdout → `ring`, one verbatim line per entry. Lossy decode (a stray
+/// non-UTF-8 byte must not kill the capture; component ANSI is ASCII, untouched)
 fn drain(out: impl Read, ring: &Mutex<Ring>) {
     let mut reader = BufReader::new(out);
     let mut line = Vec::new();
@@ -372,36 +323,24 @@ mod tests {
 
     #[test]
     fn preserves_arrival_order_verbatim_when_coloured() {
-        let out = render_ring(
-            &ring_of(&["[pod/zebrad/zebrad] a", "[pod/zaino/zaino] b"]),
-            true,
-        )
-        .unwrap();
+        let out =
+            render_ring(&ring_of(&["[pod/zebrad/zebrad] a", "[pod/zaino/zaino] b"]), true).unwrap();
         let bodies: Vec<&str> = out.lines().map(str::trim).collect();
         assert_eq!(bodies, ["[pod/zebrad/zebrad] a", "[pod/zaino/zaino] b"]);
     }
 
     #[test]
     fn strips_component_ansi_when_colour_is_off() {
-        let out = render_ring(
-            &ring_of(&["[pod/zebrad/zebrad] \x1b[33mWARN\x1b[0m x"]),
-            false,
-        )
-        .unwrap();
-        assert!(
-            !out.contains('\x1b'),
-            "ANSI must be stripped on a no-colour sink"
-        );
+        let out =
+            render_ring(&ring_of(&["[pod/zebrad/zebrad] \x1b[33mWARN\x1b[0m x"]), false).unwrap();
+        assert!(!out.contains('\x1b'), "ANSI must be stripped on a no-colour sink");
         assert!(out.contains("WARN x"));
     }
 
     #[test]
     fn keeps_component_ansi_verbatim_when_colour_is_on() {
-        let out = render_ring(
-            &ring_of(&["[pod/zebrad/zebrad] \x1b[33mWARN\x1b[0m x"]),
-            true,
-        )
-        .unwrap();
+        let out =
+            render_ring(&ring_of(&["[pod/zebrad/zebrad] \x1b[33mWARN\x1b[0m x"]), true).unwrap();
         assert!(out.contains("\x1b[33mWARN\x1b[0m x"));
     }
 
@@ -425,10 +364,7 @@ mod tests {
         drain(&b"[pod/a/a] one\r\n[pod/b/b] two\n"[..], &ring);
         let r = lock(&ring);
         let lines: Vec<&String> = r.lines.iter().collect();
-        assert_eq!(
-            lines,
-            [&"[pod/a/a] one".to_string(), &"[pod/b/b] two".to_string()]
-        );
+        assert_eq!(lines, [&"[pod/a/a] one".to_string(), &"[pod/b/b] two".to_string()]);
     }
 
     #[test]
@@ -440,9 +376,8 @@ mod tests {
 
     #[test]
     fn render_recent_keeps_last_max_lines_total_across_pods_in_order() {
-        // MAX_LINES+5 lines interleaved across two pods, pushed out of order to
-        // prove the merge sorts by timestamp. Only the most recent MAX_LINES
-        // survive — globally, not per pod — and in chronological order.
+        // Two pods interleaved, pushed out of order → merge must sort by timestamp,
+        // keeping the most recent MAX_LINES globally, not per pod.
         let n = MAX_LINES + 5;
         let mut lines: Vec<(String, String)> = (0..n)
             .map(|i| {
@@ -455,11 +390,11 @@ mod tests {
         let out = render_recent(lines, false).unwrap();
         let body: Vec<&str> = out.lines().collect();
 
-        // One dropped-count header + exactly MAX_LINES kept lines.
+        // One drop-count header + exactly MAX_LINES kept.
         assert_eq!(body.len(), MAX_LINES + 1);
         assert!(body[0].contains(&format!("{} earlier line(s) dropped", n - MAX_LINES)));
         assert!(body[0].contains(&format!("showing the most recent {MAX_LINES}")));
-        // First kept line is index 5 (the oldest survivor); last is n-1.
+        // Oldest survivor = index 5, newest = n-1.
         assert!(body[1].ends_with("line 5"));
         assert!(body[MAX_LINES].ends_with(&format!("line {}", n - 1)));
     }
@@ -478,9 +413,8 @@ mod tests {
 
     #[test]
     fn unified_output_shows_runner_in_full_then_capped_components() {
-        // Runner output (tracing + panic) is small and primary; the components
-        // emit far more than MAX_LINES. The runner section must survive in full
-        // even though the component section is capped.
+        // Runner output = small + primary; components far exceed MAX_LINES. Runner
+        // section must survive in full under a capped component section.
         let runner_raw = b"running 1 test\n\
 test my::test ... 2026-07-29T00:00:01Z  INFO ztest::env: starting\n\
 2026-07-29T00:00:03Z  INFO ztest::env: calling getdifficulty\n\
@@ -507,24 +441,23 @@ test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n"
         ))
         .unwrap();
 
-        // Runner tracing AND the panic both survive verbatim — never evicted by
-        // the high-volume component stream.
+        // Runner tracing AND panic survive verbatim, never evicted by the
+        // high-volume component stream.
         assert!(out.contains("INFO ztest::env: starting"));
         assert!(out.contains("INFO ztest::env: calling getdifficulty"));
         assert!(out.contains("thread 'my::test' panicked at json.rs:22:5:"));
         assert!(out.contains("responses disagree: left 1.0 right 1.19"));
-        // The libtest footer is stripped.
+        // libtest footer stripped.
         assert!(!out.contains("test result:"));
 
-        // The runner section precedes the component section; the components are
-        // capped (drop note present) while the runner content is not.
+        // Runner section first; components capped (drop note), runner not.
         let runner_at = out.find("panicked").unwrap();
         let header_at = out.find("── component logs ──").unwrap();
         assert!(runner_at < header_at, "runner output must come first");
         assert!(out.contains("earlier line(s) dropped"));
         assert!(out.contains(&format!("showing the most recent {MAX_LINES}")));
 
-        // The dead-pod terminal reason is shown last.
+        // Dead-pod terminal reason last.
         assert!(out.contains("exit 137 (OOMKilled)"));
         assert!(header_at < out.find("OOMKilled").unwrap());
     }
@@ -535,14 +468,8 @@ test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n"
 test my::test ... Error: archive missing\n\
 test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n"
             .to_vec();
-        let out = String::from_utf8(unified_output(
-            &runner_raw,
-            "my::test",
-            Vec::new(),
-            "",
-            false,
-        ))
-        .unwrap();
+        let out = String::from_utf8(unified_output(&runner_raw, "my::test", Vec::new(), "", false))
+            .unwrap();
         assert!(out.contains("Error: archive missing"));
         assert!(!out.contains("── component logs ──"));
     }

@@ -1,17 +1,8 @@
-//! The sync-testing harness (`docs/design-sync.md`).
+//! Sync-testing harness (`docs/design-sync.md`).
 //!
-//! A long-running chain sync (wallet / indexer / validator) runs as a
-//! continuous monitor: [`SyncRunner`] launches a [`SyncSubject`], captures an
-//! immutable [`Snapshot`] each tick, evaluates probes (invariants) at their own
-//! cadences across the four classes (`always`/`eventually`/`sometimes`/
-//! `at_completion`), and terminates on a completion predicate or a fatal
-//! violation.
-//!
-//! Build status: steps 1–3 of the design's build order — the direct
-//! `pepper_sync::sync` driver, the observable per-backend [`SyncSubject`], and
-//! this runner + probe taxonomy. The `#[ztest::sync_test]` macro (step 4),
-//! nemesis (step 5), pod lifecycle + `ztest sync` CLI (step 6), and the indexer
-//! proxy (step 7) build on top.
+//! Long-running wallet/indexer/validator sync as a continuous monitor: [`SyncRunner`]
+//! launches a [`SyncSubject`], captures a [`Snapshot`] per tick, evaluates probes at their
+//! own cadences across the four classes, ends on a completion predicate or fatal violation.
 
 mod chainwork;
 mod detached;
@@ -28,8 +19,7 @@ mod work;
 
 pub(crate) use detached::note_setup;
 pub(crate) use event::{SyncEvent, decode as decode_event};
-// Constructing an event is the driver's job (via the reporter); the controller
-// only decodes. Tests on the decode side need both halves.
+// Encoding is the driver's job, the controller only decodes; decode tests need both halves
 #[cfg(test)]
 pub(crate) use event::{Tick as SyncTick, encode as encode_event};
 
@@ -50,26 +40,24 @@ pub use probe::{
     hours, mins, secs,
 };
 pub use runner::{
-    NullReporter, StderrReporter, SyncEngine, SyncOutcome, SyncReporter, SyncVerdict,
+    DEFAULT_TICK, NullReporter, StderrReporter, SyncEngine, SyncOutcome, SyncReporter, SyncVerdict,
 };
 pub use series::{BLOCKS, CAPACITY as SERIES_CAPACITY, Cell, Channel, Timeline, plot_channels};
 pub use snapshot::{History, Snapshot};
 pub use subject::{Phase, ProgressView, SyncSubject};
 pub use tree::{TreeRoot, TreeRootError, TreeRoots};
-// The `GetTreeState` frontier parser needs the `sapling_crypto` / `orchard`
-// hash types, which ride the `librustzcash` feature. The `TreeRoots` half above
-// is plain data and stays available to every consumer.
+// Frontier parser needs `sapling_crypto`/`orchard` hash types (librustzcash-gated);
+// `TreeRoots` above is plain data, available to everyone
 #[cfg(feature = "librustzcash")]
 pub use tree::commitment_tree_root;
 pub use work::{CHANNELS, Mismatch, Op, OpSet, Rate, Segment, Work};
 
-// The observable wallet-sync harness drives ztest's default in-process wallet
-// (`backends::librustzcash`); its subject impl (`LrzSyncSubject`) lives in that
-// backend.
+// Wallet-sync harness drives the in-process wallet; its `LrzSyncSubject` lives in
+// `backends::librustzcash`
 #[cfg(feature = "librustzcash")]
 mod facade;
-// The event-publishing reporter is only reachable through the facade's run path,
-// which is where a detached driver is launched from.
+// Event-publishing reporter reachable only through the facade's run path (where a detached
+// driver is launched)
 #[cfg(feature = "librustzcash")]
 mod reporter;
 

@@ -1,11 +1,10 @@
-//! [`Graph`]: the dependency-ordered executor that drives providers. Forward
-//! provisioning runs a node once its deps are `Ready` (siblings concurrent up to
-//! `max_concurrent`, a failed dep leaves a node `Blocked`); reverse teardown
-//! reaps a node only once its dependents are gone, skipping [`Lifetime::Cached`].
+//! [`Graph`]: dependency-ordered executor driving providers.
 //!
-//! The executor holds no Kubernetes code — every K8s interaction is delegated to
-//! the [`Provider`] impl, keeping the ordering/concurrency/failure-isolation
-//! logic unit-testable against fake providers.
+//! - Forward: run a node once its deps are `Ready` (siblings concurrent to
+//!   `max_concurrent`; a failed dep leaves it `Blocked`)
+//! - Reverse: reap only once dependents are gone, skipping [`Lifetime::Cached`]
+//! - No Kubernetes here — all K8s goes through [`Provider`], so ordering /
+//!   concurrency / failure-isolation stay unit-testable against fakes
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -16,25 +15,9 @@ use crate::resource::context::Cx;
 use crate::resource::provider::{NodeId, Provider};
 use crate::resource::state::{NodeState, Readiness, ResourceError};
 
-/// A validated dependency graph of [`Provider`] nodes.
-///
-/// # Construction
-///
-/// ```ignore
-/// let mut g = Graph::new();
-/// g.add(Box::new(SnapshotCrdsProvider))?;
-/// g.add(Box::new(SnapshotControllerProvider))?;
-/// g.validate()?;   // catches missing deps and cycles
-/// ```
-///
-/// # Execution
-///
-/// ```ignore
-/// let states = g.provision(&cx, 8, |id, st| {
-///     println!("{}: {:?}", id.display_label(), st);
-/// }).await;
-/// let errors = g.teardown(&cx, &states, |id, r| { .. }).await;
-/// ```
+/// Dependency graph of [`Provider`] nodes. [`add`](Self::add)/[`add_dedup`](Self::add_dedup),
+/// then [`validate`](Self::validate) before [`provision`](Self::provision) — execution
+/// assumes a checked DAG
 #[derive(Default)]
 pub struct Graph {
     nodes: HashMap<NodeId, Box<dyn Provider>>,
@@ -42,34 +25,25 @@ pub struct Graph {
 
 impl std::fmt::Debug for Graph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Graph")
-            .field("nodes", &self.nodes.keys().collect::<Vec<_>>())
-            .finish()
+        f.debug_struct("Graph").field("nodes", &self.nodes.keys().collect::<Vec<_>>()).finish()
     }
 }
 
 impl Graph {
-    /// An empty graph.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Node count. Zero on an empty graph.
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
-    /// True when the graph holds no nodes.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
-    /// Insert a provider.
-    ///
-    /// Returns [`GraphError::Duplicate`] if a node with the same id was
-    /// already added — content-addressed callers should use
-    /// [`add_dedup`](Self::add_dedup) for fan-out where the same resource is
-    /// declared from multiple sites.
+    /// Same id twice → [`GraphError::Duplicate`]; content-addressed fan-out wants
+    /// [`add_dedup`](Self::add_dedup)
     pub fn add(&mut self, provider: Box<dyn Provider>) -> Result<(), GraphError> {
         let id = provider.id();
         if self.nodes.contains_key(&id) {
@@ -79,44 +53,28 @@ impl Graph {
         Ok(())
     }
 
-    /// Insert, ignoring duplicates: first-writer-wins.
-    ///
-    /// Used by [`plan_runtime`](super::plan_runtime) where two tests may
-    /// declare the same seed source (their providers compute the same id, so
-    /// we keep one).
+    /// Insert, first-writer-wins. [`plan_runtime`](super::plan_runtime) needs it: two
+    /// tests declaring one seed source compute one id and must collapse to one node
     pub fn add_dedup(&mut self, provider: Box<dyn Provider>) {
         self.nodes.entry(provider.id()).or_insert(provider);
     }
 
-    /// Validate the graph shape: every declared dep exists as a node, no
-    /// cycles.
-    ///
-    /// MUST be called before [`provision`](Self::provision) — the executor
-    /// assumes an acyclic DAG (a cycle would otherwise leave nodes `Pending`
-    /// forever). Cycle detection is Kahn's algorithm.
+    /// Every declared dep exists, no cycles (Kahn). MUST precede
+    /// [`provision`](Self::provision) — a cycle leaves nodes `Pending` forever
     pub fn validate(&self) -> Result<(), GraphError> {
         for (id, node) in &self.nodes {
             for dep in node.deps() {
                 if !self.nodes.contains_key(&dep) {
-                    return Err(GraphError::MissingDep {
-                        node: id.clone(),
-                        dep,
-                    });
+                    return Err(GraphError::MissingDep { node: id.clone(), dep });
                 }
             }
         }
-        // Kahn's algorithm: `indegree[n]` = number of nodes n depends ON. Peel
-        // the roots, decrement dependents; a non-zero remainder is a cycle.
-        let mut indegree: HashMap<NodeId, usize> = self
-            .nodes
-            .iter()
-            .map(|(k, node)| (k.clone(), node.deps().len()))
-            .collect();
-        let mut queue: VecDeque<NodeId> = indegree
-            .iter()
-            .filter(|&(_, &d)| d == 0)
-            .map(|(k, _)| k.clone())
-            .collect();
+        // `indegree[n]` = nodes n depends ON: peel roots, decrement dependents;
+        // non-zero remainder = cycle
+        let mut indegree: HashMap<NodeId, usize> =
+            self.nodes.iter().map(|(k, node)| (k.clone(), node.deps().len())).collect();
+        let mut queue: VecDeque<NodeId> =
+            indegree.iter().filter(|&(_, &d)| d == 0).map(|(k, _)| k.clone()).collect();
         let mut peeled = 0usize;
         while let Some(id) = queue.pop_front() {
             peeled += 1;
@@ -131,22 +89,17 @@ impl Graph {
             }
         }
         if peeled != self.nodes.len() {
-            return Err(GraphError::Cycle {
-                count: self.nodes.len() - peeled,
-            });
+            return Err(GraphError::Cycle { count: self.nodes.len() - peeled });
         }
         Ok(())
     }
 
-    /// Provision every node, forward in dependency order, up to
-    /// `max_concurrent` (clamped to ≥1) at a time. Returns each node's terminal
-    /// [`NodeState`](NodeState).
+    /// Provision in dependency order, ≤ `max_concurrent` (clamped to ≥1) at a time.
     ///
-    /// Pass a small cap (or 1) when providers share a serial resource — the
-    /// console PTY can't render two concurrent `docker build`s coherently.
-    /// `on_change` fires on every transition; a [`probe`](Provider::probe)
-    /// reporting [`Readiness::Ready`] short-circuits provision (the node still
-    /// transitions `Pending → Acquiring → Ready`).
+    /// - Cap at 1 when providers share a serial resource (the console PTY cannot render
+    ///   two concurrent builds coherently)
+    /// - [`Readiness::Ready`] from [`probe`](Provider::probe) short-circuits provision
+    ///   but still walks `Pending → Acquiring → Ready` through `on_change`
     pub async fn provision<F>(
         &self,
         cx: &Cx,
@@ -157,16 +110,13 @@ impl Graph {
         F: FnMut(&NodeId, &NodeState),
     {
         let cap = max_concurrent.max(1);
-        let mut state: HashMap<NodeId, NodeState> = self
-            .nodes
-            .keys()
-            .map(|k| (k.clone(), NodeState::Pending))
-            .collect();
+        let mut state: HashMap<NodeId, NodeState> =
+            self.nodes.keys().map(|k| (k.clone(), NodeState::Pending)).collect();
         let mut inflight = FuturesUnordered::new();
 
         loop {
-            // Classify each still-Pending node: any dep unavailable → Blocked;
-            // all deps Ready → runnable; otherwise reclassify next round.
+            // Still-Pending: any dep unavailable → Blocked, all deps Ready → runnable,
+            // else reclassify next round
             let mut to_block: Vec<NodeId> = Vec::new();
             let mut to_run: Vec<NodeId> = Vec::new();
             for (id, node) in &self.nodes {
@@ -174,15 +124,9 @@ impl Graph {
                     continue;
                 }
                 let deps = node.deps();
-                if deps
-                    .iter()
-                    .any(|d| state.get(d).is_some_and(|s| s.is_unavailable()))
-                {
+                if deps.iter().any(|d| state.get(d).is_some_and(|s| s.is_unavailable())) {
                     to_block.push(id.clone());
-                } else if deps
-                    .iter()
-                    .all(|d| state.get(d).is_some_and(|s| s.is_ready()))
-                {
+                } else if deps.iter().all(|d| state.get(d).is_some_and(|s| s.is_ready())) {
                     to_run.push(id.clone());
                 }
             }
@@ -193,8 +137,7 @@ impl Graph {
                 on_change(&id, &NodeState::Blocked);
             }
 
-            // Launch only up to the free concurrency slots; anything over
-            // the cap stays Pending and reclassifies once a slot frees.
+            // Over the cap stays Pending, reclassifies once a slot frees
             let free = cap.saturating_sub(inflight.len());
             for id in to_run.into_iter().take(free) {
                 state.insert(id.clone(), NodeState::Acquiring);
@@ -204,8 +147,7 @@ impl Graph {
             }
 
             if inflight.is_empty() {
-                // If we blocked a node this pass, loop again so `Blocked`
-                // propagates transitively before we call it done.
+                // Loop again so `Blocked` propagates transitively before we finish
                 if blocked_any {
                     continue;
                 }
@@ -221,11 +163,11 @@ impl Graph {
         state
     }
 
-    /// Teardown every provisioned, non-[`Cached`](super::Lifetime::Cached) node,
-    /// reverse in dependency order: a node is reaped only after every dependent
-    /// is gone. Independent subtrees run concurrently; idempotent and
-    /// failure-isolated. Only nodes that reached `Ready` in `states` are
-    /// candidates — a `Failed`/`Blocked` node was never materialized.
+    /// Reverse-order teardown of every provisioned non-[`Cached`](super::Lifetime::Cached)
+    /// node: reaped only after every dependent is gone.
+    ///
+    /// - Independent subtrees concurrent; idempotent and failure-isolated
+    /// - Only `Ready` nodes are candidates (`Failed`/`Blocked` never materialized)
     pub async fn teardown<F>(
         &self,
         cx: &Cx,
@@ -235,7 +177,7 @@ impl Graph {
     where
         F: FnMut(&NodeId, &Result<(), ResourceError>),
     {
-        // dependents[x] = every node that lists x as a dep.
+        // dependents[x] = every node listing x as a dep
         let mut dependents: HashMap<NodeId, Vec<NodeId>> =
             self.nodes.keys().map(|k| (k.clone(), Vec::new())).collect();
         for (id, node) in &self.nodes {
@@ -246,9 +188,8 @@ impl Graph {
             }
         }
 
-        // Candidates: Ready + reaped-lifetime. Everything else is already
-        // "gone" for ordering purposes — a Cached node stays put, a
-        // never-provisioned node has nothing to remove.
+        // Ready + reaped-lifetime only; everything else is already "gone" for ordering
+        // (Cached stays put, never-provisioned has nothing to remove)
         let mut remaining: HashSet<NodeId> = self
             .nodes
             .iter()
@@ -257,19 +198,15 @@ impl Graph {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        let mut gone: HashSet<NodeId> = self
-            .nodes
-            .keys()
-            .filter(|id| !remaining.contains(*id))
-            .cloned()
-            .collect();
+        let mut gone: HashSet<NodeId> =
+            self.nodes.keys().filter(|id| !remaining.contains(*id)).cloned().collect();
 
         let mut inflight = FuturesUnordered::new();
         let mut launched: HashSet<NodeId> = HashSet::new();
         let mut results: Vec<(NodeId, Result<(), ResourceError>)> = Vec::new();
 
         loop {
-            // A node is ready to tear down when every dependent is gone.
+            // Tear down once every dependent is gone
             let ready: Vec<NodeId> = remaining
                 .iter()
                 .filter(|id| {
@@ -299,8 +236,7 @@ impl Graph {
     }
 }
 
-/// Probe, then provision if absent. The per-node body of
-/// [`Graph::provision`].
+/// Probe, then provision if absent
 async fn run_one(node: &dyn Provider, cx: &Cx) -> NodeState {
     match node.probe(cx).await {
         Readiness::Ready => NodeState::Ready,
@@ -311,10 +247,8 @@ async fn run_one(node: &dyn Provider, cx: &Cx) -> NodeState {
     }
 }
 
-/// Static (shape) errors caught by [`Graph::validate`]. Runtime provisioning
-/// failures use [`ResourceError`] and land in
-/// [`NodeState::Failed`](super::NodeState::Failed) instead — the graph never
-/// aborts a run for one bad node.
+/// Shape errors from [`Graph::validate`]. Runtime failures are [`ResourceError`] →
+/// [`NodeState::Failed`](super::NodeState::Failed) instead (one bad node never aborts a run)
 #[derive(Debug, Error)]
 pub enum GraphError {
     #[error("node {0:?} added twice")]
@@ -327,11 +261,9 @@ pub enum GraphError {
     Cycle { count: usize },
 }
 
-// Every executor invariant is testable without a cluster: the trait is
-// object-safe, so a hand-rolled `Fake` provider with a shared event log covers
-// ordering, concurrency capping, blocking, short-circuit-on-Ready, and
-// teardown. `Fake` carries its identity as `NodeId::Image(String)` — an
-// arbitrary variant choice that keeps ids readable in assertions.
+// Object-safe trait → a `Fake` provider with a shared event log covers ordering,
+// concurrency capping, blocking, short-circuit-on-Ready and teardown, no cluster.
+// `Fake`'s `NodeId::Image(String)` is arbitrary, chosen for readable assertions
 
 #[cfg(test)]
 mod tests {
@@ -342,10 +274,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    // `Fake` keeps its own shared state (event log + concurrency counters) in a
-    // `TestCx`, never touching `cx.client`; the real `Cx` at the trait boundary
-    // is the offline stub from `test_cx()`. This avoids making `Cx::client`
-    // optional just for testability.
+    // `Fake` keeps its state in a `TestCx` and never touches `cx.client` (the boundary
+    // `Cx` is `test_cx()`'s offline stub) → `Cx::client` need not go optional for tests
     fn mk_cx(log: SharedLog) -> TestCx {
         TestCx { log }
     }
@@ -393,8 +323,7 @@ mod tests {
         NodeId::Image(s.to_string())
     }
 
-    /// A test provider whose provision/teardown just appends events to the
-    /// shared log and honors configured fail/ready flags.
+    /// Appends provision/teardown events to the shared log, honoring fail/ready flags
     #[derive(Debug)]
     struct Fake {
         id: NodeId,
@@ -457,16 +386,11 @@ mod tests {
             self.life
         }
         async fn probe(&self, _cx: &Cx) -> Readiness {
-            if self.already_ready {
-                Readiness::Ready
-            } else {
-                Readiness::Absent
-            }
+            if self.already_ready { Readiness::Ready } else { Readiness::Absent }
         }
         async fn provision(&self, _cx: &Cx) -> Result<(), ResourceError> {
             self.cx.record(format!("provision:{}", self.label));
-            // Straddle a yield so concurrent provisions overlap and the
-            // peak-in-flight counter witnesses the concurrency cap.
+            // Straddle a yield so provisions overlap and peak-in-flight witnesses the cap
             self.cx.enter();
             tokio::task::yield_now().await;
             self.cx.leave();
@@ -494,8 +418,7 @@ mod tests {
         g
     }
 
-    /// A real `Cx` whose client points at a non-existent server; the `Fake`
-    /// provider never calls through it, so no request is ever issued.
+    /// Real `Cx`, client pointed at nothing; `Fake` never calls through it
     async fn test_cx() -> Cx {
         let cfg = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
         let client = kube::Client::try_from(cfg).expect("build offline client");
@@ -523,8 +446,7 @@ mod tests {
     async fn concurrency_cap_bounds_in_flight() {
         let log: SharedLog = Arc::default();
         let tcx = mk_cx(log);
-        // Five independent nodes, cap 2 → never more than 2 provisioning
-        // at once.
+        // Five independent nodes, cap 2 → never more than 2 in flight
         let g = graph(vec![
             Fake::new("a", tcx.clone()),
             Fake::new("b", tcx.clone()),
@@ -564,7 +486,7 @@ mod tests {
     async fn failed_dep_blocks_dependents_but_not_siblings() {
         let log: SharedLog = Arc::default();
         let tcx = mk_cx(log);
-        // a fails → b (needs a) Blocked; c (independent) still Ready.
+        // a fails → b Blocked, c (independent) still Ready
         let g = graph(vec![
             Fake::new("a", tcx.clone()).fails(),
             Fake::new("b", tcx.clone()).deps(&["a"]),
@@ -601,10 +523,7 @@ mod tests {
         let cx = test_cx().await;
         let state = g.provision(&cx, usize::MAX, |_, _| {}).await;
         assert_eq!(state[&img("a")], NodeState::Ready);
-        assert!(
-            tcx.index_of("provision:a").is_none(),
-            "should not provision"
-        );
+        assert!(tcx.index_of("provision:a").is_none(), "should not provision");
     }
 
     #[test]
@@ -655,10 +574,7 @@ mod tests {
         let state = g.provision(&cx, usize::MAX, |_, _| {}).await;
         g.teardown(&cx, &state, |_, _| {}).await;
         assert!(tcx.index_of("teardown:ns").is_some());
-        assert!(
-            tcx.index_of("teardown:seed").is_none(),
-            "cache must survive"
-        );
+        assert!(tcx.index_of("teardown:seed").is_none(), "cache must survive");
     }
 
     #[tokio::test]
@@ -680,8 +596,7 @@ mod tests {
     async fn teardown_failure_is_isolated() {
         let log: SharedLog = Arc::default();
         let tcx = mk_cx(log);
-        // b's teardown fails; a and c must still be reaped, and the
-        // failure surfaces in the report rather than aborting the sweep.
+        // b's teardown fails → a and c still reaped, failure in the report not the sweep
         let g = graph(vec![
             Fake::new("a", tcx.clone()),
             Fake::new("b", tcx.clone()).fails_teardown(),
@@ -697,7 +612,7 @@ mod tests {
         }
     }
 
-    // Suppress unused warnings for helpers only used behind cfg(test).
+    // Helpers used only behind cfg(test)
     #[allow(dead_code)]
     fn _touch_atomic() {
         let _ = AtomicUsize::new(0).fetch_add(1, Ordering::SeqCst);

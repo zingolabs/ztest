@@ -1,56 +1,22 @@
-//! The on-cluster **image builder**: a privileged-in-userns [BuildKit] daemon pod
-//! plus the SCC that admits it.
+//! On-cluster image builder: ephemeral rootless [BuildKit] daemon pod, driven by
+//! `exec`d `buildctl build`. Plain Kubernetes (pod, SA, ConfigMap, PVC).
 //!
-//! ztest builds every OpenShift-target image by `exec`ing `buildctl build`
-//! against the `buildkitd` in this ephemeral pod, not through OpenShift's Build
-//! subsystem — that subsystem pins its containers to `quay.io/okd/scos-content`
-//! digests that OKD prunes from quay within days (pre-release streams), so a
-//! day-old cluster's first build fails `ImagePullBackOff: manifest unknown`. A
-//! stable public image ([`BUILDKIT_IMAGE`]) removes that whole failure class.
-//!
-//! # Privileged-in-userns
-//!
-//! The pod runs the (non-rootless) `buildkitd` as in-pod-root (uid 0) inside a
-//! Kubernetes **pod-level user namespace** (`hostUsers: false`) with
-//! `privileged: true` — "not really privileged": the userns maps that root to an
-//! unprivileged host uid, voiding the capabilities on the host. This is forced by
-//! the stack: BuildKit's OCI worker runs every `RUN` in a runc container that must
-//! mount a fresh `devpts` and `/proc`; the kernel gates those on `CAP_SYS_ADMIN`
-//! in the owning userns, and unmasked `/proc` needs `procMount: Unmasked`, which
-//! k8s permits *only* when `hostUsers: false`. Rootless BuildKit therefore cannot
-//! run `RUN` steps on OpenShift/CRI-O at all (verified on CRC).
-//!
-//! The SCC ([`BUILDKIT_SCC`]) is OKD's built-in `nested-container` SCC (which
-//! requires the pod userns via `userNamespaceLevel: RequirePodLevel`) plus
-//! `allowPrivilegedContainer`; its `runAsUser` range `0-65534` lets uid 0 validate
-//! without the namespace's uid-range annotation.
-//!
-//! # Lifecycle
-//!
-//! `ztest setup` provisions only the *scaffolding* — the SCC, the SA, the
-//! `buildkitd.toml` ConfigMap, and the cache PVC — none of which reserve CPU or
-//! memory. The BuildKit pod itself is **ephemeral**: each invocation (a
-//! `ztest run` or `ztest setup` that builds images) creates one at the build
-//! footprint ([`crate::qos::build::BUILDKIT_BUILD`]) via [`create_build_pod`],
-//! uses it for all its builds, and deletes it ([`delete_build_pod`]) on every
-//! exit path. So an idle cluster holds zero build capacity, and a build's
-//! footprint is a real Guaranteed reservation only while it runs — no in-place
-//! resize, no rest/build split.
-//!
-//! # Storage
-//!
-//! The build cache (content store + overlayfs snapshots) lives on a dedicated PVC
-//! ([`BUILDKIT_CACHE_PVC`]) mounted at [`BUILDKIT_STATE_DIR`] so layers persist
-//! across the ephemeral pods. The build context is staged in an `emptyDir` at
-//! [`WORK_MOUNT`], thrown away with the pod.
+//! - Upstream's k8s rootless recipe: uid 1000, `seccomp`/`AppArmor` unconfined,
+//!   `--oci-worker-no-process-sandbox`; no privileged/caps/`hostUsers`/`procMount`
+//! - Keeping the per-`RUN` process sandbox instead needs `CAP_SYS_ADMIN`-in-userns
+//!   + `procMount: Unmasked`, which k8s gates on `hostUsers: false`
+//! - Cost = build steps unisolated *inside this pod* (intra-pod, not the host boundary)
+//! - Unconfined exceeds PSA *baseline* → run ns carries `…/enforce: privileged`
+//! - `ztest cluster setup` provisions scaffolding only (reserves no CPU/memory); the pod is
+//!   created per build at [`crate::qos::build::BUILDKIT_BUILD`] and deleted on every exit path
+//! - Cache PVC at [`BUILDKIT_STATE_DIR`] persists layers across pods; context =
+//!   `emptyDir` at [`WORK_MOUNT`], thrown away with the pod
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, ServiceAccount};
-use kube::api::{
-    Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams, PostParams,
-};
+use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use kube::runtime::wait::await_condition;
 use serde_json::{Value, json};
 
@@ -59,44 +25,42 @@ use crate::resource::impls::policy::{BUILDKIT_SERVICE_ACCOUNT, RUN_NAMESPACE, ma
 use crate::resource::kube::FIELD_MANAGER;
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 
-/// Pinned, publicly-pullable BuildKit image (non-rootless variant — see the
-/// module docs). The one external pull this design depends on, at pod start.
-pub(crate) const BUILDKIT_IMAGE: &str = "moby/buildkit:v0.18.2";
+/// Pinned rootless BuildKit image. Entrypoint = `rootlesskit buildkitd`, so give
+/// the container `args` and never `command` (overriding drops the user namespace)
+pub(crate) const BUILDKIT_IMAGE: &str = "moby/buildkit:v0.18.2-rootless";
+/// uid the rootless image ships; sole writer of its `$HOME`/`XDG_RUNTIME_DIR`
+const BUILDKIT_UID: i64 = 1000;
+/// Rootless socket, not the rootful `/run/buildkit/buildkitd.sock` `buildctl`
+/// defaults to. Exported as `BUILDKIT_HOST` so probe + `exec`d `buildctl` inherit it
+const BUILDKIT_ADDR: &str = "unix:///run/user/1000/buildkit/buildkitd.sock";
 pub(crate) const BUILDKIT_CONTAINER: &str = "buildkit";
-/// Label marking a pod as the ephemeral BuildKit build pod (component role).
 const BUILDKIT_COMPONENT: &str = "ztest.io/component";
-/// How long [`wait_build_pod_ready`] waits for buildkitd to answer before failing.
+/// [`wait_build_pod_ready`] budget for buildkitd to answer
 const READY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// Graceful-shutdown window given to buildkitd on delete: long enough for a live
-/// daemon to abort any in-flight build and unmount its overlay/runc mounts before
-/// SIGKILL — an ungraceful kill mid-unmount is what leaks mounts and wedges the
-/// pod in `Terminating`.
+/// Grace window to abort in-flight builds and unmount overlay/runc before SIGKILL
+/// (a kill mid-unmount leaks mounts and wedges the pod `Terminating`)
 const TERMINATION_GRACE_SECS: i64 = 30;
-/// How long [`delete_build_pod`] waits for the graceful delete to complete before
-/// force-deleting; the grace window plus a margin for the kubelet's own teardown.
+/// [`delete_build_pod`] wait before force-delete (grace window + kubelet teardown margin)
 const POD_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Custom SCC admitting the privileged-in-userns pod. Bound to [`BUILDKIT_SERVICE_ACCOUNT`].
-const BUILDKIT_SCC: &str = "ztest-buildkit";
 const BUILDKIT_CACHE_PVC: &str = "ztest-buildkit-cache";
-/// ConfigMap holding `buildkitd.toml` (the docker.io mirror + the integrated
-/// registry's `ca`). Mounted at [`BUILDKIT_CONFIG_PATH`].
+/// Holds `buildkitd.toml`, mounted at [`BUILDKIT_CONFIG_PATH`]
 const BUILDKIT_CONFIG: &str = "ztest-buildkit-config";
 const BUILDKIT_CONFIG_PATH: &str = "/etc/buildkit/buildkitd.toml";
-/// OpenShift auto-injects this ConfigMap; its `service-ca.crt` signs `*.svc`
-/// serving certs including the integrated registry's. Installed into the
-/// container's **system trust store** (see [`buildkitd_entrypoint`]) rather than
-/// buildkitd.toml's per-registry `ca`, because the push's OAuth token fetch
-/// honours neither the per-registry `ca` nor `insecure` — only the system roots.
-const SERVICE_CA_CONFIGMAP: &str = "openshift-service-ca.crt";
-const SERVICE_CA_MOUNT: &str = "/etc/buildkit/certs";
-const SERVICE_CA_FILE: &str = "/etc/buildkit/certs/service-ca.crt";
-/// Where the build context is unpacked — an `emptyDir`, source-only, per-build.
+/// Build-context unpack dir: `emptyDir`, source-only, per-build
 pub(crate) const WORK_MOUNT: &str = "/build";
-/// BuildKit's state dir (content store + snapshots); the cache PVC mounts here.
-const BUILDKIT_STATE_DIR: &str = "/var/lib/buildkit";
-/// The RWO block StorageClass every substrate provides (`storage.rs`).
-const STORAGE_CLASS: &str = "rook-ceph-block";
+/// BuildKit state dir (content store + snapshots + `--mount=type=cache`), under
+/// the rootless daemon's `$HOME` not `/var/lib/buildkit`. Cache PVC mounts here.
+///
+/// Persisting it is what makes an ephemeral pod viable — cache mounts are
+/// builder-local and no registry cache backend exports them
+const BUILDKIT_STATE_DIR: &str = "/home/user/.local/share/buildkit";
+/// StorageClass for the cache PVC. `None` omits the field → cluster default (the
+/// only portable choice; a named class strands the PVC `Pending` elsewhere).
+/// `ZTEST_BUILDKIT_STORAGE_CLASS` pins a faster one
+fn storage_class() -> Option<String> {
+    std::env::var("ZTEST_BUILDKIT_STORAGE_CLASS").ok().filter(|s| !s.trim().is_empty())
+}
 
 fn cache_size() -> String {
     std::env::var("ZTEST_BUILDKIT_CACHE_SIZE")
@@ -105,18 +69,12 @@ fn cache_size() -> String {
         .unwrap_or_else(|| "100Gi".to_string())
 }
 
-/// Parse a k8s storage quantity (`…Ki/Mi/Gi/Ti` or plain bytes) into bytes, for
-/// the grow-only size comparison in [`reconcile_cache_pvc_size`]. Returns `None`
-/// on any shape we don't recognise so the caller skips the resize rather than
-/// acting on a misread size.
+/// k8s storage quantity (`Ki/Mi/Gi/Ti` or plain bytes) → bytes, for
+/// [`reconcile_cache_pvc_size`]'s grow-only compare. `None` on any unrecognised
+/// shape (caller skips the resize rather than act on a misread size)
 fn quantity_bytes(q: &str) -> Option<u128> {
     let q = q.trim();
-    for (suffix, mult) in [
-        ("Ti", 1u128 << 40),
-        ("Gi", 1 << 30),
-        ("Mi", 1 << 20),
-        ("Ki", 1 << 10),
-    ] {
+    for (suffix, mult) in [("Ti", 1u128 << 40), ("Gi", 1 << 30), ("Mi", 1 << 20), ("Ki", 1 << 10)] {
         if let Some(n) = q.strip_suffix(suffix) {
             return n.trim().parse::<u128>().ok().map(|n| n * mult);
         }
@@ -128,13 +86,11 @@ fn is_already_exists(e: &kube::Error) -> bool {
     matches!(e, kube::Error::Api(r) if r.code == 409)
 }
 
-/// Grow the existing cache PVC toward [`cache_size`] when the target is larger
-/// than its current request; a no-op otherwise. Read via `serde_json` to stay
-/// off `k8s-openapi`'s version-fragile `resources` field shape. A merge patch of
-/// only the storage request is the standard CSI expansion trigger (the resizer
-/// sidecar acts on it asynchronously). Best-effort: a cluster whose StorageClass
-/// forbids expansion should not fail `setup` — the create-time size may still be
-/// enough — so a rejected patch is surfaced as a warning, not an error.
+/// Grow the cache PVC toward [`cache_size`] when larger than its current request.
+///
+/// - Read via `serde_json` (dodges `k8s-openapi`'s version-fragile `resources` shape)
+/// - Merge patch of the storage request alone = standard CSI expansion trigger
+/// - Best-effort: a StorageClass forbidding expansion warns, never fails `setup`
 async fn reconcile_cache_pvc_size(api: &Api<PersistentVolumeClaim>) -> Result<(), ResourceError> {
     let desired = cache_size();
     let Some(desired_b) = quantity_bytes(&desired) else {
@@ -153,42 +109,28 @@ async fn reconcile_cache_pvc_size(api: &Api<PersistentVolumeClaim>) -> Result<()
         return Ok(());
     }
     let patch = json!({ "spec": { "resources": { "requests": { "storage": desired } } } });
-    if let Err(e) = api
-        .patch(
-            BUILDKIT_CACHE_PVC,
-            &PatchParams::default(),
-            &Patch::Merge(&patch),
-        )
-        .await
+    if let Err(e) =
+        api.patch(BUILDKIT_CACHE_PVC, &PatchParams::default(), &Patch::Merge(&patch)).await
     {
         eprintln!(
             "warning: could not expand buildkit cache PVC {BUILDKIT_CACHE_PVC} to {desired} \
-             (is allowVolumeExpansion enabled on {STORAGE_CLASS}?): {e}"
+             (is allowVolumeExpansion enabled on its StorageClass?): {e}"
         );
     }
     Ok(())
 }
 
-/// Pull-through cache for `docker.io`, to dodge Docker Hub's per-IP anonymous
-/// pull limit (fatal on a shared egress IP, since BuildKit's own content store
-/// re-resolves every cold base `FROM`). BuildKit's resolver tries configured
-/// mirrors first and appends the canonical Hub as the final fallback, so this
-/// serves the common case off the cache while Hub stays the automatic backstop.
+/// `docker.io` pull-through cache, dodging Hub's per-IP anonymous pull limit
+/// (fatal behind a shared egress IP). Resolver tries mirrors first, Hub stays the
+/// automatic final fallback
 const DOCKERHUB_MIRROR: &str = "mirror.gcr.io";
 
-/// `buildkitd.toml`: just the `docker.io` pull-through mirror. The integrated
-/// registry needs no entry — its service-ca-signed TLS is trusted via the system
-/// store (see [`buildkitd_entrypoint`]), covering resolver and OAuth authorizer.
+/// `buildkitd.toml`: the `docker.io` pull-through mirror + GC retention envelope
 fn buildkitd_toml() -> String {
-    // BuildKit's *default* GC keeps only a small fraction of the disk, so between
-    // runs it evicts the two most expensive things to rebuild — the compile
-    // stage's layers and the `exec.cachemount` holding cargo's registry + the
-    // Rust `target` dir — turning every `--no-run` compile into a near-cold
-    // rebuild (minutes, not a relink). Size the retention envelope to the cache
-    // PVC instead: percentages are of the worker's total disk, so this tracks
-    // `cache_size()` without restating it. reservedSpace is the floor GC never
-    // prunes below (~keep the whole working set); maxUsedSpace caps growth;
-    // minFreeSpace guarantees headroom so a build never fills the volume.
+    // Default GC keeps a small fraction of disk, evicting the compile layers and
+    // the cargo/`target` cache mount between runs (every `--no-run` compile goes
+    // near-cold). Percentages are of the worker's total disk, so this tracks
+    // `cache_size()` without restating it.
     format!(
         "[registry.\"docker.io\"]\n  mirrors = [\"{DOCKERHUB_MIRROR}\"]\n\
          [worker.oci]\n  \
@@ -196,17 +138,6 @@ fn buildkitd_toml() -> String {
          reservedSpace = \"80%\"\n  \
          maxUsedSpace = \"92%\"\n  \
          minFreeSpace = \"8%\"\n"
-    )
-}
-
-/// Container entrypoint: install the mounted service-ca into the system trust
-/// store (so the push's token fetch, which ignores buildkitd.toml's per-registry
-/// TLS, verifies the registry cert), then `exec buildkitd` as PID 1.
-fn buildkitd_entrypoint() -> String {
-    format!(
-        "install -m0644 {SERVICE_CA_FILE} /usr/local/share/ca-certificates/ztest-service-ca.crt && \
-         update-ca-certificates && \
-         exec buildkitd --oci-worker-snapshotter=overlayfs"
     )
 }
 
@@ -219,81 +150,38 @@ fn config_manifest() -> Value {
     })
 }
 
-/// The custom SCC as a [`DynamicObject`] (SCCs aren't a `k8s-openapi` type):
-/// OKD's `nested-container` SCC plus `allowPrivilegedContainer`. See the module
-/// docs for why each field is what it is.
-fn scc_manifest() -> DynamicObject {
-    serde_json::from_value(json!({
-        "apiVersion": "security.openshift.io/v1",
-        "kind": "SecurityContextConstraints",
-        "metadata": { "name": BUILDKIT_SCC },
-        "allowHostDirVolumePlugin": false,
-        "allowHostIPC": false,
-        "allowHostNetwork": false,
-        "allowHostPID": false,
-        "allowHostPorts": false,
-        "allowPrivilegedContainer": true,
-        "allowPrivilegeEscalation": true,
-        "allowedCapabilities": ["SETUID", "SETGID"],
-        "seccompProfiles": ["*"],
-        "runAsUser": { "type": "MustRunAsRange", "uidRangeMin": 0, "uidRangeMax": 65534 },
-        "seLinuxContext": { "type": "MustRunAs", "seLinuxOptions": { "type": "container_engine_t" } },
-        "fsGroup": { "type": "MustRunAs", "ranges": [{ "min": 0, "max": 65534 }] },
-        "supplementalGroups": { "type": "MustRunAs", "ranges": [{ "min": 0, "max": 65534 }] },
-        "userNamespaceLevel": "RequirePodLevel",
-        "readOnlyRootFilesystem": false,
-        "volumes": ["configMap", "csi", "downwardAPI", "emptyDir", "ephemeral", "persistentVolumeClaim", "projected", "secret"],
-        "users": [format!("system:serviceaccount:{RUN_NAMESPACE}:{BUILDKIT_SERVICE_ACCOUNT}")],
-    }))
-    .expect("static SCC manifest is valid")
-}
-
-fn scc_resource() -> ApiResource {
-    ApiResource::from_gvk_with_plural(
-        &GroupVersionKind {
-            group: "security.openshift.io".to_string(),
-            version: "v1".to_string(),
-            kind: "SecurityContextConstraints".to_string(),
-        },
-        "securitycontextconstraints",
-    )
-}
-
-/// The BuildKit pod `spec` at `cpu`/`mem` (Guaranteed). The container is
-/// `buildkitd` in the privileged-in-userns posture (see the module docs). No
-/// `--oci-worker-no-process-sandbox`: the process sandbox is what mounts the
-/// per-`RUN` `/proc` + `devpts` the pod userns makes possible. Shared by the
-/// ephemeral pod builder so there is one source of truth for the pod shape.
+/// BuildKit pod `spec` at `cpu`/`mem` (Guaranteed), rootless posture (module docs)
 fn pod_spec(cpu: &str, mem: &str) -> Value {
     json!({
         "serviceAccountName": BUILDKIT_SERVICE_ACCOUNT,
-        // Pod-level user namespace (see module docs): what makes `privileged`
-        // below host-safe and unlocks `procMount: Unmasked`.
-        "hostUsers": false,
-        // A ztest-managed single-use pod: if buildkitd crashes it must stay dead
-        // and be reaped, never resurrected — the run fails loudly instead.
+        // Single-use: a crashed buildkitd stays dead and fails the run loudly
         "restartPolicy": "Never",
         "terminationGracePeriodSeconds": TERMINATION_GRACE_SECS,
         "securityContext": {
-            // fsGroup 0 (in-userns) makes the cache PVC group-writable by the
-            // build root; SELinux type comes from the SCC's MustRunAs.
+            // Default profiles block runc's `unshare` + the daemon's mounts
             "seccompProfile": { "type": "Unconfined" },
-            "fsGroup": 0,
+            "appArmorProfile": { "type": "Unconfined" },
+            "fsGroup": BUILDKIT_UID,
         },
         "containers": [{
             "name": BUILDKIT_CONTAINER,
             "image": BUILDKIT_IMAGE,
             "imagePullPolicy": "IfNotPresent",
-            "command": ["sh", "-c", buildkitd_entrypoint()],
+            // `args`, never `command` (entrypoint = `rootlesskit buildkitd`;
+            // replacing it starts the daemon outside its userns). Snapshotter
+            // left unforced — rootless picks by kernel support
+            "args": ["--oci-worker-no-process-sandbox"],
+            "env": [
+                { "name": "BUILDKIT_HOST", "value": BUILDKIT_ADDR },
+            ],
             "securityContext": {
-                // `privileged` (confined by the pod userns) is what lets the RUN
-                // executor mount overlay/devpts/proc.
-                "runAsUser": 0,
-                "runAsGroup": 0,
-                "privileged": true,
+                "runAsUser": BUILDKIT_UID,
+                "runAsGroup": BUILDKIT_UID,
+                // rootlesskit gains its mapped ids, never a host capability
+                "allowPrivilegeEscalation": true,
             },
-            // Ready only once buildkitd answers, so the build path's wait blocks
-            // until an `exec buildctl` will connect.
+            // Ready = buildkitd answers, so the build path's wait blocks until
+            // an `exec buildctl` will connect
             "readinessProbe": {
                 "exec": { "command": ["buildctl", "debug", "workers"] },
                 "initialDelaySeconds": 2,
@@ -304,10 +192,7 @@ fn pod_spec(cpu: &str, mem: &str) -> Value {
                 { "name": "cache", "mountPath": BUILDKIT_STATE_DIR },
                 { "name": "context", "mountPath": WORK_MOUNT },
                 { "name": "config", "mountPath": BUILDKIT_CONFIG_PATH, "subPath": "buildkitd.toml" },
-                { "name": "service-ca", "mountPath": SERVICE_CA_MOUNT, "readOnly": true },
             ],
-            // Guaranteed at the build footprint for the pod's whole (ephemeral)
-            // life — created for a build, deleted after.
             "resources": {
                 "requests": { "cpu": cpu, "memory": mem },
                 "limits": { "cpu": cpu, "memory": mem },
@@ -317,24 +202,19 @@ fn pod_spec(cpu: &str, mem: &str) -> Value {
             { "name": "cache", "persistentVolumeClaim": { "claimName": BUILDKIT_CACHE_PVC } },
             { "name": "context", "emptyDir": {} },
             { "name": "config", "configMap": { "name": BUILDKIT_CONFIG } },
-            { "name": "service-ca", "configMap": { "name": SERVICE_CA_CONFIGMAP } },
         ],
     })
 }
 
-/// Create the ephemeral BuildKit pod at the build footprint and return its name.
-/// Sized at [`BUILDKIT_BUILD`](crate::qos::build::BUILDKIT_BUILD) (Guaranteed),
-/// labelled with the run id so a crashed run's reaper (`reap_run`) also removes
-/// it, labelled with the owning user so `ztest cleanup` (which scopes by
-/// [`LABEL_USER`](crate::qos::LABEL_USER)) reaps it like every other run-owned
-/// object, and stamped with the required-SCC annotation so admission accepts the
-/// privileged-in-userns posture. The caller waits it Ready
-/// ([`wait_build_pod_ready`]) and deletes it ([`delete_build_pod`]) on every path.
+/// Create the ephemeral BuildKit pod at [`BUILDKIT_BUILD`](crate::qos::build::BUILDKIT_BUILD)
+/// (Guaranteed) and return its name.
 ///
-/// The footprint this pod occupies must already be covered by a ledger
-/// reservation — see [`Reserve::Fixed`](crate::qos::ledger::Reserve::Fixed).
-/// Creating it unbudgeted is what let a builder land on a node whose memory
-/// admission had already promised to tests.
+/// - Run-id label → a crashed run's `reap_run` removes it; [`LABEL_USER`](crate::qos::LABEL_USER)
+///   label → `ztest cleanup` reaps it like any run-owned object
+/// - Caller must [`wait_build_pod_ready`] then [`delete_build_pod`] on every path
+/// - Footprint must already be covered by a ledger reservation
+///   ([`Reserve::Fixed`](crate::qos::ledger::Reserve::Fixed)); unbudgeted lands a
+///   builder on memory admission already promised to tests
 pub(crate) async fn create_build_pod(
     client: &kube::Client,
     run_id: &str,
@@ -355,7 +235,6 @@ pub(crate) async fn create_build_pod(
                 LABEL_USER: crate::naming::slug(user, crate::naming::DNS_LABEL_MAX),
             },
             "annotations": {
-                "openshift.io/required-scc": BUILDKIT_SCC,
                 "ztest.io/buildkitd-config-hash": manifest_hash(&json!(buildkitd_toml())),
             },
         },
@@ -369,16 +248,15 @@ pub(crate) async fn create_build_pod(
     Ok(name)
 }
 
-/// Block until the build pod's `Ready` condition is `True` (buildkitd answers
-/// `buildctl debug workers`), or fail after [`READY_TIMEOUT`].
+/// Block until the pod's `Ready` condition is `True` (buildkitd answers
+/// `buildctl debug workers`), or fail after [`READY_TIMEOUT`]
 pub(crate) async fn wait_build_pod_ready(
     client: &kube::Client,
     name: &str,
 ) -> Result<(), ResourceError> {
     let api: Api<Pod> = Api::namespaced(client.clone(), RUN_NAMESPACE);
-    // Settle on either terminal state — `restartPolicy: Never` means a crashed or
-    // unschedulable pod never recovers, so wake for it too and report it, rather
-    // than spinning to the full timeout on a pod that will never be Ready.
+    // Wake on either terminal state: `restartPolicy: Never` means a crashed or
+    // unschedulable pod never recovers, so report it instead of spinning to timeout
     let settled = await_condition(api, name, |p: Option<&Pod>| {
         p.is_some_and(|p| pod_ready(p) || pod_failed(p).is_some())
     });
@@ -387,9 +265,7 @@ pub(crate) async fn wait_build_pod_ready(
             "build pod {name} not Ready within {}s",
             READY_TIMEOUT.as_secs()
         ))),
-        Ok(Err(e)) => Err(ResourceError::Provision(format!(
-            "watching build pod {name}: {e}"
-        ))),
+        Ok(Err(e)) => Err(ResourceError::Provision(format!("watching build pod {name}: {e}"))),
         Ok(Ok(pod)) => match pod.as_ref().and_then(pod_failed) {
             Some(why) => Err(ResourceError::Provision(format!(
                 "build pod {name} failed before becoming Ready — {why}"
@@ -399,17 +275,12 @@ pub(crate) async fn wait_build_pod_ready(
     }
 }
 
-/// A terminal, non-recoverable pod state, if any — reported so the ready-wait can
-/// fail fast. Covers a crashed/OOMKilled container, an image that won't pull, and
-/// a pod no node can ever place (e.g. `Insufficient memory`).
+/// Terminal, non-recoverable pod state, if any, so the ready-wait fails fast:
+/// crashed/OOMKilled container, unpullable image, unplaceable pod
 fn pod_failed(p: &Pod) -> Option<String> {
     let status = p.status.as_ref()?;
     if status.phase.as_deref() == Some("Failed") {
-        let reason = status
-            .reason
-            .as_deref()
-            .map(|r| format!(" ({r})"))
-            .unwrap_or_default();
+        let reason = status.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
         return Some(format!("pod Failed{reason}"));
     }
     if let Some(conds) = &status.conditions {
@@ -443,26 +314,20 @@ fn pod_failed(p: &Pod) -> Option<String> {
     None
 }
 
-/// Delete the ephemeral build pod and confirm it is actually gone. A graceful
-/// delete first — buildkitd's [`TERMINATION_GRACE_SECS`] window lets a live daemon
-/// unmount its overlay/runc mounts cleanly — but a crashed daemon can leave leaked
-/// mounts that wedge the kubelet in `Terminating` indefinitely, so if the pod is
-/// still present after [`POD_TEARDOWN_TIMEOUT`] we force-delete it. A lingering
-/// build pod would otherwise keep holding its Guaranteed footprint. Best-effort:
-/// the pod is a single-use throwaway, all durable state on the cache PVC.
+/// Delete the build pod and confirm it gone.
+///
+/// - Graceful first ([`TERMINATION_GRACE_SECS`] lets a live daemon unmount cleanly)
+/// - Force-delete past [`POD_TEARDOWN_TIMEOUT`] (leaked mounts wedge `Terminating`
+///   forever, and a lingering pod holds its Guaranteed footprint)
+/// - Best-effort: single-use throwaway, durable state on the cache PVC
 pub(crate) async fn delete_build_pod(client: &kube::Client, name: &str) {
     let api = Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE);
     if api.delete(name, &DeleteParams::default()).await.is_err() {
         return;
     }
     let gone = await_condition(api.clone(), name, |p: Option<&Pod>| p.is_none());
-    if !matches!(
-        tokio::time::timeout(POD_TEARDOWN_TIMEOUT, gone).await,
-        Ok(Ok(_))
-    ) {
-        let _ = api
-            .delete(name, &DeleteParams::default().grace_period(0))
-            .await;
+    if !matches!(tokio::time::timeout(POD_TEARDOWN_TIMEOUT, gone).await, Ok(Ok(_))) {
+        let _ = api.delete(name, &DeleteParams::default().grace_period(0)).await;
     }
 }
 
@@ -474,10 +339,9 @@ fn pod_ready(p: &Pod) -> bool {
         .unwrap_or(false)
 }
 
-/// The BuildKit scaffolding — the admission SCC, the SA, the `buildkitd.toml`
-/// ConfigMap, and the cache PVC. `Lifetime::Cached`, provisioned by `ztest setup`;
-/// the build pod itself is ephemeral (see [`create_build_pod`]), so this node
-/// reserves no CPU/memory.
+/// BuildKit scaffolding: SA, `buildkitd.toml` ConfigMap, cache PVC. `Cached`,
+/// provisioned by `ztest cluster setup`; reserves no CPU/memory (pod is ephemeral —
+/// [`create_build_pod`])
 #[derive(Debug)]
 pub(crate) struct BuildkitProvider;
 
@@ -496,11 +360,9 @@ impl Provider for BuildkitProvider {
     }
 
     async fn probe(&self, cx: &Cx) -> Readiness {
-        // Ready once all four scaffolding objects exist and the config is current.
         let cm: Api<ConfigMap> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
         let sa: Api<ServiceAccount> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
         let pvc: Api<PersistentVolumeClaim> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
-        let scc: Api<DynamicObject> = Api::all_with(cx.client.clone(), &scc_resource());
         let config_current = matches!(
             cm.get(BUILDKIT_CONFIG).await,
             Ok(c) if c.data.as_ref().and_then(|d| d.get("buildkitd.toml")) == Some(&buildkitd_toml())
@@ -508,7 +370,6 @@ impl Provider for BuildkitProvider {
         if config_current
             && sa.get(BUILDKIT_SERVICE_ACCOUNT).await.is_ok()
             && pvc.get(BUILDKIT_CACHE_PVC).await.is_ok()
-            && scc.get(BUILDKIT_SCC).await.is_ok()
         {
             Readiness::Ready
         } else {
@@ -518,17 +379,6 @@ impl Provider for BuildkitProvider {
 
     async fn provision(&self, cx: &Cx) -> Result<(), ResourceError> {
         let params = PatchParams::apply(FIELD_MANAGER).force();
-
-        // SCC (cluster-scoped): admission needs it before the pod can start.
-        let scc_api: Api<DynamicObject> = Api::all_with(cx.client.clone(), &scc_resource());
-        scc_api
-            .patch(BUILDKIT_SCC, &params, &Patch::Apply(&scc_manifest()))
-            .await
-            .map_err(|e| {
-                ResourceError::Provision(format!(
-                    "apply SCC {BUILDKIT_SCC} — is this OpenShift? {e}"
-                ))
-            })?;
 
         let sa: ServiceAccount = serde_json::from_value(json!({
             "apiVersion": "v1",
@@ -543,7 +393,6 @@ impl Provider for BuildkitProvider {
                 ResourceError::Provision(format!("apply SA {BUILDKIT_SERVICE_ACCOUNT}: {e}"))
             })?;
 
-        // buildkitd.toml ConfigMap: the pod mounts it, so it must exist first.
         let cm: ConfigMap =
             serde_json::from_value(config_manifest()).expect("static ConfigMap manifest is valid");
         Api::<ConfigMap>::namespaced(cx.client.clone(), RUN_NAMESPACE)
@@ -553,20 +402,21 @@ impl Provider for BuildkitProvider {
                 ResourceError::Provision(format!("apply buildkit ConfigMap {BUILDKIT_CONFIG}: {e}"))
             })?;
 
-        // Cache PVC: create if absent, else grow toward `cache_size()`. A bound
-        // PVC's class is immutable and CSI can only ever expand it (never shrink),
-        // so raising the default (or `ZTEST_BUILDKIT_CACHE_SIZE`) reconciles onto
-        // an existing cluster instead of stranding it at its create-time size.
+        // Create-if-absent, else grow: a bound PVC's class is immutable and CSI
+        // only expands, so a raised `cache_size()` reconciles onto an existing cluster
         let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
+        let mut spec = json!({
+            "accessModes": ["ReadWriteOnce"],
+            "resources": { "requests": { "storage": cache_size() } },
+        });
+        if let Some(class) = storage_class() {
+            spec["storageClassName"] = json!(class);
+        }
         let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
             "metadata": { "name": BUILDKIT_CACHE_PVC, "namespace": RUN_NAMESPACE },
-            "spec": {
-                "accessModes": ["ReadWriteOnce"],
-                "storageClassName": STORAGE_CLASS,
-                "resources": { "requests": { "storage": cache_size() } },
-            },
+            "spec": spec,
         }))
         .expect("static PVC manifest is valid");
         match pvc_api.create(&PostParams::default(), &pvc).await {

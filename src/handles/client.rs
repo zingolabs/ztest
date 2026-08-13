@@ -1,9 +1,8 @@
 //! Shared RPC transport primitives.
 //!
-//! Uses a thin HTTP client ([`AuthedRpc`]) instead of
-//! `zebra_node_services::RpcRequestClient`, which can't attach an
-//! `Authorization` header — zcashd's JSON-RPC requires HTTP Basic Auth, zebrad
-//! doesn't (it leaves `auth = None`).
+//! - Thin [`AuthedRpc`] over `zebra_node_services::RpcRequestClient` (no
+//!   `Authorization` header there)
+//! - zcashd requires HTTP Basic Auth; zebrad leaves `auth = None`
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -15,8 +14,7 @@ use crate::{Endpoint, RpcError};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// HTTP JSON-RPC client with optional Basic Auth (`auth` is `Some` for zcashd,
-/// which rejects unauthed calls with HTTP 401).
+/// HTTP JSON-RPC client with optional Basic Auth (`Some` for zcashd, which 401s unauthed)
 #[derive(Debug, Clone)]
 pub struct AuthedRpc {
     client: reqwest::Client,
@@ -25,16 +23,12 @@ pub struct AuthedRpc {
 }
 
 impl AuthedRpc {
-    /// Plain unauthenticated client. Use for zebrad and indexer JSON-RPC.
+    /// Unauthenticated — zebrad and indexer JSON-RPC
     pub fn new(addr: SocketAddr) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            url: format!("http://{addr}"),
-            auth: None,
-        }
+        Self { client: reqwest::Client::new(), url: format!("http://{addr}"), auth: None }
     }
 
-    /// Client that attaches HTTP Basic Auth to every request. Use for zcashd.
+    /// HTTP Basic Auth on every request — zcashd
     pub fn with_basic_auth(addr: SocketAddr, user: &str, password: &str) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -44,7 +38,7 @@ impl AuthedRpc {
     }
 
     fn build(&self, method: &str, params: &Value) -> reqwest::RequestBuilder {
-        /// Always tags `"jsonrpc":"2.0"`; zcashd (JSON-RPC 1.0) ignores it.
+        /// Always tagged `"jsonrpc":"2.0"`; zcashd (JSON-RPC 1.0) ignores it
         #[derive(serde::Serialize)]
         struct Request<'a> {
             jsonrpc: &'static str,
@@ -52,18 +46,10 @@ impl AuthedRpc {
             params: &'a Value,
             id: u32,
         }
-        let body = serde_json::to_vec(&Request {
-            jsonrpc: "2.0",
-            method,
-            params,
-            id: 123,
-        })
-        .expect("serializing a JSON-RPC request envelope is infallible");
-        let mut req = self
-            .client
-            .post(&self.url)
-            .body(body)
-            .header("Content-Type", "application/json");
+        let body = serde_json::to_vec(&Request { jsonrpc: "2.0", method, params, id: 123 })
+            .expect("serializing a JSON-RPC request envelope is infallible");
+        let mut req =
+            self.client.post(&self.url).body(body).header("Content-Type", "application/json");
         if let Some((u, p)) = &self.auth {
             req = req.basic_auth(u, Some(p));
         }
@@ -80,8 +66,8 @@ impl AuthedRpc {
         params: &Value,
     ) -> std::result::Result<T, BoxError> {
         let text = self.text_from_call(method, params).await?;
-        // Route by which of `result`/`error` is non-null: distinguishes
-        // JSON-RPC 2.0 (zebrad/zaino) from 1.0 (zcashd) without a version sniff.
+        // Route on which of `result`/`error` is non-null → 2.0 (zebrad/zaino) vs 1.0
+        // (zcashd) without a version sniff
         let value: serde_json::Value = serde_json::from_str(&text)?;
         let error = value.get("error");
         let has_error = matches!(error, Some(e) if !e.is_null());
@@ -102,24 +88,21 @@ impl AuthedRpc {
     }
 }
 
-/// Build an unauthed JSON-RPC client pointed at an `Endpoint`. Use for zebrad
-/// and indexer JSON-RPC endpoints.
+/// Unauthed JSON-RPC client on an `Endpoint` — zebrad and indexer endpoints
 pub fn json_rpc(endpoint: &Endpoint) -> AuthedRpc {
     AuthedRpc::new(endpoint.socket_addr())
 }
 
-/// Build a JSON-RPC client with HTTP Basic Auth credentials attached.
-/// Use this for zcashd, which rejects unauthed calls.
+/// JSON-RPC client with Basic Auth attached — zcashd, which rejects unauthed calls
 pub fn json_rpc_with_basic_auth(endpoint: &Endpoint, user: &str, password: &str) -> AuthedRpc {
     AuthedRpc::with_basic_auth(endpoint.socket_addr(), user, password)
 }
 
-/// Poll a JSON-RPC endpoint until `method` returns a successful result
-/// (deserialized as `serde_json::Value` and discarded) or the budget elapses.
+/// Poll until `method` returns a successful result (parsed as `Value`, discarded) or the
+/// budget elapses.
 ///
-/// Generic over the method name because the probe varies by backend: zebrad
-/// uses `getblocktemplate`, but zcashd's is gated by `IsInitialBlockDownload`
-/// (never clears on a peer-less regtest chain) so it uses `getinfo`.
+/// Method-generic because the probe varies: zebrad `getblocktemplate`, zcashd `getinfo`
+/// (its `getblocktemplate` is gated on `IsInitialBlockDownload`, never clearing peer-less)
 pub async fn wait_for_rpc_ready(
     client: &AuthedRpc,
     address: SocketAddr,
@@ -129,10 +112,7 @@ pub async fn wait_for_rpc_ready(
 ) -> Result<(), RpcReadinessTimeout> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match client
-            .json_result_from_call::<serde_json::Value>(method, params)
-            .await
-        {
+        match client.json_result_from_call::<serde_json::Value>(method, params).await {
             Ok(_) => return Ok(()),
             Err(e) => {
                 if tokio::time::Instant::now() >= deadline {
@@ -156,12 +136,8 @@ pub struct RpcReadinessTimeout {
     pub last_error: String,
 }
 
-/// Typed JSON-RPC client returned by `ValidatorBackend::json_rpc()` and
-/// `IndexerHandle::json_rpc()`.
-///
-/// Wraps an [`AuthedRpc`] with error attribution (component label) and a
-/// typed-call convenience. Identical type for both validator and
-/// indexer handles, so tests can write generic "compare two clients" logic.
+/// [`AuthedRpc`] + error attribution. One type for validator and indexer handles →
+/// tests can write generic "compare two clients" logic
 #[derive(Debug, Clone)]
 pub struct JsonRpcClient {
     inner: AuthedRpc,
@@ -169,17 +145,12 @@ pub struct JsonRpcClient {
 }
 
 impl JsonRpcClient {
-    /// Build a plain (unauthed) JSON-RPC client. Used for zebrad and indexer
-    /// JSON-RPC endpoints.
+    /// Unauthed — zebrad and indexer JSON-RPC endpoints
     pub(crate) fn new(endpoint: &Endpoint, component: &'static str) -> Self {
-        Self {
-            inner: AuthedRpc::new(endpoint.socket_addr()),
-            component,
-        }
+        Self { inner: AuthedRpc::new(endpoint.socket_addr()), component }
     }
 
-    /// Build a JSON-RPC client that attaches HTTP Basic Auth to every call.
-    /// Used for zcashd.
+    /// HTTP Basic Auth on every call — zcashd
     pub(crate) fn with_basic_auth(
         endpoint: &Endpoint,
         component: &'static str,
@@ -192,15 +163,14 @@ impl JsonRpcClient {
         }
     }
 
-    /// Component label this client attributes errors to.
     pub fn component(&self) -> &'static str {
         self.component
     }
 
-    /// Issue a JSON-RPC call and deserialize the result into `T`.
+    /// Call and deserialize the result into `T`.
     ///
-    /// `params` is a [`serde_json::Value`], typically an array built with the
-    /// [`json!`](serde_json::json) macro: `json!([])` or `json!(["abc", 0])`.
+    /// `params` = a [`serde_json::Value`], usually [`json!`](serde_json::json)-built:
+    /// `json!([])`, `json!(["abc", 0])`
     pub async fn call<T: DeserializeOwned>(
         &self,
         method: &'static str,
@@ -212,27 +182,21 @@ impl JsonRpcClient {
             .map_err(|e| RpcError::backend_boxed(self.component, method, e))
     }
 
-    /// Issue a JSON-RPC call returning the raw `serde_json::Value`.
-    /// For one-off RPCs where the caller wants to pluck fields by hand.
+    /// Raw `serde_json::Value` — one-off RPCs whose fields the caller plucks by hand
     pub async fn call_value(&self, method: &'static str, params: Value) -> Result<Value, RpcError> {
         self.call(method, params).await
     }
 
     // ───────────────────────── chain readers ─────────────────────────
     //
-    // Four facts that tests over a real chain keep needing, and that every
-    // caller otherwise re-derives by hand from a raw `call_value`. They live
-    // here rather than in each suite because each one encodes a detail of how
-    // a validator *serialises* its answer — which upgrade names the RPC uses,
-    // where a pool's running total hangs, which of two `scriptPubKey` shapes
-    // a given release emits — and getting one wrong yields an empty or absent
-    // value that reads as a quiet pass rather than a failure.
+    // Four facts real-chain tests keep re-deriving by hand from `call_value`. Central
+    // because each encodes a *serialisation* detail (upgrade naming, where a pool total
+    // hangs, which `scriptPubKey` shape a release emits) → getting one wrong yields an
+    // absent value that reads as a quiet pass
 
-    /// Chain tip height, from `getblockchaininfo.blocks`.
+    /// Chain tip height, from `getblockchaininfo.blocks`
     pub async fn tip_height(&self) -> Result<u32, RpcError> {
-        let info = self
-            .call_value("getblockchaininfo", Value::Array(vec![]))
-            .await?;
+        let info = self.call_value("getblockchaininfo", Value::Array(vec![])).await?;
         let blocks = info
             .get("blocks")
             .and_then(Value::as_u64)
@@ -243,19 +207,12 @@ impl JsonRpcClient {
     /// Height the validator reports `upgrade_name` activating at, from
     /// `getblockchaininfo.upgrades`.
     ///
-    /// `upgrade_name` is the RPC's display name (`"NU6.3"`), not a manifest
-    /// key (`"nu6_3"`) — see [`Activation::upgrade_name`](crate::Activation::upgrade_name),
-    /// which maps between them.
-    ///
-    /// The running validator is the source of truth for the consensus
-    /// schedule; a manifest's recorded schedule is a claim to be checked
-    /// against it.
+    /// - `upgrade_name` = RPC display name (`"NU6.3"`), not a manifest key (`"nu6_3"`);
+    ///   [`Activation::upgrade_name`](crate::Activation::upgrade_name) maps between them
+    /// - Running validator = source of truth; a manifest schedule is a claim to check
     pub async fn activation_height(&self, upgrade_name: &str) -> Result<u32, RpcError> {
-        let info = self
-            .call_value("getblockchaininfo", Value::Array(vec![]))
-            .await?;
-        // The `upgrades` map is keyed by branch id, so the name is a field of
-        // each entry rather than the key: this is a scan, not a lookup.
+        let info = self.call_value("getblockchaininfo", Value::Array(vec![])).await?;
+        // `upgrades` is keyed by branch id, name lives inside each entry → scan, not lookup
         info.get("upgrades")
             .and_then(Value::as_object)
             .ok_or_else(|| self.shape("getblockchaininfo", "response has no `upgrades` map"))?
@@ -274,13 +231,10 @@ impl JsonRpcClient {
             })
     }
 
-    /// Running total of `pool` as of `height`, from the verbosity-2 block
-    /// object's `valuePools`.
+    /// Running total of `pool` at `height`, from the verbosity-2 block's `valuePools`.
     ///
-    /// Pool values, not transaction counts, are the right instrument for "did
-    /// anything happen in this window": `chainValueZat` integrates over every
-    /// block at or below `height`, so it cannot miss sparse activity the way
-    /// sampling individual blocks can.
+    /// Pool values, not tx counts, answer "did anything happen here": `chainValueZat`
+    /// integrates over every block <= `height` → cannot miss sparse activity
     pub async fn pool_zats(&self, height: u32, pool: &str) -> Result<i64, RpcError> {
         let block = self.get_block_verbose(height).await?;
         block
@@ -303,34 +257,24 @@ impl JsonRpcClient {
             })
     }
 
-    /// The txids and transparent output addresses of one block.
+    /// Txids + transparent output addresses of one block (verbosity 2 carries both).
     ///
-    /// One RPC: verbosity 2 carries both, so nothing further is needed. Every
-    /// block has a coinbase that pays a transparent address and has a txid, so
-    /// this fails rather than returning an empty sample — an empty sample makes
-    /// every comparison drawn from it pass while proving nothing, which is the
-    /// failure mode a differential test exists to avoid.
+    /// Every block's coinbase pays a transparent address and has a txid → an empty
+    /// sample is an error, never a result (it would pass every comparison vacuously)
     pub async fn block_sample(&self, height: u32) -> Result<BlockSample, RpcError> {
         let block = self.get_block_verbose(height).await?;
 
         let mut txids = Vec::new();
         let mut addresses = Vec::new();
-        let txs = block
-            .get("tx")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+        let txs = block.get("tx").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
         for tx in txs {
             match tx {
-                // Some backends return bare txid strings for historical blocks
-                // even at verbosity 2. That still yields a txid; it yields no
-                // addresses, and the emptiness check below catches that.
+                // Some backends emit bare txid strings for historical blocks even at
+                // verbosity 2 → txid but no addresses, caught by the emptiness check
                 Value::String(txid) => txids.push(txid.clone()),
                 Value::Object(_) => {
-                    if let Some(txid) = tx
-                        .get("txid")
-                        .or_else(|| tx.get("hash"))
-                        .and_then(Value::as_str)
+                    if let Some(txid) =
+                        tx.get("txid").or_else(|| tx.get("hash")).and_then(Value::as_str)
                     {
                         txids.push(txid.to_owned());
                     }
@@ -355,53 +299,38 @@ impl JsonRpcClient {
                 ),
             ));
         }
-        Ok(BlockSample {
-            height,
-            txids,
-            addresses,
-        })
+        Ok(BlockSample { height, txids, addresses })
     }
 
-    /// `getblock(height, 2)` — the shared read behind [`pool_zats`] and
-    /// [`block_sample`].
+    /// `getblock(height, 2)` — shared read behind [`pool_zats`] and [`block_sample`].
     ///
-    /// The height goes over the wire as a *string*: the RPC overloads this
-    /// argument on JSON type, reading a number as a height and a string as
-    /// either, and only the string form is accepted by every backend here.
+    /// Height goes over the wire as a *string*: the RPC overloads the argument on JSON
+    /// type, and only the string form is accepted by every backend here.
     ///
     /// [`pool_zats`]: Self::pool_zats
     /// [`block_sample`]: Self::block_sample
     async fn get_block_verbose(&self, height: u32) -> Result<Value, RpcError> {
-        self.call_value("getblock", serde_json::json!([height.to_string(), 2]))
-            .await
+        self.call_value("getblock", serde_json::json!([height.to_string(), 2])).await
     }
 
-    /// A `Decode` error attributed to this client and `op`.
     fn shape(&self, op: &'static str, reason: impl Into<String>) -> RpcError {
         RpcError::decode(self.component, op, reason)
     }
 }
 
-/// The txids and transparent output addresses of one block, from
-/// [`JsonRpcClient::block_sample`].
+/// One block's txids and transparent output addresses, from
+/// [`JsonRpcClient::block_sample`]. `addresses` sorted and deduplicated
 #[derive(Debug, Clone)]
 pub struct BlockSample {
-    /// Height the sample was read from.
     pub height: u32,
-    /// Every txid in the block, in block order (coinbase first).
     pub txids: Vec<String>,
-    /// Every transparent address paid by the block's outputs, sorted and
-    /// deduplicated.
     pub addresses: Vec<String>,
 }
 
 /// Push every transparent address paid by `tx`'s outputs into `out`.
 ///
-/// `scriptPubKey` carries the addresses under `addresses` (an array) in the
-/// long-standing Bitcoin-derived shape, and under `address` (a single string)
-/// in the newer one. Both are accepted: which one a given validator emits is a
-/// serialisation detail, and hard-coding either would silently yield an empty
-/// sample against the other.
+/// Both `scriptPubKey` shapes accepted — `addresses` (array, Bitcoin-derived) and
+/// `address` (string, newer); picking one silently empties the sample against the other
 fn collect_output_addresses(tx: &Value, out: &mut Vec<String>) {
     let Some(vouts) = tx.get("vout").and_then(Value::as_array) else {
         return;
@@ -411,12 +340,7 @@ fn collect_output_addresses(tx: &Value, out: &mut Vec<String>) {
             continue;
         };
         if let Some(addresses) = spk.get("addresses").and_then(Value::as_array) {
-            out.extend(
-                addresses
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned),
-            );
+            out.extend(addresses.iter().filter_map(Value::as_str).map(str::to_owned));
         }
         if let Some(address) = spk.get("address").and_then(Value::as_str) {
             out.push(address.to_owned());
@@ -429,9 +353,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Both `scriptPubKey` shapes must be read. A validator that emits only
-    /// the one this forgot would yield an empty address list, and a sample
-    /// built from it would make every downstream comparison vacuous.
+    /// Both `scriptPubKey` shapes must be read: a validator emitting only the forgotten
+    /// one yields an empty address list → every downstream comparison goes vacuous
     #[test]
     fn output_addresses_are_read_from_both_scriptpubkey_shapes() {
         let tx = json!({

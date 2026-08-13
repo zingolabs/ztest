@@ -1,7 +1,8 @@
-//! Indexer backends: [`IndexerConfig`] is the config ZST (config-time behaviour
-//! plus the factory for a live handle); [`IndexerBackend`] is the live handle's
-//! gRPC contract. Backend-specific RPCs are inherent methods on the concrete
-//! handle, so calling one on the wrong backend is a compile error.
+//! Indexer backends.
+//!
+//! - [`IndexerConfig`] = config ZST: config-time behaviour + factory for a live handle
+//! - [`IndexerBackend`] = the live handle's gRPC contract
+//! - Backend-specific RPCs are inherent methods → wrong-backend call = compile error
 
 use std::time::Duration;
 
@@ -16,9 +17,8 @@ pub use crate::proto::{
     CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo, RawTransaction, SendResponse,
     SubtreeRoot, TreeState,
 };
-// Upstream renamed `ShieldedProtocol` to `ShieldedPool` (deprecated alias) in
-// orchard-0.15; re-export the live enum under the historical name to keep the
-// public API stable and dodge the deprecation warning.
+// orchard-0.15 renamed `ShieldedProtocol` → `ShieldedPool`; re-export under the historical
+// name (stable public API, no deprecation warning)
 pub use zcash_protocol::ShieldedPool as ShieldedProtocol;
 pub use zcash_protocol::TxId;
 pub use zcash_protocol::consensus::BlockHeight;
@@ -26,30 +26,21 @@ pub use zcash_protocol::value::ZatBalance;
 
 // ─────────────────────────── IndexerConfig ──────────────────────────
 
-/// The config ZST handed to the [`Indexer`](crate::component::Indexer)
-/// builder (e.g. `ZainoBackend`): config-time behaviour plus the factory that
-/// produces a live [`IndexerBackend`].
+/// Config ZST for the [`Indexer`](crate::component::Indexer) builder (e.g. `ZainoBackend`):
+/// config-time behaviour + factory for a live [`IndexerBackend`]
 pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
-    /// The live handle type this backend produces.
     type Handle: IndexerBackend + Clone;
 
-    /// Backend-specific tuning tokens handed to
-    /// [`ComponentBuilder::tuning`](crate::ComponentBuilder::tuning) (e.g.
-    /// [`ZainoTuning`](crate::backends::zainod::ZainoTuning)). Backends with
-    /// no knobs use [`NoTuning`](crate::component::NoTuning), whose uninhabited
-    /// type makes `.tuning(..)` uncallable at compile time.
+    /// Tuning tokens for [`ComponentBuilder::tuning`](crate::ComponentBuilder::tuning).
+    /// Knobless backends use [`NoTuning`](crate::component::NoTuning), uninhabited so
+    /// `.tuning(..)` is uncallable at compile time
     type Tuning: Clone + std::fmt::Debug + Send + Sync + 'static;
 
-    /// Build the runtime handle once the env has assigned `plumbing`.
+    /// Build the runtime handle once the env has assigned `plumbing`
     fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
 
-    /// Render the config at build time, once the env has resolved the validator
-    /// host. `tunings` are the tokens the test applied (interpreted per
-    /// backend); `mode` is the network fixture. Called only when `mode` is not
-    /// [`IndexerMode::None`](crate::component::IndexerMode). Returns
-    /// [`EnvError::Config`] for invalid configuration
-    /// (e.g. an unparseable pinned version, or a tuning the backend rejects).
-    /// Default: no-op.
+    /// Render the config at build time, once the validator host resolves. Skipped when
+    /// `mode` is [`IndexerMode::None`](crate::component::IndexerMode)
     fn materialize_opts(
         &self,
         opts: crate::component::ComponentOpts,
@@ -64,27 +55,22 @@ pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
 
 // ─────────────────────────── IndexerBackend ─────────────────────────
 
-/// The live indexer: every gRPC call a test drives it with. The gRPC methods
-/// are all required; the convenience methods at the bottom are composition over
-/// them.
+/// Live indexer: every gRPC call a test drives it with. gRPC methods required, the
+/// conveniences below are composition over them
 #[async_trait]
 pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
-    /// Stable label string for the backend behind this handle.
     fn label(&self) -> &'static str;
 
-    /// Build the Kubernetes `PodSpec` for launching
-    /// this backend from its resolved `opts` and assigned `pod_name`. Each
-    /// backend owns its image, ports, ready port, and security context.
+    /// Per-backend image, ports, ready port, security context
     fn pod_spec(
         &self,
         opts: &crate::component::ComponentOpts,
         pod_name: String,
     ) -> Result<crate::manifest::PodSpec, crate::EnvError>;
 
-    /// Resolve a named endpoint (e.g. `"grpc"`, `"jsonrpc"`).
+    /// Resolve a named endpoint (`"grpc"`, `"jsonrpc"`)
     async fn endpoint(&self, name: &str) -> Result<Endpoint, EnvError>;
 
-    /// Resolve an endpoint by its container port.
     async fn endpoint_for(&self, container_port: u16) -> Result<Endpoint, EnvError>;
 
     async fn latest_block_height(&self) -> Result<BlockHeight, RpcError>;
@@ -135,22 +121,19 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
         exclude_txid_suffixes: Vec<Vec<u8>>,
     ) -> Result<Vec<CompactTx>, RpcError>;
     async fn get_mempool_stream(&self) -> Result<Vec<RawTransaction>, RpcError>;
-    /// Submit a fully-serialized transaction (raw consensus bytes), relayed
-    /// as-is to the indexer's `SendTransaction` RPC. Serializing the tx is the
-    /// wallet integration's job, so the harness needn't link a transaction type.
+    /// Raw consensus bytes relayed as-is to `SendTransaction`. Serializing is the wallet
+    /// integration's job, so the harness links no transaction type
     async fn send_transaction(&self, raw_tx: &[u8]) -> Result<SendResponse, RpcError>;
     async fn get_transaction(&self, txid: TxId) -> Result<RawTransaction, RpcError>;
 
-    // Conveniences: composition over the methods above, implemented per backend.
+    // Conveniences: composition over the above, implemented per backend
 
-    /// The indexer's gRPC URI as a string (`http://host:port`).
+    /// gRPC URI as `http://host:port`
     async fn grpc_uri(&self) -> Result<String, EnvError>;
 
-    /// A raw, persistent gRPC [`Channel`](tonic::transport::Channel) to the
-    /// `grpc` endpoint — opened once and HTTP/2-multiplexed. Every per-RPC method
-    /// on this trait dials a fresh channel per call, which is fine for a one-shot
-    /// assertion but measures connection setup rather than the RPC under load;
-    /// the load harness drives this instead.
+    /// Persistent [`Channel`](tonic::transport::Channel) to `grpc`, opened once and
+    /// HTTP/2-multiplexed. Per-RPC methods dial fresh per call — fine for a one-shot
+    /// assertion, but that measures connection setup, so the load harness drives this
     async fn grpc_channel(&self) -> Result<tonic::transport::Channel, EnvError> {
         tonic::transport::Channel::from_shared(self.grpc_uri().await?)
             .map_err(crate::error::env_err)?
@@ -159,33 +142,28 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
             .map_err(crate::error::env_err)
     }
 
-    /// A cheap-clone [`LwdClient`](crate::loadtest::LwdClient) over a persistent
-    /// channel — the entry point for the load / stress / differential harness in
-    /// [`crate::loadtest`].
+    /// Cheap-clone [`LwdClient`](crate::loadtest::LwdClient) over a persistent channel =
+    /// entry point for [`crate::loadtest`]
     async fn grpc_client(&self) -> Result<crate::loadtest::LwdClient, EnvError> {
         crate::loadtest::LwdClient::connect(self.grpc_uri().await?).await
     }
 
-    /// Typed JSON-RPC client for this indexer's `jsonrpc` endpoint.
+    /// Typed JSON-RPC client for the `jsonrpc` endpoint
     async fn json_rpc(&self) -> Result<JsonRpcClient, EnvError>;
 
-    /// `get_block_range` with the default (empty) pool-type filter.
+    /// `get_block_range` with the default (empty) pool-type filter
     async fn get_block_range(
         &self,
         start: BlockHeight,
         end: BlockHeight,
     ) -> Result<Vec<CompactBlock>, RpcError>;
 
-    /// Wait until the indexer's gRPC `GetLightdInfo` succeeds, or
-    /// `timeout` elapses.
+    /// Wait until `GetLightdInfo` succeeds, or `timeout` elapses
     async fn ready(&self, timeout: Duration) -> Result<(), RpcError>;
 
-    /// Poll until the indexer indexes up to `target`, using the backend's
-    /// default chain-poll timeout.
+    /// Poll until indexed up to `target`, at the backend's default chain-poll timeout
     async fn poll_block_height(&self, target: BlockHeight) -> Result<(), RpcError>;
 
-    /// Poll the indexed height until it reaches `target` or `timeout`
-    /// elapses.
     async fn wait_for_block_num(
         &self,
         target: BlockHeight,

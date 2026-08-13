@@ -1,26 +1,17 @@
-//! Shared text formatting: the number, duration, and gauge vocabulary every
-//! surface in [`ui`](super) draws from.
+//! Shared number / duration / gauge vocabulary for every [`ui`](super) surface.
 //!
-//! These live together because consistency between them *is* the requirement. A
-//! magnitude that reads `1.2k` in a metrics row and `1.23k` on the axis beside
-//! it looks like two different numbers, and the reader has no way to tell that
-//! it is one — which is what happened while these were two private helpers in
-//! two modules.
+//! Together because mutual consistency *is* the requirement: `1.2k` in a metrics row
+//! beside `1.23k` on an axis reads as two numbers with no way to tell it is one
 
 use owo_colors::OwoColorize as _;
 
 use super::Theme;
 
-/// A value abbreviated for a narrow column: `0`, `<0.01`, `0.04`, `0.4`, `912`,
-/// `1.23k`, `138k`, `2.40M`.
+/// Narrow-column value: `0`, `<0.01`, `0.04`, `912`, `1.23k`, `2.40M`.
 ///
-/// Three significant figures at most, so a label can never outgrow its gutter
-/// and push the plot around as the scale changes.
-///
-/// Below one, decimals grow instead, because a fractional rate rendered as `0`
-/// reports a stall that is not happening. That only works down to the point
-/// where the decimals themselves run out, so anything smaller gets `<0.01` — a
-/// bound rather than a rounding, since `0.00` tells the same lie `0` did.
+/// - ≤ 3 significant figures → a label never outgrows its gutter as the scale changes
+/// - Below one, decimals grow; under `0.01` becomes a bound (a fractional rate shown as
+///   `0` reports a stall that is not happening)
 pub fn compact(v: f64) -> String {
     if v == 0.0 {
         return "0".to_string();
@@ -49,11 +40,8 @@ pub fn compact(v: f64) -> String {
     format!("{scaled:.decimals$}{suffix}")
 }
 
-/// A count with thousands separators: `3,120,455`.
-///
-/// The counterpart to [`compact`], for the one place a figure is read as an
-/// identity rather than a magnitude — a block height, where `1.02M` would lose
-/// the digits that make it the height a reader is looking for.
+/// Thousands-separated count `3,120,455` — [`compact`]'s counterpart for a figure read
+/// as identity, not magnitude (a block height, where `1.02M` loses what the reader came for)
 pub fn thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -66,8 +54,7 @@ pub fn thousands(n: u64) -> String {
     out
 }
 
-/// An elapsed duration as `12s` / `1m23s`, matching nextest's `[NNs]` /
-/// `[Nm NNs]` timestamp vocabulary.
+/// Elapsed as `12s` / `1m23s`, matching nextest's `[NNs]` / `[Nm NNs]` vocabulary
 pub fn format_elapsed(d: std::time::Duration) -> String {
     let total = d.as_secs();
     match total < 60 {
@@ -76,48 +63,45 @@ pub fn format_elapsed(d: std::time::Duration) -> String {
     }
 }
 
-/// Column width for a name column: the longest name, clamped, so one very long
-/// name cannot push detail off the right edge.
-pub fn column_width<'a>(names: impl IntoIterator<Item = &'a str>, min: usize, max: usize) -> usize {
-    names
-        .into_iter()
-        .map(|n| n.len())
-        .max()
-        .unwrap_or(0)
-        .clamp(min, max)
+/// Transfer rate `18.1 MiB/s`, IEC to match the byte counts beside it
+pub fn byte_rate(bytes_per_sec: f64) -> String {
+    let clamped = bytes_per_sec.max(0.0) as u64;
+    format!("{}/s", bytesize::ByteSize::b(clamped).display().iec())
 }
 
-/// Width of the bracketed gauge drawn by [`meter`].
+/// `done / total` as one figure when both land in the same magnitude — `2.6/3.9 GiB`,
+/// else `986 MiB / 3.9 GiB`. Shared unit is the common case, and the ~6 columns it
+/// frees are what the right column has to spend
+pub fn byte_pair(done: u64, total: u64) -> String {
+    let iec = |b: u64| bytesize::ByteSize::b(b).display().iec().to_string();
+    let (d, t) = (iec(done), iec(total));
+    match (d.rsplit_once(' '), t.rsplit_once(' ')) {
+        (Some((dn, du)), Some((tn, tu))) if du == tu => format!("{dn}/{tn} {tu}"),
+        _ => format!("{d} / {t}"),
+    }
+}
+
+/// Longest name, clamped → one very long name cannot push detail off the right edge
+pub fn column_width<'a>(names: impl IntoIterator<Item = &'a str>, min: usize, max: usize) -> usize {
+    names.into_iter().map(|n| n.len()).max().unwrap_or(0).clamp(min, max)
+}
+
 pub const METER_WIDTH: usize = 12;
 
-/// A bracketed percentage gauge: `[██████░░░░░░]`.
-///
-/// btop caches all 101 states of its equivalent because each of its cells
-/// carries a gradient escape sequence, so rebuilding one costs a hundred string
-/// concatenations. Ours is two runs and one `format!`, so the cache would be
-/// state to keep in sync for no measurable gain — deliberately not copied.
+/// Bracketed percentage gauge `[██████░░░░░░]`
 pub fn meter(percent: u8, theme: &Theme) -> String {
     let pct = percent.min(100) as usize;
     let filled = pct * METER_WIDTH / 100;
     format!(
         "{}{}{}{}",
         "[".style(theme.styles.dim),
-        theme
-            .chars
-            .bar_fill
-            .repeat(filled)
-            .style(theme.styles.count),
-        theme
-            .chars
-            .bar_empty
-            .repeat(METER_WIDTH - filled)
-            .style(theme.styles.dim),
+        theme.chars.bar_fill.repeat(filled).style(theme.styles.count),
+        theme.chars.bar_empty.repeat(METER_WIDTH - filled).style(theme.styles.dim),
         "]".style(theme.styles.dim),
     )
 }
 
-/// Evenly spaced y-axis labels for `rows` rows, topmost first, right-aligned to
-/// `gutter`.
+/// Evenly spaced y-axis labels, topmost first, right-aligned to `gutter`
 pub fn y_axis(max: f64, rows: usize, gutter: usize) -> Vec<String> {
     (0..rows)
         .map(|r| {
@@ -147,9 +131,8 @@ mod tests {
         assert!(compact(1_234.0).len() <= 6);
     }
 
-    /// A rate below one is still a rate. Rendering it as `0` would report a
-    /// stall that is not happening — and `0.00` tells the same lie, which is why
-    /// the small end becomes a bound rather than a rounding.
+    /// A sub-1 rate is still a rate: `0` (and `0.00`) reports a stall that is not
+    /// happening → the small end is a bound, not a rounding
     #[test]
     fn a_sub_unit_value_never_rounds_down_to_zero() {
         assert_eq!(compact(0.4), "0.4");
@@ -161,6 +144,23 @@ mod tests {
             assert_ne!(compact(v), "0", "{v} rendered as a stall");
             assert!(compact(v).len() <= 6, "{v} outgrew the gutter");
         }
+    }
+
+    #[test]
+    fn a_byte_rate_carries_its_unit_per_second() {
+        assert_eq!(byte_rate(94.0 * 1024.0 * 1024.0), "94.0 MiB/s");
+        assert_eq!(byte_rate(0.0), "0 B/s");
+        assert_eq!(byte_rate(-5.0), "0 B/s", "a negative rate floors, never prints");
+    }
+
+    /// Shared magnitude collapses to one unit; a crossed boundary keeps both, so the
+    /// pair never reads as `986/3.9 GiB`
+    #[test]
+    fn a_byte_pair_shares_a_unit_only_when_both_ends_do() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(byte_pair(2 * GIB + GIB / 2, 4 * GIB), "2.5/4.0 GiB");
+        assert_eq!(byte_pair(986 * 1024 * 1024, 4 * GIB), "986.0 MiB / 4.0 GiB");
+        assert_eq!(byte_pair(0, 0), "0/0 B");
     }
 
     #[test]
@@ -196,8 +196,7 @@ mod tests {
         assert_eq!(column_width([], 3, 10), 3);
     }
 
-    /// Labels descend from the ceiling to zero so the gutter reads top-down
-    /// against the plot beside it.
+    /// Labels descend ceiling → zero, so the gutter reads top-down against the plot
     #[test]
     fn the_y_axis_runs_from_the_ceiling_down_to_zero() {
         let axis = y_axis(100.0, 5, 6);

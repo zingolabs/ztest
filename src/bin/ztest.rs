@@ -1,8 +1,6 @@
-//! `ztest`: primary developer entry point for ztest-managed integration
-//! testing.
+//! `ztest`: developer entry point for ztest-managed integration testing.
 //!
-//! All logic lives in [`ztest::cli`]; this file is the binary shell that hands
-//! control to it.
+//! Binary shell only; all logic lives in [`ztest::cli`].
 
 use std::process::ExitCode;
 

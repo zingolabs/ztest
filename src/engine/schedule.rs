@@ -1,17 +1,13 @@
-//! The capacity-bounded run loop: ztest's 2D [`Scheduler`] is the sole admission
-//! authority. Tests are submitted in priority order; the scheduler grants what
-//! fits the live cluster ceiling and queues the rest. As each child exits, its
-//! lease is released and the freed capacity backfills queued tests, so the
-//! number of concurrently-running tests scales up and down with capacity, with
-//! no artificial thread cap.
+//! Capacity-bounded run loop. 2D [`Scheduler`] = sole admission authority.
 //!
-//! The spawn function is injected so the loop's policy (admit / backfill /
-//! retry / fail-fast) is unit-tested with a fake spawn: no processes, no
-//! cluster.
+//! - Submitted in priority order; what fits the live ceiling is granted, the rest queues
+//! - Child exits → lease released → freed capacity backfills (no artificial thread cap)
+//! - Spawn injected (admit/backfill/retry/fail-fast unit-tested with a fake: no procs, no cluster)
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -24,82 +20,45 @@ use crate::engine::local_runner::TestOutcome;
 use crate::engine::panel::{live_snapshot, run_progress};
 use crate::engine::plan::WorkItem;
 use crate::qos::Resources;
-use crate::qos::governor::RunDemand;
 use crate::qos::live::LiveSnapshot;
-use crate::qos::scheduler::{Admission, LeaseId, RejectReason, Request, Scheduler};
+use crate::qos::scheduler::{Admission, RejectReason, Request, Scheduler, SlotId};
 use crate::resource::{NodeId, NodeState};
 use crate::ui::RunProgress;
 use tokio::sync::watch;
 
-/// Tunables for the run loop.
+/// - `cancel` → stop admitting, drop in-flight futures (`kill_on_drop` reaps the children)
+/// - `resources`: dep `Failed`/`Blocked` → [`SkipReason::DependencyUnavailable`], empty = ungated
+/// - `max_inflight` caps concurrency above capacity admission; `Some(1)` = `--no-capture` serial
+/// - `reservation` = cross-run [`Reservation`](crate::qos::ledger::Reservation); `None` = local run
 #[derive(Debug, Clone)]
 pub struct LoopConfig {
-    /// Stop admitting on the first terminal failure (nextest default).
     pub fail_fast: bool,
-    /// Soft "slow" threshold; `None` disables the SLOW signal.
     pub slow_after: Option<Duration>,
-    /// ServiceAccount the run charges against.
     pub sa: String,
-    /// Render-tick / spinner cadence.
     pub redraw: Duration,
-    /// Run id (for `RunStarted`).
     pub run_id: String,
-    /// Cooperative cancellation (Ctrl-C). When it fires the loop stops admitting
-    /// and drops its in-flight test futures; `kill_on_drop` reaps the children.
     pub cancel: Cancel,
-    /// Resource readiness (node → state) the loop gates admission on: a test
-    /// whose declared dep is `Failed`/`Blocked` is skipped
-    /// (`SkipReason::DependencyUnavailable`) rather than run. Empty ⇒ no gating
-    /// (unit tests, or a run that declared no resources). Provisioning completes
-    /// before the run, so every tracked node is terminal here.
     pub resources: HashMap<NodeId, NodeState>,
-    /// Hard cap on concurrently-running tests, on top of the scheduler's
-    /// capacity admission. `None` = unlimited (the default: concurrency scales
-    /// with cluster capacity). `Some(1)` serializes the run, which `--no-capture`
-    /// requires so a test's streamed output isn't interleaved with another's
-    /// (mirroring nextest's `test_threads = 1` coupling). Scheduler-granted but
-    /// not-yet-spawned tests wait in an ordered ready-queue.
     pub max_inflight: Option<usize>,
-    /// Live admission ceiling from the cross-run
-    /// [`CapacityGovernor`](crate::qos::governor::CapacityGovernor). Each update
-    /// reconciles the scheduler, so concurrency tracks the cluster as other runs
-    /// and the build pod come and go. `None` (local runs, unit tests) pins the
-    /// ceiling at its seed.
     pub cap_rx: Option<watch::Receiver<Resources>>,
-    /// Publishes this run's live demand (committed + queued) to the governor after
-    /// every admission and release, so it can size the run's reservation. `None`
-    /// when there is no governor.
-    pub demand_tx: Option<watch::Sender<RunDemand>>,
+    pub reservation: Option<Arc<crate::qos::ledger::Reservation>>,
 }
 
-/// The cross-run governor's two channels, bundled for the `engine::run`
-/// boundary: the live ceiling the scheduler reconciles from and the demand sink
-/// it feeds back. Absent for local runs and unit tests.
-#[derive(Debug)]
-pub struct CapacityChannels {
-    pub ceiling_rx: watch::Receiver<Resources>,
-    pub demand_tx: watch::Sender<RunDemand>,
-}
-
-/// The live state handed to the per-tick render callback.
+/// Live state handed to the per-tick render callback
 #[derive(Debug)]
 pub struct PanelFrame {
-    /// Per-tier running counts and reserves.
     pub snapshot: LiveSnapshot,
-    /// Pass/fail/elapsed for the QoS panel's progress line.
     pub progress: RunProgress,
-    /// Free cluster capacity (ceiling minus committed).
     pub free: Resources,
-    /// In-flight tests, longest-running first, for the live running region.
     pub running: Vec<RunningView>,
 }
 
-/// Whether a verdict is worth retrying (transient failures, not setup errors).
+/// Transient failure, not a setup error
 fn retryable(v: &Verdict) -> bool {
     matches!(v, Verdict::Fail(_) | Verdict::Timeout)
 }
 
-type BoxedRun = Pin<Box<dyn Future<Output = (LeaseId, TestOutcome)> + Send>>;
+type BoxedRun = Pin<Box<dyn Future<Output = (SlotId, TestOutcome)> + Send>>;
 
 struct Running {
     item: WorkItem,
@@ -108,11 +67,10 @@ struct Running {
     slow_emitted: bool,
 }
 
-/// Drive the run to completion, returning the final stats.
+/// Drive the run to completion.
 ///
-/// `spawn(item, attempt)` produces the future that runs one test; `on_tick`
-/// renders the live panel each redraw interval. The whole loop is single-task
-/// (the `Scheduler` is its sole owner, so no locking).
+/// - `spawn(item, attempt)` = future running one test; `on_tick` renders the panel per redraw
+/// - Single-task ([`Scheduler`] sole owner → no locking)
 pub async fn run_loop<S, F>(
     items: Vec<WorkItem>,
     ceiling: Resources,
@@ -126,37 +84,28 @@ where
     F: Future<Output = TestOutcome> + Send + 'static,
 {
     let total = items.len();
-    let mut stats = RunStats {
-        total,
-        ..RunStats::default()
-    };
+    let mut stats = RunStats { total, ..RunStats::default() };
     let start = Instant::now();
 
     let mut sched = Scheduler::new(ceiling);
-    let mut inflight: HashMap<LeaseId, Running> = HashMap::new();
-    // Identity to (WorkItem, attempt) currently queued in the scheduler, awaiting
-    // a grant. The attempt rides along so a retry that has to wait for capacity
-    // resumes at the right attempt when backfilled (not reset to 1).
+    let mut inflight: HashMap<SlotId, Running> = HashMap::new();
+    // Queued in the scheduler, awaiting a grant. Attempt rides along so a backfilled retry
+    // resumes at it (not reset to 1).
     let mut parked: HashMap<(String, String), (WorkItem, u32)> = HashMap::new();
-    // Scheduler-granted tests holding a lease but not yet spawned, because the
-    // `max_inflight` concurrency cap is currently reached. Ordered so a
-    // serialized run (`--no-capture`) preserves priority/submission order.
-    let mut ready: VecDeque<(LeaseId, WorkItem, u32)> = VecDeque::new();
+    // Granted + lease held, not yet spawned (at `max_inflight`); ordered so a serialized
+    // (`--no-capture`) run keeps priority/submission order.
+    let mut ready: VecDeque<(SlotId, WorkItem, u32)> = VecDeque::new();
     let cap = cfg.max_inflight.unwrap_or(usize::MAX);
     let mut futs: FuturesUnordered<BoxedRun> = FuturesUnordered::new();
     let mut fail_fast_tripped = false;
     let mut cancelled: Option<CancelReason> = None;
 
-    reporter.handle(&TestEvent::RunStarted {
-        total,
-        run_id: &cfg.run_id,
-    });
+    reporter.handle(&TestEvent::RunStarted { total, run_id: &cfg.run_id });
 
-    // Helper to spawn a granted test: push its future and record it inflight.
-    let spawn_granted = |lease: LeaseId,
+    let spawn_granted = |slot: SlotId,
                          item: WorkItem,
                          attempt: u32,
-                         inflight: &mut HashMap<LeaseId, Running>,
+                         inflight: &mut HashMap<SlotId, Running>,
                          futs: &mut FuturesUnordered<BoxedRun>,
                          reporter: &mut dyn RunReporter| {
         reporter.handle(&TestEvent::TestStarted {
@@ -166,21 +115,12 @@ where
             attempt,
         });
         let fut = spawn(item.clone(), attempt);
-        futs.push(Box::pin(async move { (lease, fut.await) }));
-        inflight.insert(
-            lease,
-            Running {
-                item,
-                attempt,
-                started: Instant::now(),
-                slow_emitted: false,
-            },
-        );
+        futs.push(Box::pin(async move { (slot, fut.await) }));
+        inflight
+            .insert(slot, Running { item, attempt, started: Instant::now(), slow_emitted: false });
     };
 
-    // Spawn granted-but-queued tests (FIFO) up to the `max_inflight` cap. A no-op
-    // when uncapped and `ready` was drained on enqueue; the sole gate for a
-    // serialized (`--no-capture`) run.
+    // Spawn granted-but-queued tests FIFO up to `max_inflight` (sole gate for a serialized run)
     macro_rules! pump {
         () => {
             while inflight.len() < cap {
@@ -194,31 +134,22 @@ where
         };
     }
 
-    // Publish this run's live appetite to the cross-run governor so it can size
-    // the reservation. A no-op when there is no governor (local runs, tests).
+    // Live appetite → an elastic reservation sizes itself (no-op for local runs and tests)
     macro_rules! publish_demand {
         () => {
-            if let Some(tx) = &cfg.demand_tx {
-                let _ = tx.send(RunDemand {
-                    committed: sched.committed(),
-                    demand: sched.demand(),
-                });
+            if let Some(r) = &cfg.reservation {
+                r.report_demand(sched.committed(), sched.demand());
             }
         };
     }
 
-    // The governor's live ceiling. Cloned so the loop can await changes while the
-    // config keeps its own handle; `None` (no governor) makes the ceiling arm
-    // idle forever.
+    // Cloned so the loop awaits changes while `cfg` keeps its handle; `None` → ceiling arm idles
     let mut cap_rx = cfg.cap_rx.clone();
 
     // Initial admission sweep (priority order already baked into `items`).
     for item in items {
-        // Resource gate: a test whose declared dependency failed to provision is
-        // SKIPPED cleanly here, before it's ever submitted to the scheduler —
-        // rather than admitted, spawned, and failed at `TestEnv::build()` with a
-        // confusing "resource absent" error. Only tests that actually need the
-        // failed resource are affected; the rest run.
+        // Skipped pre-submission (else admitted, spawned, then dead at `TestEnv::build()` with a
+        // confusing "resource absent")
         if let Some(reason) = unmet_dep(&item, &cfg.resources) {
             reporter.handle(&TestEvent::TestSkipped {
                 binary_id: &item.binary_id,
@@ -250,19 +181,11 @@ where
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     while !futs.is_empty() {
-        // Ctrl-C: stop admitting new tests and retries, but DO NOT drop the
-        // in-flight futures — that would silently discard the tests that were
-        // running. Instead each `spawn_test` future observes the same cancel,
-        // SIGKILLs its process group, and resolves to `Verdict::Terminated`, so
-        // the loop keeps draining `futs` below and reports every in-flight test
-        // (nextest never fabricates results; it lets the real ones land).
-        // Parked/never-started tests are simply not run and show up as the short
-        // `finished/total` ratio in the summary.
-        //
-        // The notice is emitted synchronously here (not from a `select!` arm):
-        // once cancelled, the terminated futures are all immediately ready, so a
-        // `select!` arm might never be polled before `futs` drains — the loop-top
-        // check guarantees the single `RunCancelling` lands before `RunFinished`.
+        // Ctrl-C: stop admitting, but do NOT drop the in-flight futures — each `spawn_test`
+        // observes the same cancel, SIGKILLs its group, resolves `Verdict::Terminated` → every
+        // in-flight test still lands a real result. Synchronous, not a `select!` arm: once
+        // cancelled every future is ready, so the arm may never poll before `futs` drains
+        // (loop-top check → the single `RunCancelling` precedes `RunFinished`).
         if cancelled.is_none() && cfg.cancel.is_cancelled() {
             cancelled = Some(CancelReason::Interrupt);
             reporter.handle(&TestEvent::RunCancelling {
@@ -271,16 +194,13 @@ where
             });
         }
         tokio::select! {
-            // Biased so the cancel waker is polled before `futs`: on the first
-            // signal the loop bounces straight back to the top-of-loop check with
-            // the full in-flight set intact, so the `RunCancelling` notice reports
-            // every running test rather than however many happened to drain first.
-            // When not cancelled this arm is `Pending`, so it never starves `futs`.
+            // Cancel waker before `futs`: the loop bounces to the top-of-loop check with the
+            // in-flight set intact, so `RunCancelling` reports every running test rather than
+            // however many drained first (`Pending` when not cancelled → never starves `futs`)
             biased;
 
-            // Pure waker: bounce the loop back to the top-of-loop check promptly
-            // on the first signal (rather than waiting for the next tick). Disabled
-            // once noticed so it doesn't spin on the latched watch value.
+            // Pure waker → prompt loop-top recheck, no waiting for the next tick. Disabled once
+            // noticed (else spins on the latched watch value).
             _ = cfg.cancel.cancelled(), if cancelled.is_none() => {}
 
             Some((lease, outcome)) = futs.next() => {
@@ -295,7 +215,6 @@ where
                     && !fail_fast_tripped
                     && !cfg.cancel.is_cancelled()
                 {
-                    // Retry: re-request a fresh lease at attempt+1.
                     let next = running.attempt + 1;
                     reporter.handle(&TestEvent::TestRetrying {
                         binary_id: &running.item.binary_id,
@@ -308,9 +227,8 @@ where
                     match sched.request(to_request(&running.item, &cfg.sa)) {
                         Admission::Granted(l) => ready.push_back((l, running.item, next)),
                         Admission::Queued => {
-                            // Re-park carrying the attempt, so when capacity frees
-                            // the retry resumes at `next`, not reset to 1, which
-                            // would let a contended flaky test retry past `retries`.
+                            // Carry the attempt (a reset to 1 lets a contended flaky test
+                            // retry past `retries`)
                             parked.insert(key(&running.item), (running.item, next));
                         }
                         Admission::Rejected(reason) => {
@@ -323,10 +241,8 @@ where
                         }
                     }
                 } else if matches!(outcome.verdict, Verdict::Terminated) {
-                    // Killed in flight by the cancellation, not by anything the
-                    // test did — tallied apart from `failed`, and never allowed
-                    // to trip fail-fast (which exists to stop a run on a real
-                    // failure; the run is already stopping).
+                    // Killed by the cancellation, not by the test → tallied apart from
+                    // `failed`, never trips fail-fast (the run is already stopping)
                     emit_finished(reporter, &running, &outcome);
                     stats.terminated += 1;
                 } else {
@@ -337,16 +253,14 @@ where
                     }
                 }
 
-                // Backfill the freed capacity with queued tests, unless fail-fast
-                // tripped or the run was cancelled, in which case we drain inflight
-                // and admit nothing more. Gated on the authoritative watch flag,
-                // not the local `cancelled`, so a terminated outcome processed in
-                // the same poll that cancel fired can't sneak a parked test in
-                // before the loop-top notice runs.
+                // Backfill the freed capacity, unless fail-fast tripped or the run was
+                // cancelled (then drain inflight, admit nothing). Gated on the authoritative
+                // watch flag, not local `cancelled`: a terminated outcome processed in the
+                // poll that cancel fired must not sneak a parked test in first.
                 if !fail_fast_tripped && !cfg.cancel.is_cancelled() {
                     for g in grants {
                         if let Some((item, attempt)) = parked.remove(&(g.binary_id.clone(), g.test_name.clone())) {
-                            ready.push_back((g.lease_id, item, attempt));
+                            ready.push_back((g.slot_id, item, attempt));
                         }
                     }
                     pump!();
@@ -355,16 +269,15 @@ where
 
                 render_tick(reporter, &inflight, &sched, ceiling, stats, start, &cfg, &mut on_tick);
             }
-            // The governor grew or shrank this run's live ceiling. Reconcile the
-            // scheduler: a grow backfills parked tests into the new headroom; a
-            // shrink stops further admission without preempting running leases
-            // (`Scheduler::reconcile`). Idle forever when there is no governor.
+            // Reservation moved this run's live ceiling: a grow backfills parked tests into
+            // the new headroom, a shrink stops admission without preempting running leases
+            // (`Scheduler::reconcile`). Idles forever with no reservation.
             new_ceiling = next_ceiling(&mut cap_rx) => {
                 let grants = sched.reconcile(new_ceiling);
                 if !fail_fast_tripped && !cfg.cancel.is_cancelled() {
                     for g in grants {
                         if let Some((item, attempt)) = parked.remove(&(g.binary_id.clone(), g.test_name.clone())) {
-                            ready.push_back((g.lease_id, item, attempt));
+                            ready.push_back((g.slot_id, item, attempt));
                         }
                     }
                     pump!();
@@ -388,17 +301,12 @@ where
         }
     }
 
-    reporter.handle(&TestEvent::RunFinished {
-        stats,
-        elapsed: start.elapsed(),
-    });
+    reporter.handle(&TestEvent::RunFinished { stats, elapsed: start.elapsed() });
     stats
 }
 
-/// Await the next value from the governor's live-ceiling channel. Resolves with
-/// the new ceiling on change; pends forever when there is no governor, or once the
-/// governor has gone (a closed channel), so the `select!` arm simply never fires
-/// rather than spinning.
+/// Next value from the reservation's live-ceiling channel. Pends forever with no reservation
+/// or on a closed channel (arm never fires, rather than spinning)
 async fn next_ceiling(rx: &mut Option<watch::Receiver<Resources>>) -> Resources {
     match rx {
         Some(r) => {
@@ -425,7 +333,7 @@ fn emit_finished(reporter: &mut dyn RunReporter, running: &Running, outcome: &Te
 
 fn emit_slows(
     reporter: &mut dyn RunReporter,
-    inflight: &HashMap<LeaseId, Running>,
+    inflight: &HashMap<SlotId, Running>,
     after: Duration,
 ) {
     for r in inflight.values() {
@@ -444,7 +352,7 @@ fn emit_slows(
 #[allow(clippy::too_many_arguments)]
 fn render_tick(
     reporter: &mut dyn RunReporter,
-    inflight: &HashMap<LeaseId, Running>,
+    inflight: &HashMap<SlotId, Running>,
     sched: &Scheduler,
     _ceiling: Resources,
     stats: RunStats,
@@ -452,17 +360,10 @@ fn render_tick(
     cfg: &LoopConfig,
     on_tick: &mut impl FnMut(&mut dyn RunReporter, &PanelFrame),
 ) {
-    let snapshot = live_snapshot(
-        inflight.values().map(|r| &r.item),
-        sched.committed(),
-        &cfg.sa,
-    );
-    // In-flight tests for the live region, longest-running first. Order by the
-    // fixed `started` instant (oldest first) with an identity tiebreak, NOT by
-    // a re-snapshotted `elapsed`: `inflight` is a HashMap (varying iteration
-    // order) and per-test `elapsed()` is measured at slightly different instants
-    // each frame, so sorting on it let near-equal tests swap rows frame-to-frame
-    // (the flicker). `started`/identity never change, so the order is stable.
+    let snapshot = live_snapshot(inflight.values().map(|r| &r.item), sched.committed(), &cfg.sa);
+    // Longest-running first, ordered by fixed `started` + identity tiebreak, NOT by a
+    // re-snapshotted `elapsed`: HashMap iteration order varies and per-frame `elapsed()` is
+    // measured at slightly different instants, so near-equal tests swapped rows (the flicker)
     let mut running: Vec<&Running> = inflight.values().collect();
     running.sort_by(|a, b| {
         a.started
@@ -502,12 +403,8 @@ fn to_request(item: &WorkItem, sa: &str) -> Request {
     }
 }
 
-/// Whether any of a work item's declared resource dependencies is unavailable
-/// (failed to provision, or blocked behind one that did). Returns the skip reason
-/// naming the first such resource; `None` when every dep is ready (or untracked,
-/// which the batch provisioner never leaves in a non-terminal state). `Ready`,
-/// `Pending`, and `Acquiring` are all treated as non-blocking so the loop never
-/// spuriously skips a resource the graph simply didn't record.
+/// First declared dep that failed to provision, or is blocked behind one that did.
+/// `Ready`/`Pending`/`Acquiring`/untracked all non-blocking (never skip on an unrecorded resource)
 fn unmet_dep(item: &WorkItem, resources: &HashMap<NodeId, NodeState>) -> Option<SkipReason> {
     for dep in &item.deps {
         let detail = match resources.get(dep) {
@@ -564,16 +461,12 @@ mod tests {
             resources: HashMap::new(),
             max_inflight: None,
             cap_rx: None,
-            demand_tx: None,
+            reservation: None,
         }
     }
 
     fn pass() -> TestOutcome {
-        TestOutcome {
-            verdict: Verdict::Pass,
-            output: vec![],
-            duration: Duration::from_millis(1),
-        }
+        TestOutcome { verdict: Verdict::Pass, output: vec![], duration: Duration::from_millis(1) }
     }
     fn fail() -> TestOutcome {
         TestOutcome {
@@ -583,7 +476,7 @@ mod tests {
         }
     }
 
-    // A ceiling that fits exactly two Integration tests (3000m each).
+    // Fits exactly two Integration tests (3000m each)
     fn ceiling_two_integration() -> Resources {
         Resources::new(6_000, 6 * crate::qos::GIB, 0, 0)
     }
@@ -612,10 +505,9 @@ mod tests {
 
     #[tokio::test]
     async fn never_overcommits_capacity() {
-        // 6 Integration tests (3000m each), ceiling fits 2 at a time.
-        let items: Vec<_> = (0..6)
-            .map(|i| item(&format!("t{i}"), QosClass::Integration, 0))
-            .collect();
+        // 6 Integration tests (3000m each), ceiling fits 2 at a time
+        let items: Vec<_> =
+            (0..6).map(|i| item(&format!("t{i}"), QosClass::Integration, 0)).collect();
         let peak = Arc::new(Mutex::new(0usize));
         let peak2 = peak.clone();
         let inflight_count = Arc::new(Mutex::new(0usize));
@@ -645,17 +537,14 @@ mod tests {
         )
         .await;
         assert_eq!(stats.passed, 6);
-        // Ceiling fits exactly 2 → never more than 2 running concurrently.
         assert!(*peak.lock().unwrap() <= 2, "peak={}", peak.lock().unwrap());
     }
 
     #[tokio::test]
     async fn max_inflight_one_serializes_despite_capacity() {
-        // A ceiling that fits two Integration tests, but `max_inflight: Some(1)`
-        // (the `--no-capture` coupling) must hold concurrency to one regardless.
-        let items: Vec<_> = (0..5)
-            .map(|i| item(&format!("t{i}"), QosClass::Integration, 0))
-            .collect();
+        // Ceiling fits two, but `max_inflight: Some(1)` (`--no-capture`) must hold it to one
+        let items: Vec<_> =
+            (0..5).map(|i| item(&format!("t{i}"), QosClass::Integration, 0)).collect();
         let peak = Arc::new(Mutex::new(0usize));
         let live = Arc::new(Mutex::new(0usize));
         let (peak2, live2) = (peak.clone(), live.clone());
@@ -685,24 +574,17 @@ mod tests {
         )
         .await;
         assert_eq!(stats.passed, 5, "every test still runs, just serially");
-        assert_eq!(
-            *peak.lock().unwrap(),
-            1,
-            "max_inflight=1 must never run two at once"
-        );
+        assert_eq!(*peak.lock().unwrap(), 1, "max_inflight=1 must never run two at once");
     }
 
     #[tokio::test]
     async fn fail_fast_off_runs_whole_suite_despite_failures() {
-        // Reproduces the scheduling incident (122 selected, only the first
-        // ~9-wide capacity wave ran because the first failure tripped fail-fast
-        // and killed backfill). With fail-fast OFF — now the default — a failing
-        // test still releases its lease and backfills the queue, so EVERY
-        // schedulable test runs even though all of them fail.
+        // Regression: 122 selected, only the first ~9-wide wave ran (first failure tripped
+        // fail-fast, killing backfill). Fail-fast OFF = default → a failing test still
+        // releases its lease and backfills.
         let n = 12;
-        let items: Vec<_> = (0..n)
-            .map(|i| item(&format!("t{i}"), QosClass::Integration, 0))
-            .collect();
+        let items: Vec<_> =
+            (0..n).map(|i| item(&format!("t{i}"), QosClass::Integration, 0)).collect();
         let mut rep = NullReporter;
         let stats = run_loop(
             items,
@@ -713,7 +595,6 @@ mod tests {
             |_, _| {},
         )
         .await;
-        // The whole suite ran (no early halt); all failed; nothing abandoned.
         assert_eq!(stats.finished() as usize, n, "every test must run");
         assert_eq!(stats.failed as usize, n);
         assert_eq!(stats.passed, 0);
@@ -721,10 +602,9 @@ mod tests {
 
     #[tokio::test]
     async fn fail_fast_stops_admission() {
-        // 6 tests, fail-fast on; the first to finish fails → no further admits.
-        let items: Vec<_> = (0..6)
-            .map(|i| item(&format!("t{i}"), QosClass::Integration, 0))
-            .collect();
+        // 6 tests, fail-fast on; first to finish fails → no further admits
+        let items: Vec<_> =
+            (0..6).map(|i| item(&format!("t{i}"), QosClass::Integration, 0)).collect();
         let mut c = cfg();
         c.fail_fast = true;
         let mut rep = NullReporter;
@@ -737,7 +617,7 @@ mod tests {
             |_, _| {},
         )
         .await;
-        // With fail-fast, far fewer than 6 reach a verdict (inflight drains, no backfill).
+        // Inflight drains, no backfill → far fewer than 6 reach a verdict
         assert!(stats.failed >= 1);
         assert!(stats.finished() < 6, "finished={}", stats.finished());
     }
@@ -755,30 +635,19 @@ mod tests {
             &mut rep,
             move |_item, _attempt| {
                 let a = a.clone();
-                async move {
-                    // Fail the first attempt, pass the second.
-                    if a.fetch_add(1, Ordering::SeqCst) == 0 {
-                        fail()
-                    } else {
-                        pass()
-                    }
-                }
+                async move { if a.fetch_add(1, Ordering::SeqCst) == 0 { fail() } else { pass() } }
             },
             |_, _| {},
         )
         .await;
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            2,
-            "should have retried once"
-        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "should have retried once");
         assert_eq!(stats.passed, 1);
         assert_eq!(stats.failed, 0);
     }
 
     #[tokio::test]
     async fn rejects_unschedulable_footprint() {
-        // Sync needs 16000m; a 1000m ceiling can't fit it even empty → Rejected.
+        // Sync needs 16000m; a 1000m ceiling cannot fit it even empty → Rejected
         let mut rep = NullReporter;
         let stats = run_loop(
             vec![item("huge", QosClass::Sync, 0)],
@@ -793,19 +662,13 @@ mod tests {
         assert_eq!(stats.passed, 0);
     }
 
-    /// Records, from the injected spawn, the exact spawn order (synchronously, so
-    /// it reflects the scheduler's admission order) and the live/peak concurrency
-    /// per tier (across the future's lifetime), plus whether the live footprint
-    /// ever exceeded the ceiling.
+    /// Spawn order (recorded synchronously = admission order), per-tier live/peak concurrency,
+    /// and whether Σ(live footprints) ever exceeded the ceiling
     #[derive(Default)]
     struct ConcRec {
-        /// Class of each test in the order the loop spawned it.
         order: Vec<QosClass>,
-        /// Currently-running count per tier.
         live: std::collections::BTreeMap<QosClass, usize>,
-        /// Peak concurrent count per tier over the whole run.
         max_live: std::collections::BTreeMap<QosClass, usize>,
-        /// Set if Σ(live footprints) ever exceeded the ceiling.
         overcommit: bool,
     }
 
@@ -836,10 +699,7 @@ mod tests {
         }
     }
 
-    /// An injected spawn that feeds a [`ConcRec`]: records spawn order
-    /// synchronously (so it mirrors the scheduler's admission order), tracks
-    /// live/peak concurrency, flags any overcommit, and dwells `dwell` so
-    /// concurrently-admitted tests genuinely overlap in time. Always passes.
+    /// Injected spawn feeding a [`ConcRec`], always passing; dwells so co-admitted tests overlap
     fn recording_spawn(
         rec: Arc<Mutex<ConcRec>>,
         ceiling: Resources,
@@ -858,25 +718,17 @@ mod tests {
         }
     }
 
-    /// Dynamic scale-up: with heavy (Testnet) and light (Integration) tests both
-    /// queued, the scheduler runs the heavy tier first (a few at a time, capped by
-    /// capacity); as the heavy tests drain, concurrency automatically ramps up
-    /// because each light test reserves far less — exactly the live behaviour
-    /// ("2-3 testnet at a time, then 6-10 integration once the heavy ones finish").
+    /// Heavy (Testnet) tier runs first, capacity-capped; as it drains, light (Integration)
+    /// concurrency ramps up — live: "2-3 testnet at a time, then 6-10 integration"
     #[tokio::test]
     async fn concurrency_ramps_up_as_heavy_tier_drains() {
         let t = QosClass::Testnet.profile().footprint;
         let i = QosClass::Integration.profile().footprint;
-        // Room for 3 Testnet + 1 Integration: a few heavy tests, with one light
-        // test backfilling the leftover capacity.
-        let ceiling = Resources::new(
-            3 * t.cpu_milli + i.cpu_milli,
-            3 * t.mem_bytes + i.mem_bytes,
-            0,
-            0,
-        );
+        // Room for 3 Testnet + 1 Integration backfilling the leftover
+        let ceiling =
+            Resources::new(3 * t.cpu_milli + i.cpu_milli, 3 * t.mem_bytes + i.mem_bytes, 0, 0);
 
-        // Submitted heavy-first (as `build_work_list` orders them in production).
+        // Heavy-first, as `build_work_list` orders them in production
         let mut items = vec![
             item("net0", QosClass::Testnet, 0),
             item("net1", QosClass::Testnet, 0),
@@ -885,7 +737,7 @@ mod tests {
         items.extend((0..12).map(|n| item(&format!("int{n}"), QosClass::Integration, 0)));
 
         let rec = Arc::new(Mutex::new(ConcRec::default()));
-        let dwell = Duration::from_millis(25); // overlap so true concurrency is observed
+        let dwell = Duration::from_millis(25); // overlap → true concurrency observed
         let mut rep = NullReporter;
         let stats = run_loop(
             items,
@@ -899,25 +751,16 @@ mod tests {
 
         assert_eq!(stats.passed, 15);
         let g = rec.lock().unwrap();
-        assert!(
-            !g.overcommit,
-            "running footprint must never exceed the ceiling"
-        );
-        // Heavy tier first AND capped by capacity: the first three to start are
-        // Testnet (not 13 Integration packed in, which is what ignoring priority
-        // would do), and never more than 3 Testnet run at once.
+        assert!(!g.overcommit, "running footprint must never exceed the ceiling");
+        // Testnet first, ≤3 at once (ignoring priority would pack 13 Integration in)
         assert_eq!(
-            g.order
-                .iter()
-                .take_while(|c| **c == QosClass::Testnet)
-                .count(),
+            g.order.iter().take_while(|c| **c == QosClass::Testnet).count(),
             3,
             "heavy tier should start first; order={:?}",
             g.order
         );
         assert_eq!(g.peak(QosClass::Testnet), 3);
-        // Once the heavy tier drains, light-tier concurrency ramps far past the
-        // heavy cap (down-scaling on heavy, up-scaling on light = dynamic).
+        // Light tier ramps far past the heavy cap = dynamic scaling
         let int_peak = g.peak(QosClass::Integration);
         assert!(
             int_peak >= 6,
@@ -925,11 +768,8 @@ mod tests {
         );
     }
 
-    /// Tier prioritisation through the loop: with a ceiling that fits one Sync at
-    /// a time, everything else queues; as capacity frees, the scheduler backfills
-    /// strictly highest-priority first. The lower tiers are *submitted earlier*
-    /// than Testnet, so only the scheduler's priority — not submission order — can
-    /// produce the descending-priority start order.
+    /// One-Sync ceiling → everything else queues, backfilled strictly highest-priority first.
+    /// Lower tiers submitted *earlier* than Testnet (only priority can order the starts)
     #[tokio::test]
     async fn higher_tiers_backfill_before_lower_even_when_queued_earlier() {
         let ceiling = QosClass::Sync.profile().footprint; // one Sync at a time
@@ -958,18 +798,13 @@ mod tests {
 
         assert_eq!(stats.passed, 7);
         let g = rec.lock().unwrap();
-        assert!(
-            !g.overcommit,
-            "running footprint must never exceed the ceiling"
-        );
+        assert!(!g.overcommit, "running footprint must never exceed the ceiling");
         let first = |c: QosClass| {
             g.order
                 .iter()
                 .position(|x| *x == c)
                 .unwrap_or_else(|| panic!("tier {c:?} never ran; order={:?}", g.order))
         };
-        // Sync (it took the initial slot) → Testnet → Integration → Basic, despite
-        // Basic/Integration being submitted before Testnet.
         assert!(
             first(QosClass::Sync) < first(QosClass::Testnet)
                 && first(QosClass::Testnet) < first(QosClass::Integration)
@@ -979,11 +814,8 @@ mod tests {
         );
     }
 
-    /// Retry under contention: with a one-Integration ceiling, a flaky test's
-    /// retry must queue behind `hog`, so it goes through the re-park path. The
-    /// attempt must be preserved across that wait — a flaky test with `retries=1`
-    /// runs at most attempts 1 then 2 (the pre-fix bug reset the attempt to 1 on
-    /// backfill, producing an extra, over-limit `[1, 1, 2]` run).
+    /// One-Integration ceiling → the retry queues behind `hog`, taking the re-park path; the
+    /// attempt must survive that wait (pre-fix reset to 1 gave an over-limit `[1, 1, 2]`)
     #[tokio::test]
     async fn retry_under_contention_preserves_attempt_count() {
         let ceiling = QosClass::Integration.profile().footprint; // one slot
@@ -991,16 +823,12 @@ mod tests {
         let r = runs.clone();
         let mut rep = NullReporter;
         let stats = run_loop(
-            vec![
-                item("flaky", QosClass::Integration, 1),
-                item("hog", QosClass::Integration, 0),
-            ],
+            vec![item("flaky", QosClass::Integration, 1), item("hog", QosClass::Integration, 0)],
             ceiling,
             cfg(),
             &mut rep,
             move |it: WorkItem, attempt| {
                 r.lock().unwrap().push((it.test_name.clone(), attempt));
-                // `flaky` fails its first attempt, passes from the second on.
                 let is_fail = it.test_name == "flaky" && attempt < 2;
                 async move { if is_fail { fail() } else { pass() } }
             },
@@ -1009,66 +837,32 @@ mod tests {
         .await;
 
         let runs = runs.lock().unwrap();
-        let flaky: Vec<u32> = runs
-            .iter()
-            .filter(|(n, _)| n == "flaky")
-            .map(|(_, a)| *a)
-            .collect();
-        assert_eq!(
-            flaky,
-            vec![1, 2],
-            "flaky must run exactly twice: attempts 1 then 2"
-        );
+        let flaky: Vec<u32> = runs.iter().filter(|(n, _)| n == "flaky").map(|(_, a)| *a).collect();
+        assert_eq!(flaky, vec![1, 2], "flaky must run exactly twice: attempts 1 then 2");
         assert_eq!(stats.passed, 2);
         assert_eq!(stats.failed, 0);
     }
 
     // ── Event-stream contract ──────────────────────────────────────────────
     //
-    // `TestEvent` borrows its identity/output, so a reporter that retains events
-    // must copy them. `RecordingReporter` keeps an owned, comparable mirror so
-    // tests can assert the exact lifecycle the loop emits — the contract the real
-    // `StyledReporter` (and any future JUnit writer) consume but which
-    // `NullReporter` silently drops.
+    // `TestEvent` borrows its identity/output → a retaining reporter must copy.
+    // `RecordingReporter` mirrors it owned, so tests assert the exact lifecycle
+    // `StyledReporter` (and any future JUnit writer) consume and `NullReporter` drops.
 
-    /// An owned, comparable mirror of one [`TestEvent`].
+    /// Owned, comparable mirror of one [`TestEvent`]
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Ev {
-        RunStarted {
-            total: usize,
-        },
-        Started {
-            test_name: String,
-            class: QosClass,
-            attempt: u32,
-        },
-        Slow {
-            test_name: String,
-            will_terminate: bool,
-        },
-        Retrying {
-            test_name: String,
-            next_attempt: u32,
-        },
-        Finished {
-            test_name: String,
-            verdict: Verdict,
-            output: Vec<u8>,
-        },
-        Skipped {
-            test_name: String,
-            reason: SkipReason,
-        },
-        Cancelling {
-            reason: CancelReason,
-            running: usize,
-        },
-        RunFinished {
-            stats: RunStats,
-        },
+        RunStarted { total: usize },
+        Started { test_name: String, class: QosClass, attempt: u32 },
+        Slow { test_name: String, will_terminate: bool },
+        Retrying { test_name: String, next_attempt: u32 },
+        Finished { test_name: String, verdict: Verdict, output: Vec<u8> },
+        Skipped { test_name: String, reason: SkipReason },
+        Cancelling { reason: CancelReason, running: usize },
+        RunFinished { stats: RunStats },
     }
 
-    /// The test identity an event refers to (`None` for run-level events).
+    /// Test identity an event refers to (`None` = run-level)
     fn ev_name(e: &Ev) -> Option<&str> {
         match e {
             Ev::Started { test_name, .. }
@@ -1080,19 +874,15 @@ mod tests {
         }
     }
 
-    /// A reporter that records every event in emission order for assertion.
+    /// Records every event in emission order
     #[derive(Default)]
     struct RecordingReporter {
         events: Vec<Ev>,
     }
 
     impl RecordingReporter {
-        /// Events for one test, in emission order.
         fn of(&self, name: &str) -> Vec<&Ev> {
-            self.events
-                .iter()
-                .filter(|e| ev_name(e) == Some(name))
-                .collect()
+            self.events.iter().filter(|e| ev_name(e) == Some(name)).collect()
         }
     }
 
@@ -1100,52 +890,28 @@ mod tests {
         fn handle(&mut self, ev: &TestEvent<'_>) {
             let owned = match ev {
                 TestEvent::RunStarted { total, .. } => Ev::RunStarted { total: *total },
-                TestEvent::TestStarted {
-                    test_name,
-                    class,
-                    attempt,
-                    ..
-                } => Ev::Started {
+                TestEvent::TestStarted { test_name, class, attempt, .. } => Ev::Started {
                     test_name: test_name.to_string(),
                     class: *class,
                     attempt: *attempt,
                 },
-                TestEvent::TestSlow {
-                    test_name,
-                    will_terminate,
-                    ..
-                } => Ev::Slow {
-                    test_name: test_name.to_string(),
-                    will_terminate: *will_terminate,
-                },
-                TestEvent::TestRetrying {
-                    test_name,
-                    next_attempt,
-                    ..
-                } => Ev::Retrying {
-                    test_name: test_name.to_string(),
-                    next_attempt: *next_attempt,
-                },
-                TestEvent::TestFinished {
-                    test_name,
-                    verdict,
-                    output,
-                    ..
-                } => Ev::Finished {
+                TestEvent::TestSlow { test_name, will_terminate, .. } => {
+                    Ev::Slow { test_name: test_name.to_string(), will_terminate: *will_terminate }
+                }
+                TestEvent::TestRetrying { test_name, next_attempt, .. } => {
+                    Ev::Retrying { test_name: test_name.to_string(), next_attempt: *next_attempt }
+                }
+                TestEvent::TestFinished { test_name, verdict, output, .. } => Ev::Finished {
                     test_name: test_name.to_string(),
                     verdict: verdict.clone(),
                     output: output.to_vec(),
                 },
-                TestEvent::TestSkipped {
-                    test_name, reason, ..
-                } => Ev::Skipped {
-                    test_name: test_name.to_string(),
-                    reason: reason.clone(),
-                },
-                TestEvent::RunCancelling { reason, running } => Ev::Cancelling {
-                    reason: *reason,
-                    running: *running,
-                },
+                TestEvent::TestSkipped { test_name, reason, .. } => {
+                    Ev::Skipped { test_name: test_name.to_string(), reason: reason.clone() }
+                }
+                TestEvent::RunCancelling { reason, running } => {
+                    Ev::Cancelling { reason: *reason, running: *running }
+                }
                 TestEvent::RunFinished { stats, .. } => Ev::RunFinished { stats: *stats },
             };
             self.events.push(owned);
@@ -1155,15 +921,11 @@ mod tests {
         }
     }
 
-    /// The stream brackets the run with exactly one `RunStarted` (first) and one
-    /// `RunFinished` (last), and every test contributes exactly one start paired
-    /// with one terminal finish.
+    /// Exactly one `RunStarted` first + one `RunFinished` last; every test = one start paired
+    /// with one terminal finish
     #[tokio::test]
     async fn event_stream_brackets_run_and_pairs_start_with_finish() {
-        let items = vec![
-            item("a", QosClass::Integration, 0),
-            item("b", QosClass::Integration, 0),
-        ];
+        let items = vec![item("a", QosClass::Integration, 0), item("b", QosClass::Integration, 0)];
         let mut rep = RecordingReporter::default();
         let stats = run_loop(
             items,
@@ -1178,18 +940,8 @@ mod tests {
 
         let ev = &rep.events;
         assert!(matches!(ev.first(), Some(Ev::RunStarted { total: 2 })));
-        assert_eq!(
-            ev.iter()
-                .filter(|e| matches!(e, Ev::RunStarted { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            ev.iter()
-                .filter(|e| matches!(e, Ev::RunFinished { .. }))
-                .count(),
-            1
-        );
+        assert_eq!(ev.iter().filter(|e| matches!(e, Ev::RunStarted { .. })).count(), 1);
+        assert_eq!(ev.iter().filter(|e| matches!(e, Ev::RunFinished { .. })).count(), 1);
         match ev.last() {
             Some(Ev::RunFinished { stats }) => {
                 assert_eq!(stats.passed, 2);
@@ -1200,27 +952,13 @@ mod tests {
         for name in ["a", "b"] {
             let evs = rep.of(name);
             assert_eq!(evs.len(), 2, "{name}: {evs:?}");
-            assert!(matches!(
-                evs[0],
-                Ev::Started {
-                    attempt: 1,
-                    class: QosClass::Integration,
-                    ..
-                }
-            ));
-            assert!(matches!(
-                evs[1],
-                Ev::Finished {
-                    verdict: Verdict::Pass,
-                    ..
-                }
-            ));
+            assert!(matches!(evs[0], Ev::Started { attempt: 1, class: QosClass::Integration, .. }));
+            assert!(matches!(evs[1], Ev::Finished { verdict: Verdict::Pass, .. }));
         }
     }
 
-    /// A retried attempt emits `Retrying` (not `Finished`) and the rerun emits a
-    /// fresh `Started` at the next attempt; only the terminal pass emits
-    /// `Finished`. This is the subtle contract `NullReporter` hid.
+    /// Retried attempt emits `Retrying`, not `Finished`; the rerun emits a fresh `Started` at
+    /// the next attempt (only the terminal pass emits `Finished`)
     #[tokio::test]
     async fn retry_emits_retrying_then_restart_without_finishing_failed_attempt() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1234,13 +972,7 @@ mod tests {
             &mut rep,
             move |_it, _a| {
                 let a = a.clone();
-                async move {
-                    if a.fetch_add(1, Ordering::SeqCst) == 0 {
-                        fail()
-                    } else {
-                        pass()
-                    }
-                }
+                async move { if a.fetch_add(1, Ordering::SeqCst) == 0 { fail() } else { pass() } }
             },
             |_, _| {},
         )
@@ -1250,25 +982,13 @@ mod tests {
         let evs = rep.of("flaky");
         assert_eq!(evs.len(), 4, "{evs:?}");
         assert!(matches!(evs[0], Ev::Started { attempt: 1, .. }));
-        assert!(matches!(
-            evs[1],
-            Ev::Retrying {
-                next_attempt: 2,
-                ..
-            }
-        ));
+        assert!(matches!(evs[1], Ev::Retrying { next_attempt: 2, .. }));
         assert!(matches!(evs[2], Ev::Started { attempt: 2, .. }));
-        assert!(matches!(
-            evs[3],
-            Ev::Finished {
-                verdict: Verdict::Pass,
-                ..
-            }
-        ));
+        assert!(matches!(evs[3], Ev::Finished { verdict: Verdict::Pass, .. }));
     }
 
-    /// An unschedulable test emits exactly one `Skipped` (with the reason) and
-    /// never a `Started`; the run still closes with `RunFinished`.
+    /// Unschedulable test = exactly one `Skipped` with reason, never a `Started`; run still
+    /// closes with `RunFinished`
     #[tokio::test]
     async fn unschedulable_emits_skipped_with_reason_and_never_starts() {
         let mut rep = RecordingReporter::default();
@@ -1284,13 +1004,7 @@ mod tests {
 
         let evs = rep.of("huge");
         assert_eq!(evs.len(), 1);
-        assert!(matches!(
-            evs[0],
-            Ev::Skipped {
-                reason: SkipReason::ExceedsClusterCapacity,
-                ..
-            }
-        ));
+        assert!(matches!(evs[0], Ev::Skipped { reason: SkipReason::ExceedsClusterCapacity, .. }));
         assert!(
             !rep.events.iter().any(|e| matches!(e, Ev::Started { .. })),
             "a skipped test must never start"
@@ -1301,10 +1015,8 @@ mod tests {
         ));
     }
 
-    /// The resource gate: a test whose declared dependency failed to provision is
-    /// SKIPPED with `DependencyUnavailable` and never started, while a test that
-    /// doesn't need the failed resource still runs. This is the "slow/broken
-    /// archive sidelines only its dependents" guarantee at the loop level.
+    /// Failed dep → `DependencyUnavailable` skip, never started; a test not needing it still
+    /// runs ("a broken archive sidelines only its dependents", at loop level)
     #[tokio::test]
     async fn dependency_failure_skips_only_dependent_tests() {
         use crate::resource::{NodeId, NodeState};
@@ -1315,8 +1027,7 @@ mod tests {
         let free = item("free", QosClass::Integration, 0);
 
         let mut c = cfg();
-        c.resources
-            .insert(dep, NodeState::Failed("docker build failed".into()));
+        c.resources.insert(dep, NodeState::Failed("docker build failed".into()));
 
         let mut rep = RecordingReporter::default();
         let stats = run_loop(
@@ -1333,16 +1044,11 @@ mod tests {
         assert_eq!(stats.skipped, 1, "the dependent test is skipped, not run");
         assert_eq!(stats.failed, 0);
 
-        // The dependent test emits exactly one Skipped (with the reason) and never
-        // a Started; the free test runs normally and is never skipped.
         let dependent = rep.of("needs_img");
         assert!(
             matches!(
                 dependent.as_slice(),
-                [Ev::Skipped {
-                    reason: SkipReason::DependencyUnavailable { .. },
-                    ..
-                }]
+                [Ev::Skipped { reason: SkipReason::DependencyUnavailable { .. }, .. }]
             ),
             "{dependent:?}"
         );
@@ -1354,15 +1060,12 @@ mod tests {
             "a dependency-skipped test must never start"
         );
         assert!(
-            rep.of("free")
-                .iter()
-                .any(|e| matches!(e, Ev::Finished { .. })),
+            rep.of("free").iter().any(|e| matches!(e, Ev::Finished { .. })),
             "the free test must finish"
         );
     }
 
-    /// The terminal `Finished` event carries the child's captured output, so the
-    /// reporter can replay it on failure.
+    /// Terminal `Finished` carries the child's captured output (reporter replays it on failure)
     #[tokio::test]
     async fn finished_event_carries_captured_output_for_replay() {
         let mut rep = RecordingReporter::default();
@@ -1383,14 +1086,9 @@ mod tests {
         .await;
 
         let evs = rep.of("noisy");
-        let fin = evs
-            .iter()
-            .find(|e| matches!(e, Ev::Finished { .. }))
-            .expect("a Finished event");
+        let fin = evs.iter().find(|e| matches!(e, Ev::Finished { .. })).expect("a Finished event");
         match fin {
-            Ev::Finished {
-                verdict, output, ..
-            } => {
+            Ev::Finished { verdict, output, .. } => {
                 assert_eq!(*verdict, Verdict::Fail(2));
                 assert_eq!(String::from_utf8_lossy(output), "boom-output");
             }
@@ -1398,10 +1096,8 @@ mod tests {
         }
     }
 
-    /// Ctrl-C mid-run: the tests that were in flight must be reported terminated
-    /// and counted (as failures) — not silently dropped — while tests that never
-    /// started are simply not run (short `finished/total`). This is the bug the
-    /// old `break` caused: in-flight tests vanished from the summary entirely.
+    /// Ctrl-C mid-run: in-flight tests reported terminated + counted, never-started ones simply
+    /// not run (short `finished/total`) — the old `break` vanished them from the summary
     #[tokio::test]
     async fn cancel_reports_inflight_as_terminated_and_leaves_rest_unrun() {
         use crate::cancel::CancelSource;
@@ -1410,10 +1106,9 @@ mod tests {
         let mut c = cfg();
         c.cancel = cancel.clone();
 
-        // Four Integration tests; the ceiling fits two → two run, two park.
-        let items: Vec<_> = (0..4)
-            .map(|i| item(&format!("t{i}"), QosClass::Integration, 0))
-            .collect();
+        // Four Integration tests, ceiling fits two → two run, two park
+        let items: Vec<_> =
+            (0..4).map(|i| item(&format!("t{i}"), QosClass::Integration, 0)).collect();
 
         let mut rep = RecordingReporter::default();
         let mut fired = false;
@@ -1423,8 +1118,7 @@ mod tests {
             c,
             &mut rep,
             move |_it, _a| {
-                // A child that only ends when the run is cancelled — mirrors
-                // `spawn_test`, which SIGKILLs its group and returns `Terminated`.
+                // Ends only on cancel — mirrors `spawn_test` (SIGKILL group → `Terminated`)
                 let cancel = cancel.clone();
                 async move {
                     cancel.cancelled().await;
@@ -1435,9 +1129,8 @@ mod tests {
                     }
                 }
             },
-            // Fire cancel deterministically once both tests are confirmed in
-            // flight (rather than on a racy wall-clock delay): they only complete
-            // after cancellation, so the first tick sees exactly two running.
+            // Deterministic, not a racy wall-clock delay: tests complete only after cancel,
+            // so the first tick showing 2 running is exactly both in flight
             move |_rep, frame| {
                 if !fired && frame.running.len() == 2 {
                     fired = true;
@@ -1447,9 +1140,6 @@ mod tests {
         )
         .await;
 
-        // The two in-flight tests are terminated, tallied apart from `failed`
-        // (nobody's code failed — the operator hit Ctrl-C); the two parked ones
-        // never ran, so the run closes short of its total.
         assert_eq!(stats.terminated, 2, "in-flight tests must be reported");
         assert_eq!(stats.failed, 0, "a kill is not a failure");
         assert_eq!(stats.passed, 0);
@@ -1458,45 +1148,23 @@ mod tests {
         assert_eq!(stats.not_run(), 2, "the parked tests are accounted for");
         assert!(stats.any_failed(), "a cancelled run still exits non-zero");
 
-        // Exactly one cancellation notice, and it names the two running tests.
-        let cancels: Vec<_> = rep
-            .events
-            .iter()
-            .filter(|e| matches!(e, Ev::Cancelling { .. }))
-            .collect();
+        let cancels: Vec<_> =
+            rep.events.iter().filter(|e| matches!(e, Ev::Cancelling { .. })).collect();
         assert_eq!(cancels.len(), 1, "exactly one RunCancelling");
         assert!(matches!(
             cancels[0],
-            Ev::Cancelling {
-                reason: CancelReason::Interrupt,
-                running: 2
-            }
+            Ev::Cancelling { reason: CancelReason::Interrupt, running: 2 }
         ));
 
-        // Both in-flight tests emitted a terminal Finished{Terminated}, and the
-        // run still closes with RunFinished last.
         let terminated = rep
             .events
             .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    Ev::Finished {
-                        verdict: Verdict::Terminated,
-                        ..
-                    }
-                )
-            })
+            .filter(|e| matches!(e, Ev::Finished { verdict: Verdict::Terminated, .. }))
             .count();
         assert_eq!(terminated, 2, "each in-flight test reports terminated");
         assert!(matches!(rep.events.last(), Some(Ev::RunFinished { .. })));
 
-        // No parked test was admitted after cancellation: exactly two ever started.
-        let started = rep
-            .events
-            .iter()
-            .filter(|e| matches!(e, Ev::Started { .. }))
-            .count();
+        let started = rep.events.iter().filter(|e| matches!(e, Ev::Started { .. })).count();
         assert_eq!(started, 2, "cancellation stops admitting new tests");
     }
 }

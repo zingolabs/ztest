@@ -1,12 +1,9 @@
-//! `ztest replay`: re-render a previously recorded run without re-executing it,
-//! mirroring `cargo nextest replay`. The run is selected by `-R/--run-id`
-//! (`latest` by default, or a run-id / unambiguous prefix / recording path), and
-//! the reporter options ([`ReporterCommonOpts`]) can be overridden so the same
-//! recording can be re-viewed with different output settings.
+//! `ztest replay`: re-render a recorded run without re-executing it (mirrors
+//! `cargo nextest replay`).
 //!
-//! Replay is a subcommand, not a `run` flag, for the same reason nextest made it
-//! one: it bypasses preflight, build, and the cluster entirely — it only reads
-//! the recording and drives the reporter.
+//! - Run picked by `-R/--run-id`: `latest` / run-id / unambiguous prefix / path
+//! - [`ReporterCommonOpts`] overridable → same recording, different output settings
+//! - Subcommand not a `run` flag (bypasses preflight, build & cluster entirely)
 
 use std::process::ExitCode;
 
@@ -65,9 +62,8 @@ pub struct ReporterCommonOpts {
 }
 
 impl ReporterCommonOpts {
-    /// Resolve the captured-output display policy. `--no-capture` forces
-    /// immediate display for both pass and fail (nextest's preset). An invalid
-    /// `--success/failure-output` value warns and falls back to the default.
+    /// Captured-output display policy. `--no-capture` = immediate for both
+    /// pass & fail (nextest preset); an invalid value warns → default
     fn output_config(&self, no_capture: bool) -> OutputConfig {
         let default = OutputConfig::default();
         let mut cfg = OutputConfig {
@@ -82,8 +78,7 @@ impl ReporterCommonOpts {
     }
 }
 
-/// Parse a `--success/failure-output` value, warning and returning `default` on
-/// an invalid one.
+/// Parse a `--success/failure-output` value; invalid → warn + `default`
 fn parse_display(
     value: &Option<String>,
     default: crate::engine::output::TestOutputDisplay,
@@ -97,8 +92,7 @@ fn parse_display(
     }
 }
 
-/// Resolve the colour decision from `--color`, honouring terminal support for
-/// `auto`.
+/// `--color` decision; `auto` defers to terminal support
 fn resolve_color(opt: Option<&str>) -> bool {
     match opt {
         Some("always") => true,

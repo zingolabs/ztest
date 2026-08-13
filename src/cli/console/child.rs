@@ -1,8 +1,7 @@
-//! Work-side subprocess runner: spawn a child under a PTY and stream its raw
-//! bytes to the render thread. A PTY (not a pipe) keeps the child's native
-//! colour + in-place progress bars intact, since those emit only when a TTY is
-//! detected. Off a TTY (no [`Console`]), the child inherits stdio for the plain
-//! CI log.
+//! Work-side subprocess runner: child under a PTY, raw bytes → render thread.
+//!
+//! - PTY not pipe (child's native colour + in-place progress bars are TTY-gated)
+//! - No [`Console`] → child inherits stdio, plain CI log
 
 use std::io::{self, Read};
 
@@ -10,13 +9,11 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use super::Console;
 
-/// Run `program args` to completion. With a [`Console`], the child runs under a
-/// PTY emulated into the session's live region; without one, it inherits stdio.
-/// Returns the child's exit code (`130` when a forwarded Ctrl-C killed it).
+/// Run `program args` to completion → exit code (`130` = forwarded Ctrl-C).
 ///
-/// The reader thread is joined before returning, so every `Output` is enqueued
-/// ahead of the caller's next `FlushLive` / phase transition — that happens-before
-/// keeps native scrollback ordered across the two producers.
+/// - With a [`Console`]: PTY emulated into the live region; without: inherited stdio
+/// - Reader thread joined before return (every `Output` enqueued ahead of the caller's
+///   next `FlushLive`, keeping scrollback ordered across both producers)
 pub(crate) async fn run_child(
     console: Option<&Console>,
     program: &str,
@@ -57,15 +54,13 @@ pub(crate) async fn run_child(
         .map_err(|e| io::Error::other(format!("spawn {program}: {e}")))?;
     drop(pair.slave);
 
-    // portable-pty `setsid`s the child, so its PID *is* its process-group id — use
-    // it directly. `master.process_group_leader()` races the not-yet-completed
-    // `setsid` and can latch a stale group, silently dropping the first Ctrl-Cs.
+    // portable-pty `setsid`s the child → its PID *is* its pgid. `master
+    // .process_group_leader()` races the pending `setsid` and can latch a stale
+    // group, silently dropping the first Ctrl-Cs.
     console.child_started(child.process_id().map(|pid| pid as i32));
 
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| io::Error::other(format!("pty reader: {e}")))?;
+    let mut reader =
+        pair.master.try_clone_reader().map_err(|e| io::Error::other(format!("pty reader: {e}")))?;
     let sink = console.clone();
     let reader_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -85,9 +80,8 @@ pub(crate) async fn run_child(
     let wait = tokio::task::spawn_blocking(move || child.wait());
     tokio::pin!(wait);
 
-    // Forward terminal resizes to the child's PTY (width + `live_rows`), matching
-    // the render thread's `avt` grid. `master.resize` delivers SIGWINCH so tools
-    // re-wrap instead of keeping their spawn-time size.
+    // Resizes → child PTY (width + `live_rows`), matching the render thread's `avt`
+    // grid. `master.resize` delivers SIGWINCH, so tools re-wrap off spawn-time size.
     let mut size = console.size_watch();
     let status = loop {
         tokio::select! {
@@ -112,8 +106,8 @@ pub(crate) async fn run_child(
     Ok(exit_code_from(status, console.cancelled()))
 }
 
-/// Non-TTY fallback: inherit stdio, run synchronously, return the exit code.
-/// A signal death maps to `128 + signo` (Ctrl-C → 130, as in [`code_for`]).
+/// Non-TTY fallback: inherited stdio, synchronous, exit code out. Signal death
+/// → `128 + signo` (Ctrl-C → 130, as in [`code_for`])
 fn run_inherited(program: &str, args: &[String], envs: &[(&str, String)]) -> io::Result<i32> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
@@ -130,7 +124,6 @@ fn run_inherited(program: &str, args: &[String], envs: &[(&str, String)]) -> io:
     })
 }
 
-/// Map a finished PTY child status to an exit code.
 fn exit_code_from(status: io::Result<portable_pty::ExitStatus>, interrupted: bool) -> i32 {
     match status {
         Ok(s) => code_for(&s, interrupted) as i32,
@@ -141,7 +134,6 @@ fn exit_code_from(status: io::Result<portable_pty::ExitStatus>, interrupted: boo
     }
 }
 
-/// Pure numeric exit-code decision (see [`exit_code_from`]).
 fn code_for(status: &portable_pty::ExitStatus, interrupted: bool) -> u8 {
     if status.signal().is_some() {
         if interrupted { 130 } else { 1 }

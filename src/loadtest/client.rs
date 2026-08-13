@@ -1,13 +1,9 @@
-//! L0 — a cheap-clone gRPC client over a **persistent, multiplexed** channel.
+//! L0 — cheap-clone gRPC client over a **persistent, multiplexed** channel.
 //!
-//! Every per-backend RPC in ztest opens a fresh tonic `Channel` per call (see
-//! `backends/zainod.rs::connect`). That is correct for a one-shot assertion but
-//! fatal for load generation: you would measure TCP + HTTP/2 + TLS setup, not
-//! the RPC. [`LwdClient`] wraps one already-connected [`Channel`]; tonic channels
-//! multiplex over a single connection and clone cheaply, so every virtual
-//! shared connection mode reuses one socket across tasks, while per-task mode
-//! dials a channel per task for genuine
-//! socket fan-out.
+//! - Per-backend RPCs dial a fresh `Channel` per call: fine for one-shot assertions, fatal
+//!   for load (measures TCP + HTTP/2 + TLS setup, not the RPC)
+//! - [`LwdClient`] wraps one connected [`Channel`]; tonic clones cheaply & multiplexes, so
+//!   shared mode reuses one socket across tasks, per-task mode dials for real fan-out
 
 use std::sync::Arc;
 
@@ -20,10 +16,8 @@ use crate::error::env_err;
 use crate::proto::compact_tx_streamer_client::CompactTxStreamerClient;
 use crate::proto::{BlockId, BlockRange, ChainSpec, CompactBlock};
 
-/// A persistent lightwalletd/zainod gRPC client. Clone is cheap — clones share
-/// the underlying multiplexed channel. The origin URI is retained so
-/// Per-task mode can [`dial`](LwdClient::dial) a fresh
-/// channel per connection.
+/// Persistent lightwalletd/zainod gRPC client; clones share the multiplexed channel.
+/// Origin URI retained so per-task mode can [`dial`](LwdClient::dial) a fresh channel
 #[derive(Debug, Clone)]
 pub struct LwdClient {
     inner: CompactTxStreamerClient<Channel>,
@@ -31,70 +25,49 @@ pub struct LwdClient {
 }
 
 impl LwdClient {
-    /// Dial `uri` (e.g. `http://host:port`) and wrap the resulting channel.
+    /// Dial `uri` (`http://host:port`) and wrap the channel
     pub async fn connect(uri: impl Into<String>) -> Result<Self, EnvError> {
         let uri = uri.into();
-        let channel = Channel::from_shared(uri.clone())
-            .map_err(env_err)?
-            .connect()
-            .await
-            .map_err(env_err)?;
-        Ok(Self {
-            inner: CompactTxStreamerClient::new(channel),
-            uri: Arc::from(uri.as_str()),
-        })
+        let channel =
+            Channel::from_shared(uri.clone()).map_err(env_err)?.connect().await.map_err(env_err)?;
+        Ok(Self { inner: CompactTxStreamerClient::new(channel), uri: Arc::from(uri.as_str()) })
     }
 
-    /// Open an independent client to the same endpoint — a separate socket, for
-    /// genuine per-connection fan-out.
+    /// Independent client to the same endpoint = separate socket, for real fan-out
     pub async fn dial(&self) -> Result<Self, EnvError> {
         Self::connect(self.uri.to_string()).await
     }
 
-    /// The endpoint URI this client dials.
     pub fn uri(&self) -> &str {
         &self.uri
     }
 
-    /// A fresh handle onto the raw generated client, sharing this client's
-    /// channel. Bespoke scenarios call arbitrary RPCs through it; the hot-path
-    /// helpers below cover the common load ops.
+    /// Raw generated client on this channel, for bespoke scenarios calling arbitrary RPCs
+    /// (helpers below cover the common load ops)
     pub fn raw(&self) -> CompactTxStreamerClient<Channel> {
         self.inner.clone()
     }
 
-    /// `GetLatestBlock` → tip height.
+    /// `GetLatestBlock` → tip height
     pub async fn latest_height(&self) -> Result<u64, Status> {
         let mut c = self.inner.clone();
         Ok(c.get_latest_block(ChainSpec {}).await?.into_inner().height)
     }
 
-    /// `GetBlock` at a single height.
+    /// `GetBlock` at a single height
     pub async fn block_at(&self, height: u64) -> Result<CompactBlock, Status> {
         let mut c = self.inner.clone();
-        Ok(c.get_block(BlockId {
-            height,
-            hash: Vec::new(),
-        })
-        .await?
-        .into_inner())
+        Ok(c.get_block(BlockId { height, hash: Vec::new() }).await?.into_inner())
     }
 
-    /// `GetBlockRange` drained into a height-sorted `Vec`. This is the primary
-    /// load op — a server-streaming call the driver issues per virtual
-    /// connection.
+    /// `GetBlockRange` drained into a height-sorted `Vec` = the primary load op, one
+    /// server-streaming call per virtual connection
     pub async fn block_range(&self, start: u64, end: u64) -> Result<Vec<CompactBlock>, Status> {
         let mut c = self.inner.clone();
         let stream = c
             .get_block_range(BlockRange {
-                start: Some(BlockId {
-                    height: start,
-                    hash: Vec::new(),
-                }),
-                end: Some(BlockId {
-                    height: end,
-                    hash: Vec::new(),
-                }),
+                start: Some(BlockId { height: start, hash: Vec::new() }),
+                end: Some(BlockId { height: end, hash: Vec::new() }),
                 pool_types: Vec::new(),
             })
             .await?
@@ -105,9 +78,8 @@ impl LwdClient {
     }
 }
 
-/// Copy a 32-byte hash out of a protobuf `bytes` field, or `None` if the length
-/// is wrong. Used by the chain-link oracle to reject malformed hashes without
-/// panicking.
+/// 32-byte hash out of a protobuf `bytes` field, `None` on wrong length (chain-link oracle
+/// rejects malformed hashes without panicking)
 pub(crate) fn copy_hash(bytes: &[u8]) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(bytes).ok()
 }

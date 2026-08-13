@@ -1,22 +1,15 @@
 //! Load, stress & differential testing over a live indexer's gRPC surface.
 //!
-//! Modelled on `hhanh00/zaino`'s `zaino-admin` tool, but reshaped from a manual
-//! CLI into a library the test body calls. The original modes collapse onto one
-//! driver:
+//! Modelled on `hhanh00/zaino`'s `zaino-admin`, reshaped from a manual CLI into a
+//! library the test body calls; both original modes collapse onto one driver.
 //!
-//! - **stress** — [`LoadDriver::new`]: N connections hammer one endpoint while
-//!   [`BlockOracle`] asserts every streamed response.
-//! - **differential** — [`LoadDriver::pair`]: two indexer backends on one
-//!   validator answer each request in the same task;
-//!   [`LoadReport::assert_parity`] gates on byte-identical output.
-//!
-//! Where ztest's own concurrency lives at a different altitude: the engine's
-//! scheduler runs concurrency *across* tests (pod-per-test), so a load test is
-//! **one** test that fans out *internally* — a library, not an engine change.
-//!
-//! See `docs/design-load-testing.md` for the rationale and the measurement-model
-//! discussion (why absolute perf gating needs a calibrated cluster and A/B-ratio
-//! gating does not).
+//! - stress ([`LoadDriver::new`]): N connections on one endpoint, [`BlockOracle`]
+//!   asserting every streamed response
+//! - differential ([`LoadDriver::pair`]): two indexers on one validator per task,
+//!   [`LoadReport::assert_parity`] gating on byte-identical output
+//! - Engine concurrency is *across* tests (pod-per-test) → a load test is **one** test
+//!   fanning out internally, a library rather than an engine change
+//! - `docs/design-load-testing.md` for the measurement model
 
 pub mod client;
 pub mod driver;

@@ -1,29 +1,24 @@
-//! [`EventReporter`] — the detached driver's [`SyncReporter`], publishing the
-//! engine's live state as a [`SyncEvent`] stream on stdout.
+//! [`EventReporter`]: the detached driver's [`SyncReporter`], publishing live
+//! engine state as a [`SyncEvent`] stream on stdout.
 //!
-//! This is the impl the runner's trait doc anticipated: in detached mode the pod
-//! log *is* the wire, so every hook becomes one tagged line for
-//! `ztest sync watch` to consume. Local (`cargo test`) runs keep the
-//! human-readable `StderrReporter` instead — nobody is tailing a pod.
+//! - Detached: pod log = the wire, so every hook becomes one tagged line
+//! - Local (`cargo test`): `StderrReporter` instead (nobody is tailing a pod)
 
 use tokio::time::Instant;
 
 use super::event::{self, Probe, SyncEvent, Tick};
+use super::observe::Observation;
 use super::probe::{ProbeStatus, Verdict};
 use super::runner::{SyncOutcome, SyncReporter};
 use super::series::{Timeline, plot_channels};
 use super::snapshot::Snapshot;
 
-/// How often the whole timeline is republished.
-///
-/// Not every tick: the timeline is orders of magnitude larger than a tick, and
-/// at a 5-second cadence over 48 hours that would dominate the pod log. Not
-/// once at the end either — `ztest sync status` has to be able to plot a *live*
-/// run. A minute is short enough that a status read is never meaningfully
-/// stale, and long enough that the series costs a fraction of the tick stream.
+/// Timeline republication period. Not per-tick (would dominate the pod log), not
+/// once at the end (`sync status` plots a *live* run)
 const SERIES_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Publishes engine state as [`SyncEvent`] lines on stdout.
+/// Publishes engine state as [`SyncEvent`] lines on stdout. `published_at` is
+/// elapsed, not a tick count (a skipped tick must not stretch the interval)
 #[derive(Debug)]
 pub(crate) struct EventReporter {
     sync_id: String,
@@ -32,9 +27,9 @@ pub(crate) struct EventReporter {
     probes: usize,
     started: Option<Instant>,
     timeline: Timeline,
-    /// Elapsed reading at the last series publication, so the cadence is
-    /// measured on the driver's own clock rather than a tick count — a tick
-    /// that skips must not stretch the interval.
+    /// Same estimator the controller runs over the published stream, so the driver's
+    /// own graph and a watcher's columns cannot disagree about a rate
+    window: crate::rate::Window<Observation, std::time::Duration>,
     published_at: Option<std::time::Duration>,
 }
 
@@ -48,9 +43,9 @@ impl EventReporter {
         EventReporter {
             sync_id: sync_id.into(),
             profile: profile.into(),
-            // Start the timeline one bucket per tick: the finest the data
-            // supports, and it coarsens itself from there as the run grows.
+            // One bucket per tick = finest the data supports; self-coarsens from there
             timeline: Timeline::new(plot_channels(), tick),
+            window: crate::rate::Window::new(tick),
             tick,
             probes,
             started: None,
@@ -63,29 +58,25 @@ impl EventReporter {
     }
 
     fn elapsed(&self) -> std::time::Duration {
-        self.started
-            .map(|s| Instant::now().saturating_duration_since(s))
-            .unwrap_or_default()
+        self.started.map(|s| Instant::now().saturating_duration_since(s)).unwrap_or_default()
     }
 
-    /// Fold one tick's rates into the timeline.
-    ///
-    /// An unmeasured op contributes `None`, which leaves a gap rather than a
-    /// zero — the graph must not draw a floor for a pool nobody counted.
+    /// Fold one tick into the window, then its smoothed rates into the timeline.
+    /// Unmeasured op contributes `None` → gap, not a floor drawn for an uncounted pool
     fn record(&mut self, snap: &Snapshot, elapsed: std::time::Duration) {
-        let secs = self.tick.as_secs_f64().max(f64::MIN_POSITIVE);
-        let blocks = f64::from(snap.height().saturating_sub(snap.prev_height())) / secs;
-        let mut values = vec![Some(blocks)];
-        values.extend(snap.rate().channels().map(|(_, rate)| rate));
+        self.window.push(elapsed, Observation::from(snap));
+        let mut values = vec![self.window.block_pace().map(|p| p.per_sec)];
+        match self.window.work_rate() {
+            Some(rate) => values.extend(rate.channels().map(|(_, r)| r)),
+            None => values.extend(std::iter::repeat_n(None, plot_channels().count() - 1)),
+        }
         self.timeline.push(elapsed, &values);
     }
 
-    /// Whether the timeline is due for republication. The first tick always
-    /// publishes, so a `status` run against a young sync gets a graph rather
-    /// than a minute of nothing.
+    /// Timeline due for republication. First tick always publishes, so `status`
+    /// against a young sync gets a graph, not a minute of nothing
     fn series_due(&self, elapsed: std::time::Duration) -> bool {
-        self.published_at
-            .is_none_or(|last| elapsed.saturating_sub(last) >= SERIES_INTERVAL)
+        self.published_at.is_none_or(|last| elapsed.saturating_sub(last) >= SERIES_INTERVAL)
     }
 }
 
@@ -106,30 +97,22 @@ impl SyncReporter for EventReporter {
         self.record(snap, elapsed);
         if self.series_due(elapsed) {
             self.published_at = Some(elapsed);
-            Self::emit(&SyncEvent::Series {
-                timeline: self.timeline.clone(),
-            });
+            Self::emit(&SyncEvent::Series { timeline: self.timeline.clone() });
         }
     }
 
     fn on_probes(&mut self, _snap: &Snapshot, board: &[ProbeStatus]) {
-        Self::emit(&SyncEvent::Probes {
-            board: board.iter().map(Probe::from).collect(),
-        });
+        Self::emit(&SyncEvent::Probes { board: board.iter().map(Probe::from).collect() });
     }
 
     fn on_probe(&mut self, name: &str, verdict: &Verdict) {
         let (height, detail) = match verdict {
             Verdict::Violated(v) => (v.height, v.detail.clone()),
             Verdict::ProbeError(e) => (None, format!("probe error: {e}")),
-            // Satisfied/Pending never reach this hook; the board carries them.
+            // Satisfied/Pending never reach this hook; the board carries them
             _ => return,
         };
-        Self::emit(&SyncEvent::Violation {
-            probe: name.to_string(),
-            height,
-            detail,
-        });
+        Self::emit(&SyncEvent::Violation { probe: name.to_string(), height, detail });
     }
 
     fn on_finish(&mut self, outcome: &SyncOutcome) {

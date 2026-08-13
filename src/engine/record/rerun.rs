@@ -1,11 +1,9 @@
-//! Support for `ztest run -R/--rerun <SELECTOR>`: re-execute only the tests that
-//! did not pass in a prior recorded run.
+//! `ztest run -R/--rerun <SELECTOR>`: re-execute what did not pass in a prior
+//! recorded run.
 //!
-//! The recorded run needs to contribute exactly one thing — the set of test
-//! identities that *passed*. Rerun then runs the complement of that set against
-//! the freshly-listed test universe, which yields, for free and with no
-//! persisted test-list: the tests that failed, the tests that never completed
-//! (parked/cancelled), and tests new since the recorded run (nextest's default).
+//! - Recording contributes one thing: the *passed* identity set
+//! - Run the complement against the fresh test list → failed + never-completed +
+//!   new-since, with no persisted test list (nextest's default)
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -15,13 +13,12 @@ use std::path::Path;
 use super::RecordedEvent;
 use crate::engine::events::Verdict;
 
-/// A test identity: `(binary_id, test_name)`.
 pub type TestId = (String, String);
 
-/// The identities that reached a passing terminal verdict in the recording at
-/// `run_dir`. A test appears at most once (retries emit `TestRetrying`, only the
-/// terminal outcome emits `TestFinished`), so a flaky test that eventually
-/// passed is counted as passed — correctly excluded from a rerun.
+/// Identities with a passing terminal verdict in the recording at `run_dir`.
+///
+/// - One entry per test (retries emit `TestRetrying`; only the terminal outcome
+///   emits `TestFinished`) → an eventually-passing flake counts as passed
 pub fn passed_tests(run_dir: &Path) -> io::Result<HashSet<TestId>> {
     let log = File::open(run_dir.join("run.log.zst"))?;
     let decoder = zstd::stream::read::Decoder::new(BufReader::new(log))?;
@@ -35,10 +32,7 @@ pub fn passed_tests(run_dir: &Path) -> io::Result<HashSet<TestId>> {
             io::Error::new(io::ErrorKind::InvalidData, format!("corrupt event: {e}"))
         })?;
         if let RecordedEvent::TestFinished {
-            binary_id,
-            test_name,
-            verdict: Verdict::Pass,
-            ..
+            binary_id, test_name, verdict: Verdict::Pass, ..
         } = rec
         {
             passed.insert((binary_id, test_name));
@@ -98,7 +92,7 @@ mod tests {
                 output: b"",
             })
             .unwrap();
-            // `parked` never finishes — not in the passed set, so a rerun runs it.
+            // `parked` never finishes → absent from the passed set → a rerun runs it
         }
         let passed = passed_tests(&dir).unwrap();
         assert!(passed.contains(&("pkg::bin".into(), "ok".into())));

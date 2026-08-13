@@ -1,15 +1,8 @@
-//! The driver→controller live event stream.
+//! Driver→controller live event stream.
 //!
-//! A detached sync's only channel to a terminal watching it is the driver pod's
-//! log: the controller is stateless and holds no connection to the run between
-//! commands. So the per-tick state the engine already computes is written to
-//! that log as one machine-readable line per event, [`EVENT_PREFIX`]-tagged so
-//! `ztest sync watch` can lift events out of a stream it otherwise passes
-//! through verbatim.
-//!
-//! The driver emits data and never formatting: every renderer lives
-//! controller-side, so the panel's layout can change without redeploying a
-//! running sync — a sync in the `sync` tier can outlive several ztest builds.
+//! - Controller stateless between commands (driver-pod log = only channel to live term)
+//! - One [`EVENT_PREFIX`]-tagged line per event, lifted from otherwise-verbatim stream
+//! - Data only, no formatting (renderers controller-side, so layout floats under a live sync)
 
 use serde::{Deserialize, Serialize};
 
@@ -17,76 +10,60 @@ use super::probe::{Class, ProbeState, ProbeStatus};
 use super::series::Timeline;
 #[cfg(feature = "librustzcash")]
 use super::snapshot::Snapshot;
-use super::work::Rate;
+use super::work::Work;
 
-/// Tags a driver stdout line as a serialized [`SyncEvent`]. Deliberately not a
-/// plausible log-line opening, so no component's output can be mistaken for an
-/// event; a line that fails to parse after the tag is passed through as log
-/// output rather than dropped.
+/// Stdout tag for a serialized [`SyncEvent`] (not a plausible log-line opening)
 pub(crate) const EVENT_PREFIX: &str = "@ztest-sync-event ";
 
-/// One observation published by the driver. Additive by contract: a controller
-/// older than the driver it watches must skip unknown events rather than fail,
-/// so this is `#[serde(other)]`-terminated and every field stays optional-safe.
+/// One observation published by the driver.
+///
+/// - Additive only (older controller skips unknown events, never fails)
+/// - `Setup` = pre-engine window, else indistinguishable from a hang
+/// - `Series` republishes whole run at constant size (controllers fold bounded tail)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum SyncEvent {
-    /// A `TestEnv::build` milestone: which provisioning gate the driver is in.
-    ///
-    /// Published because a topology takes minutes to come up and the engine does
-    /// not exist yet — so without these the whole provisioning window, which is
-    /// most of a sync's wall-clock, was indistinguishable from a hang.
     Setup {
-        /// The build phase (`validator`, `indexer`, …).
         phase: String,
-        /// What that phase is doing or waiting on, already human-readable: the
-        /// driver publishes data and never formatting, but *which gate this is* is
-        /// data, and only the gate itself knows it.
         detail: String,
-        /// The component the step concerns, when it concerns exactly one.
         #[serde(default)]
         component: Option<String>,
     },
-    /// The engine began its run loop; carries what the panel needs before the
-    /// first tick lands.
     Started {
         profile: String,
         sync_id: String,
         tick_ms: u64,
         probes: usize,
     },
-    /// One captured snapshot.
     Tick(Tick),
-    /// The run's whole shape so far, bucketed on one shared time axis.
-    ///
-    /// Republished periodically rather than accumulated controller-side,
-    /// because `ztest sync status` folds a bounded log *tail* and would
-    /// otherwise only ever see the last few minutes of a 48-hour run. The
-    /// timeline self-coarsens to a fixed bucket count, so this event's size is
-    /// constant however long the sync runs.
-    Series { timeline: Timeline },
-    /// Every probe's live state, as of the tick just evaluated.
-    Probes { board: Vec<Probe> },
-    /// A probe fired — recorded whether or not it ends the run.
+    Series {
+        timeline: Timeline,
+    },
+    Probes {
+        board: Vec<Probe>,
+    },
     Violation {
         probe: String,
         height: Option<u32>,
         detail: String,
     },
-    /// The run reached a terminal verdict.
     Finished {
         verdict: String,
         violations: usize,
         coverage_gaps: usize,
         ticks: u64,
     },
-    /// An event kind this controller does not know about.
     #[serde(other)]
     Unknown,
 }
 
-/// The wire form of a [`Snapshot`]: the fields a watcher renders, with the
-/// history-derived ones the engine already folded in.
+/// Wire form of [`Snapshot`].
+///
+/// - `work` ships **cumulative**, differenced controller-side through the one
+///   [`rate::Window`](crate::rate::Window) the scrape path uses (`elapsed_ms` is the
+///   driver's clock, so a resumed stream's gap is a real gap and the window restarts
+///   across it rather than inventing a rate)
+/// - op absent from map = unmeasured, renders `—` not `0`
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Tick {
     pub seq: u64,
@@ -96,25 +73,11 @@ pub(crate) struct Tick {
     pub pct: f32,
     pub phase: String,
     pub reorg_depth: u32,
-    /// Per-second work over the interval since the previous tick.
-    ///
-    /// The typed [`Rate`] itself rather than a parallel map of numbers: it
-    /// already answers per-op, per-channel and total, and carries which ops
-    /// were measured, so the controller needs no accessors of its own. It
-    /// travels keyed by [`Op::label`], so an op absent from the wire is
-    /// unmeasured and renders as `—` rather than zero.
-    ///
-    /// Published rather than left for the controller to difference, because a
-    /// resumed stream replays and drops events: a rate computed from whichever
-    /// ticks happened to arrive would be wrong exactly when the connection was
-    /// worst, which is when a reader is most likely watching.
     #[serde(default)]
-    pub rate: Rate,
+    pub work: Work,
 }
 
 impl Tick {
-    // Only the event-publishing reporter builds one, and that is gated on the
-    // wallet backend the sync harness drives.
     #[cfg(feature = "librustzcash")]
     pub(crate) fn from_snapshot(snap: &Snapshot, elapsed: std::time::Duration) -> Self {
         Tick {
@@ -125,14 +88,29 @@ impl Tick {
             pct: snap.pct(),
             phase: snap.phase().as_str().to_string(),
             reorg_depth: snap.reorg_depth(),
-            rate: snap.rate(),
+            work: snap.work(),
+        }
+    }
+
+    pub(crate) fn at(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.elapsed_ms)
+    }
+}
+
+impl From<&Tick> for crate::sync::Observation {
+    fn from(t: &Tick) -> crate::sync::Observation {
+        crate::sync::Observation {
+            height: Some(t.height),
+            target: t.target,
+            reported_pct: Some(t.pct),
+            work: t.work,
+            cost: crate::sync::Cost::default(),
         }
     }
 }
 
-/// The wire form of a [`ProbeStatus`]: durations as milliseconds and the class
-/// as a tag, so a raw `kubectl logs` read is legible and the format doesn't
-/// inherit `Duration`'s `{secs,nanos}` encoding.
+/// Wire form of [`ProbeStatus`]. Millis + tags, not `Duration`'s `{secs,nanos}`
+/// (raw `kubectl logs` stays legible)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Probe {
     pub name: String,
@@ -162,55 +140,36 @@ impl From<&ProbeStatus> for Probe {
     }
 }
 
-/// One event as it travels: the event itself plus the position it occupies in the
-/// driver's stream.
+/// Event + its position in the driver's stream.
 ///
-/// The sequence exists because a log stream is not a reliable channel. A watcher
-/// that loses its connection to a long sync resumes *by time*, which is
-/// at-least-once — it must not lose an event, so it accepts replaying a few. The
-/// sequence is what lets the fold stay exactly-once across that overlap: without
-/// it, a replayed `Violation` would be counted twice.
+/// - Watchers resume by time = at-least-once; `n` de-dupes the replayed overlap
+/// - `n` = `None` from a pre-sequence driver (sync outlives its build) → fold accepts all
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Envelope {
-    /// Absent from a driver predating the sequence — a sync in the `sync` tier
-    /// can outlive the build that launched it — in which case a fold has no
-    /// choice but to accept every event, as it did before.
     #[serde(default)]
     pub n: Option<u64>,
     #[serde(flatten)]
     pub event: SyncEvent,
 }
 
-/// The driver's event counter. Process-global rather than owned by the reporter
-/// so that any task publishing an event draws from one sequence: [`encode`] is
-/// the single point every event passes through, and stamping there is the only
-/// way the numbers stay monotonic across more than one publisher.
+/// Driver event counter. Process-global so every publisher draws one sequence
+/// ([`encode`] = sole stamp point → monotonic)
 static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Serialize `event` as one tagged, sequenced line, newline-terminated.
 pub(crate) fn encode(event: &SyncEvent) -> String {
     let n = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Serialization of these plain DTOs cannot fail; a bug here must not take
-    // down a 48-hour sync, so it degrades to a line the controller skips.
-    match serde_json::to_string(&Envelope {
-        n: Some(n),
-        event: event.clone(),
-    }) {
+    // Cannot fail for plain DTOs; degrade to a skippable line, never kill a 48h sync
+    match serde_json::to_string(&Envelope { n: Some(n), event: event.clone() }) {
         Ok(json) => format!("{EVENT_PREFIX}{json}\n"),
         Err(e) => format!("{EVENT_PREFIX}{{\"event\":\"encode_error\",\"detail\":\"{e}\"}}\n"),
     }
 }
 
-/// Write one event to the wire — the driver's stdout, which is the log a watcher
-/// tails.
+/// Write one event to driver stdout, the log a watcher tails.
 ///
-/// One `write_all` under a held lock, because `tracing` shares this fd: a split
-/// write could interleave with a log line and corrupt both. Failure is ignored — a
-/// broken stdout must not abort a 48-hour sync.
-///
-/// Lives beside the encoder rather than on the reporter because the reporter is
-/// only reachable once an engine exists, and the provisioning events that precede
-/// one still have to reach the same wire the same way.
+/// - Single `write_all` under lock (`tracing` shares this fd, split write corrupts both)
+/// - Failure ignored (broken stdout must not abort a 48h sync)
 pub(crate) fn publish(event: &SyncEvent) {
     use std::io::Write as _;
 
@@ -221,9 +180,8 @@ pub(crate) fn publish(event: &SyncEvent) {
     let _ = lock.flush();
 }
 
-/// Lift an event out of a driver log line. `None` means "ordinary log output" —
-/// including a tagged line this build cannot parse, which stays visible as text
-/// rather than vanishing.
+/// Lift an event out of a driver log line. `None` = ordinary log output, incl. a
+/// tagged line this build cannot parse (stays visible as text, never dropped)
 pub(crate) fn decode(line: &str) -> Option<Envelope> {
     let json = line.trim_start().strip_prefix(EVENT_PREFIX)?;
     serde_json::from_str(json).ok()
@@ -243,10 +201,10 @@ mod tests {
             pct: 88.1,
             phase: "Scanning".into(),
             reorg_depth: 0,
-            rate: {
-                let mut r = Work::ZERO;
-                r.set(Op::SaplingOutput, 5);
-                r.rate(std::time::Duration::from_secs(2))
+            work: {
+                let mut w = Work::ZERO;
+                w.set(Op::SaplingOutput, 5);
+                w
             },
         }
     }
@@ -254,38 +212,23 @@ mod tests {
     #[test]
     fn tick_round_trips_through_a_log_line() {
         let line = encode(&SyncEvent::Tick(tick()));
-        let Some(Envelope {
-            event: SyncEvent::Tick(t),
-            ..
-        }) = decode(line.trim_end())
-        else {
+        let Some(Envelope { event: SyncEvent::Tick(t), .. }) = decode(line.trim_end()) else {
             panic!("did not decode as a tick: {line}");
         };
         assert_eq!((t.seq, t.height, t.target), (42, 901, Some(1024)));
     }
 
-    /// Two events encoded in order must be distinguishable in order, whichever
-    /// task produced them — that is what makes a resumed stream de-duplicable.
+    /// Ordering across producers = what makes a resumed stream de-dupable
     #[test]
     fn successive_events_are_numbered_in_order() {
         let first = decode(encode(&SyncEvent::Tick(tick())).trim_end()).expect("an event");
         let second = decode(encode(&SyncEvent::Tick(tick())).trim_end()).expect("an event");
-        assert!(
-            second.n > first.n,
-            "{:?} did not follow {:?}",
-            second.n,
-            first.n
-        );
+        assert!(second.n > first.n, "{:?} did not follow {:?}", second.n, first.n);
     }
 
-    /// A sync outliving the build that launched it means unnumbered lines from
-    /// an older driver can still arrive; they must fold, not vanish.
-    ///
-    /// The literal is a genuine pre-work-vector tick: its retired
-    /// `*_outputs` fields are ignored and the work map defaults to empty, which
-    /// reads downstream as *unmeasured*. That is the honest answer — the driver
-    /// that produced this line never counted protocol work — and it is why the
-    /// panel distinguishes `—` from `0` rather than showing zeros here.
+    /// - Unnumbered lines from an older driver must fold, not vanish
+    /// - Literal = real pre-work-vector tick: retired `*_outputs` ignored, work map
+    ///   empty = *unmeasured* → why the panel shows `—` not `0`
     #[test]
     fn an_unnumbered_event_from_an_older_driver_still_decodes() {
         let line = format!(
@@ -298,24 +241,18 @@ mod tests {
         };
         assert_eq!(t.height, 5);
         assert_eq!(t.reorg_depth, 0, "an absent field decodes to its default");
-        assert_eq!(t.rate.get(Op::SaplingOutput), None);
-        assert_eq!(t.rate.total(), None);
+        assert_eq!(t.work.get(Op::SaplingOutput), None);
+        assert_eq!(t.work.total(), None);
     }
 
-    /// The gates that report no single component omit `component` entirely, so the
-    /// field has to be optional on the wire, not merely nullable.
+    /// Gates with no single component omit the field → optional on the wire, not nullable
     #[test]
     fn a_setup_event_without_a_component_still_decodes() {
         let line = format!(
             "{EVENT_PREFIX}{{\"n\":2,\"event\":\"setup\",\"phase\":\"indexer\",\
              \"detail\":\"waiting for gRPC GetLightdInfo\"}}"
         );
-        let Some(Envelope {
-            event: SyncEvent::Setup {
-                phase, component, ..
-            },
-            ..
-        }) = decode(&line)
+        let Some(Envelope { event: SyncEvent::Setup { phase, component, .. }, .. }) = decode(&line)
         else {
             panic!("did not decode as a setup event: {line}");
         };
@@ -336,13 +273,7 @@ mod tests {
     #[test]
     fn an_unknown_event_kind_decodes_rather_than_failing() {
         let line = format!("{EVENT_PREFIX}{{\"n\":7,\"event\":\"from_a_newer_driver\",\"x\":1}}");
-        assert!(matches!(
-            decode(&line),
-            Some(Envelope {
-                event: SyncEvent::Unknown,
-                ..
-            })
-        ));
+        assert!(matches!(decode(&line), Some(Envelope { event: SyncEvent::Unknown, .. })));
     }
 
     #[test]

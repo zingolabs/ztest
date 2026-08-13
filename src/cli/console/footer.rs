@@ -1,31 +1,27 @@
-//! The pure sticky-footer renderer: given the lines to commit into scrollback and
-//! the footer to repaint, produce the exact terminal byte sequence and the
-//! footer's new height. No I/O; unit-tested against an in-memory terminal model.
+//! Pure sticky-footer renderer: committed lines + footer in → terminal bytes +
+//! new footer height out. No I/O; tested against an in-memory terminal model.
 //!
-//! Completed lines are printed normally so the terminal scrolls them into its own
-//! scrollback; only the live footer is repainted in place via cursor-up +
-//! overwrite. A DECSTBM scroll region is never used — it discards lines scrolled
-//! past an interior top margin instead of saving them.
+//! - Committed lines printed normally (terminal owns the scrollback); only the
+//!   footer repaints in place via cursor-up + overwrite
+//! - Never DECSTBM (discards lines scrolled past an interior top margin)
 //!
 //! Invariants:
-//! - The cursor rests at column 0 of the footer's last row on entry and exit
-//!   (`prev_rows` is 0 on the first call, cursor on a fresh line).
-//! - Every `footer` line is at most `cols` columns, so it occupies exactly one
-//!   physical row (caller-guaranteed) — that keeps the `prev_rows` cursor
-//!   arithmetic in logical == physical rows.
+//! - Cursor at column 0 of the footer's last row on entry & exit (`prev_rows` = 0
+//!   on the first call, cursor on a fresh line)
+//! - Every `footer` line ≤ `cols` (caller-guaranteed) → `prev_rows` arithmetic
+//!   stays logical == physical rows
 
 use std::fmt::Write as _;
 
-/// Emit the frame that commits `committed` into scrollback above the footer and
-/// repaints `footer` as the new pinned block. `prev_rows` is the value returned
-/// by the previous call (0 initially). Returns the new footer height.
+/// Commit `committed` into scrollback above the footer, repaint `footer` as the
+/// pinned block. `prev_rows` = previous call's return (0 initially)
 pub(super) fn render(
     out: &mut String,
     committed: &[String],
     footer: &[String],
     prev_rows: usize,
 ) -> usize {
-    // Move to the top of the old footer. The cursor sits at its *last* row.
+    // To the top of the old footer (cursor sits at its *last* row)
     if prev_rows > 1 {
         let _ = write!(out, "\x1b[{}A", prev_rows - 1);
     }
@@ -33,9 +29,8 @@ pub(super) fn render(
         out.push('\r');
     }
 
-    // Committed lines overwrite the old footer top and push it down with each
-    // `\r\n`, becoming ordinary scrollback content. `\x1b[K` wipes any longer
-    // old-footer tail.
+    // Each `\r\n` pushes the old footer down; committed text becomes scrollback.
+    // `\x1b[K` wipes any longer old-footer tail
     for line in committed {
         out.push_str(line);
         out.push_str("\x1b[K\r\n");
@@ -50,7 +45,7 @@ pub(super) fn render(
         }
     }
 
-    // Wipe leftover old rows below the cursor when the new block is shorter.
+    // New block shorter → wipe the leftover rows below
     if committed.len() + f < prev_rows {
         out.push_str("\x1b[J");
     }
@@ -63,8 +58,7 @@ pub(super) fn render(
 mod tests {
     use super::*;
 
-    /// A minimal VT good enough to prove the renderer: printable glyphs, `\r`,
-    /// `\n`, `CUU` (`ESC[nA`), `EL` (`ESC[K`), `ED` (`ESC[J`), SGR (ignored).
+    /// Minimal VT: printable glyphs, `\r`, `\n`, CUU, EL, ED, SGR (ignored)
     struct Term {
         cols: usize,
         rows: usize,
@@ -121,7 +115,7 @@ mod tests {
                         i += 1;
                     }
                     '\x1b' if i + 1 < b.len() && b[i + 1] == '[' => {
-                        // Parse CSI: optional '?', numeric params, final byte.
+                        // CSI: optional '?', numeric params, final byte
                         let mut j = i + 2;
                         let private = j < b.len() && b[j] == '?';
                         if private {
@@ -163,13 +157,8 @@ mod tests {
             }
         }
 
-        /// Visible non-blank rows, trimmed.
         fn visible(&self) -> Vec<String> {
-            self.grid
-                .iter()
-                .map(|r| trim(r))
-                .filter(|s| !s.is_empty())
-                .collect()
+            self.grid.iter().map(|r| trim(r)).filter(|s| !s.is_empty()).collect()
         }
     }
 
@@ -204,7 +193,7 @@ mod tests {
         t.apply(&out);
 
         assert_eq!(rows, 2);
-        // C landed between the earlier committed lines and the footer.
+        // C lands between the earlier committed lines and the footer
         assert_eq!(t.visible(), strings(&["A", "B", "C", "P1'", "P2'"]));
     }
 
@@ -220,7 +209,7 @@ mod tests {
         rows = render(&mut out, &[], &strings(&["ONLY"]), rows);
         t.apply(&out);
         assert_eq!(rows, 1);
-        // The two extra old rows must be gone, not left as stale text.
+        // Two extra old rows gone, not left as stale text
         assert_eq!(t.visible(), strings(&["ONLY"]));
     }
 
@@ -249,7 +238,7 @@ mod tests {
         rows = render(&mut out, &[], &strings(&["hi"]), rows);
         t.apply(&out);
         assert_eq!(rows, 1);
-        // No "LONGLINE" tail remains after "hi".
+        // No "LONGLINE" tail after "hi"
         assert_eq!(t.visible(), strings(&["hi"]));
     }
 
@@ -257,7 +246,7 @@ mod tests {
     fn sgr_in_footer_does_not_shift_columns() {
         let mut t = Term::new(40, 10);
         let mut out = String::new();
-        // A styled line: the SGR codes must not count as visible columns.
+        // SGR codes must not count as visible columns
         render(&mut out, &[], &strings(&["\x1b[1;32mOK\x1b[0m"]), 0);
         t.apply(&out);
         assert_eq!(t.visible(), strings(&["OK"]));
@@ -271,15 +260,10 @@ mod tests {
         t.apply(&out);
         for i in 0..10 {
             out.clear();
-            rows = render(
-                &mut out,
-                &strings(&[&format!("line{i}")]),
-                &strings(&["panel"]),
-                rows,
-            );
+            rows = render(&mut out, &strings(&[&format!("line{i}")]), &strings(&["panel"]), rows);
             t.apply(&out);
         }
-        // Everything committed is preserved: earliest in scrollback, panel pinned.
+        // All committed preserved: earliest in scrollback, panel pinned
         let all: Vec<String> = t.scrollback.iter().cloned().chain(t.visible()).collect();
         let expected: Vec<String> = (0..10)
             .map(|i| format!("line{i}"))
@@ -290,10 +274,8 @@ mod tests {
 
     #[test]
     fn live_running_lines_never_leak_into_scrollback() {
-        // Reproduce the run panel: a live "running" block (which changes content
-        // and height as tests start/finish) above a fixed 5-line panel, with a
-        // verdict committed on some frames. Only committed verdicts may reach
-        // scrollback; a live running line must never.
+        // Run-panel shape: variable-height live "running" block over a fixed 5-line
+        // panel. Only committed verdicts may reach scrollback, never a running line
         let panel = ["p1", "p2", "p3", "p4", "p5"].map(String::from).to_vec();
         let footer = |running: &[&str]| {
             let mut f: Vec<String> = running.iter().map(|s| s.to_string()).collect();
@@ -305,7 +287,7 @@ mod tests {
         let mut rows = render(&mut out, &[], &footer(&["run_A 1s", "run_B 1s"]), 0);
         t.apply(&out);
 
-        // Frames: timer ticks, verdicts committing, and the running set changing.
+        // Frames: timer ticks, verdicts committing, running set churn
         let frames: &[(&[&str], &[&str])] = &[
             (&[], &["run_A 2s", "run_B 2s"]),             // tick
             (&["PASS run_B"], &["run_A 3s", "run_C 1s"]), // B done, C starts
@@ -322,7 +304,7 @@ mod tests {
         }
         let _ = rows;
 
-        // Everything that ever scrolled off, plus what's still visible.
+        // Everything that scrolled off + what is still visible
         let seen: Vec<String> = t.scrollback.iter().cloned().chain(t.visible()).collect();
         for line in &seen {
             assert!(

@@ -1,8 +1,7 @@
 //! Lightwalletd indexer backend.
 //!
-//! Speaks the `CompactTxStreamer` gRPC protocol; each call opens a fresh tonic
-//! connection. Deliberately shares no helpers with `zaino` so the two can
-//! diverge in framing independently.
+//! - `CompactTxStreamer` gRPC, a fresh tonic connection per call
+//! - Shares no helpers with `zaino` (the two must diverge in framing independently)
 
 use std::time::Duration;
 
@@ -25,17 +24,12 @@ use crate::{Endpoint, EnvError, RpcError};
 
 const COMPONENT: &str = "lightwalletd";
 
-/// Readiness / block-poll cadence and default timeout for this backend's
-/// `ready`, `poll_*`, and `wait_for_block_num` loops.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Resolve the container image for a lightwalletd pod. Default is the published
-/// `electriccoinco/lightwalletd:<version>` tag; a
-/// [`Dev`](crate::backends::image::ImageSpec::Dev) spec overrides it with a
-/// `lightwalletd:dev-<hash>` tag, or fails via
-/// [`ImageError::DevImageMissing`] if the pipeline never built it.
+/// A [`Dev`](crate::backends::image::ImageSpec::Dev) override never degrades to the
+/// published tag — unbuilt fails `DevImageMissing`
 pub(crate) fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
@@ -43,16 +37,14 @@ pub(crate) fn image_uri(
     crate::backends::image::resolve(&opts.image, &default_image)
 }
 
-/// Lightwalletd-flavoured indexer config. ZST for the
-/// [`Indexer`](crate::component::Indexer) builder; produces a
-/// [`LightwalletdIndexer`] handle at `add_indexer` time.
+/// [`Indexer`](crate::component::Indexer) builder's lightwalletd flavour →
+/// [`LightwalletdIndexer`] handle at `add_indexer` time
 #[derive(Debug, Clone)]
 pub struct LightwalletdBackend;
 
-/// Where the generated `zcash.conf` is mounted in the pod. lightwalletd reads
-/// the validator's RPC host/port/credentials from it.
+/// Mount point of the generated `zcash.conf` (validator RPC host/port/credentials)
 const ZCASH_CONF_PATH: &str = "/etc/lightwalletd/zcash.conf";
-/// Pod-local scratch for lightwalletd's own block cache.
+/// Pod-local scratch for lightwalletd's block cache
 const DATA_DIR: &str = "/var/lib/lightwalletd";
 
 impl IndexerConfig for LightwalletdBackend {
@@ -63,15 +55,9 @@ impl IndexerConfig for LightwalletdBackend {
         LightwalletdIndexer { plumbing }
     }
 
-    /// Render the `zcash.conf` lightwalletd needs, and the flags pointing it at
-    /// that file.
-    ///
-    /// lightwalletd has no config file of its own — everything is CLI flags,
-    /// plus a bitcoind-style `zcash.conf` naming the validator's RPC endpoint.
-    /// `rpcuser` / `rpcpassword` are required by lightwalletd's parser but are
-    /// placeholders on the wire here: ztest's regtest zebrad runs with
-    /// `enable_cookie_auth = false`, so they satisfy the client rather than
-    /// authenticating anything.
+    /// No lightwalletd config file: CLI flags + a bitcoind-style `zcash.conf` naming
+    /// the validator RPC. `rpcuser`/`rpcpassword` satisfy its parser and authenticate
+    /// nothing (regtest zebrad runs `enable_cookie_auth = false`)
     fn materialize_opts(
         &self,
         mut opts: crate::component::ComponentOpts,
@@ -108,8 +94,7 @@ rpcport={}
 ",
             crate::handles::ports::ZEBRAD_RPC,
         );
-        opts.mounts
-            .push(crate::regtest::config_mount_inline(conf, ZCASH_CONF_PATH));
+        opts.mounts.push(crate::regtest::config_mount_inline(conf, ZCASH_CONF_PATH));
         Ok(opts)
     }
 }
@@ -121,8 +106,7 @@ impl crate::regtest::Regtest for crate::component::Indexer<LightwalletdBackend> 
         use crate::component::ComponentBuilder;
 
         let mut indexer = self.mount(crate::regtest::scratch_mount(DATA_DIR)).args([
-            // No TLS: pods talk over the cluster network and the load harness
-            // dials plain h2c.
+            // No TLS: cluster-internal, and the load harness dials plain h2c
             "--no-tls-very-insecure",
             "--zcash-conf-path",
             ZCASH_CONF_PATH,
@@ -130,7 +114,7 @@ impl crate::regtest::Regtest for crate::component::Indexer<LightwalletdBackend> 
             DATA_DIR,
             "--grpc-bind-addr",
             &format!("0.0.0.0:{}", crate::handles::ports::LIGHTWALLETD_GRPC),
-            // Container stdout, so the engine's log capture sees it.
+            // Container stdout, where the engine's log capture reads
             "--log-file",
             "/dev/stdout",
         ]);
@@ -141,8 +125,6 @@ impl crate::regtest::Regtest for crate::component::Indexer<LightwalletdBackend> 
 
 // ─────────────────────────── LightwalletdIndexer ──────────────────────
 
-/// Live lightwalletd indexer handle. Holds only the env plumbing; state is
-/// remote, reached over gRPC.
 #[derive(Debug, Clone)]
 pub struct LightwalletdIndexer {
     plumbing: HandleInner,
@@ -171,11 +153,10 @@ impl IndexerBackend for LightwalletdIndexer {
             ready_port: crate::handles::ports::LIGHTWALLETD_GRPC,
             command: opts.command.clone(),
             args: opts.args.clone(),
-            resources: opts.resources.clone(),
+            resources: opts.resources,
             env: opts.env.clone(),
             fs_group: Some(1000),
-            // Upstream image sets no USER (defaults to root) and fails
-            // runAsNonRoot; pin a numeric non-root uid.
+            // Upstream image sets no USER → root → fails runAsNonRoot
             run_as_user: Some(1000),
             supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
@@ -202,11 +183,7 @@ impl IndexerBackend for LightwalletdIndexer {
             .await
             .map_err(|e| RpcError::backend(COMPONENT, "GetLatestBlock", e))?
             .into_inner();
-        Ok(BlockHeight::from(u32_height(
-            COMPONENT,
-            "GetLatestBlock",
-            resp.height,
-        )?))
+        Ok(BlockHeight::from(u32_height(COMPONENT, "GetLatestBlock", resp.height)?))
     }
 
     async fn indexer_info(&self) -> Result<proto::LightdInfo, RpcError> {
@@ -225,10 +202,7 @@ impl IndexerBackend for LightwalletdIndexer {
         let endpoint = &ep;
         fetch_block(
             endpoint,
-            proto::BlockId {
-                height: u64::from(u32::from(height)),
-                hash: Vec::new(),
-            },
+            proto::BlockId { height: u64::from(u32::from(height)), hash: Vec::new() },
         )
         .await
     }
@@ -236,14 +210,7 @@ impl IndexerBackend for LightwalletdIndexer {
     async fn get_block_by_hash(&self, hash: BlockHash) -> Result<CompactBlock, RpcError> {
         let ep = self.plumbing.endpoint("grpc").await?;
         let endpoint = &ep;
-        fetch_block(
-            endpoint,
-            proto::BlockId {
-                height: 0,
-                hash: hash.0.to_vec(),
-            },
-        )
-        .await
+        fetch_block(endpoint, proto::BlockId { height: 0, hash: hash.0.to_vec() }).await
     }
 
     async fn get_taddress_balance(&self, addresses: Vec<String>) -> Result<ZatBalance, RpcError> {
@@ -256,11 +223,7 @@ impl IndexerBackend for LightwalletdIndexer {
             .map_err(|e| RpcError::backend(COMPONENT, "GetTaddressBalance", e))?
             .into_inner();
         ZatBalance::from_i64(resp.value_zat).map_err(|e| {
-            RpcError::decode(
-                COMPONENT,
-                "GetTaddressBalance",
-                format!("invalid ZatBalance: {e:?}"),
-            )
+            RpcError::decode(COMPONENT, "GetTaddressBalance", format!("invalid ZatBalance: {e:?}"))
         })
     }
 
@@ -296,9 +259,7 @@ impl IndexerBackend for LightwalletdIndexer {
         let ep = self.plumbing.endpoint("grpc").await?;
         let endpoint = &ep;
         let mut client = connect(endpoint).await?;
-        let resp = client
-            .get_block_range(block_range(start, end, pool_types))
-            .await;
+        let resp = client.get_block_range(block_range(start, end, pool_types)).await;
         let mut stream = match resp {
             Ok(s) => s.into_inner(),
             Err(_) => return Ok((Vec::new(), true)),
@@ -351,8 +312,8 @@ impl IndexerBackend for LightwalletdIndexer {
         use futures::StreamExt;
         let ep = self.plumbing.endpoint("grpc").await?;
         let endpoint = &ep;
-        // Route through the generated enum so wire values can't drift from the
-        // proto. Ironwood has no lightwalletd wire representation.
+        // Through the generated enum → wire values cannot drift from the proto.
+        // Ironwood has no lightwalletd wire representation
         let shielded_protocol = match protocol {
             ShieldedProtocol::Sapling => proto::ShieldedProtocol::Sapling as i32,
             ShieldedProtocol::Orchard => proto::ShieldedProtocol::Orchard as i32,
@@ -526,10 +487,7 @@ impl IndexerBackend for LightwalletdIndexer {
     }
 
     async fn json_rpc(&self) -> Result<JsonRpcClient, EnvError> {
-        Ok(JsonRpcClient::new(
-            &self.plumbing.endpoint("jsonrpc").await?,
-            COMPONENT,
-        ))
+        Ok(JsonRpcClient::new(&self.plumbing.endpoint("jsonrpc").await?, COMPONENT))
     }
 
     async fn get_block_range(
@@ -537,8 +495,7 @@ impl IndexerBackend for LightwalletdIndexer {
         start: BlockHeight,
         end: BlockHeight,
     ) -> Result<Vec<CompactBlock>, RpcError> {
-        self.get_block_range_with_pools(start, end, Vec::new())
-            .await
+        self.get_block_range_with_pools(start, end, Vec::new()).await
     }
 
     async fn ready(&self, timeout: Duration) -> Result<(), RpcError> {
@@ -609,14 +566,8 @@ async fn fetch_block(endpoint: &Endpoint, id: proto::BlockId) -> Result<CompactB
 
 fn block_range(start: BlockHeight, end: BlockHeight, pool_types: Vec<i32>) -> proto::BlockRange {
     proto::BlockRange {
-        start: Some(proto::BlockId {
-            height: u64::from(u32::from(start)),
-            hash: Vec::new(),
-        }),
-        end: Some(proto::BlockId {
-            height: u64::from(u32::from(end)),
-            hash: Vec::new(),
-        }),
+        start: Some(proto::BlockId { height: u64::from(u32::from(start)), hash: Vec::new() }),
+        end: Some(proto::BlockId { height: u64::from(u32::from(end)), hash: Vec::new() }),
         pool_types,
     }
 }

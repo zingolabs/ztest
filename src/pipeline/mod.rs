@@ -1,8 +1,5 @@
-//! `ztest run` orchestration pipeline.
-//!
-//! Owns the lifecycle of a `ztest run` invocation, coordinating parallel work
-//! (cluster probe in Phase A, build / inventory in Phase B) around a single
-//! `tokio::sync::mpsc` event channel while `cli::run` drives the bottom console.
+//! `ztest run` orchestration pipeline: Phase A (cluster probe) ‖ Phase B (build /
+//! inventory), joined on one `mpsc` event channel that `cli::run` drains.
 //!
 //! ```text
 //!                    ┌─────────────────┐
@@ -17,10 +14,9 @@
 //!         └─► barrier ─► hand off to `cargo nextest run` (see cli::console)
 //! ```
 //!
-//! Each phase is a `pub async fn` taking an [`events::EventTx`] and the args /
-//! config it needs. `cli::run::pipeline_phase` is the single consumer of the
-//! channel: it folds events into the [`crate::ui`] banner state and
-//! repaints the [`crate::cli::console`] panel.
+//! - Each phase = a `pub async fn` over an [`events::EventTx`]
+//! - `cli::run::pipeline_phase` = sole consumer, folding events into the
+//!   [`crate::ui`] banner and repainting the [`crate::cli::console`] panel
 
 pub mod archives;
 pub mod build;
@@ -28,6 +24,8 @@ pub mod capacity_watch;
 pub mod cluster;
 pub mod events;
 pub mod images;
+pub mod local_bake;
+pub(crate) mod profiles;
 pub mod remote_compile;
 
 pub use self::archives::ArchivesOutcome;

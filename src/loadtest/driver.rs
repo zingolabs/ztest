@@ -1,18 +1,13 @@
-//! L2 — how load is applied. One [`LoadDriver`] fans out to N connections
-//! against either a single endpoint ([`LoadDriver::new`]) or a pair driven in
-//! lock-step ([`LoadDriver::pair`]), where each request hits A and B from the
-//! same task — same node, same instant, the precondition for trustworthy
-//! A/B-relative timing.
+//! L2 — how load is applied. One [`LoadDriver`] → N connections against one
+//! endpoint ([`LoadDriver::new`]) or a lock-step pair ([`LoadDriver::pair`]).
 //!
-//! Every connection dials its own channel, so the run exercises the accept path
-//! and per-connection server state rather than one multiplexed socket. The
-//! handshake is timed separately as [`OpKind::Connect`] and excluded from
-//! throughput.
-//!
-//! Per-op latency lands in an `hdrhistogram`. Oracle violations and parity
-//! records are **deduplicated per task**: under a duration-bounded run every
-//! connection re-fetches its window many times, and the actionable signal is
-//! *which* height diverged, not that it recurred 10⁴ times.
+//! - Paired requests hit A & B from one task (same node, same instant =
+//!   precondition for trustworthy A/B-relative timing)
+//! - One channel per connection (exercises the accept path + per-connection
+//!   server state, not one multiplexed socket)
+//! - Handshake timed as [`OpKind::Connect`], excluded from throughput
+//! - Violations & parity records deduped per task (*which* height diverged is the
+//!   signal, not that it recurred 10⁴ times)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -33,7 +28,7 @@ fn new_hist() -> Histogram<u64> {
     Histogram::new(SIGFIG).expect("valid sigfig")
 }
 
-/// Per-task accumulator for one backend. Merged across tasks after the join.
+/// Per-task accumulator for one backend, merged across tasks after the join
 struct Tally {
     hists: BTreeMap<OpKind, Histogram<u64>>,
     ops: u64,
@@ -43,17 +38,11 @@ struct Tally {
 
 impl Tally {
     fn new() -> Self {
-        Self {
-            hists: BTreeMap::new(),
-            ops: 0,
-            errors: 0,
-            violations: Vec::new(),
-        }
+        Self { hists: BTreeMap::new(), ops: 0, errors: 0, violations: Vec::new() }
     }
 
-    /// Record a latency sample. Does **not** touch `ops`: throughput counts
-    /// scenario operations only, so a [`OpKind::Connect`] sample cannot inflate
-    /// it. Call sites bump `ops` themselves for the op under test.
+    /// Record a latency sample; never touches `ops` (throughput counts scenario
+    /// ops only, so [`OpKind::Connect`] cannot inflate it — call sites bump `ops`)
     fn record(&mut self, op: OpKind, elapsed: Duration) {
         let h = self.hists.entry(op).or_insert_with(new_hist);
         let _ = h.record(elapsed.as_micros() as u64);
@@ -84,16 +73,15 @@ impl Tally {
     }
 }
 
-/// Which endpoint(s) a run drives. `Two` is the differential mode: both are
-/// issued concurrently from one task so their latencies are comparable.
+/// `Two` = differential mode: both issued concurrently from one task, so their
+/// latencies compare
 #[derive(Debug)]
 enum Target {
     One(LwdClient),
     Two(LwdClient, LwdClient),
 }
 
-/// Fan-out load generator. Drives one endpoint, or two in lock-step for a
-/// differential run.
+/// Fan-out load generator: one endpoint, or two in lock-step
 #[derive(Debug)]
 pub struct LoadDriver {
     target: Target,
@@ -106,16 +94,16 @@ pub struct LoadDriver {
 }
 
 impl LoadDriver {
-    /// Drive a single endpoint. The report's [`b`](LoadReport::b) is `None`, so
-    /// [`assert_parity`](LoadReport::assert_parity) and
-    /// [`assert_relative`](LoadReport::assert_relative) reject the run rather
-    /// than passing vacuously.
+    /// Single endpoint → [`b`](LoadReport::b) `None`, so
+    /// [`assert_parity`](LoadReport::assert_parity) /
+    /// [`assert_relative`](LoadReport::assert_relative) reject rather than pass
+    /// vacuously
     pub fn new(client: LwdClient) -> Self {
         Self::with_target(Target::One(client))
     }
 
-    /// Drive two endpoints differentially: every request is issued to both from
-    /// the same task and their responses compared for byte equality.
+    /// Two endpoints differentially: every request issued to both from one task,
+    /// responses compared for byte equality
     pub fn pair(a: LwdClient, b: LwdClient) -> Self {
         Self::with_target(Target::Two(a, b))
     }
@@ -152,15 +140,14 @@ impl LoadDriver {
         self.scenario = s;
         self
     }
-    /// Additionally hold settled history immutable: no height strictly below
-    /// `height` may change hash for the duration of the run. See
-    /// [`BlockOracle::stable_below`].
+    /// Also hold settled history immutable: no height < `height` may change hash
+    /// for the run ([`BlockOracle::stable_below`])
     pub fn stable_below(mut self, height: u64) -> Self {
         self.stable_below = Some(height);
         self
     }
-    /// How long each connection runs. The clock starts when that connection
-    /// starts, so a staggered spawn does not shorten the later connections.
+    /// Per-connection runtime; clock starts at that connection's start (a
+    /// staggered spawn does not shorten the later ones)
     pub fn duration(mut self, d: Duration) -> Self {
         self.duration = d;
         self
@@ -172,8 +159,8 @@ impl LoadDriver {
         let run_for = self.duration;
         let wall = Instant::now();
 
-        // One oracle shared by every connection: the settled-history baseline is
-        // global on purpose, so one connection cross-checks what another saw.
+        // One oracle for all connections: global settled-history baseline lets one
+        // connection cross-check what another saw
         let oracle = Arc::new(match self.stable_below {
             Some(h) => BlockOracle::new().stable_below(h),
             None => BlockOracle::new(),
@@ -210,8 +197,8 @@ impl LoadDriver {
 
                 let deadline = Instant::now() + run_for;
                 while Instant::now() < deadline {
-                    // A and B are issued concurrently, each with its own timer,
-                    // so the A/B ratio compares like with like.
+                    // Concurrent, each with its own timer → the A/B ratio compares
+                    // like with like
                     let (ra, rb) = match &b {
                         Some(b) => {
                             let (x, y) = tokio::join!(timed(&a, start, end), timed(b, start, end),);
@@ -231,9 +218,8 @@ impl LoadDriver {
                             tb.ops += 1;
                             ta.record(op_kind, da);
                             tb.record(op_kind, db);
-                            // Both endpoints are validated. Parity alone cannot
-                            // catch a defect both backends share, and B's own
-                            // findings would otherwise never be seen.
+                            // Both validated: parity alone misses a defect both
+                            // backends share, and B's own findings would go unseen
                             observe_into(&oracle, start, end, &ba, &mut seen_a, &mut ta);
                             observe_into(&oracle, start, end, &bb, &mut seen_b, &mut tb);
                             for rec in diff_ranges(&ba, &bb) {
@@ -242,8 +228,8 @@ impl LoadDriver {
                                 }
                             }
                         }
-                        // Either side failing voids the comparison, but each
-                        // side's error is attributed to that side.
+                        // Either failure voids the comparison; each error attributed
+                        // to its own side
                         ((ra, _), rb) => {
                             if ra.is_err() {
                                 ta.errors += 1;
@@ -267,8 +253,8 @@ impl LoadDriver {
         let mut parity: Vec<ParityRecord> = Vec::new();
         let mut seen: BTreeSet<(u64, &'static str)> = BTreeSet::new();
         for joined in futures::future::join_all(handles).await {
-            // A panicked connection must fail the run, not vanish: dropping it
-            // would leave the surviving tasks' numbers looking clean.
+            // Panicked connection must fail the run, not vanish (survivors' numbers
+            // would look clean)
             let (ta, tb, p) = joined.map_err(crate::error::env_err)?;
             ma.merge(ta);
             mb.merge(tb);
@@ -291,7 +277,6 @@ impl LoadDriver {
     }
 }
 
-/// Issue the scenario op, returning its result alongside how long it took.
 async fn timed(
     client: &LwdClient,
     start: u64,
@@ -302,15 +287,13 @@ async fn timed(
     (r, t.elapsed())
 }
 
-/// Dial an independent channel for one connection, timing the handshake.
 async fn dial(client: &LwdClient) -> Result<(LwdClient, Duration), EnvError> {
     let t = Instant::now();
     let dialed = client.dial().await?;
     Ok((dialed, t.elapsed()))
 }
 
-/// Run the oracle over one response, keeping only findings this task has not
-/// already recorded.
+/// Oracle over one response, keeping only findings new to this task
 fn observe_into(
     oracle: &BlockOracle,
     start: u64,
@@ -331,13 +314,9 @@ fn throughput(ops: u64, wall: Duration) -> f64 {
     if s > 0.0 { ops as f64 / s } else { 0.0 }
 }
 
-/// Align two block sets by height and compare the overlap; report presence gaps.
-///
-/// The comparison is prost's derived `PartialEq` on the whole block. That is
-/// exhaustive by construction: a field added to the proto is covered the day it
-/// lands, with no differ to keep in sync and no silent blind spot if someone
-/// forgets. The height is the fingerprint — reproduce a divergence with one
-/// `GetBlock` against each backend.
+/// Align two block sets by height, compare the overlap, report presence gaps.
+/// Whole-block derived `PartialEq` = exhaustive by construction (a new proto field
+/// is covered the day it lands, no differ to keep in sync)
 fn diff_ranges(a: &[CompactBlock], b: &[CompactBlock]) -> Vec<ParityRecord> {
     let ma: BTreeMap<u64, &CompactBlock> = a.iter().map(|x| (x.height, x)).collect();
     let mb: BTreeMap<u64, &CompactBlock> = b.iter().map(|x| (x.height, x)).collect();
@@ -394,9 +373,8 @@ mod tests {
         assert_eq!(recs[0].detail, ParityRecord::MISSING_FROM_A);
     }
 
-    /// Any inequality at all must produce a record, whatever field carries it.
-    /// Derived `PartialEq` is what makes that exhaustive — a field added to the
-    /// proto is covered with no differ to keep in sync.
+    /// Any inequality must produce a record, whatever field carries it (derived
+    /// `PartialEq` = exhaustive, no differ to keep in sync)
     #[test]
     fn any_field_difference_is_reported() {
         let a = block(10);

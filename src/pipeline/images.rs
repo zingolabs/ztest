@@ -1,7 +1,9 @@
-//! Phase C: dev-image inventory discovery. Each selected test binary is spawned
-//! with `ZTEST_DUMP_INVENTORY=1` and emits `"kind"`-tagged JSON `InventoryLine`s.
-//! Results are deduped across binaries so a `dev!` linked into N binaries builds
-//! once (a `rust_versions` matrix still forks one image per version).
+//! Phase C: dev-image inventory discovery.
+//!
+//! - Each selected binary spawned with `ZTEST_DUMP_INVENTORY=1`, emitting `"kind"`-tagged
+//!   JSON `InventoryLine`s
+//! - Deduped across binaries → a `dev!` linked into N binaries builds once (a
+//!   `rust_versions` matrix still forks one image per version)
 
 use std::collections::BTreeSet;
 use std::process::Stdio;
@@ -13,7 +15,6 @@ use crate::inventory::{
 };
 use crate::pipeline::build::SelectedBinary;
 
-/// All registries demuxed from one binary's tagged inventory dump stream.
 #[derive(Debug, Default)]
 pub(crate) struct Dumped {
     dev: Vec<DevImageEntry>,
@@ -23,9 +24,8 @@ pub(crate) struct Dumped {
     sync_tests: Vec<SyncTestEntry>,
 }
 
-/// Demux one binary's `ZTEST_DUMP_INVENTORY=1` stdout (tagged JSON-lines) into
-/// the four registries. Pure — the transport (local subprocess vs a builder-pod
-/// `exec`, see [`crate::pipeline::remote_compile`]) is the caller's concern.
+/// Pure — transport (local subprocess vs builder-pod `exec`, see
+/// [`crate::pipeline::remote_compile`]) is the caller's concern
 pub(crate) fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
     let mut dumped = Dumped::default();
     for line in stdout.lines() {
@@ -37,10 +37,9 @@ pub(crate) fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
             Ok(InventoryLine::Qos(q)) => dumped.qos.push(q),
             Ok(InventoryLine::Seed(s)) => dumped.seeds.push(s),
             Ok(InventoryLine::Dep(d)) => dumped.deps.push(d),
-            // Sync-test declarations feed the `ztest sync` controller (`start`
-            // resolves a profile name → its `test_id`, hence binary + libtest
-            // test) and `ztest run`'s selection prune, which is the only way the
-            // engine can tell a profile from an ordinary `#[tokio::test]`.
+            // Sync-test declarations feed the `ztest sync` controller (`start` resolves a
+            // profile name → its `test_id` → binary + libtest test) and `ztest run`'s
+            // selection prune, the only way the engine tells a profile from a plain test
             Ok(InventoryLine::SyncTest(s)) => dumped.sync_tests.push(s),
             Err(e) => return Err(format!("malformed inventory line `{line}`: {e}")),
         }
@@ -48,43 +47,29 @@ pub(crate) fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
     Ok(dumped)
 }
 
-/// Result of Phase C: the deduped resources (dev images + data seeds) the
-/// selection declares, ready to become resource-graph nodes, plus the per-binary
-/// associations the engine gates admission on.
+/// Deduped resources the selection declares, ready to become resource-graph nodes, plus
+/// the per-binary associations the engine gates admission on.
+///
+/// - `*_by_binary` binary-scoped (`test_id`s collide across binaries)
+/// - `sync_by_binary` also undeduped: every binary linking a profile must exclude it from
+///   *its own* selection, or the run silently shrinks
+/// - `Failed` aborts the CLI before any provisioning
 #[derive(Debug, Clone)]
 pub enum DumpOutcome {
-    /// Inventory was successfully dumped from every selected binary.
     Discovered {
-        /// Deduped dev images across the whole selection (the graph's image nodes).
         images: Vec<DevImageEntry>,
-        /// Deduped seeds across the whole selection (the graph's seed nodes).
         seeds: Vec<SeedEntry>,
-        /// Per-binary dev images (deduped within a binary): the binary-level image
-        /// edge — every test in a binary depends on that binary's images.
         images_by_binary: Vec<(String, Vec<DevImageEntry>)>,
-        /// Per-binary test→resource edges (`#[ztest::archive]`/`#[needs]`): the
-        /// sound per-test seed edge. Binary-scoped because `test_id`s can collide
-        /// across binaries.
         deps_by_binary: Vec<(String, Vec<TestDepEntry>)>,
-        /// `#[ztest::sync_test]` profiles across the selection (deduped by
-        /// `test_id`). The `ztest sync` controller resolves a profile name to its
-        /// binary + libtest test from these.
         sync_tests: Vec<SyncTestEntry>,
-        /// Per-binary sync profiles, undeduped: the exclusion edge `ztest run`
-        /// subtracts from its work-list. Binary-scoped for the same reason as
-        /// `deps_by_binary` — a profile's libtest name can collide with an
-        /// ordinary test in another binary, and dropping that one would silently
-        /// shrink the run.
         sync_by_binary: Vec<(String, Vec<SyncTestEntry>)>,
     },
-    /// One or more binaries failed to dump (non-zero exit, stderr captured). The
-    /// CLI surfaces this and aborts before provisioning.
-    Failed { detail: String },
+    Failed {
+        detail: String,
+    },
 }
 
-/// Dump each selected binary's inventory (serial; each is sub-100ms), then
-/// [`assemble`] the deduped resource lists and per-binary edges. Per-binary lists
-/// stay binary-scoped because test names can collide across binaries.
+/// Serial — each dump is sub-100ms
 pub async fn discover(binaries: &[SelectedBinary]) -> (DumpOutcome, Vec<(String, Vec<QosEntry>)>) {
     let mut dumps: Vec<Dumped> = Vec::with_capacity(binaries.len());
     for bin in binaries {
@@ -92,9 +77,7 @@ pub async fn discover(binaries: &[SelectedBinary]) -> (DumpOutcome, Vec<(String,
             Ok(d) => dumps.push(d),
             Err(detail) => {
                 return (
-                    DumpOutcome::Failed {
-                        detail: format!("{}: {detail}", bin.binary_id),
-                    },
+                    DumpOutcome::Failed { detail: format!("{}: {detail}", bin.binary_id) },
                     Vec::new(),
                 );
             }
@@ -103,10 +86,8 @@ pub async fn discover(binaries: &[SelectedBinary]) -> (DumpOutcome, Vec<(String,
     assemble(binaries, dumps)
 }
 
-/// Fold each binary's [`Dumped`] into the deduped resource set plus per-binary
-/// edges. Shared by the local ([`discover`]) and on-cluster
-/// ([`crate::pipeline::remote_compile`]) paths so dedup lives in one place.
-/// `binaries` and `dumps` are index-aligned.
+/// `binaries` and `dumps` index-aligned. Shared by the local ([`discover`]) and on-cluster
+/// ([`crate::pipeline::remote_compile`]) paths → dedup lives in one place
 pub(crate) fn assemble(
     binaries: &[SelectedBinary],
     dumps: Vec<Dumped>,
@@ -123,14 +104,8 @@ pub(crate) fn assemble(
     let mut sync_by_binary: Vec<(String, Vec<SyncTestEntry>)> = Vec::new();
 
     for (bin, dumped) in binaries.iter().zip(dumps) {
-        let Dumped {
-            dev,
-            qos,
-            seeds: s,
-            deps,
-            sync_tests: syncs,
-        } = dumped;
-        // Per-binary images, deduped within the binary (the binary edge).
+        let Dumped { dev, qos, seeds: s, deps, sync_tests: syncs } = dumped;
+        // Per-binary images, deduped within the binary (the binary edge)
         let mut seen_bin_img: BTreeSet<DedupKey> = BTreeSet::new();
         let mut bin_images: Vec<DevImageEntry> = Vec::new();
         for d in dev {
@@ -145,9 +120,8 @@ pub(crate) fn assemble(
             images_by_binary.push((bin.binary_id.clone(), bin_images));
         }
         for e in s {
-            // Dedup on the OID: the same artifact declared from two binaries is
-            // one seed, and content addressing makes that true without the two
-            // needing to agree on where the file lives.
+            // Dedup on the OID: one artifact declared from two binaries is one seed, and
+            // content addressing gets there without the two agreeing on a file path
             if seen_seed.insert((e.oid.clone(), e.payload)) {
                 seeds.push(e);
             }
@@ -158,10 +132,9 @@ pub(crate) fn assemble(
         if !deps.is_empty() {
             deps_by_binary.push((bin.binary_id.clone(), deps));
         }
-        // Sync profiles dedup by `test_id` across binaries (a profile is defined
-        // once, but a shared helper crate could link it into several binaries).
-        // The per-binary edge keeps every copy: each binary that links a profile
-        // must have it excluded from that binary's selection.
+        // Sync profiles dedup by `test_id` across binaries (defined once, but a shared
+        // helper crate can link one into several). The per-binary edge keeps every copy —
+        // each linking binary must exclude it from that binary's selection
         if !syncs.is_empty() {
             sync_by_binary.push((bin.binary_id.clone(), syncs.clone()));
         }
@@ -184,8 +157,6 @@ pub(crate) fn assemble(
     )
 }
 
-/// Spawn one binary with `ZTEST_DUMP_INVENTORY=1` and parse the
-/// JSON-lines stdout into both registries.
 async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, String> {
     let mut cmd = Command::new(&bin.binary_path);
     cmd.env("ZTEST_DUMP_INVENTORY", "1")
@@ -195,12 +166,10 @@ async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, String> {
         .stdin(Stdio::null())
         .kill_on_drop(true);
 
-    // Inventory dumps are tiny (sub-100ms binaries), so capture end-to-end and
-    // demux via the shared `parse_inventory` rather than streaming.
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| format!("spawn `{}`: {e}", bin.binary_path.display()))?;
+    // Dumps are tiny (sub-100ms binaries) → capture end-to-end and demux via the shared
+    // `parse_inventory`, no streaming
+    let out =
+        cmd.output().await.map_err(|e| format!("spawn `{}`: {e}", bin.binary_path.display()))?;
     let stderr_tail = String::from_utf8_lossy(&out.stderr).into_owned();
     let dumped = parse_inventory(&String::from_utf8_lossy(&out.stdout))
         .map_err(|e| format!("{e}\nstderr:\n{}", tail(&stderr_tail, 20)))?;
@@ -209,25 +178,21 @@ async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, String> {
     if !status.success() {
         return Err(format!(
             "binary exited {} during inventory dump; stderr:\n{}",
-            status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "?".into()),
+            status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
             tail(&stderr_tail, 20)
         ));
     }
     Ok(dumped)
 }
 
+/// `source` = the `DevSource`'s Debug repr — fully discriminating and `Ord`, so it keys
+/// the set directly. `rust_version` must discriminate too (toolchains fork the tag;
+/// without it the variants collapse and only one gets built)
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DedupKey {
     repo: String,
-    /// Debug repr of the `DevSource` — fully discriminating (local paths or
-    /// git url+rev+paths) and `Ord`, so it keys the dedup set directly.
     source: String,
     features: Vec<String>,
-    /// Different rust toolchains fork the tag, so the pinned version must
-    /// discriminate too — else the variants collapse and only one gets built.
     rust_version: Option<String>,
 }
 

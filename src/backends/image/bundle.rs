@@ -1,9 +1,10 @@
-//! Build-context serialization: [`pack`] is the single source of both a dev
-//! image's `dev-<hash>` tag (the tar's digest) and the bytes the build consumes,
-//! so the tag can never name a context the archive didn't stage. The tar is
-//! deterministic (sorted paths, zeroed mtime/uid/gid, normalized mode),
-//! directory/regular-file only (symlinks dereferenced or dropped), and filtered
-//! by `.dockerignore` plus [`DEFAULT_IGNORES`].
+//! Build-context serialization.
+//!
+//! - [`pack`] = single source of both the `dev-<hash>` tag (the tar's digest) and the
+//!   bytes the build consumes → the tag can never name a context the archive didn't stage
+//! - Deterministic: sorted paths, zeroed mtime/uid/gid, normalized mode
+//! - Directories + regular files only (symlinks dereferenced or dropped)
+//! - Filtered by `.dockerignore` + [`DEFAULT_IGNORES`]
 
 use std::path::Path;
 
@@ -11,39 +12,30 @@ use sha2::{Digest, Sha256};
 
 use super::ImageError;
 
-/// Names always excluded, even without a `.dockerignore`: build output and
-/// VCS / JS-dependency trees that are never part of a source build.
+/// Names always excluded, `.dockerignore` or not: build output, VCS and JS-dependency
+/// trees, none of which belong to a source build
 pub(crate) const DEFAULT_IGNORES: [&str; 3] = ["target", ".git", "node_modules"];
 
-/// Where the Dockerfile is staged inside the archive; the one path never subject
-/// to `.dockerignore`.
+/// Where the Dockerfile is staged in the archive — the one path `.dockerignore` can't touch
 const DOCKERFILE: &str = "Dockerfile";
 
-/// A packed build context: the tar bundle and its content digest.
+#[allow(dead_code)] // `tar` is the packed context, kept for the on-cluster builder
 pub(crate) struct Bundle {
-    /// Uncompressed tar of the `.dockerignore`-filtered context with the chosen
-    /// Dockerfile staged at the root. Directory and regular-file entries only.
     pub tar: Vec<u8>,
-    /// Lowercase-hex SHA-256 of [`tar`](Self::tar): the bundle's content address.
     pub digest: String,
 }
 
-/// Serialize `context` — with `dockerfile` staged at the root as `Dockerfile` —
-/// into a deterministic source-bundle tar. See the module docs for the rules.
+/// `dockerfile` staged at the tar's root as `Dockerfile`, whatever its name on disk.
+/// Determinism rules: module docs
 pub(crate) fn pack(context: &Path, dockerfile: &Path) -> Result<Bundle, ImageError> {
     let ignore = Ignore::load(context);
     let mut entries = collect(context, &ignore)?;
 
-    // The chosen Dockerfile always wins over any the context carries.
-    let dockerfile = std::fs::read(dockerfile).map_err(|err| ImageError::ReadFile {
-        path: dockerfile.to_path_buf(),
-        err,
-    })?;
+    // Chosen Dockerfile always wins over any the context carries
+    let dockerfile = std::fs::read(dockerfile)
+        .map_err(|err| ImageError::ReadFile { path: dockerfile.to_path_buf(), err })?;
     entries.retain(|e| e.path != DOCKERFILE);
-    entries.push(Entry {
-        path: DOCKERFILE.to_string(),
-        kind: Kind::File(dockerfile),
-    });
+    entries.push(Entry { path: DOCKERFILE.to_string(), kind: Kind::File(dockerfile) });
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 
     let tar = write_tar(&entries)?;
@@ -57,25 +49,21 @@ enum Kind {
 }
 
 struct Entry {
-    /// Context-relative path with `/` separators; the entry's name in the tar.
     path: String,
     kind: Kind,
 }
 
-/// Walk `context`, applying `ignore` and the symlink policy, into unsorted
-/// entries. Only the built-in directories are pruned wholesale; everything else
-/// is filtered per entry so a `.dockerignore` `!` line can re-include a file
-/// under an excluded directory.
+/// Built-in directories pruned wholesale; everything else filtered per entry, so a
+/// `.dockerignore` `!` line can re-include a file under an excluded directory
 fn collect(context: &Path, ignore: &Ignore) -> Result<Vec<Entry>, ImageError> {
     let mut entries = Vec::new();
-    let walk = walkdir::WalkDir::new(context)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| match e.path().strip_prefix(context) {
+    let walk = walkdir::WalkDir::new(context).follow_links(false).into_iter().filter_entry(|e| {
+        match e.path().strip_prefix(context) {
             Ok(rel) => !(e.file_type().is_dir() && is_built_in_ignore(rel)),
-            // The context root itself — always descend.
+            // Context root itself — always descend
             Err(_) => true,
-        });
+        }
+    });
 
     for entry in walk {
         let entry = entry.map_err(|e| ImageError::Walk(e.to_string()))?;
@@ -86,31 +74,19 @@ fn collect(context: &Path, ignore: &Ignore) -> Result<Vec<Entry>, ImageError> {
         if ignore.excludes(rel, entry.file_type().is_dir()) {
             continue;
         }
-        let path = rel
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
+        let path = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
         let file_type = entry.file_type();
 
         if file_type.is_dir() {
-            entries.push(Entry {
-                path,
-                kind: Kind::Dir,
-            });
+            entries.push(Entry { path, kind: Kind::Dir });
         } else if file_type.is_file() {
-            entries.push(Entry {
-                path,
-                kind: Kind::File(read(entry.path())?),
-            });
+            entries.push(Entry { path, kind: Kind::File(read(entry.path())?) });
         } else if file_type.is_symlink() {
-            // A symlink to a regular file is inlined at the link's own path;
-            // anything else (broken, or a link to a dir/device) is dropped, so a
-            // stale symlink can never abort the build.
+            // Symlink → regular file: inlined at the link's own path. Anything else
+            // (broken, or → dir/device) dropped, so a stale symlink can't abort the build
             match std::fs::metadata(entry.path()) {
                 Ok(target) if target.is_file() => {
-                    entries.push(Entry {
-                        path,
-                        kind: Kind::File(read(entry.path())?),
-                    });
+                    entries.push(Entry { path, kind: Kind::File(read(entry.path())?) });
                 }
                 Ok(_) => tracing::debug!(link = %path, "bundle: skipping symlink to non-file"),
                 Err(_) => tracing::debug!(link = %path, "bundle: skipping broken symlink"),
@@ -121,14 +97,11 @@ fn collect(context: &Path, ignore: &Ignore) -> Result<Vec<Entry>, ImageError> {
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, ImageError> {
-    std::fs::read(path).map_err(|err| ImageError::ReadFile {
-        path: path.to_path_buf(),
-        err,
-    })
+    std::fs::read(path).map_err(|err| ImageError::ReadFile { path: path.to_path_buf(), err })
 }
 
-/// Emit `entries` (already sorted) as a reproducible tar: zeroed mtime/uid/gid
-/// and a normalized mode, so identical trees are byte-identical.
+/// `entries` must arrive sorted. Zeroed mtime/uid/gid + normalized mode → identical trees
+/// pack byte-identically
 fn write_tar(entries: &[Entry]) -> Result<Vec<u8>, ImageError> {
     let assemble = |e: &str| ImageError::Bundle(e.to_string());
     let mut builder = tar::Builder::new(Vec::new());
@@ -159,30 +132,22 @@ fn write_tar(entries: &[Entry]) -> Result<Vec<u8>, ImageError> {
     builder.into_inner().map_err(|e| assemble(&e.to_string()))
 }
 
-/// Whether any component of `rel` is a [`DEFAULT_IGNORES`] name — excluded at
-/// *any* depth (a nested `target/` is still build output), unlike the
-/// root-anchored `.dockerignore` patterns.
+/// Any component of `rel` a [`DEFAULT_IGNORES`] name? Excluded at *any* depth (a nested
+/// `target/` is still build output), unlike the root-anchored `.dockerignore` patterns
 fn is_built_in_ignore(rel: &Path) -> bool {
-    rel.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|s| DEFAULT_IGNORES.contains(&s))
-    })
+    rel.components().any(|c| c.as_os_str().to_str().is_some_and(|s| DEFAULT_IGNORES.contains(&s)))
 }
 
-/// The context's `.dockerignore` patterns, matched with Docker's semantics:
-/// root-anchored, `*` does not cross `/`, trailing `/` matches directories only,
-/// `!` re-includes, last matching pattern wins, a match on an ancestor directory
-/// excludes its children. Layered on top of [`is_built_in_ignore`].
+/// Context `.dockerignore` patterns with Docker's semantics: root-anchored, `*` never
+/// crosses `/`, trailing `/` = directories only, `!` re-includes, last match wins, an
+/// ancestor match excludes its children. Layered over [`is_built_in_ignore`]
 struct Ignore {
     patterns: Vec<Pattern>,
 }
 
 struct Pattern {
     matcher: globset::GlobMatcher,
-    /// A `!`-prefixed line: a match re-includes rather than excludes.
     negated: bool,
-    /// A trailing-`/` line: matches directories only.
     dir_only: bool,
 }
 
@@ -194,10 +159,9 @@ impl Ignore {
         Ignore { patterns }
     }
 
-    /// Whether the context-relative path `rel` is excluded from the bundle.
-    /// `is_dir` gates directory-only (`foo/`) patterns.
+    /// `rel` context-relative; `is_dir` gates directory-only (`foo/`) patterns
     fn excludes(&self, rel: &Path, is_dir: bool) -> bool {
-        // The build always needs these two, whatever the patterns say.
+        // The build always needs these two, whatever the patterns say
         if rel == Path::new(DOCKERFILE) || rel == Path::new(".dockerignore") {
             return false;
         }
@@ -225,31 +189,24 @@ impl Pattern {
             None => (false, line),
         };
         let dir_only = body.ends_with('/');
-        // A leading `/` or `./` is a no-op — every pattern is root-anchored — and
-        // a trailing `/` only marked dir-only. Strip them to the bare glob.
+        // Leading `/` or `./` = no-op (every pattern is root-anchored), trailing `/` only
+        // marked dir-only → strip to the bare glob
         let body = body.trim_matches('/');
         let body = body.strip_prefix("./").unwrap_or(body);
         if body.is_empty() {
             return None;
         }
-        let matcher = globset::GlobBuilder::new(body)
-            .literal_separator(true)
-            .build()
-            .ok()?
-            .compile_matcher();
-        Some(Pattern {
-            matcher,
-            negated,
-            dir_only,
-        })
+        let matcher =
+            globset::GlobBuilder::new(body).literal_separator(true).build().ok()?.compile_matcher();
+        Some(Pattern { matcher, negated, dir_only })
     }
 
     fn matches(&self, rel: &Path, is_dir: bool) -> bool {
         if self.matcher.is_match(rel) {
             return !self.dir_only || is_dir;
         }
-        // A match on an ancestor directory excludes the entry beneath it.
-        // Ancestors are directories, so dir-only patterns apply to them.
+        // An ancestor match excludes the entry beneath it; ancestors are directories, so
+        // dir-only patterns apply to them
         rel.ancestors()
             .skip(1)
             .take_while(|a| !a.as_os_str().is_empty())
@@ -263,7 +220,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A throwaway build context on disk, cleaned up on drop.
     struct Ctx {
         dir: PathBuf,
     }
@@ -295,15 +251,15 @@ mod tests {
         }
     }
 
-    /// Every bundle carries the staged Dockerfile at the root.
+    /// Every bundle carries the staged Dockerfile at the root
     #[test]
     fn stages_the_dockerfile() {
         let c = Ctx::new();
         assert!(tar_paths(&c.pack().tar).contains(&"Dockerfile".to_string()));
     }
 
-    /// Identical trees pack to identical bytes — the property the content
-    /// address (and registry dedup) rests on.
+    /// Identical trees pack to identical bytes = what the content address (and registry
+    /// dedup) rests on
     #[test]
     fn identical_trees_are_byte_identical() {
         let a = Ctx::new();
@@ -313,7 +269,7 @@ mod tests {
         assert_eq!(a.pack().tar, b.pack().tar);
     }
 
-    /// `DEFAULT_IGNORES` drops build output with no `.dockerignore` at all.
+    /// `DEFAULT_IGNORES` drops build output with no `.dockerignore` at all
     #[test]
     fn default_ignores_exclude_build_output() {
         let c = Ctx::new();
@@ -325,7 +281,7 @@ mod tests {
         assert!(!paths.iter().any(|p| p.contains("junk")), "{paths:?}");
     }
 
-    /// A broken symlink is skipped, not fatal — the `result` regression.
+    /// Broken symlink skipped, never fatal — the `result` regression
     #[test]
     #[cfg(unix)]
     fn broken_symlink_is_skipped() {
@@ -337,9 +293,8 @@ mod tests {
         assert!(!paths.contains(&"dangling".to_string()), "{paths:?}");
     }
 
-    /// A symlink to a regular file is materialized as that file's contents at
-    /// the link's own path (the `CLAUDE.md -> AGENTS.md` case), and never as a
-    /// symlink entry (which the build pod's unpack would mishandle).
+    /// Symlink → regular file materializes as that file's contents at the link's own path
+    /// (`CLAUDE.md -> AGENTS.md`), never a symlink entry (the build pod's unpack mishandles it)
     #[test]
     #[cfg(unix)]
     fn symlink_to_file_is_dereferenced() {
@@ -350,15 +305,12 @@ mod tests {
         assert_eq!(bytes, b"the docs");
     }
 
-    /// `.dockerignore` semantics: root-anchored globs, `**/` for depth, `!`
-    /// re-inclusion, and dir-only trailing `/`.
+    /// `.dockerignore` semantics: root-anchored globs, `**/` for depth, `!` re-inclusion,
+    /// dir-only trailing `/`
     #[test]
     fn dockerignore_semantics() {
         let c = Ctx::new();
-        c.write(
-            ".dockerignore",
-            b"*.log\n**/*.tmp\nbuild/\n!build/keep\nresult\n",
-        );
+        c.write(".dockerignore", b"*.log\n**/*.tmp\nbuild/\n!build/keep\nresult\n");
         c.write("app.log", b"x"); // *.log at root → excluded
         c.write("logs/deep.log", b"x"); // *.log does not cross `/` → kept
         c.write("a/b/c.tmp", b"x"); // **/*.tmp → excluded at depth
@@ -377,8 +329,7 @@ mod tests {
         );
     }
 
-    /// The Dockerfile is immune to `.dockerignore`, and ztest's staged copy wins
-    /// over one carried in the context.
+    /// Dockerfile immune to `.dockerignore`; ztest's staged copy wins over the context's
     #[test]
     fn dockerfile_is_never_excluded_and_ztest_wins() {
         let c = Ctx::new();
@@ -391,19 +342,11 @@ mod tests {
         assert_eq!(bytes, b"FROM ztest-chosen\n");
     }
 
-    /// Read the entry names from a tar (regular files and directories).
     fn tar_paths(tar: &[u8]) -> Vec<String> {
         tar::Archive::new(tar)
             .entries()
             .unwrap()
-            .map(|e| {
-                e.unwrap()
-                    .path()
-                    .unwrap()
-                    .to_string_lossy()
-                    .trim_end_matches('/')
-                    .to_string()
-            })
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().trim_end_matches('/').to_string())
             .collect()
     }
 

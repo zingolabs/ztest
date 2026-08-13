@@ -11,13 +11,10 @@ fn builder_chain_compiles_for_every_variant() {
     let _v = t.add_validator(
         Validator::zebrad("1.9.1")
             .named("alice")
-            .mount(mount_config!(
-                "tests/assets/sample.toml",
-                "/etc/zebrad/zebrad.toml"
-            ))
+            .mount(mount_config!("tests/assets/sample.toml", "/etc/zebrad/zebrad.toml"))
             .mount(mount_file!("tests/assets/blob.bin", "/seed.bin"))
             .mount(mount_archive!("tests/assets/archive.tar.zst", "/data"))
-            .resources("500m", "512Mi")
+            .resources(Cpu::millis(500), Mem::mib(512))
             .expose("extra", 18080),
     );
     let _w = t.add_validator(Validator::zcashd("6.4.1").named("bob"));
@@ -72,9 +69,6 @@ fn a_shipped_snapshot_is_the_same_handle_type() {
 
 #[test]
 fn endpoint_url_format() {
-    let e = Endpoint {
-        host: "127.0.0.1".parse().unwrap(),
-        port: 38291,
-    };
+    let e = Endpoint { host: "127.0.0.1".parse().unwrap(), port: 38291 };
     assert_eq!(e.url("http"), "http://127.0.0.1:38291");
 }

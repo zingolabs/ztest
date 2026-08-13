@@ -1,8 +1,10 @@
-//! Kubernetes quantity parsing and pod resource accounting.
+//! k8s quantity parsing + pod resource accounting.
 //!
-//! The cluster probe reserves each scheduled pod at `max(effective_request,
-//! observed_usage)`. This module supplies the spec-derived request footprint
-//! (`pod_effective_request`); the probe adds the metrics-derived usage term.
+//! - Probe reserves each pod at `max(effective_request, observed_usage)`
+//! - Here: the spec-derived `pod_effective_request` half (probe adds the usage term)
+//! - Scalar quantity parsing delegates to `ztest_attr::footprint`, which the
+//!   `footprint = ".."` attribute grammar also reads — one accepted syntax whether
+//!   a quantity came from an annotation or the apiserver
 
 use std::collections::BTreeMap;
 
@@ -11,124 +13,48 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use super::{ANNOTATION_IO_BPS, ANNOTATION_IO_IOPS, Resources};
 
-/// Parse a k8s CPU quantity to millicores. Handles `"500m"` = 500, `"2"` =
-/// 2000, `"1.5"` = 1500, and the rarer micro/nano suffixes (`"2500000n"` = 3,
-/// rounded up, conservative). An unrecognized form parses as 0; since 0
-/// under-counts (the unsafe direction for capacity), the goal is to leave no
-/// realistic k8s unit unhandled.
+/// k8s CPU quantity → millicores. `"500m"`/`"2"`/`"1.5"`/`"2500000n"` (rounds up).
+/// Unrecognized → 0, which under-counts (unsafe direction — leave no real unit unhandled)
 pub(crate) fn parse_cpu_milli(s: &str) -> u64 {
     parse_cpu_milli_opt(s).unwrap_or(0)
 }
 
-/// Like [`parse_cpu_milli`] but yields `None` on an unparseable quantity
-/// instead of `0`. Callers that must distinguish "absent or garbage" from a
-/// deliberate `0` (e.g. SA-budget validation, where a typo'd budget must be
-/// rejected loudly rather than silently become a zero budget that fails every
-/// request) use this; the probe path that under-counts safely uses the `u64`
-/// form.
+/// [`parse_cpu_milli`] with `None` for unparseable, for callers separating
+/// garbage from an intended `0` (typo'd SA budget must be rejected, not zeroed)
 pub(crate) fn parse_cpu_milli_opt(s: &str) -> Option<u64> {
-    let s = s.trim();
-    // Float-to-int casts saturate in Rust (>=1.45): NaN and negatives to 0,
-    // huge to u64::MAX. No panics.
-    let scaled = |body: &str, per_milli: f64| -> Option<u64> {
-        body.trim()
-            .parse::<f64>()
-            .ok()
-            .map(|v| (v / per_milli).round() as u64)
-    };
-    if let Some(n) = s.strip_suffix('m') {
-        // Millicores are integers in valid k8s quantities.
-        n.trim().parse::<u64>().ok()
-    } else if let Some(n) = s.strip_suffix('u') {
-        scaled(n, 1_000.0) // microcores → millicores
-    } else if let Some(n) = s.strip_suffix('n') {
-        scaled(n, 1_000_000.0) // nanocores → millicores
-    } else {
-        // Bare cores, possibly fractional or exponent ("1.5", "2e0").
-        s.parse::<f64>()
-            .ok()
-            .map(|cores| (cores * 1000.0).round() as u64)
-    }
+    ztest_attr::footprint::parse_cpu_milli(s)
 }
 
-/// Parse a k8s memory (or generic byte) quantity to bytes. Covers binary
-/// (`Ki/Mi/Gi/Ti/Pi/Ei`), decimal SI (`k/K, M, G, T, P, E`), exponent
-/// (`129e6`), and raw bytes. Overflow saturates; unparseable → 0.
+/// k8s memory/byte quantity → bytes: binary, decimal SI, exponent, raw.
+/// Overflow saturates, unparseable → 0
 pub(crate) fn parse_mem_bytes(s: &str) -> u64 {
     parse_mem_bytes_opt(s).unwrap_or(0)
 }
 
-/// Like [`parse_mem_bytes`] but yields `None` on an unparseable quantity
-/// instead of `0`; see [`parse_cpu_milli_opt`] for the absent-vs-garbage
-/// rationale.
+/// [`parse_mem_bytes`] with `None` for unparseable, see [`parse_cpu_milli_opt`]
 pub(crate) fn parse_mem_bytes_opt(s: &str) -> Option<u64> {
-    let s = s.trim();
-    // Order matters: two-char binary suffixes are checked before the
-    // single-char decimal ones they'd otherwise shadow.
-    let (num, mult) = if let Some(n) = s.strip_suffix("Ki") {
-        (n, 1u64 << 10)
-    } else if let Some(n) = s.strip_suffix("Mi") {
-        (n, 1u64 << 20)
-    } else if let Some(n) = s.strip_suffix("Gi") {
-        (n, 1u64 << 30)
-    } else if let Some(n) = s.strip_suffix("Ti") {
-        (n, 1u64 << 40)
-    } else if let Some(n) = s.strip_suffix("Pi") {
-        (n, 1u64 << 50)
-    } else if let Some(n) = s.strip_suffix("Ei") {
-        (n, 1u64 << 60)
-    } else if let Some(n) = s.strip_suffix('k').or_else(|| s.strip_suffix('K')) {
-        (n, 1_000)
-    } else if let Some(n) = s.strip_suffix('M') {
-        (n, 1_000_000)
-    } else if let Some(n) = s.strip_suffix('G') {
-        (n, 1_000_000_000)
-    } else if let Some(n) = s.strip_suffix('T') {
-        (n, 1_000_000_000_000)
-    } else if let Some(n) = s.strip_suffix('P') {
-        (n, 1_000_000_000_000_000)
-    } else if let Some(n) = s.strip_suffix('E') {
-        (n, 1_000_000_000_000_000_000)
-    } else {
-        (s, 1)
-    };
-    let num = num.trim();
-    if let Ok(v) = num.parse::<u64>() {
-        Some(v.saturating_mul(mult))
-    } else if let Ok(f) = num.parse::<f64>() {
-        // Fractional/exponent forms ("1.5Gi", "129e6").
-        Some((f.max(0.0) * mult as f64).round() as u64)
-    } else {
-        None
-    }
+    ztest_attr::footprint::parse_mem_bytes(s)
 }
 
-/// One container's `requests` as [`Resources`] (cpu millicores + memory bytes).
-/// Absent → zero.
+/// Absent `requests` → [`Resources::ZERO`].
 pub(crate) fn container_requests(c: &Container) -> Resources {
     container_amount(c.resources.as_ref().and_then(|r| r.requests.as_ref()))
 }
 
-/// Parse a `requests`/`limits` quantity map into [`Resources`]. I/O has no k8s
-/// request/limit field, so the I/O dimensions are always zero here — the harness
-/// enforces I/O per pod via cgroup `io.max` (see `docs/design-qos.md`),
-/// not through the k8s resource model.
+/// I/O dimensions always zero (no k8s I/O field; harness caps via cgroup `io.max`,
+/// see `docs/design-qos.md`)
 fn container_amount(map: Option<&BTreeMap<String, Quantity>>) -> Resources {
     let Some(map) = map else {
         return Resources::ZERO;
     };
     let cpu = map.get("cpu").map(|q| parse_cpu_milli(&q.0)).unwrap_or(0);
-    let mem = map
-        .get("memory")
-        .map(|q| parse_mem_bytes(&q.0))
-        .unwrap_or(0);
+    let mem = map.get("memory").map(|q| parse_mem_bytes(&q.0)).unwrap_or(0);
     Resources::new(cpu, mem, 0, 0)
 }
 
-/// The pod-level effective footprint for a per-container amount, following the
-/// Kubernetes effective-request model rather than a naive sum: native sidecars
-/// (init containers with `restartPolicy: Always`, k8s >=1.28) run for the whole
-/// pod lifetime, while plain init containers contribute only a transient peak.
+/// Pod-level footprint on k8s's effective-request model, not a naive sum:
+/// native sidecars (init + `restartPolicy: Always`) run pod-lifetime, plain init
+/// containers only peak.
 ///
 /// ```text
 /// running   = Σ regular containers + Σ native-sidecar init containers
@@ -136,14 +62,10 @@ fn container_amount(map: Option<&BTreeMap<String, Quantity>>) -> Resources {
 /// effective = max(running, init_peak)          // per dimension
 /// ```
 fn pod_effective(pod: &PodSpec, per_container: impl Fn(&Container) -> Resources) -> Resources {
-    // Regular containers always run.
-    let mut running = pod.containers.iter().fold(Resources::ZERO, |acc, c| {
-        acc.saturating_add(&per_container(c))
-    });
+    let mut running =
+        pod.containers.iter().fold(Resources::ZERO, |acc, c| acc.saturating_add(&per_container(c)));
 
-    // Init containers, in order: native sidecars add permanently; plain init
-    // containers contribute their transient peak (their own amount plus the
-    // sidecars that started before them).
+    // In order: sidecars add permanently, plain init peaks at own amount + sidecars so far
     let mut sidecars = Resources::ZERO;
     let mut init_peak = Resources::ZERO;
     for c in pod.init_containers.iter().flatten() {
@@ -159,31 +81,20 @@ fn pod_effective(pod: &PodSpec, per_container: impl Fn(&Container) -> Resources)
     running.max(&init_peak)
 }
 
-/// The effective CPU + memory request of a pod, composed by the
-/// effective-request model above. The floor the probe reserves per pod; it then
-/// takes `max(request, usage)` so a Burstable co-tenant running above its
-/// request is still bounded. CPU and memory only — disk I/O is a property of the
-/// volume, declared on the PVC (see [`pvc_io_reservation`]).
+/// Per-pod reservation floor, later `max`'d with usage (bounds a bursting co-tenant).
+/// CPU+memory only, disk I/O rides the PVC ([`pvc_io_reservation`])
 pub(crate) fn pod_effective_request(pod: &PodSpec) -> Resources {
     pod_effective(pod, container_requests)
 }
 
-/// A PVC's disk-I/O reservation, read from
-/// [`ANNOTATION_IO_BPS`]/[`ANNOTATION_IO_IOPS`]. I/O lives on the volume, not the
-/// pod. CPU/memory are always zero here; a PVC with neither annotation reserves
-/// nothing — an uncapped volume the probe cannot bound.
+/// From [`ANNOTATION_IO_BPS`]/[`ANNOTATION_IO_IOPS`], CPU/memory always zero.
+/// Neither annotation = nothing reserved (uncapped volume, unbounded by the probe)
 pub(crate) fn pvc_io_reservation(pvc: &PersistentVolumeClaim) -> Resources {
     let Some(a) = pvc.metadata.annotations.as_ref() else {
         return Resources::ZERO;
     };
-    let io_bps = a
-        .get(ANNOTATION_IO_BPS)
-        .map(|s| parse_mem_bytes(s))
-        .unwrap_or(0);
-    let io_iops = a
-        .get(ANNOTATION_IO_IOPS)
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+    let io_bps = a.get(ANNOTATION_IO_BPS).map(|s| parse_mem_bytes(s)).unwrap_or(0);
+    let io_iops = a.get(ANNOTATION_IO_IOPS).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
     Resources::new(0, 0, io_bps, io_iops)
 }
 
@@ -218,10 +129,7 @@ mod tests {
         assert_eq!(parse_mem_bytes("1T"), 1_000_000_000_000);
         assert_eq!(parse_mem_bytes("1k"), 1_000);
         assert_eq!(parse_mem_bytes("129e6"), 129_000_000);
-        assert_eq!(
-            parse_mem_bytes("1.5Gi"),
-            1024 * 1024 * 1024 + 512 * 1024 * 1024
-        );
+        assert_eq!(parse_mem_bytes("1.5Gi"), 1024 * 1024 * 1024 + 512 * 1024 * 1024);
         assert_eq!(parse_mem_bytes("1048576"), 1_048_576);
         assert_eq!(parse_mem_bytes("nope"), 0);
     }
@@ -241,15 +149,11 @@ mod tests {
     }
 
     fn sidecar(cpu: &str, mem: &str) -> Container {
-        Container {
-            restart_policy: Some("Always".into()),
-            ..container(cpu, mem)
-        }
+        Container { restart_policy: Some("Always".into()), ..container(cpu, mem) }
     }
 
-    /// A Burstable container: `requests` below `limits`. The probe reserves it at
-    /// its *request* (the scheduler floor); the burst headroom above request is
-    /// accounted separately, via observed usage.
+    /// Burstable: `requests` < `limits`. Reserved at *request*, headroom above it
+    /// accounted separately via observed usage
     fn burstable(cpu_req: &str, mem_req: &str, cpu_lim: &str, mem_lim: &str) -> Container {
         Container {
             name: "c".into(),
@@ -276,15 +180,11 @@ mod tests {
         }
     }
 
-    // The effective-model composition (sums, sidecars, init peak) is exercised
-    // through `pod_effective_request`, which reserves the pod at its request.
+    // Effective-model composition exercised through `pod_effective_request`
 
     #[test]
     fn request_sums_regular_containers() {
-        let p = pod(
-            vec![container("500m", "512Mi"), container("1", "1Gi")],
-            vec![],
-        );
+        let p = pod(vec![container("500m", "512Mi"), container("1", "1Gi")], vec![]);
         let fp = pod_effective_request(&p);
         assert_eq!(fp.cpu_milli, 1500);
         assert_eq!(fp.mem_bytes, 512 * 1024 * 1024 + GIB);
@@ -300,10 +200,10 @@ mod tests {
 
     #[test]
     fn request_takes_plain_init_peak_when_larger() {
-        // Transient init needs 4 CPU; steady state only 1 → request-peak 4.
+        // Transient init 4 CPU vs steady 1 → peak 4
         let p = pod(vec![container("1", "1Gi")], vec![container("4", "1Gi")]);
         assert_eq!(pod_effective_request(&p).cpu_milli, 4000);
-        // Small init under the running total changes nothing.
+        // Small init under the running total = no change
         let p = pod(vec![container("2", "1Gi")], vec![container("1", "512Mi")]);
         assert_eq!(pod_effective_request(&p).cpu_milli, 2000);
     }
@@ -311,59 +211,41 @@ mod tests {
     #[test]
     fn request_of_empty_and_resourceless_pod_is_zero() {
         assert_eq!(pod_effective_request(&PodSpec::default()), Resources::ZERO);
-        let bare = pod(
-            vec![Container {
-                name: "c".into(),
-                ..Default::default()
-            }],
-            vec![],
-        );
+        let bare = pod(vec![Container { name: "c".into(), ..Default::default() }], vec![]);
         assert_eq!(pod_effective_request(&bare), Resources::ZERO);
     }
 
-    // The request rule: the probe reserves a pod at its request (the scheduler
-    // floor), ignoring the limit — the burst above request is caught separately
-    // by observed usage, not by reserving the whole limit.
+    // Reserve at request (scheduler floor), never the limit (burst caught via usage)
 
     #[test]
     fn request_ignores_the_limit() {
-        // A Burstable pod is reserved at its request; its limit must not
-        // sterilize the node.
+        // Limit must not sterilize the node
         let p = pod(vec![burstable("8", "4Gi", "24", "16Gi")], vec![]);
         let fp = pod_effective_request(&p);
         assert_eq!(fp.cpu_milli, 8_000);
         assert_eq!(fp.mem_bytes, 4 * GIB);
-        // A Guaranteed pod (requests == limits) reserves exactly that.
+        // Guaranteed (requests == limits) reserves exactly that
         let g = pod(vec![burstable("2", "2Gi", "2", "2Gi")], vec![]);
-        assert_eq!(
-            pod_effective_request(&g),
-            Resources::new(2_000, 2 * GIB, 0, 0)
-        );
+        assert_eq!(pod_effective_request(&g), Resources::new(2_000, 2 * GIB, 0, 0));
     }
 
     #[test]
     fn pod_request_covers_cpu_and_memory_only() {
-        // Disk I/O is not a pod-`resources` field in Kubernetes — it is declared
-        // on the volume (PVC), not the pod. So the pod request carries no I/O
-        // dimension; the probe sums that separately from the pod's PVCs (see
-        // `pvc_io_reservation`).
+        // Disk I/O declared on the PVC, not the pod → summed separately
         let p = pod(vec![burstable("8", "4Gi", "24", "16Gi")], vec![]);
         let fp = pod_effective_request(&p);
         assert_eq!(fp.io_bps, 0);
         assert_eq!(fp.io_iops, 0);
     }
 
-    // I/O reservation is a property of the storage request (the PVC).
+    // I/O reservation = a property of the PVC
 
     fn pvc(annotations: &[(&str, &str)]) -> PersistentVolumeClaim {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
         PersistentVolumeClaim {
             metadata: ObjectMeta {
                 annotations: (!annotations.is_empty()).then(|| {
-                    annotations
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect()
+                    annotations.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
                 }),
                 ..Default::default()
             },
@@ -377,17 +259,16 @@ mod tests {
         let fp = pvc_io_reservation(&p);
         assert_eq!(fp.io_bps, 100 * crate::qos::MIB);
         assert_eq!(fp.io_iops, 5_000);
-        // Never CPU/memory — those come from the pod.
+        // Never CPU/memory (those come from the pod)
         assert_eq!(fp.cpu_milli, 0);
         assert_eq!(fp.mem_bytes, 0);
     }
 
     #[test]
     fn pvc_io_reservation_is_zero_for_an_uncapped_volume() {
-        // No annotation → no reservation. Such a volume is uncapped; the probe
-        // cannot bound its I/O (why co-tenant volumes must be capped).
+        // No annotation → no reservation (uncapped volume; why co-tenants must be capped)
         assert_eq!(pvc_io_reservation(&pvc(&[])), Resources::ZERO);
-        // A partial annotation still yields the dimension it declares.
+        // Partial annotation still yields the dimension it declares
         let bps_only = pvc(&[(ANNOTATION_IO_BPS, "50Mi")]);
         assert_eq!(pvc_io_reservation(&bps_only).io_bps, 50 * crate::qos::MIB);
         assert_eq!(pvc_io_reservation(&bps_only).io_iops, 0);

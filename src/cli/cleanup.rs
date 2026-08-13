@@ -1,26 +1,13 @@
-//! `ztest cleanup`: reclaim the test resources a developer's runs left behind.
+//! `ztest cleanup`: reclaim leftover *test* resources. Sole verb that deletes
+//! cluster resources (`ztest sync` starts/observes/stops, never removes).
 //!
-//! Scoped to *test resources*, never cluster lifecycle — the cluster and its
-//! shared infrastructure (CSI, snapshot classes, RBAC, the `ztest*` namespaces)
-//! belong to `ztest setup`, and the content-addressed seed cache to
-//! `ztest snapshot prune`. Cleanup must never make the next run need a
-//! re-`setup`. See [`crate::resource::reclaim`] for the full ownership table.
-//!
-//! This is the *only* verb that deletes cluster resources. `ztest sync` starts,
-//! observes, and stops syncs; it does not remove them — reclaiming a finished
-//! sync's namespace is the same operation as reclaiming a leftover test
-//! namespace, and splitting it across two commands only invited them to disagree
-//! about whose resources are whose.
-//!
-//! Three scopes and one safety gate:
-//!
-//! - **Default** — only resources labelled `ztest.io/user=$USER`.
-//! - **`<TARGET>…`** — just the named syncs/runs, resolved across all users
-//!   because naming a resource is already an explicit instruction.
-//! - **`--all-users`** — everyone's. Needs an admin ServiceAccount able to
-//!   list/delete cluster-wide; without it the deletes come back as RBAC errors.
-//! - **Live resources are skipped** unless `--force`, so a cleanup run never
-//!   kills a concurrent `ztest run` or a multi-hour detached sync.
+//! - Never cluster lifecycle: cluster + shared infra belong to `ztest cluster setup`, the
+//!   seed cache to `ztest snapshot prune` (ownership table:
+//!   [`crate::resource::reclaim`])
+//! - Scope: default = `ztest.io/user=$USER`; `<TARGET>…` = named, across all users;
+//!   `--all-users` = everyone (needs cluster-wide list/delete, else RBAC errors)
+//! - Live resources skipped without `--force` (never kill a concurrent run or a
+//!   multi-hour sync)
 
 use std::process::ExitCode;
 
@@ -31,6 +18,11 @@ use crate::resource::reclaim::{self, Liveness, Outcome, Scope};
 
 #[derive(Debug, Parser)]
 pub struct Args {
+    /// Named cluster profile (see `ztest cluster`) — the same selector as
+    /// `ztest run --cluster`. Overrides the persisted default.
+    #[arg(long, value_name = "NAME")]
+    cluster: Option<String>,
+
     /// Reclaim only these resources, by sync id (as shown by `ztest sync list`),
     /// run id, or full object name. Omit to reclaim everything in scope.
     #[arg(value_name = "TARGET")]
@@ -53,25 +45,34 @@ pub struct Args {
 }
 
 pub fn execute(args: Args) -> ExitCode {
+    // Bind the profile, else cleanup reaps against the *ambient* kube-context.
+    // Must precede `block_on`: `activate` calls `set_var` (single-thread only) and
+    // `block_on` spawns runtime threads.
+    // SAFETY: still single-threaded here.
+    if let Err(detail) = unsafe { crate::cluster_config::activate(args.cluster.as_deref()) } {
+        eprintln!("ztest cleanup: {detail}");
+        return ExitCode::FAILURE;
+    }
     super::block_on("cleanup", super::Rt::Multi, run(&args))
 }
 
 async fn run(args: &Args) -> Result<(), String> {
-    let client = crate::cluster::client()
-        .await
-        .map_err(|e| format!("connect to cluster: {e}"))?;
+    let client = crate::cluster::client().await.map_err(|e| format!("connect to cluster: {e}"))?;
 
-    // A named target is an explicit instruction, so it is resolved against every
-    // user's resources: `ztest cleanup <id>` must not fail merely because the id
-    // belongs to a sync launched under a different account.
+    // Banner names the cluster: "nothing to reclaim" reads the same whichever one
+    // answered
+    let on =
+        crate::cluster_config::active_context().map(|c| format!(" on {c}")).unwrap_or_default();
+    // Named target = explicit instruction → AllUsers (an id owned by another
+    // account must still resolve)
     let scope = if args.all_users || !args.targets.is_empty() {
         if args.targets.is_empty() {
-            eprintln!("• reclaiming test resources for all users");
+            eprintln!("• reclaiming test resources for all users{on}");
         }
         Scope::AllUsers
     } else {
         let user = crate::naming::current_user();
-        eprintln!("• reclaiming test resources owned by `{user}`");
+        eprintln!("• reclaiming test resources owned by `{user}`{on}");
         Scope::User(user)
     };
 
@@ -130,8 +131,5 @@ fn report(outcome: &Outcome, dry_run: bool) -> Result<(), String> {
         );
         return Ok(());
     }
-    Err(format!(
-        "{} error(s); see `✗ …` lines above",
-        outcome.errors.len()
-    ))
+    Err(format!("{} error(s); see `✗ …` lines above", outcome.errors.len()))
 }

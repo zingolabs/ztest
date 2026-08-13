@@ -1,14 +1,9 @@
-//! Version-aware regtest config generators.
+//! Version-aware regtest config generators: `zcashd.conf`, `zebrad.toml`.
 //!
-//! Renders `zcashd.conf` and `zebrad.toml`, parameterised by the binary
-//! version so callers can declare `Validator::zebrad("5.1.1")` and get a
-//! conf the pod's binary accepts. Per-NU `nuparams` and TOML stanzas are
-//! gated behind release predicates: NU6.1 / NU6.2 are emitted only on
-//! binaries that recognise those branch IDs, since older binaries reject
-//! the `nuparams=` line and refuse to start.
-//!
-//! To add a release: add a `pub const` in the `versions` sub-module and a
-//! predicate method on [`Semver`] that switches on it.
+//! - Keyed on binary version, so `Validator::zebrad("5.1.1")` yields a conf that pod accepts
+//! - Per-NU `nuparams`/stanzas behind release predicates (an older binary rejects an
+//!   unknown `nuparams=` line and refuses to start)
+//! - New release = a `pub const` in `versions` + a predicate on [`Semver`]
 
 use std::fmt;
 use std::str::FromStr;
@@ -19,33 +14,27 @@ use crate::regtest::{FundingStreams, LockboxDisbursement};
 
 // ─────────────────────────── canonical addresses ──────────────────────
 
-/// Miner coinbase recipient. Must be P2PKH (`tm...`): zcashd rejects P2SH
-/// at the `-mineraddress=` parser. Derived from the canonical
-/// `abandon abandon ... art` regtest seed.
+/// Miner coinbase recipient, from the canonical `abandon ... art` seed.
+/// P2PKH (`tm...`) mandatory (zcashd's `-mineraddress=` parser rejects P2SH)
 pub const MINER_ADDRESS: &str = "tmBsTi2xWTjUdEXnuTceL7fecEQKeWaPDJd";
 
-/// Shielded (Sapling) miner coinbase recipient from the canonical
-/// `abandon ... art` regtest seed, pinning the coinbase to the Sapling
-/// pool. Valid at/after Sapling activation.
+/// Sapling miner coinbase recipient (`abandon ... art` seed), pinning the coinbase
+/// to Sapling. Valid at/after Sapling activation
 pub const SHIELDED_MINER_ADDRESS: &str =
     "zregtestsapling1fmq2ufux3gm0v8qf7x585wj56le4wjfsqsj27zprjghntrerntggg507hxh2ydcdkn7sx8kya7p";
 
-/// Orchard miner coinbase recipient: a regtest unified address
-/// (`uregtest1...`) with an Orchard receiver, under the canonical
-/// `abandon ... art` seed.
-///
-/// A coinbase builder pays the highest-priority active receiver (orchard,
-/// then sapling, then transparent), so this pins the coinbase to Orchard
-/// once NU5 is active and falls back to sapling below NU5.
+/// Unified regtest address with an Orchard receiver (`abandon ... art` seed).
+/// Coinbase builders pay the highest-priority active receiver → Orchard from NU5,
+/// sapling below it
 pub const ORCHARD_MINER_ADDRESS: &str = "uregtest1zkuzfv5m3yhv2j4fmvq5rjurkxenxyq8r7h4daun2zkznrjaa8ra8asgdm8wwgwjvlwwrxx7347r8w0ee6dqyw4rufw4wg9djwcr6frzkezmdw6dud3wsm99eany5r8wgsctlxquu009nzd6hsme2tcsk0v3sgjvxa70er7h27z5epr67p5q767s2z5gt88paru56mxpm6pwz0cu35m";
 
-/// NU6.1 lockbox-disbursement recipient. Must be P2SH (`t2...`): zebrad's
-/// `subsidy_is_valid` asserts `addr.is_script_hash()` here.
+/// NU6.1 lockbox-disbursement recipient. P2SH (`t2...`) mandatory (zebrad's
+/// `subsidy_is_valid` asserts `addr.is_script_hash()`)
 pub const LOCKBOX_ADDRESS: &str = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8";
 
 // ───────────────────────────── version model ──────────────────────────
 
-/// Semantic version `MAJOR.MINOR.PATCH`. Compared lexicographically.
+/// `MAJOR.MINOR.PATCH`, compared lexicographically
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Semver {
     pub major: u16,
@@ -69,9 +58,8 @@ pub struct VersionParseError {
 impl FromStr for Semver {
     type Err = VersionParseError;
 
-    /// Accepts `MAJOR.MINOR.PATCH`, with an optional `v` prefix and an
-    /// optional pre-release / build suffix (everything after the first
-    /// `-` or `+` is ignored). Trailing components default to `0`.
+    /// `MAJOR.MINOR.PATCH`, optional `v` prefix, anything past the first `-`/`+`
+    /// dropped. Missing trailing components = `0`
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let trimmed = s.trim_start_matches('v');
         let core = trimmed.split(['-', '+']).next().unwrap_or(trimmed);
@@ -94,93 +82,58 @@ impl FromStr for Semver {
                 reason: "more than three dot-separated components",
             });
         }
-        Ok(Semver {
-            major,
-            minor,
-            patch,
-        })
+        Ok(Semver { major, minor, patch })
     }
 }
 
-/// Named release constants; extend when a new pod image lands. Capability
-/// predicates compare `Semver` lexicographically against these.
+/// Named release constants, extended per new pod image. Capability predicates
+/// compare `Semver` lexicographically against these
 pub mod versions {
     use super::Semver;
 
     // ─── zcashd ───
-    /// First zcashd release that recognises the NU6.1 branch ID
-    /// (`4dec4df0`); earlier rejects the `nuparams=` line as "Invalid
-    /// network upgrade". `v6.20.0` is verified with both NU6.1 and NU6.2
-    /// nuparams.
-    pub const ZCASHD_NU6_1: Semver = Semver {
-        major: 6,
-        minor: 20,
-        patch: 0,
-    };
+    /// First zcashd knowing the NU6.1 branch ID `4dec4df0` (earlier: "Invalid
+    /// network upgrade" on the `nuparams=` line)
+    pub const ZCASHD_NU6_1: Semver = Semver { major: 6, minor: 20, patch: 0 };
 
-    /// First zcashd release that recognises the NU6.2 branch ID
-    /// (`5437f330`). See [`ZCASHD_NU6_1`]; `v6.20.0` is verified.
-    pub const ZCASHD_NU6_2: Semver = Semver {
-        major: 6,
-        minor: 20,
-        patch: 0,
-    };
+    /// First zcashd knowing the NU6.2 branch ID `5437f330`, see [`ZCASHD_NU6_1`]
+    pub const ZCASHD_NU6_2: Semver = Semver { major: 6, minor: 20, patch: 0 };
 
     // ─── zebrad ───
-    /// First zebrad release with NU6.1 testnet activation support. `1.0.0`
-    /// because NU6.1 predates every zebrad we run (gate dormant); bump only
-    /// if a future zebrad changes the activation-height key schema.
-    pub const ZEBRAD_NU6_1: Semver = Semver {
-        major: 1,
-        minor: 0,
-        patch: 0,
-    };
+    /// First zebrad with NU6.1 testnet activation. `1.0.0` = dormant gate (NU6.1
+    /// predates every zebrad we run); bump only on an activation-key schema change
+    pub const ZEBRAD_NU6_1: Semver = Semver { major: 1, minor: 0, patch: 0 };
 
-    /// First zebrad release with NU6.2 testnet activation support.
-    /// Same rationale as [`ZEBRAD_NU6_1`].
-    pub const ZEBRAD_NU6_2: Semver = Semver {
-        major: 1,
-        minor: 0,
-        patch: 0,
-    };
+    /// First zebrad with NU6.2 testnet activation, as [`ZEBRAD_NU6_1`]
+    pub const ZEBRAD_NU6_2: Semver = Semver { major: 1, minor: 0, patch: 0 };
 
-    /// First zebrad release that understands the `"NU6.3"` (Ironwood)
-    /// activation-height key. Earlier zebrad rejects the `"NU6.3"` nuparams
-    /// as an unknown upgrade. Verified tag `6.0.0-rc.0` (parses to `6.0.0`).
-    pub const ZEBRAD_NU6_3: Semver = Semver {
-        major: 6,
-        minor: 0,
-        patch: 0,
-    };
+    /// First zebrad knowing the `"NU6.3"` (Ironwood) activation-height key
+    /// (earlier rejects it as an unknown upgrade)
+    pub const ZEBRAD_NU6_3: Semver = Semver { major: 6, minor: 0, patch: 0 };
 }
 
 impl Semver {
-    /// `true` if this zcashd version recognises the NU6.1 (`4dec4df0`)
-    /// branch ID. Gates `nuparams=4dec4df0:…` emission.
+    /// Gates `nuparams=4dec4df0:…` emission
     pub fn zcashd_supports_nu6_1(&self) -> bool {
         *self >= versions::ZCASHD_NU6_1
     }
 
-    /// `true` if this zcashd version recognises the NU6.2 (`5437f330`)
-    /// branch ID.
+    /// Gates `nuparams=5437f330:…` emission
     pub fn zcashd_supports_nu6_2(&self) -> bool {
         *self >= versions::ZCASHD_NU6_2
     }
 
-    /// `true` if this zebrad version accepts the `NU6.1` activation
-    /// height under `[network.testnet_parameters.activation_heights]`.
+    /// `NU6.1` accepted under `[network.testnet_parameters.activation_heights]`
     pub fn zebrad_supports_nu6_1(&self) -> bool {
         *self >= versions::ZEBRAD_NU6_1
     }
 
-    /// `true` if this zebrad version accepts the `NU6.2` activation
-    /// height.
+    /// `NU6.2` accepted as an activation height
     pub fn zebrad_supports_nu6_2(&self) -> bool {
         *self >= versions::ZEBRAD_NU6_2
     }
 
-    /// `true` if this zebrad version accepts the `"NU6.3"` (Ironwood)
-    /// activation height and can mine/validate an Ironwood coinbase.
+    /// `"NU6.3"` (Ironwood) height accepted + Ironwood coinbase mine/validate
     pub fn zebrad_supports_nu6_3(&self) -> bool {
         *self >= versions::ZEBRAD_NU6_3
     }
@@ -188,20 +141,16 @@ impl Semver {
 
 // ─────────────────────────────── zcashd ───────────────────────────────
 
-/// Render the regtest `zcashd.conf` for a given binary version.
-///
-/// `rpc_port` is the port zcashd listens on inside the pod. The NU6.1 /
-/// NU6.2 `nuparams=` lines are gated on `zcashd_supports_nu6_*`.
+/// Regtest `zcashd.conf` for one binary version. NU6.1/NU6.2 `nuparams=` lines
+/// gated on `zcashd_supports_nu6_*`
 pub fn zcashd_conf(
     version: Semver,
     activation: &ActivationHeights,
     rpc_port: u16,
     miner_address: &str,
 ) -> String {
-    // One `nuparams=` line per activated upgrade. A `None` height means the
-    // topology ceiling excluded that upgrade, so the line is omitted rather
-    // than fed a value. NU6.1/NU6.2 also require a zcashd build that
-    // understands them (`zcashd_supports_*`).
+    // One line per activated upgrade. `None` = excluded by the topology ceiling →
+    // omit the line, never invent a value. NU6.1/NU6.2 also need `zcashd_supports_*`
     let nuparams: [(&str, &str, Option<u32>); 9] = [
         ("5ba81b19", "Overwinter", activation.overwinter()),
         ("76b809bb", "Sapling", activation.sapling()),
@@ -210,20 +159,8 @@ pub fn zcashd_conf(
         ("e9ff75a6", "Canopy", activation.canopy()),
         ("c2d6d0b4", "NU5 (Orchard)", activation.nu5()),
         ("c8e71055", "NU6", activation.nu6()),
-        (
-            "4dec4df0",
-            "NU6_1",
-            activation
-                .nu6_1()
-                .filter(|_| version.zcashd_supports_nu6_1()),
-        ),
-        (
-            "5437f330",
-            "NU6_2",
-            activation
-                .nu6_2()
-                .filter(|_| version.zcashd_supports_nu6_2()),
-        ),
+        ("4dec4df0", "NU6_1", activation.nu6_1().filter(|_| version.zcashd_supports_nu6_1())),
+        ("5437f330", "NU6_2", activation.nu6_2().filter(|_| version.zcashd_supports_nu6_2())),
     ];
     let mut nuparams_lines = String::new();
     for (branch_id, label, height) in nuparams {
@@ -274,24 +211,19 @@ minetolocalwallet=0
 
 // ─────────────────────────────── zebrad ───────────────────────────────
 
-/// Persistent on-disk state for a zebrad that shares its zebra-state DB
-/// with a colocated zaino StateService. zebrad persists state to
-/// `cache_dir` and serves its indexer gRPC so the StateService can open the
-/// same database as a RocksDB secondary and sync the non-finalized tip.
+/// On-disk state for a zebrad sharing its zebra-state DB with a colocated zaino
+/// StateService (which opens it as a RocksDB secondary over the indexer gRPC).
+/// `indexer_listen_port: None` = persist without that gRPC (chain-cache, no StateService)
 #[derive(Debug, Clone, Copy)]
 pub struct ZebradPersistentState<'a> {
     pub cache_dir: &'a str,
-    /// `None` persists state without serving the indexer gRPC: the
-    /// chain-cache case, where state loads from an archive and no
-    /// StateService shares the DB.
     pub indexer_listen_port: Option<u16>,
 }
 
-/// Render the regtest `zebrad.toml` for a given binary version.
+/// Regtest `zebrad.toml` for one binary version.
 ///
-/// `rpc_port` is the JSON-RPC listen port. Passing `0` for
-/// `p2p_listen_port` lets zebrad bind an ephemeral port. The NU6.1 / NU6.2
-/// activation-height entries are gated on `zebrad_supports_nu6_*`.
+/// - `p2p_listen_port` `0` → zebrad binds an ephemeral port
+/// - NU6.1/NU6.2 activation-height entries gated on `zebrad_supports_nu6_*`
 #[allow(clippy::too_many_arguments)]
 pub fn zebrad_conf(
     version: Semver,
@@ -323,10 +255,8 @@ pub fn zebrad_conf(
     let peers_toml = if peers.is_empty() {
         "[]".to_string()
     } else {
-        let quoted: Vec<String> = peers
-            .iter()
-            .map(|(host, port)| format!("\"{host}:{port}\""))
-            .collect();
+        let quoted: Vec<String> =
+            peers.iter().map(|(host, port)| format!("\"{host}:{port}\"")).collect();
         format!("[{}]", quoted.join(", "))
     };
     let mut out = format!(
@@ -377,33 +307,16 @@ use_journald = false
 miner_address = \"{miner_address}\"{metrics_block}"
     );
 
-    // One entry per activated upgrade. A `None` height means the topology
-    // ceiling excluded that upgrade, so the entry is omitted rather than
-    // fed a value. NU6.1/NU6.2 also require a zebrad build that understands
-    // them (`zebrad_supports_*`).
+    // One entry per activated upgrade. `None` = excluded by the topology ceiling →
+    // omit, never invent a value. NU6.1/NU6.2 also need `zebrad_supports_*`
     out.push_str("\n\n[network.testnet_parameters.activation_heights]");
     let activation_entries: [(&str, Option<u32>); 6] = [
         ("Canopy", activation.canopy()),
         ("NU5", activation.nu5()),
         ("NU6", activation.nu6()),
-        (
-            "\"NU6.1\"",
-            activation
-                .nu6_1()
-                .filter(|_| version.zebrad_supports_nu6_1()),
-        ),
-        (
-            "\"NU6.2\"",
-            activation
-                .nu6_2()
-                .filter(|_| version.zebrad_supports_nu6_2()),
-        ),
-        (
-            "\"NU6.3\"",
-            activation
-                .nu6_3()
-                .filter(|_| version.zebrad_supports_nu6_3()),
-        ),
+        ("\"NU6.1\"", activation.nu6_1().filter(|_| version.zebrad_supports_nu6_1())),
+        ("\"NU6.2\"", activation.nu6_2().filter(|_| version.zebrad_supports_nu6_2())),
+        ("\"NU6.3\"", activation.nu6_3().filter(|_| version.zebrad_supports_nu6_3())),
     ];
     for (key, height) in activation_entries {
         if let Some(h) = height {
@@ -426,8 +339,8 @@ miner_address = \"{miner_address}\"{metrics_block}"
             "\n\n[network.testnet_parameters.post_nu6_funding_streams.height_range]\n\
              start = {start}\n\
              end = {end}",
-            start = streams.start_height,
-            end = streams.end_height,
+            start = streams.heights.start,
+            end = streams.heights.end,
         ));
         for r in &streams.recipients {
             out.push_str(&format!(
@@ -435,11 +348,10 @@ miner_address = \"{miner_address}\"{metrics_block}"
                  receiver = \"{receiver}\"\n\
                  numerator = {numerator}",
                 receiver = r.receiver.as_toml(),
-                numerator = r.numerator,
+                numerator = r.percent,
             ));
-            if let Some(addresses) = &r.addresses
-                && !addresses.is_empty()
-            {
+            let addresses = r.receiver.addresses();
+            if !addresses.is_empty() {
                 let quoted: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
                 out.push_str(&format!("\naddresses = [{}]", quoted.join(", ")));
             }
@@ -452,15 +364,11 @@ miner_address = \"{miner_address}\"{metrics_block}"
 
 // ─────────────────────────────── zainod ───────────────────────────────
 
-/// Render `zainod.toml` for a regtest pod.
+/// `zainod.toml` for a regtest pod. Mirrors
+/// [`crate::public_conf::public_zainod_conf`] but for `network = 'Regtest'`.
 ///
-/// Mirrors [`crate::public_conf::public_zainod_conf`]; the only semantic
-/// difference is `network = 'Regtest'`. `backend` picks fetch vs. state;
-/// `validator_host` / `validator_rpc_port` locate the paired validator pod;
-/// `zebra_db_path` / `zaino_db_path` are the container-side mount paths.
-///
-/// No version gates fire yet; `_version` is plumbed so a future schema
-/// change is one predicate away.
+/// - `*_db_path` = container-side mount paths
+/// - No version gate fires yet, `_version` plumbed for the next schema change
 #[allow(clippy::too_many_arguments)]
 pub fn regtest_zainod_conf(
     _version: Semver,
@@ -474,9 +382,7 @@ pub fn regtest_zainod_conf(
     validator_grpc: Option<&str>,
     metrics_port: Option<u16>,
 ) -> String {
-    // Only the `state` backend's syncer uses this (to pull the
-    // non-finalized tip from the validator's indexer gRPC), so it's emitted
-    // only when supplied.
+    // Only the `state` syncer uses it (non-finalized tip off the validator's indexer gRPC)
     let validator_grpc_line = match validator_grpc {
         Some(addr) => format!("\nvalidator_grpc_listen_address = '{addr}'"),
         None => String::new(),
@@ -537,29 +443,11 @@ mod tests {
 
     #[test]
     fn semver_parses_with_optional_v_prefix_and_suffix() {
-        assert_eq!(
-            "6.1.0".parse::<Semver>().unwrap(),
-            Semver {
-                major: 6,
-                minor: 1,
-                patch: 0
-            }
-        );
-        assert_eq!(
-            "v5.1.1".parse::<Semver>().unwrap(),
-            Semver {
-                major: 5,
-                minor: 1,
-                patch: 1
-            }
-        );
+        assert_eq!("6.1.0".parse::<Semver>().unwrap(), Semver { major: 6, minor: 1, patch: 0 });
+        assert_eq!("v5.1.1".parse::<Semver>().unwrap(), Semver { major: 5, minor: 1, patch: 1 });
         assert_eq!(
             "2.4.0-rc.1".parse::<Semver>().unwrap(),
-            Semver {
-                major: 2,
-                minor: 4,
-                patch: 0
-            }
+            Semver { major: 2, minor: 4, patch: 0 }
         );
         assert!("not-a-version".parse::<Semver>().is_err());
         assert!("1.2.3.4".parse::<Semver>().is_err());
@@ -568,12 +456,8 @@ mod tests {
     #[test]
     fn zcashd_v6_1_omits_nu6_1_and_nu6_2_nuparams() {
         let v: Semver = "6.1.0".parse().unwrap();
-        let conf = zcashd_conf(
-            v,
-            &regtest_test_activation_heights(),
-            28232,
-            SHIELDED_MINER_ADDRESS,
-        );
+        let conf =
+            zcashd_conf(v, &regtest_test_activation_heights(), 28232, SHIELDED_MINER_ADDRESS);
         assert!(conf.contains("nuparams=c8e71055:2 # NU6"));
         assert!(!conf.contains("4dec4df0"));
         assert!(!conf.contains("5437f330"));
@@ -582,12 +466,11 @@ mod tests {
 
     #[test]
     fn zebrad_nu6_1_activation_is_version_gated() {
-        // The gate is the whole reason this generator is version-aware: a
-        // zebrad past the NU6.1 cutoff must emit the activation-height keys,
-        // while one before it must omit them (older zebrad rejects the unknown
-        // key and refuses to start). Heights are read back from the fixture, so
-        // the assertion tracks the canonical schedule, not a magic number.
-        // `"NU6.1"` is TOML-quoted (the dot); `NU6` is bare.
+        // Gate = the reason this generator is version-aware: past the NU6.1 cutoff
+        // must emit the activation keys, before it must omit them (older zebrad
+        // refuses to start on the unknown key)
+        // Heights read back from the fixture, so this tracks the canonical schedule
+        // `"NU6.1"` TOML-quoted (the dot), `NU6` bare
         let heights = regtest_test_activation_heights();
 
         let supported = zebrad_conf(
@@ -644,10 +527,8 @@ mod tests {
 
     #[test]
     fn zebrad_persistent_state_emits_indexer_line_only_with_a_port() {
-        // Both branches of the persistent-state conditional: a shared-state pod
-        // exposes the indexer gRPC (the StateService syncer connects to it); a
-        // chain-cache pod persists the DB but runs no StateService, so it must
-        // omit the indexer line. Both persist (`ephemeral = false`).
+        // Both persistent-state branches: shared-state exposes the indexer gRPC
+        // (StateService syncer dials it), chain-cache omits it. Both `ephemeral = false`
         let render = |persistent| {
             zebrad_conf(
                 "5.1.1".parse().unwrap(),
@@ -682,10 +563,9 @@ mod tests {
 
     #[test]
     fn regtest_metrics_stanzas_are_gated_on_metrics_port() {
-        // The listener is rendered only for a prometheus-compiled image
-        // (`metrics_port.is_some()`), and it must land where TOML expects:
-        // zebrad's `[metrics]` table before the testnet-parameters subtables,
-        // zaino's `metrics_endpoint` key before the first `[section]`.
+        // Listener only for a prometheus-compiled image (`metrics_port.is_some()`),
+        // and it must land where TOML expects: zebrad's `[metrics]` before the
+        // testnet-parameters subtables, zaino's `metrics_endpoint` before the first `[section]`
         let zeb = |metrics_port| {
             zebrad_conf(
                 "5.1.1".parse().unwrap(),
@@ -705,9 +585,7 @@ mod tests {
         assert!(zeb_on.contains("endpoint_addr = \"0.0.0.0:9999\""));
         assert!(
             zeb_on.find("[metrics]").unwrap()
-                < zeb_on
-                    .find("[network.testnet_parameters.activation_heights]")
-                    .unwrap()
+                < zeb_on.find("[network.testnet_parameters.activation_heights]").unwrap()
         );
 
         let zai = |metrics_port| {

@@ -1,53 +1,38 @@
-//! `Surface`: the terminal-owning render primitive (one instance, owned by the
-//! render thread). Speaks only in already-composed ANSI strings and drives a
-//! manual sticky footer ([`super::footer`]): completed lines print into native
-//! scrollback, only the footer is repainted in place.
+//! `Surface` = terminal-owning render primitive, one instance, owned by the render thread.
 //!
-//! Each frame is wrapped in a DEC private mode 2026 synchronized update so the
-//! cursor-up + repaint present atomically (terminals without 2026 ignore it), and
-//! the cursor is hidden for the session so it never blinks inside the panel.
+//! - Composed ANSI strings in, manual sticky footer out ([`super::footer`])
+//! - Completed lines → native scrollback, only the footer repaints in place
+//! - Frame wrapped in DEC 2026 synchronized update → cursor-up + repaint land atomically
+//!   (terminals without 2026 ignore it)
+//! - Cursor hidden for the session (never blinks inside the panel)
 
 use std::io::{self, Write as _};
 
 use super::{bridge, footer};
 
-/// Minimum terminal width for the two-column panel. Below this the right
-/// (transfer) column is dropped and the left column spans the full width — a
-/// narrow terminal can't fit both without mangling either.
+/// Minimum width for the two-column panel. Below it the right (transfer) column drops
+/// and the left spans the full width
 const TWO_COL_MIN: u16 = 90;
 
-/// The left column's target width, held constant so every extra terminal column
-/// flows to the right (transfer) column, which is the one that wants the room.
+/// Left column target, held constant → every extra terminal column flows right
 const LEFT_COL_TARGET: u16 = 80;
-/// Floor for the right column when the terminal is too narrow to grant the left
-/// its target: the left yields down to this so the transfer column stays legible.
+/// Right-column floor on a terminal too narrow for the left's target (the left yields
+/// down to this, keeping transfers legible)
 const RIGHT_COL_MIN: u16 = 30;
 
-/// Minimum terminal width for the three-column panel: the left at its target,
-/// plus a middle and a right each at [`RIGHT_COL_MIN`]. Below this a scene that
-/// offered a middle column composes as two — left and *middle* — since a phase
-/// asks for a middle column precisely because that content is its live one.
+/// Minimum width for three columns = left at target + middle + right, each at
+/// [`RIGHT_COL_MIN`]. Below it a scene offering a middle composes as left + *middle*
+/// (a phase offers a middle because that is its live content)
 const THREE_COL_MIN: u16 = LEFT_COL_TARGET + RIGHT_COL_MIN * 2;
 
-/// Width of the middle column when three are shown. Fixed, so the extra columns
-/// of a wide terminal keep flowing to the right column as they do at two.
+/// Middle-column width at three columns. Fixed, so extra width still flows right
 const MID_COL_WIDTH: u16 = 34;
 
-/// Compose the two-column panel into ANSI rows, each clipped to `cols` so it
-/// stays exactly one physical row. At or above [`TWO_COL_MIN`] (with a non-empty
-/// right column) the width splits per [`two_col_split`]; below that, a single
-/// full-width left column. Overlong lines are clipped, never wrapped.
-/// The footer's physical rows: the live region (running-tests block) stacked
-/// above the two-column panel, with **every** line clipped to `cols` display
-/// columns so each occupies exactly one physical row.
+/// Footer's physical rows: live region stacked above the panel.
 ///
-/// This is the invariant [`super::footer::render`] relies on for its `prev_rows`
-/// cursor arithmetic. `compose_panel` already clips the panel; the live lines
-/// (e.g. a long `binary::test` running line from `engine::reporter::render_running`)
-/// arrive un-clipped, so a name wider than the terminal would otherwise wrap into
-/// a second physical row, desync `prev_rows`, and leak stale rows into scrollback.
-/// Clipping here — the one place that knows `cols` and owns the footer — protects
-/// every scene producer.
+/// - **Every** line clipped to `cols` = 1 logical line → 1 physical row, the invariant
+///   [`super::footer::render`]'s `prev_rows` cursor arithmetic rests on
+/// - Live lines arrive un-clipped (an over-wide name would wrap and leak stale rows)
 fn compose_footer(
     live: &[String],
     left: &str,
@@ -57,11 +42,7 @@ fn compose_footer(
 ) -> Vec<String> {
     let mut lines: Vec<String> = live
         .iter()
-        .flat_map(|l| {
-            bridge::ansi_rows(l, cols as usize)
-                .into_iter()
-                .map(|(s, _)| s)
-        })
+        .flat_map(|l| bridge::ansi_rows(l, cols as usize).into_iter().map(|(s, _)| s))
         .collect();
     lines.extend(compose_panel(left, mid, right, cols));
     lines
@@ -69,21 +50,14 @@ fn compose_footer(
 
 fn compose_panel(left: &str, mid: Option<&str>, right: &str, cols: u16) -> Vec<String> {
     let right = right.trim_end_matches('\n');
-    let mid = mid
-        .map(|m| m.trim_end_matches('\n'))
-        .filter(|m| !m.is_empty());
+    let mid = mid.map(|m| m.trim_end_matches('\n')).filter(|m| !m.is_empty());
 
-    // Three columns when one was offered and the terminal can seat it; otherwise
-    // two, keeping the middle over the right (see [`THREE_COL_MIN`]); otherwise
-    // one.
+    // Three when offered and seatable, else two keeping middle over right
+    // (see `THREE_COL_MIN`), else one
     let columns: Vec<(&str, u16)> = match mid {
         Some(mid) if cols >= THREE_COL_MIN => {
             let right_w = cols - LEFT_COL_TARGET - MID_COL_WIDTH;
-            vec![
-                (left, LEFT_COL_TARGET),
-                (mid, MID_COL_WIDTH),
-                (right, right_w),
-            ]
+            vec![(left, LEFT_COL_TARGET), (mid, MID_COL_WIDTH), (right, right_w)]
         }
         Some(mid) if cols >= TWO_COL_MIN => {
             let (left_w, mid_w) = two_col_split(cols);
@@ -94,17 +68,12 @@ fn compose_panel(left: &str, mid: Option<&str>, right: &str, cols: u16) -> Vec<S
             vec![(left, left_w), (right, right_w)]
         }
         _ => {
-            return bridge::ansi_rows(left, cols as usize)
-                .into_iter()
-                .map(|(s, _)| s)
-                .collect();
+            return bridge::ansi_rows(left, cols as usize).into_iter().map(|(s, _)| s).collect();
         }
     };
 
-    let rows: Vec<Vec<(String, usize)>> = columns
-        .iter()
-        .map(|(text, w)| bridge::ansi_rows(text, *w as usize))
-        .collect();
+    let rows: Vec<Vec<(String, usize)>> =
+        columns.iter().map(|(text, w)| bridge::ansi_rows(text, *w as usize)).collect();
     let n = rows.iter().map(Vec::len).max().unwrap_or(0);
     let last = rows.len() - 1;
     (0..n)
@@ -113,11 +82,9 @@ fn compose_panel(left: &str, mid: Option<&str>, right: &str, cols: u16) -> Vec<S
             for (col_ix, (col, (_, w))) in rows.iter().zip(columns.iter()).enumerate() {
                 let (text, used) = col.get(i).cloned().unwrap_or_default();
                 line.push_str(&text);
-                // Padded to its full width so the next column starts at a fixed
-                // offset and the panel cannot shear when one column's row is
-                // shorter than its neighbour's. The last needs none: every
-                // column is already clipped to its width, and trailing spaces to
-                // the screen edge only risk a wrap.
+                // Padded to full width → next column at a fixed offset, no shear on a
+                // short row. Last needs none (already clipped, and trailing spaces to
+                // the screen edge only risk a wrap)
                 if col_ix != last {
                     line.push_str(&" ".repeat((*w as usize).saturating_sub(used)));
                 }
@@ -127,10 +94,9 @@ fn compose_panel(left: &str, mid: Option<&str>, right: &str, cols: u16) -> Vec<S
         .collect()
 }
 
-/// Split a two-column width into `(left, right)`: the left is pinned to
-/// [`LEFT_COL_TARGET`] but yields toward [`RIGHT_COL_MIN`] on a tight terminal;
-/// the right takes everything left over (uncapped, so it grows with the screen).
-/// Only called for `width >= TWO_COL_MIN`, so the subtraction can't underflow.
+/// Two-column width → `(left, right)`: left pinned to [`LEFT_COL_TARGET`], yielding
+/// toward [`RIGHT_COL_MIN`] when tight; right takes the remainder, uncapped.
+/// Callers must pass `width >= TWO_COL_MIN` (else the subtraction underflows)
 fn two_col_split(width: u16) -> (u16, u16) {
     let left = LEFT_COL_TARGET.min(width - RIGHT_COL_MIN);
     (left, width - left)
@@ -138,18 +104,17 @@ fn two_col_split(width: u16) -> (u16, u16) {
 
 /// Restores the controlling terminal's line discipline on drop.
 ///
-/// Under cooked mode the kernel would echo keystrokes (most visibly `^C`) onto
-/// the drawn panel. We disable `ECHO` + `ICANON` but keep `ISIG`, so Ctrl-C still
-/// raises `SIGINT` rather than arriving as a raw byte. Restored by
-/// [`Surface::finish`] and, as a panic/`exit` backstop, by this guard's `Drop`.
+/// - `ECHO` + `ICANON` off (cooked mode echoes keystrokes, `^C` worst, onto the panel)
+/// - `ISIG` kept → Ctrl-C still raises `SIGINT` instead of arriving as a raw byte
+/// - Restored by [`Surface::finish`], with `Drop` as the panic/`exit` backstop
 struct TtyGuard {
     fd: std::os::fd::RawFd,
     original: Option<libc::termios>,
 }
 
 impl TtyGuard {
-    /// Enter no-echo / no-canonical mode on stdin's tty, remembering the prior
-    /// attributes. A no-op (`original: None`) if stdin isn't a tty.
+    /// Enter no-echo / no-canonical mode on stdin's tty, saving the prior attributes.
+    /// No-op (`original: None`) off a tty
     fn enter() -> TtyGuard {
         let fd = libc::STDIN_FILENO;
         let mut term: libc::termios = unsafe { std::mem::zeroed() };
@@ -164,8 +129,8 @@ impl TtyGuard {
         TtyGuard { fd, original }
     }
 
-    /// Restore the saved attributes. Idempotent: called by `finish` (so a
-    /// `process::exit` that skips `Drop` still restores) and again by `Drop`.
+    /// Restore the saved attributes. Idempotent — `finish` calls it (covering a
+    /// `Drop`-skipping `process::exit`) and `Drop` calls it again
     fn restore(&self) {
         if let Some(orig) = self.original.as_ref() {
             unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, orig) };
@@ -179,65 +144,52 @@ impl Drop for TtyGuard {
     }
 }
 
-/// Synchronized-update + cursor-visibility control sequences (DEC private modes).
+/// Synchronized-update + cursor-visibility sequences (DEC private modes)
 const SYNC_BEGIN: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
 const CURSOR_HIDE: &str = "\x1b[?25l";
 const CURSOR_SHOW: &str = "\x1b[?25h";
 
-/// The terminal owner: drives a manual sticky footer over real stdout. Holds the
-/// current width/height and the footer's last height (for the in-place repaint).
-/// Rendering is synchronous — no ratatui, no reserved viewport, no runtime.
+/// Terminal owner: manual sticky footer over real stdout, synchronous (no ratatui,
+/// no reserved viewport, no runtime). `prev_footer_rows` = last present's physical row
+/// count, threaded into [`footer::render`] to walk the cursor up
 pub(crate) struct Surface {
     stdout: io::Stdout,
     cols: u16,
     rows: u16,
-    /// Footer physical-row count from the last [`present`](Self::present), threaded
-    /// back into [`footer::render`] to walk the cursor up for the next repaint.
     prev_footer_rows: usize,
     tty: TtyGuard,
 }
 
 impl Surface {
-    /// The session surface. Hides the cursor for the session (shown again by
-    /// [`finish`](Self::finish)) and enters no-echo mode. Nothing is reserved: the
-    /// first [`present`](Self::present) draws the footer at the current cursor row
-    /// and every completed line above it scrolls into native scrollback.
+    /// Session surface: cursor hidden until [`finish`](Self::finish), no-echo entered.
+    /// Nothing reserved — the first [`present`](Self::present) draws the footer at the
+    /// current cursor row, completed lines scroll above it
     pub fn bottom_panel() -> io::Result<Surface> {
-        let (cols, rows) = terminal_size::terminal_size()
-            .map(|(w, h)| (w.0, h.0))
-            .unwrap_or((80, 40));
+        let (cols, rows) =
+            terminal_size::terminal_size().map(|(w, h)| (w.0, h.0)).unwrap_or((80, 40));
         let mut stdout = io::stdout();
         stdout.write_all(CURSOR_HIDE.as_bytes())?;
         stdout.flush()?;
-        Ok(Surface {
-            stdout,
-            cols,
-            rows,
-            prev_footer_rows: 0,
-            tty: TtyGuard::enter(),
-        })
+        Ok(Surface { stdout, cols, rows, prev_footer_rows: 0, tty: TtyGuard::enter() })
     }
 
     pub fn cols(&self) -> u16 {
         self.cols
     }
 
-    /// Rows available for the live region above the pinned panel (see
-    /// [`super::live_rows_for`]).
+    /// Rows for the live region above the panel (see [`super::live_rows_for`])
     pub fn live_rows(&self) -> u16 {
         super::live_rows_for(self.rows)
     }
 
-    /// Re-query and record the terminal size (after SIGWINCH).
     pub fn set_size(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
     }
 
-    /// Present one frame: commit `committed` into native scrollback, then repaint
-    /// the footer (the `live` rows above the two-column panel) in place. The whole
-    /// frame is one synchronized-update write.
+    /// One frame: `committed` → native scrollback, then repaint the footer (`live`
+    /// rows above the panel) in place. One synchronized-update write
     pub fn present(
         &mut self,
         committed: &[String],
@@ -247,8 +199,8 @@ impl Surface {
         right: &str,
     ) {
         let mut footer_lines = compose_footer(live, left, mid, right, self.cols);
-        // The cursor can't be walked up into scrollback, so a footer taller than
-        // the screen drops its oldest live rows.
+        // Cursor cannot walk up into scrollback → an over-tall footer sheds its
+        // oldest live rows
         let max = self.rows as usize;
         if footer_lines.len() > max {
             footer_lines.drain(0..footer_lines.len() - max);
@@ -263,15 +215,15 @@ impl Surface {
         let _ = self.stdout.flush();
     }
 
-    /// Tear down: commit `final_live` into native scrollback, erase the footer,
-    /// restore the terminal's line discipline, and show the cursor on a clean line.
+    /// Tear down: `final_live` → scrollback, footer erased, line discipline restored,
+    /// cursor shown on a clean line.
     ///
-    /// Takes `&mut self` (not `self`) so the render thread's hard-exit backstop can
-    /// restore in place before `process::exit` (which would skip `Drop`).
+    /// `&mut self` not `self`, so the hard-exit backstop restores in place before a
+    /// `Drop`-skipping `process::exit`
     pub fn finish(&mut self, final_live: &[String]) {
         self.tty.restore();
         let mut frame = String::new();
-        // An empty footer erases the panel, leaving the cursor on a fresh line.
+        // Empty footer erases the panel, cursor left on a fresh line
         footer::render(&mut frame, final_live, &[], self.prev_footer_rows);
         self.prev_footer_rows = 0;
         frame.push_str(CURSOR_SHOW);
@@ -282,7 +234,7 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        // Backstop for a drop that skipped `finish`: bring the cursor back.
+        // Backstop for a drop that skipped `finish`
         let _ = self.stdout.write_all(CURSOR_SHOW.as_bytes());
         let _ = self.stdout.flush();
     }
@@ -317,7 +269,7 @@ testnet-3.1m · 63%";
         assert!(j.contains("Scheduling"), "left col missing:\n{j}");
         assert!(j.contains("dev-zainod"), "right col missing:\n{j}");
         assert!(j.contains("testnet-3.1m"), "right col missing:\n{j}");
-        // The branded rule and the first transfer share the top row.
+        // Branded rule and first transfer share the top row
         assert!(out[0].contains("────"), "top rule row:\n{j}");
     }
 
@@ -326,10 +278,7 @@ testnet-3.1m · 63%";
         assert_eq!(two_col_split(160), (LEFT_COL_TARGET, 160 - LEFT_COL_TARGET));
         assert_eq!(two_col_split(240), (LEFT_COL_TARGET, 240 - LEFT_COL_TARGET));
         assert!(two_col_split(300).1 > two_col_split(200).1);
-        assert_eq!(
-            two_col_split(TWO_COL_MIN),
-            (TWO_COL_MIN - RIGHT_COL_MIN, RIGHT_COL_MIN)
-        );
+        assert_eq!(two_col_split(TWO_COL_MIN), (TWO_COL_MIN - RIGHT_COL_MIN, RIGHT_COL_MIN));
     }
 
     const WORK: &str = "
@@ -346,20 +295,15 @@ testnet-3.1m · 63%";
         assert!(j.contains("dev-zainod"), "right col missing:\n{j}");
     }
 
-    /// Which column goes when only two fit. The middle is offered by a phase
-    /// precisely because it is that phase's live content, so the static right
-    /// column is the one to shed — dropping the middle instead would leave the
-    /// watcher staring at counters while the rates went off-screen.
+    /// Which column goes when only two fit: the static right one, never the middle
+    /// (dropping the middle leaves a watcher on counters with the rates off-screen)
     #[test]
     fn a_two_column_terminal_keeps_the_middle_over_the_right() {
         let out = compose_panel(PREFLIGHT, Some(WORK), TRANSFERS, THREE_COL_MIN - 1);
         let j = joined(&out);
         assert!(j.contains("Preflight"), "left col missing:\n{j}");
         assert!(j.contains("total"), "mid col dropped:\n{j}");
-        assert!(
-            !j.contains("dev-zainod"),
-            "right col should have gone:\n{j}"
-        );
+        assert!(!j.contains("dev-zainod"), "right col should have gone:\n{j}");
     }
 
     #[test]
@@ -390,8 +334,8 @@ testnet-3.1m · 63%";
 
     #[test]
     fn every_panel_row_fits_within_cols() {
-        // The one invariant the footer's cursor math depends on: no composed row
-        // exceeds the terminal width (which would wrap into a second physical row).
+        // The invariant the footer's cursor math rests on: no composed row exceeds
+        // the terminal width (a wrap = a second physical row)
         for cols in [80u16, 90, 120, 200] {
             for row in compose_panel(PREFLIGHT, None, TRANSFERS, cols) {
                 let w = bridge::ansi_rows(&row, usize::MAX)[0].1;
@@ -412,9 +356,8 @@ testnet-3.1m · 63%";
 
     #[test]
     fn overlong_live_line_stays_one_physical_row() {
-        // A running-test line wider than the terminal must be clipped, not wrapped:
-        // a second physical row would desync `footer::render`'s `prev_rows` cursor
-        // math and leak stale live rows into scrollback.
+        // Over-wide running-test line must clip, not wrap (a second physical row
+        // desyncs `footer::render`'s `prev_rows` and leaks stale rows into scrollback)
         let live = vec![
             "PASS [  24.882s] clientless::chain_cache chain_query_interface::\
              ephemeral_serves_finalised_blocks_zebrad"
@@ -425,13 +368,12 @@ testnet-3.1m · 63%";
         ];
         for cols in [80u16, 100, 120] {
             let out = compose_footer(&live, PREFLIGHT, None, TRANSFERS, cols);
-            // Every row — the two live lines plus the panel — must fit in one
-            // physical row.
+            // Two live lines + panel, each in one physical row
             for row in &out {
                 let w = bridge::ansi_rows(row, usize::MAX)[0].1;
                 assert!(w <= cols as usize, "row {w} > {cols}: {row:?}");
             }
-            // The two live lines contribute exactly two rows (clipped, not wrapped).
+            // Two live lines = exactly two rows (clipped, not wrapped)
             let panel_rows = compose_panel(PREFLIGHT, None, TRANSFERS, cols).len();
             assert_eq!(
                 out.len(),

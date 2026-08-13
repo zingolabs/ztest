@@ -1,6 +1,6 @@
-//! Phase A3: archive discovery. Read-only walk of the `ztest-seeds` namespace,
-//! classifying `seed-{sha8}` PVCs as ready or pending. Provisioning happens in
-//! the resource graph; this module only observes for the preflight banner.
+//! Phase A3 archive discovery: read-only walk of `ztest-seeds`, classifying
+//! `seed-*` PVCs ready/pending. Observation for the preflight banner only —
+//! provisioning lives in the resource graph
 
 use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use kube::api::ListParams;
@@ -8,52 +8,37 @@ use kube::{Api, Client};
 
 use super::events::EventTx;
 
-/// Namespace where seed archives live.
 const SEEDS_NAMESPACE: &str = "ztest-seeds";
 
-/// PVC name prefix for archive seeds.
 const SEED_PVC_PREFIX: &str = "seed-";
 
-/// Label key indicating the archive is fully materialised.
+/// `"true"` once the archive is fully materialised
 const READY_LABEL: &str = "seeds.ztest.io/ready";
 
-/// One enumerated seed PVC, classified by readiness.
+/// `size_bytes` = `spec.resources.requests.storage`, `0` when unknown
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveEntry {
-    /// PVC name (`seed-<sha8>`).
     pub name: String,
-    /// Storage requested from `spec.resources.requests.storage`, in bytes;
-    /// `0` if unknown.
     pub size_bytes: u64,
-    /// `true` when `seeds.ztest.io/ready=true`, else pending materialisation.
     pub ready: bool,
 }
 
-/// Outcome of one Phase-A3 run.
+/// Both failure arms soft: `NamespaceMissing` = fresh cluster, `Failed` (RBAC, outage)
+/// shows in the banner and the run proceeds — archive-dependent tests fail at `TestEnv::build()`
 #[derive(Debug, Clone)]
 pub enum ArchivesOutcome {
-    /// PVCs enumerated.
     Discovered { entries: Vec<ArchiveEntry> },
-    /// The `ztest-seeds` namespace doesn't exist. Soft fail: likely a fresh
-    /// cluster that hasn't run any tests yet.
     NamespaceMissing,
-    /// API call failed (RBAC, transient outage). Soft fail: the banner shows
-    /// the error and the run proceeds; archive-dependent tests fail later at
-    /// `TestEnv::build()`.
     Failed { detail: String },
 }
 
-/// Discover archive PVCs in the `ztest-seeds` namespace.
-///
-/// Lifecycle events are emitted via [`EventTx`]. The function never
-/// panics; API errors are encoded in the [`ArchivesOutcome`] return.
+/// Never panics; API errors ride in the [`ArchivesOutcome`]
 pub async fn discover(client: &Client, _tx: &EventTx) -> ArchivesOutcome {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
     let pvcs = match api.list(&ListParams::default()).await {
         Ok(p) => p,
         Err(err) => {
-            // String-match the 404 rather than the typed error-kind, which is
-            // fragile across kube versions.
+            // String-match the 404: the typed error-kind is fragile across kube versions
             let s = err.to_string();
             if s.contains("not found") || s.contains("404") {
                 return ArchivesOutcome::NamespaceMissing;
@@ -67,8 +52,7 @@ pub async fn discover(client: &Client, _tx: &EventTx) -> ArchivesOutcome {
     ArchivesOutcome::Discovered { entries }
 }
 
-/// Classify a single PVC. `Some` for matching seed-PVCs; `None` for unrelated
-/// PVCs in the namespace (manual, leftover scratch volumes).
+/// `None` for non-seed PVCs in the namespace (manual, leftover scratch)
 fn classify_pvc(pvc: &PersistentVolumeClaim) -> Option<ArchiveEntry> {
     let name = pvc.metadata.name.as_deref()?;
     if !name.starts_with(SEED_PVC_PREFIX) {
@@ -92,16 +76,10 @@ fn classify_pvc(pvc: &PersistentVolumeClaim) -> Option<ArchiveEntry> {
         .map(parse_storage_bytes)
         .unwrap_or(0);
 
-    Some(ArchiveEntry {
-        name: name.to_string(),
-        size_bytes,
-        ready,
-    })
+    Some(ArchiveEntry { name: name.to_string(), size_bytes, ready })
 }
 
-/// k8s `Quantity` parser scoped to storage values (no millicpu form).
-/// Recognises `Ki Mi Gi Ti` (binary) and `K M G T` (decimal) suffixes, or plain
-/// bytes.
+/// Storage values only (no millicpu form): `Ki Mi Gi Ti`, `K M G T`, or plain bytes
 fn parse_storage_bytes(q: &k8s_openapi::apimachinery::pkg::api::resource::Quantity) -> u64 {
     let s = &q.0;
     let (num, mult) = if let Some(n) = s.strip_suffix("Ki") {

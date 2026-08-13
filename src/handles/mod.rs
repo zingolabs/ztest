@@ -1,9 +1,8 @@
 //! Component handles and per-category RPC dispatch.
 //!
-//! Every handle is a concrete per-backend struct (e.g. `ZebraValidator`)
-//! implementing its category's `*Backend` contract; backend-specific RPCs are
-//! inherent methods, so calling one on the wrong backend is a compile error.
-//! Each handle holds a [`HandleInner`] to reach its live component.
+//! - One concrete struct per backend (e.g. `ZebraValidator`) implementing its
+//!   category's `*Backend` contract, holding a [`HandleInner`]
+//! - Backend-specific RPCs stay inherent (wrong backend = compile error)
 
 pub mod client;
 pub mod indexer;
@@ -47,21 +46,17 @@ impl Endpoint {
 
 // ───────────────────────────── handles ─────────────────────────────────
 
-/// Opaque plumbing handed to a handle so it can reach its live component: a
-/// back-reference to the env plus the component id used to resolve endpoints.
-/// Fields are crate-private: third-party backends move it into their handle and
-/// call [`endpoint`](Self::endpoint), they don't construct or inspect it.
+/// Opaque plumbing a handle uses to reach its live component; backends move it in
+/// and call [`endpoint`](Self::endpoint).
+///
+/// - `regtest` rides here because RPC cannot recover it (zebra reports regtest as
+///   `chain: "test"`)
+/// - `coinbase_pool` = `None` for indexers and wallets
 #[derive(Debug, Clone)]
 pub struct HandleInner {
     pub(crate) inner: Weak<EnvInner>,
     pub(crate) component_id: u64,
-    /// Whether the env configured this component for regtest. Carried as
-    /// plumbing because RPC can't recover it: zebra models regtest as a
-    /// Testnet-kind network, so `getblockchaininfo.chain` reports `"test"`,
-    /// indistinguishable from a real testnet.
     pub(crate) regtest: bool,
-    /// The value pool this validator mines its coinbase into. `Some` for
-    /// validators; `None` for indexers/wallets, which have no coinbase.
     pub(crate) coinbase_pool: Option<Pool>,
 }
 
@@ -74,14 +69,13 @@ impl HandleInner {
         Ok(inner)
     }
 
-    /// Resolve a named endpoint (e.g. `"rpc"`) of this component.
+    /// Resolve a named endpoint (e.g. `"rpc"`) of this component
     pub async fn endpoint(&self, name: &str) -> Result<Endpoint, EnvError> {
         let inner = self.ensure_built()?;
         let state = inner.component_state(self.component_id).await?;
         inner.resolve_named(&state, name).await
     }
 
-    /// Resolve an endpoint of this component by its container port.
     pub async fn endpoint_for(&self, port: u16) -> Result<Endpoint, EnvError> {
         let inner = self.ensure_built()?;
         let state = inner.component_state(self.component_id).await?;
@@ -91,27 +85,19 @@ impl HandleInner {
 
 // ───────────────────────────── named-port table ────────────────────────
 
-/// The single source of truth for every container port ztest assigns.
-/// Backends reference these rather than redeclaring the literals, which would
-/// drift.
+/// Sole source of every container port ztest assigns; backends reference these
+/// rather than redeclaring drift-prone literals
 pub mod ports {
     pub const ZEBRAD_RPC: u16 = 28232;
-    /// zebrad's JSON-RPC port on a public-network topology — mainnet or testnet
-    /// — restored from a pinned archive (distinct from the regtest
-    /// [`ZEBRAD_RPC`]).
-    ///
-    /// One port for both public networks, not zcash's canonical 8232/18232
-    /// split. Pods are namespace-isolated and addressed by name, so the number
-    /// is ztest's own convention; mainnet's canonical 8232 would additionally
-    /// collide with [`ZAINO_JSONRPC`]. What the port has to distinguish is
-    /// which *config generator* rendered the node, and that is
-    /// public-vs-regtest.
+    /// zebrad JSON-RPC on any public network. Distinguishes which config
+    /// generator rendered the node (public vs regtest [`ZEBRAD_RPC`]), not which
+    /// chain — pods are namespace-isolated, and 8232 collides with [`ZAINO_JSONRPC`]
     pub const ZEBRAD_PUBLIC_RPC: u16 = 18232;
     pub const ZEBRAD_METRICS: u16 = 9999;
     pub const ZEBRAD_P2P: u16 = 18233;
-    /// zebrad's indexer gRPC (`rpc.indexer_listen_addr`). Only served when a
-    /// validator shares its state DB (a `Shared`-volume `.mount(&vol)`);
-    /// consumed by a colocated zaino StateService for non-finalized-state sync.
+    /// zebrad indexer gRPC (`rpc.indexer_listen_addr`). Served only on a shared
+    /// state DB (`Shared`-volume `.mount(&vol)`); consumed by a colocated zaino
+    /// StateService for non-finalized-state sync
     pub const ZEBRAD_INDEXER: u16 = 18230;
     pub const ZCASHD_RPC: u16 = 28232;
     pub const ZAINO_GRPC: u16 = 8137;
@@ -119,18 +105,8 @@ pub mod ports {
     pub const ZAINO_METRICS: u16 = 9998;
     pub const LIGHTWALLETD_GRPC: u16 = 9067;
 
-    /// The address every ztest component must bind its listeners to.
-    ///
-    /// Not a preference — a requirement of pod-per-test. The client runs in a
-    /// *separate* pod and reaches a component at its pod IP, so a loopback bind
-    /// (the same-host `zcash_local_net` default that several upstream configs
-    /// ship) refuses every cross-pod call. Per-test namespace isolation stands
-    /// in for the loopback restriction.
-    ///
-    /// It lives here, next to the ports, because a listener is an address *and*
-    /// a port and the two drifted apart once already: the testnet zainod
-    /// generator bound its JSON-RPC to `127.0.0.1` while its gRPC bound
-    /// `0.0.0.0`, so gRPC worked, JSON-RPC refused every connection, and the
-    /// failure looked like a dead indexer rather than a bind address.
+    /// Mandatory listener bind address under pod-per-test: the client reaches a
+    /// component at its pod IP, so an upstream loopback bind refuses every
+    /// cross-pod call. Namespace isolation replaces loopback's protection
     pub const LISTEN_ALL: &str = "0.0.0.0";
 }

@@ -1,27 +1,17 @@
-//! What `ztest cleanup` reclaims — the single place that answers "which cluster
-//! objects does ztest own, and which of them is it safe to delete".
+//! What `ztest cleanup` reclaims: which cluster objects ztest owns, and which are
+//! safe to delete.
 //!
-//! ztest leaves five classes of object on a cluster. Only the first four are
-//! reclaimable; the rest is deliberately out of reach:
-//!
-//! | class | object | why it needs explicit handling |
+//! | class | object | why explicit |
 //! |---|---|---|
 //! | per-test env | `Namespace ztest-*` | cascades its pods/PVCs/quota |
-//! | detached sync | `Namespace ztest-sync-*` **+ its driver Pod** | persistent *by design*; the namespace cascades the topology, but the driver is a runner pod in [`RUN_NAMESPACE`] and cascades from nothing |
-//! | ephemeral run pods | `Pod` in [`RUN_NAMESPACE`] | build/uploader pods live outside the test namespace, so nothing cascades them |
-//! | seed binding    | `VolumeSnapshotContent` | cluster-scoped, no owner ref |
+//! | detached sync | `Namespace ztest-sync-*` **+ driver Pod** | persistent by design; driver sits in [`RUN_NAMESPACE`], cascades from nothing |
+//! | ephemeral run pods | `Pod` in [`RUN_NAMESPACE`] | outside the test namespace, nothing cascades them |
+//! | seed binding | `VolumeSnapshotContent` | cluster-scoped, no owner ref |
 //! | QoS reservation | `Lease` in [`META_NAMESPACE`] | holds admission capacity until deleted |
 //!
-//! Never touched: the content-addressed seed cache (`ztest snapshot prune` owns
-//! it) and cluster infrastructure — CSI, snapshot classes, RBAC, the `ztest*`
-//! namespaces themselves (`ztest setup` owns those). Reclaiming test resources
-//! must never make the next `ztest run` need a re-`setup`.
-//!
-//! Discovery and deletion are separate passes. That split is what lets
-//! `--dry-run` print exactly what a real run would do, and it is why the report
-//! can distinguish "reaped" from "skipped, still live" instead of guessing after
-//! the fact.
-
+//! - Never touched: seed cache (`ztest snapshot prune`) + infrastructure (`ztest cluster setup`)
+//!   — reclaiming must never force a re-`setup`
+//! - Discovery/deletion split into two passes (exact `--dry-run`, "reaped" vs "still live")
 use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
@@ -33,34 +23,25 @@ use crate::qos::ledger::{META_NAMESPACE, is_expired};
 use crate::resource::impls::policy::RUN_NAMESPACE;
 use crate::sync::{KIND_LABEL_KEY, KIND_LABEL_VALUE, SYNC_ID_KEY};
 
-/// Whose artifacts a reclaim pass considers.
+/// Whose artifacts a pass considers. `AllUsers` needs cluster-wide list/delete
 #[derive(Debug, Clone)]
 pub enum Scope {
-    /// Only objects labelled [`qos::LABEL_USER`]`=<user>`.
     User(String),
-    /// Every developer's objects. Needs cluster-wide list/delete.
     AllUsers,
 }
 
-/// The kind of object a [`Target`] refers to, in deletion order (see
-/// [`reclaim`]): everything that *consumes* capacity is deleted before the
-/// [`Lease`](Kind::Reservation) that *reserves* it.
+/// [`Target`] kind, ordered by deletion (see [`reclaim`]): capacity *consumers*
+/// before the [`Lease`](Kind::Reservation) that *reserves* it
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
-    /// A per-test `Namespace` from `ztest run` (cascades pods, PVCs, quota).
     TestEnv,
-    /// A detached sync's `Namespace` (cascades the driver pod and its report).
     Sync,
-    /// A build or seed-uploader `Pod` in [`RUN_NAMESPACE`].
     RunPod,
-    /// The cluster-scoped `VolumeSnapshotContent` half of a seed binding.
     SeedBinding,
-    /// A QoS reservation `Lease` in [`META_NAMESPACE`].
     Reservation,
 }
 
 impl Kind {
-    /// Human label for the report.
     pub fn noun(self) -> &'static str {
         match self {
             Kind::TestEnv => "test namespace",
@@ -72,9 +53,8 @@ impl Kind {
     }
 }
 
-/// Whether an object is still in use. `Live` carries the reason, which the
-/// report prints verbatim — "why did cleanup skip this?" should never require
-/// re-deriving the rule by hand.
+/// `Live`'s reason is printed verbatim ("why was this skipped?" must not need
+/// re-deriving the rule)
 #[derive(Debug, Clone)]
 pub enum Liveness {
     Finished,
@@ -87,32 +67,27 @@ impl Liveness {
     }
 }
 
-/// One reclaimable object.
+/// One reclaimable object. `id` = the sync/run id a developer types, vs the
+/// generated object `name`
 #[derive(Debug, Clone)]
 pub struct Target {
     pub kind: Kind,
     pub name: String,
-    /// `None` for cluster-scoped objects.
     pub namespace: Option<String>,
-    /// The sync-id or run-id this object belongs to — the handle a developer
-    /// actually types, as distinct from the generated object [`name`](Self::name).
     pub id: Option<String>,
-    /// Short provenance for the report ("run-id elicb-4471", "Succeeded").
     pub detail: String,
     pub liveness: Liveness,
 }
 
 impl Target {
-    /// Whether `token` names this object, by either the id a developer sees in
-    /// `ztest sync list` or the full object name.
+    /// Token = developer-facing id or full object name
     fn matches(&self, token: &str) -> bool {
         self.name == token || self.id.as_deref() == Some(token)
     }
 }
 
-/// The result of a discovery pass: what was found, plus any listing failures
-/// (an RBAC-denied list under `--all-users` must be reported, not silently
-/// treated as "nothing to reclaim").
+/// Discovery result + listing failures (an RBAC-denied `--all-users` list must be
+/// reported, never read as "nothing to reclaim")
 #[derive(Debug, Default)]
 pub struct Plan {
     pub targets: Vec<Target>,
@@ -120,26 +95,22 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Narrow the plan to the objects named by `tokens` (sync ids, run ids, or
-    /// full object names). A token matching nothing is an error, not a silent
-    /// no-op: `ztest cleanup <typo>` reporting success would be indistinguishable
-    /// from having reclaimed the thing the developer meant.
+    /// Narrow to `tokens` (sync ids, run ids, object names).
+    /// Unmatched token = error (`ztest cleanup <typo>` reporting success reads as
+    /// having reclaimed the intended thing)
     pub fn restrict_to(&mut self, tokens: &[String]) {
         if tokens.is_empty() {
             return;
         }
         for token in tokens {
             if !self.targets.iter().any(|t| t.matches(token)) {
-                self.errors
-                    .push(format!("no reclaimable resource matches `{token}`"));
+                self.errors.push(format!("no reclaimable resource matches `{token}`"));
             }
         }
-        self.targets
-            .retain(|t| tokens.iter().any(|token| t.matches(token)));
+        self.targets.retain(|t| tokens.iter().any(|token| t.matches(token)));
     }
 }
 
-/// The result of acting on a [`Plan`].
 #[derive(Debug, Default)]
 pub struct Outcome {
     pub deleted: Vec<Target>,
@@ -147,18 +118,13 @@ pub struct Outcome {
     pub errors: Vec<String>,
 }
 
-/// Find every reclaimable object in `scope`.
-///
-/// Each class is listed independently and a failure in one never aborts the
-/// others: a cluster without the snapshot CRD, or an SA without lease access,
-/// should still reclaim the namespaces it *can* see.
+/// Classes listed independently, one failure never aborts the rest (a missing
+/// snapshot CRD or lease access still reclaims the visible namespaces)
 pub async fn discover(client: &Client, scope: &Scope) -> Plan {
     let mut plan = Plan::default();
 
-    // An unexpired reservation proves its run is still in flight. Every other
-    // class consults this set, so it is computed once, first — and always
-    // cluster-wide, since a *different* user's live run can own the lease that
-    // makes one of my objects live (`--all-users`).
+    // Unexpired reservation = run in flight. Computed once, first, and always
+    // cluster-wide (another user's live run can own the lease keeping my object live)
     let live_runs = live_run_ids(client, &mut plan.errors).await;
 
     discover_test_envs(client, scope, &live_runs, &mut plan).await;
@@ -167,25 +133,17 @@ pub async fn discover(client: &Client, scope: &Scope) -> Plan {
     discover_seed_bindings(client, scope, &live_runs, &mut plan).await;
     discover_reservations(client, scope, &mut plan).await;
 
-    plan.targets
-        .sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
+    plan.targets.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
     plan
 }
 
-/// Delete the plan's targets.
+/// Live targets skipped unless `force`.
 ///
-/// Live targets are skipped unless `force`. Deletion runs in [`Kind`] order so a
-/// run's capacity consumers (namespaces, pods) are gone before its reservation
-/// [`Lease`] is released — releasing first would briefly let a concurrent run
-/// admit against capacity the dying pods still hold.
-///
-/// Idempotent: a 404 is success, since the janitor or a concurrent cleanup may
-/// have won the race.
+/// - [`Kind`] order: capacity consumers before the reservation [`Lease`] (releasing
+///   first lets a concurrent run admit against capacity the dying pods still hold)
+/// - Idempotent, 404 = success (janitor or concurrent cleanup won the race)
 pub async fn reclaim(client: &Client, plan: Plan, force: bool, dry_run: bool) -> Outcome {
-    let mut outcome = Outcome {
-        errors: plan.errors,
-        ..Default::default()
-    };
+    let mut outcome = Outcome { errors: plan.errors, ..Default::default() };
 
     for target in plan.targets {
         if target.liveness.is_live() && !force {
@@ -198,9 +156,7 @@ pub async fn reclaim(client: &Client, plan: Plan, force: bool, dry_run: bool) ->
         }
         match delete(client, &target).await {
             Ok(()) => outcome.deleted.push(target),
-            Err(e) => outcome
-                .errors
-                .push(format!("{} {}: {e}", target.kind.noun(), target.name)),
+            Err(e) => outcome.errors.push(format!("{} {}: {e}", target.kind.noun(), target.name)),
         }
     }
     outcome
@@ -209,26 +165,17 @@ pub async fn reclaim(client: &Client, plan: Plan, force: bool, dry_run: bool) ->
 async fn delete(client: &Client, target: &Target) -> Result<(), kube::Error> {
     let dp = DeleteParams::default();
     let result = match target.kind {
-        // Namespaces advertise only `delete`, never `deletecollection`, so each
-        // is deleted individually.
-        Kind::TestEnv => Api::<Namespace>::all(client.clone())
-            .delete(&target.name, &dp)
-            .await
-            .map(|_| ()),
-        // A sync is two objects: the namespace holding its topology, and the
-        // driver pod running it — which lives in `RUN_NAMESPACE` as the run
-        // identity, like every other runner pod, and so is cascaded by nothing.
-        // Reaping one without the other leaves either an orphaned driver still
-        // holding its tier's footprint, or a namespace whose driver is gone.
-        //
-        // The namespace goes first: a driver mid-teardown keeps working against
-        // the topology it is checkpointing until it is itself removed.
+        // Namespaces advertise `delete` only, never `deletecollection`
+        Kind::TestEnv => {
+            Api::<Namespace>::all(client.clone()).delete(&target.name, &dp).await.map(|_| ())
+        }
+        // Sync = namespace (topology) + driver pod in `RUN_NAMESPACE` (cascaded by
+        // nothing). Half a reap leaves an orphaned driver holding its footprint, or a
+        // driverless namespace
+        // Namespace first: a draining driver keeps checkpointing against it
         Kind::Sync => {
             let ns = ignore_not_found(
-                Api::<Namespace>::all(client.clone())
-                    .delete(&target.name, &dp)
-                    .await
-                    .map(|_| ()),
+                Api::<Namespace>::all(client.clone()).delete(&target.name, &dp).await.map(|_| ()),
             );
             let driver = ignore_not_found(
                 Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
@@ -251,7 +198,7 @@ async fn delete(client: &Client, target: &Target) -> Result<(), kube::Error> {
     ignore_not_found(result)
 }
 
-/// A 404 is success: the janitor or a concurrent cleanup may have won the race.
+/// 404 = success (janitor or a concurrent cleanup won the race)
 fn ignore_not_found(result: Result<(), kube::Error>) -> Result<(), kube::Error> {
     match result {
         Err(e) if crate::resource::kube::is_not_found(&e) => Ok(()),
@@ -259,12 +206,8 @@ fn ignore_not_found(result: Result<(), kube::Error>) -> Result<(), kube::Error> 
     }
 }
 
-/// The driver pod name for a sync [`Target`].
-///
-/// Prefers the sync id the discovery pass read off the namespace's label; falls
-/// back to the namespace name, which is what the id is derived from anyway. A
-/// namespace with no readable id is one nothing else can name either, so the
-/// fallback fails to *find* a pod rather than deleting the wrong one.
+/// Driver pod name for a sync [`Target`]: discovered sync id, else the namespace
+/// name it derives from (an id-less namespace finds no pod rather than the wrong one)
 fn driver_pod_of(target: &Target) -> String {
     match &target.id {
         Some(id) => crate::sync::driver_pod_for(id),
@@ -274,9 +217,8 @@ fn driver_pod_of(target: &Target) -> String {
 
 // ───────────────────────────── discovery ──────────────────────────────
 
-/// Run-ids holding an unexpired reservation, i.e. the runs that are still in
-/// flight. Cheap (one list of a tiny namespace) and the basis for every
-/// liveness call below.
+/// Run-ids on an unexpired reservation = runs in flight. One list of a tiny
+/// namespace, and the basis of every liveness call below
 async fn live_run_ids(client: &Client, errors: &mut Vec<String>) -> Vec<String> {
     let api: Api<Lease> = Api::namespaced(client.clone(), META_NAMESPACE);
     let now = Utc::now();
@@ -287,9 +229,8 @@ async fn live_run_ids(client: &Client, errors: &mut Vec<String>) -> Vec<String> 
             .filter(|l| !is_expired(l, now))
             .filter_map(|l| label_of(&l, qos::LABEL_RUN_ID).map(str::to_string))
             .collect(),
-        // No ledger namespace (or no access) means no liveness evidence. Report
-        // it and fall back to "nothing is provably live" rather than refusing to
-        // reclaim anything.
+        // No ledger namespace/access = no liveness evidence → report + fall back to
+        // "nothing provably live", never to reclaiming nothing
         Err(e) => {
             errors.push(format!(
                 "list reservations in {META_NAMESPACE} (liveness will be pod-phase only): {e}"
@@ -301,12 +242,9 @@ async fn live_run_ids(client: &Client, errors: &mut Vec<String>) -> Vec<String> 
 
 async fn discover_test_envs(client: &Client, scope: &Scope, live_runs: &[String], plan: &mut Plan) {
     let selector = match scope {
-        Scope::User(u) => format!(
-            "{}={u},{}={}",
-            qos::LABEL_USER,
-            qos::LABEL_ROLE,
-            qos::ROLE_TEST_ENV
-        ),
+        Scope::User(u) => {
+            format!("{}={u},{}={}", qos::LABEL_USER, qos::LABEL_ROLE, qos::ROLE_TEST_ENV)
+        }
         Scope::AllUsers => format!("{}={}", qos::LABEL_ROLE, qos::ROLE_TEST_ENV),
     };
     let api: Api<Namespace> = Api::all(client.clone());
@@ -327,13 +265,11 @@ async fn discover_test_envs(client: &Client, scope: &Scope, live_runs: &[String]
     }
 }
 
-/// Whether a per-test namespace belongs to a run that is still going.
+/// Does this namespace belong to a still-running run?
 ///
-/// A `--no-cleanup` run leaves its namespaces standing on purpose, and those are
-/// exactly what cleanup exists to reclaim — but a *concurrent* run's namespaces
-/// look identical. The reservation lease is the only signal that distinguishes
-/// them: it is created before the first namespace and renewed for the run's
-/// whole life, so an unexpired lease for this run-id means the run is live.
+/// - `--no-cleanup` leftovers and a concurrent run's namespaces look identical
+/// - Reservation lease = the only separator (created before the first namespace,
+///   renewed for the run's life)
 fn classify_test_env(run_id: &str, live_runs: &[String]) -> Liveness {
     if live_runs.iter().any(|r| r == run_id) {
         Liveness::Live(format!("run {run_id} in flight"))
@@ -344,15 +280,10 @@ fn classify_test_env(run_id: &str, live_runs: &[String]) -> Liveness {
 
 async fn discover_syncs(client: &Client, scope: &Scope, plan: &mut Plan) {
     let selector = match scope {
-        Scope::User(u) => format!(
-            "{KIND_LABEL_KEY}={KIND_LABEL_VALUE},{}={u}",
-            qos::LABEL_USER
-        ),
+        Scope::User(u) => format!("{KIND_LABEL_KEY}={KIND_LABEL_VALUE},{}={u}", qos::LABEL_USER),
         Scope::AllUsers => format!("{KIND_LABEL_KEY}={KIND_LABEL_VALUE}"),
     };
-    // The driver pods, not the namespaces, carry the phase; list them once
-    // cluster-wide and index by sync id so each namespace gets its verdict
-    // without an N+1 `get` per sync.
+    // Phase lives on the driver pods → one cluster-wide list keyed by sync id, no N+1
     let pods = match Api::<Pod>::all(client.clone())
         .list(&ListParams::default().labels(&selector))
         .await
@@ -385,14 +316,13 @@ async fn discover_syncs(client: &Client, scope: &Scope, plan: &mut Plan) {
             id: Some(sync_id.clone()),
             detail: match &phase {
                 Some(p) => format!("{sync_id} · {p}"),
-                // No driver pod: either it was already removed or the sync never
-                // got off the ground. Either way nothing is running.
+                // No driver pod (removed, or never started) = nothing running
                 None => format!("{sync_id} · no driver pod"),
             },
             liveness: match phase.as_deref() {
-                Some(p @ ("Running" | "Pending")) => Liveness::Live(format!(
-                    "{p}; `ztest sync stop {sync_id}` checkpoints it first"
-                )),
+                Some(p @ ("Running" | "Pending")) => {
+                    Liveness::Live(format!("{p}; `ztest sync stop {sync_id}` checkpoints it first"))
+                }
                 _ => Liveness::Finished,
             },
         });
@@ -400,10 +330,8 @@ async fn discover_syncs(client: &Client, scope: &Scope, plan: &mut Plan) {
 }
 
 async fn discover_run_pods(client: &Client, scope: &Scope, live_runs: &[String], plan: &mut Plan) {
-    // `!kind` excludes detached-sync drivers, which also live in `RUN_NAMESPACE`
-    // and carry the user label. They belong to [`discover_syncs`], which knows a
-    // Running one is live; claimed here they would be judged by a run-id they do
-    // not carry and reaped mid-sync.
+    // `!kind` excludes detached-sync drivers ([`discover_syncs`] owns them) — judged
+    // here by a run-id they don't carry, they'd be reaped mid-sync
     let selector = match scope {
         Scope::User(u) => format!("{}={u},!{KIND_LABEL_KEY}", qos::LABEL_USER),
         Scope::AllUsers => format!("{},!{KIND_LABEL_KEY}", qos::LABEL_RUN_ID),
@@ -412,26 +340,20 @@ async fn discover_run_pods(client: &Client, scope: &Scope, live_runs: &[String],
     let list = match api.list(&ListParams::default().labels(&selector)).await {
         Ok(l) => l,
         Err(e) => {
-            return plan
-                .errors
-                .push(format!("list pods in {RUN_NAMESPACE}: {e}"));
+            return plan.errors.push(format!("list pods in {RUN_NAMESPACE}: {e}"));
         }
     };
     for pod in list.items {
         let run_id = label_of(&pod, qos::LABEL_RUN_ID).unwrap_or("?").to_string();
-        let phase = pod
-            .status
-            .as_ref()
-            .and_then(|s| s.phase.clone())
-            .unwrap_or_else(|| "Unknown".into());
+        let phase =
+            pod.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_else(|| "Unknown".into());
         plan.targets.push(Target {
             kind: Kind::RunPod,
             name: pod.name_any(),
             namespace: Some(RUN_NAMESPACE.to_string()),
             id: Some(run_id.clone()),
             detail: format!("run-id {run_id} · {phase}"),
-            // A settled pod is reclaimable even if its run is live — the node has
-            // already released its capacity and the run is done with it.
+            // Settled pod reclaimable even under a live run (capacity already released)
             liveness: match phase.as_str() {
                 "Succeeded" | "Failed" => Liveness::Finished,
                 _ => classify_test_env(&run_id, live_runs),
@@ -450,12 +372,9 @@ async fn discover_seed_bindings(
         Scope::User(u) => format!("{}={u}", qos::LABEL_USER),
         Scope::AllUsers => qos::LABEL_RUN_ID.to_string(),
     };
-    let list = match vsc_api(client)
-        .list(&ListParams::default().labels(&selector))
-        .await
-    {
+    let list = match vsc_api(client).list(&ListParams::default().labels(&selector)).await {
         Ok(l) => l,
-        // A cluster without the snapshot CRD simply has nothing of this class.
+        // No snapshot CRD = nothing of this class
         Err(e) if crate::resource::kube::is_not_found(&e) => return,
         Err(e) => return plan.errors.push(format!("list seed bindings: {e}")),
     };
@@ -490,13 +409,9 @@ async fn discover_reservations(client: &Client, scope: &Scope, plan: &mut Plan) 
             kind: Kind::Reservation,
             name: lease.name_any(),
             namespace: Some(META_NAMESPACE.to_string()),
-            // The lease is named for the run it reserves, so its name *is* the id.
+            // Lease named for the run it reserves → name *is* the id
             id: Some(lease.name_any()),
-            detail: if expired {
-                "expired".into()
-            } else {
-                "renewing".into()
-            },
+            detail: if expired { "expired".into() } else { "renewing".into() },
             liveness: if expired {
                 Liveness::Finished
             } else {
@@ -529,8 +444,8 @@ mod tests {
 
     #[test]
     fn an_unlabelled_namespace_is_reclaimable() {
-        // A run SIGKILL'd between namespace-create and label-populate has no
-        // run-id to match; without a live lease vouching for it, it is garbage.
+        // SIGKILL between namespace-create and label-populate leaves no run-id;
+        // with no lease vouching for it, garbage
         assert!(!classify_test_env("?", &["elicb-4471".to_string()]).is_live());
     }
 
@@ -554,7 +469,7 @@ mod tests {
             ],
             errors: Vec::new(),
         };
-        // The id from `ztest sync list`, not the generated namespace name.
+        // Id from `ztest sync list`, not the generated namespace name
         plan.restrict_to(&["zaino-a52f".to_string()]);
         assert_eq!(plan.targets.len(), 1);
         assert_eq!(plan.targets[0].name, "ztest-sync-zaino-a52f");

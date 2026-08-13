@@ -1,476 +1,234 @@
 //! Named cluster profiles.
 //!
-//! A profile binds the kube-context and the image
-//! [`backend`](Profile::backend) under one name, so `ztest run --cluster
-//! <name>` (or a persisted default) and `ztest setup` select them together
-//! rather than from independent ambient signals (kube current-context vs
-//! `ZTEST_IMAGE_REGISTRY` / `KIND_CLUSTER`), which made it easy to build into
-//! a kind node while pointed at a remote cluster.
-//!
-//! Store: `$XDG_CONFIG_HOME/ztest/clusters.toml`, else `~/.config/ztest/clusters.toml`.
-//!
-//! Selection precedence (see [`activate`]): `--cluster` flag > pre-set env >
-//! persisted `current` profile > built-in kind defaults. ztest targets the
-//! profile's kube-context in-memory and never writes to the kubeconfig.
+//! - One name binds kube-context + [`ClusterClass`] + registry addresses, so
+//!   `ztest run --cluster <name>` picks them together, not from independent
+//!   ambient signals
+//! - Store: `$XDG_CONFIG_HOME/ztest/clusters.toml`, else `~/.config/ztest/clusters.toml`
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
+use kube::config::Kubeconfig;
 use serde::{Deserialize, Serialize};
 
-/// Env var carrying the kube-context a profile selected. Honored by
-/// [`crate::cluster::client`] and by `Config::infer`'s fallback.
 pub const KUBE_CONTEXT_ENV: &str = "ZTEST_KUBE_CONTEXT";
+pub const CLUSTER_CLASS_ENV: &str = "ZTEST_CLUSTER_CLASS";
+/// Carries [`Profile::storage_driver`] → `ztest run` resolves the storage
+/// `ztest cluster setup` checked
+pub const STORAGE_DRIVER_ENV: &str = "ZTEST_STORAGE_DRIVER";
 const REGISTRY_ENV: &str = "ZTEST_IMAGE_REGISTRY";
 const PUSH_REGISTRY_ENV: &str = "ZTEST_IMAGE_PUSH_REGISTRY";
-const KIND_CLUSTER_ENV: &str = "KIND_CLUSTER";
-/// Env var carrying the profile's [`ImageBackend`] selection. Read by both
-/// `ztest setup` and `ztest run` so the two can never disagree about what a
-/// cluster is.
-pub const IMAGE_BACKEND_ENV: &str = "ZTEST_IMAGE_BACKEND";
 
-/// The on-disk store: a set of named profiles plus the active default.
+const REGISTRY_EXTENSION: &str = "ztest.io/registry";
+
+/// Where the work happens; the rest follows.
+///
+/// - `Local` shares the developer's machine → images built here, side-loaded
+/// - `Remote` does not → images built on it, exchanged through a registry
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterClass {
+    #[default]
+    Local,
+    Remote,
+}
+
+impl ClusterClass {
+    /// Token in `clusters.toml` and [`CLUSTER_CLASS_ENV`]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClusterClass::Local => "local",
+            ClusterClass::Remote => "remote",
+        }
+    }
+
+    /// As `ztest cluster check` prints it
+    pub fn label(self) -> &'static str {
+        match self {
+            ClusterClass::Local => "Kind Local Cluster",
+            ClusterClass::Remote => "Remote Cluster",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "local" => Some(ClusterClass::Local),
+            "remote" => Some(ClusterClass::Remote),
+            _ => None,
+        }
+    }
+}
+
+/// `ztest.io/registry` kubeconfig extension (one file onboards a cluster)
+#[derive(Deserialize)]
+struct RegistrySpec {
+    push: String,
+    pull: String,
+}
+
+/// The on-disk store.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// Profile used when `ztest run` gets no `--cluster` flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<String>,
     #[serde(default)]
     pub clusters: BTreeMap<String, Profile>,
 }
 
-/// How a profile's images reach the cluster. Explicit rather than inferred
-/// from which of `push`/`pull`/`kind_cluster` happen to be set: inference let
-/// an under-specified profile silently resolve to kind, and let `setup` and
-/// `run` disagree about whether a target was really OpenShift.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ImageBackend {
-    /// `kind load` into a local kind node. No registry.
-    #[default]
-    Kind,
-    /// Build locally, push to a generic registry; pods pull the same address.
-    Registry,
-    /// On-cluster build in a ztest-owned rootless-BuildKit pod, pushing to the
-    /// OpenShift integrated registry (`push` = external route, `pull` =
-    /// in-cluster service), plus the SCC + registry policy `setup` installs.
-    OpenShift,
-}
-
-impl ImageBackend {
-    /// Lowercase token used in `clusters.toml` and [`IMAGE_BACKEND_ENV`].
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ImageBackend::Kind => "kind",
-            ImageBackend::Registry => "registry",
-            ImageBackend::OpenShift => "openshift",
-        }
-    }
-
-    /// Parse the [`IMAGE_BACKEND_ENV`] token; `None` for an unknown/absent value.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "kind" => Some(ImageBackend::Kind),
-            "registry" => Some(ImageBackend::Registry),
-            "openshift" => Some(ImageBackend::OpenShift),
-            _ => None,
-        }
-    }
-
-    /// True for the on-cluster OpenShift build path (SCC + registry policy).
-    pub fn is_openshift(self) -> bool {
-        matches!(self, ImageBackend::OpenShift)
-    }
-}
-
-/// One named cluster. [`backend`](Profile::backend) selects image
-/// distribution; `push`/`pull`/`kind_cluster` carry the addresses it needs.
+/// One named cluster.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "RawProfile")]
 pub struct Profile {
-    /// Expected kube-context, targeted in-memory. `None` means the current
-    /// kube-context (the natural choice for a local kind cluster).
+    /// Kube-context to target, resolved in-memory; the kubeconfig is never
+    /// modified. `None` means the current context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    /// Kubeconfig file holding this context when it isn't in the default
-    /// `~/.kube/config`. Sets `KUBECONFIG` for the run so context lookup, the
-    /// client, the registry push, and any `kubectl` the tests shell out to
-    /// read the same file. `None` uses the ambient `KUBECONFIG`.
+    /// Kubeconfig holding that context, when not `~/.kube/config`. Sets
+    /// `KUBECONFIG` for the run, so the client, the registry push, and any
+    /// `kubectl` the tests shell out to all read the same file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kubeconfig: Option<String>,
-    /// Push registry base (e.g. `ghcr.io/zingolabs`, or an OpenShift route).
-    /// For a generic registry this is also the pull address.
+    /// Registry base images are pushed to; also the pull address unless
+    /// [`pull`](Self::pull) overrides it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub push: Option<String>,
-    /// Distinct in-cluster pull base — set only for the OpenShift integrated
-    /// registry, where pods reference the service address, not the route.
+    /// Distinct in-cluster pull base, for a registry pods reach at a different
+    /// address than the builder does.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull: Option<String>,
-    /// kind cluster name (node `<name>-control-plane`).
+    /// CSI driver backing every volume ztest creates — seeds, snapshots,
+    /// caches. A driver rather than a class name, so the StorageClass and
+    /// VolumeSnapshotClass cannot be selected from different providers.
+    /// `None` follows the cluster's default StorageClass.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind_cluster: Option<String>,
+    pub storage_driver: Option<String>,
     #[serde(default)]
-    pub backend: ImageBackend,
-}
-
-/// Deserialization shape accepting both the current `backend` key and the
-/// legacy `openshift` bool. A profile with no `backend` migrates from its
-/// addresses (`openshift = true` → OpenShift, bare `push` → Registry, else
-/// Kind), so an existing `clusters.toml` keeps working without a rewrite and
-/// never silently downgrades an OpenShift profile to kind.
-#[derive(Deserialize)]
-struct RawProfile {
-    context: Option<String>,
-    kubeconfig: Option<String>,
-    push: Option<String>,
-    pull: Option<String>,
-    kind_cluster: Option<String>,
-    backend: Option<ImageBackend>,
-    #[serde(default)]
-    openshift: bool,
-}
-
-impl From<RawProfile> for Profile {
-    fn from(r: RawProfile) -> Self {
-        let backend = r.backend.unwrap_or_else(|| {
-            if r.openshift {
-                ImageBackend::OpenShift
-            } else if r.push.is_some() {
-                ImageBackend::Registry
-            } else {
-                ImageBackend::Kind
-            }
-        });
-        Profile {
-            context: r.context,
-            kubeconfig: r.kubeconfig,
-            push: r.push,
-            pull: r.pull,
-            kind_cluster: r.kind_cluster,
-            backend,
-        }
-    }
+    pub class: ClusterClass,
 }
 
 impl Profile {
-    /// Reject a `backend` that disagrees with the addresses it needs.
-    pub fn validate(&self) -> Result<(), String> {
-        match self.backend {
-            ImageBackend::Kind => {
-                if self.push.is_some() || self.pull.is_some() {
-                    return Err(
-                        "a `kind` profile must not set a registry address (push/pull)".to_string(),
-                    );
-                }
-            }
-            ImageBackend::Registry => {
-                if self.push.is_none() {
-                    return Err(
-                        "a `registry` profile needs a push address (--registry)".to_string()
-                    );
-                }
-                if self.kind_cluster.is_some() {
-                    return Err("a profile sets either a registry or --kind, not both".to_string());
-                }
-                if self.pull.is_some() {
-                    return Err(
-                        "a `registry` profile pushes and pulls one address; a distinct pull \
-                         address is the OpenShift integrated registry — use backend `openshift`"
-                            .to_string(),
-                    );
-                }
-            }
-            ImageBackend::OpenShift => {
-                if self.push.is_none() || self.pull.is_none() {
-                    return Err(
-                        "an `openshift` profile needs both a push route (--registry) and an \
-                         in-cluster pull address (--pull)"
-                            .to_string(),
-                    );
-                }
-            }
+    /// Local profile for a kind cluster (kind's context is always `kind-<cluster>`)
+    pub fn local(kind_cluster: &str) -> Profile {
+        Profile {
+            context: Some(format!("kind-{kind_cluster}")),
+            class: ClusterClass::Local,
+            ..Default::default()
         }
-        Ok(())
     }
 
-    /// One-line human summary for `ztest cluster list` / `current`.
-    pub fn summary(&self) -> String {
-        let ctx = self.context.as_deref().unwrap_or("(current kube-context)");
-        let unset = "?";
-        let images = match self.backend {
-            ImageBackend::Kind => self
-                .kind_cluster
-                .as_deref()
-                .map(|n| format!("kind {n}"))
-                .unwrap_or_else(|| "kind (default)".to_string()),
-            ImageBackend::Registry => format!("registry {}", self.push.as_deref().unwrap_or(unset)),
-            ImageBackend::OpenShift => format!(
-                "openshift push={} pull={}",
-                self.push.as_deref().unwrap_or(unset),
-                self.pull.as_deref().unwrap_or(unset),
-            ),
+    /// `kind-<name>` → `<name>`, for `kind load` and the `<name>-control-plane` node
+    pub fn kind_cluster(&self) -> Option<&str> {
+        self.context.as_deref()?.strip_prefix("kind-")
+    }
+
+    /// Kubeconfig → profile: `current-context` + any `ztest.io/registry` extension
+    /// on that context's cluster (no extension → local)
+    pub fn from_kubeconfig(path: &Path) -> Result<Profile, String> {
+        let display = path.display();
+        let config = Kubeconfig::read_from(path).map_err(|e| format!("read {display}: {e}"))?;
+        let context = config
+            .current_context
+            .clone()
+            .ok_or_else(|| format!("{display}: no current-context"))?;
+        let cluster_name = config
+            .contexts
+            .iter()
+            .find(|c| c.name == context)
+            .and_then(|c| c.context.as_ref())
+            .map(|c| c.cluster.clone())
+            .ok_or_else(|| format!("{display}: no context `{context}`"))?;
+        let registry = config
+            .clusters
+            .iter()
+            .find(|c| c.name == cluster_name)
+            .and_then(|c| c.cluster.as_ref())
+            .and_then(|c| c.extensions.as_ref())
+            .and_then(|exts| exts.iter().find(|e| e.name == REGISTRY_EXTENSION))
+            .map(|e| serde_json::from_value::<RegistrySpec>(e.extension.clone()))
+            .transpose()
+            .map_err(|e| format!("{display}: parse `{REGISTRY_EXTENSION}`: {e}"))?;
+
+        // kind contexts are always `kind-<cluster>` = the whole class distinction
+        // (on this machine → node images side-loaded, not pushed)
+        let local = context.starts_with("kind-");
+        let mut profile = Profile {
+            context: Some(context),
+            kubeconfig: (!local).then(|| display.to_string()),
+            class: if local { ClusterClass::Local } else { ClusterClass::Remote },
+            ..Default::default()
         };
-        let kc = self
-            .kubeconfig
-            .as_deref()
-            .map(|p| format!(", kubeconfig={p}"))
-            .unwrap_or_default();
-        format!("context={ctx}, images={images}{kc}")
+        if let Some(spec) = registry
+            && !local
+        {
+            profile.class = ClusterClass::Remote;
+            // Stored only when it differs (an equal pair stored twice drifts on edit)
+            profile.pull = (spec.pull != spec.push).then_some(spec.pull);
+            profile.push = Some(spec.push);
+        }
+        Ok(profile)
+    }
+
+    /// Reject a `class` disagreeing with the addresses it needs
+    pub fn validate(&self) -> Result<(), String> {
+        match self.class {
+            ClusterClass::Local if self.push.is_some() || self.pull.is_some() => {
+                Err("a `local` profile must not set push/pull".to_string())
+            }
+            ClusterClass::Local if self.kind_cluster().is_none() => {
+                Err("a `local` profile needs a kind context (`kind-<cluster>`)".to_string())
+            }
+            ClusterClass::Remote if self.push.is_none() => {
+                Err("a `remote` profile needs a push address".to_string())
+            }
+            ClusterClass::Remote if self.kind_cluster().is_some() => {
+                Err("a `remote` profile cannot name a kind context".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Address pods pull from; `None` only for a local profile
+    pub fn pull_address(&self) -> Option<&str> {
+        self.pull.as_deref().or(self.push.as_deref())
+    }
+
+    /// One line for `ztest cluster list` / `current`
+    pub fn summary(&self) -> String {
+        let images = match (self.class, self.push.as_deref(), self.pull.as_deref()) {
+            (ClusterClass::Local, ..) => {
+                format!("kind {}", self.kind_cluster().unwrap_or("(default)"))
+            }
+            // Pull shown only when it differs (an equal pair printed twice reads
+            // as a mistake)
+            (_, Some(push), Some(pull)) => format!("registry push={push} pull={pull}"),
+            (_, push, _) => format!("registry {}", push.unwrap_or("?")),
+        };
+        format!(
+            "context={}, images={images}{}",
+            self.context.as_deref().unwrap_or("(current kube-context)"),
+            self.kubeconfig.as_deref().map(|p| format!(", kubeconfig={p}")).unwrap_or_default(),
+        )
     }
 }
 
-/// The `ztest.io/registry` extension embedded in a kubeconfig cluster: the whole
-/// image-registry configuration, so a developer receives one file and
-/// `ztest cluster add --kubeconfig <file>` derives the profile from it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct RegistrySpec {
-    /// External push address (route), `host/repo-prefix`.
-    pub push: String,
-    /// In-cluster pull address (service), `host:port/repo-prefix`.
-    pub pull: String,
-    #[serde(default)]
-    pub openshift: bool,
-}
+// ── Store ─────────────────────────────────────────────────────────────
 
-/// Extension name reserved in a kubeconfig cluster for ztest's registry config.
-pub const REGISTRY_EXTENSION: &str = "ztest.io/registry";
-
-/// Read the SA token, cluster CA, and `ztest.io/registry` extension for a
-/// context out of a kubeconfig. `kubeconfig` defaults to `KUBECONFIG` /
-/// `~/.kube/config`; `context` defaults to the file's `current-context`. Used
-/// both by `cluster add` (to derive a profile from a shipped kubeconfig) and by
-/// the in-process registry push (to authenticate with the same credentials the
-/// kube client uses).
-pub fn read_material(
-    kubeconfig: Option<&Path>,
-    context: Option<&str>,
-) -> Result<KubeMaterial, String> {
-    let path = resolve_kubeconfig_path(kubeconfig)?;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let body =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let raw: RawKubeconfig =
-        serde_yaml::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?;
-
-    let ctx_name = context
-        .map(str::to_string)
-        .or_else(|| raw.current_context.clone())
-        .ok_or_else(|| {
-            format!(
-                "{}: no context given and no current-context",
-                path.display()
-            )
-        })?;
-    let ctx = raw
-        .contexts
-        .iter()
-        .find(|c| c.name == ctx_name)
-        .ok_or_else(|| format!("{}: no context `{ctx_name}`", path.display()))?;
-    let cluster = raw
-        .clusters
-        .iter()
-        .find(|c| c.name == ctx.context.cluster)
-        .ok_or_else(|| {
-            format!(
-                "{}: context `{ctx_name}` references missing cluster `{}`",
-                path.display(),
-                ctx.context.cluster
-            )
-        })?;
-
-    let token = match ctx
-        .context
-        .user
-        .as_ref()
-        .and_then(|u| raw.users.iter().find(|x| &x.name == u))
-    {
-        Some(u) => resolve_token(&u.user, dir)?,
-        None => None,
-    };
-    let ca_pem = resolve_ca(&cluster.cluster, dir)?;
-    let registry = extract_registry(&cluster.cluster)?;
-    Ok(KubeMaterial {
-        context: Some(ctx_name),
-        token,
-        ca_pem,
-        registry,
-    })
-}
-
-fn resolve_kubeconfig_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
-    if let Some(p) = explicit {
-        return Ok(expand_tilde(p));
+/// ztest's user config directory: the *installation*, not the invocation
+/// directory (`ztest run` runs from whichever repo holds the tests, routinely not
+/// the one holding the fixtures — so credentials cannot live in a repo `.envrc`)
+pub fn config_dir() -> PathBuf {
+    match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(x) => PathBuf::from(x).join("ztest"),
+        None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join(".config")
+            .join("ztest"),
     }
-    if let Some(kc) = std::env::var_os("KUBECONFIG").filter(|v| !v.is_empty()) {
-        // KUBECONFIG may list several files; the first wins for our single-cluster read.
-        let first = std::env::split_paths(&kc).next().unwrap_or_default();
-        return Ok(first);
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("HOME unset")?;
-    Ok(home.join(".kube").join("config"))
 }
 
-fn expand_tilde(p: &Path) -> PathBuf {
-    if let Ok(rest) = p.strip_prefix("~")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    p.to_path_buf()
-}
-
-fn resolve_token(user: &RawUser, dir: &Path) -> Result<Option<String>, String> {
-    if let Some(t) = &user.token {
-        return Ok(Some(t.clone()));
-    }
-    if let Some(file) = &user.token_file {
-        let p = rel_to(dir, file);
-        let t = std::fs::read_to_string(&p)
-            .map_err(|e| format!("read tokenFile {}: {e}", p.display()))?;
-        return Ok(Some(t.trim().to_string()));
-    }
-    Ok(None)
-}
-
-fn resolve_ca(cluster: &RawCluster, dir: &Path) -> Result<Option<Vec<u8>>, String> {
-    if let Some(data) = &cluster.ca_data {
-        let pem = base64::engine::general_purpose::STANDARD
-            .decode(data.trim())
-            .map_err(|e| format!("decode certificate-authority-data: {e}"))?;
-        return Ok(Some(pem));
-    }
-    if let Some(file) = &cluster.ca_file {
-        let p = rel_to(dir, file);
-        let pem = std::fs::read(&p)
-            .map_err(|e| format!("read certificate-authority {}: {e}", p.display()))?;
-        return Ok(Some(pem));
-    }
-    Ok(None)
-}
-
-fn extract_registry(cluster: &RawCluster) -> Result<Option<RegistrySpec>, String> {
-    let Some(ext) = cluster
-        .extensions
-        .iter()
-        .find(|e| e.name == REGISTRY_EXTENSION)
-    else {
-        return Ok(None);
-    };
-    let spec: RegistrySpec = serde_yaml::from_value(ext.extension.clone())
-        .map_err(|e| format!("parse `{REGISTRY_EXTENSION}` extension: {e}"))?;
-    Ok(Some(spec))
-}
-
-fn rel_to(dir: &Path, file: &str) -> PathBuf {
-    let p = expand_tilde(Path::new(file));
-    if p.is_absolute() { p } else { dir.join(p) }
-}
-
-#[derive(Debug, Deserialize)]
-struct RawKubeconfig {
-    #[serde(rename = "current-context", default)]
-    current_context: Option<String>,
-    #[serde(default)]
-    clusters: Vec<RawNamedCluster>,
-    #[serde(default)]
-    contexts: Vec<RawNamedContext>,
-    #[serde(default)]
-    users: Vec<RawNamedUser>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawNamedCluster {
-    name: String,
-    cluster: RawCluster,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawCluster {
-    #[serde(rename = "certificate-authority-data", default)]
-    ca_data: Option<String>,
-    #[serde(rename = "certificate-authority", default)]
-    ca_file: Option<String>,
-    #[serde(default)]
-    extensions: Vec<RawExtension>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawExtension {
-    name: String,
-    extension: serde_yaml::Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawNamedContext {
-    name: String,
-    context: RawContext,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawContext {
-    cluster: String,
-    #[serde(default)]
-    user: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawNamedUser {
-    name: String,
-    user: RawUser,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawUser {
-    #[serde(default)]
-    token: Option<String>,
-    #[serde(rename = "tokenFile", default)]
-    token_file: Option<String>,
-}
-
-/// Token + CA + registry spec read straight out of a kubeconfig for one context.
-/// This is the material the in-process registry push needs beyond the image
-/// bytes; it comes from the same file that authenticates the kube client.
-#[derive(Debug, Clone, Default)]
-pub struct KubeMaterial {
-    /// The resolved context name (the requested one, else `current-context`).
-    pub context: Option<String>,
-    /// SA bearer token (inline `token`, or the contents of `tokenFile`).
-    pub token: Option<String>,
-    /// Cluster CA, PEM bytes (decoded `certificate-authority-data`, or the
-    /// contents of `certificate-authority`).
-    pub ca_pem: Option<Vec<u8>>,
-    /// The `ztest.io/registry` extension, if present on the context's cluster.
-    pub registry: Option<RegistrySpec>,
-}
-
-/// Path to the profile store, honoring `$XDG_CONFIG_HOME`.
-pub fn config_path() -> PathBuf {
+fn config_path() -> PathBuf {
     config_dir().join("clusters.toml")
 }
 
-/// ztest's user config directory, honoring `$XDG_CONFIG_HOME`.
-///
-/// Shared by [`config_path`] and the snapshot-bucket credentials
-/// (`storage::r2::credentials_path`). Both describe the ztest *installation*,
-/// not the directory it was invoked from — which is the whole reason the
-/// bucket credentials cannot live in a repo's `.envrc`: `ztest run` is invoked
-/// from whichever repo holds the tests, and that is routinely not the repo that
-/// holds the fixtures.
-pub fn config_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        PathBuf::from(x).join("ztest")
-    } else {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        home.join(".config").join("ztest")
-    }
-}
-
-/// Load the store. A missing file is not an error — it yields an empty config.
+/// Missing file → empty config
 pub fn load() -> Result<Config, String> {
     let path = config_path();
     match std::fs::read_to_string(&path) {
@@ -481,7 +239,6 @@ pub fn load() -> Result<Config, String> {
 }
 
 impl Config {
-    /// Serialize back to `clusters.toml`, creating the parent directory.
     pub fn save(&self) -> Result<(), String> {
         let path = config_path();
         if let Some(dir) = path.parent() {
@@ -492,47 +249,30 @@ impl Config {
     }
 }
 
-/// Bind the selected profile's knobs to this process's environment, before any
-/// thread reads them. Returns the resolved profile name (`None` when no
-/// `--cluster` flag and no persisted default, i.e. leave the ambient env
-/// untouched — the pre-profile behavior).
+// ── Activation ────────────────────────────────────────────────────────
+
+/// Bind the selected profile to this process's env; `None` = no flag & no
+/// persisted default (ambient env left alone).
 ///
-/// Precedence: an explicit `--cluster` flag is the most specific selector and
-/// overrides any pre-set env; the persisted `current` profile defers to env
-/// that's already set (so CI, which exports `ZTEST_IMAGE_REGISTRY`, is
-/// unaffected). A profile's kube-context is verified against the kubeconfig here
-/// so a stale name fails fast with the available contexts listed, rather than
-/// silently falling through to the current context or a cryptic auth error.
+/// - Explicit `--cluster` overrides pre-set env
+/// - Persisted `current` defers to pre-set env (CI's `ZTEST_IMAGE_REGISTRY` wins)
 ///
 /// # Safety
-/// The caller must guarantee no other thread has started: `set_var` is not
-/// thread-safe. `ztest run` calls this in its single-threaded prologue.
+/// No other thread may have started: `set_var` is not thread-safe.
 pub unsafe fn activate(flag: Option<&str>) -> Result<Option<String>, String> {
     let cfg = load()?;
-    let name = match flag {
-        Some(n) => n.to_string(),
-        None => match cfg.current.as_deref() {
-            Some(n) => n.to_string(),
-            None => return Ok(None),
-        },
+    let Some(name) = flag.map(str::to_string).or_else(|| cfg.current.clone()) else {
+        return Ok(None);
     };
-    let profile = cfg
-        .clusters
-        .get(&name)
-        .ok_or_else(|| unknown_cluster(&name, &cfg))?;
+    let profile = cfg.clusters.get(&name).ok_or_else(|| {
+        format!(
+            "no cluster profile `{name}`. Known: {}. Add one with `ztest cluster add`.",
+            listed(cfg.clusters.keys().map(String::as_str))
+        )
+    })?;
+    profile.validate().map_err(|e| format!("cluster profile `{name}`: {e}"))?;
 
-    // A backend that disagrees with its addresses silently resolves to the wrong
-    // mode (e.g. an `openshift` profile with no push registry falls through to
-    // kind — the exact ambient-drift footgun profiles exist to prevent). Fail
-    // loudly at selection, naming the fix, rather than deep in a run.
-    profile
-        .validate()
-        .map_err(|e| format!("cluster profile `{name}`: {e}"))?;
-
-    // Apply before verifying: apply may set KUBECONFIG to the profile's file, and
-    // verify_context reads whatever KUBECONFIG now points at (so a context in a
-    // standalone kubeconfig is found). The flag is the explicit selector and
-    // overrides env; `current` yields to it.
+    // Apply first: it may set KUBECONFIG, which verify_context then reads
     unsafe { apply(profile, flag.is_some()) };
     if let Some(ctx) = &profile.context {
         verify_context(ctx)?;
@@ -540,78 +280,24 @@ pub unsafe fn activate(flag: Option<&str>) -> Result<Option<String>, String> {
     Ok(Some(name))
 }
 
-/// The kube-context ztest is actually targeting: the profile-set
-/// [`KUBE_CONTEXT_ENV`] if present, else the kubeconfig's own current-context.
-/// `None` in-cluster (no kubeconfig) or when neither is set — callers supply
-/// their own fallback. Lets the kind-cluster resolver follow wherever kubectl is
-/// pointed instead of a hardcoded default.
-pub fn active_context() -> Option<String> {
-    if let Some(ctx) = std::env::var(KUBE_CONTEXT_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        return Some(ctx);
-    }
-    if crate::cluster::in_cluster() {
-        return None;
-    }
-    kube::config::Kubeconfig::read().ok()?.current_context
-}
-
-/// Confirm the named context exists in the kubeconfig. Skipped in-cluster,
-/// where there is no kubeconfig and the context env is ignored anyway.
-fn verify_context(context: &str) -> Result<(), String> {
-    if crate::cluster::in_cluster() {
-        return Ok(());
-    }
-    let kubeconfig = kube::config::Kubeconfig::read()
-        .map_err(|e| format!("reading kubeconfig to verify context `{context}`: {e}"))?;
-    let known: Vec<&str> = kubeconfig
-        .contexts
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
-    if known.contains(&context) {
-        return Ok(());
-    }
-    Err(format!(
-        "kube-context `{context}` is not in your kubeconfig. Available: {}",
-        if known.is_empty() {
-            "(none)".to_string()
-        } else {
-            known.join(", ")
-        }
-    ))
-}
-
 unsafe fn apply(profile: &Profile, force: bool) {
     unsafe {
         set("KUBECONFIG", profile.kubeconfig.as_deref(), force);
         set(KUBE_CONTEXT_ENV, profile.context.as_deref(), force);
-        set(IMAGE_BACKEND_ENV, Some(profile.backend.as_str()), force);
-        match profile.backend {
-            // OpenShift integrated registry: pods reference the pull (svc)
-            // address; the build is pushed to the distinct push (route) address.
-            ImageBackend::OpenShift => {
-                set(REGISTRY_ENV, profile.pull.as_deref(), force);
+        set(CLUSTER_CLASS_ENV, Some(profile.class.as_str()), force);
+        set(STORAGE_DRIVER_ENV, profile.storage_driver.as_deref(), force);
+        match profile.class {
+            ClusterClass::Remote => {
+                set(REGISTRY_ENV, profile.pull_address(), force);
                 set(PUSH_REGISTRY_ENV, profile.push.as_deref(), force);
             }
-            // Generic registry: one address for both push and pull.
-            ImageBackend::Registry => {
-                set(REGISTRY_ENV, profile.push.as_deref(), force);
-                if force {
-                    std::env::remove_var(PUSH_REGISTRY_ENV);
-                }
-            }
-            // kind mode requires both registry vars absent so
-            // image::from_env resolves to Kind. Only an explicit flag
-            // clears a pre-set env; `current` leaves it (env wins).
-            ImageBackend::Kind => {
+            // Both vars absent → image path resolves to the kind side-loader; only
+            // an explicit flag clears a pre-set env
+            ClusterClass::Local => {
                 if force {
                     std::env::remove_var(REGISTRY_ENV);
                     std::env::remove_var(PUSH_REGISTRY_ENV);
                 }
-                set(KIND_CLUSTER_ENV, profile.kind_cluster.as_deref(), force);
             }
         }
     }
@@ -619,24 +305,54 @@ unsafe fn apply(profile: &Profile, force: bool) {
 
 unsafe fn set(key: &str, val: Option<&str>, force: bool) {
     let Some(val) = val else { return };
-    // An empty env value counts as unset, so a persisted default still fills in
-    // e.g. an empty `KUBECONFIG`.
-    let unset = std::env::var_os(key).is_none_or(|v| v.is_empty());
-    if force || unset {
+    // Empty value counts as unset (a persisted default still fills an empty KUBECONFIG)
+    if force || std::env::var_os(key).is_none_or(|v| v.is_empty()) {
         unsafe { std::env::set_var(key, val) };
     }
 }
 
-fn unknown_cluster(name: &str, cfg: &Config) -> String {
-    let known: Vec<&str> = cfg.clusters.keys().map(String::as_str).collect();
-    format!(
-        "no cluster profile `{name}`. Known: {}. Add one with `ztest cluster add`.",
-        if known.is_empty() {
-            "(none)".to_string()
-        } else {
-            known.join(", ")
-        }
-    )
+fn listed<'a>(items: impl Iterator<Item = &'a str>) -> String {
+    let v: Vec<&str> = items.collect();
+    if v.is_empty() { "(none)".to_string() } else { v.join(", ") }
+}
+
+fn verify_context(context: &str) -> Result<(), String> {
+    if crate::cluster::in_cluster() {
+        return Ok(());
+    }
+    let config = Kubeconfig::read()
+        .map_err(|e| format!("reading kubeconfig to verify context `{context}`: {e}"))?;
+    if config.contexts.iter().any(|c| c.name == context) {
+        return Ok(());
+    }
+    Err(format!(
+        "kube-context `{context}` is not in your kubeconfig. Available: {}",
+        listed(config.contexts.iter().map(|c| c.name.as_str()))
+    ))
+}
+
+/// Targeted kube-context: [`KUBE_CONTEXT_ENV`], else the kubeconfig's
+/// current-context; `None` in-cluster
+pub fn active_context() -> Option<String> {
+    if let Some(ctx) = std::env::var(KUBE_CONTEXT_ENV).ok().filter(|s| !s.is_empty()) {
+        return Some(ctx);
+    }
+    if crate::cluster::in_cluster() {
+        return None;
+    }
+    Kubeconfig::read().ok()?.current_context
+}
+
+/// Active profile's CSI driver; `None` = follow the cluster's default StorageClass
+pub fn active_storage_driver() -> Option<String> {
+    std::env::var(STORAGE_DRIVER_ENV).ok().filter(|s| !s.trim().is_empty())
+}
+
+/// Active `(push, pull)`, read from the env not the config file (an ambient
+/// `ZTEST_IMAGE_REGISTRY` — how CI supplies it — reports like a profile that set one)
+pub fn active_registry() -> (Option<String>, Option<String>) {
+    let read = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    (read(PUSH_REGISTRY_ENV), read(REGISTRY_ENV))
 }
 
 #[cfg(test)]
@@ -646,130 +362,153 @@ mod tests {
     #[test]
     fn round_trips_through_toml() {
         let mut cfg = Config::default();
+        cfg.clusters.insert("dev".into(), Profile::local("zkn"));
         cfg.clusters.insert(
-            "local".to_string(),
+            "prod".into(),
             Profile {
-                context: Some("kind-zkn".to_string()),
-                kind_cluster: Some("zkn".to_string()),
+                context: Some("prod".into()),
+                push: Some("route.example/img".into()),
+                pull: Some("svc:5000/img".into()),
+                class: ClusterClass::Remote,
                 ..Default::default()
             },
         );
-        cfg.clusters.insert(
-            "crc".to_string(),
-            Profile {
-                context: Some("crc".to_string()),
-                push: Some("route.example/ztest-images".to_string()),
-                pull: Some("svc:5000/ztest-images".to_string()),
-                backend: ImageBackend::OpenShift,
-                ..Default::default()
-            },
-        );
-        cfg.current = Some("crc".to_string());
+        cfg.current = Some("prod".into());
 
-        let body = toml::to_string_pretty(&cfg).unwrap();
-        let back: Config = toml::from_str(&body).unwrap();
-        assert_eq!(back.current.as_deref(), Some("crc"));
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(back.current.as_deref(), Some("prod"));
         assert_eq!(back.clusters, cfg.clusters);
     }
 
     #[test]
-    fn legacy_openshift_bool_migrates_to_backend() {
-        // A config written before `backend` existed: the `openshift = true` bool
-        // must migrate to `ImageBackend::OpenShift`, never silently downgrade to
-        // the kind default (which would point a remote OpenShift run at kind).
-        let body = "[clusters.crc]\n\
-                    context = \"crc\"\n\
-                    push = \"route.example/img\"\n\
-                    pull = \"svc:5000/img\"\n\
-                    openshift = true\n";
-        let cfg: Config = toml::from_str(body).unwrap();
-        assert_eq!(cfg.clusters["crc"].backend, ImageBackend::OpenShift);
-
-        // A legacy bare-registry profile (push, no openshift) → Registry.
-        let body = "[clusters.gh]\npush = \"ghcr.io/z\"\n";
-        let cfg: Config = toml::from_str(body).unwrap();
-        assert_eq!(cfg.clusters["gh"].backend, ImageBackend::Registry);
+    fn an_unknown_class_is_rejected_rather_than_defaulted() {
+        assert!(toml::from_str::<Config>("[clusters.c]\nclass = \"mainframe\"\n").is_err());
     }
 
     #[test]
-    fn absent_distribution_is_kind_default_summary() {
-        let p = Profile::default();
-        assert!(p.summary().contains("kind (default)"));
-        assert!(p.summary().contains("(current kube-context)"));
+    fn a_profile_with_no_class_is_local() {
+        let cfg: Config = toml::from_str("[clusters.c]\nkind_cluster = \"k\"\n").unwrap();
+        assert_eq!(cfg.clusters["c"].class, ClusterClass::Local);
     }
 
     #[test]
-    fn registry_and_kind_together_is_rejected() {
+    fn validate_rejects_contradictory_profiles() {
+        let remote = |f: fn(&mut Profile)| {
+            let mut p = Profile {
+                class: ClusterClass::Remote,
+                push: Some("r".into()),
+                ..Default::default()
+            };
+            f(&mut p);
+            p
+        };
+        assert!(remote(|p| p.context = Some("kind-k".into())).validate().is_err());
+        assert!(remote(|p| p.push = None).validate().is_err());
+        assert!(
+            Profile {
+                class: ClusterClass::Local,
+                pull: Some("svc:5000/x".into()),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    /// `pull` omittable (single-address registry = common case), but the address
+    /// pods resolve must stay answerable
+    #[test]
+    fn a_remote_profile_pulls_from_push_when_pull_is_unset() {
         let p = Profile {
-            backend: ImageBackend::Registry,
-            push: Some("r".into()),
-            kind_cluster: Some("k".into()),
+            class: ClusterClass::Remote,
+            push: Some("ghcr.io/z".into()),
             ..Default::default()
         };
-        assert!(p.validate().is_err());
+        assert!(p.validate().is_ok());
+        assert_eq!(p.pull_address(), Some("ghcr.io/z"));
     }
 
     #[test]
-    fn openshift_without_addresses_is_rejected() {
+    fn a_split_registry_keeps_both_addresses() {
         let p = Profile {
-            backend: ImageBackend::OpenShift,
+            class: ClusterClass::Remote,
             push: Some("route/x".into()),
-            ..Default::default()
-        };
-        assert!(p.validate().is_err(), "openshift needs a pull address too");
-    }
-
-    #[test]
-    fn kind_with_registry_address_is_rejected() {
-        let p = Profile {
-            backend: ImageBackend::Kind,
             pull: Some("svc:5000/x".into()),
             ..Default::default()
         };
-        assert!(p.validate().is_err());
+        assert_eq!(p.pull_address(), Some("svc:5000/x"));
+        assert!(p.summary().contains("push=route/x"));
     }
 
     #[test]
-    fn reads_token_ca_and_registry_extension_from_kubeconfig() {
+    fn a_local_profile_summarizes_its_kind_node() {
+        assert!(Profile::local("zkn").summary().contains("kind zkn"));
+        assert!(Profile::default().summary().contains("kind (default)"));
+    }
+
+    /// Named per test: parallel runs + a shared path = one test's cleanup deletes
+    /// the file another is reading
+    fn write_kubeconfig(name: &str, body: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ztest-kc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config");
-        let ca_pem = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
-        let ca_b64 = base64::engine::general_purpose::STANDARD.encode(ca_pem);
-        let body = format!(
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_kubeconfig_with_a_registry_extension_yields_a_remote_profile() {
+        let path = write_kubeconfig(
+            "remote.yaml",
             "apiVersion: v1\n\
-             current-context: crc\n\
+             current-context: prod\n\
              clusters:\n\
-             - name: crc-cluster\n  \
+             - name: prod-cluster\n  \
                cluster:\n    \
                  server: https://example:6443\n    \
-                 certificate-authority-data: {ca_b64}\n    \
                  extensions:\n    \
                  - name: ztest.io/registry\n      \
                    extension:\n        \
-                     push: route.example/ztest-images\n        \
-                     pull: svc:5000/ztest-images\n        \
-                     openshift: true\n\
+                     push: route.example/img\n        \
+                     pull: svc:5000/img\n\
              contexts:\n\
-             - name: crc\n  \
+             - name: prod\n  \
                context:\n    \
-                 cluster: crc-cluster\n    \
-                 user: crc-user\n\
-             users:\n\
-             - name: crc-user\n  \
-               user:\n    \
-                 token: sha256~secrettoken\n"
+                 cluster: prod-cluster\n",
         );
-        std::fs::write(&path, body).unwrap();
+        let p = Profile::from_kubeconfig(&path).unwrap();
+        assert_eq!(p.class, ClusterClass::Remote);
+        assert_eq!(p.context.as_deref(), Some("prod"));
+        assert_eq!(p.push.as_deref(), Some("route.example/img"));
+        assert_eq!(p.pull.as_deref(), Some("svc:5000/img"));
+        assert!(p.validate().is_ok());
+        std::fs::remove_file(&path).ok();
+    }
 
-        let m = read_material(Some(&path), None).unwrap();
-        assert_eq!(m.token.as_deref(), Some("sha256~secrettoken"));
-        assert_eq!(m.ca_pem.as_deref(), Some(&ca_pem[..]));
-        let reg = m.registry.expect("registry extension present");
-        assert_eq!(reg.push, "route.example/ztest-images");
-        assert_eq!(reg.pull, "svc:5000/ztest-images");
-        assert!(reg.openshift);
-
-        std::fs::remove_dir_all(&dir).ok();
+    /// Equal pair = one address; recording twice lets the two drift
+    #[test]
+    fn an_equal_push_and_pull_records_only_push() {
+        let path = write_kubeconfig(
+            "equal.yaml",
+            "apiVersion: v1\n\
+             current-context: c\n\
+             clusters:\n\
+             - name: cl\n  \
+               cluster:\n    \
+                 server: https://example:6443\n    \
+                 extensions:\n    \
+                 - name: ztest.io/registry\n      \
+                   extension:\n        \
+                     push: ghcr.io/z\n        \
+                     pull: ghcr.io/z\n\
+             contexts:\n\
+             - name: c\n  \
+               context:\n    \
+                 cluster: cl\n",
+        );
+        let p = Profile::from_kubeconfig(&path).unwrap();
+        assert_eq!(p.pull, None);
+        assert_eq!(p.pull_address(), Some("ghcr.io/z"));
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -1,18 +1,10 @@
-//! `ztest` command-line surface.
+//! `ztest` command-line surface: parsing, dispatch, per-subcommand impls
+//! (binary itself = `src/bin/ztest.rs`).
 //!
-//! `ztest` is the primary developer entry point for ztest-managed integration
-//! testing (see
-//! [`docs/guide-running-tests.md`](https://github.com/zingolabs/ztest/blob/dev/docs/guide-running-tests.md)).
-//! Subcommands:
-//!
-//! - [`run`]: preflight + cluster orchestration + `cargo nextest run`.
-//!   Arguments after `run` pass verbatim to `cargo nextest run`, so migration
-//!   is a literal `s/cargo nextest/ztest/`.
-//! - [`list_mounts`]: debug helper dumping the resolved mount inventory for the
-//!   current workspace as JSON.
-//!
-//! The binary lives at `src/bin/ztest.rs`; this module owns parsing, dispatch,
-//! and the per-subcommand implementations.
+//! - [`run`] = preflight + cluster orchestration + `cargo nextest run`; args after
+//!   `run` pass verbatim, so migration is `s/cargo nextest/ztest/`
+//! - [`list_mounts`] = debug dump of the resolved mount inventory as JSON
+//! - Guide: [`docs/guide-running-tests.md`](https://github.com/zingolabs/ztest/blob/dev/docs/guide-running-tests.md)
 
 use std::process::ExitCode;
 
@@ -20,14 +12,12 @@ use clap::{Parser, Subcommand};
 
 pub(crate) mod cleanup;
 pub(crate) mod cluster;
-pub(crate) mod cluster_tools;
 pub(crate) mod console;
 pub(crate) mod lfs_transfer;
 pub mod list_mounts;
 pub(crate) mod preview;
 pub mod replay;
 pub mod run;
-pub(crate) mod setup;
 pub(crate) mod snapshot;
 pub mod store;
 pub(crate) mod sync;
@@ -82,11 +72,6 @@ pub enum Command {
     #[command(name = "list-mounts")]
     ListMounts(list_mounts::Args),
 
-    /// Provision a cluster for the ztest suites (one command). Targets a
-    /// remote cluster (kubeconfig/ServiceAccount), a local `kind` cluster, or
-    /// local OpenShift Community (`crc`); see `--target`. Idempotent.
-    Setup(setup::Args),
-
     /// Reclaim your finished test resources — leftover `--no-cleanup`
     /// namespaces, finished detached syncs, build pods, seed bindings, and
     /// QoS reservations. Live runs and Running syncs are skipped unless
@@ -98,9 +83,10 @@ pub enum Command {
     /// `warm`).
     Snapshot(snapshot::Args),
 
-    /// Manage named cluster profiles (`list`, `add`, `set`, `current`,
-    /// `remove`) that bind kube-context + image distribution + the OpenShift
-    /// flag, so `ztest run --cluster <name>` selects a whole target at once.
+    /// Provision a cluster (`setup`, `check`) and manage the named profiles
+    /// (`list`, `add`, `set`, `current`, `remove`) that bind a kube-context to
+    /// its registry, so `ztest run --cluster <name>` selects a whole target at
+    /// once.
     Cluster(cluster::Args),
 
     /// Manage detached, ztest-owned chain syncs (`list`, `describe`, `start`,
@@ -121,16 +107,14 @@ pub enum Command {
     LfsTransfer,
 }
 
-/// Tokio runtime flavor for [`block_on`]: the k8s-only subcommands are happy on
-/// a single thread, while `run`/`setup` want the multi-thread pool.
+/// Tokio runtime flavor for [`block_on`] (k8s-only subcommands single-thread,
+/// `run`/`setup` want the pool)
 pub(crate) enum Rt {
     Multi,
     Current,
 }
 
-/// Build a Tokio runtime, drive `fut` to completion, and map its result to an
-/// `ExitCode`, prefixing any error with `ztest {label}:`. The runtime-build and
-/// result-mapping boilerplate every simple subcommand shared.
+/// Build a runtime, drive `fut`, map to `ExitCode`; errors prefixed `ztest {label}:`
 pub(crate) fn block_on(
     label: &str,
     rt: Rt,
@@ -156,12 +140,10 @@ pub(crate) fn block_on(
     }
 }
 
-/// Entry point: parse argv and dispatch.
+/// Parse argv and dispatch.
 ///
-/// Returns an `ExitCode` matching the underlying tool's exit status. For `Run`,
-/// this is the exit code of `cargo nextest run`. Signal termination maps to
-/// `130` (the conventional `SIGINT` exit) so CI can distinguish "killed" from
-/// "failed".
+/// - `ExitCode` = the underlying tool's status (`Run` → `cargo nextest run`'s)
+/// - Signal termination → `130`, so CI tells "killed" from "failed"
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
@@ -169,7 +151,6 @@ pub fn main() -> ExitCode {
         Command::Replay(args) => replay::execute(args),
         Command::Store(args) => store::execute(args),
         Command::ListMounts(args) => list_mounts::execute(args),
-        Command::Setup(args) => setup::execute(args),
         Command::Cleanup(args) => cleanup::execute(args),
         Command::Snapshot(args) => snapshot::execute(args),
         Command::Cluster(args) => cluster::execute(args),

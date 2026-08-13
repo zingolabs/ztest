@@ -1,9 +1,9 @@
-//! Translate `Mount`s into per-pod `volumes` + `volumeMounts`. Side-effecting:
-//! creates ConfigMaps for `mount_config!` / `mount_file!`, plus the seed
-//! VSCs and PVCs for `mount_archive!`.
+//! Translate `Mount`s into per-pod `volumes` + `volumeMounts`.
 //!
-//! Everything created in the slot namespace carries the sentinel's ownerRef
-//! so teardown cascades cleanly.
+//! - Side-effecting: ConfigMaps for `mount_config!`/`mount_file!`, seed VSCs + PVCs for
+//!   `mount_archive!`
+//! - Everything minted in the slot namespace carries the sentinel's ownerRef → teardown
+//!   cascades
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,21 +19,20 @@ use crate::materialize;
 use crate::seeds::{self, SeedBinding};
 use crate::{EnvError, Mount, MountKind, MountSource};
 
-/// Cap on `mount_config!` size. Re-checked at runtime in case the bytes
-/// changed between compile and run.
+/// Cap on `mount_config!` size, re-checked at runtime (the bytes may change between
+/// compile and run)
 const CONFIG_BYTES_MAX: u64 = 1024 * 1024;
 
-/// What a Pod needs for one mount: the `spec.volumes[*]` entry and the
-/// `container.volumeMounts[*]` entry, both as raw JSON. `manifest.rs`
-/// splats them into the rendered Pod.
+/// What a Pod needs for one mount: `spec.volumes[*]` + `container.volumeMounts[*]`, raw
+/// JSON, splatted into the rendered Pod by `manifest.rs`
 #[derive(Debug, Clone)]
 pub struct ResolvedMount {
     pub volume: Value,       // pod.spec.volumes[i]
     pub volume_mount: Value, // pod.spec.containers[*].volumeMounts[i]
 }
 
-/// One `ResolvedMount` per input, plus the seed bindings created here so
-/// `TestEnv` can delete their cluster-scoped content halves on teardown.
+/// One `ResolvedMount` per input, plus the seed bindings minted here so `TestEnv` can
+/// delete their cluster-scoped content halves on teardown
 #[derive(Debug, Default)]
 pub struct ResolveOutput {
     pub mounts: Vec<ResolvedMount>,
@@ -51,16 +50,8 @@ pub async fn resolve_all(
         let volume_name = format!("vol-{i}");
         let resolved = match (&m.kind, &m.source) {
             (MountKind::Config, MountSource::ConfigAbs(path)) => {
-                resolve_config(
-                    client,
-                    sentinel,
-                    pod_prefix,
-                    i,
-                    &volume_name,
-                    path,
-                    &m.destination,
-                )
-                .await?
+                resolve_config(client, sentinel, pod_prefix, i, &volume_name, path, &m.destination)
+                    .await?
             }
             (MountKind::Config, MountSource::ConfigInline(text)) => {
                 resolve_config_inline(
@@ -106,8 +97,8 @@ pub async fn resolve_all(
             (MountKind::Shared, MountSource::SharedClaim { claim }) => {
                 resolve_shared(&volume_name, claim, &m.destination)
             }
-            // The macros enforce (kind, source) pairings at compile time,
-            // so any mismatch here is a programmer error in this crate.
+            // Macros enforce (kind, source) pairings at compile time → a mismatch here is
+            // a programmer error in this crate
             (k, s) => unreachable!("mount kind/source mismatch: {k:?} / {s:?}"),
         };
         out.mounts.push(resolved);
@@ -148,10 +139,7 @@ async fn resolve_config_inline(
     if (text.len() as u64) > CONFIG_BYTES_MAX {
         return Err(EnvError::ArchiveMaterializeFailed {
             archive: destination.display().to_string(),
-            reason: format!(
-                "inline config is {} bytes; cap is {CONFIG_BYTES_MAX}",
-                text.len()
-            ),
+            reason: format!("inline config is {} bytes; cap is {CONFIG_BYTES_MAX}", text.len()),
         });
     }
     let cm_name = format!("{pod_prefix}-cfg-{index}");
@@ -161,9 +149,8 @@ async fn resolve_config_inline(
 
 // ───────── mount_file! ─────────
 //
-// Same content-addressed-PVC + seed-binding machinery as `mount_archive!`, but
-// the uploader writes a single blob into `/seed/blob` (no extraction) and the
-// consuming Pod mounts that blob at the destination via subPath.
+// Same content-addressed-PVC + seed-binding machinery as `mount_archive!`, except the
+// uploader writes one blob to `/seed/blob` (no extraction) and the Pod subPaths it
 
 #[allow(clippy::too_many_arguments)]
 async fn resolve_file(
@@ -205,15 +192,15 @@ async fn resolve_archive(
     destination: &Path,
     out: &mut ResolveOutput,
 ) -> Result<ResolvedMount, EnvError> {
-    // 1. Resolve the seed preflight already published, then read its CSI
-    //    snapshot handle. This waits; it never pulls. See materialize.rs.
+    // 1. Resolve the already-published seed preflight, read its CSI snapshot handle.
+    //    Waits, never pulls (materialize.rs)
     let seed = materialize::await_seed(client, archive).await?;
 
-    // 2. Bind the seed into the test ns: pre-provisioned VSC + VolumeSnapshot.
+    // 2. Bind the seed into the test ns: pre-provisioned VSC + VolumeSnapshot
     let binding =
         seeds::bind_seed(client, sentinel, &seed, &format!("{pod_prefix}-{index}")).await?;
 
-    // 3. Create a fresh PVC in the test ns with dataSource = the bound snapshot.
+    // 3. Fresh PVC in the test ns, dataSource = the bound snapshot
     let pvc_name = format!("{pod_prefix}-arch-{index}");
     create_pvc_from_snapshot(
         client,
@@ -255,28 +242,17 @@ async fn create_cm(
 ) -> Result<(), EnvError> {
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &sentinel.namespace);
     let cm = ConfigMap {
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            ..ObjectMeta::default()
-        },
+        metadata: ObjectMeta { name: Some(name.to_string()), ..ObjectMeta::default() },
         data: Some(BTreeMap::from([("file".to_string(), text.to_string())])),
         ..ConfigMap::default()
     };
-    api.create(&PostParams::default(), &cm)
-        .await
-        .map_err(env_err)?;
+    api.create(&PostParams::default(), &cm).await.map_err(env_err)?;
     Ok(())
 }
 
-/// Create the test's writable PVC, restored from a seed binding's snapshot.
-///
-/// `size` is the source snapshot's own `restoreSize`, threaded down from the
-/// [`SeedBinding`]'s seed rather than written here. A restore may not request
-/// less than its source: the CSI driver rejects it with `OutOfRange`, the PVC
-/// never binds, and the pod sits `Pending` on an unbound claim until the test
-/// times out — a failure that names neither the size nor the snapshot. A
-/// literal here is a second copy of a number that lives on the seed, and the
-/// two silently drift the moment `ZAINO_SEED_SIZE` or a fixture changes.
+/// `size` must be the source snapshot's own `restoreSize`, threaded from the
+/// [`SeedBinding`]'s seed: less is rejected `OutOfRange` and the pod sits `Pending` on an
+/// unbound claim until the test times out, naming neither the size nor the snapshot
 async fn create_pvc_from_snapshot(
     client: &Client,
     sentinel: &Sentinel,
@@ -284,6 +260,9 @@ async fn create_pvc_from_snapshot(
     snapshot_name: &str,
     size: &str,
 ) -> Result<(), EnvError> {
+    let storage = crate::resource::selected_storage(client)
+        .await
+        .map_err(|e| EnvError::Manifest { reason: e })?;
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &sentinel.namespace);
     let pvc_json = json!({
         "apiVersion": "v1",
@@ -299,20 +278,17 @@ async fn create_pvc_from_snapshot(
                 "name": snapshot_name,
             },
             "resources": { "requests": { "storage": size } },
-            "storageClassName": detect_storage_class(),
+            "storageClassName": storage.class_name,
         }
     });
     let pvc: PersistentVolumeClaim = serde_json::from_value(pvc_json).expect("static manifest");
-    api.create(&PostParams::default(), &pvc)
-        .await
-        .map_err(env_err)?;
+    api.create(&PostParams::default(), &pvc).await.map_err(env_err)?;
     Ok(())
 }
 
 fn file_volume_from_cm(volume_name: &str, cm_name: &str, destination: &Path) -> ResolvedMount {
-    // ConfigMap mounted as a single file via subPath. The CM key is always
-    // "file" (see `create_cm`). `mountPath` is the absolute path the test
-    // author asked for; `subPath: "file"` selects the stored entry.
+    // ConfigMap as a single file via subPath: key is always "file" (`create_cm`), and
+    // `mountPath` is the absolute path the test author asked for
     ResolvedMount {
         volume: json!({ "name": volume_name, "configMap": { "name": cm_name } }),
         volume_mount: json!({
@@ -334,10 +310,9 @@ fn resolve_scratch(volume_name: &str, destination: &Path) -> ResolvedMount {
     }
 }
 
-/// A pre-provisioned shared PVC, referenced by `claimName`. No side effects:
-/// the claim is minted once per env in [`create_shared_pvc`], and both sharing
-/// pods point at the same name. Mounted read-write (the writer pod owns the DB;
-/// the reader opens it as a RocksDB secondary, which only reads the path).
+/// Pre-provisioned shared PVC, referenced by `claimName`. No side effects — the claim is
+/// minted once per env in [`create_shared_pvc`] and both pods name it. Read-write (the
+/// writer owns the DB; the reader opens it as a RocksDB secondary)
 fn resolve_shared(volume_name: &str, claim: &str, destination: &Path) -> ResolvedMount {
     ResolvedMount {
         volume: json!({
@@ -351,15 +326,11 @@ fn resolve_shared(volume_name: &str, claim: &str, destination: &Path) -> Resolve
     }
 }
 
-/// Provision one blank `ReadWriteOnce` PVC named `claim` in the test namespace,
-/// to be shared by two co-scheduled pods. Called once per shared volume during
-/// `TestEnv::build`, before any pod is created.
+/// Called once per shared volume during `TestEnv::build`, before any pod exists.
 ///
-/// `storageClassName` is left unset so the cluster's default class provisions
-/// it (on kind that's the node-local `standard` class, RWO, which lets two pods
-/// on the single node share it). Override with `ZAINO_SHARED_STORAGECLASS` if
-/// the default isn't suitable. The PVC is namespace-scoped, so namespace
-/// teardown reclaims it.
+/// `storageClassName` unset → the cluster's default class provisions it (on kind the
+/// node-local RWO `standard`, which is what lets two same-node pods share it);
+/// `ZAINO_SHARED_STORAGECLASS` overrides
 pub(crate) async fn create_shared_pvc(
     client: &Client,
     sentinel: &Sentinel,
@@ -380,9 +351,7 @@ pub(crate) async fn create_shared_pvc(
         "spec": spec,
     });
     let pvc: PersistentVolumeClaim = serde_json::from_value(pvc_json).expect("static manifest");
-    api.create(&PostParams::default(), &pvc)
-        .await
-        .map_err(env_err)?;
+    api.create(&PostParams::default(), &pvc).await.map_err(env_err)?;
     Ok(())
 }
 
@@ -399,9 +368,8 @@ fn dir_volume_from_pvc(volume_name: &str, pvc_name: &str, destination: &Path) ->
     }
 }
 
-/// PVC populated with one file at `/blob` (see `materialize.rs`), mounted
-/// at the consumer's destination via `subPath` so it appears as a single
-/// file rather than a directory.
+/// PVC holding one file at `/blob` (`materialize.rs`), mounted at the consumer's
+/// destination via `subPath` → appears as a file, not a directory
 fn file_volume_from_pvc(volume_name: &str, pvc_name: &str, destination: &Path) -> ResolvedMount {
     ResolvedMount {
         volume: json!({
@@ -415,8 +383,4 @@ fn file_volume_from_pvc(volume_name: &str, pvc_name: &str, destination: &Path) -
             "readOnly": true,
         }),
     }
-}
-
-fn detect_storage_class() -> String {
-    std::env::var("ZAINO_STORAGECLASS").unwrap_or_else(|_| "rook-ceph-block".into())
 }

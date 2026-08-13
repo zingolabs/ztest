@@ -1,10 +1,8 @@
-//! Portable recordings: bundle a run directory into a single `.zip` that can be
-//! archived as a CI artifact and replayed elsewhere (`ztest store export`).
+//! Portable recordings: a run directory → one `.zip`, archivable as a CI artifact and
+//! replayable elsewhere (`ztest store export`).
 //!
-//! Entries are stored uncompressed (`STORE`): the event log and output blobs are
-//! already zstd-compressed, so re-deflating them would only cost CPU. `meta.json`
-//! is tiny. This matches nextest's `CompressionMethod::STORE` for pre-compressed
-//! payloads.
+//! Entries uncompressed (`STORE`) — log and blobs are already zstd, `meta.json` is tiny;
+//! matches nextest's `CompressionMethod::STORE` for pre-compressed payloads
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -12,17 +10,13 @@ use std::path::Path;
 
 use zip::write::SimpleFileOptions;
 
-/// Bundle every file under `run_dir` into the zip at `out`, preserving the
-/// relative layout (`meta.json`, `run.log.zst`, `out/…`).
+/// Every file under `run_dir` → the zip at `out`, relative layout preserved
 pub fn export(run_dir: &Path, out: &Path) -> io::Result<()> {
     let file = File::create(out)?;
     let mut zip = zip::ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
-    for entry in walkdir::WalkDir::new(run_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    for entry in walkdir::WalkDir::new(run_dir).into_iter().filter_map(Result::ok) {
         let rel = match entry.path().strip_prefix(run_dir) {
             Ok(r) if !r.as_os_str().is_empty() => r,
             _ => continue,
@@ -39,7 +33,6 @@ pub fn export(run_dir: &Path, out: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Map a `zip` error to an `io::Error` so callers see one error type.
 fn zip_err(e: zip::result::ZipError) -> io::Error {
     match e {
         zip::result::ZipError::Io(e) => e,
@@ -67,18 +60,12 @@ mod tests {
         let out = base.join("export.zip");
         export(&run_dir, &out).unwrap();
 
-        // The archive opens and carries the three files under their relative paths.
+        // Archive opens, carrying all three under their relative paths
         let mut archive = zip::ZipArchive::new(File::open(&out).unwrap()).unwrap();
-        let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
-            .collect();
+        let names: Vec<String> =
+            (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect();
         assert!(names.iter().any(|n| n == "meta.json"), "{names:?}");
         assert!(names.iter().any(|n| n == "run.log.zst"), "{names:?}");
-        assert!(
-            names
-                .iter()
-                .any(|n| n.replace('\\', "/") == "out/abc-combined"),
-            "{names:?}"
-        );
+        assert!(names.iter().any(|n| n.replace('\\', "/") == "out/abc-combined"), "{names:?}");
     }
 }

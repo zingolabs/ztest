@@ -1,19 +1,12 @@
-//! Regtest activation-height schedule.
+//! Regtest activation-height schedule, rendered into every component's config.
 //!
-//! [`ActivationHeights`] is the per-network-upgrade regtest schedule every
-//! component's config is rendered from. [`ActivationHeights::regtest_default`]
-//! is the single canonical default (NU6.3/Ironwood active); a test that needs a
-//! different schedule supplies a full explicit one via
-//! [`crate::TestEnv::activation_heights`], which is checked by
-//! `ActivationHeights::validate_schedule`.
+//! - [`ActivationHeights::regtest_default`] = sole canonical default (NU6.3/Ironwood active)
+//! - Override = a full explicit schedule via [`crate::TestEnv::activation_heights`],
+//!   checked by `ActivationHeights::validate_schedule`
 
 // ────────────────────────── ActivationHeights ─────────────────────────
 
-/// Per-network-upgrade activation heights for a regtest chain. `None` means
-/// the upgrade is not activated.
-///
-/// ztest owns this type rather than borrowing Zingo's re-implementation, so
-/// the harness depends only on the canonical `zcash_protocol`.
+/// Per-upgrade regtest activation heights. `None` = not activated
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct ActivationHeights {
     overwinter: Option<u32>,
@@ -30,7 +23,6 @@ pub struct ActivationHeights {
 }
 
 impl ActivationHeights {
-    /// Start building; unset upgrades default to `None`.
     pub fn builder() -> ActivationHeightsBuilder {
         ActivationHeightsBuilder::default()
     }
@@ -69,9 +61,8 @@ impl ActivationHeights {
         self.nu7
     }
 
-    /// The canonical regtest schedule: pre-NU5 upgrades at height 1, NU5..=NU6.3
-    /// all at height 2 (NU6.3/Ironwood active), NU7 off. The default for every
-    /// regtest env unless overridden via [`crate::TestEnv::activation_heights`].
+    /// Pre-NU5 at 1, NU5..=NU6.3 at 2, NU7 off. Default for every regtest env
+    /// unless overridden via [`crate::TestEnv::activation_heights`]
     pub fn regtest_default() -> Self {
         ActivationHeights::builder()
             .set_overwinter(Some(1))
@@ -87,7 +78,7 @@ impl ActivationHeights {
             .build()
     }
 
-    /// The upgrades in supersession order, paired with their (optional) height.
+    /// Supersession order
     fn ordered(&self) -> [(NetworkUpgrade, Option<u32>); 11] {
         use NetworkUpgrade::*;
         [
@@ -105,10 +96,9 @@ impl ActivationHeights {
         ]
     }
 
-    /// Validate a caller-supplied schedule: activated upgrades must form a
-    /// contiguous prefix from Overwinter, and heights must be non-decreasing in
-    /// supersession order. (zebrad/zcashd reject a non-prefix or out-of-order
-    /// schedule at startup; this surfaces it as a `build()` error instead.)
+    /// - Active upgrades must form a contiguous prefix from Overwinter
+    /// - Heights non-decreasing in supersession order
+    /// - Both rejected by zebrad/zcashd at startup → surfaced here as a `build()` error
     pub(crate) fn validate_schedule(&self) -> Result<(), String> {
         let ordered = self.ordered();
         let mut first_inactive: Option<NetworkUpgrade> = None;
@@ -142,8 +132,7 @@ impl ActivationHeights {
     }
 }
 
-/// Builder for [`ActivationHeights`]. Setters take `Option<u32>` so callers
-/// can thread "unknown / inactive" through without branching.
+/// Setters take `Option<u32>` (callers thread "unknown / inactive" without branching)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ActivationHeightsBuilder {
     inner: ActivationHeights,
@@ -201,12 +190,8 @@ impl ActivationHeightsBuilder {
 
 // ─────────────────────────── NetworkUpgrade ───────────────────────────
 
-/// Ordered enum of Zcash network upgrades.
-///
-/// `Ord` reflects supersession (`Nu5 < Nu6 < Nu6_1 < ...`); a new NU must be
-/// inserted in supersession order — NU6.3 sits between NU6.2 and NU7, not
-/// appended. Used by [`ActivationHeights::validate_schedule`] to name upgrades
-/// and check their ordering.
+/// Zcash network upgrades. `Ord` = supersession, so a new NU is *inserted*, not
+/// appended (NU6.3 between NU6.2 and NU7); [`ActivationHeights::validate_schedule`] leans on it
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum NetworkUpgrade {
     Overwinter,
@@ -230,7 +215,7 @@ mod tests {
 
     #[test]
     fn nu6_3_supersedes_nu6_2_and_precedes_nu7() {
-        // `validate_schedule` relies on this ordering.
+        // `validate_schedule` leans on this
         assert!(NetworkUpgrade::Nu6_2 < NetworkUpgrade::Nu6_3);
         assert!(NetworkUpgrade::Nu6_3 < NetworkUpgrade::Nu7);
     }
@@ -245,13 +230,12 @@ mod tests {
         assert_eq!(h.nu6_2(), Some(2));
         assert_eq!(h.nu6_3(), Some(2));
         assert_eq!(h.nu7(), None);
-        h.validate_schedule()
-            .expect("canonical regtest schedule is valid");
+        h.validate_schedule().expect("canonical regtest schedule is valid");
     }
 
     #[test]
     fn validate_schedule_rejects_a_gap() {
-        // Active NU6.3 with an inactive NU6.2 is not a contiguous prefix.
+        // Active NU6.3 + inactive NU6.2 = not a contiguous prefix
         let h = ActivationHeights::builder()
             .set_overwinter(Some(1))
             .set_sapling(Some(1))
@@ -268,7 +252,7 @@ mod tests {
 
     #[test]
     fn validate_schedule_rejects_decreasing_heights() {
-        // NU6.3 at 1 sits below NU5/NU6 at 2: heights must be non-decreasing.
+        // NU6.3 at 1 < NU5/NU6 at 2
         let h = ActivationHeights::builder()
             .set_overwinter(Some(1))
             .set_sapling(Some(1))

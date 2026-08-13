@@ -48,13 +48,6 @@ fn tier_attributes_register_in_inventory_with_the_right_class() {
     assert_eq!(class_of("::marker_sync"), QosClass::Sync);
 
     // test_id is module-qualified (the §3 `module_path!()::fn` shape).
-    let sync = entries
-        .iter()
-        .find(|d| d.test_id.ends_with("::marker_sync"))
-        .unwrap();
-    assert!(
-        sync.test_id.contains("qos_attr"),
-        "module-qualified: {}",
-        sync.test_id
-    );
+    let sync = entries.iter().find(|d| d.test_id.ends_with("::marker_sync")).unwrap();
+    assert!(sync.test_id.contains("qos_attr"), "module-qualified: {}", sync.test_id);
 }

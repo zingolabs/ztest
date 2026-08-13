@@ -1,11 +1,8 @@
 //! In-process zingolib wallet backend.
 //!
-//! Implements ztest's
-//! [`WalletBackend`] by running zingolib
-//! `LightClient`s in the test binary against a pod-hosted indexer's gRPC.
-//! The backend crosses the validator's [`ActivationHeights`] into
-//! zingolib's `ChainType::Regtest`; zingolib does no implicit fill-in, so every
-//! activated height is carried across explicitly.
+//! - [`WalletBackend`] over zingolib `LightClient`s in the test binary → pod-hosted indexer gRPC
+//! - Validator [`ActivationHeights`] crossed into `ChainType::Regtest` height-by-height
+//!   (zingolib does no implicit fill-in)
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -42,17 +39,15 @@ use zcash_protocol::consensus::BlockHeight;
 
 const LABEL: &str = "zingo";
 
-/// BIP-39 mnemonic for the regtest faucet. Each validator's miner address is
-/// derived from this seed, so a faucet account built from it receives the
-/// coinbase rewards after a sync.
+/// Regtest faucet mnemonic. Every validator's miner address derives from it,
+/// so a faucet account built here collects the coinbase after a sync
 pub const FAUCET_SEED: &str = zingo_test_vectors::seeds::ABANDON_ART_SEED;
 
-/// A second well-known test seed, for the recipient side of a transfer.
+/// Second well-known test seed, recipient side of a transfer
 pub const RECIPIENT_SEED: &str = zingo_test_vectors::seeds::HOSPITAL_MUSEUM_SEED;
 
-/// In-process zingolib wallet config. ZST for the
-/// [`Wallet`](crate::component::Wallet) builder; produces a
-/// [`ZingoWallet`] handle at `add_wallet` time.
+/// [`Wallet`](crate::component::Wallet) builder's zingolib flavour → [`ZingoWallet`]
+/// handle at `add_wallet` time
 #[derive(Debug, Clone, Default)]
 pub struct ZingoBackend;
 
@@ -67,32 +62,26 @@ impl WalletConfig for ZingoBackend {
     type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, _plumbing: HandleInner) -> ZingoWallet {
-        // Wallets run in-process; the handle owns its own state, no plumbing.
+        // In-process: the handle owns its state, no plumbing
         ZingoWallet::new()
     }
 }
 
-/// Live in-process zingolib wallet handle. Holds one client entry per
-/// account; methods dispatch to the matching client. Cheaply cloneable: clones
-/// share the same state.
+/// In-process. Clones share one state
 #[derive(Clone, Default)]
 pub struct ZingoWallet {
     inner: Arc<ZingoInner>,
 }
 
+/// `clients` keyed by ztest [`AccountId`], each a single-seed wallet at
+/// `zip32::AccountId::ZERO` (one account = one wallet, never a zip32 sub-account)
 #[derive(Default)]
 struct ZingoInner {
-    /// One [`ClientEntry`] per ztest [`AccountId`]. Each client wraps a
-    /// single-seed wallet addressed at `zip32::AccountId::ZERO`: ztest maps one
-    /// account to one wallet, not to a zip32 sub-account index.
     clients: StdMutex<HashMap<u32, ClientEntry>>,
     next_id: AtomicU32,
 }
 
-/// One in-process account: its `LightClient`, the inputs needed to drive its
-/// sync (`pepper_sync::sync` params/config + the indexer URI to dial), and the
-/// temp wallet-data dir held alive for the client's lifetime (dropped with the
-/// entry).
+/// `_datadir` keeps the temp wallet-data dir alive for the client's lifetime
 struct ClientEntry {
     client: Arc<AsyncMutex<LightClient>>,
     params: ChainType,
@@ -101,9 +90,7 @@ struct ClientEntry {
     _datadir: TempDir,
 }
 
-/// Everything [`ZingoWallet::sync`] needs to drive one account's sync, cloned
-/// out from its [`ClientEntry`] so the clients-map lock is released before the
-/// (long) sync runs.
+/// Cloned out of [`ClientEntry`] so the clients-map lock drops before the long sync
 struct SyncInputs {
     client: Arc<AsyncMutex<LightClient>>,
     params: ChainType,
@@ -133,8 +120,6 @@ impl ZingoWallet {
             .ok_or_else(|| format!("zingo: unknown account {account:?}").into())
     }
 
-    /// The client plus the inputs needed to drive its sync directly through
-    /// `pepper_sync::sync` (network params, engine config, indexer URI).
     fn sync_inputs(&self, account: AccountId) -> Result<SyncInputs, BoxError> {
         self.inner
             .clients
@@ -151,9 +136,7 @@ impl ZingoWallet {
     }
 }
 
-/// Cross ztest's [`ActivationHeights`] into zingolib's `ChainType::Regtest`
-/// parameter type. zingolib does no implicit fill-in, so every activated height
-/// is carried across verbatim.
+/// Every activated height carried verbatim (zingolib does no implicit fill-in)
 fn to_activation_heights(a: &ActivationHeights) -> ZingoActivationHeights {
     ZingoActivationHeights::builder()
         .set_overwinter(a.overwinter())
@@ -170,28 +153,22 @@ fn to_activation_heights(a: &ActivationHeights) -> ZingoActivationHeights {
         .build()
 }
 
-/// Birthday for the well-known regtest test wallets. Height 1 is Sapling
-/// activation under the standard fixture, so commitment trees are valid from
-/// the first scanned block.
+/// Birthday for the well-known regtest wallets. 1 = Sapling activation under the
+/// standard fixture (commitment trees valid from the first scanned block)
 const TEST_WALLET_BIRTHDAY: u32 = 1;
 
 const FAUCET_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Regtest coinbase maturity: a transparent coinbase is spendable this many
-/// blocks after mining; a shielded coinbase (Orchard/Sapling) is spendable
-/// immediately.
+/// Blocks before a transparent coinbase is spendable (shielded = immediate)
 const COINBASE_MATURITY: u32 = 100;
 
-/// Longer confirm timeout for the transparent-maturity path.
+/// Confirm timeout, transparent-maturity path
 const FAUCET_MATURITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Zingo-specific conveniences: ztest ships the well-known regtest seeds, so a
-/// test gets a funded faucet or fresh recipient without naming a mnemonic.
+/// Well-known regtest seeds ship with ztest → funded faucet / fresh recipient
+/// without naming a mnemonic
 impl ZingoWallet {
-    /// Build an in-process wallet account: derive the regtest activation
-    /// heights from `validator` (the single source of truth) and point
-    /// the lightclient at `indexer`'s gRPC endpoint. Composition over
-    /// [`WalletBackend::add_account`].
+    /// Heights from `validator` (sole source of truth), lightclient aimed at `indexer`'s gRPC
     pub async fn account<V, I>(
         &self,
         validator: &V,
@@ -217,9 +194,8 @@ impl ZingoWallet {
         Ok(Account::new(self.clone(), id, self.label()))
     }
 
-    /// The regtest faucet account, built from [`FAUCET_SEED`], whose
-    /// transparent address the validator mines to. Sync it after mining to
-    /// pick up the coinbase.
+    /// Faucet account from [`FAUCET_SEED`], the validator's mining target.
+    /// Sync after mining to pick up the coinbase
     pub async fn faucet<V, I>(
         &self,
         validator: &V,
@@ -229,16 +205,10 @@ impl ZingoWallet {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        self.account(
-            validator,
-            indexer,
-            FAUCET_SEED,
-            BlockHeight::from(TEST_WALLET_BIRTHDAY),
-        )
-        .await
+        self.account(validator, indexer, FAUCET_SEED, BlockHeight::from(TEST_WALLET_BIRTHDAY)).await
     }
 
-    /// A fresh recipient account built from [`RECIPIENT_SEED`].
+    /// Fresh recipient account from [`RECIPIENT_SEED`]
     pub async fn recipient<V, I>(
         &self,
         validator: &V,
@@ -248,19 +218,11 @@ impl ZingoWallet {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        self.account(
-            validator,
-            indexer,
-            RECIPIENT_SEED,
-            BlockHeight::from(TEST_WALLET_BIRTHDAY),
-        )
-        .await
+        self.account(validator, indexer, RECIPIENT_SEED, BlockHeight::from(TEST_WALLET_BIRTHDAY))
+            .await
     }
 
-    /// A faucet synced and ready to spend one spendable shielded note.
-    ///
-    /// Convenience for [`funded_faucet_with_notes`](Self::funded_faucet_with_notes)
-    /// with `notes = 1`.
+    /// [`funded_faucet_with_notes`](Self::funded_faucet_with_notes) at `notes = 1`
     pub async fn funded_faucet<V, I>(
         &self,
         validator: &V,
@@ -273,26 +235,13 @@ impl ZingoWallet {
         self.funded_faucet_with_notes(validator, indexer, 1).await
     }
 
-    /// A synced faucet holding at least `notes` independent spendable
-    /// shielded notes, funded from the validator's coinbase. The funding path
-    /// depends on the pool the validator mines its coinbase into (see
+    /// `notes` independent notes = that many back-to-back sends, none spending
+    /// another's unconfirmed change. Path follows the mined pool (see
     /// [`Validator::mine_to`](crate::component::Validator::mine_to)):
     ///
-    /// - Shielded coinbase (zcashd, Sapling): a shielded coinbase note is
-    ///   spendable the moment it is mined and synced, and each block yields
-    ///   one, so funding is just "mine `notes` blocks" with no maturity wait
-    ///   and no shield round.
-    /// - Transparent coinbase (zebrad, Transparent): a transparent coinbase
-    ///   is subject to the 100-block coinbase maturity, and zingo cannot spend one
-    ///   directly, only shield it. So mature the coinbase, then shield it into
-    ///   Orchard, once per requested note. Each shield consolidates the
-    ///   currently-matured transparent coinbase into one independent Orchard
-    ///   note; a fresh `COINBASE_MATURITY` batch is matured before every
-    ///   shield so each note is independent. Mirrors the upstream dev funding
-    ///   flow (`vec![100; rounds]`).
-    ///
-    /// `notes` independent notes let a test issue that many back-to-back
-    /// sends without one spending another's unconfirmed change.
+    /// - Shielded coinbase: one spendable note per block → mine `notes` blocks
+    /// - Transparent: 100-block maturity + shield-only, so a fresh `COINBASE_MATURITY`
+    ///   batch matures per shield (keeps each Orchard note independent)
     pub async fn funded_faucet_with_notes<V, I>(
         &self,
         validator: &V,
@@ -305,14 +254,12 @@ impl ZingoWallet {
     {
         let faucet = self.faucet(validator, indexer).await?;
         match validator.pool_support().coinbase {
-            // Shielded coinbase: one spendable note per mined block. (Ironwood is
-            // Orchard-based; zingolib does not track it separately, so the zingo
-            // backend treats an Ironwood coinbase like an Orchard one — see the
-            // `ironwood: 0` note in `balances`.)
+            // One spendable note per mined block. Ironwood folded into Orchard
+            // (zingolib doesn't track it — see `ironwood: 0` in `balances`)
             Pool::Orchard | Pool::Ironwood | Pool::Sapling => {
                 mine_and_sync(validator, indexer, &faucet, notes, FAUCET_CONFIRM_TIMEOUT).await?;
             }
-            // Transparent coinbase: mature, then shield into Orchard.
+            // Mature, then shield into Orchard
             Pool::Transparent => {
                 fund_via_shield(validator, indexer, &faucet, notes.max(1)).await?;
             }
@@ -321,10 +268,8 @@ impl ZingoWallet {
     }
 }
 
-/// Mine `n` blocks, wait for the indexer to surface the new tip, then sync
-/// `faucet`. No-op when `n == 0`. Waiting for the indexer before syncing
-/// means the faucet's sync already sees every new note (under parallel-test
-/// load the indexer can lag the validator).
+/// No-op at `n == 0`. Indexer awaited before the sync (it lags the validator under
+/// parallel-test load, and the sync must see every new note)
 async fn mine_and_sync<V, I>(
     validator: &V,
     indexer: &I,
@@ -346,11 +291,8 @@ where
     Ok(())
 }
 
-/// Fund `faucet` from a transparent coinbase: mature it, then shield into
-/// Orchard `notes` times for `notes` independent Orchard notes. zingo can
-/// shield a transparent coinbase but cannot spend one directly, so a direct
-/// send would see a zero balance; the shield is mandatory. Mirrors the
-/// upstream dev funding flow (mine, sync, shield).
+/// Shield mandatory, once per requested note (zingo cannot spend a transparent
+/// coinbase directly → a plain send sees zero balance)
 async fn fund_via_shield<V, I>(
     validator: &V,
     indexer: &I,
@@ -361,17 +303,12 @@ where
     V: ValidatorBackend + ?Sized,
     I: IndexerBackend + ?Sized,
 {
-    // Mature a fresh transparent-coinbase batch before each shield, so every
-    // shield consolidates a distinct, independent set of matured coinbase into
-    // its own Orchard note. Mining only one block between shields would leave
-    // the faucet re-spending an already-shielded coinbase, conflicting the
-    // second shield's transaction so it never enters the mempool.
+    // Fresh batch per shield, so each consolidates a distinct matured set into its
+    // own Orchard note (one block between shields → re-spends an already-shielded
+    // coinbase, conflicting the second shield out of the mempool)
     //
-    // The first round mines only the deficit to maturity: a cold chain mines
-    // the full `COINBASE_MATURITY + 1`, while a chain-cache booted past
-    // maturity (see `Restore::restore`) mines nothing and only
-    // re-syncs. Subsequent rounds always mine a fresh `COINBASE_MATURITY`
-    // batch.
+    // Round 0 mines only the deficit to maturity: cold chain = `COINBASE_MATURITY + 1`,
+    // a cache booted past maturity (`Restore::restore`) = nothing but a re-sync
     for i in 0..notes {
         let blocks = if i == 0 {
             let height = u32::from(validator.chain_height().await?);
@@ -380,15 +317,14 @@ where
             COINBASE_MATURITY
         };
         if blocks == 0 {
-            // Cached chain already matured: `mine_and_sync` would no-op, so
-            // sync here to surface the matured coinbase before shielding.
+            // Already matured → `mine_and_sync` no-ops; sync to surface the coinbase
             faucet.sync().await?;
         } else {
             mine_and_sync(validator, indexer, faucet, blocks, FAUCET_MATURITY_TIMEOUT).await?;
         }
         faucet.shield().await?;
     }
-    // Confirm the final shield so its Orchard note is spendable.
+    // Confirm the final shield (its Orchard note must be spendable)
     mine_and_sync(validator, indexer, faucet, 1, FAUCET_CONFIRM_TIMEOUT).await?;
     Ok(())
 }
@@ -405,20 +341,16 @@ impl WalletBackend for ZingoWallet {
         let (client, params, sync_config) =
             build_light_client(spec.indexer_uri, datadir.path(), &spec).await?;
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .clients
-            .lock()
-            .expect("zingo clients mutex poisoned")
-            .insert(
-                id,
-                ClientEntry {
-                    client: Arc::new(AsyncMutex::new(client)),
-                    params,
-                    sync_config,
-                    indexer_uri: Arc::from(spec.indexer_uri),
-                    _datadir: datadir,
-                },
-            );
+        self.inner.clients.lock().expect("zingo clients mutex poisoned").insert(
+            id,
+            ClientEntry {
+                client: Arc::new(AsyncMutex::new(client)),
+                params,
+                sync_config,
+                indexer_uri: Arc::from(spec.indexer_uri),
+                _datadir: datadir,
+            },
+        );
         Ok(AccountId(id))
     }
 
@@ -426,8 +358,7 @@ impl WalletBackend for ZingoWallet {
         let client = self.client(account)?;
         let client = client.lock().await;
         let kind = match pool {
-            // zingolib has no distinct Ironwood receiver; it shares the unified
-            // (Orchard) address.
+            // No distinct Ironwood receiver — shares the unified (Orchard) address
             Pool::Orchard | Pool::Ironwood => "unified",
             Pool::Sapling => "sapling",
             Pool::Transparent => "transparent",
@@ -445,9 +376,8 @@ impl WalletBackend for ZingoWallet {
         let zats = |v: Option<Zatoshis>| v.map(Zatoshis::into_u64).unwrap_or(0);
         Ok(PoolBalances {
             orchard: zats(b.total_orchard_balance),
-            // zingolib's WalletBalance has no Ironwood field (it does not track
-            // the NU6.3 pool); report 0. Ironwood assertions must use the
-            // librustzcash backend, not zingo.
+            // No Ironwood field in zingolib's WalletBalance (NU6.3 untracked)
+            // → Ironwood assertions need the librustzcash backend
             ironwood: 0,
             sapling: zats(b.total_sapling_balance),
             transparent: zats(b.confirmed_transparent_balance),
@@ -455,25 +385,17 @@ impl WalletBackend for ZingoWallet {
     }
 
     async fn sync(&self, account: AccountId) -> Result<(), BoxError> {
-        let SyncInputs {
-            client,
-            params,
-            sync_config,
-            indexer_uri,
-        } = self.sync_inputs(account)?;
-        // Rent the `LightWallet` the `LightClient` owns. pepper-sync writes it in
-        // place, so the client's later balance/send/shield reads observe the
-        // synced state without a second wallet impl. The lock is held only long
-        // enough to clone the wallet Arc, not for the whole sync.
+        let SyncInputs { client, params, sync_config, indexer_uri } = self.sync_inputs(account)?;
+        // Rent the client's `LightWallet`: pepper-sync writes in place, so later
+        // balance/send/shield reads see synced state without a second wallet impl
+        // Lock held only to clone the Arc, never across the sync
         let wallet = client.lock().await.wallet().clone();
         let uri = indexer_uri
             .parse::<http::Uri>()
             .map_err(|e| format!("zingo: bad indexer uri {:?}: {e}", indexer_uri.as_ref()))?;
-        let indexer = GrpcIndexer::new(uri)
-            .await
-            .map_err(|e| format!("zingo: dial indexer: {e}"))?;
-        // pepper-sync leaves `sync_mode` `Running` on return and requires its
-        // consumer to reset it to `NotRunning`; a to-tip drive owns a fresh one.
+        let indexer =
+            GrpcIndexer::new(uri).await.map_err(|e| format!("zingo: dial indexer: {e}"))?;
+        // pepper-sync returns with `sync_mode` still `Running`, consumer must reset it
         let sync_mode = Arc::new(AtomicU8::new(SyncMode::NotRunning as u8));
         pepper_sync::sync(indexer, &params, wallet, sync_mode.clone(), sync_config)
             .await
@@ -499,8 +421,7 @@ impl WalletBackend for ZingoWallet {
         }
         let client = self.client(from)?;
         let mut client = client.lock().await;
-        // zingolib's `quick_send` builds and relays atomically, so the relay
-        // cannot be isolated; bound the whole call.
+        // `quick_send` builds + relays atomically → bound the whole call, not the relay
         let send = zingolib::testutils::lightclient::from_inputs::quick_send(
             &mut client,
             vec![(to, zats, None)],
@@ -540,36 +461,24 @@ impl WalletBackend for ZingoWallet {
     }
 }
 
-/// Build one in-process zingolib `LightClient` from `spec`, bound to
-/// `indexer_uri`, with its wallet files under `datadir`.
+/// One zingolib account, sapling-only unified address (ztest's one-account-per-seed).
 ///
-/// This is the whole of what ztest needs from a wallet library — construct a
-/// client from a seed against an indexer — so it lives as a plain function
-/// rather than pulling `zingolib_testutils::scenarios::ClientBuilder`, which
-/// drags the `zcash_local_net → zebra-consensus → libzcash_script` launcher
-/// stack (and `libstdc++`) that ztest exists to replace. Uses `zingolib` core
-/// plus `pepper-sync` only.
-///
-/// Adapted from that `ClientBuilder::build_client` (zingolib rev 61418d6e):
-/// the wallet holds a single seed, so it is created for one zingolib account
-/// with a sapling-only unified address, matching ztest's one-account-per-seed
-/// model. `overwrite` is always true — `datadir` is a fresh empty tempdir.
+/// - Hand-rolled, not `zingolib_testutils`' `ClientBuilder` (drags the
+///   `zcash_local_net → zebra-consensus → libzcash_script` stack ztest replaces)
 async fn build_light_client(
     indexer_uri: &str,
     datadir: &Path,
     spec: &AccountSpec<'_>,
 ) -> Result<(LightClient, ChainType, SyncConfig), BoxError> {
-    let uri: http::Uri = indexer_uri
-        .parse()
-        .map_err(|e| format!("zingo: bad indexer uri {indexer_uri:?}: {e}"))?;
+    let uri: http::Uri =
+        indexer_uri.parse().map_err(|e| format!("zingo: bad indexer uri {indexer_uri:?}: {e}"))?;
     let chain = ChainType::Regtest(to_activation_heights(spec.activation));
     let sync_config = SyncConfig {
         transparent_address_discovery: TransparentAddressDiscovery::minimal(),
         performance_level: PerformanceLevel::High,
     };
-    // `LightClient::new` builds the `LightWallet` from the `WalletConfig` (seed
-    // + birthday) and dials the indexer; `overwrite = true` because `datadir` is
-    // a fresh empty tempdir.
+    // `LightClient::new` builds the `LightWallet` (seed + birthday) and dials the
+    // indexer; `overwrite = true` (fresh empty tempdir)
     let config = ClientConfig::builder()
         .set_chain_type(chain)
         .set_wallet_dir(datadir.to_path_buf())

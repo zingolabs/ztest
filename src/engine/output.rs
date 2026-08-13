@@ -1,35 +1,26 @@
-//! When a test's captured output is shown, mirroring nextest's model: two
-//! orthogonal choices, *how* stdout/stderr is captured ([`CaptureStrategy`]) and
-//! *when* it's displayed ([`TestOutputDisplay`], chosen independently for pass
-//! and fail). The engine captures a merged stream, so the default is
-//! [`CaptureStrategy::Combined`]; `--no-capture` → [`CaptureStrategy::None`],
-//! which (as in nextest) also forces serial execution and immediate display.
+//! Captured-output policy, on nextest's model: *how* ([`CaptureStrategy`]) and
+//! *when* ([`TestOutputDisplay`], per pass/fail) are orthogonal.
+//!
+//! - Engine merges the stream → default [`CaptureStrategy::Combined`]
+//! - `--no-capture` = [`CaptureStrategy::None`] → serial + immediate (nextest parity)
 
 use std::str::FromStr;
 
-/// When a test's captured output is written to the report. Chosen independently
-/// for passing and failing tests. Kebab-case string forms match nextest's CLI
-/// values (`immediate`, `immediate-final`, `final`, `never`).
+/// When captured output reaches the report, chosen per pass/fail.
+/// Kebab-case forms = nextest's CLI values
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestOutputDisplay {
-    /// Show the output as soon as the test completes (interleaved into the live
-    /// scrollback feed as each verdict lands).
     Immediate,
-    /// Show it both immediately AND again in the end-of-run summary block.
     ImmediateFinal,
-    /// Show it only in the end-of-run summary block.
     Final,
-    /// Never show it.
     Never,
 }
 
 impl TestOutputDisplay {
-    /// Whether the output is shown inline the moment the test finishes.
     pub fn is_immediate(self) -> bool {
         matches!(self, Self::Immediate | Self::ImmediateFinal)
     }
 
-    /// Whether the output is (also) shown in the end-of-run summary block.
     pub fn is_final(self) -> bool {
         matches!(self, Self::Final | Self::ImmediateFinal)
     }
@@ -50,29 +41,21 @@ impl FromStr for TestOutputDisplay {
     }
 }
 
-/// How a test process's stdout+stderr is captured.
+/// - `Combined` (default) buffers one merged stream per test (concurrent tests
+///   would interleave on the live console)
+/// - `None` = `--no-capture` → serial + immediate display
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureStrategy {
-    /// Buffer a merged stdout+stderr stream per test, replayed by the reporter
-    /// per [`OutputConfig`]. The default; keeps concurrent tests' output from
-    /// interleaving on the live console.
     Combined,
-    /// Do not capture: the test streams straight to the terminal
-    /// (`--no-capture`). As in nextest this forces serial execution and implies
-    /// immediate display for both success and failure.
     None,
 }
 
-/// The resolved output policy for a run. Defaults match nextest's built-in
-/// `default` profile: failing tests' output is shown immediately, passing tests'
-/// output is captured but not displayed.
+/// Resolved output policy. Defaults = nextest's `default` profile (fail shown
+/// immediately, pass captured but hidden)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputConfig {
-    /// When to show a passing test's captured output.
     pub success: TestOutputDisplay,
-    /// When to show a failing test's captured output.
     pub failure: TestOutputDisplay,
-    /// How output is captured.
     pub capture: CaptureStrategy,
 }
 
@@ -87,10 +70,8 @@ impl Default for OutputConfig {
 }
 
 impl OutputConfig {
-    /// Apply `--no-capture` semantics: as in nextest, uncaptured output implies
-    /// immediate display for both success and failure (there is nothing to defer
-    /// to a final block), and the caller must also run serially — see
-    /// [`is_serial`](Self::is_serial).
+    /// `--no-capture`: uncaptured → immediate both ways (nothing left to defer).
+    /// Caller must also run serially, see [`is_serial`](Self::is_serial)
     pub fn with_no_capture(mut self) -> Self {
         self.capture = CaptureStrategy::None;
         self.success = TestOutputDisplay::Immediate;
@@ -98,19 +79,16 @@ impl OutputConfig {
         self
     }
 
-    /// The display policy for a test that ended in `passed`.
     pub fn display_for(&self, passed: bool) -> TestOutputDisplay {
         if passed { self.success } else { self.failure }
     }
 
-    /// Whether any output is captured at all. `false` under `--no-capture`,
-    /// where the test inherits the terminal directly.
+    /// `false` under `--no-capture` (test inherits the terminal)
     pub fn captures(&self) -> bool {
         matches!(self.capture, CaptureStrategy::Combined)
     }
 
-    /// Whether the run must execute serially (one test at a time). True only
-    /// under `--no-capture`, matching nextest's `test_threads = 1` coupling.
+    /// True only under `--no-capture` (nextest's `test_threads = 1` coupling)
     pub fn is_serial(&self) -> bool {
         matches!(self.capture, CaptureStrategy::None)
     }
@@ -123,10 +101,7 @@ mod tests {
     #[test]
     fn parses_all_display_values() {
         assert_eq!("immediate".parse(), Ok(TestOutputDisplay::Immediate));
-        assert_eq!(
-            "immediate-final".parse(),
-            Ok(TestOutputDisplay::ImmediateFinal)
-        );
+        assert_eq!("immediate-final".parse(), Ok(TestOutputDisplay::ImmediateFinal));
         assert_eq!("final".parse(), Ok(TestOutputDisplay::Final));
         assert_eq!("never".parse(), Ok(TestOutputDisplay::Never));
         assert!("bogus".parse::<TestOutputDisplay>().is_err());

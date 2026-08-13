@@ -1,32 +1,14 @@
 //! Typed handles to content-addressed archive resources.
 //!
-//! One concept, one macro. An *archive* is an immutable `.tar.*` artifact
-//! stored in Git LFS alongside a plaintext `.toml` manifest, declared with
-//! [`archive!`](macro@crate::archive) / `#[ztest::archive]`
-//! and consumed by [`RestoreSource`](crate::component::RestoreSource). A
-//! pre-synced testnet chain is not a separate kind of thing — it is an archive
-//! whose manifest happens to describe a validator state directory, which is
-//! what [`ChainInfo`] carries.
-//!
-//! # Identity is the OID, not the path
-//!
-//! The manifest records the archive's `sha256` and `size_bytes`. A Git LFS
-//! object id *is* the SHA-256 of the file, so those two fields are exactly the
-//! committed pointer's `oid` and `size` — and the manifest is plaintext, never
-//! LFS-tracked, and always present in every checkout and every build context.
-//! The macro therefore bakes the identity at expansion time on any machine,
-//! touching no archive bytes and shelling out to no `git`.
-//!
-//! That is what makes the handle portable. The seed PVC is named `seed-<sha8>`
-//! from the same OID, so the laptop that declares the archive, the build pod
-//! that compiles the test, the runner pod that requests the mount, and the
-//! puller Job that fetches `lfs/<oid>` into the cluster all name the same
-//! resource without any of them reading the file.
+//! - Archive = immutable `.tar.*` in Git LFS + plaintext `.toml` manifest, declared by
+//!   [`archive!`](macro@crate::archive), consumed by [`RestoreSource`](crate::component::RestoreSource)
+//! - Pinned chain = archive whose manifest describes a validator state dir ([`ChainInfo`])
+//! - Identity = LFS oid = sha256 of bytes = manifest `sha256`/`size_bytes` (manifest plaintext &
+//!   always present → macro bakes identity at expansion, touching no archive bytes, no `git`)
+//! - Same oid names seed PVC `seed-<sha8>` & key `lfs/<oid>` → laptop/build/runner/puller agree
 
-/// Which validator's on-disk layout an archive carries.
-///
-/// zebrad and zcashd serialise their state directories incompatibly, so the
-/// backend is part of the artifact's identity rather than a property of it.
+/// Validator on-disk layout an archive carries. Part of the artifact's identity, not a
+/// property of it (zebrad/zcashd serialise state dirs incompatibly)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveBackend {
     Zebra,
@@ -34,7 +16,7 @@ pub enum ArchiveBackend {
 }
 
 impl ArchiveBackend {
-    /// The manifest value this backend parses from and renders to.
+    /// Manifest spelling
     pub const fn as_str(self) -> &'static str {
         match self {
             ArchiveBackend::Zebra => "zebra",
@@ -43,11 +25,8 @@ impl ArchiveBackend {
     }
 }
 
-/// Which Zcash network the archived chain belongs to.
-///
-/// Read from the manifest's `network`, never inferred from the filename: the
-/// filename is a convention the producer follows, the manifest is the record
-/// it writes.
+/// Zcash network of the archived chain. From manifest `network`, never the filename
+/// (filename = producer convention, manifest = the record it writes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveNetwork {
     Mainnet,
@@ -64,21 +43,16 @@ impl ArchiveNetwork {
         }
     }
 
-    /// Whether this is a public network — one whose chain ztest restores from a
-    /// pinned archive rather than mines itself.
+    /// Public = chain restored from a pinned archive, not mined.
     ///
-    /// The distinction that matters to a config generator is not
-    /// mainnet-vs-testnet but *restored-and-frozen* vs *regtest*: a public-network
-    /// validator runs peerless against an immutable pin, so its tip never moves
-    /// and it must never chase the live network. Regtest is the opposite.
+    /// - Split that matters to a config generator = restored-and-frozen vs regtest
+    /// - Public validator runs peerless against the pin (tip never moves, must not chase live net)
     pub const fn is_public(self) -> bool {
         matches!(self, ArchiveNetwork::Mainnet | ArchiveNetwork::Testnet)
     }
 
-    /// The value zebrad's `[network] network` key takes.
-    ///
-    /// Zebra spells these capitalised and ztest spells them lowercase; this is
-    /// the one place the two conventions meet.
+    /// Value for zebrad's `[network] network` key. Zebra capitalised / ztest lowercase =
+    /// the one place the two conventions meet
     pub const fn zebra_name(self) -> &'static str {
         match self {
             ArchiveNetwork::Mainnet => "Mainnet",
@@ -87,11 +61,8 @@ impl ArchiveNetwork {
         }
     }
 
-    /// zebrad's per-network initial-peers key.
-    ///
-    /// Network-specific by name, not just by value: setting `initial_testnet_peers`
-    /// on a mainnet node leaves the *mainnet* seed list at its default, and the
-    /// node dials out and syncs its tip off the pin.
+    /// zebrad's per-network initial-peers key. Name matters, not just value (wrong key leaves
+    /// the real seed list at default → node dials out & syncs its tip off the pin)
     pub const fn initial_peers_key(self) -> &'static str {
         match self {
             ArchiveNetwork::Mainnet => "initial_mainnet_peers",
@@ -101,30 +72,20 @@ impl ArchiveNetwork {
     }
 }
 
-/// One network upgrade the manifest records.
+/// Network upgrade as recorded in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Activation {
-    /// The manifest's key, in snake_case (`nu6_3`, `before_overwinter`).
     pub key: &'static str,
-    /// Height the upgrade activates at on this chain.
     pub height: u32,
 }
 
 impl Activation {
-    /// The name `getblockchaininfo.upgrades` reports for this upgrade.
+    /// Name `getblockchaininfo.upgrades` reports for this upgrade.
     ///
-    /// The manifest is keyed in snake_case because it is a TOML table; the
-    /// RPC reports display names. Consumers cross-check the two, so the
-    /// mapping has to live somewhere — here, once, rather than in each test
-    /// that compares them.
-    ///
-    /// Returns `None` for `before_overwinter`, which is the absence of any
-    /// upgrade rather than an upgrade, and so is never reported by the RPC.
+    /// - Manifest keys snake_case (TOML table), RPC reports display names; mapping lives here once
+    /// - `None` for `before_overwinter` = absence of an upgrade → never RPC-reported
     pub const fn upgrade_name(&self) -> Option<&'static str> {
-        // `match` on &str is not const, so this is a byte-slice comparison
-        // chain. The set is closed and changes only when Zcash adds an
-        // upgrade, at which point a new arm here is the correct forcing
-        // function.
+        // `match` on &str is not const → byte-slice compare chain
         const fn eq(a: &str, b: &str) -> bool {
             let (a, b) = (a.as_bytes(), b.as_bytes());
             if a.len() != b.len() {
@@ -166,36 +127,22 @@ impl Activation {
     }
 }
 
-/// The producer's evidence that the pool an upgrade introduces actually
-/// carries value by the pinned tip.
+/// Producer's evidence that the pool an upgrade introduces carries value by the pinned tip.
 ///
-/// A snapshot pinned *at* an activation holds essentially none of the data it
-/// is named for, and every boundary assertion drawn from it passes while
-/// proving nothing. The producer gates on this at production time; carrying it
-/// here lets a consumer re-assert it against the *mounted* archive, which is a
-/// different claim — a truncated extraction or a partially-populated seed PVC
-/// makes the two diverge.
+/// - Re-assertable consumer-side against the *mounted* archive (truncated extract or
+///   half-populated seed PVC diverges)
+/// - Values = pool `chainValueZat` below activation (0 by definition) & at tip (non-zero, else vacuous)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundaryCheck {
-    /// Value pool the upgrade introduces (`sapling`, `orchard`, `ironwood`).
     pub pool: &'static str,
-    /// Activation height — the bottom of the verified window.
     pub from_height: u32,
-    /// Top of the verified window (the pinned tip).
     pub to_height: u32,
-    /// The pool's `chainValueZat` below the activation. Zero by definition.
     pub value_before: i64,
-    /// The pool's `chainValueZat` at the tip. Non-zero, or the fixture is
-    /// vacuous and production fails.
     pub value_after: i64,
 }
 
-/// What a manifest adds when its archive is a validator state directory
-/// rather than an opaque blob.
-///
-/// Present on a chain snapshot, absent on (say) a fixture tarball of test
-/// vectors. Everything here answers a question the harness would otherwise
-/// have to ask the running validator — or, worse, hardcode.
+/// Manifest extras for a validator state dir (vs an opaque blob): what the harness would
+/// otherwise ask the running validator, or hardcode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainInfo {
     backend: ArchiveBackend,
@@ -240,93 +187,68 @@ impl ChainInfo {
         }
     }
 
-    /// Validator layout the archive carries.
     pub const fn backend(&self) -> ArchiveBackend {
         self.backend
     }
 
-    /// Network the archived chain belongs to. Decides the validator's own
-    /// network setting, so a testnet archive cannot be booted as regtest.
+    /// Sets the validator's own network (testnet archive cannot boot as regtest)
     pub const fn network(&self) -> ArchiveNetwork {
         self.network
     }
 
-    /// Producer version — the validator release that wrote this state DB.
-    /// A reader at a different version either upgrades the DB in place (so it
-    /// stops being the artifact the name promises) or fails to open it.
+    /// Validator release that wrote this state DB. Reader at another version either upgrades
+    /// the DB in place (no longer the artifact the name promises) or fails to open it
     pub const fn version(&self) -> &'static str {
         self.version
     }
 
-    /// Pinned tip. A restored validator runs with an empty peer set, so this
-    /// is also its permanent tip: nothing advances it.
+    /// Pinned tip = permanent tip (restored validator has an empty peer set, nothing advances it)
     pub const fn tip_height(&self) -> u32 {
         self.tip_height
     }
 
-    /// Block hash at [`tip_height`](Self::tip_height), from the producer's
-    /// shutdown record.
     pub const fn tip_hash(&self) -> &'static str {
         self.tip_hash
     }
 
-    /// The validator's on-disk state format version. When the validator bumps
-    /// this, the archive is stale — and this turns that from an opaque pod
-    /// crash-loop into a named failure.
+    /// Validator on-disk state format version. Bump = stale archive, named failure not crash-loop
     pub const fn db_format(&self) -> u32 {
         self.db_format
     }
 
-    /// Extracted size. The seed PVC is sized from this, not from the
-    /// compressed [`ArchiveHandle::size`].
+    /// Extracted size. Seed PVC sized from this, not from compressed [`ArchiveHandle::size`]
     pub const fn uncompressed_bytes(&self) -> u64 {
         self.uncompressed_bytes
     }
 
-    /// Activation heights this chain actually contains, ascending. Consumers
-    /// cross-check these against `getblockchaininfo.upgrades` rather than
-    /// hardcoding heights.
+    /// Ascending; consumers cross-check against `getblockchaininfo.upgrades`, never hardcode
     pub const fn activations(&self) -> &'static [Activation] {
         self.activations
     }
 
-    /// Upgrades scheduled *above* this chain's tip: absent from it, and a
-    /// consumer may assert their absence.
+    /// Upgrades scheduled *above* this tip → absent from the chain
     pub const fn above_tip(&self) -> &'static [Activation] {
         self.above_tip
     }
 
-    /// The producer's non-vacuity evidence, when the pinned upgrade
-    /// introduces a value pool. `None` for an upgrade that introduces none
-    /// (Blossom), which is a correct skip rather than a missing field.
+    /// Producer's non-vacuity evidence. `None` = upgrade introduces no pool (Blossom), a
+    /// correct skip not a missing field
     pub const fn boundary_check(&self) -> Option<BoundaryCheck> {
         self.boundary_check
     }
 
-    /// The upgrade this chain exists to straddle: the newest activation it
-    /// actually contains.
-    ///
-    /// Derived rather than declared. A snapshot is produced by syncing to a
-    /// fixed margin past one activation, so the highest entry in
-    /// `[activations]` *is* the boundary it was made for — and deriving it
-    /// means a re-pin cannot leave a stale upgrade name behind.
-    ///
-    /// Private, and infallible by construction: [`TestEnv::build`] rejects a
-    /// restored testnet archive whose manifest records no activation — there,
-    /// unlike here, the handle is in view and the failure can name the
-    /// artifact. Every `ChainInfo` a test can reach has come through that gate.
-    ///
-    /// [`TestEnv::build`]: crate::TestEnv::build
-    /// The straddled activation, or `None` when the manifest records none.
-    ///
-    /// The fallible form exists for the one caller that must *decide* whether
-    /// a chain is usable rather than assume it: the gate in `TestEnv` that
-    /// rejects an unusable testnet archive, and so establishes the invariant
-    /// every accessor below relies on.
+    /// Fallible form for the sole caller that must *decide* usability: the `TestEnv` gate
+    /// rejecting an unusable archive (establishes the invariant the accessors below assume)
     pub(crate) fn straddled_activation_opt(&self) -> Option<Activation> {
         self.activations.last().copied()
     }
 
+    /// Upgrade this chain straddles = newest activation it contains.
+    ///
+    /// - Derived, not declared (a re-pin cannot leave a stale upgrade name behind)
+    /// - Infallible: every reachable `ChainInfo` passed the [`TestEnv::build`] gate above
+    ///
+    /// [`TestEnv::build`]: crate::TestEnv::build
     fn straddled_activation(&self) -> Activation {
         self.straddled_activation_opt().unwrap_or_else(|| {
             panic!(
@@ -337,14 +259,12 @@ impl ChainInfo {
         })
     }
 
-    /// Height of the upgrade this chain straddles — the boundary it exists to
-    /// put history on both sides of.
+    /// Height of the straddled upgrade (boundary this chain has history on both sides of)
     pub fn activation(&self) -> u32 {
         self.straddled_activation().height
     }
 
-    /// The name `getblockchaininfo.upgrades` reports for that upgrade
-    /// (`"Sapling"`, `"NU6.3"`).
+    /// Name `getblockchaininfo.upgrades` reports for that upgrade (`"Sapling"`, `"NU6.3"`)
     pub fn upgrade_name(&self) -> &'static str {
         let straddled = self.straddled_activation();
         straddled.upgrade_name().unwrap_or_else(|| {
@@ -357,53 +277,31 @@ impl ChainInfo {
         })
     }
 
-    /// The newest height whose coinbase outputs are certainly spendable, and
-    /// so certainly present in a UTXO set.
+    /// Newest height whose coinbase outputs are certainly spendable → certainly in a UTXO set.
     ///
-    /// Coinbase outputs mature after 100 blocks; the margin here is an order
-    /// of magnitude past that, because a caller reading one block near this
-    /// height wants the answer to be unambiguous, not marginal. A query
-    /// against an immature coinbase returns a legitimately empty result, which
-    /// a test reads as a failure of the thing under test rather than of its
-    /// own sampling.
+    /// Margin is 10× the 100-block maturity (query against an immature coinbase returns a
+    /// legitimately empty result, which a test misreads as failure of the thing under test)
     pub fn mature_height(&self) -> u32 {
         self.tip_height.saturating_sub(COINBASE_MATURITY_MARGIN)
     }
 
-    /// The heights worth querying this chain at.
-    ///
-    /// Derived from the activation rather than an arbitrary stride, because
-    /// the boundary is the reason the artifact exists: the block before the
-    /// upgrade, the activation block itself (the first under the new rules),
-    /// the one after, plus a mature height and the tip. Pure arithmetic on the
-    /// pin — no chain access.
-    ///
-    /// The last entry is one *below* the tip, not at it. `getblock` at the
-    /// exact tip is the single height where an off-by-one in the pin surfaces
-    /// as an RPC error rather than a comparison failure, masking the very
-    /// mismatch a differential test is there to catch.
+    /// Heights worth querying, by arithmetic on the pin: blocks around the activation, a
+    /// mature height, tip-1 (at the exact tip an off-by-one pin surfaces as an RPC error,
+    /// not the comparison failure a differential test exists to catch)
     pub fn boundary_heights(&self) -> [u32; 5] {
         let activation = self.activation();
-        [
-            activation - 1,
-            activation,
-            activation + 1,
-            self.mature_height(),
-            self.tip_height - 1,
-        ]
+        [activation - 1, activation, activation + 1, self.mature_height(), self.tip_height - 1]
     }
 }
 
-/// Blocks below the tip that [`ChainInfo::mature_height`] steps back.
+/// Blocks below the tip that [`ChainInfo::mature_height`] steps back
 const COINBASE_MATURITY_MARGIN: u32 = 1_000;
 
-/// A compile-time typed handle to a content-addressed archive.
+/// Compile-time typed handle to a content-addressed archive.
 ///
-/// Produced by [`archive!`](macro@crate::archive) / `#[ztest::archive]`, which bakes
-/// the identity from the sidecar manifest and submits the inventory
-/// declarations that let `ztest run` pre-provision the seed and gate the tests
-/// needing it. Because the handle is a real `const`, naming one that was never
-/// declared is a compile error.
+/// - [`archive!`](macro@crate::archive) bakes identity from the sidecar manifest & submits
+///   inventory decls (`ztest run` pre-provisions the seed, gates tests needing it)
+/// - Real `const` → naming an undeclared archive = compile error
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchiveHandle {
     name: &'static str,
@@ -413,8 +311,8 @@ pub struct ArchiveHandle {
 }
 
 impl ArchiveHandle {
-    /// Construct from macro-baked values. **Not** public API — use the
-    /// `archive!` macro, which also registers the resource with preflight.
+    /// Construct from macro-baked values. **Not** public API — use `archive!` (also
+    /// registers the resource with preflight)
     #[doc(hidden)]
     pub const fn __new(
         name: &'static str,
@@ -422,58 +320,37 @@ impl ArchiveHandle {
         size: u64,
         chain: Option<ChainInfo>,
     ) -> Self {
-        Self {
-            name,
-            oid,
-            size,
-            chain,
-        }
+        Self { name, oid, size, chain }
     }
 
-    /// The archive's filename (`zebra-v6.2.3-testnet-286000.tar.zst`).
-    ///
-    /// Carried for two reasons: the extension decides the decompression the
-    /// puller applies, and every diagnostic about this archive should name
-    /// something a human can find, not a 64-hex digest.
+    /// Archive filename (`zebra-v6.2.3-testnet-286000.tar.zst`); extension picks the
+    /// puller's decompression
     pub const fn name(&self) -> &'static str {
         self.name
     }
 
-    /// The archive's Git LFS object id — the SHA-256 of its bytes, and the
-    /// sole identity that crosses a process or pod boundary. The seed PVC is
-    /// `seed-<oid[..8]>`; the bucket key is `lfs/<oid>`.
+    /// Git LFS object id = SHA-256 of the bytes = sole identity crossing a process/pod
+    /// boundary (seed PVC `seed-<oid[..8]>`, bucket key `lfs/<oid>`)
     pub const fn oid(&self) -> &'static str {
         self.oid
     }
 
-    /// Compressed size in bytes, from the manifest's `size_bytes` — the same
-    /// number the committed LFS pointer carries. Sizes the puller's transfer
-    /// budget without fetching anything.
+    /// Compressed size from manifest `size_bytes` (= the committed LFS pointer's). Sizes the
+    /// puller's transfer budget without fetching anything
     pub const fn size(&self) -> u64 {
         self.size
     }
 
-    /// Validator-state metadata, when this archive is a chain snapshot.
-    ///
-    /// Crate-internal on purpose. A handle is an artifact *pointer* — a name,
-    /// an OID, a size — and that is the whole of its public surface. What the
-    /// archived chain contains is served to tests by
-    /// [`TestEnv::chain`](crate::TestEnv::chain), which knows which archive the
-    /// env actually restored and has verified the mounted data against it.
-    /// Reading it off the handle instead would let a test assert facts about
-    /// an artifact nothing in the env is running.
+    /// Crate-internal: handle = artifact *pointer*; tests read chain facts via
+    /// [`TestEnv::chain`](crate::TestEnv::chain), which knows what the env actually restored
+    /// (off the handle a test could assert facts about an artifact nothing is running)
     pub(crate) const fn chain(&self) -> Option<ChainInfo> {
         self.chain
     }
 }
 
-/// An archive's identity, read from its sidecar manifest at *runtime*.
-///
-/// The compile-time path is `archive!`, which is how every test declares one.
-/// This exists for `ztest snapshot warm`, which is handed artifact paths on a
-/// command line and so has no macro expansion to hang off. It reads only the
-/// two identity fields — the chain metadata is the macro's business — so it is
-/// a narrow reader, not a second implementation of the manifest format.
+/// Identity fields `(name, oid, size)` read from the sidecar manifest at *runtime*, for
+/// `ztest snapshot warm` (handed paths on a command line → no `archive!` expansion to hang off)
 pub(crate) fn identity_from_manifest(
     archive: &std::path::Path,
 ) -> Result<(String, String, u64), String> {
@@ -489,12 +366,7 @@ pub(crate) fn identity_from_manifest(
     let oid = doc
         .get("sha256")
         .and_then(toml::Value::as_str)
-        .ok_or_else(|| {
-            format!(
-                "manifest {} is missing a string `sha256`",
-                manifest.display()
-            )
-        })?
+        .ok_or_else(|| format!("manifest {} is missing a string `sha256`", manifest.display()))?
         .to_ascii_lowercase();
     let size = doc
         .get("size_bytes")
@@ -509,27 +381,20 @@ pub(crate) fn identity_from_manifest(
     Ok((name, oid, size))
 }
 
-/// The sidecar manifest path for an archive: same directory, archive suffix
-/// replaced with `.toml`.
+/// Sidecar manifest path: same dir, archive suffix → `.toml`. Mirrors the `archive!` macro's
+/// expansion-time rule.
 ///
-/// Mirrors the rule the `archive!` macro applies at expansion time. A filename
-/// is not safe to split on its first `.` — `zebra-v6.2.3-testnet-286000.tar.zst`
-/// has one inside the version — so the compound suffixes are stripped
-/// explicitly.
+/// Compound suffixes stripped explicitly (`zebra-v6.2.3-…tar.zst` has a `.` inside the version)
 fn manifest_path(archive: &std::path::Path) -> std::path::PathBuf {
     const SUFFIXES: &[&str] = &[".tar.zst", ".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".tar"];
-    let name = archive
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let stem = SUFFIXES
-        .iter()
-        .find_map(|s| name.strip_suffix(s))
-        .map(str::to_owned)
-        .unwrap_or_else(|| match name.rsplit_once('.') {
-            Some((s, _)) => s.to_owned(),
-            None => name.clone(),
-        });
+    let name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem =
+        SUFFIXES.iter().find_map(|s| name.strip_suffix(s)).map(str::to_owned).unwrap_or_else(
+            || match name.rsplit_once('.') {
+                Some((s, _)) => s.to_owned(),
+                None => name.clone(),
+            },
+        );
     archive.with_file_name(format!("{stem}.toml"))
 }
 
@@ -537,15 +402,11 @@ fn manifest_path(archive: &std::path::Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
-    /// The version's dot must not be mistaken for the extension separator —
-    /// the bug this rule exists to prevent looks for `…-286000.tar.toml`.
+    /// Version's dot must not read as the extension separator (bug looks like `…-286000.tar.toml`)
     #[test]
     fn the_manifest_is_the_archive_stem_plus_toml() {
         let p = std::path::Path::new("/f/zebra-v6.2.3-testnet-286000.tar.zst");
-        assert_eq!(
-            manifest_path(p),
-            std::path::Path::new("/f/zebra-v6.2.3-testnet-286000.toml")
-        );
+        assert_eq!(manifest_path(p), std::path::Path::new("/f/zebra-v6.2.3-testnet-286000.toml"));
     }
 
     #[test]
@@ -562,31 +423,23 @@ mod tests {
         assert_eq!(a("nu5").upgrade_name(), Some("NU5"));
     }
 
-    /// `before_overwinter` is the absence of an upgrade, so the RPC never
-    /// reports it and a consumer must not look for it.
+    /// `before_overwinter` = absence of an upgrade → never RPC-reported, never looked for
     #[test]
     fn before_overwinter_has_no_rpc_name() {
-        let a = Activation {
-            key: "before_overwinter",
-            height: 1,
-        };
+        let a = Activation { key: "before_overwinter", height: 1 };
         assert_eq!(a.upgrade_name(), None);
     }
 
     #[test]
     fn an_unknown_key_has_no_rpc_name() {
-        let a = Activation {
-            key: "nu7",
-            height: 1,
-        };
+        let a = Activation { key: "nu7", height: 1 };
         assert_eq!(a.upgrade_name(), None);
     }
 
     crate::archive!(OPAQUE = "tests/assets/archive.tar.zst");
 
-    /// The positive case is covered by `snapshots`; this is the other half —
-    /// a manifest with no `[chain]` table must not synthesize one, or an
-    /// opaque tarball would answer questions about a chain it does not hold.
+    /// Manifest with no `[chain]` table must not synthesize one (else an opaque tarball
+    /// answers questions about a chain it does not hold)
     #[test]
     fn an_archive_whose_manifest_has_no_chain_table_reports_none() {
         assert!(OPAQUE.chain().is_none());

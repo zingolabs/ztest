@@ -1,11 +1,10 @@
-//! The captured-output store: content-addressed, deduplicated, zstd-compressed
-//! blobs living beside the event log, mirroring nextest's `out/` store. The
-//! event log holds only a [`StoreRef`] per test — never the bytes — so it stays
-//! small and identical outputs (retries, shared fixtures) are stored once.
+//! Captured-output store: content-addressed, deduplicated, zstd-compressed blobs beside
+//! the event log, mirroring nextest's `out/`.
 //!
-//! ztest captures a single merged stdout+stderr stream per test
-//! ([`CaptureStrategy::Combined`](crate::engine::output::CaptureStrategy)), so
-//! there is one blob kind (`combined`) — unlike nextest's split stdout/stderr.
+//! - Event log holds a [`StoreRef`] per test, never the bytes → stays small, and identical
+//!   outputs (retries, shared fixtures) are stored once
+//! - One blob kind (`combined`), not nextest's split stdout/stderr — ztest merges the
+//!   streams ([`CaptureStrategy::Combined`](crate::engine::output::CaptureStrategy))
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -14,51 +13,43 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// A reference from the event log into the [`OutputStore`]. `Empty` carries no
-/// blob (a test with no captured output); `Truncated` records the pre-truncation
-/// size so the reporter can note how much was elided.
+/// Reference from the event log into the [`OutputStore`].
+///
+/// - `Empty` = no blob (a test with no captured output)
+/// - `Truncated` = head+tail-preserved payload; `original_size` is the pre-cut byte count,
+///   so the reporter can say how much was elided
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum StoreRef {
-    /// No captured output.
     Empty,
-    /// The full output, stored under `name`.
     Full { name: String },
-    /// Output that exceeded the size cap; `name` holds the head+tail-preserved
-    /// payload and `original_size` the byte count before truncation.
     Truncated { name: String, original_size: u64 },
 }
 
-/// The head/tail budget marker inserted when output is truncated.
 fn truncation_notice(omitted: u64) -> String {
     format!("\n... <{omitted} bytes of output omitted> ...\n")
 }
 
-/// The content-addressed blob directory (`{run_dir}/out`).
+/// Content-addressed blob directory (`{run_dir}/out`)
 #[derive(Debug)]
 pub struct OutputStore {
     dir: PathBuf,
 }
 
 impl OutputStore {
-    /// Create the store directory under `run_dir`.
     pub fn create(run_dir: &Path) -> io::Result<Self> {
         let dir = run_dir.join("out");
         fs::create_dir_all(&dir)?;
         Ok(Self { dir })
     }
 
-    /// Open an existing store for reading (replay).
     pub fn open(run_dir: &Path) -> Self {
-        Self {
-            dir: run_dir.join("out"),
-        }
+        Self { dir: run_dir.join("out") }
     }
 
-    /// Store `data`, returning its reference. Empty input stores nothing;
-    /// oversized input is truncated (head+tail preserved) before addressing.
-    /// Content-addressed by blake3, so a blob already written (tracked in `seen`)
-    /// is not rewritten — free dedup across retries and identical outputs.
+    /// Store `data`, returning its reference. Empty stores nothing; oversized is truncated
+    /// (head+tail) before addressing. blake3-addressed, and an already-written blob
+    /// (tracked in `seen`) is not rewritten → free dedup across retries
     pub fn put(
         &self,
         seen: &mut HashSet<String>,
@@ -76,17 +67,13 @@ impl OutputStore {
             fs::write(self.dir.join(&name), compressed)?;
         }
         Ok(match original_size {
-            Some(original_size) => StoreRef::Truncated {
-                name,
-                original_size,
-            },
+            Some(original_size) => StoreRef::Truncated { name, original_size },
             None => StoreRef::Full { name },
         })
     }
 
-    /// Resolve a reference back to its bytes. `Empty` yields an empty vector; a
-    /// missing blob (a corrupt or partial recording) also yields empty rather
-    /// than aborting the whole replay.
+    /// Resolve a reference back to its bytes. `Empty` yields empty, and so does a missing
+    /// blob (corrupt or partial recording) rather than aborting the whole replay
     pub fn get(&self, r: &StoreRef) -> io::Result<Vec<u8>> {
         let name = match r {
             StoreRef::Empty => return Ok(Vec::new()),
@@ -101,13 +88,12 @@ impl OutputStore {
     }
 }
 
-/// zstd compression level. Level 3 is nextest's default: near-instant and
-/// already ~95% on test-log text.
+/// zstd level. 3 = nextest's default: near-instant, already ~95% on test-log text
 const ZSTD_LEVEL: i32 = 3;
 
-/// Truncate `data` to at most `max` bytes by keeping the head and tail with a
-/// notice between them; returns the (possibly borrowed) payload and, when cut,
-/// the original size. A `max` of 0 disables truncation.
+/// Truncate `data` to <=`max` bytes, keeping head and tail with a notice between.
+/// Returns the (possibly borrowed) payload and, when cut, the original size.
+/// `max == 0` disables truncation
 fn truncate(data: &[u8], max: usize) -> (std::borrow::Cow<'_, [u8]>, Option<u64>) {
     use std::borrow::Cow;
     if max == 0 || data.len() <= max {

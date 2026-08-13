@@ -1,24 +1,19 @@
 //! Version-aware config generators for the public networks.
 //!
-//! Companion to [`crate::regtest_conf`]. Renders `zebrad.toml` and
-//! `zainod.toml` for a component booting from a pre-synced chain archive,
-//! mounted via `regtest::archive_mount`.
+//! Companion to [`crate::regtest_conf`]: renders `zebrad.toml`/`zainod.toml` for a
+//! component booting from a pre-synced chain archive (`regtest::archive_mount`).
 //!
-//! The network is a *parameter*, not a copy of the module. Mainnet and testnet
-//! differ in exactly two rendered values — `[network] network` and the
-//! per-network initial-peers key — while everything that makes a pinned
-//! snapshot behave (peerless, forced-finished sync, no peer-cache writes into
-//! the mount) is identical and stated once here. A second module would have
-//! duplicated that contract and let the two copies drift.
-//!
-//! No version gates fire yet; `_version` is plumbed so a future schema change
-//! is one predicate away.
+//! - Network = a *parameter*, not a second module: mainnet and testnet differ in two
+//!   rendered values (`[network] network`, the per-network initial-peers key)
+//! - Everything making a pinned snapshot behave — peerless, forced-finished sync, no
+//!   peer-cache writes into the mount — stated once here
+//! - No version gate fires yet; `_version` is plumbed for the first schema change
 
 use crate::ArchiveNetwork;
 use crate::regtest_conf::Semver;
 
-/// Panic guard for the generators below: neither renders a coherent config for
-/// regtest, which has its own module.
+/// Panic guard: neither generator renders a coherent regtest config (that has its own
+/// module)
 fn assert_public(network: ArchiveNetwork, who: &str) {
     assert!(
         network.is_public(),
@@ -31,9 +26,8 @@ fn assert_public(network: ArchiveNetwork, who: &str) {
 
 /// Render a public-network `zebrad.toml`.
 ///
-/// `cache_dir` is the container path the chain-archive PVC is mounted at. Only
-/// `[state] cache_dir` points at it; see the tests for why `[network]
-/// cache_dir` must not.
+/// `cache_dir` = the container path the chain-archive PVC is mounted at. Only
+/// `[state] cache_dir` points there (tests say why `[network] cache_dir` must not)
 pub fn public_zebrad_conf(
     network: ArchiveNetwork,
     _version: Semver,
@@ -47,10 +41,8 @@ pub fn public_zebrad_conf(
         Some(port) => format!("\n\n[metrics]\nendpoint_addr = \"0.0.0.0:{port}\""),
         None => String::new(),
     };
-    // zebra starts its indexer gRPC server only when this key is present. Without
-    // it a colocated zaino `Direct` backend has no address to dial and refuses to
-    // construct at all ("Missing validator_grpc_listen_address"), which is why the
-    // restored-chain topology could never start.
+    // zebra starts its indexer gRPC only when this key is present; without it a colocated
+    // zaino `Direct` backend refuses to construct ("Missing validator_grpc_listen_address")
     let indexer_line = match indexer_listen_port {
         Some(port) => format!("\nindexer_listen_addr = \"0.0.0.0:{port}\""),
         None => String::new(),
@@ -112,9 +104,8 @@ use_journald = false{metrics_block}
 
 /// Render `zainod.toml` for a public-network pod.
 ///
-/// `backend` picks fetch vs. state; `validator_host` / `validator_rpc_port`
-/// locate the paired zebrad pod; `zebra_db_path` / `zaino_db_path` are the
-/// container-side mount paths.
+/// `backend` = fetch vs state; `validator_host`/`validator_rpc_port` locate the paired
+/// zebrad pod; `zebra_db_path`/`zaino_db_path` are container-side mount paths
 #[allow(clippy::too_many_arguments)]
 pub fn public_zainod_conf(
     network: ArchiveNetwork,
@@ -130,16 +121,14 @@ pub fn public_zainod_conf(
     metrics_port: Option<u16>,
 ) -> String {
     assert_public(network, "public_zainod_conf");
-    // Every listener binds `LISTEN_ALL`; see that constant for why loopback
-    // cannot work under pod-per-test.
+    // Every listener binds `LISTEN_ALL` (that constant says why loopback can't work here)
     let listen_all = crate::handles::ports::LISTEN_ALL;
     let metrics_line = match metrics_port {
         Some(port) => format!("\nmetrics_endpoint = '{listen_all}:{port}'"),
         None => String::new(),
     };
-    // `backend = 'direct'` is rejected at config load without this key, so it is
-    // required for the state backend and meaningless for fetch (which forwards
-    // every query over JSON-RPC and never opens a DB).
+    // `backend = 'direct'` is rejected at config load without this key; meaningless for
+    // fetch, which forwards every query over JSON-RPC and never opens a DB
     let validator_grpc_line = match validator_grpc {
         Some(addr) => format!("\nvalidator_grpc_listen_address = '{addr}'"),
         None => String::new(),
@@ -189,29 +178,25 @@ mod tests {
 
     const PUBLIC: [ArchiveNetwork; 2] = [ArchiveNetwork::Mainnet, ArchiveNetwork::Testnet];
 
-    /// Only `[state] cache_dir` is the chain DB. `[network] cache_dir` is the
-    /// cached peer list — a different key with the same name. Pointing both at
-    /// the mount had zebra rewriting `network/testnet.peers` inside the snapshot
-    /// every 20 s.
+    /// `[state] cache_dir` = the chain DB; `[network] cache_dir` = the cached peer list,
+    /// a different key with the same name. Both pointed at the mount had zebra rewriting
+    /// `network/testnet.peers` inside the snapshot every 20 s
     #[test]
     fn only_the_state_cache_dir_points_at_the_snapshot() {
         for network in PUBLIC {
             let toml = public_zebrad_conf(network, v(), 18232, "/var/cache/zebrad", None, None);
             assert_eq!(toml.matches("cache_dir = \"/var/cache/zebrad\"").count(), 1);
             let state = toml.find("[state]").expect("[state] table");
-            let mount = toml
-                .find("cache_dir = \"/var/cache/zebrad\"")
-                .expect("state cache_dir");
+            let mount = toml.find("cache_dir = \"/var/cache/zebrad\"").expect("state cache_dir");
             assert!(state < mount, "the snapshot mount must be [state]'s");
             assert!(toml.contains("cache_dir = false"), "peer cache disabled");
             assert!(toml.contains("listen_addr = \"0.0.0.0:18232\""));
         }
     }
 
-    /// A pinned snapshot is frozen, so nothing may try to move it. Without these
-    /// zebra crawls for peers forever and reports the pinned tip as ~99 % of an
-    /// imagined mainnet-scale one — and a validator still hunting for peers is
-    /// one connection away from leaving the tip every probe assumes it holds.
+    /// Pinned snapshot = frozen, so nothing may move it. Without these zebra crawls for
+    /// peers forever, reports the pinned tip as ~99 % of an imagined mainnet-scale one,
+    /// and sits one connection away from leaving the tip every probe assumes
     #[test]
     fn a_pinned_validator_does_not_chase_the_network() {
         for network in PUBLIC {
@@ -221,10 +206,9 @@ mod tests {
         }
     }
 
-    /// The peers key is network-*specific by name*. Emitting
-    /// `initial_testnet_peers = []` into a mainnet config silences the wrong
-    /// list: the mainnet seeds keep their defaults, the node dials out, and it
-    /// syncs its tip off the pin the whole fixture depends on.
+    /// Peers key is network-*specific by name* → `initial_testnet_peers = []` in a mainnet
+    /// config silences the wrong list: mainnet seeds keep their defaults, the node dials
+    /// out, and it syncs its tip off the pin the fixture depends on
     #[test]
     fn each_network_empties_its_own_peer_list() {
         let main = public_zebrad_conf(
@@ -252,8 +236,7 @@ mod tests {
         assert!(!test.contains("initial_mainnet_peers"));
     }
 
-    /// The zainod generator names its network too, and must agree with the
-    /// zebrad pod it is pointed at.
+    /// zainod names its network too, and must agree with the zebrad pod it dials
     #[test]
     fn zainod_names_the_same_network_as_zebrad() {
         for network in PUBLIC {
@@ -274,9 +257,8 @@ mod tests {
         }
     }
 
-    /// zebra starts its indexer gRPC only when the key is present. Its absence on
-    /// the restored-chain path left `backend = 'direct'` unconfigurable, so the
-    /// state indexer could not start at all.
+    /// zebra starts its indexer gRPC only when the key is present; absent on the
+    /// restored-chain path, `backend = 'direct'` was unconfigurable and never started
     #[test]
     fn zebrad_indexer_listen_addr_is_gated_on_the_port() {
         let net = ArchiveNetwork::Testnet;
@@ -284,19 +266,17 @@ mod tests {
         let on = public_zebrad_conf(net, v(), 18232, "/var/cache/zebrad", Some(18230), None);
         assert!(!off.contains("indexer_listen_addr"));
         assert!(on.contains("indexer_listen_addr = \"0.0.0.0:18230\""));
-        // Must land on `[rpc]`, beside `listen_addr`, not in the next table.
+        // Must land on `[rpc]` beside `listen_addr`, not in the next table
         let rpc = on.find("[rpc]").expect("[rpc] table");
         let state = on.find("[state]").expect("[state] table");
         let indexer = on.find("indexer_listen_addr").expect("indexer key");
         assert!(rpc < indexer && indexer < state);
     }
 
-    /// The regression: the public zainod generator bound gRPC to `0.0.0.0` and
-    /// JSON-RPC to `127.0.0.1`. gRPC worked, so the indexer looked alive and
-    /// `env.build()` passed — while every JSON-RPC call from the test pod got
-    /// `Connection refused`, which read as a dead indexer rather than a bind
-    /// address. Checked across *both* generators, since one having the right
-    /// address is exactly the state that hid this.
+    /// Regression: public zainod bound gRPC to `0.0.0.0`, JSON-RPC to `127.0.0.1` → gRPC
+    /// worked, `env.build()` passed, and every JSON-RPC call from the test pod got
+    /// `Connection refused`, reading as a dead indexer. Checked across *both* generators
+    /// (one being right is exactly what hid this)
     #[test]
     fn no_generator_binds_a_listener_to_loopback() {
         let mut confs = vec![crate::regtest_conf::regtest_zainod_conf(
@@ -338,7 +318,7 @@ mod tests {
             for line in conf.lines().filter(|l| {
                 !l.trim_start().starts_with('#')
                     && (l.contains("listen_add") || l.contains("_endpoint"))
-                    // `validator_*` names a peer to dial, not a socket to bind.
+                    // `validator_*` names a peer to dial, not a socket to bind
                     && !l.contains("validator_")
             }) {
                 assert!(
@@ -352,13 +332,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "belongs to regtest_conf")]
     fn regtest_is_rejected_rather_than_rendered() {
-        public_zebrad_conf(
-            ArchiveNetwork::Regtest,
-            v(),
-            18232,
-            "/var/cache/zebrad",
-            None,
-            None,
-        );
+        public_zebrad_conf(ArchiveNetwork::Regtest, v(), 18232, "/var/cache/zebrad", None, None);
     }
 }

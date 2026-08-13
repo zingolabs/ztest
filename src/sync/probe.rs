@@ -1,15 +1,15 @@
-//! The probe (invariant) taxonomy and per-probe scheduling state.
+//! Probe (invariant) taxonomy + per-probe scheduling state.
 //!
-//! A probe is a named predicate over a [`Snapshot`], registered in one of four
-//! classes (design §"the invariant taxonomy"):
+//! Probe = named predicate over a [`Snapshot`] in one of four classes (design §"the
+//! invariant taxonomy"):
 //!
-//! - **always** — safety, true at *every* tick; a violation is a bug.
-//! - **eventually** — liveness, must (re)satisfy within a `window`; else a stall.
-//! - **sometimes** — coverage, true on ≥1 tick over the run; else a weak test.
-//! - **at_completion** — a post-condition evaluated once at tip.
+//! - **always** — safety, every tick; violation = bug
+//! - **eventually** — liveness, (re)satisfy within a `window`; else stall
+//! - **sometimes** — coverage, ≥1 tick over the run; else weak test
+//! - **at_completion** — post-condition, once at tip
 //!
-//! Predicates decouple from class/cadence/severity: the same fn can register
-//! `always/Fatal/5s` in one profile and `always/Recorded/30s` in another.
+//! Predicate decoupled from class/cadence/severity (same fn = `always/Fatal/5s` in one
+//! profile, `always/Recorded/30s` in another)
 
 use std::future::Future;
 use std::pin::Pin;
@@ -20,126 +20,89 @@ use crate::handles::indexer::IndexerBackend;
 
 use super::snapshot::Snapshot;
 
-/// Outcome of one probe evaluation — three meanings, not a bool (Gomega's
-/// discipline): a probe that returns `Violated` is "invariant broken", one that
-/// returns `ProbeError` means the harness/RPC is broken (aborts the run), one
-/// that returns `Pending` is "not yet, keep going".
+/// One evaluation's outcome — three meanings, not a bool: `Violated` = invariant broken,
+/// `ProbeError` = harness/RPC broken (aborts the run), `Pending` = not yet, keep going
 #[derive(Clone, Debug)]
 pub enum Verdict {
-    /// The invariant holds at this tick.
     Satisfied,
-    /// Not yet satisfied, but not a violation — retry next tick.
     Pending,
-    /// The invariant is broken.
     Violated(Violation),
-    /// The probe itself failed to evaluate (RPC/harness error) — not a verdict
-    /// about the subject; aborts the run.
     ProbeError(String),
 }
 
-/// A recorded invariant violation. Mirrors `loadtest::oracle::Violation`.
+/// Recorded invariant violation. Mirrors `loadtest::oracle::Violation`
 #[derive(Clone, Debug)]
 pub struct Violation {
-    /// The probe name (auto-derived or `.named()`).
     pub probe: String,
-    /// Height the violation was observed at, if applicable.
     pub height: Option<u32>,
-    /// Human detail.
     pub detail: String,
 }
 
-/// Whether a violation ends the run or is only recorded.
+/// Violation ends the run, or is only recorded
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
-    /// A violation stops the sync (graceful) and fails the run.
     Fatal,
-    /// A violation is recorded and surfaced, but the run continues.
     Recorded,
 }
 
-/// The invariant class — selects when/how a probe is evaluated and what a
-/// failure means.
+/// Invariant class: selects when/how a probe evaluates and what a failure means
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
-    /// Safety, per-tick.
     Always,
-    /// Liveness, must (re)satisfy within its `window`.
     Eventually,
-    /// Coverage, checked over the whole history at the end.
     Sometimes,
-    /// Terminal post-condition.
     AtCompletion,
 }
 
-/// A probe's live state as of one tick — the standing board `ztest sync watch`
-/// renders. Derived from the rolling scheduler state on `ProbeSpec`, which is
-/// otherwise private to the runner, so a watcher can see a liveness window
-/// draining *before* it fires as a violation.
+/// Probe's live state at one tick = the board `ztest sync watch` renders.
+///
+/// - Derived from runner-private scheduler state → a draining liveness window is visible
+///   *before* it fires
+/// - `since_satisfied`/`window` are `eventually`-only; `window: None` = unbounded
 #[derive(Clone, Debug)]
 pub struct ProbeStatus {
     pub name: String,
     pub class: Class,
     pub severity: Severity,
     pub state: ProbeState,
-    /// `eventually` only: time since the probe was last satisfied, against the
-    /// `window` it must beat.
     pub since_satisfied: Option<Duration>,
-    /// `eventually` only: the satisfy-deadline. `None` for an unbounded window.
     pub window: Option<Duration>,
 }
 
-/// Where a probe stands. Not a verdict — [`Verdict`] is one evaluation's result,
-/// this is the probe's accumulated position across the run.
+/// Standing across the run, vs [`Verdict`] = one evaluation. `Violating` = already failing
+/// but not yet outlasting `hold_for`, so not fired
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeState {
-    /// Satisfied at its most recent evaluation.
     Ok,
-    /// Evaluated and not satisfied, but still inside its allowance — an
-    /// `eventually` probe that has missed an evaluation without exhausting its
-    /// window.
     Pending,
-    /// Recording consecutive violations. Past `hold_for` this becomes a fired
-    /// violation; below it the probe is already failing but has not fired.
     Violating,
-    /// Not yet evaluated: a `sometimes` probe still waiting to latch, an
-    /// `at_completion` probe (evaluated only at tip), or any probe before its
-    /// first due tick.
     NotYet,
 }
 
 impl ProbeState {
-    /// Whether this state counts toward the panel's "N ok" tally.
     pub fn is_ok(&self) -> bool {
         matches!(self, ProbeState::Ok)
     }
 }
 
-/// How often a probe is evaluated. `window` belongs to `eventually` (the
-/// satisfy-deadline), the rest are evaluation cadences.
+/// Evaluation cadence. `Window` is `eventually`'s satisfy-deadline, not a cadence
 #[derive(Clone, Copy, Debug)]
 pub enum Cadence {
-    /// Every tick.
     EachTick,
-    /// On a wall-clock interval.
     Every(Duration),
-    /// Every `n` blocks of height progress.
     EveryBlocks(u32),
-    /// `eventually`: must be satisfied at least once per rolling `Duration`.
     Window(Duration),
 }
 
-/// Context handed to RPC-backed probes: the independent oracle (indexer) the
-/// wallet's state is checked against.
+/// Context for RPC-backed probes: the independent oracle (indexer) wallet state is checked against
 pub struct SyncCtx {
     indexer: Option<Arc<dyn IndexerBackend>>,
 }
 
 impl std::fmt::Debug for SyncCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SyncCtx")
-            .field("has_indexer", &self.indexer.is_some())
-            .finish()
+        f.debug_struct("SyncCtx").field("has_indexer", &self.indexer.is_some()).finish()
     }
 }
 
@@ -147,25 +110,21 @@ impl SyncCtx {
     pub(crate) fn new(indexer: Option<Arc<dyn IndexerBackend>>) -> Self {
         Self { indexer }
     }
-    /// The oracle indexer handle, if the topology bound one. RPC-backed probes
-    /// (`chain_continuity`, `tree_root_matches_indexer`) read it; `None` in a
-    /// walletless/observer setup.
+    /// `None` in a walletless/observer setup (no topology bound one)
     pub fn indexer(&self) -> Option<&dyn IndexerBackend> {
         self.indexer.as_deref()
     }
 }
 
-/// A boxed async probe body: borrows the snapshot + ctx for the future's life.
+/// Boxed async probe body; borrows snapshot + ctx for the future's life
 type AsyncCheck = Box<
     dyn for<'a> Fn(&'a Snapshot, &'a SyncCtx) -> Pin<Box<dyn Future<Output = Verdict> + Send + 'a>>
         + Send
         + Sync,
 >;
 
-/// The evaluable body of a probe. A pure predicate stays a sync fn; an
-/// oracle-backed one is an async closure. (These can't collapse into one
-/// blanket-impl `check()` — two blanket `impl`s over `F` would violate
-/// coherence — so the builder exposes `check` and `check_rpc`.)
+/// Probe body: pure predicate = sync fn, oracle-backed = async closure. No single
+/// blanket-impl `check()` (two blanket `impl`s over `F` break coherence) → `check`/`check_rpc`
 pub(crate) enum Check {
     Sync(Box<dyn Fn(&Snapshot) -> Verdict + Send + Sync>),
     Async(AsyncCheck),
@@ -180,35 +139,31 @@ impl Check {
     }
 }
 
-/// One registered probe: its identity/class/cadence/severity plus the rolling
-/// scheduler state the runner threads across ticks.
+/// Registered probe: identity/class/cadence/severity + rolling scheduler state the runner
+/// threads across ticks.
+///
+/// - `after` = fault that must fire before an `eventually` window arms
+/// - `hold_for` = debounce, quantized to the cadence as a consecutive-violation count
 pub(crate) struct ProbeSpec {
     pub(crate) name: String,
     pub(crate) class: Class,
     pub(crate) severity: Severity,
     pub(crate) cadence: Cadence,
-    /// Arms an `eventually` window only after this named fault fires (step 5).
     pub(crate) after: Option<String>,
-    /// Debounce: a violation must persist this long before firing (quantized to
-    /// the cadence as a consecutive-violation count).
     pub(crate) hold_for: Option<Duration>,
     pub(crate) check: Check,
     // ── rolling scheduler state ──
     pub(crate) last_fired_seq: Option<u64>,
     pub(crate) last_fired_height: u32,
     pub(crate) next_due: Option<tokio::time::Instant>,
-    /// Consecutive due-evaluations that returned `Violated` (for `hold_for`).
     pub(crate) violation_streak: u32,
-    /// `eventually`: last time the probe was satisfied (or armed).
     pub(crate) last_satisfied: Option<tokio::time::Instant>,
-    /// `sometimes`: satisfied on ≥1 tick.
     pub(crate) ever_satisfied: bool,
 }
 
 impl ProbeSpec {
-    /// Whether this probe is due to evaluate at `(seq, height, now)`. `always`
-    /// and `eventually` honor the cadence; `sometimes`/`at_completion` are not
-    /// tick-driven (evaluated at end), so report not-due here.
+    /// Due to evaluate at `(height, now)`? `always`/`eventually` honor the cadence;
+    /// `sometimes`/`at_completion` evaluate at end → never due here
     pub(crate) fn due(&self, height: u32, now: tokio::time::Instant) -> bool {
         match self.class {
             Class::Sometimes | Class::AtCompletion => false,
@@ -223,7 +178,6 @@ impl ProbeSpec {
         }
     }
 
-    /// Record that the probe fired at `(seq, height, now)`, advancing cadence.
     pub(crate) fn mark_fired(&mut self, seq: u64, height: u32, now: tokio::time::Instant) {
         self.last_fired_seq = Some(seq);
         self.last_fired_height = height;
@@ -232,8 +186,8 @@ impl ProbeSpec {
         }
     }
 
-    /// The debounce threshold in consecutive violations (≥1). A bare threshold
-    /// flaps on noisy sync signals; `hold_for` quantized to the cadence smooths.
+    /// Debounce threshold in consecutive violations (≥1); a bare threshold flaps on noisy
+    /// sync signals
     pub(crate) fn violation_threshold(&self) -> u32 {
         match (self.hold_for, self.cadence) {
             (Some(hold), Cadence::Every(d)) if !d.is_zero() => {
@@ -243,20 +197,16 @@ impl ProbeSpec {
         }
     }
 
-    /// This probe's live board entry at `now`, given the engine's base `tick`.
+    /// Live board entry at `now`, given the engine's base `tick`.
     ///
-    /// `eventually` stores only *when* it was last satisfied, not the last
-    /// verdict, so its state is read off that age: still within one tick means
-    /// it was satisfied at the most recent evaluation, past the window means the
-    /// stall has already fired, and in between it is draining its allowance.
+    /// `eventually` stores only *when* last satisfied → state read off that age: ≤tick = Ok,
+    /// >window = stall already fired, between = draining its allowance
     pub(crate) fn status(&self, now: tokio::time::Instant, tick: Duration) -> ProbeStatus {
         let window = match self.cadence {
             Cadence::Window(d) if d != Duration::MAX => Some(d),
             _ => None,
         };
-        let since = self
-            .last_satisfied
-            .map(|last| now.saturating_duration_since(last));
+        let since = self.last_satisfied.map(|last| now.saturating_duration_since(last));
 
         let state = match self.class {
             Class::Always => {
@@ -295,8 +245,8 @@ impl ProbeSpec {
     }
 }
 
-/// Builder for one probe registration: `run.always(Fatal).every(secs(5)).check(fn)`.
-/// Cadence/naming setters chain; `check`/`check_rpc` finalize and register.
+/// One probe registration: `run.always(Fatal).every(secs(5)).check(fn)`. Setters chain,
+/// `check`/`check_rpc` finalize and register
 #[must_use = "a probe builder does nothing until `.check(...)` is called"]
 pub struct ProbeBuilder<'r> {
     pub(crate) sink: &'r mut Vec<ProbeSpec>,
@@ -320,43 +270,40 @@ impl std::fmt::Debug for ProbeBuilder<'_> {
 }
 
 impl<'r> ProbeBuilder<'r> {
-    /// Evaluate on a wall-clock interval.
     pub fn every(mut self, period: Duration) -> Self {
         self.cadence = Cadence::Every(period);
         self
     }
-    /// Evaluate every `n` blocks of height progress.
+    /// Evaluate every `n` blocks of height progress
     pub fn every_blocks(mut self, n: u32) -> Self {
         self.cadence = Cadence::EveryBlocks(n);
         self
     }
-    /// Evaluate at every tick.
     pub fn each_tick(mut self) -> Self {
         self.cadence = Cadence::EachTick;
         self
     }
-    /// (`eventually`) require satisfaction at least once per rolling `window`.
+    /// (`eventually`) satisfaction required ≥1× per rolling `window`
     pub fn window(mut self, window: Duration) -> Self {
         self.cadence = Cadence::Window(window);
         self
     }
-    /// Arm this probe only after the named fault fires (step-5 nemesis).
+    /// Arm only after the named fault fires
     pub fn after(mut self, fault: impl Into<String>) -> Self {
         self.after = Some(fault.into());
         self
     }
-    /// Override the auto-derived name.
+    /// Override the auto-derived name
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
-    /// Require a violation to persist `dur` before firing (debounce).
+    /// Debounce: violation must persist `dur` before firing
     pub fn hold_for(mut self, dur: Duration) -> Self {
         self.hold_for = Some(dur);
         self
     }
 
-    /// Register a pure predicate `fn(&Snapshot) -> Verdict`.
     pub fn check<F>(self, f: F)
     where
         F: Fn(&Snapshot) -> Verdict + Send + Sync + 'static,
@@ -364,8 +311,7 @@ impl<'r> ProbeBuilder<'r> {
         self.finish(Check::Sync(Box::new(f)));
     }
 
-    /// Register an RPC/oracle-backed probe. Write it as
-    /// `|s, cx| Box::pin(async move { ... })`.
+    /// Register an RPC/oracle-backed probe, written `|s, cx| Box::pin(async move { … })`
     pub fn check_rpc<F>(self, f: F)
     where
         F: for<'a> Fn(
@@ -380,9 +326,7 @@ impl<'r> ProbeBuilder<'r> {
     }
 
     fn finish(self, check: Check) {
-        let name = self
-            .name
-            .unwrap_or_else(|| format!("probe_{}", self.sink.len()));
+        let name = self.name.unwrap_or_else(|| format!("probe_{}", self.sink.len()));
         self.sink.push(ProbeSpec {
             name,
             class: self.class,
@@ -401,26 +345,18 @@ impl<'r> ProbeBuilder<'r> {
     }
 }
 
-/// Convenience constructors for durations used in cadences.
-///
-/// `const` so a profile can name its cadences as `const` items — which is where
-/// a cadence belongs, since it is a property of the profile rather than
-/// something computed per run — instead of being pushed into re-stating
-/// `Duration::from_secs` and losing the unit at the same time.
+/// Cadence duration constructors; `const` so a profile can name cadences as `const` items
 pub const fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
-/// Minutes.
 pub const fn mins(n: u64) -> Duration {
     Duration::from_secs(n * 60)
 }
-/// Hours.
 pub const fn hours(n: u64) -> Duration {
     Duration::from_secs(n * 3600)
 }
 
-/// `ensure!`-style helper for writing pure probes: return `Violated` unless the
-/// condition holds.
+/// `ensure!`-style helper for pure probes: return `Violated` unless the condition holds
 #[macro_export]
 macro_rules! sync_ensure {
     ($cond:expr, $($arg:tt)+) => {

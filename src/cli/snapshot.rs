@@ -1,11 +1,10 @@
-//! `ztest snapshot {list,prune,warm}`: manage the content-addressed seed cache
-//! in the `ztest-seeds` namespace.
+//! `ztest snapshot {list,prune,warm}`: the seed cache in `ztest-seeds`.
 //!
-//! A "seed" is a `seed-<sha8>` PVC populated once from a local archive and
-//! paired with a `VolumeSnapshot`; tests clone it copy-on-write (see
-//! `materialize.rs` / `seeds.rs`). These subcommands inspect the cache
-//! (`list`), reclaim it (`prune`), and pre-populate it without running a test
-//! (`warm`).
+//! - Seed = `seed-<sha8>-<driver>` PVC populated once from a local archive + paired
+//!   `VolumeSnapshot`; tests clone it copy-on-write (`materialize.rs` / `seeds.rs`)
+//! - Keyed on content *and* driver → `list` reports `DRIVER this|other` and seeds
+//!   for a driver this cluster no longer uses are inert, never selected
+//! - `list` inspects, `prune` reclaims, `warm` pre-populates without a test run
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -18,6 +17,7 @@ use crate::seeds::SEEDS_NAMESPACE;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 
 const READY_LABEL: &str = "seeds.ztest.io/ready";
+const DRIVER_LABEL: &str = "seeds.ztest.io/driver";
 const SEED_PREFIX: &str = "seed-";
 
 #[derive(Debug, Parser)]
@@ -61,9 +61,8 @@ struct WarmArgs {
 
 pub fn execute(args: Args) -> ExitCode {
     super::block_on("snapshot", super::Rt::Current, async {
-        let client = crate::cluster::client()
-            .await
-            .map_err(|e| format!("connecting to cluster: {e}"))?;
+        let client =
+            crate::cluster::client().await.map_err(|e| format!("connecting to cluster: {e}"))?;
         match args.cmd {
             SnapshotCmd::List => list(&client).await,
             SnapshotCmd::Prune(p) => prune(&client, &p).await,
@@ -88,18 +87,12 @@ fn volume_snapshot_content_ar() -> ApiResource {
     })
 }
 
-/// Seed PVCs in the namespace, by name (`seed-<sha8>`).
+/// Seed PVCs in the namespace, by `seed-<sha8>` name
 async fn seed_pvcs(client: &Client) -> Result<Vec<PersistentVolumeClaim>, String> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
-    let list = api
-        .list(&ListParams::default())
-        .await
-        .map_err(|e| format!("listing seed PVCs: {e}"))?;
-    Ok(list
-        .items
-        .into_iter()
-        .filter(|p| p.name_any().starts_with(SEED_PREFIX))
-        .collect())
+    let list =
+        api.list(&ListParams::default()).await.map_err(|e| format!("listing seed PVCs: {e}"))?;
+    Ok(list.items.into_iter().filter(|p| p.name_any().starts_with(SEED_PREFIX)).collect())
 }
 
 async fn list(client: &Client) -> Result<(), String> {
@@ -110,14 +103,22 @@ async fn list(client: &Client) -> Result<(), String> {
     }
     let snap_api: Api<DynamicObject> =
         Api::namespaced_with(client.clone(), SEEDS_NAMESPACE, &volume_snapshot_ar());
-    println!("{:<20} {:<8} {:<10} SNAPSHOT", "SEED", "READY", "SIZE");
+    // Seeds published on another driver still list: they are inert here, not broken,
+    // and a run switched back to that driver reuses them
+    let ours = crate::resource::selected_storage(client)
+        .await
+        .map(|s| crate::naming::slug(&s.provisioner, crate::naming::DNS_LABEL_MAX))
+        .unwrap_or_default();
+    println!("{:<38} {:<8} {:<10} {:<9} SNAPSHOT", "SEED", "READY", "SIZE", "DRIVER");
     for pvc in &pvcs {
         let name = pvc.name_any();
-        let ready = pvc
-            .labels()
-            .get(READY_LABEL)
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        let ready = pvc.labels().get(READY_LABEL).map(|v| v == "true").unwrap_or(false);
+        // Pre-`driver`-label seeds carry no driver → unknown, not "other"
+        let driver = match pvc.labels().get(DRIVER_LABEL) {
+            None => "?",
+            Some(d) if *d == ours => "this",
+            Some(_) => "other",
+        };
         let size = pvc
             .spec
             .as_ref()
@@ -135,10 +136,11 @@ async fn list(client: &Client) -> Result<(), String> {
             Err(_) => "?",
         };
         println!(
-            "{:<20} {:<8} {:<10} {}",
+            "{:<38} {:<8} {:<10} {:<9} {}",
             name,
             if ready { "yes" } else { "no" },
             size,
+            driver,
             snap
         );
     }
@@ -173,16 +175,15 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
     let dp = DeleteParams::default();
     for name in &targets {
-        // Drop any leftover uploader pod first: a crashed/stale materialization
-        // can leave one mounting the PVC, which would otherwise block the PVC
-        // delete on its mount finalizer.
+        // Leftover uploader pod first: a crashed materialization leaves one mounting
+        // the PVC, blocking its delete on the mount finalizer
         let uploader = name.replace(SEED_PREFIX, "uploader-");
         match pod_api.delete(&uploader, &dp).await {
             Ok(_) => {}
             Err(kube::Error::Api(e)) if e.code == 404 => {}
             Err(e) => eprintln!("  ! deleting uploader pod {uploader}: {e}"),
         }
-        // Snapshot next so its content can be released before the PVC.
+        // Snapshot next → its content releases before the PVC
         match snap_api.delete(name, &dp).await {
             Ok(_) => {}
             Err(kube::Error::Api(e)) if e.code == 404 => {}
@@ -196,12 +197,10 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
         println!("pruned {name}");
     }
 
-    // Sweep orphaned cluster-scoped seed-binding VolumeSnapshotContents: their
-    // `Retain` policy means a crashed test can leave them behind. Matched by
-    // name prefix rather than by label, because this is the sweep of last
-    // resort — it has to catch a content whose labels never landed. Deleting
-    // one is always safe: `Retain` means the backend snapshot it points at
-    // belongs to the seed, not to the binding.
+    // Orphaned cluster-scoped seed-binding contents (`Retain` → a crashed test leaves
+    // them). Matched by name prefix, not label: sweep of last resort, must catch a
+    // content whose labels never landed. Always safe — `Retain` means the backend
+    // snapshot belongs to the seed, not the binding
     let vsc_api: Api<DynamicObject> = Api::all_with(client.clone(), &volume_snapshot_content_ar());
     if let Ok(vscs) = vsc_api.list(&ListParams::default()).await {
         for vsc in vscs.items {
@@ -218,12 +217,11 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Pre-provision the seeds for the archives named on the command line.
+/// Pre-provision seeds for the named archives.
 ///
-/// The archive file itself is never opened: its identity comes from the sidecar
-/// manifest and its bytes come from the bucket. So this works in a checkout that
-/// has never run `git lfs pull` — the same property that lets a build pod
-/// declare a seed it has no way to read.
+/// Archive file never opened: identity from the sidecar manifest, bytes from the
+/// bucket → works in a checkout that never ran `git lfs pull` (same property that
+/// lets a build pod declare a seed it cannot read)
 async fn warm(client: &Client, args: &WarmArgs) -> Result<(), String> {
     for archive in &args.archives {
         let (name, oid, size) = crate::archive::identity_from_manifest(archive)?;
@@ -233,14 +231,14 @@ async fn warm(client: &Client, args: &WarmArgs) -> Result<(), String> {
             size,
             payload: crate::inventory::SeedPayload::Archive,
         };
-        let sha = crate::storage::seed_sha8(&entry.oid).to_string();
-        eprintln!("• warming seed-{sha} from {}", entry.name);
-        // Line-based output with no panel to paint: the pull's sub-phases have
-        // nowhere to land here, and `warm` already brackets each seed.
-        crate::materialize::provision_seed(client, &entry, &crate::materialize::Silent)
+        eprintln!("• warming seed {} from {}", crate::storage::seed_sha8(&entry.oid), entry.name);
+        // No panel to paint: the pull's sub-phases have nowhere to land, and `warm`
+        // already brackets each seed
+        // Name comes back on the handle: only `provision_seed` knows the driver half
+        let handle = crate::materialize::provision_seed(client, &entry, &Default::default())
             .await
             .map_err(|e| format!("materializing {}: {e}", entry.name))?;
-        println!("ready seed-{sha}");
+        println!("ready {}", handle.seed_pvc);
     }
     Ok(())
 }

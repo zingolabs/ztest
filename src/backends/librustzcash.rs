@@ -1,9 +1,8 @@
-//! In-process librustzcash wallet backend — ztest's default wallet.
+//! In-process librustzcash wallet backend, ztest's default.
 //!
-//! Pure-Rust `zcash_client_backend` + `zcash_client_sqlite` in the test
-//! binary. Unlike zingolib's pepper-sync (which parses each memo as UTF-8 mid
-//! scan and aborts on a malformed one), this stores raw memo bytes, tolerating
-//! the non-UTF-8 memos zebra emits on shielded coinbase notes.
+//! - Pure-Rust `zcash_client_backend` + `zcash_client_sqlite` in the test binary
+//! - Raw memo bytes stored, tolerating zebra's non-UTF-8 shielded-coinbase memos
+//!   (zingolib's pepper-sync parses each memo mid-scan and aborts on a malformed one)
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
@@ -59,20 +58,17 @@ use crate::topology::ActivationHeights;
 
 const LABEL: &str = "librustzcash";
 
-/// zcash_client_backend blocks per download/scan batch during sync.
+/// zcash_client_backend blocks per download/scan batch during sync
 const SYNC_BATCH_SIZE: u32 = 100;
 
-/// Bound TCP connection establishment to an indexer's gRPC endpoint. Applies to
-/// every `connect()` caller; only the connect handshake is bounded, so it never
-/// interferes with a long-running sync stream on the same channel. A fast-fail
-/// floor for a dead endpoint; the overall relay deadline is the caller's
-/// per-send `timeout`.
+/// Connect handshake only = fast-fail floor for a dead endpoint (never cuts a long
+/// sync stream on the same channel). Relay deadline = the caller's per-send `timeout`
 const INDEXER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, OsRng>;
 
-/// Config ZST for the [`Wallet`](crate::component::Wallet) builder; produces a
-/// live [`LrzWallet`] handle at `add_wallet` time.
+/// [`Wallet`](crate::component::Wallet) builder's librustzcash flavour → [`LrzWallet`]
+/// handle at `add_wallet` time
 #[derive(Debug, Clone, Default)]
 pub struct LrzBackend;
 
@@ -81,13 +77,12 @@ impl WalletConfig for LrzBackend {
     type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, _plumbing: HandleInner) -> LrzWallet {
-        // Wallets run in-process; the handle owns its own state, no plumbing.
+        // In-process: the handle owns its own state, no plumbing
         LrzWallet::new()
     }
 }
 
-/// Live in-process librustzcash wallet handle. Cheaply cloneable: clones share
-/// the same state.
+/// Runs in-process. Clones share one state
 #[derive(Clone, Default)]
 pub struct LrzWallet {
     inner: Arc<LrzInner>,
@@ -99,10 +94,9 @@ struct LrzInner {
     next_id: AtomicU32,
 }
 
-/// One in-process account. The `WalletDb` is behind an async mutex since
-/// `WalletWrite`/sync take `&mut`; `_dir` holds the SQLite file alive. `db_path`
-/// lets the observable sync harness open a second (WAL) reader connection to
-/// poll scan progress while the sync task writes through `db`.
+/// - `db` behind an async mutex (`WalletWrite`/sync take `&mut`)
+/// - `_dir` keeps the SQLite file alive
+/// - `db_path` lets the sync harness open a second WAL reader while the sync task writes
 struct WalletAccount {
     db: AsyncMutex<Db>,
     db_path: PathBuf,
@@ -136,9 +130,8 @@ impl std::fmt::Debug for LrzWallet {
     }
 }
 
-/// Cross ztest's [`ActivationHeights`] into librustzcash's regtest
-/// [`LocalNetwork`]. Each upgrade height is carried across verbatim;
-/// librustzcash does no implicit fill-in.
+/// ztest [`ActivationHeights`] → librustzcash regtest [`LocalNetwork`], verbatim per
+/// upgrade (librustzcash does no implicit fill-in)
 fn to_local_network(a: &ActivationHeights) -> LocalNetwork {
     LocalNetwork {
         overwinter: a.overwinter().map(BlockHeight::from_u32),
@@ -154,20 +147,9 @@ fn to_local_network(a: &ActivationHeights) -> LocalNetwork {
     }
 }
 
-/// Pool a wallet routes change / shielded output into for a transaction built
-/// at `target_height`. From NU6.3 the Orchard pool is spend-locked (its value
-/// balance must be non-negative), so shielded value must land in Ironwood. The
-/// gate is whether NU6.3 is *active at the target height*, not merely
-/// scheduled: the builder only exposes the Ironwood pool once the target height
-/// reaches NU6.3 (`create_proposed_transactions` uses the same `is_nu_active`
-/// check), so targeting Ironwood before then is rejected as
-/// `IronwoodBuilderNotAvailable`. Below the boundary Orchard is the only valid
-/// target.
-/// The [`SpendPolicy`] for a send restricted to `from_pools`. An empty slice is
-/// the fully-shielded default (any pool); a non-empty slice restricts input
-/// selection to exactly those shielded pools, so the wallet cannot reach into
-/// same-pool liquidity to avoid a pool-crossing migration (e.g. forcing an
-/// Orchard note to be spent into an Ironwood receipt across the NU6.3 boundary).
+/// Empty `from_pools` = fully-shielded default (any pool); non-empty pins input
+/// selection to exactly those, blocking the same-pool liquidity a wallet would use to
+/// dodge a pool-crossing migration (Orchard note → Ironwood receipt across NU6.3)
 fn spend_policy_for(from_pools: &[Pool]) -> Result<SpendPolicy, BoxError> {
     if from_pools.is_empty() {
         return Ok(SpendPolicy::default());
@@ -186,6 +168,10 @@ fn spend_policy_for(from_pools: &[Pool]) -> Result<SpendPolicy, BoxError> {
     Ok(SpendPolicy::shielded_pools(shielded))
 }
 
+/// - From NU6.3 Orchard is spend-locked (value balance must stay >= 0) → change lands
+///   in Ironwood
+/// - Gate = NU6.3 *active at the target height*, not merely scheduled (the builder
+///   exposes Ironwood only then; earlier → `IronwoodBuilderNotAvailable`)
 fn shielded_change_pool(params: &LocalNetwork, target_height: BlockHeight) -> ShieldedProtocol {
     if params.is_nu_active(NetworkUpgrade::Nu6_3, target_height) {
         ShieldedProtocol::Ironwood
@@ -194,10 +180,9 @@ fn shielded_change_pool(params: &LocalNetwork, target_height: BlockHeight) -> Sh
     }
 }
 
-/// Height librustzcash targets for a newly built transaction: one past the
-/// wallet's synced chain tip, mirroring `create_proposed_transactions`'
-/// `chain_tip_height + 1`. The shielded pool must be chosen for this height, or
-/// it disagrees with the pool the builder actually makes available.
+/// Target height for a newly built tx = synced tip + 1, mirroring
+/// `create_proposed_transactions`. Pick the shielded pool for *this* height, else it
+/// disagrees with what the builder exposes
 fn tx_target_height(db: &Db) -> Result<BlockHeight, BoxError> {
     let tip = db
         .chain_height()
@@ -206,7 +191,6 @@ fn tx_target_height(db: &Db) -> Result<BlockHeight, BoxError> {
     Ok(tip + 1)
 }
 
-/// Connect a lightwalletd gRPC client to the indexer.
 async fn connect(
     indexer_uri: &str,
 ) -> Result<CompactTxStreamerClient<tonic::transport::Channel>, BoxError> {
@@ -219,9 +203,8 @@ async fn connect(
     Ok(CompactTxStreamerClient::new(channel))
 }
 
-/// Serialize wallet-built transactions to raw consensus bytes. Synchronous:
-/// `WalletDb` (rusqlite) is `!Send`, so db access must finish before any
-/// `.await` or the caller's future stops being `Send`.
+/// Wallet-built txs → raw consensus bytes. Synchronous: `WalletDb` (rusqlite) is
+/// `!Send`, so db access must finish before any `.await` in the caller's future
 fn raw_txs(db: &Db, txids: &[TxId]) -> Result<Vec<Vec<u8>>, BoxError> {
     txids
         .iter()
@@ -231,17 +214,15 @@ fn raw_txs(db: &Db, txids: &[TxId]) -> Result<Vec<Vec<u8>>, BoxError> {
                 .map_err(|e| format!("librustzcash: get_transaction {txid}: {e}"))?
                 .ok_or_else(|| format!("librustzcash: built tx {txid} absent from wallet db"))?;
             let mut data = Vec::new();
-            tx.write(&mut data)
-                .map_err(|e| format!("librustzcash: serialize tx {txid}: {e}"))?;
+            tx.write(&mut data).map_err(|e| format!("librustzcash: serialize tx {txid}: {e}"))?;
             Ok(data)
         })
         .collect()
 }
 
-/// Relay raw transactions through the indexer's lightwalletd `SendTransaction`.
-/// `create_proposed_transactions` / `shield_transparent_funds` only sign and
-/// store the tx locally; without this relay it never reaches the mempool and
-/// the next mined block excludes it.
+/// Relay raw txs via the indexer's lightwalletd `SendTransaction`.
+/// `create_proposed_transactions` / `shield_transparent_funds` only sign and store
+/// locally → without this the tx never reaches the mempool
 async fn broadcast(
     indexer_uri: &str,
     raw_txs: Vec<Vec<u8>>,
@@ -298,15 +279,12 @@ impl WalletBackend for LrzWallet {
         let mut db = open_wallet_db(&db_path, params)?;
         init_wallet_db(&mut db, None).map_err(|e| format!("librustzcash: init wallet db: {e}"))?;
 
-        // Birthday treestate from the indexer: `from_treestate` reads the
-        // frontier so scanning resumes from the birthday without rescanning.
+        // Birthday treestate from the indexer: `from_treestate` reads the frontier
+        // → scanning resumes at the birthday without a rescan
         let mut client = connect(spec.indexer_uri).await?;
         let birthday_height = u64::from(u32::from(spec.birthday));
         let treestate = client
-            .get_tree_state(BlockId {
-                height: birthday_height,
-                hash: vec![],
-            })
+            .get_tree_state(BlockId { height: birthday_height, hash: vec![] })
             .await
             .map_err(|e| format!("librustzcash: get_tree_state({birthday_height}): {e}"))?
             .into_inner();
@@ -318,36 +296,30 @@ impl WalletBackend for LrzWallet {
             .map_err(|e| format!("librustzcash: create_account: {e}"))?;
 
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .accounts
-            .lock()
-            .expect("lrz accounts mutex poisoned")
-            .insert(
-                id,
-                Arc::new(WalletAccount {
-                    db: AsyncMutex::new(db),
-                    db_path,
-                    usk,
-                    account_id,
-                    params,
-                    indexer_uri: spec.indexer_uri.to_string(),
-                    _dir: dir,
-                }),
-            );
+        self.inner.accounts.lock().expect("lrz accounts mutex poisoned").insert(
+            id,
+            Arc::new(WalletAccount {
+                db: AsyncMutex::new(db),
+                db_path,
+                usk,
+                account_id,
+                params,
+                indexer_uri: spec.indexer_uri.to_string(),
+                _dir: dir,
+            }),
+        );
         Ok(AccountId(id))
     }
 
     async fn address(&self, account: AccountId, pool: Pool) -> Result<String, BoxError> {
         let acct = self.account(account)?;
-        // The STABLE default address (diversifier index 0), not a freshly
-        // advanced one: the faucet's coinbase pays this account's default
-        // transparent receiver, and advancing the diversifier would return a
-        // different, empty address whose UTXOs the wallet never finds. `Require`
-        // the requested receiver so the UA is guaranteed to carry it.
+        // STABLE default address (diversifier index 0), never a freshly advanced one:
+        // the coinbase pays the default transparent receiver, and advancing returns a
+        // different empty address whose UTXOs never turn up.
+        // `Require` so the UA is guaranteed to carry the requested receiver
         use zcash_keys::keys::ReceiverRequirement::{Allow, Require};
         let request = match pool {
-            // Ironwood is Orchard-based, so its receipts arrive at the Orchard
-            // receiver and use the same UA request.
+            // Ironwood is Orchard-based → receipts arrive at the Orchard receiver
             Pool::Orchard | Pool::Ironwood => UnifiedAddressRequest::custom(Require, Allow, Allow),
             Pool::Sapling => UnifiedAddressRequest::custom(Allow, Require, Allow),
             Pool::Transparent => UnifiedAddressRequest::custom(Allow, Allow, Require),
@@ -443,8 +415,8 @@ impl WalletBackend for LrzWallet {
             .map_err(|e| format!("librustzcash: build payment: {e:?}"))?,
         ])
         .map_err(|e| format!("librustzcash: build request: {e:?}"))?;
-        // `CommitmentTreeErrT` appears only in the error type and can't be
-        // inferred; `Infallible` marks it unreachable, matching librustzcash.
+        // `CommitmentTreeErrT` occurs only in the error type, uninferrable;
+        // `Infallible` marks it unreachable, as librustzcash does
         let proposal = propose_transfer::<Db, LocalNetwork, _, _, std::convert::Infallible>(
             &mut *db,
             &acct.params,
@@ -454,13 +426,12 @@ impl WalletBackend for LrzWallet {
             request,
             policy,
             &spend_policy,
-            // `proposed_version`: let the builder pick the consensus-branch
-            // default tx version for the target height.
+            // `proposed_version`: builder picks the branch-default tx version
             None,
         )
         .map_err(|e| format!("librustzcash: propose transfer: {e}"))?;
-        // `InputsErrT`/`ChangeErrT` appear only in the error type and can't be
-        // inferred; the proposal is already built, so both are `Infallible`.
+        // `InputsErrT`/`ChangeErrT` occur only in the error type, uninferrable;
+        // proposal already built → both `Infallible`
         let txids = create_proposed_transactions::<
             Db,
             LocalNetwork,
@@ -469,18 +440,11 @@ impl WalletBackend for LrzWallet {
             std::convert::Infallible,
             _,
         >(
-            &mut *db,
-            &acct.params,
-            &prover,
-            &prover,
-            &sk,
-            OvkPolicy::Sender,
-            &proposal,
+            &mut *db, &acct.params, &prover, &prover, &sk, OvkPolicy::Sender, &proposal
         )
         .map_err(|e| format!("librustzcash: create transactions: {e}"))?;
         let txids: Vec<TxId> = txids.into_iter().collect();
-        // Serialize under the db lock (rusqlite is `!Send`), then drop it before
-        // broadcasting.
+        // Serialize under the db lock (rusqlite `!Send`), drop before broadcasting
         let raw = raw_txs(&db, &txids)?;
         drop(db);
         broadcast(&acct.indexer_uri, raw, timeout).await?;
@@ -522,8 +486,7 @@ impl WalletBackend for LrzWallet {
         )
         .map_err(|e| format!("librustzcash: shield: {e}"))?;
         let txids: Vec<TxId> = txids.into_iter().collect();
-        // Serialize under the db lock (rusqlite is `!Send`), then drop it before
-        // broadcasting.
+        // Serialize under the db lock (rusqlite `!Send`), drop before broadcasting
         let raw = raw_txs(&db, &txids)?;
         drop(db);
         broadcast(&acct.indexer_uri, raw, timeout).await?;
@@ -531,12 +494,10 @@ impl WalletBackend for LrzWallet {
     }
 }
 
-/// Open the wallet SQLite db in WAL mode. WAL lets the observable sync harness
-/// read scan progress from a second connection while the sync task holds the
-/// primary connection writing — default rollback-journal mode blocks a
-/// concurrent reader for the whole write transaction. `load_module` installs the
-/// `rarray` virtual table `zcash_client_sqlite` requires, matching what
-/// `WalletDb::for_path` does before handing back the connection.
+/// - WAL so a second connection reads scan progress mid-write (rollback-journal blocks
+///   a concurrent reader for the whole write transaction)
+/// - `load_module` installs the `rarray` vtab `zcash_client_sqlite` needs, as
+///   `WalletDb::for_path` does
 fn open_wallet_db(path: &Path, params: LocalNetwork) -> Result<Db, BoxError> {
     let conn = rusqlite::Connection::open(path)
         .map_err(|e| format!("librustzcash: open sqlite {}: {e}", path.display()))?;
@@ -547,18 +508,14 @@ fn open_wallet_db(path: &Path, params: LocalNetwork) -> Result<Db, BoxError> {
     Ok(WalletDb::from_connection(conn, params, SystemClock, OsRng))
 }
 
-/// One-confirmation wallet-summary policy (matches [`WalletBackend::balances`]).
+/// One-confirmation wallet-summary policy (matches [`WalletBackend::balances`])
 fn one_conf_policy() -> ConfirmationsPolicy {
     ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false)
 }
 
-/// Spendable per-pool balances for `account` out of a wallet summary. Shared by
-/// the [`WalletBackend::balances`] handle and the sync subject's per-tick
-/// [`ProgressView::balances`], so a balance probe and an assertion after a send
-/// can never disagree about what "balance" means.
-///
-/// A wallet with no summary yet (nothing scanned) or no row for the account
-/// holds nothing, which is zero — not an error.
+/// Shared by [`WalletBackend::balances`] and the subject's per-tick
+/// [`ProgressView::balances`] (a probe and a post-send assertion cannot disagree on
+/// what "balance" means). No summary / no row = zero, not an error
 fn pool_balances(
     summary: Option<&WalletSummary<AccountUuid>>,
     account_id: AccountUuid,
@@ -576,11 +533,9 @@ fn pool_balances(
 }
 
 impl LrzWallet {
-    /// Build the observable [`SyncSubject`] the `#[ztest::sync_test]` facade
-    /// binds via `Subject::wallet(account)`. It drives `account`'s sync to tip
-    /// through `zcash_client_backend::sync` in a background task and exposes
-    /// per-tick scan progress plus the terminal commitment-tree roots.
-    /// `performance` sets the compact-block batch size.
+    /// Subject `#[ztest::sync_test]` binds via `Subject::wallet(account)`: drives to
+    /// tip through `zcash_client_backend::sync` in a background task. `performance` =
+    /// compact-block batch size
     pub async fn sync_subject(
         &self,
         account: AccountId,
@@ -598,8 +553,7 @@ impl LrzWallet {
     }
 }
 
-/// One progress reading of a librustzcash wallet sync, derived from its
-/// `WalletSummary` plus the wallet's own note commitment trees.
+/// Derived from the wallet's `WalletSummary` + its own note commitment trees
 #[derive(Clone, Debug)]
 pub struct LrzProgress {
     height: u32,
@@ -620,36 +574,25 @@ impl LrzProgress {
                 pct: 0.0,
                 phase: Phase::Starting,
                 balances,
-                // Reported, not unreported: this *is* a wallet, it simply has
-                // no tree yet. A probe must see "no root at this height", not
-                // "nobody maintains trees".
+                // Reported, not unreported: a wallet with no tree *yet*. A probe must
+                // read "no root at this height", not "nobody maintains trees"
                 tree_roots: TreeRoots::reported(),
             };
         };
         let scan = s.progress().scan();
         let (num, den) = (*scan.numerator(), *scan.denominator());
-        let pct = if den == 0 {
-            0.0
-        } else {
-            100.0 * num as f32 / den as f32
-        };
+        let pct = if den == 0 { 0.0 } else { 100.0 * num as f32 / den as f32 };
         Self {
             height: u32::from(s.fully_scanned_height()),
             target: Some(u32::from(s.chain_tip_height())),
             pct,
-            phase: if s.is_synced() {
-                Phase::Done
-            } else {
-                Phase::Historic
-            },
+            phase: if s.is_synced() { Phase::Done } else { Phase::Historic },
             balances,
-            // Filled in by `progress`, which holds the db handle the trees live
-            // behind; the summary alone cannot answer it.
+            // Filled by `progress`, which holds the db handle the trees live behind
             tree_roots: TreeRoots::reported(),
         }
     }
 
-    /// Attach the note-commitment-tree roots read alongside this summary.
     fn with_tree_roots(mut self, tree_roots: TreeRoots) -> Self {
         self.tree_roots = tree_roots;
         self
@@ -669,10 +612,8 @@ impl ProgressView for LrzProgress {
     fn phase(&self) -> Phase {
         self.phase
     }
-    // `work()` stays the trait default (`None`), so the harness derives work
-    // from `height` via `ChainWork`. librustzcash's `WalletSummary` reports scan
-    // progress as a height and a ratio, not as per-pool cumulative counters, so
-    // there is nothing truer to override with here.
+    // `work()` left at the trait default (`None`) → harness derives it from `height`
+    // via `ChainWork`. `WalletSummary` reports a height + ratio, not per-pool counters
     fn balances(&self) -> Option<PoolBalances> {
         Some(self.balances)
     }
@@ -681,21 +622,12 @@ impl ProgressView for LrzProgress {
     }
 }
 
-/// The wallet's own note-commitment-tree root per shielded pool, as of the
-/// checkpoint at `height` — the wallet half of the tree-root oracle.
+/// Wallet half of the tree-root oracle.
 ///
-/// Checkpoints in a `zcash_client_sqlite` shard tree are keyed by block height,
-/// the same key an indexer's `GetTreeState` takes, so the two sides line up
-/// without any interpolation: both answer "the tree after block `height`".
-///
-/// Every failure here is `None` for that pool, and deliberately so — mid-scan
-/// the shard tree is legitimately incomplete over most of its range and
-/// `root_at_checkpoint_id` says so by erroring. That is a normal reading, not a
-/// harness fault, and it resolves itself as the scan closes. What must *not*
-/// collapse into `None` is "this subject has no trees at all"; that distinction
-/// is carried by [`TreeRoots::reported`] one level up, so a `None` here always
-/// means "this wallet, this pool, this height — no root", which is exactly what
-/// a probe needs to reason about.
+/// - Shard-tree checkpoints keyed by block height = the indexer `GetTreeState` key →
+///   both sides line up without interpolation
+/// - Any failure → `None` for that pool (mid-scan the tree is legitimately incomplete
+///   and resolves as the scan closes); "no trees at all" rides [`TreeRoots::reported`]
 fn wallet_tree_roots(db: &mut Db, height: BlockHeight) -> TreeRoots {
     TreeRoots::reported()
         .with(
@@ -714,9 +646,8 @@ fn wallet_tree_roots(db: &mut Db, height: BlockHeight) -> TreeRoots {
         )
         .with(
             Pool::Ironwood,
-            // Doubly optional: the outer `Option` is "this backend keeps no
-            // separate Ironwood tree" (the trait's default), the inner one is
-            // "no root at this checkpoint".
+            // Doubly optional: outer = "backend keeps no separate Ironwood tree"
+            // (trait default), inner = "no root at this checkpoint"
             db.with_ironwood_tree_mut(|tree| tree.root_at_checkpoint_id(&height))
                 .ok()
                 .flatten()
@@ -725,9 +656,8 @@ fn wallet_tree_roots(db: &mut Db, height: BlockHeight) -> TreeRoots {
         )
 }
 
-/// Observable librustzcash wallet-sync subject. `launch` spawns the drive-to-tip
-/// as a background task holding the primary db connection; `progress` reads
-/// through a second WAL connection (`reader`) so it never blocks on the writer.
+/// Observable librustzcash wallet-sync subject. `launch` spawns drive-to-tip holding
+/// the primary connection; `progress` reads a second WAL one → never blocks on the writer
 pub struct LrzSyncSubject {
     account: Arc<WalletAccount>,
     batch_size: u32,
@@ -759,8 +689,8 @@ impl SyncSubject for LrzSyncSubject {
             let mut client = connect(&account.indexer_uri).await?;
             let cache = MemBlockCache::default();
             let params = account.params;
-            // Holds the primary connection for the whole drive-to-tip; the
-            // monitor reads the second (WAL) connection meanwhile.
+            // Holds the primary connection for the whole drive-to-tip (monitor reads
+            // the second, WAL one meanwhile)
             let mut db = account.db.lock().await;
             zcash_client_backend::sync::run(&mut client, &params, &cache, &mut *db, batch)
                 .await
@@ -772,11 +702,9 @@ impl SyncSubject for LrzSyncSubject {
     }
 
     async fn progress(&self) -> Result<LrzProgress, RpcError> {
-        // `with_*_tree_mut` needs `&mut` on the db, so the reader guard is
-        // taken mutably. It is the second (WAL) connection, and the tree reads
-        // below only ever open a DEFERRED transaction that never writes — so
-        // this never contends with the sync task holding the primary
-        // connection.
+        // Reader guard taken mutably (`with_*_tree_mut` needs `&mut`). Second, WAL
+        // connection + DEFERRED read-only transactions → no contention with the sync
+        // task on the primary
         let mut db = self.reader.lock().await;
         let summary = db
             .get_wallet_summary(one_conf_policy())
@@ -792,18 +720,16 @@ impl SyncSubject for LrzSyncSubject {
 
     async fn stop(&mut self) -> Result<(), RpcError> {
         if let Some(h) = &self.running {
-            // `zcash_client_backend::sync::run` has no cooperative checkpoint, so
-            // cancel by aborting at the next await. Each scanned batch already
-            // committed as its own transaction, so the db stays consistent.
+            // `sync::run` has no cooperative checkpoint → cancel by aborting at the
+            // next await (each batch already committed its own transaction)
             h.abort();
         }
         Ok(())
     }
 }
 
-/// In-memory [`BlockCache`] for [`zcash_client_backend::sync::run`]: neither
-/// crate ships one (`FsBlockDb` is only a `BlockSource`). Downloaded blocks
-/// live in a `BTreeMap` for a sync; the regtest chain is short.
+/// In-memory [`BlockCache`] for [`zcash_client_backend::sync::run`] (neither crate
+/// ships one; `FsBlockDb` is only a `BlockSource`). `BTreeMap` per sync, regtest is short
 #[derive(Default)]
 struct MemBlockCache {
     blocks: StdMutex<BTreeMap<u64, CompactBlock>>,

@@ -1,7 +1,8 @@
-//! Live cluster-capacity watcher: the [`super::cluster`] probe is one-shot, so it
-//! misses everything scheduled after it (the build pod, test pods). This keeps
-//! [`ClusterCapacity`] current from Pod/Node/PVC watches, folded in memory by
-//! [`super::cluster::capacity_from`].
+//! Live cluster-capacity watcher.
+//!
+//! - [`super::cluster`]'s probe is one-shot → misses the build pod, test pods, …
+//! - Keeps [`ClusterCapacity`] current off Pod/Node/PVC watches, folded in memory by
+//!   [`super::cluster::capacity_from`]
 
 use std::time::Duration;
 
@@ -14,11 +15,11 @@ use tokio::sync::watch;
 use super::cluster::capacity_from;
 use crate::qos::ClusterCapacity;
 
-/// Recompute is a pure in-memory fold (no API traffic), so this only bounds how
-/// fast a pod change reaches the banner; well under the render cadence.
+/// Recompute = pure in-memory fold, no API traffic → bounds only how fast a pod change
+/// reaches the banner (well under the render cadence)
 const RECOMPUTE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Dropping this aborts the watch tasks, so teardown needs no explicit lifetime.
+/// Drop aborts the watch tasks → teardown needs no explicit lifetime
 #[derive(Debug)]
 pub struct CapacityWatch {
     rx: watch::Receiver<ClusterCapacity>,
@@ -39,9 +40,8 @@ impl CapacityWatch {
     }
 }
 
-/// `initial` seeds the channel until the first watch sync. Must run on a
-/// multi-thread runtime so the streams progress while the caller blocks on the
-/// build.
+/// `initial` seeds the channel until the first watch sync. Multi-thread runtime
+/// required (streams must progress while the caller blocks on the build)
 pub fn spawn(client: Client, initial: ClusterCapacity) -> CapacityWatch {
     let (tx, rx) = watch::channel(initial);
 
@@ -64,8 +64,7 @@ pub fn spawn(client: Client, initial: ClusterCapacity) -> CapacityWatch {
     )));
 
     tasks.push(tokio::spawn(async move {
-        // Until the initial lists land, a fold would be over a half-empty cache
-        // and flash a near-zero capacity; hold the seed instead.
+        // Pre-list, a fold sees a half-empty cache and flashes near-zero capacity
         nodes.wait_until_ready().await.ok();
         pods.wait_until_ready().await.ok();
         pvcs.wait_until_ready().await.ok();
@@ -92,9 +91,9 @@ pub fn spawn(client: Client, initial: ClusterCapacity) -> CapacityWatch {
     CapacityWatch { rx, tasks }
 }
 
-/// Drive a reflected stream to keep its store fresh. A persistent error (e.g. a
-/// missing `watch` grant) leaves that store un-synced — capacity falls back to the
-/// seed rather than failing the run; transient errors are retried by the watcher.
+/// Drive a reflected stream to keep its store fresh. A persistent error (missing
+/// `watch` grant, …) leaves that store un-synced → capacity falls back to the seed,
+/// never fails the run; the watcher retries transient ones
 async fn drive<K>(
     what: &'static str,
     stream: impl futures::Stream<Item = Result<watcher::Event<K>, watcher::Error>>,

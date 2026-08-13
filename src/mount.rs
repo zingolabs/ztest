@@ -1,10 +1,8 @@
 //! User-facing mount types.
 //!
-//! The `mount_config!`, `mount_file!`, and `mount_archive!` macros emit
-//! `MountSource` values that get wrapped into a `Mount` and attached to a
-//! component via the builder. The internal resolver (which actually creates
-//! ConfigMaps, PVCs, and seed-binding VolumeSnapshotContents) lives in
-//! `crate::mounts`.
+//! - `mount_config!` / `mount_file!` / `mount_archive!` emit [`MountSource`] values,
+//!   wrapped into a [`Mount`] and attached to a component by the builder
+//! - Resolver (ConfigMaps, PVCs, seed-binding VolumeSnapshotContents) = `crate::mounts`
 
 use std::path::PathBuf;
 
@@ -15,60 +13,37 @@ pub struct Mount {
     pub kind: MountKind,
 }
 
+/// Where a mount's contents come from; the paired [`MountKind`] decides their fate.
+///
+/// - `Config*` → ConfigMap, under `mount_config!`'s ≤1 MiB UTF-8 cap
+/// - `Seed` = one OID-named LFS artifact (`DirArchive` extracts, `File` copies verbatim)
+/// - `Empty` = `Scratch`'s `emptyDir`
+/// - `SharedClaim` names a PVC `TestEnv::shared_volume` already made → resolution
+///   creates nothing
 #[derive(Debug, Clone)]
 pub enum MountSource {
-    /// Emitted by `mount_config!`.
     ConfigAbs(PathBuf),
-    /// Generated config bytes, paired with [`MountKind::Config`]. Used when the
-    /// config is produced by a version-aware generator (see
-    /// `crate::regtest_conf`) instead of read from disk. The bytes still land in
-    /// a ConfigMap; the ≤1 MiB UTF-8 cap from `mount_config!` applies.
     ConfigInline(String),
-    /// Emitted by `mount_file!` and `mount_archive!`: a content-addressed seed,
-    /// identified by its Git LFS object id.
-    ///
-    /// One variant for both because the *source* is the same thing either way —
-    /// an LFS artifact named by OID. What differs is what the puller does with
-    /// the bytes once they land, and that is [`MountKind`]'s job: `DirArchive`
-    /// extracts the tar, `File` copies the blob verbatim.
     Seed(crate::ArchiveHandle),
-    /// Source-less mount, backed by a per-pod ephemeral `emptyDir`. Paired with
-    /// [`MountKind::Scratch`].
     Empty,
-    /// A PVC shared across pods, provisioned once per env (see
-    /// `TestEnv::shared_volume`). `claim` is the PVC name in the test
-    /// namespace; unlike `File`/`DirArchive`, no PVC is created during mount
-    /// resolution (both referencing pods just name the same claim). Paired with
-    /// [`MountKind::Shared`].
     SharedClaim { claim: String },
 }
 
+/// - `Scratch` = per-pod `emptyDir`, wiped on pod delete; its pods get
+///   `securityContext.fsGroup` so the container uid can write the volume root
+/// - `Shared` = one RWO PVC two co-scheduled pods mount at the same path (zebrad's
+///   zebra-state DB + a colocated zaino StateService opening it as a RocksDB secondary)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountKind {
-    /// ConfigMap; templated; ≤1 MiB UTF-8.
     Config,
-    /// Single-file PVC; opaque blob, no templating.
     File,
-    /// Content-addressed extracted-tar PVC.
     DirArchive,
-    /// Per-pod writable scratch directory, backed by `emptyDir`. Wiped on pod
-    /// delete (the `TempDir` model from `zcash_local_net`). Pods that carry a
-    /// scratch mount get `securityContext.fsGroup` set so the container uid can
-    /// write to the volume root.
     Scratch,
-    /// A `ReadWriteOnce` PVC shared between two pods co-scheduled on one node,
-    /// used to share an on-disk database (zebrad's zebra-state DB and a
-    /// colocated zaino StateService opening it as a RocksDB secondary). The
-    /// claim is provisioned once per env; both pods mount it at the same path.
-    /// Paired with [`MountSource::SharedClaim`].
     Shared,
 }
 
 impl Mount {
-    /// Per-pod ephemeral writable directory at `destination`. Backed by
-    /// `emptyDir`; wiped when the pod is deleted. Use for data the
-    /// container writes during the test (DBs, caches, sockets) and that
-    /// doesn't need to survive past the pod's lifetime.
+    /// For in-test writes (DBs, caches, sockets) that need not survive the pod
     pub fn scratch(destination: impl Into<PathBuf>) -> Self {
         Mount {
             source: MountSource::Empty,
@@ -79,10 +54,8 @@ impl Mount {
 
     /// Mount `archive`, extracted into a fresh PVC at `destination`.
     ///
-    /// The archive is pulled into a seed PVC once per cluster (see
-    /// `crate::materialize`) and CoW-cloned per test invocation. The compressor
-    /// is derived from the artifact's name; the bytes are never inspected
-    /// locally, because locally is not where they are.
+    /// - Pulled into a seed PVC once per cluster (`crate::materialize`), CoW-cloned per test
+    /// - Compressor derived from the artifact's *name* (the bytes never exist locally)
     pub fn archive(archive: crate::ArchiveHandle, destination: impl Into<PathBuf>) -> Self {
         Mount {
             source: MountSource::Seed(archive),
@@ -91,15 +64,12 @@ impl Mount {
         }
     }
 
-    /// Mount the shared, env-scoped PVC named `claim` at `destination`.
-    /// The PVC must already be provisioned (see `TestEnv::shared_volume`,
-    /// which mints it during `build()`). Both pods that share the volume
-    /// call this with the same `claim` and the same `destination`.
+    /// Mount the env-scoped PVC `claim` at `destination`. Must already be provisioned
+    /// (`TestEnv::shared_volume` mints it during `build()`), and both sharing pods must
+    /// pass the same `claim` *and* `destination`
     pub fn shared(claim: impl Into<String>, destination: impl Into<PathBuf>) -> Self {
         Mount {
-            source: MountSource::SharedClaim {
-                claim: claim.into(),
-            },
+            source: MountSource::SharedClaim { claim: claim.into() },
             destination: destination.into(),
             kind: MountKind::Shared,
         }

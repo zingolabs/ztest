@@ -1,20 +1,14 @@
-//! Colour palette and glyph table for the preflight banner.
+//! Colour palette + glyph table for the preflight banner.
 //!
-//! Matches `cargo nextest`'s reporter conventions: same `owo_colors` style
-//! choices (`green().bold()` for ok actions, `red().bold()` for fails,
-//! `bright_black()` for dim separators), same [`supports_color`] /
-//! [`supports_unicode`] capability gating, same horizontal-rule glyph.
-//!
-//! Callers construct a [`Theme`] once via [`Theme::detect`] and pass it by
-//! reference into [`super::render`]. All colour / glyph decisions live here; the
-//! renderer reaches for them by semantic role and never invokes ANSI directly.
+//! - Matches nextest's reporter conventions: same `owo_colors` roles,
+//!   [`supports_color`]/[`supports_unicode`] gating, same rule glyph
+//! - Built once via [`Theme::detect`], passed by ref into [`super::render`]
+//! - Every colour/glyph decision lives here; renderers ask by role, never emit ANSI
 
 use owo_colors::Style;
 use supports_color::Stream as ColorStream;
 use supports_unicode::Stream as UnicodeStream;
 
-/// Top-level theme: palette, glyph table, and a colorize flag for callers that
-/// want to bypass `style.style(s)` no-ops.
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub styles: Styles,
@@ -22,41 +16,26 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Detect terminal capabilities and build a theme matching the
-    /// runtime context.
+    /// Same environment matrix as nextest.
     ///
-    /// Honors the same environment matrix nextest does:
-    /// - colour: `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`,
-    ///   `TERM=dumb`, and TTY detection (`supports-color`).
-    /// - unicode: terminal capability sniff via `supports-unicode`
-    ///   (which considers locale and `WT_SESSION` etc.).
+    /// - colour: `NO_COLOR`/`CLICOLOR`/`CLICOLOR_FORCE`/`TERM=dumb` + TTY detection
+    /// - unicode: `supports-unicode` sniff (locale, `WT_SESSION`, …)
     pub fn detect() -> Self {
-        let colorize = supports_color::on(ColorStream::Stdout)
-            .map(|level| level.has_basic)
-            .unwrap_or(false);
+        let colorize =
+            supports_color::on(ColorStream::Stdout).map(|level| level.has_basic).unwrap_or(false);
         let unicode = supports_unicode::on(UnicodeStream::Stdout);
         Self::for_capabilities(colorize, unicode)
     }
 
-    /// Explicit construction for tests and for code that already resolved
-    /// capability flags another way (e.g. an inherited `--color` flag).
+    /// For tests and for callers that resolved capabilities elsewhere (e.g. an
+    /// inherited `--color`)
     pub fn for_capabilities(colorize: bool, unicode: bool) -> Self {
         Self {
-            styles: if colorize {
-                Styles::colorized()
-            } else {
-                Styles::plain()
-            },
-            chars: if unicode {
-                ThemeChars::unicode()
-            } else {
-                ThemeChars::ascii()
-            },
+            styles: if colorize { Styles::colorized() } else { Styles::plain() },
+            chars: if unicode { ThemeChars::unicode() } else { ThemeChars::ascii() },
         }
     }
 
-    /// True iff this theme renders ANSI escape codes. Useful for callers that
-    /// early-return a captured rendering without an escape strip.
     pub fn is_colorized(&self) -> bool {
         self.styles.colorized
     }
@@ -64,15 +43,8 @@ impl Theme {
 
 // ─────────────────────────── Styles ───────────────────────────────────
 
-/// `owo_colors::Style` per semantic role, mirroring nextest's `helpers::Styles`:
-/// - `pass`: successful state / started action labels.
-/// - `fail`: hard failures.
-/// - `skip`: soft failures (the `!` warn marker; nextest uses skip similarly).
-/// - `count`: numeric counts; bold, no colour, so emphasis carries without
-///   fighting the palette.
-/// - `dim`: separators, secondary metadata (matches nextest's `run_id_rest`).
-/// - `script_id`: banner header label; matches nextest's setup-script identifier
-///   colour, since the preflight banner is itself setup-script output.
+/// `owo_colors::Style` per semantic role, mirroring nextest's `helpers::Styles`
+/// (banner reads as a continuation of nextest's own output)
 #[derive(Debug, Clone, Default)]
 pub struct Styles {
     pub colorized: bool,
@@ -104,33 +76,26 @@ impl Styles {
 
 // ─────────────────────────── ThemeChars ───────────────────────────────
 
-/// Glyph table: Unicode when the terminal can render it, ASCII fallback
-/// otherwise. The renderer only knows the semantic names (`ok`, `progress`,
-/// `warn`, `hbar`, `dot`); the glyph choice happens here so a CI logfile gets a
-/// deterministic ASCII rendering that diffs cleanly.
+/// Glyph table, Unicode or ASCII fallback (a CI logfile diffs cleanly).
+///
+/// `frame` = corners then edges: top-left, top-right, bottom-left, bottom-right,
+/// horizontal, vertical
 #[derive(Debug, Clone)]
 pub struct ThemeChars {
     pub ok: &'static str,
-    /// Download / incoming-transfer marker.
     pub progress: &'static str,
-    /// Upload / outgoing-transfer marker (dev-image build+load).
     pub up: &'static str,
     pub warn: &'static str,
     pub fail: &'static str,
-    /// Horizontal rule character.
     pub hbar_char: char,
-    /// Separator dot (between metadata fields on a line).
     pub dot: &'static str,
-    /// Vertical separator, between a log line's source prefix and its text.
+    /// listing marker, coloured by kind (≠ [`Self::dot`] — ASCII `*` collides on the same line)
+    pub entry: &'static str,
+    pub ellipsis: &'static str,
     pub vbar: &'static str,
-    /// Progress-bar fill and empty cells. ASCII fallback uses `#` / `-`
-    /// so a `[####------] 40%` reads cleanly in any terminal.
     pub bar_fill: &'static str,
     pub bar_empty: &'static str,
-    /// Sub-cell resolution available for time-series graphs.
     pub graph: super::plot::GraphMode,
-    /// Box-drawing frame for a graph panel: corners then edges, in the order
-    /// top-left, top-right, bottom-left, bottom-right, horizontal, vertical.
     pub frame: [&'static str; 6],
 }
 
@@ -144,6 +109,8 @@ impl ThemeChars {
             fail: "✗",
             hbar_char: '─',
             dot: "·",
+            entry: "●",
+            ellipsis: "…",
             vbar: "│",
             bar_fill: "█",
             bar_empty: "░",
@@ -161,6 +128,8 @@ impl ThemeChars {
             fail: "FAIL",
             hbar_char: '-',
             dot: "*",
+            entry: "o",
+            ellipsis: "...",
             vbar: "|",
             bar_fill: "#",
             bar_empty: "-",
@@ -169,7 +138,6 @@ impl ThemeChars {
         }
     }
 
-    /// `n`-wide horizontal rule. Matches nextest's `theme_chars.hbar(n)`.
     pub fn hbar(&self, n: usize) -> String {
         std::iter::repeat_n(self.hbar_char, n).collect()
     }

@@ -1,14 +1,14 @@
 //! Cross-run capacity reservation ledger (`docs/design-qos.md`).
 //!
-//! The in-memory [`Scheduler`](super::scheduler::Scheduler) admits within one
-//! run and can't see other concurrent runs, so two runs can both claim the same
-//! headroom and overcommit the node. This ledger makes the claim shared: each
-//! run holds a `coordination.k8s.io/Lease` in [`META_NAMESPACE`] reserving its
-//! slice, so a run's ceiling is `min(sa_budget, allocatable − non-ztest usage −
-//! Σ other runs' reservations)`. A crashed run's lease expires (TTL) and is
-//! swept. This seeds the `Scheduler`'s ceiling; it does not replace it.
+//! - [`Scheduler`](super::scheduler::Scheduler) admits within one run and can't see peers
+//!   → two runs claim the same headroom and overcommit the node
+//! - Each run holds a `coordination.k8s.io/Lease` in [`META_NAMESPACE`] reserving its slice
+//!   → ceiling = `min(sa_budget, allocatable − non-ztest usage − Σ others' reservations)`
+//! - Crashed run's lease expires (TTL) and is swept
+//! - Seeds the `Scheduler`'s ceiling, never replaces it
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -17,72 +17,61 @@ use k8s_openapi::api::core::v1::{Pod, ServiceAccount};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
 use kube::Client;
 use kube::api::{Api, ListParams, ObjectList, Patch, PatchParams};
+use tokio::sync::watch;
 
 use super::{LABEL_RUN_ID, LABEL_USER, MIB, QosClass, Resources};
 use crate::resource::impls::policy::RUN_NAMESPACE;
 
-/// Namespace holding the reservation ledger.
+/// Namespace holding the reservation ledger
 pub const META_NAMESPACE: &str = "ztest-meta";
 
-/// Reservation footprint, on the run's Lease.
+/// Reservation footprint, on the run's Lease
 const ANN_RESERVE_CPU: &str = "ztest.io/reserve-cpu-milli";
 const ANN_RESERVE_MEM: &str = "ztest.io/reserve-mem-bytes";
-/// Per-SA budget, on the ServiceAccount object.
+/// Per-SA budget, on the ServiceAccount object
 const ANN_BUDGET_CPU: &str = "ztest.io/budget-cpu-milli";
 const ANN_BUDGET_MEM: &str = "ztest.io/budget-mem-bytes";
 
-/// Lease TTL. The [`CapacityGovernor`](super::governor::CapacityGovernor) renews
-/// well within this on every reconcile; a crashed run's lease is [`is_expired`]
-/// after it and swept on the next acquire or governor tick.
+/// Lease TTL; a [`Reservation`] renews well inside it, a crashed run's lease goes
+/// [`is_expired`] and is swept on the next acquire or reconcile tick
 const LEASE_DURATION_SECS: i32 = 60;
-/// Heartbeat cadence for a lease with no governor driving it
-/// ([`Renewer::spawn_heartbeat`]). A third of the TTL, so two consecutive missed
-/// renewals still leave the lease live.
+/// Elastic resize cadence — freed capacity reaches admission within seconds
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+/// Fixed-reservation renew cadence = TTL/3 (two missed ticks still leave it live)
+///
+/// Separate from [`RECONCILE_INTERVAL`]: a fixed lease has nothing to recompute,
+/// so reconcile-rate writes would be pure apiserver load over a multi-hour sync
 const RENEW_INTERVAL: Duration = Duration::from_secs(LEASE_DURATION_SECS as u64 / 3);
-/// How long to wait for other runs to release enough capacity before giving up.
+/// How long to wait for other runs to release enough capacity before giving up
 const ACQUIRE_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
-/// Re-poll cadence while waiting for capacity.
+/// Re-poll cadence while waiting for capacity
 const ACQUIRE_POLL: Duration = Duration::from_secs(3);
 
-/// Budget for a SA with no budget annotation: the whole node. An unconfigured
-/// user is capped only by live cross-run fair-share (a lone run gets the cluster,
-/// N runs get ~1/N each — see [`fair_reserve`]), not by a fixed conservative
-/// slice that would strangle a single run to a couple of tests. The I/O
-/// dimensions are unbounded here: the per-SA budget governs the contended
-/// node-allocatable dimensions (CPU/memory); disk bandwidth/IOPS are gated by
-/// cluster capacity, not per-identity policy (matching an explicit annotation,
-/// which also sets I/O to `MAX`).
+/// Budget for an un-annotated SA = the whole node.
+///
+/// - Capped only by live cross-run fair share ([`fair_reserve`]), not a fixed slice that
+///   would strangle a lone run to a couple of tests
+/// - I/O unbounded: the per-SA budget governs the contended node-allocatable dimensions;
+///   disk bandwidth/IOPS gate on cluster capacity, not per-identity policy
 fn default_budget(allocatable: Resources) -> Resources {
-    Resources::new(
-        allocatable.cpu_milli,
-        allocatable.mem_bytes,
-        u64::MAX,
-        u64::MAX,
-    )
+    Resources::new(allocatable.cpu_milli, allocatable.mem_bytes, u64::MAX, u64::MAX)
 }
 
-/// Smallest slice worth waiting for: the lightest tier's footprint. A ceiling
-/// below this can't admit even one test, so acquisition blocks (up to
-/// [`ACQUIRE_WAIT_TIMEOUT`]) for other runs to release rather than start a run
-/// that can schedule nothing.
+/// Smallest slice worth waiting for = the lightest tier's footprint. Below it a ceiling
+/// admits no test at all, so acquisition blocks (up to [`ACQUIRE_WAIT_TIMEOUT`]) rather
+/// than starting a run that can schedule nothing
 fn min_viable() -> Resources {
     QosClass::Basic.profile().footprint
 }
 
-/// A failure to acquire a reservation.
 #[derive(Debug)]
 pub enum LedgerError {
-    /// The cluster stayed too full (other runs' reservations) for the whole
-    /// wait window.
     CapacityTimeout {
         waited: Duration,
         headroom: Resources,
     },
-    /// The ledger namespace does not exist. It is provisioned by `ztest setup`,
-    /// not by a run — so this means the cluster hasn't been set up (or not since
-    /// the ledger namespace moved into setup).
+    /// Provisioned by `ztest cluster setup`, never by a run → the cluster isn't set up
     MetaNamespaceMissing,
-    /// A kube API call failed.
     Kube(String),
 }
 
@@ -99,7 +88,7 @@ impl std::fmt::Display for LedgerError {
             ),
             LedgerError::MetaNamespaceMissing => write!(
                 f,
-                "the {META_NAMESPACE} namespace does not exist — run `ztest setup` \
+                "the {META_NAMESPACE} namespace does not exist — run `ztest cluster setup` \
                  (with a cluster-admin kubeconfig) to provision the cross-run \
                  reservation ledger"
             ),
@@ -108,134 +97,217 @@ impl std::fmt::Display for LedgerError {
     }
 }
 
-/// A held reservation. Keep it alive for the run's duration (renew it), then
-/// [`release`](Renewer::release) it. `slice` seeds the scheduler ceiling.
-#[derive(Debug)]
-pub struct Grant {
-    /// The capacity this run reserved at startup; the scheduler's initial ceiling.
-    /// The [`CapacityGovernor`](super::governor::CapacityGovernor) drives it live
-    /// from here on.
-    pub slice: Resources,
-    /// This SA's total budget (annotation or whole-node default). The governor
-    /// caps the live reservation by it; the scheduler enforces it per-request.
-    pub budget: Resources,
-    /// Handle to renew and release the lease.
-    pub renewer: Renewer,
+/// One live reservation = one `coordination.k8s.io/Lease`
+///
+/// - Owns the TTL heartbeat + (elastic only) a resize loop over live cluster state
+/// - Lone run fills the cluster, busy run cedes its fair share
+pub struct Reservation {
+    inner: Inner,
+    /// Scheduler ceiling (tracks the reservation when elastic, else fixed)
+    ceiling: watch::Receiver<Resources>,
+    /// Live appetite → sizes an elastic reservation (ignored when fixed)
+    demand: watch::Sender<Demand>,
+    budget: Resources,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Renews/releases a run's reservation lease. Cheap to clone (a `kube::Client`
-/// handle + the lease name), so the renewal task and the release path share it.
+/// Lease identity + amount currently written (cloned into the bg task)
 #[derive(Clone)]
-pub struct Renewer {
+struct Inner {
     client: Client,
-    run_id: String,
-    reserve: Resources,
+    id: String,
     user: String,
+    reserve: Arc<Mutex<Resources>>,
 }
 
-// `kube::Client` is not `Debug`; the identifying detail is the run id.
-impl std::fmt::Debug for Renewer {
+/// - `committed` = running now → reservation floor (no preemption)
+/// - `demand` = most it could use → reservation ceiling (peers keep the rest)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Demand {
+    committed: Resources,
+    demand: Resources,
+}
+
+impl std::fmt::Debug for Reservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Renewer")
-            .field("run_id", &self.run_id)
-            .field("reserve", &self.reserve)
+        f.debug_struct("Reservation")
+            .field("id", &self.inner.id)
+            .field("reserved", &self.reserved())
             .finish_non_exhaustive()
     }
 }
 
-impl Renewer {
-    fn api(&self) -> Api<Lease> {
-        Api::namespaced(self.client.clone(), META_NAMESPACE)
-    }
-
-    /// Renew the lease at the acquire-time reservation (bump `renewTime`).
-    /// Best-effort per call.
-    pub async fn renew(&self) -> Result<(), LedgerError> {
-        self.renew_at(self.reserve).await
-    }
-
-    /// Renew the lease, rewriting its reservation to `reserve`. The
-    /// [`CapacityGovernor`](super::governor::CapacityGovernor) calls this every
-    /// reconcile so the Lease always reflects the run's live reservation — the
-    /// bump to `renewTime` doubles as the TTL heartbeat. Best-effort per call.
-    pub async fn renew_at(&self, reserve: Resources) -> Result<(), LedgerError> {
-        let lease = lease_object(&self.run_id, &self.user, reserve);
-        self.api()
-            .patch(
-                &self.run_id,
-                &PatchParams::apply("ztest-ledger").force(),
-                &Patch::Apply(&lease),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| LedgerError::Kube(format!("renew lease {}: {e}", self.run_id)))
-    }
-
-    /// Release the reservation (delete the lease). Best-effort: the TTL sweep and
-    /// the run-id label reap both also remove it, so a failed delete self-heals.
-    pub async fn release(&self) {
-        let _ = self.api().delete(&self.run_id, &Default::default()).await;
-    }
-
-    /// Spawn a TTL heartbeat that renews this lease at its acquire-time
-    /// reservation until the returned [`Heartbeat`] is dropped.
-    ///
-    /// A [`Reserve::Elastic`] run gets its heartbeat for free — the
-    /// [`CapacityGovernor`](super::governor::CapacityGovernor) renews on every
-    /// reconcile. A [`Reserve::Fixed`] holder has no governor (its reservation
-    /// never changes), yet can outlive the TTL: a cold BuildKit compile runs for
-    /// minutes against a 60 s lease. Without this the lease would be swept
-    /// mid-build and the pod it covers would go back to being uncounted.
-    pub fn spawn_heartbeat(&self) -> Heartbeat {
-        let renewer = self.clone();
-        Heartbeat {
-            task: tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(RENEW_INTERVAL);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                ticker.tick().await; // fires immediately; the lease was just written
-                loop {
-                    ticker.tick().await;
-                    let _ = renewer.renew().await;
-                }
-            }),
+/// Drop = stop renewing → lease lapses at TTL. Deleting is explicit
+/// ([`release`](Reservation::release)): the other exit is a hand-off (`ztest sync
+/// start` → driver pod adopts), which a deleting Drop could not distinguish
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
         }
     }
 }
 
-/// Keeps a fixed reservation's Lease alive. Dropping it stops the renewals, after
-/// which the lease expires and is swept — so it must outlive the pods the
-/// reservation covers. Release the Lease itself through the [`Renewer`].
-#[derive(Debug)]
-pub struct Heartbeat {
-    task: tokio::task::JoinHandle<()>,
-}
+impl Inner {
+    fn api(&self) -> Api<Lease> {
+        Api::namespaced(self.client.clone(), META_NAMESPACE)
+    }
 
-impl Drop for Heartbeat {
-    fn drop(&mut self) {
-        self.task.abort();
+    /// Write at `reserve` (`renewTime` bump = the TTL heartbeat)
+    ///
+    /// - Server-side apply → overlapping holders converge, never race
+    /// - That is what lets a sync's lease pass CLI → driver pod
+    async fn write(&self, reserve: Resources) -> Result<(), LedgerError> {
+        let lease = lease_object(&self.id, &self.user, reserve);
+        self.api()
+            .patch(&self.id, &PatchParams::apply("ztest-ledger").force(), &Patch::Apply(&lease))
+            .await
+            .map(|_| *self.reserve.lock().expect("reserve mutex poisoned") = reserve)
+            .map_err(|e| LedgerError::Kube(format!("renew lease {}: {e}", self.id)))
+    }
+
+    fn current(&self) -> Resources {
+        *self.reserve.lock().expect("reserve mutex poisoned")
+    }
+
+    async fn delete(&self) {
+        let _ = self.api().delete(&self.id, &Default::default()).await;
     }
 }
 
-/// How much of the available headroom a caller wants to hold.
+impl Reservation {
+    /// Capacity currently reserved
+    pub fn reserved(&self) -> Resources {
+        self.inner.current()
+    }
+
+    /// SA's total budget = the per-request ceiling the scheduler enforces
+    pub fn budget(&self) -> Resources {
+        self.budget
+    }
+
+    /// Live scheduler ceiling = what this run may admit into
+    pub fn ceiling(&self) -> watch::Receiver<Resources> {
+        self.ceiling.clone()
+    }
+
+    /// Publish live appetite (elastic resizes next reconcile, fixed ignores)
+    pub fn report_demand(&self, committed: Resources, demand: Resources) {
+        let _ = self.demand.send(Demand { committed, demand });
+    }
+
+    /// Delete the lease → capacity returns to peers now, not at the TTL
+    pub async fn release(mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+        self.inner.delete().await;
+    }
+
+    /// Adopt another process's reservation, renewing it here
+    ///
+    /// - `ztest sync start` acquires (admission must be refusable while watched) then exits
+    /// - Driver pod picks it up for the pods' lifetime
+    /// - `reserve` must match the acquired figure (else it rewrites the reservation)
+    pub fn adopt(client: &Client, id: &str, user: &str, reserve: Resources) -> Self {
+        let inner = Inner {
+            client: client.clone(),
+            id: id.to_string(),
+            user: user.to_string(),
+            reserve: Arc::new(Mutex::new(reserve)),
+        };
+        Reservation::spawn(inner, Reserve::Fixed(reserve), reserve, reserve, reserve)
+    }
+
+    /// Background loop, shared by every reservation
+    fn spawn(
+        inner: Inner,
+        want: Reserve,
+        slice: Resources,
+        budget: Resources,
+        allocatable: Resources,
+    ) -> Self {
+        let (ceiling_tx, ceiling) = watch::channel(slice);
+        let (demand, demand_rx) = watch::channel(Demand::default());
+        let task =
+            tokio::spawn(drive(inner.clone(), want, budget, allocatable, demand_rx, ceiling_tx));
+        Reservation { inner, ceiling, demand, budget, task: Some(task) }
+    }
+}
+
+/// Renew every tick (+ resize from live cluster state when elastic)
 ///
-/// Both modes wait on the same ledger and write the same kind of Lease; they
-/// differ only in how much they take and how little is worth waiting for. Keeping
-/// that as one axis (rather than a free-floating threshold parameter) is what lets
-/// the build phase and the test run share [`acquire`] verbatim.
+/// - Holds `available <= reserved`: write lease at `max(target, prev)` *before*
+///   publishing the new ceiling
+/// - Growth covered pre-admit; shrink still covers what the scheduler may admit
+///   until it sees the lower ceiling
+async fn drive(
+    inner: Inner,
+    want: Reserve,
+    budget: Resources,
+    allocatable: Resources,
+    demand: watch::Receiver<Demand>,
+    ceiling_tx: watch::Sender<Resources>,
+) {
+    let mut ticker = tokio::time::interval(match want {
+        Reserve::Elastic => RECONCILE_INTERVAL,
+        Reserve::Fixed(_) => RENEW_INTERVAL,
+    });
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // fires immediately; the lease was just written
+    let leases = lease_api(&inner.client);
+    let mut prev = inner.current();
+    loop {
+        ticker.tick().await;
+
+        let Reserve::Elastic = want else {
+            let _ = inner.write(prev).await;
+            continue;
+        };
+
+        // A crashed peer's stale reservation would pin our fair share down for
+        // its whole TTL.
+        let _ = sweep_expired(&leases).await;
+
+        // Hold the acquire-time slice until the engine publishes real demand:
+        // acting on the zero seed would drop the reservation below what this
+        // run's already-scheduling pods hold.
+        let d = *demand.borrow();
+        if d == Demand::default() {
+            let _ = inner.write(prev).await;
+            continue;
+        }
+
+        let (Ok(live), Ok(pods)) = (list_leases(&leases).await, all_pods(&inner.client).await)
+        else {
+            continue; // transient; the TTL tolerates several missed reconciles
+        };
+        let target =
+            reserve_from_state(&live, &pods, &inner.id, allocatable, budget, d.committed, d.demand);
+        if inner.write(target.max(&prev)).await.is_err() {
+            continue; // a missed write can only under-admit, never overcommit
+        }
+        if target != prev {
+            let _ = ceiling_tx.send(target);
+        }
+        prev = target;
+    }
+}
+
+/// How much of the available headroom a caller holds. Both modes wait on the same ledger
+/// and write the same Lease, differing only in how much they take and how little is worth
+/// waiting for — one axis, so the build phase and the test run share [`acquire`] verbatim
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reserve {
-    /// A test run: take the whole available slice and let the
-    /// [`CapacityGovernor`](super::governor::CapacityGovernor) resize it live.
-    /// Worth starting as soon as the lightest tier fits (`min_viable`).
+    /// A test run: whole available slice, resized live, started as soon as the lightest
+    /// tier fits (`min_viable`)
     Elastic,
-    /// A fixed consumer that knows its own footprint — the BuildKit pod. Takes
-    /// exactly that much (never more, so peers keep the rest) and waits until
-    /// exactly that much is free.
+    /// A consumer that knows its footprint (the BuildKit pod): takes exactly that, never
+    /// more (peers keep the rest), and waits for exactly that much free
     Fixed(Resources),
 }
 
 impl Reserve {
-    /// The smallest available slice worth returning from a wait.
     fn threshold(self) -> Resources {
         match self {
             Reserve::Elastic => min_viable(),
@@ -243,7 +315,6 @@ impl Reserve {
         }
     }
 
-    /// What to write onto the Lease, given the slice currently available.
     fn amount(self, slice: Resources) -> Resources {
         match self {
             Reserve::Elastic => slice,
@@ -252,27 +323,23 @@ impl Reserve {
     }
 }
 
-/// Acquire a reservation under `lease_id`: read the ledger + live cluster usage,
-/// compute the available slice `min(sa_budget, allocatable − unreserved − Σ
-/// others)`, wait (not error) while it is below `Reserve::threshold` in case
-/// other runs release, then write the lease and return the [`Grant`].
-/// `allocatable` is the probe's whole-cluster
-/// [`ClusterCapacity::allocatable`](super::ClusterCapacity).
+/// Acquire a reservation under `lease_id`: slice = `min(sa_budget, allocatable −
+/// unreserved − Σ others)`, waiting (never erroring) below `Reserve::threshold` in case
+/// other runs release, then writing the lease.
 ///
-/// Every pod ztest places must be covered by one of these for the whole time it
-/// occupies a node — that is the invariant `assert_invariant` enforces, and the
-/// reason the build phase acquires one of its own rather than creating its pod
-/// unbudgeted.
+/// Every pod ztest places must be covered by one of these while it occupies a node — the
+/// invariant `assert_invariant` enforces
 pub async fn acquire(
     client: &Client,
     lease_id: &str,
     sa: &str,
     user: &str,
-    allocatable: Resources,
+    capacity: super::ClusterCapacity,
     want: Reserve,
-) -> Result<Grant, LedgerError> {
+) -> Result<Reservation, LedgerError> {
     require_meta_namespace(client).await?;
     let leases: Api<Lease> = Api::namespaced(client.clone(), META_NAMESPACE);
+    let allocatable = capacity.allocatable;
     let budget = sa_budget(client, sa, default_budget(allocatable)).await;
 
     let start = std::time::Instant::now();
@@ -284,58 +351,44 @@ pub async fn acquire(
             .map_err(|e| LedgerError::Kube(format!("list leases: {e}")))?;
         let pods = all_pods(client).await?;
 
-        // No leased run may run more than it reserved; a violation is a
-        // scheduling bug, surfaced as a panic not silent overcommit. Only leased
-        // runs are checked — a crashed run's orphan pods are a cleanup concern.
+        // No leased run may run past its reservation; a violation is a scheduling bug,
+        // panicked not silently overcommitted. Leased runs only (orphans = a cleanup concern)
         assert_invariant(&live, &pods);
 
         let others = sum_reservations(&live, lease_id);
-        let unreserved = unreserved_usage(&pods, &live);
-        let headroom = allocatable
-            .saturating_sub(&unreserved)
-            .saturating_sub(&others);
+        let unreserved = split_usage(&pods, &live).0;
+        let headroom = allocatable.saturating_sub(&unreserved).saturating_sub(&others);
         let slice = budget.min(&headroom);
 
-        // Enough for what this caller came for → reserve it and go. Otherwise
-        // wait (up to the timeout) for other runs to release.
+        // Enough for what this caller came for → take it; else wait for others to release
         if fits(&want.threshold(), &slice) {
             let reserve = want.amount(slice);
-            let renewer = Renewer {
+            let inner = Inner {
                 client: client.clone(),
-                run_id: lease_id.to_string(),
-                reserve,
+                id: lease_id.to_string(),
                 user: user.to_string(),
+                reserve: Arc::new(Mutex::new(reserve)),
             };
-            renewer.renew().await?; // server-side apply == create on first call
-            return Ok(Grant {
-                slice: reserve,
-                budget,
-                renewer,
-            });
+            inner.write(reserve).await?; // server-side apply == create
+            return Ok(Reservation::spawn(inner, want, reserve, budget, allocatable));
         }
 
         if start.elapsed() >= ACQUIRE_WAIT_TIMEOUT {
-            return Err(LedgerError::CapacityTimeout {
-                waited: start.elapsed(),
-                headroom,
-            });
+            return Err(LedgerError::CapacityTimeout { waited: start.elapsed(), headroom });
         }
         tokio::time::sleep(ACQUIRE_POLL).await;
     }
 }
 
-/// Whether `needle` fits within `cap` (component-wise ≤). A tiny wrapper over
-/// [`Resources::fits_within`] read in the natural order for the call sites here.
+/// [`Resources::fits_within`] in the argument order the call sites here read naturally
 fn fits(needle: &Resources, cap: &Resources) -> bool {
     needle.fits_within(cap)
 }
 
-/// Verify the ledger namespace exists. `ztest setup` provisions it (a fixed,
-/// once-ever cluster object); the minimal run SA only reads it here and writes
-/// Leases inside it — it never creates the namespace. A read-only `get` keeps the
-/// run SA free of the cluster-scoped namespace-write grant, and an absent
-/// namespace fails fast with an actionable message rather than a cryptic 403 or
-/// 404 on the first Lease write.
+/// Verify the ledger namespace exists.
+///
+/// - Read-only `get` keeps the run SA free of the cluster-scoped namespace-write grant
+/// - Absent → fails fast with an actionable message, not a cryptic 403/404 on first write
 async fn require_meta_namespace(client: &Client) -> Result<(), LedgerError> {
     use k8s_openapi::api::core::v1::Namespace;
     match Api::<Namespace>::all(client.clone())
@@ -353,7 +406,6 @@ pub(crate) fn lease_api(client: &Client) -> Api<Lease> {
     Api::namespaced(client.clone(), META_NAMESPACE)
 }
 
-/// List every live reservation lease. Shared by acquire and the governor.
 pub(crate) async fn list_leases(api: &Api<Lease>) -> Result<ObjectList<Lease>, LedgerError> {
     api.list(&ListParams::default())
         .await
@@ -377,9 +429,8 @@ pub(crate) async fn sweep_expired(api: &Api<Lease>) -> Result<(), LedgerError> {
     Ok(())
 }
 
-/// Read the SA's budget from its annotations, or `default` (the whole-node
-/// [`default_budget`]) if the SA has no (valid) budget annotation. A missing SA
-/// (e.g. a local SA name with no cluster object) also falls back to the default.
+/// SA budget from its annotations, else `default` ([`default_budget`]); a missing SA
+/// (a local SA name with no cluster object) also falls back
 async fn sa_budget(client: &Client, sa: &str, default: Resources) -> Resources {
     let api: Api<ServiceAccount> = Api::namespaced(client.clone(), RUN_NAMESPACE);
     match api.get(sa).await {
@@ -388,7 +439,7 @@ async fn sa_budget(client: &Client, sa: &str, default: Resources) -> Resources {
     }
 }
 
-/// All pods cluster-wide (for the usage split). One list call at run start.
+/// All pods cluster-wide, for the usage split; one list call at run start
 pub(crate) async fn all_pods(client: &Client) -> Result<ObjectList<Pod>, LedgerError> {
     Api::<Pod>::all(client.clone())
         .list(&ListParams::default())
@@ -398,26 +449,14 @@ pub(crate) async fn all_pods(client: &Client) -> Result<ObjectList<Pod>, LedgerE
 
 // ── Pure helpers (unit-tested; no cluster) ──────────────────────────────────
 
-/// The reservation a run should hold *right now*, given live cluster state and
-/// its own live demand. This is the heart of the elastic, work-conserving,
-/// cross-run-fair policy the [`CapacityGovernor`](super::governor::CapacityGovernor)
-/// drives; kept pure so it is unit-tested without a cluster.
+/// The reservation a run should hold *right now* — the elastic, work-conserving,
+/// cross-run-fair policy [`Reservation`] drives, kept pure for clusterless tests.
 ///
-/// - `allocatable` — whole-cluster node capacity (fixed from the probe).
-/// - `non_ztest` — capacity used by pods outside any ztest run (system, build).
-/// - `others` — Σ of *other* live runs' lease reservations (this run excluded).
-/// - `active_runs` — count of live leases *including this run* (≥1).
-/// - `budget` — this SA's total budget (whole-node default or annotation).
-/// - `committed` — footprint this run is already running (its live leases).
-/// - `demand` — committed plus everything this run still has queued.
-///
-/// The reservation is the run's fair share `(allocatable − non_ztest) / N`,
-/// lowered to what it can actually use (`demand`) and its `budget`, capped by the
-/// headroom physically left after other runs, and floored at `committed` — a run
-/// never reserves below what it is already running, because there is no
-/// preemption (`docs/design-qos.md`). A lone run (`N = 1`) with more work than the
-/// cluster holds therefore reserves the whole cluster; `N` runs each converge to
-/// `~1/N`, and a run wanting less than its share cedes the rest.
+/// - Fair share `(allocatable − non_ztest) / active_runs`, lowered to `demand` and
+///   `budget`, capped by the headroom left after `others`, floored at `committed`
+/// - Floored because there is no preemption: never reserve below what is already running
+/// - Lone run with excess work takes the cluster; N runs converge to `~1/N`; a run wanting
+///   less than its share cedes the rest
 #[allow(clippy::too_many_arguments)]
 fn fair_reserve(
     allocatable: Resources,
@@ -436,21 +475,15 @@ fn fair_reserve(
         usable.io_bps / n,
         usable.io_iops / n,
     );
-    // What we'd like: our demand, but no more than our fair share or our budget.
     let want = demand.min(&fair).min(&budget);
-    // Headroom physically available to us: `others` already excludes this run, so
-    // our own current reservation is not subtracted here.
+    // `others` already excludes this run → our own reservation isn't subtracted here
     let headroom = usable.saturating_sub(&others);
-    // Never below what we are already running (no preemption).
+    // Never below what is already running (no preemption)
     want.min(&headroom).max(&committed)
 }
 
-/// This run's live reservation from a fresh snapshot of the ledger and cluster
-/// pods: the fair-share elastic policy ([`fair_reserve`]) applied to the current
-/// lease population and this run's own `committed`/`demand`. The
-/// [`CapacityGovernor`](super::governor::CapacityGovernor) lists both every
-/// reconcile and calls this; keeping the accounting here means the governor never
-/// touches the ledger's internal shapes.
+/// [`fair_reserve`] over a fresh ledger + pod snapshot, so the reconcile loop that lists
+/// both never touches the ledger's internal shapes
 pub(crate) fn reserve_from_state(
     leases: &ObjectList<Lease>,
     pods: &ObjectList<Pod>,
@@ -461,140 +494,85 @@ pub(crate) fn reserve_from_state(
     demand: Resources,
 ) -> Resources {
     let others = sum_reservations(leases, run_id);
-    let unreserved = unreserved_usage(pods, leases);
+    let unreserved = split_usage(pods, leases).0;
     let active_runs = leases.items.len() as u64;
-    fair_reserve(
-        allocatable,
-        unreserved,
-        others,
-        active_runs,
-        budget,
-        committed,
-        demand,
-    )
+    fair_reserve(allocatable, unreserved, others, active_runs, budget, committed, demand)
 }
 
-/// Sum the reservations of every live lease except `exclude` (this run's own).
+/// Σ reservations of every live lease except `exclude` (this run's own)
 fn sum_reservations(leases: &ObjectList<Lease>, exclude: &str) -> Resources {
     leases
         .items
         .iter()
         .filter(|l| l.metadata.name.as_deref() != Some(exclude))
-        .fold(Resources::ZERO, |acc, l| {
-            acc.saturating_add(&reservation_of(l))
-        })
+        .fold(Resources::ZERO, |acc, l| acc.saturating_add(&reservation_of(l)))
 }
 
-/// Parse one of ztest's own `-milli`/`-bytes` annotation values: a plain integer
-/// (millicores or bytes), NOT a k8s quantity — so a bare `"32000"` is 32000
-/// millicores, never 32000 cores.
+/// Plain integer (millicores or bytes), NOT a k8s quantity → `"32000"` is 32000 millicores,
+/// never 32000 cores
 fn parse_u64(s: &str) -> Option<u64> {
     s.trim().parse().ok()
 }
 
-/// A lease's reserved footprint, from its annotations (absent ⇒ zero).
+/// A lease's reserved footprint, from its annotations (absent ⇒ zero)
 fn reservation_of(lease: &Lease) -> Resources {
     let ann = lease.metadata.annotations.as_ref();
-    let cpu = ann
-        .and_then(|a| a.get(ANN_RESERVE_CPU))
-        .and_then(|s| parse_u64(s))
-        .unwrap_or(0);
-    let mem = ann
-        .and_then(|a| a.get(ANN_RESERVE_MEM))
-        .and_then(|s| parse_u64(s))
-        .unwrap_or(0);
+    let cpu = ann.and_then(|a| a.get(ANN_RESERVE_CPU)).and_then(|s| parse_u64(s)).unwrap_or(0);
+    let mem = ann.and_then(|a| a.get(ANN_RESERVE_MEM)).and_then(|s| parse_u64(s)).unwrap_or(0);
     Resources::new(cpu, mem, 0, 0)
 }
 
-/// A SA's budget from its annotations, or `default` when either annotation is
-/// absent or unparseable (a typo must not silently become a zero budget that
-/// rejects every request).
+/// SA budget from its annotations, else `default` when either is absent or unparseable
+/// (a typo must not become a zero budget that rejects every request)
 fn budget_from_annotations(
     ann: Option<&BTreeMap<String, String>>,
     default: Resources,
 ) -> Resources {
-    let cpu = ann
-        .and_then(|a| a.get(ANN_BUDGET_CPU))
-        .and_then(|s| parse_u64(s));
-    let mem = ann
-        .and_then(|a| a.get(ANN_BUDGET_MEM))
-        .and_then(|s| parse_u64(s));
+    let cpu = ann.and_then(|a| a.get(ANN_BUDGET_CPU)).and_then(|s| parse_u64(s));
+    let mem = ann.and_then(|a| a.get(ANN_BUDGET_MEM)).and_then(|s| parse_u64(s));
     match (cpu, mem) {
         (Some(c), Some(m)) => Resources::new(c, m, u64::MAX, u64::MAX),
         _ => default,
     }
 }
 
-/// Capacity consumed by every pod that no live Lease reserves: system pods and
-/// other workloads (no run-id at all), plus pods whose run-id has no live lease —
-/// a crashed run's orphans, and a run's pods still terminating after its lease was
-/// released. Subtracted from allocatable before dividing headroom among ztest runs.
+/// One pod walk, split by whether a live lease covers each pod
 ///
-/// Membership is "covered by a live reservation", not "carries a run-id label".
-/// The distinction is load-bearing: a labelled pod whose lease is gone holds real
-/// node memory while being invisible to [`sum_reservations`], so keying on the
-/// label alone drops it through both buckets and charges it to nobody. The build
-/// pod made that hole expensive — it carries a run-id and occupies
-/// [`BUILDKIT_BUILD`](super::build::BUILDKIT_BUILD), the largest footprint ztest
-/// places — so admission handed out capacity a terminating builder still held and
-/// the next run's builder landed `Insufficient memory`.
-fn unreserved_usage(pods: &ObjectList<Pod>, leases: &ObjectList<Lease>) -> Resources {
-    let leased: std::collections::BTreeSet<&str> = leases
-        .items
-        .iter()
-        .filter_map(|l| l.metadata.name.as_deref())
-        .collect();
-    pods.items
-        .iter()
-        .filter(|p| consumes(p))
-        .filter(|p| !run_id_of(p).is_some_and(|r| leased.contains(r)))
-        .fold(Resources::ZERO, |acc, p| {
-            acc.saturating_add(&pod_footprint(p))
-        })
-}
-
-/// This run's-vs-others accounting: usage per run-id that currently holds a live
-/// lease. Runs without a live lease (crashed, lease swept) are excluded — their
-/// lingering pods are a cleanup concern, not an accounting bug.
-fn usage_by_leased_run(
-    leases: &ObjectList<Lease>,
+/// - `unreserved` = charged to nobody: foreign workloads + run-ids with no live lease
+///   (crashed-run orphans, pods still terminating after release)
+/// - Membership = "covered by a live lease", NOT "carries a run-id" (a labelled pod whose
+///   lease is gone holds real memory, invisible to [`sum_reservations`]) — the hole the
+///   [`BUILDKIT_BUILD`](super::build::BUILDKIT_BUILD) pod made expensive
+/// - `by_run` = per-run usage for runs that do hold one
+fn split_usage(
     pods: &ObjectList<Pod>,
-) -> BTreeMap<String, Resources> {
-    let leased: std::collections::BTreeSet<&str> = leases
-        .items
-        .iter()
-        .filter_map(|l| l.metadata.name.as_deref())
-        .collect();
+    leases: &ObjectList<Lease>,
+) -> (Resources, BTreeMap<String, Resources>) {
+    let leased: BTreeSet<&str> =
+        leases.items.iter().filter_map(|l| l.metadata.name.as_deref()).collect();
+    let mut unreserved = Resources::ZERO;
     let mut by_run: BTreeMap<String, Resources> = BTreeMap::new();
-    for p in &pods.items {
-        if !consumes(p) {
-            continue;
-        }
-        if let Some(run) = run_id_of(p)
-            && leased.contains(run)
-        {
-            let e = by_run.entry(run.to_string()).or_insert(Resources::ZERO);
-            *e = e.saturating_add(&pod_footprint(p));
+    for p in pods.items.iter().filter(|p| consumes(p)) {
+        match run_id_of(p).filter(|r| leased.contains(r)) {
+            Some(run) => {
+                let e = by_run.entry(run.to_string()).or_insert(Resources::ZERO);
+                *e = e.saturating_add(&pod_footprint(p));
+            }
+            None => unreserved = unreserved.saturating_add(&pod_footprint(p)),
         }
     }
-    by_run
+    (unreserved, by_run)
 }
 
-/// Panic if any leased run is running more than it reserved — the ledger's hard
-/// self-consistency invariant. A violation means a run created pods beyond its
-/// reservation (a scheduler/ordering bug), so it is a `ztest` defect, not a
-/// runtime condition to tolerate.
+/// Panic if a leased run exceeds its reservation (ztest defect, not a runtime condition)
 fn assert_invariant(leases: &ObjectList<Lease>, pods: &ObjectList<Pod>) {
     let reserved: BTreeMap<&str, Resources> = leases
         .items
         .iter()
         .filter_map(|l| l.metadata.name.as_deref().map(|n| (n, reservation_of(l))))
         .collect();
-    for (run, usage) in usage_by_leased_run(leases, pods) {
-        let cap = reserved
-            .get(run.as_str())
-            .copied()
-            .unwrap_or(Resources::ZERO);
+    for (run, usage) in split_usage(pods, leases).1 {
+        let cap = reserved.get(run.as_str()).copied().unwrap_or(Resources::ZERO);
         assert!(
             usage.fits_within(&cap),
             "ztest ledger invariant violated: run {run} is using {}m CPU / {} MiB but reserved \
@@ -607,25 +585,16 @@ fn assert_invariant(leases: &ObjectList<Lease>, pods: &ObjectList<Pod>) {
     }
 }
 
-/// A pod's run-id label, if any.
 fn run_id_of(pod: &Pod) -> Option<&str> {
-    pod.metadata
-        .labels
-        .as_ref()
-        .and_then(|l| l.get(LABEL_RUN_ID))
-        .map(String::as_str)
+    pod.metadata.labels.as_ref().and_then(|l| l.get(LABEL_RUN_ID)).map(String::as_str)
 }
 
-/// A pod's request footprint (spec-derived; the floor the kube-scheduler holds).
+/// A pod's request footprint, spec-derived = the floor the kube-scheduler holds
 fn pod_footprint(pod: &Pod) -> Resources {
-    pod.spec
-        .as_ref()
-        .map(super::units::pod_effective_request)
-        .unwrap_or(Resources::ZERO)
+    pod.spec.as_ref().map(super::units::pod_effective_request).unwrap_or(Resources::ZERO)
 }
 
-/// Whether a pod still consumes scheduled capacity (not a settled Succeeded/
-/// Failed pod, which the node has reclaimed).
+/// Still consuming scheduled capacity (a settled Succeeded/Failed pod is reclaimed)
 fn consumes(pod: &Pod) -> bool {
     !matches!(
         pod.status.as_ref().and_then(|s| s.phase.as_deref()),
@@ -633,9 +602,8 @@ fn consumes(pod: &Pod) -> bool {
     )
 }
 
-/// Whether a lease's TTL has lapsed as of `now` (`renewTime + duration < now`).
-/// A lease missing its `renewTime`/`duration` is treated as live (never sweep on
-/// incomplete data).
+/// TTL lapsed as of `now` (`renewTime + duration < now`); missing either field = live
+/// (never sweep on incomplete data)
 pub(crate) fn is_expired(lease: &Lease, now: chrono::DateTime<Utc>) -> bool {
     let Some(spec) = lease.spec.as_ref() else {
         return false;
@@ -646,9 +614,8 @@ pub(crate) fn is_expired(lease: &Lease, now: chrono::DateTime<Utc>) -> bool {
     renew.0 + chrono::Duration::seconds(dur as i64) < now
 }
 
-/// The Lease object for `run_id` reserving `reserve`, stamped with the run-id and
-/// user labels (so the existing label reap also cleans it up) and a fresh
-/// `renewTime`. Built identically on acquire and every renew (server-side apply).
+/// Lease for `run_id` reserving `reserve`, with run-id + user labels (so the existing
+/// label reap covers it) and a fresh `renewTime`. Identical on acquire and every renew
 fn lease_object(run_id: &str, user: &str, reserve: Resources) -> Lease {
     let labels = BTreeMap::from([
         (LABEL_RUN_ID.to_string(), run_id.to_string()),
@@ -695,15 +662,11 @@ mod tests {
     }
 
     fn list<T: Clone + serde::de::DeserializeOwned>(items: Vec<T>) -> ObjectList<T> {
-        ObjectList {
-            types: Default::default(),
-            metadata: Default::default(),
-            items,
-        }
+        ObjectList { types: Default::default(), metadata: Default::default(), items }
     }
 
-    /// A scheduled pod requesting `cpu`m / `mem_gib`, optionally labelled with a
-    /// run-id — the shape [`unreserved_usage`] classifies.
+    /// Scheduled pod requesting `cpu`m / `mem_gib`, optionally run-id labelled — the shape
+    /// [`split_usage`] classifies
     fn pod(run_id: Option<&str>, cpu: u64, mem_gib: u64) -> Pod {
         let labels = run_id.map(|r| BTreeMap::from([(LABEL_RUN_ID.to_string(), r.to_string())]));
         serde_json::from_value(serde_json::json!({
@@ -722,16 +685,14 @@ mod tests {
         .expect("static Pod manifest is valid")
     }
 
-    /// The regression this module exists for. A build pod carries a run-id label,
-    /// so the old `run_id_of(p).is_none()` test excluded it from "non-ztest" usage;
-    /// its run holding no live Lease meant `sum_reservations` did not cover it
-    /// either. Charged to nobody, its 24 GiB stayed invisible, and admission handed
-    /// the same memory to tests — which k8s then refused to place.
+    /// A build pod carries a run-id, so a `run_id_of(p).is_none()` test excludes it from
+    /// non-ztest usage; its run holding no lease excludes it from `sum_reservations` too.
+    /// Charged to nobody, its 24 GiB went invisible and admission re-handed that memory out
     #[test]
     fn a_labelled_pod_whose_run_has_no_lease_is_charged_as_unreserved() {
         let leases = list(vec![lease("run-a", 8_000, 16)]);
         let pods = list(vec![pod(Some("elicb-47192"), 16_000, 24)]);
-        let usage = unreserved_usage(&pods, &leases);
+        let usage = split_usage(&pods, &leases).0;
         assert_eq!(
             usage.mem_bytes,
             24 * GIB,
@@ -745,9 +706,9 @@ mod tests {
         let leases = list(vec![lease("run-a", 8_000, 16)]);
         let pods = list(vec![
             pod(Some("run-a"), 8_000, 16), // covered by run-a's reservation
-            pod(None, 2_000, 4),           // system pod: never covered
+            pod(None, 2_000, 4),           // system pod, never covered
         ]);
-        let usage = unreserved_usage(&pods, &leases);
+        let usage = split_usage(&pods, &leases).0;
         assert_eq!(
             usage.mem_bytes,
             4 * GIB,
@@ -755,9 +716,8 @@ mod tests {
         );
     }
 
-    /// `Fixed` exists so the builder takes its own footprint and no more — taking
-    /// the whole available slice would park capacity peers could have used, and
-    /// taking less would leave its pod partly unbudgeted.
+    /// `Fixed` = the builder's own footprint and no more: the whole slice would park
+    /// capacity peers could use, less would leave its pod partly unbudgeted
     #[test]
     fn fixed_reserves_its_footprint_while_elastic_takes_the_slice() {
         let slice = Resources::new(40_000, 32 * GIB, 0, 0);
@@ -816,14 +776,14 @@ mod tests {
 
     // ── Fair-share elastic reservation ─────────────────────────────────
 
-    /// A 72c / 48Gi node, nothing else on it.
+    /// A 72c / 48Gi node, nothing else on it
     fn node() -> Resources {
         Resources::new(72_000, 48 * GIB, 0, 0)
     }
 
     #[test]
     fn lone_run_with_more_work_than_the_cluster_reserves_the_whole_cluster() {
-        // N=1, huge demand, no other runs, no non-ztest, whole-node budget.
+        // N=1, huge demand, no other runs, no non-ztest, whole-node budget
         let r = fair_reserve(
             node(),
             Resources::ZERO,
@@ -839,8 +799,7 @@ mod tests {
 
     #[test]
     fn two_busy_runs_each_reserve_half() {
-        // N=2: fair share is half the node. The other run reserves its half, so
-        // headroom is the remaining half; demand is unbounded.
+        // N=2 → fair share is half the node; the other run holds its half, demand unbounded
         let other_half = Resources::new(36_000, 24 * GIB, 0, 0);
         let r = fair_reserve(
             node(),
@@ -857,8 +816,7 @@ mod tests {
 
     #[test]
     fn a_run_wanting_less_than_its_share_reserves_only_its_demand() {
-        // Work-conserving: demand below the fair share caps the reservation, so
-        // the surplus is left for other runs.
+        // Work-conserving: demand below the fair share caps the reservation, surplus ceded
         let r = fair_reserve(
             node(),
             Resources::ZERO,
@@ -874,9 +832,8 @@ mod tests {
 
     #[test]
     fn reservation_never_drops_below_committed() {
-        // A run that grabbed the cluster alone is now sharing (N=2, fair=36c) but
-        // is still running 50c: it holds its committed footprint (no preemption),
-        // even though that exceeds its new fair share.
+        // A run that grabbed the cluster alone now shares (N=2, fair=36c) while still
+        // running 50c → holds its committed footprint past its new fair share
         let r = fair_reserve(
             node(),
             Resources::ZERO,
@@ -886,17 +843,13 @@ mod tests {
             Resources::new(50_000, 30 * GIB, 0, 0), // committed > fair
             Resources::new(300_000, 200 * GIB, 0, 0),
         );
-        assert_eq!(
-            r.cpu_milli, 50_000,
-            "keeps running work despite a smaller share"
-        );
+        assert_eq!(r.cpu_milli, 50_000, "keeps running work despite a smaller share");
         assert_eq!(r.mem_bytes, 30 * GIB);
     }
 
     #[test]
     fn headroom_caps_below_fair_share_when_others_and_non_ztest_crowd_the_node() {
-        // Fair share (N=2) is 36c, but non-ztest load (10c) plus another run's
-        // reservation (40c) leave only 22c of real headroom.
+        // Fair share (N=2) is 36c, but non-ztest 10c + another run's 40c leave 22c real
         let r = fair_reserve(
             node(),
             Resources::new(10_000, 4 * GIB, 0, 0),  // non-ztest
@@ -906,16 +859,13 @@ mod tests {
             Resources::ZERO,
             Resources::new(300_000, 200 * GIB, 0, 0),
         );
-        // usable = 72-10 = 62c; headroom = 62-40 = 22c; fair = 62/2 = 31c.
-        assert_eq!(
-            r.cpu_milli, 22_000,
-            "physical headroom binds below the fair share"
-        );
+        // usable = 72-10 = 62c; headroom = 62-40 = 22c; fair = 62/2 = 31c
+        assert_eq!(r.cpu_milli, 22_000, "physical headroom binds below the fair share");
     }
 
     #[test]
     fn budget_annotation_caps_below_fair_share() {
-        // A lone run whose SA is annotated to 16c never reserves more than that.
+        // A lone run whose SA is annotated to 16c never reserves past it
         let r = fair_reserve(
             node(),
             Resources::ZERO,
@@ -925,10 +875,7 @@ mod tests {
             Resources::ZERO,
             Resources::new(300_000, 200 * GIB, 0, 0),
         );
-        assert_eq!(
-            r.cpu_milli, 16_000,
-            "SA budget is the hard per-identity cap"
-        );
+        assert_eq!(r.cpu_milli, 16_000, "SA budget is the hard per-identity cap");
         assert_eq!(r.mem_bytes, 12 * GIB);
     }
 
@@ -948,7 +895,7 @@ mod tests {
     fn expiry_uses_renew_time_plus_duration() {
         let now = Utc::now();
         let mut l = lease("run", 1_000, 1);
-        // No spec → never expired (incomplete data).
+        // No spec → never expired (incomplete data)
         assert!(!is_expired(&l, now));
         l.spec = Some(LeaseSpec {
             lease_duration_seconds: Some(60),

@@ -1,199 +1,118 @@
 # Observability: metrics & profiling
 
-Two independent planes for looking inside a running test, with deliberately
-different postures:
+Two planes with deliberately different postures:
 
-- **Metrics** — cheap, low-cardinality, safe to leave on for every test. Answers
-  *"is the system healthy and keeping up?"* Default-on for testnet/sync tests.
-- **Profiling** — expensive, opt-in, per-component. Answers *"where is the CPU
-  going?"* Off unless a test asks for it.
+- **Metrics** — cheap, low-cardinality, on for every test. *"Is it keeping up?"*
+- **Profiling** — expensive, opt-in per component. *"Where is the CPU going?"*
 
-The load/perf *gate* itself lives in [design-load-testing.md](design-load-testing.md)
-(client-side hdrhistogram); this doc is the *server-side* observability that
-sits underneath and beside it.
+Both are served by the stack `ztest cluster setup` provisions into `ztest-obs`:
+Prometheus, Pyroscope, and Grafana, as plain Deployments.
 
-## The two premises this corrects
+## The rule that shapes everything
 
-1. **You do not monitor LMDB.** Zaino's store is LMDB (`lmdb`/`lmdb-sys`), a
-   memory-mapped C library with zero network or metrics surface — there is
-   nothing to "turn on." You monitor **zaino** and **zebrad**, both of which
-   expose a Prometheus `/metrics` endpoint behind a compile-time feature
-   (zaino added this 2026-06-24; zebra has had `[metrics]` for years). Zaino's
-   own metrics already cover the DB tip and write timing at the application
-   level — richer and more relevant than raw LMDB page counts.
-2. **You do not inject a profiler into third-party pods.** Profiling zebra/zaino
-   is a *contract the component image opts into* ([how-to-profile.md](how-to-profile.md)),
-   not a sidecar ztest forces in. This keeps the whole profiling plane at zero
-   privilege — no custom SCC, no `hostPID`, no `shareProcessNamespace`.
+**No test verdict may depend on the collect plane.** Oracles read components
+directly (`SyncSubject::progress` scrapes the subject itself); the load-test gate
+takes its latency from a client-side hdrhistogram. Prometheus holds the
+*record*, never the *oracle* — otherwise a scrape outage becomes a test failure.
 
-## Metrics plane
+## Metrics
 
 ### What exists to scrape
 
-Both binaries emit through the `metrics` crate; enabling is a build feature plus
-one config key, bound to ports ztest already declares in
-`src/handles/mod.rs` (`ZEBRAD_METRICS=9999`, `ZAINO_METRICS=9998`):
+Both binaries emit through the `metrics` crate behind a build feature plus one
+config key, on ports declared in `src/handles/mod.rs`:
 
-| Binary | Build | Config key | Signals |
-| --- | --- | --- | --- |
-| zebrad | `--features prometheus` | `[metrics] endpoint_addr` | chain tip, verification, peers, `zebrad_build_info` |
-| zaino | `--features prometheus` (or `no_tls_with_prometheus`) | `metrics_endpoint` | **inbound gRPC rate/latency/errors by method**, **outbound JSON-RPC to the validator** (rate/latency/errors/retries), sync lag + block build/write histograms, tx/output/action counters, reorg count/depth, mempool size, DB tip height, `zainod.build_info` |
+| Binary | Build | Config key | Port | Signals |
+| --- | --- | --- | --- | --- |
+| zebrad | `--features prometheus` | `[metrics] endpoint_addr` | 9999 | chain tip, verification, peers |
+| zaino | `--features prometheus` | `metrics_endpoint` | 9998 | gRPC rate/latency/errors by method, outbound JSON-RPC to the validator, sync lag, block build/write histograms, reorg count/depth, DB tip |
 
-Zaino's by-method gRPC histograms and its outbound-JSON-RPC panel are the
-load-test signal that matters: they show *whether zaino or zebrad is the
-bottleneck* directly, without inference.
+Zaino's by-method gRPC histograms and its outbound-JSON-RPC panel show *whether
+zaino or zebrad is the bottleneck* directly, without inference.
 
-Gaps that would need bespoke pollers (deferred — not needed for the health
-picture): raw LMDB `mdb_env_stat` internals, zebrad RocksDB `Statistics`, and
-per-process CPU/RSS/fds (add a standard process collector only if a test needs
-it).
+> You do not monitor LMDB. Zaino's store is a memory-mapped C library with no
+> metrics surface. You monitor zaino, whose application-level metrics cover the
+> DB tip and write timing more usefully than raw page counts would.
 
-### Discovery & scraping: cluster-native, no ztest-owned Prometheus
+### Discovery: no operator, no per-run object
 
-The mechanism differs by cluster, because the discovery contract does:
+Prometheus' own `kubernetes_sd_configs` keeps a pod iff it carries
+`ztest.io/component-name` **and** declares a container port named `metrics`, then
+promotes ztest's pod labels (`component`, `component_category`, `test`,
+`run_id`, `namespace`) to series labels.
 
-- **OpenShift/OKD — User Workload Monitoring (UWM).** The supported path for
-  scraping *user* workloads. UWM **ignores `prometheus.io/scrape` annotations**;
-  it discovers targets via `ServiceMonitor`/`PodMonitor` CRs
-  (`monitoring.coreos.com`). ztest emits one **`PodMonitor` per metrics-enabled
-  component** into the run namespace and **never reads it back**: the
-  time-series database is the durable record, and one namespace per run makes
-  the namespace the query scope. Query it from the console or thanos-querier.
-  No ztest-owned Prometheus, no Grafana, and no query client inside ztest.
-  - **Precondition:** UWM must be enabled (`enableUserWorkload: true` in the
-    `cluster-monitoring-config` ConfigMap). Platform monitoring being on does
-    **not** imply UWM is on. Confirm before relying on this plane.
-  - **Cadence caveat:** UWM enforces a scrape-interval floor (~5–15 s;
-    default 30 s). Perfect for **sync/testnet** tests (minutes-to-hours), but
-    too coarse to compute a p99 over a 30 s load burst. That is fine, because
-    the load-test *gate* takes its latency from the client-side hdrhistogram
-    (design-load-testing.md); UWM carries the durable server-side record, not
-    the sub-second gate.
-- **kind / plain Prometheus (dev/local).** The `prometheus.io/scrape=true` +
-  `prometheus.io/port=<n>` annotation scheme from
-  [design-architecture.md](design-architecture.md) remains valid for a
-  self-hosted Prometheus. `PodSpec::render` must gain an annotations field to
-  emit it (unimplemented today).
+That is the whole mechanism. There is no `PodMonitor`, no prometheus-operator,
+and nothing emitted per component at materialize time — ztest creates every pod
+it wants scraped and already labels it, so translating that into a CR and back
+would only add a CRD set and a controller.
 
-This supersedes the assumption in design-architecture.md that a single
-ztest-provisioned `observability` Prometheus scrapes annotations everywhere:
-on OKD the cluster owns Prometheus and the annotation scheme does not apply.
-
-### Division of labor
-
-Three readers, and only one of them is ztest:
-
-- **Server-side durable record** (all testnet/sync tests): UWM, scoped by
-  namespace. This is the "track zaino/zebrad for every testnet and sync test"
-  ask. Read by a human, through the console — not by ztest.
-- **Live read** (`ztest sync watch`): `metrics::Poller` scrapes the component's
-  exporter directly, once a second, over a portforward. Direct because UWM's
-  ~15 s floor makes anything read through it useless for a live display. The
-  poller needs no sync driver and works against any namespace with a
-  metrics-exposing pod in it.
-- **Probe read** (`SyncSubject::progress`): the subject scrapes *itself* each
-  tick. This is the only load-bearing one — see `zaino_sync_finalized_height`
-  in `backends/zainod.rs`, which is the sole reading a proxying indexer cannot
-  answer on its own behalf.
-- **Load-test perf gate** (30 s bursts): client-side hdrhistogram in the
-  `LoadReport`. Independent of scrape cadence.
+Promoting `run_id` and `test` is what makes a run's series selectable after its
+namespace is gone, which is what the report reader below depends on.
 
 ### The contract a component implements
 
 One port name and one trait:
 
-- declare a container port named `metrics` in `pod_spec` and serve Prometheus
-  text exposition at `/metrics` on it;
-- `impl metrics::Exporter` — `endpoint()` and `rows()`, where `rows()` is the
-  component's own table of `(label, family, reduction, live?)`.
+- declare a container port named `metrics`, serve Prometheus text at `/metrics`;
+- `impl metrics::Exporter` — `endpoint()` and `rows()`, the component's own table
+  of `(label, family, reduction, live?)`.
 
-That is the whole surface. `metrics` names no component; which backend
-publishes which families is the backends' knowledge (`backends::metrics_rows`),
-so a new ecosystem component joins without editing the metrics module.
+`metrics` names no component; which backend publishes which families is the
+backends' knowledge (`backends::metrics_rows`), so a new component joins without
+editing the metrics module.
 
-## Profiling plane
+### Three readers
 
-**A contract, not an injection.** ztest publishes how a component image makes
-itself profileable; the component team implements it in their own source and
-Dockerfile ([how-to-profile.md](how-to-profile.md)). ztest only flips the switch
-and collects the artifact. Zero privilege, zero SCC, zero sidecar.
+| Reader | Path | Load-bearing |
+| --- | --- | --- |
+| `ztest sync watch` | scrapes the component directly, 1 s, over a portforward | display only |
+| `SyncSubject::progress` | the subject scrapes itself each tick | **yes** |
+| `ztest sync status` | `record::summarize` — `query_range` against Prometheus | no |
 
-The full contract lives in [how-to-profile.md](how-to-profile.md); the shape:
+The live reader is direct because a display refreshed at the scrape interval
+lags the thing it describes. The record reader runs at report time, reuses the
+same `Row`/`Reduce` table so a metric cannot mean one thing live and another in
+the report, and omits its whole section on any failure.
 
-- **Build gate** (links `pprof-rs`): a cargo `profile` feature, flipped by a
-  Docker build `ARG`. Linking is a build decision — a runtime env cannot pull
-  in a crate.
-- **Run-time gate** (samples + dumps): `ZTEST_PROFILE` opens a `ProfilerGuard`
-  for the whole process lifetime; `ZTEST_PROFILE_OUT` is the dump directory. On
-  graceful `SIGTERM` (pod teardown) the component builds the report *off the
-  signal handler* (pprof report-building is not async-signal-safe) and writes
-  `profile.pb` — the pprof protobuf, from which speedscope / pprof.me /
-  `go tool pprof` render the flamegraph on demand (source-of-truth, ~10× smaller
-  than a stored SVG, and interactive/diffable). Sample rate is
-  `ZTEST_PROFILE_HZ` (default 100 Hz), the real lever on overhead + size over a
-  10–600 min run.
-- **ztest owns**: setting the two env vars on the component pods, pointing
-  `ZTEST_PROFILE_OUT` at a writable volume, collecting the artifact after the
-  test, and surfacing the flamegraph in the report. A `#[ztest::profile]`
-  attribute + `ZTEST_PROFILE` is the test-facing switch.
+## Profiling
 
-Because the `ProfilerGuard` spans the process lifetime, the flamegraph covers
-the entirety of the test.
+Components push CPU profiles to Pyroscope; ztest queries the merged result back
+as pprof. The component contract is [how-to-profile.md](how-to-profile.md).
 
-**Artifact collection is new subsystem work, not a wiring job.** There is no
-per-test artifact collection today — only runner-pod stdout is captured. Two
-facts force the shape:
+- **Build gate**: a cargo `profile` feature, flipped by a Docker build `ARG`.
+  Linking is a build decision — a runtime env cannot pull in a crate.
+- **Run-time gate**: `ZTEST_PROFILE_URL`. Its presence is the switch.
+  `ZTEST_PROFILE_TAGS` carries the labels ztest scopes queries by,
+  `ZTEST_PROFILE_HZ` the sample rate (default 100).
+- **ztest owns**: discovering the Pyroscope Service, injecting those variables at
+  materialize, and querying `SelectMergeStacktraces` with `PROFILE_FORMAT_PPROF`
+  for `ztest sync perf`. (The older `SelectMergeProfile` is deprecated upstream.)
 
-- The component writes `profile.pb` **only on `SIGTERM`** (pod teardown), so
-  an `emptyDir` is destroyed before the file can be read. `ZTEST_PROFILE_OUT`
-  must be a **per-test PVC** that outlives the component pod and is reclaimed at
-  namespace teardown.
-- Component pods are owned by the *test* process, not the parent, so collection
-  runs **test-side in `TestEnv::drop`**: delete each component pod with a grace
-  period (so the profiler flushes), then a collector pod tars the PVC out. The
-  parent then does a second hop (runner pod → laptop). Both hops reuse the
-  existing `materialize.rs` attach-tar pattern.
+Pushing rather than writing a file is what makes a profile readable *during* a
+run and what makes one survive an OOM kill: there is no flush-on-shutdown step a
+`SIGKILL` can skip.
 
-### Inherent limitation, stated up front
+Reads resolve the Pyroscope **Service**, then a ready pod behind its selector —
+not a pod matching the chart label. The two differ under microservices mode,
+where the label also matches components that cannot answer a query.
 
-pprof-rs samples via `SIGPROF` + backtrace with a mandatory
-`blocklist(["libc","libgcc","pthread","vdso"])`, so **native frames are
-opaque**: zaino's LMDB C and zebrad's RocksDB C++ appear as leaf nodes, not
-walked. The contract yields a faithful **Rust-level** flamegraph — which RPC
-handler / codepath / async task burns CPU — which is the "why is zaino slow
-under load" question ~95% of the time. It does **not** show time *inside* the
-embedded databases.
+Components push over the legacy `/ingest` endpoint, which Pyroscope still
+serves, so the contract above is unchanged by the v2 storage architecture. ztest
+runs Pyroscope v2 single-binary (`target: all`) with the `filesystem` object-store
+backend; profiles *and* metastore state share one PVC. `ReadWriteMany` would only
+be needed to scale the read path across pods, which this install does not do.
 
-### Escalation (designed, deferred)
+### Inherent limitation
 
-If native-DB time ever becomes the bottleneck under investigation, the only
-mechanism that walks kernel + native stacks is host-level sampling (eBPF or
-`perf`), which on OKD's `restricted-v2` SCC requires a custom SCC in the
-buildkit tier (`privileged`/`hostPID` for a Parca-agent DaemonSet, or
-`CAP_PERFMON` + `shareProcessNamespace` for an ephemeral `perf` sidecar). This
-is a deliberate, reviewer-gated escalation reached only when the opaque-DB-leaf
-is proven to be the hot spot — not part of the default plane.
-
-## Build order
-
-1. **Exporters on** — `prometheus`-feature builds + `[metrics]`/`metrics_endpoint`
-   config render for zaino (9998) and zebrad (9999). Smallest step; unblocks the
-   whole metrics plane.
-2. **`PodMonitor` resource + RBAC** — wire components into OKD UWM.
-   (Annotations field on `PodSpec` for the kind/plain-Prometheus path.)
-3. **Profiling contract** — publish [how-to-profile.md](how-to-profile.md);
-   `#[ztest::profile]`/`ZTEST_PROFILE` env wiring + artifact collection on the
-   ztest side. Component-side integration is owned by each component team.
-
-## Open items to confirm on the target cluster
-
-- UWM enabled (`enableUserWorkload: true`) and its minimum enforced scrape
-  interval.
-- The build pipeline actually flips `--features prometheus` for zaino/zebrad
-  (ports are declared today but no listener is enabled).
+`pprof-rs` samples via `SIGPROF` + backtrace with a mandatory
+`blocklist(["libc","libgcc","pthread","vdso"])`, so **native frames are opaque**:
+zaino's LMDB C and zebrad's RocksDB C++ appear as leaf nodes. The result is a
+faithful *Rust-level* flamegraph — which RPC handler, which codepath, which task
+burns CPU — which answers "why is zaino slow" ~95% of the time. Seeing inside
+the embedded databases needs host-level eBPF sampling and elevated privileges;
+out of scope by design.
 
 ## Dependencies
 
-- `prometheus-parse` for exposition text. No query client: ztest writes the
-  `PodMonitor` and reads exporters directly, so it never speaks PromQL.
-- Profiling adds `pprof` **to the component images only**, never to ztest.
+`prometheus-parse` for exposition text. `pprof`/`pyroscope` are added to
+**component images only**, never to ztest.

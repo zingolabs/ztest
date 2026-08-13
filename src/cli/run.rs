@@ -1,9 +1,9 @@
-//! `ztest run`: preflight orchestration then the test engine. On a TTY a
-//! persistent render thread (`cli::console`) pins a status panel to the bottom
-//! while each phase's output scrolls above it; non-TTY runs linearly, no panel.
+//! `ztest run` — preflight orchestration, then the test engine.
+//!
+//! - TTY: render thread (`cli::console`) pins a status panel, phase output scrolls above
+//! - Non-TTY: linear, no panel
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write, stdout};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -17,20 +17,16 @@ use crate::engine::record::RunSelector;
 use crate::inventory::QosEntry;
 use crate::pipeline::{self, ArchivesOutcome, BuildOutcome, ProbeOutcome};
 
-/// A [`NextestExitCode`] constant as a process [`ExitCode`]. `ztest run` mirrors
-/// nextest's documented exit codes so CI can cross-reference them.
+/// [`NextestExitCode`] constant → process [`ExitCode`] (codes mirror nextest's, CI
+/// cross-references them)
 fn exit(code: i32) -> ExitCode {
     ExitCode::from(code as u8)
 }
 
-/// The single fatal-exit path: emit `msg` durably and return `code`.
+/// Sole fatal-exit path: emit `msg` durably, return `code`.
 ///
-/// With a console the message goes through [`Console::fatal`], which the render
-/// thread reprints on a clean line once the pinned panel is torn down. A raw
-/// `eprintln!` here would instead be overwritten by the footer's in-place
-/// repaint and vanish behind a frozen frame — the failure mode that made setup
-/// errors look like silent stalls. Without a console (non-TTY) stderr is already
-/// durable, so it prints directly.
+/// - Console → [`Console::fatal`] (raw `eprintln!` is clobbered by the footer repaint)
+/// - Non-TTY → stderr already durable
 fn fatal(console: Option<&Console>, msg: impl std::fmt::Display, code: i32) -> ExitCode {
     match console {
         Some(c) => c.fatal(msg.to_string()),
@@ -39,12 +35,8 @@ fn fatal(console: Option<&Console>, msg: impl std::fmt::Display, code: i32) -> E
     exit(code)
 }
 
-/// Route panics through the durable fatal surface. The default panic hook writes
-/// to stderr while the render thread is still repainting the footer, so its
-/// message is clobbered; instead capture the panic and hand it to the render
-/// thread, which reprints it on teardown (see [`Console::fatal`]). Installed only
-/// with a console — non-TTY keeps the default hook, whose stderr is already
-/// durable and carries the standard backtrace.
+/// Route panics through [`Console::fatal`] (default hook's stderr is clobbered by the
+/// footer repaint). Console only — non-TTY keeps the default hook + its backtrace
 fn install_panic_surface(console: &Console) {
     let sink = console.clone();
     std::panic::set_hook(Box::new(move |info| {
@@ -52,8 +44,7 @@ fn install_panic_surface(console: &Console) {
     }));
 }
 
-/// Format a panic for the fatal surface: message, source location, and — when
-/// `RUST_BACKTRACE` is set — the captured backtrace.
+/// Panic → fatal-surface text: message, location, backtrace (when `RUST_BACKTRACE` set)
 fn format_panic(info: &std::panic::PanicHookInfo<'_>) -> String {
     let payload = info
         .payload()
@@ -61,10 +52,7 @@ fn format_panic(info: &std::panic::PanicHookInfo<'_>) -> String {
         .copied()
         .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
         .unwrap_or("<non-string panic payload>");
-    let loc = info
-        .location()
-        .map(|l| format!(" at {}:{}", l.file(), l.line()))
-        .unwrap_or_default();
+    let loc = info.location().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default();
     let mut out = format!("ztest run: internal error (panic){loc}: {payload}");
     let bt = std::backtrace::Backtrace::capture();
     if matches!(bt.status(), std::backtrace::BacktraceStatus::Captured) {
@@ -73,7 +61,7 @@ fn format_panic(info: &std::panic::PanicHookInfo<'_>) -> String {
     out
 }
 
-/// Exit code for a Ctrl-C-interrupted run: the shell convention `128 + SIGINT`.
+/// Ctrl-C exit code (shell convention `128 + SIGINT`)
 const CANCELLED: i32 = 130;
 use crate::resource::NodeState;
 use crate::ui::{self, ArchiveRow, ArchiveStatus, BannerState, ClusterState, Theme, Transfers};
@@ -97,15 +85,11 @@ pub struct Args {
     ///                  volumes) in place instead of tearing it down, so you can
     ///                  `kubectl` into a failure for a post-mortem. A 1h janitor
     ///                  backstop still reaps them, so nothing leaks permanently.
-    #[arg(
-        trailing_var_arg = true,
-        allow_hyphen_values = true,
-        value_name = "NEXTEST_ARGS"
-    )]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "NEXTEST_ARGS")]
     pub nextest_args: Vec<String>,
 
     /// Select a named cluster profile (`ztest cluster list`): binds the
-    /// kube-context, image distribution, and OpenShift flag in one shot,
+    /// kube-context, cluster class, and image distribution in one shot,
     /// overriding the persisted default and the ambient `ZTEST_IMAGE_REGISTRY`
     /// / `KIND_CLUSTER` / kube-context. Must appear before the nextest args.
     #[arg(long, value_name = "NAME")]
@@ -119,56 +103,35 @@ pub struct Args {
     pub rerun: Option<RunSelector>,
 }
 
-/// The flags `ztest run` pulls out of its `cargo nextest run`-style argv: the
-/// few the engine acts on, plus the verbatim vector forwarded to
-/// `cargo nextest list`.
+/// Engine-owned flags pulled from the `cargo nextest run`-style argv.
+///
+/// - `list_args` = the rest, verbatim, for `cargo nextest list`
+/// - `no_tests` = `pass`/`warn`/`fail` (nextest default `fail`)
+/// - `slow_after` = soft SLOW threshold (`None` disables; hard kill = the tier's `hard_cap`)
+/// - `unsupported` = dropped run-only flags, warned about once
 #[derive(Debug, Default)]
 struct RunOptions {
-    /// Args for `cargo nextest list` (Phase B inventory): the verbatim argv with
-    /// the run-only flags stripped, since `list` rejects them.
     list_args: Vec<String>,
-    /// `-j` / `--test-threads`: surfaced in the preflight banner only.
     test_threads: Option<u32>,
-    /// `--no-tests <ACTION>`: behavior when zero tests are selected
-    /// (`pass` / `warn` / `fail`; nextest default `fail`).
     no_tests: Option<String>,
-    /// `--no-cleanup` (ztest-only): leave each test's k8s namespace standing
-    /// (passed to the run as the `ZTEST_NO_CLEANUP` env, not a nextest flag).
     no_cleanup: bool,
-    /// `--retries N`: max retry attempts per failed test (engine-owned; default 0).
     retries: u32,
-    /// `--fail-fast` / `--no-fail-fast`: stop admitting on the first terminal
-    /// failure. Default off — pack the whole suite and report every result;
-    /// `--fail-fast` opts back in.
     fail_fast: bool,
-    /// `--slow-timeout <DUR>` (ztest-only): soft "slow" threshold; hard kill is
-    /// the tier `hard_cap`. `None` disables the SLOW signal.
     slow_after: Option<std::time::Duration>,
-    /// `--success-output <WHEN>`: when a passing test's captured output is shown
-    /// (`immediate`/`immediate-final`/`final`/`never`). `None` → env/default.
     success_output: Option<String>,
-    /// `--failure-output <WHEN>`: as above, for failing tests.
     failure_output: Option<String>,
-    /// `--no-capture`: stream output live and run serially (nextest coupling).
     no_capture: bool,
-    /// Run-only flags the user passed that ztest drops (e.g. `--archive-file`,
-    /// `--debugger`), surfaced as a warning. Display-only flags aren't listed.
     unsupported: Vec<String>,
-    /// `-R/--rerun`: the prior run whose non-passing tests to re-execute. Not
-    /// parsed from the passthrough argv — it's a real `ztest run` flag copied in
-    /// from [`Args`] after classification.
     rerun: Option<RunSelector>,
 }
 
 impl RunOptions {
-    /// Classify the verbatim `ztest run` argv in one pass: extract the
-    /// engine-owned flags, forward everything else to `cargo nextest list`.
+    /// Classify the argv in one pass: engine-owned flags out, everything else forwarded
     fn parse(args: &[String]) -> Self {
-        // Forward by default, strip the run-only flags here: forward-by-default
-        // fails loudly if we miss one, whereas a dropped selection flag would
-        // silently mis-select.
+        // Forward by default (a missed run-only flag fails loudly; a dropped selection
+        // flag would silently mis-select)
 
-        // Run-only value-taking flags `cargo nextest list` rejects: stripped.
+        // Run-only value flags `nextest list` rejects
         const RUN_VALUE: &[&str] = &[
             "-j",
             "--test-threads",
@@ -180,7 +143,7 @@ impl RunOptions {
             "--success-output",
             "--failure-output",
         ];
-        // Run-only booleans `list` rejects. `--no-cleanup` is ztest-only.
+        // Run-only booleans `list` rejects (`--no-cleanup` = ztest-only)
         const RUN_BOOL: &[&str] = &[
             "--no-cleanup",
             "--no-capture",
@@ -190,8 +153,7 @@ impl RunOptions {
             "--no-fail-fast",
             "--nff",
         ];
-        // Run-only value-taking flags the engine ignores; stripped so `list`
-        // doesn't choke on them.
+        // Run-only value flags the engine ignores (stripped so `list` doesn't choke)
         const IGNORED_VALUE: &[&str] = &[
             "--max-fail",
             "--debugger",
@@ -211,7 +173,7 @@ impl RunOptions {
             "--binaries-metadata",
             "--target-dir-remap",
         ];
-        // Run-only booleans the engine ignores.
+        // Run-only booleans the engine ignores
         const IGNORED_BOOL: &[&str] = &[
             "--no-run",
             "--hide-progress-bar",
@@ -220,8 +182,7 @@ impl RunOptions {
             "--extract-overwrite",
             "--persist-extract-tempdir",
         ];
-        // Ignored flags that change behavior if dropped (unlike display-only
-        // flags, which ztest owns and drops silently) — worth warning about.
+        // Ignored flags that change behavior if dropped (display-only ones drop silently)
         const WARN_UNSUPPORTED: &[&str] = &[
             "--max-fail",
             "--debugger",
@@ -238,7 +199,7 @@ impl RunOptions {
         let mut o = RunOptions::default();
         let mut it = args.iter().peekable();
         while let Some(arg) = it.next() {
-            // After `--`, the rest are filter positionals: forward verbatim.
+            // Post-`--` = filter positionals, forwarded verbatim
             if arg == "--" {
                 o.list_args.push(arg.clone());
                 o.list_args.extend(it.cloned());
@@ -287,29 +248,26 @@ impl RunOptions {
                 continue;
             }
 
-            // Everything else (selection / filter / build / `--profile`) forwards
-            // verbatim to `cargo nextest list`.
+            // Selection / filter / build / `--profile` → `cargo nextest list`, verbatim
             o.list_args.push(arg.clone());
         }
         o
     }
 
-    /// The zero-tests-selected policy from `--no-tests` (`pass`/`warn`/`fail`;
-    /// nextest default `fail`).
+    /// Zero-tests-selected policy from `--no-tests`
     fn no_tests_is_error(&self) -> bool {
         !matches!(self.no_tests.as_deref(), Some("pass") | Some("warn"))
     }
 
-    /// Resolve the captured-output policy: CLI flag > `ZTEST_*` > `NEXTEST_*` >
-    /// default. An invalid value warns and falls back rather than aborting.
-    /// `--no-capture` forces `immediate` only for a stream not otherwise pinned.
+    /// Captured-output policy. Precedence CLI > `ZTEST_*` > `NEXTEST_*` > default
+    ///
+    /// - Invalid value warns + falls back (never aborts)
+    /// - `--no-capture` forces `immediate` only on a stream not otherwise pinned
     fn output_config(&self) -> crate::engine::output::OutputConfig {
         use crate::engine::output::{CaptureStrategy, OutputConfig, TestOutputDisplay};
 
         fn env_first(names: &[&str]) -> Option<String> {
-            names
-                .iter()
-                .find_map(|n| std::env::var(n).ok().filter(|s| !s.trim().is_empty()))
+            names.iter().find_map(|n| std::env::var(n).ok().filter(|s| !s.trim().is_empty()))
         }
         fn resolve(
             cli: &Option<String>,
@@ -349,15 +307,14 @@ impl RunOptions {
     }
 }
 
-/// Parse a `--slow-timeout` value as seconds (`"60"` or `"60s"`) into a
-/// [`Duration`](std::time::Duration). `None` on a malformed value.
+/// `--slow-timeout` seconds (`"60"` / `"60s"`) → [`Duration`](std::time::Duration);
+/// `None` on malformed
 fn parse_duration_secs(s: &str) -> Option<std::time::Duration> {
     let s = s.strip_suffix('s').unwrap_or(s);
     s.parse::<u64>().ok().map(std::time::Duration::from_secs)
 }
 
-/// Split `--flag=value` into `("--flag", Some("value"))`; a bare token yields
-/// `(token, None)`.
+/// `--flag=value` → `("--flag", Some("value"))`; bare token → `(token, None)`
 fn split_eq(arg: &str) -> (&str, Option<&str>) {
     match arg.split_once('=') {
         Some((flag, value)) => (flag, Some(value)),
@@ -365,24 +322,58 @@ fn split_eq(arg: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Resolve a `--rerun` selector to the set of `(binary_id, test_name)` that
-/// passed in that run — the tests this run will exclude.
+/// `--rerun` selector → `(binary_id, test_name)` that passed then = excluded now
 fn resolve_rerun(sel: &RunSelector) -> Result<std::collections::HashSet<(String, String)>, String> {
     let workspace = engine::record::locate::current_workspace().map_err(|e| e.to_string())?;
     let dir = engine::record::locate::resolve(&workspace, sel).map_err(|e| e.to_string())?;
     engine::record::passed_tests(&dir).map_err(|e| e.to_string())
 }
 
+/// `ztest run describe [filter]` — the plan `run` would provision, rendered, cluster-free
+async fn describe(list_args: Vec<String>) -> Result<(), String> {
+    let build =
+        crate::pipeline::build::index(&list_args).await.map_err(|e| format!("build/list: {e}"))?;
+    let BuildOutcome::Ok { selected_binaries, .. } = &build else {
+        return Err("build produced no test selection".into());
+    };
+    let (dump, qos_by_binary) = crate::pipeline::images::discover(selected_binaries).await;
+    let crate::pipeline::images::DumpOutcome::Discovered {
+        seeds,
+        images_by_binary,
+        deps_by_binary,
+        ..
+    } = &dump
+    else {
+        return Err("inventory dump failed".into());
+    };
+    let plan = crate::plan::for_run(
+        selected_binaries,
+        images_by_binary,
+        deps_by_binary,
+        &qos_by_binary,
+        seeds,
+    );
+    print!("{}", crate::plan::render::render(&plan, &Theme::detect()));
+    Ok(())
+}
+
 pub fn execute(args: Args) -> ExitCode {
-    // Bail before any UI is drawn if we're not in a cargo workspace: cargo's
-    // own error would otherwise land in the pinned-banner scroll region and be
-    // squashed into an unexplained "build failed".
+    // Bail pre-UI (cargo's own error would land in the scroll region as an
+    // unexplained "build failed")
     if let Err(detail) = locate_cargo_workspace() {
         eprintln!("ztest run: {detail}");
         eprintln!(
             "       cd into a cargo workspace (one containing a Cargo.toml in this dir or any ancestor) and retry."
         );
         return exit(NextestExitCode::SETUP_ERROR);
+    }
+
+    // `describe` recognised only as the *first* token — `nextest_args` is `trailing_var_arg`,
+    // so a real subcommand cannot be declared here. Filter for a test *named* `describe`
+    // with `-E 'test(describe)'`
+    if args.nextest_args.first().is_some_and(|a| a == "describe") {
+        let filter = RunOptions::parse(&args.nextest_args[1..]).list_args;
+        return crate::cli::block_on("run describe", crate::cli::Rt::Multi, describe(filter));
     }
 
     let mut opts = RunOptions::parse(&args.nextest_args);
@@ -395,8 +386,8 @@ pub fn execute(args: Args) -> ExitCode {
     }
     let theme = Theme::detect();
 
-    // Bind the target cluster from the selected profile before any thread reads
-    // the env. Precedence: --cluster > ambient env > persisted default.
+    // Bind the target cluster before any thread reads the env.
+    // Precedence: --cluster > ambient env > persisted default.
     //
     // SAFETY: set_var must precede thread creation; still single-threaded here.
     match unsafe { crate::cluster_config::activate(args.cluster.as_deref()) } {
@@ -410,19 +401,14 @@ pub fn execute(args: Args) -> ExitCode {
     let mut state = build_initial_state(&opts);
     let session_start = Instant::now();
 
-    // Force a shared run id before any thread starts so the parent's reaper and
-    // every test child (env-inherited) agree on the `ztest.io/run-id` label;
-    // otherwise each derives a different `{user}-{ppid}` id and label-reap can't
-    // target the children's resources.
+    // Shared run id up front → parent reaper + every (env-inheriting) test child agree on
+    // `ztest.io/run-id`; else each derives its own `{user}-{ppid}` and label-reap misses.
     //
     // SAFETY: `set_var` must precede thread creation; still single-threaded here.
     if std::env::var_os("ZTEST_RUN_ID").is_none() && std::env::var_os("GITHUB_RUN_ID").is_none() {
         let user = std::env::var("USER").unwrap_or_else(|_| "anon".into());
         unsafe {
-            std::env::set_var(
-                "ZTEST_RUN_ID",
-                format!("ztest-{user}-{}", std::process::id()),
-            );
+            std::env::set_var("ZTEST_RUN_ID", format!("ztest-{user}-{}", std::process::id()));
         }
     }
     let run_coords =
@@ -433,12 +419,9 @@ pub fn execute(args: Args) -> ExitCode {
 
     let tty = stdout().is_terminal();
 
-    // One multi-thread runtime drives every work-side phase; the render thread
-    // is a separate OS thread so the panel animates independently.
-    let work_rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    // One multi-thread runtime for every work-side phase (render thread = its own OS
+    // thread, so the panel animates independently)
+    let work_rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("ztest run: tokio runtime: {e}");
@@ -446,12 +429,10 @@ pub fn execute(args: Args) -> ExitCode {
         }
     };
 
-    // The persistent bottom panel (TTY only): a dedicated render thread owns the
-    // terminal and stays live even while a phase blocks on a silent subprocess.
-    // Non-TTY runs linearly with inherited stdio; the banner prints at the end.
+    // Persistent bottom panel (TTY only): render thread owns the terminal, stays live
+    // while a phase blocks on a silent subprocess. Non-TTY = linear, banner at the end.
     let (console, guard) = if tty {
-        // The render thread paints this the instant Ctrl-C arrives, before the
-        // work side has a chance to react.
+        // Painted the instant Ctrl-C arrives, before the work side can react
         let cancel_theme = theme.clone();
         let cancel_panel = Box::new(move |elapsed| ui::render_cancel_panel(elapsed, &cancel_theme));
         match Console::start(session_start, cancel_panel) {
@@ -462,8 +443,7 @@ pub fn execute(args: Args) -> ExitCode {
         (None, None)
     };
     if let Some(c) = &console {
-        // Route panics to the render thread so a crash surfaces on teardown
-        // instead of being wiped by the live footer.
+        // Panics → render thread (crash surfaces on teardown, not wiped by the footer)
         install_panic_surface(c);
         push_preflight_scene(c, &state, &Transfers::default(), "Preflight", &theme, None);
     }
@@ -478,18 +458,19 @@ pub fn execute(args: Args) -> ExitCode {
         &run_coords,
     );
 
-    // Tear the render thread down only after every phase has finished producing
-    // output (commits the final frame, restores the cursor).
+    // Teardown only once every phase has stopped producing output (commits the final
+    // frame, restores the cursor)
     if let Some(g) = guard {
         g.finish();
     }
     code
 }
 
-/// Ctrl-C teardown: reap the current run's resources by `ztest.io/run-id` label
-/// (a SIGKILLed test never ran its `Drop`) and return the conventional 130.
-/// Deadline-bounded so a stuck apiserver can't hang the exit — the namespace
-/// janitor is the backstop. Skipped under `--no-cleanup`.
+/// Ctrl-C teardown: label-reap this run's resources, return 130.
+///
+/// - Reap by `ztest.io/run-id` (a SIGKILLed test never ran its `Drop`)
+/// - Deadline-bounded (stuck apiserver must not hang the exit; janitor = backstop)
+/// - Skipped under `--no-cleanup`
 fn cancel_exit(work_rt: &tokio::runtime::Runtime, run_id: &str, no_cleanup: bool) -> ExitCode {
     if !no_cleanup {
         work_rt.block_on(async {
@@ -528,48 +509,34 @@ fn run_inner(
     session_start: Instant,
     run: &crate::naming::RunCoords,
 ) -> ExitCode {
-    // Cancellation (Ctrl-C) is checked after every phase, so an interrupted
-    // phase exits 130 via `cancel_exit` rather than misreporting as a failure.
+    // Checked after every phase → an interrupted phase exits 130, not "failed"
     let cancelled = || console.is_some_and(Console::cancelled);
     let cancel_exit = || cancel_exit(work_rt, &run.run_id, opts.no_cleanup);
 
-    // On-cluster-build targets (OpenShift) ship source, not artifacts: the test
-    // binaries compile in the builder pod. Every other topology keeps the
-    // local-compile path below.
+    // Remote clusters ship source, not artifacts (test binaries compile in the builder
+    // pod); every other topology takes the local-compile path below
     if crate::backends::image::builds_on_cluster() {
         return run_inner_on_cluster(work_rt, opts, theme, state, console, run);
     }
 
-    let outcome = match pipeline_phase(
-        work_rt,
-        &opts.list_args,
-        theme,
-        state,
-        console,
-        session_start,
-    ) {
-        Ok(o) => o,
-        Err(err) => {
-            // A subprocess killed by our own Ctrl-C surfaces here as an error;
-            // report it as cancellation, not a crash.
-            if cancelled() {
-                return cancel_exit();
+    let outcome =
+        match pipeline_phase(work_rt, &opts.list_args, theme, state, console, session_start) {
+            Ok(o) => o,
+            Err(err) => {
+                // A subprocess killed by our own Ctrl-C surfaces as an error → cancellation
+                if cancelled() {
+                    return cancel_exit();
+                }
+                // unexpected: nextest maps unknown failures to 1
+                return fatal(console, format!("ztest run: pipeline phase crashed: {err}"), 1);
             }
-            // unexpected: nextest maps unknown failures to 1
-            return fatal(
-                console,
-                format!("ztest run: pipeline phase crashed: {err}"),
-                1,
-            );
-        }
-    };
+        };
     if cancelled() {
         return cancel_exit();
     }
 
-    // A hard probe failure aborts before we waste an image build+push on a
-    // cluster we can't run on. Surface the detail, or it dies with the
-    // torn-down banner and the run appears to exit for no reason.
+    // Abort before an image build+push onto a cluster we can't run on. Detail surfaced,
+    // else it dies with the banner and the run looks like it exited for no reason.
     if let ProbeOutcome::Failed { detail } = &outcome.probe {
         return fatal(
             console,
@@ -578,19 +545,8 @@ fn run_inner(
         );
     }
 
-    // Image phases, only when Phase B succeeded.
-    let image_phase = if let BuildOutcome::Ok {
-        selected_binaries, ..
-    } = &outcome.build
-    {
-        run_image_phases(
-            work_rt,
-            selected_binaries,
-            console,
-            state,
-            theme,
-            session_start,
-        )
+    let image_phase = if let BuildOutcome::Ok { selected_binaries, .. } = &outcome.build {
+        run_image_phases(work_rt, selected_binaries, console, state, theme, session_start)
     } else {
         ImagePhaseOutcome::default()
     };
@@ -601,112 +557,76 @@ fn run_inner(
         state,
         console,
         run,
-        Preflight {
-            probe: &outcome.probe,
-            build: &outcome.build,
-            images: image_phase,
-        },
+        Preflight { probe: &outcome.probe, build: &outcome.build, images: image_phase },
     )
 }
 
-/// The shared tail of a run: fold the resolved build + image phases into the
-/// engine and execute. Both the local-compile and on-cluster-compile paths
-/// converge here so the [`engine::EngineInput`] assembly lives in one place.
 #[allow(clippy::too_many_arguments)]
-/// The ServiceAccount this run charges its reservations to. Both the build lease
-/// and the run lease bill the same identity, so they read it from one place.
+/// ServiceAccount this run charges its reservations to (build lease + run lease bill
+/// the same identity)
 fn service_account() -> String {
     std::env::var("ZTEST_SA").unwrap_or_else(|_| "ztest-local".to_string())
 }
 
-/// The build phase's BuildKit pod together with the ledger reservation that
-/// covers it: the pod name, the `Renewer` holding its Lease, and the heartbeat
-/// keeping that Lease alive across a long compile.
+/// BuildKit pod + its reservation, as one object (they must die as one)
 ///
-/// They travel as one object because they must die as one. The pod's footprint
-/// ([`BUILDKIT_BUILD`](crate::qos::build::BUILDKIT_BUILD)) is the largest ztest
-/// places, so a path that dropped the pod but leaked the Lease would sterilise
-/// that capacity until the TTL, and one that dropped the Lease but leaked the pod
-/// would put unbudgeted memory back under a node admission believes is free —
-/// precisely the failure this reservation exists to prevent. With a single
-/// [`teardown`](Self::teardown) there is no exit path that can do either.
+/// - Largest footprint ztest places
+/// - Leaked Lease → capacity sterilised until TTL
+/// - Leaked pod → unbudgeted memory under a node admission thinks is free
 struct ReservedBuilder {
     pod: String,
-    renewer: crate::qos::ledger::Renewer,
-    /// Aborted on drop, which stops the renewals; the Lease is deleted explicitly
-    /// in `teardown` rather than left to expire.
-    _heartbeat: crate::qos::ledger::Heartbeat,
+    reservation: crate::qos::ledger::Reservation,
 }
 
 impl ReservedBuilder {
-    /// Reserve the build footprint, then create the pod it covers.
-    ///
-    /// The reservation is taken *first* and named after the run-id the pod
-    /// carries, so the ledger attributes the pod to it (`usage_by_leased_run`)
-    /// and peers subtract it (`sum_reservations`) for the pod's whole life. The
-    /// wait inside `acquire` is what replaces the old behaviour of creating the
-    /// pod unconditionally and failing the run outright when no node could place
-    /// it.
+    /// Reserve, then create the pod it covers (reservation named for the run-id the pod
+    /// carries → ledger attributes it, peers subtract it for the pod's whole life)
     async fn acquire(
         client: &kube::Client,
         run: &crate::naming::RunCoords,
-        allocatable: crate::qos::Resources,
+        capacity: crate::qos::ClusterCapacity,
     ) -> Result<Self, String> {
-        let grant = crate::qos::ledger::acquire(
+        let reservation = crate::qos::ledger::acquire(
             client,
             &run.run_id,
             &service_account(),
             &run.user,
-            allocatable,
+            capacity,
             crate::qos::ledger::Reserve::Fixed(crate::qos::build::BUILDKIT_BUILD),
         )
         .await
         .map_err(|e| e.to_string())?;
-        let heartbeat = grant.renewer.spawn_heartbeat();
-        let pod = match crate::resource::impls::buildkit::create_build_pod(
-            client,
-            &run.run_id,
-            &run.user,
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                grant.renewer.release().await;
-                return Err(e.to_string());
-            }
-        };
+        // `?` drops `reservation` → released (the point of the RAII shape)
+        let pod =
+            crate::resource::impls::buildkit::create_build_pod(client, &run.run_id, &run.user)
+                .await
+                .map_err(|e| e.to_string())?;
         if let Err(e) = crate::resource::impls::buildkit::wait_build_pod_ready(client, &pod).await {
             crate::resource::impls::buildkit::delete_build_pod(client, &pod).await;
-            grant.renewer.release().await;
             return Err(e.to_string());
         }
-        Ok(ReservedBuilder {
-            pod,
-            renewer: grant.renewer,
-            _heartbeat: heartbeat,
-        })
+        Ok(ReservedBuilder { pod, reservation })
     }
 
-    /// Delete the pod, then release its reservation. In that order: the capacity
-    /// must not be advertised as free while the pod is still terminating on it.
+    /// Delete the pod, then release its reservation (capacity must not read free while
+    /// the pod still terminates on it)
     fn teardown(self, work_rt: &tokio::runtime::Runtime, client: &kube::Client) {
         work_rt.block_on(async {
             crate::resource::impls::buildkit::delete_build_pod(client, &self.pod).await;
-            self.renewer.release().await;
+            self.reservation.release().await;
         });
     }
 }
 
-/// Everything the preflight phases resolved, travelling as one value into the
-/// engine launch. Grouped because the three are only ever produced together and
-/// consumed together, and both call sites forward all of them unchanged.
+/// What the preflight phases resolved, as one value into the engine launch.
 struct Preflight<'a> {
     probe: &'a ProbeOutcome,
     build: &'a BuildOutcome,
     images: ImagePhaseOutcome,
 }
 
+/// Shared tail: fold the resolved build + image phases into the engine and execute
+/// (both compile paths converge here → one [`engine::EngineInput`] assembly)
 fn launch_engine(
     work_rt: &tokio::runtime::Runtime,
     opts: &RunOptions,
@@ -716,11 +636,7 @@ fn launch_engine(
     run: &crate::naming::RunCoords,
     preflight: Preflight<'_>,
 ) -> ExitCode {
-    let Preflight {
-        probe,
-        build,
-        images: image_phase,
-    } = preflight;
+    let Preflight { probe, build, images: image_phase } = preflight;
     let cancelled = || console.is_some_and(Console::cancelled);
     let cancel_exit = || cancel_exit(work_rt, &run.run_id, opts.no_cleanup);
 
@@ -728,15 +644,11 @@ fn launch_engine(
         return cancel_exit();
     }
 
-    // `cargo nextest list` cannot tell a `#[ztest::sync_test]` profile from an
-    // ordinary test — only the Phase-C dump can — so the selection is pruned
-    // here, before anything downstream sizes a wave or admits an item against
-    // it. Both the QoS plan and the work-list are then built from the same
-    // pruned selection.
+    // Only the Phase-C dump distinguishes a `#[ztest::sync_test]` profile from an ordinary
+    // test → prune here, before anything downstream sizes a wave or admits against it
+    // (QoS plan + work-list then share one pruned selection)
     let mut selected_binaries = match build {
-        BuildOutcome::Ok {
-            selected_binaries, ..
-        } => selected_binaries.clone(),
+        BuildOutcome::Ok { selected_binaries, .. } => selected_binaries.clone(),
         BuildOutcome::Failed { .. } => Vec::new(),
     };
     let excluded_sync = engine::plan::drop_sync_tests(
@@ -745,39 +657,30 @@ fn launch_engine(
         &image_phase.qos_by_binary,
     );
     let qos_by_binary = prune_qos(&image_phase.qos_by_binary, &excluded_sync);
-    let selected_count: usize = selected_binaries
-        .iter()
-        .map(|b| b.selected_tests.len())
-        .sum();
+    let selected_count: usize = selected_binaries.iter().map(|b| b.selected_tests.len()).sum();
 
-    // Group the dumped tiers and estimate the wave structure against capacity.
     state.qos_plan = qos_plan_from(&qos_by_binary, probe);
 
-    // Phase B counted the sync profiles it could not recognise; correct the
-    // banner before it is rendered so it states what will actually run.
+    // Phase B counted the sync profiles it could not recognise → correct the banner
+    // pre-render so it states what will actually run
     if !excluded_sync.is_empty()
-        && let crate::ui::BuildState::Ok {
-            test_count,
-            binary_count,
-            ..
-        } = &mut state.build
+        && let crate::ui::BuildState::Ok { test_count, binary_count, .. } = &mut state.build
     {
         *test_count = selected_count;
         *binary_count = selected_binaries.len();
     }
 
-    // Final panel refresh with all phases resolved.
     if let Some(c) = console {
         push_preflight_scene(c, state, &Transfers::default(), "Preflight", theme, None);
     }
 
-    // In non-TTY mode print the full resolved banner so CI logs have a record.
+    // Non-TTY prints the full resolved banner (CI logs keep a record)
     if console.is_none() {
         let _ = stdout().write_all(ui::render(state, theme).as_bytes());
     }
 
     if let BuildOutcome::Failed { .. } = build {
-        // Phase B is `cargo nextest list`; a non-zero exit is a build failure.
+        // Phase B = `cargo nextest list`, so non-zero = build failure
         return exit(NextestExitCode::BUILD_FAILED);
     }
     if let Some(detail) = &image_phase.failure {
@@ -787,8 +690,7 @@ fn launch_engine(
             NextestExitCode::SETUP_ERROR,
         );
     }
-    // Name what the filter matched but the engine will not run, so an absent
-    // test is never a silent absence.
+    // Name what the filter matched but the engine will not run (no silent absences)
     if !excluded_sync.is_empty() {
         let note = sync_exclusion_notice(&excluded_sync);
         match console {
@@ -796,9 +698,8 @@ fn launch_engine(
             None => print!("{note}"),
         }
     }
-    // No tests selected: honor `--no-tests` (nextest default `fail` ⇒ exit 4).
-    // Counted after the sync prune, so a filter that matched only sync profiles
-    // lands here rather than starting an empty run.
+    // No tests selected → honor `--no-tests` (nextest default `fail` ⇒ exit 4). Counted
+    // post-prune, so a sync-only filter lands here instead of starting an empty run.
     if selected_count == 0 {
         let only_sync = !excluded_sync.is_empty();
         let (msg, code) = match (only_sync, opts.no_tests_is_error()) {
@@ -812,18 +713,13 @@ fn launch_engine(
                 "ztest run: no tests to run (--no-tests=fail)".to_string(),
                 NextestExitCode::NO_TESTS_RUN,
             ),
-            (false, false) => (
-                "ztest run: no tests to run".to_string(),
-                NextestExitCode::OK,
-            ),
+            (false, false) => ("ztest run: no tests to run".to_string(), NextestExitCode::OK),
         };
         return fatal(console, msg, code);
     }
 
-    // The engine's 2D scheduler is seeded from the cluster's free capacity
-    // (`allocatable - Σ requested` across every pod, including other runs'
-    // Guaranteed pods), so independent runs coexist: whoever probes first packs,
-    // the next queues on the remainder. A probed cluster is required.
+    // Scheduler seed = free capacity (`allocatable - Σ requested` over every pod, peers'
+    // Guaranteed included) → runs coexist: first to probe packs, next queues on the rest
     let capacity = match probe {
         ProbeOutcome::Ok { capacity, .. } => capacity,
         _ => {
@@ -836,73 +732,42 @@ fn launch_engine(
     };
     let summary = match build {
         BuildOutcome::Ok { summary, .. } => summary.as_ref(),
-        // A build failure already returned `BUILD_FAILED` above.
+        // Build failure already returned `BUILD_FAILED` above
         BuildOutcome::Failed { .. } => unreachable!("build failure handled above"),
     };
     let selected_binaries = selected_binaries.as_slice();
 
     let sa = service_account();
-    // Shared with the reservation lease so the ledger's per-run invariant groups
-    // the runner pods together.
+    // Shared with the reservation lease → ledger's per-run invariant groups the runner pods
     let run_id = format!("ztest-run-{}", std::process::id());
 
-    // Acquire this run's cross-run capacity reservation. The granted slice — not
-    // a raw `free()` snapshot — seeds the scheduler ceiling, so concurrent runs
-    // carve the node up instead of all claiming the same headroom
-    // (`docs/design-qos.md`).
+    // Scheduler ceiling = the granted slice, never a raw `free()` snapshot, so concurrent
+    // runs carve the node up instead of all claiming the same headroom (`docs/design-qos.md`)
     let client = match work_rt.block_on(crate::cluster::client()) {
         Ok(c) => c,
         Err(e) => {
-            return fatal(
-                console,
-                format!("cluster client: {e}"),
-                NextestExitCode::SETUP_ERROR,
-            );
+            return fatal(console, format!("cluster client: {e}"), NextestExitCode::SETUP_ERROR);
         }
     };
-    let grant = match work_rt.block_on(crate::qos::ledger::acquire(
+    let reservation = match work_rt.block_on(crate::qos::ledger::acquire(
         &client,
         &run_id,
         &sa,
         &run.user,
-        capacity.allocatable,
+        *capacity,
         crate::qos::ledger::Reserve::Elastic,
     )) {
         Ok(g) => g,
         Err(e) => {
-            return fatal(
-                console,
-                format!("ztest run: {e}"),
-                NextestExitCode::SETUP_ERROR,
-            );
+            return fatal(console, format!("ztest run: {e}"), NextestExitCode::SETUP_ERROR);
         }
     };
-    let ceiling = grant.slice;
+    let ceiling = reservation.reserved();
+    // Engine reconciles the scheduler against the live ceiling + reports demand
+    // back (→ elastic resize)
+    let reservation = std::sync::Arc::new(reservation);
 
-    // The cross-run governor drives this run's reservation and the scheduler
-    // ceiling live for the whole run — a lone run expands to fill the cluster, a
-    // busy one cedes its fair share to peers — and its reconcile heartbeat renews
-    // the Lease, so there is no separate renewal task. The demand channel carries
-    // the scheduler's live appetite back to it. Dropped (aborted) before the
-    // Lease is released so it cannot re-create the Lease after release.
-    let (demand_tx, demand_rx) =
-        tokio::sync::watch::channel(crate::qos::governor::RunDemand::default());
-    let (governor, ceiling_rx) = work_rt.block_on(async {
-        crate::qos::governor::spawn(
-            crate::qos::governor::GovernorConfig {
-                client: client.clone(),
-                run_id: run_id.clone(),
-                allocatable: capacity.allocatable,
-                budget: grant.budget,
-                initial: grant.slice,
-                renewer: grant.renewer.clone(),
-            },
-            demand_rx,
-        )
-    });
-
-    // `--rerun`: resolve the prior run to the set of tests that passed, which the
-    // engine excludes from this run's work-list. A bad selector is a setup error.
+    // `--rerun`: prior run's passed set → excluded from this work-list (bad selector = setup error)
     let rerun_passed = match &opts.rerun {
         Some(sel) => match resolve_rerun(sel) {
             Ok(set) => set,
@@ -936,28 +801,24 @@ fn launch_engine(
             run_id,
             output: opts.output_config(),
         },
-        capacity: Some(engine::schedule::CapacityChannels {
-            ceiling_rx,
-            demand_tx,
-        }),
+        reservation: Some(reservation.clone()),
     };
     let code = engine::run(work_rt, input, console, theme, state.qos_plan.clone());
-    // Stop the governor before releasing, then release the reservation on every
-    // exit path so freed capacity is available to the next run immediately (the
-    // TTL is only the crash backstop).
-    drop(governor);
-    work_rt.block_on(grant.renewer.release());
+    // Release on every exit → freed capacity reaches the next run now (TTL = crash backstop)
+    if let Some(r) = std::sync::Arc::into_inner(reservation) {
+        work_rt.block_on(r.release());
+    }
     if cancelled() {
         return cancel_exit();
     }
     code
 }
 
-/// The on-cluster-compile path: probe the cluster, start the ephemeral BuildKit
-/// builder pod, then ship source and have that pod produce the binaries via
-/// [`pipeline::remote_compile::compile_on_cluster`] (source stream → BuildKit
-/// runner build → inventory export). Provisioning and the engine tail are the
-/// shared paths. The probe, builder startup, and compile are distinct phases.
+/// On-cluster-compile path: probe → ephemeral BuildKit pod → ship source and let it
+/// produce the binaries ([`pipeline::remote_compile::compile_on_cluster`]).
+///
+/// - Probe / builder startup / compile = three distinct phases
+/// - Provisioning + the engine tail are the shared paths
 fn run_inner_on_cluster(
     work_rt: &tokio::runtime::Runtime,
     opts: &RunOptions,
@@ -972,8 +833,8 @@ fn run_inner_on_cluster(
     let cancelled = || console.is_some_and(Console::cancelled);
     let cancel_exit = || cancel_exit(work_rt, &run.run_id, opts.no_cleanup);
 
-    // Phase A: probe (+ archives) — the client drives the builder pod and the
-    // probe's free-capacity ceiling feeds the engine.
+    // Phase A: probe (+ archives) — client drives the builder pod, probe's free-capacity
+    // ceiling feeds the engine
     let (probe, client) = work_rt.block_on(async {
         let ev_tx = pipeline::channel().0;
         let (probe, client) = pipeline::cluster::run(&ev_tx).await;
@@ -990,8 +851,8 @@ fn run_inner_on_cluster(
         return cancel_exit();
     }
 
-    // A hard probe failure aborts before we drive the builder. A `Missing` probe
-    // (unresolved kubeconfig/context) falls through to the no-client guard below.
+    // Abort before driving the builder. `Missing` (unresolved kubeconfig/context) instead
+    // falls through to the no-client guard below.
     if let ProbeOutcome::Failed { detail } = &probe {
         return fatal(
             console,
@@ -1007,8 +868,7 @@ fn run_inner_on_cluster(
         );
     };
 
-    // Registry repo the runner build pushes to (the in-cluster pull address,
-    // i.e. `ZTEST_IMAGE_REGISTRY`).
+    // Registry repo the runner build pushes to = in-cluster pull address (`ZTEST_IMAGE_REGISTRY`)
     let Some(runner_repo_ref) = crate::backends::image::runner_repo_ref() else {
         return fatal(
             console,
@@ -1018,32 +878,28 @@ fn run_inner_on_cluster(
     };
     let refs = pipeline::remote_compile::BakeRefs { runner_repo_ref };
 
-    // The probe is a pre-build snapshot; watch capacity so the panel reflects the
-    // build pod and test churn instead of stale pre-build headroom.
+    // Probe = pre-build snapshot → watch capacity so the panel tracks build-pod and test
+    // churn rather than stale headroom
     let initial_cap = match &probe {
         ProbeOutcome::Ok { capacity, .. } => *capacity,
         _ => Default::default(),
     };
-    // `spawn` schedules its watch tasks with `tokio::spawn`, so it must be called
-    // within a runtime context. Enter `work_rt` (multi-thread) so those tasks run
-    // on its workers and keep capacity current while this thread blocks on the
-    // build; without the guard `tokio::spawn` finds no reactor and panics.
+    // `spawn` uses `tokio::spawn` → needs a runtime context (no guard = no reactor =
+    // panic). `work_rt` keeps the watch tasks live while this thread blocks on the build.
     let cap_watch = {
         let _enter = work_rt.enter();
         pipeline::capacity_watch::spawn(client.clone(), initial_cap)
     };
     let cap_rx = cap_watch.receiver();
 
-    // Phase B/C on the cluster. No local child streams output, so the panel's
-    // one live row names the current remote sub-phase, its timer reset at each
-    // transition by the `on_phase` callback below. Defined before the build pod
-    // so its startup (below) reports as the first sub-phase, rather than an
-    // invisible wait that looks like the probe hanging.
+    // Phase B/C on the cluster. No local child streams output → the panel's one live row
+    // names the current remote sub-phase, timer reset per transition by `on_phase`.
+    // Defined pre-build-pod so builder startup reports as the first sub-phase (else an
+    // invisible wait that reads as a hung probe).
     let started = Instant::now();
 
-    // With a console the builder compiles under a PTY and its raw bytes feed the
-    // terminal emulator, as the local reader does; CI (no console) runs tty-free
-    // with each line to stderr.
+    // Console → builder compiles under a PTY, raw bytes into the emulator (as the local
+    // reader does); no console → tty-free, line per line to stderr
     let byte_sink = |bytes: &[u8]| {
         if let Some(c) = console {
             c.output(bytes.to_vec());
@@ -1058,15 +914,11 @@ fn run_inner_on_cluster(
         None => pipeline::remote_compile::CompileOut::Lines { sink: &line_sink },
     };
 
-    // `remote_compile` reports phase transitions; the shared driver colours each
-    // boundary line and here — where the banner state lives — we drive the live
-    // panel row on each new sub-phase.
+    // Shared driver colours each boundary line; here (where the banner state lives) each
+    // new sub-phase drives the live panel row
     let mut on_phase = |ev: pipeline::remote_compile::Phase<'_>| {
         if let Some(phase) = crate::cli::console::commit_phase(console, theme, ev) {
-            state.build = BuildState::Compiling {
-                started_at: Instant::now(),
-                phase: Some(phase),
-            };
+            state.build = BuildState::Compiling { started_at: Instant::now(), phase: Some(phase) };
             if let Some(c) = console {
                 push_preflight_scene(
                     c,
@@ -1080,23 +932,16 @@ fn run_inner_on_cluster(
         }
     };
 
-    // Startup builder: reserve the build footprint in the cross-run ledger, then
-    // create the ephemeral BuildKit pod it covers and wait it Ready. Reserving
-    // first is what keeps admission honest — the pod is Guaranteed and the largest
-    // ztest places, so a peer run must subtract it for its whole life or it will
-    // hand the same memory to tests. It is torn down after the build phase and
-    // must not linger into the test run; labelled with the run id so `reap_run`
-    // removes it on Ctrl-C / cleanup. Reported as its own phase (with a live
-    // timer) rather than a silent wait — a build pod waiting on capacity is
-    // otherwise indistinguishable from a hung probe.
+    // Startup builder: reserve the build footprint, then create + await the pod it covers.
+    //
+    // - Reserve first (pod is Guaranteed and the largest ztest places → a peer must
+    //   subtract it for its whole life, else it hands the same memory to tests)
+    // - Run-id-labelled → `reap_run` takes it on Ctrl-C / cleanup
+    // - Own phase + live timer (a builder waiting on capacity else reads as a hung probe)
     use pipeline::remote_compile::Phase;
     on_phase(Phase::Start("startup builder"));
     let t_builder = Instant::now();
-    let builder = match work_rt.block_on(ReservedBuilder::acquire(
-        &client,
-        run,
-        initial_cap.allocatable,
-    )) {
+    let builder = match work_rt.block_on(ReservedBuilder::acquire(&client, run, initial_cap)) {
         Ok(b) => b,
         Err(e) => {
             if let Some(c) = console {
@@ -1109,10 +954,7 @@ fn run_inner_on_cluster(
             );
         }
     };
-    on_phase(Phase::Done {
-        label: "builder pod ready",
-        dur: t_builder.elapsed(),
-    });
+    on_phase(Phase::Done { label: "builder pod ready", dur: t_builder.elapsed() });
     if cancelled() {
         builder.teardown(work_rt, &client);
         return cancel_exit();
@@ -1134,12 +976,11 @@ fn run_inner_on_cluster(
     let remote = match remote {
         Ok(r) => r,
         Err(e) => {
-            // Drop the ephemeral builder before bailing — a failed build must not
-            // leak its Guaranteed footprint, nor the reservation covering it,
-            // until the janitor.
+            // Drop the builder before bailing (else its Guaranteed footprint + reservation
+            // leak until the janitor)
             builder.teardown(work_rt, &client);
-            // Commit the failing compile's output before the error line, so the
-            // error lands after (not above) the output that explains it.
+            // Commit the failing compile's output first → the error lands after, not above,
+            // the output explaining it
             if let Some(c) = console {
                 c.flush_live();
             }
@@ -1151,27 +992,20 @@ fn run_inner_on_cluster(
         }
     };
 
-    // Reflect the resolved build into the banner (counts + elapsed).
     let build = remote.build;
     state.build = match &build {
-        BuildOutcome::Ok {
-            test_count,
-            binary_count,
-            ..
-        } => BuildState::Ok {
+        BuildOutcome::Ok { test_count, binary_count, .. } => BuildState::Ok {
             test_count: *test_count,
             binary_count: *binary_count,
             elapsed: started.elapsed(),
         },
-        BuildOutcome::Failed { exit_code, stage } => BuildState::Failed {
-            exit_code: *exit_code,
-            stage: *stage,
-            elapsed: started.elapsed(),
-        },
+        BuildOutcome::Failed { exit_code, stage } => {
+            BuildState::Failed { exit_code: *exit_code, stage: *stage, elapsed: started.elapsed() }
+        }
     };
 
-    // Component dev images + data seeds still provision through the resource
-    // graph; only the runner image is already baked, so it rides in Prebaked.
+    // Component dev images + seeds still provision through the resource graph; only the
+    // runner image is already baked, so it rides in `Prebaked`
     let (images, seeds, images_by_binary, deps_by_binary, sync_by_binary) = match remote.dump {
         images::DumpOutcome::Discovered {
             images,
@@ -1180,15 +1014,8 @@ fn run_inner_on_cluster(
             deps_by_binary,
             sync_tests: _,
             sync_by_binary,
-        } => (
-            images,
-            seeds,
-            images_by_binary,
-            deps_by_binary,
-            sync_by_binary,
-        ),
-        // `compile_on_cluster` only ever returns `Discovered`, but handle the
-        // failure variant rather than unwrap.
+        } => (images, seeds, images_by_binary, deps_by_binary, sync_by_binary),
+        // `compile_on_cluster` only returns `Discovered`; handled rather than unwrapped
         images::DumpOutcome::Failed { detail } => {
             builder.teardown(work_rt, &client);
             if let Some(c) = console {
@@ -1215,13 +1042,12 @@ fn run_inner_on_cluster(
         theme,
         Some(cap_rx.clone()),
     );
-    // Set here rather than passed through `provision_and_resolve` (which has no
-    // use for it and several early returns): the edge then rides every path out.
+    // Set here, not through `provision_and_resolve` (no use for it, several early
+    // returns) → the edge rides every path out
     image_phase.sync_by_binary = sync_by_binary;
-    // Build phase done — drop the builder so neither its footprint nor the
-    // reservation covering it is held through the test run. Releasing here is what
-    // lets `launch_engine`'s own acquire see that capacity as free (reap_run is the
-    // backstop on the error/cancel paths).
+    // Build done → drop the builder so neither footprint nor reservation is held through
+    // the test run (this release is what lets `launch_engine`'s acquire see it free;
+    // `reap_run` backstops the error/cancel paths)
     builder.teardown(work_rt, &client);
     if cancelled() {
         return cancel_exit();
@@ -1234,15 +1060,11 @@ fn run_inner_on_cluster(
         state,
         console,
         run,
-        Preflight {
-            probe: &probe,
-            build: &build,
-            images: image_phase,
-        },
+        Preflight { probe: &probe, build: &build, images: image_phase },
     )
 }
 
-/// Clones only on the live path, so the static path stays borrow-only.
+/// Clones only on the live path (static path stays borrow-only)
 fn with_live_capacity<'a>(snap: &'a BannerState, cap: Option<&CapRx>) -> Cow<'a, BannerState> {
     match cap {
         Some(rx) => {
@@ -1274,13 +1096,13 @@ fn push_preflight_scene(
         ),
         mid: None,
         right: ui::render_transfers(&tx, elapsed, &theme),
-        // `None` → the live region derives from the avt grid (the child's output).
+        // `None` → live region derives from the avt grid (the child's output)
         live: None,
     });
 }
 
-/// The `Building`-phase scene; `live: None` so the region derives from the avt
-/// grid where every build streams its native output.
+/// `Building`-phase scene. `live: None` → region derives from the avt grid, where every
+/// build streams its native output
 fn push_building_scene(
     con: &Console,
     state: &BannerState,
@@ -1304,13 +1126,8 @@ fn push_building_scene(
     });
 }
 
-/// Build the scheduling plan for the preflight banner: fold the per-binary QoS
-/// dump into per-tier counts and estimate the wave structure against probed
-/// capacity. `None` when no QoS tests were declared.
-/// Drop the QoS declarations of tests that were excluded from the selection, so
-/// the wave estimate is a function of what will actually run. Sync profiles wear
-/// the top-priority `sync` tier, so leaving them in would shape the whole plan
-/// around a test the engine never admits.
+/// Drop excluded tests' QoS declarations → the wave estimate covers what will actually
+/// run (sync profiles wear the top-priority `sync` tier the engine never admits)
 fn prune_qos(
     qos_by_binary: &[(String, Vec<QosEntry>)],
     excluded: &[engine::plan::ExcludedSync],
@@ -1318,10 +1135,8 @@ fn prune_qos(
     if excluded.is_empty() {
         return qos_by_binary.to_vec();
     }
-    let dropped: std::collections::HashSet<(&str, &str)> = excluded
-        .iter()
-        .map(|e| (e.binary_id.as_str(), e.test_name.as_str()))
-        .collect();
+    let dropped: std::collections::HashSet<(&str, &str)> =
+        excluded.iter().map(|e| (e.binary_id.as_str(), e.test_name.as_str())).collect();
     qos_by_binary
         .iter()
         .map(|(binary_id, entries)| {
@@ -1338,8 +1153,8 @@ fn prune_qos(
         .collect()
 }
 
-/// The scrollback note naming each sync-tier test the run declined to execute
-/// and, for a profile, the command that does run it.
+/// Scrollback note naming each declined sync-tier test + (for a profile) the command
+/// that does run it
 fn sync_exclusion_notice(excluded: &[engine::plan::ExcludedSync]) -> String {
     use engine::plan::SyncExclusion;
 
@@ -1358,36 +1173,42 @@ fn sync_exclusion_notice(excluded: &[engine::plan::ExcludedSync]) -> String {
     note
 }
 
+/// Per-binary QoS dump → per-tier counts + a wave estimate against probed capacity;
+/// `None` when no QoS tests were declared
 fn qos_plan_from(
     qos_by_binary: &[(String, Vec<QosEntry>)],
     probe: &ProbeOutcome,
 ) -> Option<crate::qos::schedule::QosPlan> {
-    let mut counts: BTreeMap<crate::qos::QosClass, u32> = BTreeMap::new();
-    for (_binary_id, entries) in qos_by_binary {
-        for e in entries {
-            *counts.entry(e.class).or_insert(0) += 1;
-        }
-    }
-    if counts.is_empty() {
+    // One entry per declared test at its real submitted reserve
+    // (count-by-tier × footprint mis-states any run holding an override)
+    let tests: Vec<crate::qos::schedule::PlannedTest> = qos_by_binary
+        .iter()
+        .flat_map(|(_binary_id, entries)| entries.iter())
+        .map(|e| crate::qos::schedule::PlannedTest {
+            class: e.class,
+            admitted: e.profile().admitted(),
+        })
+        .collect();
+    if tests.is_empty() {
         return None;
     }
-    // Same free-capacity figure the engine scheduler is seeded from.
+    // Same free-capacity figure the engine scheduler is seeded from
     let ceiling = match probe {
         ProbeOutcome::Ok { capacity, .. } => Some(capacity.free()),
         _ => None,
     };
-    Some(crate::qos::schedule::plan(&counts, ceiling))
+    Some(crate::qos::schedule::plan(&tests, ceiling))
 }
 
-/// Combined outcome of Phase A (probe) and Phase B (build) from the pipeline.
+/// Phase A (probe) + Phase B (build) outcomes from the pipeline.
 #[derive(Debug)]
 struct PipelineOutcome {
     build: BuildOutcome,
     probe: ProbeOutcome,
 }
 
-/// Incremental update from the concurrent Phase A probe / archive discovery,
-/// pushed onto an mpsc and folded into [`BannerState`] (see [`apply_update`]).
+/// Incremental Phase A (probe / archive discovery) update, mpsc → [`BannerState`]
+/// (see [`apply_update`]).
 #[derive(Debug)]
 enum Update {
     Probe(ProbeOutcome),
@@ -1395,9 +1216,10 @@ enum Update {
     ArchivesSkipped,
 }
 
-/// Run Phase A (cluster probe + archive discovery) and Phase B
-/// (`cargo nextest list`) concurrently. TTY runs the compile under a PTY with
-/// the probe feeding the panel; non-TTY is linear with inherited stderr.
+/// Phase A (probe + archive discovery) concurrent with Phase B (`cargo nextest list`).
+///
+/// - TTY: compile under a PTY, probe feeding the panel
+/// - Non-TTY: linear, inherited stderr
 fn pipeline_phase(
     work_rt: &tokio::runtime::Runtime,
     list_args: &[String],
@@ -1412,9 +1234,8 @@ fn pipeline_phase(
     }
 }
 
-/// TTY pipeline: pass 1 emulated under a PTY with the probe running
-/// concurrently, then pass 2 (JSON index) captured. The concurrent update
-/// drain folds a mid-step probe result into the panel as a fresh scene.
+/// TTY pipeline: pass 1 emulated under a PTY (probe concurrent), then pass 2 (JSON
+/// index) captured. Update drain folds a mid-step probe result in as a fresh scene.
 fn pipeline_console(
     work_rt: &tokio::runtime::Runtime,
     list_args: &[String],
@@ -1426,8 +1247,8 @@ fn pipeline_console(
     use crate::ui::{BuildStage, BuildState};
 
     work_rt.block_on(async {
-        // Probe + archives feed the panel via the `Update` channel; the throwaway
-        // event channel just satisfies the pipeline fns' signature.
+        // Probe + archives feed the panel via `Update`; the throwaway event channel only
+        // satisfies the pipeline fns' signature
         let (upd_tx, mut upd_rx) = tokio::sync::mpsc::unbounded_channel::<Update>();
         let probe_handle = {
             let upd = upd_tx.clone();
@@ -1449,54 +1270,29 @@ fn pipeline_console(
         };
         drop(upd_tx);
 
-        // Pass 1 uses `run --no-run` rather than `list` because under a PTY the
-        // merged stdout/stderr would dump `list`'s full test listing into the
-        // view; `run --no-run` emits only compile output. Pass 2 does the index.
+        // Pass 1 = `run --no-run`, not `list` (under a PTY the merged stdout/stderr would
+        // dump the full test listing into the view); pass 2 does the index
         let started_at = Instant::now();
-        state.build = BuildState::Compiling {
-            started_at,
-            phase: None,
-        };
+        state.build = BuildState::Compiling { started_at, phase: None };
         push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme, None);
 
-        let mut args = vec![
-            "nextest".to_string(),
-            "run".to_string(),
-            "--no-run".to_string(),
-        ];
+        let mut args = vec!["nextest".to_string(), "run".to_string(), "--no-run".to_string()];
         args.extend(list_args.iter().cloned());
         let code = run_child_draining(con, "cargo", &args, &[], &mut upd_rx, state, theme).await?;
 
         let build = if code != 0 {
-            BuildOutcome::Failed {
-                exit_code: code,
-                stage: BuildStage::Compile,
-            }
+            BuildOutcome::Failed { exit_code: code, stage: BuildStage::Compile }
         } else {
-            // Pass 2, JSON index: cargo's metadata/freshness pass is multi-second
-            // even warm and emits no output; the drain is only so a late probe
-            // result still lands.
-            state.build = BuildState::Indexing {
-                started_at: Instant::now(),
-            };
+            // Pass 2, JSON index: cargo's metadata/freshness pass is multi-second even warm
+            // and silent; the drain only exists so a late probe result still lands
+            state.build = BuildState::Indexing { started_at: Instant::now() };
             push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme, None);
-            drive_draining(
-                pipeline::build::index(list_args),
-                &mut upd_rx,
-                con,
-                state,
-                theme,
-            )
-            .await?
+            drive_draining(pipeline::build::index(list_args), &mut upd_rx, con, state, theme)
+                .await?
         };
 
-        // Reflect the build outcome into the panel state.
         state.build = match &build {
-            BuildOutcome::Ok {
-                test_count,
-                binary_count,
-                ..
-            } => BuildState::Ok {
+            BuildOutcome::Ok { test_count, binary_count, .. } => BuildState::Ok {
                 test_count: *test_count,
                 binary_count: *binary_count,
                 elapsed: started_at.elapsed(),
@@ -1508,23 +1304,21 @@ fn pipeline_console(
             },
         };
 
-        // Fold any late probe/archive updates, then refresh. Deliberately do NOT
-        // flush the live region: leaving cargo's final frame lets the next child's
-        // output continue on the same grid, a seamless handoff.
+        // Fold late probe/archive updates, then refresh. Do NOT flush the live region:
+        // cargo's final frame left in place lets the next child continue on the same grid.
         while let Ok(u) = upd_rx.try_recv() {
             apply_update(state, u);
         }
         push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme, None);
 
-        let probe = probe_handle
-            .await
-            .map_err(|e| std::io::Error::other(format!("Phase A: {e}")))?;
+        let probe =
+            probe_handle.await.map_err(|e| std::io::Error::other(format!("Phase A: {e}")))?;
         Ok(PipelineOutcome { build, probe })
     })
 }
 
-/// Run a PTY child to completion while folding concurrent probe/archive updates
-/// into fresh panel scenes.
+/// Drive a PTY child to completion, folding concurrent probe/archive updates into
+/// fresh panel scenes
 async fn run_child_draining(
     con: &Console,
     program: &str,
@@ -1551,8 +1345,8 @@ async fn run_child_draining(
     }
 }
 
-/// Drive a future to completion while folding concurrent probe/archive updates
-/// into fresh panel scenes.
+/// Drive a future to completion, folding concurrent probe/archive updates into fresh
+/// panel scenes
 async fn drive_draining<F: std::future::Future>(
     fut: F,
     upd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Update>,
@@ -1576,16 +1370,13 @@ async fn drive_draining<F: std::future::Future>(
     }
 }
 
-/// Non-TTY pipeline: probe + the two-pass build run concurrently with inherited
-/// stderr (cargo's plain output goes straight to the log); no panel.
+/// Non-TTY pipeline: probe + two-pass build, concurrent, inherited stderr (cargo's
+/// plain output straight to the log), no panel
 fn pipeline_inherited(
     list_args: &[String],
     state: &mut BannerState,
 ) -> std::io::Result<PipelineOutcome> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(3)
-        .build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(3).build()?;
     let list_args = list_args.to_vec();
 
     rt.block_on(async move {
@@ -1631,9 +1422,8 @@ fn pipeline_inherited(
             }
         }
 
-        let probe = cluster_handle
-            .await
-            .map_err(|e| std::io::Error::other(format!("Phase A: {e}")))?;
+        let probe =
+            cluster_handle.await.map_err(|e| std::io::Error::other(format!("Phase A: {e}")))?;
         let build = build_handle
             .await
             .map_err(|e| std::io::Error::other(format!("Phase B join: {e}")))?
@@ -1643,54 +1433,38 @@ fn pipeline_inherited(
     })
 }
 
-/// Translate a build-lifecycle [`pipeline::events::Event`] into a mutation on
-/// `state.build`, reusing the `BuildStarted` `started_at` for elapsed time.
+/// Build-lifecycle [`pipeline::events::Event`] → mutation on `state.build`, reusing the
+/// `BuildStarted` `started_at` for elapsed
 fn apply_event(state: &mut BannerState, event: pipeline::events::Event) {
     use crate::ui::BuildState;
     use pipeline::events::Event;
 
     match event {
         Event::BuildStarted => {
-            state.build = BuildState::Compiling {
-                started_at: std::time::Instant::now(),
-                phase: None,
-            };
+            state.build =
+                BuildState::Compiling { started_at: std::time::Instant::now(), phase: None };
         }
         Event::BuildIndexing => {
-            // Preserve the original `started_at` so the clock measures the whole
-            // Phase B, not just pass 2.
+            // Original `started_at` preserved → clock measures all of Phase B, not pass 2
             let started_at = match &state.build {
                 BuildState::Compiling { started_at, .. } => *started_at,
                 _ => std::time::Instant::now(),
             };
             state.build = BuildState::Indexing { started_at };
         }
-        Event::BuildComplete {
-            test_count,
-            binary_count,
-        } => {
+        Event::BuildComplete { test_count, binary_count } => {
             let elapsed = phase_b_elapsed(&state.build);
-            state.build = BuildState::Ok {
-                test_count,
-                binary_count,
-                elapsed,
-            };
+            state.build = BuildState::Ok { test_count, binary_count, elapsed };
         }
         Event::BuildFailed { exit_code, stage } => {
             let elapsed = phase_b_elapsed(&state.build);
-            state.build = BuildState::Failed {
-                exit_code,
-                stage,
-                elapsed,
-            };
+            state.build = BuildState::Failed { exit_code, stage, elapsed };
         }
-        // Phase A events flow through the `Update` channel; duplicates here are
-        // ignored.
+        // Phase A events arrive on the `Update` channel; duplicates here ignored
         Event::ProbeStarted | Event::ProbeComplete | Event::ProbeFailed => {}
     }
 }
 
-/// Phase B elapsed time from whichever ticking variant the state is in.
 fn phase_b_elapsed(build: &crate::ui::BuildState) -> std::time::Duration {
     use crate::ui::BuildState;
     match build {
@@ -1728,13 +1502,9 @@ fn apply_update(state: &mut BannerState, upd: Update) {
                 .map(|e| ArchiveRow {
                     name: e.name,
                     status: if e.ready {
-                        ArchiveStatus::Cached {
-                            size_bytes: e.size_bytes,
-                        }
+                        ArchiveStatus::Cached { size_bytes: e.size_bytes }
                     } else {
-                        ArchiveStatus::Missing {
-                            detail: "not yet ready".to_string(),
-                        }
+                        ArchiveStatus::Missing { detail: "not yet ready".to_string() }
                     },
                 })
                 .collect();
@@ -1754,36 +1524,27 @@ fn apply_update(state: &mut BannerState, upd: Update) {
     }
 }
 
-/// Everything the image/resource phase hands the run phase: the QoS dump plus
-/// the dependency edges and provisioned states the engine gates admission on.
+/// What the image/resource phase hands the run phase: QoS dump + the dependency edges
+/// and provisioned states the engine gates admission on.
+///
+/// - `sync_by_binary` = subtracted from the selection (owned by `ztest sync start`)
+/// - `runner_image` / `image_refs` = remote runs only; `None` runner → in-process
 #[derive(Debug, Default)]
 struct ImagePhaseOutcome {
-    /// Fatal setup failure detail (dump/plan failure), if any — the run aborts.
     failure: Option<String>,
-    /// Per-binary QoS tier declarations harvested from the same dump.
     qos_by_binary: Vec<(String, Vec<QosEntry>)>,
-    /// Per-binary `#[ztest::sync_test]` profiles from the same dump. `ztest run`
-    /// subtracts these — and everything else wearing the `sync` tier — from the
-    /// selection: their lifecycle owner is `ztest sync start`, never the engine.
     sync_by_binary: Vec<(String, Vec<crate::inventory::SyncTestEntry>)>,
-    /// Resource dependency edges (binary images + per-test seeds) for the engine.
     resource_deps: crate::engine::plan::ResourceDeps,
-    /// Provisioned resource states (node → state) the engine gates admission on.
     resource_states: std::collections::HashMap<crate::resource::NodeId, crate::resource::NodeState>,
-    /// Pull reference of the built runner image, when this is a remote run — the
-    /// engine runs each test in a pod from it. `None` → local-process execution.
     runner_image: Option<String>,
-    /// Resolved `spec_key → pull reference` for dev component images, forwarded
-    /// into each runner pod so an in-pod test resolves them without rebuilding.
-    /// Populated only for remote runs.
     image_refs: std::collections::BTreeMap<String, String>,
 }
 
-/// Run the inventory-driven image phase: the Phase C dump learns which dev
-/// images and seeds the selected tests need, then the resource graph provisions
-/// each (skipping anything already present). Returns the per-binary QoS
-/// declarations plus the dependency edges and provisioned states the engine
-/// gates on. Provisioning is serial (see [`provision_and_resolve`]).
+/// Inventory-driven image phase: Phase C dump names the dev images + seeds the selection
+/// needs, resource graph provisions each (skipping what is present).
+///
+/// - Returns per-binary QoS + the dependency edges and states the engine gates on
+/// - Provisioning is serial (see [`provision_and_resolve`])
 fn run_image_phases(
     work_rt: &tokio::runtime::Runtime,
     binaries: &[pipeline::SelectedBinary],
@@ -1794,9 +1555,8 @@ fn run_image_phases(
 ) -> ImagePhaseOutcome {
     use crate::pipeline::images;
 
-    // Phase C, inventory dump: spawns every test binary with
-    // `ZTEST_DUMP_INVENTORY=1`, yielding the deduped dev images and seeds the
-    // selection declares plus the per-binary/per-test edges.
+    // Phase C, inventory dump: every test binary spawned with `ZTEST_DUMP_INVENTORY=1` →
+    // deduped dev images + seeds the selection declares, plus the per-binary/per-test edges
     let (outcome, qos_by_binary) = work_rt.block_on(images::discover(binaries));
     let (images, seeds, images_by_binary, deps_by_binary, sync_by_binary) = match outcome {
         images::DumpOutcome::Discovered {
@@ -1806,13 +1566,7 @@ fn run_image_phases(
             deps_by_binary,
             sync_tests: _,
             sync_by_binary,
-        } => (
-            images,
-            seeds,
-            images_by_binary,
-            deps_by_binary,
-            sync_by_binary,
-        ),
+        } => (images, seeds, images_by_binary, deps_by_binary, sync_by_binary),
         images::DumpOutcome::Failed { detail } => {
             return ImagePhaseOutcome {
                 failure: Some(detail),
@@ -1822,8 +1576,8 @@ fn run_image_phases(
         }
     };
 
-    // Local kind only: compute is on this machine, so tests run in-process —
-    // no runner image. (OpenShift bakes the runner in a separate path.)
+    // Local kind only: compute is on this machine → in-process, no runner image (a remote
+    // cluster bakes the runner on a separate path)
     let mut phase = provision_and_resolve(
         work_rt,
         images,
@@ -1842,20 +1596,19 @@ fn run_image_phases(
     phase
 }
 
-/// Where the runner image (the pod-per-test image carrying the compiled test
-/// binaries) comes from.
+/// Where the runner image (pod-per-test image carrying the compiled binaries) comes from.
+///
+/// - `None` = local, in-process
+/// - `Prebaked` = pull ref the on-cluster builder already pushed
 enum RunnerSource {
-    /// No runner image — local kind runs tests in-process on this machine.
     None,
-    /// Already pushed to the registry by the on-cluster builder; carries the pull
-    /// reference the runner pods use.
     Prebaked(String),
 }
 
-/// Provision the component dev images + data seeds a selection declares and
-/// resolve the engine's admission inputs (dependency edges, provisioned states,
-/// image refs, runner image ref). Shared by both compile paths, which differ
-/// only in where the runner image came from ([`RunnerSource`]).
+/// Provision the selection's dev images + seeds, resolve the engine's admission inputs
+/// (dependency edges, states, image refs, runner ref).
+///
+/// - Shared by both compile paths, which differ only in [`RunnerSource`]
 #[allow(clippy::too_many_arguments)]
 fn provision_and_resolve(
     work_rt: &tokio::runtime::Runtime,
@@ -1865,13 +1618,12 @@ fn provision_and_resolve(
     deps_by_binary: Vec<(String, Vec<crate::inventory::TestDepEntry>)>,
     qos_by_binary: Vec<(String, Vec<QosEntry>)>,
     runner: RunnerSource,
-    // The ephemeral BuildKit pod component-image builds exec against (on-cluster
-    // path); `None` on the local/kind path, which builds no images on a pod.
+    // BuildKit pod component-image builds exec against; `None` on the local/kind path
     build_pod: Option<String>,
     console: Option<&Console>,
     state: &mut BannerState,
     theme: &Theme,
-    // `Some` on the on-cluster path, where the build pod is still scheduled here.
+    // `Some` on the on-cluster path, where the build pod is still scheduled here
     cap_rx: Option<CapRx>,
 ) -> ImagePhaseOutcome {
     use crate::resource;
@@ -1879,47 +1631,36 @@ fn provision_and_resolve(
 
     let cancelled = || console.is_some_and(Console::cancelled);
 
-    // Survives the no-resources short-circuit below: an on-cluster run with no
-    // component images / seeds still has a runner to run.
+    // Survives the no-resources short-circuit below (an on-cluster run with no components
+    // still has a runner to run)
     let prebaked = match &runner {
         RunnerSource::Prebaked(r) => Some(r.clone()),
         RunnerSource::None => None,
     };
 
     if (images.is_empty() && seeds.is_empty()) || cancelled() {
-        return ImagePhaseOutcome {
-            qos_by_binary,
-            runner_image: prebaked,
-            ..Default::default()
-        };
+        return ImagePhaseOutcome { qos_by_binary, runner_image: prebaked, ..Default::default() };
     }
 
-    // Commit the compile's final frame and blank the live region so
-    // provisioning's build output lands on a clean grid.
+    // Commit the compile's final frame + blank the live region → provisioning output lands
+    // on a clean grid
     if let Some(c) = console {
         c.flush_live();
         push_building_scene(c, state, &Transfers::default(), theme, cap_rx.clone());
     }
 
-    // Plan the resource graph (images + seeds) and provision it. `probe` skips
-    // resources already present; cap 1 keeps the console's single live region
-    // coherent across serial `docker`/`kind` children. Seeds need a cluster
-    // client, built here (cheap, pooled) — the probe already validated the
-    // cluster exists.
+    // Plan the resource graph (images + seeds), then provision.
+    //
+    // - `probe` skips what is already present
+    // - cap 1 keeps the single live region coherent across serial `docker`/`kind` children
     let graph = match resource::plan_runtime(&images, &seeds) {
         Ok(g) => g,
         Err(e) => {
-            return ImagePhaseOutcome {
-                failure: Some(e),
-                qos_by_binary,
-                ..Default::default()
-            };
+            return ImagePhaseOutcome { failure: Some(e), qos_by_binary, ..Default::default() };
         }
     };
-    // Runtime provisioning needs a live client (the seeds provider talks to
-    // the API server). If we can't reach the cluster the graph produces
-    // structured Failed states for every seed node — the caller renders
-    // and moves on rather than crashing here.
+    // Seeds provider talks to the API server → live client (cheap, pooled). Unreachable
+    // cluster yields Failed states per seed node; the caller renders them and moves on.
     let client = match work_rt.block_on(crate::cluster::client()) {
         Ok(c) => c,
         Err(e) => {
@@ -1931,10 +1672,9 @@ fn provision_and_resolve(
         }
     };
 
-    // Provision through the shared driver: a sequential (cap 1) topological walk
-    // that streams each build's native output through the emulator grid and folds
-    // lifecycle + sub-phase events into the right-column tracker. Each transfer
-    // change repaints the `Building` panel from this run's banner state.
+    // Shared driver: sequential (cap 1) topological walk, each build's native output through
+    // the emulator grid, lifecycle + sub-phase events into the right-column tracker (every
+    // transfer change repaints `Building` from this run's banner state)
     let resource_states = work_rt.block_on(provision_with_tracker(
         &graph,
         client,
@@ -1947,29 +1687,20 @@ fn provision_and_resolve(
         },
     ));
 
-    // Resolve the dependency edges to their node ids (the same ids the graph
-    // provisioned), so the engine can gate each test on the states above. Image
-    // ids key the binary-level edge; seed ids (content-addressed by source) key
-    // the per-test edge from `#[ztest::archive]`/`#[needs]`.
+    // Dependency edges → the node ids the graph provisioned, so the engine gates each test
+    // on the states above. Image ids key the binary edge; seed ids (content-addressed by
+    // source) key the per-test edge from `#[ztest::archive]`/`#[needs]`.
     let mut resource_deps = crate::engine::plan::ResourceDeps::default();
     for (binary_id, entries) in &images_by_binary {
-        let ids: Vec<_> = entries
-            .iter()
-            .filter_map(|e| resource::image_node_id(e).ok())
-            .collect();
+        let ids: Vec<_> = entries.iter().filter_map(|e| resource::image_node_id(e).ok()).collect();
         if !ids.is_empty() {
-            resource_deps
-                .images_by_binary
-                .insert(binary_id.clone(), ids);
+            resource_deps.images_by_binary.insert(binary_id.clone(), ids);
         }
     }
-    // OID → seed node id, from the seeds we planned. A test edge names its
-    // resource by OID (identical to the `SeedDecl` the same macro submits), so
-    // this map resolves it to the provisioned node with no re-derivation.
-    let seed_id_by_source: HashMap<&str, crate::resource::NodeId> = seeds
-        .iter()
-        .map(|e| (e.oid.as_str(), resource::seed_node_id(e)))
-        .collect();
+    // OID → seed node id. A test edge names its resource by OID (same as the `SeedDecl` the
+    // macro submits) → resolved to the provisioned node with no re-derivation.
+    let seed_id_by_source: HashMap<&str, crate::resource::NodeId> =
+        seeds.iter().map(|e| (e.oid.as_str(), resource::seed_node_id(e))).collect();
     for (binary_id, deps) in &deps_by_binary {
         for dep in deps {
             if let Some(id) = seed_id_by_source.get(dep.resource.as_str()) {
@@ -1977,37 +1708,21 @@ fn provision_and_resolve(
                     binary_id.clone(),
                     crate::engine::plan::libtest_name(&dep.test_id).to_string(),
                 );
-                resource_deps
-                    .seeds_by_test
-                    .entry(key)
-                    .or_default()
-                    .push(id.clone());
+                resource_deps.seeds_by_test.entry(key).or_default().push(id.clone());
             }
         }
     }
 
-    // Failure isolation (the graph's whole point): a resource that fails to
-    // provision does NOT abort the run — the engine now SKIPS only the tests that
-    // declared it (`SkipReason::DependencyUnavailable`), and every unaffected test
-    // still runs. We surface each failure into scrollback so the cause is visible
-    // above the panel.
+    // Failure isolation (the graph's point): a failed resource skips only its declarants
+    // (`SkipReason::DependencyUnavailable`), never the run; cause into scrollback.
     //
-    // Dev-image build failures are called out distinctly and ALWAYS printed to
-    // stderr (not just the live scrollback, which can scroll off): a failed dev
-    // image means the tests that declared it are skipped, and — critically —
-    // they do NOT silently fall back to a published image (`resolve` returns
-    // `DevImageMissing`, and `probe` never substitutes a different tag). A silent
-    // fallback is exactly how a `dev!(Validator::Zebrad, …)` build failure used
-    // to masquerade as a downstream consensus error (wrong branch id) instead of
-    // the real cause. The `{detail}` carries the underlying `ImageError`
-    // (docker-build stderr tail / git-fetch failure), so the reason is visible.
+    // Dev-image failures are called out distinctly: they do NOT fall back to a published
+    // image (`resolve` → `DevImageMissing`, `probe` never substitutes a tag), which is how
+    // a `dev!(Validator::Zebrad, …)` failure used to masquerade as a consensus error.
+    // `{detail}` carries the underlying `ImageError` (build stderr tail / fetch failure).
     let image_node_ids: std::collections::BTreeSet<crate::resource::NodeId> = images_by_binary
         .iter()
-        .flat_map(|(_, entries)| {
-            entries
-                .iter()
-                .filter_map(|e| resource::image_node_id(e).ok())
-        })
+        .flat_map(|(_, entries)| entries.iter().filter_map(|e| resource::image_node_id(e).ok()))
         .collect();
     for (id, st) in &resource_states {
         if let NodeState::Failed(detail) = st {
@@ -2022,10 +1737,9 @@ fn provision_and_resolve(
                     "resource {id:?} failed to provision ({detail}); tests needing it will be skipped"
                 )
             };
-            // Route through the console's durable scrollback, never a raw
-            // `eprintln` — the render thread owns the terminal, so a direct
-            // stderr write smears across the live panel (and its teardown can
-            // wipe it). Off a TTY there's no render thread, so `eprintln` is right.
+            // Durable scrollback, never a raw `eprintln` (render thread owns the terminal;
+            // a direct write smears across the panel and teardown can wipe it). Off a TTY
+            // there is no render thread → `eprintln`.
             match console {
                 Some(c) => c.scrollback(format!("ztest: {msg}\n")),
                 None => eprintln!("ztest run: {msg}"),
@@ -2033,17 +1747,14 @@ fn provision_and_resolve(
         }
     }
 
-    // The build manifest (`DevImageId → pull reference`) for every dev image
-    // present after provisioning, seeded process-globally here (for local kind,
-    // where preflight and tests share a process) and forwarded into each remote
-    // runner pod via `ZTEST_IMAGE_REFS`. The `ztest sync` controller derives the
-    // same map from the same helper.
+    // Build manifest (`DevImageId → pull ref`) for every provisioned dev image: seeded
+    // process-globally (local kind shares a process with the tests) and forwarded to each
+    // remote runner pod via `ZTEST_IMAGE_REFS`
     let image_refs = resource::dev_image_refs(&images_by_binary, &resource_states);
     crate::backends::image::seed_dev_images(&image_refs);
 
-    // Resolve the runner image's pull reference. A prebaked (on-cluster) runner
-    // was already built + pushed by the on-cluster buildkit build, so its ref
-    // passes straight through; local kind has no runner (tests run in-process).
+    // Prebaked ref passes straight through (already built + pushed on-cluster); local kind
+    // has no runner at all
     let runner_image = match runner {
         RunnerSource::Prebaked(r) => Some(r),
         RunnerSource::None => None,
@@ -2060,13 +1771,8 @@ fn provision_and_resolve(
     }
 }
 
-/// Walk up from the current working directory looking for a `Cargo.toml`.
-/// Returns `Ok(())` as soon as one is found; `Err(detail)` describes the failure
-/// in user-facing language.
-///
-/// Done ourselves rather than shelling out to `cargo locate-project` so the
-/// check costs microseconds and adds nothing to startup on the common
-/// (in-workspace) path.
+/// Walk up from cwd for a `Cargo.toml`; `Err(detail)` is user-facing. In-process rather
+/// than `cargo locate-project` (the common in-workspace path costs nothing at startup)
 fn locate_cargo_workspace() -> Result<(), String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("could not read current working directory: {e}"))?;
@@ -2075,10 +1781,7 @@ fn locate_cargo_workspace() -> Result<(), String> {
             return Ok(());
         }
     }
-    Err(format!(
-        "no Cargo.toml found in {} or any ancestor directory",
-        cwd.display()
-    ))
+    Err(format!("no Cargo.toml found in {} or any ancestor directory", cwd.display()))
 }
 
 fn build_initial_state(opts: &RunOptions) -> BannerState {
@@ -2112,17 +1815,13 @@ mod tests {
 
     #[test]
     fn forwards_selection_and_filter_flags_verbatim() {
-        // Selection / filter flags are not interpreted, just passed through.
         let o = parse(&["-p", "wallet-tests", "--lib", "-E", "test(reorg)"]);
-        assert_eq!(
-            o.list_args,
-            v(&["-p", "wallet-tests", "--lib", "-E", "test(reorg)"])
-        );
+        assert_eq!(o.list_args, v(&["-p", "wallet-tests", "--lib", "-E", "test(reorg)"]));
     }
 
     #[test]
     fn strips_engine_owned_flags_from_list_args() {
-        // Engine-owned run-behavior flags must not reach `cargo nextest list`.
+        // Engine-owned run-behavior flags must not reach `cargo nextest list`
         let o = parse(&[
             "-p",
             "wt",
@@ -2144,15 +1843,8 @@ mod tests {
     #[test]
     fn output_flags_parse_into_display_policy() {
         use crate::engine::output::TestOutputDisplay;
-        let o = parse(&[
-            "-p",
-            "wt",
-            "--success-output",
-            "final",
-            "--failure-output",
-            "never",
-        ]);
-        // Stripped from the list argv (nextest `list` rejects run-only flags).
+        let o = parse(&["-p", "wt", "--success-output", "final", "--failure-output", "never"]);
+        // Stripped from the list argv (`list` rejects run-only flags)
         assert_eq!(o.list_args, v(&["-p", "wt"]));
         let cfg = o.output_config();
         assert_eq!(cfg.success, TestOutputDisplay::Final);
@@ -2170,8 +1862,7 @@ mod tests {
     #[test]
     fn explicit_success_output_survives_no_capture() {
         use crate::engine::output::TestOutputDisplay;
-        // An explicit `--success-output` wins over `--no-capture`'s implied
-        // `immediate` (nextest only forces the ones not otherwise set).
+        // Explicit `--success-output` beats `--no-capture`'s implied `immediate`
         let cfg = parse(&["--no-capture", "--success-output", "final"]).output_config();
         assert_eq!(cfg.success, TestOutputDisplay::Final);
         assert!(cfg.is_serial());
@@ -2179,15 +1870,11 @@ mod tests {
 
     #[test]
     fn fail_fast_defaults_off_and_opts_in() {
-        // Regression for the scheduling incident: with fail-fast ON, the first
-        // failure abandoned the queued majority (only the initial ~9-wide
-        // capacity wave ran out of 122 selected). ztest defaults fail-fast OFF:
-        // the whole suite is packed and every result reported.
+        // Fail-fast ON abandoned the queued majority on the first failure (9 of 122 ran)
         assert!(!parse(&["-p", "wt"]).fail_fast, "default must be OFF");
-        // `--fail-fast` / `--ff` opt back into stop-on-first-failure.
         assert!(parse(&["-p", "wt", "--fail-fast"]).fail_fast);
         assert!(parse(&["-p", "wt", "--ff"]).fail_fast);
-        // Explicit `--no-fail-fast` matches the default (and still strips).
+        // Explicit `--no-fail-fast` matches the default (and still strips)
         assert!(!parse(&["-p", "wt", "--no-fail-fast"]).fail_fast);
     }
 
@@ -2200,7 +1887,7 @@ mod tests {
 
     #[test]
     fn no_cleanup_after_double_dash_is_a_filter_positional() {
-        // After `--`, tokens are nextest filter positionals: forwarded verbatim.
+        // Post-`--` tokens = nextest filter positionals, forwarded verbatim
         let o = parse(&["--", "--no-cleanup"]);
         assert!(!o.no_cleanup);
         assert_eq!(o.list_args, v(&["--", "--no-cleanup"]));
@@ -2208,13 +1895,9 @@ mod tests {
 
     #[test]
     fn profile_forwards_verbatim() {
-        // `--profile`/`-P` is not interpreted by ztest; it forwards to both
-        // `cargo nextest list` (here) and `cargo nextest run` (verbatim args), so
-        // nextest resolves the profile. Both spelling forms.
-        assert_eq!(
-            parse(&["-P", "ci", "-p", "x"]).list_args,
-            v(&["-P", "ci", "-p", "x"])
-        );
+        // `--profile`/`-P` uninterpreted → forwarded to both `list` and `run`, so nextest
+        // resolves it; both spelling forms
+        assert_eq!(parse(&["-P", "ci", "-p", "x"]).list_args, v(&["-P", "ci", "-p", "x"]));
         assert_eq!(parse(&["--profile=ci"]).list_args, v(&["--profile=ci"]));
     }
 
@@ -2227,8 +1910,7 @@ mod tests {
 
     #[test]
     fn strips_run_only_flags_that_list_rejects() {
-        // `cargo nextest list` rejects these run-only flags; they must never
-        // reach it (they did before M4.5, breaking Phase B). Selection survives.
+        // `cargo nextest list` rejects these; reaching it breaks Phase B. Selection survives.
         let o = parse(&[
             "-p",
             "wt",
@@ -2245,11 +1927,7 @@ mod tests {
             "--archive-file",
             "/tmp/a.tar.zst",
         ]);
-        assert_eq!(
-            o.list_args,
-            v(&["-p", "wt"]),
-            "only selection reaches `nextest list`"
-        );
+        assert_eq!(o.list_args, v(&["-p", "wt"]), "only selection reaches `nextest list`");
         assert_eq!(o.no_tests.as_deref(), Some("warn"));
     }
 
@@ -2263,15 +1941,8 @@ mod tests {
 
     #[test]
     fn unsupported_flags_are_recorded_for_warning() {
-        // Behavior-changing run-only flags are surfaced; display-only ones aren't.
-        let o = parse(&[
-            "--archive-file",
-            "/a",
-            "--debugger",
-            "gdb",
-            "--status-level",
-            "all",
-        ]);
+        // Behavior-changing run-only flags surface; display-only ones do not
+        let o = parse(&["--archive-file", "/a", "--debugger", "gdb", "--status-level", "all"]);
         assert!(o.unsupported.contains(&"--archive-file".to_string()));
         assert!(o.unsupported.contains(&"--debugger".to_string()));
         assert!(

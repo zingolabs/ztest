@@ -1,6 +1,5 @@
-//! The public entry points into the resource layer: every caller (`ztest
-//! setup`, `ztest run`, the Ctrl-C reaper) flows through one of these; the
-//! providers and graph mechanics are implementation details behind them.
+//! Public entry points into the resource layer — `ztest cluster setup`, `ztest run` and the
+//! Ctrl-C reaper all flow through one of these; providers and graph mechanics sit behind
 
 use std::collections::HashMap;
 
@@ -13,39 +12,25 @@ use crate::inventory::{DevImageEntry, SeedEntry};
 use crate::qos;
 use crate::resource::context::Cx;
 use crate::resource::graph::{Graph, GraphError};
-use crate::resource::impls::storage::StorageProfile;
-use crate::resource::impls::{
-    buildkit, image, mirror, monitoring, policy, scaffolding, seed, storage,
-};
-use crate::resource::provider::{NodeId, Provider};
+use crate::resource::impls::{buildkit, image, observability, policy, scaffolding, seed};
+use crate::resource::provider::NodeId;
 use crate::resource::state::NodeState;
 
-/// Options for [`initialize`]. Non-exhaustive; construct via
-/// `..Default::default()`.
+/// Options for [`initialize`]. Non-exhaustive; construct via `..Default::default()`.
+///
+/// - `no_wait` returns once objects exist, pushing rollout waits onto the first test run
+/// - `label_nvme_pool` blanket-labels every node → must be `false` on multi-node clusters
+///   (there the operator owns which nodes carry NVMe)
+/// - `observability` = the one node worth declining (a cluster with its own
+///   Prometheus/Pyroscope wants `--no-observability` + the endpoints configured)
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct InitializeOpts {
-    /// Return as soon as objects exist rather than wait for Deployments /
-    /// StatefulSets to become Ready (default `false`); the first test run then
-    /// blocks on the rollout instead.
     pub no_wait: bool,
-
-    /// Concurrency cap for provider execution (default 8). A TTY caller that
-    /// wants a coherent single-line UI can pass 1.
     pub max_concurrent: usize,
-
-    /// Storage substrate to provision the ztest StorageClasses on.
-    pub storage: StorageProfile,
-
-    /// Blanket-label every node with the NVMe pool label. `false` on real
-    /// multi-node clusters, where the operator owns which nodes carry NVMe.
     pub label_nvme_pool: bool,
-
-    /// The active image backend. Selects which policy nodes are provisioned: an
-    /// OpenShift backend adds the SCC grant, the internal-registry project, and
-    /// the on-cluster builder, and gates the OpenShift-only run rules. The run
-    /// identity (SA + token) is always provisioned.
-    pub backend: crate::cluster_config::ImageBackend,
+    pub backend: crate::cluster_config::ClusterClass,
+    pub observability: bool,
 }
 
 impl Default for InitializeOpts {
@@ -53,22 +38,23 @@ impl Default for InitializeOpts {
         Self {
             no_wait: false,
             max_concurrent: 8,
-            storage: StorageProfile::HostpathFixtures,
             label_nvme_pool: true,
-            backend: crate::cluster_config::ImageBackend::Kind,
+            // From the activated profile, never a constant: `..Default::default()` is the
+            // documented constructor, so a fixed value silently applies another profile's
+            // run rules
+            backend: crate::backends::image::selected_class(),
+            observability: true,
         }
     }
 }
 
-/// Bring the cluster up to the state ztest requires: assembles the
-/// cluster-infrastructure graph and provisions it in dependency order.
+/// Bring the cluster to the state ztest requires: assemble the infrastructure graph,
+/// provision it in dependency order.
 ///
-/// **Idempotent** — providers probe and skip resources already Ready, so it is
-/// safe to re-run against a partially-set-up cluster. **Failure-isolated** — a
-/// failed provider blocks its dependents but not its siblings; the returned
-/// [`NodeState`] map lets the caller decide the exit code.
-///
-/// `on_change` fires on every state transition; pass `|_,_| {}` for a silent run.
+/// - **Idempotent** — providers probe and skip anything already Ready
+/// - **Failure-isolated** — a failed provider blocks dependents, not siblings; the
+///   returned [`NodeState`] map is the caller's exit-code input
+/// - `on_change` fires per state transition (`|_,_| {}` for a silent run)
 pub async fn initialize<F>(
     client: Client,
     opts: InitializeOpts,
@@ -79,18 +65,13 @@ where
 {
     let mut graph = Graph::new();
 
-    // Namespaces first (RBAC binds against them).
-    graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(
-        crate::seeds::SEEDS_NAMESPACE,
-    )));
-    // The QoS cross-run ledger's namespace. A fixed, once-ever cluster object, so
-    // setup owns it — `ztest run` (the minimal run SA) only reads it and writes
-    // Leases inside it, never creating the namespace itself.
-    graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(
-        qos::ledger::META_NAMESPACE,
-    )));
+    // Namespaces first (RBAC binds against them)
+    graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(crate::seeds::SEEDS_NAMESPACE)));
+    // QoS cross-run ledger's namespace: a once-ever cluster object → setup owns it, and
+    // the minimal run SA only reads it and writes Leases inside
+    graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(qos::ledger::META_NAMESPACE)));
 
-    // Node labeling (NVMe pool selector). Independent of everything else.
+    // Node labeling (NVMe pool selector), independent of everything else
     if opts.label_nvme_pool {
         graph.add_dedup(Box::new(scaffolding::NodeLabelProvider::new(
             qos::NVME_NODE_LABEL_KEY,
@@ -98,77 +79,46 @@ where
         )));
     }
 
-    // Storage stack.
-    for p in storage::providers(&opts.storage) {
-        graph.add_dedup(p);
-    }
-
-    // Run identity (SA + RBAC + token) + OpenShift policy (SCC, registry).
-    // Namespaces the policy providers depend on:
-    graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(
-        policy::RUN_NAMESPACE,
-    )));
-    if opts.backend.is_openshift() {
-        graph.add_dedup(Box::new(scaffolding::NamespaceProvider::new(
-            policy::IMAGES_NAMESPACE,
-        )));
-    }
+    // Run identity (SA + RBAC + token). Its namespace carries `privileged` Pod Security —
+    // the rootless BuildKit pod's unconfined seccomp/AppArmor needs it to pass admission
+    graph.add_dedup(Box::new(
+        scaffolding::NamespaceProvider::new(policy::RUN_NAMESPACE).pod_security_privileged(),
+    ));
     for p in policy::providers(opts.backend) {
         graph.add_dedup(p);
     }
 
-    // On-cluster build scaffolding (OpenShift targets): the BuildKit SCC/SA/
-    // ConfigMap/cache PVC (no long-lived Deployment — the build pod is ephemeral,
-    // created below), plus the registry mirror.
-    if opts.backend.is_openshift() {
-        graph.add_dedup(Box::new(buildkit::BuildkitProvider));
-        graph.add_dedup(Box::new(mirror::ImageMirrorProvider));
-        // The metrics plane's cluster precondition: UWM must be enabled to scrape
-        // per-test component `/metrics`, and the run SA needs thanos read access.
-        graph.add_dedup(Box::new(monitoring::UserWorkloadMonitoringProvider));
+    // On-cluster build scaffolding: BuildKit SA / ConfigMap / cache PVC. No long-lived
+    // Deployment (`ztest run` creates the build pod per build). Plain k8s → every cluster
+    graph.add_dedup(Box::new(buildkit::BuildkitProvider));
+
+    // Metrics stack: the one *standing* workload here, with a real footprint → the one
+    // node whose absence is a choice rather than an oversight
+    if opts.observability {
+        graph
+            .add_dedup(Box::new(scaffolding::NamespaceProvider::new(observability::OBS_NAMESPACE)));
+        graph.add_dedup(Box::new(observability::ObservabilityProvider));
     }
 
     graph.validate()?;
 
-    let mut cx = Cx {
+    let cx = Cx {
         client: client.clone(),
         console: None,
         progress: None,
         no_wait: opts.no_wait,
         build_pod: None,
     };
-    // Base-image builds + the mirror run in an ephemeral BuildKit pod created for
-    // this setup and torn down after. The scaffolding must exist first (it's
-    // idempotent, so provisioning it directly here is safe alongside the graph
-    // node below). On any failure the pod stays unset and the image providers
-    // fail cleanly through the normal failed-node path — no need to abort setup.
-    if opts.backend.is_openshift()
-        && buildkit::BuildkitProvider.provision(&cx).await.is_ok()
-        && let Ok(pod) =
-            buildkit::create_build_pod(&client, "setup", &crate::naming::current_user()).await
-    {
-        if buildkit::wait_build_pod_ready(&client, &pod).await.is_ok() {
-            cx.build_pod = Some(pod);
-        } else {
-            buildkit::delete_build_pod(&client, &pod).await;
-        }
-    }
 
     let cap = opts.max_concurrent.max(1);
-    let states = graph.provision(&cx, cap, on_change).await;
-    if let Some(pod) = &cx.build_pod {
-        buildkit::delete_build_pod(&client, pod).await;
-    }
-    Ok(states)
+    Ok(graph.provision(&cx, cap, on_change).await)
 }
 
 /// Assemble the per-run resource graph from an inventory dump.
 ///
-/// **Pure** — no cluster contact. Returns a validated [`Graph`] the caller
-/// (`ztest run`) provisions against the live cluster with its own `Cx`.
-///
-/// Deduplicates content-addressed nodes: two tests declaring the same seed
-/// source share one node (the [`Graph::add_dedup`] contract).
+/// - **Pure** — no cluster contact; `ztest run` provisions the [`Graph`] with its own `Cx`
+/// - Content-addressed nodes dedup: two tests naming one seed share a node
+///   ([`Graph::add_dedup`])
 pub fn plan_runtime(images: &[DevImageEntry], seeds: &[SeedEntry]) -> Result<Graph, String> {
     let mut graph = Graph::new();
     for entry in images {
@@ -182,33 +132,26 @@ pub fn plan_runtime(images: &[DevImageEntry], seeds: &[SeedEntry]) -> Result<Gra
     Ok(graph)
 }
 
-/// The content-addressed [`NodeId`] a dev image resolves to.
-///
-/// Used by `cli::run` to key each binary's image-dependency edge to the
-/// graph node that provisioned it, without duplicating the id derivation.
+/// Content-addressed [`NodeId`] of a dev image → `cli::run` keys an image-dependency edge
+/// without duplicating the derivation
 pub fn image_node_id(entry: &DevImageEntry) -> Result<NodeId, String> {
     image::ImageNode::node_id(entry)
 }
 
-/// The [`NodeId`] a seed resolves to (content-addressed on the bytes, or
-/// path-addressed when they're unreadable — see [`seed::SeedProvider`]).
-///
-/// Used by `cli::run` to key each test's seed-dependency edge to the graph
-/// node that provisioned it.
+/// [`NodeId`] of a seed: content-addressed on the bytes, path-addressed when unreadable
+/// (see [`seed::SeedProvider`])
 pub fn seed_node_id(entry: &SeedEntry) -> NodeId {
     seed::SeedProvider::node_id(entry)
 }
 
-/// The build manifest `DevImageId → pull-reference` for a selection's dev
-/// images, given the post-provision node `states`.
+/// Build manifest `DevImageId → pull-reference` for a selection's dev images, given the
+/// post-provision node `states`.
 ///
-/// Keyed by the path-free [`DevImageId`](crate::backends::image::DevImageId) —
-/// not the build-context bytes — so a separately-compiled in-pod test derives
-/// the same key and resolves the already-built reference instead of rebuilding
-/// from a Dockerfile the baked runner image doesn't carry. A component whose
-/// build FAILED is omitted (its dependent tests are already skipped). Shared by
-/// `ztest run` and the `ztest sync` controller so both forward an identical map
-/// via `ZTEST_IMAGE_REFS`.
+/// - Keyed by the path-free [`DevImageId`](crate::backends::image::DevImageId), not the
+///   build-context bytes → an in-pod test resolves the built reference instead of
+///   rebuilding from a Dockerfile the runner image doesn't carry
+/// - FAILED builds omitted (dependent tests already skipped)
+/// - Shared by `ztest run` and the `ztest sync` controller → identical `ZTEST_IMAGE_REFS`
 pub fn dev_image_refs(
     images_by_binary: &[(String, Vec<DevImageEntry>)],
     states: &std::collections::HashMap<NodeId, NodeState>,
@@ -237,37 +180,32 @@ pub fn dev_image_refs(
     refs
 }
 
-/// Parent-side, by-identity teardown of a run's ephemeral resources: deletes
-/// everything labelled `ztest.io/run-id=<run_id>` (per-test Namespaces, which
-/// cascade, the ephemeral build/uploader pods, and cluster-scoped seed-binding
-/// [`VolumeSnapshotContent`]s), leaving cluster infrastructure and
+/// Parent-side, by-identity teardown of a run's ephemeral resources: everything labelled
+/// `ztest.io/run-id=<run_id>` (cascading per-test Namespaces, ephemeral build/uploader
+/// pods, cluster-scoped seed-binding VolumeSnapshotContents). Infrastructure and
 /// content-addressed caches untouched.
 ///
-/// Called on Ctrl-C so the surviving parent reaps what a SIGKILL'd child left
-/// behind — the "label before populate" invariant means a resource half-created
-/// by a crash is still findable by its run-id label. Idempotent (404 = success);
-/// per-resource errors are collected and returned, never fatal.
+/// - Called on Ctrl-C: the surviving parent reaps what a SIGKILL'd child left, findable
+///   because resources are labelled before they are populated
+/// - Idempotent (404 = success); per-resource errors collected, never fatal
 pub async fn reap_run(client: &Client, run_id: &str) -> Vec<String> {
     let selector = format!("{}={run_id}", qos::LABEL_RUN_ID);
     reap_envs(client, &selector, &selector).await
 }
 
-/// Delete per-test Namespaces (cascading their contents) matching `ns_selector`,
-/// and the ephemeral build/uploader pods, seed-binding VolumeSnapshotContents, and
-/// reservation Leases matching `vsc_selector`. The two selectors differ where
-/// namespaces carry a role label the run-scoped objects don't. Idempotent;
-/// per-resource errors are collected, never fatal.
+/// Delete per-test Namespaces (cascading) matching `ns_selector`, plus the ephemeral
+/// build/uploader pods, seed-binding VolumeSnapshotContents and reservation Leases
+/// matching `vsc_selector`. Two selectors because namespaces carry a role label the
+/// run-scoped objects don't. Idempotent; errors collected, never fatal.
 ///
-/// This is the *run-scoped* reaper, and it deliberately deletes without
-/// consulting liveness — its one caller already knows the run is over.
-/// User-facing reclaim (`ztest cleanup`), which cannot assume that, goes through
-/// [`reclaim`](crate::resource::reclaim) instead.
+/// *Run-scoped*: deletes without consulting liveness (its one caller knows the run is
+/// over). User-facing reclaim goes through [`reclaim`](crate::resource::reclaim)
 async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Vec<String> {
     let dp = DeleteParams::default();
     let mut errors = Vec::new();
 
-    // Namespaces advertise only `delete`, never `deletecollection`, so a
-    // collection-delete 405s; list by label and delete each individually.
+    // Namespaces advertise `delete`, never `deletecollection` (which 405s) → list by
+    // label, delete each
     let namespaces: Api<Namespace> = Api::all(client.clone());
     let ns_lp = ListParams::default().labels(ns_selector);
     match namespaces.list(&ns_lp).await {
@@ -286,10 +224,8 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
         Err(e) => errors.push(format!("list namespaces ({ns_selector}): {e}")),
     }
 
-    // The ephemeral build + seed-uploader pods live directly in RUN_NAMESPACE
-    // (not a per-test namespace, so the cascade above misses them). A run
-    // SIGKILL'd before its own teardown leaves them behind, still holding their
-    // Guaranteed footprint — reap them by run-id here.
+    // Build + seed-uploader pods live in RUN_NAMESPACE → the cascade above misses them,
+    // and a SIGKILL'd run leaves them holding their Guaranteed footprint
     let pods: Api<Pod> = Api::namespaced(client.clone(), policy::RUN_NAMESPACE);
     let pod_lp = ListParams::default().labels(vsc_selector);
     match pods.list(&pod_lp).await {
@@ -308,12 +244,9 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
         Err(e) => errors.push(format!("list pods ({vsc_selector}): {e}")),
     }
 
-    // Seed-binding VolumeSnapshotContents are cluster-scoped and don't cascade
-    // with the namespace; delete by label. List + delete each individually
-    // (like namespaces above) rather than `deletecollection`: the run role
-    // advertises only `delete` on this cluster-scoped resource, keeping the run
-    // identity minimal. A cluster without the snapshot CRD simply has nothing to
-    // reap here — treat that as success.
+    // Cluster-scoped → no cascade with the namespace; list + delete each by label (the
+    // run role advertises `delete` only, keeping the identity minimal). No snapshot CRD
+    // = nothing to reap = success
     let vsc: Api<DynamicObject> =
         Api::all_with(client.clone(), &crate::seeds::volume_snapshot_content_gvk());
     let vsc_lp = ListParams::default().labels(vsc_selector);
@@ -326,9 +259,7 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
                 if let Err(e) = vsc.delete(name, &dp).await
                     && !crate::resource::kube::is_not_found(&e)
                 {
-                    errors.push(format!(
-                        "reap seed binding content {name} ({vsc_selector}): {e}"
-                    ));
+                    errors.push(format!("reap seed binding content {name} ({vsc_selector}): {e}"));
                 }
             }
         }
@@ -336,10 +267,9 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
         Err(e) => errors.push(format!("list seed binding contents ({vsc_selector}): {e}")),
     }
 
-    // Deleted last, after the pods it reserves for are gone: the Lease *is* the
-    // admission reservation, so releasing it while the dying pods still hold
-    // node capacity would let a concurrent run admit against capacity that isn't
-    // free yet. A cluster with no ledger namespace has nothing to reap here.
+    // Last, after the pods it reserves for: the Lease *is* the admission reservation, so
+    // releasing it while dying pods still hold node capacity lets a concurrent run admit
+    // against capacity that isn't free
     let leases: Api<Lease> = Api::namespaced(client.clone(), qos::ledger::META_NAMESPACE);
     let lease_lp = ListParams::default().labels(vsc_selector);
     match leases.list(&lease_lp).await {
@@ -378,11 +308,9 @@ mod tests {
 
     #[test]
     fn a_seed_whose_bytes_are_absent_locally_still_plans() {
-        // Planning must never depend on the archive being readable here. It
-        // routinely is not: the OID is declared at compile time and the bytes
-        // live in the bucket, so an un-pulled checkout plans exactly like a
-        // warm one. A failure to *fetch* surfaces later, as a provision error
-        // that SKIPs only the declaring tests.
+        // Planning never depends on a readable archive: OID declared at compile time,
+        // bytes in the bucket → an un-pulled checkout plans like a warm one. A *fetch*
+        // failure surfaces later as a provision error SKIPping only the declaring tests
         let graph = plan_runtime(&[], &[seed(&"ab".repeat(32))])
             .expect("planning must not require local bytes");
         assert_eq!(graph.len(), 1);

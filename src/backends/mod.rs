@@ -1,8 +1,8 @@
-//! Bundled backend impls shipped with ztest. Third parties can supply their
-//! own validator, indexer, or wallet backends from their own crates.
+//! Bundled backend impls (third parties may supply validator/indexer/wallet
+//! backends from their own crates).
 //!
-//! Wallet backends run in-process (no pod). Default is [`librustzcash`];
-//! [`zingo`] is an opt-in zingolib backend.
+//! - Wallet backends run in-process, no pod
+//! - Default [`librustzcash`]; [`zingo`] opt-in
 pub(crate) mod image;
 #[cfg(feature = "librustzcash")]
 pub mod librustzcash;
@@ -13,61 +13,60 @@ pub mod zebra;
 #[cfg(feature = "zingo")]
 pub mod zingo;
 
-/// The metric rows a bundled backend publishes, keyed on the `ztest.io/component`
-/// label its pods carry.
+/// Sole `ztest.io/component` → backend table (no reflection in Rust).
 ///
-/// Lives here rather than in [`crate::metrics`] because which backend publishes
-/// which families is the backends' knowledge: the metrics plane defines the
-/// contract and reads it, and never names a component. A reader that has only a
-/// pod (no handle) — `ztest sync watch`, which is outside the run — resolves
-/// through this.
-///
-/// An unknown label yields no rows, which is the honest answer for a third-party
-/// backend from another crate: it is scraped into Prometheus like any other, and
-/// ztest's own readers have nothing to display for it.
-pub(crate) fn metrics_rows(component_label: &str) -> &'static [crate::metrics::Row] {
-    match component_label {
-        "zainod" => &zainod::ROWS,
-        "zebrad" => &zebra::ROWS,
-        _ => &[],
-    }
+/// - Read by [`metrics_rows`] / [`observe`] / [`metrics_components`] → new backend
+///   = one row, not three matches
+/// - Lives here, not in [`crate::metrics`] (which names no component)
+struct MetricsBackend {
+    label: &'static str,
+    rows: &'static [crate::metrics::Row],
+    observe: Option<fn(&crate::metrics::Exposition) -> Option<crate::sync::Observation>>,
 }
 
-/// Resolve one scrape of `component_label` into the live columns a watcher
-/// draws, when that backend can be observed from outside.
-///
-/// The dispatch [`metrics_rows`] already establishes: a reader holds a component
-/// label and an exposition, and no reader should learn a metric family name to
-/// use either. `None` for a backend that implements no
-/// [`Observe`](crate::sync::Observe) — a display shows what it has and says so.
+const METRICS_BACKENDS: &[MetricsBackend] = &[
+    MetricsBackend {
+        label: "zainod",
+        rows: &zainod::ROWS,
+        observe: Some(<zainod::ZainoIndexer as crate::sync::Observe>::observe),
+    },
+    MetricsBackend { label: "zebrad", rows: &zebra::ROWS, observe: None },
+];
+
+fn backend_of(component_label: &str) -> Option<&'static MetricsBackend> {
+    METRICS_BACKENDS.iter().find(|b| b.label == component_label)
+}
+
+/// Unknown label → no rows (third-party backend still scrapes into Prometheus;
+/// ztest's readers just have nothing to show)
+pub(crate) fn metrics_rows(component_label: &str) -> &'static [crate::metrics::Row] {
+    backend_of(component_label).map_or(&[], |b| b.rows)
+}
+
+/// Every bundled backend's rows, for a reader with no pod to ask (run namespace
+/// gone by report time)
+pub(crate) fn metrics_components() -> impl Iterator<Item = &'static crate::metrics::Row> {
+    METRICS_BACKENDS.iter().flat_map(|b| b.rows)
+}
+
+/// `None` for a backend that implements no [`Observe`](crate::sync::Observe).
 pub(crate) fn observe(
     component_label: &str,
     exposition: &crate::metrics::Exposition,
 ) -> Option<crate::sync::Observation> {
-    use crate::sync::Observe as _;
-    match component_label {
-        "zainod" => zainod::ZainoIndexer::observe(exposition),
-        _ => None,
-    }
+    (backend_of(component_label)?.observe?)(exposition)
 }
 
-/// The group set a component needs in order to *read* what it mounts.
+/// Group set a component needs to *read* what it mounts.
 ///
-/// A component that restores from an archive gets a clone of a materialized
-/// seed, whose entries are group-owned by
-/// [`SEED_GID`](crate::materialize::SEED_GID) and group-accessible by
-/// construction. Holding that gid is what turns the mount into readable bytes;
-/// without it a pod mounts the seed and then `EACCES`es on the first
-/// mode-`0660` file in it.
-///
-/// Every backend's `pod_spec` routes `supplemental_groups` through here rather
-/// than deciding for itself, so the rule is stated once and a backend cannot
-/// mount a seed it forgot to ask for access to.
+/// - Restored-seed entries group-owned by [`SEED_GID`](crate::materialize::SEED_GID);
+///   without it, `EACCES` on the first mode-`0660` file
+/// - Every `pod_spec` routes `supplemental_groups` through here (no backend can
+///   mount a seed it forgot to ask access for)
 pub(crate) fn seed_groups(opts: &crate::component::ComponentOpts) -> Vec<i64> {
     match opts.restore {
         Some(crate::component::RestoreSource::Archive(_)) => vec![crate::materialize::SEED_GID],
-        // A blank restore is an empty PVC this pod fills itself, so it already
-        // owns every entry on it.
+        // Blank restore = empty PVC this pod fills itself (already owns every entry)
         Some(crate::component::RestoreSource::Blank) | None => Vec::new(),
     }
 }
@@ -77,10 +76,7 @@ mod tests {
     use crate::component::{ComponentOpts, RestoreSource};
 
     fn opts_with(restore: Option<RestoreSource>) -> ComponentOpts {
-        ComponentOpts {
-            restore,
-            ..Default::default()
-        }
+        ComponentOpts { restore, ..Default::default() }
     }
 
     fn archive_restore() -> RestoreSource {
@@ -92,12 +88,8 @@ mod tests {
         ))
     }
 
-    /// The regression: `zainod`'s `pod_spec` pinned `runAsUser: 1000` and
-    /// `fsGroup: 1000`, neither of which puts the seed's gid in the container's
-    /// group set — the image's `USER` supplies a non-zero primary group. Every
-    /// mode bit `NORMALIZE_MODES` had carefully set was therefore unreachable,
-    /// and the state indexer panicked reading the mode-`0660` `version` file the
-    /// moment it opened a restored chain.
+    /// Regression: `runAsUser`/`fsGroup: 1000` alone leaves the seed gid out of the
+    /// group set → indexer panics on the mode-`0660` `version` file
     #[test]
     fn a_pod_restoring_from_an_archive_carries_the_seeds_group() {
         assert_eq!(

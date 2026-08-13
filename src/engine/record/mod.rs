@@ -1,14 +1,8 @@
-//! Record, replay, and (in future) rerun of a test run — ztest's take on
-//! nextest's recording subsystem.
+//! Record/replay/rerun of a run, on nextest's model.
 //!
-//! The design rests on the engine's existing seam: every run flows through the
-//! [`TestEvent`](crate::engine::events::TestEvent) stream that
-//! [`StyledReporter`](crate::engine::reporter::StyledReporter) renders. If that
-//! stream can be persisted, replay is a consequence, not a feature: [`record`]
-//! tees the stream to disk, and [`replay`] reads it back and feeds the identical
-//! events to an identical reporter — which cannot tell live from replayed.
-//!
-//! What's persisted, per run, under a per-user cache dir keyed by workspace:
+//! - Rides the [`TestEvent`](crate::engine::events::TestEvent) seam: tee to disk,
+//!   feed back to an identical reporter (which cannot tell live from replayed)
+//! - Streamed event log + content-addressed output store, per run:
 //!
 //! ```text
 //! {cache}/records/{workspace_id}/{run_id}/
@@ -17,12 +11,8 @@
 //!     out/{hash}-combined   content-addressed, deduped, zstd output blobs
 //! ```
 //!
-//! This mirrors nextest's split of a streamed event log from a content-addressed
-//! output store. Two deliberate right-sizings versus nextest: ztest has a single
-//! output-bearing event ([`TestFinished`](crate::engine::events::TestEvent::TestFinished)),
-//! so the stored form is one owned [`RecordedEvent`] rather than a form generic
-//! over an `OutputSpec`; and the store is a plain directory rather than a zip —
-//! portable single-file export is deferred.
+//! Right-sized vs nextest: one owned [`RecordedEvent`] (ztest has a single
+//! output-bearing event), and a plain directory store rather than a zip
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -46,34 +36,27 @@ pub use replay::replay;
 pub use rerun::passed_tests;
 pub use store::StoreRef;
 
-/// On-disk format version. Bumped on a breaking change to [`RecordedEvent`] /
-/// [`RunMeta`] / the store layout; a reader refuses a newer major.
+/// On-disk format version; bump on any breaking change to [`RecordedEvent`],
+/// [`RunMeta`] or the store layout (readers refuse a newer major)
 pub const FORMAT_VERSION: u32 = 1;
 
-/// The environment opt-out. Recording is on by default (a decorator plus a
-/// compressed file); `ZTEST_NO_RECORD=1` disables it.
+/// On by default; `ZTEST_NO_RECORD=1` disables
 pub fn recording_enabled() -> bool {
     !std::env::var_os("ZTEST_NO_RECORD").is_some_and(|v| v == "1" || v == "true")
 }
 
-/// Run-level metadata written once at run start (`meta.json`).
+/// Run-level metadata, written once at run start (`meta.json`). `captured =
+/// false` under `--no-capture` → replay renders `(output not captured)`, not blank
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunMeta {
-    /// [`FORMAT_VERSION`] the recording was written with.
     pub format_version: u32,
-    /// The shared `run_id` every child inherited.
     pub run_id: String,
-    /// RFC 3339 UTC start time.
     pub started_at: String,
-    /// The full `ztest` argv (for `store list` and provenance).
     pub args: Vec<String>,
-    /// Whether test output was captured. `false` under `--no-capture`, where a
-    /// test's output streamed straight to the terminal and was never stored — so
-    /// replay renders `(output not captured)` rather than blank output.
     pub captured: bool,
 }
 
-/// Read a run's `meta.json`.
+/// Read a run's `meta.json`
 pub fn read_meta(run_dir: &std::path::Path) -> std::io::Result<RunMeta> {
     let bytes = std::fs::read(run_dir.join("meta.json"))?;
     serde_json::from_slice(&bytes).map_err(|e| {
@@ -81,8 +64,7 @@ pub fn read_meta(run_dir: &std::path::Path) -> std::io::Result<RunMeta> {
     })
 }
 
-/// The final [`RunStats`] recorded for a run, or `None` if it never reached
-/// `RunFinished` (e.g. a hard crash mid-run).
+/// Final [`RunStats`] for a run, `None` when it never reached `RunFinished`
 pub fn final_stats(run_dir: &std::path::Path) -> std::io::Result<Option<RunStats>> {
     use std::io::BufRead;
     let log = std::fs::File::open(run_dir.join("run.log.zst"))?;
@@ -102,10 +84,9 @@ pub fn final_stats(run_dir: &std::path::Path) -> std::io::Result<Option<RunStats
     Ok(stats)
 }
 
-/// The owned, serializable mirror of [`TestEvent`](crate::engine::events::TestEvent).
-/// Identity fields are owned `String`s (vs the live event's borrowed slices) and
-/// `TestFinished`'s output is a [`StoreRef`] into the output store rather than
-/// inline bytes. One line of `run.log.zst` deserializes into one of these.
+/// Owned, serializable mirror of [`TestEvent`](crate::engine::events::TestEvent);
+/// one per line of `run.log.zst`. Identity fields owned, `TestFinished`'s output
+/// a [`StoreRef`] rather than inline bytes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum RecordedEvent {
@@ -157,16 +138,12 @@ pub enum RecordedEvent {
     },
 }
 
-/// How the user names the run to replay/rerun, mirroring nextest's selector
-/// grammar: `latest`, a run-id (full or unambiguous prefix), or a filesystem
-/// path to a recording directory.
+/// How a run is named for replay/rerun, on nextest's grammar: `latest`, a run-id
+/// (full or unambiguous prefix), or a path to a recording directory
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunSelector {
-    /// The most recent run for this workspace.
     Latest,
-    /// A run id, or an unambiguous prefix of one.
     Id(String),
-    /// A direct path to a recording directory.
     Path(PathBuf),
 }
 
@@ -184,8 +161,7 @@ impl FromStr for RunSelector {
     }
 }
 
-/// Whether a selector token denotes a filesystem path rather than a run id:
-/// it contains a path separator or ends in a recording suffix (nextest's rule).
+/// Path, not run-id: holds a separator or ends in a recording suffix (nextest's rule)
 fn is_path_like(s: &str) -> bool {
     s.contains('/')
         || s.contains(std::path::MAIN_SEPARATOR)
@@ -200,10 +176,7 @@ mod tests {
     #[test]
     fn selector_grammar_matches_nextest() {
         assert_eq!("latest".parse(), Ok(RunSelector::Latest));
-        assert_eq!(
-            "ztest-run-1234".parse(),
-            Ok(RunSelector::Id("ztest-run-1234".into()))
-        );
+        assert_eq!("ztest-run-1234".parse(), Ok(RunSelector::Id("ztest-run-1234".into())));
         assert_eq!("b0b".parse(), Ok(RunSelector::Id("b0b".into())));
         assert_eq!("/tmp/rec".parse(), Ok(RunSelector::Path("/tmp/rec".into())));
         assert_eq!("./rec".parse(), Ok(RunSelector::Path("./rec".into())));
@@ -217,17 +190,13 @@ mod tests {
             verdict: Verdict::Fail(101),
             duration: Duration::from_millis(234),
             attempt: 2,
-            output: StoreRef::Full {
-                name: "deadbeef-combined".into(),
-            },
+            output: StoreRef::Full { name: "deadbeef-combined".into() },
         };
         let line = serde_json::to_string(&ev).unwrap();
         assert!(line.contains("\"kind\":\"test-finished\""), "{line}");
         let back: RecordedEvent = serde_json::from_str(&line).unwrap();
         match back {
-            RecordedEvent::TestFinished {
-                verdict, attempt, ..
-            } => {
+            RecordedEvent::TestFinished { verdict, attempt, .. } => {
                 assert_eq!(verdict, Verdict::Fail(101));
                 assert_eq!(attempt, 2);
             }

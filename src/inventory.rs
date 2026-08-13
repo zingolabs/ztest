@@ -1,15 +1,10 @@
 //! Link-time inventory of dev-image declarations.
 //!
-//! The [`dev!`] macro submits declarations via the `inventory` crate, which
-//! aggregates them across the binary's reachable graph at link time. The CLI
-//! spawns each test binary with `ZTEST_DUMP_INVENTORY=1`; `dump_hook` then
-//! serializes the inventory to stdout (one JSON object per line) and exits
-//! before any test runs, so the tag never crosses the process boundary as a
-//! linked dependency.
-//!
-//! Each declaration kind pairs a const-evaluable `*Decl` (fields are `&'static`,
-//! as `inventory::submit!`'s static initializer requires) with an owned `*Entry`
-//! read type; both serialize to the same JSON, so either round-trips.
+//! - [`dev!`] submits via the `inventory` crate, aggregated across the link graph
+//! - CLI spawns each test binary with `ZTEST_DUMP_INVENTORY=1` → `dump_hook` dumps
+//!   one JSON object per line and exits pre-test
+//! - Per kind: const-evaluable `*Decl` (`&'static`, as `inventory::submit!` demands)
+//!   + owned `*Entry`, same JSON both ways
 //!
 //! [`dev!`]: ztest_macros::dev
 
@@ -17,63 +12,42 @@ use serde::{Deserialize, Serialize};
 
 use crate::qos::QosClass;
 
-/// One dev-image declaration, ready for `inventory::submit!`.
+/// One dev-image declaration for `inventory::submit!`.
 ///
-/// `repo` is the local image name (`zainod`, `zebrad`, ...); the preflight
-/// pipeline produces `<repo>:dev-<hash>`, the SHA-256 over (dockerfile bytes ‖
-/// context tree ‖ features ‖ pinned rust version) truncated to 12 hex chars.
-/// The same hash is recomputed at `env.build()` to look up the pre-built tag.
+/// - `repo` = local image name → preflight builds `<repo>:dev-<hash>`, hash =
+///   SHA-256(dockerfile ‖ context ‖ features ‖ rust version)[..12], recomputed at `env.build()`
+/// - One image per `rust_versions` entry, empty = the Dockerfile's own `RUST_VERSION`
+/// - `rust_versions` static: images provision pre-test, so a runtime rstest `#[case]`
+///   cannot reach it (`docs/guide-writing-tests.md`)
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct DevImageDecl {
     pub repo: &'static str,
     pub source: DevSourceDecl,
     pub features: &'static [&'static str],
-    /// Rust versions to pre-build this image at. Each becomes its own
-    /// `<repo>:dev-<hash>` image; empty ⇒ one image with the Dockerfile's own
-    /// `RUST_VERSION` default. Must be statically declarable here because images
-    /// are provisioned before any test runs, so a runtime rstest `#[case]` value
-    /// can't reach it. See `docs/guide-writing-tests.md`.
     pub rust_versions: &'static [&'static str],
 }
 
-/// Const-evaluable mirror of [`crate::backends::image::DevSource`] for the
-/// `inventory::submit!` static initializer; serializes to the same JSON so it
-/// round-trips into the owned `DevSource`.
+/// Const-evaluable mirror of [`crate::backends::image::DevSource`] for
+/// `inventory::submit!`, same JSON (round-trips into the owned form)
 #[derive(Debug, Clone, Copy, Serialize)]
 pub enum DevSourceDecl {
-    /// Dockerfile + context in the local checkout (absolute paths).
-    Local {
-        dockerfile: &'static str,
-        context: &'static str,
-    },
-    /// Dockerfile + context inside a git repo at a pinned rev (repo-relative
-    /// paths).
-    Git {
-        url: &'static str,
-        rev: &'static str,
-        dockerfile: &'static str,
-        context: &'static str,
-    },
+    Local { dockerfile: &'static str, context: &'static str },
+    Git { url: &'static str, rev: &'static str, dockerfile: &'static str, context: &'static str },
 }
 
 inventory::collect!(DevImageDecl);
 
-/// Owned counterpart of [`DevImageDecl`] for the read side of the dump-and-parse
-/// boundary; the values must outlive the originating binary's process.
+/// Owned [`DevImageDecl`]: one per rust version (`expand_decl`), each a distinct
+/// image downstream, `None` = the Dockerfile's own `RUST_VERSION`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevImageEntry {
     pub repo: String,
     pub source: crate::backends::image::DevSource,
     pub features: Vec<String>,
-    /// The single rust version this image is built at; `None` leaves the
-    /// Dockerfile's own `RUST_VERSION` default. A [`DevImageDecl`] with N
-    /// `rust_versions` expands to N entries (see `expand_decl`), each a
-    /// distinct image downstream.
     pub rust_version: Option<String>,
 }
 
-/// Expand one static [`DevImageDecl`] into the concrete images to build: one per
-/// declared rust version, or a single default-toolchain image when none.
+/// [`DevImageDecl`] → images to build, one per declared rust version (none = one default)
 fn expand_decl(d: &DevImageDecl) -> Vec<DevImageEntry> {
     let entry = |rust_version| DevImageEntry {
         repo: d.repo.to_string(),
@@ -84,10 +58,7 @@ fn expand_decl(d: &DevImageDecl) -> Vec<DevImageEntry> {
     if d.rust_versions.is_empty() {
         vec![entry(None)]
     } else {
-        d.rust_versions
-            .iter()
-            .map(|v| entry(Some(v.to_string())))
-            .collect()
+        d.rust_versions.iter().map(|v| entry(Some(v.to_string()))).collect()
     }
 }
 
@@ -95,19 +66,10 @@ impl From<DevSourceDecl> for crate::backends::image::DevSource {
     fn from(d: DevSourceDecl) -> Self {
         use crate::backends::image::DevSource;
         match d {
-            DevSourceDecl::Local {
-                dockerfile,
-                context,
-            } => DevSource::Local {
-                dockerfile: dockerfile.into(),
-                context: context.into(),
-            },
-            DevSourceDecl::Git {
-                url,
-                rev,
-                dockerfile,
-                context,
-            } => DevSource::Git {
+            DevSourceDecl::Local { dockerfile, context } => {
+                DevSource::Local { dockerfile: dockerfile.into(), context: context.into() }
+            }
+            DevSourceDecl::Git { url, rev, dockerfile, context } => DevSource::Git {
                 url: url.to_string(),
                 rev: rev.to_string(),
                 dockerfile: dockerfile.to_string(),
@@ -117,95 +79,105 @@ impl From<DevSourceDecl> for crate::backends::image::DevSource {
     }
 }
 
-/// Iterate every dev-image declaration linked into the current binary.
-/// Empty when no `dev!` site is reachable.
+/// Empty with no reachable `dev!` site
 pub fn iter() -> impl Iterator<Item = &'static DevImageDecl> {
     inventory::iter::<DevImageDecl>()
 }
 
 // ─────────────────────────── QOS tier inventory ───────────────────────
 //
-// The `#[ztest::qos::*]` attribute submits a `QosDecl`; `ztest run` reads
-// `QosEntry` off the dump stream to group selected tests by tier.
+// `#[ztest::qos::*]` submits a `QosDecl`; `ztest run` folds `QosEntry` off the
+// dump stream into per-tier groups
 
-/// One QOS tier declaration, ready for `inventory::submit!`. `test_id` is
-/// `concat!(module_path!(), "::", test_fn)` from the call site.
+/// `footprint = ".."` override, const-evaluable + already parsed by the macro
+/// (no reader re-parses a quantity → none can disagree with what was written)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FootprintDecl {
+    pub cpu_milli: u64,
+    pub mem_bytes: u64,
+}
+
+impl FootprintDecl {
+    pub fn resources(self) -> crate::qos::Resources {
+        crate::qos::Resources::new(self.cpu_milli, self.mem_bytes, 0, 0)
+    }
+}
+
+/// `Option<FootprintDecl>` → the `profile_with` argument
+pub fn footprint_resources(f: Option<FootprintDecl>) -> Option<crate::qos::Resources> {
+    f.map(FootprintDecl::resources)
+}
+
+/// One QOS tier declaration for `inventory::submit!`.
+/// `test_id` = `concat!(module_path!(), "::", test_fn)`
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct QosDecl {
     pub test_id: &'static str,
     pub class: QosClass,
+    pub footprint: Option<FootprintDecl>,
 }
 
 inventory::collect!(QosDecl);
 
-/// Owned counterpart of [`QosDecl`] for the read side of the dump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QosEntry {
     pub test_id: String,
     pub class: QosClass,
+    #[serde(default)]
+    pub footprint: Option<FootprintDecl>,
 }
 
 impl From<&QosDecl> for QosEntry {
     fn from(d: &QosDecl) -> Self {
-        QosEntry {
-            test_id: d.test_id.to_string(),
-            class: d.class,
-        }
+        QosEntry { test_id: d.test_id.to_string(), class: d.class, footprint: d.footprint }
     }
 }
 
-/// Iterate every QOS tier declaration linked into the current binary.
+impl QosEntry {
+    /// Effective profile (tier + override); read over `class.profile()` at any sizing site
+    pub fn profile(&self) -> crate::qos::QosProfile {
+        self.class.profile_with(footprint_resources(self.footprint))
+    }
+}
+
 pub fn qos_iter() -> impl Iterator<Item = &'static QosDecl> {
     inventory::iter::<QosDecl>()
 }
 
 // ─────────────────────────── seed inventory ───────────────────────────
 //
-// Data seeds a test declares via `mount_archive!` / `mount_file!` /
-// `#[ztest::needs]`. Declaring the seed as a static `SeedDecl` at the call site
-// lets the preflight resource graph pre-provision it before any test runs,
-// instead of the first test to reach `TestEnv::build()` materializing it
-// lazily.
+// Seeds declared via `mount_archive!` / `mount_file!` / `#[ztest::needs]`, static
+// so preflight pre-provisions them (else the first test at `TestEnv::build()`
+// materializes lazily)
 //
-// A seed is identified by its Git LFS object id — the SHA-256 of the archive
-// bytes — baked from the sidecar manifest at compile time. Nothing here is a
-// path. That is what lets the identity cross every boundary in a run: the
-// laptop that declares the archive, the build pod that compiles the test, the
-// runner pod that requests the mount and the puller Job that fetches
-// `lfs/<oid>` all name the same seed, and none of them has to be able to read
-// the file.
+// Identity = Git LFS oid (SHA-256 of the bytes), baked from the sidecar manifest at
+// compile time, never a path — laptop, build pod, runner pod and puller Job all name
+// the same seed without any of them reading the file
 
-/// How a seed's source is loaded into its PVC: extracted (archive) or copied
-/// byte-for-byte (file). The field is named `payload`, not `kind`, to avoid
-/// colliding with the `InventoryLine` serde tag.
+/// Seed → PVC load: extracted (archive) or copied byte-for-byte (file).
+/// Field named `payload`, not `kind` (would collide with the `InventoryLine` tag)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SeedPayload {
-    /// `mount_archive!`: `tar`-extracted into the seed PVC.
     Archive,
-    /// `mount_file!`: copied verbatim as a single-file PVC.
     File,
 }
 
-/// One seed declaration, ready for `inventory::submit!`.
+/// One seed declaration for `inventory::submit!`.
+///
+/// - `oid` = identity (LFS oid = SHA-256 of the bytes) → PVC `seed-<oid[..8]>`, key `lfs/<oid>`
+/// - `name` = filename only, for the puller's decompression + diagnostics
+/// - `size` = the manifest's compressed `size_bytes`
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SeedDecl {
-    /// The artifact's filename. Not an identity — carried so the puller can
-    /// derive decompression from the extension and so diagnostics name
-    /// something a human can find rather than a 64-hex digest.
     pub name: &'static str,
-    /// Git LFS object id (SHA-256 of the bytes): the seed's identity, the PVC
-    /// name `seed-<oid[..8]>`, and the bucket key `lfs/<oid>`.
     pub oid: &'static str,
-    /// Compressed size in bytes, from the manifest's `size_bytes`. Sizes the
-    /// puller's transfer budget without fetching anything.
     pub size: u64,
     pub payload: SeedPayload,
 }
 
 inventory::collect!(SeedDecl);
 
-/// Owned counterpart of [`SeedDecl`] for the read side of the dump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeedEntry {
     pub name: String,
@@ -225,34 +197,27 @@ impl From<&SeedDecl> for SeedEntry {
     }
 }
 
-/// Iterate every seed declaration linked into the current binary.
 pub fn seed_iter() -> impl Iterator<Item = &'static SeedDecl> {
     inventory::iter::<SeedDecl>()
 }
 
 // ───────────────────────── test→resource edges ────────────────────────
 //
-// The per-test dependency edge. `#[ztest::needs(NAME)]` submits a `TestDepDecl`
-// alongside the `SeedDecl` that makes the resource provisionable: where
-// `SeedDecl` says the resource can be built, `TestDepDecl` says which test needs
-// it, so `ztest run` can gate admission and cleanly SKIP only the tests whose
-// resource failed rather than let them fail at `TestEnv::build()`. `resource` is
-// the SAME string as the paired `SeedDecl::oid`, keying the edge to the
-// resource's node.
+// `#[ztest::needs(NAME)]` submits a `TestDepDecl` beside its `SeedDecl`:
+// `SeedDecl` = resource is provisionable, `TestDepDecl` = which test needs it
+// → `ztest run` SKIPs only the tests whose resource failed, instead of letting
+// them blow up at `TestEnv::build()`
 
-/// One test→resource dependency edge, ready for `inventory::submit!`.
+/// One test→resource edge for `inventory::submit!`. `resource` = the paired
+/// [`SeedDecl::oid`] (both resolve to one node)
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct TestDepDecl {
-    /// `concat!(module_path!(), "::", test_fn)` — crate-rooted, matching `QosDecl`.
     pub test_id: &'static str,
-    /// Git LFS object id of the needed resource — identical to the paired
-    /// [`SeedDecl::oid`], so the engine resolves both to the same node.
     pub resource: &'static str,
 }
 
 inventory::collect!(TestDepDecl);
 
-/// Owned counterpart of [`TestDepDecl`] for the read side of the dump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestDepEntry {
     pub test_id: String,
@@ -261,49 +226,36 @@ pub struct TestDepEntry {
 
 impl From<&TestDepDecl> for TestDepEntry {
     fn from(d: &TestDepDecl) -> Self {
-        TestDepEntry {
-            test_id: d.test_id.to_string(),
-            resource: d.resource.to_string(),
-        }
+        TestDepEntry { test_id: d.test_id.to_string(), resource: d.resource.to_string() }
     }
 }
 
-/// Iterate every test→resource edge linked into the current binary.
 pub fn dep_iter() -> impl Iterator<Item = &'static TestDepDecl> {
     inventory::iter::<TestDepDecl>()
 }
 
 // ─────────────────────────── sync-test inventory ──────────────────────
 //
-// The `#[ztest::sync_test]` attribute submits a `SyncTestDecl` carrying the
-// static metadata known before the body runs (name/subject/timeout/qos/tags).
-// `ztest sync list`/`describe` read `SyncTestEntry` off the dump stream, and QoS
-// admission sizes the pod from `qos` without executing the registration body.
+// `#[ztest::sync_test]` submits a `SyncTestDecl`: the metadata known pre-body
+// `ztest sync list`/`describe` read it, and QoS sizes the pod from `qos` without
+// executing the registration body
 
-/// One `#[ztest::sync_test]` declaration, ready for `inventory::submit!`. All
-/// fields are the annotation's static metadata; the invariant/nemesis manifest
-/// comes from running the body in Collect mode, not from here.
+/// One `#[ztest::sync_test]` declaration for `inventory::submit!` — annotation
+/// metadata only (the invariant/nemesis manifest comes from a Collect-mode body run)
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SyncTestDecl {
-    /// `concat!(module_path!(), "::", test_fn)` — crate-rooted, matching `QosDecl`.
     pub test_id: &'static str,
-    /// The profile name (`ztest sync start <name>`).
     pub name: &'static str,
-    /// One-line description.
     pub description: &'static str,
-    /// Subject kind: `"wallet"` | `"indexer"` | `"validator"`.
     pub subject: &'static str,
-    /// Timeout string (e.g. `"48h"`), matching the QoS tier cap.
     pub timeout: &'static str,
-    /// QoS tier name (e.g. `"sync"`).
     pub qos: &'static str,
-    /// Free-form tags for filtering in `list`.
+    pub footprint: Option<FootprintDecl>,
     pub tags: &'static [&'static str],
 }
 
 inventory::collect!(SyncTestDecl);
 
-/// Owned counterpart of [`SyncTestDecl`] for the read side of the dump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncTestEntry {
     pub test_id: String,
@@ -312,6 +264,8 @@ pub struct SyncTestEntry {
     pub subject: String,
     pub timeout: String,
     pub qos: String,
+    #[serde(default)]
+    pub footprint: Option<FootprintDecl>,
     pub tags: Vec<String>,
 }
 
@@ -324,21 +278,33 @@ impl From<&SyncTestDecl> for SyncTestEntry {
             subject: d.subject.to_string(),
             timeout: d.timeout.to_string(),
             qos: d.qos.to_string(),
+            footprint: d.footprint,
             tags: d.tags.iter().map(|t| t.to_string()).collect(),
         }
     }
 }
 
-/// Iterate every sync-test declaration linked into the current binary.
+impl SyncTestEntry {
+    /// Declared tier; unparseable → `None` (caller decides, never a silent default)
+    pub fn class(&self) -> Option<QosClass> {
+        QosClass::from_label(&self.qos)
+    }
+
+    /// Sole source of a sync run's sizing (declared tier + declared override)
+    pub fn profile(&self) -> Option<crate::qos::QosProfile> {
+        Some(self.class()?.profile_with(footprint_resources(self.footprint)))
+    }
+}
+
 pub fn sync_test_iter() -> impl Iterator<Item = &'static SyncTestDecl> {
     inventory::iter::<SyncTestDecl>()
 }
 
-/// Borrowed write side of a dump line (serialized by the dump hook), tagged with
-/// `"kind"` so the declaration kinds share one stream; [`InventoryLine`] is the
-/// owned read side. Dev images have no borrowed variant: one static
-/// [`DevImageDecl`] fans out (via `expand_decl`) into N owned
-/// [`DevImageEntry`] lines, serialized as [`InventoryLine::Dev`] directly.
+/// Borrowed write side of a dump line, `"kind"`-tagged so all kinds share one
+/// stream ([`InventoryLine`] = owned read side).
+///
+/// - No dev variant: one [`DevImageDecl`] fans out to N owned [`DevImageEntry`],
+///   written as [`InventoryLine::Dev`]
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum InventoryLineRef<'a> {
@@ -348,7 +314,7 @@ pub enum InventoryLineRef<'a> {
     SyncTest(&'a SyncTestDecl),
 }
 
-/// Owned read side of a dump line; see [`InventoryLineRef`].
+/// Owned read side of a dump line, see [`InventoryLineRef`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum InventoryLine {
@@ -359,11 +325,10 @@ pub enum InventoryLine {
     SyncTest(SyncTestEntry),
 }
 
-/// Pre-main dump hook. When the test binary is spawned with
-/// `ZTEST_DUMP_INVENTORY=1`, this constructor runs before the harness sees
-/// `argv`, serializes every linked-in declaration to stdout (one JSON object per
-/// line), and `exit(0)`s without running any test. Normal runs hit a single
-/// `env::var_os` check and return.
+/// Pre-main dump hook, ahead of the harness seeing `argv`.
+///
+/// - `ZTEST_DUMP_INVENTORY=1` → every linked-in decl to stdout, then `exit(0)`, no tests
+/// - Otherwise one `env::var_os` check and out
 #[ctor::ctor]
 fn dump_hook() {
     if std::env::var_os("ZTEST_DUMP_INVENTORY").is_none() {
@@ -373,10 +338,7 @@ fn dump_hook() {
     use std::io::Write;
     let emit = |line: std::io::Result<()>| {
         if let Err(err) = line {
-            let _ = writeln!(
-                std::io::stderr(),
-                "ztest dump_inventory: write failed: {err}"
-            );
+            let _ = writeln!(std::io::stderr(), "ztest dump_inventory: write failed: {err}");
         }
     };
     for decl in iter() {
@@ -396,10 +358,8 @@ fn dump_hook() {
         match serde_json::to_string(&InventoryLineRef::Qos(decl)) {
             Ok(line) => emit(writeln!(stdout, "{line}")),
             Err(err) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "ztest dump_inventory: serialize failed: {err}"
-                );
+                let _ =
+                    writeln!(std::io::stderr(), "ztest dump_inventory: serialize failed: {err}");
             }
         }
     }
@@ -407,10 +367,8 @@ fn dump_hook() {
         match serde_json::to_string(&InventoryLineRef::Seed(decl)) {
             Ok(line) => emit(writeln!(stdout, "{line}")),
             Err(err) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "ztest dump_inventory: serialize failed: {err}"
-                );
+                let _ =
+                    writeln!(std::io::stderr(), "ztest dump_inventory: serialize failed: {err}");
             }
         }
     }
@@ -418,10 +376,8 @@ fn dump_hook() {
         match serde_json::to_string(&InventoryLineRef::Dep(decl)) {
             Ok(line) => emit(writeln!(stdout, "{line}")),
             Err(err) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "ztest dump_inventory: serialize failed: {err}"
-                );
+                let _ =
+                    writeln!(std::io::stderr(), "ztest dump_inventory: serialize failed: {err}");
             }
         }
     }
@@ -429,10 +385,8 @@ fn dump_hook() {
         match serde_json::to_string(&InventoryLineRef::SyncTest(decl)) {
             Ok(line) => emit(writeln!(stdout, "{line}")),
             Err(err) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "ztest dump_inventory: serialize failed: {err}"
-                );
+                let _ =
+                    writeln!(std::io::stderr(), "ztest dump_inventory: serialize failed: {err}");
             }
         }
     }
@@ -444,8 +398,7 @@ fn dump_hook() {
 mod tests {
     use super::*;
 
-    /// Serialize the one entry `expand_decl` yields for a no-`rust_versions`
-    /// decl, exactly as `dump_hook` does.
+    /// The single entry a no-`rust_versions` decl yields, serialized as `dump_hook` does
     fn dev_line(decl: &DevImageDecl) -> String {
         let entries = expand_decl(decl);
         assert_eq!(entries.len(), 1, "one entry when rust_versions is empty");
@@ -456,10 +409,7 @@ mod tests {
     fn dev_line_is_tagged_and_demuxes_to_dev_entry() {
         let decl = DevImageDecl {
             repo: "zainod",
-            source: DevSourceDecl::Local {
-                dockerfile: "/df",
-                context: "/ctx",
-            },
+            source: DevSourceDecl::Local { dockerfile: "/df", context: "/ctx" },
             features: &["f1"],
             rust_versions: &[],
         };
@@ -510,8 +460,7 @@ mod tests {
         }
     }
 
-    /// A decl with N `rust_versions` fans out to N entries, each carrying its
-    /// single version — the build-set the preflight pipeline provisions.
+    /// N `rust_versions` → N entries, one version each = the preflight build-set
     #[test]
     fn rust_versions_fan_out_one_entry_each() {
         let decl = DevImageDecl {
@@ -525,14 +474,66 @@ mod tests {
             features: &[],
             rust_versions: &["1.88", "1.91.0"],
         };
-        let versions: Vec<Option<String>> = expand_decl(&decl)
-            .into_iter()
-            .map(|e| e.rust_version)
-            .collect();
-        assert_eq!(
-            versions,
-            vec![Some("1.88".to_string()), Some("1.91.0".to_string())]
-        );
+        let versions: Vec<Option<String>> =
+            expand_decl(&decl).into_iter().map(|e| e.rust_version).collect();
+        assert_eq!(versions, vec![Some("1.88".to_string()), Some("1.91.0".to_string())]);
+    }
+
+    #[test]
+    fn a_footprint_override_round_trips_through_the_dump() {
+        // Link-time half: macro emits parsed integers, CLI reads them back unparsed
+        let decl = QosDecl {
+            test_id: "walletless::big",
+            class: QosClass::Sync,
+            footprint: Some(FootprintDecl { cpu_milli: 15_000, mem_bytes: 29 * crate::qos::GIB }),
+        };
+        let line = serde_json::to_string(&InventoryLineRef::Qos(&decl)).unwrap();
+        match serde_json::from_str::<InventoryLine>(&line).unwrap() {
+            InventoryLine::Qos(e) => {
+                assert_eq!(e.footprint, decl.footprint);
+                assert_eq!(e.profile().footprint.mem_bytes, 29 * crate::qos::GIB);
+                assert_eq!(e.profile().runner, QosClass::Sync.profile().runner);
+            }
+            other => panic!("qos line demuxed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dump_without_a_footprint_field_still_deserializes() {
+        // Dump from an older test binary
+        let line = r#"{"kind":"qos","test_id":"a::b","class":"Sync"}"#;
+        match serde_json::from_str::<InventoryLine>(line).unwrap() {
+            InventoryLine::Qos(e) => {
+                assert_eq!(e.footprint, None);
+                assert_eq!(e.profile(), QosClass::Sync.profile());
+            }
+            other => panic!("qos line demuxed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sync_profile_lowers_to_its_declared_tier_not_a_sync_shaped_guess() {
+        let mut e = SyncTestEntry {
+            test_id: "c::t".into(),
+            name: "p".into(),
+            description: String::new(),
+            subject: "indexer".into(),
+            timeout: "48h".into(),
+            qos: "integration".into(),
+            footprint: None,
+            tags: Vec::new(),
+        };
+        // Tier the profile named, though launched by `ztest sync`
+        assert_eq!(e.profile(), Some(QosClass::Integration.profile()));
+
+        e.footprint = Some(FootprintDecl { cpu_milli: 15_000, mem_bytes: 29 * crate::qos::GIB });
+        let eff = e.profile().expect("known tier");
+        assert_eq!(eff.footprint.mem_bytes, 29 * crate::qos::GIB);
+        assert_eq!(eff.hard_cap, QosClass::Integration.profile().hard_cap);
+
+        // Unknown tier refused, not defaulted
+        e.qos = "nonesuch".into();
+        assert_eq!(e.profile(), None);
     }
 
     #[test]
@@ -540,6 +541,7 @@ mod tests {
         let decl = QosDecl {
             test_id: "walletless::syncs_from_genesis",
             class: QosClass::Sync,
+            footprint: None,
         };
         let line = serde_json::to_string(&InventoryLineRef::Qos(&decl)).unwrap();
         assert!(line.contains("\"kind\":\"qos\""), "missing qos tag: {line}");
@@ -561,15 +563,9 @@ mod tests {
             payload: SeedPayload::Archive,
         };
         let line = serde_json::to_string(&InventoryLineRef::Seed(&decl)).unwrap();
-        assert!(
-            line.contains("\"kind\":\"seed\""),
-            "missing seed tag: {line}"
-        );
-        // `payload` must not collide with the `"kind"` discriminant tag.
-        assert!(
-            line.contains("\"payload\":\"archive\""),
-            "payload field: {line}"
-        );
+        assert!(line.contains("\"kind\":\"seed\""), "missing seed tag: {line}");
+        // `payload` must not collide with the `"kind"` tag
+        assert!(line.contains("\"payload\":\"archive\""), "payload field: {line}");
         match serde_json::from_str::<InventoryLine>(&line).unwrap() {
             InventoryLine::Seed(e) => {
                 assert_eq!(e.name, "data.tar.zst");

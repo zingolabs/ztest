@@ -1,10 +1,10 @@
-//! The persistent render thread and the `Console` handle the work side talks to.
+//! Persistent render thread + the `Console` handle the work side talks to.
 //!
-//! A dedicated OS thread owns the terminal (`Surface`), the `avt` emulator, the
-//! `FrameClock`, and the scrollback buffer, on its own current-thread tokio
-//! runtime so its 33 ms redraw tick fires independently of the work side. The
-//! work side talks by value over one mpsc channel ([`Msg`]) — a single channel
-//! gives total ordering of all display events. See `docs/design-execution-engine.md`.
+//! - One OS thread owns `Surface` + `avt` + [`FrameClock`] + scrollback, on its own
+//!   current-thread runtime (33 ms tick fires independently of the work side)
+//! - Work side talks by value over one mpsc channel ([`Msg`]) = total ordering of
+//!   every display event
+//! - See `docs/design-execution-engine.md`
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -17,48 +17,35 @@ use tokio::time::MissedTickBehavior;
 use avt::Vt;
 
 use crate::cancel::{Cancel, CancelSource};
-// Shared with `preflight`'s `spinner_glyph` so the redraw gate and glyph table
-// can't drift apart.
+// Shared with `preflight`'s `spinner_glyph` (redraw gate & glyph table cannot drift)
 use crate::ui::SPINNER_STEP_MS;
 
 use super::{Surface, bridge};
 
-/// Target frame interval (~30 fps): the terminal repaints at most once per
-/// interval, so an output flood collapses to ~30 repaint cycles a second.
+/// Target frame interval (~30 fps) → an output flood collapses to ~30 repaints/s
 const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 
-/// One frame's worth of panel content, produced on demand by a [`SceneFn`].
-/// `left` is the phase-scoped status (cluster / build / run); `right` is the
-/// session-long transfer tracker. Subprocess output and reporter verdicts reach
-/// the terminal as native scrollback, not through the scene.
+/// One frame of panel content, produced on demand by a [`SceneFn`].
+///
+/// - `left` = phase status, `mid` = third column (wide terminals only), `right` =
+///   session-long transfer tracker; at two columns `mid` survives, `right` drops
+/// - `live` = explicit live-region content, `None` = mirror the child's `avt` grid
 pub(crate) struct SceneFrame {
     pub left: String,
-    /// Optional middle column, shown only when the terminal is wide enough for
-    /// three. `None` — every phase but a sync watch — composes as two columns
-    /// exactly as before.
-    ///
-    /// When only two fit, this is the column that *survives* and `right` is
-    /// dropped: a phase asks for a middle column because that content is its
-    /// live one, so the panel sheds the static half first.
     pub mid: Option<String>,
     pub right: String,
-    /// Explicit live-region content (the run phase's running-tests block). `None`
-    /// means "use the child's `avt` grid" — the default for the compile/build
-    /// phases, where the live region mirrors the subprocess's own output.
     pub live: Option<String>,
 }
 
-/// An immutable recipe for rendering the current data at any instant; `elapsed`
-/// is the session-wide clock (drives spinner phase). The render thread calls the
-/// latest one every tick.
+/// Immutable recipe for rendering current data at any instant, called every tick.
+/// `elapsed` = session-wide clock (drives spinner phase)
 pub(crate) type SceneFn = Box<dyn Fn(Duration) -> SceneFrame + Send>;
 
-/// Renders the pinned panel while cancelling. Provided at [`Console::start`] so
-/// the render thread can show "Cancelling…" the instant Ctrl-C arrives, even
-/// before the work side pushes a fresh scene, while staying domain-agnostic.
+/// Renders the pinned panel while cancelling. Handed in at [`Console::start`] so
+/// "Cancelling…" shows on the Ctrl-C itself, before any fresh scene arrives
 pub(crate) type CancelPanelFn = Box<dyn Fn(Duration) -> String + Send>;
 
-/// Messages from the work side to the render thread.
+/// Work side → render thread
 enum Msg {
     Scene(SceneFn),
     Output(Vec<u8>),
@@ -70,8 +57,8 @@ enum Msg {
     Shutdown,
 }
 
-/// The work-side handle: senders plus the shared size/cancel state. Cheap to
-/// clone; every clone talks to the same render thread.
+/// Work-side handle: senders + shared size/cancel state. Cheap to clone (every clone
+/// talks to the same render thread)
 #[derive(Clone, Debug)]
 pub(crate) struct Console {
     tx: mpsc::UnboundedSender<Msg>,
@@ -79,19 +66,16 @@ pub(crate) struct Console {
     cancel: Cancel,
 }
 
-/// Owns the render thread's join handle. Kept by the session's top-level flow;
-/// [`finish`](ConsoleGuard::finish) shuts the thread down and restores the
-/// terminal. Dropping it without `finish` still tears down (best effort).
+/// Owns the render thread's join handle, held by the session's top-level flow.
+/// [`finish`](ConsoleGuard::finish) restores the terminal; plain drop tears down best-effort
 pub(crate) struct ConsoleGuard {
     tx: mpsc::UnboundedSender<Msg>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Console {
-    /// Spawn the render thread and return the handle + its guard. `session_start`
-    /// anchors the session-wide spinner clock; `cancel_panel` renders the pinned
-    /// panel while cancelling. Fails if the terminal can't be put into an inline
-    /// viewport (the caller then falls back to non-TTY mode).
+    /// Spawn the render thread → handle + guard. `session_start` anchors the spinner
+    /// clock. Fails when the terminal takes no inline viewport (caller → non-TTY mode)
     pub fn start(
         session_start: Instant,
         cancel_panel: CancelPanelFn,
@@ -101,21 +85,13 @@ impl Console {
         let (size_tx, size_rx) = watch::channel(initial);
         let (cancel_src, cancel) = CancelSource::new();
 
-        // The render thread reports startup success/failure here so `start`
-        // can surface a terminal-setup error synchronously.
+        // Startup result, so `start` surfaces a terminal-setup error synchronously
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<()>>();
 
         let join = std::thread::Builder::new()
             .name("ztest-render".to_string())
             .spawn(move || {
-                render_thread(
-                    rx,
-                    size_tx,
-                    cancel_src,
-                    cancel_panel,
-                    session_start,
-                    ready_tx,
-                )
+                render_thread(rx, size_tx, cancel_src, cancel_panel, session_start, ready_tx)
             })
             .map_err(io::Error::other)?;
 
@@ -131,103 +107,84 @@ impl Console {
             }
         }
 
-        let console = Console {
-            tx: tx.clone(),
-            size: size_rx,
-            cancel,
-        };
-        let guard = ConsoleGuard {
-            tx,
-            join: Some(join),
-        };
+        let console = Console { tx: tx.clone(), size: size_rx, cancel };
+        let guard = ConsoleGuard { tx, join: Some(join) };
         Ok((console, guard))
     }
 
-    /// Push a fresh render recipe; the render thread keeps painting the latest one
-    /// with an advancing clock so spinners/timers animate between updates.
+    /// Push a fresh render recipe. Latest one keeps painting with an advancing clock
+    /// (spinners/timers animate between updates).
     ///
-    /// Fire-and-forget: a scene sent after the render thread is gone is silently
-    /// dropped (teardown is underway). Same for [`scrollback`](Self::scrollback),
-    /// [`flush_live`](Self::flush_live), and the child-lifecycle sends; only
-    /// [`output`](Self::output) reports the loss, so the reader thread knows to stop.
+    /// Fire-and-forget, as are [`scrollback`](Self::scrollback),
+    /// [`flush_live`](Self::flush_live) and the child-lifecycle sends; only
+    /// [`output`](Self::output) reports the loss (its reader thread must stop)
     pub fn scene(&self, f: impl Fn(Duration) -> SceneFrame + Send + 'static) {
         let _ = self.tx.send(Msg::Scene(Box::new(f)));
     }
 
-    /// Forward raw PTY bytes from a child's reader thread into the `avt` grid.
-    /// Returns `false` once the render thread is gone (the reader should stop).
+    /// Raw PTY bytes from a child's reader thread → the `avt` grid. `false` once the
+    /// render thread is gone (reader should stop)
     pub fn output(&self, bytes: Vec<u8>) -> bool {
         self.tx.send(Msg::Output(bytes)).is_ok()
     }
 
-    /// Push already-formatted ANSI lines straight into native scrollback (the
-    /// engine's verdict + summary lines).
+    /// Pre-formatted ANSI straight into native scrollback (engine verdict + summary)
     pub fn scrollback(&self, ansi: String) {
         let _ = self.tx.send(Msg::Scrollback(ansi));
     }
 
-    /// Commit the current `avt` grid into native scrollback and reset it, so the
-    /// next child starts on a clean live region. Used at phase boundaries.
+    /// Commit the `avt` grid into native scrollback and reset it, at a phase boundary
+    /// (next child starts on a clean live region)
     pub fn flush_live(&self) {
         let _ = self.tx.send(Msg::FlushLive);
     }
 
-    /// Announce the foreground process group of the child now running, so the
-    /// render thread can forward Ctrl-C to it.
+    /// Foreground pgid of the running child, for Ctrl-C forwarding
     pub fn child_started(&self, pgid: Option<i32>) {
         let _ = self.tx.send(Msg::ChildStarted(pgid));
     }
 
-    /// Announce that the current child has exited (clears the Ctrl-C target).
     pub fn child_exited(&self) {
         let _ = self.tx.send(Msg::ChildExited);
     }
 
-    /// Record a fatal message to print once, on a clean line, after the panel is
-    /// torn down. Durable where a mid-run `eprintln!` is not: the render thread
-    /// repaints the footer in place every tick, so a raw stderr write lands under
-    /// the panel and is overwritten by the next repaint. This instead rides the
-    /// render thread's own teardown — emitted after the footer is erased and the
-    /// terminal restored — so a fatal error or panic survives instead of vanishing
-    /// behind a frozen frame. Only the first message is kept (the root cause; later
-    /// ones are usually cascade). The fatal-exit path and the panic hook feed this.
+    /// Record a fatal message, printed once on the clean line after teardown.
+    ///
+    /// - Durable where a mid-run `eprintln!` is not (the footer repaints in place over it)
+    /// - First message only (later ones are cascade)
     pub fn fatal(&self, msg: String) {
         let _ = self.tx.send(Msg::Fatal(msg));
     }
 
-    /// The current terminal size, read by `child::run_child` when it opens a PTY.
+    /// Current terminal size, read by `child::run_child` when it opens a PTY
     pub fn size(&self) -> PtySize {
         *self.size.borrow()
     }
 
-    /// A clone of the size watch, so `child::run_child` can await SIGWINCH-driven
-    /// resizes and forward the new width to its PTY child (`master.resize`).
+    /// Size watch clone, so `child::run_child` awaits SIGWINCH and forwards the new
+    /// width to its PTY child (`master.resize`)
     pub fn size_watch(&self) -> watch::Receiver<PtySize> {
         self.size.clone()
     }
 
-    /// Rows available for the live region above the pinned panel (see
-    /// [`super::live_rows_for`]). Read fresh from the size watch so a SIGWINCH
-    /// resize reaches the child's PTY, not just the grid.
+    /// Rows for the live region above the panel (see [`super::live_rows_for`]). Read
+    /// fresh from the size watch → a SIGWINCH reaches the child's PTY, not just the grid
     pub fn live_rows(&self) -> u16 {
         super::live_rows_for(self.size.borrow().rows)
     }
 
-    /// Whether the user has asked to abort (Ctrl-C). Phases check this between
-    /// blocking steps to stop early.
+    /// Abort requested (Ctrl-C). Phases poll between blocking steps to stop early
     pub fn cancelled(&self) -> bool {
         self.cancel.is_cancelled()
     }
 
-    /// A clone of the cancellation observer, for phases that `select!` on it (the
-    /// engine run loop) rather than polling.
+    /// Cancellation observer clone, for phases that `select!` rather than poll
     pub fn cancel(&self) -> Cancel {
         self.cancel.clone()
     }
 }
 
 impl ConsoleGuard {
-    /// Shut the render thread down and restore the terminal.
     pub fn finish(mut self) {
         let _ = self.tx.send(Msg::Shutdown);
         if let Some(join) = self.join.take() {
@@ -245,8 +202,8 @@ impl Drop for ConsoleGuard {
     }
 }
 
-/// The render thread entry point: build the `Surface` on this thread (it owns
-/// stdout), report readiness, then run the loop on a current-thread runtime.
+/// Render thread entry: build `Surface` here (this thread owns stdout), report
+/// readiness, then run the loop on a current-thread runtime
 fn render_thread(
     rx: mpsc::UnboundedReceiver<Msg>,
     size_tx: watch::Sender<PtySize>,
@@ -264,24 +221,14 @@ fn render_thread(
     };
     let _ = ready_tx.send(Ok(()));
 
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(_) => return,
     };
-    rt.block_on(render_loop(
-        rx,
-        surface,
-        size_tx,
-        cancel,
-        cancel_panel,
-        session_start,
-    ));
+    rt.block_on(render_loop(rx, surface, size_tx, cancel, cancel_panel, session_start));
 }
 
-/// The single render loop: the one and only place a frame is painted.
+/// Sole place a frame is painted
 async fn render_loop(
     mut rx: mpsc::UnboundedReceiver<Msg>,
     mut surface: Surface,
@@ -290,23 +237,21 @@ async fn render_loop(
     cancel_panel: CancelPanelFn,
     session_start: Instant,
 ) {
-    // The `avt` grid's row count (recomputed on resize): the full height above the
-    // panel, so a child's in-place progress block stays live rather than being
-    // sliced into scrollback.
+    // Grid rows = full height above the panel (an in-place progress block stays live
+    // instead of being sliced into scrollback); recomputed on resize
     let mut live_rows = surface.live_rows();
     let mut vt = new_vt(surface.cols(), live_rows);
     let mut carry: Vec<u8> = Vec::new();
-    // Committed lines awaiting the next atomic present, as ANSI strings.
+    // Committed ANSI lines awaiting the next atomic present
     let mut pending: Vec<String> = Vec::new();
     let mut scene: Option<SceneFn> = None;
     let mut clock = FrameClock::new();
     let mut pgid: Option<i32> = None;
     let mut interrupts: u32 = 0;
-    // On the first Ctrl-C the panel switches to the `cancel_panel` overlay.
+    // First Ctrl-C switches the panel to the `cancel_panel` overlay
     let mut cancelling = false;
-    // A fatal message to print on the clean line left after teardown; see
-    // [`Console::fatal`]. Kept until the loop breaks so it survives the footer's
-    // in-place repaints.
+    // Printed after teardown (see `Console::fatal`); held to the loop's end so it
+    // survives the footer's in-place repaints
     let mut fatal: Option<String> = None;
 
     let mut sigint = signal(SignalKind::interrupt());
@@ -323,10 +268,9 @@ async fn render_loop(
                     clock.mark_dirty();
                 }
                 Some(Msg::Output(bytes)) => {
-                    // The redraw tick coalesces a burst into one paint. Don't drain
-                    // the channel here with a typed `while let Ok(Msg::Output(_))`:
-                    // on this unified channel that would discard a non-Output
-                    // message queued mid-burst (a `Scene` or `Scrollback`).
+                    // Redraw tick already coalesces a burst. Never drain here with a
+                    // typed `while let Ok(Msg::Output(_))`: on one unified channel that
+                    // discards a `Scene`/`Scrollback` queued mid-burst
                     feed(&mut vt, &mut carry, &mut pending, &bytes);
                     clock.mark_dirty();
                 }
@@ -351,16 +295,15 @@ async fn render_loop(
 
             _ = recv_signal(&mut sigint) => {
                 interrupts += 1;
-                // Reach the `setsid`-detached PTY children, which don't get the
-                // terminal's SIGINT directly (escalates to SIGKILL from the third).
+                // `setsid`-detached PTY children never get the terminal's SIGINT
+                // directly (third interrupt escalates to SIGKILL)
                 forward_interrupt(pgid, interrupts);
                 if !cancelling {
                     cancel.cancel();
                     cancelling = true;
                 }
                 if interrupts >= 3 {
-                    // Ctrl-C mashed: restore the terminal in place (Drop is skipped
-                    // by `exit`) and hard-quit.
+                    // Ctrl-C mashed: restore in place (`exit` skips Drop), hard-quit
                     surface.finish(&std::mem::take(&mut pending));
                     std::process::exit(130);
                 }
@@ -370,8 +313,7 @@ async fn render_loop(
             _ = recv_signal(&mut sigwinch) => {
                 let size = current_pty_size();
                 surface.set_size(size.cols, size.rows);
-                // Resize the grid to the new height (floored to 1 in `new_vt`:
-                // a 0 dimension underflow-panics inside `avt::resize`).
+                // Floored to 1 (a 0 dimension underflow-panics inside `avt::resize`)
                 live_rows = surface.live_rows();
                 let sb: Vec<avt::Line> = vt
                     .resize((size.cols.max(1)) as usize, (live_rows.max(1)) as usize)
@@ -387,8 +329,8 @@ async fn render_loop(
                 if !clock.should_paint(elapsed) {
                     continue;
                 }
-                // While cancelling, the overlay replaces the left column and clears
-                // transfers + live region; completed output is already in `pending`.
+                // Cancelling: overlay replaces the left column, clears transfers + live
+                // region (completed output already sits in `pending`)
                 let (left, mid, right, live_src) = match scene.as_ref() {
                     _ if cancelling => (
                         cancel_panel(elapsed),
@@ -400,12 +342,12 @@ async fn render_loop(
                         let f = scene(elapsed);
                         (f.left, f.mid, f.right, f.live)
                     }
-                    // No scene yet: still flush queued scrollback, painting an empty panel.
+                    // No scene yet: flush queued scrollback against an empty panel
                     None if !pending.is_empty() => (String::new(), None, String::new(), None),
                     None => continue,
                 };
-                // The scene's explicit live content when present, else the child's
-                // `avt` grid trimmed to its used rows so the footer has no blanks.
+                // Scene's explicit live content, else the `avt` grid trimmed to used
+                // rows (no blanks above the footer)
                 let live_lines: Vec<String> = match &live_src {
                     Some(s) => s.lines().map(str::to_string).collect(),
                     None => bridged(&trimmed_view(&vt)),
@@ -416,22 +358,21 @@ async fn render_loop(
         }
     }
 
-    // Teardown: commit pending scrollback plus the grid's leftover (the last
-    // subprocess's output, not yet scrolled off).
+    // Teardown: pending scrollback + the grid's leftover (last subprocess's output,
+    // never scrolled off)
     let mut final_lines = std::mem::take(&mut pending);
     final_lines.extend(bridged(&trimmed_view(&vt)));
     surface.finish(&final_lines);
 
-    // The footer is erased and the cursor is on a fresh line; a fatal message
-    // written now lands durably instead of under the next (never-coming) footer
-    // repaint. This is the one place a fatal error/panic is emitted to the user.
+    // Footer erased, cursor on a fresh line → the write lands durably.
+    // Sole place a fatal error/panic reaches the user
     if let Some(msg) = fatal {
         eprintln!("{msg}");
     }
 }
 
-/// The redraw decision: repaint when state changed (`dirty`) or the spinner frame
-/// advanced. Starts dirty so the first tick always paints.
+/// Redraw decision: repaint on changed state (`dirty`) or an advanced spinner frame.
+/// Starts dirty (first tick always paints)
 struct FrameClock {
     last_spin: u128,
     dirty: bool,
@@ -439,10 +380,7 @@ struct FrameClock {
 
 impl FrameClock {
     fn new() -> Self {
-        FrameClock {
-            last_spin: u128::MAX,
-            dirty: true,
-        }
+        FrameClock { last_spin: u128::MAX, dirty: true }
     }
 
     fn mark_dirty(&mut self) {
@@ -460,19 +398,15 @@ impl FrameClock {
     }
 }
 
-/// A fresh `avt` grid. `scrollback_limit(0)` yields each line the moment it
-/// scrolls past the grid — our feed into native scrollback. Dimensions are
-/// floored to 1: `avt` underflow-panics on a 0 dimension, which terminals can
-/// momentarily report during a resize.
+/// Fresh `avt` grid.
+///
+/// - `scrollback_limit(0)` yields each line as it scrolls off = our native-scrollback feed
+/// - Dimensions floored to 1 (`avt` underflow-panics on 0, which terminals report mid-resize)
 fn new_vt(cols: u16, rows: u16) -> Vt {
-    Vt::builder()
-        .size(cols.max(1) as usize, rows.max(1) as usize)
-        .scrollback_limit(0)
-        .build()
+    Vt::builder().size(cols.max(1) as usize, rows.max(1) as usize).scrollback_limit(0).build()
 }
 
-/// Fold a PTY chunk into the emulator, accumulating scrolled-off lines into
-/// `pending` for the next present.
+/// Fold a PTY chunk into the emulator, scrolled-off lines → `pending` for the next present
 fn feed(vt: &mut Vt, carry: &mut Vec<u8>, pending: &mut Vec<String>, bytes: &[u8]) {
     let text = decode(carry, bytes);
     if text.is_empty() {
@@ -483,43 +417,31 @@ fn feed(vt: &mut Vt, carry: &mut Vec<u8>, pending: &mut Vec<String>, bytes: &[u8
     }
 }
 
-/// Convert owned `avt` lines to ready-to-write ANSI strings.
 fn bridged(lines: &[avt::Line]) -> Vec<String> {
     lines.iter().map(bridge::avt_line_to_ansi).collect()
 }
 
-/// The live grid trimmed of trailing blank rows (avt pads to full height).
+/// Live grid minus trailing blank rows (avt pads to full height)
 fn trimmed_view(vt: &Vt) -> Vec<avt::Line> {
     let mut lines: Vec<avt::Line> = vt.view().cloned().collect();
-    while lines
-        .last()
-        .is_some_and(|l| l.cells().iter().all(|c| c.is_default()))
-    {
+    while lines.last().is_some_and(|l| l.cells().iter().all(|c| c.is_default())) {
         lines.pop();
     }
     lines
 }
 
-/// Current terminal size as a `PtySize` (80×40 fallback if the query fails).
+/// Current terminal size as a `PtySize` (80×40 fallback on a failed query)
 fn current_pty_size() -> PtySize {
-    let (cols, rows) = terminal_size::terminal_size()
-        .map(|(w, h)| (w.0, h.0))
-        .unwrap_or((80, 40));
-    PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }
+    let (cols, rows) = terminal_size::terminal_size().map(|(w, h)| (w.0, h.0)).unwrap_or((80, 40));
+    PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
 }
 
-/// Register a unix signal, or `None` if registration fails.
 fn signal(kind: SignalKind) -> Option<Signal> {
     tokio::signal::unix::signal(kind).ok()
 }
 
-/// Await the next delivery of an optional signal stream; pends forever when the
-/// stream is absent so its `select!` arm simply never fires.
+/// Await the next delivery of an optional signal stream. Absent stream → pends forever,
+/// so its `select!` arm never fires
 async fn recv_signal(sig: &mut Option<Signal>) {
     match sig {
         Some(s) => {
@@ -529,21 +451,16 @@ async fn recv_signal(sig: &mut Option<Signal>) {
     }
 }
 
-/// Forward a Ctrl-C to the child's process group, escalating with the count:
-/// `1|2` → `SIGINT`, `>=3` → `SIGKILL`. No-op if no child is running.
+/// Ctrl-C → the child's process group, escalating: `1|2` → `SIGINT`, `>=3` → `SIGKILL`.
+/// No-op with no child running
 fn forward_interrupt(pgid: Option<i32>, count: u32) {
     let Some(pgid) = pgid else { return };
-    let sig = if count >= 3 {
-        libc::SIGKILL
-    } else {
-        libc::SIGINT
-    };
+    let sig = if count >= 3 { libc::SIGKILL } else { libc::SIGINT };
     unsafe { libc::killpg(pgid, sig) };
 }
 
-/// Incrementally decode a PTY byte chunk into UTF-8, buffering a trailing
-/// incomplete multi-byte sequence in `carry` and substituting the replacement
-/// char for a genuinely invalid byte so a stray byte can't wedge the stream.
+/// Incrementally decode a PTY chunk to UTF-8: trailing incomplete sequence → `carry`,
+/// invalid byte → U+FFFD (a stray byte cannot wedge the stream)
 fn decode(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
     carry.extend_from_slice(chunk);
     let mut out = String::with_capacity(carry.len());
@@ -581,15 +498,14 @@ mod tests {
     #[test]
     fn frame_clock_paints_when_dirty_then_quiesces() {
         let mut c = FrameClock::new();
-        // Starts dirty → first paint regardless of elapsed.
+        // Starts dirty → paints whatever `elapsed`
         assert!(c.should_paint(Duration::ZERO));
-        // Same spinner frame, no new state → no paint.
+        // Same spinner frame, no new state
         assert!(!c.should_paint(Duration::from_millis(50)));
-        // Spinner frame advanced (100ms step) → paint.
+        // Spinner frame advanced (100ms step)
         assert!(c.should_paint(Duration::from_millis(100)));
-        // Quiesces again.
         assert!(!c.should_paint(Duration::from_millis(150)));
-        // A state change forces a paint within the same frame.
+        // State change repaints within one frame
         c.mark_dirty();
         assert!(c.should_paint(Duration::from_millis(150)));
     }
@@ -613,15 +529,11 @@ mod tests {
 
     #[test]
     fn trimmed_view_drops_trailing_blanks_but_keeps_interior_ones() {
-        // A 4-row grid: content on row 0 and row 2, an interior blank on row 1,
-        // and a trailing blank on row 3. Only the trailing blank should go.
+        // 4 rows: content on 0 and 2, interior blank on 1, trailing blank on 3
         let mut vt = new_vt(10, 4);
         let _ = vt.feed_str("top\r\n\r\nmid\r\n");
         let texts = bridged(&trimmed_view(&vt));
-        assert_eq!(
-            texts,
-            vec!["top".to_string(), String::new(), "mid".to_string()]
-        );
+        assert_eq!(texts, vec!["top".to_string(), String::new(), "mid".to_string()]);
     }
 
     #[test]
@@ -632,8 +544,7 @@ mod tests {
 
     #[test]
     fn feed_forwards_scrolled_off_lines_oldest_first() {
-        // A 2-row grid: feeding three newline-terminated lines scrolls the first
-        // two off the top (oldest first) into `pending`; the third stays live.
+        // 2 rows, 3 lines → first two scroll off oldest-first, third stays live
         let mut vt = new_vt(10, 2);
         let mut carry = Vec::new();
         let mut pending: Vec<String> = Vec::new();
@@ -645,8 +556,7 @@ mod tests {
 
     #[test]
     fn feed_holds_a_split_multibyte_char_in_carry() {
-        // A UTF-8 sequence split across two PTY reads must not corrupt the grid:
-        // the first (partial) feed produces nothing, the second completes it.
+        // Split across two PTY reads: partial feed produces nothing, second completes
         let mut vt = new_vt(10, 1);
         let mut carry = Vec::new();
         let mut pending: Vec<String> = Vec::new();

@@ -1,11 +1,9 @@
-//! Pure conversion from [`avt`]'s emulated terminal cells to ANSI strings.
-//! No I/O; round-trip-tested through a real `avt` parser so colour/attribute/
-//! wide-char handling can't silently drift.
+//! Pure [`avt`] terminal cells → ANSI strings. No I/O; round-tripped through a real `avt`
+//! parser so colour/attribute/wide-char handling cannot silently drift.
 
 use avt::{Color as AvtColor, Line as AvtLine, Pen, Vt};
 
-/// The SGR parameter list for a [`Pen`] (e.g. `"1;38;5;1"` for bold + red), or an
-/// empty string for the terminal default.
+/// SGR params for a [`Pen`] (`"1;38;5;1"` = bold + red); empty = terminal default
 fn sgr_params(pen: &Pen) -> String {
     let mut p: Vec<String> = Vec::new();
     if pen.is_bold() {
@@ -44,19 +42,14 @@ fn sgr_params(pen: &Pen) -> String {
     p.join(";")
 }
 
-/// Convert one emulated terminal line into a self-contained ANSI string, clipped
-/// to at most `max_cols` display columns. Returns the string and the display
-/// width it uses (for side-by-side padding in the two-column panel).
+/// One emulated line → self-contained ANSI, clipped to `max_cols`; returns `(ansi, width)`
+/// (width feeds side-by-side padding).
 ///
-/// Same-pen runs coalesce into one SGR span; trailing default cells are trimmed;
-/// each style change and the line end reset first so nothing bleeds when lines
-/// are concatenated side by side.
+/// - Same-pen runs coalesce into one SGR span, trailing default cells trimmed
+/// - Every style change & the line end reset first (nothing bleeds across concatenation)
 pub(crate) fn avt_line_ansi_clipped(line: &AvtLine, max_cols: usize) -> (String, usize) {
     let cells = line.cells();
-    let end = cells
-        .iter()
-        .rposition(|c| !c.is_default())
-        .map_or(0, |i| i + 1);
+    let end = cells.iter().rposition(|c| !c.is_default()).map_or(0, |i| i + 1);
 
     let mut out = String::new();
     let mut cur = String::new(); // SGR params currently in effect ("" = default)
@@ -89,27 +82,23 @@ pub(crate) fn avt_line_ansi_clipped(line: &AvtLine, max_cols: usize) -> (String,
     (out, used)
 }
 
-/// Unclipped [`avt_line_ansi_clipped`] — the whole line as an ANSI string.
+/// Unclipped [`avt_line_ansi_clipped`]
 pub(crate) fn avt_line_to_ansi(line: &AvtLine) -> String {
     avt_line_ansi_clipped(line, usize::MAX).0
 }
 
-/// Replay an ANSI string through a wide (non-wrapping) emulator and return each
-/// logical row clipped to `width` display columns, as `(ansi, display_width)`.
-/// Lays the two panel columns side by side: an overlong line is clipped, not
-/// wrapped, so it stays one physical row.
+/// Replay ANSI through a wide (non-wrapping) emulator → each logical row as
+/// `(ansi, display_width)`, clipped to `width`.
 ///
-/// `\n` is normalised to `\r\n` first: `avt` is a raw VT where a lone line-feed
-/// moves down without returning to column 0.
+/// - Clipped, never wrapped, so a long line stays one physical row (panel columns sit side by side)
+/// - `\n` normalised to `\r\n` first (`avt` is a raw VT: lone LF moves down, keeps the column)
 pub(crate) fn ansi_rows(s: &str, width: usize) -> Vec<(String, usize)> {
     const NOWRAP: usize = 512;
     let s = s.trim_end_matches('\n');
     let h = s.lines().count().max(1);
     let mut vt = Vt::new(NOWRAP, h);
     vt.feed_str(&s.replace('\n', "\r\n"));
-    vt.view()
-        .map(|row| avt_line_ansi_clipped(row, width))
-        .collect()
+    vt.view().map(|row| avt_line_ansi_clipped(row, width)).collect()
 }
 
 #[cfg(test)]
@@ -134,10 +123,7 @@ mod tests {
         roundtrip(40, "\x1b[1;31mERR\x1b[0m ok");
         roundtrip(40, "ok\x1b[32mgo\x1b[0m more");
         roundtrip(40, "\x1b[38;2;10;20;30mtrue\x1b[0mcolor");
-        roundtrip(
-            40,
-            "\x1b[1mbold\x1b[0m \x1b[4munder\x1b[0m \x1b[7mrev\x1b[0m",
-        );
+        roundtrip(40, "\x1b[1mbold\x1b[0m \x1b[4munder\x1b[0m \x1b[7mrev\x1b[0m");
     }
 
     fn line_of(cols: usize, input: &str) -> AvtLine {
@@ -154,10 +140,7 @@ mod tests {
     #[test]
     fn styled_ansi_resets_at_end_for_safe_concatenation() {
         let ansi = avt_line_to_ansi(&line_of(40, "\x1b[32mgreen\x1b[0m"));
-        assert!(
-            ansi.ends_with("\x1b[0m"),
-            "must reset trailing style: {ansi:?}"
-        );
+        assert!(ansi.ends_with("\x1b[0m"), "must reset trailing style: {ansi:?}");
         assert!(ansi.contains("38;5;2"), "green as extended fg: {ansi:?}");
     }
 
@@ -179,7 +162,7 @@ mod tests {
 
     #[test]
     fn ansi_rows_splits_on_newline_without_column_drift() {
-        // Bare-`\n` rows: the second must start at column 0, not be shifted right.
+        // Bare-`\n` rows: row 1 must start at column 0, not shifted right
         let rows = ansi_rows("alpha\n\x1b[32mbeta\x1b[0m", 20);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, "alpha");
