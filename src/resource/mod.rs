@@ -34,8 +34,8 @@ pub use entry::{
 };
 pub use graph::Graph;
 pub use impls::observability::{
-    GRAFANA_PORT, GRAFANA_SERVICE, OBS_NAMESPACE, PROMETHEUS_PORT, PROMETHEUS_SERVICE,
-    PYROSCOPE_PORT, PYROSCOPE_SERVICE,
+    GRAFANA_PORT, GRAFANA_SERVICE, OBS_NAMESPACE, PROFILE_RETIREMENT_LAG, PROMETHEUS_PORT,
+    PROMETHEUS_SERVICE, PYROSCOPE_PORT, PYROSCOPE_SERVICE, RETENTION_DAYS,
 };
 pub(crate) use impls::policy::{RUN_CLUSTER_ROLE, check_access as check_run_access};
 pub use impls::storage::{

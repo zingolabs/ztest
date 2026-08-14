@@ -125,11 +125,11 @@ consumer work. Group A/B item numbers below are the plan's original labels.
 
 **Produced and in-tree** (`fixtures/chains/`, LFS-tracked, manifests committed):
 
-| Rung | Pin | Compressed | Extracted | % of a 32Gi seed PVC | Boundary gate |
+| Rung | Pin | Compressed | Extracted | % of a 48Gi seed PVC | Boundary gate |
 | --- | --- | --- | --- | --- | --- |
-| Sapling | 425,200 | 11.37 GB | 18.75 GB | 54.6% | `sapling` 0 → 2,299,333,991,832 |
-| Blossom | 659,600 | 14.02 GB | 22.46 GB | 65.4% | skipped — introduces no pool |
-| NU5 / Orchard | 1,693,104 | 21.78 GB | 32.79 GB | **95.4%** | `orchard` 0 → 325,252,861,549 |
+| Sapling | 425,200 | 11.37 GB | 18.75 GB | 36.4% | `sapling` 0 → 2,299,333,991,832 |
+| Blossom | 659,600 | 14.02 GB | 22.46 GB | 43.6% | skipped — introduces no pool |
+| NU5 / Orchard | 1,693,104 | 21.78 GB | 32.79 GB | 63.6% | `orchard` 0 → 325,252,861,549 |
 | NU6.3 / Ironwood | 3,434,143 | ~230 GB (in progress) | ~277 GB | far over | `ironwood` 0 → 83,439,267,169,646 |
 
 **Done.** Step 0 (mainnet activations derived from the running producer; NU6.3
@@ -144,10 +144,16 @@ rejects `.mainnet(testnet::ORCHARD)` at `env.build()`.
 1. **Upload.** None of the mainnet blobs are in R2. `materialize` pulls only
    from the bucket, so every mainnet profile fails preflight until
    `git lfs push`. ~47 GB for the first three rungs.
-2. **A6 — per-artifact seed PVC sizing.** Still a flat `32Gi`
-   (`seed_size()`, `src/materialize/mod.rs`). Blossom fits at 65%; Orchard at
-   95.4% does not survive filesystem overhead and ext4's default 5% reserve;
-   Ironwood is out of the question. This gates every rung past Blossom.
+2. **A6 — per-artifact seed PVC sizing.** Still flat, now `48Gi`
+   (`seed_size()`, `src/materialize/mod.rs`; env var renamed
+   `ZAINO_SEED_SIZE` → `ZTEST_SEED_SIZE` to match every other knob in the
+   crate — it sizes the *chain-archive* volume, and indexer DBs are per-pod
+   `emptyDir`, never seeded). The bump unblocks Orchard at 63.6%, which was
+   95.4% of a 32Gi PVC and did not survive filesystem overhead plus ext4's
+   default 5% reserve. It does **not** close A6: Ironwood at ~277 GB is still
+   out of reach, and the ~96 GiB reclaim from sizing the three testnet seeds
+   off `uncompressed_bytes` gets further away, not closer, as the flat default
+   rises. This now gates only the Ironwood rung.
 3. **A8 — `db_format` enforcement.** Recorded, exposed, still read by nothing.
 4. **A9 — readiness budget.** `DEFAULT_READY_TIMEOUT` is 20 s against a 22.5 GB
    RocksDB open on a fresh clone.
@@ -208,17 +214,19 @@ The variant already exists (`src/component.rs:71`) and is constructed nowhere.
 Falls out of A1.
 
 **A6. Per-artifact seed PVC sizing.** *The hard blocker.*
-`seed_size()` is a flat `"32Gi"` behind one global env var
-(`src/materialize/mod.rs:914`). No mainnet rung past Blossom fits, and a global
-knob cannot be right for a ladder whose rungs differ by two orders of magnitude.
+`seed_size()` is a flat `"48Gi"` behind one global env var, `ZTEST_SEED_SIZE`
+(`src/materialize/mod.rs`). Raising it from `32Gi` bought Orchard and nothing
+structural: Ironwood still does not fit, and a global knob cannot be right for a
+ladder whose rungs differ by two orders of magnitude.
 The manifest already records the answer — `uncompressed_bytes` (the testnet deep
 rung: 10,459,813,376), parsed at compile time and exposed as
 `ChainInfo::uncompressed_bytes()`. Thread it onto `SeedEntry` and size the PVC
 from it plus headroom, the same way `pull_budget()` already derives its deadline
 from size rather than taking a constant (`src/materialize/mod.rs:91`).
 
-This is not only a mainnet fix. Three testnet seeds are bound at 32Gi each for
-~15 GB of actual data; per-artifact sizing reclaims most of ~96 GiB immediately.
+This is not only a mainnet fix, and the `48Gi` bump made it worse: three testnet
+seeds are now bound at 48Gi each for ~15 GB of actual data, so per-artifact
+sizing reclaims ~129 GiB rather than ~96 GiB.
 
 Before sizing anything in the hundreds of Gi, **confirm whether the topolvm
 device class backing `rook-ceph-block-archive` is thin or thick**. The node
@@ -309,7 +317,7 @@ group C  mainnet production                                    (days, serial)
 
 The one ordering that matters: **nothing in group C starts before A and B are
 green.** A multi-day mainnet sync landing on `IndexerMode::Mainnet` returning
-`"not yet supported"`, or on a 32Gi seed PVC, or on a verification path that
+`"not yet supported"`, or on an undersized seed PVC, or on a verification path that
 returns `Ok(())` without checking anything, is the expensive version of a
 mistake that costs nothing to find on the 620 MiB testnet rung.
 

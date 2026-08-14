@@ -74,9 +74,10 @@ pub enum Command {
 
     /// Reclaim your finished test resources — leftover `--no-cleanup`
     /// namespaces, finished detached syncs, build pods, seed bindings, and
-    /// QoS reservations. Live runs and Running syncs are skipped unless
-    /// `--force`; `--all-users` widens the scope to everyone's. Never touches
-    /// the cluster itself or the seed cache.
+    /// QoS reservations. A reclaimed sync's Prometheus metrics go with it,
+    /// permanently. Live runs and Running syncs are skipped unless `--force`;
+    /// `--all-users` widens the scope to everyone's. Never touches the cluster
+    /// itself or the seed cache.
     Cleanup(cleanup::Args),
 
     /// Manage the content-addressed seed cache (`list`, `prune`,

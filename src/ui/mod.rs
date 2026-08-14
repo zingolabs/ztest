@@ -4,7 +4,7 @@
 //!   (mechanics live in [`cli::console`](crate::cli::console)) → testable by
 //!   string comparison
 //! - [`theme`] palette/glyphs · [`layout`] geometry · [`text`] number/duration
-//!   vocabulary · [`plot`] time-series · [`render`] banner + panels · [`status`]
+//!   vocabulary · [`plot`] time-series · [`render`] banner + panels · [`report`]
 //!   sync dashboard
 //! - Shared bottom layers keep surfaces from drifting (disagreeing line budgets
 //!   tear the frame; two abbreviations of one magnitude read as two numbers)
@@ -14,20 +14,21 @@
 //!
 //! [`docs/guide-running-tests.md#preflight`]: https://github.com/zingolabs/ztest/blob/dev/docs/guide-running-tests.md#preflight
 
+mod boxes;
 mod layout;
 pub mod plot;
 mod render;
-mod status;
+mod report;
 pub mod text;
 mod theme;
 
 pub(crate) use self::layout::SPINNER_STEP_MS;
 pub use self::render::{
     RunProgress, render, render_cancel_panel, render_live_panel, render_preflight_panel,
-    render_sync_build_panel, render_sync_cost, render_sync_watch_panel, render_sync_work,
+    render_sync_build_panel, render_sync_load, render_sync_watch_panel, render_sync_work,
     render_transfers,
 };
-pub use self::status::render_sync_status;
+pub use self::report::{ComponentResources, Outcome, ReportView, render_sync_report};
 pub use self::theme::Theme;
 pub use crate::qos::schedule::{QosPlan, TierPlan};
 
@@ -146,6 +147,11 @@ pub struct SyncWatchState {
     pub probes: Vec<ProbeRow>,
     pub violations: usize,
     pub timeline: Option<crate::sync::Timeline>,
+    /// Sampled on [`SAMPLE_PERIOD`](crate::podmetrics::SAMPLE_PERIOD), not the 1s
+    /// scrape — empty until the first sample, and stays empty on a cluster with no
+    /// metrics API (`pods_note` says which)
+    pub pods: Vec<crate::podmetrics::PodLoad>,
+    pub pods_note: Option<String>,
 }
 
 /// `received_at` session-elapsed → renderer ages by subtraction, no clock read
@@ -173,6 +179,7 @@ pub struct SyncVitals {
     pub phase: String,
     pub reorg_depth: u32,
     pub pace: Option<crate::rate::Pace>,
+    pub tx_rate: Option<f64>,
     pub work_rate: Option<f64>,
     pub pool_rates: Vec<(&'static str, Option<f64>)>,
     pub cost: crate::sync::Cost,

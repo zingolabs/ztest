@@ -1,103 +1,58 @@
-//! K8s primitives shared by every [`Provider`](super::Provider) impl: multi-doc
-//! YAML → GVK-dispatched server-side apply, plus condition-waiting. Thin over
-//! `kube-rs`/`k8s-openapi`, keeping each provider to policy alone.
+//! K8s primitives shared by every [`Provider`](super::Provider) impl: typed
+//! server-side apply + condition-waiting. Thin over `kube-rs`/`k8s-openapi`, keeping
+//! each provider to policy alone.
 
 use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-use kube::Client;
-use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, Patch, PatchParams};
+use k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService;
+use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::wait::{Condition, await_condition};
-use serde::Deserialize;
-use serde_yaml::Value as YamlValue;
+use kube::{Client, Resource};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// Field-manager identity for every ztest server-side apply. Public so a co-managing
 /// consumer can pick a distinct manager (no conflicts)
 pub const FIELD_MANAGER: &str = "ztest";
 
-/// Apply a multi-doc YAML string: each doc → [`DynamicObject`], GVK from
-/// `apiVersion`/`kind`, server-side apply.
+/// Server-side apply one typed object under [`FIELD_MANAGER`].
 ///
-/// - Idempotent; providers sharing [`FIELD_MANAGER`] overlap without a stomp
-/// - `apply_error_context` prefixes any failure message
-pub(crate) async fn apply_yaml_bundle(
-    client: &Client,
-    yaml: &str,
-    apply_error_context: &str,
-) -> Result<(), String> {
-    // Owned up front: multi-doc `Deserializer` isn't `Send`, can't be held
-    // across the `.await` between applies.
-    let documents: Vec<(usize, YamlValue)> = serde_yaml::Deserializer::from_str(yaml)
-        .enumerate()
-        .map(|(idx, doc)| {
-            YamlValue::deserialize(doc)
-                .map(|v| (idx, v))
-                .map_err(|e| format!("{apply_error_context}: doc {idx}: parse: {e}"))
-        })
-        .collect::<Result<_, _>>()?;
-    for (idx, value) in documents {
-        // Leading/trailing `---` deserializes to `null`
-        if value.is_null() {
-            continue;
-        }
-        apply_one_document(client, value, apply_error_context, idx).await?;
-    }
-    Ok(())
-}
-
-async fn apply_one_document(
-    client: &Client,
-    value: YamlValue,
-    context: &str,
-    idx: usize,
-) -> Result<(), String> {
-    let (group, version) = {
-        let api_version = value
-            .get("apiVersion")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("{context}: doc {idx}: missing apiVersion"))?;
-        parse_api_version(api_version)
-    };
-    let kind = value
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("{context}: doc {idx}: missing kind"))?
-        .to_string();
-
-    let gvk = GroupVersionKind { group: group.to_string(), version, kind };
-    let ar = ApiResource::from_gvk(&gvk);
-
-    let obj: DynamicObject = serde_yaml::from_value(value)
-        .map_err(|e| format!("{context}: doc {idx}: deserialize: {e}"))?;
-
-    let name = obj
-        .metadata
-        .name
-        .clone()
-        .ok_or_else(|| format!("{context}: doc {idx}: object has no metadata.name"))?;
-    let namespace = obj.metadata.namespace.clone();
-
-    // Namespaced iff the manifest set `metadata.namespace` (discovering the real
-    // scope would cost a live API call).
-    let api: Api<DynamicObject> = match namespace.as_deref() {
-        Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
-        None => Api::all_with(client.clone(), &ar),
-    };
-
-    let params = PatchParams::apply(FIELD_MANAGER).force();
-    api.patch(&name, &params, &Patch::Apply(&obj))
+/// Objects are built, never vendored as YAML text — compiler checks the shape, and
+/// there is no indentation to get wrong
+pub(crate) async fn apply<K>(api: &Api<K>, obj: &K, context: &str) -> Result<(), String>
+where
+    K: Resource + Clone + std::fmt::Debug + Serialize + DeserializeOwned,
+{
+    let name =
+        obj.meta().name.clone().ok_or_else(|| format!("{context}: object has no metadata.name"))?;
+    api.patch(&name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(obj))
         .await
-        .map_err(|e| format!("{context}: doc {idx}: apply {}/{}: {e}", ar.kind, name))?;
+        .map_err(|e| format!("{context}: apply {name}: {e}"))?;
     Ok(())
 }
 
-/// `apiVersion` → `(group, version)`. Core (`v1`) = empty group
-fn parse_api_version(api_version: &str) -> (String, String) {
-    match api_version.split_once('/') {
-        Some((g, v)) => (g.to_string(), v.to_string()),
-        None => (String::new(), api_version.to_string()),
+/// Wait for an aggregated APIService to reach `Available=True`.
+///
+/// Backend rollout != serving: the pod passes its own readiness probe before the
+/// aggregation layer has proxied anything, so this is the only truthful signal
+pub(crate) async fn wait_api_service_available(
+    client: &Client,
+    name: &str,
+    timeout: Duration,
+    no_wait: bool,
+) -> Result<(), String> {
+    if no_wait {
+        return Ok(());
     }
+    let api: Api<APIService> = Api::all(client.clone());
+    let cond = await_condition(api, name, is_api_service_available());
+    tokio::time::timeout(timeout, cond)
+        .await
+        .map_err(|_| format!("timeout waiting for APIService {name} to become Available"))?
+        .map_err(|e| format!("wait for APIService {name}: {e}"))
+        .map(|_| ())
 }
 
 /// Wait for a CRD to reach `Established=True`. `no_wait` returns at once (caller
@@ -181,6 +136,15 @@ fn is_crd_established() -> impl Condition<CustomResourceDefinition> {
         obj.and_then(|c| c.status.as_ref())
             .and_then(|s| s.conditions.as_ref())
             .map(|conds| conds.iter().any(|c| c.type_ == "Established" && c.status == "True"))
+            .unwrap_or(false)
+    }
+}
+
+fn is_api_service_available() -> impl Condition<APIService> {
+    |obj: Option<&APIService>| {
+        obj.and_then(|a| a.status.as_ref())
+            .and_then(|s| s.conditions.as_ref())
+            .map(|cs| cs.iter().any(|c| c.type_ == "Available" && c.status == "True"))
             .unwrap_or(false)
     }
 }

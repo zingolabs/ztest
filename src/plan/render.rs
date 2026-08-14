@@ -245,7 +245,7 @@ fn seed_node(
     )
     .expect("write to string");
 
-    let pvc = format!("ztest-seeds/seed-{sha8}-<driver> 32Gi");
+    let pvc = format!("ztest-seeds/seed-{sha8}-<driver> {}", crate::materialize::seed_size());
     leaves(out, &[("pvc", pvc)], &next, theme);
 }
 

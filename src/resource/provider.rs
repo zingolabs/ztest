@@ -48,6 +48,10 @@ pub enum NodeId {
     ///
     /// [`OBS_NAMESPACE`]: crate::resource::OBS_NAMESPACE
     Observability,
+
+    /// `metrics.k8s.io` resource-metrics API (`kubectl top` / k9s / HPA), separate
+    /// plane from [`Observability`](Self::Observability)'s TSDB
+    MetricsApi,
 }
 
 impl NodeId {
@@ -55,7 +59,7 @@ impl NodeId {
     /// [`Need::Enables`](crate::capability::Need::Enables). Every other node =
     /// `ztest run` precondition
     pub fn is_optional(&self) -> bool {
-        matches!(self, Self::Observability)
+        matches!(self, Self::Observability | Self::MetricsApi)
     }
 
     /// Stable: CLI progress renderer shows these = UX contract
@@ -68,6 +72,7 @@ impl NodeId {
             Self::RunIdentity => "run-identity".into(),
             Self::Buildkit => "buildkit".into(),
             Self::Observability => "metrics-stack".into(),
+            Self::MetricsApi => "metrics-api".into(),
         }
     }
 }

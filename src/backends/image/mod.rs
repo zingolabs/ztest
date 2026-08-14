@@ -64,15 +64,6 @@ impl ImageSpec {
                     .any(|f| f == "prometheus" || f == "no_tls_with_prometheus")
         )
     }
-
-    /// Image links a profiler (`docs/how-to-profile.md`) → pointing it at Pyroscope
-    /// does something. `Published` → always `false`
-    pub(crate) fn profile_enabled(&self) -> bool {
-        matches!(
-            self,
-            ImageSpec::Dev { features, .. } if features.iter().any(|f| f == "profile")
-        )
-    }
 }
 
 /// Where a `dev!(..)` image builds from.

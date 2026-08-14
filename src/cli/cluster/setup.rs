@@ -37,6 +37,12 @@ pub struct Args {
     /// cluster profile instead, and ztest uses those.
     #[arg(long)]
     no_observability: bool,
+
+    /// Don't provision the `metrics.k8s.io` API (metrics-server, into `kube-system`).
+    /// For a cluster whose operator owns that API — a cluster already serving it is
+    /// left untouched regardless.
+    #[arg(long)]
+    no_metrics_api: bool,
 }
 
 pub fn execute(args: Args) -> ExitCode {
@@ -116,6 +122,7 @@ async fn run(args: &Args) -> Result<(), String> {
         InitializeOpts {
             no_wait: args.no_wait,
             observability: !args.no_observability,
+            metrics_api: !args.no_metrics_api,
             ..Default::default()
         },
         on_change,

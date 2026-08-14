@@ -708,8 +708,13 @@ fn detect_puller_image() -> String {
 /// Requested seed-PVC size = floor for every clone off its snapshot. Non-private
 /// because `seeds::read_seed_handle` falls back to it when a driver reports no
 /// `restoreSize`
+///
+/// - Holds the *extracted chain archive* only (indexer DBs = per-pod `emptyDir`)
+/// - Default > deepest registered artifact (mainnet 1,693,104 = 30.5 GiB extracted)
+/// - Flat, not per-artifact from `ChainInfo::uncompressed_bytes` (a full-mainnet rung
+///   would need ~258 GiB → sizing belongs on the handle, not on one global)
 pub(crate) fn seed_size() -> String {
-    std::env::var("ZAINO_SEED_SIZE").unwrap_or_else(|_| "32Gi".into())
+    std::env::var("ZTEST_SEED_SIZE").unwrap_or_else(|_| "48Gi".into())
 }
 
 #[cfg(test)]

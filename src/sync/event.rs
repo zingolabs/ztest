@@ -103,6 +103,7 @@ impl From<&Tick> for crate::sync::Observation {
             height: Some(t.height),
             target: t.target,
             reported_pct: Some(t.pct),
+            transactions: None,
             work: t.work,
             cost: crate::sync::Cost::default(),
         }

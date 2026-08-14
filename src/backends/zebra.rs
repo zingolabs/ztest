@@ -161,9 +161,9 @@ pub struct ZebraValidator {
 /// answer a whole-run question; live height comes from the subject, not the node)
 #[rustfmt::skip]
 pub const ROWS: [crate::metrics::Row; 3] = [
-    crate::metrics::row("validator best height", "zebrad_chain_verified_block_height", crate::metrics::Reduce::Max, crate::metrics::AT_REST),
-    crate::metrics::row("blocks verified", "zebrad_chain_verified_block_total", crate::metrics::Reduce::Sum, crate::metrics::AT_REST),
-    crate::metrics::row("connected peers", "zebrad_network_peers", crate::metrics::Reduce::Max, crate::metrics::AT_REST),
+    crate::metrics::row("validator best height", "zebrad_chain_verified_block_height", crate::metrics::Reduce::Max, crate::metrics::AT_REST, crate::metrics::Unit::Count, crate::metrics::Facet::Progress),
+    crate::metrics::row("blocks verified", "zebrad_chain_verified_block_total", crate::metrics::Reduce::Sum, crate::metrics::AT_REST, crate::metrics::Unit::PerSec, crate::metrics::Facet::Throughput),
+    crate::metrics::row("connected peers", "zebrad_network_peers", crate::metrics::Reduce::Max, crate::metrics::AT_REST, crate::metrics::Unit::Count, crate::metrics::Facet::Progress),
 ];
 
 #[async_trait]

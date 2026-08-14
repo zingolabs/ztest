@@ -586,10 +586,12 @@ fn render_sync_vitals(
     .expect("write to string");
 
     let stale = stale(v, elapsed);
+    // tx/s beside blk/s: same window, same staleness → the two never disagree about
+    // whether the subject is moving (phase rides the `Watching` row instead)
     let mut pace = format!(
         "{} {dot} {}",
         rate_text(v.pace.map(|p| p.per_sec), stale, "blk/s"),
-        v.phase.style(theme.styles.count),
+        rate_text(v.tx_rate, stale, " tx/s").style(theme.styles.count),
     );
     // Suppressed with the stale rate it derives from (a projection off a frozen
     // rate counts down to a finish that is not happening)
@@ -774,51 +776,84 @@ pub fn render_sync_work(
 ///   → the ratio says which to fix
 /// - [`PANEL_LINES`], top row blank (matches [`render_transfers`])
 /// - Empty column names its cause (blank rows read as "everything is zero")
-pub fn render_sync_cost(state: &SyncWatchState, theme: &Theme) -> String {
+pub fn render_sync_load(state: &SyncWatchState, theme: &Theme) -> String {
     let mut out = String::with_capacity(320);
     out.push('\n');
 
-    let row = |out: &mut String, label: &str, value: Option<f64>| {
-        let body = match value {
-            Some(ms) => format!("{ms:.1} ms"),
-            None => "—".to_string(),
-        };
+    // Name the cause: a blank column reads as "the pods are idle", the one thing it
+    // never means (no metrics API, or the first 15s sample not yet landed)
+    if state.pods.is_empty() {
         writeln!(
             out,
             "{:>width$} {}",
-            label.style(theme.styles.dim),
-            body.style(theme.styles.count),
-            width = METRIC_LABEL_WIDTH,
-        )
-        .expect("write to string");
-    };
-
-    // Name the cause: bare "no samples" sent readers hunting an unbroken exporter
-    let Some(vitals) = state.vitals.as_ref() else {
-        writeln!(
-            out,
-            "{:>width$} {}",
-            "cost".style(theme.styles.dim),
-            state
-                .metrics_note
-                .as_deref()
-                .unwrap_or("awaiting first scrape")
-                .style(theme.styles.dim),
+            "load".style(theme.styles.dim),
+            state.pods_note.as_deref().unwrap_or("awaiting first sample").style(theme.styles.dim),
             width = METRIC_LABEL_WIDTH,
         )
         .expect("write to string");
         pad_to_panel(&mut out);
         return out;
+    }
+
+    // One row per pod, `PANEL_LINES - 1` of them (blank top row aligns with the left
+    // column's branded rule); a longer topology collapses its tail
+    let budget = PANEL_LINES - 1;
+    let (shown, hidden) = if state.pods.len() > budget {
+        (&state.pods[..budget - 1], state.pods.len() - (budget - 1))
+    } else {
+        (&state.pods[..], 0)
     };
 
-    // Held through staleness, unlike the rates: means over the whole run stay true
-    // whether or not a scrape landed this second
-    row(&mut out, "fetch", vitals.cost.fetch_ms);
-    row(&mut out, "parse", vitals.cost.parse_ms);
-    row(&mut out, "gRPC", vitals.cost.grpc_ms);
+    for load in shown {
+        writeln!(
+            out,
+            "{:>width$} {} {}",
+            clip_pod(&load.pod).style(theme.styles.dim),
+            cpu_text(load).style(theme.styles.count),
+            mem_text(load).style(theme.styles.count),
+            width = METRIC_LABEL_WIDTH,
+        )
+        .expect("write to string");
+    }
+    if hidden > 0 {
+        writeln!(
+            out,
+            "{:>width$} {}",
+            "".style(theme.styles.dim),
+            format_args!("+{hidden} more").style(theme.styles.dim),
+            width = METRIC_LABEL_WIDTH,
+        )
+        .expect("write to string");
+    }
 
     pad_to_panel(&mut out);
     out
+}
+
+/// Component names are short (`zainod`, `zebrad`); a long one loses its tail rather
+/// than pushing the numbers off the column
+fn clip_pod(name: &str) -> String {
+    if name.chars().count() <= METRIC_LABEL_WIDTH {
+        return name.to_string();
+    }
+    name.chars().take(METRIC_LABEL_WIDTH).collect()
+}
+
+/// `0.6/9c` against a limit, bare `0.6c` without one (no invented denominator)
+fn cpu_text(load: &crate::podmetrics::PodLoad) -> String {
+    let used = load.usage.cpu_milli as f64 / 1000.0;
+    match load.limit.as_ref().map(|l| l.cpu_milli).filter(|&c| c > 0) {
+        Some(limit) => format!("{used:.1}/{}c", limit / 1000),
+        None => format!("{used:.1}c"),
+    }
+}
+
+fn mem_text(load: &crate::podmetrics::PodLoad) -> String {
+    let used = load.usage.mem_bytes as f64 / crate::qos::GIB as f64;
+    match load.limit.as_ref().map(|l| l.mem_bytes).filter(|&m| m > 0) {
+        Some(limit) => format!("{used:.1}/{}Gi", limit / crate::qos::GIB),
+        None => format!("{used:.1}Gi"),
+    }
 }
 
 /// Right column of the pinned console: live background acquisitions, independent
@@ -1381,6 +1416,16 @@ mod tests {
             probes: Vec::new(),
             violations: 0,
             timeline: None,
+            pods: Vec::new(),
+            pods_note: None,
+        }
+    }
+
+    fn pod_load(name: &str, cpu_milli: u64, mem_gib: u64) -> crate::podmetrics::PodLoad {
+        crate::podmetrics::PodLoad {
+            pod: name.to_string(),
+            usage: Resources::new(cpu_milli, mem_gib * crate::qos::GIB, 0, 0),
+            limit: Some(Resources::new(9_000, 24 * crate::qos::GIB, 0, 0)),
         }
     }
 
@@ -1399,6 +1444,7 @@ mod tests {
                 per_sec: 12.4,
                 eta: Some(std::time::Duration::from_secs(10)),
             }),
+            tx_rate: Some(48.0),
             // transparent/sprout = tier B, uncounted; ironwood counted & genuinely
             // idle — the panel must render that difference
             work_rate: Some(23_600.0),
@@ -1411,6 +1457,7 @@ mod tests {
             ],
             cost: crate::sync::Cost {
                 fetch_ms: Some(41.2),
+                treestate_ms: Some(2.1),
                 parse_ms: Some(6.8),
                 grpc_ms: Some(4.13),
             },
@@ -1490,46 +1537,55 @@ mod tests {
         );
     }
 
-    /// Each empty-column cause names itself (one blanket "no samples yet" sends the
-    /// reader hunting a broken exporter when the subject merely has not started)
+    /// An empty load column names its cause (blank rows read as "the pods are idle")
     #[test]
-    fn the_cost_column_distinguishes_why_it_is_empty() {
+    fn the_load_column_distinguishes_why_it_is_empty() {
         let theme = plain_unicode_theme();
-        let render = |note: &str| {
-            let mut state = watching(None);
-            state.metrics_note = Some(note.to_string());
-            let s = render_sync_cost(&state, &theme);
+        let render = |note: Option<&str>| {
+            let mut state = watching(Some(sample_vitals()));
+            state.pods_note = note.map(str::to_string);
+            let s = render_sync_load(&state, &theme);
             assert_eq!(s.lines().count(), PANEL_LINES, "fixed height:\n{s}");
             s
         };
 
-        // Renderer's half of the contract: state the cause, never blank rows (the
-        // causes are derived where the sample is taken)
-        let s = render("no metrics-exposing pod yet");
-        assert!(s.contains("no metrics-exposing pod"), "pre-target cause:\n{s}");
-
-        let s = render("unavailable · connection refused");
-        assert!(s.contains("unavailable"), "unreachable cause:\n{s}");
-        assert!(s.contains("connection refused"), "carries the reason:\n{s}");
+        assert!(render(None).contains("awaiting first sample"), "pre-sample cause");
+        let s = render(Some("no metrics API (`ztest cluster setup`)"));
+        assert!(s.contains("no metrics API"), "missing-API cause:\n{s}");
     }
 
     #[test]
-    fn the_cost_column_splits_upstream_time_from_the_subjects_own() {
-        let s = render_sync_cost(&watching(Some(sample_vitals())), &plain_unicode_theme());
+    fn the_load_column_shows_usage_against_each_pods_limit() {
+        let mut state = watching(Some(sample_vitals()));
+        state.pods = vec![pod_load("zainod", 593, 10), pod_load("zebrad", 6, 1)];
+        let s = render_sync_load(&state, &plain_unicode_theme());
+
         assert_eq!(s.lines().count(), PANEL_LINES, "fixed height:\n{s}");
-        assert!(s.contains("41.2 ms"), "validator round trip:\n{s}");
-        assert!(s.contains("6.8 ms"), "the subject's own parse cost:\n{s}");
-        assert!(s.contains("4.1 ms"), "service latency:\n{s}");
+        assert!(s.contains("zainod"), "names the pod:\n{s}");
+        assert!(s.contains("0.6/9c"), "cpu against its limit:\n{s}");
+        assert!(s.contains("10.0/24Gi"), "memory against its limit:\n{s}");
+        assert!(s.contains("zebrad"), "second pod:\n{s}");
     }
 
-    /// Unpublished summary reads absent, never zero ("no fetch time reported" and
-    /// "fetches instantly" are different claims)
+    /// Burstable pods have no denominator; inventing one would misreport headroom
     #[test]
-    fn an_unpublished_cost_reads_as_absent_not_zero() {
-        let mut vitals = sample_vitals();
-        vitals.cost = crate::sync::Cost::default();
-        let s = render_sync_cost(&watching(Some(vitals)), &plain_unicode_theme());
-        assert!(s.contains("\u{2014}"), "absent value is an em dash:\n{s}");
-        assert!(!s.contains("0.0 ms"), "and never a zero:\n{s}");
+    fn a_pod_without_limits_shows_bare_usage() {
+        let mut state = watching(Some(sample_vitals()));
+        let mut load = pod_load("zainod", 1_500, 2);
+        load.limit = None;
+        state.pods = vec![load];
+        let s = render_sync_load(&state, &plain_unicode_theme());
+        assert!(s.contains("1.5c"), "bare cpu:\n{s}");
+        assert!(!s.contains('/'), "no invented denominator:\n{s}");
+    }
+
+    /// Height-critical: more pods than rows must collapse, never shear the panel
+    #[test]
+    fn a_deep_topology_collapses_its_tail() {
+        let mut state = watching(Some(sample_vitals()));
+        state.pods = (0..8).map(|i| pod_load(&format!("pod{i}"), 100, 1)).collect::<Vec<_>>();
+        let s = render_sync_load(&state, &plain_unicode_theme());
+        assert_eq!(s.lines().count(), PANEL_LINES, "fixed height:\n{s}");
+        assert!(s.contains("+5 more"), "tail collapses:\n{s}");
     }
 }

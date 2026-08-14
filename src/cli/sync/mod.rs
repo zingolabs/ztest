@@ -15,7 +15,7 @@ mod watch;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, stdout};
 use std::process::ExitCode;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod};
 use kube::Client;
@@ -25,6 +25,7 @@ use serde_json::json;
 use clap::{Args as ClapArgs, Subcommand};
 
 use crate::cli::console::{Console, SceneFrame};
+use crate::metrics::query::Series;
 use crate::pipeline::build::BuildOutcome;
 use crate::pipeline::images::DumpOutcome;
 use crate::pipeline::local_bake;
@@ -37,7 +38,7 @@ use crate::sync::{
     SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV, SyncReportMirror, driver_pod_for, kind_selector,
     namespace_for, report_cm_name,
 };
-use crate::ui::{Theme, Transfers};
+use crate::ui::{ComponentResources, Outcome, ReportView, Theme, Transfers};
 
 /// Driver pod's sole container (named: a log request gates on the container's state,
 /// not the pod phase)
@@ -89,8 +90,8 @@ enum Cmd {
         /// Sync id.
         id: String,
     },
-    /// One-shot status: the final report if the run has finished (read from the
-    /// mirror ConfigMap, so it works after the pod is gone), else live progress.
+    /// One-shot status: the whole run in one screen, running or finished. A finished
+    /// run reads from the mirror ConfigMap, so it works after the pod is gone.
     Status {
         /// Sync id.
         id: String,
@@ -915,31 +916,30 @@ async fn list(all_users: bool, json_out: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// One view, live or finished: the header's source differs, every panel below it does
+/// not (Prometheus scrapes a running sync exactly as it scraped a finished one)
 async fn status(id: &str, json_out: bool) -> Result<(), String> {
-    // Durable report first (survives the pod), else the live phase
+    // Durable report first (survives the pod), else the live tick stream
     let client = client().await?;
     let ns = namespace_for(id);
     if let Some(report) = read_report(&client, &ns, id).await? {
         if json_out {
             println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
-        } else {
-            let theme = Theme::detect();
-            println!("{}", report_headline(&theme, &report));
-            // Violations + gaps too: sole command that reads a finished run, so a headline
-            // alone would leave *why* it failed nowhere to print
-            print_report_details(&theme, &report);
-            print_recorded_metrics(&client, &theme, id, &ns).await;
+            return Ok(());
         }
+        let view = build_report_view(&client, id, &ns, mirror_header(&report)).await;
+        print!("{}", crate::ui::render_sync_report(&view, &Theme::detect(), terminal_width()));
         return Ok(());
     }
+
     let pod = find_driver(&client, id).await?;
     let (_, _, phase, _) = row_of(&pod);
     // No report yet, but a running engine publishes state to the driver log → recover the
     // newest tick rather than reporting the pod phase alone
     let live = watch::latest_progress(&watch::DriverPod::new(&client, id)).await;
-    let vitals = live.as_ref().and_then(|s| s.vitals.as_ref());
 
     if json_out {
+        let vitals = live.as_ref().and_then(|s| s.vitals.as_ref());
         let progress = vitals.map(|v| {
             let (ok, total) = live.as_ref().expect("vitals imply state").probe_tally();
             json!({
@@ -958,23 +958,93 @@ async fn status(id: &str, json_out: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    use owo_colors::OwoColorize as _;
-    let theme = Theme::detect();
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    let Some(mut state) = live else {
-        println!(
-            "{} sync {} {dot} {}",
-            theme.chars.dot.style(theme.styles.count),
-            id.style(theme.styles.count),
-            format!("{phase} (starting; no tick published yet)").style(theme.styles.dim),
-        );
-        return Ok(());
-    };
-    // Log tail carries no pod phase (a cluster property only this side has read)
-    state.pod_phase = phase;
-    state.sync_id = id.to_string();
-    print!("{}", crate::ui::render_sync_status(&state, &theme, terminal_width()));
+    let view = build_report_view(&client, id, &ns, live_header(id, &phase, live.as_ref())).await;
+    print!("{}", crate::ui::render_sync_report(&view, &Theme::detect(), terminal_width()));
     Ok(())
+}
+
+/// How long a violating probe has gone unsatisfied, against the deadline it has to
+/// recover in. An `eventually` probe's countdown is what shows a stall coming, so it
+/// stands where a finished run puts the violation's detail
+fn unsatisfied_for(p: &crate::ui::ProbeRow) -> String {
+    use crate::ui::text::format_elapsed;
+    match (p.since_satisfied, p.window) {
+        (Some(since), Some(window)) => {
+            format!("unsatisfied {} of {}", format_elapsed(since), format_elapsed(window))
+        }
+        (Some(since), None) => format!("unsatisfied {}", format_elapsed(since)),
+        (None, Some(window)) => format!("never satisfied, {} allowed", format_elapsed(window)),
+        (None, None) => "violating".to_string(),
+    }
+}
+
+/// Header of a finished run: the mirror is the verdict, and outlives the pod
+fn mirror_header(r: &SyncReportMirror) -> ReportView {
+    ReportView {
+        sync_id: r.sync_id.clone(),
+        profile: r.profile.clone(),
+        verdict: r.verdict.clone(),
+        outcome: match r.passed() {
+            true => Outcome::Passed,
+            false => Outcome::Failed,
+        },
+        segment: r.segment.as_ref().map(|s| s.describe()),
+        elapsed: r
+            .segment
+            .as_ref()
+            .map(|s| Duration::from_millis(s.elapsed_ms))
+            .unwrap_or_default(),
+        violations: r
+            .violations
+            .iter()
+            .map(|v| {
+                let at = v.height.map(|h| format!("@{h} ")).unwrap_or_default();
+                (v.probe.clone(), format!("{at}{}", v.detail))
+            })
+            .collect(),
+        coverage_gaps: r.coverage_gaps.clone(),
+        error: r.error.clone(),
+        ticks: r.ticks,
+        dropped_snapshots: r.dropped_snapshots,
+        ..ReportView::default()
+    }
+}
+
+/// Header of a run still going.
+///
+/// - `Outcome::Running`: there is no verdict yet, and rendering one as a failure would
+///   invent it
+/// - Height/eta seed the header from the tick stream, which leads the TSDB by a scrape;
+///   [`build_report_view`] overrides them only where Prometheus has an answer
+/// - Violating probes stand in for the mirror's violations — same question, asked of a
+///   run that has not finished answering it
+fn live_header(id: &str, pod_phase: &str, live: Option<&crate::ui::SyncWatchState>) -> ReportView {
+    let Some(state) = live else {
+        return ReportView {
+            sync_id: id.to_string(),
+            verdict: pod_phase.to_string(),
+            note: Some("no tick published yet".into()),
+            ..ReportView::default()
+        };
+    };
+    let vitals = state.vitals.as_ref();
+    ReportView {
+        sync_id: id.to_string(),
+        profile: state.profile.clone(),
+        verdict: vitals.map_or_else(|| pod_phase.to_string(), |v| v.phase.clone()),
+        outcome: Outcome::Running,
+        height: vitals.and_then(|v| Some((v.height, v.target?))),
+        eta: vitals.and_then(|v| v.pace).and_then(|p| p.eta),
+        probes: Some(state.probe_tally()),
+        violations: state
+            .probes
+            .iter()
+            .filter(|p| matches!(p.state, crate::sync::ProbeState::Violating))
+            .map(|p| (p.name.clone(), unsatisfied_for(p)))
+            .collect(),
+        note: state.metrics_note.clone(),
+        ..ReportView::default()
+    }
 }
 
 /// Columns for the status view. Non-TTY (pipe, CI log) reports nothing and takes the
@@ -1046,39 +1116,130 @@ fn print_report_details(theme: &Theme, r: &SyncReportMirror) {
     }
 }
 
-/// Server-side record for a finished run: what Prometheus kept after the pods went away,
-/// plus where to see the rest.
+/// Fill a seeded header out from whatever Prometheus holds for the run's window.
 ///
-/// - Best-effort (no metrics stack / unreachable / expired retention → prints nothing;
-///   the store is optional, so a missing Deployment must not fail the report)
-async fn print_recorded_metrics(client: &Client, theme: &Theme, id: &str, ns: &str) {
-    use owo_colors::OwoColorize as _;
+/// - Seed = [`mirror_header`] or [`live_header`]; everything below the header is read
+///   the same way either way (a running sync is scraped exactly as a finished one was)
+/// - Record is best-effort (no metrics stack / unreachable / expired retention): the
+///   panels then state why they are empty rather than failing the report
+/// - Window = driver pod's creation → its exit, or → now while it still runs
+async fn build_report_view(
+    client: &Client,
+    id: &str,
+    ns: &str,
+    mut view: ReportView,
+) -> ReportView {
+    use crate::metrics::Facet;
 
     let Ok(driver) = find_driver(client, id).await else {
-        return;
+        view.note = Some("driver pod is gone; its window cannot be recovered".into());
+        return view;
     };
-    let Some(started) = driver.metadata.creation_timestamp.clone() else {
-        return;
+    let Some(created) = driver.metadata.creation_timestamp.clone() else {
+        return view;
     };
-    let window = (SystemTime::from(started.0), SystemTime::now());
+    let window = run_window(&driver, SystemTime::from(created.0), view.elapsed);
+    view.grafana = grafana_explore_url(ns, window);
+    if view.elapsed.is_zero() {
+        view.elapsed = window.1.duration_since(window.0).unwrap_or_default();
+    }
 
+    // One column per sample: asking for more only repeats points, and asking for
+    // fewer throws away detail the plot has room to draw
+    let points = terminal_width().min(160) / 2;
     let rows: Vec<_> = crate::backends::metrics_components().copied().collect();
-    let Some(recorded) = crate::record::summarize(client, ns, &rows, window).await else {
-        return;
-    };
 
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    for r in recorded {
-        println!(
-            "  {} {} {dot} {}",
-            theme.chars.dot.style(theme.styles.dim),
-            r.label.style(theme.styles.dim),
-            crate::ui::text::thousands(r.value.round() as u64).style(theme.styles.count),
-        );
+    match crate::metrics::query::history(client, ns, &rows, window, points).await {
+        None => {
+            view.note = Some(format!(
+                "no metrics recorded for this run (needs `ztest cluster setup`, and \
+                 Prometheus keeps {} days)",
+                crate::resource::RETENTION_DAYS,
+            ))
+        }
+        Some(series) => {
+            let of = |facet: Facet| -> Vec<_> {
+                series.iter().filter(|s| s.facet == Some(facet)).cloned().collect()
+            };
+            view.transparent = of(Facet::Transparent);
+            view.shielded = of(Facet::Shielded);
+            view.blocks = of(Facet::Blocks);
+            view.throughput = of(Facet::Throughput);
+
+            let progress =
+                |label: &str, pick: fn(&crate::metrics::query::Series) -> Option<f64>| {
+                    series
+                        .iter()
+                        .find(|s| s.facet == Some(Facet::Progress) && s.label == label)
+                        .and_then(pick)
+                        .map(|v| v as u32)
+                };
+            // Reached = where it *stopped* (last), objective = constant across the run so
+            // `peak` survives a dropped final scrape. Tip only ever annotates: measuring
+            // against it marks a run that met its target short by whatever the chain did
+            let reached = progress("finalized", crate::metrics::query::Series::last);
+            let objective = progress("target", crate::metrics::query::Series::peak)
+                .or_else(|| progress("chain tip", crate::metrics::query::Series::last));
+            // Only where the TSDB has an answer: a live seed already carries the tick
+            // stream's height, which is fresher, and `None` here must not erase it
+            if let Some(height) = reached.zip(objective) {
+                view.height = Some(height);
+            }
+            view.tip = progress("chain tip", crate::metrics::query::Series::last).or(view.tip);
+        }
     }
-    if let Some(url) = grafana_explore_url(ns, window) {
-        println!("  {} {}", theme.chars.dot.style(theme.styles.dim), url.style(theme.styles.dim));
+
+    if let Some(history) =
+        crate::metrics::query::container_history(client, ns, window, points).await
+    {
+        view.resources = by_component(history);
     }
+    view
+}
+
+/// Container-labelled readings → one [`ComponentResources`] per component.
+///
+/// Bundled backends lead, in the order they are declared (the subject ahead of what it
+/// proxies); anything else the namespace ran follows, named but unranked
+fn by_component(history: crate::metrics::query::ContainerHistory) -> Vec<ComponentResources> {
+    let crate::metrics::query::ContainerHistory { cpu, mem, disk_read, disk_write, io_stall } =
+        history;
+    let observed = || cpu.iter().chain(&mem).chain(&disk_read).chain(&disk_write).chain(&io_stall);
+
+    let mut names: Vec<String> = crate::backends::metrics_component_labels()
+        .map(str::to_string)
+        .filter(|n| observed().any(|s| &s.label == n))
+        .collect();
+    let mut rest: Vec<String> =
+        observed().map(|s| s.label.clone()).filter(|l| !names.contains(l)).collect();
+    rest.sort();
+    rest.dedup();
+    names.append(&mut rest);
+
+    let pick = |series: &[Series], name: &str| -> Vec<Series> {
+        series.iter().filter(|s| s.label == name).cloned().collect()
+    };
+    // Read + write are disjoint halves of one device total, so they stack. Relabelled to
+    // the operation: the panel title already names the container, and a legend repeating
+    // it twice says nothing
+    let disk = |name: &str| -> Vec<Series> {
+        [(&disk_read, "read"), (&disk_write, "write")]
+            .into_iter()
+            .flat_map(|(series, op)| {
+                pick(series, name).into_iter().map(|s| Series { label: op.to_string(), ..s })
+            })
+            .collect()
+    };
+    names
+        .into_iter()
+        .map(|component| ComponentResources {
+            cpu: pick(&cpu, &component),
+            mem: pick(&mem, &component),
+            disk: disk(&component),
+            io_stall: pick(&io_stall, &component),
+            component,
+        })
+        .collect()
 }
 
 /// Grafana Explore deep link scoped to this run's namespace + window.
@@ -1099,6 +1260,44 @@ fn grafana_explore_url(ns: &str, window: (SystemTime, SystemTime)) -> Option<Str
         crate::resource::GRAFANA_PORT,
         crate::resource::GRAFANA_PORT,
     ))
+}
+
+/// Prometheus range covering the *run*, not the pod that hosted it.
+///
+/// - Ends at the driver's exit, never `now` (a detached sync's pod idles for hours
+///   after its verdict; those flat scrapes dilute every average and squeeze the plotted
+///   run into the left edge)
+/// - Opens `elapsed` back from that end — `Segment::elapsed_ms` already excludes
+///   provisioning, which is where a cold seed spends an hour publishing nothing
+/// - Never before the pod existed, and falls back to its full span when either bound
+///   is unknown
+fn run_window(
+    driver: &k8s_openapi::api::core::v1::Pod,
+    created: SystemTime,
+    elapsed: Duration,
+) -> (SystemTime, SystemTime) {
+    let ended = driver_finished_at(driver).unwrap_or_else(SystemTime::now);
+    let started = match elapsed.is_zero() {
+        true => created,
+        false => ended.checked_sub(elapsed).unwrap_or(created).max(created),
+    };
+    (started, ended)
+}
+
+fn driver_finished_at(driver: &k8s_openapi::api::core::v1::Pod) -> Option<SystemTime> {
+    let finished = driver
+        .status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .first()?
+        .state
+        .as_ref()?
+        .terminated
+        .as_ref()?
+        .finished_at
+        .clone()?;
+    Some(SystemTime::from(finished.0))
 }
 
 async fn read_report(

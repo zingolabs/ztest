@@ -154,8 +154,12 @@ impl Palette {
             true => Palette {
                 channels: vec![
                     ("transparent", Style::new().bright_black()),
+                    ("transparent in", Style::new().bright_black()),
+                    ("transparent out", Style::new().bright_black()),
                     ("sprout", Style::new().magenta()),
                     ("sapling", Style::new().yellow()),
+                    ("sapling spends", Style::new().yellow()),
+                    ("sapling outputs", Style::new().yellow()),
                     ("orchard", Style::new().green()),
                     ("ironwood", Style::new().cyan()),
                 ],
@@ -177,7 +181,13 @@ impl Palette {
         }
     }
 
-    fn style_of(&self, channel: &str) -> Style {
+    /// Colour for structure set among data (chip separators). Blue: free of every pool
+    /// colour, so a separator never reads as a layer
+    pub fn separator(&self) -> Style {
+        self.baseline
+    }
+
+    pub fn style_of(&self, channel: &str) -> Style {
         self.channels
             .iter()
             .find(|(name, _)| *name == channel)

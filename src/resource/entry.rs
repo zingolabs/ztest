@@ -12,7 +12,9 @@ use crate::inventory::{DevImageEntry, SeedEntry};
 use crate::qos;
 use crate::resource::context::Cx;
 use crate::resource::graph::{Graph, GraphError};
-use crate::resource::impls::{buildkit, image, observability, policy, scaffolding, seed};
+use crate::resource::impls::{
+    buildkit, image, metrics_api, observability, policy, scaffolding, seed,
+};
 use crate::resource::provider::NodeId;
 use crate::resource::state::NodeState;
 
@@ -23,6 +25,8 @@ use crate::resource::state::NodeState;
 ///   (there the operator owns which nodes carry NVMe)
 /// - `observability` = the one node worth declining (a cluster with its own
 ///   Prometheus/Pyroscope wants `--no-observability` + the endpoints configured)
+/// - `metrics_api` writes into `kube-system` → declinable for a shared cluster ztest
+///   does not own (already-served clusters self-skip without it)
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct InitializeOpts {
@@ -31,6 +35,7 @@ pub struct InitializeOpts {
     pub label_nvme_pool: bool,
     pub backend: crate::cluster_config::ClusterClass,
     pub observability: bool,
+    pub metrics_api: bool,
 }
 
 impl Default for InitializeOpts {
@@ -44,6 +49,7 @@ impl Default for InitializeOpts {
             // run rules
             backend: crate::backends::image::selected_class(),
             observability: true,
+            metrics_api: true,
         }
     }
 }
@@ -98,6 +104,12 @@ where
         graph
             .add_dedup(Box::new(scaffolding::NamespaceProvider::new(observability::OBS_NAMESPACE)));
         graph.add_dedup(Box::new(observability::ObservabilityProvider));
+    }
+
+    // Resource-metrics API. Independent of the stack above (different plane, different
+    // consumers); `kube-system` is pre-existing, so no namespace dep
+    if opts.metrics_api {
+        graph.add_dedup(Box::new(metrics_api::MetricsApiProvider));
     }
 
     graph.validate()?;

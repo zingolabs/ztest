@@ -8,6 +8,13 @@
 //!   `--all-users` = everyone (needs cluster-wide list/delete, else RBAC errors)
 //! - Live resources skipped without `--force` (never kill a concurrent run or a
 //!   multi-hour sync)
+//! - Reclaims a sync's Prometheus series alongside its objects (its report ConfigMap
+//!   dies with the namespace regardless, so the record they serve goes with it)
+//! - Profiles retire, not purge: no delete API upstream, so a tenant's retention drops
+//!   to 1s and Pyroscope's own cleaner deletes ([`PROFILE_RETIREMENT_LAG`], set by the
+//!   fixed 6h partition window)
+//!
+//! [`PROFILE_RETIREMENT_LAG`]: crate::resource::PROFILE_RETIREMENT_LAG
 
 use std::process::ExitCode;
 
@@ -110,6 +117,32 @@ fn report(outcome: &Outcome, dry_run: bool) -> Result<(), String> {
     }
     for e in &outcome.errors {
         eprintln!("  {} {e}", "✗".red());
+    }
+
+    if !outcome.purged.is_empty() {
+        let verb = if dry_run { "would purge" } else { "purged" };
+        eprintln!(
+            "  {} {verb:<10} {:<16} {}",
+            "✓".green(),
+            "metrics",
+            format_args!("({} series selector(s))", outcome.purged.len()).dimmed(),
+        );
+    }
+
+    // "retired", never "purged" (no delete API — Pyroscope's own cleaner does it, later)
+    if !outcome.retired.is_empty() {
+        let verb = if dry_run { "would retire" } else { "retired" };
+        eprintln!(
+            "  {} {verb:<10} {:<16} {}",
+            "✓".green(),
+            "profiles",
+            format_args!(
+                "({} tenant(s), deleted within {})",
+                outcome.retired.len(),
+                crate::resource::PROFILE_RETIREMENT_LAG
+            )
+            .dimmed(),
+        );
     }
 
     if outcome.deleted.is_empty() && outcome.skipped.is_empty() && outcome.errors.is_empty() {

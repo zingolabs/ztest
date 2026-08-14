@@ -13,7 +13,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use super::{ANNOTATION_IO_BPS, ANNOTATION_IO_IOPS, Resources};
 
-/// k8s CPU quantity → millicores. `"500m"`/`"2"`/`"1.5"`/`"2500000n"` (rounds up).
+/// k8s CPU quantity → millicores. `"500m"`/`"2"`/`"1.5"`/`"2500000n"` (rounds to nearest).
 /// Unrecognized → 0, which under-counts (unsafe direction — leave no real unit unhandled)
 pub(crate) fn parse_cpu_milli(s: &str) -> u64 {
     parse_cpu_milli_opt(s).unwrap_or(0)
@@ -39,6 +39,12 @@ pub(crate) fn parse_mem_bytes_opt(s: &str) -> Option<u64> {
 /// Absent `requests` → [`Resources::ZERO`].
 pub(crate) fn container_requests(c: &Container) -> Resources {
     container_amount(c.resources.as_ref().and_then(|r| r.requests.as_ref()))
+}
+
+/// Absent `limits` → [`Resources::ZERO`], i.e. uncapped, not zero-capped. Callers
+/// wanting a denominator must reject `ZERO` rather than divide by it
+pub(crate) fn container_limits(c: &Container) -> Resources {
+    container_amount(c.resources.as_ref().and_then(|r| r.limits.as_ref()))
 }
 
 /// I/O dimensions always zero (no k8s I/O field; harness caps via cgroup `io.max`,
@@ -85,6 +91,12 @@ fn pod_effective(pod: &PodSpec, per_container: impl Fn(&Container) -> Resources)
 /// CPU+memory only, disk I/O rides the PVC ([`pvc_io_reservation`])
 pub(crate) fn pod_effective_request(pod: &PodSpec) -> Resources {
     pod_effective(pod, container_requests)
+}
+
+/// Ceiling the pod may draw, on the same effective model as
+/// [`pod_effective_request`]. `ZERO` in a dimension = uncapped there
+pub(crate) fn pod_effective_limit(pod: &PodSpec) -> Resources {
+    pod_effective(pod, container_limits)
 }
 
 /// From [`ANNOTATION_IO_BPS`]/[`ANNOTATION_IO_IOPS`], CPU/memory always zero.

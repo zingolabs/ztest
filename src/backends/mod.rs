@@ -49,6 +49,12 @@ pub(crate) fn metrics_components() -> impl Iterator<Item = &'static crate::metri
     METRICS_BACKENDS.iter().flat_map(|b| b.rows)
 }
 
+/// Bundled backends in report order — the subject ahead of what it proxies, so a
+/// per-component view leads with the thing under test
+pub(crate) fn metrics_component_labels() -> impl Iterator<Item = &'static str> {
+    METRICS_BACKENDS.iter().map(|b| b.label)
+}
+
 /// `None` for a backend that implements no [`Observe`](crate::sync::Observe).
 pub(crate) fn observe(
     component_label: &str,

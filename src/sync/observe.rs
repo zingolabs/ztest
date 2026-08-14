@@ -14,11 +14,14 @@ use crate::metrics::Exposition;
 use crate::rate::{Pace, Stamp};
 
 /// Where a component's per-block time goes; all-`None` for one publishing no timing
-/// summaries (a fact about it, not a zero). `parse_ms` = own work minus upstream wait,
-/// i.e. whether a slow sync is this component's fault
+/// summaries (a fact about it, not a zero).
+///
+/// - `fetch_ms`/`treestate_ms` = source reads (in-process backend → this cpu, not upstream)
+/// - `parse_ms` = build - both = assembly the component does itself
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Cost {
     pub fetch_ms: Option<f64>,
+    pub treestate_ms: Option<f64>,
     pub parse_ms: Option<f64>,
     pub grpc_ms: Option<f64>,
 }
@@ -36,6 +39,9 @@ pub struct Observation {
     pub height: Option<u32>,
     pub target: Option<u32>,
     pub reported_pct: Option<f32>,
+    /// Cumulative transactions scanned. Outside [`Work`]: a tx spans many ops, so an
+    /// `Op` variant would double-count every total and stack a pool graph wrong
+    pub transactions: Option<u64>,
     pub work: Work,
     pub cost: Cost,
 }
@@ -64,6 +70,8 @@ impl From<&super::Snapshot> for Observation {
             height: Some(snap.height()),
             target: snap.target(),
             reported_pct: Some(snap.pct()),
+            // Driver ticks carry no tx counter (exporter-only, like `cost`)
+            transactions: None,
             work: snap.work(),
             cost: Cost::default(),
         }
@@ -100,6 +108,13 @@ impl<S: Stamp> Window<S> {
         self.pace_by(|o| o.height.map(f64::from), remaining)
     }
 
+    /// Transactions/sec across the window. `None` while unmeasured or after a restart
+    /// re-published the counter from zero (a decreasing cumulative = no rate, not a
+    /// negative one)
+    pub fn tx_rate(&self) -> Option<f64> {
+        self.pace_by(|o| o.transactions.map(|t| t as f64), None).map(|p| p.per_sec)
+    }
+
     /// Protocol work/sec across the window, per op. [`Work::delta`] saturates and covers
     /// only ops **both** ends measured → a counter reset reads zero, not negative, and a
     /// dropped op leaves rather than freezes
@@ -123,6 +138,7 @@ mod tests {
             height: Some(height),
             target: Some(1_000),
             reported_pct: None,
+            transactions: None,
             work,
             cost: Cost::default(),
         }
@@ -174,6 +190,41 @@ mod tests {
     fn a_counter_reset_reads_as_zero_work_not_as_a_negative_rate() {
         let w = window(&[(0, 500, 9_000), (1, 501, 5)]);
         assert_eq!(w.work_rate().unwrap().get(Op::TransparentOut), Some(0.0));
+    }
+
+    /// `(second, cumulative transactions)` → the tx window under test
+    fn tx_window(samples: &[(u64, Option<u64>)]) -> Window {
+        let origin = Instant::now();
+        let mut w = Window::new(Duration::from_secs(10));
+        for &(secs, transactions) in samples {
+            let mut o = observation(0, 0);
+            o.transactions = transactions;
+            w.push(origin + Duration::from_secs(secs), o);
+        }
+        w
+    }
+
+    #[test]
+    fn transactions_per_second_measures_across_the_window() {
+        let w = tx_window(&[(0, Some(1_000)), (2, Some(1_400)), (4, Some(2_600))]);
+        assert_eq!(w.tx_rate(), Some(400.0));
+    }
+
+    /// A component publishing no tx counter must read `—`, never an idle `0`
+    #[test]
+    fn an_unpublished_tx_counter_is_not_a_zero_rate() {
+        assert_eq!(tx_window(&[(0, None), (1, None)]).tx_rate(), None);
+    }
+
+    /// Restart re-publishes from zero; a decreasing cumulative is no rate at all
+    #[test]
+    fn a_tx_counter_reset_reads_as_no_rate() {
+        assert_eq!(tx_window(&[(0, Some(9_000)), (1, Some(5))]).tx_rate(), None);
+    }
+
+    #[test]
+    fn one_tx_sample_is_not_a_rate() {
+        assert_eq!(tx_window(&[(0, Some(1_000))]).tx_rate(), None);
     }
 
     #[test]

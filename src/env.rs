@@ -1048,6 +1048,7 @@ impl TestEnv {
         ctx: &MaterializeCtx<'_>,
         items: &[MaterializeItem],
     ) -> Result<(), EnvError> {
+        deploy_ebpf_collector(ctx).await;
         for (id, spec, opts, handle) in items {
             // One INFO per provisioned pod; both build phases funnel here, so this is the
             // single place covering every pod
@@ -1090,20 +1091,6 @@ impl TestEnv {
                 .lock()
                 .expect("seed_bindings mutex poisoned")
                 .extend(resolved.seed_bindings);
-            // Profiled → point at Pyroscope; no install = run unprofiled (never fail a run
-            // over a diagnostic)
-            let mut spec = spec.clone();
-            if opts.image.profile_enabled()
-                && let Some(url) = crate::profiling::push_url(ctx.client).await
-            {
-                let tags = [
-                    ("component", spec.pod_name.clone()),
-                    ("namespace", ctx.sentinel.namespace.clone()),
-                    ("run_id", ctx.coords.run_id.clone()),
-                ];
-                spec.env.extend(crate::profiling::pod_env(&url, &tags, None));
-            }
-            let spec = &spec;
             apply_pod(ctx, spec, &resolved.mounts).await?;
             self.inner.components.write().await.insert(*id, state);
         }
@@ -1335,6 +1322,36 @@ fn short_kind(s: &str) -> String {
         .collect();
     let s = s.trim_matches('-').to_string();
     if s.is_empty() { "x".into() } else { s.chars().take(20).collect() }
+}
+
+/// Per-run eBPF collector, applied before the run's pods exist — discovery is a watch, so
+/// a target created later is still picked up.
+///
+/// - Server-side apply → re-running per phase re-applies, never duplicates
+/// - Never fails the run: an absent profile costs a diagnostic (same contract as the
+///   in-process pusher)
+async fn deploy_ebpf_collector(ctx: &MaterializeCtx<'_>) {
+    if !crate::profiling::ebpf::requested() {
+        return;
+    }
+    let Some(url) = crate::profiling::push_url(ctx.client).await else {
+        tracing::warn!("eBPF profiling requested but no Pyroscope found; running unprofiled");
+        return;
+    };
+    // Sync id else run id, matching the in-process tenant exactly — `ztest cleanup` retires
+    // one tenant per sync and must reach both pushers
+    let id = crate::sync::active_sync_id().unwrap_or_else(|| ctx.coords.run_id.clone());
+    let tenant = crate::profiling::tenant(&crate::naming::current_user(), &id);
+    let collector = crate::profiling::ebpf::Collector {
+        namespace: &ctx.sentinel.namespace,
+        tenant: &tenant,
+        push_url: &url,
+        hz: crate::profiling::ebpf::hz(),
+    };
+    match crate::profiling::ebpf::deploy(ctx.client, &collector).await {
+        Ok(()) => tracing::info!(namespace = %ctx.sentinel.namespace, %tenant, "eBPF collector up"),
+        Err(e) => tracing::warn!(%e, "eBPF collector failed; running unprofiled"),
+    }
 }
 
 async fn apply_pod(

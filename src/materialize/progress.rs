@@ -58,7 +58,9 @@ pub(crate) async fn watch_puller(
         };
 
         if exhausted.as_deref() == Some(name.as_str()) {
-            // Bytes in; only the Job's terminal condition (the caller's race) outstanding
+            // Re-read per tick: the exit code lands *after* the log closes, so the
+            // verdict is not knowable at EOF
+            settle(&pod, progress);
             tokio::time::sleep(PRE_RUN_POLL).await;
             continue;
         }
@@ -78,9 +80,10 @@ pub(crate) async fn watch_puller(
 
         let backfill = resuming.then_some(REATTACH_BACKFILL_SECS);
         match follow(pods, &name, total, backfill, progress, &mut transferred).await {
-            // Clean EOF = payload in; what remains (extract tail, Job condition) isn't byte-shaped
+            // Clean EOF = the container exited — succeeded *or* died. What remains
+            // (extract tail, Job condition) isn't byte-shaped either way
             Ok(()) => {
-                progress.finalizing();
+                settle(&pod, progress);
                 exhausted = Some(name);
                 resuming = false;
             }
@@ -93,6 +96,28 @@ pub(crate) async fn watch_puller(
                 tokio::time::sleep(REATTACH_DELAY).await;
             }
         }
+    }
+}
+
+/// Post-EOF state of one attempt, onto the row.
+///
+/// `finalizing` drops the bar, rate and ETA, so it must be reserved for a pull that
+/// actually landed — a dead attempt parked there reads as progress for the whole backoff
+fn settle(pod: &Pod, progress: &NodeProgress) {
+    match failure_note(pod) {
+        Some(note) => progress.note(note),
+        None => progress.finalizing(),
+    }
+}
+
+/// Attempt died, in its own exit code.
+///
+/// - Status trails the log close → absent code is *undecided*, reported as neither
+/// - Retry is the Job's (`backoffLimit`); a spent one surfaces via its terminal condition
+fn failure_note(pod: &Pod) -> Option<String> {
+    match pod.status.as_ref().and_then(pod_status::exit_code) {
+        Some(code) if code != 0 => Some(format!("pull failed (exit {code}) · retrying")),
+        _ => None,
     }
 }
 
@@ -179,6 +204,53 @@ fn dd_bytes(record: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminated(exit_code: i32) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "puller-abc" },
+            "status": {
+                "containerStatuses": [{
+                    "name": "puller",
+                    "ready": false,
+                    "restartCount": 0,
+                    "image": "fedora:40",
+                    "imageID": "",
+                    "state": { "terminated": { "exitCode": exit_code, "reason": "Error" } },
+                }],
+            },
+        }))
+        .expect("valid Pod")
+    }
+
+    /// The stuck-at-`finalizing…` bug: a dead attempt closes its log exactly like a
+    /// finished one, and `finalizing` drops the bar/rate/ETA until the Job gives up
+    #[test]
+    fn a_nonzero_exit_is_a_failure_not_a_finalizing_pull() {
+        assert_eq!(
+            failure_note(&terminated(2)).as_deref(),
+            Some("pull failed (exit 2) · retrying")
+        );
+    }
+
+    #[test]
+    fn a_clean_exit_leaves_the_row_finalizing() {
+        assert_eq!(failure_note(&terminated(0)), None);
+    }
+
+    /// Container status trails the log close; an undecided attempt must not be called failed
+    #[test]
+    fn an_unreported_exit_is_undecided_rather_than_failed() {
+        let pending: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "puller-abc" },
+            "status": { "phase": "Running" },
+        }))
+        .expect("valid Pod");
+        assert_eq!(failure_note(&pending), None);
+    }
 
     #[test]
     fn a_progress_record_yields_its_absolute_count() {

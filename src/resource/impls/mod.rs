@@ -6,6 +6,7 @@
 
 pub(crate) mod buildkit;
 pub(crate) mod image;
+pub(crate) mod metrics_api;
 pub(crate) mod observability;
 pub(crate) mod policy;
 pub(crate) mod scaffolding;

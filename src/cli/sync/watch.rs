@@ -19,7 +19,7 @@ use crate::metrics::{PodExporter, Poller, Sample};
 use crate::resource::impls::policy::RUN_NAMESPACE;
 use crate::sync::{SyncEvent, Window, decode_event, driver_pod_for, namespace_for, plot_channels};
 use crate::ui::{
-    ProbeRow, SetupStep, SyncVitals, SyncWatchState, Theme, render_sync_cost,
+    ProbeRow, SetupStep, SyncVitals, SyncWatchState, Theme, render_sync_load,
     render_sync_watch_panel, render_sync_work,
 };
 
@@ -52,12 +52,15 @@ impl DriverPod {
     }
 }
 
-/// The two logs an attach merges, each with its own namespace's handle: driver in
-/// [`RUN_NAMESPACE`], subject under test in the sync's (a pair is harder to mix up
-/// than two bare `Api<Pod>` parameters)
+/// What an attach reads from, bundled: driver log in [`RUN_NAMESPACE`], subject log +
+/// pod-metrics sampling in the sync's namespace (a bundle is harder to mix up than
+/// four bare handles, two of which are `Api<Pod>`)
 pub(super) struct Followed<'a> {
     driver: &'a DriverPod,
     sut: &'a Api<Pod>,
+    client: &'a kube::Client,
+    /// Sync's namespace; `sut`'s, named separately for the metrics.k8s.io read
+    namespace: &'a str,
 }
 
 /// Driver-pod phase re-read interval; slow, since it only matters before the
@@ -122,15 +125,16 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
         row_of(&pod).2,
     );
 
-    // Three views on one clock: position+pace / per-pool rates / per-block cost.
-    // All off the same 1s scrape → no two columns describe different instants.
-    // Too narrow for three → cost is the column that goes
+    // Three views: position+pace / per-pool rates / per-pod draw. Left and mid share
+    // the 1s scrape; right is the 15s `metrics.k8s.io` sample, on its own clock and
+    // labelled as a different quantity so the mismatch cannot read as a stall.
+    // Too narrow for three → load is the column that goes
     let render = |feed: &Feed| {
         let (state, theme) = (feed.state.clone(), theme.clone());
         console.scene(move |elapsed| SceneFrame {
             left: render_sync_watch_panel(&state, elapsed, &theme),
             mid: Some(render_sync_work(&state, elapsed, &theme)),
-            right: render_sync_cost(&state, &theme),
+            right: render_sync_load(&state, &theme),
             live: None,
         });
     };
@@ -152,7 +156,7 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
 
     feed.observed = true;
     let tail = tail_loop(
-        Followed { driver: &driver, sut: &api },
+        Followed { driver: &driver, sut: &api, client: &client, namespace: &ns },
         &mut metrics,
         &console,
         session_start,
@@ -217,7 +221,7 @@ async fn tail_loop(
     theme: &Theme,
     render: impl Fn(&Feed),
 ) -> Result<(), String> {
-    let Followed { driver, sut: api } = followed;
+    let Followed { driver, sut: api, client, namespace } = followed;
     // Last cause shown → a standing condition is stated once, not once a second
     let mut last_note: Option<String> = None;
 
@@ -240,6 +244,10 @@ async fn tail_loop(
     let (mut driver_seen, mut sut_seen) = (Instant::now(), Instant::now());
     let mut ticker = tokio::time::interval(POD_POLL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Own cadence, matching metrics-server's resolution: a faster poll re-reads one
+    // reading. First tick fires immediately, so the column fills on attach
+    let mut load_ticker = tokio::time::interval(crate::podmetrics::SAMPLE_PERIOD);
+    load_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         if console.cancelled() {
@@ -272,6 +280,25 @@ async fn tail_loop(
                 // `metrics` borrowed by this arm's future → the fold consuming it
                 // cannot run inside the arm
                 next_sample = Some(sample);
+            }
+            _ = load_ticker.tick() => {
+                match crate::podmetrics::sample(client, namespace).await {
+                    Ok(pods) => {
+                        // Empty ≠ error: pods not created yet. Note stays, so the
+                        // column keeps naming why it is blank
+                        if !pods.is_empty() {
+                            feed.state.pods_note = None;
+                        }
+                        feed.state.pods = pods;
+                    }
+                    // No metrics API is a standing condition, not a per-sample failure
+                    // → recorded once, never scrolled
+                    Err(why) => {
+                        feed.state.pods.clear();
+                        feed.state.pods_note = Some(load_note(&why));
+                    }
+                }
+                render(feed);
             }
             _ = ticker.tick() => {
                 if let Ok(Some(pod)) = driver.get().await {
@@ -352,6 +379,15 @@ async fn reattach_driver(
         .await
         .map(Some)
         .map_err(|e| format!("reattach to sync log: {e}"))
+}
+
+/// Sampling failure → the panel's one-line cause. A missing aggregated API is the
+/// common case and names its own fix; anything else shows verbatim
+fn load_note(why: &str) -> String {
+    match why.contains("metrics.k8s.io") || why.contains("404") {
+        true => "no metrics API (`ztest cluster setup`)".to_string(),
+        false => why.to_string(),
+    }
 }
 
 /// Replay window leaving no gap: since the last line read, rounded up (API
@@ -614,6 +650,7 @@ impl Feed {
             phase: self.phase.clone(),
             reorg_depth: self.reorg_depth,
             pace: window.block_pace(),
+            tx_rate: window.tx_rate(),
             work_rate: work.and_then(|r| r.total()),
             pool_rates: work.map(|r| r.channels().to_vec()).unwrap_or_default(),
             cost: observation.cost,
@@ -788,14 +825,17 @@ mod tests {
              zaino_sync_fetched_height {height}\n\
              # TYPE zaino_sync_target_height gauge\n\
              zaino_sync_target_height 1024\n\
-             # TYPE zaino_sync_transparent_ops_total counter\n\
-             zaino_sync_transparent_ops_total {transparent}\n\
+             # TYPE zaino_sync_transparent_outputs_total counter\n\
+             zaino_sync_transparent_outputs_total{{stage=\"finalised\"}} {transparent}\n\
              # TYPE zaino_sync_block_build_seconds summary\n\
              zaino_sync_block_build_seconds_sum 1.0\n\
              zaino_sync_block_build_seconds_count 100\n\
              # TYPE zaino_sync_block_fetch_seconds summary\n\
              zaino_sync_block_fetch_seconds_sum 0.6\n\
-             zaino_sync_block_fetch_seconds_count 100\n"
+             zaino_sync_block_fetch_seconds_count 100\n\
+             # TYPE zaino_sync_treestate_fetch_seconds summary\n\
+             zaino_sync_treestate_fetch_seconds_sum 0.1\n\
+             zaino_sync_treestate_fetch_seconds_count 100\n"
         );
         let mut e = crate::metrics::Exposition::default();
         e.absorb(&text);
@@ -823,10 +863,11 @@ mod tests {
             "one scrape cannot be a rate, and must not be shown as a zero"
         );
         assert_eq!(first.cost.fetch_ms, Some(6.0));
+        assert_eq!(first.cost.treestate_ms, Some(1.0));
         assert_eq!(
             first.cost.parse_ms,
-            Some(4.0),
-            "build 10ms minus fetch 6ms is zaino's own per-block cost"
+            Some(3.0),
+            "build 10ms minus both source reads (6ms + 1ms) is zaino's own per-block cost"
         );
 
         f.observe(

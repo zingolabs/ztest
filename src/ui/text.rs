@@ -6,8 +6,9 @@
 use owo_colors::OwoColorize as _;
 
 use super::Theme;
+use crate::metrics::Unit;
 
-/// Narrow-column value: `0`, `<0.01`, `0.04`, `912`, `1.23k`, `2.40M`.
+/// Narrow-column value: `0`, `<0.01`, `0.04`, `912`, `1.23k`, `2.40M`, `9.88B`.
 ///
 /// - ≤ 3 significant figures → a label never outgrows its gutter as the scale changes
 /// - Below one, decimals grow; under `0.01` becomes a bound (a fractional rate shown as
@@ -24,7 +25,9 @@ pub fn compact(v: f64) -> String {
         return format!("{sign}<0.01");
     }
     let (scaled, suffix) = match v.abs() {
-        n if n >= 1e9 => (v / 1e9, "G"),
+        // `B` = billion, never bytes: every caller here is a count, rate or core figure
+        // (`Unit::Bytes` takes its own arm in `unit_value`)
+        n if n >= 1e9 => (v / 1e9, "B"),
         n if n >= 1e6 => (v / 1e6, "M"),
         n if n >= 1e3 => (v / 1e3, "k"),
         _ => (v, ""),
@@ -38,6 +41,30 @@ pub fn compact(v: f64) -> String {
         (false, _) => 2,
     };
     format!("{scaled:.decimals$}{suffix}")
+}
+
+/// A [`Unit`]'d value in the narrowest form that keeps its meaning.
+///
+/// - `Millis` crosses to `1m56s` past a second (`116111ms` is a number a reader has to
+///   divide before it says anything)
+/// - Sub-millisecond keeps a decimal: a `0.4ms` latency shown as `0ms` reports a
+///   measurement that did not happen
+pub fn unit_value(unit: Unit, v: f64) -> String {
+    match unit {
+        Unit::Count => compact(v),
+        Unit::PerSec => format!("{}/s", compact(v)),
+        // Sub-tenth keeps a decimal: a 0.04% stall shown as `0%` reports no measurement
+        Unit::Fraction if v > 0.0 && v < 0.001 => format!("{:.2}%", v * 100.0),
+        Unit::Fraction => format!("{:.1}%", v * 100.0),
+        Unit::Cores => format!("{}c", compact(v)),
+        Unit::Bytes => bytesize::ByteSize::b(v.max(0.0) as u64).display().iec().to_string(),
+        Unit::BytesPerSec => {
+            format!("{}/s", bytesize::ByteSize::b(v.max(0.0) as u64).display().iec())
+        }
+        Unit::Millis if v < 1.0 => format!("{v:.1}ms"),
+        Unit::Millis if v < 1_000.0 => format!("{v:.0}ms"),
+        Unit::Millis => format_elapsed(std::time::Duration::from_millis(v as u64)),
+    }
 }
 
 /// Thousands-separated count `3,120,455` — [`compact`]'s counterpart for a figure read
@@ -127,7 +154,7 @@ mod tests {
         assert_eq!(compact(138_200.0), "138k");
         assert_eq!(compact(2_400_000.0), "2.40M");
         assert_eq!(compact(987_654_321.0), "988M");
-        assert!(compact(9_876_543_210.0).ends_with('G'));
+        assert_eq!(compact(9_876_543_210.0), "9.88B");
         assert!(compact(1_234.0).len() <= 6);
     }
 

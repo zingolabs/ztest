@@ -1,126 +1,77 @@
-# How to make a component profileable under ztest
+# How to profile a component under ztest
 
-A contract for **component authors** (zaino, zebra, any binary ztest runs).
-Implement it once and ztest can produce a CPU flame graph of your service — with
-no elevated privileges, no sidecar, and no change to how it runs in production.
+ztest profiles components **from outside the process**, with an eBPF collector. There is
+no contract for component authors to implement: no dependency, no cargo feature, no code
+in `main`. A component is profileable because it is a process.
 
-ztest does not inject a profiler. You expose one; ztest points it at a
-collector.
-
-## The two switches
+## The switch
 
 | Switch | Kind | Controls |
 | --- | --- | --- |
-| `profile` cargo feature | build-time | whether the profiler is **linked** |
-| `ZTEST_PROFILE_URL` | run-time | where profiles are **pushed** — and whether they are |
-| `ZTEST_PROFILE_TAGS` | run-time | `key=value,…` labels ztest attaches |
-| `ZTEST_PROFILE_HZ` | run-time | sample rate; default 100 |
+| `ZTEST_PROFILE` | run-time | whether a run deploys a collector at all |
 
-A single image built `--features profile` runs unprofiled when
-`ZTEST_PROFILE_URL` is unset and profiled when it is set. One image, one switch.
+Set it and ztest creates one collector per run; leave it unset and nothing is collected.
+Off by default — a collector is a privileged pod charged against the run's capacity.
 
-> A runtime env var cannot pull a crate into the binary — linking is decided at
-> build time. That is why the build feature exists separately.
+## What you get
 
-## Cargo
+- A flame graph spanning **Rust, C, C++ and the kernel** in one stack: `zainod` frames
+  run through LMDB into `mdb_page_search_root`, and `writev` is no longer a leaf.
+- **Off-CPU time**, merged with on-CPU. Blocked I/O, lock contention and major page
+  faults become visible; a CPU-time profiler cannot see any of them.
+- **Every process in the run**, including components built from published images
+  (`zebrad`), which an in-process profiler could never reach.
+- Unbiased sampling. The collector samples per-CPU; a signal-based in-process profiler
+  samples whichever thread happens to receive `SIGPROF`, which is not proportional to
+  CPU consumption.
+
+## Getting good symbols
+
+The collector unwinds via frame pointers, falling back to `.eh_frame`. A component built
+with neither yields truncated stacks — silently, since a partial stack is still a stack.
+For a Rust component:
 
 ```toml
-[dependencies]
-pyroscope = { version = "2", features = ["backend-pprof-rs"], optional = true }
-
-[features]
-profile = ["dep:pyroscope"]
+# .cargo/config.toml
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
 ```
 
-## Dockerfile
-
-```dockerfile
-ARG ZTEST_PROFILE_BUILD=""
-RUN cargo build --release ${ZTEST_PROFILE_BUILD:+--features profile}
+```toml
+# Cargo.toml — line numbers and inlined frames
+[profile.release]
+debug = "line-tables-only"
 ```
 
-## Wiring in `main`
+Cargo strips debuginfo from release builds when `debug` is unset (since 1.77), and every
+inlined function folds into its caller.
 
-```rust
-#[cfg(feature = "profile")]
-fn start_profiler(app: &str) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
-    use pyroscope::backend::{pprof_backend, BackendConfig, PprofConfig};
-    use pyroscope::pyroscope::PyroscopeAgentBuilder;
+> A `RUSTFLAGS` environment variable **replaces** `[build] rustflags` rather than
+> appending to it. A build environment that sets `RUSTFLAGS` must carry the
+> frame-pointer flag itself or it ships an unprofileable binary.
 
-    let url = std::env::var("ZTEST_PROFILE_URL").ok()?;
-    let hz: u32 = std::env::var("ZTEST_PROFILE_HZ")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&h| h > 0)
-        .unwrap_or(100);
-    let tags = std::env::var("ZTEST_PROFILE_TAGS").unwrap_or_default();
-    let tags: Vec<(&str, &str)> = tags
-        .split(',')
-        .filter_map(|pair| pair.split_once('='))
-        .collect();
+## How it works
 
-    let agent = PyroscopeAgentBuilder::new(
-        url,
-        app,
-        hz,
-        "pyroscope-rs",
-        env!("CARGO_PKG_VERSION"),
-        pprof_backend(PprofConfig::new().sample_rate(hz), BackendConfig::default()),
-    )
-    .tags(tags)
-    .build()
-    .ok()?;
-    agent.start().ok()
-}
-```
+One Alloy DaemonSet per run, in the run's namespace:
 
-Start it before your runtime, and on your existing graceful-shutdown path:
+- **Per run, not per node.** `pyroscope.write` sends static headers only
+  ([grafana/alloy#259](https://github.com/grafana/alloy/issues/259)), so one collector
+  pushes to exactly one Pyroscope tenant. ztest retires a sync's profiles *by tenant*, so
+  a shared node-wide collector would forfeit deletion outright.
+- **DaemonSet, not Pod.** `pyroscope.ebpf` only sees processes on its own node, and a
+  run's pods are not co-scheduled.
+- **Namespaced Role**, never a ClusterRole — discovery is scoped to the run's namespace
+  and the RBAC is garbage-collected with it.
+- Profiles carry `component` / `namespace` / `run_id` / `sync_id`, so `ztest sync perf`
+  queries them through the same selector as before.
 
-```rust
-if let Some(agent) = agent {
-    if let Ok(ready) = agent.stop() {
-        ready.shutdown();
-    }
-}
-```
+The pod runs `privileged` with `hostPID` and an `Unconfined` AppArmor profile: BPF
+program load is blocked by the default profile, and sampled PIDs resolve only against the
+host namespace.
 
-`stop()` then `shutdown()`, in that order — the agent needs a moment (usually
-well under 10 s) to drain its threads. Skipping it loses at most the last push
-interval, not the run.
+## Reading a profile
 
-**Use your component's own name as `app`.** ztest selects profiles by the
-`component` tag it sets, and a service name that collides across components
-makes two processes' samples indistinguishable.
-
-## What you get, and what you don't
-
-- **You get** a Rust-level flame graph — which RPC handler, which codepath,
-  which async task is spending CPU — queryable *while the run is still going*,
-  surviving the pod, its namespace, and an OOM kill.
-- **You do not get** time inside native libraries. `pyroscope-rs` samples via
-  pprof-rs, so LMDB (C) and RocksDB (C++) frames are opaque leaves. Seeing
-  inside them needs host-level eBPF sampling with elevated privileges — out of
-  scope for this contract by design.
-- **Async note:** the graph shows where CPU is spent (poll stacks on worker
-  threads), not logical await chains. Use `tokio-console`/`tracing` for
-  scheduling analysis; a profiler is the wrong tool for it.
-
-## Why push, and not a file
-
-The earlier contract wrote `profile.pb` to a volume on graceful shutdown, and
-ztest collected it afterwards. That made a profile exist only if the process
-exited cleanly — an OOM kill produced nothing — and made mid-run reading
-impossible, which is the question a multi-hour sync actually raises.
-
-Pushing inverts both: samples are queryable seconds after they are taken, and
-whatever was pushed before a crash survives it.
-
-## Checklist
-
-- [ ] `pyroscope` optional dependency behind a `profile` feature.
-- [ ] Dockerfile builds `--features profile` under a build `ARG`.
-- [ ] Agent started only when `ZTEST_PROFILE_URL` is set.
-- [ ] `ZTEST_PROFILE_TAGS` parsed and passed through as tags.
-- [ ] `ZTEST_PROFILE_HZ` honoured, defaulting to 100.
-- [ ] `stop()` + `shutdown()` on the graceful-shutdown path.
-- [ ] Production image (no build arg) links no profiler.
+`ztest sync perf` fetches a sync's merged pprof. Grafana has the Pyroscope datasource
+wired at first boot; its comparison view diffs two label selectors, which is how a change
+gets measured — baseline, one change, diff. Reading a single flame graph in isolation is
+how people convince themselves of things that are not true.

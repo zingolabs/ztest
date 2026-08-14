@@ -184,7 +184,7 @@ zaino builds its chain index over the pinned Blossom mainnet snapshot; zebrad is
 │   ├── dockerfile <root>/Dockerfile ctx <root>
 │   └── features no_tls_with_prometheus, allow_unencrypted_public_json_rpc_bind, profile
 └── seed zebra-v6.2.3-mainnet-659600.tar.zst 1106bc19 13.05 GiB
-    └── pvc ztest-seeds/seed-1106bc19-<driver> 32Gi
+    └── pvc ztest-seeds/seed-1106bc19-<driver> 48Gi
 ```
 
 `describe` compiles with the profile's own `ProfileStub::cargo_args` — the same
@@ -219,7 +219,7 @@ the_pub_testnet_ironwood_boundary
 │   └── features no_tls_with_prometheus
 └── seed testnet::IRONWOOD 3545da25 8.15 GiB
     ├── archive zebra-v6.2.3-testnet-4140000.tar.zst
-    └── pvc ztest-seeds/seed-3545da25-<driver> 32Gi
+    └── pvc ztest-seeds/seed-3545da25-<driver> 48Gi
 
 testnet_parity::case_1_sapling
 ├── qos testnet · reserve 8c / 8 GiB · hard cap 6h
@@ -236,7 +236,7 @@ and `pod` roots-children carrying the resolved topology.
 ```
 └── seed mainnet::BLOSSOM 1106bc19 13.05 GiB
     ├── archive zebra-v6.2.3-mainnet-659600.tar.zst
-    ├── pvc ztest-seeds/seed-1106bc19-topolvm-io 32Gi
+    ├── pvc ztest-seeds/seed-1106bc19-topolvm-io 48Gi
     ├── cache ✗ MISS published on hostpath.csi.k8s.io, cluster uses topolvm.io → re-pull 13.05 GiB
     └── clone zebrad → <cache_dir>, zainod → /var/lib/zaino/zebra-db
 ├── pod zebrad zebra:6.2.3 5c / 4 GiB

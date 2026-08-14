@@ -75,6 +75,7 @@ pub struct Target {
     pub name: String,
     pub namespace: Option<String>,
     pub id: Option<String>,
+    pub owner: Option<String>,
     pub detail: String,
     pub liveness: Liveness,
 }
@@ -83,6 +84,43 @@ impl Target {
     /// Token = developer-facing id or full object name
     fn matches(&self, token: &str) -> bool {
         self.name == token || self.id.as_deref() == Some(token)
+    }
+
+    /// Prometheus series this target owns, as admin-API label matchers.
+    ///
+    /// - Syncs only: the driver sets `TEST_NAMESPACE_ENV` to its own `ztest-sync-{id}`,
+    ///   so components, their cAdvisor series and the driver pod's all derive from the id
+    /// - Three matchers, not one: `sync_id` rides component series, `namespace` rides
+    ///   cAdvisor's (node-role SD sees no pod labels), driver pod sits outside the ns
+    /// - Test envs are unaddressable — cAdvisor carries no run id, and the
+    ///   namespace→run mapping dies with the namespace
+    fn metric_selectors(&self) -> Vec<String> {
+        let (Kind::Sync, Some(id)) = (self.kind, self.id.as_deref()) else {
+            return Vec::new();
+        };
+        vec![
+            format!("{{namespace=\"{}\"}}", self.name),
+            format!("{{sync_id=\"{id}\"}}"),
+            format!("{{pod=\"{}\"}}", crate::sync::driver_pod_for(id)),
+        ]
+    }
+
+    /// Pyroscope tenant this target's profiles were pushed under.
+    ///
+    /// - Owner from the object's own label, not the caller (a named target may be
+    ///   another dev's)
+    /// - Test envs included, unlike [`metric_selectors`](Self::metric_selectors): a
+    ///   tenant keyed on the run id hits nothing else, where `{namespace=…}` would
+    ///   have hit a concurrent run
+    /// - Kinds sharing a run id yield one tenant; caller dedups
+    fn profile_tenant(&self) -> Option<String> {
+        if !matches!(self.kind, Kind::Sync | Kind::TestEnv | Kind::RunPod) {
+            return None;
+        }
+        let (Some(id), Some(owner)) = (self.id.as_deref(), self.owner.as_deref()) else {
+            return None;
+        };
+        Some(crate::profiling::tenant(owner, id))
     }
 }
 
@@ -116,6 +154,8 @@ pub struct Outcome {
     pub deleted: Vec<Target>,
     pub skipped: Vec<Target>,
     pub errors: Vec<String>,
+    pub purged: Vec<String>,
+    pub retired: Vec<String>,
 }
 
 /// Classes listed independently, one failure never aborts the rest (a missing
@@ -145,21 +185,63 @@ pub async fn discover(client: &Client, scope: &Scope) -> Plan {
 pub async fn reclaim(client: &Client, plan: Plan, force: bool, dry_run: bool) -> Outcome {
     let mut outcome = Outcome { errors: plan.errors, ..Default::default() };
 
+    let mut reclaimable = Vec::new();
     for target in plan.targets {
-        if target.liveness.is_live() && !force {
-            outcome.skipped.push(target);
-            continue;
+        match target.liveness.is_live() && !force {
+            true => outcome.skipped.push(target),
+            false => reclaimable.push(target),
         }
-        if dry_run {
-            outcome.deleted.push(target);
-            continue;
-        }
+    }
+
+    // Every target's series in one pass: `purge` holds a single port-forward, and the
+    // selectors derive from the sync id alone, so nothing here needs what `delete` removes
+    let selectors: Vec<String> = reclaimable.iter().flat_map(Target::metric_selectors).collect();
+    // Deduped: every pod and namespace of one run derives the same tenant
+    let mut tenants: Vec<String> = reclaimable.iter().filter_map(Target::profile_tenant).collect();
+    tenants.sort();
+    tenants.dedup();
+    if dry_run {
+        outcome.purged = selectors;
+        outcome.retired = tenants;
+        outcome.deleted = reclaimable;
+        return outcome;
+    }
+    // Metrics first: a failed purge leaves the target listed and the pass retryable,
+    // and the k8s delete is the irreversible half
+    purge_metrics(client, selectors, &mut outcome).await;
+    retire_profiles(client, tenants, &mut outcome).await;
+
+    for target in reclaimable {
         match delete(client, &target).await {
             Ok(()) => outcome.deleted.push(target),
             Err(e) => outcome.errors.push(format!("{} {}: {e}", target.kind.noun(), target.name)),
         }
     }
     outcome
+}
+
+/// No Prometheus = a `--no-observability` cluster: nothing was ever recorded, so nothing
+/// is left un-reclaimed. Distinguished from a *failed* purge, which is an error
+async fn purge_metrics(client: &Client, selectors: Vec<String>, outcome: &mut Outcome) {
+    if selectors.is_empty() || !crate::metrics::query::is_deployed(client).await {
+        return;
+    }
+    match crate::metrics::query::purge(client, &selectors).await {
+        Ok(()) => outcome.purged = selectors,
+        Err(e) => outcome.errors.push(format!("purge metrics: {e}")),
+    }
+}
+
+/// Scheduled, not done: Pyroscope deletes on its own cleaner pass, so a caller must
+/// not report these as gone
+async fn retire_profiles(client: &Client, tenants: Vec<String>, outcome: &mut Outcome) {
+    if tenants.is_empty() || !crate::profiling::is_deployed(client).await {
+        return;
+    }
+    match crate::profiling::schedule_purge(client, &tenants).await {
+        Ok(()) => outcome.retired = tenants,
+        Err(e) => outcome.errors.push(format!("retire profiles: {e}")),
+    }
 }
 
 async fn delete(client: &Client, target: &Target) -> Result<(), kube::Error> {
@@ -259,6 +341,7 @@ async fn discover_test_envs(client: &Client, scope: &Scope, live_runs: &[String]
             name: ns.name_any(),
             namespace: None,
             id: Some(run_id.clone()),
+            owner: label_of(&ns, qos::LABEL_USER).map(String::from),
             detail: format!("run-id {run_id}"),
             liveness: classify_test_env(&run_id, live_runs),
         });
@@ -288,10 +371,12 @@ async fn discover_syncs(client: &Client, scope: &Scope, plan: &mut Plan) {
         .list(&ListParams::default().labels(&selector))
         .await
     {
-        Ok(l) => l.items,
+        Ok(l) => Some(l.items),
+        // `None`, never an empty list: absent pods and unreadable pods are the same
+        // shape here, and one of them means every running sync looks finished
         Err(e) => {
             plan.errors.push(format!("list sync driver pods: {e}"));
-            Vec::new()
+            None
         }
     };
 
@@ -305,27 +390,45 @@ async fn discover_syncs(client: &Client, scope: &Scope, plan: &mut Plan) {
 
     for ns in namespaces.items {
         let sync_id = label_of(&ns, SYNC_ID_KEY).unwrap_or("?").to_string();
-        let phase = pods
-            .iter()
-            .find(|p| label_of(*p, SYNC_ID_KEY) == Some(sync_id.as_str()))
-            .and_then(|p| p.status.as_ref()?.phase.clone());
+        let phase = pods.as_ref().map(|pods| {
+            pods.iter()
+                .find(|p| label_of(*p, SYNC_ID_KEY) == Some(sync_id.as_str()))
+                .and_then(|p| p.status.as_ref()?.phase.clone())
+        });
         plan.targets.push(Target {
             kind: Kind::Sync,
             name: ns.name_any(),
             namespace: None,
             id: Some(sync_id.clone()),
-            detail: match &phase {
-                Some(p) => format!("{sync_id} · {p}"),
+            owner: label_of(&ns, qos::LABEL_USER).map(String::from),
+            detail: match phase.as_ref().map(Option::as_deref) {
+                Some(Some(p)) => format!("{sync_id} · {p}"),
                 // No driver pod (removed, or never started) = nothing running
-                None => format!("{sync_id} · no driver pod"),
+                Some(None) => format!("{sync_id} · no driver pod"),
+                None => format!("{sync_id} · phase unknown"),
             },
-            liveness: match phase.as_deref() {
-                Some(p @ ("Running" | "Pending")) => {
-                    Liveness::Live(format!("{p}; `ztest sync stop {sync_id}` checkpoints it first"))
-                }
-                _ => Liveness::Finished,
-            },
+            liveness: classify_sync(&sync_id, phase),
         });
+    }
+}
+
+/// `phase`: outer `None` = the driver-pod list failed, inner = no such pod.
+///
+/// - Unreadable phase → `Live`: guessing `Finished` reclaims a *running* sync, and
+///   under `--purge-metrics` takes its history with it
+/// - Fails shut on exactly the cluster that provokes it (a flaking apiserver drops the
+///   list, and that is when a blind pass does the most damage)
+fn classify_sync(sync_id: &str, phase: Option<Option<String>>) -> Liveness {
+    let Some(phase) = phase else {
+        return Liveness::Live(
+            "driver pod phase unreadable; re-run once the cluster answers".into(),
+        );
+    };
+    match phase.as_deref() {
+        Some(p @ ("Running" | "Pending")) => {
+            Liveness::Live(format!("{p}; `ztest sync stop {sync_id}` checkpoints it first"))
+        }
+        _ => Liveness::Finished,
     }
 }
 
@@ -352,6 +455,7 @@ async fn discover_run_pods(client: &Client, scope: &Scope, live_runs: &[String],
             name: pod.name_any(),
             namespace: Some(RUN_NAMESPACE.to_string()),
             id: Some(run_id.clone()),
+            owner: label_of(&pod, qos::LABEL_USER).map(String::from),
             detail: format!("run-id {run_id} · {phase}"),
             // Settled pod reclaimable even under a live run (capacity already released)
             liveness: match phase.as_str() {
@@ -385,6 +489,7 @@ async fn discover_seed_bindings(
             name: obj.name_any(),
             namespace: None,
             id: Some(run_id.clone()),
+            owner: label_of(&obj, qos::LABEL_USER).map(String::from),
             detail: format!("run-id {run_id}"),
             liveness: classify_test_env(&run_id, live_runs),
         });
@@ -411,6 +516,7 @@ async fn discover_reservations(client: &Client, scope: &Scope, plan: &mut Plan) 
             namespace: Some(META_NAMESPACE.to_string()),
             // Lease named for the run it reserves → name *is* the id
             id: Some(lease.name_any()),
+            owner: label_of(&lease, qos::LABEL_USER).map(String::from),
             detail: if expired { "expired".into() } else { "renewing".into() },
             liveness: if expired {
                 Liveness::Finished
@@ -455,9 +561,87 @@ mod tests {
             name: name.into(),
             namespace: None,
             id: Some(id.into()),
+            owner: Some("elicb".into()),
             detail: String::new(),
             liveness: Liveness::Finished,
         }
+    }
+
+    #[test]
+    fn a_running_sync_is_live_and_names_the_checkpoint_command() {
+        let live = classify_sync("zaino-a52f", Some(Some("Running".into())));
+        assert!(live.is_live(), "a Running driver pod must protect its sync");
+        assert!(classify_sync("zaino-a52f", Some(Some("Pending".into()))).is_live());
+        assert!(!classify_sync("zaino-a52f", Some(Some("Succeeded".into()))).is_live());
+        assert!(!classify_sync("zaino-a52f", Some(None)).is_live());
+    }
+
+    /// The dangerous one: an unreadable pod list used to read as "no driver pod" for
+    /// *every* sync, so one flaking apiserver made a whole cleanup pass destructive
+    #[test]
+    fn an_unreadable_driver_phase_protects_the_sync_rather_than_reclaiming_it() {
+        assert!(classify_sync("zaino-a52f", None).is_live());
+    }
+
+    /// All three families, derived from the id alone — no cluster read, so a purge works
+    /// on a sync whose objects are already gone
+    #[test]
+    fn a_syncs_selectors_cover_components_cadvisor_and_the_driver() {
+        let selectors =
+            target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f").metric_selectors();
+        assert_eq!(
+            selectors,
+            vec![
+                r#"{namespace="ztest-sync-zaino-a52f"}"#,
+                r#"{sync_id="zaino-a52f"}"#,
+                r#"{pod="ztest-sync-zaino-a52f"}"#,
+            ]
+        );
+    }
+
+    /// Owner from the object, never the caller: `ztest cleanup <id>` resolves another
+    /// dev's sync, and their tenant is the one holding the profiles
+    #[test]
+    fn a_syncs_tenant_is_keyed_on_the_owner_not_the_caller() {
+        let mut t = target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f");
+        t.owner = Some("dana".into());
+        assert_eq!(t.profile_tenant().as_deref(), Some("ztest.dana.zaino-a52f"));
+    }
+
+    /// Unlabelled object → no tenant, rather than one built from a guessed owner
+    #[test]
+    fn an_unowned_target_offers_no_tenant_to_retire() {
+        let mut t = target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f");
+        t.owner = None;
+        assert_eq!(t.profile_tenant(), None);
+    }
+
+    /// Test envs push under a run-keyed tenant, so they retire like syncs — unlike their
+    /// metrics, which no selector can isolate. Kinds that never push get nothing
+    #[test]
+    fn a_test_env_retires_by_run_even_though_its_series_cannot() {
+        let env = target(Kind::TestEnv, "ztest-pkg-test-9f2a", "elicb-4021");
+        assert_eq!(env.profile_tenant().as_deref(), Some("ztest.elicb.elicb-4021"));
+        assert!(env.metric_selectors().is_empty());
+
+        for kind in [Kind::SeedBinding, Kind::Reservation] {
+            assert_eq!(target(kind, "obj", "elicb-4021").profile_tenant(), None, "{kind:?}");
+        }
+    }
+
+    /// One run's namespaces and pods derive one tenant; retiring it N times is one write
+    #[test]
+    fn every_object_of_a_run_derives_the_same_tenant() {
+        let ns = target(Kind::TestEnv, "ztest-pkg-a-1", "elicb-4021").profile_tenant();
+        let pod = target(Kind::RunPod, "ztest-runner-xyz", "elicb-4021").profile_tenant();
+        assert_eq!(ns, pod);
+    }
+
+    /// Silence, not a wrong matcher: `{namespace="ztest-pkg-test-9f2a"}` would delete a
+    /// *concurrent* run's series, since nothing ties that namespace to a run id
+    #[test]
+    fn a_test_env_offers_no_selectors_to_purge_by() {
+        assert!(target(Kind::TestEnv, "ztest-pkg-test-9f2a", "run").metric_selectors().is_empty());
     }
 
     #[test]

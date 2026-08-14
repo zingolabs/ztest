@@ -160,13 +160,16 @@ impl PodSpec {
             self.pod_name,
         );
 
-        let pod = json!({
+        let mut pod = json!({
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
                 "name": self.pod_name,
                 "labels": {
                     "ztest.io/run-id": coords.run_id,
+                    // Owner on the *pod*, not just its namespace: Prometheus pod-role SD
+                    // promotes pod labels only, and the namespace outlives nothing
+                    "ztest.io/user": crate::naming::slug(&coords.user, crate::naming::DNS_LABEL_MAX),
                     "ztest.io/component": component_label,
                     // Backend-independent role: select "the indexer" without knowing
                     // zainod vs lightwalletd (`ztest sync watch` follows it)
@@ -177,6 +180,12 @@ impl PodSpec {
             },
             "spec": spec,
         });
+
+        // Driver's id, inherited via env (components are built in-driver)
+        if let Some(id) = crate::sync::active_sync_id() {
+            pod["metadata"]["labels"][crate::sync::SYNC_ID_KEY] = Value::String(id);
+        }
+
         serde_json::from_value(pod)
             .map_err(|e| EnvError::Manifest { reason: format!("pod {}: {e}", self.pod_name) })
     }
@@ -255,6 +264,15 @@ mod tests {
         // Round-trip through JSON = the shape the API server would receive
         let v = serde_json::to_value(pod).unwrap();
         v["spec"]["containers"][0].clone()
+    }
+
+    /// Prometheus pod-role SD reads pod labels only; owner on the namespace alone never
+    /// reaches a series
+    #[test]
+    fn the_pod_carries_its_owner_for_prometheus_to_promote() {
+        let pod = base_spec().render(&coords(), "t", &[]).unwrap();
+        let v = serde_json::to_value(&pod).unwrap();
+        assert_eq!(v["metadata"]["labels"]["ztest.io/user"], "user");
     }
 
     #[test]
