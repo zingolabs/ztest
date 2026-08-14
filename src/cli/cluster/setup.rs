@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use clap::Args as ClapArgs;
 use dialoguer::Confirm;
 
+use super::csi_hostpath;
 use crate::resource::{self, InitializeOpts, NodeId, NodeState};
 
 #[derive(Debug, ClapArgs)]
@@ -43,6 +44,12 @@ pub struct Args {
     /// left untouched regardless.
     #[arg(long)]
     no_metrics_api: bool,
+
+    /// Install csi-hostpath on a snapshot-less local cluster instead of prompting.
+    /// Copies each seed whole; far slower than a TopoLVM thin pool
+    /// (docs/ops-local-cluster.md).
+    #[arg(long)]
+    install_storage: bool,
 }
 
 pub fn execute(args: Args) -> ExitCode {
@@ -66,10 +73,16 @@ async fn run(args: &Args) -> Result<(), String> {
 
     // Refuse a cluster that cannot run tests: setup cannot fix a missing capability
     // (operator's) → name it before writing anything
-    let report = crate::capability::probe(&client).await;
+    let mut report = crate::capability::probe(&client).await;
     for cap in report.blocking() {
         eprintln!("  ✗ {}: {}", cap.name, cap.finding.detail());
         eprintln!("      see {}", cap.remedy);
+    }
+    // Local-cluster storage = only gap setup can close (assent-gated)
+    // Before the refusal below (else unreachable)
+    if csi_hostpath::offer(&report, args.non_interactive, args.install_storage)? {
+        csi_hostpath::install()?;
+        report = crate::capability::probe(&client).await;
     }
     if !report.is_runnable() {
         return Err("cluster is missing a required capability; `ztest cluster check` for the \

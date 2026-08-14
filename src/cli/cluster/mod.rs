@@ -10,6 +10,7 @@ use clap::{Args as ClapArgs, Subcommand};
 
 use crate::cluster_config::{self, Config, Profile};
 
+mod csi_hostpath;
 mod setup;
 
 #[derive(Debug, ClapArgs)]

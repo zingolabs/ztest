@@ -111,8 +111,7 @@ pub async fn provision_seed(
     // 409-tolerant, so the warm path costs one GET
     progress.note("snapshotting");
     create_volume_snapshot(client, &pvc_name).await?;
-    progress.note("waiting for snapshot");
-    wait_snapshot_ready(client, &pvc_name).await?;
+    wait_snapshot_ready(client, &pvc_name, progress).await?;
     seeds::read_seed_handle(client, &seed.name, &seed.oid, &driver).await
 }
 
@@ -147,7 +146,8 @@ pub async fn await_seed(
         });
     }
     wait_pvc_ready(client, &pvc_name).await?;
-    wait_snapshot_ready(client, &pvc_name).await?;
+    // Test side: no console row (`NodeProgress::default` → nowhere)
+    wait_snapshot_ready(client, &pvc_name, &NodeProgress::default()).await?;
     seeds::read_seed_handle(client, handle.name(), handle.oid(), &driver).await
 }
 
@@ -168,8 +168,9 @@ fn unsupported(archive: &str, what: String) -> EnvError {
     EnvError::ArchiveMaterializeFailed {
         archive: archive.to_string(),
         reason: format!(
+            // `cluster setup` installs no storage → naming it here loops the reader
             "{what} — this archive-backed test needs CSI snapshot support. \
-             On a local kind cluster run `ztest cluster setup`; on a shared cluster \
+             On a local kind cluster run `scripts/kind-storage.sh`; on a shared cluster \
              check that the seed StorageClass / VolumeSnapshotClass are installed."
         ),
     }
@@ -662,10 +663,17 @@ async fn wait_pvc_ready(client: &Client, pvc_name: &str) -> Result<(), EnvError>
     poll(WAIT_BUDGET, || async { pvc_is_ready(client, pvc_name).await }).await
 }
 
-async fn wait_snapshot_ready(client: &Client, snap_name: &str) -> Result<(), EnvError> {
+async fn wait_snapshot_ready(
+    client: &Client,
+    snap_name: &str,
+    progress: &NodeProgress,
+) -> Result<(), EnvError> {
     let snap_gvk = volume_snapshot_gvk();
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), SEEDS_NAMESPACE, &snap_gvk);
+    let started = std::time::Instant::now();
     poll(WAIT_BUDGET, || async {
+        // Elapsed on the row (copying drivers sit here minutes; bare spinner = hang)
+        progress.note(format!("waiting for snapshot ({}s)", started.elapsed().as_secs()));
         let snap = match api.get_opt(snap_name).await.map_err(env_err)? {
             Some(s) => s,
             None => return Ok::<bool, EnvError>(false),

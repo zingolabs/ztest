@@ -9,17 +9,15 @@ hand **typed RPC handles** back to test code.
 kind create cluster
 ztest cluster add kind --kind kind --set-default
 ztest cluster setup
+
+# Run integration tests against validator/indexer pods
 ztest run
+
+# Launch long-running background syncs
+ztest sync start zaino-index-construction
 ```
 
-A stock kind cluster cannot snapshot, so seeded tests will fail — `ztest cluster check` says so. See [docs/ops-local-cluster.md](docs/ops-local-cluster.md) to fix
-that; [docs/ops-clusters.md](docs/ops-clusters.md) covers remote clusters.
-
-## Usage
-
-`TestEnv::builder()` collects components; each `add_*` call returns the
-component's concrete, typed handle. The handles only become usable after
-`build()` — calling one earlier returns `EnvError::NotBuilt`.
+## Integration Test Usage
 
 ```rust
 use ztest::prelude::*;
@@ -27,50 +25,69 @@ use ztest::prelude::*;
 #[tokio::test(flavor = "multi_thread")]
 async fn zaino_indexes_to_validator_tip() {
     let mut t = TestEnv::builder();
-    let zeb = t.add_validator(Validator::zebrad("1.9.1").regtest());
-    let zai = t.add_indexer(Indexer::zaino("0.4.0").regtest());
+    let zebra = t.add_validator(Validator::zebrad("6.2.3").regtest());
+    let zaino = t.add_indexer(Indexer::zainod("0.7.0").regtest());
     t.build().await.unwrap();
 
     // Typed RPC sugar on the validator handle:
-    zeb.generate_blocks(10).await.unwrap();
-    zai.poll_block_height(zeb.chain_height().await.unwrap())
+    zebra.generate_blocks(10).await.unwrap();
+    zaino.poll_block_height(zebra.chain_height().await.unwrap())
         .await
         .unwrap();
-
-    // Or dial an endpoint directly (named ports per backend):
-    let grpc = zai.endpoint("grpc").await.unwrap();
-    let _uri = grpc.url("http"); // e.g. "http://127.0.0.1:38291"
 }
 ```
 
-The handle types are backend-specific (`ZebraValidator`, `ZainoIndexer`,
-`ZingoWallet`), so a backend-only RPC called on the wrong backend is a
-**compile error** — no downcasts, no runtime panics.
+most operations are defined by generic traits (`ValidatorBackend`,
+`IndexerBackend`,`WalletBackend`) making ztest backend-agnostic.
 
 ### In-process wallet
 
-The zingo wallet runs in the test binary (no pod) against the indexer's
-gRPC. ztest ships well-known regtest seeds, so a funded faucet needs no
-mnemonic wiring:
+Wallets are primarily run in-process, and most do not ship a daemon docker
+container, so test-runner images are used and sized w/ more CPU.
 
 ```rust
-let w = t.add_wallet(Wallet::zingo());
-t.build().await.unwrap();
 
-let faucet = w.funded_faucet(&zeb, &zai).await.unwrap();
-let recipient = w.recipient(&zeb, &zai).await.unwrap();
-let to = recipient.address(Pool::Orchard).await.unwrap();
-faucet.send(&to, 100_000).await.unwrap();
+
+use ztest::prelude::*;
+
+#[rstest::case]
+#[tokio::test(flavor = "multi_thread")]
+#[ztest::qos::wallet]
+async fn ironwood_fetch_parity(wallet) {
+    let mut t = TestEnv::builder();
+    let zebra = t.add_validator(Validator::zebrad("6.2.3").regtest());
+    let zaino = t.add_indexer(Indexer::zainod("0.7.0").regtest());
+    let _wallet = t.add_wallet(wallet);
+    t.build().await.unwrap();
+
+
+
+
+
+    let faucet = w.funded_faucet(&zeb, &zai).await.unwrap();
+    let recipient = w.recipient(&zeb, &zai).await.unwrap();
+    let to = recipient.address(Pool::Orchard).await.unwrap();
+    faucet.send(&to, 100_000).await.unwrap();
+
+
+
 ```
 
 ### Mount a custom config and a seeded data dir
 
 ```rust
 let zebra = t.add_validator(
-    Validator::zebrad("1.9.1")
+    Validator::zebrad("6.2.3")
         .mount(mount_config! ("tests/assets/zebrad.toml",              "/etc/zebrad/zebrad.toml"))
         .mount(mount_archive!("tests/assets/zebrad-100blocks.tar.zst", "/data")),
+    );
 );
+
+// Ztest also currently has zebra chain archives for mainnet and testnet (will add more later)
+let zebra = t.add_validator(
+    Validator::zebrad("6.2.3").mainnet("orchard")
+);
+
 ```
 
 ### Dev images
@@ -85,6 +102,26 @@ let zai = t.add_indexer(dev!(Indexer::Zainod, "../Dockerfile"));
 
 Accepted variants: `Validator::Zebrad`, `Validator::Zcashd`,
 `Indexer::Zainod`, `Wallet::Zingo`.
+
+## Long-running syncs
+
+Multi-hour sync workloads run as their own pod-backed lifecycle, detached from
+the terminal that started them. `ztest sync status` renders the report —
+throughput by pool, block/tx rates, and per-component CPU, memory, disk and IO
+stall — from the same series Grafana serves:
+
+```sh
+ztest sync start zaino-index-construction
+
+# blk/s tx/s, operations/s
+ztest sync status zaino-index-construction-c287448b
+
+# Launches flamegraph viz frontend
+ztest sync perf zaino-index-construction-c287448b --component zainod
+```
+
+![ztest sync status](docs/images/sync-status.png)
+![ztest sync perf flamegraph](docs/images/sync-perf-flamegraph.png)
 
 ## CLI
 
