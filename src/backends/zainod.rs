@@ -167,21 +167,21 @@ impl IndexerConfig for ZainoBackend {
                         });
                     }
                 };
-                let network =
-                    archive.chain().map(|c| c.network()).filter(|n| n.is_public()).ok_or_else(
-                        || EnvError::Config {
-                            reason: format!(
-                                "{} is not a public-network chain archive, so zaino cannot be \
+                let network = Some(archive.network).filter(|n| n.is_public()).ok_or_else(|| {
+                    EnvError::Config {
+                        reason: format!(
+                            "{} is not a public-network chain archive, so zaino cannot be \
                              pointed at it with .testnet/.mainnet",
-                                archive.name(),
-                            ),
-                        },
-                    )?;
+                            archive.artifact.name,
+                        ),
+                    }
+                })?;
                 // Only `State` opens the DB; `Fetch` sources the same chain over JSON-RPC.
                 // Archive is multi-GB → attaching it to a fetch pod buys a CoW clone and a
                 // volume attach per test for a mount nothing opens
                 if state {
-                    opts.mounts.push(crate::regtest::archive_mount(archive, ZAINO_ZEBRA_DB));
+                    opts.mounts
+                        .push(crate::regtest::archive_mount(archive.artifact, ZAINO_ZEBRA_DB));
                 }
                 let host = validator_host.unwrap_or(ZAINO_PUBLIC_VALIDATOR_HOST);
                 // `backend = 'direct'` (State) reads the CoW clone through zebra's
@@ -914,6 +914,10 @@ impl SyncSubject for ZainoIndexer {
             Err(_) => false,
         }
     }
+
+    fn work_source(&self, op: Op) -> Option<&'static str> {
+        POOL_OPS.iter().find_map(|&(o, family)| (o == op).then_some(family))
+    }
 }
 
 // ────────────────────────────── ProgressView ──────────────────────────
@@ -1068,17 +1072,13 @@ const ZAINO_ZEBRA_DB: &str = "/var/lib/zaino/zebra-db";
 /// Zaino's own index DB — pod-local scratch under [`ZAINO_SCRATCH`], untouched by snapshots
 const ZAINO_DB: &str = "/var/lib/zaino/db";
 
-impl crate::regtest::Testnet for crate::component::Indexer<ZainoBackend> {
+impl crate::regtest::Restore for crate::component::Indexer<ZainoBackend> {
     /// Archive = *input*: `State` mounts a private CoW clone at `ZAINO_ZEBRA_DB` to read
     /// blocks from; zaino's own index starts empty in `ZAINO_DB`. Render and mount both
     /// happen in [`ZainoBackend::materialize_opts`], first point that knows the tuning
     /// (`.testnet(_)`/`.tuning(_)` compose either way, so no builder method can see it)
-    fn testnet(self, archive: crate::ArchiveHandle) -> Self {
-        read_public_chain(self, archive, crate::ArchiveNetwork::Testnet)
-    }
-
-    fn mainnet(self, archive: crate::ArchiveHandle) -> Self {
-        read_public_chain(self, archive, crate::ArchiveNetwork::Mainnet)
+    fn snapshot(self, snapshot: crate::ChainSnapshot) -> Self {
+        read_public_chain(self, snapshot)
     }
 }
 
@@ -1086,12 +1086,10 @@ impl crate::regtest::Testnet for crate::component::Indexer<ZainoBackend> {
 /// that record at `env.build()`
 fn read_public_chain(
     indexer: crate::component::Indexer<ZainoBackend>,
-    archive: crate::ArchiveHandle,
-    claimed: crate::ArchiveNetwork,
+    archive: crate::ChainSnapshot,
 ) -> crate::component::Indexer<ZainoBackend> {
     let mut indexer = apply_pod_layout(indexer);
     indexer.opts.restore = Some(crate::component::RestoreSource::Archive(archive));
-    indexer.opts.claimed_network = Some(claimed);
     indexer.mode = crate::component::IndexerMode::Public;
     indexer
 }
@@ -1234,16 +1232,21 @@ mod tests {
     /// creating RocksDB, after a clean startup and a successful chain sync
     #[test]
     fn both_mode_entry_points_mount_the_scratch_root() {
-        use crate::regtest::Testnet as _;
+        use crate::regtest::Restore as _;
 
         let zaino = || crate::component::Indexer::zaino("1.0.0");
         assert!(mounts_scratch(&super::apply_regtest(zaino())));
-        assert!(mounts_scratch(&zaino().testnet(crate::archive::ArchiveHandle::__new(
-            "zebra-v6.2.3-test.tar.zst",
-            "0".repeat(64).leak(),
-            1,
-            None,
-        ),)));
+        assert!(mounts_scratch(&zaino().snapshot(crate::ChainSnapshot {
+            tip_height: 286_000,
+            network: crate::Network::Testnet,
+            backend: crate::Backend::Zebra,
+            artifact: crate::Artifact {
+                name: "zebra-v6.2.3-test.tar.zst",
+                oid: "0".repeat(64).leak(),
+                size: 1,
+                uncompressed_bytes: 2,
+            },
+        })));
     }
 
     /// Both DB paths are pod-writable only by living under the scratch root; an escaped

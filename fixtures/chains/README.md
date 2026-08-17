@@ -23,13 +23,13 @@ Flat, and every identity field is in the filename, so an artifact stays
 self-describing when copied into a bucket or attached to a bug report:
 
 ```
-<backend>-v<producer-version>-testnet-<pinned-height>.tar.zst   # LFS
-<backend>-v<producer-version>-testnet-<pinned-height>.toml      # plaintext
+<backend>-v<producer-version>-testnet-<pinned-height>.tar.zst   # gitignored, lives in the bucket
+snapshots/<network>/<upgrade>.toml                               # committed, 4 keys
 ```
 
-`testnet_snapshot!(pub ORCHARD = zebra, "6.2.3", 1_848_420)` *derives* both
-names from its typed arguments, so a pin that disagrees with the tree is a
-compile error rather than a convention nobody checked.
+The filename is a producer convention for humans; every consumer reads the
+snapshot's identity from `snapshots/<network>/<upgrade>.toml` and its chain
+facts from the `ChainSnapshot` const, so a rename changes nothing.
 
 | Artifact | Compressed | Extracted | Boundary |
 | --- | --- | --- | --- |
@@ -44,8 +44,8 @@ compile error rather than a convention nobody checked.
 Mainnet is roughly an order of magnitude past testnet at every rung: the
 *smallest* mainnet artifact is larger than the deepest testnet one. Prefer
 testnet unless the test specifically needs mainnet's transaction density, and
-note that fetching the mainnet set is a ~47 GB `git lfs pull` — use
-`git lfs pull --include=<path>` rather than the bare form.
+note that the mainnet set is ~47 GB — fetch a single rung rather than all of
+them.
 
 Each is pinned **6,000 blocks past** its activation. A snapshot pinned *at* an
 activation holds essentially none of the data it is named for, and every
@@ -53,28 +53,39 @@ assertion drawn from it passes while proving nothing; the `[boundary_check]`
 table in each manifest is the producer's evidence that the introduced pool
 actually moved across the post-activation window.
 
-## LFS
+## Not in the tree
 
-Archives are LFS-tracked; manifests deliberately are not. `testnet_snapshot!`
-reads the manifest at compile time to cross-check the pin and size the seed PVC,
-and that has to work in a checkout whose archives are still unfetched pointers.
+The archives are **gitignored**. What git holds is
+`snapshots/<network>/<upgrade>.toml` — four machine-written keys addressing the
+bytes — and the `ChainSnapshot` const in `src/snapshots.rs` carrying the chain
+facts. The bytes live in an S3-compatible bucket (Cloudflare R2) at
+`lfs/<sha256>`, and the seed puller `curl`s a presigned GET for them straight
+onto the node.
 
-There is **no LFS server**. Blobs live in an S3-compatible bucket (Cloudflare
-R2) and are moved by `ztest lfs-transfer`, a Git LFS [custom transfer agent]
-built into this crate. Two reasons it is not the stock `basic` adapter and not a
-server:
+git-lfs is not involved anywhere: not in the fetch path, not in publishing, not
+in a checkout. A machine with no `git lfs` installed runs the full suite. See
+[docs/design-snapshots.md](../../docs/design-snapshots.md) for why.
 
-1. `basic` is exactly one `PUT` per object, which inherits R2's 4.995 GiB
-   single-request cap. The Ironwood snapshot is 8.15 GiB and cannot be pushed
-   that way at all. The agent runs a real S3 multipart upload.
-2. The agent *writes* the objects and `storage::lfs` *reads* them at test time.
-   In one binary they share `storage::r2::Bucket::key`, so the key layout they
-   must agree on is checked by the compiler instead of by convention.
+### Publishing one
+
+```sh
+ztest snapshot manifest ./zebra-v6.2.3-testnet-1848420.tar.zst \
+    > snapshots/testnet/orchard.toml
+ztest snapshot push     ./zebra-v6.2.3-testnet-1848420.tar.zst
+# then add the const to src/snapshots.rs and commit
+```
+
+Push **before** committing: a committed manifest is a claim the object exists,
+and `ztest snapshot verify` is what enforces it across the whole declared set.
+
+`manifest` reads the archive once, streaming — the sha256 is taken on the way
+into the decompressor and its output counted for the extracted size, so a 21 GB
+artifact is never buffered. It needs no cluster, no bucket and no validator.
 
 ### Environment
 
-Both directions read the standard AWS variables, so the same exports serve
-`ztest`, `aws s3`, and anything else pointed at the bucket:
+The bucket is addressed by the standard AWS variables, so one export set serves
+`ztest`, `aws s3`, and anything else pointed at it:
 
 ```
 AWS_BUCKET_NAME=ztest-archives
@@ -84,27 +95,11 @@ AWS_SECRET_ACCESS_KEY=…
 # AWS_REGION defaults to `auto`, which is what R2 expects.
 ```
 
-A laptop that has run `git lfs pull` never needs them at test time: the archive
-is a real file, `storage::for_source` picks the local backend, and both paths
-resolve to the same content-addressed seed.
-
-### Per-clone setup (one time)
-
-git-lfs **refuses** to take `lfs.customtransfer.*` or
-`lfs.standalonetransferagent` from a committed `.lfsconfig` — a repo that could
-name the binary git-lfs executes on clone would be a code-execution hole. So the
-wiring has to live in each clone's own `.git/config`:
-
-```
-git config --local lfs.customtransfer.ztest.path ztest
-git config --local lfs.customtransfer.ztest.args lfs-transfer
-git config --local lfs.standalonetransferagent ztest
-```
-
-`ztest` must be on `PATH` — `nix develop` provides it, and consumers installing
-from crates.io already have it.
-
-[custom transfer agent]: https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md
+`~/.config/ztest/bucket.toml` is the alternative, and belongs to the ztest
+installation rather than any one checkout. These are needed at test time
+**whether or not** the archive is on your disk: the seed's bytes are fetched by
+a Job on the cluster, which cannot see a local checkout. `ztest cluster check`
+reports the bucket as its own row.
 
 ## Decompression on the cluster
 

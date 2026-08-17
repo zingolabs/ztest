@@ -1,3 +1,9 @@
+> **Historical.** This records how the mainnet rungs were produced and
+> published, when publishing still went through Git LFS. The artifacts and
+> their heights are unchanged; the LFS mechanics are not — see
+> [design-snapshots.md](design-snapshots.md) for how fixtures are published
+> and fetched now.
+
 # Mainnet chain snapshots
 
 Companion to `fixtures/chains/README.md`, which documents the testnet ladder
@@ -137,7 +143,7 @@ exists on mainnet at 3,428,143). C1 and C2 (mainnet activation table and the
 free-space guard in the producer). A1–A5, A7 (network-parameterized
 `public_conf`, `.mainnet()` verb, explicit network dispatch, `ZEBRAD_PUBLIC_RPC`,
 `IndexerMode::Public`, verification parity). Plus a claim-vs-artifact check that
-rejects `.mainnet(testnet::ORCHARD)` at `env.build()`.
+rejects `.snapshot(ORCHARD_TESTNET)` at `env.build()`.
 
 **Not done, and blocking a cluster run:**
 
@@ -159,7 +165,7 @@ rejects `.mainnet(testnet::ORCHARD)` at `env.build()`.
    RocksDB open on a fresh clone.
 5. **B1 — the first sync profile.** Now exists, but in the *zaino* repo:
    `live-tests/sync/tests/{zaino_sync,zaino_state_fetch_parity}.rs`, both on
-   `mainnet::BLOSSOM`. Neither has ever run against a cluster.
+   `BLOSSOM_MAINNET`. Neither has ever run against a cluster.
 
 **Corrections to the estimates in §4.** Growth is far more back-loaded than the
 early rungs suggested: 15.9 KB/block from Sapling to Blossom, 10.0 KB/block to
@@ -180,7 +186,7 @@ against the existing testnet artifacts.
 **A1. Network-parameterize the config generators.**
 `src/testnet_conf.rs` hardcodes `network = "Testnet"` (`:61`),
 `initial_testnet_peers = []` (`:59`) and, in the zainod twin,
-`network = 'Testnet'` (`:132`). Take `ArchiveNetwork` and derive all three.
+`network = 'Testnet'` (`:132`). Take `Network` and derive all three.
 The frozen-chain contract around them — `debug_force_finished_sync = true`,
 `crawl_new_peer_interval = "365d"`, empty peer set, `cache_dir = false` for the
 *peer* cache — is network-independent and should be stated once, not twice.
@@ -190,7 +196,7 @@ that contract and let the two copies drift.
 **A2. Replace the `Testnet` builder verb.**
 `trait Testnet { fn testnet(self, archive) }` (`src/regtest.rs:204`) is the only
 entry point for a public-network archive, and the handle it takes already
-carries its own network (`ArchiveHandle::chain().network()`). A verb naming one
+carries its own network (`ChainSnapshot::chain().network()`). A verb naming one
 network is simply wrong for the other. Rename to `Chain { fn chain(self, archive) }`.
 Mechanical: the trait plus two impls (`src/backends/zebra.rs:562`,
 `src/backends/zainod.rs:1164`).
@@ -199,7 +205,7 @@ Mechanical: the trait plus two impls (`src/backends/zebra.rs:562`,
 `is_testnet_restore` (`src/backends/zebra.rs:516`), `rpc_port` (`:529`),
 `serves_indexer_grpc` (`:544`) and `fn testnet` (`:568`) all treat
 "not Testnet" as "regtest". A mainnet archive today silently boots on a regtest
-config. Match on `ArchiveNetwork` with a real `Mainnet` arm, and make an
+config. Match on `Network` with a real `Mainnet` arm, and make an
 unhandled combination an error rather than a route.
 
 **A4. Resolve the mainnet port collision.**
@@ -296,7 +302,7 @@ rung's measured `uncompressed_bytes` as the projection basis.
 **C3. Produce the ladder**, one ascending pass, archiving at each rung. Then
 `git lfs push`, add `archive!` consts to `src/snapshots.rs`, and extend that
 module's tests — `every_shipped_snapshot_carries_chain_info` currently asserts
-`network() == ArchiveNetwork::Testnet` for every handle
+`network() == Network::Testnet` for every handle
 (`src/snapshots.rs:88-94`) and must become per-handle.
 
 **C4. Re-point the B1 profile at mainnet** and record the first real number.

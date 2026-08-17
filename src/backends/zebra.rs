@@ -133,8 +133,10 @@ impl ValidatorConfig for ZebraBackend {
         if opts.shared_state.is_none() {
             match &opts.restore {
                 Some(crate::component::RestoreSource::Archive(archive)) => {
-                    opts.mounts
-                        .push(crate::mount::Mount::archive(*archive, ZEBRAD_REGTEST_CACHE_DIR));
+                    opts.mounts.push(crate::mount::Mount::archive(
+                        archive.artifact,
+                        ZEBRAD_REGTEST_CACHE_DIR,
+                    ));
                 }
                 Some(crate::component::RestoreSource::Blank) => {
                     opts.mounts.push(crate::regtest::scratch_mount(ZEBRAD_REGTEST_CACHE_DIR));
@@ -421,10 +423,10 @@ const ZEBRAD_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_RPC;
 ///
 /// - `None` covers a regtest cache and a bare metadata-less archive alike
 /// - Read off `opts.restore`, not a flag (archive's own recorded network = single fact)
-fn public_restore_network(opts: &crate::component::ComponentOpts) -> Option<crate::ArchiveNetwork> {
+fn public_restore_network(opts: &crate::component::ComponentOpts) -> Option<crate::Network> {
     match &opts.restore {
         Some(crate::component::RestoreSource::Archive(archive)) => {
-            archive.chain().map(|c| c.network()).filter(|n| n.is_public())
+            Some(archive.network).filter(|n| n.is_public())
         }
         _ => None,
     }
@@ -446,13 +448,9 @@ fn serves_indexer_grpc(opts: &crate::component::ComponentOpts) -> bool {
     opts.shared_state.is_some() || public_restore_network(opts).is_some()
 }
 
-impl crate::regtest::Testnet for crate::component::Validator<ZebraBackend> {
-    fn testnet(self, archive: crate::ArchiveHandle) -> Self {
-        restore_public(self, archive, crate::ArchiveNetwork::Testnet)
-    }
-
-    fn mainnet(self, archive: crate::ArchiveHandle) -> Self {
-        restore_public(self, archive, crate::ArchiveNetwork::Mainnet)
+impl crate::regtest::Restore for crate::component::Validator<ZebraBackend> {
+    fn snapshot(self, snapshot: crate::ChainSnapshot) -> Self {
+        restore_public(self, snapshot)
     }
 }
 
@@ -463,15 +461,13 @@ impl crate::regtest::Testnet for crate::component::Validator<ZebraBackend> {
 ///   [`materialize_regtest_opts`](ZebraBackend::materialize_regtest_opts)'s config path
 fn restore_public(
     mut validator: crate::component::Validator<ZebraBackend>,
-    archive: crate::ArchiveHandle,
-    claimed: crate::ArchiveNetwork,
+    archive: crate::ChainSnapshot,
 ) -> crate::component::Validator<ZebraBackend> {
     // Recorded for `TestEnv::build()`'s whole-env agreement check — this builder
     // cannot fail, and one component's pin says nothing about its peers.
     validator.opts.restore = Some(crate::component::RestoreSource::Archive(archive));
-    validator.opts.claimed_network = Some(claimed);
 
-    let Some(network) = archive.chain().map(|c| c.network()).filter(|n| n.is_public()) else {
+    let Some(network) = Some(archive.network).filter(|n| n.is_public()) else {
         // Regtest cache or bare archive — `materialize_opts`'s regtest path
         // mounts it and sets `cache_dir` itself.
         return validator;
@@ -494,7 +490,7 @@ fn restore_public(
     );
     validator
         .mount(crate::regtest::config_mount_inline(toml, "/etc/zebrad/zebrad.toml"))
-        .mount(crate::regtest::archive_mount(archive, ZEBRAD_PUBLIC_CACHE_DIR))
+        .mount(crate::regtest::archive_mount(archive.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
         .command(["zebrad"])
         .args(["-c", "/etc/zebrad/zebrad.toml", "start"])
 }
@@ -520,30 +516,24 @@ impl ZebraValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{ArchiveBackend, ArchiveHandle, ChainInfo};
+    use crate::archive::{Backend, ChainSnapshot};
     use crate::component::{ComponentOpts, RestoreSource};
 
-    fn archive(network: crate::ArchiveNetwork) -> ArchiveHandle {
-        ArchiveHandle::__new(
-            "zebra-v6.2.3-test.tar.zst",
-            "0".repeat(64).leak(),
-            1,
-            Some(ChainInfo::__new(
-                ArchiveBackend::Zebra,
-                network,
-                "6.2.3",
-                286_000,
-                "00",
-                28,
-                1,
-                &[],
-                &[],
-                None,
-            )),
-        )
+    fn archive(network: crate::Network) -> ChainSnapshot {
+        ChainSnapshot {
+            tip_height: 286_000,
+            network,
+            backend: Backend::Zebra,
+            artifact: crate::Artifact {
+                name: "zebra-v6.2.3-test.tar.zst",
+                oid: "0".repeat(64).leak(),
+                size: 1,
+                uncompressed_bytes: 2,
+            },
+        }
     }
 
-    fn opts_restoring(network: crate::ArchiveNetwork) -> ComponentOpts {
+    fn opts_restoring(network: crate::Network) -> ComponentOpts {
         let mut opts = ComponentOpts::builder().version("6.2.3").build();
         opts.restore = Some(RestoreSource::Archive(archive(network)));
         opts
@@ -556,7 +546,7 @@ mod tests {
     #[test]
     fn a_testnet_restore_probes_the_port_its_config_opens() {
         assert_eq!(
-            rpc_port(&opts_restoring(crate::ArchiveNetwork::Testnet)),
+            rpc_port(&opts_restoring(crate::Network::Testnet)),
             ZEBRAD_PUBLIC_RPC_PORT,
             "a testnet restore must use the port testnet_zebrad_conf writes"
         );
@@ -570,7 +560,7 @@ mod tests {
     fn regtest_and_a_regtest_cache_keep_the_regtest_rpc_port() {
         assert_eq!(rpc_port(&ComponentOpts::default()), ZEBRAD_RPC_PORT);
         assert_eq!(
-            rpc_port(&opts_restoring(crate::ArchiveNetwork::Regtest)),
+            rpc_port(&opts_restoring(crate::Network::Regtest)),
             ZEBRAD_RPC_PORT,
             "a regtest cache rides the regtest config path, so it keeps that port"
         );
@@ -580,7 +570,7 @@ mod tests {
     /// on testnet = state indexer can never start
     #[test]
     fn the_indexer_grpc_is_served_wherever_a_direct_backend_could_dial_it() {
-        assert!(serves_indexer_grpc(&opts_restoring(crate::ArchiveNetwork::Testnet)));
+        assert!(serves_indexer_grpc(&opts_restoring(crate::Network::Testnet)));
         assert!(!serves_indexer_grpc(&ComponentOpts::default()));
     }
 }

@@ -87,13 +87,20 @@ fn emit_seed_mount(
 ) -> proc_macro2::TokenStream {
     let dst = destination.value();
     let kind = syn::Ident::new(kind_ident, Span::call_site());
-    let handle = &baked.handle;
+    let (name, oid, size) = (&baked.name, &baked.oid, baked.size);
     let seed = seed_decl_submit(baked, payload_ident);
     quote! {
         {
             #seed
             ::ztest::Mount {
-                source: ::ztest::MountSource::Seed(#handle),
+                // `uncompressed_bytes: 0` = unmeasured → seed PVC takes the flat default.
+                // A mount's sidecar manifest carries identity only
+                source: ::ztest::MountSource::Seed(::ztest::Artifact {
+                    name: #name,
+                    oid: #oid,
+                    size: #size,
+                    uncompressed_bytes: 0,
+                }),
                 destination: ::std::path::PathBuf::from(#dst),
                 kind: ::ztest::MountKind::#kind,
             }
@@ -931,40 +938,8 @@ fn manifest_str(
     })
 }
 
-/// Collect the integer-valued entries of a `[activations]`-shaped table into
-/// `(key, height)` pairs, ascending by height.
-///
-/// Non-integer entries are skipped rather than rejected: `[activations]`
-/// carries the nested `above_tip` table alongside its scalars, and that nesting
-/// is the manifest's shape, not a defect.
-fn activation_pairs(table: Option<&toml::Value>) -> Vec<(String, u32)> {
-    let Some(table) = table.and_then(toml::Value::as_table) else {
-        return Vec::new();
-    };
-    let mut out: Vec<(String, u32)> = table
-        .iter()
-        .filter_map(|(k, v)| {
-            let h = v.as_integer().and_then(|i| u32::try_from(i).ok())?;
-            Some((k.clone(), h))
-        })
-        .collect();
-    out.sort_by_key(|(_, h)| *h);
-    out
-}
-
-/// Render `(key, height)` pairs as a `&'static [Activation]` literal.
-fn activation_slice(pairs: &[(String, u32)]) -> proc_macro2::TokenStream {
-    let entries = pairs.iter().map(|(k, h)| {
-        quote! { ::ztest::Activation { key: #k, height: #h } }
-    });
-    quote! { &[ #(#entries),* ] }
-}
-
-/// An archive's baked identity: the tokens for its `ArchiveHandle` plus the
-/// pieces the inventory declarations need as separate values.
+/// A mounted archive's baked identity: what the inventory declarations need.
 struct BakedArchive {
-    /// A const expression evaluating to `::ztest::ArchiveHandle`.
-    handle: proc_macro2::TokenStream,
     name: String,
     oid: String,
     size: u64,
@@ -1019,177 +994,61 @@ fn bake_archive(source_abs: &std::path::Path, span: Span) -> Result<BakedArchive
 
     let name = source_abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
-    let chain = bake_chain_info(&doc, &manifest_abs, span)?;
-    let handle = quote! {
-        ::ztest::ArchiveHandle::__new(#name, #oid, #size, #chain)
-    };
-    Ok(BakedArchive { handle, name, oid, size })
+    Ok(BakedArchive { name, oid, size })
 }
 
-/// The `Option<ChainInfo>` literal for a manifest: `Some` when it describes a
-/// validator state directory, `None` when the archive is an opaque blob.
+/// `artifact!("snapshots/testnet/orchard.toml")` — bake a manifest into an
+/// [`Artifact`](ztest::Artifact) expression.
 ///
-/// `tip_height` is the discriminator — an archive either is a chain pinned at a
-/// height or it is not — and once it is present every other chain field is
-/// required, so a half-filled manifest fails at the producer rather than at the
-/// consumer that reads a field the archive never recorded.
-fn bake_chain_info(
-    doc: &toml::Value,
-    manifest_abs: &std::path::Path,
-    span: Span,
-) -> Result<proc_macro2::TokenStream, syn::Error> {
-    if doc.get("tip_height").is_none() {
-        return Ok(quote! { ::core::option::Option::None });
-    }
-
-    let backend = manifest_str(doc, "backend", manifest_abs, span)?;
-    let backend_variant = match backend.as_str() {
-        "zebra" => "Zebra",
-        "zcashd" => "Zcashd",
-        other => {
-            return Err(syn::Error::new(
-                span,
-                format!(
-                    "manifest {} records backend = {other:?}; expected \"zebra\" or \"zcashd\"",
-                    manifest_abs.display()
-                ),
-            ));
-        }
-    };
-    let network = manifest_str(doc, "network", manifest_abs, span)?;
-    let network_variant = match network.as_str() {
-        "mainnet" => "Mainnet",
-        "testnet" => "Testnet",
-        "regtest" => "Regtest",
-        other => {
-            return Err(syn::Error::new(
-                span,
-                format!(
-                    "manifest {} records network = {other:?}; expected \"mainnet\", \
-                     \"testnet\" or \"regtest\"",
-                    manifest_abs.display()
-                ),
-            ));
-        }
-    };
-    let backend_ident = syn::Ident::new(backend_variant, Span::call_site());
-    let network_ident = syn::Ident::new(network_variant, Span::call_site());
-
-    let version = manifest_str(doc, "version", manifest_abs, span)?;
-    let tip_height = manifest_int(doc, "tip_height", manifest_abs, span)? as u32;
-    let tip_hash = manifest_str(doc, "tip_hash", manifest_abs, span)?;
-    let db_format = manifest_int(doc, "db_format", manifest_abs, span)? as u32;
-    let uncompressed_bytes = manifest_int(doc, "uncompressed_bytes", manifest_abs, span)?;
-
-    let activations = activation_slice(&activation_pairs(doc.get("activations")));
-    let above_tip = activation_slice(&activation_pairs(
-        doc.get("activations").and_then(|a| a.get("above_tip")),
-    ));
-    let boundary = bake_boundary_check(doc, manifest_abs, span)?;
-
-    Ok(quote! {
-        ::core::option::Option::Some(::ztest::ChainInfo::__new(
-            ::ztest::ArchiveBackend::#backend_ident,
-            ::ztest::ArchiveNetwork::#network_ident,
-            #version,
-            #tip_height,
-            #tip_hash,
-            #db_format,
-            #uncompressed_bytes,
-            #activations,
-            #above_tip,
-            #boundary,
-        ))
-    })
-}
-
-/// The `Option<BoundaryCheck>` literal for a manifest's `[boundary_check]`.
-///
-/// Absent is legitimate — an upgrade that introduces no value pool (Blossom)
-/// has nothing to prove non-vacuous — but a *partial* table is a producer bug.
-fn bake_boundary_check(
-    doc: &toml::Value,
-    manifest_abs: &std::path::Path,
-    span: Span,
-) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let Some(b) = doc.get("boundary_check") else {
-        return Ok(quote! { ::core::option::Option::None });
-    };
-    let pool = manifest_str(b, "pool", manifest_abs, span)?;
-    let from_height = manifest_int(b, "from_height", manifest_abs, span)? as u32;
-    let to_height = manifest_int(b, "to_height", manifest_abs, span)? as u32;
-    let (Some(value_before), Some(value_after)) = (
-        b.get("value_before").and_then(toml::Value::as_integer),
-        b.get("value_after").and_then(toml::Value::as_integer),
-    ) else {
-        return Err(syn::Error::new(
-            span,
-            format!(
-                "manifest {} has a [boundary_check] table missing an integer \
-                 `value_before` or `value_after`",
-                manifest_abs.display()
-            ),
-        ));
-    };
-    Ok(quote! {
-        ::core::option::Option::Some(::ztest::BoundaryCheck {
-            pool: #pool,
-            from_height: #from_height,
-            to_height: #to_height,
-            value_before: #value_before,
-            value_after: #value_after,
-        })
-    })
-}
-
-/// `ztest::archive!([pub] NAME = "rel/path.tar.zst")` — bind a module-level
-/// `const NAME: ArchiveHandle`.
-///
-/// The out-of-line form, for an archive consumed through a shared helper or
-/// shipped as a named default (see `ztest::snapshots`). It binds the handle and
-/// nothing else: no `SeedDecl`. When this is invoked from a module of nothing
-/// but `const`s, the linker has no reason to keep the object file holding
-/// `inventory::submit!`'s constructor, so the declaration would compile, link,
-/// and contribute nothing. The test crate submits the seed and its per-test
-/// edge with `#[ztest::needs(NAME)]`, which also gives preflight the
-/// granularity to provision only the archives the selected tests need.
+/// Reads the manifest at expansion time, so a checkout holding none of the
+/// archives still compiles. The path names the *manifest*, not the archive: the
+/// archive is the one file that is never in the tree.
 #[proc_macro]
-pub fn archive(input: TokenStream) -> TokenStream {
-    let ConstDecl { attrs, vis, name, source } = parse_macro_input!(input as ConstDecl);
+pub fn artifact(input: TokenStream) -> TokenStream {
+    let source = parse_macro_input!(input as LitStr);
     let abs = match resolve_source(&source) {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
     };
-    let baked = match bake_archive(&abs, name.span()) {
-        Ok(b) => b,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let handle = baked.handle;
-    quote! {
-        #(#attrs)*
-        #vis const #name: ::ztest::ArchiveHandle = #handle;
+    match bake_artifact(&abs, source.span()) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
     }
-    .into()
 }
 
-/// `[#attrs] [pub] NAME = "rel/path"` — the module-level const form.
-struct ConstDecl {
-    attrs: Vec<syn::Attribute>,
-    vis: syn::Visibility,
-    name: syn::Ident,
-    source: LitStr,
-}
-
-impl Parse for ConstDecl {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let attrs = input.call(syn::Attribute::parse_outer)?;
-        let vis: syn::Visibility = input.parse()?;
-        let name: syn::Ident = input.parse()?;
-        let _: Token![=] = input.parse()?;
-        let source: LitStr = input.parse()?;
-        let _ = input.parse::<Option<Token![,]>>();
-        Ok(ConstDecl { attrs, vis, name, source })
+/// The four keys a manifest carries, as an `Artifact` literal.
+fn bake_artifact(
+    manifest_abs: &std::path::Path,
+    span: Span,
+) -> Result<proc_macro2::TokenStream, syn::Error> {
+    let text = std::fs::read_to_string(manifest_abs).map_err(|e| {
+        syn::Error::new(span, format!("reading manifest {}: {e}", manifest_abs.display()))
+    })?;
+    let doc: toml::Value = toml::from_str(&text).map_err(|e| {
+        syn::Error::new(span, format!("manifest {} is not valid TOML: {e}", manifest_abs.display()))
+    })?;
+    let name = manifest_str(&doc, "name", manifest_abs, span)?;
+    let oid = manifest_str(&doc, "sha256", manifest_abs, span)?;
+    if oid.len() != 64 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "manifest {} records sha256 = {oid:?}, which is not a 64-character hex digest",
+                manifest_abs.display()
+            ),
+        ));
     }
+    let oid = oid.to_ascii_lowercase();
+    let size = manifest_int(&doc, "size_bytes", manifest_abs, span)?;
+    let uncompressed_bytes = manifest_int(&doc, "uncompressed_bytes", manifest_abs, span)?;
+    Ok(quote! {
+        ::ztest::Artifact {
+            name: #name,
+            oid: #oid,
+            size: #size,
+            uncompressed_bytes: #uncompressed_bytes,
+        }
+    })
 }
 
 /// `#[ztest::needs(NAME)]` — depend on an archive declared out of line.
@@ -1211,12 +1070,12 @@ pub fn needs(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let ident = func.sig.ident.clone();
     let seed = seed_decl_submit_expr(
-        &quote! { #handle.name() },
-        &quote! { #handle.oid() },
-        &quote! { #handle.size() },
+        &quote! { #handle.artifact.name },
+        &quote! { #handle.artifact.oid },
+        &quote! { #handle.artifact.size },
         "Archive",
     );
-    let dep = test_dep_submit(&ident, &quote! { #handle.oid() });
+    let dep = test_dep_submit(&ident, &quote! { #handle.artifact.oid });
     quote! {
         #seed
         #dep

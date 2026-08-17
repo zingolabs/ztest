@@ -93,16 +93,15 @@ pub struct ComponentOpts {
     pub(crate) shared_state: Option<SharedState>,
     pub(crate) coinbase_pool: Option<Pool>,
     pub(crate) restore: Option<RestoreSource>,
-    pub(crate) claimed_network: Option<crate::ArchiveNetwork>,
 }
 
 /// Source of a component's pre-existing on-disk state. `Archive` covers a synced
 /// public chain and a pre-mined regtest cache alike — which, and so which network
-/// boots, comes from [`ChainInfo`](crate::ChainInfo), never the variant (so a
+/// boots, comes from the [`ChainSnapshot`](crate::ChainSnapshot), never the variant (so a
 /// testnet archive booted as regtest is unrepresentable)
 #[derive(Debug, Clone)]
 pub enum RestoreSource {
-    Archive(crate::ArchiveHandle),
+    Archive(crate::ChainSnapshot),
     Blank,
 }
 

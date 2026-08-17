@@ -106,7 +106,7 @@ pub struct Mount { pub source: MountSource, pub destination: PathBuf, pub kind: 
 pub enum MountSource {
     ConfigAbs(PathBuf),          // mount_config!
     ConfigInline(String),        // generated config bytes (regtest_conf)
-    Seed(ArchiveHandle),         // mount_file! and mount_archive!
+    Seed(ChainSnapshot),         // mount_file! and mount_archive!
     Empty,                       // Mount::scratch
     SharedClaim { claim: String },// TestEnv::shared_volume
 }

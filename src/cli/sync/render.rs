@@ -53,6 +53,16 @@ pub(super) fn listing(scan: &Scan, theme: &Theme, width: usize) -> String {
     out
 }
 
+/// Shown relative to cwd where possible — the message is a `cd` instruction, and an
+/// absolute path buries the one segment that matters
+fn relative_to_cwd(dir: &std::path::Path) -> std::path::PathBuf {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| dir.strip_prefix(&cwd).ok().map(std::path::Path::to_path_buf))
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .unwrap_or_else(|| dir.to_path_buf())
+}
+
 /// One width for the whole listing (per-row sizing = ragged right column).
 fn name_column(profiles: &[ProfileStub]) -> usize {
     column_width(profiles.iter().map(|p| p.name.as_str()), NAME_MIN, NAME_MAX)
@@ -66,6 +76,13 @@ pub(super) fn miss(name: &str, scan: &Scan, why: &Miss, theme: &Theme, width: us
     match why {
         Miss::Empty => {
             out.push_str("no sync profiles in this workspace\n");
+            for dir in crate::pipeline::profiles::workspaces_with_profiles(&scan.workspace_root) {
+                let dir = relative_to_cwd(&dir);
+                out.push_str(&format!(
+                    "{CONT}{}\n",
+                    dim(theme, &format!("declared in {} — run from there", dir.display())),
+                ));
+            }
             out.push('\n');
             out.push_str(&listing(scan, theme, width));
             return out;

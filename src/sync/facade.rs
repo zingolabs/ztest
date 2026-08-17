@@ -19,6 +19,7 @@ use super::probe::{Cadence, Class, ProbeBuilder, ProbeSpec, Severity, SyncCtx};
 use super::reporter::EventReporter;
 use super::runner::{SyncEngine, SyncOutcome, SyncVerdict};
 use super::subject::SyncSubject;
+use super::work::OpSet;
 
 /// Wallet-sync aggressiveness = the batch size
 /// [`sync_subject`](LrzWallet::sync_subject) drives `zcash_client_backend::sync`
@@ -103,9 +104,16 @@ pub struct SyncRunner {
     probes: Vec<ProbeSpec>,
     nemesis: Nemesis,
     subject: Option<Subject>,
+    engine: EngineOpts,
+}
+
+/// Engine knobs a profile sets, carried to [`drive`] as one value
+#[derive(Debug)]
+struct EngineOpts {
     tick: Duration,
     timeout: Option<Duration>,
     stop_height: Option<u32>,
+    required_work: OpSet,
 }
 
 impl std::fmt::Debug for SyncRunner {
@@ -131,9 +139,12 @@ impl SyncRunner {
             probes: Vec::new(),
             nemesis: Nemesis::default(),
             subject: None,
-            tick: crate::sync::DEFAULT_TICK,
-            timeout: None,
-            stop_height: None,
+            engine: EngineOpts {
+                tick: crate::sync::DEFAULT_TICK,
+                timeout: None,
+                stop_height: None,
+                required_work: OpSet::NONE,
+            },
         }
     }
 
@@ -160,24 +171,34 @@ impl SyncRunner {
     ///
     /// Before [`topology`](Self::topology), or with no restored chain archive.
     /// See [`TestEnv::chain`]
-    pub fn chain(&self) -> crate::ChainInfo {
+    pub fn chain(&self) -> crate::ChainSnapshot {
         self.env.chain()
     }
 
     /// Base sampling interval (default 5 s)
     pub fn tick(&mut self, tick: Duration) -> &mut Self {
-        self.tick = tick;
+        self.engine.tick = tick;
         self
     }
     pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
-        self.timeout = Some(timeout);
+        self.engine.timeout = Some(timeout);
         self
     }
 
     /// Finish at `height`, not at tip — what makes throughput a measurement of the
     /// *software* (two runs to tip cover different work; `perf --base` refuses them)
     pub fn until_height(&mut self, height: u32) -> &mut Self {
-        self.stop_height = Some(height);
+        self.engine.stop_height = Some(height);
+        self
+    }
+
+    /// Ops this profile's probes will [`Work::require`](crate::sync::Work::require).
+    ///
+    /// - Checked against one live reading before the run → a subject not publishing them
+    ///   fails by series name, not as a `require` panic hours in
+    /// - Subject ↔ component agree on those series by string only, across repos
+    pub fn requires_work(&mut self, ops: OpSet) -> &mut Self {
+        self.engine.required_work = ops;
         self
     }
 
@@ -255,20 +276,10 @@ impl SyncRunner {
                     Ok(ws) => ws,
                     Err(e) => return errored(format!("bind wallet subject: {e}")),
                 };
-                drive(self.env, ws, ctx, self.probes, self.tick, self.timeout, self.stop_height)
-                    .await
+                drive(self.env, ws, ctx, self.probes, self.engine).await
             }
             SubjectKind::Zaino { indexer } => {
-                drive(
-                    self.env,
-                    indexer,
-                    ctx,
-                    self.probes,
-                    self.tick,
-                    self.timeout,
-                    self.stop_height,
-                )
-                .await
+                drive(self.env, indexer, ctx, self.probes, self.engine).await
             }
         }
     }
@@ -276,24 +287,26 @@ impl SyncRunner {
 
 /// Configure the engine over `subject`, run it, attach what the engine cannot
 /// reach: flushed profiles + the mirrored durable report
-#[allow(clippy::too_many_arguments)]
 async fn drive<S: SyncSubject>(
     env: TestEnv,
     subject: S,
     ctx: SyncCtx,
     probes: Vec<ProbeSpec>,
-    tick: Duration,
-    timeout: Option<Duration>,
-    stop_height: Option<u32>,
+    opts: EngineOpts,
 ) -> SyncOutcome {
     let detached = super::active_sync_id();
     let profile = std::env::var(super::SYNC_PROFILE_ENV).unwrap_or_default();
     let probe_count = probes.len();
-    let mut engine = SyncEngine::new(subject).with_probes(probes).with_tick(tick).with_ctx(ctx);
-    if let Some(t) = timeout {
+    let tick = opts.tick;
+    let mut engine = SyncEngine::new(subject)
+        .with_probes(probes)
+        .with_tick(tick)
+        .with_ctx(ctx)
+        .requires_work(opts.required_work);
+    if let Some(t) = opts.timeout {
         engine = engine.with_timeout(t);
     }
-    if let Some(h) = stop_height {
+    if let Some(h) = opts.stop_height {
         engine = engine.with_stop_height(h);
     }
     // Detached: driver log = only channel to a watching terminal. Local runs keep

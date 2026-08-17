@@ -261,6 +261,71 @@ fn has_cfg(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| a.path().is_ident("cfg"))
 }
 
+/// Directories elsewhere in this repo whose own workspace declares profiles, for the
+/// zero-profile message.
+///
+/// - [`scan`] only ever sees cwd's workspace → an `exclude`d or sibling one reads as "none
+///   anywhere", and the fix is a `cd` the error cannot otherwise name
+/// - Text match, not `syn`: candidates only, and running `cargo metadata` per workspace to
+///   confirm costs more than the whole error path
+pub fn workspaces_with_profiles(from: &Path) -> Vec<PathBuf> {
+    let Some(repo) = git_toplevel(from) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    let mut pending = vec![repo.clone()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                if name.starts_with('.') || name == "target" {
+                    continue;
+                }
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && std::fs::read_to_string(&path).is_ok_and(|s| s.contains("sync_test"))
+                && let Some(root) = enclosing_workspace(&path, &repo)
+                && !hits.contains(&root)
+            {
+                hits.push(root);
+            }
+        }
+    }
+    hits.sort();
+    hits
+}
+
+/// Nearest ancestor declaring `[workspace]`, bounded by `repo`
+fn enclosing_workspace(file: &Path, repo: &Path) -> Option<PathBuf> {
+    file.ancestors()
+        .skip(1)
+        .take_while(|d| d.starts_with(repo))
+        .find(|dir| {
+            std::fs::read_to_string(dir.join("Cargo.toml")).is_ok_and(|s| s.contains("[workspace]"))
+        })
+        .map(Path::to_path_buf)
+}
+
+fn git_toplevel(from: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(from)
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
 /// - `--no-deps`: skips resolution (seconds → ~20ms) + restricts `packages` to workspace members
 /// - Not `remote_compile::cargo_metadata` (that one needs the full graph for `SourceLayout`)
 fn cargo_metadata() -> Result<serde_json::Value, String> {

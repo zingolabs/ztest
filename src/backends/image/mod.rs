@@ -506,6 +506,11 @@ impl std::fmt::Display for ImageError {
             ImageError::KindImageQuery { stderr_tail } => {
                 write!(f, "image build: cluster image query failed:\n{stderr_tail}")
             }
+            // NotFound = binary absent, not a broken invocation (devShell without `kind` on PATH)
+            ImageError::Spawn { cmd, err } if err.kind() == std::io::ErrorKind::NotFound => {
+                let bin = cmd.split_whitespace().next().unwrap_or(cmd);
+                write!(f, "image build: `{bin}` not on PATH; needed to run `{cmd}`")
+            }
             ImageError::Spawn { cmd, err } => write!(f, "image build: spawn {cmd}: {err}"),
             ImageError::GitFetch { rev, stderr_tail } => {
                 write!(f, "image build: git fetch of rev {rev} failed:\n{stderr_tail}")

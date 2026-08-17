@@ -1,17 +1,13 @@
 //! Seed bytes, from the snapshot bucket, OID-addressed. One source only.
 //!
 //! - Seed = Git LFS object at `lfs/<oid>` in [`r2::Bucket`], OID compiled into the
-//!   [`ArchiveHandle`](crate::ArchiveHandle); no paths, no local files, no sniffing
+//!   [`ChainSnapshot`](crate::ChainSnapshot); no paths, no local files, no sniffing
 //! - Hands out a presigned GET ([`r2::Bucket::presigned_get`]) and nothing else:
 //!   [`crate::materialize`]'s puller Job fetches node-local, at cluster bandwidth
 //! - Runner pods have no checkout and no bucket credentials → the multi-GB stream
 //!   must never enter ztest's address space in either direction
 
 pub(crate) mod r2;
-
-/// Blob bytes as an owned async stream. `ztest lfs-transfer` only (its caller asked
-/// for `git lfs pull`); seed materialisation routes R2 → node instead
-pub type ByteSource = std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>;
 
 /// Seed `tar` compression, from the artifact's filename. Resolved here because GNU
 /// `tar` can't auto-detect on the non-seekable `curl` body the puller feeds it
@@ -42,6 +38,76 @@ impl Compression {
 /// run derives it from one compile-time constant
 pub fn seed_sha8(oid: &str) -> &str {
     &oid[..8]
+}
+
+/// Everything a manifest records, measured from the bytes.
+///
+/// - `sha256` = the identity: bucket key, seed PVC name, and what the puller verifies
+/// - `size_bytes` compressed → transfer budget + progress denominator
+/// - `uncompressed_bytes` extracted → seed PVC size
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Digest {
+    pub(crate) sha256: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) uncompressed_bytes: u64,
+}
+
+/// Measure `archive` in **one** read: hash the compressed bytes on the way into the
+/// decompressor, count what comes out. A 21 GB artifact is streamed, never buffered
+pub(crate) fn digest_of(archive: &std::path::Path) -> Result<Digest, String> {
+    /// Hashes and counts every byte pulled through it, so the compressed digest and the
+    /// decompressed size come from the same pass over the file
+    struct Tap<R> {
+        inner: R,
+        hasher: sha2::Sha256,
+        read: u64,
+    }
+    impl<R: std::io::Read> std::io::Read for Tap<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            use sha2::Digest as _;
+            self.hasher.update(&buf[..n]);
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+
+    let compression = compression_from_name(&archive.to_string_lossy()).ok_or_else(|| {
+        format!("{}: cannot determine compression from its name", archive.display())
+    })?;
+    let file =
+        std::fs::File::open(archive).map_err(|e| format!("opening {}: {e}", archive.display()))?;
+    let tap = Tap { inner: std::io::BufReader::new(file), hasher: sha2::Sha256::new(), read: 0 };
+
+    // `None` still has to be drained: the tap only sees bytes something pulls through it
+    let (uncompressed_bytes, tap) = match compression {
+        Compression::Zstd => {
+            let mut dec = zstd::Decoder::new(tap)
+                .map_err(|e| format!("opening {} as zstd: {e}", archive.display()))?;
+            let n = std::io::copy(&mut dec, &mut std::io::sink())
+                .map_err(|e| format!("decompressing {}: {e}", archive.display()))?;
+            (n, dec.finish().into_inner())
+        }
+        Compression::None => {
+            let mut tap = tap;
+            let n = std::io::copy(&mut tap, &mut std::io::sink())
+                .map_err(|e| format!("reading {}: {e}", archive.display()))?;
+            (n, tap)
+        }
+        other => {
+            return Err(format!(
+                "{}: `ztest snapshot` derives manifests for .tar.zst and .tar only, not {other:?}",
+                archive.display(),
+            ));
+        }
+    };
+
+    use sha2::Digest as _;
+    Ok(Digest {
+        sha256: hex::encode(tap.hasher.finalize()),
+        size_bytes: tap.read,
+        uncompressed_bytes,
+    })
 }
 
 /// Leaves room for the `puller-<sha8>-` prefix inside a 63-byte DNS label

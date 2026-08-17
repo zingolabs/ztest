@@ -92,7 +92,7 @@ struct AddArgs {
 }
 
 pub fn execute(args: Args) -> ExitCode {
-    // `setup`/`check` reach a cluster (own runtimes); the rest edit a local file
+    // `setup`/`check`/`add` reach a cluster (own runtimes); the rest edit a local file
     let result = match args.cmd {
         Cmd::Setup(a) => return setup::execute(a),
         Cmd::Check { cluster } => {
@@ -100,7 +100,9 @@ pub fn execute(args: Args) -> ExitCode {
         }
         Cmd::List => list(),
         Cmd::Current => current(),
-        Cmd::Add(a) => add(a),
+        Cmd::Add(a) => {
+            return super::block_on("cluster add", super::Rt::Current, add(a));
+        }
         Cmd::Set { name } => set(name),
         Cmd::Remove { name } => remove(name),
     };
@@ -145,7 +147,7 @@ fn current() -> Result<(), String> {
     }
 }
 
-fn add(a: AddArgs) -> Result<(), String> {
+async fn add(a: AddArgs) -> Result<(), String> {
     // Bare `--kind` adopts the profile name, `--kind X` overrides.
     // Distribution never typed (a remote profile derives wholly from its kubeconfig).
     let mut profile = match (a.kind, &a.kubeconfig) {
@@ -153,6 +155,7 @@ fn add(a: AddArgs) -> Result<(), String> {
         (None, Some(kc)) => Profile::from_kubeconfig(std::path::Path::new(kc))?,
         (None, None) => return Err("pass --kind or --kubeconfig".to_string()),
     };
+    let named_driver = a.storage_driver.is_some();
     profile.storage_driver = a.storage_driver;
     profile.validate()?;
 
@@ -170,7 +173,65 @@ fn add(a: AddArgs) -> Result<(), String> {
     if cfg.current.as_deref() == Some(a.name.as_str()) {
         println!("`{}` is now the default", a.name);
     }
+    if !named_driver {
+        adopt_storage_driver(&a.name).await;
+    }
     Ok(())
+}
+
+/// Record the cluster's snapshot-capable driver when the profile named none.
+///
+/// - Unnamed = follow the default StorageClass, which on a stock `kind create cluster` cannot
+///   snapshot → seeding silently degrades, and only a fixture-mounting run finds out
+/// - Only on exactly one candidate (several = a choice ztest must not make silently)
+/// - Never fatal: the profile is already saved, and `ztest cluster check` is the gate
+async fn adopt_storage_driver(name: &str) {
+    // SAFETY: pre-spawn, as in `check` (applies the profile via non-thread-safe env set)
+    if unsafe { cluster_config::activate(Some(name)) }.is_err() {
+        return;
+    }
+    let Ok(client) = crate::cluster::client().await else {
+        println!("  storage driver unset: cluster unreachable — run `ztest cluster check`");
+        return;
+    };
+    let drivers: Vec<String> = match crate::resource::discover_storage(&client).await {
+        Ok(options) => {
+            let mut d: Vec<String> = options.into_iter().map(|o| o.provisioner).collect();
+            d.sort();
+            d.dedup();
+            d
+        }
+        Err(_) => Vec::new(),
+    };
+    match storage_choice(&drivers) {
+        Ok(only) => match persist_storage_driver(name, only) {
+            Ok(()) => println!("  storage driver: {only} (probed)"),
+            Err(e) => println!("  storage driver {only} found but not saved: {e}"),
+        },
+        Err(why) => println!("  storage driver unset: {why}"),
+    }
+}
+
+/// Sole snapshot-capable driver, or why there is no unambiguous one
+fn storage_choice(drivers: &[String]) -> Result<&str, String> {
+    match drivers {
+        [only] => Ok(only),
+        [] => Err("no snapshot-capable storage found — chain fixtures will fail \
+                   (docs/ops-local-cluster.md)"
+            .to_string()),
+        many => Err(format!(
+            "{} candidates ({}) — pick one with --storage-driver",
+            many.len(),
+            many.join(", "),
+        )),
+    }
+}
+
+fn persist_storage_driver(name: &str, driver: &str) -> Result<(), String> {
+    let mut cfg = cluster_config::load()?;
+    let profile = cfg.clusters.get_mut(name).ok_or("profile vanished between write and probe")?;
+    profile.storage_driver = Some(driver.to_string());
+    cfg.save()
 }
 
 fn set(name: String) -> Result<(), String> {
@@ -267,4 +328,34 @@ fn render(report: &crate::capability::Report, bound: Option<&str>) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drivers(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_sole_driver_is_adopted() {
+        assert_eq!(storage_choice(&drivers(&["topolvm.io"])), Ok("topolvm.io"));
+    }
+
+    /// Picking for the user here would bind every seeded run to a driver they never named
+    #[test]
+    fn several_drivers_are_left_to_the_user() {
+        let why = storage_choice(&drivers(&["hostpath.csi.k8s.io", "topolvm.io"]))
+            .expect_err("two candidates cannot be resolved");
+        assert!(why.contains("--storage-driver"), "{why}");
+        assert!(why.contains("topolvm.io"), "the candidates must be named: {why}");
+    }
+
+    /// Stock `kind create cluster` — the case the quickstart walks into
+    #[test]
+    fn no_snapshot_capable_driver_says_fixtures_will_fail() {
+        let why = storage_choice(&[]).expect_err("nothing to choose");
+        assert!(why.contains("chain fixtures"), "{why}");
+    }
 }

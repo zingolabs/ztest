@@ -9,12 +9,12 @@
 //!   peer-cache writes into the mount — stated once here
 //! - No version gate fires yet; `_version` is plumbed for the first schema change
 
-use crate::ArchiveNetwork;
+use crate::Network;
 use crate::regtest_conf::Semver;
 
 /// Panic guard: neither generator renders a coherent regtest config (that has its own
 /// module)
-fn assert_public(network: ArchiveNetwork, who: &str) {
+fn assert_public(network: Network, who: &str) {
     assert!(
         network.is_public(),
         "{who} renders configs for the public networks; {} belongs to regtest_conf",
@@ -29,7 +29,7 @@ fn assert_public(network: ArchiveNetwork, who: &str) {
 /// `cache_dir` = the container path the chain-archive PVC is mounted at. Only
 /// `[state] cache_dir` points there (tests say why `[network] cache_dir` must not)
 pub fn public_zebrad_conf(
-    network: ArchiveNetwork,
+    network: Network,
     _version: Semver,
     rpc_port: u16,
     cache_dir: &str,
@@ -108,7 +108,7 @@ use_journald = false{metrics_block}
 /// zebrad pod; `zebra_db_path`/`zaino_db_path` are container-side mount paths
 #[allow(clippy::too_many_arguments)]
 pub fn public_zainod_conf(
-    network: ArchiveNetwork,
+    network: Network,
     _version: Semver,
     backend_literal: &str,
     grpc_listen_port: u16,
@@ -176,7 +176,7 @@ mod tests {
         "5.1.1".parse().unwrap()
     }
 
-    const PUBLIC: [ArchiveNetwork; 2] = [ArchiveNetwork::Mainnet, ArchiveNetwork::Testnet];
+    const PUBLIC: [Network; 2] = [Network::Mainnet, Network::Testnet];
 
     /// `[state] cache_dir` = the chain DB; `[network] cache_dir` = the cached peer list,
     /// a different key with the same name. Both pointed at the mount had zebra rewriting
@@ -211,26 +211,14 @@ mod tests {
     /// out, and it syncs its tip off the pin the fixture depends on
     #[test]
     fn each_network_empties_its_own_peer_list() {
-        let main = public_zebrad_conf(
-            ArchiveNetwork::Mainnet,
-            v(),
-            18232,
-            "/var/cache/zebrad",
-            None,
-            None,
-        );
+        let main =
+            public_zebrad_conf(Network::Mainnet, v(), 18232, "/var/cache/zebrad", None, None);
         assert!(main.contains("network = \"Mainnet\""));
         assert!(main.contains("initial_mainnet_peers = []"));
         assert!(!main.contains("initial_testnet_peers"));
 
-        let test = public_zebrad_conf(
-            ArchiveNetwork::Testnet,
-            v(),
-            18232,
-            "/var/cache/zebrad",
-            None,
-            None,
-        );
+        let test =
+            public_zebrad_conf(Network::Testnet, v(), 18232, "/var/cache/zebrad", None, None);
         assert!(test.contains("network = \"Testnet\""));
         assert!(test.contains("initial_testnet_peers = []"));
         assert!(!test.contains("initial_mainnet_peers"));
@@ -261,7 +249,7 @@ mod tests {
     /// restored-chain path, `backend = 'direct'` was unconfigurable and never started
     #[test]
     fn zebrad_indexer_listen_addr_is_gated_on_the_port() {
-        let net = ArchiveNetwork::Testnet;
+        let net = Network::Testnet;
         let off = public_zebrad_conf(net, v(), 18232, "/var/cache/zebrad", None, None);
         let on = public_zebrad_conf(net, v(), 18232, "/var/cache/zebrad", Some(18230), None);
         assert!(!off.contains("indexer_listen_addr"));
@@ -332,6 +320,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "belongs to regtest_conf")]
     fn regtest_is_rejected_rather_than_rendered() {
-        public_zebrad_conf(ArchiveNetwork::Regtest, v(), 18232, "/var/cache/zebrad", None, None);
+        public_zebrad_conf(Network::Regtest, v(), 18232, "/var/cache/zebrad", None, None);
     }
 }

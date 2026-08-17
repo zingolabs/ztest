@@ -208,7 +208,7 @@ impl JsonRpcClient {
     /// `getblockchaininfo.upgrades`.
     ///
     /// - `upgrade_name` = RPC display name (`"NU6.3"`), not a manifest key (`"nu6_3"`);
-    ///   [`Activation::upgrade_name`](crate::Activation::upgrade_name) maps between them
+    ///   the RPC reports display names (`"NU5"`), ztest's declarations use snake_case
     /// - Running validator = source of truth; a manifest schedule is a claim to check
     pub async fn activation_height(&self, upgrade_name: &str) -> Result<u32, RpcError> {
         let info = self.call_value("getblockchaininfo", Value::Array(vec![])).await?;

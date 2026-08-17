@@ -159,7 +159,7 @@ async fn resolve_file(
     pod_prefix: &str,
     index: usize,
     volume_name: &str,
-    archive: crate::ArchiveHandle,
+    archive: crate::Artifact,
     destination: &Path,
     out: &mut ResolveOutput,
 ) -> Result<ResolvedMount, EnvError> {
@@ -188,7 +188,7 @@ async fn resolve_archive(
     pod_prefix: &str,
     index: usize,
     volume_name: &str,
-    archive: crate::ArchiveHandle,
+    archive: crate::Artifact,
     destination: &Path,
     out: &mut ResolveOutput,
 ) -> Result<ResolvedMount, EnvError> {

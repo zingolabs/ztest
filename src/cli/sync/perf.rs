@@ -234,7 +234,13 @@ async fn retrieve(
     let tenant = crate::profiling::tenant_for_sync(&client, id)
         .await
         .ok_or_else(|| format!("sync {id} is gone; its profiles are no longer addressable"))?;
-    let profile = crate::profiling::fetch(&client, &selector, window.0, window.1, &tenant).await?;
+    let profile =
+        match crate::profiling::fetch(&client, &selector, window.0, window.1, &tenant).await {
+            Ok(profile) => profile,
+            // An empty match has four causes and the cluster can still separate them; a bare
+            // "matched nothing" sends the reader to the query, which is the one thing that is fine
+            Err(e) => return Err(explain_empty(&client, id, component).await.unwrap_or(e)),
+        };
 
     let dest = out.unwrap_or_else(|| default_dest(id));
     std::fs::create_dir_all(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
@@ -243,6 +249,61 @@ async fn retrieve(
     println!("{} {}", theme.chars.ok.style(theme.styles.pass), path.display());
     report_fidelity(&client, id, component, &profile, window, &theme).await;
     Ok(path)
+}
+
+/// Why the query matched nothing, when the cluster can still say. `None` = no structural
+/// cause found, so the caller's "matched nothing in this window" stands.
+///
+/// Ordered by distance from a profile: never collected → collected on another node →
+/// collector never came up
+async fn explain_empty(client: &kube::Client, id: &str, component: &str) -> Option<String> {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::Api;
+
+    let run_ns = crate::resource::impls::policy::RUN_NAMESPACE;
+    let driver: Pod =
+        Api::namespaced(client.clone(), run_ns).get(&crate::sync::driver_pod_for(id)).await.ok()?;
+    let spec = driver.spec.as_ref()?;
+
+    // Native sidecar → `initContainers`, not `containers`. Absent = the run was never
+    // profiled at all, the one cause a re-query can never fix
+    let has_profiler =
+        spec.init_containers.iter().flatten().any(|c| c.name == crate::profiling::ebpf::CONTAINER);
+    if !has_profiler {
+        return Some(format!(
+            "sync {id} carries no profiler; nothing was ever collected — \
+             restart it with `ztest sync start <profile>`"
+        ));
+    }
+
+    let status = driver
+        .status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .and_then(|cs| cs.iter().find(|c| c.name == crate::profiling::ebpf::CONTAINER));
+    if let Some(waiting) = status.and_then(|s| s.state.as_ref()?.waiting.as_ref()) {
+        let reason = waiting.reason.as_deref().unwrap_or("not running");
+        return Some(format!(
+            "sync {id}: the profiler never started ({reason}); \
+             `kubectl -n {run_ns} logs {} -c {}`",
+            crate::sync::driver_pod_for(id),
+            crate::profiling::ebpf::CONTAINER,
+        ));
+    }
+
+    // eBPF sees one node; the collector rides the driver, so anything scheduled elsewhere
+    // was never sampled
+    let node = spec.node_name.as_deref()?;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace_for(id));
+    let subject = pods.get(component).await.ok()?;
+    let subject_node = subject.spec.as_ref()?.node_name.as_deref()?;
+    if subject_node != node {
+        return Some(format!(
+            "{component} ran on node {subject_node}, the profiler on {node} — \
+             eBPF only samples its own node"
+        ));
+    }
+    None
 }
 
 /// Below this the profile is missing enough CPU that its *shape* is suspect too, not
@@ -290,9 +351,8 @@ async fn report_fidelity(
     );
     if ratio < FIDELITY_FLOOR {
         eprintln!(
-            "ztest sync perf: under-sampled — lower {hz} (rate × cores must stay under the \
-             kernel tick)",
-            hz = crate::profiling::ebpf::HZ_ENV,
+            "ztest sync perf: under-sampled — restart with a lower `--profile-hz` \
+             (rate × cores must stay under the kernel tick)"
         );
     }
 }

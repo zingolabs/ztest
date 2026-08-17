@@ -73,7 +73,7 @@ Each archive has a paired `VolumeSnapshot`; tests always clone from the snapshot
 
 ```
 tar -I zstd -cf tests/assets/<name>.tar.zst -C <data-dir> .
-git lfs track tests/assets/<name>.tar.zst && git commit && open PR
+ztest snapshot manifest <archive> > snapshots/<net>/<up>.toml && ztest snapshot push <archive>
 ```
 
 **Materialization** (lazy, on first use). At `TestEnv::build()`, per archive mount:

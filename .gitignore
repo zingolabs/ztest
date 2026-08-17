@@ -1,3 +1,12 @@
 target/
 /.envrc
 /result
+
+# Chain archives are build inputs, not source: pinned by sha256 in
+# snapshots/<network>/<upgrade>.toml and fetched from the bucket on demand.
+# `ztest snapshot push` publishes them; `ztest snapshot manifest` records them.
+/fixtures/chains/*.tar.zst
+/fixtures/chains/*.tar.gz
+/fixtures/chains/*.tar.xz
+/fixtures/chains/*.tar.bz2
+/fixtures/chains/*.tar

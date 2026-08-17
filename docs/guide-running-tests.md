@@ -51,7 +51,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { lfs: true }
 
       - name: kubeconfig
         run: |
@@ -129,7 +128,9 @@ setup = ['preflight']
 
 1. **Resolve the test selection.** Intersect the filter expression with the per-binary mount inventory; prune archives no selected test references.
 2. **Probe the cluster.** Resolve `KUBECONFIG`, list nodes, count `zaino-{ci,dev}-*` namespaces as a concurrency proxy.
-3. **Resolve archives.** For each required `seed-{sha8}` PVC in `ztest-seeds`: ready → cached; not ready → attach to the reconcile Job's log stream; absent with local LFS blob → create PVC + reconcile Job; absent with remote blob → `git lfs pull` that pointer; pointer present but blob unreachable → soft-fail and proceed. Materialization flow: [design-architecture.md](design-architecture.md#archive-pvcs).
+3. **Resolve archives.** For each required `seed-{sha8}-{driver}` PVC in `ztest-seeds`: ready → cached; not ready → attach to the puller Job's log stream; absent → create PVC + puller Job. The Job `curl`s a presigned, TTL-bounded GET for `lfs/<oid>` straight into `tar -x`, so the bytes go **R2 → node** and never enter ztest or the apiserver. Bucket unreachable or object missing → soft-fail and proceed. Materialization flow: [design-architecture.md](design-architecture.md#archive-pvcs).
+
+   Archives are gitignored, so a checkout holds none of them and nothing is fetched at clone time. The OID comes from `snapshots/<network>/<upgrade>.toml`, read at compile time. Credentials: [fixtures/chains/README.md](../fixtures/chains/README.md#environment); `ztest cluster check` reports the bucket as its own row.
 4. **Resolve snapshots.** For each `VolumeSnapshot` the selection clones, ensure its source PVC is ready (recurses into step 3) and the snapshot is bound.
 5. **Emit a final banner and exit 0.**
 
@@ -146,8 +147,8 @@ Hard failures (cluster unreachable, auth, malformed manifest) exit ≠ 0; nextes
 │ archives (4)
 │   ✓ regtest-nu5-h128        cached · 412 MiB
 │   ✓ testnet-2.6m            cached · 18.4 GiB
-│   ⇣ testnet-3.1m            downloading from LFS  [█████░░] 64%
-│   ! mainnet-snapshot-9.0    missing  (LFS pointer present, blob absent)
+│   ⇣ testnet-3.1m            pulling from R2       [█████░░] 64%
+│   ! mainnet-snapshot-9.0    missing  (no object at lfs/<oid>)
 │ snapshots
 │   ✓ pvc/zebra-testnet-cache   bound · ready
 │   ⇣ pvc/zebra-mainnet-cache   provisioning from archive testnet-3.1m
@@ -163,7 +164,7 @@ Markers: `✓` in target state; `⇣` in progress (refreshed in place); `!` soft
 | Cluster API unreachable            | n/a    | No — exit ≠ 0  |
 | Auth failed                        | n/a    | No — exit ≠ 0  |
 | Mount enumeration failed           | n/a    | No — exit ≠ 0  |
-| LFS pointer present, blob missing  | `!`    | Yes; affected tests fail at `TestEnv::build()` with the missing-archive error |
+| Bucket unreachable / object absent | `!`    | Yes; affected tests fail at `TestEnv::build()` with the missing-archive error |
 | Archive reconcile Job failed       | `!`    | Yes; same      |
 | VolumeSnapshot stuck in `Pending`  | `!`    | Yes; tests cloning it time out at `build()` |
 

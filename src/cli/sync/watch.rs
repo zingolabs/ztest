@@ -317,7 +317,7 @@ async fn tail_loop(
                         true => Backfill::Seconds(gap_since(sut_seen)),
                         false => Backfill::Lines(TAIL_LINES),
                     };
-                    if let Ok(stream) = open_log(api, &name, backfill).await {
+                    if let Ok(stream) = open_log(api, &name, None, backfill).await {
                         console.scrollback(prefixed("ztest", &format!("following {name}"), theme));
                         sut_prev = Some(name.clone());
                         sut_name = name;
@@ -375,10 +375,15 @@ async fn reattach_driver(
     if !running(&pod, DRIVER_CONTAINER) {
         return Ok(None);
     }
-    open_log(&driver.api, &driver.name, Backfill::Seconds(gap_since(last_seen)))
-        .await
-        .map(Some)
-        .map_err(|e| format!("reattach to sync log: {e}"))
+    open_log(
+        &driver.api,
+        &driver.name,
+        Some(DRIVER_CONTAINER),
+        Backfill::Seconds(gap_since(last_seen)),
+    )
+    .await
+    .map(Some)
+    .map_err(|e| format!("reattach to sync log: {e}"))
 }
 
 /// Sampling failure → the panel's one-line cause. A missing aggregated API is the
@@ -420,10 +425,15 @@ async fn open_driver_log(
             .ok_or_else(|| format!("driver pod {} no longer exists", driver.name))?;
         observe(driver_phase(&pod));
         if logs_available(&pod, DRIVER_CONTAINER) {
-            return open_log(&driver.api, &driver.name, Backfill::Lines(TAIL_LINES))
-                .await
-                .map(Some)
-                .map_err(|e| format!("stream sync log: {e}"));
+            return open_log(
+                &driver.api,
+                &driver.name,
+                Some(DRIVER_CONTAINER),
+                Backfill::Lines(TAIL_LINES),
+            )
+            .await
+            .map(Some)
+            .map_err(|e| format!("stream sync log: {e}"));
         }
         tokio::time::sleep(POD_POLL).await;
     }
@@ -476,12 +486,16 @@ enum Backfill {
     Seconds(i64),
 }
 
+/// `container`: `None` for a single-container pod, `Some` where the pod has more than one
+/// (the driver carries a profiler sidecar — unnamed, the apiserver answers 400)
 async fn open_log(
     api: &Api<Pod>,
     pod: &str,
+    container: Option<&str>,
     backfill: Backfill,
 ) -> Result<LineStream, kube::Error> {
-    let mut lp = LogParams { follow: true, ..Default::default() };
+    let mut lp =
+        LogParams { follow: true, container: container.map(str::to_string), ..Default::default() };
     match backfill {
         Backfill::Lines(n) => lp.tail_lines = Some(n),
         Backfill::Seconds(s) => lp.since_seconds = Some(s),
@@ -555,7 +569,11 @@ async fn plain_tail(driver: &DriverPod, theme: &Theme) -> Result<(), String> {
 ///   after the run ends; without this the only mid-run answer is the pod phase)
 /// - `None` = no tick published yet (provisioning) or the log is unreadable
 pub(super) async fn latest_progress(driver: &DriverPod) -> Option<SyncWatchState> {
-    let lp = LogParams { tail_lines: Some(STATUS_TAIL_LINES), ..Default::default() };
+    let lp = LogParams {
+        tail_lines: Some(STATUS_TAIL_LINES),
+        container: Some(DRIVER_CONTAINER.to_string()),
+        ..Default::default()
+    };
     let logs = driver.api.logs(&driver.name, &lp).await.ok()?;
     let theme = Theme::for_capabilities(false, true);
     let mut feed = Feed::new(String::new(), String::new(), String::new(), String::new());

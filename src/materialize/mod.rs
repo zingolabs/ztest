@@ -128,27 +128,24 @@ async fn selected_driver(client: &Client) -> Result<String, EnvError> {
 /// - Waits and reads only: no PVC create, no Job, no bucket (runner pods hold nothing)
 /// - Absent seed = a *preflight* bug, not a transient → bounded wait, error names
 ///   the missing declaration
-pub async fn await_seed(
-    client: &Client,
-    handle: crate::ArchiveHandle,
-) -> Result<SeedHandle, EnvError> {
+pub async fn await_seed(client: &Client, handle: crate::Artifact) -> Result<SeedHandle, EnvError> {
     let driver = selected_driver(client).await?;
-    let pvc_name = storage::seed_pvc_name(handle.oid(), &driver);
+    let pvc_name = storage::seed_pvc_name(handle.oid, &driver);
     if !pvc_exists(client, &pvc_name).await? {
         return Err(EnvError::ArchiveMaterializeFailed {
-            archive: handle.name().to_string(),
+            archive: handle.name.to_string(),
             reason: format!(
                 "seed {pvc_name} was never provisioned. A test may only mount an archive it \
                  declares: add `#[ztest::needs({})]` to this test so preflight provisions \
                  the seed before the run starts.",
-                handle.name()
+                handle.name
             ),
         });
     }
     wait_pvc_ready(client, &pvc_name).await?;
     // Test side: no console row (`NodeProgress::default` → nowhere)
     wait_snapshot_ready(client, &pvc_name, &NodeProgress::default()).await?;
-    seeds::read_seed_handle(client, handle.name(), handle.oid(), &driver).await
+    seeds::read_seed_handle(client, handle.name, handle.oid, &driver).await
 }
 
 // ─────────────────────────── capability preflight ───────────────────
@@ -462,6 +459,8 @@ fn puller_stuck(archive: &str, pod: &str, budget: Duration) -> MaterializeErr {
 /// - Explicit decompression flag, present in the image (GNU tar can't sniff a
 ///   non-seekable pipe) — see [`detect_puller_image`]
 /// - URL via `SEED_URL`, never argv (bearer credential vs world-readable `/proc`)
+/// - Digest checked in flight: a seed is *named* by its content, so bytes hashing to
+///   anything else are the one corruption no other check here catches
 fn puller_cmd(seed: &SeedEntry) -> Result<String, storage::StorageError> {
     let prelude = "set -o pipefail";
     let fetch = "curl --fail --silent --show-error --location \"$SEED_URL\"";
@@ -471,19 +470,45 @@ fn puller_cmd(seed: &SeedEntry) -> Result<String, storage::StorageError> {
                 storage::StorageError::UnknownCompression { name: seed.name.clone() }
             })?;
             format!(
-                "{fetch} | {METER} | tar {}-xf - -C /seed && {NORMALIZE_MODES}",
+                "{fetch} | tee {VERIFY_FIFO} | {METER} | tar {}-xf - -C /seed && \
+                 {NORMALIZE_MODES}",
                 compression.tar_flag()
             )
         }
         // Always `/seed/blob` — only the consumer's volumeMount path cares
         crate::inventory::SeedPayload::File => {
-            format!("{fetch} | {METER} > /seed/blob && {NORMALIZE_MODES}")
+            format!("{fetch} | tee {VERIFY_FIFO} | {METER} > /seed/blob && {NORMALIZE_MODES}")
         }
     };
+    let verified = format!("{VERIFY_OPEN}; {payload} && {}", verify_close(&seed.oid));
     // Group-then-pipe, not appended to the payload's pipeline: the meter writes to
     // *stderr*, and only a group carries every command's stderr through one delimiter
     // `pipefail` spans both pipelines → `tr` cannot mask a failed transfer
-    Ok(format!("{prelude}; {{ {payload} ; }} 2>&1 | {LINE_DELIMIT}"))
+    Ok(format!("{prelude}; {{ {verified} ; }} 2>&1 | {LINE_DELIMIT}"))
+}
+
+/// Where `tee` forks the stream to the hasher. A FIFO, so the bytes are hashed as they
+/// stream past — nothing is staged, and a 21 GB archive needs no second copy
+const VERIFY_FIFO: &str = "/tmp/verify.fifo";
+
+/// Start hashing before the transfer opens the write end.
+///
+/// - Backgrounded against a real pid, not a `>(…)` substitution: the shell never waits
+///   for those, so the compare could read a half-written digest
+/// - `mkfifo` stays in the *foreground* — `mkfifo … && { … } &` backgrounds the whole
+///   list, letting `tee` reach the path before it is a FIFO
+const VERIFY_OPEN: &str = "mkfifo /tmp/verify.fifo || exit 1; \
+                           { sha256sum < /tmp/verify.fifo | cut -d' ' -f1 > /tmp/verify.sum ; } & \
+                           VERIFY_PID=$!";
+
+/// Join the hasher and compare. Runs only after the transfer succeeded, so a mismatch
+/// here means the bucket served bytes that are not what the seed is named for
+fn verify_close(oid: &str) -> String {
+    format!(
+        "wait $VERIFY_PID; ACTUAL=$(cat /tmp/verify.sum); \
+         [ \"$ACTUAL\" = \"{oid}\" ] || {{ \
+         echo \"seed digest mismatch: expected {oid}, got $ACTUAL\" >&2; exit 1; }}"
+    )
 }
 
 /// Mid-pipe meter: running byte total to stderr once a second, drawn by
@@ -741,9 +766,31 @@ mod tests {
     #[test]
     fn the_archive_command_meters_the_transfer_and_delimits_its_records() {
         let cmd = puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive)).expect("known suffix");
-        assert!(cmd.starts_with("set -o pipefail; { curl "), "{cmd}");
+        assert!(cmd.starts_with("set -o pipefail; { mkfifo "), "{cmd}");
+        assert!(cmd.contains("curl --fail"), "{cmd}");
         assert!(cmd.contains(&format!("| {METER} | tar --zstd -xf - -C /seed")), "{cmd}");
         assert!(cmd.ends_with(&format!("; }} 2>&1 | {LINE_DELIMIT}")), "{cmd}");
+    }
+
+    /// A seed is *named* by its content, so bytes hashing to anything else are the one
+    /// corruption nothing downstream would catch — the PVC would just serve them.
+    ///
+    /// Three properties, each load-bearing: the hasher is joined on a real pid (a
+    /// `>(…)` substitution is never waited for, so the compare could read a partial
+    /// digest); the compare runs only on a successful transfer, so a mismatch means the
+    /// bucket lied rather than the network dropped; and the expected oid is in the
+    /// message, because "digest mismatch" alone names no artifact to go look at.
+    #[test]
+    fn a_seed_whose_bytes_do_not_hash_to_its_name_fails_the_pull() {
+        for payload in [SeedPayload::Archive, SeedPayload::File] {
+            let s = seed("chain.tar.zst", payload);
+            let cmd = puller_cmd(&s).expect("valid seed");
+            assert!(cmd.contains(&format!("tee {VERIFY_FIFO}")), "{cmd}");
+            assert!(cmd.contains("wait $VERIFY_PID"), "not joined on a real pid: {cmd}");
+            assert!(cmd.contains("&& wait $VERIFY_PID"), "compared unconditionally: {cmd}");
+            assert!(cmd.contains(&format!("expected {}", s.oid)), "{cmd}");
+            assert!(cmd.contains("exit 1"), "mismatch does not fail the pod: {cmd}");
+        }
     }
 
     #[test]

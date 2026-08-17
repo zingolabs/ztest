@@ -9,7 +9,7 @@
 
 #![deny(missing_debug_implementations)]
 
-// `archive!` expands to `::ztest::…`, and `crate::snapshots` invokes it from inside
+// `artifact!` expands to `::ztest::…`, and `crate::snapshots` invokes it from inside
 // ztest → resolves here as in a consuming crate, no in-crate special case
 extern crate self as ztest;
 
@@ -70,9 +70,7 @@ mod ui;
 
 // ─────────────────────────── top-level re-exports ──────────────────────
 
-pub use crate::archive::{
-    Activation, ArchiveBackend, ArchiveHandle, ArchiveNetwork, BoundaryCheck, ChainInfo,
-};
+pub use crate::archive::{Artifact, Backend, ChainSnapshot, Network};
 pub use crate::backends::image::DevSource;
 #[cfg(feature = "librustzcash")]
 pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
@@ -108,7 +106,7 @@ pub use crate::loadtest::{
     BlockOracle, Distribution, LoadDriver, LoadReport, LwdClient, Rel, Scenario,
 };
 pub use crate::mount::{Mount, MountKind, MountSource};
-pub use ztest_macros::{archive, dev, mount_archive, mount_config, mount_file, needs, sync_test};
+pub use ztest_macros::{artifact, dev, mount_archive, mount_config, mount_file, needs, sync_test};
 
 /// Runtime support for test-author proc macros. Not public API, paths may move
 #[doc(hidden)]
@@ -152,39 +150,33 @@ pub mod prelude {
     #[cfg(feature = "zingo")]
     pub use super::ZingoWallet;
     pub use super::{
-        Account, AccountId, ArchiveHandle, BlockHash, BlockHeight, BlockSample, BlockTip,
-        BlockchainInfo, ChainConfig, CompactBlock, CompactTx, ComponentBuilder,
-        ComponentOptsBuilder, Cpu, Endpoint, EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer,
-        IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo, Mount,
-        MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction,
-        RpcError, SendResponse, SharedVolume, ShieldedProtocol, SubtreeRoot, TestEnv, TreeState,
-        TxId, Validator, ValidatorBackend, ValidatorConfig, Wallet, WalletBackend, WalletExt,
+        Account, AccountId, BlockHash, BlockHeight, BlockSample, BlockTip, BlockchainInfo,
+        ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Cpu,
+        Endpoint, EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer, IndexerBackend,
+        JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo, Mount, MountKind,
+        MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction, RpcError,
+        SendResponse, SharedVolume, ShieldedProtocol, SubtreeRoot, TestEnv, TreeState, TxId,
+        Validator, ValidatorBackend, ValidatorConfig, Wallet, WalletBackend, WalletExt,
         ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
     };
-    /// What test bodies read off [`TestEnv::chain`] instead of hardcoding: the pin,
-    /// the straddled upgrade, the heights worth querying
-    ///
-    /// [`TestEnv::chain`]: crate::TestEnv::chain
-    pub use crate::archive::{
-        Activation, ArchiveBackend, ArchiveNetwork, BoundaryCheck, ChainInfo,
-    };
+    /// The pinned chain a test names, and the blob it is restored from
+    pub use crate::archive::{Artifact, Backend, ChainSnapshot, Network};
     pub use crate::backends::zainod::ZainoTuning;
     pub use crate::loadtest::{
         BlockOracle, Distribution, LoadDriver, LoadReport, LwdClient, Rel, Scenario,
     };
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
-        Regtest, Testnet, regtest_test_activation_heights, regtest_test_lockbox_disbursements,
+        Regtest, Restore, regtest_test_activation_heights, regtest_test_lockbox_disbursements,
         regtest_test_post_nu6_funding_streams,
     };
-    /// Named snapshots by network (`testnet::ORCHARD`, `mainnet::BLOSSOM`) = the whole
-    /// test-author surface for chain fixtures. Modules not consts: both networks pin
-    /// the same upgrade names, so a bare `ORCHARD` would mean whichever one won
-    pub use crate::snapshots::{mainnet, testnet};
+    /// Named snapshots (`ORCHARD_TESTNET`, `BLOSSOM_MAINNET`) = the whole test-author
+    /// surface for chain fixtures
+    pub use crate::snapshots::*;
     /// In public signatures (e.g. [`ValidatorBackend::activation_heights`]) → callers
     /// need the type to consume what ztest returns
     pub use crate::topology::ActivationHeights;
     pub use ztest_macros::{
-        archive, dev, mount_archive, mount_config, mount_file, needs, sync_test,
+        artifact, dev, mount_archive, mount_config, mount_file, needs, sync_test,
     };
 }

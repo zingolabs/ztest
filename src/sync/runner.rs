@@ -18,12 +18,16 @@ use super::probe::{
 };
 use super::snapshot::{History, Snapshot, SnapshotBuilder};
 use super::subject::{ProgressView, SyncSubject};
-use super::work::{Segment, Work};
+use super::work::{Op, OpSet, Segment, Work};
 use crate::handles::indexer::BlockHeight;
 
 /// Engine's sampling cadence when a profile names none. Also what a watcher assumes a
 /// driver ticks at until its `Started` says otherwise
 pub const DEFAULT_TICK: Duration = Duration::from_secs(5);
+
+/// Readings the work preflight will take before calling the subject unreadable (exporter can
+/// lag pod-Ready by a scrape)
+const WORK_PREFLIGHT_ATTEMPTS: u32 = 3;
 
 /// - `Passed` = tip reached, every fatal invariant intact, every `sometimes` probe triggered
 /// - `Errored` = probe or harness failure, not a verdict about the subject
@@ -158,6 +162,7 @@ pub struct SyncEngine<S: SyncSubject> {
     timeout: Option<Duration>,
     stop_height: Option<u32>,
     reporter: Box<dyn SyncReporter>,
+    required_work: OpSet,
 }
 
 impl<S: SyncSubject> SyncEngine<S> {
@@ -174,6 +179,7 @@ impl<S: SyncSubject> SyncEngine<S> {
             timeout: None,
             stop_height: None,
             reporter: Box::new(NullReporter),
+            required_work: OpSet::NONE,
         }
     }
 
@@ -209,6 +215,14 @@ impl<S: SyncSubject> SyncEngine<S> {
     }
     pub fn with_reporter(mut self, reporter: Box<dyn SyncReporter>) -> Self {
         self.reporter = reporter;
+        self
+    }
+
+    /// Ops this profile's probes will [`Work::require`] — checked against one live reading
+    /// before the run, so a subject that does not publish them fails by name here rather
+    /// than panicking a probe hours in
+    pub fn requires_work(mut self, ops: OpSet) -> Self {
+        self.required_work = ops;
         self
     }
 
@@ -269,6 +283,11 @@ impl<S: SyncSubject> SyncEngine<S> {
                 0,
                 None,
             );
+        }
+
+        if let Err(e) = self.check_required_work().await {
+            let _ = self.subject.stop().await;
+            return self.finish(SyncVerdict::Errored, Vec::new(), Vec::new(), Some(e), 0, 0, None);
         }
 
         let started = Instant::now();
@@ -548,6 +567,65 @@ impl<S: SyncSubject> SyncEngine<S> {
         Flow::Continue
     }
 
+    /// One reading, before the engine loop: every [`requires_work`](Self::requires_work) op
+    /// must come back measured.
+    ///
+    /// - Probes read these with `Work::require`, which panics on an unmeasured op → a
+    ///   missing series otherwise surfaces as a mid-run panic naming no series
+    /// - Subject and harness agree on these names by string only (nothing cross-checks the
+    ///   component's exporter against the families this backend reads)
+    async fn check_required_work(&mut self) -> Result<(), String> {
+        if self.required_work.is_empty() {
+            return Ok(());
+        }
+        let mut last_err = None;
+        for attempt in 0..WORK_PREFLIGHT_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(self.tick).await;
+            }
+            let progress = match self.subject.progress().await {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    continue;
+                }
+            };
+            // `None` = subject publishes no work vector at all → every required op is missing
+            let measured = progress.work().map(|w| w.known()).unwrap_or(OpSet::NONE);
+            let missing: Vec<Op> = Op::ALL
+                .into_iter()
+                .filter(|&op| self.required_work.has(op) && !measured.has(op))
+                .collect();
+            if missing.is_empty() {
+                return Ok(());
+            }
+            return Err(self.unmeasured_work_error(&missing, measured));
+        }
+        Err(format!(
+            "could not read the subject's work counters in {WORK_PREFLIGHT_ATTEMPTS} attempts: {}",
+            last_err.unwrap_or_else(|| "no error reported".to_owned()),
+        ))
+    }
+
+    fn unmeasured_work_error(&self, missing: &[Op], measured: OpSet) -> String {
+        let named = |op: Op| match self.subject.work_source(op) {
+            Some(series) => format!("  {} <- {series}", op.label()),
+            None => format!("  {} <- (no series declared by this subject)", op.label()),
+        };
+        let measured: Vec<&str> =
+            Op::ALL.into_iter().filter(|&op| measured.has(op)).map(Op::label).collect();
+        format!(
+            "the subject does not measure {} op(s) this profile requires:\n{}\n\
+             it measures: {}\n\
+             A probe reading an unmeasured op panics mid-run, so the run is refused here \
+             instead. Either the component does not publish the series (check its /metrics \
+             against the name above), or the profile should not have required the op.",
+            missing.len(),
+            missing.iter().map(|&op| named(op)).collect::<Vec<_>>().join("\n"),
+            if measured.is_empty() { "nothing".to_owned() } else { measured.join(", ") },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finish(
         &mut self,
@@ -603,6 +681,7 @@ mod tests {
         target: u32,
         sapling: u64,
         orchard: u64,
+        measured: OpSet,
     }
     impl ProgressView for FakeProgress {
         fn height(&self) -> u32 {
@@ -619,7 +698,11 @@ mod tests {
         }
         fn work(&self) -> Option<Work> {
             let mut w = Work::ZERO;
-            w.set(Op::SaplingOutput, self.sapling).set(Op::OrchardAction, self.orchard);
+            for (op, n) in [(Op::SaplingOutput, self.sapling), (Op::OrchardAction, self.orchard)] {
+                if self.measured.has(op) {
+                    w.set(op, n);
+                }
+            }
             Some(w)
         }
     }
@@ -664,10 +747,20 @@ mod tests {
             self.stopped.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+        fn work_source(&self, op: Op) -> Option<&'static str> {
+            match op {
+                Op::SaplingOutput => Some("fake_sapling_outputs_total"),
+                _ => None,
+            }
+        }
     }
 
     fn p(height: u32, target: u32) -> FakeProgress {
-        FakeProgress { height, target, sapling: u64::from(height), orchard: 0 }
+        p_measuring(height, target, OpSet::of(&[Op::SaplingOutput, Op::OrchardAction]))
+    }
+
+    fn p_measuring(height: u32, target: u32, measured: OpSet) -> FakeProgress {
+        FakeProgress { height, target, sapling: u64::from(height), orchard: 0, measured }
     }
 
     fn height_monotonic(s: &Snapshot) -> Verdict {
@@ -684,6 +777,44 @@ mod tests {
 
     fn fast_runner<S: SyncSubject>(subject: S) -> SyncEngine<S> {
         SyncEngine::new(subject).with_tick(Duration::from_millis(10))
+    }
+
+    /// The failure this guards is a *silent cross-repo rename*: the subject stops publishing
+    /// a series, the harness still asks for it, and the only symptom is a `Work::require`
+    /// panic hours in, naming an `Op` but never the series a reader must go grep for.
+    #[tokio::test(start_paused = true)]
+    async fn preflight_refuses_a_run_requiring_an_unmeasured_op() {
+        let orchard_only = OpSet::of(&[Op::OrchardAction]);
+        let run = fast_runner(FakeSubject::new(vec![p_measuring(1, 3, orchard_only)]))
+            .requires_work(OpSet::of(&[Op::SaplingOutput, Op::OrchardAction]));
+
+        let outcome = run.run().await;
+
+        assert_eq!(outcome.verdict, SyncVerdict::Errored);
+        let error = outcome.error.expect("a refused run reports why");
+        assert!(error.contains("sapling-output"), "{error}");
+        // The series name is the whole point — an Op label alone is not greppable
+        assert!(error.contains("fake_sapling_outputs_total"), "{error}");
+        assert!(error.contains("orchard-action"), "measured ops belong in the report: {error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preflight_admits_a_run_whose_required_ops_are_all_measured() {
+        let run = fast_runner(FakeSubject::new(vec![p(1, 2), p(2, 2)]))
+            .requires_work(OpSet::of(&[Op::SaplingOutput]));
+
+        assert_eq!(run.run().await.verdict, SyncVerdict::Passed);
+    }
+
+    /// Declaring nothing must not start requiring everything
+    #[tokio::test(start_paused = true)]
+    async fn preflight_is_inert_when_no_work_is_required() {
+        let run = fast_runner(FakeSubject::new(vec![
+            p_measuring(1, 2, OpSet::NONE),
+            p_measuring(2, 2, OpSet::NONE),
+        ]));
+
+        assert_eq!(run.run().await.verdict, SyncVerdict::Passed);
     }
 
     #[tokio::test(start_paused = true)]

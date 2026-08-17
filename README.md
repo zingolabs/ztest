@@ -46,32 +46,43 @@ Wallets are primarily run in-process, and most do not ship a daemon docker
 container, so test-runner images are used and sized w/ more CPU.
 
 ```rust
-
-
+use ztest::WalletConfig;
 use ztest::prelude::*;
 
-#[rstest::case]
+#[rstest::rstest]
+#[case::librustzcash(Wallet::librustzcash())]
+#[case::zingo(Wallet::zingo())]
+#[case::zallet(Wallet::zallet())]
 #[tokio::test(flavor = "multi_thread")]
 #[ztest::qos::wallet]
-async fn ironwood_fetch_parity(wallet) {
+async fn ironwood_fetch_parity<B>(#[case] wallet: Wallet<B>)
+where
+    B: WalletConfig,
+    B::Handle: WalletExt,
+{
     let mut t = TestEnv::builder();
     let zebra = t.add_validator(Validator::zebrad("6.2.3").regtest());
-    let zaino = t.add_indexer(Indexer::zainod("0.7.0").regtest());
-    let _wallet = t.add_wallet(wallet);
+    let zaino = t.add_indexer(Indexer::zaino("0.7.0").regtest());
+    let wallet = t.add_wallet(wallet);
     t.build().await.unwrap();
 
-
-
-
-
-    let faucet = w.funded_faucet(&zeb, &zai).await.unwrap();
-    let recipient = w.recipient(&zeb, &zai).await.unwrap();
+    let faucet = wallet.funded_faucet(&zebra, &zaino).await.unwrap();
+    let recipient = wallet.recipient(&zebra, &zaino).await.unwrap();
     let to = recipient.address(Pool::Orchard).await.unwrap();
     faucet.send(&to, 100_000).await.unwrap();
-
-
-
+}
 ```
+
+Each `#[case]` is a distinct wallet *type* (`Wallet<LrzBackend>`,
+`Wallet<ZingoBackend>`, …), so the body is generic over the backend and
+`WalletExt` supplies the well-known seeds, funded faucet and recipient for every
+one of them. `ztest run` names the cases
+`ironwood_fetch_parity::case_1_librustzcash`, … and each inherits the tier
+declared on the parent fn.
+
+`Wallet::zingo()` needs the `zingo` feature (`librustzcash` is the default).
+`Wallet::zallet()` is not implemented yet — drop that case until the zallet
+backend lands.
 
 ### Mount a custom config and a seeded data dir
 

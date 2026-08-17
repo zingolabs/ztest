@@ -24,7 +24,7 @@ pub struct Mount {
 pub enum MountSource {
     ConfigAbs(PathBuf),
     ConfigInline(String),
-    Seed(crate::ArchiveHandle),
+    Seed(crate::Artifact),
     Empty,
     SharedClaim { claim: String },
 }
@@ -56,7 +56,7 @@ impl Mount {
     ///
     /// - Pulled into a seed PVC once per cluster (`crate::materialize`), CoW-cloned per test
     /// - Compressor derived from the artifact's *name* (the bytes never exist locally)
-    pub fn archive(archive: crate::ArchiveHandle, destination: impl Into<PathBuf>) -> Self {
+    pub fn archive(archive: crate::Artifact, destination: impl Into<PathBuf>) -> Self {
         Mount {
             source: MountSource::Seed(archive),
             destination: destination.into(),

@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use owo_colors::OwoColorize as _;
 
-use crate::resource::reclaim::{self, Liveness, Outcome, Scope};
+use crate::resource::reclaim::{self, Outcome, Scope};
 
 #[derive(Debug, Parser)]
 pub struct Args {
@@ -95,19 +95,31 @@ fn report(outcome: &Outcome, dry_run: bool) -> Result<(), String> {
 
     for t in &outcome.deleted {
         eprintln!(
-            "  {} {verb:<10} {:<16} {}  {}",
+            "  {} {verb:<11} {:<16} {}  {}",
             "✓".green(),
             t.kind.noun(),
             t.name,
             format_args!("({})", t.detail).dimmed(),
         );
     }
+    // Not "reaped": the apiserver accepted the delete but a finalizer still holds the
+    // object, and it stays listable (and re-deletable) until that clears
+    for t in &outcome.terminating {
+        eprintln!(
+            "  {} {:<11} {:<16} {}  {}",
+            "⧗".yellow(),
+            "terminating",
+            t.kind.noun(),
+            t.name,
+            format_args!("({})", t.liveness.reason().unwrap_or(&t.detail)).dimmed(),
+        );
+    }
     for t in &outcome.skipped {
-        let Liveness::Live(why) = &t.liveness else {
+        let Some(why) = t.liveness.reason() else {
             continue;
         };
         eprintln!(
-            "  {} {:<10} {:<16} {}  {}",
+            "  {} {:<11} {:<16} {}  {}",
             "~".yellow(),
             "skipped",
             t.kind.noun(),
@@ -122,7 +134,7 @@ fn report(outcome: &Outcome, dry_run: bool) -> Result<(), String> {
     if !outcome.purged.is_empty() {
         let verb = if dry_run { "would purge" } else { "purged" };
         eprintln!(
-            "  {} {verb:<10} {:<16} {}",
+            "  {} {verb:<11} {:<16} {}",
             "✓".green(),
             "metrics",
             format_args!("({} series selector(s))", outcome.purged.len()).dimmed(),
@@ -133,7 +145,7 @@ fn report(outcome: &Outcome, dry_run: bool) -> Result<(), String> {
     if !outcome.retired.is_empty() {
         let verb = if dry_run { "would retire" } else { "retired" };
         eprintln!(
-            "  {} {verb:<10} {:<16} {}",
+            "  {} {verb:<11} {:<16} {}",
             "✓".green(),
             "profiles",
             format_args!(
@@ -145,7 +157,11 @@ fn report(outcome: &Outcome, dry_run: bool) -> Result<(), String> {
         );
     }
 
-    if outcome.deleted.is_empty() && outcome.skipped.is_empty() && outcome.errors.is_empty() {
+    if outcome.deleted.is_empty()
+        && outcome.terminating.is_empty()
+        && outcome.skipped.is_empty()
+        && outcome.errors.is_empty()
+    {
         eprintln!("✓ nothing to reclaim");
         return Ok(());
     }
@@ -158,10 +174,20 @@ fn report(outcome: &Outcome, dry_run: bool) -> Result<(), String> {
     }
 
     if outcome.errors.is_empty() {
-        eprintln!(
-            "✓ {} resource(s) {summary_verb} (cluster + shared infrastructure kept)",
-            outcome.deleted.len()
-        );
+        // Terminating counted apart: a finalizer clears on its own schedule, and only a
+        // later pass can call it reaped (`--force` does not hurry one)
+        if outcome.terminating.is_empty() {
+            eprintln!(
+                "✓ {} resource(s) {summary_verb} (cluster + shared infrastructure kept)",
+                outcome.deleted.len()
+            );
+        } else {
+            eprintln!(
+                "✓ {} {summary_verb}, {} terminating (re-run to confirm)",
+                outcome.deleted.len(),
+                outcome.terminating.len(),
+            );
+        }
         return Ok(());
     }
     Err(format!("{} error(s); see `✗ …` lines above", outcome.errors.len()))

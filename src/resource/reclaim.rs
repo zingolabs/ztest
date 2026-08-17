@@ -12,11 +12,14 @@
 //! - Never touched: seed cache (`ztest snapshot prune`) + infrastructure (`ztest cluster setup`)
 //!   — reclaiming must never force a re-`setup`
 //! - Discovery/deletion split into two passes (exact `--dry-run`, "reaped" vs "still live")
+//! - DELETE = a request, not an act (finalizers) — "reaped" claims only what the apiserver
+//!   confirmed gone, everything else reports `terminating` and is left to drain
 use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
-use kube::Client;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, DeleteParams, DynamicObject, ListParams, ResourceExt};
+use kube::{Client, Resource};
 
 use crate::qos;
 use crate::qos::ledger::{META_NAMESPACE, is_expired};
@@ -53,17 +56,28 @@ impl Kind {
     }
 }
 
-/// `Live`'s reason is printed verbatim ("why was this skipped?" must not need
-/// re-deriving the rule)
+/// Lifecycle as cleanup sees it. `Live`/`Terminating` reasons print verbatim ("why was
+/// this skipped?" must not need re-deriving the rule)
+///
+/// - `Terminating` = `deletionTimestamp` set (re-DELETE answered 200 not 404 → reads as a reap)
 #[derive(Debug, Clone)]
 pub enum Liveness {
     Finished,
+    Terminating(String),
     Live(String),
 }
 
 impl Liveness {
     pub fn is_live(&self) -> bool {
         matches!(self, Liveness::Live(_))
+    }
+
+    /// Printable reason, for the two states that carry one
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Liveness::Finished => None,
+            Liveness::Terminating(why) | Liveness::Live(why) => Some(why),
+        }
     }
 }
 
@@ -149,9 +163,12 @@ impl Plan {
     }
 }
 
+/// `deleted` = confirmed gone; `terminating` = draining behind a finalizer, whether it
+/// arrived that way or this pass asked (a re-run is what confirms it)
 #[derive(Debug, Default)]
 pub struct Outcome {
     pub deleted: Vec<Target>,
+    pub terminating: Vec<Target>,
     pub skipped: Vec<Target>,
     pub errors: Vec<String>,
     pub purged: Vec<String>,
@@ -177,7 +194,8 @@ pub async fn discover(client: &Client, scope: &Scope) -> Plan {
     plan
 }
 
-/// Live targets skipped unless `force`.
+/// Live targets skipped unless `force`; already-`Terminating` ones passed through
+/// untouched (`--force` cannot hurry a finalizer, and a re-DELETE would re-report them).
 ///
 /// - [`Kind`] order: capacity consumers before the reservation [`Lease`] (releasing
 ///   first lets a concurrent run admit against capacity the dying pods still hold)
@@ -185,21 +203,9 @@ pub async fn discover(client: &Client, scope: &Scope) -> Plan {
 pub async fn reclaim(client: &Client, plan: Plan, force: bool, dry_run: bool) -> Outcome {
     let mut outcome = Outcome { errors: plan.errors, ..Default::default() };
 
-    let mut reclaimable = Vec::new();
-    for target in plan.targets {
-        match target.liveness.is_live() && !force {
-            true => outcome.skipped.push(target),
-            false => reclaimable.push(target),
-        }
-    }
+    let reclaimable = triage(plan.targets, force, &mut outcome);
 
-    // Every target's series in one pass: `purge` holds a single port-forward, and the
-    // selectors derive from the sync id alone, so nothing here needs what `delete` removes
-    let selectors: Vec<String> = reclaimable.iter().flat_map(Target::metric_selectors).collect();
-    // Deduped: every pod and namespace of one run derives the same tenant
-    let mut tenants: Vec<String> = reclaimable.iter().filter_map(Target::profile_tenant).collect();
-    tenants.sort();
-    tenants.dedup();
+    let (selectors, tenants) = observability_of(&reclaimable, &outcome.terminating);
     if dry_run {
         outcome.purged = selectors;
         outcome.retired = tenants;
@@ -211,9 +217,13 @@ pub async fn reclaim(client: &Client, plan: Plan, force: bool, dry_run: bool) ->
     purge_metrics(client, selectors, &mut outcome).await;
     retire_profiles(client, tenants, &mut outcome).await;
 
-    for target in reclaimable {
+    for mut target in reclaimable {
         match delete(client, &target).await {
-            Ok(()) => outcome.deleted.push(target),
+            Ok(Removal::Gone) => outcome.deleted.push(target),
+            Ok(Removal::Terminating(blocker)) => {
+                target.liveness = Liveness::Terminating(terminating_reason(None, blocker));
+                outcome.terminating.push(target);
+            }
             Err(e) => outcome.errors.push(format!("{} {}: {e}", target.kind.noun(), target.name)),
         }
     }
@@ -244,47 +254,101 @@ async fn retire_profiles(client: &Client, tenants: Vec<String>, outcome: &mut Ou
     }
 }
 
-async fn delete(client: &Client, target: &Target) -> Result<(), kube::Error> {
-    let dp = DeleteParams::default();
-    let result = match target.kind {
-        // Namespaces advertise `delete` only, never `deletecollection`
-        Kind::TestEnv => {
-            Api::<Namespace>::all(client.clone()).delete(&target.name, &dp).await.map(|_| ())
-        }
-        // Sync = namespace (topology) + driver pod in `RUN_NAMESPACE` (cascaded by
-        // nothing). Half a reap leaves an orphaned driver holding its footprint, or a
-        // driverless namespace
-        // Namespace first: a draining driver keeps checkpointing against it
-        Kind::Sync => {
-            let ns = ignore_not_found(
-                Api::<Namespace>::all(client.clone()).delete(&target.name, &dp).await.map(|_| ()),
-            );
-            let driver = ignore_not_found(
-                Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
-                    .delete(&driver_pod_of(target), &dp)
-                    .await
-                    .map(|_| ()),
-            );
-            ns.and(driver)
-        }
-        Kind::RunPod => Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
-            .delete(&target.name, &dp)
-            .await
-            .map(|_| ()),
-        Kind::SeedBinding => vsc_api(client).delete(&target.name, &dp).await.map(|_| ()),
-        Kind::Reservation => Api::<Lease>::namespaced(client.clone(), META_NAMESPACE)
-            .delete(&target.name, &dp)
-            .await
-            .map(|_| ()),
-    };
-    ignore_not_found(result)
+/// Series + profile tenants this pass addresses. One pass over both: `purge` holds a
+/// single port-forward.
+///
+/// - Terminating included, not just deletable: both derive from the id alone (no cluster
+///   read), and a purge that failed earlier retries only while the target still lists
+/// - Tenants deduped (every pod and namespace of one run derives the same)
+fn observability_of(reclaimable: &[Target], terminating: &[Target]) -> (Vec<String>, Vec<String>) {
+    let addressed = || reclaimable.iter().chain(terminating);
+    let selectors = addressed().flat_map(Target::metric_selectors).collect();
+    let mut tenants: Vec<String> = addressed().filter_map(Target::profile_tenant).collect();
+    tenants.sort();
+    tenants.dedup();
+    (selectors, tenants)
 }
 
-/// 404 = success (janitor or a concurrent cleanup won the race)
-fn ignore_not_found(result: Result<(), kube::Error>) -> Result<(), kube::Error> {
-    match result {
-        Err(e) if crate::resource::kube::is_not_found(&e) => Ok(()),
-        other => other,
+/// Which targets this pass deletes — the whole policy, in one place.
+///
+/// - `Terminating` before the `force` check: a finalizer outranks the flag
+/// - Returns the deletable remainder, parking the rest on `outcome`
+fn triage(targets: Vec<Target>, force: bool, outcome: &mut Outcome) -> Vec<Target> {
+    let mut reclaimable = Vec::new();
+    for target in targets {
+        match &target.liveness {
+            Liveness::Terminating(_) => outcome.terminating.push(target),
+            Liveness::Live(_) if !force => outcome.skipped.push(target),
+            _ => reclaimable.push(target),
+        }
+    }
+    reclaimable
+}
+
+/// What one DELETE achieved. Both answer 200: a `Status` means the apiserver finished,
+/// the object echoed back with a `deletionTimestamp` means it only queued the work
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Removal {
+    Gone,
+    Terminating(Option<String>),
+}
+
+impl Removal {
+    /// Multi-object kinds: gone only once every part is (first blocker wins)
+    fn and(self, other: Removal) -> Removal {
+        match (self, other) {
+            (Removal::Gone, other) => other,
+            (Removal::Terminating(None), t @ Removal::Terminating(Some(_))) => t,
+            (this, _) => this,
+        }
+    }
+}
+
+async fn delete(client: &Client, target: &Target) -> Result<Removal, kube::Error> {
+    match target.kind {
+        // Namespaces advertise `delete` only, never `deletecollection`
+        Kind::TestEnv => delete_one(Api::<Namespace>::all(client.clone()), &target.name).await,
+        // Sync = namespace (topology) + driver pod in `RUN_NAMESPACE` (cascaded by
+        // nothing). Half a reap leaves an orphaned driver holding its footprint, or a
+        // driverless namespace — both are always attempted, errors combined after
+        // Namespace first: a draining driver keeps checkpointing against it
+        Kind::Sync => {
+            let ns = delete_one(Api::<Namespace>::all(client.clone()), &target.name).await;
+            let driver = delete_one(
+                Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE),
+                &driver_pod_of(target),
+            )
+            .await;
+            Ok(ns?.and(driver?))
+        }
+        Kind::RunPod => {
+            delete_one(Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE), &target.name).await
+        }
+        Kind::SeedBinding => delete_one(vsc_api(client), &target.name).await,
+        Kind::Reservation => {
+            delete_one(Api::<Lease>::namespaced(client.clone(), META_NAMESPACE), &target.name).await
+        }
+    }
+}
+
+/// 404 = [`Removal::Gone`] (janitor or a concurrent cleanup won the race)
+async fn delete_one<K>(api: Api<K>, name: &str) -> Result<Removal, kube::Error>
+where
+    K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    match api.delete(name, &DeleteParams::default()).await {
+        Ok(returned) => Ok(removal_of(returned.left())),
+        Err(e) if crate::resource::kube::is_not_found(&e) => Ok(Removal::Gone),
+        Err(e) => Err(e),
+    }
+}
+
+/// `Either::left` = the object echoed back; a `deletionTimestamp` on it is the only thing
+/// separating "deleted" from "queued behind a finalizer"
+fn removal_of<K: kube::Resource>(returned: Option<K>) -> Removal {
+    match returned.filter(|o| o.meta().deletion_timestamp.is_some()) {
+        Some(obj) => Removal::Terminating(finalizer_blocker(obj.meta())),
+        None => Removal::Gone,
     }
 }
 
@@ -298,6 +362,62 @@ fn driver_pod_of(target: &Target) -> String {
 }
 
 // ───────────────────────────── discovery ──────────────────────────────
+
+/// Already-dying object → its own class, ahead of every other liveness rule. A `LIST`
+/// still returns it and a second DELETE is answered 200, so re-reaping reports success
+/// on every pass forever
+fn terminating<K: kube::Resource>(obj: &K, blocker: Option<String>) -> Option<Liveness> {
+    let since = obj.meta().deletion_timestamp.as_ref()?.0;
+    let age = (Utc::now() - since).to_std().unwrap_or_default();
+    Some(Liveness::Terminating(terminating_reason(Some(age), blocker)))
+}
+
+/// `None` age = deletion just requested, nothing has elapsed to report.
+/// Never names a cause the caller has not established — a namespace transits `Terminating`
+/// on every delete, blocked or not, and "finalizers pending" would be a guess
+fn terminating_reason(age: Option<std::time::Duration>, blocker: Option<String>) -> String {
+    let head = match age {
+        Some(age) => format!("terminating {}", fmt_age(age)),
+        None => "delete accepted, draining".to_string(),
+    };
+    match blocker {
+        Some(why) => format!("{head} · {why}"),
+        None => head,
+    }
+}
+
+/// Whole units: an age in a listing is read, not measured
+fn fmt_age(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+/// Finalizer names, domain stripped (`snapshot.storage.k8s.io/…-bound-protection` →
+/// `…-bound-protection`) — the qualifier is noise, the name is the answer
+fn finalizer_blocker(meta: &ObjectMeta) -> Option<String> {
+    let names: Vec<&str> =
+        meta.finalizers.as_deref()?.iter().map(|f| f.rsplit('/').next().unwrap_or(f)).collect();
+    (!names.is_empty()).then(|| format!("finalizer: {}", names.join(", ")))
+}
+
+/// Namespace's blocker rides `status.conditions`, not `metadata.finalizers` (whose only
+/// entry is the legacy `spec.finalizers: [kubernetes]`, true of every namespace).
+/// `FinalizersRemaining` first — it names the holder, `ContentRemaining` only the kind
+fn ns_blocker(ns: &Namespace) -> Option<String> {
+    let conditions = ns.status.as_ref()?.conditions.as_ref()?;
+    ["NamespaceFinalizersRemaining", "NamespaceContentRemaining"].iter().find_map(|want| {
+        conditions
+            .iter()
+            .find(|c| c.status == "True" && c.type_ == *want)
+            .and_then(|c| c.message.clone())
+    })
+}
 
 /// Run-ids on an unexpired reservation = runs in flight. One list of a tiny
 /// namespace, and the basis of every liveness call below
@@ -343,7 +463,8 @@ async fn discover_test_envs(client: &Client, scope: &Scope, live_runs: &[String]
             id: Some(run_id.clone()),
             owner: label_of(&ns, qos::LABEL_USER).map(String::from),
             detail: format!("run-id {run_id}"),
-            liveness: classify_test_env(&run_id, live_runs),
+            liveness: terminating(&ns, ns_blocker(&ns))
+                .unwrap_or_else(|| classify_test_env(&run_id, live_runs)),
         });
     }
 }
@@ -407,7 +528,8 @@ async fn discover_syncs(client: &Client, scope: &Scope, plan: &mut Plan) {
                 Some(None) => format!("{sync_id} · no driver pod"),
                 None => format!("{sync_id} · phase unknown"),
             },
-            liveness: classify_sync(&sync_id, phase),
+            liveness: terminating(&ns, ns_blocker(&ns))
+                .unwrap_or_else(|| classify_sync(&sync_id, phase)),
         });
     }
 }
@@ -458,10 +580,12 @@ async fn discover_run_pods(client: &Client, scope: &Scope, live_runs: &[String],
             owner: label_of(&pod, qos::LABEL_USER).map(String::from),
             detail: format!("run-id {run_id} · {phase}"),
             // Settled pod reclaimable even under a live run (capacity already released)
-            liveness: match phase.as_str() {
-                "Succeeded" | "Failed" => Liveness::Finished,
-                _ => classify_test_env(&run_id, live_runs),
-            },
+            liveness: terminating(&pod, finalizer_blocker(pod.meta())).unwrap_or_else(
+                || match phase.as_str() {
+                    "Succeeded" | "Failed" => Liveness::Finished,
+                    _ => classify_test_env(&run_id, live_runs),
+                },
+            ),
         });
     }
 }
@@ -491,7 +615,8 @@ async fn discover_seed_bindings(
             id: Some(run_id.clone()),
             owner: label_of(&obj, qos::LABEL_USER).map(String::from),
             detail: format!("run-id {run_id}"),
-            liveness: classify_test_env(&run_id, live_runs),
+            liveness: terminating(&obj, finalizer_blocker(obj.meta()))
+                .unwrap_or_else(|| classify_test_env(&run_id, live_runs)),
         });
     }
 }
@@ -518,11 +643,13 @@ async fn discover_reservations(client: &Client, scope: &Scope, plan: &mut Plan) 
             id: Some(lease.name_any()),
             owner: label_of(&lease, qos::LABEL_USER).map(String::from),
             detail: if expired { "expired".into() } else { "renewing".into() },
-            liveness: if expired {
-                Liveness::Finished
-            } else {
-                Liveness::Live("reservation still being renewed".into())
-            },
+            liveness: terminating(&lease, finalizer_blocker(lease.meta())).unwrap_or({
+                if expired {
+                    Liveness::Finished
+                } else {
+                    Liveness::Live("reservation still being renewed".into())
+                }
+            }),
         });
     }
 }
@@ -680,6 +807,122 @@ mod tests {
         plan.restrict_to(&[]);
         assert_eq!(plan.targets.len(), 1);
         assert!(plan.errors.is_empty());
+    }
+
+    fn dying(name: &str) -> Target {
+        let mut t = target(Kind::Sync, name, "zaino-a52f");
+        t.liveness = Liveness::Terminating("terminating 4s".into());
+        t
+    }
+
+    /// The bug this class exists for: a `LIST` keeps returning a terminating object and
+    /// the apiserver answers its re-DELETE 200, so every pass re-reported it as reaped
+    #[test]
+    fn a_terminating_target_is_never_re_deleted() {
+        let mut outcome = Outcome::default();
+        let reclaimable = triage(vec![dying("ztest-sync-zaino-a52f")], false, &mut outcome);
+        assert!(reclaimable.is_empty());
+        assert_eq!(outcome.terminating.len(), 1);
+        assert!(outcome.skipped.is_empty(), "terminating is not `live`; --force is not the fix");
+    }
+
+    /// Excluding terminating targets from the purge would close the only window in which
+    /// a failed one retries: once the object finishes draining it stops listing, and its
+    /// series are orphaned for the whole retention
+    #[test]
+    fn a_terminating_sync_still_has_its_series_and_tenant_addressed() {
+        let (selectors, tenants) = observability_of(&[], &[dying("ztest-sync-zaino-a52f")]);
+        assert_eq!(selectors.len(), 3, "namespace, sync_id and driver-pod matchers");
+        assert_eq!(tenants, vec!["ztest.elicb.zaino-a52f"]);
+    }
+
+    /// One run's namespace + pod derive one tenant, whichever list they land on
+    #[test]
+    fn tenants_dedup_across_the_reclaimable_and_terminating_lists() {
+        let ns = target(Kind::TestEnv, "ztest-pkg-a-1", "elicb-4021");
+        let mut pod = target(Kind::RunPod, "ztest-runner-xyz", "elicb-4021");
+        pod.liveness = Liveness::Terminating("terminating 2s".into());
+        let (_, tenants) = observability_of(&[ns], &[pod]);
+        assert_eq!(tenants, vec!["ztest.elicb.elicb-4021"]);
+    }
+
+    /// `--force` overrides *liveness*, not a finalizer — nothing can hurry one
+    #[test]
+    fn force_does_not_reclaim_a_terminating_target() {
+        let mut outcome = Outcome::default();
+        assert!(triage(vec![dying("ztest-sync-zaino-a52f")], true, &mut outcome).is_empty());
+        assert_eq!(outcome.terminating.len(), 1);
+    }
+
+    #[test]
+    fn force_still_reclaims_a_live_target() {
+        let mut live = target(Kind::Sync, "ztest-sync-zaino-cf67", "zaino-cf67");
+        live.liveness = Liveness::Live("Running".into());
+
+        let mut skipped = Outcome::default();
+        assert!(triage(vec![live.clone()], false, &mut skipped).is_empty());
+        assert_eq!(skipped.skipped.len(), 1);
+
+        let mut forced = Outcome::default();
+        assert_eq!(triage(vec![live], true, &mut forced).len(), 1);
+        assert!(forced.skipped.is_empty());
+    }
+
+    fn pod_with(finalizers: Option<Vec<&str>>, deleted: bool) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                name: Some("p".into()),
+                finalizers: finalizers.map(|f| f.iter().map(|s| s.to_string()).collect()),
+                deletion_timestamp: deleted
+                    .then(|| k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now())),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The signal `.map(|_| ())` used to discard: the apiserver echoes the object back
+    /// with a `deletionTimestamp` when it only *queued* the delete
+    #[test]
+    fn an_echoed_object_with_a_deletion_timestamp_is_not_gone() {
+        assert_eq!(removal_of(Some(pod_with(None, false))), Removal::Gone);
+        assert_eq!(removal_of(None::<Pod>), Removal::Gone, "`Status` = apiserver finished");
+        assert_eq!(
+            removal_of(Some(pod_with(
+                Some(vec!["snapshot.storage.k8s.io/bound-protection"]),
+                true
+            ))),
+            Removal::Terminating(Some("finalizer: bound-protection".into())),
+        );
+    }
+
+    /// Sync deletes two objects; either one still draining keeps the pair un-reaped
+    #[test]
+    fn a_multi_object_kind_is_gone_only_once_every_part_is() {
+        let held = Removal::Terminating(Some("finalizer: bound-protection".into()));
+        assert_eq!(Removal::Gone.and(Removal::Gone), Removal::Gone);
+        assert_eq!(Removal::Gone.and(held.clone()), held);
+        assert_eq!(held.clone().and(Removal::Gone), held);
+        assert_eq!(Removal::Terminating(None).and(held.clone()), held);
+        // `Terminating(None)` is the Option variant, not a catch-all binding — an
+        // already-blamed removal keeps its own blocker
+        let other = Removal::Terminating(Some("finalizer: kubernetes".into()));
+        assert_eq!(held.clone().and(other), held, "first blocker wins");
+    }
+
+    #[test]
+    fn a_live_object_offers_no_terminating_state() {
+        assert!(terminating(&pod_with(None, false), None).is_none());
+        let why = terminating(&pod_with(None, true), Some("finalizer: x".into()));
+        assert!(matches!(why, Some(Liveness::Terminating(w)) if w.contains("finalizer: x")));
+    }
+
+    #[test]
+    fn an_age_reads_in_whole_units() {
+        use std::time::Duration;
+        assert_eq!(fmt_age(Duration::from_secs(47)), "47s");
+        assert_eq!(fmt_age(Duration::from_secs(125)), "2m05s");
+        assert_eq!(fmt_age(Duration::from_secs(3 * 3600 + 7 * 60)), "3h07m");
     }
 
     #[test]

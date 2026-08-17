@@ -1,7 +1,7 @@
 //! [`Bucket`] — S3-compatible store (Cloudflare R2) for chain-snapshot blobs, and the
 //! one definition of Git LFS OID → key.
 //!
-//! - Shared by [`super::lfs::Lfs`] (read a still-pointer seed → uploader pod) and
+//! - Shared by [`crate::materialize`] (presigns a seed's GET for the puller Job) and
 //!   [`crate::cli::lfs_transfer`] (read+write on `git lfs pull`/`push`); key layout &
 //!   credential contract are [`Bucket::key`]/[`Bucket::resolve`], compiler-checked
 //!   rather than a convention that drifts into every fixture 404ing
@@ -9,16 +9,15 @@
 //!   R2's 4.995 GiB single-request ceiling; IRONWOOD is 8.15 GiB. [`WriteMultipart`]
 //!   raises the ceiling to `MAX_PARTS × part size`, which [`part_size`] keeps non-binding
 
-use futures::TryStreamExt;
 // `get`/`put_multipart` moved to `ObjectStoreExt` in object_store 0.13
+use futures::TryStreamExt;
 use object_store::ObjectStoreExt;
 use object_store::WriteMultipart;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectPath;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio_util::io::StreamReader;
 
-use super::{ByteSource, StorageError};
+use super::StorageError;
 
 /// Standard AWS name → one export serves ztest, `aws s3`, and anything else
 const BUCKET_ENV: &str = "AWS_BUCKET_NAME";
@@ -75,6 +74,16 @@ pub(crate) struct Credentials {
 /// Stored bucket credentials, honoring `$XDG_CONFIG_HOME`
 pub(crate) fn credentials_path() -> std::path::PathBuf {
     crate::cluster_config::config_dir().join("bucket.toml")
+}
+
+/// Which of [`Bucket::resolve`]'s two sources is in play, for `ztest cluster check`.
+/// Mirrors that precedence — a stale `bucket.toml` under a live `AWS_*` export is the
+/// confusion this names
+pub(crate) fn credentials_source() -> String {
+    match std::env::var(BUCKET_ENV).ok().filter(|v| !v.trim().is_empty()) {
+        Some(bucket) => format!("{bucket} (AWS_* environment)"),
+        None => credentials_path().display().to_string(),
+    }
 }
 
 impl Bucket {
@@ -145,9 +154,11 @@ impl Bucket {
     ///
     /// - Prefix names the *protocol*, never the payload (`chains/` would double-store
     ///   bytes wanted as anything else, losing content-addressed dedup)
-    /// - Not the bare root → managed objects stay prefix-separable; `lfs` = rudolfs'
-    ///   default `--prefix`, so a real LFS server is config, not migration
+    /// - Not the bare root → managed objects stay prefix-separable
     /// - No sharding (git-lfs shards its *local* store for POSIX dir fanout only)
+    /// - **Not** rudolfs-compatible: it keys `[prefix/]<org>/<project>/<ab>/<cd>/<oid>`
+    ///   (namespace segment + 2-byte sha shard), so adopting an LFS server is a migration
+    ///   of every object, not a `--prefix` setting
     pub(crate) fn key(oid: &str) -> ObjectPath {
         ObjectPath::from(format!("{KEY_PREFIX}/{oid}"))
     }
@@ -183,14 +194,27 @@ impl Bucket {
             .map_err(|e| StorageError::R2(format!("presign GET {key}: {e}")))
     }
 
-    /// Stream a blob into *this* process. `ztest lfs-transfer` only (`git lfs pull`
-    /// asked for the bytes locally); seeds take [`presigned_get`](Self::presigned_get)
-    pub(crate) async fn get(&self, oid: &str) -> Result<ByteSource, StorageError> {
-        let key = Self::key(oid);
-        let result =
-            self.store.get(&key).await.map_err(|e| StorageError::R2(format!("GET {key}: {e}")))?;
-        let stream = result.into_stream().map_err(std::io::Error::other);
-        Ok(Box::pin(StreamReader::new(stream)))
+    /// One bounded, authenticated round trip: credentials sign, endpoint resolves, bucket
+    /// exists and is readable.
+    ///
+    /// - Listing one key, not `HEAD` on a known OID — no object need exist, and a 404 would
+    ///   not separate "unreachable" from "empty bucket"
+    /// - `timeout` because a wrong endpoint hangs on connect, and this sits in `cluster check`
+    pub(crate) async fn reachable(&self, timeout: std::time::Duration) -> Result<(), StorageError> {
+        use object_store::ObjectStore as _;
+        let prefix = ObjectPath::from(KEY_PREFIX);
+        let probe = async {
+            self.store
+                .list(Some(&prefix))
+                .try_next()
+                .await
+                .map(|_| ())
+                .map_err(|e| StorageError::R2(format!("list {prefix}: {e}")))
+        };
+        match tokio::time::timeout(timeout, probe).await {
+            Ok(result) => result,
+            Err(_) => Err(StorageError::R2(format!("no response within {timeout:?}"))),
+        }
     }
 
     /// Upload `src` as the blob for `oid`, real S3 multipart.

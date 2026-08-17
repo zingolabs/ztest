@@ -10,7 +10,7 @@ use crate::RpcError;
 use crate::handles::wallet::PoolBalances;
 
 use super::tree::TreeRoots;
-use super::work::Work;
+use super::work::{Op, Work};
 
 /// Live sync phase, surfaced in `watch` and readable by probes.
 ///
@@ -105,6 +105,12 @@ pub trait SyncSubject: Send + Sync {
     async fn progress(&self) -> Result<Self::Progress, RpcError>;
 
     async fn is_complete(&self) -> bool;
+
+    /// Series [`progress`](Self::progress) reads `op` from, named by the preflight
+    /// diagnostic. `None` = no named source (derived work, or an op never counted here)
+    fn work_source(&self, _op: Op) -> Option<&'static str> {
+        None
+    }
 
     /// Graceful stop (wallet: `sync_mode = Shutdown`); observers have nothing to stop
     async fn stop(&mut self) -> Result<(), RpcError> {

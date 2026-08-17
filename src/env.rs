@@ -265,7 +265,7 @@ pub struct TestEnv {
     activation_override: Option<ActivationHeights>,
     /// The one archive every restoring component names + what its manifest says it holds;
     /// resolved in [`build`](Self::build), `None` when nothing (or no chain) was restored
-    chain_pin: Option<(crate::ArchiveHandle, crate::ChainInfo)>,
+    chain_pin: Option<crate::ChainSnapshot>,
 }
 
 impl std::fmt::Debug for TestEnv {
@@ -448,54 +448,29 @@ impl TestEnv {
     /// - Validator version ≠ producer version → in-place state-DB upgrade, or open failure
     /// - Components pinned to different artifacts → parity assertions compare two histories
     /// - Public archive at/without an activation → boundary assertions pass over empty data
+    /// Resolve the one snapshot this env restores; ≤1 chain in play is what makes
+    /// [`chain`](Self::chain) — one answer for the whole env — well-defined.
+    ///
+    /// Components pinned to different artifacts would make every parity assertion compare
+    /// two histories, so that is the only thing left to reject: the network, tip and
+    /// backend now ride the snapshot, and cannot disagree with themselves.
     fn resolve_snapshot_pin(&mut self) -> Result<(), EnvError> {
-        // Chain-metadata archives only (a bare tarball pins no history, names no producer)
-        let pinned: Vec<(
-            String,
-            crate::ArchiveHandle,
-            crate::ChainInfo,
-            &str,
-            Option<crate::ArchiveNetwork>,
-        )> = self
+        let pinned: Vec<(String, crate::ChainSnapshot)> = self
             .pending_validators
             .iter()
             .map(|p| &p.opts)
             .chain(self.pending_indexers.iter().map(|p| &p.opts))
             .filter_map(|opts| match opts.restore.as_ref() {
-                Some(crate::component::RestoreSource::Archive(h)) => Some((
-                    pod_name_of(opts),
-                    *h,
-                    h.chain()?,
-                    opts.version.as_str(),
-                    opts.claimed_network,
-                )),
+                Some(crate::component::RestoreSource::Archive(s)) => Some((pod_name_of(opts), *s)),
                 _ => None,
             })
             .collect();
 
-        assert_claims_match_artifacts(&pinned)?;
-
-        for (name, handle, chain, version, _) in &pinned {
-            // An indexer's `version` is zaino's, no bearing on zebra's on-disk format
-            let is_validator =
-                self.pending_validators.iter().any(|p| &pod_name_of(&p.opts) == name);
-            if is_validator && *version != chain.version() {
-                return Err(EnvError::Config {
-                    reason: format!(
-                        "{name} runs version {version} but is pinned to snapshot {}, \
-                         produced by {}; a validator reading a state DB written by a \
-                         different release either upgrades it in place or fails to open it",
-                        handle.name(),
-                        chain.version(),
-                    ),
-                });
-            }
-        }
-
-        // Identity = OID, not path/name → two declarations of one archive agree by
-        // construction
-        if let Some(((first_name, first, ..), (other_name, other, ..))) =
-            pinned.first().zip(pinned.iter().find(|(_, h, ..)| h.oid() != pinned[0].1.oid()))
+        let Some((first_name, first)) = pinned.first() else {
+            return Ok(()); // nothing restored → no chain pin
+        };
+        if let Some((other_name, other)) =
+            pinned.iter().find(|(_, s)| s.artifact.oid != first.artifact.oid)
         {
             return Err(EnvError::Config {
                 reason: format!(
@@ -503,81 +478,32 @@ impl TestEnv {
                      {first_name} serves {} and {other_name} serves {}; they must name \
                      the same artifact or every comparison between them is measuring two \
                      different histories",
-                    first.name(),
-                    other.name(),
+                    first.artifact.name, other.artifact.name,
                 ),
             });
         }
 
-        let Some((_, handle, chain, _, _)) = pinned.first() else {
-            return Ok(()); // nothing restored → no chain pin
-        };
-
-        // Public archive = immutable, height-pinned (empty peer set → tip never moves);
-        // a regtest cache is mined onto, so none of the claims below hold for one
-        if chain.network().is_public() {
-            let reason = match chain.straddled_activation_opt() {
-                None => Some("its manifest records no activation at all".to_owned()),
-                Some(straddled) if straddled.upgrade_name().is_none() => Some(format!(
-                    "its newest activation is `{}`, which no RPC reports as an upgrade",
-                    straddled.key,
-                )),
-                Some(_) if chain.mature_height() <= chain.activation() => Some(format!(
-                    "it is pinned at {}, which leaves no mature history above its {} \
-                     activation at {}",
-                    chain.tip_height(),
-                    chain.upgrade_name(),
-                    chain.activation(),
-                )),
-                Some(_) => None,
-            };
-            if let Some(reason) = reason {
-                return Err(EnvError::Config {
-                    reason: format!(
-                        "{} cannot serve as a chain fixture: {reason}; a snapshot that \
-                         does not straddle an upgrade with room to spare holds \
-                         essentially none of the data it is named for, and every \
-                         assertion drawn from it passes while proving nothing",
-                        handle.name(),
-                    ),
-                });
-            }
-        }
-
-        self.chain_pin = Some((*handle, *chain));
+        self.chain_pin = Some(*first);
         Ok(())
     }
 
-    /// What the restored chain contains — pinned tip, straddled upgrade, activation
-    /// schedule, heights worth querying. Manifest-read at compile time, verified against
-    /// the running validator in [`build`](Self::build)
+    /// The chain this env restored: its pin, its network, and the artifact it came from.
+    ///
+    /// Written at the declaration in [`ztest::snapshots`](crate::snapshots), and checked
+    /// against the running validator during [`build`](Self::build).
     ///
     /// # Panics
     ///
-    /// No component restored an archive, or the archive carries no chain metadata
-    pub fn chain(&self) -> crate::ChainInfo {
-        match self.chain_pin {
-            Some((_, chain)) => chain,
-            None => panic!(
-                "this env names no chain archive, so it has no chain to describe; \
-                 `TestEnv::chain` answers for the artifact a component was built with \
-                 `.testnet(..)`",
-            ),
-        }
+    /// No component restored a snapshot.
+    pub fn chain(&self) -> crate::ChainSnapshot {
+        self.chain_pin.unwrap_or_else(|| {
+            panic!(
+                "this env restored no chain snapshot, so it has no chain to describe; \
+                 `TestEnv::chain` answers for the one a component was built with \
+                 `.snapshot(..)`",
+            )
+        })
     }
-
-    /// The archive [`chain`](Self::chain) describes, for diagnostics naming the artifact
-    /// a failure came from. Panics on the same conditions
-    pub fn chain_archive(&self) -> crate::ArchiveHandle {
-        match self.chain_pin {
-            Some((handle, _)) => handle,
-            None => panic!(
-                "this env names no chain archive; `TestEnv::chain_archive` names the \
-                 artifact a component was built with `.testnet(..)`",
-            ),
-        }
-    }
-
     fn materialize_configs(&mut self) -> Result<(), EnvError> {
         let activation = match &self.activation_override {
             None => ActivationHeights::regtest_default(),
@@ -825,14 +751,21 @@ impl TestEnv {
     ///   mismatch hundreds of lines into a test)
     /// - Public networks only (a regtest cache's tip is *meant* to move, and its schedule
     ///   comes from [`activation_heights`](Self::activation_heights), not a manifest)
+    /// Prove the validator serves the chain its declaration claims.
+    ///
+    /// The pinned tip is the whole check: it is written at the declaration rather than read
+    /// off the bytes, and a truncated extraction or partly-populated seed PVC opens at a
+    /// lower height. Ordered before any indexer deploys, so it fails by name in seconds
+    /// rather than as a parity mismatch hundreds of lines into a test.
+    ///
+    /// Public networks only — a regtest chain is *meant* to grow.
     async fn verify_restored_chain(&self) -> Result<(), EnvError> {
-        let Some((handle, chain)) = self.chain_pin else {
+        let Some(snapshot) = self.chain_pin else {
             return Ok(());
         };
-        if !chain.network().is_public() {
+        if !snapshot.network.is_public() {
             return Ok(());
         }
-        // Any validator: `resolve_snapshot_pin` already established they serve one artifact
         let validator = {
             let comps = self.inner.components.read().await;
             comps.values().find_map(|s| match &s.handle {
@@ -846,60 +779,21 @@ impl TestEnv {
 
         crate::sync::note_setup("validator", None, "verifying the restored chain");
         let rpc = validator.json_rpc().await?;
-        let mismatch = |reason: String| EnvError::ArchiveMismatch {
-            archive: handle.name().to_owned(),
-            reason,
-        };
-        let transport = |e: crate::RpcError| EnvError::Transient(Box::new(e));
-
-        let tip = rpc.tip_height().await.map_err(transport)?;
-        if tip != chain.tip_height() {
-            return Err(mismatch(format!(
-                "its manifest pins the tip at {}, but the validator serves {tip}",
-                chain.tip_height(),
-            )));
+        let tip = rpc.tip_height().await.map_err(|e| EnvError::Transient(Box::new(e)))?;
+        if tip != snapshot.tip_height {
+            return Err(EnvError::ArchiveMismatch {
+                archive: snapshot.artifact.name.to_owned(),
+                reason: format!(
+                    "it is declared as pinned at {}, but the validator serves {tip}",
+                    snapshot.tip_height,
+                ),
+            });
         }
-
-        for activation in chain.activations() {
-            // `before_overwinter` = the absence of an upgrade; no RPC reports it
-            let Some(name) = activation.upgrade_name() else {
-                continue;
-            };
-            let reported = rpc.activation_height(name).await.map_err(transport)?;
-            if reported != activation.height {
-                return Err(mismatch(format!(
-                    "its manifest records {name} activating at {}, but the validator \
-                     reports {reported}",
-                    activation.height,
-                )));
-            }
-        }
-
-        if let Some(check) = chain.boundary_check() {
-            // Below the activation the pool must be empty; at the pinned tip it holds the
-            // producer's recorded value
-            for (height, expected, position) in [
-                (check.from_height - 1, check.value_before, "below"),
-                (check.to_height, check.value_after, "at the tip above"),
-            ] {
-                let observed = rpc.pool_zats(height, check.pool).await.map_err(transport)?;
-                if observed != expected {
-                    return Err(mismatch(format!(
-                        "the {} pool holds {observed} zats at height {height}, {position} \
-                         the {} activation, where its producer recorded {expected}",
-                        check.pool,
-                        chain.upgrade_name(),
-                    )));
-                }
-            }
-        }
-
         tracing::debug!(
             target: "ztest::build",
-            archive = handle.name(),
+            archive = snapshot.artifact.name,
             tip,
-            activations = chain.activations().len(),
-            "restored chain verified against its manifest"
+            "restored chain verified against its declaration"
         );
         Ok(())
     }
@@ -1048,7 +942,6 @@ impl TestEnv {
         ctx: &MaterializeCtx<'_>,
         items: &[MaterializeItem],
     ) -> Result<(), EnvError> {
-        deploy_ebpf_collector(ctx).await;
         for (id, spec, opts, handle) in items {
             // One INFO per provisioned pod; both build phases funnel here, so this is the
             // single place covering every pod
@@ -1324,36 +1217,6 @@ fn short_kind(s: &str) -> String {
     if s.is_empty() { "x".into() } else { s.chars().take(20).collect() }
 }
 
-/// Per-run eBPF collector, applied before the run's pods exist — discovery is a watch, so
-/// a target created later is still picked up.
-///
-/// - Server-side apply → re-running per phase re-applies, never duplicates
-/// - Never fails the run: an absent profile costs a diagnostic (same contract as the
-///   in-process pusher)
-async fn deploy_ebpf_collector(ctx: &MaterializeCtx<'_>) {
-    if !crate::profiling::ebpf::requested() {
-        return;
-    }
-    let Some(url) = crate::profiling::push_url(ctx.client).await else {
-        tracing::warn!("eBPF profiling requested but no Pyroscope found; running unprofiled");
-        return;
-    };
-    // Sync id else run id, matching the in-process tenant exactly — `ztest cleanup` retires
-    // one tenant per sync and must reach both pushers
-    let id = crate::sync::active_sync_id().unwrap_or_else(|| ctx.coords.run_id.clone());
-    let tenant = crate::profiling::tenant(&crate::naming::current_user(), &id);
-    let collector = crate::profiling::ebpf::Collector {
-        namespace: &ctx.sentinel.namespace,
-        tenant: &tenant,
-        push_url: &url,
-        hz: crate::profiling::ebpf::hz(),
-    };
-    match crate::profiling::ebpf::deploy(ctx.client, &collector).await {
-        Ok(()) => tracing::info!(namespace = %ctx.sentinel.namespace, %tenant, "eBPF collector up"),
-        Err(e) => tracing::warn!(%e, "eBPF collector failed; running unprofiled"),
-    }
-}
-
 async fn apply_pod(
     ctx: &MaterializeCtx<'_>,
     spec: &PodSpec,
@@ -1442,40 +1305,6 @@ impl DeployBudget {
     }
 }
 
-/// Reject a component whose `.testnet(_)` / `.mainnet(_)` verb disagrees with the network
-/// its archive records.
-///
-/// - Verb is redundant by construction (the config generator reads the network off the
-///   artifact), so a disagreement means the call site names a chain nobody booted
-/// - `.mainnet(testnet::ORCHARD)` would otherwise run green against the wrong history
-fn assert_claims_match_artifacts(
-    pinned: &[(
-        String,
-        crate::ArchiveHandle,
-        crate::ChainInfo,
-        &str,
-        Option<crate::ArchiveNetwork>,
-    )],
-) -> Result<(), EnvError> {
-    for (name, handle, chain, _, claimed) in pinned {
-        if let Some(claimed) = claimed
-            && *claimed != chain.network()
-        {
-            return Err(EnvError::Config {
-                reason: format!(
-                    "{name} was built with .{}(…) but {} is a {} archive; the verb and the \
-                     artifact must name the same network, or the test runs green against a \
-                     chain it never asked for",
-                    claimed.as_str(),
-                    handle.name(),
-                    chain.network().as_str(),
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
 /// The active tier's per-pod share, in the pod spec's own units
 fn even_share(pods: usize) -> Option<crate::component::Resources> {
     qos::current_profile().share(pods).map(|s| crate::component::Resources {
@@ -1498,63 +1327,9 @@ type MaterializeItem = (u64, PodSpec, ComponentOpts, ComponentHandle);
 
 #[cfg(test)]
 mod tests {
-    use super::{DeployBudget, assert_claims_match_artifacts, spec_request};
+    use super::{DeployBudget, spec_request};
     use crate::component::{Cpu, Mem};
     use crate::qos::{GIB, Resources};
-
-    fn pin(
-        handle: crate::ArchiveHandle,
-        claimed: crate::ArchiveNetwork,
-    ) -> (String, crate::ArchiveHandle, crate::ChainInfo, &'static str, Option<crate::ArchiveNetwork>)
-    {
-        let chain = handle.chain().expect("shipped snapshot carries chain info");
-        ("zebrad".to_string(), handle, chain, "6.2.3", Some(claimed))
-    }
-
-    /// Both directions: a one-sided check leaves the other silently booting the wrong chain
-    #[test]
-    fn a_network_verb_that_contradicts_its_archive_is_rejected() {
-        use crate::ArchiveNetwork::{Mainnet, Testnet};
-        use crate::snapshots::{mainnet, testnet};
-
-        let err = assert_claims_match_artifacts(&[pin(mainnet::SAPLING, Testnet)])
-            .expect_err("mainnet archive named with .testnet must be rejected");
-        let msg = format!("{err}");
-        assert!(msg.contains(".testnet"), "{msg}");
-        assert!(msg.contains("is a mainnet archive"), "{msg}");
-
-        assert!(
-            assert_claims_match_artifacts(&[pin(testnet::ORCHARD, Mainnet)]).is_err(),
-            "testnet archive named with .mainnet must be rejected"
-        );
-    }
-
-    #[test]
-    fn a_network_verb_matching_its_archive_is_accepted() {
-        use crate::ArchiveNetwork::{Mainnet, Testnet};
-        use crate::snapshots::{mainnet, testnet};
-
-        assert_claims_match_artifacts(&[
-            pin(mainnet::BLOSSOM, Mainnet),
-            pin(testnet::BLOSSOM, Testnet),
-        ])
-        .expect("verbs agreeing with their artifacts must build");
-    }
-
-    /// `.regtest()` / `.mount(_)` record no claim → must pass untouched, never be compared
-    /// against a network they did not name
-    #[test]
-    fn an_unclaimed_restore_is_not_network_checked() {
-        let chain = crate::snapshots::mainnet::SAPLING.chain().expect("chain info");
-        assert_claims_match_artifacts(&[(
-            "zebrad".to_string(),
-            crate::snapshots::mainnet::SAPLING,
-            chain,
-            "6.2.3",
-            None,
-        )])
-        .expect("a restore with no verb claim is not checked");
-    }
 
     // ── DeployBudget: the sum of what actually deploys ──────────────────────
 

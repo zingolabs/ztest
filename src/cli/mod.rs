@@ -13,7 +13,6 @@ use clap::{Parser, Subcommand};
 pub(crate) mod cleanup;
 pub(crate) mod cluster;
 pub(crate) mod console;
-pub(crate) mod lfs_transfer;
 pub mod list_mounts;
 pub(crate) mod preview;
 pub mod replay;
@@ -80,8 +79,9 @@ pub enum Command {
     /// itself or the seed cache.
     Cleanup(cleanup::Args),
 
-    /// Manage the content-addressed seed cache (`list`, `prune`,
-    /// `warm`).
+    /// Chain snapshots: derive and publish an archive's manifest
+    /// (`manifest`, `push`), and manage the content-addressed seed cache
+    /// (`list`, `prune`, `warm`).
     Snapshot(snapshot::Args),
 
     /// Provision a cluster (`setup`, `check`) and manage the named profiles
@@ -91,7 +91,7 @@ pub enum Command {
     Cluster(cluster::Args),
 
     /// Manage detached, ztest-owned chain syncs (`list`, `describe`, `start`,
-    /// `watch`, `status`, `report`, `stop`) — the long-running sync-test
+    /// `watch`, `status`, `perf`, `stop`) — the long-running sync-test
     /// profiles that outlive the launching terminal.
     Sync(sync::Args),
 
@@ -99,13 +99,6 @@ pub enum Command {
     /// timeline. A formatting harness for the right-column tracker.
     #[command(hide = true)]
     Preview,
-
-    /// Git LFS custom transfer agent: speaks the custom-transfer JSON protocol
-    /// on stdin/stdout, moving `fixtures/chains/*` to and from the snapshot
-    /// bucket. Machine-invoked — git-lfs runs it via
-    /// `lfs.standalonetransferagent`; a human never types it.
-    #[command(name = "lfs-transfer", hide = true)]
-    LfsTransfer,
 }
 
 /// Tokio runtime flavor for [`block_on`] (k8s-only subcommands single-thread,
@@ -157,6 +150,5 @@ pub fn main() -> ExitCode {
         Command::Cluster(args) => cluster::execute(args),
         Command::Sync(args) => sync::execute(args),
         Command::Preview => preview::execute(),
-        Command::LfsTransfer => lfs_transfer::execute(),
     }
 }

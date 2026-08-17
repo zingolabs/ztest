@@ -1,237 +1,151 @@
-//! The named chain archives ztest ships.
+//! The named chain snapshots ztest ships.
 //!
-//! Each const = a curated, immutable, height-pinned snapshot of a public Zcash
-//! network, named for the pool or upgrade it exercises. Ordinary
-//! [`ArchiveHandle`](crate::ArchiveHandle)s (no separate "snapshot" concept),
-//! declared here so every consumer names one artifact rather than re-deriving a
-//! path. A test says
+//! Each const is a curated, immutable, height-pinned snapshot of a public Zcash network,
+//! named `<UPGRADE>_<NETWORK>` for the boundary it straddles. A test says
 //!
 //! ```ignore
-//! use ztest::snapshots::mainnet::BLOSSOM;
+//! use ztest::snapshots::ORCHARD_TESTNET;
 //!
-//! #[ztest::needs(BLOSSOM)]
+//! #[ztest::needs(ORCHARD_TESTNET)]
 //! #[tokio::test]
 //! async fn t() {
-//!     let zebra = env.add_validator(Validator::zebrad("6.2.3").mainnet(BLOSSOM));
-//!     let zaino = env.add_indexer(Indexer::zainod("0.4.0").mainnet(BLOSSOM));
+//!     let zebra = env.add_validator(Validator::zebrad("6.2.3").snapshot(ORCHARD_TESTNET));
 //! }
 //! ```
 //!
-//! and nothing else — network, pinned tip, producer version and activation
-//! schedule all ride the handle's [`ChainInfo`](crate::ChainInfo), read from the
-//! artifact's manifest at compile time.
+//! # Shape
 //!
-//! # Two networks, one shape
-//!
-//! - [`testnet`] and [`mainnet`] share upgrade names (same boundaries, different
-//!   chains); import one, and the call site reads unambiguously
-//! - Verb & handle must agree on the network (mismatch rejected at `env.build()`,
-//!   never rerouted)
-//! - Mainnet costs ~10× testnet at every rung (see each module's table) → prefer
-//!   testnet unless the test needs mainnet's transaction density
-//! - Every rung pinned **6,000 blocks past** its activation, for history on both
-//!   sides (pinned *at* one holds none of the data it is named for, so every
-//!   assertion passes proving nothing); each manifest's `[boundary_check]` is the
-//!   producer's evidence, carried on
-//!   [`ChainInfo::boundary_check`](crate::ChainInfo::boundary_check)
+//! - Chain facts are written here, next to the prose describing them; the manifest carries
+//!   only the four values that address the bytes
+//! - Every rung is pinned **6,000 blocks past** its activation, so assertions have history
+//!   on both sides (pinned *at* one holds none of the data it is named for)
+//! - `tip_height` is permanent — a restored validator has no peers — and is checked against
+//!   the running validator at `env.build()`, which is what makes writing it here safe
+//! - Mainnet costs ~10× testnet at every rung; prefer testnet unless the test needs
+//!   mainnet's transaction density
 //!
 //! # Adding one
 //!
-//! `scripts/produce-chain-fixture.sh <height> <version> <network>`, drop the
-//! `.tar.zst` + `.toml` into `fixtures/chains/`, `git lfs track` and `git lfs
-//! push`, add a const here. A pin disagreeing with the tree fails at `cargo build`.
+//! `scripts/produce-chain-fixture.sh <height> <version> <network>`, then
+//! `ztest snapshot manifest <archive> > snapshots/<network>/<upgrade>.toml`,
+//! `ztest snapshot push <archive>`, and a const here.
 
-/// Public-testnet snapshots.
+use crate::archive::{Backend, ChainSnapshot, Network};
+use ztest_macros::artifact;
+
+// ─────────────────────────────── testnet ───────────────────────────────
+
+/// Sapling activation (280,000) + 6,000 blocks.
 ///
-/// | Artifact | Compressed | Extracted | Boundary |
-/// | --- | --- | --- | --- |
-/// | `testnet-286000` | 620 MiB | 795 MB | Sapling (280,000) |
-/// | `testnet-590000` | 1.2 GiB | 1.5 GB | Blossom (584,000) |
-/// | `testnet-1848420` | 3.3 GiB | 4.0 GB | NU5 / Orchard (1,842,420) |
-/// | `testnet-4140000` | 8.2 GiB | 9.7 GB | NU6.3 / Ironwood (4,134,000) |
-pub mod testnet {
-    use crate::archive;
+/// - Smallest artifact by a wide margin → default unless a later pool is needed
+/// - Early testnet history = transaction-format diversity (Sprout JoinSplits, v1–v4)
+pub const SAPLING_TESTNET: ChainSnapshot = ChainSnapshot {
+    tip_height: 286_000,
+    network: Network::Testnet,
+    backend: Backend::Zebra,
+    artifact: artifact!("snapshots/testnet/sapling.toml"),
+};
 
-    archive!(
-        /// Sapling activation (280,000) + 6,000 blocks.
-        ///
-        /// - Smallest artifact by a wide margin → default unless a later pool is needed
-        /// - Early testnet history = transaction-format diversity (Sprout JoinSplits, v1–v4)
-        pub SAPLING = "fixtures/chains/zebra-v6.2.3-testnet-286000.tar.zst"
-    );
-
-    archive!(
-        /// Blossom activation (584,000) + 6,000 blocks.
-        ///
-        /// - No value pool → no `[boundary_check]` (producer's gate skips, not fails)
-        /// - Value = block timing + a denser early address graph
-        pub BLOSSOM = "fixtures/chains/zebra-v6.2.3-testnet-590000.tar.zst"
-    );
-
-    archive!(
-        /// NU5 / Orchard activation (1,842,420) + 6,000 blocks. First rung with v5
-        /// transactions and a funded Orchard pool
-        pub ORCHARD = "fixtures/chains/zebra-v6.2.3-testnet-1848420.tar.zst"
-    );
-
-    archive!(
-        /// NU6.3 / Ironwood activation (4,134,000) + 6,000 blocks.
-        ///
-        /// - Only testnet rung crossing the real Ironwood boundary
-        /// - Only one putting the finalised/non-finalised seam + commitment trees
-        ///   under genuine scale
-        pub IRONWOOD = "fixtures/chains/zebra-v6.2.3-testnet-4140000.tar.zst"
-    );
-}
-
-/// Snapshots of Mainnet.
+/// Blossom activation (584,000) + 6,000 blocks.
 ///
-/// | Artifact | Compressed | Extracted | Boundary |
-/// | --- | --- | --- | --- |
-/// | `mainnet-425200` | 11.4 GB | 18.7 GB | Sapling (419,200) |
-/// | `mainnet-659600` | 14.0 GB | 22.5 GB | Blossom (653,600) |
-/// | `mainnet-1693104` | 21.8 GB | 32.8 GB | NU5 / Orchard (1,687,104) |
+/// Introduces no value pool; its value is block timing and a denser early address graph
+pub const BLOSSOM_TESTNET: ChainSnapshot = ChainSnapshot {
+    tip_height: 590_000,
+    network: Network::Testnet,
+    backend: Backend::Zebra,
+    artifact: artifact!("snapshots/testnet/blossom.toml"),
+};
+
+/// NU5 / Orchard activation (1,842,420) + 6,000 blocks. First rung with v5 transactions
+/// and a funded Orchard pool
+pub const ORCHARD_TESTNET: ChainSnapshot = ChainSnapshot {
+    tip_height: 1_848_420,
+    network: Network::Testnet,
+    backend: Backend::Zebra,
+    artifact: artifact!("snapshots/testnet/orchard.toml"),
+};
+
+/// NU6.3 / Ironwood activation (4,134,000) + 6,000 blocks. Only rung crossing the real
+/// Ironwood boundary
+pub const IRONWOOD_TESTNET: ChainSnapshot = ChainSnapshot {
+    tip_height: 4_140_000,
+    network: Network::Testnet,
+    backend: Backend::Zebra,
+    artifact: artifact!("snapshots/testnet/ironwood.toml"),
+};
+
+// ─────────────────────────────── mainnet ───────────────────────────────
+
+/// Sapling activation (419,200) + 6,000 blocks. Smallest mainnet rung, and still larger
+/// than the deepest testnet one
+pub const SAPLING_MAINNET: ChainSnapshot = ChainSnapshot {
+    tip_height: 425_200,
+    network: Network::Mainnet,
+    backend: Backend::Zebra,
+    artifact: artifact!("snapshots/mainnet/sapling.toml"),
+};
+
+/// Blossom activation (653,600) + 6,000 blocks
+pub const BLOSSOM_MAINNET: ChainSnapshot = ChainSnapshot {
+    tip_height: 659_600,
+    network: Network::Mainnet,
+    backend: Backend::Zebra,
+    artifact: artifact!("snapshots/mainnet/blossom.toml"),
+};
+
+/// NU5 / Orchard activation (1,687,104) + 6,000 blocks.
 ///
-/// - Every rung ~10× its testnet counterpart (the *smallest* mainnet artifact
-///   exceeds the deepest testnet one)
-/// - That density is the point (zaino's indexer is sensitive to it, testnet has
-///   none) and why these are not a default: multi-GB pull + a seed volume sized
-///   from `ChainInfo::uncompressed_bytes`
-pub mod mainnet {
-    use crate::archive;
+/// Deepest registered artifact, and pinned ~11,000 blocks below the June 2022 sandblast
+/// onset (~1,704,323) — so every block it holds belongs to the pre-spam chain
+pub const ORCHARD_MAINNET: ChainSnapshot = ChainSnapshot {
+    tip_height: 1_693_104,
+    network: Network::Mainnet,
+    backend: Backend::Zebra,
+    artifact: artifact!("snapshots/mainnet/orchard.toml"),
+};
 
-    archive!(
-        /// Sapling activation (419,200) + 6,000 blocks.
-        ///
-        /// - Smallest mainnet rung, still 23× its testnet namesake
-        /// - Mainnet Sprout-era history + the pre-shielded transparent UTXO set
-        pub SAPLING = "fixtures/chains/zebra-v6.2.3-mainnet-425200.tar.zst"
-    );
-
-    archive!(
-        /// Blossom activation (653,600) + 6,000 blocks. No value pool → no
-        /// `[boundary_check]` (producer's gate skips, not fails)
-        pub BLOSSOM = "fixtures/chains/zebra-v6.2.3-mainnet-659600.tar.zst"
-    );
-
-    archive!(
-        /// NU5 / Orchard activation (1,687,104) + 6,000 blocks. First mainnet rung
-        /// with v5 transactions and a funded Orchard pool
-        pub ORCHARD = "fixtures/chains/zebra-v6.2.3-mainnet-1693104.tar.zst"
-    );
-}
+/// Every shipped snapshot. `ztest snapshot verify --remote` walks it to assert each
+/// declared manifest resolves to an object in the bucket
+pub const ALL: &[&ChainSnapshot] = &[
+    &SAPLING_TESTNET,
+    &BLOSSOM_TESTNET,
+    &ORCHARD_TESTNET,
+    &IRONWOOD_TESTNET,
+    &SAPLING_MAINNET,
+    &BLOSSOM_MAINNET,
+    &ORCHARD_MAINNET,
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ArchiveBackend, ArchiveHandle, ArchiveNetwork, ChainInfo};
 
-    fn all() -> Vec<(ArchiveHandle, ArchiveNetwork)> {
-        let mut v: Vec<_> =
-            [testnet::SAPLING, testnet::BLOSSOM, testnet::ORCHARD, testnet::IRONWOOD]
-                .into_iter()
-                .map(|h| (h, ArchiveNetwork::Testnet))
-                .collect();
-        v.extend(
-            [mainnet::SAPLING, mainnet::BLOSSOM, mainnet::ORCHARD]
-                .into_iter()
-                .map(|h| (h, ArchiveNetwork::Mainnet)),
-        );
-        v
-    }
-
-    /// Chain metadata mandatory: a manifest that lost `tip_height` degrades a
-    /// validator state dir to an opaque blob
+    /// Content-addressed, so two rungs sharing an oid would be one chain under two names
     #[test]
-    fn every_shipped_snapshot_carries_chain_info() {
-        for (h, network) in all() {
-            let chain = h.chain().unwrap_or_else(|| panic!("{} has no chain info", h.name()));
-            assert_eq!(chain.backend(), ArchiveBackend::Zebra);
-            assert_eq!(
-                chain.network(),
-                network,
-                "{} is filed under the wrong network module",
-                h.name(),
-            );
-        }
-    }
-
-    /// OID names the seed PVC + the bucket key → a shared one collides on both
-    #[test]
-    fn shipped_snapshots_have_distinct_oids() {
-        let mut oids: Vec<&str> = all().iter().map(|(h, _)| h.oid()).collect();
+    fn every_snapshot_is_a_distinct_artifact() {
+        let mut oids: Vec<&str> = ALL.iter().map(|s| s.artifact.oid).collect();
         oids.sort_unstable();
         let before = oids.len();
         oids.dedup();
-        assert_eq!(before, oids.len(), "duplicate snapshot OIDs: {oids:?}");
+        assert_eq!(oids.len(), before, "two snapshots share one artifact");
     }
 
-    /// Point of the 6,000-block offset: pinned *at* an activation proves nothing
-    /// about the pool it introduces
+    /// Manifests are generated; a hand-edit that truncates one would otherwise surface
+    /// only as a puller digest mismatch, minutes into a run
     #[test]
-    fn each_snapshot_is_pinned_past_the_upgrade_it_is_named_for() {
-        let pins = [
-            (testnet::SAPLING, "sapling"),
-            (testnet::BLOSSOM, "blossom"),
-            (testnet::ORCHARD, "nu5"),
-            (testnet::IRONWOOD, "nu6_3"),
-            (mainnet::SAPLING, "sapling"),
-            (mainnet::BLOSSOM, "blossom"),
-            (mainnet::ORCHARD, "nu5"),
-        ];
-        for (h, key) in pins {
-            let chain: ChainInfo = h.chain().expect("shipped snapshot has chain info");
-            let activation = chain
-                .activations()
-                .iter()
-                .find(|a| a.key == key)
-                .unwrap_or_else(|| panic!("{} records no `{key}` activation", h.name()))
-                .height;
+    fn every_artifact_carries_a_full_digest_and_real_sizes() {
+        for s in ALL {
+            let a = &s.artifact;
+            assert_eq!(a.oid.len(), 64, "{}: oid is not a sha256", a.name);
+            assert!(a.oid.bytes().all(|b| b.is_ascii_hexdigit()), "{}: oid not hex", a.name);
+            assert!(a.size > 0, "{}: zero compressed size", a.name);
             assert!(
-                chain.tip_height() > activation,
-                "{} is pinned at {}, not past its `{key}` activation at {activation}",
-                h.name(),
-                chain.tip_height(),
-            );
-        }
-    }
-
-    /// `TestEnv::build`'s fixture-quality gate: mature history above the straddled
-    /// activation. Caught here because it is a property of the artifact, knowable
-    /// at `cargo test` rather than on a cluster after provisioning + pull
-    #[test]
-    fn every_shipped_snapshot_has_mature_history_above_its_activation() {
-        for (h, _) in all() {
-            let chain = h.chain().expect("shipped snapshot has chain info");
-            assert!(
-                chain.mature_height() > chain.activation(),
-                "{} is pinned at {}, leaving no mature history above its {} activation at \
-                 {} (mature height {}); TestEnv::build rejects such a fixture",
-                h.name(),
-                chain.tip_height(),
-                chain.upgrade_name(),
-                chain.activation(),
-                chain.mature_height(),
-            );
-        }
-    }
-
-    /// Same boundaries → upgrade names must line up; a rung on one side only is a
-    /// gap in the ladder, not a deliberate asymmetry
-    #[test]
-    fn mainnet_rungs_mirror_their_testnet_counterparts() {
-        for (m, t) in [
-            (mainnet::SAPLING, testnet::SAPLING),
-            (mainnet::BLOSSOM, testnet::BLOSSOM),
-            (mainnet::ORCHARD, testnet::ORCHARD),
-        ] {
-            let (mc, tc) = (m.chain().expect("chain info"), t.chain().expect("chain info"));
-            assert_eq!(
-                mc.upgrade_name(),
-                tc.upgrade_name(),
-                "{} and {} straddle different upgrades",
-                m.name(),
-                t.name(),
+                a.uncompressed_bytes > a.size,
+                "{}: extracted ({}) is not larger than compressed ({}) — these are \
+                 compressed chain archives, so this is a generation bug",
+                a.name,
+                a.uncompressed_bytes,
+                a.size,
             );
         }
     }

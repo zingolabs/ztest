@@ -155,26 +155,20 @@ pub trait Regtest: Sized {
 /// ```
 ///
 /// Version + whole-env artifact agreement enforced at `env.build()` (a builder cannot fail)
-pub trait Testnet: Sized {
-    /// Run on the testnet chain `archive` pins. Fetch/state backend stays orthogonal
-    /// (`Indexer::backend`)
-    fn testnet(self, archive: crate::ArchiveHandle) -> Self;
-
-    /// Run on the mainnet chain `archive` pins.
+pub trait Restore: Sized {
+    /// Run on the chain `snapshot` pins.
     ///
-    /// - Machinery identical to [`testnet`](Self::testnet) (archive records its own network)
-    /// - Verb buys a checked statement of intent: wrong network → rejected at `env.build()`
-    /// - Mainnet artifacts ~10× testnet's, so only when the test needs mainnet's tx density
-    fn mainnet(self, archive: crate::ArchiveHandle) -> Self;
+    /// One verb, not `.testnet()`/`.mainnet()`: the snapshot carries its own network, so a
+    /// second statement of it could only ever disagree. Fetch/state backend stays orthogonal
+    /// (`Indexer::backend`). Mainnet rungs are ~10× testnet's — prefer testnet unless the
+    /// test needs mainnet's transaction density
+    fn snapshot(self, snapshot: crate::ChainSnapshot) -> Self;
 }
 
 /// Mount an archive at `destination`. Identity from the handle, baked at compile time as a
 /// [`SeedDecl`](crate::inventory::SeedDecl) → a missing artifact cannot first surface as an
 /// on-cluster materialization failure
-pub(crate) fn archive_mount(
-    archive: crate::ArchiveHandle,
-    destination: &str,
-) -> crate::mount::Mount {
+pub(crate) fn archive_mount(archive: crate::Artifact, destination: &str) -> crate::mount::Mount {
     crate::mount::Mount::archive(archive, destination)
 }
 

@@ -86,12 +86,17 @@ mod tests {
     }
 
     fn archive_restore() -> RestoreSource {
-        RestoreSource::Archive(crate::archive::ArchiveHandle::__new(
-            "zebra-v6.2.3-test.tar.zst",
-            "0".repeat(64).leak(),
-            1,
-            None,
-        ))
+        RestoreSource::Archive(crate::ChainSnapshot {
+            tip_height: 286_000,
+            network: crate::Network::Testnet,
+            backend: crate::Backend::Zebra,
+            artifact: crate::Artifact {
+                name: "zebra-v6.2.3-test.tar.zst",
+                oid: "0".repeat(64).leak(),
+                size: 1,
+                uncompressed_bytes: 2,
+            },
+        })
     }
 
     /// Regression: `runAsUser`/`fsGroup: 1000` alone leaves the seed gid out of the

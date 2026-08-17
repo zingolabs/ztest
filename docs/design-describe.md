@@ -217,14 +217,14 @@ the_pub_testnet_ironwood_boundary
 ├── qos testnet · reserve 8c / 8 GiB · hard cap 6h
 ├── image dev:zainod BUILD
 │   └── features no_tls_with_prometheus
-└── seed testnet::IRONWOOD 3545da25 8.15 GiB
+└── seed IRONWOOD_TESTNET 3545da25 8.15 GiB
     ├── archive zebra-v6.2.3-testnet-4140000.tar.zst
     └── pvc ztest-seeds/seed-3545da25-<driver> 48Gi
 
 testnet_parity::case_1_sapling
 ├── qos testnet · reserve 8c / 8 GiB · hard cap 6h
 ├── image dev:zainod (*)
-└── seed testnet::IRONWOOD (*)
+└── seed IRONWOOD_TESTNET (*)
 ```
 
 ### `--full`
@@ -234,7 +234,7 @@ Three additions: a `cache` child on each seed, a `registry` child on each image,
 and `pod` roots-children carrying the resolved topology.
 
 ```
-└── seed mainnet::BLOSSOM 1106bc19 13.05 GiB
+└── seed BLOSSOM_MAINNET 1106bc19 13.05 GiB
     ├── archive zebra-v6.2.3-mainnet-659600.tar.zst
     ├── pvc ztest-seeds/seed-1106bc19-topolvm-io 48Gi
     ├── cache ✗ MISS published on hostpath.csi.k8s.io, cluster uses topolvm.io → re-pull 13.05 GiB

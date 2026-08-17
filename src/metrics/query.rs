@@ -18,7 +18,7 @@ use crate::portforward::Forwarder;
 /// [`SCRAPE_CONFIG`](crate::resource::impls::observability)'s interval. A `step` under
 /// it invents points, which Prometheus fills by repeating the last sample — a flat
 /// stretch that never happened
-const SCRAPE_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const SCRAPE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Container cpu, cores. Cumulative seconds-per-second → a rate
 const CONTAINER_CPU: &str = "container_cpu_usage_seconds_total";

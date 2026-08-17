@@ -664,9 +664,8 @@ fn common_ancestor(dirs: &BTreeSet<PathBuf>) -> Option<PathBuf> {
 ///
 /// - `oc rsync` unusable: buildkit image ships no `rsync`, its tar fallback *walks* the
 ///   excluded `target/` trees instead of pruning
-/// - LFS payloads ship as index-blob pointers, never bytes ([`lfs_names`], [`lfs_pointer`]):
-///   tracked, so a smudged tree would hand `tar` multi-GB; ~135B pointer still yields the
-///   content address a seed PVC is named by, with no transfer and no credentials
+/// - Chain archives are gitignored, so `--exclude-standard` drops them here: the build
+///   context never sees a multi-GB payload, and a seed is addressed by its manifest
 /// - Total bounded by [`CONTEXT_MAX_BYTES`], offender-naming error (a silent multi-GB stall
 ///   reads as a hung cluster)
 fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, String> {
@@ -674,13 +673,10 @@ fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, String> {
     use std::os::unix::ffi::OsStrExt as _;
 
     // One NUL-delimited ancestor-relative list, sized as we go (ceiling below names offenders).
-    // Temp dir outlives `tar`: holds the lists + staged LFS pointers, which have no
-    // working-tree form here (those paths hold the smudged payload)
+    // Temp dir outlives `tar`: holds the file list `tar` reads
     let tmp = TempDir::new("ztest-ship")?;
-    let pointer_root = tmp.path().join("pointers");
 
     let mut list: Vec<u8> = Vec::new();
-    let mut pointers: Vec<u8> = Vec::new();
     let mut total: u64 = 0;
     let mut sized: Vec<(u64, PathBuf)> = Vec::new();
     for repo in &src.repos {
@@ -703,7 +699,6 @@ fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, String> {
             ));
         }
         let names: Vec<&[u8]> = out.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()).collect();
-        let lfs = lfs_names(repo, &names)?;
         for name in names {
             let mut rel = Vec::with_capacity(repo_rel.len() + 1 + name.len());
             if !repo_rel.is_empty() {
@@ -711,26 +706,6 @@ fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, String> {
                 rel.push(b'/');
             }
             rel.extend_from_slice(name);
-
-            // LFS-tracked → ship the index's pointer, never the working tree's payload
-            if lfs.contains(name) {
-                let Some(blob) = lfs_pointer(repo, name)? else {
-                    // LFS attribute but no index/HEAD blob = uncommitted artifact; no
-                    // pointer to substitute, and the payload must not ship
-                    continue;
-                };
-                let dest = pointer_root.join(OsStr::from_bytes(&rel));
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("stage LFS pointer dir {}: {e}", parent.display()))?;
-                }
-                std::fs::write(&dest, &blob)
-                    .map_err(|e| format!("stage LFS pointer {}: {e}", dest.display()))?;
-                total += blob.len() as u64;
-                pointers.extend_from_slice(&rel);
-                pointers.push(0);
-                continue;
-            }
 
             // `--cached` also lists locally-deleted files; skip missing paths (`tar` would
             // hard-fail mid-stream)
@@ -762,21 +737,13 @@ fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, String> {
 
     let mut tar = std::process::Command::new("tar");
     tar.arg("-C").arg(&src.ancestor).arg("--null").arg("-T").arg(&list_path);
-    // Second `-C`/`-T` pair splices the staged pointers in at their ancestor-relative
-    // paths; `tar` applies in order → extracted tree looks as if they were checked out
-    let pointer_list_path = tmp.path().join("files.1");
-    if !pointers.is_empty() {
-        std::fs::write(&pointer_list_path, &pointers)
-            .map_err(|e| format!("write LFS pointer list: {e}"))?;
-        tar.arg("-C").arg(&pointer_root).arg("--null").arg("-T").arg(&pointer_list_path);
-    }
     tar.arg("-cf").arg("-").stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = tar.spawn().map_err(|e| format!("spawn local `tar` (is `tar` on PATH?): {e}"))?;
     Ok(SourceStream { child, _tmp: tmp })
 }
 
-/// Spawned `tar` streaming the build context on stdout. Temp dir held so the file lists +
-/// staged pointers outlive [`spawn_source_tar`]
+/// Spawned `tar` streaming the build context on stdout. Temp dir held so the file list
+/// outlives [`spawn_source_tar`]
 struct SourceStream {
     child: std::process::Child,
     _tmp: TempDir,
@@ -852,101 +819,6 @@ pub(super) fn extract_source_to(src: &SourceLayout, dest: &Path) -> Result<(), S
         ));
     }
     Ok(())
-}
-
-/// Repo-relative `names` git resolves to `filter=lfs` = the payloads [`ship_source`] must
-/// keep out of the build context.
-///
-/// - Ask git (`check-attr`), not our own glob (`.gitattributes` precedence is git's to
-///   implement; new LFS tracking then needs no change here)
-/// - Writer thread: a repo's list exceeds the pipe buffer, write-then-read deadlocks
-fn lfs_names(repo: &Path, names: &[&[u8]]) -> Result<BTreeSet<Vec<u8>>, String> {
-    use std::io::Write as _;
-
-    if names.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let mut child = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["check-attr", "--stdin", "-z", "filter"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("run `git check-attr` (is `git` on PATH?): {e}"))?;
-    let mut stdin = child.stdin.take().expect("check-attr stdin is piped");
-    let mut payload: Vec<u8> = Vec::new();
-    for n in names {
-        payload.extend_from_slice(n);
-        payload.push(0);
-    }
-    let writer = std::thread::spawn(move || {
-        // Write errors aren't diagnostic; git's early exit + stderr is the real fault
-        let _ = stdin.write_all(&payload);
-        let _ = stdin.flush();
-        drop(stdin);
-    });
-    let out = child.wait_with_output().map_err(|e| format!("wait for `git check-attr`: {e}"))?;
-    let _ = writer.join();
-    if !out.status.success() {
-        return Err(format!(
-            "git check-attr in {} failed:\n{}",
-            repo.display(),
-            tail(&String::from_utf8_lossy(&out.stderr), 20)
-        ));
-    }
-    // `-z` output = flat NUL-delimited <path> <attr> <value> triples
-    let mut fields = out.stdout.split(|b| *b == 0);
-    let mut lfs = BTreeSet::new();
-    while let (Some(path), Some(_attr), Some(value)) = (fields.next(), fields.next(), fields.next())
-    {
-        if value == b"lfs" {
-            lfs.insert(path.to_vec());
-        }
-    }
-    Ok(lfs)
-}
-
-/// LFS pointer ≈135B; materially larger under an LFS attribute = the raw payload, committed
-/// by a `git add` without `git-lfs` on PATH (missing clean filter fails *open*) → named error
-const MAX_POINTER_BYTES: usize = 4096;
-
-/// `None` = no blob in index or `HEAD`.
-///
-/// - Index first (a freshly `git add`ed fixture's pointer lives there, usable pre-commit)
-/// - Working tree never read (after `git lfs pull` those paths hold the full payload)
-fn lfs_pointer(repo: &Path, name: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    for prefix in [b":".as_slice(), b"HEAD:".as_slice()] {
-        let mut spec = prefix.to_vec();
-        spec.extend_from_slice(name);
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["cat-file", "blob"])
-            .arg(OsStr::from_bytes(&spec))
-            .output()
-            .map_err(|e| format!("run `git cat-file` (is `git` on PATH?): {e}"))?;
-        if !out.status.success() {
-            continue;
-        }
-        if out.stdout.len() > MAX_POINTER_BYTES {
-            return Err(format!(
-                "{} in {} is `filter=lfs` but its committed blob is {} bytes — that is \
-                 the payload itself, not a pointer. It was almost certainly `git add`ed \
-                 on a machine without `git-lfs` on PATH, where the clean filter silently \
-                 does nothing. Install git-lfs and re-add the file.",
-                String::from_utf8_lossy(name),
-                repo.display(),
-                out.stdout.len(),
-            ));
-        }
-        return Ok(Some(out.stdout));
-    }
-    Ok(None)
 }
 
 /// Ceiling on the shipped build context (first-party source = a few MiB, so orders of
@@ -1032,67 +904,6 @@ mod tests {
             cwd: PathBuf::from("/src"),
             selected_tests: vec![],
         }
-    }
-
-    /// Throwaway repo with `fixtures/chains/`'s payload-vs-manifest `.gitattributes` split
-    /// (exercises real `git check-attr` precedence, not a stub)
-    fn chains_repo() -> TempDir {
-        let dir = TempDir::new("ztest-lfs-test").expect("temp dir");
-        let root = dir.path();
-        let run = |args: &[&str]| {
-            let st = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .output()
-                .expect("run git");
-            assert!(st.status.success(), "git {args:?} failed");
-        };
-        run(&["init", "-q"]);
-        std::fs::write(
-            root.join(".gitattributes"),
-            "fixtures/chains/*.tar.zst filter=lfs diff=lfs merge=lfs -text\n\
-             fixtures/chains/*.toml -filter -diff -merge text\n",
-        )
-        .expect("write attrs");
-        for f in [
-            "fixtures/chains/zebra-v6.2.3-testnet-286000.tar.zst",
-            "fixtures/chains/zebra-v6.2.3-testnet-286000.toml",
-            "fixtures/chains/README.md",
-            "src/lib.rs",
-        ] {
-            let p = root.join(f);
-            std::fs::create_dir_all(p.parent().expect("file has a parent")).expect("mkdir");
-            std::fs::write(p, b"x").expect("write file");
-        }
-        dir
-    }
-
-    #[test]
-    fn lfs_names_selects_payloads_and_spares_manifests() {
-        let repo = chains_repo();
-        let names: Vec<&[u8]> = vec![
-            b"fixtures/chains/zebra-v6.2.3-testnet-286000.tar.zst".as_slice(),
-            b"fixtures/chains/zebra-v6.2.3-testnet-286000.toml".as_slice(),
-            b"fixtures/chains/README.md".as_slice(),
-            b"src/lib.rs".as_slice(),
-        ];
-        let lfs = lfs_names(repo.path(), &names).expect("check-attr runs");
-        // Archive = payload; what the compile reads (above all the `archive!` manifest) survives
-        assert_eq!(
-            lfs,
-            BTreeSet::from([b"fixtures/chains/zebra-v6.2.3-testnet-286000.tar.zst".to_vec()])
-        );
-    }
-
-    #[test]
-    fn lfs_names_is_empty_without_attributes() {
-        let repo = chains_repo();
-        std::fs::remove_file(repo.path().join(".gitattributes")).expect("rm attrs");
-        let names: Vec<&[u8]> = vec![b"fixtures/chains/x.tar.zst".as_slice()];
-        assert!(lfs_names(repo.path(), &names).expect("check-attr runs").is_empty());
-        // Zero paths must not spawn a doomed `git check-attr --stdin`
-        assert!(lfs_names(repo.path(), &[]).expect("no-op").is_empty());
     }
 
     #[test]

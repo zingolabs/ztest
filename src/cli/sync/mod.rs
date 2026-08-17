@@ -84,6 +84,19 @@ enum Cmd {
         /// Attach a read-only progress tail after starting.
         #[arg(long)]
         watch: bool,
+        /// Collect eBPF CPU/off-CPU profiles for the run's components, readable with
+        /// `ztest sync perf`. Covers components sharing the driver's node.
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set,
+        )]
+        profile: bool,
+        /// Profiler sample rate, Hz.
+        #[arg(long, value_name = "HZ", default_value_t = crate::profiling::ebpf::DEFAULT_HZ)]
+        profile_hz: u32,
     },
     /// Attach to a sync's live progress (read-only; detaching never stops it).
     Watch {
@@ -164,7 +177,7 @@ async fn run(args: Args) -> Result<(), String> {
         Cmd::List { all_users, json } => list(all_users, json).await,
         Cmd::Status { id, json } => status(&id, json).await,
         Cmd::Stop { id } => stop(&id).await,
-        // Inspection, like `report`: reads artifacts, never touches the run
+        // Inspection, like `status`: reads artifacts, never touches the run
         Cmd::Perf { id, out, no_open, window, component, base, raw } => {
             perf::perf(perf::Request { id, out, open: !no_open, window, component, base, raw })
                 .await
@@ -172,7 +185,9 @@ async fn run(args: Args) -> Result<(), String> {
         // Inspection: succeeds when it managed to observe, whatever the verdict
         Cmd::Watch { id } => watch::watch(&id).await.map(drop),
         Cmd::Describe { name } => describe(&name).await,
-        Cmd::Start { name, watch } => start(&name, watch).await,
+        Cmd::Start { name, watch, profile, profile_hz } => {
+            start(&name, watch, profile.then_some(profile_hz)).await
+        }
     }
 }
 
@@ -237,7 +252,8 @@ fn preflight(name: &str) -> Result<Option<ProfileStub>, String> {
 
 // ─────────────────────────────── start ────────────────────────────────
 
-async fn start(name: &str, watch_after: bool) -> Result<(), String> {
+/// `profile_hz` = `Some(rate)` when profiling is on (the default), `None` for `--profile false`
+async fn start(name: &str, watch_after: bool, profile_hz: Option<u32>) -> Result<(), String> {
     // pre-client, pre-build (wrong name answerable from source in ms)
     let stub = preflight(name)?;
 
@@ -275,15 +291,44 @@ async fn start(name: &str, watch_after: bool) -> Result<(), String> {
     // inventory the compile dumped
     let target = resolve_target(&compiled, name)?;
 
+    // Resolved before the reserve: the collector rides the driver pod, so its slice must be
+    // in the amount admission holds. No Pyroscope = say so and run unprofiled, never launch
+    // a collector pushing into nothing
+    let collector = match profile_hz {
+        Some(hz) => {
+            let c = crate::profiling::ebpf::Collector::for_sync(&client, &sync_id, &ns, hz).await;
+            if c.is_none() {
+                eprintln!(
+                    "ztest sync: no Pyroscope on this cluster; starting unprofiled \
+                     (`ztest cluster setup` deploys it)"
+                );
+            }
+            c
+        }
+        None => None,
+    };
+
     // Reserve pre-create:
     // - Sync holds the tier for hours (unreserved = the ledger's biggest hole)
     // - CLI, not driver → admission can refuse while a terminal hears it
     // - `acquire` waits → a busy cluster queues the launch
-    let reservation = reserve_sync_capacity(&client, &sync_id, &sa, &target).await?;
+    let reservation =
+        reserve_sync_capacity(&client, &sync_id, &sa, &target, collector.is_some()).await?;
 
     // Pre-adoption: every failure path releases
     let launched = async {
-        launch_driver(&client, &sync_id, name, &ns, &sa, &compiled, &target, &image_refs).await?;
+        launch_driver(
+            &client,
+            &sync_id,
+            name,
+            &ns,
+            &sa,
+            &compiled,
+            &target,
+            &image_refs,
+            collector.as_ref(),
+        )
+        .await?;
         await_driver_running(&client, &sync_id).await
     }
     .await;
@@ -315,14 +360,20 @@ pub(super) fn sync_lease_id(sync_id: &str) -> String {
 /// - `Fixed` (footprint never changes) → peers keep the rest for the hours it runs
 /// - `admitted` covers the driver pod as well as the components
 /// - Amount = [`Target::profile`] → override held for the run, pods can grow into it
+/// - Profiling adds a sidecar to the driver, so its slice is reserved here too (a pod is
+///   charged its whole spec, and an unreserved container is invisible cluster load)
 async fn reserve_sync_capacity(
     client: &Client,
     sync_id: &str,
     sa: &str,
     target: &Target,
+    profiled: bool,
 ) -> Result<crate::qos::ledger::Reservation, String> {
     let capacity = crate::pipeline::cluster::probe_capacity(client).await?;
-    let want = target.profile.admitted();
+    let mut want = target.profile.admitted();
+    if profiled {
+        want = want.saturating_add(&crate::profiling::ebpf::resources());
+    }
     // Fail fast on a reserve no cluster state can satisfy (`acquire` would poll 10 min,
     // then misreport it as peer contention)
     if !want.fits_within(&capacity.allocatable) {
@@ -355,14 +406,48 @@ async fn launch_driver(
     compiled: &RemoteCompileOutcome,
     target: &Target,
     image_refs: &BTreeMap<String, String>,
+    collector: Option<&crate::profiling::ebpf::Collector>,
 ) -> Result<(), String> {
     ensure_sync_namespace(client, ns, sync_id).await?;
-    let pod = build_driver_pod(sync_id, profile, ns, sa, compiled, target, image_refs);
-    Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
+    // Config before the pod that mounts it (a missing ConfigMap holds the driver in
+    // `ContainerCreating`, not just the sidecar)
+    if let Some(c) = collector {
+        let cm = c.config_map();
+        Api::<ConfigMap>::namespaced(client.clone(), RUN_NAMESPACE)
+            .patch(&c.config_map, &PatchParams::apply("ztest-sync").force(), &Patch::Apply(&cm))
+            .await
+            .map_err(|e| format!("create profiler config: {e}"))?;
+    }
+    let pod = build_driver_pod(sync_id, profile, ns, sa, compiled, target, image_refs, collector);
+    let created = Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
         .create(&PostParams::default(), &pod)
         .await
-        .map(|_| ())
-        .map_err(|e| format!("create driver pod: {e}"))
+        .map_err(|e| format!("create driver pod: {e}"))?;
+    if let Some(c) = collector {
+        adopt_profiler_config(client, &created, &c.config_map).await;
+    }
+    Ok(())
+}
+
+/// Owner-reference the config to the driver pod → collected with it, so no cleanup class
+/// exists for a file that only ever serves one pod.
+///
+/// Best-effort: a lost ownerRef leaks one small ConfigMap, where failing the launch here
+/// would discard a driver that is already running
+async fn adopt_profiler_config(client: &Client, driver: &Pod, name: &str) {
+    let Some(uid) = driver.metadata.uid.as_deref() else {
+        return;
+    };
+    let owner = json!({ "metadata": { "ownerReferences": [{
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": driver.metadata.name,
+        "uid": uid,
+    }]}});
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), RUN_NAMESPACE);
+    if let Err(e) = api.patch(name, &PatchParams::default(), &Patch::Merge(&owner)).await {
+        eprintln!("ztest sync: profiler config {name} not owner-referenced ({e}); `ztest cleanup`");
+    }
 }
 
 /// Tear down a launch that never reached `Running` (else `sync list` shows a zombie
@@ -370,8 +455,16 @@ async fn launch_driver(
 async fn abandon_launch(client: &Client, sync_id: &str, ns: &str) {
     let pods: Api<Pod> = Api::namespaced(client.clone(), RUN_NAMESPACE);
     let _ = pods.delete(&driver_pod_for(sync_id), &Default::default()).await;
+    // Explicit: the config outlives a launch that died before the pod existed to own it
+    let configs: Api<ConfigMap> = Api::namespaced(client.clone(), RUN_NAMESPACE);
+    let _ = configs.delete(&profiler_config_name(sync_id), &Default::default()).await;
     let namespaces: Api<Namespace> = Api::all(client.clone());
     let _ = namespaces.delete(ns, &Default::default()).await;
+}
+
+/// One name, derived twice (collector builds it, unwind deletes it)
+pub(crate) fn profiler_config_name(sync_id: &str) -> String {
+    format!("{}-profiler", driver_pod_for(sync_id))
 }
 
 /// Wait for driver `Running` = where it takes over renewing (see `TestEnv::build`)
@@ -649,6 +742,24 @@ async fn provision_components(
         repaint,
     )
     .await;
+    // `dev_image_refs` drops failed nodes → un-checked, a failed build reaches the driver as
+    // "not in the build manifest", which names the wrong fix
+    let failed: Vec<String> = states
+        .iter()
+        .filter(|(id, _)| !id.is_optional())
+        .filter_map(|(id, state)| match state {
+            crate::resource::NodeState::Failed(why) => {
+                Some(format!("{}: {why}", id.display_label()))
+            }
+            crate::resource::NodeState::Blocked => {
+                Some(format!("{} (blocked by failed dep)", id.display_label()))
+            }
+            _ => None,
+        })
+        .collect();
+    if !failed.is_empty() {
+        return Err(format!("component provisioning failed:\n  {}", failed.join("\n  ")));
+    }
     Ok(crate::resource::dev_image_refs(images_by_binary, &states))
 }
 
@@ -771,6 +882,7 @@ async fn ensure_sync_namespace(client: &Client, ns: &str, sync_id: &str) -> Resu
 /// - Provisions into the sync's namespace via
 ///   [`TEST_NAMESPACE_ENV`](crate::naming::TEST_NAMESPACE_ENV) → needs no identity of its own
 /// - `kind=sync`-labelled, sync tier, NVMe pool, detached env, no reaper/timeout
+#[allow(clippy::too_many_arguments)]
 fn build_driver_pod(
     sync_id: &str,
     profile: &str,
@@ -779,6 +891,7 @@ fn build_driver_pod(
     compiled: &RemoteCompileOutcome,
     target: &Target,
     image_refs: &BTreeMap<String, String>,
+    collector: Option<&crate::profiling::ebpf::Collector>,
 ) -> Pod {
     // Declared profile's runner slice (already covered by `reserve_sync_capacity`)
     let (cpu, mem) = target.profile.runner.guaranteed_cpu_mem("sync driver pod");
@@ -826,6 +939,32 @@ fn build_driver_pod(
         env.push(json!({ "name": "ZTEST_PULL_SECRET", "value": secret }));
     }
 
+    let driver_container = json!({
+        "name": DRIVER_CONTAINER,
+        "image": compiled.runner_image_ref,
+        "imagePullPolicy": "IfNotPresent",
+        "command": [target.binary_path, "--exact", target.test_name, "--nocapture"],
+        "workingDir": target.cwd,
+        "env": env,
+        "resources": {
+            "requests": { "cpu": cpu, "memory": mem },
+            "limits": { "cpu": cpu, "memory": mem },
+        },
+    });
+    // Collector goes in `initContainers` as a native sidecar, never `containers`: Alloy
+    // never exits, and a regular container would hold this `restartPolicy: Never` pod at
+    // `Running` after the driver finishes — a sync that never settles
+    // `hostPID` is pod-level, so the driver container shares it while profiling (the cost
+    // of co-locating the collector rather than running a DaemonSet)
+    let (sidecars, volumes, host_pid) = match collector {
+        Some(c) => (
+            json!([serde_json::to_value(c.container()).expect("container serialises")]),
+            serde_json::to_value(c.volumes()).expect("volumes serialise"),
+            true,
+        ),
+        None => (json!([]), json!([]), false),
+    };
+
     serde_json::from_value(json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -850,18 +989,10 @@ fn build_driver_pod(
             "tolerations": [
                 { "key": crate::qos::NVME_TAINT_KEY, "operator": "Exists", "effect": "NoSchedule" },
             ],
-            "containers": [{
-                "name": DRIVER_CONTAINER,
-                "image": compiled.runner_image_ref,
-                "imagePullPolicy": "IfNotPresent",
-                "command": [target.binary_path, "--exact", target.test_name, "--nocapture"],
-                "workingDir": target.cwd,
-                "env": env,
-                "resources": {
-                    "requests": { "cpu": cpu, "memory": mem },
-                    "limits": { "cpu": cpu, "memory": mem },
-                },
-            }],
+            "hostPID": host_pid,
+            "volumes": volumes,
+            "initContainers": sidecars,
+            "containers": [driver_container],
         },
     }))
     .expect("driver pod manifest is valid")
@@ -1080,7 +1211,7 @@ fn report_headline(theme: &Theme, r: &SyncReportMirror) -> String {
     )
 }
 
-/// Detail block under the headline (`report` only): each violation, coverage gap, metric
+/// Detail block under the headline (`status` only): each violation, coverage gap, metric
 /// sample, and any fatal error
 fn print_report_details(theme: &Theme, r: &SyncReportMirror) {
     use owo_colors::OwoColorize as _;
@@ -1150,12 +1281,23 @@ async fn build_report_view(
     let rows: Vec<_> = crate::backends::metrics_components().copied().collect();
 
     match crate::metrics::query::history(client, ns, &rows, window, points).await {
+        // Empty from a run shorter than a few scrapes is arithmetic, not a broken obs
+        // stack — pointing those at `cluster setup` sends the reader to fix what works
         None => {
-            view.note = Some(format!(
-                "no metrics recorded for this run (needs `ztest cluster setup`, and \
-                 Prometheus keeps {} days)",
-                crate::resource::RETENTION_DAYS,
-            ))
+            let too_short = crate::metrics::query::SCRAPE_INTERVAL * 3;
+            view.note = Some(if view.elapsed < too_short {
+                format!(
+                    "no metrics recorded: the run lasted {:?}, under the {:?} Prometheus \
+                     needs to sample it",
+                    view.elapsed, too_short,
+                )
+            } else {
+                format!(
+                    "no metrics recorded for this run (needs `ztest cluster setup`, and \
+                     Prometheus keeps {} days)",
+                    crate::resource::RETENTION_DAYS,
+                )
+            })
         }
         Some(series) => {
             let of = |facet: Facet| -> Vec<_> {

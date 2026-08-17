@@ -16,6 +16,10 @@ use kube::api::{Api, ListParams};
 /// operator-installed service
 const NAME_LABEL: &str = "app.kubernetes.io/name";
 
+/// Bucket round trip's budget. Generous enough for a cold TLS handshake to R2, short
+/// enough that a wrong endpoint reports rather than hangs `check`
+const BUCKET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What a missing capability costs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Need {
@@ -81,10 +85,11 @@ impl Report {
 /// Probe every capability, concurrently (independent reads; a preflight costing
 /// the sum of its round trips gets skipped)
 pub async fn probe(client: &Client) -> Report {
-    let (storage, snapshots, metrics) = tokio::join!(
+    let (storage, snapshots, metrics, bucket) = tokio::join!(
         probe_storage(client),
         probe_api(client, "snapshot.storage.k8s.io/v1", "VolumeSnapshot"),
         probe_metrics(client),
+        probe_bucket(),
     );
 
     Report {
@@ -113,7 +118,35 @@ pub async fn probe(client: &Client) -> Report {
                 finding: probe_registry(),
                 remedy: "docs/ops-cluster-requirements.md#registry",
             },
+            Capability {
+                name: "snapshot bucket",
+                need: Need::Enables("chain fixtures (.mainnet/.testnet)"),
+                finding: bucket,
+                remedy: "export AWS_* or write ~/.config/ztest/bucket.toml \
+                         (fixtures/chains/README.md#environment)",
+            },
         ],
+    }
+}
+
+/// The bucket every chain fixture's bytes come from, resolved *and* reached.
+///
+/// - Not a cluster facility, like [`probe_registry`] — but a green cluster with an
+///   unreachable bucket still fails every fixture-mounting profile, from a subsystem
+///   `check` would otherwise never mention
+/// - Round trip, not just credential resolution: a stale key resolves fine and fails at
+///   the first seed, half an hour into a run
+/// - `Unknown` on a reachable-but-refused read: the credentials may be scoped to `GET`
+///   on `lfs/*`, which is enough for seeding and not enough to list
+async fn probe_bucket() -> Finding {
+    let bucket = match crate::storage::r2::Bucket::resolve() {
+        Ok(b) => b,
+        Err(why) => return Finding::Absent(why.to_string()),
+    };
+    let source = crate::storage::r2::credentials_source();
+    match bucket.reachable(BUCKET_PROBE_TIMEOUT).await {
+        Ok(()) => Finding::Present(format!("reachable · {source}")),
+        Err(why) => Finding::Unknown(format!("{source}: {why}")),
     }
 }
 
