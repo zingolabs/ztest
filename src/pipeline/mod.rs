@@ -16,7 +16,7 @@
 //!
 //! - Each phase = a `pub async fn` over an [`events::EventTx`]
 //! - `cli::run::pipeline_phase` = sole consumer, folding events into the
-//!   [`crate::ui`] banner and repainting the [`crate::cli::console`] panel
+//!   [`crate::ui`] banner and repainting the [`crate::console`] panel
 
 pub mod archives;
 pub mod build;
@@ -25,10 +25,10 @@ pub mod cluster;
 pub mod events;
 pub mod images;
 pub mod local_bake;
-pub(crate) mod profiles;
+pub mod profiles;
 pub mod remote_compile;
 
 pub use self::archives::ArchivesOutcome;
-pub use self::build::{BuildOutcome, SelectedBinary};
-pub use self::cluster::ProbeOutcome;
+pub use self::build::{BuildStage, SelectedBinary};
+pub use self::cluster::{NodeSummary, ProbeOutcome};
 pub use self::events::channel;

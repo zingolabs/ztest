@@ -3,11 +3,11 @@
 
 use std::time::Duration;
 
+use super::RunProgress;
 use crate::engine::events::RunStats;
 use crate::engine::plan::WorkItem;
 use crate::qos::Resources;
 use crate::qos::live::{LiveSnapshot, tier_tally};
-use crate::ui::RunProgress;
 
 /// `committed` = the scheduler's committed total (Σ of the running footprints)
 pub fn live_snapshot<'a>(

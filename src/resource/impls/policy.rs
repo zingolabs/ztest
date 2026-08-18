@@ -10,21 +10,20 @@ use kube::api::{Api, Patch, PatchParams};
 use serde_json::json;
 
 use crate::cluster_config::ClusterClass;
+use crate::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
 use crate::resource::kube::FIELD_MANAGER;
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 
 // ── Public constants (surface for cli / docs) ─────────────────────────
 
-pub const RUN_NAMESPACE: &str = "ztest";
 /// Identity a remote kubeconfig authenticates as
-pub const RUN_SERVICE_ACCOUNT: &str = "ztest";
 pub const RUN_CLUSTER_ROLE: &str = "ztest-remote";
 /// Non-expiring token Secret for the run SA. Read with
 /// `oc -n ztest get secret ztest-token -o jsonpath='{.data.token}' | base64 -d`
 pub const RUN_TOKEN_SECRET: &str = "ztest-token";
 
 /// SA the BuildKit build pod ([`crate::resource::impls::buildkit`]) runs as
-pub(crate) const BUILDKIT_SERVICE_ACCOUNT: &str = "ztest-buildkit";
+pub const BUILDKIT_SERVICE_ACCOUNT: &str = "ztest-buildkit";
 
 // ── Run identity permissions (single source of truth) ─────────────────
 //
@@ -197,11 +196,11 @@ fn render_run_rules(backend: ClusterClass) -> Vec<serde_json::Value> {
 
 /// Revision an applied object was rendered from (probe reconciles a stale object
 /// instead of reading a prior ztest's as Ready)
-pub(crate) const RULES_HASH_ANNOTATION: &str = "ztest.io/rules-hash";
+pub const RULES_HASH_ANNOTATION: &str = "ztest.io/rules-hash";
 
 /// Build-independent content hash of a rendered fragment, stamped as
 /// [`RULES_HASH_ANNOTATION`] (`DefaultHasher`'s fixed keys hash alike across processes)
-pub(crate) fn manifest_hash(v: &serde_json::Value) -> String {
+pub fn manifest_hash(v: &serde_json::Value) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     serde_json::to_string(v).expect("manifest serializes").hash(&mut h);
@@ -214,7 +213,7 @@ fn run_rules_hash(backend: ClusterClass) -> String {
 
 /// Cluster-scoped permission self-check via SelfSubjectAccessReview → missing
 /// grants (empty = all present). Probes `check_verb` rules only, `backend`-gated
-pub(crate) async fn check_access(
+pub async fn check_access(
     client: &kube::Client,
     backend: ClusterClass,
 ) -> Result<Vec<String>, kube::Error> {
@@ -268,8 +267,8 @@ pub(crate) async fn check_access(
 /// - RUN-only: no rbac-write, no SCC-write, no secrets read (token cannot escalate)
 /// - `backend` gates backend-specific rules in both the rendered role and its hash
 #[derive(Debug)]
-pub(crate) struct RunIdentityProvider {
-    pub(crate) backend: ClusterClass,
+pub struct RunIdentityProvider {
+    pub backend: ClusterClass,
 }
 
 #[async_trait]
@@ -386,7 +385,7 @@ impl Provider for RunIdentityProvider {
 
 /// Policy providers `ztest cluster setup` installs — run identity only, plain k8s RBAC.
 /// Callers add namespaces separately
-pub(crate) fn providers(backend: ClusterClass) -> Vec<Box<dyn Provider>> {
+pub fn providers(backend: ClusterClass) -> Vec<Box<dyn Provider>> {
     vec![Box::new(RunIdentityProvider { backend })]
 }
 

@@ -34,7 +34,6 @@ async fn zaino_indexes_to_validator_tip() {
 ```rust
 pub enum Validator { Zebrad(ZebradOpts), Zcashd(ZcashdOpts) }
 pub enum Indexer   { Zaino(ZainoOpts) }
-pub enum Wallet    { Zingo(ZingoOpts) }
 ```
 
 | Variant  | `image_repo`            | Constructor                    | Named ports                     |
@@ -42,7 +41,6 @@ pub enum Wallet    { Zingo(ZingoOpts) }
 | `Zebrad` | `zfnd/zebra`            | `Validator::zebrad(version)`   | `rpc` (28232), `metrics` (9999) |
 | `Zcashd` | `electriccoinco/zcashd` | `Validator::zcashd(version)`   | `rpc` (28232)                   |
 | `Zaino`  | `zingolabs/zaino`       | `Indexer::zaino(version)`      | `grpc` (8137), `metrics` (9998) |
-| `Zingo`  | `zingolabs/zingolib`    | `Wallet::zingo(version)`       | `grpc` (20000)                  |
 
 A published constructor pulls `<image_repo>:<version>`. Every variant chains the
 same builder methods:

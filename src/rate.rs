@@ -108,7 +108,7 @@ impl<T, S: Stamp> Window<T, S> {
     }
 
     /// Endpoints + interval, once two distinct stamps exist to measure across
-    pub(crate) fn endpoints(&self) -> Option<(&T, &T, Duration)> {
+    pub fn endpoints(&self) -> Option<(&T, &T, Duration)> {
         let ((first_at, first), (last_at, last)) = (self.ring.front()?, self.ring.back()?);
         let elapsed = last_at.since(*first_at);
         (!elapsed.is_zero()).then_some((first, last, elapsed))

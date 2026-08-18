@@ -20,8 +20,8 @@ use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, PostParams};
 use serde_json::{Value, json};
 
 use crate::EnvError;
-use crate::cluster::Sentinel;
 use crate::error::env_err;
+use crate::naming::Sentinel;
 
 pub const SEEDS_NAMESPACE: &str = "ztest-seeds";
 
@@ -30,7 +30,7 @@ pub const SEEDS_NAMESPACE: &str = "ztest-seeds";
 /// - Content half = `Retain` + owner-ref-less → a run killed mid-test strands it
 /// - `ztest snapshot prune` sweeps orphans by this prefix
 /// - Constant, not a literal: sweep/constructor drift leaves an orphan unreapable forever
-pub(crate) const BINDING_PREFIX: &str = "seed-binding-";
+pub const BINDING_PREFIX: &str = "seed-binding-";
 
 /// `(VolumeSnapshot in ztest-seeds, CSI snapshot handle)`.
 ///
@@ -98,7 +98,7 @@ pub async fn read_seed_handle(
     let restore_size = snap.data["status"]["restoreSize"]
         .as_str()
         .map(str::to_string)
-        .unwrap_or_else(crate::materialize::seed_size);
+        .unwrap_or_else(crate::cluster_config::seed_size);
 
     let handle = SeedHandle {
         sha8: sha8.to_string(),
@@ -140,7 +140,7 @@ pub async fn bind_seed(
     // suffix (`naming::namespace_for`) supplies that for free, and makes a stranded
     // content name say which test leaked it.
     // The snapshot half is itself namespaced → no namespace needed in its name
-    let storage = crate::resource::selected_storage(client)
+    let storage = crate::storage_class::selected(client)
         .await
         .map_err(|e| EnvError::Manifest { reason: e })?;
 
@@ -267,7 +267,7 @@ pub async fn delete_binding(client: &Client, binding: &SeedBinding) -> Result<()
     }
 }
 
-pub(crate) fn volume_snapshot_gvk() -> ApiResource {
+pub fn volume_snapshot_gvk() -> ApiResource {
     ApiResource::from_gvk(&GroupVersionKind {
         group: "snapshot.storage.k8s.io".into(),
         version: "v1".into(),
@@ -275,7 +275,7 @@ pub(crate) fn volume_snapshot_gvk() -> ApiResource {
     })
 }
 
-pub(crate) fn volume_snapshot_content_gvk() -> ApiResource {
+pub fn volume_snapshot_content_gvk() -> ApiResource {
     ApiResource::from_gvk(&GroupVersionKind {
         group: "snapshot.storage.k8s.io".into(),
         version: "v1".into(),

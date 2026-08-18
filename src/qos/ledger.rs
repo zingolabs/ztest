@@ -21,7 +21,7 @@ use tokio::sync::watch;
 
 use super::beacon::{ANN_RESERVE_CPU, ANN_RESERVE_MEM, Beacon, LeaseKind, Progress};
 use super::{LABEL_RUN_ID, LABEL_USER, MIB, QosClass, Resources};
-use crate::resource::impls::policy::RUN_NAMESPACE;
+use crate::naming::RUN_NAMESPACE;
 
 /// Namespace holding the reservation ledger
 pub const META_NAMESPACE: &str = "ztest-meta";
@@ -439,18 +439,18 @@ async fn require_meta_namespace(client: &Client) -> Result<(), LedgerError> {
 }
 
 /// The ledger's Lease API in [`META_NAMESPACE`].
-pub(crate) fn lease_api(client: &Client) -> Api<Lease> {
+pub fn lease_api(client: &Client) -> Api<Lease> {
     Api::namespaced(client.clone(), META_NAMESPACE)
 }
 
-pub(crate) async fn list_leases(api: &Api<Lease>) -> Result<ObjectList<Lease>, LedgerError> {
+pub async fn list_leases(api: &Api<Lease>) -> Result<ObjectList<Lease>, LedgerError> {
     api.list(&ListParams::default())
         .await
         .map_err(|e| LedgerError::Kube(format!("list leases: {e}")))
 }
 
 /// Delete leases whose TTL has lapsed (crashed runs). Best-effort per lease.
-pub(crate) async fn sweep_expired(api: &Api<Lease>) -> Result<(), LedgerError> {
+pub async fn sweep_expired(api: &Api<Lease>) -> Result<(), LedgerError> {
     let now = Utc::now();
     let live = api
         .list(&ListParams::default())
@@ -477,7 +477,7 @@ async fn sa_budget(client: &Client, sa: &str, default: Resources) -> Resources {
 }
 
 /// All pods cluster-wide, for the usage split; one list call at run start
-pub(crate) async fn all_pods(client: &Client) -> Result<ObjectList<Pod>, LedgerError> {
+pub async fn all_pods(client: &Client) -> Result<ObjectList<Pod>, LedgerError> {
     Api::<Pod>::all(client.clone())
         .list(&ListParams::default())
         .await
@@ -521,7 +521,7 @@ fn fair_reserve(
 
 /// [`fair_reserve`] over a fresh ledger + pod snapshot, so the reconcile loop that lists
 /// both never touches the ledger's internal shapes
-pub(crate) fn reserve_from_state(
+pub fn reserve_from_state(
     leases: &ObjectList<Lease>,
     pods: &ObjectList<Pod>,
     run_id: &str,
@@ -636,7 +636,7 @@ fn pod_footprint(pod: &Pod) -> Resources {
 
 /// TTL lapsed as of `now` (`renewTime + duration < now`); missing either field = live
 /// (never sweep on incomplete data)
-pub(crate) fn is_expired(lease: &Lease, now: chrono::DateTime<Utc>) -> bool {
+pub fn is_expired(lease: &Lease, now: chrono::DateTime<Utc>) -> bool {
     let Some(spec) = lease.spec.as_ref() else {
         return false;
     };

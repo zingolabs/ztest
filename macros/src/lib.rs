@@ -212,9 +212,8 @@ pub fn mount_archive(input: TokenStream) -> TokenStream {
 /// (zebra) that render config / derive a ceiling from it; it defaults to `"dev"`.
 ///
 /// Supported component variants: `Validator::Zebrad`, `Validator::Zcashd`,
-/// `Indexer::Zainod`, `Wallet::Zingo`. Any other path yields a compile
-/// error — keeps the matrix grep-able and the test-author surface
-/// small.
+/// `Indexer::Zainod`. Any other path yields a compile error — keeps the
+/// matrix grep-able and the test-author surface small.
 #[proc_macro]
 pub fn dev(input: TokenStream) -> TokenStream {
     let DevArgs { variant, source, version, features, rust_version, rust_versions } =
@@ -248,14 +247,13 @@ pub fn dev(input: TokenStream) -> TokenStream {
                 "zainod".to_string(),
                 vec!["no_tls_use_unencrypted_traffic", "allow_unencrypted_public_json_rpc_bind"],
             ),
-            ("Wallet", "Zingo") => ("zingo".to_string(), vec![]),
             (cat, var) => {
                 return syn::Error::new(
                     variant.span(),
                     format!(
                         "dev!: unsupported component variant `{cat}::{var}`; \
                      expected one of `Validator::Zebrad`, `Validator::Zcashd`, \
-                     `Indexer::Zainod`, `Wallet::Zingo`"
+                     `Indexer::Zainod`"
                     ),
                 )
                 .to_compile_error()
@@ -298,7 +296,7 @@ pub fn dev(input: TokenStream) -> TokenStream {
             let ctx_lit = ctx_abs.to_string_lossy().into_owned();
             (
                 quote! {
-                    ::ztest::inventory::DevSourceDecl::Local {
+                    ::ztest::macro_support::DevSourceDecl::Local {
                         dockerfile: #df_lit,
                         context: #ctx_lit,
                     }
@@ -318,7 +316,7 @@ pub fn dev(input: TokenStream) -> TokenStream {
             let ctx_s = context.map(|c| c.value()).unwrap_or_else(|| ".".to_string());
             (
                 quote! {
-                    ::ztest::inventory::DevSourceDecl::Git {
+                    ::ztest::macro_support::DevSourceDecl::Git {
                         url: #url_s,
                         rev: #rev_s,
                         dockerfile: #df_s,
@@ -357,7 +355,7 @@ pub fn dev(input: TokenStream) -> TokenStream {
     quote! {
         {
             ::ztest::__private::inventory::submit! {
-                ::ztest::inventory::DevImageDecl {
+                ::ztest::macro_support::DevImageDecl {
                     repo: #repo_lit,
                     source: #decl_source,
                     features: &[ #( #feat_lits ),* ],
@@ -619,11 +617,11 @@ fn seed_decl_submit_expr(
     let payload = syn::Ident::new(payload_ident, Span::call_site());
     quote! {
         ::ztest::__private::inventory::submit! {
-            ::ztest::inventory::SeedDecl {
+            ::ztest::macro_support::SeedDecl {
                 name: #name,
                 oid: #oid,
                 size: #size,
-                payload: ::ztest::inventory::SeedPayload::#payload,
+                payload: ::ztest::macro_support::SeedPayload::#payload,
             }
         }
     }
@@ -645,7 +643,7 @@ fn test_dep_submit(
 ) -> proc_macro2::TokenStream {
     quote! {
         ::ztest::__private::inventory::submit! {
-            ::ztest::inventory::TestDepDecl {
+            ::ztest::macro_support::TestDepDecl {
                 test_id: concat!(module_path!(), "::", stringify!(#fn_ident)),
                 resource: #resource,
             }
@@ -663,7 +661,7 @@ fn test_dep_submit(
 ///   1. an `inventory::submit!` of a `ztest::inventory::QosDecl` so
 ///      `ztest run` can group selected tests by tier (the out-of-process
 ///      bridge, dumped via `ZTEST_DUMP_INVENTORY`);
-///   2. a `::ztest::qos::__enter(class)` first statement so the runtime can
+///   2. a `::ztest::macro_support::__enter(class)` first statement so the runtime can
 ///      read the tier in `TestEnv::build()` (the in-process bridge).
 ///
 /// One optional argument, `footprint = "15c/29Gi"`: replaces this test's component
@@ -705,7 +703,7 @@ fn footprint_decl_tokens(f: Option<ztest_attr::Footprint>) -> proc_macro2::Token
         Some(f) => {
             let (cpu, mem) = (f.cpu_milli, f.mem_bytes);
             quote! {
-                ::core::option::Option::Some(::ztest::inventory::FootprintDecl {
+                ::core::option::Option::Some(::ztest::macro_support::FootprintDecl {
                     cpu_milli: #cpu,
                     mem_bytes: #mem,
                 })
@@ -748,7 +746,7 @@ fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream 
     // (b) in-process bridge: set the task-local tier + override as the first
     // statement, before any `.await` can migrate the test future across threads.
     let enter: syn::Stmt = syn::parse_quote! {
-        ::ztest::qos::__enter(::ztest::qos::QosClass::#variant, #footprint_res);
+        ::ztest::macro_support::__enter(::ztest::qos::QosClass::#variant, #footprint_res);
     };
     func.block.stmts.insert(0, enter);
 
@@ -757,7 +755,7 @@ fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream 
     // it satisfies `submit!`'s static initializer.
     quote! {
         ::ztest::__private::inventory::submit! {
-            ::ztest::inventory::QosDecl {
+            ::ztest::macro_support::QosDecl {
                 test_id: concat!(module_path!(), "::", stringify!(#ident)),
                 class: ::ztest::qos::QosClass::#variant,
                 footprint: #footprint_decl,
@@ -826,7 +824,7 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     quote! {
         ::ztest::__private::inventory::submit! {
-            ::ztest::inventory::SyncTestDecl {
+            ::ztest::macro_support::SyncTestDecl {
                 test_id: concat!(module_path!(), "::", stringify!(#test_ident)),
                 name: #name,
                 description: #description,
@@ -844,7 +842,7 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `#[ztest::qos::*]` attribute) so `TestEnv::build()` sizes the
             // topology at this profile's tier, whether run by the CI engine or
             // detached via `ztest sync start`.
-            ::ztest::qos::__enter(::ztest::qos::QosClass::#qos_variant, #footprint_res);
+            ::ztest::macro_support::__enter(::ztest::qos::QosClass::#qos_variant, #footprint_res);
             #body_fn
             let __outcome = __ztest_sync_body(::ztest::sync::SyncRunner::new()).await;
             assert!(
@@ -997,7 +995,7 @@ fn bake_archive(source_abs: &std::path::Path, span: Span) -> Result<BakedArchive
     Ok(BakedArchive { name, oid, size })
 }
 
-/// `artifact!("snapshots/testnet/orchard.toml")` — bake a manifest into an
+/// `artifact!("snapshots/testnet/zebra-6.2.3-orchard.toml")` — bake a manifest into an
 /// [`Artifact`](ztest::Artifact) expression.
 ///
 /// Reads the manifest at expansion time, so a checkout holding none of the

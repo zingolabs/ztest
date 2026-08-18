@@ -16,7 +16,7 @@ use crate::inventory::{
 use crate::pipeline::build::SelectedBinary;
 
 #[derive(Debug, Default)]
-pub(crate) struct Dumped {
+pub struct Dumped {
     dev: Vec<DevImageEntry>,
     qos: Vec<QosEntry>,
     seeds: Vec<SeedEntry>,
@@ -26,7 +26,7 @@ pub(crate) struct Dumped {
 
 /// Pure — transport (local subprocess vs builder-pod `exec`, see
 /// [`crate::pipeline::remote_compile`]) is the caller's concern
-pub(crate) fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
+pub fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
     let mut dumped = Dumped::default();
     for line in stdout.lines() {
         if line.is_empty() {
@@ -88,7 +88,7 @@ pub async fn discover(binaries: &[SelectedBinary]) -> (DumpOutcome, Vec<(String,
 
 /// `binaries` and `dumps` index-aligned. Shared by the local ([`discover`]) and on-cluster
 /// ([`crate::pipeline::remote_compile`]) paths → dedup lives in one place
-pub(crate) fn assemble(
+pub fn assemble(
     binaries: &[SelectedBinary],
     dumps: Vec<Dumped>,
 ) -> (DumpOutcome, Vec<(String, Vec<QosEntry>)>) {

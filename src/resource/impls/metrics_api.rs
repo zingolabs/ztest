@@ -310,7 +310,7 @@ fn api_service() -> APIService {
 /// Resource-metrics API as one node. Optional: absence costs `kubectl top`/k9s columns,
 /// blocks no test
 #[derive(Debug)]
-pub(crate) struct MetricsApiProvider;
+pub struct MetricsApiProvider;
 
 #[async_trait]
 impl Provider for MetricsApiProvider {

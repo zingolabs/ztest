@@ -15,6 +15,17 @@ use crate::qos::{ClusterCapacity, Resources, units};
 
 use super::events::{Event, EventTx};
 
+/// `capacity` − `allocatable` is the cordoned nodes' share, so both are carried and the
+/// gap explains itself
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct NodeSummary {
+    pub k8s_version: String,
+    pub ready: u32,
+    pub control_plane: u32,
+    pub workers: u32,
+    pub cordoned: Vec<String>,
+}
+
 /// Outcome of one Phase-A1 run, shaped like [`super::BuildOutcome`] → one `match
 /// outcome` per phase, no `Result<Option<_>, _>` juggling. `Missing` (no readable
 /// kubeconfig) is a soft fail
@@ -111,7 +122,7 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
 
 const CONTROL_PLANE_LABEL: &str = "node-role.kubernetes.io/control-plane";
 
-pub(crate) fn node_ready(node: &Node) -> bool {
+pub fn node_ready(node: &Node) -> bool {
     node.status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
@@ -142,7 +153,7 @@ fn node_allocatable(node: &Node) -> Resources {
 
 /// Total allocatable across schedulable (Ready, uncordoned) nodes. Generic over the
 /// item source so the one-shot probe and the reflector-backed watcher share one fold
-pub(crate) fn cluster_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Resources {
+pub fn cluster_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Resources {
     nodes
         .into_iter()
         .filter(|n| node_ready(n) && !node_cordoned(n))
@@ -152,17 +163,17 @@ pub(crate) fn cluster_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>)
 /// Every node's allocatable, cordoned and not-ready included. Above
 /// [`cluster_allocatable`] by exactly what is currently out of service, so `ztest status`
 /// can show the gap instead of leaving a shrunken denominator unexplained
-pub(crate) fn total_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Resources {
+pub fn total_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Resources {
     nodes.into_iter().fold(Resources::ZERO, |acc, n| acc.saturating_add(&node_allocatable(n)))
 }
 
 /// Node roster for `ztest status`. Beside the capacity folds because it answers from the
 /// same list and shares [`node_ready`]/[`node_cordoned`] — a second classification of
 /// "which nodes count" is how a denominator drifts from the roster explaining it
-pub(crate) fn node_summary(nodes: &[Node]) -> crate::ui::NodeSummary {
+pub fn node_summary(nodes: &[Node]) -> NodeSummary {
     let is_control_plane =
         |n: &Node| n.metadata.labels.as_ref().is_some_and(|l| l.contains_key(CONTROL_PLANE_LABEL));
-    crate::ui::NodeSummary {
+    NodeSummary {
         k8s_version: nodes
             .first()
             .and_then(|n| n.status.as_ref()?.node_info.as_ref())
@@ -181,7 +192,7 @@ pub(crate) fn node_summary(nodes: &[Node]) -> crate::ui::NodeSummary {
 
 /// Sole source of a [`ClusterCapacity`] — probe banner, scheduler ceiling and ledger
 /// all admit against this one reading
-pub(crate) async fn probe_capacity(client: &Client) -> Result<ClusterCapacity, String> {
+pub async fn probe_capacity(client: &Client) -> Result<ClusterCapacity, String> {
     let lp = ListParams::default();
     let (nodes_api, pods_api, pvcs_api): (Api<Node>, Api<Pod>, Api<PersistentVolumeClaim>) =
         (Api::all(client.clone()), Api::all(client.clone()), Api::all(client.clone()));
@@ -192,7 +203,7 @@ pub(crate) async fn probe_capacity(client: &Client) -> Result<ClusterCapacity, S
 }
 
 /// Shared by the one-shot probe and [`super::capacity_watch`] → identical banner figure
-pub(crate) fn capacity_from<'a>(
+pub fn capacity_from<'a>(
     nodes: impl IntoIterator<Item = &'a Node>,
     pods: impl IntoIterator<Item = &'a Pod>,
     pvcs: impl IntoIterator<Item = &'a PersistentVolumeClaim>,

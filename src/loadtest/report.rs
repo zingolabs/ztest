@@ -56,7 +56,7 @@ pub struct LatencyStats {
 
 impl LatencyStats {
     /// Samples must be microseconds
-    pub(crate) fn from_hist(h: &Histogram<u64>) -> Self {
+    pub fn from_hist(h: &Histogram<u64>) -> Self {
         let us = |q: f64| Duration::from_micros(h.value_at_quantile(q));
         Self {
             p50: us(0.50),
@@ -93,9 +93,9 @@ pub struct ParityRecord {
 }
 
 impl ParityRecord {
-    pub(crate) const DIFFERS: &'static str = "blocks differ";
-    pub(crate) const MISSING_FROM_B: &'static str = "present in A, missing from B";
-    pub(crate) const MISSING_FROM_A: &'static str = "missing from A, present in B";
+    pub const DIFFERS: &'static str = "blocks differ";
+    pub const MISSING_FROM_B: &'static str = "present in A, missing from B";
+    pub const MISSING_FROM_A: &'static str = "missing from A, present in B";
 }
 
 impl std::fmt::Display for ParityRecord {

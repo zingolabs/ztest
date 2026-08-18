@@ -12,16 +12,14 @@ use crate::inventory::{DevImageEntry, QosEntry, SeedEntry, SyncTestEntry, TestDe
 use crate::pipeline::build::SelectedBinary;
 use crate::qos::{QosClass, Resources};
 
-pub(crate) mod render;
-
 #[derive(Debug, Clone)]
-pub(crate) struct Plan {
+pub struct Plan {
     pub roots: Vec<PlanRoot>,
     pub pruned: Vec<PrunedSeed>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlanRoot {
+pub struct PlanRoot {
     pub label: String,
     pub description: String,
     pub qos: QosNode,
@@ -32,7 +30,7 @@ pub(crate) struct PlanRoot {
 
 /// `hard_cap` from the tier table; `declared` only where `#[sync_test(timeout)]` set one
 #[derive(Debug, Clone)]
-pub(crate) struct QosNode {
+pub struct QosNode {
     pub class: QosClass,
     pub admitted: Resources,
     pub declared_timeout: Option<String>,
@@ -40,7 +38,7 @@ pub(crate) struct QosNode {
 
 /// Seed declared by the compiled selection, needed by none of its selected tests
 #[derive(Debug, Clone)]
-pub(crate) struct PrunedSeed {
+pub struct PrunedSeed {
     pub seed: SeedEntry,
     pub declared_by: Vec<String>,
 }
@@ -51,7 +49,7 @@ pub(crate) struct PrunedSeed {
 /// - Match is NOT equality: `TestDepEntry::test_id` = `module_path!()::fn`, selection = libtest
 /// - `rstest` emits one entry per case (`parent::case_1_x`), `#[needs]` submits only `parent`
 ///   → prefix walk, else a seed every case needs gets pruned (same trap `declared_tier` fixed)
-pub(crate) fn needed_seeds(
+pub fn needed_seeds(
     binaries: &[SelectedBinary],
     deps_by_binary: &[(String, Vec<TestDepEntry>)],
     seeds: &[SeedEntry],
@@ -91,7 +89,7 @@ fn selects(selected: &BTreeSet<&str>, declarant: &str) -> bool {
 }
 
 /// One root per sync profile (`sync describe`); images ride the binary edge, not the test edge
-pub(crate) fn for_sync(
+pub fn for_sync(
     binaries: &[SelectedBinary],
     entry: &SyncTestEntry,
     images_by_binary: &[(String, Vec<DevImageEntry>)],
@@ -135,7 +133,7 @@ pub(crate) fn for_sync(
 }
 
 /// One root per selected test (`run describe`); a shared image/seed expands once, then `(*)`
-pub(crate) fn for_run(
+pub fn for_run(
     binaries: &[SelectedBinary],
     images_by_binary: &[(String, Vec<DevImageEntry>)],
     deps_by_binary: &[(String, Vec<TestDepEntry>)],

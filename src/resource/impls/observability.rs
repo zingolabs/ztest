@@ -32,16 +32,8 @@ use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 /// Container-port name every Service and probe targets
 const HTTP_PORT: &str = "http";
 
-/// Namespace for the whole stack: fixed, cluster-lifetime, owned by `ztest cluster setup`.
-/// Never per-run (the record must outlive the run that produced it)
-pub const OBS_NAMESPACE: &str = "ztest-obs";
-
-pub const PROMETHEUS_SERVICE: &str = "ztest-prometheus";
-pub const PROMETHEUS_PORT: u16 = 9090;
-pub const PYROSCOPE_SERVICE: &str = "ztest-pyroscope";
-pub const PYROSCOPE_PORT: u16 = 4040;
-pub const GRAFANA_SERVICE: &str = "ztest-grafana";
-pub const GRAFANA_PORT: u16 = 3000;
+pub use crate::naming::{GRAFANA_SERVICE, OBS_NAMESPACE, PROMETHEUS_SERVICE, PYROSCOPE_SERVICE};
+pub use crate::ports::{GRAFANA_PORT, PROMETHEUS_PORT, PYROSCOPE_PORT};
 
 /// The three Deployments, in [`ObservabilityProvider`]'s wait order
 const DEPLOYMENTS: [&str; 3] = [PROMETHEUS_SERVICE, PYROSCOPE_SERVICE, GRAFANA_SERVICE];
@@ -706,7 +698,7 @@ async fn apply_stack(cx: &Cx) -> Result<(), String> {
     seed_overrides(&config_maps).await?;
 
     // One resolution for both: a split here is how a stack ends up half on a test driver
-    let class = super::storage::plain_class(client, OBS_CLASS_ENV).await;
+    let class = crate::storage_class::plain_class(client, OBS_CLASS_ENV).await;
     let class = class.as_deref();
     apply(&claims, &pvc(&format!("{PROMETHEUS_SERVICE}-data"), &prometheus_size(), class), WHAT)
         .await?;
@@ -718,11 +710,11 @@ async fn apply_stack(cx: &Cx) -> Result<(), String> {
     apply(&deployments, &grafana_deployment(), WHAT).await?;
 
     apply(&services, &service(PROMETHEUS_SERVICE, "prometheus", PROMETHEUS_PORT), WHAT).await?;
-    // Nested kubelet ⇒ the collector is off-cluster (see `profiling::ebpf::Placement`), so it
-    // needs a node-reachable push target provisioned here rather than promoted mid-run
-    let pyroscope_type = match crate::profiling::ebpf::placement_for(client).await {
-        crate::profiling::ebpf::Placement::Host => Some("NodePort"),
-        crate::profiling::ebpf::Placement::Sidecar => None,
+    // Nested kubelet ⇒ the collector runs off-cluster, so it needs a node-reachable push
+    // target provisioned here rather than promoted mid-run
+    let pyroscope_type = match crate::cluster_config::kubelet_is_nested(client).await {
+        true => Some("NodePort"),
+        false => None,
     };
     apply(
         &services,
@@ -760,7 +752,7 @@ fn pyroscope_size() -> String {
 /// Prometheus + Pyroscope + Grafana as one node: one capability to the reader, one
 /// namespace/storage class/install step, and they fail together
 #[derive(Debug)]
-pub(crate) struct ObservabilityProvider;
+pub struct ObservabilityProvider;
 
 #[async_trait]
 impl Provider for ObservabilityProvider {
@@ -1109,7 +1101,7 @@ mod tests {
         // default `v1-v2-dual` routes deletion via the v1 compactor = a different limit
         assert_eq!(config.architecture_storage, "v2");
         // upstream reads 0 as never-delete, not delete-now
-        assert!(PROFILE_RETENTION_HOURS > 0, "a zero retention disables deletion outright");
+        const _: () = assert!(PROFILE_RETENTION_HOURS > 0);
         assert_eq!(config.limits.retention_period, format!("{PROFILE_RETENTION_HOURS}h"));
 
         // runtime-config path must be the mount, else the retirements are never read

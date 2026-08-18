@@ -79,6 +79,7 @@ fn env() -> EngineEnv {
         capture: true,
         color: false,
         ztest_log: None,
+        image_refs: std::collections::BTreeMap::new(),
     }
 }
 

@@ -107,7 +107,7 @@ impl std::fmt::Debug for SyncCtx {
 }
 
 impl SyncCtx {
-    pub(crate) fn new(indexer: Option<Arc<dyn IndexerBackend>>) -> Self {
+    pub fn new(indexer: Option<Arc<dyn IndexerBackend>>) -> Self {
         Self { indexer }
     }
     /// `None` in a walletless/observer setup (no topology bound one)
@@ -125,13 +125,22 @@ type AsyncCheck = Box<
 
 /// Probe body: pure predicate = sync fn, oracle-backed = async closure. No single
 /// blanket-impl `check()` (two blanket `impl`s over `F` break coherence) → `check`/`check_rpc`
-pub(crate) enum Check {
+pub enum Check {
     Sync(Box<dyn Fn(&Snapshot) -> Verdict + Send + Sync>),
     Async(AsyncCheck),
 }
 
+impl std::fmt::Debug for Check {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Check::Sync(_) => "Check::Sync(..)",
+            Check::Async(_) => "Check::Async(..)",
+        })
+    }
+}
+
 impl Check {
-    pub(crate) async fn evaluate(&self, snap: &Snapshot, cx: &SyncCtx) -> Verdict {
+    pub async fn evaluate(&self, snap: &Snapshot, cx: &SyncCtx) -> Verdict {
         match self {
             Check::Sync(f) => f(snap),
             Check::Async(f) => f(snap, cx).await,
@@ -144,27 +153,28 @@ impl Check {
 ///
 /// - `after` = fault that must fire before an `eventually` window arms
 /// - `hold_for` = debounce, quantized to the cadence as a consecutive-violation count
-pub(crate) struct ProbeSpec {
-    pub(crate) name: String,
-    pub(crate) class: Class,
-    pub(crate) severity: Severity,
-    pub(crate) cadence: Cadence,
-    pub(crate) after: Option<String>,
-    pub(crate) hold_for: Option<Duration>,
-    pub(crate) check: Check,
+#[derive(Debug)]
+pub struct ProbeSpec {
+    pub name: String,
+    pub class: Class,
+    pub severity: Severity,
+    pub cadence: Cadence,
+    pub after: Option<String>,
+    pub hold_for: Option<Duration>,
+    pub check: Check,
     // ── rolling scheduler state ──
-    pub(crate) last_fired_seq: Option<u64>,
-    pub(crate) last_fired_height: u32,
-    pub(crate) next_due: Option<tokio::time::Instant>,
-    pub(crate) violation_streak: u32,
-    pub(crate) last_satisfied: Option<tokio::time::Instant>,
-    pub(crate) ever_satisfied: bool,
+    pub last_fired_seq: Option<u64>,
+    pub last_fired_height: u32,
+    pub next_due: Option<tokio::time::Instant>,
+    pub violation_streak: u32,
+    pub last_satisfied: Option<tokio::time::Instant>,
+    pub ever_satisfied: bool,
 }
 
 impl ProbeSpec {
     /// Due to evaluate at `(height, now)`? `always`/`eventually` honor the cadence;
     /// `sometimes`/`at_completion` evaluate at end → never due here
-    pub(crate) fn due(&self, height: u32, now: tokio::time::Instant) -> bool {
+    pub fn due(&self, height: u32, now: tokio::time::Instant) -> bool {
         match self.class {
             Class::Sometimes | Class::AtCompletion => false,
             Class::Always | Class::Eventually => match self.cadence {
@@ -178,7 +188,7 @@ impl ProbeSpec {
         }
     }
 
-    pub(crate) fn mark_fired(&mut self, seq: u64, height: u32, now: tokio::time::Instant) {
+    pub fn mark_fired(&mut self, seq: u64, height: u32, now: tokio::time::Instant) {
         self.last_fired_seq = Some(seq);
         self.last_fired_height = height;
         if let Cadence::Every(d) = self.cadence {
@@ -188,7 +198,7 @@ impl ProbeSpec {
 
     /// Debounce threshold in consecutive violations (≥1); a bare threshold flaps on noisy
     /// sync signals
-    pub(crate) fn violation_threshold(&self) -> u32 {
+    pub fn violation_threshold(&self) -> u32 {
         match (self.hold_for, self.cadence) {
             (Some(hold), Cadence::Every(d)) if !d.is_zero() => {
                 (hold.as_secs_f64() / d.as_secs_f64()).ceil() as u32
@@ -201,7 +211,7 @@ impl ProbeSpec {
     ///
     /// `eventually` stores only *when* last satisfied → state read off that age: ≤tick = Ok,
     /// >window = stall already fired, between = draining its allowance
-    pub(crate) fn status(&self, now: tokio::time::Instant, tick: Duration) -> ProbeStatus {
+    pub fn status(&self, now: tokio::time::Instant, tick: Duration) -> ProbeStatus {
         let window = match self.cadence {
             Cadence::Window(d) if d != Duration::MAX => Some(d),
             _ => None,
@@ -249,13 +259,13 @@ impl ProbeSpec {
 /// `check`/`check_rpc` finalize and register
 #[must_use = "a probe builder does nothing until `.check(...)` is called"]
 pub struct ProbeBuilder<'r> {
-    pub(crate) sink: &'r mut Vec<ProbeSpec>,
-    pub(crate) class: Class,
-    pub(crate) severity: Severity,
-    pub(crate) cadence: Cadence,
-    pub(crate) after: Option<String>,
-    pub(crate) name: Option<String>,
-    pub(crate) hold_for: Option<Duration>,
+    pub sink: &'r mut Vec<ProbeSpec>,
+    pub class: Class,
+    pub severity: Severity,
+    pub cadence: Cadence,
+    pub after: Option<String>,
+    pub name: Option<String>,
+    pub hold_for: Option<Duration>,
 }
 
 impl std::fmt::Debug for ProbeBuilder<'_> {

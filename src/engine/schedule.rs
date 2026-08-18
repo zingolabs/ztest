@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use super::RunProgress;
 use crate::cancel::Cancel;
 use crate::engine::events::{
     CancelReason, RunReporter, RunStats, RunningView, SkipReason, TestEvent, Verdict,
@@ -24,7 +25,6 @@ use crate::qos::beacon::{Progress, RunningTest};
 use crate::qos::live::LiveSnapshot;
 use crate::qos::scheduler::{Admission, RejectReason, Request, Scheduler, SlotId};
 use crate::resource::{NodeId, NodeState};
-use crate::ui::RunProgress;
 use tokio::sync::watch;
 
 /// - `cancel` → stop admitting, drop in-flight futures (`kill_on_drop` reaps the children)
@@ -420,7 +420,7 @@ fn progress_of(
                     .unwrap_or_default(),
         })
         .collect();
-    running.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    running.sort_by_key(|r| std::cmp::Reverse(r.started_at));
     let total = stats.total as u32;
     Progress {
         total,

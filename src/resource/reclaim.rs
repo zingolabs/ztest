@@ -23,9 +23,9 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, DeleteParams, DynamicObject, ListParams, ResourceExt};
 use kube::{Client, Resource};
 
+use crate::naming::RUN_NAMESPACE;
 use crate::qos;
 use crate::qos::ledger::{META_NAMESPACE, is_expired};
-use crate::resource::impls::policy::RUN_NAMESPACE;
 use crate::sync::{KIND_LABEL_KEY, KIND_LABEL_VALUE, SYNC_ID_KEY, SyncStatus};
 
 /// Whose artifacts a pass considers. `AllUsers` needs cluster-wide list/delete
@@ -121,7 +121,7 @@ impl Target {
         ]
     }
 
-    /// Report ConfigMap this target left in [`OBS_NAMESPACE`](crate::resource::OBS_NAMESPACE).
+    /// Report ConfigMap this target left in [`OBS_NAMESPACE`](crate::naming::OBS_NAMESPACE).
     /// Reclaimed with the series it accompanies, never with the sync's own namespace (which
     /// is why a verdict survives an ordinary teardown)
     fn report_cm(&self) -> Option<String> {
@@ -146,8 +146,18 @@ impl Target {
         let (Some(id), Some(owner)) = (self.id.as_deref(), self.owner.as_deref()) else {
             return None;
         };
-        Some(crate::profiling::tenant(owner, id))
+        Some(crate::naming::profile_tenant(owner, id))
     }
+}
+
+/// Profile-store seam: reclaim decides *which* tenants retire, the store decides *how*.
+///
+/// - Store lives above the resource graph (needs `resource`'s own namespace/service names)
+/// - Passed in rather than reached for → no resource → profiling edge
+#[async_trait::async_trait]
+pub trait ProfileStore: Send + Sync {
+    async fn is_deployed(&self, client: &Client) -> bool;
+    async fn schedule_purge(&self, client: &Client, tenants: &[String]) -> Result<(), String>;
 }
 
 /// Discovery result + listing failures (an RBAC-denied `--all-users` list must be
@@ -213,7 +223,13 @@ pub async fn discover(client: &Client, scope: &Scope) -> Plan {
 /// - [`Kind`] order: capacity consumers before the reservation [`Lease`] (releasing
 ///   first lets a concurrent run admit against capacity the dying pods still hold)
 /// - Idempotent, 404 = success (janitor or concurrent cleanup won the race)
-pub async fn reclaim(client: &Client, plan: Plan, force: bool, dry_run: bool) -> Outcome {
+pub async fn reclaim(
+    client: &Client,
+    plan: Plan,
+    force: bool,
+    dry_run: bool,
+    profiles: &dyn ProfileStore,
+) -> Outcome {
     let mut outcome = Outcome { errors: plan.errors, ..Default::default() };
 
     let reclaimable = triage(plan.targets, force, &mut outcome);
@@ -229,7 +245,7 @@ pub async fn reclaim(client: &Client, plan: Plan, force: bool, dry_run: bool) ->
     // Metrics first: a failed purge leaves the target listed and the pass retryable,
     // and the k8s delete is the irreversible half
     purge_metrics(client, record.selectors, &mut outcome).await;
-    retire_profiles(client, record.tenants, &mut outcome).await;
+    retire_profiles(client, record.tenants, profiles, &mut outcome).await;
     delete_reports(client, record.reports, &mut outcome).await;
 
     for mut target in reclaimable {
@@ -259,11 +275,16 @@ async fn purge_metrics(client: &Client, selectors: Vec<String>, outcome: &mut Ou
 
 /// Scheduled, not done: Pyroscope deletes on its own cleaner pass, so a caller must
 /// not report these as gone
-async fn retire_profiles(client: &Client, tenants: Vec<String>, outcome: &mut Outcome) {
-    if tenants.is_empty() || !crate::profiling::is_deployed(client).await {
+async fn retire_profiles(
+    client: &Client,
+    tenants: Vec<String>,
+    profiles: &dyn ProfileStore,
+    outcome: &mut Outcome,
+) {
+    if tenants.is_empty() || !profiles.is_deployed(client).await {
         return;
     }
-    match crate::profiling::schedule_purge(client, &tenants).await {
+    match profiles.schedule_purge(client, &tenants).await {
         Ok(()) => outcome.retired = tenants,
         Err(e) => outcome.errors.push(format!("retire profiles: {e}")),
     }
@@ -378,7 +399,7 @@ where
 {
     match api.delete(name, &DeleteParams::default()).await {
         Ok(returned) => Ok(removal_of(returned.left())),
-        Err(e) if crate::resource::kube::is_not_found(&e) => Ok(Removal::Gone),
+        Err(e) if crate::cluster::is_not_found(&e) => Ok(Removal::Gone),
         Err(e) => Err(e),
     }
 }
@@ -692,7 +713,7 @@ async fn discover_seed_bindings(
     let list = match vsc_api(client).list(&ListParams::default().labels(&selector)).await {
         Ok(l) => l,
         // No snapshot CRD = nothing of this class
-        Err(e) if crate::resource::kube::is_not_found(&e) => return,
+        Err(e) if crate::cluster::is_not_found(&e) => return,
         Err(e) => return plan.errors.push(format!("list seed bindings: {e}")),
     };
     for obj in list.items {
@@ -718,7 +739,7 @@ async fn discover_reservations(client: &Client, scope: &Scope, plan: &mut Plan) 
     let api: Api<Lease> = Api::namespaced(client.clone(), META_NAMESPACE);
     let list = match api.list(&ListParams::default().labels(&selector)).await {
         Ok(l) => l,
-        Err(e) if crate::resource::kube::is_not_found(&e) => return,
+        Err(e) if crate::cluster::is_not_found(&e) => return,
         Err(e) => return plan.errors.push(format!("list reservations: {e}")),
     };
     let now = Utc::now();
@@ -866,7 +887,7 @@ mod tests {
     fn a_sync_target_addresses_its_report_in_the_observability_namespace() {
         let sync = target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f");
         assert_eq!(sync.report_cm().as_deref(), Some("ztest-sync-report-zaino-a52f"));
-        assert_eq!(crate::sync::report_cm_namespace(), crate::resource::OBS_NAMESPACE);
+        assert_eq!(crate::sync::report_cm_namespace(), crate::naming::OBS_NAMESPACE);
         assert_ne!(crate::sync::report_cm_namespace(), sync.name);
 
         let record = observability_of(&[sync], &[]);

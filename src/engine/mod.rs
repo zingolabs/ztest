@@ -17,22 +17,48 @@ pub mod schedule;
 #[cfg(test)]
 mod e2e;
 
+/// During-run progress, tallied by the run loop (`console`) from relayed
+/// per-test result lines. `total` = preflight test count, `0` = unknown
+#[derive(Debug, Clone, Default)]
+pub struct RunProgress {
+    pub elapsed: std::time::Duration,
+    pub passed: u32,
+    pub failed: u32,
+    pub total: u32,
+}
+
+impl RunProgress {
+    pub fn done(&self) -> u32 {
+        self.passed + self.failed
+    }
+}
+
 use std::process::ExitCode;
 use std::time::Duration;
 
 use nextest_metadata::{NextestExitCode, TestListSummary};
 
 use crate::cancel::Cancel;
-use crate::cli::console::{Console, SceneFrame};
 use crate::engine::local_runner::EngineEnv;
 use crate::engine::reporter::StyledReporter;
 use crate::engine::schedule::{LoopConfig, PanelFrame, run_loop};
 use crate::inventory::QosEntry;
+use crate::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
 use crate::pipeline::SelectedBinary;
 use crate::qos::Resources;
 use crate::qos::schedule::QosPlan;
-use crate::resource::impls::policy::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
-use crate::ui::{Theme, render_live_panel};
+
+/// Live-terminal seam: engine ships state, the presentation layer paints it.
+///
+/// - Engine holds no `Console`/`Theme` (→ no core → ui edge)
+/// - `None` = non-TTY path (verdicts straight to stdout)
+pub trait RunView: Send + Sync {
+    fn cancel(&self) -> Cancel;
+    fn live_rows(&self) -> usize;
+    fn flush_live(&self);
+    fn scrollback(&self, text: String);
+    fn tick(&self, frame: &PanelFrame, plan: &QosPlan, live: String);
+}
 
 /// Run-behavior options, parsed from `ztest run` flags
 #[derive(Debug, Clone)]
@@ -72,11 +98,10 @@ pub struct EngineInput<'a> {
 ///
 /// - [`Console`] (TTY) → scenes through the render thread (verdicts scroll, QoS panel pinned)
 /// - None (CI / piped) → plain lines to stdout
-pub(crate) fn run(
+pub fn run(
     work_rt: &tokio::runtime::Runtime,
     input: EngineInput<'_>,
-    console: Option<&Console>,
-    theme: &Theme,
+    view: Option<&dyn RunView>,
     qos_plan: Option<QosPlan>,
 ) -> ExitCode {
     let mut items = plan::build_work_list(
@@ -97,8 +122,8 @@ pub(crate) fn run(
             "Rerunning {} test(s); {skipped} passed previously and were skipped\n",
             items.len()
         );
-        match console {
-            Some(c) => c.scrollback(note),
+        match view {
+            Some(v) => v.scrollback(note),
             None => print!("{note}"),
         }
     }
@@ -111,6 +136,7 @@ pub(crate) fn run(
         capture: input.opts.output.captures(),
         color: supports_color::on(supports_color::Stream::Stdout).is_some(),
         ztest_log: std::env::var("ZTEST_LOG").ok().filter(|v| !v.trim().is_empty()),
+        image_refs: input.image_refs.clone(),
     };
     let executor = match select_executor(work_rt, &input, env) {
         Ok(e) => e,
@@ -128,7 +154,7 @@ pub(crate) fn run(
         run_id: input.opts.run_id.clone(),
         // Fired by the render thread on Ctrl-C; off a TTY there is none, so the process
         // dies on the default SIGINT disposition
-        cancel: console.map(Console::cancel).unwrap_or_else(Cancel::never),
+        cancel: view.map(RunView::cancel).unwrap_or_else(Cancel::never),
         resources: input.resource_states,
         // `--no-capture` serializes (nextest's `test_threads = 1` coupling) → no interleaving
         max_inflight: input.opts.output.is_serial().then_some(1),
@@ -144,12 +170,12 @@ pub(crate) fn run(
     // the subscriber falls back to stderr and desyncs the pinned footer with `ztest::pod` events.
     let log_path =
         std::env::temp_dir().join("ztest-logs").join(format!("{}.log", input.opts.run_id));
-    match console {
-        Some(c) if output.captures() => {
+    match view {
+        Some(v) if output.captures() => {
             crate::observ::init(crate::observ::Sink::File(log_path.clone()));
             // Through the console, never `eprintln!` (a direct stderr write corrupts the
             // very panel this File sink exists to protect)
-            c.scrollback(format!(
+            v.scrollback(format!(
                 "ztest: diagnostics → {} (filter via ZTEST_LOG)\n",
                 log_path.display()
             ));
@@ -167,9 +193,9 @@ pub(crate) fn run(
 
     // `--no-capture` streams live + serially; the pinned TTY panel cannot coexist → even on a
     // terminal it takes the plain inherited path
-    let stats = match console {
-        Some(c) if output.captures() => {
-            run_tty(work_rt, items, ceiling, cfg, executor, c, theme, qos_plan, output, recorder)
+    let stats = match view {
+        Some(v) if output.captures() => {
+            run_tty(work_rt, items, ceiling, cfg, executor, v, qos_plan, output, recorder)
         }
         _ => run_inherited(work_rt, items, ceiling, cfg, executor, output, recorder),
     };
@@ -183,7 +209,7 @@ pub(crate) fn run(
     };
 
     // Never a success: incomplete even if nothing had failed when cancel landed
-    let cancelled = console.map(|c| c.cancel().is_cancelled()).unwrap_or(false);
+    let cancelled = view.map(|v| v.cancel().is_cancelled()).unwrap_or(false);
 
     if stats.any_failed() || cancelled {
         ExitCode::from(NextestExitCode::TEST_RUN_FAILED as u8)
@@ -204,8 +230,7 @@ fn run_tty(
     ceiling: Resources,
     cfg: LoopConfig,
     executor: std::sync::Arc<dyn local_runner::Executor>,
-    console: &Console,
-    theme: &Theme,
+    view: &dyn RunView,
     qos_plan: Option<QosPlan>,
     output: crate::engine::output::OutputConfig,
     recorder: Option<record::RunRecorder>,
@@ -215,36 +240,26 @@ fn run_tty(
         StyledReporter::new(color, supports_unicode::on(supports_unicode::Stream::Stdout), output);
     let mut reporter = wrap_reporter(styled, recorder);
     let plan = qos_plan.unwrap_or_else(empty_plan);
-    let live_rows = console.live_rows() as usize;
+    let live_rows = view.live_rows();
 
     // Commit the preflight/image grid before the live region switches from the child PTY to
     // engine-rendered lines
-    console.flush_live();
+    view.flush_live();
 
     let stats = drive(items, ceiling, cfg, executor, rt, reporter.as_mut(), |rep, frame| {
         let bytes = rep.take_scrollback();
         if !bytes.is_empty() {
-            console.scrollback(String::from_utf8_lossy(&bytes).into_owned());
+            view.scrollback(String::from_utf8_lossy(&bytes).into_owned());
         }
-        // Snapshotted into an immutable scene the render thread re-paints (spinner animated)
-        // until the next tick
-        let left = render_live_panel(&frame.snapshot, &plan, &frame.free, &frame.progress, theme);
         // `avt` grid idle during the run → drive the live region explicitly via the scene
         let live = reporter::render_running(&frame.running, live_rows, color).join("\n");
-        // Provisioning = pre-run barrier → right column blank (width-driven split holds, no
-        // reflow here)
-        console.scene(move |_elapsed| SceneFrame {
-            left: left.clone(),
-            mid: None,
-            right: String::new(),
-            live: Some(live.clone()),
-        });
+        view.tick(frame, &plan, live);
     });
 
     // Leftover scroll-lines, incl. the final summary (emitted after the last tick)
     let leftover = reporter.take_scrollback();
     if !leftover.is_empty() {
-        console.scrollback(String::from_utf8_lossy(&leftover).into_owned());
+        view.scrollback(String::from_utf8_lossy(&leftover).into_owned());
     }
     Ok(stats)
 }

@@ -8,10 +8,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-use crate::handles::types::BlockHash;
 use crate::proto;
 use crate::proto::compact_tx_streamer_client::CompactTxStreamerClient;
 use crate::proto::{CompactBlock, CompactTx};
+use crate::protocol::types::BlockHash;
 use zcash_protocol::ShieldedPool as ShieldedProtocol;
 use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
@@ -19,13 +19,14 @@ use zcash_protocol::value::ZatBalance;
 
 use crate::component::ComponentBuilder;
 use crate::handles::HandleInner;
-use crate::handles::client::JsonRpcClient;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
 use crate::handles::validator::{BlockchainInfo, PeerInfo};
 use crate::metrics::{AT_REST, Exporter, Exposition, Facet, LIVE, Reduce, Row, Unit, row};
+use crate::protocol::Endpoint;
+use crate::protocol::client::JsonRpcClient;
 use crate::protocol::zcash_rpc::ZcashRpc;
 use crate::sync::{Cost, Observation, Observe, Op, Phase, ProgressView, SyncSubject, Work};
-use crate::{Endpoint, EnvError, RpcError};
+use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zainod";
 
@@ -33,9 +34,9 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A [`Dev`](crate::backends::image::ImageSpec::Dev) override never degrades to the
+/// A [`Dev`](crate::inventory::ImageSpec::Dev) override never degrades to the
 /// published tag (unbuilt → `DevImageMissing`)
-pub(crate) fn image_uri(
+pub fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
     let default_image = format!("zingodevops/zainod:{}", opts.version);
@@ -122,7 +123,7 @@ impl IndexerConfig for ZainoBackend {
                 let validator_grpc = opts
                     .shared_state
                     .as_ref()
-                    .map(|_| format!("{validator_host}:{}", crate::handles::ports::ZEBRAD_INDEXER));
+                    .map(|_| format!("{validator_host}:{}", crate::ports::ZEBRAD_INDEXER));
                 let zebra_db_path = opts
                     .shared_state
                     .as_ref()
@@ -138,7 +139,7 @@ impl IndexerConfig for ZainoBackend {
                     zebra_db_path,
                     ZAINO_DB,
                     validator_grpc.as_deref(),
-                    opts.image.metrics_enabled().then_some(crate::handles::ports::ZAINO_METRICS),
+                    opts.image.metrics_enabled().then_some(crate::ports::ZAINO_METRICS),
                 )
             }
             IndexerMode::Public => {
@@ -188,7 +189,7 @@ impl IndexerConfig for ZainoBackend {
                 // `ReadStateService` and rejects its config without a syncer gRPC address;
                 // Fetch opens no DB → gets none
                 let validator_grpc =
-                    state.then(|| format!("{host}:{}", crate::handles::ports::ZEBRAD_INDEXER));
+                    state.then(|| format!("{host}:{}", crate::ports::ZEBRAD_INDEXER));
                 crate::public_conf::public_zainod_conf(
                     network,
                     version,
@@ -200,7 +201,7 @@ impl IndexerConfig for ZainoBackend {
                     ZAINO_ZEBRA_DB,
                     ZAINO_DB,
                     validator_grpc.as_deref(),
-                    opts.image.metrics_enabled().then_some(crate::handles::ports::ZAINO_METRICS),
+                    opts.image.metrics_enabled().then_some(crate::ports::ZAINO_METRICS),
                 )
             }
         };
@@ -236,13 +237,13 @@ impl IndexerBackend for ZainoIndexer {
             image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
             ports: crate::manifest::merge_ports(
                 &[
-                    ("grpc", crate::handles::ports::ZAINO_GRPC),
-                    ("jsonrpc", crate::handles::ports::ZAINO_JSONRPC),
-                    ("metrics", crate::handles::ports::ZAINO_METRICS),
+                    ("grpc", crate::ports::ZAINO_GRPC),
+                    ("jsonrpc", crate::ports::ZAINO_JSONRPC),
+                    ("metrics", crate::ports::ZAINO_METRICS),
                 ],
                 &opts.extra_ports,
             ),
-            ready_port: crate::handles::ports::ZAINO_GRPC,
+            ready_port: crate::ports::ZAINO_GRPC,
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources,
@@ -651,49 +652,49 @@ impl IndexerBackend for ZainoIndexer {
 /// the Prometheus charset). Named once → [`ROWS`] and the [`SyncSubject`] impl can't drift
 mod family {
     // Serving surface. Latency histogram's `_count` = request volume (no `requests_total`)
-    pub(super) const GRPC_ERRORS: &str = "zaino_grpc_errors_total";
-    pub(super) const GRPC_LATENCY: &str = "zaino_grpc_request_duration_seconds";
+    pub const GRPC_ERRORS: &str = "zaino_grpc_errors_total";
+    pub const GRPC_LATENCY: &str = "zaino_grpc_request_duration_seconds";
     /// Retries forced by a full validator work queue (only upstream signal
     /// `block_fetch_seconds` misses, and the directly actionable one)
-    pub(super) const RPC_RETRIES: &str = "zaino_rpc_outbound_retries_total";
+    pub const RPC_RETRIES: &str = "zaino_rpc_outbound_retries_total";
     /// Reorg depth; `_count` = reorg event total (no separate counter)
-    pub(super) const REORG_DEPTH: &str = "zaino_sync_reorg_depth";
+    pub const REORG_DEPTH: &str = "zaino_sync_reorg_depth";
 
     /// Height the finalised index is **committed** to — written & fsynced, set per batch
-    pub(super) const FINALIZED_HEIGHT: &str = "zaino_sync_finalized_height";
+    pub const FINALIZED_HEIGHT: &str = "zaino_sync_finalized_height";
     /// Height built in memory ahead of the next commit (advances per block)
-    pub(super) const FETCHED_HEIGHT: &str = "zaino_sync_fetched_height";
+    pub const FETCHED_HEIGHT: &str = "zaino_sync_fetched_height";
     /// Write path's goal = tip - the non-finalised reorg buffer. Completion measured
     /// against this, never the raw tip (the finalised index trails by design)
-    pub(super) const TARGET_HEIGHT: &str = "zaino_sync_target_height";
-    pub(super) const CHAIN_TIP: &str = "zaino_chain_tip_height";
+    pub const TARGET_HEIGHT: &str = "zaino_sync_target_height";
+    pub const CHAIN_TIP: &str = "zaino_chain_tip_height";
 
     // Throughput per op class. Cumulative on the wire; ztest surfaces difference first.
     // Each carries a `stage` label (finalised / non-finalised) — `counter_total` sums it away,
     // so a steady-state reading counts a block twice (zaino ingests it at the tip, then again
     // when the finalised writer reaches it)
-    pub(super) const TRANSACTIONS: &str = "zaino_sync_transactions_total";
-    pub(super) const TRANSPARENT_INPUTS: &str = "zaino_sync_transparent_inputs_total";
-    pub(super) const TRANSPARENT_OUTPUTS: &str = "zaino_sync_transparent_outputs_total";
-    pub(super) const SAPLING_SPENDS: &str = "zaino_sync_sapling_spends_total";
-    pub(super) const SAPLING_OUTPUTS: &str = "zaino_sync_sapling_outputs_total";
-    pub(super) const ORCHARD_ACTIONS: &str = "zaino_sync_orchard_actions_total";
-    pub(super) const IRONWOOD_ACTIONS: &str = "zaino_sync_ironwood_actions_total";
+    pub const TRANSACTIONS: &str = "zaino_sync_transactions_total";
+    pub const TRANSPARENT_INPUTS: &str = "zaino_sync_transparent_inputs_total";
+    pub const TRANSPARENT_OUTPUTS: &str = "zaino_sync_transparent_outputs_total";
+    pub const SAPLING_SPENDS: &str = "zaino_sync_sapling_spends_total";
+    pub const SAPLING_OUTPUTS: &str = "zaino_sync_sapling_outputs_total";
+    pub const ORCHARD_ACTIONS: &str = "zaino_sync_orchard_actions_total";
+    pub const IRONWOOD_ACTIONS: &str = "zaino_sync_ironwood_actions_total";
 
     /// Wall-clock per block, end to end (both source reads + assembly)
-    pub(super) const BLOCK_BUILD: &str = "zaino_sync_block_build_seconds";
+    pub const BLOCK_BUILD: &str = "zaino_sync_block_build_seconds";
     /// One source read: request → deserialized block in zaino's ram. Not an upstream wait
     /// under `direct` (rocksdb read + zebra deserialize, both on zaino's own cpu)
-    pub(super) const BLOCK_FETCH: &str = "zaino_sync_block_fetch_seconds";
+    pub const BLOCK_FETCH: &str = "zaino_sync_block_fetch_seconds";
     /// Second source read per block (commitment tree roots); split off `BLOCK_FETCH` so a
     /// slow treestate can't hide behind the block read
-    pub(super) const TREESTATE_FETCH: &str = "zaino_sync_treestate_fetch_seconds";
+    pub const TREESTATE_FETCH: &str = "zaino_sync_treestate_fetch_seconds";
     /// Per committed batch, incl. fsync
-    pub(super) const BATCH_WRITE: &str = "zaino_sync_batch_write_seconds";
+    pub const BATCH_WRITE: &str = "zaino_sync_batch_write_seconds";
 
     /// LMDB environment size; against host RAM = where the write path's B-tree
     /// behaviour changes character
-    pub(super) const DB_USED_BYTES: &str = "zaino_db_used_bytes";
+    pub const DB_USED_BYTES: &str = "zaino_db_used_bytes";
 }
 
 /// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns
@@ -812,7 +813,7 @@ const EXPORTER_SCRAPE_TIMEOUT: Duration = Duration::from_secs(1);
 #[async_trait]
 impl Exporter for ZainoIndexer {
     async fn endpoint(&self) -> Result<Endpoint, EnvError> {
-        self.endpoint_for(crate::handles::ports::ZAINO_METRICS).await
+        self.endpoint_for(crate::ports::ZAINO_METRICS).await
     }
 
     fn rows(&self) -> &'static [Row] {
@@ -1051,12 +1052,12 @@ fn apply_pod_layout(
 
 /// Must match the generator's `[grpc_settings] listen_address` and the `grpc` named port
 /// in `manifest.rs`
-const ZAINO_REGTEST_GRPC_PORT: u16 = crate::handles::ports::ZAINO_GRPC;
+const ZAINO_REGTEST_GRPC_PORT: u16 = crate::ports::ZAINO_GRPC;
 
-const ZAINO_REGTEST_JSONRPC_PORT: u16 = crate::handles::ports::ZAINO_JSONRPC;
+const ZAINO_REGTEST_JSONRPC_PORT: u16 = crate::ports::ZAINO_JSONRPC;
 
 /// Regtest validator's port, not zaino's — what the rendered config dials
-const ZAINO_REGTEST_VALIDATOR_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_RPC;
+const ZAINO_REGTEST_VALIDATOR_RPC_PORT: u16 = crate::ports::ZEBRAD_RPC;
 
 /// In-pod mount path of the rendered `zainod.toml`; every pod's `--config`
 const ZAINO_CONFIG: &str = "/etc/zaino/zainod.toml";
@@ -1100,10 +1101,10 @@ fn zaino_semver(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::regtest_conf::Semver, EnvError> {
     match opts.image {
-        crate::backends::image::ImageSpec::Dev { .. } => {
+        crate::inventory::ImageSpec::Dev { .. } => {
             Ok(crate::regtest_conf::Semver { major: u16::MAX, minor: 0, patch: 0 })
         }
-        crate::backends::image::ImageSpec::Published => {
+        crate::inventory::ImageSpec::Published => {
             opts.version.parse::<crate::regtest_conf::Semver>().map_err(|_| EnvError::Config {
                 reason: format!("zaino version {:?} is not valid semver", opts.version),
             })
@@ -1113,16 +1114,16 @@ fn zaino_semver(
 
 /// Must match the generator's `[grpc_settings] listen_address` and the named port in
 /// `manifest.rs`
-const ZAINO_PUBLIC_GRPC_PORT: u16 = crate::handles::ports::ZAINO_GRPC;
+const ZAINO_PUBLIC_GRPC_PORT: u16 = crate::ports::ZAINO_GRPC;
 
-const ZAINO_PUBLIC_JSONRPC_PORT: u16 = crate::handles::ports::ZAINO_JSONRPC;
+const ZAINO_PUBLIC_JSONRPC_PORT: u16 = crate::ports::ZAINO_JSONRPC;
 
 /// In-cluster DNS name of the paired zebrad pod, matching the default
 /// `Validator::zebrad(…).testnet(archive)` assigns — override both sides if `.named(…)`
 const ZAINO_PUBLIC_VALIDATOR_HOST: &str = "zebrad";
 
 /// Public-network validator's port, not zaino's
-const ZAINO_PUBLIC_VALIDATOR_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_PUBLIC_RPC;
+const ZAINO_PUBLIC_VALIDATOR_RPC_PORT: u16 = crate::ports::ZEBRAD_PUBLIC_RPC;
 
 // ──────────────────────────── Zaino-only RPCs ─────────────────────────
 //
@@ -1148,13 +1149,13 @@ impl ZainoIndexer {
 
     /// Answered by the validator via zaino's JSON-RPC proxy, not zaino's index
     pub async fn blockchain_info(&self) -> Result<BlockchainInfo, RpcError> {
-        let client = crate::handles::client::json_rpc(&self.plumbing.endpoint("jsonrpc").await?);
+        let client = crate::protocol::client::json_rpc(&self.plumbing.endpoint("jsonrpc").await?);
         ZcashRpc::new(COMPONENT, &client).blockchain_info().await
     }
 
     /// Answered by the validator via zaino's JSON-RPC proxy
     pub async fn peer_info(&self) -> Result<PeerInfo, RpcError> {
-        let client = crate::handles::client::json_rpc(&self.plumbing.endpoint("jsonrpc").await?);
+        let client = crate::protocol::client::json_rpc(&self.plumbing.endpoint("jsonrpc").await?);
         ZcashRpc::new(COMPONENT, &client).peer_info().await
     }
 }

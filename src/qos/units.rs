@@ -15,35 +15,35 @@ use super::{ANNOTATION_IO_BPS, ANNOTATION_IO_IOPS, Resources};
 
 /// k8s CPU quantity → millicores. `"500m"`/`"2"`/`"1.5"`/`"2500000n"` (rounds to nearest).
 /// Unrecognized → 0, which under-counts (unsafe direction — leave no real unit unhandled)
-pub(crate) fn parse_cpu_milli(s: &str) -> u64 {
+pub fn parse_cpu_milli(s: &str) -> u64 {
     parse_cpu_milli_opt(s).unwrap_or(0)
 }
 
 /// [`parse_cpu_milli`] with `None` for unparseable, for callers separating
 /// garbage from an intended `0` (typo'd SA budget must be rejected, not zeroed)
-pub(crate) fn parse_cpu_milli_opt(s: &str) -> Option<u64> {
+pub fn parse_cpu_milli_opt(s: &str) -> Option<u64> {
     ztest_attr::footprint::parse_cpu_milli(s)
 }
 
 /// k8s memory/byte quantity → bytes: binary, decimal SI, exponent, raw.
 /// Overflow saturates, unparseable → 0
-pub(crate) fn parse_mem_bytes(s: &str) -> u64 {
+pub fn parse_mem_bytes(s: &str) -> u64 {
     parse_mem_bytes_opt(s).unwrap_or(0)
 }
 
 /// [`parse_mem_bytes`] with `None` for unparseable, see [`parse_cpu_milli_opt`]
-pub(crate) fn parse_mem_bytes_opt(s: &str) -> Option<u64> {
+pub fn parse_mem_bytes_opt(s: &str) -> Option<u64> {
     ztest_attr::footprint::parse_mem_bytes(s)
 }
 
 /// Absent `requests` → [`Resources::ZERO`].
-pub(crate) fn container_requests(c: &Container) -> Resources {
+pub fn container_requests(c: &Container) -> Resources {
     container_amount(c.resources.as_ref().and_then(|r| r.requests.as_ref()))
 }
 
 /// Absent `limits` → [`Resources::ZERO`], i.e. uncapped, not zero-capped. Callers
 /// wanting a denominator must reject `ZERO` rather than divide by it
-pub(crate) fn container_limits(c: &Container) -> Resources {
+pub fn container_limits(c: &Container) -> Resources {
     container_amount(c.resources.as_ref().and_then(|r| r.limits.as_ref()))
 }
 
@@ -89,25 +89,38 @@ fn pod_effective(pod: &PodSpec, per_container: impl Fn(&Container) -> Resources)
 
 /// Per-pod reservation floor, later `max`'d with usage (bounds a bursting co-tenant).
 /// CPU+memory only, disk I/O rides the PVC ([`pvc_io_reservation`])
-pub(crate) fn pod_effective_request(pod: &PodSpec) -> Resources {
+pub fn pod_effective_request(pod: &PodSpec) -> Resources {
     pod_effective(pod, container_requests)
 }
 
 /// Ceiling the pod may draw, on the same effective model as
 /// [`pod_effective_request`]. `ZERO` in a dimension = uncapped there
-pub(crate) fn pod_effective_limit(pod: &PodSpec) -> Resources {
+pub fn pod_effective_limit(pod: &PodSpec) -> Resources {
     pod_effective(pod, container_limits)
 }
 
 /// From [`ANNOTATION_IO_BPS`]/[`ANNOTATION_IO_IOPS`], CPU/memory always zero.
 /// Neither annotation = nothing reserved (uncapped volume, unbounded by the probe)
-pub(crate) fn pvc_io_reservation(pvc: &PersistentVolumeClaim) -> Resources {
+pub fn pvc_io_reservation(pvc: &PersistentVolumeClaim) -> Resources {
     let Some(a) = pvc.metadata.annotations.as_ref() else {
         return Resources::ZERO;
     };
     let io_bps = a.get(ANNOTATION_IO_BPS).map(|s| parse_mem_bytes(s)).unwrap_or(0);
     let io_iops = a.get(ANNOTATION_IO_IOPS).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
     Resources::new(0, 0, io_bps, io_iops)
+}
+
+/// Still holding capacity: anything not settled into `Succeeded`/`Failed`.
+///
+/// - Sole definition; the ledger's headroom subtraction, `assert_invariant` and the probe's
+///   `ClusterCapacity` must agree or admission double-counts a pod one of them cannot see
+/// - Unscheduled `Pending` counts: it is capacity already promised to a created pod, and
+///   under-counting it is the direction that overcommits a node
+pub fn pod_holds_capacity(pod: &k8s_openapi::api::core::v1::Pod) -> bool {
+    !matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+        Some("Succeeded") | Some("Failed")
+    )
 }
 
 #[cfg(test)]
@@ -285,17 +298,4 @@ mod tests {
         assert_eq!(pvc_io_reservation(&bps_only).io_bps, 50 * crate::qos::MIB);
         assert_eq!(pvc_io_reservation(&bps_only).io_iops, 0);
     }
-}
-
-/// Still holding capacity: anything not settled into `Succeeded`/`Failed`.
-///
-/// - Sole definition; the ledger's headroom subtraction, `assert_invariant` and the probe's
-///   `ClusterCapacity` must agree or admission double-counts a pod one of them cannot see
-/// - Unscheduled `Pending` counts: it is capacity already promised to a created pod, and
-///   under-counting it is the direction that overcommits a node
-pub fn pod_holds_capacity(pod: &k8s_openapi::api::core::v1::Pod) -> bool {
-    !matches!(
-        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
-        Some("Succeeded") | Some("Failed")
-    )
 }

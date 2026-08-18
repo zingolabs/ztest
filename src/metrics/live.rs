@@ -17,8 +17,8 @@ use tokio::sync::{Mutex, watch};
 
 use super::{Exposition, PORT_NAME, Row, scrape};
 use crate::error::EnvError;
-use crate::handles::Endpoint;
 use crate::portforward::Forwarder;
+use crate::protocol::Endpoint;
 
 // ──────────────────────────────── Exporter ────────────────────────────────
 

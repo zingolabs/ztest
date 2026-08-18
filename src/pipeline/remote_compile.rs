@@ -15,13 +15,13 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, AttachParams, TerminalSize};
 use tokio::io::AsyncReadExt as _;
 
+use crate::naming::RUN_NAMESPACE;
 use crate::pipeline::build::{self, BuildOutcome, SelectedBinary};
 use crate::pipeline::images::{self, Dumped};
 use crate::resource::impls::buildkit::{BUILDKIT_CONTAINER, WORK_MOUNT};
-use crate::resource::impls::policy::RUN_NAMESPACE;
 
 /// Runner build recipe (compile → inventory → runner)
-pub(super) const RUNNER_DOCKERFILE: &str = include_str!("../../docker/runner.Dockerfile");
+pub const RUNNER_DOCKERFILE: &str = include_str!("../../docker/runner.Dockerfile");
 
 /// In-image source root (`WORKDIR /src` + `COPY . .`). Inventory ctors resolve `dev!`/seed
 /// paths under here → come back `/src`-rooted, re-homed by [`rehome_dump`]
@@ -168,7 +168,7 @@ pub async fn compile_on_cluster(
 
 /// Fold a bake's `list.json` + framed `inventory.jsonl` into the run pipeline's outcome.
 /// Shared by both bakes of [`RUNNER_DOCKERFILE`] (same files, same stage, only *where* differs)
-pub(super) fn assemble_outcome(
+pub fn assemble_outcome(
     list_json: &str,
     inventory: &str,
     ancestor: &Path,
@@ -287,15 +287,16 @@ fn oc_cp_from_pod(pod: &str, dir: &str) -> Result<TempDir, String> {
     Ok(local)
 }
 
-pub(super) struct TempDir(PathBuf);
+#[derive(Debug)]
+pub struct TempDir(PathBuf);
 
 impl TempDir {
-    pub(super) fn new(tag: &str) -> Result<Self, String> {
+    pub fn new(tag: &str) -> Result<Self, String> {
         let base = std::env::temp_dir().join(format!("{tag}-{:08x}", rand::random::<u32>()));
         std::fs::create_dir_all(&base).map_err(|e| format!("create temp dir: {e}"))?;
         Ok(Self(base))
     }
-    pub(super) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -531,14 +532,15 @@ fn split_dumps_by_name(
 /// - Whole repos ship, not package subtrees: `dev!`/`mount_*`/seed paths resolve against
 ///   `CARGO_MANIFEST_DIR` and routinely escape the crate into its repo
 /// - Scoping to repos that hold packages keeps sibling repos out
-pub(super) struct SourceLayout {
-    pub(super) ancestor: PathBuf,
-    pub(super) workspace_rel: PathBuf,
+#[derive(Debug)]
+pub struct SourceLayout {
+    pub ancestor: PathBuf,
+    pub workspace_rel: PathBuf,
     repos: Vec<PathBuf>,
 }
 
 impl SourceLayout {
-    pub(super) fn resolve() -> Result<Self, String> {
+    pub fn resolve() -> Result<Self, String> {
         let meta = cargo_metadata()?;
         let workspace_root =
             meta["workspace_root"].as_str().ok_or("cargo metadata: no workspace_root")?;
@@ -797,7 +799,7 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
 /// Same build context into a local dir, for the laptop-side bake
 /// ([`crate::pipeline::local_bake`]). Staged rather than handing `docker build` the source
 /// ancestor (what keeps LFS payloads out — see [`spawn_source_tar`])
-pub(super) fn extract_source_to(src: &SourceLayout, dest: &Path) -> Result<(), String> {
+pub fn extract_source_to(src: &SourceLayout, dest: &Path) -> Result<(), String> {
     let mut stream = spawn_source_tar(src)?;
     let tar_stdout = stream.child.stdout.take().expect("tar stdout is piped");
     let out = std::process::Command::new("tar")
@@ -882,11 +884,11 @@ fn registry_host(reference: &str) -> String {
     reference.split('/').next().unwrap_or(reference).to_string()
 }
 
-pub(super) fn shell_quote(s: &str) -> String {
+pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-pub(super) fn tail(s: &str, n: usize) -> String {
+pub fn tail(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")

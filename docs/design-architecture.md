@@ -73,7 +73,7 @@ Each archive has a paired `VolumeSnapshot`; tests always clone from the snapshot
 
 ```
 tar -I zstd -cf tests/assets/<name>.tar.zst -C <data-dir> .
-ztest snapshot manifest <archive> > snapshots/<net>/<up>.toml && ztest snapshot push <archive>
+ztest snapshot manifest <archive> > snapshots/<net>/zebra-<ver>-<up>.toml && ztest snapshot push <archive>
 ```
 
 **Materialization** (lazy, on first use). At `TestEnv::build()`, per archive mount:
@@ -121,7 +121,7 @@ labels:
   ztest.io/run-id:    "${RUN_ID}"        # or dev-${USER}-${NEXTEST_PID}
   ztest.io/slot:      "${SLOT}"
   ztest.io/test:      "<test-name>"      # pods only
-  ztest.io/component: "zebrad|zcashd|zaino|zingo"
+  ztest.io/component: "zebrad|zcashd|zaino"
 ```
 
 Promtail forwards each label as a Loki stream label. Post-mortem query:

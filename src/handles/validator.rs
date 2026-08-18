@@ -10,15 +10,18 @@ use crate::topology::ActivationHeights;
 use async_trait::async_trait;
 
 use crate::component::ComponentOpts;
-use crate::handles::client::JsonRpcClient;
+use crate::handles::HandleInner;
 use crate::handles::wallet::Pool;
-use crate::handles::{Endpoint, HandleInner};
+use crate::protocol::Endpoint;
+use crate::protocol::client::JsonRpcClient;
 use crate::{EnvError, RpcError};
 
 pub use zcash_protocol::consensus::BlockHeight;
 
 // Re-exported so a backend impl pulls trait + response types from one path
-pub use crate::handles::types::{BlockHash, BlockTip, BlockchainInfo, MempoolInfo, Peer, PeerInfo};
+pub use crate::protocol::types::{
+    BlockHash, BlockTip, BlockchainInfo, MempoolInfo, Peer, PeerInfo,
+};
 
 /// Static consensus params from ztest's pins, keyed on the node's network
 /// identity. Not live chain state (that's [`BlockchainInfo`]).

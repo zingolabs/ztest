@@ -6,8 +6,8 @@
 //! - [`TreeRoots`] = the wallet side, folded per tick into
 //!   [`Snapshot`](crate::sync::Snapshot); [`commitment_tree_root`] = the indexer side
 //!   (hex frontier from `GetTreeState`)
-//! - `sapling_crypto`/`orchard` pinned to zingolib `dev`'s lock — two copies in one
-//!   graph give two `Node` types whose roots cannot be compared at all
+//! - One `sapling_crypto`/`orchard` copy per graph (two give two `Node` types whose
+//!   roots cannot be compared at all)
 
 use crate::handles::wallet::Pool;
 

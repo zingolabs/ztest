@@ -20,7 +20,7 @@ pub enum Event {
     BuildStarted,
     BuildIndexing,
     BuildComplete { test_count: usize, binary_count: usize },
-    BuildFailed { exit_code: i32, stage: crate::ui::BuildStage },
+    BuildFailed { exit_code: i32, stage: super::BuildStage },
 
     // Phase A: cluster
     ProbeStarted,

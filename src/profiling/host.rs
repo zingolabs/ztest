@@ -14,8 +14,8 @@ use tokio::process::Command;
 use super::ebpf::HTTP_PORT;
 
 /// Container path for the generated config + kubeconfig (mounted read-only)
-pub(crate) const HOST_CONFIG: &str = "/etc/alloy/config.alloy";
-pub(crate) const HOST_KUBECONFIG: &str = "/etc/alloy/kubeconfig";
+pub const HOST_CONFIG: &str = "/etc/alloy/config.alloy";
+pub const HOST_KUBECONFIG: &str = "/etc/alloy/kubeconfig";
 
 /// Marks a container as ours *and* whose: reaping needs the sync id without a pid file
 const SYNC_LABEL: &str = "ztest.io/sync-id";
@@ -30,7 +30,7 @@ const KIND_ROLE_LABEL: &str = "io.x-k8s.kind.role=control-plane";
 ///   (user-defined bridges are isolated from the default one)
 /// - Node IP over loopback on purpose: `--network host` would work too, but then the metrics
 ///   port lives in the host's port space, where anything may already hold it
-pub(crate) async fn cluster_network() -> Option<String> {
+pub async fn cluster_network() -> Option<String> {
     let node = Command::new("docker")
         .args(["ps", "--filter", &format!("label={KIND_ROLE_LABEL}"), "--format", "{{.Names}}"])
         .output()
@@ -52,7 +52,7 @@ pub(crate) async fn cluster_network() -> Option<String> {
 
 /// Host port docker bound the collector's `/metrics` to. Docker owns the mapping, so this is
 /// a lookup rather than a convention both sides must keep in step
-pub(crate) async fn metrics_port(sync_id: &str) -> Option<u16> {
+pub async fn metrics_port(sync_id: &str) -> Option<u16> {
     let out = Command::new("docker")
         .args(["port", &container_name(sync_id), &HTTP_PORT.to_string()])
         .output()
@@ -65,7 +65,7 @@ pub(crate) async fn metrics_port(sync_id: &str) -> Option<u16> {
         .and_then(|(_, port)| port.trim().parse().ok())
 }
 
-pub(crate) fn container_name(sync_id: &str) -> String {
+pub fn container_name(sync_id: &str) -> String {
     format!("ztest-profiler-{sync_id}")
 }
 
@@ -112,7 +112,7 @@ fn dirs_home() -> Option<PathBuf> {
 
 /// Start the collector for a run. Idempotent: an existing container for this id is replaced,
 /// so a relaunch cannot leave two collectors pushing the same tenant.
-pub(crate) async fn start(sync_id: &str, config: &str, api_server: &str) -> Result<(), String> {
+pub async fn start(sync_id: &str, config: &str, api_server: &str) -> Result<(), String> {
     let dir = run_dir(sync_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let config_path = dir.join("config.alloy");
@@ -198,15 +198,14 @@ async fn last_error(name: &str) -> String {
     let text =
         format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     text.lines()
-        .filter(|l| l.contains("level=error") || l.contains("level=ERROR"))
-        .next_back()
+        .rfind(|l| l.contains("level=error") || l.contains("level=ERROR"))
         .map(|l| l.rsplit_once("err=").map_or(l, |(_, tail)| tail))
         .unwrap_or("see `docker logs`")
         .trim()
         .to_string()
 }
 
-pub(crate) async fn stop(sync_id: &str) {
+pub async fn stop(sync_id: &str) {
     let _ = Command::new("docker").args(["rm", "-f", &container_name(sync_id)]).output().await;
     let _ = std::fs::remove_dir_all(run_dir(sync_id));
 }
@@ -215,7 +214,7 @@ pub(crate) async fn stop(sync_id: &str) {
 ///
 /// - `ps -a`, not `ps`: a collector that died (bind clash, rejected config) still owns a
 ///   container name and a scratch dir, and only this sweep frees them
-pub(crate) async fn collectors() -> Vec<String> {
+pub async fn collectors() -> Vec<String> {
     let Ok(out) = Command::new("docker")
         .args([
             "ps",
@@ -240,9 +239,9 @@ pub(crate) async fn collectors() -> Vec<String> {
 
 /// Reap collectors whose run is over. The CLI is detached, so this is the only thing that
 /// stops one — called wherever a sync's liveness is already being read.
-pub(crate) async fn reap_finished(client: &kube::Client) {
+pub async fn reap_finished(client: &kube::Client) {
     for id in collectors().await {
-        let live = crate::cli::sync::driver_is_live(client, &id).await;
+        let live = crate::sync::driver_is_live(client, &id).await;
         if !live {
             stop(&id).await;
         }

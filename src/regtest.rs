@@ -89,7 +89,7 @@ pub fn regtest_test_post_nu6_funding_streams() -> FundingStreams {
     }
 }
 
-pub(crate) fn parse_activation_heights_from_rpc(
+pub fn parse_activation_heights_from_rpc(
     upgrades: &serde_json::Map<String, serde_json::Value>,
 ) -> ActivationHeights {
     let get_height = |name: &str| -> Option<u32> {
@@ -168,7 +168,7 @@ pub trait Restore: Sized {
 /// Mount an archive at `destination`. Identity from the handle, baked at compile time as a
 /// [`SeedDecl`](crate::inventory::SeedDecl) → a missing artifact cannot first surface as an
 /// on-cluster materialization failure
-pub(crate) fn archive_mount(archive: crate::Artifact, destination: &str) -> crate::mount::Mount {
+pub fn archive_mount(archive: crate::Artifact, destination: &str) -> crate::mount::Mount {
     crate::mount::Mount::archive(archive, destination)
 }
 
@@ -178,13 +178,13 @@ use std::path::PathBuf;
 
 use crate::mount::{Mount, MountKind, MountSource};
 
-pub(crate) fn scratch_mount(dest: &str) -> Mount {
+pub fn scratch_mount(dest: &str) -> Mount {
     Mount::scratch(PathBuf::from(dest))
 }
 
 /// Pre-rendered config `content` → ConfigMap at `dest`, no fixture file. Same `<=1 MiB`
 /// UTF-8 cap as `mount_config!`
-pub(crate) fn config_mount_inline(content: String, dest: &str) -> Mount {
+pub fn config_mount_inline(content: String, dest: &str) -> Mount {
     Mount {
         source: MountSource::ConfigInline(content),
         destination: PathBuf::from(dest),

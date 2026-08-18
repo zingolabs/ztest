@@ -16,9 +16,9 @@
   # `nix fmt`               — format Nix files
   #
   # The shell sets ROCKSDB_{LIB,INCLUDE}_DIR / LIBCLANG_PATH / PROTOC so
-  # `cargo build` works out of the box on NixOS. ztest's build.rs generates
-  # the lightwalletd gRPC client from `proto/*.proto` via tonic-prost-build,
-  # so `protoc` is a build-time requirement (provided here).
+  # `cargo build` works out of the box on NixOS. `protoc` is a maintainer tool
+  # only (`cargo xtask regen-proto`) — the lightwalletd bindings are checked in,
+  # so a downstream build needs none of it.
   #
   # Local cluster bring-up (requires a Docker / Podman daemon — enable
   # `virtualisation.docker.enable = true` on NixOS first):
@@ -65,8 +65,7 @@
           # Sets LIBCLANG_PATH so librocksdb-sys's bindgen finds libclang
           # without dragging an unpinned LLVM into PATH.
           rustPlatform.bindgenHook
-          # protoc for ztest's build.rs (tonic-prost-build codegen of the
-          # vendored lightwalletd proto). PROTOC is set in `env` below.
+          # protoc for `cargo xtask regen-proto`. PROTOC is set in `env` below.
           protobuf
           cargo-nextest
           cargo-deny
@@ -114,7 +113,7 @@
           # wrapper).
           ROCKSDB_LIB_DIR = "${pkgs.rocksdb_8_11}/lib";
           ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb_8_11}/include";
-          # Pin protoc for tonic-prost-build so build.rs doesn't probe PATH.
+          # Pin protoc so xtask's codegen doesn't probe PATH.
           PROTOC = "${pkgs.protobuf}/bin/protoc";
         };
       in

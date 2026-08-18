@@ -16,30 +16,24 @@
 // Module-scoped so dead code elsewhere stays a hard error.
 #![allow(dead_code)]
 
-mod context;
-mod entry;
-mod graph;
-pub(crate) mod kube;
-mod provider;
+pub mod context;
+pub mod entry;
+pub mod graph;
+pub mod kube;
+pub mod provider;
 pub mod reclaim;
-mod state;
+pub mod state;
 
-pub(crate) mod impls;
+pub mod impls;
 
 // ── Public API ────────────────────────────────────────────────────────
 
-pub use context::{Cx, NodeProgress, Progress, ProgressSink};
+pub use context::{Cx, Progress, ProgressSink};
 pub use entry::{
     InitializeOpts, dev_image_refs, image_node_id, initialize, plan_runtime, reap_run, seed_node_id,
 };
 pub use graph::Graph;
-pub use impls::observability::{
-    GRAFANA_PORT, GRAFANA_SERVICE, OBS_NAMESPACE, PROFILE_RETIREMENT_LAG, PROMETHEUS_PORT,
-    PROMETHEUS_SERVICE, PYROSCOPE_PORT, PYROSCOPE_SERVICE, RETENTION_DAYS,
-};
-pub(crate) use impls::policy::{RUN_CLUSTER_ROLE, check_access as check_run_access};
-pub use impls::storage::{
-    discover as discover_storage, select as select_storage, selected as selected_storage,
-};
+pub use impls::observability::{PROFILE_RETIREMENT_LAG, RETENTION_DAYS};
+pub use impls::policy::{RUN_CLUSTER_ROLE, check_access as check_run_access};
 pub use provider::{NodeId, Provider};
 pub use state::{Lifetime, NodeState, Readiness, ResourceError};

@@ -20,7 +20,7 @@ const SERIES_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Publishes engine state as [`SyncEvent`] lines on stdout. `published_at` is
 /// elapsed, not a tick count (a skipped tick must not stretch the interval)
 #[derive(Debug)]
-pub(crate) struct EventReporter {
+pub struct EventReporter {
     sync_id: String,
     profile: String,
     tick: std::time::Duration,
@@ -34,7 +34,7 @@ pub(crate) struct EventReporter {
 }
 
 impl EventReporter {
-    pub(crate) fn new(
+    pub fn new(
         sync_id: impl Into<String>,
         profile: impl Into<String>,
         tick: std::time::Duration,

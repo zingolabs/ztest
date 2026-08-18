@@ -141,7 +141,7 @@ fn missing_balances(accessor: &str) -> ! {
 /// Rolling state threaded across ticks to build each [`Snapshot`]. Separate so the snapshot
 /// stays a plain immutable value
 #[derive(Debug)]
-pub(crate) struct SnapshotBuilder {
+pub struct SnapshotBuilder {
     seq: u64,
     prev_height: u32,
     prev_work: Work,
@@ -154,7 +154,7 @@ pub(crate) struct SnapshotBuilder {
 }
 
 impl SnapshotBuilder {
-    pub(crate) fn new(started_at: Instant) -> Self {
+    pub fn new(started_at: Instant) -> Self {
         Self {
             seq: 0,
             prev_height: 0,
@@ -170,7 +170,7 @@ impl SnapshotBuilder {
 
     /// Fold one reading captured at `now` into a snapshot, advancing the rolling state.
     /// `last_fault_at` comes from the fault timeline
-    pub(crate) fn build<P: ProgressView>(
+    pub fn build<P: ProgressView>(
         &mut self,
         p: &P,
         now: Instant,
@@ -227,7 +227,7 @@ impl SnapshotBuilder {
         snap
     }
 
-    pub(crate) fn seq(&self) -> u64 {
+    pub fn seq(&self) -> u64 {
         self.seq
     }
 }
@@ -242,11 +242,11 @@ pub struct History {
 }
 
 impl History {
-    pub(crate) fn new(cap: usize) -> Self {
+    pub fn new(cap: usize) -> Self {
         Self { buf: VecDeque::new(), cap, dropped: 0 }
     }
 
-    pub(crate) fn push(&mut self, snap: Arc<Snapshot>) {
+    pub fn push(&mut self, snap: Arc<Snapshot>) {
         if self.buf.len() == self.cap {
             self.buf.pop_front();
             self.dropped += 1;

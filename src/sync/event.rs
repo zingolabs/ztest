@@ -13,7 +13,7 @@ use super::snapshot::Snapshot;
 use super::work::Work;
 
 /// Stdout tag for a serialized [`SyncEvent`] (not a plausible log-line opening)
-pub(crate) const EVENT_PREFIX: &str = "@ztest-sync-event ";
+pub const EVENT_PREFIX: &str = "@ztest-sync-event ";
 
 /// One observation published by the driver.
 ///
@@ -22,7 +22,7 @@ pub(crate) const EVENT_PREFIX: &str = "@ztest-sync-event ";
 /// - `Series` republishes whole run at constant size (controllers fold bounded tail)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
-pub(crate) enum SyncEvent {
+pub enum SyncEvent {
     Setup {
         phase: String,
         detail: String,
@@ -65,7 +65,7 @@ pub(crate) enum SyncEvent {
 ///   across it rather than inventing a rate)
 /// - op absent from map = unmeasured, renders `—` not `0`
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Tick {
+pub struct Tick {
     pub seq: u64,
     pub elapsed_ms: u64,
     pub height: u32,
@@ -79,7 +79,7 @@ pub(crate) struct Tick {
 
 impl Tick {
     #[cfg(feature = "librustzcash")]
-    pub(crate) fn from_snapshot(snap: &Snapshot, elapsed: std::time::Duration) -> Self {
+    pub fn from_snapshot(snap: &Snapshot, elapsed: std::time::Duration) -> Self {
         Tick {
             seq: snap.seq(),
             elapsed_ms: elapsed.as_millis() as u64,
@@ -92,7 +92,7 @@ impl Tick {
         }
     }
 
-    pub(crate) fn at(&self) -> std::time::Duration {
+    pub fn at(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.elapsed_ms)
     }
 }
@@ -113,7 +113,7 @@ impl From<&Tick> for crate::sync::Observation {
 /// Wire form of [`ProbeStatus`]. Millis + tags, not `Duration`'s `{secs,nanos}`
 /// (raw `kubectl logs` stays legible)
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Probe {
+pub struct Probe {
     pub name: String,
     pub class: String,
     pub state: ProbeState,
@@ -146,7 +146,7 @@ impl From<&ProbeStatus> for Probe {
 /// - Watchers resume by time = at-least-once; `n` de-dupes the replayed overlap
 /// - `n` = `None` from a pre-sequence driver (sync outlives its build) → fold accepts all
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Envelope {
+pub struct Envelope {
     #[serde(default)]
     pub n: Option<u64>,
     #[serde(flatten)]
@@ -158,7 +158,7 @@ pub(crate) struct Envelope {
 static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Serialize `event` as one tagged, sequenced line, newline-terminated.
-pub(crate) fn encode(event: &SyncEvent) -> String {
+pub fn encode(event: &SyncEvent) -> String {
     let n = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Cannot fail for plain DTOs; degrade to a skippable line, never kill a 48h sync
     match serde_json::to_string(&Envelope { n: Some(n), event: event.clone() }) {
@@ -171,7 +171,7 @@ pub(crate) fn encode(event: &SyncEvent) -> String {
 ///
 /// - Single `write_all` under lock (`tracing` shares this fd, split write corrupts both)
 /// - Failure ignored (broken stdout must not abort a 48h sync)
-pub(crate) fn publish(event: &SyncEvent) {
+pub fn publish(event: &SyncEvent) {
     use std::io::Write as _;
 
     let line = encode(event);
@@ -183,7 +183,7 @@ pub(crate) fn publish(event: &SyncEvent) {
 
 /// Lift an event out of a driver log line. `None` = ordinary log output, incl. a
 /// tagged line this build cannot parse (stays visible as text, never dropped)
-pub(crate) fn decode(line: &str) -> Option<Envelope> {
+pub fn decode(line: &str) -> Option<Envelope> {
     let json = line.trim_start().strip_prefix(EVENT_PREFIX)?;
     serde_json::from_str(json).ok()
 }

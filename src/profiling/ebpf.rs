@@ -26,16 +26,16 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
 /// Sidecar container name; also what `ztest sync perf` reads back to prove profiling was on
-pub(crate) const CONTAINER: &str = "ebpf-profiler";
+pub const CONTAINER: &str = "ebpf-profiler";
 
 /// Port Alloy serves `/metrics` on, both placements. Never published to a fixed *host* port:
 /// docker allocates one per host collector ([`super::host::metrics_port`] reads it back), so
 /// two syncs cannot collide
-pub(crate) const HTTP_PORT: u16 = 12345;
+pub const HTTP_PORT: u16 = 12345;
 
 /// Pinned to the version validated on-cluster (a moved tag's `ImagePullBackOff` surfaces
 /// as "the run produced no profile", three layers from its cause)
-pub(crate) const ALLOY_IMAGE: &str = "grafana/alloy:v1.18.1";
+pub const ALLOY_IMAGE: &str = "grafana/alloy:v1.18.1";
 
 /// Which pid namespace the collector observes from. Same image, same `.eh_frame` unwinder
 /// either way — placement is the only variable.
@@ -45,38 +45,26 @@ pub(crate) const ALLOY_IMAGE: &str = "grafana/alloy:v1.18.1";
 /// - `Host`: a nested kubelet (kind's node is a container) puts every pod one level below the
 ///   initial namespace, where no privilege can name those pids → collector runs beside dockerd
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Placement {
+pub enum Placement {
     Sidecar,
     Host,
 }
 
-/// `providerID` schemes whose node is itself a container. Only kind is listed: `k3s://` also
-/// covers bare-metal k3s, so matching it would relocate clusters that profile fine
-const NESTED_PROVIDERS: [&str; 1] = ["kind://"];
-
 /// `Host` when the kubelet is nested, else `Sidecar` (an unreadable node = `Sidecar`: a probe
 /// failure should not silently move every run's collector off-cluster)
-pub(crate) async fn placement_for(client: &kube::Client) -> Placement {
-    use k8s_openapi::api::core::v1::Node;
-    let nodes: kube::Api<Node> = kube::Api::all(client.clone());
-    let nested = async {
-        let list = nodes.list(&kube::api::ListParams::default().limit(1)).await.ok()?;
-        let id = list.items.first()?.spec.as_ref()?.provider_id.clone()?;
-        Some(NESTED_PROVIDERS.iter().any(|scheme| id.starts_with(scheme)))
-    }
-    .await;
-    match nested {
-        Some(true) => Placement::Host,
-        _ => Placement::Sidecar,
+pub async fn placement_for(client: &kube::Client) -> Placement {
+    match crate::cluster_config::kubelet_is_nested(client).await {
+        true => Placement::Host,
+        false => Placement::Sidecar,
     }
 }
 
 /// Guaranteed QoS is a hard invariant for ztest pods (see `manifest::pod_is_guaranteed`);
 /// added to the tier's `runner` reserve so the driver's total stays covered
-pub(crate) const CPU_MILLI: u64 = 500;
-pub(crate) const MEM_BYTES: u64 = 512 * 1024 * 1024;
+pub const CPU_MILLI: u64 = 500;
+pub const MEM_BYTES: u64 = 512 * 1024 * 1024;
 
-pub(crate) fn resources() -> crate::qos::Resources {
+pub fn resources() -> crate::qos::Resources {
     crate::qos::Resources::new(CPU_MILLI, MEM_BYTES, 0, 0)
 }
 
@@ -88,13 +76,14 @@ pub(crate) fn resources() -> crate::qos::Resources {
 /// per-CPU perf ring. At `1.0` a busy sync overran it by ~12k events/s — every trace
 /// dropped, profile empty, collector idle at 14% of its CPU limit. Raise only while
 /// `ztest sync perf` still reports 0 dropped
-pub(crate) const DEFAULT_OFF_CPU: f64 = 0.05;
+pub const DEFAULT_OFF_CPU: f64 = 0.05;
 
 /// Upstream default. Deviating costs ring headroom that off-CPU events also draw on
-pub(crate) const DEFAULT_HZ: u32 = 19;
+pub const DEFAULT_HZ: u32 = 19;
 
 /// Collector for one run's namespace, pushing under one tenant.
-pub(crate) struct Collector {
+#[derive(Debug)]
+pub struct Collector {
     pub namespace: String,
     pub tenant: String,
     pub push_url: String,
@@ -109,7 +98,7 @@ pub(crate) struct Collector {
 impl Collector {
     /// `None` = no Pyroscope on this cluster; caller reports it rather than launching a
     /// collector that would push into nothing
-    pub(crate) async fn for_sync(
+    pub async fn for_sync(
         client: &kube::Client,
         sync_id: &str,
         namespace: &str,
@@ -126,11 +115,11 @@ impl Collector {
         };
         Some(Collector {
             namespace: namespace.to_string(),
-            tenant: super::tenant(&crate::naming::current_user(), sync_id),
+            tenant: crate::naming::profile_tenant(&crate::naming::current_user(), sync_id),
             push_url,
             hz,
             off_cpu,
-            config_map: crate::cli::sync::profiler_config_name(sync_id),
+            config_map: crate::sync::profiler_config_name(sync_id),
             placement,
             api_server,
         })
@@ -240,17 +229,17 @@ pyroscope.write "store" {{
     }
 
     /// Rendered config for a host-placed collector, which reads a file rather than a mount
-    pub(crate) fn host_config(&self) -> String {
+    pub fn host_config(&self) -> String {
         self.config()
     }
 
-    /// Lives beside the driver in [`RUN_NAMESPACE`](crate::resource::impls::policy::RUN_NAMESPACE);
+    /// Lives beside the driver in [`RUN_NAMESPACE`](crate::naming::RUN_NAMESPACE);
     /// caller owner-references it to the driver pod so it is collected with it
-    pub(crate) fn config_map(&self) -> ConfigMap {
+    pub fn config_map(&self) -> ConfigMap {
         ConfigMap {
             metadata: ObjectMeta {
                 name: Some(self.config_map.to_string()),
-                namespace: Some(crate::resource::impls::policy::RUN_NAMESPACE.to_string()),
+                namespace: Some(crate::naming::RUN_NAMESPACE.to_string()),
                 ..Default::default()
             },
             data: Some(BTreeMap::from([("config.alloy".to_string(), self.config())])),
@@ -268,7 +257,7 @@ pyroscope.write "store" {{
     /// - `privileged` + `Unconfined`: BPF program load is blocked by the default AppArmor
     ///   profile, and the loader raises `RLIMIT_MEMLOCK`
     /// - Pod must also set `hostPID` — sampled PIDs resolve against the host namespace
-    pub(crate) fn container(&self) -> Container {
+    pub fn container(&self) -> Container {
         let limits = BTreeMap::from([
             ("cpu".to_string(), Quantity(format!("{CPU_MILLI}m"))),
             ("memory".to_string(), Quantity(format!("{MEM_BYTES}"))),
@@ -323,7 +312,7 @@ pyroscope.write "store" {{
         }
     }
 
-    pub(crate) fn volumes(&self) -> Vec<Volume> {
+    pub fn volumes(&self) -> Vec<Volume> {
         vec![
             Volume {
                 name: "ebpf-config".to_string(),

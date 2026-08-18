@@ -12,12 +12,12 @@ use crate::resource::{Cx, NodeId, Readiness, ResourceError};
 
 /// `registry` serves both push and pull, e.g. `ghcr.io/zingolabs`
 #[derive(Debug)]
-pub(crate) struct Docker {
+pub struct Docker {
     registry: String,
 }
 
 impl Docker {
-    pub(crate) fn registry(registry: String) -> Docker {
+    pub fn registry(registry: String) -> Docker {
         Docker { registry }
     }
 }
@@ -49,7 +49,7 @@ impl ImageProvider for Docker {
 }
 
 impl Docker {
-    pub(super) fn reference(&self, tag: &str) -> String {
+    pub fn reference(&self, tag: &str) -> String {
         join(&self.registry, tag)
     }
 
@@ -90,7 +90,7 @@ impl Docker {
 
 /// `docker manifest inspect`: exit 0 = present, anything else = `false`
 /// (false negative → rebuild+push, whose own failure carries the real error)
-pub(crate) fn exists_in_registry(reference: &str) -> Result<bool, ImageError> {
+pub fn exists_in_registry(reference: &str) -> Result<bool, ImageError> {
     let out = Command::new("docker").args(["manifest", "inspect", reference]).output().map_err(
         |err| ImageError::Spawn { cmd: format!("docker manifest inspect {reference}"), err },
     )?;
@@ -98,6 +98,6 @@ pub(crate) fn exists_in_registry(reference: &str) -> Result<bool, ImageError> {
 }
 
 /// Split from the call site so the push rides the console PTY (live progress)
-pub(crate) fn docker_push_argv(reference: &str) -> Vec<String> {
+pub fn docker_push_argv(reference: &str) -> Vec<String> {
     vec!["push".to_string(), reference.to_string()]
 }

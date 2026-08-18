@@ -46,7 +46,7 @@ pub enum NodeId {
     /// Prometheus + Pyroscope + Grafana in [`OBS_NAMESPACE`] (sink for every
     /// component's `/metrics` + pushed profiles)
     ///
-    /// [`OBS_NAMESPACE`]: crate::resource::OBS_NAMESPACE
+    /// [`OBS_NAMESPACE`]: crate::naming::OBS_NAMESPACE
     Observability,
 
     /// `metrics.k8s.io` resource-metrics API (`kubectl top` / k9s / HPA), separate

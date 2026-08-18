@@ -19,7 +19,7 @@ use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 ///   computed fallibly at construction so [`Provider::id`] is infallible
 /// - Registry-independent, so dedup and dependency edges hold across registries
 #[derive(Debug)]
-pub(crate) struct ImageNode {
+pub struct ImageNode {
     entry: DevImageEntry,
     tag: String,
     backend: Arc<dyn image::ImageProvider>,
@@ -27,7 +27,7 @@ pub(crate) struct ImageNode {
 
 impl ImageNode {
     /// Fails when the build context cannot be hashed (missing Dockerfile/context, IO)
-    pub(crate) fn new(entry: DevImageEntry) -> Result<Self, String> {
+    pub fn new(entry: DevImageEntry) -> Result<Self, String> {
         let tag = image::dev_tag(
             &entry.source,
             &entry.features,
@@ -39,7 +39,7 @@ impl ImageNode {
     }
 
     /// Lets `cli::run` key a per-binary dependency edge without re-derivation
-    pub(crate) fn node_id(entry: &DevImageEntry) -> Result<NodeId, String> {
+    pub fn node_id(entry: &DevImageEntry) -> Result<NodeId, String> {
         Self::new(entry.clone()).map(|p| p.id())
     }
 }

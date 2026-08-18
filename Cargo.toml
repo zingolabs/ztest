@@ -1,20 +1,20 @@
 [workspace]
-members = ["macros", "attr"]
+members = ["macros", "attr", "ui", "cli", "xtask"]
 resolver = "2"
 
-# Post-ironwood dependency line. The whole zcash_* wallet stack now resolves
-# from crates.io at the ironwood versions zingolib `dev` pins (zcash_protocol
-# 0.10, zcash_client_backend 0.24.0-rc.1, zcash_keys 0.15, zcash_primitives
-# 0.29), so the librustzcash backend and the zingo backend share one copy of
-# each crate. The one required source override lives in `[patch.crates-io]` at
-# the end of this file (see there for why).
+# Post-ironwood dependency line: the whole zcash_* wallet stack resolves from
+# crates.io (zcash_protocol 0.10, zcash_client_backend 0.24.0-rc.1, zcash_keys
+# 0.15, zcash_primitives 0.29), one copy of each crate in the graph.
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-authors = ["Zingolabs <zingo@zingolabs.org>"]
+authors = ["Zingolabs <zingo@zingolabs.org>", "Eli Barbieri <elicbarbieri@gmail.com>"]
 repository = "https://github.com/zingolabs/ztest"
 homepage = "https://github.com/zingolabs/ztest"
+readme = "README.md"
+keywords = ["zcash", "kubernetes", "testing", "integration-test", "blockchain"]
+categories = ["development-tools::testing", "cryptography::cryptocurrencies"]
 version = "0.1.0"
 
 [workspace.dependencies]
@@ -35,10 +35,9 @@ serde_json = "1.0.132"
 hex = "0.4.3"
 reqwest = { version = "0.12", default-features = false }
 
-# Shared by ztest core (non-optional) and both wallet backends; the version
-# line must match zingolib dev's so `zcash_protocol` unifies to one copy across
-# the whole graph. `local-consensus` gives the `LocalNetwork` params type the
-# librustzcash backend runs regtest against.
+# Shared by ztest core (non-optional) and the librustzcash backend, one copy
+# across the graph. `local-consensus` = the `LocalNetwork` params type the
+# backend runs regtest against.
 zcash_protocol = { version = "0.10.0", features = ["local-consensus"] }
 
 # ─────────────────────────── ztest crate ──────────────────────────────
@@ -50,7 +49,27 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Boot Zcash topologies on Kubernetes and hand typed RPC handles back to test code."
+
+# Denylist, not an allowlist: a new compile-time input (`include_str!`,
+# `artifact!`) must ship or the crate will not build downstream.
+# `docker/`, `snapshots/` are exactly that, so they stay. `proto/` ships as the
+# source of truth for `cargo xtask regen-proto` (not read at build time).
+exclude = [
+    "docs/",
+    "tests/",
+    "fixtures/",
+    "scripts/",
+    "flake.nix",
+    "flake.lock",
+    "rust-toolchain.toml",
+    "rustfmt.toml",
+    "CLAUDE.md",
+    "result",
+]
 
 [lib]
 name = "ztest"
@@ -99,29 +118,8 @@ zcash_protocol = { workspace = true }
 prost = "0.14"
 tonic-prost = "0.14"
 
-# In-process wallet backend (`backends::zingo`). zingolib runs as a library in
-# the test binary against the pod-hosted indexer's gRPC. Pinned to `dev` (post-
-# ironwood); its crates.io zcash_* version lines are matched above so every
-# zcash_* / TxId copy unifies into a single version in the lockfile.
-zingolib = { git = "https://github.com/zingolabs/zingolib.git", rev = "b1fb8b1d57695e815ee64aa19ad0c09e3044e9f3", features = [
-    "testutils",
-], optional = true }
-pepper-sync = { git = "https://github.com/zingolabs/zingolib.git", rev = "b1fb8b1d57695e815ee64aa19ad0c09e3044e9f3", optional = true }
-# BIP-39 mnemonic type for `WalletBase::Mnemonic`, used by the inlined
-# `backends::zingo::client_builder` (replaces the one thing ztest used from
-# `zingolib_testutils`). Version MUST match zingolib dev's `bip0039` pin so the
-# `Mnemonic` type unifies into one copy.
+# BIP-39 mnemonic type for `WalletBase::Mnemonic`
 bip0039 = { version = "0.14", optional = true }
-# `ChainType::Regtest`'s `ActivationHeights` carrier: dev moved it out of
-# `zebra-chain` into this crate. Version tracks zingolib dev's `= "0.4.0"`.
-zingo_common_components = { version = "0.4.0", optional = true }
-# The gRPC `Indexer`/`TransparentIndexer` client the sync driver hands to
-# `pepper_sync::sync` (dev's `sync` is generic over the client trait). Same
-# zingolib repo/rev so its `CompactTxStreamerClient`/proto types unify.
-zingo-netutils = { git = "https://github.com/zingolabs/zingolib.git", rev = "b1fb8b1d57695e815ee64aa19ad0c09e3044e9f3", optional = true }
-zingo_test_vectors = { git = "https://github.com/zingolabs/infrastructure.git", tag = "zcash_local_net_v0.6.0", optional = true }
-# zingo-only (the in-process wallet backend); gated on the `zingo` feature.
-# `0.2` so it unifies with zingolib dev's `zip32 = "0.2.0"`.
 zip32 = { version = "0.2", optional = true }
 tempfile = { version = "3.2", optional = true }
 
@@ -131,8 +129,7 @@ tempfile = { version = "3.2", optional = true }
 # client; `bundled-prover` compiles the Sapling params into the binary so
 # send/shield need no external files.
 # Pinned exactly to `rc.1`: later rc's (up to rc.6) bump `zcash_keys` to 0.16,
-# which would split against zingolib dev's `zcash_keys = 0.15`. dev's own lock
-# pins `rc.1`, so ztest matches to keep one `zcash_keys`/`zcash_protocol` copy.
+# splitting `zcash_keys` into two copies in the graph.
 zcash_client_backend = { version = "=0.24.0-rc.1", features = ["sync", "orchard", "transparent-inputs"], optional = true }
 # orchard + transparent-inputs MUST match the backend's features, else sqlite's
 # cfg-gated Orchard/EphemeralTransparent handling is compiled out and its
@@ -144,8 +141,7 @@ zcash_primitives = { version = "0.29.0", optional = true }
 # The note-commitment-tree hash types (`sapling_crypto::Node`,
 # `orchard::tree::MerkleHashOrchard`) the sync tree-root oracle compares: the
 # wallet's `shard_trees` root against zaino's `TreeState` frontier, both parsed
-# with these exact crates. Versions track zingolib dev's lock so they unify to
-# one copy (no duplicate-type mismatch on the `==`).
+# with these exact crates (duplicate copies = a type mismatch on the `==`).
 sapling-crypto = { version = "0.7", optional = true }
 orchard = { version = "0.15", optional = true }
 secrecy = { version = "0.8", optional = true }
@@ -177,27 +173,22 @@ directories = "5"
 # already-compressed log + output store into a zip (STORE method, no re-deflate).
 zip = { version = "2", default-features = false }
 
+bytesize = "2.3.1"
 console = "0.16.4"
 owo-colors = "4.3.0"
 supports-color = "3.0.2"
 supports-unicode = "3.0.0"
-bytesize = "2.3.1"
-terminal_size = "0.4"
-portable-pty = "0.9"
 # `avt` is an in-memory VT emulator whose `feed_str` emits lines as they scroll
 # off the top — the mechanism the unified bottom console uses to forward child
 # output into native terminal scrollback while repainting a manual sticky footer
 # (see src/cli/console/mod.rs).
-avt = "0.18"
 libc = "0.2"
-clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 
 # `ztest run` shells out to `cargo nextest list` (inventory) and `cargo nextest
 # run` (the run, under the PTY console). `nextest-metadata` parses the
 # `cargo nextest list --json` summary into the `TestListSummary` the image
 # inventory phase consumes. Version tracks the installed `cargo nextest`.
 nextest-metadata = "0.14"
-dialoguer = { version = "0.12.0", default-features = false }
 prometheus-parse = "0.2.5"
 # S3 client for the Cloudflare R2 bucket holding `fixtures/chains/*.tar.zst`:
 # `storage::r2` reads seeds from it, and `ztest lfs-transfer` (the git-lfs
@@ -205,14 +196,8 @@ prometheus-parse = "0.2.5"
 # want; `fs` (the default) would just shadow `storage::local`.
 #
 # PINNED TO 0.13 ON PURPOSE — do not bump to 0.14 without reading this:
-#   * 0.14 requires `md-5 ^0.11` → `digest ^0.11`, which cannot coexist with
-#     the exact `digest = "=0.11.0-pre.9"` that bip32 0.6.0-pre.1 pins via
-#     pepper-sync ← zingolib. Cargo cannot resolve it at all.
-#   * 0.14 also moves to `reqwest ^0.13`, which would put a *second* reqwest
-#     in the graph alongside the 0.12 the rest of ztest uses.
-# 0.13 takes `md-5 ^0.10.6` and `reqwest ^0.12`, so it unified into the
-# existing tree at a cost of four crates total. Revisit when zingolib's
-# wallet stack leaves the `digest` pre-releases behind.
+#   * 0.14 moves to `reqwest ^0.13`, which would put a *second* reqwest in the
+#     graph alongside the 0.12 the rest of ztest uses.
 object_store = { version = "0.13.1", default-features = false, features = ["aws"] }
 ztest_attr.workspace = true
 # Source scanning for `#[ztest::sync_test]` (`pipeline::profiles`). The version
@@ -225,14 +210,15 @@ proc-macro2 = { workspace = true, features = ["span-locations"] }
 
 [features]
 default = ["librustzcash"]
+# Test-only surface (event encoders, fixtures) for sibling crates' tests. `cfg(test)` does
+# not cross a crate boundary, so the controller tests in `ztest_cli` opt in through this.
+test-util = []
 # In-process librustzcash wallet backend (`backends::librustzcash`,
-# `Wallet::librustzcash`) — ztest's default, batteries-included wallet. A
-# pure-Rust `zcash_client_backend` + `zcash_client_sqlite` wallet that syncs
-# over the indexer's lightwalletd gRPC and builds shielded txs with bundled
-# Sapling params (`zcash_proofs/bundled-prover`) + embedded Orchard params, so
-# it needs no external param files, no zingolib, no zcash_local_net, no zebra,
-# and no `libstdc++`. Unlike the eager-memo-parsing zingolib sync engine, its
-# scanner stores raw memo bytes, so it tolerates non-UTF-8 coinbase memos.
+# `Wallet::librustzcash`) — ztest's only wallet, on by default. Pure-Rust
+# `zcash_client_backend` + `zcash_client_sqlite`, syncing over the indexer's
+# lightwalletd gRPC; bundled Sapling params (`zcash_proofs/bundled-prover`) +
+# embedded Orchard params, so no external param files and no `libstdc++`.
+# Raw memo bytes stored → non-UTF-8 coinbase memos tolerated.
 # Walletless consumers can drop it with `default-features = false`.
 librustzcash = [
     "dep:zcash_client_backend",
@@ -251,22 +237,6 @@ librustzcash = [
     "dep:sapling-crypto",
     "dep:orchard",
 ]
-# In-process zingolib wallet backend (`backends::zingo`, `Wallet::zingo`).
-# OFF by default so consumers that only drive validators/indexers (e.g. zaino's
-# walletless-tests) don't link zingolib. The backend links `zingolib` proper
-# only — NOT `zingolib_testutils`, whose sole use here (`ClientBuilder`) is
-# inlined in `backends::zingo::client_builder`, keeping `zcash_local_net` /
-# `zebra-consensus` / the C++ `libzcash_script` out of the graph entirely.
-zingo = [
-    "dep:zingolib",
-    "dep:pepper-sync",
-    "dep:zingo_common_components",
-    "dep:zingo-netutils",
-    "dep:zingo_test_vectors",
-    "dep:zip32",
-    "dep:tempfile",
-    "dep:bip0039",
-]
 
 [dev-dependencies]
 # Property testing for the pure admission core: the scheduler is a
@@ -278,19 +248,3 @@ proptest = "1"
 # `test-util` gives the paused/auto-advancing clock the sync-runner probe tests
 # use to exercise cadences/windows deterministically without real waiting.
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
-
-[build-dependencies]
-# Codegen for the vendored lightwalletd proto in `proto/` → `src/proto`.
-# Needs `protoc` at build time (provided by the dev shell, see flake.nix).
-tonic-prost-build = "0.14"
-
-# zingolib/pepper-sync (the `zingo` backend) reference `lightwallet-protocol`
-# from crates.io, but rely on a `[patch.crates-io]` in their own workspace to
-# pull a git rev carrying the Ironwood (NU6.3) proto fields
-# (`CompactTx.ironwoodActions`, `TreeState.ironwoodTree`, etc.). A `[patch]` only
-# takes effect from the root workspace, so ztest — the root — must replicate it,
-# or pepper-sync fails to compile against the field-less published crate. The
-# `rebuild-proto` feature (enabled transitively by the workspace) regenerates the
-# bindings from the Ironwood `.proto` files at build time (needs `protoc`).
-[patch.crates-io]
-lightwallet-protocol = { git = "https://github.com/zingolabs/lightwallet-protocol-rust", rev = "9bdfdc77eb283f2a3d26c27100cc2ac90148cd93" }

@@ -104,22 +104,10 @@ rolled-own scanner would test nothing real. Rolling our own is rejected with
 prejudice; if intra-scan-loop determinism is ever needed, the correct move is
 upstreaming a fault/progress callback into pepper-sync, not forking it.
 
-**Integrate directly with `pepper_sync::sync`, below zingolib's `LightClient`.**
-zingolib's `LightClient::sync_and_await()` (the current call in
-`src/backends/zingo.rs`) hides all four seams. Driving `sync` directly lets
-ztest own the client (→ chaos), `sync_mode` (→ stop/checkpoint), and the wallet
-lock (→ status on our schedule), while **renting** zingolib's `LightWallet` as
-the `W` impl (those six storage traits are shard trees + note stores; ztest
-already constructs a `LightWallet` in `build_light_client`). The `W` sits behind
-a ztest seam so pepper-sync's own `mocks.rs` test wallet, or a future
-non-zingolib wallet, can slot in.
-
-`params: P: consensus::Parameters` **is the unified network carrier.** zingolib's
-`ChainType` already implements `consensus::Parameters` for all three networks, so
-`ChainType::{Mainnet, Testnet, Regtest(configured)}` passes straight into `sync`
-and the `load_clientconfig` + `LightClient` detour disappears. `ChainType` stays
-inside the `zingo`-gated backend; the ztest-neutral `Network`/`ChainParams` at
-the `WalletBackend` boundary maps to it.
+> **Superseded.** The wallet-side integration described in this section was
+> reworked onto a per-backend observable `SyncSubject` (`LrzSyncSubject`, in
+> `src/backends/librustzcash.rs`). The engine study above is retained as
+> background on what a sync engine must expose; it is not the shipped design.
 
 Two gotchas, pinned:
 
@@ -294,7 +282,7 @@ async fn test_state_sync(mut run: SyncRunner) -> SyncOutcome {
         let zeb = t.add_validator(Validator::zebrad("1.9.1").regtest()
             .mount(mount_archive!("tests/assets/zebrad-testnet-1M.tar.zst", "/cache")));  // cached-state seed
         let zai = t.add_indexer(Indexer::zaino("0.4.0").peer("zeb"));
-        let wal = t.add_wallet(Wallet::zingo());
+        let wal = t.add_wallet(Wallet::librustzcash());
         (zeb, zai, wal)
     }).await?;
     run.sync(Subject::wallet(account).performance(PerformanceLevel::High));

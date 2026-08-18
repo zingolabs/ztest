@@ -2,7 +2,7 @@
 //!
 //! - Pure-Rust `zcash_client_backend` + `zcash_client_sqlite` in the test binary
 //! - Raw memo bytes stored, tolerating zebra's non-UTF-8 shielded-coinbase memos
-//!   (zingolib's pepper-sync parses each memo mid-scan and aborts on a malformed one)
+//!   (an eager mid-scan memo parse aborts the whole sync on a malformed one)
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;

@@ -84,8 +84,8 @@ the delivery.
   historical reason (a `?`-return skipping teardown) is moot — the laptop tears
   down unconditionally after the pod finishes, and `reap_run` covers a laptop
   crash. This is why the runner image no longer carries `kubectl`.
-- **glibc-dynamic only.** `zingo` links `libstdc++` at runtime, so musl is out;
-  the compile and runtime stages both pin Debian `bookworm` for one glibc.
+- **glibc-dynamic only.** Compile and runtime stages both pin Debian `bookworm`
+  for one glibc.
 - **On-cluster BuildKit runs rootless**, on upstream's documented Kubernetes
   posture: the `-rootless` image, uid 1000, `--oci-worker-no-process-sandbox`,
   and Unconfined seccomp/AppArmor. No `privileged`, no `hostUsers: false`, no

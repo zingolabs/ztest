@@ -20,20 +20,21 @@ use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use kube::runtime::wait::await_condition;
 use serde_json::{Value, json};
 
+use crate::naming::RUN_NAMESPACE;
 use crate::qos::{LABEL_RUN_ID, LABEL_USER};
-use crate::resource::impls::policy::{BUILDKIT_SERVICE_ACCOUNT, RUN_NAMESPACE, manifest_hash};
+use crate::resource::impls::policy::{BUILDKIT_SERVICE_ACCOUNT, manifest_hash};
 use crate::resource::kube::FIELD_MANAGER;
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 
 /// Pinned rootless BuildKit image. Entrypoint = `rootlesskit buildkitd`, so give
 /// the container `args` and never `command` (overriding drops the user namespace)
-pub(crate) const BUILDKIT_IMAGE: &str = "moby/buildkit:v0.18.2-rootless";
+pub const BUILDKIT_IMAGE: &str = "moby/buildkit:v0.18.2-rootless";
 /// uid the rootless image ships; sole writer of its `$HOME`/`XDG_RUNTIME_DIR`
 const BUILDKIT_UID: i64 = 1000;
 /// Rootless socket, not the rootful `/run/buildkit/buildkitd.sock` `buildctl`
 /// defaults to. Exported as `BUILDKIT_HOST` so probe + `exec`d `buildctl` inherit it
 const BUILDKIT_ADDR: &str = "unix:///run/user/1000/buildkit/buildkitd.sock";
-pub(crate) const BUILDKIT_CONTAINER: &str = "buildkit";
+pub const BUILDKIT_CONTAINER: &str = "buildkit";
 const BUILDKIT_COMPONENT: &str = "ztest.io/component";
 /// [`wait_build_pod_ready`] budget for buildkitd to answer
 const READY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -48,7 +49,7 @@ const BUILDKIT_CACHE_PVC: &str = "ztest-buildkit-cache";
 const BUILDKIT_CONFIG: &str = "ztest-buildkit-config";
 const BUILDKIT_CONFIG_PATH: &str = "/etc/buildkit/buildkitd.toml";
 /// Build-context unpack dir: `emptyDir`, source-only, per-build
-pub(crate) const WORK_MOUNT: &str = "/build";
+pub const WORK_MOUNT: &str = "/build";
 /// BuildKit state dir (content store + snapshots + `--mount=type=cache`), under
 /// the rootless daemon's `$HOME` not `/var/lib/buildkit`. Cache PVC mounts here.
 ///
@@ -56,7 +57,7 @@ pub(crate) const WORK_MOUNT: &str = "/build";
 /// builder-local and no registry cache backend exports them
 const BUILDKIT_STATE_DIR: &str = "/home/user/.local/share/buildkit";
 /// Escape hatch for the cache PVC; absent = the profile's `storage_driver`
-/// (see [`crate::resource::impls::storage::plain_class`])
+/// (see [`crate::storage_class::plain_class`])
 const CACHE_CLASS_ENV: &str = "ZTEST_BUILDKIT_STORAGE_CLASS";
 
 fn cache_size() -> String {
@@ -212,7 +213,7 @@ fn pod_spec(cpu: &str, mem: &str) -> Value {
 /// - Footprint must already be covered by a ledger reservation
 ///   ([`Reserve::Fixed`](crate::qos::ledger::Reserve::Fixed)); unbudgeted lands a
 ///   builder on memory admission already promised to tests
-pub(crate) async fn create_build_pod(
+pub async fn create_build_pod(
     client: &kube::Client,
     run_id: &str,
     user: &str,
@@ -247,10 +248,7 @@ pub(crate) async fn create_build_pod(
 
 /// Block until the pod's `Ready` condition is `True` (buildkitd answers
 /// `buildctl debug workers`), or fail after [`READY_TIMEOUT`]
-pub(crate) async fn wait_build_pod_ready(
-    client: &kube::Client,
-    name: &str,
-) -> Result<(), ResourceError> {
+pub async fn wait_build_pod_ready(client: &kube::Client, name: &str) -> Result<(), ResourceError> {
     let api: Api<Pod> = Api::namespaced(client.clone(), RUN_NAMESPACE);
     // Wake on either terminal state: `restartPolicy: Never` means a crashed or
     // unschedulable pod never recovers, so report it instead of spinning to timeout
@@ -317,7 +315,7 @@ fn pod_failed(p: &Pod) -> Option<String> {
 /// - Force-delete past [`POD_TEARDOWN_TIMEOUT`] (leaked mounts wedge `Terminating`
 ///   forever, and a lingering pod holds its Guaranteed footprint)
 /// - Best-effort: single-use throwaway, durable state on the cache PVC
-pub(crate) async fn delete_build_pod(client: &kube::Client, name: &str) {
+pub async fn delete_build_pod(client: &kube::Client, name: &str) {
     let api = Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE);
     if api.delete(name, &DeleteParams::default()).await.is_err() {
         return;
@@ -340,7 +338,7 @@ fn pod_ready(p: &Pod) -> bool {
 /// provisioned by `ztest cluster setup`; reserves no CPU/memory (pod is ephemeral —
 /// [`create_build_pod`])
 #[derive(Debug)]
-pub(crate) struct BuildkitProvider;
+pub struct BuildkitProvider;
 
 #[async_trait]
 impl Provider for BuildkitProvider {
@@ -406,7 +404,7 @@ impl Provider for BuildkitProvider {
             "accessModes": ["ReadWriteOnce"],
             "resources": { "requests": { "storage": cache_size() } },
         });
-        if let Some(class) = super::storage::plain_class(&cx.client, CACHE_CLASS_ENV).await {
+        if let Some(class) = crate::storage_class::plain_class(&cx.client, CACHE_CLASS_ENV).await {
             spec["storageClassName"] = json!(class);
         }
         let pvc: PersistentVolumeClaim = serde_json::from_value(json!({

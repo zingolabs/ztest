@@ -16,8 +16,8 @@ use super::{LABEL_USER, Resources};
 /// Denormalized index keys. The JSON blob is the record; these three exist so the ledger's
 /// hot path ([`reservation_of`](super::ledger), [`kind_of`]) can classify and sum a lease
 /// without parsing it. Written from the same [`Beacon`], never edited independently
-pub(crate) const ANN_RESERVE_CPU: &str = "ztest.io/reserve-cpu-milli";
-pub(crate) const ANN_RESERVE_MEM: &str = "ztest.io/reserve-mem-bytes";
+pub const ANN_RESERVE_CPU: &str = "ztest.io/reserve-cpu-milli";
+pub const ANN_RESERVE_MEM: &str = "ztest.io/reserve-mem-bytes";
 const ANN_KIND: &str = "ztest.io/kind";
 
 /// The record: one [`Beacon`] as JSON

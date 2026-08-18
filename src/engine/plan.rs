@@ -52,7 +52,7 @@ impl ResourceDeps {
 
 /// Crate-rooted QoS `test_id` → libtest name (`qos_attr::marker_basic` → `marker_basic`).
 /// Exact within a binary: the dump is per-binary, so segment 1 is always that crate
-pub(crate) fn libtest_name(test_id: &str) -> &str {
+pub fn libtest_name(test_id: &str) -> &str {
     test_id.split_once("::").map_or(test_id, |(_crate, rest)| rest)
 }
 
@@ -152,9 +152,9 @@ pub fn drop_sync_tests(
 /// QoS dump indexed for [`declared_qos`]: `binary_id` → libtest name → declaration
 ///
 /// - Whole entry, not just class (dropping the override here = every item at tier default)
-fn tiers_by_binary<'a>(
-    qos_by_binary: &'a [(String, Vec<QosEntry>)],
-) -> HashMap<&'a str, HashMap<&'a str, &'a QosEntry>> {
+fn tiers_by_binary(
+    qos_by_binary: &[(String, Vec<QosEntry>)],
+) -> HashMap<&str, HashMap<&str, &QosEntry>> {
     qos_by_binary
         .iter()
         .map(|(binary_id, entries)| {
@@ -229,19 +229,8 @@ mod tests {
         }
     }
 
-    use crate::inventory::FootprintDecl;
-
     fn entry(test_id: &str, class: QosClass) -> QosEntry {
         QosEntry { test_id: test_id.to_string(), class, footprint: None }
-    }
-
-    /// [`entry`] + a `footprint = ".."` override
-    fn entry_with(test_id: &str, class: QosClass, cpu_milli: u64, mem_bytes: u64) -> QosEntry {
-        QosEntry {
-            test_id: test_id.to_string(),
-            class,
-            footprint: Some(FootprintDecl { cpu_milli, mem_bytes }),
-        }
     }
 
     fn sync_entry(test_id: &str, name: &str) -> SyncTestEntry {

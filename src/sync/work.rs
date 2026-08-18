@@ -299,7 +299,7 @@ impl Segment {
 
     /// Human form: `regtest 840,000..855,000`
     pub fn describe(&self) -> String {
-        use crate::ui::text::thousands;
+        use crate::fmt::thousands;
         format!(
             "{} {}..{}",
             self.network.as_deref().unwrap_or("unknown-network"),
@@ -327,11 +327,7 @@ mod op_keyed {
     use serde::ser::{Serialize, SerializeMap, Serializer};
     use std::collections::BTreeMap;
 
-    pub(super) fn serialize<S, T>(
-        values: &[T; Op::COUNT],
-        known: OpSet,
-        s: S,
-    ) -> Result<S::Ok, S::Error>
+    pub fn serialize<S, T>(values: &[T; Op::COUNT], known: OpSet, s: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
         T: Serialize,
@@ -345,7 +341,7 @@ mod op_keyed {
         map.end()
     }
 
-    pub(super) fn deserialize<'de, D, T>(d: D) -> Result<([T; Op::COUNT], OpSet), D::Error>
+    pub fn deserialize<'de, D, T>(d: D) -> Result<([T; Op::COUNT], OpSet), D::Error>
     where
         D: Deserializer<'de>,
         T: Deserialize<'de> + Copy + Default,

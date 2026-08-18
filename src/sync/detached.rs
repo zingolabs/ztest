@@ -4,11 +4,11 @@
 //! - Driver pod runs the ordinary `#[ztest::sync_test]` body, detached, marked by
 //!   [`SYNC_ID_ENV`]
 //! - Body then watches [`STOP_ANNOTATION`] → engine cancel (checkpoint, not kill),
-//!   and mirrors its report to a ConfigMap in [`OBS_NAMESPACE`](crate::resource::OBS_NAMESPACE),
+//!   and mirrors its report to a ConfigMap in [`OBS_NAMESPACE`](crate::naming::OBS_NAMESPACE),
 //!   beside the metrics + profiles of the same run (one record, one lifetime)
 //! - Every locator (labels, annotation, namespace, CM name) lives here, so the two
 //!   sides cannot drift
-//! - Compiled unconditionally; the in-pod runtime runs only in the `zingo` binary
+//! - Compiled unconditionally; in-pod runtime runs only in the consumer's test binary
 
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,25 @@ pub fn driver_pod_for(sync_id: &str) -> String {
     format!("ztest-sync-{sync_id}")
 }
 
+/// Profiler ConfigMap for a sync — one name, derived twice (collector builds it, unwind deletes it)
+pub fn profiler_config_name(sync_id: &str) -> String {
+    format!("{}-profiler", driver_pod_for(sync_id))
+}
+
+/// Driver pod still running (neither `Succeeded` nor `Failed`); absent = run over, which is what
+/// a host-placed collector's lifetime is pinned to (nothing resident survives to stop it)
+pub async fn driver_is_live(client: &kube::Client, id: &str) -> bool {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::Api;
+    let ns = crate::naming::RUN_NAMESPACE;
+    let Ok(Some(pod)) =
+        Api::<Pod>::namespaced(client.clone(), ns).get_opt(&driver_pod_for(id)).await
+    else {
+        return false;
+    };
+    !matches!(pod.status.and_then(|s| s.phase).as_deref(), Some("Succeeded") | Some("Failed"))
+}
+
 /// ConfigMap key the report JSON is stored under, read and written through this one name
 pub const REPORT_KEY: &str = "report.json";
 
@@ -67,13 +86,13 @@ pub fn report_cm_name(sync_id: &str) -> String {
 /// Pyroscope profiles of the same run (reclaimed with them by `ztest cleanup`, never with
 /// the sync's own namespace)
 pub fn report_cm_namespace() -> &'static str {
-    crate::resource::OBS_NAMESPACE
+    crate::naming::OBS_NAMESPACE
 }
 
 /// Driver pod, by sync id. Reads the *run* namespace, never the sync's own — the driver
 /// is a runner pod, and a sync-scoped lookup silently finds nothing
 pub async fn find_driver(client: &kube::Client, sync_id: &str) -> Result<Pod, String> {
-    let run_ns = crate::resource::impls::policy::RUN_NAMESPACE;
+    let run_ns = crate::naming::RUN_NAMESPACE;
     let pod = driver_pod_for(sync_id);
     kube::Api::<Pod>::namespaced(client.clone(), run_ns)
         .get_opt(&pod)
@@ -108,7 +127,7 @@ pub fn active_sync_id() -> Option<String> {
 /// Publish a provisioning milestone; no-op off a detached sync. Not a
 /// [`SyncReporter`](crate::sync::SyncReporter) hook — these minutes are spent
 /// inside `TestEnv::build`, before any engine or reporter exists
-pub(crate) fn note_setup(phase: &str, component: Option<&str>, detail: &str) {
+pub fn note_setup(phase: &str, component: Option<&str>, detail: &str) {
     if active_sync_id().is_none() {
         return;
     }

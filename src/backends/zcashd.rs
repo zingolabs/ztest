@@ -6,15 +6,16 @@ use crate::topology::ActivationHeights;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::handles::client::{
-    AuthedRpc, JsonRpcClient, json_rpc_with_basic_auth, wait_for_rpc_ready,
-};
+use crate::handles::HandleInner;
 use crate::handles::validator::{
     BlockHash, BlockHeight, BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, PeerInfo,
     PoolSupport, ValidatorBackend, ValidatorConfig,
 };
 use crate::handles::wallet::Pool;
-use crate::handles::{Endpoint, HandleInner};
+use crate::protocol::Endpoint;
+use crate::protocol::client::{
+    AuthedRpc, JsonRpcClient, json_rpc_with_basic_auth, wait_for_rpc_ready,
+};
 use crate::protocol::zcash_rpc::ZcashRpc;
 use crate::{EnvError, RpcError};
 
@@ -22,8 +23,8 @@ const COMPONENT: &str = "zcashd";
 
 // Fixed Basic Auth for zcashd's regtest JSON-RPC. Not a secret: throwaway values in
 // the generated `zcash.conf`, and the node is reachable only inside the test namespace
-pub(crate) const RPC_USER: &str = "test";
-pub(crate) const RPC_PASSWORD: &str = "test";
+pub const RPC_USER: &str = "test";
+pub const RPC_PASSWORD: &str = "test";
 
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -46,9 +47,9 @@ fn miner_address(pool: Pool) -> &'static str {
     }
 }
 
-/// A [`Dev`](crate::backends::image::ImageSpec::Dev) override never degrades to the
+/// A [`Dev`](crate::inventory::ImageSpec::Dev) override never degrades to the
 /// published tag — unbuilt fails `DevImageMissing`
-pub(crate) fn image_uri(
+pub fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
     let default_image = format!("electriccoinco/zcashd:{}", opts.version);
@@ -150,10 +151,10 @@ impl ValidatorBackend for ZcashdValidator {
             label: COMPONENT,
             image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
             ports: crate::manifest::merge_ports(
-                &[("rpc", crate::handles::ports::ZCASHD_RPC)],
+                &[("rpc", crate::ports::ZCASHD_RPC)],
                 &opts.extra_ports,
             ),
-            ready_port: crate::handles::ports::ZCASHD_RPC,
+            ready_port: crate::ports::ZCASHD_RPC,
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources,
@@ -318,7 +319,7 @@ impl ValidatorBackend for ZcashdValidator {
     }
 }
 
-const RPC_PORT: u16 = crate::handles::ports::ZCASHD_RPC;
+const RPC_PORT: u16 = crate::ports::ZCASHD_RPC;
 
 // ──────────────────── zcashd-only typed JSON-RPC views ─────────────────
 //

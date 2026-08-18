@@ -21,7 +21,7 @@ pub const FIELD_MANAGER: &str = "ztest";
 ///
 /// Objects are built, never vendored as YAML text — compiler checks the shape, and
 /// there is no indentation to get wrong
-pub(crate) async fn apply<K>(api: &Api<K>, obj: &K, context: &str) -> Result<(), String>
+pub async fn apply<K>(api: &Api<K>, obj: &K, context: &str) -> Result<(), String>
 where
     K: Resource + Clone + std::fmt::Debug + Serialize + DeserializeOwned,
 {
@@ -37,7 +37,7 @@ where
 ///
 /// Backend rollout != serving: the pod passes its own readiness probe before the
 /// aggregation layer has proxied anything, so this is the only truthful signal
-pub(crate) async fn wait_api_service_available(
+pub async fn wait_api_service_available(
     client: &Client,
     name: &str,
     timeout: Duration,
@@ -57,7 +57,7 @@ pub(crate) async fn wait_api_service_available(
 
 /// Wait for a CRD to reach `Established=True`. `no_wait` returns at once (caller
 /// accepts a later apply failing until the API server catches up)
-pub(crate) async fn wait_crd_established(
+pub async fn wait_crd_established(
     client: &Client,
     name: &str,
     timeout: Duration,
@@ -76,7 +76,7 @@ pub(crate) async fn wait_crd_established(
 }
 
 /// Wait for a Deployment's `.status.availableReplicas >= .spec.replicas`.
-pub(crate) async fn wait_deployment_available(
+pub async fn wait_deployment_available(
     client: &Client,
     namespace: &str,
     name: &str,
@@ -98,7 +98,7 @@ pub(crate) async fn wait_deployment_available(
 }
 
 /// Wait for a StatefulSet's `.status.readyReplicas >= .spec.replicas`.
-pub(crate) async fn wait_statefulset_ready(
+pub async fn wait_statefulset_ready(
     client: &Client,
     namespace: &str,
     name: &str,
@@ -115,18 +115,6 @@ pub(crate) async fn wait_statefulset_ready(
         .map_err(|_| format!("timeout waiting for StatefulSet {namespace}/{name} to become Ready"))?
         .map_err(|e| format!("wait for StatefulSet {namespace}/{name}: {e}"))
         .map(|_| ())
-}
-
-/// Idempotent-delete guard: 404, or a "not found" string fallback for the wrapper
-/// variants that differ across kube versions
-pub(crate) fn is_not_found(err: &kube::Error) -> bool {
-    match err {
-        kube::Error::Api(resp) => resp.code == 404,
-        other => {
-            let s = other.to_string();
-            s.contains("not found") || s.contains("404")
-        }
-    }
 }
 
 // ── Conditions ─────────────────────────────────────────────────────────

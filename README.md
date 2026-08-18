@@ -51,7 +51,6 @@ use ztest::prelude::*;
 
 #[rstest::rstest]
 #[case::librustzcash(Wallet::librustzcash())]
-#[case::zingo(Wallet::zingo())]
 #[case::zallet(Wallet::zallet())]
 #[tokio::test(flavor = "multi_thread")]
 #[ztest::qos::wallet]
@@ -73,14 +72,13 @@ where
 }
 ```
 
-Each `#[case]` is a distinct wallet *type* (`Wallet<LrzBackend>`,
-`Wallet<ZingoBackend>`, …), so the body is generic over the backend and
+Each `#[case]` is a distinct wallet *type* (`Wallet<LrzBackend>`, …), so the
+body is generic over the backend and
 `WalletExt` supplies the well-known seeds, funded faucet and recipient for every
 one of them. `ztest run` names the cases
 `ironwood_fetch_parity::case_1_librustzcash`, … and each inherits the tier
 declared on the parent fn.
 
-`Wallet::zingo()` needs the `zingo` feature (`librustzcash` is the default).
 `Wallet::zallet()` is not implemented yet — drop that case until the zallet
 backend lands.
 
@@ -112,7 +110,7 @@ let zai = t.add_indexer(dev!(Indexer::Zainod, "../Dockerfile"));
 ```
 
 Accepted variants: `Validator::Zebrad`, `Validator::Zcashd`,
-`Indexer::Zainod`, `Wallet::Zingo`.
+`Indexer::Zainod`, `Wallet::librustzcash`.
 
 ## Long-running syncs
 

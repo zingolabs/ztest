@@ -140,9 +140,80 @@ pub fn current_package() -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum NamingError {}
 
+/// Namespace every run's pods land in
+pub const RUN_NAMESPACE: &str = "ztest";
+
+/// ServiceAccount those pods run as
+pub const RUN_SERVICE_ACCOUNT: &str = "ztest";
+
+/// Image repo of the baked tests image (`docs/design-remote-execution.md`)
+pub const RUNNER_REPO: &str = "ztest-runner";
+
+/// Marks ztest's tenants apart in a Pyroscope an operator may share
+pub const TENANT_PREFIX: &str = "ztest";
+/// Upstream tenant-id ceiling, bytes
+pub const TENANT_MAX: usize = 150;
+
+/// Pyroscope tenant: `ztest.<user>.<id>`, id = sync id else run id.
+///
+/// - Derived, never looked up (retirement outlives the namespace)
+/// - `.` = separator → escaped out of both parts
+/// - Charset ≤150 bytes, alphanumeric + `!-_.*'()`, no `/`, no whitespace
+pub fn profile_tenant(user: &str, sync_id: &str) -> String {
+    let part = |s: &str| -> String {
+        s.chars()
+            .map(|c| match c {
+                c if c.is_ascii_alphanumeric() => c,
+                '-' | '_' => c,
+                _ => '_',
+            })
+            .collect()
+    };
+    let tenant = format!("{TENANT_PREFIX}.{}.{}", part(user), part(sync_id));
+    // collision-safe: sync id carries its own random suffix, far inside the cap
+    tenant.chars().take(TENANT_MAX).collect()
+}
+
+/// Namespace for the whole observability stack: fixed, cluster-lifetime, owned by
+/// `ztest cluster setup`. Never per-run (the record must outlive the run that produced it)
+pub const OBS_NAMESPACE: &str = "ztest-obs";
+
+pub const PROMETHEUS_SERVICE: &str = "ztest-prometheus";
+pub const PYROSCOPE_SERVICE: &str = "ztest-pyroscope";
+pub const GRAFANA_SERVICE: &str = "ztest-grafana";
+
+/// Namespace handle threaded into the resource helpers in `mounts.rs` and `seeds.rs`.
+/// Per-test namespaces cascade on delete → no owner-references needed
+#[derive(Debug, Clone)]
+pub struct Sentinel {
+    pub namespace: String,
+}
+
+impl Sentinel {
+    /// Handle for an existing namespace; no API calls
+    pub fn new(namespace: String) -> Self {
+        Self { namespace }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `.` = separator → neither part may contribute one (else two syncs collide)
+    #[test]
+    fn a_tenant_escapes_the_separator_out_of_both_parts() {
+        assert_eq!(profile_tenant("eli.b", "zaino.a52f"), "ztest.eli_b.zaino_a52f");
+        assert_eq!(profile_tenant("elicb", "zaino-a52f"), "ztest.elicb.zaino-a52f");
+    }
+
+    /// Charset is upstream-enforced: `/` and whitespace are rejected outright
+    #[test]
+    fn a_tenant_carries_no_character_pyroscope_rejects() {
+        let t = profile_tenant("dept/eng team", "sync id");
+        assert!(t.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)), "got {t}");
+        assert!(profile_tenant(&"x".repeat(400), "abc").len() <= TENANT_MAX);
+    }
 
     #[test]
     fn slug_is_dns_safe_and_bounded() {

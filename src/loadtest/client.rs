@@ -80,6 +80,6 @@ impl LwdClient {
 
 /// 32-byte hash out of a protobuf `bytes` field, `None` on wrong length (chain-link oracle
 /// rejects malformed hashes without panicking)
-pub(crate) fn copy_hash(bytes: &[u8]) -> Option<[u8; 32]> {
+pub fn copy_hash(bytes: &[u8]) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(bytes).ok()
 }

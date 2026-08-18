@@ -12,6 +12,8 @@
 //!   live and another in the report
 //! - Knows nothing of syncs/ticks/probes/verdicts — consumers call in
 
+pub use crate::fmt::Unit;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -41,32 +43,11 @@ pub enum Reduce {
     MeanMs,
 }
 
-/// What a reduced value *is*, so a reader renders it and a range query derives it
-/// without a per-row special case at either end.
-///
-/// - `PerSec` = family is cumulative on the wire; the meaningful reading is its
-///   derivative, so a series query differentiates before plotting
-/// - `Fraction` = seconds-per-second, i.e. dimensionless in 0..1 (PSI stall); rendered
-///   `%`, never `/s` — the ratio's denominator is the same clock as its numerator
-/// - `BytesPerSec` = throughput; IEC magnitude like `Bytes` (`412.0 MiB/s`), since
-///   `compact`'s decimal `412M/s` names a different quantity than the byte axis above it
-/// - Rest are already the quantity named; the query is the reduction alone
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unit {
-    Count,
-    PerSec,
-    Fraction,
-    Bytes,
-    BytesPerSec,
-    Millis,
-    Cores,
-}
-
 /// Which reading a row belongs to, so a renderer groups by meaning rather than by
 /// matching family names it would have to hardcode per backend.
 ///
 /// - `Transparent`/`Shielded` rows are per-pool and stack: `label` = the pool, keyed by
-///   [`Palette::pools`](crate::ui::plot::Palette::pools). Split because the two answer
+///   `ztest_ui`'s pool palette. Split because the two answer
 ///   different questions (utxo churn vs note-commitment work) and share no scale
 /// - Container cpu/mem carries no facet (kubelet's, not a component's)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,7 +192,7 @@ mod tests {
 
     /// zaino-shaped exposition: counter across two label sets, gauge, summary, as
     /// `metrics-exporter-prometheus` emits
-    pub(crate) const EXPOSITION: &str = "\
+    pub const EXPOSITION: &str = "\
 # HELP zaino_grpc_requests_total Total gRPC requests
 # TYPE zaino_grpc_requests_total counter
 zaino_grpc_requests_total{method=\"GetBlock\"} 12
@@ -224,7 +205,7 @@ zaino_grpc_request_duration_seconds_sum 0.85
 zaino_grpc_request_duration_seconds_count 17
 ";
 
-    pub(crate) fn exposition(texts: &[&str]) -> Exposition {
+    pub fn exposition(texts: &[&str]) -> Exposition {
         let mut e = Exposition::default();
         for t in texts {
             e.absorb(t);

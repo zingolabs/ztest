@@ -31,11 +31,11 @@ use serde_json::json;
 use crate::EnvError;
 use crate::error::env_err;
 use crate::inventory::SeedEntry;
-use crate::resource::NodeProgress;
+use crate::progress::{Silent, StepProgress};
 use crate::seeds::{self, SEEDS_NAMESPACE, SeedHandle, volume_snapshot_gvk};
 use crate::storage::{self, r2::Bucket};
 
-pub(crate) mod progress;
+pub mod progress;
 
 const WAIT_INTERVAL: Duration = Duration::from_secs(2);
 const WAIT_BUDGET: Duration = Duration::from_secs(300);
@@ -73,7 +73,7 @@ fn pull_budget(bytes: u64) -> Duration {
 pub async fn provision_seed(
     client: &Client,
     seed: &SeedEntry,
-    progress: &NodeProgress,
+    progress: &dyn StepProgress,
 ) -> Result<SeedHandle, EnvError> {
     // Fail fast, not via an unschedulable PVC polled out to `WAIT_BUDGET`
     // (classic: a stock kind cluster with no CSI snapshot support)
@@ -117,7 +117,7 @@ pub async fn provision_seed(
 
 /// CSI driver this run's storage resolves to — the other half of a seed's identity
 async fn selected_driver(client: &Client) -> Result<String, EnvError> {
-    crate::resource::selected_storage(client)
+    crate::storage_class::selected(client)
         .await
         .map(|s| s.provisioner.clone())
         .map_err(|reason| EnvError::Manifest { reason })
@@ -144,7 +144,7 @@ pub async fn await_seed(client: &Client, handle: crate::Artifact) -> Result<Seed
     }
     wait_pvc_ready(client, &pvc_name).await?;
     // Test side: no console row (`NodeProgress::default` → nowhere)
-    wait_snapshot_ready(client, &pvc_name, &NodeProgress::default()).await?;
+    wait_snapshot_ready(client, &pvc_name, &Silent).await?;
     seeds::read_seed_handle(client, handle.name, handle.oid, &driver).await
 }
 
@@ -155,7 +155,7 @@ pub async fn await_seed(client: &Client, handle: crate::Artifact) -> Result<Seed
 async fn check_seed_support(client: &Client, archive: &str) -> Result<(), EnvError> {
     // Same join as `ztest cluster check` (StorageClass whose provisioner a
     // VolumeSnapshotClass backs) → passing `check` cannot fail here
-    crate::resource::selected_storage(client)
+    crate::storage_class::selected(client)
         .await
         .map(|_| ())
         .map_err(|why| unsupported(archive, why))
@@ -198,9 +198,9 @@ async fn create_seed_pvc(
     client: &Client,
     pvc_name: &str,
     seed: &SeedEntry,
-    progress: &NodeProgress,
+    progress: &dyn StepProgress,
 ) -> Result<bool, EnvError> {
-    let storage = crate::resource::selected_storage(client)
+    let storage = crate::storage_class::selected(client)
         .await
         .map_err(|e| EnvError::Manifest { reason: e })?;
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
@@ -231,7 +231,7 @@ async fn create_seed_pvc(
         },
         "spec": {
             "accessModes": ["ReadWriteOnce"],
-            "resources": { "requests": { "storage": seed_size() } },
+            "resources": { "requests": { "storage": crate::cluster_config::seed_size() } },
             "storageClassName": storage.class_name,
         }
     }))
@@ -337,7 +337,7 @@ async fn try_materialize(
     client: &Client,
     pvc_name: &str,
     seed: &SeedEntry,
-    progress: &NodeProgress,
+    progress: &dyn StepProgress,
 ) -> Result<Result<(), EnvError>, InFlight> {
     match materialize(client, pvc_name, seed, progress).await {
         Ok(()) => Ok(Ok(())),
@@ -365,7 +365,7 @@ async fn materialize(
     client: &Client,
     pvc_name: &str,
     seed: &SeedEntry,
-    progress: &NodeProgress,
+    progress: &dyn StepProgress,
 ) -> Result<(), MaterializeErr> {
     let job_name = format!("puller-{}", pvc_name.trim_start_matches("seed-"));
     let jobs: Api<Job> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
@@ -538,7 +538,7 @@ const NORMALIZE_MODES: &str =
 /// volume root stamps it. Not acquired by default either (k8s takes the primary gid
 /// from the image's `USER`), so a mounting pod must list it in
 /// [`PodSpec::supplemental_groups`](crate::manifest::PodSpec::supplemental_groups)
-pub(crate) const SEED_GID: i64 = 0;
+pub const SEED_GID: i64 = 0;
 
 fn storage_fatal(archive: &str, err: storage::StorageError) -> MaterializeErr {
     MaterializeErr::Fatal(EnvError::ArchiveMaterializeFailed {
@@ -662,7 +662,7 @@ async fn job_logs(pods: &Api<Pod>, job_name: &str) -> String {
 // ─────────────────────────── snapshot + waits ───────────────────────
 
 async fn create_volume_snapshot(client: &Client, pvc_name: &str) -> Result<(), EnvError> {
-    let storage = crate::resource::selected_storage(client)
+    let storage = crate::storage_class::selected(client)
         .await
         .map_err(|e| EnvError::Manifest { reason: e })?;
     let snap_gvk = volume_snapshot_gvk();
@@ -691,14 +691,14 @@ async fn wait_pvc_ready(client: &Client, pvc_name: &str) -> Result<(), EnvError>
 async fn wait_snapshot_ready(
     client: &Client,
     snap_name: &str,
-    progress: &NodeProgress,
+    progress: &dyn StepProgress,
 ) -> Result<(), EnvError> {
     let snap_gvk = volume_snapshot_gvk();
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), SEEDS_NAMESPACE, &snap_gvk);
     let started = std::time::Instant::now();
     poll(WAIT_BUDGET, || async {
         // Elapsed on the row (copying drivers sit here minutes; bare spinner = hang)
-        progress.note(format!("waiting for snapshot ({}s)", started.elapsed().as_secs()));
+        progress.note(&format!("waiting for snapshot ({}s)", started.elapsed().as_secs()));
         let snap = match api.get_opt(snap_name).await.map_err(env_err)? {
             Some(s) => s,
             None => return Ok::<bool, EnvError>(false),
@@ -738,18 +738,6 @@ fn detect_puller_image() -> String {
     // non-root UID → "Unable to lock database: Permission denied"
     std::env::var("ZTEST_PULLER_IMAGE").unwrap_or_else(|_| "fedora:40".into())
 }
-/// Requested seed-PVC size = floor for every clone off its snapshot. Non-private
-/// because `seeds::read_seed_handle` falls back to it when a driver reports no
-/// `restoreSize`
-///
-/// - Holds the *extracted chain archive* only (indexer DBs = per-pod `emptyDir`)
-/// - Default > deepest registered artifact (mainnet 1,693,104 = 30.5 GiB extracted)
-/// - Flat, not per-artifact from `ChainInfo::uncompressed_bytes` (a full-mainnet rung
-///   would need ~258 GiB → sizing belongs on the handle, not on one global)
-pub(crate) fn seed_size() -> String {
-    std::env::var("ZTEST_SEED_SIZE").unwrap_or_else(|_| "48Gi".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

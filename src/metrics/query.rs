@@ -18,7 +18,7 @@ use crate::portforward::Forwarder;
 /// [`SCRAPE_CONFIG`](crate::resource::impls::observability)'s interval. A `step` under
 /// it invents points, which Prometheus fills by repeating the last sample — a flat
 /// stretch that never happened
-pub(crate) const SCRAPE_INTERVAL: Duration = Duration::from_secs(5);
+pub const SCRAPE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Container cpu, cores. Cumulative seconds-per-second → a rate
 const CONTAINER_CPU: &str = "container_cpu_usage_seconds_total";
@@ -354,8 +354,8 @@ pub async fn is_deployed(client: &Client) -> bool {
     use k8s_openapi::api::core::v1::Service;
     use kube::api::Api;
 
-    let api: Api<Service> = Api::namespaced(client.clone(), crate::resource::OBS_NAMESPACE);
-    api.get_opt(crate::resource::PROMETHEUS_SERVICE).await.ok().flatten().is_some()
+    let api: Api<Service> = Api::namespaced(client.clone(), crate::naming::OBS_NAMESPACE);
+    api.get_opt(crate::naming::PROMETHEUS_SERVICE).await.ok().flatten().is_some()
 }
 
 /// Drop every series matching `selectors`, permanently.
@@ -494,9 +494,9 @@ async fn prometheus_backend(client: &Client) -> Result<(String, String, u16), St
     use k8s_openapi::api::core::v1::{Pod, Service};
     use kube::api::{Api, ListParams};
 
-    let services: Api<Service> = Api::namespaced(client.clone(), crate::resource::OBS_NAMESPACE);
+    let services: Api<Service> = Api::namespaced(client.clone(), crate::naming::OBS_NAMESPACE);
     let svc = services
-        .get(crate::resource::PROMETHEUS_SERVICE)
+        .get(crate::naming::PROMETHEUS_SERVICE)
         .await
         .map_err(|e| format!("no ztest Prometheus: {e}"))?;
 
@@ -506,7 +506,7 @@ async fn prometheus_backend(client: &Client) -> Result<(String, String, u16), St
         .and_then(|s| s.ports.as_ref())
         .and_then(|p| p.first())
         .map(|p| p.port as u16)
-        .unwrap_or(crate::resource::PROMETHEUS_PORT);
+        .unwrap_or(crate::ports::PROMETHEUS_PORT);
     let selector = svc
         .spec
         .as_ref()
@@ -518,7 +518,7 @@ async fn prometheus_backend(client: &Client) -> Result<(String, String, u16), St
         .collect::<Vec<_>>()
         .join(",");
 
-    let pods: Api<Pod> = Api::namespaced(client.clone(), crate::resource::OBS_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), crate::naming::OBS_NAMESPACE);
     pods.list(&ListParams::default().labels(&selector))
         .await
         .map_err(|e| format!("listing Prometheus pods: {e}"))?
@@ -531,7 +531,7 @@ async fn prometheus_backend(client: &Client) -> Result<(String, String, u16), St
                 .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
         })
         .and_then(|p| p.metadata.name)
-        .map(|name| (crate::resource::OBS_NAMESPACE.to_string(), name, port))
+        .map(|name| (crate::naming::OBS_NAMESPACE.to_string(), name, port))
         .ok_or_else(|| "no ready Prometheus pod".to_string())
 }
 

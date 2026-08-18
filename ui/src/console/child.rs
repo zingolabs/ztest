@@ -1,0 +1,150 @@
+//! Work-side subprocess runner: child under a PTY, raw bytes → render thread.
+//!
+//! - PTY not pipe (child's native colour + in-place progress bars are TTY-gated)
+//! - No [`Console`] → child inherits stdio, plain CI log
+
+use std::io::{self, Read};
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+use super::Console;
+
+/// Run `program args` to completion → exit code (`130` = forwarded Ctrl-C).
+///
+/// - With a [`Console`]: PTY emulated into the live region; without: inherited stdio
+/// - Reader thread joined before return (every `Output` enqueued ahead of the caller's
+///   next `FlushLive`, keeping scrollback ordered across both producers)
+pub async fn run_child(
+    console: &Console,
+    program: &str,
+    args: &[String],
+    envs: &[(&str, String)],
+) -> io::Result<i32> {
+    let size = console.size();
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: console.live_rows(),
+            cols: size.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| io::Error::other(format!("openpty: {e}")))?;
+
+    let mut cmd = CommandBuilder::new(program);
+    for a in args {
+        cmd.arg(a);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    if std::env::var_os("TERM").is_none() {
+        cmd.env("TERM", "xterm-256color");
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| io::Error::other(format!("spawn {program}: {e}")))?;
+    drop(pair.slave);
+
+    // portable-pty `setsid`s the child → its PID *is* its pgid. `master
+    // .process_group_leader()` races the pending `setsid` and can latch a stale
+    // group, silently dropping the first Ctrl-Cs.
+    console.child_started(child.process_id().map(|pid| pid as i32));
+
+    let mut reader =
+        pair.master.try_clone_reader().map_err(|e| io::Error::other(format!("pty reader: {e}")))?;
+    let sink = console.clone();
+    let reader_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if !sink.output(buf[..n].to_vec()) {
+                        break; // render thread gone
+                    }
+                }
+            }
+        }
+    });
+
+    // `Child::wait` blocks; keep it off the async worker.
+    let wait = tokio::task::spawn_blocking(move || child.wait());
+    tokio::pin!(wait);
+
+    // Resizes → child PTY (width + `live_rows`), matching the render thread's `avt`
+    // grid. `master.resize` delivers SIGWINCH, so tools re-wrap off spawn-time size.
+    let mut size = console.size_watch();
+    let status = loop {
+        tokio::select! {
+            done = &mut wait => break done.map_err(io::Error::other)?,
+            changed = size.changed() => {
+                if changed.is_ok() {
+                    let cols = size.borrow().cols;
+                    let _ = pair.master.resize(PtySize {
+                        rows: console.live_rows(),
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                }
+            }
+        }
+    };
+    drop(pair.master);
+    let _ = reader_thread.join();
+    console.child_exited();
+
+    Ok(exit_code_from(status, console.cancelled()))
+}
+
+/// Non-TTY fallback: inherited stdio, synchronous, exit code out. Signal death
+/// → `128 + signo` (Ctrl-C → 130, as in [`code_for`])
+fn exit_code_from(status: io::Result<portable_pty::ExitStatus>, interrupted: bool) -> i32 {
+    match status {
+        Ok(s) => code_for(&s, interrupted) as i32,
+        Err(err) => {
+            eprintln!("ztest run: error waiting on child: {err}");
+            127
+        }
+    }
+}
+
+fn code_for(status: &portable_pty::ExitStatus, interrupted: bool) -> u8 {
+    if status.signal().is_some() {
+        if interrupted { 130 } else { 1 }
+    } else {
+        (status.exit_code() & 0xff) as u8
+    }
+}
+
+#[async_trait::async_trait]
+impl ztest::api::ChildHost for Console {
+    async fn run_child(
+        &self,
+        program: &str,
+        args: &[String],
+        envs: &[(&str, String)],
+    ) -> io::Result<i32> {
+        run_child(self, program, args, envs).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_for_maps_clean_and_signal_deaths() {
+        use portable_pty::ExitStatus;
+        assert_eq!(code_for(&ExitStatus::with_exit_code(0), false), 0);
+        assert_eq!(code_for(&ExitStatus::with_exit_code(101), false), 101);
+        assert_eq!(code_for(&ExitStatus::with_exit_code(7), true), 7);
+        assert_eq!(code_for(&ExitStatus::with_signal("Killed"), true), 130);
+        assert_eq!(code_for(&ExitStatus::with_signal("Hangup"), false), 1);
+    }
+}

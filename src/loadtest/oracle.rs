@@ -63,7 +63,7 @@ impl BlockOracle {
     }
 
     /// Validate one streamed response covering `start..=end` inclusive
-    pub(crate) fn observe(&self, start: u64, end: u64, blocks: &[CompactBlock]) -> Vec<Violation> {
+    pub fn observe(&self, start: u64, end: u64, blocks: &[CompactBlock]) -> Vec<Violation> {
         let mut v = Vec::new();
         check_links(blocks, &mut v);
         check_complete(start, end, blocks, &mut v);

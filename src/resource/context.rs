@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use kube::Client;
 
-use crate::cli::console::Console;
+use crate::proc::SharedChildHost;
 use crate::resource::provider::NodeId;
 
 /// Context handed to every [`Provider`](super::Provider) method.
@@ -17,8 +17,8 @@ use crate::resource::provider::NodeId;
 /// - `build_pod` = the ephemeral BuildKit pod, `None` when nothing is built
 pub struct Cx {
     pub client: Client,
-    pub(crate) console: Option<Console>,
-    pub(crate) progress: Option<ProgressSink>,
+    pub host: Option<SharedChildHost>,
+    pub progress: Option<ProgressSink>,
     pub no_wait: bool,
     pub build_pod: Option<String>,
 }
@@ -26,7 +26,7 @@ pub struct Cx {
 impl Cx {
     /// Headless (non-TTY) runs + unit tests: client only, waits enabled
     pub fn headless(client: Client) -> Self {
-        Self { client, console: None, progress: None, no_wait: false, build_pod: None }
+        Self { client, host: None, progress: None, no_wait: false, build_pod: None }
     }
 
     /// `Cx::builder(client).console(c).progress(s).no_wait(true).build()`.
@@ -36,7 +36,7 @@ impl Cx {
     }
 
     pub fn builder(client: Client) -> CxBuilder {
-        CxBuilder { client, console: None, progress: None, no_wait: false, build_pod: None }
+        CxBuilder { client, host: None, progress: None, no_wait: false, build_pod: None }
     }
 }
 
@@ -44,7 +44,7 @@ impl std::fmt::Debug for Cx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Presence only — a full `kube::Client` dump is enormous.
         f.debug_struct("Cx")
-            .field("console", &self.console.is_some())
+            .field("host", &self.host.is_some())
             .field("progress", &self.progress.is_some())
             .field("no_wait", &self.no_wait)
             .finish_non_exhaustive()
@@ -54,7 +54,7 @@ impl std::fmt::Debug for Cx {
 /// Builder for [`Cx`]. See [`Cx::builder`].
 pub struct CxBuilder {
     client: Client,
-    console: Option<Console>,
+    host: Option<SharedChildHost>,
     progress: Option<ProgressSink>,
     no_wait: bool,
     build_pod: Option<String>,
@@ -63,7 +63,7 @@ pub struct CxBuilder {
 impl std::fmt::Debug for CxBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CxBuilder")
-            .field("console", &self.console.is_some())
+            .field("host", &self.host.is_some())
             .field("progress", &self.progress.is_some())
             .field("no_wait", &self.no_wait)
             .finish_non_exhaustive()
@@ -71,12 +71,12 @@ impl std::fmt::Debug for CxBuilder {
 }
 
 impl CxBuilder {
-    pub(crate) fn console(mut self, console: Console) -> Self {
-        self.console = Some(console);
+    pub fn host(mut self, host: SharedChildHost) -> Self {
+        self.host = Some(host);
         self
     }
 
-    pub(crate) fn progress(mut self, sink: ProgressSink) -> Self {
+    pub fn progress(mut self, sink: ProgressSink) -> Self {
         self.progress = Some(sink);
         self
     }
@@ -94,7 +94,7 @@ impl CxBuilder {
     pub fn build(self) -> Cx {
         Cx {
             client: self.client,
-            console: self.console,
+            host: self.host,
             progress: self.progress,
             no_wait: self.no_wait,
             build_pod: self.build_pod,
@@ -171,6 +171,20 @@ impl NodeProgress {
         if let Some((sink, id)) = &self.0 {
             sink.finalizing(id);
         }
+    }
+}
+
+impl crate::progress::StepProgress for NodeProgress {
+    fn note(&self, note: &str) {
+        NodeProgress::note(self, note);
+    }
+
+    fn bytes(&self, done: u64, total: u64) {
+        NodeProgress::bytes(self, done, total);
+    }
+
+    fn finalizing(&self) {
+        NodeProgress::finalizing(self);
     }
 }
 

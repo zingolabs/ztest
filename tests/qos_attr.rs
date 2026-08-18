@@ -31,7 +31,7 @@ fn marker_sync() {}
 
 #[test]
 fn tier_attributes_register_in_inventory_with_the_right_class() {
-    let entries: Vec<_> = ztest::inventory::qos_iter().collect();
+    let entries: Vec<_> = ztest::api::inventory::qos_iter().collect();
 
     let class_of = |suffix: &str| {
         entries

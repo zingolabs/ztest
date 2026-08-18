@@ -2,7 +2,7 @@
 //!
 //! - [`WalletConfig`] = config ZST (factory + NU ceiling), [`WalletBackend`] = live contract
 //! - In-process in the test binary → a wallet component gets no pod
-//! - Concrete impl (zingolib, …) lives in the consumer crate → no wallet-library types in ztest
+//! - Concrete impl lives in the consumer crate → no wallet-library types in ztest
 
 use std::time::Duration;
 
@@ -73,7 +73,7 @@ pub struct AccountSpec<'a> {
 // ──────────────────────────── WalletConfig ────────────────────────────
 
 /// Config ZST handed to the [`Wallet`](crate::component::Wallet) builder (e.g.
-/// `ZingoBackend`) = factory for the live handle (wallets carry no pod-config)
+/// `LrzBackend`) = factory for the live handle (wallets carry no pod-config)
 pub trait WalletConfig: Send + Sync + std::fmt::Debug + 'static {
     type Handle: WalletBackend + Clone;
 
@@ -141,9 +141,9 @@ pub struct Account<W: WalletBackend> {
 }
 
 impl<W: WalletBackend> Account<W> {
-    // Unused with no wallet backend compiled in; backend infra, not zingo-specific
-    #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
-    pub(crate) fn new(wallet: W, id: AccountId, label: &'static str) -> Self {
+    // Unused with no wallet backend compiled in; backend infra, not backend-specific
+    #[cfg_attr(not(feature = "librustzcash"), allow(dead_code))]
+    pub fn new(wallet: W, id: AccountId, label: &'static str) -> Self {
         Self { wallet, id, label }
     }
 

@@ -9,8 +9,54 @@
 //! [`dev!`]: ztest_macros::dev
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::qos::QosClass;
+
+/// What image a component's pod uses.
+///
+/// - `Published` reads [`ComponentOpts::version`](crate::component::ComponentOpts::version)
+///   through the per-backend `image_uri` (zaino → `zingodevops/zainod:`)
+/// - `Dev` folds `features` (→ `--build-arg`) + `rust_version` into `dev-<hash>`, one
+///   image per combination; `rust_version: None` leaves the Dockerfile's default
+#[derive(Debug, Clone, Default)]
+pub enum ImageSpec {
+    #[default]
+    Published,
+    Dev {
+        source: DevSource,
+        features: Vec<String>,
+        repo: String,
+        rust_version: Option<String>,
+    },
+}
+
+impl ImageSpec {
+    /// Config generators gate the metrics-listener stanza on this (rendering one
+    /// against a binary lacking the feature = hard startup rejection). `Published`
+    /// cannot opt a feature in → always `false`
+    pub fn metrics_enabled(&self) -> bool {
+        matches!(
+            self,
+            ImageSpec::Dev { features, .. }
+                if features
+                    .iter()
+                    .any(|f| f == "prometheus" || f == "no_tls_with_prometheus")
+        )
+    }
+}
+
+/// Where a `dev!(..)` image builds from.
+///
+/// - `Local` paths absolute (macro resolves the caller-relative form against
+///   `CARGO_MANIFEST_DIR` at compile time)
+/// - `Git` paths repo-relative against a content-addressed fetch of `rev`; the rev
+///   pins the tree → it *is* the tag suffix (no worktree hash, no fetch to name it)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DevSource {
+    Local { dockerfile: PathBuf, context: PathBuf },
+    Git { url: String, rev: String, dockerfile: String, context: String },
+}
 
 /// One dev-image declaration for `inventory::submit!`.
 ///
@@ -42,7 +88,7 @@ inventory::collect!(DevImageDecl);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevImageEntry {
     pub repo: String,
-    pub source: crate::backends::image::DevSource,
+    pub source: DevSource,
     pub features: Vec<String>,
     pub rust_version: Option<String>,
 }
@@ -62,9 +108,8 @@ fn expand_decl(d: &DevImageDecl) -> Vec<DevImageEntry> {
     }
 }
 
-impl From<DevSourceDecl> for crate::backends::image::DevSource {
+impl From<DevSourceDecl> for DevSource {
     fn from(d: DevSourceDecl) -> Self {
-        use crate::backends::image::DevSource;
         match d {
             DevSourceDecl::Local { dockerfile, context } => {
                 DevSource::Local { dockerfile: dockerfile.into(), context: context.into() }

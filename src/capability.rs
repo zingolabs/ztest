@@ -162,10 +162,10 @@ async fn probe_bucket() -> Finding {
 /// every seeded test's CoW clone
 async fn probe_storage(client: &Client) -> Finding {
     let driver = crate::cluster_config::active_storage_driver();
-    match crate::resource::discover_storage(client).await {
+    match crate::storage_class::discover(client).await {
         // Resolved exactly as a run resolves it, driver and all — reporting the
         // cluster default under a profile-named driver = green check, failing run.
-        Ok(options) => match crate::resource::select_storage(&options, driver.as_deref()) {
+        Ok(options) => match crate::storage_class::select(&options, driver.as_deref()) {
             Ok(chosen) => {
                 Finding::Present(format!("{} ({})", chosen.class_name, chosen.provisioner))
             }

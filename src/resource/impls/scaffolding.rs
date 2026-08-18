@@ -9,19 +9,19 @@ use serde_json::json;
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 
 #[derive(Debug)]
-pub(crate) struct NamespaceProvider {
+pub struct NamespaceProvider {
     name: String,
     psa_privileged: bool,
 }
 
 impl NamespaceProvider {
-    pub(crate) fn new(name: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into(), psa_privileged: false }
     }
 
     /// Required by the BuildKit pod (unconfined seccomp/AppArmor exceeds
     /// *baseline*); without it the pod dies at admission, far from BuildKit
-    pub(crate) fn pod_security_privileged(mut self) -> Self {
+    pub fn pod_security_privileged(mut self) -> Self {
         self.psa_privileged = true;
         self
     }
@@ -89,13 +89,13 @@ impl Provider for NamespaceProvider {
 /// One cluster-wide label over all schedulable nodes. One provider per label key
 /// ([`NodeId::NodeLabel`]) → no two can fight over it
 #[derive(Debug)]
-pub(crate) struct NodeLabelProvider {
+pub struct NodeLabelProvider {
     key: String,
     value: String,
 }
 
 impl NodeLabelProvider {
-    pub(crate) fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
         Self { key: key.into(), value: value.into() }
     }
 }

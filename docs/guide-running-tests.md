@@ -130,7 +130,7 @@ setup = ['preflight']
 2. **Probe the cluster.** Resolve `KUBECONFIG`, list nodes, count `zaino-{ci,dev}-*` namespaces as a concurrency proxy.
 3. **Resolve archives.** For each required `seed-{sha8}-{driver}` PVC in `ztest-seeds`: ready → cached; not ready → attach to the puller Job's log stream; absent → create PVC + puller Job. The Job `curl`s a presigned, TTL-bounded GET for `lfs/<oid>` straight into `tar -x`, so the bytes go **R2 → node** and never enter ztest or the apiserver. Bucket unreachable or object missing → soft-fail and proceed. Materialization flow: [design-architecture.md](design-architecture.md#archive-pvcs).
 
-   Archives are gitignored, so a checkout holds none of them and nothing is fetched at clone time. The OID comes from `snapshots/<network>/<upgrade>.toml`, read at compile time. Credentials: [fixtures/chains/README.md](../fixtures/chains/README.md#environment); `ztest cluster check` reports the bucket as its own row.
+   Archives are gitignored, so a checkout holds none of them and nothing is fetched at clone time. The OID comes from `snapshots/<network>/zebra-<version>-<upgrade>.toml`, read at compile time. Credentials: [fixtures/chains/README.md](../fixtures/chains/README.md#environment); `ztest cluster check` reports the bucket as its own row.
 4. **Resolve snapshots.** For each `VolumeSnapshot` the selection clones, ensure its source PVC is ready (recurses into step 3) and the snapshot is bound.
 5. **Emit a final banner and exit 0.**
 

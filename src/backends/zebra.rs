@@ -7,13 +7,14 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::component::ComponentBuilder;
-use crate::handles::client::{AuthedRpc, JsonRpcClient, json_rpc, wait_for_rpc_ready};
+use crate::handles::HandleInner;
 use crate::handles::validator::{
     BlockHash, BlockHeight, BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, PeerInfo,
     PoolSupport, ValidatorBackend, ValidatorConfig,
 };
 use crate::handles::wallet::Pool;
-use crate::handles::{Endpoint, HandleInner};
+use crate::protocol::Endpoint;
+use crate::protocol::client::{AuthedRpc, JsonRpcClient, json_rpc, wait_for_rpc_ready};
 use crate::protocol::zcash_rpc::ZcashRpc;
 use crate::{EnvError, RpcError};
 
@@ -39,9 +40,9 @@ const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOCK_GENERATION_DELAY: Duration = Duration::from_millis(1500);
 
-/// A [`Dev`](crate::backends::image::ImageSpec::Dev) override never degrades to
+/// A [`Dev`](crate::inventory::ImageSpec::Dev) override never degrades to
 /// the published tag — unbuilt = `DevImageMissing`
-pub(crate) fn image_uri(
+pub fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
     let default_image = format!("zfnd/zebra:{}", opts.version);
@@ -103,7 +104,7 @@ impl ValidatorConfig for ZebraBackend {
         let persistent = if let Some(s) = opts.shared_state.as_ref() {
             Some(crate::regtest_conf::ZebradPersistentState {
                 cache_dir: &s.mount_path,
-                indexer_listen_port: Some(crate::handles::ports::ZEBRAD_INDEXER),
+                indexer_listen_port: Some(crate::ports::ZEBRAD_INDEXER),
             })
         } else if opts.restore.is_some() {
             Some(crate::regtest_conf::ZebradPersistentState {
@@ -118,13 +119,13 @@ impl ValidatorConfig for ZebraBackend {
             version,
             activation,
             ZEBRAD_RPC_PORT,
-            crate::handles::ports::ZEBRAD_P2P,
+            crate::ports::ZEBRAD_P2P,
             peers,
             lockbox,
             Some(funding_streams),
             persistent,
             miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
-            opts.image.metrics_enabled().then_some(crate::handles::ports::ZEBRAD_METRICS),
+            opts.image.metrics_enabled().then_some(crate::ports::ZEBRAD_METRICS),
         );
         opts.mounts.push(crate::regtest::config_mount_inline(toml, CONTAINER_CONFIG_PATH));
 
@@ -211,13 +212,13 @@ impl ValidatorBackend for ZebraValidator {
                 // generator's own derivation (else testnet probes the regtest port).
                 let mut base = vec![
                     ("rpc", rpc_port(opts)),
-                    ("metrics", crate::handles::ports::ZEBRAD_METRICS),
-                    ("p2p", crate::handles::ports::ZEBRAD_P2P),
+                    ("metrics", crate::ports::ZEBRAD_METRICS),
+                    ("p2p", crate::ports::ZEBRAD_P2P),
                 ];
                 // Indexer gRPC a colocated zaino `Direct` dials (shared state DB,
                 // or restored testnet chain) needs its port exposed too.
                 if serves_indexer_grpc(opts) {
-                    base.push(("indexer", crate::handles::ports::ZEBRAD_INDEXER));
+                    base.push(("indexer", crate::ports::ZEBRAD_INDEXER));
                 }
                 crate::manifest::merge_ports(&base, &opts.extra_ports)
             },
@@ -416,7 +417,7 @@ impl ValidatorBackend for ZebraValidator {
 /// Container-side mount path of the rendered `zebrad.toml`
 const CONTAINER_CONFIG_PATH: &str = "/etc/zebrad/zebrad.toml";
 
-const ZEBRAD_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_RPC;
+const ZEBRAD_RPC_PORT: u16 = crate::ports::ZEBRAD_RPC;
 
 /// `Some` iff rendered by [`public_conf`](crate::public_conf), not
 /// [`regtest_conf`](crate::regtest_conf).
@@ -436,7 +437,7 @@ fn public_restore_network(opts: &crate::component::ComponentOpts) -> Option<crat
 /// (zebrad opens only the config's port; the pod readiness-probes what it declares)
 fn rpc_port(opts: &crate::component::ComponentOpts) -> u16 {
     if public_restore_network(opts).is_some() {
-        crate::handles::ports::ZEBRAD_PUBLIC_RPC
+        crate::ports::ZEBRAD_PUBLIC_RPC
     } else {
         ZEBRAD_RPC_PORT
     }
@@ -485,8 +486,8 @@ fn restore_public(
         ZEBRAD_PUBLIC_CACHE_DIR,
         // Always on for a public restore (colocated zaino `Direct` needs an
         // address to dial; `serves_indexer_grpc` exposes the port to match).
-        Some(crate::handles::ports::ZEBRAD_INDEXER),
-        validator.opts().image.metrics_enabled().then_some(crate::handles::ports::ZEBRAD_METRICS),
+        Some(crate::ports::ZEBRAD_INDEXER),
+        validator.opts().image.metrics_enabled().then_some(crate::ports::ZEBRAD_METRICS),
     );
     validator
         .mount(crate::regtest::config_mount_inline(toml, "/etc/zebrad/zebrad.toml"))
@@ -495,7 +496,7 @@ fn restore_public(
         .args(["-c", "/etc/zebrad/zebrad.toml", "start"])
 }
 
-const ZEBRAD_PUBLIC_RPC_PORT: u16 = crate::handles::ports::ZEBRAD_PUBLIC_RPC;
+const ZEBRAD_PUBLIC_RPC_PORT: u16 = crate::ports::ZEBRAD_PUBLIC_RPC;
 const ZEBRAD_PUBLIC_CACHE_DIR: &str = "/var/cache/zebrad";
 
 // ──────────────────── zebrad-only typed JSON-RPC views ─────────────────
@@ -540,8 +541,8 @@ mod tests {
     }
 
     /// Guards the hang that took the testnet suite: probe on
-    /// [`ZEBRAD_RPC`](crate::handles::ports::ZEBRAD_RPC) 28232 vs config on
-    /// [`ZEBRAD_PUBLIC_RPC`](crate::handles::ports::ZEBRAD_PUBLIC_RPC) 18232 →
+    /// [`ZEBRAD_RPC`](crate::ports::ZEBRAD_RPC) 28232 vs config on
+    /// [`ZEBRAD_PUBLIC_RPC`](crate::ports::ZEBRAD_PUBLIC_RPC) 18232 →
     /// never Ready, indistinguishable from a validator that failed to start
     #[test]
     fn a_testnet_restore_probes_the_port_its_config_opens() {

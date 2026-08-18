@@ -16,7 +16,7 @@ use kube::Api;
 use kube::api::{ListParams, LogParams};
 
 use crate::pod_status;
-use crate::resource::NodeProgress;
+use crate::progress::StepProgress;
 
 const PRE_RUN_POLL: Duration = Duration::from_millis(500);
 
@@ -33,11 +33,11 @@ const MAX_RECORD: usize = 64 * 1024;
 ///
 /// **Never returns**: caller races this against the Job's terminal condition
 /// (resolving would cancel the wait that decides the outcome)
-pub(crate) async fn watch_puller(
+pub async fn watch_puller(
     pods: &Api<Pod>,
     job_name: &str,
     total: u64,
-    progress: &NodeProgress,
+    progress: &dyn StepProgress,
 ) {
     let mut transferred = 0u64;
     // Pod whose log already ended. Closed exactly once → separates "payload in,
@@ -73,7 +73,7 @@ pub(crate) async fn watch_puller(
         }
 
         if !pod.status.as_ref().is_some_and(pod_status::is_running) {
-            progress.note(pre_run_note(&pod));
+            progress.note(&pre_run_note(&pod));
             tokio::time::sleep(PRE_RUN_POLL).await;
             continue;
         }
@@ -103,9 +103,9 @@ pub(crate) async fn watch_puller(
 ///
 /// `finalizing` drops the bar, rate and ETA, so it must be reserved for a pull that
 /// actually landed — a dead attempt parked there reads as progress for the whole backoff
-fn settle(pod: &Pod, progress: &NodeProgress) {
+fn settle(pod: &Pod, progress: &dyn StepProgress) {
     match failure_note(pod) {
-        Some(note) => progress.note(note),
+        Some(note) => progress.note(&note),
         None => progress.finalizing(),
     }
 }
@@ -157,7 +157,7 @@ async fn follow(
     pod: &str,
     total: u64,
     backfill_secs: Option<i64>,
-    progress: &NodeProgress,
+    progress: &dyn StepProgress,
     transferred: &mut u64,
 ) -> Result<(), kube::Error> {
     let lp = LogParams { follow: true, since_seconds: backfill_secs, ..Default::default() };

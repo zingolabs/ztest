@@ -15,9 +15,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::cli::console::run_child;
 use crate::cluster_config::ClusterClass;
 use crate::inventory::DevImageEntry;
+use crate::proc;
 use crate::resource::{Cx, Readiness, ResourceError};
 
 /// Appended to every ztest `buildctl --output type=image`.
@@ -26,57 +26,16 @@ use crate::resource::{Cx, Readiness, ResourceError};
 ///   for the ~1 GiB runner layer); `oci-mediatypes` required for zstd descriptors
 /// - level 1 (push target = same-node registry), no `force-compression` (base layers
 ///   keep their cached blobs)
-pub(crate) const IMAGE_OUTPUT_COMPRESSION: &str =
+pub const IMAGE_OUTPUT_COMPRESSION: &str =
     "compression=zstd,compression-level=1,oci-mediatypes=true";
 
-pub(crate) mod bundle;
-pub(crate) mod docker;
-pub(crate) mod kind;
+pub mod bundle;
+pub mod docker;
+pub mod kind;
 
-/// What image a component's pod uses.
-///
-/// - `Published` reads [`ComponentOpts::version`](crate::component::ComponentOpts::version)
-///   through the per-backend `image_uri` (zaino → `zingodevops/zainod:`)
-/// - `Dev` folds `features` (→ `--build-arg`) + `rust_version` into `dev-<hash>`, one
-///   image per combination; `rust_version: None` leaves the Dockerfile's default
-#[derive(Debug, Clone, Default)]
-pub enum ImageSpec {
-    #[default]
-    Published,
-    Dev {
-        source: DevSource,
-        features: Vec<String>,
-        repo: String,
-        rust_version: Option<String>,
-    },
-}
+pub use crate::inventory::ImageSpec;
 
-impl ImageSpec {
-    /// Config generators gate the metrics-listener stanza on this (rendering one
-    /// against a binary lacking the feature = hard startup rejection). `Published`
-    /// cannot opt a feature in → always `false`
-    pub(crate) fn metrics_enabled(&self) -> bool {
-        matches!(
-            self,
-            ImageSpec::Dev { features, .. }
-                if features
-                    .iter()
-                    .any(|f| f == "prometheus" || f == "no_tls_with_prometheus")
-        )
-    }
-}
-
-/// Where a `dev!(..)` image builds from.
-///
-/// - `Local` paths absolute (macro resolves the caller-relative form against
-///   `CARGO_MANIFEST_DIR` at compile time)
-/// - `Git` paths repo-relative against a content-addressed fetch of `rev`; the rev
-///   pins the tree → it *is* the tag suffix (no worktree hash, no fetch to name it)
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum DevSource {
-    Local { dockerfile: PathBuf, context: PathBuf },
-    Git { url: String, rev: String, dockerfile: String, context: String },
-}
+pub use crate::inventory::DevSource;
 
 /// 40-hex SHA → first 12 chars; any other ref → tag-legal characters only
 fn sanitize_rev(rev: &str) -> String {
@@ -94,7 +53,7 @@ impl DevSource {
     /// `rust_version` (the *pinned* toolchain) must fold identically here and on the
     /// build side ([`docker_build_argv`]), else `resolve` names a tag never built;
     /// `None` stays unfolded (preserves existing tags)
-    pub(crate) fn tag_suffix(
+    pub fn tag_suffix(
         &self,
         features: &[String],
         rust_version: Option<&str>,
@@ -115,7 +74,7 @@ impl DevSource {
         }
     }
 
-    pub(crate) fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         match self {
             DevSource::Local { dockerfile, .. } => dockerfile.display().to_string(),
             DevSource::Git { url, rev, .. } => format!("{url}@{rev}"),
@@ -132,7 +91,7 @@ impl DevSource {
     }
 
     /// `Git` fetches `rev` into the cache (once) as a side effect
-    pub(crate) fn materialize(&self) -> Result<(PathBuf, PathBuf), ImageError> {
+    pub fn materialize(&self) -> Result<(PathBuf, PathBuf), ImageError> {
         match self {
             DevSource::Local { dockerfile, context } => Ok((dockerfile.clone(), context.clone())),
             DevSource::Git { url, rev, dockerfile, context } => {
@@ -329,7 +288,7 @@ pub fn registry_configured() -> bool {
 /// One build/load step through the console PTY (BuildKit / kind progress renders live).
 /// Provisioning runs at cap 1 → at most one stream drives the emulator grid. Off a TTY
 /// `run_child` inherits stdio
-pub(crate) async fn run_streamed(
+pub async fn run_streamed(
     cx: &Cx,
     tag: &str,
     program: &str,
@@ -337,7 +296,7 @@ pub(crate) async fn run_streamed(
     envs: &[(&str, String)],
     step: &str,
 ) -> Result<(), ResourceError> {
-    let code = run_child(cx.console.as_ref(), program, argv, envs)
+    let code = proc::run(cx.host.as_deref(), program, argv, envs)
         .await
         .map_err(|e| ResourceError::Provision(format!("{step} {tag}: {e}")))?;
     if code != 0 {
@@ -348,13 +307,13 @@ pub(crate) async fn run_streamed(
 
 /// `ZTEST_IMAGE_REGISTRY` = address pods reference, `None` = local kind. Empty treated
 /// as unset (bare `=` harmless). Also the push address for a generic registry
-pub(crate) fn pull_base() -> Option<String> {
+pub fn pull_base() -> Option<String> {
     env_nonempty("ZTEST_IMAGE_REGISTRY")
 }
 
 /// `ZTEST_IMAGE_PUSH_REGISTRY`, set only for an in-cluster registry (push → external
 /// route, pull → in-cluster service)
-pub(crate) fn push_base() -> Option<String> {
+pub fn push_base() -> Option<String> {
     env_nonempty("ZTEST_IMAGE_PUSH_REGISTRY")
 }
 
@@ -372,13 +331,13 @@ pub fn builds_on_cluster() -> bool {
 
 /// In-cluster repo (no tag) the runner image pushes to; the on-cluster build appends
 /// the per-run `:dev-<run-id>`
-pub(crate) fn runner_repo_ref() -> Option<String> {
-    pull_base().map(|base| join(&base, crate::engine::pod_runner::RUNNER_REPO))
+pub fn runner_repo_ref() -> Option<String> {
+    pull_base().map(|base| join(&base, crate::naming::RUNNER_REPO))
 }
 
 /// `ZTEST_IMAGE_PULL_SECRET` → pod `imagePullSecrets` for a private registry. `None`
 /// when the cluster injects the credentials
-pub(super) fn pull_secret_env() -> Option<String> {
+pub fn pull_secret_env() -> Option<String> {
     env_nonempty("ZTEST_IMAGE_PULL_SECRET")
 }
 
@@ -463,69 +422,7 @@ pub fn dev_tag(
     Ok(format!("{repo}:dev-{}", source.tag_suffix(features, rust_version)?))
 }
 
-/// Build/load pipeline errors, surfaced through `EnvError` by `manifest.rs` / `env.rs`
-#[derive(Debug)]
-pub enum ImageError {
-    Walk(String),
-    Bundle(String),
-    ReadFile { path: PathBuf, err: std::io::Error },
-    DockerBuild { stderr_tail: String },
-    KindLoad { stderr_tail: String },
-    KindClusterMissing { cluster: String, available: String },
-    DockerPush { stderr_tail: String },
-    KindImageQuery { stderr_tail: String },
-    Spawn { cmd: String, err: std::io::Error },
-    GitFetch { rev: String, stderr_tail: String },
-    DevImageMissing { image: String, source: String },
-}
-
-impl std::fmt::Display for ImageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ImageError::Walk(s) => write!(f, "image build: walk context: {s}"),
-            ImageError::Bundle(s) => write!(f, "image build: assemble source bundle: {s}"),
-            ImageError::ReadFile { path, err } => {
-                write!(f, "image build: read {}: {err}", path.display())
-            }
-            ImageError::DockerBuild { stderr_tail } => {
-                write!(f, "image build: docker build failed:\n{stderr_tail}")
-            }
-            ImageError::KindLoad { stderr_tail } => {
-                write!(f, "image build: kind load failed:\n{stderr_tail}")
-            }
-            ImageError::KindClusterMissing { cluster, available } => write!(
-                f,
-                "kind cluster `{cluster}` is not running (have: {available}). \
-                 Create it with `kind create cluster --name {cluster}`, then \
-                 `ztest cluster setup`, \
-                 or point at another cluster with `ztest run --cluster <name>`.",
-            ),
-            ImageError::DockerPush { stderr_tail } => {
-                write!(f, "image build: docker push failed:\n{stderr_tail}")
-            }
-            ImageError::KindImageQuery { stderr_tail } => {
-                write!(f, "image build: cluster image query failed:\n{stderr_tail}")
-            }
-            // NotFound = binary absent, not a broken invocation (devShell without `kind` on PATH)
-            ImageError::Spawn { cmd, err } if err.kind() == std::io::ErrorKind::NotFound => {
-                let bin = cmd.split_whitespace().next().unwrap_or(cmd);
-                write!(f, "image build: `{bin}` not on PATH; needed to run `{cmd}`")
-            }
-            ImageError::Spawn { cmd, err } => write!(f, "image build: spawn {cmd}: {err}"),
-            ImageError::GitFetch { rev, stderr_tail } => {
-                write!(f, "image build: git fetch of rev {rev} failed:\n{stderr_tail}")
-            }
-            ImageError::DevImageMissing { image, source } => write!(
-                f,
-                "dev image `{image}` not in the build manifest (declared by {source}). \
-                 Run `ztest run …` instead of `cargo test` / `cargo nextest run` — \
-                 the preflight pipeline is the only thing that builds and loads dev images.",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ImageError {}
+pub use crate::error::ImageError;
 
 /// `base` = source content digest: bundle digest for `Local`, empty for `Git` (its rev
 /// already content-addresses)
@@ -597,7 +494,7 @@ fn toolchain_rust_version(context: &Path) -> Option<String> {
 
 /// `RUST_VERSION` build-arg, `None` to leave the Dockerfile's own default standing.
 /// Order: pinned → `rust-toolchain.toml` channel → nothing
-pub(crate) fn build_arg_rust_version(pinned: Option<&str>, context: &Path) -> Option<String> {
+pub fn build_arg_rust_version(pinned: Option<&str>, context: &Path) -> Option<String> {
     pinned.map(str::to_owned).or_else(|| toolchain_rust_version(context))
 }
 
@@ -644,7 +541,7 @@ mod tests {
             let features: Vec<String> = features.iter().map(|s| s.to_string()).collect();
             let source =
                 DevSource::Local { dockerfile: self.dockerfile(), context: self.dir.clone() };
-            dev_tag(&source, &features, "zingo", rust).unwrap()
+            dev_tag(&source, &features, "zainod", rust).unwrap()
         }
     }
 
@@ -662,7 +559,7 @@ mod tests {
         let b = Ctx::new(df, "main.rs", b"fn main() {}");
         assert_eq!(a.tag(&[]), b.tag(&[]));
         // Real `<repo>:dev-<hash>` shape
-        assert!(a.tag(&[]).starts_with("zingo:dev-"));
+        assert!(a.tag(&[]).starts_with("zainod:dev-"));
     }
 
     /// Poison guard: a one-byte source diff (long session at S1, agent edits to S2 in
@@ -680,7 +577,7 @@ mod tests {
     fn differing_features_fork_the_tag() {
         let df = "FROM scratch\nCOPY main.rs /\n";
         let a = Ctx::new(df, "main.rs", b"fn main() {}");
-        assert_ne!(a.tag(&[]), a.tag(&["zingo"]));
+        assert_ne!(a.tag(&[]), a.tag(&["librustzcash"]));
         assert_ne!(a.tag(&["a"]), a.tag(&["a", "b"]));
     }
 

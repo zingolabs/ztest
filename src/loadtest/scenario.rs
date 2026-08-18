@@ -23,7 +23,7 @@ pub enum Scenario {
 }
 
 impl Scenario {
-    pub(crate) fn op_kind(&self) -> OpKind {
+    pub fn op_kind(&self) -> OpKind {
         match self {
             Scenario::BlockRangeSweep { .. } => OpKind::GetBlockRange,
         }
@@ -31,7 +31,7 @@ impl Scenario {
 
     /// Inclusive `(start, end)` for connection `index` of `count`. Windows may overlap when
     /// `blocks * count` > pool (the point is concurrent readers, not disjoint coverage)
-    pub(crate) fn range_for(&self, index: usize, count: usize) -> (u64, u64) {
+    pub fn range_for(&self, index: usize, count: usize) -> (u64, u64) {
         match self {
             Scenario::BlockRangeSweep { pool, blocks, dist } => {
                 let pool_size = pool.end.saturating_sub(pool.start);

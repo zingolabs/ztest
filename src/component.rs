@@ -16,7 +16,7 @@ pub enum ComponentCategory {
 
 impl ComponentCategory {
     /// Lowercase tag for `component=` in the provisioning diagnostics (see [`crate::env`])
-    pub(crate) fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             ComponentCategory::Validator => "validator",
             ComponentCategory::Indexer => "indexer",
@@ -29,9 +29,9 @@ impl ComponentCategory {
 /// [`Validator::custom`] + the [`ComponentBuilder`] chain, never by struct literal
 #[derive(Debug, Clone)]
 pub struct Validator<B: ValidatorConfig> {
-    pub(crate) backend: B,
-    pub(crate) opts: ComponentOpts,
-    pub(crate) tunings: Vec<B::Tuning>,
+    pub backend: B,
+    pub opts: ComponentOpts,
+    pub tunings: Vec<B::Tuning>,
 }
 
 /// Tuning token for a knobless backend. Uninhabited, so
@@ -55,17 +55,17 @@ pub enum IndexerMode {
 
 #[derive(Debug, Clone)]
 pub struct Indexer<B: IndexerConfig> {
-    pub(crate) backend: B,
-    pub(crate) opts: ComponentOpts,
-    pub(crate) tunings: Vec<B::Tuning>,
-    pub(crate) mode: IndexerMode,
+    pub backend: B,
+    pub opts: ComponentOpts,
+    pub tunings: Vec<B::Tuning>,
+    pub mode: IndexerMode,
 }
 
 #[derive(Debug, Clone)]
 pub struct Wallet<B: WalletConfig> {
-    pub(crate) backend: B,
-    pub(crate) opts: ComponentOpts,
-    pub(crate) tunings: Vec<B::Tuning>,
+    pub backend: B,
+    pub opts: ComponentOpts,
+    pub tunings: Vec<B::Tuning>,
 }
 
 /// Config shared by every component variant.
@@ -77,22 +77,22 @@ pub struct Wallet<B: WalletConfig> {
 ///   [`TestEnv::build`](crate::TestEnv::build) rejects a disagreement
 #[derive(Debug, Clone, Default)]
 pub struct ComponentOpts {
-    pub(crate) name: Option<String>,
-    pub(crate) version: String,
-    pub(crate) image: crate::backends::image::ImageSpec,
-    pub(crate) mounts: Vec<Mount>,
-    pub(crate) resources: Option<Resources>,
-    pub(crate) extra_ports: Vec<(String, u16)>,
-    pub(crate) command: Option<Vec<String>>,
-    pub(crate) args: Option<Vec<String>>,
-    pub(crate) env: Vec<(String, String)>,
-    pub(crate) regtest: bool,
-    pub(crate) peers: Vec<String>,
-    pub(crate) funding_streams: Option<crate::regtest::FundingStreams>,
-    pub(crate) lockbox_disbursements: Option<Vec<crate::regtest::LockboxDisbursement>>,
-    pub(crate) shared_state: Option<SharedState>,
-    pub(crate) coinbase_pool: Option<Pool>,
-    pub(crate) restore: Option<RestoreSource>,
+    pub name: Option<String>,
+    pub version: String,
+    pub image: crate::inventory::ImageSpec,
+    pub mounts: Vec<Mount>,
+    pub resources: Option<Resources>,
+    pub extra_ports: Vec<(String, u16)>,
+    pub command: Option<Vec<String>>,
+    pub args: Option<Vec<String>>,
+    pub env: Vec<(String, String)>,
+    pub regtest: bool,
+    pub peers: Vec<String>,
+    pub funding_streams: Option<crate::regtest::FundingStreams>,
+    pub lockbox_disbursements: Option<Vec<crate::regtest::LockboxDisbursement>>,
+    pub shared_state: Option<SharedState>,
+    pub coinbase_pool: Option<Pool>,
+    pub restore: Option<RestoreSource>,
 }
 
 /// Source of a component's pre-existing on-disk state. `Archive` covers a synced
@@ -110,7 +110,7 @@ pub enum RestoreSource {
 /// [`crate::SharedVolume`]
 #[derive(Debug, Clone)]
 pub struct SharedState {
-    pub(crate) mount_path: String,
+    pub mount_path: String,
 }
 
 /// CPU, in millicores
@@ -215,119 +215,13 @@ impl serde::Serialize for Mem {
 /// [`ComponentBuilder::resources`]
 #[derive(Debug, Clone, Copy)]
 pub struct Resources {
-    pub(crate) cpu: Cpu,
-    pub(crate) memory: Mem,
+    pub cpu: Cpu,
+    pub memory: Mem,
 }
 
 impl std::fmt::Display for Resources {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} / {}", self.cpu, self.memory)
-    }
-}
-
-fn opts_for(version: &str, default_name: &'static str) -> ComponentOpts {
-    use crate::backends::image::ImageSpec;
-    ComponentOpts {
-        version: version.to_string(),
-        name: Some(default_name.to_string()),
-        image: ImageSpec::Published,
-        ..ComponentOpts::default()
-    }
-}
-
-/// `features` originate solely in the `dev!` macro — runtime `ImageSpec` and
-/// inventory decl must carry the same set for the build manifest's
-/// [`DevImageId`](crate::backends::image::DevImageId) lookup to hit
-fn opts_dev(
-    source: crate::backends::image::DevSource,
-    version: String,
-    features: Vec<String>,
-    default_name: &'static str,
-) -> ComponentOpts {
-    use crate::backends::image::ImageSpec;
-    ComponentOpts {
-        version,
-        name: Some(default_name.to_string()),
-        image: ImageSpec::Dev {
-            source,
-            features,
-            repo: default_repo_for(default_name).to_string(),
-            rust_version: None,
-        },
-        ..ComponentOpts::default()
-    }
-}
-
-fn default_repo_for(component: &str) -> &'static str {
-    match component {
-        "zebrad" | "zcashd" | "zainod" => component_static(component),
-        _ => "unknown",
-    }
-}
-
-fn component_static(component: &str) -> &'static str {
-    match component {
-        "zebrad" => "zebrad",
-        "zcashd" => "zcashd",
-        "zainod" => "zainod",
-        "zingo" => "zingo",
-        _ => "unknown",
-    }
-}
-
-// ───────────────────────────── constructors ───────────────────────────
-
-use crate::backends::lightwalletd::LightwalletdBackend;
-use crate::backends::zainod::ZainoBackend;
-use crate::backends::zcashd::ZcashdBackend;
-use crate::backends::zebra::ZebraBackend;
-#[cfg(feature = "zingo")]
-use crate::backends::zingo::ZingoBackend;
-
-impl Validator<ZebraBackend> {
-    pub fn zebrad(version: impl Into<String>) -> Self {
-        Self {
-            backend: ZebraBackend,
-            opts: opts_for(&version.into(), "zebrad"),
-            tunings: Vec::new(),
-        }
-    }
-    /// zebrad from a local Dockerfile or pinned git rev (see `dev!`). `version`
-    /// must be real semver, never the `"dev"` sentinel — the regtest config and
-    /// NU ceiling derive from it
-    #[doc(hidden)]
-    pub fn zebrad_dev(
-        source: crate::backends::image::DevSource,
-        version: impl Into<String>,
-        features: Vec<String>,
-    ) -> Self {
-        Self {
-            backend: ZebraBackend,
-            opts: opts_dev(source, version.into(), features, "zebrad"),
-            tunings: Vec::new(),
-        }
-    }
-}
-
-impl Validator<ZcashdBackend> {
-    pub fn zcashd(version: impl Into<String>) -> Self {
-        Self {
-            backend: ZcashdBackend,
-            opts: opts_for(&version.into(), "zcashd"),
-            tunings: Vec::new(),
-        }
-    }
-    #[doc(hidden)]
-    pub fn zcashd_dev(
-        source: crate::backends::image::DevSource,
-        version: impl Into<String>,
-        features: Vec<String>,
-    ) -> Self {
-        Self {
-            backend: ZcashdBackend,
-            opts: opts_dev(source, version.into(), features, "zcashd"),
-            tunings: Vec::new(),
-        }
     }
 }
 
@@ -337,67 +231,9 @@ impl<B: ValidatorConfig> Validator<B> {
     }
 }
 
-impl Indexer<ZainoBackend> {
-    pub fn zaino(version: impl Into<String>) -> Self {
-        Self {
-            backend: ZainoBackend,
-            opts: opts_for(&version.into(), "zainod"),
-            tunings: Vec::new(),
-            mode: IndexerMode::None,
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn zainod_dev(
-        source: crate::backends::image::DevSource,
-        version: impl Into<String>,
-        features: Vec<String>,
-    ) -> Self {
-        Self {
-            backend: ZainoBackend,
-            opts: opts_dev(source, version.into(), features, "zainod"),
-            tunings: Vec::new(),
-            mode: IndexerMode::None,
-        }
-    }
-}
-
-impl Indexer<LightwalletdBackend> {
-    pub fn lightwalletd(version: impl Into<String>) -> Self {
-        Self {
-            backend: LightwalletdBackend,
-            opts: opts_for(&version.into(), "lightwalletd"),
-            tunings: Vec::new(),
-            mode: IndexerMode::None,
-        }
-    }
-}
-
 impl<B: IndexerConfig> Indexer<B> {
     pub fn custom(backend: B, opts: ComponentOpts) -> Self {
         Self { backend, opts, tunings: Vec::new(), mode: IndexerMode::None }
-    }
-}
-
-#[cfg(feature = "librustzcash")]
-impl Wallet<crate::backends::librustzcash::LrzBackend> {
-    /// ztest's default in-process wallet: pure-Rust `zcash_client_backend`, syncing
-    /// over the indexer's gRPC, shielded txs from bundled Sapling params. Pass to
-    /// [`TestEnv::add_wallet`](crate::env::TestEnv::add_wallet), then
-    /// [`WalletExt::account`](crate::handles::wallet::WalletExt::account)
-    pub fn librustzcash() -> Self {
-        Self::new(crate::backends::librustzcash::LrzBackend)
-    }
-}
-
-#[cfg(feature = "zingo")]
-impl Wallet<ZingoBackend> {
-    /// In-process zingolib wallet: `LightClient`s in the test binary against the
-    /// indexer's gRPC, no pod. Pass to
-    /// [`TestEnv::add_wallet`](crate::env::TestEnv::add_wallet), then
-    /// [`WalletExt::account`](crate::handles::wallet::WalletExt::account)
-    pub fn zingo() -> Self {
-        Self::new(ZingoBackend)
     }
 }
 
@@ -495,7 +331,7 @@ pub trait ComponentBuilder: Sized {
     /// those pre-build); anything else fails loud at `build()` with
     /// `DevImageMissing`. No-op on a published image. See `docs/guide-writing-tests.md`
     fn rust_version(mut self, version: impl Into<String>) -> Self {
-        if let crate::backends::image::ImageSpec::Dev { rust_version, .. } =
+        if let crate::inventory::ImageSpec::Dev { rust_version, .. } =
             &mut self.component_opts_mut().image
         {
             *rust_version = Some(version.into());
@@ -574,7 +410,7 @@ impl ComponentOptsBuilder {
         self.opts.version = version.into();
         self
     }
-    pub fn image(mut self, image: crate::backends::image::ImageSpec) -> Self {
+    pub fn image(mut self, image: crate::inventory::ImageSpec) -> Self {
         self.opts.image = image;
         self
     }

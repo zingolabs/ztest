@@ -10,17 +10,17 @@
 
 use std::time::Instant;
 
-use crate::cli::console::{Console, run_child};
 use crate::pipeline::remote_compile::{
     self, Phase, PhaseSink, RUNNER_DOCKERFILE, RemoteCompileOutcome, SourceLayout, TempDir,
 };
+use crate::proc::{self, ChildHost};
 
 /// `list_args` = the `cargo nextest list` argv every path passes; `run_id` tags
 /// the image
 pub async fn bake_locally(
     list_args: &[String],
     run_id: &str,
-    console: Option<&Console>,
+    host: Option<&dyn ChildHost>,
     on_phase: Option<PhaseSink<'_>>,
 ) -> Result<RemoteCompileOutcome, String> {
     let mut on_phase = on_phase;
@@ -44,7 +44,7 @@ pub async fn bake_locally(
         .map_err(|e| format!("write runner Dockerfile: {e}"))?;
     emit(Phase::Done { label: "build context staged", dur: t.elapsed() });
 
-    let tag = format!("{}:dev-{run_id}", crate::engine::pod_runner::RUNNER_REPO);
+    let tag = format!("{}:dev-{run_id}", crate::naming::RUNNER_REPO);
     let reference = crate::backends::image::pod_reference(&tag);
     let workspace_rel = src.workspace_rel.to_string_lossy().into_owned();
     // Quoted per arg, not joined: the Dockerfile `eval`s NEXTEST_ARGS, so `-E test(=x)`
@@ -73,7 +73,7 @@ pub async fn bake_locally(
     let mut argv = common("runner");
     argv.extend(["-t".into(), reference.clone()]);
     argv.push(ctx.to_string_lossy().into_owned());
-    docker(console, &argv, &envs, "runner build").await?;
+    docker(host, &argv, &envs, "runner build").await?;
     emit(Phase::Done { label: "runner image built", dur: t.elapsed() });
 
     emit(Phase::Start("dumping test inventory"));
@@ -82,7 +82,7 @@ pub async fn bake_locally(
     let mut argv = common("inventory-export");
     argv.extend(["--output".into(), format!("type=local,dest={}", inv.to_string_lossy())]);
     argv.push(ctx.to_string_lossy().into_owned());
-    docker(console, &argv, &envs, "inventory export").await?;
+    docker(host, &argv, &envs, "inventory export").await?;
     let list_json = std::fs::read_to_string(inv.join("list.json"))
         .map_err(|e| format!("read exported list.json: {e}"))?;
     let inventory = std::fs::read_to_string(inv.join("inventory.jsonl"))
@@ -93,7 +93,7 @@ pub async fn bake_locally(
 
     emit(Phase::Start("publishing the runner image"));
     let t = Instant::now();
-    publish(console, &reference).await?;
+    publish(host, &reference).await?;
     emit(Phase::Done { label: "runner image published", dur: t.elapsed() });
     emit(Phase::Note(&format!("runner image ready: {reference}")));
     Ok(outcome)
@@ -101,38 +101,38 @@ pub async fn bake_locally(
 
 /// Registry push, else kind side-load — same choice
 /// [`crate::backends::image::from_env`] makes for `dev!`
-async fn publish(console: Option<&Console>, reference: &str) -> Result<(), String> {
+async fn publish(host: Option<&dyn ChildHost>, reference: &str) -> Result<(), String> {
     use crate::backends::image::{docker as docker_backend, kind};
 
     if crate::backends::image::registry_configured() {
         let argv = docker_backend::docker_push_argv(reference);
-        return docker(console, &argv, &[], "runner push").await;
+        return docker(host, &argv, &[], "runner push").await;
     }
     tokio::task::spawn_blocking(kind::ensure_kind_cluster)
         .await
         .map_err(|e| format!("kind preflight: {e}"))?
         .map_err(|e| e.to_string())?;
     let argv = kind::kind_load_argv(reference);
-    run(console, "kind", &argv, &[], "kind load").await
+    run(host, "kind", &argv, &[], "kind load").await
 }
 
 async fn docker(
-    console: Option<&Console>,
+    host: Option<&dyn ChildHost>,
     argv: &[String],
     envs: &[(&str, String)],
     step: &str,
 ) -> Result<(), String> {
-    run(console, "docker", argv, envs, step).await
+    run(host, "docker", argv, envs, step).await
 }
 
 async fn run(
-    console: Option<&Console>,
+    host: Option<&dyn ChildHost>,
     program: &str,
     argv: &[String],
     envs: &[(&str, String)],
     step: &str,
 ) -> Result<(), String> {
-    let code = run_child(console, program, argv, envs)
+    let code = proc::run(host, program, argv, envs)
         .await
         .map_err(|e| format!("spawn `{program}` for the {step} (is it on PATH?): {e}"))?;
     if code != 0 {

@@ -8,15 +8,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::handles::client::JsonRpcClient;
-use crate::handles::{Endpoint, HandleInner};
+use crate::handles::HandleInner;
+use crate::protocol::Endpoint;
+use crate::protocol::client::JsonRpcClient;
 use crate::{EnvError, RpcError};
 
-pub use crate::handles::types::BlockHash;
 pub use crate::proto::{
     CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo, RawTransaction, SendResponse,
     SubtreeRoot, TreeState,
 };
+pub use crate::protocol::types::BlockHash;
 // orchard-0.15 renamed `ShieldedProtocol` → `ShieldedPool`; re-export under the historical
 // name (stable public API, no deprecation warning)
 pub use zcash_protocol::ShieldedPool as ShieldedProtocol;

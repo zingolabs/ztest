@@ -215,17 +215,14 @@ impl Profile {
 /// ztest's user config directory: the *installation*, not the invocation
 /// directory (`ztest run` runs from whichever repo holds the tests, routinely not
 /// the one holding the fixtures — so credentials cannot live in a repo `.envrc`)
-pub fn config_dir() -> PathBuf {
-    match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        Some(x) => PathBuf::from(x).join("ztest"),
-        None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-            .join(".config")
-            .join("ztest"),
-    }
+/// Inside a pod with a service account token mounted? Selects direct pod-IP dial vs
+/// kube-rs portforward
+pub fn in_cluster() -> bool {
+    std::env::var("KUBERNETES_SERVICE_HOST").is_ok()
 }
 
 fn config_path() -> PathBuf {
-    config_dir().join("clusters.toml")
+    crate::paths::config_dir().join("clusters.toml")
 }
 
 /// Missing file → empty config
@@ -317,7 +314,7 @@ fn listed<'a>(items: impl Iterator<Item = &'a str>) -> String {
 }
 
 fn verify_context(context: &str) -> Result<(), String> {
-    if crate::cluster::in_cluster() {
+    if crate::cluster_config::in_cluster() {
         return Ok(());
     }
     let config = Kubeconfig::read()
@@ -337,7 +334,7 @@ pub fn active_context() -> Option<String> {
     if let Some(ctx) = std::env::var(KUBE_CONTEXT_ENV).ok().filter(|s| !s.is_empty()) {
         return Some(ctx);
     }
-    if crate::cluster::in_cluster() {
+    if crate::cluster_config::in_cluster() {
         return None;
     }
     Kubeconfig::read().ok()?.current_context
@@ -353,6 +350,35 @@ pub fn active_storage_driver() -> Option<String> {
 pub fn active_registry() -> (Option<String>, Option<String>) {
     let read = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
     (read(PUSH_REGISTRY_ENV), read(REGISTRY_ENV))
+}
+
+/// `providerID` schemes whose node is itself a container. Only kind is listed: `k3s://` also
+/// covers bare-metal k3s, so matching it would relocate clusters that profile fine
+const NESTED_PROVIDERS: [&str; 1] = ["kind://"];
+
+/// Kubelet itself runs in a container (kind), so every pod sits one pid-namespace below the
+/// initial one. Unreadable node = `false`: a probe failure must not relocate anything
+pub async fn kubelet_is_nested(client: &kube::Client) -> bool {
+    use k8s_openapi::api::core::v1::Node;
+    let nodes: kube::Api<Node> = kube::Api::all(client.clone());
+    let nested = async {
+        let list = nodes.list(&kube::api::ListParams::default().limit(1)).await.ok()?;
+        let id = list.items.first()?.spec.as_ref()?.provider_id.clone()?;
+        Some(NESTED_PROVIDERS.iter().any(|scheme| id.starts_with(scheme)))
+    }
+    .await;
+    nested.unwrap_or(false)
+}
+
+/// Requested seed-PVC size = floor for every clone off its snapshot. Non-private because
+/// `seeds::read_seed_handle` falls back to it when a driver reports no `restoreSize`.
+///
+/// - Holds the *extracted chain archive* only (indexer DBs = per-pod `emptyDir`)
+/// - Default > deepest registered artifact (mainnet 1,693,104 = 30.5 GiB extracted)
+/// - Flat, not per-artifact from `ChainInfo::uncompressed_bytes` (a full-mainnet rung
+///   would need ~258 GiB → sizing belongs on the handle, not on one global)
+pub fn seed_size() -> String {
+    std::env::var("ZTEST_SEED_SIZE").unwrap_or_else(|_| "48Gi".into())
 }
 
 #[cfg(test)]

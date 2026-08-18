@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "The `#[ztest::sync_test]` attribute grammar, shared by the proc-macro that expands it and the CLI that scans source for it."
 
 [dependencies]

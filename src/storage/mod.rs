@@ -7,7 +7,7 @@
 //! - Runner pods have no checkout and no bucket credentials → the multi-GB stream
 //!   must never enter ztest's address space in either direction
 
-pub(crate) mod r2;
+pub mod r2;
 
 /// Seed `tar` compression, from the artifact's filename. Resolved here because GNU
 /// `tar` can't auto-detect on the non-seekable `curl` body the puller feeds it
@@ -46,15 +46,15 @@ pub fn seed_sha8(oid: &str) -> &str {
 /// - `size_bytes` compressed → transfer budget + progress denominator
 /// - `uncompressed_bytes` extracted → seed PVC size
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Digest {
-    pub(crate) sha256: String,
-    pub(crate) size_bytes: u64,
-    pub(crate) uncompressed_bytes: u64,
+pub struct Digest {
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub uncompressed_bytes: u64,
 }
 
 /// Measure `archive` in **one** read: hash the compressed bytes on the way into the
 /// decompressor, count what comes out. A 21 GB artifact is streamed, never buffered
-pub(crate) fn digest_of(archive: &std::path::Path) -> Result<Digest, String> {
+pub fn digest_of(archive: &std::path::Path) -> Result<Digest, String> {
     /// Hashes and counts every byte pulled through it, so the compressed digest and the
     /// decompressed size come from the same pass over the file
     struct Tap<R> {
@@ -125,7 +125,7 @@ pub fn seed_pvc_name(oid: &str, driver: &str) -> String {
 
 /// Sole detector; no magic-byte fallback (name from the manifest, bytes in R2 —
 /// nothing local to sniff)
-pub(crate) fn compression_from_name(name: &str) -> Option<Compression> {
+pub fn compression_from_name(name: &str) -> Option<Compression> {
     let name = name.to_ascii_lowercase();
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         Some(Compression::Gzip)

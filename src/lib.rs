@@ -15,6 +15,7 @@ extern crate self as ztest;
 
 // ───────────────────────── test-author API ─────────────────────────────
 // Supported surface, covered by ztest's SemVer
+pub mod api;
 pub mod archive;
 pub mod backends;
 pub mod component;
@@ -31,16 +32,13 @@ pub mod snapshots;
 pub mod topology;
 
 // ───────────────────────── internal machinery ──────────────────────────
-// `pub` only for reach from outside the library: the `ztest` binary (`cli`), or a
-// consumer-crate proc-macro expansion, which can only name `::ztest::` paths
-// (`inventory`, `qos`, `sync`). Doc-hidden, outside SemVer — treat as private
+// Private: `ztest_ui` / `ztest_cli` reach core through `api` only.
+// `qos` / `sync` are test-author API (`#[ztest::qos::wallet]`, `SyncRunner`), so they are
+// documented, not hidden. Macro-expansion paths live in `macro_support`
+mod inventory;
 #[doc(hidden)]
-pub mod cli;
-#[doc(hidden)]
-pub mod inventory;
-#[doc(hidden)]
+pub mod macro_support;
 pub mod qos;
-#[doc(hidden)]
 pub mod sync;
 
 mod cancel;
@@ -48,6 +46,8 @@ mod capability;
 mod cluster;
 mod cluster_config;
 mod engine;
+mod fmt;
+mod libtest;
 mod logstream;
 mod manifest;
 mod materialize;
@@ -55,18 +55,22 @@ mod metrics;
 mod mounts;
 mod naming;
 mod observ;
+mod paths;
 mod pipeline;
 mod plan;
 mod pod_status;
 mod podmetrics;
 mod portforward;
+pub mod ports;
+pub mod proc;
 mod profiling;
+mod progress;
 mod proto;
 pub mod rate;
 mod resource;
 mod seeds;
 mod storage;
-mod ui;
+mod storage_class;
 
 // ─────────────────────────── top-level re-exports ──────────────────────
 
@@ -78,15 +82,12 @@ pub use crate::backends::lightwalletd::LightwalletdIndexer;
 pub use crate::backends::zainod::ZainoIndexer;
 pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::ZebraValidator;
-#[cfg(feature = "zingo")]
-pub use crate::backends::zingo::{ZingoBackend, ZingoWallet};
 pub use crate::component::{
     ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Cpu, Indexer, Mem,
     Resources, Validator, Wallet,
 };
 pub use crate::env::{SharedVolume, TestEnv};
 pub use crate::error::{EnvError, RpcError};
-pub use crate::handles::client::{BlockSample, JsonRpcClient};
 pub use crate::handles::indexer::{
     BlockHash, BlockHeight, CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo,
     RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, TreeState, TxId, ZatBalance,
@@ -99,13 +100,15 @@ pub use crate::handles::wallet::{
     WalletExt,
 };
 pub use crate::handles::{
-    Endpoint, HandleInner, IndexerBackend, IndexerConfig, ValidatorBackend, ValidatorConfig,
-    WalletBackend, WalletConfig,
+    HandleInner, IndexerBackend, IndexerConfig, ValidatorBackend, ValidatorConfig, WalletBackend,
+    WalletConfig,
 };
 pub use crate::loadtest::{
     BlockOracle, Distribution, LoadDriver, LoadReport, LwdClient, Rel, Scenario,
 };
 pub use crate::mount::{Mount, MountKind, MountSource};
+pub use crate::protocol::Endpoint;
+pub use crate::protocol::client::{BlockSample, JsonRpcClient};
 pub use ztest_macros::{artifact, dev, mount_archive, mount_config, mount_file, needs, sync_test};
 
 /// Runtime support for test-author proc macros. Not public API, paths may move
@@ -133,7 +136,7 @@ macro_rules! validator_tests {
     ($kind:expr, $( $name:ident => $helper:ident ),* $(,)?) => {
         $(
             #[tokio::test(flavor = "multi_thread")]
-            pub(crate) async fn $name() {
+            pub async fn $name() {
                 $helper(&$kind).await;
             }
         )*
@@ -147,8 +150,6 @@ macro_rules! validator_tests {
 /// Entry bar: the item appears in a public signature test authors touch.
 /// Convenience-only re-exports = SemVer noise tying ztest's version to upstream churn
 pub mod prelude {
-    #[cfg(feature = "zingo")]
-    pub use super::ZingoWallet;
     pub use super::{
         Account, AccountId, BlockHash, BlockHeight, BlockSample, BlockTip, BlockchainInfo,
         ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Cpu,

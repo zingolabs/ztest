@@ -20,9 +20,6 @@ use crate::pod_status::{
     pull_error_is_terminal,
 };
 
-/// Image repo of the baked tests image (`docs/design-remote-execution.md`)
-pub const RUNNER_REPO: &str = "ztest-runner";
-
 /// Everything the pod executor needs that isn't per-test.
 ///
 /// - `image_pull_policy`/`service_account` `None` → cluster default; that SA needs RBAC
@@ -576,6 +573,7 @@ mod tests {
             capture: true,
             color: false,
             ztest_log: None,
+            image_refs: BTreeMap::new(),
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
@@ -607,6 +605,7 @@ mod tests {
             capture: true,
             color: false,
             ztest_log: None,
+            image_refs: BTreeMap::new(),
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
@@ -701,6 +700,7 @@ mod tests {
             capture: true,
             color: false,
             ztest_log: None,
+            image_refs: BTreeMap::new(),
         };
         let mut refs = BTreeMap::new();
         refs.insert("k".to_string(), "reg.svc:5000/ns/zainod:dev-abc".to_string());
@@ -724,6 +724,7 @@ mod tests {
             capture: true,
             color: false,
             ztest_log: None,
+            image_refs: BTreeMap::new(),
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
@@ -742,6 +743,7 @@ mod tests {
             capture: true,
             color: false,
             ztest_log: Some("ztest::build=debug".into()),
+            image_refs: BTreeMap::new(),
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
@@ -761,6 +763,7 @@ mod tests {
             capture: true,
             color: false,
             ztest_log: None,
+            image_refs: BTreeMap::new(),
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
@@ -781,6 +784,7 @@ mod tests {
             capture: true,
             color: false,
             ztest_log: None,
+            image_refs: BTreeMap::new(),
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());

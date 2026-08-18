@@ -14,20 +14,21 @@ use super::ImageError;
 
 /// Names always excluded, `.dockerignore` or not: build output, VCS and JS-dependency
 /// trees, none of which belong to a source build
-pub(crate) const DEFAULT_IGNORES: [&str; 3] = ["target", ".git", "node_modules"];
+pub const DEFAULT_IGNORES: [&str; 3] = ["target", ".git", "node_modules"];
 
 /// Where the Dockerfile is staged in the archive — the one path `.dockerignore` can't touch
 const DOCKERFILE: &str = "Dockerfile";
 
 #[allow(dead_code)] // `tar` is the packed context, kept for the on-cluster builder
-pub(crate) struct Bundle {
+#[derive(Debug)]
+pub struct Bundle {
     pub tar: Vec<u8>,
     pub digest: String,
 }
 
 /// `dockerfile` staged at the tar's root as `Dockerfile`, whatever its name on disk.
 /// Determinism rules: module docs
-pub(crate) fn pack(context: &Path, dockerfile: &Path) -> Result<Bundle, ImageError> {
+pub fn pack(context: &Path, dockerfile: &Path) -> Result<Bundle, ImageError> {
     let ignore = Ignore::load(context);
     let mut entries = collect(context, &ignore)?;
 

@@ -12,9 +12,9 @@ use serde_json::{Value, json};
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::RpcError;
-use crate::handles::client::AuthedRpc;
+use crate::protocol::client::AuthedRpc;
 // Response envelopes are interface types owned by `handles::types`
-use crate::handles::types::{BlockHash, BlockTip, BlockchainInfo, MempoolInfo, Peer, PeerInfo};
+use crate::protocol::types::{BlockHash, BlockTip, BlockchainInfo, MempoolInfo, Peer, PeerInfo};
 use crate::regtest::parse_activation_heights_from_rpc;
 
 // ──────────────────────────────── client ───────────────────────────────

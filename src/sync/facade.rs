@@ -33,7 +33,7 @@ pub enum PerformanceLevel {
 
 impl PerformanceLevel {
     /// Compact-block batch size for `zcash_client_backend::sync::run`
-    pub(crate) fn batch_size(self) -> u32 {
+    pub fn batch_size(self) -> u32 {
         match self {
             PerformanceLevel::Low => 25,
             PerformanceLevel::Medium => 100,

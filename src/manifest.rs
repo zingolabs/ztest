@@ -204,7 +204,7 @@ fn pod_is_guaranteed(spec: &Value) -> bool {
         .all(|list| list.as_array().map(|cs| cs.iter().all(has_cpu_mem_limits)).unwrap_or(true))
 }
 
-pub(crate) fn merge_ports(defaults: &[(&str, u16)], extra: &[(String, u16)]) -> Vec<(String, u16)> {
+pub fn merge_ports(defaults: &[(&str, u16)], extra: &[(String, u16)]) -> Vec<(String, u16)> {
     let mut out: Vec<(String, u16)> =
         defaults.iter().map(|(n, p)| ((*n).to_string(), *p)).collect();
     for (n, p) in extra {
@@ -217,7 +217,7 @@ pub(crate) fn merge_ports(defaults: &[(&str, u16)], extra: &[(String, u16)]) -> 
 
 /// Resolved-image result → pod image string, tagging any failure with the
 /// component name for the surfaced [`EnvError`]
-pub(crate) fn resolve_image(
+pub fn resolve_image(
     resolved: Result<backends::image::ResolvedImage, backends::image::ImageError>,
     component: &'static str,
 ) -> Result<String, EnvError> {
@@ -226,7 +226,7 @@ pub(crate) fn resolve_image(
         .map_err(|source| EnvError::ImageBuild { component: component.into(), source })
 }
 
-// No wallet pod spec: wallets run in-process (`crate::backends::zingo`)
+// No wallet pod spec: wallets run in-process (`crate::backends::librustzcash`)
 
 #[cfg(test)]
 mod tests {

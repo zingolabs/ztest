@@ -15,15 +15,17 @@ use tokio::sync::Mutex;
 use std::net::{IpAddr, Ipv4Addr};
 
 use crate::EnvError;
-use crate::cluster::{self, Sentinel};
+use crate::cluster;
 use crate::component::{ComponentOpts, Indexer, Validator, Wallet};
 use crate::error::env_err;
+use crate::naming::Sentinel;
 use crate::topology::ActivationHeights;
 
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
 use crate::handles::validator::{ValidatorBackend, ValidatorConfig};
 use crate::handles::wallet::WalletConfig;
-use crate::handles::{Endpoint, ForwardRegistry, HandleInner};
+use crate::handles::{ForwardRegistry, HandleInner};
+use crate::protocol::Endpoint;
 
 /// Regtest materialization captured per validator at `add_validator`, applied once the
 /// activation heights are known (so the concrete backend need not be retained)
@@ -52,19 +54,19 @@ use crate::seeds::{self, SeedBinding};
 /// - Validators + indexers only (wallets run in-process)
 /// - Drives the env's readiness (and, for validators, warm) probes during [`TestEnv::build`]
 #[derive(Debug, Clone)]
-pub(crate) enum ComponentHandle {
+pub enum ComponentHandle {
     Validator(Arc<dyn ValidatorBackend>),
     Indexer(Arc<dyn IndexerBackend>),
 }
 
 /// Per-component bookkeeping captured at `build` time.
 #[derive(Debug, Clone)]
-pub(crate) struct ComponentState {
-    pub(crate) namespace: String,
-    pub(crate) pod_name: String,
-    pub(crate) label: &'static str,
-    pub(crate) named_ports: Vec<(String, u16)>,
-    pub(crate) handle: ComponentHandle,
+pub struct ComponentState {
+    pub namespace: String,
+    pub pod_name: String,
+    pub label: &'static str,
+    pub named_ports: Vec<(String, u16)>,
+    pub handle: ComponentHandle,
 }
 
 impl ComponentState {
@@ -81,20 +83,17 @@ impl ComponentState {
 
 // ────────────────────────────── EnvInner ──────────────────────────────
 
-pub(crate) struct EnvInner {
-    pub(crate) client: OnceLock<Client>,
-    pub(crate) namespace: std::sync::Mutex<Option<String>>,
-    pub(crate) components: tokio::sync::RwLock<HashMap<u64, ComponentState>>,
-    pub(crate) in_cluster: bool,
-    pub(crate) forwards: ForwardRegistry,
-    pub(crate) seed_bindings: std::sync::Mutex<Vec<SeedBinding>>,
-    pub(crate) is_built: AtomicBool,
-    /// One `kubectl logs -f` follow of every component pod, rendered into the teardown
-    /// diagnostic on failure ([`crate::logstream`]); set only on a successfully-built env
-    pub(crate) log_capture: std::sync::OnceLock<crate::logstream::LogCapture>,
+pub struct EnvInner {
+    pub client: OnceLock<Client>,
+    pub namespace: std::sync::Mutex<Option<String>>,
+    pub components: tokio::sync::RwLock<HashMap<u64, ComponentState>>,
+    pub in_cluster: bool,
+    pub forwards: ForwardRegistry,
+    pub seed_bindings: std::sync::Mutex<Vec<SeedBinding>>,
+    pub is_built: AtomicBool,
     /// Detached syncs only: keeps the lease alive (`sync start` acquires then
     /// exits → driver renews for the pods' lifetime). Unset for an ordinary run
-    pub(crate) sync_lease: std::sync::OnceLock<crate::qos::ledger::Reservation>,
+    pub sync_lease: std::sync::OnceLock<crate::qos::ledger::Reservation>,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -113,25 +112,24 @@ impl EnvInner {
             client: OnceLock::new(),
             namespace: std::sync::Mutex::new(None),
             components: tokio::sync::RwLock::new(HashMap::new()),
-            in_cluster: cluster::in_cluster(),
+            in_cluster: crate::cluster_config::in_cluster(),
             forwards: Arc::new(Mutex::new(HashMap::new())),
             seed_bindings: std::sync::Mutex::new(Vec::new()),
             is_built: AtomicBool::new(false),
-            log_capture: std::sync::OnceLock::new(),
             sync_lease: std::sync::OnceLock::new(),
         }
     }
 
-    pub(crate) fn client_ref(&self) -> Result<&Client, EnvError> {
+    pub fn client_ref(&self) -> Result<&Client, EnvError> {
         self.client.get().ok_or(EnvError::NotBuilt)
     }
 
-    pub(crate) async fn component_state(&self, id: u64) -> Result<ComponentState, EnvError> {
+    pub async fn component_state(&self, id: u64) -> Result<ComponentState, EnvError> {
         let map = self.components.read().await;
         map.get(&id).cloned().ok_or(EnvError::UnknownComponent { id })
     }
 
-    pub(crate) async fn resolve_named(
+    pub async fn resolve_named(
         &self,
         state: &ComponentState,
         name: &str,
@@ -146,7 +144,7 @@ impl EnvInner {
         self.resolve_port(state, port).await
     }
 
-    pub(crate) async fn resolve_port(
+    pub async fn resolve_port(
         &self,
         state: &ComponentState,
         container_port: u16,
@@ -390,7 +388,7 @@ impl TestEnv {
         handle
     }
 
-    /// Register an in-process wallet, returning its concrete handle (e.g. `ZingoWallet`)
+    /// Register an in-process wallet, returning its concrete handle (e.g. `LrzWallet`)
     pub fn add_wallet<B: WalletConfig>(&mut self, w: Wallet<B>) -> B::Handle {
         let id = self.fresh_id();
         let plumbing = HandleInner {
@@ -448,6 +446,7 @@ impl TestEnv {
     /// - Validator version ≠ producer version → in-place state-DB upgrade, or open failure
     /// - Components pinned to different artifacts → parity assertions compare two histories
     /// - Public archive at/without an activation → boundary assertions pass over empty data
+    ///
     /// Resolve the one snapshot this env restores; ≤1 chain in play is what makes
     /// [`chain`](Self::chain) — one answer for the whole env — well-defined.
     ///
@@ -514,7 +513,7 @@ impl TestEnv {
         };
         tracing::debug!(?activation, "regtest activation-height schedule chosen");
 
-        let p2p_port = crate::handles::ports::ZEBRAD_P2P;
+        let p2p_port = crate::ports::ZEBRAD_P2P;
         let known_validators: std::collections::HashSet<String> =
             self.pending_validators.iter().map(|p| pod_name_of(&p.opts)).collect();
         let peer_tuples_for = |opts: &ComponentOpts| -> Result<Vec<(String, u16)>, EnvError> {
@@ -709,18 +708,6 @@ impl TestEnv {
         self.materialize_phase(&ctx, &dependents).await?;
         build_phase("indexers_materialize", t_phase);
 
-        // Local path only: one arrival-ordered, pod-prefixed stream for the rest of the
-        // test (`--tail=-1` backfills Phase 1), rendered in `Drop` on failure and discarded
-        // on success. Pod path: parent owns it over the kube API (runner image has no
-        // `kubectl` to shell)
-        if laptop_owned.is_none() {
-            let component_pods = self.inner.components.read().await.len();
-            let _ = self
-                .inner
-                .log_capture
-                .set(crate::logstream::LogCapture::spawn(&namespace, component_pods));
-        }
-
         // Indexer analogue of `wait_validators_rpc_ready`: pod-Ready ≠ gRPC listener bound
         // (zainod serves only after its initial chain-index build, which can lag Ready by
         // minutes under load), so gate on a live `GetLightdInfo`. `is_built` window as above
@@ -751,6 +738,7 @@ impl TestEnv {
     ///   mismatch hundreds of lines into a test)
     /// - Public networks only (a regtest cache's tip is *meant* to move, and its schedule
     ///   comes from [`activation_heights`](Self::activation_heights), not a manifest)
+    ///
     /// Prove the validator serves the chain its declaration claims.
     ///
     /// The pinned tip is the whole check: it is written at the declaration rather than read
@@ -864,22 +852,22 @@ impl TestEnv {
 
     /// Kube client, once [`build`](Self::build) has connected. Used by the facade's run
     /// tail: the detach stop-watch and the mirrored durable report
-    #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
-    pub(crate) fn kube_client(&self) -> Option<Client> {
+    #[cfg_attr(not(feature = "librustzcash"), allow(dead_code))]
+    pub fn kube_client(&self) -> Option<Client> {
         self.inner.client.get().cloned()
     }
 
     /// Namespace this env provisioned into, once [`build`](Self::build) has run. Locates
     /// this run's stop-watch and report ConfigMaps
-    #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
-    pub(crate) fn namespace(&self) -> Option<String> {
+    #[cfg_attr(not(feature = "librustzcash"), allow(dead_code))]
+    pub fn namespace(&self) -> Option<String> {
         self.inner.namespace.lock().ok().and_then(|g| g.clone())
     }
 
     /// The one indexer in this topology, type-erased for a sync run's `SyncCtx` oracle.
     /// Errors on zero or >1 (a differential 2-indexer topology is a load-test shape)
-    #[cfg_attr(not(feature = "zingo"), allow(dead_code))]
-    pub(crate) async fn single_indexer(&self) -> Result<Arc<dyn IndexerBackend>, EnvError> {
+    #[cfg_attr(not(feature = "librustzcash"), allow(dead_code))]
+    pub async fn single_indexer(&self) -> Result<Arc<dyn IndexerBackend>, EnvError> {
         let comps = self.inner.components.read().await;
         let mut indexers = comps.values().filter_map(|s| match &s.handle {
             ComponentHandle::Indexer(h) => Some(Arc::clone(h)),
@@ -1036,13 +1024,8 @@ impl Drop for TestEnv {
             return;
         }
 
-        // Stop the follow child + snapshot the timeline, emitted below after the dead-pod
-        // headers. Colour is the reporter's call, propagated by the engine as `ZTEST_COLOR`
+        // Colour is the reporter's call, propagated by the engine as `ZTEST_COLOR`
         let color = std::env::var("ZTEST_COLOR").ok().as_deref() == Some("1");
-        let timeline = self.inner.log_capture.get().and_then(|c| {
-            c.stop();
-            c.render(color)
-        });
 
         let ns = self.inner.namespace.lock().ok().and_then(|mut g| g.take());
         let bindings: Vec<_> = self
@@ -1101,10 +1084,10 @@ impl Drop for TestEnv {
                     if !headers.is_empty() {
                         eprint!("{headers}");
                     }
-                }
-                if let Some(timeline) = &timeline {
-                    eprintln!("ztest: component logs (interleaved, by arrival):");
-                    eprint!("{timeline}");
+                    let components = crate::logstream::fetch_component_lines(&client, ns).await;
+                    if let Some(section) = crate::logstream::component_section(components, color) {
+                        eprint!("{section}");
+                    }
                 }
                 if let Some(ns) = ns_to_delete {
                     cluster::delete_namespace(&client, &ns)

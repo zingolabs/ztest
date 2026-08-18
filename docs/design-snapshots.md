@@ -49,7 +49,7 @@ pub const ORCHARD_TESTNET: ChainSnapshot = ChainSnapshot {
     tip_height: 1_848_420,
     network: Network::Testnet,
     backend: Backend::Zebra,
-    artifact: artifact!("snapshots/testnet/orchard.toml"),
+    artifact: artifact!("snapshots/testnet/zebra-6.2.3-orchard.toml"),
 };
 ```
 
@@ -105,8 +105,8 @@ implied by it. What survived is what addresses the blob, plus what a test reads.
 ```
   git (trust root)
     │
-    ├── snapshots/<network>/<upgrade>.toml ──── name, sha256, sizes
-    │        │                                  committed, plaintext, 4 keys
+    ├── snapshots/<network>/zebra-<ver>-<upgrade>.toml ──── name, sha256, sizes
+    │        │                                              committed, plaintext, 4 keys
     │        └── read at COMPILE TIME by artifact!() ──► Artifact
     │                                                      ├─► bucket key  lfs/<oid>
     │                                                      └─► seed PVC    seed-<oid[..8]>-<driver>
@@ -126,7 +126,7 @@ implied by it. What survived is what addresses the blob, plus what a test reads.
     ▼                                                               it has a live node
   ./zebra-v6.2.3-testnet-1848420.tar.zst
     │
-    ├─►  ztest snapshot manifest <path> > snapshots/testnet/orchard.toml
+    ├─►  ztest snapshot manifest <path> > snapshots/testnet/zebra-6.2.3-orchard.toml
     │       one streaming read: sha256 of the compressed bytes taken on the way
     │       into the decompressor, whose output is counted. Never buffered
     │
@@ -144,7 +144,7 @@ All three are cluster-free — publishing a fixture must not require a cluster.
 ## Consuming
 
 ```
-  compile time   artifact!("snapshots/testnet/orchard.toml")  → no I/O of bytes, no git
+  compile time   artifact!("snapshots/testnet/zebra-6.2.3-orchard.toml")  → no I/O, no git
 
   preflight      seed-<sha8>-<driver> in ztest-seeds?
                    ├── ready ─────────────────────► cached

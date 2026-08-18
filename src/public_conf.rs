@@ -122,7 +122,7 @@ pub fn public_zainod_conf(
 ) -> String {
     assert_public(network, "public_zainod_conf");
     // Every listener binds `LISTEN_ALL` (that constant says why loopback can't work here)
-    let listen_all = crate::handles::ports::LISTEN_ALL;
+    let listen_all = crate::ports::LISTEN_ALL;
     let metrics_line = match metrics_port {
         Some(port) => format!("\nmetrics_endpoint = '{listen_all}:{port}'"),
         None => String::new(),
@@ -310,7 +310,7 @@ mod tests {
                     && !l.contains("validator_")
             }) {
                 assert!(
-                    line.contains(crate::handles::ports::LISTEN_ALL),
+                    line.contains(crate::ports::LISTEN_ALL),
                     "listener does not bind LISTEN_ALL and is unreachable across pods: {line}"
                 );
             }

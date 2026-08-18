@@ -2,16 +2,15 @@
 //! backends from their own crates).
 //!
 //! - Wallet backends run in-process, no pod
-//! - Default [`librustzcash`]; [`zingo`] opt-in
-pub(crate) mod image;
+//! - Default [`librustzcash`]
+pub mod ctors;
+pub mod image;
 #[cfg(feature = "librustzcash")]
 pub mod librustzcash;
 pub mod lightwalletd;
 pub mod zainod;
 pub mod zcashd;
 pub mod zebra;
-#[cfg(feature = "zingo")]
-pub mod zingo;
 
 /// Sole `ztest.io/component` → backend table (no reflection in Rust).
 ///
@@ -39,24 +38,24 @@ fn backend_of(component_label: &str) -> Option<&'static MetricsBackend> {
 
 /// Unknown label → no rows (third-party backend still scrapes into Prometheus;
 /// ztest's readers just have nothing to show)
-pub(crate) fn metrics_rows(component_label: &str) -> &'static [crate::metrics::Row] {
+pub fn metrics_rows(component_label: &str) -> &'static [crate::metrics::Row] {
     backend_of(component_label).map_or(&[], |b| b.rows)
 }
 
 /// Every bundled backend's rows, for a reader with no pod to ask (run namespace
 /// gone by report time)
-pub(crate) fn metrics_components() -> impl Iterator<Item = &'static crate::metrics::Row> {
+pub fn metrics_components() -> impl Iterator<Item = &'static crate::metrics::Row> {
     METRICS_BACKENDS.iter().flat_map(|b| b.rows)
 }
 
 /// Bundled backends in report order — the subject ahead of what it proxies, so a
 /// per-component view leads with the thing under test
-pub(crate) fn metrics_component_labels() -> impl Iterator<Item = &'static str> {
+pub fn metrics_component_labels() -> impl Iterator<Item = &'static str> {
     METRICS_BACKENDS.iter().map(|b| b.label)
 }
 
 /// `None` for a backend that implements no [`Observe`](crate::sync::Observe).
-pub(crate) fn observe(
+pub fn observe(
     component_label: &str,
     exposition: &crate::metrics::Exposition,
 ) -> Option<crate::sync::Observation> {
@@ -69,7 +68,7 @@ pub(crate) fn observe(
 ///   without it, `EACCES` on the first mode-`0660` file
 /// - Every `pod_spec` routes `supplemental_groups` through here (no backend can
 ///   mount a seed it forgot to ask access for)
-pub(crate) fn seed_groups(opts: &crate::component::ComponentOpts) -> Vec<i64> {
+pub fn seed_groups(opts: &crate::component::ComponentOpts) -> Vec<i64> {
     match opts.restore {
         Some(crate::component::RestoreSource::Archive(_)) => vec![crate::materialize::SEED_GID],
         // Blank restore = empty PVC this pod fills itself (already owns every entry)

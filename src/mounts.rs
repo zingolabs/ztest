@@ -13,9 +13,9 @@ use kube::Client;
 use kube::api::{Api, ObjectMeta, PostParams};
 use serde_json::{Value, json};
 
-use crate::cluster::Sentinel;
 use crate::error::env_err;
 use crate::materialize;
+use crate::naming::Sentinel;
 use crate::seeds::{self, SeedBinding};
 use crate::{EnvError, Mount, MountKind, MountSource};
 
@@ -260,7 +260,7 @@ async fn create_pvc_from_snapshot(
     snapshot_name: &str,
     size: &str,
 ) -> Result<(), EnvError> {
-    let storage = crate::resource::selected_storage(client)
+    let storage = crate::storage_class::selected(client)
         .await
         .map_err(|e| EnvError::Manifest { reason: e })?;
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &sentinel.namespace);
@@ -331,7 +331,7 @@ fn resolve_shared(volume_name: &str, claim: &str, destination: &Path) -> Resolve
 /// `storageClassName` unset → the cluster's default class provisions it (on kind the
 /// node-local RWO `standard`, which is what lets two same-node pods share it);
 /// `ZAINO_SHARED_STORAGECLASS` overrides
-pub(crate) async fn create_shared_pvc(
+pub async fn create_shared_pvc(
     client: &Client,
     sentinel: &Sentinel,
     claim: &str,

@@ -88,7 +88,7 @@ where
     // Run identity (SA + RBAC + token). Its namespace carries `privileged` Pod Security —
     // the rootless BuildKit pod's unconfined seccomp/AppArmor needs it to pass admission
     graph.add_dedup(Box::new(
-        scaffolding::NamespaceProvider::new(policy::RUN_NAMESPACE).pod_security_privileged(),
+        scaffolding::NamespaceProvider::new(crate::naming::RUN_NAMESPACE).pod_security_privileged(),
     ));
     for p in policy::providers(opts.backend) {
         graph.add_dedup(p);
@@ -116,7 +116,7 @@ where
 
     let cx = Cx {
         client: client.clone(),
-        console: None,
+        host: None,
         progress: None,
         no_wait: opts.no_wait,
         build_pod: None,
@@ -227,7 +227,7 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
                     continue;
                 };
                 if let Err(e) = namespaces.delete(name, &dp).await
-                    && !crate::resource::kube::is_not_found(&e)
+                    && !crate::cluster::is_not_found(&e)
                 {
                     errors.push(format!("reap namespace {name} ({ns_selector}): {e}"));
                 }
@@ -238,7 +238,7 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
 
     // Build + seed-uploader pods live in RUN_NAMESPACE → the cascade above misses them,
     // and a SIGKILL'd run leaves them holding their Guaranteed footprint
-    let pods: Api<Pod> = Api::namespaced(client.clone(), policy::RUN_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), crate::naming::RUN_NAMESPACE);
     let pod_lp = ListParams::default().labels(vsc_selector);
     match pods.list(&pod_lp).await {
         Ok(list) => {
@@ -247,7 +247,7 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
                     continue;
                 };
                 if let Err(e) = pods.delete(name, &dp).await
-                    && !crate::resource::kube::is_not_found(&e)
+                    && !crate::cluster::is_not_found(&e)
                 {
                     errors.push(format!("reap pod {name} ({vsc_selector}): {e}"));
                 }
@@ -269,13 +269,13 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
                     continue;
                 };
                 if let Err(e) = vsc.delete(name, &dp).await
-                    && !crate::resource::kube::is_not_found(&e)
+                    && !crate::cluster::is_not_found(&e)
                 {
                     errors.push(format!("reap seed binding content {name} ({vsc_selector}): {e}"));
                 }
             }
         }
-        Err(e) if crate::resource::kube::is_not_found(&e) => {}
+        Err(e) if crate::cluster::is_not_found(&e) => {}
         Err(e) => errors.push(format!("list seed binding contents ({vsc_selector}): {e}")),
     }
 
@@ -291,13 +291,13 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
                     continue;
                 };
                 if let Err(e) = leases.delete(name, &dp).await
-                    && !crate::resource::kube::is_not_found(&e)
+                    && !crate::cluster::is_not_found(&e)
                 {
                     errors.push(format!("reap reservation {name} ({vsc_selector}): {e}"));
                 }
             }
         }
-        Err(e) if crate::resource::kube::is_not_found(&e) => {}
+        Err(e) if crate::cluster::is_not_found(&e) => {}
         Err(e) => errors.push(format!("list reservations ({vsc_selector}): {e}")),
     }
 

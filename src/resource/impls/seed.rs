@@ -14,18 +14,18 @@ use crate::storage;
 
 /// One data seed to ensure present in `ztest-seeds`; `name` = the PVC name = node identity
 #[derive(Debug)]
-pub(crate) struct SeedProvider {
+pub struct SeedProvider {
     entry: SeedEntry,
     name: String,
 }
 
 impl SeedProvider {
-    pub(crate) fn new(entry: SeedEntry) -> Self {
+    pub fn new(entry: SeedEntry) -> Self {
         Self { name: seed_name(&entry), entry }
     }
 
     /// Lets `cli::run` key a per-test dependency edge without re-deriving
-    pub(crate) fn node_id(entry: &SeedEntry) -> NodeId {
+    pub fn node_id(entry: &SeedEntry) -> NodeId {
         NodeId::Seed(seed_name(entry))
     }
 }

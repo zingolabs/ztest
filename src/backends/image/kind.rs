@@ -11,11 +11,11 @@ use crate::resource::{Cx, NodeId, Readiness, ResourceError};
 
 /// Local-dev default: no registry, no push, no pull secret
 #[derive(Debug)]
-pub(crate) struct Kind;
+pub struct Kind;
 
 impl Kind {
     /// Pod pull reference = the bare tag, held in the node's containerd
-    pub(super) fn reference(&self, tag: &str) -> String {
+    pub fn reference(&self, tag: &str) -> String {
         tag.to_string()
     }
 }
@@ -79,7 +79,7 @@ impl ImageProvider for Kind {
 /// The kind node's cri-tools ignores `crictl images`' positional filter → list the full
 /// table and match `REPOSITORY TAG`, accepting the implicit `docker.io/library/` prefix
 /// `kind load docker-image` stores under
-pub(crate) fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
+pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
     let node = format!("{}-control-plane", kind_cluster_name());
     let out = Command::new("docker").args(["exec", &node, "crictl", "images"]).output().map_err(
         |err| ImageError::Spawn { cmd: format!("docker exec {node} crictl images"), err },
@@ -123,7 +123,7 @@ pub(crate) fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
 }
 
 /// Args after the `kind` program name, run through the console PTY like [`docker_build_argv`]
-pub(crate) fn kind_load_argv(tag: &str) -> Vec<String> {
+pub fn kind_load_argv(tag: &str) -> Vec<String> {
     vec![
         "load".to_string(),
         "docker-image".to_string(),
@@ -160,7 +160,7 @@ pub fn kind_clusters() -> Result<Vec<String>, ImageError> {
 }
 
 /// Actionable error before the multi-minute build, not a raw `kind load` failure after
-pub(crate) fn ensure_kind_cluster() -> Result<(), ImageError> {
+pub fn ensure_kind_cluster() -> Result<(), ImageError> {
     let cluster = kind_cluster_name();
     let available = kind_clusters()?;
     if available.contains(&cluster) {

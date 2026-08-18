@@ -70,7 +70,7 @@ in a checkout. A machine with no `git lfs` installed runs the full suite. See
 
 ```sh
 ztest snapshot manifest ./zebra-v6.2.3-testnet-1848420.tar.zst \
-    > snapshots/testnet/orchard.toml
+    > snapshots/testnet/zebra-6.2.3-orchard.toml
 ztest snapshot push     ./zebra-v6.2.3-testnet-1848420.tar.zst
 # then add the const to src/snapshots.rs and commit
 ```

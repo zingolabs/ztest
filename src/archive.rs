@@ -99,7 +99,7 @@ pub struct ChainSnapshot {
 ///
 /// For `ztest snapshot warm`, handed paths on a command line and so having no
 /// [`artifact!`](macro@crate::artifact) expansion to read them off
-pub(crate) fn identity_of(archive: &std::path::Path) -> Result<(String, String, u64), String> {
+pub fn identity_of(archive: &std::path::Path) -> Result<(String, String, u64), String> {
     let name = archive
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

@@ -5,9 +5,8 @@
 //!   and an OOM kill, and reads mid-run
 //! - [`ebpf`] collects the same profiles out-of-process (native + kernel frames, off-CPU)
 
-pub(crate) mod ebpf;
-pub(crate) mod host;
-pub(crate) mod perf;
+pub mod ebpf;
+pub mod host;
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,37 +25,11 @@ use crate::portforward::Forwarder;
 /// - Mandatory under `multitenancy_enabled`: absent → 401, not a default tenant
 const TENANT_HEADER: &str = "X-Scope-OrgID";
 
-/// Marks ztest's tenants apart in a Pyroscope an operator may share
-const TENANT_PREFIX: &str = "ztest";
-
-/// Upstream tenant-id ceiling, bytes
-const TENANT_MAX: usize = 150;
-
 /// Retention stamped on a retired tenant.
 ///
 /// - Never `0` (upstream: zero override = never delete → outlives every other tenant)
 /// - Any positive duration < data age
-pub(crate) const RETIRED_RETENTION: &str = "1s";
-
-/// Pyroscope tenant: `ztest.<user>.<id>`, id = sync id else run id.
-///
-/// - Derived, never looked up (retirement outlives the namespace)
-/// - `.` = separator → escaped out of both parts
-/// - Charset ≤150 bytes, alphanumeric + `!-_.*'()`, no `/`, no whitespace
-pub(crate) fn tenant(user: &str, sync_id: &str) -> String {
-    let part = |s: &str| -> String {
-        s.chars()
-            .map(|c| match c {
-                c if c.is_ascii_alphanumeric() => c,
-                '-' | '_' => c,
-                _ => '_',
-            })
-            .collect()
-    };
-    let tenant = format!("{TENANT_PREFIX}.{}.{}", part(user), part(sync_id));
-    // collision-safe: sync id carries its own random suffix, far inside the cap
-    tenant.chars().take(TENANT_MAX).collect()
-}
+pub const RETIRED_RETENTION: &str = "1s";
 
 /// Locates an install ztest did not create (operator's lives wherever they put it;
 /// every Pyroscope deployment carries this label)
@@ -68,7 +41,7 @@ const PYROSCOPE_LABEL: &str = "app.kubernetes.io/name=pyroscope";
 /// hot/cold flame graph Brendan Gregg documents as "difficult to use" for exactly this
 /// reason. Go's pprof and async-profiler split them the same way.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Profile {
+pub enum Profile {
     OnCpu,
     OffCpu,
 }
@@ -82,7 +55,7 @@ impl Profile {
     }
 
     /// Filename stem, so a run's two profiles never overwrite each other
-    pub(crate) fn stem(self) -> &'static str {
+    pub fn stem(self) -> &'static str {
         match self {
             Profile::OnCpu => "profile",
             Profile::OffCpu => "offcpu",
@@ -146,8 +119,8 @@ struct FlameLevel {
 /// `ztest cluster setup`'s Pyroscope Service, else an operator's. Known address first
 /// (skips a cluster-wide list, and stays deterministic where two exist)
 async fn pyroscope_service(client: &Client) -> Option<Service> {
-    let owned: Api<Service> = Api::namespaced(client.clone(), crate::resource::OBS_NAMESPACE);
-    if let Ok(svc) = owned.get(crate::resource::PYROSCOPE_SERVICE).await {
+    let owned: Api<Service> = Api::namespaced(client.clone(), crate::naming::OBS_NAMESPACE);
+    if let Ok(svc) = owned.get(crate::naming::PYROSCOPE_SERVICE).await {
         return Some(svc);
     }
     let all: Api<Service> = Api::all(client.clone());
@@ -160,7 +133,7 @@ async fn pyroscope_service(client: &Client) -> Option<Service> {
 /// - ClusterIP is unroutable off-cluster, and a port-forward would need supervising
 /// - Promotes the Service to NodePort if it is not already (idempotent; the ClusterIP keeps
 ///   working, so in-cluster pushers are unaffected)
-pub(crate) async fn node_push_url(client: &Client) -> Option<String> {
+pub async fn node_push_url(client: &Client) -> Option<String> {
     let svc = pyroscope_service(client).await?;
     let (name, namespace) = (svc.metadata.name.clone()?, svc.metadata.namespace.clone()?);
     let api: Api<Service> = Api::namespaced(client.clone(), &namespace);
@@ -188,7 +161,7 @@ fn node_port_of(svc: &Service) -> Option<i32> {
 
 /// Node address reachable from the workstation. `InternalIP` is what kind publishes its node
 /// container on, so it routes for anything on the cluster's docker network
-pub(crate) async fn node_internal_ip(client: &Client) -> Option<String> {
+pub async fn node_internal_ip(client: &Client) -> Option<String> {
     use k8s_openapi::api::core::v1::Node;
     let nodes: Api<Node> = Api::all(client.clone());
     let node = nodes.list(&ListParams::default().limit(1)).await.ok()?.items.into_iter().next()?;
@@ -202,7 +175,7 @@ pub(crate) async fn node_internal_ip(client: &Client) -> Option<String> {
 ///   the port nor the node address is guessed
 /// - kind's cert carries this IP in its SANs, so the kubeconfig CA still validates it — the
 ///   loopback address in the kubeconfig does not survive leaving the host network
-pub(crate) async fn node_api_server(client: &Client) -> Option<String> {
+pub async fn node_api_server(client: &Client) -> Option<String> {
     use k8s_openapi::api::core::v1::Endpoints;
     let api: Api<Endpoints> = Api::namespaced(client.clone(), "default");
     let subsets = api.get("kubernetes").await.ok()?.subsets?;
@@ -212,7 +185,7 @@ pub(crate) async fn node_api_server(client: &Client) -> Option<String> {
     Some(format!("https://{ip}:{port}"))
 }
 
-pub(crate) async fn push_url(client: &Client) -> Option<String> {
+pub async fn push_url(client: &Client) -> Option<String> {
     let svc = pyroscope_service(client).await?;
     let port = service_port(&svc);
     let name = svc.metadata.name?;
@@ -227,7 +200,7 @@ fn service_port(svc: &Service) -> u16 {
         .and_then(|s| s.ports.as_ref())
         .and_then(|ports| ports.first())
         .map(|p| p.port as u16)
-        .unwrap_or(crate::resource::PYROSCOPE_PORT)
+        .unwrap_or(crate::ports::PYROSCOPE_PORT)
 }
 
 /// Merged CPU profile for `selector` over `[from, to]`, as pprof bytes.
@@ -277,12 +250,12 @@ fn collapse(fg: &FlameGraph) -> String {
 }
 
 /// Nanoseconds a collapsed profile accounts for — the numerator of `fidelity`
-pub(crate) fn collapsed_nanos(profile: &[u8]) -> Option<u64> {
+pub fn collapsed_nanos(profile: &[u8]) -> Option<u64> {
     let text = std::str::from_utf8(profile).ok()?;
     Some(text.lines().filter_map(|l| l.rsplit_once(' ')?.1.parse::<u64>().ok()).sum())
 }
 
-pub(crate) async fn fetch(
+pub async fn fetch(
     client: &Client,
     selector: &str,
     from: SystemTime,
@@ -403,7 +376,7 @@ fn epoch_millis(t: SystemTime) -> i64 {
 /// - Entries expire after [`RETIREMENT_TTL`] (else unbounded growth)
 ///
 /// [`PROFILE_RETIREMENT_LAG`]: crate::resource::PROFILE_RETIREMENT_LAG
-pub(crate) async fn schedule_purge(client: &Client, tenants: &[String]) -> Result<(), String> {
+pub async fn schedule_purge(client: &Client, tenants: &[String]) -> Result<(), String> {
     use k8s_openapi::api::core::v1::ConfigMap;
     use kube::api::{Patch, PatchParams};
 
@@ -415,7 +388,7 @@ pub(crate) async fn schedule_purge(client: &Client, tenants: &[String]) -> Resul
     if tenants.is_empty() {
         return Ok(());
     }
-    let api: Api<ConfigMap> = Api::namespaced(client.clone(), crate::resource::OBS_NAMESPACE);
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), crate::naming::OBS_NAMESPACE);
     let existing = api
         .get_opt(PYROSCOPE_OVERRIDES_CONFIGMAP)
         .await
@@ -463,9 +436,9 @@ pub(crate) async fn schedule_purge(client: &Client, tenants: &[String]) -> Resul
 /// - Absent = `--no-observability` → nothing recorded, nothing left un-reclaimed
 /// - Not [`pyroscope_service`] (operator's install carries no ztest overrides ConfigMap
 ///   → retirement would error, not no-op)
-pub(crate) async fn is_deployed(client: &Client) -> bool {
-    let api: Api<Service> = Api::namespaced(client.clone(), crate::resource::OBS_NAMESPACE);
-    api.get_opt(crate::resource::PYROSCOPE_SERVICE).await.ok().flatten().is_some()
+pub async fn is_deployed(client: &Client) -> bool {
+    let api: Api<Service> = Api::namespaced(client.clone(), crate::naming::OBS_NAMESPACE);
+    api.get_opt(crate::naming::PYROSCOPE_SERVICE).await.ok().flatten().is_some()
 }
 
 /// Tenant a sync's profiles were pushed under.
@@ -473,39 +446,24 @@ pub(crate) async fn is_deployed(client: &Client) -> bool {
 /// - Owner from the namespace label, not [`current_user`](crate::naming) (a named target
 ///   may be another dev's)
 /// - `None` = namespace gone → tenant unrecoverable, profiles left to the default clock
-pub(crate) async fn tenant_for_sync(client: &Client, sync_id: &str) -> Option<String> {
+pub async fn tenant_for_sync(client: &Client, sync_id: &str) -> Option<String> {
     use k8s_openapi::api::core::v1::Namespace;
 
     let api: Api<Namespace> = Api::all(client.clone());
     let ns = api.get_opt(&crate::sync::namespace_for(sync_id)).await.ok()??;
     let owner = ns.metadata.labels?.get(crate::qos::LABEL_USER)?.clone();
-    Some(tenant(&owner, sync_id))
+    Some(crate::naming::profile_tenant(&owner, sync_id))
 }
 
 /// Pyroscope selector for one component of one run. Namespace-scoped, not run-id
 /// (what the component was tagged with, derivable from a sync id without a lookup)
-pub(crate) fn selector(component: &str, namespace: &str) -> String {
+pub fn selector(component: &str, namespace: &str) -> String {
     format!(r#"{{component="{component}",namespace="{namespace}"}}"#)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `.` = separator → neither part may contribute one (else two syncs collide)
-    #[test]
-    fn a_tenant_escapes_the_separator_out_of_both_parts() {
-        assert_eq!(tenant("eli.b", "zaino.a52f"), "ztest.eli_b.zaino_a52f");
-        assert_eq!(tenant("elicb", "zaino-a52f"), "ztest.elicb.zaino-a52f");
-    }
-
-    /// Charset is upstream-enforced: `/` and whitespace are rejected outright
-    #[test]
-    fn a_tenant_carries_no_character_pyroscope_rejects() {
-        let t = tenant("dept/eng team", "sync id");
-        assert!(t.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)), "got {t}");
-        assert!(tenant(&"x".repeat(400), "abc").len() <= TENANT_MAX);
-    }
 
     /// Both pinned, else two concurrent runs merge samples into one meaningless graph
     #[test]
@@ -597,5 +555,20 @@ mod tests {
     fn an_empty_flamegraph_collapses_to_nothing() {
         assert!(collapse(&FlameGraph::default()).is_empty());
         assert_eq!(collapsed_nanos(b""), Some(0));
+    }
+}
+
+/// [`ProfileStore`](crate::resource::reclaim::ProfileStore) over the deployed Pyroscope.
+#[derive(Debug)]
+pub struct Pyroscope;
+
+#[async_trait::async_trait]
+impl crate::resource::reclaim::ProfileStore for Pyroscope {
+    async fn is_deployed(&self, client: &Client) -> bool {
+        is_deployed(client).await
+    }
+
+    async fn schedule_purge(&self, client: &Client, tenants: &[String]) -> Result<(), String> {
+        schedule_purge(client, tenants).await
     }
 }

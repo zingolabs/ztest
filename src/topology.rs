@@ -99,7 +99,7 @@ impl ActivationHeights {
     /// - Active upgrades must form a contiguous prefix from Overwinter
     /// - Heights non-decreasing in supersession order
     /// - Both rejected by zebrad/zcashd at startup → surfaced here as a `build()` error
-    pub(crate) fn validate_schedule(&self) -> Result<(), String> {
+    pub fn validate_schedule(&self) -> Result<(), String> {
         let ordered = self.ordered();
         let mut first_inactive: Option<NetworkUpgrade> = None;
         for (nu, height) in ordered {
@@ -193,7 +193,7 @@ impl ActivationHeightsBuilder {
 /// Zcash network upgrades. `Ord` = supersession, so a new NU is *inserted*, not
 /// appended (NU6.3 between NU6.2 and NU7); [`ActivationHeights::validate_schedule`] leans on it
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum NetworkUpgrade {
+pub enum NetworkUpgrade {
     Overwinter,
     Sapling,
     Blossom,

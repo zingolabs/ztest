@@ -16,7 +16,7 @@ use crate::naming::RunCoords;
 ///
 /// rustls 0.23 (via kube/tonic/reqwest) panics without a process-level provider by the
 /// first TLS handshake. `install_default` no-ops once set → a test binary's own wins
-pub(crate) fn ensure_crypto_provider() {
+pub fn ensure_crypto_provider() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -24,9 +24,9 @@ pub(crate) fn ensure_crypto_provider() {
     });
 }
 
-/// Install the provider before `main`: under `zingo`, zingolib pulls rustls's `aws-lc-rs`
-/// beside ztest's `ring` → no auto-default, and any TLS client built off the
-/// `client()`/`config()` path panics. Pinning `ring` here settles it for every path
+/// Install before `main`: a second rustls provider anywhere in the graph kills the
+/// auto-default → every TLS client off the `client()`/`config()` path panics. Pinning
+/// `ring` here settles it for every path
 #[ctor::ctor]
 fn install_crypto_provider_ctor() {
     ensure_crypto_provider();
@@ -43,7 +43,9 @@ pub async fn client() -> Result<Client, kube::Error> {
 pub async fn config() -> Result<kube::Config, kube::Error> {
     ensure_crypto_provider();
     match std::env::var(crate::cluster_config::KUBE_CONTEXT_ENV) {
-        Ok(ctx) if !ctx.is_empty() && !in_cluster() => config_for_context(&ctx).await,
+        Ok(ctx) if !ctx.is_empty() && !crate::cluster_config::in_cluster() => {
+            config_for_context(&ctx).await
+        }
         _ => kube::Config::infer().await.map_err(kube::Error::InferConfig),
     }
 }
@@ -58,18 +60,12 @@ async fn config_for_context(context: &str) -> Result<kube::Config, kube::Error> 
         .map_err(|e| kube::Error::Service(Box::new(e)))
 }
 
-/// Inside a pod with a service account token mounted? Selects direct pod-IP dial vs
-/// kube-rs portforward
-pub fn in_cluster() -> bool {
-    std::env::var("KUBERNETES_SERVICE_HOST").is_ok()
-}
-
 /// `--no-cleanup` into the process that actually tears down (test binary / sync driver,
 /// never the `ztest` process whose `Drop` never runs)
-pub(crate) const NO_CLEANUP_ENV: &str = "ZTEST_NO_CLEANUP";
+pub const NO_CLEANUP_ENV: &str = "ZTEST_NO_CLEANUP";
 
 /// `--no-cleanup` asked for? Any non-empty, non-`"0"` value counts
-pub(crate) fn no_cleanup_requested() -> bool {
+pub fn no_cleanup_requested() -> bool {
     std::env::var_os(NO_CLEANUP_ENV).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
@@ -82,7 +78,7 @@ fn orchestrated() -> bool {
 
 /// Fail fast outside the `ztest run` orchestrator (else unbudgeted pods land on whatever
 /// kubeconfig is loaded)
-pub(crate) fn require_orchestrator() -> Result<(), crate::EnvError> {
+pub fn require_orchestrator() -> Result<(), crate::EnvError> {
     if orchestrated() {
         return Ok(());
     }
@@ -291,24 +287,22 @@ pub async fn delete_seed_binding_contents_for_ns(client: &Client, namespace: &st
             continue;
         };
         if let Err(e) = vsc.delete(name, &DeleteParams::default()).await
-            && !crate::resource::kube::is_not_found(&e)
+            && !crate::cluster::is_not_found(&e)
         {
             tracing::warn!(content = %name, namespace, error = %e, "seed binding content delete failed");
         }
     }
 }
 
-/// Namespace handle threaded into the resource helpers in `mounts.rs` and `seeds.rs`.
-/// Per-test namespaces cascade on delete → no owner-references needed
-#[derive(Debug, Clone)]
-pub struct Sentinel {
-    pub namespace: String,
-}
-
-impl Sentinel {
-    /// Handle for an existing namespace; no API calls
-    pub fn new(namespace: String) -> Self {
-        Self { namespace }
+/// Idempotent-delete guard: 404, or a "not found" string fallback for the wrapper
+/// variants that differ across kube versions
+pub fn is_not_found(err: &kube::Error) -> bool {
+    match err {
+        kube::Error::Api(resp) => resp.code == 404,
+        other => {
+            let s = other.to_string();
+            s.contains("not found") || s.contains("404")
+        }
     }
 }
 

@@ -9,9 +9,13 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::ui::BuildStage;
-
 use super::events::{Event, EventTx};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStage {
+    Compile,
+    Index,
+}
 
 /// `lines` set → pass 1's stderr is piped and forwarded there, so the bottom console can
 /// relay `Compiling …` into the scrollback above its panel; `None` → inherited (non-TTY).

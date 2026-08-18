@@ -55,31 +55,31 @@ fn part_size(total: u64) -> usize {
 }
 
 #[derive(Debug)]
-pub(crate) struct Bucket {
+pub struct Bucket {
     store: AmazonS3,
 }
 
 /// Settings addressing the snapshot bucket, from whichever source supplied them.
 /// `region` optional (R2 wants `auto`; a real region matters only on real AWS)
 #[derive(Debug, serde::Deserialize)]
-pub(crate) struct Credentials {
-    pub(crate) bucket: String,
-    pub(crate) endpoint: String,
-    pub(crate) access_key_id: String,
-    pub(crate) secret_access_key: String,
+pub struct Credentials {
+    pub bucket: String,
+    pub endpoint: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
     #[serde(default)]
-    pub(crate) region: Option<String>,
+    pub region: Option<String>,
 }
 
 /// Stored bucket credentials, honoring `$XDG_CONFIG_HOME`
-pub(crate) fn credentials_path() -> std::path::PathBuf {
-    crate::cluster_config::config_dir().join("bucket.toml")
+pub fn credentials_path() -> std::path::PathBuf {
+    crate::paths::config_dir().join("bucket.toml")
 }
 
 /// Which of [`Bucket::resolve`]'s two sources is in play, for `ztest cluster check`.
 /// Mirrors that precedence — a stale `bucket.toml` under a live `AWS_*` export is the
 /// confusion this names
-pub(crate) fn credentials_source() -> String {
+pub fn credentials_source() -> String {
     match std::env::var(BUCKET_ENV).ok().filter(|v| !v.trim().is_empty()) {
         Some(bucket) => format!("{bucket} (AWS_* environment)"),
         None => credentials_path().display().to_string(),
@@ -91,7 +91,7 @@ impl Bucket {
     ///   and `aws s3` share one export set, no ztest credential dialect
     /// - Then `~/.config/ztest/bucket.toml` — the bucket belongs to the installation,
     ///   not the cwd (`ztest run` runs in the *tests* repo, routinely not the fixtures')
-    pub(crate) fn resolve() -> Result<Self, StorageError> {
+    pub fn resolve() -> Result<Self, StorageError> {
         match Self::from_env() {
             Ok(b) => Ok(b),
             Err(env_err) => match load_credentials()? {
@@ -159,14 +159,14 @@ impl Bucket {
     /// - **Not** rudolfs-compatible: it keys `[prefix/]<org>/<project>/<ab>/<cd>/<oid>`
     ///   (namespace segment + 2-byte sha shard), so adopting an LFS server is a migration
     ///   of every object, not a `--prefix` setting
-    pub(crate) fn key(oid: &str) -> ObjectPath {
+    pub fn key(oid: &str) -> ObjectPath {
         ObjectPath::from(format!("{KEY_PREFIX}/{oid}"))
     }
 
     /// Keys are content addresses → a hit on `oid` at the right length *is* the object.
     /// The length check rejects a truncated leftover from an upload that died between
     /// its last part and `complete`
-    pub(crate) async fn has(&self, oid: &str, size: u64) -> Result<bool, StorageError> {
+    pub async fn has(&self, oid: &str, size: u64) -> Result<bool, StorageError> {
         let key = Self::key(oid);
         match self.store.head(&key).await {
             Ok(meta) => Ok(meta.size == size),
@@ -180,7 +180,7 @@ impl Bucket {
     /// - Transfer runs R2 → node, never through ztest or the apiserver
     /// - Signature scoped to one object + one verb, expires in `ttl` (a mounted
     ///   credential Secret would grant the whole bucket forever)
-    pub(crate) async fn presigned_get(
+    pub async fn presigned_get(
         &self,
         oid: &str,
         ttl: std::time::Duration,
@@ -200,7 +200,7 @@ impl Bucket {
     /// - Listing one key, not `HEAD` on a known OID — no object need exist, and a 404 would
     ///   not separate "unreachable" from "empty bucket"
     /// - `timeout` because a wrong endpoint hangs on connect, and this sits in `cluster check`
-    pub(crate) async fn reachable(&self, timeout: std::time::Duration) -> Result<(), StorageError> {
+    pub async fn reachable(&self, timeout: std::time::Duration) -> Result<(), StorageError> {
         use object_store::ObjectStore as _;
         let prefix = ObjectPath::from(KEY_PREFIX);
         let probe = async {
@@ -222,7 +222,7 @@ impl Bucket {
     /// - `total` = the LFS pointer's `size`, known before transfer, sizes parts ([`part_size`])
     /// - Mid-way failure aborts (stores bill for an incomplete upload's parts, and an
     ///   8 GiB orphan surfaces in no `list` here)
-    pub(crate) async fn put(
+    pub async fn put(
         &self,
         oid: &str,
         total: u64,

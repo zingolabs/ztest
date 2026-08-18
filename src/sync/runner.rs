@@ -239,7 +239,7 @@ impl<S: SyncSubject> SyncEngine<S> {
     }
 
     #[cfg_attr(not(feature = "librustzcash"), allow(dead_code))]
-    pub(crate) fn with_probes(mut self, probes: Vec<ProbeSpec>) -> Self {
+    pub fn with_probes(mut self, probes: Vec<ProbeSpec>) -> Self {
         self.probes = probes;
         self
     }

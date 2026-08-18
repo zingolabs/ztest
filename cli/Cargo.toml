@@ -1,0 +1,47 @@
+[package]
+name = "ztest_cli"
+description = "Command-line front end for the `ztest` harness."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["development-tools::testing", "command-line-utilities"]
+
+[lib]
+name = "ztest_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ztest"
+path = "src/main.rs"
+
+[dependencies]
+ztest = { path = "..", version = "=0.1.0" }
+ztest_ui = { path = "../ui", version = "=0.1.0" }
+
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+dialoguer = { version = "0.12.0", default-features = false }
+futures = "0.3"
+k8s-openapi = { version = "0.24", features = ["latest"] }
+kube = { version = "0.99", default-features = false, features = ["client", "runtime", "ws", "rustls-tls"] }
+nextest-metadata = "0.14"
+console = "0.16.4"
+owo-colors = "4.3.0"
+reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+rand = "0.8"
+serde_json = { workspace = true }
+terminal_size = "0.4"
+supports-color = "3.0.2"
+supports-unicode = "3.0.0"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "signal", "io-util"] }
+toml = "0.8"
+tracing = { workspace = true }
+
+[dev-dependencies]
+ztest = { path = "..", features = ["test-util"] }

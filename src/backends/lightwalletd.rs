@@ -8,19 +8,20 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-use crate::handles::types::BlockHash;
 use crate::proto;
 use crate::proto::compact_tx_streamer_client::CompactTxStreamerClient;
 use crate::proto::{CompactBlock, CompactTx};
+use crate::protocol::types::BlockHash;
 use zcash_protocol::ShieldedPool as ShieldedProtocol;
 use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::ZatBalance;
 
 use crate::handles::HandleInner;
-use crate::handles::client::JsonRpcClient;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
-use crate::{Endpoint, EnvError, RpcError};
+use crate::protocol::Endpoint;
+use crate::protocol::client::JsonRpcClient;
+use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "lightwalletd";
 
@@ -28,9 +29,9 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A [`Dev`](crate::backends::image::ImageSpec::Dev) override never degrades to the
+/// A [`Dev`](crate::inventory::ImageSpec::Dev) override never degrades to the
 /// published tag — unbuilt fails `DevImageMissing`
-pub(crate) fn image_uri(
+pub fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
     let default_image = format!("electriccoinco/lightwalletd:{}", opts.version);
@@ -92,7 +93,7 @@ rpcpassword=test
 rpcbind={validator_host}
 rpcport={}
 ",
-            crate::handles::ports::ZEBRAD_RPC,
+            crate::ports::ZEBRAD_RPC,
         );
         opts.mounts.push(crate::regtest::config_mount_inline(conf, ZCASH_CONF_PATH));
         Ok(opts)
@@ -113,7 +114,7 @@ impl crate::regtest::Regtest for crate::component::Indexer<LightwalletdBackend> 
             "--data-dir",
             DATA_DIR,
             "--grpc-bind-addr",
-            &format!("0.0.0.0:{}", crate::handles::ports::LIGHTWALLETD_GRPC),
+            &format!("0.0.0.0:{}", crate::ports::LIGHTWALLETD_GRPC),
             // Container stdout, where the engine's log capture reads
             "--log-file",
             "/dev/stdout",
@@ -147,10 +148,10 @@ impl IndexerBackend for LightwalletdIndexer {
             label: COMPONENT,
             image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
             ports: crate::manifest::merge_ports(
-                &[("grpc", crate::handles::ports::LIGHTWALLETD_GRPC)],
+                &[("grpc", crate::ports::LIGHTWALLETD_GRPC)],
                 &opts.extra_ports,
             ),
-            ready_port: crate::handles::ports::LIGHTWALLETD_GRPC,
+            ready_port: crate::ports::LIGHTWALLETD_GRPC,
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources,

@@ -11,8 +11,6 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncReadExt;
-
 use crate::cancel::Cancel;
 use crate::engine::events::Verdict;
 use crate::engine::plan::WorkItem;
@@ -46,6 +44,8 @@ impl Executor for LocalExecutor {
 /// - `ztest_log` forwarded verbatim → an in-pod subscriber matches the laptop's
 /// - `capture = false` under `--no-capture`, where the child inherits this process's stdio
 /// - `color` rides as `ZTEST_COLOR` (the child's stderr is piped, so it cannot decide)
+/// - `image_refs` ships as [`IMAGE_REFS_ENV`](crate::backends::image::IMAGE_REFS_ENV);
+///   [`seed_dev_images`](crate::backends::image::seed_dev_images) seeds *this* process only
 #[derive(Debug, Clone)]
 pub struct EngineEnv {
     pub dylib_path: OsString,
@@ -55,6 +55,7 @@ pub struct EngineEnv {
     pub ztest_log: Option<String>,
     pub capture: bool,
     pub color: bool,
+    pub image_refs: std::collections::BTreeMap<String, String>,
 }
 
 /// Outcome of one test process. `output` = merged stdout+stderr, or on the pod path the
@@ -81,6 +82,16 @@ pub async fn spawn_test(
     let started = Instant::now();
 
     let mut cmd = build_command(item, env);
+    let reader = match attach_stdio(&mut cmd, env.capture) {
+        Ok(r) => r,
+        Err(_) => {
+            return TestOutcome {
+                verdict: Verdict::SpawnError,
+                output: Vec::new(),
+                duration: started.elapsed(),
+            };
+        }
+    };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => {
@@ -91,24 +102,17 @@ pub async fn spawn_test(
             };
         }
     };
+    // Parent's writer ends must close, else the read below never sees EOF
+    drop(cmd);
 
-    // stdout+stderr read concurrently → a full pipe buffer can't deadlock the child
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let read_out = async {
-        let mut buf = Vec::new();
-        if let Some(s) = stdout.as_mut() {
-            let _ = s.read_to_end(&mut buf).await;
-        }
-        buf
-    };
-    let read_err = async {
-        let mut buf = Vec::new();
-        if let Some(s) = stderr.as_mut() {
-            let _ = s.read_to_end(&mut buf).await;
-        }
-        buf
-    };
+    // Drained concurrently with the wait → a full pipe buffer can't deadlock the child
+    let drain = reader.map(|mut r| {
+        tokio::task::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut r, &mut buf);
+            buf
+        })
+    });
 
     let pid = child.id();
     let verdict = tokio::select! {
@@ -129,22 +133,38 @@ pub async fn spawn_test(
         }
     };
 
-    // Readers complete at pipe EOF = child and every fd-inheriting descendant gone
-    let (mut out, mut err) = tokio::join!(read_out, read_err);
-    out.append(&mut err);
+    // Reader completes at pipe EOF = child and every fd-inheriting descendant gone
+    let output = match drain {
+        Some(task) => task.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
 
-    TestOutcome { verdict, output: out, duration: started.elapsed() }
+    TestOutcome { verdict, output, duration: started.elapsed() }
 }
 
-/// Build the `tokio` command: argv, cwd, stdio, env, and (Unix) a dedicated process group
-/// so the whole tree dies at the hard cap
+/// One pipe for both fds, so the capture is interleaved as written.
+///
+/// - Two pipes concatenated put stderr *after* libtest's `test result:` footer
+/// - [`strip_libtest_frame`](crate::libtest::strip_libtest_frame) truncates from that
+///   footer → an `Err`-returning test's `Error: …` line disappears
+/// - `--no-capture` → inherit and stream live, nothing to read
+fn attach_stdio(
+    cmd: &mut tokio::process::Command,
+    capture: bool,
+) -> std::io::Result<Option<std::io::PipeReader>> {
+    if !capture {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        return Ok(None);
+    }
+    let (reader, writer) = std::io::pipe()?;
+    let dup = writer.try_clone()?;
+    cmd.stdout(Stdio::from(writer)).stderr(Stdio::from(dup));
+    Ok(Some(reader))
+}
+
+/// Build the `tokio` command: argv, cwd, env, and (Unix) a dedicated process group so the
+/// whole tree dies at the hard cap. Stdout/stderr attached by [`attach_stdio`]
 fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
-    // `--no-capture` → inherit stdio and stream live; else pipe both for reporter replay
-    let (out, err) = if env.capture {
-        (Stdio::piped(), Stdio::piped())
-    } else {
-        (Stdio::inherit(), Stdio::inherit())
-    };
     let mut std_cmd = std::process::Command::new(&item.binary_path);
     std_cmd
         .arg("--exact")
@@ -152,8 +172,6 @@ fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
         .arg("--nocapture")
         .current_dir(&item.cwd)
         .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err)
         // Dynamic-library path (the libstdc++-exit-127 fix)
         .env(super::dylib::dylib_path_envvar(), &env.dylib_path)
         .env("NEXTEST", "1")
@@ -167,6 +185,13 @@ fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
         .env("ZTEST_COLOR", if env.color { "1" } else { "0" });
     if env.no_cleanup {
         std_cmd.env(crate::cluster::NO_CLEANUP_ENV, "1");
+    }
+    // Preflight's resolved component-image references (`image::resolve` in the child has
+    // no seeded manifest of its own — separate process)
+    if !env.image_refs.is_empty()
+        && let Ok(json) = serde_json::to_string(&env.image_refs)
+    {
+        std_cmd.env(crate::backends::image::IMAGE_REFS_ENV, json);
     }
 
     #[cfg(unix)]
@@ -202,7 +227,7 @@ fn kill_group(_pid: Option<u32>) {}
 /// fails `ETXTBSY`. Write-to-scratch + rename closes the window, and dropping the file
 /// *before* the rename is load-bearing (rename keeps the inode, so an open handle follows)
 #[cfg(all(test, unix))]
-pub(super) fn write_script(path: &std::path::Path, body: &str) {
+pub fn write_script(path: &std::path::Path, body: &str) {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -240,6 +265,7 @@ mod tests {
             capture: true,
             color: false,
             ztest_log: None,
+            image_refs: std::collections::BTreeMap::new(),
         }
     }
 
@@ -340,6 +366,56 @@ mod tests {
             "children must inherit ZTEST_ENGINE=1; got {:?}",
             String::from_utf8_lossy(&out.output)
         );
+    }
+
+    /// Without it every `dev!` component resolves to `DevImageMissing` (the manifest
+    /// `seed_dev_images` fills lives in the parent process)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn children_inherit_the_resolved_image_manifest() {
+        let _g = serial().lock().await;
+        let mut e = env();
+        e.image_refs.insert("zainod@sha".into(), "zainod:dev-abc".into());
+        let p = script("imagerefs", "printf 'REFS=%s\\n' \"$ZTEST_IMAGE_REFS\"");
+        let out = spawn_test(
+            &item(p.to_str().unwrap(), "x"),
+            &e,
+            Duration::from_secs(5),
+            &Cancel::never(),
+        )
+        .await;
+        let _ = std::fs::remove_file(&p);
+        let got = String::from_utf8_lossy(&out.output).to_string();
+        assert!(got.contains(r#"{"zainod@sha":"zainod:dev-abc"}"#), "{got:?}");
+    }
+
+    /// stderr must land *inside* the frame: appended after libtest's `test result:` line
+    /// it is truncated by `strip_libtest_frame`, taking the failure reason with it
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_survives_the_libtest_footer_strip() {
+        let _g = serial().lock().await;
+        let p = script(
+            "interleave",
+            "echo 'running 1 test'\n\
+             echo 'INFO provisioning component'\n\
+             echo 'Error: image build failed for zainod' >&2\n\
+             echo 'test x ... FAILED'\n\
+             echo 'failures:'\n\
+             echo 'test result: FAILED. 0 passed; 1 failed'\n\
+             exit 101",
+        );
+        let out = spawn_test(
+            &item(p.to_str().unwrap(), "x"),
+            &env(),
+            Duration::from_secs(5),
+            &Cancel::never(),
+        )
+        .await;
+        let _ = std::fs::remove_file(&p);
+        let shown = crate::libtest::strip_libtest_frame(&out.output, "x");
+        let shown = String::from_utf8_lossy(&shown).to_string();
+        assert!(shown.contains("Error: image build failed"), "{shown:?}");
     }
 
     #[tokio::test]

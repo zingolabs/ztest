@@ -461,7 +461,7 @@ mod tests {
     fn flags_a_cfg_gated_declaration_as_uncertain() {
         let (found, _) = scan_source(
             r#"
-            #[cfg(feature = "zingo")]
+            #[cfg(feature = "librustzcash")]
             #[ztest::sync_test(name = "gated", subject = wallet, qos = sync)]
             async fn gated(run: SyncRunner) -> SyncOutcome {}
             "#,
@@ -473,7 +473,7 @@ mod tests {
     fn inherits_gating_from_an_enclosing_module() {
         let (found, _) = scan_source(
             r#"
-            #[cfg(feature = "zingo")]
+            #[cfg(feature = "librustzcash")]
             mod inner {
                 #[ztest::sync_test(name = "gated", subject = wallet, qos = sync)]
                 async fn gated(run: SyncRunner) -> SyncOutcome {}

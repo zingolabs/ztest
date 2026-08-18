@@ -27,7 +27,7 @@
 //! # Adding one
 //!
 //! `scripts/produce-chain-fixture.sh <height> <version> <network>`, then
-//! `ztest snapshot manifest <archive> > snapshots/<network>/<upgrade>.toml`,
+//! `ztest snapshot manifest <archive> > snapshots/<network>/zebra-<version>-<upgrade>.toml`,
 //! `ztest snapshot push <archive>`, and a const here.
 
 use crate::archive::{Backend, ChainSnapshot, Network};
@@ -43,7 +43,7 @@ pub const SAPLING_TESTNET: ChainSnapshot = ChainSnapshot {
     tip_height: 286_000,
     network: Network::Testnet,
     backend: Backend::Zebra,
-    artifact: artifact!("snapshots/testnet/sapling.toml"),
+    artifact: artifact!("snapshots/testnet/zebra-6.2.3-sapling.toml"),
 };
 
 /// Blossom activation (584,000) + 6,000 blocks.
@@ -53,7 +53,7 @@ pub const BLOSSOM_TESTNET: ChainSnapshot = ChainSnapshot {
     tip_height: 590_000,
     network: Network::Testnet,
     backend: Backend::Zebra,
-    artifact: artifact!("snapshots/testnet/blossom.toml"),
+    artifact: artifact!("snapshots/testnet/zebra-6.2.3-blossom.toml"),
 };
 
 /// NU5 / Orchard activation (1,842,420) + 6,000 blocks. First rung with v5 transactions
@@ -62,7 +62,7 @@ pub const ORCHARD_TESTNET: ChainSnapshot = ChainSnapshot {
     tip_height: 1_848_420,
     network: Network::Testnet,
     backend: Backend::Zebra,
-    artifact: artifact!("snapshots/testnet/orchard.toml"),
+    artifact: artifact!("snapshots/testnet/zebra-6.2.3-orchard.toml"),
 };
 
 /// NU6.3 / Ironwood activation (4,134,000) + 6,000 blocks. Only rung crossing the real
@@ -71,7 +71,7 @@ pub const IRONWOOD_TESTNET: ChainSnapshot = ChainSnapshot {
     tip_height: 4_140_000,
     network: Network::Testnet,
     backend: Backend::Zebra,
-    artifact: artifact!("snapshots/testnet/ironwood.toml"),
+    artifact: artifact!("snapshots/testnet/zebra-6.2.3-ironwood.toml"),
 };
 
 // ─────────────────────────────── mainnet ───────────────────────────────
@@ -82,7 +82,7 @@ pub const SAPLING_MAINNET: ChainSnapshot = ChainSnapshot {
     tip_height: 425_200,
     network: Network::Mainnet,
     backend: Backend::Zebra,
-    artifact: artifact!("snapshots/mainnet/sapling.toml"),
+    artifact: artifact!("snapshots/mainnet/zebra-6.2.3-sapling.toml"),
 };
 
 /// Blossom activation (653,600) + 6,000 blocks
@@ -90,7 +90,7 @@ pub const BLOSSOM_MAINNET: ChainSnapshot = ChainSnapshot {
     tip_height: 659_600,
     network: Network::Mainnet,
     backend: Backend::Zebra,
-    artifact: artifact!("snapshots/mainnet/blossom.toml"),
+    artifact: artifact!("snapshots/mainnet/zebra-6.2.3-blossom.toml"),
 };
 
 /// NU5 / Orchard activation (1,687,104) + 6,000 blocks.
@@ -101,7 +101,7 @@ pub const ORCHARD_MAINNET: ChainSnapshot = ChainSnapshot {
     tip_height: 1_693_104,
     network: Network::Mainnet,
     backend: Backend::Zebra,
-    artifact: artifact!("snapshots/mainnet/orchard.toml"),
+    artifact: artifact!("snapshots/mainnet/zebra-6.2.3-orchard.toml"),
 };
 
 /// Every shipped snapshot. `ztest snapshot verify --remote` walks it to assert each

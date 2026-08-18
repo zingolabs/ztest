@@ -17,17 +17,18 @@ mod subject;
 mod tree;
 mod work;
 
-pub(crate) use detached::note_setup;
-pub(crate) use event::{SyncEvent, decode as decode_event};
+pub use detached::note_setup;
+pub use event::{SyncEvent, decode as decode_event};
 // Encoding is the driver's job, the controller only decodes; decode tests need both halves
-#[cfg(test)]
-pub(crate) use event::{Tick as SyncTick, encode as encode_event};
+// (`test-util`, not `cfg(test)`: the controller's tests live in the `ztest_cli` crate)
+#[cfg(any(test, feature = "test-util"))]
+pub use event::{Tick as SyncTick, encode as encode_event};
 
 pub use detached::{
     KIND_LABEL_KEY, KIND_LABEL_VALUE, POD_NAME_ENV, POD_NAMESPACE_ENV, REPORT_KEY, ReportViolation,
     STOP_ANNOTATION, SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV, SyncReportMirror, SyncStatus,
-    active_sync_id, driver_pod_for, find_driver, kind_selector, namespace_for, read_report,
-    report_cm_name, report_cm_namespace,
+    active_sync_id, driver_is_live, driver_pod_for, find_driver, kind_selector, namespace_for,
+    profiler_config_name, read_report, report_cm_name, report_cm_namespace,
 };
 
 pub use chainwork::{ChainWork, Support};
