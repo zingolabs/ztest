@@ -19,15 +19,13 @@ use kube::Client;
 use kube::api::{Api, ListParams, ObjectList, Patch, PatchParams};
 use tokio::sync::watch;
 
+use super::beacon::{ANN_RESERVE_CPU, ANN_RESERVE_MEM, Beacon, LeaseKind, Progress};
 use super::{LABEL_RUN_ID, LABEL_USER, MIB, QosClass, Resources};
 use crate::resource::impls::policy::RUN_NAMESPACE;
 
 /// Namespace holding the reservation ledger
 pub const META_NAMESPACE: &str = "ztest-meta";
 
-/// Reservation footprint, on the run's Lease
-const ANN_RESERVE_CPU: &str = "ztest.io/reserve-cpu-milli";
-const ANN_RESERVE_MEM: &str = "ztest.io/reserve-mem-bytes";
 /// Per-SA budget, on the ServiceAccount object
 const ANN_BUDGET_CPU: &str = "ztest.io/budget-cpu-milli";
 const ANN_BUDGET_MEM: &str = "ztest.io/budget-mem-bytes";
@@ -111,13 +109,16 @@ pub struct Reservation {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Lease identity + amount currently written (cloned into the bg task)
+/// Lease identity + the status currently written (cloned into the bg task).
+///
+/// One shared [`Beacon`]: the reconcile loop owns `reserve`, the engine owns the progress
+/// fields via [`report_status`](Reservation::report_status), and every write emits both
 #[derive(Clone)]
 struct Inner {
     client: Client,
     id: String,
     user: String,
-    reserve: Arc<Mutex<Resources>>,
+    beacon: Arc<Mutex<Beacon>>,
 }
 
 /// - `committed` = running now → reservation floor (no preemption)
@@ -153,21 +154,26 @@ impl Inner {
         Api::namespaced(self.client.clone(), META_NAMESPACE)
     }
 
-    /// Write at `reserve` (`renewTime` bump = the TTL heartbeat)
+    /// Write at `reserve`, carrying the live status (`renewTime` bump = the TTL heartbeat)
     ///
     /// - Server-side apply → overlapping holders converge, never race
     /// - That is what lets a sync's lease pass CLI → driver pod
     async fn write(&self, reserve: Resources) -> Result<(), LedgerError> {
-        let lease = lease_object(&self.id, &self.user, reserve);
+        // Cloned (never held across the await), amount applied only once the write lands
+        let beacon = {
+            let b = self.beacon.lock().expect("beacon mutex poisoned");
+            Beacon { reserve, ..b.clone() }
+        };
+        let lease = lease_object(&self.id, &self.user, &beacon);
         self.api()
             .patch(&self.id, &PatchParams::apply("ztest-ledger").force(), &Patch::Apply(&lease))
             .await
-            .map(|_| *self.reserve.lock().expect("reserve mutex poisoned") = reserve)
+            .map(|_| self.beacon.lock().expect("beacon mutex poisoned").reserve = reserve)
             .map_err(|e| LedgerError::Kube(format!("renew lease {}: {e}", self.id)))
     }
 
     fn current(&self) -> Resources {
-        *self.reserve.lock().expect("reserve mutex poisoned")
+        self.beacon.lock().expect("beacon mutex poisoned").reserve
     }
 
     async fn delete(&self) {
@@ -209,14 +215,27 @@ impl Reservation {
     /// - `ztest sync start` acquires (admission must be refusable while watched) then exits
     /// - Driver pod picks it up for the pods' lifetime
     /// - `reserve` must match the acquired figure (else it rewrites the reservation)
-    pub fn adopt(client: &Client, id: &str, user: &str, reserve: Resources) -> Self {
+    pub fn adopt(
+        client: &Client,
+        id: &str,
+        user: &str,
+        reserve: Resources,
+        kind: LeaseKind,
+    ) -> Self {
         let inner = Inner {
             client: client.clone(),
             id: id.to_string(),
             user: user.to_string(),
-            reserve: Arc::new(Mutex::new(reserve)),
+            beacon: Arc::new(Mutex::new(Beacon::new(id, user, kind, reserve))),
         };
         Reservation::spawn(inner, Reserve::Fixed(reserve), reserve, reserve, reserve)
+    }
+
+    /// Publish live test progress onto the lease. Free: the next heartbeat carries it
+    pub fn report_status(&self, progress: Progress) {
+        if let Ok(mut b) = self.inner.beacon.lock() {
+            b.apply(progress);
+        }
     }
 
     /// Background loop, shared by every reservation
@@ -336,11 +355,21 @@ pub async fn acquire(
     user: &str,
     capacity: super::ClusterCapacity,
     want: Reserve,
+    kind: LeaseKind,
 ) -> Result<Reservation, LedgerError> {
     require_meta_namespace(client).await?;
     let leases: Api<Lease> = Api::namespaced(client.clone(), META_NAMESPACE);
     let allocatable = capacity.allocatable;
     let budget = sa_budget(client, sa, default_budget(allocatable)).await;
+
+    // Held from the first poll so a blocked run is visible to peers and to `ztest status`;
+    // `started_at` = the wait's start, which is when the user launched
+    let inner = Inner {
+        client: client.clone(),
+        id: lease_id.to_string(),
+        user: user.to_string(),
+        beacon: Arc::new(Mutex::new(Beacon::new(lease_id, user, kind, Resources::ZERO))),
+    };
 
     let start = std::time::Instant::now();
     loop {
@@ -363,19 +392,27 @@ pub async fn acquire(
         // Enough for what this caller came for → take it; else wait for others to release
         if fits(&want.threshold(), &slice) {
             let reserve = want.amount(slice);
-            let inner = Inner {
-                client: client.clone(),
-                id: lease_id.to_string(),
-                user: user.to_string(),
-                reserve: Arc::new(Mutex::new(reserve)),
-            };
+            {
+                let mut b = inner.beacon.lock().expect("beacon mutex poisoned");
+                b.kind = kind;
+                b.needs = None;
+            }
             inner.write(reserve).await?; // server-side apply == create
             return Ok(Reservation::spawn(inner, want, reserve, budget, allocatable));
         }
 
         if start.elapsed() >= ACQUIRE_WAIT_TIMEOUT {
+            let _ = inner.delete().await;
             return Err(LedgerError::CapacityTimeout { waited: start.elapsed(), headroom });
         }
+        // Claim: zero reserve (adds nothing to `sum_reservations`, no pods for
+        // `assert_invariant`), rewritten each poll so it doubles as the TTL heartbeat
+        {
+            let mut b = inner.beacon.lock().expect("beacon mutex poisoned");
+            b.kind = LeaseKind::Claim;
+            b.needs = Some(want.threshold());
+        }
+        let _ = inner.write(Resources::ZERO).await;
         tokio::time::sleep(ACQUIRE_POLL).await;
     }
 }
@@ -495,8 +532,11 @@ pub(crate) fn reserve_from_state(
 ) -> Resources {
     let others = sum_reservations(leases, run_id);
     let unreserved = split_usage(pods, leases).0;
-    let active_runs = leases.items.len() as u64;
-    fair_reserve(allocatable, unreserved, others, active_runs, budget, committed, demand)
+    // Claims hold nothing and run nothing: counting them would shrink every peer's fair
+    // share on behalf of a run that may never start (FIFO admission is a separate change)
+    let active_runs =
+        leases.items.iter().filter(|l| Beacon::kind_of(l) != LeaseKind::Claim).count();
+    fair_reserve(allocatable, unreserved, others, active_runs as u64, budget, committed, demand)
 }
 
 /// Σ reservations of every live lease except `exclude` (this run's own)
@@ -552,7 +592,7 @@ fn split_usage(
         leases.items.iter().filter_map(|l| l.metadata.name.as_deref()).collect();
     let mut unreserved = Resources::ZERO;
     let mut by_run: BTreeMap<String, Resources> = BTreeMap::new();
-    for p in pods.items.iter().filter(|p| consumes(p)) {
+    for p in pods.items.iter().filter(|p| super::units::pod_holds_capacity(p)) {
         match run_id_of(p).filter(|r| leased.contains(r)) {
             Some(run) => {
                 let e = by_run.entry(run.to_string()).or_insert(Resources::ZERO);
@@ -594,14 +634,6 @@ fn pod_footprint(pod: &Pod) -> Resources {
     pod.spec.as_ref().map(super::units::pod_effective_request).unwrap_or(Resources::ZERO)
 }
 
-/// Still consuming scheduled capacity (a settled Succeeded/Failed pod is reclaimed)
-fn consumes(pod: &Pod) -> bool {
-    !matches!(
-        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
-        Some("Succeeded") | Some("Failed")
-    )
-}
-
 /// TTL lapsed as of `now` (`renewTime + duration < now`); missing either field = live
 /// (never sweep on incomplete data)
 pub(crate) fn is_expired(lease: &Lease, now: chrono::DateTime<Utc>) -> bool {
@@ -614,17 +646,14 @@ pub(crate) fn is_expired(lease: &Lease, now: chrono::DateTime<Utc>) -> bool {
     renew.0 + chrono::Duration::seconds(dur as i64) < now
 }
 
-/// Lease for `run_id` reserving `reserve`, with run-id + user labels (so the existing
-/// label reap covers it) and a fresh `renewTime`. Identical on acquire and every renew
-fn lease_object(run_id: &str, user: &str, reserve: Resources) -> Lease {
+/// Lease for `run_id` carrying `beacon`, with run-id + user labels (so the existing label
+/// reap covers it) and a fresh `renewTime`. Identical on acquire and every renew
+fn lease_object(run_id: &str, user: &str, beacon: &Beacon) -> Lease {
     let labels = BTreeMap::from([
         (LABEL_RUN_ID.to_string(), run_id.to_string()),
         (LABEL_USER.to_string(), user.to_string()),
     ]);
-    let annotations = BTreeMap::from([
-        (ANN_RESERVE_CPU.to_string(), reserve.cpu_milli.to_string()),
-        (ANN_RESERVE_MEM.to_string(), reserve.mem_bytes.to_string()),
-    ]);
+    let annotations = beacon.annotations();
     Lease {
         metadata: ObjectMeta {
             name: Some(run_id.to_string()),

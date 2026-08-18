@@ -930,8 +930,13 @@ impl TestEnv {
             return;
         }
         let reserve = qos::current_profile().admitted();
-        let held =
-            crate::qos::ledger::Reservation::adopt(client, &coords.run_id, &coords.user, reserve);
+        let held = crate::qos::ledger::Reservation::adopt(
+            client,
+            &coords.run_id,
+            &coords.user,
+            reserve,
+            crate::qos::beacon::LeaseKind::Sync,
+        );
         if self.inner.sync_lease.set(held).is_ok() {
             tracing::info!(lease = %coords.run_id, %reserve, "detached sync: holding reservation");
         }
@@ -1016,13 +1021,18 @@ impl Drop for TestEnv {
     /// that leak filled the cluster's pod cap and timed out every later test.
     ///
     /// - Pod path (`ZTEST_TEST_NAMESPACE`) = no-op: parent owns logs + teardown over kube
+    /// - Detached-sync driver excepted: no parent outlives it, so it owns its own namespace
+    ///   (its verdict is already mirrored to `OBS_NAMESPACE`, outside what this deletes)
     /// - Delete runs on its own OS thread + runtime, `join`ed (`Drop` can't await, and a
     ///   spawned task dies with the test runtime before its DELETE is sent), with a client
     ///   rebuilt inside it (the original is bound to the dying reactor)
     /// - `ZTEST_NO_CLEANUP` suppresses the delete; the 1h `janitor/ttl` still reaps it
     fn drop(&mut self) {
-        // Deleting here would race the parent's still-draining collector
-        if std::env::var(naming::TEST_NAMESPACE_ENV).is_ok_and(|v| !v.is_empty()) {
+        // Deleting here would race the parent's still-draining collector — except under a
+        // detached sync, where the `ztest sync start` process is long gone
+        let parented = std::env::var(naming::TEST_NAMESPACE_ENV).is_ok_and(|v| !v.is_empty())
+            && crate::sync::active_sync_id().is_none();
+        if parented {
             return;
         }
 

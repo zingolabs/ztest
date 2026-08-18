@@ -20,6 +20,7 @@ use crate::engine::local_runner::TestOutcome;
 use crate::engine::panel::{live_snapshot, run_progress};
 use crate::engine::plan::WorkItem;
 use crate::qos::Resources;
+use crate::qos::beacon::{Progress, RunningTest};
 use crate::qos::live::LiveSnapshot;
 use crate::qos::scheduler::{Admission, RejectReason, Request, Scheduler, SlotId};
 use crate::resource::{NodeId, NodeState};
@@ -86,6 +87,8 @@ where
     let total = items.len();
     let mut stats = RunStats { total, ..RunStats::default() };
     let start = Instant::now();
+    // Paired origin: per-test `Instant`s become wall clock for the lease beacon
+    let start_wall = chrono::Utc::now();
 
     let mut sched = Scheduler::new(ceiling);
     let mut inflight: HashMap<SlotId, Running> = HashMap::new();
@@ -134,11 +137,13 @@ where
         };
     }
 
-    // Live appetite → an elastic reservation sizes itself (no-op for local runs and tests)
+    // Live appetite → an elastic reservation sizes itself; status rides the same tick onto
+    // the lease, where `ztest status` reads it (no-op for local runs and tests)
     macro_rules! publish_demand {
         () => {
             if let Some(r) = &cfg.reservation {
                 r.report_demand(sched.committed(), sched.demand());
+                r.report_status(progress_of(&stats, &inflight, start, start_wall));
             }
         };
     }
@@ -267,7 +272,7 @@ where
                 }
                 publish_demand!();
 
-                render_tick(reporter, &inflight, &sched, ceiling, stats, start, &cfg, &mut on_tick);
+                render_tick(reporter, &inflight, &sched, ceiling, stats, start, &mut on_tick);
             }
             // Reservation moved this run's live ceiling: a grow backfills parked tests into
             // the new headroom, a shrink stops admission without preempting running leases
@@ -283,7 +288,7 @@ where
                     pump!();
                 }
                 publish_demand!();
-                render_tick(reporter, &inflight, &sched, ceiling, stats, start, &cfg, &mut on_tick);
+                render_tick(reporter, &inflight, &sched, ceiling, stats, start, &mut on_tick);
             }
             _ = tick.tick() => {
                 // Soft SLOW detection and spinner refresh.
@@ -296,7 +301,7 @@ where
                     }
                     emit_slows(reporter, &inflight, after);
                 }
-                render_tick(reporter, &inflight, &sched, ceiling, stats, start, &cfg, &mut on_tick);
+                render_tick(reporter, &inflight, &sched, ceiling, stats, start, &mut on_tick);
             }
         }
     }
@@ -357,10 +362,9 @@ fn render_tick(
     _ceiling: Resources,
     stats: RunStats,
     start: Instant,
-    cfg: &LoopConfig,
     on_tick: &mut impl FnMut(&mut dyn RunReporter, &PanelFrame),
 ) {
-    let snapshot = live_snapshot(inflight.values().map(|r| &r.item), sched.committed(), &cfg.sa);
+    let snapshot = live_snapshot(inflight.values().map(|r| &r.item), sched.committed());
     // Longest-running first, ordered by fixed `started` + identity tiebreak, NOT by a
     // re-snapshotted `elapsed`: HashMap iteration order varies and per-frame `elapsed()` is
     // measured at slightly different instants, so near-equal tests swapped rows (the flicker)
@@ -391,6 +395,40 @@ fn render_tick(
 
 fn key(item: &WorkItem) -> (String, String) {
     (item.binary_id.clone(), item.test_name.clone())
+}
+
+/// Live run status for the lease beacon (`docs/design-status.md`).
+///
+/// - Newest-launched first: the display shows the head, and the latest test is the one a
+///   watcher is looking for
+/// - `queued` derived, not counted — `parked` + `ready` + the scheduler queue are three
+///   places a test can sit, and their sum is exactly what is neither finished nor inflight
+fn progress_of(
+    stats: &RunStats,
+    inflight: &HashMap<SlotId, Running>,
+    origin: Instant,
+    origin_wall: chrono::DateTime<chrono::Utc>,
+) -> Progress {
+    let mut running: Vec<RunningTest> = inflight
+        .values()
+        .map(|r| RunningTest {
+            name: r.item.test_name.clone(),
+            footprint: r.item.footprint,
+            tier: r.item.class,
+            started_at: origin_wall
+                + chrono::Duration::from_std(r.started.saturating_duration_since(origin))
+                    .unwrap_or_default(),
+        })
+        .collect();
+    running.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    let total = stats.total as u32;
+    Progress {
+        total,
+        queued: total.saturating_sub(stats.finished()).saturating_sub(running.len() as u32),
+        failed: stats.failed,
+        running,
+        eta_override: None,
+    }
 }
 
 fn to_request(item: &WorkItem, sa: &str) -> Request {

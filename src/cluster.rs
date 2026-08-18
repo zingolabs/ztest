@@ -64,10 +64,13 @@ pub fn in_cluster() -> bool {
     std::env::var("KUBERNETES_SERVICE_HOST").is_ok()
 }
 
-/// `ztest run --no-cleanup`? Carried as `ZTEST_NO_CLEANUP` (Drop runs in the test binary,
-/// not the `ztest` process); any non-empty, non-`"0"` value counts
+/// `--no-cleanup` into the process that actually tears down (test binary / sync driver,
+/// never the `ztest` process whose `Drop` never runs)
+pub(crate) const NO_CLEANUP_ENV: &str = "ZTEST_NO_CLEANUP";
+
+/// `--no-cleanup` asked for? Any non-empty, non-`"0"` value counts
 pub(crate) fn no_cleanup_requested() -> bool {
-    std::env::var_os("ZTEST_NO_CLEANUP").is_some_and(|v| !v.is_empty() && v != "0")
+    std::env::var_os(NO_CLEANUP_ENV).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Under the `ztest run` orchestrator (`ZTEST_ENGINE`)? A `TestEnv` provisions against a

@@ -29,6 +29,7 @@ down on exit.
 | [design-execution-engine.md](design-execution-engine.md)   | Run-loop scheduler and console render thread                                               |
 | [design-resources.md](design-resources.md)                 | Provider DAG, resource lifetimes, teardown, storage byte-source                            |
 | [design-qos.md](design-qos.md)                             | Tiers, capacity model, scheduler, cross-run ledger, calibration                            |
+| [design-status.md](design-status.md)                       | `ztest status`: the live cluster view, lease beacons, claim leases, gantt layout           |
 | [design-remote-execution.md](design-remote-execution.md)   | Pod-per-test, on-cluster compilation, on-cluster image builds                              |
 | [design-observability.md](design-observability.md)         | Metrics & profiling planes, Prometheus discovery, what a run records                       |
 | [design-load-testing.md](design-load-testing.md)           | Load driver, scenarios, oracles, parity checking                                           |

@@ -85,11 +85,12 @@ impl Report {
 /// Probe every capability, concurrently (independent reads; a preflight costing
 /// the sum of its round trips gets skipped)
 pub async fn probe(client: &Client) -> Report {
-    let (storage, snapshots, metrics, bucket) = tokio::join!(
+    let (storage, snapshots, metrics, bucket, profiling) = tokio::join!(
         probe_storage(client),
         probe_api(client, "snapshot.storage.k8s.io/v1", "VolumeSnapshot"),
         probe_metrics(client),
         probe_bucket(),
+        probe_profiling(client),
     );
 
     Report {
@@ -111,6 +112,13 @@ pub async fn probe(client: &Client) -> Report {
                 need: Need::Enables("metrics & profiling"),
                 finding: metrics,
                 remedy: "run `ztest cluster setup` (docs/ops-cluster-requirements.md#metrics)",
+            },
+            Capability {
+                name: "profile collector",
+                need: Need::Enables("CPU profiles (ztest sync perf)"),
+                finding: profiling,
+                remedy: "nested kubelet profiles host-side: needs a reachable docker daemon \
+                         (`--profile=false` runs without it)",
             },
             Capability {
                 name: "image registry",
@@ -204,6 +212,53 @@ fn probe_registry() -> Finding {
     }
 }
 
+/// Where a collector can run for this cluster, and whether that placement's prerequisites hold.
+///
+/// - Placement is not a preference: a nested kubelet numbers pods below the pid namespace eBPF
+///   reports in, so kind can only be profiled from the host
+/// - Host placement leans on the *workstation* — docker, a kubeconfig, a routable node — none
+///   of which the cluster can vouch for, so they are probed here and not discovered at launch
+/// - Read-only: promoting the Pyroscope Service to NodePort is a launch-time act, not a check
+async fn probe_profiling(client: &Client) -> Finding {
+    use crate::profiling::ebpf::{Placement, placement_for};
+
+    if placement_for(client).await == Placement::Sidecar {
+        return Finding::Present("driver-pod sidecar".to_string());
+    }
+    let node_ip = crate::profiling::node_internal_ip(client).await;
+    let mut missing = Vec::new();
+    if !docker_usable() {
+        missing.push("a reachable docker daemon");
+    }
+    // The address the collector actually dials, not the kubeconfig's: a nested cluster's
+    // kubeconfig points at loopback, which is dead once the collector leaves the host network
+    if crate::profiling::node_api_server(client).await.is_none() {
+        missing.push("an apiserver address on the cluster network");
+    }
+    if crate::profiling::host::cluster_network().await.is_none() {
+        missing.push("the cluster's docker network");
+    }
+    if node_ip.is_none() {
+        missing.push("a node InternalIP to push to");
+    }
+    match missing.as_slice() {
+        [] => Finding::Present(format!(
+            "host-side, nested kubelet · pushes to {}",
+            node_ip.unwrap_or_default()
+        )),
+        _ => Finding::Absent(format!("host-side profiling needs {}", missing.join(", "))),
+    }
+}
+
+/// Daemon reachable, not just a client on `PATH` (a `docker` binary with no daemon behind it
+/// fails at `sync start`, long after `check` said yes)
+fn docker_usable() -> bool {
+    std::process::Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 /// Metrics stack as one capability — provisioned as one, and a partial install has
 /// the same fix as a missing one.
 ///
@@ -247,6 +302,24 @@ mod tests {
 
     fn cap(name: &'static str, need: Need, finding: Finding) -> Capability {
         Capability { name, need, finding, remedy: "docs/ops-cluster-requirements.md" }
+    }
+
+    /// Profiling is a diagnostic: a workstation without docker must still be able to run
+    /// tests, so an absent collector reports and never blocks
+    #[test]
+    fn an_unprofilable_cluster_is_still_runnable() {
+        let report = Report {
+            capabilities: vec![
+                cap("snapshot-capable storage", Need::Required, Finding::Present("csi".into())),
+                cap(
+                    "profile collector",
+                    Need::Enables("CPU profiles (ztest sync perf)"),
+                    Finding::Absent("host-side profiling needs a reachable docker daemon".into()),
+                ),
+            ],
+        };
+        assert!(report.is_runnable());
+        assert_eq!(report.blocking().count(), 0);
     }
 
     /// Module's founding distinction — forbidden read != absent capability, and the

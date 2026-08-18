@@ -415,13 +415,20 @@ async fn test_mainnet_full_sync(mut run: SyncRunner) -> SyncOutcome {
 A sync outlives the launching terminal, so the cluster is the daemon and the CLI
 is a stateless controller. State lives in k8s (no local daemon, no `~/.ztest`
 DB): a **ztest-owned pod** labelled `ztest.io/{kind=sync,sync-id,owner}`, a
-**PVC-backed wallet/cache datadir** (RWO, NVMe) so a restart resumes rather than
-rescans, and a `SyncReport` written to the PVC + mirrored to a ConfigMap so it
-outlives the pod. `list` is a labelled pod query; any machine with the kubeconfig
-can `list`/`watch`/`stop`.
+**PVC-backed wallet/cache datadir** (RWO, NVMe) so a *restart within the run*
+resumes rather than rescans, and a `SyncReport` mirrored to a ConfigMap in
+`ztest-obs` — beside the
+Prometheus series and Pyroscope profiles of the same run. `list` is a labelled
+pod query; any machine with the kubeconfig can `list`/`watch`/`stop`.
 
-Detached syncs live in a **persistent, user-scoped** namespace (not an ephemeral
-per-run one). `ztest cleanup` must skip `kind=sync` pods that are `Running`.
+The record and the footprint have separate lifetimes. A sync's topology lives in
+its own `ztest-sync-{id}` namespace, torn down by the driver itself when the run
+finishes (`--no-cleanup` keeps it for inspection); the report, series and
+profiles live in the cluster-lifetime `ztest-obs` namespace and are reclaimed
+only by `ztest cleanup`, together. A verdict therefore survives the teardown of
+everything that produced it. The datadir does not: teardown takes the PVC, so the
+checkpoint `stop` writes outlives the run only under `--no-cleanup`. `ztest
+cleanup` must skip `kind=sync` pods that are `Running`.
 
 Live progress rides the pod's **log stream**: the runner prints a structured
 sentinel line per tick (the in-pod `EmitSink`); `ztest sync watch` follows the
@@ -446,12 +453,14 @@ length of the run.
 ```
 ztest sync list [--all-users] [--json]        # labelled pod query: id, subject, phase, %, age
 ztest sync describe <name>                     # body in Collect mode → invariant + nemesis manifest
-ztest sync start <name> [--watch]              # admit + create the ztest-owned pod; --watch attaches
+ztest sync start <name> [--watch] [--no-cleanup]  # admit + create the ztest-owned pod; --watch
+                                               #   attaches; --no-cleanup keeps the topology ns
 ztest sync watch <id>                          # attach to live progress; Ctrl-C DETACHES only
 ztest sync status <id> [--json]                # finished: the final SyncReport (works after the
                                                #   pod is gone); still running: the last snapshot
 ztest sync stop <id>                           # graceful: sync_mode=Shutdown → checkpoint → exit 0
-ztest cleanup <id>                             # delete a finished sync's namespace (+ PVCs)
+ztest cleanup <id>                             # reclaim what the run left: leftover namespace,
+                                               #   driver pod, and the record (report + series)
 ```
 
 Deletion is deliberately *not* a `sync` subcommand: reclaiming cluster resources

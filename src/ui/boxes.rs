@@ -8,6 +8,7 @@
 use owo_colors::OwoColorize as _;
 
 use super::Theme;
+use super::layout::{display_width, truncate};
 
 /// Content width inside a `width`-column box: less two borders, two pad spaces
 pub(super) fn interior(width: usize) -> usize {
@@ -77,20 +78,6 @@ pub(super) fn row(label: &str, value: &str, inner: usize, theme: &Theme) -> Stri
 
 pub(super) fn dim(text: &str, theme: &Theme) -> String {
     text.style(theme.styles.dim).to_string()
-}
-
-/// Printable width, ANSI escapes ignored (padding against byte length leaves every
-/// coloured box ragged)
-pub(super) fn display_width(s: &str) -> usize {
-    console::measure_text_width(s)
-}
-
-/// Cut `s` to `width` printable columns, escapes preserved
-pub(super) fn truncate(s: &str, width: usize) -> String {
-    match display_width(s) <= width {
-        true => s.to_string(),
-        false => console::truncate_str(s, width, "").into_owned(),
-    }
 }
 
 #[cfg(test)]

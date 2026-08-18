@@ -8,11 +8,10 @@
 //! - `start` reuses `ztest run`'s on-cluster compile — same `#[ztest::sync_test]` body,
 //!   distinguished only by `ZTEST_SYNC_ID` (see [`crate::sync::detached`])
 
-mod perf;
 mod render;
 mod watch;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, stdout};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
@@ -31,14 +30,15 @@ use crate::pipeline::images::DumpOutcome;
 use crate::pipeline::local_bake;
 use crate::pipeline::profiles::{self, ProfileStub};
 use crate::pipeline::remote_compile::{self, BakeRefs, RemoteCompileOutcome};
+use crate::profiling::ebpf::Placement;
 use crate::resource::impls::buildkit;
 use crate::resource::impls::policy::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
 use crate::sync::{
     KIND_LABEL_KEY, KIND_LABEL_VALUE, POD_NAME_ENV, POD_NAMESPACE_ENV, STOP_ANNOTATION,
-    SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV, SyncReportMirror, driver_pod_for, kind_selector,
-    namespace_for, report_cm_name,
+    SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV, SyncReportMirror, SyncStatus, driver_pod_for,
+    find_driver, kind_selector, namespace_for, read_report, report_cm_namespace,
 };
-use crate::ui::{ComponentResources, Outcome, ReportView, Theme, Transfers};
+use crate::ui::{ComponentResources, ReportView, Theme, Transfers};
 
 /// Driver pod's sole container (named: a log request gates on the container's state,
 /// not the pod phase)
@@ -62,7 +62,7 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// List detached syncs (cluster-wide `kind=sync` query): id, namespace, phase, user.
+    /// List detached syncs (cluster-wide `kind=sync` query): id, namespace, status, user.
     List {
         /// Include every user's syncs, not just your own.
         #[arg(long)]
@@ -97,6 +97,21 @@ enum Cmd {
         /// Profiler sample rate, Hz.
         #[arg(long, value_name = "HZ", default_value_t = crate::profiling::ebpf::DEFAULT_HZ)]
         profile_hz: u32,
+        /// Fraction of off-CPU (blocked) events sampled, 0..=1. `0` profiles on-CPU time
+        /// only. Raising it costs perf-ring headroom — check `ztest sync perf` reports
+        /// 0 dropped trace events before keeping a higher value.
+        #[arg(
+            long,
+            value_name = "P",
+            default_value_t = crate::profiling::ebpf::DEFAULT_OFF_CPU,
+            value_parser = off_cpu_fraction,
+        )]
+        profile_off_cpu: f64,
+        /// Leave the sync's namespace (component pods, their logs, PVCs) standing when the
+        /// run finishes, for inspection. The verdict, metrics and profiles are kept either
+        /// way — they live outside it.
+        #[arg(long)]
+        no_cleanup: bool,
     },
     /// Attach to a sync's live progress (read-only; detaching never stops it).
     Watch {
@@ -130,16 +145,16 @@ enum Cmd {
         /// processes are not comparable.
         #[arg(long, value_name = "NAME")]
         component: Option<String>,
-        /// Compare against an earlier sync: per-op rate deltas, and a
-        /// differential flame graph of this run against that one. Both runs
-        /// must have covered the same declared height segment.
+        /// Compare against an earlier sync: per-op rate deltas, plus both runs'
+        /// profiles retrieved side by side to diff in a viewer. Both runs must
+        /// have covered the same declared height segment.
         #[arg(long, value_name = "SYNC_ID")]
         base: Option<String>,
-        /// Keep every frame, including the thread/tokio scaffolding that precedes
-        /// the first line of application code in every stack. Off by default:
-        /// that prefix is identical on every sample and is over half the graph.
+        /// Profile blocked time instead of CPU time: where the component waited on disk,
+        /// locks and timers. Read separately from the CPU profile, never merged — parked
+        /// threads outweigh real work by volume and would bury it.
         #[arg(long)]
-        raw: bool,
+        off_cpu: bool,
     },
     /// Graceful stop: `sync_mode = Shutdown` → checkpoint → exit.
     Stop {
@@ -178,15 +193,26 @@ async fn run(args: Args) -> Result<(), String> {
         Cmd::Status { id, json } => status(&id, json).await,
         Cmd::Stop { id } => stop(&id).await,
         // Inspection, like `status`: reads artifacts, never touches the run
-        Cmd::Perf { id, out, no_open, window, component, base, raw } => {
-            perf::perf(perf::Request { id, out, open: !no_open, window, component, base, raw })
-                .await
+        Cmd::Perf { id, out, no_open, window, component, base, off_cpu } => {
+            crate::profiling::perf::perf(crate::profiling::perf::Request {
+                id,
+                out,
+                open: !no_open,
+                window,
+                component,
+                base,
+                profile: match off_cpu {
+                    true => crate::profiling::Profile::OffCpu,
+                    false => crate::profiling::Profile::OnCpu,
+                },
+            })
+            .await
         }
         // Inspection: succeeds when it managed to observe, whatever the verdict
         Cmd::Watch { id } => watch::watch(&id).await.map(drop),
         Cmd::Describe { name } => describe(&name).await,
-        Cmd::Start { name, watch, profile, profile_hz } => {
-            start(&name, watch, profile.then_some(profile_hz)).await
+        Cmd::Start { name, watch, profile, profile_hz, profile_off_cpu, no_cleanup } => {
+            start(&name, watch, profile.then_some((profile_hz, profile_off_cpu)), no_cleanup).await
         }
     }
 }
@@ -252,8 +278,13 @@ fn preflight(name: &str) -> Result<Option<ProfileStub>, String> {
 
 // ─────────────────────────────── start ────────────────────────────────
 
-/// `profile_hz` = `Some(rate)` when profiling is on (the default), `None` for `--profile false`
-async fn start(name: &str, watch_after: bool, profile_hz: Option<u32>) -> Result<(), String> {
+/// `profiling` = `Some((hz, off_cpu))` when on (the default), `None` for `--profile false`
+async fn start(
+    name: &str,
+    watch_after: bool,
+    profiling: Option<(u32, f64)>,
+    no_cleanup: bool,
+) -> Result<(), String> {
     // pre-client, pre-build (wrong name answerable from source in ms)
     let stub = preflight(name)?;
 
@@ -294,14 +325,24 @@ async fn start(name: &str, watch_after: bool, profile_hz: Option<u32>) -> Result
     // Resolved before the reserve: the collector rides the driver pod, so its slice must be
     // in the amount admission holds. No Pyroscope = say so and run unprofiled, never launch
     // a collector pushing into nothing
-    let collector = match profile_hz {
-        Some(hz) => {
-            let c = crate::profiling::ebpf::Collector::for_sync(&client, &sync_id, &ns, hz).await;
-            if c.is_none() {
-                eprintln!(
-                    "ztest sync: no Pyroscope on this cluster; starting unprofiled \
-                     (`ztest cluster setup` deploys it)"
-                );
+    let collector = match profiling {
+        Some((hz, off_cpu)) => {
+            let c =
+                crate::profiling::ebpf::Collector::for_sync(&client, &sync_id, &ns, hz, off_cpu)
+                    .await;
+            match &c {
+                // Never asserts *why*: an unready Pyroscope and an absent one look the
+                // same here, and blaming setup for a broken pod sends the reader nowhere
+                None => eprintln!(
+                    "ztest sync: Pyroscope unreachable; starting unprofiled \
+                     (`ztest sync perf` reports the reason)"
+                ),
+                // Placement is a property of the cluster, not a choice; say where it landed
+                // only when that changes what the user must reach for (`perf` reads it back)
+                Some(c) if c.placement == crate::profiling::ebpf::Placement::Host => eprintln!(
+                    "ztest sync: nested kubelet — collector runs host-side (docker), not in-pod"
+                ),
+                Some(_) => {}
             }
             c
         }
@@ -312,8 +353,14 @@ async fn start(name: &str, watch_after: bool, profile_hz: Option<u32>) -> Result
     // - Sync holds the tier for hours (unreserved = the ledger's biggest hole)
     // - CLI, not driver → admission can refuse while a terminal hears it
     // - `acquire` waits → a busy cluster queues the launch
-    let reservation =
-        reserve_sync_capacity(&client, &sync_id, &sa, &target, collector.is_some()).await?;
+    let reservation = reserve_sync_capacity(
+        &client,
+        &sync_id,
+        &sa,
+        &target,
+        collector.as_ref().is_some_and(|c| c.placement == Placement::Sidecar),
+    )
+    .await?;
 
     // Pre-adoption: every failure path releases
     let launched = async {
@@ -327,6 +374,7 @@ async fn start(name: &str, watch_after: bool, profile_hz: Option<u32>) -> Result
             &target,
             &image_refs,
             collector.as_ref(),
+            no_cleanup,
         )
         .await?;
         await_driver_running(&client, &sync_id).await
@@ -390,6 +438,7 @@ async fn reserve_sync_capacity(
         &crate::naming::current_user(),
         capacity,
         crate::qos::ledger::Reserve::Fixed(want),
+        crate::qos::beacon::LeaseKind::Sync,
     )
     .await
     .map_err(|e| format!("reserve sync capacity: {e}"))
@@ -407,24 +456,40 @@ async fn launch_driver(
     target: &Target,
     image_refs: &BTreeMap<String, String>,
     collector: Option<&crate::profiling::ebpf::Collector>,
+    no_cleanup: bool,
 ) -> Result<(), String> {
     ensure_sync_namespace(client, ns, sync_id).await?;
     // Config before the pod that mounts it (a missing ConfigMap holds the driver in
     // `ContainerCreating`, not just the sidecar)
-    if let Some(c) = collector {
+    if let Some(c) = collector.filter(|c| c.placement == Placement::Sidecar) {
         let cm = c.config_map();
         Api::<ConfigMap>::namespaced(client.clone(), RUN_NAMESPACE)
             .patch(&c.config_map, &PatchParams::apply("ztest-sync").force(), &Patch::Apply(&cm))
             .await
             .map_err(|e| format!("create profiler config: {e}"))?;
     }
-    let pod = build_driver_pod(sync_id, profile, ns, sa, compiled, target, image_refs, collector);
+    let pod = build_driver_pod(
+        sync_id, profile, ns, sa, compiled, target, image_refs, collector, no_cleanup,
+    );
     let created = Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
         .create(&PostParams::default(), &pod)
         .await
         .map_err(|e| format!("create driver pod: {e}"))?;
-    if let Some(c) = collector {
-        adopt_profiler_config(client, &created, &c.config_map).await;
+    match collector {
+        Some(c) if c.placement == Placement::Sidecar => {
+            adopt_profiler_config(client, &created, &c.config_map).await;
+        }
+        // Started after the pod exists: discovery matches on labels the pod carries, and a
+        // collector racing ahead of it would idle on zero targets
+        Some(c) => {
+            crate::profiling::host::start(
+                sync_id,
+                &c.host_config(),
+                c.api_server.as_deref().unwrap_or_default(),
+            )
+            .await?
+        }
+        None => {}
     }
     Ok(())
 }
@@ -522,15 +587,15 @@ async fn await_driver_running(client: &Client, sync_id: &str) -> Result<(), Stri
 async fn attach(theme: &Theme, sync_id: &str) -> Result<(), String> {
     use owo_colors::OwoColorize as _;
     match watch::watch(sync_id).await {
-        Ok(watch::WatchEnd::Finished { passed: false }) => {
-            Err(format!("sync {sync_id} finished with violations"))
-        }
         // Log ended with the driver gone: killed, evicted, or crashed pre-report. Silence
         // here would pass a pipeline on a sync that never reached a verdict.
-        Ok(watch::WatchEnd::Unresolved) => {
+        Ok(watch::WatchEnd::Settled(SyncStatus::Unresolved)) => {
             Err(format!("sync {sync_id} ended without a report (`ztest sync status {sync_id}`)"))
         }
-        Ok(watch::WatchEnd::Finished { passed: true } | watch::WatchEnd::Detached) => Ok(()),
+        Ok(watch::WatchEnd::Settled(status)) if !status.is_pass() => {
+            Err(format!("sync {sync_id} finished {status} (`ztest sync status {sync_id}`)"))
+        }
+        Ok(watch::WatchEnd::Settled(_) | watch::WatchEnd::Detached) => Ok(()),
         Err(detail) => {
             eprintln!("ztest sync: attach to {sync_id} failed: {detail}");
             eprintln!(
@@ -892,6 +957,7 @@ fn build_driver_pod(
     target: &Target,
     image_refs: &BTreeMap<String, String>,
     collector: Option<&crate::profiling::ebpf::Collector>,
+    no_cleanup: bool,
 ) -> Pod {
     // Declared profile's runner slice (already covered by `reserve_sync_capacity`)
     let (cpu, mem) = target.profile.runner.guaranteed_cpu_mem("sync driver pod");
@@ -935,6 +1001,9 @@ fn build_driver_pod(
             "valueFrom": { "fieldRef": { "fieldPath": "metadata.namespace" } },
         }),
     ];
+    if no_cleanup {
+        env.push(json!({ "name": crate::cluster::NO_CLEANUP_ENV, "value": "1" }));
+    }
     if let Some(secret) = crate::backends::image::pull_secret() {
         env.push(json!({ "name": "ZTEST_PULL_SECRET", "value": secret }));
     }
@@ -957,12 +1026,13 @@ fn build_driver_pod(
     // `hostPID` is pod-level, so the driver container shares it while profiling (the cost
     // of co-locating the collector rather than running a DaemonSet)
     let (sidecars, volumes, host_pid) = match collector {
-        Some(c) => (
+        // Host placement costs the driver nothing: no sidecar, no `hostPID`, no volumes
+        Some(c) if c.placement == Placement::Sidecar => (
             json!([serde_json::to_value(c.container()).expect("container serialises")]),
             serde_json::to_value(c.volumes()).expect("volumes serialise"),
             true,
         ),
-        None => (json!([]), json!([]), false),
+        _ => (json!([]), json!([]), false),
     };
 
     serde_json::from_value(json!({
@@ -1000,49 +1070,89 @@ fn build_driver_pod(
 
 // ─────────────────────────── list / status ────────────────────────────
 
-/// Driver pod → `sync-id`, namespace, phase, owning user
-fn row_of(p: &Pod) -> (String, String, String, String) {
+/// What a driver pod alone can say. `pod_phase` = kubelet's word, never rendered raw
+/// ([`SyncStatus::observe`] turns it into the status every command prints)
+pub(super) struct SyncRow {
+    pub(super) id: String,
+    pub(super) namespace: String,
+    pub(super) pod_phase: Option<String>,
+    pub(super) user: String,
+}
+
+fn row_of(p: &Pod) -> SyncRow {
     let label = |k: &str| {
         p.metadata.labels.as_ref().and_then(|l| l.get(k)).cloned().unwrap_or_else(|| "-".into())
     };
-    let phase = p.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_else(|| "Unknown".into());
-    (
-        label(SYNC_ID_KEY),
-        p.metadata.namespace.clone().unwrap_or_else(|| "-".into()),
-        phase,
-        label(crate::qos::LABEL_USER),
-    )
+    SyncRow {
+        id: label(SYNC_ID_KEY),
+        namespace: p.metadata.namespace.clone().unwrap_or_else(|| "-".into()),
+        pod_phase: p.status.as_ref().and_then(|s| s.phase.clone()),
+        user: label(crate::qos::LABEL_USER),
+    }
+}
+
+/// Every mirrored report, by sync id.
+///
+/// - `list` joins them as `status` does (driver in teardown outlives its own verdict)
+/// - Pod-only status would call a finished run unfinished
+async fn report_mirrors(client: &Client) -> HashMap<String, SyncReportMirror> {
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), report_cm_namespace());
+    let lp = ListParams::default().labels(&kind_selector());
+    let Ok(list) = api.list(&lp).await else {
+        return HashMap::new();
+    };
+    list.items
+        .into_iter()
+        .filter_map(|cm| {
+            let body = cm.data?.remove(crate::sync::REPORT_KEY)?;
+            let report: SyncReportMirror = serde_json::from_str(&body).ok()?;
+            Some((report.sync_id.clone(), report))
+        })
+        .collect()
 }
 
 async fn list(all_users: bool, json_out: bool) -> Result<(), String> {
     let client = client().await?;
-    let api: Api<Pod> = Api::all(client);
+    // Host-placed collectors outlive nothing but their driver, and no process is resident to
+    // notice it ended — so every command that already reads sync liveness sweeps them
+    crate::profiling::host::reap_finished(&client).await;
+    let api: Api<Pod> = Api::all(client.clone());
     let lp = ListParams::default().labels(&kind_selector());
-    let mut items = api.list(&lp).await.map_err(|e| format!("list sync pods: {e}"))?.items;
-    if !all_users {
-        let me = crate::naming::current_user();
-        items.retain(|p| row_of(p).3 == me);
-    }
+    let items = api.list(&lp).await.map_err(|e| format!("list sync pods: {e}"))?.items;
+    let mirrors = report_mirrors(&client).await;
+    let me = crate::naming::current_user();
+    let rows: Vec<(SyncRow, SyncStatus)> = items
+        .iter()
+        .map(row_of)
+        .filter(|r| all_users || r.user == me)
+        .map(|r| {
+            let status = SyncStatus::observe(r.pod_phase.as_deref(), mirrors.get(&r.id));
+            (r, status)
+        })
+        .collect();
 
     if json_out {
-        let rows: Vec<_> = items
+        let rows: Vec<_> = rows
             .iter()
-            .map(|p| {
-                let (id, ns, phase, user) = row_of(p);
-                json!({ "id": id, "namespace": ns, "phase": phase, "user": user })
+            .map(|(r, status)| {
+                json!({
+                    "id": r.id,
+                    "namespace": r.namespace,
+                    "status": status.to_string(),
+                    "user": r.user,
+                })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?);
         return Ok(());
     }
-    if items.is_empty() {
+    if rows.is_empty() {
         println!("no detached syncs{}", if all_users { "" } else { " (yours)" });
         return Ok(());
     }
-    println!("{:<28} {:<24} {:<12} {:<12}", "SYNC-ID", "NAMESPACE", "PHASE", "USER");
-    for p in &items {
-        let (id, ns, phase, user) = row_of(p);
-        println!("{id:<28} {ns:<24} {phase:<12} {user:<12}");
+    println!("{:<28} {:<24} {:<12} {:<12}", "SYNC-ID", "NAMESPACE", "STATUS", "USER");
+    for (r, status) in &rows {
+        println!("{:<28} {:<24} {:<12} {:<12}", r.id, r.namespace, status.to_string(), r.user);
     }
     Ok(())
 }
@@ -1053,7 +1163,7 @@ async fn status(id: &str, json_out: bool) -> Result<(), String> {
     // Durable report first (survives the pod), else the live tick stream
     let client = client().await?;
     let ns = namespace_for(id);
-    if let Some(report) = read_report(&client, &ns, id).await? {
+    if let Some(report) = read_report(&client, id).await? {
         if json_out {
             println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
             return Ok(());
@@ -1064,7 +1174,7 @@ async fn status(id: &str, json_out: bool) -> Result<(), String> {
     }
 
     let pod = find_driver(&client, id).await?;
-    let (_, _, phase, _) = row_of(&pod);
+    let status = SyncStatus::observe(row_of(&pod).pod_phase.as_deref(), None);
     // No report yet, but a running engine publishes state to the driver log → recover the
     // newest tick rather than reporting the pod phase alone
     let live = watch::latest_progress(&watch::DriverPod::new(&client, id)).await;
@@ -1085,11 +1195,12 @@ async fn status(id: &str, json_out: bool) -> Result<(), String> {
                 "probes_total": total,
             })
         });
-        println!("{}", json!({ "id": id, "phase": phase, "progress": progress, "report": null }));
+        let status = status.to_string();
+        println!("{}", json!({ "id": id, "status": status, "progress": progress, "report": null }));
         return Ok(());
     }
 
-    let view = build_report_view(&client, id, &ns, live_header(id, &phase, live.as_ref())).await;
+    let view = build_report_view(&client, id, &ns, live_header(id, status, live.as_ref())).await;
     print!("{}", crate::ui::render_sync_report(&view, &Theme::detect(), terminal_width()));
     Ok(())
 }
@@ -1114,11 +1225,7 @@ fn mirror_header(r: &SyncReportMirror) -> ReportView {
     ReportView {
         sync_id: r.sync_id.clone(),
         profile: r.profile.clone(),
-        verdict: r.verdict.clone(),
-        outcome: match r.passed() {
-            true => Outcome::Passed,
-            false => Outcome::Failed,
-        },
+        status: SyncStatus::Finished(r.verdict),
         segment: r.segment.as_ref().map(|s| s.describe()),
         elapsed: r
             .segment
@@ -1141,19 +1248,23 @@ fn mirror_header(r: &SyncReportMirror) -> ReportView {
     }
 }
 
-/// Header of a run still going.
+/// Header of a run with no mirror yet.
 ///
-/// - `Outcome::Running`: there is no verdict yet, and rendering one as a failure would
-///   invent it
+/// - `status` comes from the driver pod, never from the tick stream: a subject at tip is a
+///   chain fact, and only a mirrored report ends a run
 /// - Height/eta seed the header from the tick stream, which leads the TSDB by a scrape;
 ///   [`build_report_view`] overrides them only where Prometheus has an answer
 /// - Violating probes stand in for the mirror's violations — same question, asked of a
 ///   run that has not finished answering it
-fn live_header(id: &str, pod_phase: &str, live: Option<&crate::ui::SyncWatchState>) -> ReportView {
+fn live_header(
+    id: &str,
+    status: SyncStatus,
+    live: Option<&crate::ui::SyncWatchState>,
+) -> ReportView {
     let Some(state) = live else {
         return ReportView {
             sync_id: id.to_string(),
-            verdict: pod_phase.to_string(),
+            status,
             note: Some("no tick published yet".into()),
             ..ReportView::default()
         };
@@ -1162,8 +1273,8 @@ fn live_header(id: &str, pod_phase: &str, live: Option<&crate::ui::SyncWatchStat
     ReportView {
         sync_id: id.to_string(),
         profile: state.profile.clone(),
-        verdict: vitals.map_or_else(|| pod_phase.to_string(), |v| v.phase.clone()),
-        outcome: Outcome::Running,
+        status,
+        phase: vitals.and_then(|v| v.phase),
         height: vitals.and_then(|v| Some((v.height, v.target?))),
         eta: vitals.and_then(|v| v.pace).and_then(|p| p.eta),
         probes: Some(state.probe_tally()),
@@ -1188,12 +1299,8 @@ fn terminal_width() -> usize {
 /// tick/violation/gap counts, coloured like `ztest run`'s end-of-run banner
 fn report_headline(theme: &Theme, r: &SyncReportMirror) -> String {
     use owo_colors::OwoColorize as _;
-    let passed = r.passed();
-    let (mark, style) = if passed {
-        (theme.chars.ok, theme.styles.pass)
-    } else {
-        (theme.chars.warn, theme.styles.fail)
-    };
+    let status = SyncStatus::Finished(r.verdict);
+    let (mark, style) = crate::ui::status_mark(status, theme);
     let dot = theme.chars.dot.style(theme.styles.dim);
     let gaps = if r.coverage_gaps.is_empty() {
         String::new()
@@ -1205,7 +1312,7 @@ fn report_headline(theme: &Theme, r: &SyncReportMirror) -> String {
         mark.style(style),
         r.sync_id.style(theme.styles.count),
         format!("[{}]", r.profile).style(theme.styles.dim),
-        r.verdict.style(style),
+        status.to_string().style(style),
         r.ticks.style(theme.styles.count),
         r.violations.len().style(theme.styles.count),
     )
@@ -1442,27 +1549,11 @@ fn driver_finished_at(driver: &k8s_openapi::api::core::v1::Pod) -> Option<System
     Some(SystemTime::from(finished.0))
 }
 
-async fn read_report(
-    client: &Client,
-    ns: &str,
-    id: &str,
-) -> Result<Option<SyncReportMirror>, String> {
-    let api: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
-    let Some(cm) =
-        api.get_opt(&report_cm_name(id)).await.map_err(|e| format!("read report: {e}"))?
-    else {
-        return Ok(None);
-    };
-    let Some(body) = cm.data.and_then(|d| d.get("report.json").cloned()) else {
-        return Ok(None);
-    };
-    serde_json::from_str(&body).map(Some).map_err(|e| format!("parse report: {e}"))
-}
-
 // ─────────────────────────── stop / rm / watch ────────────────────────
 
 async fn stop(id: &str) -> Result<(), String> {
     let client = client().await?;
+    crate::profiling::host::reap_finished(&client).await;
     let _ = find_driver(&client, id).await?; // 404s clearly if unknown
     let api: Api<Pod> = Api::namespaced(client, RUN_NAMESPACE);
     let patch = json!({ "metadata": { "annotations": { STOP_ANNOTATION: "true" } } });
@@ -1495,15 +1586,15 @@ fn driver_profile(pod: &Pod) -> Option<String> {
         .clone()
 }
 
-/// Driver pod for a sync id, with a clear not-found error. Lives in [`RUN_NAMESPACE`]
-/// with every runner pod → a sync id resolves to its *name* ([`driver_pod_for`])
-pub(super) async fn find_driver(client: &Client, id: &str) -> Result<Pod, String> {
-    let pod = driver_pod_for(id);
-    Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
-        .get_opt(&pod)
-        .await
-        .map_err(|e| format!("get sync pod: {e}"))?
-        .ok_or_else(|| format!("no sync with id `{id}` ({RUN_NAMESPACE} has no pod `{pod}`)"))
+/// Whether a sync's driver pod is still running. Absent or terminal = run over, which is what
+/// a host-placed collector's lifetime is pinned to (nothing resident survives to stop it)
+pub(crate) async fn driver_is_live(client: &Client, id: &str) -> bool {
+    let Ok(Some(pod)) =
+        Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE).get_opt(&driver_pod_for(id)).await
+    else {
+        return false;
+    };
+    !matches!(pod.status.and_then(|s| s.phase).as_deref(), Some("Succeeded") | Some("Failed"))
 }
 
 // ─────────────────────────────── describe ─────────────────────────────
@@ -1542,4 +1633,14 @@ async fn describe(name: &str) -> Result<(), String> {
         crate::plan::for_sync(selected_binaries, entry, images_by_binary, deps_by_binary, seeds);
     print!("{}", crate::plan::render::render(&plan, &Theme::detect()));
     Ok(())
+}
+
+/// `--profile-off-cpu` is a probability; anything outside `0..=1` is rejected by Alloy at
+/// load, which surfaces three layers away as "the run produced no profile"
+fn off_cpu_fraction(raw: &str) -> Result<f64, String> {
+    let p: f64 = raw.parse().map_err(|_| format!("`{raw}` is not a number"))?;
+    match (0.0..=1.0).contains(&p) {
+        true => Ok(p),
+        false => Err(format!("must be between 0 and 1, got {p}")),
+    }
 }

@@ -1,11 +1,13 @@
 //! CPU profiles, via Pyroscope. Component contract in `docs/how-to-profile.md`.
 //!
-//! - Components push; ztest queries the merged result back as pprof
+//! - Components push; ztest queries the merged result back and folds it to collapsed stacks
 //! - No volume, no pod collection → a profile outlives the component, its namespace
 //!   and an OOM kill, and reads mid-run
 //! - [`ebpf`] collects the same profiles out-of-process (native + kernel frames, off-CPU)
 
 pub(crate) mod ebpf;
+pub(crate) mod host;
+pub(crate) mod perf;
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -61,13 +63,41 @@ pub(crate) fn tenant(user: &str, sync_id: &str) -> String {
 const PYROSCOPE_LABEL: &str = "app.kubernetes.io/name=pyroscope";
 
 /// Profile type the collector pushes CPU samples under
-const CPU_PROFILE: &str = "process_cpu:cpu:nanoseconds:cpu:nanoseconds";
+/// Which of the collector's two profiles to read. Never merged: off-CPU time from parked
+/// threads dominates on-CPU by volume, so one graph over both buries the CPU work — the
+/// hot/cold flame graph Brendan Gregg documents as "difficult to use" for exactly this
+/// reason. Go's pprof and async-profiler split them the same way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Profile {
+    OnCpu,
+    OffCpu,
+}
+
+impl Profile {
+    fn type_id(self) -> &'static str {
+        match self {
+            Profile::OnCpu => "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+            Profile::OffCpu => "offcpu:offcpu:nanoseconds::",
+        }
+    }
+
+    /// Filename stem, so a run's two profiles never overwrite each other
+    pub(crate) fn stem(self) -> &'static str {
+        match self {
+            Profile::OnCpu => "profile",
+            Profile::OffCpu => "offcpu",
+        }
+    }
+}
 
 const SELECT_MERGE_STACKTRACES: &str = "/querier.v1.QuerierService/SelectMergeStacktraces";
 
 /// `ProfileFormat::ProfileFormatPprof`. Mandatory in effect — unspecified yields
 /// a flamegraph, not a pprof
-const PROFILE_FORMAT_PPROF: i32 = 4;
+/// Pyroscope's pprof encoder drops every sample for OTel-engine profiles (locations and
+/// functions survive, the sample list comes back empty); the flamegraph encoder carries the
+/// same query's data whole, so ztest asks for that and folds it itself
+const PROFILE_FORMAT_FLAMEGRAPH: i32 = 1;
 
 /// Hand-declared, not generated (a protoc pipeline for three messages costs more
 /// than it saves). `SelectMergeProfile` is upstream-deprecated in favour of this.
@@ -87,16 +117,30 @@ struct SelectMergeStacktracesRequest {
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct SelectMergeStacktracesResponse {
-    #[prost(message, optional, tag = "5")]
-    pprof: Option<PprofProfile>,
+    #[prost(message, optional, tag = "1")]
+    flamegraph: Option<FlameGraph>,
 }
 
-/// Upstream `google.v1.Profile`, taken as `bytes` — its raw encoding *is* pprof,
-/// and both share a wire type, so the decode is faithful and the schema stays out
+/// Pyroscope's flamebearer: `names` interned, `levels` one flat row per depth.
+///
+/// - Each row is 4-tuples `[x_delta, total, self, name_idx]`, `x_delta` relative to the
+///   previous node's *end* on that row — so a node's parent is the row above spanning its x
+/// - Requested instead of pprof because the pprof encoder returns an empty sample list for
+///   OTel-engine profiles while this one carries the same data intact
 #[derive(Clone, PartialEq, prost::Message)]
-struct PprofProfile {
-    #[prost(bytes = "vec", tag = "1")]
-    profile: Vec<u8>,
+struct FlameGraph {
+    #[prost(string, repeated, tag = "1")]
+    names: Vec<String>,
+    #[prost(message, repeated, tag = "2")]
+    levels: Vec<FlameLevel>,
+    #[prost(int64, tag = "3")]
+    total: i64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct FlameLevel {
+    #[prost(int64, repeated, tag = "1")]
+    values: Vec<i64>,
 }
 
 /// `ztest cluster setup`'s Pyroscope Service, else an operator's. Known address first
@@ -111,6 +155,63 @@ async fn pyroscope_service(client: &Client) -> Option<Service> {
 }
 
 /// In-cluster (`.svc`) address — the pushers are pods
+/// Push URL a *host* collector can reach: node IP + NodePort.
+///
+/// - ClusterIP is unroutable off-cluster, and a port-forward would need supervising
+/// - Promotes the Service to NodePort if it is not already (idempotent; the ClusterIP keeps
+///   working, so in-cluster pushers are unaffected)
+pub(crate) async fn node_push_url(client: &Client) -> Option<String> {
+    let svc = pyroscope_service(client).await?;
+    let (name, namespace) = (svc.metadata.name.clone()?, svc.metadata.namespace.clone()?);
+    let api: Api<Service> = Api::namespaced(client.clone(), &namespace);
+    let node_port = match node_port_of(&svc) {
+        Some(port) => port,
+        None => {
+            let patch = serde_json::json!({ "spec": { "type": "NodePort" } });
+            let promoted = api
+                .patch(
+                    &name,
+                    &kube::api::PatchParams::apply("ztest-profiling"),
+                    &kube::api::Patch::Merge(&patch),
+                )
+                .await
+                .ok()?;
+            node_port_of(&promoted)?
+        }
+    };
+    Some(format!("http://{}:{node_port}", node_internal_ip(client).await?))
+}
+
+fn node_port_of(svc: &Service) -> Option<i32> {
+    svc.spec.as_ref()?.ports.as_ref()?.first()?.node_port
+}
+
+/// Node address reachable from the workstation. `InternalIP` is what kind publishes its node
+/// container on, so it routes for anything on the cluster's docker network
+pub(crate) async fn node_internal_ip(client: &Client) -> Option<String> {
+    use k8s_openapi::api::core::v1::Node;
+    let nodes: Api<Node> = Api::all(client.clone());
+    let node = nodes.list(&ListParams::default().limit(1)).await.ok()?.items.into_iter().next()?;
+    node.status?.addresses?.into_iter().find(|a| a.type_ == "InternalIP").map(|a| a.address)
+}
+
+/// Apiserver address a container on the cluster's docker network reaches, read from the
+/// `kubernetes` Endpoints.
+///
+/// - Authoritative, not derived: the endpoint *is* what the apiserver advertises, so neither
+///   the port nor the node address is guessed
+/// - kind's cert carries this IP in its SANs, so the kubeconfig CA still validates it — the
+///   loopback address in the kubeconfig does not survive leaving the host network
+pub(crate) async fn node_api_server(client: &Client) -> Option<String> {
+    use k8s_openapi::api::core::v1::Endpoints;
+    let api: Api<Endpoints> = Api::namespaced(client.clone(), "default");
+    let subsets = api.get("kubernetes").await.ok()?.subsets?;
+    let subset = subsets.into_iter().next()?;
+    let ip = subset.addresses?.into_iter().next()?.ip;
+    let port = subset.ports?.into_iter().next()?.port;
+    Some(format!("https://{ip}:{port}"))
+}
+
 pub(crate) async fn push_url(client: &Client) -> Option<String> {
     let svc = pyroscope_service(client).await?;
     let port = service_port(&svc);
@@ -133,12 +234,61 @@ fn service_port(svc: &Service) -> u16 {
 ///
 /// `tenant` required, not optional — `multitenancy_enabled` makes a header-less request
 /// a 401, never a query of some default tenant
+/// Flamebearer → collapsed (`frame;frame;frame <self>`), the format flameshow reads and the
+/// one `--base` can diff line-by-line.
+///
+/// - Rebuilt by x-range: a node's parent is the node one row up whose span contains its start,
+///   which is the only parent link the encoding carries
+/// - Self-value rows only: a node's `total` is its subtree, already accounted by descendants
+/// - `total` root frame kept — it is Pyroscope's own root, and dropping it would reparent every
+///   top-level frame to nothing
+fn collapse(fg: &FlameGraph) -> String {
+    let mut out = String::new();
+    // (start, end, stack) for the row above, in x order
+    let mut parents: Vec<(i64, i64, Vec<usize>)> = Vec::new();
+    for level in &fg.levels {
+        let mut row: Vec<(i64, i64, Vec<usize>)> = Vec::new();
+        let mut x = 0i64;
+        for node in level.values.chunks_exact(4) {
+            let (delta, total, self_value, name) = (node[0], node[1], node[2], node[3] as usize);
+            x += delta;
+            let mut stack = parents
+                .iter()
+                .find(|(start, end, _)| *start <= x && x < *end)
+                .map(|(_, _, s)| s.clone())
+                .unwrap_or_default();
+            stack.push(name);
+            if self_value > 0 {
+                let frames: Vec<&str> = stack
+                    .iter()
+                    .map(|i| fg.names.get(*i).map_or("[unknown]", String::as_str))
+                    .collect();
+                out.push_str(&frames.join(";"));
+                out.push(' ');
+                out.push_str(&self_value.to_string());
+                out.push('\n');
+            }
+            row.push((x, x + total, stack));
+            x += total;
+        }
+        parents = row;
+    }
+    out
+}
+
+/// Nanoseconds a collapsed profile accounts for — the numerator of `fidelity`
+pub(crate) fn collapsed_nanos(profile: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(profile).ok()?;
+    Some(text.lines().filter_map(|l| l.rsplit_once(' ')?.1.parse::<u64>().ok()).sum())
+}
+
 pub(crate) async fn fetch(
     client: &Client,
     selector: &str,
     from: SystemTime,
     to: SystemTime,
     tenant: &str,
+    profile: Profile,
 ) -> Result<Vec<u8>, String> {
     let (namespace, pod, port) = pyroscope_backend(client).await?;
     let fwd = Forwarder::start(client.clone(), namespace, pod, port)
@@ -146,11 +296,11 @@ pub(crate) async fn fetch(
         .map_err(|e| format!("port-forward to Pyroscope: {e}"))?;
 
     let body = SelectMergeStacktracesRequest {
-        profile_type_id: CPU_PROFILE.to_string(),
+        profile_type_id: profile.type_id().to_string(),
         label_selector: selector.to_string(),
         start: epoch_millis(from),
         end: epoch_millis(to),
-        format: PROFILE_FORMAT_PPROF,
+        format: PROFILE_FORMAT_FLAMEGRAPH,
     }
     .encode_to_vec();
 
@@ -174,17 +324,17 @@ pub(crate) async fn fetch(
         ));
     }
 
-    let profile = SelectMergeStacktracesResponse::decode(&bytes[..])
+    let flamegraph = SelectMergeStacktracesResponse::decode(&bytes[..])
         .map_err(|e| format!("decoding Pyroscope response: {e}"))?
-        .pprof
-        .map(|p| p.profile)
+        .flamegraph
         .unwrap_or_default();
+    let profile = collapse(&flamegraph);
     // Empty = a successful query that matched nothing, a different problem from
     // a failed one.
     if profile.is_empty() {
         return Err(format!("no profile matched {selector} in this window"));
     }
-    Ok(profile)
+    Ok(profile.into_bytes())
 }
 
 /// A pod backing the Pyroscope Service + its port.
@@ -218,12 +368,18 @@ async fn pyroscope_backend(client: &Client) -> Result<(String, String, u16), Str
         .list(&ListParams::default().labels(&selector))
         .await
         .map_err(|e| format!("listing Pyroscope pods: {e}"))?;
-    list.items
-        .into_iter()
-        .find(pod_is_ready)
-        .and_then(|p| p.metadata.name)
-        .map(|name| (namespace, name, port))
-        .ok_or_else(|| "no ready Pyroscope pod".to_string())
+    // Deployed-but-unready separated from absent: they need opposite actions, and the
+    // pod's own log is the only place the reason (metastore leader loss) shows
+    let names: Vec<String> = list.items.iter().filter_map(|p| p.metadata.name.clone()).collect();
+    if let Some(name) = list.items.into_iter().find(pod_is_ready).and_then(|p| p.metadata.name) {
+        return Ok((namespace, name, port));
+    }
+    match names.first() {
+        Some(name) => Err(format!(
+            "Pyroscope is deployed but not ready — `kubectl -n {namespace} logs {name}`"
+        )),
+        None => Err("Pyroscope Service selects no pods; `ztest cluster setup` deploys it".into()),
+    }
 }
 
 /// `Ready`, not `Running` — a started-but-unprobed pod refuses queries, turning a
@@ -332,58 +488,6 @@ pub(crate) fn selector(component: &str, namespace: &str) -> String {
     format!(r#"{{component="{component}",namespace="{namespace}"}}"#)
 }
 
-/// CPU the profile *claims*, summed over every sample.
-///
-/// - Half of [`fidelity`](crate::cli::sync::perf); the kernel's own figure is the other
-/// - `sample.value[0]` = ns under the sole `cpu/nanoseconds` type ztest ever requests
-///   ([`CPU_PROFILE`]) — a second type would need an index, not a `[0]`
-/// - Merged profiles carry no `duration_nanos`, so utilisation is not derivable here;
-///   the caller supplies the window it asked Pyroscope for
-/// - `None` = unparseable, never 0 (a zero total reads as an idle process)
-pub(crate) fn cpu_nanos(profile: &[u8]) -> Option<u64> {
-    use prost::bytes::Buf as _;
-    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
-
-    const SAMPLE: u32 = 2;
-    const VALUE: u32 = 2;
-
-    fn first_value(sample: &[u8]) -> Option<u64> {
-        let mut rest = sample;
-        while rest.has_remaining() {
-            let (tag, wire) = decode_key(&mut rest).ok()?;
-            if tag == VALUE {
-                // Packed by every encoder in practice, but a conformant writer may emit
-                // one varint per field, and the first value is all this needs either way
-                return match wire {
-                    WireType::LengthDelimited => {
-                        let len = decode_varint(&mut rest).ok()? as usize;
-                        decode_varint(&mut rest.get(..len)?).ok()
-                    }
-                    WireType::Varint => decode_varint(&mut rest).ok(),
-                    _ => None,
-                };
-            }
-            skip_field(wire, tag, &mut rest, DecodeContext::default()).ok()?;
-        }
-        None
-    }
-
-    let mut total: u64 = 0;
-    let mut rest = profile;
-    while rest.has_remaining() {
-        let (tag, wire) = decode_key(&mut rest).ok()?;
-        if tag == SAMPLE && wire == WireType::LengthDelimited {
-            let len = decode_varint(&mut rest).ok()? as usize;
-            let sample = rest.get(..len)?;
-            total = total.saturating_add(first_value(sample).unwrap_or(0));
-            rest.advance(len);
-            continue;
-        }
-        skip_field(wire, tag, &mut rest, DecodeContext::default()).ok()?;
-    }
-    Some(total)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,65 +520,82 @@ mod tests {
     #[test]
     fn the_request_encodes_every_field() {
         let encoded = SelectMergeStacktracesRequest {
-            profile_type_id: CPU_PROFILE.to_string(),
+            profile_type_id: Profile::OnCpu.type_id().to_string(),
             label_selector: r#"{service_name="zainod"}"#.to_string(),
             start: 1_700_000_000_000,
             end: 1_700_000_060_000,
-            format: PROFILE_FORMAT_PPROF,
+            format: PROFILE_FORMAT_FLAMEGRAPH,
         }
         .encode_to_vec();
         let decoded = SelectMergeStacktracesRequest::decode(&encoded[..]).expect("round trip");
-        assert_eq!(decoded.profile_type_id, CPU_PROFILE);
+        assert_eq!(decoded.profile_type_id, Profile::OnCpu.type_id());
         assert_eq!(decoded.end - decoded.start, 60_000);
     }
 
-    /// Format must reach the wire (default-valued enums are elided, and unspecified
-    /// yields a flamegraph not a pprof)
+    /// Format must reach the wire (default-valued enums are elided, and `UNSPECIFIED`
+    /// yields a flamegraph only by accident of it sharing the value)
     #[test]
-    fn the_request_asks_for_pprof_explicitly() {
-        let encoded =
-            SelectMergeStacktracesRequest { format: PROFILE_FORMAT_PPROF, ..Default::default() }
-                .encode_to_vec();
+    fn the_request_asks_for_a_flamegraph_explicitly() {
+        let encoded = SelectMergeStacktracesRequest {
+            format: PROFILE_FORMAT_FLAMEGRAPH,
+            ..Default::default()
+        }
+        .encode_to_vec();
         assert!(!encoded.is_empty(), "a non-default format is encoded");
-        assert_eq!(
-            SelectMergeStacktracesResponse::decode(&[] as &[u8]).expect("empty decodes").pprof,
-            None
-        );
     }
 
-    /// Hand-built two-sample profile: `sample.value[0]` is what a CPU total sums, and
-    /// the second value of a multi-value sample must not join it
-    #[test]
-    fn the_cpu_total_sums_the_first_value_of_every_sample() {
-        // sample{value=[7]}, sample{value=[5,99]} — packed, as every encoder writes them
-        let profile = [0x12, 0x03, 0x12, 0x01, 0x07, 0x12, 0x05, 0x12, 0x03, 0x05, 0x63, 0x00];
-        assert_eq!(cpu_nanos(&profile), Some(12));
+    fn level(nodes: &[[i64; 4]]) -> FlameLevel {
+        FlameLevel { values: nodes.iter().flatten().copied().collect() }
     }
 
-    /// A field this build does not know must be stepped over, not abandoned
+    /// Two leaves under one root: the parent link is the x-range of the row above, which is
+    /// the only one the encoding carries
     #[test]
-    fn an_unknown_field_does_not_stop_the_sum() {
-        // string_table{""} ahead of sample{value=[7]}
-        let profile = [0x32, 0x00, 0x12, 0x03, 0x12, 0x01, 0x07];
-        assert_eq!(cpu_nanos(&profile), Some(7));
-    }
-
-    /// Unparseable yields `None`, never `Some(0)` — a zero total reads as an idle process
-    #[test]
-    fn a_truncated_profile_reports_no_total() {
-        assert_eq!(cpu_nanos(&[0x12, 0xff, 0xff]), None);
-    }
-
-    /// Embedded `google.v1.Profile` decodes to opaque bytes = the pprof payload
-    /// (round-trips a nested length-delimited message through both declarations)
-    #[test]
-    fn the_pprof_payload_survives_as_raw_bytes() {
-        let pprof_bytes = vec![0x0au8, 0x03, b'a', b'b', b'c'];
-        let response = SelectMergeStacktracesResponse {
-            pprof: Some(PprofProfile { profile: pprof_bytes.clone() }),
+    fn collapsing_rebuilds_each_stack_from_its_x_range() {
+        let fg = FlameGraph {
+            names: vec!["total".into(), "main".into(), "a".into(), "b".into()],
+            levels: vec![
+                level(&[[0, 10, 0, 0]]),
+                level(&[[0, 10, 0, 1]]),
+                level(&[[0, 6, 6, 2], [0, 4, 4, 3]]),
+            ],
+            total: 10,
         };
-        let decoded = SelectMergeStacktracesResponse::decode(&response.encode_to_vec()[..])
-            .expect("round trip");
-        assert_eq!(decoded.pprof.expect("pprof present").profile, pprof_bytes);
+        let collapsed = collapse(&fg);
+        assert!(collapsed.contains("total;main;a 6"), "{collapsed}");
+        assert!(collapsed.contains("total;main;b 4"), "{collapsed}");
+        // Ancestors carry no self time: counting them would double the total
+        assert!(!collapsed.contains("total;main 0"), "{collapsed}");
+        assert_eq!(collapsed_nanos(collapsed.as_bytes()), Some(10));
+    }
+
+    /// A frame with both children *and* self time appears once, with only its own share
+    #[test]
+    fn a_frame_with_self_and_children_counts_once() {
+        let fg = FlameGraph {
+            names: vec!["total".into(), "work".into(), "leaf".into()],
+            levels: vec![level(&[[0, 10, 0, 0]]), level(&[[0, 10, 3, 1]]), level(&[[0, 7, 7, 2]])],
+            total: 10,
+        };
+        let collapsed = collapse(&fg);
+        assert!(collapsed.contains("total;work 3"), "{collapsed}");
+        assert!(collapsed.contains("total;work;leaf 7"), "{collapsed}");
+        assert_eq!(collapsed_nanos(collapsed.as_bytes()), Some(10));
+    }
+
+    /// Two profile types, two files: a run's CPU and blocked-time profiles must not
+    /// overwrite each other in the same output directory
+    #[test]
+    fn the_two_profiles_are_distinct_types_and_filenames() {
+        assert_ne!(Profile::OnCpu.type_id(), Profile::OffCpu.type_id());
+        assert_ne!(Profile::OnCpu.stem(), Profile::OffCpu.stem());
+        assert!(Profile::OffCpu.type_id().starts_with("offcpu:"));
+    }
+
+    /// Empty flamegraph = a query that matched nothing, and must not read as a zero-cpu run
+    #[test]
+    fn an_empty_flamegraph_collapses_to_nothing() {
+        assert!(collapse(&FlameGraph::default()).is_empty());
+        assert_eq!(collapsed_nanos(b""), Some(0));
     }
 }

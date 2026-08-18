@@ -4,14 +4,17 @@ ztest profiles components **from outside the process**, with an eBPF collector. 
 no contract for component authors to implement: no dependency, no cargo feature, no code
 in `main`. A component is profileable because it is a process.
 
-## The switch
+## The switches
 
-| Switch | Kind | Controls |
-| --- | --- | --- |
-| `ZTEST_PROFILE` | run-time | whether a run deploys a collector at all |
+| Flag                | Default | Controls                                    |
+| ------------------- | ------- | ------------------------------------------- |
+| `--profile`         | on      | whether the run collects profiles at all    |
+| `--profile-hz`      | 19      | on-CPU sample rate (upstream's default)     |
+| `--profile-off-cpu` | 0.05    | fraction of scheduler-switch events sampled |
 
-Set it and ztest creates one collector per run; leave it unset and nothing is collected.
-Off by default — a collector is a privileged pod charged against the run's capacity.
+Off-CPU sampling is thinned hard on purpose: one trace event per *scheduler switch* into a
+fixed-size per-CPU ring. At `1.0` a busy sync overruns it and every trace is dropped. Raise
+it only while `ztest sync perf` still reports 0 dropped events.
 
 ## What you get
 
@@ -25,20 +28,16 @@ Off by default — a collector is a privileged pod charged against the run's cap
   samples whichever thread happens to receive `SIGPROF`, which is not proportional to
   CPU consumption.
 
-## Getting good symbols
+## Symbols: nothing to rebuild
 
-The collector unwinds via frame pointers, falling back to `.eh_frame`. A component built
-with neither yields truncated stacks — silently, since a partial stack is still a stack.
-For a Rust component:
+The collector unwinds with **`.eh_frame`**, the CFI table every optimized binary already
+carries for exception handling. Frame pointers are *not* required — `-C force-frame-pointers` buys nothing and its absence costs nothing. Stacks reach ~50 frames
+through Rust, tokio, glibc and RocksDB on stock release builds.
 
-```toml
-# .cargo/config.toml
-[build]
-rustflags = ["-C", "force-frame-pointers=yes"]
-```
+Worth adding for line numbers and inlined frames, which unwinding alone cannot recover:
 
 ```toml
-# Cargo.toml — line numbers and inlined frames
+# Cargo.toml
 [profile.release]
 debug = "line-tables-only"
 ```
@@ -46,32 +45,45 @@ debug = "line-tables-only"
 Cargo strips debuginfo from release builds when `debug` is unset (since 1.77), and every
 inlined function folds into its caller.
 
-> A `RUSTFLAGS` environment variable **replaces** `[build] rustflags` rather than
-> appending to it. A build environment that sets `RUSTFLAGS` must carry the
-> frame-pointer flag itself or it ships an unprofileable binary.
+## Where the collector runs
 
-## How it works
+One collector per run, pushing to one Pyroscope tenant — `pyroscope.write` sends static
+headers only ([grafana/alloy#259](https://github.com/grafana/alloy/issues/259)), and ztest
+retires a sync's profiles *by tenant*, so a shared node-wide collector would forfeit
+deletion outright.
 
-One Alloy DaemonSet per run, in the run's namespace:
+Placement is a property of the cluster, not a preference:
 
-- **Per run, not per node.** `pyroscope.write` sends static headers only
-  ([grafana/alloy#259](https://github.com/grafana/alloy/issues/259)), so one collector
-  pushes to exactly one Pyroscope tenant. ztest retires a sync's profiles *by tenant*, so
-  a shared node-wide collector would forfeit deletion outright.
-- **DaemonSet, not Pod.** `pyroscope.ebpf` only sees processes on its own node, and a
-  run's pods are not co-scheduled.
-- **Namespaced Role**, never a ClusterRole — discovery is scoped to the run's namespace
-  and the RBAC is garbage-collected with it.
-- Profiles carry `component` / `namespace` / `run_id` / `sync_id`, so `ztest sync perf`
-  queries them through the same selector as before.
+| Cluster               | Placement                           | Why                                                                 |
+| --------------------- | ----------------------------------- | ------------------------------------------------------------------- |
+| Real node             | sidecar on the driver pod           | `hostPID` reaches the initial pid namespace                         |
+| Nested kubelet (kind) | docker container beside the kubelet | a pod under kind's node container cannot name the pids eBPF reports |
 
-The pod runs `privileged` with `hostPID` and an `Unconfined` AppArmor profile: BPF
-program load is blocked by the default profile, and sampled PIDs resolve only against the
-host namespace.
+eBPF reports pids in the *initial* namespace. kind runs its node as a container, so
+`hostPID` there reaches the node's namespace — one level below — and every `/proc/<pid>`
+lookup misses: targets match, processes are counted, and nothing unwinds, with no error
+([kind#3182](https://github.com/kubernetes-sigs/kind/issues/3182) is closed as not
+planned). The host-placed collector joins the cluster's docker network instead, reaching
+the apiserver and Pyroscope by node IP; container attribution still works because nested
+containerd IDs appear verbatim in the host cgroup path.
+
+The sidecar runs `privileged` with `hostPID` and an `Unconfined` AppArmor profile: BPF
+program load is blocked by the default profile. It is charged against the run's capacity;
+a host-placed collector is not, being outside the cluster.
+
+`ztest cluster check` reports which placement applies and whether its prerequisites hold.
 
 ## Reading a profile
 
-`ztest sync perf` fetches a sync's merged pprof. Grafana has the Pyroscope datasource
-wired at first boot; its comparison view diffs two label selectors, which is how a change
-gets measured — baseline, one change, diff. Reading a single flame graph in isolation is
-how people convince themselves of things that are not true.
+`ztest sync perf <sync> --component <name>` writes **collapsed stacks**
+(`frame;frame <self>`) and opens them in `flameshow`.
+
+Collapsed rather than pprof because Pyroscope's pprof encoder returns an empty sample list
+for these profiles — locations and functions survive, every sample is dropped — while the
+flamegraph encoder carries the same query's data whole. ztest folds that to collapsed,
+which `flameshow` reads directly and `--base` can diff line-by-line.
+
+Grafana has the Pyroscope datasource wired at first boot; its comparison view diffs two
+label selectors, which is how a change gets measured — baseline, one change, diff. Reading
+a single flame graph in isolation is how people convince themselves of things that are not
+true.

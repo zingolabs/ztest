@@ -6,8 +6,10 @@
 //!   the last, since a stacked namespace total hides which one grew
 //! - Every series comes from the TSDB ([`query`](crate::metrics::query)), which scrapes a
 //!   live sync exactly as it scraped a finished one — hence the single view
-//! - [`Outcome::Running`] is the whole reason a verdict is not a `bool`: a run still
-//!   going has none, and must not be drawn as a failure
+//! - [`SyncStatus`] is the whole reason a verdict is not a `bool`: a run still going has
+//!   none, and must not be drawn as a failure
+//! - Chain progress (`phase`) sits beside the status, never in it — a subject at tip in a
+//!   run still probing is `Running · Done`
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -15,11 +17,13 @@ use std::time::Duration;
 use owo_colors::OwoColorize as _;
 
 use super::Theme;
-use super::boxes::{beside, boxed, dim, display_width, interior, row, truncate};
+use super::boxes::{beside, boxed, dim, interior, row};
+use super::layout::{display_width, truncate};
 use super::plot::{self, Band, Palette, PlotOpts};
 use super::text::{compact, format_elapsed, thousands, unit_value, y_axis};
 use crate::metrics::Unit;
 use crate::metrics::query::Series;
+use crate::sync::{Phase, SyncStatus};
 
 /// Full terminal, capped. Past this the plots stop gaining resolution the eye can use
 /// and the panels drift apart on a wide monitor
@@ -45,16 +49,6 @@ pub struct ComponentResources {
     pub io_stall: Vec<Series>,
 }
 
-/// Where the run stands. A live sync has no verdict yet and must not render as one —
-/// `passed: bool` could only call it a failure
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Outcome {
-    #[default]
-    Running,
-    Passed,
-    Failed,
-}
-
 /// Everything the run view draws, live or finished. Header comes from the report mirror
 /// once there is one and from the driver's tick stream before that; every panel below it
 /// comes from the TSDB either way, so the two are the same view at different times
@@ -62,8 +56,8 @@ pub enum Outcome {
 pub struct ReportView {
     pub sync_id: String,
     pub profile: String,
-    pub verdict: String,
-    pub outcome: Outcome,
+    pub status: SyncStatus,
+    pub phase: Option<Phase>,
     pub elapsed: Duration,
     pub segment: Option<String>,
     pub height: Option<(u32, u32)>,
@@ -98,7 +92,7 @@ pub fn render_sync_report(view: &ReportView, theme: &Theme, width: usize) -> Str
     let mut panels = vec![
         (
             pool_box("transparent ops/sec", &view.transparent, view, theme, left_w),
-            pool_box("shielded ops/sec", &view.shielded, view, theme, right_w),
+            pool_box("shielded ops/sec", &fold_sapling(&view.shielded), view, theme, right_w),
         ),
         (
             rate_box("blocks/sec", &view.blocks, view, theme, left_w),
@@ -132,12 +126,19 @@ pub fn render_sync_report(view: &ReportView, theme: &Theme, width: usize) -> Str
 
 // ──────────────────────────────── header ────────────────────────────────
 
+/// Sole status → glyph + ink mapping (report header + `watch` headline both draw here).
+/// - Live / unresolved never red (no verdict = nothing to have failed)
+pub fn status_mark(status: SyncStatus, theme: &Theme) -> (&'static str, owo_colors::Style) {
+    match status {
+        SyncStatus::Finished(v) if v.is_pass() => (theme.chars.ok, theme.styles.pass),
+        SyncStatus::Finished(_) => (theme.chars.fail, theme.styles.fail),
+        SyncStatus::Pending | SyncStatus::Running => (theme.chars.dot, theme.styles.count),
+        SyncStatus::Unresolved => (theme.chars.warn, theme.styles.fail),
+    }
+}
+
 fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
-    let (mark, style) = match v.outcome {
-        Outcome::Passed => (theme.chars.ok, theme.styles.pass),
-        Outcome::Failed => (theme.chars.fail, theme.styles.fail),
-        Outcome::Running => (theme.chars.dot, theme.styles.count),
-    };
+    let (mark, style) = status_mark(v.status, theme);
     let dot = theme.chars.dot.style(theme.styles.dim);
 
     let _ = writeln!(
@@ -155,18 +156,24 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
     );
     // A run still going has no segment *yet*, which is not a finding — only a finished
     // one that recorded none has something to answer for
-    let segment = match (v.segment.as_deref(), v.outcome) {
+    let segment = match (v.segment.as_deref(), v.status.is_live()) {
         (Some(s), _) => format!(" {dot} {}", s.style(theme.styles.dim)),
-        (None, Outcome::Running) => String::new(),
-        (None, _) => format!(" {dot} {}", "no segment recorded".style(theme.styles.dim)),
+        (None, true) => String::new(),
+        (None, false) => format!(" {dot} {}", "no segment recorded".style(theme.styles.dim)),
+    };
+    // Phase = chain-walk position, live only (a finished run's last phase adds nothing to
+    // its verdict)
+    let phase = match v.phase.filter(|_| v.status.is_live()) {
+        Some(p) => format!(" {dot} {}", p.style(theme.styles.dim)),
+        None => String::new(),
     };
     let _ = writeln!(
         out,
         "{}",
         truncate(
             &format!(
-                "  {} {dot} {}{segment}",
-                v.verdict.style(style),
+                "  {} {dot} {}{phase}{segment}",
+                v.status.to_string().style(style),
                 format_elapsed(v.elapsed).style(theme.styles.count),
             ),
             width,
@@ -186,8 +193,8 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
         let filled = (pct / 100.0 * bar_w as f64).round() as usize;
         // Nothing is short until the run stops trying — a live sync gets its countdown
         // in the slot a finished one spends on the shortfall
-        let standing = match (v.outcome, target.saturating_sub(reached)) {
-            (Outcome::Running, _) => match v.eta {
+        let standing = match (v.status.is_live(), target.saturating_sub(reached)) {
+            (true, _) => match v.eta {
                 None => String::new(),
                 Some(eta) => {
                     format!("eta {}", format_elapsed(eta)).style(theme.styles.count).to_string()
@@ -281,6 +288,21 @@ fn pool_chips(pools: &[Series], theme: &Theme, budget: usize) -> String {
         })
         .collect();
     truncate(&chips.join(&format!(" {} ", "*".style(palette.separator()))), budget)
+}
+
+/// Sapling ships split (only the output side is checkable against the note-commitment trees,
+/// see [`chainwork`](crate::sync::chainwork)); the panel reads pools, so display folds them
+const SAPLING_PARTS: [&str; 2] = ["sapling spends", "sapling outputs"];
+
+/// Sapling spends + outputs → one `sapling` band, in the split's place
+fn fold_sapling(pools: &[Series]) -> Vec<Series> {
+    let is_part = |s: &Series| SAPLING_PARTS.contains(&s.label.as_str());
+    let (parts, mut rest): (Vec<Series>, Vec<Series>) = pools.iter().cloned().partition(&is_part);
+    let Some(sapling) = Series::folded("sapling", &parts) else {
+        return rest;
+    };
+    rest.insert(pools.iter().take_while(|s| !is_part(s)).count(), sapling);
+    rest
 }
 
 /// Three-letter pool tag. First three characters, overridden where they collide or name
@@ -543,8 +565,8 @@ mod tests {
         ReportView {
             sync_id: "zaino-index-construction-c3115f50".into(),
             profile: "zaino_index_construction".into(),
-            verdict: "Failed".into(),
-            outcome: Outcome::Failed,
+            status: SyncStatus::Finished(crate::sync::SyncVerdict::Failed),
+            phase: None,
             eta: None,
             probes: None,
             elapsed: Duration::from_secs(1_842),
@@ -783,6 +805,46 @@ mod tests {
         assert!(rendered.contains("tsp "), "transparent chip missing:\n{rendered}");
     }
 
+    /// One band per pool: the spend/output split serves `chainwork`, not the reader
+    #[test]
+    fn the_sapling_split_renders_as_one_pool() {
+        let mut v = view();
+        v.shielded = vec![
+            series("sapling spends", Unit::PerSec, &wave(20_000.0, 60)),
+            series("sapling outputs", Unit::PerSec, &wave(10_000.0, 60)),
+            series("orchard", Unit::PerSec, &wave(14_000.0, 60)),
+        ];
+        let rendered = render_sync_report(&v, &theme(), 120);
+        assert!(!rendered.contains("sap-sp"), "{rendered}");
+        assert!(!rendered.contains("sap-out"), "{rendered}");
+        assert!(rendered.contains("sap "), "folded chip missing:\n{rendered}");
+
+        let folded = fold_sapling(&v.shielded);
+        assert_eq!(
+            folded.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(),
+            ["sapling", "orchard"]
+        );
+        let split_total: f64 = v.shielded[..2].iter().filter_map(Series::integral).sum();
+        assert!((folded[0].integral().expect("rate") - split_total).abs() < 1.0);
+    }
+
+    /// Position is the split's, not the front — a pool ordered before sapling keeps its place
+    #[test]
+    fn a_folded_sapling_holds_the_splits_place() {
+        let pools = vec![
+            series("sprout", Unit::PerSec, &[1.0, 1.0]),
+            series("sapling spends", Unit::PerSec, &[2.0, 2.0]),
+            series("sapling outputs", Unit::PerSec, &[3.0, 3.0]),
+            series("orchard", Unit::PerSec, &[4.0, 4.0]),
+        ];
+        let folded = fold_sapling(&pools);
+        assert_eq!(
+            folded.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(),
+            ["sprout", "sapling", "orchard"]
+        );
+        assert_eq!(folded[1].points, vec![(0.0, 5.0), (30.0, 5.0)]);
+    }
+
     #[test]
     fn a_pool_tag_is_three_characters() {
         for (label, tag) in [
@@ -872,7 +934,7 @@ mod tests {
     }
 
     /// A run still going has not failed — the mark a `bool` forced is the reason
-    /// [`Outcome`] exists
+    /// [`SyncStatus`] is not one
     #[test]
     fn a_running_sync_is_never_marked_failed() {
         let theme = theme();
@@ -914,14 +976,28 @@ mod tests {
         assert!(!rendered.contains("no segment recorded"), "{rendered}");
 
         let mut finished = running();
-        finished.outcome = Outcome::Failed;
+        finished.status = SyncStatus::Finished(crate::sync::SyncVerdict::Failed);
         assert!(render_sync_report(&finished, &theme(), 160).contains("no segment recorded"));
+    }
+
+    /// Subject at tip = chain fact, not a verdict (the confusion the split
+    /// `outcome`/`verdict` pair invited)
+    #[test]
+    fn a_subject_at_tip_still_reads_as_running() {
+        let mut v = running();
+        v.phase = Some(Phase::Done);
+        v.height = Some((1_700_000, 1_700_000));
+        let rendered = render_sync_report(&v, &theme(), 160);
+        let header = rendered.lines().nth(1).expect("the status line");
+        assert!(header.contains("Running"), "the run has no verdict yet: {header:?}");
+        assert!(header.contains("Done"), "the chain walk is at tip: {header:?}");
+        assert!(!rendered.contains("Passed"), "no verdict was mirrored:\n{rendered}");
     }
 
     pub(super) fn running() -> ReportView {
         ReportView {
-            verdict: "Historic".into(),
-            outcome: Outcome::Running,
+            status: SyncStatus::Running,
+            phase: Some(Phase::Historic),
             segment: None,
             height: Some((1_204_551, 1_700_000)),
             eta: Some(Duration::from_secs(4_320)),

@@ -76,17 +76,22 @@ the report, and omits its whole section on any failure.
 
 ## Profiling
 
-Components push CPU profiles to Pyroscope; ztest queries the merged result back
-as pprof. The component contract is [how-to-profile.md](how-to-profile.md).
+An eBPF collector pushes CPU and off-CPU profiles to Pyroscope; ztest queries the
+merged result back and folds it to collapsed stacks. There is no component
+contract — see [how-to-profile.md](how-to-profile.md).
 
-- **Build gate**: a cargo `profile` feature, flipped by a Docker build `ARG`.
-  Linking is a build decision — a runtime env cannot pull in a crate.
-- **Run-time gate**: `ZTEST_PROFILE_URL`. Its presence is the switch.
-  `ZTEST_PROFILE_TAGS` carries the labels ztest scopes queries by,
-  `ZTEST_PROFILE_HZ` the sample rate (default 100).
-- **ztest owns**: discovering the Pyroscope Service, injecting those variables at
-  materialize, and querying `SelectMergeStacktraces` with `PROFILE_FORMAT_PPROF`
-  for `ztest sync perf`. (The older `SelectMergeProfile` is deprecated upstream.)
+- **No build gate**: profiling is out-of-process, so nothing is linked into the
+  component and no image is built twice.
+- **Run-time gate**: `--profile` (on by default), `--profile-hz` (19),
+  `--profile-off-cpu` (0.05).
+- **Placement**: sidecar on the driver pod, or a docker container beside the
+  kubelet when the kubelet is nested — eBPF reports initial-namespace pids, which
+  a pod under kind's node container cannot resolve.
+- **ztest owns**: choosing placement, rendering the collector's config,
+  discovering the Pyroscope Service, and querying `SelectMergeStacktraces` with
+  `PROFILE_FORMAT_FLAMEGRAPH` for `ztest sync perf`. Pyroscope's pprof encoder
+  returns an empty sample list for these profiles, so the flamegraph is folded to
+  collapsed stacks client-side.
 
 Pushing rather than writing a file is what makes a profile readable *during* a
 run and what makes one survive an OOM kill: there is no flush-on-shutdown step a

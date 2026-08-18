@@ -18,6 +18,7 @@ pub(crate) mod preview;
 pub mod replay;
 pub mod run;
 pub(crate) mod snapshot;
+pub(crate) mod status;
 pub mod store;
 pub(crate) mod sync;
 
@@ -90,6 +91,11 @@ pub enum Command {
     /// once.
     Cluster(cluster::Args),
 
+    /// Live view of everything ztest is running on the connected cluster:
+    /// capacity, every active run and who launched it, the tests in flight,
+    /// and who is queued for capacity. Read-only; Ctrl-C detaches.
+    Status(status::Args),
+
     /// Manage detached, ztest-owned chain syncs (`list`, `describe`, `start`,
     /// `watch`, `status`, `perf`, `stop`) — the long-running sync-test
     /// profiles that outlive the launching terminal.
@@ -147,6 +153,7 @@ pub fn main() -> ExitCode {
         Command::ListMounts(args) => list_mounts::execute(args),
         Command::Cleanup(args) => cleanup::execute(args),
         Command::Snapshot(args) => snapshot::execute(args),
+        Command::Status(args) => status::execute(args),
         Command::Cluster(args) => cluster::execute(args),
         Command::Sync(args) => sync::execute(args),
         Command::Preview => preview::execute(),

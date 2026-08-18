@@ -14,6 +14,8 @@
 //! - Discovery/deletion split into two passes (exact `--dry-run`, "reaped" vs "still live")
 //! - DELETE = a request, not an act (finalizers) — "reaped" claims only what the apiserver
 //!   confirmed gone, everything else reports `terminating` and is left to drain
+use std::collections::BTreeMap;
+
 use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
@@ -24,7 +26,7 @@ use kube::{Client, Resource};
 use crate::qos;
 use crate::qos::ledger::{META_NAMESPACE, is_expired};
 use crate::resource::impls::policy::RUN_NAMESPACE;
-use crate::sync::{KIND_LABEL_KEY, KIND_LABEL_VALUE, SYNC_ID_KEY};
+use crate::sync::{KIND_LABEL_KEY, KIND_LABEL_VALUE, SYNC_ID_KEY, SyncStatus};
 
 /// Whose artifacts a pass considers. `AllUsers` needs cluster-wide list/delete
 #[derive(Debug, Clone)]
@@ -119,6 +121,16 @@ impl Target {
         ]
     }
 
+    /// Report ConfigMap this target left in [`OBS_NAMESPACE`](crate::resource::OBS_NAMESPACE).
+    /// Reclaimed with the series it accompanies, never with the sync's own namespace (which
+    /// is why a verdict survives an ordinary teardown)
+    fn report_cm(&self) -> Option<String> {
+        let (Kind::Sync, Some(id)) = (self.kind, self.id.as_deref()) else {
+            return None;
+        };
+        Some(crate::sync::report_cm_name(id))
+    }
+
     /// Pyroscope tenant this target's profiles were pushed under.
     ///
     /// - Owner from the object's own label, not the caller (a named target may be
@@ -173,6 +185,7 @@ pub struct Outcome {
     pub errors: Vec<String>,
     pub purged: Vec<String>,
     pub retired: Vec<String>,
+    pub reports: Vec<String>,
 }
 
 /// Classes listed independently, one failure never aborts the rest (a missing
@@ -205,17 +218,19 @@ pub async fn reclaim(client: &Client, plan: Plan, force: bool, dry_run: bool) ->
 
     let reclaimable = triage(plan.targets, force, &mut outcome);
 
-    let (selectors, tenants) = observability_of(&reclaimable, &outcome.terminating);
+    let record = observability_of(&reclaimable, &outcome.terminating);
     if dry_run {
-        outcome.purged = selectors;
-        outcome.retired = tenants;
+        outcome.purged = record.selectors;
+        outcome.retired = record.tenants;
+        outcome.reports = record.reports;
         outcome.deleted = reclaimable;
         return outcome;
     }
     // Metrics first: a failed purge leaves the target listed and the pass retryable,
     // and the k8s delete is the irreversible half
-    purge_metrics(client, selectors, &mut outcome).await;
-    retire_profiles(client, tenants, &mut outcome).await;
+    purge_metrics(client, record.selectors, &mut outcome).await;
+    retire_profiles(client, record.tenants, &mut outcome).await;
+    delete_reports(client, record.reports, &mut outcome).await;
 
     for mut target in reclaimable {
         match delete(client, &target).await {
@@ -254,19 +269,44 @@ async fn retire_profiles(client: &Client, tenants: Vec<String>, outcome: &mut Ou
     }
 }
 
+/// Verdicts, deleted last of the record: a pass that dies mid-way leaves the report as the
+/// one readable trace of a run whose series are already gone. 404 = success
+async fn delete_reports(client: &Client, reports: Vec<String>, outcome: &mut Outcome) {
+    let api: Api<k8s_openapi::api::core::v1::ConfigMap> =
+        Api::namespaced(client.clone(), crate::sync::report_cm_namespace());
+    for name in reports {
+        match api.delete(&name, &Default::default()).await {
+            Ok(_) => outcome.reports.push(name),
+            Err(kube::Error::Api(e)) if e.code == 404 => outcome.reports.push(name),
+            Err(e) => outcome.errors.push(format!("delete report {name}: {e}")),
+        }
+    }
+}
+
 /// Series + profile tenants this pass addresses. One pass over both: `purge` holds a
 /// single port-forward.
 ///
 /// - Terminating included, not just deletable: both derive from the id alone (no cluster
 ///   read), and a purge that failed earlier retries only while the target still lists
 /// - Tenants deduped (every pod and namespace of one run derives the same)
-fn observability_of(reclaimable: &[Target], terminating: &[Target]) -> (Vec<String>, Vec<String>) {
+fn observability_of(reclaimable: &[Target], terminating: &[Target]) -> Record {
     let addressed = || reclaimable.iter().chain(terminating);
-    let selectors = addressed().flat_map(Target::metric_selectors).collect();
     let mut tenants: Vec<String> = addressed().filter_map(Target::profile_tenant).collect();
     tenants.sort();
     tenants.dedup();
-    (selectors, tenants)
+    Record {
+        selectors: addressed().flat_map(Target::metric_selectors).collect(),
+        tenants,
+        reports: addressed().filter_map(Target::report_cm).collect(),
+    }
+}
+
+/// What a pass reclaims *outside* the k8s footprint: the run's record. Series, profile
+/// tenants and report CM travel together — one run's history is reclaimed whole or not at all
+struct Record {
+    selectors: Vec<String>,
+    tenants: Vec<String>,
+    reports: Vec<String>,
 }
 
 /// Which targets this pass deletes — the whole policy, in one place.
@@ -505,33 +545,79 @@ async fn discover_syncs(client: &Client, scope: &Scope, plan: &mut Plan) {
         .list(&ListParams::default().labels(&selector))
         .await
     {
-        Ok(l) => l,
+        Ok(l) => l.items,
         Err(e) => return plan.errors.push(format!("list sync namespaces: {e}")),
     };
 
-    for ns in namespaces.items {
-        let sync_id = label_of(&ns, SYNC_ID_KEY).unwrap_or("?").to_string();
-        let phase = pods.as_ref().map(|pods| {
-            pods.iter()
-                .find(|p| label_of(*p, SYNC_ID_KEY) == Some(sync_id.as_str()))
-                .and_then(|p| p.status.as_ref()?.phase.clone())
-        });
-        plan.targets.push(Target {
-            kind: Kind::Sync,
-            name: ns.name_any(),
-            namespace: None,
-            id: Some(sync_id.clone()),
-            owner: label_of(&ns, qos::LABEL_USER).map(String::from),
-            detail: match phase.as_ref().map(Option::as_deref) {
-                Some(Some(p)) => format!("{sync_id} · {p}"),
-                // No driver pod (removed, or never started) = nothing running
-                Some(None) => format!("{sync_id} · no driver pod"),
-                None => format!("{sync_id} · phase unknown"),
-            },
-            liveness: terminating(&ns, ns_blocker(&ns))
-                .unwrap_or_else(|| classify_sync(&sync_id, phase)),
-        });
+    plan.targets.extend(sync_targets(namespaces, pods));
+}
+
+/// One [`Target`] per sync id, joining the two halves [`delete`] removes.
+///
+/// - Either half can be absent (driver panicking before it creates its topology leaves a
+///   pod-only sync — namespace-anchored discovery never reaps it)
+/// - `pods` outer `None` = list failed, kept apart from "no driver pod"
+/// - Unlabelled object keys on its own name (never merged into a neighbour's target)
+fn sync_targets(namespaces: Vec<Namespace>, pods: Option<Vec<Pod>>) -> Vec<Target> {
+    let mut halves: BTreeMap<String, (Option<Namespace>, Option<Pod>)> = BTreeMap::new();
+    for ns in namespaces {
+        let key = label_of(&ns, SYNC_ID_KEY).unwrap_or(&ns.name_any()).to_string();
+        halves.entry(key).or_default().0 = Some(ns);
     }
+    for pod in pods.iter().flatten() {
+        let key = label_of(pod, SYNC_ID_KEY).unwrap_or(&pod.name_any()).to_string();
+        halves.entry(key).or_default().1 = Some(pod.clone());
+    }
+
+    halves
+        .into_values()
+        .map(|(ns, pod)| {
+            let anchor = ns.as_ref().map(Namespace::name_any);
+            let sync_id = ns
+                .as_ref()
+                .and_then(|n| label_of(n, SYNC_ID_KEY))
+                .or_else(|| pod.as_ref().and_then(|p| label_of(p, SYNC_ID_KEY)))
+                .map(String::from);
+            let phase =
+                pods.as_ref().map(|_| pod.as_ref().and_then(|p| p.status.as_ref()?.phase.clone()));
+            let id = sync_id.clone().unwrap_or_else(|| "?".into());
+            Target {
+                kind: Kind::Sync,
+                // Driver pod and topology namespace share the name, so a pod-only sync
+                // still addresses both halves
+                name: anchor
+                    .clone()
+                    .or_else(|| pod.as_ref().map(Pod::name_any))
+                    .unwrap_or_else(|| id.clone()),
+                namespace: None,
+                id: sync_id,
+                owner: ns
+                    .as_ref()
+                    .and_then(|n| label_of(n, qos::LABEL_USER))
+                    .or_else(|| pod.as_ref().and_then(|p| label_of(p, qos::LABEL_USER)))
+                    .map(String::from),
+                detail: {
+                    let phase = match phase.as_ref().map(Option::as_deref) {
+                        Some(Some(p)) => p.to_string(),
+                        // No driver pod (removed, or never started) = nothing running
+                        Some(None) => "no driver pod".into(),
+                        None => "phase unknown".into(),
+                    };
+                    match anchor {
+                        Some(_) => format!("{id} · {phase}"),
+                        None => format!("{id} · {phase} · no namespace"),
+                    }
+                },
+                liveness: ns
+                    .as_ref()
+                    .and_then(|n| terminating(n, ns_blocker(n)))
+                    .or_else(|| {
+                        pod.as_ref().and_then(|p| terminating(p, finalizer_blocker(p.meta())))
+                    })
+                    .unwrap_or_else(|| classify_sync(&id, phase)),
+            }
+        })
+        .collect()
 }
 
 /// `phase`: outer `None` = the driver-pod list failed, inner = no such pod.
@@ -546,11 +632,14 @@ fn classify_sync(sync_id: &str, phase: Option<Option<String>>) -> Liveness {
             "driver pod phase unreadable; re-run once the cluster answers".into(),
         );
     };
-    match phase.as_deref() {
-        Some(p @ ("Running" | "Pending")) => {
-            Liveness::Live(format!("{p}; `ztest sync stop {sync_id}` checkpoints it first"))
+    // No mirror read (bulk sweep) — live driver = the only thing protecting a sync, and the
+    // pod alone answers that
+    let status = SyncStatus::observe(phase.as_deref(), None);
+    match status.is_live() {
+        true => {
+            Liveness::Live(format!("{status}; `ztest sync stop {sync_id}` checkpoints it first"))
         }
-        _ => Liveness::Finished,
+        false => Liveness::Finished,
     }
 }
 
@@ -682,6 +771,83 @@ mod tests {
         assert!(!classify_test_env("?", &["elicb-4471".to_string()]).is_live());
     }
 
+    fn sync_meta(name: &str, id: &str) -> ObjectMeta {
+        ObjectMeta {
+            name: Some(name.into()),
+            labels: Some(BTreeMap::from([
+                (SYNC_ID_KEY.to_string(), id.to_string()),
+                (KIND_LABEL_KEY.to_string(), KIND_LABEL_VALUE.to_string()),
+                (qos::LABEL_USER.to_string(), "elicb".to_string()),
+            ])),
+            ..Default::default()
+        }
+    }
+
+    fn sync_ns(id: &str) -> Namespace {
+        Namespace { metadata: sync_meta(&crate::sync::namespace_for(id), id), ..Default::default() }
+    }
+
+    fn sync_pod(id: &str, phase: &str) -> Pod {
+        Pod {
+            metadata: sync_meta(&crate::sync::driver_pod_for(id), id),
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                phase: Some(phase.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Driver panicking before `TestEnv::build` leaves a pod and no namespace: anchoring
+    /// discovery on the namespace stranded it forever, with `sync list` still showing it
+    #[test]
+    fn a_driver_pod_without_a_namespace_is_still_reclaimable() {
+        let targets = sync_targets(vec![], Some(vec![sync_pod("zaino-a52f", "Failed")]));
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id.as_deref(), Some("zaino-a52f"));
+        assert_eq!(targets[0].name, crate::sync::driver_pod_for("zaino-a52f"));
+        assert_eq!(targets[0].owner.as_deref(), Some("elicb"));
+        assert!(!targets[0].liveness.is_live());
+        assert_eq!(driver_pod_of(&targets[0]), crate::sync::driver_pod_for("zaino-a52f"));
+    }
+
+    #[test]
+    fn both_halves_of_one_sync_join_into_one_target() {
+        let targets =
+            sync_targets(vec![sync_ns("zaino-a52f")], Some(vec![sync_pod("zaino-a52f", "Failed")]));
+
+        assert_eq!(targets.len(), 1, "namespace + driver = one reap, not two");
+        assert_eq!(targets[0].name, crate::sync::namespace_for("zaino-a52f"));
+        assert!(targets[0].detail.contains("Failed"), "{}", targets[0].detail);
+    }
+
+    #[test]
+    fn a_namespace_whose_driver_is_gone_is_reclaimable() {
+        let targets = sync_targets(vec![sync_ns("zaino-a52f")], Some(vec![]));
+
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].detail.contains("no driver pod"), "{}", targets[0].detail);
+        assert!(!targets[0].liveness.is_live());
+    }
+
+    #[test]
+    fn a_running_driver_protects_a_sync_that_has_no_namespace_yet() {
+        let targets = sync_targets(vec![], Some(vec![sync_pod("zaino-a52f", "Running")]));
+
+        assert!(targets[0].liveness.is_live(), "provisioning sync must survive a bare cleanup");
+    }
+
+    /// Unreadable pod list is the one case that must fail *shut*: every sync reads as
+    /// live rather than every running sync reading as garbage
+    #[test]
+    fn an_unreadable_pod_list_protects_every_sync() {
+        let targets = sync_targets(vec![sync_ns("zaino-a52f")], None);
+
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].liveness.is_live());
+    }
+
     fn target(kind: Kind, name: &str, id: &str) -> Target {
         Target {
             kind,
@@ -692,6 +858,27 @@ mod tests {
             detail: String::new(),
             liveness: Liveness::Finished,
         }
+    }
+
+    /// Report travels with the series it accompanies, not with the sync's own namespace —
+    /// what lets the driver tear that namespace down and keep its verdict
+    #[test]
+    fn a_sync_target_addresses_its_report_in_the_observability_namespace() {
+        let sync = target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f");
+        assert_eq!(sync.report_cm().as_deref(), Some("ztest-sync-report-zaino-a52f"));
+        assert_eq!(crate::sync::report_cm_namespace(), crate::resource::OBS_NAMESPACE);
+        assert_ne!(crate::sync::report_cm_namespace(), sync.name);
+
+        let record = observability_of(&[sync], &[]);
+        assert_eq!(record.reports.len(), 1, "one verdict per sync");
+        assert!(!record.selectors.is_empty(), "series reclaimed in the same pass");
+    }
+
+    /// Only syncs leave one
+    #[test]
+    fn a_run_target_leaves_no_report_to_reclaim() {
+        assert!(target(Kind::TestEnv, "elicb-4471", "elicb-4471").report_cm().is_none());
+        assert!(target(Kind::RunPod, "ztest-run-x", "elicb-4471").report_cm().is_none());
     }
 
     #[test]
@@ -831,9 +1018,9 @@ mod tests {
     /// series are orphaned for the whole retention
     #[test]
     fn a_terminating_sync_still_has_its_series_and_tenant_addressed() {
-        let (selectors, tenants) = observability_of(&[], &[dying("ztest-sync-zaino-a52f")]);
-        assert_eq!(selectors.len(), 3, "namespace, sync_id and driver-pod matchers");
-        assert_eq!(tenants, vec!["ztest.elicb.zaino-a52f"]);
+        let record = observability_of(&[], &[dying("ztest-sync-zaino-a52f")]);
+        assert_eq!(record.selectors.len(), 3, "namespace, sync_id and driver-pod matchers");
+        assert_eq!(record.tenants, vec!["ztest.elicb.zaino-a52f"]);
     }
 
     /// One run's namespace + pod derive one tenant, whichever list they land on
@@ -842,8 +1029,8 @@ mod tests {
         let ns = target(Kind::TestEnv, "ztest-pkg-a-1", "elicb-4021");
         let mut pod = target(Kind::RunPod, "ztest-runner-xyz", "elicb-4021");
         pod.liveness = Liveness::Terminating("terminating 2s".into());
-        let (_, tenants) = observability_of(&[ns], &[pod]);
-        assert_eq!(tenants, vec!["ztest.elicb.elicb-4021"]);
+        let record = observability_of(&[ns], &[pod]);
+        assert_eq!(record.tenants, vec!["ztest.elicb.elicb-4021"]);
     }
 
     /// `--force` overrides *liveness*, not a finalizer — nothing can hurry one

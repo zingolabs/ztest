@@ -70,6 +70,25 @@ pub(super) fn render_label_rule(out: &mut String, theme: &Theme) {
         .expect("write to string");
 }
 
+/// Printable width, ANSI escapes ignored (padding against byte length leaves every
+/// coloured cell ragged)
+pub(super) fn display_width(s: &str) -> usize {
+    console::measure_text_width(s)
+}
+
+/// Cut to `width` printable columns, escapes preserved
+pub(super) fn truncate(s: &str, width: usize) -> String {
+    match display_width(s) <= width {
+        true => s.to_string(),
+        false => console::truncate_str(s, width, "").into_owned(),
+    }
+}
+
+/// Pad to `width` printable columns; a styled cell's escapes must not count toward it
+pub(super) fn pad(s: &str, width: usize) -> String {
+    format!("{s}{}", " ".repeat(width.saturating_sub(display_width(s))))
+}
+
 pub(super) fn cores_of(r: &Resources) -> u64 {
     r.cpu_milli / 1000
 }
@@ -81,10 +100,8 @@ pub(super) fn gib_of(r: &Resources) -> u64 {
 /// Percent capacity free = min(cpu, mem) free fraction, the binding constraint
 /// for packing work. Zero allocatable → 0%
 pub(super) fn free_percent(free: &Resources, alloc: &Resources) -> u8 {
-    let frac = |f: u64, a: u64| -> u64 {
-        if a == 0 { 0 } else { ((f as u128 * 100) / a as u128).min(100) as u64 }
-    };
-    frac(free.cpu_milli, alloc.cpu_milli).min(frac(free.mem_bytes, alloc.mem_bytes)) as u8
+    let (cpu, mem) = free.ratio_pct(alloc);
+    cpu.min(mem)
 }
 
 /// Braille frames of `indicatif`'s default spinner
@@ -99,25 +116,9 @@ pub(super) fn spinner_glyph(elapsed: std::time::Duration) -> &'static str {
     SPINNER_FRAMES[idx]
 }
 
-pub(super) fn agg_str(r: &Resources) -> String {
-    let cpu = if r.cpu_milli.is_multiple_of(1000) {
-        format!("{}c", r.cpu_milli / 1000)
-    } else {
-        format!("{:.1}c", r.cpu_milli as f64 / 1000.0)
-    };
-    let mem = if r.mem_bytes.is_multiple_of(GIB) {
-        format!("{} GiB", r.mem_bytes / GIB)
-    } else {
-        format!("{:.1} GiB", r.mem_bytes as f64 / GIB as f64)
-    };
-    format!("{cpu} / {mem}")
-}
-
 /// Binding-dimension fullness = max(cpu, mem) fraction of `part` in `whole`.
 /// Zero `whole` → 0%
 pub(super) fn used_percent(part: &Resources, whole: &Resources) -> u8 {
-    let frac = |p: u64, w: u64| -> u64 {
-        if w == 0 { 0 } else { ((p as u128 * 100) / w as u128).min(100) as u64 }
-    };
-    frac(part.cpu_milli, whole.cpu_milli).max(frac(part.mem_bytes, whole.mem_bytes)) as u8
+    let (cpu, mem) = part.ratio_pct(whole);
+    cpu.max(mem)
 }

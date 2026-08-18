@@ -221,9 +221,13 @@ mod tests {
 
     #[test]
     fn a_tier_with_uniform_reserves_still_reports_a_per_test_figure() {
+        let admitted = QosClass::Basic.profile().admitted();
         let p = plan(&at_tier(QosClass::Basic, 3), None);
-        assert_eq!(p.tiers[0].per_test, Some(QosClass::Basic.profile().admitted()));
-        assert_eq!(p.tiers[0].subtotal, Resources::new(6000, 3 * GIB / 2, 0, 0));
+        assert_eq!(p.tiers[0].per_test, Some(admitted));
+        // Stated as a multiple of the figure above, not a literal: the two must agree, and
+        // a hardcoded subtotal is what let them drift apart
+        assert_eq!(p.tiers[0].subtotal.cpu_milli, admitted.cpu_milli * 3);
+        assert_eq!(p.tiers[0].subtotal.mem_bytes, admitted.mem_bytes * 3);
     }
 
     #[test]

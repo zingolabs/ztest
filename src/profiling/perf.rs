@@ -1,7 +1,10 @@
 //! `ztest sync perf` — query a sync's CPU profile and open it.
 //!
-//! - Components push to Pyroscope; this asks for a merged pprof over a window
+//! - Components push to Pyroscope; this asks for a merged flamegraph over a window and
+//!   folds it to collapsed stacks (`frame;frame <self>`), which every viewer here reads
 //! - Store sits outside the run → readable mid-sync and after the namespace is gone
+//! - Untransformed: Pyroscope's bytes for the window are the file (no repair, no frame
+//!   filtering, no local diff — a viewer's job, and no external toolchain to hold)
 //! - Strictly a reader: never drains, stops, or signals a component (a diagnostic
 //!   that can end a twelve-hour sync is a footgun)
 
@@ -23,35 +26,22 @@ const VIEWER_ENV: &str = "ZTEST_PROFILE_VIEWER";
 /// `ztest sync watch` over SSH, where a browser is impossible or lands elsewhere
 const VIEWERS: [&str; 1] = ["flameshow"];
 
-/// Elides the thread-spawn + tokio-runtime prologue every sample carries ahead of
-/// application code.
-///
-/// - Byte-identical on every stack, and >half the graph (11,182 of 19,131
-///   frame-lines on a nine-minute `zaino-state-sync` profile)
-/// - `-hide` = the right primitive: drops *frames*, keeps samples, so totals and
-///   flame widths hold (`-focus`/`-ignore` cut whole samples; `-prune_from` cuts
-///   leafward, the opposite end)
-/// - Cost, reported by [`report_elision`]: an all-scaffolding sample (parked worker)
-///   vanishes entirely, under-reporting pure runtime overhead. `--raw` opts out
-const HIDE_SCAFFOLDING: &str = r"^(root$|__clone|<?std::sys|core::ops::function::FnOnce|<?tokio::runtime|<?core::future::poll_fn|<?tracing::instrument)";
-
 /// One `ztest sync perf` invocation, as asked for on the command line.
 ///
-/// Mutually-constraining choices, not independent inputs: `window` xor `base`,
-/// `raw` only under `open`. Named fields also stop four `Option<String>`/`bool`
-/// arguments transposing silently
-pub(super) struct Request {
-    pub(super) id: String,
-    pub(super) out: Option<PathBuf>,
-    pub(super) open: bool,
-    pub(super) window: Option<String>,
-    pub(super) component: Option<String>,
-    pub(super) base: Option<String>,
-    pub(super) raw: bool,
+/// Mutually-constraining choices, not independent inputs: `window` xor `base`. Named
+/// fields also stop four `Option<String>`/`bool` arguments transposing silently
+pub(crate) struct Request {
+    pub(crate) id: String,
+    pub(crate) out: Option<PathBuf>,
+    pub(crate) open: bool,
+    pub(crate) window: Option<String>,
+    pub(crate) component: Option<String>,
+    pub(crate) base: Option<String>,
+    pub(crate) profile: super::Profile,
 }
 
-pub(super) async fn perf(request: Request) -> Result<(), String> {
-    let Request { id, out, open, window, component, base, raw } = request;
+pub(crate) async fn perf(request: Request) -> Result<(), String> {
+    let Request { id, out, open, window, component, base, profile } = request;
     // Parsed before any cluster call — a `--window` typo must cost nothing, not a
     // full retrieval then thrown away.
     let requested = window.as_deref().map(parse_window).transpose()?;
@@ -66,137 +56,14 @@ pub(super) async fn perf(request: Request) -> Result<(), String> {
     let span = span_for(&id, requested).await?;
 
     if let Some(base_id) = base {
-        return compare(&id, &base_id, &subject, span, open, raw).await;
+        return compare(&id, &base_id, &subject, span, open, profile).await;
     }
 
-    let target = retrieve(&id, &subject, span, out).await?;
+    let target = retrieve(&id, &subject, span, out, profile).await?;
     match open {
-        true => launch(&normalize_for_viewing(&target, raw), &Theme::detect()),
+        true => launch(&target, &Theme::detect()),
         false => Ok(()),
     }
-}
-
-/// Rewrite `profile` into what the viewer opens.
-///
-/// - Two repairs, both for legal-but-viewer-hostile profiles: [`without_default_sample_type`]
-///   always, then [`repair_with_go`] where Go exists
-/// - Strip first: `go tool pprof` propagates field 14 rather than re-deriving it, so a
-///   Go-less machine still gets an openable profile
-/// - Any failure → the original (accepted as-is by pprof, speedscope, pprof.me);
-///   [`launch`] explains what a viewer then chokes on
-fn normalize_for_viewing(profile: &Path, raw: bool) -> PathBuf {
-    let view = profile.with_extension("view.pb");
-    let stripped =
-        std::fs::read(profile).ok().and_then(|bytes| without_default_sample_type(&bytes));
-    let Some(stripped) = stripped else {
-        return profile.to_path_buf();
-    };
-    if std::fs::write(&view, &stripped).is_err() {
-        return profile.to_path_buf();
-    }
-    if repair_with_go(&view, raw) && !raw {
-        report_elision(profile, &view);
-    }
-    view
-}
-
-/// `default_sample_type` (field 14), dropped.
-///
-/// - Spec: index into the *string table*; flameshow 1.1.4 indexes `sample_type[]` with it
-///   → `IndexError` on every profile that sets it, and Pyroscope sets it
-/// - Unset = "default to the last sample type" (spec) = the same type on a one-type
-///   profile, so nothing is lost
-/// - Walked with prost's own field decoder: every other field is copied through verbatim,
-///   including ones this build's `.proto` does not know
-/// - `None` = not a parseable protobuf message (caller keeps the original)
-fn without_default_sample_type(profile: &[u8]) -> Option<Vec<u8>> {
-    use prost::bytes::Buf as _;
-    use prost::encoding::{DecodeContext, decode_key, skip_field};
-
-    const DEFAULT_SAMPLE_TYPE: u32 = 14;
-
-    let mut kept = Vec::with_capacity(profile.len());
-    let mut rest = profile;
-    while rest.has_remaining() {
-        let field = rest;
-        let (tag, wire) = decode_key(&mut rest).ok()?;
-        skip_field(wire, tag, &mut rest, DecodeContext::default()).ok()?;
-        if tag != DEFAULT_SAMPLE_TYPE {
-            kept.extend_from_slice(&field[..field.len() - rest.len()]);
-        }
-    }
-    Some(kept)
-}
-
-/// Give `view` a mapping table + strip runtime scaffolding, in place. `false` = untouched.
-///
-/// - pprof-rs emits `mapping_id = 0` with an empty table: legal, fine for `go tool
-///   pprof`, fatal for flameshow, which indexes it unconditionally
-/// - One `go tool pprof` pass synthesizes the table and applies [`HIDE_SCAFFOLDING`]
-///   (unless `raw`), so trimming rides free on a mandatory repair
-fn repair_with_go(view: &Path, raw: bool) -> bool {
-    if !on_path("go") {
-        return false;
-    }
-    match Command::new("go").args(proto_args(raw)).arg(view).output() {
-        Ok(o) if o.status.success() && !o.stdout.is_empty() => {
-            std::fs::write(view, &o.stdout).is_ok()
-        }
-        _ => false,
-    }
-}
-
-/// `go tool pprof` flags rewriting a profile for viewing. Split out so the whole
-/// `--raw` difference is an inspectable value, not a branch inside a process spawn
-fn proto_args(raw: bool) -> Vec<String> {
-    let mut args = vec!["tool".to_string(), "pprof".to_string(), "-proto".to_string()];
-    if !raw {
-        args.push(format!("-hide={HIDE_SCAFFOLDING}"));
-    }
-    args
-}
-
-/// Say so when hiding frames also cost samples.
-///
-/// - `-hide` spares any sample with one surviving frame, so totals normally match
-///   exactly; an all-scaffolding sample (parked worker) has nothing left and vanishes
-/// - A few percent on a mostly-idle process → told, not left to be discovered
-///   against `ztest sync status`
-/// - Silent on failure and on an exact match (a footnote must not fail a profile
-///   that opened fine)
-fn report_elision(raw: &Path, viewed: &Path) {
-    let (Some(before), Some(after)) = (total_samples(raw), total_samples(viewed)) else {
-        return;
-    };
-    if before == after {
-        return;
-    }
-    eprintln!(
-        "ztest sync perf: scaffolding hidden — {before} sampled, {after} shown (--raw keeps all)"
-    );
-}
-
-/// pprof's verbatim `Total samples` figure (`14.97s`). Kept as pprof's own string
-/// — the sole use is two totals side by side, and re-deriving unit + precision it
-/// already picked can only disagree with it
-fn total_samples(profile: &Path) -> Option<String> {
-    let out = Command::new("go")
-        .args(["tool", "pprof", "-top", "-nodecount=0"])
-        .arg(profile)
-        .output()
-        .ok()?;
-    parse_total_samples(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// Lift `Total samples` out of a `go tool pprof -top` stdout header
-/// (`Duration: 561.01s, Total samples = 14.97s ( 2.67%)`). Split from
-/// [`total_samples`] so a test pins this dependency on another tool's format
-fn parse_total_samples(stdout: &str) -> Option<String> {
-    stdout.lines().find_map(|line| {
-        line.split_once("Total samples = ")
-            .and_then(|(_, rest)| rest.split_whitespace().next())
-            .map(str::to_string)
-    })
 }
 
 /// Requested window → absolute times.
@@ -207,8 +74,8 @@ async fn span_for(
     id: &str,
     requested: Option<(std::time::Duration, std::time::Duration)>,
 ) -> Result<(SystemTime, SystemTime), String> {
-    let client = super::client().await?;
-    let driver = super::find_driver(&client, id).await?;
+    let client = crate::cluster::client().await.map_err(|e| format!("kube client: {e}"))?;
+    let driver = crate::sync::find_driver(&client, id).await?;
     let started: SystemTime = driver
         .metadata
         .creation_timestamp
@@ -227,28 +94,127 @@ async fn retrieve(
     component: &str,
     window: (SystemTime, SystemTime),
     out: Option<PathBuf>,
+    profile: super::Profile,
 ) -> Result<PathBuf, String> {
     let theme = Theme::detect();
-    let client = super::client().await?;
-    let selector = crate::profiling::selector(component, &namespace_for(id));
-    let tenant = crate::profiling::tenant_for_sync(&client, id)
+    let client = crate::cluster::client().await.map_err(|e| format!("kube client: {e}"))?;
+    let selector = super::selector(component, &namespace_for(id));
+    let tenant = super::tenant_for_sync(&client, id)
         .await
         .ok_or_else(|| format!("sync {id} is gone; its profiles are no longer addressable"))?;
-    let profile =
-        match crate::profiling::fetch(&client, &selector, window.0, window.1, &tenant).await {
-            Ok(profile) => profile,
-            // An empty match has four causes and the cluster can still separate them; a bare
-            // "matched nothing" sends the reader to the query, which is the one thing that is fine
-            Err(e) => return Err(explain_empty(&client, id, component).await.unwrap_or(e)),
-        };
+    let bytes = match super::fetch(&client, &selector, window.0, window.1, &tenant, profile).await {
+        Ok(profile) => profile,
+        // An empty match has four causes and the cluster can still separate them; a bare
+        // "matched nothing" sends the reader to the query, which is the one thing that is fine
+        Err(e) => return Err(explain_empty(&client, id, component).await.unwrap_or(e)),
+    };
 
     let dest = out.unwrap_or_else(|| default_dest(id));
     std::fs::create_dir_all(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
-    let path = dest.join(format!("{component}-profile.pb"));
-    std::fs::write(&path, &profile).map_err(|e| format!("write {}: {e}", path.display()))?;
+    let path = dest.join(format!("{component}-{}.collapsed", profile.stem()));
+    std::fs::write(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
     println!("{} {}", theme.chars.ok.style(theme.styles.pass), path.display());
-    report_fidelity(&client, id, component, &profile, window, &theme).await;
+    match profile {
+        super::Profile::OnCpu => {
+            report_fidelity(&client, id, component, &bytes, window, &theme).await
+        }
+        // Blocked time has no CPU denominator to be a fraction of; the dropped-event count is
+        // the only fidelity signal that still means something
+        super::Profile::OffCpu => report_dropped_events(&client, id, &theme).await,
+    }
     Ok(path)
+}
+
+/// Alloy's own count of trace events the per-CPU perf ring could not hold.
+///
+/// - Non-zero = the sampling settings outrun the ring, and the profile is missing
+///   *unattributed* work — invisible in the fidelity ratio, which only compares what
+///   arrived against the kernel's CPU figure
+/// - Silent on zero and on any failure (a footnote must not fail a profile that retrieved)
+async fn report_dropped_events(client: &kube::Client, id: &str, theme: &Theme) {
+    let Some(dropped) = collector_dropped(client, id).await.filter(|&d| d > 0) else {
+        return;
+    };
+    println!(
+        "{:>10}  {} trace events  {}",
+        "dropped".style(theme.styles.dim),
+        crate::ui::text::compact(dropped as f64).style(theme.styles.count),
+        "lower --profile-off-cpu or --profile-hz".style(theme.styles.fail),
+    );
+}
+
+async fn collector_dropped(client: &kube::Client, id: &str) -> Option<u64> {
+    collector_metrics(client, id).await?.get("agent_errors_trace_event_lost_total").copied()
+}
+
+/// Sidecar's own `/metrics`, as `name -> value` (labels dropped; every counter read here
+/// is process-wide and single-series)
+async fn collector_metrics(
+    client: &kube::Client,
+    id: &str,
+) -> Option<std::collections::HashMap<String, u64>> {
+    let port = super::ebpf::HTTP_PORT;
+    // Host-placed collectors listen on loopback already; only a sidecar needs a tunnel, and
+    // starting one against a finished driver pod fails rather than falling through
+    let (_fwd, local) = match super::host::metrics_port(id).await {
+        // Host-placed: docker owns the mapping, so the port is looked up, never assumed
+        Some(published) => (None, published),
+        None => {
+            let fwd = crate::portforward::Forwarder::start(
+                client.clone(),
+                crate::resource::impls::policy::RUN_NAMESPACE.to_string(),
+                crate::sync::driver_pod_for(id),
+                port,
+            )
+            .await
+            .ok()?;
+            let local = fwd.local_port;
+            (Some(fwd), local)
+        }
+    };
+    let body = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{local}/metrics"))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    // Summed, not collected: Alloy labels each family by `component_id`, so collecting would
+    // keep one arbitrary series per family rather than the collector's total
+    Some(
+        body.lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| {
+                let (name, value) = l.rsplit_once(' ')?;
+                let name = name.split_once('{').map_or(name, |(n, _)| n);
+                Some((name.trim().to_string(), value.trim().parse::<f64>().ok()? as u64))
+            })
+            .fold(std::collections::HashMap::new(), |mut acc, (name, value)| {
+                *acc.entry(name).or_default() += value;
+                acc
+            }),
+    )
+}
+
+/// Collector's own pipeline counters, in order of flow.
+///
+/// - Facts, not a verdict: an empty profile has several causes, and where the numbers stop
+///   separates them without this having to guess a threshold
+/// - `unwound` = executables whose stack deltas reached eBPF; zero (or far under the
+///   process count) means no stack can be walked, so nothing downstream can exist
+async fn collector_pipeline(client: &kube::Client, id: &str) -> Option<String> {
+    let metrics = collector_metrics(client, id).await?;
+    let get = |k: &str| metrics.get(k).copied().unwrap_or_default();
+    Some(format!(
+        "collector: {} targets · {} processes seen · {} executables unwound · \
+         {} samples forwarded · {} events dropped",
+        get("pyroscope_ebpf_active_targets"),
+        get("bpf_num_proc_new_total"),
+        get("agent_num_exe_id_loaded_to_ebpf"),
+        get("pyroscope_forwarded_entries_total"),
+        get("agent_errors_trace_event_lost_total"),
+    ))
 }
 
 /// Why the query matched nothing, when the cluster can still say. `None` = no structural
@@ -265,11 +231,13 @@ async fn explain_empty(client: &kube::Client, id: &str, component: &str) -> Opti
         Api::namespaced(client.clone(), run_ns).get(&crate::sync::driver_pod_for(id)).await.ok()?;
     let spec = driver.spec.as_ref()?;
 
-    // Native sidecar → `initContainers`, not `containers`. Absent = the run was never
-    // profiled at all, the one cause a re-query can never fix
-    let has_profiler =
-        spec.init_containers.iter().flatten().any(|c| c.name == crate::profiling::ebpf::CONTAINER);
-    if !has_profiler {
+    // Two placements, two places to look: a sidecar lands in `initContainers` (native
+    // sidecar, never `containers`), a host collector in docker. Neither = never profiled,
+    // the one cause a re-query can never fix
+    let has_sidecar =
+        spec.init_containers.iter().flatten().any(|c| c.name == super::ebpf::CONTAINER);
+    let has_host = super::host::metrics_port(id).await.is_some();
+    if !has_sidecar && !has_host {
         return Some(format!(
             "sync {id} carries no profiler; nothing was ever collected — \
              restart it with `ztest sync start <profile>`"
@@ -280,14 +248,14 @@ async fn explain_empty(client: &kube::Client, id: &str, component: &str) -> Opti
         .status
         .as_ref()
         .and_then(|s| s.init_container_statuses.as_ref())
-        .and_then(|cs| cs.iter().find(|c| c.name == crate::profiling::ebpf::CONTAINER));
+        .and_then(|cs| cs.iter().find(|c| c.name == super::ebpf::CONTAINER));
     if let Some(waiting) = status.and_then(|s| s.state.as_ref()?.waiting.as_ref()) {
         let reason = waiting.reason.as_deref().unwrap_or("not running");
         return Some(format!(
             "sync {id}: the profiler never started ({reason}); \
              `kubectl -n {run_ns} logs {} -c {}`",
             crate::sync::driver_pod_for(id),
-            crate::profiling::ebpf::CONTAINER,
+            super::ebpf::CONTAINER,
         ));
     }
 
@@ -303,7 +271,12 @@ async fn explain_empty(client: &kube::Client, id: &str, component: &str) -> Opti
              eBPF only samples its own node"
         ));
     }
-    None
+
+    // Nothing structural left to blame → hand over the collector's own counters. Where they
+    // stop is the answer, and it beats naming a cause this cannot actually establish
+    collector_pipeline(client, id)
+        .await
+        .map(|counters| format!("no profile matched yet · {counters}"))
 }
 
 /// Below this the profile is missing enough CPU that its *shape* is suspect too, not
@@ -313,10 +286,11 @@ const FIDELITY_FLOOR: f64 = 0.80;
 
 /// Say what fraction of the kernel's CPU the profile actually caught.
 ///
-/// - `ITIMER_PROF` cannot outrun the kernel's signal ceiling (~`CONFIG_HZ`/s), and
-///   pprof-rs drops any sample whose lock it fails to take — both losses are silent
-/// - Demanded rate = `ZTEST_PROFILE_HZ` × busy cores, so a 15-core `qos = sync` run is
-///   exactly where the ceiling bites; lowering the rate *raises* fidelity
+/// - Shortfall has several causes and this ratio distinguishes none: a collector that started
+///   late, a dropped-event backlog, or unwinding that resolved nothing all read alike
+/// - So it points at the pipeline counters rather than prescribing a knob — the in-process path
+///   is bounded by the kernel's signal ceiling (lower the rate), the eBPF path by ring headroom
+///   (lower `--profile-off-cpu`), and the two pull in opposite directions
 /// - Never fatal, never a verdict: a missing TSDB must not fail a profile that opened
 async fn report_fidelity(
     client: &kube::Client,
@@ -327,7 +301,7 @@ async fn report_fidelity(
     theme: &Theme,
 ) {
     let (Some(sampled), Some(charged)) = (
-        crate::profiling::cpu_nanos(profile).map(|ns| ns as f64 / 1e9),
+        super::collapsed_nanos(profile).map(|ns| ns as f64 / 1e9),
         crate::metrics::query::container_cpu_seconds(client, &namespace_for(id), component, window)
             .await,
     ) else {
@@ -349,16 +323,16 @@ async fn report_fidelity(
         crate::ui::text::compact(charged).style(theme.styles.dim),
         format!("{:.0}%", ratio * 100.0).style(style),
     );
+    report_dropped_events(client, id, theme).await;
     if ratio < FIDELITY_FLOOR {
         eprintln!(
-            "ztest sync perf: under-sampled — restart with a lower `--profile-hz` \
-             (rate × cores must stay under the kernel tick)"
+            "ztest sync perf: under-sampled — the collector counters above name the shortfall"
         );
     }
 }
 
-/// Compare against an earlier run: what changed (headline), then where (differential
-/// flame graph) — the two halves of an optimisation loop, useless apart.
+/// Compare against an earlier run: what changed (headline), then both profiles to see
+/// where — the two halves of an optimisation loop, useless apart.
 ///
 /// - Exactly one number to compare: over a shared span the work vector is a chain
 ///   constant, so `rate = work/elapsed` varies only through `elapsed` and every op's
@@ -372,7 +346,7 @@ async fn compare(
     component: &str,
     span: (SystemTime, SystemTime),
     open: bool,
-    raw: bool,
+    profile: super::Profile,
 ) -> Result<(), String> {
     let theme = Theme::detect();
     let head = read_report(id).await?;
@@ -395,15 +369,15 @@ async fn compare(
 
     // Second: the table is the cheap half, and reaches a reader even when one run
     // has no profile stored.
-    let head_profile = retrieve(id, component, span, None).await?;
+    let head_profile = retrieve(id, component, span, None, profile).await?;
     let base_span = span_for(base_id, None).await?;
-    let base_profile = retrieve(base_id, component, base_span, Some(default_dest(base_id))).await?;
+    let base_profile =
+        retrieve(base_id, component, base_span, Some(default_dest(base_id)), profile).await?;
 
-    let out = head_profile.with_file_name(format!("{component}-vs-{base_id}.pb"));
-    subtract(&base_profile, &head_profile, &out)?;
-    println!("{:>10}  {}", "profile".style(theme.styles.dim), out.display());
+    // Both profiles ship as retrieved; differencing them is a viewer's job, not ztest's
+    println!("{:>10}  {}", "base".style(theme.styles.dim), base_profile.display());
     match open {
-        true => launch(&normalize_for_viewing(&out, raw), &theme),
+        true => launch(&head_profile, &theme),
         false => Ok(()),
     }
 }
@@ -505,9 +479,8 @@ fn change(
 const REGRESSION_MARGIN: f64 = 0.95;
 
 async fn read_report(id: &str) -> Result<crate::sync::SyncReportMirror, String> {
-    let client = super::client().await?;
-    let ns = namespace_for(id);
-    super::read_report(&client, &ns, id)
+    let client = crate::cluster::client().await.map_err(|e| format!("kube client: {e}"))?;
+    crate::sync::read_report(&client, id)
         .await?
         .ok_or_else(|| format!("sync {id}: no report — it has not finished yet"))
 }
@@ -516,35 +489,6 @@ async fn read_report(id: &str) -> Result<crate::sync::SyncReportMirror, String> 
 /// overwrite each other's artifacts
 fn default_dest(id: &str) -> PathBuf {
     PathBuf::from(format!("ztest-perf-{id}"))
-}
-
-/// Subtract `base` from `head` → window profile at `out`.
-///
-/// Delegated to `go tool pprof -base`, the reference implementation. Hand-rolling
-/// means re-keying samples across two string tables and rebuilding the location /
-/// function / mapping tables, where a subtle error is not an error but a plausible
-/// flame graph that lies. Go-less machines get the fallback below
-fn subtract(base: &Path, head: &Path, out: &Path) -> Result<(), String> {
-    if !on_path("go") {
-        return Err(format!(
-            "windowing needs Go — run: go tool pprof -proto -base {} {}",
-            base.display(),
-            head.display()
-        ));
-    }
-    let produced = Command::new("go")
-        .args(["tool", "pprof", "-proto", "-base"])
-        .arg(base)
-        .arg(head)
-        .output()
-        .map_err(|e| format!("run go tool pprof: {e}"))?;
-    if !produced.status.success() {
-        return Err(format!(
-            "go tool pprof -base failed: {}",
-            String::from_utf8_lossy(&produced.stderr).trim()
-        ));
-    }
-    std::fs::write(out, &produced.stdout).map_err(|e| format!("write {}: {e}", out.display()))
 }
 
 /// Parse a `FROM..TO` window: `11h..12h`, `30m..90m`, `0..1h`
@@ -596,16 +540,7 @@ fn launch(profile: &Path, theme: &Theme) -> Result<(), String> {
     // and a shell prompt returning mid-paint corrupts both.
     match Command::new(&viewer).arg(profile).status() {
         Ok(status) if status.success() => Ok(()),
-        // Dominant cause: a viewer that cannot read pprof-rs's mapping-table-less
-        // profile, which `normalize_for_viewing` repairs given Go.
-        Ok(status) if !on_path("go") => Err(format!(
-            "{viewer} exited with {status} — some viewers reject a profile with no \
-             mapping table, which Go repairs; install Go, or open {} with \
-             `go tool pprof -http=: {}` elsewhere",
-            profile.display(),
-            profile.display()
-        )),
-        Ok(status) => Err(format!("{viewer} exited with {status}")),
+        Ok(status) => Err(format!("{viewer} exited with {status} ({})", profile.display())),
         Err(e) => Err(format!("launch {viewer}: {e}")),
     }
 }
@@ -752,75 +687,6 @@ mod tests {
         let out = verdict(&bare, &bare.clone(), "sync-head", "sync-base", &plain_theme());
         assert!(out.contains('—'), "{out}");
         assert!(!out.contains('%'), "no percentage without a rate:\n{out}");
-    }
-
-    /// Default hides the prologue, `--raw` keeps it (for when the prologue is the
-    /// subject). Both directions asserted — a silently inert flag is worse than none
-    #[test]
-    fn the_scaffolding_is_hidden_by_default_and_kept_for_raw() {
-        let default = proto_args(false);
-        assert!(default.iter().any(|a| a.starts_with("-hide=")), "{default:?}");
-        assert!(!proto_args(true).iter().any(|a| a.starts_with("-hide=")));
-        // Mapping-table repair = why this pass exists; must survive both modes,
-        // else `--raw` hands flameshow a profile it cannot open.
-        for args in [proto_args(false), proto_args(true)] {
-            assert!(args.contains(&"-proto".to_string()), "{args:?}");
-        }
-    }
-
-    /// Verbatim `go tool pprof -top -nodecount=0` fixture, so a header-format change
-    /// fails here with the format visible, not by silencing the elision notice
-    #[test]
-    fn the_total_samples_figure_is_read_from_the_pprof_header() {
-        let header = "Main binary filename not available.\n\
-                      Type: cpu\n\
-                      Time: 2026-08-11 09:49:47 PDT\n\
-                      Duration: 561.01s, Total samples = 14.97s ( 2.67%)\n\
-                      Showing nodes accounting for 12.14s, 81.10% of 14.97s total\n";
-        assert_eq!(parse_total_samples(header).as_deref(), Some("14.97s"));
-    }
-
-    /// No header ⇒ no figure ⇒ caller falls silent, never comparing against an
-    /// invented value
-    #[test]
-    fn output_without_a_total_yields_no_figure() {
-        assert_eq!(parse_total_samples(""), None);
-        assert_eq!(parse_total_samples("Type: cpu\nDuration: 561.01s\n"), None);
-    }
-
-    /// Minimal `Profile`: one `sample_type` (`cpu`/`nanoseconds` by string index),
-    /// `default_sample_type = 93`, one empty `string_table` entry
-    fn profile_bytes(with_default: bool) -> (Vec<u8>, Vec<u8>) {
-        let sample_type = [0x0a, 0x04, 0x08, 0x5d, 0x10, 0x01];
-        let string_table = [0x32, 0x00];
-        let survivors: Vec<u8> = [sample_type.as_slice(), string_table.as_slice()].concat();
-        let mut input = sample_type.to_vec();
-        if with_default {
-            input.extend_from_slice(&[0x70, 0x5d]);
-        }
-        input.extend_from_slice(&string_table);
-        (input, survivors)
-    }
-
-    /// flameshow 1.1.4 indexes `sample_type[]` with a string-table index → the field must
-    /// go, and every neighbouring field must survive byte-for-byte
-    #[test]
-    fn the_default_sample_type_field_is_dropped_and_the_rest_copied_through() {
-        let (input, survivors) = profile_bytes(true);
-        assert_eq!(without_default_sample_type(&input).unwrap(), survivors);
-    }
-
-    /// Nothing to strip ⇒ nothing touched (a rewrite that is not a no-op here is a bug)
-    #[test]
-    fn a_profile_without_the_field_is_returned_verbatim() {
-        let (input, _) = profile_bytes(false);
-        assert_eq!(without_default_sample_type(&input).unwrap(), input);
-    }
-
-    /// Unparseable ⇒ `None` ⇒ caller keeps the original, never writes a truncated profile
-    #[test]
-    fn bytes_that_are_not_a_protobuf_message_yield_nothing() {
-        assert_eq!(without_default_sample_type(&[0x0a, 0xff, 0xff]), None);
     }
 
     #[test]

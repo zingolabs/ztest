@@ -286,3 +286,16 @@ mod tests {
         assert_eq!(pvc_io_reservation(&bps_only).io_iops, 0);
     }
 }
+
+/// Still holding capacity: anything not settled into `Succeeded`/`Failed`.
+///
+/// - Sole definition; the ledger's headroom subtraction, `assert_invariant` and the probe's
+///   `ClusterCapacity` must agree or admission double-counts a pod one of them cannot see
+/// - Unscheduled `Pending` counts: it is capacity already promised to a created pod, and
+///   under-counting it is the direction that overcommits a node
+pub fn pod_holds_capacity(pod: &k8s_openapi::api::core::v1::Pod) -> bool {
+    !matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+        Some("Succeeded") | Some("Failed")
+    )
+}

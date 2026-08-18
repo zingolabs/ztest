@@ -8,6 +8,7 @@
 //! - Callers resolve [`QosClass`] → [`QosProfile`] → an explicit [`scheduler::Request`],
 //!   keeping the scheduler decoupled from the const profile table
 
+pub mod beacon;
 pub mod ledger;
 pub mod live;
 pub mod schedule;
@@ -69,12 +70,20 @@ pub const GIB: u64 = 1024 * MIB;
 /// - Integer-only → packing is exact; dimensions independent ("fits" = fits every one)
 /// - I/O inert until calibrated (k8s exposes no I/O `allocatable`, so an uncalibrated
 ///   node's ceiling is seeded [`u64::MAX`] and admission matches the CPU×memory model)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Resources {
     pub cpu_milli: u64,
     pub mem_bytes: u64,
+    /// Inert dimensions omitted from the wire (`0` = the uncalibrated norm, on every
+    /// beacon ever written) rather than doubling every serialized footprint
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub io_bps: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub io_iops: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl Resources {
@@ -184,6 +193,43 @@ impl Resources {
     }
 }
 
+/// Display vocabulary. Lives on the type, not in `ui` — a formatter placed in a consumer
+/// gets re-invented once per consumer
+impl Resources {
+    pub fn cores(&self) -> f64 {
+        self.cpu_milli as f64 / 1000.0
+    }
+
+    pub fn gib(&self) -> f64 {
+        self.mem_bytes as f64 / GIB as f64
+    }
+
+    /// Dense cell `16c/30Gi`, integer — a per-row footprint column that repeats a decimal
+    /// buys nothing. Sub-gibibyte falls to `Mi`; sub-core keeps a decimal (`0.5c/512Mi`)
+    pub fn compact(&self) -> String {
+        let cpu = match self.cpu_milli {
+            m if m == 0 || m.is_multiple_of(1000) => format!("{}c", m / 1000),
+            m => format!("{:.1}c", m as f64 / 1000.0),
+        };
+        let mem = match self.mem_bytes {
+            b if b >= GIB => format!("{}Gi", b / GIB),
+            b => format!("{}Mi", b / MIB),
+        };
+        format!("{cpu}/{mem}")
+    }
+
+    /// `(cpu, mem)` fill against `whole`, each saturating at 100; a zero dimension in
+    /// `whole` yields 0 there rather than dividing. Callers pick `min` (binding constraint)
+    /// or `max` (fullness) — the two are different questions and neither is the default
+    pub fn ratio_pct(&self, whole: &Resources) -> (u8, u8) {
+        let frac = |p: u64, w: u64| match w {
+            0 => 0,
+            w => (p as u128 * 100 / w as u128).min(100) as u8,
+        };
+        (frac(self.cpu_milli, whole.cpu_milli), frac(self.mem_bytes, whole.mem_bytes))
+    }
+}
+
 /// `3c / 3 GiB`, `500m / 512 MiB`. I/O omitted (`0` pending calibration, no signal here)
 impl std::fmt::Display for Resources {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -263,8 +309,10 @@ impl Pool {
 
 /// Tiers a test may declare. `Ord` = declaration order = ascending priority (a stable
 /// `BTreeMap` key for grouping tests by tier during deterministic config lowering)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 pub enum QosClass {
+    /// Un-annotated tests land here (`docs/design-qos.md`)
+    #[default]
     Basic,
     Wallet,
     Integration,
@@ -508,6 +556,68 @@ pub fn current_profile() -> QosProfile {
 
 #[cfg(test)]
 mod tests {
+    /// Pins the tier table `docs/design-qos.md` publishes. It drifted once — the doc
+    /// claimed `integration 4c/2GiB` against a `3c/3GiB` profile — and nothing caught it
+    /// because no test read the table as data
+    #[test]
+    fn the_tier_table_matches_the_documented_footprints() {
+        let expect = [
+            (QosClass::Basic, 1_000, 512 * MIB, 2_000, GIB),
+            (QosClass::Wallet, 4_000, 2 * GIB, 8_000, 3 * GIB),
+            (QosClass::Integration, 3_000, 3 * GIB, 4_000, 4 * GIB),
+            (QosClass::Testnet, 8_000, 10 * GIB, 9_000, 11 * GIB),
+            (QosClass::Sync, 15_000, 15 * GIB, 16_000, 16 * GIB),
+        ];
+        for (class, cpu, mem, adm_cpu, adm_mem) in expect {
+            let p = class.profile();
+            assert_eq!(
+                (p.footprint.cpu_milli, p.footprint.mem_bytes),
+                (cpu, mem),
+                "{} components",
+                class.as_label()
+            );
+            assert_eq!(
+                (p.admitted().cpu_milli, p.admitted().mem_bytes),
+                (adm_cpu, adm_mem),
+                "{} admitted",
+                class.as_label()
+            );
+        }
+    }
+
+    /// Saturates rather than exceeding, and a zero denominator yields 0 instead of
+    /// dividing — both dimensions independently, so a caller can pick min or max
+    #[test]
+    fn ratio_pct_is_per_dimension_and_saturates() {
+        let limit = Resources::new(9_000, 24 * GIB, 0, 0);
+        let usage = Resources::new(594, 10_348 * MIB, 0, 0);
+        assert_eq!(usage.ratio_pct(&limit), (6, 42));
+        assert_eq!(Resources::new(20_000, 0, 0, 0).ratio_pct(&limit).0, 100, "clamped at 100");
+        assert_eq!(usage.ratio_pct(&Resources::ZERO), (0, 0), "no denominator, no division");
+    }
+
+    /// The dense per-row form: integer where the value is whole, and never a `0Gi` that
+    /// would report a footprint smaller than the pod it describes
+    #[test]
+    fn compact_is_integer_but_never_rounds_a_footprint_to_nothing() {
+        assert_eq!(Resources::new(15_000, 15 * GIB, 0, 0).compact(), "15c/15Gi");
+        assert_eq!(Resources::new(1_000, 512 * MIB, 0, 0).compact(), "1c/512Mi");
+        assert_eq!(Resources::new(500, 512 * MIB, 0, 0).compact(), "0.5c/512Mi");
+        assert_eq!(Resources::ZERO.compact(), "0c/0Mi");
+    }
+
+    /// The I/O pair is inert on every beacon ever written; carrying it would double each
+    /// serialized footprint for two zeroes
+    #[test]
+    fn serialized_resources_omit_the_uncalibrated_io_dimensions() {
+        let json = serde_json::to_string(&Resources::new(3_000, GIB, 0, 0)).expect("serialize");
+        assert_eq!(json, r#"{"cpu_milli":3000,"mem_bytes":1073741824}"#);
+        assert_eq!(
+            serde_json::from_str::<Resources>(&json).expect("round-trips"),
+            Resources::new(3_000, GIB, 0, 0)
+        );
+    }
+
     use super::*;
 
     // Resources: the 4-D packing primitive. Every dimension gates; arithmetic exact per one.

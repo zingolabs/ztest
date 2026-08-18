@@ -48,7 +48,7 @@ pub(crate) enum SyncEvent {
         detail: String,
     },
     Finished {
-        verdict: String,
+        verdict: super::SyncVerdict,
         violations: usize,
         coverage_gaps: usize,
         ticks: u64,
@@ -71,7 +71,7 @@ pub(crate) struct Tick {
     pub height: u32,
     pub target: Option<u32>,
     pub pct: f32,
-    pub phase: String,
+    pub phase: super::Phase,
     pub reorg_depth: u32,
     #[serde(default)]
     pub work: Work,
@@ -86,7 +86,7 @@ impl Tick {
             height: snap.height(),
             target: snap.target(),
             pct: snap.pct(),
-            phase: snap.phase().as_str().to_string(),
+            phase: snap.phase(),
             reorg_depth: snap.reorg_depth(),
             work: snap.work(),
         }
@@ -200,7 +200,7 @@ mod tests {
             height: 901,
             target: Some(1024),
             pct: 88.1,
-            phase: "Scanning".into(),
+            phase: crate::sync::Phase::Historic,
             reorg_depth: 0,
             work: {
                 let mut w = Work::ZERO;

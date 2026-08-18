@@ -141,6 +141,16 @@ fn report(outcome: &Outcome, dry_run: bool) -> Result<(), String> {
         );
     }
 
+    if !outcome.reports.is_empty() {
+        let verb = if dry_run { "would delete" } else { "deleted" };
+        eprintln!(
+            "  {} {verb:<11} {:<16} {}",
+            "✓".green(),
+            "sync reports",
+            format_args!("({} verdict(s))", outcome.reports.len()).dimmed(),
+        );
+    }
+
     // "retired", never "purged" (no delete API — Pyroscope's own cleaner does it, later)
     if !outcome.retired.is_empty() {
         let verb = if dry_run { "would retire" } else { "retired" };

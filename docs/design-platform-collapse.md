@@ -172,6 +172,10 @@ BuildKit endpoint — capability, not identity.
 **Metrics** — unchanged CRD (`PodMonitor`); only the consumer changes from
 OpenShift UWM to prometheus-operator.
 
+> **Superseded.** The in-process push described below was replaced by an out-of-process
+> eBPF collector: no cargo feature, no `ZTEST_PROFILE_*` variables, no component contract.
+> See [how-to-profile.md](how-to-profile.md) for what shipped.
+
 **Profiles** — components push to Pyroscope. Contract collapses to one runtime
 switch:
 
@@ -184,9 +188,9 @@ switch:
 
 Mid-run profiling becomes the default rather than a feature, profiles outlive the
 namespace, and a component killed by OOM no longer loses everything. `perf.rs`
-keeps its whole reader half — `HIDE_SCAFFOLDING`, `report_elision`, viewer
-discovery, `--raw`, and the `Segment` throughput table — and swaps only its
-retrieval backend. `--window 11h..12h` keeps its elapsed-since-run-start framing
+keeps its reader half — viewer discovery and the `Segment` throughput table — and
+swaps only its retrieval backend. Post-`go`-removal it applies no pprof transform
+at all: what Pyroscope serves for the window is what lands on disk. `--window 11h..12h` keeps its elapsed-since-run-start framing
 and stops being cadence-limited.
 
 pprof-rs remains the sampler, so the C/C++ blind spot (RocksDB, LMDB) is

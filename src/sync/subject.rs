@@ -5,6 +5,7 @@
 //! - Yields a raw per-tick [`ProgressView`], folded into a [`Snapshot`](crate::sync::Snapshot)
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::RpcError;
 use crate::handles::wallet::PoolBalances;
@@ -17,7 +18,7 @@ use super::work::{Op, Work};
 /// - Wallet: from pepper-sync `ScanPriority` (`Historic` ← `{Historic, OpenAdjacent,
 ///   Scanning}`, `Finalizing` ← `{RefetchingNullifiers, ScannedWithoutMapping}`, rest by name)
 /// - Validator: from the headers-vs-blocks download split
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Starting,
     Verifying,
@@ -29,20 +30,11 @@ pub enum Phase {
     Done,
 }
 
-impl Phase {
-    /// Display/wire tag. Explicit, not `Debug` (crosses the driver→controller stream, where
-    /// a rename would silently change what a running sync publishes)
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Phase::Starting => "Starting",
-            Phase::Verifying => "Verifying",
-            Phase::ChainTip => "ChainTip",
-            Phase::FoundNote => "FoundNote",
-            Phase::Historic => "Historic",
-            Phase::Finalizing => "Finalizing",
-            Phase::Downloading => "Downloading",
-            Phase::Done => "Done",
-        }
+/// Variant name = the wire tag = the rendered word, one definition (serde derives the
+/// same names) — a rename changes what a running driver publishes
+impl std::fmt::Display for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
     }
 }
 

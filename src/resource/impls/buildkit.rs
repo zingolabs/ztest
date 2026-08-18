@@ -55,12 +55,9 @@ pub(crate) const WORK_MOUNT: &str = "/build";
 /// Persisting it is what makes an ephemeral pod viable — cache mounts are
 /// builder-local and no registry cache backend exports them
 const BUILDKIT_STATE_DIR: &str = "/home/user/.local/share/buildkit";
-/// StorageClass for the cache PVC. `None` omits the field → cluster default (the
-/// only portable choice; a named class strands the PVC `Pending` elsewhere).
-/// `ZTEST_BUILDKIT_STORAGE_CLASS` pins a faster one
-fn storage_class() -> Option<String> {
-    std::env::var("ZTEST_BUILDKIT_STORAGE_CLASS").ok().filter(|s| !s.trim().is_empty())
-}
+/// Escape hatch for the cache PVC; absent = the profile's `storage_driver`
+/// (see [`crate::resource::impls::storage::plain_class`])
+const CACHE_CLASS_ENV: &str = "ZTEST_BUILDKIT_STORAGE_CLASS";
 
 fn cache_size() -> String {
     std::env::var("ZTEST_BUILDKIT_CACHE_SIZE")
@@ -409,7 +406,7 @@ impl Provider for BuildkitProvider {
             "accessModes": ["ReadWriteOnce"],
             "resources": { "requests": { "storage": cache_size() } },
         });
-        if let Some(class) = storage_class() {
+        if let Some(class) = super::storage::plain_class(&cx.client, CACHE_CLASS_ENV).await {
             spec["storageClassName"] = json!(class);
         }
         let pvc: PersistentVolumeClaim = serde_json::from_value(json!({

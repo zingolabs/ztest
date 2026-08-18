@@ -59,11 +59,10 @@ const PYROSCOPE_IMAGE: &str = "grafana/pyroscope:2.2.1";
 const PROMETHEUS_IMAGE: &str = "prom/prometheus:v3.13.2";
 const GRAFANA_IMAGE: &str = "grafana/grafana:13.0.6";
 
-/// `None`, never a default (a named class strands the PVC `Pending` on every cluster
-/// spelling its default differently)
-fn storage_class() -> Option<String> {
-    std::env::var("ZTEST_OBS_STORAGE_CLASS").ok().filter(|s| !s.trim().is_empty())
-}
+/// Escape hatch; absent = the profile's `storage_driver` (see [`storage::plain_class`]).
+/// Pyroscope's metastore commits a Raft log synchronously, so a slow class here is an outage,
+/// not a slowdown
+const OBS_CLASS_ENV: &str = "ZTEST_OBS_STORAGE_CLASS";
 
 fn volume_size(key: &str, default: &str) -> String {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| default.to_string())
@@ -346,7 +345,7 @@ fn config_map(name: &str, key: &str, contents: String) -> ConfigMap {
     }
 }
 
-fn pvc(name: &str, size: &str) -> PersistentVolumeClaim {
+fn pvc(name: &str, size: &str, class: Option<&str>) -> PersistentVolumeClaim {
     PersistentVolumeClaim {
         metadata: meta(name),
         spec: Some(PersistentVolumeClaimSpec {
@@ -355,7 +354,7 @@ fn pvc(name: &str, size: &str) -> PersistentVolumeClaim {
                 requests: Some(BTreeMap::from([("storage".into(), Quantity(size.into()))])),
                 ..Default::default()
             }),
-            storage_class_name: storage_class(),
+            storage_class_name: class.map(str::to_string),
             ..Default::default()
         }),
         ..Default::default()
@@ -364,10 +363,20 @@ fn pvc(name: &str, size: &str) -> PersistentVolumeClaim {
 
 /// Every Service here is the same shape: ClusterIP onto the one named container port
 fn service(name: &str, app: &str, port: u16) -> Service {
+    typed_service(name, app, port, None)
+}
+
+/// `service_type = Some("NodePort")` exposes it on every node's address.
+///
+/// - Pyroscope on a nested kubelet: the collector runs on the workstation and cannot resolve
+///   a ClusterIP, so the push target must survive leaving the cluster network
+/// - ClusterIP keeps working either way → in-cluster pushers are unaffected
+fn typed_service(name: &str, app: &str, port: u16, service_type: Option<&str>) -> Service {
     Service {
         metadata: ObjectMeta { labels: Some(app_labels(app)), ..meta(name) },
         spec: Some(ServiceSpec {
             selector: Some(app_labels(app)),
+            type_: service_type.map(str::to_string),
             ports: Some(vec![ServicePort {
                 name: Some(HTTP_PORT.into()),
                 port: port as i32,
@@ -433,6 +442,14 @@ fn probe(path: &str, initial_delay: i32) -> Probe {
         period_seconds: Some(5),
         ..Default::default()
     }
+}
+
+/// Restart only on *sustained* unreadiness (5 min), never a blip.
+///
+/// - Metastore can wedge holding leadership over itself → delisted, never recovered
+/// - Slack on purpose: readiness flaps during compaction, and a restart there costs the run
+fn sustained_liveness(path: &str, initial_delay: i32) -> Probe {
+    Probe { period_seconds: Some(30), failure_threshold: Some(10), ..probe(path, initial_delay) }
 }
 
 fn resources(cpu: (&str, &str), memory: (&str, &str)) -> ResourceRequirements {
@@ -569,6 +586,7 @@ fn pyroscope_deployment() -> Deployment {
             args: Some(pyroscope_args()),
             ports: Some(vec![port(PYROSCOPE_PORT)]),
             readiness_probe: Some(probe("/ready", 10)),
+            liveness_probe: Some(sustained_liveness("/ready", 60)),
             resources: Some(resources(("200m", "2"), ("512Mi", "4Gi"))),
             volume_mounts: Some(vec![
                 mount("config", "/etc/pyroscope"),
@@ -687,15 +705,31 @@ async fn apply_stack(cx: &Cx) -> Result<(), String> {
     // would drop every retirement it has written
     seed_overrides(&config_maps).await?;
 
-    apply(&claims, &pvc(&format!("{PROMETHEUS_SERVICE}-data"), &prometheus_size()), WHAT).await?;
-    apply(&claims, &pvc(&format!("{PYROSCOPE_SERVICE}-data"), &pyroscope_size()), WHAT).await?;
+    // One resolution for both: a split here is how a stack ends up half on a test driver
+    let class = super::storage::plain_class(client, OBS_CLASS_ENV).await;
+    let class = class.as_deref();
+    apply(&claims, &pvc(&format!("{PROMETHEUS_SERVICE}-data"), &prometheus_size(), class), WHAT)
+        .await?;
+    apply(&claims, &pvc(&format!("{PYROSCOPE_SERVICE}-data"), &pyroscope_size(), class), WHAT)
+        .await?;
 
     apply(&deployments, &prometheus_deployment(), WHAT).await?;
     apply(&deployments, &pyroscope_deployment(), WHAT).await?;
     apply(&deployments, &grafana_deployment(), WHAT).await?;
 
     apply(&services, &service(PROMETHEUS_SERVICE, "prometheus", PROMETHEUS_PORT), WHAT).await?;
-    apply(&services, &service(PYROSCOPE_SERVICE, "pyroscope", PYROSCOPE_PORT), WHAT).await?;
+    // Nested kubelet ⇒ the collector is off-cluster (see `profiling::ebpf::Placement`), so it
+    // needs a node-reachable push target provisioned here rather than promoted mid-run
+    let pyroscope_type = match crate::profiling::ebpf::placement_for(client).await {
+        crate::profiling::ebpf::Placement::Host => Some("NodePort"),
+        crate::profiling::ebpf::Placement::Sidecar => None,
+    };
+    apply(
+        &services,
+        &typed_service(PYROSCOPE_SERVICE, "pyroscope", PYROSCOPE_PORT, pyroscope_type),
+        WHAT,
+    )
+    .await?;
     apply(&services, &service(GRAFANA_SERVICE, "grafana", GRAFANA_PORT), WHAT).await
 }
 
@@ -1103,6 +1137,17 @@ mod tests {
         assert!(parsed.overrides.is_empty());
     }
 
+    /// Readiness alone leaves a wedged metastore delisted forever (nothing else restarts it)
+    #[test]
+    fn pyroscope_restarts_itself_when_wedged() {
+        let spec = pyroscope_deployment().spec.unwrap().template.spec.unwrap();
+        let container = &spec.containers[0];
+        let liveness = container.liveness_probe.clone().expect("pyroscope needs a liveness probe");
+        let period = liveness.period_seconds.unwrap() * liveness.failure_threshold.unwrap();
+        assert!(period >= 240, "restart must need sustained failure, not a blip: {period}s");
+        assert!(container.readiness_probe.is_some());
+    }
+
     /// Profiles *and* metastore state on the one PVC (else a restart cannot index them)
     #[test]
     fn pyroscope_stores_everything_on_its_volume() {
@@ -1115,10 +1160,13 @@ mod tests {
         }
     }
 
+    /// Unresolvable driver must still provision (cluster default), never strand `Pending`
     #[test]
-    fn an_unset_storage_class_omits_the_field() {
-        // SAFETY: single-threaded section, no other thread reads env here
-        unsafe { std::env::remove_var("ZTEST_OBS_STORAGE_CLASS") };
-        assert_eq!(pvc("any", "20Gi").spec.expect("spec").storage_class_name, None);
+    fn an_unresolved_storage_class_omits_the_field() {
+        assert_eq!(pvc("any", "20Gi", None).spec.expect("spec").storage_class_name, None);
+        assert_eq!(
+            pvc("any", "20Gi", Some("topolvm-thin")).spec.expect("spec").storage_class_name,
+            Some("topolvm-thin".to_string())
+        );
     }
 }

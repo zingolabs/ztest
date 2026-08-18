@@ -22,13 +22,19 @@ Authors annotate a test with one of five attribute macros (snake_case path):
 #[ztest::qos::testnet] #[ztest::qos::sync]
 ```
 
-| Tier          | Hard cap | Reserve CPU | Reserve RAM | Scheduling                           |
-|---------------|----------|-------------|-------------|--------------------------------------|
-| `basic`       | 60 s     | 1 core      | 512 MiB     | general pool                         |
-| `wallet`      | 10 min   | 4 cores     | 1 GiB       | general pool                         |
-| `integration` | 10 min   | 4 cores     | 2 GiB       | general pool                         |
-| `testnet`     | 6 h      | 8 cores     | 12 GiB      | general pool                         |
-| `sync`        | 48 h     | 16 cores    | 32 GiB      | NVMe node-selector + toleration      |
+| Tier          | Hard cap | Components   | Runner      | Admitted     | Scheduling                      |
+|---------------|----------|--------------|-------------|--------------|---------------------------------|
+| `basic`       | 60 s     | 1c / 512 MiB | 1c / 512MiB | 2c / 1 GiB   | general pool                    |
+| `wallet`      | 10 min   | 4c / 2 GiB   | 4c / 1 GiB  | 8c / 3 GiB   | general pool                    |
+| `integration` | 10 min   | 3c / 3 GiB   | 1c / 1 GiB  | 4c / 4 GiB   | general pool                    |
+| `testnet`     | 6 h      | 8c / 10 GiB  | 1c / 1 GiB  | 9c / 11 GiB  | general pool                    |
+| `sync`        | 48 h     | 15c / 15 GiB | 1c / 1 GiB  | 16c / 16 GiB | NVMe node-selector + toleration |
+
+*Components* = `QosProfile::footprint`, the component-pod aggregate and the
+only overridable column. *Admitted* = `footprint + runner` — what admission,
+the lease and the namespace quota all charge. `wallet`'s runner is heavy
+because the in-process wallet runs there; every other tier's runner only
+orchestrates.
 
 - Caps (timeouts) and per-tier CPU/RAM reserves are locked in the
   `QosClass::profile` const table. Priority ascends with tier order; `wallet`

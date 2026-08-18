@@ -10,9 +10,12 @@
 //!   there, so no per-run RBAC
 //! - Covers what shares the driver's node — `ztest sync perf` names any component that
 //!   did not, rather than reporting an empty profile
+//! - [`Placement`] tracks kubelet nesting: eBPF's initial-namespace pids are unresolvable from
+//!   a pod under kind's node container, so there the collector runs host-side instead
 //! - Emits `component`/`namespace` matching [`super::selector`], so `ztest sync perf` reads
 //!   an eBPF profile and an in-process one through the same query
 
+use super::host::HOST_KUBECONFIG;
 use k8s_openapi::api::core::v1::{
     AppArmorProfile, ConfigMap, ConfigMapVolumeSource, Container, EnvVar, EnvVarSource,
     HostPathVolumeSource, ObjectFieldSelector, ResourceRequirements, SecurityContext, Volume,
@@ -25,9 +28,48 @@ use std::collections::BTreeMap;
 /// Sidecar container name; also what `ztest sync perf` reads back to prove profiling was on
 pub(crate) const CONTAINER: &str = "ebpf-profiler";
 
+/// Port Alloy serves `/metrics` on, both placements. Never published to a fixed *host* port:
+/// docker allocates one per host collector ([`super::host::metrics_port`] reads it back), so
+/// two syncs cannot collide
+pub(crate) const HTTP_PORT: u16 = 12345;
+
 /// Pinned to the version validated on-cluster (a moved tag's `ImagePullBackOff` surfaces
 /// as "the run produced no profile", three layers from its cause)
-const ALLOY_IMAGE: &str = "grafana/alloy:v1.18.1";
+pub(crate) const ALLOY_IMAGE: &str = "grafana/alloy:v1.18.1";
+
+/// Which pid namespace the collector observes from. Same image, same `.eh_frame` unwinder
+/// either way — placement is the only variable.
+///
+/// - eBPF reports *initial*-namespace pids; resolving them needs a `/proc` that numbers them
+/// - `Sidecar`: `hostPID` on the driver = the node's namespace = the initial one
+/// - `Host`: a nested kubelet (kind's node is a container) puts every pod one level below the
+///   initial namespace, where no privilege can name those pids → collector runs beside dockerd
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Placement {
+    Sidecar,
+    Host,
+}
+
+/// `providerID` schemes whose node is itself a container. Only kind is listed: `k3s://` also
+/// covers bare-metal k3s, so matching it would relocate clusters that profile fine
+const NESTED_PROVIDERS: [&str; 1] = ["kind://"];
+
+/// `Host` when the kubelet is nested, else `Sidecar` (an unreadable node = `Sidecar`: a probe
+/// failure should not silently move every run's collector off-cluster)
+pub(crate) async fn placement_for(client: &kube::Client) -> Placement {
+    use k8s_openapi::api::core::v1::Node;
+    let nodes: kube::Api<Node> = kube::Api::all(client.clone());
+    let nested = async {
+        let list = nodes.list(&kube::api::ListParams::default().limit(1)).await.ok()?;
+        let id = list.items.first()?.spec.as_ref()?.provider_id.clone()?;
+        Some(NESTED_PROVIDERS.iter().any(|scheme| id.starts_with(scheme)))
+    }
+    .await;
+    match nested {
+        Some(true) => Placement::Host,
+        _ => Placement::Sidecar,
+    }
+}
 
 /// Guaranteed QoS is a hard invariant for ztest pods (see `manifest::pod_is_guaranteed`);
 /// added to the tier's `runner` reserve so the driver's total stays covered
@@ -38,13 +80,18 @@ pub(crate) fn resources() -> crate::qos::Resources {
     crate::qos::Resources::new(CPU_MILLI, MEM_BYTES, 0, 0)
 }
 
-/// Off-CPU sampling probability. Non-zero = blocked time captured (`0` = on-CPU only, the
-/// upstream default), which is the whole reason a profile can attribute I/O stall at all
-const OFF_CPU_THRESHOLD: f64 = 1.0;
+/// Off-CPU sample probability (the configured value *is* `p`; upstream default `0` =
+/// on-CPU only). Non-zero buys blocked-time attribution, the half of a sync profile that
+/// explains I/O stall.
+///
+/// Thinned hard on purpose: one trace event per *scheduler switch*, into a fixed-size
+/// per-CPU perf ring. At `1.0` a busy sync overran it by ~12k events/s — every trace
+/// dropped, profile empty, collector idle at 14% of its CPU limit. Raise only while
+/// `ztest sync perf` still reports 0 dropped
+pub(crate) const DEFAULT_OFF_CPU: f64 = 0.05;
 
-/// `pyroscope.ebpf` default is 19; matched to the in-process contract instead so a profile
-/// taken before and after the collector swap carries comparable sample density
-pub(crate) const DEFAULT_HZ: u32 = 100;
+/// Upstream default. Deviating costs ring headroom that off-CPU events also draw on
+pub(crate) const DEFAULT_HZ: u32 = 19;
 
 /// Collector for one run's namespace, pushing under one tenant.
 pub(crate) struct Collector {
@@ -52,7 +99,11 @@ pub(crate) struct Collector {
     pub tenant: String,
     pub push_url: String,
     pub hz: u32,
+    pub off_cpu: f64,
     pub config_map: String,
+    pub placement: Placement,
+    /// `Host` only: discovery talks to the apiserver over the network, not a mounted SA token
+    pub api_server: Option<String>,
 }
 
 impl Collector {
@@ -63,14 +114,48 @@ impl Collector {
         sync_id: &str,
         namespace: &str,
         hz: u32,
+        off_cpu: f64,
     ) -> Option<Collector> {
+        let placement = placement_for(client).await;
+        // Push target follows placement: a host collector cannot resolve a ClusterIP
+        let (push_url, api_server) = match placement {
+            Placement::Sidecar => (super::push_url(client).await?, None),
+            Placement::Host => {
+                (super::node_push_url(client).await?, Some(super::node_api_server(client).await?))
+            }
+        };
         Some(Collector {
             namespace: namespace.to_string(),
             tenant: super::tenant(&crate::naming::current_user(), sync_id),
-            push_url: super::push_url(client).await?,
+            push_url,
             hz,
+            off_cpu,
             config_map: crate::cli::sync::profiler_config_name(sync_id),
+            placement,
+            api_server,
         })
+    }
+
+    /// Pod discovery, scoped to the run either way.
+    ///
+    /// - `Sidecar`: in-cluster (SA token), pinned to its own node — a sidecar sees no other
+    /// - `Host`: apiserver over the network + mounted kubeconfig; no node selector (the
+    ///   collector is off-cluster, so `NODE_NAME` has nothing to resolve against)
+    fn discovery(&self) -> String {
+        let namespace = &self.namespace;
+        let scope =
+            format!("  role = \"pod\"\n  namespaces {{\n    names = [\"{namespace}\"]\n  }}");
+        match (&self.placement, &self.api_server) {
+            (Placement::Host, Some(api)) => format!(
+                "discovery.kubernetes \"run_pods\" {{\n{scope}\n  \
+                 api_server      = \"{api}\"\n  \
+                 kubeconfig_file = \"{HOST_KUBECONFIG}\"\n}}"
+            ),
+            _ => format!(
+                "discovery.kubernetes \"run_pods\" {{\n{scope}\n  selectors {{\n    \
+                 role  = \"pod\"\n    field = \"spec.nodeName=\" + sys.env(\"NODE_NAME\")\n  }}\n}}"
+            ),
+        }
     }
 
     /// Alloy river config.
@@ -83,22 +168,14 @@ impl Collector {
     /// - `demangle` defaults to `none` upstream → C++ frames arrive as raw `_ZN…` symbols
     fn config(&self) -> String {
         let hz = self.hz;
-        let namespace = &self.namespace;
+        let off_cpu = self.off_cpu;
         let url = &self.push_url;
         let tenant = &self.tenant;
         let sync_id_label = label_var(crate::sync::SYNC_ID_KEY);
+        let discovery = self.discovery();
         format!(
             r#"
-discovery.kubernetes "run_pods" {{
-  role = "pod"
-  namespaces {{
-    names = ["{namespace}"]
-  }}
-  selectors {{
-    role  = "pod"
-    field = "spec.nodeName=" + sys.env("NODE_NAME")
-  }}
-}}
+{discovery}
 
 discovery.relabel "targets" {{
   targets = discovery.kubernetes.run_pods.targets
@@ -147,7 +224,7 @@ pyroscope.ebpf "run" {{
   forward_to        = [pyroscope.write.store.receiver]
   demangle          = "full"
   sample_rate       = {hz}
-  off_cpu_threshold = {OFF_CPU_THRESHOLD}
+  off_cpu_threshold = {off_cpu}
 }}
 
 pyroscope.write "store" {{
@@ -160,6 +237,11 @@ pyroscope.write "store" {{
 }}
 "#
         )
+    }
+
+    /// Rendered config for a host-placed collector, which reads a file rather than a mount
+    pub(crate) fn host_config(&self) -> String {
+        self.config()
     }
 
     /// Lives beside the driver in [`RUN_NAMESPACE`](crate::resource::impls::policy::RUN_NAMESPACE);
@@ -200,7 +282,7 @@ pyroscope.write "store" {{
                     "run",
                     "/etc/alloy/config.alloy",
                     "--storage.path=/tmp/alloy",
-                    "--server.http.listen-addr=0.0.0.0:12345",
+                    &format!("--server.http.listen-addr=0.0.0.0:{HTTP_PORT}"),
                 ]
                 .iter()
                 .map(|a| a.to_string())
@@ -284,14 +366,45 @@ fn mount(name: &str, path: &str) -> VolumeMount {
 mod tests {
     use super::*;
 
-    fn collector() -> Collector {
+    fn collector_on(placement: Placement) -> Collector {
         Collector {
             namespace: "ztest-sync-abc".into(),
             tenant: "ztest.eli.sync-123".into(),
             push_url: "http://ztest-pyroscope.ztest-obs.svc:4040".into(),
             hz: DEFAULT_HZ,
+            off_cpu: DEFAULT_OFF_CPU,
             config_map: "ztest-sync-abc-profiler".into(),
+            placement,
+            api_server: match placement {
+                Placement::Host => Some("https://127.0.0.1:6443".to_string()),
+                Placement::Sidecar => None,
+            },
         }
+    }
+
+    fn collector() -> Collector {
+        collector_on(Placement::Sidecar)
+    }
+
+    /// Host placement must not emit a node selector: `NODE_NAME` resolves to nothing
+    /// off-cluster, and the selector would match zero pods rather than error
+    #[test]
+    fn host_placement_discovers_over_the_apiserver() {
+        let host = collector_on(Placement::Host).config();
+        assert!(host.contains("api_server"), "{host}");
+        assert!(host.contains("kubeconfig_file"), "{host}");
+        assert!(!host.contains("NODE_NAME"), "{host}");
+
+        let sidecar = collector_on(Placement::Sidecar).config();
+        assert!(sidecar.contains("NODE_NAME"), "{sidecar}");
+        assert!(!sidecar.contains("api_server"), "{sidecar}");
+    }
+
+    /// One image either way: placement moves the collector, it does not change the engine
+    #[test]
+    fn both_placements_share_one_image() {
+        assert_eq!(collector().container().image.unwrap(), ALLOY_IMAGE);
+        assert!(collector_on(Placement::Host).config().contains("off_cpu_threshold"));
     }
 
     #[test]
@@ -337,9 +450,19 @@ mod tests {
         assert!(rule.contains(r#"replacement   = "$1""#), "{rule}");
     }
 
+    /// Off-CPU stays on (it is the half that explains I/O stall) but well under `1.0`,
+    /// which overran the perf ring and dropped every trace
     #[test]
-    fn config_captures_off_cpu_time() {
-        assert!(!collector().config().contains("off_cpu_threshold = 0\n"));
+    fn config_captures_off_cpu_time_without_saturating_the_ring() {
+        assert!(collector().config().contains(&format!("off_cpu_threshold = {DEFAULT_OFF_CPU}")));
+        const { assert!(DEFAULT_OFF_CPU > 0.0 && DEFAULT_OFF_CPU <= 0.1) };
+    }
+
+    /// Upstream default; raising it draws on the same ring the off-CPU events fill
+    #[test]
+    fn sample_rate_matches_the_documented_default() {
+        assert_eq!(DEFAULT_HZ, 19);
+        assert!(collector().config().contains("sample_rate       = 19"));
     }
 
     #[test]

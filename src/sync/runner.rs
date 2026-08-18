@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
 use crate::cancel::Cancel;
@@ -29,9 +30,12 @@ pub const DEFAULT_TICK: Duration = Duration::from_secs(5);
 /// lag pod-Ready by a scrape)
 const WORK_PREFLIGHT_ATTEMPTS: u32 = 3;
 
+/// Terminal result of a run, sole vocabulary for one ([`SyncStatus`] wraps it with the
+/// pre-terminal states rather than restating them).
+///
 /// - `Passed` = tip reached, every fatal invariant intact, every `sometimes` probe triggered
 /// - `Errored` = probe or harness failure, not a verdict about the subject
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncVerdict {
     Passed,
     Failed,
@@ -43,6 +47,14 @@ pub enum SyncVerdict {
 impl SyncVerdict {
     pub fn is_pass(&self) -> bool {
         matches!(self, SyncVerdict::Passed)
+    }
+}
+
+/// Variant name = the wire tag = the rendered word, one definition (serde derives the
+/// same names) — a rename changes what a running driver publishes
+impl std::fmt::Display for SyncVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
     }
 }
 

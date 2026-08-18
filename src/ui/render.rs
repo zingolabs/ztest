@@ -186,8 +186,8 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
             "Scheduling".style(theme.styles.pass),
             total_tests.style(theme.styles.count),
             plan.waves.style(theme.styles.count),
-            agg_str(&plan.peak).style(theme.styles.count),
-            agg_str(&plan.total).style(theme.styles.count),
+            plan.peak.style(theme.styles.count),
+            plan.total.style(theme.styles.count),
             width = LABEL_WIDTH,
         )
         .expect("write to string"),
@@ -196,7 +196,7 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
             "{:>width$} {} tests {dot} {} reserved total {dot} capacity unknown (probe unavailable)",
             "Scheduling".style(theme.styles.pass),
             total_tests.style(theme.styles.count),
-            agg_str(&plan.total).style(theme.styles.count),
+            plan.total.style(theme.styles.count),
             width = LABEL_WIDTH,
         )
         .expect("write to string"),
@@ -231,16 +231,6 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
         )
         .expect("write to string");
     }
-
-    // Deferred §8 half: would poll the ledger during the run
-    writeln!(
-        out,
-        "{INDENT}{:<width$} {dot} {}",
-        "reservation".style(theme.styles.dim),
-        "live view during run (pending)".style(theme.styles.dim),
-        width = name_col,
-    )
-    .expect("write to string");
 }
 
 /// During-run progress, tallied by the run loop (`cli::console`) from relayed
@@ -281,7 +271,7 @@ pub fn render_live_panel(
         "capacity unknown (probe unavailable)".to_string()
     } else {
         let bar = meter(used_percent(&snapshot.committed, free), theme);
-        format!("{bar} of {} free", agg_str(free).style(theme.styles.count))
+        format!("{bar} of {} free", free.style(theme.styles.count))
     };
     writeln!(
         out,
@@ -289,7 +279,7 @@ pub fn render_live_panel(
         "Running".style(theme.styles.pass),
         spin.style(theme.styles.count),
         snapshot.total_running().style(theme.styles.count),
-        agg_str(&snapshot.committed).style(theme.styles.count),
+        snapshot.committed.style(theme.styles.count),
         width = LABEL_WIDTH,
     )
     .expect("write to string");
@@ -403,7 +393,7 @@ pub fn render_preflight_panel(
                 "Scheduling".style(theme.styles.pass),
                 total_tests.style(theme.styles.count),
                 plan.waves.style(theme.styles.count),
-                agg_str(&plan.peak).style(theme.styles.count),
+                plan.peak.style(theme.styles.count),
                 width = LABEL_WIDTH,
             ),
             None => writeln!(
@@ -1277,8 +1267,6 @@ mod tests {
             s.contains("sync needs 16c / 16 GiB") && s.contains("will be rejected"),
             "missing unschedulable warning:\n{s}"
         );
-        // Deferred live-view note
-        assert!(s.contains("live view during run (pending)"), "got:\n{s}");
     }
 
     #[test]
@@ -1300,7 +1288,6 @@ mod tests {
                 (QosClass::Basic, TierLive { count: 2, reserve: Resources::new(1_000, GIB, 0, 0) }),
             ]),
             committed: Resources::new(9_000, 17 * GIB, 0, 0),
-            by_sa: BTreeMap::new(),
         };
         let progress = RunProgress {
             elapsed: std::time::Duration::from_secs(42),
@@ -1438,7 +1425,7 @@ mod tests {
             height: 901,
             target: Some(1024),
             pct: 88.1,
-            phase: "Historic".into(),
+            phase: Some(crate::sync::Phase::Historic),
             reorg_depth: 0,
             pace: Some(crate::rate::Pace {
                 per_sec: 12.4,

@@ -18,7 +18,21 @@ pub struct TierLive {
 pub struct LiveSnapshot {
     pub running: BTreeMap<QosClass, TierLive>,
     pub committed: Resources,
-    pub by_sa: BTreeMap<String, Resources>,
+}
+
+/// Group running work by tier. Sole fold — the live panel walks `WorkItem`s and
+/// `ztest status` walks decoded `RunningTest`s, and the two must not be able to disagree
+/// about what is running
+pub fn tier_tally(
+    running: impl IntoIterator<Item = (QosClass, Resources)>,
+) -> BTreeMap<QosClass, TierLive> {
+    let mut tiers: BTreeMap<QosClass, TierLive> = BTreeMap::new();
+    for (class, footprint) in running {
+        let e = tiers.entry(class).or_default();
+        e.count += 1;
+        e.reserve = e.reserve.saturating_add(&footprint);
+    }
+    tiers
 }
 
 impl LiveSnapshot {

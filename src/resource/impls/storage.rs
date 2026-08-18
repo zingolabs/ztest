@@ -144,6 +144,20 @@ pub async fn selected(client: &kube::Client) -> Result<&'static StorageOption, S
         .await
 }
 
+/// Class for a ztest-created PVC that does *not* need snapshots (observability, buildkit
+/// cache): the profile's `storage_driver`, so one cluster = one class.
+///
+/// - `escape` (component env var) wins → a cluster whose stack must sit elsewhere
+/// - Unresolvable driver → `None` = cluster default: snapshot capability is the seed path's
+///   requirement, and a cluster lacking it still wants the rest of the stack provisioned
+/// - Class is immutable once bound, so this only steers PVCs at create time
+pub async fn plain_class(client: &kube::Client, escape: &str) -> Option<String> {
+    if let Some(pinned) = std::env::var(escape).ok().filter(|s| !s.trim().is_empty()) {
+        return Some(pinned);
+    }
+    selected(client).await.ok().map(|o| o.class_name.clone())
+}
+
 fn available(options: &[StorageOption]) -> String {
     if options.is_empty() {
         return "(none)".to_string();

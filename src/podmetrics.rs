@@ -76,21 +76,6 @@ pub struct PodLoad {
     pub limit: Option<Resources>,
 }
 
-impl PodLoad {
-    /// Binding-dimension fullness in `0..=100`, `None` without a limit
-    pub fn cpu_pct(&self) -> Option<u8> {
-        pct(self.usage.cpu_milli, self.limit.as_ref()?.cpu_milli)
-    }
-
-    pub fn mem_pct(&self) -> Option<u8> {
-        pct(self.usage.mem_bytes, self.limit.as_ref()?.mem_bytes)
-    }
-}
-
-fn pct(part: u64, whole: u64) -> Option<u8> {
-    (whole > 0).then(|| ((part as u128 * 100) / whole as u128).min(100) as u8)
-}
-
 /// Every pod in `namespace`, usage joined to its declared limit.
 ///
 /// - Sorted by name: the panel's row order must not shuffle between samples
@@ -172,31 +157,5 @@ mod tests {
         let total = containers_total(&metrics("p", &[("100m", "1Gi"), ("250m", "512Mi")]));
         assert_eq!(total.cpu_milli, 350);
         assert_eq!(total.mem_bytes, GIB + 512 * 1024 * 1024);
-    }
-
-    #[test]
-    fn percentages_are_against_the_limit_and_saturate() {
-        let load = PodLoad {
-            pod: "zainod".into(),
-            usage: Resources::new(594, 10348 * 1024 * 1024, 0, 0),
-            limit: Some(Resources::new(9_000, 24 * GIB, 0, 0)),
-        };
-        assert_eq!(load.cpu_pct(), Some(6));
-        assert_eq!(load.mem_pct(), Some(42));
-
-        let over = PodLoad {
-            pod: "p".into(),
-            usage: Resources::new(20_000, 0, 0, 0),
-            limit: Some(Resources::new(9_000, 24 * GIB, 0, 0)),
-        };
-        assert_eq!(over.cpu_pct(), Some(100), "clamped, never above 100");
-    }
-
-    /// Burstable pods have no denominator; a percentage there would be invented
-    #[test]
-    fn a_pod_without_limits_reports_no_percentage() {
-        let load = PodLoad { pod: "p".into(), usage: Resources::new(100, GIB, 0, 0), limit: None };
-        assert_eq!(load.cpu_pct(), None);
-        assert_eq!(load.mem_pct(), None);
     }
 }

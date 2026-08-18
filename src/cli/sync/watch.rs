@@ -17,16 +17,16 @@ use owo_colors::OwoColorize as _;
 use crate::cli::console::{Console, SceneFrame};
 use crate::metrics::{PodExporter, Poller, Sample};
 use crate::resource::impls::policy::RUN_NAMESPACE;
-use crate::sync::{SyncEvent, Window, decode_event, driver_pod_for, namespace_for, plot_channels};
+use crate::sync::{
+    SyncEvent, SyncStatus, Window, decode_event, driver_pod_for, find_driver, namespace_for,
+    plot_channels, read_report,
+};
 use crate::ui::{
     ProbeRow, SetupStep, SyncVitals, SyncWatchState, Theme, render_sync_load,
     render_sync_watch_panel, render_sync_work,
 };
 
-use super::{
-    DRIVER_CONTAINER, driver_profile, find_driver, print_report_details, read_report,
-    report_headline, row_of,
-};
+use super::{DRIVER_CONTAINER, driver_profile, print_report_details, report_headline, row_of};
 
 /// Driver-pod address: run-namespace API handle + pod name.
 ///
@@ -78,17 +78,14 @@ const SUT_SELECTOR: &str = "ztest.io/component-category=indexer";
 
 type LineStream = std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<String>> + Send>>;
 
-/// How an attach ended. `watch` reports; the *caller* maps it to an exit status
-/// (`ztest sync watch` always succeeds; `ztest sync start --watch` stands in for a
-/// foreground run and must fail its pipeline on a failing verdict)
+/// How an attach ended: the sync's own standing, or the user leaving it running. `watch`
+/// reports; the *caller* maps it to an exit status (`ztest sync watch` always succeeds;
+/// `ztest sync start --watch` stands in for a foreground run and must fail its pipeline on
+/// a failing verdict)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum WatchEnd {
     Detached,
-    Finished {
-        passed: bool,
-    },
-    /// Log ended with no report (driver killed, evicted, or crashed before mirroring one)
-    Unresolved,
+    Settled(SyncStatus),
 }
 
 pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
@@ -104,7 +101,7 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
 
     // Non-TTY: no panel to pin, so the events that would drive it render as lines
     if !stdout().is_terminal() {
-        return linear(&driver, &client, &ns, id, &theme).await;
+        return linear(&driver, &client, id, &theme).await;
     }
 
     let cancel_theme = theme.clone();
@@ -115,14 +112,14 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
     let session_start = Instant::now();
     let (console, guard) = match Console::start(session_start, cancel_panel) {
         Ok(cg) => cg,
-        Err(_) => return linear(&driver, &client, &ns, id, &theme).await,
+        Err(_) => return linear(&driver, &client, id, &theme).await,
     };
 
     let mut feed = Feed::new(
         profile,
         id.to_string(),
         crate::cluster_config::active_context().unwrap_or_else(|| "(cluster)".into()),
-        row_of(&pod).2,
+        driver_phase(&pod),
     );
 
     // Three views: position+pace / per-pool rates / per-pod draw. Left and mid share
@@ -174,7 +171,7 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
         println!("sync {id}: detached — still running (`ztest sync status {id}`)");
         return Ok(WatchEnd::Detached);
     }
-    settled(&client, &ns, id, &theme).await
+    settled(&client, id, &theme).await
 }
 
 /// Panel-less attach: linear driver-log tail, then the settled verdict. Off a TTY,
@@ -182,30 +179,24 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
 async fn linear(
     driver: &DriverPod,
     client: &kube::Client,
-    ns: &str,
     id: &str,
     theme: &Theme,
 ) -> Result<WatchEnd, String> {
     plain_tail(driver, theme).await?;
-    settled(client, ns, id, theme).await
+    settled(client, id, theme).await
 }
 
 /// Post-log verdict: the durable report if the driver mirrored one, else "no report"
-async fn settled(
-    client: &kube::Client,
-    ns: &str,
-    id: &str,
-    theme: &Theme,
-) -> Result<WatchEnd, String> {
-    match read_report(client, ns, id).await? {
+async fn settled(client: &kube::Client, id: &str, theme: &Theme) -> Result<WatchEnd, String> {
+    match read_report(client, id).await? {
         Some(report) => {
             println!("{}", report_headline(theme, &report));
             print_report_details(theme, &report);
-            Ok(WatchEnd::Finished { passed: report.passed() })
+            Ok(WatchEnd::Settled(SyncStatus::Finished(report.verdict)))
         }
         None => {
             println!("sync {id}: tail ended — no report yet (`ztest sync status {id}`)");
-            Ok(WatchEnd::Unresolved)
+            Ok(WatchEnd::Settled(SyncStatus::Unresolved))
         }
     }
 }
@@ -463,7 +454,7 @@ fn container_state(pod: &Pod, container: &str) -> Option<ContainerState> {
 /// Phase + the container's waiting reason (bare `Pending` cannot separate
 /// scheduling from `ImagePullBackOff`)
 fn driver_phase(pod: &Pod) -> String {
-    let phase = row_of(pod).2;
+    let phase = row_of(pod).pod_phase.unwrap_or_else(|| "Unknown".into());
     let reason = pod
         .status
         .as_ref()
@@ -610,7 +601,7 @@ pub(super) struct Feed {
     /// Newest scrape folded; moves forward only (a failed scrape re-sends the last
     /// exposition, which differenced against itself reads as a phantom stall)
     observed_at: Option<Instant>,
-    phase: String,
+    phase: Option<crate::sync::Phase>,
     reorg_depth: u32,
     /// Newest event folded; keeps the fold exactly-once across a resumed stream's
     /// by-time replay
@@ -627,7 +618,7 @@ impl Feed {
             tick: crate::sync::DEFAULT_TICK,
             series: crate::sync::Timeline::new(plot_channels(), crate::metrics::LIVE_PERIOD),
             observed_at: None,
-            phase: String::new(),
+            phase: None,
             reorg_depth: 0,
             folded_through: None,
         }
@@ -665,7 +656,7 @@ impl Feed {
             height: observation.height.unwrap_or(0),
             target: observation.target,
             pct: observation.pct(),
-            phase: self.phase.clone(),
+            phase: self.phase,
             reorg_depth: self.reorg_depth,
             pace: window.block_pace(),
             tx_rate: window.tx_rate(),
@@ -763,10 +754,10 @@ impl Feed {
             }
             SyncEvent::Tick(t) => {
                 // Engine state; no exporter publishes it, so every path needs it here
-                self.phase = t.phase.clone();
+                self.phase = Some(t.phase);
                 self.reorg_depth = t.reorg_depth;
                 if let Some(vitals) = &mut self.state.vitals {
-                    vitals.phase = t.phase.clone();
+                    vitals.phase = Some(t.phase);
                     vitals.reorg_depth = t.reorg_depth;
                 }
                 self.ticked.push(t.at(), t.into());
@@ -947,7 +938,7 @@ mod tests {
 
         let v = f.state.vitals.as_ref().expect("vitals");
         assert_eq!(v.height, 900, "the scrape still owns the height");
-        assert_eq!(v.phase, "Historic", "the tick still owns the phase");
+        assert_eq!(v.phase, Some(crate::sync::Phase::Historic), "the tick still owns the phase");
     }
 
     fn theme() -> Theme {
@@ -966,7 +957,7 @@ mod tests {
             height,
             target: Some(1024),
             pct: 0.0,
-            phase: "Historic".into(),
+            phase: crate::sync::Phase::Historic,
             reorg_depth: 0,
             work: crate::sync::Work::ZERO,
         })

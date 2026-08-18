@@ -24,9 +24,10 @@ pub(crate) use event::{SyncEvent, decode as decode_event};
 pub(crate) use event::{Tick as SyncTick, encode as encode_event};
 
 pub use detached::{
-    KIND_LABEL_KEY, KIND_LABEL_VALUE, POD_NAME_ENV, POD_NAMESPACE_ENV, ReportViolation,
-    STOP_ANNOTATION, SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV, SyncReportMirror, active_sync_id,
-    driver_pod_for, kind_selector, namespace_for, report_cm_name,
+    KIND_LABEL_KEY, KIND_LABEL_VALUE, POD_NAME_ENV, POD_NAMESPACE_ENV, REPORT_KEY, ReportViolation,
+    STOP_ANNOTATION, SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV, SyncReportMirror, SyncStatus,
+    active_sync_id, driver_pod_for, find_driver, kind_selector, namespace_for, read_report,
+    report_cm_name, report_cm_namespace,
 };
 
 pub use chainwork::{ChainWork, Support};

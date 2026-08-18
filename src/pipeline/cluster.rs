@@ -109,7 +109,9 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
     (ProbeOutcome::Ok { context, slots_used, nodes_ready, nodes_cordoned, capacity }, Some(client))
 }
 
-fn node_ready(node: &Node) -> bool {
+const CONTROL_PLANE_LABEL: &str = "node-role.kubernetes.io/control-plane";
+
+pub(crate) fn node_ready(node: &Node) -> bool {
     node.status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
@@ -140,11 +142,41 @@ fn node_allocatable(node: &Node) -> Resources {
 
 /// Total allocatable across schedulable (Ready, uncordoned) nodes. Generic over the
 /// item source so the one-shot probe and the reflector-backed watcher share one fold
-fn cluster_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Resources {
+pub(crate) fn cluster_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Resources {
     nodes
         .into_iter()
         .filter(|n| node_ready(n) && !node_cordoned(n))
         .fold(Resources::ZERO, |acc, n| acc.saturating_add(&node_allocatable(n)))
+}
+
+/// Every node's allocatable, cordoned and not-ready included. Above
+/// [`cluster_allocatable`] by exactly what is currently out of service, so `ztest status`
+/// can show the gap instead of leaving a shrunken denominator unexplained
+pub(crate) fn total_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Resources {
+    nodes.into_iter().fold(Resources::ZERO, |acc, n| acc.saturating_add(&node_allocatable(n)))
+}
+
+/// Node roster for `ztest status`. Beside the capacity folds because it answers from the
+/// same list and shares [`node_ready`]/[`node_cordoned`] — a second classification of
+/// "which nodes count" is how a denominator drifts from the roster explaining it
+pub(crate) fn node_summary(nodes: &[Node]) -> crate::ui::NodeSummary {
+    let is_control_plane =
+        |n: &Node| n.metadata.labels.as_ref().is_some_and(|l| l.contains_key(CONTROL_PLANE_LABEL));
+    crate::ui::NodeSummary {
+        k8s_version: nodes
+            .first()
+            .and_then(|n| n.status.as_ref()?.node_info.as_ref())
+            .map(|i| i.kubelet_version.clone())
+            .unwrap_or_default(),
+        ready: nodes.iter().filter(|n| node_ready(n)).count() as u32,
+        control_plane: nodes.iter().filter(|n| is_control_plane(n)).count() as u32,
+        workers: nodes.iter().filter(|n| !is_control_plane(n)).count() as u32,
+        cordoned: nodes
+            .iter()
+            .filter(|n| node_cordoned(n))
+            .filter_map(|n| n.metadata.name.clone())
+            .collect(),
+    }
 }
 
 /// Sole source of a [`ClusterCapacity`] — probe banner, scheduler ceiling and ledger
@@ -157,13 +189,6 @@ pub(crate) async fn probe_capacity(client: &Client) -> Result<ClusterCapacity, S
         tokio::try_join!(nodes_api.list(&lp), pods_api.list(&lp), pvcs_api.list(&lp))
             .map_err(|e| format!("probe cluster capacity: {e}"))?;
     Ok(capacity_from(&nodes.items, &pods.items, &pvcs.items))
-}
-
-/// Scheduled and not yet `Succeeded`/`Failed`, so still holding capacity
-fn pod_consumes(pod: &Pod) -> bool {
-    let scheduled = pod.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_some();
-    let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
-    scheduled && !matches!(phase, Some("Succeeded") | Some("Failed"))
 }
 
 /// Shared by the one-shot probe and [`super::capacity_watch`] → identical banner figure
@@ -189,7 +214,7 @@ fn cluster_reserved<'a>(
 ) -> Resources {
     let by_name: HashMap<&str, &PersistentVolumeClaim> =
         pvcs.into_iter().filter_map(|p| Some((p.metadata.name.as_deref()?, p))).collect();
-    pods.into_iter().filter(|p| pod_consumes(p)).fold(Resources::ZERO, |acc, pod| {
+    pods.into_iter().filter(|p| units::pod_holds_capacity(p)).fold(Resources::ZERO, |acc, pod| {
         let request =
             pod.spec.as_ref().map(units::pod_effective_request).unwrap_or(Resources::ZERO);
         acc.saturating_add(&request).saturating_add(&pod_io_reservation(pod, &by_name))
@@ -340,19 +365,21 @@ mod tests {
         assert_eq!(a.mem_bytes, 8 * crate::qos::GIB);
     }
 
+    /// Unsettled = reserved, scheduled or not. An unscheduled `Pending` pod is capacity
+    /// already promised, and the ledger charges it too — the probe excluding it is what
+    /// let two readings of one cluster disagree
     #[test]
-    fn reserved_sums_only_scheduled_live_pods() {
+    fn reserved_sums_every_unsettled_pod() {
         let pods = vec![
-            pod(Some("n1"), "Running", "500m", "512Mi"), // counted
-            pod(Some("n1"), "Pending", "500m", "512Mi"), // counted (scheduled)
-            pod(None, "Pending", "1", "1Gi"),            // unscheduled → excluded
-            pod(Some("n1"), "Succeeded", "1", "1Gi"),    // finished → excluded
-            pod(Some("n1"), "Failed", "1", "1Gi"),       // finished → excluded
+            pod(Some("n1"), "Running", "500m", "512Mi"),
+            pod(Some("n1"), "Pending", "500m", "512Mi"),
+            pod(None, "Pending", "1", "1Gi"), // unscheduled, still promised
+            pod(Some("n1"), "Succeeded", "1", "1Gi"), // settled → reclaimed
+            pod(Some("n1"), "Failed", "1", "1Gi"), // settled → reclaimed
         ];
         let r = cluster_reserved(&pods, &[]);
-        // Request-only pods reserve their request → counted ones sum exactly
-        assert_eq!(r.cpu_milli, 1000);
-        assert_eq!(r.mem_bytes, 1024 * 1024 * 1024);
+        assert_eq!(r.cpu_milli, 2000);
+        assert_eq!(r.mem_bytes, 2 * crate::qos::GIB);
     }
 
     #[test]

@@ -374,7 +374,7 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> 
         env_var(crate::naming::TEST_NAMESPACE_ENV, test_ns),
     ];
     if cfg.env.no_cleanup {
-        env.push(env_var("ZTEST_NO_CLEANUP", "1"));
+        env.push(env_var(crate::cluster::NO_CLEANUP_ENV, "1"));
     }
     // Forward the laptop's diagnostics filter so `observ::init_in_pod` honours the same
     // `ZTEST_LOG` the operator set (mirrors `NEXTEST_LOG`). Unset → the pod's own default

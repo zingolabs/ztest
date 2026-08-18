@@ -593,6 +593,7 @@ impl ReservedBuilder {
             &run.user,
             capacity,
             crate::qos::ledger::Reserve::Fixed(crate::qos::build::BUILDKIT_BUILD),
+            crate::qos::beacon::LeaseKind::Build,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -756,6 +757,7 @@ fn launch_engine(
         &run.user,
         *capacity,
         crate::qos::ledger::Reserve::Elastic,
+        crate::qos::beacon::LeaseKind::Run,
     )) {
         Ok(g) => g,
         Err(e) => {

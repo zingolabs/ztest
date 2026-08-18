@@ -166,7 +166,7 @@ fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
         .env("ZTEST_SA", &env.sa)
         .env("ZTEST_COLOR", if env.color { "1" } else { "0" });
     if env.no_cleanup {
-        std_cmd.env("ZTEST_NO_CLEANUP", "1");
+        std_cmd.env(crate::cluster::NO_CLEANUP_ENV, "1");
     }
 
     #[cfg(unix)]

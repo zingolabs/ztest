@@ -19,6 +19,7 @@ mod layout;
 pub mod plot;
 mod render;
 mod report;
+mod status;
 pub mod text;
 mod theme;
 
@@ -28,7 +29,8 @@ pub use self::render::{
     render_sync_build_panel, render_sync_load, render_sync_watch_panel, render_sync_work,
     render_transfers,
 };
-pub use self::report::{ComponentResources, Outcome, ReportView, render_sync_report};
+pub use self::report::{ComponentResources, ReportView, render_sync_report, status_mark};
+pub use self::status::render_status;
 pub use self::theme::Theme;
 pub use crate::qos::schedule::{QosPlan, TierPlan};
 
@@ -81,6 +83,68 @@ pub struct ClusterState {
 pub struct ArchiveRow {
     pub name: String,
     pub status: ArchiveStatus,
+}
+
+// ─────────────────────────── ztest status ─────────────────────────────
+
+/// One frame of `ztest status` (`docs/design-status.md`).
+///
+/// - Folded from the `ztest-meta` lease beacons + one node read, nothing else
+/// - `now` travels with the frame so every row ages against one clock read
+/// - `Serialize` is the `--json` surface; display-only fields are skipped there
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatusView {
+    pub context: String,
+    pub server: String,
+    pub nodes: NodeSummary,
+    pub allocatable: crate::qos::Resources,
+    pub capacity: crate::qos::Resources,
+    pub runs: Vec<RunRow>,
+    pub claims: Vec<ClaimRow>,
+    pub anomaly: Option<String>,
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+/// `capacity` − `allocatable` is the cordoned nodes' share, so both are carried and the
+/// gap explains itself
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct NodeSummary {
+    pub k8s_version: String,
+    pub ready: u32,
+    pub control_plane: u32,
+    pub workers: u32,
+    pub cordoned: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunRow {
+    pub beacon: crate::qos::beacon::Beacon,
+    pub yours: bool,
+    /// User has >1 active run → the id is the only thing telling the rows apart
+    #[serde(skip)]
+    pub show_run_id: bool,
+    #[serde(rename = "eta_seconds", serialize_with = "secs")]
+    pub eta: Option<std::time::Duration>,
+}
+
+/// Durations reach `--json` as whole seconds; the derived `{secs,nanos}` pair is a Rust
+/// detail no consumer should have to reassemble
+fn secs<S: serde::Serializer>(d: &Option<std::time::Duration>, s: S) -> Result<S::Ok, S::Error> {
+    match d {
+        Some(d) => s.serialize_some(&d.as_secs()),
+        None => s.serialize_none(),
+    }
+}
+
+/// `projected_start` = when running peers free enough for `beacon.needs`; `None` = past
+/// the axis window or unprojectable
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClaimRow {
+    pub beacon: crate::qos::beacon::Beacon,
+    pub yours: bool,
+    #[serde(rename = "projected_start_seconds", serialize_with = "secs")]
+    pub projected_start: Option<std::time::Duration>,
+    pub position: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +230,7 @@ pub struct SetupStep {
 ///
 /// - All but `phase`/`reorg_depth` (engine-only) come from one 1s watcher scrape
 ///   → no row lags another by a tick
+/// - `phase` = chain-walk progress, never a run's standing; `None` until the first tick
 /// - `None` rate = unmeasured, not idle; renders `—` not `0`
 /// - `pace` blocks/sec + its ETA, together so the countdown can never outlive the rate
 ///   it was projected from
@@ -176,7 +241,7 @@ pub struct SyncVitals {
     pub height: u32,
     pub target: Option<u32>,
     pub pct: f32,
-    pub phase: String,
+    pub phase: Option<crate::sync::Phase>,
     pub reorg_depth: u32,
     pub pace: Option<crate::rate::Pace>,
     pub tx_rate: Option<f64>,

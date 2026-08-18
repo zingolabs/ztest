@@ -117,7 +117,7 @@ impl SyncReporter for EventReporter {
 
     fn on_finish(&mut self, outcome: &SyncOutcome) {
         Self::emit(&SyncEvent::Finished {
-            verdict: format!("{:?}", outcome.verdict),
+            verdict: outcome.verdict,
             violations: outcome.violations.len(),
             coverage_gaps: outcome.coverage_gaps.len(),
             ticks: outcome.ticks,

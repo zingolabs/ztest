@@ -335,9 +335,9 @@ async fn drive<S: SyncSubject>(
         tracing::info!("profiles available with `ztest sync perf {sync_id}`");
     }
     // Mirror to a ConfigMap so `ztest sync status` works after the pod is gone
-    if let (Some(sync_id), Some(kube), Some(ns)) = (&detached, env.kube_client(), env.namespace()) {
+    if let (Some(sync_id), Some(kube)) = (&detached, env.kube_client()) {
         let report = super::SyncReportMirror::from_outcome(sync_id, &profile, &outcome);
-        super::detached::write_report(&kube, &ns, &report).await;
+        super::detached::write_report(&kube, &report).await;
         tracing::info!(sync_id = %sync_id, "detached sync: report mirrored");
     }
     outcome

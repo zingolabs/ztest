@@ -102,6 +102,31 @@ impl Series {
             self.points.windows(2).map(|w| (w[1].0 - w[0].0) * (w[0].1 + w[1].1) / 2.0).sum()
         })
     }
+
+    /// Pointwise sum of like-for-like series onto one label.
+    ///
+    /// - Timestamp intersection (part missing a scrape → total unknown, never smaller)
+    /// - Unit & facet from the first part (caller folds like with like)
+    pub fn folded(label: &str, parts: &[Series]) -> Option<Series> {
+        let first = parts.first()?;
+        // ms key: samples must compare exactly & f64 is not Ord
+        let mut acc: BTreeMap<u64, (f64, usize)> = BTreeMap::new();
+        for (at, v) in parts.iter().flat_map(|s| &s.points) {
+            let slot = acc.entry((at * 1000.0).round() as u64).or_insert((0.0, 0));
+            slot.0 += v;
+            slot.1 += 1;
+        }
+        Some(Series {
+            label: label.to_string(),
+            unit: first.unit,
+            facet: first.facet,
+            points: acc
+                .into_iter()
+                .filter(|(_, (_, seen))| *seen == parts.len())
+                .map(|(ms, (sum, _))| (ms as f64 / 1000.0, sum))
+                .collect(),
+        })
+    }
 }
 
 /// Sampling grid for a range read: one point per plot column, plus the window counters
@@ -688,6 +713,36 @@ mod tests {
         assert_eq!(series[0].labels.get("container").map(String::as_str), Some("zainod"));
         assert_eq!(series[0].points, vec![(0.0, 1.5), (30.0, 2.5)]);
         assert_eq!(series[1].points.len(), 1);
+    }
+
+    /// A part missing a scrape leaves the total unknown; carrying the survivors alone
+    /// would draw a dip the run never had
+    #[test]
+    fn a_fold_sums_where_every_part_sampled_and_gaps_elsewhere() {
+        let part = |label: &str, points: Vec<(f64, f64)>| Series {
+            label: label.into(),
+            unit: Unit::PerSec,
+            facet: Some(Facet::Shielded),
+            points,
+        };
+        let folded = Series::folded(
+            "sapling",
+            &[
+                part("sapling spends", vec![(0.0, 1.0), (30.0, 2.0), (60.0, 4.0)]),
+                part("sapling outputs", vec![(0.0, 10.0), (60.0, 40.0)]),
+            ],
+        )
+        .expect("two parts fold");
+
+        assert_eq!(folded.label, "sapling");
+        assert_eq!(folded.unit, Unit::PerSec);
+        assert_eq!(folded.facet, Some(Facet::Shielded));
+        assert_eq!(folded.points, vec![(0.0, 11.0), (60.0, 44.0)]);
+    }
+
+    #[test]
+    fn folding_nothing_yields_no_series() {
+        assert_eq!(Series::folded("sapling", &[]), None);
     }
 
     /// A dropped sample is a gap, not a zero — a stall the run never had
