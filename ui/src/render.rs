@@ -1062,7 +1062,7 @@ mod tests {
                 ArchiveRow {
                     name: "mainnet-snapshot-9.0".to_string(),
                     status: ArchiveStatus::Missing {
-                        detail: "LFS pointer present, blob absent".to_string(),
+                        detail: "manifest committed, blob absent".to_string(),
                     },
                 },
             ],
@@ -1195,7 +1195,7 @@ mod tests {
     Archives 3 selected
              ✓ regtest-nu5-h128     · cached · 412.0 MiB
              ✓ testnet-2.6m         · cached · 18.4 GiB
-             ! mainnet-snapshot-9.0 · missing · LFS pointer present, blob absent
+             ! mainnet-snapshot-9.0 · missing · manifest committed, blob absent
 ────────────
 ";
         assert_eq!(s, expected, "golden mismatch.\n--- got ---\n{s}\n--- want ---\n{expected}");

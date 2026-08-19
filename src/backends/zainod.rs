@@ -25,7 +25,9 @@ use crate::metrics::{AT_REST, Exporter, Exposition, Facet, LIVE, Reduce, Row, Un
 use crate::protocol::Endpoint;
 use crate::protocol::client::JsonRpcClient;
 use crate::protocol::zcash_rpc::ZcashRpc;
-use crate::sync::{Cost, Observation, Observe, Op, Phase, ProgressView, SyncSubject, Work};
+use crate::sync::{
+    Cost, Heights, Observation, Observe, Op, Phase, ProgressView, SyncSubject, Work,
+};
 use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zainod";
@@ -238,10 +240,7 @@ impl IndexerBackend for ZainoIndexer {
             image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
             ports: crate::manifest::merge_ports(
                 &crate::backends::metrics_port_appended(
-                    &[
-                        ("grpc", crate::ports::ZAINO_GRPC),
-                        ("jsonrpc", crate::ports::ZAINO_JSONRPC),
-                    ],
+                    &[("grpc", crate::ports::ZAINO_GRPC), ("jsonrpc", crate::ports::ZAINO_JSONRPC)],
                     ZainoBackend.metrics_port(),
                 ),
                 &opts.extra_ports,
@@ -703,7 +702,7 @@ mod family {
 /// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns
 /// scannable (reformatted, each row costs six lines)
 #[rustfmt::skip]
-pub const ROWS: [Row; 21] = [
+const ROWS: [Row; 21] = [
     // Per-op throughput. Cumulative on the wire → `PerSec` differentiates at query
     // time; `label` = the band, which is what keys `Palette::pools` when they stack.
     // `AT_REST`: a live reader differences its own scrapes, and a counter shown raw
@@ -748,37 +747,35 @@ pub const ROWS: [Row; 21] = [
     row("db used", family::DB_USED_BYTES, Reduce::Max, AT_REST, Unit::Bytes, Facet::Store),
 ];
 
-/// One counter per [`Op`] zaino publishes → `Op::SaplingOutput` is sapling outputs, directly
-/// comparable with [`chainwork`](crate::sync::chainwork)'s tree-size reading of the same range.
-/// Shared by [`progress`](SyncSubject::progress) and [`Observe`] (probe and panel can't drift)
-const POOL_OPS: [(Op, &str); 6] = [
-    (Op::TransparentIn, family::TRANSPARENT_INPUTS),
-    (Op::TransparentOut, family::TRANSPARENT_OUTPUTS),
-    (Op::SaplingSpend, family::SAPLING_SPENDS),
-    (Op::SaplingOutput, family::SAPLING_OUTPUTS),
-    (Op::OrchardAction, family::ORCHARD_ACTIONS),
-    (Op::IronwoodAction, family::IRONWOOD_ACTIONS),
-];
-
-/// Only counted ops are `set` → a probe reading an unpublished one panics via
-/// [`Work::require`], never compares zeroes. `Op::SproutJoinSplit` absent on purpose and
-/// must stay absent (the compact model carries no JoinSplits → sprout work unmeasured)
-fn work_of(exposition: &Exposition) -> Work {
-    let mut work = Work::ZERO;
-    for (op, family) in POOL_OPS {
-        if let Some(n) = exposition.counter_total(family) {
-            work.set(op, n);
-        }
-    }
-    work
-}
-
 /// Zaino as a live display sees it, from outside the cluster. Families resolved in the
 /// module owning them → asking for one [`ROWS`] lacks is a compile error, not a `—`
 /// indistinguishable from a pending value
+impl crate::metrics::MetricLayout for ZainoIndexer {
+    const ROWS: &'static [Row] = &ROWS;
+}
+
 impl Observe for ZainoIndexer {
+    /// `finalized` is the durable frontier a probe gates on; `fetched` moves per block,
+    /// which is what a panel needs (`finalized` steps once per `sync_checkpoint_interval`)
+    const HEIGHTS: Heights = Heights {
+        committed: family::FINALIZED_HEIGHT,
+        live: Some(family::FETCHED_HEIGHT),
+        target: Some(family::TARGET_HEIGHT),
+    };
+
+    /// `Op::SproutJoinSplit` absent on purpose and must stay absent (the compact model
+    /// carries no JoinSplits → sprout work unmeasured)
+    const WORK_OPS: &'static [(Op, &'static str)] = &[
+        (Op::TransparentIn, family::TRANSPARENT_INPUTS),
+        (Op::TransparentOut, family::TRANSPARENT_OUTPUTS),
+        (Op::SaplingSpend, family::SAPLING_SPENDS),
+        (Op::SaplingOutput, family::SAPLING_OUTPUTS),
+        (Op::OrchardAction, family::ORCHARD_ACTIONS),
+        (Op::IronwoodAction, family::IRONWOOD_ACTIONS),
+    ];
+
     fn observe(exposition: &Exposition) -> Option<Observation> {
-        let work = work_of(exposition);
+        let work = Self::work_of(exposition);
         // Counters pre-created at zero by zaino's exporter → their presence separates
         // this component's exposition from another's, before any block or gauge
         if work.known().is_empty() {
@@ -793,13 +790,8 @@ impl Observe for ZainoIndexer {
             .zip(fetch_ms)
             .map(|(build, fetch)| (build - fetch - treestate_ms.unwrap_or(0.0)).max(0.0));
         Some(Observation {
-            // Fetched first, where `progress` below prefers finalized: probes gate on
-            // what is durable, displays must move per block (`finalized` steps once per
-            // commit, 120 s → cannot carry a per-second rate)
-            height: exposition
-                .height_gauge(family::FETCHED_HEIGHT)
-                .or_else(|| exposition.height_gauge(family::FINALIZED_HEIGHT)),
-            target: exposition.height_gauge(family::TARGET_HEIGHT).filter(|&t| t > 0),
+            height: Self::live_height(exposition),
+            target: Self::target_of(exposition),
             // No progress-percent family published; height/target is the whole story
             reported_pct: None,
             transactions: exposition.counter_total(family::TRANSACTIONS),
@@ -820,7 +812,7 @@ impl Exporter for ZainoIndexer {
     }
 
     fn rows(&self) -> &'static [Row] {
-        &ROWS
+        <Self as crate::metrics::MetricLayout>::ROWS
     }
 }
 
@@ -842,20 +834,13 @@ impl ZainoIndexer {
     pub async fn index_frontier(&self) -> Result<u32, RpcError> {
         frontier_of(&self.exporter().await?, "index_frontier")
     }
-
 }
 
-/// Takes an already-scraped exposition: [`SyncSubject::progress`] needs height, work
-/// counters and target from the *same* scrape (a second round trip = a different instant)
+/// [`Observe::committed_height`] with zaino's diagnostic. Takes an already-scraped
+/// exposition: [`SyncSubject::progress`] needs height, work counters and target from the
+/// *same* scrape (a second round trip = a different instant)
 fn frontier_of(exporter: &Exposition, op: &'static str) -> Result<u32, RpcError> {
-    if let Some(h) = exporter.height_gauge(family::FINALIZED_HEIGHT) {
-        return Ok(h);
-    }
-    // `finalized_height` absent for a sync's first minutes: set only per batch commit
-    // (<=1 per `sync_checkpoint_interval`, 120 s), gauges not pre-zeroed (a zeroed
-    // height would claim a tip at genesis). `fetched_height` = the frontier in that
-    // window — set per block, still unanswerable by a proxied validator
-    if let Some(h) = exporter.height_gauge(family::FETCHED_HEIGHT) {
+    if let Some(h) = ZainoIndexer::committed_height(exporter) {
         return Ok(h);
     }
     // Counters *are* pre-created at zero (gauges are not) → a present counter proves
@@ -899,12 +884,10 @@ impl SyncSubject for ZainoIndexer {
     async fn progress(&self) -> Result<ZainoSyncProgress, RpcError> {
         let exporter = self.exporter().await?;
         let height = frontier_of(&exporter, "progress")?;
-        let work = work_of(&exporter);
         Ok(ZainoSyncProgress {
             height,
-            // Zero = tip not yet known, not a zero-length chain (would render 100 %)
-            target: exporter.height_gauge(family::TARGET_HEIGHT).filter(|&t| t > 0),
-            work,
+            target: Self::target_of(&exporter),
+            work: Self::work_of(&exporter),
         })
     }
 
@@ -921,7 +904,7 @@ impl SyncSubject for ZainoIndexer {
     }
 
     fn work_source(&self, op: Op) -> Option<&'static str> {
-        POOL_OPS.iter().find_map(|&(o, family)| (o == op).then_some(family))
+        <Self as Observe>::work_source(op)
     }
 }
 
@@ -1221,6 +1204,63 @@ mod tests {
             reported.get(Op::TransparentOut),
             None,
             "zaino publishes no transparent counter; an unmeasured op must not read as zero"
+        );
+    }
+
+    fn scrape(text: &str) -> Exposition {
+        let mut e = Exposition::default();
+        e.absorb(text);
+        e
+    }
+
+    /// One [`Heights`] declaration, two readers: a probe gates on the durable frontier,
+    /// a panel shows the one that moves per block. Written by hand they drifted
+    #[test]
+    fn probe_and_panel_read_the_same_declaration_in_opposite_orders() {
+        let e = scrape(
+            "# TYPE zaino_sync_finalized_height gauge\n\
+             zaino_sync_finalized_height 61\n\
+             # TYPE zaino_sync_fetched_height gauge\n\
+             zaino_sync_fetched_height 161\n",
+        );
+        assert_eq!(ZainoIndexer::committed_height(&e), Some(61), "probe gates on durable");
+        assert_eq!(ZainoIndexer::live_height(&e), Some(161), "panel shows per-block");
+    }
+
+    /// Either family alone answers both readers — the fallback is what covers the window
+    /// before the first commit
+    #[test]
+    fn one_height_family_answers_both_readers() {
+        let live_only =
+            scrape("# TYPE zaino_sync_fetched_height gauge\nzaino_sync_fetched_height 42\n");
+        assert_eq!(ZainoIndexer::committed_height(&live_only), Some(42));
+        assert_eq!(ZainoIndexer::live_height(&live_only), Some(42));
+        assert_eq!(ZainoIndexer::committed_height(&scrape("")), None);
+    }
+
+    /// A tip not yet known renders 100 % if taken as a target
+    #[test]
+    fn a_zero_target_is_no_target() {
+        let zero = scrape("# TYPE zaino_sync_target_height gauge\nzaino_sync_target_height 0\n");
+        assert_eq!(ZainoIndexer::target_of(&zero), None);
+    }
+
+    /// `work_source` and `work_of` both read `WORK_OPS`, so a probe cannot name a family
+    /// the reader would not have counted
+    #[test]
+    fn work_source_and_work_of_agree_on_the_declaration() {
+        let e = scrape(
+            "# TYPE zaino_sync_orchard_actions_total counter\n\
+             zaino_sync_orchard_actions_total 7\n",
+        );
+        let family =
+            <ZainoIndexer as Observe>::work_source(Op::OrchardAction).expect("orchard is declared");
+        assert_eq!(family, "zaino_sync_orchard_actions_total");
+        assert_eq!(ZainoIndexer::work_of(&e).get(Op::OrchardAction), Some(7));
+        assert_eq!(
+            <ZainoIndexer as Observe>::work_source(Op::SproutJoinSplit),
+            None,
+            "sprout is deliberately unmeasured; naming a family for it would fake a zero"
         );
     }
 

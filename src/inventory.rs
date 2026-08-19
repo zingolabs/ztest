@@ -195,7 +195,7 @@ pub fn qos_iter() -> impl Iterator<Item = &'static QosDecl> {
 // so preflight pre-provisions them (else the first test at `TestEnv::build()`
 // materializes lazily)
 //
-// Identity = Git LFS oid (SHA-256 of the bytes), baked from the sidecar manifest at
+// Identity = oid (SHA-256 of the bytes), baked from the sidecar manifest at
 // compile time, never a path — laptop, build pod, runner pod and puller Job all name
 // the same seed without any of them reading the file
 
@@ -210,7 +210,7 @@ pub enum SeedPayload {
 
 /// One seed declaration for `inventory::submit!`.
 ///
-/// - `oid` = identity (LFS oid = SHA-256 of the bytes) → PVC `seed-<oid[..8]>`, key `lfs/<oid>`
+/// - `oid` = identity (SHA-256 of the bytes) → PVC `seed-<oid[..8]>`, key `lfs/<oid>`
 /// - `name` = filename only, for the puller's decompression + diagnostics
 /// - `size` = the manifest's compressed `size_bytes`
 #[derive(Debug, Clone, Copy, Serialize)]

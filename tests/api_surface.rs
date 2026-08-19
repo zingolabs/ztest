@@ -29,7 +29,7 @@ fn mount_macros_emit_expected_variants() {
     assert!(matches!(m.source, MountSource::ConfigAbs(ref p) if p.is_absolute()));
 
     // Both seed macros emit the same `Seed(handle)` source — one identity for
-    // an LFS artifact — and differ only in the `kind` that decides whether the
+    // a bucket artifact — and differ only in the `kind` that decides whether the
     // puller extracts the tar or copies the blob.
     let m = mount_file!("tests/assets/blob.bin", "/blob");
     assert_eq!(m.kind, MountKind::File);

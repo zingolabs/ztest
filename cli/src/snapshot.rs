@@ -320,8 +320,8 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
 /// Pre-provision seeds for the named archives.
 ///
 /// Archive file never opened: identity from the sidecar manifest, bytes from the
-/// bucket → works in a checkout that never ran `git lfs pull` (same property that
-/// lets a build pod declare a seed it cannot read)
+/// bucket → works in a checkout holding only the manifest (same property that lets
+/// a build pod declare a seed it cannot read)
 async fn warm(client: &Client, args: &WarmArgs) -> Result<(), String> {
     for archive in &args.archives {
         let (name, oid, size) = ztest::archive::identity_of(archive)?;

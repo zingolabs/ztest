@@ -163,12 +163,12 @@ pub mod prelude {
     /// The pinned chain a test names, and the blob it is restored from
     pub use crate::archive::{Artifact, Backend, ChainSnapshot, Network};
     pub use crate::backends::zainod::ZainoTuning;
-    /// Reading a component's `/metrics`: [`Exporter::metric`](crate::metrics::Exporter::metric)
-    /// on any validator/indexer that publishes one
-    pub use crate::metrics::{DEFAULT_SAMPLE_RATE, Exporter, MetricKind};
     pub use crate::loadtest::{
         BlockOracle, Distribution, LoadDriver, LoadReport, LwdClient, Rel, Scenario,
     };
+    /// Reading a component's `/metrics`: [`Exporter::metric`](crate::metrics::Exporter::metric)
+    /// on any validator/indexer that publishes one
+    pub use crate::metrics::{DEFAULT_SAMPLE_RATE, Exporter, MetricKind, MetricLayout};
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
         Regtest, Restore, regtest_test_activation_heights, regtest_test_lockbox_disbursements,

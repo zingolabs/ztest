@@ -70,7 +70,7 @@ fn emit_config_mount(
 }
 
 /// A PVC-backed mount: a content-addressed seed, identified by the archive's
-/// Git LFS OID and mounted at `destination`.
+/// oid and mounted at `destination`.
 ///
 /// Also registers a static `SeedDecl` in the link-time inventory — same pattern
 /// as `dev!` — so the preflight resource graph pre-provisions the seed before
@@ -155,8 +155,8 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
 /// `mount_file!("rel/blob.bin", "/path/in/container")`
 ///
 /// Materializes as a content-addressed single-file PVC, copied verbatim.
-/// Requires a sidecar manifest carrying the blob's `sha256`/`size_bytes` — the
-/// source must be a Git LFS object, like every seed.
+/// Requires a sidecar manifest carrying the blob's `sha256`/`size_bytes` — those
+/// address the bytes in the snapshot bucket, like every seed.
 #[proc_macro]
 pub fn mount_file(input: TokenStream) -> TokenStream {
     let MountArgs { source, destination } = parse_macro_input!(input as MountArgs);
@@ -175,7 +175,7 @@ pub fn mount_file(input: TokenStream) -> TokenStream {
 ///
 /// Materializes as a content-addressed extracted-tar PVC (CoW clone per use).
 /// Requires a sidecar manifest carrying the archive's `sha256`/`size_bytes` —
-/// the source must be a Git LFS object, like every seed.
+/// those address the bytes in the snapshot bucket, like every seed.
 #[proc_macro]
 pub fn mount_archive(input: TokenStream) -> TokenStream {
     let MountArgs { source, destination } = parse_macro_input!(input as MountArgs);
@@ -860,11 +860,11 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 // Every archive resource — a pre-synced testnet chain, a regtest chain cache,
 // an opaque fixture tarball — is declared the same way and carries the same
 // identity. The sidecar `<stem>.toml` is what makes that possible: it records
-// the archive's `sha256` and `size_bytes`, which are *exactly* the committed
-// Git LFS pointer's `oid` and `size` (an LFS object id is the SHA-256 of the
-// file). The manifest is plaintext and never LFS-tracked, so it is readable in
-// every checkout and every build context, and the identity bakes with no `git`
-// invocation and no access to the archive bytes.
+// the archive's `sha256` and `size_bytes`, which address the bytes in the
+// snapshot bucket. The manifest is plaintext and committed while the archive
+// itself is gitignored, so it is readable in every checkout and every build
+// context, and the identity bakes with no `git` invocation and no access to the
+// archive bytes.
 //
 // This is the whole reason there is one macro here instead of two. The old
 // `testnet_snapshot!` derived a filename from typed arguments and parsed the
@@ -958,11 +958,11 @@ fn bake_archive(source_abs: &std::path::Path, span: Span) -> Result<BakedArchive
             span,
             format!(
                 "archive {} has no sidecar manifest at {}\n\
-                 every archive needs one: it carries the `sha256`/`size_bytes` that are \
-                 the archive's Git LFS identity, and it is the only part of the artifact \
-                 readable in a build pod or a checkout that has not run `git lfs pull`. \
-                 Produce it with scripts/produce-chain-fixture.sh, or hand-write one with \
-                 just those two fields for a non-chain archive.",
+                 every archive needs one: it carries the `sha256`/`size_bytes` addressing \
+                 the bytes in the snapshot bucket, and it is the only part of the artifact \
+                 present in a build pod or a checkout (the archive itself is gitignored). \
+                 Produce it with `ztest snapshot manifest <archive>`, or hand-write one \
+                 with just those two fields for a non-chain archive.",
                 source_abs.display(),
                 manifest_abs.display()
             ),
@@ -981,8 +981,8 @@ fn bake_archive(source_abs: &std::path::Path, span: Span) -> Result<BakedArchive
             span,
             format!(
                 "manifest {} records sha256 = {oid:?}, which is not a 64-character hex \
-                 digest; it must be the SHA-256 of the archive, which is also its Git LFS \
-                 object id",
+                 digest; it must be the SHA-256 of the archive, which is also its bucket \
+                 oid",
                 manifest_abs.display()
             ),
         ));

@@ -379,8 +379,8 @@ async fn materialize(
         return Err(MaterializeErr::Fatal(EnvError::ArchiveMaterializeFailed {
             archive: seed.name.clone(),
             reason: format!(
-                "the bucket has no blob for oid {} at the manifest's size ({} bytes). The \
-                 archive is committed but was never uploaded: run `git lfs push` for it.",
+                "no blob at oid {} with the manifest's size ({} bytes): run \
+                 `ztest snapshot push <archive>` to upload it",
                 seed.oid, seed.size
             ),
         }));

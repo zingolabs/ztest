@@ -44,7 +44,7 @@ for the API.
 every test ([design-architecture.md](design-architecture.md)).
 
 - 1 OSD per node on a dedicated data disk, 3 MONs, 2 MGRs.
-- Default RBD pool `size=3`; archive pool `size=1` (recreatable from LFS).
+- Default RBD pool `size=3`; archive pool `size=1` (recreatable from the snapshot bucket).
 - `rbd-csi-snapshotter` enabled.
 - Host side: `boot.kernelModules = [ "rbd" "ceph" ];`
 
@@ -107,7 +107,7 @@ ztest cluster setup --cluster prod
 the flake as in bootstrap step 1. Tailscale joins, k3s registers, Rook adds an
 OSD and rebalances over ~1 hour. For a replacement, drain and delete the old
 node first and set `removeOSDsIfOutAndSafeToRemove` on the `CephCluster`. The
-`size=3` pool re-replicates; the `size=1` archive pool re-materializes from LFS.
+`size=3` pool re-replicates; the `size=1` archive pool re-materializes from the bucket.
 
 **Disaster recovery** — k3s ships etcd snapshots off-cluster, 24h × 30
 retention. Re-provision 3 nodes, then:
@@ -118,7 +118,7 @@ ssh nixos@node-1.zaino-cluster.ts.net sudo k3s server \
 ```
 
 Rejoin nodes 2 and 3; Flux reconciles from git; Rook re-creates Ceph. If disks
-were wiped, archives re-materialize from LFS and ephemerals were transient.
+were wiped, archives re-materialize from the bucket and ephemerals were transient.
 Rehearse annually against a deliberately destroyed staging cluster.
 
 ## Onboarding

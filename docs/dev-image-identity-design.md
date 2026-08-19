@@ -115,13 +115,15 @@ actually staged, so the tag can never name a context the archive didn't ship.
 
 Two properties fall out for free:
 
-- **LFS.** The git index holds pointers, not payloads. Enumerating from git is
-  what makes a context containing LFS archives tractable at all; ztest's own
-  `fixtures/` is 14 GB smudged and a few KB as pointers. `remote_compile`
-  already substitutes pointers deliberately; the image path currently would not.
-  `bundle::pack` reads every file and the whole tar into memory, so a
-  `dev!(…, context = ".")` added in the ztest repo today is an out-of-memory
-  failure, not merely a slow one.
+- **Large payloads stay out.** Enumerating from git is what makes a context
+  sitting next to multi-GB chain archives tractable: git lists what is tracked,
+  not what is on disk. `bundle::pack` reads every file and the whole tar into
+  memory, so a `dev!(…, context = ".")` over a directory holding a materialized
+  archive is an out-of-memory failure, not merely a slow one. (Written when
+  ztest's own `fixtures/` was Git LFS-tracked — 14 GB smudged, a few KB as
+  pointers; the archives are now gitignored and bucket-hosted, see
+  [design-snapshots.md](design-snapshots.md). The property is unchanged, and
+  still applies to a consuming repo that does use LFS.)
 - **BuildKit's incremental context sync.** Its differ compares size + mtime, and
   our zeroed mtimes mean an unchanged tree transfers ~zero bytes even though the
   build pod's context dir is a fresh `emptyDir` each run.
@@ -549,8 +551,8 @@ Phases 1 and 2 are the correctness core. 3 and 4 are what make it stay correct.
   the key does not move. This is the regression test for the reported bug.
 - **Structural** — assert the manifest reference cannot be produced without a
   successful provision or probe (a failed node must yield no reference).
-- **LFS** — a context containing an LFS-tracked archive packs pointer-sized
-  entries, not the payload.
+- **Large payloads** — a context directory holding an untracked multi-GB archive
+  packs neither it nor an entry for it.
 - **Reference forms** — `repo:dev-<hash>@sha256:…` round-trips through the pod
   spec, and a reference is never produced without a successful build or probe.
 - **Fallback** — a non-git context still builds, under a distinct key schema.

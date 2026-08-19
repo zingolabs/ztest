@@ -12,24 +12,34 @@ pub mod zainod;
 pub mod zcashd;
 pub mod zebra;
 
-/// Sole `ztest.io/component` → backend table (no reflection in Rust).
+/// Sole `ztest.io/component` → backend table.
 ///
-/// - Read by [`metrics_rows`] / [`observe`] / [`metrics_components`] → new backend
-///   = one row, not three matches
-/// - Lives here, not in [`crate::metrics`] (which names no component)
+/// Exists because [`PodExporter`](crate::metrics::PodExporter) resolves a scrapee by its
+/// pod label at runtime, where no type is available — the one place a label must be
+/// mapped by hand. Every field is read straight off the backend's own
+/// [`MetricLayout`](crate::metrics::MetricLayout) / [`Observe`](crate::sync::Observe)
+/// impl, so a row or family added there needs no edit here
 struct MetricsBackend {
     label: &'static str,
     rows: &'static [crate::metrics::Row],
     observe: Option<fn(&crate::metrics::Exposition) -> Option<crate::sync::Observation>>,
 }
 
+impl MetricsBackend {
+    /// Component whose sync is observable — rows and reader both off its impls
+    const fn observed<T: crate::sync::Observe>(label: &'static str) -> Self {
+        Self { label, rows: <T as crate::metrics::MetricLayout>::ROWS, observe: Some(T::observe) }
+    }
+
+    /// Publishes rows but no sync progress (nothing to watch a chain build)
+    const fn rows_only<T: crate::metrics::MetricLayout>(label: &'static str) -> Self {
+        Self { label, rows: T::ROWS, observe: None }
+    }
+}
+
 const METRICS_BACKENDS: &[MetricsBackend] = &[
-    MetricsBackend {
-        label: "zainod",
-        rows: &zainod::ROWS,
-        observe: Some(<zainod::ZainoIndexer as crate::sync::Observe>::observe),
-    },
-    MetricsBackend { label: "zebrad", rows: &zebra::ROWS, observe: None },
+    MetricsBackend::observed::<zainod::ZainoIndexer>("zainod"),
+    MetricsBackend::rows_only::<zebra::ZebraValidator>("zebrad"),
 ];
 
 fn backend_of(component_label: &str) -> Option<&'static MetricsBackend> {

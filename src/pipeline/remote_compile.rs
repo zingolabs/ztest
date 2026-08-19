@@ -601,7 +601,7 @@ fn git_repo_root(dir: &Path) -> Result<PathBuf, String> {
 /// [`IMAGE_SRC_ROOT`] → laptop `ancestor` for laptop-provisioned source paths.
 ///
 /// - Local (path) sources only; per-binary test paths stay pod-side
-/// - Seeds + their dep edges **never** re-homed (named by LFS OID = same everywhere)
+/// - Seeds + their dep edges **never** re-homed (named by oid = same everywhere)
 fn rehome_dump(dump: &mut images::DumpOutcome, ancestor: &Path) {
     let images::DumpOutcome::Discovered {
         images,
@@ -798,7 +798,7 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
 
 /// Same build context into a local dir, for the laptop-side bake
 /// ([`crate::pipeline::local_bake`]). Staged rather than handing `docker build` the source
-/// ancestor (what keeps LFS payloads out — see [`spawn_source_tar`])
+/// ancestor (what keeps gitignored payloads out — see [`spawn_source_tar`])
 pub fn extract_source_to(src: &SourceLayout, dest: &Path) -> Result<(), String> {
     let mut stream = spawn_source_tar(src)?;
     let tar_stdout = stream.child.stdout.take().expect("tar stdout is piped");
@@ -852,9 +852,8 @@ fn oversized_context(total: u64, mut sized: Vec<(u64, PathBuf)>) -> String {
         msg.push_str(&format!("  {:>10}  {}\n", gib(*n), p.display()));
     }
     msg.push_str(
-        "\nOnly first-party source belongs in the context. LFS-track a large \
-         artifact (`filter=lfs` in .gitattributes) or .gitignore it to drop it \
-         from the ship set; raise the ceiling with ",
+        "\nOnly first-party source belongs in the context. .gitignore a large \
+         artifact to drop it from the ship set; raise the ceiling with ",
     );
     msg.push_str(CONTEXT_MAX_ENV);
     msg.push_str(" (e.g. 1Gi) only if the tree really must ship this much.");

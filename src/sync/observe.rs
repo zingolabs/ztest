@@ -9,7 +9,7 @@
 //!   [`Phase`](super::Phase), and an `Unknown` variant no subject reports would face
 //!   every probe matching on one. The shared part is [`Work`], reused whole
 
-use super::work::{Rate, Work};
+use super::work::{Op, Rate, Work};
 use crate::metrics::Exposition;
 use crate::rate::{Pace, Stamp};
 
@@ -78,14 +78,75 @@ impl From<&super::Snapshot> for Observation {
     }
 }
 
+/// The height families a component publishes. Read in a different order by a probe than
+/// by a display, so the preference lives here as data rather than as two hand-written
+/// resolvers that can disagree.
+#[derive(Debug, Clone, Copy)]
+pub struct Heights {
+    /// Durable frontier — written and fsynced. What a probe gates on
+    pub committed: &'static str,
+    /// Frontier built ahead of the next commit; moves per block. What a display shows,
+    /// since `committed` steps once per commit and carries no per-second rate
+    pub live: Option<&'static str>,
+    /// Completion denominator. `None` = component publishes no target
+    pub target: Option<&'static str>,
+}
+
 /// Live progress readable from one scrape of a component's exporter.
 ///
 /// Keeps metric names out of the display: implemented beside the family constants a
 /// backend owns → a renamed family breaks here, not as an em-dash indistinguishable
-/// from a value still in flight
-pub trait Observe {
+/// from a value still in flight.
+///
+/// [`HEIGHTS`](Self::HEIGHTS) and [`WORK_OPS`](Self::WORK_OPS) are the whole declaration;
+/// every reader below is derived from them, so a probe and a panel cannot drift. Only
+/// [`observe`](Self::observe) is hand-written, and only for the parts that are genuinely
+/// per-component (cost breakdown, transaction count)
+pub trait Observe: crate::metrics::MetricLayout {
+    const HEIGHTS: Heights;
+
+    /// Per-[`Op`] counters this component publishes. An `Op` absent here stays
+    /// unmeasured: [`Work::require`] panics rather than compare a zero that can never fail
+    const WORK_OPS: &'static [(Op, &'static str)];
+
     /// `None` = not this component's exposition (nothing it should publish is present)
     fn observe(exposition: &Exposition) -> Option<Observation>;
+
+    /// Counters named by [`WORK_OPS`](Self::WORK_OPS); absent ones left unmeasured
+    fn work_of(exposition: &Exposition) -> Work {
+        let mut work = Work::ZERO;
+        for &(op, family) in Self::WORK_OPS {
+            if let Some(n) = exposition.counter_total(family) {
+                work.set(op, n);
+            }
+        }
+        work
+    }
+
+    /// Which family measures `op`, or `None` when this component does not count it
+    fn work_source(op: Op) -> Option<&'static str> {
+        Self::WORK_OPS.iter().find_map(|&(o, family)| (o == op).then_some(family))
+    }
+
+    /// Zero filtered out: a tip not yet known, not a zero-length chain (renders 100 %)
+    fn target_of(exposition: &Exposition) -> Option<u32> {
+        Self::HEIGHTS.target.and_then(|f| exposition.height_gauge(f)).filter(|&t| t > 0)
+    }
+
+    /// Durable first — what a probe gates on
+    fn committed_height(exposition: &Exposition) -> Option<u32> {
+        Self::height(exposition, [Some(Self::HEIGHTS.committed), Self::HEIGHTS.live])
+    }
+
+    /// Live first — what a display shows, so it moves per block
+    fn live_height(exposition: &Exposition) -> Option<u32> {
+        Self::height(exposition, [Self::HEIGHTS.live, Some(Self::HEIGHTS.committed)])
+    }
+
+    #[doc(hidden)]
+    fn height(exposition: &Exposition, order: [Option<&'static str>; 2]) -> Option<u32> {
+        order.into_iter().flatten().find_map(|f| exposition.height_gauge(f))
+    }
 }
 
 /// Trailing window over successive [`Observation`]s → per-second rates.

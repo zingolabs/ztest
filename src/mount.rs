@@ -16,7 +16,7 @@ pub struct Mount {
 /// Where a mount's contents come from; the paired [`MountKind`] decides their fate.
 ///
 /// - `Config*` → ConfigMap, under `mount_config!`'s ≤1 MiB UTF-8 cap
-/// - `Seed` = one OID-named LFS artifact (`DirArchive` extracts, `File` copies verbatim)
+/// - `Seed` = one oid-named bucket artifact (`DirArchive` extracts, `File` copies verbatim)
 /// - `Empty` = `Scratch`'s `emptyDir`
 /// - `SharedClaim` names a PVC `TestEnv::shared_volume` already made → resolution
 ///   creates nothing

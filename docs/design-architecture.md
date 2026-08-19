@@ -57,7 +57,7 @@ Ceph RBD snapshots the live PVC in place — no SIGTERM, no restart; clones boot
 
 ## Seeds — content-addressed archive PVCs
 
-Pre-baked PVC content (chain/indexer state) lives **in the consuming test crate** at `<test-crate>/tests/assets/*.tar.zst`, committed via Git LFS; there is no seed catalog in this repo. Tests reference assets via `mount_archive!` (see [guide-writing-tests.md](guide-writing-tests.md)), which resolves the path relative to `CARGO_MANIFEST_DIR` at compile time and fails the build if missing; the runtime payload is the absolute path, so binaries don't embed tarballs. Archive PVCs are content-addressed: the library SHA-256s the tarball at first use and dedupes by hash, so tests referencing identical bytes share one archive PVC.
+Pre-baked PVC content (chain/indexer state) is **content-addressed and bucket-hosted**: git holds a sidecar `<stem>.toml` manifest recording the archive's `sha256`/`size_bytes`, and the bytes live in the snapshot bucket at `lfs/<oid>` (see [design-snapshots.md](design-snapshots.md)). The chain snapshots ztest ships are `ChainSnapshot` consts in `src/snapshots.rs`, manifests under `fixtures/chains/snapshots/<network>/<upgrade>.toml`; a consuming test crate declares its own the same way. Tests reference them via `#[ztest::needs(CONST)]` or `mount_archive!` (see [guide-writing-tests.md](guide-writing-tests.md)), which reads the sidecar manifest at compile time and fails the build if it is missing — the archive bytes are never opened, so identity bakes in a build pod that cannot read them. Archive PVCs are keyed by that oid, so tests referencing identical bytes share one archive PVC.
 
 | Property | Value |
 | --- | --- |
@@ -65,7 +65,7 @@ Pre-baked PVC content (chain/indexer state) lives **in the consuming test crate*
 | Name | `seed-{sha8}` |
 | Labels | `seeds.ztest.io/sha`, `seeds.ztest.io/ready` |
 | Annotation | `last_accessed_at` (bumped per clone) |
-| Backing | Ceph archive pool, `size=1` (recreatable from LFS) |
+| Backing | Ceph archive pool, `size=1` (recreatable from the snapshot bucket) |
 
 Each archive has a paired `VolumeSnapshot`; tests always clone from the snapshot, never the live PVC.
 

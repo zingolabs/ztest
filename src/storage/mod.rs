@@ -1,6 +1,6 @@
 //! Seed bytes, from the snapshot bucket, OID-addressed. One source only.
 //!
-//! - Seed = Git LFS object at `lfs/<oid>` in [`r2::Bucket`], OID compiled into the
+//! - Seed = object at `lfs/<oid>` in [`r2::Bucket`], oid compiled into the
 //!   [`ChainSnapshot`](crate::ChainSnapshot); no paths, no local files, no sniffing
 //! - Hands out a presigned GET ([`r2::Bucket::presigned_get`]) and nothing else:
 //!   [`crate::materialize`]'s puller Job fetches node-local, at cluster bandwidth

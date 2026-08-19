@@ -81,9 +81,7 @@ path = "src/lib.rs"
 ztest_macros = { workspace = true }
 
 thiserror = { workspace = true }
-# `io-std` is for `ztest lfs-transfer`: the git-lfs custom transfer protocol is
-# a newline-delimited JSON conversation on this process's own stdin/stdout.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "io-std", "time", "fs", "process", "signal"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "fs", "process", "signal"] }
 tracing = { workspace = true }
 # ztest's own diagnostics subscriber (pod-lifecycle timing etc). `env-filter`
 # parses the `ZTEST_LOG` target syntax, mirroring nextest's `NEXTEST_LOG`.
@@ -154,7 +152,7 @@ rusqlite = { version = "0.37", optional = true }
 http = "1.1"
 
 reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
-# `io` gives `StreamReader`, wrapping a reqwest byte stream (the LFS blob GET)
+# `io` gives `StreamReader`, wrapping a reqwest byte stream (the seed blob GET)
 # as an `AsyncRead` we pipe into the seed uploader pod's stdin.
 tokio-util = { version = "0.7", features = ["io"] }
 base64 = "0.22"
@@ -193,9 +191,8 @@ libc = "0.2"
 nextest-metadata = "0.14"
 prometheus-parse = "0.2.5"
 # S3 client for the Cloudflare R2 bucket holding `fixtures/chains/*.tar.zst`:
-# `storage::r2` reads seeds from it, and `ztest lfs-transfer` (the git-lfs
-# custom transfer agent) reads and writes it. `aws` is the only backend we
-# want; `fs` (the default) would just shadow `storage::local`.
+# `storage::r2` reads seeds from it and `ztest snapshot push` writes it. `aws` is
+# the only backend we want; `fs` (the default) would just shadow `storage::local`.
 #
 # PINNED TO 0.13 ON PURPOSE — do not bump to 0.14 without reading this:
 #   * 0.14 moves to `reqwest ^0.13`, which would put a *second* reqwest in the

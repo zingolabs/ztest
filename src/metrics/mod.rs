@@ -62,7 +62,6 @@ pub enum MetricKind {
     Mean,
 }
 
-
 /// Which reading a row belongs to, so a renderer groups by meaning rather than by
 /// matching family names it would have to hardcode per backend.
 ///
@@ -110,6 +109,17 @@ pub const fn row(
     facet: Facet,
 ) -> Row {
     Row { label, family, reduce, live, unit, facet }
+}
+
+/// What one component publishes, declared beside the family constants it owns.
+///
+/// The single origin for that component's metric layout: [`crate::backends`]'s
+/// label→backend table and its own [`Exporter::rows`] both read this, so a row added
+/// here reaches every reader without a second edit. Components whose *sync* is
+/// observable extend it with [`Observe`](crate::sync::Observe)
+pub trait MetricLayout {
+    /// Report order — a reader renders them top to bottom
+    const ROWS: &'static [Row];
 }
 
 // ───────────────────────────── the exposition ─────────────────────────────

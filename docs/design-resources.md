@@ -136,20 +136,20 @@ snapshot bucket (`r2.rs`), addressed by OID.
 
 ### Identity is the OID
 
-A seed is a Git LFS object. Its identity is the `sha256`/`size_bytes` recorded in
-the artifact's sidecar `.toml`, which are *exactly* the committed LFS pointer's
-`oid`/`size` — an LFS object id is the SHA-256 of the file. The manifest is
-plaintext, never LFS-tracked, and present in every checkout and every build
-context, so `archive!` bakes the identity at expansion time with no `git` and no
-access to the archive bytes.
+A seed is a blob in the snapshot bucket. Its identity is the `sha256`/`size_bytes`
+recorded in the artifact's sidecar `.toml`, the SHA-256 of the file being both the
+bucket key and the PVC name. The manifest is plaintext and committed while the
+archive itself is not, so it is present in every checkout and every build context,
+and `archive!` bakes the identity at expansion time with no `git` and no access to
+the archive bytes.
 
 `storage::seed_sha8(oid)` names the PVC `seed-{oid[..8]}`. It is a pure function
 of a compile-time constant, so the laptop, the build pod, the runner pod and the
 puller Job all derive the same name without any of them reading the file.
 
 > **What this replaced.** Identity used to be the archive's *path*, hashed at
-> runtime, with a `Local` backend for a real file and an `Lfs` backend for a
-> pointer. That works on a laptop and nowhere else: under on-cluster compile the
+> runtime, with a `Local` backend for a real file and an `Lfs` backend for a Git
+> LFS pointer. That works on a laptop and nowhere else: under on-cluster compile the
 > path is `/src/…` inside a build container, which exists on no other machine —
 > so every seeded test failed with "does not exist", naming a path that had never
 > been openable where the error was raised. `Local`, the pointer sniffing, and

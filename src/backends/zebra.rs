@@ -166,11 +166,15 @@ pub struct ZebraValidator {
 /// Families zebrad publishes, in report order. All `AT_REST` (serving counters
 /// answer a whole-run question; live height comes from the subject, not the node)
 #[rustfmt::skip]
-pub const ROWS: [crate::metrics::Row; 3] = [
+const ROWS: [crate::metrics::Row; 3] = [
     crate::metrics::row("validator best height", "zebrad_chain_verified_block_height", crate::metrics::Reduce::Max, crate::metrics::AT_REST, crate::metrics::Unit::Count, crate::metrics::Facet::Progress),
     crate::metrics::row("blocks verified", "zebrad_chain_verified_block_total", crate::metrics::Reduce::Sum, crate::metrics::AT_REST, crate::metrics::Unit::PerSec, crate::metrics::Facet::Throughput),
     crate::metrics::row("connected peers", "zebrad_network_peers", crate::metrics::Reduce::Max, crate::metrics::AT_REST, crate::metrics::Unit::Count, crate::metrics::Facet::Progress),
 ];
+
+impl crate::metrics::MetricLayout for ZebraValidator {
+    const ROWS: &'static [crate::metrics::Row] = &ROWS;
+}
 
 #[async_trait]
 impl crate::metrics::Exporter for ZebraValidator {

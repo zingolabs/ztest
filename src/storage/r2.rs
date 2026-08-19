@@ -1,13 +1,13 @@
 //! [`Bucket`] — S3-compatible store (Cloudflare R2) for chain-snapshot blobs, and the
-//! one definition of Git LFS OID → key.
+//! one definition of oid → key.
 //!
 //! - Shared by [`crate::materialize`] (presigns a seed's GET for the puller Job) and
-//!   [`crate::cli::lfs_transfer`] (read+write on `git lfs pull`/`push`); key layout &
-//!   credential contract are [`Bucket::key`]/[`Bucket::resolve`], compiler-checked
-//!   rather than a convention that drifts into every fixture 404ing
-//! - Multipart is mandatory: LFS's stock `basic` adapter = one `PUT`, so it inherits
-//!   R2's 4.995 GiB single-request ceiling; IRONWOOD is 8.15 GiB. [`WriteMultipart`]
-//!   raises the ceiling to `MAX_PARTS × part size`, which [`part_size`] keeps non-binding
+//!   `ztest snapshot push`/`verify` (read+write); key layout & credential contract are
+//!   [`Bucket::key`]/[`Bucket::resolve`], compiler-checked rather than a convention that
+//!   drifts into every fixture 404ing
+//! - Multipart is mandatory: one `PUT` inherits R2's 4.995 GiB single-request ceiling and
+//!   IRONWOOD is 8.15 GiB. [`WriteMultipart`] raises the ceiling to `MAX_PARTS × part size`,
+//!   which [`part_size`] keeps non-binding
 
 // `get`/`put_multipart` moved to `ObjectStoreExt` in object_store 0.13
 use futures::TryStreamExt;
@@ -28,7 +28,7 @@ const SECRET_KEY_ENV: &str = "AWS_SECRET_ACCESS_KEY";
 
 /// Namespace for every managed object. Compile-time, not config — a per-deployment
 /// prefix reintroduces the reader/writer disagreement this module exists to prevent.
-/// [`Bucket::key`] for why it names the protocol, not the payload
+/// Frozen legacy name, see [`Bucket::key`]
 const KEY_PREFIX: &str = "lfs";
 
 /// R2 has no regions, but SigV4 needs *a* region in the signing scope and Cloudflare
@@ -150,15 +150,13 @@ fn load_credentials() -> Result<Option<Credentials>, StorageError> {
 }
 
 impl Bucket {
-    /// Object key for a Git LFS OID: `lfs/<oid>`. **Changing it re-uploads every blob.**
+    /// Object key for a snapshot oid: `lfs/<oid>`. **Changing it re-uploads every blob.**
     ///
-    /// - Prefix names the *protocol*, never the payload (`chains/` would double-store
-    ///   bytes wanted as anything else, losing content-addressed dedup)
+    /// - `lfs` = frozen from the retired Git LFS store (rename costs ~100 GB, buys nothing)
+    /// - Names the store, never the payload (`chains/` would double-store bytes wanted as
+    ///   anything else, losing content-addressed dedup)
     /// - Not the bare root → managed objects stay prefix-separable
-    /// - No sharding (git-lfs shards its *local* store for POSIX dir fanout only)
-    /// - **Not** rudolfs-compatible: it keys `[prefix/]<org>/<project>/<ab>/<cd>/<oid>`
-    ///   (namespace segment + 2-byte sha shard), so adopting an LFS server is a migration
-    ///   of every object, not a `--prefix` setting
+    /// - Flat, no sharding (object store has no POSIX dir fanout to spread)
     pub fn key(oid: &str) -> ObjectPath {
         ObjectPath::from(format!("{KEY_PREFIX}/{oid}"))
     }
@@ -219,7 +217,7 @@ impl Bucket {
 
     /// Upload `src` as the blob for `oid`, real S3 multipart.
     ///
-    /// - `total` = the LFS pointer's `size`, known before transfer, sizes parts ([`part_size`])
+    /// - `total` = manifest `size_bytes`, known before transfer, sizes parts ([`part_size`])
     /// - Mid-way failure aborts (stores bill for an incomplete upload's parts, and an
     ///   8 GiB orphan surfaces in no `list` here)
     pub async fn put(

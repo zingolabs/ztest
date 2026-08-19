@@ -50,38 +50,41 @@ pub trait Exporter: Send + Sync + 'static {
     /// `kind`. The caller names the wire family, so nothing here can drift from what the
     /// component publishes.
     ///
-    /// Waits for the family to appear: a gauge exists only once first set, so a probe
-    /// racing the first write sees nothing rather than a wrong value. Re-scrapes every
-    /// `sample_rate` ([`DEFAULT_SAMPLE_RATE`] when `None`) until it does, giving up after
-    /// [`METRIC_WAIT_BUDGET`] — a misspelled family would otherwise hang the test.
+    /// - `Ok(None)` = scraped fine, family not there. A real answer, not an error: a
+    ///   gauge exists only once first set, so a caller polling for a value must be able
+    ///   to keep polling across the window before the first write
+    /// - `Err` = the exporter itself could not be read, after retrying every
+    ///   `sample_rate` ([`DEFAULT_SAMPLE_RATE`] when `None`) for [`SCRAPE_RETRY_BUDGET`].
+    ///   A pod mid-replacement or a blipping portforward resolves inside that window; a
+    ///   wedged endpoint is named rather than mistaken for an unpublished family
     async fn metric(
         &self,
         name: &str,
         kind: MetricKind,
         sample_rate: Option<Duration>,
-    ) -> Result<f64, String> {
+    ) -> Result<Option<f64>, String> {
         let rate = sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
-        let deadline = tokio::time::Instant::now() + METRIC_WAIT_BUDGET;
+        let deadline = tokio::time::Instant::now() + SCRAPE_RETRY_BUDGET;
         loop {
-            if let Some(v) = self.read(SCRAPE_TIMEOUT).await?.read(name, kind) {
-                return Ok(v);
+            match self.read(SCRAPE_TIMEOUT).await {
+                Ok(exposition) => return Ok(exposition.read(name, kind)),
+                Err(e) if tokio::time::Instant::now() >= deadline => {
+                    return Err(format!(
+                        "{name}: /metrics unreadable for {SCRAPE_RETRY_BUDGET:?}: {e}"
+                    ));
+                }
+                Err(_) => tokio::time::sleep(rate).await,
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "{name} ({kind:?}) absent from /metrics after {METRIC_WAIT_BUDGET:?}                      — wrong family name, or this build publishes no metrics"
-                ));
-            }
-            tokio::time::sleep(rate).await;
         }
     }
 }
 
 /// `metric`'s re-scrape cadence when the caller names none
 pub const DEFAULT_SAMPLE_RATE: Duration = Duration::from_secs(5);
-/// How long `metric` waits for a family to appear before calling it absent. At the
-/// default sample rate that is two scrapes — enough to clear a scrape landing between
-/// two writes, not enough to hide a name that is simply wrong
-const METRIC_WAIT_BUDGET: Duration = Duration::from_secs(5);
+/// How long `metric` keeps retrying an unreadable exporter before naming it. Covers a
+/// pod mid-replacement or a portforward blip; a family that is merely absent never
+/// reaches this (it is `Ok(None)` on the first successful scrape)
+const SCRAPE_RETRY_BUDGET: Duration = Duration::from_secs(5);
 /// One `/metrics` HTTP read
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(5);
 

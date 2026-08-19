@@ -30,8 +30,8 @@ pub async fn bake_locally(
         }
     };
 
-    // Staged, not pointed at the source ancestor: staging applies the git/LFS file
-    // selection (else multi-GB LFS payloads get tarred in)
+    // Staged, not pointed at the source ancestor: staging applies the git file
+    // selection (else multi-GB chain archives get tarred in)
     let src = SourceLayout::resolve()?;
     let stage = TempDir::new("ztest-ctx")?;
     let ctx = stage.path().join("ctx");

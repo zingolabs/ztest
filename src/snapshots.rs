@@ -26,7 +26,7 @@
 //!
 //! # Adding one
 //!
-//! `scripts/produce-chain-fixture.sh <height> <version> <network>`, then
+//! `zaino/scripts/produce-chain-fixture.sh <height> <version> <network>`, then
 //! `ztest snapshot manifest <archive> > snapshots/<network>/zebra-<version>-<upgrade>.toml`,
 //! `ztest snapshot push <archive>`, and a const here.
 
