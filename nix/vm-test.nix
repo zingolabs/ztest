@@ -85,11 +85,9 @@ let
         machine.wait_for_unit("sockets.target")
         machine.succeed("${runtime} version")
 
-        # No AWS_* and no bucket.toml anywhere in these VMs: reads are public, so a green
-        # bucket line proves the consumer path (credentials = `snapshot push` only, host-side)
-
-        # --keep-vm-state reruns hit a surviving cluster
+        # cleanup if --keep-vm-state is set on prev run
         machine.execute("kind delete cluster --name ztest")
+
         machine.succeed("kind create cluster --name ztest --wait 120s")
         machine.succeed("kubectl cluster-info")
 
@@ -98,8 +96,6 @@ let
             print(out)
             assert "runtime: ${runtime} (probed)" in out, out
 
-        # 2>&1 throughout: driver execute() captures stdout only, and ztest's status +
-        # gate lines are eprintln! (console-only otherwise)
         with subtest("check names the storage gap, and the bucket needs no credentials"):
             status, out = machine.execute("ztest cluster check 2>&1")
             print(out)
@@ -109,7 +105,7 @@ let
 
         with subtest("stock kind cannot snapshot; unattended setup refuses to fix it"):
             status, out = machine.execute(
-                "ztest cluster setup --non-interactive --no-observability --no-metrics-api 2>&1"
+                "ztest cluster setup --non-interactive --no-observability 2>&1"
             )
             print(out)
             assert status != 0, "expected the snapshot gate to block setup"
@@ -117,8 +113,7 @@ let
 
         with subtest("setup provisions once storage is installed"):
             print(machine.succeed(
-                "ztest cluster setup --non-interactive --install-storage"
-                " --no-observability --no-metrics-api 2>&1"
+                "ztest cluster setup --non-interactive --install-storage 2>&1"
             ))
 
         with subtest("check goes green once setup has run"):

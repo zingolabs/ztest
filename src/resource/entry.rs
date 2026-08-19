@@ -23,10 +23,8 @@ use crate::resource::state::NodeState;
 /// - `no_wait` returns once objects exist, pushing rollout waits onto the first test run
 /// - `label_nvme_pool` blanket-labels every node → must be `false` on multi-node clusters
 ///   (there the operator owns which nodes carry NVMe)
-/// - `observability` = the one node worth declining (a cluster with its own
-///   Prometheus/Pyroscope wants `--no-observability` + the endpoints configured)
-/// - `metrics_api` writes into `kube-system` → declinable for a shared cluster ztest
-///   does not own (already-served clusters self-skip without it)
+/// - `observability` = the one node worth declining, covering both metrics planes (stack +
+///   `metrics.k8s.io`; a cluster with its own wants `--no-observability` + endpoints configured)
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct InitializeOpts {
@@ -35,7 +33,6 @@ pub struct InitializeOpts {
     pub label_nvme_pool: bool,
     pub backend: crate::cluster_config::ClusterClass,
     pub observability: bool,
-    pub metrics_api: bool,
 }
 
 impl Default for InitializeOpts {
@@ -49,7 +46,6 @@ impl Default for InitializeOpts {
             // run rules
             backend: crate::backends::image::selected_class(),
             observability: true,
-            metrics_api: true,
         }
     }
 }
@@ -98,17 +94,12 @@ where
     // Deployment (`ztest run` creates the build pod per build). Plain k8s → every cluster
     graph.add_dedup(Box::new(buildkit::BuildkitProvider));
 
-    // Metrics stack: the one *standing* workload here, with a real footprint → the one
-    // node whose absence is a choice rather than an oversight
+    // Metrics: only *standing* workload here (real footprint → absence = a choice, not an oversight)
+    // - both planes gated together (stack + `metrics.k8s.io`); `kube-system` pre-exists → no ns dep
     if opts.observability {
         graph
             .add_dedup(Box::new(scaffolding::NamespaceProvider::new(observability::OBS_NAMESPACE)));
         graph.add_dedup(Box::new(observability::ObservabilityProvider));
-    }
-
-    // Resource-metrics API. Independent of the stack above (different plane, different
-    // consumers); `kube-system` is pre-existing, so no namespace dep
-    if opts.metrics_api {
         graph.add_dedup(Box::new(metrics_api::MetricsApiProvider));
     }
 

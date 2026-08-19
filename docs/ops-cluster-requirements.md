@@ -57,7 +57,9 @@ needs none.
 plain Deployments in `ztest-obs`. Nothing for an operator to install, nothing to configure (Prometheus
 discovers ztest pods from labels they already carry).
 
-- `--no-observability` declines it
+- `--no-observability` declines it, together with the `metrics.k8s.io` API (metrics-server, into
+  `kube-system`) setup provisions alongside it — one switch for everything metrics-related; a
+  cluster already serving that API is left untouched either way
 - An existing Pyroscope is adopted by its `app.kubernetes.io/name` label rather than duplicated
 - Without the stack: components are not scraped and `ztest sync perf` is unavailable. Nothing else changes
 

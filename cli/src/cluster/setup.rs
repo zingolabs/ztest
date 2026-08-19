@@ -35,17 +35,13 @@ pub struct Args {
     #[arg(long)]
     no_wait: bool,
 
-    /// Don't provision the metrics stack (Prometheus + Pyroscope + Grafana).
-    /// For a cluster that already runs its own — configure the endpoints on the
-    /// cluster profile instead, and ztest uses those.
+    /// Don't provision anything metrics-related: neither the metrics stack (Prometheus
+    /// + Pyroscope + Grafana, into `ztest-obs`) nor the `metrics.k8s.io` API
+    /// (metrics-server, into `kube-system`). For a cluster whose operator owns these —
+    /// configure the stack's endpoints on the cluster profile instead, and ztest uses
+    /// those. A cluster already serving `metrics.k8s.io` is left untouched regardless.
     #[arg(long)]
     no_observability: bool,
-
-    /// Don't provision the `metrics.k8s.io` API (metrics-server, into `kube-system`).
-    /// For a cluster whose operator owns that API — a cluster already serving it is
-    /// left untouched regardless.
-    #[arg(long)]
-    no_metrics_api: bool,
 
     /// Install csi-hostpath on a snapshot-less local cluster instead of prompting.
     /// Copies each seed whole; far slower than a TopoLVM thin pool
@@ -134,7 +130,6 @@ async fn run(args: &Args) -> Result<(), CliError> {
     let mut opts = InitializeOpts::default();
     opts.no_wait = args.no_wait;
     opts.observability = !args.no_observability;
-    opts.metrics_api = !args.no_metrics_api;
 
     let states = resource::initialize(client, opts, on_change)
         .await
