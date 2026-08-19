@@ -7,3 +7,6 @@ publish = false
 
 [dependencies]
 tonic-prost-build = "0.14"
+
+[package.metadata.release]
+release = false

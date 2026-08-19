@@ -20,3 +20,6 @@ proc-macro2 = { workspace = true }
 quote = "1"
 syn = { workspace = true }
 toml = "0.9"
+
+[package.metadata.release]
+tag = false

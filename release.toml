@@ -1,0 +1,12 @@
+# - 5 crates, 1 version (workspace.package.version); `shared-version` holds them equal
+# - bump = `cargo release <version> --workspace`, which rewrites the sibling reqs below it
+
+shared-version = true
+pre-release-commit-message = "{{version}} release"
+
+# - default tags per-crate (5 tags/release); root `ztest` = the representative tagger
+# - every other member opts out via [package.metadata.release]
+tag-name = "v{{version}}"
+
+# - push + publish stay manual (tag lands first, then `cargo release --execute`)
+push = false

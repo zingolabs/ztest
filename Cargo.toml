@@ -19,7 +19,7 @@ version = "0.1.1"
 
 [workspace.dependencies]
 # - Siblings `=`-pinned (lockstep; macro expansion vs its runtime = link error, not an upgrade)
-# - Sole version literal (no `version.workspace` for deps) -> bump here + [workspace.package]
+# - Sole version literal (no `version.workspace` for deps); `cargo release` rewrites it
 ztest = { path = ".", version = "=0.1.1", default-features = false }
 ztest_macros = { path = "macros", version = "=0.1.1" }
 ztest_attr = { path = "attr", version = "=0.1.1" }

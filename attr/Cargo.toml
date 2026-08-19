@@ -14,3 +14,6 @@ description = "The `#[ztest::sync_test]` attribute grammar, shared by the proc-m
 [dependencies]
 proc-macro2 = { workspace = true }
 syn = { workspace = true }
+
+[package.metadata.release]
+tag = false

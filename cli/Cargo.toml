@@ -45,3 +45,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 ztest = { workspace = true, features = ["librustzcash", "test-util"] }
+
+[package.metadata.release]
+tag = false

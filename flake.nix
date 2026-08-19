@@ -65,42 +65,16 @@
           # Sets LIBCLANG_PATH so librocksdb-sys's bindgen finds libclang
           # without dragging an unpinned LLVM into PATH.
           rustPlatform.bindgenHook
-          # protoc for `cargo xtask regen-proto`. PROTOC is set in `env` below.
+
           protobuf
           cargo-nextest
           cargo-deny
           rust-analyzer
+          cargo-release
 
-          # Chain-snapshot artifact tooling (`fixtures/chains/`).
-          #
-          # `git-lfs` is NOT optional: `.gitattributes` declares
-          # `fixtures/chains/*.tar.zst filter=lfs`, and a clean/smudge filter
-          # whose binary is absent fails *open* — `git add` would commit the
-          # multi-GB archives themselves into the object database with no
-          # warning. Pinning it here makes the filter's presence a property of
-          # the shell rather than of whoever's laptop it is.
-          #
-          # The transfer agent that actually moves those blobs is `ztest
-          # lfs-transfer` (see src/cli/lfs_transfer.rs), so there is nothing
-          # else to install: `lfs.standalonetransferagent` points git-lfs at
-          # this repo's own binary and no LFS server is involved.
-          git-lfs
-
-          # Cluster tooling — `kind` brings up a local k8s cluster on
-          # top of Docker/Podman; `kubectl` talks to it; `kubernetes-helm`
-          # is here for the eventual observability stack.
+          # Cluster tooling
           kind
           kubectl
-          kubernetes-helm
-
-          # OpenShift tooling — `crc` (OpenShift Local) boots a single-node
-          # OpenShift VM via libvirt/KVM for tests that exercise the
-          # OpenShift API surface. `openshift` provides the `oc` client
-          # standalone so you can target a cluster without sourcing
-          # `crc oc-env` first. See the header comment for pull-secret /
-          # libvirtd prerequisites.
-          crc
-          openshift
         ];
 
         # stdenv.cc.cc.lib provides libstdc++.so.6 / libgcc_s.so.1 that
@@ -118,11 +92,6 @@
         };
       in
       {
-        # No image packages: all cluster images are built where they run. Component
-        # images and the on-cluster compile **builder** + test-runner **base**
-        # (`docker/{builder,runner-base}.Dockerfile`) are built on the cluster by
-        # `ztest cluster setup` in the ztest-owned rootless-buildah pod; local kind runs
-        # tests in-process (no runner image). See `src/resource/impls/base_images.rs`.
 
         devShells.default = pkgs.mkShell ({
           inherit nativeBuildInputs buildInputs;
@@ -133,7 +102,7 @@
         } // env);
 
         # `nix flake check` runs fmt + clippy on the workspace. Heavier
-        # nextest/doc builds stay out of the gate — local laptop CI.
+        # nextest/doc builds stay out of the gate
         checks = {
           fmt = pkgs.runCommand "cargo-fmt" {
             inherit nativeBuildInputs;
