@@ -23,28 +23,51 @@ ztest --version
 ### Quickstart
 
 ```sh
-# Create a Kind cluster with Docker (Reccomended)
+# Create a k8s cluster w/ docker (recommended) for podman see below
 kind create cluster
 
-# Create a Kind cluster with Podman
-systemd-run --user --scope -p Delegate=yes -- env KIND_EXPERIMENTAL_PROVIDER=podman kind create cluster
-
 ztest cluster add kind --kind kind --set-default
-ztest cluster setup
+ztest cluster setup --install-storage --no-observability
+ztest cluster check
 
-# Run integration tests against validator/indexer pods
+cd zaino/live-tests/  # Or any other repo w/ ztest-powered tests
 ztest run
 
-# Launch long-running background syncs
-ztest sync start zaino-index-construction
 ```
 
-#### Podman
-
-Only cluster creation differs. kind needs its provider named, and under rootless
-Podman it needs a cgroup-delegated scope:
+### Running Sync Tests
 
 ```sh
+kind create cluster
+ztest cluster add kind --kind kind --set-default
+ztest cluster setup --install-storage # Include the observability stack
+ztest cluster check
+
+cd zaino/live-tests/sync
+ztest sync start zaino-index-construction
+ztest sync list
+ztest sync status zaino-index-construction-1234abcd
+
+# For viewing profiling data
+uv tool install flameshow
+ztest sync perf zaino-index-construction-1234abcd --component zainod
+
+```
+
+### Podman Backend Cluster & Ztest
+
+```sh
+systemd-run --user --scope -p Delegate=yes -- env KIND_EXPERIMENTAL_PROVIDER=podman kind create cluster
+ztest cluster add kind --kind kind --set-default
+ztest cluster setup --install-storage
+ztest cluster check
+
+cd zaino/live-tests/
+ztest run
+
+cd zaino/live-tests/sync
+ztest sync start zaino-index-construction --watch
+
 
 ```
 
