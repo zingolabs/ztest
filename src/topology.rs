@@ -4,6 +4,8 @@
 //! - Override = a full explicit schedule via [`crate::TestEnv::activation_heights`],
 //!   checked by `ActivationHeights::validate_schedule`
 
+use crate::handles::wallet::Pool;
+
 // ────────────────────────── ActivationHeights ─────────────────────────
 
 /// Per-upgrade regtest activation heights. `None` = not activated
@@ -63,6 +65,23 @@ impl ActivationHeights {
 
     /// Pre-NU5 at 1, NU5..=NU6.3 at 2, NU7 off. Default for every regtest env
     /// unless overridden via [`crate::TestEnv::activation_heights`]
+    /// Effective coinbase pool at `height` for a validator mining to `mined_to`.
+    ///
+    /// - transparent/sapling miner addresses single-receiver → pinned at any height
+    /// - orchard/ironwood share one UA ([`crate::regtest_conf::ORCHARD_MINER_ADDRESS`])
+    ///   → highest-priority *active* receiver wins (sapling below NU5, orchard from
+    ///   NU5, ironwood from NU6.3)
+    pub fn coinbase_pool_at(&self, height: u32, mined_to: Pool) -> Pool {
+        let active = |h: Option<u32>| h.is_some_and(|a| height >= a);
+        match mined_to {
+            Pool::Transparent => Pool::Transparent,
+            Pool::Sapling => Pool::Sapling,
+            Pool::Orchard | Pool::Ironwood if active(self.nu6_3) => Pool::Ironwood,
+            Pool::Orchard | Pool::Ironwood if active(self.nu5) => Pool::Orchard,
+            Pool::Orchard | Pool::Ironwood => Pool::Sapling,
+        }
+    }
+
     pub fn regtest_default() -> Self {
         ActivationHeights::builder()
             .set_overwinter(Some(1))
@@ -211,6 +230,43 @@ pub enum NetworkUpgrade {
 
 #[cfg(test)]
 mod tests {
+    // sapling→orchard→ironwood ladder walked by one UA-mined chain
+    #[test]
+    fn ua_coinbase_follows_the_active_receiver() {
+        let h = ActivationHeights::builder().set_nu5(Some(2)).set_nu6_3(Some(6)).build();
+        assert_eq!(h.coinbase_pool_at(1, Pool::Orchard), Pool::Sapling);
+        assert_eq!(h.coinbase_pool_at(2, Pool::Orchard), Pool::Orchard);
+        assert_eq!(h.coinbase_pool_at(5, Pool::Orchard), Pool::Orchard);
+        assert_eq!(h.coinbase_pool_at(6, Pool::Orchard), Pool::Ironwood);
+    }
+
+    // Ironwood never activated → orchard holds to the tip
+    #[test]
+    fn ua_coinbase_stays_orchard_without_nu6_3() {
+        let h = ActivationHeights::builder().set_nu5(Some(2)).build();
+        assert_eq!(h.coinbase_pool_at(1, Pool::Orchard), Pool::Sapling);
+        assert_eq!(h.coinbase_pool_at(99, Pool::Orchard), Pool::Orchard);
+    }
+
+    // single-receiver miner addresses ignore the schedule
+    #[test]
+    fn single_receiver_miner_addresses_are_pinned() {
+        let h = ActivationHeights::builder().set_nu5(Some(2)).set_nu6_3(Some(6)).build();
+        for height in [1, 2, 6, 99] {
+            assert_eq!(h.coinbase_pool_at(height, Pool::Transparent), Pool::Transparent);
+            assert_eq!(h.coinbase_pool_at(height, Pool::Sapling), Pool::Sapling);
+        }
+    }
+
+    // Ironwood miner pool = same UA as Orchard, so it downgrades identically
+    #[test]
+    fn ironwood_miner_pool_downgrades_like_orchard() {
+        let h = ActivationHeights::builder().set_nu5(Some(2)).set_nu6_3(Some(6)).build();
+        assert_eq!(h.coinbase_pool_at(1, Pool::Ironwood), Pool::Sapling);
+        assert_eq!(h.coinbase_pool_at(3, Pool::Ironwood), Pool::Orchard);
+        assert_eq!(h.coinbase_pool_at(6, Pool::Ironwood), Pool::Ironwood);
+    }
+
     use super::*;
 
     #[test]
