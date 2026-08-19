@@ -589,7 +589,7 @@ fn resolve_dir(rel: &LitStr) -> Result<std::path::PathBuf, syn::Error> {
 //
 // Two macros, one meaning each:
 //
-//   ztest::archive!(pub SAPLING = "fixtures/chains/….tar.zst")
+//   ztest::archive!(pub SAPLING = "snapshots/….tar.zst")
 //       binds a module-level `const SAPLING: ArchiveHandle` from the sidecar
 //       manifest. Declaration only.
 //

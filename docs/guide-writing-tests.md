@@ -1,12 +1,11 @@
 # Writing tests
 
-The Rust test-author API: build a topology with `TestEnv::builder`, dial
-components through handles, and matrix a `dev!` image across Rust toolchains.
+Rust test-author API: build a topology with `TestEnv::builder`, dial components through handles, matrix a
+`dev!` image across toolchains.
 
-Version selection lives entirely in the test code — no `versions.toml`, no
-`ZAINO_*_VERSION` env var. Assets (configs, seed tarballs) live under the test
-crate's `tests/assets/`; the `mount_*` macros resolve paths against
-`CARGO_MANIFEST_DIR` and fail compilation if the file is missing.
+- Version selection lives in the test code — no `versions.toml`, no `ZAINO_*_VERSION`
+- Assets (configs, seed tarballs) under the test crate's `tests/assets/`
+- `mount_*` macros resolve against `CARGO_MANIFEST_DIR` and fail *compilation* on a missing file
 
 ## At a glance
 
@@ -36,14 +35,13 @@ pub enum Validator { Zebrad(ZebradOpts), Zcashd(ZcashdOpts) }
 pub enum Indexer   { Zaino(ZainoOpts) }
 ```
 
-| Variant  | `image_repo`            | Constructor                    | Named ports                     |
-| -------- | ----------------------- | ------------------------------ | ------------------------------- |
-| `Zebrad` | `zfnd/zebra`            | `Validator::zebrad(version)`   | `rpc` (28232), `metrics` (9999) |
-| `Zcashd` | `electriccoinco/zcashd` | `Validator::zcashd(version)`   | `rpc` (28232)                   |
-| `Zaino`  | `zingolabs/zaino`       | `Indexer::zaino(version)`      | `grpc` (8137), `metrics` (9998) |
+| Variant  | `image_repo`            | Constructor                  | Named ports                     |
+| -------- | ----------------------- | ---------------------------- | ------------------------------- |
+| `Zebrad` | `zfnd/zebra`            | `Validator::zebrad(version)` | `rpc` (28232), `metrics` (9999) |
+| `Zcashd` | `electriccoinco/zcashd` | `Validator::zcashd(version)` | `rpc` (28232)                   |
+| `Zaino`  | `zingolabs/zaino`       | `Indexer::zaino(version)`    | `grpc` (8137), `metrics` (9998) |
 
-A published constructor pulls `<image_repo>:<version>`. Every variant chains the
-same builder methods:
+Published constructor pulls `<image_repo>:<version>`. Every variant chains the same builders:
 
 ```rust
 .named(name)                    // for peering / lookup
@@ -54,9 +52,8 @@ same builder methods:
 
 ## `dev!` — build a component from source
 
-When iterating on a component locally, replace the published constructor with
-`dev!`, which builds an image and returns the same `Validator`/`Indexer`/`Wallet`
-value (so the rest of the test is unchanged). Two source forms:
+Replaces the published constructor, returns the same `Validator`/`Indexer`/`Wallet` value, so the rest of
+the test is unchanged. Two source forms:
 
 ```rust
 // Local Dockerfile, resolved relative to the test source file:
@@ -70,8 +67,7 @@ dev!(Validator::Zebrad,
      dockerfile = "docker/Dockerfile")
 ```
 
-Both forms accept the builder chain and an optional Rust-version selector (see
-[matrix](#multi-rust-version-matrix)):
+Both accept the builder chain + an optional Rust-version selector ([matrix](#multi-rust-version-matrix)):
 
 ```rust
 let zai = t.add(dev!(Indexer::Zaino, "../packages/zainod/Dockerfile")
@@ -79,22 +75,19 @@ let zai = t.add(dev!(Indexer::Zaino, "../packages/zainod/Dockerfile")
     .mount(mount_archive!("tests/assets/zaino-100blocks.tar.zst", "/state")));
 ```
 
-The Dockerfile/`git`/`rev`/`context` values fold into a content-addressed
-`<repo>:dev-<hash>` tag, so identical `dev!` sites collapse to one build and
-distinct ones cache independently. Builds are cache hits on re-run; force a
-rebuild with `docker image rm <tag>` or `ZTEST_REBUILD_IMAGES=1`.
+Dockerfile/`git`/`rev`/`context` fold into a content-addressed `<repo>:dev-<hash>` tag → identical `dev!`
+sites collapse to one build, distinct ones cache independently. Re-runs hit cache; force with
+`docker image rm <tag>` or `ZTEST_REBUILD_IMAGES=1`.
 
 ### Constraints
 
-- **Every dev image is built before any test runs**, from a static declaration
-  scan. A test only *looks up* an already-built tag at runtime; it never builds.
-  A tag with no matching build fails `build()` with `DevImageMissing`.
-- `dev!` is valid only inside a function body. For a binary-wide declaration no
-  test references yet, wrap it: `const _: () = { dev!(...); };`.
-- At most one `dev!` image per component variant per test binary. A second
-  `dev!(Indexer::Zaino, ...)` with a different source panics at startup.
-- Dockerfile / `git` / `rev` / `context` must be string literals (resolved at
-  compile time); computed paths are unsupported.
+- **Every dev image builds before any test runs**, from a static declaration scan. A test only *looks up*
+  an already-built tag; a tag with no matching build fails `build()` with `DevImageMissing`
+- Valid only inside a function body. Binary-wide declaration no test references yet:
+  `const _: () = { dev!(...); };`
+- At most one `dev!` image per component variant per test binary — a second `dev!(Indexer::Zaino, …)`
+  with a different source panics at startup
+- Dockerfile / `git` / `rev` / `context` must be string literals (compile-time resolved); no computed paths
 
 ## Mounts
 
@@ -111,16 +104,16 @@ pub enum MountSource {
 pub enum MountKind { Config, File, DirArchive, Scratch, Shared }
 ```
 
-| Macro                      | Materialized as                                        | Templated | Compile-time rules                        |
-| -------------------------- | ------------------------------------------------------ | --------- | ----------------------------------------- |
-| `mount_config!(rel, dst)`  | `ConfigMap` at `dst`                                   | Yes       | Must exist, UTF-8, < 1 MiB                |
-| `mount_file!(rel, dst)`    | Content-addressed single-file PVC                      | No        | Must exist                                |
-| `mount_archive!(rel, dst)` | Content-addressed extracted-tar PVC; CoW clone per use | No        | Must exist (`.tar.zst` recommended)       |
+| Macro                      | Materialized as                                        | Templated | Compile-time rules                  |
+| -------------------------- | ------------------------------------------------------ | --------- | ----------------------------------- |
+| `mount_config!(rel, dst)`  | `ConfigMap` at `dst`                                   | Yes       | Must exist, UTF-8, < 1 MiB          |
+| `mount_file!(rel, dst)`    | Content-addressed single-file PVC                      | No        | Must exist                          |
+| `mount_archive!(rel, dst)` | Content-addressed extracted-tar PVC; CoW clone per use | No        | Must exist (`.tar.zst` recommended) |
 
 ## Handles and endpoints
 
-`env.handle(&h)` returns the test's interface to a running component: an
-**endpoint** (raw `(host, port)`) plus **typed RPC** sugar on top.
+`env.handle(&h)` = the test's interface to a running component: an **endpoint** (raw `(host, port)`) plus
+**typed RPC** sugar over it.
 
 ```rust
 pub struct Endpoint { pub host: IpAddr, pub port: u16 }
@@ -135,19 +128,17 @@ pub trait Handle {
 }
 ```
 
-Routing is resolved at `TestEnv::build()`, transparent to test code:
+Routing resolves at `TestEnv::build()`, transparent to test code:
 
-| Mode                     | Endpoint                                     | Transport                                     |
-| ------------------------ | -------------------------------------------- | --------------------------------------------- |
-| In-cluster (CI runner)   | `{ host: pod IP, port: container_port }`     | direct TCP                                     |
-| Out-of-cluster (laptop)  | `{ host: 127.0.0.1, port: ephemeral }`       | kube-rs port-forward → API server → pod       |
+| Mode                    | Endpoint                                 | Transport                               |
+| ----------------------- | ---------------------------------------- | --------------------------------------- |
+| In-cluster (CI runner)  | `{ host: pod IP, port: container_port }` | direct TCP                              |
+| Out-of-cluster (laptop) | `{ host: 127.0.0.1, port: ephemeral }`   | kube-rs port-forward → API server → pod |
 
-Port-forwards are created lazily on first `endpoint(name)` per `(handle, name)`,
-cached, and closed when the handle drops. An undeclared port returns
-`EnvError::UnknownEndpoint`.
+- Port-forwards created lazily on first `endpoint(name)` per `(handle, name)`, cached, closed on handle drop
+- Undeclared port → `EnvError::UnknownEndpoint`
 
-Typed RPC builds on `endpoint("rpc")` (validators) / `endpoint("grpc")`
-(indexers, wallets):
+Typed RPC builds on `endpoint("rpc")` (validators) / `endpoint("grpc")` (indexers, wallets):
 
 ```rust
 impl ValidatorHandle {
@@ -158,7 +149,7 @@ impl ValidatorHandle {
 }
 ```
 
-For a protocol with no shipped client, dial the endpoint yourself:
+No shipped client for a protocol → dial the endpoint yourself:
 
 ```rust
 let ep = env.handle(&zaino).endpoint("grpc").await?;
@@ -200,13 +191,10 @@ async fn rejects_height_past_tip(#[case] v: Validator, #[case] data: Mount) {
 
 ## Multi-Rust-version matrix
 
-Build one `dev!` image once per toolchain and let rstest pick the case. The
-version list appears in two roles:
+Build one `dev!` image per toolchain, let rstest pick the case. The version list appears in two roles:
 
-- `rust_versions` on the `dev!` call — **what gets built**; a property of the
-  image, read by the pre-build scan.
-- `#[case]` + `.rust_version(rust)` — **what a run uses**; selects among the
-  pre-built images at runtime.
+- `rust_versions` on the `dev!` call — **what gets built** (a property of the image, read by the pre-build scan)
+- `#[case]` + `.rust_version(rust)` — **what a run uses** (selects among pre-built images at runtime)
 
 ```rust
 const RUSTS: &[&str] = &["1.88", "1.91.0"];
@@ -230,38 +218,31 @@ async fn builds_on_rust(#[case] rust: &str) -> Result<()> {
 }
 ```
 
-To pin a single toolchain (and stop ztest from overriding a Dockerfile's own
-default), use the singular `rust_version = "…"`; no `.rust_version()` call is
-then needed. Each version folds into the content-addressed tag, so
-`zebrad@1.88` and `zebrad@1.91.0` coexist.
+Singular `rust_version = "…"` pins one toolchain (and stops ztest overriding a Dockerfile's own default);
+no `.rust_version()` call needed then. Each version folds into the tag, so `zebrad@1.88` and
+`zebrad@1.91.0` coexist.
 
 ### Rules
 
-- **Keep the `#[case]` count in sync with the `const`.** rstest can't expand a
-  const into cases. An extra const entry builds an unused image (slow); a missing
-  one indexes past the end.
-- **Always thread `.rust_version(rust)`.** It is not compile-enforced. Skipping
-  it resolves the *default* tag, which for a matrixed `dev!` was never built, so
-  `build()` fails with `DevImageMissing`.
-- **Only `dev!` images vary.** `.rust_version()` on a published constructor is a
-  no-op — those images are pulled, not built.
+- **Keep `#[case]` count in sync with the `const`** — rstest cannot expand a const into cases; an extra
+  entry builds an unused image (slow), a missing one indexes past the end
+- **Always thread `.rust_version(rust)`** — not compile-enforced. Skipping it resolves the *default* tag,
+  never built for a matrixed `dev!` → `build()` fails with `DevImageMissing`
+- **Only `dev!` images vary** — `.rust_version()` on a published constructor is a no-op (pulled, not built)
 
 ### `RUST_VERSION` build-arg resolution
 
-For any dev-image build, the `RUST_VERSION` build-arg is picked in order:
-
-1. the pinned version (`rust_version` / `.rust_version()` / a `rust_versions` entry),
-2. a *concrete* `channel` in a `rust-toolchain.toml` in the build context (a
-   rustup channel name like `stable`/`beta`/`nightly` is ignored — it isn't a
-   docker tag),
-3. the Dockerfile's own `ARG RUST_VERSION` default.
+1. Pinned version (`rust_version` / `.rust_version()` / a `rust_versions` entry)
+1. A *concrete* `channel` in a `rust-toolchain.toml` in the build context — a rustup channel name
+   (`stable`/`beta`/`nightly`) is ignored, it isn't a docker tag
+1. The Dockerfile's own `ARG RUST_VERSION` default
 
 Only (1) folds into the image tag.
 
 ### Cost
 
-Each version is a full serialized rebuild, multiplying preflight build time and
-cache size by N. Zebra is ~10 min per build — keep matrix sets small.
+Each version = a full serialized rebuild → preflight time and cache size × N. Zebra is ~10 min per build;
+keep matrix sets small.
 
 ## Errors
 
@@ -285,8 +266,8 @@ pub enum EnvError {
 }
 ```
 
-`component` is `{kind}-{version}` (e.g. `zebrad-1.9.1`). The client does not
-auto-retry `Transient` — wrap your own policy if the operation is idempotent.
+- `component` = `{kind}-{version}` (e.g. `zebrad-1.9.1`)
+- No auto-retry on `Transient` — wrap your own policy when the operation is idempotent
 
 ## See also
 

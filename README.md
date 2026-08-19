@@ -3,10 +3,32 @@
 Boot Zcash topologies (validators, indexers, wallets) on Kubernetes and
 hand **typed RPC handles** back to test code.
 
+### Installation
+
+```sh
+cargo install ztest_cli
+
+# Install Kind, Kubectl, Docker, Podman, etc.
+# Kind Installation:
+#   via nix:  nix-shell -p kind
+#   via brew: brew install kind
+#   via arch: sudo pacman -Syu kind
+
+kubectl --version
+kind --version
+docker --version
+ztest --version
+```
+
 ### Quickstart
 
 ```sh
+# Create a Kind cluster with Docker (Reccomended)
 kind create cluster
+
+# Create a Kind cluster with Podman
+systemd-run --user --scope -p Delegate=yes -- env KIND_EXPERIMENTAL_PROVIDER=podman kind create cluster
+
 ztest cluster add kind --kind kind --set-default
 ztest cluster setup
 
@@ -16,6 +38,19 @@ ztest run
 # Launch long-running background syncs
 ztest sync start zaino-index-construction
 ```
+
+#### Podman
+
+Only cluster creation differs. kind needs its provider named, and under rootless
+Podman it needs a cgroup-delegated scope:
+
+```sh
+
+```
+
+Everything after is unchanged: `ztest cluster add` records whichever engine owns
+the cluster's node, and `ztest cluster check` prints it. See
+[ops-cluster-requirements.md](docs/ops-cluster-requirements.md#container-engine).
 
 ## Integration Test Usage
 

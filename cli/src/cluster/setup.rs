@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use clap::Args as ClapArgs;
 use dialoguer::Confirm;
 
-use super::csi_hostpath;
+use super::csi_hostpath::{self, Offer};
+use crate::CliError;
+use ztest::api::capability::Report;
 use ztest::api::resource::{self, InitializeOpts, NodeId, NodeState};
 
 #[derive(Debug, ClapArgs)]
@@ -65,7 +67,7 @@ pub fn execute(args: Args) -> ExitCode {
     crate::block_on("cluster setup", crate::Rt::Multi, run(&args))
 }
 
-async fn run(args: &Args) -> Result<(), String> {
+async fn run(args: &Args) -> Result<(), CliError> {
     // Echo the target pre-write (wrong-context provisioning = the irreversible footgun)
     let cfg =
         ztest::api::cluster::config().await.map_err(|e| format!("resolve kube config: {e}"))?;
@@ -73,22 +75,20 @@ async fn run(args: &Args) -> Result<(), String> {
     let client = kube::Client::try_from(cfg).map_err(|e| format!("connect to cluster: {e}"))?;
 
     // Refuse a cluster that cannot run tests: setup cannot fix a missing capability
-    // (operator's) → name it before writing anything
+    // (operator's) → name it before writing anything. Local-cluster storage = the one
+    // exception, so it speaks first and in its own shape
     let mut report = ztest::api::capability::probe(&client).await;
-    for cap in report.blocking() {
-        eprintln!("  ✗ {}: {}", cap.name, cap.finding.detail());
-        eprintln!("      see {}", cap.remedy);
-    }
-    // Local-cluster storage = only gap setup can close (assent-gated)
-    // Before the refusal below (else unreachable)
-    if csi_hostpath::offer(&report, args.non_interactive, args.install_storage)? {
-        csi_hostpath::install()?;
-        report = ztest::api::capability::probe(&client).await;
+    match csi_hostpath::offer(&report, args.non_interactive, args.install_storage)? {
+        Offer::Install => {
+            csi_hostpath::install()?;
+            report = ztest::api::capability::probe(&client).await;
+        }
+        Offer::Explained => return Err(CliError::Reported),
+        Offer::Unrelated => {}
     }
     if !report.is_runnable() {
-        return Err("cluster is missing a required capability; `ztest cluster check` for the \
-                    full report"
-            .to_string());
+        eprint!("{}", blocking_summary(&report));
+        return Err(CliError::Reported);
     }
 
     // First write gated on assent (remote cluster ztest did not create)
@@ -99,7 +99,7 @@ async fn run(args: &Args) -> Result<(), String> {
             .interact()
             .map_err(|e| format!("confirmation prompt: {e}"))?;
         if !ok {
-            return Err("aborted: no changes made".to_string());
+            return Err(CliError::Message("aborted: no changes made".into()));
         }
     }
 
@@ -160,15 +160,34 @@ async fn run(args: &Args) -> Result<(), String> {
     let (failed, blocked): (Vec<_>, Vec<_>) =
         required.into_iter().partition(|(_, s)| matches!(s, NodeState::Failed(_)));
     if !failed.is_empty() || !blocked.is_empty() {
-        return Err(format!(
-            "{} node(s) failed, {} node(s) blocked. See `  ✗ … / · …` lines above.",
+        // Counts only; each node already printed its own ✗ / · line
+        return Err(CliError::Message(format!(
+            "{} failed, {} blocked",
             failed.len(),
             blocked.len(),
-        ));
+        )));
     }
 
     eprintln!("\n✓ ztest resources ready. Run tests with: ztest run");
     Ok(())
+}
+
+/// Blocking capabilities, one line each, remedies deduped below (same doc anchor twice = noise)
+fn blocking_summary(report: &Report) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let mut remedies: Vec<&str> = Vec::new();
+    for cap in report.blocking() {
+        let _ = writeln!(out, "  ✗ {}: {}", cap.name, cap.finding.detail());
+        if !remedies.contains(&cap.remedy) {
+            remedies.push(cap.remedy);
+        }
+    }
+    for remedy in remedies {
+        let _ = writeln!(out, "  → {remedy}");
+    }
+    out
 }
 
 /// Insert-or-replace, vec kept in insertion order
@@ -177,5 +196,43 @@ fn upsert(v: &mut Vec<(NodeId, NodeState)>, id: &NodeId, state: &NodeState) {
         existing.1 = state.clone();
     } else {
         v.push((id.clone(), state.clone()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ztest::api::capability::{Capability, Finding, Need};
+
+    fn blocked(name: &'static str, remedy: &'static str) -> Capability {
+        Capability { name, need: Need::Required, finding: Finding::Absent("gone".into()), remedy }
+    }
+
+    /// Storage + snapshot API share a doc anchor: the setup screen it replaced spent
+    /// two of its four lines printing that anchor twice
+    #[test]
+    fn one_remedy_is_printed_once_however_many_capabilities_cite_it() {
+        let report = Report {
+            capabilities: vec![
+                blocked("snapshot-capable storage", "docs/ops-cluster-requirements.md#storage"),
+                blocked("VolumeSnapshot v1 API", "docs/ops-cluster-requirements.md#storage"),
+            ],
+        };
+        let summary = blocking_summary(&report);
+        assert_eq!(summary.lines().count(), 3, "{summary}");
+        assert_eq!(summary.matches("docs/ops-cluster-requirements.md#storage").count(), 1);
+    }
+
+    #[test]
+    fn distinct_remedies_all_survive() {
+        let report = Report {
+            capabilities: vec![
+                blocked("snapshot-capable storage", "docs/storage.md"),
+                blocked("image registry", "docs/registry.md"),
+            ],
+        };
+        let summary = blocking_summary(&report);
+        assert!(summary.contains("→ docs/storage.md"), "{summary}");
+        assert!(summary.contains("→ docs/registry.md"), "{summary}");
     }
 }

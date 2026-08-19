@@ -257,10 +257,8 @@ impl SyncReportMirror {
 
 // ── in-pod runtime (only reachable inside the sync test binary) ──────────
 
-#[cfg(feature = "librustzcash")]
 pub use runtime::{watch_stop, write_report};
 
-#[cfg(feature = "librustzcash")]
 mod runtime {
     use std::time::Duration;
 

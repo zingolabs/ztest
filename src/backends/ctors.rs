@@ -7,7 +7,9 @@ use crate::backends::lightwalletd::LightwalletdBackend;
 use crate::backends::zainod::ZainoBackend;
 use crate::backends::zcashd::ZcashdBackend;
 use crate::backends::zebra::ZebraBackend;
-use crate::component::{ComponentOpts, Indexer, IndexerMode, Validator, Wallet};
+#[cfg(feature = "librustzcash")]
+use crate::component::Wallet;
+use crate::component::{ComponentOpts, Indexer, IndexerMode, Validator};
 
 impl Validator<ZebraBackend> {
     pub fn zebrad(version: impl Into<String>) -> Self {

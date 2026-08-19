@@ -32,6 +32,7 @@ pub struct Snapshot {
     target: Option<u32>,
     pct: f32,
     phase: Phase,
+    detail: Option<&'static str>,
     work: Work,
     prev_work: Work,
     since_prev: Duration,
@@ -65,6 +66,10 @@ impl Snapshot {
     }
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+    /// Subject's own word for its stage, `None` = the lifecycle word alone
+    pub fn detail(&self) -> Option<&'static str> {
+        self.detail
     }
     /// Rollback from the deepest height seen, `0` = no reorg (probes compare against the
     /// Zcash rollback bound)
@@ -170,9 +175,9 @@ impl SnapshotBuilder {
 
     /// Fold one reading captured at `now` into a snapshot, advancing the rolling state.
     /// `last_fault_at` comes from the fault timeline
-    pub fn build<P: ProgressView>(
+    pub fn build(
         &mut self,
-        p: &P,
+        p: &dyn ProgressView,
         now: Instant,
         work: Work,
         last_fault_at: Option<Instant>,
@@ -205,6 +210,7 @@ impl SnapshotBuilder {
             target: p.target(),
             pct: p.pct(),
             phase: p.phase(),
+            detail: p.detail(),
             work,
             prev_work: self.prev_work,
             since_prev: now.saturating_duration_since(self.prev_at),

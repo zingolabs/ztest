@@ -59,6 +59,8 @@ pub struct ReportView {
     pub profile: String,
     pub status: SyncStatus,
     pub phase: Option<Phase>,
+    /// Subject's own stage word, rendered after the lifecycle one
+    pub phase_detail: Option<String>,
     pub elapsed: Duration,
     pub segment: Option<String>,
     pub height: Option<(u32, u32)>,
@@ -165,7 +167,13 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
     // Phase = chain-walk position, live only (a finished run's last phase adds nothing to
     // its verdict)
     let phase = match v.phase.filter(|_| v.status.is_live()) {
-        Some(p) => format!(" {dot} {}", p.style(theme.styles.dim)),
+        Some(p) => {
+            let label = match v.phase_detail.as_deref() {
+                Some(d) => format!("{p} {dot} {d}"),
+                None => p.to_string(),
+            };
+            format!(" {dot} {}", label.style(theme.styles.dim))
+        }
         None => String::new(),
     };
     let _ = writeln!(
@@ -568,6 +576,7 @@ mod tests {
             profile: "zaino_index_construction".into(),
             status: SyncStatus::Finished(ztest::api::SyncVerdict::Failed),
             phase: None,
+            phase_detail: None,
             eta: None,
             probes: None,
             elapsed: Duration::from_secs(1_842),
@@ -998,7 +1007,7 @@ mod tests {
     pub(super) fn running() -> ReportView {
         ReportView {
             status: SyncStatus::Running,
-            phase: Some(Phase::Historic),
+            phase: Some(Phase::Syncing),
             segment: None,
             height: Some((1_204_551, 1_700_000)),
             eta: Some(Duration::from_secs(4_320)),

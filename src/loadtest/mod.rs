@@ -9,7 +9,6 @@
 //!   [`LoadReport::assert_parity`] gating on byte-identical output
 //! - Engine concurrency is *across* tests (pod-per-test) → a load test is **one** test
 //!   fanning out internally, a library rather than an engine change
-//! - `docs/design-load-testing.md` for the measurement model
 
 pub mod client;
 pub mod driver;

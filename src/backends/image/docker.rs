@@ -1,6 +1,4 @@
-//! Build-local-then-push backend: `docker build` → `docker push` (one address for both).
-//!
-//! - Also hosts the authenticated OCI manifest probes (kubeconfig SA token + cluster CA)
+//! Build-local-then-push backend: `build` → `push` (one address for both)
 
 use std::process::Command;
 
@@ -9,6 +7,7 @@ use async_trait::async_trait;
 use super::{ImageError, ImageProvider, docker_build_argv, join, run_streamed};
 use crate::inventory::DevImageEntry;
 use crate::resource::{Cx, NodeId, Readiness, ResourceError};
+use crate::runtime;
 
 /// `registry` serves both push and pull, e.g. `ghcr.io/zingolabs`
 #[derive(Debug)]
@@ -77,23 +76,25 @@ impl Docker {
             &reference,
             entry.rust_version.as_deref(),
         );
-        let envs = [("DOCKER_BUILDKIT", "1".to_string())];
-        run_streamed(cx, tag, "docker", &argv, &envs, "docker build").await?;
+        let rt = runtime::active();
+        run_streamed(cx, tag, rt.as_str(), &argv, &rt.build_envs(), "build").await?;
 
         if let Some(sink) = &cx.progress {
             sink.note(&id, "push→registry");
         }
         let argv = docker_push_argv(&reference);
-        run_streamed(cx, tag, "docker", &argv, &[], "docker push").await
+        run_streamed(cx, tag, rt.as_str(), &argv, &[], "push").await
     }
 }
 
-/// `docker manifest inspect`: exit 0 = present, anything else = `false`
-/// (false negative → rebuild+push, whose own failure carries the real error)
+/// `manifest inspect`: exit 0 = present, anything else = `false` (both engines reach the
+/// remote registry; false negative → rebuild+push, whose own failure carries the real error)
 pub fn exists_in_registry(reference: &str) -> Result<bool, ImageError> {
-    let out = Command::new("docker").args(["manifest", "inspect", reference]).output().map_err(
-        |err| ImageError::Spawn { cmd: format!("docker manifest inspect {reference}"), err },
-    )?;
+    let engine = runtime::program();
+    let out =
+        Command::new(engine).args(["manifest", "inspect", reference]).output().map_err(|err| {
+            ImageError::Spawn { cmd: format!("{engine} manifest inspect {reference}"), err }
+        })?;
     Ok(out.status.success())
 }
 

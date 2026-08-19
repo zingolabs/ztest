@@ -2018,18 +2018,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsonrpsee-types"
-version = "0.24.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41d86fc943f81dab0ecdd6c0240b6e0f55ad57a2ea9ad8ad7efe8456fb9cc7a4"
-dependencies = [
- "http",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "jubjub"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5622,7 +5610,6 @@ dependencies = [
  "hex",
  "http",
  "inventory",
- "jsonrpsee-types",
  "k8s-openapi",
  "kube",
  "libc",
@@ -5651,7 +5638,6 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tokio-util",
  "toml 0.8.23",
  "tonic",
  "tonic-prost",
@@ -5665,7 +5651,6 @@ dependencies = [
  "zcash_proofs",
  "zcash_protocol",
  "zip",
- "zip32",
  "zstd",
  "ztest_attr",
  "ztest_macros",

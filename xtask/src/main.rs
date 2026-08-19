@@ -1,13 +1,11 @@
-//! Maintainer tasks. `protoc` lives here, not in the published build graph.
+//! `cargo xtask regen-proto` — rewrite the checked-in lightwalletd bindings.
 //!
-//! - `regen-proto` rewrites the checked-in lightwalletd bindings
-//! - `check-proto` fails if they drift from `proto/*.proto`
+//! - Sole reason this crate exists: keep `protoc` out of the published build graph
+//! - Drift = `git diff --exit-code src/proto/generated.rs` after a regen (CI does exactly that)
 
-use std::{
-    env, fs, io,
-    path::{Path, PathBuf},
-    process::ExitCode,
-};
+use std::error::Error;
+use std::path::Path;
+use std::{fs, process::ExitCode};
 
 const PROTOS: [&str; 2] = ["proto/compact_formats.proto", "proto/service.proto"];
 const PACKAGE: &str = "cash.z.wallet.sdk.rpc.rs";
@@ -18,54 +16,18 @@ const HEADER: &str = "\
 ";
 
 fn main() -> ExitCode {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
-    match env::args().nth(1).as_deref() {
-        Some("regen-proto") => run(&root, false),
-        Some("check-proto") => run(&root, true),
-        other => {
-            eprintln!(
-                "unknown task {:?}; expected regen-proto or check-proto",
-                other.unwrap_or("")
-            );
-            ExitCode::FAILURE
-        }
+    if let Err(e) = regen() {
+        eprintln!("xtask: {e}");
+        return ExitCode::FAILURE;
     }
-}
-
-fn run(root: &Path, check_only: bool) -> ExitCode {
-    match generate(root) {
-        Err(e) => {
-            eprintln!("proto codegen failed: {e}");
-            ExitCode::FAILURE
-        }
-        Ok(fresh) => {
-            let dest = root.join(CHECKED_IN);
-            let current = fs::read_to_string(&dest).unwrap_or_default();
-            if current == fresh {
-                println!("{CHECKED_IN} up to date");
-                return ExitCode::SUCCESS;
-            }
-            if check_only {
-                eprintln!("{CHECKED_IN} is stale — run `cargo xtask regen-proto`");
-                return ExitCode::FAILURE;
-            }
-            match fs::write(&dest, fresh) {
-                Ok(()) => {
-                    println!("wrote {CHECKED_IN}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("write {CHECKED_IN}: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-    }
+    println!("wrote {CHECKED_IN}");
+    ExitCode::SUCCESS
 }
 
 // Client only (ztest drives pod-hosted indexers, never serves the API); both protos share
 // one package, so a single compile emits one flat module.
-fn generate(root: &Path) -> io::Result<String> {
+fn regen() -> Result<(), Box<dyn Error>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask/ has a parent");
     let out = root.join("target/xtask-proto");
     fs::create_dir_all(&out)?;
     let protos: Vec<_> = PROTOS.iter().map(|p| root.join(p)).collect();
@@ -73,5 +35,6 @@ fn generate(root: &Path) -> io::Result<String> {
         .build_server(false)
         .out_dir(&out)
         .compile_protos(&protos, &[root.join("proto")])?;
-    Ok(format!("{HEADER}{}", fs::read_to_string(out.join(PACKAGE))?))
+    let generated = fs::read_to_string(out.join(PACKAGE))?;
+    Ok(fs::write(root.join(CHECKED_IN), format!("{HEADER}{generated}"))?)
 }

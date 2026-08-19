@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use clap::{Args as ClapArgs, Subcommand};
 
 use ztest::api::cluster_config::{self, Config, Profile};
+use ztest::api::runtime::{self, ContainerRuntime};
 
 mod csi_hostpath;
 mod setup;
@@ -86,6 +87,12 @@ struct AddArgs {
     #[arg(long, value_name = "DRIVER")]
     storage_driver: Option<String>,
 
+    /// Container engine for builds, side-loads and host profiling. Omitted,
+    /// ztest records whichever engine owns the cluster's node — pass this only
+    /// when there is no node to observe, or to override what it found.
+    #[arg(long, value_name = "ENGINE", value_parser = ["docker", "podman"])]
+    runtime: Option<String>,
+
     /// Also make this the active default.
     #[arg(long)]
     set_default: bool,
@@ -157,6 +164,7 @@ async fn add(a: AddArgs) -> Result<(), String> {
     };
     let named_driver = a.storage_driver.is_some();
     profile.storage_driver = a.storage_driver;
+    profile.runtime = a.runtime.as_deref().and_then(ContainerRuntime::parse);
     profile.validate()?;
 
     let mut cfg = cluster_config::load()?;
@@ -173,10 +181,40 @@ async fn add(a: AddArgs) -> Result<(), String> {
     if cfg.current.as_deref() == Some(a.name.as_str()) {
         println!("`{}` is now the default", a.name);
     }
+    if profile.runtime.is_none() {
+        adopt_runtime(&a.name, &profile);
+    }
     if !named_driver {
         adopt_storage_driver(&a.name).await;
     }
     Ok(())
+}
+
+/// Record the engine owning this cluster when the profile named none.
+///
+/// - kind profile → exact (node container = one engine's, never shared)
+/// - no node to observe → sole live daemon, else left unset
+/// - Never fatal: profile already saved, `ztest cluster check` = the gate
+fn adopt_runtime(name: &str, profile: &Profile) {
+    let observed = profile
+        .kind_cluster()
+        .and_then(|cluster| runtime::owner_of(&format!("{cluster}-control-plane")))
+        .or_else(runtime::sole_usable);
+    let Some(rt) = observed else {
+        println!("  runtime unset: no single engine found — name one with --runtime");
+        return;
+    };
+    match persist_runtime(name, rt) {
+        Ok(()) => println!("  runtime: {} (probed)", rt.as_str()),
+        Err(e) => println!("  runtime {} found but not saved: {e}", rt.as_str()),
+    }
+}
+
+fn persist_runtime(name: &str, rt: ContainerRuntime) -> Result<(), String> {
+    let mut cfg = cluster_config::load()?;
+    let profile = cfg.clusters.get_mut(name).ok_or("profile vanished between write and probe")?;
+    profile.runtime = Some(rt);
+    cfg.save()
 }
 
 /// Record the cluster's snapshot-capable driver when the profile named none.
@@ -296,9 +334,10 @@ fn render(report: &ztest::api::capability::Report, bound: Option<&str>) -> Strin
     let class = ztest::backends::image::selected_class().label();
     let _ = writeln!(
         out,
-        "cluster  {}  {}  (context: {context})",
+        "cluster  {}  {}  (context: {context}, runtime: {})",
         bound.unwrap_or("-").style(theme.styles.count),
         class.style(theme.styles.dim),
+        runtime::program().style(theme.styles.dim),
     );
 
     for cap in &report.capabilities {

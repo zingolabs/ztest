@@ -1,8 +1,9 @@
-//! Sync-subject abstraction = what varies between wallet, indexer, validator (design
-//! §"One harness, three subjects").
+//! Sync-subject abstraction = the whole of what the harness knows about what it watches.
 //!
-//! - `SyncRunner<S>` generic over it; subject launches or merely observes its own sync
+//! - Subject launches its own sync or merely observes one; harness never names an engine
 //! - Yields a raw per-tick [`ProgressView`], folded into a [`Snapshot`](crate::sync::Snapshot)
+//! - Object-safe on purpose: a profile binds `Box<dyn SyncSubject>`, so a new subject is a
+//!   new impl (any crate's) and never a new arm in ztest
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -13,21 +14,28 @@ use crate::handles::wallet::PoolBalances;
 use super::tree::TreeRoots;
 use super::work::{Op, Work};
 
-/// Live sync phase, surfaced in `watch` and readable by probes.
+/// Lifecycle position, the only phase vocabulary the harness owns.
 ///
-/// - Wallet: from pepper-sync `ScanPriority` (`Historic` ← `{Historic, OpenAdjacent,
-///   Scanning}`, `Finalizing` ← `{RefetchingNullifiers, ScannedWithoutMapping}`, rest by name)
-/// - Validator: from the headers-vs-blocks download split
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// - Deliberately engine-neutral: a subject's own stage names ride
+///   [`ProgressView::detail`], so no engine's scan taxonomy lands in this enum
+/// - `Syncing` = launched and working, whatever the subject calls that internally
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Phase {
     Starting,
-    Verifying,
-    ChainTip,
-    FoundNote,
-    Historic,
-    Finalizing,
-    Downloading,
+    Syncing,
     Done,
+}
+
+/// Unknown word → `Syncing`, never an error: a 48 h detached sync outlives the CLI build
+/// watching it, and a driver from another build may publish a stage word this one retired
+impl<'de> Deserialize<'de> for Phase {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(d)?.as_str() {
+            "Starting" => Phase::Starting,
+            "Done" => Phase::Done,
+            _ => Phase::Syncing,
+        })
+    }
 }
 
 /// Variant name = the wire tag = the rendered word, one definition (serde derives the
@@ -60,6 +68,11 @@ pub trait ProgressView: Send + std::fmt::Debug {
         }
     }
     fn phase(&self) -> Phase;
+    /// Subject's own word for its current stage, rendered beside [`phase`](Self::phase)
+    /// (`"historic scan"`, `"downloading headers"`). `None` = the lifecycle word alone
+    fn detail(&self) -> Option<&'static str> {
+        None
+    }
     /// Subject's own cumulative protocol work. `None` (default, every observer) → derived
     /// from [`height`](Self::height) via [`ChainWork`](crate::sync::ChainWork), needing
     /// nothing from the component. Override only where height misreports progress
@@ -83,18 +96,18 @@ pub trait ProgressView: Send + std::fmt::Debug {
 /// [`progress`](Self::progress) each tick, [`is_complete`](Self::is_complete), then
 /// [`stop`](Self::stop) on fatal violation or cancellation.
 ///
-/// Wallet: ztest owns the engine (launch spawns `pepper_sync::sync`). Self-syncing
-/// indexer/validator: `launch`/`stop` no-op, runner is a pure observer
+/// - Driving subject: `launch` starts the engine it owns, `stop` checkpoints it
+/// - Observing subject (component syncs itself): both no-op, runner is a pure prober
 // `Sync` not just `Send`: `progress(&self)` borrows across an await, so `async_trait`
 // needs the subject shareable for that future to be `Send`
 #[async_trait]
 pub trait SyncSubject: Send + Sync {
-    type Progress: ProgressView;
-
     /// Start the sync; the runner calls it exactly once
     async fn launch(&mut self) -> Result<(), RpcError>;
 
-    async fn progress(&self) -> Result<Self::Progress, RpcError>;
+    /// Boxed, not an associated type: the profile binds one `dyn SyncSubject`, so ztest
+    /// carries no enum of known subjects (allocation is per tick, seconds apart)
+    async fn progress(&self) -> Result<Box<dyn ProgressView>, RpcError>;
 
     async fn is_complete(&self) -> bool;
 
@@ -104,7 +117,7 @@ pub trait SyncSubject: Send + Sync {
         None
     }
 
-    /// Graceful stop (wallet: `sync_mode = Shutdown`); observers have nothing to stop
+    /// Graceful stop — checkpoint, never a kill; observers have nothing to stop
     async fn stop(&mut self) -> Result<(), RpcError> {
         Ok(())
     }

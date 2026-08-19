@@ -602,6 +602,7 @@ pub(super) struct Feed {
     /// exposition, which differenced against itself reads as a phantom stall)
     observed_at: Option<Instant>,
     phase: Option<ztest::sync::Phase>,
+    phase_detail: Option<String>,
     reorg_depth: u32,
     /// Newest event folded; keeps the fold exactly-once across a resumed stream's
     /// by-time replay
@@ -619,6 +620,7 @@ impl Feed {
             series: ztest::sync::Timeline::new(plot_channels(), ztest::api::metrics::LIVE_PERIOD),
             observed_at: None,
             phase: None,
+            phase_detail: None,
             reorg_depth: 0,
             folded_through: None,
         }
@@ -657,6 +659,7 @@ impl Feed {
             target: observation.target,
             pct: observation.pct(),
             phase: self.phase,
+            phase_detail: self.phase_detail.clone(),
             reorg_depth: self.reorg_depth,
             pace: window.block_pace(),
             tx_rate: window.tx_rate(),
@@ -755,9 +758,11 @@ impl Feed {
             SyncEvent::Tick(t) => {
                 // Engine state; no exporter publishes it, so every path needs it here
                 self.phase = Some(t.phase);
+                self.phase_detail = t.detail.clone();
                 self.reorg_depth = t.reorg_depth;
                 if let Some(vitals) = &mut self.state.vitals {
                     vitals.phase = Some(t.phase);
+                    vitals.phase_detail = t.detail.clone();
                     vitals.reorg_depth = t.reorg_depth;
                 }
                 self.ticked.push(t.at(), t.into());
@@ -941,7 +946,7 @@ mod tests {
 
         let v = f.state.vitals.as_ref().expect("vitals");
         assert_eq!(v.height, 900, "the scrape still owns the height");
-        assert_eq!(v.phase, Some(ztest::sync::Phase::Historic), "the tick still owns the phase");
+        assert_eq!(v.phase, Some(ztest::sync::Phase::Syncing), "the tick still owns the phase");
     }
 
     fn theme() -> Theme {
@@ -955,12 +960,13 @@ mod tests {
     /// Tick published `elapsed_ms` into the driver's run
     fn tick_at(seq: u64, height: u32, elapsed_ms: u64) -> SyncEvent {
         SyncEvent::Tick(ztest::sync::SyncTick {
+            detail: None,
             seq,
             elapsed_ms,
             height,
             target: Some(1024),
             pct: 0.0,
-            phase: ztest::sync::Phase::Historic,
+            phase: ztest::sync::Phase::Syncing,
             reorg_depth: 0,
             work: ztest::sync::Work::ZERO,
         })

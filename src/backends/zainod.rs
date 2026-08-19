@@ -875,20 +875,12 @@ fn frontier_of(exporter: &Exposition, op: &'static str) -> Result<u32, RpcError>
 ///   tick one, nothing observed
 #[async_trait]
 impl SyncSubject for ZainoIndexer {
-    type Progress = ZainoSyncProgress;
-
     async fn launch(&mut self) -> Result<(), RpcError> {
         Ok(())
     }
 
-    async fn progress(&self) -> Result<ZainoSyncProgress, RpcError> {
-        let exporter = self.exporter().await?;
-        let height = frontier_of(&exporter, "progress")?;
-        Ok(ZainoSyncProgress {
-            height,
-            target: Self::target_of(&exporter),
-            work: Self::work_of(&exporter),
-        })
+    async fn progress(&self) -> Result<Box<dyn ProgressView>, RpcError> {
+        Ok(Box::new(self.reading().await?))
     }
 
     /// Index written up to the tip it is working towards.
@@ -897,7 +889,7 @@ impl SyncSubject for ZainoIndexer {
     /// - Live network = **transient** (mainnet mints every ~75 s) → measurement runs
     ///   declare `run.until_height(..)`, completing ahead of this predicate
     async fn is_complete(&self) -> bool {
-        match SyncSubject::progress(self).await {
+        match self.reading().await {
             Ok(p) => p.target.is_some_and(|t| p.height >= t),
             Err(_) => false,
         }
@@ -905,6 +897,19 @@ impl SyncSubject for ZainoIndexer {
 
     fn work_source(&self, op: Op) -> Option<&'static str> {
         <Self as Observe>::work_source(op)
+    }
+}
+
+impl ZainoIndexer {
+    /// Concretely-typed read behind [`SyncSubject::progress`] — `is_complete` needs the
+    /// fields, which the boxed trait object does not expose
+    async fn reading(&self) -> Result<ZainoSyncProgress, RpcError> {
+        let exporter = self.exporter().await?;
+        Ok(ZainoSyncProgress {
+            height: frontier_of(&exporter, "progress")?,
+            target: Self::target_of(&exporter),
+            work: Self::work_of(&exporter),
+        })
     }
 }
 
@@ -931,8 +936,12 @@ impl ProgressView for ZainoSyncProgress {
         match self.target {
             None => Phase::Starting,
             Some(t) if self.height >= t => Phase::Done,
-            Some(_) => Phase::Downloading,
+            Some(_) => Phase::Syncing,
         }
+    }
+
+    fn detail(&self) -> Option<&'static str> {
+        matches!(self.phase(), Phase::Syncing).then_some("indexing")
     }
 
     /// Overrides the default: the chain-derived fallback turns a *height* into a work
@@ -1183,7 +1192,7 @@ mod tests {
 
     #[test]
     fn phase_tracks_the_gap_to_the_tip() {
-        assert_eq!(progress(10, Some(1_000)).phase(), Phase::Downloading);
+        assert_eq!(progress(10, Some(1_000)).phase(), Phase::Syncing);
         assert_eq!(progress(1_000, Some(1_000)).phase(), Phase::Done);
     }
 

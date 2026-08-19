@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use super::probe::{Class, ProbeState, ProbeStatus};
 use super::series::Timeline;
-#[cfg(feature = "librustzcash")]
 use super::snapshot::Snapshot;
 use super::work::Work;
 
@@ -72,13 +71,15 @@ pub struct Tick {
     pub target: Option<u32>,
     pub pct: f32,
     pub phase: super::Phase,
+    /// Subject's own stage word beside the lifecycle one (`"scanning"`); absent = none published
+    #[serde(default)]
+    pub detail: Option<String>,
     pub reorg_depth: u32,
     #[serde(default)]
     pub work: Work,
 }
 
 impl Tick {
-    #[cfg(feature = "librustzcash")]
     pub fn from_snapshot(snap: &Snapshot, elapsed: std::time::Duration) -> Self {
         Tick {
             seq: snap.seq(),
@@ -87,6 +88,7 @@ impl Tick {
             target: snap.target(),
             pct: snap.pct(),
             phase: snap.phase(),
+            detail: snap.detail().map(str::to_owned),
             reorg_depth: snap.reorg_depth(),
             work: snap.work(),
         }
@@ -200,7 +202,8 @@ mod tests {
             height: 901,
             target: Some(1024),
             pct: 88.1,
-            phase: crate::sync::Phase::Historic,
+            phase: crate::sync::Phase::Syncing,
+            detail: Some("scanning".into()),
             reorg_depth: 0,
             work: {
                 let mut w = Work::ZERO;
@@ -230,6 +233,8 @@ mod tests {
     /// - Unnumbered lines from an older driver must fold, not vanish
     /// - Literal = real pre-work-vector tick: retired `*_outputs` ignored, work map
     ///   empty = *unmeasured* → why the panel shows `—` not `0`
+    /// - `phase: "Historic"` = a retired subject-specific word; a 48 h sync outlives the
+    ///   build watching it, so an unknown stage folds to `Syncing` rather than failing
     #[test]
     fn an_unnumbered_event_from_an_older_driver_still_decodes() {
         let line = format!(
@@ -241,6 +246,8 @@ mod tests {
             panic!("did not decode as a tick");
         };
         assert_eq!(t.height, 5);
+        assert_eq!(t.phase, crate::sync::Phase::Syncing, "a retired stage word still folds");
+        assert_eq!(t.detail, None);
         assert_eq!(t.reorg_depth, 0, "an absent field decodes to its default");
         assert_eq!(t.work.get(Op::SaplingOutput), None);
         assert_eq!(t.work.total(), None);

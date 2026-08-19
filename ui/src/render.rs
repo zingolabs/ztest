@@ -1406,7 +1406,8 @@ mod tests {
             height: 901,
             target: Some(1024),
             pct: 88.1,
-            phase: Some(ztest::api::Phase::Historic),
+            phase: Some(ztest::api::Phase::Syncing),
+            phase_detail: Some("scanning".into()),
             reorg_depth: 0,
             pace: Some(ztest::api::Pace {
                 per_sec: 12.4,

@@ -3,7 +3,6 @@
 //! - Local only (shared-cluster storage = operator's)
 //! - Assent-gated (cluster-scoped writes + steals the default StorageClass)
 //! - Upstream manifests @ pinned refs, deploy dir = server minor
-//! - Mirrors `scripts/kind-storage.sh` (operator copy-paste path)
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -21,31 +20,51 @@ const DEFAULT_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-cl
 /// Gaps this install closes
 const FIXABLE: [&str; 2] = ["snapshot-capable storage", "VolumeSnapshot v1 API"];
 
-/// `Ok(false)` → caller's missing-capability refusal
-pub fn offer(report: &Report, non_interactive: bool, install: bool) -> Result<bool, String> {
+/// FIXABLE pair = one gap to a reader (probe names report the harness, not the cluster)
+const GAP: &str = "no volume snapshots";
+
+/// Subprocesses [`install`] drives
+const TOOLS: [&str; 2] = ["kubectl", "git"];
+
+/// How the local snapshot gap resolved, ahead of any capability report.
+///
+/// - `Explained` = gap + its fix already on stderr (caller exits without restating)
+/// - `Unrelated` = not this gap (caller's own report)
+pub enum Offer {
+    Install,
+    Explained,
+    Unrelated,
+}
+
+pub fn offer(report: &Report, non_interactive: bool, install: bool) -> Result<Offer, String> {
     if !fixable_here(report) {
-        return Ok(false);
+        return Ok(Offer::Unrelated);
+    }
+    // Before assent, not inside install() (assent then a tooling error = the offer was a lie)
+    let missing: Vec<&str> = TOOLS.into_iter().filter(|b| which(b).is_err()).collect();
+    if !missing.is_empty() {
+        eprintln!("✗ {GAP}; install {} to fix it here", missing.join(" + "));
+        return Ok(Offer::Explained);
     }
     if install {
-        return Ok(true);
+        return Ok(Offer::Install);
     }
     // Unattended = never mutate cluster-scoped state by default
     if non_interactive || !std::io::stdin().is_terminal() {
-        eprintln!(
-            "  (a local cluster can get this from `--install-storage`, or \
-             `scripts/kind-storage.sh`)"
-        );
-        return Ok(false);
+        eprintln!("✗ {GAP}; rerun with --install-storage");
+        return Ok(Offer::Explained);
     }
-    Confirm::new()
-        .with_prompt(
-            "Install the csi-hostpath driver for running sync tests? \
-             (csi-hostpath is much slower than a dedicated TopoLVM thin pool — it copies \
-             each seed whole instead of cloning copy-on-write)",
-        )
+    // One line, no wrap (dialoguer re-renders on answer → a wrapped prompt prints twice)
+    let yes = Confirm::new()
+        .with_prompt(format!("{GAP} — install csi-hostpath? (seed copies, no CoW)"))
         .default(false)
         .interact()
-        .map_err(|e| format!("confirmation prompt: {e}"))
+        .map_err(|e| format!("confirmation prompt: {e}"))?;
+    if !yes {
+        eprintln!("  → nothing installed; `ztest run` needs snapshots");
+        return Ok(Offer::Explained);
+    }
+    Ok(Offer::Install)
 }
 
 /// Storage = sole blocker, cluster = local
@@ -61,7 +80,7 @@ fn fixable_here(report: &Report) -> bool {
 ///
 /// - Blocking (setup CLI, nothing else in flight; every step = subprocess)
 pub fn install() -> Result<(), String> {
-    for bin in ["kubectl", "git"] {
+    for bin in TOOLS {
         which(bin)?;
     }
     let work = WorkDir::new()?;

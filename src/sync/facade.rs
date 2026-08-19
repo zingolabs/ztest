@@ -8,11 +8,8 @@
 
 use std::time::Duration;
 
-use crate::backends::librustzcash::LrzWallet;
-use crate::backends::zainod::ZainoIndexer;
 use crate::env::TestEnv;
 use crate::error::EnvError;
-use crate::handles::wallet::{Account, AccountId};
 
 use super::nemesis::{Nemesis, NemesisBuilder};
 use super::probe::{Cadence, Class, ProbeBuilder, ProbeSpec, Severity, SyncCtx};
@@ -20,74 +17,6 @@ use super::reporter::EventReporter;
 use super::runner::{SyncEngine, SyncOutcome, SyncVerdict};
 use super::subject::SyncSubject;
 use super::work::OpSet;
-
-/// Wallet-sync aggressiveness = the batch size
-/// [`sync_subject`](LrzWallet::sync_subject) drives `zcash_client_backend::sync`
-/// with. ztest-owned, so a body sets it without depending on the backend
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PerformanceLevel {
-    Low,
-    Medium,
-    High,
-}
-
-impl PerformanceLevel {
-    /// Compact-block batch size for `zcash_client_backend::sync::run`
-    pub fn batch_size(self) -> u32 {
-        match self {
-            PerformanceLevel::Low => 25,
-            PerformanceLevel::Medium => 100,
-            PerformanceLevel::High => 1_000,
-        }
-    }
-}
-
-/// Sync subject bound via `run.sync(Subject::wallet(account))`
-#[derive(Debug)]
-pub struct Subject {
-    kind: SubjectKind,
-}
-
-/// One variant per backend subject: `SyncSubject` carries an associated
-/// `Progress`, so each is a distinct `SyncEngine<S>` with nothing to erase
-#[derive(Debug)]
-enum SubjectKind {
-    Wallet { wallet: LrzWallet, account: AccountId, performance: Option<PerformanceLevel> },
-    Zaino { indexer: ZainoIndexer },
-}
-
-impl Subject {
-    pub fn wallet(account: &Account<LrzWallet>) -> Self {
-        Subject {
-            kind: SubjectKind::Wallet {
-                wallet: account.wallet().clone(),
-                account: account.id(),
-                performance: None,
-            },
-        }
-    }
-
-    /// Observe a zaino indexer's ingest; nothing driven (zaino syncs itself).
-    /// `loadtest` asks how fast zaino *answers*
-    pub fn zaino(indexer: &ZainoIndexer) -> Self {
-        Subject { kind: SubjectKind::Zaino { indexer: indexer.clone() } }
-    }
-
-    /// Override the sync performance level. Wallet-only — an observed subject
-    /// runs its own sync, so this warns and no-ops there
-    pub fn performance(mut self, level: PerformanceLevel) -> Self {
-        match &mut self.kind {
-            SubjectKind::Wallet { performance, .. } => *performance = Some(level),
-            SubjectKind::Zaino { .. } => {
-                tracing::warn!(
-                    "Subject::performance is a wallet sync knob and has no effect on an \
-                     observed zaino subject — configure zaino itself instead"
-                );
-            }
-        }
-        self
-    }
-}
 
 /// Cluster-free summary of a profile's registrations: invariants + nemesis, for
 /// `ztest sync describe`
@@ -103,7 +32,7 @@ pub struct SyncRunner {
     env: TestEnv,
     probes: Vec<ProbeSpec>,
     nemesis: Nemesis,
-    subject: Option<Subject>,
+    subject: Option<Box<dyn SyncSubject>>,
     engine: EngineOpts,
 }
 
@@ -159,8 +88,10 @@ impl SyncRunner {
         Ok(handles)
     }
 
-    pub fn sync(&mut self, subject: Subject) {
-        self.subject = Some(subject);
+    /// Bind what this profile watches. Any [`SyncSubject`] — ztest's backends implement it,
+    /// and so can a consuming crate's own component; the harness never names an engine
+    pub fn sync(&mut self, subject: impl SyncSubject + 'static) {
+        self.subject = Some(Box::new(subject));
     }
 
     /// Chain this run is pinned to: read from the artifact manifest at compile
@@ -256,8 +187,7 @@ impl SyncRunner {
     }
 
     /// Provision if needed, bind the engine over the subject, run to completion.
-    /// (Cluster-bound.) Arms cannot collapse — each subject is its own
-    /// `SyncEngine<S>`; shared post-engine work lives in [`drive`]
+    /// (Cluster-bound.)
     pub async fn run(self) -> SyncOutcome {
         let Some(subject) = self.subject else {
             return errored("run.sync(..) must be called before run.run()");
@@ -270,26 +200,15 @@ impl SyncRunner {
         };
         let ctx = SyncCtx::new(Some(reader));
 
-        match subject.kind {
-            SubjectKind::Wallet { wallet, account, performance } => {
-                let ws = match wallet.sync_subject(account, performance).await {
-                    Ok(ws) => ws,
-                    Err(e) => return errored(format!("bind wallet subject: {e}")),
-                };
-                drive(self.env, ws, ctx, self.probes, self.engine).await
-            }
-            SubjectKind::Zaino { indexer } => {
-                drive(self.env, indexer, ctx, self.probes, self.engine).await
-            }
-        }
+        drive(self.env, subject, ctx, self.probes, self.engine).await
     }
 }
 
 /// Configure the engine over `subject`, run it, attach what the engine cannot
 /// reach: flushed profiles + the mirrored durable report
-async fn drive<S: SyncSubject>(
+async fn drive(
     env: TestEnv,
-    subject: S,
+    subject: Box<dyn SyncSubject>,
     ctx: SyncCtx,
     probes: Vec<ProbeSpec>,
     opts: EngineOpts,

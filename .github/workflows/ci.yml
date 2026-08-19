@@ -21,5 +21,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: taiki-e/install-action@nextest
 
-      - run: cargo xtask check-proto
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # bindings are checked in; regen must be a no-op against proto/*.proto
+      - run: cargo xtask regen-proto
+      - run: git diff --exit-code src/proto/generated.rs
       - run: cargo nextest run --workspace

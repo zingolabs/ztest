@@ -12,6 +12,8 @@ use k8s_openapi::api::core::v1::Service;
 use kube::Client;
 use kube::api::{Api, ListParams};
 
+use crate::runtime::{self, ContainerRuntime};
+
 /// Set by the Pyroscope Helm chart = the only name-independent way to find an
 /// operator-installed service
 const NAME_LABEL: &str = "app.kubernetes.io/name";
@@ -117,7 +119,7 @@ pub async fn probe(client: &Client) -> Report {
                 name: "profile collector",
                 need: Need::Enables("CPU profiles (ztest sync perf)"),
                 finding: profiling,
-                remedy: "nested kubelet profiles host-side: needs a reachable docker daemon \
+                remedy: "nested kubelet profiles host-side: needs a reachable container engine \
                          (`--profile=false` runs without it)",
             },
             Capability {
@@ -130,8 +132,7 @@ pub async fn probe(client: &Client) -> Report {
                 name: "snapshot bucket",
                 need: Need::Enables("chain fixtures (.mainnet/.testnet)"),
                 finding: bucket,
-                remedy: "export AWS_* or write ~/.config/ztest/bucket.toml \
-                         (fixtures/chains/README.md#environment)",
+                remedy: "export AWS_* or write ~/.config/ztest/bucket.toml",
             },
         ],
     }
@@ -226,20 +227,24 @@ async fn probe_profiling(client: &Client) -> Finding {
         return Finding::Present("driver-pod sidecar".to_string());
     }
     let node_ip = crate::profiling::node_internal_ip(client).await;
-    let mut missing = Vec::new();
-    if !docker_usable() {
-        missing.push("a reachable docker daemon");
+    let engine = runtime::program();
+    let mut missing: Vec<String> = Vec::new();
+    if !runtime::active().usable() {
+        missing.push(format!("a reachable {engine} daemon"));
     }
     // The address the collector actually dials, not the kubeconfig's: a nested cluster's
     // kubeconfig points at loopback, which is dead once the collector leaves the host network
     if crate::profiling::node_api_server(client).await.is_none() {
-        missing.push("an apiserver address on the cluster network");
+        missing.push("an apiserver address on the cluster network".to_string());
     }
     if crate::profiling::host::cluster_network().await.is_none() {
-        missing.push("the cluster's docker network");
+        missing.push(format!("the cluster's {engine} network"));
+    }
+    if rootless_podman() {
+        missing.push("rootful podman (rootless --pid=host hides pod pids)".to_string());
     }
     if node_ip.is_none() {
-        missing.push("a node InternalIP to push to");
+        missing.push("a node InternalIP to push to".to_string());
     }
     match missing.as_slice() {
         [] => Finding::Present(format!(
@@ -250,13 +255,14 @@ async fn probe_profiling(client: &Client) -> Finding {
     }
 }
 
-/// Daemon reachable, not just a client on `PATH` (a `docker` binary with no daemon behind it
-/// fails at `sync start`, long after `check` said yes)
-fn docker_usable() -> bool {
-    std::process::Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output()
-        .is_ok_and(|out| out.status.success())
+/// Rootless podman: `--pid=host` = caller's processes only → no pod pids resolved
+/// (empty profile, not partial)
+fn rootless_podman() -> bool {
+    runtime::active() == ContainerRuntime::Podman
+        && std::process::Command::new(runtime::program())
+            .args(["info", "--format", "{{.Host.Security.Rootless}}"])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "true")
 }
 
 /// Metrics stack as one capability — provisioned as one, and a partial install has

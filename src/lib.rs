@@ -68,6 +68,7 @@ mod progress;
 mod proto;
 pub mod rate;
 mod resource;
+pub mod runtime;
 mod seeds;
 mod storage;
 mod storage_class;
@@ -77,7 +78,7 @@ mod storage_class;
 pub use crate::archive::{Artifact, Backend, ChainSnapshot, Network};
 pub use crate::backends::image::DevSource;
 #[cfg(feature = "librustzcash")]
-pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
+pub use crate::backends::librustzcash::{LrzBackend, LrzWallet, PerformanceLevel};
 pub use crate::backends::lightwalletd::LightwalletdIndexer;
 pub use crate::backends::zainod::ZainoIndexer;
 pub use crate::backends::zcashd::ZcashdValidator;

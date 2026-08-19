@@ -1,45 +1,108 @@
-# Running Tests
+# Running tests
 
-The suite runs via `cargo nextest run` — no wrapper binary, same command in dev and CI.
+Cluster tests run through **`ztest run`**, never bare `cargo nextest`.
+
+- Arguments after `run` forward verbatim to nextest — migration is `s/cargo nextest/ztest/`
+- `TestEnv::build()` refuses outside the orchestrator (`ZTEST_ENGINE`), naming the command to use;
+  a bare `cargo test` would otherwise create unbudgeted pods on whatever kubeconfig is loaded
+- ztest owns the run loop itself (`src/engine/`); nextest is invoked only for `list`
 
 ## Requirements
 
-- `cargo nextest` **≥ 0.9.x** — ztest reads `NEXTEST_TEST_GLOBAL_SLOT`, which older nextest doesn't set.
-- A reachable cluster, resolved by `kube::Config::infer()`: an in-pod ServiceAccount token, a SA-token `KUBECONFIG` (CI), or a dev `KUBECONFIG` for a local kind cluster.
-- Dev-image distribution — `kind load` by default, or registry push when `ZTEST_IMAGE_REGISTRY` is set. See [ops-clusters.md](ops-clusters.md) for the full `ZTEST_IMAGE_*` env-var table.
+- `cargo nextest` on PATH (inventory + selection)
+- A reachable cluster from `kube::Config::infer()`: in-pod SA token, or a `KUBECONFIG`
+- Cluster capabilities present — `ztest cluster check`
+  ([ops-cluster-requirements.md](ops-cluster-requirements.md))
+- Dev-image distribution: `kind load` locally, registry push remotely
+  ([ops-clusters.md](ops-clusters.md))
 
-## Dev
-
-```bash
-cargo nextest run -p zaino-integration-tests
-cargo nextest run -p zaino-integration-tests indexer::wallet_sync
-KUBECONFIG=~/.kube/kind-zaino cargo nextest run -p zaino-integration-tests
-```
-
-Each test process bootstraps its own namespace on first `TestEnv::build()`:
-
-```
-ztest-dev-${USER}-${NEXTEST_PID}-${NEXTEST_TEST_GLOBAL_SLOT}
-```
-
-`NEXTEST_PID` (nextest's PID) differs between parallel invocations, so their namespaces don't collide.
-
-Dev namespaces are **not** cleaned up at exit; the cluster TTL controller GCs them (default 1h after `last_accessed_at`). To force cleanup:
+## Invoking
 
 ```bash
-ztest cleanup            # your finished runs and syncs; --dry-run to preview
+ztest run -p zaino-integration-tests
+ztest run -p zaino-integration-tests indexer::wallet_sync     # substring on crate::module::test_fn
+ztest run -E 'test(reorg)'                                    # nextest filter DSL
+ztest run --cluster okd-home -p e2e                           # named profile: context + class + registry
+ztest run --no-cleanup -E 'test(flaky_one)'                   # keep the namespace for a post-mortem
+ztest run -R latest                                           # rerun what didn't pass last time
+```
+
+- `--cluster` and `-R/--rerun` must appear **before** the nextest args (everything after is forwarded)
+- `-j`/`--test-threads` is advisory — the engine auto-scales concurrency to QoS capacity
+- Engine consumes `--retries`, `--fail-fast`/`--no-fail-fast`, `--no-capture`, `-P/--profile`,
+  `--message-format`, `--success-output`/`--failure-output` directly
+- `--no-capture` serializes (nextest's `test_threads = 1` coupling) and streams live, so the pinned TTY
+  panel steps aside
+
+## Namespaces and cleanup
+
+One namespace per `TestEnv`, `ztest-{package}-{test}-{suffix}`; every resource is labeled
+`ztest.io/run-id` ([design-architecture.md](design-architecture.md)).
+
+- Normal exit: the laptop tears the namespace down after collecting logs
+- Ctrl-C: teardown runs in the surviving parent, `reap_run` by run-id, 30 s deadline
+- Crash: the 1 h `janitor/ttl` annotation is the unconditional backstop
+- `--no-cleanup` suppresses only the `Drop` teardown; the TTL still applies, so nothing leaks permanently
+
+```bash
+ztest cleanup                # your finished runs and syncs; --dry-run previews
 ztest cleanup --all-users
 ```
 
-`cleanup` skips anything still live (an in-flight run, a `Running` sync) and
-never touches the cluster itself or the seed cache; `--force` overrides the
-liveness gate.
+`cleanup` skips anything live (in-flight run, `Running` sync) unless `--force`, and never touches the
+cluster itself or the seed cache.
 
-## CI (GitHub Actions)
+## What a run does, in order
 
-One job on a default GitHub-hosted runner (`ubuntu-latest`, no self-hosted / ARC). The runner builds/pushes the dev image and drives the test binary over kubeconfig; every expensive operation runs on the cluster.
+1. **Probe** the cluster → capacity, kept live during the run
+1. **Admit** across concurrent runs via the k8s-Lease ledger ([design-qos.md](design-qos.md))
+1. **Inventory** — `cargo nextest list --message-format=json` + a per-binary `ZTEST_DUMP_INVENTORY` dump
+   (QoS tiers, `dev!` images, declared seeds)
+1. **Resource graph** — build/push `dev!` images, materialize declared seeds into content-addressed PVCs
+   - snapshots ([design-resources.md](design-resources.md))
+1. **Run loop** — scheduler grants by tier footprint, one process (or pod) per test
 
-Auth is a ServiceAccount-token `KUBECONFIG` stored as `KUBECONFIG_B64`: a cluster SA with run RBAC (namespace CRUD, VolumeSnapshot create, node/CSIDriver read), token embedded in a kubeconfig. Images go to `ghcr.io` — the runner pushes with `GITHUB_TOKEN`, the cluster pulls over egress (no cluster ingress needed).
+`ztest run describe` prints the plan without running it ([design-describe.md](design-describe.md)).
+
+## Seeds at preflight
+
+Per required `seed-<sha8>-<driver>` PVC in `ztest-seeds`:
+
+- ready → cached
+- not ready → attach to the puller Job's log stream
+- absent → create PVC + puller Job, which `curl`s a presigned TTL-bounded GET for `lfs/<oid>` straight
+  into `tar -x` — bytes go **R2 → node**, never through ztest or the apiserver
+
+Archives are gitignored, so a checkout holds none and nothing is fetched at clone time. The OID comes
+from `snapshots/<network>/zebra-<version>-<upgrade>.toml`, read at compile time. Credentials: `AWS_*`
+in the environment, else `~/.config/ztest/bucket.toml`; `ztest cluster check` reports the bucket as its
+own row.
+
+A missing seed fails only the tests that declared it (`#[ztest::needs]`), as a skip with a named reason —
+never the whole run.
+
+## Failure modes
+
+| Condition                         | Effect                                                      |
+| --------------------------------- | ----------------------------------------------------------- |
+| Cluster unreachable / auth failed | Run aborts before anything is created                       |
+| Missing required capability       | `ztest cluster setup` / `check` names it; run refuses       |
+| Bucket unreachable, object absent | Tests declaring that seed skip; the rest run                |
+| Image build/push failed           | Run fails — there is no fallback path                       |
+| Pod `Pending` on capacity         | Waits; bounded only by the tier's hard cap, never a failure |
+| Test exceeds hard cap             | SLOW at 1×, killed at 2× (janitor reaps the namespace)      |
+
+## Output
+
+- Reporter is byte-identical to `cargo nextest run`, one divergence: the captured block is stripped of
+  libtest's per-run framing ([design-execution-engine.md](design-execution-engine.md))
+- A failing test's block carries the runner's own output in full, then component logs (chronologically
+  merged, most recent 40 lines), then any pod terminal reason (OOMKilled/Evicted)
+- Every run is recorded: `ztest store list`, `ztest replay <run>`, `ztest run --rerun`
+
+## CI
+
+One job on a stock GitHub runner; every expensive operation runs on the cluster.
 
 ```yaml
 env:
@@ -51,133 +114,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: kubeconfig
         run: |
           mkdir -p ~/.kube
           echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
-
       - name: registry login
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - run: ztest run -p clientless -p e2e --test-threads 8
-
+      - run: ztest run -p clientless -p e2e
       - if: always()
         run: kubectl delete ns -l ztest.io/run-id=$ZTEST_RUN_ID
 ```
 
-`ZTEST_RUN_ID` prefixes each namespace name and labels every resource, so the cleanup step and cluster-resident observability filter by run — there is no artifact collection step; query logs/events/metrics by `run-id` (see [design-architecture.md](design-architecture.md#observability)). If the cleanup step is skipped (runner preempted), the TTL controller is the backstop.
-
-## Slot mechanics
-
-Nextest is process-per-test. With `--test-threads N`, up to N processes run concurrently, each assigned a slot in `0..N`. When a test finishes in a slot, the next test starts in that same slot as a new process, inheriting the slot number and its namespace.
-
-```
-nextest run --test-threads 4
-│
-├─ slot 0 ┬─ test_a (pid 1001)  ─┐ same namespace ztest-ci-X-0
-│         └─ test_d (pid 1009)  ─┘ across the slot's lifetime
-├─ slot 1 ── test_b
-├─ slot 2
-└─ slot 3
-```
-
-Pods in a shared namespace are UID-suffixed so they don't collide. Per-test cleanup uses the sentinel ConfigMap pattern (see [design-architecture.md](design-architecture.md#lifecycle)).
-
-**Hard cap: 16 slots.** ztest refuses to start if `NEXTEST_TEST_GLOBAL_SLOT >= 16`. Set `--test-threads ≤ 16`; for heavier parallelism, scale the cluster.
-
-## Filtering
-
-```bash
-cargo nextest run -p zaino-integration-tests indexer::wallet_sync              # substring match
-cargo nextest run -p zaino-integration-tests --filter-expr 'test(reorg)'
-cargo nextest run -p zaino-integration-tests --filter-expr 'binary(indexer) and not test(slow)'
-cargo nextest run -p zaino-integration-tests --skip slow                       # by name substring
-```
-
-Substring filters match the fully-qualified test name (`crate::module::test_fn`); `--filter-expr` accepts nextest's [filtering DSL](https://nexte.st/book/filter-expressions.html). Cross-version regression uses `rstest` — each `#[case]` is its own nextest target, so filters operate on cases too (see [guide-writing-tests.md](guide-writing-tests.md)).
-
-## Layout
-
-A *suite* is a directory under `tests/`; a *test case* is a `#[tokio::test]`. Cargo compiles each top-level file under `tests/` as a separate binary, so nextest's `hash:N/M` distributes binaries across workers — a flaky test's retry lands on the same worker.
-
-```
-crates/zaino-integration-tests/tests/
-├── indexer/        # Zaino ↔ validator
-├── interop/        # zebrad ↔ zcashd parity
-├── state/          # snapshot / clone
-└── wallet/
-```
-
-## Preflight
-
-`zkn-preflight` runs once per invocation as a [nextest setup script](https://nexte.st/book/configuration.html#setup-scripts), wired in via `.config/nextest.toml`:
-
-```toml
-[scripts.setup.preflight]
-command = ['cargo', 'run', '--quiet', '--bin', 'zkn-preflight']
-slow-timeout = { period = "120s", terminate-after = 3 }
-
-[[profile.default.scripts]]
-setup = ['preflight']
-```
-
-`capture-stdout`/`capture-stderr` stay false so the banner streams straight to the terminal.
-
-### What preflight does
-
-1. **Resolve the test selection.** Intersect the filter expression with the per-binary mount inventory; prune archives no selected test references.
-2. **Probe the cluster.** Resolve `KUBECONFIG`, list nodes, count `zaino-{ci,dev}-*` namespaces as a concurrency proxy.
-3. **Resolve archives.** For each required `seed-{sha8}-{driver}` PVC in `ztest-seeds`: ready → cached; not ready → attach to the puller Job's log stream; absent → create PVC + puller Job. The Job `curl`s a presigned, TTL-bounded GET for `lfs/<oid>` straight into `tar -x`, so the bytes go **R2 → node** and never enter ztest or the apiserver. Bucket unreachable or object missing → soft-fail and proceed. Materialization flow: [design-architecture.md](design-architecture.md#archive-pvcs).
-
-   Archives are gitignored, so a checkout holds none of them and nothing is fetched at clone time. The OID comes from `snapshots/<network>/zebra-<version>-<upgrade>.toml`, read at compile time. Credentials: [fixtures/chains/README.md](../fixtures/chains/README.md#environment); `ztest cluster check` reports the bucket as its own row.
-4. **Resolve snapshots.** For each `VolumeSnapshot` the selection clones, ensure its source PVC is ready (recurses into step 3) and the snapshot is bound.
-5. **Emit a final banner and exit 0.**
-
-Hard failures (cluster unreachable, auth, malformed manifest) exit ≠ 0; nextest treats a setup-script failure as a suite-level abort, so no test binary runs.
-
-### Banner
-
-```
-┌─ ztest ────────────────────────────────────────────────────
-│ cluster
-│   context        kind-zaino-local
-│   capacity       12 / 16 slots used  (configured: 6 via --test-threads)
-│   nodes          3 ready · 0 cordoned  (12 cores · 48 GiB)
-│ archives (4)
-│   ✓ regtest-nu5-h128        cached · 412 MiB
-│   ✓ testnet-2.6m            cached · 18.4 GiB
-│   ⇣ testnet-3.1m            pulling from R2       [█████░░] 64%
-│   ! mainnet-snapshot-9.0    missing  (no object at lfs/<oid>)
-│ snapshots
-│   ✓ pvc/zebra-testnet-cache   bound · ready
-│   ⇣ pvc/zebra-mainnet-cache   provisioning from archive testnet-3.1m
-└────────────────────────────────────────────────────────────
-```
-
-Markers: `✓` in target state; `⇣` in progress (refreshed in place); `!` soft failure — the run proceeds and only tests that need the affected resource fail at `TestEnv::build()`. Plain-ASCII fallback (`OK`/`..`/`WARN`, no escape codes) applies under `NO_COLOR=1` or a non-TTY stdout, so CI logs are diffable.
-
-### Failure modes
-
-| Condition                          | Marker | Run continues? |
-| ---------------------------------- | ------ | -------------- |
-| Cluster API unreachable            | n/a    | No — exit ≠ 0  |
-| Auth failed                        | n/a    | No — exit ≠ 0  |
-| Mount enumeration failed           | n/a    | No — exit ≠ 0  |
-| Bucket unreachable / object absent | `!`    | Yes; affected tests fail at `TestEnv::build()` with the missing-archive error |
-| Archive reconcile Job failed       | `!`    | Yes; same      |
-| VolumeSnapshot stuck in `Pending`  | `!`    | Yes; tests cloning it time out at `build()` |
-
-### Mount enumeration
-
-Each test binary publishes the `mount_archive!` / `mount_file!` / `mount_config!` paths it would invoke, via a `linkme` distributed slice compiled into a `&'static [Mount]` table. Preflight calls `<test-bin> --zkn-list-mounts` (parsed before nextest's arg-parser) and reads JSON on stdout, then intersects with the filter to build the work list. One `exec` per binary (~50 ms); the binary is already linked before setup scripts run.
-
-## Namespace summary
-
-|                     | Dev                                           | CI                                         |
-| ------------------- | --------------------------------------------- | ------------------------------------------ |
-| Namespace           | `ztest-dev-${user}-${nextest_pid}-${slot}`    | `ztest-ci-${run_id}-${slot}`               |
-| Created by          | Library, first `TestEnv::build()` in slot     | Same                                       |
-| Reused across tests | Within a slot, yes (sequential tests)         | Same                                       |
-| End-of-run cleanup  | None (TTL controller GC, default 1h idle)     | Workflow step deletes ns by `run-id` label |
-| Logs / metrics      | Cluster Loki + Prometheus (query by `run-id`) | Same                                       |
+- Auth = a ServiceAccount-token kubeconfig; the SA needs namespace CRUD, VolumeSnapshot create,
+  node/CSIDriver read, and `Lease` CRUD in `ztest-meta`
+- Images push to `ghcr.io` with `GITHUB_TOKEN`; the cluster pulls over egress, so no cluster ingress
+- `ZTEST_RUN_ID` labels every resource → the cleanup step and cluster-resident observability filter by
+  run; no artifact-collection step, query by `run-id`
+- Skipped cleanup (preempted runner) falls to the TTL janitor

@@ -1,16 +1,11 @@
 # Sync testing
 
-A test class for **long-running chain sync** — a wallet, indexer, or validator
-syncing from birthday/genesis to tip — that runs in a ztest-owned pod (up to the
-`sync` QoS tier's 48 h cap), **continuously asserts** correctness invariants
-against the in-progress sync, injects network chaos, and passes only when the
-subject reaches tip with every invariant intact.
+Test class for **long-running chain sync** — wallet, indexer, or validator, birthday/genesis → tip.
 
-Sync is not a one-shot `arrange → act → assert`. It is a **continuous monitor
-with a completion predicate**: the runner owns the sync lifecycle, produces a
-snapshot each tick, evaluates a set of probes at their own cadences, and
-terminates `pass` when the completion predicate fires or `fail` when a fatal
-invariant is violated.
+- Runs in a ztest-owned pod, up to the `sync` tier's 48 h cap
+- Not `arrange → act → assert` — continuous monitor + completion predicate
+- Runner owns the lifecycle, snapshots each tick, evaluates probes at their own cadences
+- `pass` = completion predicate fires; `fail` = fatal invariant violated
 
 ## Goals
 
@@ -22,478 +17,245 @@ invariant is violated.
 | Throughput / resource  | blocks-s, outputs-s, CPU/mem/IO profile over the run (feeds the phase model) | no     |
 | Robustness under chaos | sync recovers from partitions / packet loss / dropped links                  | yes    |
 
-Perf-gating and calibration are explicitly **not** primary here; the `sync` QoS
-tier is an admission/placement concern (§QoS), not a latency budget.
-
-## One harness, three subjects
-
-There is no shared sync *engine*: a wallet scans over lightwallet gRPC
-(pepper-sync), an indexer ingests blocks from its backing validator, and a
-validator downloads + verifies from P2P peers. Each engine is internal to its
-component. What is shared is the **harness** — runner, probes, nemesis, history,
-report, `watch`, the QoS tier, the pod lifecycle. Only two things vary per
-subject: where progress comes from, and whether ztest drives the sync or only
-observes it.
-
-| Subject   | Engine              | ztest's role          | Progress source                               | Runs where         |
-| --------- | ------------------- | --------------------- | --------------------------------------------- | ------------------ |
-| Wallet    | pepper-sync         | **driver + observer** | `pepper_sync::sync_status` (in-process)       | the runner process |
-| Indexer   | zaino/lwd ingestion | observer + chaos      | `GetLightdInfo` vs validator height (RPC)     | its own pod        |
-| Validator | zebrad/zcashd P2P   | observer + chaos      | `getblockchaininfo` (blocks/headers/progress) | its own pod        |
-
-```rust
-#[async_trait]
-pub trait SyncSubject {
-    type Snapshot: ProgressView;                       // height / target / pct / phase — common view
-    async fn snapshot(&self) -> Result<Self::Snapshot, RpcError>;
-    async fn is_complete(&self, s: &Self::Snapshot) -> bool;
-    // driver hooks — real for wallet, no-ops for the self-syncing subjects
-    async fn start(&mut self) -> Result<(), RpcError> { Ok(()) }
-    async fn stop(&mut self)  -> Result<(), RpcError> { Ok(()) }
-}
-```
-
-`SyncRunner<S: SyncSubject>` is generic. Probes read the common `ProgressView`
-(monotonic height, no-stall, reached-target work for all three subjects) and
-reach subject extras when needed. The progress sources already exist on the
-handles: `IndexerBackend::{latest_block_height, indexer_info, wait_for_block_num}`
-and `ValidatorBackend::{chain_height, tip}`.
-
-For a **wallet** ztest owns the engine (§pepper-sync). For **indexer/validator**
-the component drives itself; the runner is a pure prober + chaos injector over
-the component's RPC.
+Perf-gating + calibration explicitly out of scope (`sync` tier = admission/placement, not a latency budget).
 
 ## The subject seam
 
-Each backend contributes its own observable `SyncSubject`
-(`backends::librustzcash::LrzSyncSubject`); the facade holds one variant per
-subject and drives it through `sync::facade::drive`. A subject owns its own
-endpoint resolution, so `Endpoint { host: IpAddr, port: u16 }` — which cannot
-carry a scheme, DNS host, or TLS URI — never has to.
-
-## pepper-sync integration (the wallet subject)
-
-pepper-sync is a **standalone sync engine** — multi-task (fetcher, mempool
-monitor, batcher, parallel scan workers), non-linear (chain-tip-first,
-spend-before-sync, shard-based), with reorg verification built in. Its whole
-public surface:
+ztest ships **no sync engine and knows none**. What it ships is the harness: runner, probe scheduler,
+invariant taxonomy, nemesis, history, report, `watch`, the QoS tier, the detached pod lifecycle.
+Everything it watches enters through one object-safe trait:
 
 ```rust
-async fn sync<P, W>(client: CompactTxStreamerClient<Channel>, params: &P,
-                    wallet: Arc<RwLock<W>>, sync_mode: Arc<AtomicU8>,
-                    config: SyncConfig) -> Result<SyncResult, _>
-async fn sync_status<W>(wallet: &W) -> Result<SyncStatus, _>   // poll anytime, from outside
-// config::{SyncConfig, PerformanceLevel(Low/Medium/High/Maximum), TransparentAddressDiscovery}
-// wallet::{SyncWallet + SyncBlocks + SyncTransactions + SyncNullifiers + SyncOutPoints + SyncShardTrees}
+#[async_trait]
+pub trait SyncSubject: Send + Sync {          // Sync, not just Send: progress(&self) borrows across await
+    async fn launch(&mut self) -> Result<(), RpcError>;              // once; no-op if it syncs itself
+    async fn progress(&self) -> Result<Box<dyn ProgressView>, RpcError>;
+    async fn is_complete(&self) -> bool;
+    fn work_source(&self, op: Op) -> Option<&'static str> { None }   // series `progress` reads op from
+    async fn stop(&mut self) -> Result<(), RpcError> { Ok(()) }      // graceful checkpoint; observers no-op
+}
 ```
 
-The engine is parameterized on four things the consumer owns and one it
-implements:
+- **Boxed, not an associated type** — a profile binds one `dyn SyncSubject`, so ztest carries no enum of
+  known subjects and a new one is a new impl (in any crate), never a new arm here. One allocation per
+  tick, seconds apart
+- Two roles, from the same trait: a **driving** subject starts the engine it owns in `launch`; an
+  **observing** subject leaves `launch`/`stop` empty and the runner is a pure prober over its RPC
+- Probes read the common `ProgressView` (height, target, pct, phase); subject extras (balances, tree
+  roots, work counters) ride `Option` defaults, so an observer reports *unreported*, never a zero a
+  probe would read as passing
+- Subject owns its endpoint resolution → `Endpoint { IpAddr, u16 }` never has to carry scheme/DNS/TLS
+- The harness compiles with **no backend feature at all**; wallet, indexer and validator subjects are
+  interchangeable to it
 
-| Seam                                  | Owner               | Unlocks                                               |
-| ------------------------------------- | ------------------- | ----------------------------------------------------- |
-| `client: CompactTxStreamerClient`     | **ztest** (we dial) | dialing, TLS, external URI — **and wrapping** (chaos) |
-| `sync_mode: Arc<AtomicU8>`            | **ztest**           | pause / resume / stop / checkpoint                    |
-| `wallet: Arc<RwLock<W>>`              | **ztest**           | poll `sync_status`, read balances/tree-roots          |
-| `params: P: consensus::Parameters`    | **ztest**           | network selection (mainnet/testnet/regtest)           |
-| `W: Sync{Wallet,Blocks,…,ShardTrees}` | the wallet impl     | note storage, shard trees, serialization              |
+### Phase vocabulary belongs to the subject
 
-**We rent pepper-sync; we do not reimplement it.** pepper-sync *is* the system
-under test — a wallet-sync harness exists to exercise the code users run. A
-rolled-own scanner would test nothing real. Rolling our own is rejected with
-prejudice; if intra-scan-loop determinism is ever needed, the correct move is
-upstreaming a fault/progress callback into pepper-sync, not forking it.
+`Phase` is `Starting` / `Syncing` / `Done` — lifecycle only. A subject's own stage word (`"scanning"`,
+`"indexing"`, `"downloading headers"`) rides `ProgressView::detail` and is rendered beside it.
 
-> **Superseded.** The wallet-side integration described in this section was
-> reworked onto a per-backend observable `SyncSubject` (`LrzSyncSubject`, in
-> `src/backends/librustzcash.rs`). The engine study above is retained as
-> background on what a sync engine must expose; it is not the shipped design.
+- No engine's scan taxonomy lands in the harness enum. An earlier `Phase` carried one wallet engine's
+  `ScanPriority` names, four of which no producer ever emitted
+- Unknown stage words decode to `Syncing` rather than failing — a 48 h detached sync outlives the CLI
+  build watching it
 
-Two gotchas, pinned:
-
-- **Completion keys on `sync_mode`, not the percentage.** When ranges are
-  `RefetchingNullifiers`/`ScannedWithoutMapping`, `sync_status` caps its reported
-  percentage at 99 % until truly done. A "100 % == done" predicate fires early.
-  Complete on `sync_mode == NotRunning` + the returned `SyncResult`.
-- **Status polling contends with the scan write-lock.** The engine takes the
-  wallet write-lock per batch (longer under `PerformanceLevel::Maximum`).
-  Mitigate with a coarse probe cadence (seconds), and `Paused`-then-read for
-  expensive `at_completion` checks — `Paused` releases the lock by design.
-
-Use `percentage_total_outputs_scanned` as the headline metric (scanning is
-non-linear in height; its own doc-comment says outputs are the accurate signal).
-`scan_ranges` + `ScanPriority` (Verify / ChainTip / Historic / FoundNote /
-RefetchingNullifiers / Scanned) give the live phase, including the reorg
-verification phase — surfaced in `watch` and observable by probes.
-
-## The unified gRPC substrate
-
-`pepper_sync::sync` takes the same generated `CompactTxStreamerClient<Channel>`
-that lives in `src/proto/`, that the load driver's `LwdClient` wraps, and that
-`IndexerBackend` RPCs use. So one substrate underlies everything:
+## One gRPC substrate
 
 ```
 SyncSubject ─▶ Channel ─▶ [optional Nemesis decorator] ─▶ ┬─ IndexerBackend RPCs (oracle authority)
  (owns dialing + TLS)                                     ├─ LwdClient (load driver)
-                                                           └─ pepper_sync::sync (the engine)
+                                                          └─ whatever engine the subject drives
 ```
 
-One dialing/TLS/port-forward/fault layer, three consumers. The correctness
-oracle (wallet tree-root vs `IndexerBackend::get_tree_state`) rides the same
-channel — no second wallet impl needed; the indexer is the independent authority
-(the CometBFT app-hash / Hive head-hash analog).
+- One dialing/TLS/port-forward/fault layer, every consumer
+- Oracle rides the same channel — an independent authority (indexer `GetTreeState` against a wallet's
+  own root; CometBFT app-hash / Hive head-hash analog) rather than a second implementation of the SUT
 
 ## Continuous verification: the invariant taxonomy
 
-Per-tick callbacks alone are insufficient (Jepsen/Antithesis/TLA+). A probe is
-one of four classes, plus a recorded snapshot history checked at the end:
+Per-tick callbacks alone are insufficient (Jepsen/Antithesis/TLA+). Four probe classes + a recorded
+history checked at the end:
 
-| Class                     | Semantics                    | Evaluated               | Failure means   | Wallet-sync examples                                                                                |
-| ------------------------- | ---------------------------- | ----------------------- | --------------- | --------------------------------------------------------------------------------------------------- |
+| Class                     | Semantics                    | Evaluated               | Failure means   | Examples                                                                                                                 |
+| ------------------------- | ---------------------------- | ----------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | **always** (safety)       | true at *every* tick         | per-tick, live          | a **bug**       | height monotonic (except bounded reorg); balances monotonic absent a reorg; per-pool outputs monotonic; chain continuity |
-| **eventually** (liveness) | becomes true before deadline | live + terminal         | a **stall**     | progress within a window; recovers after a heal; reaches tip                                        |
-| **sometimes** (coverage)  | true on ≥1 tick over the run | end-of-run over history | a **weak test** | observed a reorg handled; exercised the reconnect path                                              |
-| **at_completion**         | post-condition once at tip   | terminal                | final-state bug | balances match oracle; note-commitment-tree root == indexer's                                       |
+| **eventually** (liveness) | becomes true before deadline | live + terminal         | a **stall**     | progress within a window; recovers after a heal; reaches tip                                                             |
+| **sometimes** (coverage)  | true on ≥1 tick over the run | end-of-run over history | a **weak test** | observed a reorg handled; exercised the reconnect path                                                                   |
+| **at_completion**         | post-condition once at tip   | terminal                | final-state bug | balances match oracle; note-commitment-tree root == indexer's                                                            |
 
-The **sometimes** class is load-bearing, not decoration: a green 48 h run that
-never triggered its coverage probes means the chaos never entered the interesting
-state — a weak pass, not a real one. Each fault is gated behind a `sometimes` so
-a pass *proves* the adverse state was reached.
+**sometimes** is load-bearing, not decoration — a green 48 h run whose coverage probes never fired means
+the chaos never reached the interesting state. Each fault is gated behind one, so a pass *proves* the
+adverse state happened.
 
 ## Scheduled probes
 
-Grounded in Prometheus rule evaluation + Gomega `Consistently` + CronJob
-semantics:
+Grounded in Prometheus rule evaluation + Gomega `Consistently` + CronJob semantics.
 
-- **Per-probe cadence** (`every(dur)` / `every_blocks(n)` / `each_tick` /
-  `window(dur)`). Each probe runs on its own timer; cheap safety checks tick
-  fast, expensive RPC-backed checks slow. No shared global tick.
-- **Snapshot-then-evaluate.** One immutable `Snapshot` per tick; all probes due
-  at that tick read it. Keeps predicates pure and shares one wallet read.
-- **`hold_for` / `keep_for`** (Prometheus `for:` / `keep_firing_for:`), quantized
-  to the cadence — sync signals are noisy (reorgs, RPC gaps); a bare threshold
-  flaps.
-- **Missed-tick policy is explicit.** If a probe is still running at its next
-  tick, default **Skip/Coalesce** — never backlog (thousands of stale evals over
-  48 h). A skip is a distinct, visible outcome.
-- **Three outcomes, not a bool** (Gomega's discipline): `Satisfied` /
-  `Pending(retry)` / `Violated(record)` / `ProbeError(abort)`. A probe that
-  *throws* means the harness/RPC is broken and aborts the run; a probe that
-  returns false is "keep going". This lets the reporter distinguish "invariant
-  violated" from "probe crashed".
-- **Multi-cadence = multiple registrations**, not a per-probe combinator (SLO
-  multi-window multi-burn-rate): register the same predicate at 30 s and 1 h with
-  different severities.
+- **Per-probe cadence** (`every(dur)` / `every_blocks(n)` / `each_tick` / `window(dur)`) — no global tick;
+  cheap safety checks tick fast, RPC-backed ones slow
+- **Snapshot-then-evaluate** — one immutable `Snapshot` per tick, shared by every probe due (pure
+  predicates, one read of the subject)
+- **`hold_for` / `keep_for`** (Prometheus `for:` / `keep_firing_for:`), quantized to cadence (reorgs +
+  RPC gaps make a bare threshold flap)
+- **Missed tick = Skip/Coalesce, never backlog** (thousands of stale evals over 48 h); a skip is a
+  distinct visible outcome
+- **Four outcomes, not a bool**: `Satisfied` / `Pending(retry)` / `Violated(record)` / `ProbeError(abort)`
+  — a *throwing* probe means the harness/RPC broke, a false one means keep going
+- **Multi-cadence = multiple registrations**, not a combinator (SLO multi-window multi-burn-rate): same
+  predicate at 30 s and 1 h with different severities
 
 ## Chaos: the nemesis
 
-Adversity is injected at three altitudes, all **outside** pepper-sync (the SUT):
+Three altitudes, all **outside** the SUT:
 
-| Altitude      | Mechanism                                                  | Models                                                                  | Determinism                       |
-| ------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------- | --------------------------------- |
-| Channel       | `tower` layer wrapping the tonic `Channel`                 | wallet↔indexer link: latency, drops, errors, throttle                   | high — seed-reproducible, per-RPC |
-| k8s network   | NetworkPolicy + netem on real pods                         | anywhere in the topology: validator↔indexer, peer partitions, bandwidth | low — real kernel netem           |
-| Indexer proxy | ztest-owned `CompactTxStreamer` between wallet and indexer | reorgs, stalled ranges, malformed blocks, scripted chains               | total — the generator             |
+| Altitude      | Mechanism                                                   | Models                                                                  | Determinism                       |
+| ------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------- | --------------------------------- |
+| Channel       | `tower` layer wrapping the tonic `Channel`                  | subject↔peer link: latency, drops, errors, throttle                     | high — seed-reproducible, per-RPC |
+| k8s network   | NetworkPolicy + netem on real pods                          | anywhere in the topology: validator↔indexer, peer partitions, bandwidth | low — real kernel netem           |
+| Indexer proxy | ztest-owned `CompactTxStreamer` between subject and indexer | reorgs, stalled ranges, malformed blocks, scripted chains               | total — the generator             |
 
-For **indexer/validator** subjects there is no in-process channel to wrap (the
-sync link lives inside the component's pod), so chaos is necessarily
-k8s-network-level: partition a validator from its P2P peers → heal → assert reorg
-recovery; partition indexer↔validator → assert catch-up. This makes the
-`NetworkChaos` resource the centerpiece for two of three subjects. The indexer
-proxy is gRPC-only (validator P2P is the Zcash wire protocol; netem, not a proxy).
-
-Chaos is scheduled on the same cron-tick model, probabilistic faults use a
-seed-logged `buggify` posture (FoundationDB) for deterministic replay, and each
-fault is recorded in the history.
-
-**Safety is a harness correctness property, not a nicety.** A partition or netem
-rule that leaks past a crashed test wedges the shared cluster. Every fault is a
-first-class node in the resource graph (`src/resource/`), reaped by the
-parent-owned label cleanup, **and** carries a kernel-side dead-man's-switch
-(netem TTL / revert-on-timeout, per Chaos Mesh's `duration`). Chaos that cannot
-guarantee its own reversion is not shipped.
-
-Native vs delegated: ztest owns chaos natively — NetworkPolicy for partitions
-(declarative, zero privilege) and a privileged netem sidecar for delay/loss/
-bandwidth (reusing the buildkit SCC machinery) — rather than taking a Chaos Mesh
-controller dependency, consistent with ztest's self-contained posture.
+- A subject syncing inside its own pod has no in-process channel to wrap → k8s-level only, which makes
+  `NetworkChaos` the centerpiece for every observed subject
+- Indexer proxy is gRPC-only (validator P2P = the Zcash wire protocol → netem, not a proxy)
+- Same cron-tick scheduling; probabilistic faults use a seed-logged `buggify` posture (FoundationDB)
+- **Reversion is a correctness property**: a partition leaking past a crashed test wedges the shared
+  cluster. Every fault = a resource-graph node (parent-owned label reap) **and** carries a kernel-side
+  dead-man's-switch (netem TTL / revert-on-timeout, per Chaos Mesh `duration`). Chaos that cannot
+  guarantee its own reversion is not shipped
+- Native, not delegated: NetworkPolicy for partitions (declarative, zero privilege) + a privileged netem
+  sidecar reusing the buildkit SCC machinery — no Chaos Mesh controller dependency
 
 ## Test-author API
 
-A profile is authored with a `#[ztest::sync_test(...)]` annotation whose body is
-a **registration program**. The split is principled:
+`#[ztest::sync_test(...)]` annotation + a body that is a **registration program**:
 
-- **Annotation — static, known before running:** name, description, subject
-  kind, timeout, QoS tier, tags. Powers `ztest sync list` / `--help` and QoS
-  admission (the scheduler sizes the pod before the body runs).
-- **Body — runs in the pod:** builds the topology, binds the subject, and
-  registers named invariant fns — defined **inline in the body** — at chosen
-  cadences, plus the nemesis schedule.
+- **Annotation = static, known pre-run**: name, description, subject kind, timeout, QoS tier, tags.
+  Powers `ztest sync list` / `--help` + admission (scheduler sizes the pod before the body runs)
+- **Body = runs in the pod**: topology, subject binding, named invariant fns at chosen cadences, nemesis
+  schedule
+- Body is pure registration up to `run.run()` → two modes. **Execute** provisions and syncs; **Collect**
+  makes `run.run()` inert and returns the manifest, so `ztest sync describe <name>` prints the full
+  invariant + nemesis manifest **without a cluster**
+- **Invariants are nested `fn` items**, not closures: cannot capture the enclosing scope (accidental
+  capture = compile error, predicate stays pure), but *can* read block-level `const`/`fn` items; nested
+  `async fn` allowed for RPC-backed checks. Shared ones factor into a module, referenced by path
+- Predicate decoupled from class/cadence/severity — same `height_monotonic` registers `always/Fatal/5s`
+  in one profile, `always/Recorded/30s` in another
+- Auto-named from the fn (last `type_name` segment), `.named()` overrides; each is its own `watch` row
+- `check()` takes `fn(&Snapshot) -> Verdict` or `async fn(&Snapshot, &SyncCtx) -> Verdict` via a blanket
+  `Probe` impl — cheap predicates stay sync, indexer-backed go async, both register identically
 
-Because the body is pure registration up to `run.run()`, it executes in two
-modes: **Execute** (provision + sync) and **Collect** (`run.run()` inert; returns
-the recorded manifest). `ztest sync describe <name>` runs Collect mode and prints
-the full invariant + nemesis manifest **without touching a cluster** — static
-discoverability from a readable imperative flow.
+### Example: verifying a wallet sync
 
-Refinements over a plain builder or per-assertion macro:
-
-- **Invariants are nested `fn` items in the body.** Each assertion is its own
-  named function, defined inline right next to its registration. A nested `fn`
-  is an item, not a closure: it cannot capture the enclosing scope, so an
-  accidental capture is a compile error and the invariant stays a pure
-  predicate — but it *can* see block-level `const`/`fn` items (e.g. a local
-  `MAX_REORG`), and nested `async fn` items are allowed for RPC-backed checks.
-  Genuinely shared invariants factor into a module and are referenced by path
-  (see the second profile).
-- **Predicate decoupled from class/cadence/severity.** The fn is just a
-  predicate; the body decides how it is used, so the same `height_monotonic`
-  registers `always/Fatal/5s` in one profile and `always/Recorded/30s` in
-  another.
-- **Auto-naming** from the fn (last segment of `type_name`), `.named()` override.
-  Each invariant is its own live row in `watch`.
-
-`check()` accepts both `fn(&Snapshot) -> Verdict` and
-`async fn(&Snapshot, &SyncCtx) -> Verdict` via a blanket `Probe` impl — cheap
-invariants stay pure sync fns, indexer-backed ones go async, both register
-identically.
-
-### Profile: chaos wallet state-sync
-
-Invariants are nested `fn`s in the body — registered up top, defined below.
+The only backend-specific line is the one that constructs the subject; everything else is harness API.
 
 ```rust
-use ztest::prelude::*;
-use ztest::sync::{Fault::*, Severity::*};
-
-#[ztest::sync_test(
-    name        = "state_sync",
-    description = "genesis→tip wallet sync through zebrad+zaino under network chaos",
-    subject     = wallet,
-    timeout     = "48h",
-    qos         = sync,
-    tags        = ["chaos", "wallet", "regtest"],
-)]
-async fn test_state_sync(mut run: SyncRunner) -> SyncOutcome {
-    const MAX_REORG: u32 = 100;   // Zcash rollback bound (~coinbase maturity); deeper = violation
-
-    // topology + subject (real code — too rich for an annotation)
-    let (zeb, zai, account) = run.topology(|t| {
-        let zeb = t.add_validator(Validator::zebrad("1.9.1").regtest()
-            .mount(mount_archive!("tests/assets/zebrad-testnet-1M.tar.zst", "/cache")));  // cached-state seed
-        let zai = t.add_indexer(Indexer::zaino("0.4.0").peer("zeb"));
-        let wal = t.add_wallet(Wallet::librustzcash());
-        (zeb, zai, wal)
-    }).await?;
-    run.sync(Subject::wallet(account).performance(PerformanceLevel::High));
-
-    // register invariants — each is a nested fn (defined below); names auto-derive
-    run.always(Fatal).every(secs(5)).check(height_monotonic);
-    run.always(Fatal).every_blocks(2_000).check(chain_continuity);
-    run.always(Fatal).every(secs(10)).check(pool_outputs_monotonic);
-    run.always(Recorded).each_tick().check(balance_monotonic);
-
-    run.eventually(Fatal).window(mins(10)).check(no_stall);
-    run.eventually(Fatal).window(mins(15)).after("net-split").check(recovers_from_partition);
-
-    run.sometimes().check(reorg_handled);
-    run.sometimes().check(reconnect_after_drop);
-
-    run.at_completion(Fatal).check(tree_root_matches_indexer);
-    run.at_completion(Fatal).check(reached_network_tip);
-
-    // nemesis — network errors + minor injected faults, scheduled + probabilistic
-    run.nemesis()
-       .named("net-split").at(mins(20)).for_(mins(3)).partition(&zai, &zeb)         // k8s NetworkPolicy
-       .at(mins(35)).for_(mins(2)).netem(&zai, Delay(300).jitter(80).loss(0.03))    // tc/netem on the pod
-       .channel(&account).buggify(0.01, DropConnection)                             // 1% of gRPC calls dropped
-       .channel(&account).buggify(0.02, SlowResponse(secs(2)))                      // 2% minor latency
-       .seed(0x5EC0_1DAB)                                                           // deterministic replay
-       .heal_all_on_drop();                                                         // dead-man's-switch
-
-    // ── invariants: nested fns; pure predicates over the snapshot (+ ctx for RPC) ──
-    fn height_monotonic(s: &Snapshot) -> Verdict {
-        ensure!(s.height() >= s.prev_height() || s.reorg_depth() <= MAX_REORG,
-                "height went backwards {} → {} beyond reorg bound", s.prev_height(), s.height());
-        Verdict::Pass
-    }
-    // `require` panics on an op this run never measured, rather than reading it
-    // as zero — which would make this predicate unfailable and report green.
-    fn pool_outputs_monotonic(s: &Snapshot) -> Verdict {
-        ensure!(s.work().require(SaplingOutput) >= s.prev_work().require(SaplingOutput));
-        ensure!(s.work().require(OrchardAction) >= s.prev_work().require(OrchardAction));
-        Verdict::Pass
-    }
-    // Balances are `u64`, so "non-negative" is not a claim. The real invariant
-    // for a scan-only profile is that they never fall: a drop means a block was
-    // un-applied or a credited note went missing. A reorg is the one legal way.
-    fn balance_monotonic(s: &Snapshot) -> Verdict {
-        ensure!(s.balances().total() >= s.prev_balances().total() || s.reorg_depth() > 0,
-                "balance fell {} → {} with no reorg", s.prev_balances().total(), s.balances().total());
-        Verdict::Pass
-    }
-    fn no_stall(s: &Snapshot) -> Verdict {
-        ensure!(s.progressed_within(mins(10)), "no progress in 10m at height {}", s.height());
-        Verdict::Pass
-    }
-    fn recovers_from_partition(s: &Snapshot) -> Verdict {
-        ensure!(s.progressed_since_fault(), "sync did not resume after the partition healed");
-        Verdict::Pass
-    }
-    fn reorg_handled(s: &Snapshot) -> Verdict { want!(s.observed_reorg()) }          // coverage
-    fn reconnect_after_drop(s: &Snapshot) -> Verdict { want!(s.observed_reconnect()) }
-
-    async fn chain_continuity(s: &Snapshot, cx: &SyncCtx) -> Verdict {
-        let blocks = cx.indexer().get_block_range(s.prev_height(), s.height()).await?;
-        chain_link(&blocks)                    // genesis zeros · 32-byte hashes · prev_hash == prior.hash
-    }
-    // No separate `FinalView`: tree roots are a per-tick wallet extra on the
-    // `Snapshot` like balances, so an `at_completion` probe is an ordinary
-    // predicate over the last snapshot and the same root check can also be
-    // registered as an `always` probe. `commitment_tree_root` parses the
-    // indexer's hex frontier; a *present but unparseable* one is a ProbeError,
-    // never folded into "the pool is empty".
-    async fn tree_root_matches_indexer(s: &Snapshot, cx: &SyncCtx) -> Verdict {
-        let ts = cx.indexer().get_tree_state(s.height()).await?;
-        ensure_eq!(s.tree_root(Orchard), commitment_tree_root(Orchard, &ts.orchard_tree)?);
-        ensure_eq!(s.tree_root(Sapling), commitment_tree_root(Sapling, &ts.sapling_tree)?);
-        Verdict::Pass
-    }
-    async fn reached_network_tip(s: &Snapshot, cx: &SyncCtx) -> Verdict {
-        ensure_eq!(s.height(), cx.indexer().latest_block_height().await?);
-        Verdict::Pass
-    }
-
-    run.run().await
-}
-```
-
-Item order inside the body is irrelevant — the nested fns are visible to the
-`.check(...)` calls above them, and each can read the block-level `MAX_REORG`.
-
-### Profile: shared invariants, different subject
-
-A validator sync reuses the genuinely-common invariants from a shared module
-(`inv::`) — the factoring the first profile's inline fns would graduate into
-once a second profile wants them — and keeps `subject = validator` so the
-runner only observes (zebrad drives itself).
-
-```rust
-#[ztest::sync_test(
-    name = "mainnet_full", description = "zebrad full mainnet sync from genesis, long-haul",
-    subject = validator, timeout = "48h", qos = sync, tags = ["mainnet", "longhaul"],
-)]
-async fn test_mainnet_full_sync(mut run: SyncRunner) -> SyncOutcome {
-    let zeb = run.topology(|t| t.add_validator(
-        Validator::zebrad("1.9.1").mainnet().mount(mount_archive!("tests/assets/zebrad-main-cache.tar.zst", "/cache"))
+#[ztest::sync_test(name = "wallet_state_sync", description = "genesis→tip wallet sync under chaos",
+                   subject = wallet, timeout = "48h", qos = sync, tags = ["chaos", "regtest"])]
+async fn wallet_state_sync(mut run: SyncRunner) -> SyncOutcome {
+    let (zeb, zai, wallet) = run.topology(|t| (
+        t.add_validator(Validator::zebrad("1.9.1").regtest().snapshot(ORCHARD_TESTNET)),
+        t.add_indexer(Indexer::zaino("0.4.0").peer("zeb")),
+        t.add_wallet(Wallet::librustzcash()),
     )).await?;
-    run.sync(Subject::validator(zeb));                          // observer subject — zebrad drives itself
+    let account = wallet.account(&zeb, &zai, MNEMONIC, BIRTHDAY).await?;
+    run.sync(account.wallet().sync_subject(account.id(), Some(PerformanceLevel::High)).await?);
 
-    run.always(Fatal).every(secs(30)).check(inv::height_monotonic);   // same fn, coarser cadence
-    run.eventually(Fatal).window(mins(20)).check(inv::no_stall);      // same fn, wider window
-    run.sometimes().check(inv::reorg_handled);
+    run.always(Fatal).every(secs(5)).check(height_monotonic);          // nested fns, defined below
+    run.eventually(Fatal).window(mins(10)).check(no_stall);
+    run.sometimes().check(reorg_handled);
+    run.at_completion(Fatal).check(tree_root_matches_indexer);
+    run.nemesis().named("split").at(mins(20)).for_(mins(3)).partition(&zai, &zeb).heal_all_on_drop();
 
-    run.nemesis().named("peer-split").at(hours(2)).for_(mins(10)).isolate_p2p(&zeb).seed(1).heal_all_on_drop();
+    fn height_monotonic(s: &Snapshot) -> Verdict {
+        ensure!(s.height() >= s.prev_height() || s.reorg_depth() <= MAX_REORG, "rolled back too far");
+        Verdict::Pass
+    }
+    // …no_stall, reorg_handled, tree_root_matches_indexer likewise
     run.run().await
 }
 ```
+
+- Swap those two subject lines for `run.sync(zaino_indexer)` or a validator handle and every probe,
+  fault and report above them is unchanged — that substitution is the whole point of the seam
+- A subject a consuming crate wrote binds identically; ztest needs no knowledge of it
+
+Two invariant-authoring rules the harness leans on:
+
+- `balances()`/`work()` return `Option` — a probe reading an extra the subject does not publish
+  **panics**, rather than comparing zeroes that can never fail. `run.requires_work(..)` moves that to a
+  preflight check against one live reading, so a missing series fails by name in seconds, not hours in
+- Balances are `u64`, so "non-negative" claims nothing; the real invariant is "never falls, absent a
+  reorg" — a drop means an un-applied block or a lost credited note
 
 ## Execution model: ztest-owned pods
 
-A sync outlives the launching terminal, so the cluster is the daemon and the CLI
-is a stateless controller. State lives in k8s (no local daemon, no `~/.ztest`
-DB): a **ztest-owned pod** labelled `ztest.io/{kind=sync,sync-id,owner}`, a
-**PVC-backed wallet/cache datadir** (RWO, NVMe) so a *restart within the run*
-resumes rather than rescans, and a `SyncReport` mirrored to a ConfigMap in
-`ztest-obs` — beside the
-Prometheus series and Pyroscope profiles of the same run. `list` is a labelled
-pod query; any machine with the kubeconfig can `list`/`watch`/`stop`.
+Sync outlives the launching terminal → cluster = the daemon, CLI = a stateless controller. All state in
+k8s (no local daemon, no `~/.ztest` db).
 
-The record and the footprint have separate lifetimes. A sync's topology lives in
-its own `ztest-sync-{id}` namespace, torn down by the driver itself when the run
-finishes (`--no-cleanup` keeps it for inspection); the report, series and
-profiles live in the cluster-lifetime `ztest-obs` namespace and are reclaimed
-only by `ztest cleanup`, together. A verdict therefore survives the teardown of
-everything that produced it. The datadir does not: teardown takes the PVC, so the
-checkpoint `stop` writes outlives the run only under `--no-cleanup`. `ztest
-cleanup` must skip `kind=sync` pods that are `Running`.
+- Pod labelled `ztest.io/{kind=sync,sync-id,owner}`; `list` = a labelled pod query, so any kubeconfig can
+  `list`/`watch`/`stop`
+- PVC-backed subject datadir (RWO, NVMe) → a restart *within* the run resumes rather than restarting
+- `SyncReport` mirrored to a ConfigMap in `ztest-obs`, beside the same run's Prometheus series + profiles
+- **Record and footprint have separate lifetimes**: topology lives in `ztest-sync-{id}`, torn down by the
+  driver at finish (`--no-cleanup` keeps it); report/series/profiles live in cluster-lifetime `ztest-obs`
+  and are reclaimed only by `ztest cleanup`. A verdict survives everything that produced it — the datadir
+  does not (teardown takes the PVC, so `stop`'s checkpoint outlives the run only under `--no-cleanup`)
+- `ztest cleanup` must skip `Running` `kind=sync` pods
+- Live progress rides the pod log: one structured sentinel line per tick (in-pod `EmitSink`), followed and
+  parsed by `ztest sync watch`; k8s log retention means re-attaching resumes mid-flight
+- `stop` calls the subject's own graceful stop (checkpoint), never a kill
 
-Live progress rides the pod's **log stream**: the runner prints a structured
-sentinel line per tick (the in-pod `EmitSink`); `ztest sync watch` follows the
-pod log, parses it, and renders per-invariant rows + scan phase. k8s log
-retention means re-attaching resumes mid-flight. `stop` flips `sync_mode` to
-`Shutdown` (graceful checkpoint to PVC), not a kill.
+`ztest sync start` is a profile's **sole** lifecycle owner; `ztest run` never executes at the `sync` tier:
 
-`ztest sync start` is a profile's **sole** lifecycle owner: k8s owns the pod, it
-survives the terminal, and only `stop` ends it. `ztest run` never executes
-anything at the `sync` tier. A profile compiles to an ordinary `#[tokio::test]`,
-so `cargo nextest list` selects it like any other test; the engine subtracts it
-from the selection using the Phase-C inventory dump (`sync_by_binary` +
-`qos_by_binary` → `plan::drop_sync_tests`), naming what it dropped. The
-subtraction is by *tier*, not by profile registration, so a bare
-`#[ztest::qos::sync]` test leaves too — otherwise it survives into the QoS plan
-and puts a `sync` row in the live panel for work that never launches. Admitting
-either into a run would park a 48 h item at the top-priority `sync` tier for the
-length of the run.
+- A profile compiles to an ordinary `#[tokio::test]`, so `cargo nextest list` selects it like any test
+- The engine subtracts it using the Phase-C inventory (`sync_by_binary` + `qos_by_binary` →
+  `plan::drop_sync_tests`), naming what it dropped
+- Subtraction is by *tier*, not by profile registration — a bare `#[ztest::qos::sync]` test must leave too,
+  else it survives into the QoS plan and puts a `sync` row in the live panel for work that never launches
+- Admitting either parks a 48 h item at top priority for the length of the run
 
-## CLI (provisional — surface subject to change)
+## CLI (provisional)
 
 ```
 ztest sync list [--all-users] [--json]        # labelled pod query: id, subject, phase, %, age
-ztest sync describe <name>                     # body in Collect mode → invariant + nemesis manifest
-ztest sync start <name> [--watch] [--no-cleanup]  # admit + create the ztest-owned pod; --watch
-                                               #   attaches; --no-cleanup keeps the topology ns
-ztest sync watch <id>                          # attach to live progress; Ctrl-C DETACHES only
-ztest sync status <id> [--json]                # finished: the final SyncReport (works after the
-                                               #   pod is gone); still running: the last snapshot
-ztest sync stop <id>                           # graceful: sync_mode=Shutdown → checkpoint → exit 0
-ztest cleanup <id>                             # reclaim what the run left: leftover namespace,
-                                               #   driver pod, and the record (report + series)
+ztest sync describe <name>                    # body in Collect mode → invariant + nemesis manifest
+ztest sync start <name> [--watch] [--no-cleanup]
+ztest sync watch <id>                         # attach to live progress; Ctrl-C DETACHES only
+ztest sync status <id> [--json]               # finished: final SyncReport (works after the pod is gone);
+                                              #   running: the last snapshot
+ztest sync stop <id>                          # graceful: sync_mode=Shutdown → checkpoint → exit 0
+ztest cleanup <id>                            # namespace + driver pod + record (report + series)
 ```
 
-Deletion is deliberately *not* a `sync` subcommand: reclaiming cluster resources
-is one verb, `ztest cleanup`, whether the resource came from a sync or a run.
-
-The load-bearing UX invariant: `watch` / `start --watch` are read-only tails;
-detaching never stops the sync. Ending a sync is only `stop`.
+- Deletion is deliberately not a `sync` verb — reclaiming is one verb, `ztest cleanup`, run or sync
+- Load-bearing UX invariant: `watch` / `start --watch` are read-only tails, detaching never stops a sync
 
 ## QoS
 
-`QosClass::Sync` already exists (`src/qos/`): NVMe pool, 48 h cap, top priority,
-NVMe taint/toleration; the NVMe node count is the concurrency ceiling. A
-from-genesis in-topology sync wears `#[ztest::qos::sync]`; an external sync
-(in-process client to a remote server) needs only `#[ztest::qos::wallet]`.
-`PerformanceLevel::Maximum` (quadrupled batch, unbounded nullifier map) must be
-consistent with the tier's 32 GiB. `start` admits against the tier; a full NVMe
-pool queues the pod `Pending` (k8s-native) rather than failing fast.
+- `QosClass::Sync` (`src/qos/`): NVMe pool, 48 h cap, top priority, NVMe taint/toleration
+- NVMe node count = the concurrency ceiling; a full pool leaves the pod `Pending` (k8s-native), not failed
+- From-genesis in-topology sync wears `#[ztest::qos::sync]`; an external sync (in-process client to a
+  remote server) needs only `#[ztest::qos::wallet]`
+- A subject's own aggressiveness knob (e.g. the wallet's `PerformanceLevel` batch size) must fit the
+  tier's footprint — the harness admits against the tier, not against what the engine decides to buffer
 
 ## Status
 
-Landed: the per-backend `SyncSubject` seam (`sync/subject.rs`,
-`backends::librustzcash::LrzSyncSubject`) and the driver behind it
-(`sync/facade.rs`); the probe scheduler and invariant taxonomy
-(`sync/runner.rs`, `sync/probe.rs`); the `#[ztest::sync_test]` authoring macro;
-the nemesis fault injectors (`sync/nemesis.rs`, applied as `NetworkChaos`); and
-the detached pod lifecycle behind `ztest sync` (`sync/detached.rs`,
-`cli/sync/`).
-
-Outstanding: the indexer proxy — programmable gRPC subjects, which turn the
-chaos surface from "what the network can do to a client" into "what a
-misbehaving server can do to one".
+- Landed: object-safe subject seam (`sync/subject.rs`) + backend-free facade (`sync/facade.rs`), which
+  compiles with no wallet feature; probe scheduler
+  and taxonomy (`sync/runner.rs`, `sync/probe.rs`); `#[ztest::sync_test]`; nemesis injectors
+  (`sync/nemesis.rs` → `NetworkChaos`); detached pod lifecycle (`sync/detached.rs`, `cli/sync/`)
+- Outstanding: the indexer proxy — programmable gRPC subjects, turning the chaos surface from "what the
+  network can do to a client" into "what a misbehaving server can do to one"
 
 ## Open decisions
 
-- Full cron expressions vs `Duration` intervals for cadence (intervals +
-  multi-registration cover the real need).
-- Snapshot retention richness over 48 h (~11k small snapshots at 15 s is trivial;
-  rich snapshots ring-buffer).
+- Cron expressions vs `Duration` intervals for cadence (intervals + multi-registration cover the real need)
+- Snapshot retention over 48 h (~11k small snapshots at 15 s is trivial; rich snapshots ring-buffer)
 
 ## See also
 
-- [design-load-testing.md](design-load-testing.md) — the `LwdClient` / `LoadDriver`
-  sharing the same gRPC substrate
+- `src/loadtest` — `LwdClient` / `LoadDriver` on the same gRPC substrate
 - [design-qos.md](design-qos.md) — the `sync` tier, NVMe pool, calibration
-- [design-resources.md](design-resources.md) — the resource graph the
-  `NetworkChaos` node plugs into
-- [guide-writing-tests.md](guide-writing-tests.md) — the `TestEnv` / handle API
-  the topology builder uses
+- [design-resources.md](design-resources.md) — the graph `NetworkChaos` plugs into
+- [guide-writing-tests.md](guide-writing-tests.md) — `TestEnv` / handle API the topology builder uses

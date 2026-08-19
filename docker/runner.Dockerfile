@@ -45,7 +45,7 @@ ARG RUST_VERSION=1.95.0
 # laptop applied, which is the point of applying it.
 
 # ── compile ─────────────────────────────────────────────────────────────────
-FROM rust:${RUST_VERSION}-bookworm AS compile
+FROM docker.io/library/rust:${RUST_VERSION}-bookworm AS compile
 # CARGO_TARGET_DIR stays an env — not the config file below — so it outranks any
 # `.cargo/config.toml` the compiled repo ships: the build must always land in the
 # mounted target cache, or the `/bins` copy-out finds nothing.
@@ -169,7 +169,7 @@ COPY --from=inventory /out/ /
 # No `kubectl`: component-pod log capture is owned by the parent `ztest run` over
 # the kube API (src/logstream.rs `Collector`), not shelled from inside the pod, so
 # the runtime closure is just glibc + CA roots.
-FROM debian:bookworm-slim AS runner
+FROM docker.io/library/debian:bookworm-slim AS runner
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 # Place the binaries at the same absolute path they were compiled at, so the

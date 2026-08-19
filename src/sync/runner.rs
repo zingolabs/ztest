@@ -154,7 +154,7 @@ enum Flow {
     Abort(String),
 }
 
-impl<S: SyncSubject> std::fmt::Debug for SyncEngine<S> {
+impl std::fmt::Debug for SyncEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncEngine")
             .field("probes", &self.probes.len())
@@ -164,8 +164,10 @@ impl<S: SyncSubject> std::fmt::Debug for SyncEngine<S> {
     }
 }
 
-pub struct SyncEngine<S: SyncSubject> {
-    subject: S,
+/// Subject is boxed, not a type parameter: every profile binds one dynamically, and a
+/// generic engine would push that parameter into every caller for no gain
+pub struct SyncEngine {
+    subject: Box<dyn SyncSubject>,
     probes: Vec<ProbeSpec>,
     ctx: SyncCtx,
     cancel: Cancel,
@@ -177,10 +179,10 @@ pub struct SyncEngine<S: SyncSubject> {
     required_work: OpSet,
 }
 
-impl<S: SyncSubject> SyncEngine<S> {
+impl SyncEngine {
     /// Runner over `subject`: no oracle indexer, no cancellation, 5 s base tick,
     /// 20k-snapshot history, no timeout, `NullReporter`. Chain the setters below.
-    pub fn new(subject: S) -> Self {
+    pub fn new(subject: Box<dyn SyncSubject>) -> Self {
         Self {
             subject,
             probes: Vec::new(),
@@ -238,7 +240,6 @@ impl<S: SyncSubject> SyncEngine<S> {
         self
     }
 
-    #[cfg_attr(not(feature = "librustzcash"), allow(dead_code))]
     pub fn with_probes(mut self, probes: Vec<ProbeSpec>) -> Self {
         self.probes = probes;
         self
@@ -365,8 +366,8 @@ impl<S: SyncSubject> SyncEngine<S> {
                     continue;
                 }
             };
-            last_work = self.read_work(&mut chain_work, &progress, last_work).await;
-            let snap = Arc::new(builder.build(&progress, now, last_work, None));
+            last_work = self.read_work(&mut chain_work, progress.as_ref(), last_work).await;
+            let snap = Arc::new(builder.build(progress.as_ref(), now, last_work, None));
             let mark = Mark { height: snap.height(), work: last_work, at: now };
             origin.get_or_insert(mark);
             head = Some(mark);
@@ -402,9 +403,9 @@ impl<S: SyncSubject> SyncEngine<S> {
                 // roots (sync task done → wallet static, read cannot race the scan). A
                 // roots-read failure degrades to empty roots, no abort at the finish line.
                 if let Ok(p) = self.subject.progress().await {
-                    let work = self.read_work(&mut chain_work, &p, last_work).await;
+                    let work = self.read_work(&mut chain_work, p.as_ref(), last_work).await;
                     let at = Instant::now();
-                    let final_snap = Arc::new(builder.build(&p, at, work, None));
+                    let final_snap = Arc::new(builder.build(p.as_ref(), at, work, None));
                     head = Some(Mark { height: final_snap.height(), work, at });
                     if let Some(msg) = self.eval_at_completion(&final_snap, &mut violations).await {
                         error = Some(msg);
@@ -452,10 +453,10 @@ impl<S: SyncSubject> SyncEngine<S> {
     /// - Subject's own count preferred (a wallet scans non-linearly → its height understates)
     /// - Else derived from the chain at the subject's height
     /// - Failed read holds `last`, never zeroes (a zero prints a rate spike on recovery)
-    async fn read_work<P: ProgressView>(
+    async fn read_work(
         &self,
         chain_work: &mut ChainWork,
-        progress: &P,
+        progress: &dyn ProgressView,
         last: Work,
     ) -> Work {
         if let Some(own) = progress.work() {
@@ -706,7 +707,7 @@ mod tests {
             0.0
         }
         fn phase(&self) -> Phase {
-            Phase::Historic
+            Phase::Syncing
         }
         fn work(&self) -> Option<Work> {
             let mut w = Work::ZERO;
@@ -743,14 +744,13 @@ mod tests {
     }
     #[async_trait]
     impl SyncSubject for FakeSubject {
-        type Progress = FakeProgress;
         async fn launch(&mut self) -> Result<(), crate::RpcError> {
             Ok(())
         }
-        async fn progress(&self) -> Result<FakeProgress, crate::RpcError> {
+        async fn progress(&self) -> Result<Box<dyn ProgressView>, crate::RpcError> {
             let i = self.cursor.fetch_add(1, Ordering::SeqCst);
             let idx = i.min(self.script.len() - 1);
-            Ok(self.script[idx].clone())
+            Ok(Box::new(self.script[idx].clone()))
         }
         async fn is_complete(&self) -> bool {
             !self.never_complete && self.cursor.load(Ordering::SeqCst) >= self.script.len()
@@ -787,8 +787,8 @@ mod tests {
         }
     }
 
-    fn fast_runner<S: SyncSubject>(subject: S) -> SyncEngine<S> {
-        SyncEngine::new(subject).with_tick(Duration::from_millis(10))
+    fn fast_runner(subject: impl SyncSubject + 'static) -> SyncEngine {
+        SyncEngine::new(Box::new(subject)).with_tick(Duration::from_millis(10))
     }
 
     /// The failure this guards is a *silent cross-repo rename*: the subject stops publishing

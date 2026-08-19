@@ -1,8 +1,8 @@
-//! Host-placed collector: Alloy in a docker container beside the kubelet, not inside it.
+//! Host-placed collector: Alloy in a host-engine container beside the kubelet, not inside it.
 //!
 //! - Nested kubelet (kind) numbers pods below the initial pid namespace; eBPF reports initial
 //!   pids, so an in-cluster collector resolves none of them (see [`super::ebpf::Placement`])
-//! - `--pid=host` puts it in the namespace eBPF measures in; it joins the cluster's docker
+//! - `--pid=host` puts it in the namespace eBPF measures in; it joins the cluster's engine
 //!   network so the apiserver and the Pyroscope NodePort resolve by node IP
 //! - Container ids still match: nested containerd ids appear verbatim in the host cgroup path
 //! - Lifetime = the run's, enforced by reaping against the driver pod (the CLI is detached, so
@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use super::ebpf::HTTP_PORT;
+use crate::runtime;
 
 /// Container path for the generated config + kubeconfig (mounted read-only)
 pub const HOST_CONFIG: &str = "/etc/alloy/config.alloy";
@@ -20,24 +21,24 @@ pub const HOST_KUBECONFIG: &str = "/etc/alloy/kubeconfig";
 /// Marks a container as ours *and* whose: reaping needs the sync id without a pid file
 const SYNC_LABEL: &str = "ztest.io/sync-id";
 
-/// kind labels its node containers; the cluster's docker network is read off one of them so
+/// kind labels its node containers; the cluster's engine network is read off one of them so
 /// the collector joins it rather than guessing a name
 const KIND_ROLE_LABEL: &str = "io.x-k8s.kind.role=control-plane";
 
-/// Docker network the cluster's nodes sit on.
+/// Engine network the cluster's nodes sit on.
 ///
 /// - Joining it is what makes the apiserver and the Pyroscope NodePort reachable by node IP
 ///   (user-defined bridges are isolated from the default one)
 /// - Node IP over loopback on purpose: `--network host` would work too, but then the metrics
 ///   port lives in the host's port space, where anything may already hold it
 pub async fn cluster_network() -> Option<String> {
-    let node = Command::new("docker")
+    let node = Command::new(runtime::program())
         .args(["ps", "--filter", &format!("label={KIND_ROLE_LABEL}"), "--format", "{{.Names}}"])
         .output()
         .await
         .ok()?;
     let node = String::from_utf8_lossy(&node.stdout).lines().next()?.trim().to_string();
-    let net = Command::new("docker")
+    let net = Command::new(runtime::program())
         .args([
             "inspect",
             "-f",
@@ -50,10 +51,10 @@ pub async fn cluster_network() -> Option<String> {
     String::from_utf8_lossy(&net.stdout).split_whitespace().next().map(str::to_string)
 }
 
-/// Host port docker bound the collector's `/metrics` to. Docker owns the mapping, so this is
-/// a lookup rather than a convention both sides must keep in step
+/// Host port the engine bound the collector's `/metrics` to. Engine owns the mapping, so this
+/// is a lookup rather than a convention both sides must keep in step
 pub async fn metrics_port(sync_id: &str) -> Option<u16> {
-    let out = Command::new("docker")
+    let out = Command::new(runtime::program())
         .args(["port", &container_name(sync_id), &HTTP_PORT.to_string()])
         .output()
         .await
@@ -120,12 +121,12 @@ pub async fn start(sync_id: &str, config: &str, api_server: &str) -> Result<(), 
     let kubeconfig = write_kubeconfig(&dir, api_server)?;
 
     let name = container_name(sync_id);
-    let _ = Command::new("docker").args(["rm", "-f", &name]).output().await;
+    let _ = Command::new(runtime::program()).args(["rm", "-f", &name]).output().await;
 
     let network = cluster_network().await.ok_or("no kind docker network found for this cluster")?;
     let http = format!("--server.http.listen-addr=0.0.0.0:{HTTP_PORT}");
     let publish = format!("127.0.0.1::{HTTP_PORT}");
-    let out = Command::new("docker")
+    let out = Command::new(runtime::program())
         .args([
             "run",
             "-d",
@@ -170,7 +171,7 @@ pub async fn start(sync_id: &str, config: &str, api_server: &str) -> Result<(), 
 async fn settled(name: &str) -> Result<(), String> {
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let Ok(out) = Command::new("docker")
+        let Ok(out) = Command::new(runtime::program())
             .args(["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", name])
             .output()
             .await
@@ -192,7 +193,9 @@ async fn settled(name: &str) -> Result<(), String> {
 
 /// Alloy's own last complaint, which names the cause far better than an exit code
 async fn last_error(name: &str) -> String {
-    let Ok(out) = Command::new("docker").args(["logs", "--tail", "40", name]).output().await else {
+    let Ok(out) =
+        Command::new(runtime::program()).args(["logs", "--tail", "40", name]).output().await
+    else {
         return "see `docker logs`".to_string();
     };
     let text =
@@ -206,7 +209,10 @@ async fn last_error(name: &str) -> String {
 }
 
 pub async fn stop(sync_id: &str) {
-    let _ = Command::new("docker").args(["rm", "-f", &container_name(sync_id)]).output().await;
+    let _ = Command::new(runtime::program())
+        .args(["rm", "-f", &container_name(sync_id)])
+        .output()
+        .await;
     let _ = std::fs::remove_dir_all(run_dir(sync_id));
 }
 
@@ -215,7 +221,7 @@ pub async fn stop(sync_id: &str) {
 /// - `ps -a`, not `ps`: a collector that died (bind clash, rejected config) still owns a
 ///   container name and a scratch dir, and only this sweep frees them
 pub async fn collectors() -> Vec<String> {
-    let Ok(out) = Command::new("docker")
+    let Ok(out) = Command::new(runtime::program())
         .args([
             "ps",
             "-a",

@@ -165,10 +165,10 @@ fn unsupported(archive: &str, what: String) -> EnvError {
     EnvError::ArchiveMaterializeFailed {
         archive: archive.to_string(),
         reason: format!(
-            // `cluster setup` installs no storage → naming it here loops the reader
             "{what} — this archive-backed test needs CSI snapshot support. \
-             On a local kind cluster run `scripts/kind-storage.sh`; on a shared cluster \
-             check that the seed StorageClass / VolumeSnapshotClass are installed."
+             On a local kind cluster run `ztest cluster setup --install-storage`; on a \
+             shared cluster check that the seed StorageClass / VolumeSnapshotClass are \
+             installed."
         ),
     }
 }

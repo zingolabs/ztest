@@ -54,14 +54,10 @@ pub use tree::{TreeRoot, TreeRootError, TreeRoots};
 pub use tree::commitment_tree_root;
 pub use work::{CHANNELS, Mismatch, Op, OpSet, Rate, Segment, Work};
 
-// Wallet-sync harness drives the in-process wallet; its `LrzSyncSubject` lives in
-// `backends::librustzcash`
-#[cfg(feature = "librustzcash")]
+// Test-author facade; subject-agnostic, so it needs no backend feature
 mod facade;
 // Event-publishing reporter reachable only through the facade's run path (where a detached
 // driver is launched)
-#[cfg(feature = "librustzcash")]
 mod reporter;
 
-#[cfg(feature = "librustzcash")]
-pub use facade::{PerformanceLevel, Subject, SyncManifest, SyncRunner};
+pub use facade::{SyncManifest, SyncRunner};

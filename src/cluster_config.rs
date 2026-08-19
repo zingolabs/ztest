@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use kube::config::Kubeconfig;
 use serde::{Deserialize, Serialize};
 
+use crate::runtime::{ContainerRuntime, RUNTIME_ENV};
+
 pub const KUBE_CONTEXT_ENV: &str = "ZTEST_KUBE_CONTEXT";
 pub const CLUSTER_CLASS_ENV: &str = "ZTEST_CLUSTER_CLASS";
 /// Carries [`Profile::storage_driver`] → `ztest run` resolves the storage
@@ -101,6 +103,9 @@ pub struct Profile {
     /// `None` follows the cluster's default StorageClass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_driver: Option<String>,
+    /// Host engine for builds, side-loads, profiling. `None` → [`crate::runtime::active`] resolves
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<ContainerRuntime>,
     #[serde(default)]
     pub class: ClusterClass,
 }
@@ -283,6 +288,7 @@ unsafe fn apply(profile: &Profile, force: bool) {
         set(KUBE_CONTEXT_ENV, profile.context.as_deref(), force);
         set(CLUSTER_CLASS_ENV, Some(profile.class.as_str()), force);
         set(STORAGE_DRIVER_ENV, profile.storage_driver.as_deref(), force);
+        set(RUNTIME_ENV, profile.runtime.map(ContainerRuntime::as_str), force);
         match profile.class {
             ClusterClass::Remote => {
                 set(REGISTRY_ENV, profile.pull_address(), force);

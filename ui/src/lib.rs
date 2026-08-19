@@ -232,6 +232,8 @@ pub struct SyncVitals {
     pub target: Option<u32>,
     pub pct: f32,
     pub phase: Option<ztest::api::Phase>,
+    /// Subject's own stage word (`"scanning"`, `"indexing"`) — harness owns no such vocabulary
+    pub phase_detail: Option<String>,
     pub reorg_depth: u32,
     pub pace: Option<ztest::api::Pace>,
     pub tx_rate: Option<f64>,

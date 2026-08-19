@@ -21,6 +21,7 @@ pub use crate::podmetrics::{PodLoad, SAMPLE_PERIOD};
 pub use crate::proc::ChildHost;
 pub use crate::rate::{Pace, Window};
 pub use crate::resource::{Cx, Graph, NodeId, NodeState, Progress, ProgressSink};
+pub use crate::runtime;
 pub use crate::storage::seed_sha8;
 
 pub use crate::backends::image::DevSource;

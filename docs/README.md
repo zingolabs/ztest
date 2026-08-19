@@ -19,22 +19,21 @@ down on exit.
 | [ops-cluster-requirements.md](ops-cluster-requirements.md) | What a cluster must provide before ztest can run on it, and how `ztest cluster check` reports it |
 | [ops-local-cluster.md](ops-local-cluster.md)               | Give a local kind cluster snapshot-capable storage (CSI hostpath, or TopoLVM for fast seeds)     |
 | [ops-clusters.md](ops-clusters.md)                         | Bind a kube-context + cluster class + registry under a named `ztest cluster` profile             |
-| [ops-production-cluster.md](ops-production-cluster.md)     | Stand up and operate the bare-metal NixOS/k3s/Ceph cluster                                       |
 
 ## Design — how it works
 
-| Doc                                                        | Covers                                                                                     |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| [design-architecture.md](design-architecture.md)           | K8s substrate: namespaces, ownership/cleanup, networking, seed→snapshot→CoW, observability |
-| [design-execution-engine.md](design-execution-engine.md)   | Run-loop scheduler and console render thread                                               |
-| [design-resources.md](design-resources.md)                 | Provider DAG, resource lifetimes, teardown, storage byte-source                            |
-| [design-qos.md](design-qos.md)                             | Tiers, capacity model, scheduler, cross-run ledger, calibration                            |
-| [design-status.md](design-status.md)                       | `ztest status`: the live cluster view, lease beacons, claim leases, gantt layout           |
-| [design-remote-execution.md](design-remote-execution.md)   | Pod-per-test, on-cluster compilation, on-cluster image builds                              |
-| [design-observability.md](design-observability.md)         | Metrics & profiling planes, Prometheus discovery, what a run records                       |
-| [design-load-testing.md](design-load-testing.md)           | Load driver, scenarios, oracles, parity checking                                           |
-| [design-sync.md](design-sync.md)                           | Observable chain-sync harness, probe taxonomy, nemesis/chaos layer                         |
-| [design-platform-collapse.md](design-platform-collapse.md) | Why ztest asserts cluster capabilities instead of installing them, and what that deleted   |
+| Doc                                                      | Covers                                                                                     |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| [design-architecture.md](design-architecture.md)         | K8s substrate: namespaces, ownership/cleanup, networking, seed→snapshot→CoW, observability |
+| [design-execution-engine.md](design-execution-engine.md) | Run-loop scheduler and console render thread                                               |
+| [design-resources.md](design-resources.md)               | Provider DAG, resource lifetimes, teardown, storage byte-source                            |
+| [design-qos.md](design-qos.md)                           | Tiers, capacity model, scheduler, cross-run ledger, calibration                            |
+| [design-status.md](design-status.md)                     | `ztest status`: the live cluster view, lease beacons, claim leases, gantt layout           |
+| [design-remote-execution.md](design-remote-execution.md) | Pod-per-test, on-cluster compilation, on-cluster image builds                              |
+| [design-observability.md](design-observability.md)       | Metrics & profiling planes, Prometheus discovery, what a run records                       |
+| [design-sync.md](design-sync.md)                         | Observable chain-sync harness, probe taxonomy, nemesis/chaos layer                         |
+| [design-snapshots.md](design-snapshots.md)               | Chain fixtures as pinned build inputs: manifest-as-lockfile, content-addressed bucket      |
+| [design-describe.md](design-describe.md)                 | One planner behind `run` and `sync describe`: what a selection actually pulls              |
 
 ## How-to
 

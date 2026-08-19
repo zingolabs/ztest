@@ -113,11 +113,24 @@ pub(crate) enum Rt {
     Current,
 }
 
+/// Subcommand failure. `Reported` = already rendered in the subcommand's own shape
+/// (a generic restatement under it reads as a second, different failure)
+pub(crate) enum CliError {
+    Message(String),
+    Reported,
+}
+
+impl From<String> for CliError {
+    fn from(m: String) -> Self {
+        CliError::Message(m)
+    }
+}
+
 /// Build a runtime, drive `fut`, map to `ExitCode`; errors prefixed `ztest {label}:`
-pub(crate) fn block_on(
+pub(crate) fn block_on<E: Into<CliError>>(
     label: &str,
     rt: Rt,
-    fut: impl std::future::Future<Output = Result<(), String>>,
+    fut: impl std::future::Future<Output = Result<(), E>>,
 ) -> ExitCode {
     let mut builder = match rt {
         Rt::Multi => tokio::runtime::Builder::new_multi_thread(),
@@ -133,7 +146,9 @@ pub(crate) fn block_on(
     match rt.block_on(fut) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("ztest {label}: {e}");
+            if let CliError::Message(m) = e.into() {
+                eprintln!("ztest {label}: {m}");
+            }
             ExitCode::FAILURE
         }
     }

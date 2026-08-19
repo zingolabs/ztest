@@ -53,7 +53,7 @@ use crate::handles::HandleInner;
 use crate::handles::wallet::{
     AccountId, AccountSpec, BoxError, Pool, PoolBalances, WalletBackend, WalletConfig,
 };
-use crate::sync::{PerformanceLevel, Phase, ProgressView, SyncSubject, TreeRoots};
+use crate::sync::{Phase, ProgressView, SyncSubject, TreeRoots};
 use crate::topology::ActivationHeights;
 
 const LABEL: &str = "librustzcash";
@@ -532,8 +532,28 @@ fn pool_balances(
     }
 }
 
+/// Compact-block batch size `sync_subject` drives `zcash_client_backend::sync` with.
+///
+/// - Backend-owned: the harness has no scan concept, so this knob lives with the engine it tunes
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerformanceLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl PerformanceLevel {
+    pub fn batch_size(self) -> u32 {
+        match self {
+            PerformanceLevel::Low => 25,
+            PerformanceLevel::Medium => 100,
+            PerformanceLevel::High => 1_000,
+        }
+    }
+}
+
 impl LrzWallet {
-    /// Subject `#[ztest::sync_test]` binds via `Subject::wallet(account)`: drives to
+    /// Subject a `#[ztest::sync_test]` body binds with `run.sync(..)`: drives to
     /// tip through `zcash_client_backend::sync` in a background task. `performance` =
     /// compact-block batch size
     pub async fn sync_subject(
@@ -586,7 +606,7 @@ impl LrzProgress {
             height: u32::from(s.fully_scanned_height()),
             target: Some(u32::from(s.chain_tip_height())),
             pct,
-            phase: if s.is_synced() { Phase::Done } else { Phase::Historic },
+            phase: if s.is_synced() { Phase::Done } else { Phase::Syncing },
             balances,
             // Filled by `progress`, which holds the db handle the trees live behind
             tree_roots: TreeRoots::reported(),
@@ -611,6 +631,9 @@ impl ProgressView for LrzProgress {
     }
     fn phase(&self) -> Phase {
         self.phase
+    }
+    fn detail(&self) -> Option<&'static str> {
+        (self.phase == Phase::Syncing).then_some("scanning")
     }
     // `work()` left at the trait default (`None`) → harness derives it from `height`
     // via `ChainWork`. `WalletSummary` reports a height + ratio, not per-pool counters
@@ -677,8 +700,6 @@ impl std::fmt::Debug for LrzSyncSubject {
 
 #[async_trait]
 impl SyncSubject for LrzSyncSubject {
-    type Progress = LrzProgress;
-
     async fn launch(&mut self) -> Result<(), RpcError> {
         if self.running.is_some() {
             return Err(RpcError::decode(LABEL, "launch", "sync already launched"));
@@ -701,7 +722,7 @@ impl SyncSubject for LrzSyncSubject {
         Ok(())
     }
 
-    async fn progress(&self) -> Result<LrzProgress, RpcError> {
+    async fn progress(&self) -> Result<Box<dyn ProgressView>, RpcError> {
         // Reader guard taken mutably (`with_*_tree_mut` needs `&mut`). Second, WAL
         // connection + DEFERRED read-only transactions → no contention with the sync
         // task on the primary
@@ -711,7 +732,7 @@ impl SyncSubject for LrzSyncSubject {
             .map_err(|e| RpcError::decode(LABEL, "get_wallet_summary", format!("{e}")))?;
         let progress = LrzProgress::from_summary(summary.as_ref(), self.account.account_id);
         let scanned = BlockHeight::from(progress.height);
-        Ok(progress.with_tree_roots(wallet_tree_roots(&mut db, scanned)))
+        Ok(Box::new(progress.with_tree_roots(wallet_tree_roots(&mut db, scanned))))
     }
 
     async fn is_complete(&self) -> bool {

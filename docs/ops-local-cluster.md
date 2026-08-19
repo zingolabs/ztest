@@ -1,30 +1,27 @@
 # Local cluster storage
 
-ztest seeds tests by cloning a PVC copy-on-write from a `VolumeSnapshot`, so a
-local cluster needs a CSI driver that can snapshot. ztest installs none of it —
-which driver a cluster runs is the operator's call
-([ops-cluster-requirements.md](ops-cluster-requirements.md)) — you name the
-driver and ztest resolves the rest:
+Seeding clones a PVC copy-on-write from a `VolumeSnapshot` → a local cluster needs a CSI driver that can
+snapshot. `ztest cluster setup` offers to install csi-hostpath here; anywhere else the driver is the
+operator's call ([ops-cluster-requirements.md](ops-cluster-requirements.md)). Name the driver, ztest
+resolves the rest:
 
 ```sh
 ztest cluster add kind --kind kind --storage-driver topolvm.io --set-default
 ztest cluster check
 ```
 
-A CSI driver rather than class names, so the StorageClass and
-VolumeSnapshotClass can never be selected from different providers. Omit it and
-ztest follows the cluster's default StorageClass. `check` resolves storage
-exactly as a run does, so green means seeding will work.
+- A *driver*, not class names → StorageClass and VolumeSnapshotClass can never come from different providers
+- Omitted, ztest follows the cluster's default StorageClass
+- `check` resolves storage exactly as a run does, so green means seeding works
 
 ## Which driver
 
-| | setup | 32 GiB snapshot |
-| --- | --- | --- |
-| **CSI hostpath** (`scripts/kind-storage.sh`) | one command | **~10 min** — `tar`, and it blocks every other volume |
-| **TopoLVM thin pool** | below | **~5 s** — O(1) copy-on-write |
+|                                                            | setup       | 32 GiB snapshot                                       |
+| ---------------------------------------------------------- | ----------- | ----------------------------------------------------- |
+| **CSI hostpath** (`ztest cluster setup --install-storage`) | one command | **~10 min** — `tar`, and it blocks every other volume |
+| **TopoLVM thin pool**                                      | below       | **~5 s** — O(1) copy-on-write                         |
 
-hostpath is fine for small volumes and needs nothing from the host. Use TopoLVM
-if you run real seeds.
+hostpath is fine for small volumes and needs nothing from the host. TopoLVM for real seeds.
 
 ## TopoLVM
 
@@ -36,18 +33,16 @@ Containers cannot load modules; the kind node inherits the host's.
 boot.kernelModules = [ "dm-thin-pool" "dm-snapshot" ];   # NixOS
 ```
 
-Missing `dm-thin-pool`, the pool cannot be created. Missing `dm-snapshot`, it
-provisions fine and every snapshot fails.
+- No `dm-thin-pool` → pool cannot be created
+- No `dm-snapshot` → provisions fine, every snapshot fails
 
 ### 2. A thin pool
 
-ztest needs a volume group `ztest` containing a thin pool `thin`. Back it however
-suits the machine — an existing VG with free extents, a loopback file, or a
-dedicated disk (fastest, and it erases the device).
+Volume group `ztest` containing thin pool `thin`. Back it however suits the machine — an existing VG with
+free extents, a loopback file, or a dedicated disk (fastest, erases the device).
 
-The loopback path needs no spare disk and works anywhere. Put it **inside the
-kind node**: the host and the node have separate `/dev` trees, and two LVM
-instances managing one VG deactivate each other's devices.
+Loopback needs no spare disk and works anywhere. Put it **inside the kind node**: host and node have
+separate `/dev` trees, and two LVM instances managing one VG deactivate each other's devices.
 
 ```sh
 docker exec <cluster>-control-plane sh -c '
@@ -64,18 +59,13 @@ EOF
   lvm lvcreate --type thin-pool -n thin -l 95%FREE --poolmetadatasize 2G --zero n ztest'
 ```
 
-The `lvm.conf` block is load-bearing: there is no `udev` in a kind node, so
-without it LVM creates the device-mapper device in the kernel and then blocks
-forever waiting for a `/dev` entry nobody will make.
-
-`--zero n` skips zeroing newly provisioned blocks, so a fresh volume can expose
-blocks freed by another — fine for single-tenant test fixtures, not for a shared
-cluster.
-
-Already have a VG on a real disk? Create the pool there instead and skip the
-loopback; only the `lvm2` install and `lvm.conf` are still needed in the node,
-plus `lvm vgchange -ay ztest` from inside it. **The host must never activate the
-VG** — that is the same two-instance conflict.
+- `lvm.conf` block is load-bearing: no `udev` in a kind node, so without it LVM creates the
+  device-mapper device in the kernel then blocks forever on a `/dev` entry nobody will make
+- `--zero n` skips zeroing new blocks → a fresh volume can expose blocks freed by another (fine for
+  single-tenant fixtures, not a shared cluster)
+- Existing VG on a real disk: create the pool there, skip the loopback — still need the `lvm2` install +
+  `lvm.conf` in the node, plus `lvm vgchange -ay ztest` from inside it. **The host must never activate
+  the VG** (same two-instance conflict)
 
 ### 3. TopoLVM
 
@@ -109,8 +99,7 @@ storageClasses:
 YAML
 ```
 
-The chart ships no `VolumeSnapshotClass`, and without one ztest sees no
-snapshot-capable storage:
+Chart ships no `VolumeSnapshotClass`; without one ztest sees no snapshot-capable storage:
 
 ```sh
 kubectl apply -f - <<'YAML'
@@ -122,8 +111,7 @@ deletionPolicy: Delete
 YAML
 ```
 
-If csi-hostpath is also installed, demote it — two default StorageClasses is
-invalid and Kubernetes picks neither:
+csi-hostpath also installed → demote it; two default StorageClasses is invalid and k8s picks neither:
 
 ```sh
 kubectl patch sc csi-hostpath-sc \
@@ -142,11 +130,10 @@ Health of the pool itself:
 docker exec <cluster>-control-plane lvm lvs ztest    # expect twi-aot---
 ```
 
-`a` active, `o` open, `t` thin target. A pool that is not `a` will fail every
-PVC at once — the usual cause is a reboot without the kernel modules.
+`a` active, `o` open, `t` thin target. A pool that is not `a` fails every PVC at once — usually a reboot
+without the kernel modules.
 
 ## Recreating the node
 
-`lvm2` and `/etc/lvm/lvm.conf` live in the node's container filesystem and are
-lost on `kind delete cluster`. Re-run step 2 after recreating; the volume group
-is on disk and survives.
+`lvm2` + `/etc/lvm/lvm.conf` live in the node's container filesystem → lost on `kind delete cluster`.
+Re-run step 2 after recreating; the volume group is on disk and survives.
