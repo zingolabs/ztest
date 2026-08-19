@@ -48,26 +48,19 @@ pub fn image_uri(
 #[derive(Debug, Clone)]
 pub struct ZainoBackend;
 
-/// Ingest path, **not** whether an index is built (one `NodeBackedIndexerService` serves
-/// both arms). Orthogonal to [`IndexerMode`](crate::component::IndexerMode), composes with
-/// `.regtest()`/`.testnet(_)` in any order.
+/// Stackable zainod knobs, read at build time. Two independent axes — stack with repeated
+/// `.tuning(..)`. Orthogonal to [`IndexerMode`](crate::component::IndexerMode), composes
+/// with `.regtest()`/`.testnet(_)` in any order.
 ///
-/// - `Fetch` (default) = blocks over the validator's JSON-RPC, no state DB
-/// - `State` = zebra state DB on disk (regtest: validator's own; testnet: CoW archive clone)
+/// - ingest path: `Fetch` (default) = blocks over validator JSON-RPC, no state DB /
+///   `State` = zebra state DB on disk (regtest: validator's own; testnet: CoW archive clone).
+///   Not whether an index is built — one `NodeBackedIndexerService` serves both arms
+/// - `Ephemeral` = no persistent finalised-state DB (finalised reads → the backing source)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZainoTuning {
     Fetch,
     State,
-}
-
-impl ZainoTuning {
-    /// `backend =` literal in `zainod.toml`
-    fn as_toml(self) -> &'static str {
-        match self {
-            ZainoTuning::Fetch => "fetch",
-            ZainoTuning::State => "state",
-        }
-    }
+    Ephemeral,
 }
 
 impl IndexerConfig for ZainoBackend {
@@ -76,6 +69,10 @@ impl IndexerConfig for ZainoBackend {
 
     fn to_handle(&self, plumbing: HandleInner) -> ZainoIndexer {
         ZainoIndexer { plumbing }
+    }
+
+    fn metrics_port(&self) -> Option<u16> {
+        Some(crate::ports::ZAINO_METRICS)
     }
 
     fn materialize_opts(
@@ -91,8 +88,10 @@ impl IndexerConfig for ZainoBackend {
         // live DB via a co-scheduled RWO PVC; testnet = per-pod CoW archive clone), so
         // the precondition belongs inside the match below — hoisting the regtest form
         // out of it made every `.testnet(_).tuning(State)` env unbuildable
-        let state = tunings.iter().any(|t| matches!(t, ZainoTuning::State));
-        let backend_literal = if state { ZainoTuning::State } else { ZainoTuning::Fetch }.as_toml();
+        let state = tunings.contains(&ZainoTuning::State);
+        let backend_literal = if state { "state" } else { "fetch" };
+        // Zaino's own finalised index, not the validator's DB → independent of `state`
+        let ephemeral = tunings.contains(&ZainoTuning::Ephemeral);
 
         // Shared state volume only ever meaningful to `State`, under every mode
         if !state && opts.shared_state.is_some() {
@@ -139,7 +138,8 @@ impl IndexerConfig for ZainoBackend {
                     zebra_db_path,
                     ZAINO_DB,
                     validator_grpc.as_deref(),
-                    opts.image.metrics_enabled().then_some(crate::ports::ZAINO_METRICS),
+                    opts.image.metrics_enabled().then(|| self.metrics_port()).flatten(),
+                    ephemeral,
                 )
             }
             IndexerMode::Public => {
@@ -201,7 +201,8 @@ impl IndexerConfig for ZainoBackend {
                     ZAINO_ZEBRA_DB,
                     ZAINO_DB,
                     validator_grpc.as_deref(),
-                    opts.image.metrics_enabled().then_some(crate::ports::ZAINO_METRICS),
+                    opts.image.metrics_enabled().then(|| self.metrics_port()).flatten(),
+                    ephemeral,
                 )
             }
         };
@@ -236,11 +237,13 @@ impl IndexerBackend for ZainoIndexer {
             label: COMPONENT,
             image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
             ports: crate::manifest::merge_ports(
-                &[
-                    ("grpc", crate::ports::ZAINO_GRPC),
-                    ("jsonrpc", crate::ports::ZAINO_JSONRPC),
-                    ("metrics", crate::ports::ZAINO_METRICS),
-                ],
+                &crate::backends::metrics_port_appended(
+                    &[
+                        ("grpc", crate::ports::ZAINO_GRPC),
+                        ("jsonrpc", crate::ports::ZAINO_JSONRPC),
+                    ],
+                    ZainoBackend.metrics_port(),
+                ),
                 &opts.extra_ports,
             ),
             ready_port: crate::ports::ZAINO_GRPC,
@@ -813,7 +816,7 @@ const EXPORTER_SCRAPE_TIMEOUT: Duration = Duration::from_secs(1);
 #[async_trait]
 impl Exporter for ZainoIndexer {
     async fn endpoint(&self) -> Result<Endpoint, EnvError> {
-        self.endpoint_for(crate::ports::ZAINO_METRICS).await
+        self.plumbing.endpoint(crate::metrics::PORT_NAME).await
     }
 
     fn rows(&self) -> &'static [Row] {
@@ -839,6 +842,7 @@ impl ZainoIndexer {
     pub async fn index_frontier(&self) -> Result<u32, RpcError> {
         frontier_of(&self.exporter().await?, "index_frontier")
     }
+
 }
 
 /// Takes an already-scraped exposition: [`SyncSubject::progress`] needs height, work

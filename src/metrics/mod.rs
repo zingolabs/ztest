@@ -22,7 +22,7 @@ use prometheus_parse::Value as Scraped;
 pub mod live;
 pub mod query;
 
-pub use self::live::{Exporter, LIVE_PERIOD, PodExporter, Poller, Sample};
+pub use self::live::{DEFAULT_SAMPLE_RATE, Exporter, LIVE_PERIOD, PodExporter, Poller, Sample};
 
 /// Container-port name serving `/metrics` = the entire contract. Prometheus SD
 /// keeps a pod by it, [`PodExporter`] discovers by it, every `pod_spec` declares it
@@ -42,6 +42,26 @@ pub enum Reduce {
     Max,
     MeanMs,
 }
+
+/// Prometheus exposition type to read a family as.
+///
+/// - [`Exposition::absorb`] keeps only scalar samples; histogram/summary composites are
+///   dropped and their `_sum`/`_count` arrive as families of their own. So `Sum`/`Count`/
+///   `Mean` are the readable parts of a histogram — **buckets and quantiles are not kept**
+/// - `Gauge` takes the max and `Counter` the sum across label sets, matching how their
+///   PromQL counterparts fold a namespace
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetricKind {
+    Gauge,
+    Counter,
+    /// `{name}_sum`
+    Sum,
+    /// `{name}_count`
+    Count,
+    /// `{name}_sum / {name}_count`, in the observation's own unit
+    Mean,
+}
+
 
 /// Which reading a row belongs to, so a renderer groups by meaning rather than by
 /// matching family names it would have to hardcode per backend.
@@ -145,6 +165,22 @@ impl Exposition {
         }
     }
 
+    /// One family as `kind`. Absent → `None`, never a zero
+    pub fn read(&self, name: &str, kind: MetricKind) -> Option<f64> {
+        match kind {
+            MetricKind::Gauge => self.reduce(name, Reduce::Max),
+            MetricKind::Counter => self.reduce(name, Reduce::Sum),
+            MetricKind::Sum => self.reduce(&format!("{name}_sum"), Reduce::Sum),
+            MetricKind::Count => self.reduce(&format!("{name}_count"), Reduce::Sum),
+            MetricKind::Mean => {
+                let sum = self.reduce(&format!("{name}_sum"), Reduce::Sum)?;
+                let count = self.reduce(&format!("{name}_count"), Reduce::Sum)?;
+                // No observations = 0/0; NaN would render as a real mean
+                (count > 0.0).then(|| sum / count)
+            }
+        }
+    }
+
     /// Gauge → whole number.
     ///
     /// - Every gauge here = a block height the exporter widened to `f64`; narrow at
@@ -204,6 +240,21 @@ zaino_grpc_request_duration_seconds{quantile=\"0.5\"} 0.004
 zaino_grpc_request_duration_seconds_sum 0.85
 zaino_grpc_request_duration_seconds_count 17
 ";
+
+    /// Histogram composites are dropped by `absorb`; only the `_sum`/`_count` families
+    /// survive, so those are what `Sum`/`Count`/`Mean` read
+    #[test]
+    fn metric_kinds_read_their_own_families() {
+        let e = exposition(&[EXPOSITION]);
+        assert_eq!(e.read("zaino_chain_tip_height", MetricKind::Gauge), Some(304.0));
+        // Counter folds both label sets
+        assert_eq!(e.read("zaino_grpc_requests_total", MetricKind::Counter), Some(17.0));
+        assert_eq!(e.read("zaino_grpc_request_duration_seconds", MetricKind::Sum), Some(0.85));
+        assert_eq!(e.read("zaino_grpc_request_duration_seconds", MetricKind::Count), Some(17.0));
+        let mean = e.read("zaino_grpc_request_duration_seconds", MetricKind::Mean).unwrap();
+        assert!((mean - 0.05).abs() < 1e-9, "mean {mean}");
+        assert_eq!(e.read("never_published", MetricKind::Gauge), None);
+    }
 
     pub fn exposition(texts: &[&str]) -> Exposition {
         let mut e = Exposition::default();

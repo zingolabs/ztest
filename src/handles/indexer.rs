@@ -40,6 +40,12 @@ pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
     /// Build the runtime handle once the env has assigned `plumbing`
     fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
 
+    /// Container port serving Prometheus, published as [`crate::metrics::PORT_NAME`].
+    /// `None` = this backend exports nothing (no metrics plane, no `Exporter` impl)
+    fn metrics_port(&self) -> Option<u16> {
+        None
+    }
+
     /// Render the config at build time, once the validator host resolves. Skipped when
     /// `mode` is [`IndexerMode::None`](crate::component::IndexerMode)
     fn materialize_opts(

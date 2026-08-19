@@ -15,7 +15,7 @@ use kube::Client;
 use kube::api::{Api, ListParams};
 use tokio::sync::{Mutex, watch};
 
-use super::{Exposition, PORT_NAME, Row, scrape};
+use super::{Exposition, MetricKind, PORT_NAME, Row, scrape};
 use crate::error::EnvError;
 use crate::portforward::Forwarder;
 use crate::protocol::Endpoint;
@@ -45,7 +45,45 @@ pub trait Exporter: Send + Sync + 'static {
         let http = reqwest::Client::new();
         scrape(&http, &endpoint.url("http"), timeout).await
     }
+
+    /// One metric by its **exposition family name** (`zaino_db_tip_height`, …), read as
+    /// `kind`. The caller names the wire family, so nothing here can drift from what the
+    /// component publishes.
+    ///
+    /// Waits for the family to appear: a gauge exists only once first set, so a probe
+    /// racing the first write sees nothing rather than a wrong value. Re-scrapes every
+    /// `sample_rate` ([`DEFAULT_SAMPLE_RATE`] when `None`) until it does, giving up after
+    /// [`METRIC_WAIT_BUDGET`] — a misspelled family would otherwise hang the test.
+    async fn metric(
+        &self,
+        name: &str,
+        kind: MetricKind,
+        sample_rate: Option<Duration>,
+    ) -> Result<f64, String> {
+        let rate = sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
+        let deadline = tokio::time::Instant::now() + METRIC_WAIT_BUDGET;
+        loop {
+            if let Some(v) = self.read(SCRAPE_TIMEOUT).await?.read(name, kind) {
+                return Ok(v);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{name} ({kind:?}) absent from /metrics after {METRIC_WAIT_BUDGET:?}                      — wrong family name, or this build publishes no metrics"
+                ));
+            }
+            tokio::time::sleep(rate).await;
+        }
+    }
 }
+
+/// `metric`'s re-scrape cadence when the caller names none
+pub const DEFAULT_SAMPLE_RATE: Duration = Duration::from_secs(5);
+/// How long `metric` waits for a family to appear before calling it absent. At the
+/// default sample rate that is two scrapes — enough to clear a scrape landing between
+/// two writes, not enough to hide a name that is simply wrong
+const METRIC_WAIT_BUDGET: Duration = Duration::from_secs(5);
+/// One `/metrics` HTTP read
+const SCRAPE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Exporter reached from **outside** the cluster: pod by `ztest.io/component-category`,
 /// forwarded to its [`PORT_NAME`] port, `rows_for` keyed on `ztest.io/component`.

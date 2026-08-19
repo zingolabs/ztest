@@ -50,6 +50,12 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     /// cheapest template, zcashd [`Pool::Sapling`])
     fn default_coinbase_pool(&self) -> Pool;
 
+    /// Container port serving Prometheus, published as [`crate::metrics::PORT_NAME`].
+    /// `None` = this backend exports nothing (no metrics plane, no `Exporter` impl)
+    fn metrics_port(&self) -> Option<u16> {
+        None
+    }
+
     /// Stable backend label (`zcashd`/`zebrad`), readable pre-launch so a
     /// backend-generic test can branch on it
     fn label(&self) -> &'static str;
@@ -114,6 +120,9 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
 
     /// Generate `n` blocks → new tip height once the chain advances. Coinbase pays
     /// into [`PoolSupport::coinbase`]
+    ///
+    /// - one `generate` RPC **per block**, never one call for `n` (a batched call is
+    ///   held open for the whole mine and dies with the portforward)
     async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError>;
 
     fn pool_support(&self) -> PoolSupport;
@@ -168,8 +177,6 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     fn is_regtest(&self) -> bool;
 
     // Conveniences: loops over the methods above, implemented per backend
-
-    async fn generate_blocks_with_delay(&self, n: u32) -> Result<BlockHeight, RpcError>;
 
     /// Poll until the chain reaches `target`, at the backend's default poll timeout
     async fn poll_chain_height(&self, target: BlockHeight) -> Result<(), RpcError>;

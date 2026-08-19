@@ -28,14 +28,14 @@ pub const RPC_PASSWORD: &str = "test";
 
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
-const BLOCK_GENERATION_DELAY: Duration = Duration::from_millis(1500);
 
 const CONTAINER_CONF_PATH: &str = "/etc/zcash/zcash.conf";
 const CONTAINER_DATA_DIR: &str = "/var/lib/zcashd";
 
 /// Applies with [`Validator::mine_to`](crate::component::Validator::mine_to) unset.
-/// Sapling avoids the per-block Halo2 proof an Orchard coinbase costs
-const DEFAULT_COINBASE_POOL: Pool = Pool::Sapling;
+/// Cheapest template — no per-block shielded proof at all (Sapling still costs a
+/// groth16 one). A test needing a shielded coinbase says so with `mine_to`
+const DEFAULT_COINBASE_POOL: Pool = Pool::Transparent;
 
 /// All three pools mineable; the Orchard recipient pins the coinbase there from NU5
 fn miner_address(pool: Pool) -> &'static str {
@@ -203,12 +203,16 @@ impl ValidatorBackend for ZcashdValidator {
         )
     }
 
+    /// One `generate` call per block — see the zebra impl for why batching loses the
+    /// whole mine once `n` × per-block cost outlives the portforward.
     async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError> {
         let client = self.rpc_client().await?;
-        let _: Value = client
-            .json_result_from_call("generate", &json!([n]))
-            .await
-            .map_err(|e| RpcError::backend_boxed(COMPONENT, "generate", e))?;
+        for _ in 0..n {
+            let _: Value = client
+                .json_result_from_call("generate", &json!([1]))
+                .await
+                .map_err(|e| RpcError::backend_boxed(COMPONENT, "generate", e))?;
+        }
         self.chain_height().await
     }
 
@@ -280,15 +284,6 @@ impl ValidatorBackend for ZcashdValidator {
         // No `nSubsidyHalvingInterval` set → the binary's regtest default governs the
         // halving schedule, which ztest does not model
         Ok(ChainConfig { network, first_halving_height: None })
-    }
-
-    async fn generate_blocks_with_delay(&self, n: u32) -> Result<BlockHeight, RpcError> {
-        let mut tip = self.chain_height().await?;
-        for _ in 0..n {
-            tip = self.generate_blocks(1).await?;
-            tokio::time::sleep(BLOCK_GENERATION_DELAY).await;
-        }
-        Ok(tip)
     }
 
     async fn poll_chain_height(&self, target: BlockHeight) -> Result<(), RpcError> {

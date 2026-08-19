@@ -38,7 +38,6 @@ fn miner_address(pool: Pool) -> &'static str {
 
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
-const BLOCK_GENERATION_DELAY: Duration = Duration::from_millis(1500);
 
 /// A [`Dev`](crate::inventory::ImageSpec::Dev) override never degrades to
 /// the published tag — unbuilt = `DevImageMissing`
@@ -64,6 +63,10 @@ impl ValidatorConfig for ZebraBackend {
 
     fn default_coinbase_pool(&self) -> Pool {
         DEFAULT_COINBASE_POOL
+    }
+
+    fn metrics_port(&self) -> Option<u16> {
+        Some(crate::ports::ZEBRAD_METRICS)
     }
 
     fn label(&self) -> &'static str {
@@ -125,7 +128,7 @@ impl ValidatorConfig for ZebraBackend {
             Some(funding_streams),
             persistent,
             miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
-            opts.image.metrics_enabled().then_some(crate::ports::ZEBRAD_METRICS),
+            opts.image.metrics_enabled().then(|| self.metrics_port()).flatten(),
         );
         opts.mounts.push(crate::regtest::config_mount_inline(toml, CONTAINER_CONFIG_PATH));
 
@@ -210,11 +213,10 @@ impl ValidatorBackend for ZebraValidator {
             ports: {
                 // Declared port + readiness probe both from `rpc_port`, the config
                 // generator's own derivation (else testnet probes the regtest port).
-                let mut base = vec![
-                    ("rpc", rpc_port(opts)),
-                    ("metrics", crate::ports::ZEBRAD_METRICS),
-                    ("p2p", crate::ports::ZEBRAD_P2P),
-                ];
+                let mut base = crate::backends::metrics_port_appended(
+                    &[("rpc", rpc_port(opts)), ("p2p", crate::ports::ZEBRAD_P2P)],
+                    ZebraBackend.metrics_port(),
+                );
                 // Indexer gRPC a colocated zaino `Direct` dials (shared state DB,
                 // or restored testnet chain) needs its port exposed too.
                 if serves_indexer_grpc(opts) {
@@ -277,15 +279,23 @@ impl ValidatorBackend for ZebraValidator {
         })
     }
 
+    /// One `generate` call per block, not one call for `n`.
+    ///
+    /// - `generate` mines server-side (regtest / `disable_pow()`), synchronous → the
+    ///   request stays open for the whole mine
+    /// - batched, `n` blocks = one request held for `n` × per-block cost; past the
+    ///   portforward's lifetime the tunnel drops mid-flight ("connection closed before
+    ///   message completed") and the whole call is lost
+    /// - per-block requests bound each one to a single block, so `n` is limited by the
+    ///   test's own budget, not the tunnel's
     async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError> {
-        // `generate` mines server-side (gated on regtest / `disable_pow()`),
-        // keeping the Zebra node tree out of our dep graph. Synchronous →
-        // no client-side retry loop.
         let client = self.rpc_client().await?;
-        let _: Value = client
-            .json_result_from_call("generate", &json!([n]))
-            .await
-            .map_err(|e| RpcError::backend_boxed(COMPONENT, "generate", e))?;
+        for _ in 0..n {
+            let _: Value = client
+                .json_result_from_call("generate", &json!([1]))
+                .await
+                .map_err(|e| RpcError::backend_boxed(COMPONENT, "generate", e))?;
+        }
         self.chain_height().await
     }
 
@@ -373,15 +383,6 @@ impl ValidatorBackend for ZebraValidator {
         };
         let first_halving_height = first_halving.map(BlockHeight::from);
         Ok(ChainConfig { network, first_halving_height })
-    }
-
-    async fn generate_blocks_with_delay(&self, n: u32) -> Result<BlockHeight, RpcError> {
-        let mut tip = self.chain_height().await?;
-        for _ in 0..n {
-            tip = self.generate_blocks(1).await?;
-            tokio::time::sleep(BLOCK_GENERATION_DELAY).await;
-        }
-        Ok(tip)
     }
 
     async fn poll_chain_height(&self, target: BlockHeight) -> Result<(), RpcError> {
@@ -487,7 +488,7 @@ fn restore_public(
         // Always on for a public restore (colocated zaino `Direct` needs an
         // address to dial; `serves_indexer_grpc` exposes the port to match).
         Some(crate::ports::ZEBRAD_INDEXER),
-        validator.opts().image.metrics_enabled().then_some(crate::ports::ZEBRAD_METRICS),
+        validator.opts().image.metrics_enabled().then(|| ZebraBackend.metrics_port()).flatten(),
     );
     validator
         .mount(crate::regtest::config_mount_inline(toml, "/etc/zebrad/zebrad.toml"))

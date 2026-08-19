@@ -76,9 +76,53 @@ pub fn seed_groups(opts: &crate::component::ComponentOpts) -> Vec<i64> {
     }
 }
 
+/// `base` + the metrics port under [`crate::metrics::PORT_NAME`], when the backend
+/// declares one. Keeps the port number in the backend's `metrics_port` and nowhere else
+pub(crate) fn metrics_port_appended(
+    base: &[(&'static str, u16)],
+    metrics_port: Option<u16>,
+) -> Vec<(&'static str, u16)> {
+    let mut ports = base.to_vec();
+    ports.extend(metrics_port.map(|p| (crate::metrics::PORT_NAME, p)));
+    ports
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::component::{ComponentOpts, RestoreSource};
+    use crate::component::{ComponentOpts, RestoreSource, Validator};
+    use crate::handles::validator::ValidatorConfig;
+    use crate::handles::wallet::Pool;
+    use crate::regtest::Regtest;
+
+    /// Transparent = the only coinbase costing no per-block proof. Both backends default
+    /// to it; `env.add_validator` resolves `coinbase_pool: None` through
+    /// `default_coinbase_pool`, so an unset builder must leave it `None`
+    #[test]
+    fn coinbase_defaults_to_transparent_on_every_backend() {
+        assert_eq!(super::zebra::ZebraBackend.default_coinbase_pool(), Pool::Transparent);
+        assert_eq!(super::zcashd::ZcashdBackend.default_coinbase_pool(), Pool::Transparent);
+
+        assert_eq!(Validator::zebrad("6.2.3").regtest().opts.coinbase_pool, None);
+        assert_eq!(Validator::zcashd("v6.20.0").regtest().opts.coinbase_pool, None);
+    }
+
+    /// `.mine_to` is the only way a shielded coinbase is selected — it must win over the
+    /// backend default, in either builder order
+    #[test]
+    fn mine_to_overrides_the_default() {
+        assert_eq!(
+            Validator::zebrad("6.2.3").regtest().mine_to(Pool::Orchard).opts.coinbase_pool,
+            Some(Pool::Orchard)
+        );
+        assert_eq!(
+            Validator::zebrad("6.2.3").mine_to(Pool::Sapling).regtest().opts.coinbase_pool,
+            Some(Pool::Sapling)
+        );
+        assert_eq!(
+            Validator::zcashd("v6.20.0").regtest().mine_to(Pool::Sapling).opts.coinbase_pool,
+            Some(Pool::Sapling)
+        );
+    }
 
     fn opts_with(restore: Option<RestoreSource>) -> ComponentOpts {
         ComponentOpts { restore, ..Default::default() }

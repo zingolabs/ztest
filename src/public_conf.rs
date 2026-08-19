@@ -119,6 +119,7 @@ pub fn public_zainod_conf(
     zaino_db_path: &str,
     validator_grpc: Option<&str>,
     metrics_port: Option<u16>,
+    ephemeral_finalised_state: bool,
 ) -> String {
     assert_public(network, "public_zainod_conf");
     // Every listener binds `LISTEN_ALL` (that constant says why loopback can't work here)
@@ -133,6 +134,11 @@ pub fn public_zainod_conf(
         Some(addr) => format!("\nvalidator_grpc_listen_address = '{addr}'"),
         None => String::new(),
     };
+    // Omitted when false (zainod defaults it) → unchanged render for every existing topology
+    let ephemeral_line = match ephemeral_finalised_state {
+        true => "\nephemeral_finalised_state = true",
+        false => "",
+    };
     let network_name = network.zebra_name();
     format!(
         "\
@@ -140,7 +146,7 @@ pub fn public_zainod_conf(
 
 backend = '{backend_literal}'
 zebra_db_path = '{zebra_db_path}'
-network = '{network_name}'{metrics_line}
+network = '{network_name}'{ephemeral_line}{metrics_line}
 
 [grpc_settings]
 listen_address = '{listen_all}:{grpc_listen_port}'
@@ -240,6 +246,7 @@ mod tests {
                 "/db/zaino",
                 None,
                 None,
+                false,
             );
             assert!(toml.contains(&format!("network = '{}'", network.zebra_name())));
         }
@@ -278,6 +285,7 @@ mod tests {
             "/db/zaino",
             None,
             Some(9998),
+            false,
         )];
         for network in PUBLIC {
             confs.push(public_zainod_conf(
@@ -292,6 +300,7 @@ mod tests {
                 "/db/zaino",
                 None,
                 Some(9998),
+                false,
             ));
             confs.push(public_zebrad_conf(
                 network,
