@@ -12,19 +12,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 One NixOS VM per container engine, each running a real `kind` cluster against
 `ztest cluster add|check|setup`. Defined in `nix/vm-test.nix`.
 
-Every nix build here reads the **git tree**. you MUST `git add` any changes before running these nix tests
+`nix build` reads the git tree, so you need to `git add .` before `nix run`
 
 ```sh
-nix build .#checks.x86_64-linux.ztest-cluster-docker -L
+# Non-interactive background tests
+nix run .#test-docker
+nix run .#test-podman
 
-nix build .#checks.x86_64-linux.ztest-cluster-docker.driverInteractive
-./result/bin/nixos-test-driver --keep-vm-state    # reuses $TMPDIR/vm-state-machine
->>> start_all()
->>> test_script()          # run the whole script, then drop back to the REPL
-
-
-# From second-terminal:  SSH into the VM
-ssh vsock/3 -o User=root
+# Boot into VM to run setup/bootstrap commands & validate UX
+nix run .#vm-docker
+nix run .#vm-podman
 ```
 
 ## Release

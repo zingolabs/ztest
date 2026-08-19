@@ -67,6 +67,7 @@ exclude = [
     "scripts/",
     "flake.nix",
     "flake.lock",
+    "nix/",
     "rust-toolchain.toml",
     "rustfmt.toml",
     "CLAUDE.md",
