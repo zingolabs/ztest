@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-ztest = { path = "..", version = "=0.1.0", default-features = false }
+ztest.workspace = true
 
 async-trait = "0.1"
 avt = "0.18"
