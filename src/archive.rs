@@ -69,17 +69,28 @@ impl Network {
 /// One immutable blob in the snapshot bucket, addressed by content.
 ///
 /// Written by [`artifact!`](macro@crate::artifact) from a manifest at expansion time — no
-/// archive bytes read, no `git` — so a checkout holding none of the archives still compiles
+/// archive bytes read, no `git` — so a checkout holding none of the archives still compiles.
+/// Location rides the manifest too, so a consumer needs no bucket configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Artifact {
     /// Archive filename; its extension picks the puller's decompression
     pub name: &'static str,
-    /// SHA-256 of the bytes = bucket key `lfs/<oid>` and seed PVC `seed-<oid[..8]>-<driver>`
+    /// SHA-256 of the bytes = bucket key `<key_prefix>/<oid>` and seed PVC `seed-<oid[..8]>-<driver>`
     pub oid: &'static str,
     /// Compressed. Sizes the puller's transfer budget and its progress bar
     pub size: u64,
     /// Extracted. Sizes the seed PVC
     pub uncompressed_bytes: u64,
+    /// Public read base; unauthenticated `GET` (see [`crate::storage::r2::BASE_URI`])
+    pub base_uri: &'static str,
+    pub key_prefix: &'static str,
+}
+
+impl Artifact {
+    /// Unauthenticated URL the puller fetches
+    pub fn blob_url(&self) -> String {
+        crate::storage::r2::blob_url(self.base_uri, self.key_prefix, self.oid)
+    }
 }
 
 /// A pinned public chain: the bytes, plus which chain they hold.

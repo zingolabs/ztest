@@ -26,10 +26,17 @@ const ENDPOINT_ENV: &str = "AWS_ENDPOINT";
 const ACCESS_KEY_ENV: &str = "AWS_ACCESS_KEY_ID";
 const SECRET_KEY_ENV: &str = "AWS_SECRET_ACCESS_KEY";
 
-/// Namespace for every managed object. Compile-time, not config — a per-deployment
-/// prefix reintroduces the reader/writer disagreement this module exists to prevent.
+/// Namespace for every managed object. Writer-side constant; `ztest snapshot manifest`
+/// records it per manifest so a reader cannot disagree with the push that made the blob.
 /// Frozen legacy name, see [`Bucket::key`]
-const KEY_PREFIX: &str = "lfs";
+pub const KEY_PREFIX: &str = "lfs";
+
+/// Public read base the bucket serves `GET` from, unauthenticated.
+///
+/// - Consumers need no credentials (`cargo install ztest_cli` → `ztest run`)
+/// - Writes stay authenticated (`AWS_*`, `ztest snapshot push`)
+/// - Written into each manifest, not read from here at seed time
+pub const BASE_URI: &str = "https://pub-d725266f59e44d9e8bf6fcc638782af0.r2.dev";
 
 /// R2 has no regions, but SigV4 needs *a* region in the signing scope and Cloudflare
 /// expects this literal. Applied only when the env names none (real S3 still works)
@@ -76,13 +83,49 @@ pub fn credentials_path() -> std::path::PathBuf {
     crate::paths::config_dir().join("bucket.toml")
 }
 
-/// Which of [`Bucket::resolve`]'s two sources is in play, for `ztest cluster check`.
-/// Mirrors that precedence — a stale `bucket.toml` under a live `AWS_*` export is the
-/// confusion this names
-pub fn credentials_source() -> String {
-    match std::env::var(BUCKET_ENV).ok().filter(|v| !v.trim().is_empty()) {
-        Some(bucket) => format!("{bucket} (AWS_* environment)"),
-        None => credentials_path().display().to_string(),
+/// Unauthenticated object URL — what the puller `curl`s.
+///
+/// `base_uri`/`key_prefix` ride the manifest (see [`crate::Artifact`]), so a blob published
+/// under one base is never addressed under another
+pub fn blob_url(base_uri: &str, key_prefix: &str, oid: &str) -> String {
+    format!("{}/{key_prefix}/{oid}", base_uri.trim_end_matches('/'))
+}
+
+/// `HEAD` the public URL: object exists and is the manifest's length.
+///
+/// Read path is unauthenticated by contract, so this must not resolve credentials — the
+/// credentialed [`Bucket::has`] stays for `ztest snapshot push`
+pub async fn blob_present(
+    url: &str,
+    size: u64,
+    timeout: std::time::Duration,
+) -> Result<bool, StorageError> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| StorageError::R2(format!("http client: {e}")))?;
+    let resp =
+        client.head(url).send().await.map_err(|e| StorageError::R2(format!("HEAD {url}: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        return Err(StorageError::R2(format!("HEAD {url}: {}", resp.status())));
+    }
+    // Header, not `Response::content_length()` — a HEAD carries no body, so the latter
+    // reports 0 and every present blob reads as absent
+    let declared = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    match declared {
+        // Present at the wrong length = a truncated upload, not a missing blob: naming it
+        // beats sending the caller to `snapshot push` for bytes that are already there
+        Some(len) if len != size => {
+            Err(StorageError::R2(format!("{url} is {len} bytes, manifest says {size}")))
+        }
+        _ => Ok(true),
     }
 }
 
@@ -335,5 +378,18 @@ mod tests {
         assert_ne!(Bucket::key(&oid), Bucket::key(&"b".repeat(64)));
         // Digest = the whole name, nothing of the payload encoded
         assert!(Bucket::key(&oid).as_ref().ends_with(&oid));
+    }
+}
+
+#[cfg(test)]
+mod live {
+    /// Network + a real published blob; `cargo test -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn canary_blob_is_publicly_present() {
+        let a = crate::snapshots::SAPLING_TESTNET.artifact;
+        let url = a.blob_url();
+        let got = super::blob_present(&url, a.size, std::time::Duration::from_secs(20)).await;
+        assert!(matches!(got, Ok(true)), "{url} -> {got:?}");
     }
 }

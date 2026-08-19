@@ -70,13 +70,14 @@ Per required `seed-<sha8>-<driver>` PVC in `ztest-seeds`:
 
 - ready → cached
 - not ready → attach to the puller Job's log stream
-- absent → create PVC + puller Job, which `curl`s a presigned TTL-bounded GET for `lfs/<oid>` straight
+- absent → create PVC + puller Job, which `curl`s the public URL for `lfs/<oid>` straight
   into `tar -x` — bytes go **R2 → node**, never through ztest or the apiserver
 
 Archives are gitignored, so a checkout holds none and nothing is fetched at clone time. The OID comes
-from `snapshots/<network>/zebra-<version>-<upgrade>.toml`, read at compile time. Credentials: `AWS_*`
-in the environment, else `~/.config/ztest/bucket.toml`; `ztest cluster check` reports the bucket as its
-own row.
+from `snapshots/<network>/zebra-<version>-<upgrade>.toml`, read at compile time, along with the
+`base_uri`/`key_prefix` the bytes are fetched from. Reads from object storage are public.
+
+`ztest cluster check` will verify that configured seeds are reachable from the current cluster
 
 A missing seed fails only the tests that declared it (`#[ztest::needs]`), as a skip with a named reason —
 never the whole run.

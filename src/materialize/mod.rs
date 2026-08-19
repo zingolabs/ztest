@@ -11,7 +11,7 @@
 //! # The pull
 //!
 //! 1. Get-or-create the PVC (409 = lost the race → wait-for-ready)
-//! 2. If created, or not `ready=true`, launch a puller Job: `curl` a presigned
+//! 2. If created, or not `ready=true`, launch a puller Job: `curl` the public
 //!    `lfs/<oid>` into `tar -x -C /seed` (`cat > /seed/blob` for a file seed).
 //!    R2 → node, nothing through this process, hence [`progress`]
 //! 3. Label `seeds.ztest.io/ready=true` + create the paired `VolumeSnapshot`, from
@@ -33,7 +33,7 @@ use crate::error::env_err;
 use crate::inventory::SeedEntry;
 use crate::progress::{Silent, StepProgress};
 use crate::seeds::{self, SEEDS_NAMESPACE, SeedHandle, volume_snapshot_gvk};
-use crate::storage::{self, r2::Bucket};
+use crate::storage;
 
 pub mod progress;
 
@@ -50,7 +50,8 @@ const DEFAULT_THROUGHPUT_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 
 /// Presigned-URL lifetime: covers schedule + image pull + the largest transfer,
 /// short enough that a leaked manifest is no standing grant
-const PRESIGN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Bounded: a wrong base_uri hangs on connect, and this sits in front of every seed
+const BLOB_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Wall-clock budget for `bytes`. Sized, not flat (a constant is at once generous
 /// for a 100 MB cache and short for a 9.7 GB snapshot, which surfaces as an opaque
@@ -360,7 +361,7 @@ impl From<EnvError> for MaterializeErr {
 ///
 /// - Job, not a bare Pod: `backoffLimit` survives a transient bucket/network error
 /// - Job name = the concurrency lock a 409 reports
-/// - Nothing streams from here (the pod holds a presigned URL, transfers itself)
+/// - Nothing streams from here (the pod holds the public URL, transfers itself)
 async fn materialize(
     client: &Client,
     pvc_name: &str,
@@ -371,24 +372,23 @@ async fn materialize(
     let jobs: Api<Job> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
     let pods: Api<Pod> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
 
-    // Presign before the Job: an unconfigured bucket or missing object fails here,
-    // named, in ms, not as a puller retrying a 403 to its budget
-    progress.note("presigning blob");
-    let bucket = Bucket::resolve().map_err(|e| storage_fatal(&seed.name, e))?;
-    if !bucket.has(&seed.oid, seed.size).await.map_err(|e| storage_fatal(&seed.name, e))? {
+    // Check before the Job: a missing object fails here, named, in ms, not as a puller
+    // retrying a 404 to its budget. Unauthenticated — the read path takes no credentials
+    let url = seed.blob_url();
+    progress.note("locating blob");
+    let present = crate::storage::r2::blob_present(&url, seed.size, BLOB_PROBE_TIMEOUT)
+        .await
+        .map_err(|e| storage_fatal(&seed.name, e))?;
+    if !present {
         return Err(MaterializeErr::Fatal(EnvError::ArchiveMaterializeFailed {
             archive: seed.name.clone(),
             reason: format!(
-                "no blob at oid {} with the manifest's size ({} bytes): run \
+                "no blob at {url} with the manifest's size ({} bytes): run \
                  `ztest snapshot push <archive>` to upload it",
-                seed.oid, seed.size
+                seed.size
             ),
         }));
     }
-    let url = bucket
-        .presigned_get(&seed.oid, PRESIGN_TTL)
-        .await
-        .map_err(|e| storage_fatal(&seed.name, e))?;
 
     let cmd = puller_cmd(seed).map_err(|e| storage_fatal(&seed.name, e))?;
     let body = puller_job(&job_name, pvc_name, &cmd, &url);
@@ -549,7 +549,7 @@ fn storage_fatal(archive: &str, err: storage::StorageError) -> MaterializeErr {
 
 /// One-shot Job filling a seed PVC from the bucket.
 ///
-/// - `backoffLimit: 2`: a retry reuses the same URL (valid for [`PRESIGN_TTL`])
+/// - `backoffLimit: 2`: a retry reuses the same URL (public, never expires)
 /// - Safe to retry — fresh PVC, and complete only once a pod exits 0 on the whole stream
 fn puller_job(name: &str, pvc_name: &str, cmd: &str, url: &str) -> Job {
     // Guaranteed QoS (requests == limits) at the fixed puller footprint, via the
@@ -745,7 +745,14 @@ mod tests {
     use crate::inventory::SeedPayload;
 
     fn seed(name: &str, payload: SeedPayload) -> SeedEntry {
-        SeedEntry { name: name.to_string(), oid: "a".repeat(64), size: 4096, payload }
+        SeedEntry {
+            name: name.to_string(),
+            oid: "a".repeat(64),
+            size: 4096,
+            payload,
+            base_uri: crate::storage::r2::BASE_URI.to_string(),
+            key_prefix: crate::storage::r2::KEY_PREFIX.to_string(),
+        }
     }
 
     /// Everything the parent's byte bar rests on:

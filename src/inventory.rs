@@ -210,7 +210,7 @@ pub enum SeedPayload {
 
 /// One seed declaration for `inventory::submit!`.
 ///
-/// - `oid` = identity (SHA-256 of the bytes) → PVC `seed-<oid[..8]>`, key `lfs/<oid>`
+/// - `oid` = identity (SHA-256 of the bytes) → PVC `seed-<oid[..8]>`, key `<key_prefix>/<oid>`
 /// - `name` = filename only, for the puller's decompression + diagnostics
 /// - `size` = the manifest's compressed `size_bytes`
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -219,6 +219,8 @@ pub struct SeedDecl {
     pub oid: &'static str,
     pub size: u64,
     pub payload: SeedPayload,
+    pub base_uri: &'static str,
+    pub key_prefix: &'static str,
 }
 
 inventory::collect!(SeedDecl);
@@ -229,6 +231,15 @@ pub struct SeedEntry {
     pub oid: String,
     pub size: u64,
     pub payload: SeedPayload,
+    pub base_uri: String,
+    pub key_prefix: String,
+}
+
+impl SeedEntry {
+    /// Unauthenticated URL the puller fetches
+    pub fn blob_url(&self) -> String {
+        crate::storage::r2::blob_url(&self.base_uri, &self.key_prefix, &self.oid)
+    }
 }
 
 impl From<&SeedDecl> for SeedEntry {
@@ -238,6 +249,8 @@ impl From<&SeedDecl> for SeedEntry {
             oid: d.oid.to_string(),
             size: d.size,
             payload: d.payload,
+            base_uri: d.base_uri.to_string(),
+            key_prefix: d.key_prefix.to_string(),
         }
     }
 }
@@ -606,6 +619,8 @@ mod tests {
             oid: "d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00",
             size: 4096,
             payload: SeedPayload::Archive,
+            base_uri: crate::storage::r2::BASE_URI,
+            key_prefix: crate::storage::r2::KEY_PREFIX,
         };
         let line = serde_json::to_string(&InventoryLineRef::Seed(&decl)).unwrap();
         assert!(line.contains("\"kind\":\"seed\""), "missing seed tag: {line}");

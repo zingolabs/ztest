@@ -100,6 +100,8 @@ fn emit_seed_mount(
                     oid: #oid,
                     size: #size,
                     uncompressed_bytes: 0,
+                    base_uri: ::ztest::api::storage::BASE_URI,
+                    key_prefix: ::ztest::api::storage::KEY_PREFIX,
                 }),
                 destination: ::std::path::PathBuf::from(#dst),
                 kind: ::ztest::MountKind::#kind,
@@ -612,6 +614,8 @@ fn seed_decl_submit_expr(
     name: &proc_macro2::TokenStream,
     oid: &proc_macro2::TokenStream,
     size: &proc_macro2::TokenStream,
+    base_uri: &proc_macro2::TokenStream,
+    key_prefix: &proc_macro2::TokenStream,
     payload_ident: &str,
 ) -> proc_macro2::TokenStream {
     let payload = syn::Ident::new(payload_ident, Span::call_site());
@@ -622,6 +626,8 @@ fn seed_decl_submit_expr(
                 oid: #oid,
                 size: #size,
                 payload: ::ztest::macro_support::SeedPayload::#payload,
+                base_uri: #base_uri,
+                key_prefix: #key_prefix,
             }
         }
     }
@@ -631,7 +637,15 @@ fn seed_decl_submit_expr(
 /// call site, so the values are literals rather than handle accessors.
 fn seed_decl_submit(baked: &BakedArchive, payload_ident: &str) -> proc_macro2::TokenStream {
     let (name, oid, size) = (&baked.name, &baked.oid, baked.size);
-    seed_decl_submit_expr(&quote! { #name }, &quote! { #oid }, &quote! { #size }, payload_ident)
+    // Sidecar manifests carry identity only → location falls back to the published bucket
+    seed_decl_submit_expr(
+        &quote! { #name },
+        &quote! { #oid },
+        &quote! { #size },
+        &quote! { ::ztest::api::storage::BASE_URI },
+        &quote! { ::ztest::api::storage::KEY_PREFIX },
+        payload_ident,
+    )
 }
 
 /// The `inventory::submit!` for one test→resource edge. `resource` is a const
@@ -1014,7 +1028,7 @@ pub fn artifact(input: TokenStream) -> TokenStream {
     }
 }
 
-/// The four keys a manifest carries, as an `Artifact` literal.
+/// The keys a manifest carries, as an `Artifact` literal.
 fn bake_artifact(
     manifest_abs: &std::path::Path,
     span: Span,
@@ -1039,12 +1053,16 @@ fn bake_artifact(
     let oid = oid.to_ascii_lowercase();
     let size = manifest_int(&doc, "size_bytes", manifest_abs, span)?;
     let uncompressed_bytes = manifest_int(&doc, "uncompressed_bytes", manifest_abs, span)?;
+    let base_uri = manifest_str(&doc, "base_uri", manifest_abs, span)?;
+    let key_prefix = manifest_str(&doc, "key_prefix", manifest_abs, span)?;
     Ok(quote! {
         ::ztest::Artifact {
             name: #name,
             oid: #oid,
             size: #size,
             uncompressed_bytes: #uncompressed_bytes,
+            base_uri: #base_uri,
+            key_prefix: #key_prefix,
         }
     })
 }
@@ -1071,6 +1089,8 @@ pub fn needs(attr: TokenStream, item: TokenStream) -> TokenStream {
         &quote! { #handle.artifact.name },
         &quote! { #handle.artifact.oid },
         &quote! { #handle.artifact.size },
+        &quote! { #handle.artifact.base_uri },
+        &quote! { #handle.artifact.key_prefix },
         "Archive",
     );
     let dep = test_dep_submit(&ident, &quote! { #handle.artifact.oid });

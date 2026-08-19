@@ -132,30 +132,30 @@ pub async fn probe(client: &Client) -> Report {
                 name: "snapshot bucket",
                 need: Need::Enables("chain fixtures (.mainnet/.testnet)"),
                 finding: bucket,
-                remedy: "export AWS_* or write ~/.config/ztest/bucket.toml",
+                remedy: "docs/ops-cluster-requirements.md",
             },
         ],
     }
 }
 
-/// The bucket every chain fixture's bytes come from, resolved *and* reached.
+/// The bucket every chain fixture's bytes come from, reached the way a run reaches it.
 ///
 /// - Not a cluster facility, like [`probe_registry`] — but a green cluster with an
 ///   unreachable bucket still fails every fixture-mounting profile, from a subsystem
 ///   `check` would otherwise never mention
-/// - Round trip, not just credential resolution: a stale key resolves fine and fails at
-///   the first seed, half an hour into a run
-/// - `Unknown` on a reachable-but-refused read: the credentials may be scoped to `GET`
-///   on `lfs/*`, which is enough for seeding and not enough to list
+/// - Never credentials: reads are public, and `check` must stay green for a consumer
+///   holding no `AWS_*` (writes are `ztest snapshot push`'s problem, not a cluster's)
+/// - A real declared object, not the base: public buckets do not list, and every wrong
+///   answer (base typo, public access revoked, blob evicted) 404s identically at the
+///   prefix. [`SAPLING_TESTNET`](crate::snapshots::SAPLING_TESTNET) is the smallest
+///   artifact and the default rung, so an absent one breaks every profile anyway
 async fn probe_bucket() -> Finding {
-    let bucket = match crate::storage::r2::Bucket::resolve() {
-        Ok(b) => b,
-        Err(why) => return Finding::Absent(why.to_string()),
-    };
-    let source = crate::storage::r2::credentials_source();
-    match bucket.reachable(BUCKET_PROBE_TIMEOUT).await {
-        Ok(()) => Finding::Present(format!("reachable · {source}")),
-        Err(why) => Finding::Unknown(format!("{source}: {why}")),
+    let canary = crate::snapshots::SAPLING_TESTNET.artifact;
+    let url = canary.blob_url();
+    match crate::storage::r2::blob_present(&url, canary.size, BUCKET_PROBE_TIMEOUT).await {
+        Ok(true) => Finding::Present(format!("public · {}", canary.base_uri)),
+        Ok(false) => Finding::Absent(format!("no public blob at {url}")),
+        Err(why) => Finding::Unknown(format!("{}: {why}", canary.base_uri)),
     }
 }
 

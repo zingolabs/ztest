@@ -11,7 +11,7 @@ ztest cluster check [--cluster <profile>]     # non-zero only on a missing *requ
 | snapshot-capable StorageClass + `snapshot.storage.k8s.io/v1` | **required**                                   | operator (local: `ztest cluster setup`)      |
 | image registry                                               | required for `dev!` images on a remote cluster | operator                                     |
 | metrics stack                                                | optional — metrics & profiling                 | `ztest cluster setup`                        |
-| snapshot bucket credentials                                  | optional — chain fixtures                      | `AWS_*` env or `~/.config/ztest/bucket.toml` |
+| snapshot bucket (public read)                                 | optional — chain fixtures                      | none — published bucket, no credentials      |
 
 Three outcomes, and the third matters:
 

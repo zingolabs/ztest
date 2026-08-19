@@ -325,6 +325,8 @@ mod tests {
             oid: oid.to_string(),
             size,
             payload: SeedPayload::Archive,
+            base_uri: ztest::api::storage::BASE_URI.to_string(),
+            key_prefix: ztest::api::storage::KEY_PREFIX.to_string(),
         }
     }
 
