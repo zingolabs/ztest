@@ -32,7 +32,8 @@ const MID_COL_WIDTH: u16 = 34;
 ///
 /// - **Every** line clipped to `cols` = 1 logical line → 1 physical row, the invariant
 ///   [`super::footer::render`]'s `prev_rows` cursor arithmetic rests on
-/// - Live lines arrive un-clipped (an over-wide name would wrap and leak stale rows)
+/// - Clipped, never wrapped: a running-test line must not balloon the panel. Child output
+///   is pre-wrapped by the render loop, which knows it came from a grid, not a scene
 fn compose_footer(
     live: &[String],
     left: &str,

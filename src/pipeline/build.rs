@@ -1,10 +1,10 @@
-//! Phase B: `cargo nextest list` in two passes — a chatty compile pass (stderr
-//! inherited/relayed, stdout dropped), then a silent JSON index pass (stdout captured) →
-//! the user sees compile output and the test list still parses off a warm cache
+//! Phase B in two passes — a chatty compile pass (stderr inherited/relayed, stdout
+//! dropped), then a silent JSON index pass (stdout captured) → the user sees compile
+//! output and the test list still parses off a warm cache
 
 use std::process::Stdio;
 
-use nextest_metadata::TestListSummary;
+use nextest_metadata::{NextestExitCode, TestListSummary};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
@@ -17,6 +17,22 @@ pub enum BuildStage {
     Index,
 }
 
+/// Pass-1 argv: the compile the user's `ztest run` stands for.
+///
+/// - `run --no-run`, not `list` — a usage/filterset error must name the command they typed
+/// - Sole builder, so the PTY and non-TTY callers cannot drift apart
+/// - `list_args` already has the run-behavior flags stripped (pass 2's `list` rejects them)
+pub fn compile_argv(list_args: &[String]) -> Vec<String> {
+    let mut argv = vec!["nextest".to_string(), "run".to_string(), "--no-run".to_string()];
+    argv.extend_from_slice(list_args);
+    argv
+}
+
+/// Child status → nextest exit code. Signal death has no code and is a build failure
+fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or(NextestExitCode::BUILD_FAILED)
+}
+
 /// `lines` set → pass 1's stderr is piped and forwarded there, so the bottom console can
 /// relay `Compiling …` into the scrollback above its panel; `None` → inherited (non-TTY).
 /// The JSON pass is always captured
@@ -27,16 +43,11 @@ pub async fn run(
 ) -> std::io::Result<BuildOutcome> {
     let _ = tx.send(Event::BuildStarted);
 
-    // `list_args` is already the `cargo nextest list` argv — the caller stripped the
-    // run-behavior flags (`--retries`, …) `list` would reject
-
     // Pass 1: chatty compile. `lines` set → stderr piped and relayed into scrollback
     // line-by-line; else inherited
     let pass1 = if let Some(lines) = lines {
         let mut child = Command::new("cargo")
-            .arg("nextest")
-            .arg("list")
-            .args(list_args)
+            .args(compile_argv(list_args))
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -49,9 +60,7 @@ pub async fn run(
         child.wait().await?
     } else {
         Command::new("cargo")
-            .arg("nextest")
-            .arg("list")
-            .args(list_args)
+            .args(compile_argv(list_args))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .status()
@@ -59,7 +68,7 @@ pub async fn run(
     };
 
     if !pass1.success() {
-        let exit_code = pass1.code().unwrap_or(-1);
+        let exit_code = exit_code_of(&pass1);
         let _ = tx.send(Event::BuildFailed { exit_code, stage: BuildStage::Compile });
         return Ok(BuildOutcome::Failed { exit_code, stage: BuildStage::Compile });
     }
@@ -95,7 +104,7 @@ pub async fn index(list_args: &[String]) -> std::io::Result<BuildOutcome> {
 
     if !pass2.status.success() {
         return Ok(BuildOutcome::Failed {
-            exit_code: pass2.status.code().unwrap_or(-1),
+            exit_code: exit_code_of(&pass2.status),
             stage: BuildStage::Index,
         });
     }

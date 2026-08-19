@@ -240,7 +240,7 @@ async fn render_loop(
     // Grid rows = full height above the panel (an in-place progress block stays live
     // instead of being sliced into scrollback); recomputed on resize
     let mut live_rows = surface.live_rows();
-    let mut vt = new_vt(surface.cols(), live_rows);
+    let mut vt = new_vt(live_rows);
     let mut carry: Vec<u8> = Vec::new();
     // Committed ANSI lines awaiting the next atomic present
     let mut pending: Vec<String> = Vec::new();
@@ -280,7 +280,7 @@ async fn render_loop(
                 }
                 Some(Msg::FlushLive) => {
                     pending.extend(bridged(&trimmed_view(&vt)));
-                    vt = new_vt(surface.cols(), live_rows);
+                    vt = new_vt(live_rows);
                     clock.mark_dirty();
                 }
                 Some(Msg::ChildStarted(p)) => pgid = p,
@@ -313,12 +313,11 @@ async fn render_loop(
             _ = recv_signal(&mut sigwinch) => {
                 let size = current_pty_size();
                 surface.set_size(size.cols, size.rows);
-                // Floored to 1 (a 0 dimension underflow-panics inside `avt::resize`)
+                // Height only — grid width is fixed (see `new_vt`). Rows floored to 1
+                // (a 0 dimension underflow-panics inside `avt::resize`)
                 live_rows = surface.live_rows();
-                let sb: Vec<avt::Line> = vt
-                    .resize((size.cols.max(1)) as usize, (live_rows.max(1)) as usize)
-                    .scrollback
-                    .collect();
+                let sb: Vec<avt::Line> =
+                    vt.resize(bridge::NOWRAP_COLS, live_rows.max(1) as usize).scrollback.collect();
                 pending.extend(bridged(&sb));
                 let _ = size_tx.send(size);
                 clock.mark_dirty();
@@ -350,7 +349,7 @@ async fn render_loop(
                 // rows (no blanks above the footer)
                 let live_lines: Vec<String> = match &live_src {
                     Some(s) => s.lines().map(str::to_string).collect(),
-                    None => bridged(&trimmed_view(&vt)),
+                    None => wrapped(&trimmed_view(&vt), surface.cols()),
                 };
                 surface.present(&pending, &live_lines, &left, mid.as_deref(), &right);
                 pending.clear();
@@ -398,12 +397,16 @@ impl FrameClock {
     }
 }
 
-/// Fresh `avt` grid.
+/// Fresh `avt` grid, [`NOWRAP_COLS`](bridge::NOWRAP_COLS) wide.
 ///
+/// - Width decoupled from the terminal: the child already wrapped to its PTY size, and
+///   re-wrapping here would bake a newline mid-token into scrollback
+/// - Rows clipped to the real width at present time (`viewport::compose_footer`), so the
+///   footer's 1-line = 1-row invariant survives the wide grid
 /// - `scrollback_limit(0)` yields each line as it scrolls off = our native-scrollback feed
-/// - Dimensions floored to 1 (`avt` underflow-panics on 0, which terminals report mid-resize)
-fn new_vt(cols: u16, rows: u16) -> Vt {
-    Vt::builder().size(cols.max(1) as usize, rows.max(1) as usize).scrollback_limit(0).build()
+/// - Rows floored to 1 (`avt` underflow-panics on 0, which terminals report mid-resize)
+fn new_vt(rows: u16) -> Vt {
+    Vt::builder().size(bridge::NOWRAP_COLS, rows.max(1) as usize).scrollback_limit(0).build()
 }
 
 /// Fold a PTY chunk into the emulator, scrolled-off lines → `pending` for the next present
@@ -417,8 +420,24 @@ fn feed(vt: &mut Vt, carry: &mut Vec<u8>, pending: &mut Vec<String>, bytes: &[u8
     }
 }
 
+/// Grid rows → scrollback lines, full width (the terminal soft-wraps, as it would have
+/// for the child writing directly)
 fn bridged(lines: &[avt::Line]) -> Vec<String> {
     lines.iter().map(bridge::avt_line_to_ansi).collect()
+}
+
+/// Grid rows → live-region lines wrapped to the real terminal width.
+///
+/// - Grid is [`NOWRAP_COLS`](bridge::NOWRAP_COLS) wide, so one grid row may need several
+///   physical ones; each emitted line still fits `cols` (`compose_footer`'s invariant)
+/// - Only the grid wraps — a scene's own live lines clip, so a long test name cannot
+///   balloon the panel
+fn wrapped(lines: &[avt::Line], cols: u16) -> Vec<String> {
+    lines
+        .iter()
+        .flat_map(|l| bridge::avt_line_ansi_rows(l, cols as usize))
+        .map(|(s, _)| s)
+        .collect()
 }
 
 /// Live grid minus trailing blank rows (avt pads to full height)
@@ -530,7 +549,7 @@ mod tests {
     #[test]
     fn trimmed_view_drops_trailing_blanks_but_keeps_interior_ones() {
         // 4 rows: content on 0 and 2, interior blank on 1, trailing blank on 3
-        let mut vt = new_vt(10, 4);
+        let mut vt = new_vt(4);
         let _ = vt.feed_str("top\r\n\r\nmid\r\n");
         let texts = bridged(&trimmed_view(&vt));
         assert_eq!(texts, vec!["top".to_string(), String::new(), "mid".to_string()]);
@@ -538,14 +557,14 @@ mod tests {
 
     #[test]
     fn trimmed_view_of_a_blank_grid_is_empty() {
-        let vt = new_vt(10, 4);
+        let vt = new_vt(4);
         assert!(trimmed_view(&vt).is_empty());
     }
 
     #[test]
     fn feed_forwards_scrolled_off_lines_oldest_first() {
         // 2 rows, 3 lines → first two scroll off oldest-first, third stays live
-        let mut vt = new_vt(10, 2);
+        let mut vt = new_vt(2);
         let mut carry = Vec::new();
         let mut pending: Vec<String> = Vec::new();
         feed(&mut vt, &mut carry, &mut pending, b"a\r\nb\r\nc\r\n");
@@ -557,7 +576,7 @@ mod tests {
     #[test]
     fn feed_holds_a_split_multibyte_char_in_carry() {
         // Split across two PTY reads: partial feed produces nothing, second completes
-        let mut vt = new_vt(10, 1);
+        let mut vt = new_vt(1);
         let mut carry = Vec::new();
         let mut pending: Vec<String> = Vec::new();
         feed(&mut vt, &mut carry, &mut pending, &[0xC3]); // lead byte of 'é'

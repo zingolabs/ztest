@@ -681,9 +681,10 @@ fn launch_engine(
         let _ = stdout().write_all(ztest_ui::render(state, theme).as_bytes());
     }
 
-    if let BuildOutcome::Failed { .. } = build {
-        // Phase B = `cargo nextest list`, so non-zero = build failure
-        return exit(NextestExitCode::BUILD_FAILED);
+    // Child = `cargo nextest`, so its code is already a nextest code (101 build, 94 bad
+    // filterset, 2 usage, ...). Collapsing to BUILD_FAILED would lie about the last two
+    if let BuildOutcome::Failed { exit_code, .. } = build {
+        return exit(*exit_code);
     }
     if let Some(detail) = &image_phase.failure {
         return fatal(
@@ -1280,17 +1281,17 @@ fn pipeline_console(
         };
         drop(upd_tx);
 
-        // Pass 1 = `run --no-run`, not `list` (under a PTY the merged stdout/stderr would
-        // dump the full test listing into the view); pass 2 does the index
         let started_at = Instant::now();
         state.build = BuildState::Compiling { started_at, phase: None };
         push_preflight_scene(con, state, &Transfers::default(), "Preflight", theme, None);
 
-        let mut args = vec!["nextest".to_string(), "run".to_string(), "--no-run".to_string()];
-        args.extend(list_args.iter().cloned());
+        let args = pipeline::compile_argv(list_args);
         let code = run_child_draining(con, "cargo", &args, &[], &mut upd_rx, state, theme).await?;
 
         let build = if code != 0 {
+            // Terminal for the run → commit the child's diagnostics to scrollback now.
+            // Teardown would otherwise re-flush the grid *under* the panel = printed twice
+            con.flush_live();
             BuildOutcome::Failed { exit_code: code, stage: BuildStage::Compile }
         } else {
             // Pass 2, JSON index: cargo's metadata/freshness pass is multi-second even warm
