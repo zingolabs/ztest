@@ -35,10 +35,7 @@ use ztest_macros::artifact;
 
 // ─────────────────────────────── testnet ───────────────────────────────
 
-/// Sapling activation (280,000) + 6,000 blocks.
-///
-/// - Smallest artifact by a wide margin → default unless a later pool is needed
-/// - Early testnet history = transaction-format diversity (Sprout JoinSplits, v1–v4)
+/// Sapling activation (280,000) + 6,000 blocks
 pub const SAPLING_TESTNET: ChainSnapshot = ChainSnapshot {
     tip_height: 286_000,
     network: Network::Testnet,
@@ -46,9 +43,7 @@ pub const SAPLING_TESTNET: ChainSnapshot = ChainSnapshot {
     artifact: artifact!("snapshots/testnet/zebra-6.2.3-sapling.toml"),
 };
 
-/// Blossom activation (584,000) + 6,000 blocks.
-///
-/// Introduces no value pool; its value is block timing and a denser early address graph
+/// Blossom activation (584,000) + 6,000 blocks
 pub const BLOSSOM_TESTNET: ChainSnapshot = ChainSnapshot {
     tip_height: 590_000,
     network: Network::Testnet,
@@ -56,8 +51,7 @@ pub const BLOSSOM_TESTNET: ChainSnapshot = ChainSnapshot {
     artifact: artifact!("snapshots/testnet/zebra-6.2.3-blossom.toml"),
 };
 
-/// NU5 / Orchard activation (1,842,420) + 6,000 blocks. First rung with v5 transactions
-/// and a funded Orchard pool
+/// NU5 / Orchard activation (1,842,420) + 6,000 blocks
 pub const ORCHARD_TESTNET: ChainSnapshot = ChainSnapshot {
     tip_height: 1_848_420,
     network: Network::Testnet,
@@ -65,8 +59,7 @@ pub const ORCHARD_TESTNET: ChainSnapshot = ChainSnapshot {
     artifact: artifact!("snapshots/testnet/zebra-6.2.3-orchard.toml"),
 };
 
-/// NU6.3 / Ironwood activation (4,134,000) + 6,000 blocks. Only rung crossing the real
-/// Ironwood boundary
+/// NU6.3 / Ironwood activation (4,134,000) + 6,000 blocks
 pub const IRONWOOD_TESTNET: ChainSnapshot = ChainSnapshot {
     tip_height: 4_140_000,
     network: Network::Testnet,
@@ -76,8 +69,7 @@ pub const IRONWOOD_TESTNET: ChainSnapshot = ChainSnapshot {
 
 // ─────────────────────────────── mainnet ───────────────────────────────
 
-/// Sapling activation (419,200) + 6,000 blocks. Smallest mainnet rung, and still larger
-/// than the deepest testnet one
+/// Sapling activation (419,200) + 6,000 blocks
 pub const SAPLING_MAINNET: ChainSnapshot = ChainSnapshot {
     tip_height: 425_200,
     network: Network::Mainnet,
@@ -94,14 +86,22 @@ pub const BLOSSOM_MAINNET: ChainSnapshot = ChainSnapshot {
 };
 
 /// NU5 / Orchard activation (1,687,104) + 6,000 blocks.
-///
-/// Deepest registered artifact, and pinned ~11,000 blocks below the June 2022 sandblast
-/// onset (~1,704,323) — so every block it holds belongs to the pre-spam chain
 pub const ORCHARD_MAINNET: ChainSnapshot = ChainSnapshot {
     tip_height: 1_693_104,
     network: Network::Mainnet,
     backend: Backend::Zebra,
     artifact: artifact!("snapshots/mainnet/zebra-6.2.3-orchard.toml"),
+};
+
+/// NU6.3 / Ironwood activation (3,428,143) + 6,000 blocks.
+///
+/// - Deepest rung either network ships; only mainnet one above the sandblast onset
+/// - 257.85 GiB extracted → size a volume off `artifact.uncompressed_bytes`, never `seed_size()`
+pub const IRONWOOD_MAINNET: ChainSnapshot = ChainSnapshot {
+    tip_height: 3_434_143,
+    network: Network::Mainnet,
+    backend: Backend::Zebra,
+    artifact: artifact!("snapshots/mainnet/zebra-6.2.3-ironwood.toml"),
 };
 
 /// Every shipped snapshot. `ztest snapshot verify --remote` walks it to assert each
@@ -114,6 +114,7 @@ pub const ALL: &[&ChainSnapshot] = &[
     &SAPLING_MAINNET,
     &BLOSSOM_MAINNET,
     &ORCHARD_MAINNET,
+    &IRONWOOD_MAINNET,
 ];
 
 #[cfg(test)]
