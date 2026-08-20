@@ -262,7 +262,7 @@ pub async fn fetch(
     to: SystemTime,
     tenant: &str,
     profile: Profile,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, crate::error::PipelineError> {
     let (namespace, pod, port) = pyroscope_backend(client).await?;
     let fwd = Forwarder::start(client.clone(), namespace, pod, port)
         .await
@@ -294,7 +294,8 @@ pub async fn fetch(
         return Err(format!(
             "Pyroscope returned {status}: {}",
             String::from_utf8_lossy(&bytes).trim()
-        ));
+        )
+        .into());
     }
 
     let flamegraph = SelectMergeStacktracesResponse::decode(&bytes[..])
@@ -305,7 +306,7 @@ pub async fn fetch(
     // Empty = a successful query that matched nothing, a different problem from
     // a failed one.
     if profile.is_empty() {
-        return Err(format!("no profile matched {selector} in this window"));
+        return Err(format!("no profile matched {selector} in this window").into());
     }
     Ok(profile.into_bytes())
 }
@@ -315,7 +316,9 @@ pub async fn fetch(
 /// - Resolved through the Service's own selector, never the chart label on pods
 /// - Microservices mode: that label also matches ingesters/distributors, and a
 ///   query landing on one never reaches the querier
-async fn pyroscope_backend(client: &Client) -> Result<(String, String, u16), String> {
+async fn pyroscope_backend(
+    client: &Client,
+) -> Result<(String, String, u16), crate::error::PipelineError> {
     let svc = pyroscope_service(client)
         .await
         .ok_or_else(|| "no Pyroscope Service in this cluster".to_string())?;
@@ -348,10 +351,8 @@ async fn pyroscope_backend(client: &Client) -> Result<(String, String, u16), Str
         return Ok((namespace, name, port));
     }
     match names.first() {
-        Some(name) => Err(format!(
-            "Pyroscope is deployed but not ready — `kubectl -n {namespace} logs {name}`"
-        )),
-        None => Err("Pyroscope Service selects no pods; `ztest cluster setup` deploys it".into()),
+        Some(name) => Err(format!("pyroscope pod {name} not ready").into()),
+        None => Err("pyroscope service selects no pods".into()),
     }
 }
 
@@ -376,7 +377,10 @@ fn epoch_millis(t: SystemTime) -> i64 {
 /// - Entries expire after [`RETIREMENT_TTL`] (else unbounded growth)
 ///
 /// [`PROFILE_RETIREMENT_LAG`]: crate::resource::PROFILE_RETIREMENT_LAG
-pub async fn schedule_purge(client: &Client, tenants: &[String]) -> Result<(), String> {
+pub async fn schedule_purge(
+    client: &Client,
+    tenants: &[String],
+) -> Result<(), crate::error::PipelineError> {
     use k8s_openapi::api::core::v1::ConfigMap;
     use kube::api::{Patch, PatchParams};
 
@@ -568,7 +572,11 @@ impl crate::resource::reclaim::ProfileStore for Pyroscope {
         is_deployed(client).await
     }
 
-    async fn schedule_purge(&self, client: &Client, tenants: &[String]) -> Result<(), String> {
+    async fn schedule_purge(
+        &self,
+        client: &Client,
+        tenants: &[String],
+    ) -> Result<(), crate::error::PipelineError> {
         schedule_purge(client, tenants).await
     }
 }

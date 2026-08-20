@@ -43,6 +43,8 @@ supports-unicode = "3.0.0"
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "signal", "io-util"] }
 toml = "0.8"
 tracing = { workspace = true }
+anyhow = "1.0.104"
+thiserror.workspace = true
 
 [dev-dependencies]
 ztest = { workspace = true, features = ["librustzcash", "test-util"] }

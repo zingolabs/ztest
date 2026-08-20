@@ -366,7 +366,10 @@ pub async fn is_deployed(client: &Client) -> bool {
 /// - `delete_series` only writes tombstones; the bytes come back at `clean_tombstones`
 /// - Returns `Err`, unlike the rest of this module: a silent failure here reads as
 ///   "reclaimed" while the data is still queryable
-pub async fn purge(client: &Client, selectors: &[String]) -> Result<(), String> {
+pub async fn purge(
+    client: &Client,
+    selectors: &[String],
+) -> Result<(), crate::error::PipelineError> {
     if selectors.is_empty() {
         return Ok(());
     }
@@ -383,7 +386,7 @@ struct Reader {
 }
 
 impl Reader {
-    async fn open(client: &Client) -> Result<Reader, String> {
+    async fn open(client: &Client) -> Result<Reader, crate::error::PipelineError> {
         let (namespace, pod, port) = prometheus_backend(client).await?;
         let forwarder = Forwarder::start(client.clone(), namespace, pod, port)
             .await
@@ -400,13 +403,17 @@ impl Reader {
         query: &str,
         window: (SystemTime, SystemTime),
         step: Duration,
-    ) -> Result<Vec<Labelled>, String> {
+    ) -> Result<Vec<Labelled>, crate::error::PipelineError> {
         let body: RangeResponse = self.range(query, window, step).await?;
         Ok(body.data.result.into_iter().map(Labelled::from).collect())
     }
 
     /// One TSDB admin endpoint. Success is `204`, carrying no body
-    async fn admin(&self, endpoint: &str, params: &[(&str, &str)]) -> Result<(), String> {
+    async fn admin(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+    ) -> Result<(), crate::error::PipelineError> {
         let url =
             format!("http://127.0.0.1:{}/api/v1/admin/tsdb/{endpoint}", self.forwarder.local_port);
         let response = self
@@ -431,11 +438,8 @@ impl Reader {
             .unwrap_or_else(|| body.trim().to_string());
 
         match detail.contains(ADMIN_DISABLED) {
-            true => Err(format!(
-                "{endpoint}: Prometheus admin API is disabled — \
-                 re-run `ztest cluster setup` to roll it with `--web.enable-admin-api`"
-            )),
-            false => Err(format!("{endpoint}: Prometheus returned {status}: {detail}")),
+            true => Err(format!("{endpoint}: prometheus admin API disabled").into()),
+            false => Err(format!("{endpoint}: Prometheus returned {status}: {detail}").into()),
         }
     }
 
@@ -444,7 +448,7 @@ impl Reader {
         query: &str,
         window: (SystemTime, SystemTime),
         step: Duration,
-    ) -> Result<RangeResponse, String> {
+    ) -> Result<RangeResponse, crate::error::PipelineError> {
         let url = format!("http://127.0.0.1:{}/api/v1/query_range", self.forwarder.local_port);
         let response = self
             .http
@@ -460,9 +464,9 @@ impl Reader {
             .map_err(|e| format!("querying Prometheus: {e}"))?;
 
         if !response.status().is_success() {
-            return Err(format!("Prometheus returned {}", response.status()));
+            return Err(format!("Prometheus returned {}", response.status()).into());
         }
-        response.json().await.map_err(|e| format!("decoding Prometheus response: {e}"))
+        response.json().await.map_err(|e| format!("decoding Prometheus response: {e}").into())
     }
 }
 
@@ -490,7 +494,9 @@ impl From<RangeSeries> for Labelled {
 
 /// Pod backing the Prometheus Service, via the Service's own selector — same reasoning
 /// as [`profiling::pyroscope_backend`](crate::profiling)
-async fn prometheus_backend(client: &Client) -> Result<(String, String, u16), String> {
+async fn prometheus_backend(
+    client: &Client,
+) -> Result<(String, String, u16), crate::error::PipelineError> {
     use k8s_openapi::api::core::v1::{Pod, Service};
     use kube::api::{Api, ListParams};
 
@@ -521,7 +527,7 @@ async fn prometheus_backend(client: &Client) -> Result<(String, String, u16), St
     let pods: Api<Pod> = Api::namespaced(client.clone(), crate::naming::OBS_NAMESPACE);
     pods.list(&ListParams::default().labels(&selector))
         .await
-        .map_err(|e| format!("listing Prometheus pods: {e}"))?
+        .map_err(|e| crate::error::PipelineError(format!("list prometheus pods: {e}")))?
         .items
         .into_iter()
         .find(|p| {
@@ -532,7 +538,7 @@ async fn prometheus_backend(client: &Client) -> Result<(String, String, u16), St
         })
         .and_then(|p| p.metadata.name)
         .map(|name| (crate::naming::OBS_NAMESPACE.to_string(), name, port))
-        .ok_or_else(|| "no ready Prometheus pod".to_string())
+        .ok_or_else(|| "no ready prometheus pod".into())
 }
 
 // ── Response shape ────────────────────────────────────────────────────

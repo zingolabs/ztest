@@ -112,10 +112,7 @@ async fn reconcile_cache_pvc_size(api: &Api<PersistentVolumeClaim>) -> Result<()
     if let Err(e) =
         api.patch(BUILDKIT_CACHE_PVC, &PatchParams::default(), &Patch::Merge(&patch)).await
     {
-        eprintln!(
-            "warning: could not expand buildkit cache PVC {BUILDKIT_CACHE_PVC} to {desired} \
-             (is allowVolumeExpansion enabled on its StorageClass?): {e}"
-        );
+        eprintln!("expand {BUILDKIT_CACHE_PVC} to {desired}: {e}");
     }
     Ok(())
 }

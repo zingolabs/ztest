@@ -339,7 +339,7 @@ async fn create_pvc(
 ) -> Result<(), EnvError> {
     let storage = crate::storage_class::selected(client)
         .await
-        .map_err(|e| EnvError::Manifest { reason: e })?;
+        .map_err(|e| EnvError::Manifest { reason: e.to_string() })?;
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &sentinel.namespace);
     let mut spec = json!({
         "accessModes": ["ReadWriteOnce"],

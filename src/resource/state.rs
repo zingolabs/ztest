@@ -69,8 +69,8 @@ pub enum Readiness {
 /// teardown report. Propagation is the graph's job, no aggregation here
 #[derive(Debug, Error)]
 pub enum ResourceError {
-    #[error("provision failed: {0}")]
+    #[error("provision: {0}")]
     Provision(String),
-    #[error("teardown failed: {0}")]
+    #[error("teardown: {0}")]
     Teardown(String),
 }

@@ -6,6 +6,7 @@
 
 use std::process::ExitCode;
 
+use anyhow::{Context as _, Result, anyhow};
 use clap::{Args as ClapArgs, Subcommand};
 
 use ztest::api::cluster_config::{self, Config, Profile};
@@ -190,7 +191,7 @@ pub fn execute(args: Args) -> ExitCode {
     }
 }
 
-fn list() -> Result<(), String> {
+fn list() -> Result<()> {
     let theme = Theme::detect();
     let cfg = cluster_config::load()?;
     if cfg.clusters.is_empty() {
@@ -209,7 +210,7 @@ fn list() -> Result<(), String> {
     Ok(())
 }
 
-fn current() -> Result<(), String> {
+fn current() -> Result<()> {
     let theme = Theme::detect();
     let cfg = cluster_config::load()?;
     match cfg.current.as_deref() {
@@ -230,13 +231,13 @@ fn current() -> Result<(), String> {
     Ok(())
 }
 
-async fn add(a: AddArgs) -> Result<(), String> {
+async fn add(a: AddArgs) -> Result<()> {
     // Bare `--kind` adopts the profile name, `--kind X` overrides.
     // Distribution never typed (a remote profile derives wholly from its kubeconfig).
     let mut profile = match (a.kind, &a.kubeconfig) {
         (Some(k), _) => Profile::local(&k.unwrap_or_else(|| a.name.clone())),
         (None, Some(kc)) => Profile::from_kubeconfig(std::path::Path::new(kc))?,
-        (None, None) => return Err("pass --kind or --kubeconfig".to_string()),
+        (None, None) => return Err(anyhow!("pass --kind or --kubeconfig")),
     };
     let named_driver = a.storage_driver.is_some();
     profile.storage_driver = a.storage_driver;
@@ -273,11 +274,11 @@ async fn add(a: AddArgs) -> Result<(), String> {
 
 /// `label` names which knob a probe row reports on ([`row::PROBED`] and friends serve
 /// runtime and storage driver alike)
-fn probed(label: &str, value: &str, saved: Result<(), String>, theme: &Theme) {
+fn probed(label: &str, value: &str, saved: Result<()>, theme: &Theme) {
     let data = Fields::new().text("label", label).text("value", value);
     match saved {
         Ok(()) => say(row::PROBED, &data, theme),
-        Err(e) => say(row::UNSAVED, &data.text("detail", e), theme),
+        Err(e) => say(row::UNSAVED, &data.text("detail", e.to_string()), theme),
     }
 }
 
@@ -302,11 +303,11 @@ fn adopt_runtime(name: &str, profile: &Profile, theme: &Theme) {
     probed("runtime", rt.as_str(), persist_runtime(name, rt), theme);
 }
 
-fn persist_runtime(name: &str, rt: ContainerRuntime) -> Result<(), String> {
+fn persist_runtime(name: &str, rt: ContainerRuntime) -> Result<()> {
     let mut cfg = cluster_config::load()?;
-    let profile = cfg.clusters.get_mut(name).ok_or("profile vanished between write and probe")?;
+    let profile = cfg.clusters.get_mut(name).context("profile vanished between write and probe")?;
     profile.runtime = Some(rt);
-    cfg.save()
+    Ok(cfg.save()?)
 }
 
 /// Record the cluster's snapshot-capable driver when the profile named none.
@@ -335,36 +336,41 @@ async fn adopt_storage_driver(name: &str, theme: &Theme) {
     };
     match storage_choice(&drivers) {
         Ok(only) => probed("storage driver", only, persist_storage_driver(name, only), theme),
-        Err(why) => unset("storage driver", &why, theme),
+        Err(why) => unset("storage driver", &why.to_string(), theme),
     }
+}
+
+/// Why there is no unambiguous snapshot-capable driver
+#[derive(Debug, thiserror::Error)]
+enum NoDriver {
+    #[error("no snapshot-capable storage")]
+    None,
+    /// The candidates stay in the message: `--storage-driver` takes one of *these*, and a
+    /// bare count sends the reader back to `kubectl get storageclass`
+    #[error("pass --storage-driver: {0}")]
+    Ambiguous(String),
 }
 
 /// Sole snapshot-capable driver, or why there is no unambiguous one
-fn storage_choice(drivers: &[String]) -> Result<&str, String> {
+fn storage_choice(drivers: &[String]) -> Result<&str, NoDriver> {
     match drivers {
         [only] => Ok(only),
-        [] => Err("no snapshot-capable storage found — chain fixtures will fail \
-                   (docs/ops-local-cluster.md)"
-            .to_string()),
-        many => Err(format!(
-            "{} candidates ({}) — pick one with --storage-driver",
-            many.len(),
-            many.join(", "),
-        )),
+        [] => Err(NoDriver::None),
+        many => Err(NoDriver::Ambiguous(many.join(", "))),
     }
 }
 
-fn persist_storage_driver(name: &str, driver: &str) -> Result<(), String> {
+fn persist_storage_driver(name: &str, driver: &str) -> Result<()> {
     let mut cfg = cluster_config::load()?;
-    let profile = cfg.clusters.get_mut(name).ok_or("profile vanished between write and probe")?;
+    let profile = cfg.clusters.get_mut(name).context("profile vanished between write and probe")?;
     profile.storage_driver = Some(driver.to_string());
-    cfg.save()
+    Ok(cfg.save()?)
 }
 
-fn set(name: String) -> Result<(), String> {
+fn set(name: String) -> Result<()> {
     let mut cfg = cluster_config::load()?;
     if !cfg.clusters.contains_key(&name) {
-        return Err(format!("no profile `{name}`. Known: {}", known(&cfg)));
+        return Err(anyhow!("no profile `{name}`. Known: {}", known(&cfg)));
     }
     cfg.current = Some(name.clone());
     cfg.save()?;
@@ -372,10 +378,10 @@ fn set(name: String) -> Result<(), String> {
     Ok(())
 }
 
-fn remove(name: String) -> Result<(), String> {
+fn remove(name: String) -> Result<()> {
     let mut cfg = cluster_config::load()?;
     if cfg.clusters.remove(&name).is_none() {
-        return Err(format!("no profile `{name}`. Known: {}", known(&cfg)));
+        return Err(anyhow!("no profile `{name}`. Known: {}", known(&cfg)));
     }
     if cfg.current.as_deref() == Some(name.as_str()) {
         cfg.current = None;
@@ -392,21 +398,17 @@ fn known(cfg: &Config) -> String {
 
 /// Probe the cluster, print what it can and cannot do
 /// (non-zero only on a missing *required* capability, else unusable as a CI gate)
-async fn check(cluster: Option<String>) -> Result<(), String> {
+async fn check(cluster: Option<String>) -> Result<()> {
     // SAFETY: pre-spawn, as in `setup` (applies the profile via non-thread-safe env set)
     let bound = unsafe { cluster_config::activate(cluster.as_deref()) }?;
-    let client =
-        ztest::api::cluster::client().await.map_err(|e| format!("connecting to cluster: {e}"))?;
+    let client = ztest::api::cluster::client().await.context("connecting to cluster")?;
 
     let report = ztest::api::capability::probe(&client).await;
     print!("{}", render(&report, bound.as_deref(), &Theme::detect()));
 
     match report.is_runnable() {
         true => Ok(()),
-        false => Err(match report.blocking().count() {
-            1 => "1 capability `ztest run` needs is missing".to_string(),
-            n => format!("{n} capabilities `ztest run` needs are missing"),
-        }),
+        false => Err(anyhow!("{} capabilities missing", report.blocking().count())),
     }
 }
 
@@ -558,22 +560,23 @@ mod tests {
 
     #[test]
     fn a_sole_driver_is_adopted() {
-        assert_eq!(storage_choice(&drivers(&["topolvm.io"])), Ok("topolvm.io"));
+        assert_eq!(storage_choice(&drivers(&["topolvm.io"])).ok(), Some("topolvm.io"));
     }
 
     /// Picking for the user here would bind every seeded run to a driver they never named
     #[test]
     fn several_drivers_are_left_to_the_user() {
         let why = storage_choice(&drivers(&["hostpath.csi.k8s.io", "topolvm.io"]))
-            .expect_err("two candidates cannot be resolved");
+            .expect_err("two candidates cannot be resolved")
+            .to_string();
         assert!(why.contains("--storage-driver"), "{why}");
         assert!(why.contains("topolvm.io"), "the candidates must be named: {why}");
     }
 
     /// Stock `kind create cluster` — the case the quickstart walks into
     #[test]
-    fn no_snapshot_capable_driver_says_fixtures_will_fail() {
-        let why = storage_choice(&[]).expect_err("nothing to choose");
-        assert!(why.contains("chain fixtures"), "{why}");
+    fn no_snapshot_capable_driver_is_named_as_such() {
+        let why = storage_choice(&[]).expect_err("nothing to choose").to_string();
+        assert_eq!(why, "no snapshot-capable storage");
     }
 }

@@ -26,7 +26,7 @@ pub struct Dumped {
 
 /// Pure — transport (local subprocess vs builder-pod `exec`, see
 /// [`crate::pipeline::remote_compile`]) is the caller's concern
-pub fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
+pub fn parse_inventory(stdout: &str) -> Result<Dumped, crate::error::PipelineError> {
     let mut dumped = Dumped::default();
     for line in stdout.lines() {
         if line.is_empty() {
@@ -41,7 +41,7 @@ pub fn parse_inventory(stdout: &str) -> Result<Dumped, String> {
             // profile name → its `test_id` → binary + libtest test) and `ztest run`'s
             // selection prune, the only way the engine tells a profile from a plain test
             Ok(InventoryLine::SyncTest(s)) => dumped.sync_tests.push(s),
-            Err(e) => return Err(format!("malformed inventory line `{line}`: {e}")),
+            Err(e) => return Err(format!("malformed inventory line `{line}`: {e}").into()),
         }
     }
     Ok(dumped)
@@ -157,7 +157,7 @@ pub fn assemble(
     )
 }
 
-async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, String> {
+async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, crate::error::PipelineError> {
     let mut cmd = Command::new(&bin.binary_path);
     cmd.env("ZTEST_DUMP_INVENTORY", "1")
         .current_dir(&bin.cwd)
@@ -180,7 +180,8 @@ async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, String> {
             "binary exited {} during inventory dump; stderr:\n{}",
             status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
             tail(&stderr_tail, 20)
-        ));
+        )
+        .into());
     }
     Ok(dumped)
 }

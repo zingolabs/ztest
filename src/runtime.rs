@@ -70,6 +70,13 @@ impl ContainerRuntime {
         }
     }
 
+    /// Sole derivation of a locally built image's name — build `-t`, side-load argument, and
+    /// pod `image:` all take it (kubelet normalizes an unprefixed name to `docker.io/library/`,
+    /// which podman's store never holds → `ImagePullBackOff`)
+    pub fn local_reference(self, tag: &str) -> String {
+        format!("{}{tag}", self.local_tag_prefix())
+    }
+
     /// Repo column forms `crictl images` reports for a locally loaded `<repo>`
     pub fn node_repo_forms(self, repo: &str) -> Vec<String> {
         match self {
@@ -175,6 +182,11 @@ mod tests {
     fn podman_prefixes_a_locally_built_tag() {
         assert_eq!(ContainerRuntime::Docker.local_tag_prefix(), "");
         assert_eq!(ContainerRuntime::Podman.local_tag_prefix(), "localhost/");
+        assert_eq!(ContainerRuntime::Docker.local_reference("zebrad:dev-abc"), "zebrad:dev-abc");
+        assert_eq!(
+            ContainerRuntime::Podman.local_reference("zebrad:dev-abc"),
+            "localhost/zebrad:dev-abc"
+        );
     }
 
     #[test]

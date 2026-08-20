@@ -9,6 +9,7 @@ use std::io::{IsTerminal as _, Write as _, stdout};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use anyhow::{Context as _, Result};
 use chrono::Utc;
 use clap::Parser;
 use k8s_openapi::api::core::v1::Node;
@@ -39,8 +40,8 @@ pub fn execute(args: Args) -> ExitCode {
     super::block_on("status", super::Rt::Multi, run(args))
 }
 
-async fn run(args: Args) -> Result<(), String> {
-    let client = Client::try_default().await.map_err(|e| format!("cluster client: {e}"))?;
+async fn run(args: Args) -> Result<()> {
+    let client = Client::try_default().await.context("cluster client")?;
     let theme = Theme::detect();
     // Non-TTY has no frame to repaint into; one frame is the whole useful output
     if args.json || args.once || !stdout().is_terminal() {
@@ -56,14 +57,14 @@ async fn run(args: Args) -> Result<(), String> {
     live(&client, &theme).await
 }
 
-async fn live(client: &Client, theme: &Theme) -> Result<(), String> {
+async fn live(client: &Client, theme: &Theme) -> Result<()> {
     let mut painted = 0usize;
     let mut interrupt = Box::pin(tokio::signal::ctrl_c());
     loop {
         let frame = match snapshot(client).await {
             Ok(v) => render_status(&v, term_cols(), theme),
             // A transient apiserver blip must not tear down a watch the user is reading
-            Err(e) => format!("ztest status: {e}\n"),
+            Err(e) => format!("ztest status: {e:#}\n"),
         };
         repaint(&frame, &mut painted);
         tokio::select! {
@@ -93,7 +94,7 @@ fn term_cols() -> u16 {
 
 // ─────────────────────────── snapshot ─────────────────────────────────
 
-async fn snapshot(client: &Client) -> Result<StatusView, String> {
+async fn snapshot(client: &Client) -> Result<StatusView> {
     let server = kube::Config::infer()
         .await
         .ok()
@@ -102,8 +103,8 @@ async fn snapshot(client: &Client) -> Result<StatusView, String> {
     let leases = ledger::lease_api(client);
     let nodes: Api<Node> = Api::all(client.clone());
     let lp = ListParams::default();
-    let (leases, nodes) = tokio::try_join!(leases.list(&lp), nodes.list(&lp))
-        .map_err(|e| format!("read cluster status: {e}"))?;
+    let (leases, nodes) =
+        tokio::try_join!(leases.list(&lp), nodes.list(&lp)).context("read cluster status")?;
 
     let now = Utc::now();
     let me = ztest::api::naming::current_user();
@@ -201,7 +202,7 @@ fn anomaly(runs: &[RunRow], now: chrono::DateTime<Utc>) -> Option<String> {
 
 /// The view *is* the document — a hand-built projection beside it is a second schema to
 /// keep in step with the renderer
-fn emit_json(v: &StatusView) -> Result<(), String> {
-    println!("{}", serde_json::to_string_pretty(v).map_err(|e| e.to_string())?);
+fn emit_json(v: &StatusView) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }

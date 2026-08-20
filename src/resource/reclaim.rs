@@ -157,7 +157,11 @@ impl Target {
 #[async_trait::async_trait]
 pub trait ProfileStore: Send + Sync {
     async fn is_deployed(&self, client: &Client) -> bool;
-    async fn schedule_purge(&self, client: &Client, tenants: &[String]) -> Result<(), String>;
+    async fn schedule_purge(
+        &self,
+        client: &Client,
+        tenants: &[String],
+    ) -> Result<(), crate::error::PipelineError>;
 }
 
 /// Discovery result + listing failures (an RBAC-denied `--all-users` list must be
@@ -483,9 +487,7 @@ async fn live_run_ids(client: &Client, errors: &mut Vec<String>) -> Vec<String> 
         // No ledger namespace/access = no liveness evidence → report + fall back to
         // "nothing provably live", never to reclaiming nothing
         Err(e) => {
-            errors.push(format!(
-                "list reservations in {META_NAMESPACE} (liveness will be pod-phase only): {e}"
-            ));
+            errors.push(format!("list reservations in {META_NAMESPACE}: {e}"));
             Vec::new()
         }
     }

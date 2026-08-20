@@ -137,10 +137,7 @@ impl Snapshot {
 }
 
 fn missing_balances(accessor: &str) -> ! {
-    panic!(
-        "probe read `Snapshot::{accessor}`, but this sync subject reports no \
-         balances (only a wallet subject does)"
-    )
+    panic!("Snapshot::{accessor}: subject reports no balances (wallet only)")
 }
 
 /// Rolling state threaded across ticks to build each [`Snapshot`]. Separate so the snapshot

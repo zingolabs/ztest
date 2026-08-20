@@ -40,7 +40,7 @@ pub trait Exporter: Send + Sync + 'static {
     }
 
     /// One scrape, now. Live readers want [`Poller`] (holds its client across scrapes)
-    async fn read(&self, timeout: Duration) -> Result<Exposition, String> {
+    async fn read(&self, timeout: Duration) -> Result<Exposition, crate::error::PipelineError> {
         let endpoint = self.endpoint().await.map_err(|e| e.to_string())?;
         let http = reqwest::Client::new();
         scrape(&http, &endpoint.url("http"), timeout).await
@@ -62,7 +62,7 @@ pub trait Exporter: Send + Sync + 'static {
         name: &str,
         kind: MetricKind,
         sample_rate: Option<Duration>,
-    ) -> Result<Option<f64>, String> {
+    ) -> Result<Option<f64>, crate::error::PipelineError> {
         let rate = sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
         let deadline = tokio::time::Instant::now() + SCRAPE_RETRY_BUDGET;
         loop {
@@ -71,7 +71,8 @@ pub trait Exporter: Send + Sync + 'static {
                 Err(e) if tokio::time::Instant::now() >= deadline => {
                     return Err(format!(
                         "{name}: /metrics unreadable for {SCRAPE_RETRY_BUDGET:?}: {e}"
-                    ));
+                    )
+                    .into());
                 }
                 Err(_) => tokio::time::sleep(rate).await,
             }
@@ -315,7 +316,7 @@ async fn poll_loop(exporter: Arc<dyn Exporter>, period: Duration, tx: watch::Sen
                     exposition: Arc::new(exposition),
                     error: None,
                 },
-                Err(e) => failed(&tx, e),
+                Err(e) => failed(&tx, e.to_string()),
             },
             Err(e) => failed(&tx, e.to_string()),
         };

@@ -81,7 +81,7 @@ fn run_dir(sync_id: &str) -> PathBuf {
 ///   `current-context`, which is whatever the *user's* shell last set
 /// - Written from the same config ztest resolved its own client from, so the collector cannot
 ///   discover against a different cluster than the run
-fn write_kubeconfig(dir: &Path, api_server: &str) -> Result<PathBuf, String> {
+fn write_kubeconfig(dir: &Path, api_server: &str) -> Result<PathBuf, crate::error::PipelineError> {
     let source = std::env::var("KUBECONFIG")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -113,7 +113,11 @@ fn dirs_home() -> Option<PathBuf> {
 
 /// Start the collector for a run. Idempotent: an existing container for this id is replaced,
 /// so a relaunch cannot leave two collectors pushing the same tenant.
-pub async fn start(sync_id: &str, config: &str, api_server: &str) -> Result<(), String> {
+pub async fn start(
+    sync_id: &str,
+    config: &str,
+    api_server: &str,
+) -> Result<(), crate::error::PipelineError> {
     let dir = run_dir(sync_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let config_path = dir.join("config.alloy");
@@ -160,7 +164,8 @@ pub async fn start(sync_id: &str, config: &str, api_server: &str) -> Result<(), 
         return Err(format!(
             "start host collector: {}",
             String::from_utf8_lossy(&out.stderr).trim().lines().next_back().unwrap_or_default()
-        ));
+        )
+        .into());
     }
     settled(&name).await
 }
@@ -168,7 +173,7 @@ pub async fn start(sync_id: &str, config: &str, api_server: &str) -> Result<(), 
 /// `docker run -d` returning 0 means *spawned*, not *serving*: a bind clash or a rejected
 /// config exits a second later, and reporting success there is how a run reaches `sync perf`
 /// before anyone learns the collector died
-async fn settled(name: &str) -> Result<(), String> {
+async fn settled(name: &str) -> Result<(), crate::error::PipelineError> {
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let Ok(out) = Command::new(runtime::program())
@@ -183,7 +188,7 @@ async fn settled(name: &str) -> Result<(), String> {
         match (fields.next(), fields.next()) {
             (Some("true"), _) => return Ok(()),
             (Some("false"), Some(code)) if code != "0" => {
-                return Err(format!("collector exited ({code}): {}", last_error(name).await));
+                return Err(format!("collector exited ({code}): {}", last_error(name).await).into());
             }
             _ => continue,
         }

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
+use anyhow::{Context as _, Result, anyhow};
 use ztest::api::metrics::Exposition;
 use ztest::api::{Unit, compact, format_elapsed, unit_value};
 use ztest::sync::namespace_for;
@@ -71,19 +72,17 @@ pub(crate) struct Request {
     pub(crate) profile: ztest::api::profiling::Profile,
 }
 
-pub(crate) async fn perf(request: Request) -> Result<(), String> {
+pub(crate) async fn perf(request: Request) -> Result<()> {
     let Request { id, out, open, window, component, base, profile } = request;
     // Parsed before any cluster call — a `--window` typo must cost nothing, not a
     // full retrieval then thrown away.
     let requested = window.as_deref().map(parse_window).transpose()?;
     if requested.is_some() && base.is_some() {
-        return Err("`--window` and `--base` are different subtractions — pick one".to_string());
+        return Err(anyhow!("--window and --base are different subtractions"));
     }
     // Never guessed: profiles key by component, and merged samples from two
     // processes are meaningless, not merely coarse.
-    let subject = component.ok_or_else(|| {
-        "name the component to profile with `--component` (e.g. `--component zainod`)".to_string()
-    })?;
+    let subject = component.context("no --component")?;
     let span = span_for(&id, requested).await?;
 
     if let Some(base_id) = base {
@@ -104,13 +103,13 @@ pub(crate) async fn perf(request: Request) -> Result<(), String> {
 async fn span_for(
     id: &str,
     requested: Option<(std::time::Duration, std::time::Duration)>,
-) -> Result<(SystemTime, SystemTime), String> {
-    let client = ztest::api::cluster::client().await.map_err(|e| format!("kube client: {e}"))?;
+) -> Result<(SystemTime, SystemTime)> {
+    let client = ztest::api::cluster::client().await.context("kube client")?;
     let driver = ztest::sync::find_driver(&client, id).await?;
     let started: SystemTime = driver
         .metadata
         .creation_timestamp
-        .ok_or_else(|| format!("sync {id}: driver pod has no creation timestamp"))?
+        .with_context(|| format!("sync {id}: driver pod has no creation timestamp"))?
         .0
         .into();
     Ok(match requested {
@@ -126,13 +125,13 @@ async fn retrieve(
     window: (SystemTime, SystemTime),
     out: Option<PathBuf>,
     profile: ztest::api::profiling::Profile,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf> {
     let theme = Theme::detect();
-    let client = ztest::api::cluster::client().await.map_err(|e| format!("kube client: {e}"))?;
+    let client = ztest::api::cluster::client().await.context("kube client")?;
     let selector = ztest::api::profiling::selector(component, &namespace_for(id));
     let tenant = ztest::api::profiling::tenant_for_sync(&client, id)
         .await
-        .ok_or_else(|| format!("sync {id} is gone; its profiles are no longer addressable"))?;
+        .with_context(|| format!("sync {id}: gone"))?;
     let bytes = match ztest::api::profiling::fetch(
         &client, &selector, window.0, window.1, &tenant, profile,
     )
@@ -141,13 +140,17 @@ async fn retrieve(
         Ok(profile) => profile,
         // An empty match has four causes and the cluster can still separate them; a bare
         // "matched nothing" sends the reader to the query, which is the one thing that is fine
-        Err(e) => return Err(explain_empty(&client, id, component).await.unwrap_or(e)),
+        Err(e) => {
+            return Err(explain_empty(&client, id, component)
+                .await
+                .map_or_else(|| anyhow!("{e}"), |why| anyhow!("{why}")));
+        }
     };
 
     let dest = out.unwrap_or_else(|| default_dest(id));
-    std::fs::create_dir_all(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    std::fs::create_dir_all(&dest).with_context(|| format!("create {}", dest.display()))?;
     let path = dest.join(format!("{component}-{}.collapsed", profile.stem()));
-    std::fs::write(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
     let wrote = Fields::new().text("path", path.display().to_string());
     println!("{}", draw(row::WROTE, &wrote, &theme));
     match profile {
@@ -370,26 +373,20 @@ async fn compare(
     span: (SystemTime, SystemTime),
     open: bool,
     profile: ztest::api::profiling::Profile,
-) -> Result<(), String> {
+) -> Result<()> {
     let theme = Theme::detect();
     let head = read_report(id).await?;
     let base = read_report(base_id).await?;
 
     let (Some(head_seg), Some(base_seg)) = (&head.segment, &base.segment) else {
-        return Err(format!(
-            "sync {id} and {base_id}: no segment on one — give both a `run.until_height(..)`"
-        ));
+        return Err(anyhow!("{id} vs {base_id}: no segment; both need run.until_height(..)"));
     };
     head_seg.comparable_with(base_seg).map_err(|why| {
         let span = |run: &str, seg: &ztest::sync::Segment| {
             let f = Fields::new().text("id", run).text("span", seg.describe());
             draw(row::MISMATCH, &f, &theme)
         };
-        format!(
-            "sync {id} and {base_id} cannot be compared: {why}\n{}\n{}",
-            span(id, head_seg),
-            span(base_id, base_seg),
-        )
+        anyhow!("{id} vs {base_id}: {why}\n{}\n{}", span(id, head_seg), span(base_id, base_seg))
     })?;
 
     print!("{}", verdict(head_seg, base_seg, id, base_id, &theme));
@@ -506,11 +503,11 @@ fn change(
 /// Fraction of baseline below which a change is flagged
 const REGRESSION_MARGIN: f64 = 0.95;
 
-async fn read_report(id: &str) -> Result<ztest::sync::SyncReportMirror, String> {
-    let client = ztest::api::cluster::client().await.map_err(|e| format!("kube client: {e}"))?;
+async fn read_report(id: &str) -> Result<ztest::sync::SyncReportMirror> {
+    let client = ztest::api::cluster::client().await.context("kube client")?;
     ztest::sync::read_report(&client, id)
         .await?
-        .ok_or_else(|| format!("sync {id}: no report — it has not finished yet"))
+        .with_context(|| format!("sync {id}: no report — it has not finished yet"))
 }
 
 /// Landing dir absent `--out`. Per-sync, so two syncs of one profile never
@@ -520,20 +517,20 @@ fn default_dest(id: &str) -> PathBuf {
 }
 
 /// Parse a `FROM..TO` window: `11h..12h`, `30m..90m`, `0..1h`
-fn parse_window(spec: &str) -> Result<(std::time::Duration, std::time::Duration), String> {
+fn parse_window(spec: &str) -> Result<(std::time::Duration, std::time::Duration)> {
     let (from, to) = spec
         .split_once("..")
-        .ok_or_else(|| format!("window {spec:?} is not `FROM..TO` (e.g. `11h..12h`)"))?;
+        .with_context(|| format!("window {spec:?} is not `FROM..TO` (e.g. `11h..12h`)"))?;
     let from = parse_elapsed(from)?;
     let to = parse_elapsed(to)?;
     if from >= to {
-        return Err(format!("window {spec:?} does not advance"));
+        return Err(anyhow!("window {spec:?} does not advance"));
     }
     Ok((from, to))
 }
 
 /// Parse an elapsed bound: bare seconds, or `s`/`m`/`h`-suffixed
-fn parse_elapsed(text: &str) -> Result<std::time::Duration, String> {
+fn parse_elapsed(text: &str) -> Result<std::time::Duration> {
     let text = text.trim();
     let (digits, scale) = match text.chars().last() {
         Some('s') => (&text[..text.len() - 1], 1),
@@ -544,12 +541,12 @@ fn parse_elapsed(text: &str) -> Result<std::time::Duration, String> {
     digits
         .parse::<u64>()
         .map(|n| std::time::Duration::from_secs(n * scale))
-        .map_err(|_| format!("{text:?} is not an elapsed time (try `90m` or `2h`)"))
+        .with_context(|| format!("{text:?}: not an elapsed time (`90m`, `2h`)"))
 }
 
 /// Hand `profile` to a viewer, else explain how to get one. Missing viewer =
 /// guidance, not error (the artifact — what was actually asked for — is on disk)
-fn launch(profile: &Path, theme: &Theme) -> Result<(), String> {
+fn launch(profile: &Path, theme: &Theme) -> Result<()> {
     let Some(viewer) = choose_viewer() else {
         eprintln!(
             "ztest sync perf: no viewer — `uv tool install flameshow` or set {VIEWER_ENV} ({})",
@@ -564,8 +561,8 @@ fn launch(profile: &Path, theme: &Theme) -> Result<(), String> {
     // and a shell prompt returning mid-paint corrupts both.
     match Command::new(&viewer).arg(profile).status() {
         Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!("{viewer} exited with {status} ({})", profile.display())),
-        Err(e) => Err(format!("launch {viewer}: {e}")),
+        Ok(status) => Err(anyhow!("{viewer} exited with {status} ({})", profile.display())),
+        Err(e) => Err(anyhow!("launch {viewer}: {e}")),
     }
 }
 

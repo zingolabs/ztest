@@ -8,6 +8,7 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
+use anyhow::{Context as _, Result, anyhow};
 use clap::Args as ClapArgs;
 use dialoguer::Confirm;
 
@@ -76,11 +77,10 @@ async fn run(args: &Args) -> Result<(), CliError> {
     let theme = Theme::detect();
 
     // Echo the target pre-write (wrong-context provisioning = the irreversible footgun)
-    let cfg =
-        ztest::api::cluster::config().await.map_err(|e| format!("resolve kube config: {e}"))?;
+    let cfg = ztest::api::cluster::config().await.context("resolve kube config")?;
     let target = Fields::new().text("url", cfg.cluster_url.to_string());
     note(row::TARGET, &target, &theme);
-    let client = kube::Client::try_from(cfg).map_err(|e| format!("connect to cluster: {e}"))?;
+    let client = kube::Client::try_from(cfg).context("connect to cluster")?;
 
     // Refuse a cluster that cannot run tests: setup cannot fix a missing capability
     // (operator's) → name it before writing anything. Local-cluster storage = the one
@@ -107,9 +107,9 @@ async fn run(args: &Args) -> Result<(), CliError> {
             .with_prompt("Provision ztest infrastructure into this cluster?")
             .default(false)
             .interact()
-            .map_err(|e| format!("confirmation prompt: {e}"))?;
+            .context("confirmation prompt")?;
         if !ok {
-            return Err(CliError::Message("aborted: no changes made".into()));
+            return Err(CliError::Fatal(anyhow!("aborted")));
         }
     }
 
@@ -141,9 +141,8 @@ async fn run(args: &Args) -> Result<(), CliError> {
     opts.no_wait = args.no_wait;
     opts.observability = !args.no_observability;
 
-    let states = resource::initialize(client.clone(), opts, on_change)
-        .await
-        .map_err(|e| format!("graph shape: {e}"))?;
+    let states =
+        resource::initialize(client.clone(), opts, on_change).await.context("graph shape")?;
 
     // Any Failed/Blocked *required* node ⇒ non-zero, scanned from the final map (the graph
     // never aborts early: one stuck subtree must not strand the rest). Optional nodes
@@ -164,11 +163,7 @@ async fn run(args: &Args) -> Result<(), CliError> {
         required.into_iter().partition(|(_, s)| matches!(s, NodeState::Failed(_)));
     if !failed.is_empty() || !blocked.is_empty() {
         // Counts only; each node already printed its own ✗ / · line
-        return Err(CliError::Message(format!(
-            "{} failed, {} blocked",
-            failed.len(),
-            blocked.len(),
-        )));
+        return Err(CliError::Fatal(anyhow!("{} failed, {} blocked", failed.len(), blocked.len())));
     }
 
     // Close the loop the graph cannot: re-probe and hold the same contract `ztest cluster

@@ -16,13 +16,6 @@ use crate::runtime::{self, ContainerRuntime};
 #[derive(Debug)]
 pub struct Kind;
 
-impl Kind {
-    /// Pod pull reference = what the node's containerd holds
-    pub fn reference(&self, tag: &str) -> String {
-        format!("{}{tag}", runtime::active().local_tag_prefix())
-    }
-}
-
 #[async_trait]
 impl ImageProvider for Kind {
     fn pull_secret(&self) -> Option<String> {
@@ -56,11 +49,11 @@ impl ImageProvider for Kind {
             .map_err(|e| ResourceError::Provision(format!("kind preflight: {e}")))?
             .map_err(|e| ResourceError::Provision(e.to_string()))?;
 
-        // Build tags bare → the load step is a plain `kind load`, no re-tag
         if let Some(sink) = &cx.progress {
             sink.note(&id, "building");
         }
-        let reference = self.reference(tag);
+        let rt = runtime::active();
+        let reference = rt.local_reference(tag);
         let argv = docker_build_argv(
             &dockerfile,
             &context,
@@ -68,15 +61,15 @@ impl ImageProvider for Kind {
             &reference,
             entry.rust_version.as_deref(),
         );
-        let rt = runtime::active();
         run_streamed(cx, tag, rt.as_str(), &argv, &rt.build_envs(), "build").await?;
 
         if let Some(sink) = &cx.progress {
             sink.note(&id, format!("load → kind {}", kind_cluster_name()));
         }
-        side_load(cx.host.as_deref(), rt, &reference)
+        side_load(cx.host.as_deref(), rt, tag)
             .await
             .map_err(|e| ResourceError::Provision(format!("side-load {reference}: {e}")))?;
+        confirm_loaded(tag).await.map_err(|e| ResourceError::Provision(e.to_string()))?;
         Ok(reference)
     }
 }
@@ -86,10 +79,10 @@ impl ImageProvider for Kind {
 pub fn crictl_images() -> Result<String, ImageError> {
     let node = format!("{}-control-plane", kind_cluster_name());
     let engine = runtime::program();
-    let out =
-        Command::new(engine).args(["exec", &node, "crictl", "images"]).output().map_err(|err| {
-            ImageError::Spawn { cmd: format!("{engine} exec {node} crictl images"), err }
-        })?;
+    let out = Command::new(engine)
+        .args(["exec", &node, "crictl", "images"])
+        .output()
+        .map_err(|err| ImageError::spawn(format!("{engine} exec {node} crictl images"), err))?;
     if !out.status.success() {
         return Err(ImageError::KindImageQuery { stderr_tail: tail(&out.stderr, 40) });
     }
@@ -134,7 +127,8 @@ pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
     Ok(false)
 }
 
-/// Image → node containerd. Sole side-load path (`Kind` provider + local bake).
+/// Bare `<repo>:<tag>` → node containerd, under [`ContainerRuntime::local_reference`] — the
+/// name pods pull. Sole side-load path (`Kind` provider + local bake).
 ///
 /// - podman: `kind load docker-image` hardcodes `docker image inspect` → never finds a
 ///   podman-built image, whatever the tag form
@@ -142,22 +136,19 @@ pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
 pub async fn side_load(
     host: Option<&dyn ChildHost>,
     rt: ContainerRuntime,
-    reference: &str,
-) -> Result<(), String> {
+    tag: &str,
+) -> Result<(), crate::error::PipelineError> {
+    let reference = rt.local_reference(tag);
     let envs = rt.kind_envs();
     if rt == ContainerRuntime::Docker {
-        let argv = kind_load_argv(reference);
+        let argv = kind_load_argv(&reference);
         return proc::run_checked(host, "kind", &argv, &envs, "kind load").await;
     }
     let stem: String =
         reference.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
     let tar = std::env::temp_dir().join(format!("ztest-{stem}.tar"));
-    let save = vec![
-        "save".to_string(),
-        "-o".to_string(),
-        tar.display().to_string(),
-        reference.to_string(),
-    ];
+    let save =
+        vec!["save".to_string(), "-o".to_string(), tar.display().to_string(), reference.clone()];
 
     let staged = proc::run_checked(host, rt.as_str(), &save, &[], "image save").await;
     let loaded = match staged {
@@ -169,6 +160,24 @@ pub async fn side_load(
     };
     let _ = std::fs::remove_file(&tar);
     loaded
+}
+
+/// Node image table holds what the pod will ask for.
+///
+/// - Load is not proof: `kind load` reports the transfer, never the name containerd filed it under
+/// - Divergence otherwise surfaces mid-test as `ImagePullBackOff` on a registry that never had it
+pub async fn confirm_loaded(tag: &str) -> Result<(), ImageError> {
+    let owned = tag.to_string();
+    let present = tokio::task::spawn_blocking(move || exists_in_kind(&owned))
+        .await
+        .map_err(|e| ImageError::KindImageQuery { stderr_tail: format!("confirm {tag}: {e}") })??;
+    if present {
+        return Ok(());
+    }
+    Err(ImageError::SideLoadUnconfirmed {
+        reference: runtime::active().local_reference(tag),
+        images: crictl_images().unwrap_or_default().lines().take(40).collect::<Vec<_>>().join("\n"),
+    })
 }
 
 /// Args after the `kind` program name, run through the console PTY like [`docker_build_argv`]
@@ -225,7 +234,7 @@ fn node_names(filter: &str) -> Result<Vec<String>, ImageError> {
     let out = Command::new(engine)
         .args(&argv)
         .output()
-        .map_err(|err| ImageError::Spawn { cmd: format!("{engine} ps --filter {filter}"), err })?;
+        .map_err(|err| ImageError::spawn(format!("{engine} ps --filter {filter}"), err))?;
     if !out.status.success() {
         return Err(ImageError::KindClusterQuery { engine, stderr_tail: tail(&out.stderr, 20) });
     }
@@ -276,10 +285,7 @@ pub fn kind_resolves_nodes(cluster: &str) -> Result<Vec<String>, ImageError> {
         .args(["get", "nodes", "--name", cluster])
         .envs(runtime::active().kind_envs())
         .output()
-        .map_err(|err| ImageError::Spawn {
-            cmd: format!("kind get nodes --name {cluster}"),
-            err,
-        })?;
+        .map_err(|err| ImageError::spawn(format!("kind get nodes --name {cluster}"), err))?;
     if !out.status.success() {
         return Err(ImageError::KindNodeQuery { stderr_tail: tail(&out.stderr, 20) });
     }
@@ -356,7 +362,10 @@ mod tests {
         let (program, argv, _) = &spawns[0];
         assert_eq!(program, "podman");
         assert_eq!(argv[0], "save");
-        assert_eq!(argv.last().unwrap(), "zebrad:dev-abc");
+        assert_eq!(
+            argv.last().unwrap(),
+            &ContainerRuntime::Podman.local_reference("zebrad:dev-abc")
+        );
 
         let (program, argv, envs) = &spawns[1];
         assert_eq!(program, "kind");
@@ -393,15 +402,14 @@ mod tests {
         assert_eq!(clusters_from_nodes(&nodes), ["other", "zkn"]);
     }
 
+    /// Loaded name, pod `image:`, and the node-table lookup are one derivation apart — a
+    /// pod asking for the bare tag resolves `docker.io/library/…` and never finds it
     #[test]
-    fn the_pod_reference_follows_what_the_engine_stores() {
-        assert_eq!(
-            format!("{}zebrad:dev-abc", ContainerRuntime::Docker.local_tag_prefix()),
-            "zebrad:dev-abc"
-        );
-        assert_eq!(
-            format!("{}zebrad:dev-abc", ContainerRuntime::Podman.local_tag_prefix()),
-            "localhost/zebrad:dev-abc"
-        );
+    fn the_loaded_name_is_the_one_the_node_table_reports() {
+        for rt in [ContainerRuntime::Docker, ContainerRuntime::Podman] {
+            let reference = rt.local_reference("zebrad:dev-abc");
+            let (repo, _) = reference.rsplit_once(':').expect("tagged");
+            assert!(rt.node_repo_forms("zebrad").contains(&repo.to_string()), "{reference}");
+        }
     }
 }

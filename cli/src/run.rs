@@ -8,6 +8,7 @@ use std::io::{IsTerminal, Write, stdout};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use nextest_metadata::NextestExitCode;
 
@@ -323,18 +324,17 @@ fn split_eq(arg: &str) -> (&str, Option<&str>) {
 }
 
 /// `--rerun` selector → `(binary_id, test_name)` that passed then = excluded now
-fn resolve_rerun(sel: &RunSelector) -> Result<std::collections::HashSet<(String, String)>, String> {
-    let workspace = engine::locate::current_workspace().map_err(|e| e.to_string())?;
-    let dir = engine::locate::resolve(&workspace, sel).map_err(|e| e.to_string())?;
-    engine::passed_tests(&dir).map_err(|e| e.to_string())
+fn resolve_rerun(sel: &RunSelector) -> Result<std::collections::HashSet<(String, String)>> {
+    let workspace = engine::locate::current_workspace()?;
+    let dir = engine::locate::resolve(&workspace, sel)?;
+    engine::passed_tests(&dir).map_err(anyhow::Error::from)
 }
 
 /// `ztest run describe [filter]` — the plan `run` would provision, rendered, cluster-free
-async fn describe(list_args: Vec<String>) -> Result<(), String> {
-    let build =
-        ztest::api::pipeline::index(&list_args).await.map_err(|e| format!("build/list: {e}"))?;
+async fn describe(list_args: Vec<String>) -> Result<()> {
+    let build = ztest::api::pipeline::index(&list_args).await.context("build/list")?;
     let BuildOutcome::Ok { selected_binaries, .. } = &build else {
-        return Err("build produced no test selection".into());
+        return Err(anyhow!("build produced no test selection"));
     };
     let (dump, qos_by_binary) = ztest::api::pipeline::discover(selected_binaries).await;
     let ztest::api::pipeline::DumpOutcome::Discovered {
@@ -344,7 +344,7 @@ async fn describe(list_args: Vec<String>) -> Result<(), String> {
         ..
     } = &dump
     else {
-        return Err("inventory dump failed".into());
+        return Err(anyhow!("inventory dump failed"));
     };
     let plan = ztest::api::plan::for_run(
         selected_binaries,
@@ -362,9 +362,7 @@ pub fn execute(args: Args) -> ExitCode {
     // unexplained "build failed")
     if let Err(detail) = locate_cargo_workspace() {
         eprintln!("ztest run: {detail}");
-        eprintln!(
-            "       cd into a cargo workspace (one containing a Cargo.toml in this dir or any ancestor) and retry."
-        );
+
         return exit(NextestExitCode::SETUP_ERROR);
     }
 
@@ -489,9 +487,9 @@ fn cancel_exit(work_rt: &tokio::runtime::Runtime, run_id: &str, no_cleanup: bool
                                 eprintln!("ztest run: cleanup: {e}");
                             }
                         }
-                        Err(_) => eprintln!(
-                            "ztest run: cleanup timed out; the namespace janitor will reap the rest"
-                        ),
+                        Err(_) => {
+                            eprintln!("ztest run: cleanup timed out; janitor will reap the rest")
+                        }
                     }
                 }
                 Err(e) => eprintln!("ztest run: cleanup: no cluster client: {e}"),
@@ -587,7 +585,7 @@ impl ReservedBuilder {
         client: &kube::Client,
         run: &ztest::api::naming::RunCoords,
         capacity: ztest::qos::ClusterCapacity,
-    ) -> Result<Self, String> {
+    ) -> Result<Self> {
         let reservation = ztest::qos::ledger::acquire(
             client,
             &run.run_id,
@@ -597,15 +595,12 @@ impl ReservedBuilder {
             ztest::qos::ledger::Reserve::Fixed(ztest::qos::build::BUILDKIT_BUILD),
             ztest::qos::beacon::LeaseKind::Build,
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
         // `?` drops `reservation` → released (the point of the RAII shape)
-        let pod = ztest::api::resource::create_build_pod(client, &run.run_id, &run.user)
-            .await
-            .map_err(|e| e.to_string())?;
+        let pod = ztest::api::resource::create_build_pod(client, &run.run_id, &run.user).await?;
         if let Err(e) = ztest::api::resource::wait_build_pod_ready(client, &pod).await {
             ztest::api::resource::delete_build_pod(client, &pod).await;
-            return Err(e.to_string());
+            return Err(anyhow!("{e}"));
         }
         Ok(ReservedBuilder { pod, reservation })
     }
@@ -1667,7 +1662,11 @@ fn provision_and_resolve(
     let graph = match resource::plan_runtime(&images, &seeds) {
         Ok(g) => g,
         Err(e) => {
-            return ImagePhaseOutcome { failure: Some(e), qos_by_binary, ..Default::default() };
+            return ImagePhaseOutcome {
+                failure: Some(e.to_string()),
+                qos_by_binary,
+                ..Default::default()
+            };
         }
     };
     // Seeds provider talks to the API server → live client (cheap, pooled). Unreachable
@@ -1782,15 +1781,14 @@ fn provision_and_resolve(
 
 /// Walk up from cwd for a `Cargo.toml`; `Err(detail)` is user-facing. In-process rather
 /// than `cargo locate-project` (the common in-workspace path costs nothing at startup)
-fn locate_cargo_workspace() -> Result<(), String> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("could not read current working directory: {e}"))?;
+fn locate_cargo_workspace() -> Result<()> {
+    let cwd = std::env::current_dir().context("could not read current working directory")?;
     for dir in cwd.ancestors() {
         if dir.join("Cargo.toml").is_file() {
             return Ok(());
         }
     }
-    Err(format!("no Cargo.toml found in {} or any ancestor directory", cwd.display()))
+    Err(anyhow!("no Cargo.toml found in {} or any ancestor directory", cwd.display()))
 }
 
 fn build_initial_state(opts: &RunOptions) -> BannerState {

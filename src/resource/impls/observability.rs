@@ -601,13 +601,13 @@ fn prometheus_config_map() -> ConfigMap {
     config_map(&format!("{PROMETHEUS_SERVICE}-config"), "prometheus.yml", SCRAPE_CONFIG.into())
 }
 
-fn pyroscope_config_map() -> Result<ConfigMap, String> {
+fn pyroscope_config_map() -> Result<ConfigMap, crate::error::PipelineError> {
     let rendered = serde_yaml::to_string(&pyroscope_config())
         .map_err(|e| format!("render Pyroscope config: {e}"))?;
     Ok(config_map(&format!("{PYROSCOPE_SERVICE}-config"), "config.yaml", rendered))
 }
 
-fn pyroscope_overrides_config_map() -> Result<ConfigMap, String> {
+fn pyroscope_overrides_config_map() -> Result<ConfigMap, crate::error::PipelineError> {
     let seed = serde_yaml::to_string(&Overrides::default())
         .map_err(|e| format!("render Pyroscope overrides: {e}"))?;
     Ok(config_map(PYROSCOPE_OVERRIDES_CONFIGMAP, PYROSCOPE_OVERRIDES_KEY, seed))
@@ -669,7 +669,7 @@ fn grafana_deployment() -> Deployment {
 /// Applied in dependency order: RBAC before the pod that binds it, ConfigMaps and PVCs
 /// before the pod that mounts them (a Deployment whose volume is missing sits
 /// `ContainerCreating` past the rollout wait, reporting nothing)
-async fn apply_stack(cx: &Cx) -> Result<(), String> {
+async fn apply_stack(cx: &Cx) -> Result<(), crate::error::PipelineError> {
     const WHAT: &str = "observability stack";
     let client = &cx.client;
     let ns = |c: &kube::Client| -> (Api<ConfigMap>, Api<Service>, Api<Deployment>) {
@@ -727,7 +727,7 @@ async fn apply_stack(cx: &Cx) -> Result<(), String> {
 
 /// Create-if-absent, never apply — a re-provision must not clobber the retirements
 /// `ztest cleanup` has written into it
-async fn seed_overrides(api: &Api<ConfigMap>) -> Result<(), String> {
+async fn seed_overrides(api: &Api<ConfigMap>) -> Result<(), crate::error::PipelineError> {
     use kube::api::PostParams;
 
     if api.get_opt(PYROSCOPE_OVERRIDES_CONFIGMAP).await.map_err(|e| e.to_string())?.is_some() {
@@ -737,7 +737,7 @@ async fn seed_overrides(api: &Api<ConfigMap>) -> Result<(), String> {
         Ok(_) => Ok(()),
         // Lost the race with a concurrent setup; its seed is as good as ours
         Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
-        Err(e) => Err(format!("seed {PYROSCOPE_OVERRIDES_CONFIGMAP}: {e}")),
+        Err(e) => Err(format!("seed {PYROSCOPE_OVERRIDES_CONFIGMAP}: {e}").into()),
     }
 }
 
@@ -793,7 +793,7 @@ impl Provider for ObservabilityProvider {
     }
 
     async fn provision(&self, cx: &Cx) -> Result<(), ResourceError> {
-        apply_stack(cx).await.map_err(ResourceError::Provision)?;
+        apply_stack(cx).await.map_err(|e| ResourceError::Provision(e.to_string()))?;
 
         for name in DEPLOYMENTS {
             if let Err(timeout) = crate::resource::kube::wait_deployment_available(
@@ -810,7 +810,7 @@ impl Provider for ObservabilityProvider {
                 let why = stalled_because(cx, name).await;
                 return Err(ResourceError::Provision(match why {
                     Some(detail) => format!("{timeout}: {detail}"),
-                    None => timeout,
+                    None => timeout.to_string(),
                 }));
             }
         }

@@ -20,6 +20,7 @@ use std::process::ExitCode;
 
 use std::time::Duration;
 
+use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 
 use ztest::api::fmt::thousands;
@@ -67,9 +68,8 @@ pub fn execute(args: Args) -> ExitCode {
     super::block_on("cleanup", super::Rt::Multi, run(&args))
 }
 
-async fn run(args: &Args) -> Result<(), String> {
-    let client =
-        ztest::api::cluster::client().await.map_err(|e| format!("connect to cluster: {e}"))?;
+async fn run(args: &Args) -> Result<()> {
+    let client = ztest::api::cluster::client().await.context("connect to cluster")?;
 
     // Banner names the cluster: "nothing to reclaim" reads the same whichever one
     // answered
@@ -143,7 +143,7 @@ fn paren(detail: &str) -> String {
 ///
 /// - `ok` = reaped, `dot` = terminating (finalizer still holds it), `warn` = skipped
 ///   because live, `fail` = error
-fn report(outcome: &Outcome, dry_run: bool, theme: &Theme) -> Result<(), String> {
+fn report(outcome: &Outcome, dry_run: bool, theme: &Theme) -> Result<()> {
     let summary_verb = if dry_run { "would be reaped" } else { "reaped" };
     let reaped = Template::parse(&row::reap("pass"));
     let flagged = Template::parse(&row::reap("skip"));
@@ -221,7 +221,7 @@ fn report(outcome: &Outcome, dry_run: bool, theme: &Theme) -> Result<(), String>
     }
     let f =
         Fields::new().text("n", count(outcome.errors.len())).text("ellipsis", theme.chars.ellipsis);
-    Err(draw(row::ERRORS, &f, theme))
+    Err(anyhow!("{}", draw(row::ERRORS, &f, theme)))
 }
 
 fn count(n: usize) -> String {

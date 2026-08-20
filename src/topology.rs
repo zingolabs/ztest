@@ -118,16 +118,15 @@ impl ActivationHeights {
     /// - Active upgrades must form a contiguous prefix from Overwinter
     /// - Heights non-decreasing in supersession order
     /// - Both rejected by zebrad/zcashd at startup → surfaced here as a `build()` error
-    pub fn validate_schedule(&self) -> Result<(), String> {
+    pub fn validate_schedule(&self) -> Result<(), crate::error::PipelineError> {
         let ordered = self.ordered();
         let mut first_inactive: Option<NetworkUpgrade> = None;
         for (nu, height) in ordered {
             match (height, first_inactive) {
                 (Some(_), Some(gap)) => {
-                    return Err(format!(
-                        "activation schedule has a gap: {nu:?} is active but the earlier \
-                         {gap:?} is not; regtest upgrades activate as a contiguous prefix"
-                    ));
+                    return Err(
+                        format!("activation gap: {nu:?} active, earlier {gap:?} is not").into()
+                    );
                 }
                 (None, None) => first_inactive = Some(nu),
                 _ => {}
@@ -140,9 +139,9 @@ impl ActivationHeights {
                     && height < prev_height
                 {
                     return Err(format!(
-                        "activation height for {nu:?} ({height}) is below {prev_nu:?} \
-                         ({prev_height}); heights must be non-decreasing in upgrade order"
-                    ));
+                        "activation {nu:?} {height} below {prev_nu:?} {prev_height}"
+                    )
+                    .into());
                 }
                 prev = Some((nu, height));
             }

@@ -72,33 +72,19 @@ impl TreeRoots {
         let Some(i) = slot(pool) else { no_tree(pool) };
         match self.per_pool {
             Some(roots) => roots[i],
-            None => panic!(
-                "probe read the {pool:?} tree root, but this sync subject reports \
-                 no note commitment trees (only a wallet subject does)"
-            ),
+            None => panic!("{pool:?} tree root: subject reports no trees (wallet only)"),
         }
     }
 }
 
 /// Why an indexer's `GetTreeState` frontier yielded no root
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TreeRootError {
+    #[error("tree state not hex: {0}")]
     NotHex(String),
+    #[error("tree state not a commitment tree: {0}")]
     Malformed(String),
 }
-
-impl std::fmt::Display for TreeRootError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TreeRootError::NotHex(e) => write!(f, "tree state field is not hex: {e}"),
-            TreeRootError::Malformed(e) => {
-                write!(f, "tree state field is not a commitment tree: {e}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TreeRootError {}
 
 /// Root of an indexer's `GetTreeState` frontier (`TreeState.sapling_tree`/`.orchard_tree`),
 /// for comparison against a wallet's [`TreeRoots`].
@@ -152,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "reports no note commitment trees")]
+    #[should_panic(expected = "subject reports no trees")]
     fn require_panics_on_an_unreporting_subject() {
         // Point of the type: an observer must not answer a root probe with a quiet
         // `None` that reads as agreement

@@ -18,6 +18,7 @@ use std::io::{IsTerminal, stdout};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
+use anyhow::{Context as _, Result, anyhow};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod};
 use kube::Client;
 use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
@@ -214,7 +215,7 @@ pub fn execute(args: Args) -> ExitCode {
     super::block_on("sync", super::Rt::Multi, run(args))
 }
 
-async fn run(args: Args) -> Result<(), String> {
+async fn run(args: Args) -> Result<()> {
     let Some(cmd) = args.cmd else {
         return catalogue();
     };
@@ -247,8 +248,8 @@ async fn run(args: Args) -> Result<(), String> {
     }
 }
 
-async fn client() -> Result<Client, String> {
-    ztest::api::cluster::client().await.map_err(|e| format!("kube client: {e}"))
+async fn client() -> Result<Client> {
+    ztest::api::cluster::client().await.context("kube client")
 }
 
 /// ServiceAccount a detached sync charges its QoS budget to = the *credential*, not the
@@ -270,7 +271,7 @@ fn service_account() -> String {
 /// `ztest sync` — profiles declared in the cwd's workspace.
 ///
 /// - Source-derived + cluster-free (answers with no sync tests, no kubeconfig, no compile)
-fn catalogue() -> Result<(), String> {
+fn catalogue() -> Result<()> {
     let scan = profiles::scan()?;
     let theme = Theme::detect();
     print!("{}", render::listing(&scan, &theme, render::width()));
@@ -282,15 +283,13 @@ fn catalogue() -> Result<(), String> {
 /// - `Ok(None)` = scan uncertain (`cfg`-gated decl | unparsed file) → proceed, [`resolve_target`]
 ///   still rejects post-build
 /// - Rejecting on uncertainty would block work the compiler accepts
-fn preflight(name: &str) -> Result<Option<ProfileStub>, String> {
+fn preflight(name: &str) -> Result<Option<ProfileStub>> {
     let scan = profiles::scan()?;
     match scan.find(name) {
         Ok(found) => Ok(Some(found.clone())),
         Err(_) if scan.is_uncertain() => {
             let theme = Theme::detect();
-            let note = format!(
-                "`{name}` not found in source, but the scan is incomplete — building anyway"
-            );
+            let note = format!("`{name}` not in source; scan incomplete, building anyway");
             eprintln!("{}", draw(row::SCAN_NOTE, &Fields::new().text("note", note), &theme));
             for spot in &scan.blind_spots {
                 let f = Fields::new()
@@ -300,7 +299,9 @@ fn preflight(name: &str) -> Result<Option<ProfileStub>, String> {
             }
             Ok(None)
         }
-        Err(why) => Err(render::miss(name, &scan, &why, &Theme::detect(), render::width())),
+        Err(why) => {
+            Err(anyhow!("{}", render::miss(name, &scan, &why, &Theme::detect(), render::width())))
+        }
     }
 }
 
@@ -312,7 +313,7 @@ async fn start(
     watch_after: bool,
     profiling: Option<(u32, f64)>,
     no_cleanup: bool,
-) -> Result<(), String> {
+) -> Result<()> {
     // pre-client, pre-build (wrong name answerable from source in ms)
     let stub = preflight(name)?;
 
@@ -443,7 +444,7 @@ async fn reserve_sync_capacity(
     sa: &str,
     target: &Target,
     profiled: bool,
-) -> Result<ztest::qos::ledger::Reservation, String> {
+) -> Result<ztest::qos::ledger::Reservation> {
     let capacity = ztest::api::pipeline::probe_capacity(client).await?;
     let mut want = target.profile.admitted();
     if profiled {
@@ -452,11 +453,7 @@ async fn reserve_sync_capacity(
     // Fail fast on a reserve no cluster state can satisfy (`acquire` would poll 10 min,
     // then misreport it as peer contention)
     if !want.fits_within(&capacity.allocatable) {
-        return Err(format!(
-            "this profile reserves {want}, which exceeds the cluster's total \
-             allocatable {} — lower its `footprint` (or its tier) to what a node can hold",
-            capacity.allocatable
-        ));
+        return Err(anyhow!("footprint {want} exceeds allocatable {}", capacity.allocatable));
     }
     ztest::qos::ledger::acquire(
         client,
@@ -468,7 +465,7 @@ async fn reserve_sync_capacity(
         ztest::qos::beacon::LeaseKind::Sync,
     )
     .await
-    .map_err(|e| format!("reserve sync capacity: {e}"))
+    .context("reserve sync capacity")
 }
 
 /// Sync namespace + driver pod (split out → the reservation has one unwind path)
@@ -484,7 +481,7 @@ async fn launch_driver(
     image_refs: &BTreeMap<String, String>,
     collector: Option<&ztest::api::profiling::Collector>,
     no_cleanup: bool,
-) -> Result<(), String> {
+) -> Result<()> {
     ensure_sync_namespace(client, ns, sync_id).await?;
     // Config before the pod that mounts it (a missing ConfigMap holds the driver in
     // `ContainerCreating`, not just the sidecar)
@@ -493,7 +490,7 @@ async fn launch_driver(
         Api::<ConfigMap>::namespaced(client.clone(), RUN_NAMESPACE)
             .patch(&c.config_map, &PatchParams::apply("ztest-sync").force(), &Patch::Apply(&cm))
             .await
-            .map_err(|e| format!("create profiler config: {e}"))?;
+            .context("create profiler config")?;
     }
     let pod = build_driver_pod(
         sync_id, profile, ns, sa, compiled, target, image_refs, collector, no_cleanup,
@@ -501,7 +498,7 @@ async fn launch_driver(
     let created = Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
         .create(&PostParams::default(), &pod)
         .await
-        .map_err(|e| format!("create driver pod: {e}"))?;
+        .context("create driver pod")?;
     match collector {
         Some(c) if c.placement == Placement::Sidecar => {
             adopt_profiler_config(client, &created, &c.config_map).await;
@@ -538,7 +535,7 @@ async fn adopt_profiler_config(client: &Client, driver: &Pod, name: &str) {
     }]}});
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), RUN_NAMESPACE);
     if let Err(e) = api.patch(name, &PatchParams::default(), &Patch::Merge(&owner)).await {
-        eprintln!("ztest sync: profiler config {name} not owner-referenced ({e}); `ztest cleanup`");
+        eprintln!("ztest sync: profiler config {name} not owner-referenced: {e}");
     }
 }
 
@@ -556,7 +553,7 @@ async fn abandon_launch(client: &Client, sync_id: &str, ns: &str) {
 
 /// Wait for driver `Running` = where it takes over renewing (see `TestEnv::build`)
 /// — caller renews meanwhile, bridging an image pull longer than the TTL
-async fn await_driver_running(client: &Client, sync_id: &str) -> Result<(), String> {
+async fn await_driver_running(client: &Client, sync_id: &str) -> Result<()> {
     use ztest::api::pod_status as ps;
 
     let api: Api<Pod> = Api::namespaced(client.clone(), RUN_NAMESPACE);
@@ -575,8 +572,8 @@ async fn await_driver_running(client: &Client, sync_id: &str) -> Result<(), Stri
             if !ps::is_scheduled(status) {
                 let since = *unscheduled_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() >= ps::PENDING_TIMEOUT {
-                    return Err(format!(
-                        "sync driver pod was never scheduled onto a node within {}: {}",
+                    return Err(anyhow!(
+                        "sync driver pod unschedulable after {}: {}",
                         format_span(since.elapsed()),
                         ps::schedule_blocker(status)
                             .unwrap_or_else(|| "no PodScheduled condition".to_string()),
@@ -584,7 +581,7 @@ async fn await_driver_running(client: &Client, sync_id: &str) -> Result<(), Stri
                 }
             }
             if let Some(reason) = ps::fault(status) {
-                return Err(format!("sync driver pod failed to start: {reason}"));
+                return Err(anyhow!("sync driver pod failed to start: {reason}"));
             }
             if let Some(reason) = ps::image_error(status)
                 && ps::pull_error_is_terminal(
@@ -594,7 +591,7 @@ async fn await_driver_running(client: &Client, sync_id: &str) -> Result<(), Stri
                     ps::IMAGE_PULL_GRACE,
                 )
             {
-                return Err(format!("sync driver pod image error: {reason}"));
+                return Err(anyhow!("sync driver pod image error: {reason}"));
             }
         }
         tokio::time::sleep(ps::POLL_INTERVAL).await;
@@ -606,15 +603,15 @@ async fn await_driver_running(client: &Client, sync_id: &str) -> Result<(), Stri
 /// - Failed *attach* ≠ failed `start` (sync is durable from pod creation; a non-zero
 ///   `start` reads as "didn't launch" and invites a re-run = a second footprint)
 /// - Failed *verdict* fails, as `ztest run` would (`--watch` = its foreground stand-in)
-async fn attach(theme: &Theme, sync_id: &str) -> Result<(), String> {
+async fn attach(theme: &Theme, sync_id: &str) -> Result<()> {
     match watch::watch(sync_id).await {
         // Log ended with the driver gone: killed, evicted, or crashed pre-report. Silence
         // here would pass a pipeline on a sync that never reached a verdict.
         Ok(watch::WatchEnd::Settled(SyncStatus::Unresolved)) => {
-            Err(format!("sync {sync_id} ended without a report (`ztest sync status {sync_id}`)"))
+            Err(anyhow!("sync {sync_id} ended without a report (`ztest sync status {sync_id}`)"))
         }
         Ok(watch::WatchEnd::Settled(status)) if !status.is_pass() => {
-            Err(format!("sync {sync_id} finished {status} (`ztest sync status {sync_id}`)"))
+            Err(anyhow!("sync {sync_id} finished {status} (`ztest sync status {sync_id}`)"))
         }
         Ok(watch::WatchEnd::Settled(_) | watch::WatchEnd::Detached) => Ok(()),
         Err(detail) => {
@@ -642,7 +639,7 @@ async fn build_and_provision(
     stub: Option<&ProfileStub>,
     console: Option<&Console>,
     theme: &Theme,
-) -> Result<(RemoteCompileOutcome, BTreeMap<String, String>), String> {
+) -> Result<(RemoteCompileOutcome, BTreeMap<String, String>)> {
     use ztest::api::pipeline::Phase;
     use ztest_ui::console::commit_phase;
     use ztest_ui::{BuildState, render_sync_build_panel, render_transfers};
@@ -692,10 +689,8 @@ async fn build_and_provision(
 
     let (compiled, build_pod) = if ztest::backends::image::builds_on_cluster() {
         let refs = BakeRefs {
-            runner_repo_ref: ztest::backends::image::runner_repo_ref().ok_or(
-                "runner registry unknown: set the cluster's in-cluster pull address \
-                 (ZTEST_IMAGE_REGISTRY) — see `ztest cluster`.",
-            )?,
+            runner_repo_ref: ztest::backends::image::runner_repo_ref()
+                .context("no runner registry; set ZTEST_IMAGE_REGISTRY")?,
         };
 
         // Ephemeral BuildKit pod (own phase + live timer), Ready before compiling
@@ -705,10 +700,10 @@ async fn build_and_provision(
             let p =
                 buildkit::create_build_pod(client, sync_id, &ztest::api::naming::current_user())
                     .await
-                    .map_err(|e| format!("create build pod: {e}"))?;
+                    .context("create build pod")?;
             if let Err(e) = buildkit::wait_build_pod_ready(client, &p).await {
                 buildkit::delete_build_pod(client, &p).await;
-                return Err(format!("build pod not ready: {e}"));
+                return Err(anyhow!("build pod not ready: {e}"));
             }
             p
         };
@@ -746,7 +741,7 @@ async fn build_and_provision(
                     c.flush_live();
                 }
                 buildkit::delete_build_pod(client, &build_pod).await;
-                return Err(e);
+                return Err(e.into());
             }
         }
     } else {
@@ -763,7 +758,7 @@ async fn build_and_provision(
                 if let Some(c) = console {
                     c.flush_live();
                 }
-                return Err(e);
+                return Err(e.into());
             }
         }
     };
@@ -805,12 +800,12 @@ async fn provision_components(
     profile: &str,
     console: Option<&Console>,
     repaint: impl FnMut(&Transfers),
-) -> Result<BTreeMap<String, String>, String> {
+) -> Result<BTreeMap<String, String>> {
     let DumpOutcome::Discovered {
         images, seeds, images_by_binary, deps_by_binary, sync_tests, ..
     } = &compiled.dump
     else {
-        return Err("inventory dump failed (no component images resolved)".into());
+        return Err(anyhow!("inventory dump failed (no component images resolved)"));
     };
     // Dump unions seeds across the compiled binaries; only this profile's are wanted.
     // `cargo_args` already narrows to `-p/--test`, but falls back to a whole-workspace bake
@@ -832,8 +827,8 @@ async fn provision_components(
     if images.is_empty() && seeds.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let graph = ztest::api::resource::plan_runtime(images, &seeds)
-        .map_err(|e| format!("plan component images: {e}"))?;
+    let graph =
+        ztest::api::resource::plan_runtime(images, &seeds).context("plan component images")?;
     let states = ztest_ui::console::provision_with_tracker(
         &graph,
         client.clone(),
@@ -858,7 +853,7 @@ async fn provision_components(
         })
         .collect();
     if !failed.is_empty() {
-        return Err(format!("component provisioning failed:\n  {}", failed.join("\n  ")));
+        return Err(anyhow!("component provisioning failed:\n  {}", failed.join("\n  ")));
     }
     Ok(ztest::api::resource::dev_image_refs(images_by_binary, &states))
 }
@@ -887,17 +882,13 @@ struct Target {
 /// - Dump's `test_id` (`crate::…::fn`) minus the crate segment = the libtest name
 /// - Binary = whichever selection contains that test (derived, never guessed)
 /// - `profile` = declared tier + declared override → one resolved value sizes the launch
-fn resolve_target(compiled: &RemoteCompileOutcome, name: &str) -> Result<Target, String> {
+fn resolve_target(compiled: &RemoteCompileOutcome, name: &str) -> Result<Target> {
     let DumpOutcome::Discovered { sync_tests, .. } = &compiled.dump else {
-        return Err("inventory dump failed".into());
+        return Err(anyhow!("inventory dump failed"));
     };
     let entry = sync_tests.iter().find(|s| s.name == name).ok_or_else(|| {
         let have: Vec<&str> = sync_tests.iter().map(|s| s.name.as_str()).collect();
-        if have.is_empty() {
-            format!("no sync profiles found in the compiled selection (looked for `{name}`)")
-        } else {
-            format!("no sync profile named `{name}`; available: {}", have.join(", "))
-        }
+        anyhow!("no sync profile `{name}`; have: {}", have.join(", "))
     })?;
     // `test_id` = `crate::module::fn`; in-binary libtest name drops the crate segment
     // (`module_path!()` at an integration test's root is the crate)
@@ -905,25 +896,16 @@ fn resolve_target(compiled: &RemoteCompileOutcome, name: &str) -> Result<Target,
         entry.test_id.split_once("::").map(|(_, rest)| rest).unwrap_or(entry.test_id.as_str());
 
     let BuildOutcome::Ok { selected_binaries, .. } = &compiled.build else {
-        return Err("on-cluster build produced no test selection".into());
+        return Err(anyhow!("on-cluster build produced no test selection"));
     };
     let bin = selected_binaries
         .iter()
         .find(|b| b.selected_tests.iter().any(|t| t == libtest))
-        .ok_or_else(|| {
-            format!(
-                "profile `{name}` (test `{libtest}`) is not in any compiled binary — \
-                 was it built with the features it needs?"
-            )
-        })?;
+        .with_context(|| format!("profile `{name}`: test `{libtest}` in no compiled binary"))?;
     // Unknown tier label → refuse (never reserve at a default the profile did not ask for)
-    let profile = entry.profile().ok_or_else(|| {
-        format!(
-            "profile `{name}` declares `qos = {}`, not a known tier — cannot size \
-             its reservation",
-            entry.qos
-        )
-    })?;
+    let profile = entry
+        .profile()
+        .with_context(|| format!("profile `{name}`: qos `{}` is not a tier", entry.qos))?;
     Ok(Target {
         binary_path: bin.binary_path.to_string_lossy().into_owned(),
         test_name: libtest.to_string(),
@@ -946,7 +928,7 @@ fn new_sync_id(name: &str) -> String {
 ///   per-sync SA + RoleBinding is uncreatable by this credential, and would drop the
 ///   role's cluster-scoped rules anyway. Driver runs as the run identity; see
 ///   [`build_driver_pod`].
-async fn ensure_sync_namespace(client: &Client, ns: &str, sync_id: &str) -> Result<(), String> {
+async fn ensure_sync_namespace(client: &Client, ns: &str, sync_id: &str) -> Result<()> {
     let namespace: Namespace = serde_json::from_value(json!({
         "apiVersion": "v1",
         "kind": "Namespace",
@@ -963,7 +945,7 @@ async fn ensure_sync_namespace(client: &Client, ns: &str, sync_id: &str) -> Resu
     Api::<Namespace>::all(client.clone())
         .patch(ns, &PatchParams::apply("ztest-sync").force(), &Patch::Apply(&namespace))
         .await
-        .map_err(|e| format!("create sync namespace {ns}: {e}"))
+        .with_context(|| format!("create sync namespace {ns}"))
         .map(|_| ())
 }
 
@@ -1139,14 +1121,14 @@ async fn report_mirrors(client: &Client) -> HashMap<String, SyncReportMirror> {
         .collect()
 }
 
-async fn list(all_users: bool, json_out: bool) -> Result<(), String> {
+async fn list(all_users: bool, json_out: bool) -> Result<()> {
     let client = client().await?;
     // Host-placed collectors outlive nothing but their driver, and no process is resident to
     // notice it ended — so every command that already reads sync liveness sweeps them
     ztest::api::profiling::reap_finished(&client).await;
     let api: Api<Pod> = Api::all(client.clone());
     let lp = ListParams::default().labels(&kind_selector());
-    let items = api.list(&lp).await.map_err(|e| format!("list sync pods: {e}"))?.items;
+    let items = api.list(&lp).await.context("list sync pods")?.items;
     let mirrors = report_mirrors(&client).await;
     let me = ztest::api::naming::current_user();
     let rows: Vec<(SyncRow, SyncStatus)> = items
@@ -1171,7 +1153,7 @@ async fn list(all_users: bool, json_out: bool) -> Result<(), String> {
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?);
+        println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
     if rows.is_empty() {
@@ -1208,13 +1190,13 @@ async fn list(all_users: bool, json_out: bool) -> Result<(), String> {
 
 /// One view, live or finished: the header's source differs, every panel below it does
 /// not (Prometheus scrapes a running sync exactly as it scraped a finished one)
-async fn status(id: &str, json_out: bool) -> Result<(), String> {
+async fn status(id: &str, json_out: bool) -> Result<()> {
     // Durable report first (survives the pod), else the live tick stream
     let client = client().await?;
     let ns = namespace_for(id);
     if let Some(report) = read_report(&client, id).await? {
         if json_out {
-            println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+            println!("{}", serde_json::to_string_pretty(&report)?);
             return Ok(());
         }
         let view = build_report_view(&client, id, &ns, mirror_header(&report)).await;
@@ -1549,7 +1531,7 @@ fn driver_finished_at(driver: &k8s_openapi::api::core::v1::Pod) -> Option<System
 
 // ─────────────────────────── stop / rm / watch ────────────────────────
 
-async fn stop(id: &str) -> Result<(), String> {
+async fn stop(id: &str) -> Result<()> {
     let client = client().await?;
     ztest::api::profiling::reap_finished(&client).await;
     let _ = find_driver(&client, id).await?; // 404s clearly if unknown
@@ -1557,7 +1539,7 @@ async fn stop(id: &str) -> Result<(), String> {
     let patch = json!({ "metadata": { "annotations": { STOP_ANNOTATION: "true" } } });
     api.patch(&driver_pod_for(id), &PatchParams::apply("ztest-sync"), &Patch::Merge(&patch))
         .await
-        .map_err(|e| format!("signal stop: {e}"))?;
+        .context("signal stop")?;
     println!("sync {id}: stop signalled (graceful checkpoint, report, then exit)");
     Ok(())
 }
@@ -1586,7 +1568,7 @@ fn driver_profile(pod: &Pod) -> Option<String> {
 
 // ─────────────────────────────── describe ─────────────────────────────
 
-async fn describe(name: &str) -> Result<(), String> {
+async fn describe(name: &str) -> Result<()> {
     // Cluster-free: local inventory dump → each profile's static `SyncTestDecl`, printed
     // without executing the body.
     // No `--features` (virtual-workspace root rejects a bare one); default selection
@@ -1594,27 +1576,19 @@ async fn describe(name: &str) -> Result<(), String> {
     // Same `-p/--test` narrowing `start` compiles with — a describe that models a wider
     // selection than the run it describes reports a `pruned` set the run never had
     let list_args = preflight(name)?.map(|s| s.cargo_args()).unwrap_or_default();
-    let build = ztest::api::pipeline::index(&list_args)
-        .await
-        .map_err(|e| format!("local build/list for describe: {e}"))?;
+    let build =
+        ztest::api::pipeline::index(&list_args).await.context("local build/list for describe")?;
     let BuildOutcome::Ok { selected_binaries, .. } = &build else {
-        return Err("local build produced no test selection".into());
+        return Err(anyhow!("local build produced no test selection"));
     };
     let (dump, _) = ztest::api::pipeline::discover(selected_binaries).await;
     let DumpOutcome::Discovered { sync_tests, images_by_binary, deps_by_binary, seeds, .. } = &dump
     else {
-        return Err("local inventory dump failed".into());
+        return Err(anyhow!("local inventory dump failed"));
     };
     let entry = sync_tests.iter().find(|s| s.name == name).ok_or_else(|| {
         let have: Vec<&str> = sync_tests.iter().map(|s| s.name.as_str()).collect();
-        format!(
-            "no sync profile named `{name}`{}",
-            if have.is_empty() {
-                String::new()
-            } else {
-                format!("; available: {}", have.join(", "))
-            }
-        )
+        anyhow!("no sync profile `{name}`; have: {}", have.join(", "))
     })?;
     let plan = ztest::api::plan::for_sync(
         selected_binaries,
@@ -1629,11 +1603,11 @@ async fn describe(name: &str) -> Result<(), String> {
 
 /// `--profile-off-cpu` is a probability; anything outside `0..=1` is rejected by Alloy at
 /// load, which surfaces three layers away as "the run produced no profile"
-fn off_cpu_fraction(raw: &str) -> Result<f64, String> {
-    let p: f64 = raw.parse().map_err(|_| format!("`{raw}` is not a number"))?;
+fn off_cpu_fraction(raw: &str) -> Result<f64> {
+    let p: f64 = raw.parse().with_context(|| format!("`{raw}`: not a number"))?;
     match (0.0..=1.0).contains(&p) {
         true => Ok(p),
-        false => Err(format!("must be between 0 and 1, got {p}")),
+        false => Err(anyhow!("{p}: outside 0..=1")),
     }
 }
 

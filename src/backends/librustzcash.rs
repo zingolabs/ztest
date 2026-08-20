@@ -161,7 +161,7 @@ fn spend_policy_for(from_pools: &[Pool]) -> Result<SpendPolicy, BoxError> {
             Pool::Orchard => ShieldedProtocol::Orchard,
             Pool::Ironwood => ShieldedProtocol::Ironwood,
             Pool::Transparent => {
-                return Err("librustzcash: transparent is not a shielded spend source".into());
+                return Err("librustzcash: transparent is not a shielded source".into());
             }
         });
     }
@@ -251,11 +251,7 @@ async fn broadcast(
     };
     match tokio::time::timeout(timeout, relay).await {
         Ok(result) => result,
-        Err(_) => Err(format!(
-            "librustzcash: send relay: no response within {timeout:?} \
-             (indexer likely cannot reach its backing node)"
-        )
-        .into()),
+        Err(_) => Err(format!("librustzcash: send relay: no response in {timeout:?}").into()),
     }
 }
 

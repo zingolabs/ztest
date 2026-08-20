@@ -98,8 +98,7 @@ impl IndexerConfig for ZainoBackend {
         // Shared state volume only ever meaningful to `State`, under every mode
         if !state && opts.shared_state.is_some() {
             return Err(EnvError::Config {
-                reason: "a shared state volume is mounted but ZainoTuning::State is not set"
-                    .to_string(),
+                reason: "shared state volume without ZainoTuning::State".to_string(),
             });
         }
 
@@ -114,8 +113,7 @@ impl IndexerConfig for ZainoBackend {
                 })?;
                 if state && opts.shared_state.is_none() {
                     return Err(EnvError::Config {
-                        reason: "ZainoTuning::State on regtest reads the validator's live \
-                                 on-disk DB; mount one with .mount(&shared_volume)"
+                        reason: "ZainoTuning::State on regtest needs .mount(&shared_volume)"
                             .to_string(),
                     });
                 }
@@ -149,10 +147,7 @@ impl IndexerConfig for ZainoBackend {
                 // regtest topology on the wrong mode (name it, don't fail on an empty mount)
                 if opts.shared_state.is_some() {
                     return Err(EnvError::Config {
-                        reason: "a restored chain supplies zaino's state DB as the pod's own \
-                                 CoW clone of the archive; a shared state volume is a \
-                                 regtest-only topology and cannot be combined with \
-                                 .testnet/.mainnet"
+                        reason: "shared state volume is regtest-only, not with .testnet/.mainnet"
                             .to_string(),
                     });
                 }
@@ -163,10 +158,9 @@ impl IndexerConfig for ZainoBackend {
                     Some(crate::component::RestoreSource::Archive(handle)) => handle,
                     _ => {
                         return Err(EnvError::Config {
-                            reason: "zaino is in public-network mode but names no chain \
-                                     archive; select the chain with .testnet(<ARCHIVE>) or \
-                                     .mainnet(<ARCHIVE>)"
-                                .to_string(),
+                            reason:
+                                "public-network zaino names no archive; use .testnet()/.mainnet()"
+                                    .to_string(),
                         });
                     }
                 };
@@ -420,7 +414,7 @@ impl IndexerBackend for ZainoIndexer {
                 return Err(RpcError::decode(
                     COMPONENT,
                     "GetSubtreeRoots",
-                    format!("shielded pool {other:?} has no lightwalletd wire representation"),
+                    format!("pool {other:?}: no lightwalletd wire form"),
                 ));
             }
         };
@@ -820,7 +814,7 @@ impl ZainoIndexer {
     async fn exporter(&self) -> Result<Exposition, RpcError> {
         self.read(EXPORTER_SCRAPE_TIMEOUT)
             .await
-            .map_err(|e| RpcError::decode(COMPONENT, "scrape /metrics", e))
+            .map_err(|e| RpcError::decode(COMPONENT, "scrape /metrics", e.to_string()))
     }
 
     /// How far this pod's finalised index is written — the one question no other surface

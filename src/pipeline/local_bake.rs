@@ -23,7 +23,7 @@ pub async fn bake_locally(
     run_id: &str,
     host: Option<&dyn ChildHost>,
     on_phase: Option<PhaseSink<'_>>,
-) -> Result<RemoteCompileOutcome, String> {
+) -> Result<RemoteCompileOutcome, crate::error::PipelineError> {
     let mut on_phase = on_phase;
     let mut emit = |ev: Phase<'_>| {
         if let Some(cb) = on_phase.as_deref_mut() {
@@ -93,7 +93,7 @@ pub async fn bake_locally(
 
     emit(Phase::Start("publishing the runner image"));
     let t = Instant::now();
-    publish(host, &reference).await?;
+    publish(host, &tag, &reference).await?;
     emit(Phase::Done { label: "runner image published", dur: t.elapsed() });
     emit(Phase::Note(&format!("runner image ready: {reference}")));
     Ok(outcome)
@@ -101,7 +101,11 @@ pub async fn bake_locally(
 
 /// Registry push, else kind side-load — same choice
 /// [`crate::backends::image::from_env`] makes for `dev!`
-async fn publish(host: Option<&dyn ChildHost>, reference: &str) -> Result<(), String> {
+async fn publish(
+    host: Option<&dyn ChildHost>,
+    tag: &str,
+    reference: &str,
+) -> Result<(), crate::error::PipelineError> {
     use crate::backends::image::{docker as docker_backend, kind};
 
     if crate::backends::image::registry_configured() {
@@ -112,7 +116,8 @@ async fn publish(host: Option<&dyn ChildHost>, reference: &str) -> Result<(), St
         .await
         .map_err(|e| format!("kind preflight: {e}"))?
         .map_err(|e| e.to_string())?;
-    kind::side_load(host, runtime::active(), reference).await
+    kind::side_load(host, runtime::active(), tag).await?;
+    kind::confirm_loaded(tag).await.map_err(|e| e.to_string().into())
 }
 
 async fn engine(
@@ -120,6 +125,6 @@ async fn engine(
     argv: &[String],
     envs: &[(&str, String)],
     step: &str,
-) -> Result<(), String> {
+) -> Result<(), crate::error::PipelineError> {
     proc::run_checked(host, runtime::program(), argv, envs, step).await
 }

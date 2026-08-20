@@ -338,7 +338,7 @@ impl Provider for MetricsApiProvider {
         let ctx = "metrics-server";
         let c = &cx.client;
 
-        let applied: Result<(), String> = async {
+        let applied: Result<(), crate::error::PipelineError> = async {
             apply(&Api::namespaced(c.clone(), NAMESPACE), &service_account(), ctx).await?;
             apply(&Api::<ClusterRole>::all(c.clone()), &aggregated_metrics_reader(), ctx).await?;
             apply(&Api::<ClusterRole>::all(c.clone()), &metrics_server_role(), ctx).await?;
@@ -352,14 +352,14 @@ impl Provider for MetricsApiProvider {
             apply(&Api::<APIService>::all(c.clone()), &api_service(), ctx).await
         }
         .await;
-        applied.map_err(ResourceError::Provision)?;
+        applied.map_err(|e| ResourceError::Provision(e.to_string()))?;
 
         wait_deployment_available(c, NAMESPACE, NAME, ROLLOUT_TIMEOUT, cx.no_wait)
             .await
-            .map_err(ResourceError::Provision)?;
+            .map_err(|e| ResourceError::Provision(e.to_string()))?;
         wait_api_service_available(c, API_SERVICE, ROLLOUT_TIMEOUT, cx.no_wait)
             .await
-            .map_err(ResourceError::Provision)?;
+            .map_err(|e| ResourceError::Provision(e.to_string()))?;
         Ok(())
     }
 }

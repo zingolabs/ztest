@@ -114,16 +114,20 @@ pub(crate) enum Rt {
     Current,
 }
 
-/// Subcommand failure. `Reported` = already rendered in the subcommand's own shape
-/// (a generic restatement under it reads as a second, different failure)
+/// Subcommand failure.
+///
+/// Two cases because there are two situations, not two error types: `Fatal` has not been
+/// shown yet and [`block_on`] prints it; `Reported` was already rendered in the
+/// subcommand's own shape, and a generic restatement under it reads as a second,
+/// different failure
 pub(crate) enum CliError {
-    Message(String),
+    Fatal(anyhow::Error),
     Reported,
 }
 
-impl From<String> for CliError {
-    fn from(m: String) -> Self {
-        CliError::Message(m)
+impl From<anyhow::Error> for CliError {
+    fn from(e: anyhow::Error) -> Self {
+        CliError::Fatal(e)
     }
 }
 
@@ -147,8 +151,10 @@ pub(crate) fn block_on<E: Into<CliError>>(
     match rt.block_on(fut) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            if let CliError::Message(m) = e.into() {
-                eprintln!("ztest {label}: {m}");
+            // `{:#}` flattens the context chain onto one line: `outer: inner: cause`.
+            // The default `{}` prints only the outermost context, dropping the cause
+            if let CliError::Fatal(e) = e.into() {
+                eprintln!("ztest {label}: {e:#}");
             }
             ExitCode::FAILURE
         }

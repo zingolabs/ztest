@@ -131,7 +131,7 @@ fn fetch_git_rev(url: &str, rev: &str) -> Result<PathBuf, ImageError> {
             .args(args)
             .current_dir(&scratch)
             .output()
-            .map_err(|err| ImageError::Spawn { cmd: format!("git {}", args.join(" ")), err })?;
+            .map_err(|err| ImageError::spawn(format!("git {}", args.join(" ")), err))?;
         if !out.status.success() {
             return Err(ImageError::GitFetch {
                 rev: rev.to_string(),
@@ -192,7 +192,7 @@ pub trait ImageProvider: Send + Sync + std::fmt::Debug {
         );
         lookup_dev_image(id.as_str()).ok_or_else(|| ImageError::DevImageMissing {
             image: entry.repo.clone(),
-            source: entry.source.describe(),
+            declared_by: entry.source.describe(),
         })
     }
 
@@ -381,11 +381,11 @@ fn lookup_dev_image(id: &str) -> Option<String> {
     manifest().lock().expect("image manifest mutex poisoned").get(id).cloned()
 }
 
-/// Bare for kind, pull-base-qualified for remote. Shared by the preflight (manifest
+/// Engine-native for kind, pull-base-qualified for remote. Shared by the preflight (manifest
 /// build) and each backend's `build_image` → recorded ref & pushed image always agree
 pub fn pod_reference(tag: &str) -> String {
     let base = match selected_class() {
-        ClusterClass::Local => return tag.to_string(),
+        ClusterClass::Local => return crate::runtime::active().local_reference(tag),
         // *Pull* address: only the kubelet resolves what goes into a pod manifest
         ClusterClass::Remote => pull_base().or_else(push_base),
     };

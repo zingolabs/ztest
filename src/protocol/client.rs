@@ -130,7 +130,7 @@ pub async fn wait_for_rpc_ready(
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("RPC at {address} did not respond within {timeout:?}: {last_error}")]
+#[error("rpc {address}: no response in {timeout:?}: {last_error}")]
 pub struct RpcReadinessTimeout {
     pub address: SocketAddr,
     pub timeout: Duration,

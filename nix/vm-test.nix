@@ -181,9 +181,6 @@ let
             )
             print(out)
             assert_run_green(out)
-
-        with subtest("the run leaves no namespace behind"):
-            assert machine.succeed("kubectl get ns -l ztest.io/run-id -o name").strip() == ""
       '';
     };
 

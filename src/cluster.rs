@@ -84,10 +84,8 @@ pub fn require_orchestrator() -> Result<(), crate::EnvError> {
     }
     Err(crate::EnvError::Config {
         reason: format!(
-            "this test provisions a cluster environment and must run under the ztest \
-             orchestrator. Run it with:\n    ztest run -- {}\n(running the test binary directly \
-             via `cargo test`/`cargo nextest` is not supported for cluster tests).",
-            crate::naming::current_test_name(),
+            "needs the orchestrator: ztest run -- {}",
+            crate::naming::current_test_name()
         ),
     })
 }
@@ -193,8 +191,7 @@ async fn wait_for_default_sa(client: &Client, namespace: &str) -> Result<(), kub
     Err(kube::Error::Api(kube::core::ErrorResponse {
         status: "Failure".to_string(),
         message: format!(
-            "namespace {namespace}: the `default` ServiceAccount was not provisioned within {}s \
-             (ServiceAccount controller stalled?)",
+            "namespace {namespace}: no default ServiceAccount after {}s",
             (ATTEMPTS * INTERVAL.as_millis() as u32) / 1000,
         ),
         reason: "Timeout".to_string(),

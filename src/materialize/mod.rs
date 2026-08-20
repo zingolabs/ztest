@@ -121,7 +121,7 @@ async fn selected_driver(client: &Client) -> Result<String, EnvError> {
     crate::storage_class::selected(client)
         .await
         .map(|s| s.provisioner.clone())
-        .map_err(|reason| EnvError::Manifest { reason })
+        .map_err(|e| EnvError::Manifest { reason: e.to_string() })
 }
 
 /// Resolve a preflight-published seed, test side.
@@ -135,12 +135,7 @@ pub async fn await_seed(client: &Client, handle: crate::Artifact) -> Result<Seed
     if !pvc_exists(client, &pvc_name).await? {
         return Err(EnvError::ArchiveMaterializeFailed {
             archive: handle.name.to_string(),
-            reason: format!(
-                "seed {pvc_name} was never provisioned. A test may only mount an archive it \
-                 declares: add `#[ztest::needs({})]` to this test so preflight provisions \
-                 the seed before the run starts.",
-                handle.name
-            ),
+            reason: format!("seed {pvc_name}: no #[ztest::needs({})]", handle.name),
         });
     }
     wait_pvc_ready(client, &pvc_name).await?;
@@ -159,7 +154,7 @@ async fn check_seed_support(client: &Client, archive: &str) -> Result<(), EnvErr
     crate::storage_class::selected(client)
         .await
         .map(|_| ())
-        .map_err(|why| unsupported(archive, why))
+        .map_err(|why| unsupported(archive, why.to_string()))
 }
 
 fn unsupported(archive: &str, what: String) -> EnvError {
@@ -203,7 +198,7 @@ async fn create_seed_pvc(
 ) -> Result<bool, EnvError> {
     let storage = crate::storage_class::selected(client)
         .await
-        .map_err(|e| EnvError::Manifest { reason: e })?;
+        .map_err(|e| EnvError::Manifest { reason: e.to_string() })?;
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
     if let Some(existing) = api.get_opt(pvc_name).await.map_err(env_err)? {
         if existing.metadata.deletion_timestamp.is_none() {
@@ -274,8 +269,7 @@ async fn await_pvc_gone(client: &Client, pvc_name: &str, archive: &str) -> Resul
             return Err(EnvError::ArchiveMaterializeFailed {
                 archive: archive.to_string(),
                 reason: format!(
-                    "seed volume {pvc_name} has been Terminating for over {}s and its name \
-                     cannot be reused until it is gone; {blame}",
+                    "seed volume {pvc_name}: Terminating for {}s; {blame}",
                     WAIT_BUDGET.as_secs()
                 ),
             });
@@ -383,11 +377,7 @@ async fn materialize(
     if !present {
         return Err(MaterializeErr::Fatal(EnvError::ArchiveMaterializeFailed {
             archive: seed.name.clone(),
-            reason: format!(
-                "no blob at {url} with the manifest's size ({} bytes): run \
-                 `ztest snapshot push <archive>` to upload it",
-                seed.size
-            ),
+            reason: format!("no blob at {url} sized {} bytes", seed.size),
         }));
     }
 
@@ -665,7 +655,7 @@ async fn job_logs(pods: &Api<Pod>, job_name: &str) -> String {
 async fn create_volume_snapshot(client: &Client, pvc_name: &str) -> Result<(), EnvError> {
     let storage = crate::storage_class::selected(client)
         .await
-        .map_err(|e| EnvError::Manifest { reason: e })?;
+        .map_err(|e| EnvError::Manifest { reason: e.to_string() })?;
     let snap_gvk = volume_snapshot_gvk();
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), SEEDS_NAMESPACE, &snap_gvk);
     let body = json!({

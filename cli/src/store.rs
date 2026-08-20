@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use ztest::api::engine::record::{self, RunSelector};
@@ -55,14 +56,14 @@ pub fn execute(args: Args) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("ztest store: {e}");
+            eprintln!("ztest store: {e:#}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn workspace() -> Result<PathBuf, String> {
-    record::locate::current_workspace().map_err(|e| e.to_string())
+fn workspace() -> Result<PathBuf> {
+    record::locate::current_workspace().map_err(anyhow::Error::from)
 }
 
 /// Label column is 12 wide in every `info` row, so the values land on one gutter
@@ -99,9 +100,9 @@ fn tally(s: &ztest::api::engine::RunStats, theme: &Theme) -> String {
     s.tally().into_iter().map(term).collect::<Vec<_>>().join(", ")
 }
 
-fn list(theme: &Theme) -> Result<(), String> {
+fn list(theme: &Theme) -> Result<()> {
     let ws = workspace()?;
-    let runs = record::locate::list_runs(&ws).map_err(|e| e.to_string())?;
+    let runs = record::locate::list_runs(&ws)?;
     if runs.is_empty() {
         print(row::EMPTY, Fields::new().text("note", "no recorded runs for this workspace"), theme);
         return Ok(());
@@ -122,10 +123,10 @@ fn list(theme: &Theme) -> Result<(), String> {
     Ok(())
 }
 
-fn info(sel: &RunSelector, theme: &Theme) -> Result<(), String> {
+fn info(sel: &RunSelector, theme: &Theme) -> Result<()> {
     let ws = workspace()?;
-    let dir = record::locate::resolve(&ws, sel).map_err(|e| e.to_string())?;
-    let meta = record::read_meta(&dir).map_err(|e| e.to_string())?;
+    let dir = record::locate::resolve(&ws, sel)?;
+    let meta = record::read_meta(&dir)?;
     let field = |label: &str, value: String| {
         print(
             row::FIELD,
@@ -144,7 +145,7 @@ fn info(sel: &RunSelector, theme: &Theme) -> Result<(), String> {
 
     let f = Fields::new().text("label", "result:");
     // `[ (… run)]` drops with the counts an unfinished run never recorded
-    let f = match record::final_stats(&dir).map_err(|e| e.to_string())? {
+    let f = match record::final_stats(&dir)? {
         Some(s) => f
             .text("summary", tally(&s, theme))
             .text("ran", thousands(u64::from(s.ran())))
@@ -155,17 +156,17 @@ fn info(sel: &RunSelector, theme: &Theme) -> Result<(), String> {
     Ok(())
 }
 
-fn export(sel: &RunSelector, out: &std::path::Path, theme: &Theme) -> Result<(), String> {
+fn export(sel: &RunSelector, out: &std::path::Path, theme: &Theme) -> Result<()> {
     let ws = workspace()?;
-    let dir = record::locate::resolve(&ws, sel).map_err(|e| e.to_string())?;
-    record::portable::export(&dir, out).map_err(|e| e.to_string())?;
+    let dir = record::locate::resolve(&ws, sel)?;
+    record::portable::export(&dir, out)?;
     let f =
         Fields::new().text("src", dir.display().to_string()).text("out", out.display().to_string());
     print(row::EXPORTED, f, theme);
     Ok(())
 }
 
-fn prune(theme: &Theme) -> Result<(), String> {
+fn prune(theme: &Theme) -> Result<()> {
     let ws = workspace()?;
     let deleted = record::retention::gc(&ws, record::retention::RetentionPolicy::default());
     print(row::PRUNED, Fields::new().text("n", thousands(deleted as u64)), theme);

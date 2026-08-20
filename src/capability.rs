@@ -246,13 +246,13 @@ fn lift<T, E: std::fmt::Display>(
 
 /// One piece of a multi-part capability: `Ok(None)` present, `Ok(Some(name))` missing,
 /// `Err` unreadable
-type Piece = Result<Option<String>, String>;
+type Piece = Result<Option<String>, crate::error::PipelineError>;
 
 fn piece(name: &str, found: Result<bool, impl std::fmt::Display>) -> Piece {
     match found {
         Ok(true) => Ok(None),
         Ok(false) => Ok(Some(name.to_string())),
-        Err(e) => Err(format!("reading {name}: {e}")),
+        Err(e) => Err(format!("reading {name}: {e}").into()),
     }
 }
 
@@ -264,7 +264,7 @@ fn parts(pieces: impl IntoIterator<Item = Piece>, whole: &str) -> Finding {
         match p {
             Ok(None) => {}
             Ok(Some(name)) => missing.push(name),
-            Err(why) => return Finding::Unknown(why),
+            Err(why) => return Finding::Unknown(why.to_string()),
         }
     }
     match missing.is_empty() {
@@ -375,11 +375,11 @@ async fn storage(client: &Client) -> Finding {
     match crate::storage_class::discover(client).await {
         Ok(options) => match crate::storage_class::select(&options, driver.as_deref()) {
             Ok(c) => Finding::Present(format!("{} ({})", c.class_name, c.provisioner)),
-            Err(why) => Finding::Absent(why),
+            Err(why) => Finding::Absent(why.to_string()),
         },
         // `discover` fails only on a failed list, indistinguishable from a cluster that
         // has nothing.
-        Err(why) => Finding::Unknown(why),
+        Err(why) => Finding::Unknown(why.to_string()),
     }
 }
 
@@ -410,7 +410,7 @@ async fn expandable(client: &Client) -> Finding {
     use k8s_openapi::api::storage::v1::StorageClass;
     let chosen = match crate::storage_class::selected(client).await {
         Ok(c) => c,
-        Err(why) => return Finding::Unknown(why),
+        Err(why) => return Finding::Unknown(why.to_string()),
     };
     let read = Api::<StorageClass>::all(client.clone()).get_opt(&chosen.class_name).await;
     lift(
@@ -585,8 +585,7 @@ fn side_load_path() -> Finding {
         Err(e) => return Finding::Absent(cause(e)),
         Ok(nodes) if nodes.is_empty() => {
             return Finding::Absent(format!(
-                "{engine} holds the nodes but `kind get nodes --name {cluster}` resolves none \
-                 (kind cannot drive this engine)"
+                "{engine} nodes invisible to `kind get nodes --name {cluster}`"
             ));
         }
         Ok(_) => {}
@@ -619,7 +618,7 @@ async fn metrics(client: &Client) -> Finding {
             Ok(Found::Ready(_)) => Ok(None),
             Ok(Found::NotReady(at)) => Ok(Some(format!("{at} (not Ready)"))),
             Ok(Found::Nothing) => Ok(Some(app.to_string())),
-            Err(e) => Err(format!("listing {app} pods: {e}")),
+            Err(e) => Err(format!("listing {app} pods: {e}").into()),
         });
     }
     parts(pieces, "prometheus, pyroscope, grafana")

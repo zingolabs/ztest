@@ -110,6 +110,79 @@ pub struct Profile {
     pub class: ClusterClass,
 }
 
+/// Cluster-profile failures.
+///
+/// Messages are fragments, not sentences: a developer reads them under a `ztest cluster: `
+/// prefix, and the remedy for nearly every one is the subcommand they just typed
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("parse {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("serialize: {0}")]
+    Serialize(#[source] toml::ser::Error),
+
+    #[error("read kubeconfig: {0}")]
+    Kubeconfig(#[source] kube::config::KubeconfigError),
+
+    #[error("{path}: no current-context")]
+    NoCurrentContext { path: String },
+
+    #[error("{path}: no context `{context}`")]
+    NoContext { path: String, context: String },
+
+    #[error("{path}: parse `{REGISTRY_EXTENSION}`: {source}")]
+    RegistryExtension {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("no profile `{name}`; known: {known}")]
+    NoProfile { name: String, known: String },
+
+    #[error("no kube-context `{context}`; known: {known}")]
+    UnknownContext { context: String, known: String },
+
+    #[error("profile `{name}`: {source}")]
+    Profile {
+        name: String,
+        #[source]
+        source: ProfileError,
+    },
+}
+
+/// A profile whose `class` disagrees with the addresses it carries
+#[derive(Debug, thiserror::Error)]
+pub enum ProfileError {
+    #[error("local profile sets push/pull")]
+    LocalHasRegistry,
+    #[error("local profile needs a `kind-` context")]
+    LocalNeedsKind,
+    #[error("remote profile has no push address")]
+    RemoteNeedsPush,
+    #[error("remote profile names a `kind-` context")]
+    RemoteHasKind,
+}
+
 impl Profile {
     /// Local profile for a kind cluster (kind's context is always `kind-<cluster>`)
     pub fn local(kind_cluster: &str) -> Profile {
@@ -127,20 +200,23 @@ impl Profile {
 
     /// Kubeconfig → profile: `current-context` + any `ztest.io/registry` extension
     /// on that context's cluster (no extension → local)
-    pub fn from_kubeconfig(path: &Path) -> Result<Profile, String> {
+    pub fn from_kubeconfig(path: &Path) -> Result<Profile, ConfigError> {
         let display = path.display();
-        let config = Kubeconfig::read_from(path).map_err(|e| format!("read {display}: {e}"))?;
+        let config = Kubeconfig::read_from(path).map_err(ConfigError::Kubeconfig)?;
         let context = config
             .current_context
             .clone()
-            .ok_or_else(|| format!("{display}: no current-context"))?;
+            .ok_or_else(|| ConfigError::NoCurrentContext { path: display.to_string() })?;
         let cluster_name = config
             .contexts
             .iter()
             .find(|c| c.name == context)
             .and_then(|c| c.context.as_ref())
             .map(|c| c.cluster.clone())
-            .ok_or_else(|| format!("{display}: no context `{context}`"))?;
+            .ok_or_else(|| ConfigError::NoContext {
+                path: display.to_string(),
+                context: context.clone(),
+            })?;
         let registry = config
             .clusters
             .iter()
@@ -150,7 +226,10 @@ impl Profile {
             .and_then(|exts| exts.iter().find(|e| e.name == REGISTRY_EXTENSION))
             .map(|e| serde_json::from_value::<RegistrySpec>(e.extension.clone()))
             .transpose()
-            .map_err(|e| format!("{display}: parse `{REGISTRY_EXTENSION}`: {e}"))?;
+            .map_err(|source| ConfigError::RegistryExtension {
+                path: display.to_string(),
+                source,
+            })?;
 
         // kind contexts are always `kind-<cluster>` = the whole class distinction
         // (on this machine → node images side-loaded, not pushed)
@@ -173,19 +252,17 @@ impl Profile {
     }
 
     /// Reject a `class` disagreeing with the addresses it needs
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ProfileError> {
         match self.class {
             ClusterClass::Local if self.push.is_some() || self.pull.is_some() => {
-                Err("a `local` profile must not set push/pull".to_string())
+                Err(ProfileError::LocalHasRegistry)
             }
             ClusterClass::Local if self.kind_cluster().is_none() => {
-                Err("a `local` profile needs a kind context (`kind-<cluster>`)".to_string())
+                Err(ProfileError::LocalNeedsKind)
             }
-            ClusterClass::Remote if self.push.is_none() => {
-                Err("a `remote` profile needs a push address".to_string())
-            }
+            ClusterClass::Remote if self.push.is_none() => Err(ProfileError::RemoteNeedsPush),
             ClusterClass::Remote if self.kind_cluster().is_some() => {
-                Err("a `remote` profile cannot name a kind context".to_string())
+                Err(ProfileError::RemoteHasKind)
             }
             _ => Ok(()),
         }
@@ -231,23 +308,24 @@ fn config_path() -> PathBuf {
 }
 
 /// Missing file → empty config
-pub fn load() -> Result<Config, String> {
+pub fn load() -> Result<Config, ConfigError> {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(body) => toml::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display())),
+        Ok(body) => toml::from_str(&body).map_err(|source| ConfigError::Parse { path, source }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(e) => Err(format!("read {}: {e}", path.display())),
+        Err(source) => Err(ConfigError::Read { path, source }),
     }
 }
 
 impl Config {
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&self) -> Result<(), ConfigError> {
         let path = config_path();
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .map_err(|source| ConfigError::Write { path: dir.to_path_buf(), source })?;
         }
-        let body = toml::to_string_pretty(self).map_err(|e| format!("serialize: {e}"))?;
-        std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))
+        let body = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
+        std::fs::write(&path, body).map_err(|source| ConfigError::Write { path, source })
     }
 }
 
@@ -261,18 +339,16 @@ impl Config {
 ///
 /// # Safety
 /// No other thread may have started: `set_var` is not thread-safe.
-pub unsafe fn activate(flag: Option<&str>) -> Result<Option<String>, String> {
+pub unsafe fn activate(flag: Option<&str>) -> Result<Option<String>, ConfigError> {
     let cfg = load()?;
     let Some(name) = flag.map(str::to_string).or_else(|| cfg.current.clone()) else {
         return Ok(None);
     };
-    let profile = cfg.clusters.get(&name).ok_or_else(|| {
-        format!(
-            "no cluster profile `{name}`. Known: {}. Add one with `ztest cluster add`.",
-            listed(cfg.clusters.keys().map(String::as_str))
-        )
+    let profile = cfg.clusters.get(&name).ok_or_else(|| ConfigError::NoProfile {
+        name: name.clone(),
+        known: listed(cfg.clusters.keys().map(String::as_str)),
     })?;
-    profile.validate().map_err(|e| format!("cluster profile `{name}`: {e}"))?;
+    profile.validate().map_err(|source| ConfigError::Profile { name: name.clone(), source })?;
 
     // Apply first: it may set KUBECONFIG, which verify_context then reads
     unsafe { apply(profile, flag.is_some()) };
@@ -319,19 +395,18 @@ fn listed<'a>(items: impl Iterator<Item = &'a str>) -> String {
     if v.is_empty() { "(none)".to_string() } else { v.join(", ") }
 }
 
-fn verify_context(context: &str) -> Result<(), String> {
+fn verify_context(context: &str) -> Result<(), ConfigError> {
     if crate::cluster_config::in_cluster() {
         return Ok(());
     }
-    let config = Kubeconfig::read()
-        .map_err(|e| format!("reading kubeconfig to verify context `{context}`: {e}"))?;
+    let config = Kubeconfig::read().map_err(ConfigError::Kubeconfig)?;
     if config.contexts.iter().any(|c| c.name == context) {
         return Ok(());
     }
-    Err(format!(
-        "kube-context `{context}` is not in your kubeconfig. Available: {}",
-        listed(config.contexts.iter().map(|c| c.name.as_str()))
-    ))
+    Err(ConfigError::UnknownContext {
+        context: context.to_string(),
+        known: listed(config.contexts.iter().map(|c| c.name.as_str())),
+    })
 }
 
 /// Targeted kube-context: [`KUBE_CONTEXT_ENV`], else the kubeconfig's

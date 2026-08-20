@@ -129,7 +129,7 @@ pub struct Rel {
 pub enum CorrectnessError {
     #[error("{label}: {count} oracle violation(s); first: {first}")]
     Violations { label: String, count: usize, first: String },
-    #[error("{label}: {errors} request error(s) across {attempts} attempt(s)")]
+    #[error("{label}: {errors}/{attempts} requests errored")]
     Errors { label: String, errors: u64, attempts: u64 },
 }
 
@@ -137,9 +137,9 @@ pub enum CorrectnessError {
 /// is not evidence of agreement)
 #[derive(Debug, thiserror::Error)]
 pub enum ParityError {
-    #[error("parity failed ({label}): {count} height(s) diverged; first: {first}")]
+    #[error("parity {label}: {count} heights diverged; first {first}")]
     Diverged { label: String, count: usize, first: String },
-    #[error("{label}: assert_parity needs a differential run (LoadDriver::pair)")]
+    #[error("{label}: assert_parity needs LoadDriver::pair")]
     NotDifferential { label: String },
 }
 
@@ -147,7 +147,7 @@ pub enum ParityError {
 pub enum RelError {
     #[error("relative budget breached ({label}): {reasons:?}")]
     Breached { label: String, reasons: Vec<String> },
-    #[error("{label}: assert_relative needs a differential run (LoadDriver::pair)")]
+    #[error("{label}: assert_relative needs LoadDriver::pair")]
     NotDifferential { label: String },
 }
 
@@ -326,7 +326,7 @@ mod tests {
         let err = report(side(), Some(b)).assert_correct().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("[backend B]"), "{msg}");
-        assert!(msg.contains("3 request error"), "{msg}");
+        assert!(msg.contains("3/13 requests errored"), "{msg}");
     }
 
     #[test]

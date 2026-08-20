@@ -483,7 +483,7 @@ fn restore_public(
         .opts()
         .version
         .parse::<crate::regtest_conf::Semver>()
-        .expect("zebrad version on Validator builder must be a valid semver");
+        .expect("zebrad version must be semver");
     let toml = crate::public_conf::public_zebrad_conf(
         network,
         version,

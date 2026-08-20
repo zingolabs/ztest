@@ -110,10 +110,11 @@ pub struct ChainSnapshot {
 ///
 /// For `ztest snapshot warm`, handed paths on a command line and so having no
 /// [`artifact!`](macro@crate::artifact) expansion to read them off
-pub fn identity_of(archive: &std::path::Path) -> Result<(String, crate::storage::Digest), String> {
-    let name = archive
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| format!("{} has no filename", archive.display()))?;
+pub fn identity_of(
+    archive: &std::path::Path,
+) -> Result<(String, crate::storage::Digest), crate::storage::StorageError> {
+    let name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| {
+        crate::storage::StorageError::NoFilename { path: archive.display().to_string() }
+    })?;
     Ok((name, crate::storage::digest_of(archive)?))
 }

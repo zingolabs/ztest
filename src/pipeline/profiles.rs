@@ -100,7 +100,7 @@ impl Scan {
 }
 
 /// Cargo workspace containing cwd.
-pub fn scan() -> Result<Scan, String> {
+pub fn scan() -> Result<Scan, crate::error::PipelineError> {
     let meta = cargo_metadata()?;
     let workspace_root = meta
         .get("workspace_root")
@@ -328,7 +328,7 @@ fn git_toplevel(from: &Path) -> Option<PathBuf> {
 
 /// - `--no-deps`: skips resolution (seconds → ~20ms) + restricts `packages` to workspace members
 /// - Not `remote_compile::cargo_metadata` (that one needs the full graph for `SourceLayout`)
-fn cargo_metadata() -> Result<serde_json::Value, String> {
+fn cargo_metadata() -> Result<serde_json::Value, crate::error::PipelineError> {
     let out = std::process::Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .stderr(Stdio::piped())
@@ -337,9 +337,9 @@ fn cargo_metadata() -> Result<serde_json::Value, String> {
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let detail = err.lines().next().unwrap_or("cargo metadata failed");
-        return Err(format!("cargo metadata failed: {detail}"));
+        return Err(format!("cargo metadata failed: {detail}").into());
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("parse cargo metadata: {e}"))
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("parse cargo metadata: {e}").into())
 }
 
 fn git_branch(root: &Path) -> Option<String> {

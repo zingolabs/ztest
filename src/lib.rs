@@ -88,7 +88,7 @@ pub use crate::component::{
     Mem, Resources, Validator, Wallet,
 };
 pub use crate::env::{SharedVolume, TestEnv};
-pub use crate::error::{EnvError, RpcError};
+pub use crate::error::{EnvError, PipelineError, RpcError};
 pub use crate::handles::indexer::{
     BlockHash, BlockHeight, CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo,
     RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, TreeState, TxId, ZatBalance,

@@ -205,13 +205,12 @@ pub fn node_summary(nodes: &[Node]) -> NodeSummary {
 
 /// Sole source of a [`ClusterCapacity`] — probe banner, scheduler ceiling and ledger
 /// all admit against this one reading
-pub async fn probe_capacity(client: &Client) -> Result<ClusterCapacity, String> {
+pub async fn probe_capacity(client: &Client) -> Result<ClusterCapacity, kube::Error> {
     let lp = ListParams::default();
     let (nodes_api, pods_api, pvcs_api): (Api<Node>, Api<Pod>, Api<PersistentVolumeClaim>) =
         (Api::all(client.clone()), Api::all(client.clone()), Api::all(client.clone()));
     let (nodes, pods, pvcs) =
-        tokio::try_join!(nodes_api.list(&lp), pods_api.list(&lp), pvcs_api.list(&lp))
-            .map_err(|e| format!("probe cluster capacity: {e}"))?;
+        tokio::try_join!(nodes_api.list(&lp), pods_api.list(&lp), pvcs_api.list(&lp))?;
     Ok(capacity_from(&nodes.items, &pods.items, &pvcs.items))
 }
 

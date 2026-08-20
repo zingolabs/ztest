@@ -62,37 +62,20 @@ fn min_viable() -> Resources {
     QosClass::Basic.profile().footprint
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
-    CapacityTimeout {
-        waited: Duration,
-        headroom: Resources,
-    },
-    /// Provisioned by `ztest cluster setup`, never by a run → the cluster isn't set up
-    MetaNamespaceMissing,
-    Kube(String),
-}
+    /// `headroom` is the whole diagnosis: it says how far short the cluster is, which the
+    /// "try again when they finish" this used to append did not
+    #[error("capacity held by other runs: {}m cpu / {} MiB free after {}s",
+            headroom.cpu_milli, headroom.mem_bytes / MIB, waited.as_secs())]
+    CapacityTimeout { waited: Duration, headroom: Resources },
 
-impl std::fmt::Display for LedgerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LedgerError::CapacityTimeout { waited, headroom } => write!(
-                f,
-                "cluster capacity is reserved by other ztest runs: after {}s only \
-                 {}m CPU / {} MiB free — try again when they finish",
-                waited.as_secs(),
-                headroom.cpu_milli,
-                headroom.mem_bytes / MIB,
-            ),
-            LedgerError::MetaNamespaceMissing => write!(
-                f,
-                "the {META_NAMESPACE} namespace does not exist — run `ztest cluster setup` \
-                 (with a cluster-admin kubeconfig) to provision the cross-run \
-                 reservation ledger"
-            ),
-            LedgerError::Kube(e) => write!(f, "reservation ledger: {e}"),
-        }
-    }
+    /// Provisioned by `ztest cluster setup`, never by a run → the cluster isn't set up
+    #[error("no {META_NAMESPACE} namespace; run `ztest cluster setup`")]
+    MetaNamespaceMissing,
+
+    #[error("reservation ledger: {0}")]
+    Kube(String),
 }
 
 /// One live reservation = one `coordination.k8s.io/Lease`

@@ -73,7 +73,7 @@ pub async fn compile_on_cluster(
     run_id: &str,
     compile_out: Option<CompileOut<'_>>,
     on_phase: Option<PhaseSink<'_>>,
-) -> Result<RemoteCompileOutcome, String> {
+) -> Result<RemoteCompileOutcome, crate::error::PipelineError> {
     let mut on_phase = on_phase;
     let mut emit = |ev: Phase<'_>| {
         if let Some(cb) = on_phase.as_deref_mut() {
@@ -127,7 +127,8 @@ pub async fn compile_on_cluster(
         return Err(format!(
             "on-cluster runner build failed (exit {code}):\n{}",
             tail(&tail_out, 40)
-        ));
+        )
+        .into());
     }
     emit(Phase::Done { label: "runner image built + pushed", dur: t.elapsed() });
 
@@ -146,10 +147,7 @@ pub async fn compile_on_cluster(
     );
     let (_o, inv_err, inv_code) = exec_capture(&api, pod, &inv_cmd).await?;
     if inv_code != 0 {
-        return Err(format!(
-            "on-cluster inventory export failed (exit {inv_code}):\n{}",
-            tail(&inv_err, 40)
-        ));
+        return Err(format!("inventory export exited {inv_code}:\n{}", tail(&inv_err, 40)).into());
     }
     let local = oc_cp_from_pod(pod, &inv_dir)?;
     let list_json = std::fs::read_to_string(local.path().join("list.json"))
@@ -173,14 +171,14 @@ pub fn assemble_outcome(
     inventory: &str,
     ancestor: &Path,
     runner_image_ref: String,
-) -> Result<RemoteCompileOutcome, String> {
+) -> Result<RemoteCompileOutcome, crate::error::PipelineError> {
     let build = build::parse_list_summary(list_json.as_bytes())
         .map_err(|e| format!("parse nextest list: {e}"))?;
     let BuildOutcome::Ok { selected_binaries, .. } = &build else {
-        return Err("nextest list produced no selection".to_string());
+        return Err("nextest list produced no selection".into());
     };
     if selected_binaries.is_empty() {
-        return Err("nextest list selected no test binaries".to_string());
+        return Err("nextest list selected no test binaries".into());
     }
 
     let sections = split_dumps_by_name(inventory, selected_binaries)?;
@@ -191,7 +189,8 @@ pub fn assemble_outcome(
                 "inventory dump of {} failed (exit {rc}):\n{}",
                 bin.binary_id,
                 tail(&chunk, 40)
-            ));
+            )
+            .into());
         }
         let dumped = images::parse_inventory(&chunk)
             .map_err(|e| format!("parse inventory of {}: {e}", bin.binary_id))?;
@@ -244,7 +243,11 @@ fn buildctl_cmd(
 }
 
 /// Lands at `<ctx>/Dockerfile`, so the build need not locate it in the synced tree.
-async fn stage_dockerfile(api: &Api<Pod>, pod: &str, ctx_dir: &str) -> Result<(), String> {
+async fn stage_dockerfile(
+    api: &Api<Pod>,
+    pod: &str,
+    ctx_dir: &str,
+) -> Result<(), crate::error::PipelineError> {
     // Heredoc keeps the multi-line, special-char Dockerfile intact through one `sh -c`
     let cmd = format!(
         "mkdir -p {dir}\ncat > {dir}/Dockerfile <<'ZTEST_DF_EOF'\n{df}\nZTEST_DF_EOF\n",
@@ -253,12 +256,12 @@ async fn stage_dockerfile(api: &Api<Pod>, pod: &str, ctx_dir: &str) -> Result<()
     );
     let (_o, err, code) = exec_capture(api, pod, &cmd).await?;
     if code != 0 {
-        return Err(format!("stage runner Dockerfile in pod:\n{}", tail(&err, 20)));
+        return Err(format!("stage runner Dockerfile in pod:\n{}", tail(&err, 20)).into());
     }
     Ok(())
 }
 
-fn oc_cp_from_pod(pod: &str, dir: &str) -> Result<TempDir, String> {
+fn oc_cp_from_pod(pod: &str, dir: &str) -> Result<TempDir, crate::error::PipelineError> {
     let local = TempDir::new("ztest-inv")?;
     let mut cmd = std::process::Command::new("oc");
     cmd.arg("cp");
@@ -282,7 +285,8 @@ fn oc_cp_from_pod(pod: &str, dir: &str) -> Result<TempDir, String> {
         return Err(format!(
             "oc cp of exported inventory failed:\n{}",
             tail(&String::from_utf8_lossy(&out.stderr), 40)
-        ));
+        )
+        .into());
     }
     Ok(local)
 }
@@ -291,7 +295,7 @@ fn oc_cp_from_pod(pod: &str, dir: &str) -> Result<TempDir, String> {
 pub struct TempDir(PathBuf);
 
 impl TempDir {
-    pub fn new(tag: &str) -> Result<Self, String> {
+    pub fn new(tag: &str) -> Result<Self, crate::error::PipelineError> {
         let base = std::env::temp_dir().join(format!("{tag}-{:08x}", rand::random::<u32>()));
         std::fs::create_dir_all(&base).map_err(|e| format!("create temp dir: {e}"))?;
         Ok(Self(base))
@@ -342,7 +346,7 @@ async fn exec_streamed(
     pod: &str,
     cmd: &str,
     on_line: Option<LineSink<'_>>,
-) -> Result<(String, String, i32), String> {
+) -> Result<(String, String, i32), crate::error::PipelineError> {
     use tokio::io::AsyncBufReadExt as _;
 
     let ap = AttachParams::default()
@@ -400,7 +404,7 @@ async fn exec_tty(
     cmd: &str,
     size: (u16, u16),
     on_bytes: ByteSink<'_>,
-) -> Result<(String, i32), String> {
+) -> Result<(String, i32), crate::error::PipelineError> {
     let ap = AttachParams::default()
         .container(BUILDKIT_CONTAINER)
         .stdin(false)
@@ -427,7 +431,7 @@ async fn exec_tty(
                     on_bytes(visible_prefix(&buf[..n]));
                     out.push_str(&String::from_utf8_lossy(&buf[..n]));
                 }
-                Err(e) => return Err(format!("read exec tty stdout: {e}")),
+                Err(e) => return Err(format!("read exec tty stdout: {e}").into()),
             }
         }
     }
@@ -453,7 +457,7 @@ async fn exec_capture(
     api: &Api<Pod>,
     pod: &str,
     cmd: &str,
-) -> Result<(String, String, i32), String> {
+) -> Result<(String, String, i32), crate::error::PipelineError> {
     exec_streamed(api, pod, cmd, None).await
 }
 
@@ -483,7 +487,7 @@ fn split_exit_sentinel(out: &str) -> (String, i32) {
 fn split_dumps_by_name(
     out: &str,
     selected: &[SelectedBinary],
-) -> Result<Vec<(String, i32)>, String> {
+) -> Result<Vec<(String, i32)>, crate::error::PipelineError> {
     use std::collections::HashMap;
     let mut by_name: HashMap<String, (String, i32)> = HashMap::new();
     let mut cur: Option<(String, String)> = None;
@@ -503,7 +507,7 @@ fn split_dumps_by_name(
                 Some((n, buf)) if n == name => {
                     by_name.insert(name, (buf, rc));
                 }
-                _ => return Err(format!("mismatched dump markers at {name:?}")),
+                _ => return Err(format!("mismatched dump markers at {name:?}").into()),
             }
         } else if let Some((_, buf)) = cur.as_mut() {
             buf.push_str(line);
@@ -518,9 +522,9 @@ fn split_dumps_by_name(
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            by_name
-                .remove(&name)
-                .ok_or_else(|| format!("inventory export missing a block for binary {name:?}"))
+            by_name.remove(&name).ok_or_else(|| {
+                crate::error::PipelineError(format!("inventory: no block for {name:?}"))
+            })
         })
         .collect()
 }
@@ -540,7 +544,7 @@ pub struct SourceLayout {
 }
 
 impl SourceLayout {
-    pub fn resolve() -> Result<Self, String> {
+    pub fn resolve() -> Result<Self, crate::error::PipelineError> {
         let meta = cargo_metadata()?;
         let workspace_root =
             meta["workspace_root"].as_str().ok_or("cargo metadata: no workspace_root")?;
@@ -565,11 +569,7 @@ impl SourceLayout {
         }
         let ancestor = common_ancestor(&repos).ok_or("cannot derive a common source ancestor")?;
         if ancestor.parent().is_none() || ancestor == Path::new("/home") {
-            return Err(format!(
-                "local source spans too wide a tree (common ancestor {}); a path \
-                 dependency likely points outside the project",
-                ancestor.display()
-            ));
+            return Err(format!("source ancestor too wide: {}", ancestor.display()).into());
         }
         let workspace_rel = Path::new(workspace_root)
             .strip_prefix(&ancestor)
@@ -581,7 +581,7 @@ impl SourceLayout {
 
 /// Git repo root containing `dir` (`git rev-parse --show-toplevel`). Non-git `dir` = hard
 /// named error ([`ship_source`] enumerates via git, honouring each repo's `.gitignore`)
-fn git_repo_root(dir: &Path) -> Result<PathBuf, String> {
+fn git_repo_root(dir: &Path) -> Result<PathBuf, crate::error::PipelineError> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -590,10 +590,11 @@ fn git_repo_root(dir: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("run `git rev-parse` (is `git` on PATH?): {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "on-cluster compile needs the source in a git checkout, but {} is not in one:\n{}",
+            "{} is not in a git checkout:\n{}",
             dir.display(),
             tail(&String::from_utf8_lossy(&out.stderr), 5)
-        ));
+        )
+        .into());
     }
     Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim_end()))
 }
@@ -638,16 +639,16 @@ fn rehome_path(p: &Path, ancestor: &Path) -> PathBuf {
     }
 }
 
-fn cargo_metadata() -> Result<serde_json::Value, String> {
+fn cargo_metadata() -> Result<serde_json::Value, crate::error::PipelineError> {
     let out = std::process::Command::new("cargo")
         .args(["metadata", "--format-version", "1"])
         .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("run cargo metadata: {e}"))?;
     if !out.status.success() {
-        return Err("cargo metadata failed".to_string());
+        return Err("cargo metadata failed".into());
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("parse cargo metadata: {e}"))
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("parse cargo metadata: {e}").into())
 }
 
 fn common_ancestor(dirs: &BTreeSet<PathBuf>) -> Option<PathBuf> {
@@ -670,7 +671,7 @@ fn common_ancestor(dirs: &BTreeSet<PathBuf>) -> Option<PathBuf> {
 ///   context never sees a multi-GB payload, and a seed is addressed by its manifest
 /// - Total bounded by [`CONTEXT_MAX_BYTES`], offender-naming error (a silent multi-GB stall
 ///   reads as a hung cluster)
-fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, String> {
+fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, crate::error::PipelineError> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -698,7 +699,8 @@ fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, String> {
                 "git ls-files in {} failed:\n{}",
                 repo.display(),
                 tail(&String::from_utf8_lossy(&out.stderr), 20)
-            ));
+            )
+            .into());
         }
         let names: Vec<&[u8]> = out.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()).collect();
         for name in names {
@@ -726,10 +728,10 @@ fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, String> {
         }
     }
     if list.is_empty() {
-        return Err("no source files to ship (git ls-files returned nothing)".to_string());
+        return Err("git ls-files returned nothing".into());
     }
     if total > context_max_bytes() {
-        return Err(oversized_context(total, sized));
+        return Err(oversized_context(total, sized).into());
     }
 
     // `-T <file>` leaves tar's stdin free (feeding the list over stdin while `oc` drains
@@ -751,7 +753,11 @@ struct SourceStream {
     _tmp: TempDir,
 }
 
-fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), String> {
+fn ship_source(
+    src: &SourceLayout,
+    pod: &str,
+    ctx_dir: &str,
+) -> Result<(), crate::error::PipelineError> {
     let mut stream = spawn_source_tar(src)?;
     let tar_child = &mut stream.child;
     let tar_stdout = tar_child.stdout.take().expect("tar stdout is piped");
@@ -785,13 +791,15 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
         return Err(format!(
             "local `tar` of source failed ({tar_status}):\n{}",
             tail(&tar_err, 40)
-        ));
+        )
+        .into());
     }
     if !oc_out.status.success() {
         return Err(format!(
             "streaming source into the build pod failed:\n{}",
             tail(&String::from_utf8_lossy(&oc_out.stderr), 40)
-        ));
+        )
+        .into());
     }
     Ok(())
 }
@@ -799,7 +807,10 @@ fn ship_source(src: &SourceLayout, pod: &str, ctx_dir: &str) -> Result<(), Strin
 /// Same build context into a local dir, for the laptop-side bake
 /// ([`crate::pipeline::local_bake`]). Staged rather than handing `docker build` the source
 /// ancestor (what keeps gitignored payloads out — see [`spawn_source_tar`])
-pub fn extract_source_to(src: &SourceLayout, dest: &Path) -> Result<(), String> {
+pub fn extract_source_to(
+    src: &SourceLayout,
+    dest: &Path,
+) -> Result<(), crate::error::PipelineError> {
     let mut stream = spawn_source_tar(src)?;
     let tar_stdout = stream.child.stdout.take().expect("tar stdout is piped");
     let out = std::process::Command::new("tar")
@@ -812,13 +823,14 @@ pub fn extract_source_to(src: &SourceLayout, dest: &Path) -> Result<(), String> 
         .map_err(|e| format!("spawn local `tar -x`: {e}"))?;
     let status = stream.child.wait().map_err(|e| format!("wait for local `tar`: {e}"))?;
     if !status.success() {
-        return Err(format!("local `tar` of source failed ({status})"));
+        return Err(format!("local `tar` of source failed ({status})").into());
     }
     if !out.status.success() {
         return Err(format!(
             "staging the build context failed:\n{}",
             tail(&String::from_utf8_lossy(&out.stderr), 40)
-        ));
+        )
+        .into());
     }
     Ok(())
 }

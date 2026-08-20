@@ -34,9 +34,7 @@ impl FromStr for TestOutputDisplay {
             "immediate-final" => Ok(Self::ImmediateFinal),
             "final" => Ok(Self::Final),
             "never" => Ok(Self::Never),
-            other => Err(format!(
-                "invalid output display {other:?} (expected immediate, immediate-final, final, or never)"
-            )),
+            other => Err(format!("invalid output display {other:?}")),
         }
     }
 }

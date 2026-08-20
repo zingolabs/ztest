@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context as _, Result, anyhow};
 use dialoguer::Confirm;
 use k8s_openapi::api::core::v1::{Pod, PodStatus};
 use kube::Client;
@@ -67,7 +68,7 @@ pub enum Offer {
     Unrelated,
 }
 
-pub fn offer(report: &Report, non_interactive: bool, install: bool) -> Result<Offer, String> {
+pub fn offer(report: &Report, non_interactive: bool, install: bool) -> Result<Offer> {
     if !fixable_here(report) {
         return Ok(Offer::Unrelated);
     }
@@ -93,7 +94,7 @@ pub fn offer(report: &Report, non_interactive: bool, install: bool) -> Result<Of
         .with_prompt(format!("{GAP} — install csi-hostpath? (seed copies, no CoW)"))
         .default(false)
         .interact()
-        .map_err(|e| format!("confirmation prompt: {e}"))?;
+        .context("confirmation prompt")?;
     if !yes {
         let data = Fields::new()
             .text("mark", theme.chars.arrow)
@@ -130,7 +131,7 @@ fn repairs_the_gap(report: &Report) -> bool {
 ///
 /// - Every step a subprocess, sequential (setup CLI, nothing else in flight); only
 ///   [`deploy_driver`] runs anything alongside it
-pub async fn install(client: &Client) -> Result<(), String> {
+pub async fn install(client: &Client) -> Result<()> {
     for bin in TOOLS {
         which(bin)?;
     }
@@ -188,10 +189,7 @@ pub async fn install(client: &Client) -> Result<(), String> {
             root.join("kubernetes-latest")
         }
         Deploy::Unsupported => {
-            return Err(format!(
-                "csi-driver-host-path {HOSTPATH_REF} covers {window}, server is 1.{minor}; \
-                 pin an older HOSTPATH_REF"
-            ));
+            return Err(anyhow!("{HOSTPATH_REF} covers {window}, server is 1.{minor}"));
         }
     };
     deploy_driver(client, &deploy, &kubeconfig, &theme).await?;
@@ -224,13 +222,13 @@ async fn deploy_driver(
     deploy: &Path,
     kubeconfig: &Path,
     theme: &Theme,
-) -> Result<(), String> {
+) -> Result<()> {
     let script = deploy.join("deploy.sh");
     let mut child = tokio::process::Command::new(&script)
         .env("KUBECONFIG", kubeconfig)
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("spawn {}: {e}", script.display()))?;
+        .with_context(|| format!("spawn {}", script.display()))?;
     let stdout = child.stdout.take().expect("stdout piped");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let forwarder = tokio::spawn(forward(stdout, tx));
@@ -251,12 +249,12 @@ async fn deploy_driver(
     }
 
     match outcome {
-        Outcome::Stuck(why) => Err(why),
+        Outcome::Stuck(why) => Err(anyhow!("{why}")),
         Outcome::Exited(exited) => {
-            let status = exited.map_err(|e| format!("wait for deploy.sh: {e}"))?;
+            let status = exited.context("wait for deploy.sh")?;
             match status.success() {
                 true => Ok(()),
-                false => Err(format!("csi-hostpath deploy.sh failed ({status})")),
+                false => Err(anyhow!("csi-hostpath deploy.sh failed ({status})")),
             }
         }
     }
@@ -426,7 +424,7 @@ impl StatusLine {
 }
 
 /// kind's default `standard` (local-path) = no snapshots, no expansion → unnamed PVCs unusable
-fn make_default(kubeconfig: &Path) -> Result<(), String> {
+fn make_default(kubeconfig: &Path) -> Result<()> {
     let listed = output(Command::new("kubectl").env("KUBECONFIG", kubeconfig).args([
         "get",
         "storageclass",
@@ -456,20 +454,19 @@ fn controller_url() -> String {
 }
 
 /// Picks the deploy dir ([`DeployWindow`])
-fn server_minor(kubeconfig: &Path) -> Result<u32, String> {
+fn server_minor(kubeconfig: &Path) -> Result<u32> {
     let raw = output(
         Command::new("kubectl").env("KUBECONFIG", kubeconfig).args(["version", "-o", "json"]),
     )?;
-    let json: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("parse `kubectl version`: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&raw).context("parse `kubectl version`")?;
     let minor = json["serverVersion"]["minor"]
         .as_str()
-        .ok_or_else(|| "`kubectl version` reported no server minor".to_string())?;
+        .context("`kubectl version` reported no server minor")?;
     // Managed distributions suffix it ("29+")
     minor
         .trim_end_matches(|c: char| !c.is_ascii_digit())
         .parse()
-        .map_err(|_| format!("unparsable server minor `{minor}`"))
+        .with_context(|| format!("server minor `{minor}`"))
 }
 
 /// Kubernetes minors a release's `deploy/` names = what it was tested against.
@@ -489,11 +486,11 @@ enum Deploy {
 }
 
 impl DeployWindow {
-    fn read(root: &Path) -> Result<Self, String> {
+    fn read(root: &Path) -> Result<Self> {
         let entries = std::fs::read_dir(root)
-            .map_err(|e| format!("read {}: {e}", root.display()))?
+            .with_context(|| format!("read {}", root.display()))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read {}: {e}", root.display()))?;
+            .with_context(|| format!("read {}", root.display()))?;
         // Name-parsed, not is_dir(): every minor but the oldest is a symlink
         let minors: BTreeSet<u32> = entries
             .iter()
@@ -503,11 +500,7 @@ impl DeployWindow {
             })
             .collect();
         if minors.is_empty() {
-            return Err(format!(
-                "csi-driver-host-path {HOSTPATH_REF} names no Kubernetes minor under {}; \
-                 the pinned ref is not a driver checkout",
-                root.display()
-            ));
+            return Err(anyhow!("{HOSTPATH_REF}: no kubernetes minor under {}", root.display()));
         }
         Ok(Self(minors))
     }
@@ -539,7 +532,7 @@ impl std::fmt::Display for DeployWindow {
     }
 }
 
-fn minified_kubeconfig(work: &Path) -> Result<PathBuf, String> {
+fn minified_kubeconfig(work: &Path) -> Result<PathBuf> {
     let mut cmd = Command::new("kubectl");
     cmd.args(["config", "view", "--raw", "--minify"]);
     if let Some(ctx) = ztest::api::cluster_config::active_context() {
@@ -547,48 +540,48 @@ fn minified_kubeconfig(work: &Path) -> Result<PathBuf, String> {
     }
     let path = work.join("kubeconfig");
     std::fs::write(&path, output(&mut cmd)?)
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 
-fn kubectl(kubeconfig: &Path, args: &[&str]) -> Result<(), String> {
+fn kubectl(kubeconfig: &Path, args: &[&str]) -> Result<()> {
     run(Command::new("kubectl").env("KUBECONFIG", kubeconfig).args(args))
 }
 
-fn run(cmd: &mut Command) -> Result<(), String> {
-    let status = cmd.status().map_err(|e| format!("spawn {:?}: {e}", cmd.get_program()))?;
+fn run(cmd: &mut Command) -> Result<()> {
+    let status = cmd.status().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
     if !status.success() {
-        return Err(format!("{:?} failed ({status})", cmd.get_program()));
+        return Err(anyhow!("{:?} failed ({status})", cmd.get_program()));
     }
     Ok(())
 }
 
-fn output(cmd: &mut Command) -> Result<String, String> {
-    let out = cmd.output().map_err(|e| format!("spawn {:?}: {e}", cmd.get_program()))?;
+fn output(cmd: &mut Command) -> Result<String> {
+    let out = cmd.output().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
     if !out.status.success() {
-        return Err(format!(
+        return Err(anyhow!(
             "{:?} failed ({}): {}",
             cmd.get_program(),
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    String::from_utf8(out.stdout).map_err(|e| format!("non-UTF-8 output: {e}"))
+    String::from_utf8(out.stdout).context("non-UTF-8 output")
 }
 
-fn which(bin: &str) -> Result<(), String> {
+fn which(bin: &str) -> Result<()> {
     ztest::api::on_path(bin)
         .then_some(())
-        .ok_or_else(|| format!("`{bin}` not on PATH; needed to install csi-hostpath"))
+        .with_context(|| format!("`{bin}` not on PATH; needed to install csi-hostpath"))
 }
 
 /// Scratch dir, removed on drop (`tempfile` = wallet-feature-gated)
 struct WorkDir(PathBuf);
 
 impl WorkDir {
-    fn new() -> Result<Self, String> {
+    fn new() -> Result<Self> {
         let path = std::env::temp_dir().join(format!("ztest-csi-hostpath-{}", std::process::id()));
-        std::fs::create_dir_all(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        std::fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
         Ok(Self(path))
     }
 
@@ -647,7 +640,7 @@ mod tests {
     fn a_deploy_dir_holding_no_minor_is_a_named_error() {
         let root = std::env::temp_dir().join(format!("ztest-csi-empty-{}", std::process::id()));
         std::fs::create_dir_all(root.join("util")).unwrap();
-        assert!(DeployWindow::read(&root).unwrap_err().contains("names no Kubernetes minor"));
+        assert!(DeployWindow::read(&root).unwrap_err().to_string().contains("no kubernetes minor"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

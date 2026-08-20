@@ -24,7 +24,9 @@ const DEFAULT_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-cl
 
 /// Discover snapshot-capable StorageClasses: list both kinds, keep the classes a
 /// snapshot driver backs
-pub async fn discover(client: &kube::Client) -> Result<Vec<StorageOption>, String> {
+pub async fn discover(
+    client: &kube::Client,
+) -> Result<Vec<StorageOption>, crate::error::PipelineError> {
     let sc_api: Api<StorageClass> = Api::all(client.clone());
     let classes =
         sc_api.list(&Default::default()).await.map_err(|e| format!("list StorageClasses: {e}"))?;
@@ -47,12 +49,7 @@ pub async fn discover(client: &kube::Client) -> Result<Vec<StorageOption>, Strin
             .collect(),
         // 403 = this caller can't see snapshot classes (RBAC), not "cluster has none"
         Err(kube::Error::Api(e)) if e.code == 403 => {
-            return Err(format!(
-                "cannot list VolumeSnapshotClasses at cluster scope (forbidden: {}). Run \
-                 `ztest cluster setup` with a cluster-admin kubeconfig, not the ztest run \
-                 ServiceAccount.",
-                e.message
-            ));
+            return Err(format!("list VolumeSnapshotClasses forbidden: {}", e.message).into());
         }
         // Anything else (e.g. snapshot CRDs absent) = the cluster cannot snapshot
         Err(_) => Vec::new(),
@@ -99,19 +96,16 @@ fn snapshot_capable(
 pub fn select<'a>(
     options: &'a [StorageOption],
     driver: Option<&str>,
-) -> Result<&'a StorageOption, String> {
+) -> Result<&'a StorageOption, crate::error::PipelineError> {
     match driver {
         Some(d) => options.iter().find(|o| o.provisioner == d).ok_or_else(|| {
-            format!(
-                "no snapshot-capable StorageClass uses driver `{d}`. Available: {}",
-                available(options)
-            )
+            format!("no snapshot StorageClass on driver `{d}`; have: {}", available(options)).into()
         }),
         None => options
             .iter()
             .find(|o| o.is_default)
             .or_else(|| options.first())
-            .ok_or_else(|| "no snapshot-capable StorageClass on this cluster".to_string()),
+            .ok_or_else(|| "no snapshot-capable StorageClass".into()),
     }
 }
 
@@ -124,7 +118,9 @@ static SELECTED: tokio::sync::OnceCell<StorageOption> = tokio::sync::OnceCell::c
 const CLASS_OVERRIDE_ENV: &str = "ZTEST_STORAGE_CLASS";
 const SNAPSHOT_CLASS_OVERRIDE_ENV: &str = "ZTEST_VOLUMESNAPSHOT_CLASS";
 
-pub async fn selected(client: &kube::Client) -> Result<&'static StorageOption, String> {
+pub async fn selected(
+    client: &kube::Client,
+) -> Result<&'static StorageOption, crate::error::PipelineError> {
     SELECTED
         .get_or_try_init(|| async {
             if let (Ok(class_name), Ok(snapshot_class)) =
@@ -257,8 +253,8 @@ mod tests {
     fn an_absent_driver_is_an_error_not_a_fallback() {
         let opts = vec![opt("csi-hostpath-sc", "hostpath.csi.k8s.io", true)];
         let err = select(&opts, Some("topolvm.io")).expect_err("must not fall back");
-        assert!(err.contains("topolvm.io"), "names what was asked: {err}");
-        assert!(err.contains("hostpath.csi.k8s.io"), "names what exists: {err}");
+        assert!(err.0.contains("topolvm.io"), "names what was asked: {err}");
+        assert!(err.0.contains("hostpath.csi.k8s.io"), "names what exists: {err}");
     }
 
     #[test]

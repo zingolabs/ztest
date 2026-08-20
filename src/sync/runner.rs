@@ -300,7 +300,15 @@ impl SyncEngine {
 
         if let Err(e) = self.check_required_work().await {
             let _ = self.subject.stop().await;
-            return self.finish(SyncVerdict::Errored, Vec::new(), Vec::new(), Some(e), 0, 0, None);
+            return self.finish(
+                SyncVerdict::Errored,
+                Vec::new(),
+                Vec::new(),
+                Some(e.to_string()),
+                0,
+                0,
+                None,
+            );
         }
 
         let started = Instant::now();
@@ -360,7 +368,7 @@ impl SyncEngine {
                     if progress_errors.is_power_of_two() {
                         tracing::warn!(
                             consecutive = progress_errors,
-                            "sync: progress read failed; no snapshot captured this tick: {e}"
+                            "progress read failed; no snapshot this tick: {e}"
                         );
                     }
                     continue;
@@ -587,7 +595,7 @@ impl SyncEngine {
     ///   missing series otherwise surfaces as a mid-run panic naming no series
     /// - Subject and harness agree on these names by string only (nothing cross-checks the
     ///   component's exporter against the families this backend reads)
-    async fn check_required_work(&mut self) -> Result<(), String> {
+    async fn check_required_work(&mut self) -> Result<(), crate::error::PipelineError> {
         if self.required_work.is_empty() {
             return Ok(());
         }
@@ -612,12 +620,13 @@ impl SyncEngine {
             if missing.is_empty() {
                 return Ok(());
             }
-            return Err(self.unmeasured_work_error(&missing, measured));
+            return Err(self.unmeasured_work_error(&missing, measured).into());
         }
         Err(format!(
-            "could not read the subject's work counters in {WORK_PREFLIGHT_ATTEMPTS} attempts: {}",
+            "work counters unreadable in {WORK_PREFLIGHT_ATTEMPTS} attempts: {}",
             last_err.unwrap_or_else(|| "no error reported".to_owned()),
-        ))
+        )
+        .into())
     }
 
     fn unmeasured_work_error(&self, missing: &[Op], measured: OpSet) -> String {

@@ -81,7 +81,10 @@ pub struct PodLoad {
 /// - Sorted by name: the panel's row order must not shuffle between samples
 /// - A pod present in one list and not the other is kept/skipped rather than erroring
 ///   (the two reads race a starting pod, and half a reading beats none)
-pub async fn sample(client: &Client, namespace: &str) -> Result<Vec<PodLoad>, String> {
+pub async fn sample(
+    client: &Client,
+    namespace: &str,
+) -> Result<Vec<PodLoad>, crate::error::PipelineError> {
     let metrics: Api<PodMetrics> = Api::namespaced(client.clone(), namespace);
     let usage = metrics
         .list(&ListParams::default())

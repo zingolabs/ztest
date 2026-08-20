@@ -348,7 +348,7 @@ fn select_executor(
     work_rt: &tokio::runtime::Runtime,
     input: &EngineInput<'_>,
     env: EngineEnv,
-) -> Result<std::sync::Arc<dyn local_runner::Executor>, String> {
+) -> Result<std::sync::Arc<dyn local_runner::Executor>, crate::error::PipelineError> {
     // Preflight image (remote runs) wins over the manual env override; neither → local
     let from_preflight = input.runner_image.clone();
     let image = match from_preflight

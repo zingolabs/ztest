@@ -73,9 +73,7 @@ impl IndexerConfig for LightwalletdBackend {
             IndexerMode::Regtest => {}
             other => {
                 return Err(EnvError::Config {
-                    reason: format!(
-                        "lightwalletd supports only regtest in ztest today (got {other:?})"
-                    ),
+                    reason: format!("lightwalletd: regtest only (got {other:?})"),
                 });
             }
         }

@@ -215,7 +215,7 @@ pub async fn scrape(
     http: &reqwest::Client,
     base: &str,
     timeout: Duration,
-) -> Result<Exposition, String> {
+) -> Result<Exposition, crate::error::PipelineError> {
     let text = http
         .get(format!("{}/metrics", base.trim_end_matches('/')))
         .timeout(timeout)

@@ -89,16 +89,36 @@ pub fn report_cm_namespace() -> &'static str {
     crate::naming::OBS_NAMESPACE
 }
 
+/// Lookups against a detached sync's cluster objects
+#[derive(Debug, thiserror::Error)]
+pub enum SyncLookupError {
+    #[error("get pod {pod}: {source}")]
+    GetPod {
+        pod: String,
+        #[source]
+        source: kube::Error,
+    },
+
+    #[error("no sync `{0}`")]
+    NoSync(String),
+
+    #[error("read report: {0}")]
+    ReadReport(#[source] kube::Error),
+
+    #[error("parse report: {0}")]
+    ParseReport(#[source] serde_json::Error),
+}
+
 /// Driver pod, by sync id. Reads the *run* namespace, never the sync's own — the driver
 /// is a runner pod, and a sync-scoped lookup silently finds nothing
-pub async fn find_driver(client: &kube::Client, sync_id: &str) -> Result<Pod, String> {
+pub async fn find_driver(client: &kube::Client, sync_id: &str) -> Result<Pod, SyncLookupError> {
     let run_ns = crate::naming::RUN_NAMESPACE;
     let pod = driver_pod_for(sync_id);
     kube::Api::<Pod>::namespaced(client.clone(), run_ns)
         .get_opt(&pod)
         .await
-        .map_err(|e| format!("get sync pod: {e}"))?
-        .ok_or_else(|| format!("no sync with id `{sync_id}` ({run_ns} has no pod `{pod}`)"))
+        .map_err(|source| SyncLookupError::GetPod { pod, source })?
+        .ok_or_else(|| SyncLookupError::NoSync(sync_id.to_string()))
 }
 
 /// Mirrored report, `None` while the run has yet to finish. Counterpart of
@@ -106,17 +126,17 @@ pub async fn find_driver(client: &kube::Client, sync_id: &str) -> Result<Pod, St
 pub async fn read_report(
     client: &kube::Client,
     sync_id: &str,
-) -> Result<Option<SyncReportMirror>, String> {
+) -> Result<Option<SyncReportMirror>, SyncLookupError> {
     let api: kube::Api<ConfigMap> = kube::Api::namespaced(client.clone(), report_cm_namespace());
     let Some(cm) =
-        api.get_opt(&report_cm_name(sync_id)).await.map_err(|e| format!("read report: {e}"))?
+        api.get_opt(&report_cm_name(sync_id)).await.map_err(SyncLookupError::ReadReport)?
     else {
         return Ok(None);
     };
     let Some(body) = cm.data.and_then(|d| d.get(REPORT_KEY).cloned()) else {
         return Ok(None);
     };
-    serde_json::from_str(&body).map(Some).map_err(|e| format!("parse report: {e}"))
+    serde_json::from_str(&body).map(Some).map_err(SyncLookupError::ParseReport)
 }
 
 /// Active sync id, `None` unless this process is a detached sync

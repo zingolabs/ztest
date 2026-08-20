@@ -480,10 +480,7 @@ impl TestEnv {
         {
             return Err(EnvError::Config {
                 reason: format!(
-                    "components in this env are pinned to different chain snapshots: \
-                     {first_name} serves {} and {other_name} serves {}; they must name \
-                     the same artifact or every comparison between them is measuring two \
-                     different histories",
+                    "snapshot mismatch: {first_name} serves {}, {other_name} serves {}",
                     first.artifact.name, other.artifact.name,
                 ),
             });
@@ -502,19 +499,15 @@ impl TestEnv {
     ///
     /// No component restored a snapshot.
     pub fn chain(&self) -> crate::ChainSnapshot {
-        self.chain_pin.unwrap_or_else(|| {
-            panic!(
-                "this env restored no chain snapshot, so it has no chain to describe; \
-                 `TestEnv::chain` answers for the one a component was built with \
-                 `.snapshot(..)`",
-            )
-        })
+        self.chain_pin.unwrap_or_else(|| panic!("no chain snapshot in this env",))
     }
     fn materialize_configs(&mut self) -> Result<(), EnvError> {
         let activation = match &self.activation_override {
             None => ActivationHeights::regtest_default(),
             Some(heights) => {
-                heights.validate_schedule().map_err(|reason| EnvError::Config { reason })?;
+                heights
+                    .validate_schedule()
+                    .map_err(|e| EnvError::Config { reason: e.to_string() })?;
                 *heights
             }
         };
@@ -531,8 +524,7 @@ impl TestEnv {
                     if !known_validators.contains(&host) {
                         return Err(EnvError::Config {
                             reason: format!(
-                                "validator peer {name:?} not found in this env's \
-                                 topology (known: {known_validators:?})"
+                                "no validator peer {name:?}; known: {known_validators:?}"
                             ),
                         });
                     }
@@ -778,10 +770,7 @@ impl TestEnv {
         if tip != snapshot.tip_height {
             return Err(EnvError::ArchiveMismatch {
                 archive: snapshot.artifact.name.to_owned(),
-                reason: format!(
-                    "it is declared as pinned at {}, but the validator serves {tip}",
-                    snapshot.tip_height,
-                ),
+                reason: format!("pinned at {}, validator serves {tip}", snapshot.tip_height,),
             });
         }
         tracing::debug!(
@@ -883,10 +872,10 @@ impl TestEnv {
         match (indexers.next(), indexers.next()) {
             (Some(h), None) => Ok(h),
             (None, _) => Err(EnvError::Config {
-                reason: "sync oracle needs an indexer, but the topology has none".into(),
+                reason: "sync oracle needs an indexer; topology has none".into(),
             }),
             (Some(_), Some(_)) => Err(EnvError::Config {
-                reason: "sync oracle is ambiguous: topology has more than one indexer".into(),
+                reason: "sync oracle ambiguous: more than one indexer".into(),
             }),
         }
     }

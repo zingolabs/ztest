@@ -157,7 +157,7 @@ pub async fn bind_seed(
     // The snapshot half is itself namespaced → no namespace needed in its name
     let storage = crate::storage_class::selected(client)
         .await
-        .map_err(|e| EnvError::Manifest { reason: e })?;
+        .map_err(|e| EnvError::Manifest { reason: e.to_string() })?;
 
     // Pre-provisioned content is taken on trust: a mismatched (driver, handle) reports
     // `readyToUse` and fails later in the provisioner, as a PVC that never binds
@@ -165,8 +165,7 @@ pub async fn bind_seed(
         return Err(EnvError::ArchiveMaterializeFailed {
             archive: seed.sha8.clone(),
             reason: format!(
-                "seed was published on driver `{}`, but this cluster uses `{}` \
-                 (StorageClass {}) — snapshots cannot be restored across drivers",
+                "seed driver `{}` != cluster `{}` (StorageClass {})",
                 seed.csi_driver, storage.provisioner, storage.class_name,
             ),
         });

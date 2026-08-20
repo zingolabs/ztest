@@ -54,7 +54,7 @@ pub struct Digest {
 
 /// Measure `archive` in **one** read: hash the compressed bytes on the way into the
 /// decompressor, count what comes out. A 21 GB artifact is streamed, never buffered
-pub fn digest_of(archive: &std::path::Path) -> Result<Digest, String> {
+pub fn digest_of(archive: &std::path::Path) -> Result<Digest, StorageError> {
     digest_of_with(archive, &crate::progress::Silent)
 }
 
@@ -64,7 +64,7 @@ pub fn digest_of(archive: &std::path::Path) -> Result<Digest, String> {
 pub fn digest_of_with(
     archive: &std::path::Path,
     progress: &dyn crate::progress::StepProgress,
-) -> Result<Digest, String> {
+) -> Result<Digest, StorageError> {
     /// Hashes and counts every byte pulled through it, so the compressed digest and the
     /// decompressed size come from the same pass over the file
     struct Tap<'a, R> {
@@ -86,11 +86,14 @@ pub fn digest_of_with(
         }
     }
 
-    let compression = compression_from_name(&archive.to_string_lossy()).ok_or_else(|| {
-        format!("{}: cannot determine compression from its name", archive.display())
+    let path = || archive.display().to_string();
+    let compression = compression_from_name(&archive.to_string_lossy())
+        .ok_or_else(|| StorageError::UnknownCompression { name: path() })?;
+    let file = std::fs::File::open(archive).map_err(|source| StorageError::Io {
+        op: "open",
+        path: path(),
+        source,
     })?;
-    let file =
-        std::fs::File::open(archive).map_err(|e| format!("opening {}: {e}", archive.display()))?;
     let total = file.metadata().map(|m| m.len()).unwrap_or(0);
     progress.note("hashing archive");
     let tap = Tap {
@@ -104,23 +107,23 @@ pub fn digest_of_with(
     // `None` still has to be drained: the tap only sees bytes something pulls through it
     let (uncompressed_bytes, tap) = match compression {
         Compression::Zstd => {
-            let mut dec = zstd::Decoder::new(tap)
-                .map_err(|e| format!("opening {} as zstd: {e}", archive.display()))?;
+            let mut dec = zstd::Decoder::new(tap).map_err(|source| StorageError::Io {
+                op: "open zstd",
+                path: path(),
+                source,
+            })?;
             let n = std::io::copy(&mut dec, &mut std::io::sink())
-                .map_err(|e| format!("decompressing {}: {e}", archive.display()))?;
+                .map_err(|source| StorageError::Io { op: "decompress", path: path(), source })?;
             (n, dec.finish().into_inner())
         }
         Compression::None => {
             let mut tap = tap;
             let n = std::io::copy(&mut tap, &mut std::io::sink())
-                .map_err(|e| format!("reading {}: {e}", archive.display()))?;
+                .map_err(|source| StorageError::Io { op: "read", path: path(), source })?;
             (n, tap)
         }
         other => {
-            return Err(format!(
-                "{}: `ztest snapshot` derives manifests for .tar.zst and .tar only, not {other:?}",
-                archive.display(),
-            ));
+            return Err(StorageError::Undigestable { path: path(), compression: other });
         }
     };
 
@@ -171,33 +174,34 @@ pub fn compression_from_name(name: &str) -> Option<Compression> {
 /// - `materialize` call sites map these to `EnvError::ArchiveMaterializeFailed`
 /// - `R2Config` reaches only seed-provisioning processes (runner pods never touch
 ///   the bucket) → fix by exporting AWS env where `ztest run` is invoked
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// `detail` already names the missing key or the credentials file that failed, so the
+    /// AWS_* roster this used to recite added length, not information
+    #[error("bucket not configured: {detail}")]
     R2Config { detail: String },
+
+    #[error("bucket: {0}")]
     R2(String),
+
+    #[error("{name}: not .tar[.gz|.zst|.xz|.bz2]")]
     UnknownCompression { name: String },
-}
 
-impl std::fmt::Display for StorageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StorageError::R2Config { detail } => write!(
-                f,
-                "the chain-snapshot bucket is not configured ({detail}) — export \
-                 AWS_BUCKET_NAME / AWS_ENDPOINT / AWS_ACCESS_KEY_ID / \
-                 AWS_SECRET_ACCESS_KEY in the environment running `ztest run`",
-            ),
-            StorageError::R2(m) => write!(f, "chain-snapshot bucket: {m}"),
-            StorageError::UnknownCompression { name } => write!(
-                f,
-                "{name}: cannot determine archive compression from its name \
-                 (expected .tar / .tar.gz / .tar.zst / .tar.xz / .tar.bz2)",
-            ),
-        }
-    }
-}
+    #[error("{path}: no filename")]
+    NoFilename { path: String },
 
-impl std::error::Error for StorageError {}
+    #[error("{op} {path}: {source}")]
+    Io {
+        op: &'static str,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// `ztest snapshot` derives manifests for `.tar.zst` and `.tar` only
+    #[error("{path}: cannot digest {compression:?}")]
+    Undigestable { path: String, compression: Compression },
+}
 
 #[cfg(test)]
 mod tests {

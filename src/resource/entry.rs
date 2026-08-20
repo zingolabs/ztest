@@ -122,7 +122,10 @@ where
 /// - **Pure** — no cluster contact; `ztest run` provisions the [`Graph`] with its own `Cx`
 /// - Content-addressed nodes dedup: two tests naming one seed share a node
 ///   ([`Graph::add_dedup`])
-pub fn plan_runtime(images: &[DevImageEntry], seeds: &[SeedEntry]) -> Result<Graph, String> {
+pub fn plan_runtime(
+    images: &[DevImageEntry],
+    seeds: &[SeedEntry],
+) -> Result<Graph, crate::error::PipelineError> {
     let mut graph = Graph::new();
     for entry in images {
         let provider = image::ImageNode::new(entry.clone())?;
@@ -137,7 +140,7 @@ pub fn plan_runtime(images: &[DevImageEntry], seeds: &[SeedEntry]) -> Result<Gra
 
 /// Content-addressed [`NodeId`] of a dev image → `cli::run` keys an image-dependency edge
 /// without duplicating the derivation
-pub fn image_node_id(entry: &DevImageEntry) -> Result<NodeId, String> {
+pub fn image_node_id(entry: &DevImageEntry) -> Result<NodeId, crate::error::PipelineError> {
     image::ImageNode::node_id(entry)
 }
 

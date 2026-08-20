@@ -91,10 +91,10 @@ impl Docker {
 /// remote registry; false negative → rebuild+push, whose own failure carries the real error)
 pub fn exists_in_registry(reference: &str) -> Result<bool, ImageError> {
     let engine = runtime::program();
-    let out =
-        Command::new(engine).args(["manifest", "inspect", reference]).output().map_err(|err| {
-            ImageError::Spawn { cmd: format!("{engine} manifest inspect {reference}"), err }
-        })?;
+    let out = Command::new(engine)
+        .args(["manifest", "inspect", reference])
+        .output()
+        .map_err(|err| ImageError::spawn(format!("{engine} manifest inspect {reference}"), err))?;
     Ok(out.status.success())
 }
 

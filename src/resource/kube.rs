@@ -21,7 +21,11 @@ pub const FIELD_MANAGER: &str = "ztest";
 ///
 /// Objects are built, never vendored as YAML text — compiler checks the shape, and
 /// there is no indentation to get wrong
-pub async fn apply<K>(api: &Api<K>, obj: &K, context: &str) -> Result<(), String>
+pub async fn apply<K>(
+    api: &Api<K>,
+    obj: &K,
+    context: &str,
+) -> Result<(), crate::error::PipelineError>
 where
     K: Resource + Clone + std::fmt::Debug + Serialize + DeserializeOwned,
 {
@@ -42,7 +46,7 @@ pub async fn wait_api_service_available(
     name: &str,
     timeout: Duration,
     no_wait: bool,
-) -> Result<(), String> {
+) -> Result<(), crate::error::PipelineError> {
     if no_wait {
         return Ok(());
     }
@@ -51,7 +55,7 @@ pub async fn wait_api_service_available(
     tokio::time::timeout(timeout, cond)
         .await
         .map_err(|_| format!("timeout waiting for APIService {name} to become Available"))?
-        .map_err(|e| format!("wait for APIService {name}: {e}"))
+        .map_err(|e| format!("wait for APIService {name}: {e}").into())
         .map(|_| ())
 }
 
@@ -62,7 +66,7 @@ pub async fn wait_crd_established(
     name: &str,
     timeout: Duration,
     no_wait: bool,
-) -> Result<(), String> {
+) -> Result<(), crate::error::PipelineError> {
     if no_wait {
         return Ok(());
     }
@@ -71,7 +75,7 @@ pub async fn wait_crd_established(
     tokio::time::timeout(timeout, cond)
         .await
         .map_err(|_| format!("timeout waiting for CRD {name} to become Established"))?
-        .map_err(|e| format!("wait for CRD {name}: {e}"))
+        .map_err(|e| format!("wait for CRD {name}: {e}").into())
         .map(|_| ())
 }
 
@@ -82,7 +86,7 @@ pub async fn wait_deployment_available(
     name: &str,
     timeout: Duration,
     no_wait: bool,
-) -> Result<(), String> {
+) -> Result<(), crate::error::PipelineError> {
     if no_wait {
         return Ok(());
     }
@@ -93,7 +97,7 @@ pub async fn wait_deployment_available(
         .map_err(|_| {
             format!("timeout waiting for Deployment {namespace}/{name} to become Available")
         })?
-        .map_err(|e| format!("wait for Deployment {namespace}/{name}: {e}"))
+        .map_err(|e| format!("wait for Deployment {namespace}/{name}: {e}").into())
         .map(|_| ())
 }
 
@@ -104,7 +108,7 @@ pub async fn wait_statefulset_ready(
     name: &str,
     timeout: Duration,
     no_wait: bool,
-) -> Result<(), String> {
+) -> Result<(), crate::error::PipelineError> {
     if no_wait {
         return Ok(());
     }
@@ -113,7 +117,7 @@ pub async fn wait_statefulset_ready(
     tokio::time::timeout(timeout, cond)
         .await
         .map_err(|_| format!("timeout waiting for StatefulSet {namespace}/{name} to become Ready"))?
-        .map_err(|e| format!("wait for StatefulSet {namespace}/{name}: {e}"))
+        .map_err(|e| format!("wait for StatefulSet {namespace}/{name}: {e}").into())
         .map(|_| ())
 }
 

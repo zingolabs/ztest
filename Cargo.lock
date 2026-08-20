@@ -5889,6 +5889,7 @@ dependencies = [
 name = "ztest_cli"
 version = "0.1.4"
 dependencies = [
+ "anyhow",
  "chrono",
  "clap",
  "console",
@@ -5906,6 +5907,7 @@ dependencies = [
  "supports-color",
  "supports-unicode",
  "terminal_size",
+ "thiserror 1.0.69",
  "tokio",
  "toml 0.8.23",
  "tracing",

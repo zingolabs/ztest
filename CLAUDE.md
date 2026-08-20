@@ -12,15 +12,14 @@ Delete these classes of comment on sight (never add them):
 1. **Restating the code.** `// increment i`, `// return the client`,
    `// Storage stack, profile-dependent` above a `match` that is already
    obviously profile-dependent.
-2. **Justifying an API's own spec.** e.g. a comment explaining that the
+1. **Justifying an API's own spec.** e.g. a comment explaining that the
    field is `fstype` not `fsType`, or that an enum value is one of the
    documented set. The code is correct; the reader does not need the
    rejected alternative narrated. Just write `fstype: xfs`.
-3. **Docstrings that echo the item name.** A `#[test]` named
-   `render_is_valid_yaml_with_all_paths` needs no `/// The render must be
-   valid YAML with all paths` above it. Same for functions whose name and
+1. **Docstrings that echo the item name.** A `#[test]` named
+   `render_is_valid_yaml_with_all_paths` needs no `/// The render must be valid YAML with all paths` above it. Same for functions whose name and
    signature already say it.
-4. **Provenance trivia.** "verified against a live cluster", "reached
+1. **Provenance trivia.** "verified against a live cluster", "reached
    state Ready", "the historical behaviour" and similar belong in the PR
    description or commit message, not the source.
 
@@ -63,21 +62,18 @@ Mechanical rules, all mandatory:
    as the main verb. `Held across await` not "This lock is held across
    the await". `Callers must drop before poll()` is fine — a real
    constraint keeps its modal.
-2. **No leading article.** Never open with "A", "An", "The", "This",
+1. **No leading article.** Never open with "A", "An", "The", "This",
    "One". `Bytes remaining` not "The number of bytes remaining".
-3. **Parenthesise the why.** The rationale goes in `(...)` after the
-   fact, not in a subordinate clause. `rate ships pre-computed (resumed
-   stream drops events)` not "rate is published rather than differenced
+1. **Parenthesise the why.** The rationale goes in `(...)` after the
+   fact, not in a subordinate clause. `rate ships pre-computed (resumed stream drops events)` not "rate is published rather than differenced
    controller-side, because a resumed stream replays and drops events".
-4. **Use symbols over words.** `=`, `→`, `!=`, `>=`, `&`, `/`. `driver →
-   controller` not "from the driver to the controller". `x = only
-   channel` not "x is the only channel that exists".
-5. **Multiple facts = multiple bullets.** Never chain with em-dash,
+1. **Use symbols over words.** `=`, `→`, `!=`, `>=`, `&`, `/`. `driver → controller` not "from the driver to the controller". `x = only channel` not "x is the only channel that exists".
+1. **Multiple facts = multiple bullets.** Never chain with em-dash,
    semicolon, "because", "so that", "which means", "rather than". One
    fact per line, `- ` prefixed.
-6. **No hedges.** "deliberately", "genuinely", "merely", "actually",
+1. **No hedges.** "deliberately", "genuinely", "merely", "actually",
    "simply", "note that", "of course". Zero information.
-7. **No trailing period on a fragment.** It is not a sentence.
+1. **No trailing period on a fragment.** It is not a sentence.
 
 **Budget: one line. Two if the invariant needs it.** Three-plus bullets
 means it belongs in `docs/`, in a better name, or nowhere. A 30-word

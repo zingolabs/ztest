@@ -9,6 +9,7 @@
 use std::io::{IsTerminal, stdout};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context as _, Result};
 use futures::{AsyncBufReadExt as _, StreamExt as _};
 use k8s_openapi::api::core::v1::{ContainerState, Pod};
 use kube::api::{Api, ListParams, LogParams};
@@ -89,7 +90,7 @@ pub(super) enum WatchEnd {
     Settled(SyncStatus),
 }
 
-pub(super) async fn watch(id: &str) -> Result<WatchEnd, String> {
+pub(super) async fn watch(id: &str) -> Result<WatchEnd> {
     let client = super::client().await?;
     let ns = namespace_for(id);
     let pod = find_driver(&client, id).await?;
@@ -182,13 +183,13 @@ async fn linear(
     client: &kube::Client,
     id: &str,
     theme: &Theme,
-) -> Result<WatchEnd, String> {
+) -> Result<WatchEnd> {
     plain_tail(driver, theme).await?;
     settled(client, id, theme).await
 }
 
 /// Post-log verdict: the durable report if the driver mirrored one, else "no report"
-async fn settled(client: &kube::Client, id: &str, theme: &Theme) -> Result<WatchEnd, String> {
+async fn settled(client: &kube::Client, id: &str, theme: &Theme) -> Result<WatchEnd> {
     match read_report(client, id).await? {
         Some(report) => {
             print!("{}", report_verdict(theme, &report));
@@ -211,7 +212,7 @@ async fn tail_loop(
     feed: &mut Feed,
     theme: &Theme,
     render: impl Fn(&Feed),
-) -> Result<(), String> {
+) -> Result<()> {
     let Followed { driver, sut: api, client, namespace } = followed;
     // Last cause shown → a standing condition is stated once, not once a second
     let mut last_note: Option<String> = None;
@@ -286,7 +287,7 @@ async fn tail_loop(
                     // → recorded once, never scrolled
                     Err(why) => {
                         feed.state.pods.clear();
-                        feed.state.pods_note = Some(load_note(&why));
+                        feed.state.pods_note = Some(load_note(&why.to_string()));
                     }
                 }
                 render(feed);
@@ -353,14 +354,11 @@ async fn tail_loop(
 /// - Hours-long follow-streams are routinely cut (idle API-server timeout, proxy
 ///   hop, rebalanced connection); reading that as the run's end strands a live sync
 /// - `None` = the driver really finished
-async fn reattach_driver(
-    driver: &DriverPod,
-    last_seen: Instant,
-) -> Result<Option<LineStream>, String> {
+async fn reattach_driver(driver: &DriverPod, last_seen: Instant) -> Result<Option<LineStream>> {
     // Backs off a stream that fails immediately; also lets a driver mid-exit finish
     // writing
     tokio::time::sleep(POD_POLL).await;
-    let Some(pod) = driver.get().await.map_err(|e| format!("read driver pod: {e}"))? else {
+    let Some(pod) = driver.get().await.context("read driver pod")? else {
         return Ok(None);
     };
     if !running(&pod, DRIVER_CONTAINER) {
@@ -374,7 +372,7 @@ async fn reattach_driver(
     )
     .await
     .map(Some)
-    .map_err(|e| format!("reattach to sync log: {e}"))
+    .context("reattach to sync log")
 }
 
 /// Sampling failure → the panel's one-line cause. A missing aggregated API is the
@@ -404,7 +402,7 @@ async fn open_driver_log(
     driver: &DriverPod,
     stop: &dyn Fn() -> bool,
     mut observe: impl FnMut(String),
-) -> Result<Option<LineStream>, String> {
+) -> Result<Option<LineStream>> {
     loop {
         if stop() {
             return Ok(None);
@@ -412,8 +410,8 @@ async fn open_driver_log(
         let pod = driver
             .get()
             .await
-            .map_err(|e| format!("read driver pod: {e}"))?
-            .ok_or_else(|| format!("driver pod {} no longer exists", driver.name))?;
+            .context("read driver pod")?
+            .with_context(|| format!("driver pod {} no longer exists", driver.name))?;
         observe(driver_phase(&pod));
         if logs_available(&pod, DRIVER_CONTAINER) {
             return open_log(
@@ -424,7 +422,7 @@ async fn open_driver_log(
             )
             .await
             .map(Some)
-            .map_err(|e| format!("stream sync log: {e}"));
+            .context("stream sync log");
         }
         tokio::time::sleep(POD_POLL).await;
     }
@@ -521,7 +519,7 @@ fn prefixed(source: &str, line: &str, theme: &Theme) -> String {
 
 /// Linear follow-tail of the driver log (non-TTY, or console won't start). No
 /// panel, so every event including ticks renders as a line = a progress log
-async fn plain_tail(driver: &DriverPod, theme: &Theme) -> Result<(), String> {
+async fn plain_tail(driver: &DriverPod, theme: &Theme) -> Result<()> {
     let mut lines = open_driver_log(driver, &|| false, |phase| {
         println!("ztest sync: driver {phase}");
     })
@@ -534,7 +532,7 @@ async fn plain_tail(driver: &DriverPod, theme: &Theme) -> Result<(), String> {
     // hours-long log
     loop {
         while let Some(line) = lines.next().await {
-            let line = line.map_err(|e| format!("read sync log: {e}"))?;
+            let line = line.context("read sync log")?;
             seen = Instant::now();
             if let Some(text) = feed.absorb_verbose(&line, started.elapsed(), theme) {
                 println!("{text}");

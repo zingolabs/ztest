@@ -20,10 +20,7 @@ pub enum EnvError {
 
     /// Unplaced within `PENDING_TIMEOUT`. No container ever ran (unlike
     /// [`PodFailed`](Self::PodFailed)) → `reason` = sole diagnostic
-    #[error(
-        "{component} pod was never scheduled onto a node within {elapsed:?}: {reason}\n\
-         check volume binding (PVC/StorageClass), nodeSelector/taints, and namespace quota"
-    )]
+    #[error("{component} pod unschedulable after {elapsed:?}: {reason}")]
     PodUnschedulable { component: String, reason: String, elapsed: Duration },
 
     /// `archive` = filename, never a path (seeds are OID-identified; only a process
@@ -46,7 +43,7 @@ pub enum EnvError {
     /// Manifest vs mounted data disagree (swapped/truncated/re-pinned artifact), not
     /// [`Config`](Self::Config)'s static misconfig. Unnamed, it reads as a parity
     /// failure or a boundary test passing over empty results.
-    #[error("restored archive {archive} does not serve the chain its manifest describes: {reason}")]
+    #[error("archive {archive}: chain disagrees with its manifest: {reason}")]
     ArchiveMismatch { archive: String, reason: String },
 
     #[error("image build failed for {component}: {source}")]
@@ -56,18 +53,45 @@ pub enum EnvError {
         source: ImageError,
     },
 
-    #[error("TestEnv has not been built yet; call env.build().await before using handles")]
+    #[error("TestEnv not built; call env.build()")]
     NotBuilt,
 
-    #[error("TestEnv was dropped or torn down; handle is no longer usable")]
+    #[error("TestEnv dropped; handle unusable")]
     EnvDropped,
 
     /// ztest bug, not user error (`build` registers every issued handle)
-    #[error("internal error: no component registered for handle id {id}")]
+    #[error("no component for handle {id}")]
     UnknownComponent { id: u64 },
 
     #[error(transparent)]
     Transient(Box<dyn StdError + Send + Sync>),
+}
+
+/// Orchestration failure from the build / profiling / resource pipelines.
+///
+/// One type, deliberately, rather than one enum per module. Every one of these is "a step
+/// of the pipeline failed", every consumer prints it under a subcommand prefix, and no
+/// caller matches on the kind — a per-module enum would be ceremony over a string that is
+/// only ever displayed. What the *type* buys, which `String` did not, is
+/// [`std::error::Error`]: `?` composes across the tree and `anyhow` can carry it, so the
+/// CLI needs no conversion shim at the crate boundary.
+///
+/// Where a failure *is* matched on, it gets a real enum instead — see [`ImageError`],
+/// [`EnvError`], or [`ConfigError`](crate::cluster_config::ConfigError).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PipelineError(pub String);
+
+impl From<String> for PipelineError {
+    fn from(m: String) -> Self {
+        PipelineError(m)
+    }
+}
+
+impl From<&str> for PipelineError {
+    fn from(m: &str) -> Self {
+        PipelineError(m.to_string())
+    }
 }
 
 /// Typed RPC sugar failures (`generate_blocks`, `tip`, …).
@@ -88,7 +112,7 @@ pub enum RpcError {
     Decode { component: &'static str, op: &'static str, reason: String },
 
     /// Poll loop out of budget ([`EnvError::RpcTimeout`] = initial-readiness counterpart)
-    #[error("{component} {op}: did not converge within {elapsed:?}: {detail}")]
+    #[error("{component} {op}: no convergence in {elapsed:?}: {detail}")]
     Timeout { component: &'static str, op: &'static str, elapsed: Duration, detail: String },
 
     #[error(transparent)]
@@ -130,74 +154,79 @@ pub fn env_err<E: StdError + Send + Sync + 'static>(e: E) -> EnvError {
 }
 
 /// Build/load pipeline errors, surfaced through `EnvError` by `manifest.rs` / `env.rs`
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ImageError {
+    #[error("image build: walk context: {0}")]
     Walk(String),
+
+    #[error("image build: bundle source: {0}")]
     Bundle(String),
-    ReadFile { path: PathBuf, err: std::io::Error },
+
+    #[error("image build: read {path}: {err}")]
+    ReadFile {
+        path: PathBuf,
+        #[source]
+        err: std::io::Error,
+    },
+
+    #[error("image build: docker build failed:\n{stderr_tail}")]
     DockerBuild { stderr_tail: String },
+
+    #[error("image build: kind load failed:\n{stderr_tail}")]
     KindLoad { stderr_tail: String },
+
+    #[error("no kind cluster `{cluster}`; have: {available}")]
     KindClusterMissing { cluster: String, available: String },
+
+    #[error("`{engine} ps` failed:\n{stderr_tail}")]
     KindClusterQuery { engine: &'static str, stderr_tail: String },
+
+    #[error("`kind get nodes` failed:\n{stderr_tail}")]
     KindNodeQuery { stderr_tail: String },
+
+    #[error("image build: docker push failed:\n{stderr_tail}")]
     DockerPush { stderr_tail: String },
+
+    #[error("image build: image query failed:\n{stderr_tail}")]
     KindImageQuery { stderr_tail: String },
-    Spawn { cmd: String, err: std::io::Error },
+
+    /// `kind load` reports the transfer, not the name containerd filed it under
+    #[error("side-load: `{reference}` absent from the node; it holds:\n{images}")]
+    SideLoadUnconfirmed { reference: String, images: String },
+
+    /// `NotFound` = binary absent, not a broken invocation (a devShell without `kind` on
+    /// PATH), so it reads as a missing tool rather than a spawn bug
+    #[error("image build: spawn `{cmd}`: {err}")]
+    Spawn {
+        cmd: String,
+        #[source]
+        err: std::io::Error,
+    },
+
+    #[error("`{bin}` not on PATH; needed for `{cmd}`")]
+    NotOnPath { bin: String, cmd: String },
+
+    #[error("image build: git fetch {rev} failed:\n{stderr_tail}")]
     GitFetch { rev: String, stderr_tail: String },
-    DevImageMissing { image: String, source: String },
+
+    /// Only the preflight pipeline builds dev images, so this means `cargo test` was run
+    /// where `ztest run` was needed.
+    ///
+    /// `declared_by`, not `source`: thiserror reads a field of that name as the error
+    /// cause, and this one names the test that asked for the image
+    #[error("dev image `{image}` not in the build manifest (from {declared_by})")]
+    DevImageMissing { image: String, declared_by: String },
 }
 
-impl std::fmt::Display for ImageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ImageError::Walk(s) => write!(f, "image build: walk context: {s}"),
-            ImageError::Bundle(s) => write!(f, "image build: assemble source bundle: {s}"),
-            ImageError::ReadFile { path, err } => {
-                write!(f, "image build: read {}: {err}", path.display())
+impl ImageError {
+    /// `PATH` misses are the common case and read as a missing tool, not a spawn bug
+    pub fn spawn(cmd: String, err: std::io::Error) -> ImageError {
+        match err.kind() {
+            std::io::ErrorKind::NotFound => {
+                let bin = cmd.split_whitespace().next().unwrap_or(&cmd).to_string();
+                ImageError::NotOnPath { bin, cmd }
             }
-            ImageError::DockerBuild { stderr_tail } => {
-                write!(f, "image build: docker build failed:\n{stderr_tail}")
-            }
-            ImageError::KindLoad { stderr_tail } => {
-                write!(f, "image build: kind load failed:\n{stderr_tail}")
-            }
-            ImageError::KindClusterMissing { cluster, available } => write!(
-                f,
-                "kind cluster `{cluster}` is not running (have: {available}). \
-                 Create it with `kind create cluster --name {cluster}`, then \
-                 `ztest cluster setup`, \
-                 or point at another cluster with `ztest run --cluster <name>`.",
-            ),
-            ImageError::KindClusterQuery { engine, stderr_tail } => write!(
-                f,
-                "kind cluster query failed; `{engine} ps` could not list the nodes:\n{stderr_tail}"
-            ),
-            ImageError::KindNodeQuery { stderr_tail } => {
-                write!(f, "`kind get nodes` failed:\n{stderr_tail}")
-            }
-            ImageError::DockerPush { stderr_tail } => {
-                write!(f, "image build: docker push failed:\n{stderr_tail}")
-            }
-            ImageError::KindImageQuery { stderr_tail } => {
-                write!(f, "image build: cluster image query failed:\n{stderr_tail}")
-            }
-            // NotFound = binary absent, not a broken invocation (devShell without `kind` on PATH)
-            ImageError::Spawn { cmd, err } if err.kind() == std::io::ErrorKind::NotFound => {
-                let bin = cmd.split_whitespace().next().unwrap_or(cmd);
-                write!(f, "image build: `{bin}` not on PATH; needed to run `{cmd}`")
-            }
-            ImageError::Spawn { cmd, err } => write!(f, "image build: spawn {cmd}: {err}"),
-            ImageError::GitFetch { rev, stderr_tail } => {
-                write!(f, "image build: git fetch of rev {rev} failed:\n{stderr_tail}")
-            }
-            ImageError::DevImageMissing { image, source } => write!(
-                f,
-                "dev image `{image}` not in the build manifest (declared by {source}). \
-                 Run `ztest run …` instead of `cargo test` / `cargo nextest run` — \
-                 the preflight pipeline is the only thing that builds and loads dev images.",
-            ),
+            _ => ImageError::Spawn { cmd, err },
         }
     }
 }
-
-impl std::error::Error for ImageError {}
