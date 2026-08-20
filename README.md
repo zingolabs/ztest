@@ -44,13 +44,13 @@ ztest cluster setup --install-storage # Include the observability stack
 ztest cluster check
 
 cd zaino/live-tests/sync
-ztest sync start zaino-index-construction
+ztest sync start zaino_index_construction
 ztest sync list
-ztest sync status zaino-index-construction-1234abcd
+ztest sync status zaino_index-construction_1234abcd  # replace w/ actual id
 
 # For viewing profiling data
 uv tool install flameshow
-ztest sync perf zaino-index-construction-1234abcd --component zainod
+ztest sync perf zaino_index-construction_1234abcd --component zainod
 
 ```
 
@@ -66,7 +66,7 @@ cd zaino/live-tests/
 ztest run
 
 cd zaino/live-tests/sync
-ztest sync start zaino-index-construction --watch
+ztest sync start zaino_index_construction --watch
 
 
 ```

@@ -2,8 +2,9 @@
 //!
 //! - Local only (shared-cluster storage = operator's)
 //! - Assent-gated (cluster-scoped writes + steals the default StorageClass)
-//! - Upstream manifests @ pinned refs, deploy dir = server minor
+//! - Upstream manifests @ pinned refs, deploy dir = server minor (`latest` past the pin's window)
 
+use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -123,12 +124,21 @@ pub fn install() -> Result<(), String> {
     ]))?;
 
     let minor = server_minor(&kubeconfig)?;
-    let deploy = checkout.join("deploy").join(format!("kubernetes-1.{minor}"));
-    if !deploy.is_dir() {
-        return Err(format!(
-            "csi-driver-host-path {HOSTPATH_REF} ships no deploy dir for Kubernetes 1.{minor}"
-        ));
-    }
+    let root = checkout.join("deploy");
+    let window = DeployWindow::read(&root)?;
+    let deploy = match window.select(minor) {
+        Deploy::Exact(m) => root.join(format!("kubernetes-1.{m}")),
+        Deploy::Latest => {
+            eprintln!("  ! server 1.{minor} is past {HOSTPATH_REF}'s {window}; deploying `latest`");
+            root.join("kubernetes-latest")
+        }
+        Deploy::Unsupported => {
+            return Err(format!(
+                "csi-driver-host-path {HOSTPATH_REF} covers {window}, server is 1.{minor}; \
+                 pin an older HOSTPATH_REF"
+            ));
+        }
+    };
     run(Command::new(deploy.join("deploy.sh")).env("KUBECONFIG", &kubeconfig))?;
     kubectl(
         &kubeconfig,
@@ -181,7 +191,7 @@ fn controller_url() -> String {
     )
 }
 
-/// One deploy dir per k8s minor (`latest` sidecars assume APIs an old server lacks)
+/// Picks the deploy dir ([`DeployWindow`])
 fn server_minor(kubeconfig: &Path) -> Result<u32, String> {
     let raw = output(
         Command::new("kubectl").env("KUBECONFIG", kubeconfig).args(["version", "-o", "json"]),
@@ -196,6 +206,73 @@ fn server_minor(kubeconfig: &Path) -> Result<u32, String> {
         .trim_end_matches(|c: char| !c.is_ascii_digit())
         .parse()
         .map_err(|_| format!("unparsable server minor `{minor}`"))
+}
+
+/// Kubernetes minors a release's `deploy/` names = what it was tested against.
+///
+/// - One manifest set per release (numbered dirs + `latest` = symlinks onto it) → minor labels
+///   the pairing, never the content
+/// - Sparse across releases (no release ever shipped 1.29 / 1.32 / 1.33)
+#[derive(Debug)]
+struct DeployWindow(BTreeSet<u32>);
+
+/// Which `deploy/` dir serves a server minor
+#[derive(Debug, PartialEq)]
+enum Deploy {
+    Exact(u32),
+    Latest,
+    Unsupported,
+}
+
+impl DeployWindow {
+    fn read(root: &Path) -> Result<Self, String> {
+        let entries = std::fs::read_dir(root)
+            .map_err(|e| format!("read {}: {e}", root.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read {}: {e}", root.display()))?;
+        // Name-parsed, not is_dir(): every minor but the oldest is a symlink
+        let minors: BTreeSet<u32> = entries
+            .iter()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                name.strip_prefix("kubernetes-1.")?.parse().ok()
+            })
+            .collect();
+        if minors.is_empty() {
+            return Err(format!(
+                "csi-driver-host-path {HOSTPATH_REF} names no Kubernetes minor under {}; \
+                 the pinned ref is not a driver checkout",
+                root.display()
+            ));
+        }
+        Ok(Self(minors))
+    }
+
+    /// Past the window = routine (kind ships a minor long before the driver cuts a release)
+    fn select(&self, minor: u32) -> Deploy {
+        if self.0.contains(&minor) {
+            Deploy::Exact(minor)
+        } else if minor < self.oldest() {
+            Deploy::Unsupported
+        } else {
+            Deploy::Latest
+        }
+    }
+
+    fn oldest(&self) -> u32 {
+        *self.0.iter().next().expect("read() rejects an empty window")
+    }
+
+    fn newest(&self) -> u32 {
+        *self.0.iter().next_back().expect("read() rejects an empty window")
+    }
+}
+
+impl std::fmt::Display for DeployWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (oldest, newest) = (self.oldest(), self.newest());
+        if oldest == newest { write!(f, "1.{oldest}") } else { write!(f, "1.{oldest}-1.{newest}") }
+    }
 }
 
 fn minified_kubeconfig(work: &Path) -> Result<PathBuf, String> {
@@ -263,5 +340,75 @@ impl WorkDir {
 impl Drop for WorkDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(minors: [u32; 2]) -> DeployWindow {
+        DeployWindow(minors.into_iter().collect())
+    }
+
+    /// v1.18.0's shape: one real dir, the rest symlinks, plus the `-test` and `distributed` noise
+    fn v1_18_0_deploy() -> PathBuf {
+        let root = std::env::temp_dir()
+            .join(format!("ztest-csi-window-{}", std::process::id()))
+            .join("deploy");
+        let _ = std::fs::remove_dir_all(&root);
+        for entry in [
+            "kubernetes-1.34",
+            "kubernetes-1.34-test",
+            "kubernetes-1.35",
+            "kubernetes-1.35-test",
+            "kubernetes-distributed",
+            "kubernetes-latest",
+            "kubernetes-latest-test",
+            "util",
+        ] {
+            std::fs::create_dir_all(root.join(entry)).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_window_reads_every_numbered_minor_and_nothing_else() {
+        let root = v1_18_0_deploy();
+        let w = DeployWindow::read(&root).unwrap();
+        assert_eq!(w.0, BTreeSet::from([34, 35]));
+        assert_eq!(w.to_string(), "1.34-1.35");
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_deploy_dir_holding_no_minor_is_a_named_error() {
+        let root = std::env::temp_dir().join(format!("ztest-csi-empty-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("util")).unwrap();
+        assert!(DeployWindow::read(&root).unwrap_err().contains("names no Kubernetes minor"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_in_window_minor_selects_its_own_dir() {
+        assert_eq!(window([34, 35]).select(34), Deploy::Exact(34));
+        assert_eq!(window([34, 35]).select(35), Deploy::Exact(35));
+    }
+
+    #[test]
+    fn a_server_past_the_window_falls_through_to_latest() {
+        assert_eq!(window([34, 35]).select(36), Deploy::Latest);
+        assert_eq!(window([34, 35]).select(99), Deploy::Latest);
+    }
+
+    /// v1.17.1 shipped 1.30/1.31, v1.18.0 jumps to 1.34 — skipped minors resolve, not error
+    #[test]
+    fn a_minor_upstream_skipped_falls_through_to_latest() {
+        assert_eq!(window([30, 34]).select(32), Deploy::Latest);
+    }
+
+    #[test]
+    fn a_server_below_the_window_is_unsupported() {
+        assert_eq!(window([34, 35]).select(33), Deploy::Unsupported);
     }
 }
