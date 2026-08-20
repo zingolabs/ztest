@@ -55,19 +55,33 @@ pub struct Digest {
 /// Measure `archive` in **one** read: hash the compressed bytes on the way into the
 /// decompressor, count what comes out. A 21 GB artifact is streamed, never buffered
 pub fn digest_of(archive: &std::path::Path) -> Result<Digest, String> {
+    digest_of_with(archive, &crate::progress::Silent)
+}
+
+/// [`digest_of`], reporting the read.
+///
+/// - Bytes counted against *compressed* size (= what is read; the decoder is what makes it slow)
+pub fn digest_of_with(
+    archive: &std::path::Path,
+    progress: &dyn crate::progress::StepProgress,
+) -> Result<Digest, String> {
     /// Hashes and counts every byte pulled through it, so the compressed digest and the
     /// decompressed size come from the same pass over the file
-    struct Tap<R> {
+    struct Tap<'a, R> {
         inner: R,
         hasher: sha2::Sha256,
         read: u64,
+        total: u64,
+        progress: &'a dyn crate::progress::StepProgress,
     }
-    impl<R: std::io::Read> std::io::Read for Tap<R> {
+    impl<R: std::io::Read> std::io::Read for Tap<'_, R> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let n = self.inner.read(buf)?;
             use sha2::Digest as _;
             self.hasher.update(&buf[..n]);
             self.read += n as u64;
+            // Reports every read (throttling = sink's, only side knowing paint cost)
+            self.progress.bytes(self.read, self.total);
             Ok(n)
         }
     }
@@ -77,7 +91,15 @@ pub fn digest_of(archive: &std::path::Path) -> Result<Digest, String> {
     })?;
     let file =
         std::fs::File::open(archive).map_err(|e| format!("opening {}: {e}", archive.display()))?;
-    let tap = Tap { inner: std::io::BufReader::new(file), hasher: sha2::Sha256::new(), read: 0 };
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+    progress.note("hashing archive");
+    let tap = Tap {
+        inner: std::io::BufReader::new(file),
+        hasher: sha2::Sha256::new(),
+        read: 0,
+        total,
+        progress,
+    };
 
     // `None` still has to be drained: the tap only sees bytes something pulls through it
     let (uncompressed_bytes, tap) = match compression {

@@ -44,7 +44,9 @@ const TERMINATION_GRACE_SECS: i64 = 30;
 /// [`delete_build_pod`] wait before force-delete (grace window + kubelet teardown margin)
 const POD_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 
-const BUILDKIT_CACHE_PVC: &str = "ztest-buildkit-cache";
+/// Layer + `--mount=type=cache` store, outliving every build pod. Public so
+/// [`capability`](crate::capability) can report it as part of what `setup` provisions
+pub const BUILDKIT_CACHE_PVC: &str = "ztest-buildkit-cache";
 /// Holds `buildkitd.toml`, mounted at [`BUILDKIT_CONFIG_PATH`]
 const BUILDKIT_CONFIG: &str = "ztest-buildkit-config";
 const BUILDKIT_CONFIG_PATH: &str = "/etc/buildkit/buildkitd.toml";
@@ -218,10 +220,34 @@ pub async fn create_build_pod(
     run_id: &str,
     user: &str,
 ) -> Result<String, ResourceError> {
+    let name = format!("ztest-build-{:08x}", rand::random::<u32>());
+    Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
+        .create(&PostParams::default(), &build_pod(&name, run_id, user))
+        .await
+        .map_err(|e| ResourceError::Provision(format!("create build pod {name}: {e}")))?;
+    Ok(name)
+}
+
+/// Would this cluster admit the build pod? Dry-run create runs the whole admission chain
+/// — PSA level, SCC selection, mutating/validating webhooks — and persists nothing.
+///
+/// Named as the reason it exists: the rootless posture (Unconfined seccomp/AppArmor,
+/// `allowPrivilegeEscalation`) is what a default `restricted` policy rejects, and it does
+/// so twenty minutes into a run otherwise
+pub async fn probe_admission(client: &kube::Client) -> Result<(), kube::Error> {
+    let params = PostParams { dry_run: true, ..Default::default() };
+    Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
+        .create(&params, &build_pod("ztest-build-admission-probe", "probe", "probe"))
+        .await
+        .map(|_| ())
+}
+
+/// The pod both the real build and [`probe_admission`] submit — one manifest, so the
+/// dry run cannot pass a spec the build then differs from
+fn build_pod(name: &str, run_id: &str, user: &str) -> Pod {
     let (cpu, mem) =
         crate::qos::build::BUILDKIT_BUILD.guaranteed_cpu_mem("buildkit build footprint");
-    let name = format!("ztest-build-{:08x}", rand::random::<u32>());
-    let pod: Pod = serde_json::from_value(json!({
+    serde_json::from_value(json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
@@ -238,12 +264,7 @@ pub async fn create_build_pod(
         },
         "spec": pod_spec(&cpu, &mem),
     }))
-    .expect("static Pod manifest is valid");
-    Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
-        .create(&PostParams::default(), &pod)
-        .await
-        .map_err(|e| ResourceError::Provision(format!("create build pod {name}: {e}")))?;
-    Ok(name)
+    .expect("static Pod manifest is valid")
 }
 
 /// Block until the pod's `Ready` condition is `True` (buildkitd answers

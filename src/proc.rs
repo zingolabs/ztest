@@ -64,3 +64,10 @@ pub async fn run(
         None => run_inherited(program, args, envs),
     }
 }
+
+/// Is `bin` on `PATH`? A scan, nothing executed (`git --help` opens a pager,
+/// `kubectl --version` is not a flag)
+pub fn on_path(bin: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else { return false };
+    std::env::split_paths(&path).any(|dir| dir.join(bin).is_file())
+}

@@ -305,6 +305,7 @@ mod tests {
             name: "data.tar.zst".to_string(),
             oid: oid.to_string(),
             size: 4096,
+            uncompressed_bytes: 0,
             payload: SeedPayload::Archive,
             base_uri: crate::storage::r2::BASE_URI.to_string(),
             key_prefix: crate::storage::r2::KEY_PREFIX.to_string(),

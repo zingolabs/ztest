@@ -10,9 +10,77 @@ use clap::{Args as ClapArgs, Subcommand};
 
 use ztest::api::cluster_config::{self, Config, Profile};
 use ztest::api::runtime::{self, ContainerRuntime};
+use ztest_ui::Theme;
+use ztest_ui::template::{Fields, draw};
 
 mod csi_hostpath;
 mod setup;
+
+/// Row shapes for every `ztest cluster` line; glyph + ink resolve through [`Theme`]
+mod row {
+    /// Mark cells opening a verdict row. Glyph and tone ride one const, so a mark and its
+    /// ink cannot disagree
+    pub(super) const OK: &str = "{@ok|pass}";
+    pub(super) const FAIL: &str = "{@fail|fail}";
+    pub(super) const WARN: &str = "{@warn|skip}";
+    pub(super) const BLOCKED: &str = "{@dot|dim}";
+    pub(super) const BULLET: &str = "{@bullet|dim}";
+    /// No `@arrow` glyph cell → caller binds `mark` (`→`)
+    pub(super) const BOUND: &str = "{mark|dim}";
+
+    pub(super) const HINT: &str = "  {hint|dim}";
+    pub(super) const NOTE: &str = "{note}";
+    /// Marker stays plain — the inactive one is a space, and ink around it is pure escape
+    pub(super) const PROFILE: &str = "{marker} {name|bold}  ({summary|dim})";
+    pub(super) const CURRENT: &str = "{name|bold}  ({summary|dim})";
+    pub(super) const SAVED: &str = "{verb} `{name|bold}`  ({summary|dim})";
+    pub(super) const DEFAULTED: &str = "`{name|bold}` is now the default";
+    pub(super) const DEFAULT_SET: &str = "default is now `{name|bold}`";
+    pub(super) const REMOVED: &str = "removed `{name|bold}`";
+    pub(super) const PROBED: &str = "  {label}: {value|bold} (probed)";
+    pub(super) const UNSET: &str = "  {label} unset: {why|dim}";
+    pub(super) const UNSAVED: &str = "  {label} {value|bold} found but not saved: {detail|dim}";
+    pub(super) const HEADER: &str =
+        "cluster  {name|bold}  {class|dim}  (context: {context}, runtime: {runtime|dim})";
+    pub(super) const REMEDY: &str = "      {note|dim}";
+    pub(super) const TARGET: &str = "{@bullet|dim} target cluster: {url|bold}";
+    pub(super) const READY: &str = "{@ok|pass} ztest resources ready. Run tests with: {cmd|bold}";
+    pub(super) const OPTIONAL_DOWN: &str = concat!(
+        "{@warn|skip} {name|bold} did not come up. Everything `ztest run` needs is ready; ",
+        "metrics and profiling are not.",
+    );
+    pub(super) const GAP_TOOLS: &str = "{@fail|fail} {gap}; install {tools|bold} to fix it here";
+    pub(super) const GAP_FLAG: &str = "{@fail|fail} {gap}; rerun with {flag|bold}";
+    pub(super) const PAST_WINDOW: &str = concat!(
+        "  {@warn|skip} server 1.{minor|bold} is past {reference|bold}'s {window|bold};",
+        " deploying `latest`",
+    );
+    pub(super) const INSTALLED: &str = concat!(
+        "  {@ok|pass} csi-hostpath installed",
+        " ({class|bold} is now the default StorageClass)",
+    );
+    /// Repainted in place while a driver pod settles; `secs` drops on a non-TTY
+    pub(super) const SETTLING: &str = "    {note}[  {secs:.0}s]";
+
+    pub(super) fn capability(mark: &str) -> String {
+        format!("  {mark} {{name:<26}}  {{detail|dim}}")
+    }
+
+    /// Mark + text, `detail` and `note` optional (an absent one takes its separator)
+    pub(super) fn marked(mark: &str) -> String {
+        format!("{mark} {{text}}[: {{detail|dim}}][ {{note|dim}}]")
+    }
+
+    /// [`marked`], indented under the command line that owns it
+    pub(super) fn step(mark: &str) -> String {
+        format!("  {}", marked(mark))
+    }
+}
+
+/// Bind + draw one row (no `*` cell and no spinner anywhere here → zero width, zero elapsed)
+fn say(src: &str, fields: &Fields<'_>, theme: &Theme) {
+    println!("{}", draw(src, fields, theme));
+}
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -123,19 +191,26 @@ pub fn execute(args: Args) -> ExitCode {
 }
 
 fn list() -> Result<(), String> {
+    let theme = Theme::detect();
     let cfg = cluster_config::load()?;
     if cfg.clusters.is_empty() {
-        println!("no cluster profiles. Add one:\n  ztest cluster add zkn --kind");
+        say(row::NOTE, &Fields::new().text("note", "no cluster profiles. Add one:"), &theme);
+        say(row::HINT, &Fields::new().text("hint", "ztest cluster add zkn --kind"), &theme);
         return Ok(());
     }
     for (name, profile) in &cfg.clusters {
         let marker = if cfg.current.as_deref() == Some(name.as_str()) { "*" } else { " " };
-        println!("{marker} {name}  ({})", profile.summary());
+        let data = Fields::new()
+            .text("marker", marker)
+            .text("name", name.as_str())
+            .text("summary", profile.summary());
+        say(row::PROFILE, &data, &theme);
     }
     Ok(())
 }
 
 fn current() -> Result<(), String> {
+    let theme = Theme::detect();
     let cfg = cluster_config::load()?;
     match cfg.current.as_deref() {
         Some(name) => {
@@ -144,14 +219,15 @@ fn current() -> Result<(), String> {
                 .get(name)
                 .map(Profile::summary)
                 .unwrap_or_else(|| "<dangling: profile removed>".to_string());
-            println!("{name}  ({summary})");
-            Ok(())
+            let data = Fields::new().text("name", name).text("summary", summary);
+            say(row::CURRENT, &data, &theme);
         }
         None => {
-            println!("no default cluster set (runs follow the ambient kube-context / env)");
-            Ok(())
+            let note = "no default cluster set (runs follow the ambient kube-context / env)";
+            say(row::NOTE, &Fields::new().text("note", note), &theme);
         }
     }
+    Ok(())
 }
 
 async fn add(a: AddArgs) -> Result<(), String> {
@@ -176,18 +252,37 @@ async fn add(a: AddArgs) -> Result<(), String> {
     }
     cfg.save()?;
 
+    let theme = Theme::detect();
     let verb = if existed { "updated" } else { "added" };
-    println!("{verb} `{}`  ({})", a.name, profile.summary());
+    let data = Fields::new()
+        .text("verb", verb)
+        .text("name", a.name.as_str())
+        .text("summary", profile.summary());
+    say(row::SAVED, &data, &theme);
     if cfg.current.as_deref() == Some(a.name.as_str()) {
-        println!("`{}` is now the default", a.name);
+        say(row::DEFAULTED, &Fields::new().text("name", a.name.as_str()), &theme);
     }
     if profile.runtime.is_none() {
-        adopt_runtime(&a.name, &profile);
+        adopt_runtime(&a.name, &profile, &theme);
     }
     if !named_driver {
-        adopt_storage_driver(&a.name).await;
+        adopt_storage_driver(&a.name, &theme).await;
     }
     Ok(())
+}
+
+/// `label` names which knob a probe row reports on ([`row::PROBED`] and friends serve
+/// runtime and storage driver alike)
+fn probed(label: &str, value: &str, saved: Result<(), String>, theme: &Theme) {
+    let data = Fields::new().text("label", label).text("value", value);
+    match saved {
+        Ok(()) => say(row::PROBED, &data, theme),
+        Err(e) => say(row::UNSAVED, &data.text("detail", e), theme),
+    }
+}
+
+fn unset(label: &str, why: &str, theme: &Theme) {
+    say(row::UNSET, &Fields::new().text("label", label).text("why", why), theme);
 }
 
 /// Record the engine owning this cluster when the profile named none.
@@ -195,19 +290,16 @@ async fn add(a: AddArgs) -> Result<(), String> {
 /// - kind profile → exact (node container = one engine's, never shared)
 /// - no node to observe → sole live daemon, else left unset
 /// - Never fatal: profile already saved, `ztest cluster check` = the gate
-fn adopt_runtime(name: &str, profile: &Profile) {
+fn adopt_runtime(name: &str, profile: &Profile, theme: &Theme) {
     let observed = profile
         .kind_cluster()
         .and_then(|cluster| runtime::owner_of(&format!("{cluster}-control-plane")))
         .or_else(runtime::sole_usable);
     let Some(rt) = observed else {
-        println!("  runtime unset: no single engine found — name one with --runtime");
+        unset("runtime", "no single engine found — name one with --runtime", theme);
         return;
     };
-    match persist_runtime(name, rt) {
-        Ok(()) => println!("  runtime: {} (probed)", rt.as_str()),
-        Err(e) => println!("  runtime {} found but not saved: {e}", rt.as_str()),
-    }
+    probed("runtime", rt.as_str(), persist_runtime(name, rt), theme);
 }
 
 fn persist_runtime(name: &str, rt: ContainerRuntime) -> Result<(), String> {
@@ -223,13 +315,13 @@ fn persist_runtime(name: &str, rt: ContainerRuntime) -> Result<(), String> {
 ///   snapshot → seeding silently degrades, and only a fixture-mounting run finds out
 /// - Only on exactly one candidate (several = a choice ztest must not make silently)
 /// - Never fatal: the profile is already saved, and `ztest cluster check` is the gate
-async fn adopt_storage_driver(name: &str) {
+async fn adopt_storage_driver(name: &str, theme: &Theme) {
     // SAFETY: pre-spawn, as in `check` (applies the profile via non-thread-safe env set)
     if unsafe { cluster_config::activate(Some(name)) }.is_err() {
         return;
     }
     let Ok(client) = ztest::api::cluster::client().await else {
-        println!("  storage driver unset: cluster unreachable — run `ztest cluster check`");
+        unset("storage driver", "cluster unreachable — run `ztest cluster check`", theme);
         return;
     };
     let drivers: Vec<String> = match ztest::api::storage_class::discover(&client).await {
@@ -242,11 +334,8 @@ async fn adopt_storage_driver(name: &str) {
         Err(_) => Vec::new(),
     };
     match storage_choice(&drivers) {
-        Ok(only) => match persist_storage_driver(name, only) {
-            Ok(()) => println!("  storage driver: {only} (probed)"),
-            Err(e) => println!("  storage driver {only} found but not saved: {e}"),
-        },
-        Err(why) => println!("  storage driver unset: {why}"),
+        Ok(only) => probed("storage driver", only, persist_storage_driver(name, only), theme),
+        Err(why) => unset("storage driver", &why, theme),
     }
 }
 
@@ -279,7 +368,7 @@ fn set(name: String) -> Result<(), String> {
     }
     cfg.current = Some(name.clone());
     cfg.save()?;
-    println!("default is now `{name}`");
+    say(row::DEFAULT_SET, &Fields::new().text("name", name), &Theme::detect());
     Ok(())
 }
 
@@ -292,7 +381,7 @@ fn remove(name: String) -> Result<(), String> {
         cfg.current = None;
     }
     cfg.save()?;
-    println!("removed `{name}`");
+    say(row::REMOVED, &Fields::new().text("name", name), &Theme::detect());
     Ok(())
 }
 
@@ -310,60 +399,48 @@ async fn check(cluster: Option<String>) -> Result<(), String> {
         ztest::api::cluster::client().await.map_err(|e| format!("connecting to cluster: {e}"))?;
 
     let report = ztest::api::capability::probe(&client).await;
-    print!("{}", render(&report, bound.as_deref()));
+    print!("{}", render(&report, bound.as_deref(), &Theme::detect()));
 
     match report.is_runnable() {
         true => Ok(()),
-        false => Err(format!(
-            "{} required capability/ies missing — `ztest run` cannot work here",
-            report.blocking().count()
-        )),
+        false => Err(match report.blocking().count() {
+            1 => "1 capability `ztest run` needs is missing".to_string(),
+            n => format!("{n} capabilities `ztest run` needs are missing"),
+        }),
     }
 }
 
 /// One line per capability, remedy only where actionable
-fn render(report: &ztest::api::capability::Report, bound: Option<&str>) -> String {
-    use owo_colors::OwoColorize as _;
+fn render(report: &ztest::api::capability::Report, bound: Option<&str>, theme: &Theme) -> String {
     use std::fmt::Write as _;
     use ztest::api::capability::{Finding, Need};
 
-    let theme = ztest_ui::Theme::detect();
     let mut out = String::new();
 
-    let context = cluster_config::active_context().unwrap_or_else(|| "(ambient)".into());
-    let class = ztest::backends::image::selected_class().label();
-    let _ = writeln!(
-        out,
-        "cluster  {}  {}  (context: {context}, runtime: {})",
-        bound.unwrap_or("-").style(theme.styles.count),
-        class.style(theme.styles.dim),
-        runtime::program().style(theme.styles.dim),
-    );
+    let header = Fields::new()
+        .text("name", bound.unwrap_or("-"))
+        .text("class", ztest::backends::image::selected_class().label())
+        .text("context", cluster_config::active_context().unwrap_or_else(|| "(ambient)".into()))
+        .text("runtime", runtime::program());
+    let _ = writeln!(out, "{}", draw(row::HEADER, &header, theme));
 
     for cap in &report.capabilities {
         // Missing optional = warning (costs a feature, not the run)
-        let (mark, style) = match (&cap.finding, cap.need) {
-            (Finding::Present(_), _) => (theme.chars.ok, theme.styles.pass),
-            (_, Need::Required) => (theme.chars.fail, theme.styles.fail),
-            (_, Need::Enables(_)) => (theme.chars.warn, theme.styles.skip),
+        let mark = match (&cap.finding, cap.need) {
+            (Finding::Present(_), _) => row::OK,
+            (_, Need::Required | Need::Provisioned | Need::RequiredForRun) => row::FAIL,
+            (_, Need::Enables(_)) => row::WARN,
         };
-        let _ = writeln!(
-            out,
-            "  {} {:<26}  {}",
-            mark.style(style),
-            cap.name,
-            cap.finding.detail().style(theme.styles.dim),
-        );
+        let data = Fields::new().text("name", cap.name).text("detail", cap.finding.detail());
+        let _ = writeln!(out, "{}", draw(&row::capability(mark), &data, theme));
         if !cap.finding.is_present() {
             let lost = match cap.need {
-                Need::Required => "ztest run".to_string(),
-                Need::Enables(f) => f.to_string(),
+                Need::Required | Need::Provisioned | Need::RequiredForRun => "ztest run",
+                Need::Enables(f) => f,
             };
-            let _ = writeln!(
-                out,
-                "      {}",
-                format!("→ {lost} unavailable; see {}", cap.remedy).style(theme.styles.dim),
-            );
+            let note = format!("{} {lost} unavailable; {}", theme.chars.arrow, cap.remedy);
+            let _ =
+                writeln!(out, "{}", draw(row::REMEDY, &Fields::new().text("note", note), theme));
         }
     }
     out
@@ -372,9 +449,111 @@ fn render(report: &ztest::api::capability::Report, bound: Option<&str>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ztest_ui::template::Template;
+
+    use ztest::api::capability::{Capability, Finding, Need, Report};
 
     fn drivers(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// One row per verdict the mark table distinguishes
+    fn report() -> Report {
+        Report {
+            capabilities: vec![
+                Capability {
+                    name: "image registry",
+                    need: Need::Required,
+                    finding: Finding::Present("in-cluster".into()),
+                    remedy: "see docs/registry.md",
+                },
+                Capability {
+                    name: "snapshot-capable storage",
+                    need: Need::Required,
+                    finding: Finding::Absent("no CSI driver".into()),
+                    remedy: "see docs/storage.md",
+                },
+                Capability {
+                    name: "metrics stack",
+                    need: Need::Enables("profiling"),
+                    finding: Finding::Absent("no ztest-obs".into()),
+                    remedy: "see docs/obs.md",
+                },
+            ],
+        }
+    }
+
+    /// `Template::parse` panics on a malformed source, and most of these rows draw only on
+    /// a failing cluster — a typo would otherwise surface as a panic mid-provision
+    #[test]
+    fn every_row_parses() {
+        let marks = [row::OK, row::FAIL, row::WARN, row::BLOCKED, row::BULLET, row::BOUND];
+        let composed: Vec<String> =
+            marks.iter().flat_map(|m| [row::capability(m), row::marked(m), row::step(m)]).collect();
+        let fixed = [
+            row::HINT,
+            row::NOTE,
+            row::PROFILE,
+            row::CURRENT,
+            row::SAVED,
+            row::DEFAULTED,
+            row::DEFAULT_SET,
+            row::REMOVED,
+            row::PROBED,
+            row::UNSET,
+            row::UNSAVED,
+            row::HEADER,
+            row::REMEDY,
+            row::TARGET,
+            row::READY,
+            row::OPTIONAL_DOWN,
+            row::GAP_TOOLS,
+            row::GAP_FLAG,
+            row::PAST_WINDOW,
+            row::INSTALLED,
+            row::SETTLING,
+        ];
+        for src in fixed.into_iter().chain(composed.iter().map(String::as_str)) {
+            Template::parse(src);
+        }
+    }
+
+    /// Every mark used to be a hardcoded glyph, so a terminal without Unicode got mojibake
+    /// where a verdict belonged
+    #[test]
+    fn a_finding_marks_itself_in_whichever_theme_is_active() {
+        let unicode = render(&report(), Some("zkn"), &Theme::for_capabilities(false, true));
+        let ascii = render(&report(), Some("zkn"), &Theme::for_capabilities(false, false));
+        for (drawn, (ok, fail, warn)) in
+            [(&unicode, ("✓", "✗", "!")), (&ascii, ("OK", "FAIL", "WARN"))]
+        {
+            assert!(drawn.contains(&format!("  {ok} image registry")), "{drawn}");
+            assert!(drawn.contains(&format!("  {fail} snapshot-capable storage")), "{drawn}");
+            assert!(drawn.contains(&format!("  {warn} metrics stack")), "{drawn}");
+        }
+    }
+
+    /// The whole `cluster check` frame in ascii. A remedy arrow and a cordon mark were
+    /// hardcoded here, and a Unicode golden reads identically either way
+    #[test]
+    fn the_cluster_report_falls_back_to_ascii() {
+        let ascii = Theme::for_capabilities(false, false);
+        for context in [Some("zkn"), None] {
+            ztest_ui::testing::assert_ascii_clean(
+                "cluster::render",
+                &render(&report(), context, &ascii),
+            );
+        }
+    }
+
+    /// A missing capability is only actionable with the remedy under it; a present one
+    /// would only add noise
+    #[test]
+    fn only_a_missing_capability_carries_a_remedy() {
+        let drawn = render(&report(), None, &Theme::for_capabilities(false, true));
+        assert!(drawn.contains("→ ztest run unavailable; see docs/storage.md"), "{drawn}");
+        assert!(drawn.contains("→ profiling unavailable; see docs/obs.md"), "{drawn}");
+        assert!(!drawn.contains("docs/registry.md"), "{drawn}");
     }
 
     #[test]

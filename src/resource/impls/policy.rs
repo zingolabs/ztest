@@ -49,39 +49,28 @@ impl RuleScope {
     }
 }
 
-/// One RBAC rule for the run identity. `check_verb` = the verb the run-start
-/// self-check probes: `Some` for cluster-scoped rules (RBAC-drift-prone), `None`
-/// for the namespaced per-test objects
+/// One RBAC rule for the run identity. Every (resource, verb) pair here is probed by
+/// [`check_access`] — naming a resource is not being allowed to write it, and a rule
+/// granted four verbs of five fails exactly one call site
 struct Rule {
     group: &'static str,
     resources: &'static [&'static str],
     verbs: &'static [&'static str],
-    check_verb: Option<&'static str>,
     scope: RuleScope,
 }
 
-const RUN_RULES: &[Rule] = &[
+static RUN_RULES: &[Rule] = &[
+    // `patch` = server-side apply, which `sync` uses to create its persistent namespace
     Rule {
         group: "",
         resources: &["namespaces"],
-        verbs: &["get", "list", "watch", "create", "delete"],
-        check_verb: Some("create"),
+        verbs: &["get", "list", "watch", "create", "patch", "delete"],
         scope: RuleScope::All,
     },
-    // `watch` feeds `pipeline::capacity_watch`, best-effort → check verb stays
-    // `list` (an older role degrades, never fails)
     Rule {
         group: "",
         resources: &["nodes"],
         verbs: &["get", "list", "watch"],
-        check_verb: Some("list"),
-        scope: RuleScope::All,
-    },
-    Rule {
-        group: "",
-        resources: &["persistentvolumes"],
-        verbs: &["get", "list", "watch"],
-        check_verb: Some("list"),
         scope: RuleScope::All,
     },
     // Per-test environment objects, bound cluster-wide (apply in every ztest namespace)
@@ -89,7 +78,6 @@ const RUN_RULES: &[Rule] = &[
         group: "",
         resources: &["pods", "services", "configmaps", "persistentvolumeclaims", "resourcequotas"],
         verbs: &["get", "list", "watch", "create", "update", "patch", "delete"],
-        check_verb: None,
         scope: RuleScope::All,
     },
     // SAs read-only on the run path (waits for `default`, reads budget annotations)
@@ -98,14 +86,14 @@ const RUN_RULES: &[Rule] = &[
         group: "",
         resources: &["serviceaccounts"],
         verbs: &["get", "list", "watch"],
-        check_verb: None,
         scope: RuleScope::All,
     },
+    // `kubernetes` endpoint in `default` = the apiserver address a host-side profile
+    // collector dials (the kubeconfig's is loopback, dead off the host network)
     Rule {
         group: "",
-        resources: &["events"],
+        resources: &["endpoints"],
         verbs: &["get", "list", "watch"],
-        check_verb: None,
         scope: RuleScope::All,
     },
     // logs = diagnostics, port-forward = out-of-cluster dial, exec = build pod + profiler
@@ -113,26 +101,15 @@ const RUN_RULES: &[Rule] = &[
         group: "",
         resources: &["pods/log", "pods/portforward", "pods/exec"],
         verbs: &["get", "list", "create"],
-        check_verb: None,
-        scope: RuleScope::All,
-    },
-    // Build-pod resizer grows/shrinks buildkit + builder in place (KEP-1287)
-    Rule {
-        group: "",
-        resources: &["pods/resize"],
-        verbs: &["get", "patch", "update"],
-        check_verb: None,
         scope: RuleScope::All,
     },
     // Metrics API, unused by ztest itself (capacity = request-based)
     // - Needed by k9s through this SA: without it the whole CPU/MEM path blanks
     // - `pods`+`nodes` mirror `system:aggregated-metrics-reader`
-    // - No `check_verb`: a cluster without the metrics API still runs
     Rule {
         group: "metrics.k8s.io",
         resources: &["pods", "nodes"],
         verbs: &["get", "list"],
-        check_verb: None,
         scope: RuleScope::All,
     },
     // Read = capacity accounting, write = seed puller (`materialize::puller_job`)
@@ -141,36 +118,25 @@ const RUN_RULES: &[Rule] = &[
         group: "batch",
         resources: &["jobs"],
         verbs: &["get", "list", "watch", "create", "delete"],
-        check_verb: Some("list"),
         scope: RuleScope::All,
     },
     Rule {
         group: "coordination.k8s.io",
         resources: &["leases"],
         verbs: &["get", "list", "watch", "create", "update", "patch", "delete"],
-        check_verb: None,
         scope: RuleScope::All,
     },
     // Seed clone (VolumeSnapshots), seed bindings (VolumeSnapshotContents), class read
     Rule {
         group: "snapshot.storage.k8s.io",
-        resources: &["volumesnapshots"],
+        resources: &["volumesnapshots", "volumesnapshotcontents"],
         verbs: &["get", "list", "watch", "create", "delete"],
-        check_verb: None,
-        scope: RuleScope::All,
-    },
-    Rule {
-        group: "snapshot.storage.k8s.io",
-        resources: &["volumesnapshotcontents"],
-        verbs: &["get", "list", "watch", "create", "delete"],
-        check_verb: Some("create"),
         scope: RuleScope::All,
     },
     Rule {
         group: "snapshot.storage.k8s.io",
         resources: &["volumesnapshotclasses"],
         verbs: &["get", "list"],
-        check_verb: Some("get"),
         scope: RuleScope::All,
     },
     // Class read → fail fast on a cluster with no snapshot-capable storage
@@ -178,7 +144,6 @@ const RUN_RULES: &[Rule] = &[
         group: "storage.k8s.io",
         resources: &["storageclasses"],
         verbs: &["get", "list"],
-        check_verb: Some("get"),
         scope: RuleScope::All,
     },
     // No registry grant: builds ride `pods/exec` above, push uses the BuildKit pod's creds
@@ -211,53 +176,100 @@ fn run_rules_hash(backend: ClusterClass) -> String {
     manifest_hash(&serde_json::Value::Array(render_run_rules(backend)))
 }
 
-/// Cluster-scoped permission self-check via SelfSubjectAccessReview → missing
-/// grants (empty = all present). Probes `check_verb` rules only, `backend`-gated
+/// Bound on concurrent SelfSubjectAccessReviews. The whole role is ~80 pairs; issuing
+/// them at once is a burst the apiserver need not absorb for a preflight
+const SSAR_CONCURRENCY: usize = 16;
+
+/// Permission self-check: every (resource, verb) [`RUN_RULES`] grants, asked of the
+/// apiserver as this caller. Empty = the role covers every call ztest makes.
+///
+/// Whole-role, not a sampled subset: the failures this catches are partial grants (a rule
+/// naming `jobs` read-only while the seed puller needs `create`), which no sample sees
 pub async fn check_access(
     client: &kube::Client,
     backend: ClusterClass,
 ) -> Result<Vec<String>, kube::Error> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+    use k8s_openapi::api::authorization::v1::SelfSubjectAccessReview;
+
+    let api: Api<SelfSubjectAccessReview> = Api::all(client.clone());
+    let grants: Vec<Grant> = RUN_RULES
+        .iter()
+        .filter(|r| r.scope.includes(backend))
+        .flat_map(|r| {
+            r.resources.iter().flat_map(|resource| {
+                r.verbs.iter().map(|verb| Grant { group: r.group, resource, verb })
+            })
+        })
+        .collect();
+
+    let denied: Vec<Option<String>> = futures::stream::iter(grants)
+        .map(|g| allows(&api, g))
+        .buffer_unordered(SSAR_CONCURRENCY)
+        .try_collect()
+        .await?;
+    Ok(denied.into_iter().flatten().collect())
+}
+
+/// One (resource, verb) pair as the SSAR asks it. A named type, not a tuple: a
+/// three-`&str` tuple crossing `buffer_unordered` defeats closure lifetime inference
+#[derive(Clone, Copy)]
+struct Grant {
+    group: &'static str,
+    resource: &'static str,
+    verb: &'static str,
+}
+
+/// `None` = allowed; `Some` = denied, phrased as the grant an operator must add
+async fn allows(
+    api: &Api<k8s_openapi::api::authorization::v1::SelfSubjectAccessReview>,
+    Grant { group, resource, verb }: Grant,
+) -> Result<Option<String>, kube::Error> {
     use k8s_openapi::api::authorization::v1::{
         ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
     };
     use kube::api::PostParams;
 
-    let api: Api<SelfSubjectAccessReview> = Api::all(client.clone());
-    let mut missing = Vec::new();
-    for rule in RUN_RULES {
-        if !rule.scope.includes(backend) {
-            continue;
-        }
-        let Some(verb) = rule.check_verb else {
-            continue;
-        };
-        let resource = rule.resources[0];
-        // `resource/subresource` must be split for the SSAR, else it probes a
-        // nonexistent resource and always denies
-        let (res, subres) = match resource.split_once('/') {
-            Some((r, s)) => (r, Some(s.to_string())),
-            None => (resource, None),
-        };
-        let review = SelfSubjectAccessReview {
-            spec: SelfSubjectAccessReviewSpec {
-                resource_attributes: Some(ResourceAttributes {
-                    group: Some(rule.group.to_string()),
-                    resource: Some(res.to_string()),
-                    subresource: subres,
-                    verb: Some(verb.to_string()),
-                    ..Default::default()
-                }),
+    // `resource/subresource` must be split for the SSAR, else it probes a nonexistent
+    // resource and always denies
+    let (res, subres) = match resource.split_once('/') {
+        Some((r, s)) => (r, Some(s.to_string())),
+        None => (resource, None),
+    };
+    let review = SelfSubjectAccessReview {
+        spec: SelfSubjectAccessReviewSpec {
+            resource_attributes: Some(ResourceAttributes {
+                group: Some(group.to_string()),
+                resource: Some(res.to_string()),
+                subresource: subres,
+                verb: Some(verb.to_string()),
                 ..Default::default()
-            },
+            }),
             ..Default::default()
-        };
-        let resp = api.create(&PostParams::default(), &review).await?;
-        if !resp.status.map(|s| s.allowed).unwrap_or(false) {
-            let group = if rule.group.is_empty() { "core" } else { rule.group };
-            missing.push(format!("{verb} {resource} ({group})"));
-        }
-    }
-    Ok(missing)
+        },
+        ..Default::default()
+    };
+    let allowed =
+        api.create(&PostParams::default(), &review).await?.status.is_some_and(|s| s.allowed);
+    let group = if group.is_empty() { "core" } else { group };
+    Ok((!allowed).then(|| format!("{verb} {resource} ({group})")))
+}
+
+/// Does the applied `ztest-remote` match what this build renders?
+///
+/// The half [`check_access`] cannot see: an admin caller is allowed everything, so their
+/// SSAR passes over a role that would 403 the run ServiceAccount mid-run
+pub async fn role_is_current(
+    client: &kube::Client,
+    backend: ClusterClass,
+) -> Result<bool, kube::Error> {
+    let role = Api::<ClusterRole>::all(client.clone()).get_opt(RUN_CLUSTER_ROLE).await?;
+    Ok(role.as_ref().and_then(rules_hash) == Some(run_rules_hash(backend)))
+}
+
+/// Revision stamp an applied role carries, if any
+fn rules_hash(role: &ClusterRole) -> Option<String> {
+    role.metadata.annotations.as_ref()?.get(RULES_HASH_ANNOTATION).cloned()
 }
 
 // ── RunIdentity ───────────────────────────────────────────────────────
@@ -285,26 +297,17 @@ impl Provider for RunIdentityProvider {
         Lifetime::Cached
     }
 
+    /// Ready needs a *current* role, not merely a present one — a stale one re-applies
+    /// rather than reading as done
     async fn probe(&self, cx: &Cx) -> Readiness {
         let sa: Api<ServiceAccount> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
-        let cr: Api<ClusterRole> = Api::all(cx.client.clone());
         let sec: Api<Secret> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
         match (
             sa.get(RUN_SERVICE_ACCOUNT).await,
-            cr.get(RUN_CLUSTER_ROLE).await,
             sec.get(RUN_TOKEN_SECRET).await,
+            role_is_current(&cx.client, self.backend).await,
         ) {
-            // Ready only on a matching hash annotation (present-but-stale reconciles)
-            (Ok(_), Ok(role), Ok(_))
-                if role
-                    .metadata
-                    .annotations
-                    .as_ref()
-                    .and_then(|a| a.get(RULES_HASH_ANNOTATION))
-                    == Some(&run_rules_hash(self.backend)) =>
-            {
-                Readiness::Ready
-            }
+            (Ok(_), Ok(_), Ok(true)) => Readiness::Ready,
             _ => Readiness::Absent,
         }
     }
@@ -436,17 +439,24 @@ mod tests {
         );
         // BuildKit builds drive through `pods/exec`, never a registry-specific grant
         assert!(grants(b, "", "pods/exec"), "buildkit build execs into the pod");
+        assert!(
+            grants_verb(b, "", "namespaces", "patch"),
+            "`ztest sync` server-side applies its persistent namespace"
+        );
+        assert!(
+            grants(b, "", "endpoints"),
+            "host-side profiling reads the `kubernetes` endpoint for the apiserver address"
+        );
     }
 
+    /// A grant nothing calls is authority the run identity should not hold
     #[test]
-    fn self_check_verbs_are_actually_granted() {
-        // Probe a verb the rule grants, else a present role reads as missing
+    fn the_role_grants_nothing_unused() {
         for r in RUN_RULES {
-            if let Some(v) = r.check_verb {
+            for res in r.resources {
                 assert!(
-                    r.verbs.contains(&v),
-                    "{}: check_verb `{v}` not in granted verbs",
-                    r.resources[0]
+                    !["persistentvolumes", "events", "pods/resize"].contains(res),
+                    "`{res}` has no call site; drop the rule rather than grant it"
                 );
             }
         }

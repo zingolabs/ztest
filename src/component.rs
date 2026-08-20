@@ -93,6 +93,7 @@ pub struct ComponentOpts {
     pub shared_state: Option<SharedState>,
     pub coinbase_pool: Option<Pool>,
     pub restore: Option<RestoreSource>,
+    pub disk: Option<Disk>,
 }
 
 /// Source of a component's pre-existing on-disk state. `Archive` covers a synced
@@ -120,6 +121,83 @@ pub struct Cpu(u64);
 /// Memory, in bytes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Mem(u64);
+
+/// One volume's reservation: capacity, plus bandwidth/IOPS floors.
+///
+/// - Own type, not a [`Mem`] alias: a volume reserves three things, memory reserves one
+/// - `min_bps`/`min_iops` are carried and accounted, not yet enforced — the cgroup
+///   `io.max` path they render into lands with the CSI work (`docs/design-qos.md`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Disk {
+    bytes: u64,
+    min_bps: Option<u64>,
+    min_iops: Option<u64>,
+}
+
+impl Disk {
+    pub fn bytes(n: u64) -> Self {
+        assert!(n > 0, "disk quantity must be non-zero");
+        Disk { bytes: n, min_bps: None, min_iops: None }
+    }
+
+    pub fn mib(n: u64) -> Self {
+        Self::bytes(n.checked_mul(crate::qos::MIB).expect("disk overflow"))
+    }
+
+    pub fn gib(n: u64) -> Self {
+        Self::bytes(n.checked_mul(crate::qos::GIB).expect("disk overflow"))
+    }
+
+    pub fn tib(n: u64) -> Self {
+        Self::gib(n.checked_mul(1024).expect("disk overflow"))
+    }
+
+    /// Parse a Kubernetes quantity (`400Gi`, `1Ti`). `None` if unparseable or zero
+    pub fn parse(s: &str) -> Option<Self> {
+        crate::qos::units::parse_mem_bytes_opt(s).filter(|b| *b > 0).map(Self::bytes)
+    }
+
+    /// Sustained read+write floor, bytes/sec
+    pub fn min_bps(mut self, n: u64) -> Self {
+        self.min_bps = Some(n);
+        self
+    }
+
+    /// Sustained read+write floor, ops/sec
+    pub fn min_iops(mut self, n: u64) -> Self {
+        self.min_iops = Some(n);
+        self
+    }
+
+    pub fn as_bytes(self) -> u64 {
+        self.bytes
+    }
+
+    pub fn bps(self) -> Option<u64> {
+        self.min_bps
+    }
+
+    pub fn iops(self) -> Option<u64> {
+        self.min_iops
+    }
+
+    /// k8s storage quantity for a PVC request
+    pub fn to_quantity(self) -> String {
+        for (unit, suffix) in [(crate::qos::GIB, "Gi"), (crate::qos::MIB, "Mi"), (1 << 10, "Ki")] {
+            if self.bytes.is_multiple_of(unit) {
+                return format!("{}{suffix}", self.bytes / unit);
+            }
+        }
+        self.bytes.to_string()
+    }
+
+    /// What this volume charges the ledger. The bridge from declaration to accounting —
+    /// admission speaks [`Resources`](crate::qos::Resources), never `Disk`
+    pub fn reservation(self) -> crate::qos::Resources {
+        crate::qos::Resources::new(0, 0, self.min_bps.unwrap_or(0), self.min_iops.unwrap_or(0))
+            .with_disk(self.bytes)
+    }
+}
 
 impl Cpu {
     pub fn millis(n: u64) -> Self {
@@ -297,6 +375,15 @@ pub trait ComponentBuilder: Sized {
     }
     fn resources(mut self, cpu: Cpu, memory: Mem) -> Self {
         self.component_opts_mut().resources = Some(Resources { cpu, memory });
+        self
+    }
+    /// Size this component's chain volume, overriding the artifact-derived default.
+    ///
+    /// - For a chain that *grows* past its pin (a to-tip sync): no manifest can know the
+    ///   final size, so the test declares it
+    /// - Floors at the seed's `restoreSize` — a clone below its source is rejected by CSI
+    fn disk(mut self, size: Disk) -> Self {
+        self.component_opts_mut().disk = Some(size);
         self
     }
     /// Expose a named container port beyond the backend defaults
@@ -512,5 +599,45 @@ mod tests {
             id_for("/cache/src/zaino/live-tests/clientless/../../Dockerfile"),
             "DevImageId must not depend on the Dockerfile path"
         );
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::Disk;
+    use crate::qos::GIB;
+
+    #[test]
+    fn units_render_as_k8s_quantities() {
+        assert_eq!(Disk::gib(400).to_quantity(), "400Gi");
+        assert_eq!(Disk::tib(1).to_quantity(), "1024Gi");
+        assert_eq!(Disk::mib(512).to_quantity(), "512Mi");
+        assert_eq!(Disk::parse("400Gi").expect("parses").as_bytes(), 400 * GIB);
+        assert_eq!(Disk::parse("0Gi"), None);
+    }
+
+    /// Floors are absent until declared: an unset floor and a zero floor must not be the
+    /// same value, or "unconstrained" reads as "reserve nothing" once enforcement lands
+    #[test]
+    fn bandwidth_floors_are_absent_until_declared() {
+        let plain = Disk::gib(400);
+        assert_eq!((plain.bps(), plain.iops()), (None, None));
+
+        let floored = Disk::gib(400).min_bps(200 * 1024 * 1024).min_iops(5_000);
+        assert_eq!(floored.bps(), Some(200 * 1024 * 1024));
+        assert_eq!(floored.iops(), Some(5_000));
+        assert_eq!(floored.as_bytes(), plain.as_bytes());
+    }
+
+    /// The bridge admission actually charges; an undeclared floor charges zero, which is
+    /// what every uncalibrated dimension already means
+    #[test]
+    fn reservation_carries_every_dimension() {
+        let r = Disk::gib(400).min_bps(100).min_iops(20).reservation();
+        assert_eq!((r.disk_bytes, r.disk_bps, r.disk_iops), (400 * GIB, 100, 20));
+        assert_eq!((r.cpu_milli, r.mem_bytes), (0, 0), "a volume reserves no compute");
+
+        let bare = Disk::gib(400).reservation();
+        assert_eq!((bare.disk_bps, bare.disk_iops), (0, 0));
     }
 }

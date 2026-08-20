@@ -845,11 +845,11 @@ fn oversized_context(total: u64, mut sized: Vec<(u64, PathBuf)>) -> String {
     sized.sort_unstable_by_key(|(n, _)| std::cmp::Reverse(*n));
     let mut msg = format!(
         "build context is {} (ceiling {}); refusing to ship it.\nLargest files:\n",
-        gib(total),
-        gib(context_max_bytes())
+        bytes(total),
+        bytes(context_max_bytes())
     );
     for (n, p) in sized.iter().take(SHOWN) {
-        msg.push_str(&format!("  {:>10}  {}\n", gib(*n), p.display()));
+        msg.push_str(&format!("  {:>10}  {}\n", bytes(*n), p.display()));
     }
     msg.push_str(
         "\nOnly first-party source belongs in the context. .gitignore a large \
@@ -860,20 +860,10 @@ fn oversized_context(total: u64, mut sized: Vec<(u64, PathBuf)>) -> String {
     msg
 }
 
-/// Bytes as a binary-prefixed quantity, matching ztest's `Mi`/`Gi` reporting
-fn gib(n: u64) -> String {
-    const UNITS: [(&str, u64); 4] =
-        [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10), ("B", 1)];
-    for (suffix, mult) in UNITS {
-        if n >= mult {
-            return if mult == 1 {
-                format!("{n} B")
-            } else {
-                format!("{:.1} {suffix}", n as f64 / mult as f64)
-            };
-        }
-    }
-    "0 B".to_string()
+/// IEC bytes. Wraps [`unit_value`](crate::fmt::unit_value) so a build-context size reads
+/// the same as every other byte figure ztest prints
+fn bytes(n: u64) -> String {
+    crate::fmt::unit_value(crate::fmt::Unit::Bytes, n as f64)
 }
 
 // ── small helpers ─────────────────────────────────────────────────────
@@ -928,11 +918,11 @@ mod tests {
 
     #[test]
     fn byte_quantities_use_binary_prefixes() {
-        assert_eq!(gib(8_751_733_052), "8.2 GiB");
-        assert_eq!(gib(649_866_689), "619.8 MiB");
-        assert_eq!(gib(1 << 10), "1.0 KiB");
-        assert_eq!(gib(512), "512 B");
-        assert_eq!(gib(0), "0 B");
+        assert_eq!(bytes(8_751_733_052), "8.2 GiB");
+        assert_eq!(bytes(649_866_689), "619.8 MiB");
+        assert_eq!(bytes(1 << 10), "1.0 KiB");
+        assert_eq!(bytes(512), "512 B");
+        assert_eq!(bytes(0), "0 B");
     }
 
     #[test]

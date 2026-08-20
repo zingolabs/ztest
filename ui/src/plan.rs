@@ -6,15 +6,42 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use owo_colors::OwoColorize as _;
 
 use super::Theme;
-use ztest::api::Resources;
+use super::template::{Fields, Template};
 use ztest::api::{DevImageEntry, SeedEntry};
 use ztest::api::{Plan, PlanRoot, QosNode};
 
-const GIB: u64 = 1024 * 1024 * 1024;
+/// Node grammar as templates: `kind name facts`, one shape per node kind
+mod tmpl {
+    pub(super) const SUMMARY: &str = concat!(
+        "{tests|bold} tests {@dot|dim} {images|bold} images {@dot|dim} ",
+        "{seeds|bold} seeds {@dot|dim} {bytes|bytes.bold} to pull",
+    );
+    pub(super) const ROOT: &str = "{label|bold}";
+    pub(super) const DESCRIPTION: &str = "{description|dim}";
+    pub(super) const QOS: &str = concat!(
+        "{head|dim}{kind|script_id} {class|bold} {@dot|dim} reserve {reserve|bold} ",
+        "{@dot|dim} hard cap {cap|bold}[ {@dot|dim} declared {declared|bold}]",
+    );
+    pub(super) const TAGS: &str = "{head|dim}{kind|script_id} {tags}";
+    pub(super) const IMAGE: &str = "{head|dim}{kind|script_id} {repo|bold} {mark|skip}";
+    /// Image and seed alike: the name already printed once, so only `(*)` follows
+    pub(super) const REPEAT: &str = "{head|dim}{kind|script_id} {name|bold} {mark|dim}";
+    pub(super) const SEED: &str =
+        "{head|dim}{kind|script_id} {name|bold} {sha8|dim} {size|bytes.bold}";
+    pub(super) const LEAF: &str = "{head|dim}{kind|script_id} {text|dim}";
+    pub(super) const PRUNED: &str =
+        "{head|dim}{kind|script_id} {name|skip} {sha8|dim} {size|bytes.bold}";
+}
+
+/// Renders + appends. No `*` cell and no spinner in a tree row → zero width, zero elapsed
+fn emit(out: &mut String, f: Fields<'_>, src: &str, theme: &Theme) {
+    let _ = writeln!(out, "{}", Template::parse(src).render_str(&f, 0, Duration::ZERO, theme));
+}
 
 /// `└──`/`├──` + the continuation prefix children inherit
 struct Branch {
@@ -23,12 +50,19 @@ struct Branch {
 }
 
 impl Branch {
+    /// Corners come from the theme (a gantt connector spells them the same way); only the
+    /// tail — three rules and a space — belongs to a plan tree
     fn glyphs(&self, theme: &Theme) -> (String, String) {
-        let unicode = theme.chars.vbar == "│";
-        let (tee, elbow, pipe) =
-            if unicode { ("├── ", "└── ", "│   ") } else { ("|-- ", "`-- ", "|   ") };
-        let head = format!("{}{}", self.prefix, if self.last { elbow } else { tee });
-        let next = format!("{}{}", self.prefix, if self.last { "    " } else { pipe });
+        let ch = &theme.chars;
+        let corner = match self.last {
+            true => ch.stem_last,
+            false => ch.stem_mid,
+        };
+        let head = format!("{}{corner}{} ", self.prefix, ch.hbar(2));
+        let next = match self.last {
+            true => format!("{}    ", self.prefix),
+            false => format!("{}{}   ", self.prefix, ch.vbar),
+        };
         (head, next)
     }
 }
@@ -38,7 +72,8 @@ pub fn render(plan: &Plan, theme: &Theme) -> String {
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     if plan.roots.len() > 1 {
-        writeln!(out, "{}\n", summary(plan, theme)).expect("write to string");
+        summary(&mut out, plan, theme);
+        out.push('\n');
     }
     for (i, root) in plan.roots.iter().enumerate() {
         if i > 0 {
@@ -52,8 +87,7 @@ pub fn render(plan: &Plan, theme: &Theme) -> String {
     out
 }
 
-fn summary(plan: &Plan, theme: &Theme) -> String {
-    let dot = theme.chars.dot.style(theme.styles.dim);
+fn summary(out: &mut String, plan: &Plan, theme: &Theme) {
     let images: BTreeSet<&str> =
         plan.roots.iter().flat_map(|r| r.images.iter().map(|i| i.repo.as_str())).collect();
     let seeds: BTreeSet<&str> =
@@ -66,19 +100,23 @@ fn summary(plan: &Plan, theme: &Theme) -> String {
         .collect::<std::collections::BTreeMap<_, _>>()
         .values()
         .sum();
-    format!(
-        "{} tests {dot} {} images {dot} {} seeds {dot} {} to pull",
-        plan.roots.len().style(theme.styles.count),
-        images.len().style(theme.styles.count),
-        seeds.len().style(theme.styles.count),
-        gib(bytes).style(theme.styles.count),
-    )
+    emit(
+        out,
+        Fields::new()
+            .text("tests", plan.roots.len().to_string())
+            .text("images", images.len().to_string())
+            .text("seeds", seeds.len().to_string())
+            .value("bytes", bytes as f64),
+        tmpl::SUMMARY,
+        theme,
+    );
 }
 
 fn render_root(out: &mut String, root: &PlanRoot, seen: &mut BTreeSet<String>, theme: &Theme) {
-    writeln!(out, "{}", root.label.style(theme.styles.count)).expect("write to string");
+    emit(out, Fields::new().text("label", root.label.as_str()), tmpl::ROOT, theme);
     if !root.description.is_empty() {
-        writeln!(out, "{}", root.description.style(theme.styles.dim)).expect("write to string");
+        let d = Fields::new().text("description", root.description.as_str());
+        emit(out, d, tmpl::DESCRIPTION, theme);
     }
 
     let mut rows: Vec<Row> = vec![Row::Qos(&root.qos)];
@@ -109,34 +147,24 @@ enum Row<'a> {
 
 fn qos_node(out: &mut String, q: &QosNode, b: &Branch, theme: &Theme) {
     let (head, _) = b.glyphs(theme);
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    let cap = cap_duration(q.class.profile().hard_cap);
-    let declared = match &q.declared_timeout {
-        Some(t) => format!(" {dot} declared {}", t.style(theme.styles.count)),
-        None => String::new(),
-    };
-    writeln!(
+    emit(
         out,
-        "{}{} {} {dot} reserve {} {dot} hard cap {}{declared}",
-        head.style(theme.styles.dim),
-        "qos".style(theme.styles.script_id),
-        q.class.as_label().style(theme.styles.count),
-        res(&q.admitted).style(theme.styles.count),
-        cap.style(theme.styles.count),
-    )
-    .expect("write to string");
+        Fields::new()
+            .text("head", head)
+            .text("kind", "qos")
+            .text("class", q.class.as_label())
+            .text("reserve", q.admitted.compact())
+            .text("cap", ztest::api::format_span(q.class.profile().hard_cap))
+            .maybe_text("declared", q.declared_timeout.clone()),
+        tmpl::QOS,
+        theme,
+    );
 }
 
 fn tags_node(out: &mut String, tags: &[String], b: &Branch, theme: &Theme) {
     let (head, _) = b.glyphs(theme);
-    writeln!(
-        out,
-        "{}{} {}",
-        head.style(theme.styles.dim),
-        "tags".style(theme.styles.script_id),
-        tags.join(", ")
-    )
-    .expect("write to string");
+    let f = Fields::new().text("head", head).text("kind", "tags").text("tags", tags.join(", "));
+    emit(out, f, tmpl::TAGS, theme);
 }
 
 fn image_node(
@@ -148,27 +176,12 @@ fn image_node(
 ) {
     let (head, next) = b.glyphs(theme);
     let key = format!("image:{}:{:?}", img.repo, img.source);
+    let row = Fields::new().text("head", head).text("kind", "image");
     if !seen.insert(key) {
-        writeln!(
-            out,
-            "{}{} {} {}",
-            head.style(theme.styles.dim),
-            "image".style(theme.styles.script_id),
-            img.repo.style(theme.styles.count),
-            "(*)".style(theme.styles.dim)
-        )
-        .expect("write to string");
+        emit(out, row.text("name", img.repo.as_str()).text("mark", "(*)"), tmpl::REPEAT, theme);
         return;
     }
-    writeln!(
-        out,
-        "{}{} {} {}",
-        head.style(theme.styles.dim),
-        "image".style(theme.styles.script_id),
-        img.repo.style(theme.styles.count),
-        "BUILD".style(theme.styles.skip)
-    )
-    .expect("write to string");
+    emit(out, row.text("repo", img.repo.as_str()).text("mark", "BUILD"), tmpl::IMAGE, theme);
 
     let source = describe_source(&img.source);
     let kids: Vec<(&str, String)> = match img.features.is_empty() {
@@ -222,65 +235,48 @@ fn seed_node(
 ) {
     let (head, next) = b.glyphs(theme);
     let sha8 = ztest::api::seed_sha8(&s.oid);
+    let row = Fields::new().text("head", head).text("kind", "seed");
     if !seen.insert(format!("seed:{}", s.oid)) {
-        writeln!(
-            out,
-            "{}{} {} {}",
-            head.style(theme.styles.dim),
-            "seed".style(theme.styles.script_id),
-            sha8.style(theme.styles.count),
-            "(*)".style(theme.styles.dim)
-        )
-        .expect("write to string");
+        emit(out, row.text("name", sha8).text("mark", "(*)"), tmpl::REPEAT, theme);
         return;
     }
-    writeln!(
-        out,
-        "{}{} {} {} {}",
-        head.style(theme.styles.dim),
-        "seed".style(theme.styles.script_id),
-        s.name.style(theme.styles.count),
-        sha8.style(theme.styles.dim),
-        gib(s.size).style(theme.styles.count),
-    )
-    .expect("write to string");
+    let full = row.text("name", s.name.as_str()).text("sha8", sha8).value("size", s.size as f64);
+    emit(out, full, tmpl::SEED, theme);
 
-    let pvc = format!("ztest-seeds/seed-{sha8}-<driver> {}", ztest::api::seed_size());
+    let pvc = format!(
+        "ztest-seeds/seed-{sha8}-<driver> {}",
+        ztest::api::seed_size_for(s.uncompressed_bytes)
+    );
     leaves(out, &[("pvc", pvc)], &next, theme);
 }
 
 fn leaves(out: &mut String, kids: &[(&str, String)], prefix: &str, theme: &Theme) {
     let n = kids.len();
-    for (i, (kind, text)) in kids.iter().enumerate() {
+    for (i, (label, text)) in kids.iter().enumerate() {
         let b = Branch { prefix: prefix.to_string(), last: i + 1 == n };
         let (head, _) = b.glyphs(theme);
-        writeln!(
-            out,
-            "{}{} {}",
-            head.style(theme.styles.dim),
-            kind.style(theme.styles.script_id),
-            text.style(theme.styles.dim)
-        )
-        .expect("write to string");
+        let f = Fields::new().text("head", head).text("kind", *label).text("text", text.as_str());
+        emit(out, f, tmpl::LEAF, theme);
     }
 }
 
 fn render_pruned(out: &mut String, plan: &Plan, theme: &Theme) {
-    writeln!(out, "\n{}", "pruned".style(theme.styles.skip)).expect("write to string");
+    let _ = writeln!(out, "\n{}", "pruned".style(theme.styles.skip));
     let n = plan.pruned.len();
     for (i, p) in plan.pruned.iter().enumerate() {
         let b = Branch { prefix: String::new(), last: i + 1 == n };
         let (head, next) = b.glyphs(theme);
-        writeln!(
+        emit(
             out,
-            "{}{} {} {} {}",
-            head.style(theme.styles.dim),
-            "seed".style(theme.styles.script_id),
-            p.seed.name.style(theme.styles.skip),
-            ztest::api::seed_sha8(&p.seed.oid).style(theme.styles.dim),
-            gib(p.seed.size).style(theme.styles.count),
-        )
-        .expect("write to string");
+            Fields::new()
+                .text("head", head)
+                .text("kind", "seed")
+                .text("name", p.seed.name.as_str())
+                .text("sha8", ztest::api::seed_sha8(&p.seed.oid))
+                .value("size", p.seed.size as f64),
+            tmpl::PRUNED,
+            theme,
+        );
         let by = match p.declared_by.is_empty() {
             true => "declaring test not in the dump".to_string(),
             false => p.declared_by.join(", "),
@@ -289,28 +285,10 @@ fn render_pruned(out: &mut String, plan: &Plan, theme: &Theme) {
     }
 }
 
-/// Tier caps run 60s → 48h; `format_elapsed`'s m/s vocabulary renders that as `2880m00s`
-fn cap_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    match secs {
-        s if s >= 3600 && s % 3600 == 0 => format!("{}h", s / 3600),
-        s if s >= 3600 => format!("{}h{}m", s / 3600, (s % 3600) / 60),
-        s if s >= 60 => format!("{}m", s / 60),
-        s => format!("{s}s"),
-    }
-}
-
-fn res(r: &Resources) -> String {
-    format!("{}c / {} GiB", r.cpu_milli / 1000, r.mem_bytes / GIB)
-}
-
-fn gib(bytes: u64) -> String {
-    format!("{:.2} GiB", bytes as f64 / GIB as f64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ztest::api::GIB;
     use ztest::api::QosClass;
     use ztest::api::SeedPayload;
     use ztest::api::{PlanRoot, PrunedSeed, QosNode};
@@ -324,6 +302,7 @@ mod tests {
             name: name.to_string(),
             oid: oid.to_string(),
             size,
+            uncompressed_bytes: 0,
             payload: SeedPayload::Archive,
             base_uri: ztest::api::storage::BASE_URI.to_string(),
             key_prefix: ztest::api::storage::KEY_PREFIX.to_string(),
@@ -360,13 +339,32 @@ mod tests {
         let out = render(&plan, &plain());
 
         assert!(out.contains("zaino_index_construction"));
-        assert!(out.contains("qos sync · reserve 16c / 16 GiB · hard cap 48h · declared 48h"));
-        assert!(out.contains("13.05 GiB"));
+        assert!(out.contains("qos sync · reserve 16c/16Gi · hard cap 48h · declared 48h"));
+        assert!(out.contains("13.1 GiB"));
         assert!(out.contains("pruned"));
         assert!(out.contains("declared by clientless::the_pub_testnet_ironwood_boundary"));
         // No `test`/`binary` rows: structure without information
         assert!(!out.contains("├── test "));
         assert!(!out.contains("binary"));
+    }
+
+    /// A plan tree is drawn almost entirely from glyphs, so ASCII mode is the encoding
+    /// most likely to shear it — and the branch corners were hardcoded until they moved
+    /// into [`ThemeChars`](crate::Theme)
+    #[test]
+    fn the_plan_tree_falls_back_to_ascii() {
+        let plan = Plan {
+            roots: vec![
+                root("first", vec![seed("a.tar.zst", "aaaa1111ff", GIB)]),
+                root("second", vec![seed("b.tar.zst", "bbbb2222ff", 2 * GIB)]),
+            ],
+            pruned: vec![PrunedSeed {
+                seed: seed("c.tar.zst", "cccc3333ff", GIB),
+                declared_by: vec!["clientless::somewhere".into()],
+            }],
+        };
+        let ascii = Theme::for_capabilities(false, false);
+        crate::testing::assert_ascii_clean("render_plan", &render(&plan, &ascii));
     }
 
     /// One seed shared by N roots expands once; the rest repeat as `(*)`

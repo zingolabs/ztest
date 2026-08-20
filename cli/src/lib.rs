@@ -14,6 +14,7 @@ pub(crate) mod cleanup;
 pub(crate) mod cluster;
 pub mod list_mounts;
 pub(crate) mod preview;
+pub(crate) mod progress;
 pub mod replay;
 pub mod run;
 pub(crate) mod snapshot;

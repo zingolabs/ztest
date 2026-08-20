@@ -1175,7 +1175,7 @@ fn sync_exclusion_notice(excluded: &[engine::ExcludedSync]) -> String {
     );
     for e in excluded {
         let tail = match &e.reason {
-            SyncExclusion::Profile(profile) => format!("→ ztest sync start {profile}"),
+            SyncExclusion::Profile(profile) => format!("run it with `ztest sync start {profile}`"),
             SyncExclusion::TierOnly => "(declares the sync tier, no sync profile)".to_string(),
         };
         note.push_str(&format!("  {} ({}) {tail}\n", e.test_name, e.binary_id));
@@ -1738,7 +1738,7 @@ fn provision_and_resolve(
             let msg = if image_node_ids.contains(id) {
                 format!(
                     "dev image {id:?} FAILED TO BUILD/LOAD:\n{detail}\n\
-                     → tests that declare this image are SKIPPED; they do NOT fall back to a \
+                     Tests that declare this image are SKIPPED; they do NOT fall back to a \
                      published image. Fix the build failure above and re-run `ztest run`."
                 )
             } else {
@@ -1796,7 +1796,7 @@ fn locate_cargo_workspace() -> Result<(), String> {
 fn build_initial_state(opts: &RunOptions) -> BannerState {
     BannerState {
         cluster: ClusterState {
-            context: "probing…".to_string(),
+            context: "probing".to_string(),
             slots_used: 0,
             slots_total: 16,
             slots_configured: opts.test_threads.unwrap_or(0),

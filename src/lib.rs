@@ -84,8 +84,8 @@ pub use crate::backends::zainod::ZainoIndexer;
 pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::ZebraValidator;
 pub use crate::component::{
-    ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Cpu, Indexer, Mem,
-    Resources, Validator, Wallet,
+    ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Cpu, Disk, Indexer,
+    Mem, Resources, Validator, Wallet,
 };
 pub use crate::env::{SharedVolume, TestEnv};
 pub use crate::error::{EnvError, RpcError};
@@ -153,7 +153,7 @@ macro_rules! validator_tests {
 pub mod prelude {
     pub use super::{
         Account, AccountId, BlockHash, BlockHeight, BlockSample, BlockTip, BlockchainInfo,
-        ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Cpu,
+        ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Cpu, Disk,
         Endpoint, EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer, IndexerBackend,
         JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo, Mount, MountKind,
         MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction, RpcError,

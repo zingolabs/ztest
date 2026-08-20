@@ -94,9 +94,6 @@ pub const ORCHARD_MAINNET: ChainSnapshot = ChainSnapshot {
 };
 
 /// NU6.3 / Ironwood activation (3,428,143) + 6,000 blocks.
-///
-/// - Deepest rung either network ships; only mainnet one above the sandblast onset
-/// - 257.85 GiB extracted → size a volume off `artifact.uncompressed_bytes`, never `seed_size()`
 pub const IRONWOOD_MAINNET: ChainSnapshot = ChainSnapshot {
     tip_height: 3_434_143,
     network: Network::Mainnet,

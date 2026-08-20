@@ -119,7 +119,7 @@ fn push(
         // Bytes complete → brief finalizing window, then gone
         let done_tick = start + total_bytes.div_ceil(per_tick);
         if tick < done_tick + FINALIZE_TICKS {
-            Some(stage(label, kind, "finalizing…"))
+            Some(stage(label, kind, "finalizing"))
         } else {
             None
         }
@@ -161,7 +161,7 @@ fn pull(
         // Bytes in → extract tail → snapshot → node Ready, row removed
         let tail = elapsed - total_bytes.div_ceil(per_tick);
         match tail {
-            t if t < FINALIZE_TICKS => Some(stage(label, TransferKind::Seed, "finalizing…")),
+            t if t < FINALIZE_TICKS => Some(stage(label, TransferKind::Seed, "finalizing")),
             t if t < FINALIZE_TICKS + SNAPSHOT_TICKS => {
                 Some(stage(label, TransferKind::Seed, "snapshotting"))
             }

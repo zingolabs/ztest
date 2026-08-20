@@ -614,6 +614,7 @@ fn seed_decl_submit_expr(
     name: &proc_macro2::TokenStream,
     oid: &proc_macro2::TokenStream,
     size: &proc_macro2::TokenStream,
+    uncompressed_bytes: &proc_macro2::TokenStream,
     base_uri: &proc_macro2::TokenStream,
     key_prefix: &proc_macro2::TokenStream,
     payload_ident: &str,
@@ -625,6 +626,7 @@ fn seed_decl_submit_expr(
                 name: #name,
                 oid: #oid,
                 size: #size,
+                uncompressed_bytes: #uncompressed_bytes,
                 payload: ::ztest::macro_support::SeedPayload::#payload,
                 base_uri: #base_uri,
                 key_prefix: #key_prefix,
@@ -637,11 +639,13 @@ fn seed_decl_submit_expr(
 /// call site, so the values are literals rather than handle accessors.
 fn seed_decl_submit(baked: &BakedArchive, payload_ident: &str) -> proc_macro2::TokenStream {
     let (name, oid, size) = (&baked.name, &baked.oid, baked.size);
-    // Sidecar manifests carry identity only → location falls back to the published bucket
+    // Sidecar manifests carry identity only → location falls back to the published bucket,
+    // size to the unmeasured default
     seed_decl_submit_expr(
         &quote! { #name },
         &quote! { #oid },
         &quote! { #size },
+        &quote! { 0u64 },
         &quote! { ::ztest::api::storage::BASE_URI },
         &quote! { ::ztest::api::storage::KEY_PREFIX },
         payload_ident,
@@ -716,7 +720,10 @@ pub fn sync(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn footprint_resources_tokens(f: Option<ztest_attr::Footprint>) -> proc_macro2::TokenStream {
     match f {
         Some(f) => {
-            let (cpu, mem, disk) = (f.cpu_milli, f.mem_bytes, f.disk_bytes);
+            // Unwrapped here: `quote!` renders `Option<u64>` by its `ToTokens`, which emits
+            // *nothing* for `None` — `.with_disk()` with no argument, at the call site
+            let (cpu, mem) = (f.cpu_milli, f.mem_bytes);
+            let disk = f.disk_bytes.unwrap_or(0);
             quote! {
                 ::core::option::Option::Some(
                     ::ztest::qos::Resources::new(#cpu, #mem, 0, 0).with_disk(#disk)
@@ -1074,6 +1081,7 @@ pub fn needs(attr: TokenStream, item: TokenStream) -> TokenStream {
         &quote! { #handle.artifact.name },
         &quote! { #handle.artifact.oid },
         &quote! { #handle.artifact.size },
+        &quote! { #handle.artifact.uncompressed_bytes },
         &quote! { #handle.artifact.base_uri },
         &quote! { #handle.artifact.key_prefix },
         "Archive",

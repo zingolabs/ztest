@@ -1,31 +1,38 @@
-//! What a cluster must provide for ztest, and whether it does.
+//! What ztest needs from a cluster and a workstation, and whether it is there.
 //!
-//! - Every probe = a read: missing → reported with a remedy, never repaired
-//!   (installing infra from a harness needs cluster-admin and puts a CI job's
-//!   blast radius around the whole cluster)
+//! - Contract: a green `ztest cluster check` = every `ztest run` / `ztest sync`
+//!   precondition holds. Residual gaps are named in `docs/ops-cluster-requirements.md`
+//!   and nowhere else
+//! - Every probe = a read; missing → reported with a remedy, never repaired (installing
+//!   infra from a harness needs cluster-admin and puts a CI job's blast radius around the
+//!   whole cluster). [`admission`] is the one write-shaped call, and it is `dryRun`
 //! - Probe capabilities, never platforms — brand is not a capability, and same-brand
 //!   clusters differ in what they can do
-//! - Operator-provided only; the BuildKit builder is ztest's own ephemeral pod, so
-//!   its absence means "run `ztest cluster setup`", not "unsuitable cluster"
+//! - [`probe`] is a table, one line per capability; the reads it composes are below it,
+//!   each built from [`lift`] / [`parts`] / [`ready_pod`] / [`present`]
 
-use k8s_openapi::api::core::v1::Service;
+use std::future::Future;
+use std::pin::Pin;
+
+use k8s_openapi::api::core::v1::{Namespace, PersistentVolumeClaim, Pod, ServiceAccount};
 use kube::Client;
 use kube::api::{Api, ListParams};
+use serde::de::DeserializeOwned;
 
+use crate::cluster_config::ClusterClass;
+use crate::qos::Resources;
 use crate::runtime::{self, ContainerRuntime};
-
-/// Set by the Pyroscope Helm chart = the only name-independent way to find an
-/// operator-installed service
-const NAME_LABEL: &str = "app.kubernetes.io/name";
-
-/// Bucket round trip's budget. Generous enough for a cold TLS handshake to R2, short
-/// enough that a wrong endpoint reports rather than hangs `check`
-const BUCKET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What a missing capability costs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Need {
+    /// Operator's to provide. `ztest cluster setup` cannot fix it, so it blocks setup too
     Required,
+    /// `ztest cluster setup` provisions it: blocks a run, never blocks setup itself
+    Provisioned,
+    /// Operator's to provide, but no input to `ztest cluster setup` (which reaches the
+    /// cluster over the kube API alone) → blocks a run, never blocks setup
+    RequiredForRun,
     Enables(&'static str),
 }
 
@@ -50,8 +57,7 @@ impl Finding {
     }
 }
 
-/// One cluster facility ztest depends on but does not provide. `remedy` shows only
-/// when absent
+/// One facility ztest depends on. `remedy` shows only when absent
 #[derive(Debug, Clone)]
 pub struct Capability {
     pub name: &'static str,
@@ -61,9 +67,15 @@ pub struct Capability {
 }
 
 impl Capability {
-    /// Blocks `ztest run` outright. `Unknown` blocks a *required* capability too
-    /// (refusing now beats an obscure failure twenty minutes in)
+    /// Blocks `ztest run` outright. `Unknown` blocks too — refusing now beats an obscure
+    /// failure twenty minutes in
     pub fn is_blocking(&self) -> bool {
+        !matches!(self.need, Need::Enables(_)) && !self.finding.is_present()
+    }
+
+    /// Blocks `ztest cluster setup`. [`Need::Provisioned`] must not: setup is what
+    /// creates those, and gating it on them deadlocks every fresh cluster
+    pub fn blocks_setup(&self) -> bool {
         self.need == Need::Required && !self.finding.is_present()
     }
 }
@@ -79,130 +91,455 @@ impl Report {
         self.capabilities.iter().filter(|c| c.is_blocking())
     }
 
+    pub fn setup_blockers(&self) -> impl Iterator<Item = &Capability> {
+        self.capabilities.iter().filter(|c| c.blocks_setup())
+    }
+
     pub fn is_runnable(&self) -> bool {
         self.blocking().next().is_none()
     }
-}
 
-/// Probe every capability, concurrently (independent reads; a preflight costing
-/// the sum of its round trips gets skipped)
-pub async fn probe(client: &Client) -> Report {
-    let (storage, snapshots, metrics, bucket, profiling) = tokio::join!(
-        probe_storage(client),
-        probe_api(client, "snapshot.storage.k8s.io/v1", "VolumeSnapshot"),
-        probe_metrics(client),
-        probe_bucket(),
-        probe_profiling(client),
-    );
-
-    Report {
-        capabilities: vec![
-            Capability {
-                name: "snapshot-capable storage",
-                need: Need::Required,
-                finding: storage,
-                remedy: "docs/ops-cluster-requirements.md#storage",
-            },
-            Capability {
-                name: "VolumeSnapshot v1 API",
-                need: Need::Required,
-                finding: snapshots,
-                remedy: "docs/ops-cluster-requirements.md#storage",
-            },
-            Capability {
-                name: "metrics",
-                need: Need::Enables("metrics & profiling"),
-                finding: metrics,
-                remedy: "run `ztest cluster setup` (docs/ops-cluster-requirements.md#metrics)",
-            },
-            Capability {
-                name: "profile collector",
-                need: Need::Enables("CPU profiles (ztest sync perf)"),
-                finding: profiling,
-                remedy: "nested kubelet profiles host-side: needs a reachable container engine \
-                         (`--profile=false` runs without it)",
-            },
-            Capability {
-                name: "image registry",
-                need: Need::Enables("dev! images"),
-                finding: probe_registry(),
-                remedy: "docs/ops-cluster-requirements.md#registry",
-            },
-            Capability {
-                name: "snapshot bucket",
-                need: Need::Enables("chain fixtures (.mainnet/.testnet)"),
-                finding: bucket,
-                remedy: "docs/ops-cluster-requirements.md",
-            },
-        ],
+    pub fn is_setupable(&self) -> bool {
+        self.setup_blockers().next().is_none()
     }
 }
 
-/// The bucket every chain fixture's bytes come from, reached the way a run reaches it.
+// ── The table ─────────────────────────────────────────────────────────
+
+/// Capability names another crate matches on (`ztest cluster setup`'s csi-hostpath
+/// offer). Symbols, not literals across a crate boundary — a rename here must not
+/// silently detach the offer from the gap it repairs
+pub const REACHABLE: &str = "cluster reachable";
+pub const STORAGE: &str = "snapshot-capable storage";
+pub const SNAPSHOT_API: &str = "VolumeSnapshot v1 API";
+pub const SNAPSHOT_CONTROLLER: &str = "snapshot controller";
+
+const DOC_STORAGE: &str = "see docs/ops-cluster-requirements.md#storage";
+const DOC_REGISTRY: &str = "see docs/ops-cluster-requirements.md#registry";
+const DOC_BUILDER: &str = "see docs/ops-cluster-requirements.md#builder";
+const DOC_TOOLING: &str = "see docs/ops-cluster-requirements.md#container-engine";
+const DOC_CAPACITY: &str = "see docs/ops-cluster-requirements.md#capacity";
+const DOC_ROOT: &str = "see docs/ops-cluster-requirements.md";
+const REMEDY_SETUP: &str = "run `ztest cluster setup`";
+const DOC_PROFILING: &str = "`--profile=false` runs without it (docs/how-to-profile.md)";
+
+/// Probe every capability, concurrently (independent reads; a preflight costing the sum
+/// of its round trips gets skipped).
 ///
-/// - Not a cluster facility, like [`probe_registry`] — but a green cluster with an
-///   unreachable bucket still fails every fixture-mounting profile, from a subsystem
-///   `check` would otherwise never mention
-/// - Never credentials: reads are public, and `check` must stay green for a consumer
-///   holding no `AWS_*` (writes are `ztest snapshot push`'s problem, not a cluster's)
-/// - A real declared object, not the base: public buckets do not list, and every wrong
-///   answer (base typo, public access revoked, blob evicted) 404s identically at the
-///   prefix. [`SAPLING_TESTNET`](crate::snapshots::SAPLING_TESTNET) is the smallest
-///   artifact and the default rung, so an absent one breaks every profile anyway
-async fn probe_bucket() -> Finding {
-    let canary = crate::snapshots::SAPLING_TESTNET.artifact;
-    let url = canary.blob_url();
-    match crate::storage::r2::blob_present(&url, canary.size, BUCKET_PROBE_TIMEOUT).await {
-        Ok(true) => Finding::Present(format!("public · {}", canary.base_uri)),
-        Ok(false) => Finding::Absent(format!("no public blob at {url}")),
-        Err(why) => Finding::Unknown(format!("{}: {why}", canary.base_uri)),
-    }
-}
+/// Order = what an operator owns, then what `setup` provisions, then what only degrades
+pub async fn probe(client: &Client) -> Report {
+    use Need::{Enables, Provisioned, Required, RequiredForRun};
 
-/// StorageClass whose provisioner has a VolumeSnapshotClass = precondition for
-/// every seeded test's CoW clone
-async fn probe_storage(client: &Client) -> Finding {
-    let driver = crate::cluster_config::active_storage_driver();
-    match crate::storage_class::discover(client).await {
-        // Resolved exactly as a run resolves it, driver and all — reporting the
-        // cluster default under a profile-named driver = green check, failing run.
-        Ok(options) => match crate::storage_class::select(&options, driver.as_deref()) {
-            Ok(chosen) => {
-                Finding::Present(format!("{} ({})", chosen.class_name, chosen.provisioner))
-            }
-            Err(why) => Finding::Absent(why),
+    if let Some(why) = unreachable(client).await {
+        let finding = Finding::Absent(why);
+        let down = Capability { name: REACHABLE, need: Required, finding, remedy: DOC_ROOT };
+        return Report { capabilities: vec![down] };
+    }
+
+    let class = crate::backends::image::selected_class();
+    // Both preconditions of the on-cluster build, which only a remote cluster runs
+    let builds = gated(class == ClusterClass::Remote, "on-cluster builds");
+
+    let table = vec![
+        cap(STORAGE, Required, DOC_STORAGE, storage(client)),
+        cap(SNAPSHOT_API, Required, DOC_STORAGE, snapshot_api(client)),
+        cap(SNAPSHOT_CONTROLLER, Required, DOC_STORAGE, snapshot_controller(client)),
+        cap("host toolchain", Required, DOC_TOOLING, now(tooling(class))),
+        cap("node capacity", builds, DOC_CAPACITY, capacity(client)),
+        // A local cluster has no registry to check and no other way in: probe the path itself
+        match class {
+            ClusterClass::Local => cap("image side-load", RequiredForRun, DOC_TOOLING, side_load()),
+            ClusterClass::Remote => cap("image registry", Required, DOC_REGISTRY, now(registry())),
         },
-        // `discover_storage` fails only on a failed list, indistinguishable from
-        // a cluster that has nothing.
-        Err(why) => Finding::Unknown(why),
+        cap("ztest infrastructure", Provisioned, REMEDY_SETUP, infrastructure(client, class)),
+        cap("run permissions", Provisioned, REMEDY_SETUP, permissions(client, class)),
+        cap("build pod admission", Provisioned, DOC_BUILDER, admission(client)),
+        cap("volume expansion", Enables("BuildKit cache growth"), DOC_STORAGE, expandable(client)),
+        cap("metrics API", Enables("kubectl top / k9s"), REMEDY_SETUP, metrics_api(client)),
+        cap("metrics stack", Enables("metrics & profiling"), REMEDY_SETUP, metrics(client)),
+        cap("profile collector", Enables("CPU profiles"), DOC_PROFILING, profiling(client)),
+        cap("snapshot bucket", Enables("chain fixtures"), DOC_ROOT, bucket()),
+    ];
+    Report { capabilities: resolve(table).await }
+}
+
+/// Why no other probe is worth running, if so.
+///
+/// - A real read, not `/version`: that answers off memory, so a cluster whose etcd is down
+///   passes it and then fails all fourteen rows with the same buried error
+/// - `default` exists on every cluster and the run role already grants `namespaces get`
+/// - 401/403 is not an outage — a least-privilege caller still runs tests, so it falls
+///   through to the table where `run permissions` names the gap precisely
+async fn unreachable(client: &Client) -> Option<String> {
+    match Api::<Namespace>::all(client.clone()).get_opt("default").await {
+        Ok(_) => None,
+        Err(kube::Error::Api(e)) if e.code == 401 || e.code == 403 => None,
+        Err(e) => Some(e.to_string()),
     }
 }
 
-/// Does the API server serve `kind` at `api_version`? Asked of discovery, not by
-/// listing (which conflates empty, unserved and forbidden)
-async fn probe_api(client: &Client, api_version: &str, kind: &str) -> Finding {
+/// `Required` where the feature is on every run of this cluster class, else `Enables`
+fn gated(required: bool, feature: &'static str) -> Need {
+    if required { Need::Required } else { Need::Enables(feature) }
+}
+
+/// Group the seed clone rides: `VolumeSnapshot` + the content it binds
+async fn snapshot_api(client: &Client) -> Finding {
+    served(client, "snapshot.storage.k8s.io/v1", "VolumeSnapshot").await
+}
+
+/// Aggregated resource-metrics plane — `kubectl top`, k9s columns, HPA. Separate from
+/// the [`metrics`] stack's TSDB; neither substitutes for the other
+async fn metrics_api(client: &Client) -> Finding {
+    served(client, "metrics.k8s.io/v1beta1", "PodMetrics").await
+}
+
+/// A read needing no round trip, in the table's shape (host-side probes answer from
+/// config and `PATH`)
+fn now(finding: Finding) -> impl Future<Output = Finding> + Send {
+    std::future::ready(finding)
+}
+
+// ── Table plumbing ────────────────────────────────────────────────────
+
+type Read<'a> = Pin<Box<dyn Future<Output = Finding> + Send + 'a>>;
+
+/// One table row: a capability's identity beside the pending read that answers it.
+/// Splitting the two is what lets [`probe`] stay one line per capability and still issue
+/// every read at once
+struct Row<'a>(&'static str, Need, &'static str, Read<'a>);
+
+fn cap<'a>(
+    name: &'static str,
+    need: Need,
+    remedy: &'static str,
+    read: impl Future<Output = Finding> + Send + 'a,
+) -> Row<'a> {
+    Row(name, need, remedy, Box::pin(read))
+}
+
+async fn resolve(rows: Vec<Row<'_>>) -> Vec<Capability> {
+    let (meta, reads): (Vec<_>, Vec<_>) =
+        rows.into_iter().map(|Row(n, need, r, read)| ((n, need, r), read)).unzip();
+    let findings = futures::future::join_all(reads).await;
+    meta.into_iter()
+        .zip(findings)
+        .map(|((name, need, remedy), finding)| Capability { name, need, finding, remedy })
+        .collect()
+}
+
+// ── Probe primitives ──────────────────────────────────────────────────
+
+/// The three-state lift every read shares: a value found, nothing found, or a read this
+/// caller could not make
+fn lift<T, E: std::fmt::Display>(
+    read: Result<Option<T>, E>,
+    present: impl FnOnce(T) -> String,
+    absent: impl FnOnce() -> String,
+) -> Finding {
+    match read {
+        Ok(Some(v)) => Finding::Present(present(v)),
+        Ok(None) => Finding::Absent(absent()),
+        Err(e) => Finding::Unknown(e.to_string()),
+    }
+}
+
+/// One piece of a multi-part capability: `Ok(None)` present, `Ok(Some(name))` missing,
+/// `Err` unreadable
+type Piece = Result<Option<String>, String>;
+
+fn piece(name: &str, found: Result<bool, impl std::fmt::Display>) -> Piece {
+    match found {
+        Ok(true) => Ok(None),
+        Ok(false) => Ok(Some(name.to_string())),
+        Err(e) => Err(format!("reading {name}: {e}")),
+    }
+}
+
+/// Fold pieces into one finding. Any unreadable piece ⇒ the whole answer is `Unknown`,
+/// never a partial `Absent` (which would send an operator to install what is already there)
+fn parts(pieces: impl IntoIterator<Item = Piece>, whole: &str) -> Finding {
+    let mut missing = Vec::new();
+    for p in pieces {
+        match p {
+            Ok(None) => {}
+            Ok(Some(name)) => missing.push(name),
+            Err(why) => return Finding::Unknown(why),
+        }
+    }
+    match missing.is_empty() {
+        true => Finding::Present(whole.to_string()),
+        false => Finding::Absent(format!("missing {}", missing.join(", "))),
+    }
+}
+
+/// Cluster-scoped object, as a [`Piece`]. `Err` propagates so a forbidden read never
+/// reads as an absent object
+async fn cluster_object<K>(client: &Client, name: &'static str) -> Piece
+where
+    K: Object<kube::core::ClusterResourceScope>,
+{
+    piece(name, Api::<K>::all(client.clone()).get_opt(name).await.map(|o| o.is_some()))
+}
+
+/// Namespaced object, as a [`Piece`]
+async fn object<K>(client: &Client, ns: &str, name: &'static str) -> Piece
+where
+    K: Object<kube::core::NamespaceResourceScope>,
+{
+    piece(name, Api::<K>::namespaced(client.clone(), ns).get_opt(name).await.map(|o| o.is_some()))
+}
+
+/// Anything `Api::get_opt` reads at scope `S`. Names the bound once
+trait Object<S>:
+    kube::Resource<DynamicType = (), Scope = S> + Clone + std::fmt::Debug + DeserializeOwned
+{
+}
+
+impl<S, K> Object<S> for K where
+    K: kube::Resource<DynamicType = (), Scope = S> + Clone + std::fmt::Debug + DeserializeOwned
+{
+}
+
+/// `namespace/name` of a **Ready** pod matching any of `selectors`, anywhere in the cluster.
+///
+/// Ready is the whole point, and it is free: the kubelet flips that condition only after
+/// the container's own readiness endpoint answered — `/-/ready` (Prometheus), `/ready`
+/// (Pyroscope), `/api/health` (Grafana), `buildctl debug workers` (BuildKit). So this
+/// reads those endpoints through the API server, and a Service in front of a
+/// CrashLoopBackOff Deployment cannot pass for a working one
+async fn ready_pod(client: &Client, selectors: &[String]) -> Result<Found, kube::Error> {
+    let api: Api<Pod> = Api::all(client.clone());
+    let mut seen = Found::Nothing;
+    for selector in selectors {
+        for pod in api.list(&ListParams::default().labels(selector)).await?.items {
+            let at = format!(
+                "{}.{}",
+                pod.metadata.name.as_deref().unwrap_or("?"),
+                pod.metadata.namespace.as_deref().unwrap_or("?"),
+            );
+            match pod.status.as_ref().is_some_and(crate::pod_status::is_ready) {
+                true => return Ok(Found::Ready(at)),
+                // Held, not returned: a rolling restart leaves a dying pod beside a live one
+                false => seen = Found::NotReady(at),
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// What a pod selector matched. `NotReady` is its own answer, not an absence — a
+/// restarting component and an uninstalled one send an operator to different places
+enum Found {
+    Ready(String),
+    NotReady(String),
+    Nothing,
+}
+
+fn found(f: Found, absent: impl FnOnce() -> String) -> Finding {
+    match f {
+        Found::Ready(at) => Finding::Present(at),
+        Found::NotReady(at) => Finding::Absent(format!("{at} is not Ready")),
+        Found::Nothing => Finding::Absent(absent()),
+    }
+}
+
+fn selectors<const N: usize>(pairs: [(&str, &str); N]) -> Vec<String> {
+    pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+/// Does the API server serve `kind` at `api_version`? Asked of discovery, not by listing
+/// (which conflates empty, unserved and forbidden)
+async fn served(client: &Client, api_version: &'static str, kind: &'static str) -> Finding {
     match client.list_api_group_resources(api_version).await {
         Ok(list) if list.resources.iter().any(|r| r.kind == kind) => {
             Finding::Present(api_version.to_string())
         }
         Ok(_) => Finding::Absent(format!("{api_version} is served but has no {kind}")),
-        Err(e) if is_not_found(&e) => Finding::Absent(format!("{api_version} is not served")),
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            Finding::Absent(format!("{api_version} is not served"))
+        }
         Err(e) => Finding::Unknown(format!("querying {api_version}: {e}")),
     }
 }
 
+// ── Storage ───────────────────────────────────────────────────────────
+
+/// StorageClass whose provisioner has a VolumeSnapshotClass = precondition for every
+/// seeded test's CoW clone.
+///
+/// Resolved exactly as a run resolves it, driver and all — reporting the cluster default
+/// under a profile-named driver = green check, failing run
+async fn storage(client: &Client) -> Finding {
+    let driver = crate::cluster_config::active_storage_driver();
+    match crate::storage_class::discover(client).await {
+        Ok(options) => match crate::storage_class::select(&options, driver.as_deref()) {
+            Ok(c) => Finding::Present(format!("{} ({})", c.class_name, c.provisioner)),
+            Err(why) => Finding::Absent(why),
+        },
+        // `discover` fails only on a failed list, indistinguishable from a cluster that
+        // has nothing.
+        Err(why) => Finding::Unknown(why),
+    }
+}
+
+/// Names the snapshot-controller Deployment publishes itself under. Upstream
+/// external-snapshotter first, OpenShift's fork second
+const CONTROLLER_SELECTORS: [(&str, &str); 3] = [
+    ("app.kubernetes.io/name", "snapshot-controller"),
+    ("app", "snapshot-controller"),
+    ("app", "csi-snapshot-controller"),
+];
+
+/// The controller that reconciles VolumeSnapshots into bound content.
+///
+/// CRDs without it = every seed sits at `readyToUse: false` for its whole budget and then
+/// fails, with nothing in the cluster to say why. Found by label, not address, so an
+/// operator's own install is recognised rather than missed
+async fn snapshot_controller(client: &Client) -> Finding {
+    let selectors = selectors(CONTROLLER_SELECTORS);
+    match ready_pod(client, &selectors).await {
+        Ok(f) => found(f, || format!("nothing matching {}", selectors.join(" / "))),
+        Err(e) => Finding::Unknown(format!("listing controller pods: {e}")),
+    }
+}
+
+/// Grow-only reconcile of the BuildKit cache PVC needs it; a raised
+/// `ZTEST_BUILDKIT_CACHE_SIZE` is otherwise a warning on `setup`'s stderr and nothing else
+async fn expandable(client: &Client) -> Finding {
+    use k8s_openapi::api::storage::v1::StorageClass;
+    let chosen = match crate::storage_class::selected(client).await {
+        Ok(c) => c,
+        Err(why) => return Finding::Unknown(why),
+    };
+    let read = Api::<StorageClass>::all(client.clone()).get_opt(&chosen.class_name).await;
+    lift(
+        read.map(|sc| sc.and_then(|sc| sc.allow_volume_expansion).unwrap_or(false).then_some(())),
+        |()| format!("{} expands in place", chosen.class_name),
+        || format!("{} has allowVolumeExpansion unset", chosen.class_name),
+    )
+}
+
+// ── What `ztest cluster setup` provisions ─────────────────────────────
+
+/// Everything `ztest cluster setup` creates, as one capability: same remedy for every
+/// piece, and a half-provisioned cluster fails a run exactly as an unprovisioned one does.
+///
+/// The role is checked by *revision*, not existence — that is the half
+/// [`permissions`] cannot see, since an admin caller's own SSAR passes over a stale role
+async fn infrastructure(client: &Client, backend: ClusterClass) -> Finding {
+    use crate::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
+    use crate::resource::impls::buildkit::BUILDKIT_CACHE_PVC;
+    use crate::resource::impls::policy::{BUILDKIT_SERVICE_ACCOUNT, RUN_CLUSTER_ROLE};
+
+    let (seeds, meta, run, sa, buildkit_sa, cache, role) = tokio::join!(
+        cluster_object::<Namespace>(client, crate::seeds::SEEDS_NAMESPACE),
+        cluster_object::<Namespace>(client, crate::qos::ledger::META_NAMESPACE),
+        cluster_object::<Namespace>(client, RUN_NAMESPACE),
+        object::<ServiceAccount>(client, RUN_NAMESPACE, RUN_SERVICE_ACCOUNT),
+        object::<ServiceAccount>(client, RUN_NAMESPACE, BUILDKIT_SERVICE_ACCOUNT),
+        object::<PersistentVolumeClaim>(client, RUN_NAMESPACE, BUILDKIT_CACHE_PVC),
+        async {
+            piece(RUN_CLUSTER_ROLE, crate::resource::run_role_is_current(client, backend).await)
+        },
+    );
+    parts(
+        [seeds, meta, run, sa, buildkit_sa, cache, role],
+        "namespaces, run identity, BuildKit scaffolding",
+    )
+}
+
+/// Every grant the run identity needs, asked of the API server as this caller
+async fn permissions(client: &Client, backend: ClusterClass) -> Finding {
+    match crate::resource::check_run_access(client, backend).await {
+        Ok(missing) if missing.is_empty() => Finding::Present("every grant a run makes".into()),
+        Ok(missing) => Finding::Absent(format!("cannot {}", missing.join(", "))),
+        Err(e) => Finding::Unknown(format!("SelfSubjectAccessReview: {e}")),
+    }
+}
+
+/// Would the BuildKit pod be admitted? Answered by submitting the real spec with
+/// `dryRun`, so PSA level, SCC selection and every admission webhook vote for real
+async fn admission(client: &Client) -> Finding {
+    match crate::resource::probe_build_admission(client).await {
+        Ok(()) => Finding::Present("rootless BuildKit posture accepted".into()),
+        Err(kube::Error::Api(e)) if e.code == 403 || e.code == 400 => Finding::Absent(e.message),
+        Err(e) => Finding::Unknown(format!("dry-run create: {e}")),
+    }
+}
+
+// ── Workstation ───────────────────────────────────────────────────────
+
+/// Binaries a run of this cluster class spawns.
+///
+/// - `cargo` (`cargo metadata`) + `git`/`tar` (build context = `git ls-files` piped
+///   through `tar`) are on every path
+/// - `oc` is the on-cluster compile's only transport for shipping context in and copying
+///   the inventory back; `kind` side-loads where there is no registry
+fn tools(class: ClusterClass) -> &'static [&'static str] {
+    match class {
+        ClusterClass::Local => &["cargo", "git", "tar", "kind"],
+        ClusterClass::Remote => &["cargo", "git", "tar", "oc"],
+    }
+}
+
+/// PATH + (local only) a container engine that answers. A client without a daemon passes
+/// a `which`, then fails a build minutes later
+fn tooling(class: ClusterClass) -> Finding {
+    let mut pieces: Vec<Piece> =
+        tools(class).iter().map(|t| piece(t, Ok::<_, String>(crate::proc::on_path(t)))).collect();
+    if class == ClusterClass::Local {
+        let engine = runtime::program();
+        pieces
+            .push(piece(&format!("{engine} daemon"), Ok::<_, String>(runtime::active().usable())));
+    }
+    parts(pieces, &format!("{} on PATH", tools(class).join(", ")))
+}
+
+// ── Capacity ──────────────────────────────────────────────────────────
+
+/// Largest pod ztest ever asks a single node to hold: the BuildKit builder, or the
+/// heaviest tier's whole admitted reserve, whichever is bigger
+fn heaviest_pod() -> Resources {
+    crate::qos::QosClass::ALL
+        .iter()
+        .map(|c| c.profile().admitted())
+        .fold(crate::qos::build::BUILDKIT_BUILD, |acc, r| acc.max(&r))
+}
+
+/// Can one node hold the largest thing ztest places?
+///
+/// Per-node, not cluster-summed: a pod lands on one node, so 4×4c promises 16 cores that
+/// nothing can actually hold. Measured against *allocatable*, not free — transient load
+/// queues a pod, it does not make the cluster unusable
+async fn capacity(client: &Client) -> Finding {
+    use k8s_openapi::api::core::v1::Node;
+    let need = heaviest_pod();
+    let nodes = match Api::<Node>::all(client.clone()).list(&ListParams::default()).await {
+        Ok(list) => list,
+        Err(e) => return Finding::Unknown(format!("listing nodes: {e}")),
+    };
+    let biggest = crate::pipeline::cluster::largest_node(&nodes.items);
+    match need.fits_within(&biggest) {
+        true => {
+            Finding::Present(format!("largest node {} ≥ {}", biggest.compact(), need.compact()))
+        }
+        false => Finding::Absent(format!(
+            "largest schedulable node is {}; ztest places pods up to {}",
+            biggest.compact(),
+            need.compact()
+        )),
+    }
+}
+
+// ── Optional planes ───────────────────────────────────────────────────
+
 /// Where `dev!` images are pushed to and pulled from.
 ///
-/// - Config, not a cluster read (push reachability says nothing about pull, which
-///   only the kubelet resolves; an unauthed probe of a private registry fails anyway)
-/// - Catches the failure that does happen: a registry-less profile whose builds die
-///   at push time
-fn probe_registry() -> Finding {
-    // `kind load` side-loads into the node — no registry in the path, so "none
-    // configured" is correct rather than missing.
-    if crate::backends::image::selected_class() == crate::cluster_config::ClusterClass::Local {
-        return Finding::Present("kind load (no registry)".to_string());
-    }
+/// Config, not a cluster read: push reachability says nothing about pull, which only the
+/// kubelet resolves, and an unauthed probe of a private registry fails anyway. Catches
+/// the failure that does happen — a registry-less remote profile whose builds die at push
+fn registry() -> Finding {
     match crate::cluster_config::active_registry() {
         (Some(push), Some(pull)) if push == pull => Finding::Present(push),
         (Some(push), Some(pull)) => Finding::Present(format!("push {push} / pull {pull}")),
@@ -213,14 +550,90 @@ fn probe_registry() -> Finding {
     }
 }
 
-/// Where a collector can run for this cluster, and whether that placement's prerequisites hold.
+/// Row = one line, but a failed tool carries its whole stderr → keep the last non-empty line
+/// (where every tool here puts the cause)
+fn cause(e: impl std::fmt::Display) -> String {
+    let full = e.to_string();
+    match full.lines().rev().find(|l| !l.trim().is_empty()) {
+        Some(last) => last.trim().to_string(),
+        None => full,
+    }
+}
+
+/// Side-load = a local cluster's only image path, and it runs four tools deep: ztest → `kind`
+/// → engine → the node's containerd. PATH proves none of that talks (kind ≤0.32 and podman 6
+/// are each healthy alone, and cannot list a cluster together).
 ///
-/// - Placement is not a preference: a nested kubelet numbers pods below the pid namespace eBPF
-///   reports in, so kind can only be profiled from the host
-/// - Host placement leans on the *workstation* — docker, a kubeconfig, a routable node — none
-///   of which the cluster can vouch for, so they are probed here and not discovered at launch
-/// - Read-only: promoting the Pyroscope Service to NodePort is a launch-time act, not a check
-async fn probe_profiling(client: &Client) -> Finding {
+/// - Ladder, not [`parts`]: a later rung says nothing once an earlier one fails
+/// - Read-only, no image crosses (`check` stays a read)
+fn side_load_path() -> Finding {
+    use crate::backends::image::kind;
+
+    let cluster = kind::kind_cluster_name();
+    let engine = runtime::program();
+
+    match kind::kind_cluster_exists(&cluster) {
+        Err(e) => return Finding::Unknown(cause(e)),
+        Ok(false) => {
+            return Finding::Absent(format!(
+                "{engine} holds no nodes for kind cluster `{cluster}`"
+            ));
+        }
+        Ok(true) => {}
+    }
+    match kind::kind_resolves_nodes(&cluster) {
+        Err(e) => return Finding::Absent(cause(e)),
+        Ok(nodes) if nodes.is_empty() => {
+            return Finding::Absent(format!(
+                "{engine} holds the nodes but `kind get nodes --name {cluster}` resolves none \
+                 (kind cannot drive this engine)"
+            ));
+        }
+        Ok(_) => {}
+    }
+    match kind::crictl_images() {
+        Err(e) => Finding::Absent(cause(e)),
+        Ok(_) => Finding::Present(format!("kind load → `{cluster}` ({engine})")),
+    }
+}
+
+/// Three shell-outs, off the async worker
+async fn side_load() -> Finding {
+    match tokio::task::spawn_blocking(side_load_path).await {
+        Ok(finding) => finding,
+        Err(e) => Finding::Unknown(format!("side-load probe: {e}")),
+    }
+}
+
+/// Set by every ztest and upstream chart alike = the one name-independent way to find an
+/// operator-installed component
+const NAME_LABEL: &str = "app.kubernetes.io/name";
+
+/// Metrics stack as one capability — provisioned as one, and a partial install has the
+/// same fix as a missing one. Ready pods, not Services: the Service outlives its backend
+async fn metrics(client: &Client) -> Finding {
+    let mut pieces = Vec::new();
+    for app in ["prometheus", "pyroscope", "grafana"] {
+        let selector = selectors([(NAME_LABEL, app)]);
+        pieces.push(match ready_pod(client, &selector).await {
+            Ok(Found::Ready(_)) => Ok(None),
+            Ok(Found::NotReady(at)) => Ok(Some(format!("{at} (not Ready)"))),
+            Ok(Found::Nothing) => Ok(Some(app.to_string())),
+            Err(e) => Err(format!("listing {app} pods: {e}")),
+        });
+    }
+    parts(pieces, "prometheus, pyroscope, grafana")
+}
+
+/// Where a collector can run for this cluster, and whether that placement's prerequisites
+/// hold.
+///
+/// - Placement is not a preference: a nested kubelet numbers pods below the pid namespace
+///   eBPF reports in, so kind can only be profiled from the host
+/// - Host placement leans on the *workstation* — an engine, a kubeconfig, a routable node —
+///   none of which the cluster can vouch for, so they are probed here, not at launch
+/// - Read-only: promoting the Pyroscope Service to NodePort is a launch-time act
+async fn profiling(client: &Client) -> Finding {
     use crate::profiling::ebpf::{Placement, placement_for};
 
     if placement_for(client).await == Placement::Sidecar {
@@ -265,41 +678,28 @@ fn rootless_podman() -> bool {
             .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "true")
 }
 
-/// Metrics stack as one capability — provisioned as one, and a partial install has
-/// the same fix as a missing one.
-///
-/// Found by `app.kubernetes.io/name`, not a fixed address, so an operator's own
-/// install (foreign namespace, foreign release name) is adopted not duplicated
-async fn probe_metrics(client: &Client) -> Finding {
-    let api: Api<Service> = Api::all(client.clone());
-    let mut found = Vec::new();
-    let mut missing = Vec::new();
-    for component in ["prometheus", "pyroscope", "grafana"] {
-        let selector = format!("{NAME_LABEL}={component}");
-        match api.list(&ListParams::default().labels(&selector)).await {
-            Ok(list) => match list.items.first() {
-                Some(svc) => {
-                    let ns = svc.metadata.namespace.as_deref().unwrap_or("?");
-                    let name = svc.metadata.name.as_deref().unwrap_or("?");
-                    found.push(format!("{name}.{ns}"));
-                }
-                None => missing.push(component),
-            },
-            // One unreadable list ⇒ whole answer unknown, else an operator is sent
-            // to install what is already there.
-            Err(e) => return Finding::Unknown(format!("listing Services: {e}")),
-        }
-    }
-    match missing.as_slice() {
-        [] => Finding::Present(found.join(", ")),
-        _ if found.is_empty() => Finding::Absent("not installed".to_string()),
-        _ => Finding::Absent(format!("missing {}", missing.join(", "))),
-    }
-}
+/// Bucket round trip's budget. Generous enough for a cold TLS handshake to R2, short
+/// enough that a wrong endpoint reports rather than hangs `check`
+const BUCKET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Discovery 404 = group/version not served
-fn is_not_found(err: &kube::Error) -> bool {
-    matches!(err, kube::Error::Api(e) if e.code == 404)
+/// The bucket every chain fixture's bytes come from, reached the way a run reaches it.
+///
+/// - Never credentials: reads are public, and `check` must stay green for a consumer
+///   holding no `AWS_*` (writes are `ztest snapshot push`'s problem)
+/// - A real declared object, not the base: public buckets do not list, and every wrong
+///   answer (base typo, public access revoked, blob evicted) 404s identically at the
+///   prefix. [`SAPLING_TESTNET`](crate::snapshots::SAPLING_TESTNET) is the smallest
+///   artifact and the default rung, so an absent one breaks every profile anyway
+/// - Workstation-side. Cluster→bucket egress is the one precondition no read-only probe
+///   reaches (`docs/ops-cluster-requirements.md`)
+async fn bucket() -> Finding {
+    let canary = crate::snapshots::SAPLING_TESTNET.artifact;
+    let url = canary.blob_url();
+    match crate::storage::r2::blob_present(&url, canary.size, BUCKET_PROBE_TIMEOUT).await {
+        Ok(true) => Finding::Present(format!("public · {}", canary.base_uri)),
+        Ok(false) => Finding::Absent(format!("no public blob at {url}")),
+        Err(why) => Finding::Unknown(format!("{}: {why}", canary.base_uri)),
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +728,21 @@ mod tests {
         assert_eq!(report.blocking().count(), 0);
     }
 
+    /// Side-load lives on the workstation; `setup` only ever reaches the cluster over the
+    /// kube API, so gating it on a broken `kind` would strand a fresh cluster
+    #[test]
+    fn a_run_blocker_setup_cannot_fix_still_lets_setup_through() {
+        let report = Report {
+            capabilities: vec![cap(
+                "image side-load",
+                Need::RequiredForRun,
+                Finding::Absent("kind cannot drive this engine".into()),
+            )],
+        };
+        assert!(!report.is_runnable());
+        assert!(report.is_setupable());
+    }
+
     /// Module's founding distinction — forbidden read != absent capability, and the
     /// two send an operator to different places
     #[test]
@@ -353,9 +768,25 @@ mod tests {
         for finding in
             [Finding::Absent("not installed".into()), Finding::Unknown("forbidden".into())]
         {
-            let c = cap("PodMonitor CRD", Need::Enables("metrics"), finding);
+            let c = cap("metrics stack", Need::Enables("metrics"), finding);
             assert!(!c.is_blocking());
         }
+    }
+
+    /// The deadlock this variant exists to prevent: gating `setup` on what `setup`
+    /// creates means no cluster is ever provisionable
+    #[test]
+    fn what_setup_provisions_blocks_a_run_but_never_setup() {
+        let c = cap("ztest infrastructure", Need::Provisioned, Finding::Absent("missing".into()));
+        assert!(c.is_blocking(), "a run cannot proceed without it");
+        assert!(!c.blocks_setup(), "setup is what creates it");
+    }
+
+    /// A substrate gap `setup` cannot fix must stop it before the first write
+    #[test]
+    fn a_substrate_gap_blocks_setup() {
+        let c = cap("snapshot-capable storage", Need::Required, Finding::Absent("none".into()));
+        assert!(c.blocks_setup() && c.is_blocking());
     }
 
     #[test]
@@ -363,7 +794,7 @@ mod tests {
         let report = Report {
             capabilities: vec![
                 cap("snapshot-capable storage", Need::Required, Finding::Absent("none".into())),
-                cap("PodMonitor CRD", Need::Enables("metrics"), Finding::Absent("none".into())),
+                cap("metrics stack", Need::Enables("metrics"), Finding::Absent("none".into())),
                 cap(
                     "image registry",
                     Need::Enables("dev! images"),
@@ -377,22 +808,55 @@ mod tests {
         assert_eq!(blocking, vec!["snapshot-capable storage"]);
     }
 
+    /// Any unreadable piece must sink the whole answer to `Unknown` — a partial `Absent`
+    /// sends an operator to install what is already there
     #[test]
-    fn a_capable_cluster_is_runnable() {
-        let report = Report {
-            capabilities: vec![
-                cap(
-                    "snapshot-capable storage",
-                    Need::Required,
-                    Finding::Present("ceph-rbd".into()),
-                ),
-                cap(
-                    "PodMonitor CRD",
-                    Need::Enables("metrics"),
-                    Finding::Present("monitoring.coreos.com/v1".into()),
-                ),
-            ],
-        };
-        assert!(report.is_runnable());
+    fn one_unreadable_piece_makes_the_whole_capability_unknown() {
+        let pieces = vec![Ok(None), Ok(Some("b".into())), Err("forbidden".into())];
+        assert!(matches!(parts(pieces, "whole"), Finding::Unknown(_)));
+    }
+
+    #[test]
+    fn every_piece_present_reports_the_whole() {
+        assert_eq!(parts(vec![Ok(None), Ok(None)], "whole"), Finding::Present("whole".into()));
+    }
+
+    #[test]
+    fn missing_pieces_are_all_named() {
+        let f = parts(vec![Ok(Some("a".into())), Ok(None), Ok(Some("c".into()))], "whole");
+        assert_eq!(f, Finding::Absent("missing a, c".to_string()));
+    }
+
+    /// Registry and capacity are preconditions of the on-cluster build, which only a
+    /// remote cluster runs — required there, merely enabling on kind
+    #[test]
+    fn a_remote_only_precondition_is_required_only_remotely() {
+        assert_eq!(gated(true, "on-cluster builds"), Need::Required);
+        assert_eq!(gated(false, "on-cluster builds"), Need::Enables("on-cluster builds"));
+    }
+
+    /// The build pod is the largest thing ztest places; a bound below it would pass a
+    /// node that cannot hold the builder
+    #[test]
+    fn the_capacity_bound_covers_the_build_pod() {
+        assert!(crate::qos::build::BUILDKIT_BUILD.fits_within(&heaviest_pod()));
+        for tier in crate::qos::QosClass::ALL {
+            assert!(tier.profile().admitted().fits_within(&heaviest_pod()), "{tier:?} overflows");
+        }
+    }
+
+    /// `oc` is the on-cluster compile's transport and `kind` the local side-loader —
+    /// neither is needed on the other class, and a run fails at spawn without its own
+    #[test]
+    fn each_cluster_class_names_the_binaries_its_own_path_spawns() {
+        assert!(tools(ClusterClass::Remote).contains(&"oc"));
+        assert!(!tools(ClusterClass::Remote).contains(&"kind"));
+        assert!(tools(ClusterClass::Local).contains(&"kind"));
+        assert!(!tools(ClusterClass::Local).contains(&"oc"));
+        for class in [ClusterClass::Local, ClusterClass::Remote] {
+            for shared in ["cargo", "git", "tar"] {
+                assert!(tools(class).contains(&shared), "{class:?} drops {shared}");
+            }
+        }
     }
 }

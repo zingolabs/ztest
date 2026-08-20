@@ -138,6 +138,8 @@ pub enum ImageError {
     DockerBuild { stderr_tail: String },
     KindLoad { stderr_tail: String },
     KindClusterMissing { cluster: String, available: String },
+    KindClusterQuery { engine: &'static str, stderr_tail: String },
+    KindNodeQuery { stderr_tail: String },
     DockerPush { stderr_tail: String },
     KindImageQuery { stderr_tail: String },
     Spawn { cmd: String, err: std::io::Error },
@@ -166,6 +168,13 @@ impl std::fmt::Display for ImageError {
                  `ztest cluster setup`, \
                  or point at another cluster with `ztest run --cluster <name>`.",
             ),
+            ImageError::KindClusterQuery { engine, stderr_tail } => write!(
+                f,
+                "kind cluster query failed; `{engine} ps` could not list the nodes:\n{stderr_tail}"
+            ),
+            ImageError::KindNodeQuery { stderr_tail } => {
+                write!(f, "`kind get nodes` failed:\n{stderr_tail}")
+            }
             ImageError::DockerPush { stderr_tail } => {
                 write!(f, "image build: docker push failed:\n{stderr_tail}")
             }

@@ -23,23 +23,60 @@ mod render;
 mod report;
 mod runview;
 mod status;
+pub mod template;
 pub mod text;
 mod theme;
 
 use ztest::api::{BuildStage, NodeSummary};
 
-pub use self::layout::SPINNER_STEP_MS;
+pub use self::layout::{SPINNER_STEP_MS, display_width, pad, truncate, truncate_with};
 pub use self::plan::render as render_plan;
 pub use self::render::{
     render, render_cancel_panel, render_live_panel, render_preflight_panel,
     render_sync_build_panel, render_sync_load, render_sync_watch_panel, render_sync_work,
-    render_transfers,
+    render_transfer_line, render_transfers,
 };
-pub use self::report::{ComponentResources, ReportView, render_sync_report, status_mark};
+pub use self::report::{
+    ComponentResources, ReportView, render_sync_report, render_sync_verdict, status_mark,
+};
 pub use self::runview::ConsoleView;
 pub use self::status::render_status;
 pub use self::theme::Theme;
 pub use ztest::api::{QosPlan, TierPlan};
+
+/// Cross-crate test support. `pub` only so `ztest_cli`'s tests can reach it — nothing
+/// here is part of the rendering API, and `#[cfg(test)]` would not cross the crate line
+#[doc(hidden)]
+pub mod testing {
+    /// Assert an ASCII-mode render leaked no Unicode.
+    ///
+    /// The one gate every surface's golden test runs through. A hardcoded glyph is
+    /// invisible in a Unicode golden — it renders identically to the themed one — so the
+    /// only mechanical way to catch it is to draw the same frame with
+    /// [`ThemeChars::ascii`](crate::Theme) and check what came out. Without this, a leak
+    /// is found by a user on a terminal that cannot render it
+    ///
+    /// # Panics
+    /// With the offending characters named, and the line each sits on
+    pub fn assert_ascii_clean(surface: &str, drawn: &str) {
+        let bad: Vec<String> = drawn
+            .lines()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                let leaked: Vec<char> = line.chars().filter(|c| !c.is_ascii()).collect();
+                match leaked.is_empty() {
+                    true => None,
+                    false => Some(format!("  line {}: {leaked:?} in {line:?}", i + 1)),
+                }
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "`{surface}` leaked non-ascii glyphs in ascii mode — they belong in `ThemeChars`:\n{}",
+            bad.join("\n")
+        );
+    }
+}
 
 // ─────────────────────────── data model ───────────────────────────────
 
@@ -165,6 +202,7 @@ pub enum TransferKind {
     Download,
     Image,
     Seed,
+    Upload,
 }
 
 /// Live state of a [`TransferRow`].
@@ -180,6 +218,63 @@ pub enum TransferProgress {
     Stage(String),
     Bytes { done: u64, total: u64, pace: Option<ztest::api::Pace> },
     Failed { detail: String },
+}
+
+/// Byte reports arrive ~1/s (`dd status=progress`; image pulls no faster), sizing the
+/// [`Window`](ztest::api::Window) that smooths them
+const BYTE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One row's [`Progress`](ztest::api::Progress) reports folded into a [`TransferProgress`],
+/// owning the rate window behind them.
+///
+/// - Single fold for every surface (console build phase, `snapshot push`, `snapshot warm`)
+/// - Window dropped on leaving byte mode (resumed bar must not date its rate to the gap)
+/// - `Failed` latches (a failed row keeps its failure until the phase ends)
+#[derive(Debug)]
+pub struct TransferState {
+    rate: ztest::api::Window<u64>,
+    progress: TransferProgress,
+}
+
+impl TransferState {
+    pub fn new(stage: impl Into<String>) -> TransferState {
+        TransferState {
+            rate: ztest::api::Window::new(BYTE_SAMPLE_INTERVAL),
+            progress: TransferProgress::Stage(stage.into()),
+        }
+    }
+
+    /// `at` = arrival, passed in rather than read here (a fold reading the clock cannot be
+    /// driven over a scripted timeline)
+    pub fn apply(&mut self, ev: ztest::api::Progress, at: std::time::Instant) {
+        if matches!(self.progress, TransferProgress::Failed { .. }) {
+            return;
+        }
+        self.progress = match ev {
+            ztest::api::Progress::Bytes { done, total } => {
+                self.rate.push(at, done);
+                let pace = self.rate.pace(Some(total.saturating_sub(done) as f64));
+                TransferProgress::Bytes { done, total, pace }
+            }
+            ztest::api::Progress::Note(note) => {
+                self.rate = ztest::api::Window::new(BYTE_SAMPLE_INTERVAL);
+                TransferProgress::Stage(note)
+            }
+            // Bar dropped, not parked at 100% (full bar that keeps sitting = reads as a hang)
+            ztest::api::Progress::Finalizing => {
+                self.rate = ztest::api::Window::new(BYTE_SAMPLE_INTERVAL);
+                TransferProgress::Stage("finalizing".to_string())
+            }
+        };
+    }
+
+    pub fn fail(&mut self, detail: String) {
+        self.progress = TransferProgress::Failed { detail };
+    }
+
+    pub fn progress(&self) -> &TransferProgress {
+        &self.progress
+    }
 }
 
 // ─────────────────────────── sync watch (both columns) ────────────────

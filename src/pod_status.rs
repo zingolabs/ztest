@@ -1,11 +1,14 @@
-//! Pure pod-`status` classification for the two poll-and-wait loops: runner-pod terminal
-//! wait ([`engine::pod_runner`](crate::engine)) + dependency readiness ([`env::TestEnv`](crate::env)).
+//! Pure pod-`status` classification for every poll-and-wait loop: runner-pod terminal wait
+//! ([`engine::pod_runner`](crate::engine)), dependency readiness ([`env::TestEnv`](crate::env)),
+//! csi-hostpath install (`ztest cluster setup`).
 //!
+//! - [`ReadyWatch`] = the shared deadline policy; predicates below stay separately usable
+//!   (the terminal wait wants faults, not readiness)
 //! - `Pending` on capacity = broker's backlog, never a test failure; `OOMKilled` /
 //!   `CrashLoopBackOff` never self-heal → fail fast ("no flaky tests")
 //! - `Pending` too coarse: [`is_scheduled`] splits queued from unplaceable by node
 //!   assignment, [`PENDING_TIMEOUT`] bounds the unscheduled window
-//! - I/O-free → both loops unit-test decisions against synthetic `PodStatus`
+//! - I/O-free → every loop unit-tests its decisions against synthetic `PodStatus`
 
 use std::time::{Duration, Instant};
 
@@ -119,6 +122,72 @@ pub fn pull_error_is_terminal(
     grace: Duration,
 ) -> bool {
     reason == "InvalidImageName" || now.duration_since(first_seen) >= grace
+}
+
+/// Verdict on one pod-`status` sample, from [`ReadyWatch::observe`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Ready,
+    Waiting,
+    Unschedulable { reason: String, elapsed: Duration },
+    Faulted(String),
+    PullFailed(String),
+    ReadyTimeout(Duration),
+}
+
+/// The three readiness deadlines, folded one sample at a time.
+///
+/// - Owns a clock per deadline; caller owns the poll and the reporting
+/// - I/O-free → one policy for every wait loop, tested on synthetic `PodStatus`
+#[derive(Debug)]
+pub struct ReadyWatch {
+    ready_timeout: Duration,
+    unscheduled_since: Option<Instant>,
+    running_since: Option<Instant>,
+    pull_error_since: Option<Instant>,
+}
+
+impl ReadyWatch {
+    /// `ready_timeout` clocks from `Running` (time-to-ready = the app's, not the scheduler's)
+    pub fn new(ready_timeout: Duration) -> Self {
+        Self { ready_timeout, unscheduled_since: None, running_since: None, pull_error_since: None }
+    }
+
+    /// Order load-bearing: placement gates the rest (no node → every later check vacuous)
+    pub fn observe(&mut self, status: &PodStatus, now: Instant) -> Verdict {
+        if is_ready(status) {
+            return Verdict::Ready;
+        }
+        if !is_scheduled(status) {
+            let since = *self.unscheduled_since.get_or_insert(now);
+            let elapsed = now.saturating_duration_since(since);
+            if elapsed >= PENDING_TIMEOUT {
+                let reason = schedule_blocker(status)
+                    .unwrap_or_else(|| "no PodScheduled condition".to_string());
+                return Verdict::Unschedulable { reason, elapsed };
+            }
+        }
+        if let Some(reason) = fault(status) {
+            return Verdict::Faulted(reason);
+        }
+        match image_error(status) {
+            Some(reason) => {
+                let first = *self.pull_error_since.get_or_insert(now);
+                if pull_error_is_terminal(&reason, first, now, IMAGE_PULL_GRACE) {
+                    return Verdict::PullFailed(reason);
+                }
+            }
+            // Kubelet backoff cleared → the grace restarts, never carries over
+            None => self.pull_error_since = None,
+        }
+        if is_running(status) {
+            let since = *self.running_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= self.ready_timeout {
+                return Verdict::ReadyTimeout(self.ready_timeout);
+            }
+        }
+        Verdict::Waiting
+    }
 }
 
 pub fn exit_code(status: &PodStatus) -> Option<i32> {
@@ -511,5 +580,131 @@ mod tests {
         assert!(!pull_error_is_terminal("ErrImagePull", t0, t0 + Duration::from_secs(30), grace));
         assert!(pull_error_is_terminal("ErrImagePull", t0, t0 + Duration::from_secs(91), grace));
         assert!(pull_error_is_terminal("InvalidImageName", t0, t0, grace));
+    }
+
+    // ── ReadyWatch: the shared deadline fold ────────────────────────────────
+
+    fn waiting_on(reason: &str) -> PodStatus {
+        with_conditions(
+            with_container(status(Some("Pending")), {
+                let mut c = container("hostpath");
+                c.state = Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some(reason.into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+                c
+            }),
+            vec![sched_cond("True", None, None)],
+        )
+    }
+
+    fn ready_pod() -> PodStatus {
+        with_conditions(
+            status(Some("Running")),
+            vec![PodCondition {
+                type_: "Ready".into(),
+                status: "True".into(),
+                ..Default::default()
+            }],
+        )
+    }
+
+    #[test]
+    fn a_ready_pod_short_circuits_every_deadline() {
+        let mut w = ReadyWatch::new(Duration::from_secs(1));
+        let t0 = Instant::now();
+        assert_eq!(w.observe(&ready_pod(), t0 + Duration::from_secs(9_999)), Verdict::Ready);
+    }
+
+    #[test]
+    fn an_unplaceable_pod_is_named_only_once_pending_timeout_expires() {
+        let mut w = ReadyWatch::new(Duration::from_secs(60));
+        let unplaceable = with_conditions(
+            status(Some("Pending")),
+            vec![sched_cond("False", Some("Unschedulable"), Some("0/1 nodes are available"))],
+        );
+        let t0 = Instant::now();
+        assert_eq!(w.observe(&unplaceable, t0), Verdict::Waiting);
+        assert_eq!(
+            w.observe(&unplaceable, t0 + PENDING_TIMEOUT - Duration::from_secs(1)),
+            Verdict::Waiting
+        );
+        let verdict = w.observe(&unplaceable, t0 + PENDING_TIMEOUT);
+        let Verdict::Unschedulable { reason, .. } = verdict else {
+            panic!("expected Unschedulable, got {verdict:?}");
+        };
+        assert!(reason.contains("0/1 nodes are available"), "{reason}");
+    }
+
+    /// The clock starts at the *first* unscheduled sample, not at construction
+    #[test]
+    fn the_pending_clock_starts_on_the_first_sample() {
+        let mut w = ReadyWatch::new(Duration::from_secs(60));
+        let unplaceable =
+            with_conditions(status(Some("Pending")), vec![sched_cond("False", None, None)]);
+        let t0 = Instant::now();
+        let late = t0 + Duration::from_secs(600);
+        assert_eq!(w.observe(&unplaceable, late), Verdict::Waiting);
+        assert!(matches!(
+            w.observe(&unplaceable, late + PENDING_TIMEOUT),
+            Verdict::Unschedulable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_crashloop_fails_fast_with_no_grace() {
+        let mut w = ReadyWatch::new(Duration::from_secs(60));
+        let crashed = waiting_on("CrashLoopBackOff");
+        assert_eq!(
+            w.observe(&crashed, Instant::now()),
+            Verdict::Faulted("hostpath: CrashLoopBackOff".to_string())
+        );
+    }
+
+    #[test]
+    fn a_pull_error_is_terminal_only_past_the_grace() {
+        let mut w = ReadyWatch::new(Duration::from_secs(60));
+        let stuck = waiting_on("ImagePullBackOff");
+        let t0 = Instant::now();
+        assert_eq!(w.observe(&stuck, t0), Verdict::Waiting);
+        assert_eq!(
+            w.observe(&stuck, t0 + IMAGE_PULL_GRACE),
+            Verdict::PullFailed("ImagePullBackOff".to_string())
+        );
+    }
+
+    /// Kubelet backoff clearing must restart the grace, not resume a spent one
+    #[test]
+    fn a_cleared_pull_error_resets_the_grace() {
+        let mut w = ReadyWatch::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert_eq!(w.observe(&waiting_on("ImagePullBackOff"), t0), Verdict::Waiting);
+        assert_eq!(
+            w.observe(&waiting_on("ContainerCreating"), t0 + IMAGE_PULL_GRACE),
+            Verdict::Waiting
+        );
+        assert_eq!(
+            w.observe(&waiting_on("ImagePullBackOff"), t0 + IMAGE_PULL_GRACE),
+            Verdict::Waiting
+        );
+    }
+
+    /// Pull time sits before `Running`, so a slow cold pull never trips the ready budget
+    #[test]
+    fn the_ready_budget_clocks_from_running_not_from_creation() {
+        let mut w = ReadyWatch::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert_eq!(w.observe(&waiting_on("ContainerCreating"), t0), Verdict::Waiting);
+        let running =
+            with_conditions(status(Some("Running")), vec![sched_cond("True", None, None)]);
+        let up = t0 + Duration::from_secs(600);
+        assert_eq!(w.observe(&running, up), Verdict::Waiting);
+        assert_eq!(
+            w.observe(&running, up + Duration::from_secs(60)),
+            Verdict::ReadyTimeout(Duration::from_secs(60))
+        );
     }
 }

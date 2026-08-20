@@ -107,10 +107,78 @@ pub fn format_elapsed(d: std::time::Duration) -> String {
     }
 }
 
-/// Transfer rate `18.1 MiB/s`, IEC to match the byte counts beside it
-pub fn byte_rate(bytes_per_sec: f64) -> String {
-    let clamped = bytes_per_sec.max(0.0) as u64;
-    format!("{}/s", bytesize::ByteSize::b(clamped).display().iec())
+/// Age `47s` / `2m05s` / `3h07m` — [`format_elapsed`] carried past the hour.
+///
+/// The third member of this vocabulary, and the reason all three live here: each is
+/// pinned to a different contract, so none can be collapsed into another.
+///
+/// - [`format_elapsed`] mirrors nextest's `NNs`/`NmNNs` exactly and *never* reaches
+///   hours; a 3-hour test would read `187m12s`, which is what nextest prints
+/// - [`format_span`] drops seconds past a minute and stops at hours, so a declared cap
+///   echoes its own spelling (`48h`)
+/// - this one keeps seconds *and* rolls to hours, which is what a listing needs: a pod
+///   that has been terminating for three hours must not read as `187m`
+pub fn format_age(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3_600 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{}h{:02}m", s / 3_600, (s % 3_600) / 60),
+    }
+}
+
+/// Human span `45s` / `12m` / `2h30m` / `48h`.
+///
+/// - Distinct from [`format_elapsed`] on purpose: that one tracks nextest's `NNs`/`NmNNs`
+///   and never reaches hours, which a 48h cap needs
+/// - Exact hours collapse (`48h`, not `48h00m`)
+/// - Hours never roll to days: a hard cap echoes its declaration (`timeout = "48h"`), and
+///   `2d` breaks that correspondence
+pub fn format_span(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3_600 => format!("{}m", s / 60),
+        s if s % 3_600 == 0 => format!("{}h", s / 3_600),
+        s => format!("{}h{:02}m", s / 3_600, (s % 3_600) / 60),
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::{format_age, format_elapsed, format_span};
+    use std::time::Duration;
+
+    /// The three curves side by side. Read as one table, the split is obvious; read as
+    /// three functions in three files, the fourth one gets written
+    #[test]
+    fn each_duration_spelling_keeps_the_contract_it_was_written_for() {
+        let d = Duration::from_secs(3 * 3_600 + 7 * 60 + 5);
+        assert_eq!(format_elapsed(d), "187m05s", "nextest never rolls to hours");
+        assert_eq!(format_span(d), "3h07m", "a cap drops seconds");
+        assert_eq!(format_age(d), "3h07m", "an age keeps both");
+        let short = Duration::from_secs(125);
+        assert_eq!(format_elapsed(short), "2m05s");
+        assert_eq!(format_span(short), "2m", "a cap drops seconds past the minute");
+        assert_eq!(format_age(short), "2m05s", "an age keeps them");
+    }
+
+    #[test]
+    fn an_age_reads_in_whole_units() {
+        assert_eq!(format_age(Duration::from_secs(47)), "47s");
+        assert_eq!(format_age(Duration::from_secs(125)), "2m05s");
+        assert_eq!(format_age(Duration::from_secs(3 * 3600 + 7 * 60)), "3h07m");
+    }
+
+    #[test]
+    fn a_span_reaches_hours_and_never_rolls_to_days() {
+        let s = |n| format_span(Duration::from_secs(n));
+        assert_eq!(s(45), "45s");
+        assert_eq!(s(12 * 60), "12m");
+        assert_eq!(s(2 * 3600 + 30 * 60), "2h30m");
+        // Echoes `timeout = "48h"`, which `2d` would not
+        assert_eq!(s(48 * 3600), "48h");
+    }
 }
 
 /// `done / total` as one figure when both land in the same magnitude — `2.6/3.9 GiB`,
@@ -164,9 +232,10 @@ mod tests {
 
     #[test]
     fn a_byte_rate_carries_its_unit_per_second() {
-        assert_eq!(byte_rate(94.0 * 1024.0 * 1024.0), "94.0 MiB/s");
-        assert_eq!(byte_rate(0.0), "0 B/s");
-        assert_eq!(byte_rate(-5.0), "0 B/s", "a negative rate floors, never prints");
+        let rate = |v| unit_value(Unit::BytesPerSec, v);
+        assert_eq!(rate(94.0 * 1024.0 * 1024.0), "94.0 MiB/s");
+        assert_eq!(rate(0.0), "0 B/s");
+        assert_eq!(rate(-5.0), "0 B/s", "a negative rate floors, never prints");
     }
 
     /// Shared magnitude collapses to one unit; a crossed boundary keeps both, so the

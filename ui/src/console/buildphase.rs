@@ -9,48 +9,51 @@
 //!   context), over the shared [`crate::ui`] primitives
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use kube::Client;
-use owo_colors::OwoColorize as _;
 
 use crate::console::Console;
-use crate::{Theme, TransferKind, TransferProgress, TransferRow, Transfers};
+use crate::template::{Fields, Template};
+use crate::{Theme, TransferKind, TransferRow, Transfers};
 use ztest::api::CompilePhase as Phase;
-use ztest::api::{Cx, Graph, NodeId, NodeState, Progress, ProgressSink};
+use ztest::api::{Cx, Graph, NodeId, NodeState, ProgressSink};
 
 /// Read per frame by a scene closure to paint live capacity; `None` pins the panel
 /// to its last static figure
 pub type CapRx = tokio::sync::watch::Receiver<ztest::api::ClusterCapacity>;
 
-/// Compact duration: `12.3s` under a minute, `1m05s` above
-pub(crate) fn fmt_dur(d: Duration) -> String {
-    let s = d.as_secs_f64();
-    if s < 60.0 {
-        format!("{s:.1}s")
-    } else {
-        let t = d.as_secs();
-        format!("{}m{:02}s", t / 60, t % 60)
-    }
+/// Scrollback lines this module commits. A phase start and a note share a glyph on
+/// purpose — both are "something is happening", and the indent tells the closing line apart
+mod row {
+    pub(super) const START: &str = "{@bullet|dim} {label}{@ellipsis}";
+    /// `elapsed` arrives parenthesised: the template cannot tone a literal, and a
+    /// bright `(` around a dim `12s` reads as two things
+    pub(super) const DONE: &str = "  {@ok|pass} {label} {elapsed|dim}";
+    pub(super) const NOTE: &str = "{@bullet|dim} {note}";
 }
 
 /// [`Phase`] transition → colored scrollback line, committed through the console
 /// (stderr when there is none). `Some(label)` on a phase *start*, for the caller's
 /// live row; `None` for `Done`/`Note`, which only land in scrollback
 pub fn commit_phase(console: Option<&Console>, theme: &Theme, ev: Phase<'_>) -> Option<String> {
+    let draw = |src: &str, f: Fields<'_>| {
+        Template::parse(src).render_str(&f, 0, std::time::Duration::ZERO, theme)
+    };
     let (line, new_phase) = match ev {
         Phase::Start(label) => {
-            (format!("{} {label}…", "•".style(theme.styles.dim)), Some(label.to_string()))
+            (draw(row::START, Fields::new().text("label", label)), Some(label.to_string()))
         }
         Phase::Done { label, dur } => (
-            format!(
-                "  {} {label} {}",
-                theme.chars.ok.style(theme.styles.pass),
-                format!("({})", fmt_dur(dur)).style(theme.styles.dim),
+            draw(
+                row::DONE,
+                Fields::new()
+                    .text("label", label)
+                    .text("elapsed", format!("({})", ztest::api::format_elapsed(dur))),
             ),
             None,
         ),
-        Phase::Note(text) => (format!("{} {text}", "•".style(theme.styles.dim)), None),
+        Phase::Note(text) => (draw(row::NOTE, Fields::new().text("note", text)), None),
     };
     match console {
         Some(c) => {
@@ -86,94 +89,62 @@ enum TransferEvent {
     Progress(NodeId, ztest::api::Progress),
 }
 
-/// Byte reports arrive ~1/s (`dd status=progress`; image pulls no faster), sizing the
-/// [`rate::Window`](ztest::api::Window) that smooths them
-const BYTE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Work-side model behind the right column: in-flight and failed acquisitions, by node.
-///
-/// `rates` parallels `rows` — a window is a *series*, so it cannot live in the
-/// per-frame [`Transfers`] snapshot the renderer sees
+/// Work-side model behind the right column: in-flight and failed acquisitions, by node
 #[derive(Default)]
 struct TransferRegistry {
-    rows: std::collections::BTreeMap<NodeId, TransferRow>,
-    rates: std::collections::BTreeMap<NodeId, ztest::api::Window<u64>>,
+    rows: std::collections::BTreeMap<NodeId, TrackedRow>,
+}
+
+/// [`TransferRow`] before its per-frame snapshot — carries the series the snapshot cannot
+struct TrackedRow {
+    label: String,
+    kind: TransferKind,
+    state: crate::TransferState,
 }
 
 impl TransferRegistry {
-    /// Fold one byte report into the node's window → smoothed bytes/sec + its ETA
-    fn observe_bytes(
-        &mut self,
-        id: &NodeId,
-        done: u64,
-        total: u64,
-        at: Instant,
-    ) -> Option<ztest::api::Pace> {
-        let window = self
-            .rates
-            .entry(id.clone())
-            .or_insert_with(|| ztest::api::Window::new(BYTE_SAMPLE_INTERVAL));
-        window.push(at, done);
-        window.pace(Some(total.saturating_sub(done) as f64))
-    }
-
-    /// `at` = arrival, passed in rather than read here (a fold that reads the clock
-    /// cannot be driven over a scripted timeline)
+    /// `at` = arrival, passed in rather than read here (a fold reading the clock cannot be
+    /// driven over a scripted timeline)
     fn apply(&mut self, ev: TransferEvent, at: Instant) {
         match ev {
             TransferEvent::State(id, NodeState::Acquiring) => {
                 let (label, kind) = describe_node(&id);
-                self.rows.entry(id).or_insert_with(|| TransferRow {
+                self.rows.entry(id).or_insert_with(|| TrackedRow {
                     label,
                     kind,
-                    progress: TransferProgress::Stage("acquiring".to_string()),
+                    state: crate::TransferState::new("acquiring"),
                 });
             }
             TransferEvent::State(id, NodeState::Ready) => {
                 self.rows.remove(&id);
-                self.rates.remove(&id);
             }
             TransferEvent::State(id, NodeState::Failed(detail)) => {
                 if let Some(row) = self.rows.get_mut(&id) {
-                    row.progress = TransferProgress::Failed { detail };
+                    row.state.fail(detail);
                 }
             }
             // Pending/Blocked never surface: nothing started, and a blocked node's
             // failed dependency is the signal shown instead
             TransferEvent::State(_, NodeState::Pending | NodeState::Blocked) => {}
-            // Sub-phase reports touch active rows only (a Failed row keeps its
-            // failure until the phase ends)
             TransferEvent::Progress(id, progress) => {
-                // Window folds before the row borrow (both want `&mut self`). Leaving
-                // byte mode discards it — a resumed bar must not date its rate to
-                // whatever the node was doing while it was off
-                let painted = match progress {
-                    Progress::Bytes { done, total } => {
-                        let pace = self.observe_bytes(&id, done, total, at);
-                        TransferProgress::Bytes { done, total, pace }
-                    }
-                    Progress::Note(note) => {
-                        self.rates.remove(&id);
-                        TransferProgress::Stage(note)
-                    }
-                    // Bytes done, manifest in flight: drop the bar so the row spins
-                    // instead of parking at 100% until Ready
-                    Progress::Finalizing => {
-                        self.rates.remove(&id);
-                        TransferProgress::Stage("finalizing…".to_string())
-                    }
-                };
-                if let Some(row) = self.rows.get_mut(&id)
-                    && !matches!(row.progress, TransferProgress::Failed { .. })
-                {
-                    row.progress = painted;
+                if let Some(row) = self.rows.get_mut(&id) {
+                    row.state.apply(progress, at);
                 }
             }
         }
     }
 
     fn snapshot(&self) -> Transfers {
-        Transfers { rows: self.rows.values().cloned().collect() }
+        let rows = self
+            .rows
+            .values()
+            .map(|r| TransferRow {
+                label: r.label.clone(),
+                kind: r.kind,
+                progress: r.state.progress().clone(),
+            })
+            .collect();
+        Transfers { rows }
     }
 }
 
@@ -242,6 +213,9 @@ pub async fn provision_with_tracker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TransferProgress;
+    use std::time::Duration;
+    use ztest::api::Progress;
 
     fn seed() -> NodeId {
         NodeId::Seed("seed-a1b2c3d4".to_string())
@@ -339,6 +313,8 @@ mod tests {
         assert!(matches!(row.progress, TransferProgress::Failed { .. }));
     }
 
+    /// Row owns its window, so departing takes it — the parallel-map leak this once
+    /// guarded is no longer expressible
     #[test]
     fn a_ready_node_leaves_the_column_and_takes_its_window() {
         let origin = Instant::now();
@@ -348,6 +324,6 @@ mod tests {
             .apply(TransferEvent::Progress(seed(), Progress::Bytes { done: 5, total: 9 }), origin);
         registry.apply(TransferEvent::State(seed(), NodeState::Ready), origin);
         assert!(registry.snapshot().rows.is_empty());
-        assert!(registry.rates.is_empty(), "a departed row must not leak its window");
+        assert!(registry.rows.is_empty(), "a departed row must not leak its window");
     }
 }

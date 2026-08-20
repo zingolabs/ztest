@@ -1,20 +1,18 @@
-use std::fmt::Write as _;
-
-use bytesize::ByteSize;
-use owo_colors::OwoColorize;
+use std::borrow::Cow;
+use std::time::Duration;
 
 use super::layout::*;
-use super::text::meter;
 use super::theme::Theme;
 use super::{
     ArchiveRow, ArchiveStatus, BannerState, BuildState, QosPlan, SyncVitals, SyncWatchState,
     TierPlan, TransferKind, TransferProgress, TransferRow, Transfers,
 };
+use crate::template::{Fields, Row, Template};
 use ztest::api::BuildStage;
 use ztest::api::LiveSnapshot;
 use ztest::api::Resources;
 use ztest::api::RunProgress;
-use ztest::api::{byte_pair, byte_rate, column_width, compact, format_elapsed, thousands};
+use ztest::api::{column_width, format_elapsed, thousands};
 
 pub fn render(state: &BannerState, theme: &Theme) -> String {
     let mut out = String::with_capacity(2048);
@@ -36,204 +34,282 @@ pub fn render(state: &BannerState, theme: &Theme) -> String {
     out
 }
 
+// ─────────────────────────── row binder ───────────────────────────────
+
+/// Star budget is `0`: no template here carries a `*` cell (every column is either fixed
+/// or pre-measured by the caller)
+fn draw(out: &mut String, f: Fields<'_>, src: &str, elapsed: Duration, theme: &Theme) {
+    out.push_str(&Template::parse(src).render_str(&f, 0, elapsed, theme));
+    out.push('\n');
+}
+
+/// Action-label column, padded here rather than by a template width: the column is a
+/// minimum, and a fixed cell would clip the phase that names the row
+fn label(text: &str) -> String {
+    format!("{text:>width$}", width = LABEL_WIDTH)
+}
+
+/// [`label`] in the narrower side columns
+fn side_label(text: &str) -> String {
+    format!("{text:>width$}", width = METRIC_LABEL_WIDTH)
+}
+
+// ─────────────────────────── banner ───────────────────────────────────
+
+/// Preflight banner row shapes
+mod banner_row {
+    pub(super) const HEADER: &str = "{label|pass} {name}";
+    pub(super) const CLUSTER: &str = concat!(
+        "{label|pass} context {context} {@dot|dim} {used|bold} / {total|bold} slots used",
+        " {@dot|dim} configured {configured|bold} via --test-threads",
+    );
+    pub(super) const NODES: &str = "{label} {ready|bold} ready {@dot|dim} {cordoned|bold} cordoned";
+    pub(super) const CAPACITY: &str = concat!(
+        "{label} capacity {@dot|dim} {free_cores|bold} / {alloc_cores|bold} cores",
+        " {@dot|dim} {free_gib|bold} / {alloc_gib|bold} GiB free {gauge:12#} {pct|bold}%",
+    );
+    pub(super) const INVENTORY_QUEUED: &str = "{label|dim} {state|dim}";
+    pub(super) const INVENTORY_WORKING: &str =
+        "{label|pass} {@spin|bold} {phase}{@ellipsis} {@dot|dim} {elapsed|bold}";
+    pub(super) const INVENTORY_OK: &str = concat!(
+        "{label|pass} {@ok|pass} {tests|bold} tests across {bins|bold} binaries",
+        " {@dot|dim} {elapsed|bold}",
+    );
+    pub(super) const INVENTORY_FAILED: &str =
+        "{label|fail} {@warn|fail} {stage} failed (exit {code}) {@dot|dim} {elapsed|bold}";
+    pub(super) const ARCHIVES: &str = "{label|pass} {count|bold} selected";
+    pub(super) const ARCHIVE_CACHED: &str =
+        "{label} {@ok|pass} {name} {@dot|dim} {state|pass} {@dot|dim} {size|bytes.bold}";
+    pub(super) const ARCHIVE_MISSING: &str =
+        "{label} {@warn|skip} {name} {@dot|dim} missing {@dot|dim} {detail|dim}";
+    pub(super) const SCHEDULING: &str = concat!(
+        "{label|pass} {tests|bold} tests {@dot|dim} {waves|bold} waves {@dot|dim} peak",
+        " {peak|bold} {@dot|dim} {total|bold} reserved total",
+    );
+    pub(super) const SCHEDULING_BLIND: &str = concat!(
+        "{label|pass} {tests|bold} tests {@dot|dim} {total|bold} reserved total",
+        " {@dot|dim} capacity unknown (probe unavailable)",
+    );
+    pub(super) const TIER: &str = "{label} {class|dim} {count|bold} {@dot|dim} {each} each";
+    pub(super) const TIER_MIXED: &str =
+        "{label} {class|dim} {count|bold} {@dot|dim} {subtotal} total {@dot|dim} mixed footprints";
+    pub(super) const UNSCHEDULABLE: &str = concat!(
+        "{label} {@warn|skip} {class|skip} needs {admitted} {@dot|dim}",
+        " exceeds cluster capacity — will be rejected",
+    );
+}
+
 fn render_header_line(out: &mut String, _state: &BannerState, theme: &Theme) {
-    let label = "Preflight";
-    writeln!(
-        out,
-        "{:>width$} {}",
-        label.style(theme.styles.pass),
-        "ztest".style(theme.styles.script_id),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f = Fields::new().text("label", label("Preflight")).text("name", "ztest");
+    draw(out, f, banner_row::HEADER, Duration::ZERO, theme);
 }
 
 fn render_cluster_block(out: &mut String, state: &BannerState, theme: &Theme) {
     let c = &state.cluster;
-    let dot = theme.chars.dot.style(theme.styles.dim);
 
-    writeln!(
-        out,
-        "{:>width$} context {} {dot} {} / {} slots used {dot} configured {} via --test-threads",
-        "Cluster".style(theme.styles.pass),
-        c.context,
-        c.slots_used.style(theme.styles.count),
-        c.slots_total.style(theme.styles.count),
-        c.slots_configured.style(theme.styles.count),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f = Fields::new()
+        .text("label", label("Cluster"))
+        .text("context", c.context.as_str())
+        .text("used", c.slots_used.to_string())
+        .text("total", c.slots_total.to_string())
+        .text("configured", c.slots_configured.to_string());
+    draw(out, f, banner_row::CLUSTER, Duration::ZERO, theme);
 
-    writeln!(
-        out,
-        "{INDENT}{} ready {dot} {} cordoned",
-        c.nodes_ready.style(theme.styles.count),
-        c.nodes_cordoned.style(theme.styles.count),
-    )
-    .expect("write to string");
+    let f = Fields::new()
+        .text("label", label(""))
+        .text("ready", c.nodes_ready.to_string())
+        .text("cordoned", c.nodes_cordoned.to_string());
+    draw(out, f, banner_row::NODES, Duration::ZERO, theme);
 
     // One global figure (allocatable − requested); gauge = free headroom, driven
     // by the tighter dimension
     let alloc = c.capacity.allocatable;
     let free = c.capacity.free();
     let pct = free_percent(&free, &alloc);
-    let bar = meter(pct, theme);
-    writeln!(
-        out,
-        "{INDENT}capacity {dot} {} / {} cores {dot} {} / {} GiB free {bar} {}",
-        cores_of(&free).style(theme.styles.count),
-        cores_of(&alloc).style(theme.styles.count),
-        gib_of(&free).style(theme.styles.count),
-        gib_of(&alloc).style(theme.styles.count),
-        format_args!("{pct}%").style(theme.styles.count),
-    )
-    .expect("write to string");
+    let f = Fields::new()
+        .text("label", label(""))
+        .text("free_cores", cores_of(&free).to_string())
+        .text("alloc_cores", cores_of(&alloc).to_string())
+        .text("free_gib", gib_of(&free).to_string())
+        .text("alloc_gib", gib_of(&alloc).to_string())
+        .percent("gauge", pct)
+        .text("pct", pct.to_string());
+    draw(out, f, banner_row::CAPACITY, Duration::ZERO, theme);
 }
 
 fn render_inventory_block(out: &mut String, state: &BannerState, theme: &Theme) {
-    let dot = theme.chars.dot.style(theme.styles.dim);
+    let f = Fields::new().text("label", label("Inventory"));
     match &state.build {
-        BuildState::Pending => {
-            writeln!(
-                out,
-                "{:>width$} {}",
-                "Inventory".style(theme.styles.dim),
-                "queued".style(theme.styles.dim),
-                width = LABEL_WIDTH,
-            )
-            .expect("write to string");
-        }
-        BuildState::Compiling { started_at, phase } => {
-            let elapsed = started_at.elapsed();
-            let label = phase.as_deref().unwrap_or("compiling test binaries");
-            writeln!(
-                out,
-                "{:>width$} {} {label}… {dot} {}",
-                "Inventory".style(theme.styles.pass),
-                spinner_glyph(elapsed).style(theme.styles.count),
-                format_elapsed(elapsed).style(theme.styles.count),
-                width = LABEL_WIDTH,
-            )
-            .expect("write to string");
-        }
-        BuildState::Indexing { started_at } => {
-            let elapsed = started_at.elapsed();
-            writeln!(
-                out,
-                "{:>width$} {} indexing test selection… {dot} {}",
-                "Inventory".style(theme.styles.pass),
-                spinner_glyph(elapsed).style(theme.styles.count),
-                format_elapsed(elapsed).style(theme.styles.count),
-                width = LABEL_WIDTH,
-            )
-            .expect("write to string");
-        }
-        BuildState::Ok { test_count, binary_count, elapsed } => {
-            writeln!(
-                out,
-                "{:>width$} {} {} tests across {} binaries {dot} {}",
-                "Inventory".style(theme.styles.pass),
-                theme.chars.ok.style(theme.styles.pass),
-                test_count.style(theme.styles.count),
-                binary_count.style(theme.styles.count),
-                format_elapsed(*elapsed).style(theme.styles.count),
-                width = LABEL_WIDTH,
-            )
-            .expect("write to string");
-        }
-        BuildState::Failed { exit_code, stage, elapsed } => {
-            let stage_label = match stage {
-                BuildStage::Compile => "compile",
-                BuildStage::Index => "index",
-            };
-            writeln!(
-                out,
-                "{:>width$} {} {} failed (exit {exit_code}) {dot} {}",
-                "Inventory".style(theme.styles.fail),
-                theme.chars.warn.style(theme.styles.fail),
-                stage_label,
-                format_elapsed(*elapsed).style(theme.styles.count),
-                width = LABEL_WIDTH,
-            )
-            .expect("write to string");
-        }
+        BuildState::Pending => draw(
+            out,
+            f.text("state", "queued"),
+            banner_row::INVENTORY_QUEUED,
+            Duration::ZERO,
+            theme,
+        ),
+        BuildState::Compiling { started_at, phase } => draw(
+            out,
+            f.text("phase", phase.as_deref().unwrap_or("compiling test binaries"))
+                .text("elapsed", format_elapsed(started_at.elapsed())),
+            banner_row::INVENTORY_WORKING,
+            started_at.elapsed(),
+            theme,
+        ),
+        BuildState::Indexing { started_at } => draw(
+            out,
+            f.text("phase", "indexing test selection")
+                .text("elapsed", format_elapsed(started_at.elapsed())),
+            banner_row::INVENTORY_WORKING,
+            started_at.elapsed(),
+            theme,
+        ),
+        BuildState::Ok { test_count, binary_count, elapsed } => draw(
+            out,
+            f.text("tests", test_count.to_string())
+                .text("bins", binary_count.to_string())
+                .text("elapsed", format_elapsed(*elapsed)),
+            banner_row::INVENTORY_OK,
+            Duration::ZERO,
+            theme,
+        ),
+        BuildState::Failed { exit_code, stage, elapsed } => draw(
+            out,
+            f.text("stage", stage_label(*stage))
+                .text("code", exit_code.to_string())
+                .text("elapsed", format_elapsed(*elapsed)),
+            banner_row::INVENTORY_FAILED,
+            Duration::ZERO,
+            theme,
+        ),
+    }
+}
+
+fn stage_label(stage: BuildStage) -> &'static str {
+    match stage {
+        BuildStage::Compile => "compile",
+        BuildStage::Index => "index",
     }
 }
 
 fn render_archive_block(out: &mut String, state: &BannerState, theme: &Theme) {
     let archives = &state.archives;
-    writeln!(
-        out,
-        "{:>width$} {} selected",
-        "Archives".style(theme.styles.pass),
-        archives.len().style(theme.styles.count),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f =
+        Fields::new().text("label", label("Archives")).text("count", archives.len().to_string());
+    draw(out, f, banner_row::ARCHIVES, Duration::ZERO, theme);
 
     let name_col = column_width(archives.iter().map(|r| r.name.as_str()), 18, 28);
-    let dot = theme.chars.dot.style(theme.styles.dim);
     for row in archives {
-        write_archive_row(out, row, name_col, &dot, theme);
+        write_archive_row(out, row, name_col, theme);
+    }
+}
+
+/// `name_col` = caller-measured across sibling rows, so the padding is data rather than
+/// a template width
+fn write_archive_row(out: &mut String, row: &ArchiveRow, name_col: usize, theme: &Theme) {
+    let f = Fields::new().text("label", label("")).text("name", pad(&row.name, name_col));
+    match &row.status {
+        ArchiveStatus::Cached { size_bytes } => draw(
+            out,
+            f.text("state", "cached").value("size", *size_bytes as f64),
+            banner_row::ARCHIVE_CACHED,
+            Duration::ZERO,
+            theme,
+        ),
+        ArchiveStatus::Missing { detail } => draw(
+            out,
+            f.text("detail", detail.as_str()),
+            banner_row::ARCHIVE_MISSING,
+            Duration::ZERO,
+            theme,
+        ),
     }
 }
 
 fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
-    let dot = theme.chars.dot.style(theme.styles.dim);
     let total_tests: u32 = plan.tiers.iter().map(|t| t.count).sum();
-
+    let header = Fields::new()
+        .text("label", label("Scheduling"))
+        .text("tests", total_tests.to_string())
+        .text("total", plan.total.to_string());
     match plan.free {
-        Some(_) => writeln!(
+        Some(_) => draw(
             out,
-            "{:>width$} {} tests {dot} {} waves {dot} peak {} {dot} {} reserved total",
-            "Scheduling".style(theme.styles.pass),
-            total_tests.style(theme.styles.count),
-            plan.waves.style(theme.styles.count),
-            plan.peak.style(theme.styles.count),
-            plan.total.style(theme.styles.count),
-            width = LABEL_WIDTH,
-        )
-        .expect("write to string"),
-        None => writeln!(
-            out,
-            "{:>width$} {} tests {dot} {} reserved total {dot} capacity unknown (probe unavailable)",
-            "Scheduling".style(theme.styles.pass),
-            total_tests.style(theme.styles.count),
-            plan.total.style(theme.styles.count),
-            width = LABEL_WIDTH,
-        )
-        .expect("write to string"),
+            header.text("waves", plan.waves.to_string()).text("peak", plan.peak.to_string()),
+            banner_row::SCHEDULING,
+            Duration::ZERO,
+            theme,
+        ),
+        None => draw(out, header, banner_row::SCHEDULING_BLIND, Duration::ZERO, theme),
     }
 
     let name_col = column_width(plan.tiers.iter().map(|t| t.class.as_label()), 12, 16);
     for TierPlan { class, count, per_test, subtotal } in &plan.tiers {
+        let f = Fields::new()
+            .text("label", label(""))
+            .text("class", pad(class.as_label(), name_col))
+            .text("count", count.to_string());
         // "X each" only when uniform; mixed (an override in the tier) → subtotal
-        let amount = match per_test {
-            Some(each) => format!("{each} each"),
-            None => format!("{subtotal} total {dot} mixed footprints"),
-        };
-        writeln!(
-            out,
-            "{INDENT}{:<width$} {} {dot} {amount}",
-            class.as_label().style(theme.styles.dim),
-            count.style(theme.styles.count),
-            width = name_col,
-        )
-        .expect("write to string");
+        match per_test {
+            Some(each) => {
+                draw(out, f.text("each", each.to_string()), banner_row::TIER, Duration::ZERO, theme)
+            }
+            None => draw(
+                out,
+                f.text("subtotal", subtotal.to_string()),
+                banner_row::TIER_MIXED,
+                Duration::ZERO,
+                theme,
+            ),
+        }
     }
 
     // Fail-fast on a test admission will reject; reserve carried on the rejection
     // (override → tier no longer determines it)
-    let warn = theme.chars.warn.style(theme.styles.skip);
     for u in &plan.unschedulable {
-        writeln!(
-            out,
-            "{INDENT}{warn} {} needs {} {dot} exceeds cluster capacity — will be rejected",
-            u.class.as_label().style(theme.styles.skip),
-            u.admitted,
-        )
-        .expect("write to string");
+        let f = Fields::new()
+            .text("label", label(""))
+            .text("class", u.class.as_label())
+            .text("admitted", u.admitted.to_string());
+        draw(out, f, banner_row::UNSCHEDULABLE, Duration::ZERO, theme);
     }
+}
+
+// ─────────────────────────── pinned panels ────────────────────────────
+
+/// Pinned-panel row shapes, shared where two panels draw the same row
+mod panel_row {
+    pub(super) const RUNNING: &str = concat!(
+        "{label|pass} {@spin|bold} {running|bold} running {@dot|dim} {committed|bold}",
+        " committed {@dot|dim}[ {gauge:12#} of {free|bold} free][ {blind}]",
+    );
+    pub(super) const PROGRESS: &str = concat!(
+        "{label} {done|bold}[/{total|bold}] done {@dot|dim} {passed|pass} passed",
+        "[ {@dot|dim} {failed|count.fail} failed] {@dot|dim} {elapsed|dim}",
+    );
+    pub(super) const TIERS: &str = "{label} {tiers} {@dot|dim} running / planned";
+    pub(super) const CLUSTER: &str = concat!(
+        "{label|pass} {@spin|bold} {context} {@dot|dim} {ready|bold} ready {@dot|dim}",
+        " {used|bold}/{total|bold} slots",
+    );
+    pub(super) const CAPACITY: &str = concat!(
+        "{label|dim} {gauge:12#} {pct|bold}% {@dot|dim} {free_cores|bold}/{alloc_cores|bold}c",
+        " {@dot|dim} {free_gib|bold}/{alloc_gib|bold}Gi free",
+    );
+    pub(super) const BUILD_QUEUED: &str = "{label|pass} {@dot|dim} queued";
+    pub(super) const BUILD_WORKING: &str =
+        "{label|pass} {@spin|bold} {phase}{@ellipsis} {@dot|dim} {elapsed}";
+    pub(super) const BUILD_OK: &str =
+        "{label|pass} {@ok|pass} {tests} tests / {bins} bins {@dot|dim} {elapsed}";
+    pub(super) const BUILD_FAILED: &str = "{label|pass} {@warn|fail} build failed (exit {code})";
+    pub(super) const SCHEDULING: &str =
+        "{label|pass} {tests|bold} tests {@dot|dim} {waves|bold} waves {@dot|dim} peak {peak|bold}";
+    pub(super) const SCHEDULING_BLIND: &str =
+        "{label|pass} {tests|bold} tests {@dot|dim} capacity unknown";
+    pub(super) const SUBJECT: &str =
+        "{label|pass} {@spin|bold} {profile|bold} {@dot|dim} {sync_id|dim}";
+    pub(super) const CONTEXT: &str = "{label|dim} {context}";
+    pub(super) const CANCEL: &str =
+        "{label|skip} {@spin|skip} terminating subprocesses{@ellipsis} {@dot|dim} {hint|dim}";
 }
 
 /// Left column during the run: [`render_preflight_panel`]'s counterpart, same
@@ -247,55 +323,35 @@ pub fn render_live_panel(
     theme: &Theme,
 ) -> String {
     let mut out = String::with_capacity(320);
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    // Advances per redraw, independent of cluster polling = "still alive?" heartbeat
-    let spin = spinner_glyph(progress.elapsed);
 
     render_label_rule(&mut out, theme);
 
+    let running = Fields::new()
+        .text("label", label("Running"))
+        .text("running", snapshot.total_running().to_string())
+        .text("committed", snapshot.committed.to_string());
     // `free` == 0 means the re-probe was unavailable; say so, never draw an empty gauge
-    let capacity = if free.cpu_milli == 0 && free.mem_bytes == 0 {
-        "capacity unknown (probe unavailable)".to_string()
-    } else {
-        let bar = meter(used_percent(&snapshot.committed, free), theme);
-        format!("{bar} of {} free", free.style(theme.styles.count))
+    let running = match free.cpu_milli == 0 && free.mem_bytes == 0 {
+        true => running.text("blind", "capacity unknown (probe unavailable)"),
+        false => running
+            .percent("gauge", used_percent(&snapshot.committed, free))
+            .text("free", free.to_string()),
     };
-    writeln!(
-        out,
-        "{:>width$} {} {} running {dot} {} committed {dot} {capacity}",
-        "Running".style(theme.styles.pass),
-        spin.style(theme.styles.count),
-        snapshot.total_running().style(theme.styles.count),
-        snapshot.committed.style(theme.styles.count),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    draw(&mut out, running, panel_row::RUNNING, progress.elapsed, theme);
 
-    // Bare `done` when total unknown
-    let done = match progress.total {
-        0 => format!("{} done", progress.done().style(theme.styles.count)),
-        total => format!(
-            "{}/{} done",
-            progress.done().style(theme.styles.count),
-            total.style(theme.styles.count),
-        ),
-    };
-    let failed = if progress.failed > 0 {
-        format!(
-            " {dot} {} {}",
-            progress.failed.style(theme.styles.fail),
-            "failed".style(theme.styles.fail),
-        )
-    } else {
-        String::new()
-    };
-    writeln!(
-        out,
-        "{INDENT}{done} {dot} {} passed{failed} {dot} {}",
-        progress.passed.style(theme.styles.pass),
-        format_elapsed(progress.elapsed).style(theme.styles.dim),
-    )
-    .expect("write to string");
+    // Bare `done` when total unknown; `failed` only once one has
+    let mut progress_row = Fields::new()
+        .text("label", label(""))
+        .text("done", progress.done().to_string())
+        .text("passed", progress.passed.to_string())
+        .text("elapsed", format_elapsed(progress.elapsed));
+    if progress.total > 0 {
+        progress_row = progress_row.text("total", progress.total.to_string());
+    }
+    if progress.failed > 0 {
+        progress_row = progress_row.value("failed", f64::from(progress.failed));
+    }
+    draw(&mut out, progress_row, panel_row::PROGRESS, Duration::ZERO, theme);
 
     if !plan.tiers.is_empty() {
         let parts: Vec<String> = plan
@@ -306,12 +362,10 @@ pub fn render_live_panel(
                 format!("{} {}/{}", t.class.as_label(), run, t.count)
             })
             .collect();
-        writeln!(
-            out,
-            "{INDENT}{} {dot} running / planned",
-            parts.join(&format!(" {} ", theme.chars.dot)),
-        )
-        .expect("write to string");
+        let f = Fields::new()
+            .text("label", label(""))
+            .text("tiers", parts.join(&format!(" {} ", theme.chars.dot)));
+        draw(&mut out, f, panel_row::TIERS, Duration::ZERO, theme);
     }
 
     pad_to_panel(&mut out);
@@ -328,70 +382,49 @@ pub fn render_preflight_panel(
     theme: &Theme,
 ) -> String {
     let mut out = String::with_capacity(320);
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    let spin = spinner_glyph(elapsed);
     let c = &state.cluster;
 
     render_label_rule(&mut out, theme);
 
-    // Line 1 — cluster
-    writeln!(
-        out,
-        "{:>width$} {} {} {dot} {} ready {dot} {}/{} slots",
-        phase.style(theme.styles.pass),
-        spin.style(theme.styles.count),
-        c.context,
-        c.nodes_ready.style(theme.styles.count),
-        c.slots_used.style(theme.styles.count),
-        c.slots_total.style(theme.styles.count),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f = Fields::new()
+        .text("label", label(phase))
+        .text("context", c.context.as_str())
+        .text("ready", c.nodes_ready.to_string())
+        .text("used", c.slots_used.to_string())
+        .text("total", c.slots_total.to_string());
+    draw(&mut out, f, panel_row::CLUSTER, elapsed, theme);
 
-    // Line 2 — capacity gauge (tighter of cpu/mem). Own label + compact units keep
-    // the line unclipped
+    // Gauge on the tighter of cpu/mem; own label + compact units keep the line unclipped
     let alloc = c.capacity.allocatable;
     let free = c.capacity.free();
     let pct = free_percent(&free, &alloc);
-    let bar = meter(pct, theme);
-    writeln!(
-        out,
-        "{:>width$} {bar} {} {dot} {}/{}c {dot} {}/{}Gi free",
-        "capacity".style(theme.styles.dim),
-        format_args!("{pct}%").style(theme.styles.count),
-        cores_of(&free).style(theme.styles.count),
-        cores_of(&alloc).style(theme.styles.count),
-        gib_of(&free).style(theme.styles.count),
-        gib_of(&alloc).style(theme.styles.count),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f = Fields::new()
+        .text("label", label("capacity"))
+        .percent("gauge", pct)
+        .text("pct", pct.to_string())
+        .text("free_cores", cores_of(&free).to_string())
+        .text("alloc_cores", cores_of(&alloc).to_string())
+        .text("free_gib", gib_of(&free).to_string())
+        .text("alloc_gib", gib_of(&alloc).to_string());
+    draw(&mut out, f, panel_row::CAPACITY, Duration::ZERO, theme);
 
-    // Line 3 — inventory / build state
-    render_build_line(&mut out, &state.build, spin, theme);
+    render_build_line(&mut out, &state.build, elapsed, theme);
 
-    // Line 4 — scheduling (blank without a QoS plan)
+    // Scheduling row absent without a QoS plan
     if let Some(plan) = &state.qos_plan {
         let total_tests: u32 = plan.tiers.iter().map(|t| t.count).sum();
+        let f =
+            Fields::new().text("label", label("Scheduling")).text("tests", total_tests.to_string());
         match plan.free {
-            Some(_) => writeln!(
-                out,
-                "{:>width$} {} tests {dot} {} waves {dot} peak {}",
-                "Scheduling".style(theme.styles.pass),
-                total_tests.style(theme.styles.count),
-                plan.waves.style(theme.styles.count),
-                plan.peak.style(theme.styles.count),
-                width = LABEL_WIDTH,
+            Some(_) => draw(
+                &mut out,
+                f.text("waves", plan.waves.to_string()).text("peak", plan.peak.to_string()),
+                panel_row::SCHEDULING,
+                Duration::ZERO,
+                theme,
             ),
-            None => writeln!(
-                out,
-                "{:>width$} {} tests {dot} capacity unknown",
-                "Scheduling".style(theme.styles.pass),
-                total_tests.style(theme.styles.count),
-                width = LABEL_WIDTH,
-            ),
+            None => draw(&mut out, f, panel_row::SCHEDULING_BLIND, Duration::ZERO, theme),
         }
-        .expect("write to string");
     }
 
     pad_to_panel(&mut out);
@@ -399,42 +432,49 @@ pub fn render_preflight_panel(
 }
 
 /// Shared `Inventory` line: `ztest sync start`'s panel and the run banner cannot
-/// disagree about build state. `spin` = caller's per-frame glyph
-fn render_build_line(out: &mut String, build: &BuildState, spin: &str, theme: &Theme) {
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    let (build_marker, build_style, build_text) = match build {
-        BuildState::Pending => (theme.chars.dot, theme.styles.dim, "queued".to_string()),
-        BuildState::Compiling { started_at, phase } => (
-            spin,
-            theme.styles.count,
-            format!(
-                "{}… {dot} {}",
-                phase.as_deref().unwrap_or("compiling test binaries"),
-                format_elapsed(started_at.elapsed())
-            ),
+/// disagree about build state. `elapsed` drives the spinner
+fn render_build_line(
+    out: &mut String,
+    build: &BuildState,
+    elapsed: std::time::Duration,
+    theme: &Theme,
+) {
+    let f = Fields::new().text("label", label("Inventory"));
+    match build {
+        BuildState::Pending => draw(out, f, panel_row::BUILD_QUEUED, elapsed, theme),
+        BuildState::Compiling { started_at, phase } => draw(
+            out,
+            f.text("phase", phase.as_deref().unwrap_or("compiling test binaries"))
+                .text("elapsed", format_elapsed(started_at.elapsed())),
+            panel_row::BUILD_WORKING,
+            elapsed,
+            theme,
         ),
-        BuildState::Indexing { started_at } => (
-            spin,
-            theme.styles.count,
-            format!("indexing test selection… {dot} {}", format_elapsed(started_at.elapsed())),
+        BuildState::Indexing { started_at } => draw(
+            out,
+            f.text("phase", "indexing test selection")
+                .text("elapsed", format_elapsed(started_at.elapsed())),
+            panel_row::BUILD_WORKING,
+            elapsed,
+            theme,
         ),
-        BuildState::Ok { test_count, binary_count, elapsed } => (
-            theme.chars.ok,
-            theme.styles.pass,
-            format!("{test_count} tests / {binary_count} bins {dot} {}", format_elapsed(*elapsed)),
+        BuildState::Ok { test_count, binary_count, elapsed: took } => draw(
+            out,
+            f.text("tests", test_count.to_string())
+                .text("bins", binary_count.to_string())
+                .text("elapsed", format_elapsed(*took)),
+            panel_row::BUILD_OK,
+            elapsed,
+            theme,
         ),
-        BuildState::Failed { exit_code, .. } => {
-            (theme.chars.warn, theme.styles.fail, format!("build failed (exit {exit_code})"))
-        }
-    };
-    writeln!(
-        out,
-        "{:>width$} {} {build_text}",
-        "Inventory".style(theme.styles.pass),
-        build_marker.style(build_style),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+        BuildState::Failed { exit_code, .. } => draw(
+            out,
+            f.text("code", exit_code.to_string()),
+            panel_row::BUILD_FAILED,
+            elapsed,
+            theme,
+        ),
+    }
 }
 
 /// Left column during `ztest sync start`'s build+provision: [`render_preflight_panel`]'s
@@ -450,35 +490,17 @@ pub fn render_sync_build_panel(
     theme: &Theme,
 ) -> String {
     let mut out = String::with_capacity(320);
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    let spin = spinner_glyph(elapsed);
 
     render_label_rule(&mut out, theme);
 
-    // Line 1 — phase + profile + sync id
-    writeln!(
-        out,
-        "{:>width$} {} {} {dot} {}",
-        phase.style(theme.styles.pass),
-        spin.style(theme.styles.count),
-        profile.style(theme.styles.count),
-        sync_id.style(theme.styles.dim),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f =
+        Fields::new().text("label", label(phase)).text("profile", profile).text("sync_id", sync_id);
+    draw(&mut out, f, panel_row::SUBJECT, elapsed, theme);
 
-    // Line 2 — target cluster context
-    writeln!(
-        out,
-        "{:>width$} {}",
-        "cluster".style(theme.styles.dim),
-        context,
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f = Fields::new().text("label", label("cluster")).text("context", context);
+    draw(&mut out, f, panel_row::CONTEXT, Duration::ZERO, theme);
 
-    // Line 3 — inventory / build state (shared with the run banner)
-    render_build_line(&mut out, build, spin, theme);
+    render_build_line(&mut out, build, elapsed, theme);
 
     pad_to_panel(&mut out);
     out
@@ -493,21 +515,14 @@ pub fn render_sync_watch_panel(
     theme: &Theme,
 ) -> String {
     let mut out = String::with_capacity(384);
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    let spin = spinner_glyph(elapsed);
 
     render_label_rule(&mut out, theme);
 
-    writeln!(
-        out,
-        "{:>width$} {} {} {dot} {}",
-        "Watching".style(theme.styles.pass),
-        spin.style(theme.styles.count),
-        state.profile.style(theme.styles.count),
-        state.sync_id.style(theme.styles.dim),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f = Fields::new()
+        .text("label", label("Watching"))
+        .text("profile", state.profile.as_str())
+        .text("sync_id", state.sync_id.as_str());
+    draw(&mut out, f, panel_row::SUBJECT, elapsed, theme);
 
     match &state.vitals {
         Some(v) => render_sync_vitals(&mut out, state, v, elapsed, theme),
@@ -516,6 +531,34 @@ pub fn render_sync_watch_panel(
 
     pad_to_panel(&mut out);
     out
+}
+
+// ─────────────────────────── sync metrics ─────────────────────────────
+
+/// Metric row shapes. First four sit in the watch panel's [`LABEL_WIDTH`] column, the
+/// rest in the narrower [`METRIC_LABEL_WIDTH`] side columns
+mod metric_row {
+    pub(super) const HEIGHT: &str =
+        "{label|dim} {height|bold}[ / {target|bold}] {@dot|dim} {pct|fraction.bold} {gauge:12#}";
+    pub(super) const PACE: &str = concat!(
+        "{label|dim} [{blk:.1} blk/s][{blk_na}] {@dot|dim} [{tx|per_sec.bold} tx/s][{tx_na|bold}]",
+        "[ {@dot|dim} eta {eta}][ {@dot|dim} reorg -{reorg|count.skip}]",
+    );
+    pub(super) const TREND: &str =
+        "{label|dim} {blocks:12~} {span|dim}[ {@dot|dim} peak {peak:.0|dim} blk/s]";
+    pub(super) const DRIVER: &str = "{label|dim} {phase|bold} {@dot|dim} {age|dim}";
+    pub(super) const SETUP: &str =
+        "{label|dim} {subject|bold} {@dot|dim} {detail} {@dot|dim} {age|dim}";
+    pub(super) const NOTE: &str = "{label|dim} {note|dim}";
+    pub(super) const POOL: &str = "{label|dim} [{rate:>8|per_sec.bold}][{rate_na:>8|bold}] {spark}";
+    pub(super) const TOTAL: &str =
+        "{label|dim} [{rate:>8|per_sec.bold}][{rate_na:>8|bold}] {span|dim}";
+    // Absent limit != zero limit: a Burstable pod gets no denominator rather than an
+    // invented one
+    pub(super) const LOAD: &str =
+        "{label|dim} {cpu:.1|bold}c[/{cpu_limit:.0|bold}c] [{mem%|bold}][{mem|bytes.bold}]";
+    pub(super) const SIDE_NOTE: &str = "{label|dim} {note|dim}";
+    pub(super) const MORE: &str = "{label|dim} +{count|count.dim} more";
 }
 
 /// Scrape believability window = 3 periods (one dropped scrape must not blink the
@@ -529,12 +572,12 @@ fn stale(v: &SyncVitals, elapsed: std::time::Duration) -> bool {
     elapsed.saturating_sub(v.received_at) > STALE_AFTER
 }
 
-/// `—` for both unmeasured and stale (one statement to the reader: not known now)
-fn rate_text(rate: Option<f64>, stale: bool, unit: &str) -> String {
-    match rate.filter(|_| !stale) {
-        Some(r) if unit == "blk/s" => format!("{r:.1} {unit}"),
-        Some(r) => format!("{}{unit}", compact(r)),
-        None => "—".to_string(),
+/// Measured → the `{key}` rate cell, unmeasured or stale → `{na}` = `—` (one statement
+/// to the reader: not known now)
+fn rate<'a>(f: Fields<'a>, key: &'static str, na: &'static str, r: Option<f64>) -> Fields<'a> {
+    match r {
+        Some(r) => f.value(key, r),
+        None => f.text(na, "—"),
     }
 }
 
@@ -545,44 +588,30 @@ fn render_sync_vitals(
     elapsed: std::time::Duration,
     theme: &Theme,
 ) {
-    let dot = theme.chars.dot.style(theme.styles.dim);
-
-    let target = match v.target {
-        Some(t) => format!("{} / {}", thousands(v.height as u64), thousands(t as u64)),
-        None => thousands(v.height as u64),
-    };
-    writeln!(
-        out,
-        "{:>width$} {} {dot} {} {}",
-        "height".style(theme.styles.dim),
-        target.style(theme.styles.count),
-        format_args!("{:.1}%", v.pct).style(theme.styles.count),
-        meter(v.pct.clamp(0.0, 100.0) as u8, theme),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f = Fields::new()
+        .text("label", label("height"))
+        .text("height", thousands(v.height as u64))
+        .maybe_text("target", v.target.map(|t| thousands(t as u64)))
+        .value("pct", f64::from(v.pct) / 100.0)
+        .percent("gauge", v.pct.clamp(0.0, 100.0) as u8);
+    draw(out, f, metric_row::HEIGHT, Duration::ZERO, theme);
 
     let stale = stale(v, elapsed);
     // tx/s beside blk/s: same window, same staleness → the two never disagree about
     // whether the subject is moving (phase rides the `Watching` row instead)
-    let mut pace = format!(
-        "{} {dot} {}",
-        rate_text(v.pace.map(|p| p.per_sec), stale, "blk/s"),
-        rate_text(v.tx_rate, stale, " tx/s").style(theme.styles.count),
-    );
+    let fresh = |r: Option<f64>| r.filter(|_| !stale);
+    let mut pace = Fields::new().text("label", label("pace"));
+    pace = rate(pace, "blk", "blk_na", fresh(v.pace.map(|p| p.per_sec)));
+    pace = rate(pace, "tx", "tx_na", fresh(v.tx_rate));
     // Suppressed with the stale rate it derives from (a projection off a frozen
     // rate counts down to a finish that is not happening)
     if let Some(eta) = v.pace.and_then(|p| p.eta).filter(|_| !stale) {
-        pace.push_str(&format!(" {dot} eta {}", format_elapsed(eta)));
+        pace = pace.text("eta", format_elapsed(eta));
     }
     if v.reorg_depth > 0 {
-        pace.push_str(&format!(
-            " {dot} {}",
-            format_args!("reorg -{}", v.reorg_depth).style(theme.styles.skip),
-        ));
+        pace = pace.value("reorg", f64::from(v.reorg_depth));
     }
-    writeln!(out, "{:>width$} {pace}", "pace".style(theme.styles.dim), width = LABEL_WIDTH,)
-        .expect("write to string");
+    draw(out, pace, metric_row::PACE, Duration::ZERO, theme);
 
     render_scan_trend(out, state, theme);
 }
@@ -591,34 +620,17 @@ fn render_sync_vitals(
 /// actionable (a scan holding at half its demonstrated best = a regression nothing
 /// else on the panel can state)
 fn render_scan_trend(out: &mut String, state: &SyncWatchState, theme: &Theme) {
-    use super::plot::{Palette, PlotOpts, plot_stacked};
-    let dot = theme.chars.dot.style(theme.styles.dim);
-
-    let body = match &state.timeline {
-        Some(timeline) => {
-            let bands = timeline.bands(ztest::api::BLOCKS);
-            let opts = PlotOpts::new(SPARK_WIDTH, 1, theme.chars.graph);
-            let spark = plot_stacked(
-                &[(ztest::api::BLOCKS, bands)],
-                &opts,
-                &Palette::pools(theme.is_colorized()),
-            )
-            .pop()
-            .unwrap_or_default();
-            let peak = match timeline.peak(&[ztest::api::BLOCKS]) {
-                Some(p) => format!(" {dot} peak {p:.0} blk/s"),
-                None => String::new(),
-            };
-            format!(
-                "{spark} {}{}",
-                format_elapsed(timeline.span()).style(theme.styles.dim),
-                peak.style(theme.styles.dim),
-            )
-        }
-        None => "gathering".style(theme.styles.dim).to_string(),
+    let Some(timeline) = &state.timeline else {
+        let f = Fields::new().text("label", label("blocks")).text("note", "gathering");
+        draw(out, f, metric_row::NOTE, Duration::ZERO, theme);
+        return;
     };
-    writeln!(out, "{:>width$} {body}", "blocks".style(theme.styles.dim), width = LABEL_WIDTH,)
-        .expect("write to string");
+    let trend = Fields::new()
+        .text("label", label("blocks"))
+        .bands(ztest::api::BLOCKS, timeline.bands(ztest::api::BLOCKS))
+        .text("span", format_elapsed(timeline.span()))
+        .maybe_value("peak", timeline.peak(&[ztest::api::BLOCKS]));
+    draw(out, trend, metric_row::TREND, Duration::ZERO, theme);
 }
 
 /// Pre-first-tick rows: cluster, driver-pod phase, provisioning gate.
@@ -631,37 +643,35 @@ fn render_sync_waiting(
     elapsed: std::time::Duration,
     theme: &Theme,
 ) {
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    writeln!(
-        out,
-        "{:>width$} {}",
-        "cluster".style(theme.styles.dim),
-        state.context,
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
-    writeln!(
-        out,
-        "{:>width$} {} {dot} {}",
-        "driver".style(theme.styles.dim),
-        state.pod_phase.style(theme.styles.count),
-        format_elapsed(elapsed).style(theme.styles.dim),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f = Fields::new().text("label", label("cluster")).text("context", state.context.as_str());
+    draw(out, f, panel_row::CONTEXT, Duration::ZERO, theme);
 
-    let step = match &state.setup {
-        Some(s) => format!(
-            "{} {dot} {} {dot} {}",
-            s.subject.style(theme.styles.count),
-            s.detail,
-            format_elapsed(elapsed.saturating_sub(s.received_at)).style(theme.styles.dim),
+    let f = Fields::new()
+        .text("label", label("driver"))
+        .text("phase", state.pod_phase.as_str())
+        .text("age", format_elapsed(elapsed));
+    draw(out, f, metric_row::DRIVER, Duration::ZERO, theme);
+
+    let f = Fields::new().text("label", label("setup"));
+    match &state.setup {
+        Some(s) => draw(
+            out,
+            f.text("subject", s.subject.as_str())
+                .text("detail", s.detail.as_str())
+                .text("age", format_elapsed(elapsed.saturating_sub(s.received_at))),
+            metric_row::SETUP,
+            Duration::ZERO,
+            theme,
         ),
         // Say "no report yet" rather than leave a row that reads as a finished step
-        None => format!("{}", "waiting for the driver's first report".style(theme.styles.dim)),
-    };
-    writeln!(out, "{:>width$} {step}", "setup".style(theme.styles.dim), width = LABEL_WIDTH,)
-        .expect("write to string");
+        None => draw(
+            out,
+            f.text("note", "waiting for the driver's first report"),
+            metric_row::NOTE,
+            Duration::ZERO,
+            theme,
+        ),
+    }
 }
 
 /// Middle column of `ztest sync watch`: one row per measured pool + `total`, each
@@ -681,14 +691,9 @@ pub fn render_sync_work(
     out.push('\n');
 
     let (Some(timeline), Some(vitals)) = (&state.timeline, state.vitals.as_ref()) else {
-        writeln!(
-            out,
-            "{:>width$} {}",
-            "work".style(theme.styles.dim),
-            "awaiting first scrape".style(theme.styles.dim),
-            width = METRIC_LABEL_WIDTH,
-        )
-        .expect("write to string");
+        let f =
+            Fields::new().text("label", side_label("work")).text("note", "awaiting first scrape");
+        draw(&mut out, f, metric_row::SIDE_NOTE, Duration::ZERO, theme);
         pad_to_panel(&mut out);
         return out;
     };
@@ -708,40 +713,38 @@ pub fn render_sync_work(
         .filter(|(_, _, bands)| bands.iter().any(Option::is_some));
 
     let mut drawn = 0;
-    for (name, rate, bands) in measured.take(MAX_TRANSFER_ROWS.saturating_sub(1)) {
+    // Sparkline drawn here, not through a `{key:N~}` cell: the palette keys on the
+    // channel name, which a template's literal key cannot carry per pool
+    let fresh = |r: Option<f64>| r.filter(|_| !stale);
+    for (name, r, bands) in measured.take(MAX_TRANSFER_ROWS.saturating_sub(1)) {
         let spark = plot_stacked(&[(name, bands)], &opts, &palette).pop().unwrap_or_default();
-        writeln!(
-            out,
-            "{:>width$} {:>8} {spark}",
-            name.style(theme.styles.dim),
-            rate_text(*rate, stale, "/s").style(theme.styles.count),
-            width = METRIC_LABEL_WIDTH,
-        )
-        .expect("write to string");
+        let f = Fields::new().text("label", side_label(name)).text("spark", spark);
+        draw(
+            &mut out,
+            rate(f, "rate", "rate_na", fresh(*r)),
+            metric_row::POOL,
+            Duration::ZERO,
+            theme,
+        );
         drawn += 1;
     }
     if drawn == 0 {
-        writeln!(
-            out,
-            "{:>width$} {}",
-            "work".style(theme.styles.dim),
-            "no pool measured".style(theme.styles.dim),
-            width = METRIC_LABEL_WIDTH,
-        )
-        .expect("write to string");
+        let f = Fields::new().text("label", side_label("work")).text("note", "no pool measured");
+        draw(&mut out, f, metric_row::SIDE_NOTE, Duration::ZERO, theme);
     }
 
     // Total last, under its pools, carrying the sparkline span (else a reader
     // cannot tell ten minutes from two days of history)
-    writeln!(
-        out,
-        "{:>width$} {:>8} {}",
-        "total".style(theme.styles.dim),
-        rate_text(vitals.work_rate, stale, "/s").style(theme.styles.count),
-        format_elapsed(timeline.span()).style(theme.styles.dim),
-        width = METRIC_LABEL_WIDTH,
-    )
-    .expect("write to string");
+    let f = Fields::new()
+        .text("label", side_label("total"))
+        .text("span", format_elapsed(timeline.span()));
+    draw(
+        &mut out,
+        rate(f, "rate", "rate_na", fresh(vitals.work_rate)),
+        metric_row::TOTAL,
+        Duration::ZERO,
+        theme,
+    );
 
     pad_to_panel(&mut out);
     out
@@ -760,14 +763,10 @@ pub fn render_sync_load(state: &SyncWatchState, theme: &Theme) -> String {
     // Name the cause: a blank column reads as "the pods are idle", the one thing it
     // never means (no metrics API, or the first 15s sample not yet landed)
     if state.pods.is_empty() {
-        writeln!(
-            out,
-            "{:>width$} {}",
-            "load".style(theme.styles.dim),
-            state.pods_note.as_deref().unwrap_or("awaiting first sample").style(theme.styles.dim),
-            width = METRIC_LABEL_WIDTH,
-        )
-        .expect("write to string");
+        let f = Fields::new()
+            .text("label", side_label("load"))
+            .text("note", state.pods_note.as_deref().unwrap_or("awaiting first sample"));
+        draw(&mut out, f, metric_row::SIDE_NOTE, Duration::ZERO, theme);
         pad_to_panel(&mut out);
         return out;
     }
@@ -782,25 +781,25 @@ pub fn render_sync_load(state: &SyncWatchState, theme: &Theme) -> String {
     };
 
     for load in shown {
-        writeln!(
-            out,
-            "{:>width$} {} {}",
-            clip_pod(&load.pod).style(theme.styles.dim),
-            cpu_text(load).style(theme.styles.count),
-            mem_text(load).style(theme.styles.count),
-            width = METRIC_LABEL_WIDTH,
-        )
-        .expect("write to string");
+        let limit = load.limit.as_ref();
+        let mut f = Fields::new()
+            .text("label", side_label(&clip_pod(&load.pod)))
+            .value("cpu", load.usage.cpu_milli as f64 / 1000.0)
+            .maybe_value(
+                "cpu_limit",
+                limit.map(|l| l.cpu_milli).filter(|&c| c > 0).map(|c| c as f64 / 1000.0),
+            );
+        // Pair when a denominator exists (`10.0/24.0 GiB` shares one magnitude); bare
+        // usage otherwise
+        f = match limit.map(|l| l.mem_bytes).filter(|&m| m > 0) {
+            Some(m) => f.pair("mem", load.usage.mem_bytes, m),
+            None => f.value("mem", load.usage.mem_bytes as f64),
+        };
+        draw(&mut out, f, metric_row::LOAD, Duration::ZERO, theme);
     }
     if hidden > 0 {
-        writeln!(
-            out,
-            "{:>width$} {}",
-            "".style(theme.styles.dim),
-            format_args!("+{hidden} more").style(theme.styles.dim),
-            width = METRIC_LABEL_WIDTH,
-        )
-        .expect("write to string");
+        let f = Fields::new().text("label", side_label("")).value("count", hidden as f64);
+        draw(&mut out, f, metric_row::MORE, Duration::ZERO, theme);
     }
 
     pad_to_panel(&mut out);
@@ -816,22 +815,7 @@ fn clip_pod(name: &str) -> String {
     name.chars().take(METRIC_LABEL_WIDTH).collect()
 }
 
-/// `0.6/9c` against a limit, bare `0.6c` without one (no invented denominator)
-fn cpu_text(load: &ztest::api::PodLoad) -> String {
-    let used = load.usage.cpu_milli as f64 / 1000.0;
-    match load.limit.as_ref().map(|l| l.cpu_milli).filter(|&c| c > 0) {
-        Some(limit) => format!("{used:.1}/{}c", limit / 1000),
-        None => format!("{used:.1}c"),
-    }
-}
-
-fn mem_text(load: &ztest::api::PodLoad) -> String {
-    let used = load.usage.mem_bytes as f64 / ztest::api::GIB as f64;
-    match load.limit.as_ref().map(|l| l.mem_bytes).filter(|&m| m > 0) {
-        Some(limit) => format!("{used:.1}/{}Gi", limit / ztest::api::GIB),
-        None => format!("{used:.1}Gi"),
-    }
-}
+// ─────────────────────────── transfers ────────────────────────────────
 
 /// Right column of the pinned console: live background acquisitions, independent
 /// of the scrolling main output. [`PANEL_LINES`] = blank top row + up to
@@ -855,17 +839,112 @@ pub fn render_transfers(
     };
 
     let name_col = column_width(rows.iter().take(visible).map(|r| r.label.as_str()), 12, 18);
-    let dot = theme.chars.dot.style(theme.styles.dim);
     for row in rows.iter().take(visible) {
-        write_transfer_row(&mut out, row, name_col, elapsed, &dot, theme);
+        write_transfer_row(&mut out, row, name_col, elapsed, theme);
     }
     if overflow > 0 {
-        writeln!(out, "{} more transferring", format_args!("+{overflow}").style(theme.styles.dim),)
-            .expect("write to string");
+        let f = Fields::new().value("count", overflow as f64);
+        draw(&mut out, f, transfer_row::OVERFLOW, Duration::ZERO, theme);
     }
 
     pad_to_panel(&mut out);
     out
+}
+
+/// One transfer row, standalone — no panel padding, no row cap, no trailing newline.
+///
+/// - [`render_transfers`] pads to `PANEL_ROWS` (paints into the console `run` owns)
+/// - Cluster-free subcommands have no console + one row → repaint discipline is theirs
+pub fn render_transfer_line(
+    row: &TransferRow,
+    elapsed: std::time::Duration,
+    theme: &Theme,
+) -> String {
+    let mut out = String::with_capacity(160);
+    let name_col = row.label.chars().count();
+    write_transfer_row(&mut out, row, name_col, elapsed, theme);
+    out.truncate(out.trim_end_matches('\n').len());
+    out
+}
+
+/// Row shapes. Three, because the variants differ in what they *are*, not in width:
+/// a stage has no bar, a failure has no spinner
+mod transfer_row {
+    pub(super) const STAGE: &str =
+        "{glyph|dim}{@spin|bold} {label:<*} {@dot|dim} {note|bold}{@ellipsis|dim}";
+    pub(super) const BYTES: &str = concat!(
+        "{glyph|dim}{@spin|bold} {label:<*} {@dot|dim} {pct:12#} {pct|count}% {@dot|dim} {done%|bold}",
+        "[ {@dot|dim} {rate|bytes_per_sec.bold}]",
+        "[ {@dot|dim} {eta|dim} left]",
+    );
+    pub(super) const FAILED: &str = "{glyph|dim}{@warn|fail} {label:<*} {@dot|dim} {detail|dim}";
+    pub(super) const OVERFLOW: &str = "+{count|count.dim} more transferring";
+}
+
+/// [`TransferRow`] + the theme it draws under, bound to a template.
+///
+/// Theme rides along because the glyphs are theme-chosen (ASCII fallback), which a bare
+/// view-model cannot answer
+struct TransferData<'a> {
+    row: &'a TransferRow,
+    theme: &'a Theme,
+}
+
+impl Row for TransferData<'_> {
+    fn text(&self, key: &str) -> Option<Cow<'_, str>> {
+        match key {
+            "glyph" => Some(Cow::Borrowed(transfer_glyph(self.row.kind, self.theme))),
+            "label" => Some(Cow::Borrowed(self.row.label.as_str())),
+            "note" => match &self.row.progress {
+                TransferProgress::Stage(n) => Some(Cow::Borrowed(n.as_str())),
+                _ => None,
+            },
+            "detail" => match &self.row.progress {
+                TransferProgress::Failed { detail } => Some(Cow::Borrowed(detail.as_str())),
+                _ => None,
+            },
+            "eta" => match &self.row.progress {
+                TransferProgress::Bytes { pace: Some(p), .. } => {
+                    p.eta.map(|e| Cow::Owned(format_elapsed(e)))
+                }
+                _ => None,
+            },
+            // Markers resolve as `{@name}` cells; this row answers data only
+            _ => None,
+        }
+    }
+
+    fn value(&self, key: &str) -> Option<f64> {
+        match (key, &self.row.progress) {
+            ("pct", TransferProgress::Bytes { done, total, .. }) => {
+                Some(f64::from(percent_of(*done, *total)))
+            }
+            ("rate", TransferProgress::Bytes { pace: Some(p), .. }) => Some(p.per_sec),
+            _ => None,
+        }
+    }
+
+    fn pair(&self, key: &str) -> Option<(u64, u64)> {
+        match (key, &self.row.progress) {
+            ("done", TransferProgress::Bytes { done, total, .. }) => Some((*done, *total)),
+            _ => None,
+        }
+    }
+
+    fn percent(&self, key: &str) -> Option<u8> {
+        match (key, &self.row.progress) {
+            ("pct", TransferProgress::Bytes { done, total, .. }) => Some(percent_of(*done, *total)),
+            _ => None,
+        }
+    }
+}
+
+/// Saturating, so a zero-length transfer reads 0% rather than dividing by it
+fn percent_of(done: u64, total: u64) -> u8 {
+    match total {
+        0 => 0,
+        t => ((done as u128 * 100) / t as u128).min(100) as u8,
+    }
 }
 
 /// One transfer line: marker, label, then a `%` bar (bytes known) or the note
@@ -874,73 +953,24 @@ fn write_transfer_row(
     row: &TransferRow,
     name_col: usize,
     elapsed: std::time::Duration,
-    dot: &impl std::fmt::Display,
     theme: &Theme,
 ) {
-    // Direction glyph = kind; the spinner beside it is the heartbeat for rows
-    // with no byte bar
-    let glyph = transfer_glyph(row.kind, theme);
-    let mut head = |marker: &str, style| {
-        write!(
-            out,
-            "{}{} {:<name_col$} {dot} ",
-            glyph.style(theme.styles.dim),
-            marker.style(style),
-            row.label,
-        )
-        .expect("write to string");
+    let src = match &row.progress {
+        TransferProgress::Stage(_) => transfer_row::STAGE,
+        TransferProgress::Bytes { .. } => transfer_row::BYTES,
+        TransferProgress::Failed { .. } => transfer_row::FAILED,
     };
-    match &row.progress {
-        TransferProgress::Stage(note) => {
-            head(spinner_glyph(elapsed), theme.styles.count);
-            writeln!(out, "{}", note.style(theme.styles.count)).expect("write to string");
-        }
-        TransferProgress::Bytes { done, total, pace } => {
-            head(spinner_glyph(elapsed), theme.styles.count);
-            let percent = if *total == 0 {
-                0
-            } else {
-                ((*done as u128 * 100) / *total as u128).min(100) as u8
-            };
-            let bar = meter(percent, theme);
-            write!(
-                out,
-                "{bar} {} {dot} {}",
-                format_args!("{percent}%").style(theme.styles.count),
-                byte_pair(*done, *total).style(theme.styles.count),
-            )
-            .expect("write to string");
-            if let Some(pace) = pace {
-                write!(out, " {dot} {}", byte_rate(pace.per_sec).style(theme.styles.count))
-                    .expect("write to string");
-                if let Some(eta) = pace.eta {
-                    write!(
-                        out,
-                        " {dot} {}",
-                        format_args!("{} left", format_elapsed(eta)).style(theme.styles.dim),
-                    )
-                    .expect("write to string");
-                }
-            }
-            out.push('\n');
-        }
-        TransferProgress::Failed { detail } => {
-            writeln!(
-                out,
-                "{}{} {:<name_col$} {dot} {}",
-                glyph.style(theme.styles.dim),
-                theme.chars.warn.style(theme.styles.fail),
-                row.label,
-                detail.style(theme.styles.dim),
-            )
-            .expect("write to string");
-        }
-    }
+    // `name_col` is the label column the caller measured across sibling rows; the rest of
+    // the row is fixed, so handing it as the star budget reproduces the old padding
+    let data = TransferData { row, theme };
+    let line = Template::parse(src);
+    out.push_str(&line.render_str(&data, name_col, elapsed, theme));
+    out.push('\n');
 }
 
 fn transfer_glyph(kind: TransferKind, theme: &Theme) -> &'static str {
     match kind {
-        TransferKind::Image => theme.chars.up,
+        TransferKind::Image | TransferKind::Upload => theme.chars.up,
         TransferKind::Download | TransferKind::Seed => theme.chars.progress,
     }
 }
@@ -949,66 +979,12 @@ fn transfer_glyph(kind: TransferKind, theme: &Theme) -> &'static str {
 /// thread has no [`BannerState`]
 pub fn render_cancel_panel(elapsed: std::time::Duration, theme: &Theme) -> String {
     let mut out = String::with_capacity(128);
-    let dot = theme.chars.dot.style(theme.styles.dim);
     render_label_rule(&mut out, theme);
-    write!(
-        out,
-        "{:>width$} {} terminating subprocesses… {dot} {}",
-        "Cancelling".style(theme.styles.skip),
-        spinner_glyph(elapsed).style(theme.styles.skip),
-        "Ctrl-C again to force quit".style(theme.styles.dim),
-        width = LABEL_WIDTH,
-    )
-    .expect("write to string");
-    out.push('\n');
+    let f =
+        Fields::new().text("label", label("Cancelling")).text("hint", "Ctrl-C again to force quit");
+    draw(&mut out, f, panel_row::CANCEL, elapsed, theme);
     out
 }
-
-// ─────────────────────────── per-row writers ──────────────────────────
-
-fn write_archive_row(
-    out: &mut String,
-    row: &ArchiveRow,
-    name_col: usize,
-    dot: &impl std::fmt::Display,
-    theme: &Theme,
-) {
-    let (marker, marker_style) = match &row.status {
-        ArchiveStatus::Cached { .. } => (theme.chars.ok, theme.styles.pass),
-        ArchiveStatus::Missing { .. } => (theme.chars.warn, theme.styles.skip),
-    };
-    write!(
-        out,
-        "{INDENT}{} {:<width$} {dot} ",
-        marker.style(marker_style),
-        row.name,
-        width = name_col,
-    )
-    .expect("write to string");
-    write_archive_detail(out, &row.status, theme);
-    out.push('\n');
-}
-
-fn write_archive_detail(out: &mut String, status: &ArchiveStatus, theme: &Theme) {
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    match status {
-        ArchiveStatus::Cached { size_bytes } => {
-            write!(
-                out,
-                "{} {dot} {}",
-                "cached".style(theme.styles.pass),
-                ByteSize::b(*size_bytes).display().iec().style(theme.styles.count),
-            )
-            .expect("write to string");
-        }
-        ArchiveStatus::Missing { detail } => {
-            write!(out, "missing {dot} {}", detail.style(theme.styles.dim),)
-                .expect("write to string");
-        }
-    }
-}
-
-// ─────────────────────────── helpers ──────────────────────────────────
 
 // ─────────────────────────── tests ────────────────────────────────────
 
@@ -1029,6 +1005,32 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// One staged row + one byte row with a pace: between them they exercise every cell
+    /// kind a transfers column can draw (spinner, bar, rate, eta, kind glyph)
+    fn transfers_fixture() -> Transfers {
+        Transfers {
+            rows: vec![
+                TransferRow {
+                    label: "dev-zainod".to_string(),
+                    kind: TransferKind::Image,
+                    progress: TransferProgress::Stage("building".to_string()),
+                },
+                TransferRow {
+                    label: "testnet-3.1m".to_string(),
+                    kind: TransferKind::Download,
+                    progress: TransferProgress::Bytes {
+                        done: 17_900_000_000,
+                        total: 28_000_000_000,
+                        pace: Some(ztest::api::Pace {
+                            per_sec: 94.0 * 1024.0 * 1024.0,
+                            eta: Some(std::time::Duration::from_secs(102)),
+                        }),
+                    },
+                },
+            ],
+        }
     }
 
     fn sample_state() -> BannerState {
@@ -1116,27 +1118,7 @@ mod tests {
         let idle = render_transfers(&Transfers::default(), std::time::Duration::ZERO, &theme);
         assert_eq!(idle.lines().count(), PANEL_LINES, "idle height:\n{idle}");
 
-        let transfers = Transfers {
-            rows: vec![
-                TransferRow {
-                    label: "dev-zainod".to_string(),
-                    kind: TransferKind::Image,
-                    progress: TransferProgress::Stage("building".to_string()),
-                },
-                TransferRow {
-                    label: "testnet-3.1m".to_string(),
-                    kind: TransferKind::Download,
-                    progress: TransferProgress::Bytes {
-                        done: 17_900_000_000,
-                        total: 28_000_000_000,
-                        pace: Some(ztest::api::Pace {
-                            per_sec: 94.0 * 1024.0 * 1024.0,
-                            eta: Some(std::time::Duration::from_secs(102)),
-                        }),
-                    },
-                },
-            ],
-        };
+        let transfers = transfers_fixture();
         let s = render_transfers(&transfers, std::time::Duration::from_secs(1), &theme);
         assert_eq!(s.lines().count(), PANEL_LINES, "active height:\n{s}");
         assert!(s.contains("dev-zainod"), "image row:\n{s}");
@@ -1163,6 +1145,37 @@ mod tests {
         let s = render_transfers(&Transfers { rows }, std::time::Duration::ZERO, &theme);
         assert_eq!(s.lines().count(), PANEL_LINES, "overflow height:\n{s}");
         assert!(s.contains("more transferring"), "overflow marker:\n{s}");
+    }
+
+    /// Regression: `render_transfers` pads one row to five (repainting caller then
+    /// scrolls four lines per frame)
+    #[test]
+    fn a_standalone_transfer_line_is_one_line_and_unterminated() {
+        let row = TransferRow {
+            label: "archive.tar.zst".to_string(),
+            kind: TransferKind::Upload,
+            progress: TransferProgress::Bytes { done: 512, total: 1024, pace: None },
+        };
+        let line = render_transfer_line(&row, std::time::Duration::ZERO, &plain_unicode_theme());
+        assert!(!line.contains('\n'), "must be one unterminated line:\n{line:?}");
+        assert!(line.contains("50%"), "percent:\n{line}");
+        assert!(line.contains("512 B / 1.0 KiB"), "byte pair:\n{line}");
+    }
+
+    #[test]
+    fn an_upload_row_carries_the_up_glyph() {
+        let theme = plain_unicode_theme();
+        let row = |kind| TransferRow {
+            label: "a".to_string(),
+            kind,
+            progress: TransferProgress::Stage("hashing".to_string()),
+        };
+        let up =
+            render_transfer_line(&row(TransferKind::Upload), std::time::Duration::ZERO, &theme);
+        let down =
+            render_transfer_line(&row(TransferKind::Download), std::time::Duration::ZERO, &theme);
+        assert!(up.contains(theme.chars.up), "upload glyph:\n{up}");
+        assert_ne!(up, down, "upload and download must not render identically");
     }
 
     /// No colours + Unicode glyphs = `Theme::detect()` under UTF-8 + `NO_COLOR=1`
@@ -1201,15 +1214,37 @@ mod tests {
         assert_eq!(s, expected, "golden mismatch.\n--- got ---\n{s}\n--- want ---\n{expected}");
     }
 
+    /// Regression: this asserted three named glyphs were absent and passed while braille,
+    /// box-drawing and arrows leaked past it. The gate now rejects *any* non-ascii
+    /// character, so a new hardcoded glyph fails on the surface that introduced it
     #[test]
     fn ascii_fallback_strips_unicode_glyphs() {
         let s = render(&sample_state(), &plain_ascii_theme());
-        assert!(!s.contains('─'), "ascii leaked hbar:\n{s}");
-        assert!(!s.contains('│'), "ascii leaked vert rule:\n{s}");
-        assert!(!s.contains('·'), "ascii leaked dot:\n{s}");
+        crate::testing::assert_ascii_clean("render", &s);
         assert!(s.contains("------------"), "ascii hbar missing:\n{s}");
         assert!(s.contains("OK regtest-nu5-h128"), "ascii ok marker:\n{s}");
         assert!(s.contains("WARN mainnet-snapshot-9.0"), "ascii warn marker:\n{s}");
+    }
+
+    /// Every panel this module exports, in ascii, at a couple of frame times so a spinner
+    /// cannot hide a Unicode frame behind an ascii one
+    #[test]
+    fn every_panel_falls_back_to_ascii() {
+        use std::time::Duration;
+        let t = plain_ascii_theme();
+        let check = crate::testing::assert_ascii_clean;
+        for ms in [0u64, 250, 700] {
+            let at = Duration::from_millis(ms);
+            check("render_cancel_panel", &render_cancel_panel(at, &t));
+            check("render_transfers", &render_transfers(&transfers_fixture(), at, &t));
+            let w = watching(Some(sample_vitals()));
+            check("render_sync_work", &render_sync_work(&w, FRAME, &t));
+            check("render_sync_load", &render_sync_load(&w, &t));
+            check(
+                "render_preflight_panel",
+                &render_preflight_panel(&sample_state(), "Preflight", at, &t),
+            );
+        }
     }
 
     #[test]
@@ -1531,8 +1566,9 @@ mod tests {
 
         assert_eq!(s.lines().count(), PANEL_LINES, "fixed height:\n{s}");
         assert!(s.contains("zainod"), "names the pod:\n{s}");
-        assert!(s.contains("0.6/9c"), "cpu against its limit:\n{s}");
-        assert!(s.contains("10.0/24Gi"), "memory against its limit:\n{s}");
+        assert!(s.contains("0.6c/9c"), "cpu against its limit:\n{s}");
+        // Byte pair shares one magnitude, so the denominator costs 6 columns, not 9
+        assert!(s.contains("10.0/24.0 GiB"), "memory against its limit:\n{s}");
         assert!(s.contains("zebrad"), "second pod:\n{s}");
     }
 
@@ -1544,7 +1580,10 @@ mod tests {
         load.limit = None;
         state.pods = vec![load];
         let s = render_sync_load(&state, &plain_unicode_theme());
+        // Regression: routing cpu through `Unit::Cores` reduced 1.5 to `2c` (`compact` is
+        // integer past 1.0); a `{cpu:.1}` cell keeps the tenth a load reading needs
         assert!(s.contains("1.5c"), "bare cpu:\n{s}");
+        assert!(s.contains("2.0 GiB"), "bare memory:\n{s}");
         assert!(!s.contains('/'), "no invented denominator:\n{s}");
     }
 

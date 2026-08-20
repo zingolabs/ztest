@@ -70,16 +70,6 @@ pub(super) fn beside(out: &mut String, left: &[String], right: &[String], left_w
     }
 }
 
-/// `label   value` row, right-aligned to the box interior
-pub(super) fn row(label: &str, value: &str, inner: usize, theme: &Theme) -> String {
-    let pad = inner.saturating_sub(display_width(label) + display_width(value));
-    format!("{}{:pad$}{}", label.style(theme.styles.dim), "", value.style(theme.styles.count))
-}
-
-pub(super) fn dim(text: &str, theme: &Theme) -> String {
-    text.style(theme.styles.dim).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

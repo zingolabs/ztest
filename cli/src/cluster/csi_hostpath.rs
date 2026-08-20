@@ -3,29 +3,59 @@
 //! - Local only (shared-cluster storage = operator's)
 //! - Assent-gated (cluster-scoped writes + steals the default StorageClass)
 //! - Upstream manifests @ pinned refs, deploy dir = server minor (`latest` past the pin's window)
+//! - `deploy.sh` owns the success edge (only it knows the set it applied); ztest owns the
+//!   narration + every fail-fast verdict ([`until_stuck`])
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use dialoguer::Confirm;
+use k8s_openapi::api::core::v1::{Pod, PodStatus};
+use kube::Client;
+use kube::api::{Api, ListParams};
 
-use ztest::api::capability::Report;
+use super::{draw, row};
+use ztest::api::capability::{self, Capability, Finding, Report};
+use ztest::api::pod_status::{POLL_INTERVAL, ReadyWatch, Verdict};
+use ztest_ui::Theme;
+use ztest_ui::template::Fields;
 
 const SNAPSHOTTER_REF: &str = "v8.6.0";
 const HOSTPATH_REF: &str = "v1.18.0";
 const STORAGE_CLASS: &str = "csi-hostpath-sc";
 const DEFAULT_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
 
-/// Gaps this install closes
-const FIXABLE: [&str; 2] = ["snapshot-capable storage", "VolumeSnapshot v1 API"];
+/// Gaps this install closes — CRDs, the controller reconciling them, and a driver
+/// backing both. Named by symbol, so a capability rename cannot silently detach the
+/// offer from the gap
+const FIXABLE: [&str; 3] =
+    [capability::STORAGE, capability::SNAPSHOT_API, capability::SNAPSHOT_CONTROLLER];
 
 /// FIXABLE pair = one gap to a reader (probe names report the harness, not the cluster)
 const GAP: &str = "no volume snapshots";
 
 /// Subprocesses [`install`] drives
 const TOOLS: [&str; 2] = ["kubectl", "git"];
+
+/// Every object `deploy.sh` applies carries it (kustomize `commonLabels`)
+const DRIVER_LABEL: &str = "app.kubernetes.io/instance=hostpath.csi.k8s.io";
+
+/// Budget from `Running` to Ready. Pull time sits *before* `Running`, so this bounds only
+/// probe failures — an unbounded cold pull stays the operator's call to watch or abort
+const READY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One rendered row to stderr (stdout stays the forwarded script's)
+fn say(src: &str, fields: &Fields<'_>, theme: &Theme) {
+    eprintln!("{}", draw(src, fields, theme));
+}
+
+/// One install step, announced before it runs
+fn progress(text: &str, theme: &Theme) {
+    say(&row::step(row::BULLET), &Fields::new().text("text", text), theme);
+}
 
 /// How the local snapshot gap resolved, ahead of any capability report.
 ///
@@ -41,10 +71,12 @@ pub fn offer(report: &Report, non_interactive: bool, install: bool) -> Result<Of
     if !fixable_here(report) {
         return Ok(Offer::Unrelated);
     }
+    let theme = Theme::detect();
     // Before assent, not inside install() (assent then a tooling error = the offer was a lie)
     let missing: Vec<&str> = TOOLS.into_iter().filter(|b| which(b).is_err()).collect();
     if !missing.is_empty() {
-        eprintln!("✗ {GAP}; install {} to fix it here", missing.join(" + "));
+        let data = Fields::new().text("gap", GAP).text("tools", missing.join(" + "));
+        say(row::GAP_TOOLS, &data, &theme);
         return Ok(Offer::Explained);
     }
     if install {
@@ -52,7 +84,8 @@ pub fn offer(report: &Report, non_interactive: bool, install: bool) -> Result<Of
     }
     // Unattended = never mutate cluster-scoped state by default
     if non_interactive || !std::io::stdin().is_terminal() {
-        eprintln!("✗ {GAP}; rerun with --install-storage");
+        let data = Fields::new().text("gap", GAP).text("flag", "--install-storage");
+        say(row::GAP_FLAG, &data, &theme);
         return Ok(Offer::Explained);
     }
     // One line, no wrap (dialoguer re-renders on answer → a wrapped prompt prints twice)
@@ -62,33 +95,51 @@ pub fn offer(report: &Report, non_interactive: bool, install: bool) -> Result<Of
         .interact()
         .map_err(|e| format!("confirmation prompt: {e}"))?;
     if !yes {
-        eprintln!("  → nothing installed; `ztest run` needs snapshots");
+        let data = Fields::new()
+            .text("mark", theme.chars.arrow)
+            .text("text", "nothing installed; `ztest run` needs snapshots");
+        say(&row::step(row::BOUND), &data, &theme);
         return Ok(Offer::Explained);
     }
     Ok(Offer::Install)
 }
 
-/// Storage = sole blocker, cluster = local
+/// Storage = the blocker, cluster = local.
+///
+/// - Setup blockers, not run blockers: everything `setup` is about to provision is also
+///   absent on a fresh cluster, and folding those in means the offer never fires
+/// - Storage itself must be the gap. A restarting snapshot-controller on a cluster that
+///   already has TopoLVM is briefly a blocker too, and installing here would steal the
+///   default StorageClass out from under it
 fn fixable_here(report: &Report) -> bool {
-    if ztest::backends::image::selected_class() != ztest::api::cluster_config::ClusterClass::Local {
-        return false;
-    }
-    let mut blocking = report.blocking().peekable();
-    blocking.peek().is_some() && report.blocking().all(|c| FIXABLE.contains(&c.name))
+    ztest::backends::image::selected_class() == ztest::api::cluster_config::ClusterClass::Local
+        && repairs_the_gap(report)
+}
+
+/// Cluster-independent half, so the offer's rule is testable without one.
+///
+/// `Absent`, never `Unknown`: an unreachable cluster or a forbidden list is not a cluster
+/// missing a driver, and installing on that reading steals the default StorageClass
+fn repairs_the_gap(report: &Report) -> bool {
+    let absent = |c: &&Capability| matches!(c.finding, Finding::Absent(_));
+    report.setup_blockers().filter(absent).any(|c| c.name == capability::STORAGE)
+        && report.setup_blockers().all(|c| FIXABLE.contains(&c.name))
 }
 
 /// external-snapshotter (CRDs + controller) → csi-hostpath → class pair → default class.
 ///
-/// - Blocking (setup CLI, nothing else in flight; every step = subprocess)
-pub fn install() -> Result<(), String> {
+/// - Every step a subprocess, sequential (setup CLI, nothing else in flight); only
+///   [`deploy_driver`] runs anything alongside it
+pub async fn install(client: &Client) -> Result<(), String> {
     for bin in TOOLS {
         which(bin)?;
     }
+    let theme = Theme::detect();
     let work = WorkDir::new()?;
     // deploy.sh = kubectl with no --context, no override hook → pin via single-context kubeconfig
     let kubeconfig = minified_kubeconfig(work.path())?;
 
-    eprintln!("  • external-snapshotter CRDs");
+    progress("external-snapshotter CRDs", &theme);
     kubectl(&kubeconfig, &["apply", "-k", &crd_url()])?;
     // Controller RBAC references these kinds (unestablished CRDs → NotFound race)
     kubectl(
@@ -103,14 +154,14 @@ pub fn install() -> Result<(), String> {
         ],
     )?;
 
-    eprintln!("  • snapshot-controller");
+    progress("snapshot-controller", &theme);
     kubectl(&kubeconfig, &["apply", "-k", &controller_url()])?;
     kubectl(
         &kubeconfig,
         &["-n", "kube-system", "rollout", "status", "deploy/snapshot-controller", "--timeout=180s"],
     )?;
 
-    eprintln!("  • csi-hostpath driver ({HOSTPATH_REF})");
+    progress(&format!("csi-hostpath driver ({HOSTPATH_REF})"), &theme);
     let checkout = work.path().join("csi-hostpath");
     run(Command::new("git").args([
         "clone",
@@ -129,7 +180,11 @@ pub fn install() -> Result<(), String> {
     let deploy = match window.select(minor) {
         Deploy::Exact(m) => root.join(format!("kubernetes-1.{m}")),
         Deploy::Latest => {
-            eprintln!("  ! server 1.{minor} is past {HOSTPATH_REF}'s {window}; deploying `latest`");
+            let data = Fields::new()
+                .text("minor", minor.to_string())
+                .text("reference", HOSTPATH_REF)
+                .text("window", window.to_string());
+            say(row::PAST_WINDOW, &data, &theme);
             root.join("kubernetes-latest")
         }
         Deploy::Unsupported => {
@@ -139,13 +194,9 @@ pub fn install() -> Result<(), String> {
             ));
         }
     };
-    run(Command::new(deploy.join("deploy.sh")).env("KUBECONFIG", &kubeconfig))?;
-    kubectl(
-        &kubeconfig,
-        &["rollout", "status", "statefulset/csi-hostpathplugin", "--timeout=300s"],
-    )?;
+    deploy_driver(client, &deploy, &kubeconfig, &theme).await?;
 
-    eprintln!("  • StorageClass + VolumeSnapshotClass");
+    progress("StorageClass + VolumeSnapshotClass", &theme);
     let examples = checkout.join("examples");
     kubectl(
         &kubeconfig,
@@ -157,8 +208,221 @@ pub fn install() -> Result<(), String> {
     )?;
 
     make_default(&kubeconfig)?;
-    eprintln!("  ✓ csi-hostpath installed ({STORAGE_CLASS} is now the default StorageClass)");
+    say(row::INSTALLED, &Fields::new().text("class", STORAGE_CLASS), &theme);
     Ok(())
+}
+
+/// Run `deploy.sh`, narrating driver-pod readiness beside it.
+///
+/// - Script decides success (sole knower of the set it applied), re-checking within a tick
+///   of the last pod going Ready — no upstream hook to skip its loop anyway
+/// - Its failure edge = 5min silent, then a `describe` + logs wall → [`until_stuck`] pre-empts
+///   it, naming the container
+/// - Script stdout piped, not inherited (its wait counter would fight the painted line)
+async fn deploy_driver(
+    client: &Client,
+    deploy: &Path,
+    kubeconfig: &Path,
+    theme: &Theme,
+) -> Result<(), String> {
+    let script = deploy.join("deploy.sh");
+    let mut child = tokio::process::Command::new(&script)
+        .env("KUBECONFIG", kubeconfig)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", script.display()))?;
+    let stdout = child.stdout.take().expect("stdout piped");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let forwarder = tokio::spawn(forward(stdout, tx));
+
+    let mut line = StatusLine::new(theme.clone());
+    let outcome = tokio::select! {
+        exited = child.wait() => Outcome::Exited(exited),
+        stuck = until_stuck(client, &mut line, &mut rx) => Outcome::Stuck(stuck),
+    };
+    if matches!(outcome, Outcome::Stuck(_)) {
+        terminate(&mut child).await;
+    }
+    // Sender drops with the forwarder → the drain below terminates (script's dump lands in it)
+    let _ = forwarder.await;
+    line.finish();
+    while let Some(text) = rx.recv().await {
+        println!("{text}");
+    }
+
+    match outcome {
+        Outcome::Stuck(why) => Err(why),
+        Outcome::Exited(exited) => {
+            let status = exited.map_err(|e| format!("wait for deploy.sh: {e}"))?;
+            match status.success() {
+                true => Ok(()),
+                false => Err(format!("csi-hostpath deploy.sh failed ({status})")),
+            }
+        }
+    }
+}
+
+enum Outcome {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Stuck(String),
+}
+
+/// Line the script's wait loop repeats every 10s; ztest's own line says strictly more
+const WAIT_COUNTER: &str = "waiting for hostpath deployment to complete";
+
+/// Script stdout → painter, [`WAIT_COUNTER`] dropped. Everything else passes verbatim
+async fn forward(
+    stdout: tokio::process::ChildStdout,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    use tokio::io::AsyncBufReadExt as _;
+
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    while let Ok(Some(text)) = lines.next_line().await {
+        if !text.contains(WAIT_COUNTER) && tx.send(text).is_err() {
+            return;
+        }
+    }
+}
+
+/// Poll driver pods until one provably will not become Ready. Returns the reason.
+///
+/// - No success return (`deploy.sh` owns that edge) → no race against a StatefulSet it has
+///   applied but we have not yet listed
+/// - Empty list = not applied yet, never done
+/// - Transient list errors ignored, as in the runner-pod loop
+async fn until_stuck(
+    client: &Client,
+    line: &mut StatusLine,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> String {
+    let pods: Api<Pod> = Api::default_namespaced(client.clone());
+    let params = ListParams::default().labels(DRIVER_LABEL);
+    let mut watches: HashMap<String, ReadyWatch> = HashMap::new();
+    let started = Instant::now();
+    // Independent of the forwarding arm (a burst of script output must not starve the poll)
+    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            Some(text) = rx.recv() => line.emit(&text),
+            _ = tick.tick() => {
+                let Ok(list) = pods.list(&params).await else { continue };
+                let mut pending = Vec::new();
+                for pod in &list.items {
+                    let (Some(name), Some(status)) =
+                        (pod.metadata.name.as_deref(), pod.status.as_ref())
+                    else {
+                        continue;
+                    };
+                    let watch = watches
+                        .entry(name.to_string())
+                        .or_insert_with(|| ReadyWatch::new(READY_TIMEOUT));
+                    match watch.observe(status, Instant::now()) {
+                        Verdict::Ready => {}
+                        Verdict::Waiting => pending.push(format!("{name} {}", note(status))),
+                        Verdict::Unschedulable { reason, elapsed } => {
+                            let secs = elapsed.as_secs();
+                            return stuck(name, &format!("unplaceable for {secs}s: {reason}"));
+                        }
+                        Verdict::Faulted(reason) | Verdict::PullFailed(reason) => {
+                            return stuck(name, &reason);
+                        }
+                        Verdict::ReadyTimeout(budget) => {
+                            let secs = budget.as_secs();
+                            return stuck(name, &format!("{} after {secs}s", note(status)));
+                        }
+                    }
+                }
+                if list.items.is_empty() {
+                    pending.push("applying manifests".to_string());
+                }
+                line.set(&pending.join(" · "), started.elapsed());
+            }
+        }
+    }
+}
+
+fn stuck(pod: &str, detail: &str) -> String {
+    format!("csi-hostpath driver stuck ({pod} {detail}); `kubectl describe pod {pod}` for events")
+}
+
+/// `5/8 ready · csi-provisioner: ImagePullBackOff` — the count, then the first laggard's own word
+fn note(status: &PodStatus) -> String {
+    let all = status.container_statuses.as_deref().unwrap_or_default();
+    let Some(total) = std::num::NonZeroUsize::new(all.len()) else {
+        return status.phase.clone().unwrap_or_else(|| "Pending".to_string());
+    };
+    let ready = all.iter().filter(|c| c.ready).count();
+    let head = format!("{ready}/{total} ready");
+    match all.iter().find(|c| !c.ready) {
+        None => head,
+        Some(c) => match c.state.as_ref().and_then(|s| s.waiting.as_ref()) {
+            Some(w) => match w.reason.as_deref() {
+                Some(reason) => format!("{head} · {}: {reason}", c.name),
+                None => format!("{head} · {}", c.name),
+            },
+            None => format!("{head} · {}", c.name),
+        },
+    }
+}
+
+/// SIGTERM, never `start_kill` — `deploy.sh` drops its `mktemp -d` from an EXIT trap
+async fn terminate(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // SAFETY: pid of a child we own and have not reaped, so it cannot have been reused
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+    let _ = child.wait().await;
+}
+
+/// One stderr line repainted in place.
+///
+/// - Non-TTY = print on change only, elapsed dropped (CI logs must not carry repaint frames)
+/// - stderr, as the bullets above it (one stream → no interleave)
+struct StatusLine {
+    term: console::Term,
+    tty: bool,
+    theme: Theme,
+    last: String,
+    painted: bool,
+}
+
+impl StatusLine {
+    fn new(theme: Theme) -> Self {
+        let term = console::Term::stderr();
+        let tty = term.is_term();
+        StatusLine { term, tty, theme, last: String::new(), painted: false }
+    }
+
+    fn set(&mut self, text: &str, elapsed: Duration) {
+        let data = Fields::new().text("note", text);
+        if self.tty {
+            // Elapsed only here — its group drops below, so a CI log carries no repaint frames
+            let data = data.value("secs", elapsed.as_secs() as f64);
+            let _ = self.term.clear_line();
+            let _ = self.term.write_str(&draw(row::SETTLING, &data, &self.theme));
+            self.painted = true;
+            return;
+        }
+        if text != self.last {
+            self.last = text.to_string();
+            eprintln!("{}", draw(row::SETTLING, &data, &self.theme));
+        }
+    }
+
+    /// Forwarded script output: clear, print, let the next tick repaint below it
+    fn emit(&mut self, text: &str) {
+        self.finish();
+        println!("{text}");
+    }
+
+    /// Idempotent — every path closes the line before printing anything else
+    fn finish(&mut self) {
+        if self.painted {
+            self.painted = false;
+            let _ = self.term.clear_line();
+        }
+    }
 }
 
 /// kind's default `standard` (local-path) = no snapshots, no expansion → unnamed PVCs unusable
@@ -312,14 +576,10 @@ fn output(cmd: &mut Command) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|e| format!("non-UTF-8 output: {e}"))
 }
 
-/// PATH scan, nothing executed (`git --help` → pager, `kubectl --version` → not a flag)
 fn which(bin: &str) -> Result<(), String> {
-    let missing = || format!("`{bin}` not on PATH; needed to install csi-hostpath");
-    let path = std::env::var_os("PATH").ok_or_else(missing)?;
-    std::env::split_paths(&path)
-        .any(|dir| dir.join(bin).is_file())
+    ztest::api::on_path(bin)
         .then_some(())
-        .ok_or_else(missing)
+        .ok_or_else(|| format!("`{bin}` not on PATH; needed to install csi-hostpath"))
 }
 
 /// Scratch dir, removed on drop (`tempfile` = wallet-feature-gated)
@@ -346,6 +606,8 @@ impl Drop for WorkDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::api::core::v1::{ContainerState, ContainerStateWaiting, ContainerStatus};
+    use ztest::api::capability::Need;
 
     fn window(minors: [u32; 2]) -> DeployWindow {
         DeployWindow(minors.into_iter().collect())
@@ -410,5 +672,109 @@ mod tests {
     #[test]
     fn a_server_below_the_window_is_unsupported() {
         assert_eq!(window([34, 35]).select(33), Deploy::Unsupported);
+    }
+
+    // ── The line the operator actually reads ────────────────────────────────
+
+    fn container(name: &str, ready: bool, waiting: Option<&str>) -> ContainerStatus {
+        ContainerStatus {
+            name: name.into(),
+            image: "img".into(),
+            image_id: String::new(),
+            ready,
+            restart_count: 0,
+            state: waiting.map(|reason| ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some(reason.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn pod_status(containers: Vec<ContainerStatus>) -> PodStatus {
+        PodStatus {
+            phase: Some("Pending".into()),
+            container_statuses: Some(containers),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_note_counts_ready_then_names_the_first_laggard() {
+        let s = pod_status(vec![
+            container("hostpath", true, None),
+            container("csi-provisioner", false, Some("ImagePullBackOff")),
+            container("csi-resizer", false, Some("PodInitializing")),
+        ]);
+        assert_eq!(note(&s), "1/3 ready · csi-provisioner: ImagePullBackOff");
+    }
+
+    #[test]
+    fn a_note_drops_the_laggard_clause_once_every_container_is_ready() {
+        let s = pod_status(vec![container("hostpath", true, None)]);
+        assert_eq!(note(&s), "1/1 ready");
+    }
+
+    /// Statuses land a beat after the pod does — the phase is all there is to say
+    #[test]
+    fn a_note_falls_back_to_the_phase_before_any_container_reports() {
+        assert_eq!(note(&pod_status(vec![])), "Pending");
+        assert_eq!(note(&PodStatus::default()), "Pending");
+    }
+
+    #[test]
+    fn a_note_names_a_laggard_that_reports_no_waiting_reason() {
+        let s = pod_status(vec![container("hostpath", false, None)]);
+        assert_eq!(note(&s), "0/1 ready · hostpath");
+    }
+
+    fn report(blocked: &[&'static str]) -> Report {
+        with(blocked, |_| Finding::Absent("gone".into()))
+    }
+
+    fn with(blocked: &[&'static str], finding: fn(&str) -> Finding) -> Report {
+        let cap = |name: &'static str| Capability {
+            name,
+            need: Need::Required,
+            finding: finding(name),
+            remedy: "docs/ops-cluster-requirements.md",
+        };
+        Report { capabilities: blocked.iter().copied().map(cap).collect() }
+    }
+
+    #[test]
+    fn a_cluster_with_no_snapshot_storage_is_offered_the_install() {
+        assert!(repairs_the_gap(&report(&[capability::STORAGE, capability::SNAPSHOT_API])));
+    }
+
+    /// The regression: installing here steals the default StorageClass from a driver that
+    /// works, because its controller happened to be mid-restart
+    #[test]
+    fn a_restarting_controller_beside_working_storage_is_never_offered_an_install() {
+        assert!(!repairs_the_gap(&report(&[capability::SNAPSHOT_CONTROLLER])));
+    }
+
+    #[test]
+    fn a_capable_cluster_is_offered_nothing() {
+        assert!(!repairs_the_gap(&report(&[])));
+    }
+
+    /// An unreachable cluster reports every storage row unreadable; installing on that
+    /// reading would steal the default StorageClass from a driver nobody could see
+    #[test]
+    fn an_unreadable_cluster_is_never_offered_an_install() {
+        let unknown = with(&[capability::STORAGE, capability::SNAPSHOT_API], |_| {
+            Finding::Unknown("client error (Connect)".into())
+        });
+        assert!(!repairs_the_gap(&unknown));
+    }
+
+    /// A gap this install cannot close means the offer would be a lie
+    #[test]
+    fn an_unrelated_blocker_withdraws_the_offer() {
+        assert!(!repairs_the_gap(&report(&[capability::STORAGE, "host toolchain"])));
     }
 }

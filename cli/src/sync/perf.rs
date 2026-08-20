@@ -13,11 +13,42 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use owo_colors::OwoColorize as _;
-
+use ztest::api::metrics::Exposition;
+use ztest::api::{Unit, compact, format_elapsed, unit_value};
 use ztest::sync::namespace_for;
 use ztest_ui::Theme;
+use ztest_ui::template::{Fields, draw};
 
+/// Row shapes. Every reading here shares one label gutter, so the column is declared
+/// once rather than per `println!`
+mod row {
+    pub(super) const WROTE: &str = "{@ok|pass} {path}";
+    pub(super) const DROPPED: &str =
+        "{label:>10|dim}  {events|count.bold} trace events  {fix|fail}";
+    pub(super) const BASE: &str = "{label:>10|dim}  {path}";
+    pub(super) const CONTENT: &str = "{label:>10|dim}  {text|dim}";
+    pub(super) const OPENING: &str = "{@dot|dim} {word|dim} {viewer|bold}";
+    /// Plain by design: rides an error string, which no other line of stderr colours
+    pub(super) const MISMATCH: &str = "  {id:>16}  {span}";
+    /// `[  {delta:>8}]` drops on an unmeasured rate, taking its gutter with it
+    pub(super) const RUN: &str =
+        "{label:>10|dim}  {id:<12}  {elapsed:>9|bold}  {rate:>12|bold}[  {delta:>8}]";
+
+    /// Ink tracks the reading, spliced rather than a template per verdict
+    pub(super) fn fidelity(tone: &str) -> String {
+        format!(
+            "{{label:>10|dim}}  {{sampled|count.bold}} of {{charged|count.dim}} cpu-seconds \
+             sampled  {{ratio|fraction.{tone}}}"
+        )
+    }
+
+    pub(super) fn segment(tone: &str) -> String {
+        format!("{{label:>10|dim}}  {{span|bold}}  {{mark|{tone}}} {{note|{tone}}}")
+    }
+}
+
+/// Bind and draw. No `*` cell and no spinner in any of these rows → zero width, zero
+/// elapsed
 /// Viewer override, honoured ahead of [`VIEWERS`] (taste + what a machine has
 /// installed are not ztest's call). Program name or path; profile appended last
 const VIEWER_ENV: &str = "ZTEST_PROFILE_VIEWER";
@@ -117,7 +148,8 @@ async fn retrieve(
     std::fs::create_dir_all(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
     let path = dest.join(format!("{component}-{}.collapsed", profile.stem()));
     std::fs::write(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    println!("{} {}", theme.chars.ok.style(theme.styles.pass), path.display());
+    let wrote = Fields::new().text("path", path.display().to_string());
+    println!("{}", draw(row::WROTE, &wrote, &theme));
     match profile {
         ztest::api::profiling::Profile::OnCpu => {
             report_fidelity(&client, id, component, &bytes, window, &theme).await
@@ -139,24 +171,24 @@ async fn report_dropped_events(client: &kube::Client, id: &str, theme: &Theme) {
     let Some(dropped) = collector_dropped(client, id).await.filter(|&d| d > 0) else {
         return;
     };
-    println!(
-        "{:>10}  {} trace events  {}",
-        "dropped".style(theme.styles.dim),
-        ztest::api::fmt::compact(dropped as f64).style(theme.styles.count),
-        "lower --profile-off-cpu or --profile-hz".style(theme.styles.fail),
-    );
+    let f = Fields::new()
+        .text("label", "dropped")
+        .value("events", dropped as f64)
+        .text("fix", "lower --profile-off-cpu or --profile-hz");
+    println!("{}", draw(row::DROPPED, &f, theme));
 }
 
 async fn collector_dropped(client: &kube::Client, id: &str) -> Option<u64> {
-    collector_metrics(client, id).await?.get("agent_errors_trace_event_lost_total").copied()
+    collector_metrics(client, id).await?.counter_total(DROPPED_EVENTS)
 }
 
-/// Sidecar's own `/metrics`, as `name -> value` (labels dropped; every counter read here
-/// is process-wide and single-series)
-async fn collector_metrics(
-    client: &kube::Client,
-    id: &str,
-) -> Option<std::collections::HashMap<String, u64>> {
+const DROPPED_EVENTS: &str = "agent_errors_trace_event_lost_total";
+
+/// Sidecar's own `/metrics`, absorbed.
+///
+/// - Alloy labels each family by `component_id` → [`Exposition`]'s per-family fold spans
+///   the collector's targets, where one arbitrary series would report a fraction
+async fn collector_metrics(client: &kube::Client, id: &str) -> Option<Exposition> {
     let port = ztest::api::profiling::HTTP_PORT;
     // Host-placed collectors listen on loopback already; only a sidecar needs a tunnel, and
     // starting one against a finished driver pod fails rather than falling through
@@ -184,21 +216,9 @@ async fn collector_metrics(
         .text()
         .await
         .ok()?;
-    // Summed, not collected: Alloy labels each family by `component_id`, so collecting would
-    // keep one arbitrary series per family rather than the collector's total
-    Some(
-        body.lines()
-            .filter(|l| !l.starts_with('#'))
-            .filter_map(|l| {
-                let (name, value) = l.rsplit_once(' ')?;
-                let name = name.split_once('{').map_or(name, |(n, _)| n);
-                Some((name.trim().to_string(), value.trim().parse::<f64>().ok()? as u64))
-            })
-            .fold(std::collections::HashMap::new(), |mut acc, (name, value)| {
-                *acc.entry(name).or_default() += value;
-                acc
-            }),
-    )
+    let mut exposition = Exposition::default();
+    exposition.absorb(&body);
+    Some(exposition)
 }
 
 /// Collector's own pipeline counters, in order of flow.
@@ -209,7 +229,7 @@ async fn collector_metrics(
 ///   process count) means no stack can be walked, so nothing downstream can exist
 async fn collector_pipeline(client: &kube::Client, id: &str) -> Option<String> {
     let metrics = collector_metrics(client, id).await?;
-    let get = |k: &str| metrics.get(k).copied().unwrap_or_default();
+    let get = |family: &str| metrics.counter_total(family).unwrap_or_default();
     Some(format!(
         "collector: {} targets · {} processes seen · {} executables unwound · \
          {} samples forwarded · {} events dropped",
@@ -217,7 +237,7 @@ async fn collector_pipeline(client: &kube::Client, id: &str) -> Option<String> {
         get("bpf_num_proc_new_total"),
         get("agent_num_exe_id_loaded_to_ebpf"),
         get("pyroscope_forwarded_entries_total"),
-        get("agent_errors_trace_event_lost_total"),
+        get(DROPPED_EVENTS),
     ))
 }
 
@@ -316,17 +336,16 @@ async fn report_fidelity(
     }
 
     let ratio = sampled / charged;
-    let style = match ratio < FIDELITY_FLOOR {
-        true => theme.styles.fail,
-        false => theme.styles.pass,
+    let tone = match ratio < FIDELITY_FLOOR {
+        true => "fail",
+        false => "pass",
     };
-    println!(
-        "{:>10}  {} of {} cpu-seconds sampled  {}",
-        "fidelity".style(theme.styles.dim),
-        ztest::api::fmt::compact(sampled).style(theme.styles.count),
-        ztest::api::fmt::compact(charged).style(theme.styles.dim),
-        format!("{:.0}%", ratio * 100.0).style(style),
-    );
+    let f = Fields::new()
+        .text("label", "fidelity")
+        .value("sampled", sampled)
+        .value("charged", charged)
+        .value("ratio", ratio);
+    println!("{}", draw(&row::fidelity(tone), &f, theme));
     report_dropped_events(client, id, theme).await;
     if ratio < FIDELITY_FLOOR {
         eprintln!(
@@ -362,10 +381,14 @@ async fn compare(
         ));
     };
     head_seg.comparable_with(base_seg).map_err(|why| {
+        let span = |run: &str, seg: &ztest::sync::Segment| {
+            let f = Fields::new().text("id", run).text("span", seg.describe());
+            draw(row::MISMATCH, &f, &theme)
+        };
         format!(
-            "sync {id} and {base_id} cannot be compared: {why}\n  {id:>16}  {}\n  {base_id:>16}  {}",
-            head_seg.describe(),
-            base_seg.describe(),
+            "sync {id} and {base_id} cannot be compared: {why}\n{}\n{}",
+            span(id, head_seg),
+            span(base_id, base_seg),
         )
     })?;
 
@@ -379,7 +402,8 @@ async fn compare(
         retrieve(base_id, component, base_span, Some(default_dest(base_id)), profile).await?;
 
     // Both profiles ship as retrieved; differencing them is a viewer's job, not ztest's
-    println!("{:>10}  {}", "base".style(theme.styles.dim), base_profile.display());
+    let f = Fields::new().text("label", "base").text("path", base_profile.display().to_string());
+    println!("{}", draw(row::BASE, &f, &theme));
     match open {
         true => launch(&head_profile, &theme),
         false => Ok(()),
@@ -397,33 +421,28 @@ fn verdict(
     let mut out = String::new();
     // Equal spans ⇒ equal work, so disagreement = untrustworthy measurement, not a
     // slower run. Say so rather than print a difference in what was counted.
-    let (agree, note) = match head.work == base.work {
-        true => (theme.styles.pass, "identical work"),
-        false => (theme.styles.fail, "WORK DISAGREES — see below"),
+    let (tone, note) = match head.work == base.work {
+        true => ("pass", "identical work"),
+        false => ("fail", "WORK DISAGREES — see below"),
     };
-    let _ = writeln!(
-        out,
-        "{:>10}  {}  {} {}",
-        "segment".style(theme.styles.dim),
-        head.describe().style(theme.styles.count),
-        theme.chars.ok.style(agree),
-        note.style(agree),
-    );
+    let f = Fields::new()
+        .text("label", "segment")
+        .text("span", head.describe())
+        .text("mark", theme.chars.ok)
+        .text("note", note);
+    let _ = writeln!(out, "{}", draw(&row::segment(tone), &f, theme));
 
-    let line =
-        |out: &mut String, label: &str, id: &str, seg: &ztest::sync::Segment, delta: &str| {
-            let row = format!(
-                "{:>10}  {:<12}  {:>9}  {:>12}  {:>8}",
-                label.style(theme.styles.dim),
-                id,
-                ztest::api::fmt::format_elapsed(seg.elapsed()).style(theme.styles.count),
-                ops_per_sec(seg).style(theme.styles.count),
-                delta,
-            );
-            let _ = writeln!(out, "{}", row.trim_end());
-        };
-    line(&mut out, "base", base_id, base, "");
-    line(&mut out, "head", head_id, head, &change(head, base, theme).unwrap_or_default());
+    let mut line = |label: &str, id: &str, seg: &ztest::sync::Segment, delta: Option<String>| {
+        let f = Fields::new()
+            .text("label", label)
+            .text("id", id)
+            .text("elapsed", format_elapsed(seg.elapsed()))
+            .text("rate", ops_per_sec(seg))
+            .maybe_text("delta", delta);
+        let _ = writeln!(out, "{}", draw(row::RUN, &f, theme));
+    };
+    line("base", base_id, base, None);
+    line("head", head_id, head, change(head, base, theme));
 
     let content: Vec<String> = head
         .work
@@ -439,23 +458,19 @@ fn verdict(
         .map(|(name, _)| *name)
         .collect();
     if !content.is_empty() {
-        let mut row = content.join("  ");
+        let mut text = content.join("  ");
         if !unmeasured.is_empty() {
-            row = format!("{row}  · {} unmeasured", unmeasured.join(", "));
+            text = format!("{text}  · {} unmeasured", unmeasured.join(", "));
         }
-        let _ = writeln!(
-            out,
-            "{:>10}  {}",
-            "content".style(theme.styles.dim),
-            row.style(theme.styles.dim),
-        );
+        let f = Fields::new().text("label", "content").text("text", text);
+        let _ = writeln!(out, "{}", draw(row::CONTENT, &f, theme));
     }
     out
 }
 
 fn ops_per_sec(seg: &ztest::sync::Segment) -> String {
     match seg.rate().total() {
-        Some(r) => format!("{}/s", ztest::api::fmt::compact(r)),
+        Some(r) => format!("{}/s", compact(r)),
         None => "—".to_string(),
     }
 }
@@ -472,11 +487,20 @@ fn change(
     if b <= 0.0 {
         return None;
     }
-    let style = match h < b * REGRESSION_MARGIN {
-        true => theme.styles.fail,
-        false => theme.styles.pass,
+    // Tone rides the template (not bindable data), same shape as `sync::row::list`
+    let tone = match h < b * REGRESSION_MARGIN {
+        true => "fail",
+        false => "pass",
     };
-    Some(format!("{:+.1}%", (h - b) / b * 100.0).style(style).to_string())
+    // Sign carried explicitly: `unit_value` prints magnitude, and an unsigned `+2.0%`
+    // beside a baseline reads as the new absolute
+    let delta = (h - b) / b;
+    let sign = match delta >= 0.0 {
+        true => "+",
+        false => "",
+    };
+    let f = Fields::new().text("delta", format!("{sign}{}", unit_value(Unit::Fraction, delta)));
+    Some(draw(&format!("{{delta|{tone}}}"), &f, theme))
 }
 
 /// Fraction of baseline below which a change is flagged
@@ -534,12 +558,8 @@ fn launch(profile: &Path, theme: &Theme) -> Result<(), String> {
         return Ok(());
     };
 
-    println!(
-        "{} {} {}",
-        theme.chars.dot.style(theme.styles.dim),
-        "opening".style(theme.styles.dim),
-        viewer.style(theme.styles.count)
-    );
+    let f = Fields::new().text("word", "opening").text("viewer", &*viewer);
+    println!("{}", draw(row::OPENING, &f, theme));
     // Inherited stdio, joined not detached — full-screen viewers must own the tty,
     // and a shell prompt returning mid-paint corrupts both.
     match Command::new(&viewer).arg(profile).status() {
@@ -568,6 +588,54 @@ fn on_path(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mistyped key binds nothing and renders blank, so every row the cluster paths
+    /// draw is bound once here
+    #[test]
+    fn every_row_binds_the_readings_it_names() {
+        let theme = plain_theme();
+        let f = Fields::new().text("path", "ztest-perf-x/zainod-cpu.collapsed");
+        assert_eq!(draw(row::WROTE, &f, &theme), "✓ ztest-perf-x/zainod-cpu.collapsed");
+
+        let f = Fields::new()
+            .text("label", "dropped")
+            .value("events", 12_400.0)
+            .text("fix", "lower --profile-off-cpu");
+        assert_eq!(
+            draw(row::DROPPED, &f, &theme),
+            "   dropped  12.4k trace events  lower --profile-off-cpu"
+        );
+
+        let f = Fields::new()
+            .text("label", "fidelity")
+            .value("sampled", 41.0)
+            .value("charged", 52.0)
+            .value("ratio", 41.0 / 52.0);
+        assert_eq!(
+            draw(&row::fidelity("fail"), &f, &theme),
+            "  fidelity  41 of 52 cpu-seconds sampled  78.8%"
+        );
+
+        let f = Fields::new().text("word", "opening").text("viewer", "flameshow");
+        assert_eq!(draw(row::OPENING, &f, &theme), "· opening flameshow");
+
+        let f = Fields::new().text("id", "sync-head").text("span", "main 3,013..658,599");
+        assert_eq!(draw(row::MISMATCH, &f, &theme), "         sync-head  main 3,013..658,599");
+    }
+
+    /// Base run has no delta; its gutter must leave with it rather than trailing spaces
+    #[test]
+    fn a_run_without_a_delta_ends_at_its_rate() {
+        let out = verdict(
+            &segment(840_000, 855_000, 50),
+            &segment(840_000, 855_000, 100),
+            "sync-head",
+            "sync-base",
+            &plain_theme(),
+        );
+        let base = out.lines().find(|l| l.contains("sync-base")).expect("base line");
+        assert_eq!(base.trim_end(), base, "{base:?}");
+    }
 
     /// Artifacts are named per component → only the directory separates two syncs
     /// of one profile

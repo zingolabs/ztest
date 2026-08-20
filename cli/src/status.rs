@@ -88,7 +88,7 @@ fn repaint(frame: &str, painted: &mut usize) {
 }
 
 fn term_cols() -> u16 {
-    terminal_size::terminal_size().map(|(w, _)| w.0).unwrap_or(120)
+    u16::try_from(crate::sync::render::width()).unwrap_or(u16::MAX)
 }
 
 // ─────────────────────────── snapshot ─────────────────────────────────
@@ -190,11 +190,10 @@ fn anomaly(runs: &[RunRow], now: chrono::DateTime<Utc>) -> Option<String> {
         .find(|r| r.eta.is_none() && (now - r.beacon.started_at).num_minutes() >= 5)
         .map(|r| {
             format!(
-                "{}/{} holds {}c/{}Gi and has completed no tests in {}m",
+                "{}/{} holds {} and has completed no tests in {}m",
                 r.beacon.user,
                 r.beacon.run_id,
-                r.beacon.reserve.cpu_milli / 1000,
-                r.beacon.reserve.mem_bytes / ztest::qos::GIB,
+                r.beacon.reserve.compact(),
                 (now - r.beacon.started_at).num_minutes(),
             )
         })

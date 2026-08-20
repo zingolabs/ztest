@@ -16,7 +16,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use crate::EnvError;
 use crate::cluster;
-use crate::component::{ComponentOpts, Indexer, Validator, Wallet};
+use crate::component::{ComponentOpts, Disk, Indexer, Validator, Wallet};
 use crate::error::env_err;
 use crate::naming::Sentinel;
 use crate::topology::ActivationHeights;
@@ -254,7 +254,7 @@ pub struct TestEnv {
     pending_validators: Vec<PendingValidator>,
     pending_indexers: Vec<PendingIndexer>,
     pending_wallets: Vec<PendingWallet>,
-    pending_shared_volumes: Vec<String>,
+    pending_shared_volumes: Vec<(String, Disk)>,
     next_id: u64,
     ready_timeout: Duration,
     /// Schedule of the *regtest* chain this env mines (`None` =
@@ -313,9 +313,16 @@ impl TestEnv {
     /// [`.mount(&vol)`](crate::ComponentBuilder::mount) on both a zebrad and a
     /// `.tuning(ZainoTuning::State)` zaino (PVC provisioned during [`TestEnv::build`])
     pub fn shared_volume(&mut self, name: &str) -> SharedVolume {
+        // Regtest chains are a handful of blocks; a public one wants `shared_volume_sized`
+        self.shared_volume_sized(name, Disk::gib(2))
+    }
+
+    /// [`shared_volume`](Self::shared_volume) for a chain that outgrows the regtest
+    /// default — a restored public network, or one syncing past its pin
+    pub fn shared_volume_sized(&mut self, name: &str, disk: Disk) -> SharedVolume {
         let slug = short_kind(name);
         let claim = format!("shared-{slug}");
-        self.pending_shared_volumes.push(claim.clone());
+        self.pending_shared_volumes.push((claim.clone(), disk));
         SharedVolume { claim, mount_path: format!("/shared/{slug}") }
     }
 
@@ -641,8 +648,8 @@ impl TestEnv {
 
         // Before any pod references them (WaitForFirstConsumer → the claim stays Pending
         // until the Phase-1 validator schedules)
-        for claim in std::mem::take(&mut self.pending_shared_volumes) {
-            mounts::create_shared_pvc(&client, &sentinel, &claim).await?;
+        for (claim, disk) in std::mem::take(&mut self.pending_shared_volumes) {
+            mounts::create_shared_pvc(&client, &sentinel, &claim, disk).await?;
         }
 
         let ctx = MaterializeCtx {
@@ -970,8 +977,14 @@ impl TestEnv {
                     "resolving mounts and seeds",
                 );
             }
-            let resolved =
-                mounts::resolve_all(ctx.client, ctx.sentinel, &spec.pod_name, &opts.mounts).await?;
+            let resolved = mounts::resolve_all(
+                ctx.client,
+                ctx.sentinel,
+                &spec.pod_name,
+                &opts.mounts,
+                opts.disk,
+            )
+            .await?;
             self.inner
                 .seed_bindings
                 .lock()
@@ -1134,12 +1147,10 @@ fn image_summary(image: &str) -> &str {
     image.rsplit('/').next().unwrap_or(image)
 }
 
-/// Wait for a dependency pod to reach Ready. Three deadlines, in sequence:
+/// Wait for a dependency pod to reach Ready, under the shared
+/// [`ReadyWatch`](crate::pod_status::ReadyWatch) deadlines.
 ///
-/// - unscheduled → `PENDING_TIMEOUT` (contention clears inside it, a bad placement never does)
-/// - `Running` → `ready_timeout` (time-to-ready = the app's problem)
-/// - `CrashLoopBackOff` / `OOMKilled` / terminal pull error / `Failed` → fail fast
-/// - transient kube-API `get` errors ignored, as in [`crate::engine`]'s runner-pod loop
+/// - Transient kube-API `get` errors ignored, as in [`crate::engine`]'s runner-pod loop
 async fn await_pod_ready(
     pods: &Api<Pod>,
     name: &str,
@@ -1147,52 +1158,30 @@ async fn await_pod_ready(
 ) -> Result<(), EnvError> {
     use crate::pod_status as ps;
 
-    let mut unscheduled_since: Option<Instant> = None;
-    let mut running_since: Option<Instant> = None;
-    let mut pull_error_since: Option<Instant> = None;
+    let mut watch = ps::ReadyWatch::new(ready_timeout);
     loop {
         if let Ok(pod) = pods.get(name).await
             && let Some(status) = pod.status.as_ref()
         {
-            if ps::is_ready(status) {
-                return Ok(());
-            }
-            // Placement first (no node → every check below is vacuous)
-            if !ps::is_scheduled(status) {
-                let since = *unscheduled_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= ps::PENDING_TIMEOUT {
+            let component = || name.to_string();
+            match watch.observe(status, Instant::now()) {
+                ps::Verdict::Ready => return Ok(()),
+                ps::Verdict::Waiting => {}
+                ps::Verdict::Unschedulable { reason, elapsed } => {
                     return Err(EnvError::PodUnschedulable {
-                        component: name.to_string(),
-                        reason: ps::schedule_blocker(status)
-                            .unwrap_or_else(|| "no PodScheduled condition".to_string()),
-                        elapsed: since.elapsed(),
+                        component: component(),
+                        reason,
+                        elapsed,
                     });
                 }
-            }
-            if let Some(reason) = ps::fault(status) {
-                return Err(EnvError::PodFailed { component: name.to_string(), reason });
-            }
-            match ps::image_error(status) {
-                Some(reason) => {
-                    let first = *pull_error_since.get_or_insert_with(Instant::now);
-                    if ps::pull_error_is_terminal(
-                        &reason,
-                        first,
-                        Instant::now(),
-                        ps::IMAGE_PULL_GRACE,
-                    ) {
-                        return Err(EnvError::PodFailed { component: name.to_string(), reason });
-                    }
+                ps::Verdict::Faulted(reason) | ps::Verdict::PullFailed(reason) => {
+                    return Err(EnvError::PodFailed { component: component(), reason });
                 }
-                None => pull_error_since = None,
-            }
-            if ps::is_running(status) {
-                let since = *running_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= ready_timeout {
+                ps::Verdict::ReadyTimeout(elapsed) => {
                     return Err(EnvError::RpcTimeout {
-                        component: name.to_string(),
+                        component: component(),
                         op: "pod_ready",
-                        elapsed: ready_timeout,
+                        elapsed,
                     });
                 }
             }

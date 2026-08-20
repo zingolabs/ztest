@@ -11,11 +11,12 @@
 //! - Marker coloured by subject, left column sized to longest name, right column = remainder
 //! - No hardcoded terminal width
 
-use owo_colors::Style;
+use std::time::Duration;
 
 use ztest::api::fmt::column_width;
 use ztest::api::pipeline::profiles::{Miss, ProfileStub, Scan};
-use ztest_ui::Theme;
+use ztest_ui::template::{Fields, Template};
+use ztest_ui::{Theme, truncate_with};
 
 /// ` ● ` + trailing space
 const GUTTER: usize = 4;
@@ -30,18 +31,59 @@ const MIN_WIDTH: usize = 60;
 /// hanging indent = width of the `ztest sync: ` prefix `crate::block_on` prepends
 const CONT: &str = "            ";
 
-pub(super) fn width() -> usize {
+mod tmpl {
+    use super::GAP;
+
+    pub(super) const HEADER: &str = "sync profiles{right:>*|dim}";
+    pub(super) const IDENTITY: &str = "{ws}[ {@dot} {branch}] {@dot} {count}";
+    pub(super) const NOTE: &str = "    {note|dim}";
+    pub(super) const HINT: &str = "{indent}{note|dim}";
+
+    /// Marker tone tracks the subject, so the shape is built per row
+    pub(super) fn head(tone: &str, name_w: usize) -> String {
+        let gap = " ".repeat(GAP);
+        format!(" {{marker|{tone}}}  {{name:<{name_w}|script_id}}{gap}{{desc|dim}}")
+    }
+
+    pub(super) fn stem(name_w: usize) -> String {
+        let gap = " ".repeat(GAP);
+        format!(" {{stem|dim}}  {{meta:<{name_w}}}{gap}{{tags|dim}}")
+    }
+}
+
+fn draw(src: &str, data: &Fields<'_>, width: usize, theme: &Theme) -> String {
+    Template::parse(src).render_str(data, width, Duration::ZERO, theme)
+}
+
+/// Width for every *printed* CLI surface (`status`, `sync`, catalogue).
+///
+/// - Fixed [`DEFAULT_WIDTH`] off a TTY → redirected output stays diffable, never stretched
+/// - [`MIN_WIDTH`] floor over the raw report (a 40-column split shears every panel)
+/// - Not the only probe in the tree, and deliberately so: `ztest_ui::console` queries rows
+///   as well as columns and falls back to 80×40, because a pinned panel must reserve a
+///   height even where a printed report only has to avoid wrapping
+pub(crate) fn width() -> usize {
     terminal_size::terminal_size()
         .map(|(w, _)| usize::from(w.0))
         .unwrap_or(DEFAULT_WIDTH)
         .max(MIN_WIDTH)
 }
 
+/// Indented aside under the listing
+fn note(text: &str, theme: &Theme) -> String {
+    draw(tmpl::NOTE, &Fields::new().text("note", text), 0, theme)
+}
+
+/// Aside hung under an error line, aligned past the `ztest sync: ` prefix
+fn hint(text: &str, theme: &Theme) -> String {
+    draw(tmpl::HINT, &Fields::new().text("indent", CONT).text("note", text), 0, theme)
+}
+
 pub(super) fn listing(scan: &Scan, theme: &Theme, width: usize) -> String {
     let mut out = header(scan, theme, width);
     if scan.profiles.is_empty() {
         // no explainer (workspace + branch already in the header = the whole diagnosis)
-        out.push_str(&format!("\n    {}\n", dim(theme, "none in this workspace")));
+        out.push_str(&format!("\n{}\n", note("none in this workspace", theme)));
         return out;
     }
     let name_w = name_column(&scan.profiles);
@@ -49,7 +91,7 @@ pub(super) fn listing(scan: &Scan, theme: &Theme, width: usize) -> String {
         out.push('\n');
         out.push_str(&entry(p, theme, width, name_w));
     }
-    out.push_str(&format!("\n    {}\n", dim(theme, "ztest sync start <name>")));
+    out.push_str(&format!("\n{}\n", note("ztest sync start <name>", theme)));
     out
 }
 
@@ -78,10 +120,8 @@ pub(super) fn miss(name: &str, scan: &Scan, why: &Miss, theme: &Theme, width: us
             out.push_str("no sync profiles in this workspace\n");
             for dir in ztest::api::pipeline::workspaces_with_profiles(&scan.workspace_root) {
                 let dir = relative_to_cwd(&dir);
-                out.push_str(&format!(
-                    "{CONT}{}\n",
-                    dim(theme, &format!("declared in {} — run from there", dir.display())),
-                ));
+                let text = format!("declared in {} — run from there", dir.display());
+                out.push_str(&format!("{}\n", hint(&text, theme)));
             }
             out.push('\n');
             out.push_str(&listing(scan, theme, width));
@@ -90,16 +130,14 @@ pub(super) fn miss(name: &str, scan: &Scan, why: &Miss, theme: &Theme, width: us
         Miss::Unknown { suggestions } => {
             out.push_str(&format!("no profile `{name}`\n"));
             if let Some(near) = suggestions.first() {
-                out.push_str(&format!("{CONT}{}\n", dim(theme, &format!("did you mean {near}?"))));
+                out.push_str(&format!("{}\n", hint(&format!("did you mean {near}?"), theme)));
             }
         }
         Miss::Ambiguous { found } => {
             out.push_str(&format!("`{name}` is declared {} times\n", found.len()));
             for p in found {
-                out.push_str(&format!(
-                    "{CONT}{}\n",
-                    dim(theme, &format!("{}:{}", p.file.display(), p.line))
-                ));
+                let site = format!("{}:{}", p.file.display(), p.line);
+                out.push_str(&format!("{}\n", hint(&site, theme)));
             }
             return out;
         }
@@ -120,88 +158,50 @@ fn header(scan: &Scan, theme: &Theme, width: usize) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| scan.workspace_root.display().to_string());
-    let sep = theme.chars.dot;
-    let mut right = ws;
-    if let Some(branch) = &scan.branch {
-        right = format!("{right} {sep} {branch}");
-    }
-    right = format!("{right} {sep} {}", scan.profiles.len());
-
-    const LEFT: &str = "sync profiles";
-    let pad = width.saturating_sub(LEFT.chars().count() + right.chars().count());
-    format!("{LEFT}{}{}\n", " ".repeat(pad), dim(theme, &right))
+    let identity = Fields::new()
+        .text("ws", ws)
+        .maybe_text("branch", scan.branch.as_deref())
+        .text("count", scan.profiles.len().to_string());
+    let right = Fields::new().text("right", draw(tmpl::IDENTITY, &identity, 0, theme));
+    format!("{}\n", draw(tmpl::HEADER, &right, width, theme))
 }
 
 fn entry(p: &ProfileStub, theme: &Theme, width: usize, name_w: usize) -> String {
     let right_w = width.saturating_sub(GUTTER + name_w + GAP).max(1);
-    let gap = " ".repeat(GAP);
+    let clip = |s: &str, w: usize| truncate_with(s, w, theme.chars.ellipsis);
+    let sep = theme.chars.dot;
 
-    let meta = {
-        let sep = theme.chars.dot;
-        // Overridden reserve shown beside the tier (else the tier alone implies its default)
-        let qos = match p.footprint {
-            Some(f) => {
-                format!("{} ({})", p.qos, ztest::qos::Resources::from_footprint(f).compact())
-            }
-            None => p.qos.clone(),
-        };
-        format!("{} {sep} {qos} {sep} {}", p.subject, p.timeout)
+    // Overridden reserve shown beside the tier (else the tier alone implies its default)
+    let qos = match p.footprint {
+        Some(f) => format!("{} ({})", p.qos, ztest::qos::Resources::from_footprint(f).compact()),
+        None => p.qos.clone(),
     };
-    let tags = p.tags.join(", ");
+    let meta = format!("{} {sep} {qos} {sep} {}", p.subject, p.timeout);
 
-    let marker = subject_style(theme, &p.subject).style(theme.chars.entry).to_string();
-    let stem = dim(theme, theme.chars.vbar);
+    let head = Fields::new()
+        .text("marker", theme.chars.entry)
+        .text("name", clip(&p.name, name_w))
+        .text("desc", clip(&p.description, right_w));
+    let stem = Fields::new()
+        .text("stem", theme.chars.vbar)
+        .text("meta", clip(&meta, name_w))
+        .text("tags", clip(&p.tags.join(", "), right_w));
 
-    let mut out = format!(
-        " {marker}  {}{gap}{}\n",
-        theme.styles.script_id.style(pad(&clip(&p.name, name_w, theme), name_w)),
-        dim(theme, &clip(&p.description, right_w, theme)),
-    );
-    out.push_str(&format!(
-        " {stem}  {}{gap}{}\n",
-        pad(&clip(&meta, name_w, theme), name_w),
-        dim(theme, &clip(&tags, right_w, theme)),
-    ));
-    out
+    format!(
+        "{}\n{}\n",
+        draw(&tmpl::head(subject_tone(&p.subject), name_w), &head, width, theme),
+        draw(&tmpl::stem(name_w), &stem, width, theme),
+    )
 }
 
 /// Only variable colour here (existing palette slots, no new roles).
-fn subject_style(theme: &Theme, subject: &str) -> Style {
+fn subject_tone(subject: &str) -> &'static str {
     match subject {
-        "indexer" => theme.styles.script_id,
-        "wallet" => theme.styles.pass,
-        "validator" => theme.styles.skip,
-        _ => theme.styles.count,
+        "indexer" => "script_id",
+        "wallet" => "pass",
+        "validator" => "skip",
+        _ => "bold",
     }
-}
-
-fn dim(theme: &Theme, s: &str) -> String {
-    theme.styles.dim.style(s).to_string()
-}
-
-/// Never truncates ([`clip`] owns that → unclipped caller gets a ragged line, not lost text).
-fn pad(s: &str, w: usize) -> String {
-    let len = s.chars().count();
-    if len >= w {
-        return s.to_string();
-    }
-    format!("{s}{}", " ".repeat(w - len))
-}
-
-/// Widths in `char`s (fields = identifiers/tags/English → matches display width; not wcwidth).
-fn clip(s: &str, w: usize, theme: &Theme) -> String {
-    let len = s.chars().count();
-    if len <= w {
-        return s.to_string();
-    }
-    let ell = theme.chars.ellipsis;
-    // column narrower than the marker → plain truncation (ASCII marker = 3 chars, so reachable)
-    if w <= ell.chars().count() {
-        return s.chars().take(w).collect();
-    }
-    let keep = w - ell.chars().count();
-    let head: String = s.chars().take(keep).collect();
-    format!("{head}{ell}")
 }
 
 #[cfg(test)]
@@ -373,23 +373,18 @@ mod tests {
         assert_eq!(out.matches("zaino_sync.rs:91").count(), 2);
     }
 
+    /// Column budget the two-column form depends on, asserted against the shared
+    /// primitive (both themes: the ASCII ellipsis is 3 wide, so every narrow column
+    /// takes the hard-cut branch)
     #[test]
-    fn clip_is_a_no_op_when_it_fits() {
-        assert_eq!(clip("abc", 3, &theme()), "abc");
-        assert_eq!(clip("abc", 9, &theme()), "abc");
-    }
-
-    #[test]
-    fn clip_never_exceeds_its_budget() {
-        for w in 1..12usize {
-            assert!(clip("abcdefghijkl", w, &theme()).chars().count() <= w);
-            assert!(clip("abcdefghijkl", w, &ascii_theme()).chars().count() <= w);
+    fn a_clipped_cell_never_exceeds_its_budget() {
+        for t in [theme(), ascii_theme()] {
+            let clip = |s, w| truncate_with(s, w, t.chars.ellipsis);
+            assert_eq!(clip("abc", 3), "abc");
+            assert_eq!(clip("abc", 9), "abc");
+            for w in 1..12usize {
+                assert!(clip("abcdefghijkl", w).chars().count() <= w);
+            }
         }
-    }
-
-    #[test]
-    fn pad_reaches_the_column_and_never_truncates() {
-        assert_eq!(pad("ab", 4), "ab  ");
-        assert_eq!(pad("abcdef", 3), "abcdef");
     }
 }

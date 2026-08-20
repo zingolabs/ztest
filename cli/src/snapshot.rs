@@ -17,11 +17,78 @@ use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind,
 use kube::{Client, ResourceExt};
 
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use ztest::api::progress::StepProgress as _;
 use ztest::api::seeds::SEEDS_NAMESPACE;
+use ztest_ui::template::{Fields, draw};
+use ztest_ui::{Theme, TransferKind};
+
+use crate::progress::LiveStep;
 
 const READY_LABEL: &str = "seeds.ztest.io/ready";
 const DRIVER_LABEL: &str = "seeds.ztest.io/driver";
 const SEED_PREFIX: &str = "seed-";
+
+/// Seed column bounds (driver slug runs a name out to `DNS_LABEL_MAX`)
+const SEED_COL_MIN: usize = 24;
+const SEED_COL_MAX: usize = 44;
+
+mod tmpl {
+    pub(super) const NOTE: &str = "{note|dim}";
+    pub(super) const PUSH_RESULT: &str = "{verb} lfs/{oid} {@dot|dim} {size|bytes.bold}";
+    pub(super) const WARMING: &str = "{entry|dim} warming seed {sha|bold} {@dot|dim} {name}";
+    pub(super) const READY: &str = "{@ok|pass} {name}";
+    pub(super) const PRUNED: &str = "{@ok|pass} pruned {name}";
+    pub(super) const PRUNED_ORPHAN: &str = "{@ok|pass} pruned orphan {name}";
+    pub(super) const PRUNE_ERROR: &str = "  {@fail|fail} {detail|dim}";
+    pub(super) const VERIFY_TALLY: &str = "{count|bold} snapshots, all present";
+
+    /// - Header + body = one shape, tone apart (columns cannot drift)
+    /// - `[{size}][{size_raw}]` = exactly one binds (parsed `Quantity`, else its raw text)
+    pub(super) fn list_row(seed: usize, tone: &str) -> String {
+        format!(
+            "{{seed:<{seed}|{tone}}} {{ready:<5|{tone}}} [{{size:>9|bytes.{tone}}}]\
+             [{{size_raw:>9|{tone}}}] {{driver:<6|{tone}}} {{snap|{tone}}}"
+        )
+    }
+
+    pub(super) fn verify_row(tone: &str) -> String {
+        format!("{{mark:<4|{tone}}} {{oid|dim}}  {{name}}")
+    }
+}
+
+/// Bind and draw (no `*` cell, no spinner here → zero width, zero elapsed)
+/// Result lines → stdout (caller redirects it), everything else → [`say_err`]
+fn say(src: &str, f: Fields<'_>, theme: &Theme) {
+    println!("{}", draw(src, &f, theme));
+}
+
+fn say_err(src: &str, f: Fields<'_>, theme: &Theme) {
+    eprintln!("{}", draw(src, &f, theme));
+}
+
+fn note(text: &str, theme: &Theme) {
+    say(tmpl::NOTE, Fields::new().text("note", text), theme);
+}
+
+/// `{ok} … {name}` row (pruned / pruned orphan / ready differ in wording alone)
+fn ok_line(src: &str, name: &str, theme: &Theme) {
+    say(src, Fields::new().text("name", name), theme);
+}
+
+/// Column captions, drawn through the body's own template (→ no drift)
+fn header_fields() -> Fields<'static> {
+    Fields::new()
+        .text("seed", "SEED")
+        .text("ready", "READY")
+        .text("size_raw", "SIZE")
+        .text("driver", "DRIVER")
+        .text("snap", "SNAPSHOT")
+}
+
+/// Non-fatal sweep failure (`prune` carries on → reports, never returns)
+fn prune_error(detail: &str, theme: &Theme) {
+    say_err(tmpl::PRUNE_ERROR, Fields::new().text("detail", detail), theme);
+}
 
 #[derive(Debug, Parser)]
 pub struct Args {
@@ -151,29 +218,53 @@ fn manifest(args: &ManifestArgs) -> Result<(), String> {
 /// Upload `archive` under its own content address. Idempotent by construction — the key
 /// *is* the content, so re-pushing identical bytes is a no-op
 async fn push(args: &PushArgs) -> Result<(), String> {
-    let digest = ztest::api::storage::digest_of(&args.archive)?;
+    let theme = Theme::detect();
+    let label = args
+        .archive
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| args.archive.display().to_string());
+    // - one row across both phases (hash + upload = one push to a watcher)
+    // - stage note marks the crossing
+    let step = LiveStep::new(label, TransferKind::Upload);
+    let result = push_reporting(args, &step, &theme).await;
+    step.finish();
+    result
+}
+
+async fn push_reporting(args: &PushArgs, step: &LiveStep, theme: &Theme) -> Result<(), String> {
+    let digest = ztest::api::storage::digest_of_with(&args.archive, step)?;
     let bucket = ztest::api::storage::Bucket::resolve().map_err(|e| e.to_string())?;
+    let result = |verb| {
+        say(
+            tmpl::PUSH_RESULT,
+            Fields::new()
+                .text("verb", verb)
+                .text("oid", digest.sha256.as_str())
+                .value("size", digest.size_bytes as f64),
+            theme,
+        )
+    };
     if bucket.has(&digest.sha256, digest.size_bytes).await.map_err(|e| e.to_string())? {
-        println!("already present: lfs/{} ({} bytes)", digest.sha256, digest.size_bytes);
+        step.finish();
+        result("already present:");
         return Ok(());
     }
     let file = tokio::fs::File::open(&args.archive)
         .await
         .map_err(|e| format!("opening {}: {e}", args.archive.display()))?;
     let total = digest.size_bytes;
-    let (mut sent, mut fifth) = (0u64, 0u64);
+    let mut sent = 0u64;
+    step.note("uploading");
     bucket
         .put(&digest.sha256, total, file, &mut |n| {
             sent += n as u64;
-            let pct = sent * 100 / total.max(1);
-            if pct / 5 > fifth {
-                fifth = pct / 5;
-                eprintln!("  {pct}%  ({sent} / {total} bytes)");
-            }
+            step.bytes(sent, total);
         })
         .await
         .map_err(|e| e.to_string())?;
-    println!("pushed lfs/{} ({total} bytes)", digest.sha256);
+    step.finish();
+    result("pushed");
     Ok(())
 }
 
@@ -202,9 +293,10 @@ async fn seed_pvcs(client: &Client) -> Result<Vec<PersistentVolumeClaim>, String
 }
 
 async fn list(client: &Client) -> Result<(), String> {
+    let theme = Theme::detect();
     let pvcs = seed_pvcs(client).await?;
     if pvcs.is_empty() {
-        println!("No seeds in {SEEDS_NAMESPACE}.");
+        note(&format!("no seeds in {SEEDS_NAMESPACE}"), &theme);
         return Ok(());
     }
     let snap_api: Api<DynamicObject> =
@@ -215,9 +307,11 @@ async fn list(client: &Client) -> Result<(), String> {
         .await
         .map(|s| ztest::api::naming::slug(&s.provisioner, ztest::api::naming::DNS_LABEL_MAX))
         .unwrap_or_default();
-    println!("{:<38} {:<8} {:<10} {:<9} SNAPSHOT", "SEED", "READY", "SIZE", "DRIVER");
-    for pvc in &pvcs {
-        let name = pvc.name_any();
+    let names: Vec<String> = pvcs.iter().map(|p| p.name_any()).collect();
+    let seed_w =
+        ztest::api::column_width(names.iter().map(String::as_str), SEED_COL_MIN, SEED_COL_MAX);
+    say(&tmpl::list_row(seed_w, "dim"), header_fields(), &theme);
+    for (pvc, name) in pvcs.iter().zip(&names) {
         let ready = pvc.labels().get(READY_LABEL).map(|v| v == "true").unwrap_or(false);
         // Pre-`driver`-label seeds carry no driver → unknown, not "other"
         let driver = match pvc.labels().get(DRIVER_LABEL) {
@@ -233,7 +327,8 @@ async fn list(client: &Client) -> Result<(), String> {
             .and_then(|m| m.get("storage"))
             .map(|q| q.0.clone())
             .unwrap_or_else(|| "?".into());
-        let snap = match snap_api.get_opt(&name).await {
+        let size_bytes = ztest::qos::units::parse_mem_bytes_opt(&size);
+        let snap = match snap_api.get_opt(name).await {
             Ok(Some(s)) => {
                 let bound = s.data["status"]["readyToUse"].as_bool().unwrap_or(false);
                 if bound { "ready" } else { "pending" }
@@ -241,19 +336,20 @@ async fn list(client: &Client) -> Result<(), String> {
             Ok(None) => "missing",
             Err(_) => "?",
         };
-        println!(
-            "{:<38} {:<8} {:<10} {:<9} {}",
-            name,
-            if ready { "yes" } else { "no" },
-            size,
-            driver,
-            snap
-        );
+        let row = Fields::new()
+            .text("seed", name.as_str())
+            .text("ready", if ready { "yes" } else { "no" })
+            .maybe_value("size", size_bytes.map(|b| b as f64))
+            .maybe_text("size_raw", size_bytes.is_none().then_some(size.as_str()))
+            .text("driver", driver)
+            .text("snap", snap);
+        say(&tmpl::list_row(seed_w, ""), row, &theme);
     }
     Ok(())
 }
 
 async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
+    let theme = Theme::detect();
     if !args.all && args.shas.is_empty() {
         return Err("nothing selected — pass `--all` or one or more seed sha8 prefixes.".into());
     }
@@ -271,7 +367,7 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
         .collect();
 
     if targets.is_empty() {
-        println!("No matching seeds to prune.");
+        note("no matching seeds to prune", &theme);
         return Ok(());
     }
 
@@ -287,7 +383,7 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
         match pod_api.delete(&uploader, &dp).await {
             Ok(_) => {}
             Err(kube::Error::Api(e)) if e.code == 404 => {}
-            Err(e) => eprintln!("  ! deleting uploader pod {uploader}: {e}"),
+            Err(e) => prune_error(&format!("uploader pod {uploader}: {e}"), &theme),
         }
         // Snapshot next → its content releases before the PVC
         match snap_api.delete(name, &dp).await {
@@ -300,7 +396,7 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
             Err(kube::Error::Api(e)) if e.code == 404 => {}
             Err(e) => return Err(format!("deleting PVC {name}: {e}")),
         }
-        println!("pruned {name}");
+        ok_line(tmpl::PRUNED, name, &theme);
     }
 
     // Orphaned cluster-scoped seed-binding contents (`Retain` → a crashed test leaves
@@ -313,9 +409,9 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
             let n = vsc.name_any();
             if n.starts_with(ztest::api::seeds::BINDING_PREFIX) {
                 match vsc_api.delete(&n, &dp).await {
-                    Ok(_) => println!("pruned orphan {n}"),
+                    Ok(_) => ok_line(tmpl::PRUNED_ORPHAN, &n, &theme),
                     Err(kube::Error::Api(e)) if e.code == 404 => {}
-                    Err(e) => eprintln!("  ! deleting {n}: {e}"),
+                    Err(e) => prune_error(&format!("{n}: {e}"), &theme),
                 }
             }
         }
@@ -329,29 +425,32 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<(), String> {
 /// bucket → works in a checkout holding only the manifest (same property that lets
 /// a build pod declare a seed it cannot read)
 async fn warm(client: &Client, args: &WarmArgs) -> Result<(), String> {
+    let theme = Theme::detect();
     for archive in &args.archives {
-        let (name, oid, size) = ztest::archive::identity_of(archive)?;
+        let (name, digest) = ztest::archive::identity_of(archive)?;
         let entry = ztest::api::inventory::SeedEntry {
             name,
-            oid,
-            size,
+            oid: digest.sha256,
+            size: digest.size_bytes,
+            uncompressed_bytes: digest.uncompressed_bytes,
             payload: ztest::api::inventory::SeedPayload::Archive,
             base_uri: ztest::api::storage::BASE_URI.to_string(),
             key_prefix: ztest::api::storage::KEY_PREFIX.to_string(),
         };
-        eprintln!(
-            "• warming seed {} from {}",
-            ztest::api::storage::seed_sha8(&entry.oid),
-            entry.name
+        say_err(
+            tmpl::WARMING,
+            Fields::new()
+                .text("entry", theme.chars.entry)
+                .text("sha", ztest::api::storage::seed_sha8(&entry.oid))
+                .text("name", entry.name.as_str()),
+            &theme,
         );
-        // No panel to paint: the pull's sub-phases have nowhere to land, and `warm`
-        // already brackets each seed
         // Name comes back on the handle: only `provision_seed` knows the driver half
-        let handle =
-            ztest::api::materialize::provision_seed(client, &entry, &ztest::api::progress::Silent)
-                .await
-                .map_err(|e| format!("materializing {}: {e}", entry.name))?;
-        println!("ready {}", handle.seed_pvc);
+        let step = LiveStep::new(entry.name.clone(), TransferKind::Seed);
+        let handle = ztest::api::materialize::provision_seed(client, &entry, &step).await;
+        step.finish();
+        let handle = handle.map_err(|e| format!("materializing {}: {e}", entry.name))?;
+        ok_line(tmpl::READY, &handle.seed_pvc, &theme);
     }
     Ok(())
 }
@@ -361,17 +460,28 @@ async fn warm(client: &Client, args: &WarmArgs) -> Result<(), String> {
 /// The lockfile integrity check: committing a manifest claims an object exists, and
 /// nothing else enforces that the `push` happened. `HEAD` per object, no transfer
 async fn verify() -> Result<(), String> {
+    let theme = Theme::detect();
     let bucket = ztest::api::storage::Bucket::resolve().map_err(|e| e.to_string())?;
     let mut missing = 0usize;
     for snapshot in ztest::snapshots::ALL {
         let a = &snapshot.artifact;
         let present = bucket.has(a.oid, a.size).await.map_err(|e| e.to_string())?;
-        println!("{} {}  {}", if present { "ok     " } else { "MISSING" }, a.oid, a.name);
+        let (mark, tone) = match present {
+            true => (theme.chars.ok, "pass"),
+            false => (theme.chars.warn, "fail"),
+        };
+        say(
+            &tmpl::verify_row(tone),
+            Fields::new().text("mark", mark).text("oid", a.oid).text("name", a.name),
+            &theme,
+        );
         missing += usize::from(!present);
     }
     match missing {
         0 => {
-            println!("\n{} snapshots, all present", ztest::snapshots::ALL.len());
+            let count = ztest::api::thousands(ztest::snapshots::ALL.len() as u64);
+            println!();
+            say(tmpl::VERIFY_TALLY, Fields::new().text("count", count), &theme);
             Ok(())
         }
         n => Err(format!(
@@ -379,5 +489,46 @@ async fn verify() -> Result<(), String> {
              committing the manifest",
             ztest::snapshots::ALL.len(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn theme() -> Theme {
+        Theme::for_capabilities(false, true)
+    }
+
+    fn row(size: &str) -> String {
+        let bytes = ztest::qos::units::parse_mem_bytes_opt(size);
+        let f = Fields::new()
+            .text("seed", "seed-4c86ea3c-hostpath")
+            .text("ready", "yes")
+            .maybe_value("size", bytes.map(|b| b as f64))
+            .maybe_text("size_raw", bytes.is_none().then_some(size))
+            .text("driver", "this")
+            .text("snap", "ready");
+        draw(&tmpl::list_row(24, ""), &f, &theme())
+    }
+
+    /// - `48Gi` / `51539607552` = one size, one rendering
+    /// - unparseable falls back to its raw text, still holding the header's column
+    #[test]
+    fn a_size_reads_as_bytes_and_falls_back_to_its_raw_quantity() {
+        assert_eq!(row("48Gi"), "seed-4c86ea3c-hostpath   yes    48.0 GiB this   ready");
+        assert_eq!(row("51539607552"), "seed-4c86ea3c-hostpath   yes    48.0 GiB this   ready");
+        assert_eq!(row("?"), "seed-4c86ea3c-hostpath   yes           ? this   ready");
+    }
+
+    #[test]
+    fn the_header_lands_on_the_body_columns() {
+        let head = draw(&tmpl::list_row(24, "dim"), &header_fields(), &theme());
+        let column = |s: &str, word: &str| s.find(word);
+        assert_eq!(
+            column(&head, "SIZE").map(|c| c + 4),
+            column(&row("48Gi"), "GiB").map(|c| c + 3)
+        );
+        assert_eq!(column(&head, "DRIVER"), column(&row("48Gi"), "this"));
     }
 }

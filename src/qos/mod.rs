@@ -230,7 +230,8 @@ impl Resources {
     /// Dense cell `16c/30Gi`, integer — a per-row footprint column that repeats a decimal
     /// buys nothing. Sub-gibibyte falls to `Mi`; sub-core keeps a decimal (`0.5c/512Mi`)
     ///
-    /// - Undeclared disk drops its segment → output re-parses as `footprint = ".."`
+    /// - Undeclared *or unbounded* disk drops its segment → output re-parses as
+    ///   `footprint = ".."`, and a node ceiling does not print `u64::MAX` as gibibytes
     pub fn compact(&self) -> String {
         let cpu = match self.cpu_milli {
             m if m == 0 || m.is_multiple_of(1000) => format!("{}c", m / 1000),
@@ -241,7 +242,7 @@ impl Resources {
             b => format!("{}Mi", b / MIB),
         };
         match self.disk_bytes {
-            0 => format!("{cpu}/{}", bytes(self.mem_bytes)),
+            0 | u64::MAX => format!("{cpu}/{}", bytes(self.mem_bytes)),
             d => format!("{cpu}/{}/{}", bytes(self.mem_bytes), bytes(d)),
         }
     }
@@ -447,6 +448,16 @@ impl QosClass {
     pub fn profile_with(self, footprint: Option<Resources>) -> QosProfile {
         self.profile().with_footprint(footprint)
     }
+
+    /// Every tier, for callers that must bound over all of them (capacity preflight,
+    /// plan rendering). Ordered as declared
+    pub const ALL: [QosClass; 5] = [
+        QosClass::Basic,
+        QosClass::Wallet,
+        QosClass::Integration,
+        QosClass::Testnet,
+        QosClass::Sync,
+    ];
 
     /// Const profile table: one source of truth for every tier's schedulable shape. I/O
     /// reserves stay `0` pending calibration (a reserve must come from measured `io.stat`,
@@ -806,13 +817,16 @@ mod tests {
         assert!(t <= s, "sync is not below testnet");
     }
 
-    const ALL_TIERS: [QosClass; 5] = [
-        QosClass::Basic,
-        QosClass::Wallet,
-        QosClass::Integration,
-        QosClass::Testnet,
-        QosClass::Sync,
-    ];
+    const ALL_TIERS: [QosClass; 5] = QosClass::ALL;
+
+    /// `cpu_mem_unbounded_rest` seeds disk with the never-gates sentinel; printing it
+    /// yields `17179869183Gi` in a capacity line
+    #[test]
+    fn an_unbounded_disk_ceiling_prints_no_disk_segment() {
+        let node = Resources::cpu_mem_unbounded_rest(20_000, 93 * GIB);
+        assert_eq!(node.compact(), "20c/93Gi");
+        assert_eq!(Resources::new(1_000, GIB, 0, 0).with_disk(4 * GIB).compact(), "1c/1Gi/4Gi");
+    }
 
     #[test]
     fn every_tier_reserves_zero_io_pending_calibration() {

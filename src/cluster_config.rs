@@ -376,20 +376,52 @@ pub async fn kubelet_is_nested(client: &kube::Client) -> bool {
     nested.unwrap_or(false)
 }
 
-/// Requested seed-PVC size = floor for every clone off its snapshot. Non-private because
-/// `seeds::read_seed_handle` falls back to it when a driver reports no `restoreSize`.
+/// Above every artifact whose manifest predates `uncompressed_bytes`
+const SEED_SIZE_UNMEASURED: &str = "48Gi";
+/// Extract + this much = the request. Covers filesystem metadata and the 5% ext4 keeps back
+const SEED_HEADROOM_PCT: u64 = 15;
+
+/// Seed-PVC request for an artifact measuring `uncompressed_bytes` extracted. Holds the
+/// *extracted chain archive* only (indexer DBs = per-pod `emptyDir`)
 ///
-/// - Holds the *extracted chain archive* only (indexer DBs = per-pod `emptyDir`)
-/// - Default > deepest registered artifact (mainnet 1,693,104 = 30.5 GiB extracted)
-/// - Flat, not per-artifact from `ChainInfo::uncompressed_bytes` (a full-mainnet rung
-///   would need ~258 GiB → sizing belongs on the handle, not on one global)
-pub fn seed_size() -> String {
-    std::env::var("ZTEST_SEED_SIZE").unwrap_or_else(|_| "48Gi".into())
+/// - `0` = unmeasured (sidecar manifests carry identity without a size)
+/// - Rounds up to whole GiB: a PVC request is a floor, and CSI rounds anyway
+pub fn seed_size_for(uncompressed_bytes: u64) -> String {
+    if uncompressed_bytes == 0 {
+        return SEED_SIZE_UNMEASURED.to_string();
+    }
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let headroom = uncompressed_bytes / 100 * SEED_HEADROOM_PCT;
+    format!("{}Gi", uncompressed_bytes.saturating_add(headroom).div_ceil(GIB).max(1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The rung that forced per-artifact sizing: 48Gi would not hold a tenth of it
+    #[test]
+    fn a_measured_artifact_sizes_from_its_manifest() {
+        // mainnet Ironwood, `uncompressed_bytes` off snapshots/mainnet/zebra-6.2.3-ironwood.toml
+        assert_eq!(seed_size_for(276_863_224_320), "297Gi");
+        // testnet Ironwood — smaller than the old flat default, so sizing frees space too
+        assert_eq!(seed_size_for(10_459_813_376), "12Gi");
+    }
+
+    #[test]
+    fn an_unmeasured_artifact_takes_the_flat_default() {
+        assert_eq!(seed_size_for(0), SEED_SIZE_UNMEASURED);
+    }
+
+    /// A PVC request is a floor; rounding down would hand the extract a volume it
+    /// cannot finish unpacking into
+    #[test]
+    fn sizing_rounds_up_and_never_returns_zero() {
+        assert_eq!(seed_size_for(1), "1Gi");
+        assert_eq!(seed_size_for(GIB), "2Gi");
+    }
 
     #[test]
     fn round_trips_through_toml() {

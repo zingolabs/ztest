@@ -81,9 +81,9 @@ impl ImageProvider for Kind {
     }
 }
 
-/// The kind node's cri-tools ignores `crictl images`' positional filter → list the full
-/// table and match `REPOSITORY TAG` against every form the engine stores under
-pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
+/// Node's own image table, as `crictl` prints it. Reaching it at all = engine `exec` and the
+/// node's containerd both answer
+pub fn crictl_images() -> Result<String, ImageError> {
     let node = format!("{}-control-plane", kind_cluster_name());
     let engine = runtime::program();
     let out =
@@ -93,6 +93,13 @@ pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
     if !out.status.success() {
         return Err(ImageError::KindImageQuery { stderr_tail: tail(&out.stderr, 40) });
     }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The kind node's cri-tools ignores `crictl images`' positional filter → list the full
+/// table and match `REPOSITORY TAG` against every form the engine stores under
+pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
+    let stdout = crictl_images()?;
     // `REPOSITORY` (maybe registry-prefixed) then `TAG` → accept both `<repo>` and
     // `docker.io/library/<repo>`
     let needle_repo_tag: Vec<&str> = tag.splitn(2, ':').collect();
@@ -104,7 +111,6 @@ pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
     let (n_repo, n_tag) = (needle_repo_tag[0], needle_repo_tag[1]);
     let accepted = runtime::active().node_repo_forms(n_repo);
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
     let mut lines = stdout.lines();
     // Skip header
     let _ = lines.next();
@@ -198,14 +204,85 @@ pub fn kind_cluster_name() -> String {
         .unwrap_or_else(|| "kind".to_string())
 }
 
-/// Sole caller of `kind get clusters`
-pub fn kind_clusters() -> Result<Vec<String>, ImageError> {
-    let mut cmd = Command::new("kind");
-    cmd.args(["get", "clusters"]);
-    cmd.envs(runtime::active().kind_envs());
-    let out = cmd
+/// kind's own label on every node container it creates
+const CLUSTER_LABEL: &str = "io.x-k8s.kind.cluster";
+
+/// Node-name suffixes kind appends to the cluster name (`[N]` for the 2nd+ of a role)
+const NODE_ROLES: [&str; 3] = ["-control-plane", "-worker", "-external-load-balancer"];
+
+/// Engine-native, never `kind get clusters`.
+///
+/// - `--filter` = engine-side; `{{.Names}}` never renders a label (podman 6.0 turned `.Labels`
+///   map → slice, breaking kind's `{{index .Labels}}` on every release through v0.32.0)
+/// - Same shape as [`crate::profiling::host::cluster_network`]
+fn ps_argv(filter: &str) -> Vec<String> {
+    ["ps", "-a", "--filter", filter, "--format", "{{.Names}}"].map(str::to_string).to_vec()
+}
+
+fn node_names(filter: &str) -> Result<Vec<String>, ImageError> {
+    let engine = runtime::program();
+    let argv = ps_argv(filter);
+    let out = Command::new(engine)
+        .args(&argv)
         .output()
-        .map_err(|err| ImageError::Spawn { cmd: "kind get clusters".to_string(), err })?;
+        .map_err(|err| ImageError::Spawn { cmd: format!("{engine} ps --filter {filter}"), err })?;
+    if !out.status.success() {
+        return Err(ImageError::KindClusterQuery { engine, stderr_tail: tail(&out.stderr, 20) });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// `<cluster><role>[N]` → `<cluster>`; longest match wins (a cluster may itself end in a role
+/// word, e.g. `my-worker-control-plane`)
+fn cluster_of_node(node: &str) -> Option<&str> {
+    NODE_ROLES
+        .iter()
+        .filter_map(|role| node.rfind(role))
+        .max()
+        .map(|cut| &node[..cut])
+        .filter(|cluster| !cluster.is_empty())
+}
+
+fn clusters_from_nodes(nodes: &[String]) -> Vec<String> {
+    let mut names: Vec<String> =
+        nodes.iter().filter_map(|node| cluster_of_node(node)).map(str::to_string).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Every kind cluster this engine holds, running or stopped
+pub fn kind_clusters() -> Result<Vec<String>, ImageError> {
+    Ok(clusters_from_nodes(&node_names(&format!("label={CLUSTER_LABEL}"))?))
+}
+
+/// Exact: the label carries the cluster name, so the engine answers without a name convention
+pub fn kind_cluster_exists(cluster: &str) -> Result<bool, ImageError> {
+    Ok(!node_names(&format!("label={CLUSTER_LABEL}={cluster}"))?.is_empty())
+}
+
+/// Nodes as *kind* resolves them — the `ListNodes` call `kind load` makes, without the load.
+///
+/// - Exit status is not the answer: an unresolvable cluster prints `No kind nodes found` to
+///   stderr and exits 0, so an empty list is the failure
+/// - Sole remaining kind-CLI read (side-load itself is the only other kind invocation)
+pub fn kind_resolves_nodes(cluster: &str) -> Result<Vec<String>, ImageError> {
+    let out = Command::new("kind")
+        .args(["get", "nodes", "--name", cluster])
+        .envs(runtime::active().kind_envs())
+        .output()
+        .map_err(|err| ImageError::Spawn {
+            cmd: format!("kind get nodes --name {cluster}"),
+            err,
+        })?;
+    if !out.status.success() {
+        return Err(ImageError::KindNodeQuery { stderr_tail: tail(&out.stderr, 20) });
+    }
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
@@ -217,10 +294,11 @@ pub fn kind_clusters() -> Result<Vec<String>, ImageError> {
 /// Actionable error before the multi-minute build, not a raw `kind load` failure after
 pub fn ensure_kind_cluster() -> Result<(), ImageError> {
     let cluster = kind_cluster_name();
-    let available = kind_clusters()?;
-    if available.contains(&cluster) {
+    if kind_cluster_exists(&cluster)? {
         return Ok(());
     }
+    // Only now (naming the alternatives costs a second query, and the happy path pays nothing)
+    let available = kind_clusters()?;
     Err(ImageError::KindClusterMissing {
         cluster,
         available: if available.is_empty() { "(none)".to_string() } else { available.join(", ") },
@@ -285,6 +363,34 @@ mod tests {
         assert_eq!(argv[..2], ["load", "image-archive"]);
         assert!(argv[2].ends_with(".tar"), "{argv:?}");
         assert!(envs.contains(&"KIND_EXPERIMENTAL_PROVIDER=podman".to_string()), "{envs:?}");
+    }
+
+    /// kind's own `{{index .Labels "…"}}` broke on podman 6.0 (map → slice) and is unfixed
+    /// through kind v0.32.0 — ours must stay filter-only
+    #[test]
+    fn the_cluster_query_never_renders_a_label() {
+        let argv = ps_argv("label=io.x-k8s.kind.cluster=zkn");
+        let fmt = argv.iter().position(|a| a == "--format").expect("--format");
+        assert_eq!(argv[fmt + 1], "{{.Names}}");
+        assert!(!argv.iter().any(|a| a.contains(".Label")), "{argv:?}");
+    }
+
+    #[test]
+    fn a_node_names_the_cluster_owning_it() {
+        assert_eq!(cluster_of_node("kind-control-plane"), Some("kind"));
+        assert_eq!(cluster_of_node("zkn-worker2"), Some("zkn"));
+        assert_eq!(cluster_of_node("zkn-external-load-balancer"), Some("zkn"));
+        // Cluster name ending in a role word → rightmost role wins
+        assert_eq!(cluster_of_node("my-worker-control-plane"), Some("my-worker"));
+        assert_eq!(cluster_of_node("-control-plane"), None);
+        assert_eq!(cluster_of_node("unlabelled"), None);
+    }
+
+    #[test]
+    fn every_node_of_a_cluster_collapses_to_one_name() {
+        let nodes = ["zkn-control-plane", "zkn-worker", "zkn-worker2", "other-control-plane"]
+            .map(str::to_string);
+        assert_eq!(clusters_from_nodes(&nodes), ["other", "zkn"]);
     }
 
     #[test]

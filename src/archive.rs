@@ -106,15 +106,14 @@ pub struct ChainSnapshot {
     pub artifact: Artifact,
 }
 
-/// Identity `(name, oid, size)` of a local archive, hashed on the spot.
+/// Filename + measurement of a local archive, hashed on the spot.
 ///
 /// For `ztest snapshot warm`, handed paths on a command line and so having no
 /// [`artifact!`](macro@crate::artifact) expansion to read them off
-pub fn identity_of(archive: &std::path::Path) -> Result<(String, String, u64), String> {
+pub fn identity_of(archive: &std::path::Path) -> Result<(String, crate::storage::Digest), String> {
     let name = archive
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| format!("{} has no filename", archive.display()))?;
-    let digest = crate::storage::digest_of(archive)?;
-    Ok((name, digest.sha256, digest.size_bytes))
+    Ok((name, crate::storage::digest_of(archive)?))
 }

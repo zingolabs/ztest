@@ -52,8 +52,6 @@ pub(super) fn blank_line(out: &mut String) {
     out.push('\n');
 }
 
-pub(super) const INDENT: &str = "             "; // 12 spaces + 1 separator = label column width + 1
-
 pub(super) fn render_top_rule(out: &mut String, theme: &Theme) {
     writeln!(out, "{}", theme.chars.hbar(LABEL_WIDTH)).expect("write to string");
 }
@@ -72,12 +70,12 @@ pub(super) fn render_label_rule(out: &mut String, theme: &Theme) {
 
 /// Printable width, ANSI escapes ignored (padding against byte length leaves every
 /// coloured cell ragged)
-pub(super) fn display_width(s: &str) -> usize {
+pub fn display_width(s: &str) -> usize {
     ::console::measure_text_width(s)
 }
 
 /// Cut to `width` printable columns, escapes preserved
-pub(super) fn truncate(s: &str, width: usize) -> String {
+pub fn truncate(s: &str, width: usize) -> String {
     match display_width(s) <= width {
         true => s.to_string(),
         false => ::console::truncate_str(s, width, "").into_owned(),
@@ -85,7 +83,22 @@ pub(super) fn truncate(s: &str, width: usize) -> String {
 }
 
 /// Pad to `width` printable columns; a styled cell's escapes must not count toward it
-pub(super) fn pad(s: &str, width: usize) -> String {
+/// [`truncate`] with an ellipsis when it actually cuts.
+///
+/// - Below the ellipsis's own width, falls back to a hard cut (a bare `…` names nothing)
+/// - `cli`'s catalogue grew its own copy of this; one definition instead
+pub fn truncate_with(s: &str, width: usize, ellipsis: &str) -> String {
+    if display_width(s) <= width {
+        return s.to_string();
+    }
+    let e = display_width(ellipsis);
+    match width > e {
+        true => format!("{}{ellipsis}", truncate(s, width - e)),
+        false => truncate(s, width),
+    }
+}
+
+pub fn pad(s: &str, width: usize) -> String {
     format!("{s}{}", " ".repeat(width.saturating_sub(display_width(s))))
 }
 
@@ -107,13 +120,22 @@ pub(super) fn free_percent(free: &Resources, alloc: &Resources) -> u8 {
 /// Braille frames of `indicatif`'s default spinner
 pub(super) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// ASCII fallback. Four frames, not ten: a `|/-\` cycle reads as rotation, whereas
+/// stretching it to ten repeats frames and reads as a stutter
+pub(super) const SPINNER_FRAMES_ASCII: [&str; 4] = ["|", "/", "-", "\\"];
+
 /// Ms per spinner frame = sole animation cadence; `console`'s `FrameClock`
 /// gates redraw on the same step, repainting exactly when the frame advances
 pub const SPINNER_STEP_MS: u128 = 100;
 
-pub(super) fn spinner_glyph(elapsed: std::time::Duration) -> &'static str {
-    let idx = (elapsed.as_millis() / SPINNER_STEP_MS) as usize % SPINNER_FRAMES.len();
-    SPINNER_FRAMES[idx]
+/// Theme-aware: braille has no meaning on a terminal that cannot render it, and `{@spin}`
+/// promises a fallback like every other glyph cell
+pub(super) fn spinner_glyph(elapsed: std::time::Duration, theme: &Theme) -> &'static str {
+    let frames: &[&'static str] = match theme.chars.unicode {
+        true => &SPINNER_FRAMES,
+        false => &SPINNER_FRAMES_ASCII,
+    };
+    frames[(elapsed.as_millis() / SPINNER_STEP_MS) as usize % frames.len()]
 }
 
 /// Binding-dimension fullness = max(cpu, mem) fraction of `part` in `whole`.

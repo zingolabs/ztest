@@ -28,6 +28,7 @@ kube = { version = "0.99", default-features = false }
 console = "0.16.4"
 libc = "0.2"
 terminal_size = "0.4"
+ratatui = { version = "0.30.2", default-features = false, features = ["unstable-widget-ref"] }
 
 [package.metadata.release]
 tag = false

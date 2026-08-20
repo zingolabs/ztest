@@ -232,7 +232,8 @@ async fn create_seed_pvc(
         },
         "spec": {
             "accessModes": ["ReadWriteOnce"],
-            "resources": { "requests": { "storage": crate::cluster_config::seed_size() } },
+            "resources": { "requests": {
+                "storage": crate::cluster_config::seed_size_for(seed.uncompressed_bytes) } },
             "storageClassName": storage.class_name,
         }
     }))
@@ -749,6 +750,7 @@ mod tests {
             name: name.to_string(),
             oid: "a".repeat(64),
             size: 4096,
+            uncompressed_bytes: 0,
             payload,
             base_uri: crate::storage::r2::BASE_URI.to_string(),
             key_prefix: crate::storage::r2::KEY_PREFIX.to_string(),

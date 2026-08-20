@@ -1,34 +1,17 @@
-//! Themed gauge / axis vocabulary for every [`ui`](super) surface.
+//! Axis-label vocabulary. Gauges are the template `{k:N#}` cell (`text::meter` deleted)
 
-use owo_colors::OwoColorize as _;
+use ztest::api::{Unit, unit_value};
 
-use super::Theme;
-use ztest::api::compact;
-
-pub const METER_WIDTH: usize = 12;
-
-/// Bracketed percentage gauge `[██████░░░░░░]`
-pub fn meter(percent: u8, theme: &Theme) -> String {
-    let pct = percent.min(100) as usize;
-    let filled = pct * METER_WIDTH / 100;
-    format!(
-        "{}{}{}{}",
-        "[".style(theme.styles.dim),
-        theme.chars.bar_fill.repeat(filled).style(theme.styles.count),
-        theme.chars.bar_empty.repeat(METER_WIDTH - filled).style(theme.styles.dim),
-        "]".style(theme.styles.dim),
-    )
-}
-
-/// Evenly spaced y-axis labels, topmost first, right-aligned to `gutter`
-pub fn y_axis(max: f64, rows: usize, gutter: usize) -> Vec<String> {
+/// Evenly spaced y-axis labels in `unit`, topmost first, right-aligned to `gutter`.
+/// Sole axis-labelling path (`16.0` vs `16.0 GiB` in one gutter = two claims)
+pub fn y_axis(max: f64, rows: usize, unit: Unit, gutter: usize) -> Vec<String> {
     (0..rows)
         .map(|r| {
             let frac = match rows {
                 0 | 1 => 1.0,
                 _ => 1.0 - (r as f64 / (rows - 1) as f64),
             };
-            format!("{:>gutter$}", compact(max * frac))
+            format!("{:>gutter$}", unit_value(unit, max * frac))
         })
         .collect()
 }
@@ -37,18 +20,10 @@ pub fn y_axis(max: f64, rows: usize, gutter: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_meter_clamps_overflow() {
-        let theme = Theme::for_capabilities(false, true);
-        assert_eq!(meter(0, &theme), "[░░░░░░░░░░░░]");
-        assert_eq!(meter(100, &theme), "[████████████]");
-        assert_eq!(meter(250, &theme), "[████████████]", "clamps at 100%");
-    }
-
     /// Labels descend ceiling → zero, so the gutter reads top-down against the plot
     #[test]
     fn the_y_axis_runs_from_the_ceiling_down_to_zero() {
-        let axis = y_axis(100.0, 5, 6);
+        let axis = y_axis(100.0, 5, Unit::Count, 6);
         assert_eq!(axis.len(), 5);
         assert_eq!(axis[0].trim(), "100");
         assert_eq!(axis[4].trim(), "0");
@@ -57,7 +32,13 @@ mod tests {
 
     #[test]
     fn a_single_row_axis_is_labelled_with_the_ceiling() {
-        assert_eq!(y_axis(42.0, 1, 4)[0].trim(), "42");
-        assert!(y_axis(42.0, 0, 4).is_empty());
+        assert_eq!(y_axis(42.0, 1, Unit::Count, 4)[0].trim(), "42");
+        assert!(y_axis(42.0, 0, Unit::Count, 4).is_empty());
+    }
+
+    /// Unit-blind labelling was the duplicate this parameter deleted
+    #[test]
+    fn a_byte_axis_is_labelled_in_bytes() {
+        assert_eq!(y_axis(16.0 * 1024.0 * 1024.0 * 1024.0, 2, Unit::Bytes, 0)[0], "16.0 GiB");
     }
 }

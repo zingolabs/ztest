@@ -17,14 +17,15 @@ use std::time::Duration;
 use owo_colors::OwoColorize as _;
 
 use super::Theme;
-use super::boxes::{beside, boxed, dim, interior, row};
+use super::boxes::{beside, boxed, interior};
 use super::layout::{display_width, truncate};
 use super::plot::{self, Band, Palette, PlotOpts};
+use super::template::{Fields, Template};
 use super::text::y_axis;
 use ztest::api::Series;
 use ztest::api::Unit;
 use ztest::api::{Phase, SyncStatus};
-use ztest::api::{compact, format_elapsed, thousands, unit_value};
+use ztest::api::{format_elapsed, thousands, unit_value};
 
 /// Full terminal, capped. Past this the plots stop gaining resolution the eye can use
 /// and the panels drift apart on a wide monitor
@@ -37,6 +38,60 @@ const PLOT_ROWS: usize = 5;
 /// cpu over mem in one panel: two stacks, each shorter than a lone plot
 const HALF_ROWS: usize = 3;
 const GUTTER: usize = 6;
+
+// ──────────────────────────────── rows ────────────────────────────────
+
+/// Row shapes, one per thing the report draws.
+///
+/// - Ink that tracks the verdict is spliced (`{tone}`), never duplicated per verdict
+/// - Meter stays two text cells, not `{k:N#}` — the header bar carries no `[..]` frame
+mod row {
+    pub(super) fn ident(tone: &str) -> String {
+        format!("{{mark|{tone}}} {{id|bold}} {{profile|dim}}")
+    }
+
+    pub(super) fn status(tone: &str) -> String {
+        format!(
+            "  {{status|{tone}}} {{@dot|dim}} {{elapsed|bold}}\
+             [ {{@dot|dim}} {{phase|dim}}[ {{@dot|dim}} {{detail|dim}}]]\
+             [ {{@dot|dim}} {{segment|dim}}]"
+        )
+    }
+
+    pub(super) fn height(tone: &str) -> String {
+        format!(
+            "  {{reached|bold}} / {{target|dim}}[ {{@dot|dim}} {{standing|{tone}}}] \
+             {{@dot|dim}} {{fill}}{{empty|dim}} {{pct:>6|fraction}}[ {{@dot|dim}} {{behind|dim}}]"
+        )
+    }
+
+    pub(super) fn violation_detail() -> String {
+        format!("{}{{line|dim}}", super::VIOLATION_INDENT)
+    }
+
+    pub(super) const CHIP: &str = "{tag} {total|bold}";
+    pub(super) const CHIPS_AND_RATE: &str = "{chips}{summary:>*|bold}";
+    pub(super) const LABEL_VALUE: &str = "{label|dim}{value:>*|bold}";
+    pub(super) const EMPTY: &str = "{why|dim}";
+    pub(super) const VIOLATION: &str = "{@fail|fail} {probe|fail}";
+    pub(super) const COVERAGE_GAP: &str = "{@warn} coverage gap {@dot|dim} {gap}";
+    pub(super) const ERROR: &str = "{@fail|fail} {error}";
+    pub(super) const INDENTED: &str = "  {text|dim}";
+    pub(super) const TALLY: &str = "  [{ticks|bold} ticks {@dot|dim} ]\
+        {violations|bold} violations[ {@dot|dim} {ok|bold}/{total} probes ok]\
+        [ {@dot|dim} {dropped|bold} snapshots dropped]";
+}
+
+/// Bind and draw. Zero elapsed: a report prints once, so no template here holds a spinner
+fn draw(t: &Template, data: &Fields<'_>, width: usize, theme: &Theme) -> String {
+    t.render_str(data, width, Duration::ZERO, theme)
+}
+
+/// `label   value` row, value right-aligned to the box interior
+fn label_value(label: &str, value: &str, inner: usize, theme: &Theme) -> String {
+    let data = Fields::new().text("label", label).text("value", value);
+    draw(&Template::parse(row::LABEL_VALUE), &data, inner, theme)
+}
 
 /// One component's draw on the cluster, kubelet's reading. Split per component rather
 /// than stacked into a namespace total — which container grew is the only question
@@ -79,6 +134,17 @@ pub struct ReportView {
     pub resources: Vec<ComponentResources>,
     pub note: Option<String>,
     pub grafana: Option<String>,
+}
+
+/// [`render_sync_report`] without its panels: the same header + footer over the same
+/// view, for a surface that already scrolled the series past (`watch`'s settled verdict,
+/// which never queries the TSDB and would draw every panel as "no series recorded")
+pub fn render_sync_verdict(view: &ReportView, theme: &Theme, width: usize) -> String {
+    let width = width.min(MAX_WIDTH);
+    let mut out = String::with_capacity(1024);
+    header(&mut out, view, theme, width);
+    footer(&mut out, view, theme, width);
+    out
 }
 
 pub fn render_sync_report(view: &ReportView, theme: &Theme, width: usize) -> String {
@@ -131,63 +197,54 @@ pub fn render_sync_report(view: &ReportView, theme: &Theme, width: usize) -> Str
 
 /// Sole status → glyph + ink mapping (report header + `watch` headline both draw here).
 /// - Live / unresolved never red (no verdict = nothing to have failed)
-pub fn status_mark(status: SyncStatus, theme: &Theme) -> (&'static str, owo_colors::Style) {
+pub fn status_mark(status: SyncStatus, theme: &Theme) -> (&'static str, &'static str) {
+    let glyph = match status {
+        SyncStatus::Finished(v) if v.is_pass() => theme.chars.ok,
+        SyncStatus::Finished(_) => theme.chars.fail,
+        SyncStatus::Pending | SyncStatus::Running => theme.chars.dot,
+        SyncStatus::Unresolved => theme.chars.warn,
+    };
+    (glyph, status_tone(status))
+}
+
+/// Status ink as a template tone, paired with [`status_mark`]'s glyph
+pub(super) fn status_tone(status: SyncStatus) -> &'static str {
     match status {
-        SyncStatus::Finished(v) if v.is_pass() => (theme.chars.ok, theme.styles.pass),
-        SyncStatus::Finished(_) => (theme.chars.fail, theme.styles.fail),
-        SyncStatus::Pending | SyncStatus::Running => (theme.chars.dot, theme.styles.count),
-        SyncStatus::Unresolved => (theme.chars.warn, theme.styles.fail),
+        SyncStatus::Finished(v) if v.is_pass() => "pass",
+        SyncStatus::Finished(_) | SyncStatus::Unresolved => "fail",
+        SyncStatus::Pending | SyncStatus::Running => "bold",
     }
 }
 
 fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
-    let (mark, style) = status_mark(v.status, theme);
-    let dot = theme.chars.dot.style(theme.styles.dim);
+    let (mark, _) = status_mark(v.status, theme);
+    let tone = status_tone(v.status);
+    let live = v.status.is_live();
+    let mut line = |src: &str, data: &Fields<'_>| {
+        let _ =
+            writeln!(out, "{}", truncate(&draw(&Template::parse(src), data, width, theme), width));
+    };
 
-    let _ = writeln!(
-        out,
-        "{}",
-        truncate(
-            &format!(
-                "{} {} {}",
-                mark.style(style),
-                v.sync_id.style(theme.styles.count),
-                format!("[{}]", v.profile).style(theme.styles.dim),
-            ),
-            width,
-        )
-    );
-    // A run still going has no segment *yet*, which is not a finding — only a finished
-    // one that recorded none has something to answer for
-    let segment = match (v.segment.as_deref(), v.status.is_live()) {
-        (Some(s), _) => format!(" {dot} {}", s.style(theme.styles.dim)),
-        (None, true) => String::new(),
-        (None, false) => format!(" {dot} {}", "no segment recorded".style(theme.styles.dim)),
+    let ident = Fields::new()
+        .text("mark", mark)
+        .text("id", &*v.sync_id)
+        .text("profile", format!("[{}]", v.profile));
+    line(&row::ident(tone), &ident);
+
+    // - Phase = chain-walk position, live only (a finished run's last phase adds nothing)
+    // - A live run has no segment *yet*; only a finished one that recorded none answers for it
+    let segment = match (v.segment.as_deref(), live) {
+        (Some(s), _) => Some(s),
+        (None, true) => None,
+        (None, false) => Some("no segment recorded"),
     };
-    // Phase = chain-walk position, live only (a finished run's last phase adds nothing to
-    // its verdict)
-    let phase = match v.phase.filter(|_| v.status.is_live()) {
-        Some(p) => {
-            let label = match v.phase_detail.as_deref() {
-                Some(d) => format!("{p} {dot} {d}"),
-                None => p.to_string(),
-            };
-            format!(" {dot} {}", label.style(theme.styles.dim))
-        }
-        None => String::new(),
-    };
-    let _ = writeln!(
-        out,
-        "{}",
-        truncate(
-            &format!(
-                "  {} {dot} {}{phase}{segment}",
-                v.status.to_string().style(style),
-                format_elapsed(v.elapsed).style(theme.styles.count),
-            ),
-            width,
-        )
-    );
+    let status = Fields::new()
+        .text("status", v.status.to_string())
+        .text("elapsed", format_elapsed(v.elapsed))
+        .maybe_text("phase", v.phase.filter(|_| live).map(|p| p.to_string()))
+        .maybe_text("detail", v.phase_detail.as_deref())
+        .maybe_text("segment", segment);
+    line(&row::status(tone), &status);
 
     // Shortfall is the verdict for an index run, so it leads rather than sitting in a
     // metrics row: `short 1,001` is the finding, `99.8%` alone reads as success.
@@ -202,38 +259,26 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
         let filled = (pct / 100.0 * bar_w as f64).round() as usize;
         // Nothing is short until the run stops trying — a live sync gets its countdown
         // in the slot a finished one spends on the shortfall
-        let standing = match (v.status.is_live(), target.saturating_sub(reached)) {
-            (true, _) => match v.eta {
-                None => String::new(),
-                Some(eta) => {
-                    format!("eta {}", format_elapsed(eta)).style(theme.styles.count).to_string()
-                }
-            },
-            (_, 0) => "complete".style(theme.styles.pass).to_string(),
-            (_, n) => {
-                format!("short {}", thousands(u64::from(n))).style(theme.styles.fail).to_string()
-            }
-        };
-        let standing = match standing.is_empty() {
-            true => String::new(),
-            false => format!(" {dot} {standing}"),
+        let (standing, tone) = match (live, target.saturating_sub(reached)) {
+            (true, _) => (v.eta.map(|e| format!("eta {}", format_elapsed(e))), "bold"),
+            (_, 0) => (Some("complete".to_string()), "pass"),
+            (_, n) => (Some(format!("short {}", thousands(u64::from(n)))), "fail"),
         };
         // Chain moved on while the run worked: context, never a failure
-        let behind = match v.tip.map(|tip| tip.saturating_sub(target)) {
-            Some(0) | None => String::new(),
-            Some(n) => format!(" {dot} tip +{}", thousands(u64::from(n)))
-                .style(theme.styles.dim)
-                .to_string(),
-        };
-        let line = format!(
-            "  {} / {}{standing} {dot} {}{} {:>5.1}%{behind}",
-            thousands(u64::from(reached)).style(theme.styles.count),
-            thousands(u64::from(target)).style(theme.styles.dim),
-            theme.chars.bar_fill.repeat(filled),
-            theme.chars.bar_empty.repeat(bar_w.saturating_sub(filled)).style(theme.styles.dim),
-            pct,
-        );
-        let _ = writeln!(out, "{}", truncate(&line, width));
+        let behind = v
+            .tip
+            .map(|tip| tip.saturating_sub(target))
+            .filter(|n| *n > 0)
+            .map(|n| format!("tip +{}", thousands(u64::from(n))));
+        let height = Fields::new()
+            .text("reached", thousands(u64::from(reached)))
+            .text("target", thousands(u64::from(target)))
+            .maybe_text("standing", standing)
+            .text("fill", theme.chars.bar_fill.repeat(filled))
+            .text("empty", theme.chars.bar_empty.repeat(bar_w.saturating_sub(filled)))
+            .value("pct", pct / 100.0)
+            .maybe_text("behind", behind);
+        line(&row::height(tone), &height);
     }
     out.push('\n');
 }
@@ -261,16 +306,16 @@ fn pool_box(
     // → stack rather than truncate (a cut chip drops a pool's total with no sign of it)
     // Aggregate dropped for a lone pool: its chip already is that number
     let total = pools.iter().filter_map(Series::integral).sum::<f64>();
-    let summary = rate_text(pools, Some(total).filter(|_| pools.len() > 1));
+    let summary = summary_text(pools, (pools.len() > 1).then_some(total), theme);
     let chips = pool_chips(pools, theme, inner);
     match display_width(&chips) + display_width(&summary) < inner {
         true => {
-            let pad = inner - display_width(&chips) - display_width(&summary);
-            body.push(format!("{chips}{:pad$}{}", "", summary.style(theme.styles.count)));
+            let data = Fields::new().text("chips", chips).text("summary", summary);
+            body.push(draw(&Template::parse(row::CHIPS_AND_RATE), &data, inner, theme));
         }
         false => {
             body.push(chips);
-            body.push(row("", &summary, inner, theme));
+            body.push(label_value("", &summary, inner, theme));
         }
     }
     boxed(title, "", &body, width, theme)
@@ -285,18 +330,26 @@ fn pool_chips(pools: &[Series], theme: &Theme, budget: usize) -> String {
     let mut ranked: Vec<&Series> = pools.iter().collect();
     ranked.sort_by(|a, b| b.integral().unwrap_or(0.0).total_cmp(&a.integral().unwrap_or(0.0)));
 
+    // Tag pre-styled: a pool's ink is its band's, which no named tone can name
+    let chip = Template::parse(row::CHIP);
     let chips: Vec<String> = ranked
         .iter()
         .map(|s| {
-            let total = s.integral().map(compact).unwrap_or_else(|| "—".into());
-            format!(
-                "{} {}",
-                pool_tag(&s.label).style(palette.style_of(&s.label)),
-                total.style(theme.styles.count),
-            )
+            let data = Fields::new()
+                .text("tag", pool_tag(&s.label).style(palette.style_of(&s.label)).to_string())
+                .text(
+                    "total",
+                    s.integral()
+                        .map(|t| unit_value(Unit::Count, t))
+                        .unwrap_or_else(|| theme.chars.na.to_string()),
+                );
+            draw(&chip, &data, budget, theme)
         })
         .collect();
-    truncate(&chips.join(&format!(" {} ", "*".style(palette.separator()))), budget)
+    // Themed, not a literal `*`: the ASCII spelling happened to match, so a Unicode
+    // report drew a separator no other surface uses
+    let sep = format!(" {} ", theme.chars.dot.style(palette.separator()));
+    truncate(&chips.join(&sep), budget)
 }
 
 /// Sapling ships split (only the output side is checkable against the note-commitment trees,
@@ -345,7 +398,7 @@ fn rate_box(
         .map(|(label, plotted)| format!("{} {plotted}", label.style(theme.styles.dim)))
         .collect();
     let total = series.iter().filter_map(Series::integral).sum::<f64>();
-    body.push(row("", &rate_text(series, Some(total)), inner, theme));
+    body.push(label_value("", &summary_text(series, Some(total), theme), inner, theme));
     boxed(title, "", &body, width, theme)
 }
 
@@ -382,9 +435,9 @@ fn resources_box(r: &ComponentResources, theme: &Theme, width: usize) -> Vec<Str
                     .map(|(label, plotted)| format!("{} {plotted}", label.style(theme.styles.dim))),
             );
         }
-        body.push(row(name, &format!("peak {}", unit_value(unit, peak)), inner, theme));
+        body.push(label_value(name, &format!("peak {}", unit_value(unit, peak)), inner, theme));
     }
-    boxed(&format!("resources · {}", r.component), "", &body, width, theme)
+    boxed(&format!("resources {} {}", theme.chars.dot, r.component), "", &body, width, theme)
 }
 
 // ──────────────────────────────── footer ────────────────────────────────
@@ -418,55 +471,39 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 fn footer(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
-    let dot = theme.chars.dot.style(theme.styles.dim);
+    let mut line = |src: &str, data: &Fields<'_>| {
+        let _ = writeln!(out, "{}", draw(&Template::parse(src), data, width, theme));
+    };
+
     // Wrapped, never truncated: this is the one line stating *why* the run failed, and
     // a backend error carries its cause last (`{component} {op}: {source}`) — clipping
     // to the terminal keeps the half that names nothing
     for (probe, detail) in &v.violations {
-        let _ = writeln!(
-            out,
-            "{} {}",
-            theme.chars.fail.style(theme.styles.fail),
-            probe.style(theme.styles.fail),
-        );
-        for line in wrap(detail, width.saturating_sub(VIOLATION_INDENT.len())) {
-            let _ = writeln!(out, "{VIOLATION_INDENT}{}", line.style(theme.styles.dim));
+        line(row::VIOLATION, &Fields::new().text("probe", &**probe));
+        for text in wrap(detail, width.saturating_sub(VIOLATION_INDENT.len())) {
+            line(&row::violation_detail(), &Fields::new().text("line", text));
         }
     }
     for gap in &v.coverage_gaps {
-        let _ = writeln!(out, "{} coverage gap {dot} {}", theme.chars.warn, gap);
+        let data = Fields::new().text("gap", &**gap);
+        line(row::COVERAGE_GAP, &data);
     }
     if let Some(error) = &v.error {
-        let _ = writeln!(out, "{} {}", theme.chars.fail.style(theme.styles.fail), error);
+        line(row::ERROR, &Fields::new().text("error", &**error));
     }
-    if let Some(note) = &v.note {
-        let _ = writeln!(out, "  {}", note.style(theme.styles.dim));
+    for text in v.note.iter().chain(v.grafana.iter()) {
+        line(row::INDENTED, &Fields::new().text("text", &**text));
     }
-    let dropped = match v.dropped_snapshots {
-        0 => String::new(),
-        n => format!(" {dot} {} snapshots dropped", n.style(theme.styles.count)),
-    };
-    if let Some(url) = &v.grafana {
-        let _ = writeln!(out, "  {}", url.style(theme.styles.dim));
-    }
-    // Probe tally is the live counterpart of a verdict: before one exists, how many
-    // probes are holding is the only standing there is
-    let probes = match v.probes {
-        None => String::new(),
-        Some((ok, total)) => {
-            format!(" {dot} {}/{total} probes ok", ok.style(theme.styles.count))
-        }
-    };
-    // Pre-first-tick a `0 ticks` reads as a stalled run rather than one still starting
-    let ticks = match v.ticks {
-        0 => String::new(),
-        n => format!("{} ticks {dot} ", n.style(theme.styles.count)),
-    };
-    let _ = writeln!(
-        out,
-        "  {ticks}{} violations{probes}{dropped}",
-        v.violations.len().style(theme.styles.count),
-    );
+    // - Probe tally = the live counterpart of a verdict (before one exists, the only standing)
+    // - `0 ticks` reads as a stalled run rather than one still starting
+    // - Counts through `thousands`, never `Unit::Count` (`1.50k ticks` points at no tick)
+    let tally = Fields::new()
+        .text("violations", thousands(v.violations.len() as u64))
+        .maybe_text("ticks", Some(v.ticks).filter(|n| *n > 0).map(thousands))
+        .maybe_text("ok", v.probes.map(|(ok, _)| thousands(ok as u64)))
+        .maybe_text("total", v.probes.map(|(_, total)| thousands(total as u64)))
+        .maybe_text("dropped", Some(v.dropped_snapshots).filter(|n| *n > 0).map(thousands));
+    line(row::TALLY, &tally);
 }
 
 // ──────────────────────────────── helpers ────────────────────────────────
@@ -505,32 +542,33 @@ fn stacked(
     labels.into_iter().zip(plot::plot_stacked(&channels, &opts, &palette)).collect()
 }
 
-/// Axis labels top-down, right-aligned, plus the width they needed
+/// Axis labels top-down, right-aligned, plus the width they needed.
+/// Unitless caller = [`Unit::Count`] (bare magnitude, keeping [`y_axis`] the only path)
 fn axis(ceiling: f64, rows: usize, unit: Option<Unit>) -> (Vec<String>, usize) {
-    let raw: Vec<String> = match unit {
-        None => y_axis(ceiling, rows, 0),
-        Some(unit) => (0..rows)
-            .map(|r| {
-                let frac = match rows {
-                    0 | 1 => 1.0,
-                    _ => 1.0 - (r as f64 / (rows - 1) as f64),
-                };
-                unit_value(unit, ceiling * frac)
-            })
-            .collect(),
-    };
+    let raw = y_axis(ceiling, rows, unit.unwrap_or(Unit::Count), 0);
     let width = raw.iter().map(|l| display_width(l)).max().unwrap_or(0);
     (raw.into_iter().map(|l| format!("{:>width$}", l)).collect(), width)
 }
 
 /// `avg 44.3k/s · peak 88.0k/s · 78.3M total`. Unstyled — callers that pair it with
-/// pre-styled text lay it out themselves
-fn rate_text(series: &[Series], total: Option<f64>) -> String {
+/// pre-styled text lay it out themselves.
+///
+/// - avg/peak in the series' declared [`Unit`] (hardcoded `/s` mislabels a byte rate)
+/// - total = an [`integral`](Series::integral), i.e. a count → no `/s`
+fn summary_text(series: &[Series], total: Option<f64>, theme: &Theme) -> String {
+    let unit = series.first().map_or(Unit::Count, |s| s.unit);
     let mean: f64 = series.iter().filter_map(Series::mean).sum();
     let peak: f64 = series.iter().filter_map(Series::peak).sum();
-    let total =
-        total.filter(|t| *t > 0.0).map(|t| format!(" · {} total", compact(t))).unwrap_or_default();
-    format!("avg {}/s · peak {}/s{total}", compact(mean), compact(peak))
+    let total = total
+        .filter(|t| *t > 0.0)
+        .map(|t| format!(" {} {} total", theme.chars.dot, unit_value(Unit::Count, t)))
+        .unwrap_or_default();
+    format!(
+        "avg {} {} peak {}{total}",
+        unit_value(unit, mean),
+        theme.chars.dot,
+        unit_value(unit, peak)
+    )
 }
 
 /// Peak of the *sum*, not the sum of peaks: series do not peak together, and adding
@@ -546,7 +584,14 @@ fn stacked_peak(series: &[Series]) -> f64 {
 /// which is a fact about retention and the cluster, not about the run
 fn empty(theme: &Theme, title: &str, v: &ReportView, width: usize) -> Vec<String> {
     let why = v.note.as_deref().unwrap_or("no series recorded for this run");
-    boxed(title, "", &[dim(why, theme)], width, theme)
+    let data = Fields::new().text("why", why);
+    boxed(
+        title,
+        "",
+        &[draw(&Template::parse(row::EMPTY), &data, interior(width), theme)],
+        width,
+        theme,
+    )
 }
 
 #[cfg(test)]
@@ -683,6 +728,18 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("resources · zainod") && l.contains("resources · zebrad"))
         );
+    }
+
+    /// Verdict carries every header/footer reading of the full report, and no panel
+    #[test]
+    fn the_verdict_drops_the_panels_and_keeps_the_findings() {
+        let rendered = render_sync_verdict(&view(), &theme(), 120);
+        for kept in ["zaino-index-construction-c3115f50", "short 1,001", "2 violations"] {
+            assert!(rendered.contains(kept), "{kept} missing:\n{rendered}");
+        }
+        for dropped in ["ops/sec", "resources ·", "no series recorded"] {
+            assert!(!rendered.contains(dropped), "{dropped} drawn:\n{rendered}");
+        }
     }
 
     /// A stacked namespace total hides which container grew — the one question this
@@ -868,11 +925,16 @@ mod tests {
         }
     }
 
-    /// Printed once into scrollback, so nothing re-flows: no padding to reserve
+    /// Printed once into scrollback, so nothing re-flows: no padding to reserve.
+    ///
+    /// Regression: the separator was a literal `*` — the ASCII spelling of `dot` — so the
+    /// Unicode report drew a glyph no other surface uses, and the ASCII one looked correct
     #[test]
     fn a_chip_row_separates_pools_and_leads_with_the_largest() {
         let row = pool_chips(&view().shielded, &theme(), 60);
-        assert_eq!(row, "sap 53.4M * orc 24.9M * iro 0", "{row:?}");
+        assert_eq!(row, "sap 53.4M · orc 24.9M · iro 0", "{row:?}");
+        let ascii = pool_chips(&view().shielded, &Theme::for_capabilities(false, false), 60);
+        assert_eq!(ascii, "sap 53.4M * orc 24.9M * iro 0", "{ascii:?}");
     }
 
     /// Per-pool totals and the run's rates are the same reading; two lines wasted one
@@ -1018,6 +1080,30 @@ mod tests {
             )],
             ticks: 118,
             ..view()
+        }
+    }
+}
+
+#[cfg(test)]
+mod ascii {
+    use super::tests::{running, view};
+    use super::{Theme, render_sync_report, render_sync_verdict};
+
+    /// Both report surfaces, both fixtures, at the widths a piped report actually uses
+    #[test]
+    fn the_sync_report_falls_back_to_ascii() {
+        let ascii = Theme::for_capabilities(false, false);
+        for (name, v) in [("finished", view()), ("running", running())] {
+            for width in [80, 120] {
+                crate::testing::assert_ascii_clean(
+                    &format!("render_sync_report({name}, {width})"),
+                    &render_sync_report(&v, &ascii, width),
+                );
+                crate::testing::assert_ascii_clean(
+                    &format!("render_sync_verdict({name}, {width})"),
+                    &render_sync_verdict(&v, &ascii, width),
+                );
+            }
         }
     }
 }

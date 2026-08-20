@@ -161,6 +161,18 @@ pub fn cluster_allocatable<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Res
         .fold(Resources::ZERO, |acc, n| acc.saturating_add(&node_allocatable(n)))
 }
 
+/// Largest single schedulable node's allocatable.
+///
+/// - A pod is placed on one node, so the summed cluster figure promises capacity nothing
+///   can hold (4×4c never fits the 16c build pod)
+/// - Ceiling on any one pod ztest may create
+pub fn largest_node<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> Resources {
+    nodes
+        .into_iter()
+        .filter(|n| node_ready(n) && !node_cordoned(n))
+        .fold(Resources::ZERO, |acc, n| acc.max(&node_allocatable(n)))
+}
+
 /// Every node's allocatable, cordoned and not-ready included. Above
 /// [`cluster_allocatable`] by exactly what is currently out of service, so `ztest status`
 /// can show the gap instead of leaving a shrunken denominator unexplained

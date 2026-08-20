@@ -438,24 +438,12 @@ fn terminating<K: kube::Resource>(obj: &K, blocker: Option<String>) -> Option<Li
 /// on every delete, blocked or not, and "finalizers pending" would be a guess
 fn terminating_reason(age: Option<std::time::Duration>, blocker: Option<String>) -> String {
     let head = match age {
-        Some(age) => format!("terminating {}", fmt_age(age)),
+        Some(age) => format!("terminating {}", crate::fmt::format_age(age)),
         None => "delete accepted, draining".to_string(),
     };
     match blocker {
         Some(why) => format!("{head} · {why}"),
         None => head,
-    }
-}
-
-/// Whole units: an age in a listing is read, not measured
-fn fmt_age(d: std::time::Duration) -> String {
-    let s = d.as_secs();
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m{:02}s", s / 60, s % 60)
-    } else {
-        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
     }
 }
 
@@ -1124,15 +1112,6 @@ mod tests {
         let why = terminating(&pod_with(None, true), Some("finalizer: x".into()));
         assert!(matches!(why, Some(Liveness::Terminating(w)) if w.contains("finalizer: x")));
     }
-
-    #[test]
-    fn an_age_reads_in_whole_units() {
-        use std::time::Duration;
-        assert_eq!(fmt_age(Duration::from_secs(47)), "47s");
-        assert_eq!(fmt_age(Duration::from_secs(125)), "2m05s");
-        assert_eq!(fmt_age(Duration::from_secs(3 * 3600 + 7 * 60)), "3h07m");
-    }
-
     #[test]
     fn deletion_order_frees_capacity_before_the_reservation() {
         let mut kinds = vec![Kind::Reservation, Kind::TestEnv, Kind::RunPod];

@@ -8,7 +8,7 @@
 //! - `start` reuses `ztest run`'s on-cluster compile — same `#[ztest::sync_test]` body,
 //!   distinguished only by `ZTEST_SYNC_ID` (see [`ztest::sync::detached`])
 
-mod render;
+pub(crate) mod render;
 mod watch;
 
 mod perf;
@@ -34,6 +34,7 @@ use ztest::api::pipeline::profiles::{self, ProfileStub};
 use ztest::api::pipeline::remote_compile::{self, BakeRefs, RemoteCompileOutcome};
 use ztest::api::profiling::Placement;
 use ztest::api::resource::buildkit;
+use ztest::api::{column_width, format_elapsed, format_span, thousands};
 use ztest::sync::{
     KIND_LABEL_KEY, KIND_LABEL_VALUE, POD_NAME_ENV, POD_NAMESPACE_ENV, STOP_ANNOTATION,
     SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV, SyncReportMirror, SyncStatus, driver_pod_for,
@@ -41,8 +42,33 @@ use ztest::sync::{
     report_cm_namespace,
 };
 use ztest_ui::console::{Console, SceneFrame};
-use ztest_ui::{ComponentResources, ReportView, Theme, Transfers};
+use ztest_ui::template::{Fields, draw};
+use ztest_ui::{ComponentResources, ReportView, Theme, Transfers, pad};
 
+/// Row shapes for what `sync` prints itself; the run view proper draws through
+/// [`ztest_ui::render_sync_report`]
+mod row {
+    pub(super) const LIST_HEADER: &str = "  {id|dim} {ns|dim} {status|dim} {user|dim}";
+    /// `mark` arrives pre-styled from [`ztest_ui::status_mark`] — sole verdict→ink map,
+    /// shared with the run view
+    /// Verdict ink rides the template (a tone is not bindable data); glyph + tone both
+    /// come from `status_mark`, so they cannot disagree
+    pub(super) fn list(tone: &str) -> String {
+        format!("{{mark|{tone}}} {{id|bold}} {{ns|dim}} {{status}} {{user|dim}}")
+    }
+
+    pub(super) const HANDOFF: &str =
+        "{@ok|pass} sync {id|bold} started {@dot|dim} namespace {ns|dim}";
+    pub(super) const HANDOFF_CMD: &str = "  {@dot|dim} ztest sync {verb:<6} {id}";
+
+    pub(super) const SCAN_NOTE: &str = "ztest sync: {note|dim}";
+    /// Gutter = `ztest sync: `, so a blind spot hangs under the note it qualifies
+    pub(super) const SCAN_BLIND_SPOT: &str = "            {file|dim}: {reason|dim}";
+    pub(super) const ATTACH_INTACT: &str = "  {@dot|dim} {note}";
+}
+
+/// Bind and draw. No `*` cell and no spinner in any of these rows → zero width, zero
+/// elapsed
 /// Driver pod's sole container (named: a log request gates on the container's state,
 /// not the pod phase)
 const DRIVER_CONTAINER: &str = "sync";
@@ -262,17 +288,15 @@ fn preflight(name: &str) -> Result<Option<ProfileStub>, String> {
         Ok(found) => Ok(Some(found.clone())),
         Err(_) if scan.is_uncertain() => {
             let theme = Theme::detect();
-            eprintln!(
-                "ztest sync: {}",
-                theme.styles.dim.style(format!(
-                    "`{name}` not found in source, but the scan is incomplete — building anyway"
-                ))
+            let note = format!(
+                "`{name}` not found in source, but the scan is incomplete — building anyway"
             );
+            eprintln!("{}", draw(row::SCAN_NOTE, &Fields::new().text("note", note), &theme));
             for spot in &scan.blind_spots {
-                eprintln!(
-                    "            {}",
-                    theme.styles.dim.style(format!("{}: {}", spot.file.display(), spot.reason))
-                );
+                let f = Fields::new()
+                    .text("file", spot.file.display().to_string())
+                    .text("reason", &*spot.reason);
+                eprintln!("{}", draw(row::SCAN_BLIND_SPOT, &f, &theme));
             }
             Ok(None)
         }
@@ -552,8 +576,8 @@ async fn await_driver_running(client: &Client, sync_id: &str) -> Result<(), Stri
                 let since = *unscheduled_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() >= ps::PENDING_TIMEOUT {
                     return Err(format!(
-                        "sync driver pod was never scheduled onto a node within {:?}: {}",
-                        since.elapsed(),
+                        "sync driver pod was never scheduled onto a node within {}: {}",
+                        format_span(since.elapsed()),
                         ps::schedule_blocker(status)
                             .unwrap_or_else(|| "no PodScheduled condition".to_string()),
                     ));
@@ -583,7 +607,6 @@ async fn await_driver_running(client: &Client, sync_id: &str) -> Result<(), Stri
 ///   `start` reads as "didn't launch" and invites a re-run = a second footprint)
 /// - Failed *verdict* fails, as `ztest run` would (`--watch` = its foreground stand-in)
 async fn attach(theme: &Theme, sync_id: &str) -> Result<(), String> {
-    use owo_colors::OwoColorize as _;
     match watch::watch(sync_id).await {
         // Log ended with the driver gone: killed, evicted, or crashed pre-report. Silence
         // here would pass a pipeline on a sync that never reached a verdict.
@@ -596,10 +619,11 @@ async fn attach(theme: &Theme, sync_id: &str) -> Result<(), String> {
         Ok(watch::WatchEnd::Settled(_) | watch::WatchEnd::Detached) => Ok(()),
         Err(detail) => {
             eprintln!("ztest sync: attach to {sync_id} failed: {detail}");
-            eprintln!(
-                "  {} the sync is unaffected — re-attach with `ztest sync watch {sync_id}`",
-                theme.chars.dot.style(theme.styles.dim),
+            let f = Fields::new().text(
+                "note",
+                format!("the sync is unaffected — re-attach with `ztest sync watch {sync_id}`"),
             );
+            eprintln!("{}", draw(row::ATTACH_INTACT, &f, theme));
             Ok(())
         }
     }
@@ -842,18 +866,11 @@ async fn provision_components(
 /// Post-build handoff: themed summary of the started sync + its follow-up commands, onto
 /// clean stdout after the console tears down
 fn print_handoff(theme: &Theme, sync_id: &str, ns: &str) {
-    use owo_colors::OwoColorize as _;
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    println!(
-        "{} sync {} started {dot} namespace {}",
-        theme.chars.ok.style(theme.styles.pass),
-        sync_id.style(theme.styles.count),
-        ns.style(theme.styles.dim),
-    );
-    for (verb, rest) in
-        [("watch ", sync_id), ("status", sync_id), ("report", sync_id), ("stop  ", sync_id)]
-    {
-        println!("  {} ztest sync {verb} {rest}", theme.chars.dot.style(theme.styles.dim),);
+    let started = Fields::new().text("id", sync_id).text("ns", ns);
+    println!("{}", draw(row::HANDOFF, &started, theme));
+    for verb in ["watch", "status", "report", "stop"] {
+        let f = Fields::new().text("verb", verb).text("id", sync_id);
+        println!("{}", draw(row::HANDOFF_CMD, &f, theme));
     }
 }
 
@@ -1161,9 +1178,30 @@ async fn list(all_users: bool, json_out: bool) -> Result<(), String> {
         println!("no detached syncs{}", if all_users { "" } else { " (yours)" });
         return Ok(());
     }
-    println!("{:<28} {:<24} {:<12} {:<12}", "SYNC-ID", "NAMESPACE", "STATUS", "USER");
-    for (r, status) in &rows {
-        println!("{:<28} {:<24} {:<12} {:<12}", r.id, r.namespace, status.to_string(), r.user);
+    // Columns measured across the rows they hold: a fixed gutter either wastes the width
+    // a short id leaves or lets a long one shear the table
+    let theme = Theme::detect();
+    let statuses: Vec<String> = rows.iter().map(|(_, s)| s.to_string()).collect();
+    let id_col = column_width(rows.iter().map(|(r, _)| r.id.as_str()).chain(["SYNC-ID"]), 12, 40);
+    let ns_col =
+        column_width(rows.iter().map(|(r, _)| r.namespace.as_str()).chain(["NAMESPACE"]), 12, 36);
+    let status_col = column_width(statuses.iter().map(String::as_str).chain(["STATUS"]), 8, 16);
+
+    let head = Fields::new()
+        .text("id", pad("SYNC-ID", id_col))
+        .text("ns", pad("NAMESPACE", ns_col))
+        .text("status", pad("STATUS", status_col))
+        .text("user", "USER");
+    println!("{}", draw(row::LIST_HEADER, &head, &theme));
+    for ((r, status), text) in rows.iter().zip(&statuses) {
+        let (mark, tone) = ztest_ui::status_mark(*status, &theme);
+        let f = Fields::new()
+            .text("mark", mark)
+            .text("id", pad(&r.id, id_col))
+            .text("ns", pad(&r.namespace, ns_col))
+            .text("status", pad(text, status_col))
+            .text("user", &*r.user);
+        println!("{}", draw(&row::list(tone), &f, &theme));
     }
     Ok(())
 }
@@ -1180,7 +1218,7 @@ async fn status(id: &str, json_out: bool) -> Result<(), String> {
             return Ok(());
         }
         let view = build_report_view(&client, id, &ns, mirror_header(&report)).await;
-        print!("{}", ztest_ui::render_sync_report(&view, &Theme::detect(), terminal_width()));
+        print!("{}", ztest_ui::render_sync_report(&view, &Theme::detect(), render::width()));
         return Ok(());
     }
 
@@ -1213,7 +1251,7 @@ async fn status(id: &str, json_out: bool) -> Result<(), String> {
     }
 
     let view = build_report_view(&client, id, &ns, live_header(id, status, live.as_ref())).await;
-    print!("{}", ztest_ui::render_sync_report(&view, &Theme::detect(), terminal_width()));
+    print!("{}", ztest_ui::render_sync_report(&view, &Theme::detect(), render::width()));
     Ok(())
 }
 
@@ -1221,7 +1259,6 @@ async fn status(id: &str, json_out: bool) -> Result<(), String> {
 /// recover in. An `eventually` probe's countdown is what shows a stall coming, so it
 /// stands where a finished run puts the violation's detail
 fn unsatisfied_for(p: &ztest_ui::ProbeRow) -> String {
-    use ztest::api::fmt::format_elapsed;
     match (p.since_satisfied, p.window) {
         (Some(since), Some(window)) => {
             format!("unsatisfied {} of {}", format_elapsed(since), format_elapsed(window))
@@ -1238,7 +1275,12 @@ fn mirror_header(r: &SyncReportMirror) -> ReportView {
         sync_id: r.sync_id.clone(),
         profile: r.profile.clone(),
         status: SyncStatus::Finished(r.verdict),
-        segment: r.segment.as_ref().map(|s| s.describe()),
+        // Ops ride the segment they were counted over: the number compares between runs
+        // only across a shared span, which is the thing beside it
+        segment: r.segment.as_ref().map(|s| match s.work.total() {
+            Some(ops) => format!("{} ({} ops)", s.describe(), thousands(ops)),
+            None => s.describe(),
+        }),
         elapsed: r
             .segment
             .as_ref()
@@ -1302,69 +1344,13 @@ fn live_header(
     }
 }
 
-/// Columns for the status view. Non-TTY (pipe, CI log) reports nothing and takes the
-/// default → a redirected `status` stays diffable instead of stretching
-fn terminal_width() -> usize {
-    console::Term::stdout().size_checked().map_or(80, |(_, cols)| usize::from(cols))
-}
-
-/// One-line verdict headline shared by `status` and `watch`: mark, sync id + profile,
-/// tick/violation/gap counts, coloured like `ztest run`'s end-of-run banner
-fn report_headline(theme: &Theme, r: &SyncReportMirror) -> String {
-    use owo_colors::OwoColorize as _;
-    let status = SyncStatus::Finished(r.verdict);
-    let (mark, style) = ztest_ui::status_mark(status, theme);
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    let gaps = if r.coverage_gaps.is_empty() {
-        String::new()
-    } else {
-        format!(" {dot} {} gaps", r.coverage_gaps.len().style(theme.styles.count))
-    };
-    format!(
-        "{} {} {} {dot} {} {dot} {} ticks {dot} {} violations{gaps}",
-        mark.style(style),
-        r.sync_id.style(theme.styles.count),
-        format!("[{}]", r.profile).style(theme.styles.dim),
-        status.to_string().style(style),
-        r.ticks.style(theme.styles.count),
-        r.violations.len().style(theme.styles.count),
-    )
-}
-
-/// Detail block under the headline (`status` only): each violation, coverage gap, metric
-/// sample, and any fatal error
-fn print_report_details(theme: &Theme, r: &SyncReportMirror) {
-    use owo_colors::OwoColorize as _;
-    let dot = theme.chars.dot.style(theme.styles.dim);
-    // Span first (decides whether these numbers compare with any other run's — what a
-    // reader reaching for `perf --base` needs before they try)
-    if let Some(segment) = &r.segment {
-        let work = segment
-            .work
-            .total()
-            .map(|t| format!(" {dot} {} ops", ztest::api::fmt::thousands(t)))
-            .unwrap_or_default();
-        println!(
-            "  {} segment {dot} {}{work}",
-            theme.chars.dot.style(theme.styles.dim),
-            segment.describe().style(theme.styles.count),
-        );
-    }
-    for v in &r.violations {
-        let at = v.height.map(|h| format!(" @{h}")).unwrap_or_default();
-        println!(
-            "  {} {}{at} {dot} {}",
-            theme.chars.warn.style(theme.styles.fail),
-            v.probe.style(theme.styles.fail),
-            v.detail,
-        );
-    }
-    for g in &r.coverage_gaps {
-        println!("  {} coverage gap {dot} {g}", theme.chars.dot.style(theme.styles.dim),);
-    }
-    if let Some(e) = &r.error {
-        println!("  {} error {dot} {e}", theme.chars.warn.style(theme.styles.fail),);
-    }
+/// Settled verdict, `watch`-only: [`mirror_header`]'s [`ReportView`] drawn without the
+/// panels (a live tail already scrolled them past, and `watch` queries no TSDB).
+///
+/// - Same view + renderer as `status`, so the two cannot disagree on a glyph, an ink,
+///   a count or a violation's wording
+fn report_verdict(theme: &Theme, r: &SyncReportMirror) -> String {
+    ztest_ui::render_sync_verdict(&mirror_header(r), theme, render::width())
 }
 
 /// Fill a seeded header out from whatever Prometheus holds for the run's window.
@@ -1397,7 +1383,7 @@ async fn build_report_view(
 
     // One column per sample: asking for more only repeats points, and asking for
     // fewer throws away detail the plot has room to draw
-    let points = terminal_width().min(160) / 2;
+    let points = render::width().min(160) / 2;
     let rows: Vec<_> = ztest::backends::metrics_components().copied().collect();
 
     match ztest::api::metrics::history(client, ns, &rows, window, points).await {
@@ -1407,9 +1393,10 @@ async fn build_report_view(
             let too_short = ztest::api::metrics::SCRAPE_INTERVAL * 3;
             view.note = Some(if view.elapsed < too_short {
                 format!(
-                    "no metrics recorded: the run lasted {:?}, under the {:?} Prometheus \
+                    "no metrics recorded: the run lasted {}, under the {} Prometheus \
                      needs to sample it",
-                    view.elapsed, too_short,
+                    format_elapsed(view.elapsed),
+                    format_span(too_short),
                 )
             } else {
                 format!(
@@ -1512,7 +1499,7 @@ fn grafana_explore_url(ns: &str, window: (SystemTime, SystemTime)) -> Option<Str
     let (from, to) = (millis(window.0)?, millis(window.1)?);
     Some(format!(
         "grafana: kubectl -n {} port-forward svc/{} {}:{} \
-         → http://localhost:{}/explore?left=%7B%22range%22:%7B%22from%22:%22{from}%22,%22to%22:%22{to}%22%7D,\
+         then http://localhost:{}/explore?left=%7B%22range%22:%7B%22from%22:%22{from}%22,%22to%22:%22{to}%22%7D,\
          %22datasource%22:%22Prometheus%22,%22queries%22:%5B%7B%22expr%22:%22%7Bnamespace%3D%5C%22{ns}%5C%22%7D%22%7D%5D%7D",
         ztest::api::naming::OBS_NAMESPACE,
         ztest::api::naming::GRAFANA_SERVICE,
@@ -1571,7 +1558,7 @@ async fn stop(id: &str) -> Result<(), String> {
     api.patch(&driver_pod_for(id), &PatchParams::apply("ztest-sync"), &Patch::Merge(&patch))
         .await
         .map_err(|e| format!("signal stop: {e}"))?;
-    println!("sync {id}: stop signalled (graceful checkpoint → report → exit)");
+    println!("sync {id}: stop signalled (graceful checkpoint, report, then exit)");
     Ok(())
 }
 
@@ -1647,5 +1634,53 @@ fn off_cpu_fraction(raw: &str) -> Result<f64, String> {
     match (0.0..=1.0).contains(&p) {
         true => Ok(p),
         false => Err(format!("must be between 0 and 1, got {p}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain_theme() -> Theme {
+        Theme::for_capabilities(false, true)
+    }
+
+    /// Heading sits over the column it names, whatever width the rows measured to
+    #[test]
+    fn the_listing_columns_line_up_under_their_headings() {
+        let theme = plain_theme();
+        let head = Fields::new()
+            .text("id", pad("SYNC-ID", 12))
+            .text("ns", pad("NAMESPACE", 12))
+            .text("status", pad("STATUS", 8))
+            .text("user", "USER");
+        let head = draw(row::LIST_HEADER, &head, &theme);
+        let listed = Fields::new()
+            .text("mark", "*")
+            .text("id", pad("sync-aaa", 12))
+            .text("ns", pad("ztest-sync-a", 12))
+            .text("status", pad("passed", 8))
+            .text("user", "eli");
+        let listed = draw(&row::list("pass"), &listed, &theme);
+        assert_eq!(listed, "* sync-aaa     ztest-sync-a passed   eli");
+        assert_eq!(head.find("NAMESPACE"), listed.find("ztest-sync-a"));
+        assert_eq!(head.find("STATUS"), listed.find("passed"));
+        assert_eq!(head.find("USER"), listed.find("eli"));
+    }
+
+    /// A mistyped key binds nothing and renders blank, so the handoff is bound once here.
+    ///
+    /// Regression: the mark was bound as data with a literal `*` — the ascii spelling —
+    /// so the Unicode handoff drew an asterisk where every other surface drew a tick
+    #[test]
+    fn the_handoff_names_the_sync_and_its_follow_ups() {
+        let theme = plain_theme();
+        let started = Fields::new().text("id", "sync-aaa").text("ns", "ztest-sync-aaa");
+        assert_eq!(
+            draw(row::HANDOFF, &started, &theme),
+            "✓ sync sync-aaa started · namespace ztest-sync-aaa"
+        );
+        let cmd = Fields::new().text("verb", "stop").text("id", "sync-aaa");
+        assert_eq!(draw(row::HANDOFF_CMD, &cmd, &theme), "  · ztest sync stop   sync-aaa");
     }
 }

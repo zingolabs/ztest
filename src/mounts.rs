@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim};
+
+use crate::component::Disk;
 use kube::Client;
 use kube::api::{Api, ObjectMeta, PostParams};
 use serde_json::{Value, json};
@@ -44,7 +46,9 @@ pub async fn resolve_all(
     sentinel: &Sentinel,
     pod_prefix: &str,
     mounts: &[Mount],
+    disk: Option<Disk>,
 ) -> Result<ResolveOutput, EnvError> {
+    let (scratch_disk, archive_disk) = route_disk(mounts, disk);
     let mut out = ResolveOutput::default();
     for (i, m) in mounts.iter().enumerate() {
         let volume_name = format!("vol-{i}");
@@ -75,6 +79,7 @@ pub async fn resolve_all(
                     *handle,
                     &m.destination,
                     &mut out,
+                    archive_disk,
                 )
                 .await?
             }
@@ -88,12 +93,36 @@ pub async fn resolve_all(
                     *handle,
                     &m.destination,
                     &mut out,
+                    archive_disk,
                 )
                 .await?
             }
-            (MountKind::Scratch, MountSource::Empty) => {
-                resolve_scratch(&volume_name, &m.destination)
-            }
+            (MountKind::Scratch, MountSource::Empty) => match scratch_disk {
+                Some(disk) => {
+                    resolve_scratch_pvc(
+                        client,
+                        sentinel,
+                        pod_prefix,
+                        i,
+                        &volume_name,
+                        &m.destination,
+                        disk,
+                    )
+                    .await?
+                }
+                None => {
+                    assert_ne!(
+                        crate::qos::current(),
+                        crate::qos::QosClass::Sync,
+                        "sync profiles write for hours and must reserve their storage: \
+                         {pod_prefix} mounts a scratch at {} with no `.disk(..)`, so it \
+                         would take unbounded node ephemeral storage and be evicted under \
+                         DiskPressure mid-run",
+                        m.destination.display()
+                    );
+                    resolve_scratch(&volume_name, &m.destination)
+                }
+            },
             (MountKind::Shared, MountSource::SharedClaim { claim }) => {
                 resolve_shared(&volume_name, claim, &m.destination)
             }
@@ -162,17 +191,18 @@ async fn resolve_file(
     archive: crate::Artifact,
     destination: &Path,
     out: &mut ResolveOutput,
+    disk: Option<Disk>,
 ) -> Result<ResolvedMount, EnvError> {
     let seed = materialize::await_seed(client, archive).await?;
     let binding =
         seeds::bind_seed(client, sentinel, &seed, &format!("{pod_prefix}-{index}")).await?;
     let pvc_name = format!("{pod_prefix}-file-{index}");
-    create_pvc_from_snapshot(
+    create_pvc(
         client,
         sentinel,
         &pvc_name,
-        &binding.binding_snapshot,
-        &seed.restore_size,
+        Some(&binding.binding_snapshot),
+        &volume_size(disk, &seed.restore_size),
     )
     .await?;
     out.seed_bindings.push(binding);
@@ -191,6 +221,7 @@ async fn resolve_archive(
     archive: crate::Artifact,
     destination: &Path,
     out: &mut ResolveOutput,
+    disk: Option<Disk>,
 ) -> Result<ResolvedMount, EnvError> {
     // 1. Resolve the already-published seed preflight, read its CSI snapshot handle.
     //    Waits, never pulls (materialize.rs)
@@ -202,17 +233,61 @@ async fn resolve_archive(
 
     // 3. Fresh PVC in the test ns, dataSource = the bound snapshot
     let pvc_name = format!("{pod_prefix}-arch-{index}");
-    create_pvc_from_snapshot(
+    create_pvc(
         client,
         sentinel,
         &pvc_name,
-        &binding.binding_snapshot,
-        &seed.restore_size,
+        Some(&binding.binding_snapshot),
+        &volume_size(disk, &seed.restore_size),
     )
     .await?;
 
     out.seed_bindings.push(binding);
     Ok(dir_volume_from_pvc(volume_name, &pvc_name, destination))
+}
+
+/// `(scratch, archive)` halves of one `.disk(..)`.
+///
+/// - A component writes one volume: zaino writes its index into a scratch, zebra writes
+///   the chain into the archive clone it booted from
+/// - Scratch wins where both exist → a State indexer sizes its index and leaves the
+///   read-only chain clone at the seed's floor, rather than doubling the run's storage
+fn route_disk(mounts: &[Mount], disk: Option<Disk>) -> (Option<Disk>, Option<Disk>) {
+    match mounts.iter().any(|m| matches!(m.kind, MountKind::Scratch)) {
+        true => (disk, None),
+        false => (None, disk),
+    }
+}
+
+/// Scratch backed by a sized PVC instead of an `emptyDir`: a reservation the scheduler
+/// honours, rather than a share of whatever the node has left
+#[allow(clippy::too_many_arguments)]
+async fn resolve_scratch_pvc(
+    client: &Client,
+    sentinel: &Sentinel,
+    pod_prefix: &str,
+    index: usize,
+    volume_name: &str,
+    destination: &Path,
+    disk: Disk,
+) -> Result<ResolvedMount, EnvError> {
+    let pvc_name = format!("{pod_prefix}-scratch-{index}");
+    create_pvc(client, sentinel, &pvc_name, None, &disk.to_quantity()).await?;
+    Ok(dir_volume_from_pvc(volume_name, &pvc_name, destination))
+}
+
+/// Test's `.disk(..)` when it declares one and it clears the seed's floor, else the floor.
+///
+/// - A clone below its source's `restoreSize` is rejected by the CSI driver, so an
+///   undersized declaration is a stuck PVC rather than a smaller volume
+fn volume_size(disk: Option<Disk>, restore_size: &str) -> String {
+    let Some(disk) = disk else {
+        return restore_size.to_string();
+    };
+    match crate::qos::units::parse_mem_bytes_opt(restore_size) {
+        Some(floor) if floor >= disk.as_bytes() => restore_size.to_string(),
+        _ => disk.to_quantity(),
+    }
 }
 
 // ───────── helpers ─────────
@@ -253,33 +328,36 @@ async fn create_cm(
 /// `size` must be the source snapshot's own `restoreSize`, threaded from the
 /// [`SeedBinding`]'s seed: less is rejected `OutOfRange` and the pod sits `Pending` on an
 /// unbound claim until the test times out, naming neither the size nor the snapshot
-async fn create_pvc_from_snapshot(
+/// PVC in the test namespace, cloned from `snapshot_name` when given and empty otherwise.
+/// Reclaimed with the namespace, so no owner ref
+async fn create_pvc(
     client: &Client,
     sentinel: &Sentinel,
     name: &str,
-    snapshot_name: &str,
+    snapshot_name: Option<&str>,
     size: &str,
 ) -> Result<(), EnvError> {
     let storage = crate::storage_class::selected(client)
         .await
         .map_err(|e| EnvError::Manifest { reason: e })?;
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &sentinel.namespace);
+    let mut spec = json!({
+        "accessModes": ["ReadWriteOnce"],
+        "resources": { "requests": { "storage": size } },
+        "storageClassName": storage.class_name,
+    });
+    if let Some(snapshot_name) = snapshot_name {
+        spec["dataSource"] = json!({
+            "apiGroup": "snapshot.storage.k8s.io",
+            "kind": "VolumeSnapshot",
+            "name": snapshot_name,
+        });
+    }
     let pvc_json = json!({
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
-        "metadata": {
-            "name": name,
-        },
-        "spec": {
-            "accessModes": ["ReadWriteOnce"],
-            "dataSource": {
-                "apiGroup": "snapshot.storage.k8s.io",
-                "kind": "VolumeSnapshot",
-                "name": snapshot_name,
-            },
-            "resources": { "requests": { "storage": size } },
-            "storageClassName": storage.class_name,
-        }
+        "metadata": { "name": name },
+        "spec": spec,
     });
     let pvc: PersistentVolumeClaim = serde_json::from_value(pvc_json).expect("static manifest");
     api.create(&PostParams::default(), &pvc).await.map_err(env_err)?;
@@ -335,11 +413,12 @@ pub async fn create_shared_pvc(
     client: &Client,
     sentinel: &Sentinel,
     claim: &str,
+    disk: Disk,
 ) -> Result<(), EnvError> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &sentinel.namespace);
     let mut spec = json!({
         "accessModes": ["ReadWriteOnce"],
-        "resources": { "requests": { "storage": "2Gi" } },
+        "resources": { "requests": { "storage": disk.to_quantity() } },
     });
     if let Ok(sc) = std::env::var("ZAINO_SHARED_STORAGECLASS") {
         spec["storageClassName"] = json!(sc);
@@ -382,5 +461,57 @@ fn file_volume_from_pvc(volume_name: &str, pvc_name: &str, destination: &Path) -
             "subPath": "blob",
             "readOnly": true,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Disk, volume_size};
+
+    /// The declaration is a raise, never a cut: CSI rejects a clone below its source, so a
+    /// too-small `.disk(..)` would strand the PVC instead of shrinking the volume
+    #[test]
+    fn a_declared_disk_only_raises_the_seed_floor() {
+        assert_eq!(volume_size(Some(Disk::gib(400)), "297Gi"), "400Gi");
+        assert_eq!(volume_size(Some(Disk::gib(100)), "297Gi"), "297Gi");
+        assert_eq!(volume_size(None, "297Gi"), "297Gi");
+    }
+
+    /// An unparseable floor must not silently drop the declaration
+    #[test]
+    fn an_unreadable_floor_still_honours_the_declaration() {
+        assert_eq!(volume_size(Some(Disk::gib(400)), "not-a-quantity"), "400Gi");
+        assert_eq!(volume_size(None, "not-a-quantity"), "not-a-quantity");
+    }
+
+    /// Which volume a `.disk(..)` sizes is decided by the component's shape, and a State
+    /// indexer has both: sizing its read-only chain clone to the index's request would
+    /// double the run's storage for a volume nothing writes
+    #[test]
+    fn a_scratch_claims_the_declaration_ahead_of_an_archive_clone() {
+        let scratch = crate::Mount::scratch("/var/lib/zaino");
+        let archive = crate::Mount::archive(fixture_artifact(), "/var/lib/zaino/zebra-db");
+        let d = Disk::gib(400);
+
+        // State indexer: index sized, chain clone left on the seed's floor
+        assert_eq!(
+            super::route_disk(&[scratch.clone(), archive.clone()], Some(d)),
+            (Some(d), None)
+        );
+        // Validator on a snapshot: the clone is what it writes
+        assert_eq!(super::route_disk(&[archive], Some(d)), (None, Some(d)));
+        // Nothing declared, nothing routed
+        assert_eq!(super::route_disk(&[scratch], None), (None, None));
+    }
+
+    fn fixture_artifact() -> crate::Artifact {
+        crate::Artifact {
+            name: "chain.tar.zst",
+            oid: "a".repeat(64).leak(),
+            size: 1,
+            uncompressed_bytes: 2,
+            base_uri: crate::storage::r2::BASE_URI,
+            key_prefix: crate::storage::r2::KEY_PREFIX,
+        }
     }
 }

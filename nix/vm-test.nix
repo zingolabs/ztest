@@ -9,22 +9,35 @@ let
 
   day = 24 * 60 * 60;
 
-  diskSizeMb = 32768;
+  # Cold cargo build + an in-VM image build of zainod from source, both uncached (qcow2 is sparse)
+  diskSizeMb = 131072;
 
   zaino = {
     url = "https://github.com/zingolabs/zaino.git";
-    branch = "dev";
+    branch = "feat_migrate_tests";    # TODO:  Remove this once 1265 merges
     dest = "/root/zaino";
+    workspace = "/root/zaino/live-tests";
+    selector = "-E 'binary(validator_heights)'";  # single 4c/4GiB test
   };
 
-  # Probed by the wrapper: shell opens only once boot + clone have settled
+  cloneZaino = "git clone --depth 1 --branch ${zaino.branch} ${zaino.url} ${zaino.dest}";
+
+  # live-tests take `ztest = "0.1"` from the registry; every cargo run in the VM must reach
+  # THIS build instead — $CARGO_HOME/config.toml, so an interactive `ztest run` gets it too
+  ztestSrcDest = "/root/ztest";
+  stageZtest = lib.concatStringsSep " && " [
+    "cp -r ${ztest.src} ${ztestSrcDest}"
+    "chmod -R u+w ${ztestSrcDest}"
+    "mkdir -p /root/.cargo"
+    ''printf '[patch.crates-io]\nztest = { path = "%s" }\n' ${ztestSrcDest} > /root/.cargo/config.toml''
+  ];
+
   readyMarker = "/root/.vm-ready";
 
   node = runtime: {
     virtualisation = {
-      # kind node + control plane + pulled images; defaults (1G/1core/1G disk) fail
-      memorySize = 8192;
-      cores = 4;
+      memorySize = 16384;
+      cores = 8;
       diskSize = diskSizeMb;
 
       qemu.drives = lib.mkForce [
@@ -51,10 +64,24 @@ let
       pkgs.kind
       pkgs.kubectl
       pkgs.git
+
+      # Deps to build/run tests
+      pkgs.rustup
+      pkgs.cargo-nextest
+      pkgs.gcc # cc = rustc's linker driver, g++ = librocksdb-sys
+      pkgs.pkg-config
     ];
 
     environment.variables = {
       KUBECONFIG = "/root/.kube/config";
+
+      RUSTUP_HOME = "/root/.rustup";
+      CARGO_HOME = "/root/.cargo";
+      PROTOC = "${pkgs.protobuf}/bin/protoc";
+      LIBCLANG_PATH = "${pkgs.libclang.lib}/lib"; # librocksdb-sys bindgen
+      # openssl-sys reads both (headers in .dev, .so in .out) → no PKG_CONFIG_PATH juggling
+      OPENSSL_DIR = "${pkgs.openssl.dev}";
+      OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
     }
 
     # Auto-inject the KIND_EXPERIMENTAL_PROVIDER env for podman test vms
@@ -78,8 +105,29 @@ let
       name = "ztest-cluster-${runtime}";
       nodes.machine = node runtime;
       interactive.sshBackdoor.enable = true;
+      globalTimeout = 6 * 60 * 60; # default 1h kills the cold zaino + zainod-image builds
 
       testScript = ''
+        import re
+
+        ANSI = re.compile(r"\x1b\[[0-9;]*m")
+        # `N tests run: X passed[, Y failed][, Z sigkilled], S skipped` (engine/reporter.rs)
+        SUMMARY = re.compile(
+            r"tests? run: (\d+) passed(?:, (\d+) failed)?(?:, (\d+) sigkilled)?, (\d+) skipped"
+        )
+
+
+        def assert_run_green(out):
+            """passed >= 1 guards the vacuous pass: a bad selector or an all-skip run
+            reports `0 passed, 0 failed` and would otherwise read as success."""
+            plain = ANSI.sub("", out)
+            m = SUMMARY.search(plain)
+            assert m, f"no Summary line:\n{plain}"
+            passed, failed, sigkilled, skipped = (int(g or 0) for g in m.groups())
+            assert passed >= 1, f"nothing ran (skipped={skipped}) — selector or seed gate:\n{plain}"
+            assert failed == 0 and sigkilled == 0, plain
+
+
         start_all()
         machine.wait_for_unit("multi-user.target")
         machine.wait_for_unit("sockets.target")
@@ -121,6 +169,21 @@ let
             print(out)
             assert status == 0, out
             assert "cannot work here" not in out, out
+
+        with subtest("zaino's live-tests run green on the harness"):
+            machine.succeed("${cloneZaino}", timeout=900)
+            machine.succeed("""${stageZtest}""")
+
+            print(machine.succeed("cd ${zaino.dest} && rustup show active-toolchain", timeout=1800))
+
+            out = machine.succeed(
+                "cd ${zaino.workspace} && ztest run ${zaino.selector} 2>&1", timeout=5 * 3600
+            )
+            print(out)
+            assert_run_green(out)
+
+        with subtest("the run leaves no namespace behind"):
+            assert machine.succeed("kubectl get ns -l ztest.io/run-id -o name").strip() == ""
       '';
     };
 
@@ -146,11 +209,11 @@ let
         machine.wait_for_unit("multi-user.target")
         machine.wait_for_unit("sockets.target")
 
-        # clone zaino for ztest run validation
-        status, out = machine.execute("git clone --branch ${zaino.branch} ${zaino.url} ${zaino.dest}")
+        # ztest staged + patched in, so a hand-run in the shell picks up this build
+        status, out = machine.execute("""${cloneZaino} && ${stageZtest}""")
 
         if status != 0:
-            print(f"zaino clone failed (shell still opens):\n{out}")
+            print(f"zaino checkout failed (shell still opens):\n{out}")
 
         machine.succeed("touch ${readyMarker}")
 

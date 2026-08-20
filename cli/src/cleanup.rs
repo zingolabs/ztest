@@ -18,10 +18,14 @@
 
 use std::process::ExitCode;
 
-use clap::Parser;
-use owo_colors::OwoColorize as _;
+use std::time::Duration;
 
-use ztest::api::resource::reclaim::{self, Outcome, Scope};
+use clap::Parser;
+
+use ztest::api::fmt::thousands;
+use ztest::api::resource::reclaim::{self, Outcome, Scope, Target};
+use ztest_ui::Theme;
+use ztest_ui::template::{Fields, Template, draw};
 
 #[derive(Debug, Parser)]
 pub struct Args {
@@ -69,19 +73,20 @@ async fn run(args: &Args) -> Result<(), String> {
 
     // Banner names the cluster: "nothing to reclaim" reads the same whichever one
     // answered
-    let on = ztest::api::cluster_config::active_context()
-        .map(|c| format!(" on {c}"))
-        .unwrap_or_default();
+    let theme = Theme::detect();
+    let on = ztest::api::cluster_config::active_context();
     // Named target = explicit instruction → AllUsers (an id owned by another
     // account must still resolve)
     let scope = if args.all_users || !args.targets.is_empty() {
         if args.targets.is_empty() {
-            eprintln!("• reclaiming test resources for all users{on}");
+            let f = Fields::new().maybe_text("context", on.as_deref());
+            eprintln!("{}", draw(row::BANNER_ALL, &f, &theme));
         }
         Scope::AllUsers
     } else {
         let user = ztest::api::naming::current_user();
-        eprintln!("• reclaiming test resources owned by `{user}`{on}");
+        let f = Fields::new().text("user", user.as_str()).maybe_text("context", on.as_deref());
+        eprintln!("{}", draw(row::BANNER_USER, &f, &theme));
         Scope::User(user)
     };
 
@@ -95,85 +100,95 @@ async fn run(args: &Args) -> Result<(), String> {
         &ztest::api::profiling::Pyroscope,
     )
     .await;
-    report(&outcome, args.dry_run)
+    report(&outcome, args.dry_run, &theme)
 }
 
-fn report(outcome: &Outcome, dry_run: bool) -> Result<(), String> {
-    let verb = if dry_run { "would reap" } else { "reaped" };
-    let summary_verb = if dry_run { "would be reaped" } else { "reaped" };
+mod row {
+    pub(super) const BANNER_ALL: &str =
+        "{@bullet|dim} reclaiming test resources for all users[ on {context}]";
+    pub(super) const BANNER_USER: &str =
+        "{@bullet|dim} reclaiming test resources owned by `{user}`[ on {context}]";
 
+    /// One shape for every reap line; `[{name}  ]` drops on a tally row (no object named)
+    pub(super) fn reap(tone: &str) -> String {
+        format!("  {{mark|{tone}}} {{verb:<11}} {{kind:<16}} [{{name}}  ]{{detail|dim}}")
+    }
+
+    pub(super) const ERROR: &str = "  {mark|fail} {error}";
+    pub(super) const NOTHING: &str = "{mark|pass} nothing to reclaim";
+    pub(super) const NOTE: &str =
+        "  {note|dim} live resources were skipped; `--force` reclaims them too";
+    pub(super) const REAPED: &str =
+        "{mark|pass} {n|bold} resource(s) {verb} (cluster + shared infrastructure kept)";
+    pub(super) const REAPED_PARTIAL: &str =
+        "{mark|pass} {n|bold} {verb}, {terminating|bold} terminating (re-run to confirm)";
+    pub(super) const ERRORS: &str = "{n|bold} error(s); see `{fail} {ellipsis}` lines above";
+}
+
+/// Shared head of every named reap row; the caller adds the `detail` cell
+fn object<'a>(mark: &'a str, verb: &'a str, t: &'a Target) -> Fields<'a> {
+    Fields::new()
+        .text("mark", mark)
+        .text("verb", verb)
+        .text("kind", t.kind.noun())
+        .text("name", t.name.as_str())
+}
+
+fn paren(detail: &str) -> String {
+    format!("({detail})")
+}
+
+/// No `*` cell and no spinner in any of these rows → zero width, zero elapsed
+/// Glyph vocabulary, all four rows from the theme (`NO_COLOR` + the ASCII fallback).
+///
+/// - `ok` = reaped, `dot` = terminating (finalizer still holds it), `warn` = skipped
+///   because live, `fail` = error
+fn report(outcome: &Outcome, dry_run: bool, theme: &Theme) -> Result<(), String> {
+    let summary_verb = if dry_run { "would be reaped" } else { "reaped" };
+    let reaped = Template::parse(&row::reap("pass"));
+    let flagged = Template::parse(&row::reap("skip"));
+    let emit =
+        |t: &Template, f: Fields<'_>| eprintln!("{}", t.render_str(&f, 0, Duration::ZERO, theme));
+
+    let verb = if dry_run { "would reap" } else { "reaped" };
     for t in &outcome.deleted {
-        eprintln!(
-            "  {} {verb:<11} {:<16} {}  {}",
-            "✓".green(),
-            t.kind.noun(),
-            t.name,
-            format_args!("({})", t.detail).dimmed(),
-        );
+        emit(&reaped, object(theme.chars.ok, verb, t).text("detail", paren(&t.detail)));
     }
     // Not "reaped": the apiserver accepted the delete but a finalizer still holds the
     // object, and it stays listable (and re-deletable) until that clears
     for t in &outcome.terminating {
-        eprintln!(
-            "  {} {:<11} {:<16} {}  {}",
-            "⧗".yellow(),
-            "terminating",
-            t.kind.noun(),
-            t.name,
-            format_args!("({})", t.liveness.reason().unwrap_or(&t.detail)).dimmed(),
-        );
+        let why = t.liveness.reason().unwrap_or(&t.detail);
+        emit(&flagged, object(theme.chars.dot, "terminating", t).text("detail", paren(why)));
     }
     for t in &outcome.skipped {
         let Some(why) = t.liveness.reason() else {
             continue;
         };
-        eprintln!(
-            "  {} {:<11} {:<16} {}  {}",
-            "~".yellow(),
-            "skipped",
-            t.kind.noun(),
-            t.name,
-            format_args!("({why})").dimmed(),
-        );
+        emit(&flagged, object(theme.chars.warn, "skipped", t).text("detail", paren(why)));
     }
     for e in &outcome.errors {
-        eprintln!("  {} {e}", "✗".red());
+        let f = Fields::new().text("mark", theme.chars.fail).text("error", e.as_str());
+        eprintln!("{}", draw(row::ERROR, &f, theme));
     }
 
+    let tally = |verb: &str, kind: &str, detail: String| {
+        let f = Fields::new().text("mark", theme.chars.ok).text("verb", verb).text("kind", kind);
+        emit(&reaped, f.text("detail", detail));
+    };
     if !outcome.purged.is_empty() {
         let verb = if dry_run { "would purge" } else { "purged" };
-        eprintln!(
-            "  {} {verb:<11} {:<16} {}",
-            "✓".green(),
-            "metrics",
-            format_args!("({} series selector(s))", outcome.purged.len()).dimmed(),
-        );
+        tally(verb, "metrics", format!("({} series selector(s))", count(outcome.purged.len())));
     }
-
     if !outcome.reports.is_empty() {
         let verb = if dry_run { "would delete" } else { "deleted" };
-        eprintln!(
-            "  {} {verb:<11} {:<16} {}",
-            "✓".green(),
-            "sync reports",
-            format_args!("({} verdict(s))", outcome.reports.len()).dimmed(),
-        );
+        tally(verb, "sync reports", format!("({} verdict(s))", count(outcome.reports.len())));
     }
-
     // "retired", never "purged" (no delete API — Pyroscope's own cleaner does it, later)
     if !outcome.retired.is_empty() {
         let verb = if dry_run { "would retire" } else { "retired" };
-        eprintln!(
-            "  {} {verb:<11} {:<16} {}",
-            "✓".green(),
-            "profiles",
-            format_args!(
-                "({} tenant(s), deleted within {})",
-                outcome.retired.len(),
-                ztest::api::resource::PROFILE_RETIREMENT_LAG
-            )
-            .dimmed(),
-        );
+        let lag = ztest::api::resource::PROFILE_RETIREMENT_LAG;
+        let detail = format!("({} tenant(s), deleted within {lag})", count(outcome.retired.len()));
+        tally(verb, "profiles", detail);
     }
 
     if outcome.deleted.is_empty()
@@ -181,33 +196,78 @@ fn report(outcome: &Outcome, dry_run: bool) -> Result<(), String> {
         && outcome.skipped.is_empty()
         && outcome.errors.is_empty()
     {
-        eprintln!("✓ nothing to reclaim");
+        eprintln!("{}", draw(row::NOTHING, &Fields::new().text("mark", theme.chars.ok), theme));
         return Ok(());
     }
 
     if !outcome.skipped.is_empty() {
-        eprintln!(
-            "  {} live resources were skipped; `--force` reclaims them too",
-            "note:".dimmed()
-        );
+        eprintln!("{}", draw(row::NOTE, &Fields::new().text("note", "note:"), theme));
     }
 
     if outcome.errors.is_empty() {
+        let f = Fields::new()
+            .text("mark", theme.chars.ok)
+            .text("n", count(outcome.deleted.len()))
+            .text("verb", summary_verb);
         // Terminating counted apart: a finalizer clears on its own schedule, and only a
         // later pass can call it reaped (`--force` does not hurry one)
         if outcome.terminating.is_empty() {
-            eprintln!(
-                "✓ {} resource(s) {summary_verb} (cluster + shared infrastructure kept)",
-                outcome.deleted.len()
-            );
+            eprintln!("{}", draw(row::REAPED, &f, theme));
         } else {
-            eprintln!(
-                "✓ {} {summary_verb}, {} terminating (re-run to confirm)",
-                outcome.deleted.len(),
-                outcome.terminating.len(),
-            );
+            let f = f.text("terminating", count(outcome.terminating.len()));
+            eprintln!("{}", draw(row::REAPED_PARTIAL, &f, theme));
         }
         return Ok(());
     }
-    Err(format!("{} error(s); see `✗ …` lines above", outcome.errors.len()))
+    let f =
+        Fields::new().text("n", count(outcome.errors.len())).text("ellipsis", theme.chars.ellipsis);
+    Err(draw(row::ERRORS, &f, theme))
+}
+
+fn count(n: usize) -> String {
+    thousands(n as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One shape serves both: a tally row's collapsed `[{name}  ]` must leave `kind`'s
+    /// column and the detail gutter exactly where a named row puts them
+    #[test]
+    fn a_tally_row_lands_on_the_columns_a_named_row_sets() {
+        let theme = Theme::for_capabilities(false, true);
+        let t = Template::parse(&row::reap("pass"));
+        let named = Fields::new()
+            .text("mark", theme.chars.ok)
+            .text("verb", "reaped")
+            .text("kind", "test namespace")
+            .text("name", "ztest-abc")
+            .text("detail", "(2 pods)");
+        let tally = Fields::new()
+            .text("mark", theme.chars.ok)
+            .text("verb", "purged")
+            .text("kind", "metrics")
+            .text("detail", "(3 series selector(s))");
+        assert_eq!(
+            t.render_str(&named, 0, Duration::ZERO, &theme),
+            "  ✓ reaped      test namespace   ztest-abc  (2 pods)"
+        );
+        assert_eq!(
+            t.render_str(&tally, 0, Duration::ZERO, &theme),
+            "  ✓ purged      metrics          (3 series selector(s))"
+        );
+    }
+
+    /// `[ on {context}]` drops in-cluster, where there is no kube-context to name
+    #[test]
+    fn the_banner_names_a_context_only_when_there_is_one() {
+        let theme = Theme::for_capabilities(false, true);
+        let banner = |ctx: Option<&str>| {
+            let f = Fields::new().text("user", "eli").maybe_text("context", ctx);
+            draw(row::BANNER_USER, &f, &theme)
+        };
+        assert_eq!(banner(Some("zkn")), "• reclaiming test resources owned by `eli` on zkn");
+        assert_eq!(banner(None), "• reclaiming test resources owned by `eli`");
+    }
 }

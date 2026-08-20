@@ -33,7 +33,10 @@ pub use entry::{
     InitializeOpts, dev_image_refs, image_node_id, initialize, plan_runtime, reap_run, seed_node_id,
 };
 pub use graph::Graph;
+pub use impls::buildkit::probe_admission as probe_build_admission;
 pub use impls::observability::{PROFILE_RETIREMENT_LAG, RETENTION_DAYS};
-pub use impls::policy::{RUN_CLUSTER_ROLE, check_access as check_run_access};
+pub use impls::policy::{
+    RUN_CLUSTER_ROLE, check_access as check_run_access, role_is_current as run_role_is_current,
+};
 pub use provider::{NodeId, Provider};
 pub use state::{Lifetime, NodeState, Readiness, ResourceError};

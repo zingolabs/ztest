@@ -202,6 +202,8 @@ pub struct SeedDecl {
     pub name: &'static str,
     pub oid: &'static str,
     pub size: u64,
+    /// Extracted; sizes the seed PVC. 0 = unmeasured (sidecar manifests carry identity only)
+    pub uncompressed_bytes: u64,
     pub payload: SeedPayload,
     pub base_uri: &'static str,
     pub key_prefix: &'static str,
@@ -214,6 +216,8 @@ pub struct SeedEntry {
     pub name: String,
     pub oid: String,
     pub size: u64,
+    #[serde(default)]
+    pub uncompressed_bytes: u64,
     pub payload: SeedPayload,
     pub base_uri: String,
     pub key_prefix: String,
@@ -232,6 +236,7 @@ impl From<&SeedDecl> for SeedEntry {
             name: d.name.to_string(),
             oid: d.oid.to_string(),
             size: d.size,
+            uncompressed_bytes: d.uncompressed_bytes,
             payload: d.payload,
             base_uri: d.base_uri.to_string(),
             key_prefix: d.key_prefix.to_string(),
@@ -602,6 +607,7 @@ mod tests {
             name: "data.tar.zst",
             oid: "d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00",
             size: 4096,
+            uncompressed_bytes: 0,
             payload: SeedPayload::Archive,
             base_uri: crate::storage::r2::BASE_URI,
             key_prefix: crate::storage::r2::KEY_PREFIX,

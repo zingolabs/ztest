@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use futures::{AsyncBufReadExt as _, StreamExt as _};
 use k8s_openapi::api::core::v1::{ContainerState, Pod};
 use kube::api::{Api, ListParams, LogParams};
-use owo_colors::OwoColorize as _;
 
+use ztest::api::fmt::thousands;
 use ztest::api::metrics::{PodExporter, Poller, Sample};
 use ztest::api::naming::RUN_NAMESPACE;
 use ztest::sync::{
@@ -21,12 +21,13 @@ use ztest::sync::{
     plot_channels, read_report,
 };
 use ztest_ui::console::{Console, SceneFrame};
+use ztest_ui::template::{Fields, draw};
 use ztest_ui::{
     ProbeRow, SetupStep, SyncVitals, SyncWatchState, Theme, render_sync_load,
     render_sync_watch_panel, render_sync_work,
 };
 
-use super::{DRIVER_CONTAINER, driver_profile, print_report_details, report_headline, row_of};
+use super::{DRIVER_CONTAINER, driver_profile, report_verdict, row_of};
 
 /// Driver-pod address: run-namespace API handle + pod name.
 ///
@@ -190,8 +191,7 @@ async fn linear(
 async fn settled(client: &kube::Client, id: &str, theme: &Theme) -> Result<WatchEnd, String> {
     match read_report(client, id).await? {
         Some(report) => {
-            println!("{}", report_headline(theme, &report));
-            print_report_details(theme, &report);
+            print!("{}", report_verdict(theme, &report));
             Ok(WatchEnd::Settled(SyncStatus::Finished(report.verdict)))
         }
         None => {
@@ -515,12 +515,8 @@ async fn next_line(stream: &mut Option<LineStream>) -> Option<std::io::Result<St
 
 /// Tag a line with the pod it came from, so a merged stream stays attributable.
 fn prefixed(source: &str, line: &str, theme: &Theme) -> String {
-    format!(
-        "{:>8} {} {}\n",
-        source.style(theme.styles.dim),
-        theme.chars.vbar.style(theme.styles.dim),
-        line
-    )
+    let f = Fields::new().text("source", source).text("stem", theme.chars.vbar).text("line", line);
+    format!("{}\n", draw(tmpl::SOURCE, &f, theme))
 }
 
 /// Linear follow-tail of the driver log (non-TTY, or console won't start). No
@@ -580,6 +576,25 @@ const STATUS_TAIL_LINES: i64 = 400;
 
 // ─────────────────────────── event folding ────────────────────────────
 
+/// Scrollback vocabulary, matching the pinned panel's row templates (a piped watch and a
+/// TTY one report the same figures the same way)
+mod tmpl {
+    pub(super) const SOURCE: &str = "{source:>8|dim} {stem|dim} {line}";
+    pub(super) const SETUP: &str = "setup {@dot|dim} {subject} {@dot|dim} {detail}";
+    pub(super) const STARTED: &str =
+        "sync engine started {@dot|dim} {probes|bold} probes {@dot|dim} {tick|millis} tick";
+    pub(super) const TICK: &str = concat!(
+        "tick {seq|bold} {@dot|dim} height {height|bold}[ / {target|dim}]",
+        " {@dot|dim} {pct|fraction} {@dot|dim} {phase}",
+    );
+    pub(super) const VIOLATION: &str = "{@fail|fail} {probe|fail}[ at {height|dim}]: {detail}";
+    pub(super) const FINISHED: &str = concat!(
+        "sync finished {@dot|dim} {verdict} {@dot|dim} {ticks|bold} ticks",
+        " {@dot|dim} {violations|bold} violations {@dot|dim} {gaps|bold} coverage gaps",
+    );
+}
+
+/// Scrollback lines flow, never column-align → no `*` cell to size
 /// Folds the driver's event stream into the panel's view model, holding the
 /// derived quantities (scan rate, ETA) no single event carries.
 pub(super) struct Feed {
@@ -739,7 +754,10 @@ impl Feed {
                 });
                 // Panel-only here: the driver's own `provisioning component` lines
                 // already reach scrollback, so ztest lines would double every step
-                verbose.then(|| format!("setup · {subject} · {detail}"))
+                verbose.then(|| {
+                    let f = Fields::new().text("subject", subject).text("detail", detail.clone());
+                    draw(tmpl::SETUP, &f, theme)
+                })
             }
             SyncEvent::Started { profile, sync_id, tick_ms, probes } => {
                 let tick = Duration::from_millis(*tick_ms);
@@ -753,7 +771,10 @@ impl Feed {
                     self.state.profile = profile.clone();
                     self.state.sync_id = sync_id.clone();
                 }
-                Some(format!("sync engine started · {probes} probes · {}s tick", tick_ms / 1000))
+                let f = Fields::new()
+                    .text("probes", thousands(*probes as u64))
+                    .value("tick", *tick_ms as f64);
+                Some(draw(tmpl::STARTED, &f, theme))
             }
             SyncEvent::Tick(t) => {
                 // Engine state; no exporter publishes it, so every path needs it here
@@ -770,11 +791,13 @@ impl Feed {
                     self.state.vitals = self.vitals_of(&self.ticked, elapsed);
                 }
                 verbose.then(|| {
-                    let of = t.target.map(|t| format!("/{t}")).unwrap_or_default();
-                    format!(
-                        "tick {} · height {}{of} · {:.1}% · {}",
-                        t.seq, t.height, t.pct, t.phase
-                    )
+                    let f = Fields::new()
+                        .text("seq", thousands(t.seq))
+                        .text("height", thousands(u64::from(t.height)))
+                        .maybe_text("target", t.target.map(|h| thousands(u64::from(h))))
+                        .value("pct", f64::from(t.pct) / 100.0)
+                        .text("phase", t.phase.to_string());
+                    draw(tmpl::TICK, &f, theme)
                 })
             }
             // Replaced wholesale, never merged: the driver owns the bucketing, and a
@@ -801,17 +824,20 @@ impl Feed {
             }
             SyncEvent::Violation { probe, height, detail } => {
                 self.state.violations += 1;
-                let at = height.map(|h| format!(" at {h}")).unwrap_or_default();
-                Some(format!(
-                    "{} {}{at}: {detail}",
-                    theme.chars.fail.style(theme.styles.fail),
-                    probe.style(theme.styles.fail),
-                ))
+                let f = Fields::new()
+                    .text("probe", probe.clone())
+                    .maybe_text("height", height.map(|h| thousands(u64::from(h))))
+                    .text("detail", detail.clone());
+                Some(draw(tmpl::VIOLATION, &f, theme))
             }
-            SyncEvent::Finished { verdict, violations, coverage_gaps, ticks } => Some(format!(
-                "sync finished · {verdict} · {ticks} ticks · {violations} violation(s) · \
-                 {coverage_gaps} coverage gap(s)"
-            )),
+            SyncEvent::Finished { verdict, violations, coverage_gaps, ticks } => {
+                let f = Fields::new()
+                    .text("verdict", verdict.to_string())
+                    .text("ticks", thousands(*ticks))
+                    .text("violations", thousands(*violations as u64))
+                    .text("gaps", thousands(*coverage_gaps as u64));
+                Some(draw(tmpl::FINISHED, &f, theme))
+            }
             SyncEvent::Unknown => None,
         }
     }

@@ -15,6 +15,7 @@
 //! - Materialization (first-use upload) lives in `materialize`; this file resolves
 //!   against an already-published seed
 
+use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, PostParams};
 use serde_json::{Value, json};
@@ -93,12 +94,13 @@ pub async fn read_seed_handle(
         })?
         .to_string();
 
-    // As the driver reports it to a restoring clone. Fallback = the configured seed
-    // size, which is what the seed PVC was requested at (covers drivers omitting it)
-    let restore_size = snap.data["status"]["restoreSize"]
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_else(crate::cluster_config::seed_size);
+    // As the driver reports it to a restoring clone. Fallback = what the seed PVC was
+    // actually requested at, read back rather than recomputed (sizing is per-artifact now,
+    // so a recomputed default would be the wrong number for every measured rung)
+    let restore_size = match snap.data["status"]["restoreSize"].as_str() {
+        Some(size) => size.to_string(),
+        None => requested_size(client, &pvc_name).await,
+    };
 
     let handle = SeedHandle {
         sha8: sha8.to_string(),
@@ -118,6 +120,19 @@ pub async fn read_seed_handle(
         "resolved seed handle"
     );
     Ok(handle)
+}
+
+/// Seed PVC's own `spec.resources.requests.storage`; the configured default if it cannot
+/// be read (a clone sized below its source is rejected by the CSI driver, not silently
+/// truncated, so a wrong guess here fails loudly)
+async fn requested_size(client: &Client, pvc_name: &str) -> String {
+    let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
+    api.get_opt(pvc_name)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|pvc| pvc.spec?.resources?.requests?.get("storage").map(|q| q.0.clone()))
+        .unwrap_or_else(|| crate::cluster_config::seed_size_for(0))
 }
 
 /// Bind a published seed into a test namespace → the `dataSource` for the test's PVC.
