@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::core::v1::{Container, PersistentVolumeClaim, PodSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-use super::{ANNOTATION_IO_BPS, ANNOTATION_IO_IOPS, Resources};
+use super::{ANNOTATION_DISK_BPS, ANNOTATION_DISK_BYTES, ANNOTATION_DISK_IOPS, Resources};
 
 /// k8s CPU quantity → millicores. `"500m"`/`"2"`/`"1.5"`/`"2500000n"` (rounds to nearest).
 /// Unrecognized → 0, which under-counts (unsafe direction — leave no real unit unhandled)
@@ -88,7 +88,7 @@ fn pod_effective(pod: &PodSpec, per_container: impl Fn(&Container) -> Resources)
 }
 
 /// Per-pod reservation floor, later `max`'d with usage (bounds a bursting co-tenant).
-/// CPU+memory only, disk I/O rides the PVC ([`pvc_io_reservation`])
+/// CPU+memory only, I/O + capacity ride the PVC ([`pvc_reservation`])
 pub fn pod_effective_request(pod: &PodSpec) -> Resources {
     pod_effective(pod, container_requests)
 }
@@ -99,15 +99,34 @@ pub fn pod_effective_limit(pod: &PodSpec) -> Resources {
     pod_effective(pod, container_limits)
 }
 
-/// From [`ANNOTATION_IO_BPS`]/[`ANNOTATION_IO_IOPS`], CPU/memory always zero.
-/// Neither annotation = nothing reserved (uncapped volume, unbounded by the probe)
-pub fn pvc_io_reservation(pvc: &PersistentVolumeClaim) -> Resources {
-    let Some(a) = pvc.metadata.annotations.as_ref() else {
-        return Resources::ZERO;
-    };
-    let io_bps = a.get(ANNOTATION_IO_BPS).map(|s| parse_mem_bytes(s)).unwrap_or(0);
-    let io_iops = a.get(ANNOTATION_IO_IOPS).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
-    Resources::new(0, 0, io_bps, io_iops)
+/// A volume's whole contribution to the reserve: I/O from
+/// [`ANNOTATION_DISK_BPS`]/[`ANNOTATION_DISK_IOPS`], capacity from [`ANNOTATION_DISK_BYTES`]
+/// falling back to `spec.resources.requests.storage`. CPU/memory always zero.
+///
+/// - Capacity fallback is what makes the dimension cluster-wide on day one (every PVC
+///   already declares a size; annotating is only for a reserve above the provisioned one)
+/// - No I/O annotation = nothing reserved there (uncapped volume, unbounded by the probe)
+pub fn pvc_reservation(pvc: &PersistentVolumeClaim) -> Resources {
+    let annotations = pvc.metadata.annotations.as_ref();
+    let annotated = |k: &str| annotations.and_then(|a| a.get(k));
+    let disk_bps = annotated(ANNOTATION_DISK_BPS).map(|s| parse_mem_bytes(s)).unwrap_or(0);
+    let disk_iops =
+        annotated(ANNOTATION_DISK_IOPS).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+    let disk = annotated(ANNOTATION_DISK_BYTES)
+        .map(|s| parse_mem_bytes(s))
+        .unwrap_or_else(|| pvc_requested_storage(pvc));
+    Resources::new(0, 0, disk_bps, disk_iops).with_disk(disk)
+}
+
+/// `spec.resources.requests.storage` → bytes; absent/unparseable → 0
+fn pvc_requested_storage(pvc: &PersistentVolumeClaim) -> u64 {
+    pvc.spec
+        .as_ref()
+        .and_then(|s| s.resources.as_ref())
+        .and_then(|r| r.requests.as_ref())
+        .and_then(|r| r.get("storage"))
+        .map(|q| parse_mem_bytes(&q.0))
+        .unwrap_or(0)
 }
 
 /// Still holding capacity: anything not settled into `Succeeded`/`Failed`.
@@ -259,11 +278,28 @@ mod tests {
         // Disk I/O declared on the PVC, not the pod → summed separately
         let p = pod(vec![burstable("8", "4Gi", "24", "16Gi")], vec![]);
         let fp = pod_effective_request(&p);
-        assert_eq!(fp.io_bps, 0);
-        assert_eq!(fp.io_iops, 0);
+        assert_eq!(fp.disk_bps, 0);
+        assert_eq!(fp.disk_iops, 0);
     }
 
-    // I/O reservation = a property of the PVC
+    // Volume reservation = a property of the PVC
+
+    /// [`pvc`] plus a provisioned `requests.storage`, the capacity fallback's input
+    fn pvc_sized(annotations: &[(&str, &str)], storage: &str) -> PersistentVolumeClaim {
+        use k8s_openapi::api::core::v1::{PersistentVolumeClaimSpec, VolumeResourceRequirements};
+        let mut p = pvc(annotations);
+        p.spec = Some(PersistentVolumeClaimSpec {
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(BTreeMap::from([(
+                    "storage".to_string(),
+                    Quantity(storage.to_string()),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        p
+    }
 
     fn pvc(annotations: &[(&str, &str)]) -> PersistentVolumeClaim {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -279,23 +315,37 @@ mod tests {
     }
 
     #[test]
-    fn pvc_io_reservation_reads_the_storage_request_annotations() {
-        let p = pvc(&[(ANNOTATION_IO_BPS, "100Mi"), (ANNOTATION_IO_IOPS, "5000")]);
-        let fp = pvc_io_reservation(&p);
-        assert_eq!(fp.io_bps, 100 * crate::qos::MIB);
-        assert_eq!(fp.io_iops, 5_000);
+    fn pvc_reservation_reads_the_storage_request_annotations() {
+        let p = pvc(&[(ANNOTATION_DISK_BPS, "100Mi"), (ANNOTATION_DISK_IOPS, "5000")]);
+        let fp = pvc_reservation(&p);
+        assert_eq!(fp.disk_bps, 100 * crate::qos::MIB);
+        assert_eq!(fp.disk_iops, 5_000);
         // Never CPU/memory (those come from the pod)
         assert_eq!(fp.cpu_milli, 0);
         assert_eq!(fp.mem_bytes, 0);
     }
 
+    /// Every PVC declares a size, so capacity is counted without anyone opting in — the
+    /// annotation is only for a reserve above what was provisioned
     #[test]
-    fn pvc_io_reservation_is_zero_for_an_uncapped_volume() {
+    fn pvc_capacity_falls_back_to_the_provisioned_request() {
+        assert_eq!(pvc_reservation(&pvc_sized(&[], "400Gi")).disk_bytes, 400 * crate::qos::GIB);
+
+        let overridden = pvc_sized(&[(ANNOTATION_DISK_BYTES, "1Ti")], "400Gi");
+        assert_eq!(
+            pvc_reservation(&overridden).disk_bytes,
+            1024 * crate::qos::GIB,
+            "annotation is the reserve; the request is only what was provisioned"
+        );
+    }
+
+    #[test]
+    fn pvc_reservation_is_zero_for_an_uncapped_volume() {
         // No annotation → no reservation (uncapped volume; why co-tenants must be capped)
-        assert_eq!(pvc_io_reservation(&pvc(&[])), Resources::ZERO);
+        assert_eq!(pvc_reservation(&pvc(&[])), Resources::ZERO);
         // Partial annotation still yields the dimension it declares
-        let bps_only = pvc(&[(ANNOTATION_IO_BPS, "50Mi")]);
-        assert_eq!(pvc_io_reservation(&bps_only).io_bps, 50 * crate::qos::MIB);
-        assert_eq!(pvc_io_reservation(&bps_only).io_iops, 0);
+        let bps_only = pvc(&[(ANNOTATION_DISK_BPS, "50Mi")]);
+        assert_eq!(pvc_reservation(&bps_only).disk_bps, 50 * crate::qos::MIB);
+        assert_eq!(pvc_reservation(&bps_only).disk_iops, 0);
     }
 }

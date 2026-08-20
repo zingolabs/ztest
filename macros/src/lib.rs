@@ -678,7 +678,7 @@ fn test_dep_submit(
 ///   2. a `::ztest::macro_support::__enter(class)` first statement so the runtime can
 ///      read the tier in `TestEnv::build()` (the in-process bridge).
 ///
-/// One optional argument, `footprint = "15c/29Gi"`: replaces this test's component
+/// One optional argument, `footprint = "15c/29Gi[/400Gi]"`: replaces this test's component
 /// reserve only (tier still supplies priority/pool/hard cap). Omitted → tier default.
 #[proc_macro_attribute]
 pub fn basic(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -709,31 +709,18 @@ pub fn sync(attr: TokenStream, item: TokenStream) -> TokenStream {
     qos_attr("Sync", attr, item)
 }
 
-/// Parsed `footprint = ".."` → the const the inventory decl stores
+/// Parsed `footprint = ".."` → the const the inventory decl stores *and* the
+/// `__enter` override; one emitter so the two can never disagree
 ///
-/// - Two integers, not the string (CLI never re-parses what the macro validated)
-fn footprint_decl_tokens(f: Option<ztest_attr::Footprint>) -> proc_macro2::TokenStream {
-    match f {
-        Some(f) => {
-            let (cpu, mem) = (f.cpu_milli, f.mem_bytes);
-            quote! {
-                ::core::option::Option::Some(::ztest::macro_support::FootprintDecl {
-                    cpu_milli: #cpu,
-                    mem_bytes: #mem,
-                })
-            }
-        }
-        None => quote! { ::core::option::Option::None },
-    }
-}
-
-/// Same override as the `Resources` argument `__enter` takes
+/// - Integers, not the string (CLI never re-parses what the macro validated)
 fn footprint_resources_tokens(f: Option<ztest_attr::Footprint>) -> proc_macro2::TokenStream {
     match f {
         Some(f) => {
-            let (cpu, mem) = (f.cpu_milli, f.mem_bytes);
+            let (cpu, mem, disk) = (f.cpu_milli, f.mem_bytes, f.disk_bytes);
             quote! {
-                ::core::option::Option::Some(::ztest::qos::Resources::new(#cpu, #mem, 0, 0))
+                ::core::option::Option::Some(
+                    ::ztest::qos::Resources::new(#cpu, #mem, 0, 0).with_disk(#disk)
+                )
             }
         }
         None => quote! { ::core::option::Option::None },
@@ -754,7 +741,6 @@ fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream 
 
     let variant = syn::Ident::new(variant, Span::call_site());
     let ident = &func.sig.ident;
-    let footprint_decl = footprint_decl_tokens(args.footprint);
     let footprint_res = footprint_resources_tokens(args.footprint);
 
     // (b) in-process bridge: set the task-local tier + override as the first
@@ -772,7 +758,7 @@ fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream 
             ::ztest::macro_support::QosDecl {
                 test_id: concat!(module_path!(), "::", stringify!(#ident)),
                 class: ::ztest::qos::QosClass::#variant,
-                footprint: #footprint_decl,
+                footprint: #footprint_res,
             }
         }
         #func
@@ -820,7 +806,6 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let SyncTestArgs { name, description, subject, timeout, qos, footprint, tags } = args;
     let subject_str = LitStr::new(&subject.to_string(), subject.span());
     let qos_str = LitStr::new(&qos.to_string(), qos.span());
-    let footprint_decl = footprint_decl_tokens(footprint);
     let footprint_res = footprint_resources_tokens(footprint);
     // The tier ident (`sync`) → the `QosClass` variant (`Sync`), so the wrapper
     // can enter the tier at runtime exactly as `#[ztest::qos::*]` does. Without
@@ -845,7 +830,7 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 subject: #subject_str,
                 timeout: #timeout,
                 qos: #qos_str,
-                footprint: #footprint_decl,
+                footprint: #footprint_res,
                 tags: &[#(#tags),*],
             }
         }

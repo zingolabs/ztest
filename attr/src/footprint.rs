@@ -1,25 +1,62 @@
-//! `footprint = "<cpu>/<mem>"` — per-test QoS reserve override.
+//! `footprint = "<cpu>/<mem>[/<disk>]"` — per-test QoS reserve override.
 //!
 //! - One parser, three readers: proc-macro (expands), CLI source scan, `qos::units`
 //! - Lives here (proc-macro crate unlinkable from CLI, both must agree byte-for-byte)
-//! - CPU × memory only (io_bps/io_iops uncalibrated → reserve nothing charges)
+//! - CPU × memory schedulable; disk declared-but-inert (bytes, io_bps, io_iops)
 
 /// Component reserve replacing a tier's own, `footprint = ".."`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Footprint {
     pub cpu_milli: u64,
     pub mem_bytes: u64,
+    pub disk_bytes: Option<u64>,
+    pub disk_bps: Option<u64>,
+    pub disk_iops: Option<u64>,
 }
 
-/// `"15c/29Gi"` → [`Footprint`]
+/// `"15c/29Gi"` / `"15c/29Gi/400Gi"` → [`Footprint`]
 ///
-/// - Units mandatory both halves (ledger holds this for hours; misread = silent under-reserve)
+/// - Units mandatory every segment (ledger holds this for hours; misread = silent
+///   under-reserve)
 /// - Whole cores only (`guaranteed_cpu_mem` rounds up → pod could top its own reserve)
 pub fn parse(s: &str) -> Result<Footprint, String> {
-    let (cpu, mem) = s
-        .split_once('/')
-        .ok_or_else(|| format!("footprint `{s}` must be `<cpu>/<mem>`, e.g. \"15c/29Gi\""))?;
-    Ok(Footprint { cpu_milli: parse_cpu(cpu.trim())?, mem_bytes: parse_mem(mem.trim())? })
+    let mut parts = s.split('/');
+    let (Some(cpu), Some(mem)) = (parts.next(), parts.next()) else {
+        return Err(format!(
+            "footprint `{s}` must be `<cpu>/<mem>` or `<cpu>/<mem>/<disk>`, e.g. \"15c/29Gi\""
+        ));
+    };
+    let disk = parts.next();
+    if parts.next().is_some() {
+        return Err(format!(
+            "footprint `{s}` has more than three segments; grammar is `<cpu>/<mem>[/<disk>]`"
+        ));
+    }
+    Ok(Footprint {
+        cpu_milli: parse_cpu(cpu.trim())?,
+        mem_bytes: parse_mem(mem.trim())?,
+        disk_bytes: disk.map(|d| parse_disk(d.trim())).transpose()?,
+        // No grammar segment yet; declared here so one type carries every disk dimension
+        disk_bps: None,
+        disk_iops: None,
+    })
+}
+
+/// k8s storage quantity → bytes. Same grammar as memory, own diagnostic + zero rule
+///
+/// - Zero rejected: `"…/0Gi"` reads as "declared none", which `None` already says
+fn parse_disk(s: &str) -> Result<u64, String> {
+    if !s.ends_with(|c: char| c.is_ascii_alphabetic()) {
+        return Err(format!(
+            "footprint disk `{s}` needs a unit, e.g. \"400Gi\" (a bare number would mean bytes)"
+        ));
+    }
+    let bytes = parse_mem_bytes(s)
+        .ok_or_else(|| format!("footprint disk `{s}` is not a k8s quantity, e.g. \"400Gi\""))?;
+    if bytes == 0 {
+        return Err("footprint disk is zero — omit the segment to declare no reserve".to_string());
+    }
+    Ok(bytes)
 }
 
 /// `"15c"` / `"15000m"` → millicores
@@ -143,17 +180,44 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    /// Every disk dimension undeclared — the shape `<cpu>/<mem>` yields
+    fn cpu_mem(cpu_milli: u64, mem_bytes: u64) -> Footprint {
+        Footprint { cpu_milli, mem_bytes, disk_bytes: None, disk_bps: None, disk_iops: None }
+    }
+
     #[test]
     fn parses_the_canonical_form() {
-        assert_eq!(parse("15c/29Gi"), Ok(Footprint { cpu_milli: 15_000, mem_bytes: 29 * GIB }));
-        assert_eq!(parse("15000m/29Gi"), Ok(Footprint { cpu_milli: 15_000, mem_bytes: 29 * GIB }));
-        assert_eq!(parse(" 4c / 512Mi "), Ok(Footprint { cpu_milli: 4_000, mem_bytes: 512 << 20 }));
+        assert_eq!(parse("15c/29Gi"), Ok(cpu_mem(15_000, 29 * GIB)));
+        assert_eq!(parse("15000m/29Gi"), Ok(cpu_mem(15_000, 29 * GIB)));
+        assert_eq!(parse(" 4c / 512Mi "), Ok(cpu_mem(4_000, 512 << 20)));
     }
 
     #[test]
     fn requires_both_halves() {
         assert!(parse("29Gi").is_err());
         assert!(parse("15c").is_err());
+    }
+
+    #[test]
+    fn parses_the_optional_disk_segment() {
+        assert_eq!(
+            parse("15c/29Gi/400Gi"),
+            Ok(Footprint { disk_bytes: Some(400 * GIB), ..cpu_mem(15_000, 29 * GIB) })
+        );
+        assert_eq!(parse(" 15c / 29Gi / 400Gi ").map(|f| f.disk_bytes), Ok(Some(400 * GIB)));
+    }
+
+    /// Bare number would read as bytes, and a 400-byte reserve passes every check it faces
+    #[test]
+    fn disk_needs_a_unit_and_may_not_be_zero() {
+        assert!(parse("15c/29Gi/400").is_err());
+        assert!(parse("15c/29Gi/0Gi").is_err());
+        assert!(parse("15c/29Gi/lots").is_err());
+    }
+
+    #[test]
+    fn a_fourth_segment_is_rejected() {
+        assert!(parse("15c/29Gi/400Gi/9").is_err());
     }
 
     // Rejections stopping a silent misread → bad reserve

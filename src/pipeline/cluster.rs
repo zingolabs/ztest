@@ -140,15 +140,16 @@ fn count_nodes(nodes: &[Node]) -> (u32, u32) {
     (ready, cordoned)
 }
 
-/// `status.allocatable` as [`Resources`]: millicpu and bytes
+/// `status.allocatable` as [`Resources`]: millicpu + bytes (PVC capacity is pool-side, not
+/// node `ephemeral-storage` → left uncalibrated)
 fn node_allocatable(node: &Node) -> Resources {
     let Some(alloc) = node.status.as_ref().and_then(|s| s.allocatable.as_ref()) else {
         return Resources::ZERO;
     };
     let cpu = alloc.get("cpu").map(|q| units::parse_cpu_milli(&q.0)).unwrap_or(0);
     let mem = alloc.get("memory").map(|q| units::parse_mem_bytes(&q.0)).unwrap_or(0);
-    // I/O ceiling unbounded until the node is benchmarked (docs/design-qos.md)
-    Resources::cpu_mem_unbounded_io(cpu, mem)
+    // I/O + disk ceilings unbounded until the node is benchmarked (docs/design-qos.md)
+    Resources::cpu_mem_unbounded_rest(cpu, mem)
 }
 
 /// Total allocatable across schedulable (Ready, uncordoned) nodes. Generic over the
@@ -218,7 +219,8 @@ pub fn capacity_from<'a>(
 ///
 /// - The *request*, not the limit (reserving a limit sterilizes a node for a pod that
 ///   merely *could* burst; request = what the kube scheduler packs against)
-/// - Disk I/O summed separately from mounted PVCs (declared on the storage request)
+/// - Disk I/O + capacity summed separately from mounted PVCs (declared on the storage
+///   request)
 fn cluster_reserved<'a>(
     pods: impl IntoIterator<Item = &'a Pod>,
     pvcs: impl IntoIterator<Item = &'a PersistentVolumeClaim>,
@@ -228,12 +230,13 @@ fn cluster_reserved<'a>(
     pods.into_iter().filter(|p| units::pod_holds_capacity(p)).fold(Resources::ZERO, |acc, pod| {
         let request =
             pod.spec.as_ref().map(units::pod_effective_request).unwrap_or(Resources::ZERO);
-        acc.saturating_add(&request).saturating_add(&pod_io_reservation(pod, &by_name))
+        acc.saturating_add(&request).saturating_add(&pod_volume_reservation(pod, &by_name))
     })
 }
 
-/// I/O reservations of a pod's mounted PVCs. RWO → one PVC binds one pod, no double count
-fn pod_io_reservation(pod: &Pod, by_name: &HashMap<&str, &PersistentVolumeClaim>) -> Resources {
+/// Volume reservations (I/O + capacity) of a pod's mounted PVCs. RWO → one PVC binds one
+/// pod, no double count
+fn pod_volume_reservation(pod: &Pod, by_name: &HashMap<&str, &PersistentVolumeClaim>) -> Resources {
     let Some(spec) = pod.spec.as_ref() else {
         return Resources::ZERO;
     };
@@ -242,7 +245,7 @@ fn pod_io_reservation(pod: &Pod, by_name: &HashMap<&str, &PersistentVolumeClaim>
         .flatten()
         .filter_map(|v| v.persistent_volume_claim.as_ref())
         .filter_map(|c| by_name.get(c.claim_name.as_str()))
-        .fold(Resources::ZERO, |acc, pvc| acc.saturating_add(&units::pvc_io_reservation(pvc)))
+        .fold(Resources::ZERO, |acc, pvc| acc.saturating_add(&units::pvc_reservation(pvc)))
 }
 
 /// `zaino-{ci,dev}-*` namespaces proxy current concurrency (no authoritative session
@@ -327,22 +330,22 @@ mod tests {
         p
     }
 
-    fn pvc_with_io(name: &str, io_bps: &str, io_iops: &str) -> PersistentVolumeClaim {
-        pvc_with_io_opt(name, Some(io_bps), Some(io_iops))
+    fn pvc_with_io(name: &str, disk_bps: &str, disk_iops: &str) -> PersistentVolumeClaim {
+        pvc_with_io_opt(name, Some(disk_bps), Some(disk_iops))
     }
 
     fn pvc_with_io_opt(
         name: &str,
-        io_bps: Option<&str>,
-        io_iops: Option<&str>,
+        disk_bps: Option<&str>,
+        disk_iops: Option<&str>,
     ) -> PersistentVolumeClaim {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
         let mut ann = BTreeMap::new();
-        if let Some(v) = io_bps {
-            ann.insert(crate::qos::ANNOTATION_IO_BPS.to_string(), v.to_string());
+        if let Some(v) = disk_bps {
+            ann.insert(crate::qos::ANNOTATION_DISK_BPS.to_string(), v.to_string());
         }
-        if let Some(v) = io_iops {
-            ann.insert(crate::qos::ANNOTATION_IO_IOPS.to_string(), v.to_string());
+        if let Some(v) = disk_iops {
+            ann.insert(crate::qos::ANNOTATION_DISK_IOPS.to_string(), v.to_string());
         }
         PersistentVolumeClaim {
             metadata: ObjectMeta {
@@ -411,11 +414,11 @@ mod tests {
         let r = cluster_reserved(&pods, &pvcs);
         assert_eq!(r.cpu_milli, 1000, "cpu from the pod");
         assert_eq!(r.mem_bytes, crate::qos::GIB, "mem from the pod");
-        assert_eq!(r.io_bps, 100 * crate::qos::MIB, "io from the PVC");
-        assert_eq!(r.io_iops, 5000, "io from the PVC");
+        assert_eq!(r.disk_bps, 100 * crate::qos::MIB, "io from the PVC");
+        assert_eq!(r.disk_iops, 5000, "io from the PVC");
         // Uncapped volume (no annotation) reserves no I/O
         let bare = vec![pvc_with_io_opt("chain-data", None, None)];
-        assert_eq!(cluster_reserved(&pods, &bare).io_bps, 0);
+        assert_eq!(cluster_reserved(&pods, &bare).disk_bps, 0);
     }
 
     #[test]

@@ -134,32 +134,16 @@ pub fn iter() -> impl Iterator<Item = &'static DevImageDecl> {
 // `#[ztest::qos::*]` submits a `QosDecl`; `ztest run` folds `QosEntry` off the
 // dump stream into per-tier groups
 
-/// `footprint = ".."` override, const-evaluable + already parsed by the macro
-/// (no reader re-parses a quantity → none can disagree with what was written)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FootprintDecl {
-    pub cpu_milli: u64,
-    pub mem_bytes: u64,
-}
-
-impl FootprintDecl {
-    pub fn resources(self) -> crate::qos::Resources {
-        crate::qos::Resources::new(self.cpu_milli, self.mem_bytes, 0, 0)
-    }
-}
-
-/// `Option<FootprintDecl>` → the `profile_with` argument
-pub fn footprint_resources(f: Option<FootprintDecl>) -> Option<crate::qos::Resources> {
-    f.map(FootprintDecl::resources)
-}
-
 /// One QOS tier declaration for `inventory::submit!`.
-/// `test_id` = `concat!(module_path!(), "::", test_fn)`
+///
+/// - `test_id` = `concat!(module_path!(), "::", test_fn)`
+/// - `footprint` = the `footprint = ".."` override, macro-parsed into the same
+///   [`Resources`](crate::qos::Resources) every consumer already speaks
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct QosDecl {
     pub test_id: &'static str,
     pub class: QosClass,
-    pub footprint: Option<FootprintDecl>,
+    pub footprint: Option<crate::qos::Resources>,
 }
 
 inventory::collect!(QosDecl);
@@ -169,7 +153,7 @@ pub struct QosEntry {
     pub test_id: String,
     pub class: QosClass,
     #[serde(default)]
-    pub footprint: Option<FootprintDecl>,
+    pub footprint: Option<crate::qos::Resources>,
 }
 
 impl From<&QosDecl> for QosEntry {
@@ -181,7 +165,7 @@ impl From<&QosDecl> for QosEntry {
 impl QosEntry {
     /// Effective profile (tier + override); read over `class.profile()` at any sizing site
     pub fn profile(&self) -> crate::qos::QosProfile {
-        self.class.profile_with(footprint_resources(self.footprint))
+        self.class.profile_with(self.footprint)
     }
 }
 
@@ -308,7 +292,7 @@ pub struct SyncTestDecl {
     pub subject: &'static str,
     pub timeout: &'static str,
     pub qos: &'static str,
-    pub footprint: Option<FootprintDecl>,
+    pub footprint: Option<crate::qos::Resources>,
     pub tags: &'static [&'static str],
 }
 
@@ -323,7 +307,7 @@ pub struct SyncTestEntry {
     pub timeout: String,
     pub qos: String,
     #[serde(default)]
-    pub footprint: Option<FootprintDecl>,
+    pub footprint: Option<crate::qos::Resources>,
     pub tags: Vec<String>,
 }
 
@@ -350,7 +334,7 @@ impl SyncTestEntry {
 
     /// Sole source of a sync run's sizing (declared tier + declared override)
     pub fn profile(&self) -> Option<crate::qos::QosProfile> {
-        Some(self.class()?.profile_with(footprint_resources(self.footprint)))
+        Some(self.class()?.profile_with(self.footprint))
     }
 }
 
@@ -543,7 +527,7 @@ mod tests {
         let decl = QosDecl {
             test_id: "walletless::big",
             class: QosClass::Sync,
-            footprint: Some(FootprintDecl { cpu_milli: 15_000, mem_bytes: 29 * crate::qos::GIB }),
+            footprint: Some(crate::qos::Resources::new(15_000, 29 * crate::qos::GIB, 0, 0)),
         };
         let line = serde_json::to_string(&InventoryLineRef::Qos(&decl)).unwrap();
         match serde_json::from_str::<InventoryLine>(&line).unwrap() {
@@ -584,7 +568,7 @@ mod tests {
         // Tier the profile named, though launched by `ztest sync`
         assert_eq!(e.profile(), Some(QosClass::Integration.profile()));
 
-        e.footprint = Some(FootprintDecl { cpu_milli: 15_000, mem_bytes: 29 * crate::qos::GIB });
+        e.footprint = Some(crate::qos::Resources::new(15_000, 29 * crate::qos::GIB, 0, 0));
         let eff = e.profile().expect("known tier");
         assert_eq!(eff.footprint.mem_bytes, 29 * crate::qos::GIB);
         assert_eq!(eff.hard_cap, QosClass::Integration.profile().hard_cap);

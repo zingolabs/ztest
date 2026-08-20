@@ -381,11 +381,11 @@ mod tests {
     fn request_fitting_cpu_and_memory_but_not_io_bandwidth_queues() {
         // Fitting CPU + memory with room to spare must still queue on exhausted I/O
         // bandwidth — the dimension the 2-D packer could not see
-        let io_req = |name: &str, io_bps: u64| Request {
+        let io_req = |name: &str, disk_bps: u64| Request {
             binary_id: "bin".into(),
             test_name: name.into(),
             sa: "acme".into(),
-            footprint: Resources::new(1_000, GIB, io_bps, 0),
+            footprint: Resources::new(1_000, GIB, disk_bps, 0),
             priority: 0,
         };
         // Occupy 400 of 500 MB/s → 100 free
@@ -400,11 +400,11 @@ mod tests {
     #[test]
     fn request_fitting_all_else_but_not_io_iops_queues() {
         // IOPS gates independently of bandwidth
-        let iops_req = |name: &str, io_iops: u64| Request {
+        let iops_req = |name: &str, disk_iops: u64| Request {
             binary_id: "bin".into(),
             test_name: name.into(),
             sa: "acme".into(),
-            footprint: Resources::new(1_000, GIB, 0, io_iops),
+            footprint: Resources::new(1_000, GIB, 0, disk_iops),
             priority: 0,
         };
         let mut s = Scheduler::new(Resources::new(8_000, 16 * GIB, 0, 10_000));
@@ -498,6 +498,20 @@ mod tests {
             Resources::new(4_000, 8 * GIB, 0, 0),  // footprint
         );
         assert_eq!(v, Admission::Queued);
+    }
+
+    /// A declared disk reserve must not read as "exceeds budget" against a budget that
+    /// only ever prices cpu/mem — every uncalibrated dimension seeds unbounded, or the
+    /// first test to declare one is rejected outright
+    #[test]
+    fn a_disk_reserve_is_admitted_against_a_cpu_mem_budget() {
+        let ceiling = Resources::cpu_mem_unbounded_rest(16_000, 16 * GIB);
+        let budget = Resources::cpu_mem_unbounded_rest(16_000, 16 * GIB);
+        let footprint = Resources::new(15_000, 15 * GIB, 0, 0).with_disk(400 * GIB);
+        assert_eq!(
+            decide(ceiling, Resources::ZERO, Resources::ZERO, Some(budget), footprint),
+            Admission::Granted(())
+        );
     }
 
     #[test]

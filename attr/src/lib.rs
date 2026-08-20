@@ -220,7 +220,13 @@ mod tests {
                 .expect("parses");
         assert_eq!(
             args.footprint,
-            Some(Footprint { cpu_milli: 15_000, mem_bytes: 29 * 1024 * 1024 * 1024 })
+            Some(Footprint {
+                cpu_milli: 15_000,
+                mem_bytes: 29 * 1024 * 1024 * 1024,
+                disk_bytes: None,
+                disk_bps: None,
+                disk_iops: None,
+            })
         );
     }
 

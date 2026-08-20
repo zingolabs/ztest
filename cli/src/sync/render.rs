@@ -140,12 +140,9 @@ fn entry(p: &ProfileStub, theme: &Theme, width: usize, name_w: usize) -> String 
         let sep = theme.chars.dot;
         // Overridden reserve shown beside the tier (else the tier alone implies its default)
         let qos = match p.footprint {
-            Some(f) => format!(
-                "{} ({}c/{}Gi)",
-                p.qos,
-                f.cpu_milli / 1000,
-                f.mem_bytes / (1024 * 1024 * 1024)
-            ),
+            Some(f) => {
+                format!("{} ({})", p.qos, ztest::qos::Resources::from_footprint(f).compact())
+            }
             None => p.qos.clone(),
         };
         format!("{} {sep} {qos} {sep} {}", p.subject, p.timeout)

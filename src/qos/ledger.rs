@@ -49,10 +49,10 @@ const ACQUIRE_POLL: Duration = Duration::from_secs(3);
 ///
 /// - Capped only by live cross-run fair share ([`fair_reserve`]), not a fixed slice that
 ///   would strangle a lone run to a couple of tests
-/// - I/O unbounded: the per-SA budget governs the contended node-allocatable dimensions;
-///   disk bandwidth/IOPS gate on cluster capacity, not per-identity policy
+/// - I/O + disk unbounded: the per-SA budget governs the contended node-allocatable
+///   dimensions; storage gates on cluster capacity, not per-identity policy
 fn default_budget(allocatable: Resources) -> Resources {
-    Resources::new(allocatable.cpu_milli, allocatable.mem_bytes, u64::MAX, u64::MAX)
+    Resources::cpu_mem_unbounded_rest(allocatable.cpu_milli, allocatable.mem_bytes)
 }
 
 /// Smallest slice worth waiting for = the lightest tier's footprint. Below it a ceiling
@@ -509,8 +509,8 @@ fn fair_reserve(
     let fair = Resources::new(
         usable.cpu_milli / n,
         usable.mem_bytes / n,
-        usable.io_bps / n,
-        usable.io_iops / n,
+        usable.disk_bps / n,
+        usable.disk_iops / n,
     );
     let want = demand.min(&fair).min(&budget);
     // `others` already excludes this run → our own reservation isn't subtracted here
@@ -571,7 +571,7 @@ fn budget_from_annotations(
     let cpu = ann.and_then(|a| a.get(ANN_BUDGET_CPU)).and_then(|s| parse_u64(s));
     let mem = ann.and_then(|a| a.get(ANN_BUDGET_MEM)).and_then(|s| parse_u64(s));
     match (cpu, mem) {
-        (Some(c), Some(m)) => Resources::new(c, m, u64::MAX, u64::MAX),
+        (Some(c), Some(m)) => Resources::cpu_mem_unbounded_rest(c, m),
         _ => default,
     }
 }
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn slice_takes_the_tighter_of_budget_and_headroom_per_dimension() {
-        let budget = Resources::new(32_000, 24 * GIB, u64::MAX, u64::MAX);
+        let budget = Resources::cpu_mem_unbounded_rest(32_000, 24 * GIB);
         let headroom = Resources::new(40_000, 16 * GIB, 0, 0);
         let slice = budget.min(&headroom);
         assert_eq!(slice.cpu_milli, 32_000, "CPU bounded by budget");
@@ -799,8 +799,8 @@ mod tests {
         let b = default_budget(Resources::new(72_000, 46 * GIB, 0, 0));
         assert_eq!(b.cpu_milli, 72_000);
         assert_eq!(b.mem_bytes, 46 * GIB);
-        assert_eq!(b.io_bps, u64::MAX, "I/O ungoverned by the per-SA budget");
-        assert_eq!(b.io_iops, u64::MAX);
+        assert_eq!(b.disk_bps, u64::MAX, "I/O ungoverned by the per-SA budget");
+        assert_eq!(b.disk_iops, u64::MAX);
     }
 
     // ── Fair-share elastic reservation ─────────────────────────────────
@@ -900,7 +900,7 @@ mod tests {
             Resources::ZERO,
             Resources::ZERO,
             1,
-            Resources::new(16_000, 12 * GIB, u64::MAX, u64::MAX),
+            Resources::cpu_mem_unbounded_rest(16_000, 12 * GIB),
             Resources::ZERO,
             Resources::new(300_000, 200 * GIB, 0, 0),
         );

@@ -45,9 +45,12 @@ pub const LABEL_TEST_NS: &str = "ztest.io/test-ns";
 // a backend's CSI can honor one. See `docs/design-qos.md`.
 
 /// k8s quantity in bytes/sec; mirrors cgroup `io.max` `{r,w}bps`
-pub const ANNOTATION_IO_BPS: &str = "qos.ztest.io/io-bps";
+pub const ANNOTATION_DISK_BPS: &str = "qos.ztest.io/disk-bps";
 /// Plain integer in ops/sec; mirrors cgroup `io.max` `{r,w}iops`
-pub const ANNOTATION_IO_IOPS: &str = "qos.ztest.io/io-iops";
+pub const ANNOTATION_DISK_IOPS: &str = "qos.ztest.io/disk-iops";
+/// k8s quantity in bytes; overrides the PVC's own `requests.storage` as the *reserve*
+/// (provisioned size != what a CoW clone or a growing index actually charges the pool)
+pub const ANNOTATION_DISK_BYTES: &str = "qos.ztest.io/disk-bytes";
 
 // ── NVMe placement (node taint + nodeSelector) ─────────────────────────
 //
@@ -65,11 +68,13 @@ pub const NVME_TAINT_KEY: &str = "ztest.io/pool";
 pub const MIB: u64 = 1024 * 1024;
 pub const GIB: u64 = 1024 * MIB;
 
-/// 4-D resource amount: k8s `requests`/`limits` units + the cgroup v2 `io.max` pair.
+/// 5-D resource amount: k8s `requests`/`limits` units, the cgroup v2 `io.max` pair, and
+/// storage capacity.
 ///
 /// - Integer-only → packing is exact; dimensions independent ("fits" = fits every one)
-/// - I/O inert until calibrated (k8s exposes no I/O `allocatable`, so an uncalibrated
-///   node's ceiling is seeded [`u64::MAX`] and admission matches the CPU×memory model)
+/// - I/O + disk inert until calibrated (k8s surfaces neither as node `allocatable`, so an
+///   uncalibrated ceiling is seeded [`u64::MAX`] and admission matches the CPU×memory model)
+/// - Disk = PVC pool capacity, not node `ephemeral-storage` (different pools, never summed)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Resources {
     pub cpu_milli: u64,
@@ -77,9 +82,11 @@ pub struct Resources {
     /// Inert dimensions omitted from the wire (`0` = the uncalibrated norm, on every
     /// beacon ever written) rather than doubling every serialized footprint
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub io_bps: u64,
+    pub disk_bps: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub io_iops: u64,
+    pub disk_iops: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub disk_bytes: u64,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -87,31 +94,40 @@ fn is_zero(v: &u64) -> bool {
 }
 
 impl Resources {
-    pub const ZERO: Resources = Resources { cpu_milli: 0, mem_bytes: 0, io_bps: 0, io_iops: 0 };
+    pub const ZERO: Resources =
+        Resources { cpu_milli: 0, mem_bytes: 0, disk_bps: 0, disk_iops: 0, disk_bytes: 0 };
 
-    pub const fn new(cpu_milli: u64, mem_bytes: u64, io_bps: u64, io_iops: u64) -> Self {
-        Resources { cpu_milli, mem_bytes, io_bps, io_iops }
+    /// Disk omitted: 157 call sites predate it, and a 5th positional `u64` reads as noise
+    /// → [`Resources::with_disk`] is the one way to set it
+    pub const fn new(cpu_milli: u64, mem_bytes: u64, disk_bps: u64, disk_iops: u64) -> Self {
+        Resources { cpu_milli, mem_bytes, disk_bps, disk_iops, disk_bytes: 0 }
     }
 
-    /// Both I/O dimensions [`u64::MAX`], for a *ceiling* on an un-benchmarked node (those
-    /// dimensions then never gate admission)
-    pub const fn cpu_mem_unbounded_io(cpu_milli: u64, mem_bytes: u64) -> Self {
-        Resources::new(cpu_milli, mem_bytes, u64::MAX, u64::MAX)
+    pub const fn with_disk(self, disk_bytes: u64) -> Self {
+        Resources { disk_bytes, ..self }
+    }
+
+    /// I/O + disk [`u64::MAX`], for a *ceiling* on an un-benchmarked node (those dimensions
+    /// then never gate admission)
+    pub const fn cpu_mem_unbounded_rest(cpu_milli: u64, mem_bytes: u64) -> Self {
+        Resources::new(cpu_milli, mem_bytes, u64::MAX, u64::MAX).with_disk(u64::MAX)
     }
 
     pub fn fits_within(&self, cap: &Resources) -> bool {
         self.cpu_milli <= cap.cpu_milli
             && self.mem_bytes <= cap.mem_bytes
-            && self.io_bps <= cap.io_bps
-            && self.io_iops <= cap.io_iops
+            && self.disk_bps <= cap.disk_bps
+            && self.disk_iops <= cap.disk_iops
+            && self.disk_bytes <= cap.disk_bytes
     }
 
     pub fn checked_add(&self, other: &Resources) -> Option<Resources> {
         Some(Resources {
             cpu_milli: self.cpu_milli.checked_add(other.cpu_milli)?,
             mem_bytes: self.mem_bytes.checked_add(other.mem_bytes)?,
-            io_bps: self.io_bps.checked_add(other.io_bps)?,
-            io_iops: self.io_iops.checked_add(other.io_iops)?,
+            disk_bps: self.disk_bps.checked_add(other.disk_bps)?,
+            disk_iops: self.disk_iops.checked_add(other.disk_iops)?,
+            disk_bytes: self.disk_bytes.checked_add(other.disk_bytes)?,
         })
     }
 
@@ -119,8 +135,9 @@ impl Resources {
         Some(Resources {
             cpu_milli: self.cpu_milli.checked_sub(other.cpu_milli)?,
             mem_bytes: self.mem_bytes.checked_sub(other.mem_bytes)?,
-            io_bps: self.io_bps.checked_sub(other.io_bps)?,
-            io_iops: self.io_iops.checked_sub(other.io_iops)?,
+            disk_bps: self.disk_bps.checked_sub(other.disk_bps)?,
+            disk_iops: self.disk_iops.checked_sub(other.disk_iops)?,
+            disk_bytes: self.disk_bytes.checked_sub(other.disk_bytes)?,
         })
     }
 
@@ -131,8 +148,9 @@ impl Resources {
         Resources {
             cpu_milli: self.cpu_milli.saturating_sub(other.cpu_milli),
             mem_bytes: self.mem_bytes.saturating_sub(other.mem_bytes),
-            io_bps: self.io_bps.saturating_sub(other.io_bps),
-            io_iops: self.io_iops.saturating_sub(other.io_iops),
+            disk_bps: self.disk_bps.saturating_sub(other.disk_bps),
+            disk_iops: self.disk_iops.saturating_sub(other.disk_iops),
+            disk_bytes: self.disk_bytes.saturating_sub(other.disk_bytes),
         }
     }
 
@@ -140,8 +158,9 @@ impl Resources {
         Resources {
             cpu_milli: self.cpu_milli.saturating_add(other.cpu_milli),
             mem_bytes: self.mem_bytes.saturating_add(other.mem_bytes),
-            io_bps: self.io_bps.saturating_add(other.io_bps),
-            io_iops: self.io_iops.saturating_add(other.io_iops),
+            disk_bps: self.disk_bps.saturating_add(other.disk_bps),
+            disk_iops: self.disk_iops.saturating_add(other.disk_iops),
+            disk_bytes: self.disk_bytes.saturating_add(other.disk_bytes),
         }
     }
 
@@ -151,8 +170,9 @@ impl Resources {
         Resources {
             cpu_milli: self.cpu_milli.max(other.cpu_milli),
             mem_bytes: self.mem_bytes.max(other.mem_bytes),
-            io_bps: self.io_bps.max(other.io_bps),
-            io_iops: self.io_iops.max(other.io_iops),
+            disk_bps: self.disk_bps.max(other.disk_bps),
+            disk_iops: self.disk_iops.max(other.disk_iops),
+            disk_bytes: self.disk_bytes.max(other.disk_bytes),
         }
     }
 
@@ -160,8 +180,9 @@ impl Resources {
         Resources {
             cpu_milli: self.cpu_milli.min(other.cpu_milli),
             mem_bytes: self.mem_bytes.min(other.mem_bytes),
-            io_bps: self.io_bps.min(other.io_bps),
-            io_iops: self.io_iops.min(other.io_iops),
+            disk_bps: self.disk_bps.min(other.disk_bps),
+            disk_iops: self.disk_iops.min(other.disk_iops),
+            disk_bytes: self.disk_bytes.min(other.disk_bytes),
         }
     }
 
@@ -175,9 +196,11 @@ impl Resources {
         );
     }
 
-    /// `footprint = "15c/29Gi"` → reserve; io stays `0` (uncalibrated, nothing charges it)
+    /// `footprint = "15c/29Gi[/400Gi]"` → reserve. Undeclared disk dimension → `0`, the
+    /// "nothing charges it" value every uncalibrated dimension already carries
     pub fn from_footprint(f: ztest_attr::Footprint) -> Resources {
-        Resources::new(f.cpu_milli, f.mem_bytes, 0, 0)
+        Resources::new(f.cpu_milli, f.mem_bytes, f.disk_bps.unwrap_or(0), f.disk_iops.unwrap_or(0))
+            .with_disk(f.disk_bytes.unwrap_or(0))
     }
 
     /// `(cpu, memory)` k8s quantity strings for a Guaranteed container: whole-core CPU
@@ -206,21 +229,28 @@ impl Resources {
 
     /// Dense cell `16c/30Gi`, integer — a per-row footprint column that repeats a decimal
     /// buys nothing. Sub-gibibyte falls to `Mi`; sub-core keeps a decimal (`0.5c/512Mi`)
+    ///
+    /// - Undeclared disk drops its segment → output re-parses as `footprint = ".."`
     pub fn compact(&self) -> String {
         let cpu = match self.cpu_milli {
             m if m == 0 || m.is_multiple_of(1000) => format!("{}c", m / 1000),
             m => format!("{:.1}c", m as f64 / 1000.0),
         };
-        let mem = match self.mem_bytes {
+        let bytes = |b: u64| match b {
             b if b >= GIB => format!("{}Gi", b / GIB),
             b => format!("{}Mi", b / MIB),
         };
-        format!("{cpu}/{mem}")
+        match self.disk_bytes {
+            0 => format!("{cpu}/{}", bytes(self.mem_bytes)),
+            d => format!("{cpu}/{}/{}", bytes(self.mem_bytes), bytes(d)),
+        }
     }
 
     /// `(cpu, mem)` fill against `whole`, each saturating at 100; a zero dimension in
     /// `whole` yields 0 there rather than dividing. Callers pick `min` (binding constraint)
     /// or `max` (fullness) — the two are different questions and neither is the default
+    ///
+    /// - Disk excluded while uncalibrated (ceiling seeds [`u64::MAX`] → fill rounds to 0)
     pub fn ratio_pct(&self, whole: &Resources) -> (u8, u8) {
         let frac = |p: u64, w: u64| match w {
             0 => 0,
@@ -230,7 +260,8 @@ impl Resources {
     }
 }
 
-/// `3c / 3 GiB`, `500m / 512 MiB`. I/O omitted (`0` pending calibration, no signal here)
+/// `3c / 3 GiB`, `500m / 512 MiB`. I/O + disk omitted (`0` pending calibration, no signal
+/// here); [`Resources::compact`] carries disk where a footprint cell needs it
 impl std::fmt::Display for Resources {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let cpu = if self.cpu_milli != 0 && self.cpu_milli.is_multiple_of(1000) {
@@ -362,6 +393,8 @@ impl QosProfile {
     /// - CPU floors to whole cores (CPU Manager `static` pins only integer cores)
     /// - Floor, not ceil → `pods x share <= footprint`, so a deploy never exceeds
     ///   what was admitted (lost sub-core stays as headroom)
+    /// - cpu/mem only: this sizes a Guaranteed *container*, and io/disk are volume
+    ///   properties with no per-pod split to make
     pub fn share(&self, pods: usize) -> Option<Resources> {
         if pods == 0 {
             return None;
@@ -606,6 +639,26 @@ mod tests {
         assert_eq!(Resources::ZERO.compact(), "0c/0Mi");
     }
 
+    /// Disk rides the same footprint cell as cpu/mem, and drops out when undeclared so the
+    /// rendered form is still `footprint = ".."` input
+    #[test]
+    fn compact_carries_disk_only_once_declared() {
+        assert_eq!(
+            Resources::new(15_000, 15 * GIB, 0, 0).with_disk(400 * GIB).compact(),
+            "15c/15Gi/400Gi"
+        );
+        assert_eq!(Resources::new(15_000, 15 * GIB, 0, 0).compact(), "15c/15Gi");
+    }
+
+    /// `compact` → `footprint::parse` round trip: the cell a table renders is the string a
+    /// test may paste back into its attribute
+    #[test]
+    fn a_rendered_footprint_reparses() {
+        let r = Resources::new(15_000, 29 * GIB, 0, 0).with_disk(400 * GIB);
+        let parsed = ztest_attr::footprint::parse(&r.compact()).expect("re-parses");
+        assert_eq!(Resources::from_footprint(parsed), r);
+    }
+
     /// The I/O pair is inert on every beacon ever written; carrying it would double each
     /// serialized footprint for two zeroes
     #[test]
@@ -627,6 +680,38 @@ mod tests {
         assert_eq!(Resources::new(3_000, 3 * GIB, 0, 0).to_string(), "3c / 3 GiB");
         assert_eq!(Resources::new(500, 512 * MIB, 0, 0).to_string(), "500m / 512 MiB");
         assert_eq!(Resources::ZERO.to_string(), "0m / 0 MiB");
+    }
+
+    /// Undeclared disk must stay off the wire: every beacon written before the dimension
+    /// existed decodes, and a declared one survives the round trip
+    #[test]
+    fn serialized_disk_is_omitted_when_undeclared_and_carried_when_set() {
+        let bare = serde_json::to_string(&Resources::new(3_000, GIB, 0, 0)).expect("serialize");
+        assert!(!bare.contains("disk_bytes"), "undeclared disk must not reach the wire: {bare}");
+
+        let sized = Resources::new(3_000, GIB, 0, 0).with_disk(400 * GIB);
+        let json = serde_json::to_string(&sized).expect("serialize");
+        assert_eq!(serde_json::from_str::<Resources>(&json).expect("round-trips"), sized);
+
+        let legacy = r#"{"cpu_milli":3000,"mem_bytes":1073741824}"#;
+        assert_eq!(
+            serde_json::from_str::<Resources>(legacy).expect("legacy beacon decodes").disk_bytes,
+            0
+        );
+    }
+
+    /// Disk gates like every other dimension, and an uncalibrated ceiling never gates
+    #[test]
+    fn disk_gates_fits_within_unless_the_ceiling_is_unbounded() {
+        let cap = Resources::new(1_000, GIB, 0, 0).with_disk(100 * GIB);
+        assert!(Resources::new(1_000, GIB, 0, 0).with_disk(100 * GIB).fits_within(&cap));
+        assert!(!Resources::new(1_000, GIB, 0, 0).with_disk(101 * GIB).fits_within(&cap));
+
+        let uncalibrated = Resources::cpu_mem_unbounded_rest(1_000, GIB);
+        assert!(
+            Resources::new(1_000, GIB, 0, 0).with_disk(400 * GIB).fits_within(&uncalibrated),
+            "an un-benchmarked node must not gate on a dimension it cannot measure"
+        );
     }
 
     #[test]
@@ -736,8 +821,8 @@ mod tests {
         // Flip this when calibration lands (§6)
         for c in ALL_TIERS {
             let fp = c.profile().footprint;
-            assert_eq!(fp.io_bps, 0, "{c:?} has a fabricated io_bps reserve");
-            assert_eq!(fp.io_iops, 0, "{c:?} has a fabricated io_iops reserve");
+            assert_eq!(fp.disk_bps, 0, "{c:?} has a fabricated disk_bps reserve");
+            assert_eq!(fp.disk_iops, 0, "{c:?} has a fabricated disk_iops reserve");
         }
     }
 
