@@ -5332,7 +5332,7 @@ checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 
 [[package]]
 name = "xtask"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "tonic-prost-build",
 ]
@@ -5814,7 +5814,7 @@ dependencies = [
 
 [[package]]
 name = "ztest"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -5879,7 +5879,7 @@ dependencies = [
 
 [[package]]
 name = "ztest_attr"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "proc-macro2",
  "syn 2.0.119",
@@ -5887,7 +5887,7 @@ dependencies = [
 
 [[package]]
 name = "ztest_cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5917,7 +5917,7 @@ dependencies = [
 
 [[package]]
 name = "ztest_macros"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5928,7 +5928,7 @@ dependencies = [
 
 [[package]]
 name = "ztest_ui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "avt",
