@@ -2,7 +2,11 @@
 //!
 //! - Pod reference = engine's own form for a locally built tag (podman prefixes `localhost/`)
 
-use std::process::Command;
+use std::{
+    process::Command,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 
@@ -162,17 +166,53 @@ pub async fn side_load(
     loaded
 }
 
+const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Node's image probe, injectable so the poll loop unit-tests without a cluster
+type Probe = Arc<dyn Fn(&str) -> Result<bool, ImageError> + Send + Sync>;
+
 /// Node image table holds what the pod will ask for.
 ///
 /// - Load is not proof: `kind load` reports the transfer, never the name containerd filed it under
 /// - Divergence otherwise surfaces mid-test as `ImagePullBackOff` on a registry that never had it
 pub async fn confirm_loaded(tag: &str) -> Result<(), ImageError> {
-    let owned = tag.to_string();
-    let present = tokio::task::spawn_blocking(move || exists_in_kind(&owned))
-        .await
-        .map_err(|e| ImageError::KindImageQuery { stderr_tail: format!("confirm {tag}: {e}") })??;
-    if present {
-        return Ok(());
+    confirm_polling(tag, Arc::new(exists_in_kind), CONFIRM_POLL_INTERVAL, CONFIRM_TIMEOUT).await
+}
+
+/// - `crictl` = CRI store, rebuilt off containerd's event stream → a `ctr images tag` lands
+///   in containerd's metadata store first and surfaces here ~300ms later (`kind load`'s
+///   re-tag path, taken whenever a rebuild reproduces an image ID already on the node)
+/// - CRI store stays the oracle (kubelet resolves pod images through it), so poll it to
+///   convergence rather than read it once
+/// - Query errors retried too (busy node) — a deadline reached on errors alone reports the
+///   error, never `absent`
+async fn confirm_polling(
+    tag: &str,
+    probe: Probe,
+    interval: Duration,
+    timeout: Duration,
+) -> Result<(), ImageError> {
+    let deadline = Instant::now() + timeout;
+    let mut last_err;
+    loop {
+        let (owned, probe) = (tag.to_string(), Arc::clone(&probe));
+        let read = tokio::task::spawn_blocking(move || probe(&owned)).await.map_err(|e| {
+            ImageError::KindImageQuery { stderr_tail: format!("confirm {tag}: {e}") }
+        })?;
+        match read {
+            Ok(true) => return Ok(()),
+            Ok(false) => last_err = None,
+            Err(e) => last_err = Some(e),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(interval.min(remaining)).await;
+    }
+    if let Some(e) = last_err {
+        return Err(e);
     }
     Err(ImageError::SideLoadUnconfirmed {
         reference: runtime::active().local_reference(tag),
@@ -314,7 +354,62 @@ pub fn ensure_kind_cluster() -> Result<(), ImageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering::SeqCst},
+    };
+
+    /// Reads `hits` of `false` before the tag appears
+    fn appears_after(hits: usize) -> (Probe, Arc<AtomicUsize>) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&reads);
+        (Arc::new(move |_: &str| Ok(seen.fetch_add(1, SeqCst) >= hits)), reads)
+    }
+
+    async fn confirm(probe: Probe, timeout: Duration) -> Result<(), ImageError> {
+        confirm_polling("zebrad:dev-abc", probe, Duration::from_millis(1), timeout).await
+    }
+
+    /// `crictl`'s CRI store trails a `kind load` re-tag → the one-shot read failed a load that
+    /// had in fact landed
+    #[tokio::test]
+    async fn a_tag_the_cri_store_has_not_caught_up_on_still_confirms() {
+        let (probe, reads) = appears_after(2);
+        confirm(probe, Duration::from_secs(5)).await.expect("third read hits");
+        assert_eq!(reads.load(SeqCst), 3);
+    }
+
+    /// Interval outlasts the timeout → returning at all proves the first read never slept
+    #[tokio::test]
+    async fn a_present_tag_confirms_without_waiting_out_an_interval() {
+        let (probe, reads) = appears_after(0);
+        confirm_polling("zebrad:dev-abc", probe, Duration::from_secs(60), Duration::from_secs(60))
+            .await
+            .expect("first read hits");
+        assert_eq!(reads.load(SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_transient_query_failure_is_retried() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&reads);
+        let probe: Probe = Arc::new(move |_: &str| match seen.fetch_add(1, SeqCst) {
+            0 => Err(ImageError::KindImageQuery { stderr_tail: "node busy".to_string() }),
+            _ => Ok(true),
+        });
+        confirm(probe, Duration::from_secs(5)).await.expect("second read hits");
+        assert_eq!(reads.load(SeqCst), 2);
+    }
+
+    /// Never `absent` off a node that never answered
+    #[tokio::test]
+    async fn a_query_broken_through_the_deadline_reports_the_query_error() {
+        let probe: Probe = Arc::new(|_: &str| {
+            Err(ImageError::KindImageQuery { stderr_tail: "no such container".to_string() })
+        });
+        let err = confirm(probe, Duration::from_millis(5)).await.expect_err("never confirms");
+        assert!(matches!(err, ImageError::KindImageQuery { .. }), "{err:?}");
+    }
 
     /// program, argv, `KEY=VALUE` envs
     type Spawn = (String, Vec<String>, Vec<String>);
