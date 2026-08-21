@@ -55,7 +55,7 @@ mod metrics;
 mod mounts;
 mod naming;
 mod observ;
-mod paths;
+pub(crate) mod paths;
 mod pipeline;
 mod plan;
 mod pod_status;

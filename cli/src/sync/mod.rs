@@ -90,6 +90,14 @@ pub struct Args {
     cmd: Option<Cmd>,
 }
 
+impl Args {
+    /// `--cluster`, read back by `bind_cluster` in dispatch — the one place that binds a
+    /// profile, for every subcommand
+    pub(crate) fn cluster_profile(&self) -> Option<&str> {
+        self.cluster.as_deref()
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// List detached syncs (cluster-wide `kind=sync` query): id, namespace, status, user.
@@ -205,13 +213,6 @@ pub fn execute(args: Args) -> ExitCode {
     // single-threaded here.
     // bare catalogue exempt too: source-only, and requiring a cluster would fail hardest in the
     // checkout it exists to diagnose
-    if !matches!(args.cmd, None | Some(Cmd::Describe { .. }))
-        && let Err(detail) =
-            unsafe { ztest::api::cluster_config::activate(args.cluster.as_deref()) }
-    {
-        eprintln!("ztest sync: {detail}");
-        return ExitCode::FAILURE;
-    }
     super::block_on("sync", super::Rt::Multi, run(args))
 }
 

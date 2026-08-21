@@ -130,18 +130,18 @@ One answer to "where do a seed's bytes come from": the snapshot bucket (`r2.rs`)
 
 ### Who moves bytes
 
-Only the side holding credentials, and never through this process:
+Neither side holds a credential, and the bytes never pass through this process:
 
-|                       | `provision_seed` (parent)      | `await_seed` (test)                 |
-| --------------------- | ------------------------------ | ----------------------------------- |
-| runs in               | `ztest run` preflight          | the runner pod, at `TestEnv::build` |
-| needs bucket creds    | yes — the only thing that does | no                                  |
-| needs the archive     | no (only its OID)              | no                                  |
-| creates the PVC / Job | yes                            | no                                  |
+|                       | `provision_seed` (parent) | `await_seed` (test)                 |
+| --------------------- | ------------------------- | ----------------------------------- |
+| runs in               | `ztest run` preflight     | the runner pod, at `TestEnv::build` |
+| needs bucket creds    | no — nothing here can     | no                                  |
+| needs the archive     | no (only its OID)         | no                                  |
+| creates the PVC / Job | yes                       | no                                  |
 
-- `provision_seed` presigns a GET for `lfs/<oid>` and hands the URL to a puller Job; the pod `curl`s it
-  into `tar -x -C /seed` itself → R2 → node at cluster bandwidth. URL is scoped to one object and one
-  verb and expires, which is why no credential Secret is ever mounted into the cluster
+- `provision_seed` hands the manifest's public URL for `lfs/<oid>` to a puller Job; the pod `curl`s it
+  into `tar -x -C /seed` itself → CDN → node at cluster bandwidth. No credential Secret is mounted into
+  the cluster because none exists to mount
 - `await_seed` only waits. A seed missing there is a preflight bug (a test mounting an archive it never
   declared with `#[ztest::needs]`) and the error says so instead of timing out
 

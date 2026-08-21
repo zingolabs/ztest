@@ -16,6 +16,8 @@ pub mod schedule;
 
 #[cfg(test)]
 mod e2e;
+#[cfg(test)]
+mod fixture_child;
 
 /// During-run progress, tallied by the run loop (`console`) from relayed
 /// per-test result lines. `total` = preflight test count, `0` = unknown

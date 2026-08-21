@@ -56,15 +56,15 @@ pub struct Args {
     force: bool,
 }
 
-pub fn execute(args: Args) -> ExitCode {
-    // Bind the profile, else cleanup reaps against the *ambient* kube-context.
-    // Must precede `block_on`: `activate` calls `set_var` (single-thread only) and
-    // `block_on` spawns runtime threads.
-    // SAFETY: still single-threaded here.
-    if let Err(detail) = unsafe { ztest::api::cluster_config::activate(args.cluster.as_deref()) } {
-        eprintln!("ztest cleanup: {detail}");
-        return ExitCode::FAILURE;
+impl Args {
+    /// `--cluster`, read back by `bind_cluster` in dispatch — the one place that binds a
+    /// profile, for every subcommand
+    pub(crate) fn cluster_profile(&self) -> Option<&str> {
+        self.cluster.as_deref()
     }
+}
+
+pub fn execute(args: Args) -> ExitCode {
     super::block_on("cleanup", super::Rt::Multi, run(&args))
 }
 

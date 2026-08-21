@@ -226,7 +226,7 @@ pub struct SeedEntry {
 impl SeedEntry {
     /// Unauthenticated URL the puller fetches
     pub fn blob_url(&self) -> String {
-        crate::storage::r2::blob_url(&self.base_uri, &self.key_prefix, &self.oid)
+        crate::storage::blob_url(&self.base_uri, &self.key_prefix, &self.oid)
     }
 }
 
@@ -609,8 +609,8 @@ mod tests {
             size: 4096,
             uncompressed_bytes: 0,
             payload: SeedPayload::Archive,
-            base_uri: crate::storage::r2::BASE_URI,
-            key_prefix: crate::storage::r2::KEY_PREFIX,
+            base_uri: crate::storage::BASE_URI,
+            key_prefix: crate::storage::KEY_PREFIX,
         };
         let line = serde_json::to_string(&InventoryLineRef::Seed(&decl)).unwrap();
         assert!(line.contains("\"kind\":\"seed\""), "missing seed tag: {line}");

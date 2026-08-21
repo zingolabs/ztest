@@ -98,6 +98,9 @@ tar -I zstd -cf tests/assets/<name>.tar.zst -C <data-dir> .
 ztest snapshot manifest <archive> > snapshots/<net>/zebra-<ver>-<up>.toml && ztest snapshot push <archive>
 ```
 
+`push` is the only ztest command that takes credentials (`ztest snapshot config set`, once per
+machine). Reading a snapshot never does.
+
 **Materialization** (lazy, first use) at `TestEnv::build()`, per archive mount:
 
 ```

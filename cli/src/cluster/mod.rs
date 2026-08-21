@@ -89,6 +89,17 @@ pub struct Args {
     cmd: Cmd,
 }
 
+impl Args {
+    /// `--cluster` from whichever subcommand carries one, for `bind_cluster`
+    pub(crate) fn cluster_profile(&self) -> Option<&str> {
+        match &self.cmd {
+            Cmd::Setup(a) => a.cluster_profile(),
+            Cmd::Check { cluster } => cluster.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Provision the namespaced resources ztest owns. Idempotent. The cluster
@@ -171,8 +182,8 @@ pub fn execute(args: Args) -> ExitCode {
     // `setup`/`check`/`add` reach a cluster (own runtimes); the rest edit a local file
     let result = match args.cmd {
         Cmd::Setup(a) => return setup::execute(a),
-        Cmd::Check { cluster } => {
-            return super::block_on("cluster check", super::Rt::Current, check(cluster));
+        Cmd::Check { .. } => {
+            return super::block_on("cluster check", super::Rt::Current, check());
         }
         Cmd::List => list(),
         Cmd::Current => current(),
@@ -317,11 +328,19 @@ fn persist_runtime(name: &str, rt: ContainerRuntime) -> Result<()> {
 /// - Only on exactly one candidate (several = a choice ztest must not make silently)
 /// - Never fatal: the profile is already saved, and `ztest cluster check` is the gate
 async fn adopt_storage_driver(name: &str, theme: &Theme) {
-    // SAFETY: pre-spawn, as in `check` (applies the profile via non-thread-safe env set)
-    if unsafe { cluster_config::activate(Some(name)) }.is_err() {
-        return;
-    }
-    let Ok(client) = ztest::api::cluster::client().await else {
+    // The profile just written, not the one bound at dispatch — and reached by naming its
+    // context, never by mutating env: this runs inside the runtime, where `set_var` is
+    // unsound and a global rebind would leak into the rest of the command
+    let context = cluster_config::load()
+        .ok()
+        .and_then(|cfg| cfg.clusters.get(name).and_then(|p| p.context.clone()));
+    let connect = async {
+        match &context {
+            Some(ctx) => ztest::api::cluster::client_for_context(ctx).await,
+            None => ztest::api::cluster::client().await,
+        }
+    };
+    let Ok(client) = connect.await else {
         unset("storage driver", "cluster unreachable — run `ztest cluster check`", theme);
         return;
     };
@@ -398,13 +417,13 @@ fn known(cfg: &Config) -> String {
 
 /// Probe the cluster, print what it can and cannot do
 /// (non-zero only on a missing *required* capability, else unusable as a CI gate)
-async fn check(cluster: Option<String>) -> Result<()> {
-    // SAFETY: pre-spawn, as in `setup` (applies the profile via non-thread-safe env set)
-    let bound = unsafe { cluster_config::activate(cluster.as_deref()) }?;
+async fn check() -> Result<()> {
+    // Bound by `bind_cluster` in dispatch; this only needs its name for the banner
+    let bound = cluster_config::active_profile();
     let client = ztest::api::cluster::client().await.context("connecting to cluster")?;
 
     let report = ztest::api::capability::probe(&client).await;
-    print!("{}", render(&report, bound.as_deref(), &Theme::detect()));
+    print!("{}", render(&report, bound, &Theme::detect()));
 
     match report.is_runnable() {
         true => Ok(()),

@@ -55,16 +55,15 @@ pub struct Args {
     install_storage: bool,
 }
 
-pub fn execute(args: Args) -> ExitCode {
-    // Bind kube-context + kubeconfig pre-runtime → the resolution below targets it.
-    // Precedence: --cluster > ambient env > default.
-    //
-    // SAFETY: still single-threaded; `set_var` must precede thread creation.
-    if let Err(detail) = unsafe { ztest::api::cluster_config::activate(args.cluster.as_deref()) } {
-        eprintln!("ztest cluster setup: {detail}");
-        return ExitCode::FAILURE;
+impl Args {
+    /// `--cluster`, read back by `bind_cluster` in dispatch — the one place that binds a
+    /// profile, for every subcommand
+    pub(crate) fn cluster_profile(&self) -> Option<&str> {
+        self.cluster.as_deref()
     }
+}
 
+pub fn execute(args: Args) -> ExitCode {
     crate::block_on("cluster setup", crate::Rt::Multi, run(&args))
 }
 

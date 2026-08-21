@@ -81,7 +81,7 @@ pub struct Artifact {
     pub size: u64,
     /// Extracted. Sizes the seed PVC
     pub uncompressed_bytes: u64,
-    /// Public read base; unauthenticated `GET` (see [`crate::storage::r2::BASE_URI`])
+    /// Public read base; unauthenticated `GET` (see [`crate::storage::BASE_URI`])
     pub base_uri: &'static str,
     pub key_prefix: &'static str,
 }
@@ -89,7 +89,7 @@ pub struct Artifact {
 impl Artifact {
     /// Unauthenticated URL the puller fetches
     pub fn blob_url(&self) -> String {
-        crate::storage::r2::blob_url(self.base_uri, self.key_prefix, self.oid)
+        crate::storage::blob_url(self.base_uri, self.key_prefix, self.oid)
     }
 }
 

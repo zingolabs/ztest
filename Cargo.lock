@@ -905,6 +905,7 @@ checksum = "25f104b501bf2364e78d0d3974cbc774f738f5865306ed128e1e0d7499c0ad96"
 dependencies = [
  "console",
  "shell-words",
+ "zeroize",
 ]
 
 [[package]]
@@ -5817,7 +5818,6 @@ name = "ztest"
 version = "0.1.5"
 dependencies = [
  "async-trait",
- "base64",
  "bip0039",
  "blake3",
  "bytesize",
@@ -5835,7 +5835,6 @@ dependencies = [
  "kube",
  "libc",
  "nextest-metadata",
- "object_store",
  "orchard",
  "owo-colors",
  "proc-macro2",
@@ -5899,7 +5898,7 @@ dependencies = [
  "kube",
  "libc",
  "nextest-metadata",
- "owo-colors",
+ "object_store",
  "rand 0.8.7",
  "reqwest",
  "serde",
@@ -5910,7 +5909,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "toml 0.8.23",
- "tracing",
  "ztest",
  "ztest_ui",
 ]

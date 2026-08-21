@@ -510,8 +510,8 @@ mod tests {
             oid: "a".repeat(64).leak(),
             size: 1,
             uncompressed_bytes: 2,
-            base_uri: crate::storage::r2::BASE_URI,
-            key_prefix: crate::storage::r2::KEY_PREFIX,
+            base_uri: crate::storage::BASE_URI,
+            key_prefix: crate::storage::KEY_PREFIX,
         }
     }
 }

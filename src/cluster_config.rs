@@ -355,7 +355,18 @@ pub unsafe fn activate(flag: Option<&str>) -> Result<Option<String>, ConfigError
     if let Some(ctx) = &profile.context {
         verify_context(ctx)?;
     }
+    let _ = ACTIVE_PROFILE.set(name.clone());
     Ok(Some(name))
+}
+
+/// Profile [`activate`] bound, for callers that only want to *name* it (banners, errors).
+///
+/// Written once, by the single `activate` the CLI runs before dispatch — two subcommands
+/// reading different answers here would be the bug this path exists to prevent
+static ACTIVE_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn active_profile() -> Option<&'static str> {
+    ACTIVE_PROFILE.get().map(String::as_str)
 }
 
 unsafe fn apply(profile: &Profile, force: bool) {

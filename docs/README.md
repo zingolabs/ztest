@@ -19,6 +19,7 @@ down on exit.
 | [ops-cluster-requirements.md](ops-cluster-requirements.md) | What a cluster must provide before ztest can run on it, and how `ztest cluster check` reports it |
 | [ops-local-cluster.md](ops-local-cluster.md)               | Give a local kind cluster snapshot-capable storage (CSI hostpath, or TopoLVM for fast seeds)     |
 | [ops-clusters.md](ops-clusters.md)                         | Bind a kube-context + cluster class + registry under a named `ztest cluster` profile             |
+| [seed-cdn runbook](../workers/seed-cdn/README.md)          | Operate the read-only Worker that is ztest's seed read path: deploy, verify, repoint `base_uri`  |
 
 ## Design — how it works
 

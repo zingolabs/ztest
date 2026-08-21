@@ -46,6 +46,7 @@ pub mod inventory;
 pub mod materialize;
 pub mod metrics;
 pub mod naming;
+pub mod paths;
 pub mod pipeline;
 pub mod plan;
 pub mod pod_status;

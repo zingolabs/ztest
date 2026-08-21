@@ -81,26 +81,24 @@ pub async fn spawn_test(
 ) -> TestOutcome {
     let started = Instant::now();
 
+    // A spawn failure has no child and so no output of its own. Reported blank it reaches the
+    // user as a bare `XFAIL` with an empty pane — and the causes are all environmental
+    // (missing binary, unresolved shared library, wrong arch), none guessable from the test
+    // name. `pod_runner` already names its reason; this is the same contract
+    let failed = |e: std::io::Error| TestOutcome {
+        verdict: Verdict::SpawnError,
+        output: format!("cannot execute {}: {e}", item.binary_path.display()).into_bytes(),
+        duration: started.elapsed(),
+    };
+
     let mut cmd = build_command(item, env);
     let reader = match attach_stdio(&mut cmd, env.capture) {
         Ok(r) => r,
-        Err(_) => {
-            return TestOutcome {
-                verdict: Verdict::SpawnError,
-                output: Vec::new(),
-                duration: started.elapsed(),
-            };
-        }
+        Err(e) => return failed(e),
     };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => {
-            return TestOutcome {
-                verdict: Verdict::SpawnError,
-                output: Vec::new(),
-                duration: started.elapsed(),
-            };
-        }
+        Err(e) => return failed(e),
     };
     // Parent's writer ends must close, else the read below never sees EOF
     drop(cmd);
@@ -220,46 +218,20 @@ fn kill_group(pid: Option<u32>) {
 #[cfg(not(unix))]
 fn kill_group(_pid: Option<u32>) {}
 
-/// Write `body` as an executable `#!/bin/sh` script at `path`, atomically.
-///
-/// A child forked by *any* thread inherits every fd open at that moment → a concurrent
-/// `spawn_test` child can hold a write handle to a half-written script and executing it
-/// fails `ETXTBSY`. Write-to-scratch + rename closes the window, and dropping the file
-/// *before* the rename is load-bearing (rename keeps the inode, so an open handle follows)
-#[cfg(all(test, unix))]
-pub fn write_script(path: &std::path::Path, body: &str) {
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let scratch = path.with_extension("sh.partial");
-    let mut f = std::fs::File::create(&scratch).unwrap();
-    write!(f, "#!/bin/sh\n{body}\n").unwrap();
-    let mut perms = f.metadata().unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&scratch, perms).unwrap();
-    drop(f);
-    std::fs::rename(&scratch, path).unwrap();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::fixture_child as child;
     use crate::qos::QosClass;
-    use std::path::PathBuf;
-    use std::sync::OnceLock;
+    use std::path::{Path, PathBuf};
 
-    /// Serializes the process-spawning tests in *this* module only — `engine::e2e` spawns
-    /// children too and cannot take this lock, which is why
-    /// [`write_script`](super::write_script) closes the handle before the path exists
-    fn serial() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
+    /// No lock and no temp files: the child is this binary, so these tests share nothing and
+    /// run fully parallel. The `serial()` mutex they used to take existed only to order
+    /// writes to fixture scripts
     fn env() -> EngineEnv {
         EngineEnv {
             dylib_path: OsString::new(),
-            run_id: "run-test".into(),
+            run_id: child::RUN_ID.into(),
             sa: "ztest-local".into(),
             no_cleanup: false,
             capture: true,
@@ -269,12 +241,12 @@ mod tests {
         }
     }
 
-    fn item(bin: &str, name: &str) -> WorkItem {
+    fn item(bin: &Path, name: &str) -> WorkItem {
         let p = QosClass::Basic.profile();
         WorkItem {
             binary_id: "t::b".into(),
             test_name: name.into(),
-            binary_path: PathBuf::from(bin),
+            binary_path: bin.to_path_buf(),
             cwd: PathBuf::from("/"),
             class: QosClass::Basic,
             footprint: p.footprint,
@@ -285,172 +257,104 @@ mod tests {
         }
     }
 
-    /// Script ignores argv (so the fixed `--exact ... --nocapture` don't matter) and uses
-    /// `/bin/sh`, which exists where `/bin/true`/`/bin/false` don't (NixOS)
-    #[cfg(unix)]
-    fn script(tag: &str, body: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("ztest-{tag}-{}.sh", std::process::id()));
-        super::write_script(&path, body);
-        path
+    /// Run one [`fixture_child`](crate::engine::fixture_child) helper to completion
+    async fn play(name: &str, env: &EngineEnv) -> TestOutcome {
+        spawn_test(
+            &item(&child::exe(), &child::test_name(name)),
+            env,
+            Duration::from_secs(5),
+            &Cancel::never(),
+        )
+        .await
     }
 
-    #[cfg(unix)]
+    fn output(out: &TestOutcome) -> String {
+        String::from_utf8_lossy(&out.output).to_string()
+    }
+
+    /// The marker matters: a wrong `--exact` selects no test and libtest still exits 0, so
+    /// verdict alone cannot tell "the child passed" from "the child never ran"
     #[tokio::test]
     async fn pass_on_zero_exit() {
-        let _g = serial().lock().await;
-        let p = script("pass", "exit 0");
-        let out = spawn_test(
-            &item(p.to_str().unwrap(), "x"),
-            &env(),
-            Duration::from_secs(5),
-            &Cancel::never(),
-        )
-        .await;
-        let _ = std::fs::remove_file(&p);
+        let out = play("exits_zero", &env()).await;
         assert_eq!(out.verdict, Verdict::Pass);
+        assert!(output(&out).contains("zero-ok"), "{:?}", output(&out));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn fail_on_nonzero_exit() {
-        let _g = serial().lock().await;
-        let p = script("fail", "exit 3");
-        let out = spawn_test(
-            &item(p.to_str().unwrap(), "x"),
-            &env(),
-            Duration::from_secs(5),
-            &Cancel::never(),
-        )
-        .await;
-        let _ = std::fs::remove_file(&p);
+    async fn fail_carries_the_childs_exit_code() {
+        let out = play("exits_three", &env()).await;
         assert_eq!(out.verdict, Verdict::Fail(3));
+        assert!(output(&out).contains("three-ok"), "{:?}", output(&out));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn captures_child_output() {
-        let _g = serial().lock().await;
-        let p = script("cap", "echo hello-stdout");
-        let out = spawn_test(
-            &item(p.to_str().unwrap(), "x"),
-            &env(),
-            Duration::from_secs(5),
-            &Cancel::never(),
-        )
-        .await;
-        let _ = std::fs::remove_file(&p);
-        assert!(
-            String::from_utf8_lossy(&out.output).contains("hello-stdout"),
-            "{:?}",
-            String::from_utf8_lossy(&out.output)
-        );
+        let out = play("prints_stdout", &env()).await;
+        assert!(output(&out).contains("hello-stdout"), "{:?}", output(&out));
     }
 
     /// A dropped `ZTEST_ENGINE` fails every cluster test fast at `require_orchestrator`
-    #[cfg(unix)]
     #[tokio::test]
     async fn children_run_marked_as_orchestrated() {
-        let _g = serial().lock().await;
-        let p = script("engineenv", "printf 'ENGINE=[%s]\\n' \"$ZTEST_ENGINE\"");
-        let out = spawn_test(
-            &item(p.to_str().unwrap(), "x"),
-            &env(),
-            Duration::from_secs(5),
-            &Cancel::never(),
-        )
-        .await;
-        let _ = std::fs::remove_file(&p);
+        let out = play("prints_ztest_engine", &env()).await;
         assert_eq!(out.verdict, Verdict::Pass);
         assert!(
-            String::from_utf8_lossy(&out.output).contains("ENGINE=[1]"),
+            output(&out).contains("ENGINE=[1]"),
             "children must inherit ZTEST_ENGINE=1; got {:?}",
-            String::from_utf8_lossy(&out.output)
+            output(&out)
         );
     }
 
     /// Without it every `dev!` component resolves to `DevImageMissing` (the manifest
     /// `seed_dev_images` fills lives in the parent process)
-    #[cfg(unix)]
     #[tokio::test]
     async fn children_inherit_the_resolved_image_manifest() {
-        let _g = serial().lock().await;
         let mut e = env();
         e.image_refs.insert("zainod@sha".into(), "zainod:dev-abc".into());
-        let p = script("imagerefs", "printf 'REFS=%s\\n' \"$ZTEST_IMAGE_REFS\"");
-        let out = spawn_test(
-            &item(p.to_str().unwrap(), "x"),
-            &e,
-            Duration::from_secs(5),
-            &Cancel::never(),
-        )
-        .await;
-        let _ = std::fs::remove_file(&p);
-        let got = String::from_utf8_lossy(&out.output).to_string();
-        assert!(got.contains(r#"{"zainod@sha":"zainod:dev-abc"}"#), "{got:?}");
+        let out = play("prints_image_refs", &e).await;
+        assert!(output(&out).contains(r#"{"zainod@sha":"zainod:dev-abc"}"#), "{:?}", output(&out));
     }
 
-    /// stderr must land *inside* the frame: appended after libtest's `test result:` line
-    /// it is truncated by `strip_libtest_frame`, taking the failure reason with it
-    #[cfg(unix)]
+    /// stderr must land *inside* the frame: appended after libtest's `test result:` line it
+    /// is truncated by `strip_libtest_frame`, taking the failure reason with it. The frame
+    /// here is libtest's own — the child is a real test binary, not a script imitating one
     #[tokio::test]
     async fn stderr_survives_the_libtest_footer_strip() {
-        let _g = serial().lock().await;
-        let p = script(
-            "interleave",
-            "echo 'running 1 test'\n\
-             echo 'INFO provisioning component'\n\
-             echo 'Error: image build failed for zainod' >&2\n\
-             echo 'test x ... FAILED'\n\
-             echo 'failures:'\n\
-             echo 'test result: FAILED. 0 passed; 1 failed'\n\
-             exit 101",
-        );
-        let out = spawn_test(
-            &item(p.to_str().unwrap(), "x"),
-            &env(),
-            Duration::from_secs(5),
-            &Cancel::never(),
-        )
-        .await;
-        let _ = std::fs::remove_file(&p);
-        let shown = crate::libtest::strip_libtest_frame(&out.output, "x");
+        let name = child::test_name("fails_with_an_error_line");
+        let out = play("fails_with_an_error_line", &env()).await;
+        assert!(matches!(out.verdict, Verdict::Fail(_)), "{:?}", out.verdict);
+        let shown = crate::libtest::strip_libtest_frame(&out.output, &name);
         let shown = String::from_utf8_lossy(&shown).to_string();
         assert!(shown.contains("Error: image build failed"), "{shown:?}");
     }
 
     #[tokio::test]
-    async fn spawn_error_on_missing_binary() {
+    async fn spawn_error_names_the_binary_it_could_not_run() {
         let out = spawn_test(
-            &item("/nonexistent/zzz", "x"),
+            &item(Path::new("/nonexistent/zzz"), "x"),
             &env(),
             Duration::from_secs(5),
             &Cancel::never(),
         )
         .await;
         assert_eq!(out.verdict, Verdict::SpawnError);
+        // A blank pane under `XFAIL` is unactionable; the pod runner already names its
+        // reason and the local path must match
+        let shown = output(&out);
+        assert!(shown.contains("/nonexistent/zzz"), "{shown:?}");
+        assert!(!shown.trim().is_empty(), "spawn failure must explain itself");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_long_sleeper() {
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
-        let _g = serial().lock().await;
-
-        // Sleeps far past the cap
-        let path = std::env::temp_dir().join(format!("ztest-sleeper-{}.sh", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(b"#!/bin/sh\nsleep 30\n").unwrap();
-            let mut perms = f.metadata().unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-
-        let it = item(path.to_str().unwrap(), "x");
-        let out = spawn_test(&it, &env(), Duration::from_millis(300), &Cancel::never()).await;
-        let _ = std::fs::remove_file(&path);
-
+        let out = spawn_test(
+            &item(&child::exe(), &child::test_name("sleeps_past_any_cap")),
+            &env(),
+            Duration::from_millis(300),
+            &Cancel::never(),
+        )
+        .await;
         assert_eq!(out.verdict, Verdict::Timeout);
         assert!(out.duration < Duration::from_secs(5));
     }

@@ -11,9 +11,9 @@
 //! # The pull
 //!
 //! 1. Get-or-create the PVC (409 = lost the race → wait-for-ready)
-//! 2. If created, or not `ready=true`, launch a puller Job: `curl` the public
-//!    `lfs/<oid>` into `tar -x -C /seed` (`cat > /seed/blob` for a file seed).
-//!    R2 → node, nothing through this process, hence [`progress`]
+//! 2. If created, or not `ready=true`, launch a puller Job: `curl` `lfs/<oid>` as byte
+//!    ranges into `tar -x -C /seed` (`cat > /seed/blob` for a file seed), signed when
+//!    this process holds credentials. R2 → node, nothing through here, hence [`progress`]
 //! 3. Label `seeds.ztest.io/ready=true` + create the paired `VolumeSnapshot`, from
 //!    which `seeds::read_seed_handle` resolves the handle and `bind_seed` clones per pod
 //!
@@ -48,10 +48,51 @@ const PULL_BUDGET_FLOOR: Duration = Duration::from_secs(300);
 /// spuriously). Override: `ZTEST_SEED_THROUGHPUT_MIB_S`
 const DEFAULT_THROUGHPUT_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 
-/// Presigned-URL lifetime: covers schedule + image pull + the largest transfer,
-/// short enough that a leaked manifest is no standing grant
 /// Bounded: a wrong base_uri hangs on connect, and this sits in front of every seed
 const BLOB_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Refuse to fill a volume that cannot hold the artifact.
+///
+/// - Name is content+driver, never capacity → a PVC created under an older sizing policy
+///   is adopted silently and caps the extraction
+/// - Failure surfaces hours in as `tar: Cannot write: No space left on device`, naming an
+///   `.sst` file rather than the volume (observed: a 48 GiB PVC adopted for a 258 GiB tree)
+/// - Never deletes: the volume may hold another run's seed. Names the remedy instead
+fn adopted_volume_fits(
+    pvc: &PersistentVolumeClaim,
+    seed: &SeedEntry,
+    pvc_name: &str,
+) -> Result<(), EnvError> {
+    // `status.capacity` = what the CSI driver actually gave; `spec.resources` is only what
+    // was asked for, and a bound volume can be either
+    let have = pvc
+        .status
+        .as_ref()
+        .and_then(|s| s.capacity.as_ref())
+        .and_then(|c| c.get("storage"))
+        .or_else(|| pvc.spec.as_ref()?.resources.as_ref()?.requests.as_ref()?.get("storage"))
+        .map(|q| q.0.as_str());
+    let want = crate::cluster_config::seed_size_for(seed.uncompressed_bytes);
+    match volume_shortfall(have, &want) {
+        None => Ok(()),
+        Some((have, want)) => Err(EnvError::ArchiveMaterializeFailed {
+            archive: seed.name.clone(),
+            reason: format!(
+                "seed volume {pvc_name} is {have}, but this artifact extracts to {want}. \
+                 It predates the current sizing; delete it and re-run: \
+                 kubectl -n {SEEDS_NAMESPACE} delete pvc {pvc_name}"
+            ),
+        }),
+    }
+}
+
+/// `(have, want)` when the volume is too small, `None` when it fits or either quantity is
+/// unreadable — an unparseable capacity is not evidence of a problem
+fn volume_shortfall<'a>(have: Option<&'a str>, want: &'a str) -> Option<(&'a str, &'a str)> {
+    use crate::qos::units::parse_mem_bytes_opt;
+    let (h, w) = (parse_mem_bytes_opt(have?)?, parse_mem_bytes_opt(want)?);
+    (h < w).then_some((have?, want))
+}
 
 /// Wall-clock budget for `bytes`. Sized, not flat (a constant is at once generous
 /// for a 100 MB cache and short for a 9.7 GB snapshot, which surfaces as an opaque
@@ -202,6 +243,7 @@ async fn create_seed_pvc(
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
     if let Some(existing) = api.get_opt(pvc_name).await.map_err(env_err)? {
         if existing.metadata.deletion_timestamp.is_none() {
+            adopted_volume_fits(&existing, seed, pvc_name)?;
             return Ok(false);
         }
         // Never adopt a deleting PVC: it still carries its `ready=true`, so believing
@@ -368,10 +410,10 @@ async fn materialize(
     let pods: Api<Pod> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
 
     // Check before the Job: a missing object fails here, named, in ms, not as a puller
-    // retrying a 404 to its budget. Unauthenticated — the read path takes no credentials
+    // retrying a 404 to its budget. Unauthenticated, like every read ztest makes
     let url = seed.blob_url();
     progress.note("locating blob");
-    let present = crate::storage::r2::blob_present(&url, seed.size, BLOB_PROBE_TIMEOUT)
+    let present = crate::storage::blob_present(&url, seed.size, BLOB_PROBE_TIMEOUT)
         .await
         .map_err(|e| storage_fatal(&seed.name, e))?;
     if !present {
@@ -453,8 +495,14 @@ fn puller_stuck(archive: &str, pod: &str, budget: Duration) -> MaterializeErr {
 /// - Digest checked in flight: a seed is *named* by its content, so bytes hashing to
 ///   anything else are the one corruption no other check here catches
 fn puller_cmd(seed: &SeedEntry) -> Result<String, storage::StorageError> {
+    puller_cmd_chunked(seed, CHUNK_BYTES)
+}
+
+/// [`puller_cmd`] at an explicit chunk size, so a test can drive the same command over a
+/// fixture small enough to run in-process
+fn puller_cmd_chunked(seed: &SeedEntry, chunk: u64) -> Result<String, storage::StorageError> {
     let prelude = "set -o pipefail";
-    let fetch = "curl --fail --silent --show-error --location \"$SEED_URL\"";
+    let fetch = ranged_fetch(seed.size, chunk);
     let payload = match seed.payload {
         crate::inventory::SeedPayload::Archive => {
             let compression = storage::compression_from_name(&seed.name).ok_or_else(|| {
@@ -471,12 +519,71 @@ fn puller_cmd(seed: &SeedEntry) -> Result<String, storage::StorageError> {
             format!("{fetch} | tee {VERIFY_FIFO} | {METER} > /seed/blob && {NORMALIZE_MODES}")
         }
     };
-    let verified = format!("{VERIFY_OPEN}; {payload} && {}", verify_close(&seed.oid));
+    // Verify grouped, not spliced: it is a `;`-separated list, so a bare `&&` would gate
+    // only its first command and leave the group's status set by the digest test —
+    // masking a failed `tar` whenever the bytes still hashed correctly
+    let verified = format!("{VERIFY_OPEN}; {payload} && {{ {} ; }}", verify_close(&seed.oid));
     // Group-then-pipe, not appended to the payload's pipeline: the meter writes to
     // *stderr*, and only a group carries every command's stderr through one delimiter
     // `pipefail` spans both pipelines → `tr` cannot mask a failed transfer
     Ok(format!("{prelude}; {{ {verified} ; }} 2>&1 | {LINE_DELIMIT}"))
 }
+
+/// Blob → stdout as byte ranges, one chunk ahead of the consumer.
+///
+/// - One connection for the whole object = the failure mode (no endpoint holds a
+///   multi-hour transfer open; a 245 GiB seed died at 8/33/34 GB, restarting from zero)
+/// - Chunk staged, emitted whole (a partial range already on stdout would be re-sent by
+///   its retry → duplicate bytes past the hasher)
+/// - Staging alone would serialise transfer and extraction, so chunk *n+1* downloads
+///   while *n* feeds `tar`: measured 17.1 → 20.3 MB/s mean over 6 pairs, and the floor
+///   11.8 → 18.4 (the win is the consumer's time, so it grows with link speed)
+/// - Two buffers, never more: a deeper queue would stage more disk for a transfer
+///   already at the link's ceiling
+fn ranged_fetch(size: u64, chunk: u64) -> String {
+    // `fetch <off> <end> <file>`, retried; run backgrounded, so its status reaches the
+    // loop through `wait`
+    let fetch = format!(
+        "fetch() {{ want=$(($2 - $1 + 1)); try=1; while :; do \
+         curl --fail --silent --show-error --location --range \"$1-$2\" \
+         --speed-limit {STALL_FLOOR_BPS} --speed-time {STALL_WINDOW_SECS} \
+         --output \"$3\" \"$SEED_URL\" && [ \"$(wc -c < \"$3\")\" -eq $want ] && return 0; \
+         [ $try -ge {CHUNK_ATTEMPTS} ] && return 1; sleep $((try * 5)); try=$((try + 1)); \
+         done; }}"
+    );
+    format!(
+        "{fetch}; \
+         {{ a={CHUNK_FILE}.a; b={CHUNK_FILE}.b; off=0; \
+         end=$(({chunk} - 1)); [ $end -ge {size} ] && end=$(({size} - 1)); \
+         fetch $off $end $a & p=$!; \
+         while [ $off -lt {size} ]; do \
+         wait $p || exit 1; \
+         nxt=$((end + 1)); \
+         [ $nxt -lt {size} ] && {{ nend=$((nxt + {chunk} - 1)); \
+         [ $nend -ge {size} ] && nend=$(({size} - 1)); \
+         fetch $nxt $nend $b & p=$!; end=$nend; }}; \
+         cat $a || exit 1; t=$a; a=$b; b=$t; off=$nxt; \
+         done; rm -f {CHUNK_FILE}.a {CHUNK_FILE}.b ; }}"
+    )
+}
+
+/// Bytes per ranged GET. Short enough that a dropped connection costs one chunk, long
+/// enough that a 245 GiB seed stays under 1k requests. Two of these are staged at once
+const CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Redial floor: a range crawling under this for [`STALL_WINDOW_SECS`] is abandoned to the
+/// retry rather than held open. A throttled connection does not recover on its own, and a
+/// stalled one costs the whole run's clock
+const STALL_FLOOR_BPS: u64 = 1024 * 1024;
+
+/// Long enough to ride out a pause, far under the run budget
+const STALL_WINDOW_SECS: u64 = 60;
+
+/// Attempts per chunk before the pull fails (backoff = 5s × attempt)
+const CHUNK_ATTEMPTS: u32 = 5;
+
+/// Where [`ranged_fetch`] stages the in-flight chunk
+const CHUNK_FILE: &str = "/tmp/chunk";
 
 /// Where `tee` forks the stream to the hasher. A FIFO, so the bytes are hashed as they
 /// stream past — nothing is staged, and a 21 GB archive needs no second copy
@@ -742,8 +849,8 @@ mod tests {
             size: 4096,
             uncompressed_bytes: 0,
             payload,
-            base_uri: crate::storage::r2::BASE_URI.to_string(),
-            key_prefix: crate::storage::r2::KEY_PREFIX.to_string(),
+            base_uri: crate::storage::BASE_URI.to_string(),
+            key_prefix: crate::storage::KEY_PREFIX.to_string(),
         }
     }
 
@@ -774,7 +881,9 @@ mod tests {
             let cmd = puller_cmd(&s).expect("valid seed");
             assert!(cmd.contains(&format!("tee {VERIFY_FIFO}")), "{cmd}");
             assert!(cmd.contains("wait $VERIFY_PID"), "not joined on a real pid: {cmd}");
-            assert!(cmd.contains("&& wait $VERIFY_PID"), "compared unconditionally: {cmd}");
+            // Grouped: a bare `&&` would gate only the `wait`, leaving the pod's status
+            // set by the digest test — a failed `tar` would pass on matching bytes
+            assert!(cmd.contains("&& { wait $VERIFY_PID"), "compared unconditionally: {cmd}");
             assert!(cmd.contains(&format!("expected {}", s.oid)), "{cmd}");
             assert!(cmd.contains("exit 1"), "mismatch does not fail the pod: {cmd}");
         }
@@ -798,6 +907,198 @@ mod tests {
             };
             let cmd = puller_cmd(&seed(name, payload)).expect("valid seed");
             assert_eq!(cmd.find("set -o pipefail"), Some(0), "{cmd}");
+        }
+    }
+
+    /// Multi-hour transfers get dropped, so the blob arrives as ranges: a chunk reaches
+    /// the consumer only once it is whole, and one that never is fails the pod
+    #[test]
+    fn the_transfer_is_ranged_and_a_short_chunk_never_reaches_the_consumer() {
+        let mut s = seed("chain.tar.zst", SeedPayload::Archive);
+        s.size = 3 * CHUNK_BYTES;
+        let cmd = puller_cmd(&s).expect("known suffix");
+        assert!(cmd.contains(&format!("[ $off -lt {} ]", s.size)), "{cmd}");
+        assert!(cmd.contains(r#"--range "$1-$2""#), "{cmd}");
+        assert!(cmd.contains(r#"--output "$3""#), "not staged: {cmd}");
+        let whole = r#"[ "$(wc -c < "$3")" -eq $want ]"#;
+        assert!(cmd.contains(whole), "short chunk not caught: {cmd}");
+        assert!(cmd.find(whole) < cmd.find("cat $a"), "emitted before it was whole: {cmd}");
+    }
+
+    /// Transfer and extraction overlap, or the link idles for every byte `tar` spends
+    /// decompressing (measured 17.1 → 20.3 MB/s). Two buffers, swapped
+    #[test]
+    fn the_next_chunk_downloads_while_the_current_one_feeds_the_consumer() {
+        let cmd = puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive)).expect("known suffix");
+        let prefetch = cmd.find("fetch $nxt $nend $b & p=$!").expect("no prefetch");
+        let emit = cmd.find("cat $a").expect("nothing emitted");
+        assert!(prefetch < emit, "prefetch does not precede the emit it overlaps: {cmd}");
+        assert!(cmd.contains("t=$a; a=$b; b=$t"), "buffers never swap: {cmd}");
+        assert!(cmd.contains("wait $p || exit 1"), "prefetch failure is not awaited: {cmd}");
+    }
+
+    /// A volume too small for the artifact must be refused at adoption, in milliseconds —
+    /// not discovered three hours in as `tar: No space left on device`
+    #[test]
+    fn a_volume_smaller_than_the_extracted_tree_is_refused() {
+        assert_eq!(volume_shortfall(Some("48Gi"), "297Gi"), Some(("48Gi", "297Gi")));
+        assert_eq!(volume_shortfall(Some("297Gi"), "297Gi"), None, "exact fit refused");
+        assert_eq!(volume_shortfall(Some("400Gi"), "297Gi"), None, "larger volume refused");
+    }
+
+    /// Nothing readable to compare is not evidence of a problem: a PVC whose capacity this
+    /// cannot parse still gets its pull, exactly as before the check existed
+    #[test]
+    fn an_unreadable_capacity_does_not_block_the_pull() {
+        assert_eq!(volume_shortfall(None, "297Gi"), None);
+        assert_eq!(volume_shortfall(Some("what"), "297Gi"), None);
+        assert_eq!(volume_shortfall(Some("48Gi"), "nonsense"), None);
+    }
+
+    /// A throttled range does not recover — it is redialed. Without this the pod holds a
+    /// crawling connection open against the run's clock and the retry never fires
+    #[test]
+    fn a_stalled_range_is_abandoned_to_the_retry() {
+        let cmd = puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive)).expect("known suffix");
+        let guard = format!("--speed-limit {STALL_FLOOR_BPS} --speed-time {STALL_WINDOW_SECS}");
+        assert!(cmd.contains(&guard), "{cmd}");
+    }
+
+    /// Everything the shell does, run for real: `curl` serves `file://` ranges, so the
+    /// generated command can pull a fixture archive end to end with no network and no
+    /// cluster. Covers what `sh -n` cannot — chunk boundaries, ordering across the
+    /// double buffer, the `wait` status path, and the digest gate
+    struct PullerRun {
+        dir: std::path::PathBuf,
+        seed: std::path::PathBuf,
+        status: std::process::ExitStatus,
+        /// Captured, not inherited: the meter writes a progress line per second, and a
+        /// passing test should say nothing. Surfaces in the assertion that fails
+        log: String,
+    }
+
+    /// Absent tooling skips rather than fails: this asserts ztest's command, not the
+    /// image the developer happens to be sitting in
+    fn run_puller(
+        name: &str,
+        oid: Option<&str>,
+        chunk: u64,
+        payload: &[u8],
+        dest_exists: bool,
+    ) -> Option<PullerRun> {
+        for tool in ["curl", "tar", "zstd", "sha256sum"] {
+            if std::process::Command::new(tool).arg("--version").output().is_err() {
+                eprintln!("skipping: {tool} is not on PATH");
+                return None;
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ztest-puller-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, seed) = (dir.join("src"), dir.join("seed"));
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&seed).expect("seed");
+        std::fs::write(src.join("chain.dat"), payload).expect("payload");
+
+        let archive = dir.join("chain.tar.zst");
+        let tar = std::process::Command::new("tar")
+            .args(["--zstd", "-cf"])
+            .arg(&archive)
+            .args(["-C", &src.display().to_string(), "chain.dat"])
+            .status()
+            .expect("tar runs");
+        assert!(tar.success(), "fixture archive");
+        let bytes = std::fs::read(&archive).expect("archive");
+        use sha2::Digest as _;
+        let digest = hex::encode(sha2::Sha256::digest(&bytes));
+
+        let entry = SeedEntry {
+            name: "chain.tar.zst".to_string(),
+            oid: oid.unwrap_or(&digest).to_string(),
+            size: bytes.len() as u64,
+            uncompressed_bytes: 0,
+            payload: SeedPayload::Archive,
+            base_uri: crate::storage::BASE_URI.to_string(),
+            key_prefix: crate::storage::KEY_PREFIX.to_string(),
+        };
+        // `/seed` and `/tmp` are the pod's paths; rewritten so concurrent tests cannot
+        // collide on one FIFO. Everything else is the command the cluster runs
+        // `/tmp/` first: rewriting `/seed` produces a path *under* the temp dir, which a
+        // later `/tmp/` pass would mangle
+        let cmd = puller_cmd_chunked(&entry, chunk)
+            .expect("known suffix")
+            .replace("/tmp/", &format!("{}/", dir.display()))
+            .replace("/seed", &seed.display().to_string());
+        if !dest_exists {
+            std::fs::remove_dir_all(&seed).expect("drop destination");
+        }
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("SEED_URL", format!("file://{}", archive.display()))
+            .output()
+            .expect("sh runs");
+        let log = String::from_utf8_lossy(&out.stdout).into_owned();
+        Some(PullerRun { dir, seed, status: out.status, log })
+    }
+
+    /// Many chunks, none of them aligned to the object's end — the case where an
+    /// off-by-one in the range arithmetic corrupts the stream instead of failing
+    #[test]
+    fn the_puller_reassembles_an_archive_from_ranges_in_order() {
+        let payload: Vec<u8> = (0..3_000_000u32).map(|i| (i ^ (i >> 8)) as u8).collect();
+        let Some(run) = run_puller("ordered", None, 300_000, &payload, true) else {
+            return;
+        };
+        assert!(run.status.success(), "puller failed: {:?}\n{}", run.status, run.log);
+        let landed = std::fs::read(run.seed.join("chain.dat")).expect("extracted");
+        assert_eq!(landed, payload, "reassembled bytes differ from the source");
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    /// The digest gate still fires when the bytes are not what the seed is named for —
+    /// the one corruption nothing downstream would catch
+    #[test]
+    fn a_seed_whose_bytes_hash_to_something_else_fails_the_pull() {
+        let payload: Vec<u8> = (0..500_000u32).map(|i| i as u8).collect();
+        let wrong = "0".repeat(64);
+        let Some(run) = run_puller("mismatch", Some(&wrong), 300_000, &payload, true) else {
+            return;
+        };
+        assert!(!run.status.success(), "a digest mismatch completed the pull:\n{}", run.log);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    /// Extraction failing on bytes that *do* hash correctly: the group's status used to
+    /// come from the digest test, so a broken `tar` exited 0 and the PVC was marked ready
+    /// over an empty tree
+    #[test]
+    fn a_failed_extraction_fails_the_pull_even_when_the_digest_matches() {
+        let payload: Vec<u8> = (0..500_000u32).map(|i| i as u8).collect();
+        let Some(run) = run_puller("no-dest", None, 300_000, &payload, false) else {
+            return;
+        };
+        assert!(!run.status.success(), "a failed extraction reported success:\n{}", run.log);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    /// Whole command is a shell program → a quoting slip is a parse error here, not a
+    /// puller that dies on the cluster an hour in
+    #[test]
+    fn the_generated_command_parses_as_a_shell_program() {
+        use std::io::Write;
+        for payload in [SeedPayload::Archive, SeedPayload::File] {
+            let name = match payload {
+                SeedPayload::Archive => "chain.tar.zst",
+                SeedPayload::File => "wallet.dat",
+            };
+            let cmd = puller_cmd(&seed(name, payload)).expect("valid seed");
+            let mut sh = std::process::Command::new("sh")
+                .arg("-n")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("sh on PATH");
+            sh.stdin.take().expect("piped").write_all(cmd.as_bytes()).expect("write script");
+            assert!(sh.wait().expect("sh runs").success(), "{cmd}");
         }
     }
 

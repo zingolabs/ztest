@@ -50,6 +50,16 @@ pub async fn config() -> Result<kube::Config, kube::Error> {
     }
 }
 
+/// Client for one named kube-context, bypassing the ambient binding.
+///
+/// For the rare caller that means a *specific* cluster rather than the one this process is
+/// bound to — `ztest cluster add`, probing the profile it just wrote. Everything else calls
+/// [`client`], so a subcommand cannot silently talk to a different cluster than the rest
+pub async fn client_for_context(context: &str) -> Result<Client, kube::Error> {
+    ensure_crypto_provider();
+    Client::try_from(config_for_context(context).await?)
+}
+
 /// Config for a named kube-context, read from the kubeconfig in-memory
 async fn config_for_context(context: &str) -> Result<kube::Config, kube::Error> {
     use kube::config::{KubeConfigOptions, Kubeconfig};

@@ -104,6 +104,14 @@ pub struct Args {
     pub rerun: Option<RunSelector>,
 }
 
+impl Args {
+    /// `--cluster`, read back by `bind_cluster` in dispatch — the one place that binds a
+    /// profile, for every subcommand
+    pub(crate) fn cluster_profile(&self) -> Option<&str> {
+        self.cluster.as_deref()
+    }
+}
+
 /// Engine-owned flags pulled from the `cargo nextest run`-style argv.
 ///
 /// - `list_args` = the rest, verbatim, for `cargo nextest list`
@@ -383,18 +391,6 @@ pub fn execute(args: Args) -> ExitCode {
         );
     }
     let theme = Theme::detect();
-
-    // Bind the target cluster before any thread reads the env.
-    // Precedence: --cluster > ambient env > persisted default.
-    //
-    // SAFETY: set_var must precede thread creation; still single-threaded here.
-    match unsafe { ztest::api::cluster_config::activate(args.cluster.as_deref()) } {
-        Ok(_) => {}
-        Err(detail) => {
-            eprintln!("ztest run: {detail}");
-            return exit(NextestExitCode::SETUP_ERROR);
-        }
-    }
 
     let mut state = build_initial_state(&opts);
     let session_start = Instant::now();

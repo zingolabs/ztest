@@ -1,0 +1,21 @@
+{
+  // Name is a DNS label in the workers.dev URL: <=63 chars, [a-zA-Z0-9-], no leading or
+  // trailing dash. Changing it changes the URL every manifest's `base_uri` points at
+  "name": "ztest-seeds",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  // Fill from `npx wrangler whoami`.  Prevents publishing to wrong account
+  "account_id": "bb5cc5e2ef0e85af44eabfabe715b9e3",
+  // Bucket holding `lfs/<oid>`; must be in the account above
+  "r2_buckets": [
+    {
+      "binding": "SEEDS",
+      "bucket_name": "ztest-archives"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}

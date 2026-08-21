@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+pub(crate) mod bucket;
 pub(crate) mod cleanup;
 pub(crate) mod cluster;
 pub mod list_mounts;
@@ -161,12 +162,44 @@ pub(crate) fn block_on<E: Into<CliError>>(
     }
 }
 
+/// Bind the cluster profile — kube-context, kubeconfig, class, storage driver, registry —
+/// for **every** subcommand, from the one place that runs before all of them.
+///
+/// - Was per-subcommand, and five of them never called it: `snapshot list/prune/warm`,
+///   `status`, `store`, `replay` and `list-mounts` resolved whatever context `kubectl`
+///   happened to have selected, so they reported on a different cluster than `run` used
+/// - Here, not in `execute`: `activate` sets env, which is only safe before any runtime
+///   thread exists, and every `execute` starts with `block_on`
+/// - `--cluster` still belongs to the subcommands that accept one; this reads it back out
+///
+/// # Safety
+/// Single-threaded at this point — argv is parsed, no runtime spawned.
+fn bind_cluster(cmd: &Command) -> Result<Option<String>, ztest::api::cluster_config::ConfigError> {
+    let flag = match cmd {
+        Command::Run(a) => a.cluster_profile(),
+        Command::Sync(a) => a.cluster_profile(),
+        Command::Cleanup(a) => a.cluster_profile(),
+        Command::Cluster(a) => a.cluster_profile(),
+        Command::Replay(_)
+        | Command::Store(_)
+        | Command::ListMounts(_)
+        | Command::Snapshot(_)
+        | Command::Status(_)
+        | Command::Preview => None,
+    };
+    unsafe { ztest::api::cluster_config::activate(flag) }
+}
+
 /// Parse argv and dispatch.
 ///
 /// - `ExitCode` = the underlying tool's status (`Run` → `cargo nextest run`'s)
 /// - Signal termination → `130`, so CI tells "killed" from "failed"
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Err(detail) = bind_cluster(&cli.cmd) {
+        eprintln!("ztest: {detail}");
+        return ExitCode::FAILURE;
+    }
     match cli.cmd {
         Command::Run(args) => run::execute(args),
         Command::Replay(args) => replay::execute(args),

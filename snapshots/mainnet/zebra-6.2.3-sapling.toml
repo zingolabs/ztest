@@ -7,5 +7,5 @@ name               = "zebra-v6.2.3-mainnet-425200.tar.zst"
 sha256             = "6a8fb1767dd43fc288bccc0725394aa002ceeb93c03289461eb9c5b53f70a14e"
 size_bytes         = 11369205424
 uncompressed_bytes = 18746924544
-base_uri           = "https://pub-d725266f59e44d9e8bf6fcc638782af0.r2.dev"
+base_uri           = "https://ztest-seeds.elicbarbieri.workers.dev"
 key_prefix         = "lfs"

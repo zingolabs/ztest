@@ -1,13 +1,15 @@
 //! End-to-end engine stories over the real plan → scheduler → `spawn_test` → reporter → panel.
 //!
 //! - Asserts across the seams (per-module tests each fake a neighbour, so nothing else does)
-//! - Hermetic + fast: the "tests" are tiny `#!/bin/sh` scripts as short-lived children
+//! - Hermetic + fast: each "test binary" is this binary re-run as a
+//!   [`fixture_child`](crate::engine::fixture_child) helper, so nothing is written to disk
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::engine::events::RunReporter as _;
+use crate::engine::fixture_child as child;
 use crate::engine::local_runner::{EngineEnv, spawn_test};
 use crate::engine::plan::{WorkItem, build_work_list};
 use crate::engine::reporter::StyledReporter;
@@ -18,8 +20,8 @@ use crate::qos::{QosClass, Resources};
 
 // ── Fixture scaffolding ────────────────────────────────────────────────────
 
-/// Throwaway dir of executable `#!/bin/sh` "test binaries", removed on drop. All written before
-/// the run starts (no write-fd open across a concurrent `fork`+`exec` = the `ETXTBSY` race)
+/// Throwaway scratch dir for the children that need state, removed on drop. Nothing
+/// executable is written: a `fixture_child` helper *is* this binary
 struct Fixture {
     dir: PathBuf,
 }
@@ -32,12 +34,18 @@ impl Fixture {
         Self { dir }
     }
 
-    /// Atomic via [`write_script`](crate::engine::local_runner::write_script): a fork landing
-    /// inside a plain write leaves the child holding a write handle to another test's script
-    fn script(&self, name: &str, body: &str) -> PathBuf {
-        let path = self.dir.join(format!("{name}.sh"));
-        crate::engine::local_runner::write_script(&path, body);
-        path
+    /// One selected binary = this binary, re-run as `helper`.
+    ///
+    /// `cwd` is the fixture dir, which `build_command` passes to the child — so a helper
+    /// needing scratch state (the retry counter) reaches it by relative path, with nothing
+    /// to smuggle through the environment
+    fn binary(&self, binary_id: &str, helper: &str) -> SelectedBinary {
+        SelectedBinary {
+            binary_path: child::exe(),
+            cwd: self.dir.clone(),
+            binary_id: binary_id.to_string(),
+            selected_tests: vec![child::test_name(helper)],
+        }
     }
 
     fn scratch(&self, name: &str) -> PathBuf {
@@ -51,29 +59,17 @@ impl Drop for Fixture {
     }
 }
 
-/// One selected binary = one script exposing a single libtest test `test_name`
-fn binary(binary_id: &str, script: &Path, test_name: &str) -> SelectedBinary {
-    SelectedBinary {
-        binary_path: script.to_path_buf(),
-        cwd: PathBuf::from("/"),
-        binary_id: binary_id.to_string(),
-        selected_tests: vec![test_name.to_string()],
-    }
-}
-
 /// Per-binary QoS dump entry; `test_id` crate-rooted (`<crate>::<name>`), so the dummy prefix
 /// exercises the real strip/join in `build_work_list`
-fn qos(binary_id: &str, test_name: &str, class: QosClass) -> (String, Vec<QosEntry>) {
-    (
-        binary_id.to_string(),
-        vec![QosEntry { test_id: format!("somecrate::{test_name}"), class, footprint: None }],
-    )
+fn qos(binary_id: &str, helper: &str, class: QosClass) -> (String, Vec<QosEntry>) {
+    let test_id = format!("somecrate::{}", child::test_name(helper));
+    (binary_id.to_string(), vec![QosEntry { test_id, class, footprint: None }])
 }
 
 fn env() -> EngineEnv {
     EngineEnv {
         dylib_path: std::ffi::OsString::new(),
-        run_id: "e2e-run".into(),
+        run_id: child::RUN_ID.into(),
         sa: "ztest-local".into(),
         no_cleanup: false,
         capture: true,
@@ -204,20 +200,16 @@ async fn drive_real(
 #[tokio::test]
 async fn mixed_suite_packs_runs_to_completion_and_reports_each_verdict() {
     let fx = Fixture::new("mixed");
-    // Short dwell → two children genuinely overlap without slowing the suite
-    let pass_a = fx.script("alpha", "sleep 0.06; echo alpha-ok; exit 0");
-    let pass_b = fx.script("beta", "sleep 0.06; echo beta-ok; exit 0");
-    let fail_c = fx.script("gamma", "echo kaboom-from-gamma 1>&2; exit 1");
-
+    // `alpha`/`beta` dwell briefly → two children genuinely overlap without slowing the suite
     let binaries = [
-        binary("pkg::alpha", &pass_a, "runs_fine"),
-        binary("pkg::beta", &pass_b, "also_fine"),
-        binary("pkg::gamma", &fail_c, "blows_up"),
+        fx.binary("pkg::alpha", "alpha"),
+        fx.binary("pkg::beta", "beta"),
+        fx.binary("pkg::gamma", "gamma"),
     ];
     let qos_dump = [
-        qos("pkg::alpha", "runs_fine", QosClass::Integration),
-        qos("pkg::beta", "also_fine", QosClass::Integration),
-        qos("pkg::gamma", "blows_up", QosClass::Integration),
+        qos("pkg::alpha", "alpha", QosClass::Integration),
+        qos("pkg::beta", "beta", QosClass::Integration),
+        qos("pkg::gamma", "gamma", QosClass::Integration),
     ];
     // Charged the admitted footprint (tier + per-test runner reserve) → size the ceiling from
     // `admitted()`, not the bare tier footprint, or fewer than two are admitted
@@ -264,15 +256,8 @@ async fn mixed_suite_packs_runs_to_completion_and_reports_each_verdict() {
 async fn flaky_test_recovers_on_retry_and_retry_is_logged() {
     let fx = Fixture::new("flaky");
     let counter = fx.scratch("attempts");
-    let body = format!(
-        "n=$(cat '{c}' 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > '{c}'; \
-         if [ \"$n\" -lt 2 ]; then echo flaked-on-$n 1>&2; exit 1; fi; echo recovered; exit 0",
-        c = counter.display()
-    );
-    let flaky = fx.script("flaky", &body);
-
-    let binaries = [binary("pkg::flaky", &flaky, "sometimes_fails")];
-    let qos_dump = [qos("pkg::flaky", "sometimes_fails", QosClass::Integration)];
+    let binaries = [fx.binary("pkg::flaky", "flakes_once_then_recovers")];
+    let qos_dump = [qos("pkg::flaky", "flakes_once_then_recovers", QosClass::Integration)];
     let i = QosClass::Integration.profile().admitted();
     let ceiling = Resources::new(i.cpu_milli, i.mem_bytes, 0, 0);
 
@@ -297,12 +282,12 @@ async fn flaky_test_recovers_on_retry_and_retry_is_logged() {
 #[tokio::test]
 async fn oversized_test_is_skipped_with_reason_while_the_rest_runs() {
     let fx = Fixture::new("skip");
-    let ok = fx.script("ok", "echo small-ok; exit 0");
-    let huge = fx.script("huge", "echo should-never-run; exit 0");
-
-    let binaries = [binary("pkg::ok", &ok, "fits"), binary("pkg::huge", &huge, "too_big")];
-    let qos_dump =
-        [qos("pkg::ok", "fits", QosClass::Basic), qos("pkg::huge", "too_big", QosClass::Sync)];
+    let binaries =
+        [fx.binary("pkg::ok", "prints_small_ok"), fx.binary("pkg::huge", "never_admitted")];
+    let qos_dump = [
+        qos("pkg::ok", "prints_small_ok", QosClass::Basic),
+        qos("pkg::huge", "never_admitted", QosClass::Sync),
+    ];
     // Fits Basic, far below a Sync footprint → Sync rejected
     let b = QosClass::Basic.profile().footprint;
     let ceiling = Resources::new(b.cpu_milli * 2, b.mem_bytes * 2, 0, 0);
@@ -329,14 +314,11 @@ async fn oversized_test_is_skipped_with_reason_while_the_rest_runs() {
 #[tokio::test]
 async fn hung_test_goes_slow_then_times_out_and_frees_the_slot() {
     let fx = Fixture::new("timeout");
-    let hang = fx.script("hang", "echo entering-hang; sleep 30");
-    let ok = fx.script("ok", "echo queued-ran; exit 0");
-
     let binaries =
-        [binary("pkg::hang", &hang, "never_returns"), binary("pkg::ok", &ok, "waits_its_turn")];
+        [fx.binary("pkg::hang", "sleeps_past_any_cap"), fx.binary("pkg::ok", "prints_queued_ran")];
     let qos_dump = [
-        qos("pkg::hang", "never_returns", QosClass::Integration),
-        qos("pkg::ok", "waits_its_turn", QosClass::Integration),
+        qos("pkg::hang", "sleeps_past_any_cap", QosClass::Integration),
+        qos("pkg::ok", "prints_queued_ran", QosClass::Integration),
     ];
     let i = QosClass::Integration.profile().admitted();
     let ceiling = Resources::new(i.cpu_milli, i.mem_bytes, 0, 0); // one slot → ok queues
@@ -346,7 +328,7 @@ async fn hung_test_goes_slow_then_times_out_and_frees_the_slot() {
         items
             .into_iter()
             .map(|mut w| {
-                if w.test_name == "never_returns" {
+                if w.test_name == child::test_name("sleeps_past_any_cap") {
                     w.hard_cap = Duration::from_millis(350);
                 }
                 w

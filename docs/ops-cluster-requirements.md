@@ -25,7 +25,17 @@ either has a probe below or is named under [residual gaps](#residual-gaps) — t
 | `metrics.k8s.io` API                        | optional — `kubectl top` / k9s   | `ztest cluster setup`                  |
 | metrics stack                               | optional — metrics & profiling   | `ztest cluster setup`                  |
 | profile collector                           | optional — CPU profiles          | your workstation                       |
-| snapshot bucket (public read)               | optional — chain fixtures        | none — published, no credentials       |
+| snapshot read path (seed CDN)               | optional — chain fixtures        | none — public, no credentials ever     |
+
+Seeds pull over plain HTTPS from whatever each manifest's `base_uri` names, which is the
+[seed CDN Worker](../workers/seed-cdn/README.md). No credential is involved and none can be:
+the library carries no S3 client. The Worker is the bucket's *only* public read path —
+`r2.dev` access is disabled, so the `lfs/<64 hex>` key pattern it enforces cannot be
+sidestepped, and the endpoint Cloudflare rate-limits and bandwidth-throttles by design is no
+longer reachable to fall back to.
+
+Publishing a fixture is the one credentialed operation: `ztest snapshot config set` stores the
+key, `ztest snapshot push` uses it. Nothing else in ztest reads it.
 
 Three outcomes, and the third matters:
 

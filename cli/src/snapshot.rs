@@ -41,7 +41,13 @@ mod tmpl {
     pub(super) const PRUNED: &str = "{@ok|pass} pruned {name}";
     pub(super) const PRUNED_ORPHAN: &str = "{@ok|pass} pruned orphan {name}";
     pub(super) const PRUNE_ERROR: &str = "  {@fail|fail} {detail|dim}";
-    pub(super) const VERIFY_TALLY: &str = "{count|bold} snapshots, all present";
+    pub(super) const VERIFY_TALLY: &str =
+        "{count|bold} snapshots, all present · read path {endpoints|bold} sound";
+
+    /// Endpoint row: one per distinct `base_uri`, not per artifact
+    pub(super) fn endpoint_row(tone: &str) -> String {
+        format!("{{mark:<4|{tone}}} {{base}}  {{detail|dim}}")
+    }
 
     /// - Header + body = one shape, tone apart (columns cannot drift)
     /// - `[{size}][{size_raw}]` = exactly one binds (parsed `Quantity`, else its raw text)
@@ -121,6 +127,48 @@ enum SnapshotCmd {
     /// Assert every declared snapshot resolves to an object in the bucket.
     /// A committed manifest is a claim the bytes exist; this is what checks it.
     Verify,
+
+    /// Store the credentials `push` uploads with. Optional: pulling seeds needs
+    /// none, so only someone publishing a fixture ever runs this.
+    #[command(subcommand)]
+    Config(ConfigCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCmd {
+    /// Write the push credentials, prompting for anything not passed as a flag.
+    /// The file is created `0600` and replaces any previous one.
+    Set(ConfigSetArgs),
+
+    /// Print the stored settings with the secret key redacted.
+    Show,
+
+    /// Print the config file's path and exit.
+    Path,
+}
+
+#[derive(Debug, Parser)]
+struct ConfigSetArgs {
+    /// S3 API endpoint, e.g. `https://<account-id>.r2.cloudflarestorage.com`.
+    #[arg(long)]
+    endpoint: Option<String>,
+
+    /// Bucket holding the snapshot objects.
+    #[arg(long)]
+    bucket: Option<String>,
+
+    /// Access key id from an R2 API token with object write permission.
+    #[arg(long)]
+    access_key_id: Option<String>,
+
+    /// Secret access key. Prompted for without echo when omitted; pass `-` to
+    /// read it from stdin, which is how CI should supply it.
+    #[arg(long)]
+    secret_access_key: Option<String>,
+
+    /// Signing region. R2 ignores it and wants `auto`, which is the default.
+    #[arg(long)]
+    region: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -158,12 +206,14 @@ struct WarmArgs {
 
 pub fn execute(args: Args) -> ExitCode {
     super::block_on("snapshot", super::Rt::Current, async {
-        // `manifest` touches only the file; `push` needs the bucket, not a cluster.
-        // Connecting first would make publishing a fixture require a cluster to be up
+        // `manifest` touches only the file, `verify` only the public read path, `push` the
+        // bucket. None needs a cluster: connecting first would make publishing a fixture
+        // require one to be up
         match args.cmd {
             SnapshotCmd::Manifest(m) => return manifest(&m),
             SnapshotCmd::Push(p) => return push(&p).await,
             SnapshotCmd::Verify => return verify().await,
+            SnapshotCmd::Config(c) => return config(c).await,
             _ => {}
         }
         let client = ztest::api::cluster::client().await.context("connecting to cluster")?;
@@ -171,9 +221,10 @@ pub fn execute(args: Args) -> ExitCode {
             SnapshotCmd::List => list(&client).await,
             SnapshotCmd::Prune(p) => prune(&client, &p).await,
             SnapshotCmd::Warm(w) => warm(&client, &w).await,
-            SnapshotCmd::Manifest(_) | SnapshotCmd::Push(_) | SnapshotCmd::Verify => {
-                unreachable!("handled above")
-            }
+            SnapshotCmd::Manifest(_)
+            | SnapshotCmd::Push(_)
+            | SnapshotCmd::Verify
+            | SnapshotCmd::Config(_) => unreachable!("handled above"),
         }
     })
 }
@@ -233,7 +284,7 @@ async fn push(args: &PushArgs) -> Result<()> {
 
 async fn push_reporting(args: &PushArgs, step: &LiveStep, theme: &Theme) -> Result<()> {
     let digest = ztest::api::storage::digest_of_with(&args.archive, step)?;
-    let bucket = ztest::api::storage::Bucket::resolve()?;
+    let bucket = crate::bucket::Bucket::resolve()?;
     let result = |verb| {
         say(
             tmpl::PUSH_RESULT,
@@ -249,14 +300,11 @@ async fn push_reporting(args: &PushArgs, step: &LiveStep, theme: &Theme) -> Resu
         result("already present:");
         return Ok(());
     }
-    let file = tokio::fs::File::open(&args.archive)
-        .await
-        .with_context(|| format!("opening {}", args.archive.display()))?;
     let total = digest.size_bytes;
     let mut sent = 0u64;
     step.note("uploading");
     bucket
-        .put(&digest.sha256, total, file, &mut |n| {
+        .put(&digest.sha256, total, &args.archive, &mut |n| {
             sent += n as u64;
             step.bytes(sent, total);
         })
@@ -418,9 +466,9 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<()> {
 
 /// Pre-provision seeds for the named archives.
 ///
-/// Archive file never opened: identity from the sidecar manifest, bytes from the
-/// bucket → works in a checkout holding only the manifest (same property that lets
-/// a build pod declare a seed it cannot read)
+/// The archive is hashed locally ([`identity_of`]) to learn its oid — the bytes then come
+/// from the bucket, never from this file. So it needs the archive present, unlike the
+/// `artifact!` path a test uses, which reads the oid out of a committed manifest
 async fn warm(client: &Client, args: &WarmArgs) -> Result<()> {
     let theme = Theme::detect();
     for archive in &args.archives {
@@ -452,17 +500,26 @@ async fn warm(client: &Client, args: &WarmArgs) -> Result<()> {
     Ok(())
 }
 
-/// Every declared snapshot's bytes must be in the bucket.
+/// Every declared snapshot's bytes must be reachable on the read path.
 ///
 /// The lockfile integrity check: committing a manifest claims an object exists, and
-/// nothing else enforces that the `push` happened. `HEAD` per object, no transfer
+/// nothing else enforces that the `push` happened. `HEAD` per object, no transfer.
+///
+/// Deliberately unauthenticated: it checks the URL consumers actually fetch, so it
+/// catches a blob that exists but is unreadable — and it runs for someone who has never
+/// configured a credential
+///
+/// Then the endpoint itself, once per distinct `base_uri`: a non-seed key must 404 and a
+/// write must be refused. Presence says the bytes are there; these say the thing serving
+/// them is still the read-only seed path and not, say, public bucket access restored by hand
 async fn verify() -> Result<()> {
     let theme = Theme::detect();
-    let bucket = ztest::api::storage::Bucket::resolve()?;
     let mut missing = 0usize;
     for snapshot in ztest::snapshots::ALL {
         let a = &snapshot.artifact;
-        let present = bucket.has(a.oid, a.size).await?;
+        let present = ztest::api::storage::blob_present(&a.blob_url(), a.size, VERIFY_TIMEOUT)
+            .await
+            .with_context(|| format!("checking {}", a.name))?;
         let (mark, tone) = match present {
             true => (theme.chars.ok, "pass"),
             false => (theme.chars.warn, "fail"),
@@ -474,17 +531,163 @@ async fn verify() -> Result<()> {
         );
         missing += usize::from(!present);
     }
-    match missing {
-        0 => {
+    let mut endpoints: Vec<&str> =
+        ztest::snapshots::ALL.iter().map(|s| s.artifact.base_uri).collect();
+    endpoints.sort_unstable();
+    endpoints.dedup();
+
+    println!();
+    let mut unsound = 0usize;
+    for base in &endpoints {
+        let sound = endpoint_is_sound(base).await;
+        let (mark, tone, detail) = match &sound {
+            Ok(()) => (theme.chars.ok, "pass", "seed keys only, writes refused".to_string()),
+            Err(why) => (theme.chars.warn, "fail", why.clone()),
+        };
+        unsound += usize::from(sound.is_err());
+        say(
+            &tmpl::endpoint_row(tone),
+            Fields::new().text("mark", mark).text("base", *base).text("detail", detail.as_str()),
+            &theme,
+        );
+    }
+
+    match (missing, unsound) {
+        (0, 0) => {
             let count = ztest::api::thousands(ztest::snapshots::ALL.len() as u64);
             println!();
-            say(tmpl::VERIFY_TALLY, Fields::new().text("count", count), &theme);
+            say(
+                tmpl::VERIFY_TALLY,
+                Fields::new()
+                    .text("count", count)
+                    .text("endpoints", ztest::api::thousands(endpoints.len() as u64)),
+                &theme,
+            );
             Ok(())
         }
-        n => Err(anyhow!(
+        (0, n) => Err(anyhow!("{n}/{} read endpoints unsound", endpoints.len())),
+        (n, _) => Err(anyhow!(
             "{n}/{} declared snapshots absent from the bucket",
             ztest::snapshots::ALL.len(),
         )),
+    }
+}
+
+/// The read path serves seeds and nothing else. `Err` carries what it did instead.
+///
+/// The write probe targets a well-formed but unused oid, never a declared artifact. This
+/// check only does anything when the endpoint turns out to be writable — and aimed at a real
+/// seed, that is exactly the case where it would overwrite one with its own probe body
+async fn endpoint_is_sound(base: &str) -> Result<(), String> {
+    let only_seeds = ztest::api::storage::serves_only_seeds(base, VERIFY_TIMEOUT)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !only_seeds {
+        return Err("a non-seed key did not 404 — endpoint exposes the whole bucket".into());
+    }
+    let scratch =
+        ztest::api::storage::blob_url(base, ztest::api::storage::KEY_PREFIX, &"0".repeat(64));
+    let read_only = ztest::api::storage::refuses_writes(&scratch, VERIFY_TIMEOUT)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !read_only {
+        return Err(format!("a PUT to {scratch} was accepted — endpoint is not read-only"));
+    }
+    Ok(())
+}
+
+/// Bounded per object: `verify` walks every declared snapshot, and a wrong base_uri hangs
+/// on connect rather than failing
+const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `ztest snapshot config` — the only way credentials enter ztest.
+async fn config(cmd: ConfigCmd) -> Result<()> {
+    let theme = Theme::detect();
+    match cmd {
+        ConfigCmd::Path => {
+            println!("{}", crate::bucket::credentials_path().display());
+            Ok(())
+        }
+        ConfigCmd::Show => match crate::bucket::load_credentials()? {
+            Some(c) => {
+                println!("{}", crate::bucket::credentials_path().display());
+                println!("{}", c.redacted());
+                Ok(())
+            }
+            None => Err(anyhow!(
+                "no credentials at {} — run `ztest snapshot config set`",
+                crate::bucket::credentials_path().display()
+            )),
+        },
+        ConfigCmd::Set(a) => {
+            let c = crate::bucket::Credentials {
+                endpoint: ask(a.endpoint, "S3 endpoint")?,
+                bucket: ask(a.bucket, "bucket")?,
+                access_key_id: ask(a.access_key_id, "access key id")?,
+                secret_access_key: ask_secret(a.secret_access_key)?,
+                region: a.region,
+            };
+            let path = crate::bucket::store_credentials(&c)?;
+            say(
+                tmpl::READY,
+                Fields::new().text("name", format!("credentials written to {}", path.display())),
+                &theme,
+            );
+            // Prove them now. A typo otherwise surfaces at the end of a multi-hour push,
+            // and the file is written either way — the target bucket may not exist yet
+            note("checking them against the bucket", &theme);
+            match check_credentials().await {
+                Ok(()) => {
+                    ok_line(tmpl::READY, "credentials accepted by the bucket", &theme);
+                    Ok(())
+                }
+                Err(why) => Err(why.context(format!(
+                    "credentials saved to {}, but the bucket rejected them",
+                    path.display()
+                ))),
+            }
+        }
+    }
+}
+
+/// One authenticated round trip against a key that is *declared*, so a `false` means the
+/// credentials read a bucket that is not the fixture store — not merely that some key is
+/// absent. Signing, endpoint, and bucket name are all exercised
+async fn check_credentials() -> Result<()> {
+    let a = ztest::snapshots::SAPLING_TESTNET.artifact;
+    match crate::bucket::Bucket::resolve()?.has(a.oid, a.size).await? {
+        true => Ok(()),
+        false => Err(anyhow!("{} is not in this bucket — wrong bucket or endpoint?", a.name)),
+    }
+}
+
+/// Flag, else prompt. A missing value is a question, not an error — `config set` with no
+/// flags at all is the interactive path
+fn ask(given: Option<String>, label: &str) -> Result<String> {
+    match given {
+        Some(v) => Ok(v),
+        None => dialoguer::Input::new()
+            .with_prompt(label)
+            .interact_text()
+            .with_context(|| format!("reading {label}")),
+    }
+}
+
+/// - `-` reads stdin, so CI pipes a secret in without it reaching argv or the environment
+/// - otherwise prompt without echo; a secret typed at a prompt is not in shell history
+fn ask_secret(given: Option<String>) -> Result<String> {
+    match given.as_deref() {
+        Some("-") => {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .context("reading the secret from stdin")?;
+            Ok(buf.trim().to_string())
+        }
+        Some(v) => Ok(v.to_string()),
+        None => dialoguer::Password::new()
+            .with_prompt("secret access key")
+            .interact()
+            .context("reading the secret access key"),
     }
 }
 

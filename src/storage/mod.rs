@@ -1,13 +1,120 @@
 //! Seed bytes, from the snapshot bucket, OID-addressed. One source only.
 //!
-//! - Seed = object at `lfs/<oid>` in [`r2::Bucket`], oid compiled into the
+//! - Seed = object at `lfs/<oid>`, oid compiled into the
 //!   [`ChainSnapshot`](crate::ChainSnapshot); no paths, no local files, no sniffing
-//! - Hands out a presigned GET ([`r2::Bucket::presigned_get`]) and nothing else:
-//!   [`crate::materialize`]'s puller Job fetches node-local, at cluster bandwidth
+//! - **Reads are unauthenticated, always.** This crate holds no credentials and no S3
+//!   client; it hands a public URL to [`crate::materialize`]'s puller Job, which fetches
+//!   node-local at cluster bandwidth. Writing a blob is `ztest snapshot push`'s problem
 //! - Runner pods have no checkout and no bucket credentials → the multi-GB stream
 //!   must never enter ztest's address space in either direction
 
-pub mod r2;
+/// Namespace for every managed object. Recorded per manifest by `ztest snapshot manifest`,
+/// so a reader cannot disagree with the push that made the blob. Frozen legacy name from
+/// the retired Git LFS store — renaming it re-uploads every blob and buys nothing
+pub const KEY_PREFIX: &str = "lfs";
+
+/// Public read base. Unauthenticated `GET`, by contract: `cargo install ztest_cli` →
+/// `ztest run` pulls fixtures with no credentials anywhere.
+///
+/// Written into each manifest at `snapshot manifest` time, never read from here at seed
+/// time — a blob published under one base is never addressed under another, which is what
+/// makes moving the read path a per-artifact edit rather than a release
+pub const BASE_URI: &str = "https://ztest-seeds.elicbarbieri.workers.dev";
+
+/// Object URL the puller `curl`s. `base_uri`/`key_prefix` ride the manifest (see
+/// [`crate::Artifact`])
+pub fn blob_url(base_uri: &str, key_prefix: &str, oid: &str) -> String {
+    format!("{}/{key_prefix}/{oid}", base_uri.trim_end_matches('/'))
+}
+
+/// `HEAD` the public URL: object exists and is the manifest's length
+pub async fn blob_present(
+    url: &str,
+    size: u64,
+    timeout: std::time::Duration,
+) -> Result<bool, StorageError> {
+    let resp = probe_client(timeout)?
+        .head(url)
+        .send()
+        .await
+        .map_err(|e| StorageError::Bucket(format!("HEAD {url}: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        return Err(StorageError::Bucket(format!("HEAD {url}: {}", resp.status())));
+    }
+    // Header, not `Response::content_length()` — a HEAD carries no body, so the latter
+    // reports 0 and every present blob reads as absent
+    let declared = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    match declared {
+        // Present at the wrong length = a truncated upload, not a missing blob: naming it
+        // beats sending the caller to `snapshot push` for bytes that are already there
+        Some(len) if len != size => {
+            Err(StorageError::Bucket(format!("{url} is {len} bytes, manifest says {size}")))
+        }
+        _ => Ok(true),
+    }
+}
+
+/// Shared client: every probe below wants the same timeout and nothing else
+fn probe_client(timeout: std::time::Duration) -> Result<reqwest::Client, StorageError> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| StorageError::Bucket(format!("http client: {e}")))
+}
+
+/// Does the read path honour `Range`, asked the way the puller asks?
+///
+/// Load-bearing, not cosmetic: the puller fetches 256 MiB windows because no endpoint holds a
+/// multi-hour transfer open. An endpoint that ignores `Range` answers `200` with the *whole*
+/// body — a 245 GiB response to a pod that budgeted for one chunk — so a read path without
+/// this is worse than an absent one, which at least fails immediately.
+pub async fn serves_ranges(url: &str, timeout: std::time::Duration) -> Result<bool, StorageError> {
+    let resp = probe_client(timeout)?
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-1023")
+        .send()
+        .await
+        .map_err(|e| StorageError::Bucket(format!("ranged GET {url}: {e}")))?;
+    // `Content-Range` too: 206 is the claim, that header is the thing a partial response is
+    // required to carry, and checking it costs nothing over trusting the status alone
+    Ok(resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+        && resp.headers().contains_key(reqwest::header::CONTENT_RANGE))
+}
+
+/// A key outside `lfs/<oid>` must 404 — the bucket is not a public filesystem.
+///
+/// Cheap standing check that the endpoint in front of the bucket is the read-only Worker and
+/// not, say, public bucket access restored by hand
+pub async fn serves_only_seeds(
+    base_uri: &str,
+    timeout: std::time::Duration,
+) -> Result<bool, StorageError> {
+    let url = format!("{}/not-a-seed-key", base_uri.trim_end_matches('/'));
+    let resp = probe_client(timeout)?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| StorageError::Bucket(format!("GET {url}: {e}")))?;
+    Ok(resp.status() == reqwest::StatusCode::NOT_FOUND)
+}
+
+/// The read path must refuse writes. Any 2xx here means the endpoint is not read-only
+pub async fn refuses_writes(url: &str, timeout: std::time::Duration) -> Result<bool, StorageError> {
+    let resp = probe_client(timeout)?
+        .put(url)
+        .body("ztest read-path probe")
+        .send()
+        .await
+        .map_err(|e| StorageError::Bucket(format!("PUT {url}: {e}")))?;
+    Ok(!resp.status().is_success())
+}
 
 /// Seed `tar` compression, from the artifact's filename. Resolved here because GNU
 /// `tar` can't auto-detect on the non-seekable `curl` body the puller feeds it
@@ -169,20 +276,12 @@ pub fn compression_from_name(name: &str) -> Option<Compression> {
 
 // ─────────────────────────── errors ─────────────────────────────────
 
-/// Failures resolving a seed's bytes.
-///
-/// - `materialize` call sites map these to `EnvError::ArchiveMaterializeFailed`
-/// - `R2Config` reaches only seed-provisioning processes (runner pods never touch
-///   the bucket) → fix by exporting AWS env where `ztest run` is invoked
+/// Failures resolving a seed's bytes. `materialize` call sites map these to
+/// `EnvError::ArchiveMaterializeFailed`
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    /// `detail` already names the missing key or the credentials file that failed, so the
-    /// AWS_* roster this used to recite added length, not information
-    #[error("bucket not configured: {detail}")]
-    R2Config { detail: String },
-
     #[error("bucket: {0}")]
-    R2(String),
+    Bucket(String),
 
     #[error("{name}: not .tar[.gz|.zst|.xz|.bz2]")]
     UnknownCompression { name: String },
@@ -252,5 +351,95 @@ mod tests {
         assert_eq!(Compression::Zstd.tar_flag(), "--zstd ");
         assert_eq!(Compression::Gzip.tar_flag(), "-z ");
         assert_eq!(Compression::None.tar_flag(), "");
+    }
+
+    /// One-shot HTTP server replying `status` to whatever it is asked, so the read-path
+    /// probes can be shown to *fail*. A probe that only ever sees a healthy endpoint proves
+    /// nothing about the unhealthy one it exists to catch
+    fn responds_once(status: &'static str, body: &'static str) -> String {
+        responds_once_with(status, "", body)
+    }
+
+    fn responds_once_with(
+        status: &'static str,
+        extra_headers: &'static str,
+        body: &'static str,
+    ) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            let _ = sock.read(&mut [0u8; 2048]);
+            let _ = write!(
+                sock,
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        format!("http://{addr}")
+    }
+
+    const T: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// An endpoint that ignores `Range` answers 200 with the whole body — the case that would
+    /// turn one seed into a 245 GiB response
+    #[tokio::test]
+    async fn range_support_is_not_assumed_from_a_200() {
+        let url = responds_once("200 OK", "the whole object");
+        assert!(!serves_ranges(&url, T).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_206_is_range_support() {
+        let url = responds_once_with(
+            "206 Partial Content",
+            "content-range: bytes 0-1023/650000000\r\n",
+            "chunk",
+        );
+        assert!(serves_ranges(&url, T).await.unwrap());
+    }
+
+    /// A 206 without `Content-Range` is malformed, not partial content
+    #[tokio::test]
+    async fn a_206_without_content_range_is_not_range_support() {
+        let url = responds_once("206 Partial Content", "chunk");
+        assert!(!serves_ranges(&url, T).await.unwrap());
+    }
+
+    /// Public bucket access restored by hand: every key answers, not just `lfs/<oid>`
+    #[tokio::test]
+    async fn an_endpoint_serving_arbitrary_keys_is_not_seeds_only() {
+        let base = responds_once("200 OK", "/etc/passwd");
+        assert!(!serves_only_seeds(&base, T).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_404_on_a_non_seed_key_is_seeds_only() {
+        let base = responds_once("404 Not Found", "");
+        assert!(serves_only_seeds(&base, T).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_accepted_put_is_not_read_only() {
+        let url = responds_once("200 OK", "stored");
+        assert!(!refuses_writes(&url, T).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_405_is_a_refused_write() {
+        let url = responds_once("405 Method Not Allowed", "");
+        assert!(refuses_writes(&url, T).await.unwrap());
+    }
+
+    /// The read path, unauthenticated, against a real published blob — the whole contract
+    /// this crate has with the bucket. `cargo test -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn the_public_read_path_serves_a_declared_snapshot() {
+        let a = crate::snapshots::SAPLING_TESTNET.artifact;
+        let url = a.blob_url();
+        let got = blob_present(&url, a.size, std::time::Duration::from_secs(20)).await;
+        assert!(matches!(got, Ok(true)), "{url} -> {got:?}");
     }
 }
