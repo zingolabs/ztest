@@ -446,9 +446,11 @@ fn render(report: &ztest::api::capability::Report, bound: Option<&str>, theme: &
     let _ = writeln!(out, "{}", draw(row::HEADER, &header, theme));
 
     for cap in &report.capabilities {
-        // Missing optional = warning (costs a feature, not the run)
+        // Missing optional = warning (costs a feature, not the run); broken = failure at any
+        // need, since nothing was declined
         let mark = match (&cap.finding, cap.need) {
             (Finding::Present(_), _) => row::OK,
+            (Finding::Broken(_), _) => row::FAIL,
             (_, Need::Required | Need::Provisioned | Need::RequiredForRun) => row::FAIL,
             (_, Need::Enables(_)) => row::WARN,
         };
@@ -459,7 +461,11 @@ fn render(report: &ztest::api::capability::Report, bound: Option<&str>, theme: &
                 Need::Required | Need::Provisioned | Need::RequiredForRun => "ztest run",
                 Need::Enables(f) => f,
             };
-            let note = format!("{} {lost} unavailable; {}", theme.chars.arrow, cap.remedy);
+            let verdict = match cap.finding.is_broken() {
+                true => "broken",
+                false => "unavailable",
+            };
+            let note = format!("{} {lost} {verdict}; {}", theme.chars.arrow, cap.remedy);
             let _ =
                 writeln!(out, "{}", draw(row::REMEDY, &Fields::new().text("note", note), theme));
         }
@@ -500,8 +506,23 @@ mod tests {
                     finding: Finding::Absent("no ztest-obs".into()),
                     remedy: "see docs/obs.md",
                 },
+                Capability {
+                    name: "profile collector",
+                    need: Need::Enables("CPU profiles"),
+                    finding: Finding::Broken("collector cannot list pods".into()),
+                    remedy: "see docs/how-to-profile.md",
+                },
             ],
         }
+    }
+
+    /// Same `Need` as the row above it, opposite mark: an optional facility may be absent,
+    /// never silently mis-wired
+    #[test]
+    fn a_broken_optional_draws_as_a_failure_not_a_warning() {
+        let drawn = render(&report(), Some("zkn"), &Theme::for_capabilities(false, false));
+        assert!(drawn.contains("  FAIL profile collector"), "{drawn}");
+        assert!(drawn.contains("CPU profiles broken"), "{drawn}");
     }
 
     /// `Template::parse` panics on a malformed source, and most of these rows draw only on

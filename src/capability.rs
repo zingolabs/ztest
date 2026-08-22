@@ -36,13 +36,18 @@ pub enum Need {
     Enables(&'static str),
 }
 
-/// One probe's outcome. `Unknown` stays out of `Absent` — a forbidden read means
-/// *this caller* cannot see it, and folding them blames a healthy cluster
+/// One probe's outcome.
+///
+/// - `Unknown` stays out of `Absent` — a forbidden read means *this caller* cannot see it,
+///   and folding them blames a healthy cluster
+/// - `Broken` stays out of both: the facility is here and misconfigured, which no remedy for
+///   an absent one addresses, and which a green row would hide until a run needs it
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finding {
     Present(String),
     Absent(String),
     Unknown(String),
+    Broken(String),
 }
 
 impl Finding {
@@ -50,9 +55,17 @@ impl Finding {
         matches!(self, Finding::Present(_))
     }
 
+    /// Present and wrong. Blocks whatever its capability gates, `Need` notwithstanding — an
+    /// optional feature may be declined, never silently mis-wired
+    pub fn is_broken(&self) -> bool {
+        matches!(self, Finding::Broken(_))
+    }
+
     pub fn detail(&self) -> &str {
         match self {
-            Finding::Present(d) | Finding::Absent(d) | Finding::Unknown(d) => d,
+            Finding::Present(d) | Finding::Absent(d) | Finding::Unknown(d) | Finding::Broken(d) => {
+                d
+            }
         }
     }
 }
@@ -68,9 +81,13 @@ pub struct Capability {
 
 impl Capability {
     /// Blocks `ztest run` outright. `Unknown` blocks too — refusing now beats an obscure
-    /// failure twenty minutes in
+    /// failure twenty minutes in. So does a `Broken` optional: `Enables` buys the right to
+    /// go without a facility, not the right to a green row over a broken one
     pub fn is_blocking(&self) -> bool {
-        !matches!(self.need, Need::Enables(_)) && !self.finding.is_present()
+        match self.finding {
+            Finding::Broken(_) => true,
+            _ => !matches!(self.need, Need::Enables(_)) && !self.finding.is_present(),
+        }
     }
 
     /// Blocks `ztest cluster setup`. [`Need::Provisioned`] must not: setup is what
@@ -640,13 +657,14 @@ async fn profiling(client: &Client) -> Finding {
     }
     let node_ip = crate::profiling::node_internal_ip(client).await;
     let engine = runtime::program();
+    let api_server = crate::profiling::node_api_server(client).await;
     let mut missing: Vec<String> = Vec::new();
     if !runtime::active().usable() {
         missing.push(format!("a reachable {engine} daemon"));
     }
     // The address the collector actually dials, not the kubeconfig's: a nested cluster's
     // kubeconfig points at loopback, which is dead once the collector leaves the host network
-    if crate::profiling::node_api_server(client).await.is_none() {
+    if api_server.is_none() {
         missing.push("an apiserver address on the cluster network".to_string());
     }
     if crate::profiling::host::cluster_network().await.is_none() {
@@ -658,13 +676,54 @@ async fn profiling(client: &Client) -> Finding {
     if node_ip.is_none() {
         missing.push("a node InternalIP to push to".to_string());
     }
-    match missing.as_slice() {
-        [] => Finding::Present(format!(
+    if !missing.is_empty() {
+        return Finding::Absent(format!("host-side profiling needs {}", missing.join(", ")));
+    }
+
+    // Ingredients present ⇒ the only question left is whether they assemble
+    let api_server = api_server.unwrap_or_default();
+    match discovery_reaches_the_run_cluster(&api_server).await {
+        Ok(()) => Finding::Present(format!(
             "host-side, nested kubelet · pushes to {}",
             node_ip.unwrap_or_default()
         )),
-        _ => Finding::Absent(format!("host-side profiling needs {}", missing.join(", "))),
+        Err(why) => Finding::Broken(why),
     }
+}
+
+/// Make the collector's own discovery call, with the collector's own credentials.
+///
+/// - Ingredient checks pass on a collector that cannot authenticate at all (the kubeconfig
+///   binds a context, and only the *rendered* file says which)
+/// - Same render `host::start` mounts + same address it dials + the pod list
+///   `discovery.kubernetes` makes ⇒ green here = the path, not four facts about it
+/// - Host-side stands in for the container: both reach the cluster network over the engine's
+///   bridge (rootless, where they do not, is refused above)
+async fn discovery_reaches_the_run_cluster(api_server: &str) -> Result<(), String> {
+    use kube::config::{KubeConfigOptions, Kubeconfig};
+
+    let rendered = crate::profiling::host::kubeconfig(api_server).map_err(|e| e.0)?;
+    let parsed =
+        Kubeconfig::from_yaml(&rendered).map_err(|e| format!("collector kubeconfig: {e}"))?;
+    let config = kube::Config::from_custom_kubeconfig(parsed, &KubeConfigOptions::default())
+        .await
+        .map_err(|e| format!("collector kubeconfig: {e}"))?;
+    let client = Client::try_from(config).map_err(|e| format!("collector client: {e}"))?;
+    let pods: Api<Pod> = Api::namespaced(client, crate::naming::RUN_NAMESPACE);
+    match pods.list(&ListParams::default().limit(1)).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("collector cannot list pods at {api_server}: {}", root_cause(&e))),
+    }
+}
+
+/// Innermost message: kube wraps a TLS failure three layers deep, and the outer text names
+/// the request rather than the reason a reader can act on
+fn root_cause(error: &kube::Error) -> String {
+    let mut source: &dyn std::error::Error = error;
+    while let Some(inner) = source.source() {
+        source = inner;
+    }
+    source.to_string()
 }
 
 /// Rootless podman: `--pid=host` = caller's processes only → no pod pids resolved
@@ -717,6 +776,19 @@ mod tests {
 
     fn cap(name: &'static str, need: Need, finding: Finding) -> Capability {
         Capability { name, need, finding, remedy: "docs/ops-cluster-requirements.md" }
+    }
+
+    /// Declining a facility is a choice; being mis-wired to one is not. A collector that
+    /// cannot authenticate ran for hours behind a green row, which is what this forbids
+    #[test]
+    fn a_broken_optional_blocks_where_an_absent_one_does_not() {
+        let broken = cap(
+            "profile collector",
+            Need::Enables("CPU profiles"),
+            Finding::Broken("collector cannot list pods at https://10.0.0.1:6443".into()),
+        );
+        assert!(broken.is_blocking());
+        assert!(!Report { capabilities: vec![broken] }.is_runnable());
     }
 
     /// Profiling is a diagnostic: a workstation without docker must still be able to run

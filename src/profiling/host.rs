@@ -75,40 +75,133 @@ fn run_dir(sync_id: &str) -> PathBuf {
     std::env::temp_dir().join(container_name(sync_id))
 }
 
-/// Single-context kubeconfig for the collector.
+/// Self-contained, single-context kubeconfig for the collector.
 ///
-/// - Alloy's `discovery.kubernetes` has no context selector: it takes the file's
-///   `current-context`, which is whatever the *user's* shell last set
-/// - Written from the same config ztest resolved its own client from, so the collector cannot
-///   discover against a different cluster than the run
-fn write_kubeconfig(dir: &Path, api_server: &str) -> Result<PathBuf, crate::error::PipelineError> {
-    let source = std::env::var("KUBECONFIG")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs_home().map(|h| h.join(".kube/config")))
-        .ok_or("no kubeconfig: set KUBECONFIG or $HOME/.kube/config")?;
-    let raw = std::fs::read_to_string(&source)
-        .map_err(|e| format!("read kubeconfig {}: {e}", source.display()))?;
-    let mut doc: serde_yaml::Value =
-        serde_yaml::from_str(&raw).map_err(|e| format!("parse kubeconfig: {e}"))?;
-    // Every cluster's address rewritten, not just the current one: the loopback address the
-    // file carries is unreachable once the collector leaves the host network
-    if let Some(clusters) = doc.get_mut("clusters").and_then(|c| c.as_sequence_mut()) {
-        for entry in clusters {
-            if let Some(cluster) = entry.get_mut("cluster").and_then(|c| c.as_mapping_mut()) {
-                cluster.insert("server".into(), api_server.into());
-            }
-        }
-    }
-    let path = dir.join("kubeconfig");
-    let rendered = serde_yaml::to_string(&doc).map_err(|e| format!("render kubeconfig: {e}"))?;
-    std::fs::write(&path, rendered).map_err(|e| format!("write kubeconfig: {e}"))?;
-    Ok(path)
+/// - Alloy's `discovery.kubernetes` takes no context: it uses the file's `current-context` =
+///   whatever the user's shell last set, which is not the context the run bound to
+/// - Pinned to [`active_context`](crate::cluster_config::active_context) — same resolution
+///   [`cluster::config`](crate::cluster::config) binds the run's own client by
+/// - Every other cluster/user/context dropped (nothing left to pick up)
+/// - Only this cluster's `server` rewritten: the file's address is loopback or a host-side
+///   name, dead once the collector leaves the host network
+/// - Path credentials inlined: the container has neither those paths nor the files
+pub fn kubeconfig(api_server: &str) -> Result<String, crate::error::PipelineError> {
+    let source = kube::config::Kubeconfig::read().map_err(|e| format!("read kubeconfig: {e}"))?;
+    let wanted = crate::cluster_config::active_context()
+        .ok_or("no kube-context bound: set one with `ztest cluster set <profile>`")?;
+    let pinned = pin(source, &wanted, api_server)?;
+    serde_yaml::to_string(&pinned).map_err(|e| format!("render kubeconfig: {e}").into())
 }
 
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().filter(|s| !s.trim().is_empty()).map(PathBuf::from)
+/// [`kubeconfig`]'s reduction, over a kubeconfig already read
+fn pin(
+    source: kube::config::Kubeconfig,
+    wanted: &str,
+    api_server: &str,
+) -> Result<kube::config::Kubeconfig, crate::error::PipelineError> {
+    use kube::config::{Kubeconfig, NamedAuthInfo, NamedCluster};
+
+    let named = source
+        .contexts
+        .iter()
+        .find(|c| c.name == wanted)
+        .cloned()
+        .ok_or_else(|| format!("kube-context `{wanted}` is not in the kubeconfig"))?;
+    let context = named.context.clone().ok_or_else(|| format!("context `{wanted}` is empty"))?;
+
+    let mut cluster = source
+        .clusters
+        .iter()
+        .find(|c| c.name == context.cluster)
+        .and_then(|c| c.cluster.clone())
+        .ok_or_else(|| format!("context `{wanted}` names cluster `{}`, absent", context.cluster))?;
+    cluster.server = Some(api_server.to_string());
+    inline(&mut cluster.certificate_authority, &mut cluster.certificate_authority_data)?;
+
+    let user = context.user.clone().unwrap_or_default();
+    let mut auth = source
+        .auth_infos
+        .iter()
+        .find(|a| a.name == user)
+        .and_then(|a| a.auth_info.clone())
+        .unwrap_or_default();
+    portable(&auth, wanted)?;
+    inline(&mut auth.client_certificate, &mut auth.client_certificate_data)?;
+    inline_secret(&mut auth.client_key, &mut auth.client_key_data)?;
+
+    Ok(Kubeconfig {
+        clusters: vec![NamedCluster { name: context.cluster.clone(), cluster: Some(cluster) }],
+        auth_infos: vec![NamedAuthInfo { name: user, auth_info: Some(auth) }],
+        contexts: vec![named],
+        current_context: Some(wanted.to_string()),
+        kind: Some("Config".to_string()),
+        api_version: Some("v1".to_string()),
+        preferences: None,
+        extensions: None,
+    })
+}
+
+/// Credentials the collector cannot reproduce: the plugin binary is not in its image, and a
+/// cached token would expire mid-sync with no way to refresh
+fn portable(
+    auth: &kube::config::AuthInfo,
+    context: &str,
+) -> Result<(), crate::error::PipelineError> {
+    let plugin = match (&auth.exec, &auth.auth_provider) {
+        (Some(_), _) => "an exec credential plugin",
+        (_, Some(p)) => return Err(format!("context `{context}` authenticates through the `{}` auth-provider, which the collector image cannot run", p.name).into()),
+        _ => return Ok(()),
+    };
+    Err(format!(
+        "context `{context}` authenticates through {plugin}, absent from the collector image"
+    )
+    .into())
+}
+
+/// Referenced file → embedded `-data`, base64 as the kubeconfig schema wants it
+fn inline(
+    path: &mut Option<String>,
+    data: &mut Option<String>,
+) -> Result<(), crate::error::PipelineError> {
+    if let Some(pem) = read_pem(path, data.is_some())? {
+        *data = Some(pem);
+    }
+    Ok(())
+}
+
+/// Generic over the secret wrapper: naming `kube`'s own would pin this file to whichever
+/// `secrecy` major it tracks, and two live in the tree
+fn inline_secret<T: From<String>>(
+    path: &mut Option<String>,
+    data: &mut Option<T>,
+) -> Result<(), crate::error::PipelineError> {
+    if let Some(pem) = read_pem(path, data.is_some())? {
+        *data = Some(pem.into());
+    }
+    Ok(())
+}
+
+/// `None` = nothing to inline (already embedded, or never set). Takes the path either way:
+/// a stale path beside the data reads as a file the container will look for
+fn read_pem(
+    path: &mut Option<String>,
+    embedded: bool,
+) -> Result<Option<String>, crate::error::PipelineError> {
+    use base64::Engine as _;
+    let Some(file) = path.take() else {
+        return Ok(None);
+    };
+    if embedded {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&file).map_err(|e| format!("read {file} for the collector: {e}"))?;
+    Ok(Some(base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
+fn write_kubeconfig(dir: &Path, api_server: &str) -> Result<PathBuf, crate::error::PipelineError> {
+    let path = dir.join("kubeconfig");
+    std::fs::write(&path, kubeconfig(api_server)?).map_err(|e| format!("write kubeconfig: {e}"))?;
+    Ok(path)
 }
 
 /// Start the collector for a run. Idempotent: an existing container for this id is replaced,
@@ -256,5 +349,115 @@ pub async fn reap_finished(client: &kube::Client) {
         if !live {
             stop(&id).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kube::config::Kubeconfig;
+
+    /// Two clusters, current-context on the one the run did *not* bind — the shape that
+    /// pointed a collector at the wrong apiserver for six hours
+    fn two_clusters() -> Kubeconfig {
+        Kubeconfig::from_yaml(
+            r#"
+apiVersion: v1
+kind: Config
+current-context: kind-other
+clusters:
+- name: kind-run
+  cluster:
+    server: https://127.0.0.1:36591
+    certificate-authority-data: cnVuLWNh
+- name: kind-other
+  cluster:
+    server: https://127.0.0.1:44444
+    certificate-authority-data: b3RoZXItY2E=
+users:
+- name: kind-run
+  user:
+    client-certificate-data: cnVuLWNlcnQ=
+- name: kind-other
+  user:
+    client-certificate-data: b3RoZXItY2VydA==
+contexts:
+- name: kind-run
+  context: { cluster: kind-run, user: kind-run }
+- name: kind-other
+  context: { cluster: kind-other, user: kind-other }
+"#,
+        )
+        .expect("fixture parses")
+    }
+
+    const API: &str = "https://172.24.0.2:6443";
+
+    /// Alloy has no context selector, so `current-context` *is* the selection — inheriting
+    /// the shell's authenticates against the run's cluster with another one's CA
+    #[test]
+    fn pin_takes_the_bound_context_over_the_files_current_one() {
+        let pinned = pin(two_clusters(), "kind-run", API).expect("pins");
+        assert_eq!(pinned.current_context.as_deref(), Some("kind-run"));
+        let ca = pinned.clusters[0].cluster.as_ref().unwrap().certificate_authority_data.as_deref();
+        assert_eq!(ca, Some("cnVuLWNh"));
+    }
+
+    /// One entry each: an unreferenced cluster left in the file is one a future
+    /// `current-context` can still select
+    #[test]
+    fn pin_drops_every_entry_the_context_does_not_name() {
+        let pinned = pin(two_clusters(), "kind-run", API).expect("pins");
+        assert_eq!(pinned.clusters.len(), 1);
+        assert_eq!(pinned.auth_infos.len(), 1);
+        assert_eq!(pinned.contexts.len(), 1);
+        assert_eq!(pinned.clusters[0].name, "kind-run");
+        assert_eq!(
+            pinned.auth_infos[0].auth_info.as_ref().unwrap().client_certificate_data.as_deref(),
+            Some("cnVuLWNlcnQ=")
+        );
+    }
+
+    /// The file's address is loopback, which is dead once the collector leaves the host network
+    #[test]
+    fn pin_dials_the_address_the_collector_can_reach() {
+        let pinned = pin(two_clusters(), "kind-run", API).expect("pins");
+        assert_eq!(pinned.clusters[0].cluster.as_ref().unwrap().server.as_deref(), Some(API));
+    }
+
+    /// A stale profile outlives the kubeconfig it names; silently falling back to the file's
+    /// current-context is the bug, so this must fail and say which context is missing
+    #[test]
+    fn pin_refuses_a_context_the_kubeconfig_lacks() {
+        let err = pin(two_clusters(), "kind-gone", API).expect_err("refused");
+        assert!(err.0.contains("kind-gone"), "{}", err.0);
+    }
+
+    /// The plugin binary is not in the collector image: rendered anyway, discovery fails at
+    /// runtime with an error only the container's log carries
+    #[test]
+    fn pin_refuses_credentials_the_collector_image_cannot_produce() {
+        let exec = Kubeconfig::from_yaml(
+            r#"
+apiVersion: v1
+kind: Config
+current-context: oidc
+clusters:
+- name: oidc
+  cluster: { server: https://example:6443 }
+users:
+- name: oidc
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1
+      command: kubelogin
+contexts:
+- name: oidc
+  context: { cluster: oidc, user: oidc }
+"#,
+        )
+        .expect("fixture parses");
+        let err = pin(exec, "oidc", API).expect_err("refused");
+        assert!(err.0.contains("exec credential plugin"), "{}", err.0);
     }
 }

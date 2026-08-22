@@ -505,14 +505,23 @@ async fn launch_driver(
             adopt_profiler_config(client, &created, &c.config_map).await;
         }
         // Started after the pod exists: discovery matches on labels the pod carries, and a
-        // collector racing ahead of it would idle on zero targets
+        // collector racing ahead of it would idle on zero targets.
+        //
+        // Never fatal: a diagnostic that discards a driver already scheduled for a
+        // twelve-hour sync is the wrong trade. `ztest cluster check` is the gate
         Some(c) => {
-            ztest::api::profiling::start(
+            if let Err(e) = ztest::api::profiling::start(
                 sync_id,
                 &c.host_config(),
                 c.api_server.as_deref().unwrap_or_default(),
             )
-            .await?
+            .await
+            {
+                eprintln!(
+                    "ztest sync: profiler not started ({e}); running unprofiled — \
+                     `ztest cluster check` names the fault"
+                );
+            }
         }
         None => {}
     }
