@@ -27,8 +27,8 @@
 //! # Adding one
 //!
 //! `zaino/scripts/produce-chain-fixture.sh <height> <version> <network>`, then
-//! `ztest snapshot manifest <archive> > snapshots/<network>/zebra-<version>-<upgrade>.toml`,
-//! `ztest snapshot push <archive>`, and a const here.
+//! `ztest snapshot push <archive> > snapshots/<network>/zebra-<version>-<upgrade>.toml`
+//! (packs, uploads, and prints the record in one pass), and a const here.
 
 use crate::archive::{Backend, ChainSnapshot, Network};
 use ztest_macros::artifact;

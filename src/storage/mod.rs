@@ -8,6 +8,9 @@
 //! - Runner pods have no checkout and no bucket credentials → the multi-GB stream
 //!   must never enter ztest's address space in either direction
 
+pub mod pack;
+pub mod seekable;
+
 /// Namespace for every managed object. Recorded per manifest by `ztest snapshot manifest`,
 /// so a reader cannot disagree with the push that made the blob. Frozen legacy name from
 /// the retired Git LFS store — renaming it re-uploads every blob and buys nothing
@@ -67,6 +70,38 @@ fn probe_client(timeout: std::time::Duration) -> Result<reqwest::Client, Storage
         .timeout(timeout)
         .build()
         .map_err(|e| StorageError::Bucket(format!("http client: {e}")))
+}
+
+/// Frame table of a published blob, or `None` where the object predates segmentation.
+///
+/// - One ranged `GET` of the tail: the seek table is the last thing in the object, and
+///   [`seekable::TAIL_PROBE_BYTES`] covers more frames than any seed has
+/// - Unauthenticated, like every read ztest makes
+/// - Absent table is the *legacy* answer, not a failure — the puller streams it whole
+pub async fn seek_table(
+    url: &str,
+    size: u64,
+    timeout: std::time::Duration,
+) -> Result<Option<Vec<seekable::Segment>>, StorageError> {
+    let from = size.saturating_sub(seekable::TAIL_PROBE_BYTES);
+    let resp = probe_client(timeout)?
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes={from}-{}", size.saturating_sub(1)))
+        .send()
+        .await
+        .map_err(|e| StorageError::Bucket(format!("GET {url} tail: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(StorageError::Bucket(format!("GET {url} tail: {}", resp.status())));
+    }
+    let tail =
+        resp.bytes().await.map_err(|e| StorageError::Bucket(format!("GET {url} tail: {e}")))?;
+    match seekable::parse(&tail, size) {
+        Ok(segments) => Ok(Some(segments)),
+        Err(seekable::SeekTableError::NoFooter) => Ok(None),
+        // A table that is present but unreadable is not a legacy object: resuming on it
+        // would range at offsets that decode to something else
+        Err(e) => Err(StorageError::Bucket(format!("{url}: {e}"))),
+    }
 }
 
 /// Does the read path honour `Range`, asked the way the puller asks?

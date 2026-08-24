@@ -12,8 +12,11 @@
 //!
 //! 1. Get-or-create the PVC (409 = lost the race → wait-for-ready)
 //! 2. If created, or not `ready=true`, launch a puller Job: `curl` `lfs/<oid>` as byte
-//!    ranges into `tar -x -C /seed` (`cat > /seed/blob` for a file seed), signed when
-//!    this process holds credentials. R2 → node, nothing through here, hence [`progress`]
+//!    ranges into `tar -x -C /seed` (`cat > /seed/blob` for a file seed). R2 → node,
+//!    nothing through here, hence [`progress`]
+//!    - Object's frame table (`storage::seek_table`) decides the shape: segments the pod
+//!      extracts and records one at a time, resuming off `/seed/.ztest-resume` after a dead
+//!      pod — or, with no table, the single stream every pre-segmentation blob is
 //! 3. Label `seeds.ztest.io/ready=true` + create the paired `VolumeSnapshot`, from
 //!    which `seeds::read_seed_handle` resolves the handle and `bind_seed` clones per pod
 //!
@@ -34,22 +37,23 @@ use crate::inventory::SeedEntry;
 use crate::progress::{Silent, StepProgress};
 use crate::seeds::{self, SEEDS_NAMESPACE, SeedHandle, volume_snapshot_gvk};
 use crate::storage;
+use crate::storage::seekable::Segment;
 
 pub mod progress;
 
 const WAIT_INTERVAL: Duration = Duration::from_secs(2);
 const WAIT_BUDGET: Duration = Duration::from_secs(300);
 
-/// Budget floor: scheduling, image pull, the costs not scaling with the payload
-const PULL_BUDGET_FLOOR: Duration = Duration::from_secs(300);
-
-/// Sustained transfer+extract throughput, B/s. Far below the real rate — a
-/// *deadline*, not an expectation (a fast-path budget makes a slow cluster fail
-/// spuriously). Override: `ZTEST_SEED_THROUGHPUT_MIB_S`
-const DEFAULT_THROUGHPUT_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
-
 /// Bounded: a wrong base_uri hangs on connect, and this sits in front of every seed
 const BLOB_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Cluster GC's hold on a finished puller Job — long enough to read a failure, short enough
+/// that an interrupted run leaks nothing lasting
+const JOB_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Puller log lines quoted in an error. The meter writes one record a second, so the whole
+/// log is thousands of them and the failure is always at the end
+const LOG_TAIL_LINES: i64 = 50;
 
 /// Refuse to fill a volume that cannot hold the artifact.
 ///
@@ -92,19 +96,6 @@ fn volume_shortfall<'a>(have: Option<&'a str>, want: &'a str) -> Option<(&'a str
     use crate::qos::units::parse_mem_bytes_opt;
     let (h, w) = (parse_mem_bytes_opt(have?)?, parse_mem_bytes_opt(want)?);
     (h < w).then_some((have?, want))
-}
-
-/// Wall-clock budget for `bytes`. Sized, not flat (a constant is at once generous
-/// for a 100 MB cache and short for a 9.7 GB snapshot, which surfaces as an opaque
-/// "did not finish")
-fn pull_budget(bytes: u64) -> Duration {
-    let throughput = std::env::var("ZTEST_SEED_THROUGHPUT_MIB_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|mib| mib * 1024 * 1024)
-        .unwrap_or(DEFAULT_THROUGHPUT_BYTES_PER_SEC)
-        .max(1);
-    PULL_BUDGET_FLOOR + Duration::from_secs(bytes / throughput)
 }
 
 /// Publish a seed: get-or-create the PVC, fill from the bucket, snapshot.
@@ -396,7 +387,7 @@ impl From<EnvError> for MaterializeErr {
 
 /// Fill `pvc_name` from the bucket with a one-shot puller Job.
 ///
-/// - Job, not a bare Pod: `backoffLimit` survives a transient bucket/network error
+/// - Job, not a bare Pod: its terminal condition is the verdict, and its name the lock
 /// - Job name = the concurrency lock a 409 reports
 /// - Nothing streams from here (the pod holds the public URL, transfers itself)
 async fn materialize(
@@ -423,8 +414,14 @@ async fn materialize(
         }));
     }
 
-    let cmd = puller_cmd(seed).map_err(|e| storage_fatal(&seed.name, e))?;
-    let body = puller_job(&job_name, pvc_name, &cmd, &url);
+    // Frame table decides the shape of the pull: present = resumable segments, absent =
+    // one stream (every object published before segmentation)
+    let segments = crate::storage::seek_table(&url, seed.size, BLOB_PROBE_TIMEOUT)
+        .await
+        .map_err(|e| storage_fatal(&seed.name, e))?;
+    let resumable = segments.is_some();
+    let cmd = puller_cmd(seed, segments.as_deref()).map_err(|e| storage_fatal(&seed.name, e))?;
+    let body = puller_job(&job_name, pvc_name, &cmd, &url, backoff_limit(resumable));
     match jobs.create(&PostParams::default(), &body).await {
         Ok(_) => {}
         Err(kube::Error::Api(e)) if e.code == 409 => {
@@ -442,21 +439,30 @@ async fn materialize(
         Err(e) => return Err(MaterializeErr::Fatal(env_err(e))),
     }
 
-    // The wait that must scale: a multi-GB snapshot transfers *and* extracts, so the
-    // budget comes from the manifest's `size_bytes`, not a flat 300 s
-    //
-    // Watcher rides alongside, never in front: it only reports, and never resolves,
-    // so this `select!` is decided by the wait
-    let budget = pull_budget(seed.size);
-    let finished =
-        tokio::time::timeout(budget, await_condition(jobs.clone(), &job_name, is_job_finished()));
-    let outcome = tokio::select! {
-        r = finished => r,
-        () = progress::watch_puller(&pods, &job_name, seed.size, progress) => {
-            unreachable!("watch_puller parks rather than resolving")
+    // No duration is predicted, because none can be: transfer+extract time spans orders of
+    // magnitude across link, CPU and CSI write path, so any budget is at once too tight for
+    // the slowest honest cluster and too loose to catch a hang. The Job's condition decides
+    // the pull; the watcher only ends states no condition would ever arrive to settle
+    let stalled = tokio::select! {
+        r = await_condition(jobs.clone(), &job_name, is_job_finished()) => {
+            r.map_err(env_err)?;
+            None
+        }
+        stall = progress::watch_puller(&pods, &job_name, seed.size, resumable, progress) => {
+            Some(stall)
         }
     };
-    outcome.map_err(|_| puller_stuck(&seed.name, &job_name, budget))?.map_err(env_err)?;
+    // Wedged pull is deleted, not left to inspect: it holds a Guaranteed pod and the PVC's
+    // `pvc-protection` finalizer, and `reap_finished_job` reads a non-terminal Job as another
+    // run's live pull — so leaving it wedges every later run too. Diagnostic rides the error
+    if let Some(stall) = stalled {
+        let tail = match stall.ran() {
+            true => job_logs(&pods, &job_name).await,
+            false => String::new(),
+        };
+        let _ = jobs.delete(&job_name, &kube::api::DeleteParams::background()).await;
+        return Err(MaterializeErr::Fatal(puller_stuck(&seed.name, stall, &tail)));
+    }
     progress.finalizing();
 
     if !job_succeeded(&jobs, &job_name).await {
@@ -473,16 +479,17 @@ async fn materialize(
     Ok(())
 }
 
-fn puller_stuck(archive: &str, pod: &str, budget: Duration) -> MaterializeErr {
-    MaterializeErr::Fatal(EnvError::ArchiveMaterializeFailed {
+/// Last thing the puller said, appended to the verdict. One line, not the tail: over a
+/// wedged pull the rest is meter records, and the count they carry is already in `stall`
+fn puller_stuck(archive: &str, stall: progress::Stall, tail: &str) -> EnvError {
+    let last = tail.lines().rev().map(str::trim).find(|l| !l.is_empty());
+    EnvError::ArchiveMaterializeFailed {
         archive: archive.to_string(),
-        reason: format!(
-            "puller job {pod} did not finish within {budget:?} \
-             (check `kubectl -n {SEEDS_NAMESPACE} describe job {pod}` for image-pull/scheduling \
-             errors; if the payload is simply large and the cluster slow, raise \
-             ZTEST_SEED_THROUGHPUT_MIB_S)"
-        ),
-    })
+        reason: match last {
+            None => stall.to_string(),
+            Some(last) => format!("{stall}; puller last said: {last}"),
+        },
+    }
 }
 
 /// Shell command populating `/seed` from the bucket.
@@ -494,30 +501,38 @@ fn puller_stuck(archive: &str, pod: &str, budget: Duration) -> MaterializeErr {
 /// - URL via `SEED_URL`, never argv (bearer credential vs world-readable `/proc`)
 /// - Digest checked in flight: a seed is *named* by its content, so bytes hashing to
 ///   anything else are the one corruption no other check here catches
-fn puller_cmd(seed: &SeedEntry) -> Result<String, storage::StorageError> {
-    puller_cmd_chunked(seed, CHUNK_BYTES)
+fn puller_cmd(
+    seed: &SeedEntry,
+    segments: Option<&[Segment]>,
+) -> Result<String, storage::StorageError> {
+    puller_cmd_chunked(seed, CHUNK_BYTES, segments)
 }
 
 /// [`puller_cmd`] at an explicit chunk size, so a test can drive the same command over a
 /// fixture small enough to run in-process
-fn puller_cmd_chunked(seed: &SeedEntry, chunk: u64) -> Result<String, storage::StorageError> {
-    let prelude = "set -o pipefail";
-    let fetch = ranged_fetch(seed.size, chunk);
-    let payload = match seed.payload {
-        crate::inventory::SeedPayload::Archive => {
+fn puller_cmd_chunked(
+    seed: &SeedEntry,
+    chunk: u64,
+    segments: Option<&[Segment]>,
+) -> Result<String, storage::StorageError> {
+    let payload = match (seed.payload, segments) {
+        (crate::inventory::SeedPayload::Archive, Some(segments)) => segmented(segments, seed.size),
+        (crate::inventory::SeedPayload::Archive, None) => {
             let compression = storage::compression_from_name(&seed.name).ok_or_else(|| {
                 storage::StorageError::UnknownCompression { name: seed.name.clone() }
             })?;
             format!(
-                "{fetch} | tee {VERIFY_FIFO} | {METER} | tar {}-xf - -C /seed && \
+                "stream 0 $(({} - 1)) | tee {VERIFY_FIFO} | {METER} | tar {}-ixf - -C /seed && \
                  {NORMALIZE_MODES}",
+                seed.size,
                 compression.tar_flag()
             )
         }
         // Always `/seed/blob` — only the consumer's volumeMount path cares
-        crate::inventory::SeedPayload::File => {
-            format!("{fetch} | tee {VERIFY_FIFO} | {METER} > /seed/blob && {NORMALIZE_MODES}")
-        }
+        (crate::inventory::SeedPayload::File, _) => format!(
+            "stream 0 $(({} - 1)) | tee {VERIFY_FIFO} | {METER} > /seed/blob && {NORMALIZE_MODES}",
+            seed.size
+        ),
     };
     // Verify grouped, not spliced: it is a `;`-separated list, so a bare `&&` would gate
     // only its first command and leave the group's status set by the digest test —
@@ -526,10 +541,54 @@ fn puller_cmd_chunked(seed: &SeedEntry, chunk: u64) -> Result<String, storage::S
     // Group-then-pipe, not appended to the payload's pipeline: the meter writes to
     // *stderr*, and only a group carries every command's stderr through one delimiter
     // `pipefail` spans both pipelines → `tr` cannot mask a failed transfer
-    Ok(format!("{prelude}; {{ {verified} ; }} 2>&1 | {LINE_DELIMIT}"))
+    // `RESUME` is read by [`verify_close`] on every path; only [`segmented`] ever moves it
+    // off zero, so a single-stream pull verifies exactly as it always did
+    Ok(format!(
+        "set -o pipefail; RESUME=0; {}; {{ {verified} ; }} 2>&1 | {LINE_DELIMIT}",
+        stream_fns(chunk)
+    ))
 }
 
-/// Blob → stdout as byte ranges, one chunk ahead of the consumer.
+/// Segment-at-a-time pull, resumable across a dead pod.
+///
+/// - Marker written only *after* `tar` returns → a segment interrupted mid-extract is
+///   redone, and redoing one is harmless (`tar` overwrites what it already wrote)
+/// - Marker lives on the PVC (the one thing that outlives the pod) and is removed before
+///   the seed is published, or every clone would carry it
+/// - `-i`: each segment ends with its own end-of-archive blocks, and without this `tar`
+///   stops at the first pair and exits **0** over a fraction of the tree
+/// - Meter restarts at every frame, so each segment announces the absolute offset its
+///   counts are relative to ([`BASE_MARK`])
+/// - Digest compared only on a pull that ran the whole object; a resumed one never held
+///   the earlier bytes, and each frame carries its own checksum for zstd to enforce
+/// - Seek table trails the last frame and no segment covers it, so a whole pull draws it
+///   through the hasher too — which is what binds the table the parent read off the network
+///   to the oid committed in the tree
+fn segmented(segments: &[Segment], size: u64) -> String {
+    let lens = segments.iter().map(|s| s.compressed.to_string()).collect::<Vec<_>>().join(" ");
+    format!(
+        "SEGS=\"{lens}\"; \
+         RESUME=$(cat {RESUME_FILE} 2>/dev/null || echo 0); \
+         case \"$RESUME\" in \'\'|*[!0-9]*) RESUME=0;; esac; \
+         exec 9>{VERIFY_FIFO}; \
+         k=0; off=0; \
+         for len in $SEGS; do \
+         if [ $k -ge $RESUME ]; then \
+         echo \"{BASE_MARK} $off\"; \
+         stream $off $((off + len - 1)) | tee {VERIFY_FIFO} | {METER} \
+         | zstd -dc | tar -ixf - -C /seed || exit 1; \
+         echo $((k + 1)) > {RESUME_FILE}; \
+         fi; \
+         off=$((off + len)); k=$((k + 1)); \
+         done; \
+         [ $RESUME -eq 0 ] && {{ stream $off $(({size} - 1)) | tee {VERIFY_FIFO} > /dev/null \
+         || exit 1; }}; \
+         exec 9>&-; \
+         rm -f {CHUNK_FILE}.a {CHUNK_FILE}.b {RESUME_FILE} && {NORMALIZE_MODES}"
+    )
+}
+
+/// `fetch` + `stream`: the transfer, as two shell functions the payloads call.
 ///
 /// - One connection for the whole object = the failure mode (no endpoint holds a
 ///   multi-hour transfer open; a 245 GiB seed died at 8/33/34 GB, restarting from zero)
@@ -540,7 +599,9 @@ fn puller_cmd_chunked(seed: &SeedEntry, chunk: u64) -> Result<String, storage::S
 ///   11.8 → 18.4 (the win is the consumer's time, so it grows with link speed)
 /// - Two buffers, never more: a deeper queue would stage more disk for a transfer
 ///   already at the link's ceiling
-fn ranged_fetch(size: u64, chunk: u64) -> String {
+/// - `return`, never `exit`: `stream` is a pipeline element, so it runs in a subshell and
+///   only its status reaches `pipefail`
+fn stream_fns(chunk: u64) -> String {
     // `fetch <off> <end> <file>`, retried; run backgrounded, so its status reaches the
     // loop through `wait`
     let fetch = format!(
@@ -548,24 +609,33 @@ fn ranged_fetch(size: u64, chunk: u64) -> String {
          curl --fail --silent --show-error --location --range \"$1-$2\" \
          --speed-limit {STALL_FLOOR_BPS} --speed-time {STALL_WINDOW_SECS} \
          --output \"$3\" \"$SEED_URL\" && [ \"$(wc -c < \"$3\")\" -eq $want ] && return 0; \
-         [ $try -ge {CHUNK_ATTEMPTS} ] && return 1; sleep $((try * 5)); try=$((try + 1)); \
+         [ $try -ge {CHUNK_ATTEMPTS} ] && return 1; \
+         sleep $((try * ${{{BACKOFF_ENV}:-{CHUNK_BACKOFF_SECS}}})); try=$((try + 1)); \
          done; }}"
     );
+    // `stream <first> <last>`, both inclusive — a byte range on stdout, one chunk ahead
     format!(
         "{fetch}; \
-         {{ a={CHUNK_FILE}.a; b={CHUNK_FILE}.b; off=0; \
-         end=$(({chunk} - 1)); [ $end -ge {size} ] && end=$(({size} - 1)); \
+         stream() {{ a={CHUNK_FILE}.a; b={CHUNK_FILE}.b; off=$1; last=$2; \
+         end=$((off + {chunk} - 1)); [ $end -gt $last ] && end=$last; \
          fetch $off $end $a & p=$!; \
-         while [ $off -lt {size} ]; do \
-         wait $p || exit 1; \
+         while [ $off -le $last ]; do \
+         wait $p || return 1; \
          nxt=$((end + 1)); \
-         [ $nxt -lt {size} ] && {{ nend=$((nxt + {chunk} - 1)); \
-         [ $nend -ge {size} ] && nend=$(({size} - 1)); \
+         [ $nxt -le $last ] && {{ nend=$((nxt + {chunk} - 1)); \
+         [ $nend -gt $last ] && nend=$last; \
          fetch $nxt $nend $b & p=$!; end=$nend; }}; \
-         cat $a || exit 1; t=$a; a=$b; b=$t; off=$nxt; \
-         done; rm -f {CHUNK_FILE}.a {CHUNK_FILE}.b ; }}"
+         cat $a || return 1; t=$a; a=$b; b=$t; off=$nxt; \
+         done; }}"
     )
 }
+
+/// Absolute offset the meter's following counts are relative to. `dd` restarts at every
+/// frame, so without this the bar would saw back to zero once a segment
+const BASE_MARK: &str = "ZTEST_BASE";
+
+/// Segments already extracted, on the volume that outlives the pod
+const RESUME_FILE: &str = "/seed/.ztest-resume";
 
 /// Bytes per ranged GET. Short enough that a dropped connection costs one chunk, long
 /// enough that a 245 GiB seed stays under 1k requests. Two of these are staged at once
@@ -579,8 +649,13 @@ const STALL_FLOOR_BPS: u64 = 1024 * 1024;
 /// Long enough to ride out a pause, far under the run budget
 const STALL_WINDOW_SECS: u64 = 60;
 
-/// Attempts per chunk before the pull fails (backoff = 5s × attempt)
+/// Attempts per chunk before the pull fails
 const CHUNK_ATTEMPTS: u32 = 5;
+
+/// Backoff between attempts, × the attempt number. Overridable in the pod's environment so a
+/// test can drive the exhaustion path without waiting out the real ladder
+const CHUNK_BACKOFF_SECS: u32 = 5;
+const BACKOFF_ENV: &str = "ZTEST_CHUNK_BACKOFF_SECS";
 
 /// Where [`ranged_fetch`] stages the in-flight chunk
 const CHUNK_FILE: &str = "/tmp/chunk";
@@ -600,10 +675,14 @@ const VERIFY_OPEN: &str = "mkfifo /tmp/verify.fifo || exit 1; \
                            VERIFY_PID=$!";
 
 /// Join the hasher and compare. Runs only after the transfer succeeded, so a mismatch
-/// here means the bucket served bytes that are not what the seed is named for
+/// here means the bucket served bytes that are not what the seed is named for.
+///
+/// Skipped on a resumed pull alone (`RESUME` != 0): those bytes were drawn by a pod that is
+/// gone, and no digest over the remainder means anything. What covers them instead is the
+/// per-frame checksum zstd enforces at decompression
 fn verify_close(oid: &str) -> String {
     format!(
-        "wait $VERIFY_PID; ACTUAL=$(cat /tmp/verify.sum); \
+        "wait $VERIFY_PID; [ $RESUME -eq 0 ] || exit 0; ACTUAL=$(cat /tmp/verify.sum); \
          [ \"$ACTUAL\" = \"{oid}\" ] || {{ \
          echo \"seed digest mismatch: expected {oid}, got $ACTUAL\" >&2; exit 1; }}"
     )
@@ -647,9 +726,14 @@ fn storage_fatal(archive: &str, err: storage::StorageError) -> MaterializeErr {
 
 /// One-shot Job filling a seed PVC from the bucket.
 ///
-/// - `backoffLimit: 2`: a retry reuses the same URL (public, never expires)
-/// - Safe to retry — fresh PVC, and complete only once a pod exits 0 on the whole stream
-fn puller_job(name: &str, pvc_name: &str, cmd: &str, url: &str) -> Job {
+/// - `backoffLimit` tracks what a restart costs: a segmented object resumes off its marker,
+///   so a fresh pod is cheap; an unsegmented one would re-fetch from byte 0, and there the
+///   only retry that can resume anything is `fetch()`'s, per range
+/// - Complete only once a pod exits 0 on the whole stream
+/// - `ttlSecondsAfterFinished` backstops the delete-on-success (a Ctrl-C between create and
+///   delete leaks the Job otherwise), long enough that a failure is still there to read
+/// - No `activeDeadlineSeconds`: server-side wall clock, the same unmodelable duration
+fn puller_job(name: &str, pvc_name: &str, cmd: &str, url: &str, backoff_limit: u32) -> Job {
     // Guaranteed QoS (requests == limits) at the fixed puller footprint, via the
     // single QoS lowering — this pod moves seed bytes and must never be
     // BestEffort.
@@ -662,7 +746,8 @@ fn puller_job(name: &str, pvc_name: &str, cmd: &str, url: &str) -> Job {
             "labels": { "seeds.ztest.io/puller-for": pvc_name },
         },
         "spec": {
-            "backoffLimit": 2,
+            "backoffLimit": backoff_limit,
+            "ttlSecondsAfterFinished": JOB_TTL.as_secs(),
             "template": {
                 "metadata": {
                     "labels": { "seeds.ztest.io/puller-for": pvc_name },
@@ -689,6 +774,15 @@ fn puller_job(name: &str, pvc_name: &str, cmd: &str, url: &str) -> Job {
         }
     });
     serde_json::from_value(body).expect("static manifest")
+}
+
+/// Attempts a Job is worth. A resumed pod picks up at its marker, so a restart costs one
+/// segment; without a marker it costs the object, and failing loudly beats redoing it twice
+fn backoff_limit(resumable: bool) -> u32 {
+    match resumable {
+        true => 2,
+        false => 0,
+    }
 }
 
 /// Delete a terminal puller Job, freeing its name. `false` = still running, so the
@@ -752,9 +846,8 @@ async fn job_logs(pods: &Api<Pod>, job_name: &str) -> String {
     let Some(name) = pod.metadata.name else {
         return "<puller pod has no name>".to_string();
     };
-    pods.logs(&name, &Default::default())
-        .await
-        .unwrap_or_else(|e| format!("<logs unavailable: {e}>"))
+    let lp = kube::api::LogParams { tail_lines: Some(LOG_TAIL_LINES), ..Default::default() };
+    pods.logs(&name, &lp).await.unwrap_or_else(|e| format!("<logs unavailable: {e}>"))
 }
 
 // ─────────────────────────── snapshot + waits ───────────────────────
@@ -859,10 +952,11 @@ mod tests {
     /// - Delimiter wraps the whole group (meter's stderr reaches the log per-record)
     #[test]
     fn the_archive_command_meters_the_transfer_and_delimits_its_records() {
-        let cmd = puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive)).expect("known suffix");
-        assert!(cmd.starts_with("set -o pipefail; { mkfifo "), "{cmd}");
+        let cmd =
+            puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive), None).expect("known suffix");
+        assert!(cmd.starts_with("set -o pipefail; RESUME=0; fetch() "), "{cmd}");
         assert!(cmd.contains("curl --fail"), "{cmd}");
-        assert!(cmd.contains(&format!("| {METER} | tar --zstd -xf - -C /seed")), "{cmd}");
+        assert!(cmd.contains(&format!("| {METER} | tar --zstd -ixf - -C /seed")), "{cmd}");
         assert!(cmd.ends_with(&format!("; }} 2>&1 | {LINE_DELIMIT}")), "{cmd}");
     }
 
@@ -878,7 +972,7 @@ mod tests {
     fn a_seed_whose_bytes_do_not_hash_to_its_name_fails_the_pull() {
         for payload in [SeedPayload::Archive, SeedPayload::File] {
             let s = seed("chain.tar.zst", payload);
-            let cmd = puller_cmd(&s).expect("valid seed");
+            let cmd = puller_cmd(&s, None).expect("valid seed");
             assert!(cmd.contains(&format!("tee {VERIFY_FIFO}")), "{cmd}");
             assert!(cmd.contains("wait $VERIFY_PID"), "not joined on a real pid: {cmd}");
             // Grouped: a bare `&&` would gate only the `wait`, leaving the pod's status
@@ -891,7 +985,8 @@ mod tests {
 
     #[test]
     fn a_file_seed_is_metered_the_same_way_before_landing_at_the_blob_path() {
-        let cmd = puller_cmd(&seed("wallet.dat", SeedPayload::File)).expect("file needs no suffix");
+        let cmd =
+            puller_cmd(&seed("wallet.dat", SeedPayload::File), None).expect("file needs no suffix");
         assert!(cmd.contains(&format!("| {METER} > /seed/blob")), "{cmd}");
         assert!(cmd.ends_with(&format!("; }} 2>&1 | {LINE_DELIMIT}")), "{cmd}");
     }
@@ -905,7 +1000,7 @@ mod tests {
                 SeedPayload::Archive => "chain.tar.zst",
                 SeedPayload::File => "wallet.dat",
             };
-            let cmd = puller_cmd(&seed(name, payload)).expect("valid seed");
+            let cmd = puller_cmd(&seed(name, payload), None).expect("valid seed");
             assert_eq!(cmd.find("set -o pipefail"), Some(0), "{cmd}");
         }
     }
@@ -916,8 +1011,8 @@ mod tests {
     fn the_transfer_is_ranged_and_a_short_chunk_never_reaches_the_consumer() {
         let mut s = seed("chain.tar.zst", SeedPayload::Archive);
         s.size = 3 * CHUNK_BYTES;
-        let cmd = puller_cmd(&s).expect("known suffix");
-        assert!(cmd.contains(&format!("[ $off -lt {} ]", s.size)), "{cmd}");
+        let cmd = puller_cmd(&s, None).expect("known suffix");
+        assert!(cmd.contains(&format!("stream 0 $(({} - 1))", s.size)), "{cmd}");
         assert!(cmd.contains(r#"--range "$1-$2""#), "{cmd}");
         assert!(cmd.contains(r#"--output "$3""#), "not staged: {cmd}");
         let whole = r#"[ "$(wc -c < "$3")" -eq $want ]"#;
@@ -929,12 +1024,14 @@ mod tests {
     /// decompressing (measured 17.1 → 20.3 MB/s). Two buffers, swapped
     #[test]
     fn the_next_chunk_downloads_while_the_current_one_feeds_the_consumer() {
-        let cmd = puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive)).expect("known suffix");
+        let cmd =
+            puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive), None).expect("known suffix");
         let prefetch = cmd.find("fetch $nxt $nend $b & p=$!").expect("no prefetch");
         let emit = cmd.find("cat $a").expect("nothing emitted");
         assert!(prefetch < emit, "prefetch does not precede the emit it overlaps: {cmd}");
         assert!(cmd.contains("t=$a; a=$b; b=$t"), "buffers never swap: {cmd}");
-        assert!(cmd.contains("wait $p || exit 1"), "prefetch failure is not awaited: {cmd}");
+        // `return`, not `exit`: `stream` is a pipeline element, so it runs in a subshell
+        assert!(cmd.contains("wait $p || return 1"), "prefetch failure is not awaited: {cmd}");
     }
 
     /// A volume too small for the artifact must be refused at adoption, in milliseconds —
@@ -959,7 +1056,8 @@ mod tests {
     /// crawling connection open against the run's clock and the retry never fires
     #[test]
     fn a_stalled_range_is_abandoned_to_the_retry() {
-        let cmd = puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive)).expect("known suffix");
+        let cmd =
+            puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive), None).expect("known suffix");
         let guard = format!("--speed-limit {STALL_FLOOR_BPS} --speed-time {STALL_WINDOW_SECS}");
         assert!(cmd.contains(&guard), "{cmd}");
     }
@@ -1024,7 +1122,7 @@ mod tests {
         // collide on one FIFO. Everything else is the command the cluster runs
         // `/tmp/` first: rewriting `/seed` produces a path *under* the temp dir, which a
         // later `/tmp/` pass would mangle
-        let cmd = puller_cmd_chunked(&entry, chunk)
+        let cmd = puller_cmd_chunked(&entry, chunk, None)
             .expect("known suffix")
             .replace("/tmp/", &format!("{}/", dir.display()))
             .replace("/seed", &seed.display().to_string());
@@ -1081,6 +1179,207 @@ mod tests {
         let _ = std::fs::remove_dir_all(&run.dir);
     }
 
+    /// Pack a fixture into segments and drive the real generated command over `file://`.
+    ///
+    /// `resume` pre-seeds the marker the way a dead pod would leave it
+    struct Segmented {
+        dir: std::path::PathBuf,
+        seed: std::path::PathBuf,
+        segments: Vec<crate::storage::seekable::Segment>,
+        entry: SeedEntry,
+        blob: std::path::PathBuf,
+    }
+
+    fn segmented_fixture(tag: &str, members: usize) -> Option<Segmented> {
+        for tool in ["curl", "tar", "zstd", "sha256sum"] {
+            if std::process::Command::new(tool).arg("--version").output().is_err() {
+                eprintln!("skipping: {tool} is not on PATH");
+                return None;
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ztest-seg-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, seed) = (dir.join("src"), dir.join("seed"));
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&seed).expect("seed");
+        for i in 0..members {
+            std::fs::write(src.join(format!("m{i}.dat")), vec![i as u8; 40_000]).expect("member");
+        }
+        let plain = dir.join("plain.tar.zst");
+        assert!(
+            std::process::Command::new("tar")
+                .args(["--zstd", "-cf"])
+                .arg(&plain)
+                .args(["-C", &src.display().to_string()])
+                .args((0..members).map(|i| format!("m{i}.dat")).collect::<Vec<_>>())
+                .status()
+                .expect("tar runs")
+                .success(),
+            "fixture archive"
+        );
+        // 1 byte = cut at the first legal boundary after every member → one member a segment
+        let blob = dir.join("packed.tar.zst");
+        let packed = crate::storage::pack::pack_with(&plain, &blob, 3, 1, &crate::progress::Silent)
+            .expect("packs");
+        let entry = SeedEntry {
+            name: "chain.tar.zst".to_string(),
+            oid: packed.sha256.clone(),
+            size: packed.size_bytes,
+            uncompressed_bytes: packed.uncompressed_bytes,
+            payload: SeedPayload::Archive,
+            base_uri: crate::storage::BASE_URI.to_string(),
+            key_prefix: crate::storage::KEY_PREFIX.to_string(),
+        };
+        Some(Segmented { dir, seed, segments: packed.segments, entry, blob })
+    }
+
+    impl Segmented {
+        /// Same rewrite the single-stream harness uses: `/tmp` and `/seed` are the pod's
+        fn run(&self, segments: Option<&[crate::storage::seekable::Segment]>) -> (bool, String) {
+            self.run_against(&self.blob, segments)
+        }
+
+        fn run_against(
+            &self,
+            url_path: &std::path::Path,
+            segments: Option<&[crate::storage::seekable::Segment]>,
+        ) -> (bool, String) {
+            // Pod-local scratch; a resumed pull is a *new* pod, so it never inherits these
+            for leftover in ["verify.fifo", "verify.sum", "chunk.a", "chunk.b"] {
+                let _ = std::fs::remove_file(self.dir.join(leftover));
+            }
+            let cmd = puller_cmd_chunked(&self.entry, 4096, segments)
+                .expect("known suffix")
+                .replace("/tmp/", &format!("{}/", self.dir.display()))
+                .replace("/seed", &self.seed.display().to_string());
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .env("SEED_URL", format!("file://{}", url_path.display()))
+                .env(BACKOFF_ENV, "0")
+                .output()
+                .expect("sh runs");
+            (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+
+        fn marker(&self) -> Option<String> {
+            std::fs::read_to_string(self.seed.join(".ztest-resume")).ok()
+        }
+
+        fn landed(&self, i: usize) -> bool {
+            self.seed.join(format!("m{i}.dat")).exists()
+        }
+    }
+
+    /// End to end over the segmented path: every member lands, and the resume marker is
+    /// gone — it must never reach the snapshot every test clones
+    #[test]
+    fn a_segmented_pull_lands_the_whole_tree_and_leaves_no_marker() {
+        let Some(f) = segmented_fixture("whole", 4) else { return };
+        assert!(f.segments.len() > 1, "fixture was not segmented");
+        let (ok, log) = f.run(Some(&f.segments));
+        assert!(ok, "segmented pull failed:\n{log}");
+        for i in 0..4 {
+            assert!(f.landed(i), "m{i}.dat missing:\n{log}");
+        }
+        assert_eq!(f.marker(), None, "resume marker survived into the seed");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// The point of the whole feature: a pull that resumes re-fetches nothing it already
+    /// landed. Proven by deleting an extracted member — a resumed pull must leave it gone
+    #[test]
+    fn a_resumed_pull_skips_the_segments_already_extracted() {
+        let Some(f) = segmented_fixture("resume", 4) else { return };
+        let (ok, log) = f.run(Some(&f.segments));
+        assert!(ok, "first pull failed:\n{log}");
+
+        // A dead pod leaves exactly this: two segments recorded, their bytes on the volume
+        std::fs::write(f.seed.join(".ztest-resume"), "2").expect("marker");
+        for i in 0..4 {
+            std::fs::remove_file(f.seed.join(format!("m{i}.dat"))).expect("clear");
+        }
+        let (ok, log) = f.run(Some(&f.segments));
+        assert!(ok, "resumed pull failed:\n{log}");
+        assert!(!f.landed(0) && !f.landed(1), "resume re-fetched a recorded segment:\n{log}");
+        assert!(f.landed(2) && f.landed(3), "resume did not finish the tail:\n{log}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A pull cut off mid-object records what it finished, and nothing more. Without this
+    /// the marker would either over-claim (losing bytes) or never advance
+    #[test]
+    fn an_interrupted_pull_records_only_the_segments_that_completed() {
+        let Some(f) = segmented_fixture("cut", 4) else { return };
+        // Truncated object: the ranges of later segments cannot be served
+        let whole = std::fs::read(&f.blob).expect("blob");
+        let short = f.dir.join("short.tar.zst");
+        let keep = (f.segments[0].compressed + f.segments[1].compressed) as usize;
+        std::fs::write(&short, &whole[..keep]).expect("write");
+
+        let (ok, log) = f.run_against(&short, Some(&f.segments));
+        assert!(!ok, "a truncated object completed the pull:\n{log}");
+        assert_eq!(f.marker().as_deref(), Some("2\n"), "marker disagrees with what landed");
+        assert!(f.landed(0) && f.landed(1), "recorded segments are not on the volume");
+        assert!(!f.landed(2), "a segment that never arrived was recorded");
+
+        // Same seed volume, whole object: the tail completes over the top of the marker
+        let (ok, log) = f.run_against(&f.blob, Some(&f.segments));
+        assert!(ok, "resume after truncation failed:\n{log}");
+        for i in 0..4 {
+            assert!(f.landed(i), "m{i}.dat missing after resume:\n{log}");
+        }
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// `-i` is what makes a segmented blob safe on the single-stream path: without it `tar`
+    /// stops at the first segment's end-of-archive blocks and exits **0** over a fraction of
+    /// the tree, and the PVC is marked ready over it
+    #[test]
+    fn a_segmented_blob_still_extracts_whole_through_the_single_stream_path() {
+        let Some(f) = segmented_fixture("legacy", 4) else { return };
+        let (ok, log) = f.run(None);
+        assert!(ok, "single-stream pull of a segmented blob failed:\n{log}");
+        for i in 0..4 {
+            assert!(f.landed(i), "m{i}.dat lost to a missing --ignore-zeros:\n{log}");
+        }
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// Guards the flag itself, so the hazard above cannot come back through an edit that
+    /// never runs the end-to-end tests
+    #[test]
+    fn every_extraction_ignores_the_zero_blocks_between_segments() {
+        let seed = seed("chain.tar.zst", SeedPayload::Archive);
+        let segments = [crate::storage::seekable::Segment {
+            offset: 0,
+            compressed: seed.size,
+            uncompressed: 4096,
+        }];
+        for cmd in [
+            puller_cmd(&seed, None).expect("known suffix"),
+            puller_cmd(&seed, Some(&segments)).expect("known suffix"),
+        ] {
+            assert!(cmd.contains("-ixf - -C /seed"), "extraction is not zero-block safe: {cmd}");
+        }
+    }
+
+    /// Retry policy follows what a restart costs. Without a frame table a fresh pod re-fetches
+    /// the whole object against a clock sized for one pass, which is why it must not happen
+    #[test]
+    fn only_a_resumable_object_is_worth_retrying_at_the_job() {
+        assert_eq!(backoff_limit(false), 0, "an unresumable pull was given a second pass");
+        assert!(backoff_limit(true) > 0, "a resumable pull cannot retry");
+        let job = puller_job("puller-x", "seed-x", "true", "https://e/lfs/x", backoff_limit(true));
+        let spec = job.spec.expect("spec");
+        assert_eq!(spec.backoff_limit, Some(backoff_limit(true) as i32));
+        assert_eq!(
+            spec.ttl_seconds_after_finished,
+            Some(JOB_TTL.as_secs() as i32),
+            "a finished Job is left for the cluster to keep forever"
+        );
+    }
+
     /// Whole command is a shell program → a quoting slip is a parse error here, not a
     /// puller that dies on the cluster an hour in
     #[test]
@@ -1091,7 +1390,7 @@ mod tests {
                 SeedPayload::Archive => "chain.tar.zst",
                 SeedPayload::File => "wallet.dat",
             };
-            let cmd = puller_cmd(&seed(name, payload)).expect("valid seed");
+            let cmd = puller_cmd(&seed(name, payload), None).expect("valid seed");
             let mut sh = std::process::Command::new("sh")
                 .arg("-n")
                 .stdin(std::process::Stdio::piped())
@@ -1106,7 +1405,8 @@ mod tests {
     /// `&&`, never after the delimiter
     #[test]
     fn normalization_stays_inside_the_metered_group() {
-        let cmd = puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive)).expect("known suffix");
+        let cmd =
+            puller_cmd(&seed("chain.tar.zst", SeedPayload::Archive), None).expect("known suffix");
         let normalize = cmd.find(NORMALIZE_MODES).expect("normalization is chained");
         assert!(normalize < cmd.find(LINE_DELIMIT).expect("delimiter"), "{cmd}");
         assert!(cmd[..normalize].ends_with("-C /seed && "), "{cmd}");
