@@ -172,7 +172,7 @@ pub async fn ensure_namespace(
             },
             "annotations": {
                 "ztest.io/test-full": test,
-                "janitor/ttl": "1h",
+                crate::naming::TTL_ANNOTATION: "1h",
             },
         }
     }))

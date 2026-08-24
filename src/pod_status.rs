@@ -47,6 +47,12 @@ pub fn is_running(status: &PodStatus) -> bool {
     status.phase.as_deref() == Some("Running")
 }
 
+/// Not yet started: no container has run, so every later signal is the cluster's rather
+/// than the workload's. Absent phase = not yet reported, which is the same window
+pub fn is_pending(status: &PodStatus) -> bool {
+    status.phase.as_deref().unwrap_or("Pending") == "Pending"
+}
+
 /// Node assigned = the boundary [`PENDING_TIMEOUT`] clocks. Never revoked once `True`
 pub fn is_scheduled(status: &PodStatus) -> bool {
     status

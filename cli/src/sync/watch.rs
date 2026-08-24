@@ -28,7 +28,7 @@ use ztest_ui::{
     render_sync_watch_panel, render_sync_work,
 };
 
-use super::{DRIVER_CONTAINER, driver_profile, report_verdict, row_of};
+use super::{DRIVER_CONTAINER, driver_profile, report_verdict};
 
 /// Driver-pod address: run-namespace API handle + pod name.
 ///
@@ -452,7 +452,7 @@ fn container_state(pod: &Pod, container: &str) -> Option<ContainerState> {
 /// Phase + the container's waiting reason (bare `Pending` cannot separate
 /// scheduling from `ImagePullBackOff`)
 fn driver_phase(pod: &Pod) -> String {
-    let phase = row_of(pod).pod_phase.unwrap_or_else(|| "Unknown".into());
+    let phase = super::pod_phase(pod).unwrap_or_else(|| "Unknown".into());
     let reason = pod
         .status
         .as_ref()

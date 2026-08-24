@@ -366,7 +366,7 @@ fn pod_is_ready(p: &Pod) -> bool {
 }
 
 fn epoch_millis(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    crate::sync::epoch_millis(t) as i64
 }
 
 /// Retire `tenants`; Pyroscope's cleaner deletes within [`PROFILE_RETIREMENT_LAG`].
@@ -445,11 +445,13 @@ pub async fn is_deployed(client: &Client) -> bool {
     api.get_opt(crate::naming::PYROSCOPE_SERVICE).await.ok().flatten().is_some()
 }
 
-/// Tenant a sync's profiles were pushed under.
+/// Tenant a sync's profiles were pushed under, recovered from the run namespace.
 ///
+/// - Legacy path: a sync launched today records its tenant in [`SyncLaunch`], which outlives
+///   this namespace ([`crate::sync::read_launch`] is what readers try first)
 /// - Owner from the namespace label, not [`current_user`](crate::naming) (a named target
 ///   may be another dev's)
-/// - `None` = namespace gone → tenant unrecoverable, profiles left to the default clock
+/// - `None` = namespace gone → tenant unrecoverable for those older runs
 pub async fn tenant_for_sync(client: &Client, sync_id: &str) -> Option<String> {
     use k8s_openapi::api::core::v1::Namespace;
 

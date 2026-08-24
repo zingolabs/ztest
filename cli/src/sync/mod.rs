@@ -1,8 +1,9 @@
 //! `ztest sync` — stateless controller for detached, ztest-owned chain syncs.
 //!
 //! - Sync outlives its terminal (state in k8s, no local daemon)
-//! - Per-sync namespace `ztest-sync-<id>`: driver pod (`ztest.io/{kind=sync,sync-id,user}`)
-//!   + the `zebrad`/`zaino` pods its in-pod `TestEnv` provisions
+//! - Driver pod (`ztest.io/{kind=sync,sync-id,user}`) in the shared run namespace; the
+//!   `zebrad`/`zaino` pods its in-pod `TestEnv` provisions in `ztest-sync-<id>`, which is
+//!   deleted at run end (durable record lives in `ztest-obs`, see [`ztest::sync::SyncLaunch`])
 //! - Any kubeconfig holder can `list`/`watch`/`stop` (syncs found by `kind=sync` label)
 //! - `watch` = read-only tail; only `stop` ends a sync (`sync_mode = Shutdown` → checkpoint)
 //! - `start` reuses `ztest run`'s on-cluster compile — same `#[ztest::sync_test]` body,
@@ -483,7 +484,12 @@ async fn launch_driver(
     collector: Option<&ztest::api::profiling::Collector>,
     no_cleanup: bool,
 ) -> Result<()> {
-    ensure_sync_namespace(client, ns, sync_id).await?;
+    let namespace = ensure_sync_namespace(client, ns, sync_id, &target.profile, no_cleanup).await?;
+    let ns_uid = namespace
+        .metadata
+        .uid
+        .clone()
+        .with_context(|| format!("sync namespace {ns} has no uid to own the driver"))?;
     // Config before the pod that mounts it (a missing ConfigMap holds the driver in
     // `ContainerCreating`, not just the sidecar)
     if let Some(c) = collector.filter(|c| c.placement == Placement::Sidecar) {
@@ -494,12 +500,13 @@ async fn launch_driver(
             .context("create profiler config")?;
     }
     let pod = build_driver_pod(
-        sync_id, profile, ns, sa, compiled, target, image_refs, collector, no_cleanup,
+        sync_id, profile, ns, &ns_uid, sa, compiled, target, image_refs, collector, no_cleanup,
     );
     let created = Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
         .create(&PostParams::default(), &pod)
         .await
         .context("create driver pod")?;
+    record_launch(client, sync_id, &created, collector).await?;
     match collector {
         Some(c) if c.placement == Placement::Sidecar => {
             adopt_profiler_config(client, &created, &c.config_map).await;
@@ -559,6 +566,39 @@ async fn abandon_launch(client: &Client, sync_id: &str, ns: &str) {
     let _ = configs.delete(&profiler_config_name(sync_id), &Default::default()).await;
     let namespaces: Api<Namespace> = Api::all(client.clone());
     let _ = namespaces.delete(ns, &Default::default()).await;
+    // Launch record outlives the namespace by design, so it needs deleting by name
+    let reports: Api<ConfigMap> = Api::namespaced(client.clone(), report_cm_namespace());
+    let _ = reports.delete(&ztest::sync::report_cm_name(sync_id), &Default::default()).await;
+}
+
+/// Stamp what only the controller knows, so no reader of a finished run needs a live object.
+///
+/// - Origin = pod creation, the clock `perf`/`status` already window against
+/// - Fatal: an unrecorded launch is profiles that become unreadable at teardown, and the
+///   caller's `abandon_launch` still has a pod to remove
+async fn record_launch(
+    client: &Client,
+    sync_id: &str,
+    driver: &Pod,
+    collector: Option<&ztest::api::profiling::Collector>,
+) -> Result<()> {
+    let created = driver
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| SystemTime::from(t.0))
+        .unwrap_or_else(SystemTime::now);
+    let launch = ztest::sync::SyncLaunch {
+        sync_id: sync_id.to_string(),
+        started_ms: ztest::sync::epoch_millis(created),
+        profiling: collector.map(|c| ztest::sync::LaunchProfiling {
+            tenant: c.tenant.clone(),
+            placement: c.placement,
+            hz: c.hz,
+            off_cpu: c.off_cpu,
+        }),
+    };
+    ztest::sync::write_launch(client, &launch).await.context("record sync launch")
 }
 
 /// Wait for driver `Running` = where it takes over renewing (see `TestEnv::build`)
@@ -929,16 +969,30 @@ fn new_sync_id(name: &str) -> String {
     format!("{}-{:08x}", ztest::api::naming::slug(name, 24), rand::random::<u32>())
 }
 
-/// Idempotently create the sync's persistent namespace — the topology the driver
-/// provisions, nothing else.
+/// Idempotently create the sync's persistent namespace — the deletion unit for everything
+/// this run creates in-cluster.
 ///
-/// - No `janitor/ttl` (a sync outlives the 1h test-namespace TTL; `ztest cleanup` reclaims)
+/// - TTL at creation, never at completion: a driver that is OOM-killed or evicted annotates
+///   nothing, and that is exactly the run that would leak
+/// - 2x the tier's hard cap → a live sync can never be reaped out from under itself;
+///   `--no-cleanup` doubles it again rather than removing the bound
+/// - Driver shortens it on a clean finish ([`mark_finished`](ztest::sync::mark_finished))
 /// - RBAC-free: the run role grants no `rbac` verbs and no `serviceaccounts` write, so a
 ///   run cannot mint itself authority ([`policy`](ztest::api::resource::policy)) — a
 ///   per-sync SA + RoleBinding is uncreatable by this credential, and would drop the
 ///   role's cluster-scoped rules anyway. Driver runs as the run identity; see
 ///   [`build_driver_pod`].
-async fn ensure_sync_namespace(client: &Client, ns: &str, sync_id: &str) -> Result<()> {
+async fn ensure_sync_namespace(
+    client: &Client,
+    ns: &str,
+    sync_id: &str,
+    profile: &ztest::qos::QosProfile,
+    no_cleanup: bool,
+) -> Result<Namespace> {
+    let ttl = match no_cleanup {
+        true => ztest::sync::held_ttl(profile),
+        false => ztest::sync::birth_ttl(profile),
+    };
     let namespace: Namespace = serde_json::from_value(json!({
         "apiVersion": "v1",
         "kind": "Namespace",
@@ -949,6 +1003,7 @@ async fn ensure_sync_namespace(client: &Client, ns: &str, sync_id: &str) -> Resu
                 SYNC_ID_KEY: sync_id,
                 ztest::qos::LABEL_USER: ztest::api::naming::current_user(),
             },
+            "annotations": { ztest::api::naming::TTL_ANNOTATION: ztest::api::naming::ttl_value(ttl) },
         },
     }))
     .expect("static Namespace manifest is valid");
@@ -956,7 +1011,6 @@ async fn ensure_sync_namespace(client: &Client, ns: &str, sync_id: &str) -> Resu
         .patch(ns, &PatchParams::apply("ztest-sync").force(), &Patch::Apply(&namespace))
         .await
         .with_context(|| format!("create sync namespace {ns}"))
-        .map(|_| ())
 }
 
 /// Detached driver pod: baked runner image running `<bin> --exact <test>`, as a
@@ -972,6 +1026,7 @@ fn build_driver_pod(
     sync_id: &str,
     profile: &str,
     ns: &str,
+    ns_uid: &str,
     sa: &str,
     compiled: &RemoteCompileOutcome,
     target: &Target,
@@ -1061,6 +1116,15 @@ fn build_driver_pod(
         "metadata": {
             "name": driver_pod_for(sync_id),
             "namespace": RUN_NAMESPACE,
+            // Cluster-scoped owner, so a namespaced dependent in *another* namespace is
+            // legal (cross-*namespace* refs are not): deleting the sync namespace GCs the
+            // driver with it, making that namespace the whole run's single deletion unit
+            "ownerReferences": [{
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "name": ns,
+                "uid": ns_uid,
+            }],
             "labels": {
                 KIND_LABEL_KEY: KIND_LABEL_VALUE,
                 SYNC_ID_KEY: sync_id,
@@ -1095,37 +1159,69 @@ fn build_driver_pod(
 pub(super) struct SyncRow {
     pub(super) id: String,
     pub(super) namespace: String,
-    pub(super) pod_phase: Option<String>,
     pub(super) user: String,
 }
 
-fn row_of(p: &Pod) -> SyncRow {
-    let label = |k: &str| {
-        p.metadata.labels.as_ref().and_then(|l| l.get(k)).cloned().unwrap_or_else(|| "-".into())
-    };
-    SyncRow {
-        id: label(SYNC_ID_KEY),
-        namespace: p.metadata.namespace.clone().unwrap_or_else(|| "-".into()),
-        pod_phase: p.status.as_ref().and_then(|s| s.phase.clone()),
-        user: label(ztest::qos::LABEL_USER),
-    }
+/// Kubelet's phase for a driver pod, the only thing a pod still answers for a sync
+pub(super) fn pod_phase(p: &Pod) -> Option<String> {
+    p.status.as_ref()?.phase.clone()
 }
 
-/// Every mirrored report, by sync id.
-///
-/// - `list` joins them as `status` does (driver in teardown outlives its own verdict)
-/// - Pod-only status would call a finished run unfinished
-async fn report_mirrors(client: &Client) -> HashMap<String, SyncReportMirror> {
-    let api: Api<ConfigMap> = Api::namespaced(client.clone(), report_cm_namespace());
-    let lp = ListParams::default().labels(&kind_selector());
-    let Ok(list) = api.list(&lp).await else {
-        return HashMap::new();
+/// One row per sync id across both halves. Owner from whichever half carries the label —
+/// a record written before owners were stamped on records still lists under its driver pod
+fn merge_rows(records: &[ConfigMap], pods: &HashMap<String, Pod>) -> Vec<SyncRow> {
+    let owner_of = |m: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta| {
+        m.labels.as_ref().and_then(|l| l.get(ztest::qos::LABEL_USER)).cloned()
     };
-    list.items
+    let mut owners: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for cm in records {
+        let Some(id) = cm.metadata.labels.as_ref().and_then(|l| l.get(SYNC_ID_KEY)) else {
+            continue;
+        };
+        let slot = owners.entry(id.clone()).or_default();
+        *slot = slot.take().or_else(|| owner_of(&cm.metadata));
+    }
+    for (id, pod) in pods {
+        let slot = owners.entry(id.clone()).or_default();
+        *slot = slot.take().or_else(|| owner_of(&pod.metadata));
+    }
+    owners
         .into_iter()
+        .map(|(id, owner)| SyncRow {
+            // Topology's namespace, not the driver's: the one a reader would `kubectl` into,
+            // and the key `status` windows its metrics by
+            namespace: namespace_for(&id),
+            user: owner.unwrap_or_else(|| "-".into()),
+            id,
+        })
+        .collect()
+}
+
+/// Driver pods by sync id. Hard error, never an empty map — an unreadable list would
+/// render every running sync `Unresolved`, which reads as "no verdict coming"
+async fn driver_pods(client: &Client) -> Result<HashMap<String, Pod>> {
+    let api: Api<Pod> = Api::all(client.clone());
+    let list = api
+        .list(&ListParams::default().labels(&kind_selector()))
+        .await
+        .context("list sync driver pods")?;
+    Ok(list
+        .items
+        .into_iter()
+        .filter_map(|p| {
+            let id = p.metadata.labels.as_ref()?.get(SYNC_ID_KEY)?.clone();
+            Some((id, p))
+        })
+        .collect())
+}
+
+/// Verdicts out of records already fetched — `list` reads that collection once
+fn mirrors_of(records: &[ConfigMap]) -> HashMap<String, SyncReportMirror> {
+    records
+        .iter()
         .filter_map(|cm| {
-            let body = cm.data?.remove(ztest::sync::REPORT_KEY)?;
-            let report: SyncReportMirror = serde_json::from_str(&body).ok()?;
+            let body = cm.data.as_ref()?.get(ztest::sync::REPORT_KEY)?;
+            let report: SyncReportMirror = serde_json::from_str(body).ok()?;
             Some((report.sync_id.clone(), report))
         })
         .collect()
@@ -1136,17 +1232,24 @@ async fn list(all_users: bool, json_out: bool) -> Result<()> {
     // Host-placed collectors outlive nothing but their driver, and no process is resident to
     // notice it ended — so every command that already reads sync liveness sweeps them
     ztest::api::profiling::reap_finished(&client).await;
-    let api: Api<Pod> = Api::all(client.clone());
-    let lp = ListParams::default().labels(&kind_selector());
-    let items = api.list(&lp).await.context("list sync pods")?.items;
-    let mirrors = report_mirrors(&client).await;
+    // Union, keyed by sync id: the record outlives the pod (reaped with its namespace), and
+    // the pod pre-dates the record (a sync launched before records existed, or still running
+    // under an older ztest). Either half alone drops syncs from the listing
+    let records: Api<ConfigMap> = Api::namespaced(client.clone(), report_cm_namespace());
+    let items = records
+        .list(&ListParams::default().labels(&kind_selector()))
+        .await
+        .context("list sync records")?
+        .items;
+    let pods = driver_pods(&client).await?;
+    let mirrors = mirrors_of(&items);
     let me = ztest::api::naming::current_user();
-    let rows: Vec<(SyncRow, SyncStatus)> = items
-        .iter()
-        .map(row_of)
+    let rows: Vec<(SyncRow, SyncStatus)> = merge_rows(&items, &pods)
+        .into_iter()
         .filter(|r| all_users || r.user == me)
         .map(|r| {
-            let status = SyncStatus::observe(r.pod_phase.as_deref(), mirrors.get(&r.id));
+            let phase = pods.get(&r.id).and_then(pod_phase);
+            let status = SyncStatus::observe(phase.as_deref(), mirrors.get(&r.id));
             (r, status)
         })
         .collect();
@@ -1215,7 +1318,7 @@ async fn status(id: &str, json_out: bool) -> Result<()> {
     }
 
     let pod = find_driver(&client, id).await?;
-    let status = SyncStatus::observe(row_of(&pod).pod_phase.as_deref(), None);
+    let status = SyncStatus::observe(pod_phase(&pod).as_deref(), None);
     // No report yet, but a running engine publishes state to the driver log → recover the
     // newest tick rather than reporting the pod phase alone
     let live = watch::latest_progress(&watch::DriverPod::new(&client, id)).await;
@@ -1666,5 +1769,59 @@ mod tests {
         );
         let cmd = Fields::new().text("verb", "stop").text("id", "sync-aaa");
         assert_eq!(draw(row::HANDOFF_CMD, &cmd, &theme), "  · ztest sync stop   sync-aaa");
+    }
+
+    fn labelled_cm(id: &str, user: Option<&str>) -> ConfigMap {
+        let mut labels = BTreeMap::from([(SYNC_ID_KEY.to_string(), id.to_string())]);
+        if let Some(u) = user {
+            labels.insert(ztest::qos::LABEL_USER.to_string(), u.to_string());
+        }
+        ConfigMap {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                labels: Some(labels),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn labelled_pod(id: &str, user: &str) -> Pod {
+        serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": driver_pod_for(id), "labels": {
+                SYNC_ID_KEY: id,
+                ztest::qos::LABEL_USER: user,
+            }},
+        }))
+        .expect("static Pod manifest is valid")
+    }
+
+    /// Record outlives the pod, pod pre-dates the record — listing either alone loses syncs
+    #[test]
+    fn a_listing_unions_records_and_driver_pods() {
+        let records = vec![labelled_cm("reaped-pod", Some("elicb"))];
+        let pods = HashMap::from([("no-record".to_string(), labelled_pod("no-record", "elicb"))]);
+        let rows = merge_rows(&records, &pods);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["no-record", "reaped-pod"]);
+        assert!(rows.iter().all(|r| r.user == "elicb"), "owner from whichever half has it");
+    }
+
+    /// Records written before owners were stamped on them must still list for their owner
+    #[test]
+    fn an_unlabelled_record_takes_its_owner_from_the_driver_pod() {
+        let records = vec![labelled_cm("legacy", None)];
+        let pods = HashMap::from([("legacy".to_string(), labelled_pod("legacy", "elicb"))]);
+        assert_eq!(merge_rows(&records, &pods)[0].user, "elicb");
+    }
+
+    /// Neither half labelled → listed, never silently dropped from its owner's view
+    #[test]
+    fn an_ownerless_sync_still_lists() {
+        let rows = merge_rows(&[labelled_cm("orphan", None)], &HashMap::new());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user, "-");
+        assert_eq!(rows[0].namespace, namespace_for("orphan"));
     }
 }

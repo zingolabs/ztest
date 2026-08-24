@@ -259,6 +259,14 @@ async fn drive(
         super::detached::write_report(&kube, &report).await;
         tracing::info!(sync_id = %sync_id, "detached sync: report mirrored");
     }
+    // Strict order: verdict durable → teardown → namespace offered to the reaper. Client
+    // cloned out first because `Drop` is what tears down (seed bindings), and a reaper
+    // acting on a shortened TTL would otherwise be free to delete this pod mid-teardown
+    let kube = env.kube_client();
+    drop(env);
+    if let (Some(sync_id), Some(kube)) = (&detached, kube) {
+        super::detached::mark_finished(&kube, sync_id).await;
+    }
     outcome
 }
 

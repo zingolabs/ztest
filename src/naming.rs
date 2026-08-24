@@ -174,6 +174,22 @@ pub fn profile_tenant(user: &str, sync_id: &str) -> String {
     tenant.chars().take(TENANT_MAX).collect()
 }
 
+/// TTL annotation, read relative to `creationTimestamp` (kube-janitor's grammar).
+///
+/// - Advisory here: no janitor ships with ztest, `ztest cleanup` is the reaper
+/// - Written anyway — states the intended window, and a cluster running a janitor honours it
+pub const TTL_ANNOTATION: &str = "janitor/ttl";
+
+/// [`TTL_ANNOTATION`] value. Whole hours where they divide, else minutes (floor 1m — a
+/// zero would read as "no TTL", not "expire now")
+pub fn ttl_value(ttl: std::time::Duration) -> String {
+    let secs = ttl.as_secs();
+    match secs % 3600 {
+        0 if secs > 0 => format!("{}h", secs / 3600),
+        _ => format!("{}m", (secs / 60).max(1)),
+    }
+}
+
 /// Namespace for the whole observability stack: fixed, cluster-lifetime, owned by
 /// `ztest cluster setup`. Never per-run (the record must outlive the run that produced it)
 pub const OBS_NAMESPACE: &str = "ztest-obs";

@@ -1011,25 +1011,30 @@ impl Drop for TestEnv {
     /// that leak filled the cluster's pod cap and timed out every later test.
     ///
     /// - Pod path (`ZTEST_TEST_NAMESPACE`) = no-op: parent owns logs + teardown over kube
-    /// - Detached-sync driver excepted: no parent outlives it, so it owns its own namespace
-    ///   (its verdict is already mirrored to `OBS_NAMESPACE`, outside what this deletes)
+    /// - Detached-sync driver: seed bindings only. Namespace = the deletion unit it lives
+    ///   inside, reaped on its TTL ([`mark_finished`](crate::sync::mark_finished))
     /// - Delete runs on its own OS thread + runtime, `join`ed (`Drop` can't await, and a
     ///   spawned task dies with the test runtime before its DELETE is sent), with a client
     ///   rebuilt inside it (the original is bound to the dying reactor)
     /// - `ZTEST_NO_CLEANUP` suppresses the delete; the 1h `janitor/ttl` still reaps it
     fn drop(&mut self) {
-        // Deleting here would race the parent's still-draining collector — except under a
-        // detached sync, where the `ztest sync start` process is long gone
-        let parented = std::env::var(naming::TEST_NAMESPACE_ENV).is_ok_and(|v| !v.is_empty())
-            && crate::sync::active_sync_id().is_none();
-        if parented {
+        // Deleting here would race the parent's still-draining collector
+        let parented = std::env::var(naming::TEST_NAMESPACE_ENV).is_ok_and(|v| !v.is_empty());
+        // Detached driver keeps its bindings (cluster-scoped, nothing cascades them) but
+        // owns no namespace: it sits *inside* the deletion unit, and `mark_finished` hands
+        // that to the reaper instead
+        let detached = crate::sync::active_sync_id().is_some();
+        if parented && !detached {
             return;
         }
 
         // Colour is the reporter's call, propagated by the engine as `ZTEST_COLOR`
         let color = std::env::var("ZTEST_COLOR").ok().as_deref() == Some("1");
 
-        let ns = self.inner.namespace.lock().ok().and_then(|mut g| g.take());
+        let ns = match detached {
+            true => None,
+            false => self.inner.namespace.lock().ok().and_then(|mut g| g.take()),
+        };
         let bindings: Vec<_> = self
             .inner
             .seed_bindings

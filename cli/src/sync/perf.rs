@@ -99,23 +99,52 @@ pub(crate) async fn perf(request: Request) -> Result<()> {
 /// Requested window → absolute times.
 ///
 /// - Bounds = elapsed since start ("hour eleven", how a forty-hour run is read)
-/// - Origin = driver pod creation, so this answers mid-run too; no window = whole run
+/// - Origin = launch record, so this answers mid-run, finished and reaped alike
+/// - No window = launch → engine finish, else `now` (still running)
 async fn span_for(
     id: &str,
     requested: Option<(std::time::Duration, std::time::Duration)>,
 ) -> Result<(SystemTime, SystemTime)> {
     let client = ztest::api::cluster::client().await.context("kube client")?;
-    let driver = ztest::sync::find_driver(&client, id).await?;
-    let started: SystemTime = driver
-        .metadata
-        .creation_timestamp
-        .with_context(|| format!("sync {id}: driver pod has no creation timestamp"))?
-        .0
-        .into();
+    let started = run_origin(&client, id).await?;
+    let ended = match ztest::sync::read_report(&client, id).await.ok().flatten() {
+        Some(report) => report.ended().unwrap_or_else(SystemTime::now),
+        None => SystemTime::now(),
+    };
     Ok(match requested {
         Some((from, to)) => (started + from, started + to),
-        None => (started, SystemTime::now()),
+        None => (started, ended),
     })
+}
+
+/// Run origin, durable first. Driver pod = fallback for a sync started before launch
+/// records existed (its window dies with the pod, as it always did)
+async fn run_origin(client: &kube::Client, id: &str) -> Result<SystemTime> {
+    if let Some(launch) = ztest::sync::read_launch(client, id).await? {
+        return Ok(launch.started());
+    }
+    let driver = ztest::sync::find_driver(client, id).await?;
+    let created = driver
+        .metadata
+        .creation_timestamp
+        .with_context(|| format!("sync {id}: no launch record, and its pod has no timestamp"))?;
+    Ok(created.0.into())
+}
+
+/// Pyroscope tenant a sync's profiles were pushed under.
+///
+/// - Launch record = the writer's own value, recorded where it was computed
+/// - Namespace label = legacy fallback, dead once the run namespace is reclaimed
+/// - Refusal names which of the two applies, so the reader knows whether to re-run
+async fn tenant_for(client: &kube::Client, id: &str) -> Result<String> {
+    match ztest::sync::read_launch(client, id).await? {
+        Some(launch) => launch.profiling.map(|p| p.tenant).with_context(|| {
+            format!("sync {id} ran unprofiled; start it with `--profile` to collect one")
+        }),
+        None => ztest::api::profiling::tenant_for_sync(client, id).await.with_context(|| {
+            format!("sync {id}: no launch record, and its namespace is gone — tenant unrecoverable")
+        }),
+    }
 }
 
 /// Query one component's merged profile over `window`, write to `out`
@@ -129,9 +158,7 @@ async fn retrieve(
     let theme = Theme::detect();
     let client = ztest::api::cluster::client().await.context("kube client")?;
     let selector = ztest::api::profiling::selector(component, &namespace_for(id));
-    let tenant = ztest::api::profiling::tenant_for_sync(&client, id)
-        .await
-        .with_context(|| format!("sync {id}: gone"))?;
+    let tenant = tenant_for(&client, id).await?;
     let bytes = match ztest::api::profiling::fetch(
         &client, &selector, window.0, window.1, &tenant, profile,
     )

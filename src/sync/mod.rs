@@ -24,11 +24,13 @@ pub use event::{SyncEvent, decode as decode_event};
 #[cfg(any(test, feature = "test-util"))]
 pub use event::{Tick as SyncTick, encode as encode_event};
 
+pub use detached::{FINISHED_TTL, LAUNCH_FIELD_MANAGER, REPORT_FIELD_MANAGER, birth_ttl, held_ttl};
 pub use detached::{
-    KIND_LABEL_KEY, KIND_LABEL_VALUE, POD_NAME_ENV, POD_NAMESPACE_ENV, REPORT_KEY, ReportViolation,
-    STOP_ANNOTATION, SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV, SyncReportMirror, SyncStatus,
-    active_sync_id, driver_is_live, driver_pod_for, find_driver, kind_selector, namespace_for,
-    profiler_config_name, read_report, report_cm_name, report_cm_namespace,
+    KIND_LABEL_KEY, KIND_LABEL_VALUE, LAUNCH_KEY, LaunchProfiling, POD_NAME_ENV, POD_NAMESPACE_ENV,
+    REPORT_KEY, ReportViolation, STOP_ANNOTATION, SYNC_ID_ENV, SYNC_ID_KEY, SYNC_PROFILE_ENV,
+    SyncLaunch, SyncReportMirror, SyncStatus, active_sync_id, driver_is_live, driver_pod_for,
+    epoch_millis, find_driver, kind_selector, mark_finished, namespace_for, profiler_config_name,
+    read_launch, read_report, report_cm_name, report_cm_namespace, write_launch,
 };
 
 pub use chainwork::{ChainWork, Support};

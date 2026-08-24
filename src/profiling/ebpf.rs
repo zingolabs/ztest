@@ -44,7 +44,8 @@ pub const ALLOY_IMAGE: &str = "grafana/alloy:v1.18.1";
 /// - `Sidecar`: `hostPID` on the driver = the node's namespace = the initial one
 /// - `Host`: a nested kubelet (kind's node is a container) puts every pod one level below the
 ///   initial namespace, where no privilege can name those pids → collector runs beside dockerd
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Placement {
     Sidecar,
     Host,
