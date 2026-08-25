@@ -11,7 +11,7 @@
 pub mod pack;
 pub mod seekable;
 
-/// Namespace for every managed object. Recorded per manifest by `ztest snapshot manifest`,
+/// Namespace for every managed object. Recorded per manifest by `ztest snapshot push`,
 /// so a reader cannot disagree with the push that made the blob. Frozen legacy name from
 /// the retired Git LFS store — renaming it re-uploads every blob and buys nothing
 pub const KEY_PREFIX: &str = "lfs";
@@ -19,7 +19,7 @@ pub const KEY_PREFIX: &str = "lfs";
 /// Public read base. Unauthenticated `GET`, by contract: `cargo install ztest_cli` →
 /// `ztest run` pulls fixtures with no credentials anywhere.
 ///
-/// Written into each manifest at `snapshot manifest` time, never read from here at seed
+/// Written into each manifest at `snapshot push` time, never read from here at seed
 /// time — a blob published under one base is never addressed under another, which is what
 /// makes moving the read path a per-artifact edit rather than a release
 pub const BASE_URI: &str = "https://ztest-seeds.elicbarbieri.workers.dev";

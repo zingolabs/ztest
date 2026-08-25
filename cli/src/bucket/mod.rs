@@ -51,6 +51,15 @@ fn part_size(total: u64) -> usize {
     scaled.max(MIN_PART_SIZE) as usize
 }
 
+/// HTTP deadlines for a push. `object_store`'s defaults (30 s/request, 180 s retry budget)
+/// are sized for object-sized requests, and nothing here is object-sized: a part is tens of
+/// MiB and sealing a 9,000-part object keeps R2 busy for minutes.
+///
+/// TODO(you): pick the policy — see the trade-off in the conversation
+fn push_client_options() -> object_store::ClientOptions {
+    object_store::ClientOptions::new()
+}
+
 #[derive(Debug)]
 pub struct Bucket {
     store: AmazonS3,
@@ -68,6 +77,7 @@ impl Bucket {
             return Err(BucketError::Unconfigured { path: path.display().to_string() });
         };
         let store = AmazonS3Builder::new()
+            .with_client_options(push_client_options())
             .with_bucket_name(c.bucket)
             .with_endpoint(c.endpoint)
             .with_access_key_id(c.access_key_id)
@@ -139,12 +149,13 @@ impl Bucket {
     ///   attempts is a different oid, never a half-old object
     /// - Second pass only for an upload R2 has since forgotten; every other failure is
     ///   the caller's to see
+    /// - `on_progress` = bytes landed *this pass*, absolute (a restart rewinds it to 0)
     pub async fn put(
         &self,
         oid: &str,
         total: u64,
         src: &std::path::Path,
-        on_progress: &mut dyn FnMut(usize),
+        on_progress: &mut dyn FnMut(u64),
     ) -> Result<(), BucketError> {
         let plan = UploadPlan::for_object(total);
         if plan.count == 0 {
@@ -168,14 +179,14 @@ impl Bucket {
     ///
     /// - Ledger written by this driver as each part lands, never by the workers (one
     ///   writer = no interleaved lines, and the ledger is all a resume trusts)
-    /// - `has` after `complete` because a resumed part list is assembled from two
-    ///   processes; a wrong-length object here beats one discovered by a test run
+    /// - `has` is the sole arbiter of the outcome: a completion's own 404 cannot be told
+    ///   from an expired upload's, and a resumed part list is assembled from two processes
     async fn put_resuming(
         &self,
         oid: &str,
         plan: &UploadPlan,
         src: &std::path::Path,
-        on_progress: &mut dyn FnMut(usize),
+        on_progress: &mut dyn FnMut(u64),
     ) -> Result<(), BucketError> {
         let key = Self::key(oid);
         let mut ledger = ResumeLedger::open(oid, plan);
@@ -192,10 +203,12 @@ impl Bucket {
             }
         };
 
+        let mut sent = 0u64;
         let mut pending = Vec::new();
         for idx in 0..plan.count {
             if ledger.holds(idx) {
-                on_progress(plan.part_len(idx));
+                sent += plan.part_len(idx) as u64;
+                on_progress(sent);
             } else {
                 pending.push(idx);
             }
@@ -206,17 +219,25 @@ impl Bucket {
         while let Some(landed) = landing.next().await {
             let (idx, id) = landed?;
             ledger.landed(idx, &id)?;
-            on_progress(plan.part_len(idx));
+            sent += plan.part_len(idx) as u64;
+            on_progress(sent);
         }
 
-        self.store
-            .complete_multipart(&key, &upload_id, ledger.parts()?)
-            .await
-            .map_err(|e| upload_error(&upload_id, format!("complete multipart {key}"), e))?;
-        ledger.forget()?;
-        match self.has(oid, plan.total).await? {
-            true => Ok(()),
-            false => Err(BucketError::Bucket(format!("{key} completed at the wrong length"))),
+        let completed = self.store.complete_multipart(&key, &upload_id, ledger.parts()?).await;
+        // Completion is NOT idempotent, yet object_store replays it: the retry asks about an
+        // upload id the winning attempt consumed and gets the same 404 an expired one gives.
+        // Only the object separates the two, so it decides both cases
+        match (completed, self.has(oid, plan.total).await?) {
+            (_, true) => {
+                ledger.forget()?;
+                Ok(())
+            }
+            (Err(e), false) => {
+                Err(upload_error(&upload_id, format!("complete multipart {key}"), e))
+            }
+            (Ok(_), false) => {
+                Err(BucketError::Bucket(format!("{key} completed at the wrong length")))
+            }
         }
     }
 
@@ -389,10 +410,10 @@ mod live {
         let (idx, id) = bucket.put_part(&key, &upload_id, &path, &plan, 0).await.expect("part 0");
         ledger.landed(idx, &id).expect("record");
 
-        let mut sent = 0usize;
-        bucket.put(&oid, bytes.len() as u64, &path, &mut |n| sent += n).await.expect("resume");
+        let mut sent = 0u64;
+        bucket.put(&oid, bytes.len() as u64, &path, &mut |n| sent = n).await.expect("resume");
 
-        assert_eq!(sent, bytes.len(), "progress did not account for the resumed part");
+        assert_eq!(sent, bytes.len() as u64, "progress did not account for the resumed part");
         assert_eq!(ResumeLedger::open(&oid, &plan).upload_id(), None, "ledger outlived the push");
         let landed = bucket.store.get(&key).await.expect("get").bytes().await.expect("body");
         assert_eq!(landed.as_ref(), bytes.as_slice(), "resumed object is not the source bytes");
@@ -415,7 +436,7 @@ mod live {
         ledger.begin("an-upload-id-r2-never-issued").expect("ledger");
         ledger.landed(0, &PartId { content_id: "\"deadbeef\"".into() }).expect("record");
 
-        let mut sent = 0usize;
+        let mut sent = 0u64;
         bucket.put(&oid, bytes.len() as u64, &path, &mut |n| sent += n).await.expect("restart");
 
         let key = Bucket::key(&oid);

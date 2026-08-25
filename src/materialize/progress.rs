@@ -79,7 +79,7 @@ impl fmt::Display for Stall {
             }
             Stall::NoProgress { transferred, total } => write!(
                 f,
-                "puller stalled at {}/{} after {mins}m without a byte — check node disk and network",
+                "puller stalled at {}/{} after {mins}m without a byte — check node disk/network",
                 human(*transferred),
                 human(*total)
             ),
@@ -226,8 +226,8 @@ pub async fn watch_puller(
             tokio::time::sleep(PRE_RUN_POLL).await;
             continue;
         };
-        // A second pod resumes off the marker (segmented) or restarts at byte 0 (not), and
-        // only the second walks the count backwards out from under every window here
+        // Second pod resumes off the marker (segmented) or restarts at byte 0 (not) — only the
+        // second walks the count backwards out from under every window here
         if attempt.as_ref().is_some_and(|a| a.name != name) {
             if !resumable {
                 let transferred = clock.as_ref().map_or(0, |c| c.transferred);
@@ -279,7 +279,7 @@ pub async fn watch_puller(
             // Dropped mid-pull (apiserver hiccup / pod gone) — not the parent's to
             // adjudicate. The clock rides through, so a re-attach cannot launder a stall
             Err(e) => {
-                tracing::debug!(job = %job_name, error = %e, "puller log follow dropped; re-attaching");
+                tracing::debug!(job = %job_name, error = %e, "puller log dropped; re-attaching");
                 progress.note("re-attaching to puller");
                 attempt = Some(Attempt { name, ended: false, resuming: true });
                 tokio::time::sleep(REATTACH_DELAY).await;

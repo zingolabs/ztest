@@ -1,8 +1,9 @@
 //! `ztest snapshot`: publishing chain archives, and the seed cache in `ztest-seeds`.
 //!
 //! - `push` packs an archive into resumable segments, uploads it under the packed blob's
-//!   sha256 and prints the record; `manifest` is the same minus the upload; `verify`
-//!   asserts every declared snapshot resolves. All three are cluster-free
+//!   sha256, and prints the record the tree commits — one command, because the record
+//!   describes the *packed* object and nothing can describe it without packing it
+//! - `verify` asserts every declared snapshot resolves. Both are cluster-free
 //! - Seed = `seed-<sha8>-<driver>` PVC filled once from the bucket + paired
 //!   `VolumeSnapshot`; tests clone it copy-on-write (`materialize.rs` / `seeds.rs`)
 //! - Keyed on content *and* driver → `list` reports `DRIVER this|other` and seeds
@@ -116,10 +117,6 @@ enum SnapshotCmd {
     /// running a test.
     Warm(WarmArgs),
 
-    /// Pack an archive and print the manifest it would publish under, without
-    /// uploading. Local only — no cluster, no bucket, no network.
-    Manifest(ManifestArgs),
-
     /// Pack an archive into resumable segments, upload it under the packed
     /// blob's content address, and print its manifest to stdout. Idempotent:
     /// packing is deterministic, so re-pushing lands on the same key.
@@ -173,13 +170,6 @@ struct ConfigSetArgs {
 }
 
 #[derive(Debug, Parser)]
-struct ManifestArgs {
-    /// Archive to describe. Packed to a temporary file so the record matches
-    /// what `push` would publish, then the temporary is removed.
-    archive: PathBuf,
-}
-
-#[derive(Debug, Parser)]
 struct PushArgs {
     /// Archive to publish. Re-packed into resumable segments first, so the
     /// object's SHA-256 is the packed blob's, not this file's.
@@ -221,7 +211,6 @@ pub fn execute(args: Args) -> ExitCode {
         // bucket. None needs a cluster: connecting first would make publishing a fixture
         // require one to be up
         match args.cmd {
-            SnapshotCmd::Manifest(m) => return manifest(&m),
             SnapshotCmd::Push(p) => return push(&p).await,
             SnapshotCmd::Verify => return verify().await,
             SnapshotCmd::Config(c) => return config(c).await,
@@ -232,10 +221,9 @@ pub fn execute(args: Args) -> ExitCode {
             SnapshotCmd::List => list(&client).await,
             SnapshotCmd::Prune(p) => prune(&client, &p).await,
             SnapshotCmd::Warm(w) => warm(&client, &w).await,
-            SnapshotCmd::Manifest(_)
-            | SnapshotCmd::Push(_)
-            | SnapshotCmd::Verify
-            | SnapshotCmd::Config(_) => unreachable!("handled above"),
+            SnapshotCmd::Push(_) | SnapshotCmd::Verify | SnapshotCmd::Config(_) => {
+                unreachable!("handled above")
+            }
         }
     })
 }
@@ -245,25 +233,6 @@ pub fn execute(args: Args) -> ExitCode {
 /// stdout carries the TOML alone, so it redirects straight into the tree; where it belongs
 /// goes to stderr, because a hand-picked filename disagreeing with the content is exactly
 /// what the declaration exists to prevent
-fn manifest(args: &ManifestArgs) -> Result<()> {
-    let theme = Theme::detect();
-    let label = file_name(&args.archive)?;
-    let step = LiveStep::new(label.clone(), TransferKind::Upload);
-    let packed = pack_to_temp(&args.archive, None, ztest::api::storage::pack::DEFAULT_LEVEL, &step);
-    step.finish();
-    let packed = packed?;
-    print!("{}", manifest_toml(&label, &packed.blob));
-    say_err(
-        tmpl::NOTE,
-        Fields::new().text(
-            "note",
-            "describe-only — `ztest snapshot push` packs, uploads and prints the same record",
-        ),
-        &theme,
-    );
-    Ok(())
-}
-
 fn file_name(archive: &std::path::Path) -> Result<String> {
     archive
         .file_name()
@@ -367,14 +336,8 @@ async fn push_reporting(args: &PushArgs, step: &LiveStep, theme: &Theme) -> Resu
     let bucket = crate::bucket::Bucket::resolve()?;
     // Packing is deterministic, so re-publishing an archive lands on the key already there
     if !bucket.has(&oid, total).await? {
-        let mut sent = 0u64;
         step.note("uploading");
-        bucket
-            .put(&oid, total, &packed.path, &mut |n| {
-                sent += n as u64;
-                step.bytes(sent, total);
-            })
-            .await?;
+        bucket.put(&oid, total, &packed.path, &mut |sent| step.bytes(sent, total)).await?;
         step.finish();
         result("pushed");
     } else {

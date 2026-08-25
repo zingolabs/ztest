@@ -967,7 +967,7 @@ fn bake_archive(source_abs: &std::path::Path, span: Span) -> Result<BakedArchive
                  every archive needs one: it carries the `sha256`/`size_bytes` addressing \
                  the bytes in the snapshot bucket, and it is the only part of the artifact \
                  present in a build pod or a checkout (the archive itself is gitignored). \
-                 Produce it with `ztest snapshot manifest <archive>`, or hand-write one \
+                 Produce it with `ztest snapshot push <archive>`, or hand-write one \
                  with just those two fields for a non-chain archive.",
                 source_abs.display(),
                 manifest_abs.display()

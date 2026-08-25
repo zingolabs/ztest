@@ -91,7 +91,7 @@ Two preconditions no read-only, workstation-side probe reaches. Both are cluster
 
 | Gap                          | Fails as                                           |
 | ---------------------------- | -------------------------------------------------- |
-| cluster → snapshot bucket    | seed puller Job exhausts `backoffLimit: 2` mid-run |
+| cluster → snapshot bucket    | seed puller exhausts its per-range retries, Job fails |
 | BuildKit pod → registry push | `buildctl` push error at the end of the compile    |
 
 `check` probes the bucket from *your* machine, which catches a wrong endpoint or a withdrawn blob but not

@@ -27,7 +27,7 @@ const ENTRY_LEN: usize = 8;
 /// so one fetch always covers it
 pub const TAIL_PROBE_BYTES: u64 = 128 * 1024;
 
-/// One data frame: a whole number of `tar` members, independently fetchable and extractable
+/// Data frame = a whole number of `tar` members, independently fetchable and extractable
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment {
     pub offset: u64,
@@ -45,19 +45,9 @@ impl Segment {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SeekTableError {
     NoFooter,
-    Truncated {
-        need: usize,
-        have: usize,
-    },
-    /// A frame wider than the format's `u32` — [`super::pack`] cannot have written it
-    FrameTooLarge {
-        index: usize,
-    },
-    /// Frame sizes do not add up to the blob: table is for different bytes
-    SizeMismatch {
-        table: u64,
-        blob: u64,
-    },
+    Truncated { need: usize, have: usize },
+    FrameTooLarge { index: usize },
+    SizeMismatch { table: u64, blob: u64 },
 }
 
 impl fmt::Display for SeekTableError {
@@ -135,8 +125,8 @@ pub fn parse(tail: &[u8], blob_len: u64) -> Result<Vec<Segment>, SeekTableError>
         segments.push(Segment { offset, compressed, uncompressed });
         offset += compressed;
     }
-    // The table's own skippable frame is the remainder; anything else means these are not
-    // this blob's frames
+    // Remainder must be exactly the table's own skippable frame (anything else = not this
+    // blob's frames)
     let table_len = (need - 8) as u64 + 8;
     if offset + table_len != blob_len {
         return Err(SeekTableError::SizeMismatch { table: offset + table_len, blob: blob_len });

@@ -1,7 +1,7 @@
 # Chain snapshots: manifest-as-lockfile
 
 Chain fixtures = **build inputs, not source**: pinned by hash, fetched on demand — the model Cargo, Go
-modules, Bazel `http_archive` and Nix fixed-output derivations all use. Git holds a four-key record; the
+modules, Bazel `http_archive` and Nix fixed-output derivations all use. Git holds a small plaintext record; the
 bytes live in the snapshot bucket, addressed by content.
 
 Replaced Git LFS, whose premise (materialise large files on checkout so they feel like source) ztest
@@ -44,23 +44,32 @@ pub const ORCHARD_TESTNET: ChainSnapshot = ChainSnapshot {
 
 ## Manifest schema
 
-Four keys, every one machine-computed, never hand-written.
+Six keys, every one machine-computed, never hand-written. They describe the **packed** object
+`push` produced, not the file handed to it.
 
 ```toml
 name               = "zebra-v6.2.3-testnet-1848420.tar.zst"
 sha256             = "8c350d15ecc54c5610707093e31293bc13f9d24acfc9bade9d987e60660ac9a6"
 size_bytes         = 3499975919
 uncompressed_bytes = 4468310016
+base_uri           = "https://ztest-seeds.elicbarbieri.workers.dev"
+key_prefix         = "lfs"
 ```
 
-| Key                  | Consumed by                                                        |
-| -------------------- | ------------------------------------------------------------------ |
-| `sha256`             | bucket key `lfs/<oid>`, seed PVC name, the puller's digest check   |
-| `size_bytes`         | `Bucket::has()` idempotent push, pull budget, progress denominator |
-| `uncompressed_bytes` | seed PVC sizing                                                    |
-| `name`               | `compression_from_name` → the puller's `tar` flag; error messages  |
+| Key                  | Consumed by                                                             |
+| -------------------- | ----------------------------------------------------------------------- |
+| `sha256`             | bucket key `<key_prefix>/<oid>`, seed PVC name, the puller's digest check |
+| `size_bytes`         | `Bucket::has()` idempotent push, seek-table tail probe, progress denominator |
+| `uncompressed_bytes` | seed PVC sizing                                                         |
+| `name`               | `compression_from_name` → the puller's `tar` flag; error messages       |
+| `base_uri`           | the read path, per artifact — repointing is a text edit, not a release  |
+| `key_prefix`         | object namespace inside the bucket                                      |
 
-Deserialises to `Artifact` one-to-one — same four fields, no mapping layer.
+Deserialises to `Artifact` one-to-one — same fields, no mapping layer.
+
+The frame table is deliberately *not* here: it lives in the object (see
+[Segmented archives](#segmented-archives)), so a 258 GiB snapshot adds 4 KiB to the blob rather
+than ~500 rows to a committed file.
 
 The schema shrank to this by audit: `tip_hash`, `db_format`, `version`, `contents`, `produced_by`,
 `stop_method` had **zero** readers anywhere; `[activations]` were consensus constants that need
@@ -74,7 +83,7 @@ is what addresses the blob plus what a test reads.
   git (trust root)
     │
     ├── snapshots/<network>/zebra-<ver>-<upgrade>.toml ──── name, sha256, sizes
-    │        │                                              committed, plaintext, 4 keys
+    │        │                                              committed, plaintext, 6 keys
     │        └── read at COMPILE TIME by artifact!() ──► Artifact
     │                                                      ├─► bucket key  lfs/<oid>
     │                                                      └─► seed PVC    seed-<oid[..8]>-<driver>
@@ -94,20 +103,23 @@ is what addresses the blob plus what a test reads.
     ▼
   ./zebra-v6.2.3-testnet-1848420.tar.zst
     │
-    ├─►  ztest snapshot manifest <path> > snapshots/testnet/zebra-6.2.3-orchard.toml
-    │       one streaming read: sha256 of the compressed bytes taken on the way
-    │       into the decompressor, whose output is counted. Never buffered
+    ├─►  ztest snapshot push <path> > snapshots/testnet/zebra-6.2.3-orchard.toml
+    │       ← the only credentialed command in ztest; credentials from
+    │         `ztest snapshot config`, never the environment
     │
-    ├─►  ztest snapshot push <path>            ← the only credentialed command in ztest
-    │       credentials from `ztest snapshot config`, never the environment
-    │       oid → has(oid,size)? skip : resumable multipart → lfs/<oid>
-    │              part i ─► R2 ─► ETag ─► append ~/.cache/ztest/uploads/<oid>.ledger
-    │              killed? the next push adopts that uploadId and sends only what is missing
+    │    1. pack: re-emit as member-aligned 512 MiB zstd frames + a seek table.
+    │       One streaming pass, one copy on disk; sha256 taken as bytes are written
+    │    2. has(oid,size)? skip : resumable multipart → lfs/<oid>
+    │          part i ─► R2 ─► ETag ─► append ~/.cache/ztest/uploads/<oid>.ledger
+    │          killed? the next push adopts that uploadId and sends only what is missing
+    │    3. the manifest → stdout. Progress and results → stderr
     │
     └─►  add a const to src/snapshots.rs, commit
 
-  ORDER MATTERS: push before commit. A committed manifest claims the object
-  exists; `ztest snapshot verify` is what enforces it.
+  There is no `snapshot manifest` command. The record describes the packed object,
+  which does not exist until it is packed — so a describe-only command could only
+  print an oid for bytes nobody uploaded. A manifest now exists *because* a push
+  succeeded, which is what used to depend on running two commands in the right order.
 ```
 
 Every `ztest snapshot` step is cluster-free — publishing a fixture must not require a cluster.
@@ -122,11 +134,18 @@ Every `ztest snapshot` step is cluster-free — publishing a fixture must not re
                    └── absent ─► create PVC + puller Job
                                     │ manifest.base_uri/lfs/<oid> — public, no credential
                                     ▼
+                 seek table ─ one ranged GET of the object's last 128 KiB
+                   ├── present ─► segments, resumable      ← everything published now
+                   └── absent  ─► one stream               ← pre-segmentation objects
+
   puller pod     mkfifo /tmp/verify.fifo
                  sha256sum < fifo > /tmp/verify.sum &        VERIFY_PID=$!
-                 { fetch range n+1 in the background; cat range n }
-                   | tee fifo | dd | tar --zstd -x -C /seed
-                   && { wait $VERIFY_PID; [ "$ACTUAL" = "<oid>" ] || exit 1; }
+                 RESUME=$(cat /seed/.ztest-resume || echo 0)
+                 for segment k >= RESUME:
+                   { fetch range n+1 in the background; cat range n }   ← inside the segment
+                     | tee fifo | dd | zstd -dc | tar -ixf - -C /seed
+                   echo $((k+1)) > /seed/.ztest-resume     ← only once tar has returned
+                 RESUME==0 && { wait $VERIFY_PID; [ "$ACTUAL" = "<oid>" ] || exit 1; }
                    │
                    ▼
                  VolumeSnapshot ─► CoW clone per pod (~5 s on TopoLVM)
@@ -153,19 +172,67 @@ Every `ztest snapshot` step is cluster-free — publishing a fixture must not re
   the floor rises more than the mean. A deeper queue would stage more disk for a transfer already at the
   link's ceiling: 1 / 4 / 8 / 16 concurrent ranges all aggregate to ~20 MB/s, so parallelism is not the
   lever — overlap is
+- **Resume is per segment.** The marker is written only once `tar` has returned, so an interrupted pull
+  redoes at most one segment, and redoing one is harmless — `tar` overwrites what it already wrote. It
+  lives on the PVC because that is the only thing outliving the pod, and is removed before the seed is
+  published or every clone would carry it
 - Digest taken **in flight** — bytes stream past a FIFO into a background hasher, so a 21 GB archive
-  needs no second copy
+  needs no second copy. Compared only on a pull that ran the whole object: a resumed one never held the
+  earlier bytes, and what covers those is the per-frame checksum zstd enforces at decompression. A whole
+  pull also draws the trailing seek table through the hasher, which is what binds the table the parent
+  read off the network to the oid committed in the tree
 - `mkfifo` stays in the foreground: `mkfifo … && { … } &` backgrounds the whole list and lets `tee` reach
   the path before it is a FIFO
 - Hasher joined on a real pid, not a `>(…)` substitution, which the shell never waits for
 - A mismatch fails the Job → PVC never marked ready, never snapshotted. Extraction has already written
   bytes by then (you cannot stream-verify before writing), but nothing downstream can reach them
 
+## Segmented archives
+
+A published object is a concatenation of independently-extractable segments, each a complete
+`.tar.zst` over whole `tar` members, followed by a seek table in a skippable frame.
+
+```
+  lfs/<oid> = [ segment 0 ][ segment 1 ] … [ segment n ][ seek table ]
+                   │                                         │
+                   │  complete tar.zst, ~512 MiB extracted   │  skippable frame: sizes only,
+                   │  fetch its range → zstd -dc → tar -x    │  offsets are the running sum
+```
+
+- **Still one plain `.tar.zst`.** [RFC 8878](https://datatracker.ietf.org/doc/html/rfc8878) makes
+  concatenated frames mandatory decoder behaviour and requires skippable frames to be skipped, so the
+  whole object decompresses and extracts normally — with `-i`, see the trade-off below
+- **Why segments, not staging.** The alternative for resumability was downloading the blob to disk
+  before extracting. These archives barely compress (mainnet Ironwood: 244.8 GiB packed against a
+  257.8 GiB tree — RocksDB SSTs are already compressed), so staging is ~2× the volume, and on the seed
+  PVC that inflation propagates to every per-test clone. Segments cost one segment of scratch instead
+- **Why complete tars per segment, not one stream cut into frames.** A mid-stream fragment has no
+  end-of-archive block, so `tar -x` on it fails at EOF. The price is 1 KiB of zero blocks per segment
+  and the rule that a file cannot span a segment — irrelevant at 64 MiB SSTs against 512 MiB segments
+- **Cuts land on member boundaries**, and never between a GNU long-name / pax extended header and the
+  member it describes. `pack` copies members byte-for-byte rather than re-creating them, so modes,
+  owners and sparse maps survive untouched; a pax *global* header is refused outright, because every
+  segment would have to repeat it
+- **The seek table is not in the manifest.** Sizes only, 8 bytes a frame, so ~500 frames is 4 KiB in the
+  object rather than ~500 rows in a committed file. The parent reads it with one ranged GET beside the
+  `blob_present` probe it already makes; the pod is shell and gets byte ranges already resolved
+- **Only the format's principle is borrowed.** zstd's seekable format lives in `contrib/`, has no CLI in
+  any standard distribution, and its jump table says nothing about `tar` member alignment — which is the
+  actual constraint. What ztest writes is a compatible seek table over frames it aligned itself
+- **`backoffLimit` follows what a restart costs**: 2 for a segmented object, which resumes off its
+  marker; 0 without one, where a fresh pod would re-fetch from byte 0 against a clock sized for one pass
+
 ## Known trade-offs
 
 1. **Metadata and bytes are no longer atomic** — push, then commit: two systems, two steps, and a window
    where a committed manifest names an unpushed object. `ztest snapshot verify` closes it after the fact;
-   nothing closes it during
+   nothing closes it during. Narrowed, though not shut, by folding the record into `push`: the TOML only
+   comes out of an upload that succeeded, so the manifest can no longer *precede* the bytes
+1. **Segmented objects require `--ignore-zeros` on every consumer** — each segment ends with its own
+   end-of-archive blocks, and a `tar` without `-i` stops at the first pair and exits **0** over a
+   fraction of the tree. Nothing downstream would notice: the PVC gets marked ready over it. The flag is
+   unconditional in `puller_cmd` and pinned by a test, but anything else that ever reads these objects
+   inherits the requirement
 1. **A bespoke store replaces a standard one** — LFS ships `ls-files`, `fsck`, `migrate`, `prune`;
    `ztest snapshot` is ours
 1. **No automatic fetch** — producing a successor rung needs the archive fetched deliberately;

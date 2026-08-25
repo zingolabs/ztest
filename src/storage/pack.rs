@@ -43,7 +43,7 @@ pub struct Packed {
     pub segments: Vec<Segment>,
 }
 
-/// One `tar` header, in the only two facts segmentation needs
+/// `tar` header, in the only two facts segmentation needs
 struct Header {
     size: u64,
     typeflag: u8,

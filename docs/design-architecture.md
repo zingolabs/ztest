@@ -84,7 +84,7 @@ Pre-baked PVC content (chain/indexer state) is content-addressed and bucket-host
 | Property   | Value                                                |
 | ---------- | ---------------------------------------------------- |
 | Namespace  | `ztest-seeds`                                        |
-| Name       | `seed-{sha8}`                                        |
+| Name       | `seed-{sha8}-{driver}`                               |
 | Labels     | `seeds.ztest.io/sha`, `seeds.ztest.io/ready`         |
 | Annotation | `last_accessed_at` (bumped per clone)                |
 | Backing    | archive pool, `size=1` (recreatable from the bucket) |
@@ -95,7 +95,7 @@ Each archive has a paired `VolumeSnapshot`; tests always clone the snapshot, nev
 
 ```
 tar -I zstd -cf tests/assets/<name>.tar.zst -C <data-dir> .
-ztest snapshot manifest <archive> > snapshots/<net>/zebra-<ver>-<up>.toml && ztest snapshot push <archive>
+ztest snapshot push <archive> > snapshots/<net>/zebra-<ver>-<up>.toml
 ```
 
 `push` is the only ztest command that takes credentials (`ztest snapshot config set`, once per
@@ -104,13 +104,14 @@ machine). Reading a snapshot never does.
 **Materialization** (lazy, first use) at `TestEnv::build()`, per archive mount:
 
 ```
-sha = sha256(file at source)
-if PVC seed-{sha8} exists and labelled ready=true: reuse
+oid = the manifest's sha256 (compile-time; a runner pod has no checkout to hash)
+if PVC seed-{sha8}-{driver} exists and labelled ready=true: reuse
 else:
     atomically create the PVC (loser of a race falls through to reuse)
-    spawn reconcile Job: attach PVC, stream tarball in, `tar -xf`
+    spawn puller Job: attach PVC, fetch lfs/<oid> as ranges, extract into /seed
+      resumable object → segment at a time, marker on the PVC; a fresh pod continues
       success → label ready=true, create VolumeSnapshot
-      failure → leave un-ready; next build() retries
+      failure → leave un-ready; next run retries
 ```
 
 **Cross-namespace clone (shadow VSC).** PVC `dataSource` is namespace-local, so the library mints a
