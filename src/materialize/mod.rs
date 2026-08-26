@@ -20,8 +20,8 @@
 //! 3. Label `seeds.ztest.io/ready=true` + create the paired `VolumeSnapshot`, from
 //!    which `seeds::read_seed_handle` resolves the handle and `bind_seed` clones per pod
 //!
-//! Race losers poll `ready=true`, then `status.readyToUse`. No leader election
-//! (the Job's name is the lock)
+//! Race losers watch the winner's Job on its own terms — byte meter + stall, never a budget.
+//! No leader election (the Job's name is the lock)
 use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
@@ -40,6 +40,7 @@ use crate::storage;
 use crate::storage::seekable::Segment;
 
 pub mod progress;
+pub mod snapshot;
 
 const WAIT_INTERVAL: Duration = Duration::from_secs(2);
 const WAIT_BUDGET: Duration = Duration::from_secs(300);
@@ -122,21 +123,11 @@ pub async fn provision_seed(
     let we_created = create_seed_pvc(client, &pvc_name, seed, progress).await?;
     if we_created || !pvc_is_ready(client, &pvc_name).await? {
         tracing::info!(pvc = %pvc_name, archive = %seed.name, "materializing seed PVC");
-        match try_materialize(client, &pvc_name, seed, progress).await {
-            Ok(Ok(())) => mark_ready(client, &pvc_name).await?,
-            Ok(Err(e)) => return Err(e),
-            // Another process materializing → wait it out in the polls below
-            Err(InFlight) => {
-                progress.note("waiting on another run's pull");
-                tracing::debug!(pvc = %pvc_name, "seed materialization in flight elsewhere; waiting");
-            }
-        }
+        publish(client, &pvc_name, seed, progress).await?;
     }
 
-    wait_pvc_ready(client, &pvc_name).await?;
-
-    // After the readiness wait: `ready=true` is what says every byte is in, and on
-    // the `InFlight` path snapshotting early captures a half-filled volume
+    // `publish` returns only on `ready=true`, which is what says every byte is in — snapshotting
+    // ahead of it captures a half-filled volume on the `InFlight` path
     //
     // Unconditional: published = PVC *and* snapshot, but `ready=true` records only
     // the first. A PVC outliving its snapshot otherwise parks every future run on
@@ -144,7 +135,7 @@ pub async fn provision_seed(
     // 409-tolerant, so the warm path costs one GET
     progress.note("snapshotting");
     create_volume_snapshot(client, &pvc_name).await?;
-    wait_snapshot_ready(client, &pvc_name, progress).await?;
+    wait_snapshot_ready(client, &seed.name, &pvc_name, &driver, seed.size, progress).await?;
     seeds::read_seed_handle(client, &seed.name, &seed.oid, &driver).await
 }
 
@@ -172,7 +163,8 @@ pub async fn await_seed(client: &Client, handle: crate::Artifact) -> Result<Seed
     }
     wait_pvc_ready(client, &pvc_name).await?;
     // Test side: no console row (`NodeProgress::default` → nowhere)
-    wait_snapshot_ready(client, &pvc_name, &Silent).await?;
+    // Total unknown test side (a runner pod holds no inventory) → meter reports bytes, no bar
+    wait_snapshot_ready(client, handle.name, &pvc_name, &driver, 0, &Silent).await?;
     seeds::read_seed_handle(client, handle.name, handle.oid, &driver).await
 }
 
@@ -359,8 +351,137 @@ async fn mark_ready(client: &Client, pvc_name: &str) -> Result<(), EnvError> {
 // ─────────────────────────── puller Job ─────────────────────────────
 
 /// Puller Job already exists (another actor filling this seed) → the "wait" branch
-/// of [`provision_seed`]
-struct InFlight;
+/// of [`publish`]. Carries the shape the waiter needs to read that Job's meter
+struct InFlight {
+    resumable: bool,
+}
+
+/// How a wait on another run's puller ended
+enum InFlightEnd {
+    Published,
+    /// Job gone, volume still unlabelled → lock free, this run takes the pull
+    TakeOver,
+}
+
+/// Turns one run may take at a seed. Each `TakeOver` means the lock was free and this run
+/// claimed it, so a second lap is a lost race and a third is a loop
+const PUBLISH_ATTEMPTS: usize = 3;
+
+/// Fill and label the seed volume, whichever run's puller does the work.
+///
+/// - Returns only once `ready=true` is set, so nothing downstream waits on the label
+/// - Waiting on another run is not a budget: its puller is a named Job over a byte-metered
+///   pod, watched here on exactly the terms its owner watches it
+async fn publish(
+    client: &Client,
+    pvc_name: &str,
+    seed: &SeedEntry,
+    progress: &dyn StepProgress,
+) -> Result<(), EnvError> {
+    for _ in 0..PUBLISH_ATTEMPTS {
+        let InFlight { resumable } = match try_materialize(client, pvc_name, seed, progress).await {
+            Ok(Ok(())) => return mark_ready(client, pvc_name).await,
+            Ok(Err(e)) => return Err(e),
+            Err(inflight) => inflight,
+        };
+        progress.note("waiting on another run's pull");
+        tracing::debug!(pvc = %pvc_name, "seed materialization in flight elsewhere; waiting");
+        match await_inflight(client, pvc_name, seed, resumable, progress).await? {
+            InFlightEnd::Published => return Ok(()),
+            InFlightEnd::TakeOver => continue,
+        }
+    }
+    Err(EnvError::ArchiveMaterializeFailed {
+        archive: seed.name.clone(),
+        reason: format!("seed pull changed hands {PUBLISH_ATTEMPTS}x without publishing — rerun"),
+    })
+}
+
+/// Wait out the puller Job another run owns.
+///
+/// - No budget: the Job's own liveness is the verdict, same as owning the pull
+/// - `Complete` but unlabelled = owner died between the Job succeeding and [`mark_ready`]; bytes
+///   are on the volume, so finish its publish rather than redo the transfer
+/// - Stall is reported, never reaped: the Job is another actor's, and a log-derived verdict is
+///   not grounds to delete its work
+async fn await_inflight(
+    client: &Client,
+    pvc_name: &str,
+    seed: &SeedEntry,
+    resumable: bool,
+    progress: &dyn StepProgress,
+) -> Result<InFlightEnd, EnvError> {
+    let jobs: Api<Job> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
+    let job_name = puller_job_name(pvc_name);
+
+    let settled = tokio::select! {
+        settled = inflight_settled(client, &jobs, pvc_name, &job_name) => settled?,
+        stall = progress::watch_puller(&pods, &job_name, seed.size, resumable, progress) => {
+            return Err(orphaned_puller(&seed.name, &job_name, stall));
+        }
+    };
+    match settled {
+        Settled::Published => Ok(InFlightEnd::Published),
+        Settled::Gone => Ok(InFlightEnd::TakeOver),
+        Settled::Finished { succeeded: true } => {
+            mark_ready(client, pvc_name).await?;
+            Ok(InFlightEnd::Published)
+        }
+        Settled::Finished { .. } => Err(EnvError::ArchiveMaterializeFailed {
+            archive: seed.name.clone(),
+            reason: format!("puller job failed: {}", job_logs(&pods, &job_name).await.trim()),
+        }),
+    }
+}
+
+/// Every way a wait on another run's puller can stop being a wait. Sole place those states are
+/// spelled, so [`await_inflight`] reads as a mapping and not a second copy of the predicates
+enum Settled {
+    Published,
+    Gone,
+    Finished { succeeded: bool },
+}
+
+/// Block until the wait's premise changes, on the Job's own watch — same primitive its owner
+/// waits on in [`materialize`], so no second polling idiom and no per-tick GET over an hour
+async fn inflight_settled(
+    client: &Client,
+    jobs: &Api<Job>,
+    pvc_name: &str,
+    job_name: &str,
+) -> Result<Settled, EnvError> {
+    match await_condition(jobs.clone(), job_name, is_job_settled()).await.map_err(env_err)? {
+        Some(job) => Ok(Settled::Finished { succeeded: succeeded(&job) }),
+        // Absent reads identically whether its owner reaped a corpse or cleaned up after success
+        // (`materialize` deletes on both) — only the label separates them, and taking over an
+        // already-published seed would redo the whole transfer
+        None if pvc_is_ready(client, pvc_name).await? => Ok(Settled::Published),
+        None => Ok(Settled::Gone),
+    }
+}
+
+/// Terminal *or* gone — both end a waiter's interest, and `await_condition` reports which
+/// (`Ok(None)` = no Job left to wait on)
+fn is_job_settled() -> impl Condition<Job> {
+    |obj: Option<&Job>| obj.is_none() || is_job_finished().matches_object(obj)
+}
+
+/// Another run's pull, stuck. Not reaped from here — naming it is the whole remedy
+fn orphaned_puller(archive: &str, job_name: &str, stall: progress::Stall) -> EnvError {
+    EnvError::ArchiveMaterializeFailed {
+        archive: archive.to_string(),
+        reason: format!(
+            "{stall}; pull owned by another run — `kubectl -n {SEEDS_NAMESPACE} delete job \
+             {job_name}` to retake it"
+        ),
+    }
+}
+
+/// Job name = the seed's lock, derived identically by its owner and by every waiter
+fn puller_job_name(pvc_name: &str) -> String {
+    format!("puller-{}", pvc_name.trim_start_matches("seed-"))
+}
 
 async fn try_materialize(
     client: &Client,
@@ -370,13 +491,13 @@ async fn try_materialize(
 ) -> Result<Result<(), EnvError>, InFlight> {
     match materialize(client, pvc_name, seed, progress).await {
         Ok(()) => Ok(Ok(())),
-        Err(MaterializeErr::InFlight) => Err(InFlight),
+        Err(MaterializeErr::InFlight(resumable)) => Err(InFlight { resumable }),
         Err(MaterializeErr::Fatal(e)) => Ok(Err(e)),
     }
 }
 
 enum MaterializeErr {
-    InFlight,
+    InFlight(bool),
     Fatal(EnvError),
 }
 impl From<EnvError> for MaterializeErr {
@@ -396,7 +517,7 @@ async fn materialize(
     seed: &SeedEntry,
     progress: &dyn StepProgress,
 ) -> Result<(), MaterializeErr> {
-    let job_name = format!("puller-{}", pvc_name.trim_start_matches("seed-"));
+    let job_name = puller_job_name(pvc_name);
     let jobs: Api<Job> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
     let pods: Api<Pod> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
 
@@ -430,7 +551,7 @@ async fn materialize(
             // that will never make the PVC ready — treated as in-flight it burns every
             // later run's budget on a corpse. Reap and retry once
             if !reap_finished_job(&jobs, &job_name).await {
-                return Err(MaterializeErr::InFlight);
+                return Err(MaterializeErr::InFlight(resumable));
             }
             jobs.create(&PostParams::default(), &body)
                 .await
@@ -824,13 +945,12 @@ fn is_job_finished() -> impl Condition<Job> {
 
 /// `Complete`, as against `Failed`
 async fn job_succeeded(jobs: &Api<Job>, name: &str) -> bool {
-    jobs.get_opt(name)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|j| j.status)
-        .and_then(|s| s.succeeded)
-        .is_some_and(|n| n > 0)
+    jobs.get_opt(name).await.ok().flatten().is_some_and(|job| succeeded(&job))
+}
+
+/// Same verdict off a Job already in hand — no second GET to disagree with the first
+fn succeeded(job: &Job) -> bool {
+    job.status.as_ref().and_then(|s| s.succeeded).is_some_and(|n| n > 0)
 }
 
 /// Newest pod's logs, for a failure message. Found by the template's stamped label
@@ -875,48 +995,63 @@ async fn create_volume_snapshot(client: &Client, pvc_name: &str) -> Result<(), E
     }
 }
 
+/// Test side only, and budgeted for it: preflight publishes before any runner pod is scheduled,
+/// so this bounds label propagation, never a transfer ([`publish`] owns every real wait)
 async fn wait_pvc_ready(client: &Client, pvc_name: &str) -> Result<(), EnvError> {
-    poll(WAIT_BUDGET, || async { pvc_is_ready(client, pvc_name).await }).await
-}
-
-async fn wait_snapshot_ready(
-    client: &Client,
-    snap_name: &str,
-    progress: &dyn StepProgress,
-) -> Result<(), EnvError> {
-    let snap_gvk = volume_snapshot_gvk();
-    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), SEEDS_NAMESPACE, &snap_gvk);
-    let started = std::time::Instant::now();
-    poll(WAIT_BUDGET, || async {
-        // Elapsed on the row (copying drivers sit here minutes; bare spinner = hang)
-        progress.note(&format!("waiting for snapshot ({}s)", started.elapsed().as_secs()));
-        let snap = match api.get_opt(snap_name).await.map_err(env_err)? {
-            Some(s) => s,
-            None => return Ok::<bool, EnvError>(false),
-        };
-        Ok(snap.data["status"]["readyToUse"].as_bool().unwrap_or(false))
-    })
-    .await
-}
-
-/// Returns on `Ok(true)` or budget expiry. Predicate errors propagate at once
-async fn poll<F, Fut>(budget: Duration, mut f: F) -> Result<(), EnvError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<bool, EnvError>>,
-{
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = tokio::time::Instant::now() + WAIT_BUDGET;
     loop {
-        if f().await? {
+        if pvc_is_ready(client, pvc_name).await? {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(EnvError::NotReady {
-                component: "seed materialize".into(),
-                elapsed: budget,
+                component: "seed volume".into(),
+                elapsed: WAIT_BUDGET,
             });
         }
         tokio::time::sleep(WAIT_INTERVAL).await;
+    }
+}
+
+/// Wait out the snapshot with no deadline.
+///
+/// - Verdict = silence, never duration: a copying driver's `CreateSnapshot` runs for as long as
+///   the volume is big, and no constant spans that (same argument as [`materialize`])
+/// - [`snapshot::watch`] is the other half of the race — it returns only for states readiness
+///   would never arrive to settle
+async fn wait_snapshot_ready(
+    client: &Client,
+    archive: &str,
+    snap_name: &str,
+    driver: &str,
+    total: u64,
+    progress: &dyn StepProgress,
+) -> Result<(), EnvError> {
+    let snap_gvk = volume_snapshot_gvk();
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), SEEDS_NAMESPACE, &snap_gvk);
+    tokio::select! {
+        ready = snapshot_ready(&api, snap_name) => ready,
+        fault = snapshot::watch(client, snap_name, driver, total, progress) => {
+            Err(EnvError::ArchiveMaterializeFailed {
+                archive: archive.to_string(),
+                reason: fault.to_string(),
+            })
+        }
+    }
+}
+
+/// Readiness alone, on the object's own watch — [`snapshot::watch`] owns every other ending.
+///
+/// Watch, not a poll: this wait is unbounded, and a copying driver would otherwise cost
+/// thousands of GETs across one snapshot
+async fn snapshot_ready(api: &Api<DynamicObject>, snap_name: &str) -> Result<(), EnvError> {
+    await_condition(api.clone(), snap_name, is_snapshot_ready()).await.map_err(env_err)?;
+    Ok(())
+}
+
+fn is_snapshot_ready() -> impl Condition<DynamicObject> {
+    |obj: Option<&DynamicObject>| {
+        obj.is_some_and(|s| s.data["status"]["readyToUse"].as_bool().unwrap_or(false))
     }
 }
 
@@ -934,6 +1069,28 @@ mod tests {
     use super::*;
 
     use crate::inventory::SeedPayload;
+
+    #[test]
+    fn owner_and_waiter_derive_the_same_lock_from_the_volume() {
+        let pvc = storage::seed_pvc_name(&"b".repeat(64), "hostpath.csi.k8s.io");
+        let job = puller_job_name(&pvc);
+        assert_eq!(job, format!("puller-{}", pvc.trim_start_matches("seed-")));
+        assert!(!job.contains("seed-"), "lock is derived once, not doubly prefixed: {job}");
+    }
+
+    #[test]
+    fn a_stuck_pull_owned_elsewhere_names_the_job_and_the_remedy() {
+        let stall = progress::Stall::NoProgress { transferred: 1 << 30, total: 4 << 30 };
+        let EnvError::ArchiveMaterializeFailed { reason, .. } =
+            orphaned_puller("chain", "puller-abc", stall)
+        else {
+            panic!("wrong variant");
+        };
+        assert!(reason.contains("puller-abc"), "names the Job: {reason}");
+        assert!(reason.contains("delete job"), "carries the remedy: {reason}");
+        assert!(reason.contains(SEEDS_NAMESPACE), "remedy is runnable: {reason}");
+        assert_eq!(reason.lines().count(), 1, "one line: {reason}");
+    }
 
     fn seed(name: &str, payload: SeedPayload) -> SeedEntry {
         SeedEntry {

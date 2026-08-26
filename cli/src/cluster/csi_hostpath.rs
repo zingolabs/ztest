@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use dialoguer::Confirm;
+use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{Pod, PodStatus};
 use kube::Client;
-use kube::api::{Api, ListParams};
+use kube::api::{Api, ListParams, Patch, PatchParams};
+use serde_json::json;
 
 use super::{draw, row};
 use ztest::api::capability::{self, Capability, Finding, Report};
@@ -43,6 +45,24 @@ const TOOLS: [&str; 2] = ["kubectl", "git"];
 
 /// Every object `deploy.sh` applies carries it (kustomize `commonLabels`)
 const DRIVER_LABEL: &str = "app.kubernetes.io/instance=hostpath.csi.k8s.io";
+
+/// Namespace + workload `deploy.sh` pins; neither is ours to configure
+const PLUGIN_NAMESPACE: &str = "default";
+const PLUGIN_STS: &str = "csi-hostpathplugin";
+const SNAPSHOTTER_CONTAINER: &str = "csi-snapshotter";
+const TIMEOUT_FLAG: &str = "--timeout=";
+
+/// csi-snapshotter's per-RPC deadline, raised off its 1m default.
+///
+/// - hostpath `tar czf`s the whole volume *inside* `CreateSnapshot`, under the driver's global
+///   mutex, and the sidecar's cancel never reaches that `tar` (RPC ctx unplumbed into the exec)
+/// - So the default deadline buys no bound, only a retry storm: every retry blocks on the same
+///   mutex and expires again, while the first copy runs on regardless
+/// - Sized to the largest seed ztest publishes, not to a copy's true duration (unmodelable, as
+///   the pull's is): a 250 GiB chain through single-threaded gzip runs ~3.5h
+/// - Overrunning it is not a failure — it degrades to the retry storm this removes, which does
+///   converge once the first copy lands. `materialize::snapshot` owns the hang verdict either way
+const SNAPSHOT_RPC_DEADLINE_MINS: u64 = 240;
 
 /// Budget from `Running` to Ready. Pull time sits *before* `Running`, so this bounds only
 /// probe failures — an unbounded cold pull stays the operator's call to watch or abort
@@ -193,6 +213,9 @@ pub async fn install(client: &Client) -> Result<()> {
         }
     };
     deploy_driver(client, &deploy, &kubeconfig, &theme).await?;
+
+    progress("csi-snapshotter RPC deadline", &theme);
+    pin_snapshotter_timeout(client, &kubeconfig).await?;
 
     progress("StorageClass + VolumeSnapshotClass", &theme);
     let examples = checkout.join("examples");
@@ -544,6 +567,58 @@ fn minified_kubeconfig(work: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Raise the snapshotter's RPC deadline past any copy this cluster will be asked to make.
+///
+/// - Read-modify-write, so an upstream arg change survives the patch
+/// - Strategic merge: `containers` merges by `name`, leaving every sidecar but this one alone
+/// - Only safe now that ztest watches snapshot liveness itself — a long deadline with no
+///   watcher would trade a retry storm for a silent hang
+async fn pin_snapshotter_timeout(client: &Client, kubeconfig: &Path) -> Result<()> {
+    let api: Api<StatefulSet> = Api::namespaced(client.clone(), PLUGIN_NAMESPACE);
+    let sts = api
+        .get_opt(PLUGIN_STS)
+        .await?
+        .ok_or_else(|| anyhow!("{PLUGIN_STS} absent after deploy.sh"))?;
+    let args = snapshotter_args(&sts)
+        .ok_or_else(|| anyhow!("no {SNAPSHOTTER_CONTAINER} container in {PLUGIN_STS}"))?;
+    let patch = json!({
+        "spec": { "template": { "spec": { "containers": [
+            { "name": SNAPSHOTTER_CONTAINER, "args": with_deadline(args) }
+        ] } } }
+    });
+    api.patch(PLUGIN_STS, &PatchParams::default(), &Patch::Strategic(&patch)).await?;
+    kubectl(
+        kubeconfig,
+        &[
+            "-n",
+            PLUGIN_NAMESPACE,
+            "rollout",
+            "status",
+            &format!("statefulset/{PLUGIN_STS}"),
+            "--timeout=180s",
+        ],
+    )
+}
+
+fn snapshotter_args(sts: &StatefulSet) -> Option<Vec<String>> {
+    sts.spec
+        .as_ref()?
+        .template
+        .spec
+        .as_ref()?
+        .containers
+        .iter()
+        .find(|c| c.name == SNAPSHOTTER_CONTAINER)
+        .map(|c| c.args.clone().unwrap_or_default())
+}
+
+/// Flag replaced where present, appended where not (re-install must not stack duplicates)
+fn with_deadline(args: Vec<String>) -> Vec<String> {
+    let mut kept: Vec<String> = args.into_iter().filter(|a| !a.starts_with(TIMEOUT_FLAG)).collect();
+    kept.push(format!("{TIMEOUT_FLAG}{SNAPSHOT_RPC_DEADLINE_MINS}m"));
+    kept
+}
+
 fn kubectl(kubeconfig: &Path, args: &[&str]) -> Result<()> {
     run(Command::new("kubectl").env("KUBECONFIG", kubeconfig).args(args))
 }
@@ -599,6 +674,39 @@ impl Drop for WorkDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_deadline_replaces_an_existing_flag_rather_than_stacking_one() {
+        let got = with_deadline(vec!["-v=5".into(), "--timeout=1m".into()]);
+        let want = format!("--timeout={SNAPSHOT_RPC_DEADLINE_MINS}m");
+        assert_eq!(got, vec!["-v=5".to_string(), want]);
+    }
+
+    #[test]
+    fn upstream_args_survive_the_patch() {
+        let got = with_deadline(vec!["-v=5".into(), "--csi-address=/csi/csi.sock".into()]);
+        assert_eq!(got[0], "-v=5");
+        assert_eq!(got[1], "--csi-address=/csi/csi.sock");
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn re_running_the_install_is_idempotent() {
+        let once = with_deadline(vec!["-v=5".into()]);
+        assert_eq!(with_deadline(once.clone()), once);
+    }
+
+    /// 250 GiB (largest published seed) through single-threaded gzip, at a pessimistic
+    /// 20 MiB/s — the deadline must clear the biggest copy this cluster can be handed
+    #[test]
+    fn the_deadline_clears_the_largest_seed_a_default_timeout_cannot() {
+        let biggest_copy_mins = (250 * 1024) / 20 / 60;
+        assert!(
+            SNAPSHOT_RPC_DEADLINE_MINS >= biggest_copy_mins,
+            "{SNAPSHOT_RPC_DEADLINE_MINS}m does not cover {biggest_copy_mins}m"
+        );
+    }
+
     use k8s_openapi::api::core::v1::{ContainerState, ContainerStateWaiting, ContainerStatus};
     use ztest::api::capability::Need;
 

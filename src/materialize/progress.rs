@@ -98,7 +98,7 @@ impl fmt::Display for Stall {
 }
 
 /// Byte count at the scale it lands on (seeds run from a 100 MB cache to a 250 GiB chain)
-fn human(bytes: u64) -> String {
+pub(super) fn human(bytes: u64) -> String {
     for (unit, scale) in [("GiB", 1u64 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)] {
         if bytes >= scale {
             return format!("{:.1} {unit}", bytes as f64 / scale as f64);

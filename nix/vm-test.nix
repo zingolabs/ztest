@@ -149,7 +149,7 @@ let
             print(out)
             assert status != 0, "stock kind is missing required storage; check must fail"
             assert "no snapshot-capable StorageClass" in out, out
-            assert "public ·" in out, out
+            assert "public, ranged ·" in out, out
 
         with subtest("stock kind cannot snapshot; unattended setup refuses to fix it"):
             status, out = machine.execute(
