@@ -57,6 +57,9 @@ ztest sync perf zaino_index-construction_1234abcd --component zainod
 ### Podman Backend Cluster & Ztest
 
 ```sh
+# CRITICAL: the latest versions of kind have a bug w/ podman.  install from main
+go install sigs.k8s.io/kind@main
+
 systemd-run --user --scope -p Delegate=yes -- env KIND_EXPERIMENTAL_PROVIDER=podman kind create cluster
 ztest cluster add kind --kind kind --set-default
 ztest cluster setup --install-storage
