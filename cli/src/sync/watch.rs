@@ -850,7 +850,7 @@ mod tests {
         Feed::new(
             "zaino_state_sync".into(),
             "zaino-state-sync-a52f9ec9".into(),
-            "crc".into(),
+            "zingo-infra".into(),
             "Running".into(),
         )
     }

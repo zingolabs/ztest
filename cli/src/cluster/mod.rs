@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use anyhow::{Context as _, Result, anyhow};
 use clap::{Args as ClapArgs, Subcommand};
 
-use ztest::api::cluster_config::{self, Config, Profile};
+use ztest::api::cluster_config::{self, ClusterSpec, Config, Profile};
 use ztest::api::runtime::{self, ContainerRuntime};
 use ztest_ui::Theme;
 use ztest_ui::template::{Fields, draw};
@@ -39,6 +39,8 @@ mod row {
     pub(super) const DEFAULT_SET: &str = "default is now `{name|bold}`";
     pub(super) const REMOVED: &str = "removed `{name|bold}`";
     pub(super) const PROBED: &str = "  {label}: {value|bold} (probed)";
+    pub(super) const EXTRA_SOURCE: &str = "{@bullet|dim} {verb} cluster config from {uri|bold}";
+    pub(super) const EXTRA_FIELD: &str = "  {label}: {value|bold}";
     pub(super) const UNSET: &str = "  {label} unset: {why|dim}";
     pub(super) const UNSAVED: &str = "  {label} {value|bold} found but not saved: {detail|dim}";
     pub(super) const HEADER: &str =
@@ -139,10 +141,10 @@ enum Cmd {
     },
 }
 
-/// A profile has one of two sources: a local kind cluster (`--kind`, addressed
-/// by name) or a kubeconfig-described remote (`--kubeconfig`, whose context and
-/// registry config come from the file itself: its
-/// current-context and its `ztest.io/registry` extension).
+/// A profile binds *who you are* to *what the cluster is*. Identity is always a
+/// kube-context in whichever kubeconfig the run already reads — named directly
+/// (`--kube-context`) or derived from a local kind cluster (`--kind`). Cluster
+/// facts — registry, storage — come from `--extra-config`.
 #[derive(Debug, ClapArgs)]
 struct AddArgs {
     /// Profile name.
@@ -152,14 +154,19 @@ struct AddArgs {
     /// `<cluster>-control-plane` and the context is derived as `kind-<cluster>`.
     /// The cluster name defaults to the profile name; pass a value to override
     /// (`--kind zkn`).
-    #[arg(long, value_name = "CLUSTER", num_args = 0..=1, conflicts_with = "kubeconfig")]
+    #[arg(long, value_name = "CLUSTER", num_args = 0..=1, conflicts_with = "kube_context")]
     kind: Option<Option<String>>,
 
-    /// Kubeconfig describing a remote cluster. Sets `KUBECONFIG` for the run; the
-    /// context is the file's current-context and any `ztest.io/registry`
-    /// extension supplies the registry config (the "ship one file" path).
-    #[arg(long, value_name = "PATH")]
-    kubeconfig: Option<String>,
+    /// Kube-context to target, as it is named in your kubeconfig. The usual path
+    /// for a shared cluster you have already merged into `~/.kube/config`.
+    #[arg(long, value_name = "NAME")]
+    kube_context: Option<String>,
+
+    /// Cluster facts as TOML — registry, storage classes — from a path or an
+    /// `https://` URL. Carries no credential and cannot set a context. A fetched
+    /// one is echoed and confirmed before anything is written.
+    #[arg(long, value_name = "URI")]
+    extra_config: Option<String>,
 
     /// CSI driver seeding uses, e.g. `topolvm.io`. Omitted, ztest follows the
     /// cluster's default StorageClass. ztest never installs a driver — this
@@ -172,6 +179,11 @@ struct AddArgs {
     /// when there is no node to observe, or to override what it found.
     #[arg(long, value_name = "ENGINE", value_parser = ["docker", "podman"])]
     runtime: Option<String>,
+
+    /// Accept a fetched `--extra-config` without prompting. Required to fetch
+    /// one off a terminal, where there is nobody to read what it sets.
+    #[arg(long)]
+    yes: bool,
 
     /// Also make this the active default.
     #[arg(long)]
@@ -243,16 +255,38 @@ fn current() -> Result<()> {
 }
 
 async fn add(a: AddArgs) -> Result<()> {
-    // Bare `--kind` adopts the profile name, `--kind X` overrides.
-    // Distribution never typed (a remote profile derives wholly from its kubeconfig).
-    let mut profile = match (a.kind, &a.kubeconfig) {
+    let theme = Theme::detect();
+
+    // Bare `--kind` adopts the profile name, `--kind X` overrides
+    let mut profile = match (a.kind, &a.kube_context) {
         (Some(k), _) => Profile::local(&k.unwrap_or_else(|| a.name.clone())),
-        (None, Some(kc)) => Profile::from_kubeconfig(std::path::Path::new(kc))?,
-        (None, None) => return Err(anyhow!("pass --kind or --kubeconfig")),
+        (None, Some(ctx)) => Profile::for_context(ctx),
+        (None, None) => return Err(anyhow!("pass --kind or --kube-context")),
     };
-    let named_driver = a.storage_driver.is_some();
-    profile.storage_driver = a.storage_driver;
-    profile.runtime = a.runtime.as_deref().and_then(ContainerRuntime::parse);
+
+    // Facts land before the flags, so an explicitly typed one still wins
+    if let Some(uri) = &a.extra_config {
+        let source = cluster_config::extra::source_of(uri)?;
+        if source.is_remote() {
+            consentable(a.yes)?;
+        }
+        let spec = cluster_config::extra::load_from(&source).await?;
+        echo_extra(&source, &spec, &theme);
+        if source.is_remote() && !accepted(a.yes)? {
+            return Err(anyhow!("declined"));
+        }
+        spec.apply_to(&mut profile);
+    }
+
+    // Assign only what was typed: a bare `=` would erase what --extra-config just set
+    if a.storage_driver.is_some() {
+        profile.storage_driver = a.storage_driver;
+    }
+    if let Some(rt) = a.runtime.as_deref().and_then(ContainerRuntime::parse) {
+        profile.runtime = Some(rt);
+    }
+    // Pinned classes short-circuit driver resolution, so probing one stores what nothing reads
+    let driver_settled = profile.storage_driver.is_some() || profile.storage_class.is_some();
     profile.validate()?;
 
     let mut cfg = cluster_config::load()?;
@@ -264,7 +298,6 @@ async fn add(a: AddArgs) -> Result<()> {
     }
     cfg.save()?;
 
-    let theme = Theme::detect();
     let verb = if existed { "updated" } else { "added" };
     let data = Fields::new()
         .text("verb", verb)
@@ -277,10 +310,46 @@ async fn add(a: AddArgs) -> Result<()> {
     if profile.runtime.is_none() {
         adopt_runtime(&a.name, &profile, &theme);
     }
-    if !named_driver {
+    if !driver_settled {
         adopt_storage_driver(&a.name, &theme).await;
     }
     Ok(())
+}
+
+/// Echo what a `--extra-config` sets, before it can affect anything.
+///
+/// - Remote source = `push`/`pull` decide which registry ztest runs images from, so the
+///   values are shown whether or not a prompt follows
+fn echo_extra(source: &cluster_config::extra::Source, spec: &ClusterSpec, theme: &Theme) {
+    let (label, name) = match source {
+        cluster_config::extra::Source::Remote(u) => ("fetched", u.clone()),
+        cluster_config::extra::Source::Local(p) => ("read", p.display().to_string()),
+    };
+    say(row::EXTRA_SOURCE, &Fields::new().text("verb", label).text("uri", name), theme);
+    for (field, value) in spec.fields() {
+        say(row::EXTRA_FIELD, &Fields::new().text("label", field).text("value", value), theme);
+    }
+}
+
+/// Can a fetched config be consented to at all? Asked before the request, so a run that
+/// could never accept one does not make it
+fn consentable(yes: bool) -> Result<()> {
+    if yes || std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(());
+    }
+    Err(anyhow!("fetched --extra-config needs --yes when not on a terminal"))
+}
+
+/// Gate on a fetched config: whoever served it chose those values
+fn accepted(yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    // One line, no wrap (dialoguer re-renders on answer → a wrapped prompt prints twice)
+    Ok(dialoguer::Confirm::new()
+        .with_prompt("use this configuration?")
+        .default(false)
+        .interact()?)
 }
 
 /// `label` names which knob a probe row reports on ([`row::PROBED`] and friends serve
@@ -542,6 +611,8 @@ mod tests {
             row::DEFAULT_SET,
             row::REMOVED,
             row::PROBED,
+            row::EXTRA_SOURCE,
+            row::EXTRA_FIELD,
             row::UNSET,
             row::UNSAVED,
             row::HEADER,

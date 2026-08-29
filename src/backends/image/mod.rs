@@ -347,6 +347,12 @@ pub fn pull_secret() -> Option<String> {
     from_env().pull_secret()
 }
 
+/// `kubernetes.io/dockerconfigjson` Secret mounted into the build pod as BuildKit's
+/// `DOCKER_CONFIG`. `None` = anonymous push
+pub fn push_secret() -> Option<String> {
+    env_nonempty(crate::cluster_config::PUSH_SECRET_ENV)
+}
+
 /// JSON `{DevImageId: pull_reference}` of the preflight's resolved dev images, stamped
 /// on every runner pod by `engine::pod_runner` (a baked in-pod image has no Dockerfile).
 /// Local kind seeds the same map process-globally ([`seed_dev_images`]) → [`resolve`]

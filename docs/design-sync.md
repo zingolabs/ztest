@@ -122,7 +122,7 @@ Three altitudes, all **outside** the SUT:
   dead-man's-switch (netem TTL / revert-on-timeout, per Chaos Mesh `duration`). Chaos that cannot
   guarantee its own reversion is not shipped
 - Native, not delegated: NetworkPolicy for partitions (declarative, zero privilege) + a privileged netem
-  sidecar reusing the buildkit SCC machinery — no Chaos Mesh controller dependency
+  sidecar reusing the buildkit admission machinery — no Chaos Mesh controller dependency
 
 ## Test-author API
 

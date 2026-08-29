@@ -6,7 +6,7 @@
 //! - Store: `$XDG_CONFIG_HOME/ztest/clusters.toml`, else `~/.config/ztest/clusters.toml`
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use kube::config::Kubeconfig;
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,11 @@ pub const CLUSTER_CLASS_ENV: &str = "ZTEST_CLUSTER_CLASS";
 pub const STORAGE_DRIVER_ENV: &str = "ZTEST_STORAGE_DRIVER";
 const REGISTRY_ENV: &str = "ZTEST_IMAGE_REGISTRY";
 const PUSH_REGISTRY_ENV: &str = "ZTEST_IMAGE_PUSH_REGISTRY";
-
-const REGISTRY_EXTENSION: &str = "ztest.io/registry";
+/// dockerconfigjson Secret the build pod mounts as `DOCKER_CONFIG`
+pub(crate) const PUSH_SECRET_ENV: &str = "ZTEST_IMAGE_PUSH_SECRET";
+/// Storage overrides, read as a pair ([`crate::storage_class::selected`])
+pub(crate) const STORAGE_CLASS_ENV: &str = "ZTEST_STORAGE_CLASS";
+pub(crate) const SNAPSHOT_CLASS_ENV: &str = "ZTEST_VOLUMESNAPSHOT_CLASS";
 
 /// Where the work happens; the rest follows.
 ///
@@ -61,11 +64,67 @@ impl ClusterClass {
     }
 }
 
-/// `ztest.io/registry` kubeconfig extension (one file onboards a cluster)
-#[derive(Deserialize)]
-struct RegistrySpec {
-    push: String,
-    pull: String,
+/// `--extra-config` document: cluster facts, namespaced per consuming tool.
+///
+/// - Sibling sections tolerated (one file describes a cluster to several tools)
+/// - `[ztest]` itself is strict — see [`ClusterSpec`]
+#[derive(Debug, Deserialize)]
+pub struct ExtraConfig {
+    pub ztest: ClusterSpec,
+}
+
+/// Cluster facts a fetched file may set: strict subset of [`Profile`].
+///
+/// - No `context` — identity is the operator's, never a downloaded file's
+/// - `deny_unknown_fields` = naming one fails loudly instead of being ignored
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterSpec {
+    class: Option<ClusterClass>,
+    push: Option<String>,
+    pull: Option<String>,
+    push_secret: Option<String>,
+    storage_driver: Option<String>,
+    storage_class: Option<String>,
+    snapshot_class: Option<String>,
+}
+
+impl ClusterSpec {
+    /// Overlay onto `profile`; an unset field leaves what is already there
+    pub fn apply_to(self, profile: &mut Profile) {
+        if let Some(class) = self.class {
+            profile.class = class;
+        }
+        let over = |dst: &mut Option<String>, src: Option<String>| {
+            if src.is_some() {
+                *dst = src;
+            }
+        };
+        over(&mut profile.push, self.push);
+        over(&mut profile.pull, self.pull);
+        over(&mut profile.push_secret, self.push_secret);
+        over(&mut profile.storage_driver, self.storage_driver);
+        over(&mut profile.storage_class, self.storage_class);
+        over(&mut profile.snapshot_class, self.snapshot_class);
+    }
+
+    /// `(label, value)` per field the spec actually sets, for the pre-write echo
+    pub fn fields(&self) -> Vec<(&'static str, String)> {
+        let mut out: Vec<(&'static str, String)> = Vec::new();
+        if let Some(class) = self.class {
+            out.push(("class", class.as_str().to_string()));
+        }
+        let pairs: [(&'static str, &Option<String>); 6] = [
+            ("push", &self.push),
+            ("pull", &self.pull),
+            ("push_secret", &self.push_secret),
+            ("storage_driver", &self.storage_driver),
+            ("storage_class", &self.storage_class),
+            ("snapshot_class", &self.snapshot_class),
+        ];
+        out.extend(pairs.iter().filter_map(|(k, v)| v.as_ref().map(|v| (*k, v.clone()))));
+        out
+    }
 }
 
 /// The on-disk store.
@@ -78,17 +137,16 @@ pub struct Config {
 }
 
 /// One named cluster.
+///
+/// - `deny_unknown_fields` guards the migration off `kubeconfig`: a profile still carrying
+///   one would otherwise parse and be ignored, silently retargeting the cluster it names
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
-    /// Kube-context to target, resolved in-memory; the kubeconfig is never
-    /// modified. `None` means the current context.
+    /// Kube-context to target within the ambient kubeconfig, resolved in-memory;
+    /// the file is never modified. `None` means the current context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    /// Kubeconfig holding that context, when not `~/.kube/config`. Sets
-    /// `KUBECONFIG` for the run, so the client, the registry push, and any
-    /// `kubectl` the tests shell out to all read the same file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kubeconfig: Option<String>,
     /// Registry base images are pushed to; also the pull address unless
     /// [`pull`](Self::pull) overrides it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,12 +155,24 @@ pub struct Profile {
     /// address than the builder does.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull: Option<String>,
+    /// `kubernetes.io/dockerconfigjson` Secret in the ztest namespace, mounted
+    /// by the build pod as `DOCKER_CONFIG`. `None` = anonymous push.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub push_secret: Option<String>,
     /// CSI driver backing every volume ztest creates — seeds, snapshots,
     /// caches. A driver rather than a class name, so the StorageClass and
     /// VolumeSnapshotClass cannot be selected from different providers.
     /// `None` follows the cluster's default StorageClass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_driver: Option<String>,
+    /// StorageClass seeding uses, naming it outright instead of resolving it
+    /// from `storage_driver`. Set with `snapshot_class` or not at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+    /// VolumeSnapshotClass seed clones bind through. Needed wherever one driver
+    /// serves several, which driver-matching alone cannot tell apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_class: Option<String>,
     /// Host engine for builds, side-loads, profiling. `None` → [`crate::runtime::active`] resolves
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<ContainerRuntime>,
@@ -143,19 +213,6 @@ pub enum ConfigError {
     #[error("read kubeconfig: {0}")]
     Kubeconfig(#[source] kube::config::KubeconfigError),
 
-    #[error("{path}: no current-context")]
-    NoCurrentContext { path: String },
-
-    #[error("{path}: no context `{context}`")]
-    NoContext { path: String, context: String },
-
-    #[error("{path}: parse `{REGISTRY_EXTENSION}`: {source}")]
-    RegistryExtension {
-        path: String,
-        #[source]
-        source: serde_json::Error,
-    },
-
     #[error("no profile `{name}`; known: {known}")]
     NoProfile { name: String, known: String },
 
@@ -177,10 +234,13 @@ pub enum ProfileError {
     LocalHasRegistry,
     #[error("local profile needs a `kind-` context")]
     LocalNeedsKind,
-    #[error("remote profile has no push address")]
+    #[error("remote profile has no push address; supply one with --extra-config")]
     RemoteNeedsPush,
     #[error("remote profile names a `kind-` context")]
     RemoteHasKind,
+    /// Half a pair silently reverts to driver-matching, which is what naming a class was for
+    #[error("storage_class and snapshot_class are set together or not at all")]
+    HalfPinnedStorage,
 }
 
 impl Profile {
@@ -198,61 +258,25 @@ impl Profile {
         self.context.as_deref()?.strip_prefix("kind-")
     }
 
-    /// Kubeconfig → profile: `current-context` + any `ztest.io/registry` extension
-    /// on that context's cluster (no extension → local)
-    pub fn from_kubeconfig(path: &Path) -> Result<Profile, ConfigError> {
-        let display = path.display();
-        let config = Kubeconfig::read_from(path).map_err(ConfigError::Kubeconfig)?;
-        let context = config
-            .current_context
-            .clone()
-            .ok_or_else(|| ConfigError::NoCurrentContext { path: display.to_string() })?;
-        let cluster_name = config
-            .contexts
-            .iter()
-            .find(|c| c.name == context)
-            .and_then(|c| c.context.as_ref())
-            .map(|c| c.cluster.clone())
-            .ok_or_else(|| ConfigError::NoContext {
-                path: display.to_string(),
-                context: context.clone(),
-            })?;
-        let registry = config
-            .clusters
-            .iter()
-            .find(|c| c.name == cluster_name)
-            .and_then(|c| c.cluster.as_ref())
-            .and_then(|c| c.extensions.as_ref())
-            .and_then(|exts| exts.iter().find(|e| e.name == REGISTRY_EXTENSION))
-            .map(|e| serde_json::from_value::<RegistrySpec>(e.extension.clone()))
-            .transpose()
-            .map_err(|source| ConfigError::RegistryExtension {
-                path: display.to_string(),
-                source,
-            })?;
-
-        // kind contexts are always `kind-<cluster>` = the whole class distinction
-        // (on this machine → node images side-loaded, not pushed)
+    /// Profile targeting an already-present kube-context.
+    ///
+    /// - kind contexts are always `kind-<cluster>` = the whole class distinction
+    ///   (on this machine → node images side-loaded, not pushed)
+    /// - Registry + storage stay unset: cluster facts arrive by `--extra-config`
+    pub fn for_context(context: &str) -> Profile {
         let local = context.starts_with("kind-");
-        let mut profile = Profile {
-            context: Some(context),
-            kubeconfig: (!local).then(|| display.to_string()),
+        Profile {
+            context: Some(context.to_string()),
             class: if local { ClusterClass::Local } else { ClusterClass::Remote },
             ..Default::default()
-        };
-        if let Some(spec) = registry
-            && !local
-        {
-            profile.class = ClusterClass::Remote;
-            // Stored only when it differs (an equal pair stored twice drifts on edit)
-            profile.pull = (spec.pull != spec.push).then_some(spec.pull);
-            profile.push = Some(spec.push);
         }
-        Ok(profile)
     }
 
     /// Reject a `class` disagreeing with the addresses it needs
     pub fn validate(&self) -> Result<(), ProfileError> {
+        if self.storage_class.is_some() != self.snapshot_class.is_some() {
+            return Err(ProfileError::HalfPinnedStorage);
+        }
         match self.class {
             ClusterClass::Local if self.push.is_some() || self.pull.is_some() => {
                 Err(ProfileError::LocalHasRegistry)
@@ -285,9 +309,8 @@ impl Profile {
             (_, push, _) => format!("registry {}", push.unwrap_or("?")),
         };
         format!(
-            "context={}, images={images}{}",
+            "context={}, images={images}",
             self.context.as_deref().unwrap_or("(current kube-context)"),
-            self.kubeconfig.as_deref().map(|p| format!(", kubeconfig={p}")).unwrap_or_default(),
         )
     }
 }
@@ -371,15 +394,16 @@ pub fn active_profile() -> Option<&'static str> {
 
 unsafe fn apply(profile: &Profile, force: bool) {
     unsafe {
-        set("KUBECONFIG", profile.kubeconfig.as_deref(), force);
         set(KUBE_CONTEXT_ENV, profile.context.as_deref(), force);
         set(CLUSTER_CLASS_ENV, Some(profile.class.as_str()), force);
         set(STORAGE_DRIVER_ENV, profile.storage_driver.as_deref(), force);
+        set_storage_pair(profile, force);
         set(RUNTIME_ENV, profile.runtime.map(ContainerRuntime::as_str), force);
         match profile.class {
             ClusterClass::Remote => {
                 set(REGISTRY_ENV, profile.pull_address(), force);
                 set(PUSH_REGISTRY_ENV, profile.push.as_deref(), force);
+                set(PUSH_SECRET_ENV, profile.push_secret.as_deref(), force);
             }
             // Both vars absent → image path resolves to the kind side-loader; only
             // an explicit flag clears a pre-set env
@@ -387,10 +411,46 @@ unsafe fn apply(profile: &Profile, force: bool) {
                 if force {
                     std::env::remove_var(REGISTRY_ENV);
                     std::env::remove_var(PUSH_REGISTRY_ENV);
+                    std::env::remove_var(PUSH_SECRET_ENV);
                 }
             }
         }
     }
+}
+
+/// StorageClass + VolumeSnapshotClass, written together or not at all.
+///
+/// - One occupancy test for both slots: [`set`] skips per variable, so a stale
+///   `ZTEST_STORAGE_CLASS` in the shell would keep its value while the snapshot class took
+///   the profile's — the cross-provider mismatch [`crate::storage_class::StorageOption`]
+///   exists to prevent
+/// - Profile pinning neither + `force` clears both, so an explicit `--cluster` is not
+///   overridden by an ambient pair
+unsafe fn set_storage_pair(profile: &Profile, force: bool) {
+    let occupied = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    let (Some(class), Some(snapshot)) =
+        (profile.storage_class.as_deref(), profile.snapshot_class.as_deref())
+    else {
+        if force {
+            unsafe {
+                std::env::remove_var(STORAGE_CLASS_ENV);
+                std::env::remove_var(SNAPSHOT_CLASS_ENV);
+            }
+        }
+        return;
+    };
+    if pair_writable(force, occupied(STORAGE_CLASS_ENV), occupied(SNAPSHOT_CLASS_ENV)) {
+        unsafe {
+            std::env::set_var(STORAGE_CLASS_ENV, class);
+            std::env::set_var(SNAPSHOT_CLASS_ENV, snapshot);
+        }
+    }
+}
+
+/// One decision covering both slots — either occupied blocks the write, so the pair can
+/// never be assembled half from the shell and half from the profile
+fn pair_writable(force: bool, class_set: bool, snapshot_set: bool) -> bool {
+    force || !(class_set || snapshot_set)
 }
 
 unsafe fn set(key: &str, val: Option<&str>, force: bool) {
@@ -537,7 +597,7 @@ mod tests {
 
     #[test]
     fn a_profile_with_no_class_is_local() {
-        let cfg: Config = toml::from_str("[clusters.c]\nkind_cluster = \"k\"\n").unwrap();
+        let cfg: Config = toml::from_str("[clusters.c]\ncontext = \"kind-k\"\n").unwrap();
         assert_eq!(cfg.clusters["c"].class, ClusterClass::Local);
     }
 
@@ -596,69 +656,62 @@ mod tests {
         assert!(Profile::default().summary().contains("kind (default)"));
     }
 
-    /// Named per test: parallel runs + a shared path = one test's cleanup deletes
-    /// the file another is reading
-    fn write_kubeconfig(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ztest-kc-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
-        path
-    }
-
+    /// A remote profile carries identity only — registry facts arrive by `--extra-config`,
+    /// so it is incomplete until one does
     #[test]
-    fn a_kubeconfig_with_a_registry_extension_yields_a_remote_profile() {
-        let path = write_kubeconfig(
-            "remote.yaml",
-            "apiVersion: v1\n\
-             current-context: prod\n\
-             clusters:\n\
-             - name: prod-cluster\n  \
-               cluster:\n    \
-                 server: https://example:6443\n    \
-                 extensions:\n    \
-                 - name: ztest.io/registry\n      \
-                   extension:\n        \
-                     push: route.example/img\n        \
-                     pull: svc:5000/img\n\
-             contexts:\n\
-             - name: prod\n  \
-               context:\n    \
-                 cluster: prod-cluster\n",
-        );
-        let p = Profile::from_kubeconfig(&path).unwrap();
+    fn a_bare_remote_profile_is_incomplete_until_facts_arrive() {
+        let p = Profile::for_context("prod");
         assert_eq!(p.class, ClusterClass::Remote);
-        assert_eq!(p.context.as_deref(), Some("prod"));
-        assert_eq!(p.push.as_deref(), Some("route.example/img"));
-        assert_eq!(p.pull.as_deref(), Some("svc:5000/img"));
-        assert!(p.validate().is_ok());
-        std::fs::remove_file(&path).ok();
+        assert_eq!(p.push, None);
+        assert!(matches!(p.validate(), Err(ProfileError::RemoteNeedsPush)));
     }
 
-    /// Equal pair = one address; recording twice lets the two drift
+    /// `kubeconfig` used to decide which cluster a profile hit. Parsing a stale one as an
+    /// ignorable extra would retarget it silently, which is the worst outcome available
     #[test]
-    fn an_equal_push_and_pull_records_only_push() {
-        let path = write_kubeconfig(
-            "equal.yaml",
-            "apiVersion: v1\n\
-             current-context: c\n\
-             clusters:\n\
-             - name: cl\n  \
-               cluster:\n    \
-                 server: https://example:6443\n    \
-                 extensions:\n    \
-                 - name: ztest.io/registry\n      \
-                   extension:\n        \
-                     push: ghcr.io/z\n        \
-                     pull: ghcr.io/z\n\
-             contexts:\n\
-             - name: c\n  \
-               context:\n    \
-                 cluster: cl\n",
-        );
-        let p = Profile::from_kubeconfig(&path).unwrap();
-        assert_eq!(p.pull, None);
-        assert_eq!(p.pull_address(), Some("ghcr.io/z"));
-        std::fs::remove_file(&path).ok();
+    fn a_profile_left_carrying_kubeconfig_fails_to_load() {
+        let stale = "[clusters.prod]\ncontext = \"prod\"\nkubeconfig = \"/home/me/other\"\n";
+        let err = toml::from_str::<Config>(stale).expect_err("must not be ignored").to_string();
+        assert!(err.contains("kubeconfig"), "{err}");
+    }
+
+    /// A stale `ZTEST_STORAGE_CLASS` in the shell used to keep its value while the snapshot
+    /// class took the profile's — a cross-provider pair nothing downstream rejects
+    #[test]
+    fn a_storage_pair_is_written_whole_or_not_at_all() {
+        assert!(pair_writable(false, false, false), "clean env takes the profile's pair");
+        assert!(!pair_writable(false, true, false), "a stale class must block both");
+        assert!(!pair_writable(false, false, true), "a stale snapshot class must block both");
+        assert!(pair_writable(true, true, true), "--cluster overrides both together");
+    }
+
+    /// `kind-` prefix is the whole class distinction, whichever flag supplied the context
+    #[test]
+    fn a_context_names_its_own_class() {
+        assert_eq!(Profile::for_context("kind-zkn").class, ClusterClass::Local);
+        assert_eq!(Profile::for_context("admin@prod").class, ClusterClass::Remote);
+        assert_eq!(Profile::for_context("kind-zkn").kind_cluster(), Some("zkn"));
+    }
+
+    /// Half a pair silently reverts to driver-matching — the thing naming a class avoids
+    #[test]
+    fn a_pinned_storage_class_needs_its_snapshot_class() {
+        let pinned = |sc: Option<&str>, vsc: Option<&str>| Profile {
+            class: ClusterClass::Remote,
+            push: Some("r".into()),
+            storage_class: sc.map(str::to_string),
+            snapshot_class: vsc.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(matches!(
+            pinned(Some("topolvm-thin"), None).validate(),
+            Err(ProfileError::HalfPinnedStorage)
+        ));
+        assert!(matches!(
+            pinned(None, Some("ztest-snapshot")).validate(),
+            Err(ProfileError::HalfPinnedStorage)
+        ));
+        assert!(pinned(Some("topolvm-thin"), Some("ztest-snapshot")).validate().is_ok());
+        assert!(pinned(None, None).validate().is_ok());
     }
 }

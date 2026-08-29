@@ -14,9 +14,9 @@ kind 0.30.0, against live kind clusters under both engines.
 ## Scope
 
 Only **host-side** paths are affected: `dev!` image builds, the `local_bake`
-runner bake, kind side-loading, and the host-placed profiler. The
-OpenShift/BuildKit path builds on-cluster and spawns no container CLI, so the
-runtime is irrelevant there. Nothing in-pod resolves a runtime — the driver pod
+runner bake, kind side-loading, and the host-placed profiler. The remote
+BuildKit path builds on-cluster and spawns no CLI at all, so the runtime is
+irrelevant there. Nothing in-pod resolves a runtime — the driver pod
 has neither engine installed.
 
 ## Layout

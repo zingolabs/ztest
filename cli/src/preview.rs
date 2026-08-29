@@ -199,7 +199,7 @@ fn row(label: &str, kind: TransferKind, progress: TransferProgress) -> TransferR
 fn demo_state() -> BannerState {
     BannerState {
         cluster: ClusterState {
-            context: "crc-remote".to_string(),
+            context: "zingo-infra".to_string(),
             slots_used: 3,
             slots_total: 16,
             slots_configured: 8,

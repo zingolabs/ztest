@@ -493,7 +493,7 @@ mod tests {
     }
 
     /// One node, idle build co-tenant (usage ≤ request), as in a post-build test wave
-    fn crc_with_idle_buildkit() -> ClusterCapacity {
+    fn cluster_with_idle_buildkit() -> ClusterCapacity {
         let nodes = vec![node(true, false, "72", "48Gi")];
         let pods = vec![burstable_pod("n1", BUILDKIT_REQ, BUILDKIT_LIM)];
         capacity_from(&nodes, &pods, &[])
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn free_credits_idle_build_pod_at_request_not_limit() {
-        let cap = crc_with_idle_buildkit();
+        let cap = cluster_with_idle_buildkit();
         let free = cap.free();
         // Free = allocatable − request, not − limit
         let expected = cap.allocatable.saturating_sub(&BUILDKIT_REQ);
@@ -518,7 +518,7 @@ mod tests {
         use crate::qos::QosClass;
         use crate::qos::scheduler::{Admission, Request, Scheduler};
 
-        let cap = crc_with_idle_buildkit();
+        let cap = cluster_with_idle_buildkit();
         // Seeded as `ztest run` does: `qos_plan_from` + the engine scheduler both take
         // `ClusterCapacity::free()` as the ceiling
         let mut sched = Scheduler::new(cap.free());

@@ -30,8 +30,8 @@ pub enum Need {
     Required,
     /// `ztest cluster setup` provisions it: blocks a run, never blocks setup itself
     Provisioned,
-    /// Operator's to provide, but no input to `ztest cluster setup` (which reaches the
-    /// cluster over the kube API alone) → blocks a run, never blocks setup
+    /// Required, but no input to `ztest cluster setup` (which reaches the cluster over
+    /// the kube API alone) → blocks a run, never blocks setup
     RequiredForRun,
     Enables(&'static str),
 }
@@ -161,7 +161,8 @@ pub async fn probe(client: &Client) -> Report {
         cap(STORAGE, Required, DOC_STORAGE, storage(client)),
         cap(SNAPSHOT_API, Required, DOC_STORAGE, snapshot_api(client)),
         cap(SNAPSHOT_CONTROLLER, Required, DOC_STORAGE, snapshot_controller(client)),
-        cap("host toolchain", Required, DOC_TOOLING, now(tooling(class))),
+        // Setup spawns none of these, so a gap here must not gate it (`Need` docs)
+        cap("host toolchain", RequiredForRun, DOC_TOOLING, now(tooling(class))),
         cap("node capacity", builds, DOC_CAPACITY, capacity(client)),
         // A local cluster has no registry to check and no other way in: probe the path itself
         match class {
@@ -400,8 +401,8 @@ async fn storage(client: &Client) -> Finding {
     }
 }
 
-/// Names the snapshot-controller Deployment publishes itself under. Upstream
-/// external-snapshotter first, OpenShift's fork second
+/// Names the snapshot-controller Deployment publishes itself under — upstream
+/// external-snapshotter first, then the labels distro repackagings use
 const CONTROLLER_SELECTORS: [(&str, &str); 3] = [
     ("app.kubernetes.io/name", "snapshot-controller"),
     ("app", "snapshot-controller"),
@@ -476,7 +477,7 @@ async fn permissions(client: &Client, backend: ClusterClass) -> Finding {
 }
 
 /// Would the BuildKit pod be admitted? Answered by submitting the real spec with
-/// `dryRun`, so PSA level, SCC selection and every admission webhook vote for real
+/// `dryRun`, so PSA level and every admission webhook vote for real
 async fn admission(client: &Client) -> Finding {
     match crate::resource::probe_build_admission(client).await {
         Ok(()) => Finding::Present("rootless BuildKit posture accepted".into()),
@@ -491,12 +492,12 @@ async fn admission(client: &Client) -> Finding {
 ///
 /// - `cargo` (`cargo metadata`) + `git`/`tar` (build context = `git ls-files` piped
 ///   through `tar`) are on every path
-/// - `oc` is the on-cluster compile's only transport for shipping context in and copying
-///   the inventory back; `kind` side-loads where there is no registry
+/// - `kind` side-loads where there is no registry; the remote path adds nothing (context
+///   in and inventory out ride `kube`'s own `exec`)
 fn tools(class: ClusterClass) -> &'static [&'static str] {
     match class {
         ClusterClass::Local => &["cargo", "git", "tar", "kind"],
-        ClusterClass::Remote => &["cargo", "git", "tar", "oc"],
+        ClusterClass::Remote => &["cargo", "git", "tar"],
     }
 }
 
@@ -926,14 +927,15 @@ mod tests {
         }
     }
 
-    /// `oc` is the on-cluster compile's transport and `kind` the local side-loader —
-    /// neither is needed on the other class, and a run fails at spawn without its own
+    /// `kind` is the local side-loader; the remote path spawns no cluster CLI at all, so
+    /// a kube-native transport must never reappear as a host-binary requirement
     #[test]
     fn each_cluster_class_names_the_binaries_its_own_path_spawns() {
-        assert!(tools(ClusterClass::Remote).contains(&"oc"));
-        assert!(!tools(ClusterClass::Remote).contains(&"kind"));
         assert!(tools(ClusterClass::Local).contains(&"kind"));
-        assert!(!tools(ClusterClass::Local).contains(&"oc"));
+        assert!(!tools(ClusterClass::Remote).contains(&"kind"));
+        for cli in ["oc", "kubectl"] {
+            assert!(!tools(ClusterClass::Remote).contains(&cli), "remote path spawns {cli}");
+        }
         for class in [ClusterClass::Local, ClusterClass::Remote] {
             for shared in ["cargo", "git", "tar"] {
                 assert!(tools(class).contains(&shared), "{class:?} drops {shared}");

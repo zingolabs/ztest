@@ -4,15 +4,17 @@
 //!   [`docker/runner.Dockerfile`](RUNNER_DOCKERFILE) in the ephemeral BuildKit pod
 //! - Laptop ships *source* as the build context; build compiles, assembles + pushes the image
 //! - Inventory (`list.json` + framed `inventory.jsonl`) exported `--output type=local`,
-//!   `oc cp`'d back, parsed exactly as the laptop path parses a dump
+//!   streamed back over `exec`, parsed exactly as the laptop path parses a dump
+//! - Every cluster call rides `kube` — no host CLI on the remote path
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, AttachParams, TerminalSize};
+use kube::api::{Api, AttachParams, AttachedProcess, TerminalSize};
 use tokio::io::AsyncReadExt as _;
 
 use crate::naming::RUN_NAMESPACE;
@@ -88,7 +90,7 @@ pub async fn compile_on_cluster(
     let ctx_dir = format!("{WORK_MOUNT}/ctx");
     emit(Phase::Start("syncing source to the build pod"));
     let t = Instant::now();
-    ship_source(&src, pod, &ctx_dir)?;
+    ship_source(&api, &src, pod, &ctx_dir).await?;
     stage_dockerfile(&api, pod, &ctx_dir).await?;
     emit(Phase::Done { label: "source synced", dur: t.elapsed() });
 
@@ -110,7 +112,7 @@ pub async fn compile_on_cluster(
             shell_quote(&runner_ref),
             crate::backends::image::IMAGE_OUTPUT_COMPRESSION,
         ),
-        Some(registry_host(&runner_ref)),
+        Push::Yes,
     );
     let (tail_out, code) = match compile_out {
         Some(CompileOut::Pty { size, sink }) => exec_tty(&api, pod, &build_cmd, size, sink).await?,
@@ -133,7 +135,7 @@ pub async fn compile_on_cluster(
     emit(Phase::Done { label: "runner image built + pushed", dur: t.elapsed() });
 
     // 3. Second build of the `inventory-export` stage writes list.json + inventory.jsonl
-    //    into the pod, `oc cp` brings them back (layer + cache-mount reuse → no re-compile)
+    //    into the pod, streamed back over `exec` (layer + cache-mount reuse → no re-compile)
     emit(Phase::Start("dumping test inventory"));
     let t = Instant::now();
     let inv_dir = format!("{WORK_MOUNT}/inv");
@@ -143,13 +145,13 @@ pub async fn compile_on_cluster(
         &nextest_args,
         &workspace_rel,
         &format!("--output type=local,dest={}", shell_quote(&inv_dir)),
-        None,
+        Push::No,
     );
     let (_o, inv_err, inv_code) = exec_capture(&api, pod, &inv_cmd).await?;
     if inv_code != 0 {
         return Err(format!("inventory export exited {inv_code}:\n{}", tail(&inv_err, 40)).into());
     }
-    let local = oc_cp_from_pod(pod, &inv_dir)?;
+    let local = fetch_inventory(&api, pod, &inv_dir).await?;
     let list_json = std::fs::read_to_string(local.path().join("list.json"))
         .map_err(|e| format!("read exported list.json: {e}"))?;
     let inventory = std::fs::read_to_string(local.path().join("inventory.jsonl"))
@@ -203,10 +205,18 @@ pub fn assemble_outcome(
     Ok(RemoteCompileOutcome { build, dump, qos_by_binary, runner_image_ref })
 }
 
+/// Whether this stage pushes, hence whether it needs registry credentials
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Push {
+    Yes,
+    No,
+}
+
 /// `buildctl build` shell for one Dockerfile stage in the build pod.
 ///
-/// - `push_host` set → docker `config.json` written from the pod SA token (service-ca TLS
-///   already trusted through the system store)
+/// - Pushing stage + a configured push Secret → point `DOCKER_CONFIG` at its mount;
+///   unset = anonymous push, which is every registry reachable only in-cluster
+/// - Credentials are the Secret's to hold: no token is minted, printed or logged here
 /// - Builds `target` from `ctx` with `NEXTEST_ARGS`/`WORKSPACE_REL` build-args
 fn buildctl_cmd(
     ctx: &str,
@@ -214,18 +224,13 @@ fn buildctl_cmd(
     nextest_args: &str,
     workspace_rel: &str,
     output: &str,
-    push_host: Option<String>,
+    push: Push,
 ) -> String {
-    let auth = match push_host {
-        Some(host) => format!(
-            "export DOCKER_CONFIG=/tmp/.docker\n\
-             mkdir -p \"$DOCKER_CONFIG\"\n\
-             TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\n\
-             AUTH=$(printf 'ztest:%s' \"$TOKEN\" | base64 | tr -d '\\n')\n\
-             printf '{{\"auths\":{{\"%s\":{{\"auth\":\"%s\"}}}}}}' {host} \"$AUTH\" > \"$DOCKER_CONFIG/config.json\"\n",
-            host = shell_quote(&host),
-        ),
-        None => String::new(),
+    let auth = match (push, crate::backends::image::push_secret()) {
+        (Push::Yes, Some(_)) => {
+            format!("export DOCKER_CONFIG={}\n", crate::resource::impls::buildkit::REGISTRY_MOUNT)
+        }
+        _ => String::new(),
     };
     format!(
         "set -eu\n\
@@ -261,29 +266,40 @@ async fn stage_dockerfile(
     Ok(())
 }
 
-fn oc_cp_from_pod(pod: &str, dir: &str) -> Result<TempDir, crate::error::PipelineError> {
+/// Exported inventory back to a local dir: `tar -c` in the pod, `tar -x` here.
+///
+/// - Two small files (`list.json` + `inventory.jsonl`) → collected whole, not streamed
+async fn fetch_inventory(
+    api: &Api<Pod>,
+    pod: &str,
+    dir: &str,
+) -> Result<TempDir, crate::error::PipelineError> {
+    use std::io::Write as _;
+
     let local = TempDir::new("ztest-inv")?;
-    let mut cmd = std::process::Command::new("oc");
-    cmd.arg("cp");
-    if let Some(ctx) =
-        std::env::var_os(crate::cluster_config::KUBE_CONTEXT_ENV).filter(|v| !v.is_empty())
-    {
-        cmd.arg("--context").arg(ctx);
-    }
-    cmd.args([
-        "-n",
-        RUN_NAMESPACE,
-        "-c",
-        BUILDKIT_CONTAINER,
-        &format!("{pod}:{dir}"),
-        &local.path().to_string_lossy(),
-    ])
-    .stdout(Stdio::null())
-    .stderr(Stdio::piped());
-    let out = cmd.output().map_err(|e| format!("spawn `oc cp` (is `oc` on PATH?): {e}"))?;
+    let archive =
+        stream_from_pod(api, pod, &format!("tar -cf - -C {d} .", d = shell_quote(dir))).await?;
+
+    let mut untar = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg("-")
+        .arg("-C")
+        .arg(local.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn local `tar -x` (is `tar` on PATH?): {e}"))?;
+    untar
+        .stdin
+        .take()
+        .expect("tar stdin is piped")
+        .write_all(&archive)
+        .map_err(|e| format!("write inventory archive to local `tar`: {e}"))?;
+    let out = untar.wait_with_output().map_err(|e| format!("wait for local `tar -x`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "oc cp of exported inventory failed:\n{}",
+            "unpacking the exported inventory failed:\n{}",
             tail(&String::from_utf8_lossy(&out.stderr), 40)
         )
         .into());
@@ -459,6 +475,109 @@ async fn exec_capture(
     cmd: &str,
 ) -> Result<(String, String, i32), crate::error::PipelineError> {
     exec_streamed(api, pod, cmd, None).await
+}
+
+// ── Binary exec: tar over the websocket ───────────────────────────────
+//
+// The [`OUTER`] wrapper reports its exit code as a sentinel *on stdout*, unusable where
+// stdout carries a tar stream. These two take the code off the websocket's status channel
+// instead, leaving the payload byte-exact.
+
+/// Feed `cmd`'s stdin from `chunks`; stdout discarded, stderr kept for the error.
+async fn stream_into_pod(
+    api: &Api<Pod>,
+    pod: &str,
+    cmd: &str,
+    mut chunks: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> Result<(), crate::error::PipelineError> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let ap = AttachParams::default()
+        .container(BUILDKIT_CONTAINER)
+        .stdin(true)
+        .stdout(false)
+        .stderr(true);
+    let mut attached = api
+        .exec(pod, ["sh", "-c", cmd], &ap)
+        .await
+        .map_err(|e| format!("exec in build pod {pod}: {e}"))?;
+    let status = attached.take_status();
+
+    let mut stdin = attached.stdin().ok_or_else(|| "exec stdin not attached".to_string())?;
+    let stderr = attached.stderr();
+    let (wrote, err) = tokio::join!(
+        async {
+            while let Some(chunk) = chunks.recv().await {
+                stdin.write_all(&chunk).await?;
+            }
+            stdin.shutdown().await
+        },
+        drain(stderr),
+    );
+    wrote.map_err(|e| format!("write exec stdin: {e}"))?;
+    exit_ok(attached, status, &err).await
+}
+
+/// `cmd`'s stdout collected whole; stderr kept for the error.
+async fn stream_from_pod(
+    api: &Api<Pod>,
+    pod: &str,
+    cmd: &str,
+) -> Result<Vec<u8>, crate::error::PipelineError> {
+    let ap = AttachParams::default()
+        .container(BUILDKIT_CONTAINER)
+        .stdin(false)
+        .stdout(true)
+        .stderr(true);
+    let mut attached = api
+        .exec(pod, ["sh", "-c", cmd], &ap)
+        .await
+        .map_err(|e| format!("exec in build pod {pod}: {e}"))?;
+    let status = attached.take_status();
+
+    let mut stdout = attached.stdout().ok_or_else(|| "exec stdout not attached".to_string())?;
+    let stderr = attached.stderr();
+    let (read, err) = tokio::join!(
+        async {
+            let mut buf = Vec::new();
+            stdout.read_to_end(&mut buf).await.map(|_| buf)
+        },
+        drain(stderr),
+    );
+    let out = read.map_err(|e| format!("read exec stdout: {e}"))?;
+    exit_ok(attached, status, &err).await?;
+    Ok(out)
+}
+
+async fn drain(stream: Option<impl tokio::io::AsyncRead + Unpin>) -> String {
+    let Some(mut s) = stream else { return String::new() };
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Status channel resolves only once the streams are done and the process joined
+async fn exit_ok(
+    attached: AttachedProcess,
+    status: Option<
+        impl Future<Output = Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>>,
+    >,
+    stderr: &str,
+) -> Result<(), crate::error::PipelineError> {
+    let _ = attached.join().await;
+    match status {
+        Some(fut) => match fut.await {
+            Some(s) if s.status.as_deref() == Some("Success") => Ok(()),
+            Some(s) => Err(format!(
+                "{}\n{}",
+                s.message.unwrap_or_else(|| "command failed in the build pod".into()),
+                tail(stderr, 40)
+            )
+            .into()),
+            None => Err(format!("no exit status from the build pod\n{}", tail(stderr, 40)).into()),
+        },
+        None => Err(format!("no status channel on the exec\n{}", tail(stderr, 40)).into()),
+    }
 }
 
 /// Split the trailing `ZTEST_EXIT=<n>` off captured stdout → (clean output, code).
@@ -665,8 +784,8 @@ fn common_ancestor(dirs: &BTreeSet<PathBuf>) -> Option<PathBuf> {
 /// Build context = per-repo `git ls-files` streamed as a local tar, ancestor-relative
 /// (cargo path-deps + `CARGO_MANIFEST_DIR` mounts resolve identically under `/src`).
 ///
-/// - `oc rsync` unusable: buildkit image ships no `rsync`, its tar fallback *walks* the
-///   excluded `target/` trees instead of pruning
+/// - `tar` over `exec`, not a sync tool: the buildkit image ships no `rsync`, and a
+///   directory-walking copy descends the excluded `target/` trees instead of pruning
 /// - Chain archives are gitignored, so `--exclude-standard` drops them here: the build
 ///   context never sees a multi-GB payload, and a seed is addressed by its manifest
 /// - Total bounded by [`CONTEXT_MAX_BYTES`], offender-naming error (a silent multi-GB stall
@@ -734,8 +853,8 @@ fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, crate::error::Pi
         return Err(oversized_context(total, sized).into());
     }
 
-    // `-T <file>` leaves tar's stdin free (feeding the list over stdin while `oc` drains
-    // stdout can deadlock)
+    // `-T <file>` leaves tar's stdin free (feeding the list in while draining its stdout
+    // from the same task can deadlock)
     let list_path = tmp.path().join("files.0");
     std::fs::write(&list_path, &list).map_err(|e| format!("write tar file list: {e}"))?;
 
@@ -753,54 +872,60 @@ struct SourceStream {
     _tmp: TempDir,
 }
 
-fn ship_source(
+/// Local `tar -c` piped over `exec` into `tar -x` in the build pod.
+///
+/// - Bounded channel = backpressure (`tar` blocks once the websocket falls behind)
+/// - `tar`'s stderr drained on its own thread (a full pipe deadlocks the stdout reader)
+async fn ship_source(
+    api: &Api<Pod>,
     src: &SourceLayout,
     pod: &str,
     ctx_dir: &str,
 ) -> Result<(), crate::error::PipelineError> {
     let mut stream = spawn_source_tar(src)?;
-    let tar_child = &mut stream.child;
-    let tar_stdout = tar_child.stdout.take().expect("tar stdout is piped");
-    let mut tar_stderr = tar_child.stderr.take().expect("tar stderr is piped");
-    // Drain tar's stderr on a thread (a full pipe would deadlock against the `oc` we block on)
-    let tar_err = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = std::io::Read::read_to_string(&mut tar_stderr, &mut s);
-        s
+    let mut tar_stdout = stream.child.stdout.take().expect("tar stdout is piped");
+    let mut tar_stderr = stream.child.stderr.take().expect("tar stderr is piped");
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(CONTEXT_CHUNKS_IN_FLIGHT);
+    let pump = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        use std::io::Read as _;
+
+        let errs = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut tar_stderr, &mut s);
+            s
+        });
+
+        let mut buf = vec![0u8; CONTEXT_CHUNK_BYTES];
+        loop {
+            match tar_stdout.read(&mut buf) {
+                Ok(0) => break,
+                // Receiver gone = the exec already failed; its error is the useful one
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => return Err(format!("read local `tar`: {e}")),
+            }
+        }
+        drop(tar_stdout);
+
+        let status = stream.child.wait().map_err(|e| format!("wait for local `tar`: {e}"))?;
+        let errs = errs.join().unwrap_or_default();
+        match status.success() {
+            true => Ok(()),
+            false => Err(format!("local `tar` of source failed ({status}):\n{}", tail(&errs, 40))),
+        }
     });
 
-    let mut oc = std::process::Command::new("oc");
-    oc.arg("exec").arg("-i").args(["-n", RUN_NAMESPACE, "-c", BUILDKIT_CONTAINER]);
-    if let Some(ctx) =
-        std::env::var_os(crate::cluster_config::KUBE_CONTEXT_ENV).filter(|v| !v.is_empty())
-    {
-        oc.arg("--context").arg(ctx);
-    }
-    oc.arg(pod)
-        .arg("--")
-        .args(["sh", "-c"])
-        .arg(format!("mkdir -p {c} && exec tar -xf - -C {c}", c = shell_quote(ctx_dir)))
-        .stdin(Stdio::from(tar_stdout))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let oc_out = oc.output().map_err(|e| format!("spawn `oc exec` (is `oc` on PATH?): {e}"))?;
+    let cmd = format!("mkdir -p {c} && exec tar -xf - -C {c}", c = shell_quote(ctx_dir));
+    let shipped = stream_into_pod(api, pod, &cmd, rx).await;
+    let pumped = pump.await.map_err(|e| format!("source pump panicked: {e}"))?;
 
-    let tar_status = tar_child.wait().map_err(|e| format!("wait for local `tar`: {e}"))?;
-    let tar_err = tar_err.join().unwrap_or_default();
-    if !tar_status.success() {
-        return Err(format!(
-            "local `tar` of source failed ({tar_status}):\n{}",
-            tail(&tar_err, 40)
-        )
-        .into());
-    }
-    if !oc_out.status.success() {
-        return Err(format!(
-            "streaming source into the build pod failed:\n{}",
-            tail(&String::from_utf8_lossy(&oc_out.stderr), 40)
-        )
-        .into());
-    }
+    // Exec failure wins: a torn-down websocket SIGPIPEs `tar`, whose status would mask it
+    shipped.map_err(|e| format!("streaming source into the build pod failed:\n{e}"))?;
+    pumped?;
     Ok(())
 }
 
@@ -838,6 +963,12 @@ pub fn extract_source_to(
 /// Ceiling on the shipped build context (first-party source = a few MiB, so orders of
 /// headroom while still catching a stray artifact before it reads as a hung cluster)
 const CONTEXT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read size off the local `tar`, matched to the websocket's own framing
+const CONTEXT_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Queue depth between `tar` and the websocket — the backpressure window
+const CONTEXT_CHUNKS_IN_FLIGHT: usize = 4;
 
 /// Env override for [`CONTEXT_MAX_BYTES`], k8s-style quantity (`512Mi`, `2Gi`) — escape
 /// hatch so the ceiling never becomes a reason to disable the check
@@ -879,11 +1010,6 @@ fn bytes(n: u64) -> String {
 }
 
 // ── small helpers ─────────────────────────────────────────────────────
-
-/// Leading `host[:port]` of `host[:port]/project/repo[:tag]`
-fn registry_host(reference: &str) -> String {
-    reference.split('/').next().unwrap_or(reference).to_string()
-}
 
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -996,10 +1122,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_host_strips_project_and_tag() {
-        assert_eq!(
-            registry_host("image-registry.svc:5000/ztest-images/ztest-runner:dev-abc"),
-            "image-registry.svc:5000"
-        );
+    fn push_stage_without_a_secret_writes_no_auth_prelude() {
+        let cmd = buildctl_cmd("/build/ctx", "runner", "", ".", "--output type=image", Push::Yes);
+        assert!(!cmd.contains("DOCKER_CONFIG"), "unexpected auth prelude: {cmd}");
     }
 }

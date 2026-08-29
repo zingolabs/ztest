@@ -19,7 +19,7 @@ use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 /// Identity a remote kubeconfig authenticates as
 pub const RUN_CLUSTER_ROLE: &str = "ztest-remote";
 /// Non-expiring token Secret for the run SA. Read with
-/// `oc -n ztest get secret ztest-token -o jsonpath='{.data.token}' | base64 -d`
+/// `kubectl -n ztest get secret ztest-token -o jsonpath='{.data.token}' | base64 -d`
 pub const RUN_TOKEN_SECRET: &str = "ztest-token";
 
 /// SA the BuildKit build pod ([`crate::resource::impls::buildkit`]) runs as
@@ -276,7 +276,7 @@ fn rules_hash(role: &ClusterRole) -> Option<String> {
 
 /// Run SA + `ztest-remote` ClusterRole/binding + non-expiring token Secret.
 ///
-/// - RUN-only: no rbac-write, no SCC-write, no secrets read (token cannot escalate)
+/// - RUN-only: no rbac-write, no policy-write, no secrets read (token cannot escalate)
 /// - `backend` gates backend-specific rules in both the rendered role and its hash
 #[derive(Debug)]
 pub struct RunIdentityProvider {
@@ -363,7 +363,7 @@ impl Provider for RunIdentityProvider {
             })?;
 
         // Typed service-account-token Secret = stable workstation/CI credential
-        // (`oc create token` is short-lived on 4.11+)
+        // (`kubectl create token` is audience-bound + short-lived)
         let secret: Secret = serde_json::from_value(json!({
             "apiVersion": "v1",
             "kind": "Secret",

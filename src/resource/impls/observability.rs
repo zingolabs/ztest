@@ -114,8 +114,8 @@ fn prometheus_args() -> Vec<String> {
 /// - Rest promote pod labels to series labels → a run stays selectable once its
 ///   namespace is gone
 /// - `kubelet-cadvisor` — cpu/mem/io-stall a component cannot publish about itself; via
-///   the apiserver proxy, not node:10250 (kubelet serving certs are per-cluster and CRC's
-///   are not in any CA the pod trusts)
+///   the apiserver proxy, not node:10250 (kubelet serving certs are per-cluster, commonly
+///   signed by a CA no pod trusts)
 /// - PSI pair kept together: `stalled` (cgroup `full`) = every task blocked, so throughput
 ///   lost; `waiting` (`some`) = one task blocked, near-always nonzero on a threaded
 ///   process. Either alone misleads — `full` under-reports a partial stall, `some`
@@ -700,10 +700,18 @@ async fn apply_stack(cx: &Cx) -> Result<(), crate::error::PipelineError> {
     // One resolution for both: a split here is how a stack ends up half on a test driver
     let class = crate::storage_class::plain_class(client, OBS_CLASS_ENV).await;
     let class = class.as_deref();
-    apply(&claims, &pvc(&format!("{PROMETHEUS_SERVICE}-data"), &prometheus_size(), class), WHAT)
-        .await?;
-    apply(&claims, &pvc(&format!("{PYROSCOPE_SERVICE}-data"), &pyroscope_size(), class), WHAT)
-        .await?;
+    apply_claim(
+        &claims,
+        &pvc(&format!("{PROMETHEUS_SERVICE}-data"), &prometheus_size(), class),
+        WHAT,
+    )
+    .await?;
+    apply_claim(
+        &claims,
+        &pvc(&format!("{PYROSCOPE_SERVICE}-data"), &pyroscope_size(), class),
+        WHAT,
+    )
+    .await?;
 
     apply(&deployments, &prometheus_deployment(), WHAT).await?;
     apply(&deployments, &pyroscope_deployment(), WHAT).await?;
@@ -723,6 +731,56 @@ async fn apply_stack(cx: &Cx) -> Result<(), crate::error::PipelineError> {
     )
     .await?;
     apply(&services, &service(GRAFANA_SERVICE, "grafana", GRAFANA_PORT), WHAT).await
+}
+
+/// Create-if-absent, then grow — a bound PVC is not applyable.
+///
+/// - Spec is immutable once bound, so re-applying a drifted `storageClassName` (profile's
+///   `storage_driver` changed under a cluster that already has the stack) is a 422 that
+///   takes the whole stack down with it
+/// - An existing claim's class is a fact, not a preference (changing it = moving the data)
+/// - `resources.requests` is one of the two mutable fields → a raised size still lands
+/// - Shrink is a no-op, never an error (k8s rejects it, and the size is env-tunable)
+async fn apply_claim(
+    claims: &Api<PersistentVolumeClaim>,
+    desired: &PersistentVolumeClaim,
+    what: &str,
+) -> Result<(), crate::error::PipelineError> {
+    use kube::api::{Patch, PatchParams, PostParams};
+
+    let name = desired
+        .metadata
+        .name
+        .as_deref()
+        .ok_or_else(|| format!("{what}: claim has no metadata.name"))?;
+    let Some(live) = claims.get_opt(name).await.map_err(|e| format!("{what}: read {name}: {e}"))?
+    else {
+        claims
+            .create(&PostParams::default(), desired)
+            .await
+            .map_err(|e| format!("{what}: create {name}: {e}"))?;
+        return Ok(());
+    };
+
+    let (want, have) = (claim_storage(desired), claim_storage(&live));
+    let bytes = |q: Option<&Quantity>| {
+        q.and_then(|q| crate::qos::units::parse_mem_bytes_opt(&q.0)).unwrap_or(0)
+    };
+    if bytes(want) <= bytes(have) {
+        return Ok(());
+    }
+    let grow = serde_json::json!({
+        "spec": { "resources": { "requests": { "storage": want.map(|q| q.0.as_str()) } } }
+    });
+    claims
+        .patch(name, &PatchParams::default(), &Patch::Merge(&grow))
+        .await
+        .map_err(|e| format!("{what}: grow {name}: {e}"))?;
+    Ok(())
+}
+
+fn claim_storage(claim: &PersistentVolumeClaim) -> Option<&Quantity> {
+    claim.spec.as_ref()?.resources.as_ref()?.requests.as_ref()?.get("storage")
 }
 
 /// Create-if-absent, never apply — a re-provision must not clobber the retirements
@@ -796,6 +854,9 @@ impl Provider for ObservabilityProvider {
         apply_stack(cx).await.map_err(|e| ResourceError::Provision(e.to_string()))?;
 
         for name in DEPLOYMENTS {
+            // Before the wait, not after: a stranded pod holds the replica *and* the RWO
+            // mount, so the rollout below cannot start until it is gone
+            reap_unmanaged(cx, name).await;
             if let Err(timeout) = crate::resource::kube::wait_deployment_available(
                 &cx.client,
                 OBS_NAMESPACE,
@@ -878,6 +939,43 @@ async fn stalled_because(cx: &Cx, deployment: &str) -> Option<String> {
             .and_then(|c| c.message.clone())?;
         Some(format!("pod is {phase} — {reason}"))
     })
+}
+
+/// Delete stack pods the kubelet has stopped managing, so the ReplicaSet can replace them.
+///
+/// - Deployment counts a stranded pod as its one replica → no replacement is ever created
+/// - k8s pod GC reaps these only when the *node* is deleted (single-node cluster → never)
+/// - Liveness cannot cover it (kubelet-enforced, and the lost kubelet is the failure)
+/// - Grace 0: `Recreate` over RWO → the replacement blocks on the mount until the object is gone
+///
+/// Best-effort — a failed delete leaves the rollout wait to time out and name it
+async fn reap_unmanaged(cx: &Cx, deployment: &str) {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::{DeleteParams, ListParams};
+
+    let pods: Api<Pod> = Api::namespaced(cx.client.clone(), OBS_NAMESPACE);
+    let selector = format!("app.kubernetes.io/name={}", deployment.trim_start_matches("ztest-"));
+    let Ok(list) = pods.list(&ListParams::default().labels(&selector)).await else {
+        return;
+    };
+    let force = DeleteParams { grace_period_seconds: Some(0), ..DeleteParams::default() };
+    for pod in list.items.iter().filter(|p| pod_is_unmanaged(p)) {
+        if let Some(name) = pod.metadata.name.as_deref() {
+            let _ = pods.delete(name, &force).await;
+        }
+    }
+}
+
+/// Pod is stranded: no kubelet is driving it, and recreating is the only way forward.
+///
+/// - `Pending` is NEVER stranded — an unbound PVC or a cold pull is progress, and reaping
+///   it would loop the pod forever instead of letting the wait report why
+/// - `Running`-but-unready belongs to the readiness probe, not here
+fn pod_is_unmanaged(pod: &k8s_openapi::api::core::v1::Pod) -> bool {
+    let Some(phase) = pod.status.as_ref().and_then(|s| s.phase.as_deref()) else {
+        return false;
+    };
+    matches!(phase, "Failed" | "Succeeded")
 }
 
 fn deployment_is_available(d: &Deployment) -> bool {

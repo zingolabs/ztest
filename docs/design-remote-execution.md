@@ -77,8 +77,8 @@ progress. One engine, one `Executor` seam, both targets — the cluster profile 
   uid 1000, `--oci-worker-no-process-sandbox`, Unconfined seccomp/AppArmor. No `privileged`, no
   `hostUsers: false`, no `CAP_SYS_ADMIN`. An earlier design took `RUN` steps to be impossible rootless on
   CRI-O; measured and disproved — `RUN` succeeds and the snapshotter selects `overlayfs`. Unconfined
-  seccomp is the one thing a default `restricted` policy still rejects, so a cluster needs a narrowed SCC
-  (or PSA label) admitting exactly that — [ops-cluster-requirements.md](ops-cluster-requirements.md#builder)
+  seccomp is the one thing a default `restricted` policy still rejects, so the builder's namespace needs a
+  PSA label admitting exactly that — [ops-cluster-requirements.md](ops-cluster-requirements.md#builder)
 - **No fallback** — a failed build/push fails the run, never degrades to another path
 
 See [design-execution-engine.md](design-execution-engine.md) (engine/console),

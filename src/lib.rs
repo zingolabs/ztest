@@ -46,6 +46,7 @@ mod capability;
 mod cluster;
 mod cluster_config;
 mod engine;
+mod extra_config;
 mod fmt;
 mod libtest;
 mod logstream;

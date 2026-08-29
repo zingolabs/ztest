@@ -1411,7 +1411,7 @@ mod tests {
         SyncWatchState {
             profile: "zaino_state_sync".into(),
             sync_id: "zaino-state-sync-a52f9ec9".into(),
-            context: "crc-remote".into(),
+            context: "zingo-infra".into(),
             pod_phase: "Running".into(),
             setup: None,
             vitals,

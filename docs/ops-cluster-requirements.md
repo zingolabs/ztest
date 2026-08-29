@@ -14,13 +14,13 @@ either has a probe below or is named under [residual gaps](#residual-gaps) — t
 | cluster reachable                           | **required**                     | operator                               |
 | snapshot-capable StorageClass               | **required**                     | operator (local: `--install-storage`)  |
 | `snapshot.storage.k8s.io/v1` + a controller | **required**                     | operator (local: `--install-storage`)  |
-| host toolchain                              | **required**                     | you — `cargo git tar` + `oc` / `kind`  |
+| host toolchain                              | required for a run               | you — `cargo git tar` (+ `kind`, local)|
 | node capacity                               | required on a remote cluster     | operator                               |
 | image side-load (`kind load` chain)         | required on a local cluster      | you — a working `kind` + engine pair   |
 | image registry                              | required on a remote cluster     | operator                               |
 | ztest namespaces, identity, BuildKit cache  | **required**                     | `ztest cluster setup`                  |
 | run ServiceAccount permissions              | **required**                     | `ztest cluster setup`                  |
-| build pod admission (PSA / SCC)             | **required**                     | `ztest cluster setup` + operator's SCC |
+| build pod admission (PSA)                   | **required**                     | `ztest cluster setup` + cluster policy |
 | volume expansion                            | optional — BuildKit cache growth | operator                               |
 | `metrics.k8s.io` API                        | optional — `kubectl top` / k9s   | `ztest cluster setup`                  |
 | metrics stack                               | optional — metrics & profiling   | `ztest cluster setup`                  |
@@ -72,7 +72,7 @@ Every probe is a read, and each reuses a signal the cluster already publishes ra
   access review passes over a stale role that would 403 the run ServiceAccount. The applied role carries
   a hash of the rules it was rendered from, and the probe compares it.
 - **`dryRun` create for admission** — the real BuildKit pod spec is submitted with `dryRun: true`, so PSA
-  level, SCC selection and every admission webhook vote for real and nothing is persisted.
+  level, the distro's own policy and every admission webhook vote for real and nothing is persisted.
 - **A real read for reachability, not `/version`** — the version endpoint answers off memory, so a
   cluster whose etcd is down passes it and then fails every remaining row with the same buried error. A
   `get` of the `default` namespace touches storage; one line replaces fourteen. A 401/403 is not an
@@ -119,10 +119,27 @@ match its release to the CSI driver's compatibility matrix.
 needs none.
 
 - Content-addressed `dev-<hash>` images need a writable target, configured per profile as `push`
-  (reachable from the builder) and `pull` (reachable from inside the cluster) — an in-cluster registry
-  has different addresses inside and out
+  (reachable from the builder) and `pull` (reachable from inside the cluster). Both are usually the same
+  in-cluster address: the builder *is* a pod, so nothing pushes from your workstation
 - [zot](https://zotregistry.dev/) suits it: OCI-native, official Helm chart, online GC with retention
-  policies, which `dev-<hash>` churn needs
+  policies, which `dev-<hash>` churn needs. Any OCI registry works — Harbor, GHCR, ECR, GAR
+
+### credentials
+
+BuildKit reads the standard `DOCKER_CONFIG/config.json`, so credentials are supplied the standard way
+and ztest never mints, derives or logs one:
+
+- A profile's `push_secret` (or `ZTEST_IMAGE_PUSH_SECRET`) names a `kubernetes.io/dockerconfigjson`
+  Secret in the `ztest` namespace; setup-independent, so rotating it is a Secret write and nothing else.
+  The build pod mounts it read-only and points `DOCKER_CONFIG` at it
+- Unset = anonymous push, which is the right answer for a registry only reachable in-cluster
+- `ZTEST_IMAGE_PULL_SECRET` is its pull-side twin, landing on pods as `imagePullSecrets`
+- The Secret's *name* is a cluster fact and rides `--extra-config`
+  ([ops-clusters.md](ops-clusters.md)); its contents never leave the cluster
+
+TLS is the registry's own: the build pod trusts what its system store trusts, and ztest adds no
+`insecure` escape hatch. A registry with a publicly-chaining certificate needs no configuration
+anywhere; a private CA has to be in the node and builder trust stores.
 
 ## metrics
 
@@ -155,8 +172,8 @@ profiler. A remote cluster building on-cluster with BuildKit needs no engine on 
 
 `ztest cluster add` records whichever engine owns the cluster's node container — exact, since a
 node belongs to one engine and never both. Override with `--runtime docker|podman`, which is
-only needed where there is no node to observe (a `--kubeconfig` profile on a machine running
-both). `ztest cluster check` prints the resolved engine on its header line.
+only needed where there is no node to observe (a remote profile on a machine running both).
+`ztest cluster check` prints the resolved engine on its header line.
 
 Podman carries two host requirements ztest cannot satisfy for you:
 

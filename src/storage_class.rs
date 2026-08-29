@@ -114,9 +114,10 @@ pub fn select<'a>(
 static SELECTED: tokio::sync::OnceCell<StorageOption> = tokio::sync::OnceCell::const_new();
 
 /// Escape hatches for a cluster whose classes ztest should not choose between.
-/// Set both or neither ([`StorageOption`] exists to stop that cross-driver mismatch)
-const CLASS_OVERRIDE_ENV: &str = "ZTEST_STORAGE_CLASS";
-const SNAPSHOT_CLASS_OVERRIDE_ENV: &str = "ZTEST_VOLUMESNAPSHOT_CLASS";
+/// Set both or neither ([`StorageOption`] exists to stop that cross-driver mismatch).
+/// Named once in `cluster_config`, which also writes them from a profile
+const CLASS_OVERRIDE_ENV: &str = crate::cluster_config::STORAGE_CLASS_ENV;
+const SNAPSHOT_CLASS_OVERRIDE_ENV: &str = crate::cluster_config::SNAPSHOT_CLASS_ENV;
 
 pub async fn selected(
     client: &kube::Client,

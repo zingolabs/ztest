@@ -52,6 +52,9 @@ const BUILDKIT_CONFIG: &str = "ztest-buildkit-config";
 const BUILDKIT_CONFIG_PATH: &str = "/etc/buildkit/buildkitd.toml";
 /// Build-context unpack dir: `emptyDir`, source-only, per-build
 pub const WORK_MOUNT: &str = "/build";
+/// `DOCKER_CONFIG` dir when a push Secret is configured — holds `config.json` alone,
+/// mounted read-only (`ZTEST_IMAGE_PUSH_SECRET`)
+pub const REGISTRY_MOUNT: &str = "/etc/ztest/registry";
 /// BuildKit state dir (content store + snapshots + `--mount=type=cache`), under
 /// the rootless daemon's `$HOME` not `/var/lib/buildkit`. Cache PVC mounts here.
 ///
@@ -149,6 +152,31 @@ fn config_manifest() -> Value {
 
 /// BuildKit pod `spec` at `cpu`/`mem` (Guaranteed), rootless posture (module docs)
 fn pod_spec(cpu: &str, mem: &str) -> Value {
+    let push_secret = crate::backends::image::push_secret();
+
+    let mut mounts = vec![
+        json!({ "name": "cache", "mountPath": BUILDKIT_STATE_DIR }),
+        json!({ "name": "context", "mountPath": WORK_MOUNT }),
+        json!({ "name": "config", "mountPath": BUILDKIT_CONFIG_PATH, "subPath": "buildkitd.toml" }),
+    ];
+    let mut volumes = vec![
+        json!({ "name": "cache", "persistentVolumeClaim": { "claimName": BUILDKIT_CACHE_PVC } }),
+        json!({ "name": "context", "emptyDir": {} }),
+        json!({ "name": "config", "configMap": { "name": BUILDKIT_CONFIG } }),
+    ];
+    if let Some(secret) = &push_secret {
+        mounts.push(json!({ "name": "registry", "mountPath": REGISTRY_MOUNT, "readOnly": true }));
+        // `.dockerconfigjson` → `config.json`: the key a dockerconfigjson Secret holds is
+        // not the filename `DOCKER_CONFIG` looks for
+        volumes.push(json!({
+            "name": "registry",
+            "secret": {
+                "secretName": secret,
+                "items": [{ "key": ".dockerconfigjson", "path": "config.json" }],
+            },
+        }));
+    }
+
     json!({
         "serviceAccountName": BUILDKIT_SERVICE_ACCOUNT,
         // Single-use: a crashed buildkitd stays dead and fails the run loudly
@@ -185,21 +213,13 @@ fn pod_spec(cpu: &str, mem: &str) -> Value {
                 "periodSeconds": 5,
                 "failureThreshold": 30,
             },
-            "volumeMounts": [
-                { "name": "cache", "mountPath": BUILDKIT_STATE_DIR },
-                { "name": "context", "mountPath": WORK_MOUNT },
-                { "name": "config", "mountPath": BUILDKIT_CONFIG_PATH, "subPath": "buildkitd.toml" },
-            ],
+            "volumeMounts": mounts,
             "resources": {
                 "requests": { "cpu": cpu, "memory": mem },
                 "limits": { "cpu": cpu, "memory": mem },
             },
         }],
-        "volumes": [
-            { "name": "cache", "persistentVolumeClaim": { "claimName": BUILDKIT_CACHE_PVC } },
-            { "name": "context", "emptyDir": {} },
-            { "name": "config", "configMap": { "name": BUILDKIT_CONFIG } },
-        ],
+        "volumes": volumes,
     })
 }
 
@@ -226,7 +246,7 @@ pub async fn create_build_pod(
 }
 
 /// Would this cluster admit the build pod? Dry-run create runs the whole admission chain
-/// — PSA level, SCC selection, mutating/validating webhooks — and persists nothing.
+/// — PSA level, mutating/validating webhooks, any distro's own policy — persisting nothing.
 ///
 /// Named as the reason it exists: the rootless posture (Unconfined seccomp/AppArmor,
 /// `allowPrivilegeEscalation`) is what a default `restricted` policy rejects, and it does
