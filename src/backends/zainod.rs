@@ -21,7 +21,7 @@ use crate::component::ComponentBuilder;
 use crate::handles::HandleInner;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
 use crate::handles::validator::{BlockchainInfo, PeerInfo};
-use crate::metrics::{AT_REST, Exporter, Exposition, Facet, LIVE, Reduce, Row, Unit, row};
+use crate::metrics::{Exporter, Exposition, Facet, Family, Phi, Reduce, Row, Unit, row};
 use crate::protocol::Endpoint;
 use crate::protocol::client::JsonRpcClient;
 use crate::protocol::zcash_rpc::ZcashRpc;
@@ -647,98 +647,105 @@ impl IndexerBackend for ZainoIndexer {
 /// Zaino's dotted `metric_names` after scrape (`metrics-exporter-prometheus` sanitizes to
 /// the Prometheus charset). Named once → [`ROWS`] and the [`SyncSubject`] impl can't drift
 mod family {
+    use crate::metrics::{Family, family, family_where};
+
+    /// Split on every per-block metric: tip ingest, finalised writer, migration.
+    ///
+    /// Folding counts one block 3×; `finalised` = the pass that survived a commit
+    const STAGE: &str = "stage";
+    const FINALISED: &str = "finalised";
+
+    const fn staged(name: &'static str) -> Family {
+        family_where(name, STAGE, FINALISED)
+    }
+
     // Serving surface. Latency histogram's `_count` = request volume (no `requests_total`)
-    pub const GRPC_ERRORS: &str = "zaino_grpc_errors_total";
-    pub const GRPC_LATENCY: &str = "zaino_grpc_request_duration_seconds";
-    /// Retries forced by a full validator work queue (only upstream signal
-    /// `block_fetch_seconds` misses, and the directly actionable one)
-    pub const RPC_RETRIES: &str = "zaino_rpc_outbound_retries_total";
-    /// Reorg depth; `_count` = reorg event total (no separate counter)
-    pub const REORG_DEPTH: &str = "zaino_sync_reorg_depth";
+    pub const GRPC_ERRORS: Family = family("zaino_grpc_errors_total");
+    pub const GRPC_LATENCY: Family = family("zaino_grpc_request_duration_seconds");
+    /// Count only — depth rides `zaino_sync_reorg_depth`, a histogram no [`Reduce`] reads yet
+    pub const REORG_TOTAL: Family = family("zaino_sync_reorg_total");
 
     /// Height the finalised index is **committed** to — written & fsynced, set per batch
-    pub const FINALIZED_HEIGHT: &str = "zaino_sync_finalized_height";
+    pub const FINALIZED_HEIGHT: Family = family("zaino_sync_finalized_height");
     /// Height built in memory ahead of the next commit (advances per block)
-    pub const FETCHED_HEIGHT: &str = "zaino_sync_fetched_height";
+    pub const FETCHED_HEIGHT: Family = family("zaino_sync_fetched_height");
     /// Write path's goal = tip - the non-finalised reorg buffer. Completion measured
     /// against this, never the raw tip (the finalised index trails by design)
-    pub const TARGET_HEIGHT: &str = "zaino_sync_target_height";
-    pub const CHAIN_TIP: &str = "zaino_chain_tip_height";
+    pub const TARGET_HEIGHT: Family = family("zaino_sync_target_height");
+    pub const CHAIN_TIP: Family = family("zaino_chain_tip_height");
 
-    // Throughput per op class. Cumulative on the wire; ztest surfaces difference first.
-    // Each carries a `stage` label (finalised / non-finalised) — `counter_total` sums it away,
-    // so a steady-state reading counts a block twice (zaino ingests it at the tip, then again
-    // when the finalised writer reaches it)
-    pub const TRANSACTIONS: &str = "zaino_sync_transactions_total";
-    pub const TRANSPARENT_INPUTS: &str = "zaino_sync_transparent_inputs_total";
-    pub const TRANSPARENT_OUTPUTS: &str = "zaino_sync_transparent_outputs_total";
-    pub const SAPLING_SPENDS: &str = "zaino_sync_sapling_spends_total";
-    pub const SAPLING_OUTPUTS: &str = "zaino_sync_sapling_outputs_total";
-    pub const ORCHARD_ACTIONS: &str = "zaino_sync_orchard_actions_total";
-    pub const IRONWOOD_ACTIONS: &str = "zaino_sync_ironwood_actions_total";
+    // Throughput per op class, all `stage`-split. Cumulative on the wire
+    pub const TRANSACTIONS: Family = staged("zaino_sync_transactions_total");
+    pub const TRANSPARENT_INPUTS: Family = staged("zaino_sync_transparent_inputs_total");
+    pub const TRANSPARENT_OUTPUTS: Family = staged("zaino_sync_transparent_outputs_total");
+    pub const SAPLING_SPENDS: Family = staged("zaino_sync_sapling_spends_total");
+    pub const SAPLING_OUTPUTS: Family = staged("zaino_sync_sapling_outputs_total");
+    pub const ORCHARD_ACTIONS: Family = staged("zaino_sync_orchard_actions_total");
+    pub const IRONWOOD_ACTIONS: Family = staged("zaino_sync_ironwood_actions_total");
 
-    /// Wall-clock per block, end to end (both source reads + assembly)
-    pub const BLOCK_BUILD: &str = "zaino_sync_block_build_seconds";
+    /// Per block, after both source reads
+    pub const BLOCK_ASSEMBLE: Family = staged("zaino_sync_block_assemble_seconds");
     /// One source read: request → deserialized block in zaino's ram. Not an upstream wait
     /// under `direct` (rocksdb read + zebra deserialize, both on zaino's own cpu)
-    pub const BLOCK_FETCH: &str = "zaino_sync_block_fetch_seconds";
+    pub const BLOCK_FETCH: Family = staged("zaino_sync_block_fetch_seconds");
     /// Second source read per block (commitment tree roots); split off `BLOCK_FETCH` so a
     /// slow treestate can't hide behind the block read
-    pub const TREESTATE_FETCH: &str = "zaino_sync_treestate_fetch_seconds";
-    /// Per committed batch, incl. fsync
-    pub const BATCH_WRITE: &str = "zaino_sync_batch_write_seconds";
+    pub const TREESTATE_FETCH: Family = staged("zaino_sync_treestate_fetch_seconds");
+    /// Per committed batch, incl. fsync — batch-scoped, so no `stage` split
+    pub const BATCH_WRITE: Family = family("zaino_sync_batch_write_seconds");
 
     /// LMDB environment size; against host RAM = where the write path's B-tree
     /// behaviour changes character
-    pub const DB_USED_BYTES: &str = "zaino_db_used_bytes";
+    pub const DB_USED_BYTES: Family = family("zaino_db_used_bytes");
 }
 
 /// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns
 /// scannable (reformatted, each row costs six lines)
 #[rustfmt::skip]
-const ROWS: [Row; 21] = [
+const ROWS: [Row; 23] = [
     // Per-op throughput. Cumulative on the wire → `PerSec` differentiates at query
     // time; `label` = the band, which is what keys `Palette::pools` when they stack.
     // `AT_REST`: a live reader differences its own scrapes, and a counter shown raw
     // beside rates reads as a rate that jumped six orders of magnitude.
     // Directions kept apart: only the output side is checkable against the note-commitment
     // trees ([`super::super::sync::chainwork`]), and folding spends in loses that
-    row("transparent in", family::TRANSPARENT_INPUTS, Reduce::Sum, AT_REST, Unit::PerSec, Facet::Transparent),
-    row("transparent out", family::TRANSPARENT_OUTPUTS, Reduce::Sum, AT_REST, Unit::PerSec, Facet::Transparent),
-    row("sapling spends", family::SAPLING_SPENDS, Reduce::Sum, AT_REST, Unit::PerSec, Facet::Shielded),
-    row("sapling outputs", family::SAPLING_OUTPUTS, Reduce::Sum, AT_REST, Unit::PerSec, Facet::Shielded),
-    row("orchard", family::ORCHARD_ACTIONS, Reduce::Sum, AT_REST, Unit::PerSec, Facet::Shielded),
-    row("ironwood", family::IRONWOOD_ACTIONS, Reduce::Sum, AT_REST, Unit::PerSec, Facet::Shielded),
+    row("transparent in", family::TRANSPARENT_INPUTS, Reduce::Sum, Unit::PerSec, Facet::Transparent),
+    row("transparent out", family::TRANSPARENT_OUTPUTS, Reduce::Sum, Unit::PerSec, Facet::Transparent),
+    row("sapling spends", family::SAPLING_SPENDS, Reduce::Sum, Unit::PerSec, Facet::Shielded),
+    row("sapling outputs", family::SAPLING_OUTPUTS, Reduce::Sum, Unit::PerSec, Facet::Shielded),
+    row("orchard", family::ORCHARD_ACTIONS, Reduce::Sum, Unit::PerSec, Facet::Shielded),
+    row("ironwood", family::IRONWOOD_ACTIONS, Reduce::Sum, Unit::PerSec, Facet::Shielded),
     // Scan rate, off the frontier gauge (zaino counts no blocks). `Max` + `PerSec` =
     // the gauge-slope query, matching what `Window::block_pace` differences live
-    row("blocks", family::FETCHED_HEIGHT, Reduce::Max, AT_REST, Unit::PerSec, Facet::Blocks),
+    row("blocks", family::FETCHED_HEIGHT, Reduce::Max, Unit::PerSec, Facet::Blocks),
     // Transactions, not ops: one tx spans many ops, so it never joins the stack above
-    row("transactions", family::TRANSACTIONS, Reduce::Sum, AT_REST, Unit::PerSec, Facet::Throughput),
-    // Per-block cost = what a tuning pass acts on. `fetch` split from `build` because
-    // remedies differ (validator time vs parse cost); `batch write` is the commit
-    row("fetch", family::BLOCK_FETCH, Reduce::MeanMs, LIVE, Unit::Millis, Facet::WritePath),
-    row("treestate", family::TREESTATE_FETCH, Reduce::MeanMs, LIVE, Unit::Millis, Facet::WritePath),
-    row("build", family::BLOCK_BUILD, Reduce::MeanMs, LIVE, Unit::Millis, Facet::WritePath),
-    row("batch write", family::BATCH_WRITE, Reduce::MeanMs, AT_REST, Unit::Millis, Facet::WritePath),
+    row("transactions", family::TRANSACTIONS, Reduce::Sum, Unit::PerSec, Facet::Throughput),
+    // Per-block cost = what a tuning pass acts on. `fetch` split from `assemble` (remedies
+    // differ: validator time vs parse cost); mean beside p99 where a tail is actionable
+    row("fetch", family::BLOCK_FETCH, Reduce::Mean, Unit::Millis, Facet::WritePath),
+    row("fetch p99", family::BLOCK_FETCH, Reduce::Quantile(Phi::P99), Unit::Millis, Facet::WritePath),
+    row("treestate", family::TREESTATE_FETCH, Reduce::Mean, Unit::Millis, Facet::WritePath),
+    row("assemble", family::BLOCK_ASSEMBLE, Reduce::Mean, Unit::Millis, Facet::WritePath),
+    row("assemble p99", family::BLOCK_ASSEMBLE, Reduce::Quantile(Phi::P99), Unit::Millis, Facet::WritePath),
+    row("batch write", family::BATCH_WRITE, Reduce::Mean, Unit::Millis, Facet::WritePath),
     // Inbound gRPC. No request-count row (latency histogram's `_count` = the volume)
-    row("gRPC", family::GRPC_LATENCY, Reduce::MeanMs, LIVE, Unit::Millis, Facet::WritePath),
-    row("errors", family::GRPC_ERRORS, Reduce::Sum, AT_REST, Unit::Count, Facet::WritePath),
-    // Rising retries = validator saturated → more concurrency makes throughput worse
-    row("retries", family::RPC_RETRIES, Reduce::Sum, AT_REST, Unit::Count, Facet::WritePath),
+    row("gRPC", family::GRPC_LATENCY, Reduce::Mean, Unit::Millis, Facet::WritePath),
+    row("gRPC p99", family::GRPC_LATENCY, Reduce::Quantile(Phi::P99), Unit::Millis, Facet::WritePath),
+    row("errors", family::GRPC_ERRORS, Reduce::Sum, Unit::Count, Facet::WritePath),
     // `finalized` live = only trustworthy read of zaino's own index (every other height
     // it serves is answerable by the validator it proxies while indexing). Beside
     // `fetched` because the *gap* is the diagnostic: commits at most once per
     // `sync_checkpoint_interval` (120 s) → separates slow-to-fetch from not-committing
-    row("finalized", family::FINALIZED_HEIGHT, Reduce::Max, LIVE, Unit::Count, Facet::Progress),
-    row("fetched", family::FETCHED_HEIGHT, Reduce::Max, LIVE, Unit::Count, Facet::Progress),
-    row("chain tip", family::CHAIN_TIP, Reduce::Max, LIVE, Unit::Count, Facet::Progress),
+    row("finalized", family::FINALIZED_HEIGHT, Reduce::Max, Unit::Count, Facet::Progress),
+    row("fetched", family::FETCHED_HEIGHT, Reduce::Max, Unit::Count, Facet::Progress),
+    row("chain tip", family::CHAIN_TIP, Reduce::Max, Unit::Count, Facet::Progress),
     // Height this run was *asked* for — fixed for its duration, so the only honest
     // denominator (the tip advances underneath, marking a finished run short by
     // however far the network moved)
-    row("target", family::TARGET_HEIGHT, Reduce::Max, AT_REST, Unit::Count, Facet::Progress),
-    row("reorg depth", family::REORG_DEPTH, Reduce::Max, LIVE, Unit::Count, Facet::Progress),
+    row("target", family::TARGET_HEIGHT, Reduce::Max, Unit::Count, Facet::Progress),
+    row("reorgs", family::REORG_TOTAL, Reduce::Sum, Unit::Count, Facet::Progress),
     // DB size against host RAM — the write path's B-tree behaviour turns at that crossing
-    row("db used", family::DB_USED_BYTES, Reduce::Max, AT_REST, Unit::Bytes, Facet::Store),
+    row("db used", family::DB_USED_BYTES, Reduce::Max, Unit::Bytes, Facet::Store),
 ];
 
 /// Zaino as a live display sees it, from outside the cluster. Families resolved in the
@@ -759,7 +766,7 @@ impl Observe for ZainoIndexer {
 
     /// `Op::SproutJoinSplit` absent on purpose and must stay absent (the compact model
     /// carries no JoinSplits → sprout work unmeasured)
-    const WORK_OPS: &'static [(Op, &'static str)] = &[
+    const WORK_OPS: &'static [(Op, Family)] = &[
         (Op::TransparentIn, family::TRANSPARENT_INPUTS),
         (Op::TransparentOut, family::TRANSPARENT_OUTPUTS),
         (Op::SaplingSpend, family::SAPLING_SPENDS),
@@ -775,14 +782,7 @@ impl Observe for ZainoIndexer {
         if work.known().is_empty() {
             return None;
         }
-        let mean = |family| exposition.reduce(family, Reduce::MeanMs);
-        let (fetch_ms, build_ms) = (mean(family::BLOCK_FETCH), mean(family::BLOCK_BUILD));
-        let treestate_ms = mean(family::TREESTATE_FETCH);
-        // Clamped at 0, never negative: the summaries scrape together but are observed by
-        // different paths → a read straddling the scrape can exceed its build
-        let parse_ms = build_ms
-            .zip(fetch_ms)
-            .map(|(build, fetch)| (build - fetch - treestate_ms.unwrap_or(0.0)).max(0.0));
+        let timing = |family| exposition.timing(family);
         Some(Observation {
             height: Self::live_height(exposition),
             target: Self::target_of(exposition),
@@ -790,7 +790,12 @@ impl Observe for ZainoIndexer {
             reported_pct: None,
             transactions: exposition.counter_total(family::TRANSACTIONS),
             work,
-            cost: Cost { fetch_ms, treestate_ms, parse_ms, grpc_ms: mean(family::GRPC_LATENCY) },
+            cost: Cost {
+                fetch: timing(family::BLOCK_FETCH),
+                treestate: timing(family::TREESTATE_FETCH),
+                assemble: timing(family::BLOCK_ASSEMBLE),
+                grpc: timing(family::GRPC_LATENCY),
+            },
         })
     }
 }
@@ -889,7 +894,17 @@ impl SyncSubject for ZainoIndexer {
         }
     }
 
-    fn work_source(&self, op: Op) -> Option<&'static str> {
+    /// Zaino = the subject, so the panel reads its own exporter. A wallet syncing *through*
+    /// zaino keeps the tick default — this frontier is already at tip and says nothing of it
+    fn observes(&self) -> crate::sync::Observed {
+        crate::sync::Observed::exporter("zaino index", COMPONENT)
+    }
+
+    async fn declared(&self) -> Option<(&'static [Row], Exposition)> {
+        Some((<Self as crate::metrics::MetricLayout>::ROWS, self.exporter().await.ok()?))
+    }
+
+    fn work_source(&self, op: Op) -> Option<Family> {
         <Self as Observe>::work_source(op)
     }
 }
@@ -1252,14 +1267,26 @@ mod tests {
     /// the reader would not have counted
     #[test]
     fn work_source_and_work_of_agree_on_the_declaration() {
+        // Shape zaino publishes: one series per ingest stage
         let e = scrape(
             "# TYPE zaino_sync_orchard_actions_total counter\n\
-             zaino_sync_orchard_actions_total 7\n",
+             zaino_sync_orchard_actions_total{stage=\"finalised\"} 7\n\
+             zaino_sync_orchard_actions_total{stage=\"non-finalised\"} 6\n\
+             zaino_sync_orchard_actions_total{stage=\"migration\"} 4\n",
         );
         let family =
             <ZainoIndexer as Observe>::work_source(Op::OrchardAction).expect("orchard is declared");
-        assert_eq!(family, "zaino_sync_orchard_actions_total");
-        assert_eq!(ZainoIndexer::work_of(&e).get(Op::OrchardAction), Some(7));
+        assert_eq!(family.name, "zaino_sync_orchard_actions_total");
+        assert_eq!(
+            family.select.map(|s| (s.label, s.value)),
+            Some(("stage", "finalised")),
+            "a probe must read the finalised pass, not the fold of every ingest stage"
+        );
+        assert_eq!(
+            ZainoIndexer::work_of(&e).get(Op::OrchardAction),
+            Some(7),
+            "17 here would be the three stages folded — one block counted once per pass"
+        );
         assert_eq!(
             <ZainoIndexer as Observe>::work_source(Op::SproutJoinSplit),
             None,

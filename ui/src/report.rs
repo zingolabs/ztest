@@ -69,6 +69,13 @@ mod row {
         format!("{}{{line|dim}}", super::VIOLATION_INDENT)
     }
 
+    /// Dim — the number above still stands; this says only that the plot ends elsewhere
+    pub(super) const HEIGHT_CHECK: &str = "  {@warn|dim} prometheus last read {observed|dim} here \
+         ({gap|dim} {side|dim} the recorded finish)";
+
+    pub(super) const UNPUBLISHED: &str =
+        "{@warn} {n|bold} declared metric(s) this build does not publish";
+
     pub(super) const CHIP: &str = "{tag} {total|bold}";
     pub(super) const CHIPS_AND_RATE: &str = "{chips}{summary:>*|bold}";
     pub(super) const LABEL_VALUE: &str = "{label|dim}{value:>*|bold}";
@@ -119,6 +126,9 @@ pub struct ReportView {
     pub elapsed: Duration,
     pub segment: Option<String>,
     pub height: Option<(u32, u32)>,
+    /// `(recorded, observed)` past scrape lag. Rendered, never resolved — the record keeps
+    /// the verdict's number and the divergence is itself the finding
+    pub height_check: Option<(u32, u32)>,
     pub eta: Option<Duration>,
     pub probes: Option<(usize, usize)>,
     pub tip: Option<u32>,
@@ -131,7 +141,12 @@ pub struct ReportView {
     pub shielded: Vec<Series>,
     pub blocks: Vec<Series>,
     pub throughput: Vec<Series>,
+    /// Per-stage cost + its tail. Paired by label: `fetch` carries `fetch p99`
+    pub write_path: Vec<Series>,
+    pub store: Vec<Series>,
     pub resources: Vec<ComponentResources>,
+    /// `label <- family{sel}` the build never published (em-dashes read like a quiet run)
+    pub unpublished: Vec<String>,
     pub note: Option<String>,
     pub grafana: Option<String>,
 }
@@ -166,6 +181,10 @@ pub fn render_sync_report(view: &ReportView, theme: &Theme, width: usize) -> Str
         (
             rate_box("blocks/sec", &view.blocks, view, theme, left_w),
             rate_box("transactions/sec", &view.throughput, view, theme, right_w),
+        ),
+        (
+            latency_box("write path", &view.write_path, view, theme, left_w),
+            gauge_box("store", &view.store, view, theme, right_w),
         ),
     ];
     match view.resources.is_empty() {
@@ -279,6 +298,18 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
             .value("pct", pct / 100.0)
             .maybe_text("behind", behind);
         line(&row::height(tone), &height);
+    }
+    // Two observers of one run disagreeing = the finding; the record's number stands above
+    if let Some((recorded, observed)) = v.height_check {
+        let (side, gap) = match observed < recorded {
+            true => ("below", recorded - observed),
+            false => ("above", observed - recorded),
+        };
+        let f = Fields::new()
+            .text("observed", thousands(u64::from(observed)))
+            .text("side", side.to_string())
+            .text("gap", thousands(u64::from(gap)));
+        line(row::HEIGHT_CHECK, &f);
     }
     out.push('\n');
 }
@@ -402,6 +433,89 @@ fn rate_box(
     boxed(title, "", &body, width, theme)
 }
 
+/// Tail series' label = its stage's, suffixed. Paired here rather than plotted apart,
+/// since a mean and its p99 are one reading
+const P99_SUFFIX: &str = " p99";
+
+/// Per-stage cost, one line each.
+///
+/// - No plot: two stages' latencies never add to a quantity, so a stack would draw one
+/// - `peak` off the tail series where published (worst window, at the sharpest resolution)
+/// - Counters riding this facet (errors) report their whole-run total, not a duration
+fn latency_box(
+    title: &str,
+    series: &[Series],
+    v: &ReportView,
+    theme: &Theme,
+    width: usize,
+) -> Vec<String> {
+    let inner = interior(width);
+    if series.is_empty() {
+        return empty(theme, title, v, width);
+    }
+    let tail =
+        |stage: &str| series.iter().find(|s| s.label.strip_suffix(P99_SUFFIX) == Some(stage));
+
+    let mut body = Vec::new();
+    for s in series.iter().filter(|s| !s.label.ends_with(P99_SUFFIX)) {
+        let tail = tail(&s.label);
+        let mut parts = Vec::new();
+        if s.unit == Unit::Millis {
+            if let Some(mean) = s.mean() {
+                parts.push(format!("avg {}", unit_value(s.unit, mean)));
+            }
+            if let Some(p99) = tail.and_then(Series::mean) {
+                parts.push(format!("p99 {}", unit_value(s.unit, p99)));
+            }
+            // Tail's peak where there is one: the mean series' worst window still averages
+            if let Some(peak) = tail.or(Some(s)).and_then(Series::peak) {
+                parts.push(format!("peak {}", unit_value(s.unit, peak)));
+            }
+        } else if let Some(last) = s.last() {
+            parts.push(format!("{} total", unit_value(s.unit, last)));
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        let sep = format!(" {} ", theme.chars.dot);
+        body.push(label_value(&s.label, &parts.join(&sep), inner, theme));
+    }
+    if body.is_empty() {
+        return empty(theme, title, v, width);
+    }
+    boxed(title, "", &body, width, theme)
+}
+
+/// A held quantity rather than a flow: plotted as published, summarised by where it
+/// finished. No total — integrating a size yields byte-seconds
+fn gauge_box(
+    title: &str,
+    series: &[Series],
+    v: &ReportView,
+    theme: &Theme,
+    width: usize,
+) -> Vec<String> {
+    let inner = interior(width);
+    if series.is_empty() {
+        return empty(theme, title, v, width);
+    }
+    let unit = series[0].unit;
+    let mut body: Vec<String> = stacked(series, PLOT_ROWS, Some(unit), inner, 0, theme)
+        .into_iter()
+        .map(|(label, plotted)| format!("{} {plotted}", label.style(theme.styles.dim)))
+        .collect();
+    for s in series {
+        let Some(peak) = s.peak() else { continue };
+        let mut parts = vec![format!("peak {}", unit_value(unit, peak))];
+        if let Some(last) = s.last() {
+            parts.push(format!("final {}", unit_value(unit, last)));
+        }
+        let sep = format!(" {} ", theme.chars.dot);
+        body.push(label_value(&s.label, &parts.join(&sep), inner, theme));
+    }
+    boxed(title, "", &body, width, theme)
+}
+
 /// One component's draw and its disk. The title carries the component, so each summary
 /// names its quantity instead of repeating it.
 ///
@@ -488,6 +602,13 @@ fn footer(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
         let data = Fields::new().text("gap", &**gap);
         line(row::COVERAGE_GAP, &data);
     }
+    // Not a verdict (run unaffected), but every panel these rows feed is blank for a reason
+    if !v.unpublished.is_empty() {
+        line(row::UNPUBLISHED, &Fields::new().text("n", v.unpublished.len().to_string()));
+        for row in &v.unpublished {
+            line(row::INDENTED, &Fields::new().text("text", &**row));
+        }
+    }
     if let Some(error) = &v.error {
         line(row::ERROR, &Fields::new().text("error", &**error));
     }
@@ -558,7 +679,8 @@ fn axis(ceiling: f64, rows: usize, unit: Option<Unit>) -> (Vec<String>, usize) {
 fn summary_text(series: &[Series], total: Option<f64>, theme: &Theme) -> String {
     let unit = series.first().map_or(Unit::Count, |s| s.unit);
     let mean: f64 = series.iter().filter_map(Series::mean).sum();
-    let peak: f64 = series.iter().filter_map(Series::peak).sum();
+    // Peak of the sum — summing per-series maxima invents a moment the run never had
+    let peak = stacked_peak(series);
     let total = total
         .filter(|t| *t > 0.0)
         .map(|t| format!(" {} {} total", theme.chars.dot, unit_value(Unit::Count, t)))
@@ -572,12 +694,16 @@ fn summary_text(series: &[Series], total: Option<f64>, theme: &Theme) -> String 
 }
 
 /// Peak of the *sum*, not the sum of peaks: series do not peak together, and adding
-/// their maxima invents a moment the run never had
+/// their maxima invents a moment the run never had.
+///
+/// Summed by timestamp, never by position — a dropped `NaN` shortens one series and
+/// slides every later sample against its neighbours
 fn stacked_peak(series: &[Series]) -> f64 {
-    let len = series.iter().map(|s| s.points.len()).max().unwrap_or(0);
-    (0..len)
-        .map(|i| series.iter().filter_map(|s| s.points.get(i)).map(|(_, v)| v).sum::<f64>())
-        .fold(0.0, f64::max)
+    let mut at: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
+    for (t, v) in series.iter().flat_map(|s| &s.points) {
+        *at.entry((t * 1000.0).round() as u64).or_default() += v;
+    }
+    at.into_values().fold(0.0, f64::max)
 }
 
 /// An empty frame reads as "nothing happened"; the real cause is the record's reach,
@@ -611,8 +737,10 @@ mod tests {
         }
     }
 
-    fn wave(scale: f64, n: usize) -> Vec<f64> {
-        (0..n).map(|i| scale * (1.0 + (i as f64 / 9.0).sin())).collect()
+    /// `shift` in samples. Stacked channels get different shifts — in phase, sum-of-peaks
+    /// and peak-of-sum agree, and the fixture cannot tell them apart
+    fn wave(scale: f64, n: usize, shift: f64) -> Vec<f64> {
+        (0..n).map(|i| scale * (1.0 + ((i as f64 + shift) / 9.0).sin())).collect()
     }
 
     pub(super) fn view() -> ReportView {
@@ -622,6 +750,8 @@ mod tests {
             status: SyncStatus::Finished(ztest::api::SyncVerdict::Failed),
             phase: None,
             phase_detail: None,
+            height_check: None,
+            unpublished: Vec::new(),
             eta: None,
             probes: None,
             elapsed: Duration::from_secs(1_842),
@@ -644,30 +774,39 @@ mod tests {
             error: None,
             ticks: 118,
             dropped_snapshots: 0,
-            transparent: vec![series("transparent", Unit::PerSec, &wave(70_000.0, 60))],
+            transparent: vec![series("transparent", Unit::PerSec, &wave(70_000.0, 60, 0.0))],
+            // Half a period apart: these two never peak in the same slot
             shielded: vec![
-                series("sapling", Unit::PerSec, &wave(30_000.0, 60)),
-                series("orchard", Unit::PerSec, &wave(14_000.0, 60)),
-                series("ironwood", Unit::PerSec, &wave(0.0, 60)),
+                series("sapling", Unit::PerSec, &wave(30_000.0, 60, 0.0)),
+                series("orchard", Unit::PerSec, &wave(14_000.0, 60, 14.0)),
+                series("ironwood", Unit::PerSec, &wave(0.0, 60, 0.0)),
             ],
-            blocks: vec![series("blocks", Unit::PerSec, &wave(400.0, 60))],
-            throughput: vec![series("transactions", Unit::PerSec, &wave(900.0, 60))],
+            blocks: vec![series("blocks", Unit::PerSec, &wave(400.0, 60, 0.0))],
+            throughput: vec![series("transactions", Unit::PerSec, &wave(900.0, 60, 0.0))],
+            write_path: vec![
+                series("fetch", Unit::Millis, &wave(4.0, 60, 0.0)),
+                series("fetch p99", Unit::Millis, &wave(30.0, 60, 14.0)),
+                series("treestate", Unit::Millis, &wave(1.2, 60, 0.0)),
+                series("batch write", Unit::Millis, &wave(880.0, 60, 7.0)),
+                series("errors", Unit::Count, &[0.0; 60]),
+            ],
+            store: vec![series("db used", Unit::Bytes, &wave(4e9, 60, 0.0))],
             resources: vec![
                 ComponentResources {
                     component: "zainod".into(),
-                    cpu: vec![series("zainod", Unit::Cores, &wave(3.0, 60))],
-                    mem: vec![series("zainod", Unit::Bytes, &wave(6e9, 60))],
+                    cpu: vec![series("zainod", Unit::Cores, &wave(3.0, 60, 0.0))],
+                    mem: vec![series("zainod", Unit::Bytes, &wave(6e9, 60, 0.0))],
                     disk: vec![
-                        series("read", Unit::BytesPerSec, &wave(4.1e8, 60)),
-                        series("write", Unit::BytesPerSec, &wave(9e7, 60)),
+                        series("read", Unit::BytesPerSec, &wave(4.1e8, 60, 0.0)),
+                        series("write", Unit::BytesPerSec, &wave(9e7, 60, 14.0)),
                     ],
-                    io_stall: vec![series("zainod", Unit::Fraction, &wave(0.004, 60))],
+                    io_stall: vec![series("zainod", Unit::Fraction, &wave(0.004, 60, 0.0))],
                 },
                 ComponentResources {
                     component: "zebrad".into(),
-                    cpu: vec![series("zebrad", Unit::Cores, &wave(1.0, 60))],
-                    mem: vec![series("zebrad", Unit::Bytes, &wave(2e9, 60))],
-                    disk: vec![series("write", Unit::BytesPerSec, &wave(2.2e8, 60))],
+                    cpu: vec![series("zebrad", Unit::Cores, &wave(1.0, 60, 0.0))],
+                    mem: vec![series("zebrad", Unit::Bytes, &wave(2e9, 60, 0.0))],
+                    disk: vec![series("write", Unit::BytesPerSec, &wave(2.2e8, 60, 0.0))],
                     io_stall: vec![series("zebrad", Unit::Fraction, &[0.0; 60])],
                 },
             ],
@@ -757,7 +896,7 @@ mod tests {
         let mut v = view();
         v.resources.push(ComponentResources {
             component: "lightwalletd".into(),
-            cpu: vec![series("lightwalletd", Unit::Cores, &wave(0.5, 60))],
+            cpu: vec![series("lightwalletd", Unit::Cores, &wave(0.5, 60, 0.0))],
             mem: Vec::new(),
             disk: Vec::new(),
             io_stall: Vec::new(),
@@ -784,6 +923,41 @@ mod tests {
         let rendered = render_sync_report(&v, &theme(), 120);
         assert!(rendered.contains("complete"), "{rendered}");
         assert!(!rendered.contains("short"));
+    }
+
+    /// Reading the verdict off the series printed `short 4,479` in fail ink on a finished run
+    #[test]
+    fn a_stale_final_scrape_annotates_instead_of_inventing_a_shortfall() {
+        let mut v = view();
+        v.height = Some((659_600, 659_600));
+        v.height_check = Some((659_600, 655_121));
+        let rendered = render_sync_report(&v, &theme(), 120);
+        assert!(rendered.contains("complete"), "the record's verdict stands: {rendered}");
+        assert!(!rendered.contains("short "), "{rendered}");
+        assert!(rendered.contains("655,121"), "the disagreement is stated: {rendered}");
+        assert!(rendered.contains("below"), "{rendered}");
+    }
+
+    /// Silence is the normal case and must cost no ink
+    #[test]
+    fn agreement_between_the_record_and_the_series_draws_nothing() {
+        let rendered = render_sync_report(&view(), &theme(), 120);
+        assert!(!rendered.contains("prometheus last read"), "{rendered}");
+        assert!(!rendered.contains("does not publish"), "{rendered}");
+    }
+
+    /// Renamed family → empty panel, indistinguishable from a quiet run
+    #[test]
+    fn rows_the_build_never_published_are_named_in_the_footer() {
+        let mut v = view();
+        v.unpublished = vec![
+            "db used <- zaino_db_used_bytes".into(),
+            "fetch <- zaino_sync_block_fetch_seconds{stage=\"finalised\"}".into(),
+        ];
+        let rendered = render_sync_report(&v, &theme(), 120);
+        assert!(rendered.contains("2 declared metric(s)"), "{rendered}");
+        assert!(rendered.contains("zaino_db_used_bytes"), "{rendered}");
+        assert!(rendered.contains("stage=\"finalised\""), "the selector too: {rendered}");
     }
 
     /// The bug this replaced: measured against the tip, a run that indexed every block
@@ -843,6 +1017,53 @@ mod tests {
         assert_eq!(stacked_peak(&[a, b]), 10.0, "sum of peaks would be 20");
     }
 
+    /// A dropped `NaN` shortens one series; summing by position then adds each later
+    /// sample to a neighbour's *earlier* one and reports a peak from two different instants
+    #[test]
+    fn a_stack_sums_by_timestamp_rather_than_by_position() {
+        let at = |points: &[(f64, f64)]| Series {
+            label: "x".into(),
+            unit: Unit::Cores,
+            facet: None,
+            points: points.to_vec(),
+        };
+        // Second series lost its t=0 sample: by position its 4.0 would land against 1.0
+        let full = at(&[(0.0, 1.0), (30.0, 2.0), (60.0, 9.0)]);
+        let gapped = at(&[(30.0, 4.0), (60.0, 1.0)]);
+        assert_eq!(stacked_peak(&[full, gapped]), 10.0, "9+1 at t=60, never 1+4 across slots");
+    }
+
+    /// Tail belongs to its stage's line — surfaced as its own row it reads as a fifth
+    /// stage, and the stage it describes loses the number that makes it actionable
+    #[test]
+    fn a_tail_row_joins_its_stage_rather_than_becoming_one() {
+        let rendered = latency_box("write path", &view().write_path, &view(), &theme(), 60);
+        let body: Vec<&String> =
+            rendered.iter().filter(|l| l.contains("avg") || l.contains("total")).collect();
+        assert_eq!(body.len(), 4, "fetch, treestate, batch write, errors: {rendered:#?}");
+        let fetch = body.iter().find(|l| l.contains("fetch")).expect("the fetch line");
+        assert!(fetch.contains("p99"), "{fetch}");
+        assert!(!rendered.iter().any(|l| l.contains("fetch p99 ")), "no row of its own");
+    }
+
+    /// Integrating a held size yields byte-seconds; only a flow has a total
+    #[test]
+    fn a_store_gauge_reports_where_it_finished_and_never_a_total() {
+        let rendered = gauge_box("store", &view().store, &view(), &theme(), 60);
+        let summary = rendered.iter().find(|l| l.contains("peak")).expect("a summary");
+        assert!(summary.contains("final"), "{summary}");
+        assert!(!rendered.iter().any(|l| l.contains("total")), "{rendered:#?}");
+    }
+
+    /// Queried and dropped, these were 10 of 23 rows: the whole per-block cost breakdown
+    /// paid for on every report and shown on none
+    #[test]
+    fn the_write_path_and_store_facets_reach_the_report() {
+        let rendered = render_sync_report(&view(), &theme(), 120);
+        assert!(rendered.contains("write path"), "{rendered}");
+        assert!(rendered.contains("db used"), "{rendered}");
+    }
+
     /// Prometheus gone or the run past retention: state it, never draw an empty frame
     #[test]
     fn a_run_with_no_record_states_why_rather_than_drawing_empty_plots() {
@@ -877,9 +1098,9 @@ mod tests {
     fn the_sapling_split_renders_as_one_pool() {
         let mut v = view();
         v.shielded = vec![
-            series("sapling spends", Unit::PerSec, &wave(20_000.0, 60)),
-            series("sapling outputs", Unit::PerSec, &wave(10_000.0, 60)),
-            series("orchard", Unit::PerSec, &wave(14_000.0, 60)),
+            series("sapling spends", Unit::PerSec, &wave(20_000.0, 60, 0.0)),
+            series("sapling outputs", Unit::PerSec, &wave(10_000.0, 60, 0.0)),
+            series("orchard", Unit::PerSec, &wave(14_000.0, 60, 14.0)),
         ];
         let rendered = render_sync_report(&v, &theme(), 120);
         assert!(!rendered.contains("sap-sp"), "{rendered}");
@@ -932,9 +1153,9 @@ mod tests {
     #[test]
     fn a_chip_row_separates_pools_and_leads_with_the_largest() {
         let row = pool_chips(&view().shielded, &theme(), 60);
-        assert_eq!(row, "sap 53.4M · orc 24.9M · iro 0", "{row:?}");
+        assert_eq!(row, "sap 53.4M · orc 25.8M · iro 0", "{row:?}");
         let ascii = pool_chips(&view().shielded, &Theme::for_capabilities(false, false), 60);
-        assert_eq!(ascii, "sap 53.4M * orc 24.9M * iro 0", "{ascii:?}");
+        assert_eq!(ascii, "sap 53.4M * orc 25.8M * iro 0", "{ascii:?}");
     }
 
     /// Per-pool totals and the run's rates are the same reading; two lines wasted one
@@ -942,8 +1163,24 @@ mod tests {
     fn the_chips_share_a_line_with_the_rate_summary() {
         let rendered = render_sync_report(&view(), &theme(), 160);
         let line = rendered.lines().find(|l| l.contains("sap 53.4M")).expect("a chip row");
-        assert!(line.contains("avg 44.3k/s"), "{line:?}");
-        assert!(line.contains("peak 88.0k/s"), "{line:?}");
+        assert!(line.contains("avg 45.0k/s"), "{line:?}");
+        assert!(line.contains("peak 77.3k/s"), "{line:?}");
+    }
+
+    /// Sapling and orchard peak half a period apart → maxima sum to 88.0k/s, a moment
+    /// the run never had
+    #[test]
+    fn a_panel_peak_is_the_peak_of_the_stack_not_the_sum_of_its_channels_peaks() {
+        let shielded = fold_sapling(&view().shielded);
+        let sum_of_peaks: f64 = shielded.iter().filter_map(Series::peak).sum();
+        let peak_of_sum = stacked_peak(&shielded);
+        assert!(
+            peak_of_sum < sum_of_peaks * 0.95,
+            "fixture must not have its channels in phase: {peak_of_sum} vs {sum_of_peaks}"
+        );
+        let rendered = render_sync_report(&view(), &theme(), 160);
+        assert!(rendered.contains("peak 77.3k/s"), "{rendered}");
+        assert!(!rendered.contains("peak 88.0k/s"), "sum of peaks leaked back in");
     }
 
     /// Truncating would drop a pool's total with nothing to show it happened

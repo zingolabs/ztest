@@ -10,20 +10,70 @@
 //!   every probe matching on one. The shared part is [`Work`], reused whole
 
 use super::work::{Op, Rate, Work};
-use crate::metrics::Exposition;
+use crate::metrics::{Exposition, Family, Phi, Tally, windowed_quantile};
 use crate::rate::{Pace, Stamp};
 
-/// Where a component's per-block time goes; all-`None` for one publishing no timing
-/// summaries (a fact about it, not a zero).
+/// Timing family as scraped, undivided like every counter here — [`Window`] owns the span,
+/// and a mean taken at the scrape is a lifetime one that converges away from the decay.
 ///
-/// - `fetch_ms`/`treestate_ms` = source reads (in-process backend → this cpu, not upstream)
-/// - `parse_ms` = build - both = assembly the component does itself
+/// `buckets` empty = producer left it unbucketed → mean only, no quantile
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Timing {
+    pub tally: Tally,
+    pub buckets: std::sync::Arc<[(f64, f64)]>,
+}
+
+/// Mean + tail together (a mean hides the stall, a p99 cannot say if it is the common case)
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Latency {
+    pub mean_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+}
+
+/// Where a component's per-block time goes; all-`None` = publishes no timing histograms.
+///
+/// - `fetch`/`treestate` = source reads (in-process backend → this cpu, not upstream)
+/// - `assemble` = its own timer, not differenced out of an enclosing one
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Cost {
-    pub fetch_ms: Option<f64>,
-    pub treestate_ms: Option<f64>,
-    pub parse_ms: Option<f64>,
-    pub grpc_ms: Option<f64>,
+    pub fetch: Option<Timing>,
+    pub treestate: Option<Timing>,
+    pub assemble: Option<Timing>,
+    pub grpc: Option<Timing>,
+}
+
+/// [`Cost`] differenced across a window
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CostMs {
+    pub fetch: Latency,
+    pub treestate: Latency,
+    pub assemble: Latency,
+    pub grpc: Latency,
+}
+
+impl Cost {
+    /// Parts answer independently — a quiet gRPC window says nothing about block fetches
+    pub fn over(before: &Cost, after: &Cost) -> CostMs {
+        CostMs {
+            fetch: Timing::over(&before.fetch, &after.fetch),
+            treestate: Timing::over(&before.treestate, &after.treestate),
+            assemble: Timing::over(&before.assemble, &after.assemble),
+            grpc: Timing::over(&before.grpc, &after.grpc),
+        }
+    }
+}
+
+impl Timing {
+    /// Absent either end = family unpublished for that scrape
+    fn over(before: &Option<Timing>, after: &Option<Timing>) -> Latency {
+        let (Some(b), Some(a)) = (before, after) else {
+            return Latency::default();
+        };
+        Latency {
+            mean_ms: Tally::mean_ms(b.tally, a.tally),
+            p99_ms: windowed_quantile(&b.buckets, &a.buckets, Phi::P99),
+        }
+    }
 }
 
 /// One scrape resolved into the live columns.
@@ -84,12 +134,40 @@ impl From<&super::Snapshot> for Observation {
 #[derive(Debug, Clone, Copy)]
 pub struct Heights {
     /// Durable frontier — written and fsynced. What a probe gates on
-    pub committed: &'static str,
+    pub committed: Family,
     /// Frontier built ahead of the next commit; moves per block. What a display shows,
     /// since `committed` steps once per commit and carries no per-second rate
-    pub live: Option<&'static str>,
+    pub live: Option<Family>,
     /// Completion denominator. `None` = component publishes no target
-    pub target: Option<&'static str>,
+    pub target: Option<Family>,
+}
+
+/// Where a watcher's numbers come from. `Exporter` carries a `ztest.io/component`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservedSource {
+    DriverTicks,
+    Exporter(String),
+}
+
+/// Subject's own answer to "what am I, and what publishes my numbers".
+///
+/// Travels driver → controller: the CLI never sees the profile that bound the subject, and
+/// a guess renders one component's progress under another's name
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observed {
+    pub name: String,
+    pub source: ObservedSource,
+}
+
+impl Observed {
+    /// Subject reads its own engine — no exporter to scrape
+    pub fn ticks(name: impl Into<String>) -> Observed {
+        Observed { name: name.into(), source: ObservedSource::DriverTicks }
+    }
+
+    pub fn exporter(name: impl Into<String>, component: impl Into<String>) -> Observed {
+        Observed { name: name.into(), source: ObservedSource::Exporter(component.into()) }
+    }
 }
 
 /// Live progress readable from one scrape of a component's exporter.
@@ -107,7 +185,7 @@ pub trait Observe: crate::metrics::MetricLayout {
 
     /// Per-[`Op`] counters this component publishes. An `Op` absent here stays
     /// unmeasured: [`Work::require`] panics rather than compare a zero that can never fail
-    const WORK_OPS: &'static [(Op, &'static str)];
+    const WORK_OPS: &'static [(Op, Family)];
 
     /// `None` = not this component's exposition (nothing it should publish is present)
     fn observe(exposition: &Exposition) -> Option<Observation>;
@@ -124,7 +202,7 @@ pub trait Observe: crate::metrics::MetricLayout {
     }
 
     /// Which family measures `op`, or `None` when this component does not count it
-    fn work_source(op: Op) -> Option<&'static str> {
+    fn work_source(op: Op) -> Option<Family> {
         Self::WORK_OPS.iter().find_map(|&(o, family)| (o == op).then_some(family))
     }
 
@@ -144,7 +222,7 @@ pub trait Observe: crate::metrics::MetricLayout {
     }
 
     #[doc(hidden)]
-    fn height(exposition: &Exposition, order: [Option<&'static str>; 2]) -> Option<u32> {
+    fn height(exposition: &Exposition, order: [Option<Family>; 2]) -> Option<u32> {
         order.into_iter().flatten().find_map(|f| exposition.height_gauge(f))
     }
 }

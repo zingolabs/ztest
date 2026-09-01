@@ -1364,6 +1364,20 @@ fn unsatisfied_for(p: &ztest_ui::ProbeRow) -> String {
     }
 }
 
+/// Blocks the last grid sample may honestly trail the record by: one step + the rate
+/// window's lag, at the run's own pace.
+///
+/// Self-scaling — a regtest run moves thousands inside one step, a stalled mainnet one none
+fn stale_scrape_slack(elapsed: Duration, blocks_per_sec: Option<f64>) -> u32 {
+    let Some(pace) = blocks_per_sec.filter(|p| p.is_finite() && *p >= 0.0) else {
+        // Unknown pace → no honest bound, so never flag
+        return u32::MAX;
+    };
+    let grid = ztest::api::metrics::Grid::for_span(elapsed);
+    let lag = (grid.step + grid.rate_window).as_secs_f64();
+    ((pace * lag).ceil() as u32).max(1)
+}
+
 /// Header of a finished run: the mirror is the verdict, and outlives the pod
 fn mirror_header(r: &SyncReportMirror) -> ReportView {
     ReportView {
@@ -1376,6 +1390,10 @@ fn mirror_header(r: &SyncReportMirror) -> ReportView {
             Some(ops) => format!("{} ({} ops)", s.describe(), thousands(ops)),
             None => s.describe(),
         }),
+        // Both durable — a height off the query grid lands up to one step early, printing
+        // a shortfall that is scrape cadence rather than the run
+        height: r.segment.as_ref().map(|s| s.to).zip(r.target),
+        unpublished: r.unpublished.clone(),
         elapsed: r
             .segment
             .as_ref()
@@ -1476,12 +1494,11 @@ async fn build_report_view(
         view.elapsed = window.1.duration_since(window.0).unwrap_or_default();
     }
 
-    // One column per sample: asking for more only repeats points, and asking for
-    // fewer throws away detail the plot has room to draw
-    let points = render::width().min(160) / 2;
+    // Analysis grid, not the terminal — the renderer decimates downstream, where a
+    // min/max envelope keeps the peaks a viewport-sized query would have smoothed away
     let rows: Vec<_> = ztest::backends::metrics_components().copied().collect();
 
-    match ztest::api::metrics::history(client, ns, &rows, window, points).await {
+    match ztest::api::metrics::history(client, ns, &rows, window).await {
         // Empty from a run shorter than a few scrapes is arithmetic, not a broken obs
         // stack — pointing those at `cluster setup` sends the reader to fix what works
         None => {
@@ -1509,6 +1526,8 @@ async fn build_report_view(
             view.shielded = of(Facet::Shielded);
             view.blocks = of(Facet::Blocks);
             view.throughput = of(Facet::Throughput);
+            view.write_path = of(Facet::WritePath);
+            view.store = of(Facet::Store);
 
             let progress = |label: &str, pick: fn(&ztest::api::metrics::Series) -> Option<f64>| {
                 series
@@ -1517,23 +1536,25 @@ async fn build_report_view(
                     .and_then(pick)
                     .map(|v| v as u32)
             };
-            // Reached = where it *stopped* (last), objective = constant across the run so
-            // `peak` survives a dropped final scrape. Tip only ever annotates: measuring
-            // against it marks a run that met its target short by whatever the chain did
-            let reached = progress("finalized", ztest::api::metrics::Series::last);
-            let objective = progress("target", ztest::api::metrics::Series::peak)
-                .or_else(|| progress("chain tip", ztest::api::metrics::Series::last));
-            // Only where the TSDB has an answer: a live seed already carries the tick
-            // stream's height, which is fresher, and `None` here must not erase it
-            if let Some(height) = reached.zip(objective) {
-                view.height = Some(height);
+            // Record owns the verdict's numbers; the TSDB only confirms them, and a
+            // disagreement is shown rather than resolved
+            let observed = progress("finalized", ztest::api::metrics::Series::last);
+            let pace = view.blocks.first().and_then(ztest::api::metrics::Series::mean);
+            let tolerance = stale_scrape_slack(view.elapsed, pace);
+            view.height_check = view.height.zip(observed).and_then(|((recorded, _), observed)| {
+                (recorded.abs_diff(observed) > tolerance).then_some((recorded, observed))
+            });
+            // Record never landed → still a height, marked provisional by the absent check
+            if view.height.is_none() {
+                let objective = progress("target", ztest::api::metrics::Series::last)
+                    .or_else(|| progress("chain tip", ztest::api::metrics::Series::last));
+                view.height = observed.zip(objective);
             }
             view.tip = progress("chain tip", ztest::api::metrics::Series::last).or(view.tip);
         }
     }
 
-    if let Some(history) = ztest::api::metrics::container_history(client, ns, window, points).await
-    {
+    if let Some(history) = ztest::api::metrics::container_history(client, ns, window).await {
         view.resources = by_component(history);
     }
     view

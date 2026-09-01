@@ -73,9 +73,8 @@ const POD_POLL: Duration = Duration::from_secs(2);
 /// flood on a days-old sync
 const TAIL_LINES: i64 = 200;
 
-/// Component whose log rides alongside the driver's = the indexer (a sync
-/// profile's subject). By category, not backend name, so `lightwalletd` is
-/// followed like `zainod`
+/// Component whose **log** rides alongside the driver's, by category so `lightwalletd` is
+/// followed like `zainod`. Scrollback only — whose *numbers* show comes from `Observing`
 const SUT_SELECTOR: &str = "ztest.io/component-category=indexer";
 
 type LineStream = std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<String>> + Send>>;
@@ -153,7 +152,6 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd> {
         ztest::api::metrics::LIVE_PERIOD,
     );
 
-    feed.observed = true;
     let tail = tail_loop(
         Followed { driver: &driver, sut: &api, client: &client, namespace: &ns },
         &mut metrics,
@@ -597,10 +595,9 @@ mod tmpl {
 /// derived quantities (scan rate, ETA) no single event carries.
 pub(super) struct Feed {
     pub(super) state: SyncWatchState,
-    /// Live scrape feeding the panel → the 5s tick stops writing vitals and
-    /// contributes only phase + reorg depth (two writers would flip the panel
-    /// between a 1s and a 5s reading); `ztest sync status` keeps the tick-fed path
-    pub(super) observed: bool,
+    /// From the subject's `Observing`, never inferred — a guess scrapes whichever indexer
+    /// is in the namespace and labels its progress as the subject's. `None` = undeclared
+    pub(super) observing: Option<ztest::sync::ObservedSource>,
     /// One estimator, two clocks: scrapes stamped as observed here, driver ticks on
     /// the driver's own elapsed (a resumed stream replays a minute in milliseconds)
     scraped: Window,
@@ -626,7 +623,7 @@ impl Feed {
     fn new(profile: String, sync_id: String, context: String, pod_phase: String) -> Feed {
         Feed {
             state: SyncWatchState { profile, sync_id, context, pod_phase, ..Default::default() },
-            observed: false,
+            observing: None,
             scraped: Window::new(ztest::api::metrics::LIVE_PERIOD),
             ticked: Window::new(ztest::sync::DEFAULT_TICK),
             tick: ztest::sync::DEFAULT_TICK,
@@ -643,10 +640,14 @@ impl Feed {
     /// rates and per-block cost all come off one exposition → no two columns can
     /// describe different instants
     fn observe(&mut self, sample: &Sample, component: Option<&str>, elapsed: Duration) {
+        // Only the declared component — anything else is a different process
+        let Some(ztest::sync::ObservedSource::Exporter(declared)) = self.observing.as_ref() else {
+            return;
+        };
         let fresh = sample
             .at
             .filter(|at| self.observed_at.is_none_or(|folded| *at > folded))
-            .zip(component)
+            .zip(component.filter(|name| name == declared))
             .and_then(|(at, name)| Some((at, ztest::backends::observe(name, &sample.exposition)?)));
 
         if let Some((at, observation)) = fresh {
@@ -656,6 +657,11 @@ impl Feed {
             self.record_series(elapsed);
         }
         self.state.metrics_note = sample.note(self.state.vitals.is_some());
+    }
+
+    /// Until the subject declares an exporter, ticks are the reading
+    fn scrape_owns_vitals(&self) -> bool {
+        matches!(self.observing, Some(ztest::sync::ObservedSource::Exporter(_)))
     }
 
     /// One window → the panel's vitals. Same fold whichever clock fed it, so no column
@@ -678,7 +684,11 @@ impl Feed {
             tx_rate: window.tx_rate(),
             work_rate: work.and_then(|r| r.total()),
             pool_rates: work.map(|r| r.channels().to_vec()).unwrap_or_default(),
-            cost: observation.cost,
+            // Same endpoints as every rate beside it → this window, not the whole run
+            cost: window
+                .endpoints()
+                .map(|(first, last, _)| ztest::api::Cost::over(&first.cost, &last.cost))
+                .unwrap_or_default(),
             received_at: elapsed,
         })
     }
@@ -774,6 +784,20 @@ impl Feed {
                     .value("tick", *tick_ms as f64);
                 Some(draw(tmpl::STARTED, &f, theme))
             }
+            // Republished, so a controller attaching hours in still learns both
+            SyncEvent::Observing { subject, component, tick_ms } => {
+                let tick = Duration::from_millis(*tick_ms);
+                if self.tick != tick {
+                    self.tick = tick;
+                    self.ticked = Window::new(tick);
+                }
+                self.state.subject = Some(subject.clone());
+                self.observing = Some(match component {
+                    Some(c) => ztest::sync::ObservedSource::Exporter(c.clone()),
+                    None => ztest::sync::ObservedSource::DriverTicks,
+                });
+                None
+            }
             SyncEvent::Tick(t) => {
                 // Engine state; no exporter publishes it, so every path needs it here
                 self.phase = Some(t.phase);
@@ -785,7 +809,7 @@ impl Feed {
                     vitals.reorg_depth = t.reorg_depth;
                 }
                 self.ticked.push(t.at(), t.into());
-                if !self.observed {
+                if !self.scrape_owns_vitals() {
                     self.state.vitals = self.vitals_of(&self.ticked, elapsed);
                 }
                 verbose.then(|| {
@@ -803,7 +827,7 @@ impl Feed {
             // Ignored under a live scrape, which builds its own second-by-second
             // series (taking turns would change sparkline resolution mid-read)
             SyncEvent::Series { timeline } => {
-                if !self.observed {
+                if !self.scrape_owns_vitals() {
                     self.state.timeline = Some(timeline.clone());
                 }
                 None
@@ -855,12 +879,16 @@ mod tests {
         )
     }
 
-    /// zaino exposition at `height`: `transparent` cumulative ops + per-block
-    /// timing summary = the subset the panel resolves
+    /// zaino exposition at `height`, the subset the panel resolves. `blocks` = observations
+    /// behind the timing histograms — held constant they read as an unobserved window
     fn exposition(
         height: u32,
         transparent: u64,
+        blocks: u64,
     ) -> std::sync::Arc<ztest::api::metrics::Exposition> {
+        // Per-block: 6ms fetch, 1ms treestate, 10ms assemble
+        let (fetch, treestate, assemble) =
+            (0.006 * blocks as f64, 0.001 * blocks as f64, 0.010 * blocks as f64);
         let text = format!(
             "# TYPE zaino_sync_fetched_height gauge\n\
              zaino_sync_fetched_height {height}\n\
@@ -868,23 +896,24 @@ mod tests {
              zaino_sync_target_height 1024\n\
              # TYPE zaino_sync_transparent_outputs_total counter\n\
              zaino_sync_transparent_outputs_total{{stage=\"finalised\"}} {transparent}\n\
-             # TYPE zaino_sync_block_build_seconds summary\n\
-             zaino_sync_block_build_seconds_sum 1.0\n\
-             zaino_sync_block_build_seconds_count 100\n\
-             # TYPE zaino_sync_block_fetch_seconds summary\n\
-             zaino_sync_block_fetch_seconds_sum 0.6\n\
-             zaino_sync_block_fetch_seconds_count 100\n\
-             # TYPE zaino_sync_treestate_fetch_seconds summary\n\
-             zaino_sync_treestate_fetch_seconds_sum 0.1\n\
-             zaino_sync_treestate_fetch_seconds_count 100\n"
+             zaino_sync_transparent_outputs_total{{stage=\"non-finalised\"}} 99\n\
+             # TYPE zaino_sync_block_assemble_seconds histogram\n\
+             zaino_sync_block_assemble_seconds_sum{{stage=\"finalised\"}} {assemble}\n\
+             zaino_sync_block_assemble_seconds_count{{stage=\"finalised\"}} {blocks}\n\
+             # TYPE zaino_sync_block_fetch_seconds histogram\n\
+             zaino_sync_block_fetch_seconds_sum{{stage=\"finalised\"}} {fetch}\n\
+             zaino_sync_block_fetch_seconds_count{{stage=\"finalised\"}} {blocks}\n\
+             # TYPE zaino_sync_treestate_fetch_seconds histogram\n\
+             zaino_sync_treestate_fetch_seconds_sum{{stage=\"finalised\"}} {treestate}\n\
+             zaino_sync_treestate_fetch_seconds_count{{stage=\"finalised\"}} {blocks}\n"
         );
         let mut e = ztest::api::metrics::Exposition::default();
         e.absorb(&text);
         std::sync::Arc::new(e)
     }
 
-    fn sample(at: Instant, height: u32, transparent: u64) -> Sample {
-        Sample { at: Some(at), exposition: exposition(height, transparent), error: None }
+    fn sample(at: Instant, height: u32, transparent: u64, blocks: u64) -> Sample {
+        Sample { at: Some(at), exposition: exposition(height, transparent, blocks), error: None }
     }
 
     /// Whole live display in one path: two zaino scrapes → height, scan rate,
@@ -892,10 +921,10 @@ mod tests {
     #[test]
     fn two_scrapes_become_the_panels_vitals() {
         let mut f = feed();
-        f.observed = true;
+        f.observing = Some(ztest::sync::ObservedSource::Exporter("zainod".into()));
         let origin = Instant::now();
 
-        f.observe(&sample(origin, 900, 1_000), Some("zainod"), Duration::ZERO);
+        f.observe(&sample(origin, 900, 1_000, 100), Some("zainod"), Duration::ZERO);
         let first = f.state.vitals.as_ref().expect("a scrape is a reading");
         assert_eq!(first.height, 900);
         assert_eq!(first.target, Some(1024));
@@ -903,20 +932,38 @@ mod tests {
             first.pace, None,
             "one scrape cannot be a rate, and must not be shown as a zero"
         );
-        assert_eq!(first.cost.fetch_ms, Some(6.0));
-        assert_eq!(first.cost.treestate_ms, Some(1.0));
         assert_eq!(
-            first.cost.parse_ms,
-            Some(3.0),
-            "build 10ms minus both source reads (6ms + 1ms) is zaino's own per-block cost"
+            first.cost,
+            ztest::api::CostMs::default(),
+            "a latency is a mean over a span; one scrape carries only the lifetime figure"
         );
 
         f.observe(
-            &sample(origin + Duration::from_secs(2), 1_000, 3_000),
+            &sample(origin + Duration::from_secs(2), 1_000, 3_000, 200),
             Some("zainod"),
             Duration::from_secs(2),
         );
         let v = f.state.vitals.as_ref().expect("still reading");
+        assert_eq!(
+            v.cost.fetch.mean_ms,
+            Some(6.0),
+            "0.6s over the 100 blocks observed in this window"
+        );
+        assert_eq!(v.cost.treestate.mean_ms, Some(1.0));
+        assert_eq!(
+            v.cost.assemble.mean_ms,
+            Some(10.0),
+            "assembly is its own timer now, not an enclosing build minus the source reads"
+        );
+        assert_eq!(
+            v.cost.fetch.p99_ms, None,
+            "this fixture publishes no buckets, so the tail is unanswerable — not zero"
+        );
+        assert_eq!(
+            v.cost.grpc,
+            ztest::api::Latency::default(),
+            "a family this exposition never published stays absent"
+        );
         assert_eq!(v.height, 1_000);
         assert_eq!(v.pace.map(|p| p.per_sec), Some(50.0), "100 blocks over 2s");
         assert_eq!(
@@ -933,17 +980,70 @@ mod tests {
         assert!(f.state.metrics_note.is_none(), "nothing to explain away");
     }
 
+    /// Wallet through zaino: folding zaino's scrapes renders its frontier — at tip, so
+    /// 100% and ~0 blk/s — as the wallet's progress
+    #[test]
+    fn a_subject_that_declares_no_exporter_ignores_a_neighbours_scrapes() {
+        let mut f = feed();
+        f.absorb(
+            ztest::sync::encode_event(&ztest::sync::SyncEvent::Observing {
+                subject: "librustzcash wallet".into(),
+                component: None,
+                tick_ms: 5_000,
+            })
+            .trim_end(),
+            Duration::ZERO,
+            &theme(),
+        );
+        assert_eq!(f.state.subject.as_deref(), Some("librustzcash wallet"));
+
+        f.observe(&sample(Instant::now(), 900, 1_000, 100), Some("zainod"), Duration::ZERO);
+        assert!(
+            f.state.vitals.is_none(),
+            "zaino's frontier is not this subject's progress: {:?}",
+            f.state.vitals
+        );
+    }
+
+    /// Declaring one component must not admit another's exposition either
+    #[test]
+    fn a_scrape_of_an_undeclared_component_is_dropped() {
+        let mut f = feed();
+        f.observing = Some(ztest::sync::ObservedSource::Exporter("lightwalletd".into()));
+        f.observe(&sample(Instant::now(), 900, 1_000, 100), Some("zainod"), Duration::ZERO);
+        assert!(f.state.vitals.is_none(), "{:?}", f.state.vitals);
+    }
+
+    /// Cadence sizes every rate window; lost from the log tail it leaves the window
+    /// narrower than the tick gap, clearing the ring on every push
+    #[test]
+    fn the_declaration_carries_the_tick_so_a_late_watcher_sizes_its_window() {
+        let mut f = feed();
+        assert_eq!(f.tick, ztest::sync::DEFAULT_TICK);
+        f.absorb(
+            ztest::sync::encode_event(&ztest::sync::SyncEvent::Observing {
+                subject: "zaino index".into(),
+                component: Some("zainod".into()),
+                tick_ms: 30_000,
+            })
+            .trim_end(),
+            Duration::ZERO,
+            &theme(),
+        );
+        assert_eq!(f.tick, Duration::from_secs(30), "a 30s tick must resize the window");
+    }
+
     /// Failed scrape re-sends the last exposition under its original timestamp;
     /// re-folding differences a reading against itself = a phantom stall
     #[test]
     fn a_repeated_sample_is_not_folded_twice() {
         let mut f = feed();
-        f.observed = true;
+        f.observing = Some(ztest::sync::ObservedSource::Exporter("zainod".into()));
         let origin = Instant::now();
-        let first = sample(origin, 900, 1_000);
+        let first = sample(origin, 900, 1_000, 100);
         f.observe(&first, Some("zainod"), Duration::ZERO);
         f.observe(
-            &sample(origin + Duration::from_secs(1), 1_000, 2_000),
+            &sample(origin + Duration::from_secs(1), 1_000, 2_000, 200),
             Some("zainod"),
             Duration::from_secs(1),
         );
@@ -963,8 +1063,8 @@ mod tests {
     #[test]
     fn a_tick_contributes_only_what_the_exporter_cannot_publish() {
         let mut f = feed();
-        f.observed = true;
-        f.observe(&sample(Instant::now(), 900, 1_000), Some("zainod"), Duration::ZERO);
+        f.observing = Some(ztest::sync::ObservedSource::Exporter("zainod".into()));
+        f.observe(&sample(Instant::now(), 900, 1_000, 100), Some("zainod"), Duration::ZERO);
         let tick = ztest::sync::encode_event(&tick_at(1, 5, 0));
         f.absorb(tick.trim_end(), Duration::ZERO, &theme());
 

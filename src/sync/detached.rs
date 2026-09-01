@@ -361,6 +361,11 @@ pub struct SyncReportMirror {
     pub segment: Option<crate::sync::Segment>,
     #[serde(default)]
     pub ended_ms: Option<u64>,
+    /// Recorded, not re-derived: a denominator read off a series makes one bad scrape a shortfall
+    #[serde(default)]
+    pub target: Option<u32>,
+    #[serde(default)]
+    pub unpublished: Vec<String>,
 }
 
 /// Recorded violation, projected for the durable report
@@ -382,6 +387,8 @@ impl SyncReportMirror {
             profile: profile.to_string(),
             verdict: outcome.verdict,
             segment: outcome.segment.clone(),
+            target: outcome.target,
+            unpublished: outcome.unpublished.clone(),
             ended_ms: Some(epoch_millis(std::time::SystemTime::now())),
             ticks: outcome.ticks,
             dropped_snapshots: outcome.dropped_snapshots,
@@ -618,6 +625,8 @@ mod tests {
             error: None,
             ended_ms: None,
             segment: None,
+            target: None,
+            unpublished: Vec::new(),
         }
     }
 

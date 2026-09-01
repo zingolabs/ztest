@@ -1414,6 +1414,7 @@ mod tests {
             context: "zingo-infra".into(),
             pod_phase: "Running".into(),
             setup: None,
+            subject: Some("zaino index".into()),
             vitals,
             metrics_note: None,
             probes: Vec::new(),
@@ -1437,6 +1438,9 @@ mod tests {
     const FRAME: std::time::Duration = std::time::Duration::from_secs(212);
 
     fn sample_vitals() -> SyncVitals {
+        fn latency(mean_ms: f64, p99_ms: f64) -> ztest::api::Latency {
+            ztest::api::Latency { mean_ms: Some(mean_ms), p99_ms: Some(p99_ms) }
+        }
         SyncVitals {
             height: 901,
             target: Some(1024),
@@ -1459,11 +1463,11 @@ mod tests {
                 ("orchard", Some(4_200.0)),
                 ("ironwood", Some(0.0)),
             ],
-            cost: ztest::api::Cost {
-                fetch_ms: Some(41.2),
-                treestate_ms: Some(2.1),
-                parse_ms: Some(6.8),
-                grpc_ms: Some(4.13),
+            cost: ztest::api::CostMs {
+                fetch: latency(41.2, 96.0),
+                treestate: latency(2.1, 5.0),
+                assemble: latency(6.8, 14.0),
+                grpc: latency(4.13, 11.0),
             },
             received_at: std::time::Duration::from_secs(210),
         }

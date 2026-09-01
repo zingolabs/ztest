@@ -38,7 +38,9 @@ pub use nemesis::{
     Buggify, BuggifyRule, Delay, Fault, FaultKind, Nemesis, NemesisBuilder, NetemSpec,
     ScheduledFault,
 };
-pub use observe::{Cost, Heights, Observation, Observe, Window};
+pub use observe::{
+    Cost, CostMs, Heights, Latency, Observation, Observe, Observed, ObservedSource, Timing, Window,
+};
 pub use probe::{
     Cadence, Class, ProbeBuilder, ProbeState, ProbeStatus, Severity, SyncCtx, Verdict, Violation,
     hours, mins, secs,

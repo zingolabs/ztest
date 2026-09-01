@@ -15,7 +15,7 @@ use kube::Client;
 use kube::api::{Api, ListParams};
 use tokio::sync::{Mutex, watch};
 
-use super::{Exposition, MetricKind, PORT_NAME, Row, scrape};
+use super::{Exposition, PORT_NAME, Row, scrape};
 use crate::error::EnvError;
 use crate::portforward::Forwarder;
 use crate::protocol::Endpoint;
@@ -45,49 +45,7 @@ pub trait Exporter: Send + Sync + 'static {
         let http = reqwest::Client::new();
         scrape(&http, &endpoint.url("http"), timeout).await
     }
-
-    /// One metric by its **exposition family name** (`zaino_db_tip_height`, …), read as
-    /// `kind`. The caller names the wire family, so nothing here can drift from what the
-    /// component publishes.
-    ///
-    /// - `Ok(None)` = scraped fine, family not there. A real answer, not an error: a
-    ///   gauge exists only once first set, so a caller polling for a value must be able
-    ///   to keep polling across the window before the first write
-    /// - `Err` = the exporter itself could not be read, after retrying every
-    ///   `sample_rate` ([`DEFAULT_SAMPLE_RATE`] when `None`) for [`SCRAPE_RETRY_BUDGET`].
-    ///   A pod mid-replacement or a blipping portforward resolves inside that window; a
-    ///   wedged endpoint is named rather than mistaken for an unpublished family
-    async fn metric(
-        &self,
-        name: &str,
-        kind: MetricKind,
-        sample_rate: Option<Duration>,
-    ) -> Result<Option<f64>, crate::error::PipelineError> {
-        let rate = sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
-        let deadline = tokio::time::Instant::now() + SCRAPE_RETRY_BUDGET;
-        loop {
-            match self.read(SCRAPE_TIMEOUT).await {
-                Ok(exposition) => return Ok(exposition.read(name, kind)),
-                Err(e) if tokio::time::Instant::now() >= deadline => {
-                    return Err(format!(
-                        "{name}: /metrics unreadable for {SCRAPE_RETRY_BUDGET:?}: {e}"
-                    )
-                    .into());
-                }
-                Err(_) => tokio::time::sleep(rate).await,
-            }
-        }
-    }
 }
-
-/// `metric`'s re-scrape cadence when the caller names none
-pub const DEFAULT_SAMPLE_RATE: Duration = Duration::from_secs(5);
-/// How long `metric` keeps retrying an unreadable exporter before naming it. Covers a
-/// pod mid-replacement or a portforward blip; a family that is merely absent never
-/// reaches this (it is `Ok(None)` on the first successful scrape)
-const SCRAPE_RETRY_BUDGET: Duration = Duration::from_secs(5);
-/// One `/metrics` HTTP read
-const SCRAPE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Exporter reached from **outside** the cluster: pod by `ztest.io/component-category`,
 /// forwarded to its [`PORT_NAME`] port, `rows_for` keyed on `ztest.io/component`.
@@ -380,7 +338,9 @@ mod tests {
     #[test]
     fn a_sample_states_why_it_has_no_values() {
         let at = || Some(Instant::now());
-        let tip = |s: &Sample| s.exposition.reduce("zaino_chain_tip_height", Reduce::Max);
+        let tip = |s: &Sample| {
+            s.exposition.reduce(crate::metrics::family("zaino_chain_tip_height"), Reduce::Max)
+        };
 
         // never read → no target yet
         let never = Sample::default();
@@ -432,6 +392,9 @@ mod tests {
         });
         let after = failed(&tx, "connection refused".into());
         assert_eq!(after.error.as_deref(), Some("connection refused"));
-        assert_eq!(after.exposition.reduce("zaino_chain_tip_height", Reduce::Max), Some(304.0));
+        assert_eq!(
+            after.exposition.reduce(crate::metrics::family("zaino_chain_tip_height"), Reduce::Max),
+            Some(304.0)
+        );
     }
 }

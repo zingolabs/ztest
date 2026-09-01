@@ -31,6 +31,7 @@ pub struct EventReporter {
     /// own graph and a watcher's columns cannot disagree about a rate
     window: crate::rate::Window<Observation, std::time::Duration>,
     published_at: Option<std::time::Duration>,
+    observed: Option<crate::sync::Observed>,
 }
 
 impl EventReporter {
@@ -50,6 +51,7 @@ impl EventReporter {
             probes,
             started: None,
             published_at: None,
+            observed: None,
         }
     }
 
@@ -78,17 +80,34 @@ impl EventReporter {
     fn series_due(&self, elapsed: std::time::Duration) -> bool {
         self.published_at.is_none_or(|last| elapsed.saturating_sub(last) >= SERIES_INTERVAL)
     }
+
+    /// On the series cadence — a controller folds a bounded log tail, so a t=0-only fact is lost
+    fn emit_observing(&self) {
+        let Some(observed) = &self.observed else {
+            return;
+        };
+        Self::emit(&SyncEvent::Observing {
+            subject: observed.name.clone(),
+            component: match &observed.source {
+                crate::sync::ObservedSource::DriverTicks => None,
+                crate::sync::ObservedSource::Exporter(c) => Some(c.clone()),
+            },
+            tick_ms: self.tick.as_millis() as u64,
+        });
+    }
 }
 
 impl SyncReporter for EventReporter {
-    fn on_start(&mut self) {
+    fn on_start(&mut self, observed: &crate::sync::Observed) {
         self.started = Some(Instant::now());
+        self.observed = Some(observed.clone());
         Self::emit(&SyncEvent::Started {
             profile: self.profile.clone(),
             sync_id: self.sync_id.clone(),
             tick_ms: self.tick.as_millis() as u64,
             probes: self.probes,
         });
+        self.emit_observing();
     }
 
     fn on_tick(&mut self, snap: &Snapshot) {
@@ -97,6 +116,7 @@ impl SyncReporter for EventReporter {
         self.record(snap, elapsed);
         if self.series_due(elapsed) {
             self.published_at = Some(elapsed);
+            self.emit_observing();
             Self::emit(&SyncEvent::Series { timeline: self.timeline.clone() });
         }
     }

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::RpcError;
 use crate::handles::wallet::PoolBalances;
+use crate::metrics::Exposition;
 
 use super::tree::TreeRoots;
 use super::work::{Op, Work};
@@ -113,7 +114,21 @@ pub trait SyncSubject: Send + Sync {
 
     /// Series [`progress`](Self::progress) reads `op` from, named by the preflight
     /// diagnostic. `None` = no named source (derived work, or an op never counted here)
-    fn work_source(&self, _op: Op) -> Option<&'static str> {
+    /// Default = engine ticks, the reading every subject provably has. Only the subject may
+    /// name an exporter; scraping a neighbour renders its progress under this one's name
+    fn observes(&self) -> super::Observed {
+        super::Observed::ticks("subject")
+    }
+
+    /// Declared rows + one scrape to check them against; `None` = no exporter to check.
+    ///
+    /// Preflight compares the two, so a family renamed upstream fails by name in seconds
+    /// rather than as an em-dash for the length of the run
+    async fn declared(&self) -> Option<(&'static [crate::metrics::Row], Exposition)> {
+        None
+    }
+
+    fn work_source(&self, _op: Op) -> Option<crate::metrics::Family> {
         None
     }
 

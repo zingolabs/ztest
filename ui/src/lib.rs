@@ -291,6 +291,8 @@ pub struct SyncWatchState {
     pub context: String,
     pub pod_phase: String,
     pub setup: Option<SetupStep>,
+    /// From the subject's own `Observing` — no figure shown without naming what produced it
+    pub subject: Option<String>,
     pub vitals: Option<SyncVitals>,
     pub metrics_note: Option<String>,
     pub probes: Vec<ProbeRow>,
@@ -334,7 +336,7 @@ pub struct SyncVitals {
     pub tx_rate: Option<f64>,
     pub work_rate: Option<f64>,
     pub pool_rates: Vec<(&'static str, Option<f64>)>,
-    pub cost: ztest::api::Cost,
+    pub cost: ztest::api::CostMs,
     pub received_at: std::time::Duration,
 }
 

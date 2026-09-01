@@ -33,8 +33,8 @@ pub use crate::qos::live::{LiveSnapshot, TierLive, tier_tally};
 pub use crate::qos::schedule::{PlannedTest, QosPlan, TierPlan, plan as qos_plan};
 pub use crate::qos::{ClusterCapacity, GIB, QosClass, Resources};
 pub use crate::sync::{
-    BLOCKS, CHANNELS, Cost, Phase, ProbeState, SyncStatus, SyncVerdict, Timeline, Work,
-    plot_channels,
+    BLOCKS, CHANNELS, Cost, CostMs, Latency, Phase, ProbeState, SyncStatus, SyncVerdict, Timeline,
+    Timing, Work, plot_channels,
 };
 
 pub mod capability;

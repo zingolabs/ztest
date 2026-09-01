@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kube::Client;
 use serde::Deserialize;
 
-use crate::metrics::{Facet, Reduce, Row, Unit};
+use crate::metrics::{Facet, Family, Reduce, Row, Unit};
 use crate::portforward::Forwarder;
 
 /// [`SCRAPE_CONFIG`](crate::resource::impls::observability)'s interval. A `step` under
@@ -48,17 +48,32 @@ const CONTAINER_DISK: &str = "container_blkio_device_usage_total";
 ///
 /// Mirrors [`Exposition::reduce`](crate::metrics::Exposition::reduce) server-side; one
 /// enum for both keeps a metric from meaning one thing live and another in the report
-fn promql(row: &Row, namespace: &str) -> String {
-    let scope = format!("{{namespace=\"{namespace}\"}}");
+fn promql(row: &Row, namespace: &str, grid: Grid) -> String {
+    let scope = scope_of(row.family, namespace);
+    let family = row.family.name;
+    let w = grid.rate_window.as_secs();
     match row.reduce {
-        Reduce::Sum => format!("sum({}{scope})", row.family),
-        Reduce::Max => format!("max({}{scope})", row.family),
-        // Σ_sum / Σ_count × 1000, guarded: an unobserved summary has count 0, and
-        // PromQL divides to NaN rather than erroring → a plausible-looking `NaN ms`
-        Reduce::MeanMs => format!(
-            "sum({family}_sum{scope}) / clamp_min(sum({family}_count{scope}), 1) * 1000",
-            family = row.family
+        Reduce::Sum => format!("sum({family}{scope})"),
+        Reduce::Max => format!("max({family}{scope})"),
+        // Unguarded: unobserved → 0/0 → NaN → dropped as a gap, matching live's `None`
+        // (a `clamp_min` would print a fabricated `0 ms`)
+        Reduce::Mean => format!(
+            "sum(rate({family}_sum{scope}[{w}s])) / sum(rate({family}_count{scope}[{w}s])) * 1000"
         ),
+        // `rate` before the quantile, `le` kept through the sum (histogram_quantile needs one
+        // series per bound; un-rated answers for all history)
+        Reduce::Quantile(phi) => format!(
+            "histogram_quantile({p}, sum by (le) (rate({family}_bucket{scope}[{w}s]))) * 1000",
+            p = phi.value(),
+        ),
+    }
+}
+
+/// Run namespace + the row's own selector, so both planes narrow a split family alike
+fn scope_of(family: Family, namespace: &str) -> String {
+    match family.select {
+        None => format!("{{namespace=\"{namespace}\"}}"),
+        Some(s) => format!("{{namespace=\"{namespace}\",{}=\"{}\"}}", s.label, s.value),
     }
 }
 
@@ -129,23 +144,27 @@ impl Series {
     }
 }
 
-/// Sampling grid for a range read: one point per plot column, plus the window counters
-/// are differenced over.
+/// Analysis resolution + the span counters are differenced over. Viewport-independent —
+/// derived from terminal width, `rate_window` made every plotted peak a function of it.
 ///
-/// - `rate_window` = 4 steps (2 samples is the minimum for a derivative, 4 survives a
-///   missed scrape without punching a hole in the plot)
+/// - `step` floors at the scrape (finer → Prometheus repeats the last sample)
+/// - `rate_window` ≥ `step` + scrape, always: a window narrower than the step samples
+///   only part of each interval, and the rest reaches no plotted point
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Grid {
     pub step: Duration,
     pub rate_window: Duration,
 }
 
+const ANALYSIS_STEP: Duration = Duration::from_secs(30);
+
+/// Payload ceiling per series (48 h at 30 s = 5,760)
+const MAX_SLOTS: u32 = 6_000;
+
 impl Grid {
-    pub fn for_span(span: Duration, points: usize) -> Grid {
-        let step = Duration::from_secs(
-            (span.as_secs() / points.max(1) as u64).max(SCRAPE_INTERVAL.as_secs()),
-        );
-        Grid { step, rate_window: (step * 4).max(Duration::from_secs(20)) }
+    pub fn for_span(span: Duration) -> Grid {
+        let step = ANALYSIS_STEP.max(span / MAX_SLOTS).max(SCRAPE_INTERVAL);
+        Grid { step, rate_window: (step + SCRAPE_INTERVAL).max(SCRAPE_INTERVAL * 4) }
     }
 }
 
@@ -155,13 +174,13 @@ impl Grid {
 /// [`Reduce`] carries which kind it is (`Sum` = counter, `Max` = gauge), and the two
 /// take different differentiators
 fn promql_series(row: &Row, namespace: &str, grid: Grid) -> String {
-    let (family, w) = (row.family, grid.rate_window.as_secs());
+    let w = grid.rate_window.as_secs();
+    let scope = scope_of(row.family, namespace);
+    let family = row.family.name;
     match (row.unit, row.reduce) {
-        // `rate`, not `irate`: at a 5 s scrape the instantaneous slope is mostly
-        // jitter, and the plot would read as noise over a trend that is really there
-        (Unit::PerSec, Reduce::Sum) => {
-            format!("sum(rate({family}{{namespace=\"{namespace}\"}}[{w}s]))")
-        }
+        // `rate` not `irate` (5 s scrape → instantaneous slope is mostly jitter);
+        // `rate` before `sum` (summing first hides a restart from the reset correction)
+        (Unit::PerSec, Reduce::Sum) => format!("sum(rate({family}{scope}[{w}s]))"),
         // Gauge slope, the TSDB counterpart of
         // [`Window::block_pace`](crate::sync::Window::block_pace).
         //
@@ -169,15 +188,17 @@ fn promql_series(row: &Row, namespace: &str, grid: Grid) -> String {
         //   rollback as a reset and inflates the slope)
         // - `clamp_min` at 0, as `block_pace` drops a retreating frontier rather than
         //   reporting a negative scan rate
+        // - Subquery resolution = the scrape, never `step` (a resolution at or above the
+        //   range yields one sample, and `deriv` needs two → the row vanishes silently)
         (Unit::PerSec, Reduce::Max) => format!(
-            "clamp_min(deriv(max({family}{{namespace=\"{namespace}\"}})[{w}s:{step}s]), 0)",
-            step = grid.step.as_secs().max(1),
+            "clamp_min(deriv(max({family}{scope})[{w}s:{res}s]), 0)",
+            res = SCRAPE_INTERVAL.as_secs(),
         ),
-        _ => promql(row, namespace),
+        _ => promql(row, namespace, grid),
     }
 }
 
-/// Every row as a series over `window`, sampled to about `points` columns.
+/// Every row as a series over `window`, at the analysis resolution.
 ///
 /// Rows with nothing recorded are omitted rather than emitted empty (never-published
 /// != published-zero)
@@ -186,10 +207,9 @@ pub async fn history(
     namespace: &str,
     rows: &[Row],
     window: (SystemTime, SystemTime),
-    points: usize,
 ) -> Option<Vec<Series>> {
     let reader = Reader::open(client).await.ok()?;
-    let grid = Grid::for_span(span(window), points);
+    let grid = Grid::for_span(span(window));
     let mut out = Vec::new();
     for row in rows {
         let query = promql_series(row, namespace, grid);
@@ -230,10 +250,9 @@ pub async fn container_history(
     client: &Client,
     namespace: &str,
     window: (SystemTime, SystemTime),
-    points: usize,
 ) -> Option<ContainerHistory> {
     let reader = Reader::open(client).await.ok()?;
-    let grid = Grid::for_span(span(window), points);
+    let grid = Grid::for_span(span(window));
     let scope = format!("{{namespace=\"{namespace}\",container!=\"\"}}");
 
     let cpu_q = format!(
@@ -572,7 +591,7 @@ fn epoch_secs(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::{AT_REST, Facet, Unit, row};
+    use crate::metrics::{Facet, Unit, family, family_where, row};
 
     /// Verbatim from a live v3.13.2 with the flag absent. `500` + an `unavailable`
     /// errorType: neither the status nor a status→cause table can tell this from a
@@ -588,46 +607,86 @@ mod tests {
     fn a_sum_row_scopes_to_the_run_namespace() {
         let r = row(
             "blocks",
-            "zebrad_chain_verified_block_total",
+            family("zebrad_chain_verified_block_total"),
             Reduce::Sum,
-            AT_REST,
             Unit::Count,
             Facet::Progress,
         );
         assert_eq!(
-            promql(&r, "ztest-sync-abc"),
+            promql(&r, "ztest-sync-abc", grid()),
             r#"sum(zebrad_chain_verified_block_total{namespace="ztest-sync-abc"})"#
         );
+    }
+
+    /// A real grid, never a hand-built one: a query test on invented values asserts a
+    /// shape production never emits
+    fn grid() -> Grid {
+        Grid::for_span(Duration::from_secs(600))
     }
 
     #[test]
     fn a_max_row_uses_max_not_sum() {
         let r = row(
             "height",
-            "zebrad_chain_verified_block_height",
+            family("zebrad_chain_verified_block_height"),
             Reduce::Max,
-            AT_REST,
             Unit::Count,
             Facet::Progress,
         );
-        assert!(promql(&r, "ns").starts_with("max("));
+        assert!(promql(&r, "ns", grid()).starts_with("max("));
     }
 
-    /// Without the guard an un-observed summary divides by zero and reports `NaN ms`
-    /// as though measured
+    /// Lifetime `sum/count` converges, hiding late decay; a guard would print `0 ms` for
+    /// a path that never ran, where live answers `None`
     #[test]
-    fn a_mean_row_guards_against_a_zero_count() {
+    fn a_mean_is_windowed_and_unguarded() {
         let r = row(
             "latency",
-            "zaino_grpc_duration",
-            Reduce::MeanMs,
-            AT_REST,
+            family("zaino_grpc_duration"),
+            Reduce::Mean,
             Unit::Millis,
             Facet::Throughput,
         );
-        let q = promql(&r, "ns");
-        assert!(q.contains("clamp_min(sum(zaino_grpc_duration_count{namespace=\"ns\"}), 1)"));
-        assert!(q.ends_with("* 1000"));
+        let q = promql(&r, "ns", grid());
+        assert!(!q.contains("clamp_min"), "{q}");
+        assert_eq!(
+            q,
+            r#"sum(rate(zaino_grpc_duration_sum{namespace="ns"}[35s])) / sum(rate(zaino_grpc_duration_count{namespace="ns"}[35s])) * 1000"#
+        );
+    }
+
+    /// `histogram_quantile` needs one series per `le`, and the buckets must be rated
+    /// before the quantile or it answers for all history rather than this window
+    #[test]
+    fn a_quantile_rates_the_buckets_and_keeps_le_through_the_sum() {
+        let r = row(
+            "fetch p99",
+            family_where("zaino_sync_block_fetch_seconds", "stage", "finalised"),
+            Reduce::Quantile(crate::metrics::Phi::P99),
+            Unit::Millis,
+            Facet::WritePath,
+        );
+        assert_eq!(
+            promql(&r, "ns", grid()),
+            r#"histogram_quantile(0.99, sum by (le) (rate(zaino_sync_block_fetch_seconds_bucket{namespace="ns",stage="finalised"}[35s]))) * 1000"#
+        );
+    }
+
+    /// zaino splits every per-block family on `stage`; folding it counts one block
+    /// once per ingest pass, so the selector must reach the query
+    #[test]
+    fn a_split_family_carries_its_selector_into_the_query() {
+        let r = row(
+            "orchard",
+            family_where("zaino_sync_orchard_actions_total", "stage", "finalised"),
+            Reduce::Sum,
+            Unit::PerSec,
+            Facet::Shielded,
+        );
+        assert_eq!(
+            promql_series(&r, "ns", grid()),
+            r#"sum(rate(zaino_sync_orchard_actions_total{namespace="ns",stage="finalised"}[35s]))"#
+        );
     }
 
     /// A counter plotted raw climbs to its total and says nothing about throughput;
@@ -636,18 +695,19 @@ mod tests {
     fn a_cumulative_row_is_differentiated_for_a_plot_but_not_for_a_total() {
         let r = row(
             "orchard",
-            "zaino_sync_orchard_actions_total",
+            family("zaino_sync_orchard_actions_total"),
             Reduce::Sum,
-            AT_REST,
             Unit::PerSec,
             Facet::Shielded,
         );
-        let grid = Grid { step: Duration::from_secs(15), rate_window: Duration::from_secs(60) };
         assert_eq!(
-            promql_series(&r, "ns", grid),
-            r#"sum(rate(zaino_sync_orchard_actions_total{namespace="ns"}[60s]))"#
+            promql_series(&r, "ns", grid()),
+            r#"sum(rate(zaino_sync_orchard_actions_total{namespace="ns"}[35s]))"#
         );
-        assert_eq!(promql(&r, "ns"), r#"sum(zaino_sync_orchard_actions_total{namespace="ns"})"#);
+        assert_eq!(
+            promql(&r, "ns", grid()),
+            r#"sum(zaino_sync_orchard_actions_total{namespace="ns"})"#
+        );
     }
 
     /// Zaino counts no blocks; the scan rate is the frontier gauge's slope. `rate`
@@ -657,17 +717,43 @@ mod tests {
     fn a_per_second_gauge_row_takes_a_clamped_derivative_not_a_rate() {
         let r = row(
             "blocks",
-            "zaino_sync_fetched_height",
+            family("zaino_sync_fetched_height"),
             Reduce::Max,
-            AT_REST,
             Unit::PerSec,
             Facet::Blocks,
         );
-        let grid = Grid { step: Duration::from_secs(15), rate_window: Duration::from_secs(60) };
         assert_eq!(
-            promql_series(&r, "ns", grid),
-            r#"clamp_min(deriv(max(zaino_sync_fetched_height{namespace="ns"})[60s:15s]), 0)"#
+            promql_series(&r, "ns", grid()),
+            r#"clamp_min(deriv(max(zaino_sync_fetched_height{namespace="ns"})[35s:5s]), 0)"#
         );
+    }
+
+    /// Subquery resolution is the scrape, so the range holds samples however coarse the
+    /// display step gets. At `step` it held one, and `deriv` under two samples returns
+    /// nothing — the scan-rate row vanished with no gap to show for it
+    #[test]
+    fn a_gauge_slope_keeps_enough_samples_to_have_a_slope() {
+        let r = row(
+            "blocks",
+            family("zaino_sync_fetched_height"),
+            Reduce::Max,
+            Unit::PerSec,
+            Facet::Blocks,
+        );
+        for secs in [60, 600, 7_200, 172_800, 30 * 24 * 3_600] {
+            let grid = Grid::for_span(Duration::from_secs(secs));
+            let q = promql_series(&r, "ns", grid);
+            let (range, res) = subquery_of(&q);
+            assert!(range / res >= 2, "{secs}s span: {q} carries no slope");
+        }
+    }
+
+    /// `[<range>:<resolution>]` from a rendered subquery, in seconds
+    fn subquery_of(query: &str) -> (u64, u64) {
+        let inner = query.rsplit_once('[').expect("a subquery").1;
+        let (range, rest) = inner.split_once(':').expect("a resolution");
+        let res = rest.split_once("s]").expect("a close").0;
+        (range.trim_end_matches('s').parse().unwrap(), res.parse().unwrap())
     }
 
     /// Everything else already *is* the quantity; wrapping it in `rate` would report
@@ -675,34 +761,50 @@ mod tests {
     #[test]
     fn a_gauge_row_is_plotted_as_published() {
         let r =
-            row("db used", "zaino_db_used_bytes", Reduce::Max, AT_REST, Unit::Bytes, Facet::Store);
-        let grid = Grid::for_span(Duration::from_secs(600), 40);
-        assert_eq!(promql_series(&r, "ns", grid), promql(&r, "ns"));
+            row("db used", family("zaino_db_used_bytes"), Reduce::Max, Unit::Bytes, Facet::Store);
+        let grid = Grid::for_span(Duration::from_secs(600));
+        assert_eq!(promql_series(&r, "ns", grid), promql(&r, "ns", grid));
     }
 
-    /// One point per column at most: a finer step makes Prometheus repeat the last
-    /// sample, drawing a flat stretch the run never had
+    /// Smoothing was `4 × step`, `step` from terminal width → one run at 80 and 200 columns
+    /// attenuated its peaks differently, neither plot saying so
     #[test]
-    fn the_grid_never_asks_for_more_resolution_than_was_scraped() {
-        let short = Grid::for_span(Duration::from_secs(60), 40);
-        assert_eq!(short.step, SCRAPE_INTERVAL, "60s over 40 columns is finer than the scrape");
-
-        let long = Grid::for_span(Duration::from_secs(7_200), 40);
-        assert_eq!(long.step, Duration::from_secs(180));
-        assert_eq!(long.rate_window, Duration::from_secs(720), "4 steps");
-    }
-
-    /// Two samples is the minimum for a derivative; one missed scrape must not punch
-    /// a hole in the plot
-    #[test]
-    fn the_rate_window_always_spans_several_scrapes() {
-        for secs in [1, 30, 600, 86_400] {
-            let grid = Grid::for_span(Duration::from_secs(secs), 44);
-            assert!(
-                grid.rate_window >= grid.step * 4 && grid.rate_window >= SCRAPE_INTERVAL * 4,
-                "{secs}s span: {grid:?}"
-            );
+    fn the_rate_window_is_the_same_however_long_the_run() {
+        let baseline = Grid::for_span(Duration::from_secs(60)).rate_window;
+        for secs in [60, 600, 7_200, 172_800] {
+            let grid = Grid::for_span(Duration::from_secs(secs));
+            assert_eq!(grid.rate_window, baseline, "{secs}s span must smooth like every other");
+            assert!(grid.step >= SCRAPE_INTERVAL, "never finer than the scrape: {grid:?}");
         }
+    }
+
+    /// Grafana's `$__rate_interval`: a window under the step leaves every interval partly
+    /// unread, and nothing in the plot says which third of the run is missing
+    #[test]
+    fn a_rate_window_always_covers_its_step() {
+        for secs in [60, 600, 7_200, 172_800, 30 * 24 * 3_600] {
+            let grid = Grid::for_span(Duration::from_secs(secs));
+            assert!(
+                grid.rate_window >= grid.step + SCRAPE_INTERVAL,
+                "{secs}s span samples only {:?} of each {:?}",
+                grid.rate_window,
+                grid.step
+            );
+            assert!(grid.rate_window >= SCRAPE_INTERVAL * 4, "{grid:?}");
+        }
+    }
+
+    /// Finer → Prometheus repeats the last sample; coarser only caps a long run's payload
+    #[test]
+    fn the_step_holds_at_the_analysis_resolution_until_a_run_is_very_long() {
+        assert_eq!(Grid::for_span(Duration::from_secs(60)).step, ANALYSIS_STEP);
+        assert_eq!(Grid::for_span(Duration::from_secs(7_200)).step, ANALYSIS_STEP);
+        let long = Grid::for_span(Duration::from_secs(48 * 3_600));
+        assert!(long.step >= ANALYSIS_STEP, "{long:?}");
+        assert!(
+            48 * 3_600 / long.step.as_secs() <= u64::from(MAX_SLOTS),
+            "a 48h run must stay under the payload cap: {long:?}"
+        );
     }
 
     /// `sum by (container)` returns one series per container, and which one it is

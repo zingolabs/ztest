@@ -279,5 +279,7 @@ fn errored(msg: impl Into<String>) -> SyncOutcome {
         ticks: 0,
         dropped_snapshots: 0,
         segment: None,
+        target: None,
+        unpublished: Vec::new(),
     }
 }

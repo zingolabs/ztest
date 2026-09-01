@@ -209,7 +209,7 @@ async fn report_dropped_events(client: &kube::Client, id: &str, theme: &Theme) {
 }
 
 async fn collector_dropped(client: &kube::Client, id: &str) -> Option<u64> {
-    collector_metrics(client, id).await?.counter_total(DROPPED_EVENTS)
+    collector_metrics(client, id).await?.counter_total(ztest::api::metrics::family(DROPPED_EVENTS))
 }
 
 const DROPPED_EVENTS: &str = "agent_errors_trace_event_lost_total";
@@ -259,7 +259,9 @@ async fn collector_metrics(client: &kube::Client, id: &str) -> Option<Exposition
 ///   process count) means no stack can be walked, so nothing downstream can exist
 async fn collector_pipeline(client: &kube::Client, id: &str) -> Option<String> {
     let metrics = collector_metrics(client, id).await?;
-    let get = |family: &str| metrics.counter_total(family).unwrap_or_default();
+    let get = |name: &'static str| {
+        metrics.counter_total(ztest::api::metrics::family(name)).unwrap_or_default()
+    };
     Some(format!(
         "collector: {} targets · {} processes seen · {} executables unwound · \
          {} samples forwarded · {} events dropped",

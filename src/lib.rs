@@ -168,9 +168,9 @@ pub mod prelude {
     pub use crate::loadtest::{
         BlockOracle, Distribution, LoadDriver, LoadReport, LwdClient, Rel, Scenario,
     };
-    /// Reading a component's `/metrics`: [`Exporter::metric`](crate::metrics::Exporter::metric)
-    /// on any validator/indexer that publishes one
-    pub use crate::metrics::{DEFAULT_SAMPLE_RATE, Exporter, MetricKind, MetricLayout};
+    /// Declaring a component's `/metrics` layout: [`MetricLayout::ROWS`] beside the
+    /// family constants the backend owns
+    pub use crate::metrics::{Exporter, Family, MetricLayout, Select, family, family_where};
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
         Regtest, Restore, regtest_test_activation_heights, regtest_test_lockbox_disbursements,

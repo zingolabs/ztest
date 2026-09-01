@@ -34,6 +34,14 @@ pub enum SyncEvent {
         tick_ms: u64,
         probes: usize,
     },
+    /// Subject, the `ztest.io/component` publishing its numbers (`None` = ticks), and the
+    /// engine cadence. Re-emitted: a controller folds a bounded log tail, so anything sent
+    /// only at t=0 is gone by the time a 48 h run is watched
+    Observing {
+        subject: String,
+        component: Option<String>,
+        tick_ms: u64,
+    },
     Tick(Tick),
     Series {
         timeline: Timeline,

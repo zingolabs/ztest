@@ -13,6 +13,7 @@ use crate::handles::validator::{
     PoolSupport, ValidatorBackend, ValidatorConfig,
 };
 use crate::handles::wallet::Pool;
+use crate::metrics::{Facet, Reduce, Row, Unit, family, row};
 use crate::protocol::Endpoint;
 use crate::protocol::client::{AuthedRpc, JsonRpcClient, json_rpc, wait_for_rpc_ready};
 use crate::protocol::zcash_rpc::ZcashRpc;
@@ -163,17 +164,19 @@ pub struct ZebraValidator {
     plumbing: HandleInner,
 }
 
-/// Families zebrad publishes, in report order. All `AT_REST` (serving counters
-/// answer a whole-run question; live height comes from the subject, not the node)
+/// Families zebrad publishes, in report order.
+///
+/// Verification switches families at the highest checkpoint (concurrency 1000 → 20), so a
+/// per-regime one draws a cliff that is a metric artifact; `verified_block_total` spans both
 #[rustfmt::skip]
-const ROWS: [crate::metrics::Row; 3] = [
-    crate::metrics::row("validator best height", "zebrad_chain_verified_block_height", crate::metrics::Reduce::Max, crate::metrics::AT_REST, crate::metrics::Unit::Count, crate::metrics::Facet::Progress),
-    crate::metrics::row("blocks verified", "zebrad_chain_verified_block_total", crate::metrics::Reduce::Sum, crate::metrics::AT_REST, crate::metrics::Unit::PerSec, crate::metrics::Facet::Throughput),
-    crate::metrics::row("connected peers", "zebrad_network_peers", crate::metrics::Reduce::Max, crate::metrics::AT_REST, crate::metrics::Unit::Count, crate::metrics::Facet::Progress),
+const ROWS: [Row; 3] = [
+    row("validator best height", family("zebrad_chain_verified_block_height"), Reduce::Max, Unit::Count, Facet::Progress),
+    row("blocks verified", family("zebrad_chain_verified_block_total"), Reduce::Sum, Unit::PerSec, Facet::Throughput),
+    row("connected peers", family("zebrad_network_peers"), Reduce::Max, Unit::Count, Facet::Progress),
 ];
 
 impl crate::metrics::MetricLayout for ZebraValidator {
-    const ROWS: &'static [crate::metrics::Row] = &ROWS;
+    const ROWS: &'static [Row] = &ROWS;
 }
 
 #[async_trait]

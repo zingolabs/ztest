@@ -72,6 +72,11 @@ pub struct SyncOutcome {
     pub ticks: u64,
     pub dropped_snapshots: u64,
     pub segment: Option<Segment>,
+    /// `until_height` where a profile named one, else the last target seen. Recorded, not
+    /// re-derived: a denominator read back off a series makes one bad scrape a shortfall
+    pub target: Option<u32>,
+    /// Declared rows the component never published (em-dashes read like a quiet run)
+    pub unpublished: Vec<String>,
 }
 
 /// One end of the span a run covered ([`Segment`] = last mark - first)
@@ -92,6 +97,8 @@ impl SyncOutcome {
             ticks: 0,
             dropped_snapshots: 0,
             segment: None,
+            target: None,
+            unpublished: Vec::new(),
         }
     }
 }
@@ -111,7 +118,7 @@ impl From<crate::RpcError> for SyncOutcome {
 
 /// Sink for live progress + probe events.
 pub trait SyncReporter: Send {
-    fn on_start(&mut self) {}
+    fn on_start(&mut self, _observed: &super::Observed) {}
     fn on_tick(&mut self, _snap: &Snapshot) {}
     /// Probe evaluated to a non-`Satisfied` verdict worth surfacing
     fn on_probe(&mut self, _name: &str, _verdict: &Verdict) {}
@@ -284,7 +291,8 @@ impl SyncEngine {
     }
 
     pub async fn run(mut self) -> SyncOutcome {
-        self.reporter.on_start();
+        let observed = self.subject.observes();
+        self.reporter.on_start(&observed);
 
         if let Err(e) = self.subject.launch().await {
             return self.finish(
@@ -295,6 +303,8 @@ impl SyncEngine {
                 0,
                 0,
                 None,
+                None,
+                Vec::new(),
             );
         }
 
@@ -308,8 +318,13 @@ impl SyncEngine {
                 0,
                 0,
                 None,
+                None,
+                Vec::new(),
             );
         }
+
+        // Once: a renamed family is a property of the build, not something appearing mid-run
+        let unpublished = self.check_vocabulary().await;
 
         let started = Instant::now();
         let deadline = self.timeout.map(|t| started + t);
@@ -445,7 +460,8 @@ impl SyncEngine {
                 elapsed_ms: head.at.saturating_duration_since(origin.at).as_millis() as u64,
             },
         );
-        self.finish(verdict, violations, gaps, error, ticks, dropped, segment)
+        let target = history.latest().and_then(|s| s.target());
+        self.finish(verdict, violations, gaps, error, ticks, dropped, segment, target, unpublished)
     }
 
     /// Chain this run is against, as the indexer names it (`main`/`test`/`regtest`); `None`
@@ -629,6 +645,20 @@ impl SyncEngine {
         .into())
     }
 
+    /// Every declared row against one scrape of the component that should publish it.
+    ///
+    /// Advisory — probe-read ops are already gated by
+    /// [`check_required_work`](Self::check_required_work), and a cosmetic row must not block
+    async fn check_vocabulary(&mut self) -> Vec<String> {
+        let Some((rows, exposition)) = self.subject.declared().await else {
+            return Vec::new();
+        };
+        rows.iter()
+            .filter(|row| !exposition.resolves(row))
+            .map(|row| format!("{} <- {}", row.label, row.family))
+            .collect()
+    }
+
     fn unmeasured_work_error(&self, missing: &[Op], measured: OpSet) -> String {
         let named = |op: Op| match self.subject.work_source(op) {
             Some(series) => format!("  {} <- {series}", op.label()),
@@ -658,6 +688,8 @@ impl SyncEngine {
         ticks: u64,
         dropped_snapshots: u64,
         segment: Option<Segment>,
+        target: Option<u32>,
+        unpublished: Vec<String>,
     ) -> SyncOutcome {
         let outcome = SyncOutcome {
             verdict,
@@ -667,6 +699,9 @@ impl SyncEngine {
             ticks,
             dropped_snapshots,
             segment,
+            // Named stop height = the objective; absent one, the subject's own last target
+            target: self.stop_height.or(target),
+            unpublished,
         };
         self.reporter.on_finish(&outcome);
         outcome
@@ -768,9 +803,9 @@ mod tests {
             self.stopped.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn work_source(&self, op: Op) -> Option<&'static str> {
+        fn work_source(&self, op: Op) -> Option<crate::metrics::Family> {
             match op {
-                Op::SaplingOutput => Some("fake_sapling_outputs_total"),
+                Op::SaplingOutput => Some(crate::metrics::family("fake_sapling_outputs_total")),
                 _ => None,
             }
         }
