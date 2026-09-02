@@ -253,15 +253,25 @@ async fn stage_dockerfile(
     pod: &str,
     ctx_dir: &str,
 ) -> Result<(), crate::error::PipelineError> {
-    // Heredoc keeps the multi-line, special-char Dockerfile intact through one `sh -c`
+    stage_file(api, pod, ctx_dir, "Dockerfile", RUNNER_DOCKERFILE).await
+}
+
+/// Heredoc → multi-line/special-char file intact through one `sh -c`; quoted delimiter = no expansion
+pub(crate) async fn stage_file(
+    api: &Api<Pod>,
+    pod: &str,
+    dir: &str,
+    name: &str,
+    contents: &str,
+) -> Result<(), crate::error::PipelineError> {
     let cmd = format!(
-        "mkdir -p {dir}\ncat > {dir}/Dockerfile <<'ZTEST_DF_EOF'\n{df}\nZTEST_DF_EOF\n",
-        dir = shell_quote(ctx_dir),
-        df = RUNNER_DOCKERFILE,
+        "mkdir -p {dir}\ncat > {dir}/{name} <<'ZTEST_DF_EOF'\n{contents}\nZTEST_DF_EOF\n",
+        dir = shell_quote(dir),
+        name = shell_quote(name),
     );
     let (_o, err, code) = exec_capture(api, pod, &cmd).await?;
     if code != 0 {
-        return Err(format!("stage runner Dockerfile in pod:\n{}", tail(&err, 20)).into());
+        return Err(format!("stage {name} in pod:\n{}", tail(&err, 20)).into());
     }
     Ok(())
 }
@@ -331,8 +341,11 @@ impl Drop for TempDir {
 /// the exit-code source (k8s `exec` Status has a version-fragile Rust shape)
 const OUTER: &str = r#"sh -c "$1"; printf '\nZTEST_EXIT=%s\n' "$?""#;
 
-/// Live stderr sink for the non-interactive (CI) path, one line per call
-pub type LineSink<'a> = &'a dyn Fn(&str);
+/// Live stderr sink for the non-interactive (CI) path, one line per call.
+/// `Send + Sync` — held across an await in [`ImageProvider`]'s boxed `Send` future
+///
+/// [`ImageProvider`]: crate::backends::image::ImageProvider
+pub type LineSink<'a> = &'a (dyn Fn(&str) + Send + Sync);
 
 /// Raw-bytes sink for the PTY stream (ANSI + cursor control verbatim → console emulator)
 pub type ByteSink<'a> = &'a dyn Fn(&[u8]);
@@ -357,7 +370,7 @@ impl std::fmt::Debug for CompileOut<'_> {
 
 /// `exec` in the build pod → `(stdout, stderr, exit_code)`, each stderr line to `on_line`.
 /// No TTY → both streams share ONE websocket and MUST be drained concurrently
-async fn exec_streamed(
+pub(crate) async fn exec_streamed(
     api: &Api<Pod>,
     pod: &str,
     cmd: &str,
@@ -791,20 +804,39 @@ fn common_ancestor(dirs: &BTreeSet<PathBuf>) -> Option<PathBuf> {
 /// - Total bounded by [`CONTEXT_MAX_BYTES`], offender-naming error (a silent multi-GB stall
 ///   reads as a hung cluster)
 fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, crate::error::PipelineError> {
+    spawn_tar(&src.ancestor, &src.repos)
+}
+
+/// [`spawn_tar`] over one `dev!` context = its own tar root.
+///
+/// Work tree required, not preferred (git selection *is* the exclusion; outside one, ships
+/// whatever the dir holds)
+fn spawn_context_tar(dir: &Path) -> Result<SourceStream, crate::error::PipelineError> {
+    git_repo_root(dir).map_err(|_| {
+        crate::error::PipelineError(format!(
+            "dev! build context {} is not in a git work tree; ztest ships a context by its \
+             git file selection (`git ls-files`), which is also what keeps `target/` out",
+            dir.display()
+        ))
+    })?;
+    spawn_tar(dir, std::slice::from_ref(&dir.to_path_buf()))
+}
+
+fn spawn_tar(root: &Path, repos: &[PathBuf]) -> Result<SourceStream, crate::error::PipelineError> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt as _;
 
-    // One NUL-delimited ancestor-relative list, sized as we go (ceiling below names offenders).
+    // One NUL-delimited root-relative list, sized as we go (ceiling below names offenders).
     // Temp dir outlives `tar`: holds the file list `tar` reads
     let tmp = TempDir::new("ztest-ship")?;
 
     let mut list: Vec<u8> = Vec::new();
     let mut total: u64 = 0;
     let mut sized: Vec<(u64, PathBuf)> = Vec::new();
-    for repo in &src.repos {
+    for repo in repos {
         let repo_rel = repo
-            .strip_prefix(&src.ancestor)
-            .map_err(|_| format!("repo {} not under the source ancestor", repo.display()))?
+            .strip_prefix(root)
+            .map_err(|_| format!("repo {} not under the tar root", repo.display()))?
             .as_os_str()
             .as_bytes();
         let out = std::process::Command::new("git")
@@ -832,7 +864,7 @@ fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, crate::error::Pi
 
             // `--cached` also lists locally-deleted files; skip missing paths (`tar` would
             // hard-fail mid-stream)
-            let abs = src.ancestor.join(OsStr::from_bytes(&rel));
+            let abs = root.join(OsStr::from_bytes(&rel));
             let Ok(md) = std::fs::metadata(&abs) else {
                 continue;
             };
@@ -859,7 +891,7 @@ fn spawn_source_tar(src: &SourceLayout) -> Result<SourceStream, crate::error::Pi
     std::fs::write(&list_path, &list).map_err(|e| format!("write tar file list: {e}"))?;
 
     let mut tar = std::process::Command::new("tar");
-    tar.arg("-C").arg(&src.ancestor).arg("--null").arg("-T").arg(&list_path);
+    tar.arg("-C").arg(root).arg("--null").arg("-T").arg(&list_path);
     tar.arg("-cf").arg("-").stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = tar.spawn().map_err(|e| format!("spawn local `tar` (is `tar` on PATH?): {e}"))?;
     Ok(SourceStream { child, _tmp: tmp })
@@ -882,7 +914,28 @@ async fn ship_source(
     pod: &str,
     ctx_dir: &str,
 ) -> Result<(), crate::error::PipelineError> {
-    let mut stream = spawn_source_tar(src)?;
+    ship_stream(api, spawn_source_tar(src)?, pod, ctx_dir).await
+}
+
+/// One `dev!` build context into the build pod.
+///
+/// Git-selected like [`ship_source`], never a plain `tar` (context = normally a repo root →
+/// `.git` + `target/` ride along, multi-GB, over the ceiling)
+pub(crate) async fn ship_context(
+    api: &Api<Pod>,
+    dir: &Path,
+    pod: &str,
+    dest: &str,
+) -> Result<(), crate::error::PipelineError> {
+    ship_stream(api, spawn_context_tar(dir)?, pod, dest).await
+}
+
+async fn ship_stream(
+    api: &Api<Pod>,
+    mut stream: SourceStream,
+    pod: &str,
+    ctx_dir: &str,
+) -> Result<(), crate::error::PipelineError> {
     let mut tar_stdout = stream.child.stdout.take().expect("tar stdout is piped");
     let mut tar_stderr = stream.child.stderr.take().expect("tar stderr is piped");
 

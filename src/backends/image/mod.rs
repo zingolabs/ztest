@@ -30,6 +30,7 @@ pub const IMAGE_OUTPUT_COMPRESSION: &str =
     "compression=zstd,compression-level=1,oci-mediatypes=true";
 
 pub mod bundle;
+pub mod cluster;
 pub mod docker;
 pub mod kind;
 
@@ -268,15 +269,16 @@ pub fn selected_class() -> ClusterClass {
     }
 }
 
-/// Selected by how the cluster can be *given* an image, not by platform: registry
-/// address → build-and-push, none → side-load into the local kind node.
+/// Two questions, ordered: *where the build runs* ([`builds_on_cluster`]), then *how the
+/// cluster is given the result* (registry address → push, none → side-load).
 ///
-/// `push` / `pull` differ only as config (in-cluster registry sits at one address for
-/// the builder, another from inside the cluster)
+/// - remote = runner's BuildKit pod already there → component images build there too
+/// - workstation engine out of the path → registry needs one in-cluster address, not two
 pub fn from_env() -> Arc<dyn ImageProvider> {
-    match push_base().or_else(pull_base) {
-        Some(base) => Arc::new(docker::Docker::registry(base)),
-        None => Arc::new(kind::Kind),
+    match (builds_on_cluster(), push_base().or_else(pull_base)) {
+        (true, Some(_)) => Arc::new(cluster::ClusterBuild),
+        (false, Some(base)) => Arc::new(docker::Docker::registry(base)),
+        (_, None) => Arc::new(kind::Kind),
     }
 }
 
@@ -308,13 +310,33 @@ pub async fn run_streamed(
 /// `ZTEST_IMAGE_REGISTRY` = address pods reference, `None` = local kind. Empty treated
 /// as unset (bare `=` harmless). Also the push address for a generic registry
 pub fn pull_base() -> Option<String> {
-    env_nonempty("ZTEST_IMAGE_REGISTRY")
+    pull_base_raw().map(|b| scheme_of(&b).1.to_string())
 }
 
 /// `ZTEST_IMAGE_PUSH_REGISTRY`, set only for an in-cluster registry (push → external
 /// route, pull → in-cluster service)
 pub fn push_base() -> Option<String> {
+    push_base_raw().map(|b| scheme_of(&b).1.to_string())
+}
+
+fn pull_base_raw() -> Option<String> {
+    env_nonempty("ZTEST_IMAGE_REGISTRY")
+}
+
+fn push_base_raw() -> Option<String> {
     env_nonempty("ZTEST_IMAGE_PUSH_REGISTRY")
+}
+
+/// `(plaintext, address)`.
+///
+/// - address may carry the scheme its clients speak, as containerd's endpoint does
+/// - stated, not negotiated (HTTPS→HTTP fallback = a downgrade, so no client tries it)
+/// - stripped here (an image reference carries no scheme)
+fn scheme_of(base: &str) -> (bool, &str) {
+    match base.strip_prefix("http://") {
+        Some(rest) => (true, rest),
+        None => (false, base.strip_prefix("https://").unwrap_or(base)),
+    }
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
@@ -351,6 +373,17 @@ pub fn pull_secret() -> Option<String> {
 /// `DOCKER_CONFIG`. `None` = anonymous push
 pub fn push_secret() -> Option<String> {
     env_nonempty(crate::cluster_config::PUSH_SECRET_ENV)
+}
+
+/// `http://` on the address → BuildKit needs `http = true` (else TLS against a listener with none)
+pub fn registry_plaintext() -> bool {
+    pull_base_raw().or_else(push_base_raw).is_some_and(|b| scheme_of(&b).0)
+}
+
+/// `host[:port]`, repo path dropped — the key BuildKit & containerd index registry config by
+pub fn registry_host() -> Option<String> {
+    let base = pull_base().or_else(push_base)?;
+    Some(base.split('/').next().unwrap_or(&base).to_string())
 }
 
 /// JSON `{DevImageId: pull_reference}` of the preflight's resolved dev images, stamped

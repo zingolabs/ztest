@@ -125,14 +125,23 @@ async fn reconcile_cache_pvc_size(api: &Api<PersistentVolumeClaim>) -> Result<()
 /// automatic final fallback
 const DOCKERHUB_MIRROR: &str = "mirror.gcr.io";
 
-/// `buildkitd.toml`: the `docker.io` pull-through mirror + GC retention envelope
+/// `buildkitd.toml`: `docker.io` pull-through mirror, declared plaintext registry, GC envelope
 fn buildkitd_toml() -> String {
+    // `http`, not `mirrors` — buildkit resolves a *push* against the reference's own host
+    let plaintext = match (
+        crate::backends::image::registry_plaintext(),
+        crate::backends::image::registry_host(),
+    ) {
+        (true, Some(host)) => format!("[registry.\"{host}\"]\n  http = true\n"),
+        _ => String::new(),
+    };
     // Default GC keeps a small fraction of disk, evicting the compile layers and
     // the cargo/`target` cache mount between runs (every `--no-run` compile goes
     // near-cold). Percentages are of the worker's total disk, so this tracks
     // `cache_size()` without restating it.
     format!(
-        "[registry.\"docker.io\"]\n  mirrors = [\"{DOCKERHUB_MIRROR}\"]\n\
+        "{plaintext}\
+         [registry.\"docker.io\"]\n  mirrors = [\"{DOCKERHUB_MIRROR}\"]\n\
          [worker.oci]\n  \
          gc = true\n  \
          reservedSpace = \"80%\"\n  \

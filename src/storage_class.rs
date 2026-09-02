@@ -141,18 +141,38 @@ pub async fn selected(
         .await
 }
 
-/// Class for a ztest-created PVC that does *not* need snapshots (observability, buildkit
-/// cache): the profile's `storage_driver`, so one cluster = one class.
+/// Class for a ztest PVC needing no snapshots (observability, buildkit cache).
 ///
-/// - `escape` (component env var) wins → a cluster whose stack must sit elsewhere
-/// - Unresolvable driver → `None` = cluster default: snapshot capability is the seed path's
-///   requirement, and a cluster lacking it still wants the rest of the stack provisioned
-/// - Class is immutable once bound, so this only steers PVCs at create time
+/// - `escape` (component env var) wins → stack pinned elsewhere
+/// - else `None` = cluster default (snapshot pool = the expensive one; a cache has no
+///   business on it)
+/// - no cluster default → [`selected`] (unclassed PVC would hang Pending)
+/// - class immutable once bound → steers creation only
 pub async fn plain_class(client: &kube::Client, escape: &str) -> Option<String> {
     if let Some(pinned) = std::env::var(escape).ok().filter(|s| !s.trim().is_empty()) {
         return Some(pinned);
     }
+    if has_default_class(client).await {
+        return None;
+    }
     selected(client).await.ok().map(|o| o.class_name.clone())
+}
+
+/// Any default suffices — admission takes the newest where several claim it
+async fn has_default_class(client: &kube::Client) -> bool {
+    let api: Api<StorageClass> = Api::all(client.clone());
+    let Ok(list) = api.list(&Default::default()).await else {
+        return false;
+    };
+    list.items.iter().any(is_default_class)
+}
+
+fn is_default_class(sc: &StorageClass) -> bool {
+    sc.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(DEFAULT_CLASS_ANNOTATION))
+        .is_some_and(|v| v == "true")
 }
 
 fn available(options: &[StorageOption]) -> String {

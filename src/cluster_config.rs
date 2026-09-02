@@ -241,6 +241,9 @@ pub enum ProfileError {
     /// Half a pair silently reverts to driver-matching, which is what naming a class was for
     #[error("storage_class and snapshot_class are set together or not at all")]
     HalfPinnedStorage,
+    /// Unstripped scheme → part of the hostname → every pull 404s
+    #[error("registry address {0} carries a scheme that is not http:// or https://")]
+    RegistryScheme(String),
 }
 
 impl Profile {
@@ -276,6 +279,13 @@ impl Profile {
     pub fn validate(&self) -> Result<(), ProfileError> {
         if self.storage_class.is_some() != self.snapshot_class.is_some() {
             return Err(ProfileError::HalfPinnedStorage);
+        }
+        for addr in [self.push.as_deref(), self.pull.as_deref()].into_iter().flatten() {
+            if let Some((scheme, _)) = addr.split_once("://")
+                && !matches!(scheme, "http" | "https")
+            {
+                return Err(ProfileError::RegistryScheme(addr.to_string()));
+            }
         }
         match self.class {
             ClusterClass::Local if self.push.is_some() || self.pull.is_some() => {
