@@ -29,6 +29,15 @@ use crate::resource::{Cx, Readiness, ResourceError};
 pub const IMAGE_OUTPUT_COMPRESSION: &str =
     "compression=zstd,compression-level=1,oci-mediatypes=true";
 
+/// `--output type=image` attrs for a pushed image.
+///
+/// - `registry.insecure` per-export: exporter never reads `buildkitd.toml` registry config
+///   (its `http = true` reaches the pull resolver only)
+pub fn image_output_attrs(plaintext: bool) -> String {
+    let insecure = if plaintext { ",registry.insecure=true" } else { "" };
+    format!("{IMAGE_OUTPUT_COMPRESSION}{insecure}")
+}
+
 pub mod bundle;
 pub mod cluster;
 pub mod docker;

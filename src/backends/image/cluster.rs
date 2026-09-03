@@ -76,7 +76,12 @@ impl ImageProvider for ClusterBuild {
         }
         // build-args off the *local* context (toolchain file read here, not pod-side → same
         // RUST_VERSION either backend)
-        let cmd = buildctl_cmd(&base, &reference, &build_args(entry, &context));
+        let cmd = buildctl_cmd(
+            &base,
+            &reference,
+            &build_args(entry, &context),
+            &super::image_output_attrs(super::registry_plaintext()),
+        );
         let note = |line: &str| {
             if let Some(sink) = &cx.progress {
                 sink.note(&id, line);
@@ -112,7 +117,7 @@ fn build_args(entry: &DevImageEntry, context: &Path) -> Vec<String> {
 
 /// - `--progress=plain` (no PTY on this exec → live renderer has nothing to drive)
 /// - push Secret held by the build pod ([`REGISTRY_MOUNT`](crate::resource::impls::buildkit::REGISTRY_MOUNT))
-fn buildctl_cmd(base: &str, reference: &str, args: &[String]) -> String {
+fn buildctl_cmd(base: &str, reference: &str, args: &[String], attrs: &str) -> String {
     let auth = match super::push_secret() {
         Some(_) => {
             format!("export DOCKER_CONFIG={}\n", crate::resource::impls::buildkit::REGISTRY_MOUNT)
@@ -126,11 +131,10 @@ fn buildctl_cmd(base: &str, reference: &str, args: &[String]) -> String {
          buildctl build --frontend dockerfile.v0 \
            --local context={ctx} --local dockerfile={df} --opt filename=Dockerfile\
            {opts} \
-           --output type=image,name={name},push=true,{comp} --progress=plain\n",
+           --output type=image,name={name},push=true,{attrs} --progress=plain\n",
         ctx = shell_quote(&format!("{base}/ctx")),
         df = shell_quote(&format!("{base}/df")),
         name = shell_quote(reference),
-        comp = super::IMAGE_OUTPUT_COMPRESSION,
     )
 }
 
@@ -177,10 +181,23 @@ mod tests {
     /// `dev!` Dockerfile routinely sits outside the context it builds
     #[test]
     fn buildctl_separates_context_and_dockerfile_roots() {
-        let cmd = buildctl_cmd("/build/dev/x", "reg/zainod:dev-abc", &[]);
+        let cmd = buildctl_cmd("/build/dev/x", "reg/zainod:dev-abc", &[], "compression=zstd");
         assert!(cmd.contains("--local context='/build/dev/x/ctx'"), "{cmd}");
         assert!(cmd.contains("--local dockerfile='/build/dev/x/df'"), "{cmd}");
         assert!(cmd.contains("--opt filename=Dockerfile"), "{cmd}");
         assert!(cmd.contains("push=true"), "{cmd}");
+    }
+
+    /// Plaintext registry: push fails HTTPS-against-HTTP without the per-export attr
+    #[test]
+    fn plaintext_registry_marks_the_export_insecure() {
+        use super::super::image_output_attrs;
+
+        assert!(image_output_attrs(true).contains(",registry.insecure=true"));
+        assert!(!image_output_attrs(false).contains("registry.insecure"));
+
+        let cmd =
+            buildctl_cmd("/build/dev/x", "zot:5000/z:dev-abc", &[], &image_output_attrs(true));
+        assert!(cmd.contains(",registry.insecure=true"), "{cmd}");
     }
 }

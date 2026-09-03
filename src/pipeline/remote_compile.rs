@@ -110,7 +110,7 @@ pub async fn compile_on_cluster(
         &format!(
             "--output type=image,name={},push=true,{} --progress=auto",
             shell_quote(&runner_ref),
-            crate::backends::image::IMAGE_OUTPUT_COMPRESSION,
+            crate::backends::image::image_output_attrs(crate::backends::image::registry_plaintext()),
         ),
         Push::Yes,
     );
