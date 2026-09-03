@@ -159,7 +159,7 @@ impl IndexerBackend for LightwalletdIndexer {
             run_as_user: Some(1000),
             supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
-            guaranteed: None,
+            guaranteed: Some(crate::qos::pod::INDEXER.into()),
             image_pull_secret: crate::backends::image::pull_secret(),
             termination_grace_period: None,
         })

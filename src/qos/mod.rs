@@ -15,11 +15,10 @@ pub mod schedule;
 pub mod scheduler;
 pub mod units;
 
-/// Tier attributes `#[ztest::qos::basic]` .. `#[ztest::qos::sync]`, surfaced only under
-/// `ztest::qos::*`, never the prelude
-pub use ztest_macros::{basic, integration, sync, testnet, wallet};
+/// Tier attributes `#[ztest::qos::integration]` .. `#[ztest::qos::sync]`, surfaced only
+/// under `ztest::qos::*`, never the prelude
+pub use ztest_macros::{integration, sync, testnet, wallet};
 
-use std::cell::Cell;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -279,6 +278,24 @@ impl std::fmt::Display for Resources {
     }
 }
 
+/// Default per-pod reserve each component backend renders when a test declares none.
+///
+/// - Sizing lives with the component, not with the tier: a tier ceiling bounds a topology's
+///   sum, and dividing it across pods priced them by pod count rather than by workload
+/// - `.resources(..)` overrides per pod; the tier ceiling still bounds their sum
+/// - Whole cores: CPU Manager `static` pins exclusive CPUs only to integer-core Guaranteed
+///   pods, and every ztest component pod is one
+pub mod pod {
+    use super::{GIB, Resources};
+
+    /// Memory-led: 2 GiB clears regtest Orchard proving and the NU6 boundary work with
+    /// headroom over the 1 GiB an even split used to hand it (512 MiB OOM-killed it)
+    pub const VALIDATOR: Resources = Resources::new(1_000, 2 * GIB, 0, 0);
+    /// Same shape either tuning: `Fetch` forwards to its validator, `State` builds an index,
+    /// and neither saturates a core over a regtest chain
+    pub const INDEXER: Resources = Resources::new(1_000, 2 * GIB, 0, 0);
+}
+
 /// Footprints for the ephemeral on-cluster build pods, in the [`Resources`] model so they
 /// share its units + Guaranteed invariant. Each is created at its footprint for one job
 /// and deleted after — no idle reservation, no in-place resize.
@@ -345,19 +362,19 @@ impl Pool {
 pub enum QosClass {
     /// Un-annotated tests land here (`docs/design-qos.md`)
     #[default]
-    Basic,
-    Wallet,
     Integration,
+    Wallet,
     Testnet,
     Sync,
 }
 
 /// Lowered form of a [`QosClass`] (§2/§11).
 ///
-/// - `footprint` = component-pod aggregate reserve *and* ceiling; excludes the runner pod,
-///   sizes the namespace `ResourceQuota`, whole-core count = max component pods the tier
-///   admits (so `pods × per-pod ≤ footprint` always holds)
+/// - `footprint` = component-pod aggregate ceiling, excluding the runner; pods size
+///   themselves from [`pod`] defaults + `.resources(..)`, and their sum must fit here
 /// - `footprint` + `runner` = [`admitted`](Self::admitted); higher `priority` goes first
+/// - [`ZERO`](Resources::ZERO) footprint = tier declares no default (`sync`), so
+///   `footprint = ".."` is required — [`QosClass::profile_with`] is where that is enforced
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QosProfile {
     pub footprint: Resources,
@@ -374,9 +391,9 @@ impl QosProfile {
         self.footprint.saturating_add(&self.runner)
     }
 
-    /// Component reserve replaced by a test's `footprint = ".."`; `None` = untouched
+    /// Component ceiling replaced by a test's `footprint = ".."`; `None` = untouched
     ///
-    /// - Sole place an override lands (quota/share/budget/lease/request all read `footprint`)
+    /// - Sole place an override lands (quota/budget/lease/request all read `footprint`)
     /// - `runner`/`pool`/`priority`/`hard_cap` not overridable (cross-test policy)
     pub fn with_footprint(self, footprint: Option<Resources>) -> QosProfile {
         match footprint {
@@ -387,45 +404,13 @@ impl QosProfile {
             None => self,
         }
     }
-
-    /// Per-pod Guaranteed reserve = [`footprint`](Self::footprint) split evenly
-    /// across `pods` (`None` when none to size)
-    ///
-    /// - CPU floors to whole cores (CPU Manager `static` pins only integer cores)
-    /// - Floor, not ceil → `pods x share <= footprint`, so a deploy never exceeds
-    ///   what was admitted (lost sub-core stays as headroom)
-    /// - cpu/mem only: this sizes a Guaranteed *container*, and io/disk are volume
-    ///   properties with no per-pod split to make
-    pub fn share(&self, pods: usize) -> Option<Resources> {
-        if pods == 0 {
-            return None;
-        }
-        self.footprint.assert_pod_schedulable("tier footprint");
-        let n = pods as u64;
-        // 1-core clamp → trips only when pods > tier cores (mispriced tier;
-        // would otherwise deploy past the reservation and wedge `Pending`)
-        assert!(
-            self.footprint.cpu_milli / 1000 >= n,
-            "QoS over-schedule: {pods} component pods need {pods} whole cores but this test \
-             reserves {}m — raise the tier, or its `footprint = \"..\"` override, so the \
-             core count covers the topology",
-            self.footprint.cpu_milli,
-        );
-        Some(Resources::new(
-            (self.footprint.cpu_milli / n / 1000).max(1) * 1000,
-            (self.footprint.mem_bytes / n).max(1),
-            0,
-            0,
-        ))
-    }
 }
 
 impl QosClass {
     pub fn as_label(self) -> &'static str {
         match self {
-            QosClass::Basic => "basic",
-            QosClass::Wallet => "wallet",
             QosClass::Integration => "integration",
+            QosClass::Wallet => "wallet",
             QosClass::Testnet => "testnet",
             QosClass::Sync => "sync",
         }
@@ -433,9 +418,8 @@ impl QosClass {
 
     pub fn from_label(s: &str) -> Option<QosClass> {
         match s {
-            "basic" => Some(QosClass::Basic),
-            "wallet" => Some(QosClass::Wallet),
             "integration" => Some(QosClass::Integration),
+            "wallet" => Some(QosClass::Wallet),
             "testnet" => Some(QosClass::Testnet),
             "sync" => Some(QosClass::Sync),
             _ => None,
@@ -445,70 +429,72 @@ impl QosClass {
     /// Effective profile = tier + this test's override; read at every sizing/admission site
     ///
     /// - Bare [`profile`](Self::profile) there = latent bug (sizes default, ledger holds override)
+    /// - Tier with no default ceiling (`sync`) and no override = panic, not a silent reserve
     pub fn profile_with(self, footprint: Option<Resources>) -> QosProfile {
-        self.profile().with_footprint(footprint)
+        let profile = self.profile().with_footprint(footprint);
+        assert!(
+            profile.footprint != Resources::ZERO,
+            "tier `{}` declares no default reserve — its topologies have nothing in common to \
+             size from, so the test must declare its own `footprint = \"..\"`",
+            self.as_label(),
+        );
+        profile
     }
 
     /// Every tier, for callers that must bound over all of them (capacity preflight,
     /// plan rendering). Ordered as declared
-    pub const ALL: [QosClass; 5] = [
-        QosClass::Basic,
-        QosClass::Wallet,
-        QosClass::Integration,
-        QosClass::Testnet,
-        QosClass::Sync,
-    ];
+    pub const ALL: [QosClass; 4] =
+        [QosClass::Integration, QosClass::Wallet, QosClass::Testnet, QosClass::Sync];
 
-    /// Const profile table: one source of truth for every tier's schedulable shape. I/O
-    /// reserves stay `0` pending calibration (a reserve must come from measured `io.stat`,
-    /// never a guess), so those dimensions never gate. Tier *default*, not what a given
-    /// test runs at — see [`profile_with`](Self::profile_with)
+    /// Default tier's ceiling = the admission floor a run needs before it can schedule
+    /// anything (`ledger::min_viable`, the `ztest status` verdict): below it, an
+    /// un-annotated test cannot start
+    pub fn default_footprint() -> Resources {
+        QosClass::default().profile().footprint
+    }
+
+    /// Const policy table: pool, priority, cap, runner, and the default component ceiling.
+    ///
+    /// - Ceiling bounds the sum of pods sized from [`pod`] + `.resources(..)`; it does not
+    ///   size them (`2c/4Gi` = the two-pod validator+indexer shape at [`pod`]'s defaults)
+    /// - I/O reserves stay `0` pending calibration (a reserve must come from measured
+    ///   `io.stat`, never a guess), so those dimensions never gate
+    /// - Tier *default*, not what a given test runs at — see
+    ///   [`profile_with`](Self::profile_with)
     pub const fn profile(self) -> QosProfile {
         match self {
-            QosClass::Basic => QosProfile {
-                footprint: Resources::new(1_000, 512 * MIB, 0, 0),
-                runner: Resources::new(1_000, 512 * MIB, 0, 0),
-                pool: Pool::General,
-                priority: 0,
-                hard_cap: Duration::from_secs(60),
-            },
-            QosClass::Wallet => QosProfile {
-                // 2c + 1 GiB per pod across the validator + indexer pair. 1 GiB is what a
-                // regtest zebrad needs for Orchard proving and the NU6 boundary work (a
-                // 512 MiB share OOM-killed it)
-                footprint: Resources::new(4_000, 2 * GIB, 0, 0),
-                // In-process wallet lives here → real compute, not just orchestration
-                runner: Resources::new(4_000, GIB, 0, 0),
-                pool: Pool::General,
-                priority: 1,
-                hard_cap: Duration::from_secs(10 * 60),
-            },
             QosClass::Integration => QosProfile {
-                // 1c + 1 GiB per pod across the ≤3-pod zaino topology (zebrad +
-                // zaino-fetch + zaino-state); core count = max component pods admitted
-                footprint: Resources::new(3_000, 3 * GIB, 0, 0),
+                footprint: Resources::new(2_000, 4 * GIB, 0, 0),
                 runner: Resources::new(1_000, GIB, 0, 0),
                 pool: Pool::General,
-                priority: 2,
+                priority: 0,
+                hard_cap: Duration::from_secs(10 * 60),
+            },
+            QosClass::Wallet => QosProfile {
+                footprint: Resources::new(2_000, 4 * GIB, 0, 0),
+                // In-process wallet lives here → real compute, not just orchestration
+                runner: Resources::new(2_000, 2 * GIB, 0, 0),
+                pool: Pool::General,
+                priority: 1,
                 hard_cap: Duration::from_secs(10 * 60),
             },
             QosClass::Testnet => QosProfile {
                 footprint: Resources::new(8_000, 10 * GIB, 0, 0),
                 runner: Resources::new(1_000, GIB, 0, 0),
                 pool: Pool::General,
-                priority: 3,
+                priority: 2,
                 hard_cap: Duration::from_secs(6 * 60 * 60),
             },
             QosClass::Sync => QosProfile {
-                // 16c / 16 GiB all in, minus the runner's slice. A ceiling the pods share,
-                // not an even split: this tier's topologies are lopsided (a validator
-                // serving a frozen snapshot beside an indexer building one), so tests size
-                // pods with `.resources()` and this bounds their sum
-                footprint: Resources::new(15_000, 15 * GIB, 0, 0),
+                // No default: this tier's topologies share nothing to size from (a validator
+                // serving a frozen snapshot beside an indexer building one), and `ztest run`
+                // never launches them — `drop_sync_tests` excludes the tier outright, so the
+                // marker routes to `ztest sync` and the reserve comes from the test
+                footprint: Resources::ZERO,
                 // Driver only marshals the test + polls an exporter; work is in the pods
                 runner: Resources::new(1_000, GIB, 0, 0),
                 pool: Pool::Nvme,
-                priority: 4,
+                priority: 3,
                 hard_cap: Duration::from_secs(48 * 60 * 60),
             },
         }
@@ -517,83 +503,42 @@ impl QosClass {
 
 // ── Runtime tier (the in-process bridge) ───────────────────────────────
 //
-// `#[ztest::qos::*]` / `#[ztest::sync_test]` inject `__enter(class)` as the body's first
-// statement; `build()` reads `current()` to size pods. Thread-local is the fast path, but
-// a `multi_thread` test can migrate off the entering thread across an `.await` before
-// `build()` reads the tier → `__enter` also stamps a process-global backstop. Sound because
-// ztest is strictly process-per-test: the last-entered tier is unambiguous process-wide.
+// `#[ztest::qos::*]` / `#[ztest::sync_test]` inject `__enter(class, footprint)` as the body's
+// first statement; `build()` reads it back to size pods.
+//
+// - Process-global, not thread-local: a `multi_thread` test migrates off the entering thread
+//   across an `.await` before `build()` reads it
+// - Sound because ztest is strictly process-per-test → the last entry is unambiguous
+// - Tier + override under one lock, so no read can see half of an entry
 
-thread_local! {
-    static CURRENT: Cell<Option<QosClass>> = const { Cell::new(None) };
-}
-/// Process-global backstop for the thread-local; `u8::MAX` = no tier entered (→ `Basic`)
-static CURRENT_GLOBAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+/// Declaration the running test entered: tier, plus its `footprint = ".."` if it declared one
+static CURRENT: std::sync::RwLock<Option<(QosClass, Option<Resources>)>> =
+    std::sync::RwLock::new(None);
 
-/// Explicit rather than a `repr(u8)` cast → adding a variant is a compile error here
-fn tier_to_u8(class: QosClass) -> u8 {
-    match class {
-        QosClass::Basic => 0,
-        QosClass::Wallet => 1,
-        QosClass::Integration => 2,
-        QosClass::Testnet => 3,
-        QosClass::Sync => 4,
-    }
+fn current_entry() -> Option<(QosClass, Option<Resources>)> {
+    *CURRENT.read().expect("qos declaration lock poisoned")
 }
-fn tier_from_u8(v: u8) -> Option<QosClass> {
-    Some(match v {
-        0 => QosClass::Basic,
-        1 => QosClass::Wallet,
-        2 => QosClass::Integration,
-        3 => QosClass::Testnet,
-        4 => QosClass::Sync,
-        _ => return None,
-    })
-}
-
-// Override rides alongside the tier, same thread-local + global-backstop rule
-// - Two atomics, no lock: `0` = unset (grammar + `assert_pod_schedulable` both reject zero)
-thread_local! {
-    static CURRENT_FOOTPRINT: Cell<Option<Resources>> = const { Cell::new(None) };
-}
-static CURRENT_FOOTPRINT_CPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static CURRENT_FOOTPRINT_MEM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Set current tier + optional override. Injected by `#[ztest::qos::*]` /
 /// `#[ztest::sync_test]` as the body's first statement; never called directly
 #[doc(hidden)]
 pub fn __enter(class: QosClass, footprint: Option<Resources>) {
-    use std::sync::atomic::Ordering::Relaxed;
-    CURRENT.with(|c| c.set(Some(class)));
-    CURRENT_GLOBAL.store(tier_to_u8(class), Relaxed);
-    CURRENT_FOOTPRINT.with(|c| c.set(footprint));
-    CURRENT_FOOTPRINT_CPU.store(footprint.map_or(0, |f| f.cpu_milli), Relaxed);
-    CURRENT_FOOTPRINT_MEM.store(footprint.map_or(0, |f| f.mem_bytes), Relaxed);
+    *CURRENT.write().expect("qos declaration lock poisoned") = Some((class, footprint));
 }
 
-/// Tier declared by the running test, else [`QosClass::Basic`]. Read by `TestEnv::build`;
-/// thread-local first, process-global backstop for off-thread reads
+/// Tier declared by the running test, else [`QosClass::default`]. Read by `TestEnv::build`
 pub fn current() -> QosClass {
-    if let Some(c) = CURRENT.with(|c| c.get()) {
-        return c;
-    }
-    tier_from_u8(CURRENT_GLOBAL.load(std::sync::atomic::Ordering::Relaxed))
-        .unwrap_or(QosClass::Basic)
+    current_entry().map_or_else(QosClass::default, |(class, _)| class)
 }
 
 /// Override declared by the running test, else `None`
 fn current_footprint() -> Option<Resources> {
-    if let Some(f) = CURRENT_FOOTPRINT.with(|c| c.get()) {
-        return Some(f);
-    }
-    use std::sync::atomic::Ordering::Relaxed;
-    let (cpu, mem) = (CURRENT_FOOTPRINT_CPU.load(Relaxed), CURRENT_FOOTPRINT_MEM.load(Relaxed));
-    // Either dimension `0` = none entered (grammar cannot emit a half-zero footprint)
-    (cpu > 0 && mem > 0).then(|| Resources::new(cpu, mem, 0, 0))
+    current_entry().and_then(|(_, footprint)| footprint)
 }
 
 /// Effective profile of the running test (declared tier + declared override)
 ///
-/// - Sole accessor for in-process sizing (shares, quota, deploy budget, sync lease)
+/// - Sole accessor for in-process sizing (quota, deploy budget, sync lease)
 pub fn current_profile() -> QosProfile {
     current().profile_with(current_footprint())
 }
@@ -606,11 +551,9 @@ mod tests {
     #[test]
     fn the_tier_table_matches_the_documented_footprints() {
         let expect = [
-            (QosClass::Basic, 1_000, 512 * MIB, 2_000, GIB),
-            (QosClass::Wallet, 4_000, 2 * GIB, 8_000, 3 * GIB),
-            (QosClass::Integration, 3_000, 3 * GIB, 4_000, 4 * GIB),
+            (QosClass::Integration, 2_000, 4 * GIB, 3_000, 5 * GIB),
+            (QosClass::Wallet, 2_000, 4 * GIB, 4_000, 6 * GIB),
             (QosClass::Testnet, 8_000, 10 * GIB, 9_000, 11 * GIB),
-            (QosClass::Sync, 15_000, 15 * GIB, 16_000, 16 * GIB),
         ];
         for (class, cpu, mem, adm_cpu, adm_mem) in expect {
             let p = class.profile();
@@ -775,7 +718,6 @@ mod tests {
 
     #[test]
     fn hard_caps_are_locked() {
-        assert_eq!(QosClass::Basic.profile().hard_cap, Duration::from_secs(60));
         assert_eq!(QosClass::Integration.profile().hard_cap, Duration::from_secs(10 * 60));
         assert_eq!(QosClass::Testnet.profile().hard_cap, Duration::from_secs(6 * 60 * 60));
         assert_eq!(QosClass::Sync.profile().hard_cap, Duration::from_secs(48 * 60 * 60));
@@ -783,41 +725,49 @@ mod tests {
 
     #[test]
     fn only_sync_is_off_the_general_pool() {
-        assert_eq!(QosClass::Basic.profile().pool, Pool::General);
         assert_eq!(QosClass::Integration.profile().pool, Pool::General);
+        assert_eq!(QosClass::Wallet.profile().pool, Pool::General);
         assert_eq!(QosClass::Testnet.profile().pool, Pool::General);
         assert_eq!(QosClass::Sync.profile().pool, Pool::Nvme);
     }
 
+    /// Wallet differs from integration in the runner alone: same validator+indexer
+    /// topology, plus an in-process wallet doing real compute beside it
     #[test]
     fn wallet_tier_puts_its_compute_in_the_runner() {
-        // 4c / 2 GiB even-split across validator+indexer → 2c / 1 GiB each (1 GiB clears
-        // the Orchard/boundary work a 512 MiB share OOM-killed); runner carries the
-        // in-process wallet's 4c; admitted = their sum, 8c / 3 GiB
-        let p = QosClass::Wallet.profile();
-        assert_eq!(p.footprint, Resources::new(4_000, 2 * GIB, 0, 0));
-        assert_eq!(p.runner, Resources::new(4_000, GIB, 0, 0));
-        assert_eq!(p.admitted(), Resources::new(8_000, 3 * GIB, 0, 0));
-        assert_eq!(p.pool, Pool::General);
-        assert_eq!(p.hard_cap, Duration::from_secs(10 * 60));
+        let (w, i) = (QosClass::Wallet.profile(), QosClass::Integration.profile());
+        assert_eq!(w.footprint, i.footprint, "same two-pod topology");
+        assert!(w.runner.cpu_milli > i.runner.cpu_milli);
+        assert!(w.runner.mem_bytes > i.runner.mem_bytes);
+        assert_eq!(w.admitted(), Resources::new(4_000, 6 * GIB, 0, 0));
     }
 
     #[test]
     fn priority_order_matches_declaration_order() {
-        let (b, w, i, t, s) = (
-            QosClass::Basic.profile().priority,
-            QosClass::Wallet.profile().priority,
+        let (i, w, t, s) = (
             QosClass::Integration.profile().priority,
+            QosClass::Wallet.profile().priority,
             QosClass::Testnet.profile().priority,
             QosClass::Sync.profile().priority,
         );
-        // The general-pool ordering behind "testnet scheduled first"
-        assert!(b < w && w < i && i < t, "basic < wallet < integration < testnet");
+        // Default tier lowest: a flood of ordinary tests must not starve the rare heavy ones
+        assert!(i < w && w < t, "integration < wallet < testnet");
         // sync tops the order overall (own pool, ordering still well-defined)
         assert!(t <= s, "sync is not below testnet");
     }
 
-    const ALL_TIERS: [QosClass; 5] = QosClass::ALL;
+    /// Admission floor = what an un-annotated test reserves, so no tier carrying a default
+    /// may price below it (a run cleared to start must be able to start anything)
+    #[test]
+    fn no_tier_default_sits_below_the_admission_floor() {
+        let floor = QosClass::default_footprint();
+        for class in QosClass::ALL {
+            let fp = class.profile().footprint;
+            assert!(fp == Resources::ZERO || floor.fits_within(&fp), "{class:?} sits below it");
+        }
+    }
+
+    const ALL_TIERS: [QosClass; 4] = QosClass::ALL;
 
     /// `cpu_mem_unbounded_rest` seeds disk with the never-gates sentinel; printing it
     /// yields `17179869183Gi` in a capacity line
@@ -867,25 +817,66 @@ mod tests {
     }
 
     #[test]
-    fn every_tier_and_build_pod_footprint_is_pod_schedulable() {
+    fn every_runner_component_and_build_pod_footprint_is_pod_schedulable() {
         // No ztest-spawned pod may be sized degenerate (BestEffort/unschedulable); covers
-        // the runner reserves + build-infra footprints as a set
+        // the runner reserves + per-pod defaults + build-infra footprints as a set.
+        // Tier ceilings are excluded: `sync` declares none, and a ceiling sizes no pod
         for c in ALL_TIERS {
-            c.profile().footprint.assert_pod_schedulable("tier footprint");
             c.profile().runner.assert_pod_schedulable("tier runner");
         }
-        for fp in [build::BUILDKIT_BUILD, build::UPLOADER] {
-            fp.assert_pod_schedulable("build pod footprint");
+        for fp in [pod::VALIDATOR, pod::INDEXER, build::BUILDKIT_BUILD, build::UPLOADER] {
+            fp.assert_pod_schedulable("pod footprint");
+        }
+    }
+
+    /// Every component pod is Guaranteed and integer-core, so a fractional default would
+    /// silently drop it out of CPU Manager `static` and into the shared pool
+    #[test]
+    fn per_pod_defaults_are_whole_cores() {
+        for fp in [pod::VALIDATOR, pod::INDEXER] {
+            assert_eq!(fp.cpu_milli % 1_000, 0, "{fp} is not a whole number of cores");
+        }
+    }
+
+    /// The two-pod default topology must fit the ceiling of every tier that hosts one,
+    /// or the tier admits a shape its own `DeployBudget` then refuses in-pod
+    #[test]
+    fn the_default_two_pod_topology_fits_the_general_tiers() {
+        let two_pods = pod::VALIDATOR.saturating_add(&pod::INDEXER);
+        for class in [QosClass::Integration, QosClass::Wallet, QosClass::Testnet] {
+            assert!(
+                two_pods.fits_within(&class.profile().footprint),
+                "{class:?} cannot hold a validator + indexer at the per-pod defaults"
+            );
         }
     }
 
     #[test]
     fn wallet_runner_keeps_the_in_process_wallet_compute() {
-        // Wallet runs in-process in the runner → ≥4 cores; orchestration-only tiers keep 1
-        assert!(QosClass::Wallet.profile().runner.cpu_milli >= 4_000);
-        assert_eq!(QosClass::Integration.profile().runner.cpu_milli, 1_000);
-        assert_eq!(QosClass::Testnet.profile().runner.cpu_milli, 1_000);
-        assert_eq!(QosClass::Sync.profile().runner.cpu_milli, 1_000);
+        // Wallet runs in-process in the runner; orchestration-only tiers keep 1c
+        let wallet = QosClass::Wallet.profile().runner;
+        assert!(wallet.cpu_milli > 1_000 && wallet.mem_bytes > GIB);
+        for class in [QosClass::Integration, QosClass::Testnet, QosClass::Sync] {
+            assert_eq!(class.profile().runner.cpu_milli, 1_000, "{class:?} only orchestrates");
+        }
+    }
+
+    /// `sync` is a routing marker, not a reserve: `drop_sync_tests` keeps the tier out of
+    /// `ztest run`, and `ztest sync` prices each profile from its own declaration
+    #[test]
+    fn sync_declares_no_default_ceiling_and_demands_one() {
+        assert_eq!(QosClass::Sync.profile().footprint, Resources::ZERO);
+        for class in [QosClass::Integration, QosClass::Wallet, QosClass::Testnet] {
+            assert_ne!(class.profile().footprint, Resources::ZERO, "{class:?} lost its default");
+        }
+        let declared = Resources::new(15_000, 29 * GIB, 0, 0);
+        assert_eq!(QosClass::Sync.profile_with(Some(declared)).footprint, declared);
+    }
+
+    #[test]
+    #[should_panic(expected = "declares no default reserve")]
+    fn a_sync_test_without_a_declared_footprint_is_refused_rather_than_given_one() {
+        let _ = QosClass::Sync.profile_with(None);
     }
 
     #[test]
@@ -904,17 +895,6 @@ mod tests {
         }
         // Variant names are the wire form
         assert_eq!(serde_json::to_string(&QosClass::Sync).unwrap(), "\"Sync\"");
-    }
-
-    #[test]
-    fn enter_sets_current_tier_on_this_thread() {
-        // Thread-local fast path only: the process-global backstop rests on a
-        // one-test-per-process invariant, so asserting it here would race other tests'
-        // `__enter` under the parallel harness
-        __enter(QosClass::Testnet, None);
-        assert_eq!(current(), QosClass::Testnet);
-        __enter(QosClass::Sync, None);
-        assert_eq!(current(), QosClass::Sync);
     }
 
     // ── footprint override ──────────────────────────────────────────────
@@ -951,19 +931,6 @@ mod tests {
     }
 
     #[test]
-    fn share_divides_the_override_rather_than_the_tier_default() {
-        let eff =
-            QosClass::Sync.profile().with_footprint(Some(Resources::new(16_000, 32 * GIB, 0, 0)));
-        let share = eff.share(2).expect("two pods");
-        assert_eq!(share, Resources::new(8_000, 16 * GIB, 0, 0));
-        // Floor invariant holds against the effective footprint
-        assert!(
-            Resources::new(share.cpu_milli * 2, share.mem_bytes * 2, 0, 0)
-                .fits_within(&eff.footprint)
-        );
-    }
-
-    #[test]
     #[should_panic(expected = "footprint override")]
     fn a_zero_override_is_refused_rather_than_rendering_besteffort_pods() {
         // Grammar rejects first; guards a programmatically-built override
@@ -974,77 +941,28 @@ mod tests {
     fn profile_with_is_the_same_lowering_as_with_footprint() {
         let over = Resources::new(4_000, 8 * GIB, 0, 0);
         assert_eq!(
-            QosClass::Basic.profile_with(Some(over)),
-            QosClass::Basic.profile().with_footprint(Some(over))
+            QosClass::Integration.profile_with(Some(over)),
+            QosClass::Integration.profile().with_footprint(Some(over))
         );
     }
 
+    /// One test, not several: `__enter` writes process-global state, so separate cases would
+    /// race each other under the parallel harness rather than under the process-per-test
+    /// invariant the global rests on
     #[test]
-    fn enter_carries_the_override_into_the_effective_profile() {
-        let over = Resources::new(15_000, 29 * GIB, 0, 0);
+    fn enter_carries_the_declaration_into_the_effective_profile() {
+        // Nothing entered → the default tier, so an un-annotated test still sizes pods
+        assert_eq!(current(), QosClass::default());
+
+        let over = Resources::new(15_000, 29 * GIB, 0, 0).with_disk(400 * GIB);
         __enter(QosClass::Sync, Some(over));
         assert_eq!(current(), QosClass::Sync);
+        // Whole `Resources`, disk included — the reserve read back is the one declared
         assert_eq!(current_profile().footprint, over);
         assert_eq!(current_profile().runner, QosClass::Sync.profile().runner);
 
         // Re-enter without one → tier default (stale override must not leak process-wide)
-        __enter(QosClass::Sync, None);
-        assert_eq!(current_profile(), QosClass::Sync.profile());
-    }
-
-    #[test]
-    fn tier_u8_mapping_round_trips_and_rejects_unknown() {
-        for c in ALL_TIERS {
-            assert_eq!(tier_from_u8(tier_to_u8(c)), Some(c));
-        }
-        assert_eq!(tier_from_u8(u8::MAX), None);
-    }
-
-    /// Synthetic tier → sizing tested independently of the reserve table
-    fn tier(cpu_milli: u64, mem_bytes: u64) -> QosProfile {
-        QosProfile {
-            footprint: Resources::new(cpu_milli, mem_bytes, 0, 0),
-            runner: Resources::new(1_000, GIB, 0, 0),
-            pool: Pool::General,
-            priority: 0,
-            hard_cap: Duration::from_secs(60),
-        }
-    }
-
-    #[test]
-    fn share_floors_cpu_to_whole_cores_and_splits_memory() {
-        // 16c/32Gi across 2 pods: an exact split
-        let s = tier(16_000, 32 * GIB).share(2).unwrap();
-        assert_eq!((s.cpu_milli, s.mem_bytes), (8_000, 16 * GIB));
-
-        // 8c/18Gi across 3 → 2667m each, floored to 2c; the spare core stays inside the
-        // reservation as headroom rather than over-deploying
-        assert_eq!(tier(8_000, 18 * GIB).share(3).unwrap().cpu_milli, 2_000);
-
-        // Smallest viable tier: one core, one pod
-        let s = tier(1_000, 512 * MIB).share(1).unwrap();
-        assert_eq!((s.cpu_milli, s.mem_bytes), (1_000, 512 * MIB));
-
-        assert!(tier(8_000, 8 * GIB).share(0).is_none(), "no pods to size");
-    }
-
-    #[test]
-    fn the_default_split_never_exceeds_the_footprint_it_splits() {
-        // Flooring invariant across every topology a tier admits: the pods' total request
-        // never tops what admission reserved
-        let t = tier(8_000, 18 * GIB);
-        for pods in 1..=8 {
-            let s = t.share(pods).expect("pods > 0");
-            let total = s.cpu_milli * pods as u64;
-            assert!(total <= t.footprint.cpu_milli, "{pods} pods want {total}m");
-        }
-        assert_eq!(t.share(3).unwrap().cpu_milli, 2_000, "floor(2667m) = 2c");
-    }
-
-    #[test]
-    #[should_panic(expected = "over-schedule")]
-    fn share_panics_when_a_topology_needs_more_pods_than_the_tier_has_cores() {
-        // 4 pods on a 3-core tier: each clamps to 1c → a 4c deploy against a 3c budget
-        tier(3_000, 3 * GIB).share(4);
+        __enter(QosClass::Integration, None);
+        assert_eq!(current_profile(), QosClass::Integration.profile());
     }
 }

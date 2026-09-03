@@ -59,7 +59,7 @@ fn default_budget(allocatable: Resources) -> Resources {
 /// admits no test at all, so acquisition blocks (up to [`ACQUIRE_WAIT_TIMEOUT`]) rather
 /// than starting a run that can schedule nothing
 fn min_viable() -> Resources {
-    QosClass::Basic.profile().footprint
+    QosClass::default_footprint()
 }
 
 #[derive(Debug, thiserror::Error)]

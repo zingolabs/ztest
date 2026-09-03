@@ -517,7 +517,11 @@ fn tooling(class: ClusterClass) -> Finding {
 // ── Capacity ──────────────────────────────────────────────────────────
 
 /// Largest pod ztest ever asks a single node to hold: the BuildKit builder, or the
-/// heaviest tier's whole admitted reserve, whichever is bigger
+/// heaviest tier's whole admitted reserve, whichever is bigger.
+///
+/// - `sync` contributes its runner alone (no tier default); a sync profile's own reserve is
+///   checked against cluster `allocatable` by `ztest sync start`, which is the only path
+///   that knows it
 fn heaviest_pod() -> Resources {
     crate::qos::QosClass::ALL
         .iter()

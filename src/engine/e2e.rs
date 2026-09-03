@@ -61,9 +61,13 @@ impl Drop for Fixture {
 
 /// Per-binary QoS dump entry; `test_id` crate-rooted (`<crate>::<name>`), so the dummy prefix
 /// exercises the real strip/join in `build_work_list`
+/// `sync` carries no tier default, so an entry on that tier declares its own reserve —
+/// lowering one without a footprint panics, exactly as it would for a real profile
 fn qos(binary_id: &str, helper: &str, class: QosClass) -> (String, Vec<QosEntry>) {
     let test_id = format!("somecrate::{}", child::test_name(helper));
-    (binary_id.to_string(), vec![QosEntry { test_id, class, footprint: None }])
+    let footprint = (class == QosClass::Sync)
+        .then(|| Resources::new(15_000, 15 * crate::qos::GIB, 0, 0));
+    (binary_id.to_string(), vec![QosEntry { test_id, class, footprint }])
 }
 
 fn env() -> EngineEnv {
@@ -285,11 +289,11 @@ async fn oversized_test_is_skipped_with_reason_while_the_rest_runs() {
     let binaries =
         [fx.binary("pkg::ok", "prints_small_ok"), fx.binary("pkg::huge", "never_admitted")];
     let qos_dump = [
-        qos("pkg::ok", "prints_small_ok", QosClass::Basic),
+        qos("pkg::ok", "prints_small_ok", QosClass::Integration),
         qos("pkg::huge", "never_admitted", QosClass::Sync),
     ];
-    // Fits Basic, far below a Sync footprint → Sync rejected
-    let b = QosClass::Basic.profile().footprint;
+    // Fits Integration, far below a Sync footprint → Sync rejected
+    let b = QosClass::Integration.profile().footprint;
     let ceiling = Resources::new(b.cpu_milli * 2, b.mem_bytes * 2, 0, 0);
 
     let (stats, out, _conc, _panel) =
@@ -301,7 +305,7 @@ async fn oversized_test_is_skipped_with_reason_while_the_rest_runs() {
     assert!(out.contains("SKIP"), "{out}");
     assert!(out.contains("exceeds cluster capacity"), "skip reason must show; {out}");
     assert!(out.contains("pkg::huge"), "{out}");
-    assert!(out.contains("PASS"), "the basic test must report PASS; {out}");
+    assert!(out.contains("PASS"), "the schedulable test must report PASS; {out}");
     assert!(out.contains("1 skipped"), "summary must tally the skip; {out}");
     assert!(!out.contains("should-never-run"), "skipped test must not run; {out}");
 }

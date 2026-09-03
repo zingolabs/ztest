@@ -160,10 +160,10 @@ pub fn for_run(
 
         for test in &bin.selected_tests {
             let declared = tier_for(&tiers, test);
-            let class = declared.map_or(QosClass::Basic, |e| e.class);
+            let class = declared.map_or_else(QosClass::default, |e| e.class);
             // Reserve admission will ask for, override included
             let admitted =
-                declared.map_or_else(|| QosClass::Basic.profile(), |e| e.profile()).admitted();
+                declared.map_or_else(|| QosClass::default().profile(), |e| e.profile()).admitted();
             let seeds = deps_by_binary
                 .iter()
                 .filter(|(id, _)| *id == bin.binary_id)

@@ -163,7 +163,7 @@ impl ValidatorBackend for ZcashdValidator {
             run_as_user: None,
             supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
-            guaranteed: None,
+            guaranteed: Some(crate::qos::pod::VALIDATOR.into()),
             image_pull_secret: crate::backends::image::pull_secret(),
             termination_grace_period: None,
         })

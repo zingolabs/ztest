@@ -472,8 +472,13 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
+    /// `sync` carries no tier default, so an item on that tier is priced from a declared
+    /// reserve — the same lowering `ztest sync` performs on a real profile
     fn item(name: &str, class: QosClass, retries: u32) -> WorkItem {
-        let p = class.profile();
+        let p = class.profile_with(match class {
+            QosClass::Sync => Some(Resources::new(15_000, 15 * crate::qos::GIB, 0, 0)),
+            _ => None,
+        });
         WorkItem {
             binary_id: "pkg::b".into(),
             test_name: name.into(),
@@ -810,12 +815,12 @@ mod tests {
     /// Lower tiers submitted *earlier* than Testnet (only priority can order the starts)
     #[tokio::test]
     async fn higher_tiers_backfill_before_lower_even_when_queued_earlier() {
-        let ceiling = QosClass::Sync.profile().footprint; // one Sync at a time
+        let ceiling = item("probe", QosClass::Sync, 0).footprint; // one Sync at a time
         let items = vec![
             item("sync", QosClass::Sync, 0), // grabs the only initial slot
             // Submitted lowest-priority-first on purpose:
-            item("basic0", QosClass::Basic, 0),
-            item("basic1", QosClass::Basic, 0),
+            item("wal0", QosClass::Wallet, 0),
+            item("wal1", QosClass::Wallet, 0),
             item("int0", QosClass::Integration, 0),
             item("int1", QosClass::Integration, 0),
             item("net0", QosClass::Testnet, 0),
@@ -845,8 +850,8 @@ mod tests {
         };
         assert!(
             first(QosClass::Sync) < first(QosClass::Testnet)
-                && first(QosClass::Testnet) < first(QosClass::Integration)
-                && first(QosClass::Integration) < first(QosClass::Basic),
+                && first(QosClass::Testnet) < first(QosClass::Wallet)
+                && first(QosClass::Wallet) < first(QosClass::Integration),
             "tiers must start in descending-priority order; order={:?}",
             g.order
         );

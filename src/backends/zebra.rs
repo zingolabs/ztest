@@ -244,7 +244,7 @@ impl ValidatorBackend for ZebraValidator {
             run_as_user: opts.shared_state.as_ref().map(|_| 1000),
             supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
-            guaranteed: None,
+            guaranteed: Some(crate::qos::pod::VALIDATOR.into()),
             image_pull_secret: crate::backends::image::pull_secret(),
             termination_grace_period: None,
         })

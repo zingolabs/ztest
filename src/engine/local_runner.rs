@@ -242,13 +242,13 @@ mod tests {
     }
 
     fn item(bin: &Path, name: &str) -> WorkItem {
-        let p = QosClass::Basic.profile();
+        let p = QosClass::Integration.profile();
         WorkItem {
             binary_id: "t::b".into(),
             test_name: name.into(),
             binary_path: bin.to_path_buf(),
             cwd: PathBuf::from("/"),
-            class: QosClass::Basic,
+            class: QosClass::Integration,
             footprint: p.footprint,
             priority: p.priority,
             hard_cap: p.hard_cap,

@@ -547,12 +547,13 @@ mod tests {
 
     #[test]
     fn a_dump_without_a_footprint_field_still_deserializes() {
-        // Dump from an older test binary
-        let line = r#"{"kind":"qos","test_id":"a::b","class":"Sync"}"#;
+        // Dump from an older test binary. `Integration` rather than `Sync`: the field is
+        // absent either way, but only a tier with a default ceiling can be lowered without one
+        let line = r#"{"kind":"qos","test_id":"a::b","class":"Integration"}"#;
         match serde_json::from_str::<InventoryLine>(line).unwrap() {
             InventoryLine::Qos(e) => {
                 assert_eq!(e.footprint, None);
-                assert_eq!(e.profile(), QosClass::Sync.profile());
+                assert_eq!(e.profile(), QosClass::Integration.profile());
             }
             other => panic!("qos line demuxed as {other:?}"),
         }

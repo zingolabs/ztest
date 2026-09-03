@@ -11,45 +11,80 @@ calibration.
   (`cluster::require_orchestrator`, keyed on `ZTEST_ENGINE`) → a bare `cargo test` errors instead of
   creating unbudgeted pods
 
+## Per-pod defaults
+
+Sizing lives with the component, not with the tier. Each backend renders its own reserve
+(`qos::pod`), `.resources(cpu, mem)` overrides it per pod, and the tier only bounds their sum.
+
+| Pod                        | Reserve    | Set by                       |
+| -------------------------- | ---------- | ---------------------------- |
+| validator (zebrad, zcashd) | 1c / 2 GiB | `qos::pod::VALIDATOR`        |
+| indexer (zainod, lwd)      | 1c / 2 GiB | `qos::pod::INDEXER`          |
+| runner                     | tier       | `QosProfile::runner`         |
+
+- Memory-led: 2 GiB clears regtest Orchard proving and the NU6 boundary work
+- Whole cores, `requests == limits` → Guaranteed, and eligible for CPU Manager `static`
+  (exclusive pinned CPUs); a fractional reserve drops the container into the shared pool
+- One pinned core per pod is the floor, so cluster cores ÷ (pods + 1) caps run concurrency
+
 ## Tier ladder
 
 ```rust
-#[ztest::qos::basic]   #[ztest::qos::wallet]   #[ztest::qos::integration]
-#[ztest::qos::testnet] #[ztest::qos::sync]
+#[ztest::qos::integration] #[ztest::qos::wallet]
+#[ztest::qos::testnet]     #[ztest::qos::sync(footprint = "…")]
 ```
 
-| Tier          | Hard cap | Components   | Runner      | Admitted     | Scheduling                      |
-| ------------- | -------- | ------------ | ----------- | ------------ | ------------------------------- |
-| `basic`       | 60 s     | 1c / 512 MiB | 1c / 512MiB | 2c / 1 GiB   | general pool                    |
-| `wallet`      | 10 min   | 4c / 2 GiB   | 4c / 1 GiB  | 8c / 3 GiB   | general pool                    |
-| `integration` | 10 min   | 3c / 3 GiB   | 1c / 1 GiB  | 4c / 4 GiB   | general pool                    |
-| `testnet`     | 6 h      | 8c / 10 GiB  | 1c / 1 GiB  | 9c / 11 GiB  | general pool                    |
-| `sync`        | 48 h     | 15c / 15 GiB | 1c / 1 GiB  | 16c / 16 GiB | NVMe node-selector + toleration |
+| Tier          | Hard cap | Ceiling     | Runner     | Admitted    | Scheduling                      |
+| ------------- | -------- | ----------- | ---------- | ----------- | ------------------------------- |
+| `integration` | 10 min   | 2c / 4 GiB  | 1c / 1 GiB | 3c / 5 GiB  | general pool                    |
+| `wallet`      | 10 min   | 2c / 4 GiB  | 2c / 2 GiB | 4c / 6 GiB  | general pool                    |
+| `testnet`     | 6 h      | 8c / 10 GiB | 1c / 1 GiB | 9c / 11 GiB | general pool                    |
+| `sync`        | 48 h     | *declared*  | 1c / 1 GiB | *declared*  | NVMe node-selector + toleration |
 
-- *Components* = `QosProfile::footprint`, the component-pod aggregate — the only overridable column
-- *Admitted* = `footprint + runner`, what admission, the lease and the namespace quota all charge
-- `wallet`'s runner is heavy (in-process wallet lives there); every other runner only orchestrates
-- Caps + reserves locked in the `QosClass::profile` const table; priority ascends with tier order
-  (`wallet` between `basic` and `integration`)
-- **Reserve** = per-namespace aggregate budget: both the scheduling reservation and the default ceiling
-  for pod `limits`; per-component `.resources(cpu, mem)` overrides individual pods
-- `sync` off the general pool → nodeSelector + toleration (`qos::NVME_*`, label `ztest.io/pool=nvme`);
-  NVMe node count sizes the sync concurrency ceiling
-- Un-annotated → `basic`
+- *Ceiling* = `QosProfile::footprint`, the bound on Σ component-pod reserves — the only
+  overridable column. It does **not** size pods; `2c/4Gi` is the two-pod validator+indexer
+  shape at the defaults above
+- *Admitted* = `ceiling + runner`, what admission, the lease and the namespace quota all charge
+- `wallet` differs from `integration` in the runner alone (the in-process wallet lives there);
+  every other runner only orchestrates
+- Caps + reserves locked in the `QosClass::profile` const table; priority ascends with tier
+  order, and the default tier sits lowest so a flood of ordinary tests cannot starve the
+  rare heavy ones
+- `sync` off the general pool → nodeSelector + toleration (`qos::NVME_*`, label
+  `ztest.io/pool=nvme`); NVMe node count sizes the sync concurrency ceiling
+- Un-annotated → `integration`. A test smaller than the default two-pod shape declares
+  `footprint = "1c/2Gi"` rather than reaching for a lighter tier
 - Cap enforced by nextest `slow-timeout` (`period = hard_cap, terminate-after = 2`): SLOW at 1×,
   hard-kill at 2×. Teardown after a timeout-kill falls to the janitor/ttl backstop
 
+### `sync` declares no default
+
+`sync` is a routing marker before it is a tier: `plan::drop_sync_tests` subtracts the whole tier
+from every `ztest run` selection, so the annotation exists to keep those tests *out* of the engine
+and to make them discoverable by `ztest sync`. Its topologies share nothing to size from — a
+validator serving a frozen snapshot beside an indexer building one — so the table reserves
+`Resources::ZERO` and `footprint = ".."` is mandatory.
+
+- Enforced at compile time by `qos_attr` / `sync_test` (a missing footprint is a build error)
+- Backstopped at runtime in `QosClass::profile_with`, which refuses to hand back a zero ceiling
+- The admission floor (`ledger::min_viable`, the `ztest status` verdict) reads
+  `QosClass::default_footprint` — the default tier's ceiling — so a zero-reserve tier never
+  drags it to nothing
+
 ## Per-test footprint override
 
-Tier reserve = a default, not an allotment. A topology that doesn't fit declares its own:
+Tier ceiling = a default, not an allotment. A topology that doesn't fit declares its own:
 
 ```rust
-#[ztest::qos::sync(footprint = "15c/29Gi")]
+#[ztest::qos::integration(footprint = "3c/6Gi")]   // e.g. a 3-pod state/fetch comparison
+#[ztest::qos::sync(footprint = "15c/29Gi")]        // required: sync has no default
 #[ztest::sync_test(name = "…", subject = indexer, qos = sync, footprint = "15c/29Gi")]
 ```
 
 - Replaces the **component** half only — `runner`, `pool`, `priority`, `hard_cap` still come from the
   tier (a test that could raise its own priority or cap would starve its peers)
+- Raises the ceiling, never the pods: a third pod at `qos::pod`'s defaults needs a third core of
+  headroom, and `DeployBudget` names the whole topology when the sum does not fit
 - Grammar `"<cpu>/<mem>"` (`ztest_attr::footprint`), shared by proc-macro, CLI source scan, `qos::units`
 - Units mandatory on both halves, CPU whole cores: a bare `29` = a 29-**byte** reserve, and a fractional
   core renders (rounded up) as a pod larger than the reserve it was admitted against
@@ -62,7 +97,6 @@ override takes effect:
 | Consumer                              | Reads        |
 | ------------------------------------- | ------------ |
 | namespace `ResourceQuota`             | `footprint`  |
-| default per-pod share (`share(n)`)    | `footprint`  |
 | `DeployBudget` ceiling                | `footprint`  |
 | ledger reservation, scheduler request | `admitted()` |
 
@@ -83,7 +117,7 @@ Outer attribute on the test; re-emits the item intact (inner `#[tokio::test]` in
 mirroring `dev!` → inventory → image:
 
 ```rust
-#[ztest::qos::sync]
+#[ztest::qos::sync(footprint = "15c/29Gi")]
 #[tokio::test(flavor = "multi_thread")]
 async fn syncs_from_genesis() { /* body */ }
 
@@ -92,11 +126,12 @@ async fn syncs_from_genesis() { /* body */ }
     ::ztest::qos::QosDecl {
         test_id: concat!(module_path!(), "::", stringify!(syncs_from_genesis)),
         class: ::ztest::qos::QosClass::Sync,
+        footprint: Some(::ztest::qos::Resources::new(15_000, 31_138_512_896, 0, 0)),
     }
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn syncs_from_genesis() {
-    ::ztest::qos::__enter(::ztest::qos::QosClass::Sync);   // task-local
+    ::ztest::qos::__enter(::ztest::qos::QosClass::Sync, /* footprint */);  // task-local
     /* body */
 }
 ```
@@ -105,7 +140,7 @@ async fn syncs_from_genesis() {
   by tier and builds the capacity plan. `QosDecl` (submit, `&'static`) / `QosEntry` (owned read) flow
   through `src/inventory.rs` beside `DevImageDecl` / `TestDepDecl` / `SeedDecl`
 - **task-local enter** (in-process): `TestEnv::build()` reads the tier for requests/limits/scheduling
-- Macros in `ztest_macros` (`qos_attr()`); `qos` re-exports the five plus `#[ztest::calibrated]`
+- Macros in `ztest_macros` (`qos_attr()`); `qos` re-exports the four plus `#[ztest::calibrated]`
 
 ## 4-D capacity model
 
@@ -115,14 +150,15 @@ async fn syncs_from_genesis() {
 | --------------- | ----------- | ---------- | ------------------------------------------- |
 | CPU             | `cpu_milli` | millicores | pod `requests`/`limits`                     |
 | Memory          | `mem_bytes` | bytes      | pod `requests`/`limits`                     |
-| Disk bandwidth  | `io_bps`    | bytes/sec  | PVC annotation / VAC → `io.max` `{r,w}bps`  |
-| Disk operations | `io_iops`   | ops/sec    | PVC annotation / VAC → `io.max` `{r,w}iops` |
+| Disk bandwidth  | `disk_bps`    | bytes/sec  | PVC annotation / VAC → `io.max` `{r,w}bps`  |
+| Disk operations | `disk_iops`   | ops/sec    | PVC annotation / VAC → `io.max` `{r,w}iops` |
 
 - "Fits" = fits in **every** dimension; the machinery (`decide`, `Scheduler`, ledger) is
   dimension-agnostic, all through `Resources::{fits_within, checked_add, saturating_sub, …}`
 - Per-pool capacity = `allocatable − Σ reserved`, where a scheduled pod reserves the **per-dimension max
-  of requests and limits** (`qos::units::pod_effective_reservation`) — the burst ceiling, not the
-  request, which keeps admission contention-safe against Burstable co-tenants (notably build pods)
+  of its effective request and its observed usage** (`qos::units::pod_effective_request`, `max`'d with
+  live usage by the probe) — the request keeps admission scheduler-safe, the usage term catches a
+  Burstable co-tenant running over its request (notably build pods)
 - `pipeline/cluster.rs::cluster_reserved` sums that cluster-wide
 
 ### I/O inert until calibrated
@@ -130,7 +166,7 @@ async fn syncs_from_genesis() {
 k8s exposes no I/O `allocatable` and a test's I/O demand is unknown a priori → both the node ceiling and
 the per-tier reserve start unset, so an uncalibrated cluster behaves byte-for-byte like CPU×memory:
 
-- Node ceiling from annotations (below); absent → `u64::MAX` (`Resources::cpu_mem_unbounded_io`)
+- Node ceiling from annotations (below); absent → `u64::MAX` (`Resources::cpu_mem_unbounded_rest`)
 - Per-tier reserve `0` until calibration fills it, guarded by
   `qos::tests::every_tier_reserves_zero_io_pending_calibration`
 
@@ -141,7 +177,7 @@ I/O is a property of the volume → cap on the **PVC**, namespace budget = Σ it
 vehicle is a `VolumeAttributesClass`, honored by neither backend today (topolvm/LVMS has none; ceph-csi
 RBD's krbd `io.max` path is `devel`-only, targeting v3.18 + k8s 1.34). So:
 
-- **Declared** on the PVC via `qos::ANNOTATION_IO_BPS` / `ANNOTATION_IO_IOPS` — backend-uniform carrier,
+- **Declared** on the PVC via `qos::ANNOTATION_DISK_BPS` / `ANNOTATION_DISK_IOPS` — backend-uniform carrier,
   swaps to a VAC on Ceph once ceph-csi ≥ v3.18
 - **Enforced** with cgroup v2 `io.max` on the pod cgroup via **CRI-O `blockio` classes** (works on a
   topolvm `/dev/dm-N` and a krbd `/dev/rbdN` alike). Node config (MachineConfig): cgroup v2,
@@ -177,20 +213,19 @@ triggers a fresh pass.
 
 ## Guaranteed-QoS pods
 
-No `.resources()` call → tier footprint split **evenly across the env's pods** (validators + indexers;
-in-process wallets get none), rendered `requests == limits` (`env::even_share` + `manifest::PodSpec`) =
-kubelet "Guaranteed".
+Every component pod renders `requests == limits` (`manifest::PodSpec`) = kubelet "Guaranteed". The
+amount comes from the pod, never from arithmetic on the tier: the backend's `qos::pod` default,
+replaced by an explicit `.resources()`.
 
-- CPU per pod rounds **up to whole cores** (≥1) for CPU Manager `static` eligibility (exclusive pinned
-  CPUs); a fractional core drops the container into the shared pool. Memory = exact even share
-- Rounding up means `pods × per-pod` can exceed the raw footprint (8c over 3 pods → 9c) → admission
-  reserves the **deployed** footprint (`env::deployed_footprint`), so the ledger never under-counts
+- CPU per pod is **whole cores** (≥1) for CPU Manager `static` eligibility (exclusive pinned CPUs);
+  a fractional core drops the container into the shared pool
+- `DeployBudget` charges each spec as it is built and refuses the topology whose *sum* tops the tier
+  ceiling — per-pod checks miss it, since 9c + 9c each fit a 15c ceiling that their sum does not
 - Killed, never migrated: bare `Pod`s, `restartPolicy: Never`, and the auto-added
   `node.kubernetes.io/{not-ready,unreachable}` tolerations overridden to `tolerationSeconds: 0` so a lost
   node deletes immediately
-- Explicit `.resources()` overrides (requests-only)
-- Per-test namespace also gets a requests- and pod-count-scoped `ResourceQuota` sized to the deployed
-  footprint (`cluster::apply_resource_quota`) as an API-server backstop
+- Per-test namespace also gets a requests- and pod-count-scoped `ResourceQuota` sized to the tier
+  ceiling (`cluster::apply_resource_quota`) as an API-server backstop
 
 ## Cross-run reservation ledger
 

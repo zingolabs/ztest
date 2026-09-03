@@ -303,6 +303,14 @@ impl std::fmt::Display for Resources {
     }
 }
 
+/// Lowers an accounting amount to a pod's own units, for the [`qos::pod`](crate::qos::pod)
+/// defaults each backend renders. Drops I/O + capacity, which ride the PVC, not the container
+impl From<crate::qos::Resources> for Resources {
+    fn from(r: crate::qos::Resources) -> Self {
+        Resources { cpu: Cpu::millis(r.cpu_milli), memory: Mem::bytes(r.mem_bytes) }
+    }
+}
+
 impl<B: ValidatorConfig> Validator<B> {
     pub fn custom(backend: B, opts: ComponentOpts) -> Self {
         Self { backend, opts, tunings: Vec::new() }

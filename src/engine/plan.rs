@@ -50,7 +50,7 @@ impl ResourceDeps {
     }
 }
 
-/// Crate-rooted QoS `test_id` → libtest name (`qos_attr::marker_basic` → `marker_basic`).
+/// Crate-rooted QoS `test_id` → libtest name (`qos_attr::marker_plain` → `marker_plain`).
 /// Exact within a binary: the dump is per-binary, so segment 1 is always that crate
 pub fn libtest_name(test_id: &str) -> &str {
     test_id.split_once("::").map_or(test_id, |(_crate, rest)| rest)
@@ -60,8 +60,8 @@ pub fn libtest_name(test_id: &str) -> &str {
 ///
 /// - Exact match misses `rstest` cases (one libtest entry per case, `QosEntry` names only
 ///   the annotated fn) → walk off trailing `::` segments to the declaring ancestor
-/// - Without it, cases fall to `Basic` and a fixture-restoring testnet test dies at Basic's
-///   60s `hard_cap`, looking like a product hang
+/// - Without it, cases fall to the default tier and a fixture-restoring testnet test dies
+///   at its far shorter `hard_cap`, looking like a product hang
 fn declared_qos<'a>(
     by_name: &HashMap<&str, &'a QosEntry>,
     test_name: &str,
@@ -70,7 +70,7 @@ fn declared_qos<'a>(
         return Some(entry);
     }
     // One generated segment per step; first declaring ancestor owns this case. Declared
-    // nothing → walks to root, `None`, Basic default preserved
+    // nothing → walks to root, `None`, tier default preserved
     let mut rest = test_name;
     while let Some((parent, _)) = rest.rsplit_once("::") {
         if let Some(entry) = by_name.get(parent) {
@@ -164,7 +164,7 @@ fn tiers_by_binary(
         .collect()
 }
 
-/// Undeclared → [`QosClass::Basic`], matching `qos::current`; `retries` applied uniformly
+/// Undeclared → [`QosClass::default`], matching `qos::current`; `retries` applied uniformly
 pub fn build_work_list(
     selected_binaries: &[SelectedBinary],
     qos_by_binary: &[(String, Vec<QosEntry>)],
@@ -177,11 +177,12 @@ pub fn build_work_list(
     for bin in selected_binaries {
         let bin_tiers = tiers.get(bin.binary_id.as_str());
         for test_name in &bin.selected_tests {
-            // Undeclared → `Basic`, matching `qos::current`; declared → effective profile
-            // (override must reach the scheduler request, not flatten to the tier default)
+            // Undeclared → the default tier, matching `qos::current`; declared → effective
+            // profile (override must reach the scheduler request, not flatten to the default)
             let declared = bin_tiers.and_then(|m| declared_qos(m, test_name.as_str()));
-            let class = declared.map_or(QosClass::Basic, |e| e.class);
-            let profile = declared.map_or_else(|| QosClass::Basic.profile(), |e| e.profile());
+            let class = declared.map_or_else(QosClass::default, |e| e.class);
+            let profile =
+                declared.map_or_else(|| QosClass::default().profile(), |e| e.profile());
             let item_deps = deps.for_item(&bin.binary_id, test_name);
             items.push(WorkItem {
                 binary_id: bin.binary_id.clone(),
@@ -231,6 +232,15 @@ mod tests {
 
     fn entry(test_id: &str, class: QosClass) -> QosEntry {
         QosEntry { test_id: test_id.to_string(), class, footprint: None }
+    }
+
+    /// `sync` carries no tier default, so an entry for it always declares its own
+    fn sync_qos_entry(test_id: &str) -> QosEntry {
+        QosEntry {
+            test_id: test_id.to_string(),
+            class: QosClass::Sync,
+            footprint: Some(crate::qos::Resources::new(15_000, 15 * crate::qos::GIB, 0, 0)),
+        }
     }
 
     fn sync_entry(test_id: &str, name: &str) -> SyncTestEntry {
@@ -289,7 +299,7 @@ mod tests {
         let mut bins = vec![bin("pkg::b", &["a", "b"])];
         let qos = [(
             "pkg::b".to_string(),
-            vec![entry("b::a", QosClass::Basic), entry("b::b", QosClass::Testnet)],
+            vec![entry("b::a", QosClass::Integration), entry("b::b", QosClass::Testnet)],
         )];
         assert!(drop_sync_tests(&mut bins, &[], &qos).is_empty());
         assert_eq!(bins.len(), 1);
@@ -304,7 +314,7 @@ mod tests {
         let mut bins = vec![bin(
             "ztest::qos_attr",
             &[
-                "marker_basic",
+                "marker_plain",
                 "marker_sync",
                 "parameterized_sync::case_1",
                 "parameterized_sync::case_2",
@@ -313,15 +323,15 @@ mod tests {
         let qos = [(
             "ztest::qos_attr".to_string(),
             vec![
-                entry("qos_attr::marker_basic", QosClass::Basic),
-                entry("qos_attr::marker_sync", QosClass::Sync),
-                entry("qos_attr::parameterized_sync", QosClass::Sync),
+                entry("qos_attr::marker_plain", QosClass::Integration),
+                sync_qos_entry("qos_attr::marker_sync"),
+                sync_qos_entry("qos_attr::parameterized_sync"),
             ],
         )];
 
         let excluded = drop_sync_tests(&mut bins, &[], &qos);
 
-        assert_eq!(bins[0].selected_tests, ["marker_basic"]);
+        assert_eq!(bins[0].selected_tests, ["marker_plain"]);
         assert_eq!(excluded.len(), 3);
         assert!(excluded.iter().all(|e| e.reason == SyncExclusion::TierOnly));
         assert!(
@@ -333,7 +343,7 @@ mod tests {
 
     #[test]
     fn libtest_name_strips_crate_segment() {
-        assert_eq!(libtest_name("qos_attr::marker_basic"), "marker_basic");
+        assert_eq!(libtest_name("qos_attr::marker_plain"), "marker_plain");
         assert_eq!(libtest_name("mycrate::mod::deep::t"), "mod::deep::t");
         // No `::` → as-is
         assert_eq!(libtest_name("bare"), "bare");
@@ -375,39 +385,43 @@ mod tests {
     /// Fallback survives the parent walk: declared-nothing stays `Basic`, so the lookup is
     /// not "inherit from any ancestor at all"
     #[test]
-    fn a_test_declaring_no_tier_still_defaults_to_basic() {
+    fn a_test_declaring_no_tier_still_defaults_to_the_default_tier() {
         let bins = [bin("pkg::b", &["some::module::undeclared_test"])];
         let qos =
             [("pkg::b".to_string(), vec![entry("b::other::declared_test", QosClass::Testnet)])];
         let items = build_work_list(&bins, &qos, 0, &ResourceDeps::default());
-        assert_eq!(items[0].class, QosClass::Basic);
+        assert_eq!(items[0].class, QosClass::default());
     }
 
     #[test]
     fn joins_tier_by_stripped_test_id() {
-        let bins = [bin("ztest::qos_attr", &["marker_basic", "marker_sync"])];
+        let bins = [bin("ztest::qos_attr", &["marker_plain", "marker_sync"])];
         let qos = [(
             "ztest::qos_attr".to_string(),
             vec![
                 // dump test_ids are crate-rooted
-                entry("qos_attr::marker_basic", QosClass::Basic),
-                entry("qos_attr::marker_sync", QosClass::Sync),
+                entry("qos_attr::marker_plain", QosClass::Integration),
+                sync_qos_entry("qos_attr::marker_sync"),
             ],
         )];
         let items = build_work_list(&bins, &qos, 0, &ResourceDeps::default());
         let by_name: HashMap<_, _> = items.iter().map(|w| (w.test_name.as_str(), w)).collect();
-        assert_eq!(by_name["marker_basic"].class, QosClass::Basic);
+        assert_eq!(by_name["marker_plain"].class, QosClass::Integration);
         assert_eq!(by_name["marker_sync"].class, QosClass::Sync);
-        // Reserves the whole admitted total (components + runner), so the runner is accounted
-        assert_eq!(by_name["marker_sync"].footprint, QosClass::Sync.profile().admitted());
+        // Reserves the whole admitted total (components + runner), so the runner is
+        // accounted — and for `sync` the components half is the test's own declaration
+        assert_eq!(
+            by_name["marker_sync"].footprint,
+            sync_qos_entry("qos_attr::marker_sync").profile().admitted()
+        );
     }
 
     #[test]
-    fn undeclared_tests_default_to_basic() {
+    fn undeclared_tests_default_to_the_default_tier() {
         let bins = [bin("pkg::b", &["lonely"])];
         let items = build_work_list(&bins, &[], 2, &ResourceDeps::default());
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].class, QosClass::Basic);
+        assert_eq!(items[0].class, QosClass::default());
         assert_eq!(items[0].retries, 2);
     }
 
@@ -417,8 +431,8 @@ mod tests {
         let qos = [(
             "pkg::b".to_string(),
             vec![
-                entry("pkg::s", QosClass::Sync),        // priority 3
-                entry("pkg::i", QosClass::Integration), // priority 1
+                sync_qos_entry("pkg::s"),               // priority 3
+                entry("pkg::i", QosClass::Integration), // priority 0
                 entry("pkg::y", QosClass::Testnet),     // priority 2
             ],
         )];

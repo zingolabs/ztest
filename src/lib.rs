@@ -170,7 +170,12 @@ pub mod prelude {
     };
     /// Declaring a component's `/metrics` layout: [`MetricLayout::ROWS`] beside the
     /// family constants the backend owns
-    pub use crate::metrics::{Exporter, Family, MetricLayout, Select, family, family_where};
+    ///
+    /// - `Reduce` rides along so a probe reading an exposition directly can tell an absent
+    ///   family from a broken one (`height_gauge`/`counter_total` fold both to `None`)
+    pub use crate::metrics::{
+        Exporter, Family, MetricLayout, Reduce, Select, family, family_where,
+    };
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,
         Regtest, Restore, regtest_test_activation_heights, regtest_test_lockbox_disbursements,

@@ -671,9 +671,9 @@ fn test_dep_submit(
 
 // ───────────────────────── qos tier attributes ────────────────────────
 
-/// `#[ztest::qos::basic]` — declare a test's quality-of-service tier.
+/// `#[ztest::qos::integration]` — declare a test's quality-of-service tier.
 ///
-/// The tier attributes (`basic`, `wallet`, `integration`, `testnet`, `sync`)
+/// The tier attributes (`integration`, `wallet`, `testnet`, `sync`)
 /// wrap a test, re-emit it intact (preserving any inner `#[tokio::test]` etc.),
 /// and inject two things — mirroring the `dev!` → inventory pattern:
 ///   1. an `inventory::submit!` of a `ztest::inventory::QosDecl` so
@@ -683,31 +683,28 @@ fn test_dep_submit(
 ///      read the tier in `TestEnv::build()` (the in-process bridge).
 ///
 /// One optional argument, `footprint = "15c/29Gi[/400Gi]"`: replaces this test's component
-/// reserve only (tier still supplies priority/pool/hard cap). Omitted → tier default.
-#[proc_macro_attribute]
-pub fn basic(attr: TokenStream, item: TokenStream) -> TokenStream {
-    qos_attr("Basic", attr, item)
-}
-
-/// `#[ztest::qos::wallet]` — see [`basic`].
-#[proc_macro_attribute]
-pub fn wallet(attr: TokenStream, item: TokenStream) -> TokenStream {
-    qos_attr("Wallet", attr, item)
-}
-
-/// `#[ztest::qos::integration]` — see [`basic`].
+/// ceiling only (tier still supplies priority/pool/hard cap). Omitted → tier default, and
+/// pods size themselves from `qos::pod` unless they call `.resources(..)`.
+///
+/// `sync` has no default ceiling, so there it is required rather than optional.
 #[proc_macro_attribute]
 pub fn integration(attr: TokenStream, item: TokenStream) -> TokenStream {
     qos_attr("Integration", attr, item)
 }
 
-/// `#[ztest::qos::testnet]` — see [`basic`].
+/// `#[ztest::qos::wallet]` — see [`integration`].
+#[proc_macro_attribute]
+pub fn wallet(attr: TokenStream, item: TokenStream) -> TokenStream {
+    qos_attr("Wallet", attr, item)
+}
+
+/// `#[ztest::qos::testnet]` — see [`integration`].
 #[proc_macro_attribute]
 pub fn testnet(attr: TokenStream, item: TokenStream) -> TokenStream {
     qos_attr("Testnet", attr, item)
 }
 
-/// `#[ztest::qos::sync]` — see [`basic`].
+/// `#[ztest::qos::sync]` — see [`integration`]. `footprint = ".."` is required here.
 #[proc_macro_attribute]
 pub fn sync(attr: TokenStream, item: TokenStream) -> TokenStream {
     qos_attr("Sync", attr, item)
@@ -735,7 +732,7 @@ fn footprint_resources_tokens(f: Option<ztest_attr::Footprint>) -> proc_macro2::
 }
 
 /// Shared body of the four tier attributes. `variant` is the [`QosClass`]
-/// variant ident (`"Basic"` …).
+/// variant ident (`"Integration"` …).
 fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = match syn::parse::<ztest_attr::QosAttrArgs>(attr) {
         Ok(a) => a,
@@ -745,6 +742,17 @@ fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream 
         Ok(f) => f,
         Err(e) => return e.to_compile_error().into(),
     };
+    // `sync` alone carries no tier default, so the runtime would have nothing to reserve.
+    // Caught here rather than at `profile_with`, which fires mid-run on the cluster
+    if variant == "Sync" && args.footprint.is_none() {
+        return syn::Error::new(
+            Span::call_site(),
+            "the `sync` tier has no default reserve — declare one, e.g. \
+             `#[ztest::qos::sync(footprint = \"15c/29Gi\")]`",
+        )
+        .to_compile_error()
+        .into();
+    }
 
     let variant = syn::Ident::new(variant, Span::call_site());
     let ident = &func.sig.ident;
@@ -811,6 +819,17 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     body_fn.sig.ident = syn::Ident::new("__ztest_sync_body", test_ident.span());
 
     let SyncTestArgs { name, description, subject, timeout, qos, footprint, tags } = args;
+    // Same rule as the bare `#[ztest::qos::sync]` attribute: the tier reserves nothing by
+    // default, so a profile riding it must price its own topology
+    if qos == "sync" && footprint.is_none() {
+        return syn::Error::new(
+            qos.span(),
+            "`qos = sync` has no default reserve — declare one, e.g. \
+             `footprint = \"15c/29Gi\"`",
+        )
+        .to_compile_error()
+        .into();
+    }
     let subject_str = LitStr::new(&subject.to_string(), subject.span());
     let qos_str = LitStr::new(&qos.to_string(), qos.span());
     let footprint_res = footprint_resources_tokens(footprint);

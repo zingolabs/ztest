@@ -117,7 +117,7 @@ runs and to this display. It should write a lease with **`reserve = 0`**, `kind:
 Computed in `qos::beacon`, pure and clusterless.
 
 - **Verdict** — `OPEN`/`TIGHT`/`FULL` from free capacity against the lightest tier's footprint
-  (`QosClass::Basic.profile().footprint`, the same `min_viable` threshold `acquire` waits on); below it
+  (`QosClass::default_footprint()`, the same `min_viable` threshold `acquire` waits on); below it
   nothing can start
 - **ETA** — from `started-at`, `completed`, `queued`, `tests-running-count`. `Option`: a run with nothing
   completed has no throughput → renders `?` rather than a fabricated countdown. Quantized to the minute

@@ -358,8 +358,8 @@ mod tests {
         let fp = QosClass::Wallet.profile().footprint;
         let m = resource_quota_manifest(fp, 2);
         let hard = &m["spec"]["hard"];
-        assert_eq!(hard["requests.cpu"], "4000m");
-        assert_eq!(hard["requests.memory"], (2 * GIB).to_string());
+        assert_eq!(hard["requests.cpu"], "2000m");
+        assert_eq!(hard["requests.memory"], (4 * GIB).to_string());
         assert_eq!(hard["pods"], "2");
         assert_eq!(m["metadata"]["name"], "ztest-tier");
         // Scope is load-bearing: unscoped, this rejects ztest's own requestless

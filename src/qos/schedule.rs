@@ -143,59 +143,69 @@ mod tests {
         sets.iter().flat_map(|&(c, n)| at_tier(c, n)).collect()
     }
 
+    /// `n` sync tests, which carry no tier default and are priced from their declaration
+    fn at_sync(footprint: Resources, n: u32) -> Vec<PlannedTest> {
+        let admitted = QosClass::Sync.profile_with(Some(footprint)).admitted();
+        vec![PlannedTest { class: QosClass::Sync, admitted }; n as usize]
+    }
+
     #[test]
     fn tiers_are_listed_highest_priority_first() {
-        let p = plan(
-            &tiers(&[(QosClass::Basic, 1), (QosClass::Sync, 1), (QosClass::Integration, 1)]),
-            None,
-        );
+        let mut planned = tiers(&[(QosClass::Integration, 1), (QosClass::Testnet, 1)]);
+        planned.extend(at_sync(Resources::new(15_000, 15 * GIB, 0, 0), 1));
+        let p = plan(&planned, None);
         let order: Vec<QosClass> = p.tiers.iter().map(|t| t.class).collect();
-        assert_eq!(order, vec![QosClass::Sync, QosClass::Integration, QosClass::Basic]);
-        // Zero-count tiers omitted (testnet undeclared)
-        assert!(!order.contains(&QosClass::Testnet));
+        assert_eq!(order, vec![QosClass::Sync, QosClass::Testnet, QosClass::Integration]);
+        // Zero-count tiers omitted (wallet undeclared)
+        assert!(!order.contains(&QosClass::Wallet));
     }
 
     #[test]
     fn total_is_sum_of_count_times_admitted() {
-        // Admitted (components + runner): basic 2c/1Gi, integration 4c/4Gi
-        // → 3 basic + 1 integration = 10c, 7Gi
-        let p = plan(&tiers(&[(QosClass::Basic, 3), (QosClass::Integration, 1)]), None);
-        assert_eq!(p.total.cpu_milli, 3 * 2000 + 4000);
-        assert_eq!(p.total.mem_bytes, 3 * GIB + 4 * GIB);
+        // Admitted (components + runner): integration 3c/5Gi, testnet 9c/11Gi
+        // → 3 integration + 1 testnet = 18c, 26Gi
+        let p = plan(&tiers(&[(QosClass::Integration, 3), (QosClass::Testnet, 1)]), None);
+        assert_eq!(p.total.cpu_milli, 3 * 3000 + 9000);
+        assert_eq!(p.total.mem_bytes, 3 * 5 * GIB + 11 * GIB);
     }
 
     #[test]
     fn fits_in_one_wave_when_total_within_capacity() {
-        // 4 basic = 8c / 4 GiB against 8c/16Gi → one wave
-        let p = plan(&at_tier(QosClass::Basic, 4), Some(Resources::new(8000, 16 * GIB, 0, 0)));
+        // 4 integration = 12c / 20 GiB against 12c/24Gi → one wave
+        let p =
+            plan(&at_tier(QosClass::Integration, 4), Some(Resources::new(12_000, 24 * GIB, 0, 0)));
         assert_eq!(p.waves, 1);
-        assert_eq!(p.peak, Resources::new(8000, 4 * GIB, 0, 0));
+        assert_eq!(p.peak, Resources::new(12_000, 20 * GIB, 0, 0));
         assert!(p.unschedulable.is_empty());
     }
 
     #[test]
     fn spills_into_multiple_waves_when_total_exceeds_capacity() {
-        // 5 × 4c/4Gi on 4c/8Gi: CPU-bound, 1 per wave → 5 waves
-        let p = plan(&at_tier(QosClass::Integration, 5), Some(Resources::new(4000, 8 * GIB, 0, 0)));
+        // 5 × 3c/5Gi on 3c/8Gi: CPU-bound, 1 per wave → 5 waves
+        let p = plan(&at_tier(QosClass::Integration, 5), Some(Resources::new(3000, 8 * GIB, 0, 0)));
         assert_eq!(p.waves, 5);
-        assert_eq!(p.peak, Resources::new(4000, 4 * GIB, 0, 0));
+        assert_eq!(p.peak, Resources::new(3000, 5 * GIB, 0, 0));
     }
 
     #[test]
     fn unschedulable_test_is_flagged_with_its_own_reserve_and_excluded_from_waves() {
-        // sync admits 16c/16Gi against 4c/8Gi → never fits; a basic (2c/1Gi) still
-        // plans normally around it
-        let p = plan(
-            &tiers(&[(QosClass::Sync, 2), (QosClass::Basic, 1)]),
-            Some(Resources::new(4000, 8 * GIB, 0, 0)),
-        );
+        // A sync test declaring 15c/15Gi admits 16c/16Gi against 4c/8Gi → never fits;
+        // an integration test (3c/5Gi) still plans normally around it
+        let declared = Resources::new(15_000, 15 * GIB, 0, 0);
+        let mut planned = at_sync(declared, 2);
+        planned.extend(at_tier(QosClass::Integration, 1));
+        let p = plan(&planned, Some(Resources::new(4000, 8 * GIB, 0, 0)));
         assert_eq!(p.unschedulable.len(), 2);
         assert!(p.unschedulable.iter().all(|u| u.class == QosClass::Sync));
-        // Amount travels with the rejection (class no longer determines it)
-        assert_eq!(p.unschedulable[0].admitted, QosClass::Sync.profile().admitted());
-        // Only the basic test entered the sim
+        // Amount travels with the rejection (class no longer determines it — and for `sync`
+        // the class carries no amount at all)
+        assert_eq!(
+            p.unschedulable[0].admitted,
+            QosClass::Sync.profile_with(Some(declared)).admitted()
+        );
+        // Only the integration test entered the sim
         assert_eq!(p.waves, 1);
-        assert_eq!(p.peak, Resources::new(2000, GIB, 0, 0));
+        assert_eq!(p.peak, Resources::new(3000, 5 * GIB, 0, 0));
     }
 
     #[test]
@@ -221,8 +231,8 @@ mod tests {
 
     #[test]
     fn a_tier_with_uniform_reserves_still_reports_a_per_test_figure() {
-        let admitted = QosClass::Basic.profile().admitted();
-        let p = plan(&at_tier(QosClass::Basic, 3), None);
+        let admitted = QosClass::Integration.profile().admitted();
+        let p = plan(&at_tier(QosClass::Integration, 3), None);
         assert_eq!(p.tiers[0].per_test, Some(admitted));
         // Stated as a multiple of the figure above, not a literal: the two must agree, and
         // a hardcoded subtotal is what let them drift apart
@@ -232,13 +242,13 @@ mod tests {
 
     #[test]
     fn an_override_makes_its_tier_non_uniform_and_still_sums_correctly() {
-        // Two basic tests, one overriding its component reserve upward
-        let base = QosClass::Basic.profile();
-        let raised = base.with_footprint(Some(Resources::new(4_000, 4 * GIB, 0, 0)));
+        // Two integration tests, one overriding its component reserve upward
+        let base = QosClass::Integration.profile();
+        let raised = base.with_footprint(Some(Resources::new(4_000, 8 * GIB, 0, 0)));
         let p = plan(
             &[
-                PlannedTest { class: QosClass::Basic, admitted: base.admitted() },
-                PlannedTest { class: QosClass::Basic, admitted: raised.admitted() },
+                PlannedTest { class: QosClass::Integration, admitted: base.admitted() },
+                PlannedTest { class: QosClass::Integration, admitted: raised.admitted() },
             ],
             None,
         );
@@ -251,12 +261,12 @@ mod tests {
 
     #[test]
     fn an_override_can_make_one_test_unschedulable_while_its_tier_peer_plans() {
-        let base = QosClass::Basic.profile();
+        let base = QosClass::Integration.profile();
         let huge = base.with_footprint(Some(Resources::new(64_000, 512 * GIB, 0, 0)));
         let p = plan(
             &[
-                PlannedTest { class: QosClass::Basic, admitted: base.admitted() },
-                PlannedTest { class: QosClass::Basic, admitted: huge.admitted() },
+                PlannedTest { class: QosClass::Integration, admitted: base.admitted() },
+                PlannedTest { class: QosClass::Integration, admitted: huge.admitted() },
             ],
             Some(Resources::new(8_000, 16 * GIB, 0, 0)),
         );

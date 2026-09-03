@@ -1076,7 +1076,7 @@ mod tests {
     fn preflight_panel_is_constant_height_and_summarizes_phase() {
         let mut state = sample_state();
         state.qos_plan = Some(ztest::api::qos_plan(
-            &at_tiers(&[(QosClass::Basic, 6)]),
+            &at_tiers(&[(QosClass::Integration, 6)]),
             Some(Resources::new(12_000, 48 * GIB, 0, 0)),
         ));
         let s = render_preflight_panel(
@@ -1268,7 +1268,7 @@ mod tests {
         let mut state = sample_state();
         // sync (17c/18Gi admitted) cannot fit 4c/8Gi → unschedulable; the rest schedule
         state.qos_plan = Some(ztest::api::qos_plan(
-            &at_tiers(&[(QosClass::Basic, 3), (QosClass::Integration, 1), (QosClass::Sync, 2)]),
+            &at_tiers(&[(QosClass::Integration, 3), (QosClass::Wallet, 1), (QosClass::Sync, 2)]),
             Some(Resources::new(4000, 8 * GIB, 0, 0)),
         ));
         let s = render(&state, &plain_unicode_theme());
@@ -1293,7 +1293,7 @@ mod tests {
         use ztest::api::{LiveSnapshot, TierLive};
 
         let plan = ztest::api::qos_plan(
-            &at_tiers(&[(QosClass::Sync, 2), (QosClass::Basic, 3)]),
+            &at_tiers(&[(QosClass::Sync, 2), (QosClass::Integration, 3)]),
             Some(Resources::new(12_000, 48 * GIB, 0, 0)),
         );
         let snapshot = LiveSnapshot {
@@ -1302,7 +1302,7 @@ mod tests {
                     QosClass::Sync,
                     TierLive { count: 1, reserve: Resources::new(8_000, 16 * GIB, 0, 0) },
                 ),
-                (QosClass::Basic, TierLive { count: 2, reserve: Resources::new(1_000, GIB, 0, 0) }),
+                (QosClass::Integration, TierLive { count: 2, reserve: Resources::new(1_000, GIB, 0, 0) }),
             ]),
             committed: Resources::new(9_000, 17 * GIB, 0, 0),
         };
@@ -1342,7 +1342,7 @@ mod tests {
     fn live_panel_with_unknown_capacity_says_so_instead_of_a_zero_gauge() {
         use ztest::api::LiveSnapshot;
 
-        let plan = ztest::api::qos_plan(&at_tiers(&[(QosClass::Basic, 2)]), None);
+        let plan = ztest::api::qos_plan(&at_tiers(&[(QosClass::Integration, 2)]), None);
         let snapshot =
             LiveSnapshot { committed: Resources::new(1_000, GIB, 0, 0), ..LiveSnapshot::default() };
         // free == ZERO → probe unavailable

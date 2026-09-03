@@ -188,7 +188,7 @@ fn pad_to(s: &mut String, col: usize) {
 /// `OPEN`/`TIGHT`/`FULL` against the lightest tier's footprint — the same `min_viable`
 /// threshold `ledger::acquire` blocks on, so the word predicts what a launch would do
 fn verdict(free: Resources, allocatable: Resources) -> (&'static str, bool) {
-    let floor = QosClass::Basic.profile().footprint;
+    let floor = QosClass::default_footprint();
     if !floor.fits_within(&free) {
         return ("FULL", false);
     }
@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn verdict_turns_full_once_the_smallest_tier_cannot_fit() {
         let alloc = Resources::new(96_000, 128 * ztest::api::GIB, 0, 0);
-        let basic = QosClass::Basic.profile().footprint;
+        let basic = QosClass::default_footprint();
         assert_eq!(verdict(basic, alloc).0, "TIGHT");
         let short = Resources::new(basic.cpu_milli - 1, basic.mem_bytes, 0, 0);
         assert_eq!(verdict(short, alloc).0, "FULL");
@@ -729,7 +729,7 @@ mod tests {
             name: name.to_string(),
             footprint: Resources::new(2_000, 4 * ztest::api::GIB, 0, 0),
             started_at: at(-300),
-            tier: QosClass::Basic,
+            tier: QosClass::Integration,
         };
         let beacon = |user: &str, kind: LeaseKind, running: Vec<ztest::api::RunningTest>| Beacon {
             run_id: format!("{user}-4711"),

@@ -549,7 +549,7 @@ mod tests {
             test_name: test.to_string(),
             binary_path: PathBuf::new(),
             cwd: PathBuf::new(),
-            class: crate::qos::QosClass::Basic,
+            class: crate::qos::QosClass::Integration,
             footprint: crate::qos::Resources::ZERO,
             priority: 0,
             hard_cap: Duration::from_secs(1),
@@ -588,11 +588,11 @@ mod tests {
         assert_eq!(req, lim, "runner pod must be Guaranteed (requests == limits)");
         assert_eq!(req["cpu"].0, "1");
 
-        // Wallet tier keeps the in-process wallet's compute here (>=4 cores)
+        // Wallet tier keeps the in-process wallet's compute here — more than orchestration
         let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Wallet), "ztest-test-ns");
         let c = &pod.spec.as_ref().unwrap().containers[0];
         let req = c.resources.as_ref().unwrap().requests.as_ref().unwrap();
-        assert_eq!(req["cpu"].0, "4");
+        assert_eq!(req["cpu"].0, "2");
     }
 
     #[test]

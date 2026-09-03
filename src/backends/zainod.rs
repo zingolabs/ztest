@@ -252,7 +252,7 @@ impl IndexerBackend for ZainoIndexer {
             // seed until `seed_groups` lets it back in
             supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
-            guaranteed: None,
+            guaranteed: Some(crate::qos::pod::INDEXER.into()),
             image_pull_secret: crate::backends::image::pull_secret(),
             termination_grace_period: None,
         })
