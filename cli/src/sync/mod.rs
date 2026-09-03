@@ -757,7 +757,7 @@ async fn build_and_provision(
     };
 
     let cx = build_cx(client.clone(), console, build_pod.clone());
-    let compiled = match runner::compile(&cx, &list_args, sync_id, Some(&mut on_phase)).await {
+    let compiled = match runner::compile(&cx, &list_args, Some(&mut on_phase)).await {
         Ok(c) => c,
         Err(e) => {
             if let Some(c) = console {

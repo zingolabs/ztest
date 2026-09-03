@@ -48,14 +48,6 @@ impl LocalEngine {
         LocalEngine { publish, staged: Mutex::new(HashMap::new()) }
     }
 
-    /// What the build tags *and* what the pod pulls — one derivation, so a push needs no re-tag
-    pub(crate) fn reference(&self, tag: &str) -> String {
-        match &self.publish {
-            Publish::Push(registry) => join(registry, tag),
-            Publish::SideLoad => runtime::active().local_reference(tag),
-        }
-    }
-
     fn build_argv(&self, req: &BuildRequest, dockerfile: &Path, context: &Path) -> Vec<String> {
         let mut argv =
             vec!["build".to_string(), "-f".to_string(), dockerfile.display().to_string()];
@@ -81,20 +73,19 @@ impl LocalEngine {
         argv
     }
 
-    /// A wide root is git-selected into a temp dir first; a plain dir goes to the engine
-    /// as-is under its own `.dockerignore`
+    /// Git-selected into a temp dir, always — a raw root ships `target/`, `.git` and
+    /// gitignored archives past the [`CONTEXT_MAX_BYTES`](super::buildpod::CONTEXT_MAX_BYTES)
+    /// ceiling, and the tag hashes the *selection*, so a wider build moves bytes under a
+    /// fixed tag. Staged copies are keyed, so one recipe stages once per run
     fn stage_context(
         &self,
         cx: &Cx,
         req: &BuildRequest,
-    ) -> Result<(PathBuf, Option<Arc<TempDir>>), ResourceError> {
-        if req.context.is_plain_dir() {
-            return Ok((req.context.root.clone(), None));
-        }
+    ) -> Result<(PathBuf, Arc<TempDir>), ResourceError> {
         let key = req.context.key();
         let mut staged = self.staged.lock().expect("staged context mutex poisoned");
         if let Some(tmp) = staged.get(&key) {
-            return Ok((tmp.path().join("ctx"), Some(Arc::clone(tmp))));
+            return Ok((tmp.path().join("ctx"), Arc::clone(tmp)));
         }
         note(cx, req, "staging the build context");
         let tmp = Arc::new(
@@ -106,7 +97,7 @@ impl LocalEngine {
         super::buildpod::extract_context(&req.context, &dir)
             .map_err(|e| ResourceError::Provision(e.to_string()))?;
         staged.insert(key, Arc::clone(&tmp));
-        Ok((dir, Some(tmp)))
+        Ok((dir, tmp))
     }
 
     async fn publish_image(
@@ -136,6 +127,14 @@ impl LocalEngine {
 
 #[async_trait]
 impl ImageProvider for LocalEngine {
+    /// What the build tags *and* what the pod pulls — one derivation, so a push needs no re-tag
+    fn reference(&self, tag: &str) -> String {
+        match &self.publish {
+            Publish::Push(registry) => join(registry, tag),
+            Publish::SideLoad => runtime::active().local_reference(tag),
+        }
+    }
+
     async fn exists(&self, _cx: &Cx, tag: &str) -> Readiness {
         // Shell-out kept off the async worker. Query error (registry or node unreachable)
         // → `Absent`, so (re)build rather than assume present
@@ -250,18 +249,5 @@ mod tests {
         let b = argv.iter().position(|a| a == "--build-arg").expect("--build-arg");
         assert_eq!(argv[b + 1], "FEATURES=a,b");
         assert_eq!(argv.last().unwrap(), "/ctx", "context is the trailing positional");
-    }
-
-    /// A `dev!` context is its own work tree → handed to the engine in place, as it always
-    /// has been; a source ancestor spanning repos must be git-selected first
-    #[test]
-    fn only_a_wider_root_than_its_one_repo_needs_staging() {
-        let ctx = super::super::Context::dir(PathBuf::from("/ctx"));
-        assert!(ctx.is_plain_dir());
-        let spanning = super::super::Context {
-            root: PathBuf::from("/src"),
-            repos: vec![PathBuf::from("/src/a"), PathBuf::from("/src/b")],
-        };
-        assert!(!spanning.is_plain_dir());
     }
 }

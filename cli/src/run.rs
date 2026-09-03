@@ -948,7 +948,6 @@ fn run_inner_on_cluster(
     let remote = work_rt.block_on(pipeline::runner::compile(
         &compile_cx,
         &opts.list_args,
-        &run.run_id,
         Some(&mut on_phase),
     ));
     if cancelled() {

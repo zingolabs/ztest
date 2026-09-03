@@ -32,10 +32,9 @@
 # that links a native library *dynamically* must add its runtime package to the
 # `runner` stage (confirm the closure with `ldd` on a baked binary).
 
-ARG RUST_VERSION=1.95.0
 
 # NEXTEST_ARGS arrives already shell-quoted by the laptop (`shell_quote` in
-# `pipeline/remote_compile.rs`), so every use of it below goes through `eval`.
+# `pipeline/runner.rs`), so every use of it below goes through `eval`.
 # A bare `${NEXTEST_ARGS}` is a *variable expansion*: the shell word-splits it
 # but does not re-parse the quotes, so `-E 'test(=x)'` reaches nextest as two
 # tokens containing literal `'` characters. nextest then reads them as a
@@ -45,7 +44,12 @@ ARG RUST_VERSION=1.95.0
 # laptop applied, which is the point of applying it.
 
 # ── compile ─────────────────────────────────────────────────────────────────
-FROM docker.io/library/rust:${RUST_VERSION}-bookworm AS compile
+# Bases pinned by digest, not tag: a tag can move under an already-published runner image
+# while the freshly-exported inventory rebuilds against the new one, and the binary paths
+# then miss. The tag stays in the reference for the reader; the digest is what resolves.
+# Refresh: docker manifest inspect -v <ref> | jq -r '.Descriptor.digest'
+# (the compiled toolchain comes from the repo's rust-toolchain.toml, not from this base)
+FROM docker.io/library/rust:1.95.0-bookworm@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb AS compile
 # CARGO_TARGET_DIR stays an env — not the config file below — so it outranks any
 # `.cargo/config.toml` the compiled repo ships: the build must always land in the
 # mounted target cache, or the `/bins` copy-out finds nothing.
@@ -84,7 +88,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # binaries) as pinned static releases. mold preserves its bin/+lib/ tree so
 # `mold -run` finds its wrapper .so relative to the binary.
 ARG MOLD_VERSION=2.32.1
-RUN curl -fsSL https://get.nexte.st/latest/linux | tar -xz -C /usr/local/bin \
+# Pinned, not `latest`: nextest decides what `list` reports, so a silent upgrade between a
+# published runner image and a later inventory export desynchronises the two
+ARG NEXTEST_VERSION=0.9.143
+RUN curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/linux" | tar -xz -C /usr/local/bin \
  && curl -fsSL "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-x86_64-linux.tar.gz" \
       | tar -xz -C /usr/local --strip-components=1
 
@@ -169,7 +176,7 @@ COPY --from=inventory /out/ /
 # No `kubectl`: component-pod log capture is owned by the parent `ztest run` over
 # the kube API (src/logstream.rs `Collector`), not shelled from inside the pod, so
 # the runtime closure is just glibc + CA roots.
-FROM docker.io/library/debian:bookworm-slim AS runner
+FROM docker.io/library/debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867 AS runner
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 # Place the binaries at the same absolute path they were compiled at, so the

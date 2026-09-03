@@ -425,6 +425,16 @@ pub(crate) async fn ship_context(
 pub(crate) fn extract_context(ctx: &super::Context, dest: &Path) -> Result<(), PipelineError> {
     let mut stream = tar_context(ctx)?;
     let tar_stdout = stream.child.stdout.take().expect("tar stdout is piped");
+    // Drained on its own thread, as `ship_stream` does: `tar -c` blocks once its stderr pipe
+    // fills (a wide tree warns per file), `tar -x` then never sees EOF, and the build hangs
+    // with nothing to read
+    let mut tar_stderr = stream.child.stderr.take().expect("tar stderr is piped");
+    let warnings = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        let _ = tar_stderr.read_to_string(&mut buf);
+        buf
+    });
     let out = std::process::Command::new("tar")
         .arg("-xf")
         .arg("-")
@@ -434,8 +444,11 @@ pub(crate) fn extract_context(ctx: &super::Context, dest: &Path) -> Result<(), P
         .output()
         .map_err(|e| format!("spawn local `tar -x`: {e}"))?;
     let status = stream.child.wait().map_err(|e| format!("wait for local `tar`: {e}"))?;
+    let warnings = warnings.join().unwrap_or_default();
     if !status.success() {
-        return Err(format!("local `tar` of source failed ({status})").into());
+        return Err(
+            format!("local `tar` of source failed ({status}):\n{}", tail(&warnings, 20)).into()
+        );
     }
     if !out.status.success() {
         return Err(format!(
@@ -518,25 +531,18 @@ async fn ship_stream(
     Ok(())
 }
 
-/// `tar -c` over `repos`' git file selection, rooted at `root`.
+/// Root-relative names `git ls-files` selects, with their absolute paths, in listing order.
 ///
-/// - `tar` over `exec`, not a sync tool: the buildkit image ships no `rsync`, and a
-///   directory-walking copy descends the excluded `target/` trees instead of pruning
-/// - Chain archives are gitignored, so `--exclude-standard` drops them here: the build
-///   context never sees a multi-GB payload, and a seed is addressed by its manifest
-/// - Total bounded by [`CONTEXT_MAX_BYTES`], offender-naming error (a silent multi-GB stall
-///   reads as a hung cluster)
-fn spawn_tar(root: &Path, repos: &[PathBuf]) -> Result<ContextStream, PipelineError> {
+/// Shared by the shipper and [`Context::content_digest`](super::Context::content_digest) →
+/// shipped bytes and the content address cannot disagree
+pub(crate) fn selected_files(
+    root: &Path,
+    repos: &[PathBuf],
+) -> Result<Vec<(Vec<u8>, PathBuf)>, PipelineError> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt as _;
 
-    // One NUL-delimited root-relative list, sized as we go (ceiling below names offenders).
-    // Temp dir outlives `tar`: holds the file list `tar` reads
-    let tmp = TempDir::new("ztest-ship")?;
-
-    let mut list: Vec<u8> = Vec::new();
-    let mut total: u64 = 0;
-    let mut sized: Vec<(u64, PathBuf)> = Vec::new();
+    let mut selected: Vec<(Vec<u8>, PathBuf)> = Vec::new();
     for repo in repos {
         let repo_rel = repo
             .strip_prefix(root)
@@ -566,24 +572,46 @@ fn spawn_tar(root: &Path, repos: &[PathBuf]) -> Result<ContextStream, PipelineEr
             }
             rel.extend_from_slice(name);
 
-            // `--cached` also lists locally-deleted files; skip missing paths (`tar` would
-            // hard-fail mid-stream)
             let abs = root.join(OsStr::from_bytes(&rel));
-            let Ok(md) = std::fs::metadata(&abs) else {
-                continue;
-            };
-            // Regular files only: `tar` stores a symlink as the link, so charging its
-            // target's size would overcount
-            if md.is_file() {
-                total += md.len();
-                sized.push((md.len(), abs));
-            }
-            list.extend_from_slice(&rel);
-            list.push(0);
+            selected.push((rel, abs));
         }
     }
-    if list.is_empty() {
+    if selected.is_empty() {
         return Err("git ls-files returned nothing".into());
+    }
+    Ok(selected)
+}
+
+/// `tar -c` over `repos`' git file selection, rooted at `root`.
+///
+/// - `tar` over `exec`, not a sync tool: the buildkit image ships no `rsync`, and a
+///   directory-walking copy descends the excluded `target/` trees instead of pruning
+/// - Chain archives are gitignored, so `--exclude-standard` drops them here: the build
+///   context never sees a multi-GB payload, and a seed is addressed by its manifest
+/// - Total bounded by [`CONTEXT_MAX_BYTES`], offender-naming error (a silent multi-GB stall
+///   reads as a hung cluster)
+fn spawn_tar(root: &Path, repos: &[PathBuf]) -> Result<ContextStream, PipelineError> {
+    // One NUL-delimited root-relative list, sized as we go (ceiling below names offenders).
+    // Temp dir outlives `tar`: holds the file list `tar` reads
+    let tmp = TempDir::new("ztest-ship")?;
+
+    let mut list: Vec<u8> = Vec::new();
+    let mut total: u64 = 0;
+    let mut sized: Vec<(u64, PathBuf)> = Vec::new();
+    for (rel, abs) in selected_files(root, repos)? {
+        // `--cached` also lists locally-deleted files; skip missing paths (`tar` would
+        // hard-fail mid-stream)
+        let Ok(md) = std::fs::metadata(&abs) else {
+            continue;
+        };
+        // Regular files only: `tar` stores a symlink as the link, so charging its
+        // target's size would overcount
+        if md.is_file() {
+            total += md.len();
+            sized.push((md.len(), abs));
+        }
+        list.extend_from_slice(&rel);
+        list.push(0);
     }
     if total > context_max_bytes() {
         return Err(oversized_context(total, sized).into());

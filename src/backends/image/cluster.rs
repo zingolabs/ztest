@@ -25,10 +25,17 @@ pub(crate) struct RemoteBuildkit;
 
 #[async_trait]
 impl ImageProvider for RemoteBuildkit {
-    /// Unprobed — BuildKit's cache is the skip (a registry round trip the workstation
-    /// cannot make to an in-cluster address, to spare a build that is already cached)
-    async fn exists(&self, _cx: &Cx, _tag: &str) -> Readiness {
-        Readiness::Absent
+    fn reference(&self, tag: &str) -> String {
+        super::pod_reference(tag)
+    }
+
+    /// Registry `HEAD`, tunnelled to the Service (an in-cluster address is unroutable from
+    /// here, so `docker manifest inspect` cannot reach it the way the local engine does)
+    async fn exists(&self, cx: &Cx, tag: &str) -> Readiness {
+        match super::registry::tag_state(&cx.client, &super::pod_reference(tag)).await {
+            super::registry::TagState::Present => Readiness::Ready,
+            _ => Readiness::Absent,
+        }
     }
 
     async fn build(&self, cx: &Cx, req: &BuildRequest) -> Result<Built, ResourceError> {
@@ -101,7 +108,7 @@ enum Export<'a> {
 impl<'a> Export<'a> {
     fn of(req: &'a BuildRequest, label: &str) -> Export<'a> {
         match &req.output {
-            Output::Image { tag } => Export::Image { reference: super::pod_reference(tag) },
+            Output::Image { tag } => Export::Image { reference: RemoteBuildkit.reference(tag) },
             Output::Files { dest } => Export::Files {
                 pod_dir: format!("{WORK_MOUNT}/out/{}", super::short_hash(label.as_bytes())),
                 dest,

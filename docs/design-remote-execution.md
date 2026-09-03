@@ -19,10 +19,10 @@ progress. One engine, one `Executor` seam, both targets — the cluster profile 
 1. **Probe** → `ClusterCapacity` (`qos`), kept live by `pipeline/capacity_watch`
 1. **Admit across runs** — a k8s-Lease `ledger` reserves this run's fair-share slice; a 2 s `governor`
    keeps the scheduler ceiling in step with peers
-1. **Compile on-cluster** (`pipeline/remote_compile.rs`) — ephemeral BuildKit pod, source shipped as a
+1. **Compile on-cluster** (`pipeline/runner.rs`) — ephemeral BuildKit pod, source shipped as a
    `git ls-files` tar, one multi-stage `buildctl` build of `docker/runner.Dockerfile` that compiles +
    pushes the runner image and exports the inventory (`list.json` + per-binary `ZTEST_DUMP_INVENTORY`
-   dump), parsed exactly as the local path parses it
+   dump), parsed exactly as the local path parses it. An already-published tag skips the build
 1. **Resource graph** (`resource/`, `plan_runtime`) — DAG builds/pushes component `dev!` images and
    materializes seeds (content-addressed PVC + snapshot → CoW shadow-clone per test). Idempotent,
    label-before-populate, reverse-topo teardown
@@ -61,6 +61,16 @@ progress. One engine, one `Executor` seam, both targets — the cluster profile 
 - **Baked binaries sit at their compile-time absolute path** (`runner` stage `COPY`s into
   `/cache/target/debug/deps/`) → the engine execs each by the exact `binary_path` the inventory reported;
   `::baked` needs no volume and no path map
+- **The runner image is content-addressed** (`runner_key`) — tag folds a schema version, the
+  Dockerfile text, the sorted build args and a digest of the shipped tree, so a repeat run reuses the
+  published image instead of minting a per-run tag. The digest hashes the same `git ls-files` set the
+  shipper sends (`selected_files`), by name + exec bit + bytes, never mtimes: clamped timestamps are
+  what defeat mtime-keyed caches (moby/buildkit#5680)
+- **A skip needs a registry answer, and only `404` means absent** — `ImageProvider::exists` HEADs the
+  manifest through a port-forward to the Service (an in-cluster address is unroutable from the laptop,
+  so `docker manifest inspect` cannot reach it the way the local engine does). 401/403, a timeout or a
+  dead tunnel all read as *unknown* and rebuild: a false skip runs the wrong image, a false build costs
+  one builder
 - **`ZTEST_ENGINE=1`** marks the child orchestrated — a `TestEnv` refuses to provision outside a
   `ztest run` (the parent owns capacity admission)
 - **`ZTEST_IMAGE_REFS`** carries a `DevImageId → pull ref` map into the pod: the baked image has no

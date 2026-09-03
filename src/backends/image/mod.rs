@@ -198,6 +198,11 @@ fn join(base: &str, local_tag: &str) -> String {
 ///   manifest, needs no builder, and is what an in-pod test reaches
 #[async_trait]
 pub(crate) trait ImageProvider: Send + Sync + std::fmt::Debug {
+    /// What a pod pulls for `tag`. One derivation per backend, so a skipped build and a
+    /// fresh one name the same image (push- and pull-side bases differ where a profile
+    /// splits them)
+    fn reference(&self, tag: &str) -> String;
+
     /// Query error → `Absent` (attempt a rebuild, never assume present)
     async fn exists(&self, cx: &Cx, tag: &str) -> Readiness;
 
@@ -246,17 +251,58 @@ pub(crate) struct Context {
     pub repos: Vec<PathBuf>,
 }
 
+/// Entry-kind discriminators: a name alone cannot say whether it arrived as bytes, a link or
+/// a gitlink, and the three are different context
+const ENTRY_FILE: u8 = 0;
+const ENTRY_LINK: u8 = 1;
+const ENTRY_OTHER: u8 = 2;
+
 impl Context {
+    /// Content address of exactly the bytes the shipper would send.
+    ///
+    /// - name length-prefixed (unframed `name ‖ bytes` cannot tell `("ab","c")` from `("a","bc")`)
+    /// - exec bit only, the one mode git itself records
+    /// - no mtimes: a fresh clone must hash identically (clamped mtimes defeat mtime-keyed
+    ///   caches — moby/buildkit#5680)
+    pub(crate) fn content_digest(&self) -> Result<String, crate::error::PipelineError> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut h = Sha256::new();
+        for (rel, abs) in buildpod::selected_files(&self.root, &self.repos)? {
+            // `symlink_metadata`: `tar` stores a symlink as the link, so the target path is
+            // the shipped content. A dangling link the shipper drops still folds in here —
+            // a spurious rebuild, never a false reuse
+            let Ok(md) = std::fs::symlink_metadata(&abs) else {
+                continue;
+            };
+            h.update((rel.len() as u64).to_le_bytes());
+            h.update(&rel);
+            if md.is_file() {
+                h.update([ENTRY_FILE, u8::from(md.permissions().mode() & 0o111 != 0)]);
+                h.update(md.len().to_le_bytes());
+                let mut f = std::fs::File::open(&abs)
+                    .map_err(|e| format!("open {} to hash: {e}", abs.display()))?;
+                std::io::copy(&mut f, &mut h)
+                    .map_err(|e| format!("hash {}: {e}", abs.display()))?;
+            } else if md.is_symlink() {
+                let target = std::fs::read_link(&abs)
+                    .map_err(|e| format!("read link {}: {e}", abs.display()))?;
+                let target = target.as_os_str().as_bytes();
+                h.update([ENTRY_LINK]);
+                h.update((target.len() as u64).to_le_bytes());
+                h.update(target);
+            } else {
+                // Submodule gitlink or directory: the name is all the shipper sends
+                h.update([ENTRY_OTHER]);
+            }
+        }
+        Ok(hex::encode(h.finalize()))
+    }
+
     /// One directory, its own tar root
     pub(crate) fn dir(root: PathBuf) -> Context {
         Context { repos: vec![root.clone()], root }
-    }
-
-    /// Root is itself the one work tree → a host engine can build from it in place under
-    /// its own `.dockerignore`. A wider root must be git-selected first (gitignored
-    /// payloads under a source ancestor run to multi-GB)
-    pub(crate) fn is_plain_dir(&self) -> bool {
-        self.repos.len() == 1 && self.repos[0] == self.root
     }
 
     /// Identity of a shipped/staged copy, so the builds of one recipe reuse one tree.
@@ -897,5 +943,74 @@ mod tests {
         map.insert(id.as_str().to_string(), "reg.svc:5000/ns/manifesttest:dev-abc".to_string());
         seed_dev_images(&map);
         assert_eq!(resolve(&spec, "unused").unwrap().image, "reg.svc:5000/ns/manifesttest:dev-abc");
+    }
+
+    /// The cache rests on this: an edit must fork the digest, and a rewrite that only moves
+    /// mtimes must not (clamped mtimes are what defeat mtime-keyed caches)
+    #[test]
+    fn content_digest_follows_bytes_and_modes_not_timestamps() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::{Duration, SystemTime};
+
+        let tmp = buildpod::TempDir::new("ztest-digest").unwrap();
+        let root = tmp.path().to_path_buf();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .output()
+            .expect("git init for the digest fixture");
+
+        // Untracked-but-unignored files ship, so `--others` reaches them without a commit
+        let file = root.join("a.txt");
+        std::fs::write(&file, "one").unwrap();
+        let cx = Context::dir(root.clone());
+        let base = cx.content_digest().unwrap();
+
+        let handle = std::fs::File::options().write(true).open(&file).unwrap();
+        let moved = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        handle.set_times(std::fs::FileTimes::new().set_modified(moved)).unwrap();
+        assert_eq!(base, cx.content_digest().unwrap(), "mtime is not an input");
+
+        std::fs::write(&file, "two").unwrap();
+        let edited = cx.content_digest().unwrap();
+        assert_ne!(base, edited, "an edit must fork the digest");
+
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&file, perms).unwrap();
+        let executable = cx.content_digest().unwrap();
+        assert_ne!(edited, executable, "the exec bit is content");
+
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(root.join("b.txt"), "two").unwrap();
+        assert_ne!(edited, cx.content_digest().unwrap(), "the same bytes under a new name");
+    }
+
+    /// `tar` ships a symlink as the link, so its target is content — retargeting one changes
+    /// the build context and must move the digest with it
+    #[test]
+    fn content_digest_covers_a_symlink_target() {
+        let tmp = buildpod::TempDir::new("ztest-digest-link").unwrap();
+        let root = tmp.path().to_path_buf();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .output()
+            .expect("git init for the link fixture");
+
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        std::fs::write(root.join("b.txt"), "one").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink("a.txt", &link).unwrap();
+
+        let cx = Context::dir(root.clone());
+        let to_a = cx.content_digest().unwrap();
+
+        // Same bytes behind both targets: only the link itself changed
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("b.txt", &link).unwrap();
+        assert_ne!(to_a, cx.content_digest().unwrap(), "a retargeted link is a changed context");
     }
 }

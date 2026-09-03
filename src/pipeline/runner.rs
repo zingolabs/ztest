@@ -20,7 +20,8 @@ use crate::error::PipelineError;
 use crate::inventory::{DevImageEntry, QosEntry};
 use crate::pipeline::build::{self, BuildOutcome, SelectedBinary};
 use crate::pipeline::images::{self, Dumped};
-use crate::resource::Cx;
+use crate::resource::{Cx, Readiness};
+use sha2::{Digest, Sha256};
 
 /// Runner build recipe (compile → inventory → runner)
 const RUNNER_DOCKERFILE: &str = include_str!("../../docker/runner.Dockerfile");
@@ -59,11 +60,10 @@ pub enum Phase<'a> {
 pub type PhaseSink<'a> = &'a mut dyn FnMut(Phase<'_>);
 
 /// - `list_args` = the `cargo nextest list` argv every path passes
-/// - `run_id` tags the published runner image per run
+/// - image is content-addressed, so `run_id` no longer names it
 pub async fn compile(
     cx: &Cx,
     list_args: &[String],
-    run_id: &str,
     mut on_phase: Option<PhaseSink<'_>>,
 ) -> Result<CompileOutcome, PipelineError> {
     let mut emit = |ev: Phase<'_>| {
@@ -93,15 +93,23 @@ pub async fn compile(
     // Compile happens inside this build's `compile` stage
     emit(Phase::Start("building the runner image"));
     let t = Instant::now();
-    let tag = format!("{}:dev-{run_id}", crate::naming::RUNNER_REPO);
-    let built = provider
-        .build(cx, &request("runner", image::Output::Image { tag }))
-        .await
-        .map_err(|e| PipelineError(format!("runner image build failed: {e}")))?;
-    let Some(runner_image_ref) = built.into_image() else {
-        return Err("runner build produced no image reference".into());
+    let tag = format!("{}:dev-{}", crate::naming::RUNNER_REPO, runner_key(&context, &build_args)?);
+    // Published already ⇒ the bytes are identical by construction; skip the build. A probe
+    // that cannot answer reports `Absent`, so an unreachable registry rebuilds
+    let runner_image_ref = if matches!(provider.exists(cx, &tag).await, Readiness::Ready) {
+        emit(Phase::Done { label: "runner image reused", dur: t.elapsed() });
+        provider.reference(&tag)
+    } else {
+        let built = provider
+            .build(cx, &request("runner", image::Output::Image { tag: tag.clone() }))
+            .await
+            .map_err(|e| PipelineError(format!("runner image build failed: {e}")))?;
+        let Some(reference) = built.into_image() else {
+            return Err("runner build produced no image reference".into());
+        };
+        emit(Phase::Done { label: "runner image built + published", dur: t.elapsed() });
+        reference
     };
-    emit(Phase::Done { label: "runner image built + published", dur: t.elapsed() });
 
     emit(Phase::Start("dumping test inventory"));
     let t = Instant::now();
@@ -123,6 +131,38 @@ pub async fn compile(
     });
     emit(Phase::Note(&format!("runner image ready: {}", outcome.runner_image_ref)));
     Ok(outcome)
+}
+
+/// Hand-bumped to invalidate every published runner tag at once
+const RUNNER_KEY_SCHEMA: u32 = 1;
+
+/// Tag suffix: everything deciding the image's bytes, nothing that does not.
+///
+/// - Dockerfile text covers the digest-pinned bases and tool versions
+/// - `NEXTEST_ARGS` picks which binaries are copied → content, not invocation
+/// - 16 hex: a collision runs the wrong image, not merely a wasted build
+fn runner_key(
+    context: &image::Context,
+    build_args: &[(String, String)],
+) -> Result<String, PipelineError> {
+    Ok(fold_key(RUNNER_DOCKERFILE, build_args, &context.content_digest()?))
+}
+
+/// Pure half of [`runner_key`]: everything but reading the tree
+fn fold_key(dockerfile: &str, build_args: &[(String, String)], content: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(RUNNER_KEY_SCHEMA.to_le_bytes());
+    h.update(dockerfile.as_bytes());
+    let mut args: Vec<&(String, String)> = build_args.iter().collect();
+    args.sort();
+    for (k, v) in args {
+        h.update((k.len() as u64).to_le_bytes());
+        h.update(k.as_bytes());
+        h.update((v.len() as u64).to_le_bytes());
+        h.update(v.as_bytes());
+    }
+    h.update(content.as_bytes());
+    hex::encode(&h.finalize()[..8])
 }
 
 /// Fold a build's `list.json` + framed `inventory.jsonl` into the run pipeline's outcome
@@ -380,5 +420,48 @@ mod tests {
             rehome_path(Path::new("/some/git/cache/ctx"), anc),
             PathBuf::from("/some/git/cache/ctx")
         );
+    }
+
+    fn args(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    }
+
+    /// Build args reach the key as a set: a caller reordering them must not re-push an
+    /// identical image under a new tag
+    #[test]
+    fn build_arg_order_does_not_move_the_key() {
+        let a = args(&[("NEXTEST_ARGS", "-E test(x)"), ("WORKSPACE_REL", "live-tests")]);
+        let b = args(&[("WORKSPACE_REL", "live-tests"), ("NEXTEST_ARGS", "-E test(x)")]);
+        assert_eq!(fold_key("FROM x", &a, "abc"), fold_key("FROM x", &b, "abc"));
+    }
+
+    /// Each input is load-bearing: sharing a tag across any of them serves the wrong image
+    #[test]
+    fn every_input_forks_the_key() {
+        let base = args(&[("NEXTEST_ARGS", "-E test(x)")]);
+        let key = fold_key("FROM x", &base, "abc");
+
+        assert_ne!(key, fold_key("FROM y", &base, "abc"), "dockerfile");
+        assert_ne!(
+            key,
+            fold_key("FROM x", &args(&[("NEXTEST_ARGS", "-E test(y)")]), "abc"),
+            "args"
+        );
+        assert_ne!(key, fold_key("FROM x", &base, "abd"), "source content");
+    }
+
+    /// Length-prefixed framing: an unframed concatenation cannot tell these apart
+    #[test]
+    fn adjacent_arg_fields_cannot_be_confused() {
+        let split = args(&[("AB", "C")]);
+        let slid = args(&[("A", "BC")]);
+        assert_ne!(fold_key("FROM x", &split, "z"), fold_key("FROM x", &slid, "z"));
+    }
+
+    #[test]
+    fn key_is_sixteen_hex() {
+        let k = fold_key("FROM x", &args(&[]), "abc");
+        assert_eq!(k.len(), 16, "{k}");
+        assert!(k.chars().all(|c| c.is_ascii_hexdigit()), "{k}");
     }
 }
