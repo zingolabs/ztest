@@ -15,7 +15,7 @@ mod footer;
 mod render;
 mod viewport;
 
-pub use buildphase::{CapRx, commit_phase, provision_with_tracker};
+pub use buildphase::{CapRx, build_cx, commit_phase, provision_with_tracker};
 pub use child::run_child;
 pub use render::{Console, ConsoleGuard, SceneFrame};
 pub use viewport::Surface;

@@ -16,7 +16,7 @@ use ztest::api::engine;
 use ztest::api::engine::RunSelector;
 use ztest::api::inventory::QosEntry;
 use ztest::api::pipeline::{self, ArchivesOutcome, BuildOutcome, ProbeOutcome};
-use ztest_ui::console::{CapRx, Console, SceneFrame, provision_with_tracker};
+use ztest_ui::console::{CapRx, Console, SceneFrame, build_cx, provision_with_tracker};
 
 /// [`NextestExitCode`] constant → process [`ExitCode`] (codes mirror nextest's, CI
 /// cross-references them)
@@ -816,7 +816,7 @@ fn launch_engine(
 }
 
 /// On-cluster-compile path: probe → ephemeral BuildKit pod → ship source and let it
-/// produce the binaries ([`pipeline::remote_compile::compile_on_cluster`]).
+/// produce the binaries ([`pipeline::runner::compile`]).
 ///
 /// - Probe / builder startup / compile = three distinct phases
 /// - Provisioning + the engine tail are the shared paths
@@ -869,15 +869,14 @@ fn run_inner_on_cluster(
         );
     };
 
-    // Registry repo the runner build pushes to = in-cluster pull address (`ZTEST_IMAGE_REGISTRY`)
-    let Some(runner_repo_ref) = ztest::backends::image::runner_repo_ref() else {
+    // Registry the runner build publishes to = in-cluster pull address
+    if ztest::backends::image::pull_base().is_none() {
         return fatal(
             console,
             "ztest run: on-cluster build requires ZTEST_IMAGE_REGISTRY (the in-cluster pull address)",
             NextestExitCode::SETUP_ERROR,
         );
-    };
-    let refs = pipeline::remote_compile::BakeRefs { runner_repo_ref };
+    }
 
     // Probe = pre-build snapshot → watch capacity so the panel tracks build-pod and test
     // churn rather than stale headroom
@@ -899,25 +898,9 @@ fn run_inner_on_cluster(
     // invisible wait that reads as a hung probe).
     let started = Instant::now();
 
-    // Console → builder compiles under a PTY, raw bytes into the emulator (as the local
-    // reader does); no console → tty-free, line per line to stderr
-    let byte_sink = |bytes: &[u8]| {
-        if let Some(c) = console {
-            c.output(bytes.to_vec());
-        }
-    };
-    let line_sink = |line: &str| eprintln!("{line}");
-    let compile_out = match console {
-        Some(c) => pipeline::remote_compile::CompileOut::Pty {
-            size: (c.size().cols, c.live_rows()),
-            sink: &byte_sink,
-        },
-        None => pipeline::remote_compile::CompileOut::Lines { sink: &line_sink },
-    };
-
     // Shared driver colours each boundary line; here (where the banner state lives) each
     // new sub-phase drives the live panel row
-    let mut on_phase = |ev: pipeline::remote_compile::Phase<'_>| {
+    let mut on_phase = |ev: pipeline::runner::Phase<'_>| {
         if let Some(phase) = ztest_ui::console::commit_phase(console, theme, ev) {
             state.build = BuildState::Compiling { started_at: Instant::now(), phase: Some(phase) };
             if let Some(c) = console {
@@ -939,7 +922,7 @@ fn run_inner_on_cluster(
     //   subtract it for its whole life, else it hands the same memory to tests)
     // - Run-id-labelled → `reap_run` takes it on Ctrl-C / cleanup
     // - Own phase + live timer (a builder waiting on capacity else reads as a hung probe)
-    use pipeline::remote_compile::Phase;
+    use pipeline::runner::Phase;
     on_phase(Phase::Start("startup builder"));
     let t_builder = Instant::now();
     let builder = match work_rt.block_on(ReservedBuilder::acquire(&client, run, initial_cap)) {
@@ -961,13 +944,11 @@ fn run_inner_on_cluster(
         return cancel_exit();
     }
 
-    let remote = work_rt.block_on(pipeline::remote_compile::compile_on_cluster(
-        &client,
-        &builder.pod,
+    let compile_cx = build_cx(client.clone(), console, Some(builder.pod.clone()));
+    let remote = work_rt.block_on(pipeline::runner::compile(
+        &compile_cx,
         &opts.list_args,
-        &refs,
         &run.run_id,
-        Some(compile_out),
         Some(&mut on_phase),
     ));
     if cancelled() {
@@ -1016,7 +997,7 @@ fn run_inner_on_cluster(
             sync_tests: _,
             sync_by_binary,
         } => (images, seeds, images_by_binary, deps_by_binary, sync_by_binary),
-        // `compile_on_cluster` only returns `Discovered`; handled rather than unwrapped
+        // `runner::compile` only returns `Discovered`; handled rather than unwrapped
         images::DumpOutcome::Failed { detail } => {
             builder.teardown(work_rt, &client);
             if let Some(c) = console {

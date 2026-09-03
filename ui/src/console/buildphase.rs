@@ -148,6 +148,19 @@ impl TransferRegistry {
     }
 }
 
+/// Build-side [`Cx`]: console as the child host + live-region sink, and the pod an
+/// on-cluster build `exec`s into. No progress sink — callers with graph nodes add one
+pub fn build_cx(client: Client, console: Option<&Console>, build_pod: Option<String>) -> Cx {
+    let mut builder = Cx::builder(client);
+    if let Some(c) = console.cloned() {
+        builder = builder.host(std::sync::Arc::new(c));
+    }
+    if let Some(pod) = build_pod {
+        builder = builder.build_pod(pod);
+    }
+    builder.build()
+}
+
 /// Provision a planned `graph` → terminal node states, `repaint`ing a fresh
 /// [`Transfers`] snapshot per lifecycle/sub-phase change.
 ///
@@ -169,17 +182,8 @@ pub async fn provision_with_tracker(
             let _ = tx.send(TransferEvent::Progress(id, progress));
         })
     });
-    let mut builder = Cx::builder(client);
-    if let Some(c) = console.cloned() {
-        builder = builder.host(std::sync::Arc::new(c.clone()));
-    }
-    if let Some(p) = progress {
-        builder = builder.progress(p);
-    }
-    if let Some(pod) = build_pod {
-        builder = builder.build_pod(pod);
-    }
-    let cx = builder.build();
+    let mut cx = build_cx(client, console, build_pod);
+    cx.progress = progress;
 
     let on_change = {
         let tx = tx.clone();

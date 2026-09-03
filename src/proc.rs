@@ -3,9 +3,12 @@
 use std::io;
 use std::sync::Arc;
 
-/// Child runner. Core holds `Option<&dyn ChildHost>`; `None` = inherited stdio.
+/// Child runner + live-region sink. Core holds `Option<&dyn ChildHost>`; `None` = inherited
+/// stdio.
 ///
 /// - Impl lives in `console` (PTY emulated into the live region) → no core → ui edge
+/// - [`live_size`](Self::live_size)/[`write_live`](Self::write_live) serve a *remote* PTY
+///   (`exec`d builder renders its own progress UI); defaults = no emulator
 #[async_trait::async_trait]
 pub trait ChildHost: Send + Sync {
     async fn run_child(
@@ -14,6 +17,13 @@ pub trait ChildHost: Send + Sync {
         args: &[String],
         envs: &[(&str, String)],
     ) -> io::Result<i32>;
+
+    /// `(cols, rows)` to open a remote PTY at; `None` → caller falls back to line output
+    fn live_size(&self) -> Option<(u16, u16)> {
+        None
+    }
+
+    fn write_live(&self, _bytes: &[u8]) {}
 }
 
 pub type SharedChildHost = Arc<dyn ChildHost>;

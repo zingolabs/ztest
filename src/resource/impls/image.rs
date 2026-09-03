@@ -55,12 +55,14 @@ impl Provider for ImageNode {
     }
 
     async fn probe(&self, cx: &Cx) -> Readiness {
-        self.backend.image_built(cx, &self.entry, &self.tag).await
+        self.backend.exists(cx, &self.tag).await
     }
 
     async fn provision(&self, cx: &Cx) -> Result<(), ResourceError> {
+        let req = image::dev_request(&self.entry, &self.tag)
+            .map_err(|e| ResourceError::Provision(format!("resolve image source: {e}")))?;
         // Resolved ref discarded: the run's image phase records it into the manifest
-        self.backend.build_image(cx, &self.entry, &self.tag).await?;
+        self.backend.build(cx, &req).await?;
         Ok(())
     }
 }

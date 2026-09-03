@@ -1,5 +1,7 @@
-//! Local kind topology: build → side-load into the node's containerd.
+//! kind node's containerd: side-load + the node/cluster queries around it.
 //!
+//! - Publish half of [`LocalEngine`](super::local::LocalEngine)'s `SideLoad`, plus the
+//!   cluster probes `ztest cluster` reads
 //! - Pod reference = engine's own form for a locally built tag (podman prefixes `localhost/`)
 
 use std::{
@@ -8,79 +10,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
-
-use super::{ImageError, ImageProvider, docker_build_argv, run_streamed, tail};
-use crate::inventory::DevImageEntry;
+use super::{ImageError, tail};
 use crate::proc::{self, ChildHost};
-use crate::resource::{Cx, NodeId, Readiness, ResourceError};
 use crate::runtime::{self, ContainerRuntime};
-
-/// Local-dev default: no registry, no push, no pull secret
-#[derive(Debug)]
-pub struct Kind;
-
-#[async_trait]
-impl ImageProvider for Kind {
-    fn pull_secret(&self) -> Option<String> {
-        super::pull_secret_env()
-    }
-
-    async fn image_built(&self, _cx: &Cx, _entry: &DevImageEntry, tag: &str) -> Readiness {
-        // Query error (node unreachable) → `Absent`, so (re)build rather than assume
-        // present. Shell-out kept off the async worker
-        let tag = tag.to_string();
-        let present =
-            matches!(tokio::task::spawn_blocking(move || exists_in_kind(&tag)).await, Ok(Ok(true)));
-        if present { Readiness::Ready } else { Readiness::Absent }
-    }
-
-    async fn build_image(
-        &self,
-        cx: &Cx,
-        entry: &DevImageEntry,
-        tag: &str,
-    ) -> Result<String, ResourceError> {
-        let (dockerfile, context) = entry
-            .source
-            .materialize()
-            .map_err(|e| ResourceError::Provision(format!("resolve image source {tag}: {e}")))?;
-        let id = NodeId::Image(tag.to_string());
-
-        // Missing kind cluster reported before the multi-minute build, not after it
-        tokio::task::spawn_blocking(ensure_kind_cluster)
-            .await
-            .map_err(|e| ResourceError::Provision(format!("kind preflight: {e}")))?
-            .map_err(|e| ResourceError::Provision(e.to_string()))?;
-
-        if let Some(sink) = &cx.progress {
-            sink.note(&id, "building");
-        }
-        let rt = runtime::active();
-        let reference = rt.local_reference(tag);
-        let argv = docker_build_argv(
-            &dockerfile,
-            &context,
-            &entry.features,
-            &reference,
-            entry.rust_version.as_deref(),
-        );
-        run_streamed(cx, tag, rt.as_str(), &argv, &rt.build_envs(), "build").await?;
-
-        if let Some(sink) = &cx.progress {
-            sink.note(&id, format!("load → kind {}", kind_cluster_name()));
-        }
-        side_load(cx.host.as_deref(), rt, tag)
-            .await
-            .map_err(|e| ResourceError::Provision(format!("side-load {reference}: {e}")))?;
-        confirm_loaded(tag).await.map_err(|e| ResourceError::Provision(e.to_string()))?;
-        Ok(reference)
-    }
-}
 
 /// Node's own image table, as `crictl` prints it. Reaching it at all = engine `exec` and the
 /// node's containerd both answer
-pub fn crictl_images() -> Result<String, ImageError> {
+pub(crate) fn crictl_images() -> Result<String, ImageError> {
     let node = format!("{}-control-plane", kind_cluster_name());
     let engine = runtime::program();
     let out = Command::new(engine)
@@ -95,7 +31,7 @@ pub fn crictl_images() -> Result<String, ImageError> {
 
 /// The kind node's cri-tools ignores `crictl images`' positional filter → list the full
 /// table and match `REPOSITORY TAG` against every form the engine stores under
-pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
+pub(crate) fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
     let stdout = crictl_images()?;
     // `REPOSITORY` (maybe registry-prefixed) then `TAG` → accept both `<repo>` and
     // `docker.io/library/<repo>`
@@ -132,12 +68,12 @@ pub fn exists_in_kind(tag: &str) -> Result<bool, ImageError> {
 }
 
 /// Bare `<repo>:<tag>` → node containerd, under [`ContainerRuntime::local_reference`] — the
-/// name pods pull. Sole side-load path (`Kind` provider + local bake).
+/// name pods pull.
 ///
 /// - podman: `kind load docker-image` hardcodes `docker image inspect` → never finds a
 ///   podman-built image, whatever the tag form
 /// - archive form = no engine probe (carries both)
-pub async fn side_load(
+pub(crate) async fn side_load(
     host: Option<&dyn ChildHost>,
     rt: ContainerRuntime,
     tag: &str,
@@ -176,7 +112,7 @@ type Probe = Arc<dyn Fn(&str) -> Result<bool, ImageError> + Send + Sync>;
 ///
 /// - Load is not proof: `kind load` reports the transfer, never the name containerd filed it under
 /// - Divergence otherwise surfaces mid-test as `ImagePullBackOff` on a registry that never had it
-pub async fn confirm_loaded(tag: &str) -> Result<(), ImageError> {
+pub(crate) async fn confirm_loaded(tag: &str) -> Result<(), ImageError> {
     confirm_polling(tag, Arc::new(exists_in_kind), CONFIRM_POLL_INTERVAL, CONFIRM_TIMEOUT).await
 }
 
@@ -220,8 +156,8 @@ async fn confirm_polling(
     })
 }
 
-/// Args after the `kind` program name, run through the console PTY like [`docker_build_argv`]
-pub fn kind_load_argv(reference: &str) -> Vec<String> {
+/// Args after the `kind` program name, run through the console PTY like the build itself
+pub(crate) fn kind_load_argv(reference: &str) -> Vec<String> {
     vec![
         "load".to_string(),
         "docker-image".to_string(),
@@ -243,7 +179,7 @@ fn kind_archive_argv(tar: &str) -> Vec<String> {
 
 /// First hit wins: `KIND_CLUSTER` → kind-shaped active kube-context (`kind-<name>` →
 /// `<name>`) → `kind`, so kind mode follows wherever kubectl points
-pub fn kind_cluster_name() -> String {
+pub(crate) fn kind_cluster_name() -> String {
     if let Some(name) = std::env::var("KIND_CLUSTER").ok().filter(|s| !s.is_empty()) {
         return name;
     }
@@ -306,12 +242,12 @@ fn clusters_from_nodes(nodes: &[String]) -> Vec<String> {
 }
 
 /// Every kind cluster this engine holds, running or stopped
-pub fn kind_clusters() -> Result<Vec<String>, ImageError> {
+pub(crate) fn kind_clusters() -> Result<Vec<String>, ImageError> {
     Ok(clusters_from_nodes(&node_names(&format!("label={CLUSTER_LABEL}"))?))
 }
 
 /// Exact: the label carries the cluster name, so the engine answers without a name convention
-pub fn kind_cluster_exists(cluster: &str) -> Result<bool, ImageError> {
+pub(crate) fn kind_cluster_exists(cluster: &str) -> Result<bool, ImageError> {
     Ok(!node_names(&format!("label={CLUSTER_LABEL}={cluster}"))?.is_empty())
 }
 
@@ -320,7 +256,7 @@ pub fn kind_cluster_exists(cluster: &str) -> Result<bool, ImageError> {
 /// - Exit status is not the answer: an unresolvable cluster prints `No kind nodes found` to
 ///   stderr and exits 0, so an empty list is the failure
 /// - Sole remaining kind-CLI read (side-load itself is the only other kind invocation)
-pub fn kind_resolves_nodes(cluster: &str) -> Result<Vec<String>, ImageError> {
+pub(crate) fn kind_resolves_nodes(cluster: &str) -> Result<Vec<String>, ImageError> {
     let out = Command::new("kind")
         .args(["get", "nodes", "--name", cluster])
         .envs(runtime::active().kind_envs())
@@ -338,7 +274,7 @@ pub fn kind_resolves_nodes(cluster: &str) -> Result<Vec<String>, ImageError> {
 }
 
 /// Actionable error before the multi-minute build, not a raw `kind load` failure after
-pub fn ensure_kind_cluster() -> Result<(), ImageError> {
+pub(crate) fn ensure_kind_cluster() -> Result<(), ImageError> {
     let cluster = kind_cluster_name();
     if kind_cluster_exists(&cluster)? {
         return Ok(());
@@ -354,6 +290,7 @@ pub fn ensure_kind_cluster() -> Result<(), ImageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering::SeqCst},

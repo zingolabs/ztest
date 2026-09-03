@@ -16,7 +16,7 @@ pub use crate::engine::schedule::PanelFrame;
 pub use crate::engine::{RunProgress, RunView};
 pub use crate::metrics::query::Series;
 pub use crate::metrics::{LIVE_PERIOD, Unit};
-pub use crate::pipeline::remote_compile::Phase as CompilePhase;
+pub use crate::pipeline::runner::Phase as CompilePhase;
 pub use crate::pipeline::{BuildStage, NodeSummary};
 pub use crate::podmetrics::{PodLoad, SAMPLE_PERIOD};
 pub use crate::proc::{ChildHost, on_path};

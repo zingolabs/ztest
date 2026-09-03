@@ -132,6 +132,14 @@ impl ztest::api::ChildHost for Console {
     ) -> io::Result<i32> {
         run_child(self, program, args, envs).await
     }
+
+    fn live_size(&self) -> Option<(u16, u16)> {
+        Some((self.size().cols, self.live_rows()))
+    }
+
+    fn write_live(&self, bytes: &[u8]) {
+        self.output(bytes.to_vec());
+    }
 }
 
 #[cfg(test)]

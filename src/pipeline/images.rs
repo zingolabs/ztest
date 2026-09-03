@@ -25,7 +25,7 @@ pub struct Dumped {
 }
 
 /// Pure — transport (local subprocess vs builder-pod `exec`, see
-/// [`crate::pipeline::remote_compile`]) is the caller's concern
+/// [`crate::pipeline::runner`]) is the caller's concern
 pub fn parse_inventory(stdout: &str) -> Result<Dumped, crate::error::PipelineError> {
     let mut dumped = Dumped::default();
     for line in stdout.lines() {
@@ -87,7 +87,7 @@ pub async fn discover(binaries: &[SelectedBinary]) -> (DumpOutcome, Vec<(String,
 }
 
 /// `binaries` and `dumps` index-aligned. Shared by the local ([`discover`]) and on-cluster
-/// ([`crate::pipeline::remote_compile`]) paths → dedup lives in one place
+/// ([`crate::pipeline::runner`]) paths → dedup lives in one place
 pub fn assemble(
     binaries: &[SelectedBinary],
     dumps: Vec<Dumped>,

@@ -3,8 +3,10 @@
 //!
 //! - Build = preflight only: content-address `<repo>:dev-<hash>`, publish, record `DevImageId → ref`
 //! - Resolve = anywhere incl. in-pod: path-free [`DevImageId`] lookup, no file read, no hash
-//!   (separately-compiled binaries disagree on `CARGO_MANIFEST_DIR`); miss = [`ImageError::DevImageMissing`]
-//! - [`from_env`] picks [`Docker`](docker::Docker) (push) / [`Kind`](kind::Kind) (side-load); same tag → shared cache
+//!   (separately-compiled binaries disagree on `CARGO_MANIFEST_DIR`); miss =
+//!   [`ImageError::DevImageMissing`]
+//! - [`from_env`] picks the builder: [`LocalEngine`](local::LocalEngine) (host engine) or
+//!   [`RemoteBuildkit`](cluster::RemoteBuildkit) (build pod); same tag → shared cache
 //!
 //! [`dev!`]: ztest_macros::dev
 
@@ -18,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::cluster_config::ClusterClass;
 use crate::inventory::DevImageEntry;
 use crate::proc;
-use crate::resource::{Cx, Readiness, ResourceError};
+use crate::resource::{Cx, NodeId, Readiness, ResourceError};
 
 /// Appended to every ztest `buildctl --output type=image`.
 ///
@@ -26,22 +28,24 @@ use crate::resource::{Cx, Readiness, ResourceError};
 ///   for the ~1 GiB runner layer); `oci-mediatypes` required for zstd descriptors
 /// - level 1 (push target = same-node registry), no `force-compression` (base layers
 ///   keep their cached blobs)
-pub const IMAGE_OUTPUT_COMPRESSION: &str =
+pub(crate) const IMAGE_OUTPUT_COMPRESSION: &str =
     "compression=zstd,compression-level=1,oci-mediatypes=true";
 
 /// `--output type=image` attrs for a pushed image.
 ///
 /// - `registry.insecure` per-export: exporter never reads `buildkitd.toml` registry config
 ///   (its `http = true` reaches the pull resolver only)
-pub fn image_output_attrs(plaintext: bool) -> String {
+pub(crate) fn image_output_attrs(plaintext: bool) -> String {
     let insecure = if plaintext { ",registry.insecure=true" } else { "" };
     format!("{IMAGE_OUTPUT_COMPRESSION}{insecure}")
 }
 
+pub(crate) mod buildpod;
 pub mod bundle;
-pub mod cluster;
-pub mod docker;
-pub mod kind;
+pub(crate) mod cluster;
+pub(crate) mod kind;
+pub(crate) mod local;
+mod registry;
 
 pub use crate::inventory::ImageSpec;
 
@@ -61,7 +65,7 @@ impl DevSource {
     /// Computable without network I/O (`Local` hashes the worktree, `Git` uses the rev).
     ///
     /// `rust_version` (the *pinned* toolchain) must fold identically here and on the
-    /// build side ([`docker_build_argv`]), else `resolve` names a tag never built;
+    /// build side ([`dev_request`]), else `resolve` names a tag never built;
     /// `None` stays unfolded (preserves existing tags)
     pub fn tag_suffix(
         &self,
@@ -184,43 +188,171 @@ fn join(base: &str, local_tag: &str) -> String {
     format!("{}/{local_tag}", base.trim_end_matches('/'))
 }
 
-/// One cluster topology for producing a dev image; [`from_env`] selects one.
+/// Where an image build runs; [`from_env`] selects one.
 ///
-/// - resolve (`image_reference`, `pull_secret`) = pure → the only side an in-pod test reaches
-/// - build (`image_built`, `build_image`) needs source + a builder → preflight only
+/// - [`LocalEngine`](local::LocalEngine) = host docker/podman, publishing by push or kind
+///   side-load; [`RemoteBuildkit`](cluster::RemoteBuildkit) = `buildctl` in the run's build pod
+/// - Every build goes through it — `dev!` component images and the runner image alike,
+///   differing only in the [`BuildRequest`] they hand over
+/// - Resolution ([`image_reference`], [`pull_secret`]) is *not* here: it reads the build
+///   manifest, needs no builder, and is what an in-pod test reaches
 #[async_trait]
-pub trait ImageProvider: Send + Sync + std::fmt::Debug {
-    /// [Build-manifest](seed_dev_images) lookup, reads no source. Miss =
-    /// [`ImageError::DevImageMissing`], never a Dockerfile hash → an in-pod test
-    /// (no Dockerfile) fails loud
-    fn image_reference(&self, entry: &DevImageEntry) -> Result<String, ImageError> {
-        let id = DevImageId::of(
-            &entry.repo,
-            &entry.features,
-            entry.rust_version.as_deref(),
-            &entry.source,
-        );
-        lookup_dev_image(id.as_str()).ok_or_else(|| ImageError::DevImageMissing {
-            image: entry.repo.clone(),
-            declared_by: entry.source.describe(),
-        })
+pub(crate) trait ImageProvider: Send + Sync + std::fmt::Debug {
+    /// Query error → `Absent` (attempt a rebuild, never assume present)
+    async fn exists(&self, cx: &Cx, tag: &str) -> Readiness;
+
+    /// Native build output streams through the console PTY
+    async fn build(&self, cx: &Cx, req: &BuildRequest) -> Result<Built, ResourceError>;
+}
+
+/// One image build, wherever it runs.
+///
+/// `context` is a host path either way — [`RemoteBuildkit`](cluster::RemoteBuildkit) ships
+/// it into the build pod, and `Output::Files` comes back out to a host dir, so a caller
+/// never spells a pod path
+#[derive(Debug, Clone)]
+pub(crate) struct BuildRequest {
+    pub context: Context,
+    pub dockerfile: Dockerfile,
+    pub target: Option<String>,
+    pub build_args: Vec<(String, String)>,
+    pub output: Output,
+}
+
+impl BuildRequest {
+    /// Graph node this build reports under; `None` for a `Files` output (no image → no node)
+    pub(crate) fn node(&self) -> Option<NodeId> {
+        match &self.output {
+            Output::Image { tag } => Some(NodeId::Image(tag.clone())),
+            Output::Files { .. } => None,
+        }
     }
 
-    /// `imagePullSecrets` entry; `None` for kind & for cluster-injected credentials
-    fn pull_secret(&self) -> Option<String>;
+    /// Names the build in error text
+    pub(crate) fn label(&self) -> String {
+        match &self.output {
+            Output::Image { tag } => tag.clone(),
+            Output::Files { dest } => dest.display().to_string(),
+        }
+    }
+}
 
-    /// Query error → `Absent` (attempt a rebuild, never assume present)
-    async fn image_built(&self, cx: &Cx, entry: &DevImageEntry, tag: &str) -> Readiness;
+/// Build context: a tar root plus the git work trees under it whose file selection
+/// (`git ls-files`) is the exclusion. One repo for a `dev!` image; every first-party repo
+/// under a common ancestor for the runner's source
+#[derive(Debug, Clone)]
+pub(crate) struct Context {
+    pub root: PathBuf,
+    pub repos: Vec<PathBuf>,
+}
 
-    /// Returns the pull reference [`image_reference`](ImageProvider::image_reference)
-    /// will hand pods. `tag` = the caller's content-addressed `<repo>:dev-<hash>`.
-    /// Native build output streams through the console PTY
-    async fn build_image(
-        &self,
-        cx: &Cx,
-        entry: &DevImageEntry,
-        tag: &str,
-    ) -> Result<String, ResourceError>;
+impl Context {
+    /// One directory, its own tar root
+    pub(crate) fn dir(root: PathBuf) -> Context {
+        Context { repos: vec![root.clone()], root }
+    }
+
+    /// Root is itself the one work tree → a host engine can build from it in place under
+    /// its own `.dockerignore`. A wider root must be git-selected first (gitignored
+    /// payloads under a source ancestor run to multi-GB)
+    pub(crate) fn is_plain_dir(&self) -> bool {
+        self.repos.len() == 1 && self.repos[0] == self.root
+    }
+
+    /// Identity of a shipped/staged copy, so the builds of one recipe reuse one tree.
+    /// Addresses the *selection*, not its contents — sound only for the life of a build
+    /// pod or engine instance, both of which are created per run
+    pub(crate) fn key(&self) -> String {
+        let mut bytes = self.root.as_os_str().as_encoded_bytes().to_vec();
+        for repo in &self.repos {
+            bytes.push(0);
+            bytes.extend_from_slice(repo.as_os_str().as_encoded_bytes());
+        }
+        short_hash(&bytes)
+    }
+}
+
+/// Short content address, for naming a cached copy of something
+pub(crate) fn short_hash(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(&h.finalize()[..8])
+}
+
+/// `Text` = compiled in (the runner recipe is not in the shipped context)
+#[derive(Debug, Clone)]
+pub(crate) enum Dockerfile {
+    Path(PathBuf),
+    Text(String),
+}
+
+/// `Image` publishes under the backend's own strategy; `Files` exports a stage's `local`
+/// output to `dest` (the inventory dump)
+#[derive(Debug, Clone)]
+pub(crate) enum Output {
+    Image { tag: String },
+    Files { dest: PathBuf },
+}
+
+/// [`ImageProvider::build`] result, mirroring the request's [`Output`]. `Image` carries the
+/// pull reference the kubelet resolves
+#[derive(Debug, Clone)]
+pub(crate) enum Built {
+    Image(String),
+    Files,
+}
+
+impl Built {
+    pub(crate) fn into_image(self) -> Option<String> {
+        match self {
+            Built::Image(reference) => Some(reference),
+            Built::Files => None,
+        }
+    }
+}
+
+/// Sub-phase note for the build's node, where it has one. Backends call this rather than
+/// reaching into `cx.progress` themselves
+pub(crate) fn note(cx: &Cx, req: &BuildRequest, text: impl Into<String>) {
+    if let (Some(sink), Some(id)) = (&cx.progress, req.node()) {
+        sink.note(&id, text);
+    }
+}
+
+/// `dev!` entry → the build every backend runs. Sole place the macro's vocabulary
+/// (features, pinned toolchain) becomes build-args
+pub(crate) fn dev_request(entry: &DevImageEntry, tag: &str) -> Result<BuildRequest, ImageError> {
+    let (dockerfile, context) = entry.source.materialize()?;
+    let mut build_args = Vec::new();
+    if let Some(rv) = build_arg_rust_version(entry.rust_version.as_deref(), &context) {
+        build_args.push(("RUST_VERSION".to_string(), rv));
+    }
+    // Both the ztest (`CARGO_FEATURES`) and upstream zcash (`FEATURES`) conventions —
+    // an undeclared build-arg is only a warning
+    if !entry.features.is_empty() {
+        let joined = entry.features.join(",");
+        build_args.push(("CARGO_FEATURES".to_string(), joined.clone()));
+        build_args.push(("FEATURES".to_string(), joined));
+    }
+    Ok(BuildRequest {
+        context: Context::dir(context),
+        dockerfile: Dockerfile::Path(dockerfile),
+        target: None,
+        build_args,
+        output: Output::Image { tag: tag.to_string() },
+    })
+}
+
+/// [Build-manifest](seed_dev_images) lookup, reads no source. Miss =
+/// [`ImageError::DevImageMissing`], never a Dockerfile hash → an in-pod test
+/// (no Dockerfile) fails loud
+fn image_reference(entry: &DevImageEntry) -> Result<String, ImageError> {
+    let id =
+        DevImageId::of(&entry.repo, &entry.features, entry.rust_version.as_deref(), &entry.source);
+    lookup_dev_image(id.as_str()).ok_or_else(|| ImageError::DevImageMissing {
+        image: entry.repo.clone(),
+        declared_by: entry.source.describe(),
+    })
 }
 
 /// [Build-manifest](seed_dev_images) key: repo + features + toolchain + origin kind
@@ -283,23 +415,18 @@ pub fn selected_class() -> ClusterClass {
 ///
 /// - remote = runner's BuildKit pod already there → component images build there too
 /// - workstation engine out of the path → registry needs one in-cluster address, not two
-pub fn from_env() -> Arc<dyn ImageProvider> {
+pub(crate) fn from_env() -> Arc<dyn ImageProvider> {
     match (builds_on_cluster(), push_base().or_else(pull_base)) {
-        (true, Some(_)) => Arc::new(cluster::ClusterBuild),
-        (false, Some(base)) => Arc::new(docker::Docker::registry(base)),
-        (_, None) => Arc::new(kind::Kind),
+        (true, Some(_)) => Arc::new(cluster::RemoteBuildkit),
+        (false, Some(base)) => Arc::new(local::LocalEngine::push(base)),
+        (_, None) => Arc::new(local::LocalEngine::side_load()),
     }
-}
-
-/// [`from_env`]'s question, for callers publishing outside the [`ImageProvider`] trait
-pub fn registry_configured() -> bool {
-    push_base().or_else(pull_base).is_some()
 }
 
 /// One build/load step through the console PTY (BuildKit / kind progress renders live).
 /// Provisioning runs at cap 1 → at most one stream drives the emulator grid. Off a TTY
 /// `run_child` inherits stdio
-pub async fn run_streamed(
+pub(crate) async fn run_streamed(
     cx: &Cx,
     tag: &str,
     program: &str,
@@ -324,7 +451,7 @@ pub fn pull_base() -> Option<String> {
 
 /// `ZTEST_IMAGE_PUSH_REGISTRY`, set only for an in-cluster registry (push → external
 /// route, pull → in-cluster service)
-pub fn push_base() -> Option<String> {
+fn push_base() -> Option<String> {
     push_base_raw().map(|b| scheme_of(&b).1.to_string())
 }
 
@@ -360,22 +487,10 @@ pub fn builds_on_cluster() -> bool {
     matches!(selected_class(), ClusterClass::Remote)
 }
 
-/// In-cluster repo (no tag) the runner image pushes to; the on-cluster build appends
-/// the per-run `:dev-<run-id>`
-pub fn runner_repo_ref() -> Option<String> {
-    pull_base().map(|base| join(&base, crate::naming::RUNNER_REPO))
-}
-
-/// `ZTEST_IMAGE_PULL_SECRET` → pod `imagePullSecrets` for a private registry. `None`
-/// when the cluster injects the credentials
-pub fn pull_secret_env() -> Option<String> {
-    env_nonempty("ZTEST_IMAGE_PULL_SECRET")
-}
-
-/// Free-fn facade over [`ImageProvider::pull_secret`] (backends need no provider
-/// handle). `None` = rely on SA-/node-level pull auth
+/// `ZTEST_IMAGE_PULL_SECRET` → pod `imagePullSecrets` for a private registry. `None` when
+/// the cluster injects the credentials, and for kind (nothing is pulled)
 pub fn pull_secret() -> Option<String> {
-    from_env().pull_secret()
+    env_nonempty("ZTEST_IMAGE_PULL_SECRET")
 }
 
 /// `kubernetes.io/dockerconfigjson` Secret mounted into the build pod as BuildKit's
@@ -455,7 +570,7 @@ pub fn resolve(spec: &ImageSpec, default_published: &str) -> Result<ResolvedImag
                 features: features.clone(),
                 rust_version: rust_version.clone(),
             };
-            Ok(ResolvedImage { image: from_env().image_reference(&entry)? })
+            Ok(ResolvedImage { image: image_reference(&entry)? })
         }
     }
 }
@@ -488,41 +603,6 @@ fn fold_suffix(base: &[u8], features: &[String], rust_version: Option<&str>) -> 
     hex::encode(&h.finalize()[..6])
 }
 
-/// `docker build` argv for a dev image, run through the console PTY with
-/// `DOCKER_BUILDKIT=1` (BuildKit renders native progress). `tag` = what the active
-/// backend bakes in: bare `<repo>:dev-<hash>` for kind, registry-qualified otherwise
-/// (push needs no re-tag)
-pub fn docker_build_argv(
-    dockerfile: &Path,
-    context: &Path,
-    features: &[String],
-    tag: &str,
-    rust_version: Option<&str>,
-) -> Vec<String> {
-    let mut argv = vec![
-        "build".to_string(),
-        "-f".to_string(),
-        dockerfile.display().to_string(),
-        "-t".to_string(),
-        tag.to_string(),
-    ];
-    if let Some(rv) = build_arg_rust_version(rust_version, context) {
-        argv.push("--build-arg".to_string());
-        argv.push(format!("RUST_VERSION={rv}"));
-    }
-    // Both the ztest (`CARGO_FEATURES`) and upstream zcash (`FEATURES`) conventions —
-    // an undeclared build-arg is only a warning
-    if !features.is_empty() {
-        let joined = features.join(",");
-        argv.push("--build-arg".to_string());
-        argv.push(format!("CARGO_FEATURES={joined}"));
-        argv.push("--build-arg".to_string());
-        argv.push(format!("FEATURES={joined}"));
-    }
-    argv.push(context.display().to_string());
-    argv
-}
-
 /// `channel` from the context's `rust-toolchain.toml`, else `None` (Dockerfile's
 /// `ARG RUST_VERSION` default wins). Non-concrete channels (`stable`) also `None` —
 /// valid rustup, but `rust:stable` is no Docker Hub tag
@@ -542,7 +622,7 @@ fn toolchain_rust_version(context: &Path) -> Option<String> {
 
 /// `RUST_VERSION` build-arg, `None` to leave the Dockerfile's own default standing.
 /// Order: pinned → `rust-toolchain.toml` channel → nothing
-pub fn build_arg_rust_version(pinned: Option<&str>, context: &Path) -> Option<String> {
+fn build_arg_rust_version(pinned: Option<&str>, context: &Path) -> Option<String> {
     pinned.map(str::to_owned).or_else(|| toolchain_rust_version(context))
 }
 
@@ -590,6 +670,23 @@ mod tests {
             let source =
                 DevSource::Local { dockerfile: self.dockerfile(), context: self.dir.clone() };
             dev_tag(&source, &features, "zainod", rust).unwrap()
+        }
+
+        fn request(&self, features: &[&str], rust: Option<&str>) -> BuildRequest {
+            let entry = DevImageEntry {
+                repo: "zebrad".into(),
+                source: DevSource::Local {
+                    dockerfile: self.dockerfile(),
+                    context: self.dir.clone(),
+                },
+                features: features.iter().map(|s| (*s).to_string()).collect(),
+                rust_version: rust.map(str::to_owned),
+            };
+            dev_request(&entry, "zebrad:dev-x").unwrap()
+        }
+
+        fn build_arg(&self, key: &str, rust: Option<&str>) -> Option<String> {
+            arg(&self.request(&[], rust), key)
         }
     }
 
@@ -654,21 +751,13 @@ mod tests {
     #[test]
     fn no_rust_version_means_no_build_arg() {
         let c = Ctx::new("FROM scratch\n", "main.rs", b"fn main() {}");
-        let argv = docker_build_argv(&c.dockerfile(), &c.dir, &[], "zebrad:dev-x", None);
-        assert!(
-            !argv.iter().any(|a| a.starts_with("RUST_VERSION=")),
-            "should not pass RUST_VERSION when unpinned: {argv:?}"
-        );
+        assert_eq!(c.build_arg("RUST_VERSION", None), None);
     }
 
     #[test]
     fn pinned_rust_version_becomes_build_arg() {
         let c = Ctx::new("FROM scratch\n", "main.rs", b"fn main() {}");
-        let argv = docker_build_argv(&c.dockerfile(), &c.dir, &[], "zebrad:dev-x", Some("1.91.0"));
-        assert!(
-            argv.iter().any(|a| a == "RUST_VERSION=1.91.0"),
-            "pinned version must be a build-arg: {argv:?}"
-        );
+        assert_eq!(c.build_arg("RUST_VERSION", Some("1.91.0")).as_deref(), Some("1.91.0"));
     }
 
     /// A rustup channel (`stable`) is **not** a docker tag → must be ignored, else
@@ -679,18 +768,30 @@ mod tests {
         let tc = c.dir.join("rust-toolchain.toml");
 
         std::fs::write(&tc, "[toolchain]\nchannel = \"stable\"\n").unwrap();
-        let argv = docker_build_argv(&c.dockerfile(), &c.dir, &[], "zebrad:dev-x", None);
-        assert!(
-            !argv.iter().any(|a| a.starts_with("RUST_VERSION=")),
-            "a channel name must not become a build-arg: {argv:?}"
-        );
+        assert_eq!(c.build_arg("RUST_VERSION", None), None, "a channel name is not a build-arg");
 
         std::fs::write(&tc, "[toolchain]\nchannel = \"1.75.0\"\n").unwrap();
-        let argv = docker_build_argv(&c.dockerfile(), &c.dir, &[], "zebrad:dev-x", None);
-        assert!(
-            argv.iter().any(|a| a == "RUST_VERSION=1.75.0"),
-            "a concrete toolchain version must be a build-arg: {argv:?}"
-        );
+        assert_eq!(c.build_arg("RUST_VERSION", None).as_deref(), Some("1.75.0"));
+    }
+
+    /// Both conventions, from one declaration
+    #[test]
+    fn features_reach_both_build_arg_conventions() {
+        let c = Ctx::new("FROM scratch\n", "main.rs", b"fn main() {}");
+        let req = c.request(&["a", "b"], None);
+        for key in ["CARGO_FEATURES", "FEATURES"] {
+            assert_eq!(arg(&req, key).as_deref(), Some("a,b"), "{key}");
+        }
+    }
+
+    #[test]
+    fn no_features_emits_no_build_args() {
+        let c = Ctx::new("FROM scratch\n", "main.rs", b"fn main() {}");
+        assert!(c.request(&[], None).build_args.is_empty());
+    }
+
+    fn arg(req: &BuildRequest, key: &str) -> Option<String> {
+        req.build_args.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
     /// Dockerfile is part of identity even when the context bytes match
@@ -704,9 +805,9 @@ mod tests {
     /// Trailing `/` on the base normalises; the `dev-<hash>` suffix survives untouched
     #[test]
     fn registry_reference_prefixes_base_and_preserves_hash() {
-        let d = docker::Docker::registry("ghcr.io/zingolabs".into());
+        let d = local::LocalEngine::push("ghcr.io/zingolabs".into());
         assert_eq!(d.reference("zainod:dev-abc123"), "ghcr.io/zingolabs/zainod:dev-abc123");
-        let trailing = docker::Docker::registry("ghcr.io/zingolabs/".into());
+        let trailing = local::LocalEngine::push("ghcr.io/zingolabs/".into());
         assert_eq!(trailing.reference("zainod:dev-abc123"), "ghcr.io/zingolabs/zainod:dev-abc123");
     }
 

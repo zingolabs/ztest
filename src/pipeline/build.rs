@@ -112,7 +112,7 @@ pub async fn index(list_args: &[String]) -> std::io::Result<BuildOutcome> {
     parse_list_summary(&pass2.stdout)
 }
 
-/// Split from [`index`] so the on-cluster path ([`crate::pipeline::remote_compile`]) reuses
+/// Split from [`index`] so the image-build path ([`crate::pipeline::runner`]) reuses
 /// this parse on a builder pod's JSON, where `binary_path`/`cwd` are the pod's paths
 pub fn parse_list_summary(stdout: &[u8]) -> std::io::Result<BuildOutcome> {
     let summary: TestListSummary = serde_json::from_slice(stdout).map_err(|err| {

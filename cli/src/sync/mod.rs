@@ -31,9 +31,8 @@ use ztest::api::metrics::Series;
 use ztest::api::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
 use ztest::api::pipeline::BuildOutcome;
 use ztest::api::pipeline::DumpOutcome;
-use ztest::api::pipeline::local_bake;
 use ztest::api::pipeline::profiles::{self, ProfileStub};
-use ztest::api::pipeline::remote_compile::{self, BakeRefs, RemoteCompileOutcome};
+use ztest::api::pipeline::runner::{self, CompileOutcome};
 use ztest::api::profiling::Placement;
 use ztest::api::resource::buildkit;
 use ztest::api::{column_width, format_elapsed, format_span, thousands};
@@ -43,7 +42,7 @@ use ztest::sync::{
     find_driver, kind_selector, namespace_for, profiler_config_name, read_report,
     report_cm_namespace,
 };
-use ztest_ui::console::{Console, SceneFrame};
+use ztest_ui::console::{Console, SceneFrame, build_cx};
 use ztest_ui::template::{Fields, draw};
 use ztest_ui::{ComponentResources, ReportView, Theme, Transfers, pad};
 
@@ -478,7 +477,7 @@ async fn launch_driver(
     profile: &str,
     ns: &str,
     sa: &str,
-    compiled: &RemoteCompileOutcome,
+    compiled: &CompileOutcome,
     target: &Target,
     image_refs: &BTreeMap<String, String>,
     collector: Option<&ztest::api::profiling::Collector>,
@@ -689,7 +688,7 @@ async fn build_and_provision(
     stub: Option<&ProfileStub>,
     console: Option<&Console>,
     theme: &Theme,
-) -> Result<(RemoteCompileOutcome, BTreeMap<String, String>)> {
+) -> Result<(CompileOutcome, BTreeMap<String, String>)> {
     use ztest::api::pipeline::Phase;
     use ztest_ui::console::commit_phase;
     use ztest_ui::{BuildState, render_sync_build_panel, render_transfers};
@@ -737,79 +736,37 @@ async fn build_and_provision(
     // - no `--features` (virtual-workspace root rejects a bare one)
     let list_args = stub.map(ProfileStub::cargo_args).unwrap_or_default();
 
-    let (compiled, build_pod) = if ztest::backends::image::builds_on_cluster() {
-        let refs = BakeRefs {
-            runner_repo_ref: ztest::backends::image::runner_repo_ref()
-                .context("no runner registry; set ZTEST_IMAGE_REGISTRY")?,
-        };
-
-        // Ephemeral BuildKit pod (own phase + live timer), Ready before compiling
+    // On-cluster builds need the ephemeral BuildKit pod (own phase + live timer), Ready
+    // before compiling; a host-engine build needs nothing
+    let build_pod = if ztest::backends::image::builds_on_cluster() {
+        ztest::backends::image::pull_base()
+            .context("no runner registry; set ZTEST_IMAGE_REGISTRY")?;
         on_phase(Phase::Start("startup builder"));
         let t_builder = Instant::now();
-        let build_pod = {
-            let p =
-                buildkit::create_build_pod(client, sync_id, &ztest::api::naming::current_user())
-                    .await
-                    .context("create build pod")?;
-            if let Err(e) = buildkit::wait_build_pod_ready(client, &p).await {
-                buildkit::delete_build_pod(client, &p).await;
-                return Err(anyhow!("build pod not ready: {e}"));
-            }
-            p
-        };
-        on_phase(Phase::Done { label: "builder pod ready", dur: t_builder.elapsed() });
-
-        // Console → BuildKit progress through a remote PTY into the emulator grid; off it,
-        // line per line to stderr
-        let byte_sink = |bytes: &[u8]| {
-            if let Some(c) = console {
-                c.output(bytes.to_vec());
-            }
-        };
-        let line_sink = |line: &str| eprintln!("{line}");
-        let compile_out = match console {
-            Some(c) => remote_compile::CompileOut::Pty {
-                size: (c.size().cols, c.live_rows()),
-                sink: &byte_sink,
-            },
-            None => remote_compile::CompileOut::Lines { sink: &line_sink },
-        };
-        match remote_compile::compile_on_cluster(
-            client,
-            &build_pod,
-            &list_args,
-            &refs,
-            sync_id,
-            Some(compile_out),
-            Some(&mut on_phase),
-        )
-        .await
-        {
-            Ok(c) => (c, Some(build_pod)),
-            Err(e) => {
-                if let Some(c) = console {
-                    c.flush_live();
-                }
-                buildkit::delete_build_pod(client, &build_pod).await;
-                return Err(e.into());
-            }
+        let p = buildkit::create_build_pod(client, sync_id, &ztest::api::naming::current_user())
+            .await
+            .context("create build pod")?;
+        if let Err(e) = buildkit::wait_build_pod_ready(client, &p).await {
+            buildkit::delete_build_pod(client, &p).await;
+            return Err(anyhow!("build pod not ready: {e}"));
         }
+        on_phase(Phase::Done { label: "builder pod ready", dur: t_builder.elapsed() });
+        Some(p)
     } else {
-        match local_bake::bake_locally(
-            &list_args,
-            sync_id,
-            console.map(|c| c as &dyn ztest::proc::ChildHost),
-            Some(&mut on_phase),
-        )
-        .await
-        {
-            Ok(c) => (c, None),
-            Err(e) => {
-                if let Some(c) = console {
-                    c.flush_live();
-                }
-                return Err(e.into());
+        None
+    };
+
+    let cx = build_cx(client.clone(), console, build_pod.clone());
+    let compiled = match runner::compile(&cx, &list_args, sync_id, Some(&mut on_phase)).await {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(c) = console {
+                c.flush_live();
             }
+            if let Some(p) = &build_pod {
+                buildkit::delete_build_pod(client, p).await;
+            }
+            return Err(e.into());
         }
     };
 
@@ -846,7 +803,7 @@ async fn build_and_provision(
 async fn provision_components(
     client: &Client,
     build_pod: Option<&str>,
-    compiled: &RemoteCompileOutcome,
+    compiled: &CompileOutcome,
     profile: &str,
     console: Option<&Console>,
     repaint: impl FnMut(&Transfers),
@@ -932,7 +889,7 @@ struct Target {
 /// - Dump's `test_id` (`crate::…::fn`) minus the crate segment = the libtest name
 /// - Binary = whichever selection contains that test (derived, never guessed)
 /// - `profile` = declared tier + declared override → one resolved value sizes the launch
-fn resolve_target(compiled: &RemoteCompileOutcome, name: &str) -> Result<Target> {
+fn resolve_target(compiled: &CompileOutcome, name: &str) -> Result<Target> {
     let DumpOutcome::Discovered { sync_tests, .. } = &compiled.dump else {
         return Err(anyhow!("inventory dump failed"));
     };
@@ -1028,7 +985,7 @@ fn build_driver_pod(
     ns: &str,
     ns_uid: &str,
     sa: &str,
-    compiled: &RemoteCompileOutcome,
+    compiled: &CompileOutcome,
     target: &Target,
     image_refs: &BTreeMap<String, String>,
     collector: Option<&ztest::api::profiling::Collector>,

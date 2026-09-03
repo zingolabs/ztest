@@ -24,9 +24,8 @@ pub mod capacity_watch;
 pub mod cluster;
 pub mod events;
 pub mod images;
-pub mod local_bake;
 pub mod profiles;
-pub mod remote_compile;
+pub mod runner;
 
 pub use self::archives::ArchivesOutcome;
 pub use self::build::{BuildStage, SelectedBinary};
