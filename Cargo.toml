@@ -123,9 +123,9 @@ tonic-prost = "0.14"
 
 # BIP-39 mnemonic type for `WalletBase::Mnemonic`
 bip0039 = { version = "0.14", optional = true }
-# - Unused here; direct entry = version pin only (bip0039 → unicode-normalization enables `alloc`, no `std`)
-# - 1.13.0 `with_initial_len` calls `vec!` → unresolvable no_std; unpin once 1.13.1 ships the fix
-tinyvec = ">=1.12, <1.13"
+# Not imported here; sole purpose = add `std` to what bip0039 → unicode-normalization pulls
+# (its own `std` feature is empty, so tinyvec lands `alloc`-only and its `vec!` calls fail)
+tinyvec = { version = "1", features = ["std"] }
 tempfile = { version = "3.2", optional = true }
 
 # librustzcash wallet backend (`backends::librustzcash`); gated on the

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, ServiceAccount};
-use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use kube::runtime::wait::await_condition;
 use serde_json::{Value, json};
 
@@ -38,6 +38,8 @@ pub const BUILDKIT_CONTAINER: &str = "buildkit";
 const BUILDKIT_COMPONENT: &str = "ztest.io/component";
 /// [`wait_build_pod_ready`] budget for buildkitd to answer
 const READY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Log tail carried on a build-pod startup failure (daemon dies within a few lines of the cause)
+const FAILURE_LOG_LINES: i64 = 20;
 /// Grace window to abort in-flight builds and unmount overlay/runc before SIGKILL
 /// (a kill mid-unmount leaks mounts and wedges the pod `Terminating`)
 const TERMINATION_GRACE_SECS: i64 = 30;
@@ -309,12 +311,30 @@ pub async fn wait_build_pod_ready(client: &kube::Client, name: &str) -> Result<(
         ))),
         Ok(Err(e)) => Err(ResourceError::Provision(format!("watching build pod {name}: {e}"))),
         Ok(Ok(pod)) => match pod.as_ref().and_then(pod_failed) {
-            Some(why) => Err(ResourceError::Provision(format!(
-                "build pod {name} failed before becoming Ready — {why}"
-            ))),
+            Some(why) => {
+                let detail = failure_log_tail(client, name).await.unwrap_or_default();
+                Err(ResourceError::Provision(format!(
+                    "build pod {name} failed before becoming Ready — {why}{detail}"
+                )))
+            }
             None => Ok(()),
         },
     }
+}
+
+/// buildkitd's own stderr, the only place the cause is written: pod status carries an exit
+/// code, never a reason (state-dir lock held by a concurrent run, unusable snapshotter, …).
+/// Logs survive the container's exit, so this reads after the terminal state settles
+async fn failure_log_tail(client: &kube::Client, name: &str) -> Option<String> {
+    let params = LogParams {
+        container: Some(BUILDKIT_CONTAINER.to_owned()),
+        tail_lines: Some(FAILURE_LOG_LINES),
+        ..Default::default()
+    };
+    let logs =
+        Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE).logs(name, &params).await.ok()?;
+    let tail = logs.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n");
+    (!tail.is_empty()).then(|| format!(":\n{tail}"))
 }
 
 /// Terminal, non-recoverable pod state, if any, so the ready-wait fails fast:

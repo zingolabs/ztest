@@ -70,6 +70,11 @@ pub enum LedgerError {
             headroom.cpu_milli, headroom.mem_bytes / MIB, waited.as_secs())]
     CapacityTimeout { waited: Duration, headroom: Resources },
 
+    /// Distinct from [`CapacityTimeout`](Self::CapacityTimeout): capacity was free, the
+    /// single-writer cache was not, so the holder is the whole diagnosis
+    #[error("buildkit cache held by run {holder} after {}s", waited.as_secs())]
+    BuildCacheTimeout { waited: Duration, holder: String },
+
     /// Provisioned by `ztest cluster setup`, never by a run → the cluster isn't set up
     #[error("no {META_NAMESPACE} namespace; run `ztest cluster setup`")]
     MetaNamespaceMissing,
@@ -372,8 +377,13 @@ pub async fn acquire(
         let headroom = allocatable.saturating_sub(&unreserved).saturating_sub(&others);
         let slice = budget.min(&headroom);
 
+        // A build additionally needs the single-writer cache; capacity free while it is held
+        // is the common case (the holder's footprint is the only thing peers subtract)
+        let holder = (kind == LeaseKind::Build).then(|| build_holder(&live)).flatten();
+        let cache_free = holder.as_deref().is_none_or(|h| h == lease_id);
+
         // Enough for what this caller came for → take it; else wait for others to release
-        if fits(&want.threshold(), &slice) {
+        if fits(&want.threshold(), &slice) && cache_free {
             let reserve = want.amount(slice);
             {
                 let mut b = inner.beacon.lock().expect("beacon mutex poisoned");
@@ -381,23 +391,48 @@ pub async fn acquire(
                 b.needs = None;
             }
             inner.write(reserve).await?; // server-side apply == create
+            // The write orders contenders, the check above cannot: two acquirers can both
+            // read a free cache in one poll window. Re-read and yield unless ours survived
+            if kind == LeaseKind::Build && !won_cache(&leases, lease_id).await? {
+                park_as_claim(&inner, &want).await;
+                tokio::time::sleep(ACQUIRE_POLL).await;
+                continue;
+            }
             return Ok(Reservation::spawn(inner, want, reserve, budget, allocatable));
         }
 
         if start.elapsed() >= ACQUIRE_WAIT_TIMEOUT {
             let _ = inner.delete().await;
-            return Err(LedgerError::CapacityTimeout { waited: start.elapsed(), headroom });
+            return Err(match holder {
+                Some(h) if h != lease_id => {
+                    LedgerError::BuildCacheTimeout { waited: start.elapsed(), holder: h }
+                }
+                _ => LedgerError::CapacityTimeout { waited: start.elapsed(), headroom },
+            });
         }
-        // Claim: zero reserve (adds nothing to `sum_reservations`, no pods for
-        // `assert_invariant`), rewritten each poll so it doubles as the TTL heartbeat
-        {
-            let mut b = inner.beacon.lock().expect("beacon mutex poisoned");
-            b.kind = LeaseKind::Claim;
-            b.needs = Some(want.threshold());
-        }
-        let _ = inner.write(Resources::ZERO).await;
+        park_as_claim(&inner, &want).await;
         tokio::time::sleep(ACQUIRE_POLL).await;
     }
+}
+
+/// Claim: zero reserve (adds nothing to [`sum_reservations`], no pods for `assert_invariant`),
+/// rewritten each poll so it doubles as the TTL heartbeat
+async fn park_as_claim(inner: &Inner, want: &Reserve) {
+    {
+        let mut b = inner.beacon.lock().expect("beacon mutex poisoned");
+        b.kind = LeaseKind::Claim;
+        b.needs = Some(want.threshold());
+    }
+    let _ = inner.write(Resources::ZERO).await;
+}
+
+/// Did our just-written `Build` lease survive as the elected [`build_holder`]?
+async fn won_cache(leases: &Api<Lease>, lease_id: &str) -> Result<bool, LedgerError> {
+    let live = leases
+        .list(&ListParams::default())
+        .await
+        .map_err(|e| LedgerError::Kube(format!("list leases: {e}")))?;
+    Ok(build_holder(&live).as_deref() == Some(lease_id))
 }
 
 /// [`Resources::fits_within`] in the argument order the call sites here read naturally
@@ -523,6 +558,20 @@ pub fn reserve_from_state(
 }
 
 /// Σ reservations of every live lease except `exclude` (this run's own)
+/// Cache holder = earliest live `Build` lease (buildkitd takes an exclusive lock on its state
+/// dir, and every build pod mounts the one cache PVC → a second pod exits at startup).
+///
+/// - Waiters park as `Claim`, so only real holders are counted
+/// - Name breaks a timestamp tie → racing acquirers all elect the same winner
+fn build_holder(leases: &ObjectList<Lease>) -> Option<String> {
+    leases
+        .items
+        .iter()
+        .filter(|l| Beacon::kind_of(l) == LeaseKind::Build)
+        .min_by_key(|l| (l.metadata.creation_timestamp.as_ref().map(|t| t.0), l.metadata.name.clone()))
+        .and_then(|l| l.metadata.name.clone())
+}
+
 fn sum_reservations(leases: &ObjectList<Lease>, exclude: &str) -> Resources {
     leases
         .items
