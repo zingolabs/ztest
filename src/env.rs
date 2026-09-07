@@ -889,7 +889,10 @@ impl TestEnv {
             crate::sync::note_setup("validator", None, "mining the warm-up block");
         }
         for handle in handles {
-            handle.generate_blocks(1).await.map_err(|e| EnvError::Transient(Box::new(e)))?;
+            handle
+                .generate_blocks_to(1, None)
+                .await
+                .map_err(|e| EnvError::Transient(Box::new(e)))?;
         }
         Ok(())
     }

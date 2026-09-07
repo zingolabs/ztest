@@ -4,6 +4,8 @@
 //! - [`ValidatorBackend`] = the live handle's RPC contract
 //! - Backend-specific RPCs stay inherent on the concrete handle (wrong backend = compile error)
 
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::topology::ActivationHeights;
@@ -46,8 +48,8 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
 
     /// Default coinbase pool, absent
     /// [`Validator::mine_to`](crate::component::Validator::mine_to). Both backends
-    /// mine any pool; this is cost/convenience (zebrad [`Pool::Transparent`] =
-    /// cheapest template, zcashd [`Pool::Sapling`])
+    /// mine any pool; this is cost/convenience — both default to
+    /// [`Pool::Transparent`], the only coinbase costing no per-block proof
     fn default_coinbase_pool(&self) -> Pool;
 
     /// Container port serving Prometheus, published as [`crate::metrics::PORT_NAME`].
@@ -95,6 +97,33 @@ impl PoolSupport {
     }
 }
 
+/// Pending [`ValidatorBackend::generate_blocks`] — `.await` mines to the configured
+/// miner, [`to`](Self::to) overrides the coinbase recipient first
+#[must_use = "does nothing until awaited"]
+#[derive(Debug)]
+pub struct GenerateBlocks<'a, V: ?Sized> {
+    validator: &'a V,
+    n: u32,
+    miner_address: Option<&'a str>,
+}
+
+impl<'a, V: ?Sized> GenerateBlocks<'a, V> {
+    /// Pay these blocks' coinbase to `miner_address` instead of the configured miner
+    pub fn to(mut self, miner_address: &'a str) -> Self {
+        self.miner_address = Some(miner_address);
+        self
+    }
+}
+
+impl<'a, V: ValidatorBackend + ?Sized> IntoFuture for GenerateBlocks<'a, V> {
+    type Output = Result<BlockHeight, RpcError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.validator.generate_blocks_to(self.n, self.miner_address).await })
+    }
+}
+
 #[async_trait]
 pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     fn label(&self) -> &'static str;
@@ -118,12 +147,42 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     /// (zebrad `getblocktemplate`, zcashd `getinfo`)
     async fn ready(&self, timeout: Duration) -> Result<(), RpcError>;
 
-    /// Generate `n` blocks → new tip height once the chain advances. Coinbase pays
-    /// into [`PoolSupport::coinbase`]
+    /// Generate `n` blocks → new tip height once the chain advances.
+    ///
+    /// Awaited directly, the coinbase pays into [`PoolSupport::coinbase`] — the pool
+    /// `mine_to` configured. [`GenerateBlocks::to`] overrides the recipient first:
+    ///
+    /// ```ignore
+    /// validator.generate_blocks(105).await?;
+    /// validator.generate_blocks(105).to(FILLER_ADDRESS).await?;
+    /// ```
+    ///
+    /// `Self: Sized` keeps the trait object-safe; `dyn`/`?Sized` holders call
+    /// [`generate_blocks_to`](Self::generate_blocks_to)
+    fn generate_blocks(&self, n: u32) -> GenerateBlocks<'_, Self>
+    where
+        Self: Sized,
+    {
+        GenerateBlocks { validator: self, n, miner_address: None }
+    }
+
+    /// [`generate_blocks`](Self::generate_blocks)'s primitive, recipient explicit.
     ///
     /// - one `generate` RPC **per block**, never one call for `n` (a batched call is
     ///   held open for the whole mine and dies with the portforward)
-    async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError>;
+    /// - `None` = the configured miner
+    /// - [`FILLER_ADDRESS`](crate::regtest_conf::FILLER_ADDRESS) buys height with no
+    ///   per-block proof & no credit to any wallet
+    /// - `Some` where [`supports_coinbase_recipient`](Self::supports_coinbase_recipient)
+    ///   is false → [`RpcError::Unsupported`], never a fall back to the configured miner
+    async fn generate_blocks_to(
+        &self,
+        n: u32,
+        miner_address: Option<&str>,
+    ) -> Result<BlockHeight, RpcError>;
+
+    /// Per-call coinbase recipient honoured (zebrad `generatetoaddress`)
+    fn supports_coinbase_recipient(&self) -> bool;
 
     fn pool_support(&self) -> PoolSupport;
 

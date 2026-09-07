@@ -205,7 +205,21 @@ impl ValidatorBackend for ZcashdValidator {
 
     /// One `generate` call per block — see the zebra impl for why batching loses the
     /// whole mine once `n` × per-block cost outlives the portforward.
-    async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError> {
+    async fn generate_blocks_to(
+        &self,
+        n: u32,
+        miner_address: Option<&str>,
+    ) -> Result<BlockHeight, RpcError> {
+        if let Some(addr) = miner_address {
+            return Err(RpcError::unsupported(
+                COMPONENT,
+                "generatetoaddress",
+                format!(
+                    "no per-call coinbase recipient ({addr}); gate on \
+                     `supports_coinbase_recipient()` or pin the test to zebrad"
+                ),
+            ));
+        }
         let client = self.rpc_client().await?;
         for _ in 0..n {
             let _: Value = client
@@ -216,8 +230,14 @@ impl ValidatorBackend for ZcashdValidator {
         self.chain_height().await
     }
 
+    /// Unverified upstream; `generate` is the only mining RPC ztest has exercised, so this
+    /// stays false until a probe proves `generatetoaddress` on the pinned image
+    fn supports_coinbase_recipient(&self) -> bool {
+        false
+    }
+
     fn pool_support(&self) -> PoolSupport {
-        // All three pools validated; coinbase pool is per-validator (default Sapling)
+        // All three pools validated; coinbase pool is per-validator (default Transparent)
         PoolSupport {
             supported: &[Pool::Orchard, Pool::Sapling, Pool::Transparent],
             coinbase: self

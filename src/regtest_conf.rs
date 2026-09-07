@@ -32,6 +32,16 @@ pub const ORCHARD_MINER_ADDRESS: &str = "uregtest1zkuzfv5m3yhv2j4fmvq5rjurkxenxy
 /// `subsidy_is_valid` asserts `addr.is_script_hash()`)
 pub const LOCKBOX_ADDRESS: &str = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8";
 
+/// Filler-block coinbase recipient — chain height at no cost & no credit.
+///
+/// - off-seed (unreachable from `FAUCET_SEED`) → filler never enters a wallet's note set
+/// - transparent → no per-block halo2/groth16 proof
+/// - hash160 = `sha256("ztest filler coinbase")[..20]`, no preimage → unspendable
+///
+/// Maturity/advance runs mined to the configured miner instead keep minting fresh
+/// immature coinbase, so the faucet's newest `COINBASE_MATURITY` are never spendable
+pub const FILLER_ADDRESS: &str = "tmPKnGY8VkGoKUikpfCEJMBrG2WAVQKTKPA";
+
 // ───────────────────────────── version model ──────────────────────────
 
 /// `MAJOR.MINOR.PATCH`, compared lexicographically
@@ -640,5 +650,16 @@ mod tests {
         let zai_on = zai(Some(9998));
         assert!(zai_on.contains("metrics_endpoint = '0.0.0.0:9998'"));
         assert!(zai_on.find("metrics_endpoint").unwrap() < zai_on.find("[grpc_settings]").unwrap());
+    }
+
+    /// Filler must be spendable by nobody and mineable by everyone: sharing a payout
+    /// address with the faucet silently reintroduces the immature-coinbase treadmill
+    #[test]
+    fn filler_address_is_distinct_from_every_miner_address() {
+        for addr in [MINER_ADDRESS, SHIELDED_MINER_ADDRESS, ORCHARD_MINER_ADDRESS, LOCKBOX_ADDRESS]
+        {
+            assert_ne!(FILLER_ADDRESS, addr);
+        }
+        assert!(FILLER_ADDRESS.starts_with("tm"), "P2PKH transparent, else a coinbase proof");
     }
 }

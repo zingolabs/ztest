@@ -115,6 +115,11 @@ pub enum RpcError {
     #[error("{component} {op}: no convergence in {elapsed:?}: {detail}")]
     Timeout { component: &'static str, op: &'static str, elapsed: Duration, detail: String },
 
+    /// Backend cannot honour the request as asked — never silently approximate (filler
+    /// mined to the configured miner instead would pass while proving less)
+    #[error("{component} {op}: unsupported: {detail}")]
+    Unsupported { component: &'static str, op: &'static str, detail: String },
+
     #[error(transparent)]
     Env(#[from] EnvError),
 }
@@ -146,6 +151,14 @@ impl RpcError {
         detail: impl Into<String>,
     ) -> Self {
         RpcError::Timeout { component, op, elapsed, detail: detail.into() }
+    }
+
+    pub fn unsupported(
+        component: &'static str,
+        op: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        RpcError::Unsupported { component, op, detail: detail.into() }
     }
 }
 

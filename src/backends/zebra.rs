@@ -295,15 +295,29 @@ impl ValidatorBackend for ZebraValidator {
     ///   message completed") and the whole call is lost
     /// - per-block requests bound each one to a single block, so `n` is limited by the
     ///   test's own budget, not the tunnel's
-    async fn generate_blocks(&self, n: u32) -> Result<BlockHeight, RpcError> {
+    async fn generate_blocks_to(
+        &self,
+        n: u32,
+        miner_address: Option<&str>,
+    ) -> Result<BlockHeight, RpcError> {
         let client = self.rpc_client().await?;
+        // `generatetoaddress` overrides miner params on a clone of the RPC handle → the
+        // node's configured `mining.miner_address` survives the call
+        let (op, params) = match miner_address {
+            None => ("generate", json!([1])),
+            Some(addr) => ("generatetoaddress", json!([1, addr])),
+        };
         for _ in 0..n {
             let _: Value = client
-                .json_result_from_call("generate", &json!([1]))
+                .json_result_from_call(op, &params)
                 .await
-                .map_err(|e| RpcError::backend_boxed(COMPONENT, "generate", e))?;
+                .map_err(|e| RpcError::backend_boxed(COMPONENT, op, e))?;
         }
         self.chain_height().await
+    }
+
+    fn supports_coinbase_recipient(&self) -> bool {
+        true
     }
 
     fn pool_support(&self) -> PoolSupport {

@@ -346,7 +346,8 @@ pub trait WalletExt: WalletBackend {
                 if matches!(validator.pool_support().coinbase, Pool::Orchard | Pool::Ironwood) {
                     warmup_to_nu5(validator).await?;
                 }
-                mine_and_sync(validator, indexer, &faucet, notes, FAUCET_CONFIRM_TIMEOUT).await?;
+                mine_and_sync(validator, indexer, &faucet, notes, FAUCET_CONFIRM_TIMEOUT, None)
+                    .await?;
             }
             Pool::Transparent => {
                 fund_via_shield(validator, indexer, &faucet, notes.max(1)).await?;
@@ -367,20 +368,22 @@ where
     let target = nu5.saturating_sub(1);
     let height = u32::from(validator.chain_height().await?);
     if height < target {
-        validator.generate_blocks(target - height).await?;
+        validator.generate_blocks_to(target - height, None).await?;
     }
     Ok(())
 }
 
 impl<W: WalletBackend> WalletExt for W {}
 
-/// Mine `n`, await the indexer's new tip, sync `faucet`. No-op at `n == 0`
+/// Mine `n` to `miner_address`, await the indexer's new tip, sync `faucet`.
+/// No-op at `n == 0`
 async fn mine_and_sync<W, V, I>(
     validator: &V,
     indexer: &I,
     faucet: &Account<W>,
     n: u32,
     timeout: Duration,
+    miner_address: Option<&str>,
 ) -> Result<(), RpcError>
 where
     W: WalletBackend,
@@ -391,7 +394,7 @@ where
         return Ok(());
     }
     let pre = validator.chain_height().await?;
-    validator.generate_blocks(n).await?;
+    validator.generate_blocks_to(n, miner_address).await?;
     indexer.wait_for_block_num(pre + n, timeout).await?;
     faucet.sync().await?;
     Ok(())
@@ -399,6 +402,10 @@ where
 
 /// Fund `faucet` from a transparent coinbase: mature, then shield into Orchard
 /// `notes` times. Fresh maturity batch before each shield (keeps the notes independent)
+///
+/// Maturity + confirm runs go to [`FILLER_ADDRESS`]: `shield()` sweeps the faucet's whole
+/// transparent UTXO set, so a maturity run paying the faucet mints a fresh immature
+/// coinbase every block and the newest `COINBASE_MATURITY` can never all be spendable
 async fn fund_via_shield<W, V, I>(
     validator: &V,
     indexer: &I,
@@ -410,20 +417,28 @@ where
     V: ValidatorBackend + ?Sized,
     I: IndexerBackend + ?Sized,
 {
-    for i in 0..notes {
-        let blocks = if i == 0 {
-            let height = u32::from(validator.chain_height().await?);
-            (COINBASE_MATURITY + 1).saturating_sub(height)
-        } else {
-            COINBASE_MATURITY
-        };
-        if blocks == 0 {
-            faucet.sync().await?;
-        } else {
-            mine_and_sync(validator, indexer, faucet, blocks, FAUCET_MATURITY_TIMEOUT).await?;
-        }
+    if !validator.supports_coinbase_recipient() {
+        return Err(RpcError::unsupported(
+            validator.label(),
+            "fund_via_shield",
+            "transparent-coinbase funding needs filler mining to mature the faucet's \
+             coinbase; pin the test to a backend with a per-call coinbase recipient",
+        ));
+    }
+    let filler = Some(crate::regtest_conf::FILLER_ADDRESS);
+    for _ in 0..notes {
+        mine_and_sync(validator, indexer, faucet, 1, FAUCET_CONFIRM_TIMEOUT, None).await?;
+        mine_and_sync(
+            validator,
+            indexer,
+            faucet,
+            COINBASE_MATURITY,
+            FAUCET_MATURITY_TIMEOUT,
+            filler,
+        )
+        .await?;
         faucet.shield().await?;
     }
-    mine_and_sync(validator, indexer, faucet, 1, FAUCET_CONFIRM_TIMEOUT).await?;
+    mine_and_sync(validator, indexer, faucet, 1, FAUCET_CONFIRM_TIMEOUT, filler).await?;
     Ok(())
 }

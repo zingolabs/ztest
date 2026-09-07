@@ -111,6 +111,7 @@ pub use crate::loadtest::{
 pub use crate::mount::{Mount, MountKind, MountSource};
 pub use crate::protocol::Endpoint;
 pub use crate::protocol::client::{BlockSample, JsonRpcClient};
+pub use crate::regtest_conf::FILLER_ADDRESS;
 pub use ztest_macros::{artifact, dev, mount_archive, mount_config, mount_file, needs, sync_test};
 
 /// Runtime support for test-author proc macros. Not public API, paths may move
@@ -155,11 +156,11 @@ pub mod prelude {
     pub use super::{
         Account, AccountId, BlockHash, BlockHeight, BlockSample, BlockTip, BlockchainInfo,
         ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Cpu, Disk,
-        Endpoint, EnvError, FAUCET_SEED, GetAddressUtxosReply, Indexer, IndexerBackend,
-        JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo, Mount, MountKind,
-        MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction, RpcError,
-        SendResponse, SharedVolume, ShieldedProtocol, SubtreeRoot, TestEnv, TreeState, TxId,
-        Validator, ValidatorBackend, ValidatorConfig, Wallet, WalletBackend, WalletExt,
+        Endpoint, EnvError, FAUCET_SEED, FILLER_ADDRESS, GetAddressUtxosReply, Indexer,
+        IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo, Mount,
+        MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction,
+        RpcError, SendResponse, SharedVolume, ShieldedProtocol, SubtreeRoot, TestEnv, TreeState,
+        TxId, Validator, ValidatorBackend, ValidatorConfig, Wallet, WalletBackend, WalletExt,
         ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
     };
     /// The pinned chain a test names, and the blob it is restored from
