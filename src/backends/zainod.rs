@@ -659,17 +659,7 @@ impl IndexerBackend for ZainoIndexer {
 /// Zaino's dotted `metric_names` after scrape (`metrics-exporter-prometheus` sanitizes to
 /// the Prometheus charset). Named once → [`ROWS`] and the [`SyncSubject`] impl can't drift
 mod family {
-    use crate::metrics::{Family, family, family_where};
-
-    /// Split on every per-block metric: tip ingest, finalised writer, migration.
-    ///
-    /// Folding counts one block 3×; `finalised` = the pass that survived a commit
-    const STAGE: &str = "stage";
-    const FINALISED: &str = "finalised";
-
-    const fn staged(name: &'static str) -> Family {
-        family_where(name, STAGE, FINALISED)
-    }
+    use crate::metrics::{Family, family};
 
     // Serving surface. Latency histogram's `_count` = request volume (no `requests_total`)
     pub const GRPC_ERRORS: Family = family("zaino_grpc_errors_total");
@@ -686,24 +676,29 @@ mod family {
     pub const TARGET_HEIGHT: Family = family("zaino_sync_target_height");
     pub const CHAIN_TIP: Family = family("zaino_chain_tip_height");
 
-    // Throughput per op class, all `stage`-split. Cumulative on the wire
-    pub const TRANSACTIONS: Family = staged("zaino_sync_transactions_total");
-    pub const TRANSPARENT_INPUTS: Family = staged("zaino_sync_transparent_inputs_total");
-    pub const TRANSPARENT_OUTPUTS: Family = staged("zaino_sync_transparent_outputs_total");
-    pub const SAPLING_SPENDS: Family = staged("zaino_sync_sapling_spends_total");
-    pub const SAPLING_OUTPUTS: Family = staged("zaino_sync_sapling_outputs_total");
-    pub const ORCHARD_ACTIONS: Family = staged("zaino_sync_orchard_actions_total");
-    pub const IRONWOOD_ACTIONS: Family = staged("zaino_sync_ironwood_actions_total");
+    // Throughput per op class, cumulative on the wire.
+    //
+    // - Whole family, no label selector: zaino publishes these unlabelled, and a series
+    //   missing a selected label is not that value (folds to nothing, not to zero)
+    // - Only the finalised writer tallies today → one pass, one count; a second tallying
+    //   pass (migration, tip ingest) would fold into these silently
+    pub const TRANSACTIONS: Family = family("zaino_sync_transactions_total");
+    pub const TRANSPARENT_INPUTS: Family = family("zaino_sync_transparent_inputs_total");
+    pub const TRANSPARENT_OUTPUTS: Family = family("zaino_sync_transparent_outputs_total");
+    pub const SAPLING_SPENDS: Family = family("zaino_sync_sapling_spends_total");
+    pub const SAPLING_OUTPUTS: Family = family("zaino_sync_sapling_outputs_total");
+    pub const ORCHARD_ACTIONS: Family = family("zaino_sync_orchard_actions_total");
+    pub const IRONWOOD_ACTIONS: Family = family("zaino_sync_ironwood_actions_total");
 
     /// Per block, after both source reads
-    pub const BLOCK_ASSEMBLE: Family = staged("zaino_sync_block_assemble_seconds");
+    pub const BLOCK_ASSEMBLE: Family = family("zaino_sync_block_assemble_seconds");
     /// One source read: request → deserialized block in zaino's ram. Not an upstream wait
     /// under `direct` (rocksdb read + zebra deserialize, both on zaino's own cpu)
-    pub const BLOCK_FETCH: Family = staged("zaino_sync_block_fetch_seconds");
+    pub const BLOCK_FETCH: Family = family("zaino_sync_block_fetch_seconds");
     /// Second source read per block (commitment tree roots); split off `BLOCK_FETCH` so a
     /// slow treestate can't hide behind the block read
-    pub const TREESTATE_FETCH: Family = staged("zaino_sync_treestate_fetch_seconds");
-    /// Per committed batch, incl. fsync — batch-scoped, so no `stage` split
+    pub const TREESTATE_FETCH: Family = family("zaino_sync_treestate_fetch_seconds");
+    /// Per committed batch, incl. fsync
     pub const BATCH_WRITE: Family = family("zaino_sync_batch_write_seconds");
 
     /// LMDB environment size; against host RAM = where the write path's B-tree
@@ -1313,26 +1308,19 @@ mod tests {
     /// the reader would not have counted
     #[test]
     fn work_source_and_work_of_agree_on_the_declaration() {
-        // Shape zaino publishes: one series per ingest stage
+        // Shape zaino publishes: one unlabelled series per op class
         let e = scrape(
             "# TYPE zaino_sync_orchard_actions_total counter\n\
-             zaino_sync_orchard_actions_total{stage=\"finalised\"} 7\n\
-             zaino_sync_orchard_actions_total{stage=\"non-finalised\"} 6\n\
-             zaino_sync_orchard_actions_total{stage=\"migration\"} 4\n",
+             zaino_sync_orchard_actions_total 7\n",
         );
         let family =
             <ZainoIndexer as Observe>::work_source(Op::OrchardAction).expect("orchard is declared");
         assert_eq!(family.name, "zaino_sync_orchard_actions_total");
         assert_eq!(
-            family.select.map(|s| (s.label, s.value)),
-            Some(("stage", "finalised")),
-            "a probe must read the finalised pass, not the fold of every ingest stage"
+            family.select, None,
+            "a selector drops zaino's unlabelled series entirely — reads as unpublished, not zero"
         );
-        assert_eq!(
-            ZainoIndexer::work_of(&e).get(Op::OrchardAction),
-            Some(7),
-            "17 here would be the three stages folded — one block counted once per pass"
-        );
+        assert_eq!(ZainoIndexer::work_of(&e).get(Op::OrchardAction), Some(7));
         assert_eq!(
             <ZainoIndexer as Observe>::work_source(Op::SproutJoinSplit),
             None,
