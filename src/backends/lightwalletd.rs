@@ -149,7 +149,7 @@ impl IndexerBackend for LightwalletdIndexer {
                 &[("grpc", crate::ports::LIGHTWALLETD_GRPC)],
                 &opts.extra_ports,
             ),
-            ready_port: crate::ports::LIGHTWALLETD_GRPC,
+            ready: crate::manifest::ReadyProbe::Tcp(crate::ports::LIGHTWALLETD_GRPC),
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources,

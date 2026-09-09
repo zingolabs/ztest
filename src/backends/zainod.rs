@@ -207,6 +207,18 @@ impl IndexerConfig for ZainoBackend {
     }
 }
 
+/// gRPC binds only once the chain-index source is open (minutes over a mainnet snapshot),
+/// so "pod up" reads the admin thread, which binds pre-indexer.
+///
+/// - `/livez` not `/readyz`: ready = fully synced, which is the run itself
+/// - No admin listener without the metrics feature → serving port is all there is
+fn ready_probe(image: &crate::inventory::ImageSpec) -> crate::manifest::ReadyProbe {
+    match image.metrics_enabled().then(|| ZainoBackend.metrics_port()).flatten() {
+        Some(port) => crate::manifest::ReadyProbe::Http { port, path: "/livez" },
+        None => crate::manifest::ReadyProbe::Tcp(crate::ports::ZAINO_GRPC),
+    }
+}
+
 // ─────────────────────────────── ZainoIndexer ─────────────────────────
 
 #[derive(Debug, Clone)]
@@ -239,7 +251,7 @@ impl IndexerBackend for ZainoIndexer {
                 ),
                 &opts.extra_ports,
             ),
-            ready_port: crate::ports::ZAINO_GRPC,
+            ready: ready_probe(&opts.image),
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources,
@@ -1171,6 +1183,40 @@ mod tests {
 
     fn progress(height: u32, target: Option<u32>) -> ZainoSyncProgress {
         ZainoSyncProgress { height, target, work: Work::ZERO }
+    }
+
+    fn dev_image(features: &[&str]) -> crate::inventory::ImageSpec {
+        crate::inventory::ImageSpec::Dev {
+            source: crate::inventory::DevSource::Local {
+                dockerfile: "Dockerfile".into(),
+                context: ".".into(),
+            },
+            features: features.iter().map(|f| f.to_string()).collect(),
+            repo: "zainod".into(),
+            rust_version: None,
+        }
+    }
+
+    /// A metrics build probes the admin thread; anything else has no listener to probe and
+    /// falls back to the serving port, which opens only after the index source is up
+    #[test]
+    fn only_a_metrics_build_probes_livez() {
+        assert!(matches!(
+            ready_probe(&dev_image(&["no_tls_with_prometheus"])),
+            crate::manifest::ReadyProbe::Http { port: crate::ports::ZAINO_METRICS, path: "/livez" }
+        ));
+        assert!(matches!(
+            ready_probe(&dev_image(&["prometheus"])),
+            crate::manifest::ReadyProbe::Http { .. }
+        ));
+        assert!(matches!(
+            ready_probe(&dev_image(&["no_tls_use_unencrypted_traffic"])),
+            crate::manifest::ReadyProbe::Tcp(crate::ports::ZAINO_GRPC)
+        ));
+        assert!(matches!(
+            ready_probe(&crate::inventory::ImageSpec::Published),
+            crate::manifest::ReadyProbe::Tcp(crate::ports::ZAINO_GRPC)
+        ));
     }
 
     #[test]

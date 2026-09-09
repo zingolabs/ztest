@@ -301,6 +301,13 @@ impl TestEnv {
         self
     }
 
+    /// [`ready_timeout`](Self::ready_timeout) for a borrowed env — the only form
+    /// [`SyncRunner::topology`](crate::sync::SyncRunner::topology) can reach
+    pub fn set_ready_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.ready_timeout = timeout;
+        self
+    }
+
     /// Pin an explicit regtest activation schedule, overriding
     /// [`ActivationHeights::regtest_default`]. Validated at [`build`](Self::build):
     /// activated upgrades = a contiguous prefix, heights non-decreasing
@@ -1306,7 +1313,7 @@ mod tests {
             label: "test",
             image: "img".into(),
             ports: Vec::new(),
-            ready_port: 1,
+            ready: crate::manifest::ReadyProbe::Tcp(1),
             command: None,
             args: None,
             resources: Some(crate::component::Resources { cpu, memory }),

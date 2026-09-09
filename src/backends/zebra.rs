@@ -231,7 +231,7 @@ impl ValidatorBackend for ZebraValidator {
                 }
                 crate::manifest::merge_ports(&base, &opts.extra_ports)
             },
-            ready_port: rpc_port(opts),
+            ready: crate::manifest::ReadyProbe::Tcp(rpc_port(opts)),
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources,

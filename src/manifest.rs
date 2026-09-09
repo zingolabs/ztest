@@ -9,6 +9,37 @@ use crate::component::{ComponentCategory, Resources};
 use crate::mounts::ResolvedMount;
 use crate::naming::RunCoords;
 
+/// What "this pod is up" means to kubelet.
+///
+/// - `Tcp` = serving port open (component serves as soon as it binds)
+/// - `Http` = process-liveness endpoint, for a component whose serving port opens long
+///   after the process does (zaino: minutes of DB open before the gRPC bind)
+#[derive(Debug, Clone, Copy)]
+pub enum ReadyProbe {
+    Tcp(u16),
+    Http { port: u16, path: &'static str },
+}
+
+/// Consecutive probe failures before kubelet marks the pod NotReady.
+///
+/// - Not a deadline: readiness never fails a `restartPolicy: Never` pod, so
+///   [`ReadyWatch`](crate::pod_status::ReadyWatch) is what ends a wedged start
+/// - Generous → a flap during a slow open never un-readies a pod ztest already passed
+const READY_FAILURE_THRESHOLD: u32 = 60;
+
+impl ReadyProbe {
+    fn render(self) -> Value {
+        let mut probe = match self {
+            ReadyProbe::Tcp(port) => json!({ "tcpSocket": { "port": port } }),
+            ReadyProbe::Http { port, path } => json!({ "httpGet": { "port": port, "path": path } }),
+        };
+        probe["initialDelaySeconds"] = json!(1);
+        probe["periodSeconds"] = json!(2);
+        probe["failureThreshold"] = json!(READY_FAILURE_THRESHOLD);
+        probe
+    }
+}
+
 /// Rendered pod spec. Constraints the types don't show:
 ///
 /// - `resources` (explicit) wins over `guaranteed` (QoS per-pod reserve); both
@@ -23,7 +54,7 @@ pub struct PodSpec {
     pub label: &'static str,
     pub image: String,
     pub ports: Vec<(String, u16)>,
-    pub ready_port: u16,
+    pub ready: ReadyProbe,
     pub command: Option<Vec<String>>,
     pub args: Option<Vec<String>>,
     pub resources: Option<Resources>,
@@ -55,12 +86,7 @@ impl PodSpec {
             "image": self.image,
             "ports": ports_json,
             "volumeMounts": volume_mounts,
-            "readinessProbe": {
-                "tcpSocket": { "port": self.ready_port },
-                "initialDelaySeconds": 1,
-                "periodSeconds": 2,
-                "failureThreshold": 60,
-            },
+            "readinessProbe": self.ready.render(),
         });
         if let Some(cmd) = &self.command {
             container["command"] = json!(cmd);
@@ -244,7 +270,7 @@ mod tests {
             label: "zebrad",
             image: "zfnd/zebra:1.9.1".into(),
             ports: vec![("rpc".into(), 28232)],
-            ready_port: 28232,
+            ready: ReadyProbe::Tcp(28232),
             command: None,
             args: None,
             resources: None,
@@ -264,6 +290,21 @@ mod tests {
         // Round-trip through JSON = the shape the API server would receive
         let v = serde_json::to_value(pod).unwrap();
         v["spec"]["containers"][0].clone()
+    }
+
+    #[test]
+    fn tcp_and_http_probes_render_their_own_handler_and_nothing_else() {
+        let tcp = container(&base_spec().render(&coords(), "t", &[]).unwrap());
+        assert_eq!(tcp["readinessProbe"]["tcpSocket"]["port"], 28232);
+        assert!(tcp["readinessProbe"]["httpGet"].is_null());
+
+        let spec =
+            PodSpec { ready: ReadyProbe::Http { port: 9998, path: "/livez" }, ..base_spec() };
+        let http = container(&spec.render(&coords(), "t", &[]).unwrap());
+        assert_eq!(http["readinessProbe"]["httpGet"]["port"], 9998);
+        assert_eq!(http["readinessProbe"]["httpGet"]["path"], "/livez");
+        assert!(http["readinessProbe"]["tcpSocket"].is_null());
+        assert_eq!(http["readinessProbe"]["periodSeconds"], 2);
     }
 
     /// Prometheus pod-role SD reads pod labels only; owner on the namespace alone never

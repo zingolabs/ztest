@@ -154,7 +154,7 @@ impl ValidatorBackend for ZcashdValidator {
                 &[("rpc", crate::ports::ZCASHD_RPC)],
                 &opts.extra_ports,
             ),
-            ready_port: crate::ports::ZCASHD_RPC,
+            ready: crate::manifest::ReadyProbe::Tcp(crate::ports::ZCASHD_RPC),
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources,
