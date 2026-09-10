@@ -64,7 +64,10 @@ declares a container port named `metrics`, then promotes ztest's pod labels (`co
 | `ztest sync status`/`watch` | Prometheus: raw samples for totals, `query_range` for plots  | no           |
 
 - Oracle reads the component direct → no verdict waits on a scrape
-- `watch` = `status` redrawn each scrape interval: one view, one source, one renderer
+- `watch` = the pinned 3-column panel (height/pace/trend · per-pool rates · per-container load) + driver
+  and subject logs in scrollback; panel fed by the same `report_view` read as `status`, once per scrape
+  interval → one source, two renderers
+- Height = the committed frontier only (zaino's `finalized`), in probe and panel alike
 - Driver = a target like any component: `ztest_sync_started_timestamp_seconds` (segment origin, the live
   window) + `ztest_sync_violations_total{probe}`. No state strings — see
   [design-metrics.md](design-metrics.md)

@@ -127,16 +127,12 @@ impl From<&super::Snapshot> for Observation {
     }
 }
 
-/// The height families a component publishes. Read in a different order by a probe than
-/// by a display, so the preference lives here as data rather than as two hand-written
-/// resolvers that can disagree.
+/// Height families a component publishes. `committed` = the one height probe and panel both read
+/// (a second frontier family = a second answer to "how far")
 #[derive(Debug, Clone, Copy)]
 pub struct Heights {
-    /// Durable frontier — written and fsynced. What a probe gates on
+    /// Durable frontier — written and fsynced
     pub committed: Gauge,
-    /// Frontier built ahead of the next commit; moves per block. What a display shows,
-    /// since `committed` steps once per commit and carries no per-second rate
-    pub live: Option<Gauge>,
     /// Completion denominator. `None` = component publishes no target
     pub target: Option<Gauge>,
     /// Network tip as this component sees it. Not a denominator — it advances underneath a
@@ -213,19 +209,9 @@ pub trait Observe: crate::metrics::MetricLayout {
         Self::HEIGHTS.target.and_then(|g| exposition.height(g)).filter(|&t| t > 0)
     }
 
-    /// Durable first — what a probe gates on
+    /// `None` before the first commit
     fn committed_height(exposition: &Exposition) -> Option<u32> {
-        Self::height(exposition, [Some(Self::HEIGHTS.committed), Self::HEIGHTS.live])
-    }
-
-    /// Live first — what a display shows, so it moves per block
-    fn live_height(exposition: &Exposition) -> Option<u32> {
-        Self::height(exposition, [Self::HEIGHTS.live, Some(Self::HEIGHTS.committed)])
-    }
-
-    #[doc(hidden)]
-    fn height(exposition: &Exposition, order: [Option<Gauge>; 2]) -> Option<u32> {
-        order.into_iter().flatten().find_map(|g| exposition.height(g))
+        exposition.height(Self::HEIGHTS.committed)
     }
 }
 

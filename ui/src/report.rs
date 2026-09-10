@@ -152,6 +152,15 @@ impl ReportView {
     }
 }
 
+/// [`render_sync_report`] minus its panels: `watch`'s settled verdict (its panel already drew the series)
+pub fn render_sync_verdict(view: &ReportView, theme: &Theme, width: usize) -> String {
+    let width = width.min(MAX_WIDTH);
+    let mut out = String::with_capacity(1024);
+    header(&mut out, view, theme, width);
+    footer(&mut out, view, theme, width);
+    out
+}
+
 pub fn render_sync_report(view: &ReportView, theme: &Theme, width: usize) -> String {
     let width = width.min(MAX_WIDTH);
     let mut out = String::with_capacity(4096);
@@ -374,7 +383,7 @@ fn pool_chips(pools: &[Series], theme: &Theme, budget: usize) -> String {
 /// Sapling ships split (only the output side is checkable against the note-commitment trees,
 /// see [`chainwork`](ztest::sync::chainwork)) and transparent ships by direction; the panel
 /// reads pools, so display folds every row sharing a [`Channel`](ztest::api::Channel)
-fn fold_pools(pools: &[Series]) -> Vec<Series> {
+pub(super) fn fold_pools(pools: &[Series]) -> Vec<Series> {
     let mut out: Vec<Series> = Vec::new();
     for series in pools {
         let Some(channel) = series.channel else {
@@ -627,7 +636,7 @@ fn footer(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
 
 /// One band per sample. [`plot_stacked`](plot::plot_stacked) resamples to its own
 /// width, so no decimation is needed here — and doing it twice would flatten extremes
-fn bands(series: &Series) -> Vec<Band> {
+pub(super) fn bands(series: &Series) -> Vec<Band> {
     series.points.iter().map(|(_, v)| Some((*v, *v))).collect()
 }
 

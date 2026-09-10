@@ -669,8 +669,6 @@ mod family {
 
     /// Height the finalised index is **committed** to — written & fsynced, set per batch
     pub const FINALIZED_HEIGHT: Gauge = gauge("zaino_sync_finalized_height", Dimension::Count);
-    /// Height built in memory ahead of the next commit (advances per block)
-    pub const FETCHED_HEIGHT: Gauge = gauge("zaino_sync_fetched_height", Dimension::Count);
     /// Write path's goal = tip - the non-finalised reorg buffer. Completion measured
     /// against this, never the raw tip (the finalised index trails by design)
     pub const TARGET_HEIGHT: Gauge = gauge("zaino_sync_target_height", Dimension::Count);
@@ -716,7 +714,7 @@ mod family {
 /// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns
 /// scannable (reformatted, each row costs six lines)
 #[rustfmt::skip]
-const ROWS: [Row; 23] = [
+const ROWS: [Row; 22] = [
     // Per-op throughput. `label` = the band, which is what keys `Palette::pools` when they
     // stack. Directions kept apart: only the output side is checkable against the
     // note-commitment trees ([`super::super::sync::chainwork`]), and folding spends in loses that
@@ -726,9 +724,8 @@ const ROWS: [Row; 23] = [
     row("sapling outputs", family::SAPLING_OUTPUTS.rate(), Facet::Shielded).pool(Pool::Sapling),
     row("orchard", family::ORCHARD_ACTIONS.rate(), Facet::Shielded).pool(Pool::Orchard),
     row("ironwood", family::IRONWOOD_ACTIONS.rate(), Facet::Shielded).pool(Pool::Ironwood),
-    // Scan rate off the frontier gauge (zaino counts no blocks), so its total is *net
-    // progress* — blocks re-scanned after a reorg are not recoverable from a height
-    row("blocks", family::FETCHED_HEIGHT.slope(), Facet::Blocks),
+    // Off the durable frontier (zaino counts no blocks) → total = net committed progress
+    row("blocks", family::FINALIZED_HEIGHT.slope(), Facet::Blocks),
     // Transactions, not ops: one tx spans many ops, so it never joins the stack above
     row("transactions", family::TRANSACTIONS.rate(), Facet::Throughput),
     // Per-block cost = what a tuning pass acts on. `fetch` split from `assemble` (remedies
@@ -743,12 +740,8 @@ const ROWS: [Row; 23] = [
     row("gRPC", family::GRPC_LATENCY.mean(), Facet::WritePath),
     row("gRPC p99", family::GRPC_LATENCY.p(Phi::P99), Facet::WritePath),
     row("errors", family::GRPC_ERRORS.rate(), Facet::WritePath),
-    // `finalized` live = only trustworthy read of zaino's own index (every other height
-    // it serves is answerable by the validator it proxies while indexing). Beside
-    // `fetched` because the *gap* is the diagnostic: commits at most once per
-    // `sync_checkpoint_interval` (120 s) → separates slow-to-fetch from not-committing
+    // Only trustworthy read of zaino's own index (it proxies the validator while indexing)
     row("finalized", family::FINALIZED_HEIGHT.level(), Facet::Progress),
-    row("fetched", family::FETCHED_HEIGHT.level(), Facet::Progress),
     row("chain tip", family::CHAIN_TIP.level(), Facet::Progress),
     // Height this run was *asked* for — fixed for its duration, so the only honest
     // denominator (the tip advances underneath, marking a finished run short by
@@ -767,11 +760,9 @@ impl crate::metrics::MetricLayout for ZainoIndexer {
 }
 
 impl Observe for ZainoIndexer {
-    /// `finalized` is the durable frontier a probe gates on; `fetched` moves per block,
-    /// which is what a panel needs (`finalized` steps once per `sync_checkpoint_interval`)
+    /// `fetched` never read (runs ahead of the fsync → counts blocks a crash would lose)
     const HEIGHTS: Heights = Heights {
         committed: family::FINALIZED_HEIGHT,
-        live: Some(family::FETCHED_HEIGHT),
         target: Some(family::TARGET_HEIGHT),
         tip: Some(family::CHAIN_TIP),
     };
@@ -796,7 +787,7 @@ impl Observe for ZainoIndexer {
         }
         let timing = |family| exposition.timing(family);
         Some(Observation {
-            height: Self::live_height(exposition),
+            height: Self::committed_height(exposition),
             target: Self::target_of(exposition),
             // No progress-percent family published; height/target is the whole story
             reported_pct: None,
@@ -858,11 +849,9 @@ fn frontier_of(exporter: &Exposition, op: &'static str) -> Result<u32, RpcError>
         op,
         if has_metrics {
             format!(
-                "this pod publishes work counters but neither {} nor {}, so how far its index \
-                 has got cannot be observed — the sync loop has not built a single block yet, \
-                 or this build sets neither gauge",
+                "this pod publishes work counters but no {}: no batch committed yet, or this \
+                 build does not set it",
                 family::FINALIZED_HEIGHT,
-                family::FETCHED_HEIGHT,
             )
         } else {
             format!(
@@ -1254,29 +1243,20 @@ mod tests {
         e
     }
 
-    /// One [`Heights`] declaration, two readers: a probe gates on the durable frontier,
-    /// a panel shows the one that moves per block. Written by hand they drifted
+    /// `fetched` running ahead must reach neither probe nor panel, even before the first commit
     #[test]
-    fn probe_and_panel_read_the_same_declaration_in_opposite_orders() {
-        let e = scrape(
+    fn height_is_finalized_and_never_fetched() {
+        let both = scrape(
             "# TYPE zaino_sync_finalized_height gauge\n\
              zaino_sync_finalized_height 61\n\
              # TYPE zaino_sync_fetched_height gauge\n\
              zaino_sync_fetched_height 161\n",
         );
-        assert_eq!(ZainoIndexer::committed_height(&e), Some(61), "probe gates on durable");
-        assert_eq!(ZainoIndexer::live_height(&e), Some(161), "panel shows per-block");
-    }
+        assert_eq!(ZainoIndexer::committed_height(&both), Some(61));
 
-    /// Either family alone answers both readers — the fallback is what covers the window
-    /// before the first commit
-    #[test]
-    fn one_height_family_answers_both_readers() {
-        let live_only =
+        let fetched_only =
             scrape("# TYPE zaino_sync_fetched_height gauge\nzaino_sync_fetched_height 42\n");
-        assert_eq!(ZainoIndexer::committed_height(&live_only), Some(42));
-        assert_eq!(ZainoIndexer::live_height(&live_only), Some(42));
-        assert_eq!(ZainoIndexer::committed_height(&scrape("")), None);
+        assert_eq!(ZainoIndexer::committed_height(&fetched_only), None);
     }
 
     /// A tip not yet known renders 100 % if taken as a target

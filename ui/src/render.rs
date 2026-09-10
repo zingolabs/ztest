@@ -4,15 +4,15 @@ use std::time::Duration;
 use super::layout::*;
 use super::theme::Theme;
 use super::{
-    ArchiveRow, ArchiveStatus, BannerState, BuildState, QosPlan, TierPlan, TransferKind,
-    TransferProgress, TransferRow, Transfers,
+    ArchiveRow, ArchiveStatus, BannerState, BuildState, QosPlan, SyncVitals, SyncWatchState,
+    TierPlan, TransferKind, TransferProgress, TransferRow, Transfers,
 };
 use crate::template::{Fields, Row, Template};
 use ztest::api::BuildStage;
 use ztest::api::LiveSnapshot;
 use ztest::api::Resources;
 use ztest::api::RunProgress;
-use ztest::api::{column_width, format_elapsed};
+use ztest::api::{column_width, format_elapsed, thousands};
 
 pub fn render(state: &BannerState, theme: &Theme) -> String {
     let mut out = String::with_capacity(2048);
@@ -47,6 +47,10 @@ fn draw(out: &mut String, f: Fields<'_>, src: &str, elapsed: Duration, theme: &T
 /// minimum, and a fixed cell would clip the phase that names the row
 fn label(text: &str) -> String {
     format!("{text:>width$}", width = LABEL_WIDTH)
+}
+
+fn side_label(text: &str) -> String {
+    format!("{text:>width$}", width = METRIC_LABEL_WIDTH)
 }
 
 // ─────────────────────────── banner ───────────────────────────────────
@@ -503,6 +507,237 @@ pub fn render_sync_build_panel(
 
 // ─────────────────────────── transfers ────────────────────────────────
 
+/// Left column while `ztest sync watch` follows a detached sync: live vitals, or before the first
+/// commit the driver pod's phase explaining the silence. Same frame as the build that launched it
+pub fn render_sync_watch_panel(state: &SyncWatchState, elapsed: Duration, theme: &Theme) -> String {
+    let mut out = String::with_capacity(384);
+
+    render_label_rule(&mut out, theme);
+
+    let f = Fields::new()
+        .text("label", label("Watching"))
+        .text("profile", state.profile.as_str())
+        .text("sync_id", state.sync_id.as_str());
+    draw(&mut out, f, panel_row::SUBJECT, elapsed, theme);
+
+    match &state.vitals {
+        Some(v) => render_sync_vitals(&mut out, v, elapsed, theme),
+        None => render_sync_waiting(&mut out, state, elapsed, theme),
+    }
+
+    pad_to_panel(&mut out);
+    out
+}
+
+/// Metric row shapes. First three sit in the watch panel's [`LABEL_WIDTH`] column, the rest in
+/// the narrower [`METRIC_LABEL_WIDTH`] side columns
+mod metric_row {
+    pub(super) const HEIGHT: &str =
+        "{label|dim} {height|bold} / {target|bold} {@dot|dim} {pct|fraction.bold} {gauge:12#}";
+    pub(super) const PACE: &str = concat!(
+        "{label|dim} [{blk:.1} blk/s][{blk_na}] {@dot|dim} [{tx|per_sec.bold} tx/s][{tx_na|bold}]",
+        "[ {@dot|dim} eta {eta}]",
+    );
+    pub(super) const TREND: &str =
+        "{label|dim} {blocks:12~} {span|dim}[ {@dot|dim} peak {peak:.0|dim} blk/s]";
+    pub(super) const DRIVER: &str = "{label|dim} {phase|bold} {@dot|dim} {age|dim}";
+    pub(super) const NOTE: &str = "{label|dim} {note|dim}";
+    pub(super) const POOL: &str = "{label|dim} [{rate:>8|per_sec.bold}][{rate_na:>8|bold}] {spark}";
+    pub(super) const TOTAL: &str =
+        "{label|dim} [{rate:>8|per_sec.bold}][{rate_na:>8|bold}] {span|dim}";
+    // Absent limit != zero limit (a Burstable pod gets no denominator, never an invented one)
+    pub(super) const LOAD: &str =
+        "{label|dim} {cpu:.1|bold}c[/{cpu_limit:.0|bold}c] [{mem%|bold}][{mem|bytes.bold}]";
+    pub(super) const SIDE_NOTE: &str = "{label|dim} {note|dim}";
+    pub(super) const MORE: &str = "{label|dim} +{count|count.dim} more";
+}
+
+/// Believability = 3 scrape intervals (one missed scrape must not blink the panel). Past it rates
+/// blank, never hold (a frozen rate drawn as healthy = the one unacceptable failure)
+const STALE_AFTER: Duration =
+    Duration::from_secs(ztest::api::metrics::SCRAPE_INTERVAL.as_secs() * 3);
+
+fn stale(v: &SyncVitals, elapsed: Duration) -> bool {
+    elapsed.saturating_sub(v.received_at) > STALE_AFTER
+}
+
+/// Measured → the `{key}` cell; unmeasured or stale → `{na}` = `—` (one statement: not known now)
+fn rate<'a>(f: Fields<'a>, key: &'static str, na: &'static str, r: Option<f64>) -> Fields<'a> {
+    match r {
+        Some(r) => f.value(key, r),
+        None => f.text(na, "—"),
+    }
+}
+
+fn render_sync_vitals(out: &mut String, v: &SyncVitals, elapsed: Duration, theme: &Theme) {
+    let pct = v.pct();
+    let f = Fields::new()
+        .text("label", label("height"))
+        .text("height", thousands(u64::from(v.height)))
+        .text("target", thousands(u64::from(v.target)))
+        .value("pct", pct / 100.0)
+        .percent("gauge", pct.clamp(0.0, 100.0) as u8);
+    draw(out, f, metric_row::HEIGHT, Duration::ZERO, theme);
+
+    // tx/s beside blk/s: one read, one staleness → never disagree about whether the subject moves
+    let stale = stale(v, elapsed);
+    let fresh = |r: Option<f64>| r.filter(|_| !stale);
+    let mut pace = Fields::new().text("label", label("pace"));
+    pace = rate(pace, "blk", "blk_na", fresh(v.pace.map(|p| p.per_sec)));
+    pace = rate(pace, "tx", "tx_na", fresh(v.tx_rate));
+    // Blanked with its rate (a countdown off a frozen rate counts to a finish that is not coming)
+    if let Some(eta) = v.pace.and_then(|p| p.eta).filter(|_| !stale) {
+        pace = pace.text("eta", format_elapsed(eta));
+    }
+    draw(out, pace, metric_row::PACE, Duration::ZERO, theme);
+
+    render_scan_trend(out, v, theme);
+}
+
+/// Scan rate over the run + its best (a scan holding at half its demonstrated peak = a regression
+/// nothing else on the panel states)
+fn render_scan_trend(out: &mut String, v: &SyncVitals, theme: &Theme) {
+    let Some(blocks) = v.blocks.as_ref().filter(|b| !b.points.is_empty()) else {
+        let f = Fields::new().text("label", label("blocks")).text("note", "gathering");
+        draw(out, f, metric_row::NOTE, Duration::ZERO, theme);
+        return;
+    };
+    let trend = Fields::new()
+        .text("label", label("blocks"))
+        .bands("blocks", super::report::bands(blocks))
+        .text("span", format_elapsed(v.span))
+        .maybe_value("peak", blocks.peak());
+    draw(out, trend, metric_row::TREND, Duration::ZERO, theme);
+}
+
+/// Pre-first-commit rows. Provisioning + image pulls = most of a sync's early wall-clock → the only
+/// progress display for minutes
+fn render_sync_waiting(out: &mut String, state: &SyncWatchState, elapsed: Duration, theme: &Theme) {
+    let f = Fields::new().text("label", label("cluster")).text("context", state.context.as_str());
+    draw(out, f, panel_row::CONTEXT, Duration::ZERO, theme);
+
+    let f = Fields::new()
+        .text("label", label("driver"))
+        .text("phase", state.pod_phase.as_str())
+        .text("age", format_elapsed(elapsed));
+    draw(out, f, metric_row::DRIVER, Duration::ZERO, theme);
+
+    let f = Fields::new()
+        .text("label", label("metrics"))
+        .text("note", state.metrics_note.as_deref().unwrap_or("awaiting first read"));
+    draw(out, f, metric_row::NOTE, Duration::ZERO, theme);
+}
+
+/// Middle column of `ztest sync watch`: total, then one row per measured pool with its sparkline.
+///
+/// - Total heads the column (four pools + a total fill every row the panel has)
+/// - Pool never published = no series = no row (an empty sparkline claims idle)
+pub fn render_sync_work(state: &SyncWatchState, elapsed: Duration, theme: &Theme) -> String {
+    use super::plot::{Palette, PlotOpts, plot_stacked};
+
+    let mut out = String::with_capacity(320);
+    let Some(vitals) = state.vitals.as_ref() else {
+        out.push('\n');
+        let f = Fields::new().text("label", side_label("work")).text("note", "awaiting first read");
+        draw(&mut out, f, metric_row::SIDE_NOTE, Duration::ZERO, theme);
+        pad_to_panel(&mut out);
+        return out;
+    };
+    let stale = stale(vitals, elapsed);
+    let fresh = |r: Option<f64>| r.filter(|_| !stale);
+
+    // Carries the span (else ten minutes and two days of history look alike)
+    let f =
+        Fields::new().text("label", side_label("total")).text("span", format_elapsed(vitals.span));
+    draw(
+        &mut out,
+        rate(f, "rate", "rate_na", fresh(vitals.work_rate())),
+        metric_row::TOTAL,
+        Duration::ZERO,
+        theme,
+    );
+
+    let palette = Palette::pools(theme.is_colorized());
+    let opts = PlotOpts::new(SPARK_WIDTH, 1, theme.chars.graph);
+    for pool in vitals.pools.iter().take(MAX_TRANSFER_ROWS) {
+        // Sparkline drawn here, not via `{key:N~}` (palette keys on the pool; a template key is literal)
+        let (name, tag) = pool
+            .channel
+            .map_or((pool.label.as_str(), pool.label.as_str()), |c| (c.name(), c.tag()));
+        let spark = plot_stacked(&[(name, super::report::bands(pool))], &opts, &palette)
+            .pop()
+            .unwrap_or_default();
+        let f = Fields::new().text("label", side_label(tag)).text("spark", spark);
+        draw(
+            &mut out,
+            rate(f, "rate", "rate_na", fresh(pool.last())),
+            metric_row::POOL,
+            Duration::ZERO,
+            theme,
+        );
+    }
+    if vitals.pools.is_empty() {
+        let f = Fields::new().text("label", side_label("work")).text("note", "no pool measured");
+        draw(&mut out, f, metric_row::SIDE_NOTE, Duration::ZERO, theme);
+    }
+
+    pad_to_panel(&mut out);
+    out
+}
+
+/// Right column of `ztest sync watch`: each container's newest cpu + memory against its limit.
+///
+/// - Kubelet's reading off the same TSDB read (no exporter sees its own cgroup)
+/// - Empty column names its cause (blank rows read as idle containers)
+pub fn render_sync_load(state: &SyncWatchState, theme: &Theme) -> String {
+    let mut out = String::with_capacity(320);
+    out.push('\n');
+
+    if state.loads.is_empty() {
+        let f = Fields::new()
+            .text("label", side_label("load"))
+            .text("note", state.loads_note.as_deref().unwrap_or("awaiting first sample"));
+        draw(&mut out, f, metric_row::SIDE_NOTE, Duration::ZERO, theme);
+        pad_to_panel(&mut out);
+        return out;
+    }
+
+    // Blank top row aligns with the left column's rule; a longer topology collapses its tail
+    let budget = PANEL_LINES - 1;
+    let (shown, hidden) = match state.loads.len() > budget {
+        true => (&state.loads[..budget - 1], state.loads.len() - (budget - 1)),
+        false => (&state.loads[..], 0),
+    };
+    for load in shown {
+        let limit = load.limit.as_ref();
+        let mut f = Fields::new()
+            .text("label", side_label(&clip_name(&load.container)))
+            .value("cpu", load.usage.cpu_milli as f64 / 1000.0)
+            .maybe_value(
+                "cpu_limit",
+                limit.map(|l| l.cpu_milli).filter(|&c| c > 0).map(|c| c as f64 / 1000.0),
+            );
+        // Pair when a denominator exists (`10.0/24.0 GiB` shares one magnitude); bare otherwise
+        f = match limit.map(|l| l.mem_bytes).filter(|&m| m > 0) {
+            Some(m) => f.pair("mem", load.usage.mem_bytes, m),
+            None => f.value("mem", load.usage.mem_bytes as f64),
+        };
+        draw(&mut out, f, metric_row::LOAD, Duration::ZERO, theme);
+    }
+    if hidden > 0 {
+        let f = Fields::new().text("label", side_label("")).value("count", hidden as f64);
+        draw(&mut out, f, metric_row::MORE, Duration::ZERO, theme);
+    }
+
+    pad_to_panel(&mut out);
+    out
+}
+
+/// Long name loses its tail rather than push the numbers off the column
+fn clip_name(name: &str) -> String {
+    name.chars().take(METRIC_LABEL_WIDTH).collect()
+}
+
 /// Right column of the pinned console: live background acquisitions, independent
 /// of the scrolling main output. [`PANEL_LINES`] = blank top row + up to
 /// [`MAX_TRANSFER_ROWS`] rows, tail collapsing to `+N more`
@@ -680,6 +915,176 @@ mod tests {
     use super::*;
     use ztest::api::GIB;
     use ztest::api::QosClass;
+
+    // ─────────────────────── sync watch panel ─────────────────────────
+
+    fn watching(vitals: Option<SyncVitals>) -> SyncWatchState {
+        SyncWatchState {
+            profile: "zaino_state_sync".into(),
+            sync_id: "zaino-state-sync-a52f9ec9".into(),
+            context: "zingo-infra".into(),
+            pod_phase: "Running".into(),
+            vitals,
+            ..SyncWatchState::default()
+        }
+    }
+
+    fn per_minute(
+        label: &str,
+        channel: Option<ztest::api::Channel>,
+        values: &[f64],
+    ) -> ztest::api::Series {
+        ztest::api::Series {
+            reading: None,
+            label: label.into(),
+            unit: ztest::api::Unit::PerSec,
+            facet: None,
+            channel,
+            points: values.iter().enumerate().map(|(i, v)| (i as f64 * 60.0, *v)).collect(),
+            total: None,
+            coverage: None,
+        }
+    }
+
+    /// Session-elapsed frame these render at: 2s after [`sample_vitals`]'s read = fresh
+    const FRAME: Duration = Duration::from_secs(212);
+
+    const POOLS: [ztest::api::Channel; 4] = [
+        ztest::api::Channel::Transparent,
+        ztest::api::Channel::Sapling,
+        ztest::api::Channel::Orchard,
+        ztest::api::Channel::Ironwood,
+    ];
+
+    fn sample_vitals() -> SyncVitals {
+        SyncVitals {
+            height: 901,
+            target: 1024,
+            pace: Some(ztest::api::Pace { per_sec: 12.4, eta: Some(Duration::from_secs(10)) }),
+            tx_rate: Some(48.0),
+            blocks: Some(per_minute("blocks", None, &[400.0, 440.0, 480.0, 520.0])),
+            // Ironwood counted & idle: a row at zero, never dropped
+            pools: POOLS
+                .iter()
+                .zip([900.0, 19_400.0, 4_200.0, 0.0])
+                .map(|(c, r)| per_minute(c.name(), Some(*c), &[r, r]))
+                .collect(),
+            span: Duration::from_secs(3 * 3600),
+            received_at: Duration::from_secs(210),
+        }
+    }
+
+    fn load(container: &str, cpu_milli: u64, mem_gib: u64) -> ContainerLoad {
+        ContainerLoad {
+            container: container.to_string(),
+            usage: Resources::new(cpu_milli, mem_gib * GIB, 0, 0),
+            limit: Some(Resources::new(9_000, 24 * GIB, 0, 0)),
+        }
+    }
+
+    /// A column whose line count differs from its neighbours' shears the pinned block
+    #[test]
+    fn every_watch_column_is_panel_height_in_every_state() {
+        let theme = plain_unicode_theme();
+        let mut loaded = watching(Some(sample_vitals()));
+        loaded.loads = (0..8).map(|i| load(&format!("c{i}"), 100, 1)).collect();
+        for state in [watching(None), watching(Some(sample_vitals())), loaded] {
+            for (column, out) in [
+                ("left", render_sync_watch_panel(&state, FRAME, &theme)),
+                ("work", render_sync_work(&state, FRAME, &theme)),
+                ("load", render_sync_load(&state, &theme)),
+            ] {
+                assert_eq!(out.lines().count(), PANEL_LINES, "{column} column:\n{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_left_panel_shows_height_pace_and_trend() {
+        let out = render_sync_watch_panel(
+            &watching(Some(sample_vitals())),
+            FRAME,
+            &plain_unicode_theme(),
+        );
+        for expected in ["901", "1,024", "12.4 blk/s", "eta", "peak 520"] {
+            assert!(out.contains(expected), "`{expected}` missing:\n{out}");
+        }
+    }
+
+    /// Before the first commit the panel explains the wait (driver phase + why no vitals)
+    #[test]
+    fn the_left_panel_waiting_names_the_driver_phase() {
+        let mut state = watching(None);
+        state.metrics_note = Some("no committed height scraped yet".into());
+        let out = render_sync_watch_panel(&state, FRAME, &plain_unicode_theme());
+        assert!(out.contains("Running"), "driver phase:\n{out}");
+        assert!(out.contains("no committed height scraped yet"), "cause:\n{out}");
+    }
+
+    #[test]
+    fn a_stale_read_blanks_every_rate_and_the_countdown() {
+        let theme = plain_unicode_theme();
+        let late = FRAME + Duration::from_secs(600);
+        let state = watching(Some(sample_vitals()));
+        let left = render_sync_watch_panel(&state, late, &theme);
+        assert!(left.contains('—') && !left.contains("eta"), "stale pace must blank:\n{left}");
+        let work = render_sync_work(&state, late, &theme);
+        assert!(work.contains('—'), "stale pool rates must blank:\n{work}");
+    }
+
+    #[test]
+    fn the_work_column_heads_every_measured_pool_with_the_total() {
+        let out = render_sync_work(&watching(Some(sample_vitals())), FRAME, &plain_unicode_theme());
+        assert!(out.lines().next().is_some_and(|l| l.contains("total")), "total first:\n{out}");
+        for pool in POOLS {
+            assert!(out.contains(pool.tag()), "`{}` row missing:\n{out}", pool.name());
+        }
+    }
+
+    #[test]
+    fn the_work_column_names_why_it_is_empty() {
+        let out = render_sync_work(&watching(None), FRAME, &plain_unicode_theme());
+        assert!(out.contains("awaiting first read"), "{out}");
+    }
+
+    #[test]
+    fn the_load_column_names_why_it_is_empty() {
+        let theme = plain_unicode_theme();
+        let mut state = watching(Some(sample_vitals()));
+        assert!(render_sync_load(&state, &theme).contains("awaiting first sample"));
+        state.loads_note = Some("prometheus unreadable".into());
+        assert!(render_sync_load(&state, &theme).contains("prometheus unreadable"));
+    }
+
+    #[test]
+    fn the_load_column_shows_usage_against_each_containers_limit() {
+        let mut state = watching(Some(sample_vitals()));
+        state.loads = vec![load("zainod", 593, 10), load("zebrad", 6, 1)];
+        let s = render_sync_load(&state, &plain_unicode_theme());
+        assert!(s.contains("zainod") && s.contains("zebrad"), "names each container:\n{s}");
+        assert!(s.contains("0.6c/9c"), "cpu against its limit:\n{s}");
+        // Byte pair shares one magnitude → the denominator costs 6 columns, not 9
+        assert!(s.contains("10.0/24.0 GiB"), "memory against its limit:\n{s}");
+    }
+
+    /// Burstable containers have no denominator; inventing one misreports headroom
+    #[test]
+    fn a_container_without_limits_shows_bare_usage() {
+        let mut state = watching(Some(sample_vitals()));
+        state.loads = vec![ContainerLoad { limit: None, ..load("zainod", 1_500, 2) }];
+        let s = render_sync_load(&state, &plain_unicode_theme());
+        assert!(s.contains("1.5c"), "bare cpu:\n{s}");
+        assert!(s.contains("2.0 GiB"), "bare memory:\n{s}");
+        assert!(!s.contains('/'), "no invented denominator:\n{s}");
+    }
+
+    #[test]
+    fn a_deep_topology_collapses_its_tail() {
+        let mut state = watching(Some(sample_vitals()));
+        state.loads = (0..8).map(|i| load(&format!("c{i}"), 100, 1)).collect();
+        let s = render_sync_load(&state, &plain_unicode_theme());
+        assert!(s.contains("+5 more"), "tail collapses:\n{s}");
+    }
 
     /// `(tier, count)` → one `PlannedTest` per test, each at its tier default
     fn at_tiers(sets: &[(QosClass, u32)]) -> Vec<ztest::api::PlannedTest> {

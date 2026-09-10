@@ -33,9 +33,12 @@ pub use self::layout::{SPINNER_STEP_MS, display_width, pad, truncate, truncate_w
 pub use self::plan::render as render_plan;
 pub use self::render::{
     render, render_cancel_panel, render_live_panel, render_preflight_panel,
-    render_sync_build_panel, render_transfer_line, render_transfers,
+    render_sync_build_panel, render_sync_load, render_sync_watch_panel, render_sync_work,
+    render_transfer_line, render_transfers,
 };
-pub use self::report::{ComponentResources, ReportView, render_sync_report, status_mark};
+pub use self::report::{
+    ComponentResources, ReportView, render_sync_report, render_sync_verdict, status_mark,
+};
 pub use self::runview::ConsoleView;
 pub use self::status::render_status;
 pub use self::theme::Theme;
@@ -271,5 +274,174 @@ impl TransferState {
 
     pub fn progress(&self) -> &TransferProgress {
         &self.progress
+    }
+}
+
+// ─────────────────────────── sync watch (all three columns) ───────────
+
+/// `ztest sync watch` panel model: one [`ReportView`] per scrape interval + the driver pod's phase.
+///
+/// - Same TSDB read `status` draws (a live panel off another source would disagree with the report)
+/// - `metrics_note` / `loads_note` = why a column is empty (blank rows read as an idle subject)
+#[derive(Debug, Clone, Default)]
+pub struct SyncWatchState {
+    pub profile: String,
+    pub sync_id: String,
+    pub context: String,
+    pub pod_phase: String,
+    pub vitals: Option<SyncVitals>,
+    pub metrics_note: Option<String>,
+    pub loads: Vec<ContainerLoad>,
+    pub loads_note: Option<String>,
+}
+
+/// Live sync vitals, all off one [`ReportView`] → no row describes another instant.
+///
+/// - `None` rate = unmeasured → `—`, never `0`
+/// - `pools` one series per [`Channel`](ztest::api::Channel), oldest pool first
+/// - `received_at` session-elapsed → stale rates blank by subtraction
+#[derive(Debug, Clone)]
+pub struct SyncVitals {
+    pub height: u32,
+    pub target: u32,
+    pub pace: Option<ztest::api::Pace>,
+    pub tx_rate: Option<f64>,
+    pub blocks: Option<ztest::api::Series>,
+    pub pools: Vec<ztest::api::Series>,
+    pub span: std::time::Duration,
+    pub received_at: std::time::Duration,
+}
+
+/// Countdown basis, trailing seconds (rides out a burst, still tracks the chain's changing density)
+const ETA_BASIS_SECS: f64 = 600.0;
+
+impl SyncVitals {
+    /// `None` until the view holds a committed height
+    pub fn of(view: &ReportView, received_at: std::time::Duration) -> Option<SyncVitals> {
+        let (height, target) = view.height?;
+        let blocks = view.blocks.first().cloned();
+        let pace = blocks.as_ref().and_then(|b| {
+            Some(ztest::api::Pace {
+                per_sec: b.last()?,
+                eta: eta(b, target.saturating_sub(height)),
+            })
+        });
+        let pools: Vec<ztest::api::Series> =
+            view.transparent.iter().chain(&view.shielded).cloned().collect();
+        Some(SyncVitals {
+            height,
+            target,
+            pace,
+            tx_rate: view.throughput.first().and_then(ztest::api::Series::last),
+            blocks,
+            pools: report::fold_pools(&pools),
+            span: view.elapsed().unwrap_or_default(),
+            received_at,
+        })
+    }
+
+    pub fn pct(&self) -> f64 {
+        match self.target {
+            0 => 0.0,
+            target => (f64::from(self.height) / f64::from(target) * 100.0).min(100.0),
+        }
+    }
+
+    /// Sum over measured pools; `None` = none measured
+    pub fn work_rate(&self) -> Option<f64> {
+        self.pools
+            .iter()
+            .filter_map(ztest::api::Series::last)
+            .fold(None, |acc, r| Some(acc.unwrap_or(0.0) + r))
+    }
+}
+
+/// Mean over [`ETA_BASIS_SECS`], not the newest point (one grid point swings the countdown by hours)
+fn eta(blocks: &ztest::api::Series, remaining: u32) -> Option<std::time::Duration> {
+    let (newest, _) = *blocks.points.last()?;
+    let recent: Vec<f64> = blocks
+        .points
+        .iter()
+        .filter(|(t, _)| *t >= newest - ETA_BASIS_SECS)
+        .map(|(_, v)| *v)
+        .collect();
+    let mean = recent.iter().sum::<f64>() / recent.len() as f64;
+    (mean > 0.0).then(|| std::time::Duration::from_secs_f64(f64::from(remaining) / mean))
+}
+
+/// One container's newest draw. `limit` unset = none declared (Burstable) → bare usage, never an
+/// invented denominator
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContainerLoad {
+    pub container: String,
+    pub usage: ztest::api::Resources,
+    pub limit: Option<ztest::api::Resources>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::{ReportView, SyncVitals};
+    use ztest::api::{Channel, Series, Unit};
+
+    fn per_minute(label: &str, channel: Option<Channel>, values: &[f64]) -> Series {
+        Series {
+            reading: None,
+            label: label.into(),
+            unit: Unit::PerSec,
+            facet: None,
+            channel,
+            points: values.iter().enumerate().map(|(i, v)| (i as f64 * 60.0, *v)).collect(),
+            total: None,
+            coverage: None,
+        }
+    }
+
+    fn view(blocks: &[f64]) -> ReportView {
+        ReportView {
+            height: Some((900, 1_000)),
+            span: Some((UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(3_600))),
+            blocks: vec![per_minute("blocks", None, blocks)],
+            ..ReportView::default()
+        }
+    }
+
+    #[test]
+    fn no_committed_height_is_no_vitals() {
+        let view = ReportView { height: None, ..view(&[10.0]) };
+        assert!(SyncVitals::of(&view, Duration::ZERO).is_none());
+    }
+
+    /// Transparent ships by direction; the panel reads one row per pool
+    #[test]
+    fn split_rows_fold_into_one_row_per_pool() {
+        let view = ReportView {
+            transparent: vec![
+                per_minute("tsp-in", Some(Channel::Transparent), &[10.0]),
+                per_minute("tsp-out", Some(Channel::Transparent), &[30.0]),
+            ],
+            shielded: vec![per_minute("orchard", Some(Channel::Orchard), &[5.0])],
+            ..view(&[10.0])
+        };
+        let v = SyncVitals::of(&view, Duration::ZERO).expect("a committed height");
+        let rates: Vec<_> = v.pools.iter().map(|s| (s.channel, s.last())).collect();
+        assert_eq!(
+            rates,
+            [(Some(Channel::Transparent), Some(40.0)), (Some(Channel::Orchard), Some(5.0))]
+        );
+        assert_eq!(v.work_rate(), Some(45.0));
+    }
+
+    /// Run mean would promise a mainnet finish hours early (the early chain is the fast one)
+    #[test]
+    fn the_countdown_runs_off_the_recent_pace() {
+        let mut blocks = vec![1_000.0; 10];
+        blocks.extend([10.0; 11]);
+        let pace = SyncVitals::of(&view(&blocks), Duration::ZERO)
+            .and_then(|v| v.pace)
+            .expect("a measured pace");
+        assert_eq!(pace.per_sec, 10.0);
+        assert_eq!(pace.eta, Some(Duration::from_secs(10)));
     }
 }

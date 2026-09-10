@@ -23,6 +23,13 @@ pub(super) const PANEL_LINES: usize = 5;
 /// `-1` = the right column's blank top row aligning with the left's branded rule
 pub(super) const MAX_TRANSFER_ROWS: usize = PANEL_LINES - 1;
 
+/// Side-column label width, under [`LABEL_WIDTH`] (side columns get what the terminal has past the
+/// left column's fixed 80)
+pub(super) const METRIC_LABEL_WIDTH: usize = 7;
+
+/// Per-pool sparkline width. Fixed (a terminal-tracking sparkline breaks run-to-run comparison)
+pub(super) const SPARK_WIDTH: usize = 12;
+
 /// Pad/truncate `out` to exactly [`PANEL_LINES`] lines (viewport never reflows)
 pub(super) fn pad_to_panel(out: &mut String) {
     let n = out.lines().count();
