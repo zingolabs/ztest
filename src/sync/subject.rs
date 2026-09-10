@@ -6,7 +6,6 @@
 //!   new impl (any crate's) and never a new arm in ztest
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 use crate::RpcError;
 use crate::handles::wallet::PoolBalances;
@@ -14,38 +13,6 @@ use crate::metrics::Exposition;
 
 use super::tree::TreeRoots;
 use super::work::{Op, Work};
-
-/// Lifecycle position, the only phase vocabulary the harness owns.
-///
-/// - Deliberately engine-neutral: a subject's own stage names ride
-///   [`ProgressView::detail`], so no engine's scan taxonomy lands in this enum
-/// - `Syncing` = launched and working, whatever the subject calls that internally
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum Phase {
-    Starting,
-    Syncing,
-    Done,
-}
-
-/// Unknown word → `Syncing`, never an error: a 48 h detached sync outlives the CLI build
-/// watching it, and a driver from another build may publish a stage word this one retired
-impl<'de> Deserialize<'de> for Phase {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(match String::deserialize(d)?.as_str() {
-            "Starting" => Phase::Starting,
-            "Done" => Phase::Done,
-            _ => Phase::Syncing,
-        })
-    }
-}
-
-/// Variant name = the wire tag = the rendered word, one definition (serde derives the
-/// same names) — a rename changes what a running driver publishes
-impl std::fmt::Display for Phase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self, f)
-    }
-}
 
 /// Progress columns every subject exposes, enough for the subject-agnostic probes
 /// (monotonic height, no-stall, reached-target).
@@ -67,12 +34,6 @@ pub trait ProgressView: Send + std::fmt::Debug {
             }
             _ => 0.0,
         }
-    }
-    fn phase(&self) -> Phase;
-    /// Subject's own word for its current stage, rendered beside [`phase`](Self::phase)
-    /// (`"historic scan"`, `"downloading headers"`). `None` = the lifecycle word alone
-    fn detail(&self) -> Option<&'static str> {
-        None
     }
     /// Subject's own cumulative protocol work. `None` (default, every observer) → derived
     /// from [`height`](Self::height) via [`ChainWork`](crate::sync::ChainWork), needing

@@ -26,9 +26,7 @@ use crate::protocol::Endpoint;
 use crate::protocol::client::JsonRpcClient;
 use crate::protocol::zcash_rpc::ZcashRpc;
 use crate::sync::Channel as Pool;
-use crate::sync::{
-    Cost, Heights, Observation, Observe, Op, Phase, ProgressView, SyncSubject, Work,
-};
+use crate::sync::{Cost, Heights, Observation, Observe, Op, ProgressView, SyncSubject, Work};
 use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zainod";
@@ -823,10 +821,6 @@ impl Exporter for ZainoIndexer {
     async fn endpoint(&self) -> Result<Endpoint, EnvError> {
         self.plumbing.endpoint(crate::metrics::PORT_NAME).await
     }
-
-    fn rows(&self) -> &'static [Row] {
-        <Self as crate::metrics::MetricLayout>::ROWS
-    }
 }
 
 impl ZainoIndexer {
@@ -953,18 +947,6 @@ impl ProgressView for ZainoSyncProgress {
 
     fn target(&self) -> Option<u32> {
         self.target
-    }
-
-    fn phase(&self) -> Phase {
-        match self.target {
-            None => Phase::Starting,
-            Some(t) if self.height >= t => Phase::Done,
-            Some(_) => Phase::Syncing,
-        }
-    }
-
-    fn detail(&self) -> Option<&'static str> {
-        matches!(self.phase(), Phase::Syncing).then_some("indexing")
     }
 
     /// Overrides the default: the chain-derived fallback turns a *height* into a work
@@ -1244,13 +1226,6 @@ mod tests {
         let p = progress(0, None);
         assert_eq!(p.target(), None);
         assert_eq!(p.pct(), 0.0);
-        assert_eq!(p.phase(), Phase::Starting);
-    }
-
-    #[test]
-    fn phase_tracks_the_gap_to_the_tip() {
-        assert_eq!(progress(10, Some(1_000)).phase(), Phase::Syncing);
-        assert_eq!(progress(1_000, Some(1_000)).phase(), Phase::Done);
     }
 
     /// Zaino counts its own outputs/actions → `Work` reported, not derived from height.

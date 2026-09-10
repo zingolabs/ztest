@@ -13,7 +13,7 @@ Test class for **long-running chain sync** — wallet, indexer, or validator, bi
 | ---------------------- | ---------------------------------------------------------------------------- | ------ |
 | End-state correctness  | at tip: balances / note-commitment-tree root match an independent authority  | yes    |
 | Continuous invariants  | core Zcash chain guarantees hold on every tick of a multi-hour sync          | yes    |
-| Live progress          | streamed scan phase + % to tip, surfaced in `ztest sync watch`               | no     |
+| Live progress          | height vs target + per-pool counters off Prometheus, in `ztest sync watch`   | no     |
 | Throughput / resource  | blocks-s, outputs-s, CPU/mem/IO profile over the run (feeds the phase model) | no     |
 | Robustness under chaos | sync recovers from partitions / packet loss / dropped links                  | yes    |
 
@@ -47,16 +47,6 @@ pub trait SyncSubject: Send + Sync {          // Sync, not just Send: progress(&
 - Subject owns its endpoint resolution → `Endpoint { IpAddr, u16 }` never has to carry scheme/DNS/TLS
 - The harness compiles with **no backend feature at all**; wallet, indexer and validator subjects are
   interchangeable to it
-
-### Phase vocabulary belongs to the subject
-
-`Phase` is `Starting` / `Syncing` / `Done` — lifecycle only. A subject's own stage word (`"scanning"`,
-`"indexing"`, `"downloading headers"`) rides `ProgressView::detail` and is rendered beside it.
-
-- No engine's scan taxonomy lands in the harness enum. An earlier `Phase` carried one wallet engine's
-  `ScanPriority` names, four of which no producer ever emitted
-- Unknown stage words decode to `Syncing` rather than failing — a 48 h detached sync outlives the CLI
-  build watching it
 
 ## One gRPC substrate
 
@@ -201,8 +191,8 @@ k8s (no local daemon, no `~/.ztest` db).
   and are reclaimed only by `ztest cleanup`. A verdict survives everything that produced it — the datadir
   does not (teardown takes the PVC, so `stop`'s checkpoint outlives the run only under `--no-cleanup`)
 - `ztest cleanup` must skip `Running` `kind=sync` pods
-- Live progress rides the pod log: one structured sentinel line per tick (in-pod `EmitSink`), followed and
-  parsed by `ztest sync watch`; k8s log retention means re-attaching resumes mid-flight
+- Live progress rides Prometheus: the driver is a scrape target like any component, so `watch` attaches
+  anywhere in a run and reads exactly what `status` reads
 - `stop` calls the subject's own graceful stop (checkpoint), never a kill
 
 `ztest sync start` is a profile's **sole** lifecycle owner; `ztest run` never executes at the `sync` tier:
@@ -217,18 +207,18 @@ k8s (no local daemon, no `~/.ztest` db).
 ## CLI (provisional)
 
 ```
-ztest sync list [--all-users] [--json]        # labelled pod query: id, subject, phase, %, age
+ztest sync list [--all-users] [--json]        # labelled pod query: id, subject, status, age
 ztest sync describe <name>                    # body in Collect mode → invariant + nemesis manifest
 ztest sync start <name> [--watch] [--no-cleanup]
 ztest sync watch <id>                         # attach to live progress; Ctrl-C DETACHES only
 ztest sync status <id> [--json]               # finished: final SyncReport (works after the pod is gone);
-                                              #   running: the last snapshot
+                                              #   running: the driver's + subject's series
 ztest sync stop <id>                          # graceful: sync_mode=Shutdown → checkpoint → exit 0
 ztest cleanup <id>                            # namespace + driver pod + record (report + series)
 ```
 
 - Deletion is deliberately not a `sync` verb — reclaiming is one verb, `ztest cleanup`, run or sync
-- Load-bearing UX invariant: `watch` / `start --watch` are read-only tails, detaching never stops a sync
+- Load-bearing UX invariant: `watch` / `start --watch` are read-only views, detaching never stops a sync
 
 ## QoS
 

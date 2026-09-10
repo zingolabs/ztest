@@ -1,7 +1,7 @@
 //! Reading the durable record back out of Prometheus.
 //!
-//! - Live plane ([`crate::metrics::Poller`]) dies with its components; this re-reads the
-//!   same [`Row`]s from the TSDB after the pods and namespace are gone
+//! - Components die with their namespace; this re-reads their [`Row`]s from the TSDB after
+//!   the pods and namespace are gone
 //! - **Never load-bearing**: every failure → `None`, caller omits the section (a verdict
 //!   here would hang on scrape cadence, retention, and an optional Deployment)
 //! - [`purge`] is the one exception — it deletes, so it reports
@@ -88,9 +88,14 @@ fn promql_raw(reading: Reading, namespace: &str, span: Duration) -> String {
 
 /// Run namespace + the row's own selector, so both planes narrow a split family alike
 fn scope_of(family: Family, namespace: &str) -> String {
+    scope_where(family, "namespace", namespace)
+}
+
+/// `label` = `value` + the family's own selector (dropped = silently refolded)
+fn scope_where(family: Family, label: &str, value: &str) -> String {
     match family.select {
-        None => format!("{{namespace=\"{namespace}\"}}"),
-        Some(s) => format!("{{namespace=\"{namespace}\",{}=\"{}\"}}", s.label, s.value),
+        None => format!("{{{label}=\"{value}\"}}"),
+        Some(s) => format!("{{{label}=\"{value}\",{}=\"{}\"}}", s.label, s.value),
     }
 }
 
@@ -151,7 +156,7 @@ impl Series {
             slot.1 += 1;
         }
         let totals: Vec<f64> = parts.iter().filter_map(|s| s.total).collect();
-        let widest = parts.iter().filter_map(|s| s.coverage).map(|c| c.widest_gap).max();
+        let coverages: Vec<Coverage> = parts.iter().filter_map(|s| s.coverage).collect();
         Some(Series {
             reading: first.reading,
             label: label.to_string(),
@@ -164,10 +169,10 @@ impl Series {
                 .map(|(ms, (sum, _))| (ms as f64 / 1000.0, sum))
                 .collect(),
             total: (totals.len() == parts.len()).then(|| totals.iter().sum()),
-            coverage: parts
-                .first()
-                .and_then(|p| p.coverage)
-                .map(|c| Coverage { widest_gap: widest.unwrap_or(c.widest_gap), ..c }),
+            // Every part or none: one part without coverage leaves the whole unknown, as a total does
+            coverage: (coverages.len() == parts.len())
+                .then(|| coverages.into_iter().reduce(Coverage::merge))
+                .flatten(),
         })
     }
 }
@@ -191,6 +196,18 @@ pub struct Coverage {
     pub last: f64,
     pub widest_gap: Duration,
     pub resets: u32,
+}
+
+impl Coverage {
+    fn merge(self, other: Coverage) -> Coverage {
+        Coverage {
+            samples: self.samples + other.samples,
+            first: self.first.min(other.first),
+            last: self.last.max(other.last),
+            widest_gap: self.widest_gap.max(other.widest_gap),
+            resets: self.resets + other.resets,
+        }
+    }
 }
 
 impl Total {
@@ -236,17 +253,8 @@ impl Total {
 
     /// Label sets folded after differencing, never before
     fn folded(parts: &[Total]) -> Option<Total> {
-        let first = parts.first()?;
-        Some(Total {
-            value: parts.iter().map(|p| p.value).sum(),
-            coverage: parts.iter().skip(1).fold(first.coverage, |a, p| Coverage {
-                samples: a.samples + p.coverage.samples,
-                first: a.first.min(p.coverage.first),
-                last: a.last.max(p.coverage.last),
-                widest_gap: a.widest_gap.max(p.coverage.widest_gap),
-                resets: a.resets + p.coverage.resets,
-            }),
-        })
+        let coverage = parts.iter().map(|p| p.coverage).reduce(Coverage::merge)?;
+        Some(Total { value: parts.iter().map(|p| p.value).sum(), coverage })
     }
 }
 
@@ -278,25 +286,26 @@ impl Grid {
 
 /// Every row as a plotted series + its exact total over `window`.
 ///
-/// Rows with nothing recorded are omitted rather than emitted empty (never-published
-/// != published-zero)
+/// - Nothing recorded → row omitted (never-published != published-zero)
+/// - Query failure → error, never an empty row (a failed read must not render as unpublished)
 pub async fn history(
     client: &Client,
     namespace: &str,
     rows: &[Row],
     window: (SystemTime, SystemTime),
-) -> Option<Vec<Series>> {
-    let reader = Reader::open(client).await.ok()?;
+) -> Result<Vec<Series>, crate::error::PipelineError> {
+    let reader = Reader::open(client).await?;
     let grid = Grid::for_span(span(window));
     let mut out = Vec::new();
     for row in rows {
         let total = match row.reading.totalled() {
-            true => total_of(&reader, row.reading, namespace, window).await,
+            true => total_of(&reader, row.reading, namespace, window).await?,
             false => None,
         };
-        let points = match row.reading.plotted() {
-            true => plot_of(&reader, row.reading, namespace, window, grid).await,
-            false => Vec::new(),
+        // Every reading but `Progress` has a series (a latency summarises off its points, unstacked)
+        let points = match row.reading {
+            Reading::Progress(_) => Vec::new(),
+            _ => plot_of(&reader, row.reading, namespace, window, grid).await?,
         };
         if points.is_empty() && total.is_none() {
             continue;
@@ -312,7 +321,7 @@ pub async fn history(
             coverage: total.map(|t| t.coverage),
         });
     }
-    (!out.is_empty()).then_some(out)
+    Ok(out)
 }
 
 async fn plot_of(
@@ -321,11 +330,13 @@ async fn plot_of(
     namespace: &str,
     window: (SystemTime, SystemTime),
     grid: Grid,
-) -> Vec<(f64, f64)> {
+) -> Result<Vec<(f64, f64)>, crate::error::PipelineError> {
     let query = promql_plot(reading, namespace, grid);
-    let Ok(series) = reader.series(&query, window, grid.step).await else { return Vec::new() };
-    // `sum`/`max` collapse to one series; anything else here is a query bug
-    series.into_iter().next().map(|s| s.points).unwrap_or_default()
+    // `sum`/`max` collapse to ≤1 series; none = never published in this window
+    Ok(match reader.series(&query, window, grid.step).await?.into_iter().next() {
+        Some(series) => series.points,
+        None => Vec::new(),
+    })
 }
 
 /// Whole-run count off raw samples, folded across label sets **after** differencing.
@@ -337,11 +348,63 @@ async fn total_of(
     reading: Reading,
     namespace: &str,
     window: (SystemTime, SystemTime),
-) -> Option<Total> {
+) -> Result<Option<Total>, crate::error::PipelineError> {
     let query = promql_raw(reading, namespace, span(window));
-    let series = reader.raw(&query, window.1).await.ok()?;
+    let series = reader.raw(&query, window.1).await?;
     let parts: Vec<Total> = series.iter().filter_map(|s| Total::of(&s.points, reading)).collect();
-    Total::folded(&parts)
+    Ok(Total::folded(&parts))
+}
+
+/// Prometheus's own lookback-delta → a newest-sample read sees what an instant query would
+const LOOKBACK: Duration = Duration::from_secs(300);
+
+/// Each matching series' newest sample within [`LOOKBACK`], with the labels naming it
+async fn newest(
+    client: &Client,
+    family: Family,
+    label: &str,
+    value: &str,
+) -> Result<Vec<(BTreeMap<String, String>, (f64, f64))>, crate::error::PipelineError> {
+    let reader = Reader::open(client).await?;
+    let scope = scope_where(family, label, value);
+    let query = format!("{}{scope}[{}s]", family.name, LOOKBACK.as_secs());
+    Ok(reader
+        .raw(&query, SystemTime::now())
+        .await?
+        .into_iter()
+        .filter_map(|l| Some((l.labels, *l.points.last()?)))
+        .collect())
+}
+
+/// `gauge`'s newest value where `label` = `value`, stamped with the TSDB's own sample time
+/// (a span ending there is measured on one clock, never the reader's)
+pub async fn level_now(
+    client: &Client,
+    gauge: crate::metrics::Gauge,
+    label: &str,
+    value: &str,
+) -> Result<Option<(SystemTime, f64)>, crate::error::PipelineError> {
+    Ok(newest(client, gauge.family(), label, value)
+        .await?
+        .into_iter()
+        .map(|(_, sample)| sample)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(at, v)| (UNIX_EPOCH + Duration::from_secs_f64(at), v)))
+}
+
+/// `counter`'s newest total per value of its `by` label, where `label` = `value`
+pub async fn totals_now(
+    client: &Client,
+    counter: crate::metrics::Counter,
+    label: &str,
+    value: &str,
+    by: &str,
+) -> Result<Vec<(String, f64)>, crate::error::PipelineError> {
+    Ok(newest(client, counter.family(), label, value)
+        .await?
+        .into_iter()
+        .filter_map(|(labels, (_, v))| Some((labels.get(by)?.clone(), v)))
+        .collect())
 }
 
 /// What the kubelet saw of a run's containers, each split per container.
@@ -365,8 +428,8 @@ pub async fn container_history(
     client: &Client,
     namespace: &str,
     window: (SystemTime, SystemTime),
-) -> Option<ContainerHistory> {
-    let reader = Reader::open(client).await.ok()?;
+) -> Result<ContainerHistory, crate::error::PipelineError> {
+    let reader = Reader::open(client).await?;
     let grid = Grid::for_span(span(window));
     let scope = format!("{{namespace=\"{namespace}\",container!=\"\"}}");
 
@@ -384,44 +447,39 @@ pub async fn container_history(
         let mut rows: Vec<Series> = labelled
             .into_iter()
             .filter(|l| !l.points.is_empty())
-            .map(|l| Series {
-                reading: None,
-                label: l.labels.get("container").cloned().unwrap_or_default(),
-                unit,
-                facet: None,
-                channel: None,
-                points: l.points,
-                total: None,
-                coverage: None,
+            // `by (container)` over `container!=""` → the label is always there
+            .filter_map(|l| {
+                Some(Series {
+                    reading: None,
+                    label: l.labels.get("container")?.clone(),
+                    unit,
+                    facet: None,
+                    channel: None,
+                    points: l.points,
+                    total: None,
+                    coverage: None,
+                })
             })
             .collect();
         // Largest first: the stack's base is the container that dominates it
         rows.sort_by(|a, b| {
-            b.peak().unwrap_or(0.0).total_cmp(&a.peak().unwrap_or(0.0)).then(a.label.cmp(&b.label))
+            let peak = |s: &Series| s.peak().expect("filtered to non-empty");
+            peak(b).total_cmp(&peak(a)).then(a.label.cmp(&b.label))
         });
         rows
     };
 
-    let cpu = by_container(reader.series(&cpu_q, window, grid.step).await.ok()?, Unit::Cores);
-    let mem = by_container(reader.series(&mem_q, window, grid.step).await.ok()?, Unit::Bytes);
-    // Not `?`: PSI and blkio each need a kubelet that fills them, so a cluster without
-    // either must still get cpu/mem rather than an absent resources panel
-    let optional =
-        async |query: &str, unit: Unit| match reader.series(query, window, grid.step).await {
-            Ok(series) => by_container(series, unit),
-            Err(_) => Vec::new(),
-        };
-    let io_stall = optional(&stall_q, Unit::Fraction).await;
-    let disk_read = optional(&disk_q(namespace, "Read", grid), Unit::BytesPerSec).await;
-    let disk_write = optional(&disk_q(namespace, "Write", grid), Unit::BytesPerSec).await;
-
-    let history = ContainerHistory { cpu, mem, disk_read, disk_write, io_stall };
-    let empty = history.cpu.is_empty()
-        && history.mem.is_empty()
-        && history.disk_read.is_empty()
-        && history.disk_write.is_empty()
-        && history.io_stall.is_empty();
-    (!empty).then_some(history)
+    let series = async |query: &str| reader.series(query, window, grid.step).await;
+    Ok(ContainerHistory {
+        cpu: by_container(series(&cpu_q).await?, Unit::Cores),
+        mem: by_container(series(&mem_q).await?, Unit::Bytes),
+        io_stall: by_container(series(&stall_q).await?, Unit::Fraction),
+        disk_read: by_container(series(&disk_q(namespace, "Read", grid)).await?, Unit::BytesPerSec),
+        disk_write: by_container(
+            series(&disk_q(namespace, "Write", grid)).await?,
+            Unit::BytesPerSec,
+        ),
+    })
 }
 
 /// Device bytes `operation` moved on this cgroup's behalf, per second.
@@ -714,15 +772,12 @@ struct RangeResponse {
 
 #[derive(Deserialize)]
 struct RangeData {
-    #[serde(default)]
     result: Vec<RangeSeries>,
 }
 
 #[derive(Deserialize)]
 struct RangeSeries {
-    #[serde(default)]
     metric: BTreeMap<String, String>,
-    #[serde(default)]
     values: Vec<(f64, String)>,
 }
 

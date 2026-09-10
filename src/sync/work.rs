@@ -45,7 +45,7 @@ impl Channel {
         Channel::Ironwood,
     ];
 
-    /// Timeline key + palette slot
+    /// Palette slot + folded band name
     pub const fn name(self) -> &'static str {
         match self {
             Channel::Transparent => "transparent",
@@ -290,6 +290,8 @@ where
 /// - `to` = height **reached**, never the one asked for
 /// - `network` as the indexer names it; two `None`s != same chain
 /// - `elapsed_ms` spans first→last reading (excludes provisioning)
+/// - `started_ms` = wall clock at first reading → report window anchor (driver outlives its
+///   segment by every at-completion probe)
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Segment {
     pub network: Option<String>,
@@ -297,6 +299,7 @@ pub struct Segment {
     pub to: u32,
     pub work: Work,
     pub elapsed_ms: u64,
+    pub started_ms: u64,
 }
 
 /// Why two segments cannot be compared.
@@ -344,6 +347,12 @@ impl Segment {
 
     pub fn elapsed(&self) -> Duration {
         Duration::from_millis(self.elapsed_ms)
+    }
+
+    /// Wall-clock interval first→last reading
+    pub fn span(&self) -> (std::time::SystemTime, std::time::SystemTime) {
+        let started = std::time::UNIX_EPOCH + Duration::from_millis(self.started_ms);
+        (started, started + self.elapsed())
     }
 
     pub fn rate(&self) -> Rate {
@@ -612,6 +621,7 @@ mod tests {
             to,
             work: tier_a(1000, 500, 0),
             elapsed_ms: secs * 1000,
+            started_ms: 0,
         }
     }
 

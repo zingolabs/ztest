@@ -15,10 +15,6 @@ use ztest::api::{GIB, Resources};
 /// Action-label column width, matching nextest's `{:>12}`
 pub(super) const LABEL_WIDTH: usize = 12;
 
-/// Right-hand metrics label column. Under [`LABEL_WIDTH`] — the right column gets
-/// only what the terminal has past the left column's fixed 80
-pub(super) const METRIC_LABEL_WIDTH: usize = 7;
-
 /// Pinned panel's fixed line count; must equal `cli::console::PANEL_ROWS`. Every
 /// block formatter returns exactly this many (session-constant, non-reflowing)
 pub(super) const PANEL_LINES: usize = 5;
@@ -26,10 +22,6 @@ pub(super) const PANEL_LINES: usize = 5;
 /// Max transfer rows at once; a longer list collapses its tail to `+N more`.
 /// `-1` = the right column's blank top row aligning with the left's branded rule
 pub(super) const MAX_TRANSFER_ROWS: usize = PANEL_LINES - 1;
-
-/// Per-pool sparkline width. Fixed, not derived (a block renders without knowing
-/// its clip width, and a terminal-tracking sparkline breaks run-to-run comparison)
-pub(super) const SPARK_WIDTH: usize = 12;
 
 /// Pad/truncate `out` to exactly [`PANEL_LINES`] lines (viewport never reflows)
 pub(super) fn pad_to_panel(out: &mut String) {

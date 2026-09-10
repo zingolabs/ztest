@@ -15,7 +15,7 @@ use crate::cancel::Cancel;
 
 use super::chainwork::ChainWork;
 use super::probe::{
-    Cadence, Class, ProbeBuilder, ProbeSpec, ProbeStatus, Severity, SyncCtx, Verdict, Violation,
+    Cadence, Class, ProbeBuilder, ProbeSpec, Severity, SyncCtx, Verdict, Violation,
 };
 use super::snapshot::{History, Snapshot, SnapshotBuilder};
 use super::subject::{ProgressView, SyncSubject};
@@ -79,12 +79,21 @@ pub struct SyncOutcome {
     pub unpublished: Vec<String>,
 }
 
-/// One end of the span a run covered ([`Segment`] = last mark - first)
+/// One end of the span a run covered ([`Segment`] = last mark - first).
+///
+/// `at` orders marks; `wall` places them in the TSDB — the report window's only source
 #[derive(Clone, Copy)]
 struct Mark {
     height: u32,
     work: Work,
     at: Instant,
+    wall: std::time::SystemTime,
+}
+
+impl Mark {
+    fn new(height: u32, work: Work, at: Instant) -> Mark {
+        Mark { height, work, at, wall: std::time::SystemTime::now() }
+    }
 }
 
 impl SyncOutcome {
@@ -116,15 +125,12 @@ impl From<crate::RpcError> for SyncOutcome {
     }
 }
 
-/// Sink for live progress + probe events.
+/// Sink for what a run produces as it goes. `origin` = the segment's first reading on the
+/// wall clock, every tick (a sink never has to remember it)
 pub trait SyncReporter: Send {
-    fn on_start(&mut self, _observed: &super::Observed) {}
-    fn on_tick(&mut self, _snap: &Snapshot) {}
+    fn on_tick(&mut self, _snap: &Snapshot, _origin: std::time::SystemTime) {}
     /// Probe evaluated to a non-`Satisfied` verdict worth surfacing
     fn on_probe(&mut self, _name: &str, _verdict: &Verdict) {}
-    /// Standing board: every probe's live state once per tick, vs
-    /// [`on_probe`](Self::on_probe)'s edge events
-    fn on_probes(&mut self, _snap: &Snapshot, _board: &[ProbeStatus]) {}
     fn on_finish(&mut self, _outcome: &SyncOutcome) {}
 }
 
@@ -291,9 +297,6 @@ impl SyncEngine {
     }
 
     pub async fn run(mut self) -> SyncOutcome {
-        let observed = self.subject.observes();
-        self.reporter.on_start(&observed);
-
         if let Err(e) = self.subject.launch().await {
             return self.finish(
                 SyncVerdict::Errored,
@@ -391,11 +394,11 @@ impl SyncEngine {
             };
             last_work = self.read_work(&mut chain_work, progress.as_ref(), last_work).await;
             let snap = Arc::new(builder.build(progress.as_ref(), now, last_work, None));
-            let mark = Mark { height: snap.height(), work: last_work, at: now };
-            origin.get_or_insert(mark);
+            let mark = Mark::new(snap.height(), last_work, now);
+            let first = *origin.get_or_insert(mark);
             head = Some(mark);
             history.push(snap.clone());
-            self.reporter.on_tick(&snap);
+            self.reporter.on_tick(&snap, first.wall);
 
             match self.eval_tick(&snap, now, &mut violations).await {
                 Flow::Continue => {}
@@ -412,12 +415,6 @@ impl SyncEngine {
                 }
             }
 
-            // Built before the reporter call → no borrow of `self.probes` while
-            // `self.reporter` is borrowed mutably
-            let board: Vec<ProbeStatus> =
-                self.probes.iter().map(|p| p.status(now, self.tick)).collect();
-            self.reporter.on_probes(&snap, &board);
-
             // Declared stop height completes ahead of the subject's own predicate (a segment
             // must end where it said it would, whether or not the chain has more)
             let reached_stop = self.stop_height.is_some_and(|h| snap.height() >= h);
@@ -429,7 +426,7 @@ impl SyncEngine {
                     let work = self.read_work(&mut chain_work, p.as_ref(), last_work).await;
                     let at = Instant::now();
                     let final_snap = Arc::new(builder.build(p.as_ref(), at, work, None));
-                    head = Some(Mark { height: final_snap.height(), work, at });
+                    head = Some(Mark::new(final_snap.height(), work, at));
                     if let Some(msg) = self.eval_at_completion(&final_snap, &mut violations).await {
                         error = Some(msg);
                     }
@@ -458,6 +455,7 @@ impl SyncEngine {
                 to: head.height,
                 work: head.work.delta(&origin.work),
                 elapsed_ms: head.at.saturating_duration_since(origin.at).as_millis() as u64,
+                started_ms: super::detached::epoch_millis(origin.wall),
             },
         );
         let target = history.latest().and_then(|s| s.target());
@@ -728,7 +726,7 @@ mod tests {
 
     use super::super::probe::{Verdict, Violation};
     use super::super::snapshot::Snapshot;
-    use super::super::subject::{Phase, SyncSubject};
+    use super::super::subject::SyncSubject;
     use super::super::work::Op;
     use super::*;
 
@@ -749,9 +747,6 @@ mod tests {
         }
         fn pct(&self) -> f32 {
             0.0
-        }
-        fn phase(&self) -> Phase {
-            Phase::Syncing
         }
         fn work(&self) -> Option<Work> {
             let mut w = Work::ZERO;

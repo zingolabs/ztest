@@ -55,17 +55,19 @@ declares a container port named `metrics`, then promotes ztest's pod labels (`co
 `metrics` names no component; which backend publishes which families is the backends' knowledge
 (`backends::metrics_rows`), so a new component joins without editing the metrics module.
 
-### Three readers
 
-| Reader                  | Path                                                    | Load-bearing |
-| ----------------------- | ------------------------------------------------------- | ------------ |
-| `ztest sync watch`      | scrapes the component directly, 1 s, over a portforward | display only |
-| `SyncSubject::progress` | the subject scrapes itself each tick                    | **yes**      |
-| `ztest sync status`     | `record::summarize` — `query_range` against Prometheus  | no           |
+### Two readers
 
-- Live reader is direct because a display refreshed at the scrape interval lags what it describes
-- Record reader runs at report time, reusing the same `Row`/`Reduce` table so a metric cannot mean one
-  thing live and another in the report, and omits its whole section on any failure
+| Reader                      | Path                                                         | Load-bearing |
+| --------------------------- | ------------------------------------------------------------ | ------------ |
+| `SyncSubject::progress`     | the subject scrapes itself each tick                         | **yes**      |
+| `ztest sync status`/`watch` | Prometheus: raw samples for totals, `query_range` for plots  | no           |
+
+- Oracle reads the component direct → no verdict waits on a scrape
+- `watch` = `status` redrawn each scrape interval: one view, one source, one renderer
+- Driver = a target like any component: `ztest_sync_started_timestamp_seconds` (segment origin, the live
+  window) + `ztest_sync_violations_total{probe}`. No state strings — see
+  [design-metrics.md](design-metrics.md)
 
 ## Profiling
 

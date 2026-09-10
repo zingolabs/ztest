@@ -716,7 +716,7 @@ impl TestEnv {
         ready?;
 
         self.inner.is_built.store(true, Ordering::Release);
-        crate::sync::note_setup("topology", None, "ready — starting the engine");
+        tracing::info!(stage = "topology", "ready — starting the engine");
 
         tracing::debug!(
             target: "ztest::build",
@@ -762,7 +762,7 @@ impl TestEnv {
             return Ok(()); // indexer-only env, nothing authoritative to ask
         };
 
-        crate::sync::note_setup("validator", None, "verifying the restored chain");
+        tracing::info!(stage = "validator", "verifying the restored chain");
         let rpc = validator.json_rpc().await?;
         let tip = rpc.tip_height().await.map_err(|e| EnvError::Transient(Box::new(e)))?;
         if tip != snapshot.tip_height {
@@ -796,7 +796,7 @@ impl TestEnv {
         if validators.is_empty() {
             return Ok(());
         }
-        crate::sync::note_setup("validator", None, "waiting for RPC readiness");
+        tracing::info!(stage = "validator", "waiting for RPC readiness");
 
         let timeout = self.ready_timeout;
         let probes = validators.into_iter().map(|(pod_name, handle)| async move {
@@ -828,7 +828,7 @@ impl TestEnv {
         if indexers.is_empty() {
             return Ok(());
         }
-        crate::sync::note_setup("indexer", None, "waiting for gRPC GetLightdInfo");
+        tracing::info!(stage = "indexer", "waiting for gRPC GetLightdInfo");
 
         let timeout = self.ready_timeout;
         let probes = indexers.into_iter().map(|(pod_name, handle)| async move {
@@ -893,7 +893,7 @@ impl TestEnv {
                 .collect()
         };
         if !handles.is_empty() {
-            crate::sync::note_setup("validator", None, "mining the warm-up block");
+            tracing::info!(stage = "validator", "mining the warm-up block");
         }
         for handle in handles {
             handle
@@ -948,7 +948,7 @@ impl TestEnv {
                 reservation = %reservation,
                 "provisioning component"
             );
-            crate::sync::note_setup(spec.category.as_str(), Some(&spec.pod_name), "creating pod");
+            tracing::info!(stage = spec.category.as_str(), pod = %spec.pod_name, "creating pod");
             let state = ComponentState::new(spec, ctx.sentinel.namespace.clone(), handle.clone());
             cluster::create_pod_service(
                 ctx.client,
@@ -961,10 +961,10 @@ impl TestEnv {
             // Own step: resolving a seed mount can fetch an archive through the storage
             // backend (minutes of network, not a local call)
             if !opts.mounts.is_empty() {
-                crate::sync::note_setup(
-                    spec.category.as_str(),
-                    Some(&spec.pod_name),
-                    "resolving mounts and seeds",
+                tracing::info!(
+                    stage = spec.category.as_str(),
+                    pod = %spec.pod_name,
+                    "resolving mounts and seeds"
                 );
             }
             let resolved = mounts::resolve_all(
@@ -984,13 +984,13 @@ impl TestEnv {
             self.inner.components.write().await.insert(*id, state);
         }
 
-        // One event for the gate, not per pod (the waits run concurrently → "which pod are
+        // One line for the gate, not per pod (the waits run concurrently → "which pod are
         // we on" has no answer)
         if let Some((_, spec, _, _)) = items.first() {
-            crate::sync::note_setup(
-                spec.category.as_str(),
-                None,
-                &format!("waiting for {} pod(s) to reach Ready", items.len()),
+            tracing::info!(
+                stage = spec.category.as_str(),
+                "waiting for {} pod(s) to reach Ready",
+                items.len()
             );
         }
 

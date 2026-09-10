@@ -198,12 +198,11 @@ ztest_attr.workspace = true
 # listing can print.
 syn = { workspace = true }
 proc-macro2 = { workspace = true, features = ["span-locations"] }
+metrics = { version = "0.24.6", default-features = false }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 
 [features]
 default = ["librustzcash"]
-# Test-only surface (event encoders, fixtures) for sibling crates' tests. `cfg(test)` does
-# not cross a crate boundary, so the controller tests in `ztest_cli` opt in through this.
-test-util = []
 # In-process librustzcash wallet backend (`backends::librustzcash`,
 # `Wallet::librustzcash`) — ztest's only wallet, on by default. Pure-Rust
 # `zcash_client_backend` + `zcash_client_sqlite`, syncing over the indexer's

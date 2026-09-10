@@ -12,34 +12,24 @@ pub mod zainod;
 pub mod zcashd;
 pub mod zebra;
 
-/// Sole `ztest.io/component` → backend table.
-///
-/// Exists because [`PodExporter`](crate::metrics::PodExporter) resolves a scrapee by its
-/// pod label at runtime, where no type is available — the one place a label must be
-/// mapped by hand. Every field is read straight off the backend's own
-/// [`MetricLayout`](crate::metrics::MetricLayout) / [`Observe`](crate::sync::Observe)
-/// impl, so a row or family added there needs no edit here
+/// Bundled backends' metric catalogues, for a reader with no pod to ask (the report reads
+/// after the run namespace is gone). Every field comes off the backend's own
+/// [`MetricLayout`](crate::metrics::MetricLayout) / [`Observe`](crate::sync::Observe) impl
 struct MetricsBackend {
     label: &'static str,
     rows: &'static [crate::metrics::Row],
     heights: Option<crate::sync::Heights>,
-    observe: Option<fn(&crate::metrics::Exposition) -> Option<crate::sync::Observation>>,
 }
 
 impl MetricsBackend {
-    /// Component whose sync is observable — rows and reader both off its impls
+    /// Component whose sync is observable — rows + the heights that measure it
     const fn observed<T: crate::sync::Observe>(label: &'static str) -> Self {
-        Self {
-            label,
-            rows: <T as crate::metrics::MetricLayout>::ROWS,
-            heights: Some(T::HEIGHTS),
-            observe: Some(T::observe),
-        }
+        Self { label, rows: <T as crate::metrics::MetricLayout>::ROWS, heights: Some(T::HEIGHTS) }
     }
 
     /// Publishes rows but no sync progress (nothing to watch a chain build)
     const fn rows_only<T: crate::metrics::MetricLayout>(label: &'static str) -> Self {
-        Self { label, rows: T::ROWS, heights: None, observe: None }
+        Self { label, rows: T::ROWS, heights: None }
     }
 }
 
@@ -47,16 +37,6 @@ const METRICS_BACKENDS: &[MetricsBackend] = &[
     MetricsBackend::observed::<zainod::ZainoIndexer>("zainod"),
     MetricsBackend::rows_only::<zebra::ZebraValidator>("zebrad"),
 ];
-
-fn backend_of(component_label: &str) -> Option<&'static MetricsBackend> {
-    METRICS_BACKENDS.iter().find(|b| b.label == component_label)
-}
-
-/// Unknown label → no rows (third-party backend still scrapes into Prometheus;
-/// ztest's readers just have nothing to show)
-pub fn metrics_rows(component_label: &str) -> &'static [crate::metrics::Row] {
-    backend_of(component_label).map_or(&[], |b| b.rows)
-}
 
 /// Every bundled backend's rows, for a reader with no pod to ask (run namespace
 /// gone by report time)
@@ -74,14 +54,6 @@ pub fn metrics_heights() -> impl Iterator<Item = crate::sync::Heights> {
 /// per-component view leads with the thing under test
 pub fn metrics_component_labels() -> impl Iterator<Item = &'static str> {
     METRICS_BACKENDS.iter().map(|b| b.label)
-}
-
-/// `None` for a backend that implements no [`Observe`](crate::sync::Observe).
-pub fn observe(
-    component_label: &str,
-    exposition: &crate::metrics::Exposition,
-) -> Option<crate::sync::Observation> {
-    (backend_of(component_label)?.observe?)(exposition)
 }
 
 /// Group set a component needs to *read* what it mounts.

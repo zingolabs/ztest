@@ -60,7 +60,6 @@ pub(crate) mod paths;
 mod pipeline;
 mod plan;
 mod pod_status;
-mod podmetrics;
 mod portforward;
 pub mod ports;
 pub mod proc;

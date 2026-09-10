@@ -11,29 +11,40 @@ legal on it, and how a total is extracted so that it is exact.
 A `zaino_index_construction` run over mainnet reported, on one screen:
 
 ```
-main 761..3,433,142 (481,929,395 ops)          ← live plane, raw counter delta
-tsp-out 35.1M · tsp-in 30.5M   … 65.6M total   ← durable plane, ∫ of a rate
-blocks                          … 1.70M total   ← durable plane, ∫ of a derivative
+main 761..3,433,142 (481,929,395 ops)          ← driver, raw counter delta
+tsp-out 35.1M · tsp-in 30.5M   … 65.6M total   ← report, off Prometheus
+blocks                          … 1.70M total   ← report, off Prometheus
 ```
 
-The run indexed 3,432,381 blocks and the report said 1.70M. Two planes, the same counters, answers
+The run indexed 3,432,381 blocks and the report said 1.70M. Two readers, the same counters, answers
 differing by 2.6×, and nothing in the system compared them.
 
-Three independent causes, all of them type-level:
+The numbers came from the **window**, not the arithmetic. The report anchored its span to the driver's
+exit and opened `elapsed` back from there — but the driver outlives its segment by every at-completion
+probe (half an hour, here). The window slid late: it read thirty dead minutes after the sync and dropped
+its first thirty, which on mainnet is the fast early chain — 1.7M blocks, 154M transparent outputs.
+Orchard came out nearly right only because it activated just before the cut. Re-read over the right
+window, the TSDB held every op: zero scrape gaps, zero resets.
+
+Hence the rule above the rest: **the window is the segment's own span, off one stamp** (`Mark`), live and
+finished alike. No reconstruction from other clocks, no fallback to the pod's lifetime.
+
+The same investigation found three latent defects — type-level, and each able to produce the same symptom
+on a less healthy run:
 
 1. **A windowed rate cannot be integrated back into a total.** `rate()` is a *within-window* slope: it
    requires ≥2 samples inside the range and yields nothing otherwise (silently — upstream's
-   `RangeTooShortWarning` is still a TODO). Any counter increment that spans a scrape gap wider than
-   the range window therefore reaches **no** evaluation point and is deleted from every derived
-   series. Integrating that plot inherits every hole.
-2. **A gauge is not a counter.** `blocks` was `deriv()` over a height gauge, re-integrated. Net
-   progress on a monotone gauge is `last − first` — exact, integer, one subtraction. Cumulative work
-   cannot be derived from a gauge at all; if you want gross blocks processed (counting re-syncs after
-   a reorg) the producer must publish a counter.
-3. **Nothing in `Row` said which of the two a family was.** `Reduce::Sum`/`Max` was doing double duty
-   as "fold across label sets" *and* "counter vs gauge", and `Unit::PerSec` was doing duty as a
-   display format *and* an instruction to differentiate. The same family appeared twice with the same
-   `(family, reduce)` and different `Unit`, meaning a level in one row and a slope in the other.
+   `RangeTooShortWarning` is still a TODO). A counter increment spanning a scrape gap wider than the
+   range window reaches **no** evaluation point and is deleted from every derived series; integrating
+   the plot inherits every hole. Measured on a real Prometheus: one 4-minute gap cost 0.9% of the ops
+   and 3.2% of the blocks.
+2. **A gauge is not a counter.** `blocks` was `deriv()` over a height gauge, re-integrated. Forward
+   progress on a height is the sum of its positive deltas — exact and integer. Cumulative *work* cannot
+   be derived from a gauge at all: blocks re-scanned after a reorg need a producer-side counter.
+3. **Nothing in `Row` said which of the two a family was.** `Reduce::Sum`/`Max` did double duty as
+   "fold across label sets" *and* "counter vs gauge", and `Unit::PerSec` as a display format *and* an
+   instruction to differentiate. One family appeared twice with the same `(family, reduce)` and a
+   different `Unit` — a level in one row, a slope in the other.
 
 ## Axes
 
@@ -84,16 +95,16 @@ so a single reorg becomes a spike of millions. `Hist::rate()` does not exist. Th
 whole enforcement mechanism.
 
 Declarations live in `src/backends/<component>.rs`, beside the image and pod spec. The metrics module
-names no component; `backends::metrics_rows` maps a pod label to its rows.
+names no component; `backends::metrics_components` hands a reader every bundled catalogue.
 
 ## Readings
 
 | Reading | Shape | Plot | Total |
 | --- | --- | --- | --- |
 | `Rate` | counter | `sum(rate(f[w]))` | exact count, raw samples |
-| `Slope` | gauge | client-side positive deltas | net progress, `last − first` |
+| `Slope` | gauge | `clamp_min(deriv(max(f)[w:5s]), 0)` | forward progress, Σ positive deltas |
 | `Level` | gauge | value as published | — |
-| `Progress` | gauge | — | net change, `last − first` |
+| `Progress` | gauge | — | forward progress, Σ positive deltas |
 | `Mean` | histogram | `Δsum/Δcount` | — |
 | `Quantile(φ)` | histogram | `histogram_quantile` over rated buckets | — |
 
@@ -168,9 +179,28 @@ survive the pod. Worth knowing; not worth depending on.)
 
 ## Both planes read one catalogue
 
-`Reading` is a closed set, so `promql(reading)` and `eval(reading, &Exposition)` are total functions
-over the same six arms — a seventh variant fails to compile in both files at once. The live plane
-differences per label set before folding, matching the durable plane's order.
+- **Oracle** — the engine reads a component's exposition directly (`Exposition::total`/`level`/`tally`),
+  off the same shape witnesses; no verdict waits on a scrape
+- **Record** — `status` and `watch` read the TSDB (`promql_plot`/`promql_raw` over the same `Reading`)
+- `Reading` is closed, so both are a total match over its arms: a new variant fails to compile in both
+- Tested: every reading a backend declares resolves against a live exposition, and each unit derives from
+  its wire dimension
 
-Parity is tested per variant against a synthetic exposition and a synthetic TSDB range. The planes
-disagreeing is a reportable finding, not a rounding difference.
+## The driver is a target
+
+A detached sync's driver pod serves `/metrics` like any component (a `metrics` port + the component-name
+label = what Prometheus SD keeps). It publishes only what the engine alone knows:
+
+| Family                                 | Shape   | Reading                                    |
+| -------------------------------------- | ------- | ------------------------------------------ |
+| `ztest_sync_started_timestamp_seconds` | gauge   | segment origin → a live report's window    |
+| `ztest_sync_violations_total{probe}`   | counter | violations so far, per probe               |
+
+Work and heights stay with the subject's exporter — a second copy from the driver would double every panel.
+A live window runs from that origin to its newest sample, both on the TSDB's clock; a finished one is the
+recorded segment's span. Same `Mark` stamp either way, so the live and finished reports window alike.
+
+## No state strings
+
+Phases, stage words, probe standings: none of them is a quantity, and none is published or rendered. A
+report shows counters, gauges and a verdict — the verdict comes from the mirrored record, never a metric.

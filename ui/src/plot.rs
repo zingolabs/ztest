@@ -1,7 +1,7 @@
 //! Terminal time-series plots (`ztest sync status`, live dashboard).
 //!
 //! - Series share one caller-fixed axis → a column means the same instant in every
-//!   plot on screen ([`Timeline`](ztest::api::Timeline) supplies the bucketing)
+//!   plot on screen (the TSDB supplies the samples)
 //! - All modes rasterise 2 sub-cols × 4 sub-rows; cell = `table[left*5 + right]`
 //!   (btop `Draw::Graph::_create`; tiers differ in data only, no per-cell branch)
 //! - Colour = channel identity, never magnitude (`ops/s` has no ceiling to gradient)

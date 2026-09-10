@@ -5,9 +5,8 @@
 //!   mean height / work / per-block cost
 //! - [`Window`] = smoothing, stated once per observer rather than per column, over the
 //!   crate-wide [`rate`](crate::rate) estimator
-//! - Not a [`ProgressView`](super::ProgressView): an outside scrape cannot know
-//!   [`Phase`](super::Phase), and an `Unknown` variant no subject reports would face
-//!   every probe matching on one. The shared part is [`Work`], reused whole
+//! - Not a [`ProgressView`](super::ProgressView): an outside scrape answers fewer questions
+//!   than a subject → only [`Work`] is shared, reused whole
 
 use super::work::{Op, Rate, Work};
 use crate::metrics::{Counter, Exposition, Gauge, Phi, Tally, windowed_quantile};

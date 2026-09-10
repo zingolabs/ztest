@@ -6,8 +6,8 @@
 //! - [`query`] = durable plane, ztest's Prometheus
 //!   ([`observability`](crate::resource::impls::observability)) discovers off pod labels
 //!   + that port and keeps 30d of history; read back long after the pods are gone
-//! - [`live`] = now plane, scrapes an [`Exporter`] direct at ~1 s (a display on the
-//!   scrape interval lags what it describes)
+//! - [`live`] = the [`Exporter`] contract — the engine's oracle reads a component direct, so
+//!   no verdict waits on a scrape
 //! - [`Row`] is shared by both on purpose: it is what stops a metric meaning one number
 //!   live and another in the report
 //! - Knows nothing of syncs/ticks/probes/verdicts — consumers call in
@@ -22,10 +22,10 @@ use prometheus_parse::Value as Scraped;
 pub mod live;
 pub mod query;
 
-pub use self::live::{Exporter, LIVE_PERIOD, PodExporter, Poller, Sample};
+pub use self::live::Exporter;
 
 /// Container-port name serving `/metrics` = the entire contract. Prometheus SD
-/// keeps a pod by it, [`PodExporter`] discovers by it, every `pod_spec` declares it
+/// keeps a pod by it, every `pod_spec` declares it
 pub const PORT_NAME: &str = "metrics";
 
 /// Cadence the collect plane samples at. Stated once — the Prometheus ConfigMap is rendered
@@ -229,11 +229,6 @@ impl Reading {
     /// Carries a whole-run count (a level and a latency do not)
     pub const fn totalled(self) -> bool {
         matches!(self, Reading::Rate(_) | Reading::Slope(_) | Reading::Progress(_))
-    }
-
-    /// Plotted over time (`Progress` is one number, and a latency plots per stage, not stacked)
-    pub const fn plotted(self) -> bool {
-        matches!(self, Reading::Rate(_) | Reading::Slope(_) | Reading::Level(_))
     }
 
     /// Unit of the *result*, derived — a declared one drifts from the wire
@@ -722,17 +717,15 @@ zaino_grpc_request_duration_seconds_count 17
     /// A level has no whole-run count and a latency has no plot; asking either for one is
     /// how a rate came to be integrated into a total in the first place
     #[test]
-    fn only_a_flow_carries_a_total_and_only_a_level_or_flow_is_plotted() {
+    fn only_a_flow_carries_a_total() {
         let c = counter("c_total", Dimension::Count);
         let g = gauge("g", Dimension::Count);
         let h = hist("h_seconds", Dimension::Seconds);
 
-        assert!(c.rate().totalled() && c.rate().plotted());
-        assert!(g.slope().totalled() && g.slope().plotted());
-        assert!(g.progress().totalled() && !g.progress().plotted());
-        assert!(!g.level().totalled() && g.level().plotted());
-        assert!(!h.mean().totalled() && !h.mean().plotted());
-        assert!(!h.p(Phi::P99).totalled());
+        assert!(c.rate().totalled());
+        assert!(g.slope().totalled() && g.progress().totalled());
+        assert!(!g.level().totalled());
+        assert!(!h.mean().totalled() && !h.p(Phi::P99).totalled());
     }
 
     /// Unpublished family reads absent, never as a zero a probe accepts as an observation

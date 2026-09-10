@@ -6,23 +6,14 @@
 
 mod chainwork;
 mod detached;
-mod event;
 mod nemesis;
 mod observe;
 mod probe;
 mod runner;
-mod series;
 mod snapshot;
 mod subject;
 mod tree;
 mod work;
-
-pub use detached::note_setup;
-pub use event::{SyncEvent, decode as decode_event};
-// Encoding is the driver's job, the controller only decodes; decode tests need both halves
-// (`test-util`, not `cfg(test)`: the controller's tests live in the `ztest_cli` crate)
-#[cfg(any(test, feature = "test-util"))]
-pub use event::{Tick as SyncTick, encode as encode_event};
 
 pub use detached::{FINISHED_TTL, LAUNCH_FIELD_MANAGER, REPORT_FIELD_MANAGER, birth_ttl, held_ttl};
 pub use detached::{
@@ -48,9 +39,8 @@ pub use probe::{
 pub use runner::{
     DEFAULT_TICK, NullReporter, StderrReporter, SyncEngine, SyncOutcome, SyncReporter, SyncVerdict,
 };
-pub use series::{BLOCKS, CAPACITY as SERIES_CAPACITY, Cell, Timeline, Track, plot_channels};
 pub use snapshot::{History, Snapshot};
-pub use subject::{Phase, ProgressView, SyncSubject};
+pub use subject::{ProgressView, SyncSubject};
 pub use tree::{TreeRoot, TreeRootError, TreeRoots};
 // Frontier parser needs `sapling_crypto`/`orchard` hash types (librustzcash-gated);
 // `TreeRoots` above is plain data, available to everyone
@@ -60,8 +50,9 @@ pub use work::{Channel, Mismatch, Op, OpSet, Rate, Segment, Work};
 
 // Test-author facade; subject-agnostic, so it needs no backend feature
 mod facade;
-// Event-publishing reporter reachable only through the facade's run path (where a detached
-// driver is launched)
-mod reporter;
+// Driver-side exporter, installed on the facade's detached run path
+mod export;
+
+pub use export::family as driver_family;
 
 pub use facade::{SyncManifest, SyncRunner};

@@ -33,12 +33,9 @@ pub use self::layout::{SPINNER_STEP_MS, display_width, pad, truncate, truncate_w
 pub use self::plan::render as render_plan;
 pub use self::render::{
     render, render_cancel_panel, render_live_panel, render_preflight_panel,
-    render_sync_build_panel, render_sync_load, render_sync_watch_panel, render_sync_work,
-    render_transfer_line, render_transfers,
+    render_sync_build_panel, render_transfer_line, render_transfers,
 };
-pub use self::report::{
-    ComponentResources, ReportView, render_sync_report, render_sync_verdict, status_mark,
-};
+pub use self::report::{ComponentResources, ReportView, render_sync_report, status_mark};
 pub use self::runview::ConsoleView;
 pub use self::status::render_status;
 pub use self::theme::Theme;
@@ -274,84 +271,5 @@ impl TransferState {
 
     pub fn progress(&self) -> &TransferProgress {
         &self.progress
-    }
-}
-
-// ─────────────────────────── sync watch (both columns) ────────────────
-
-/// `ztest sync watch` panel model: the driver's publications folded into one view.
-///
-/// - Not the driver's wire events (a 48h sync outlives the build that launched it)
-/// - `metrics_note` = why `vitals` is empty (blank rows can't separate warm-up
-///   from a broken subject)
-#[derive(Debug, Clone, Default)]
-pub struct SyncWatchState {
-    pub profile: String,
-    pub sync_id: String,
-    pub context: String,
-    pub pod_phase: String,
-    pub setup: Option<SetupStep>,
-    /// From the subject's own `Observing` — no figure shown without naming what produced it
-    pub subject: Option<String>,
-    pub vitals: Option<SyncVitals>,
-    pub metrics_note: Option<String>,
-    pub probes: Vec<ProbeRow>,
-    pub violations: usize,
-    pub timeline: Option<ztest::api::Timeline>,
-    /// Sampled on [`SAMPLE_PERIOD`](ztest::api::SAMPLE_PERIOD), not the 1s
-    /// scrape — empty until the first sample, and stays empty on a cluster with no
-    /// metrics API (`pods_note` says which)
-    pub pods: Vec<ztest::api::PodLoad>,
-    pub pods_note: Option<String>,
-}
-
-/// `received_at` session-elapsed → renderer ages by subtraction, no clock read
-#[derive(Debug, Clone)]
-pub struct SetupStep {
-    pub subject: String,
-    pub detail: String,
-    pub received_at: std::time::Duration,
-}
-
-/// Live sync vitals.
-///
-/// - All but `phase`/`reorg_depth` (engine-only) come from one 1s watcher scrape
-///   → no row lags another by a tick
-/// - `phase` = chain-walk progress, never a run's standing; `None` until the first tick
-/// - `None` rate = unmeasured, not idle; renders `—` not `0`
-/// - `pace` blocks/sec + its ETA, together so the countdown can never outlive the rate
-///   it was projected from
-/// - `pool_rates` in [`Channel`](ztest::api::Channel) order = graph stacking order
-/// - `received_at` session-elapsed → stale rates blank by subtraction
-#[derive(Debug, Clone)]
-pub struct SyncVitals {
-    pub height: u32,
-    pub target: Option<u32>,
-    pub pct: f32,
-    pub phase: Option<ztest::api::Phase>,
-    /// Subject's own stage word (`"scanning"`, `"indexing"`) — harness owns no such vocabulary
-    pub phase_detail: Option<String>,
-    pub reorg_depth: u32,
-    pub pace: Option<ztest::api::Pace>,
-    pub tx_rate: Option<f64>,
-    pub work_rate: Option<f64>,
-    pub pool_rates: Vec<(ztest::api::Channel, Option<f64>)>,
-    pub cost: ztest::api::CostMs,
-    pub received_at: std::time::Duration,
-}
-
-/// `since_satisfied` + `window` are `eventually`-only; together = the countdown
-/// that shows a stall coming
-#[derive(Debug, Clone)]
-pub struct ProbeRow {
-    pub name: String,
-    pub state: ztest::api::ProbeState,
-    pub since_satisfied: Option<std::time::Duration>,
-    pub window: Option<std::time::Duration>,
-}
-
-impl SyncWatchState {
-    pub fn probe_tally(&self) -> (usize, usize) {
-        (self.probes.iter().filter(|r| r.state.is_ok()).count(), self.probes.len())
     }
 }

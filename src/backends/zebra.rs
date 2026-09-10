@@ -194,10 +194,6 @@ impl crate::metrics::Exporter for ZebraValidator {
     async fn endpoint(&self) -> Result<Endpoint, EnvError> {
         self.plumbing.endpoint(crate::metrics::PORT_NAME).await
     }
-
-    fn rows(&self) -> &'static [crate::metrics::Row] {
-        &ROWS
-    }
 }
 
 impl ZebraValidator {

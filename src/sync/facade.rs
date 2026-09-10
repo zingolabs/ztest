@@ -13,7 +13,6 @@ use crate::error::EnvError;
 
 use super::nemesis::{Nemesis, NemesisBuilder};
 use super::probe::{Cadence, Class, ProbeBuilder, ProbeSpec, Severity, SyncCtx};
-use super::reporter::EventReporter;
 use super::runner::{SyncEngine, SyncOutcome, SyncVerdict};
 use super::subject::SyncSubject;
 use super::work::OpSet;
@@ -215,7 +214,6 @@ async fn drive(
 ) -> SyncOutcome {
     let detached = super::active_sync_id();
     let profile = std::env::var(super::SYNC_PROFILE_ENV).unwrap_or_default();
-    let probe_count = probes.len();
     let tick = opts.tick;
     let mut engine = SyncEngine::new(subject)
         .with_probes(probes)
@@ -228,15 +226,13 @@ async fn drive(
     if let Some(h) = opts.stop_height {
         engine = engine.with_stop_height(h);
     }
-    // Detached: driver log = only channel to a watching terminal. Local runs keep
-    // the silent reporter (no watcher, and stdout is the test's own)
-    if let Some(sync_id) = &detached {
-        engine = engine.with_reporter(Box::new(EventReporter::new(
-            sync_id,
-            &profile,
-            tick,
-            probe_count,
-        )));
+    // Detached: a Prometheus target, read like any component. Local runs keep the silent
+    // reporter (nothing scrapes a `cargo test`)
+    if detached.is_some() {
+        if let Err(e) = super::export::install() {
+            return errored(format!("driver metrics exporter: {e}"));
+        }
+        engine = engine.with_reporter(Box::new(super::export::MetricsReporter));
     }
     // `ztest sync stop` (and SIGTERM on node loss) must checkpoint, not kill →
     // route the in-pod stop-watch into engine cancellation. No namespace arg: it

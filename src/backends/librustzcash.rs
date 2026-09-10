@@ -53,7 +53,7 @@ use crate::handles::HandleInner;
 use crate::handles::wallet::{
     AccountId, AccountSpec, BoxError, Pool, PoolBalances, WalletBackend, WalletConfig,
 };
-use crate::sync::{Phase, ProgressView, SyncSubject, TreeRoots};
+use crate::sync::{ProgressView, SyncSubject, TreeRoots};
 use crate::topology::ActivationHeights;
 
 const LABEL: &str = "librustzcash";
@@ -575,7 +575,6 @@ pub struct LrzProgress {
     height: u32,
     target: Option<u32>,
     pct: f32,
-    phase: Phase,
     balances: PoolBalances,
     tree_roots: TreeRoots,
 }
@@ -588,7 +587,6 @@ impl LrzProgress {
                 height: 0,
                 target: None,
                 pct: 0.0,
-                phase: Phase::Starting,
                 balances,
                 // Reported, not unreported: a wallet with no tree *yet*. A probe must
                 // read "no root at this height", not "nobody maintains trees"
@@ -602,7 +600,6 @@ impl LrzProgress {
             height: u32::from(s.fully_scanned_height()),
             target: Some(u32::from(s.chain_tip_height())),
             pct,
-            phase: if s.is_synced() { Phase::Done } else { Phase::Syncing },
             balances,
             // Filled by `progress`, which holds the db handle the trees live behind
             tree_roots: TreeRoots::reported(),
@@ -624,12 +621,6 @@ impl ProgressView for LrzProgress {
     }
     fn pct(&self) -> f32 {
         self.pct
-    }
-    fn phase(&self) -> Phase {
-        self.phase
-    }
-    fn detail(&self) -> Option<&'static str> {
-        (self.phase == Phase::Syncing).then_some("scanning")
     }
     // `work()` left at the trait default (`None`) → harness derives it from `height`
     // via `ChainWork`. `WalletSummary` reports a height + ratio, not per-pool counters

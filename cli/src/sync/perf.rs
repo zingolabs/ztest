@@ -108,7 +108,7 @@ async fn span_for(
     let client = ztest::api::cluster::client().await.context("kube client")?;
     let started = run_origin(&client, id).await?;
     let ended = match ztest::sync::read_report(&client, id).await.ok().flatten() {
-        Some(report) => report.ended().unwrap_or_else(SystemTime::now),
+        Some(report) => report.ended(),
         None => SystemTime::now(),
     };
     Ok(match requested {
@@ -117,34 +117,19 @@ async fn span_for(
     })
 }
 
-/// Run origin, durable first. Driver pod = fallback for a sync started before launch
-/// records existed (its window dies with the pod, as it always did)
+/// Run origin, off the launch record
 async fn run_origin(client: &kube::Client, id: &str) -> Result<SystemTime> {
-    if let Some(launch) = ztest::sync::read_launch(client, id).await? {
-        return Ok(launch.started());
-    }
-    let driver = ztest::sync::find_driver(client, id).await?;
-    let created = driver
-        .metadata
-        .creation_timestamp
-        .with_context(|| format!("sync {id}: no launch record, and its pod has no timestamp"))?;
-    Ok(created.0.into())
+    let launch = ztest::sync::read_launch(client, id).await?;
+    Ok(launch.with_context(|| format!("sync {id}: no launch record"))?.started())
 }
 
-/// Pyroscope tenant a sync's profiles were pushed under.
-///
-/// - Launch record = the writer's own value, recorded where it was computed
-/// - Namespace label = legacy fallback, dead once the run namespace is reclaimed
-/// - Refusal names which of the two applies, so the reader knows whether to re-run
+/// Pyroscope tenant a sync's profiles were pushed under, off the launch record
 async fn tenant_for(client: &kube::Client, id: &str) -> Result<String> {
-    match ztest::sync::read_launch(client, id).await? {
-        Some(launch) => launch.profiling.map(|p| p.tenant).with_context(|| {
-            format!("sync {id} ran unprofiled; start it with `--profile` to collect one")
-        }),
-        None => ztest::api::profiling::tenant_for_sync(client, id).await.with_context(|| {
-            format!("sync {id}: no launch record, and its namespace is gone — tenant unrecoverable")
-        }),
-    }
+    let launch = ztest::sync::read_launch(client, id).await?;
+    let launch = launch.with_context(|| format!("sync {id}: no launch record"))?;
+    launch.profiling.map(|p| p.tenant).with_context(|| {
+        format!("sync {id} ran unprofiled; start it with `--profile` to collect one")
+    })
 }
 
 /// Query one component's merged profile over `window`, write to `out`
@@ -271,8 +256,11 @@ async fn collector_metrics(client: &kube::Client, id: &str) -> Option<Exposition
 ///   process count) means no stack can be walked, so nothing downstream can exist
 async fn collector_pipeline(client: &kube::Client, id: &str) -> Option<String> {
     let metrics = collector_metrics(client, id).await?;
-    let counted = |c| metrics.counter_total(c).unwrap_or_default();
-    let held = |g| metrics.height(g).unwrap_or_default();
+    // Unpublished reads `—`, never `0` (a zero here is a stage that ran and did nothing)
+    let counted =
+        |c| metrics.counter_total(c).map_or_else(|| "—".to_string(), ztest::api::thousands);
+    let held =
+        |g| metrics.height(g).map_or_else(|| "—".to_string(), |n| ztest::api::thousands(n.into()));
     Some(format!(
         "collector: {} targets · {} processes seen · {} executables unwound · \
          {} samples forwarded · {} events dropped",
@@ -725,6 +713,7 @@ mod tests {
             to,
             work,
             elapsed_ms: secs * 1000,
+            started_ms: 0,
         }
     }
 
@@ -792,6 +781,7 @@ mod tests {
             to: 10,
             work: ztest::sync::Work::ZERO,
             elapsed_ms: 1000,
+            started_ms: 0,
         };
         let out = verdict(&bare, &bare.clone(), "sync-head", "sync-base", &plain_theme());
         assert!(out.contains('—'), "{out}");

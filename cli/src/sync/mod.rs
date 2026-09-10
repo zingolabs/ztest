@@ -1042,6 +1042,10 @@ fn build_driver_pod(
 
     let driver_container = json!({
         "name": DRIVER_CONTAINER,
+        "ports": [{
+            "name": ztest::api::metrics::PORT_NAME,
+            "containerPort": ztest::ports::SYNC_DRIVER_METRICS,
+        }],
         "image": compiled.runner_image_ref,
         "imagePullPolicy": "IfNotPresent",
         "command": [target.binary_path, "--exact", target.test_name, "--nocapture"],
@@ -1085,6 +1089,8 @@ fn build_driver_pod(
             "labels": {
                 KIND_LABEL_KEY: KIND_LABEL_VALUE,
                 SYNC_ID_KEY: sync_id,
+                // + a `metrics` port = what Prometheus SD keeps (the driver is a target)
+                "ztest.io/component-name": driver_pod_for(sync_id),
                 ztest::qos::LABEL_USER: ztest::api::naming::current_user(),
                 // Ledger attribution. Absent → the driver's footprint counts as
                 // foreign load, subtracted twice, invisible to `assert_invariant`
@@ -1261,64 +1267,37 @@ async fn list(all_users: bool, json_out: bool) -> Result<()> {
 /// One view, live or finished: the header's source differs, every panel below it does
 /// not (Prometheus scrapes a running sync exactly as it scraped a finished one)
 async fn status(id: &str, json_out: bool) -> Result<()> {
-    // Durable report first (survives the pod), else the live tick stream
     let client = client().await?;
-    let ns = namespace_for(id);
-    if let Some(report) = read_report(&client, id).await? {
-        if json_out {
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            return Ok(());
-        }
-        let view = build_report_view(&client, id, &ns, mirror_header(&report)).await;
-        print!("{}", ztest_ui::render_sync_report(&view, &Theme::detect(), render::width()));
-        return Ok(());
-    }
-
-    let pod = find_driver(&client, id).await?;
-    let status = SyncStatus::observe(pod_phase(&pod).as_deref(), None);
-    // No report yet, but a running engine publishes state to the driver log → recover the
-    // newest tick rather than reporting the pod phase alone
-    let live = watch::latest_progress(&watch::DriverPod::new(&client, id)).await;
-
     if json_out {
-        let vitals = live.as_ref().and_then(|s| s.vitals.as_ref());
-        let progress = vitals.map(|v| {
-            let (ok, total) = live.as_ref().expect("vitals imply state").probe_tally();
-            json!({
-                "height": v.height,
-                "target": v.target,
-                "pct": v.pct,
-                "phase": v.phase,
-                "phase_detail": v.phase_detail,
-                "reorg_depth": v.reorg_depth,
-                "blocks_per_sec": v.pace.map(|p| p.per_sec),
-                "eta_secs": v.pace.and_then(|p| p.eta).map(|d| d.as_secs()),
-                "probes_ok": ok,
-                "probes_total": total,
-            })
-        });
-        let status = status.to_string();
-        println!("{}", json!({ "id": id, "status": status, "progress": progress, "report": null }));
+        let json = match read_report(&client, id).await? {
+            Some(report) => serde_json::to_value(&report)?,
+            None => {
+                let (view, status) = report_view(&client, id).await?;
+                json!({ "id": id, "status": status.to_string(), "height": view.height, "report": null })
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
     }
-
-    let view = build_report_view(&client, id, &ns, live_header(id, status, live.as_ref())).await;
+    let (view, _) = report_view(&client, id).await?;
     print!("{}", ztest_ui::render_sync_report(&view, &Theme::detect(), render::width()));
     Ok(())
 }
 
-/// How long a violating probe has gone unsatisfied, against the deadline it has to
-/// recover in. An `eventually` probe's countdown is what shows a stall coming, so it
-/// stands where a finished run puts the violation's detail
-fn unsatisfied_for(p: &ztest_ui::ProbeRow) -> String {
-    match (p.since_satisfied, p.window) {
-        (Some(since), Some(window)) => {
-            format!("unsatisfied {} of {}", format_elapsed(since), format_elapsed(window))
-        }
-        (Some(since), None) => format!("unsatisfied {}", format_elapsed(since)),
-        (None, Some(window)) => format!("never satisfied, {} allowed", format_elapsed(window)),
-        (None, None) => "violating".to_string(),
+/// The run as it stands, off the record it has: its mirror once finished, the driver's own
+/// series until then
+pub(super) async fn report_view(client: &Client, id: &str) -> Result<(ReportView, SyncStatus)> {
+    let ns = namespace_for(id);
+    if let Some(report) = read_report(client, id).await? {
+        let status = SyncStatus::Finished(report.verdict);
+        return Ok((build_report_view(client, &ns, mirror_header(&report)).await, status));
     }
+    let pod = find_driver(client, id).await?;
+    let status = SyncStatus::observe(pod_phase(&pod).as_deref(), None);
+    let profile =
+        driver_profile(&pod).with_context(|| format!("sync {id}: driver pod names no profile"))?;
+    let header = live_header(client, id, &profile, status).await?;
+    Ok((build_report_view(client, &ns, header).await, status))
 }
 
 /// Blocks the last grid sample may honestly trail the record by: one step + the rate
@@ -1351,11 +1330,7 @@ fn mirror_header(r: &SyncReportMirror) -> ReportView {
         // a shortfall that is scrape cadence rather than the run
         height: r.segment.as_ref().map(|s| s.to).zip(r.target),
         unpublished: r.unpublished.clone(),
-        elapsed: r
-            .segment
-            .as_ref()
-            .map(|s| Duration::from_millis(s.elapsed_ms))
-            .unwrap_or_default(),
+        span: r.segment.as_ref().map(ztest::sync::Segment::span),
         violations: r
             .violations
             .iter()
@@ -1372,55 +1347,36 @@ fn mirror_header(r: &SyncReportMirror) -> ReportView {
     }
 }
 
-/// Header of a run with no mirror yet.
+/// Header of a run with no mirror yet, off the driver's own series.
 ///
-/// - `status` comes from the driver pod, never from the tick stream: a subject at tip is a
-///   chain fact, and only a mirrored report ends a run
-/// - Height/eta seed the header from the tick stream, which leads the TSDB by a scrape;
-///   [`build_report_view`] overrides them only where Prometheus has an answer
-/// - Violating probes stand in for the mirror's violations — same question, asked of a
-///   run that has not finished answering it
-fn live_header(
+/// - `status` from the driver pod: only a mirrored report ends a run
+/// - Window = segment origin → that series' newest sample, both on the TSDB's clock (same
+///   `Mark` stamp a finished segment records)
+/// - Violations = per-probe counts; detail text rides the driver log until the mirror lands
+async fn live_header(
+    client: &Client,
     id: &str,
+    profile: &str,
     status: SyncStatus,
-    live: Option<&ztest_ui::SyncWatchState>,
-) -> ReportView {
-    let Some(state) = live else {
-        return ReportView {
-            sync_id: id.to_string(),
-            status,
-            note: Some("no tick published yet".into()),
-            ..ReportView::default()
-        };
-    };
-    let vitals = state.vitals.as_ref();
-    ReportView {
-        sync_id: id.to_string(),
-        profile: state.profile.clone(),
-        status,
-        phase: vitals.and_then(|v| v.phase),
-        phase_detail: vitals.and_then(|v| v.phase_detail.clone()),
-        height: vitals.and_then(|v| Some((v.height, v.target?))),
-        eta: vitals.and_then(|v| v.pace).and_then(|p| p.eta),
-        probes: Some(state.probe_tally()),
-        violations: state
-            .probes
-            .iter()
-            .filter(|p| matches!(p.state, ztest::sync::ProbeState::Violating))
-            .map(|p| (p.name.clone(), unsatisfied_for(p)))
-            .collect(),
-        note: state.metrics_note.clone(),
-        ..ReportView::default()
-    }
-}
+) -> Result<ReportView> {
+    use ztest::api::metrics::{level_now, totals_now};
+    use ztest::sync::driver_family::{STARTED, VIOLATIONS};
 
-/// Settled verdict, `watch`-only: [`mirror_header`]'s [`ReportView`] drawn without the
-/// panels (a live tail already scrolled them past, and `watch` queries no TSDB).
-///
-/// - Same view + renderer as `status`, so the two cannot disagree on a glyph, an ink,
-///   a count or a violation's wording
-fn report_verdict(theme: &Theme, r: &SyncReportMirror) -> String {
-    ztest_ui::render_sync_verdict(&mirror_header(r), theme, render::width())
+    let span = level_now(client, STARTED, "sync_id", id).await?.map(|(sampled, origin)| {
+        (std::time::UNIX_EPOCH + Duration::from_secs_f64(origin), sampled)
+    });
+    let violations = totals_now(client, VIOLATIONS, "sync_id", id, "probe").await?;
+    Ok(ReportView {
+        sync_id: id.to_string(),
+        profile: profile.to_string(),
+        status,
+        span,
+        violations: violations
+            .into_iter()
+            .map(|(probe, n)| (probe, format!("{} violations so far", thousands(n as u64))))
+            .collect(),
+        ..ReportView::default()
+    })
 }
 
 /// Fill a seeded header out from whatever Prometheus holds for the run's window.
@@ -1429,42 +1385,32 @@ fn report_verdict(theme: &Theme, r: &SyncReportMirror) -> String {
 ///   the same way either way (a running sync is scraped exactly as a finished one was)
 /// - Record is best-effort (no metrics stack / unreachable / expired retention): the
 ///   panels then state why they are empty rather than failing the report
-/// - Window = driver pod's creation → its exit, or → now while it still runs
-async fn build_report_view(
-    client: &Client,
-    id: &str,
-    ns: &str,
-    mut view: ReportView,
-) -> ReportView {
+/// - Window = the segment's own span
+async fn build_report_view(client: &Client, ns: &str, mut view: ReportView) -> ReportView {
     use ztest::api::metrics::Facet;
 
-    let Ok(driver) = find_driver(client, id).await else {
-        view.note = Some("driver pod is gone; its window cannot be recovered".into());
+    let Some(window) = view.span else {
+        view.note = Some("no segment recorded yet — nothing to window".into());
         return view;
     };
-    let Some(created) = driver.metadata.creation_timestamp.clone() else {
-        return view;
-    };
-    let window = run_window(&driver, SystemTime::from(created.0), view.elapsed);
+    let elapsed = view.elapsed().expect("spanned above");
     view.grafana = grafana_explore_url(ns, window);
-    if view.elapsed.is_zero() {
-        view.elapsed = window.1.duration_since(window.0).unwrap_or_default();
-    }
 
     // Analysis grid, not the terminal — the renderer decimates downstream, where a
     // min/max envelope keeps the peaks a viewport-sized query would have smoothed away
     let rows: Vec<_> = ztest::backends::metrics_components().copied().collect();
 
     match ztest::api::metrics::history(client, ns, &rows, window).await {
+        Err(e) => view.note = Some(format!("prometheus unreadable: {e}")),
         // Empty from a run shorter than a few scrapes is arithmetic, not a broken obs
         // stack — pointing those at `cluster setup` sends the reader to fix what works
-        None => {
+        Ok(series) if series.is_empty() => {
             let too_short = ztest::api::metrics::SCRAPE_INTERVAL * 3;
-            view.note = Some(if view.elapsed < too_short {
+            view.note = Some(if elapsed < too_short {
                 format!(
                     "no metrics recorded: the run lasted {}, under the {} Prometheus \
                      needs to sample it",
-                    format_elapsed(view.elapsed),
+                    format_elapsed(elapsed),
                     format_span(too_short),
                 )
             } else {
@@ -1475,7 +1421,7 @@ async fn build_report_view(
                 )
             })
         }
-        Some(series) => {
+        Ok(series) => {
             let of = |facet: Facet| -> Vec<_> {
                 series.iter().filter(|s| s.facet == Some(facet)).cloned().collect()
             };
@@ -1503,16 +1449,15 @@ async fn build_report_view(
             // disagreement is shown rather than resolved
             let observed = progress(|h| Some(h.committed));
             let pace = view.blocks.first().and_then(ztest::api::metrics::Series::mean);
-            let tolerance = stale_scrape_slack(view.elapsed, pace);
+            let tolerance = stale_scrape_slack(elapsed, pace);
+            // Running = no record yet → the TSDB holds the only height there is
+            if view.status.is_live() {
+                view.height = observed.zip(progress(|h| h.target));
+            }
             view.height_check = view.height.zip(observed).and_then(|((recorded, _), observed)| {
                 (recorded.abs_diff(observed) > tolerance).then_some((recorded, observed))
             });
-            // Record never landed → still a height, marked provisional by the absent check
-            if view.height.is_none() {
-                let objective = progress(|h| h.target).or_else(|| progress(|h| h.tip));
-                view.height = observed.zip(objective);
-            }
-            view.tip = progress(|h| h.tip).or(view.tip);
+            view.tip = progress(|h| h.tip);
         }
     }
 
@@ -1520,8 +1465,9 @@ async fn build_report_view(
     // spans one must not read as a clean measurement
     view.coverage_gaps.extend(scrape_gaps(&view));
 
-    if let Some(history) = ztest::api::metrics::container_history(client, ns, window).await {
-        view.resources = by_component(history);
+    match ztest::api::metrics::container_history(client, ns, window).await {
+        Ok(history) => view.resources = by_component(history),
+        Err(e) => view.note = Some(format!("prometheus unreadable: {e}")),
     }
     view
 }
@@ -1619,44 +1565,6 @@ fn grafana_explore_url(ns: &str, window: (SystemTime, SystemTime)) -> Option<Str
     ))
 }
 
-/// Prometheus range covering the *run*, not the pod that hosted it.
-///
-/// - Ends at the driver's exit, never `now` (a detached sync's pod idles for hours
-///   after its verdict; those flat scrapes dilute every average and squeeze the plotted
-///   run into the left edge)
-/// - Opens `elapsed` back from that end — `Segment::elapsed_ms` already excludes
-///   provisioning, which is where a cold seed spends an hour publishing nothing
-/// - Never before the pod existed, and falls back to its full span when either bound
-///   is unknown
-fn run_window(
-    driver: &k8s_openapi::api::core::v1::Pod,
-    created: SystemTime,
-    elapsed: Duration,
-) -> (SystemTime, SystemTime) {
-    let ended = driver_finished_at(driver).unwrap_or_else(SystemTime::now);
-    let started = match elapsed.is_zero() {
-        true => created,
-        false => ended.checked_sub(elapsed).unwrap_or(created).max(created),
-    };
-    (started, ended)
-}
-
-fn driver_finished_at(driver: &k8s_openapi::api::core::v1::Pod) -> Option<SystemTime> {
-    let finished = driver
-        .status
-        .as_ref()?
-        .container_statuses
-        .as_ref()?
-        .first()?
-        .state
-        .as_ref()?
-        .terminated
-        .as_ref()?
-        .finished_at
-        .clone()?;
-    Some(SystemTime::from(finished.0))
-}
-
 // ─────────────────────────── stop / rm / watch ────────────────────────
 
 async fn stop(id: &str) -> Result<()> {
@@ -1680,7 +1588,6 @@ async fn stop(id: &str) -> Result<()> {
 //   eviction and kill alike
 
 /// Profile a driver pod was launched for, read back from its `ZTEST_SYNC_PROFILE` env
-/// (the panel's label; falls back to the sync id)
 fn driver_profile(pod: &Pod) -> Option<String> {
     pod.spec
         .as_ref()?

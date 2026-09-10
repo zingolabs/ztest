@@ -8,8 +8,6 @@
 //!   live sync exactly as it scraped a finished one — hence the single view
 //! - [`SyncStatus`] is the whole reason a verdict is not a `bool`: a run still going has
 //!   none, and must not be drawn as a failure
-//! - Chain progress (`phase`) sits beside the status, never in it — a subject at tip in a
-//!   run still probing is `Running · Done`
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -24,8 +22,8 @@ use super::template::{Fields, Template};
 use super::text::y_axis;
 use ztest::api::Reading;
 use ztest::api::Series;
+use ztest::api::SyncStatus;
 use ztest::api::Unit;
-use ztest::api::{Phase, SyncStatus};
 use ztest::api::{format_elapsed, thousands, unit_value};
 
 /// Full terminal, capped. Past this the plots stop gaining resolution the eye can use
@@ -53,9 +51,7 @@ mod row {
 
     pub(super) fn status(tone: &str) -> String {
         format!(
-            "  {{status|{tone}}} {{@dot|dim}} {{elapsed|bold}}\
-             [ {{@dot|dim}} {{phase|dim}}[ {{@dot|dim}} {{detail|dim}}]]\
-             [ {{@dot|dim}} {{segment|dim}}]"
+            "  {{status|{tone}}}[ {{@dot|dim}} {{elapsed|bold}}][ {{@dot|dim}} {{segment|dim}}]"
         )
     }
 
@@ -86,7 +82,7 @@ mod row {
     pub(super) const ERROR: &str = "{@fail|fail} {error}";
     pub(super) const INDENTED: &str = "  {text|dim}";
     pub(super) const TALLY: &str = "  [{ticks|bold} ticks {@dot|dim} ]\
-        {violations|bold} violations[ {@dot|dim} {ok|bold}/{total} probes ok]\
+        {violations|bold} violations\
         [ {@dot|dim} {dropped|bold} snapshots dropped]";
 }
 
@@ -121,17 +117,14 @@ pub struct ReportView {
     pub sync_id: String,
     pub profile: String,
     pub status: SyncStatus,
-    pub phase: Option<Phase>,
-    /// Subject's own stage word, rendered after the lifecycle one
-    pub phase_detail: Option<String>,
-    pub elapsed: Duration,
+    /// Wall-clock interval the segment covered — the report window, so panels count what the
+    /// header counts. `None` = no segment reading yet
+    pub span: Option<(std::time::SystemTime, std::time::SystemTime)>,
     pub segment: Option<String>,
     pub height: Option<(u32, u32)>,
     /// `(recorded, observed)` past scrape lag. Rendered, never resolved — the record keeps
     /// the verdict's number and the divergence is itself the finding
     pub height_check: Option<(u32, u32)>,
-    pub eta: Option<Duration>,
-    pub probes: Option<(usize, usize)>,
     pub tip: Option<u32>,
     pub violations: Vec<(String, String)>,
     pub coverage_gaps: Vec<String>,
@@ -152,15 +145,11 @@ pub struct ReportView {
     pub grafana: Option<String>,
 }
 
-/// [`render_sync_report`] without its panels: the same header + footer over the same
-/// view, for a surface that already scrolled the series past (`watch`'s settled verdict,
-/// which never queries the TSDB and would draw every panel as "no series recorded")
-pub fn render_sync_verdict(view: &ReportView, theme: &Theme, width: usize) -> String {
-    let width = width.min(MAX_WIDTH);
-    let mut out = String::with_capacity(1024);
-    header(&mut out, view, theme, width);
-    footer(&mut out, view, theme, width);
-    out
+impl ReportView {
+    /// Length of [`span`](Self::span) — stated once, never stored beside it
+    pub fn elapsed(&self) -> Option<Duration> {
+        self.span.map(|(from, to)| to.duration_since(from).expect("a span ends after it starts"))
+    }
 }
 
 pub fn render_sync_report(view: &ReportView, theme: &Theme, width: usize) -> String {
@@ -251,7 +240,6 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
         .text("profile", format!("[{}]", v.profile));
     line(&row::ident(tone), &ident);
 
-    // - Phase = chain-walk position, live only (a finished run's last phase adds nothing)
     // - A live run has no segment *yet*; only a finished one that recorded none answers for it
     let segment = match (v.segment.as_deref(), live) {
         (Some(s), _) => Some(s),
@@ -260,9 +248,7 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
     };
     let status = Fields::new()
         .text("status", v.status.to_string())
-        .text("elapsed", format_elapsed(v.elapsed))
-        .maybe_text("phase", v.phase.filter(|_| live).map(|p| p.to_string()))
-        .maybe_text("detail", v.phase_detail.as_deref())
+        .maybe_text("elapsed", v.elapsed().map(format_elapsed))
         .maybe_text("segment", segment);
     line(&row::status(tone), &status);
 
@@ -277,10 +263,9 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
             t => (f64::from(reached) / f64::from(t) * 100.0).clamp(0.0, 100.0),
         };
         let filled = (pct / 100.0 * bar_w as f64).round() as usize;
-        // Nothing is short until the run stops trying — a live sync gets its countdown
-        // in the slot a finished one spends on the shortfall
+        // Nothing is short until the run stops trying → a live sync leaves the slot empty
         let (standing, tone) = match (live, target.saturating_sub(reached)) {
-            (true, _) => (v.eta.map(|e| format!("eta {}", format_elapsed(e))), "bold"),
+            (true, _) => (None, "bold"),
             (_, 0) => (Some("complete".to_string()), "pass"),
             (_, n) => (Some(format!("short {}", thousands(u64::from(n)))), "fail"),
         };
@@ -629,14 +614,11 @@ fn footer(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
     for text in v.note.iter().chain(v.grafana.iter()) {
         line(row::INDENTED, &Fields::new().text("text", &**text));
     }
-    // - Probe tally = the live counterpart of a verdict (before one exists, the only standing)
     // - `0 ticks` reads as a stalled run rather than one still starting
     // - Counts through `thousands`, never `Unit::Count` (`1.50k ticks` points at no tick)
     let tally = Fields::new()
         .text("violations", thousands(v.violations.len() as u64))
         .maybe_text("ticks", Some(v.ticks).filter(|n| *n > 0).map(thousands))
-        .maybe_text("ok", v.probes.map(|(ok, _)| thousands(ok as u64)))
-        .maybe_text("total", v.probes.map(|(_, total)| thousands(total as u64)))
         .maybe_text("dropped", Some(v.dropped_snapshots).filter(|n| *n > 0).map(thousands));
     line(row::TALLY, &tally);
 }
@@ -791,13 +773,9 @@ mod tests {
             sync_id: "zaino-index-construction-c3115f50".into(),
             profile: "zaino_index_construction".into(),
             status: SyncStatus::Finished(ztest::api::SyncVerdict::Failed),
-            phase: None,
-            phase_detail: None,
             height_check: None,
             unpublished: Vec::new(),
-            eta: None,
-            probes: None,
-            elapsed: Duration::from_secs(1_842),
+            span: Some((std::time::UNIX_EPOCH, std::time::UNIX_EPOCH + Duration::from_secs(1_842))),
             segment: Some("main 3,013..658,599".into()),
             height: Some((658_599, 659_600)),
             tip: Some(659_640),
@@ -920,18 +898,6 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("resources · zainod") && l.contains("resources · zebrad"))
         );
-    }
-
-    /// Verdict carries every header/footer reading of the full report, and no panel
-    #[test]
-    fn the_verdict_drops_the_panels_and_keeps_the_findings() {
-        let rendered = render_sync_verdict(&view(), &theme(), 120);
-        for kept in ["zaino-index-construction-c3115f50", "short 1,001", "2 violations"] {
-            assert!(rendered.contains(kept), "{kept} missing:\n{rendered}");
-        }
-        for dropped in ["ops/sec", "resources ·", "no series recorded"] {
-            assert!(!rendered.contains(dropped), "{dropped} drawn:\n{rendered}");
-        }
     }
 
     /// A stacked namespace total hides which container grew — the one question this
@@ -1309,20 +1275,6 @@ mod tests {
         assert!(!rendered.contains("short "), "a run mid-flight is not short:\n{rendered}");
     }
 
-    /// The countdown a finished run spends on its shortfall
-    #[test]
-    fn a_running_sync_shows_its_eta_where_a_finished_one_shows_the_shortfall() {
-        let rendered = render_sync_report(&running(), &theme(), 160);
-        assert!(rendered.contains("eta 72m00s"), "{rendered}");
-    }
-
-    /// Before a verdict exists, how many probes are holding is the only standing there is
-    #[test]
-    fn a_running_sync_reports_its_probe_tally() {
-        let rendered = render_sync_report(&running(), &theme(), 160);
-        assert!(rendered.contains("3/4 probes ok"), "{rendered}");
-    }
-
     /// `0 ticks` reads as a stalled run rather than one still starting
     #[test]
     fn a_run_before_its_first_tick_omits_the_tick_count() {
@@ -1349,23 +1301,18 @@ mod tests {
     #[test]
     fn a_subject_at_tip_still_reads_as_running() {
         let mut v = running();
-        v.phase = Some(Phase::Done);
         v.height = Some((1_700_000, 1_700_000));
         let rendered = render_sync_report(&v, &theme(), 160);
         let header = rendered.lines().nth(1).expect("the status line");
         assert!(header.contains("Running"), "the run has no verdict yet: {header:?}");
-        assert!(header.contains("Done"), "the chain walk is at tip: {header:?}");
         assert!(!rendered.contains("Passed"), "no verdict was mirrored:\n{rendered}");
     }
 
     pub(super) fn running() -> ReportView {
         ReportView {
             status: SyncStatus::Running,
-            phase: Some(Phase::Syncing),
             segment: None,
             height: Some((1_204_551, 1_700_000)),
-            eta: Some(Duration::from_secs(4_320)),
-            probes: Some((3, 4)),
             violations: vec![(
                 "index_serves_the_pinned_tip".into(),
                 "unsatisfied 12m03s of 30m00s".into(),
@@ -1379,9 +1326,9 @@ mod tests {
 #[cfg(test)]
 mod ascii {
     use super::tests::{running, view};
-    use super::{Theme, render_sync_report, render_sync_verdict};
+    use super::{Theme, render_sync_report};
 
-    /// Both report surfaces, both fixtures, at the widths a piped report actually uses
+    /// Both fixtures, at the widths a piped report actually uses
     #[test]
     fn the_sync_report_falls_back_to_ascii() {
         let ascii = Theme::for_capabilities(false, false);
@@ -1390,10 +1337,6 @@ mod ascii {
                 crate::testing::assert_ascii_clean(
                     &format!("render_sync_report({name}, {width})"),
                     &render_sync_report(&v, &ascii, width),
-                );
-                crate::testing::assert_ascii_clean(
-                    &format!("render_sync_verdict({name}, {width})"),
-                    &render_sync_verdict(&v, &ascii, width),
                 );
             }
         }
