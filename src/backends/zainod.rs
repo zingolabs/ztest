@@ -658,7 +658,7 @@ impl IndexerBackend for ZainoIndexer {
 /// Zaino's dotted `metric_names` after scrape (`metrics-exporter-prometheus` sanitizes to
 /// the Prometheus charset). Shape declared here, once → every reader inherits it, and an
 /// illegal reading is a compile error rather than a wrong number
-mod family {
+pub mod family {
     use crate::metrics::{Counter, Dimension, Gauge, Hist, counter, gauge, hist};
 
     // Serving surface. Latency histogram's `_count` = request volume (no `requests_total`)
@@ -667,8 +667,9 @@ mod family {
     /// Count only — depth rides `zaino_sync_reorg_depth`, a histogram no row reads yet
     pub const REORG_TOTAL: Counter = counter("zaino_sync_reorg_total", Dimension::Count);
 
-    /// Height the finalised index is **committed** to — written & fsynced, set per batch
-    pub const FINALIZED_HEIGHT: Gauge = gauge("zaino_sync_finalized_height", Dimension::Count);
+    /// Height the finalised index is **committed** to — written & fsynced, set per batch.
+    pub const FINALIZED_HEIGHT: Gauge = gauge("zaino_sync_finalized_height", Dimension::Count)
+        .ready_within(std::time::Duration::from_secs(300));
     /// Write path's goal = tip - the non-finalised reorg buffer. Completion measured
     /// against this, never the raw tip (the finalised index trails by design)
     pub const TARGET_HEIGHT: Gauge = gauge("zaino_sync_target_height", Dimension::Count);
@@ -897,8 +898,17 @@ impl SyncSubject for ZainoIndexer {
         crate::sync::Observed::exporter("zaino index", COMPONENT)
     }
 
-    async fn declared(&self) -> Option<(&'static [Row], Exposition)> {
-        Some((<Self as crate::metrics::MetricLayout>::ROWS, self.exporter().await.ok()?))
+    fn rows(&self) -> &'static [Row] {
+        <Self as crate::metrics::MetricLayout>::ROWS
+    }
+
+    async fn exposition(&self) -> Option<Exposition> {
+        self.exporter().await.ok()
+    }
+
+    /// `progress` reads the committed frontier and nothing else it cannot do without
+    fn gates(&self) -> Vec<crate::metrics::Family> {
+        vec![<Self as Observe>::HEIGHTS.committed.family()]
     }
 
     fn work_source(&self, op: Op) -> Option<Counter> {

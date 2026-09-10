@@ -90,7 +90,8 @@ pub struct Select {
     pub value: &'static str,
 }
 
-/// Family name + the selector making it one quantity + what it is measured in.
+/// Family name + the selector making it one quantity + what it is measured in + how long after
+/// launch it may still be absent.
 ///
 /// Reached through a shape witness ([`Counter`]/[`Gauge`]/[`Hist`]), never declared bare — the
 /// shape is what makes a [`Reading`] legal
@@ -99,6 +100,18 @@ pub struct Family {
     pub name: &'static str,
     pub select: Option<Select>,
     pub dim: Dimension,
+    pub ready: Duration,
+}
+
+/// Every family's ready window unless its declaration says otherwise (a family published at
+/// startup lands within a scrape or two; slower ones override beside their constant)
+pub const DEFAULT_READY: Duration = Duration::from_secs(60);
+
+impl Family {
+    /// Same quantity, whatever its ready window (an override must match the declaration it widens)
+    pub fn is(&self, other: Family) -> bool {
+        self.name == other.name && self.select == other.select
+    }
 }
 
 /// Selector included — "nothing published" != "that label value never published"
@@ -124,15 +137,15 @@ pub struct Gauge(Family);
 pub struct Hist(Family);
 
 pub const fn counter(name: &'static str, dim: Dimension) -> Counter {
-    Counter(Family { name, select: None, dim })
+    Counter(Family { name, select: None, dim, ready: DEFAULT_READY })
 }
 
 pub const fn gauge(name: &'static str, dim: Dimension) -> Gauge {
-    Gauge(Family { name, select: None, dim })
+    Gauge(Family { name, select: None, dim, ready: DEFAULT_READY })
 }
 
 pub const fn hist(name: &'static str, dim: Dimension) -> Hist {
-    Hist(Family { name, select: None, dim })
+    Hist(Family { name, select: None, dim, ready: DEFAULT_READY })
 }
 
 /// Split family, narrowed to one label value
@@ -142,7 +155,7 @@ pub const fn counter_where(
     label: &'static str,
     value: &'static str,
 ) -> Counter {
-    Counter(Family { name, select: Some(Select { label, value }), dim })
+    Counter(Family { name, select: Some(Select { label, value }), dim, ready: DEFAULT_READY })
 }
 
 macro_rules! shape {
@@ -150,6 +163,17 @@ macro_rules! shape {
         impl $t {
             pub const fn family(self) -> Family {
                 self.0
+            }
+
+            /// Override of [`DEFAULT_READY`] — only where the producer publishes late by design
+            pub const fn ready_within(mut self, ready: Duration) -> Self {
+                self.0.ready = ready;
+                self
+            }
+        }
+        impl From<$t> for Family {
+            fn from(shape: $t) -> Family {
+                shape.0
             }
         }
         impl std::fmt::Display for $t {
@@ -428,6 +452,12 @@ impl Exposition {
         }
     }
 
+    /// Published in any shape, ≥1 admitted series. Readiness asks existence; [`resolves`](Self::resolves) asks shape
+    pub fn publishes(&self, family: Family) -> bool {
+        let seen = |suffix| self.part(family, suffix).is_some_and(|mut v| v.next().is_some());
+        seen("") || seen("_count") || self.buckets(family).is_some()
+    }
+
     /// Cumulative parts + the ladder a quantile needs, where the producer bucketed it
     pub fn timing(&self, hist: Hist) -> Option<crate::sync::Timing> {
         let family = hist.family();
@@ -584,6 +614,7 @@ zaino_grpc_request_duration_seconds_count 17
             name: "zaino_sync_block_fetch_seconds",
             select: Some(Select { label: "stage", value: "finalised" }),
             dim: Dimension::Seconds,
+            ready: DEFAULT_READY,
         };
         assert_eq!(e.tally(one), Some(Tally { sum: 0.6, count: 100.0 }));
 

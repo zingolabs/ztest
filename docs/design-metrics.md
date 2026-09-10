@@ -97,6 +97,21 @@ whole enforcement mechanism.
 Declarations live in `src/backends/<component>.rs`, beside the image and pod spec. The metrics module
 names no component; `backends::metrics_components` hands a reader every bundled catalogue.
 
+## Readiness
+
+A family may be absent early for reasons of its producer: counters are pre-created at zero, a height
+gauge is set by its first commit, a histogram by its first observation. Absence is judged against a
+**ready window** running from the subject's launch.
+
+- Default = `DEFAULT_READY` (60 s) for every family; nothing is annotated per metric
+- A declaration overrides only where its producer publishes late by design —
+  `FINALIZED_HEIGHT.ready_within(5 min)` (first commit waits out zaino's 120 s checkpoint interval)
+- A profile overrides one run: `run.ready_within(family, d)`
+- Gates (`SyncSubject::gates`, the families `progress` cannot read without) are waited for before the
+  first tick; one missing past its window errors the run, named
+- Every other row settles at its own deadline: resolved, or listed as unpublished (advisory — gRPC
+  latency never appears on a sync nobody queries)
+
 ## Readings
 
 | Reading | Shape | Plot | Total |

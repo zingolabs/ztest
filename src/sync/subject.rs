@@ -81,12 +81,21 @@ pub trait SyncSubject: Send + Sync {
         super::Observed::ticks("subject")
     }
 
-    /// Declared rows + one scrape to check them against; `None` = no exporter to check.
-    ///
-    /// Preflight compares the two, so a family renamed upstream fails by name in seconds
-    /// rather than as an em-dash for the length of the run
-    async fn declared(&self) -> Option<(&'static [crate::metrics::Row], Exposition)> {
+    /// Rows this subject's exporter declares; each settles at its family's ready deadline
+    /// (renamed upstream → named as unpublished, not an em-dash for the length of the run)
+    fn rows(&self) -> &'static [crate::metrics::Row] {
+        &[]
+    }
+
+    /// One scrape of this subject's exporter. `None` = no exporter, or unreachable right now
+    async fn exposition(&self) -> Option<Exposition> {
         None
+    }
+
+    /// Families [`progress`](Self::progress) cannot read without. Engine waits for each before
+    /// the first tick, erroring by name past its ready window
+    fn gates(&self) -> Vec<crate::metrics::Family> {
+        Vec::new()
     }
 
     fn work_source(&self, _op: Op) -> Option<crate::metrics::Counter> {

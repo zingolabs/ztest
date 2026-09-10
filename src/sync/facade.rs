@@ -42,6 +42,7 @@ struct EngineOpts {
     timeout: Option<Duration>,
     stop_height: Option<u32>,
     required_work: OpSet,
+    ready: Vec<crate::metrics::Family>,
 }
 
 impl std::fmt::Debug for SyncRunner {
@@ -72,6 +73,7 @@ impl SyncRunner {
                 timeout: None,
                 stop_height: None,
                 required_work: OpSet::NONE,
+                ready: Vec::new(),
             },
         }
     }
@@ -129,6 +131,18 @@ impl SyncRunner {
     /// - Subject ↔ component agree on those series by string only, across repos
     pub fn requires_work(&mut self, ops: OpSet) -> &mut Self {
         self.engine.required_work = ops;
+        self
+    }
+
+    /// Widen (or narrow) one family's ready window for this profile — e.g. a cold mainnet
+    /// validator delaying zaino's first commit past
+    /// `ztest::backends::zainod::family::FINALIZED_HEIGHT`'s declared 5 min
+    pub fn ready_within(
+        &mut self,
+        family: impl Into<crate::metrics::Family>,
+        ready: Duration,
+    ) -> &mut Self {
+        self.engine.ready.push(crate::metrics::Family { ready, ..family.into() });
         self
     }
 
@@ -220,6 +234,9 @@ async fn drive(
         .with_tick(tick)
         .with_ctx(ctx)
         .requires_work(opts.required_work);
+    for family in opts.ready {
+        engine = engine.with_ready(family);
+    }
     if let Some(t) = opts.timeout {
         engine = engine.with_timeout(t);
     }
