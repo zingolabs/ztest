@@ -97,7 +97,7 @@ pub(super) fn listing(scan: &Scan, theme: &Theme, width: usize) -> String {
 
 /// Shown relative to cwd where possible — the message is a `cd` instruction, and an
 /// absolute path buries the one segment that matters
-fn relative_to_cwd(dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn relative_to_cwd(dir: &std::path::Path) -> std::path::PathBuf {
     std::env::current_dir()
         .ok()
         .and_then(|cwd| dir.strip_prefix(&cwd).ok().map(std::path::Path::to_path_buf))
