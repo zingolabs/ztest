@@ -14,7 +14,7 @@ let
 
   zaino = {
     url = "https://github.com/zingolabs/zaino.git";
-    branch = "feat_migrate_tests";    # TODO:  Remove this once 1265 merges
+    branch = "dev";
     dest = "/root/zaino";
     workspace = "/root/zaino/live-tests";
     selector = "-E 'binary(validator_heights)'";  # single 4c/4GiB test
