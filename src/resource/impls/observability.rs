@@ -6,7 +6,7 @@
 //!   `kubernetes_sd_configs` reads those labels directly (one ConfigMap replaces a
 //!   CRD set + operator Deployment + a per-component CR per run)
 //! - To be scraped: carry `ztest.io/component-name` (every ztest pod does) and declare
-//!   a port named [`crate::metrics::PORT_NAME`]; [`SCRAPE_CONFIG`] drops everything else
+//!   a port named [`crate::metrics::PORT_NAME`]; [`scrape_config`] drops everything else
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -94,7 +94,7 @@ const CONFIG_HASH_ANNOTATION: &str = "ztest.io/config-hash";
 ///
 /// - `--web.enable-admin-api` = the `delete_series`/`clean_tombstones` endpoints
 ///   [`purge`](crate::metrics::query::purge) drives (ClusterIP, no ingress)
-/// - Feeds [`config_hash`] alongside [`SCRAPE_CONFIG`]: a flag change touches no
+/// - Feeds [`config_hash`] alongside [`scrape_config`]: a flag change touches no
 ///   ConfigMap, so nothing else would notice it
 fn prometheus_args() -> Vec<String> {
     vec![
@@ -124,9 +124,11 @@ fn prometheus_args() -> Vec<String> {
 ///   the `container_fs_*` family reads 0 throughout under cgroup v2 + containerd
 /// - Kept to 5 families × ztest namespaces: unfiltered cAdvisor is ~40 families over
 ///   every container on the node, which is the run's own TSDB budget spent on `kube-system`
-const SCRAPE_CONFIG: &str = r#"global:
-  scrape_interval: 5s
-  scrape_timeout: 4s
+fn scrape_config() -> String {
+    format!(
+        r#"global:
+  scrape_interval: {interval}s
+  scrape_timeout: {timeout}s
 scrape_configs:
   - job_name: ztest-components
     kubernetes_sd_configs:
@@ -136,7 +138,7 @@ scrape_configs:
         regex: .+
         action: keep
       - source_labels: [__meta_kubernetes_pod_container_port_name]
-        regex: metrics
+        regex: {port_name}
         action: keep
       - source_labels: [__meta_kubernetes_namespace]
         target_label: namespace
@@ -180,7 +182,15 @@ scrape_configs:
       - source_labels: [container]
         regex: (|POD)
         action: drop
-"#;
+"#,
+        interval = crate::metrics::SCRAPE_INTERVAL.as_secs(),
+        timeout = SCRAPE_TIMEOUT.as_secs(),
+        port_name = crate::metrics::PORT_NAME,
+    )
+}
+
+/// Under the interval, so a slow target is dropped rather than delaying the next scrape
+const SCRAPE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Pyroscope v2 writes profiles *and* metastore state to object storage; `filesystem`
 /// = a directory, all one replica needs. Both must land on the same volume (else a
@@ -598,7 +608,7 @@ fn pyroscope_deployment() -> Deployment {
 }
 
 fn prometheus_config_map() -> ConfigMap {
-    config_map(&format!("{PROMETHEUS_SERVICE}-config"), "prometheus.yml", SCRAPE_CONFIG.into())
+    config_map(&format!("{PROMETHEUS_SERVICE}-config"), "prometheus.yml", scrape_config())
 }
 
 fn pyroscope_config_map() -> Result<ConfigMap, crate::error::PipelineError> {
@@ -829,7 +839,7 @@ impl Provider for ObservabilityProvider {
     /// Running *and* configured as this build would configure it.
     ///
     /// Deployment availability alone would pin every cluster to whatever
-    /// [`SCRAPE_CONFIG`] it was first set up with: `Lifetime::Cached` skips
+    /// [`scrape_config`] it was first set up with: `Lifetime::Cached` skips
     /// [`provision`](Self::provision) once ready, so a new scrape job would never reach
     /// a cluster that already has the stack — and would look installed
     async fn probe(&self, cx: &Cx) -> Readiness {
@@ -896,7 +906,7 @@ fn deployed_hash(deployment: &Deployment) -> Option<&str> {
         .map(String::as_str)
 }
 
-/// Config digest, stamped on the pod template so a changed [`SCRAPE_CONFIG`] or
+/// Config digest, stamped on the pod template so a changed [`scrape_config`] or
 /// [`prometheus_args`] rolls Prometheus.
 ///
 /// A ConfigMap edit alone changes nothing running: the projected volume updates on the
@@ -904,7 +914,7 @@ fn deployed_hash(deployment: &Deployment) -> Option<&str> {
 /// cheaper than it sounds — `Recreate` over a PVC, so the TSDB survives
 fn config_hash() -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(SCRAPE_CONFIG.as_bytes());
+    hasher.update(scrape_config().as_bytes());
     for arg in prometheus_args() {
         hasher.update(arg.as_bytes());
     }
@@ -1034,7 +1044,7 @@ mod tests {
     }
 
     fn job(name: &str) -> serde_yaml::Value {
-        let config: serde_yaml::Value = serde_yaml::from_str(SCRAPE_CONFIG).expect("valid YAML");
+        let config: serde_yaml::Value = serde_yaml::from_str(&scrape_config()).expect("valid YAML");
         config["scrape_configs"]
             .as_sequence()
             .expect("jobs")
@@ -1056,8 +1066,8 @@ mod tests {
     fn discovery_keeps_only_ztest_pods_with_a_metrics_port() {
         let components = job("ztest-components");
         assert_eq!(actions(&components, "relabel_configs", "keep"), 2);
-        assert!(SCRAPE_CONFIG.contains("__meta_kubernetes_pod_label_ztest_io_component_name"));
-        assert!(SCRAPE_CONFIG.contains("__meta_kubernetes_pod_container_port_name"));
+        assert!(scrape_config().contains("__meta_kubernetes_pod_label_ztest_io_component_name"));
+        assert!(scrape_config().contains("__meta_kubernetes_pod_container_port_name"));
     }
 
     /// Ownership must ride the *series*, not the pod: `ztest cleanup` scopes by user,
@@ -1095,7 +1105,7 @@ mod tests {
         assert!(deployed.iter().any(|a| a == "--web.enable-admin-api"), "{deployed:?}");
     }
 
-    /// Flags touch no ConfigMap; hashing only [`SCRAPE_CONFIG`] would leave an existing
+    /// Flags touch no ConfigMap; hashing only [`scrape_config`] would leave an existing
     /// cluster un-rolled and the admin API off, while `probe` reported it installed
     #[test]
     fn the_stamp_covers_the_flags_not_just_the_scrape_config() {
@@ -1104,7 +1114,7 @@ mod tests {
         assert_eq!(deployed_hash(&prometheus_deployment()), Some(baseline.as_str()));
 
         let mut hasher = blake3::Hasher::new();
-        hasher.update(SCRAPE_CONFIG.as_bytes());
+        hasher.update(scrape_config().as_bytes());
         assert_ne!(baseline, hasher.finalize().to_hex()[..16].to_string());
     }
 
@@ -1171,7 +1181,7 @@ mod tests {
     /// Filtered port name = the exporter contract's (drift here silently scrapes nothing)
     #[test]
     fn the_kept_port_name_is_the_exporter_contract() {
-        assert!(SCRAPE_CONFIG.contains(&format!("regex: {}", crate::metrics::PORT_NAME)));
+        assert!(scrape_config().contains(&format!("regex: {}", crate::metrics::PORT_NAME)));
     }
 
     /// Every input the pods read must move the stamp; one left out leaves an existing
@@ -1180,7 +1190,7 @@ mod tests {
     fn the_stamp_moves_with_every_config_the_pods_read() {
         let baseline = config_hash();
         for ingredient in [
-            SCRAPE_CONFIG.to_string(),
+            scrape_config(),
             prometheus_args().join(" "),
             serde_yaml::to_string(&pyroscope_config()).expect("renders"),
             pyroscope_args().join(" "),

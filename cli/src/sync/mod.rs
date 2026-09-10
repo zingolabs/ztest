@@ -27,7 +27,7 @@ use serde_json::json;
 
 use clap::{Args as ClapArgs, Subcommand};
 
-use ztest::api::metrics::Series;
+use ztest::api::metrics::{Reading, Series};
 use ztest::api::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
 use ztest::api::pipeline::BuildOutcome;
 use ztest::api::pipeline::DumpOutcome;
@@ -1331,7 +1331,7 @@ fn stale_scrape_slack(elapsed: Duration, blocks_per_sec: Option<f64>) -> u32 {
         return u32::MAX;
     };
     let grid = ztest::api::metrics::Grid::for_span(elapsed);
-    let lag = (grid.step + grid.rate_window).as_secs_f64();
+    let lag = (grid.step + grid.window).as_secs_f64();
     ((pace * lag).ceil() as u32).max(1)
 }
 
@@ -1486,16 +1486,22 @@ async fn build_report_view(
             view.write_path = of(Facet::WritePath);
             view.store = of(Facet::Store);
 
-            let progress = |label: &str, pick: fn(&ztest::api::metrics::Series) -> Option<f64>| {
-                series
-                    .iter()
-                    .find(|s| s.facet == Some(Facet::Progress) && s.label == label)
-                    .and_then(pick)
-                    .map(|v| v as u32)
-            };
+            // Resolved by declared gauge, never by display label: a reworded row must not
+            // silently drop the height check
+            let heights: Vec<ztest::api::Heights> = ztest::backends::metrics_heights().collect();
+            let progress =
+                |pick: fn(&ztest::api::Heights) -> Option<ztest::api::metrics::Gauge>| {
+                    heights.iter().filter_map(pick).find_map(|gauge| {
+                        series
+                            .iter()
+                            .find(|s| s.reading.map(Reading::family) == Some(gauge.family()))
+                            .and_then(ztest::api::metrics::Series::last)
+                            .map(|v| v as u32)
+                    })
+                };
             // Record owns the verdict's numbers; the TSDB only confirms them, and a
             // disagreement is shown rather than resolved
-            let observed = progress("finalized", ztest::api::metrics::Series::last);
+            let observed = progress(|h| Some(h.committed));
             let pace = view.blocks.first().and_then(ztest::api::metrics::Series::mean);
             let tolerance = stale_scrape_slack(view.elapsed, pace);
             view.height_check = view.height.zip(observed).and_then(|((recorded, _), observed)| {
@@ -1503,18 +1509,49 @@ async fn build_report_view(
             });
             // Record never landed → still a height, marked provisional by the absent check
             if view.height.is_none() {
-                let objective = progress("target", ztest::api::metrics::Series::last)
-                    .or_else(|| progress("chain tip", ztest::api::metrics::Series::last));
+                let objective = progress(|h| h.target).or_else(|| progress(|h| h.tip));
                 view.height = observed.zip(objective);
             }
-            view.tip = progress("chain tip", ztest::api::metrics::Series::last).or(view.tip);
+            view.tip = progress(|h| h.tip).or(view.tip);
         }
     }
+
+    // Coverage travels with the totals: a scrape gap cannot be recovered, but a total that
+    // spans one must not read as a clean measurement
+    view.coverage_gaps.extend(scrape_gaps(&view));
 
     if let Some(history) = ztest::api::metrics::container_history(client, ns, window).await {
         view.resources = by_component(history);
     }
     view
+}
+
+/// Scrape gaps under the run's totals, worst first.
+///
+/// Reported, never corrected — an increment that landed inside a gap is gone, and the only
+/// honest thing a report can do is say which totals were measured across one
+fn scrape_gaps(view: &ReportView) -> Vec<String> {
+    let tolerated = ztest::api::metrics::SCRAPE_INTERVAL * 3;
+    let panels = [&view.transparent, &view.shielded, &view.blocks, &view.throughput];
+    let mut gaps: Vec<(Duration, String)> = panels
+        .into_iter()
+        .flatten()
+        .filter_map(|s| Some((s.label.clone(), s.coverage?)))
+        .filter(|(_, c)| c.widest_gap > tolerated)
+        .map(|(label, c)| {
+            (
+                c.widest_gap,
+                format!(
+                    "{label}: {} unscraped at its widest, over {} samples — its total is \
+                     short by whatever landed in the gap",
+                    format_span(c.widest_gap),
+                    thousands(c.samples as u64),
+                ),
+            )
+        })
+        .collect();
+    gaps.sort_by_key(|(gap, _)| std::cmp::Reverse(*gap));
+    gaps.into_iter().map(|(_, text)| text).collect()
 }
 
 /// Container-labelled readings → one [`ComponentResources`] per component.

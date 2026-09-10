@@ -48,7 +48,9 @@ declares a container port named `metrics`, then promotes ztest's pod labels (`co
 
 - Declare a container port named `metrics`, serve Prometheus text at `/metrics`
 - `impl metrics::Exporter` — `endpoint()` + `rows()`, the component's own table of
-  `(label, family, reduction, live?)`
+  `(label, reading, facet)`. Families are declared through a shape witness
+  (`counter`/`gauge`/`hist`), which is what makes a reading legal — see
+  [design-metrics.md](design-metrics.md)
 
 `metrics` names no component; which backend publishes which families is the backends' knowledge
 (`backends::metrics_rows`), so a new component joins without editing the metrics module.

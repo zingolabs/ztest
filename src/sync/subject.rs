@@ -128,7 +128,7 @@ pub trait SyncSubject: Send + Sync {
         None
     }
 
-    fn work_source(&self, _op: Op) -> Option<crate::metrics::Family> {
+    fn work_source(&self, _op: Op) -> Option<crate::metrics::Counter> {
         None
     }
 

@@ -209,10 +209,22 @@ async fn report_dropped_events(client: &kube::Client, id: &str, theme: &Theme) {
 }
 
 async fn collector_dropped(client: &kube::Client, id: &str) -> Option<u64> {
-    collector_metrics(client, id).await?.counter_total(ztest::api::metrics::family(DROPPED_EVENTS))
+    collector_metrics(client, id).await?.counter_total(family::DROPPED_EVENTS)
 }
 
-const DROPPED_EVENTS: &str = "agent_errors_trace_event_lost_total";
+/// Alloy's own pipeline families. One `component_id` per collector, so a gauge's max over
+/// admitted label sets *is* its total
+mod family {
+    use ztest::api::metrics::{Counter, Dimension, Gauge, counter, gauge};
+
+    pub const DROPPED_EVENTS: Counter =
+        counter("agent_errors_trace_event_lost_total", Dimension::Count);
+    pub const ACTIVE_TARGETS: Gauge = gauge("pyroscope_ebpf_active_targets", Dimension::Count);
+    pub const PROCESSES_SEEN: Counter = counter("bpf_num_proc_new_total", Dimension::Count);
+    pub const EXECUTABLES_UNWOUND: Gauge =
+        gauge("agent_num_exe_id_loaded_to_ebpf", Dimension::Count);
+    pub const FORWARDED: Counter = counter("pyroscope_forwarded_entries_total", Dimension::Count);
+}
 
 /// Sidecar's own `/metrics`, absorbed.
 ///
@@ -259,17 +271,16 @@ async fn collector_metrics(client: &kube::Client, id: &str) -> Option<Exposition
 ///   process count) means no stack can be walked, so nothing downstream can exist
 async fn collector_pipeline(client: &kube::Client, id: &str) -> Option<String> {
     let metrics = collector_metrics(client, id).await?;
-    let get = |name: &'static str| {
-        metrics.counter_total(ztest::api::metrics::family(name)).unwrap_or_default()
-    };
+    let counted = |c| metrics.counter_total(c).unwrap_or_default();
+    let held = |g| metrics.height(g).unwrap_or_default();
     Some(format!(
         "collector: {} targets · {} processes seen · {} executables unwound · \
          {} samples forwarded · {} events dropped",
-        get("pyroscope_ebpf_active_targets"),
-        get("bpf_num_proc_new_total"),
-        get("agent_num_exe_id_loaded_to_ebpf"),
-        get("pyroscope_forwarded_entries_total"),
-        get(DROPPED_EVENTS),
+        held(family::ACTIVE_TARGETS),
+        counted(family::PROCESSES_SEEN),
+        held(family::EXECUTABLES_UNWOUND),
+        counted(family::FORWARDED),
+        counted(family::DROPPED_EVENTS),
     ))
 }
 
@@ -474,14 +485,14 @@ fn verdict(
         .work
         .composition()
         .iter()
-        .filter_map(|(name, share)| share.map(|s| format!("{name} {s:.0}%")))
+        .filter_map(|(c, share)| share.map(|s| format!("{} {s:.0}%", c.name())))
         .collect();
     let unmeasured: Vec<&str> = head
         .work
         .composition()
         .iter()
         .filter(|(_, share)| share.is_none())
-        .map(|(name, _)| *name)
+        .map(|(c, _)| c.name())
         .collect();
     if !content.is_empty() {
         let mut text = content.join("  ");

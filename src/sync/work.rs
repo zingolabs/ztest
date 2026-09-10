@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 /// One class of protocol work. Finer than a value pool (Sapling spend proof !=
-/// Sapling output proof); display collapses to [`CHANNELS`], weighting stays here
+/// Sapling output proof); display collapses to [`Channel`], weighting stays here
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Op {
     TransparentIn,
@@ -23,17 +23,60 @@ pub enum Op {
     IronwoodAction,
 }
 
-/// Display channels: name + its ops, in stacking order (oldest pool first).
+/// Value pool a display groups by, in stacking order (oldest first).
 ///
-/// Sole source of every per-pool list (panel rows, plot stack, timeline
-/// channels) — a stack order disagreeing with its legend mislabels silently
-pub const CHANNELS: [(&str, &[Op]); 5] = [
-    ("transparent", &[Op::TransparentIn, Op::TransparentOut]),
-    ("sprout", &[Op::SproutJoinSplit]),
-    ("sapling", &[Op::SaplingSpend, Op::SaplingOutput]),
-    ("orchard", &[Op::OrchardAction]),
-    ("ironwood", &[Op::IronwoodAction]),
-];
+/// Sole source of pool identity — stack order, timeline key, chip tag and palette slot all
+/// come from here, so a legend cannot disagree with the stack it labels
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Channel {
+    Transparent,
+    Sprout,
+    Sapling,
+    Orchard,
+    Ironwood,
+}
+
+impl Channel {
+    pub const ALL: [Channel; 5] = [
+        Channel::Transparent,
+        Channel::Sprout,
+        Channel::Sapling,
+        Channel::Orchard,
+        Channel::Ironwood,
+    ];
+
+    /// Timeline key + palette slot
+    pub const fn name(self) -> &'static str {
+        match self {
+            Channel::Transparent => "transparent",
+            Channel::Sprout => "sprout",
+            Channel::Sapling => "sapling",
+            Channel::Orchard => "orchard",
+            Channel::Ironwood => "ironwood",
+        }
+    }
+
+    /// Chip tag, ≤3 chars so a narrow panel keeps every pool
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Channel::Transparent => "tsp",
+            Channel::Sprout => "spr",
+            Channel::Sapling => "sap",
+            Channel::Orchard => "orc",
+            Channel::Ironwood => "iro",
+        }
+    }
+
+    pub const fn ops(self) -> &'static [Op] {
+        match self {
+            Channel::Transparent => &[Op::TransparentIn, Op::TransparentOut],
+            Channel::Sprout => &[Op::SproutJoinSplit],
+            Channel::Sapling => &[Op::SaplingSpend, Op::SaplingOutput],
+            Channel::Orchard => &[Op::OrchardAction],
+            Channel::Ironwood => &[Op::IronwoodAction],
+        }
+    }
+}
 
 impl Op {
     /// Display order = graph stacking order (oldest pool first)
@@ -60,6 +103,16 @@ impl Op {
             Op::SaplingOutput => 4,
             Op::OrchardAction => 5,
             Op::IronwoodAction => 6,
+        }
+    }
+
+    pub const fn channel(self) -> Channel {
+        match self {
+            Op::TransparentIn | Op::TransparentOut => Channel::Transparent,
+            Op::SproutJoinSplit => Channel::Sprout,
+            Op::SaplingSpend | Op::SaplingOutput => Channel::Sapling,
+            Op::OrchardAction => Channel::Orchard,
+            Op::IronwoodAction => Channel::Ironwood,
         }
     }
 
@@ -193,19 +246,19 @@ impl Work {
         out
     }
 
-    /// Per-[`CHANNELS`] totals, stacking order. `None` = unmeasured (renders
+    /// Per-[`Channel`] totals, stacking order. `None` = unmeasured (renders
     /// `—`), `Some(0)` = counted zero
-    pub fn channels(&self) -> [(&'static str, Option<u64>); 5] {
-        CHANNELS.map(|(name, ops)| (name, sum(ops.iter().map(|&op| self.get(op)))))
+    pub fn channels(&self) -> [(Channel, Option<u64>); 5] {
+        Channel::ALL.map(|c| (c, sum(c.ops().iter().map(|&op| self.get(op)))))
     }
 
     /// Each channel's % share of the total (over a fixed span totals are constant
     /// across runs, so composition = the only signal)
-    pub fn composition(&self) -> [(&'static str, Option<f64>); 5] {
+    pub fn composition(&self) -> [(Channel, Option<f64>); 5] {
         let total = self.total().unwrap_or(0) as f64;
-        self.channels().map(|(name, n)| {
+        self.channels().map(|(c, n)| {
             let share = n.filter(|_| total > 0.0).map(|n| n as f64 / total * 100.0);
-            (name, share)
+            (c, share)
         })
     }
 }
@@ -405,8 +458,8 @@ impl Rate {
         (!self.known.is_empty()).then(|| Op::ALL.iter().filter_map(|&op| self.get(op)).sum::<f64>())
     }
 
-    pub fn channels(&self) -> [(&'static str, Option<f64>); 5] {
-        CHANNELS.map(|(name, ops)| (name, sum(ops.iter().map(|&op| self.get(op)))))
+    pub fn channels(&self) -> [(Channel, Option<f64>); 5] {
+        Channel::ALL.map(|c| (c, sum(c.ops().iter().map(|&op| self.get(op)))))
     }
 }
 
@@ -668,7 +721,7 @@ mod tests {
     fn channels_render_unmeasured_pools_as_absent() {
         let channels = tier_a(10, 20, 0).channels();
         assert_eq!(
-            channels.map(|(name, _)| name),
+            channels.map(|(c, _)| c.name()),
             ["transparent", "sprout", "sapling", "orchard", "ironwood"]
         );
         assert_eq!(channels[0].1, None);
@@ -681,8 +734,8 @@ mod tests {
     #[test]
     fn every_op_appears_in_exactly_one_channel() {
         let mut seen = Vec::new();
-        for (_, ops) in CHANNELS {
-            seen.extend_from_slice(ops);
+        for c in Channel::ALL {
+            seen.extend_from_slice(c.ops());
         }
         for op in Op::ALL {
             assert_eq!(

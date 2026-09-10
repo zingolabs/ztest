@@ -48,7 +48,7 @@ pub use probe::{
 pub use runner::{
     DEFAULT_TICK, NullReporter, StderrReporter, SyncEngine, SyncOutcome, SyncReporter, SyncVerdict,
 };
-pub use series::{BLOCKS, CAPACITY as SERIES_CAPACITY, Cell, Channel, Timeline, plot_channels};
+pub use series::{BLOCKS, CAPACITY as SERIES_CAPACITY, Cell, Timeline, Track, plot_channels};
 pub use snapshot::{History, Snapshot};
 pub use subject::{Phase, ProgressView, SyncSubject};
 pub use tree::{TreeRoot, TreeRootError, TreeRoots};
@@ -56,7 +56,7 @@ pub use tree::{TreeRoot, TreeRootError, TreeRoots};
 // `TreeRoots` above is plain data, available to everyone
 #[cfg(feature = "librustzcash")]
 pub use tree::commitment_tree_root;
-pub use work::{CHANNELS, Mismatch, Op, OpSet, Rate, Segment, Work};
+pub use work::{Channel, Mismatch, Op, OpSet, Rate, Segment, Work};
 
 // Test-author facade; subject-agnostic, so it needs no backend feature
 mod facade;

@@ -568,7 +568,9 @@ fn build_holder(leases: &ObjectList<Lease>) -> Option<String> {
         .items
         .iter()
         .filter(|l| Beacon::kind_of(l) == LeaseKind::Build)
-        .min_by_key(|l| (l.metadata.creation_timestamp.as_ref().map(|t| t.0), l.metadata.name.clone()))
+        .min_by_key(|l| {
+            (l.metadata.creation_timestamp.as_ref().map(|t| t.0), l.metadata.name.clone())
+        })
         .and_then(|l| l.metadata.name.clone())
 }
 

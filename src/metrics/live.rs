@@ -294,7 +294,6 @@ fn failed(tx: &watch::Sender<Sample>, error: String) -> Sample {
 mod tests {
     use serde_json::json;
 
-    use super::super::Reduce;
     use super::super::tests::{EXPOSITION, exposition};
     use super::*;
 
@@ -339,7 +338,10 @@ mod tests {
     fn a_sample_states_why_it_has_no_values() {
         let at = || Some(Instant::now());
         let tip = |s: &Sample| {
-            s.exposition.reduce(crate::metrics::family("zaino_chain_tip_height"), Reduce::Max)
+            s.exposition.level(crate::metrics::gauge(
+                "zaino_chain_tip_height",
+                crate::metrics::Dimension::Count,
+            ))
         };
 
         // never read → no target yet
@@ -393,7 +395,10 @@ mod tests {
         let after = failed(&tx, "connection refused".into());
         assert_eq!(after.error.as_deref(), Some("connection refused"));
         assert_eq!(
-            after.exposition.reduce(crate::metrics::family("zaino_chain_tip_height"), Reduce::Max),
+            after.exposition.level(crate::metrics::gauge(
+                "zaino_chain_tip_height",
+                crate::metrics::Dimension::Count
+            )),
             Some(304.0)
         );
     }

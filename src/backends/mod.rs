@@ -22,18 +22,24 @@ pub mod zebra;
 struct MetricsBackend {
     label: &'static str,
     rows: &'static [crate::metrics::Row],
+    heights: Option<crate::sync::Heights>,
     observe: Option<fn(&crate::metrics::Exposition) -> Option<crate::sync::Observation>>,
 }
 
 impl MetricsBackend {
     /// Component whose sync is observable — rows and reader both off its impls
     const fn observed<T: crate::sync::Observe>(label: &'static str) -> Self {
-        Self { label, rows: <T as crate::metrics::MetricLayout>::ROWS, observe: Some(T::observe) }
+        Self {
+            label,
+            rows: <T as crate::metrics::MetricLayout>::ROWS,
+            heights: Some(T::HEIGHTS),
+            observe: Some(T::observe),
+        }
     }
 
     /// Publishes rows but no sync progress (nothing to watch a chain build)
     const fn rows_only<T: crate::metrics::MetricLayout>(label: &'static str) -> Self {
-        Self { label, rows: T::ROWS, observe: None }
+        Self { label, rows: T::ROWS, heights: None, observe: None }
     }
 }
 
@@ -56,6 +62,12 @@ pub fn metrics_rows(component_label: &str) -> &'static [crate::metrics::Row] {
 /// gone by report time)
 pub fn metrics_components() -> impl Iterator<Item = &'static crate::metrics::Row> {
     METRICS_BACKENDS.iter().flat_map(|b| b.rows)
+}
+
+/// Height gauges the bundled backends declare, for a reader resolving a progress row by
+/// what it *is* rather than by how it is spelled on screen
+pub fn metrics_heights() -> impl Iterator<Item = crate::sync::Heights> {
+    METRICS_BACKENDS.iter().filter_map(|b| b.heights)
 }
 
 /// Bundled backends in report order — the subject ahead of what it proxies, so a

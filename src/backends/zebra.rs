@@ -13,7 +13,7 @@ use crate::handles::validator::{
     PoolSupport, ValidatorBackend, ValidatorConfig,
 };
 use crate::handles::wallet::Pool;
-use crate::metrics::{Facet, Reduce, Row, Unit, family, row};
+use crate::metrics::{Facet, Row, row};
 use crate::protocol::Endpoint;
 use crate::protocol::client::{AuthedRpc, JsonRpcClient, json_rpc, wait_for_rpc_ready};
 use crate::protocol::zcash_rpc::ZcashRpc;
@@ -168,11 +168,21 @@ pub struct ZebraValidator {
 ///
 /// Verification switches families at the highest checkpoint (concurrency 1000 → 20), so a
 /// per-regime one draws a cliff that is a metric artifact; `verified_block_total` spans both
+mod family {
+    use crate::metrics::{Counter, Dimension, Gauge, counter, gauge};
+
+    pub const VERIFIED_HEIGHT: Gauge =
+        gauge("zebrad_chain_verified_block_height", Dimension::Count);
+    pub const VERIFIED_TOTAL: Counter =
+        counter("zebrad_chain_verified_block_total", Dimension::Count);
+    pub const PEERS: Gauge = gauge("zebrad_network_peers", Dimension::Count);
+}
+
 #[rustfmt::skip]
 const ROWS: [Row; 3] = [
-    row("validator best height", family("zebrad_chain_verified_block_height"), Reduce::Max, Unit::Count, Facet::Progress),
-    row("blocks verified", family("zebrad_chain_verified_block_total"), Reduce::Sum, Unit::PerSec, Facet::Throughput),
-    row("connected peers", family("zebrad_network_peers"), Reduce::Max, Unit::Count, Facet::Progress),
+    row("validator best height", family::VERIFIED_HEIGHT.level(), Facet::Progress),
+    row("blocks verified", family::VERIFIED_TOTAL.rate(), Facet::Throughput),
+    row("connected peers", family::PEERS.level(), Facet::Progress),
 ];
 
 impl crate::metrics::MetricLayout for ZebraValidator {

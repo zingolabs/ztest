@@ -28,18 +28,24 @@ pub use self::live::{Exporter, LIVE_PERIOD, PodExporter, Poller, Sample};
 /// keeps a pod by it, [`PodExporter`] discovers by it, every `pod_spec` declares it
 pub const PORT_NAME: &str = "metrics";
 
-// ──────────────────────────────── the rows ────────────────────────────────
+/// Cadence the collect plane samples at. Stated once — the Prometheus ConfigMap is rendered
+/// from it, and a plot `step` under it invents points Prometheus fills by repeating the last
+/// sample, a flat stretch that never happened
+pub const SCRAPE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Family → the one scalar a reader shows.
+// ──────────────────────────────── the catalogue ────────────────────────────────
+
+/// Wire dimension of a published value, base units only.
 ///
-/// - `Sum` = counter, `Max` = gauge; wrong choice reads a reorg rollback as a reset
-/// - `Mean`/`Quantile` windowed off cumulative parts (lifetime mean converges, hiding late decay)
+/// - Renderer scales (ms, MiB, `/s`); a catalogue that stores a display unit drifts from the wire
+/// - `Seconds` vs `Ratio` = what the seconds are seconds *of*: cpu time is unbounded-parallel
+///   (rated → cores), a PSI stall is bounded by wall clock (rated → a fraction)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reduce {
-    Sum,
-    Max,
-    Mean,
-    Quantile(Phi),
+pub enum Dimension {
+    Seconds,
+    Bytes,
+    Ratio,
+    Count,
 }
 
 /// Quantile a bucketed histogram answers (interpolated in-bucket → only as good as the ladder)
@@ -84,13 +90,15 @@ pub struct Select {
     pub value: &'static str,
 }
 
-/// Family name + the selector making it one quantity.
+/// Family name + the selector making it one quantity + what it is measured in.
 ///
-/// Carried instead of `&str` so both planes read the same selector (dropped = silently refolded)
+/// Reached through a shape witness ([`Counter`]/[`Gauge`]/[`Hist`]), never declared bare — the
+/// shape is what makes a [`Reading`] legal
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Family {
     pub name: &'static str,
     pub select: Option<Select>,
+    pub dim: Dimension,
 }
 
 /// Selector included — "nothing published" != "that label value never published"
@@ -103,22 +111,155 @@ impl std::fmt::Display for Family {
     }
 }
 
-/// Whole family, every label set folded together
-pub const fn family(name: &'static str) -> Family {
-    Family { name, select: None }
+/// Monotonic cumulative count. Resets to 0 on producer restart
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counter(Family);
+/// Level sampled as published. A decrease is a real move, never a restart
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gauge(Family);
+/// Cumulative `_sum`/`_count`/`_bucket` ladder.
+///
+/// No `Summary` peer: producer-windowed quantiles are not re-aggregatable, so nothing can read one
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hist(Family);
+
+pub const fn counter(name: &'static str, dim: Dimension) -> Counter {
+    Counter(Family { name, select: None, dim })
+}
+
+pub const fn gauge(name: &'static str, dim: Dimension) -> Gauge {
+    Gauge(Family { name, select: None, dim })
+}
+
+pub const fn hist(name: &'static str, dim: Dimension) -> Hist {
+    Hist(Family { name, select: None, dim })
 }
 
 /// Split family, narrowed to one label value
-pub const fn family_where(name: &'static str, label: &'static str, value: &'static str) -> Family {
-    Family { name, select: Some(Select { label, value }) }
+pub const fn counter_where(
+    name: &'static str,
+    dim: Dimension,
+    label: &'static str,
+    value: &'static str,
+) -> Counter {
+    Counter(Family { name, select: Some(Select { label, value }), dim })
 }
 
-/// Which reading a row belongs to, so a renderer groups by meaning rather than by
-/// matching family names it would have to hardcode per backend.
+macro_rules! shape {
+    ($($t:ty),*) => {$(
+        impl $t {
+            pub const fn family(self) -> Family {
+                self.0
+            }
+        }
+        impl std::fmt::Display for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    )*};
+}
+shape!(Counter, Gauge, Hist);
+
+impl Counter {
+    /// Per-second plot + the exact count it accumulated
+    pub const fn rate(self) -> Reading {
+        Reading::Rate(self.0)
+    }
+}
+
+impl Gauge {
+    pub const fn level(self) -> Reading {
+        Reading::Level(self.0)
+    }
+
+    /// Per-second plot + net progress across the run
+    pub const fn slope(self) -> Reading {
+        Reading::Slope(self.0)
+    }
+
+    /// Net change only, no plot
+    pub const fn progress(self) -> Reading {
+        Reading::Progress(self.0)
+    }
+}
+
+impl Hist {
+    pub const fn mean(self) -> Reading {
+        Reading::Mean(self.0)
+    }
+
+    pub const fn p(self, phi: Phi) -> Reading {
+        Reading::Quantile(self.0, phi)
+    }
+}
+
+/// The projections that mean anything, closed.
 ///
-/// - `Transparent`/`Shielded` rows are per-pool and stack: `label` = the pool, keyed by
-///   `ztest_ui`'s pool palette. Split because the two answer
-///   different questions (utxo churn vs note-commitment work) and share no scale
+/// Both planes are a total match over these arms — a seventh fails to compile in both at once.
+/// Constructed only through a shape witness, so `Gauge::rate` (a reorg read as a counter reset,
+/// adding back the whole height) does not exist to be written
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    Rate(Family),
+    Slope(Family),
+    Level(Family),
+    Progress(Family),
+    Mean(Family),
+    Quantile(Family, Phi),
+}
+
+impl Reading {
+    pub const fn family(self) -> Family {
+        match self {
+            Reading::Rate(f)
+            | Reading::Slope(f)
+            | Reading::Level(f)
+            | Reading::Progress(f)
+            | Reading::Mean(f) => f,
+            Reading::Quantile(f, _) => f,
+        }
+    }
+
+    /// Cumulative on the wire → differenced before it means anything
+    pub const fn cumulative(self) -> bool {
+        matches!(self, Reading::Rate(_) | Reading::Mean(_) | Reading::Quantile(_, _))
+    }
+
+    /// Carries a whole-run count (a level and a latency do not)
+    pub const fn totalled(self) -> bool {
+        matches!(self, Reading::Rate(_) | Reading::Slope(_) | Reading::Progress(_))
+    }
+
+    /// Plotted over time (`Progress` is one number, and a latency plots per stage, not stacked)
+    pub const fn plotted(self) -> bool {
+        matches!(self, Reading::Rate(_) | Reading::Slope(_) | Reading::Level(_))
+    }
+
+    /// Unit of the *result*, derived — a declared one drifts from the wire
+    pub const fn unit(self) -> Unit {
+        match self {
+            Reading::Rate(f) | Reading::Slope(f) => match f.dim {
+                Dimension::Bytes => Unit::BytesPerSec,
+                Dimension::Seconds => Unit::Cores,
+                Dimension::Ratio => Unit::Fraction,
+                Dimension::Count => Unit::PerSec,
+            },
+            Reading::Mean(_) | Reading::Quantile(_, _) => Unit::Millis,
+            Reading::Level(f) | Reading::Progress(f) => match f.dim {
+                Dimension::Bytes => Unit::Bytes,
+                Dimension::Seconds => Unit::Millis,
+                Dimension::Ratio => Unit::Fraction,
+                Dimension::Count => Unit::Count,
+            },
+        }
+    }
+}
+
+/// Which panel a row belongs to, so a renderer groups by meaning rather than by matching
+/// family names it would have to hardcode per backend.
+///
+/// - `Transparent`/`Shielded` rows are per-pool and stack, keyed by [`Channel`](crate::sync::Channel)
 /// - Container cpu/mem carries no facet (kubelet's, not a component's)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Facet {
@@ -133,25 +274,34 @@ pub enum Facet {
 
 /// One published metric, owned by its publishing backend (never a global table here).
 ///
-/// - `label` names the quantity, `unit` carries what it is measured in (a label
-///   spelling its own unit renders it twice)
+/// `channel` set on the per-pool rows only — it is what folds a split (spends + outputs) and
+/// keys the stack's colour, in place of matching the display label
 #[derive(Debug, Clone, Copy)]
 pub struct Row {
     pub label: &'static str,
-    pub family: Family,
-    pub reduce: Reduce,
-    pub unit: Unit,
+    pub reading: Reading,
     pub facet: Facet,
+    pub channel: Option<crate::sync::Channel>,
 }
 
-pub const fn row(
-    label: &'static str,
-    family: Family,
-    reduce: Reduce,
-    unit: Unit,
-    facet: Facet,
-) -> Row {
-    Row { label, family, reduce, unit, facet }
+pub const fn row(label: &'static str, reading: Reading, facet: Facet) -> Row {
+    Row { label, reading, facet, channel: None }
+}
+
+impl Row {
+    /// Pool this row stacks into
+    pub const fn pool(mut self, channel: crate::sync::Channel) -> Row {
+        self.channel = Some(channel);
+        self
+    }
+
+    pub const fn family(&self) -> Family {
+        self.reading.family()
+    }
+
+    pub const fn unit(&self) -> Unit {
+        self.reading.unit()
+    }
 }
 
 /// What one component publishes, declared beside the family constants it owns.
@@ -269,19 +419,23 @@ impl Exposition {
         Some(Tally { sum, count })
     }
 
-    /// Whether `row` resolves in the *shape* its reduction needs.
+    /// Whether `row` resolves in the *shape* its reading needs.
     ///
-    /// Shape, not name: a gauge turned histogram upstream keeps its name and stops answering `Max`
+    /// Shape, not name: a gauge turned histogram upstream keeps its name and stops answering a level
     pub fn resolves(&self, row: &Row) -> bool {
-        match row.reduce {
-            Reduce::Sum | Reduce::Max => self.values(row.family).is_some(),
-            Reduce::Mean => self.tally(row.family).is_some(),
-            Reduce::Quantile(_) => self.buckets(row.family).is_some_and(|b| !b.is_empty()),
+        let family = row.family();
+        match row.reading {
+            Reading::Rate(_) | Reading::Slope(_) | Reading::Level(_) | Reading::Progress(_) => {
+                self.values(family).is_some()
+            }
+            Reading::Mean(_) => self.tally(family).is_some(),
+            Reading::Quantile(_, _) => self.buckets(family).is_some_and(|b| !b.is_empty()),
         }
     }
 
     /// Cumulative parts + the ladder a quantile needs, where the producer bucketed it
-    pub fn timing(&self, family: Family) -> Option<crate::sync::Timing> {
+    pub fn timing(&self, hist: Hist) -> Option<crate::sync::Timing> {
+        let family = hist.family();
         Some(crate::sync::Timing {
             tally: self.tally(family)?,
             buckets: self.buckets(family).unwrap_or_default().into(),
@@ -318,33 +472,31 @@ impl Exposition {
         Some(points.iter().filter(move |p| admits(select, &p.labels)).map(|p| p.value))
     }
 
-    /// Instantaneous reductions only. Absent family → `None`, never a zero.
-    ///
-    /// `Mean`/`Quantile` need a span — read [`tally`](Self::tally)/[`buckets`](Self::buckets)
-    pub fn reduce(&self, family: Family, reduce: Reduce) -> Option<f64> {
-        match reduce {
-            Reduce::Sum => Some(self.values(family)?.sum()),
-            Reduce::Max => self
-                .values(family)?
-                .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v)))),
-            Reduce::Mean | Reduce::Quantile(_) => None,
-        }
+    /// Cumulative total across every admitted label set. Absent family → `None`, never a zero
+    pub fn total(&self, counter: Counter) -> Option<f64> {
+        Some(self.values(counter.family())?.sum())
     }
 
-    /// Gauge → whole number.
+    /// Largest across admitted label sets — a level is one quantity however many targets
+    /// report it, and summing two would invent a height neither reached
+    pub fn level(&self, gauge: Gauge) -> Option<f64> {
+        self.values(gauge.family())?
+            .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
+    }
+
+    /// Height gauge → whole number.
     ///
     /// - Every gauge here = a block height the exporter widened to `f64`; narrow at
     ///   the read so that leaks into no probe arithmetic
     /// - Negative/non-finite → `None`, never a wrapped `u32` (broken exporter, not a low height)
-    pub fn height_gauge(&self, family: Family) -> Option<u32> {
-        let v = self.reduce(family, Reduce::Max)?;
+    pub fn height(&self, gauge: Gauge) -> Option<u32> {
+        let v = self.level(gauge)?;
         (v.is_finite() && v >= 0.0).then_some(v as u32)
     }
 
-    /// Counter total → whole number, under [`height_gauge`](Self::height_gauge)'s
-    /// narrowing contract
-    pub fn counter_total(&self, family: Family) -> Option<u64> {
-        let v = self.reduce(family, Reduce::Sum)?;
+    /// Counter total → whole number, under [`height`](Self::height)'s narrowing contract
+    pub fn counter_total(&self, counter: Counter) -> Option<u64> {
+        let v = self.total(counter)?;
         (v.is_finite() && v >= 0.0).then_some(v as u64)
     }
 }
@@ -396,29 +548,26 @@ zaino_grpc_request_duration_seconds_count 17
     #[test]
     fn a_selector_narrows_a_split_family_instead_of_folding_it() {
         let e = exposition(&[EXPOSITION]);
-        let all = family("zaino_grpc_requests_total");
-        let one = family_where("zaino_grpc_requests_total", "method", "GetBlock");
-        let absent = family_where("zaino_grpc_requests_total", "method", "GetTreeState");
+        let named = |l, v| counter_where("zaino_grpc_requests_total", Dimension::Count, l, v);
+        let all = counter("zaino_grpc_requests_total", Dimension::Count);
 
-        assert_eq!(e.reduce(all, Reduce::Sum), Some(17.0), "unselected folds both methods");
-        assert_eq!(e.reduce(one, Reduce::Sum), Some(12.0), "selector reads its own value");
+        assert_eq!(e.total(all), Some(17.0), "unselected folds both methods");
+        assert_eq!(e.total(named("method", "GetBlock")), Some(12.0), "selector reads its own");
         assert_eq!(
-            e.reduce(absent, Reduce::Sum),
+            e.total(named("method", "GetTreeState")),
             Some(0.0),
             "family present, value never published"
         );
-        assert_eq!(e.reduce(family("never_published"), Reduce::Sum), None);
+        assert_eq!(e.total(counter("never_published", Dimension::Count)), None);
     }
 
     /// One scrape carries only the lifetime figure — converges, hiding the decay
     #[test]
     fn a_windowed_reduction_refuses_to_answer_from_one_scrape() {
         let e = exposition(&[EXPOSITION]);
-        let latency = family("zaino_grpc_request_duration_seconds");
-        assert_eq!(e.reduce(latency, Reduce::Mean), None);
-        assert_eq!(e.reduce(latency, Reduce::Quantile(Phi::P99)), None);
+        let latency = hist("zaino_grpc_request_duration_seconds", Dimension::Seconds);
         assert_eq!(
-            e.tally(latency),
+            e.tally(latency.family()),
             Some(Tally { sum: 0.85, count: 17.0 }),
             "the cumulative parts are what a window differences"
         );
@@ -436,7 +585,11 @@ zaino_grpc_request_duration_seconds_count 17
              zaino_sync_block_fetch_seconds_sum{stage=\"non-finalised\"} 9.0\n\
              zaino_sync_block_fetch_seconds_count{stage=\"non-finalised\"} 50\n",
         );
-        let one = family_where("zaino_sync_block_fetch_seconds", "stage", "finalised");
+        let one = Family {
+            name: "zaino_sync_block_fetch_seconds",
+            select: Some(Select { label: "stage", value: "finalised" }),
+            dim: Dimension::Seconds,
+        };
         assert_eq!(e.tally(one), Some(Tally { sum: 0.6, count: 100.0 }));
 
         let before = Tally { sum: 0.0, count: 0.0 };
@@ -465,22 +618,22 @@ zaino_grpc_request_duration_seconds_count 17
     #[test]
     fn a_counters_label_sets_sum_into_one_family_total() {
         let e = exposition(&[EXPOSITION]);
-        assert_eq!(e.reduce(family("zaino_grpc_requests_total"), Reduce::Sum), Some(17.0));
+        assert_eq!(e.total(counter("zaino_grpc_requests_total", Dimension::Count)), Some(17.0));
     }
 
     #[test]
-    fn a_gauge_reduces_by_max_across_targets() {
+    fn a_level_is_the_max_across_targets_never_their_sum() {
         let e = exposition(&[
             EXPOSITION,
             "# TYPE zaino_chain_tip_height gauge\nzaino_chain_tip_height 309\n",
         ]);
-        assert_eq!(e.reduce(family("zaino_chain_tip_height"), Reduce::Max), Some(309.0));
+        assert_eq!(e.level(gauge("zaino_chain_tip_height", Dimension::Count)), Some(309.0));
     }
 
     /// Only path to a quantile — `_sum`/`_count` bound the mean, saying nothing of the tail
     #[test]
     fn a_quantile_comes_from_bucket_deltas_not_from_all_history() {
-        let hist = |le_5ms: u32, le_50ms: u32, inf: u32| {
+        let ladder = |le_5ms: u32, le_50ms: u32, inf: u32| {
             let mut e = Exposition::default();
             e.absorb(&format!(
                 "# TYPE fetch_seconds histogram\n\
@@ -488,11 +641,11 @@ zaino_grpc_request_duration_seconds_count 17
                  fetch_seconds_bucket{{le=\"0.05\"}} {le_50ms}\n\
                  fetch_seconds_bucket{{le=\"+Inf\"}} {inf}\n"
             ));
-            e.buckets(family("fetch_seconds")).expect("bucketed")
+            e.buckets(hist("fetch_seconds", Dimension::Seconds).family()).expect("bucketed")
         };
         // History: 100 fast. Window: 100 more, all in the 5–50ms bucket
-        let before = hist(100, 100, 100);
-        let after = hist(100, 200, 200);
+        let before = ladder(100, 100, 100);
+        let after = ladder(100, 200, 200);
         let p50 = windowed_quantile(&before, &after, Phi::P50).expect("observed");
         assert!((5.0..=50.0).contains(&p50), "p50 {p50}ms sits in the window's own bucket");
 
@@ -508,17 +661,94 @@ zaino_grpc_request_duration_seconds_count 17
         assert_eq!(windowed_quantile(&before, &rebucketed, Phi::P50), None);
     }
 
+    /// Both planes read one catalogue, so every arm must be answerable by both. A reading
+    /// the live plane cannot resolve renders `—` where the report shows a number, and the
+    /// two disagreeing is exactly the class of defect this catalogue exists to stop
+    #[test]
+    fn every_reading_a_backend_declares_resolves_against_a_live_exposition() {
+        let e = exposition(&[
+            EXPOSITION,
+            "# TYPE zaino_sync_orchard_actions_total counter\n\
+             zaino_sync_orchard_actions_total 4200\n\
+             # TYPE zaino_sync_fetched_height gauge\n\
+             zaino_sync_fetched_height 658599\n\
+             # TYPE zaino_sync_block_fetch_seconds histogram\n\
+             zaino_sync_block_fetch_seconds_sum 0.6\n\
+             zaino_sync_block_fetch_seconds_count 100\n\
+             zaino_sync_block_fetch_seconds_bucket{le=\"0.005\"} 90\n\
+             zaino_sync_block_fetch_seconds_bucket{le=\"+Inf\"} 100\n",
+        ]);
+        let counter = counter("zaino_sync_orchard_actions_total", Dimension::Count);
+        let gauge = gauge("zaino_sync_fetched_height", Dimension::Count);
+        let hist = hist("zaino_sync_block_fetch_seconds", Dimension::Seconds);
+
+        for reading in [
+            counter.rate(),
+            gauge.level(),
+            gauge.slope(),
+            gauge.progress(),
+            hist.mean(),
+            hist.p(Phi::P99),
+        ] {
+            let row = row("probe", reading, Facet::Progress);
+            assert!(e.resolves(&row), "{reading:?} published but unresolvable live");
+        }
+    }
+
+    /// The unit is derived from the wire dimension, so a renderer cannot be handed a
+    /// per-second figure labelled as a level, or seconds labelled as milliseconds
+    #[test]
+    fn a_readings_unit_follows_its_wire_dimension() {
+        let cpu = counter("container_cpu_usage_seconds_total", Dimension::Seconds);
+        let stall = counter("container_pressure_io_stalled_seconds_total", Dimension::Ratio);
+        let bytes = counter("container_blkio_device_usage_total", Dimension::Bytes);
+        let ops = counter("zaino_sync_orchard_actions_total", Dimension::Count);
+
+        assert_eq!(cpu.rate().unit(), Unit::Cores, "cpu-seconds per second = parallelism");
+        assert_eq!(stall.rate().unit(), Unit::Fraction, "stall is bounded by wall clock");
+        assert_eq!(bytes.rate().unit(), Unit::BytesPerSec);
+        assert_eq!(ops.rate().unit(), Unit::PerSec);
+
+        let height = gauge("zaino_sync_fetched_height", Dimension::Count);
+        assert_eq!(height.level().unit(), Unit::Count);
+        assert_eq!(height.slope().unit(), Unit::PerSec);
+        assert_eq!(
+            hist("zaino_sync_block_fetch_seconds", Dimension::Seconds).mean().unit(),
+            Unit::Millis,
+            "a seconds histogram renders as ms"
+        );
+    }
+
+    /// A level has no whole-run count and a latency has no plot; asking either for one is
+    /// how a rate came to be integrated into a total in the first place
+    #[test]
+    fn only_a_flow_carries_a_total_and_only_a_level_or_flow_is_plotted() {
+        let c = counter("c_total", Dimension::Count);
+        let g = gauge("g", Dimension::Count);
+        let h = hist("h_seconds", Dimension::Seconds);
+
+        assert!(c.rate().totalled() && c.rate().plotted());
+        assert!(g.slope().totalled() && g.slope().plotted());
+        assert!(g.progress().totalled() && !g.progress().plotted());
+        assert!(!g.level().totalled() && g.level().plotted());
+        assert!(!h.mean().totalled() && !h.mean().plotted());
+        assert!(!h.p(Phi::P99).totalled());
+    }
+
     /// Unpublished family reads absent, never as a zero a probe accepts as an observation
     #[test]
     fn an_absent_family_is_none_rather_than_zero() {
         let e = exposition(&[EXPOSITION]);
-        assert_eq!(e.height_gauge(family("zaino_sync_finalized_height")), None);
-        assert_eq!(e.counter_total(family("zaino_sync_orchard_actions_total")), None);
+        assert_eq!(e.height(gauge("zaino_sync_finalized_height", Dimension::Count)), None);
+        assert_eq!(
+            e.counter_total(counter("zaino_sync_orchard_actions_total", Dimension::Count)),
+            None
+        );
     }
 
     #[test]
-    fn a_height_gauge_narrows_back_to_a_whole_height() {
+    fn a_height_narrows_back_to_a_whole_height() {
         let e = exposition(&[EXPOSITION]);
-        assert_eq!(e.height_gauge(family("zaino_chain_tip_height")), Some(304));
+        assert_eq!(e.height(gauge("zaino_chain_tip_height", Dimension::Count)), Some(304));
     }
 }

@@ -701,7 +701,7 @@ pub fn render_sync_work(
 
     let palette = Palette::pools(theme.is_colorized());
     let opts = PlotOpts::new(SPARK_WIDTH, 1, theme.chars.graph);
-    // Measured channels only, in `CHANNELS` (oldest-pool-first) order, leaving a
+    // Measured channels only, in `Channel` (oldest-pool-first) order, leaving a
     // row for the total.
     // Filtered *before* the row budget is applied: taking first would spend the
     // budget on tier-B channels that are then skipped, and the pools that were
@@ -709,16 +709,16 @@ pub fn render_sync_work(
     let measured = vitals
         .pool_rates
         .iter()
-        .map(|(name, rate)| (*name, rate, timeline.bands(name)))
+        .map(|(c, rate)| (*c, rate, timeline.bands(c.name())))
         .filter(|(_, _, bands)| bands.iter().any(Option::is_some));
 
     let mut drawn = 0;
     // Sparkline drawn here, not through a `{key:N~}` cell: the palette keys on the
     // channel name, which a template's literal key cannot carry per pool
     let fresh = |r: Option<f64>| r.filter(|_| !stale);
-    for (name, r, bands) in measured.take(MAX_TRANSFER_ROWS.saturating_sub(1)) {
-        let spark = plot_stacked(&[(name, bands)], &opts, &palette).pop().unwrap_or_default();
-        let f = Fields::new().text("label", side_label(name)).text("spark", spark);
+    for (c, r, bands) in measured.take(MAX_TRANSFER_ROWS.saturating_sub(1)) {
+        let spark = plot_stacked(&[(c.name(), bands)], &opts, &palette).pop().unwrap_or_default();
+        let f = Fields::new().text("label", side_label(c.name())).text("spark", spark);
         draw(
             &mut out,
             rate(f, "rate", "rate_na", fresh(*r)),
@@ -992,6 +992,7 @@ pub fn render_cancel_panel(elapsed: std::time::Duration, theme: &Theme) -> Strin
 mod tests {
     use super::super::*;
     use super::*;
+    use ztest::api::Channel;
     use ztest::api::GIB;
     use ztest::api::QosClass;
 
@@ -1302,7 +1303,10 @@ mod tests {
                     QosClass::Sync,
                     TierLive { count: 1, reserve: Resources::new(8_000, 16 * GIB, 0, 0) },
                 ),
-                (QosClass::Integration, TierLive { count: 2, reserve: Resources::new(1_000, GIB, 0, 0) }),
+                (
+                    QosClass::Integration,
+                    TierLive { count: 2, reserve: Resources::new(1_000, GIB, 0, 0) },
+                ),
             ]),
             committed: Resources::new(9_000, 17 * GIB, 0, 0),
         };
@@ -1457,11 +1461,11 @@ mod tests {
             // idle — the panel must render that difference
             work_rate: Some(23_600.0),
             pool_rates: vec![
-                ("transparent", None),
-                ("sprout", None),
-                ("sapling", Some(19_400.0)),
-                ("orchard", Some(4_200.0)),
-                ("ironwood", Some(0.0)),
+                (Channel::Transparent, None),
+                (Channel::Sprout, None),
+                (Channel::Sapling, Some(19_400.0)),
+                (Channel::Orchard, Some(4_200.0)),
+                (Channel::Ironwood, Some(0.0)),
             ],
             cost: ztest::api::CostMs {
                 fetch: latency(41.2, 96.0),

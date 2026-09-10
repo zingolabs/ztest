@@ -152,17 +152,21 @@ impl Palette {
         match colorize {
             false => Palette::plain(),
             true => Palette {
-                channels: vec![
-                    ("transparent", Style::new().bright_black()),
-                    ("transparent in", Style::new().bright_black()),
-                    ("transparent out", Style::new().bright_black()),
-                    ("sprout", Style::new().magenta()),
-                    ("sapling", Style::new().yellow()),
-                    ("sapling spends", Style::new().yellow()),
-                    ("sapling outputs", Style::new().yellow()),
-                    ("orchard", Style::new().green()),
-                    ("ironwood", Style::new().cyan()),
-                ],
+                // Off `Channel::ALL`, so a pool added upstream cannot render in the fallback
+                // colour while its legend claims a hue
+                channels: ztest::api::Channel::ALL
+                    .iter()
+                    .map(|c| {
+                        let style = match c {
+                            ztest::api::Channel::Transparent => Style::new().bright_black(),
+                            ztest::api::Channel::Sprout => Style::new().magenta(),
+                            ztest::api::Channel::Sapling => Style::new().yellow(),
+                            ztest::api::Channel::Orchard => Style::new().green(),
+                            ztest::api::Channel::Ironwood => Style::new().cyan(),
+                        };
+                        (c.name(), style)
+                    })
+                    .collect(),
                 default: Style::new().white(),
                 axis: Style::new().bright_black(),
                 baseline: Style::new().blue(),
@@ -187,7 +191,12 @@ impl Palette {
         self.baseline
     }
 
-    pub fn style_of(&self, channel: &str) -> Style {
+    pub fn style_of(&self, channel: Option<ztest::api::Channel>) -> Style {
+        self.style_named(channel.map(|c| c.name()).unwrap_or_default())
+    }
+
+    /// Plot channels arrive as names (a container series has no pool)
+    pub fn style_named(&self, channel: &str) -> Style {
         self.channels
             .iter()
             .find(|(name, _)| *name == channel)
@@ -253,7 +262,7 @@ pub type Channel<'a> = (&'a str, Vec<Band>);
 pub fn plot_stacked(channels: &[Channel<'_>], opts: &PlotOpts, palette: &Palette) -> Vec<String> {
     let series: Vec<&[Band]> = channels.iter().map(|(_, b)| b.as_slice()).collect();
     // Per plot, not per cell (name lookup = linear scan, fold runs width × height/frame)
-    let styles: Vec<Style> = channels.iter().map(|(name, _)| palette.style_of(name)).collect();
+    let styles: Vec<Style> = channels.iter().map(|(name, _)| palette.style_named(name)).collect();
     render(&rasterize(&series, opts), opts, palette, &styles)
 }
 
@@ -916,7 +925,7 @@ mod tests {
             &o,
             &palette,
         );
-        let sapling = palette.style_of("sapling");
+        let sapling = palette.style_named("sapling");
         let mark = 'x'.style(sapling).to_string();
         let colour = mark.split('x').next().unwrap().to_string();
         assert!(!colour.is_empty(), "the pool palette must be colourised");

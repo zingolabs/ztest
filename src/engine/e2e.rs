@@ -65,8 +65,8 @@ impl Drop for Fixture {
 /// lowering one without a footprint panics, exactly as it would for a real profile
 fn qos(binary_id: &str, helper: &str, class: QosClass) -> (String, Vec<QosEntry>) {
     let test_id = format!("somecrate::{}", child::test_name(helper));
-    let footprint = (class == QosClass::Sync)
-        .then(|| Resources::new(15_000, 15 * crate::qos::GIB, 0, 0));
+    let footprint =
+        (class == QosClass::Sync).then(|| Resources::new(15_000, 15 * crate::qos::GIB, 0, 0));
     (binary_id.to_string(), vec![QosEntry { test_id, class, footprint }])
 }
 

@@ -58,7 +58,7 @@ impl Cell {
 
 /// One named series within a [`Timeline`], on the timeline's axis
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Channel {
+pub struct Track {
     pub name: String,
     pub cells: Vec<Cell>,
 }
@@ -68,10 +68,10 @@ pub struct Channel {
 pub const BLOCKS: &str = "blocks";
 
 /// Plotted channels in stacking order: blocks, then
-/// [`CHANNELS`](super::work::CHANNELS). Stated once — driver and watcher both
+/// [`Channel`](super::work::Channel). Stated once — driver and watcher both
 /// build from it, and a builder-dependent stack order would be unreadable
 pub fn plot_channels() -> impl Iterator<Item = &'static str> {
-    std::iter::once(BLOCKS).chain(super::work::CHANNELS.iter().map(|(name, _)| *name))
+    std::iter::once(BLOCKS).chain(super::work::Channel::ALL.iter().map(|c| c.name()))
 }
 
 /// Fixed-capacity multi-channel timeline on a shared, self-coarsening axis.
@@ -80,7 +80,7 @@ pub fn plot_channels() -> impl Iterator<Item = &'static str> {
 pub struct Timeline {
     #[serde(rename = "w_ms")]
     width_ms: u64,
-    channels: Vec<Channel>,
+    channels: Vec<Track>,
 }
 
 impl Timeline {
@@ -97,7 +97,7 @@ impl Timeline {
             width_ms: (width.as_millis() as u64).max(1),
             channels: names
                 .into_iter()
-                .map(|name| Channel { name: name.into(), cells: Vec::new() })
+                .map(|name| Track { name: name.into(), cells: Vec::new() })
                 .collect(),
         }
     }
@@ -115,11 +115,11 @@ impl Timeline {
     }
 
     /// Construction order = stack order for a stacked-area render
-    pub fn channels(&self) -> &[Channel] {
+    pub fn channels(&self) -> &[Track] {
         &self.channels
     }
 
-    pub fn channel(&self, name: &str) -> Option<&Channel> {
+    pub fn channel(&self, name: &str) -> Option<&Track> {
         self.channels.iter().find(|c| c.name == name)
     }
 

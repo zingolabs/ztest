@@ -967,12 +967,15 @@ mod tests {
         assert_eq!(v.height, 1_000);
         assert_eq!(v.pace.map(|p| p.per_sec), Some(50.0), "100 blocks over 2s");
         assert_eq!(
-            v.pool_rates.iter().find(|(name, _)| *name == "transparent").map(|(_, r)| *r),
+            v.pool_rates
+                .iter()
+                .find(|(c, _)| *c == ztest::api::Channel::Transparent)
+                .map(|(_, r)| *r),
             Some(Some(1_000.0)),
             "2,000 transparent ops over 2s"
         );
         assert_eq!(
-            v.pool_rates.iter().find(|(name, _)| *name == "orchard").map(|(_, r)| *r),
+            v.pool_rates.iter().find(|(c, _)| *c == ztest::api::Channel::Orchard).map(|(_, r)| *r),
             Some(None),
             "a pool this exposition never published stays unmeasured"
         );
@@ -1120,12 +1123,13 @@ mod tests {
             );
         }
         let vitals = f.state.vitals.expect("a tick landed");
-        let rate =
-            |name: &str| vitals.pool_rates.iter().find(|(n, _)| *n == name).and_then(|(_, r)| *r);
-        assert_eq!(rate("sapling"), Some(19.4));
-        assert_eq!(rate("orchard"), Some(4.2));
-        assert_eq!(rate("transparent"), None, "tier B was never counted");
-        assert_eq!(rate("sprout"), None);
+        let rate = |c: ztest::api::Channel| {
+            vitals.pool_rates.iter().find(|(n, _)| *n == c).and_then(|(_, r)| *r)
+        };
+        assert_eq!(rate(ztest::api::Channel::Sapling), Some(19.4));
+        assert_eq!(rate(ztest::api::Channel::Orchard), Some(4.2));
+        assert_eq!(rate(ztest::api::Channel::Transparent), None, "tier B was never counted");
+        assert_eq!(rate(ztest::api::Channel::Sprout), None);
         let total = vitals.work_rate.expect("a measured total");
         assert!((total - 23.6).abs() < 1e-9, "{total}");
     }

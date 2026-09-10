@@ -181,8 +181,7 @@ pub fn build_work_list(
             // profile (override must reach the scheduler request, not flatten to the default)
             let declared = bin_tiers.and_then(|m| declared_qos(m, test_name.as_str()));
             let class = declared.map_or_else(QosClass::default, |e| e.class);
-            let profile =
-                declared.map_or_else(|| QosClass::default().profile(), |e| e.profile());
+            let profile = declared.map_or_else(|| QosClass::default().profile(), |e| e.profile());
             let item_deps = deps.for_item(&bin.binary_id, test_name);
             items.push(WorkItem {
                 binary_id: bin.binary_id.clone(),

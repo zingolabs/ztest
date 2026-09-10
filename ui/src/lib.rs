@@ -321,7 +321,7 @@ pub struct SetupStep {
 /// - `None` rate = unmeasured, not idle; renders `—` not `0`
 /// - `pace` blocks/sec + its ETA, together so the countdown can never outlive the rate
 ///   it was projected from
-/// - `pool_rates` in [`CHANNELS`](ztest::api::CHANNELS) order = graph stacking order
+/// - `pool_rates` in [`Channel`](ztest::api::Channel) order = graph stacking order
 /// - `received_at` session-elapsed → stale rates blank by subtraction
 #[derive(Debug, Clone)]
 pub struct SyncVitals {
@@ -335,7 +335,7 @@ pub struct SyncVitals {
     pub pace: Option<ztest::api::Pace>,
     pub tx_rate: Option<f64>,
     pub work_rate: Option<f64>,
-    pub pool_rates: Vec<(&'static str, Option<f64>)>,
+    pub pool_rates: Vec<(ztest::api::Channel, Option<f64>)>,
     pub cost: ztest::api::CostMs,
     pub received_at: std::time::Duration,
 }

@@ -12,13 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kube::Client;
 use serde::Deserialize;
 
-use crate::metrics::{Facet, Family, Reduce, Row, Unit};
+use crate::metrics::{Facet, Family, Reading, Row, SCRAPE_INTERVAL, Unit};
 use crate::portforward::Forwarder;
-
-/// [`SCRAPE_CONFIG`](crate::resource::impls::observability)'s interval. A `step` under
-/// it invents points, which Prometheus fills by repeating the last sample — a flat
-/// stretch that never happened
-pub const SCRAPE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Container cpu, cores. Cumulative seconds-per-second → a rate
 const CONTAINER_CPU: &str = "container_cpu_usage_seconds_total";
@@ -44,29 +39,51 @@ const CONTAINER_IO_STALL: &str = "container_pressure_io_stalled_seconds_total";
 /// dropped upstream, so IOPS is not derivable from this exposition
 const CONTAINER_DISK: &str = "container_blkio_device_usage_total";
 
-/// PromQL for a row, scoped to one run's namespace.
+/// PromQL for a row's **plot**, scoped to one run's namespace.
 ///
-/// Mirrors [`Exposition::reduce`](crate::metrics::Exposition::reduce) server-side; one
-/// enum for both keeps a metric from meaning one thing live and another in the report
-fn promql(row: &Row, namespace: &str, grid: Grid) -> String {
-    let scope = scope_of(row.family, namespace);
-    let family = row.family.name;
-    let w = grid.rate_window.as_secs();
-    match row.reduce {
-        Reduce::Sum => format!("sum({family}{scope})"),
-        Reduce::Max => format!("max({family}{scope})"),
-        // Unguarded: unobserved → 0/0 → NaN → dropped as a gap, matching live's `None`
-        // (a `clamp_min` would print a fabricated `0 ms`)
-        Reduce::Mean => format!(
-            "sum(rate({family}_sum{scope}[{w}s])) / sum(rate({family}_count{scope}[{w}s])) * 1000"
+/// Display only — the number beside it comes from [`total_of`], never from integrating this.
+/// `rate` before `sum`: aggregating first builds a synthetic series whose value tracks which
+/// label sets exist, and reset correction then adds back the whole aggregate
+fn promql_plot(reading: Reading, namespace: &str, grid: Grid) -> String {
+    let family = reading.family();
+    let scope = scope_of(family, namespace);
+    let name = family.name;
+    let w = grid.window.as_secs();
+    match reading {
+        Reading::Rate(_) => format!("sum(rate({name}{scope}[{w}s]))"),
+        // `deriv` not `rate` (a rollback is a move, not a reset), clamped as a retreating
+        // frontier is no scan rate at all
+        Reading::Slope(_) => format!(
+            "clamp_min(deriv(max({name}{scope})[{w}s:{res}s]), 0)",
+            res = SCRAPE_INTERVAL.as_secs(),
+        ),
+        Reading::Level(_) => format!("max({name}{scope})"),
+        // Unguarded: unobserved → 0/0 → NaN → dropped as a gap (a `clamp_min` would print a
+        // fabricated `0 ms`)
+        Reading::Mean(_) => format!(
+            "sum(rate({name}_sum{scope}[{w}s])) / sum(rate({name}_count{scope}[{w}s])) * 1000"
         ),
         // `rate` before the quantile, `le` kept through the sum (histogram_quantile needs one
         // series per bound; un-rated answers for all history)
-        Reduce::Quantile(phi) => format!(
-            "histogram_quantile({p}, sum by (le) (rate({family}_bucket{scope}[{w}s]))) * 1000",
+        Reading::Quantile(_, phi) => format!(
+            "histogram_quantile({p}, sum by (le) (rate({name}_bucket{scope}[{w}s]))) * 1000",
             p = phi.value(),
         ),
+        // One number, never plotted
+        Reading::Progress(_) => format!("max({name}{scope})"),
     }
+}
+
+/// Raw stored samples, one series per label set, over the whole run.
+///
+/// An **instant** query with a range selector — `query_range` would answer off an evaluation
+/// grid with 5 min lookback carry-forward, which duplicates samples under a fine step, drops
+/// them under a coarse one, and papers over every gap shorter than the lookback
+fn promql_raw(reading: Reading, namespace: &str, span: Duration) -> String {
+    let family = reading.family();
+    // Ranges are left-open in Prometheus v3 — an unpadded span drops the sample at `t_start`
+    let range = span.as_secs() + SCRAPE_INTERVAL.as_secs();
+    format!("{}{}[{range}s]", family.name, scope_of(family, namespace))
 }
 
 /// Run namespace + the row's own selector, so both planes narrow a split family alike
@@ -83,12 +100,21 @@ fn scope_of(family: Family, namespace: &str) -> String {
 ///
 /// - Gaps are absent points, never interpolated (a partition's absence *is* the reading)
 /// - `label` is dynamic for container series (the container's name), fixed for a [`Row`]
+/// - `points` are the plot, smoothed and never summed; `total` is measured separately off raw
+///   samples and is the only exact figure here
+/// - `total`/`coverage` absent where the reading carries no count (a level, a latency)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Series {
+    /// What was read, and of which family — stable identity, where `label` is display and
+    /// may be reworded. `None` for a container series (the kubelet's, not a row's)
+    pub reading: Option<Reading>,
     pub label: String,
     pub unit: Unit,
     pub facet: Option<Facet>,
+    pub channel: Option<crate::sync::Channel>,
     pub points: Vec<(f64, f64)>,
+    pub total: Option<f64>,
+    pub coverage: Option<Coverage>,
 }
 
 impl Series {
@@ -110,17 +136,10 @@ impl Series {
         self.points.last().map(|(_, v)| *v)
     }
 
-    /// Area under a per-second series = the whole-run count it accumulated. `None`
-    /// for anything not a rate (summing latencies yields a number with no meaning)
-    pub fn integral(&self) -> Option<f64> {
-        (self.unit == Unit::PerSec).then(|| {
-            self.points.windows(2).map(|w| (w[1].0 - w[0].0) * (w[0].1 + w[1].1) / 2.0).sum()
-        })
-    }
-
     /// Pointwise sum of like-for-like series onto one label.
     ///
     /// - Timestamp intersection (part missing a scrape → total unknown, never smaller)
+    /// - Totals sum over every part, gaps included (each is exact on its own)
     /// - Unit & facet from the first part (caller folds like with like)
     pub fn folded(label: &str, parts: &[Series]) -> Option<Series> {
         let first = parts.first()?;
@@ -131,29 +150,118 @@ impl Series {
             slot.0 += v;
             slot.1 += 1;
         }
+        let totals: Vec<f64> = parts.iter().filter_map(|s| s.total).collect();
+        let widest = parts.iter().filter_map(|s| s.coverage).map(|c| c.widest_gap).max();
         Some(Series {
+            reading: first.reading,
             label: label.to_string(),
             unit: first.unit,
             facet: first.facet,
+            channel: first.channel,
             points: acc
                 .into_iter()
                 .filter(|(_, (_, seen))| *seen == parts.len())
                 .map(|(ms, (sum, _))| (ms as f64 / 1000.0, sum))
                 .collect(),
+            total: (totals.len() == parts.len()).then(|| totals.iter().sum()),
+            coverage: parts
+                .first()
+                .and_then(|p| p.coverage)
+                .map(|c| Coverage { widest_gap: widest.unwrap_or(c.widest_gap), ..c }),
         })
     }
 }
 
-/// Analysis resolution + the span counters are differenced over. Viewport-independent —
-/// derived from terminal width, `rate_window` made every plotted peak a function of it.
+/// Whole-run count + the evidence for trusting it.
+///
+/// Coverage travels with the number because a window holding under two samples yields no
+/// warning and no error upstream — the series just vanishes, and "not published" and
+/// "window too short" are otherwise the same report
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Total {
+    pub value: f64,
+    pub coverage: Coverage,
+}
+
+/// What was actually observed under a [`Total`]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Coverage {
+    pub samples: usize,
+    pub first: f64,
+    pub last: f64,
+    pub widest_gap: Duration,
+    pub resets: u32,
+}
+
+impl Total {
+    /// Raw cumulative samples → the count they accumulated.
+    ///
+    /// - Every increment lands between two surviving samples → a scrape gap widens one bucket
+    ///   and loses nothing (a windowed `rate` sees only within-window slope, so an increment
+    ///   spanning a wider gap reaches no evaluation point at all)
+    /// - Independent of resolution: subsampling a monotone series cannot change the sum of
+    ///   its deltas
+    /// - A decrease means restart on a counter (work resumes from 0, so the post-reset value
+    ///   is the interval's increment) and rollback on a gauge (no work at all) — same
+    ///   arithmetic, opposite answer, which is why the shape has to reach here
+    fn of(points: &[(f64, f64)], reading: Reading) -> Option<Total> {
+        let (&(first, _), &(last, _)) = (points.first()?, points.last()?);
+        if points.len() < 2 {
+            return None;
+        }
+        let restarts = reading.cumulative();
+        let (mut value, mut resets, mut widest) = (0.0, 0, 0.0f64);
+        for w in points.windows(2) {
+            let ((t0, v0), (t1, v1)) = (w[0], w[1]);
+            widest = widest.max(t1 - t0);
+            match v1 < v0 {
+                true => {
+                    resets += 1;
+                    if restarts {
+                        value += v1;
+                    }
+                }
+                false => value += v1 - v0,
+            }
+        }
+        let coverage = Coverage {
+            samples: points.len(),
+            first,
+            last,
+            widest_gap: Duration::from_secs_f64(widest.max(0.0)),
+            resets,
+        };
+        Some(Total { value, coverage })
+    }
+
+    /// Label sets folded after differencing, never before
+    fn folded(parts: &[Total]) -> Option<Total> {
+        let first = parts.first()?;
+        Some(Total {
+            value: parts.iter().map(|p| p.value).sum(),
+            coverage: parts.iter().skip(1).fold(first.coverage, |a, p| Coverage {
+                samples: a.samples + p.coverage.samples,
+                first: a.first.min(p.coverage.first),
+                last: a.last.max(p.coverage.last),
+                widest_gap: a.widest_gap.max(p.coverage.widest_gap),
+                resets: a.resets + p.coverage.resets,
+            }),
+        })
+    }
+}
+
+/// Plot resolution + the span a plotted rate is smoothed over. Viewport-independent —
+/// derived from terminal width, `window` made every plotted peak a function of it.
+///
+/// Totals do not read this: they come off raw samples, where resolution cannot change the answer
 ///
 /// - `step` floors at the scrape (finer → Prometheus repeats the last sample)
-/// - `rate_window` ≥ `step` + scrape, always: a window narrower than the step samples
-///   only part of each interval, and the rest reaches no plotted point
+/// - `window` ≥ `step` + scrape, always: a window narrower than the step samples only part of
+///   each interval, and the rest reaches no plotted point
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Grid {
     pub step: Duration,
-    pub rate_window: Duration,
+    pub window: Duration,
 }
 
 const ANALYSIS_STEP: Duration = Duration::from_secs(30);
@@ -164,41 +272,11 @@ const MAX_SLOTS: u32 = 6_000;
 impl Grid {
     pub fn for_span(span: Duration) -> Grid {
         let step = ANALYSIS_STEP.max(span / MAX_SLOTS).max(SCRAPE_INTERVAL);
-        Grid { step, rate_window: (step + SCRAPE_INTERVAL).max(SCRAPE_INTERVAL * 4) }
+        Grid { step, window: (step + SCRAPE_INTERVAL).max(SCRAPE_INTERVAL * 4) }
     }
 }
 
-/// As [`promql`], but for a plotted series: a cumulative family is differenced
-/// server-side rather than shown climbing to its total.
-///
-/// [`Reduce`] carries which kind it is (`Sum` = counter, `Max` = gauge), and the two
-/// take different differentiators
-fn promql_series(row: &Row, namespace: &str, grid: Grid) -> String {
-    let w = grid.rate_window.as_secs();
-    let scope = scope_of(row.family, namespace);
-    let family = row.family.name;
-    match (row.unit, row.reduce) {
-        // `rate` not `irate` (5 s scrape → instantaneous slope is mostly jitter);
-        // `rate` before `sum` (summing first hides a restart from the reset correction)
-        (Unit::PerSec, Reduce::Sum) => format!("sum(rate({family}{scope}[{w}s]))"),
-        // Gauge slope, the TSDB counterpart of
-        // [`Window::block_pace`](crate::sync::Window::block_pace).
-        //
-        // - `deriv` not `rate` (`rate` assumes counter semantics → reads a reorg
-        //   rollback as a reset and inflates the slope)
-        // - `clamp_min` at 0, as `block_pace` drops a retreating frontier rather than
-        //   reporting a negative scan rate
-        // - Subquery resolution = the scrape, never `step` (a resolution at or above the
-        //   range yields one sample, and `deriv` needs two → the row vanishes silently)
-        (Unit::PerSec, Reduce::Max) => format!(
-            "clamp_min(deriv(max({family}{scope})[{w}s:{res}s]), 0)",
-            res = SCRAPE_INTERVAL.as_secs(),
-        ),
-        _ => promql(row, namespace, grid),
-    }
-}
-
-/// Every row as a series over `window`, at the analysis resolution.
+/// Every row as a plotted series + its exact total over `window`.
 ///
 /// Rows with nothing recorded are omitted rather than emitted empty (never-published
 /// != published-zero)
@@ -212,21 +290,58 @@ pub async fn history(
     let grid = Grid::for_span(span(window));
     let mut out = Vec::new();
     for row in rows {
-        let query = promql_series(row, namespace, grid);
-        let Ok(series) = reader.series(&query, window, grid.step).await else { continue };
-        // `sum`/`max` collapse to one series; anything else here is a query bug
-        let Some(first) = series.into_iter().next() else { continue };
-        if first.points.is_empty() {
+        let total = match row.reading.totalled() {
+            true => total_of(&reader, row.reading, namespace, window).await,
+            false => None,
+        };
+        let points = match row.reading.plotted() {
+            true => plot_of(&reader, row.reading, namespace, window, grid).await,
+            false => Vec::new(),
+        };
+        if points.is_empty() && total.is_none() {
             continue;
         }
         out.push(Series {
+            reading: Some(row.reading),
             label: row.label.to_string(),
-            unit: row.unit,
+            unit: row.unit(),
             facet: Some(row.facet),
-            points: first.points,
+            channel: row.channel,
+            points,
+            total: total.map(|t| t.value),
+            coverage: total.map(|t| t.coverage),
         });
     }
     (!out.is_empty()).then_some(out)
+}
+
+async fn plot_of(
+    reader: &Reader,
+    reading: Reading,
+    namespace: &str,
+    window: (SystemTime, SystemTime),
+    grid: Grid,
+) -> Vec<(f64, f64)> {
+    let query = promql_plot(reading, namespace, grid);
+    let Ok(series) = reader.series(&query, window, grid.step).await else { return Vec::new() };
+    // `sum`/`max` collapse to one series; anything else here is a query bug
+    series.into_iter().next().map(|s| s.points).unwrap_or_default()
+}
+
+/// Whole-run count off raw samples, folded across label sets **after** differencing.
+///
+/// A restart replaces the series, so one label set is one producer's run of the counter and
+/// the reset rule holds within it
+async fn total_of(
+    reader: &Reader,
+    reading: Reading,
+    namespace: &str,
+    window: (SystemTime, SystemTime),
+) -> Option<Total> {
+    let query = promql_raw(reading, namespace, span(window));
+    let series = reader.raw(&query, window.1).await.ok()?;
+    let parts: Vec<Total> = series.iter().filter_map(|s| Total::of(&s.points, reading)).collect();
+    Total::folded(&parts)
 }
 
 /// What the kubelet saw of a run's containers, each split per container.
@@ -255,27 +370,29 @@ pub async fn container_history(
     let grid = Grid::for_span(span(window));
     let scope = format!("{{namespace=\"{namespace}\",container!=\"\"}}");
 
-    let cpu_q = format!(
-        "sum by (container) (rate({CONTAINER_CPU}{scope}[{w}s]))",
-        w = grid.rate_window.as_secs()
-    );
-    let mem_q = format!("sum by (container) ({CONTAINER_MEM}{scope})");
+    let w = grid.window.as_secs();
+    // `rate` inside the `sum`: a cgroup counter resets when its container restarts, and
+    // aggregating first hides that from the reset correction
+    let cpu_q = format!("sum by (container) (rate({CONTAINER_CPU}{scope}[{w}s]))");
+    let mem_q = format!("max by (container) ({CONTAINER_MEM}{scope})");
     // `max`, not `sum`: PSI is already a whole-cgroup ratio, and summing two containers'
     // stall fractions yields a share of time >1, which is not a quantity
-    let stall_q = format!(
-        "max by (container) (rate({CONTAINER_IO_STALL}{scope}[{w}s]))",
-        w = grid.rate_window.as_secs()
-    );
+    let stall_q = format!("max by (container) (rate({CONTAINER_IO_STALL}{scope}[{w}s]))");
 
+    // Resources plot peaks and levels only — no totals, so no raw pass
     let by_container = |labelled: Vec<Labelled>, unit: Unit| -> Vec<Series> {
         let mut rows: Vec<Series> = labelled
             .into_iter()
             .filter(|l| !l.points.is_empty())
             .map(|l| Series {
+                reading: None,
                 label: l.labels.get("container").cloned().unwrap_or_default(),
                 unit,
                 facet: None,
+                channel: None,
                 points: l.points,
+                total: None,
+                coverage: None,
             })
             .collect();
         // Largest first: the stack's base is the container that dominates it
@@ -322,7 +439,7 @@ fn disk_q(namespace: &str, operation: &str, grid: Grid) -> String {
     format!(
         "max by (container) (rate({CONTAINER_DISK}\
          {{namespace=\"{namespace}\",container!=\"\",operation=\"{operation}\"}}[{w}s]))",
-        w = grid.rate_window.as_secs()
+        w = grid.window.as_secs()
     )
 }
 
@@ -424,6 +541,31 @@ impl Reader {
         step: Duration,
     ) -> Result<Vec<Labelled>, crate::error::PipelineError> {
         let body: RangeResponse = self.range(query, window, step).await?;
+        Ok(body.data.result.into_iter().map(Labelled::from).collect())
+    }
+
+    /// Verbatim stored samples, one entry per label set.
+    ///
+    /// `/api/v1/query` with a range selector — no evaluation grid, no lookback
+    /// carry-forward, and no 11,000-point ceiling (that check is `query_range`'s)
+    async fn raw(
+        &self,
+        query: &str,
+        at: SystemTime,
+    ) -> Result<Vec<Labelled>, crate::error::PipelineError> {
+        let url = format!("http://127.0.0.1:{}/api/v1/query", self.forwarder.local_port);
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("query", query), ("time", &epoch_secs(at).to_string())])
+            .send()
+            .await
+            .map_err(|e| format!("querying Prometheus: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("Prometheus returned {}", response.status()).into());
+        }
+        let body: RangeResponse =
+            response.json().await.map_err(|e| format!("decoding Prometheus response: {e}"))?;
         Ok(body.data.result.into_iter().map(Labelled::from).collect())
     }
 
@@ -591,7 +733,7 @@ fn epoch_secs(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::{Facet, Unit, family, family_where, row};
+    use crate::metrics::{Facet, Unit};
 
     /// Verbatim from a live v3.13.2 with the flag absent. `500` + an `unavailable`
     /// errorType: neither the status nor a status→cause table can tell this from a
@@ -603,55 +745,57 @@ mod tests {
         assert!(parsed.error.contains(ADMIN_DISABLED));
     }
 
-    #[test]
-    fn a_sum_row_scopes_to_the_run_namespace() {
-        let r = row(
-            "blocks",
-            family("zebrad_chain_verified_block_total"),
-            Reduce::Sum,
-            Unit::Count,
-            Facet::Progress,
-        );
-        assert_eq!(
-            promql(&r, "ztest-sync-abc", grid()),
-            r#"sum(zebrad_chain_verified_block_total{namespace="ztest-sync-abc"})"#
-        );
-    }
-
     /// A real grid, never a hand-built one: a query test on invented values asserts a
     /// shape production never emits
     fn grid() -> Grid {
         Grid::for_span(Duration::from_secs(600))
     }
 
+    const ORCHARD: crate::metrics::Counter = crate::metrics::counter(
+        "zaino_sync_orchard_actions_total",
+        crate::metrics::Dimension::Count,
+    );
+    const FETCHED: crate::metrics::Gauge =
+        crate::metrics::gauge("zaino_sync_fetched_height", crate::metrics::Dimension::Count);
+    const FETCH: crate::metrics::Hist =
+        crate::metrics::hist("zaino_sync_block_fetch_seconds", crate::metrics::Dimension::Seconds);
+
+    /// `rate` inside the `sum`: aggregating first builds a synthetic series whose value
+    /// tracks which label sets exist, and reset correction then adds back the whole aggregate
     #[test]
-    fn a_max_row_uses_max_not_sum() {
-        let r = row(
-            "height",
-            family("zebrad_chain_verified_block_height"),
-            Reduce::Max,
-            Unit::Count,
-            Facet::Progress,
+    fn a_counter_plot_rates_before_it_folds() {
+        assert_eq!(
+            promql_plot(ORCHARD.rate(), "ns", grid()),
+            r#"sum(rate(zaino_sync_orchard_actions_total{namespace="ns"}[35s]))"#
         );
-        assert!(promql(&r, "ns", grid()).starts_with("max("));
+    }
+
+    /// A rollback is a move, not a restart — `rate` here would read it as a counter reset
+    /// and add back the whole absolute height
+    #[test]
+    fn a_gauge_plot_takes_a_clamped_derivative_never_a_rate() {
+        assert_eq!(
+            promql_plot(FETCHED.slope(), "ns", grid()),
+            r#"clamp_min(deriv(max(zaino_sync_fetched_height{namespace="ns"})[35s:5s]), 0)"#
+        );
+    }
+
+    #[test]
+    fn a_level_is_plotted_as_published() {
+        assert_eq!(
+            promql_plot(FETCHED.level(), "ns", grid()),
+            r#"max(zaino_sync_fetched_height{namespace="ns"})"#
+        );
     }
 
     /// Lifetime `sum/count` converges, hiding late decay; a guard would print `0 ms` for
     /// a path that never ran, where live answers `None`
     #[test]
     fn a_mean_is_windowed_and_unguarded() {
-        let r = row(
-            "latency",
-            family("zaino_grpc_duration"),
-            Reduce::Mean,
-            Unit::Millis,
-            Facet::Throughput,
-        );
-        let q = promql(&r, "ns", grid());
-        assert!(!q.contains("clamp_min"), "{q}");
         assert_eq!(
-            q,
-            r#"sum(rate(zaino_grpc_duration_sum{namespace="ns"}[35s])) / sum(rate(zaino_grpc_duration_count{namespace="ns"}[35s])) * 1000"#
+            promql_plot(FETCH.mean(), "ns", grid()),
+            "sum(rate(zaino_sync_block_fetch_seconds_sum{namespace=\"ns\"}[35s])) / \
+             sum(rate(zaino_sync_block_fetch_seconds_count{namespace=\"ns\"}[35s])) * 1000"
         );
     }
 
@@ -659,152 +803,79 @@ mod tests {
     /// before the quantile or it answers for all history rather than this window
     #[test]
     fn a_quantile_rates_the_buckets_and_keeps_le_through_the_sum() {
-        let r = row(
-            "fetch p99",
-            family_where("zaino_sync_block_fetch_seconds", "stage", "finalised"),
-            Reduce::Quantile(crate::metrics::Phi::P99),
-            Unit::Millis,
-            Facet::WritePath,
-        );
         assert_eq!(
-            promql(&r, "ns", grid()),
-            r#"histogram_quantile(0.99, sum by (le) (rate(zaino_sync_block_fetch_seconds_bucket{namespace="ns",stage="finalised"}[35s]))) * 1000"#
+            promql_plot(FETCH.p(crate::metrics::Phi::P99), "ns", grid()),
+            "histogram_quantile(0.99, sum by (le) \
+             (rate(zaino_sync_block_fetch_seconds_bucket{namespace=\"ns\"}[35s]))) * 1000"
         );
+    }
+
+    /// Raw samples, not `query_range`: an evaluation grid answers off a 5 min lookback,
+    /// which duplicates samples under a fine step and drops them under a coarse one
+    #[test]
+    fn a_total_is_taken_from_raw_samples_over_the_padded_run() {
+        assert_eq!(
+            promql_raw(ORCHARD.rate(), "ns", Duration::from_secs(600)),
+            r#"zaino_sync_orchard_actions_total{namespace="ns"}[605s]"#
+        );
+    }
+
+    /// Ranges are left-open in Prometheus v3 — unpadded, the sample at `t_start` is excluded
+    /// and the run's first interval never lands in any total
+    #[test]
+    fn a_raw_range_is_padded_past_the_left_open_boundary() {
+        let span = Duration::from_secs(3_600);
+        let range = promql_raw(ORCHARD.rate(), "ns", span);
+        let secs: u64 = range.rsplit_once('[').unwrap().1.trim_end_matches("s]").parse().unwrap();
+        assert!(secs > span.as_secs(), "{range}");
+        assert_eq!(secs - span.as_secs(), SCRAPE_INTERVAL.as_secs());
     }
 
     /// zaino splits every per-block family on `stage`; folding it counts one block
-    /// once per ingest pass, so the selector must reach the query
+    /// once per ingest pass, so the selector must reach both queries
     #[test]
-    fn a_split_family_carries_its_selector_into_the_query() {
-        let r = row(
-            "orchard",
-            family_where("zaino_sync_orchard_actions_total", "stage", "finalised"),
-            Reduce::Sum,
-            Unit::PerSec,
-            Facet::Shielded,
+    fn a_split_family_carries_its_selector_into_every_query() {
+        let split = crate::metrics::counter_where(
+            "zaino_sync_orchard_actions_total",
+            crate::metrics::Dimension::Count,
+            "stage",
+            "finalised",
         );
         assert_eq!(
-            promql_series(&r, "ns", grid()),
+            promql_plot(split.rate(), "ns", grid()),
             r#"sum(rate(zaino_sync_orchard_actions_total{namespace="ns",stage="finalised"}[35s]))"#
         );
-    }
-
-    /// A counter plotted raw climbs to its total and says nothing about throughput;
-    /// the rate is the reading, and it must be taken server-side
-    #[test]
-    fn a_cumulative_row_is_differentiated_for_a_plot_but_not_for_a_total() {
-        let r = row(
-            "orchard",
-            family("zaino_sync_orchard_actions_total"),
-            Reduce::Sum,
-            Unit::PerSec,
-            Facet::Shielded,
-        );
-        assert_eq!(
-            promql_series(&r, "ns", grid()),
-            r#"sum(rate(zaino_sync_orchard_actions_total{namespace="ns"}[35s]))"#
-        );
-        assert_eq!(
-            promql(&r, "ns", grid()),
-            r#"sum(zaino_sync_orchard_actions_total{namespace="ns"})"#
-        );
-    }
-
-    /// Zaino counts no blocks; the scan rate is the frontier gauge's slope. `rate`
-    /// here would read a reorg rollback as a counter reset and inflate it, and the
-    /// negative arm of a real rollback is no scan rate at all
-    #[test]
-    fn a_per_second_gauge_row_takes_a_clamped_derivative_not_a_rate() {
-        let r = row(
-            "blocks",
-            family("zaino_sync_fetched_height"),
-            Reduce::Max,
-            Unit::PerSec,
-            Facet::Blocks,
-        );
-        assert_eq!(
-            promql_series(&r, "ns", grid()),
-            r#"clamp_min(deriv(max(zaino_sync_fetched_height{namespace="ns"})[35s:5s]), 0)"#
-        );
-    }
-
-    /// Subquery resolution is the scrape, so the range holds samples however coarse the
-    /// display step gets. At `step` it held one, and `deriv` under two samples returns
-    /// nothing — the scan-rate row vanished with no gap to show for it
-    #[test]
-    fn a_gauge_slope_keeps_enough_samples_to_have_a_slope() {
-        let r = row(
-            "blocks",
-            family("zaino_sync_fetched_height"),
-            Reduce::Max,
-            Unit::PerSec,
-            Facet::Blocks,
-        );
-        for secs in [60, 600, 7_200, 172_800, 30 * 24 * 3_600] {
-            let grid = Grid::for_span(Duration::from_secs(secs));
-            let q = promql_series(&r, "ns", grid);
-            let (range, res) = subquery_of(&q);
-            assert!(range / res >= 2, "{secs}s span: {q} carries no slope");
-        }
-    }
-
-    /// `[<range>:<resolution>]` from a rendered subquery, in seconds
-    fn subquery_of(query: &str) -> (u64, u64) {
-        let inner = query.rsplit_once('[').expect("a subquery").1;
-        let (range, rest) = inner.split_once(':').expect("a resolution");
-        let res = rest.split_once("s]").expect("a close").0;
-        (range.trim_end_matches('s').parse().unwrap(), res.parse().unwrap())
-    }
-
-    /// Everything else already *is* the quantity; wrapping it in `rate` would report
-    /// the speed a latency was changing
-    #[test]
-    fn a_gauge_row_is_plotted_as_published() {
-        let r =
-            row("db used", family("zaino_db_used_bytes"), Reduce::Max, Unit::Bytes, Facet::Store);
-        let grid = Grid::for_span(Duration::from_secs(600));
-        assert_eq!(promql_series(&r, "ns", grid), promql(&r, "ns", grid));
+        assert!(promql_raw(split.rate(), "ns", Duration::from_secs(60)).contains("stage="));
     }
 
     /// Smoothing was `4 × step`, `step` from terminal width → one run at 80 and 200 columns
     /// attenuated its peaks differently, neither plot saying so
     #[test]
-    fn the_rate_window_is_the_same_however_long_the_run() {
-        let baseline = Grid::for_span(Duration::from_secs(60)).rate_window;
-        for secs in [60, 600, 7_200, 172_800] {
+    fn the_plot_window_is_the_same_however_long_the_run() {
+        let baseline = Grid::for_span(Duration::from_secs(60)).window;
+        for secs in [600, 7_200, 172_800] {
             let grid = Grid::for_span(Duration::from_secs(secs));
-            assert_eq!(grid.rate_window, baseline, "{secs}s span must smooth like every other");
-            assert!(grid.step >= SCRAPE_INTERVAL, "never finer than the scrape: {grid:?}");
+            assert_eq!(grid.window, baseline, "{secs}s span must smooth like every other");
         }
     }
 
     /// Grafana's `$__rate_interval`: a window under the step leaves every interval partly
     /// unread, and nothing in the plot says which third of the run is missing
     #[test]
-    fn a_rate_window_always_covers_its_step() {
+    fn a_plot_window_always_covers_its_step() {
         for secs in [60, 600, 7_200, 172_800, 30 * 24 * 3_600] {
             let grid = Grid::for_span(Duration::from_secs(secs));
-            assert!(
-                grid.rate_window >= grid.step + SCRAPE_INTERVAL,
-                "{secs}s span samples only {:?} of each {:?}",
-                grid.rate_window,
-                grid.step
-            );
-            assert!(grid.rate_window >= SCRAPE_INTERVAL * 4, "{grid:?}");
+            assert!(grid.window >= grid.step + SCRAPE_INTERVAL, "{grid:?}");
+            assert!(grid.window >= SCRAPE_INTERVAL * 4, "{grid:?}");
         }
     }
 
     /// Finer → Prometheus repeats the last sample; coarser only caps a long run's payload
     #[test]
     fn the_step_holds_at_the_analysis_resolution_until_a_run_is_very_long() {
-        assert_eq!(Grid::for_span(Duration::from_secs(60)).step, ANALYSIS_STEP);
-        assert_eq!(Grid::for_span(Duration::from_secs(7_200)).step, ANALYSIS_STEP);
-        let long = Grid::for_span(Duration::from_secs(48 * 3_600));
-        assert!(long.step >= ANALYSIS_STEP, "{long:?}");
-        assert!(
-            48 * 3_600 / long.step.as_secs() <= u64::from(MAX_SLOTS),
-            "a 48h run must stay under the payload cap: {long:?}"
-        );
+        assert_eq!(Grid::for_span(Duration::from_secs(600)).step, ANALYSIS_STEP);
+        let long = Grid::for_span(Duration::from_secs(MAX_SLOTS as u64 * 60));
+        assert!(long.step > ANALYSIS_STEP, "{long:?}");
     }
 
     /// `sum by (container)` returns one series per container, and which one it is
@@ -828,10 +899,14 @@ mod tests {
     #[test]
     fn a_fold_sums_where_every_part_sampled_and_gaps_elsewhere() {
         let part = |label: &str, points: Vec<(f64, f64)>| Series {
+            reading: Some(ORCHARD.rate()),
             label: label.into(),
             unit: Unit::PerSec,
             facet: Some(Facet::Shielded),
+            channel: None,
             points,
+            total: Some(0.0),
+            coverage: None,
         };
         let folded = Series::folded(
             "sapling",
@@ -864,42 +939,100 @@ mod tests {
         assert_eq!(s.points, vec![(0.0, 1.0), (60.0, 3.0)]);
     }
 
-    /// Area under a rate = the count it accumulated, which is what the legend shows
-    /// beside each pool
     #[test]
-    fn integrating_a_rate_recovers_its_total() {
-        let rate = |points: Vec<(f64, f64)>| Series {
-            label: "orchard".into(),
-            unit: Unit::PerSec,
-            facet: None,
-            points,
-        };
-        // 10/s held across 60s
-        let steady = rate(vec![(0.0, 10.0), (30.0, 10.0), (60.0, 10.0)]);
-        assert_eq!(steady.integral(), Some(600.0));
-        assert_eq!(steady.mean(), Some(10.0));
-        assert_eq!(steady.peak(), Some(10.0));
-
-        // Trapezoid, not a left-hand sum: 0→10 over 60s is 300, not 0
-        assert_eq!(rate(vec![(0.0, 0.0), (60.0, 10.0)]).integral(), Some(300.0));
+    fn a_counter_total_is_the_count_it_accumulated() {
+        let t = Total::of(&[(0.0, 100.0), (30.0, 400.0), (60.0, 1000.0)], ORCHARD.rate())
+            .expect("two samples");
+        assert_eq!(t.value, 900.0);
+        assert_eq!(t.coverage.samples, 3);
+        assert_eq!(t.coverage.resets, 0);
     }
 
-    /// Summing latencies yields a number with no meaning; only a rate has an integral
+    /// The defect this path exists to avoid: `rate()` sees only within-window slope, so an
+    /// increment spanning a wider gap reaches no evaluation point and leaves every total
+    #[test]
+    fn an_increment_spanning_a_scrape_gap_survives() {
+        let t = Total::of(&[(0.0, 0.0), (600.0, 1_000_000.0)], ORCHARD.rate()).expect("two");
+        assert_eq!(t.value, 1_000_000.0);
+        assert_eq!(t.coverage.widest_gap, Duration::from_secs(600));
+    }
+
+    /// Subsampling a monotone counter widens buckets; the count it accumulated is the same
+    #[test]
+    fn a_total_does_not_depend_on_the_step_it_was_sampled_at() {
+        let dense: Vec<(f64, f64)> = (0..=60).map(|i| (i as f64 * 5.0, i as f64 * 70.0)).collect();
+        let sparse: Vec<(f64, f64)> = dense.iter().step_by(6).copied().collect();
+        let of = |p: &[(f64, f64)]| Total::of(p, ORCHARD.rate()).expect("samples").value;
+        assert_eq!(of(&dense), of(&sparse));
+    }
+
+    /// A restart resumes from 0, so the post-reset reading *is* that interval's increment —
+    /// Prometheus' own rule. Only what accrued between the last scrape and the restart is lost
+    #[test]
+    fn a_counter_reset_keeps_the_work_either_side_of_it() {
+        let t = Total::of(&[(0.0, 500.0), (30.0, 900.0), (60.0, 200.0)], ORCHARD.rate())
+            .expect("samples");
+        assert_eq!(t.value, 600.0, "400 before the restart, 200 after");
+        assert_eq!(t.coverage.resets, 1);
+    }
+
+    /// Same arithmetic, opposite answer: a height going backwards is a rollback, and adding
+    /// the post-rollback height back would report a re-scan the chain never did
+    #[test]
+    fn a_gauge_rollback_is_not_a_restart() {
+        let t = Total::of(&[(0.0, 500.0), (30.0, 900.0), (60.0, 200.0)], FETCHED.slope())
+            .expect("samples");
+        assert_eq!(t.value, 400.0, "net progress, the rollback contributing nothing");
+        assert_eq!(t.coverage.resets, 1);
+    }
+
+    /// A window holding one sample is not a zero — upstream emits no warning for it, so the
+    /// absence has to survive as an absence
+    #[test]
+    fn one_sample_is_not_a_total() {
+        assert_eq!(Total::of(&[(0.0, 500.0)], ORCHARD.rate()), None);
+        assert_eq!(Total::of(&[], ORCHARD.rate()), None);
+    }
+
+    /// Label sets fold after differencing: summing first tracks which pods existed, and the
+    /// reset correction then adds back the whole aggregate
+    #[test]
+    fn label_sets_fold_after_they_are_differenced() {
+        let a = Total::of(&[(0.0, 0.0), (60.0, 100.0)], ORCHARD.rate()).expect("a");
+        let b = Total::of(&[(0.0, 40.0), (60.0, 90.0)], ORCHARD.rate()).expect("b");
+        let folded = Total::folded(&[a, b]).expect("two parts");
+        assert_eq!(folded.value, 150.0);
+        assert_eq!(folded.coverage.samples, 4);
+    }
+
     #[test]
     fn a_latency_series_has_no_total() {
         let latency = Series {
+            reading: Some(FETCH.mean()),
             label: "batch write".into(),
             unit: Unit::Millis,
             facet: None,
+            channel: None,
             points: vec![(0.0, 12.0), (30.0, 900.0)],
+            total: None,
+            coverage: None,
         };
-        assert_eq!(latency.integral(), None);
+        assert_eq!(latency.total, None);
         assert_eq!(latency.peak(), Some(900.0));
     }
 
     #[test]
     fn an_empty_series_reports_no_statistics() {
-        let empty = Series { label: "x".into(), unit: Unit::PerSec, facet: None, points: vec![] };
+        let empty = Series {
+            reading: None,
+            label: "x".into(),
+            unit: Unit::PerSec,
+            facet: None,
+            channel: None,
+            points: vec![],
+            total: None,
+            coverage: None,
+        };
         assert_eq!(empty.mean(), None);
         assert_eq!(empty.peak(), None);
         assert_eq!(empty.last(), None);

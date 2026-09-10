@@ -15,7 +15,7 @@ pub use crate::cluster_config::seed_size_for;
 pub use crate::engine::schedule::PanelFrame;
 pub use crate::engine::{RunProgress, RunView};
 pub use crate::metrics::query::Series;
-pub use crate::metrics::{LIVE_PERIOD, Unit};
+pub use crate::metrics::{LIVE_PERIOD, Reading, Unit};
 pub use crate::pipeline::runner::Phase as CompilePhase;
 pub use crate::pipeline::{BuildStage, NodeSummary};
 pub use crate::podmetrics::{PodLoad, SAMPLE_PERIOD};
@@ -33,8 +33,8 @@ pub use crate::qos::live::{LiveSnapshot, TierLive, tier_tally};
 pub use crate::qos::schedule::{PlannedTest, QosPlan, TierPlan, plan as qos_plan};
 pub use crate::qos::{ClusterCapacity, GIB, QosClass, Resources};
 pub use crate::sync::{
-    BLOCKS, CHANNELS, Cost, CostMs, Latency, Phase, ProbeState, SyncStatus, SyncVerdict, Timeline,
-    Timing, Work, plot_channels,
+    BLOCKS, Channel, Cost, CostMs, Heights, Latency, Phase, ProbeState, SyncStatus, SyncVerdict,
+    Timeline, Timing, Work, plot_channels,
 };
 
 pub mod capability;

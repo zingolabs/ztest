@@ -7,8 +7,7 @@
 /// What a reduced value *is*, so a reader renders it and a range query derives it
 /// without a per-row special case at either end.
 ///
-/// - `PerSec` = family is cumulative on the wire; the meaningful reading is its
-///   derivative, so a series query differentiates before plotting
+/// - `PerSec` = a flow, derived by [`Reading`](crate::metrics::Reading) rather than declared
 /// - `Fraction` = seconds-per-second, i.e. dimensionless in 0..1 (PSI stall); rendered
 ///   `%`, never `/s` — the ratio's denominator is the same clock as its numerator
 /// - `BytesPerSec` = throughput; IEC magnitude like `Bytes` (`412.0 MiB/s`), since

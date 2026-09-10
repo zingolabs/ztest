@@ -655,7 +655,7 @@ impl SyncEngine {
         };
         rows.iter()
             .filter(|row| !exposition.resolves(row))
-            .map(|row| format!("{} <- {}", row.label, row.family))
+            .map(|row| format!("{} <- {}", row.label, row.family()))
             .collect()
     }
 
@@ -803,9 +803,12 @@ mod tests {
             self.stopped.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn work_source(&self, op: Op) -> Option<crate::metrics::Family> {
+        fn work_source(&self, op: Op) -> Option<crate::metrics::Counter> {
             match op {
-                Op::SaplingOutput => Some(crate::metrics::family("fake_sapling_outputs_total")),
+                Op::SaplingOutput => Some(crate::metrics::counter(
+                    "fake_sapling_outputs_total",
+                    crate::metrics::Dimension::Count,
+                )),
                 _ => None,
             }
         }
