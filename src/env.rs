@@ -1459,7 +1459,6 @@ mod tests {
                 test_name: format!("t{i}"),
                 sa: "ci".into(),
                 footprint: per_test,
-                priority: profile.priority,
             };
             match sched.request(req) {
                 Admission::Granted(_) => admitted += 1,

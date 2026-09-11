@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 use owo_colors::OwoColorize as _;
 
-use super::layout::{pad, truncate};
+use super::layout::pad;
 use super::template::{Fields, draw};
 use super::theme::Theme;
 use super::{ClaimRow, RunRow, StatusView};
@@ -48,7 +48,6 @@ mod tmpl {
     pub(super) const RUNS: &str = " runs   {runs:>2}  {@dot}  {users}";
     pub(super) const TESTS: &str = " tests  {running:>2} running {@dot} {queued} q";
     pub(super) const PENDING: &str = " pending {count}";
-    pub(super) const TIER: &str = " {tier:<6} {count:>2} {@dot} {reserve}";
     pub(super) const CLUSTER_CONTEXT: &str = " {context}  {version}";
     pub(super) const CLUSTER_NODES: &str =
         " {nodes} {@dot} {control_plane} cp {@dot} {workers} wkr";
@@ -244,26 +243,9 @@ fn left_column(v: &StatusView, theme: &Theme) -> Vec<String> {
             theme,
         ));
     }
-    for (tier, live) in cluster_tiers(v) {
-        rows.push(draw(
-            tmpl::TIER,
-            &Fields::new()
-                .text("tier", truncate(tier.as_label(), 5))
-                .text("count", live.count.to_string())
-                .text("reserve", live.reserve.compact()),
-            theme,
-        ));
-    }
     rows.push(String::new());
     rows.extend(cluster_block(&v.context, &v.nodes, v.capacity, theme));
     rows
-}
-
-/// Every run's in-flight tests folded by tier — the line that explains the cpu figure
-fn cluster_tiers(v: &StatusView) -> std::collections::BTreeMap<QosClass, ztest::api::TierLive> {
-    ztest::api::tier_tally(
-        v.runs.iter().flat_map(|r| r.beacon.running.iter()).map(|t| (t.tier, t.footprint)),
-    )
 }
 
 fn cluster_block(
@@ -729,7 +711,6 @@ mod tests {
             name: name.to_string(),
             footprint: Resources::new(2_000, 4 * ztest::api::GIB, 0, 0),
             started_at: at(-300),
-            tier: QosClass::Integration,
         };
         let beacon = |user: &str, kind: LeaseKind, running: Vec<ztest::api::RunningTest>| Beacon {
             run_id: format!("{user}-4711"),

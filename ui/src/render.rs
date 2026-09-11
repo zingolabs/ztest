@@ -5,12 +5,11 @@ use super::layout::*;
 use super::theme::Theme;
 use super::{
     ArchiveRow, ArchiveStatus, BannerState, BuildState, QosPlan, SyncVitals, SyncWatchState,
-    TierPlan, TransferKind, TransferProgress, TransferRow, Transfers,
+    TransferKind, TransferProgress, TransferRow, Transfers,
 };
 use crate::template::{Fields, Row, Template};
 use ztest::api::BuildStage;
 use ztest::api::LiveSnapshot;
-use ztest::api::Resources;
 use ztest::api::RunProgress;
 use ztest::api::{column_width, format_elapsed, thousands};
 
@@ -63,10 +62,8 @@ mod banner_row {
         " {@dot|dim} configured {configured|bold} via --test-threads",
     );
     pub(super) const NODES: &str = "{label} {ready|bold} ready {@dot|dim} {cordoned|bold} cordoned";
-    pub(super) const CAPACITY: &str = concat!(
-        "{label} capacity {@dot|dim} {free_cores|bold} / {alloc_cores|bold} cores",
-        " {@dot|dim} {free_gib|bold} / {alloc_gib|bold} GiB free {gauge:12#} {pct|bold}%",
-    );
+    pub(super) const CAPACITY: &str =
+        "{label} capacity {@dot|dim} {cpu|bold} {@dot|dim} {mem|bold}";
     pub(super) const INVENTORY_QUEUED: &str = "{label|dim} {state|dim}";
     pub(super) const INVENTORY_WORKING: &str =
         "{label|pass} {@spin|bold} {phase}{@ellipsis} {@dot|dim} {elapsed|bold}";
@@ -81,19 +78,14 @@ mod banner_row {
         "{label} {@ok|pass} {name} {@dot|dim} {state|pass} {@dot|dim} {size|bytes.bold}";
     pub(super) const ARCHIVE_MISSING: &str =
         "{label} {@warn|skip} {name} {@dot|dim} missing {@dot|dim} {detail|dim}";
-    pub(super) const SCHEDULING: &str = concat!(
-        "{label|pass} {tests|bold} tests {@dot|dim} {waves|bold} waves {@dot|dim} peak",
-        " {peak|bold} {@dot|dim} {total|bold} reserved total",
-    );
+    pub(super) const SCHEDULING: &str =
+        "{label|pass} {tests|bold} tests {@dot|dim} {total|bold} reserved total";
     pub(super) const SCHEDULING_BLIND: &str = concat!(
         "{label|pass} {tests|bold} tests {@dot|dim} {total|bold} reserved total",
         " {@dot|dim} capacity unknown (probe unavailable)",
     );
-    pub(super) const TIER: &str = "{label} {class|dim} {count|bold} {@dot|dim} {each} each";
-    pub(super) const TIER_MIXED: &str =
-        "{label} {class|dim} {count|bold} {@dot|dim} {subtotal} total {@dot|dim} mixed footprints";
     pub(super) const UNSCHEDULABLE: &str = concat!(
-        "{label} {@warn|skip} {class|skip} needs {admitted} {@dot|dim}",
+        "{label} {@warn|skip} {test|skip} needs {admitted} {@dot|dim}",
         " exceeds cluster capacity — will be rejected",
     );
 }
@@ -120,19 +112,9 @@ fn render_cluster_block(out: &mut String, state: &BannerState, theme: &Theme) {
         .text("cordoned", c.nodes_cordoned.to_string());
     draw(out, f, banner_row::NODES, Duration::ZERO, theme);
 
-    // One global figure (allocatable − requested); gauge = free headroom, driven
-    // by the tighter dimension
-    let alloc = c.capacity.allocatable;
-    let free = c.capacity.free();
-    let pct = free_percent(&free, &alloc);
-    let f = Fields::new()
-        .text("label", label(""))
-        .text("free_cores", cores_of(&free).to_string())
-        .text("alloc_cores", cores_of(&alloc).to_string())
-        .text("free_gib", gib_of(&free).to_string())
-        .text("alloc_gib", gib_of(&alloc).to_string())
-        .percent("gauge", pct)
-        .text("pct", pct.to_string());
+    // One global figure: requested of allocatable, per dimension
+    let (cpu, mem) = used_of(&c.capacity.reserved, &c.capacity.allocatable);
+    let f = Fields::new().text("label", label("")).text("cpu", cpu).text("mem", mem);
     draw(out, f, banner_row::CAPACITY, Duration::ZERO, theme);
 }
 
@@ -225,49 +207,20 @@ fn write_archive_row(out: &mut String, row: &ArchiveRow, name_col: usize, theme:
 }
 
 fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
-    let total_tests: u32 = plan.tiers.iter().map(|t| t.count).sum();
     let header = Fields::new()
         .text("label", label("Scheduling"))
-        .text("tests", total_tests.to_string())
+        .text("tests", plan.tests.to_string())
         .text("total", plan.total.to_string());
     match plan.free {
-        Some(_) => draw(
-            out,
-            header.text("waves", plan.waves.to_string()).text("peak", plan.peak.to_string()),
-            banner_row::SCHEDULING,
-            Duration::ZERO,
-            theme,
-        ),
+        Some(_) => draw(out, header, banner_row::SCHEDULING, Duration::ZERO, theme),
         None => draw(out, header, banner_row::SCHEDULING_BLIND, Duration::ZERO, theme),
     }
 
-    let name_col = column_width(plan.tiers.iter().map(|t| t.class.as_label()), 12, 16);
-    for TierPlan { class, count, per_test, subtotal } in &plan.tiers {
-        let f = Fields::new()
-            .text("label", label(""))
-            .text("class", pad(class.as_label(), name_col))
-            .text("count", count.to_string());
-        // "X each" only when uniform; mixed (an override in the tier) → subtotal
-        match per_test {
-            Some(each) => {
-                draw(out, f.text("each", each.to_string()), banner_row::TIER, Duration::ZERO, theme)
-            }
-            None => draw(
-                out,
-                f.text("subtotal", subtotal.to_string()),
-                banner_row::TIER_MIXED,
-                Duration::ZERO,
-                theme,
-            ),
-        }
-    }
-
-    // Fail-fast on a test admission will reject; reserve carried on the rejection
-    // (override → tier no longer determines it)
+    // Fail-fast on a test admission will reject, named with its own reserve
     for u in &plan.unschedulable {
         let f = Fields::new()
             .text("label", label(""))
-            .text("class", u.class.as_label())
+            .text("test", u.name.as_str())
             .text("admitted", u.admitted.to_string());
         draw(out, f, banner_row::UNSCHEDULABLE, Duration::ZERO, theme);
     }
@@ -278,22 +231,19 @@ fn render_qos_block(out: &mut String, plan: &QosPlan, theme: &Theme) {
 /// Pinned-panel row shapes, shared where two panels draw the same row
 mod panel_row {
     pub(super) const RUNNING: &str = concat!(
-        "{label|pass} {@spin|bold} {running|bold} running {@dot|dim} {committed|bold}",
-        " committed {@dot|dim}[ {gauge:12#} of {free|bold} free][ {blind}]",
+        "{label|pass} {@spin|bold} {running|bold} running {@dot|dim} {cpu|bold} {@dot|dim}",
+        " {mem|bold}",
     );
     pub(super) const PROGRESS: &str = concat!(
         "{label} {done|bold}[/{total|bold}] done {@dot|dim} {passed|pass} passed",
         "[ {@dot|dim} {failed|count.fail} failed] {@dot|dim} {elapsed|dim}",
     );
-    pub(super) const TIERS: &str = "{label} {tiers} {@dot|dim} running / planned";
+    pub(super) const QUEUE: &str = "{label} {queued|bold} queued";
     pub(super) const CLUSTER: &str = concat!(
         "{label|pass} {@spin|bold} {context} {@dot|dim} {ready|bold} ready {@dot|dim}",
         " {used|bold}/{total|bold} slots",
     );
-    pub(super) const CAPACITY: &str = concat!(
-        "{label|dim} {gauge:12#} {pct|bold}% {@dot|dim} {free_cores|bold}/{alloc_cores|bold}c",
-        " {@dot|dim} {free_gib|bold}/{alloc_gib|bold}Gi free",
-    );
+    pub(super) const CAPACITY: &str = "{label|dim} {cpu|bold} {@dot|dim} {mem|bold}";
     pub(super) const BUILD_QUEUED: &str = "{label|pass} {@dot|dim} queued";
     pub(super) const BUILD_WORKING: &str =
         "{label|pass} {@spin|bold} {phase}{@ellipsis} {@dot|dim} {elapsed}";
@@ -301,7 +251,7 @@ mod panel_row {
         "{label|pass} {@ok|pass} {tests} tests / {bins} bins {@dot|dim} {elapsed}";
     pub(super) const BUILD_FAILED: &str = "{label|pass} {@warn|fail} build failed (exit {code})";
     pub(super) const SCHEDULING: &str =
-        "{label|pass} {tests|bold} tests {@dot|dim} {waves|bold} waves {@dot|dim} peak {peak|bold}";
+        "{label|pass} {tests|bold} tests {@dot|dim} {total|bold} reserved";
     pub(super) const SCHEDULING_BLIND: &str =
         "{label|pass} {tests|bold} tests {@dot|dim} capacity unknown";
     pub(super) const SUBJECT: &str =
@@ -312,30 +262,18 @@ mod panel_row {
 }
 
 /// Left column during the run: [`render_preflight_panel`]'s counterpart, same
-/// [`PANEL_LINES`] height. Ledger-only, so per-tier `n/m` = running / planned,
-/// not queue depth
-pub fn render_live_panel(
-    snapshot: &LiveSnapshot,
-    plan: &QosPlan,
-    free: &Resources,
-    progress: &RunProgress,
-    theme: &Theme,
-) -> String {
+/// [`PANEL_LINES`] height
+pub fn render_live_panel(snapshot: &LiveSnapshot, progress: &RunProgress, theme: &Theme) -> String {
     let mut out = String::with_capacity(320);
 
     render_label_rule(&mut out, theme);
 
+    let (cpu, mem) = used_of(&snapshot.committed, &snapshot.limit);
     let running = Fields::new()
         .text("label", label("Running"))
-        .text("running", snapshot.total_running().to_string())
-        .text("committed", snapshot.committed.to_string());
-    // `free` == 0 means the re-probe was unavailable; say so, never draw an empty gauge
-    let running = match free.cpu_milli == 0 && free.mem_bytes == 0 {
-        true => running.text("blind", "capacity unknown (probe unavailable)"),
-        false => running
-            .percent("gauge", used_percent(&snapshot.committed, free))
-            .text("free", free.to_string()),
-    };
+        .text("running", snapshot.running.to_string())
+        .text("cpu", cpu)
+        .text("mem", mem);
     draw(&mut out, running, panel_row::RUNNING, progress.elapsed, theme);
 
     // Bare `done` when total unknown; `failed` only once one has
@@ -352,20 +290,8 @@ pub fn render_live_panel(
     }
     draw(&mut out, progress_row, panel_row::PROGRESS, Duration::ZERO, theme);
 
-    if !plan.tiers.is_empty() {
-        let parts: Vec<String> = plan
-            .tiers
-            .iter()
-            .map(|t| {
-                let run = snapshot.running.get(&t.class).map(|x| x.count).unwrap_or(0);
-                format!("{} {}/{}", t.class.as_label(), run, t.count)
-            })
-            .collect();
-        let f = Fields::new()
-            .text("label", label(""))
-            .text("tiers", parts.join(&format!(" {} ", theme.chars.dot)));
-        draw(&mut out, f, panel_row::TIERS, Duration::ZERO, theme);
-    }
+    let f = Fields::new().text("label", label("")).text("queued", snapshot.queued.to_string());
+    draw(&mut out, f, panel_row::QUEUE, Duration::ZERO, theme);
 
     pad_to_panel(&mut out);
     out
@@ -393,31 +319,20 @@ pub fn render_preflight_panel(
         .text("total", c.slots_total.to_string());
     draw(&mut out, f, panel_row::CLUSTER, elapsed, theme);
 
-    // Gauge on the tighter of cpu/mem; own label + compact units keep the line unclipped
-    let alloc = c.capacity.allocatable;
-    let free = c.capacity.free();
-    let pct = free_percent(&free, &alloc);
-    let f = Fields::new()
-        .text("label", label("capacity"))
-        .percent("gauge", pct)
-        .text("pct", pct.to_string())
-        .text("free_cores", cores_of(&free).to_string())
-        .text("alloc_cores", cores_of(&alloc).to_string())
-        .text("free_gib", gib_of(&free).to_string())
-        .text("alloc_gib", gib_of(&alloc).to_string());
+    let (cpu, mem) = used_of(&c.capacity.reserved, &c.capacity.allocatable);
+    let f = Fields::new().text("label", label("capacity")).text("cpu", cpu).text("mem", mem);
     draw(&mut out, f, panel_row::CAPACITY, Duration::ZERO, theme);
 
     render_build_line(&mut out, &state.build, elapsed, theme);
 
     // Scheduling row absent without a QoS plan
     if let Some(plan) = &state.qos_plan {
-        let total_tests: u32 = plan.tiers.iter().map(|t| t.count).sum();
         let f =
-            Fields::new().text("label", label("Scheduling")).text("tests", total_tests.to_string());
+            Fields::new().text("label", label("Scheduling")).text("tests", plan.tests.to_string());
         match plan.free {
             Some(_) => draw(
                 &mut out,
-                f.text("waves", plan.waves.to_string()).text("peak", plan.peak.to_string()),
+                f.text("total", plan.total.to_string()),
                 panel_row::SCHEDULING,
                 Duration::ZERO,
                 theme,
@@ -915,6 +830,7 @@ mod tests {
     use super::*;
     use ztest::api::GIB;
     use ztest::api::QosClass;
+    use ztest::api::Resources;
 
     // ─────────────────────── sync watch panel ─────────────────────────
 
@@ -1086,14 +1002,14 @@ mod tests {
         assert!(s.contains("+5 more"), "tail collapses:\n{s}");
     }
 
-    /// `(tier, count)` → one `PlannedTest` per test, each at its tier default
-    fn at_tiers(sets: &[(QosClass, u32)]) -> Vec<ztest::api::PlannedTest> {
+    /// `(tag, count)` → one `PlannedTest` per test, each at its tag's default reserve
+    fn planned(sets: &[(QosClass, u32)]) -> Vec<ztest::api::PlannedTest> {
         sets.iter()
             .flat_map(|&(class, n)| {
-                std::iter::repeat_n(
-                    ztest::api::PlannedTest { class, admitted: class.profile().admitted() },
-                    n as usize,
-                )
+                (0..n).map(move |i| ztest::api::PlannedTest {
+                    name: format!("{}_{i}", class.as_label()),
+                    admitted: class.profile().admitted(),
+                })
             })
             .collect()
     }
@@ -1167,7 +1083,7 @@ mod tests {
     fn preflight_panel_is_constant_height_and_summarizes_phase() {
         let mut state = sample_state();
         state.qos_plan = Some(ztest::api::qos_plan(
-            &at_tiers(&[(QosClass::Integration, 6)]),
+            &planned(&[(QosClass::Integration, 6)]),
             Some(Resources::new(12_000, 48 * GIB, 0, 0)),
         ));
         let s = render_preflight_panel(
@@ -1184,7 +1100,7 @@ mod tests {
         assert!(s.contains("kind-zaino-local"), "cluster context:\n{s}");
         assert!(s.contains("capacity"), "capacity gauge:\n{s}");
         assert!(s.contains("47 tests / 8 bins"), "build summary:\n{s}");
-        assert!(s.contains("waves"), "scheduling summary:\n{s}");
+        assert!(s.contains("6 tests") && s.contains("reserved"), "scheduling summary:\n{s}");
     }
 
     #[test]
@@ -1292,7 +1208,7 @@ mod tests {
 
      Cluster context kind-zaino-local · 12 / 16 slots used · configured 6 via --test-threads
              3 ready · 0 cordoned
-             capacity · 6 / 12 cores · 28 / 48 GiB free [██████░░░░░░] 50%
+             capacity · 6 / 12 cores · 20 / 48 GiB
 
    Inventory ✓ 47 tests across 8 binaries · 18s
 
@@ -1352,50 +1268,34 @@ mod tests {
     }
 
     #[test]
-    fn qos_plan_renders_tiers_waves_and_unschedulable_warning() {
+    fn qos_plan_renders_the_total_and_names_unschedulable_tests() {
         let mut state = sample_state();
-        // sync (17c/18Gi admitted) cannot fit 4c/8Gi → unschedulable; the rest schedule
-        state.qos_plan = Some(ztest::api::qos_plan(
-            &at_tiers(&[(QosClass::Integration, 3), (QosClass::Wallet, 1), (QosClass::Sync, 2)]),
-            Some(Resources::new(4000, 8 * GIB, 0, 0)),
-        ));
+        let mut tests = planned(&[(QosClass::Integration, 3), (QosClass::Wallet, 1)]);
+        // 15c/15Gi components + 1c/1Gi runner = 16c/16Gi > 4c/8Gi
+        let sync = QosClass::Sync.profile_with(Some(Resources::new(15_000, 15 * GIB, 0, 0)));
+        tests
+            .push(ztest::api::PlannedTest { name: "zaino_sync".into(), admitted: sync.admitted() });
+        state.qos_plan =
+            Some(ztest::api::qos_plan(&tests, Some(Resources::new(4_000, 8 * GIB, 0, 0))));
         let s = render(&state, &plain_unicode_theme());
-        // Header: test count + wave estimate
-        assert!(s.contains("Scheduling 6 tests"), "missing header:\n{s}");
-        assert!(s.contains("waves"), "missing wave estimate:\n{s}");
-        // Per-tier rows in priority order. CPU always whole cores (integer
-        // allocations) → basic renders `1c`, never `500m`
-        assert!(s.contains("integration"), "got:\n{s}");
-        // Admitted = components + runner
-        assert!(s.contains("2c / 1 GiB"), "missing basic footprint:\n{s}");
-        // sync admitted 15c/15Gi components + 1c/1Gi runner = 16c/16Gi > 4c/8Gi
+        assert!(s.contains("Scheduling 5 tests"), "missing header:\n{s}");
+        assert!(s.contains("reserved total"), "missing total:\n{s}");
+        assert!(!s.contains("wave") && !s.contains("integration"), "no waves, no tiers:\n{s}");
         assert!(
-            s.contains("sync needs 16c / 16 GiB") && s.contains("will be rejected"),
+            s.contains("zaino_sync needs 16c / 16 GiB") && s.contains("will be rejected"),
             "missing unschedulable warning:\n{s}"
         );
     }
 
     #[test]
-    fn live_panel_shows_running_over_planned_and_a_gauge() {
-        use std::collections::BTreeMap;
-        use ztest::api::{LiveSnapshot, TierLive};
+    fn live_panel_shows_running_queued_and_used_of_limit() {
+        use ztest::api::LiveSnapshot;
 
-        let plan = ztest::api::qos_plan(
-            &at_tiers(&[(QosClass::Sync, 2), (QosClass::Integration, 3)]),
-            Some(Resources::new(12_000, 48 * GIB, 0, 0)),
-        );
         let snapshot = LiveSnapshot {
-            running: BTreeMap::from([
-                (
-                    QosClass::Sync,
-                    TierLive { count: 1, reserve: Resources::new(8_000, 16 * GIB, 0, 0) },
-                ),
-                (
-                    QosClass::Integration,
-                    TierLive { count: 2, reserve: Resources::new(1_000, GIB, 0, 0) },
-                ),
-            ]),
+            running: 3,
+            queued: 12,
             committed: Resources::new(9_000, 17 * GIB, 0, 0),
+            limit: Resources::new(12_000, 48 * GIB, 0, 0),
         };
         let progress = RunProgress {
             elapsed: std::time::Duration::from_secs(42),
@@ -1403,26 +1303,19 @@ mod tests {
             failed: 1,
             total: 20,
         };
-        let s = render_live_panel(
-            &snapshot,
-            &plan,
-            &Resources::new(12_000, 48 * GIB, 0, 0),
-            &progress,
-            &plain_unicode_theme(),
-        );
+        let s = render_live_panel(&snapshot, &progress, &plain_unicode_theme());
         assert!(s.contains("3 running"), "header:\n{s}");
-        assert!(s.contains("9c / 17 GiB committed"), "committed:\n{s}");
+        assert!(
+            s.contains("3 running · 9 / 12 cores · 17 / 48 GiB"),
+            "used of limit per dimension:\n{s}"
+        );
+        assert!(!s.contains('%') && !s.contains("free"), "no bar, percent or free:\n{s}");
         // done/total, passed, failed, elapsed
         assert!(s.contains("8/20 done"), "done count:\n{s}");
         assert!(s.contains("7 passed"), "passed count:\n{s}");
         assert!(s.contains("1 failed"), "failed count:\n{s}");
-        // Per-tier running/planned, priority order
-        assert!(s.contains("sync 1/2"), "got:\n{s}");
-        assert!(s.contains("basic 2/3"), "got:\n{s}");
-        let sync_at = s.find("sync 1/2").unwrap();
-        let basic_at = s.find("basic 2/3").unwrap();
-        assert!(sync_at < basic_at, "priority order:\n{s}");
-        assert!(s.contains("running / planned"), "legend:\n{s}");
+        assert!(s.contains("12 queued"), "queue depth:\n{s}");
+        assert!(!s.contains("sync") && !s.contains("integration"), "no tier rows:\n{s}");
         // Rule at the top only — a bottom rule would leave a trailing blank when the
         // console sizes the panel region
         assert!(s.starts_with("───── Ztest ─────"), "top rule present:\n{s}");
@@ -1430,22 +1323,19 @@ mod tests {
     }
 
     #[test]
-    fn live_panel_with_unknown_capacity_says_so_instead_of_a_zero_gauge() {
+    /// Zero free = full, a measurement — never "unknown" (the two once shared a sentinel)
+    fn a_full_run_reads_as_full_per_dimension() {
         use ztest::api::LiveSnapshot;
 
-        let plan = ztest::api::qos_plan(&at_tiers(&[(QosClass::Integration, 2)]), None);
-        let snapshot =
-            LiveSnapshot { committed: Resources::new(1_000, GIB, 0, 0), ..LiveSnapshot::default() };
-        // free == ZERO → probe unavailable
-        let s = render_live_panel(
-            &snapshot,
-            &plan,
-            &Resources::ZERO,
-            &RunProgress::default(),
-            &plain_unicode_theme(),
-        );
-        assert!(s.contains("capacity unknown (probe unavailable)"), "got:\n{s}");
-        assert!(!s.contains("of 0c"), "should not show a zero-free gauge:\n{s}");
+        let snapshot = LiveSnapshot {
+            running: 23,
+            queued: 115,
+            committed: Resources::new(92_000, 122 * GIB, 0, 0),
+            limit: Resources::new(92_000, 198 * GIB, 0, 0),
+        };
+        let s = render_live_panel(&snapshot, &RunProgress::default(), &plain_unicode_theme());
+        assert!(s.contains("92 / 92 cores · 122 / 198 GiB"), "used of limit:\n{s}");
+        assert!(!s.contains("unknown") && !s.contains("unavailable"), "never unknown:\n{s}");
     }
 
     #[test]
@@ -1465,13 +1355,9 @@ mod tests {
     }
 
     #[test]
-    fn capacity_line_shows_free_over_allocatable_and_a_gauge() {
+    fn capacity_line_shows_reserved_of_allocatable_per_dimension() {
         let s = render(&sample_state(), &plain_unicode_theme());
-        // free = 12-6 cores / 48-20 GiB; gauge on the tighter dim
-        assert!(
-            s.contains("capacity · 6 / 12 cores · 28 / 48 GiB free [██████░░░░░░] 50%"),
-            "capacity line wrong:\n{s}"
-        );
+        assert!(s.contains("capacity · 6 / 12 cores · 20 / 48 GiB"), "capacity line wrong:\n{s}");
     }
 
     #[test]
@@ -1479,20 +1365,15 @@ mod tests {
         let mut state = sample_state();
         state.cluster.capacity = ztest::api::ClusterCapacity::default();
         let s = render(&state, &plain_unicode_theme());
-        // All-zero capacity renders 0/0 and a 0% gauge, no panic / div-by-zero.
-        assert!(
-            s.contains("capacity · 0 / 0 cores · 0 / 0 GiB free [░░░░░░░░░░░░] 0%"),
-            "zero-capacity line wrong:\n{s}"
-        );
+        assert!(s.contains("capacity · 0 / 0 cores · 0 / 0 GiB"), "zero-capacity line wrong:\n{s}");
     }
 
     #[test]
-    fn free_percent_uses_the_tighter_dimension() {
-        // CPU 50% free, memory 25% free → 25
-        let free = Resources::new(2_000, GIB, 0, 0);
-        let alloc = Resources::new(4_000, 4 * GIB, 0, 0);
-        assert_eq!(free_percent(&free, &alloc), 25);
-        // Zero allocatable → 0, no div-by-zero
-        assert_eq!(free_percent(&Resources::ZERO, &Resources::ZERO), 0);
+    fn a_fraction_keeps_one_decimal_and_a_whole_number_drops_it() {
+        let (cpu, mem) = used_of(
+            &Resources::new(500, 512 * 1024 * 1024, 0, 0),
+            &Resources::new(8_000, 16 * GIB, 0, 0),
+        );
+        assert_eq!((cpu.as_str(), mem.as_str()), ("0.5 / 8 cores", "0.5 / 16 GiB"));
     }
 }

@@ -5,16 +5,21 @@ use std::time::Duration;
 
 use super::RunProgress;
 use crate::engine::events::RunStats;
-use crate::engine::plan::WorkItem;
 use crate::qos::Resources;
-use crate::qos::live::{LiveSnapshot, tier_tally};
+use crate::qos::live::LiveSnapshot;
 
-/// `committed` = the scheduler's committed total (Σ of the running footprints)
-pub fn live_snapshot<'a>(
-    running: impl Iterator<Item = &'a WorkItem>,
+/// - `queued` derived, not counted (neither finished nor running = waiting, wherever it sits),
+///   the same fold the lease beacon publishes
+/// - `committed` of `limit` = the scheduler's own committed total against its ceiling
+pub fn live_snapshot(
+    running: usize,
+    stats: RunStats,
     committed: Resources,
+    limit: Resources,
 ) -> LiveSnapshot {
-    LiveSnapshot { running: tier_tally(running.map(|i| (i.class, i.footprint))), committed }
+    let running = running as u32;
+    let queued = (stats.total as u32).saturating_sub(stats.finished()).saturating_sub(running);
+    LiveSnapshot { running, queued, committed, limit }
 }
 
 pub fn run_progress(stats: RunStats, elapsed: Duration) -> RunProgress {
@@ -24,48 +29,20 @@ pub fn run_progress(stats: RunStats, elapsed: Duration) -> RunProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qos::QosClass;
-    use std::path::PathBuf;
 
-    fn item(class: QosClass) -> WorkItem {
-        let p = class.profile();
-        WorkItem {
-            binary_id: "pkg::b".into(),
-            test_name: "t".into(),
-            binary_path: PathBuf::from("/t"),
-            cwd: PathBuf::from("/t"),
-            class,
-            footprint: p.admitted(),
-            priority: p.priority,
-            hard_cap: p.hard_cap,
-            retries: 0,
-            deps: Vec::new(),
-        }
+    #[test]
+    fn queued_is_what_has_neither_finished_nor_started() {
+        let stats = RunStats { passed: 3, failed: 1, skipped: 1, total: 12, ..RunStats::default() };
+        let (committed, limit) = (Resources::new(6_000, 0, 0, 0), Resources::new(8_000, 0, 0, 0));
+        let snap = live_snapshot(2, stats, committed, limit);
+        assert_eq!(snap, LiveSnapshot { running: 2, queued: 5, committed, limit });
     }
 
     #[test]
-    fn folds_running_per_tier() {
-        let running =
-            [item(QosClass::Integration), item(QosClass::Integration), item(QosClass::Sync)];
-        // Independent echo value for the committed check (cpu-only)
-        let committed = Resources::new(2_000 * 2 + 16_000, 0, 0, 0);
-        let snap = live_snapshot(running.iter(), committed);
-
-        let integ = &snap.running[&QosClass::Integration];
-        assert_eq!(integ.count, 2);
-        // Per-tier reserve folds each item's admitted total (components + runner)
+    fn nothing_selected_folds_to_an_empty_snapshot() {
         assert_eq!(
-            integ.reserve.cpu_milli,
-            QosClass::Integration.profile().admitted().cpu_milli * 2
+            live_snapshot(0, RunStats::default(), Resources::ZERO, Resources::ZERO),
+            LiveSnapshot::default()
         );
-        assert_eq!(snap.running[&QosClass::Sync].count, 1);
-        assert_eq!(snap.committed, committed);
-    }
-
-    #[test]
-    fn nothing_running_folds_to_an_empty_tally() {
-        let snap = live_snapshot(std::iter::empty(), Resources::ZERO);
-        assert!(snap.running.is_empty());
-        assert_eq!(snap.committed, Resources::ZERO);
     }
 }

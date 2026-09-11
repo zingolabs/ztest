@@ -42,7 +42,7 @@ pub use self::report::{
 pub use self::runview::ConsoleView;
 pub use self::status::render_status;
 pub use self::theme::Theme;
-pub use ztest::api::{QosPlan, TierPlan};
+pub use ztest::api::QosPlan;
 
 /// Cross-crate test support. `pub` only so `ztest_cli`'s tests can reach it — nothing
 /// here is part of the rendering API, and `#[cfg(test)]` would not cross the crate line

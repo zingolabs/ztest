@@ -3,7 +3,6 @@
 use crate::console::{Console, SceneFrame};
 use ztest::api::Cancel;
 use ztest::api::PanelFrame;
-use ztest::api::QosPlan;
 use ztest::api::RunView;
 
 use super::{Theme, render_live_panel};
@@ -36,11 +35,10 @@ impl RunView for ConsoleView<'_> {
         self.console.scrollback(text);
     }
 
-    fn tick(&self, frame: &PanelFrame, plan: &QosPlan, live: String) {
+    fn tick(&self, frame: &PanelFrame, live: String) {
         // Snapshotted into an immutable scene the render thread re-paints (spinner animated)
         // until the next tick
-        let left =
-            render_live_panel(&frame.snapshot, plan, &frame.free, &frame.progress, self.theme);
+        let left = render_live_panel(&frame.snapshot, &frame.progress, self.theme);
         // Provisioning = pre-run barrier → right column blank (width-driven split holds, no
         // reflow here)
         self.console.scene(move |_elapsed| SceneFrame {

@@ -28,8 +28,8 @@ pub use crate::backends::image::DevSource;
 pub use crate::inventory::{DevImageEntry, SeedEntry, SeedPayload};
 pub use crate::plan::{Plan, PlanRoot, PrunedSeed, QosNode};
 pub use crate::qos::beacon::{Beacon, LeaseKind, RunningTest};
-pub use crate::qos::live::{LiveSnapshot, TierLive, tier_tally};
-pub use crate::qos::schedule::{PlannedTest, QosPlan, TierPlan, plan as qos_plan};
+pub use crate::qos::live::LiveSnapshot;
+pub use crate::qos::schedule::{PlannedTest, QosPlan, plan as qos_plan};
 pub use crate::qos::{ClusterCapacity, GIB, QosClass, Resources};
 pub use crate::sync::{
     Channel, Cost, CostMs, Heights, Latency, ProbeState, SyncStatus, SyncVerdict, Timing, Work,

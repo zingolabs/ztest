@@ -23,7 +23,6 @@ pub struct WorkItem {
     pub cwd: PathBuf,
     pub class: QosClass,
     pub footprint: Resources,
-    pub priority: u8,
     pub hard_cap: Duration,
     pub retries: u32,
     pub deps: Vec<NodeId>,
@@ -103,7 +102,7 @@ pub struct ExcludedSync {
 ///   ≥1-test invariant)
 /// - Both forms caught: `#[ztest::sync_test]` compiles to a plain `#[tokio::test]` that
 ///   `nextest list` matches; bare `#[ztest::qos::sync]` declares the tier with no profile
-/// - Either admitted parks a 48h top-priority item + a panel row the engine never launches
+/// - Either admitted parks a 48h item in the queue that the engine never launches
 /// - Binary-scoped, via [`declared_tier`] so parameterized cases leave with their parent
 pub fn drop_sync_tests(
     selected: &mut Vec<SelectedBinary>,
@@ -190,7 +189,6 @@ pub fn build_work_list(
                 cwd: bin.cwd.clone(),
                 class,
                 footprint: profile.admitted(),
-                priority: profile.priority,
                 hard_cap: profile.hard_cap,
                 retries,
                 deps: item_deps,
@@ -202,18 +200,10 @@ pub fn build_work_list(
     items
 }
 
-/// Submission order: priority desc, then smallest footprint, stable id tiebreak.
-/// [`Scheduler`](crate::qos::scheduler::Scheduler) re-sorts by `(priority desc, seq asc)`
-/// → this governs only the seq tiebreak
+/// Submission = arrival order at the [`Scheduler`](crate::qos::scheduler::Scheduler)'s queue:
+/// stable test order, so two runs of one selection queue alike
 fn sort_for_admission(items: &mut [WorkItem]) {
-    items.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then(a.footprint.cpu_milli.cmp(&b.footprint.cpu_milli))
-            .then(a.footprint.mem_bytes.cmp(&b.footprint.mem_bytes))
-            .then(a.binary_id.cmp(&b.binary_id))
-            .then(a.test_name.cmp(&b.test_name))
-    });
+    items.sort_by(|a, b| a.binary_id.cmp(&b.binary_id).then(a.test_name.cmp(&b.test_name)));
 }
 
 #[cfg(test)]
@@ -425,20 +415,19 @@ mod tests {
     }
 
     #[test]
-    fn sorted_high_priority_then_smallest_first() {
+    /// Tier and size never reorder the queue — a heavy test queues where its name puts it
+    fn submitted_in_stable_test_order_whatever_the_tier() {
         let bins = [bin("pkg::b", &["s", "i", "y"])];
         let qos = [(
             "pkg::b".to_string(),
             vec![
-                sync_qos_entry("pkg::s"),               // priority 3
-                entry("pkg::i", QosClass::Integration), // priority 0
-                entry("pkg::y", QosClass::Testnet),     // priority 2
+                sync_qos_entry("pkg::s"),
+                entry("pkg::i", QosClass::Integration),
+                entry("pkg::y", QosClass::Testnet),
             ],
         )];
         let items = build_work_list(&bins, &qos, 0, &ResourceDeps::default());
-        // Highest priority (Sync) first
-        assert_eq!(items[0].test_name, "s");
-        assert_eq!(items[1].test_name, "y");
-        assert_eq!(items[2].test_name, "i");
+        let order: Vec<&str> = items.iter().map(|i| i.test_name.as_str()).collect();
+        assert_eq!(order, ["i", "s", "y"]);
     }
 }

@@ -1,4 +1,4 @@
-//! Cluster resource allocation, scheduling, priority (`docs/design-qos.md`).
+//! Cluster resource allocation + scheduling (`docs/design-qos.md`).
 //!
 //! - Test declares a tier → harness lowers it to pod requests/limits + a footprint →
 //!   [`scheduler::Scheduler`] admits it against probed capacity
@@ -232,18 +232,23 @@ impl Resources {
     /// - Undeclared *or unbounded* disk drops its segment → output re-parses as
     ///   `footprint = ".."`, and a node ceiling does not print `u64::MAX` as gibibytes
     pub fn compact(&self) -> String {
-        let cpu = match self.cpu_milli {
+        let (cpu, mem) = (self.compact_cpu(), self.compact_mem());
+        match self.disk_bytes {
+            0 | u64::MAX => format!("{cpu}/{mem}"),
+            d => format!("{cpu}/{mem}/{}", compact_bytes(d)),
+        }
+    }
+
+    /// Cores: whole where exact (`92c`), one decimal off a core boundary (`0.5c`)
+    pub fn compact_cpu(&self) -> String {
+        match self.cpu_milli {
             m if m == 0 || m.is_multiple_of(1000) => format!("{}c", m / 1000),
             m => format!("{:.1}c", m as f64 / 1000.0),
-        };
-        let bytes = |b: u64| match b {
-            b if b >= GIB => format!("{}Gi", b / GIB),
-            b => format!("{}Mi", b / MIB),
-        };
-        match self.disk_bytes {
-            0 | u64::MAX => format!("{cpu}/{}", bytes(self.mem_bytes)),
-            d => format!("{cpu}/{}/{}", bytes(self.mem_bytes), bytes(d)),
         }
+    }
+
+    pub fn compact_mem(&self) -> String {
+        compact_bytes(self.mem_bytes)
     }
 
     /// `(cpu, mem)` fill against `whole`, each saturating at 100; a zero dimension in
@@ -262,6 +267,14 @@ impl Resources {
 
 /// `3c / 3 GiB`, `500m / 512 MiB`. I/O + disk omitted (`0` pending calibration, no signal
 /// here); [`Resources::compact`] carries disk where a footprint cell needs it
+/// `Gi` from a GiB up, `Mi` below — integer either way (a footprint vocabulary, not a meter)
+fn compact_bytes(b: u64) -> String {
+    match b {
+        b if b >= GIB => format!("{}Gi", b / GIB),
+        b => format!("{}Mi", b / MIB),
+    }
+}
+
 impl std::fmt::Display for Resources {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let cpu = if self.cpu_milli != 0 && self.cpu_milli.is_multiple_of(1000) {
@@ -356,8 +369,8 @@ impl Pool {
     }
 }
 
-/// Tiers a test may declare. `Ord` = declaration order = ascending priority (a stable
-/// `BTreeMap` key for grouping tests by tier during deterministic config lowering)
+/// Tiers a test may declare = sizing presets, never an order. `Ord` = declaration order (a
+/// stable `BTreeMap` key for grouping tests by tier during deterministic config lowering)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 pub enum QosClass {
     /// Un-annotated tests land here (`docs/design-qos.md`)
@@ -372,7 +385,7 @@ pub enum QosClass {
 ///
 /// - `footprint` = component-pod aggregate ceiling, excluding the runner; pods size
 ///   themselves from [`pod`] defaults + `.resources(..)`, and their sum must fit here
-/// - `footprint` + `runner` = [`admitted`](Self::admitted); higher `priority` goes first
+/// - `footprint` + `runner` = [`admitted`](Self::admitted). A tier sizes a test, never orders it
 /// - [`ZERO`](Resources::ZERO) footprint = tier declares no default (`sync`), so
 ///   `footprint = ".."` is required — [`QosClass::profile_with`] is where that is enforced
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,7 +393,6 @@ pub struct QosProfile {
     pub footprint: Resources,
     pub runner: Resources,
     pub pool: Pool,
-    pub priority: u8,
     pub hard_cap: Duration,
 }
 
@@ -394,7 +406,7 @@ impl QosProfile {
     /// Component ceiling replaced by a test's `footprint = ".."`; `None` = untouched
     ///
     /// - Sole place an override lands (quota/budget/lease/request all read `footprint`)
-    /// - `runner`/`pool`/`priority`/`hard_cap` not overridable (cross-test policy)
+    /// - `runner`/`pool`/`hard_cap` not overridable (cross-test policy)
     pub fn with_footprint(self, footprint: Option<Resources>) -> QosProfile {
         match footprint {
             Some(footprint) => {
@@ -453,7 +465,7 @@ impl QosClass {
         QosClass::default().profile().footprint
     }
 
-    /// Const policy table: pool, priority, cap, runner, and the default component ceiling.
+    /// Const policy table: pool, cap, runner, and the default component ceiling.
     ///
     /// - Ceiling bounds the sum of pods sized from [`pod`] + `.resources(..)`; it does not
     ///   size them (`2c/4Gi` = the two-pod validator+indexer shape at [`pod`]'s defaults)
@@ -467,7 +479,6 @@ impl QosClass {
                 footprint: Resources::new(2_000, 4 * GIB, 0, 0),
                 runner: Resources::new(1_000, GIB, 0, 0),
                 pool: Pool::General,
-                priority: 0,
                 hard_cap: Duration::from_secs(10 * 60),
             },
             QosClass::Wallet => QosProfile {
@@ -475,14 +486,12 @@ impl QosClass {
                 // In-process wallet lives here → real compute, not just orchestration
                 runner: Resources::new(2_000, 2 * GIB, 0, 0),
                 pool: Pool::General,
-                priority: 1,
                 hard_cap: Duration::from_secs(10 * 60),
             },
             QosClass::Testnet => QosProfile {
                 footprint: Resources::new(8_000, 10 * GIB, 0, 0),
                 runner: Resources::new(1_000, GIB, 0, 0),
                 pool: Pool::General,
-                priority: 2,
                 hard_cap: Duration::from_secs(6 * 60 * 60),
             },
             QosClass::Sync => QosProfile {
@@ -494,7 +503,6 @@ impl QosClass {
                 // Driver only marshals the test + polls an exporter; work is in the pods
                 runner: Resources::new(1_000, GIB, 0, 0),
                 pool: Pool::Nvme,
-                priority: 3,
                 hard_cap: Duration::from_secs(48 * 60 * 60),
             },
         }
@@ -742,20 +750,6 @@ mod tests {
         assert_eq!(w.admitted(), Resources::new(4_000, 6 * GIB, 0, 0));
     }
 
-    #[test]
-    fn priority_order_matches_declaration_order() {
-        let (i, w, t, s) = (
-            QosClass::Integration.profile().priority,
-            QosClass::Wallet.profile().priority,
-            QosClass::Testnet.profile().priority,
-            QosClass::Sync.profile().priority,
-        );
-        // Default tier lowest: a flood of ordinary tests must not starve the rare heavy ones
-        assert!(i < w && w < t, "integration < wallet < testnet");
-        // sync tops the order overall (own pool, ordering still well-defined)
-        assert!(t <= s, "sync is not below testnet");
-    }
-
     /// Admission floor = what an un-annotated test reserves, so no tier carrying a default
     /// may price below it (a run cleared to start must be able to start anything)
     #[test]
@@ -909,7 +903,6 @@ mod tests {
 
         assert_eq!(eff.footprint, over);
         assert_eq!(eff.runner, base.runner, "runner is not overridable");
-        assert_eq!(eff.priority, base.priority, "priority is not overridable");
         assert_eq!(eff.hard_cap, base.hard_cap, "hard cap is not overridable");
         assert_eq!(eff.pool, base.pool, "placement is not overridable");
     }

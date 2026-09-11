@@ -184,7 +184,8 @@ async fn drive_real(
             if !frame.running.is_empty() {
                 w.saw_running = true;
             }
-            if !frame.free.fits_within(&ceiling) {
+            let free = frame.snapshot.limit.saturating_sub(&frame.snapshot.committed);
+            if !free.fits_within(&ceiling) {
                 w.free_ever_exceeded_ceiling = true;
             }
         },
@@ -312,9 +313,8 @@ async fn oversized_test_is_skipped_with_reason_while_the_rest_runs() {
 
 // ── Story 4 ─────────────────────────────────────────────────────────────────
 
-/// Hung test goes SLOW, killed at its hard cap as TIMEOUT, freeing its one-slot ceiling to
-/// backfill the queued test. Sole path over soft-slow + hard-cap kill + backfill after an
-/// unclean exit.
+/// Hung test goes SLOW, killed at its hard cap as TIMEOUT, freeing its one-slot ceiling for
+/// the queued test. Sole path over soft-slow + hard-cap kill + admission after an unclean exit.
 #[tokio::test]
 async fn hung_test_goes_slow_then_times_out_and_frees_the_slot() {
     let fx = Fixture::new("timeout");
@@ -360,6 +360,6 @@ async fn hung_test_goes_slow_then_times_out_and_frees_the_slot() {
     // replays to scrollback
     assert!(
         out.contains("PASS") && out.contains("pkg::ok"),
-        "the backfilled test must run and pass after the slot frees; {out}"
+        "the queued test must run and pass after the slot frees; {out}"
     );
 }

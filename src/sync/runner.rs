@@ -1009,9 +1009,9 @@ mod tests {
         assert_eq!(run.run().await.verdict, SyncVerdict::Passed);
     }
 
-    /// Absent at launch ≠ unpublished: a row settles only once its window closes
+    /// Nothing judged at launch: present by its deadline → settled, absent at it → unpublished
     #[tokio::test(start_paused = true)]
-    async fn a_row_is_unpublished_only_once_its_window_has_closed() {
+    async fn a_row_is_judged_at_its_deadline_not_at_launch() {
         static ROWS: [Row; 2] = [
             crate::metrics::row(
                 "late",
@@ -1025,7 +1025,7 @@ mod tests {
             ),
         ];
         let script = (1..=10).map(|h| p(h, 10)).collect();
-        let subject = FakeSubject::new(script).publishing(LATE.family(), 2, &ROWS);
+        let subject = FakeSubject::new(script).publishing(LATE.family(), 1, &ROWS);
         let out = fast_runner(subject).run().await;
         assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
         assert_eq!(out.unpublished, ["never <- fake_never_height"]);

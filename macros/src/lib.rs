@@ -683,7 +683,7 @@ fn test_dep_submit(
 ///      read the tier in `TestEnv::build()` (the in-process bridge).
 ///
 /// One optional argument, `footprint = "15c/29Gi[/400Gi]"`: replaces this test's component
-/// ceiling only (tier still supplies priority/pool/hard cap). Omitted → tier default, and
+/// ceiling only (tier still supplies pool/hard cap). Omitted → tier default, and
 /// pods size themselves from `qos::pod` unless they call `.resources(..)`.
 ///
 /// `sync` has no default ceiling, so there it is required rather than optional.

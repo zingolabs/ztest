@@ -201,8 +201,8 @@ k8s (no local daemon, no `~/.ztest` db).
 - The engine subtracts it using the Phase-C inventory (`sync_by_binary` + `qos_by_binary` →
   `plan::drop_sync_tests`), naming what it dropped
 - Subtraction is by *tier*, not by profile registration — a bare `#[ztest::qos::sync]` test must leave too,
-  else it survives into the QoS plan and puts a `sync` row in the live panel for work that never launches
-- Admitting either parks a 48 h item at top priority for the length of the run
+  else it survives into the QoS plan and holds a queue slot for work that never launches
+- Admitting either parks a 48 h item in the queue for the length of the run
 
 ## CLI (provisional)
 
@@ -222,7 +222,7 @@ ztest cleanup <id>                            # namespace + driver pod + record 
 
 ## QoS
 
-- `QosClass::Sync` (`src/qos/`): NVMe pool, 48 h cap, top priority, NVMe taint/toleration
+- `QosClass::Sync` (`src/qos/`): NVMe pool, 48 h cap, NVMe taint/toleration
 - NVMe node count = the concurrency ceiling; a full pool leaves the pod `Pending` (k8s-native), not failed
 - From-genesis in-topology sync wears `#[ztest::qos::sync]`; an external sync (in-process client to a
   remote server) needs only `#[ztest::qos::wallet]`

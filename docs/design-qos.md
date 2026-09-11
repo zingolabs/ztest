@@ -47,9 +47,8 @@ Sizing lives with the component, not with the tier. Each backend renders its own
 - *Admitted* = `ceiling + runner`, what admission, the lease and the namespace quota all charge
 - `wallet` differs from `integration` in the runner alone (the in-process wallet lives there);
   every other runner only orchestrates
-- Caps + reserves locked in the `QosClass::profile` const table; priority ascends with tier
-  order, and the default tier sits lowest so a flood of ordinary tests cannot starve the
-  rare heavy ones
+- Caps + reserves locked in the `QosClass::profile` const table. A tier sizes a test; it never orders
+  one (admission is arrival order, see [Scheduler](#scheduler))
 - `sync` off the general pool → nodeSelector + toleration (`qos::NVME_*`, label
   `ztest.io/pool=nvme`); NVMe node count sizes the sync concurrency ceiling
 - Un-annotated → `integration`. A test smaller than the default two-pod shape declares
@@ -81,8 +80,8 @@ Tier ceiling = a default, not an allotment. A topology that doesn't fit declares
 #[ztest::sync_test(name = "…", subject = indexer, qos = sync, footprint = "15c/29Gi")]
 ```
 
-- Replaces the **component** half only — `runner`, `pool`, `priority`, `hard_cap` still come from the
-  tier (a test that could raise its own priority or cap would starve its peers)
+- Replaces the **component** half only — `runner`, `pool`, `hard_cap` still come from the tier (a test
+  that could raise its own cap would hold capacity its peers are queued for)
 - Raises the ceiling, never the pods: a third pod at `qos::pod`'s defaults needs a third core of
   headroom, and `DeployBudget` names the whole topology when the sum does not fit
 - Grammar `"<cpu>/<mem>"` (`ztest_attr::footprint`), shared by proc-macro, CLI source scan, `qos::units`
@@ -136,8 +135,8 @@ async fn syncs_from_genesis() {
 }
 ```
 
-- **inventory submit** (out-of-process): dumped by the `ZTEST_DUMP_INVENTORY` ctor → `ztest run` groups
-  by tier and builds the capacity plan. `QosDecl` (submit, `&'static`) / `QosEntry` (owned read) flow
+- **inventory submit** (out-of-process): dumped by the `ZTEST_DUMP_INVENTORY` ctor → `ztest run` builds the
+  preflight plan (count, total reserve, tests no empty cluster holds). `QosDecl` (submit, `&'static`) / `QosEntry` (owned read) flow
   through `src/inventory.rs` beside `DevImageDecl` / `TestDepDecl` / `SeedDecl`
 - **task-local enter** (in-process): `TestEnv::build()` reads the tier for requests/limits/scheduling
 - Macros in `ztest_macros` (`qos_attr()`); `qos` re-exports the four plus `#[ztest::calibrated]`
@@ -198,18 +197,21 @@ bandwidth) and `ztest.io/io-iops` (random-4k ceiling).
 
 ## Scheduler
 
-Greedy **priority admission with backfill**: each pass admits the highest-priority queued request that
-fits its pool's live 4-D capacity, lower-priority requests backfill the remainder, a lease release
-triggers a fresh pass.
+One **arrival-ordered queue**: each pass walks it in arrival order and admits every request that fits
+the live 4-D capacity, skipping any that do not fit yet (a later request that fits starts ahead of an
+earlier one that cannot). A lease release or a capacity reconcile triggers a fresh pass. Tiers size a
+test; nothing orders by tier.
 
 - A request exceeding even the empty-pool capacity is **rejected** (unschedulable), never queued
 - Each request acquires its whole 4-D footprint atomically → no hold-and-wait, no deadlock. A test never
   escalates while holding (tier fixes the need up front) and tests are mutually independent
 - `sync`: `build()` fails fast when no NVMe node is schedulable, rather than leaving the pod Pending on
   an unsatisfiable selector
-- Preflight (`ui/render.rs` + a `qos::schedule` planning pass) fills the `tier`/`queue`/`reservation`
-  banner rows — group by tier, compute peak concurrent namespaces and wave structure against probed
-  capacity, warn when a tier's footprint exceeds its pool. Live lease state updates `reservation`
+- A skipped request keeps its place: once capacity frees it still precedes every later arrival. A large
+  request can wait behind a steady stream of smaller ones — the accepted cost of never idling capacity
+- Preflight (`qos::schedule`) states the test count, total reserve and the tests no empty cluster can
+  hold (named, rejected at admission). No wave or concurrency estimate; the live panel shows running /
+  queued
 
 ## Guaranteed-QoS pods
 

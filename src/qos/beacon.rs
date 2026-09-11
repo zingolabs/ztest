@@ -76,10 +76,6 @@ pub struct RunningTest {
     pub name: String,
     pub footprint: Resources,
     pub started_at: DateTime<Utc>,
-    /// Beside the footprint, not instead of it — an override makes the two independent,
-    /// and the left panel's tally groups by tier
-    #[serde(default)]
-    pub tier: super::QosClass,
 }
 
 /// One run, as `ztest status` sees it. Serialized whole into the lease's record
@@ -157,12 +153,6 @@ impl Beacon {
     /// Derived, never stored — no counter that can drift out of step with the others
     pub fn completed(&self) -> u32 {
         self.total.saturating_sub(self.queued).saturating_sub(self.running_count)
-    }
-
-    /// Running tests grouped by tier. Truncated past [`MAX_RUNNING`] — the tally covers
-    /// what the list carries, and [`elided`](Self::elided) accounts for the rest
-    pub fn by_tier(&self) -> std::collections::BTreeMap<super::QosClass, super::live::TierLive> {
-        super::live::tier_tally(self.running.iter().map(|t| (t.tier, t.footprint)))
     }
 
     /// Tests running beyond the [`MAX_RUNNING`] list, and what they hold together
@@ -287,7 +277,6 @@ mod tests {
             name: name.into(),
             footprint: Resources::new(cpu, mem, 0, 0),
             started_at: ts("2026-08-17T14:33:03Z"),
-            tier: crate::qos::QosClass::Sync,
         }
     }
 
