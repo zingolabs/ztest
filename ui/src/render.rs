@@ -1015,10 +1015,10 @@ mod tests {
     #[test]
     fn the_left_panel_waiting_names_the_driver_phase() {
         let mut state = watching(None);
-        state.metrics_note = Some("no committed height scraped yet".into());
+        state.metrics_note = Some("no height scraped yet".into());
         let out = render_sync_watch_panel(&state, FRAME, &plain_unicode_theme());
         assert!(out.contains("Running"), "driver phase:\n{out}");
-        assert!(out.contains("no committed height scraped yet"), "cause:\n{out}");
+        assert!(out.contains("no height scraped yet"), "cause:\n{out}");
     }
 
     #[test]

@@ -67,7 +67,8 @@ declares a container port named `metrics`, then promotes ztest's pod labels (`co
 - `watch` = the pinned 3-column panel (height/pace/trend · per-pool rates · per-container load) + driver
   and subject logs in scrollback; panel fed by the same `report_view` read as `status`, once per scrape
   interval → one source, two renderers
-- Height = the committed frontier only (zaino's `finalized`), in probe and panel alike
+- Height = one frontier family, in probe and panel alike (zaino's `fetched`: per block; its
+  `finalized` steps once per checkpoint interval and carries no blocks/s)
 - Driver = a target like any component: `ztest_sync_started_timestamp_seconds` (segment origin, the live
   window) + `ztest_sync_violations_total{probe}`. No state strings — see
   [design-metrics.md](design-metrics.md)

@@ -127,12 +127,11 @@ impl From<&super::Snapshot> for Observation {
     }
 }
 
-/// Height families a component publishes. `committed` = the one height probe and panel both read
+/// Height families a component publishes. `height` = the one frontier probe and panel both read
 /// (a second frontier family = a second answer to "how far")
 #[derive(Debug, Clone, Copy)]
 pub struct Heights {
-    /// Durable frontier — written and fsynced
-    pub committed: Gauge,
+    pub height: Gauge,
     /// Completion denominator. `None` = component publishes no target
     pub target: Option<Gauge>,
     /// Network tip as this component sees it. Not a denominator — it advances underneath a
@@ -209,9 +208,9 @@ pub trait Observe: crate::metrics::MetricLayout {
         Self::HEIGHTS.target.and_then(|g| exposition.height(g)).filter(|&t| t > 0)
     }
 
-    /// `None` before the first commit
-    fn committed_height(exposition: &Exposition) -> Option<u32> {
-        exposition.height(Self::HEIGHTS.committed)
+    /// `None` until the frontier is first published
+    fn height_of(exposition: &Exposition) -> Option<u32> {
+        exposition.height(Self::HEIGHTS.height)
     }
 }
 

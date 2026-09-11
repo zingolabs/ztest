@@ -252,7 +252,7 @@ fn fold(state: &mut SyncWatchState, newest: &mut Option<SystemTime>, read: Read,
     }
     state.metrics_note = match (&frame.view.note, &state.vitals) {
         (Some(note), _) => Some(note.clone()),
-        (None, None) => Some("no committed height scraped yet".into()),
+        (None, None) => Some("no height scraped yet".into()),
         (None, Some(_)) => None,
     };
     state.loads = loads(&frame.view.resources, &frame.limits);
@@ -618,7 +618,7 @@ mod tests {
         let (mut state, mut newest) = (SyncWatchState::default(), None);
         fold(&mut state, &mut newest, frame(5, None), Duration::ZERO);
         assert!(state.vitals.is_none());
-        assert_eq!(state.metrics_note.as_deref(), Some("no committed height scraped yet"));
+        assert_eq!(state.metrics_note.as_deref(), Some("no height scraped yet"));
     }
 
     fn newest_at(value: f64) -> Series {

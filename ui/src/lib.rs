@@ -316,7 +316,7 @@ pub struct SyncVitals {
 const ETA_BASIS_SECS: f64 = 600.0;
 
 impl SyncVitals {
-    /// `None` until the view holds a committed height
+    /// `None` until the view holds a height
     pub fn of(view: &ReportView, received_at: std::time::Duration) -> Option<SyncVitals> {
         let (height, target) = view.height?;
         let blocks = view.blocks.first().cloned();
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn no_committed_height_is_no_vitals() {
+    fn no_height_is_no_vitals() {
         let view = ReportView { height: None, ..view(&[10.0]) };
         assert!(SyncVitals::of(&view, Duration::ZERO).is_none());
     }
@@ -424,7 +424,7 @@ mod tests {
             shielded: vec![per_minute("orchard", Some(Channel::Orchard), &[5.0])],
             ..view(&[10.0])
         };
-        let v = SyncVitals::of(&view, Duration::ZERO).expect("a committed height");
+        let v = SyncVitals::of(&view, Duration::ZERO).expect("a height");
         let rates: Vec<_> = v.pools.iter().map(|s| (s.channel, s.last())).collect();
         assert_eq!(
             rates,

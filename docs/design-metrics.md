@@ -77,15 +77,15 @@ once and every reader inherits it.
 ```rust
 mod family {
     pub const ORCHARD_ACTIONS: Counter = counter("zaino_sync_orchard_actions_total", Dimension::Count);
-    pub const FINALIZED_HEIGHT: Gauge  = gauge("zaino_sync_finalized_height", Dimension::Count);
+    pub const FETCHED_HEIGHT:  Gauge   = gauge("zaino_sync_fetched_height", Dimension::Count);
     pub const BLOCK_FETCH:     Hist    = hist("zaino_sync_block_fetch_seconds", Dimension::Seconds);
 }
 
 const ROWS: &[Row] = &[
-    row("orchard",   family::ORCHARD_ACTIONS.rate(),    Facet::Shielded),
-    row("blocks",    family::FINALIZED_HEIGHT.slope(),  Facet::Blocks),
-    row("finalized", family::FINALIZED_HEIGHT.level(),  Facet::Progress),
-    row("fetch p99", family::BLOCK_FETCH.p(Phi::P99),   Facet::WritePath),
+    row("orchard",   family::ORCHARD_ACTIONS.rate(),  Facet::Shielded),
+    row("blocks",    family::FETCHED_HEIGHT.slope(),  Facet::Blocks),
+    row("fetched",   family::FETCHED_HEIGHT.level(),  Facet::Progress),
+    row("fetch p99", family::BLOCK_FETCH.p(Phi::P99), Facet::WritePath),
 ];
 ```
 
@@ -104,8 +104,8 @@ gauge is set by its first commit, a histogram by its first observation. Absence 
 **ready window** running from the subject's launch.
 
 - Default = `DEFAULT_READY` (60 s) for every family; nothing is annotated per metric
-- A declaration overrides only where its producer publishes late by design —
-  `FINALIZED_HEIGHT.ready_within(5 min)` (first commit waits out zaino's 120 s checkpoint interval)
+- A declaration overrides only where its producer publishes late by design (`.ready_within(d)`
+  beside the constant); no bundled family needs one today
 - A profile overrides one run: `run.ready_within(family, d)`
 - Gates (`SyncSubject::gates`, the families `progress` cannot read without) are waited for before the
   first tick; one missing past its window errors the run, named

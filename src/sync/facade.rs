@@ -135,8 +135,8 @@ impl SyncRunner {
     }
 
     /// Widen (or narrow) one family's ready window for this profile — e.g. a cold mainnet
-    /// validator delaying zaino's first commit past
-    /// `ztest::backends::zainod::family::FINALIZED_HEIGHT`'s declared 5 min
+    /// validator delaying zaino's first block past
+    /// `ztest::backends::zainod::family::FETCHED_HEIGHT`'s 60 s default
     pub fn ready_within(
         &mut self,
         family: impl Into<crate::metrics::Family>,

@@ -1447,7 +1447,7 @@ async fn build_report_view(client: &Client, ns: &str, mut view: ReportView) -> R
                 };
             // Record owns the verdict's numbers; the TSDB only confirms them, and a
             // disagreement is shown rather than resolved
-            let observed = progress(|h| Some(h.committed));
+            let observed = progress(|h| Some(h.height));
             let pace = view.blocks.first().and_then(ztest::api::metrics::Series::mean);
             let tolerance = stale_scrape_slack(elapsed, pace);
             // Running = no record yet → the TSDB holds the only height there is
