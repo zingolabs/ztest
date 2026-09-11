@@ -1046,7 +1046,7 @@ fn with_live_capacity<'a>(snap: &'a BannerState, cap: Option<&CapRx>) -> Cow<'a,
     match cap {
         Some(rx) => {
             let mut s = snap.clone();
-            s.cluster.capacity = *rx.borrow();
+            s.cluster.capacity = Some(*rx.borrow());
             Cow::Owned(s)
         }
         None => Cow::Borrowed(snap),
@@ -1463,7 +1463,7 @@ fn apply_update(state: &mut BannerState, upd: Update) {
             state.cluster.context = context;
             state.cluster.nodes_ready = nodes_ready;
             state.cluster.nodes_cordoned = nodes_cordoned;
-            state.cluster.capacity = capacity;
+            state.cluster.capacity = Some(capacity);
             state.cluster.slots_used = slots_used;
         }
         Update::Probe(ProbeOutcome::Missing { detail }) => {
@@ -1771,7 +1771,7 @@ fn build_initial_state(opts: &RunOptions) -> BannerState {
             slots_configured: opts.test_threads.unwrap_or(0),
             nodes_ready: 0,
             nodes_cordoned: 0,
-            capacity: ztest::qos::ClusterCapacity::default(),
+            capacity: None,
         },
         build: ztest_ui::BuildState::Pending,
         archives: Vec::<ArchiveRow>::new(),

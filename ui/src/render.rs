@@ -64,6 +64,7 @@ mod banner_row {
     pub(super) const NODES: &str = "{label} {ready|bold} ready {@dot|dim} {cordoned|bold} cordoned";
     pub(super) const CAPACITY: &str =
         "{label} capacity {@dot|dim} {cpu|bold} {@dot|dim} {mem|bold}";
+    pub(super) const CAPACITY_PROBING: &str = "{label} capacity {@dot|dim} probing{@ellipsis}";
     pub(super) const INVENTORY_QUEUED: &str = "{label|dim} {state|dim}";
     pub(super) const INVENTORY_WORKING: &str =
         "{label|pass} {@spin|bold} {phase}{@ellipsis} {@dot|dim} {elapsed|bold}";
@@ -113,9 +114,20 @@ fn render_cluster_block(out: &mut String, state: &BannerState, theme: &Theme) {
     draw(out, f, banner_row::NODES, Duration::ZERO, theme);
 
     // One global figure: requested of allocatable, per dimension
-    let (cpu, mem) = used_of(&c.capacity.reserved, &c.capacity.allocatable);
-    let f = Fields::new().text("label", label("")).text("cpu", cpu).text("mem", mem);
-    draw(out, f, banner_row::CAPACITY, Duration::ZERO, theme);
+    let f = Fields::new().text("label", label(""));
+    match &c.capacity {
+        Some(cap) => {
+            let (cpu, mem) = used_of(&cap.reserved, &cap.allocatable);
+            draw(
+                out,
+                f.text("cpu", cpu).text("mem", mem),
+                banner_row::CAPACITY,
+                Duration::ZERO,
+                theme,
+            )
+        }
+        None => draw(out, f, banner_row::CAPACITY_PROBING, Duration::ZERO, theme),
+    }
 }
 
 fn render_inventory_block(out: &mut String, state: &BannerState, theme: &Theme) {
@@ -244,6 +256,7 @@ mod panel_row {
         " {used|bold}/{total|bold} slots",
     );
     pub(super) const CAPACITY: &str = "{label|dim} {cpu|bold} {@dot|dim} {mem|bold}";
+    pub(super) const CAPACITY_PROBING: &str = "{label|dim} probing{@ellipsis}";
     pub(super) const BUILD_QUEUED: &str = "{label|pass} {@dot|dim} queued";
     pub(super) const BUILD_WORKING: &str =
         "{label|pass} {@spin|bold} {phase}{@ellipsis} {@dot|dim} {elapsed}";
@@ -319,9 +332,20 @@ pub fn render_preflight_panel(
         .text("total", c.slots_total.to_string());
     draw(&mut out, f, panel_row::CLUSTER, elapsed, theme);
 
-    let (cpu, mem) = used_of(&c.capacity.reserved, &c.capacity.allocatable);
-    let f = Fields::new().text("label", label("capacity")).text("cpu", cpu).text("mem", mem);
-    draw(&mut out, f, panel_row::CAPACITY, Duration::ZERO, theme);
+    let f = Fields::new().text("label", label("capacity"));
+    match &c.capacity {
+        Some(cap) => {
+            let (cpu, mem) = used_of(&cap.reserved, &cap.allocatable);
+            draw(
+                &mut out,
+                f.text("cpu", cpu).text("mem", mem),
+                panel_row::CAPACITY,
+                Duration::ZERO,
+                theme,
+            )
+        }
+        None => draw(&mut out, f, panel_row::CAPACITY_PROBING, Duration::ZERO, theme),
+    }
 
     render_build_line(&mut out, &state.build, elapsed, theme);
 
@@ -1049,10 +1073,10 @@ mod tests {
                 slots_configured: 6,
                 nodes_ready: 3,
                 nodes_cordoned: 0,
-                capacity: ztest::api::ClusterCapacity {
+                capacity: Some(ztest::api::ClusterCapacity {
                     allocatable: Resources::new(12_000, 48 * GIB, 0, 0),
                     reserved: Resources::new(6_000, 20 * GIB, 0, 0),
-                },
+                }),
             },
             build: BuildState::Ok {
                 test_count: 47,
@@ -1361,9 +1385,27 @@ mod tests {
     }
 
     #[test]
-    fn capacity_line_degrades_to_zero_before_the_probe_lands() {
+    fn an_unprobed_cluster_says_probing_never_zero() {
         let mut state = sample_state();
-        state.cluster.capacity = ztest::api::ClusterCapacity::default();
+        state.cluster.capacity = None;
+        let banner = render(&state, &plain_unicode_theme());
+        let panel = render_preflight_panel(
+            &state,
+            "Preflight",
+            std::time::Duration::ZERO,
+            &plain_unicode_theme(),
+        );
+        for s in [banner, panel] {
+            assert!(s.contains("probing…"), "unprobed must say so:\n{s}");
+            assert!(!s.contains("0 / 0"), "unprobed is not a zero reading:\n{s}");
+        }
+    }
+
+    /// A measured zero is a reading like any other (an empty kind node, say), not "unknown"
+    #[test]
+    fn a_measured_zero_renders_as_zero() {
+        let mut state = sample_state();
+        state.cluster.capacity = Some(ztest::api::ClusterCapacity::default());
         let s = render(&state, &plain_unicode_theme());
         assert!(s.contains("capacity · 0 / 0 cores · 0 / 0 GiB"), "zero-capacity line wrong:\n{s}");
     }

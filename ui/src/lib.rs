@@ -104,8 +104,8 @@ pub enum BuildState {
 }
 
 /// - `slots_used` = observed `zaino-{ci,dev}-*` namespaces (concurrency proxy)
-/// - `capacity` = whole-cluster allocatable − requested (NVMe vs general is k8s
-///   placement, not a second pool)
+/// - `capacity` = whole-cluster requested of allocatable (NVMe vs general is k8s placement, not
+///   a second pool). `None` = probe not answered → "probing…", never a zero that reads as measured
 #[derive(Debug, Clone)]
 pub struct ClusterState {
     pub context: String,
@@ -114,7 +114,7 @@ pub struct ClusterState {
     pub slots_configured: u32,
     pub nodes_ready: u32,
     pub nodes_cordoned: u32,
-    pub capacity: ztest::api::ClusterCapacity,
+    pub capacity: Option<ztest::api::ClusterCapacity>,
 }
 
 #[derive(Debug, Clone)]
