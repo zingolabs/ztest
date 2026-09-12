@@ -16,4 +16,5 @@ pub use crate::pipeline::events::Event;
 pub use crate::pipeline::images::{DumpOutcome, discover};
 pub use crate::pipeline::profiles::workspaces_with_profiles;
 pub use crate::pipeline::runner::Phase;
+pub use crate::pipeline::workspace::{Unlinked, check as workspace_check};
 pub use crate::pipeline::{BuildStage, images, profiles, runner};
