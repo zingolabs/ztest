@@ -694,8 +694,8 @@ zaino_grpc_request_duration_seconds_count 17
     fn every_reading_a_backend_declares_resolves_against_a_live_exposition() {
         let e = exposition(&[
             EXPOSITION,
-            "# TYPE zaino_sync_orchard_actions_total counter\n\
-             zaino_sync_orchard_actions_total 4200\n\
+            "# TYPE zaino_sync_fetched_orchard_actions_total counter\n\
+             zaino_sync_fetched_orchard_actions_total 4200\n\
              # TYPE zaino_sync_fetched_height gauge\n\
              zaino_sync_fetched_height 658599\n\
              # TYPE zaino_sync_block_fetch_seconds histogram\n\
@@ -704,7 +704,7 @@ zaino_grpc_request_duration_seconds_count 17
              zaino_sync_block_fetch_seconds_bucket{le=\"0.005\"} 90\n\
              zaino_sync_block_fetch_seconds_bucket{le=\"+Inf\"} 100\n",
         ]);
-        let counter = counter("zaino_sync_orchard_actions_total", Dimension::Count);
+        let counter = counter("zaino_sync_fetched_orchard_actions_total", Dimension::Count);
         let gauge = gauge("zaino_sync_fetched_height", Dimension::Count);
         let hist = hist("zaino_sync_block_fetch_seconds", Dimension::Seconds);
 
@@ -728,7 +728,7 @@ zaino_grpc_request_duration_seconds_count 17
         let cpu = counter("container_cpu_usage_seconds_total", Dimension::Seconds);
         let stall = counter("container_pressure_io_stalled_seconds_total", Dimension::Ratio);
         let bytes = counter("container_blkio_device_usage_total", Dimension::Bytes);
-        let ops = counter("zaino_sync_orchard_actions_total", Dimension::Count);
+        let ops = counter("zaino_sync_fetched_orchard_actions_total", Dimension::Count);
 
         assert_eq!(cpu.rate().unit(), Unit::Cores, "cpu-seconds per second = parallelism");
         assert_eq!(stall.rate().unit(), Unit::Fraction, "stall is bounded by wall clock");
@@ -765,7 +765,7 @@ zaino_grpc_request_duration_seconds_count 17
         let e = exposition(&[EXPOSITION]);
         assert_eq!(e.height(gauge("zaino_sync_finalized_height", Dimension::Count)), None);
         assert_eq!(
-            e.counter_total(counter("zaino_sync_orchard_actions_total", Dimension::Count)),
+            e.counter_total(counter("zaino_sync_fetched_orchard_actions_total", Dimension::Count)),
             None
         );
     }

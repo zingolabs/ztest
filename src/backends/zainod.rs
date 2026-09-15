@@ -670,6 +670,9 @@ pub mod family {
     /// Height fetched + assembled, advancing per block (zaino counts no blocks → the only
     /// per-block frontier)
     pub const FETCHED_HEIGHT: Gauge = gauge("zaino_sync_fetched_height", Dimension::Count);
+    /// Committed + fsynced. Steps once per batch → trails `FETCHED_HEIGHT` by up to a batch,
+    /// unset on an empty db until the first commit
+    pub const FINALIZED_HEIGHT: Gauge = gauge("zaino_sync_finalized_height", Dimension::Count);
     /// Write path's goal = tip - the non-finalised reorg buffer. Completion measured
     /// against this, never the raw tip (the finalised index trails by design)
     pub const TARGET_HEIGHT: Gauge = gauge("zaino_sync_target_height", Dimension::Count);
@@ -679,21 +682,22 @@ pub mod family {
     //
     // - Whole family, no label selector: zaino publishes these unlabelled, and a series
     //   missing a selected label is not that value (folds to nothing, not to zero)
-    // - Only the finalised writer tallies today → one pass, one count; a second tallying
-    //   pass (migration, tip ingest) would fold into these silently
-    pub const TRANSACTIONS: Counter = counter("zaino_sync_transactions_total", Dimension::Count);
+    // - Tallied at fetch (paired with `FETCHED_HEIGHT`), not at commit → a failed commit or a
+    //   restart re-fetches and re-counts (durable progress = `zaino_sync_finalized_height`)
+    pub const TRANSACTIONS: Counter =
+        counter("zaino_sync_fetched_transactions_total", Dimension::Count);
     pub const TRANSPARENT_INPUTS: Counter =
-        counter("zaino_sync_transparent_inputs_total", Dimension::Count);
+        counter("zaino_sync_fetched_transparent_inputs_total", Dimension::Count);
     pub const TRANSPARENT_OUTPUTS: Counter =
-        counter("zaino_sync_transparent_outputs_total", Dimension::Count);
+        counter("zaino_sync_fetched_transparent_outputs_total", Dimension::Count);
     pub const SAPLING_SPENDS: Counter =
-        counter("zaino_sync_sapling_spends_total", Dimension::Count);
+        counter("zaino_sync_fetched_sapling_spends_total", Dimension::Count);
     pub const SAPLING_OUTPUTS: Counter =
-        counter("zaino_sync_sapling_outputs_total", Dimension::Count);
+        counter("zaino_sync_fetched_sapling_outputs_total", Dimension::Count);
     pub const ORCHARD_ACTIONS: Counter =
-        counter("zaino_sync_orchard_actions_total", Dimension::Count);
+        counter("zaino_sync_fetched_orchard_actions_total", Dimension::Count);
     pub const IRONWOOD_ACTIONS: Counter =
-        counter("zaino_sync_ironwood_actions_total", Dimension::Count);
+        counter("zaino_sync_fetched_ironwood_actions_total", Dimension::Count);
 
     /// Per block, after both source reads
     pub const BLOCK_ASSEMBLE: Hist = hist("zaino_sync_block_assemble_seconds", Dimension::Seconds);
@@ -704,8 +708,9 @@ pub mod family {
     /// slow treestate can't hide behind the block read
     pub const TREESTATE_FETCH: Hist =
         hist("zaino_sync_treestate_fetch_seconds", Dimension::Seconds);
-    /// Per committed batch, incl. fsync
+    /// Per batch, B-tree insert only (fsync = `FSYNC`; the two saturate for unrelated reasons)
     pub const BATCH_WRITE: Hist = hist("zaino_sync_batch_write_seconds", Dimension::Seconds);
+    pub const FSYNC: Hist = hist("zaino_sync_fsync_seconds", Dimension::Seconds);
 
     /// LMDB environment size; against host RAM = where the write path's B-tree
     /// behaviour changes character
@@ -715,7 +720,7 @@ pub mod family {
 /// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns
 /// scannable (reformatted, each row costs six lines)
 #[rustfmt::skip]
-const ROWS: [Row; 22] = [
+const ROWS: [Row; 24] = [
     // Per-op throughput. `label` = the band, which is what keys `Palette::pools` when they
     // stack. Directions kept apart: only the output side is checkable against the
     // note-commitment trees ([`super::super::sync::chainwork`]), and folding spends in loses that
@@ -737,12 +742,14 @@ const ROWS: [Row; 22] = [
     row("assemble", family::BLOCK_ASSEMBLE.mean(), Facet::WritePath),
     row("assemble p99", family::BLOCK_ASSEMBLE.p(Phi::P99), Facet::WritePath),
     row("batch write", family::BATCH_WRITE.mean(), Facet::WritePath),
+    row("fsync", family::FSYNC.mean(), Facet::WritePath),
     // Inbound gRPC. No request-count row (latency histogram's `_count` = the volume)
     row("gRPC", family::GRPC_LATENCY.mean(), Facet::WritePath),
     row("gRPC p99", family::GRPC_LATENCY.p(Phi::P99), Facet::WritePath),
     row("errors", family::GRPC_ERRORS.rate(), Facet::WritePath),
     // Only trustworthy read of zaino's own progress (it proxies the validator while indexing)
     row("fetched", family::FETCHED_HEIGHT.level(), Facet::Progress),
+    row("finalized", family::FINALIZED_HEIGHT.level(), Facet::Progress),
     row("chain tip", family::CHAIN_TIP.level(), Facet::Progress),
     // Height this run was *asked* for — fixed for its duration, so the only honest
     // denominator (the tip advances underneath, marking a finished run short by
@@ -834,6 +841,22 @@ impl ZainoIndexer {
     /// Never `0` — a zero frontier and an unobservable one are different facts
     pub async fn index_frontier(&self) -> Result<u32, RpcError> {
         frontier_of(&self.exporter().await?, "index_frontier")
+    }
+
+    /// Durable counterpart of [`Self::index_frontier`]: committed + fsynced, trailing it by
+    /// up to one batch → end-state claims about the finalised index read this
+    ///
+    /// # Errors
+    ///
+    /// Gauge absent (empty db before the first commit, or no Prometheus feature)
+    pub async fn finalized_frontier(&self) -> Result<u32, RpcError> {
+        self.exporter().await?.height(family::FINALIZED_HEIGHT).ok_or_else(|| {
+            RpcError::decode(
+                COMPONENT,
+                "finalized_frontier",
+                format!("{} unpublished: no batch committed yet", family::FINALIZED_HEIGHT),
+            )
+        })
     }
 }
 
@@ -1284,12 +1307,12 @@ mod tests {
     fn work_source_and_work_of_agree_on_the_declaration() {
         // Shape zaino publishes: one unlabelled series per op class
         let e = scrape(
-            "# TYPE zaino_sync_orchard_actions_total counter\n\
-             zaino_sync_orchard_actions_total 7\n",
+            "# TYPE zaino_sync_fetched_orchard_actions_total counter\n\
+             zaino_sync_fetched_orchard_actions_total 7\n",
         );
         let family =
             <ZainoIndexer as Observe>::work_source(Op::OrchardAction).expect("orchard is declared");
-        assert_eq!(family.family().name, "zaino_sync_orchard_actions_total");
+        assert_eq!(family.family().name, "zaino_sync_fetched_orchard_actions_total");
         assert_eq!(
             family.family().select,
             None,

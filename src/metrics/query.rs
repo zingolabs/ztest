@@ -807,7 +807,7 @@ mod tests {
     }
 
     const ORCHARD: crate::metrics::Counter = crate::metrics::counter(
-        "zaino_sync_orchard_actions_total",
+        "zaino_sync_fetched_orchard_actions_total",
         crate::metrics::Dimension::Count,
     );
     const FETCHED: crate::metrics::Gauge =
@@ -821,7 +821,7 @@ mod tests {
     fn a_counter_plot_rates_before_it_folds() {
         assert_eq!(
             promql_plot(ORCHARD.rate(), "ns", grid()),
-            r#"sum(rate(zaino_sync_orchard_actions_total{namespace="ns"}[35s]))"#
+            r#"sum(rate(zaino_sync_fetched_orchard_actions_total{namespace="ns"}[35s]))"#
         );
     }
 
@@ -871,7 +871,7 @@ mod tests {
     fn a_total_is_taken_from_raw_samples_over_the_padded_run() {
         assert_eq!(
             promql_raw(ORCHARD.rate(), "ns", Duration::from_secs(600)),
-            r#"zaino_sync_orchard_actions_total{namespace="ns"}[605s]"#
+            r#"zaino_sync_fetched_orchard_actions_total{namespace="ns"}[605s]"#
         );
     }
 
@@ -891,14 +891,14 @@ mod tests {
     #[test]
     fn a_split_family_carries_its_selector_into_every_query() {
         let split = crate::metrics::counter_where(
-            "zaino_sync_orchard_actions_total",
+            "zaino_sync_fetched_orchard_actions_total",
             crate::metrics::Dimension::Count,
             "stage",
             "finalised",
         );
         assert_eq!(
             promql_plot(split.rate(), "ns", grid()),
-            r#"sum(rate(zaino_sync_orchard_actions_total{namespace="ns",stage="finalised"}[35s]))"#
+            r#"sum(rate(zaino_sync_fetched_orchard_actions_total{namespace="ns",stage="finalised"}[35s]))"#
         );
         assert!(promql_raw(split.rate(), "ns", Duration::from_secs(60)).contains("stage="));
     }
