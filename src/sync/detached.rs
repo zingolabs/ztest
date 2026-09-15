@@ -83,7 +83,7 @@ pub const REPORT_KEY: &str = "report.json";
 
 /// ConfigMap key the launch record sits under, beside [`REPORT_KEY`] in the same object.
 ///
-/// - Separate key + separate field manager ([`LAUNCH_FIELD_MANAGER`]) → driver's apply of
+/// - Separate key + separate field manager ([`LAUNCH_FIELD_MANAGER`]) → driver's patch of
 ///   the report cannot evict what the controller wrote, and neither needs read-modify-write
 pub const LAUNCH_KEY: &str = "launch.json";
 
@@ -417,9 +417,7 @@ mod runtime {
 
     use crate::cancel::{Cancel, CancelSource};
 
-    use super::{
-        POD_NAME_ENV, POD_NAMESPACE_ENV, REPORT_KEY, STOP_ANNOTATION, SYNC_ID_KEY, SyncReportMirror,
-    };
+    use super::{POD_NAME_ENV, POD_NAMESPACE_ENV, REPORT_KEY, STOP_ANNOTATION, SyncReportMirror};
 
     /// Stop-watch re-read interval. Coarse — a poll beats a watch stream needing
     /// re-establishment across API hiccups, and a stop is not latency-critical
@@ -546,11 +544,14 @@ mod runtime {
         }
     }
 
-    /// Mirror the final report to its ConfigMap (SSA, idempotent) in
+    /// Add the final report to the launch record in
     /// [`report_cm_namespace`](super::report_cm_namespace). Best-effort — the run already
     /// finished; a lost mirror costs only `report`
+    ///
+    /// - Merge patch, never apply: updates the record `write_launch` created, never creates one
+    ///   (a driver draining after `ztest cleanup` resurrected a label-less, owner-less record)
+    /// - Owner + kind labels ride the launch half
     pub async fn write_report(client: &Client, report: &SyncReportMirror) {
-        let namespace = super::report_cm_namespace();
         let name = super::report_cm_name(&report.sync_id);
         let body = match serde_json::to_string_pretty(report) {
             Ok(s) => s,
@@ -559,30 +560,20 @@ mod runtime {
                 return;
             }
         };
-        let cm: ConfigMap = serde_json::from_value(json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "name": name,
-                "namespace": namespace,
-                "labels": {
-                    super::KIND_LABEL_KEY: super::KIND_LABEL_VALUE,
-                    SYNC_ID_KEY: report.sync_id,
-                },
-            },
-            "data": { REPORT_KEY: body },
-        }))
-        .expect("static ConfigMap manifest is valid");
-        let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-        if let Err(e) = api
-            .patch(
-                &name,
-                &PatchParams::apply(super::REPORT_FIELD_MANAGER).force(),
-                &Patch::Apply(&cm),
-            )
-            .await
-        {
-            tracing::warn!(error = %e, cm = %name, "sync report: ConfigMap mirror failed");
+        let api: Api<ConfigMap> = Api::namespaced(client.clone(), super::report_cm_namespace());
+        let params = PatchParams {
+            field_manager: Some(super::REPORT_FIELD_MANAGER.into()),
+            ..PatchParams::default()
+        };
+        let patch = json!({ "data": { REPORT_KEY: body } });
+        match api.patch(&name, &params, &Patch::Merge(&patch)).await {
+            Ok(_) => {}
+            Err(e) if crate::cluster::is_not_found(&e) => {
+                tracing::info!(cm = %name, "sync report: record already reclaimed, verdict dropped");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, cm = %name, "sync report: ConfigMap mirror failed")
+            }
         }
     }
 }

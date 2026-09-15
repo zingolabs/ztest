@@ -4,7 +4,7 @@
 //! | class | object | why explicit |
 //! |---|---|---|
 //! | per-test env | `Namespace ztest-*` | cascades its pods/PVCs/quota |
-//! | detached sync | `Namespace ztest-sync-*` **+ driver Pod** | persistent by design; driver sits in [`RUN_NAMESPACE`], cascades from nothing |
+//! | detached sync | `Namespace ztest-sync-*` **+ driver Pod + record ConfigMap** | persistent by design; driver in [`RUN_NAMESPACE`], record in `OBS_NAMESPACE`, neither cascades |
 //! | ephemeral run pods | `Pod` in [`RUN_NAMESPACE`] | outside the test namespace, nothing cascades them |
 //! | seed binding | `VolumeSnapshotContent` | cluster-scoped, no owner ref |
 //! | QoS reservation | `Lease` in [`META_NAMESPACE`] | holds admission capacity until deleted |
@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{Namespace, Pod};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, DeleteParams, DynamicObject, ListParams, ResourceExt};
 use kube::{Client, Resource};
@@ -560,34 +560,62 @@ async fn discover_syncs(client: &Client, scope: &Scope, plan: &mut Plan) {
         Err(e) => return plan.errors.push(format!("list sync namespaces: {e}")),
     };
 
-    plan.targets.extend(sync_targets(namespaces, pods));
+    let records =
+        match Api::<ConfigMap>::namespaced(client.clone(), crate::sync::report_cm_namespace())
+            .list(&ListParams::default().labels(&selector))
+            .await
+        {
+            Ok(l) => l.items,
+            Err(e) => return plan.errors.push(format!("list sync records: {e}")),
+        };
+
+    plan.targets.extend(sync_targets(namespaces, pods, records));
 }
 
-/// One [`Target`] per sync id, joining the two halves [`delete`] removes.
+/// Parts of one sync, any subset present
+#[derive(Default)]
+struct SyncParts {
+    namespace: Option<Namespace>,
+    pod: Option<Pod>,
+    record: Option<ConfigMap>,
+}
+
+/// One [`Target`] per sync id, joining every part `ztest sync list` or [`delete`] sees.
 ///
-/// - Either half can be absent (driver panicking before it creates its topology leaves a
-///   pod-only sync — namespace-anchored discovery never reaps it)
+/// - Any part can be absent (driver panicking before it creates its topology leaves a
+///   pod-only sync; a reaped namespace + driver leaves a record-only one `list` still shows)
 /// - `pods` outer `None` = list failed, kept apart from "no driver pod"
 /// - Unlabelled object keys on its own name (never merged into a neighbour's target)
-fn sync_targets(namespaces: Vec<Namespace>, pods: Option<Vec<Pod>>) -> Vec<Target> {
-    let mut halves: BTreeMap<String, (Option<Namespace>, Option<Pod>)> = BTreeMap::new();
+fn sync_targets(
+    namespaces: Vec<Namespace>,
+    pods: Option<Vec<Pod>>,
+    records: Vec<ConfigMap>,
+) -> Vec<Target> {
+    let mut halves: BTreeMap<String, SyncParts> = BTreeMap::new();
     for ns in namespaces {
         let key = label_of(&ns, SYNC_ID_KEY).unwrap_or(&ns.name_any()).to_string();
-        halves.entry(key).or_default().0 = Some(ns);
+        halves.entry(key).or_default().namespace = Some(ns);
     }
     for pod in pods.iter().flatten() {
         let key = label_of(pod, SYNC_ID_KEY).unwrap_or(&pod.name_any()).to_string();
-        halves.entry(key).or_default().1 = Some(pod.clone());
+        halves.entry(key).or_default().pod = Some(pod.clone());
+    }
+    // Keyed by label only: a record's name is not its sync id
+    for record in records {
+        if let Some(id) = label_of(&record, SYNC_ID_KEY).map(String::from) {
+            halves.entry(id).or_default().record = Some(record);
+        }
     }
 
     halves
         .into_values()
-        .map(|(ns, pod)| {
+        .map(|SyncParts { namespace: ns, pod, record }| {
             let anchor = ns.as_ref().map(Namespace::name_any);
             let sync_id = ns
                 .as_ref()
                 .and_then(|n| label_of(n, SYNC_ID_KEY))
                 .or_else(|| pod.as_ref().and_then(|p| label_of(p, SYNC_ID_KEY)))
+                .or_else(|| record.as_ref().and_then(|r| label_of(r, SYNC_ID_KEY)))
                 .map(String::from);
             let phase =
                 pods.as_ref().map(|_| pod.as_ref().and_then(|p| p.status.as_ref()?.phase.clone()));
@@ -599,13 +627,14 @@ fn sync_targets(namespaces: Vec<Namespace>, pods: Option<Vec<Pod>>) -> Vec<Targe
                 name: anchor
                     .clone()
                     .or_else(|| pod.as_ref().map(Pod::name_any))
-                    .unwrap_or_else(|| id.clone()),
+                    .unwrap_or_else(|| crate::sync::driver_pod_for(&id)),
                 namespace: None,
                 id: sync_id,
                 owner: ns
                     .as_ref()
                     .and_then(|n| label_of(n, qos::LABEL_USER))
                     .or_else(|| pod.as_ref().and_then(|p| label_of(p, qos::LABEL_USER)))
+                    .or_else(|| record.as_ref().and_then(|r| label_of(r, qos::LABEL_USER)))
                     .map(String::from),
                 detail: {
                     let phase = match phase.as_ref().map(Option::as_deref) {
@@ -813,7 +842,7 @@ mod tests {
     /// discovery on the namespace stranded it forever, with `sync list` still showing it
     #[test]
     fn a_driver_pod_without_a_namespace_is_still_reclaimable() {
-        let targets = sync_targets(vec![], Some(vec![sync_pod("zaino-a52f", "Failed")]));
+        let targets = sync_targets(vec![], Some(vec![sync_pod("zaino-a52f", "Failed")]), vec![]);
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].id.as_deref(), Some("zaino-a52f"));
@@ -825,8 +854,11 @@ mod tests {
 
     #[test]
     fn both_halves_of_one_sync_join_into_one_target() {
-        let targets =
-            sync_targets(vec![sync_ns("zaino-a52f")], Some(vec![sync_pod("zaino-a52f", "Failed")]));
+        let targets = sync_targets(
+            vec![sync_ns("zaino-a52f")],
+            Some(vec![sync_pod("zaino-a52f", "Failed")]),
+            vec![],
+        );
 
         assert_eq!(targets.len(), 1, "namespace + driver = one reap, not two");
         assert_eq!(targets[0].name, crate::sync::namespace_for("zaino-a52f"));
@@ -835,7 +867,7 @@ mod tests {
 
     #[test]
     fn a_namespace_whose_driver_is_gone_is_reclaimable() {
-        let targets = sync_targets(vec![sync_ns("zaino-a52f")], Some(vec![]));
+        let targets = sync_targets(vec![sync_ns("zaino-a52f")], Some(vec![]), vec![]);
 
         assert_eq!(targets.len(), 1);
         assert!(targets[0].detail.contains("no driver pod"), "{}", targets[0].detail);
@@ -844,16 +876,49 @@ mod tests {
 
     #[test]
     fn a_running_driver_protects_a_sync_that_has_no_namespace_yet() {
-        let targets = sync_targets(vec![], Some(vec![sync_pod("zaino-a52f", "Running")]));
+        let targets = sync_targets(vec![], Some(vec![sync_pod("zaino-a52f", "Running")]), vec![]);
 
         assert!(targets[0].liveness.is_live(), "provisioning sync must survive a bare cleanup");
+    }
+
+    fn sync_record(id: &str) -> ConfigMap {
+        ConfigMap {
+            metadata: sync_meta(&crate::sync::report_cm_name(id), id),
+            ..Default::default()
+        }
+    }
+
+    /// Namespace TTL-reaped + driver gone leaves only the record, which `ztest sync list` still
+    /// shows: discovery anchored on namespace/pod stranded it forever
+    #[test]
+    fn a_record_without_namespace_or_driver_is_reclaimed_with_its_report() {
+        let targets = sync_targets(vec![], Some(vec![]), vec![sync_record("zaino-a52f")]);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id.as_deref(), Some("zaino-a52f"));
+        assert_eq!(targets[0].owner.as_deref(), Some("elicb"));
+        assert!(!targets[0].liveness.is_live());
+        let record = observability_of(&targets, &[]);
+        assert_eq!(record.reports, vec![crate::sync::report_cm_name("zaino-a52f")]);
+    }
+
+    #[test]
+    fn a_record_joins_the_namespace_and_driver_of_its_sync() {
+        let targets = sync_targets(
+            vec![sync_ns("zaino-a52f")],
+            Some(vec![sync_pod("zaino-a52f", "Failed")]),
+            vec![sync_record("zaino-a52f")],
+        );
+
+        assert_eq!(targets.len(), 1, "namespace + driver + record = one sync");
+        assert_eq!(targets[0].name, crate::sync::namespace_for("zaino-a52f"));
     }
 
     /// Unreadable pod list is the one case that must fail *shut*: every sync reads as
     /// live rather than every running sync reading as garbage
     #[test]
     fn an_unreadable_pod_list_protects_every_sync() {
-        let targets = sync_targets(vec![sync_ns("zaino-a52f")], None);
+        let targets = sync_targets(vec![sync_ns("zaino-a52f")], None, vec![]);
 
         assert_eq!(targets.len(), 1);
         assert!(targets[0].liveness.is_live());
