@@ -26,6 +26,7 @@ pub mod events;
 pub mod images;
 pub mod profiles;
 pub mod runner;
+pub mod workspace;
 
 pub use self::archives::ArchivesOutcome;
 pub use self::build::{BuildStage, SelectedBinary};

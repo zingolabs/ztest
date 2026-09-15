@@ -373,6 +373,11 @@ pub fn execute(args: Args) -> ExitCode {
 
         return exit(NextestExitCode::SETUP_ERROR);
     }
+    // Same slot: a workspace without `ztest` compiles clean, then fails the inventory dump
+    if let Some(root) = pipeline::unlinked_workspace() {
+        eprintln!("ztest run: no crate in {} depends on `ztest`", root.display());
+        return exit(NextestExitCode::SETUP_ERROR);
+    }
 
     // `describe` recognised only as the *first* token — `nextest_args` is `trailing_var_arg`,
     // so a real subcommand cannot be declared here. Filter for a test *named* `describe`

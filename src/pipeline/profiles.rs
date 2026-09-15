@@ -328,7 +328,7 @@ fn git_toplevel(from: &Path) -> Option<PathBuf> {
 
 /// - `--no-deps`: skips resolution (seconds → ~20ms) + restricts `packages` to workspace members
 /// - Not `runner::cargo_metadata` (that one needs the full graph for `SourceLayout`)
-fn cargo_metadata() -> Result<serde_json::Value, crate::error::PipelineError> {
+pub(super) fn cargo_metadata() -> Result<serde_json::Value, crate::error::PipelineError> {
     let out = std::process::Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .stderr(Stdio::piped())

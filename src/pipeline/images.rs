@@ -41,6 +41,14 @@ pub fn parse_inventory(stdout: &str) -> Result<Dumped, crate::error::PipelineErr
             // profile name → its `test_id` → binary + libtest test) and `ztest run`'s
             // selection prune, the only way the engine tells a profile from a plain test
             Ok(InventoryLine::SyncTest(s)) => dumped.sync_tests.push(s),
+            // Non-JSON = libtest answered, not `dump_hook` (binary never linked `ztest`)
+            Err(_) if !line.trim_start().starts_with('{') => {
+                return Err(format!(
+                    "`{line}` is not an inventory line: the binary ran without ztest's dump \
+                     hook (its crate does not depend on `ztest`)"
+                )
+                .into());
+            }
             Err(e) => return Err(format!("malformed inventory line `{line}`: {e}").into()),
         }
     }
@@ -159,7 +167,9 @@ pub fn assemble(
 
 async fn dump_one(bin: &SelectedBinary) -> Result<Dumped, crate::error::PipelineError> {
     let mut cmd = Command::new(&bin.binary_path);
+    // `dump_hook` exits pre-main → argv unread; a hookless binary lists instead of running
     cmd.env("ZTEST_DUMP_INVENTORY", "1")
+        .args(["--list", "--format", "terse"])
         .current_dir(&bin.cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -214,4 +224,24 @@ fn tail(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn libtest_output_names_the_missing_hook() {
+        let err =
+            parse_inventory("classify::tests::rejects_garbage: test\n\n8 tests, 0 benchmarks\n")
+                .expect_err("libtest listing is not an inventory");
+        assert!(err.to_string().contains("dump hook"), "{err}");
+        assert!(err.to_string().contains("does not depend on `ztest`"), "{err}");
+    }
+
+    #[test]
+    fn broken_json_stays_malformed() {
+        let err = parse_inventory("{\"kind\":\"nope\"}\n").expect_err("unknown kind");
+        assert!(err.to_string().starts_with("malformed inventory line"), "{err}");
+    }
 }

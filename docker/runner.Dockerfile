@@ -161,7 +161,7 @@ RUN --mount=type=cache,target=/cache/cargo \
         [ -n "$binpath" ] || { echo "inventory: nextest list gave an empty binary-path (schema drift?) for cwd=$cwd" >&2; exit 1; }; \
         name=$(basename "$binpath"); \
         printf '\nZTEST_DUMP_BEGIN %s\n' "$name" >> /out/inventory.jsonl; \
-        if ( cd "$cwd" && ZTEST_DUMP_INVENTORY=1 "$binpath" ) >> /out/inventory.jsonl 2>/dev/null; \
+        if ( cd "$cwd" && ZTEST_DUMP_INVENTORY=1 "$binpath" --list --format terse ) >> /out/inventory.jsonl 2>/dev/null; \
             then rc=0; else rc=$?; fi; \
         printf '\nZTEST_DUMP_END %s rc=%s\n' "$name" "$rc" >> /out/inventory.jsonl; \
     done

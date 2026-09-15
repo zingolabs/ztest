@@ -100,7 +100,7 @@ impl LiveStep {
         if st.finished {
             return;
         }
-        let due = !st.last_fold.is_some_and(|last| now.duration_since(last) < REPAINT);
+        let due = st.last_fold.is_none_or(|last| now.duration_since(last) >= REPAINT);
         if matches!(ev, Progress::Bytes { .. }) && !due {
             return;
         }
