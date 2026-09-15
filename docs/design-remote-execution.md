@@ -26,8 +26,9 @@ progress. One engine, one `Executor` seam, both targets — the cluster profile 
 1. **Resource graph** (`resource/`, `plan_runtime`) — DAG builds/pushes component `dev!` images and
    materializes seeds (content-addressed PVC + snapshot → CoW shadow-clone per test). Idempotent,
    label-before-populate, reverse-topo teardown
-1. **Run loop** (`engine/schedule.rs`) — sole admission authority; the pure `qos::Scheduler` packs by
-   CPU×memory with priority + backfill, gated on resource-dep readiness, reconciled from the governor
+1. **Run loop** (`engine/schedule.rs`) — sole admission authority; the pure `qos::Scheduler` admits by
+   CPU×memory from one arrival-ordered queue (whatever fits, in order), gated on resource-dep
+   readiness, reconciled from the governor
 1. **Pod-per-test** (`engine/pod_runner.rs`) — laptop creates the per-test namespace, then a Guaranteed
    single-container runner pod running `<bin> --exact <test> --nocapture` (labeled `ztest.io/run-id`),
    injecting the namespace via `ZTEST_TEST_NAMESPACE`; polls phase until Succeeded/Failed (exit code =

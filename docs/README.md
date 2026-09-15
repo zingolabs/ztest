@@ -32,6 +32,7 @@ down on exit.
 | [design-status.md](design-status.md)                     | `ztest status`: the live cluster view, lease beacons, claim leases, gantt layout           |
 | [design-remote-execution.md](design-remote-execution.md) | Pod-per-test, on-cluster compilation, on-cluster image builds                              |
 | [design-observability.md](design-observability.md)       | Metrics & profiling planes, Prometheus discovery, what a run records                       |
+| [design-metrics.md](design-metrics.md)                   | The metric model: shape, readings, exact totals vs plots, one catalogue for both planes    |
 | [design-sync.md](design-sync.md)                         | Observable chain-sync harness, probe taxonomy, nemesis/chaos layer                         |
 | [design-snapshots.md](design-snapshots.md)               | Chain fixtures as pinned build inputs: manifest-as-lockfile, content-addressed bucket      |
 | [design-describe.md](design-describe.md)                 | One planner behind `run` and `sync describe`: what a selection actually pulls              |

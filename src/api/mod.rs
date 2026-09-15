@@ -15,10 +15,9 @@ pub use crate::cluster_config::seed_size_for;
 pub use crate::engine::schedule::PanelFrame;
 pub use crate::engine::{RunProgress, RunView};
 pub use crate::metrics::query::Series;
-pub use crate::metrics::{LIVE_PERIOD, Unit};
+pub use crate::metrics::{Reading, Unit};
 pub use crate::pipeline::runner::Phase as CompilePhase;
 pub use crate::pipeline::{BuildStage, NodeSummary};
-pub use crate::podmetrics::{PodLoad, SAMPLE_PERIOD};
 pub use crate::proc::{ChildHost, on_path};
 pub use crate::rate::{Pace, Window};
 pub use crate::resource::{Cx, Graph, NodeId, NodeState, Progress, ProgressSink};
@@ -29,12 +28,11 @@ pub use crate::backends::image::DevSource;
 pub use crate::inventory::{DevImageEntry, SeedEntry, SeedPayload};
 pub use crate::plan::{Plan, PlanRoot, PrunedSeed, QosNode};
 pub use crate::qos::beacon::{Beacon, LeaseKind, RunningTest};
-pub use crate::qos::live::{LiveSnapshot, TierLive, tier_tally};
-pub use crate::qos::schedule::{PlannedTest, QosPlan, TierPlan, plan as qos_plan};
+pub use crate::qos::live::LiveSnapshot;
+pub use crate::qos::schedule::{PlannedTest, QosPlan, plan as qos_plan};
 pub use crate::qos::{ClusterCapacity, GIB, QosClass, Resources};
 pub use crate::sync::{
-    BLOCKS, CHANNELS, Cost, CostMs, Latency, Phase, ProbeState, SyncStatus, SyncVerdict, Timeline,
-    Timing, Work, plot_channels,
+    Channel, Cost, CostMs, Heights, Latency, ProbeState, SyncStatus, SyncVerdict, Timing, Work,
 };
 
 pub mod capability;
@@ -50,7 +48,6 @@ pub mod paths;
 pub mod pipeline;
 pub mod plan;
 pub mod pod_status;
-pub mod podmetrics;
 pub mod portforward;
 pub mod ports;
 pub mod profiling;

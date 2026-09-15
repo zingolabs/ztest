@@ -120,7 +120,7 @@ pub const FINISHED_TTL: std::time::Duration = std::time::Duration::from_secs(5 *
 
 /// Wall clock → epoch millis: the one time encoding a durable sync record uses
 pub fn epoch_millis(t: std::time::SystemTime) -> u64 {
-    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    t.duration_since(std::time::UNIX_EPOCH).expect("wall clock after the epoch").as_millis() as u64
 }
 
 pub fn report_cm_name(sync_id: &str) -> String {
@@ -249,26 +249,10 @@ pub fn active_sync_id() -> Option<String> {
     std::env::var(SYNC_ID_ENV).ok().filter(|s| !s.is_empty())
 }
 
-/// Publish a provisioning milestone; no-op off a detached sync. Not a
-/// [`SyncReporter`](crate::sync::SyncReporter) hook — these minutes are spent
-/// inside `TestEnv::build`, before any engine or reporter exists
-pub fn note_setup(phase: &str, component: Option<&str>, detail: &str) {
-    if active_sync_id().is_none() {
-        return;
-    }
-    super::event::publish(&super::event::SyncEvent::Setup {
-        phase: phase.to_string(),
-        detail: detail.to_string(),
-        component: component.map(str::to_string),
-    });
-}
-
 /// Where a sync stands = the one answer `list`/`status`/`watch` all render.
 ///
 /// - [`Self::observe`] = sole constructor (mirror outranks pod phase, outliving the pod)
 /// - `Unresolved` = pod terminal/unreachable & no mirror → no verdict coming
-/// - Chain progress ([`Phase`](crate::sync::Phase)) = the other axis, never this one (subject
-///   at tip mid-probe = `Running`)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SyncStatus {
     Pending,
@@ -321,7 +305,6 @@ impl std::fmt::Display for SyncStatus {
 pub struct SyncLaunch {
     pub sync_id: String,
     pub started_ms: u64,
-    #[serde(default)]
     pub profiling: Option<LaunchProfiling>,
 }
 
@@ -344,9 +327,9 @@ impl SyncLaunch {
 /// report ConfigMap so it survives the pod.
 ///
 /// - Plain DTO (the live types carry handles and must not be `Serialize`)
-/// - `segment` absent from a pre-segment driver → `perf --base` calls it incomparable
+/// - `segment` absent = run traversed nothing (`perf --base` calls it incomparable)
 /// - `ended_ms` = engine finish, ahead of the pod's `terminated_at` (teardown deletes a
-///   namespace in between); `None` from a pre-`ended_ms` driver
+///   namespace in between)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncReportMirror {
     pub sync_id: String,
@@ -357,14 +340,10 @@ pub struct SyncReportMirror {
     pub violations: Vec<ReportViolation>,
     pub coverage_gaps: Vec<String>,
     pub error: Option<String>,
-    #[serde(default)]
     pub segment: Option<crate::sync::Segment>,
-    #[serde(default)]
-    pub ended_ms: Option<u64>,
+    pub ended_ms: u64,
     /// Recorded, not re-derived: a denominator read off a series makes one bad scrape a shortfall
-    #[serde(default)]
     pub target: Option<u32>,
-    #[serde(default)]
     pub unpublished: Vec<String>,
 }
 
@@ -377,8 +356,8 @@ pub struct ReportViolation {
 }
 
 impl SyncReportMirror {
-    pub fn ended(&self) -> Option<std::time::SystemTime> {
-        Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(self.ended_ms?))
+    pub fn ended(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(self.ended_ms)
     }
 
     pub fn from_outcome(sync_id: &str, profile: &str, outcome: &crate::sync::SyncOutcome) -> Self {
@@ -389,7 +368,7 @@ impl SyncReportMirror {
             segment: outcome.segment.clone(),
             target: outcome.target,
             unpublished: outcome.unpublished.clone(),
-            ended_ms: Some(epoch_millis(std::time::SystemTime::now())),
+            ended_ms: epoch_millis(std::time::SystemTime::now()),
             ticks: outcome.ticks,
             dropped_snapshots: outcome.dropped_snapshots,
             violations: outcome
@@ -623,7 +602,7 @@ mod tests {
             violations: Vec::new(),
             coverage_gaps: Vec::new(),
             error: None,
-            ended_ms: None,
+            ended_ms: 0,
             segment: None,
             target: None,
             unpublished: Vec::new(),
@@ -682,16 +661,6 @@ mod tests {
         let json = r#"{"sync_id":"sync-1","started_ms":1}"#;
         let back: SyncLaunch = serde_json::from_str(json).expect("deserialize");
         assert!(back.profiling.is_none());
-    }
-
-    /// Reports written before `ended_ms` existed still read — the window falls back to the pod
-    #[test]
-    fn a_pre_ended_ms_report_still_deserialises() {
-        let mut json: serde_json::Value =
-            serde_json::to_value(mirror(SyncVerdict::Passed)).expect("serialize");
-        json.as_object_mut().expect("object").remove("ended_ms");
-        let back: SyncReportMirror = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(back.ended(), None);
     }
 
     /// Widest bound ztest states, so a reaper honouring it clears any run that respects

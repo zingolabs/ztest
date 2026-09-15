@@ -48,22 +48,30 @@ declares a container port named `metrics`, then promotes ztest's pod labels (`co
 
 - Declare a container port named `metrics`, serve Prometheus text at `/metrics`
 - `impl metrics::Exporter` — `endpoint()` + `rows()`, the component's own table of
-  `(label, family, reduction, live?)`
+  `(label, reading, facet)`. Families are declared through a shape witness
+  (`counter`/`gauge`/`hist`), which is what makes a reading legal — see
+  [design-metrics.md](design-metrics.md)
 
 `metrics` names no component; which backend publishes which families is the backends' knowledge
 (`backends::metrics_rows`), so a new component joins without editing the metrics module.
 
-### Three readers
 
-| Reader                  | Path                                                    | Load-bearing |
-| ----------------------- | ------------------------------------------------------- | ------------ |
-| `ztest sync watch`      | scrapes the component directly, 1 s, over a portforward | display only |
-| `SyncSubject::progress` | the subject scrapes itself each tick                    | **yes**      |
-| `ztest sync status`     | `record::summarize` — `query_range` against Prometheus  | no           |
+### Two readers
 
-- Live reader is direct because a display refreshed at the scrape interval lags what it describes
-- Record reader runs at report time, reusing the same `Row`/`Reduce` table so a metric cannot mean one
-  thing live and another in the report, and omits its whole section on any failure
+| Reader                      | Path                                                         | Load-bearing |
+| --------------------------- | ------------------------------------------------------------ | ------------ |
+| `SyncSubject::progress`     | the subject scrapes itself each tick                         | **yes**      |
+| `ztest sync status`/`watch` | Prometheus: raw samples for totals, `query_range` for plots  | no           |
+
+- Oracle reads the component direct → no verdict waits on a scrape
+- `watch` = the pinned 3-column panel (height/pace/trend · per-pool rates · per-container load) + driver
+  and subject logs in scrollback; panel fed by the same `report_view` read as `status`, once per scrape
+  interval → one source, two renderers
+- Height = one frontier family, in probe and panel alike (zaino's `fetched`: per block; its
+  `finalized` steps once per checkpoint interval and carries no blocks/s)
+- Driver = a target like any component: `ztest_sync_started_timestamp_seconds` (segment origin, the live
+  window) + `ztest_sync_violations_total{probe}`. No state strings — see
+  [design-metrics.md](design-metrics.md)
 
 ## Profiling
 

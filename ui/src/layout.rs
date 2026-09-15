@@ -15,10 +15,6 @@ use ztest::api::{GIB, Resources};
 /// Action-label column width, matching nextest's `{:>12}`
 pub(super) const LABEL_WIDTH: usize = 12;
 
-/// Right-hand metrics label column. Under [`LABEL_WIDTH`] — the right column gets
-/// only what the terminal has past the left column's fixed 80
-pub(super) const METRIC_LABEL_WIDTH: usize = 7;
-
 /// Pinned panel's fixed line count; must equal `cli::console::PANEL_ROWS`. Every
 /// block formatter returns exactly this many (session-constant, non-reflowing)
 pub(super) const PANEL_LINES: usize = 5;
@@ -27,8 +23,11 @@ pub(super) const PANEL_LINES: usize = 5;
 /// `-1` = the right column's blank top row aligning with the left's branded rule
 pub(super) const MAX_TRANSFER_ROWS: usize = PANEL_LINES - 1;
 
-/// Per-pool sparkline width. Fixed, not derived (a block renders without knowing
-/// its clip width, and a terminal-tracking sparkline breaks run-to-run comparison)
+/// Side-column label width, under [`LABEL_WIDTH`] (side columns get what the terminal has past the
+/// left column's fixed 80)
+pub(super) const METRIC_LABEL_WIDTH: usize = 7;
+
+/// Per-pool sparkline width. Fixed (a terminal-tracking sparkline breaks run-to-run comparison)
 pub(super) const SPARK_WIDTH: usize = 12;
 
 /// Pad/truncate `out` to exactly [`PANEL_LINES`] lines (viewport never reflows)
@@ -102,19 +101,23 @@ pub fn pad(s: &str, width: usize) -> String {
     format!("{s}{}", " ".repeat(width.saturating_sub(display_width(s))))
 }
 
-pub(super) fn cores_of(r: &Resources) -> u64 {
-    r.cpu_milli / 1000
+/// `(cpu, mem)` as `used/total` — the one capacity vocabulary every panel draws.
+///
+/// - Per dimension: cpu can bind with memory spare, and one merged figure hides which
+/// - No bar, no percent, no "free": the pair already says full (`92c/92c`) and how far off
+pub(super) fn used_of(used: &Resources, total: &Resources) -> (String, String) {
+    let cores = |r: &Resources| tenths(r.cpu_milli as f64 / 1000.0);
+    let gib = |r: &Resources| tenths(r.mem_bytes as f64 / GIB as f64);
+    (
+        format!("{} / {} cores", cores(used), cores(total)),
+        format!("{} / {} GiB", gib(used), gib(total)),
+    )
 }
 
-pub(super) fn gib_of(r: &Resources) -> u64 {
-    r.mem_bytes / GIB
-}
-
-/// Percent capacity free = min(cpu, mem) free fraction, the binding constraint
-/// for packing work. Zero allocatable → 0%
-pub(super) fn free_percent(free: &Resources, alloc: &Resources) -> u8 {
-    let (cpu, mem) = free.ratio_pct(alloc);
-    cpu.min(mem)
+/// Whole where exact (`92`), one decimal otherwise (`0.5`) — a trailing `.0` is noise
+fn tenths(v: f64) -> String {
+    let s = format!("{v:.1}");
+    s.strip_suffix(".0").map_or(s.clone(), str::to_string)
 }
 
 /// Braille frames of `indicatif`'s default spinner
@@ -136,11 +139,4 @@ pub(super) fn spinner_glyph(elapsed: std::time::Duration, theme: &Theme) -> &'st
         false => &SPINNER_FRAMES_ASCII,
     };
     frames[(elapsed.as_millis() / SPINNER_STEP_MS) as usize % frames.len()]
-}
-
-/// Binding-dimension fullness = max(cpu, mem) fraction of `part` in `whole`.
-/// Zero `whole` → 0%
-pub(super) fn used_percent(part: &Resources, whole: &Resources) -> u8 {
-    let (cpu, mem) = part.ratio_pct(whole);
-    cpu.max(mem)
 }

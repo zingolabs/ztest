@@ -17,6 +17,8 @@ pub const ZCASHD_RPC: u16 = 28232;
 pub const ZAINO_GRPC: u16 = 8137;
 pub const ZAINO_JSONRPC: u16 = 8232;
 pub const ZAINO_METRICS: u16 = 9998;
+/// Detached sync driver's own `/metrics` (segment origin, probe violations)
+pub const SYNC_DRIVER_METRICS: u16 = 9997;
 pub const LIGHTWALLETD_GRPC: u16 = 9067;
 
 /// Mandatory listener bind address under pod-per-test: the client reaches a

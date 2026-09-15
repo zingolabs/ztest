@@ -804,12 +804,8 @@ fn launch_engine(
         reservation: Some(reservation.clone()),
     };
     let view = console.map(|c| ztest_ui::ConsoleView::new(c, theme));
-    let code = engine::run(
-        work_rt,
-        input,
-        view.as_ref().map(|v| v as &dyn ztest::api::engine::RunView),
-        state.qos_plan.clone(),
-    );
+    let code =
+        engine::run(work_rt, input, view.as_ref().map(|v| v as &dyn ztest::api::engine::RunView));
     // Release on every exit → freed capacity reaches the next run now (TTL = crash backstop)
     if let Some(r) = std::sync::Arc::into_inner(reservation) {
         work_rt.block_on(r.release());
@@ -1055,7 +1051,7 @@ fn with_live_capacity<'a>(snap: &'a BannerState, cap: Option<&CapRx>) -> Cow<'a,
     match cap {
         Some(rx) => {
             let mut s = snap.clone();
-            s.cluster.capacity = *rx.borrow();
+            s.cluster.capacity = Some(*rx.borrow());
             Cow::Owned(s)
         }
         None => Cow::Borrowed(snap),
@@ -1112,8 +1108,8 @@ fn push_building_scene(
     });
 }
 
-/// Drop excluded tests' QoS declarations → the wave estimate covers what will actually
-/// run (sync profiles wear the top-priority `sync` tier the engine never admits)
+/// Drop excluded tests' QoS declarations → the preflight total covers what will actually
+/// run (sync profiles wear the `sync` tag the engine never admits)
 fn prune_qos(
     qos_by_binary: &[(String, Vec<QosEntry>)],
     excluded: &[engine::ExcludedSync],
@@ -1159,19 +1155,18 @@ fn sync_exclusion_notice(excluded: &[engine::ExcludedSync]) -> String {
     note
 }
 
-/// Per-binary QoS dump → per-tier counts + a wave estimate against probed capacity;
-/// `None` when no QoS tests were declared
+/// Per-binary QoS dump → count, total reserve and unschedulable tests against probed
+/// capacity; `None` when no QoS tests were declared
 fn qos_plan_from(
     qos_by_binary: &[(String, Vec<QosEntry>)],
     probe: &ProbeOutcome,
 ) -> Option<ztest::qos::schedule::QosPlan> {
-    // One entry per declared test at its real submitted reserve
-    // (count-by-tier × footprint mis-states any run holding an override)
+    // One entry per declared test at its real submitted reserve (an override moves it)
     let tests: Vec<ztest::qos::schedule::PlannedTest> = qos_by_binary
         .iter()
         .flat_map(|(_binary_id, entries)| entries.iter())
         .map(|e| ztest::qos::schedule::PlannedTest {
-            class: e.class,
+            name: engine::libtest_name(&e.test_id).to_string(),
             admitted: e.profile().admitted(),
         })
         .collect();
@@ -1473,7 +1468,7 @@ fn apply_update(state: &mut BannerState, upd: Update) {
             state.cluster.context = context;
             state.cluster.nodes_ready = nodes_ready;
             state.cluster.nodes_cordoned = nodes_cordoned;
-            state.cluster.capacity = capacity;
+            state.cluster.capacity = Some(capacity);
             state.cluster.slots_used = slots_used;
         }
         Update::Probe(ProbeOutcome::Missing { detail }) => {
@@ -1795,7 +1790,7 @@ fn build_initial_state(opts: &RunOptions) -> BannerState {
             slots_configured: opts.test_threads.unwrap_or(0),
             nodes_ready: 0,
             nodes_cordoned: 0,
-            capacity: ztest::qos::ClusterCapacity::default(),
+            capacity: None,
         },
         build: ztest_ui::BuildState::Pending,
         archives: Vec::<ArchiveRow>::new(),

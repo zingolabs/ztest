@@ -8,8 +8,6 @@
 //!   live sync exactly as it scraped a finished one — hence the single view
 //! - [`SyncStatus`] is the whole reason a verdict is not a `bool`: a run still going has
 //!   none, and must not be drawn as a failure
-//! - Chain progress (`phase`) sits beside the status, never in it — a subject at tip in a
-//!   run still probing is `Running · Done`
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -22,9 +20,10 @@ use super::layout::{display_width, truncate};
 use super::plot::{self, Band, Palette, PlotOpts};
 use super::template::{Fields, Template};
 use super::text::y_axis;
+use ztest::api::Reading;
 use ztest::api::Series;
+use ztest::api::SyncStatus;
 use ztest::api::Unit;
-use ztest::api::{Phase, SyncStatus};
 use ztest::api::{format_elapsed, thousands, unit_value};
 
 /// Full terminal, capped. Past this the plots stop gaining resolution the eye can use
@@ -52,9 +51,7 @@ mod row {
 
     pub(super) fn status(tone: &str) -> String {
         format!(
-            "  {{status|{tone}}} {{@dot|dim}} {{elapsed|bold}}\
-             [ {{@dot|dim}} {{phase|dim}}[ {{@dot|dim}} {{detail|dim}}]]\
-             [ {{@dot|dim}} {{segment|dim}}]"
+            "  {{status|{tone}}}[ {{@dot|dim}} {{elapsed|bold}}][ {{@dot|dim}} {{segment|dim}}]"
         )
     }
 
@@ -85,7 +82,7 @@ mod row {
     pub(super) const ERROR: &str = "{@fail|fail} {error}";
     pub(super) const INDENTED: &str = "  {text|dim}";
     pub(super) const TALLY: &str = "  [{ticks|bold} ticks {@dot|dim} ]\
-        {violations|bold} violations[ {@dot|dim} {ok|bold}/{total} probes ok]\
+        {violations|bold} violations\
         [ {@dot|dim} {dropped|bold} snapshots dropped]";
 }
 
@@ -120,17 +117,14 @@ pub struct ReportView {
     pub sync_id: String,
     pub profile: String,
     pub status: SyncStatus,
-    pub phase: Option<Phase>,
-    /// Subject's own stage word, rendered after the lifecycle one
-    pub phase_detail: Option<String>,
-    pub elapsed: Duration,
+    /// Wall-clock interval the segment covered — the report window, so panels count what the
+    /// header counts. `None` = no segment reading yet
+    pub span: Option<(std::time::SystemTime, std::time::SystemTime)>,
     pub segment: Option<String>,
     pub height: Option<(u32, u32)>,
     /// `(recorded, observed)` past scrape lag. Rendered, never resolved — the record keeps
     /// the verdict's number and the divergence is itself the finding
     pub height_check: Option<(u32, u32)>,
-    pub eta: Option<Duration>,
-    pub probes: Option<(usize, usize)>,
     pub tip: Option<u32>,
     pub violations: Vec<(String, String)>,
     pub coverage_gaps: Vec<String>,
@@ -151,9 +145,14 @@ pub struct ReportView {
     pub grafana: Option<String>,
 }
 
-/// [`render_sync_report`] without its panels: the same header + footer over the same
-/// view, for a surface that already scrolled the series past (`watch`'s settled verdict,
-/// which never queries the TSDB and would draw every panel as "no series recorded")
+impl ReportView {
+    /// Length of [`span`](Self::span) — stated once, never stored beside it
+    pub fn elapsed(&self) -> Option<Duration> {
+        self.span.map(|(from, to)| to.duration_since(from).expect("a span ends after it starts"))
+    }
+}
+
+/// [`render_sync_report`] minus its panels: `watch`'s settled verdict (its panel already drew the series)
 pub fn render_sync_verdict(view: &ReportView, theme: &Theme, width: usize) -> String {
     let width = width.min(MAX_WIDTH);
     let mut out = String::with_capacity(1024);
@@ -176,7 +175,7 @@ pub fn render_sync_report(view: &ReportView, theme: &Theme, width: usize) -> Str
     let mut panels = vec![
         (
             pool_box("transparent ops/sec", &view.transparent, view, theme, left_w),
-            pool_box("shielded ops/sec", &fold_sapling(&view.shielded), view, theme, right_w),
+            pool_box("shielded ops/sec", &fold_pools(&view.shielded), view, theme, right_w),
         ),
         (
             rate_box("blocks/sec", &view.blocks, view, theme, left_w),
@@ -250,7 +249,6 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
         .text("profile", format!("[{}]", v.profile));
     line(&row::ident(tone), &ident);
 
-    // - Phase = chain-walk position, live only (a finished run's last phase adds nothing)
     // - A live run has no segment *yet*; only a finished one that recorded none answers for it
     let segment = match (v.segment.as_deref(), live) {
         (Some(s), _) => Some(s),
@@ -259,9 +257,7 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
     };
     let status = Fields::new()
         .text("status", v.status.to_string())
-        .text("elapsed", format_elapsed(v.elapsed))
-        .maybe_text("phase", v.phase.filter(|_| live).map(|p| p.to_string()))
-        .maybe_text("detail", v.phase_detail.as_deref())
+        .maybe_text("elapsed", v.elapsed().map(format_elapsed))
         .maybe_text("segment", segment);
     line(&row::status(tone), &status);
 
@@ -276,10 +272,9 @@ fn header(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
             t => (f64::from(reached) / f64::from(t) * 100.0).clamp(0.0, 100.0),
         };
         let filled = (pct / 100.0 * bar_w as f64).round() as usize;
-        // Nothing is short until the run stops trying — a live sync gets its countdown
-        // in the slot a finished one spends on the shortfall
+        // Nothing is short until the run stops trying → a live sync leaves the slot empty
         let (standing, tone) = match (live, target.saturating_sub(reached)) {
-            (true, _) => (v.eta.map(|e| format!("eta {}", format_elapsed(e))), "bold"),
+            (true, _) => (None, "bold"),
             (_, 0) => (Some("complete".to_string()), "pass"),
             (_, n) => (Some(format!("short {}", thousands(u64::from(n)))), "fail"),
         };
@@ -336,7 +331,7 @@ fn pool_box(
     // Chips and rates are the same reading, so they share a line where both fit. Narrow
     // → stack rather than truncate (a cut chip drops a pool's total with no sign of it)
     // Aggregate dropped for a lone pool: its chip already is that number
-    let total = pools.iter().filter_map(Series::integral).sum::<f64>();
+    let total = pools.iter().filter_map(|s| s.total).sum::<f64>();
     let summary = summary_text(pools, (pools.len() > 1).then_some(total), theme);
     let chips = pool_chips(pools, theme, inner);
     match display_width(&chips) + display_width(&summary) < inner {
@@ -359,7 +354,7 @@ fn pool_box(
 fn pool_chips(pools: &[Series], theme: &Theme, budget: usize) -> String {
     let palette = Palette::pools(theme.is_colorized());
     let mut ranked: Vec<&Series> = pools.iter().collect();
-    ranked.sort_by(|a, b| b.integral().unwrap_or(0.0).total_cmp(&a.integral().unwrap_or(0.0)));
+    ranked.sort_by(|a, b| b.total.unwrap_or(0.0).total_cmp(&a.total.unwrap_or(0.0)));
 
     // Tag pre-styled: a pool's ink is its band's, which no named tone can name
     let chip = Template::parse(row::CHIP);
@@ -367,10 +362,10 @@ fn pool_chips(pools: &[Series], theme: &Theme, budget: usize) -> String {
         .iter()
         .map(|s| {
             let data = Fields::new()
-                .text("tag", pool_tag(&s.label).style(palette.style_of(&s.label)).to_string())
+                .text("tag", pool_tag(s).style(palette.style_of(s.channel)).to_string())
                 .text(
                     "total",
-                    s.integral()
+                    s.total
                         .map(|t| unit_value(Unit::Count, t))
                         .unwrap_or_else(|| theme.chars.na.to_string()),
                 );
@@ -383,31 +378,43 @@ fn pool_chips(pools: &[Series], theme: &Theme, budget: usize) -> String {
     truncate(&chips.join(&sep), budget)
 }
 
+/// Split pools → one band each, in the split's place.
+///
 /// Sapling ships split (only the output side is checkable against the note-commitment trees,
-/// see [`chainwork`](ztest::sync::chainwork)); the panel reads pools, so display folds them
-const SAPLING_PARTS: [&str; 2] = ["sapling spends", "sapling outputs"];
-
-/// Sapling spends + outputs → one `sapling` band, in the split's place
-fn fold_sapling(pools: &[Series]) -> Vec<Series> {
-    let is_part = |s: &Series| SAPLING_PARTS.contains(&s.label.as_str());
-    let (parts, mut rest): (Vec<Series>, Vec<Series>) = pools.iter().cloned().partition(&is_part);
-    let Some(sapling) = Series::folded("sapling", &parts) else {
-        return rest;
-    };
-    rest.insert(pools.iter().take_while(|s| !is_part(s)).count(), sapling);
-    rest
+/// see [`chainwork`](ztest::sync::chainwork)) and transparent ships by direction; the panel
+/// reads pools, so display folds every row sharing a [`Channel`](ztest::api::Channel)
+pub(super) fn fold_pools(pools: &[Series]) -> Vec<Series> {
+    let mut out: Vec<Series> = Vec::new();
+    for series in pools {
+        let Some(channel) = series.channel else {
+            out.push(series.clone());
+            continue;
+        };
+        if out.iter().any(|s| s.channel == Some(channel)) {
+            continue;
+        }
+        let parts: Vec<Series> =
+            pools.iter().filter(|s| s.channel == Some(channel)).cloned().collect();
+        match parts.len() {
+            1 => out.push(parts[0].clone()),
+            _ => out.extend(Series::folded(channel.name(), &parts)),
+        }
+    }
+    out
 }
 
-/// Three-letter pool tag. First three characters, overridden where they collide or name
-/// nothing a reader recognises (`tra`; both transparent directions; both sapling directions)
-fn pool_tag(label: &str) -> String {
-    match label {
-        "transparent" => "tsp".to_string(),
-        "transparent in" => "tsp-in".to_string(),
-        "transparent out" => "tsp-out".to_string(),
-        "sapling spends" => "sap-sp".to_string(),
-        "sapling outputs" => "sap-out".to_string(),
-        other => other.chars().take(3).flat_map(char::to_lowercase).collect(),
+/// Pool tag for a chip. A split row keeps its direction, so two bands of one hue stay
+/// tellable apart
+fn pool_tag(series: &Series) -> String {
+    let Some(channel) = series.channel else {
+        return series.label.chars().take(3).flat_map(char::to_lowercase).collect();
+    };
+    let tag = channel.tag();
+    match series.label.rsplit_once(' ') {
+        Some((_, direction)) if series.label != channel.name() => {
+            format!("{tag}-{}", &direction[..direction.len().min(3)])
+        }
+        _ => tag.to_string(),
     }
 }
 
@@ -428,14 +435,10 @@ fn rate_box(
         .into_iter()
         .map(|(label, plotted)| format!("{} {plotted}", label.style(theme.styles.dim)))
         .collect();
-    let total = series.iter().filter_map(Series::integral).sum::<f64>();
+    let total = series.iter().filter_map(|s| s.total).sum::<f64>();
     body.push(label_value("", &summary_text(series, Some(total), theme), inner, theme));
     boxed(title, "", &body, width, theme)
 }
-
-/// Tail series' label = its stage's, suffixed. Paired here rather than plotted apart,
-/// since a mean and its p99 are one reading
-const P99_SUFFIX: &str = " p99";
 
 /// Per-stage cost, one line each.
 ///
@@ -453,12 +456,17 @@ fn latency_box(
     if series.is_empty() {
         return empty(theme, title, v, width);
     }
-    let tail =
-        |stage: &str| series.iter().find(|s| s.label.strip_suffix(P99_SUFFIX) == Some(stage));
+    // Paired by family, not by a label suffix: a mean and its quantile are two readings of
+    // one histogram, and renaming either must not silently unpair them
+    let is_tail = |s: &Series| matches!(s.reading, Some(Reading::Quantile(_, _)));
+    let tail = |of: &Series| {
+        let family = of.reading?.family();
+        series.iter().find(|s| is_tail(s) && s.reading.map(Reading::family) == Some(family))
+    };
 
     let mut body = Vec::new();
-    for s in series.iter().filter(|s| !s.label.ends_with(P99_SUFFIX)) {
-        let tail = tail(&s.label);
+    for s in series.iter().filter(|s| !is_tail(s)) {
+        let tail = tail(s);
         let mut parts = Vec::new();
         if s.unit == Unit::Millis {
             if let Some(mean) = s.mean() {
@@ -615,14 +623,11 @@ fn footer(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
     for text in v.note.iter().chain(v.grafana.iter()) {
         line(row::INDENTED, &Fields::new().text("text", &**text));
     }
-    // - Probe tally = the live counterpart of a verdict (before one exists, the only standing)
     // - `0 ticks` reads as a stalled run rather than one still starting
     // - Counts through `thousands`, never `Unit::Count` (`1.50k ticks` points at no tick)
     let tally = Fields::new()
         .text("violations", thousands(v.violations.len() as u64))
         .maybe_text("ticks", Some(v.ticks).filter(|n| *n > 0).map(thousands))
-        .maybe_text("ok", v.probes.map(|(ok, _)| thousands(ok as u64)))
-        .maybe_text("total", v.probes.map(|(_, total)| thousands(total as u64)))
         .maybe_text("dropped", Some(v.dropped_snapshots).filter(|n| *n > 0).map(thousands));
     line(row::TALLY, &tally);
 }
@@ -631,7 +636,7 @@ fn footer(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
 
 /// One band per sample. [`plot_stacked`](plot::plot_stacked) resamples to its own
 /// width, so no decimation is needed here — and doing it twice would flatten extremes
-fn bands(series: &Series) -> Vec<Band> {
+pub(super) fn bands(series: &Series) -> Vec<Band> {
     series.points.iter().map(|(_, v)| Some((*v, *v))).collect()
 }
 
@@ -650,8 +655,11 @@ fn stacked(
     reserve: usize,
     theme: &Theme,
 ) -> Vec<(String, String)> {
-    let channels: Vec<plot::Channel<'_>> =
-        series.iter().map(|s| (s.label.as_str(), bands(s))).collect();
+    // Palette keys on the pool, so a split's two bands share their pool's hue
+    let channels: Vec<plot::Channel<'_>> = series
+        .iter()
+        .map(|s| (s.channel.map_or(s.label.as_str(), |c| c.name()), bands(s)))
+        .collect();
     let palette = Palette::pools(theme.is_colorized());
     let width_for = |gutter: usize| inner.saturating_sub(gutter + 1 + reserve).max(1);
 
@@ -675,7 +683,7 @@ fn axis(ceiling: f64, rows: usize, unit: Option<Unit>) -> (Vec<String>, usize) {
 /// pre-styled text lay it out themselves.
 ///
 /// - avg/peak in the series' declared [`Unit`] (hardcoded `/s` mislabels a byte rate)
-/// - total = an [`integral`](Series::integral), i.e. a count → no `/s`
+/// - total = the series' own count off the raw counter → no `/s`
 fn summary_text(series: &[Series], total: Option<f64>, theme: &Theme) -> String {
     let unit = series.first().map_or(Unit::Count, |s| s.unit);
     let mean: f64 = series.iter().filter_map(Series::mean).sum();
@@ -723,17 +731,28 @@ fn empty(theme: &Theme, title: &str, v: &ReportView, width: usize) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ztest::api::Channel;
 
     fn theme() -> Theme {
         Theme::for_capabilities(false, true)
     }
 
+    /// Plot points as the durable plane delivers them — one per 30 s bucket. `total` is
+    /// measured separately there, so the fixture states it rather than integrating
     fn series(label: &str, unit: Unit, values: &[f64]) -> Series {
+        pool(label, unit, values, None)
+    }
+
+    fn pool(label: &str, unit: Unit, values: &[f64], channel: Option<Channel>) -> Series {
         Series {
+            reading: None,
             label: label.to_string(),
             unit,
             facet: None,
+            channel,
             points: values.iter().enumerate().map(|(i, v)| (i as f64 * 30.0, *v)).collect(),
+            total: (unit == Unit::PerSec).then(|| values.iter().sum::<f64>() * 30.0),
+            coverage: None,
         }
     }
 
@@ -743,18 +762,29 @@ mod tests {
         (0..n).map(|i| scale * (1.0 + ((i as f64 + shift) / 9.0).sin())).collect()
     }
 
+    /// A pool band, as a `Facet::Transparent`/`Shielded` row arrives
+    fn p(label: &str, values: &[f64], channel: Channel) -> Series {
+        pool(label, Unit::PerSec, values, Some(channel))
+    }
+
+    /// A write-path stage. `tail` = the quantile row, which pairs to its mean by family
+    fn stage(label: &str, family: &'static str, values: &[f64], tail: bool) -> Series {
+        let h = ztest::api::metrics::hist(family, ztest::api::metrics::Dimension::Seconds);
+        let reading = match tail {
+            true => h.p(ztest::api::metrics::Phi::P99),
+            false => h.mean(),
+        };
+        Series { reading: Some(reading), ..series(label, Unit::Millis, values) }
+    }
+
     pub(super) fn view() -> ReportView {
         ReportView {
             sync_id: "zaino-index-construction-c3115f50".into(),
             profile: "zaino_index_construction".into(),
             status: SyncStatus::Finished(ztest::api::SyncVerdict::Failed),
-            phase: None,
-            phase_detail: None,
             height_check: None,
             unpublished: Vec::new(),
-            eta: None,
-            probes: None,
-            elapsed: Duration::from_secs(1_842),
+            span: Some((std::time::UNIX_EPOCH, std::time::UNIX_EPOCH + Duration::from_secs(1_842))),
             segment: Some("main 3,013..658,599".into()),
             height: Some((658_599, 659_600)),
             tip: Some(659_640),
@@ -774,20 +804,30 @@ mod tests {
             error: None,
             ticks: 118,
             dropped_snapshots: 0,
-            transparent: vec![series("transparent", Unit::PerSec, &wave(70_000.0, 60, 0.0))],
+            transparent: vec![p("transparent", &wave(70_000.0, 60, 0.0), Channel::Transparent)],
             // Half a period apart: these two never peak in the same slot
             shielded: vec![
-                series("sapling", Unit::PerSec, &wave(30_000.0, 60, 0.0)),
-                series("orchard", Unit::PerSec, &wave(14_000.0, 60, 14.0)),
-                series("ironwood", Unit::PerSec, &wave(0.0, 60, 0.0)),
+                p("sapling", &wave(30_000.0, 60, 0.0), Channel::Sapling),
+                p("orchard", &wave(14_000.0, 60, 14.0), Channel::Orchard),
+                p("ironwood", &wave(0.0, 60, 0.0), Channel::Ironwood),
             ],
             blocks: vec![series("blocks", Unit::PerSec, &wave(400.0, 60, 0.0))],
             throughput: vec![series("transactions", Unit::PerSec, &wave(900.0, 60, 0.0))],
             write_path: vec![
-                series("fetch", Unit::Millis, &wave(4.0, 60, 0.0)),
-                series("fetch p99", Unit::Millis, &wave(30.0, 60, 14.0)),
-                series("treestate", Unit::Millis, &wave(1.2, 60, 0.0)),
-                series("batch write", Unit::Millis, &wave(880.0, 60, 7.0)),
+                stage("fetch", "zaino_sync_block_fetch_seconds", &wave(4.0, 60, 0.0), false),
+                stage("fetch p99", "zaino_sync_block_fetch_seconds", &wave(30.0, 60, 14.0), true),
+                stage(
+                    "treestate",
+                    "zaino_sync_treestate_fetch_seconds",
+                    &wave(1.2, 60, 0.0),
+                    false,
+                ),
+                stage(
+                    "batch write",
+                    "zaino_sync_batch_write_seconds",
+                    &wave(880.0, 60, 7.0),
+                    false,
+                ),
                 series("errors", Unit::Count, &[0.0; 60]),
             ],
             store: vec![series("db used", Unit::Bytes, &wave(4e9, 60, 0.0))],
@@ -867,18 +907,6 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("resources · zainod") && l.contains("resources · zebrad"))
         );
-    }
-
-    /// Verdict carries every header/footer reading of the full report, and no panel
-    #[test]
-    fn the_verdict_drops_the_panels_and_keeps_the_findings() {
-        let rendered = render_sync_verdict(&view(), &theme(), 120);
-        for kept in ["zaino-index-construction-c3115f50", "short 1,001", "2 violations"] {
-            assert!(rendered.contains(kept), "{kept} missing:\n{rendered}");
-        }
-        for dropped in ["ops/sec", "resources ·", "no series recorded"] {
-            assert!(!rendered.contains(dropped), "{dropped} drawn:\n{rendered}");
-        }
     }
 
     /// A stacked namespace total hides which container grew — the one question this
@@ -1022,10 +1050,14 @@ mod tests {
     #[test]
     fn a_stack_sums_by_timestamp_rather_than_by_position() {
         let at = |points: &[(f64, f64)]| Series {
+            reading: None,
             label: "x".into(),
             unit: Unit::Cores,
             facet: None,
+            channel: None,
             points: points.to_vec(),
+            total: None,
+            coverage: None,
         };
         // Second series lost its t=0 sample: by position its 4.0 would land against 1.0
         let full = at(&[(0.0, 1.0), (30.0, 2.0), (60.0, 9.0)]);
@@ -1098,34 +1130,34 @@ mod tests {
     fn the_sapling_split_renders_as_one_pool() {
         let mut v = view();
         v.shielded = vec![
-            series("sapling spends", Unit::PerSec, &wave(20_000.0, 60, 0.0)),
-            series("sapling outputs", Unit::PerSec, &wave(10_000.0, 60, 0.0)),
-            series("orchard", Unit::PerSec, &wave(14_000.0, 60, 14.0)),
+            p("sapling spends", &wave(20_000.0, 60, 0.0), Channel::Sapling),
+            p("sapling outputs", &wave(10_000.0, 60, 0.0), Channel::Sapling),
+            p("orchard", &wave(14_000.0, 60, 14.0), Channel::Orchard),
         ];
         let rendered = render_sync_report(&v, &theme(), 120);
         assert!(!rendered.contains("sap-sp"), "{rendered}");
         assert!(!rendered.contains("sap-out"), "{rendered}");
         assert!(rendered.contains("sap "), "folded chip missing:\n{rendered}");
 
-        let folded = fold_sapling(&v.shielded);
+        let folded = fold_pools(&v.shielded);
         assert_eq!(
             folded.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(),
             ["sapling", "orchard"]
         );
-        let split_total: f64 = v.shielded[..2].iter().filter_map(Series::integral).sum();
-        assert!((folded[0].integral().expect("rate") - split_total).abs() < 1.0);
+        let split_total: f64 = v.shielded[..2].iter().filter_map(|s| s.total).sum();
+        assert!((folded[0].total.expect("rate") - split_total).abs() < 1.0);
     }
 
     /// Position is the split's, not the front — a pool ordered before sapling keeps its place
     #[test]
     fn a_folded_sapling_holds_the_splits_place() {
         let pools = vec![
-            series("sprout", Unit::PerSec, &[1.0, 1.0]),
-            series("sapling spends", Unit::PerSec, &[2.0, 2.0]),
-            series("sapling outputs", Unit::PerSec, &[3.0, 3.0]),
-            series("orchard", Unit::PerSec, &[4.0, 4.0]),
+            p("sprout", &[1.0, 1.0], Channel::Sprout),
+            p("sapling spends", &[2.0, 2.0], Channel::Sapling),
+            p("sapling outputs", &[3.0, 3.0], Channel::Sapling),
+            p("orchard", &[4.0, 4.0], Channel::Orchard),
         ];
-        let folded = fold_sapling(&pools);
+        let folded = fold_pools(&pools);
         assert_eq!(
             folded.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(),
             ["sprout", "sapling", "orchard"]
@@ -1133,17 +1165,15 @@ mod tests {
         assert_eq!(folded[1].points, vec![(0.0, 5.0), (30.0, 5.0)]);
     }
 
+    /// Tags come off `Channel`, so a pool cannot render a tag its legend does not use
     #[test]
-    fn a_pool_tag_is_three_characters() {
-        for (label, tag) in [
-            ("transparent", "tsp"),
-            ("sapling", "sap"),
-            ("orchard", "orc"),
-            ("ironwood", "iro"),
-            ("sprout", "spr"),
-        ] {
-            assert_eq!(pool_tag(label), tag);
+    fn a_pool_tag_is_its_channels_and_a_split_keeps_its_direction() {
+        for channel in Channel::ALL {
+            let s = pool(channel.name(), Unit::PerSec, &[1.0], Some(channel));
+            assert_eq!(pool_tag(&s), channel.tag());
         }
+        let split = pool("transparent out", Unit::PerSec, &[1.0], Some(Channel::Transparent));
+        assert_eq!(pool_tag(&split), "tsp-out");
     }
 
     /// Printed once into scrollback, so nothing re-flows: no padding to reserve.
@@ -1153,16 +1183,16 @@ mod tests {
     #[test]
     fn a_chip_row_separates_pools_and_leads_with_the_largest() {
         let row = pool_chips(&view().shielded, &theme(), 60);
-        assert_eq!(row, "sap 53.4M · orc 25.8M · iro 0", "{row:?}");
+        assert_eq!(row, "sap 54.4M · orc 26.6M · iro 0", "{row:?}");
         let ascii = pool_chips(&view().shielded, &Theme::for_capabilities(false, false), 60);
-        assert_eq!(ascii, "sap 53.4M * orc 25.8M * iro 0", "{ascii:?}");
+        assert_eq!(ascii, "sap 54.4M * orc 26.6M * iro 0", "{ascii:?}");
     }
 
     /// Per-pool totals and the run's rates are the same reading; two lines wasted one
     #[test]
     fn the_chips_share_a_line_with_the_rate_summary() {
         let rendered = render_sync_report(&view(), &theme(), 160);
-        let line = rendered.lines().find(|l| l.contains("sap 53.4M")).expect("a chip row");
+        let line = rendered.lines().find(|l| l.contains("sap 54.4M")).expect("a chip row");
         assert!(line.contains("avg 45.0k/s"), "{line:?}");
         assert!(line.contains("peak 77.3k/s"), "{line:?}");
     }
@@ -1171,7 +1201,7 @@ mod tests {
     /// the run never had
     #[test]
     fn a_panel_peak_is_the_peak_of_the_stack_not_the_sum_of_its_channels_peaks() {
-        let shielded = fold_sapling(&view().shielded);
+        let shielded = fold_pools(&view().shielded);
         let sum_of_peaks: f64 = shielded.iter().filter_map(Series::peak).sum();
         let peak_of_sum = stacked_peak(&shielded);
         assert!(
@@ -1254,20 +1284,6 @@ mod tests {
         assert!(!rendered.contains("short "), "a run mid-flight is not short:\n{rendered}");
     }
 
-    /// The countdown a finished run spends on its shortfall
-    #[test]
-    fn a_running_sync_shows_its_eta_where_a_finished_one_shows_the_shortfall() {
-        let rendered = render_sync_report(&running(), &theme(), 160);
-        assert!(rendered.contains("eta 72m00s"), "{rendered}");
-    }
-
-    /// Before a verdict exists, how many probes are holding is the only standing there is
-    #[test]
-    fn a_running_sync_reports_its_probe_tally() {
-        let rendered = render_sync_report(&running(), &theme(), 160);
-        assert!(rendered.contains("3/4 probes ok"), "{rendered}");
-    }
-
     /// `0 ticks` reads as a stalled run rather than one still starting
     #[test]
     fn a_run_before_its_first_tick_omits_the_tick_count() {
@@ -1294,23 +1310,18 @@ mod tests {
     #[test]
     fn a_subject_at_tip_still_reads_as_running() {
         let mut v = running();
-        v.phase = Some(Phase::Done);
         v.height = Some((1_700_000, 1_700_000));
         let rendered = render_sync_report(&v, &theme(), 160);
         let header = rendered.lines().nth(1).expect("the status line");
         assert!(header.contains("Running"), "the run has no verdict yet: {header:?}");
-        assert!(header.contains("Done"), "the chain walk is at tip: {header:?}");
         assert!(!rendered.contains("Passed"), "no verdict was mirrored:\n{rendered}");
     }
 
     pub(super) fn running() -> ReportView {
         ReportView {
             status: SyncStatus::Running,
-            phase: Some(Phase::Syncing),
             segment: None,
             height: Some((1_204_551, 1_700_000)),
-            eta: Some(Duration::from_secs(4_320)),
-            probes: Some((3, 4)),
             violations: vec![(
                 "index_serves_the_pinned_tip".into(),
                 "unsatisfied 12m03s of 30m00s".into(),
@@ -1324,9 +1335,9 @@ mod tests {
 #[cfg(test)]
 mod ascii {
     use super::tests::{running, view};
-    use super::{Theme, render_sync_report, render_sync_verdict};
+    use super::{Theme, render_sync_report};
 
-    /// Both report surfaces, both fixtures, at the widths a piped report actually uses
+    /// Both fixtures, at the widths a piped report actually uses
     #[test]
     fn the_sync_report_falls_back_to_ascii() {
         let ascii = Theme::for_capabilities(false, false);
@@ -1335,10 +1346,6 @@ mod ascii {
                 crate::testing::assert_ascii_clean(
                     &format!("render_sync_report({name}, {width})"),
                     &render_sync_report(&v, &ascii, width),
-                );
-                crate::testing::assert_ascii_clean(
-                    &format!("render_sync_verdict({name}, {width})"),
-                    &render_sync_verdict(&v, &ascii, width),
                 );
             }
         }

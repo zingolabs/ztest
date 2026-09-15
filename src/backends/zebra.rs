@@ -13,10 +13,11 @@ use crate::handles::validator::{
     PoolSupport, ValidatorBackend, ValidatorConfig,
 };
 use crate::handles::wallet::Pool;
-use crate::metrics::{Facet, Reduce, Row, Unit, family, row};
+use crate::metrics::{Facet, Row, row};
 use crate::protocol::Endpoint;
 use crate::protocol::client::{AuthedRpc, JsonRpcClient, json_rpc, wait_for_rpc_ready};
 use crate::protocol::zcash_rpc::ZcashRpc;
+use crate::public_conf::ChainMotion;
 use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zebrad";
@@ -146,6 +147,14 @@ impl ValidatorConfig for ZebraBackend {
                 Some(crate::component::RestoreSource::Blank) => {
                     opts.mounts.push(crate::regtest::scratch_mount(ZEBRAD_REGTEST_CACHE_DIR));
                 }
+                Some(crate::component::RestoreSource::Follow(archive)) => {
+                    return Err(EnvError::Config {
+                        reason: format!(
+                            "{} is a regtest cache; only a public chain has a network to follow",
+                            archive.artifact.name,
+                        ),
+                    });
+                }
                 None => {}
             }
         }
@@ -168,11 +177,21 @@ pub struct ZebraValidator {
 ///
 /// Verification switches families at the highest checkpoint (concurrency 1000 → 20), so a
 /// per-regime one draws a cliff that is a metric artifact; `verified_block_total` spans both
+mod family {
+    use crate::metrics::{Counter, Dimension, Gauge, counter, gauge};
+
+    pub const VERIFIED_HEIGHT: Gauge =
+        gauge("zebrad_chain_verified_block_height", Dimension::Count);
+    pub const VERIFIED_TOTAL: Counter =
+        counter("zebrad_chain_verified_block_total", Dimension::Count);
+    pub const PEERS: Gauge = gauge("zebrad_network_peers", Dimension::Count);
+}
+
 #[rustfmt::skip]
 const ROWS: [Row; 3] = [
-    row("validator best height", family("zebrad_chain_verified_block_height"), Reduce::Max, Unit::Count, Facet::Progress),
-    row("blocks verified", family("zebrad_chain_verified_block_total"), Reduce::Sum, Unit::PerSec, Facet::Throughput),
-    row("connected peers", family("zebrad_network_peers"), Reduce::Max, Unit::Count, Facet::Progress),
+    row("validator best height", family::VERIFIED_HEIGHT.level(), Facet::Progress),
+    row("blocks verified", family::VERIFIED_TOTAL.rate(), Facet::Throughput),
+    row("connected peers", family::PEERS.level(), Facet::Progress),
 ];
 
 impl crate::metrics::MetricLayout for ZebraValidator {
@@ -183,10 +202,6 @@ impl crate::metrics::MetricLayout for ZebraValidator {
 impl crate::metrics::Exporter for ZebraValidator {
     async fn endpoint(&self) -> Result<Endpoint, EnvError> {
         self.plumbing.endpoint(crate::metrics::PORT_NAME).await
-    }
-
-    fn rows(&self) -> &'static [crate::metrics::Row] {
-        &ROWS
     }
 }
 
@@ -447,12 +462,7 @@ const ZEBRAD_RPC_PORT: u16 = crate::ports::ZEBRAD_RPC;
 /// - `None` covers a regtest cache and a bare metadata-less archive alike
 /// - Read off `opts.restore`, not a flag (archive's own recorded network = single fact)
 fn public_restore_network(opts: &crate::component::ComponentOpts) -> Option<crate::Network> {
-    match &opts.restore {
-        Some(crate::component::RestoreSource::Archive(archive)) => {
-            Some(archive.network).filter(|n| n.is_public())
-        }
-        _ => None,
-    }
+    opts.restore.as_ref()?.snapshot().map(|s| s.network).filter(|n| n.is_public())
 }
 
 /// Sole source for both `zebrad.toml` and the pod spec — they **must** agree
@@ -496,24 +506,54 @@ fn restore_public(
         return validator;
     };
 
+    let toml = public_toml(&validator, network, ChainMotion::Pinned, ZEBRAD_PUBLIC_CACHE_DIR);
+    boot_public(validator, toml)
+        .mount(crate::regtest::archive_mount(archive.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
+}
+
+impl crate::component::Validator<ZebraBackend> {
+    /// Boot off `volume`'s snapshot, then sync onward with the network (tip moves past the pin).
+    ///
+    /// - TEMPORARY: shared volume only while zaino ingests via `direct` (fetch migration ~2026-10)
+    pub fn follow(mut self, volume: &crate::ChainVolume) -> Self {
+        let snapshot = volume.snapshot();
+        self.opts.restore = Some(crate::component::RestoreSource::Follow(snapshot));
+        let toml =
+            public_toml(&self, snapshot.network, ChainMotion::Following, volume.mount_path());
+        boot_public(self, toml).mount(volume)
+    }
+}
+
+fn public_toml(
+    validator: &crate::component::Validator<ZebraBackend>,
+    network: crate::Network,
+    motion: ChainMotion,
+    cache_dir: &str,
+) -> String {
     let version = validator
         .opts()
         .version
         .parse::<crate::regtest_conf::Semver>()
         .expect("zebrad version must be semver");
-    let toml = crate::public_conf::public_zebrad_conf(
+    crate::public_conf::public_zebrad_conf(
         network,
+        motion,
         version,
         ZEBRAD_PUBLIC_RPC_PORT,
-        ZEBRAD_PUBLIC_CACHE_DIR,
+        cache_dir,
         // Always on for a public restore (colocated zaino `Direct` needs an
         // address to dial; `serves_indexer_grpc` exposes the port to match).
         Some(crate::ports::ZEBRAD_INDEXER),
         validator.opts().image.metrics_enabled().then(|| ZebraBackend.metrics_port()).flatten(),
-    );
+    )
+}
+
+fn boot_public(
+    validator: crate::component::Validator<ZebraBackend>,
+    toml: String,
+) -> crate::component::Validator<ZebraBackend> {
     validator
         .mount(crate::regtest::config_mount_inline(toml, "/etc/zebrad/zebrad.toml"))
-        .mount(crate::regtest::archive_mount(archive.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
         .command(["zebrad"])
         .args(["-c", "/etc/zebrad/zebrad.toml", "start"])
 }
@@ -597,5 +637,34 @@ mod tests {
     fn the_indexer_grpc_is_served_wherever_a_direct_backend_could_dial_it() {
         assert!(serves_indexer_grpc(&opts_restoring(crate::Network::Testnet)));
         assert!(!serves_indexer_grpc(&ComponentOpts::default()));
+    }
+
+    /// Chain lives on the shared volume (no private clone), config dials the network, and the
+    /// pod still serves the public RPC + indexer gRPC a colocated zaino needs
+    #[test]
+    fn a_following_validator_boots_off_the_shared_chain_and_joins_the_network() {
+        let mut env = crate::TestEnv::builder();
+        let vol = env.chain_volume(archive(crate::Network::Mainnet), crate::Disk::gib(400));
+        let opts = crate::component::Validator::zebrad("6.2.3").follow(&vol).opts;
+
+        assert!(matches!(opts.restore, Some(RestoreSource::Follow(_))));
+        assert_eq!(
+            opts.shared_state.as_ref().map(|s| s.mount_path.as_str()),
+            Some(vol.mount_path())
+        );
+        assert!(!opts.mounts.iter().any(|m| matches!(m.kind, crate::MountKind::DirArchive)));
+        let toml = opts
+            .mounts
+            .iter()
+            .find_map(|m| match &m.source {
+                crate::MountSource::ConfigInline(text) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("rendered zebrad.toml");
+        assert!(toml.contains(&format!("cache_dir = \"{}\"", vol.mount_path())));
+        assert!(!toml.contains("debug_force_finished_sync"));
+        assert_eq!(rpc_port(&opts), ZEBRAD_PUBLIC_RPC_PORT);
+        assert!(serves_indexer_grpc(&opts));
+        assert_eq!(crate::backends::seed_groups(&opts), vec![crate::materialize::SEED_GID]);
     }
 }

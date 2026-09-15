@@ -551,7 +551,6 @@ mod tests {
             cwd: PathBuf::new(),
             class: crate::qos::QosClass::Integration,
             footprint: crate::qos::Resources::ZERO,
-            priority: 0,
             hard_cap: Duration::from_secs(1),
             retries: 0,
             deps: Vec::new(),

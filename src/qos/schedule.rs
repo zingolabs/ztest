@@ -1,278 +1,79 @@
-//! Pre-run scheduling plan for the preflight banner (`docs/design-qos.md` §8).
+//! Pre-run summary of the selected tests' reserves, for the preflight banner.
 //!
-//! - Pure `(per-test reserves, capacity) -> plan`: concurrency waves, peak reserve,
-//!   tests whose footprint exceeds the cluster outright (fail-fast)
-//! - Per *test*, not per tier: a test may override its tier's component reserve
-//!   (`footprint = ".."`), so two tests in one tier can admit against different
-//!   amounts and a per-tier constant would estimate a run nobody is going to get
-//! - Not [`super::scheduler`], one letter apart — that one is the live admission core
+//! - Pure `(per-test reserves, capacity) -> plan`: count, total reserve, and the tests whose
+//!   reserve exceeds the cluster outright (admission rejects them → fail-fast)
+//! - Per *test*: a `footprint = ".."` override makes two tests of one tag differ
+//! - No order or concurrency estimate: admission is one arrival-ordered queue popped as
+//!   capacity frees ([`super::scheduler`], one letter apart)
 
-use super::{QosClass, Resources};
+use super::Resources;
 
-/// One selected test: declared tier + the `admitted` reserve it is submitted with
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One selected test + the `admitted` reserve it is submitted with
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedTest {
-    pub class: QosClass,
+    pub name: String,
     pub admitted: Resources,
 }
 
-/// One tier's contribution, aggregated from its [`PlannedTest`]s.
+/// Selected tests against probed capacity.
 ///
-/// - `per_test` = `None` when overrides make the tier non-uniform (renderer shows `subtotal`)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TierPlan {
-    pub class: QosClass,
-    pub count: u32,
-    pub per_test: Option<Resources>,
-    pub subtotal: Resources,
-}
-
-/// Test that cannot fit an empty cluster; carries the amount (class no longer
-/// determines it once overrides exist)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unschedulable {
-    pub class: QosClass,
-    pub admitted: Resources,
-}
-
-/// Estimated schedule for the selected tests against probed capacity.
-///
-/// - `total` = Σ every test's reserve, i.e. the reserve with everything at once
-/// - `free` `None` = probe unavailable → `waves`/`peak` are `0`/`ZERO`, counts only
-/// - `unschedulable` tests miss even the empty cluster (rejected at admission,
-///   `ExceedsClusterCapacity`) and sit out the wave sim
+/// - `total` = Σ every test's reserve
+/// - `free` `None` = probe unavailable → nothing judged unschedulable
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QosPlan {
-    pub tiers: Vec<TierPlan>,
+    pub tests: u32,
     pub total: Resources,
     pub free: Option<Resources>,
-    pub waves: u32,
-    pub peak: Resources,
-    pub unschedulable: Vec<Unschedulable>,
+    pub unschedulable: Vec<PlannedTest>,
 }
 
-/// Schedule estimate; `tests` = one per selected test, `free` = probed headroom
-///
-/// - Ordering/sim/fail-fast all per test → matches what `engine::plan` submits one-for-one
 pub fn plan(tests: &[PlannedTest], free: Option<Resources>) -> QosPlan {
-    // Highest priority first (sync, testnet, integration, basic): display order, and
-    // the order the wave sim admits in
-    let mut ordered: Vec<PlannedTest> = tests.to_vec();
-    ordered.sort_by_key(|t| std::cmp::Reverse(t.class.profile().priority));
-
-    let mut tiers: Vec<TierPlan> = Vec::new();
-    for t in &ordered {
-        match tiers.last_mut().filter(|tp| tp.class == t.class) {
-            Some(tp) => {
-                tp.count += 1;
-                tp.subtotal = tp.subtotal.saturating_add(&t.admitted);
-                if tp.per_test != Some(t.admitted) {
-                    tp.per_test = None;
-                }
-            }
-            None => tiers.push(TierPlan {
-                class: t.class,
-                count: 1,
-                per_test: Some(t.admitted),
-                subtotal: t.admitted,
-            }),
-        }
-    }
-
-    let total = ordered.iter().fold(Resources::ZERO, |acc, t| acc.saturating_add(&t.admitted));
-
-    let mut unschedulable = Vec::new();
-    let (waves, peak) = match free {
-        None => (0, Resources::ZERO),
-        Some(free) => {
-            // Priority-ordered; a test missing even the empty cluster sits out the sim
-            let mut units: Vec<Resources> = Vec::new();
-            for t in &ordered {
-                if t.admitted.fits_within(&free) {
-                    units.push(t.admitted);
-                } else {
-                    unschedulable.push(Unschedulable { class: t.class, admitted: t.admitted });
-                }
-            }
-            simulate_waves(&units, free)
-        }
+    let total = tests.iter().fold(Resources::ZERO, |acc, t| acc.saturating_add(&t.admitted));
+    let unschedulable = match free {
+        Some(free) => tests.iter().filter(|t| !t.admitted.fits_within(&free)).cloned().collect(),
+        None => Vec::new(),
     };
-
-    QosPlan { tiers, total, free, waves, peak, unschedulable }
-}
-
-/// Greedy priority+backfill wave sim mirroring `scheduler`'s policy → `(wave count,
-/// per-dimension peak reserve)`. Each wave walks priority-ordered `units`, admitting
-/// whatever still fits its 2-D capacity; the rest spill to the next
-fn simulate_waves(units: &[Resources], free: Resources) -> (u32, Resources) {
-    let mut remaining: Vec<Resources> = units.to_vec();
-    let mut waves = 0;
-    let mut peak = Resources::ZERO;
-    while !remaining.is_empty() {
-        waves += 1;
-        let mut used = Resources::ZERO;
-        let mut spill = Vec::new();
-        for u in remaining {
-            match used.checked_add(&u) {
-                Some(after) if after.fits_within(&free) => used = after,
-                _ => spill.push(u),
-            }
-        }
-        peak = peak.max(&used);
-        // Every unit fits `free` alone (unschedulable filtered) → each wave admits
-        // >=1 and `remaining` shrinks; guard is defensive only
-        if used == Resources::ZERO {
-            break;
-        }
-        remaining = spill;
-    }
-    (waves, peak)
+    QosPlan { tests: tests.len() as u32, total, free, unschedulable }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qos::GIB;
+    use crate::qos::{GIB, QosClass};
 
-    /// `n` tests of `class` at its tier default
-    fn at_tier(class: QosClass, n: u32) -> Vec<PlannedTest> {
-        vec![PlannedTest { class, admitted: class.profile().admitted() }; n as usize]
-    }
-
-    fn tiers(sets: &[(QosClass, u32)]) -> Vec<PlannedTest> {
-        sets.iter().flat_map(|&(c, n)| at_tier(c, n)).collect()
-    }
-
-    /// `n` sync tests, which carry no tier default and are priced from their declaration
-    fn at_sync(footprint: Resources, n: u32) -> Vec<PlannedTest> {
-        let admitted = QosClass::Sync.profile_with(Some(footprint)).admitted();
-        vec![PlannedTest { class: QosClass::Sync, admitted }; n as usize]
+    fn test(name: &str, admitted: Resources) -> PlannedTest {
+        PlannedTest { name: name.into(), admitted }
     }
 
     #[test]
-    fn tiers_are_listed_highest_priority_first() {
-        let mut planned = tiers(&[(QosClass::Integration, 1), (QosClass::Testnet, 1)]);
-        planned.extend(at_sync(Resources::new(15_000, 15 * GIB, 0, 0), 1));
-        let p = plan(&planned, None);
-        let order: Vec<QosClass> = p.tiers.iter().map(|t| t.class).collect();
-        assert_eq!(order, vec![QosClass::Sync, QosClass::Testnet, QosClass::Integration]);
-        // Zero-count tiers omitted (wallet undeclared)
-        assert!(!order.contains(&QosClass::Wallet));
+    fn total_sums_every_tests_own_reserve() {
+        let base = QosClass::Integration.profile();
+        let raised = base.with_footprint(Some(Resources::new(4_000, 8 * GIB, 0, 0)));
+        let p = plan(&[test("a", base.admitted()), test("b", raised.admitted())], None);
+        assert_eq!(p.tests, 2);
+        assert_eq!(p.total, base.admitted().saturating_add(&raised.admitted()));
     }
 
     #[test]
-    fn total_is_sum_of_count_times_admitted() {
-        // Admitted (components + runner): integration 3c/5Gi, testnet 9c/11Gi
-        // → 3 integration + 1 testnet = 18c, 26Gi
-        let p = plan(&tiers(&[(QosClass::Integration, 3), (QosClass::Testnet, 1)]), None);
-        assert_eq!(p.total.cpu_milli, 3 * 3000 + 9000);
-        assert_eq!(p.total.mem_bytes, 3 * 5 * GIB + 11 * GIB);
-    }
-
-    #[test]
-    fn fits_in_one_wave_when_total_within_capacity() {
-        // 4 integration = 12c / 20 GiB against 12c/24Gi → one wave
-        let p =
-            plan(&at_tier(QosClass::Integration, 4), Some(Resources::new(12_000, 24 * GIB, 0, 0)));
-        assert_eq!(p.waves, 1);
-        assert_eq!(p.peak, Resources::new(12_000, 20 * GIB, 0, 0));
-        assert!(p.unschedulable.is_empty());
-    }
-
-    #[test]
-    fn spills_into_multiple_waves_when_total_exceeds_capacity() {
-        // 5 × 3c/5Gi on 3c/8Gi: CPU-bound, 1 per wave → 5 waves
-        let p = plan(&at_tier(QosClass::Integration, 5), Some(Resources::new(3000, 8 * GIB, 0, 0)));
-        assert_eq!(p.waves, 5);
-        assert_eq!(p.peak, Resources::new(3000, 5 * GIB, 0, 0));
-    }
-
-    #[test]
-    fn unschedulable_test_is_flagged_with_its_own_reserve_and_excluded_from_waves() {
-        // A sync test declaring 15c/15Gi admits 16c/16Gi against 4c/8Gi → never fits;
-        // an integration test (3c/5Gi) still plans normally around it
-        let declared = Resources::new(15_000, 15 * GIB, 0, 0);
-        let mut planned = at_sync(declared, 2);
-        planned.extend(at_tier(QosClass::Integration, 1));
-        let p = plan(&planned, Some(Resources::new(4000, 8 * GIB, 0, 0)));
-        assert_eq!(p.unschedulable.len(), 2);
-        assert!(p.unschedulable.iter().all(|u| u.class == QosClass::Sync));
-        // Amount travels with the rejection (class no longer determines it — and for `sync`
-        // the class carries no amount at all)
-        assert_eq!(
-            p.unschedulable[0].admitted,
-            QosClass::Sync.profile_with(Some(declared)).admitted()
+    fn a_test_over_the_cluster_is_named_with_its_reserve() {
+        let huge = Resources::new(16_000, 16 * GIB, 0, 0);
+        let p = plan(
+            &[test("small", Resources::new(3_000, 5 * GIB, 0, 0)), test("zaino_sync", huge)],
+            Some(Resources::new(4_000, 8 * GIB, 0, 0)),
         );
-        // Only the integration test entered the sim
-        assert_eq!(p.waves, 1);
-        assert_eq!(p.peak, Resources::new(3000, 5 * GIB, 0, 0));
+        assert_eq!(p.unschedulable, [test("zaino_sync", huge)]);
     }
 
     #[test]
-    fn no_capacity_degrades_to_counts_only() {
-        let p = plan(&at_tier(QosClass::Testnet, 2), None);
-        assert_eq!(p.waves, 0);
-        assert_eq!(p.peak, Resources::ZERO);
+    fn no_capacity_judges_nothing_unschedulable() {
+        let p = plan(&[test("t", Resources::new(64_000, 512 * GIB, 0, 0))], None);
         assert!(p.unschedulable.is_empty());
-        // Counts/footprints still populated
-        assert_eq!(p.tiers.len(), 1);
-        assert_eq!(p.tiers[0].count, 2);
+        assert_eq!(p.tests, 1);
     }
 
     #[test]
     fn empty_input_is_an_empty_plan() {
-        let p = plan(&[], Some(Resources::new(8000, 16 * GIB, 0, 0)));
-        assert!(p.tiers.is_empty());
-        assert_eq!(p.total, Resources::ZERO);
-        assert_eq!(p.waves, 0);
-    }
-
-    // ── overrides: the reason this works per test rather than per tier ──
-
-    #[test]
-    fn a_tier_with_uniform_reserves_still_reports_a_per_test_figure() {
-        let admitted = QosClass::Integration.profile().admitted();
-        let p = plan(&at_tier(QosClass::Integration, 3), None);
-        assert_eq!(p.tiers[0].per_test, Some(admitted));
-        // Stated as a multiple of the figure above, not a literal: the two must agree, and
-        // a hardcoded subtotal is what let them drift apart
-        assert_eq!(p.tiers[0].subtotal.cpu_milli, admitted.cpu_milli * 3);
-        assert_eq!(p.tiers[0].subtotal.mem_bytes, admitted.mem_bytes * 3);
-    }
-
-    #[test]
-    fn an_override_makes_its_tier_non_uniform_and_still_sums_correctly() {
-        // Two integration tests, one overriding its component reserve upward
-        let base = QosClass::Integration.profile();
-        let raised = base.with_footprint(Some(Resources::new(4_000, 8 * GIB, 0, 0)));
-        let p = plan(
-            &[
-                PlannedTest { class: QosClass::Integration, admitted: base.admitted() },
-                PlannedTest { class: QosClass::Integration, admitted: raised.admitted() },
-            ],
-            None,
-        );
-        assert_eq!(p.tiers.len(), 1, "still one tier row");
-        assert_eq!(p.tiers[0].count, 2);
-        assert_eq!(p.tiers[0].per_test, None, "mixed reserves have no honest `each` figure");
-        assert_eq!(p.tiers[0].subtotal, base.admitted().saturating_add(&raised.admitted()));
-        assert_eq!(p.total, p.tiers[0].subtotal);
-    }
-
-    #[test]
-    fn an_override_can_make_one_test_unschedulable_while_its_tier_peer_plans() {
-        let base = QosClass::Integration.profile();
-        let huge = base.with_footprint(Some(Resources::new(64_000, 512 * GIB, 0, 0)));
-        let p = plan(
-            &[
-                PlannedTest { class: QosClass::Integration, admitted: base.admitted() },
-                PlannedTest { class: QosClass::Integration, admitted: huge.admitted() },
-            ],
-            Some(Resources::new(8_000, 16 * GIB, 0, 0)),
-        );
-        // Per-tier accounting would flag both or neither
-        assert_eq!(p.unschedulable.len(), 1);
-        assert_eq!(p.unschedulable[0].admitted, huge.admitted());
-        assert_eq!(p.waves, 1, "the ordinary test still plans");
+        let p = plan(&[], Some(Resources::new(8_000, 16 * GIB, 0, 0)));
+        assert_eq!((p.tests, p.total), (0, Resources::ZERO));
     }
 }

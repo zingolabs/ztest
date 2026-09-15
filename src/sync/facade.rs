@@ -13,7 +13,6 @@ use crate::error::EnvError;
 
 use super::nemesis::{Nemesis, NemesisBuilder};
 use super::probe::{Cadence, Class, ProbeBuilder, ProbeSpec, Severity, SyncCtx};
-use super::reporter::EventReporter;
 use super::runner::{SyncEngine, SyncOutcome, SyncVerdict};
 use super::subject::SyncSubject;
 use super::work::OpSet;
@@ -43,6 +42,7 @@ struct EngineOpts {
     timeout: Option<Duration>,
     stop_height: Option<u32>,
     required_work: OpSet,
+    ready: Vec<crate::metrics::Family>,
 }
 
 impl std::fmt::Debug for SyncRunner {
@@ -73,6 +73,7 @@ impl SyncRunner {
                 timeout: None,
                 stop_height: None,
                 required_work: OpSet::NONE,
+                ready: Vec::new(),
             },
         }
     }
@@ -130,6 +131,18 @@ impl SyncRunner {
     /// - Subject ↔ component agree on those series by string only, across repos
     pub fn requires_work(&mut self, ops: OpSet) -> &mut Self {
         self.engine.required_work = ops;
+        self
+    }
+
+    /// Widen (or narrow) one family's ready window for this profile — e.g. a cold mainnet
+    /// validator delaying zaino's first block past
+    /// `ztest::backends::zainod::family::FETCHED_HEIGHT`'s 60 s default
+    pub fn ready_within(
+        &mut self,
+        family: impl Into<crate::metrics::Family>,
+        ready: Duration,
+    ) -> &mut Self {
+        self.engine.ready.push(crate::metrics::Family { ready, ..family.into() });
         self
     }
 
@@ -215,28 +228,28 @@ async fn drive(
 ) -> SyncOutcome {
     let detached = super::active_sync_id();
     let profile = std::env::var(super::SYNC_PROFILE_ENV).unwrap_or_default();
-    let probe_count = probes.len();
     let tick = opts.tick;
     let mut engine = SyncEngine::new(subject)
         .with_probes(probes)
         .with_tick(tick)
         .with_ctx(ctx)
         .requires_work(opts.required_work);
+    for family in opts.ready {
+        engine = engine.with_ready(family);
+    }
     if let Some(t) = opts.timeout {
         engine = engine.with_timeout(t);
     }
     if let Some(h) = opts.stop_height {
         engine = engine.with_stop_height(h);
     }
-    // Detached: driver log = only channel to a watching terminal. Local runs keep
-    // the silent reporter (no watcher, and stdout is the test's own)
-    if let Some(sync_id) = &detached {
-        engine = engine.with_reporter(Box::new(EventReporter::new(
-            sync_id,
-            &profile,
-            tick,
-            probe_count,
-        )));
+    // Detached: a Prometheus target, read like any component. Local runs keep the silent
+    // reporter (nothing scrapes a `cargo test`)
+    if detached.is_some() {
+        if let Err(e) = super::export::install() {
+            return errored(format!("driver metrics exporter: {e}"));
+        }
+        engine = engine.with_reporter(Box::new(super::export::MetricsReporter));
     }
     // `ztest sync stop` (and SIGTERM on node loss) must checkpoint, not kill →
     // route the in-pod stop-watch into engine cancellation. No namespace arg: it

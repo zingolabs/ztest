@@ -5,12 +5,11 @@
 //!   mean height / work / per-block cost
 //! - [`Window`] = smoothing, stated once per observer rather than per column, over the
 //!   crate-wide [`rate`](crate::rate) estimator
-//! - Not a [`ProgressView`](super::ProgressView): an outside scrape cannot know
-//!   [`Phase`](super::Phase), and an `Unknown` variant no subject reports would face
-//!   every probe matching on one. The shared part is [`Work`], reused whole
+//! - Not a [`ProgressView`](super::ProgressView): an outside scrape answers fewer questions
+//!   than a subject → only [`Work`] is shared, reused whole
 
 use super::work::{Op, Rate, Work};
-use crate::metrics::{Exposition, Family, Phi, Tally, windowed_quantile};
+use crate::metrics::{Counter, Exposition, Gauge, Phi, Tally, windowed_quantile};
 use crate::rate::{Pace, Stamp};
 
 /// Timing family as scraped, undivided like every counter here — [`Window`] owns the span,
@@ -128,18 +127,16 @@ impl From<&super::Snapshot> for Observation {
     }
 }
 
-/// The height families a component publishes. Read in a different order by a probe than
-/// by a display, so the preference lives here as data rather than as two hand-written
-/// resolvers that can disagree.
+/// Height families a component publishes. `height` = the one frontier probe and panel both read
+/// (a second frontier family = a second answer to "how far")
 #[derive(Debug, Clone, Copy)]
 pub struct Heights {
-    /// Durable frontier — written and fsynced. What a probe gates on
-    pub committed: Family,
-    /// Frontier built ahead of the next commit; moves per block. What a display shows,
-    /// since `committed` steps once per commit and carries no per-second rate
-    pub live: Option<Family>,
+    pub height: Gauge,
     /// Completion denominator. `None` = component publishes no target
-    pub target: Option<Family>,
+    pub target: Option<Gauge>,
+    /// Network tip as this component sees it. Not a denominator — it advances underneath a
+    /// run, which is why `target` exists
+    pub tip: Option<Gauge>,
 }
 
 /// Where a watcher's numbers come from. `Exporter` carries a `ztest.io/component`
@@ -185,7 +182,7 @@ pub trait Observe: crate::metrics::MetricLayout {
 
     /// Per-[`Op`] counters this component publishes. An `Op` absent here stays
     /// unmeasured: [`Work::require`] panics rather than compare a zero that can never fail
-    const WORK_OPS: &'static [(Op, Family)];
+    const WORK_OPS: &'static [(Op, Counter)];
 
     /// `None` = not this component's exposition (nothing it should publish is present)
     fn observe(exposition: &Exposition) -> Option<Observation>;
@@ -193,8 +190,8 @@ pub trait Observe: crate::metrics::MetricLayout {
     /// Counters named by [`WORK_OPS`](Self::WORK_OPS); absent ones left unmeasured
     fn work_of(exposition: &Exposition) -> Work {
         let mut work = Work::ZERO;
-        for &(op, family) in Self::WORK_OPS {
-            if let Some(n) = exposition.counter_total(family) {
+        for &(op, counter) in Self::WORK_OPS {
+            if let Some(n) = exposition.counter_total(counter) {
                 work.set(op, n);
             }
         }
@@ -202,28 +199,18 @@ pub trait Observe: crate::metrics::MetricLayout {
     }
 
     /// Which family measures `op`, or `None` when this component does not count it
-    fn work_source(op: Op) -> Option<Family> {
-        Self::WORK_OPS.iter().find_map(|&(o, family)| (o == op).then_some(family))
+    fn work_source(op: Op) -> Option<Counter> {
+        Self::WORK_OPS.iter().find_map(|&(o, counter)| (o == op).then_some(counter))
     }
 
     /// Zero filtered out: a tip not yet known, not a zero-length chain (renders 100 %)
     fn target_of(exposition: &Exposition) -> Option<u32> {
-        Self::HEIGHTS.target.and_then(|f| exposition.height_gauge(f)).filter(|&t| t > 0)
+        Self::HEIGHTS.target.and_then(|g| exposition.height(g)).filter(|&t| t > 0)
     }
 
-    /// Durable first — what a probe gates on
-    fn committed_height(exposition: &Exposition) -> Option<u32> {
-        Self::height(exposition, [Some(Self::HEIGHTS.committed), Self::HEIGHTS.live])
-    }
-
-    /// Live first — what a display shows, so it moves per block
-    fn live_height(exposition: &Exposition) -> Option<u32> {
-        Self::height(exposition, [Self::HEIGHTS.live, Some(Self::HEIGHTS.committed)])
-    }
-
-    #[doc(hidden)]
-    fn height(exposition: &Exposition, order: [Option<Family>; 2]) -> Option<u32> {
-        order.into_iter().flatten().find_map(|f| exposition.height_gauge(f))
+    /// `None` until the frontier is first published
+    fn height_of(exposition: &Exposition) -> Option<u32> {
+        exposition.height(Self::HEIGHTS.height)
     }
 }
 

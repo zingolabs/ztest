@@ -404,6 +404,31 @@ fn resolve_shared(volume_name: &str, claim: &str, destination: &Path) -> Resolve
     }
 }
 
+/// Seeded shared volume: `claim` cloned from `artifact`'s seed snapshot (`resolve_archive`'s
+/// clone, named for sharing instead of for one pod).
+///
+/// - Seed's CSI class, not the default one (a clone must stay on its source's driver)
+/// - TEMPORARY with `ChainVolume` (direct-only zaino topology)
+pub async fn create_seeded_shared_pvc(
+    client: &Client,
+    sentinel: &Sentinel,
+    claim: &str,
+    artifact: crate::Artifact,
+    disk: Disk,
+) -> Result<SeedBinding, EnvError> {
+    let seed = materialize::await_seed(client, artifact).await?;
+    let binding = seeds::bind_seed(client, sentinel, &seed, claim).await?;
+    create_pvc(
+        client,
+        sentinel,
+        claim,
+        Some(&binding.binding_snapshot),
+        &volume_size(Some(disk), &seed.restore_size),
+    )
+    .await?;
+    Ok(binding)
+}
+
 /// Called once per shared volume during `TestEnv::build`, before any pod exists.
 ///
 /// `storageClassName` unset → the cluster's default class provisions it (on kind the

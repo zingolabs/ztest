@@ -1,45 +1,27 @@
-//! Now plane: scrape an [`Exporter`] directly, on the reader's cadence.
+//! [`Exporter`]: a component's `/metrics`, read directly.
 //!
-//! - Bypasses Prometheus by design — a panel refreshing on the scrape interval shows a
-//!   number already stale by up to that interval
-//! - Same [`Row`]/[`Exposition`] vocabulary as [`query`](super::query), so a figure
-//!   cannot mean one thing here and another in the report
-//! - Reduces across whatever targets it resolves, as its PromQL counterpart reduces
-//!   across a namespace
+//! - The engine's oracle path: a probe reads its subject here, never off Prometheus (a
+//!   scrape outage must not become a verdict)
+//! - Same [`Row`](super::Row)/[`Exposition`] vocabulary as [`query`](super::query), so a figure cannot
+//!   mean one thing here and another in the report
+//! - [`Live`] = the watch panel's source (1 s direct scrapes, `status` stays on the TSDB)
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::collections::VecDeque;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use k8s_openapi::api::core::v1::Pod;
-use kube::Client;
-use kube::api::{Api, ListParams};
-use tokio::sync::{Mutex, watch};
-
-use super::{Exposition, PORT_NAME, Row, scrape};
+use super::query::Series;
+use super::{Counter, Exposition, Gauge, Reading, Row, Tally, scrape, windowed_quantile};
 use crate::error::EnvError;
-use crate::portforward::Forwarder;
 use crate::protocol::Endpoint;
+use crate::rate::Window;
 
-// ──────────────────────────────── Exporter ────────────────────────────────
-
-/// Scrapable right now. This impl + a [`PORT_NAME`] port in `pod_spec` = joining
-/// the metrics plane (nothing here names a component)
+/// Scrapable right now. This impl + a [`PORT_NAME`](super::PORT_NAME) port in `pod_spec` =
+/// joining the metrics plane (nothing here names a component)
 #[async_trait::async_trait]
 pub trait Exporter: Send + Sync + 'static {
-    /// `/metrics` location, resolved per scrape (pods get replaced mid-run).
-    /// Caching is the implementation's call
+    /// `/metrics` location, resolved per scrape (pods get replaced mid-run)
     async fn endpoint(&self) -> Result<Endpoint, EnvError>;
 
-    fn rows(&self) -> &'static [Row] {
-        &[]
-    }
-
-    /// Scrapee's `ztest.io/component` label, `None` until a target resolves
-    fn component(&self) -> Option<String> {
-        None
-    }
-
-    /// One scrape, now. Live readers want [`Poller`] (holds its client across scrapes)
     async fn read(&self, timeout: Duration) -> Result<Exposition, crate::error::PipelineError> {
         let endpoint = self.endpoint().await.map_err(|e| e.to_string())?;
         let http = reqwest::Client::new();
@@ -47,354 +29,162 @@ pub trait Exporter: Send + Sync + 'static {
     }
 }
 
-/// Exporter reached from **outside** the cluster: pod by `ztest.io/component-category`,
-/// forwarded to its [`PORT_NAME`] port, `rows_for` keyed on `ztest.io/component`.
+/// Live-panel sampling cadence (a person reading a panel, not a TSDB budget)
+pub const LIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Plotted history kept per row (bounds memory on a days-long attach)
+const TRAIL: Duration = Duration::from_secs(600);
+
+/// Direct-scrape counterpart of [`history`](super::query::history): same rows, same readings.
 ///
-/// - `latched` filled at first resolve: per-frame reads are sync, so they cannot
-///   await the target lock (and a category's component is fixed for a run)
-pub struct PodExporter {
-    client: Client,
-    namespace: String,
-    category: String,
-    rows_for: fn(&str) -> &'static [Row],
-    target: Mutex<Option<Target>>,
-    latched: std::sync::RwLock<(Option<String>, &'static [Row])>,
+/// - Every row off one window's two endpoints → rates on one panel share a span
+#[derive(Debug)]
+pub struct Live {
+    rows: &'static [Row],
+    window: Window<Exposition>,
+    trails: Vec<VecDeque<(f64, f64)>>,
 }
 
-struct Target {
-    pod: String,
-    forwarder: Forwarder,
-}
-
-impl std::fmt::Debug for PodExporter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PodExporter")
-            .field("namespace", &self.namespace)
-            .field("category", &self.category)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PodExporter {
-    pub fn new(
-        client: Client,
-        namespace: String,
-        category: impl Into<String>,
-        rows_for: fn(&str) -> &'static [Row],
-    ) -> PodExporter {
-        PodExporter {
-            client,
-            namespace,
-            category: category.into(),
-            rows_for,
-            target: Mutex::new(None),
-            latched: std::sync::RwLock::new((None, &[])),
+impl Live {
+    pub fn new(rows: &'static [Row]) -> Live {
+        Live {
+            rows,
+            window: Window::new(LIVE_INTERVAL),
+            trails: rows.iter().map(|_| VecDeque::new()).collect(),
         }
     }
 
-    /// Newest scrape-capable pod of this category + its port and component label
-    async fn resolve(&self) -> Option<(String, u16, String)> {
-        let api: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
-        let params =
-            ListParams::default().labels(&format!("ztest.io/component-category={}", self.category));
-        let pods = api.list(&params).await.ok()?;
-        pods.items.iter().find_map(|p| {
-            if !ready_to_scrape(p) {
-                return None;
+    /// `at` measures the window, `sampled` stamps the plotted point
+    pub fn push(&mut self, at: Instant, sampled: SystemTime, exposition: Exposition) {
+        self.window.push(at, exposition);
+        let x = sampled.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let (latest, endpoints) = (self.window.latest(), self.window.endpoints());
+        for (row, trail) in self.rows.iter().zip(&mut self.trails) {
+            let value = match (row.reading, endpoints) {
+                (Reading::Level(f), _) => latest.and_then(|e| e.level(Gauge(f))),
+                (reading, Some((first, last, elapsed))) => evaluate(reading, first, last, elapsed),
+                (_, None) => None,
+            };
+            if let Some(v) = value {
+                trail.push_back((x, v));
             }
-            let label = p
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|l| l.get("ztest.io/component"))
-                .cloned()
-                .unwrap_or_default();
-            Some((p.metadata.name.clone()?, metrics_port(p)?, label))
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl Exporter for PodExporter {
-    async fn endpoint(&self) -> Result<Endpoint, EnvError> {
-        let (pod, port, component) = self.resolve().await.ok_or_else(|| EnvError::Config {
-            reason: format!(
-                "no ready {} pod in {} exposes a `{PORT_NAME}` port",
-                self.category, self.namespace
-            ),
-        })?;
-
-        let mut target = self.target.lock().await;
-        // Keep the forwarder while it still points here (a fresh one per scrape
-        // rebinds a local port every period and loses the reuse making 1 s free)
-        if !matches!(&*target, Some(t) if t.pod == pod) {
-            let forwarder =
-                Forwarder::start(self.client.clone(), self.namespace.clone(), pod.clone(), port)
-                    .await
-                    .map_err(|e| EnvError::Config {
-                        reason: format!("portforward to {pod}:{port}: {e}"),
-                    })?;
-            *target = Some(Target { pod, forwarder });
-            *self.latched.write().expect("latch poisoned") =
-                (Some(component.clone()), (self.rows_for)(&component));
-        }
-        let local = target.as_ref().expect("target set immediately above").forwarder.local_port;
-        Ok(Endpoint { host: std::net::Ipv4Addr::LOCALHOST.into(), port: local })
-    }
-
-    fn rows(&self) -> &'static [Row] {
-        self.latched.read().expect("latch poisoned").1
-    }
-
-    fn component(&self) -> Option<String> {
-        self.latched.read().expect("latch poisoned").0.clone()
-    }
-}
-
-/// Scrapable = Running (dialing a `Pending`/terminated pod only yields errors a
-/// reader shows as a broken exporter)
-fn ready_to_scrape(pod: &Pod) -> bool {
-    pod.status.as_ref().and_then(|s| s.phase.as_deref()).is_some_and(|phase| phase == "Running")
-}
-
-fn metrics_port(pod: &Pod) -> Option<u16> {
-    pod.spec
-        .as_ref()?
-        .containers
-        .iter()
-        .flat_map(|c| c.ports.iter().flatten())
-        .find(|p| p.name.as_deref() == Some(PORT_NAME))
-        .map(|p| p.container_port as u16)
-}
-
-// ───────────────────────────────── Poller ─────────────────────────────────
-
-/// Default live cadence: a counter climbing during a scan must look like it.
-/// No load concern (an exporter is an in-memory registry)
-pub const LIVE_PERIOD: Duration = Duration::from_secs(1);
-
-/// Per-scrape bound, under [`LIVE_PERIOD`] (a wedged target must not stall the cadence)
-const LIVE_TIMEOUT: Duration = Duration::from_millis(700);
-
-/// One reading. No status enum: never-read (`at.is_none()`), unreachable
-/// (`error.is_some()`) and silent (all values `None`) all derive, a second encoding drifts
-#[derive(Debug, Clone, Default)]
-pub struct Sample {
-    pub at: Option<Instant>,
-    pub exposition: Arc<Exposition>,
-    pub error: Option<String>,
-}
-
-impl Sample {
-    /// Why this sample shows nothing, when it shows nothing.
-    ///
-    /// - Only this plane separates "never resolved" / "unreachable" / "silent", so a
-    ///   renderer of blank rows never has to guess
-    /// - `published` = the caller's own verdict on the families it asked for
-    pub fn note(&self, published: bool) -> Option<String> {
-        match (&self.error, self.at) {
-            (None, None) => Some("no metrics-exposing pod yet".to_string()),
-            (Some(why), None) => Some(format!("resolving target · {why}")),
-            (Some(why), Some(_)) => Some(format!("unavailable · {why}")),
-            (None, Some(_)) if !published => {
-                Some(format!("scraping every {}s · no series published yet", LIVE_PERIOD.as_secs()))
+            while trail.front().is_some_and(|(t, _)| x - t > TRAIL.as_secs_f64()) {
+                trail.pop_front();
             }
-            (None, Some(_)) => None,
         }
     }
-}
 
-/// Running live scrape of one [`Exporter`]. Drop = stop + release the exporter's
-/// hold on its target (a departed reader must not keep dialing)
-pub struct Poller {
-    rx: watch::Receiver<Sample>,
-    task: tokio::task::JoinHandle<()>,
-    exporter: Arc<dyn Exporter>,
-}
+    pub fn latest(&self) -> Option<&Exposition> {
+        self.window.latest()
+    }
 
-impl std::fmt::Debug for Poller {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Poller").field("rows", &self.rows().len()).finish_non_exhaustive()
+    /// Rows evaluated at least once; never-evaluated rows omitted (`history` alike)
+    pub fn series(&self) -> Vec<Series> {
+        self.rows
+            .iter()
+            .zip(&self.trails)
+            .filter(|(_, trail)| !trail.is_empty())
+            .map(|(row, trail)| Series {
+                reading: Some(row.reading),
+                label: row.label.to_string(),
+                unit: row.unit(),
+                facet: Some(row.facet),
+                channel: row.channel,
+                points: trail.iter().copied().collect(),
+                total: None,
+                coverage: None,
+            })
+            .collect()
     }
 }
 
-impl Drop for Poller {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl Poller {
-    pub fn spawn(exporter: impl Exporter, period: Duration) -> Poller {
-        let exporter: Arc<dyn Exporter> = Arc::new(exporter);
-        let (tx, rx) = watch::channel(Sample::default());
-        let task = tokio::spawn(poll_loop(exporter.clone(), period, tx));
-        Poller { rx, task, exporter }
-    }
-
-    pub fn rows(&self) -> &'static [Row] {
-        self.exporter.rows()
-    }
-
-    /// See [`Exporter::component`]
-    pub fn component(&self) -> Option<String> {
-        self.exporter.component()
-    }
-
-    /// Next sample, always the newest (a lagging caller skips, never drains a backlog).
-    ///
-    /// - Cancel-safe, fit for a `select!` arm
-    /// - Pends forever once the poll task is gone (an instantly-resolving arm spins its loop)
-    pub async fn changed(&mut self) -> Sample {
-        match self.rx.changed().await {
-            Ok(()) => self.rx.borrow_and_update().clone(),
-            Err(_) => std::future::pending().await,
+/// `reading` across `first → last`, mirroring its PromQL in `query::promql_plot`.
+///
+/// - Counter regressed (restart) → `None`, never a negative rate
+/// - `Progress` never plotted (one number, `history` alike); `Level` read off `last` alone
+fn evaluate(
+    reading: Reading,
+    first: &Exposition,
+    last: &Exposition,
+    elapsed: Duration,
+) -> Option<f64> {
+    let secs = elapsed.as_secs_f64();
+    match reading {
+        Reading::Rate(f) => {
+            let (a, b) = (first.total(Counter(f))?, last.total(Counter(f))?);
+            (b >= a).then(|| (b - a) / secs)
         }
+        Reading::Slope(f) => {
+            let (a, b) = (first.level(Gauge(f))?, last.level(Gauge(f))?);
+            Some(((b - a) / secs).max(0.0))
+        }
+        Reading::Level(f) => last.level(Gauge(f)),
+        Reading::Progress(_) => None,
+        Reading::Mean(f) => Tally::mean_ms(first.tally(f)?, last.tally(f)?),
+        Reading::Quantile(f, phi) => windowed_quantile(&first.buckets(f)?, &last.buckets(f)?, phi),
     }
 }
 
-async fn poll_loop(exporter: Arc<dyn Exporter>, period: Duration, tx: watch::Sender<Sample>) {
-    let http = match reqwest::Client::builder().timeout(LIVE_TIMEOUT).build() {
-        Ok(http) => http,
-        Err(e) => {
-            let _ = tx
-                .send(Sample { error: Some(format!("no HTTP client: {e}")), ..Sample::default() });
-            return;
-        }
-    };
-    let mut ticker = tokio::time::interval(period);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        ticker.tick().await;
-        let sample = match exporter.endpoint().await {
-            Ok(endpoint) => match scrape(&http, &endpoint.url("http"), LIVE_TIMEOUT).await {
-                Ok(exposition) => Sample {
-                    at: Some(Instant::now()),
-                    exposition: Arc::new(exposition),
-                    error: None,
-                },
-                Err(e) => failed(&tx, e.to_string()),
-            },
-            Err(e) => failed(&tx, e.to_string()),
-        };
-        // `send` fails only with every reader gone = what this feeds is down
-        if tx.send(sample).is_err() {
-            return;
-        }
-    }
-}
-
-/// Failure keeps the last good exposition (one refused scrape must not blank a
-/// truthful reading), with `error` marking it stale
-fn failed(tx: &watch::Sender<Sample>, error: String) -> Sample {
-    Sample { error: Some(error), ..tx.borrow().clone() }
-}
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
-    use super::super::Reduce;
-    use super::super::tests::{EXPOSITION, exposition};
     use super::*;
+    use crate::metrics::{Dimension, Facet, counter, gauge, row};
 
-    #[test]
-    fn a_pod_without_a_metrics_port_is_not_a_target() {
-        let with: Pod = serde_json::from_value(json!({
-            "metadata": { "name": "zainod" },
-            "spec": { "containers": [{
-                "name": "zainod",
-                "ports": [{ "name": "grpc", "containerPort": 8137 },
-                          { "name": PORT_NAME, "containerPort": 9998 }],
-            }] },
-            "status": { "phase": "Running" },
-        }))
-        .expect("a pod");
-        let without: Pod = serde_json::from_value(json!({
-            "metadata": { "name": "wallet" },
-            "spec": { "containers": [{ "name": "wallet" }] },
-            "status": { "phase": "Running" },
-        }))
-        .expect("a pod");
+    const ROWS: &[Row] = &[
+        row("ops", counter("ops_total", Dimension::Count).rate(), Facet::Throughput),
+        row("blocks", gauge("height", Dimension::Count).slope(), Facet::Blocks),
+        row("height", gauge("height", Dimension::Count).level(), Facet::Progress),
+    ];
 
-        assert_eq!(metrics_port(&with), Some(9998));
-        assert_eq!(metrics_port(&without), None);
-        assert!(ready_to_scrape(&with));
+    fn scrape_of(ops: u64, height: u32) -> Exposition {
+        let mut e = Exposition::default();
+        e.absorb(&format!(
+            "# TYPE ops_total counter\nops_total {ops}\n# TYPE height gauge\nheight {height}\n"
+        ));
+        e
     }
 
-    /// Dialing an unstarted pod yields connection errors shown as a broken exporter
-    #[test]
-    fn a_pending_pod_is_not_scraped_yet() {
-        let pending: Pod = serde_json::from_value(json!({
-            "metadata": { "name": "zainod" },
-            "status": { "phase": "Pending" },
-        }))
-        .expect("a pod");
-        assert!(!ready_to_scrape(&pending));
+    fn fed(samples: &[(u64, u64, u32)]) -> Live {
+        let (origin, epoch) = (Instant::now(), UNIX_EPOCH + Duration::from_secs(1_000));
+        let mut live = Live::new(ROWS);
+        for &(secs, ops, height) in samples {
+            let offset = Duration::from_secs(secs);
+            live.push(origin + offset, epoch + offset, scrape_of(ops, height));
+        }
+        live
     }
 
-    /// Every cause a reader must distinguish, derived from the sample itself
-    /// (why no status enum, and why no consumer classifies a blank column)
-    #[test]
-    fn a_sample_states_why_it_has_no_values() {
-        let at = || Some(Instant::now());
-        let tip = |s: &Sample| {
-            s.exposition.reduce(crate::metrics::family("zaino_chain_tip_height"), Reduce::Max)
-        };
-
-        // never read → no target yet
-        let never = Sample::default();
-        assert_eq!(never.note(false).as_deref(), Some("no metrics-exposing pod yet"));
-        assert_eq!(tip(&never), None);
-
-        // unresolved → target lookup failed, nothing scraped
-        let unresolved = Sample { error: Some("no ready indexer pod".into()), ..Sample::default() };
-        assert!(
-            unresolved.note(false).is_some_and(|n| n.starts_with("resolving target")),
-            "{unresolved:?}"
-        );
-
-        // unreachable → scraped once, target now down
-        let unreachable =
-            Sample { at: at(), error: Some("connection refused".into()), ..Sample::default() };
-        assert!(
-            unreachable.note(false).is_some_and(|n| n.contains("connection refused")),
-            "{unreachable:?}"
-        );
-
-        // silent → scraped fine, asked-for families absent
-        let silent = Sample {
-            at: at(),
-            exposition: Arc::new(exposition(&["# TYPE other gauge\nother 1\n"])),
-            error: None,
-        };
-        assert!(
-            silent.note(false).is_some_and(|n| n.contains("no series published yet")),
-            "{silent:?}"
-        );
-        assert_eq!(tip(&silent), None);
-
-        // published → no note
-        let sampled =
-            Sample { at: at(), exposition: Arc::new(exposition(&[EXPOSITION])), error: None };
-        assert_eq!(sampled.note(true), None);
-        assert_eq!(tip(&sampled), Some(304.0));
+    fn last(live: &Live, label: &str) -> Option<f64> {
+        live.series().iter().find(|s| s.label == label).and_then(Series::last)
     }
 
-    /// Failure after a good scrape keeps the numbers, adds the reason (blanking on
-    /// one refused connection loses a reading true a second ago)
     #[test]
-    fn a_failure_keeps_the_last_good_reading() {
-        let (tx, _rx) = watch::channel(Sample {
-            at: Some(Instant::now()),
-            exposition: Arc::new(exposition(&[EXPOSITION])),
-            error: None,
-        });
-        let after = failed(&tx, "connection refused".into());
-        assert_eq!(after.error.as_deref(), Some("connection refused"));
-        assert_eq!(
-            after.exposition.reduce(crate::metrics::family("zaino_chain_tip_height"), Reduce::Max),
-            Some(304.0)
-        );
+    fn one_scrape_plots_levels_but_no_rates() {
+        let live = fed(&[(0, 10, 100)]);
+        assert_eq!(last(&live, "height"), Some(100.0));
+        assert_eq!(last(&live, "ops"), None);
+        assert_eq!(last(&live, "blocks"), None);
+    }
+
+    #[test]
+    fn rates_and_slopes_span_the_window_endpoints() {
+        let live = fed(&[(0, 0, 0), (1, 100, 10), (2, 400, 40)]);
+        assert_eq!(last(&live, "ops"), Some(200.0));
+        assert_eq!(last(&live, "blocks"), Some(20.0));
+        assert_eq!(last(&live, "height"), Some(40.0));
+    }
+
+    /// Height gauge + slope row share one family → each resolves by its reading
+    #[test]
+    fn a_level_and_a_slope_on_one_gauge_stay_distinct() {
+        let live = fed(&[(0, 0, 1_000), (1, 0, 1_500)]);
+        assert_eq!(last(&live, "blocks"), Some(500.0));
+        assert_eq!(last(&live, "height"), Some(1_500.0));
+    }
+
+    #[test]
+    fn a_restarted_counter_plots_no_rate() {
+        let live = fed(&[(0, 9_000, 0), (1, 5, 1)]);
+        assert_eq!(last(&live, "ops"), None);
     }
 }

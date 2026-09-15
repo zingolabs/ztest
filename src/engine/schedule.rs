@@ -1,8 +1,9 @@
 //! Capacity-bounded run loop. 2D [`Scheduler`] = sole admission authority.
 //!
-//! - Submitted in priority order; what fits the live ceiling is granted, the rest queues
-//! - Child exits → lease released → freed capacity backfills (no artificial thread cap)
-//! - Spawn injected (admit/backfill/retry/fail-fast unit-tested with a fake: no procs, no cluster)
+//! - Submitted in stable test order = the queue's arrival order; what fits the live ceiling is
+//!   granted, the rest queues
+//! - Child exits → lease released → queue popped for whatever now fits (no artificial thread cap)
+//! - Spawn injected (admit/queue/retry/fail-fast unit-tested with a fake: no procs, no cluster)
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -50,7 +51,6 @@ pub struct LoopConfig {
 pub struct PanelFrame {
     pub snapshot: LiveSnapshot,
     pub progress: RunProgress,
-    pub free: Resources,
     pub running: Vec<RunningView>,
 }
 
@@ -92,11 +92,11 @@ where
 
     let mut sched = Scheduler::new(ceiling);
     let mut inflight: HashMap<SlotId, Running> = HashMap::new();
-    // Queued in the scheduler, awaiting a grant. Attempt rides along so a backfilled retry
+    // Queued in the scheduler, awaiting a grant. Attempt rides along so a queued retry
     // resumes at it (not reset to 1).
     let mut parked: HashMap<(String, String), (WorkItem, u32)> = HashMap::new();
     // Granted + lease held, not yet spawned (at `max_inflight`); ordered so a serialized
-    // (`--no-capture`) run keeps priority/submission order.
+    // (`--no-capture`) run keeps submission order.
     let mut ready: VecDeque<(SlotId, WorkItem, u32)> = VecDeque::new();
     let cap = cfg.max_inflight.unwrap_or(usize::MAX);
     let mut futs: FuturesUnordered<BoxedRun> = FuturesUnordered::new();
@@ -151,7 +151,7 @@ where
     // Cloned so the loop awaits changes while `cfg` keeps its handle; `None` → ceiling arm idles
     let mut cap_rx = cfg.cap_rx.clone();
 
-    // Initial admission sweep (priority order already baked into `items`).
+    // Initial admission sweep, in submission order.
     for item in items {
         // Skipped pre-submission (else admitted, spawned, then dead at `TestEnv::build()` with a
         // confusing "resource absent")
@@ -258,7 +258,7 @@ where
                     }
                 }
 
-                // Backfill the freed capacity, unless fail-fast tripped or the run was
+                // Admit into the freed capacity, unless fail-fast tripped or the run was
                 // cancelled (then drain inflight, admit nothing). Gated on the authoritative
                 // watch flag, not local `cancelled`: a terminated outcome processed in the
                 // poll that cancel fired must not sneak a parked test in first.
@@ -272,9 +272,9 @@ where
                 }
                 publish_demand!();
 
-                render_tick(reporter, &inflight, &sched, ceiling, stats, start, &mut on_tick);
+                render_tick(reporter, &inflight, &sched, stats, start, &mut on_tick);
             }
-            // Reservation moved this run's live ceiling: a grow backfills parked tests into
+            // Reservation moved this run's live ceiling: a grow admits parked tests into
             // the new headroom, a shrink stops admission without preempting running leases
             // (`Scheduler::reconcile`). Idles forever with no reservation.
             new_ceiling = next_ceiling(&mut cap_rx) => {
@@ -288,7 +288,7 @@ where
                     pump!();
                 }
                 publish_demand!();
-                render_tick(reporter, &inflight, &sched, ceiling, stats, start, &mut on_tick);
+                render_tick(reporter, &inflight, &sched, stats, start, &mut on_tick);
             }
             _ = tick.tick() => {
                 // Soft SLOW detection and spinner refresh.
@@ -301,7 +301,7 @@ where
                     }
                     emit_slows(reporter, &inflight, after);
                 }
-                render_tick(reporter, &inflight, &sched, ceiling, stats, start, &mut on_tick);
+                render_tick(reporter, &inflight, &sched, stats, start, &mut on_tick);
             }
         }
     }
@@ -354,17 +354,15 @@ fn emit_slows(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_tick(
     reporter: &mut dyn RunReporter,
     inflight: &HashMap<SlotId, Running>,
     sched: &Scheduler,
-    _ceiling: Resources,
     stats: RunStats,
     start: Instant,
     on_tick: &mut impl FnMut(&mut dyn RunReporter, &PanelFrame),
 ) {
-    let snapshot = live_snapshot(inflight.values().map(|r| &r.item), sched.committed());
+    let snapshot = live_snapshot(inflight.len(), stats, sched.committed(), sched.ceiling());
     // Longest-running first, ordered by fixed `started` + identity tiebreak, NOT by a
     // re-snapshotted `elapsed`: HashMap iteration order varies and per-frame `elapsed()` is
     // measured at slightly different instants, so near-equal tests swapped rows (the flicker)
@@ -384,12 +382,7 @@ fn render_tick(
             slow: r.slow_emitted,
         })
         .collect();
-    let frame = PanelFrame {
-        snapshot,
-        progress: run_progress(stats, start.elapsed()),
-        free: sched.free(),
-        running,
-    };
+    let frame = PanelFrame { snapshot, progress: run_progress(stats, start.elapsed()), running };
     on_tick(reporter, &frame);
 }
 
@@ -414,7 +407,6 @@ fn progress_of(
         .map(|r| RunningTest {
             name: r.item.test_name.clone(),
             footprint: r.item.footprint,
-            tier: r.item.class,
             started_at: origin_wall
                 + chrono::Duration::from_std(r.started.saturating_duration_since(origin))
                     .unwrap_or_default(),
@@ -437,7 +429,6 @@ fn to_request(item: &WorkItem, sa: &str) -> Request {
         test_name: item.test_name.clone(),
         sa: sa.to_string(),
         footprint: item.footprint,
-        priority: item.priority,
     }
 }
 
@@ -486,7 +477,6 @@ mod tests {
             cwd: PathBuf::from("/t"),
             class,
             footprint: p.footprint,
-            priority: p.priority,
             hard_cap: p.hard_cap,
             retries,
             deps: Vec::new(),
@@ -520,8 +510,10 @@ mod tests {
     }
 
     // Fits exactly two Integration tests (3000m each)
+    /// Derived from the preset (a hardcoded amount drifted below two when the preset grew)
     fn ceiling_two_integration() -> Resources {
-        Resources::new(6_000, 6 * crate::qos::GIB, 0, 0)
+        let one = QosClass::Integration.profile().footprint;
+        one.saturating_add(&one)
     }
 
     #[tokio::test]
@@ -622,16 +614,16 @@ mod tests {
 
     #[tokio::test]
     async fn fail_fast_off_runs_whole_suite_despite_failures() {
-        // Regression: 122 selected, only the first ~9-wide wave ran (first failure tripped
-        // fail-fast, killing backfill). Fail-fast OFF = default → a failing test still
-        // releases its lease and backfills.
+        // Regression: 122 selected, only the first ~9 ran (first failure tripped fail-fast,
+        // stopping admission). Fail-fast OFF = default → a failing test still releases its
+        // lease and the queue moves on.
         let n = 12;
         let items: Vec<_> =
             (0..n).map(|i| item(&format!("t{i}"), QosClass::Integration, 0)).collect();
         let mut rep = NullReporter;
         let stats = run_loop(
             items,
-            ceiling_two_integration(), // only 2 in flight at a time → 6 backfill waves
+            ceiling_two_integration(), // only 2 in flight at a time
             cfg(),                     // fail_fast: false
             &mut rep,
             |_item, _attempt| async { fail() },
@@ -660,7 +652,7 @@ mod tests {
             |_, _| {},
         )
         .await;
-        // Inflight drains, no backfill → far fewer than 6 reach a verdict
+        // Inflight drains, nothing more admitted → far fewer than 6 reach a verdict
         assert!(stats.failed >= 1);
         assert!(stats.finished() < 6, "finished={}", stats.finished());
     }
@@ -705,8 +697,8 @@ mod tests {
         assert_eq!(stats.passed, 0);
     }
 
-    /// Spawn order (recorded synchronously = admission order), per-tier live/peak concurrency,
-    /// and whether Σ(live footprints) ever exceeded the ceiling
+    /// Spawn order (recorded synchronously = admission order), live/peak concurrency per size
+    /// preset, and whether Σ(live footprints) ever exceeded the ceiling
     #[derive(Default)]
     struct ConcRec {
         order: Vec<QosClass>,
@@ -761,100 +753,33 @@ mod tests {
         }
     }
 
-    /// Heavy (Testnet) tier runs first, capacity-capped; as it drains, light (Integration)
-    /// concurrency ramps up — live: "2-3 testnet at a time, then 6-10 integration"
+    /// Queue popped in arrival order, skipping what does not fit: `int1` starts beside `int0`
+    /// while `net0`, earlier but too big for what is left, waits for `int0` to finish
     #[tokio::test]
-    async fn concurrency_ramps_up_as_heavy_tier_drains() {
-        let t = QosClass::Testnet.profile().footprint;
-        let i = QosClass::Integration.profile().footprint;
-        // Room for 3 Testnet + 1 Integration backfilling the leftover
-        let ceiling =
-            Resources::new(3 * t.cpu_milli + i.cpu_milli, 3 * t.mem_bytes + i.mem_bytes, 0, 0);
-
-        // Heavy-first, as `build_work_list` orders them in production
-        let mut items = vec![
-            item("net0", QosClass::Testnet, 0),
-            item("net1", QosClass::Testnet, 0),
-            item("net2", QosClass::Testnet, 0),
-        ];
-        items.extend((0..12).map(|n| item(&format!("int{n}"), QosClass::Integration, 0)));
-
-        let rec = Arc::new(Mutex::new(ConcRec::default()));
-        let dwell = Duration::from_millis(25); // overlap → true concurrency observed
-        let mut rep = NullReporter;
-        let stats = run_loop(
-            items,
-            ceiling,
-            cfg(),
-            &mut rep,
-            recording_spawn(rec.clone(), ceiling, dwell),
-            |_, _| {},
-        )
-        .await;
-
-        assert_eq!(stats.passed, 15);
-        let g = rec.lock().unwrap();
-        assert!(!g.overcommit, "running footprint must never exceed the ceiling");
-        // Testnet first, ≤3 at once (ignoring priority would pack 13 Integration in)
-        assert_eq!(
-            g.order.iter().take_while(|c| **c == QosClass::Testnet).count(),
-            3,
-            "heavy tier should start first; order={:?}",
-            g.order
-        );
-        assert_eq!(g.peak(QosClass::Testnet), 3);
-        // Light tier ramps far past the heavy cap = dynamic scaling
-        let int_peak = g.peak(QosClass::Integration);
-        assert!(
-            int_peak >= 6,
-            "integration concurrency should ramp up after heavy drains; peak={int_peak}"
-        );
-    }
-
-    /// One-Sync ceiling → everything else queues, backfilled strictly highest-priority first.
-    /// Lower tiers submitted *earlier* than Testnet (only priority can order the starts)
-    #[tokio::test]
-    async fn higher_tiers_backfill_before_lower_even_when_queued_earlier() {
-        let ceiling = item("probe", QosClass::Sync, 0).footprint; // one Sync at a time
+    async fn a_later_test_that_fits_starts_ahead_of_an_earlier_one_that_does_not() {
+        let ceiling = QosClass::Testnet.profile().footprint; // one testnet, or two integration
         let items = vec![
-            item("sync", QosClass::Sync, 0), // grabs the only initial slot
-            // Submitted lowest-priority-first on purpose:
-            item("wal0", QosClass::Wallet, 0),
-            item("wal1", QosClass::Wallet, 0),
             item("int0", QosClass::Integration, 0),
-            item("int1", QosClass::Integration, 0),
             item("net0", QosClass::Testnet, 0),
-            item("net1", QosClass::Testnet, 0),
+            item("int1", QosClass::Integration, 0),
         ];
         let rec = Arc::new(Mutex::new(ConcRec::default()));
-        let dwell = Duration::from_millis(10);
         let mut rep = NullReporter;
         let stats = run_loop(
             items,
             ceiling,
             cfg(),
             &mut rep,
-            recording_spawn(rec.clone(), ceiling, dwell),
+            recording_spawn(rec.clone(), ceiling, Duration::from_millis(10)),
             |_, _| {},
         )
         .await;
 
-        assert_eq!(stats.passed, 7);
+        assert_eq!(stats.passed, 3);
         let g = rec.lock().unwrap();
         assert!(!g.overcommit, "running footprint must never exceed the ceiling");
-        let first = |c: QosClass| {
-            g.order
-                .iter()
-                .position(|x| *x == c)
-                .unwrap_or_else(|| panic!("tier {c:?} never ran; order={:?}", g.order))
-        };
-        assert!(
-            first(QosClass::Sync) < first(QosClass::Testnet)
-                && first(QosClass::Testnet) < first(QosClass::Wallet)
-                && first(QosClass::Wallet) < first(QosClass::Integration),
-            "tiers must start in descending-priority order; order={:?}",
-            g.order
-        );
+        assert_eq!(g.order, [QosClass::Integration, QosClass::Integration, QosClass::Testnet]);
+        assert_eq!(g.peak(QosClass::Integration), 2);
     }
 
     /// One-Integration ceiling → the retry queues behind `hog`, taking the re-park path; the
@@ -1155,7 +1080,7 @@ mod tests {
 
         let mut rep = RecordingReporter::default();
         let mut fired = false;
-        let stats = run_loop(
+        let run = run_loop(
             items,
             ceiling_two_integration(),
             c,
@@ -1180,8 +1105,11 @@ mod tests {
                     src.cancel();
                 }
             },
-        )
-        .await;
+        );
+        // Bounded: a cancel that never fires must fail here, not hang the suite
+        let stats = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("run loop must end once cancelled");
 
         assert_eq!(stats.terminated, 2, "in-flight tests must be reported");
         assert_eq!(stats.failed, 0, "a kill is not a failure");

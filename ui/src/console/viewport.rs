@@ -248,9 +248,9 @@ mod tests {
     const PREFLIGHT: &str = "\
 ────────────
    Preflight kind-zaino-local · 3 ready · 12/16 slots
-    capacity [██████░░░░░░] 50% · 6/12c · 28/48Gi free
+    capacity 6 / 12 cores · 20 / 48 GiB
    Inventory compiling test binaries… · 34s
-  Scheduling 8 tests · 1 waves";
+  Scheduling 8 tests · 24c / 40 GiB reserved";
 
     const TRANSFERS: &str = "
 dev-zainod · building

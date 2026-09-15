@@ -250,7 +250,6 @@ mod tests {
             cwd: PathBuf::from("/"),
             class: QosClass::Integration,
             footprint: p.footprint,
-            priority: p.priority,
             hard_cap: p.hard_cap,
             retries: 0,
             deps: Vec::new(),

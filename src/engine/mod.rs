@@ -48,7 +48,6 @@ use crate::inventory::QosEntry;
 use crate::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
 use crate::pipeline::SelectedBinary;
 use crate::qos::Resources;
-use crate::qos::schedule::QosPlan;
 
 /// Live-terminal seam: engine ships state, the presentation layer paints it.
 ///
@@ -59,7 +58,7 @@ pub trait RunView: Send + Sync {
     fn live_rows(&self) -> usize;
     fn flush_live(&self);
     fn scrollback(&self, text: String);
-    fn tick(&self, frame: &PanelFrame, plan: &QosPlan, live: String);
+    fn tick(&self, frame: &PanelFrame, live: String);
 }
 
 /// Run-behavior options, parsed from `ztest run` flags
@@ -104,7 +103,6 @@ pub fn run(
     work_rt: &tokio::runtime::Runtime,
     input: EngineInput<'_>,
     view: Option<&dyn RunView>,
-    qos_plan: Option<QosPlan>,
 ) -> ExitCode {
     let mut items = plan::build_work_list(
         input.selected_binaries,
@@ -197,7 +195,7 @@ pub fn run(
     // terminal it takes the plain inherited path
     let stats = match view {
         Some(v) if output.captures() => {
-            run_tty(work_rt, items, ceiling, cfg, executor, v, qos_plan, output, recorder)
+            run_tty(work_rt, items, ceiling, cfg, executor, v, output, recorder)
         }
         _ => run_inherited(work_rt, items, ceiling, cfg, executor, output, recorder),
     };
@@ -233,7 +231,6 @@ fn run_tty(
     cfg: LoopConfig,
     executor: std::sync::Arc<dyn local_runner::Executor>,
     view: &dyn RunView,
-    qos_plan: Option<QosPlan>,
     output: crate::engine::output::OutputConfig,
     recorder: Option<record::RunRecorder>,
 ) -> std::io::Result<events::RunStats> {
@@ -241,7 +238,6 @@ fn run_tty(
     let styled =
         StyledReporter::new(color, supports_unicode::on(supports_unicode::Stream::Stdout), output);
     let mut reporter = wrap_reporter(styled, recorder);
-    let plan = qos_plan.unwrap_or_else(empty_plan);
     let live_rows = view.live_rows();
 
     // Commit the preflight/image grid before the live region switches from the child PTY to
@@ -255,7 +251,7 @@ fn run_tty(
         }
         // `avt` grid idle during the run → drive the live region explicitly via the scene
         let live = reporter::render_running(&frame.running, live_rows, color).join("\n");
-        view.tick(frame, &plan, live);
+        view.tick(frame, live);
     });
 
     // Leftover scroll-lines, incl. the final summary (emitted after the last tick)
@@ -402,18 +398,6 @@ fn select_executor(
         )
     };
     Ok(std::sync::Arc::new(pod_runner::PodExecutor::new(client, cfg)))
-}
-
-/// Plan for runs with no `#[qos]` declarations (panel shows running/progress, no per-tier lines)
-fn empty_plan() -> QosPlan {
-    QosPlan {
-        tiers: Vec::new(),
-        total: Resources::ZERO,
-        free: None,
-        waves: 0,
-        peak: Resources::ZERO,
-        unschedulable: Vec::new(),
-    }
 }
 
 fn flush_stdout(rep: &mut dyn events::RunReporter) {

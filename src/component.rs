@@ -100,10 +100,22 @@ pub struct ComponentOpts {
 /// public chain and a pre-mined regtest cache alike — which, and so which network
 /// boots, comes from the [`ChainSnapshot`](crate::ChainSnapshot), never the variant (so a
 /// testnet archive booted as regtest is unrepresentable)
+///
+/// - `Follow` = boots off the snapshot, then joins its network (tip moves past the pin)
 #[derive(Debug, Clone)]
 pub enum RestoreSource {
     Archive(crate::ChainSnapshot),
+    Follow(crate::ChainSnapshot),
     Blank,
+}
+
+impl RestoreSource {
+    pub fn snapshot(&self) -> Option<crate::ChainSnapshot> {
+        match self {
+            RestoreSource::Archive(s) | RestoreSource::Follow(s) => Some(*s),
+            RestoreSource::Blank => None,
+        }
+    }
 }
 
 /// One side of a shared zebra-state DB (validator + colocated zaino). Mount path

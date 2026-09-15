@@ -205,7 +205,7 @@ fn demo_state() -> BannerState {
             slots_configured: 8,
             nodes_ready: 4,
             nodes_cordoned: 0,
-            capacity: ztest::qos::ClusterCapacity::default(),
+            capacity: None,
         },
         build: BuildState::Compiling { started_at: Instant::now(), phase: None },
         archives: Vec::new(),

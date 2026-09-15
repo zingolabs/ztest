@@ -91,8 +91,7 @@ to disagree about which run a lease belongs to.
 - **Serde, not a hand-rolled codec** — the previous encoder/decoder pair was 86 lines edited in lockstep
   per field, with a back-compat arm for a field the encoder had always written
 - **Footprints are sent, never derived from a tier**: `.resources()` overrides via
-  `QosClass::profile_with`, so tier + table lookup would display a figure the scheduler never reserved.
-  `tier` ships *beside* `footprint` (the left panel tallies by tier)
+  `QosClass::profile_with`, so tier + table lookup would display a figure the scheduler never reserved
 - `io_bps`/`io_iops` omitted when zero = every beacon ever written (inert pending calibration); carrying
   them doubles every serialized footprint for two zeroes
 - `running` truncates at 8, display shows 3; `running_count`/`running_footprint` stay exact so the

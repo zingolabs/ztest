@@ -47,9 +47,8 @@ struct PlannedTest {
     cwd: PathBuf,           // libtest cwd contract
     binary_id: String,      // engine sets NEXTEST_BINARY_ID itself
     test_name: String,      // engine sets NEXTEST_TEST_NAME itself
-    tier: QosClass,         // from the dump; None ⇒ default/basic
+    tier: QosClass,         // from the dump; None ⇒ default (integration)
     footprint: Resources,   // tier.profile().footprint — full 2-D
-    priority: u8,
     hard_cap: Duration,
 }
 ```
@@ -64,7 +63,7 @@ struct PlannedTest {
    `NEXTEST_EXECUTION_MODE=process-per-test`, dylib path, cwd → `<bin> --exact <name> --nocapture`.
    Hard-cap timer arms at spawn, which is also admission (tests spawn only after a grant)
 1. On exit the **exit code is the verdict** (0 = pass), output captured verbatim → `TestFinished`;
-   `Scheduler::release(lease)` backfills grants
+   `Scheduler::release(lease)` admits every queued test that now fits, in arrival order
 1. Free capacity reconciled from the k8s `Allocator`/probe (`Scheduler::reconcile`); the loop owns cadence
 1. Bounded exec workers, but the `Scheduler` — not a fixed pool — decides how many run, by 2-D capacity
 1. Retries + `--no-fail-fast` handled here

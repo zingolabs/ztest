@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
 use crate::cancel::Cancel;
+use crate::metrics::{Family, Row};
 
 use super::chainwork::ChainWork;
 use super::probe::{
-    Cadence, Class, ProbeBuilder, ProbeSpec, ProbeStatus, Severity, SyncCtx, Verdict, Violation,
+    Cadence, Class, ProbeBuilder, ProbeSpec, Severity, SyncCtx, Verdict, Violation,
 };
 use super::snapshot::{History, Snapshot, SnapshotBuilder};
 use super::subject::{ProgressView, SyncSubject};
@@ -79,12 +80,21 @@ pub struct SyncOutcome {
     pub unpublished: Vec<String>,
 }
 
-/// One end of the span a run covered ([`Segment`] = last mark - first)
+/// One end of the span a run covered ([`Segment`] = last mark - first).
+///
+/// `at` orders marks; `wall` places them in the TSDB — the report window's only source
 #[derive(Clone, Copy)]
 struct Mark {
     height: u32,
     work: Work,
     at: Instant,
+    wall: std::time::SystemTime,
+}
+
+impl Mark {
+    fn new(height: u32, work: Work, at: Instant) -> Mark {
+        Mark { height, work, at, wall: std::time::SystemTime::now() }
+    }
 }
 
 impl SyncOutcome {
@@ -116,15 +126,12 @@ impl From<crate::RpcError> for SyncOutcome {
     }
 }
 
-/// Sink for live progress + probe events.
+/// Sink for what a run produces as it goes. `origin` = the segment's first reading on the
+/// wall clock, every tick (a sink never has to remember it)
 pub trait SyncReporter: Send {
-    fn on_start(&mut self, _observed: &super::Observed) {}
-    fn on_tick(&mut self, _snap: &Snapshot) {}
+    fn on_tick(&mut self, _snap: &Snapshot, _origin: std::time::SystemTime) {}
     /// Probe evaluated to a non-`Satisfied` verdict worth surfacing
     fn on_probe(&mut self, _name: &str, _verdict: &Verdict) {}
-    /// Standing board: every probe's live state once per tick, vs
-    /// [`on_probe`](Self::on_probe)'s edge events
-    fn on_probes(&mut self, _snap: &Snapshot, _board: &[ProbeStatus]) {}
     fn on_finish(&mut self, _outcome: &SyncOutcome) {}
 }
 
@@ -161,6 +168,13 @@ enum Flow {
     Abort(String),
 }
 
+/// How the wait for a subject's gate families ended
+enum Readiness {
+    Ready,
+    Cancelled,
+    Late(String),
+}
+
 impl std::fmt::Debug for SyncEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncEngine")
@@ -184,6 +198,7 @@ pub struct SyncEngine {
     stop_height: Option<u32>,
     reporter: Box<dyn SyncReporter>,
     required_work: OpSet,
+    ready: Vec<Family>,
 }
 
 impl SyncEngine {
@@ -201,7 +216,19 @@ impl SyncEngine {
             stop_height: None,
             reporter: Box::new(NullReporter),
             required_work: OpSet::NONE,
+            ready: Vec::new(),
         }
+    }
+
+    /// Profile's override of one family's ready window (matched by name + selector)
+    pub fn with_ready(mut self, family: Family) -> Self {
+        self.ready.retain(|f| !f.is(family));
+        self.ready.push(family);
+        self
+    }
+
+    fn ready_for(&self, family: Family) -> Duration {
+        self.ready.iter().find(|f| f.is(family)).map_or(family.ready, |f| f.ready)
     }
 
     pub fn with_ctx(mut self, ctx: SyncCtx) -> Self {
@@ -291,40 +318,30 @@ impl SyncEngine {
     }
 
     pub async fn run(mut self) -> SyncOutcome {
-        let observed = self.subject.observes();
-        self.reporter.on_start(&observed);
-
         if let Err(e) = self.subject.launch().await {
-            return self.finish(
-                SyncVerdict::Errored,
-                Vec::new(),
-                Vec::new(),
-                Some(format!("launch: {e}")),
-                0,
-                0,
-                None,
-                None,
-                Vec::new(),
-            );
+            return self.end_before_start(SyncVerdict::Errored, Some(format!("launch: {e}")));
+        }
+        // Every ready window runs from here
+        let launched = Instant::now();
+        match self.await_ready(launched).await {
+            Readiness::Ready => {}
+            Readiness::Cancelled => {
+                let _ = self.subject.stop().await;
+                return self.end_before_start(SyncVerdict::Cancelled, None);
+            }
+            Readiness::Late(e) => {
+                let _ = self.subject.stop().await;
+                return self.end_before_start(SyncVerdict::Errored, Some(e));
+            }
         }
 
         if let Err(e) = self.check_required_work().await {
             let _ = self.subject.stop().await;
-            return self.finish(
-                SyncVerdict::Errored,
-                Vec::new(),
-                Vec::new(),
-                Some(e.to_string()),
-                0,
-                0,
-                None,
-                None,
-                Vec::new(),
-            );
+            return self.end_before_start(SyncVerdict::Errored, Some(e.to_string()));
         }
 
-        // Once: a renamed family is a property of the build, not something appearing mid-run
-        let unpublished = self.check_vocabulary().await;
+        let mut pending: Vec<Row> = self.subject.rows().to_vec();
+        let mut unpublished: Vec<String> = Vec::new();
 
         let started = Instant::now();
         let deadline = self.timeout.map(|t| started + t);
@@ -367,6 +384,7 @@ impl SyncEngine {
                 verdict = SyncVerdict::TimedOut;
                 break;
             }
+            self.settle_rows(&mut pending, &mut unpublished, launched).await;
 
             // Snapshot-then-evaluate. A progress-read error holds prior state and retries next
             // tick (the reservation loop's pattern); only a *probe* error aborts.
@@ -391,11 +409,11 @@ impl SyncEngine {
             };
             last_work = self.read_work(&mut chain_work, progress.as_ref(), last_work).await;
             let snap = Arc::new(builder.build(progress.as_ref(), now, last_work, None));
-            let mark = Mark { height: snap.height(), work: last_work, at: now };
-            origin.get_or_insert(mark);
+            let mark = Mark::new(snap.height(), last_work, now);
+            let first = *origin.get_or_insert(mark);
             head = Some(mark);
             history.push(snap.clone());
-            self.reporter.on_tick(&snap);
+            self.reporter.on_tick(&snap, first.wall);
 
             match self.eval_tick(&snap, now, &mut violations).await {
                 Flow::Continue => {}
@@ -412,12 +430,6 @@ impl SyncEngine {
                 }
             }
 
-            // Built before the reporter call → no borrow of `self.probes` while
-            // `self.reporter` is borrowed mutably
-            let board: Vec<ProbeStatus> =
-                self.probes.iter().map(|p| p.status(now, self.tick)).collect();
-            self.reporter.on_probes(&snap, &board);
-
             // Declared stop height completes ahead of the subject's own predicate (a segment
             // must end where it said it would, whether or not the chain has more)
             let reached_stop = self.stop_height.is_some_and(|h| snap.height() >= h);
@@ -429,7 +441,7 @@ impl SyncEngine {
                     let work = self.read_work(&mut chain_work, p.as_ref(), last_work).await;
                     let at = Instant::now();
                     let final_snap = Arc::new(builder.build(p.as_ref(), at, work, None));
-                    head = Some(Mark { height: final_snap.height(), work, at });
+                    head = Some(Mark::new(final_snap.height(), work, at));
                     if let Some(msg) = self.eval_at_completion(&final_snap, &mut violations).await {
                         error = Some(msg);
                     }
@@ -458,6 +470,7 @@ impl SyncEngine {
                 to: head.height,
                 work: head.work.delta(&origin.work),
                 elapsed_ms: head.at.saturating_duration_since(origin.at).as_millis() as u64,
+                started_ms: super::detached::epoch_millis(origin.wall),
             },
         );
         let target = history.latest().and_then(|s| s.target());
@@ -645,18 +658,87 @@ impl SyncEngine {
         .into())
     }
 
-    /// Every declared row against one scrape of the component that should publish it.
+    /// Wait for every [`gates`](SyncSubject::gates) family, each within its ready window.
     ///
-    /// Advisory — probe-read ops are already gated by
-    /// [`check_required_work`](Self::check_required_work), and a cosmetic row must not block
-    async fn check_vocabulary(&mut self) -> Vec<String> {
-        let Some((rows, exposition)) = self.subject.declared().await else {
-            return Vec::new();
+    /// - Inside the window a missing family = still starting (zaino's frontier exists only
+    ///   after its first commit), never a read error
+    /// - Past it = the run errors naming the family and the window it missed
+    async fn await_ready(&self, launched: Instant) -> Readiness {
+        let gates = self.subject.gates();
+        if gates.is_empty() {
+            return Readiness::Ready;
+        }
+        let mut waits: u32 = 0;
+        loop {
+            let missing: Vec<Family> = match self.subject.exposition().await {
+                Some(e) => gates.iter().copied().filter(|&f| !e.publishes(f)).collect(),
+                None => gates.clone(),
+            };
+            if missing.is_empty() {
+                return Readiness::Ready;
+            }
+            let elapsed = launched.elapsed();
+            let late: Vec<String> = missing
+                .iter()
+                .filter(|&&f| elapsed >= self.ready_for(f))
+                .map(|&f| {
+                    format!("{f} (ready within {})", crate::fmt::format_span(self.ready_for(f)))
+                })
+                .collect();
+            if !late.is_empty() {
+                return Readiness::Late(format!(
+                    "not published within its ready window: {} — widen one with \
+                     `run.ready_within(family, d)`",
+                    late.join(", ")
+                ));
+            }
+            waits += 1;
+            if waits.is_power_of_two() {
+                let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+                tracing::info!(missing = ?names, "waiting for the subject to publish");
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Readiness::Cancelled,
+                _ = tokio::time::sleep(self.tick) => {}
+            }
+        }
+    }
+
+    /// Settle every row whose window has closed: resolved → dropped, absent → unpublished.
+    ///
+    /// - Checked at the deadline, not at launch (a histogram publishes after its first block)
+    /// - Advisory — display rows must not fail a run (gRPC latency never appears on a sync
+    ///   nobody queries)
+    /// - Scrapes only once a row is due; an unreachable exporter defers to the next tick
+    async fn settle_rows(
+        &self,
+        pending: &mut Vec<Row>,
+        unpublished: &mut Vec<String>,
+        launched: Instant,
+    ) {
+        let elapsed = launched.elapsed();
+        if !pending.iter().any(|row| elapsed >= self.ready_for(row.family())) {
+            return;
+        }
+        let Some(exposition) = self.subject.exposition().await else {
+            return;
         };
-        rows.iter()
-            .filter(|row| !exposition.resolves(row))
-            .map(|row| format!("{} <- {}", row.label, row.family))
-            .collect()
+        pending.retain(|row| {
+            if exposition.resolves(row) {
+                return false;
+            }
+            if elapsed < self.ready_for(row.family()) {
+                return true;
+            }
+            unpublished.push(format!("{} <- {}", row.label, row.family()));
+            false
+        });
+    }
+
+    /// Outcome of a run that never reached its first tick
+    fn end_before_start(&mut self, verdict: SyncVerdict, error: Option<String>) -> SyncOutcome {
+        self.finish(verdict, Vec::new(), Vec::new(), error, 0, 0, None, None, Vec::new())
     }
 
     fn unmeasured_work_error(&self, missing: &[Op], measured: OpSet) -> String {
@@ -728,7 +810,7 @@ mod tests {
 
     use super::super::probe::{Verdict, Violation};
     use super::super::snapshot::Snapshot;
-    use super::super::subject::{Phase, SyncSubject};
+    use super::super::subject::SyncSubject;
     use super::super::work::Op;
     use super::*;
 
@@ -750,9 +832,6 @@ mod tests {
         fn pct(&self) -> f32 {
             0.0
         }
-        fn phase(&self) -> Phase {
-            Phase::Syncing
-        }
         fn work(&self) -> Option<Work> {
             let mut w = Work::ZERO;
             for (op, n) in [(Op::SaplingOutput, self.sapling), (Op::OrchardAction, self.orchard)] {
@@ -771,6 +850,11 @@ mod tests {
         cursor: AtomicUsize,
         never_complete: bool,
         stopped: Arc<AtomicUsize>,
+        // `(family, n)` = exporter publishes `family` from its n-th scrape on
+        published: Option<(Family, usize)>,
+        gated: bool,
+        scrapes: AtomicUsize,
+        rows: &'static [Row],
     }
     impl FakeSubject {
         fn new(script: Vec<FakeProgress>) -> Self {
@@ -779,10 +863,24 @@ mod tests {
                 cursor: AtomicUsize::new(0),
                 never_complete: false,
                 stopped: Arc::new(AtomicUsize::new(0)),
+                published: None,
+                gated: false,
+                scrapes: AtomicUsize::new(0),
+                rows: &[],
             }
         }
         fn never_complete(mut self) -> Self {
             self.never_complete = true;
+            self
+        }
+        fn gated_on(mut self, family: Family, from_scrape: usize) -> Self {
+            self.published = Some((family, from_scrape));
+            self.gated = true;
+            self
+        }
+        fn publishing(mut self, family: Family, from_scrape: usize, rows: &'static [Row]) -> Self {
+            self.published = Some((family, from_scrape));
+            self.rows = rows;
             self
         }
     }
@@ -803,9 +901,28 @@ mod tests {
             self.stopped.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn work_source(&self, op: Op) -> Option<crate::metrics::Family> {
+        fn rows(&self) -> &'static [Row] {
+            self.rows
+        }
+        async fn exposition(&self) -> Option<crate::metrics::Exposition> {
+            let n = self.scrapes.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut e = crate::metrics::Exposition::default();
+            if let Some((family, from)) = self.published
+                && n >= from
+            {
+                e.absorb(&format!("# TYPE {0} gauge\n{0} 1\n", family.name));
+            }
+            Some(e)
+        }
+        fn gates(&self) -> Vec<Family> {
+            self.published.filter(|_| self.gated).map(|(f, _)| f).into_iter().collect()
+        }
+        fn work_source(&self, op: Op) -> Option<crate::metrics::Counter> {
             match op {
-                Op::SaplingOutput => Some(crate::metrics::family("fake_sapling_outputs_total")),
+                Op::SaplingOutput => Some(crate::metrics::counter(
+                    "fake_sapling_outputs_total",
+                    crate::metrics::Dimension::Count,
+                )),
                 _ => None,
             }
         }
@@ -860,6 +977,58 @@ mod tests {
             .requires_work(OpSet::of(&[Op::SaplingOutput]));
 
         assert_eq!(run.run().await.verdict, SyncVerdict::Passed);
+    }
+
+    const LATE: crate::metrics::Gauge =
+        crate::metrics::gauge("fake_committed_height", crate::metrics::Dimension::Count);
+    const NEVER: crate::metrics::Gauge =
+        crate::metrics::gauge("fake_never_height", crate::metrics::Dimension::Count);
+
+    /// A family still inside its window = the subject starting, not a failed read
+    #[tokio::test(start_paused = true)]
+    async fn the_run_waits_for_a_gate_family_inside_its_window() {
+        let subject = FakeSubject::new(vec![p(1, 2), p(2, 2)]).gated_on(LATE.family(), 5);
+        assert_eq!(fast_runner(subject).run().await.verdict, SyncVerdict::Passed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_family_missing_past_its_window_errors_by_name() {
+        let late = LATE.ready_within(Duration::from_millis(30)).family();
+        let subject = FakeSubject::new(vec![p(1, 2)]).gated_on(late, 100);
+        let out = fast_runner(subject).run().await;
+        assert_eq!(out.verdict, SyncVerdict::Errored);
+        let error = out.error.expect("a late gate reports why");
+        assert!(error.contains("fake_committed_height"), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_profile_override_widens_the_catalogues_window() {
+        let late = LATE.ready_within(Duration::from_millis(30)).family();
+        let subject = FakeSubject::new(vec![p(1, 2), p(2, 2)]).gated_on(late, 10);
+        let run = fast_runner(subject).with_ready(Family { ready: Duration::from_secs(1), ..late });
+        assert_eq!(run.run().await.verdict, SyncVerdict::Passed);
+    }
+
+    /// Nothing judged at launch: present by its deadline → settled, absent at it → unpublished
+    #[tokio::test(start_paused = true)]
+    async fn a_row_is_judged_at_its_deadline_not_at_launch() {
+        static ROWS: [Row; 2] = [
+            crate::metrics::row(
+                "late",
+                LATE.ready_within(Duration::from_millis(20)).level(),
+                crate::metrics::Facet::Progress,
+            ),
+            crate::metrics::row(
+                "never",
+                NEVER.ready_within(Duration::from_millis(20)).level(),
+                crate::metrics::Facet::Progress,
+            ),
+        ];
+        let script = (1..=10).map(|h| p(h, 10)).collect();
+        let subject = FakeSubject::new(script).publishing(LATE.family(), 1, &ROWS);
+        let out = fast_runner(subject).run().await;
+        assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
+        assert_eq!(out.unpublished, ["never <- fake_never_height"]);
     }
 
     /// Declaring nothing must not start requiring everything

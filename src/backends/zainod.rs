@@ -21,13 +21,12 @@ use crate::component::ComponentBuilder;
 use crate::handles::HandleInner;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
 use crate::handles::validator::{BlockchainInfo, PeerInfo};
-use crate::metrics::{Exporter, Exposition, Facet, Family, Phi, Reduce, Row, Unit, row};
+use crate::metrics::{Counter, Exporter, Exposition, Facet, Phi, Row, row};
 use crate::protocol::Endpoint;
 use crate::protocol::client::JsonRpcClient;
 use crate::protocol::zcash_rpc::ZcashRpc;
-use crate::sync::{
-    Cost, Heights, Observation, Observe, Op, Phase, ProgressView, SyncSubject, Work,
-};
+use crate::sync::Channel as Pool;
+use crate::sync::{Cost, Heights, Observation, Observe, Op, ProgressView, SyncSubject, Work};
 use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zainod";
@@ -143,20 +142,12 @@ impl IndexerConfig for ZainoBackend {
                 )
             }
             IndexerMode::Public => {
-                // Frozen archive, no writer to share with → a shared volume here = a
-                // regtest topology on the wrong mode (name it, don't fail on an empty mount)
-                if opts.shared_state.is_some() {
-                    return Err(EnvError::Config {
-                        reason: "shared state volume is regtest-only, not with .testnet/.mainnet"
-                            .to_string(),
-                    });
-                }
                 // Which chain comes off the archive, not the mode (which says only
                 // *public*). `.testnet(_)`/`.mainnet(_)` set both → an absent archive
                 // here = a config bug, not a topology a user can express
-                let archive = match opts.restore {
-                    Some(crate::component::RestoreSource::Archive(handle)) => handle,
-                    _ => {
+                let archive = match opts.restore.as_ref().and_then(|r| r.snapshot()) {
+                    Some(handle) => handle,
+                    None => {
                         return Err(EnvError::Config {
                             reason:
                                 "public-network zaino names no archive; use .testnet()/.mainnet()"
@@ -176,10 +167,17 @@ impl IndexerConfig for ZainoBackend {
                 // Only `State` opens the DB; `Fetch` sources the same chain over JSON-RPC.
                 // Archive is multi-GB → attaching it to a fetch pod buys a CoW clone and a
                 // volume attach per test for a mount nothing opens
-                if state {
-                    opts.mounts
-                        .push(crate::regtest::archive_mount(archive.artifact, ZAINO_ZEBRA_DB));
-                }
+                // - `ChainVolume` mounted (TEMPORARY, direct-only) → the following zebrad's live
+                //   DB; else a private clone frozen at the pin
+                let zebra_db_path = match (state, opts.shared_state.as_ref()) {
+                    (true, Some(shared)) => shared.mount_path.clone(),
+                    (true, None) => {
+                        opts.mounts
+                            .push(crate::regtest::archive_mount(archive.artifact, ZAINO_ZEBRA_DB));
+                        ZAINO_ZEBRA_DB.to_string()
+                    }
+                    (false, _) => ZAINO_ZEBRA_DB.to_string(),
+                };
                 let host = validator_host.unwrap_or(ZAINO_PUBLIC_VALIDATOR_HOST);
                 // `backend = 'direct'` (State) reads the CoW clone through zebra's
                 // `ReadStateService` and rejects its config without a syncer gRPC address;
@@ -194,7 +192,7 @@ impl IndexerConfig for ZainoBackend {
                     ZAINO_PUBLIC_JSONRPC_PORT,
                     host,
                     ZAINO_PUBLIC_VALIDATOR_RPC_PORT,
-                    ZAINO_ZEBRA_DB,
+                    &zebra_db_path,
                     ZAINO_DB,
                     validator_grpc.as_deref(),
                     opts.image.metrics_enabled().then(|| self.metrics_port()).flatten(),
@@ -657,102 +655,108 @@ impl IndexerBackend for ZainoIndexer {
 //   `LrzSyncSubject`, which owns a batch size, a reader conn and the scan task)
 
 /// Zaino's dotted `metric_names` after scrape (`metrics-exporter-prometheus` sanitizes to
-/// the Prometheus charset). Named once → [`ROWS`] and the [`SyncSubject`] impl can't drift
-mod family {
-    use crate::metrics::{Family, family};
+/// the Prometheus charset). Shape declared here, once → every reader inherits it, and an
+/// illegal reading is a compile error rather than a wrong number
+pub mod family {
+    use crate::metrics::{Counter, Dimension, Gauge, Hist, counter, gauge, hist};
 
     // Serving surface. Latency histogram's `_count` = request volume (no `requests_total`)
-    pub const GRPC_ERRORS: Family = family("zaino_grpc_errors_total");
-    pub const GRPC_LATENCY: Family = family("zaino_grpc_request_duration_seconds");
-    /// Count only — depth rides `zaino_sync_reorg_depth`, a histogram no [`Reduce`] reads yet
-    pub const REORG_TOTAL: Family = family("zaino_sync_reorg_total");
+    pub const GRPC_ERRORS: Counter = counter("zaino_grpc_errors_total", Dimension::Count);
+    pub const GRPC_LATENCY: Hist = hist("zaino_grpc_request_duration_seconds", Dimension::Seconds);
+    /// Count only — depth rides `zaino_sync_reorg_depth`, a histogram no row reads yet
+    pub const REORG_TOTAL: Counter = counter("zaino_sync_reorg_total", Dimension::Count);
 
-    /// Height the finalised index is **committed** to — written & fsynced, set per batch
-    pub const FINALIZED_HEIGHT: Family = family("zaino_sync_finalized_height");
-    /// Height built in memory ahead of the next commit (advances per block)
-    pub const FETCHED_HEIGHT: Family = family("zaino_sync_fetched_height");
+    /// Height fetched + assembled, advancing per block (zaino counts no blocks → the only
+    /// per-block frontier)
+    pub const FETCHED_HEIGHT: Gauge = gauge("zaino_sync_fetched_height", Dimension::Count);
+    /// Committed + fsynced. Steps once per batch → trails `FETCHED_HEIGHT` by up to a batch,
+    /// unset on an empty db until the first commit
+    pub const FINALIZED_HEIGHT: Gauge = gauge("zaino_sync_finalized_height", Dimension::Count);
     /// Write path's goal = tip - the non-finalised reorg buffer. Completion measured
     /// against this, never the raw tip (the finalised index trails by design)
-    pub const TARGET_HEIGHT: Family = family("zaino_sync_target_height");
-    pub const CHAIN_TIP: Family = family("zaino_chain_tip_height");
+    pub const TARGET_HEIGHT: Gauge = gauge("zaino_sync_target_height", Dimension::Count);
+    pub const CHAIN_TIP: Gauge = gauge("zaino_chain_tip_height", Dimension::Count);
 
     // Throughput per op class, cumulative on the wire.
     //
     // - Whole family, no label selector: zaino publishes these unlabelled, and a series
     //   missing a selected label is not that value (folds to nothing, not to zero)
-    // - Only the finalised writer tallies today → one pass, one count; a second tallying
-    //   pass (migration, tip ingest) would fold into these silently
-    pub const TRANSACTIONS: Family = family("zaino_sync_transactions_total");
-    pub const TRANSPARENT_INPUTS: Family = family("zaino_sync_transparent_inputs_total");
-    pub const TRANSPARENT_OUTPUTS: Family = family("zaino_sync_transparent_outputs_total");
-    pub const SAPLING_SPENDS: Family = family("zaino_sync_sapling_spends_total");
-    pub const SAPLING_OUTPUTS: Family = family("zaino_sync_sapling_outputs_total");
-    pub const ORCHARD_ACTIONS: Family = family("zaino_sync_orchard_actions_total");
-    pub const IRONWOOD_ACTIONS: Family = family("zaino_sync_ironwood_actions_total");
+    // - Tallied at fetch (paired with `FETCHED_HEIGHT`), not at commit → a failed commit or a
+    //   restart re-fetches and re-counts (durable progress = `zaino_sync_finalized_height`)
+    pub const TRANSACTIONS: Counter =
+        counter("zaino_sync_fetched_transactions_total", Dimension::Count);
+    pub const TRANSPARENT_INPUTS: Counter =
+        counter("zaino_sync_fetched_transparent_inputs_total", Dimension::Count);
+    pub const TRANSPARENT_OUTPUTS: Counter =
+        counter("zaino_sync_fetched_transparent_outputs_total", Dimension::Count);
+    pub const SAPLING_SPENDS: Counter =
+        counter("zaino_sync_fetched_sapling_spends_total", Dimension::Count);
+    pub const SAPLING_OUTPUTS: Counter =
+        counter("zaino_sync_fetched_sapling_outputs_total", Dimension::Count);
+    pub const ORCHARD_ACTIONS: Counter =
+        counter("zaino_sync_fetched_orchard_actions_total", Dimension::Count);
+    pub const IRONWOOD_ACTIONS: Counter =
+        counter("zaino_sync_fetched_ironwood_actions_total", Dimension::Count);
 
     /// Per block, after both source reads
-    pub const BLOCK_ASSEMBLE: Family = family("zaino_sync_block_assemble_seconds");
+    pub const BLOCK_ASSEMBLE: Hist = hist("zaino_sync_block_assemble_seconds", Dimension::Seconds);
     /// One source read: request → deserialized block in zaino's ram. Not an upstream wait
     /// under `direct` (rocksdb read + zebra deserialize, both on zaino's own cpu)
-    pub const BLOCK_FETCH: Family = family("zaino_sync_block_fetch_seconds");
+    pub const BLOCK_FETCH: Hist = hist("zaino_sync_block_fetch_seconds", Dimension::Seconds);
     /// Second source read per block (commitment tree roots); split off `BLOCK_FETCH` so a
     /// slow treestate can't hide behind the block read
-    pub const TREESTATE_FETCH: Family = family("zaino_sync_treestate_fetch_seconds");
-    /// Per committed batch, incl. fsync
-    pub const BATCH_WRITE: Family = family("zaino_sync_batch_write_seconds");
+    pub const TREESTATE_FETCH: Hist =
+        hist("zaino_sync_treestate_fetch_seconds", Dimension::Seconds);
+    /// Per batch, B-tree insert only (fsync = `FSYNC`; the two saturate for unrelated reasons)
+    pub const BATCH_WRITE: Hist = hist("zaino_sync_batch_write_seconds", Dimension::Seconds);
+    pub const FSYNC: Hist = hist("zaino_sync_fsync_seconds", Dimension::Seconds);
 
     /// LMDB environment size; against host RAM = where the write path's B-tree
     /// behaviour changes character
-    pub const DB_USED_BYTES: Family = family("zaino_db_used_bytes");
+    pub const DB_USED_BYTES: Gauge = gauge("zaino_db_used_bytes", Dimension::Bytes);
 }
 
 /// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns
 /// scannable (reformatted, each row costs six lines)
 #[rustfmt::skip]
-const ROWS: [Row; 23] = [
-    // Per-op throughput. Cumulative on the wire → `PerSec` differentiates at query
-    // time; `label` = the band, which is what keys `Palette::pools` when they stack.
-    // `AT_REST`: a live reader differences its own scrapes, and a counter shown raw
-    // beside rates reads as a rate that jumped six orders of magnitude.
-    // Directions kept apart: only the output side is checkable against the note-commitment
-    // trees ([`super::super::sync::chainwork`]), and folding spends in loses that
-    row("transparent in", family::TRANSPARENT_INPUTS, Reduce::Sum, Unit::PerSec, Facet::Transparent),
-    row("transparent out", family::TRANSPARENT_OUTPUTS, Reduce::Sum, Unit::PerSec, Facet::Transparent),
-    row("sapling spends", family::SAPLING_SPENDS, Reduce::Sum, Unit::PerSec, Facet::Shielded),
-    row("sapling outputs", family::SAPLING_OUTPUTS, Reduce::Sum, Unit::PerSec, Facet::Shielded),
-    row("orchard", family::ORCHARD_ACTIONS, Reduce::Sum, Unit::PerSec, Facet::Shielded),
-    row("ironwood", family::IRONWOOD_ACTIONS, Reduce::Sum, Unit::PerSec, Facet::Shielded),
-    // Scan rate, off the frontier gauge (zaino counts no blocks). `Max` + `PerSec` =
-    // the gauge-slope query, matching what `Window::block_pace` differences live
-    row("blocks", family::FETCHED_HEIGHT, Reduce::Max, Unit::PerSec, Facet::Blocks),
+const ROWS: [Row; 24] = [
+    // Per-op throughput. `label` = the band, which is what keys `Palette::pools` when they
+    // stack. Directions kept apart: only the output side is checkable against the
+    // note-commitment trees ([`super::super::sync::chainwork`]), and folding spends in loses that
+    row("transparent in", family::TRANSPARENT_INPUTS.rate(), Facet::Transparent).pool(Pool::Transparent),
+    row("transparent out", family::TRANSPARENT_OUTPUTS.rate(), Facet::Transparent).pool(Pool::Transparent),
+    row("sapling spends", family::SAPLING_SPENDS.rate(), Facet::Shielded).pool(Pool::Sapling),
+    row("sapling outputs", family::SAPLING_OUTPUTS.rate(), Facet::Shielded).pool(Pool::Sapling),
+    row("orchard", family::ORCHARD_ACTIONS.rate(), Facet::Shielded).pool(Pool::Orchard),
+    row("ironwood", family::IRONWOOD_ACTIONS.rate(), Facet::Shielded).pool(Pool::Ironwood),
+    // Off the frontier gauge (zaino counts no blocks) → total = net progress
+    row("blocks", family::FETCHED_HEIGHT.slope(), Facet::Blocks),
     // Transactions, not ops: one tx spans many ops, so it never joins the stack above
-    row("transactions", family::TRANSACTIONS, Reduce::Sum, Unit::PerSec, Facet::Throughput),
+    row("transactions", family::TRANSACTIONS.rate(), Facet::Throughput),
     // Per-block cost = what a tuning pass acts on. `fetch` split from `assemble` (remedies
     // differ: validator time vs parse cost); mean beside p99 where a tail is actionable
-    row("fetch", family::BLOCK_FETCH, Reduce::Mean, Unit::Millis, Facet::WritePath),
-    row("fetch p99", family::BLOCK_FETCH, Reduce::Quantile(Phi::P99), Unit::Millis, Facet::WritePath),
-    row("treestate", family::TREESTATE_FETCH, Reduce::Mean, Unit::Millis, Facet::WritePath),
-    row("assemble", family::BLOCK_ASSEMBLE, Reduce::Mean, Unit::Millis, Facet::WritePath),
-    row("assemble p99", family::BLOCK_ASSEMBLE, Reduce::Quantile(Phi::P99), Unit::Millis, Facet::WritePath),
-    row("batch write", family::BATCH_WRITE, Reduce::Mean, Unit::Millis, Facet::WritePath),
+    row("fetch", family::BLOCK_FETCH.mean(), Facet::WritePath),
+    row("fetch p99", family::BLOCK_FETCH.p(Phi::P99), Facet::WritePath),
+    row("treestate", family::TREESTATE_FETCH.mean(), Facet::WritePath),
+    row("assemble", family::BLOCK_ASSEMBLE.mean(), Facet::WritePath),
+    row("assemble p99", family::BLOCK_ASSEMBLE.p(Phi::P99), Facet::WritePath),
+    row("batch write", family::BATCH_WRITE.mean(), Facet::WritePath),
+    row("fsync", family::FSYNC.mean(), Facet::WritePath),
     // Inbound gRPC. No request-count row (latency histogram's `_count` = the volume)
-    row("gRPC", family::GRPC_LATENCY, Reduce::Mean, Unit::Millis, Facet::WritePath),
-    row("gRPC p99", family::GRPC_LATENCY, Reduce::Quantile(Phi::P99), Unit::Millis, Facet::WritePath),
-    row("errors", family::GRPC_ERRORS, Reduce::Sum, Unit::Count, Facet::WritePath),
-    // `finalized` live = only trustworthy read of zaino's own index (every other height
-    // it serves is answerable by the validator it proxies while indexing). Beside
-    // `fetched` because the *gap* is the diagnostic: commits at most once per
-    // `sync_checkpoint_interval` (120 s) → separates slow-to-fetch from not-committing
-    row("finalized", family::FINALIZED_HEIGHT, Reduce::Max, Unit::Count, Facet::Progress),
-    row("fetched", family::FETCHED_HEIGHT, Reduce::Max, Unit::Count, Facet::Progress),
-    row("chain tip", family::CHAIN_TIP, Reduce::Max, Unit::Count, Facet::Progress),
+    row("gRPC", family::GRPC_LATENCY.mean(), Facet::WritePath),
+    row("gRPC p99", family::GRPC_LATENCY.p(Phi::P99), Facet::WritePath),
+    row("errors", family::GRPC_ERRORS.rate(), Facet::WritePath),
+    // Only trustworthy read of zaino's own progress (it proxies the validator while indexing)
+    row("fetched", family::FETCHED_HEIGHT.level(), Facet::Progress),
+    row("finalized", family::FINALIZED_HEIGHT.level(), Facet::Progress),
+    row("chain tip", family::CHAIN_TIP.level(), Facet::Progress),
     // Height this run was *asked* for — fixed for its duration, so the only honest
     // denominator (the tip advances underneath, marking a finished run short by
     // however far the network moved)
-    row("target", family::TARGET_HEIGHT, Reduce::Max, Unit::Count, Facet::Progress),
-    row("reorgs", family::REORG_TOTAL, Reduce::Sum, Unit::Count, Facet::Progress),
+    row("target", family::TARGET_HEIGHT.level(), Facet::Progress),
+    row("reorgs", family::REORG_TOTAL.rate(), Facet::Progress),
     // DB size against host RAM — the write path's B-tree behaviour turns at that crossing
-    row("db used", family::DB_USED_BYTES, Reduce::Max, Unit::Bytes, Facet::Store),
+    row("db used", family::DB_USED_BYTES.level(), Facet::Store),
 ];
 
 /// Zaino as a live display sees it, from outside the cluster. Families resolved in the
@@ -763,17 +767,17 @@ impl crate::metrics::MetricLayout for ZainoIndexer {
 }
 
 impl Observe for ZainoIndexer {
-    /// `finalized` is the durable frontier a probe gates on; `fetched` moves per block,
-    /// which is what a panel needs (`finalized` steps once per `sync_checkpoint_interval`)
+    /// `fetched` = the only frontier (the committed one steps once per checkpoint interval →
+    /// no per-block height, no blocks/s)
     const HEIGHTS: Heights = Heights {
-        committed: family::FINALIZED_HEIGHT,
-        live: Some(family::FETCHED_HEIGHT),
+        height: family::FETCHED_HEIGHT,
         target: Some(family::TARGET_HEIGHT),
+        tip: Some(family::CHAIN_TIP),
     };
 
     /// `Op::SproutJoinSplit` absent on purpose and must stay absent (the compact model
     /// carries no JoinSplits → sprout work unmeasured)
-    const WORK_OPS: &'static [(Op, Family)] = &[
+    const WORK_OPS: &'static [(Op, Counter)] = &[
         (Op::TransparentIn, family::TRANSPARENT_INPUTS),
         (Op::TransparentOut, family::TRANSPARENT_OUTPUTS),
         (Op::SaplingSpend, family::SAPLING_SPENDS),
@@ -791,7 +795,7 @@ impl Observe for ZainoIndexer {
         }
         let timing = |family| exposition.timing(family);
         Some(Observation {
-            height: Self::live_height(exposition),
+            height: Self::height_of(exposition),
             target: Self::target_of(exposition),
             // No progress-percent family published; height/target is the whole story
             reported_pct: None,
@@ -816,10 +820,6 @@ impl Exporter for ZainoIndexer {
     async fn endpoint(&self) -> Result<Endpoint, EnvError> {
         self.plumbing.endpoint(crate::metrics::PORT_NAME).await
     }
-
-    fn rows(&self) -> &'static [Row] {
-        <Self as crate::metrics::MetricLayout>::ROWS
-    }
 }
 
 impl ZainoIndexer {
@@ -829,9 +829,10 @@ impl ZainoIndexer {
             .map_err(|e| RpcError::decode(COMPONENT, "scrape /metrics", e.to_string()))
     }
 
-    /// How far this pod's finalised index is written — the one question no other surface
-    /// answers (every height zaino *serves* is answerable by the validator it proxies).
-    /// Public form of what [`SyncSubject`] reads per tick
+    /// How far this pod has fetched + assembled — the one question no other surface answers
+    /// (every height zaino *serves* is answerable by the validator it proxies). Not a commit:
+    /// runs ahead of the fsync by up to one checkpoint interval. Public form of what
+    /// [`SyncSubject`] reads per tick
     ///
     /// # Errors
     ///
@@ -840,13 +841,29 @@ impl ZainoIndexer {
     pub async fn index_frontier(&self) -> Result<u32, RpcError> {
         frontier_of(&self.exporter().await?, "index_frontier")
     }
+
+    /// Durable counterpart of [`Self::index_frontier`]: committed + fsynced, trailing it by
+    /// up to one batch → end-state claims about the finalised index read this
+    ///
+    /// # Errors
+    ///
+    /// Gauge absent (empty db before the first commit, or no Prometheus feature)
+    pub async fn finalized_frontier(&self) -> Result<u32, RpcError> {
+        self.exporter().await?.height(family::FINALIZED_HEIGHT).ok_or_else(|| {
+            RpcError::decode(
+                COMPONENT,
+                "finalized_frontier",
+                format!("{} unpublished: no batch committed yet", family::FINALIZED_HEIGHT),
+            )
+        })
+    }
 }
 
-/// [`Observe::committed_height`] with zaino's diagnostic. Takes an already-scraped
+/// [`Observe::height_of`] with zaino's diagnostic. Takes an already-scraped
 /// exposition: [`SyncSubject::progress`] needs height, work counters and target from the
 /// *same* scrape (a second round trip = a different instant)
 fn frontier_of(exporter: &Exposition, op: &'static str) -> Result<u32, RpcError> {
-    if let Some(h) = ZainoIndexer::committed_height(exporter) {
+    if let Some(h) = ZainoIndexer::height_of(exporter) {
         return Ok(h);
     }
     // Counters *are* pre-created at zero (gauges are not) → a present counter proves
@@ -857,10 +874,8 @@ fn frontier_of(exporter: &Exposition, op: &'static str) -> Result<u32, RpcError>
         op,
         if has_metrics {
             format!(
-                "this pod publishes work counters but neither {} nor {}, so how far its index \
-                 has got cannot be observed — the sync loop has not built a single block yet, \
-                 or this build sets neither gauge",
-                family::FINALIZED_HEIGHT,
+                "this pod publishes work counters but no {}: no block fetched yet, or this \
+                 build does not set it",
                 family::FETCHED_HEIGHT,
             )
         } else {
@@ -907,11 +922,20 @@ impl SyncSubject for ZainoIndexer {
         crate::sync::Observed::exporter("zaino index", COMPONENT)
     }
 
-    async fn declared(&self) -> Option<(&'static [Row], Exposition)> {
-        Some((<Self as crate::metrics::MetricLayout>::ROWS, self.exporter().await.ok()?))
+    fn rows(&self) -> &'static [Row] {
+        <Self as crate::metrics::MetricLayout>::ROWS
     }
 
-    fn work_source(&self, op: Op) -> Option<Family> {
+    async fn exposition(&self) -> Option<Exposition> {
+        self.exporter().await.ok()
+    }
+
+    /// `progress` reads the frontier and nothing else it cannot do without
+    fn gates(&self) -> Vec<crate::metrics::Family> {
+        vec![<Self as Observe>::HEIGHTS.height.family()]
+    }
+
+    fn work_source(&self, op: Op) -> Option<Counter> {
         <Self as Observe>::work_source(op)
     }
 }
@@ -946,18 +970,6 @@ impl ProgressView for ZainoSyncProgress {
 
     fn target(&self) -> Option<u32> {
         self.target
-    }
-
-    fn phase(&self) -> Phase {
-        match self.target {
-            None => Phase::Starting,
-            Some(t) if self.height >= t => Phase::Done,
-            Some(_) => Phase::Syncing,
-        }
-    }
-
-    fn detail(&self) -> Option<&'static str> {
-        matches!(self.phase(), Phase::Syncing).then_some("indexing")
     }
 
     /// Overrides the default: the chain-derived fallback turns a *height* into a work
@@ -1237,13 +1249,6 @@ mod tests {
         let p = progress(0, None);
         assert_eq!(p.target(), None);
         assert_eq!(p.pct(), 0.0);
-        assert_eq!(p.phase(), Phase::Starting);
-    }
-
-    #[test]
-    fn phase_tracks_the_gap_to_the_tip() {
-        assert_eq!(progress(10, Some(1_000)).phase(), Phase::Syncing);
-        assert_eq!(progress(1_000, Some(1_000)).phase(), Phase::Done);
     }
 
     /// Zaino counts its own outputs/actions → `Work` reported, not derived from height.
@@ -1272,29 +1277,20 @@ mod tests {
         e
     }
 
-    /// One [`Heights`] declaration, two readers: a probe gates on the durable frontier,
-    /// a panel shows the one that moves per block. Written by hand they drifted
+    /// One frontier: the committed gauge, stepping per checkpoint, reaches neither probe nor panel
     #[test]
-    fn probe_and_panel_read_the_same_declaration_in_opposite_orders() {
-        let e = scrape(
+    fn height_is_fetched_and_never_finalized() {
+        let both = scrape(
             "# TYPE zaino_sync_finalized_height gauge\n\
              zaino_sync_finalized_height 61\n\
              # TYPE zaino_sync_fetched_height gauge\n\
              zaino_sync_fetched_height 161\n",
         );
-        assert_eq!(ZainoIndexer::committed_height(&e), Some(61), "probe gates on durable");
-        assert_eq!(ZainoIndexer::live_height(&e), Some(161), "panel shows per-block");
-    }
+        assert_eq!(ZainoIndexer::height_of(&both), Some(161));
 
-    /// Either family alone answers both readers — the fallback is what covers the window
-    /// before the first commit
-    #[test]
-    fn one_height_family_answers_both_readers() {
-        let live_only =
-            scrape("# TYPE zaino_sync_fetched_height gauge\nzaino_sync_fetched_height 42\n");
-        assert_eq!(ZainoIndexer::committed_height(&live_only), Some(42));
-        assert_eq!(ZainoIndexer::live_height(&live_only), Some(42));
-        assert_eq!(ZainoIndexer::committed_height(&scrape("")), None);
+        let finalized_only =
+            scrape("# TYPE zaino_sync_finalized_height gauge\nzaino_sync_finalized_height 42\n");
+        assert_eq!(ZainoIndexer::height_of(&finalized_only), None);
     }
 
     /// A tip not yet known renders 100 % if taken as a target
@@ -1310,14 +1306,15 @@ mod tests {
     fn work_source_and_work_of_agree_on_the_declaration() {
         // Shape zaino publishes: one unlabelled series per op class
         let e = scrape(
-            "# TYPE zaino_sync_orchard_actions_total counter\n\
-             zaino_sync_orchard_actions_total 7\n",
+            "# TYPE zaino_sync_fetched_orchard_actions_total counter\n\
+             zaino_sync_fetched_orchard_actions_total 7\n",
         );
         let family =
             <ZainoIndexer as Observe>::work_source(Op::OrchardAction).expect("orchard is declared");
-        assert_eq!(family.name, "zaino_sync_orchard_actions_total");
+        assert_eq!(family.family().name, "zaino_sync_fetched_orchard_actions_total");
         assert_eq!(
-            family.select, None,
+            family.family().select,
+            None,
             "a selector drops zaino's unlabelled series entirely — reads as unpublished, not zero"
         );
         assert_eq!(ZainoIndexer::work_of(&e).get(Op::OrchardAction), Some(7));

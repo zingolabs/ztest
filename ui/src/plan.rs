@@ -315,7 +315,9 @@ mod tests {
             description: String::new(),
             qos: QosNode {
                 class: QosClass::Sync,
-                admitted: QosClass::Sync.profile().admitted(),
+                admitted: QosClass::Sync
+                    .profile_with(Some(ztest::api::Resources::new(15_000, 15 * GIB, 0, 0)))
+                    .admitted(),
                 declared_timeout: Some("48h".into()),
             },
             tags: vec!["mainnet".into(), "blossom".into()],

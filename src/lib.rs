@@ -60,7 +60,6 @@ pub(crate) mod paths;
 mod pipeline;
 mod plan;
 mod pod_status;
-mod podmetrics;
 mod portforward;
 pub mod ports;
 pub mod proc;
@@ -88,7 +87,7 @@ pub use crate::component::{
     ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Cpu, Disk, Indexer,
     Mem, Resources, Validator, Wallet,
 };
-pub use crate::env::{SharedVolume, TestEnv};
+pub use crate::env::{ChainVolume, SharedVolume, TestEnv};
 pub use crate::error::{EnvError, PipelineError, RpcError};
 pub use crate::handles::indexer::{
     BlockHash, BlockHeight, CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo,
@@ -155,8 +154,8 @@ macro_rules! validator_tests {
 pub mod prelude {
     pub use super::{
         Account, AccountId, BlockHash, BlockHeight, BlockSample, BlockTip, BlockchainInfo,
-        ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Cpu, Disk,
-        Endpoint, EnvError, FAUCET_SEED, FILLER_ADDRESS, GetAddressUtxosReply, Indexer,
+        ChainConfig, ChainVolume, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder,
+        Cpu, Disk, Endpoint, EnvError, FAUCET_SEED, FILLER_ADDRESS, GetAddressUtxosReply, Indexer,
         IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo, Mount,
         MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction,
         RpcError, SendResponse, SharedVolume, ShieldedProtocol, SubtreeRoot, TestEnv, TreeState,
@@ -172,10 +171,11 @@ pub mod prelude {
     /// Declaring a component's `/metrics` layout: [`MetricLayout::ROWS`] beside the
     /// family constants the backend owns
     ///
-    /// - `Reduce` rides along so a probe reading an exposition directly can tell an absent
-    ///   family from a broken one (`height_gauge`/`counter_total` fold both to `None`)
+    /// - Shape witness first ([`Counter`]/[`Gauge`]/[`Hist`]), so the legal [`Reading`]s
+    ///   are the ones the type offers and an illegal one cannot be written
     pub use crate::metrics::{
-        Exporter, Family, MetricLayout, Reduce, Select, family, family_where,
+        Counter, Dimension, Exporter, Family, Gauge, Hist, MetricLayout, Phi, Reading, Row, Select,
+        counter, counter_where, gauge, hist, row,
     };
     pub use crate::regtest::{
         FundingStreamReceiver, FundingStreamRecipient, FundingStreams, LockboxDisbursement,

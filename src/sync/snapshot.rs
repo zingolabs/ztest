@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 use crate::handles::wallet::{Pool, PoolBalances};
 
-use super::subject::{Phase, ProgressView};
+use super::subject::ProgressView;
 use super::tree::{TreeRoot, TreeRoots};
 use super::work::{Rate, Work};
 
@@ -31,8 +31,6 @@ pub struct Snapshot {
     prev_height: u32,
     target: Option<u32>,
     pct: f32,
-    phase: Phase,
-    detail: Option<&'static str>,
     work: Work,
     prev_work: Work,
     since_prev: Duration,
@@ -63,13 +61,6 @@ impl Snapshot {
     /// Fraction complete, `0.0..=100.0`
     pub fn pct(&self) -> f32 {
         self.pct
-    }
-    pub fn phase(&self) -> Phase {
-        self.phase
-    }
-    /// Subject's own word for its stage, `None` = the lifecycle word alone
-    pub fn detail(&self) -> Option<&'static str> {
-        self.detail
     }
     /// Rollback from the deepest height seen, `0` = no reorg (probes compare against the
     /// Zcash rollback bound)
@@ -206,8 +197,6 @@ impl SnapshotBuilder {
             prev_height: self.prev_height,
             target: p.target(),
             pct: p.pct(),
-            phase: p.phase(),
-            detail: p.detail(),
             work,
             prev_work: self.prev_work,
             since_prev: now.saturating_duration_since(self.prev_at),

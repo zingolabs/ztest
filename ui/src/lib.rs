@@ -42,7 +42,7 @@ pub use self::report::{
 pub use self::runview::ConsoleView;
 pub use self::status::render_status;
 pub use self::theme::Theme;
-pub use ztest::api::{QosPlan, TierPlan};
+pub use ztest::api::QosPlan;
 
 /// Cross-crate test support. `pub` only so `ztest_cli`'s tests can reach it — nothing
 /// here is part of the rendering API, and `#[cfg(test)]` would not cross the crate line
@@ -104,8 +104,8 @@ pub enum BuildState {
 }
 
 /// - `slots_used` = observed `zaino-{ci,dev}-*` namespaces (concurrency proxy)
-/// - `capacity` = whole-cluster allocatable − requested (NVMe vs general is k8s
-///   placement, not a second pool)
+/// - `capacity` = whole-cluster requested of allocatable (NVMe vs general is k8s placement, not
+///   a second pool). `None` = probe not answered → "probing…", never a zero that reads as measured
 #[derive(Debug, Clone)]
 pub struct ClusterState {
     pub context: String,
@@ -114,7 +114,7 @@ pub struct ClusterState {
     pub slots_configured: u32,
     pub nodes_ready: u32,
     pub nodes_cordoned: u32,
-    pub capacity: ztest::api::ClusterCapacity,
+    pub capacity: Option<ztest::api::ClusterCapacity>,
 }
 
 #[derive(Debug, Clone)]
@@ -277,81 +277,171 @@ impl TransferState {
     }
 }
 
-// ─────────────────────────── sync watch (both columns) ────────────────
+// ─────────────────────────── sync watch (all three columns) ───────────
 
-/// `ztest sync watch` panel model: the driver's publications folded into one view.
+/// `ztest sync watch` panel model: vitals per live read, loads per TSDB read, driver pod's phase.
 ///
-/// - Not the driver's wire events (a 48h sync outlives the build that launched it)
-/// - `metrics_note` = why `vitals` is empty (blank rows can't separate warm-up
-///   from a broken subject)
+/// - Vitals off the SUT's `/metrics` direct, placed into a [`ReportView`] the way `status` places them
+/// - `metrics_note` / `loads_note` = why a column is empty (blank rows read as an idle subject)
 #[derive(Debug, Clone, Default)]
 pub struct SyncWatchState {
     pub profile: String,
     pub sync_id: String,
     pub context: String,
     pub pod_phase: String,
-    pub setup: Option<SetupStep>,
-    /// From the subject's own `Observing` — no figure shown without naming what produced it
-    pub subject: Option<String>,
     pub vitals: Option<SyncVitals>,
     pub metrics_note: Option<String>,
-    pub probes: Vec<ProbeRow>,
-    pub violations: usize,
-    pub timeline: Option<ztest::api::Timeline>,
-    /// Sampled on [`SAMPLE_PERIOD`](ztest::api::SAMPLE_PERIOD), not the 1s
-    /// scrape — empty until the first sample, and stays empty on a cluster with no
-    /// metrics API (`pods_note` says which)
-    pub pods: Vec<ztest::api::PodLoad>,
-    pub pods_note: Option<String>,
+    pub loads: Vec<ContainerLoad>,
+    pub loads_note: Option<String>,
 }
 
-/// `received_at` session-elapsed → renderer ages by subtraction, no clock read
-#[derive(Debug, Clone)]
-pub struct SetupStep {
-    pub subject: String,
-    pub detail: String,
-    pub received_at: std::time::Duration,
-}
-
-/// Live sync vitals.
+/// Live sync vitals, all off one [`ReportView`] → no row describes another instant.
 ///
-/// - All but `phase`/`reorg_depth` (engine-only) come from one 1s watcher scrape
-///   → no row lags another by a tick
-/// - `phase` = chain-walk progress, never a run's standing; `None` until the first tick
-/// - `None` rate = unmeasured, not idle; renders `—` not `0`
-/// - `pace` blocks/sec + its ETA, together so the countdown can never outlive the rate
-///   it was projected from
-/// - `pool_rates` in [`CHANNELS`](ztest::api::CHANNELS) order = graph stacking order
+/// - `None` rate = unmeasured → `—`, never `0`
+/// - `pools` one series per [`Channel`](ztest::api::Channel), oldest pool first
 /// - `received_at` session-elapsed → stale rates blank by subtraction
 #[derive(Debug, Clone)]
 pub struct SyncVitals {
     pub height: u32,
-    pub target: Option<u32>,
-    pub pct: f32,
-    pub phase: Option<ztest::api::Phase>,
-    /// Subject's own stage word (`"scanning"`, `"indexing"`) — harness owns no such vocabulary
-    pub phase_detail: Option<String>,
-    pub reorg_depth: u32,
+    pub target: u32,
     pub pace: Option<ztest::api::Pace>,
     pub tx_rate: Option<f64>,
-    pub work_rate: Option<f64>,
-    pub pool_rates: Vec<(&'static str, Option<f64>)>,
-    pub cost: ztest::api::CostMs,
+    pub blocks: Option<ztest::api::Series>,
+    pub pools: Vec<ztest::api::Series>,
+    pub span: std::time::Duration,
     pub received_at: std::time::Duration,
 }
 
-/// `since_satisfied` + `window` are `eventually`-only; together = the countdown
-/// that shows a stall coming
-#[derive(Debug, Clone)]
-pub struct ProbeRow {
-    pub name: String,
-    pub state: ztest::api::ProbeState,
-    pub since_satisfied: Option<std::time::Duration>,
-    pub window: Option<std::time::Duration>,
+/// Countdown basis, trailing seconds (rides out a burst, still tracks the chain's changing density)
+const ETA_BASIS_SECS: f64 = 600.0;
+
+impl SyncVitals {
+    /// `None` until the view holds a height
+    pub fn of(view: &ReportView, received_at: std::time::Duration) -> Option<SyncVitals> {
+        let (height, target) = view.height?;
+        let blocks = view.blocks.first().cloned();
+        let pace = blocks.as_ref().and_then(|b| {
+            Some(ztest::api::Pace {
+                per_sec: b.last()?,
+                eta: eta(b, target.saturating_sub(height)),
+            })
+        });
+        let pools: Vec<ztest::api::Series> =
+            view.transparent.iter().chain(&view.shielded).cloned().collect();
+        Some(SyncVitals {
+            height,
+            target,
+            pace,
+            tx_rate: view.throughput.first().and_then(ztest::api::Series::last),
+            blocks,
+            pools: report::fold_pools(&pools),
+            span: view.elapsed().unwrap_or_default(),
+            received_at,
+        })
+    }
+
+    pub fn pct(&self) -> f64 {
+        match self.target {
+            0 => 0.0,
+            target => (f64::from(self.height) / f64::from(target) * 100.0).min(100.0),
+        }
+    }
+
+    /// Sum over measured pools; `None` = none measured
+    pub fn work_rate(&self) -> Option<f64> {
+        self.pools
+            .iter()
+            .filter_map(ztest::api::Series::last)
+            .fold(None, |acc, r| Some(acc.unwrap_or(0.0) + r))
+    }
 }
 
-impl SyncWatchState {
-    pub fn probe_tally(&self) -> (usize, usize) {
-        (self.probes.iter().filter(|r| r.state.is_ok()).count(), self.probes.len())
+/// Mean over [`ETA_BASIS_SECS`], not the newest point (one grid point swings the countdown by hours)
+fn eta(blocks: &ztest::api::Series, remaining: u32) -> Option<std::time::Duration> {
+    let (newest, _) = *blocks.points.last()?;
+    let recent: Vec<f64> = blocks
+        .points
+        .iter()
+        .filter(|(t, _)| *t >= newest - ETA_BASIS_SECS)
+        .map(|(_, v)| *v)
+        .collect();
+    let mean = recent.iter().sum::<f64>() / recent.len() as f64;
+    (mean > 0.0).then(|| std::time::Duration::from_secs_f64(f64::from(remaining) / mean))
+}
+
+/// One container's newest draw. `limit` unset = none declared (Burstable) → bare usage, never an
+/// invented denominator
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContainerLoad {
+    pub container: String,
+    pub usage: ztest::api::Resources,
+    pub limit: Option<ztest::api::Resources>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::{ReportView, SyncVitals};
+    use ztest::api::{Channel, Series, Unit};
+
+    fn per_minute(label: &str, channel: Option<Channel>, values: &[f64]) -> Series {
+        Series {
+            reading: None,
+            label: label.into(),
+            unit: Unit::PerSec,
+            facet: None,
+            channel,
+            points: values.iter().enumerate().map(|(i, v)| (i as f64 * 60.0, *v)).collect(),
+            total: None,
+            coverage: None,
+        }
+    }
+
+    fn view(blocks: &[f64]) -> ReportView {
+        ReportView {
+            height: Some((900, 1_000)),
+            span: Some((UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(3_600))),
+            blocks: vec![per_minute("blocks", None, blocks)],
+            ..ReportView::default()
+        }
+    }
+
+    #[test]
+    fn no_height_is_no_vitals() {
+        let view = ReportView { height: None, ..view(&[10.0]) };
+        assert!(SyncVitals::of(&view, Duration::ZERO).is_none());
+    }
+
+    /// Transparent ships by direction; the panel reads one row per pool
+    #[test]
+    fn split_rows_fold_into_one_row_per_pool() {
+        let view = ReportView {
+            transparent: vec![
+                per_minute("tsp-in", Some(Channel::Transparent), &[10.0]),
+                per_minute("tsp-out", Some(Channel::Transparent), &[30.0]),
+            ],
+            shielded: vec![per_minute("orchard", Some(Channel::Orchard), &[5.0])],
+            ..view(&[10.0])
+        };
+        let v = SyncVitals::of(&view, Duration::ZERO).expect("a height");
+        let rates: Vec<_> = v.pools.iter().map(|s| (s.channel, s.last())).collect();
+        assert_eq!(
+            rates,
+            [(Some(Channel::Transparent), Some(40.0)), (Some(Channel::Orchard), Some(5.0))]
+        );
+        assert_eq!(v.work_rate(), Some(45.0));
+    }
+
+    /// Run mean would promise a mainnet finish hours early (the early chain is the fast one)
+    #[test]
+    fn the_countdown_runs_off_the_recent_pace() {
+        let mut blocks = vec![1_000.0; 10];
+        blocks.extend([10.0; 11]);
+        let pace = SyncVitals::of(&view(&blocks), Duration::ZERO)
+            .and_then(|v| v.pace)
+            .expect("a measured pace");
+        assert_eq!(pace.per_sec, 10.0);
+        assert_eq!(pace.eta, Some(Duration::from_secs(10)));
     }
 }
