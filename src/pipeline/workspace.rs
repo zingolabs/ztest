@@ -48,12 +48,12 @@ fn linked_workspaces(from: &Path) -> Vec<PathBuf> {
     })
 }
 
-/// `ztest = …` at line start (plain, `{ workspace = true }`, or `[workspace.dependencies]`)
+/// `ztest = …` / `ztest.workspace = true` at line start
 fn declares_ztest(manifest: &str) -> bool {
     manifest.lines().any(|line| {
         line.trim_start()
             .strip_prefix("ztest")
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
+            .is_some_and(|rest| rest.trim_start().starts_with(['=', '.']))
     })
 }
 
@@ -89,6 +89,7 @@ mod tests {
         assert!(declares_ztest("[dependencies]\nztest = \"0.1\"\n"));
         assert!(declares_ztest("[dev-dependencies]\n  ztest={ workspace = true }\n"));
         assert!(declares_ztest("[workspace.dependencies]\nztest = { path = \"..\" }\n"));
+        assert!(declares_ztest("[dev-dependencies]\nztest.workspace = true\n"));
         assert!(!declares_ztest("[dependencies]\nztest_attr = \"0.1\"\n"));
         assert!(!declares_ztest("# ztest = \"0.1\"\nserde = \"1\"\n"));
     }

@@ -375,7 +375,13 @@ pub fn execute(args: Args) -> ExitCode {
     }
     // Same slot: a workspace without `ztest` compiles clean, then fails the inventory dump
     if let Some(unlinked) = pipeline::workspace_check() {
-        eprintln!("ztest run: {}", unlinked_message(&unlinked));
+        eprintln!(
+            "ztest run: no crate in {} depends on `ztest`",
+            unlinked.workspace_root.display()
+        );
+        for dir in &unlinked.linked_workspaces {
+            eprintln!("  run from {}", crate::sync::render::relative_to_cwd(dir).display());
+        }
         return exit(NextestExitCode::SETUP_ERROR);
     }
 
@@ -1765,20 +1771,6 @@ fn locate_cargo_workspace() -> Result<()> {
         }
     }
     Err(anyhow!("no Cargo.toml found in {} or any ancestor directory", cwd.display()))
-}
-
-/// Names the `cd` target(s) when the repo has a `ztest` workspace elsewhere
-fn unlinked_message(unlinked: &pipeline::Unlinked) -> String {
-    let mut out = format!(
-        "no crate in this workspace depends on `ztest` ({})\n  its test binaries carry no \
-         inventory hook, so nothing here can run under `ztest run`",
-        unlinked.workspace_root.join("Cargo.toml").display()
-    );
-    for dir in &unlinked.linked_workspaces {
-        let dir = crate::sync::render::relative_to_cwd(dir);
-        out.push_str(&format!("\n  `ztest` is a dependency in {} — run from there", dir.display()));
-    }
-    out
 }
 
 fn build_initial_state(opts: &RunOptions) -> BannerState {
