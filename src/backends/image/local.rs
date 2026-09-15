@@ -16,7 +16,7 @@ use super::buildpod::TempDir;
 use super::kind;
 use super::{BuildRequest, Built, Dockerfile, ImageError, ImageProvider, Output, join, note};
 use crate::resource::{Cx, Readiness, ResourceError};
-use crate::runtime;
+use crate::runtime::{self, ContainerRuntime};
 
 /// How a locally built image reaches the kubelet
 #[derive(Debug, Clone)]
@@ -48,9 +48,17 @@ impl LocalEngine {
         LocalEngine { publish, staged: Mutex::new(HashMap::new()) }
     }
 
-    fn build_argv(&self, req: &BuildRequest, dockerfile: &Path, context: &Path) -> Vec<String> {
-        let mut argv =
-            vec!["build".to_string(), "-f".to_string(), dockerfile.display().to_string()];
+    fn build_argv(
+        &self,
+        rt: ContainerRuntime,
+        req: &BuildRequest,
+        dockerfile: &Path,
+        context: &Path,
+    ) -> Vec<String> {
+        let mut argv = vec!["build".to_string()];
+        argv.extend(rt.build_flags().into_iter().map(str::to_string));
+        argv.push("-f".to_string());
+        argv.push(dockerfile.display().to_string());
         if let Some(target) = &req.target {
             argv.push("--target".to_string());
             argv.push(target.clone());
@@ -162,7 +170,7 @@ impl ImageProvider for LocalEngine {
 
         note(cx, req, "building");
         let rt = runtime::active();
-        let argv = self.build_argv(req, &dockerfile, &context);
+        let argv = self.build_argv(rt, req, &dockerfile, &context);
         super::run_streamed(cx, &req.label(), rt.as_str(), &argv, &rt.build_envs(), "build")
             .await?;
 
@@ -219,7 +227,19 @@ mod tests {
     }
 
     fn argv(e: &LocalEngine, output: Output) -> Vec<String> {
-        e.build_argv(&req(output), Path::new("D"), Path::new("/ctx"))
+        e.build_argv(ContainerRuntime::Docker, &req(output), Path::new("D"), Path::new("/ctx"))
+    }
+
+    /// The engine flag sits between `build` and the request's own flags, so a docker-format
+    /// podman build still parses the rest of the argv unchanged
+    #[test]
+    fn podman_builds_in_the_docker_image_format() {
+        let e = LocalEngine::side_load();
+        let output = Output::Image { tag: "z:dev-x".into() };
+        let argv =
+            e.build_argv(ContainerRuntime::Podman, &req(output), Path::new("D"), Path::new("/ctx"));
+        assert_eq!(&argv[..3], ["build", "--format", "docker"]);
+        assert_eq!(argv[3], "-f");
     }
 
     /// Tag carries the registry already — the push address and the build tag are one string
