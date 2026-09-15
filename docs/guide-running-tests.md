@@ -11,7 +11,7 @@ Cluster tests run through **`ztest run`**, never bare `cargo nextest`.
 
 - `cargo nextest` on PATH (inventory + selection)
 - Run from the workspace whose crates depend on `ztest` (the inventory hook links with it);
-  elsewhere `ztest run` refuses before compiling and names the workspace to `cd` into
+  elsewhere `ztest run` refuses before compiling
 - A reachable cluster from `kube::Config::infer()`: in-pod SA token, or a `KUBECONFIG`
 - Cluster capabilities present — `ztest cluster check`
   ([ops-cluster-requirements.md](ops-cluster-requirements.md))

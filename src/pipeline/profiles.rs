@@ -269,16 +269,6 @@ fn has_cfg(attrs: &[syn::Attribute]) -> bool {
 /// - Text match, not `syn`: candidates only, and running `cargo metadata` per workspace to
 ///   confirm costs more than the whole error path
 pub fn workspaces_with_profiles(from: &Path) -> Vec<PathBuf> {
-    workspaces_where(from, |path| {
-        path.extension().is_some_and(|e| e == "rs")
-            && std::fs::read_to_string(path).is_ok_and(|s| s.contains("sync_test"))
-    })
-}
-
-/// Workspaces in `from`'s repo holding a file `hit` accepts, sorted.
-///
-/// - `.dotdirs` + `target` skipped
-pub(super) fn workspaces_where(from: &Path, hit: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     let Some(repo) = git_toplevel(from) else {
         return Vec::new();
     };
@@ -297,7 +287,8 @@ pub(super) fn workspaces_where(from: &Path, hit: impl Fn(&Path) -> bool) -> Vec<
                     continue;
                 }
                 pending.push(path);
-            } else if hit(&path)
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && std::fs::read_to_string(&path).is_ok_and(|s| s.contains("sync_test"))
                 && let Some(root) = enclosing_workspace(&path, &repo)
                 && !hits.contains(&root)
             {

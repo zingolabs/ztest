@@ -3,30 +3,19 @@
 //! - Dump hook = `#[ctor]` inside `ztest` ([`crate::inventory`]) → binary w/o `ztest` linked
 //!   runs libtest instead of dumping
 //! - `cargo metadata --no-deps` (~20ms) ahead of compiling a whole unrelated workspace
-//! - Direct deps of members only (every ztest test crate names `ztest` itself)
 //! - Metadata failure = no verdict (nextest surfaces cargo's error, the dump parse backs this)
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::profiles;
 
-/// Workspace none of whose members depend on `ztest`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unlinked {
-    pub workspace_root: PathBuf,
-    /// Workspaces elsewhere in the repo declaring a `ztest` dependency (`cd` targets)
-    pub linked_workspaces: Vec<PathBuf>,
-}
-
-/// `Some` = veto with the `cd` targets, `None` = linked or undecidable
-pub fn check() -> Option<Unlinked> {
+/// `Some(workspace_root)` = no member depends on `ztest`; `None` = linked or undecidable
+pub fn unlinked_workspace() -> Option<PathBuf> {
     let meta = profiles::cargo_metadata().ok()?;
     if links_ztest(&meta) {
         return None;
     }
-    let workspace_root = PathBuf::from(meta["workspace_root"].as_str()?);
-    let linked_workspaces = linked_workspaces(&workspace_root);
-    Some(Unlinked { workspace_root, linked_workspaces })
+    meta["workspace_root"].as_str().map(PathBuf::from)
 }
 
 fn links_ztest(meta: &serde_json::Value) -> bool {
@@ -36,24 +25,6 @@ fn links_ztest(meta: &serde_json::Value) -> bool {
                 .as_array()
                 .is_some_and(|deps| deps.iter().any(|dep| dep["name"].as_str() == Some("ztest")))
         })
-    })
-}
-
-/// Text match over manifests (candidates only, same trade as
-/// [`profiles::workspaces_with_profiles`])
-fn linked_workspaces(from: &Path) -> Vec<PathBuf> {
-    profiles::workspaces_where(from, |path| {
-        path.file_name().is_some_and(|name| name == "Cargo.toml")
-            && std::fs::read_to_string(path).is_ok_and(|manifest| declares_ztest(&manifest))
-    })
-}
-
-/// `ztest = …` / `ztest.workspace = true` at line start
-fn declares_ztest(manifest: &str) -> bool {
-    manifest.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix("ztest")
-            .is_some_and(|rest| rest.trim_start().starts_with(['=', '.']))
     })
 }
 
@@ -82,15 +53,5 @@ mod tests {
     fn members_without_ztest_do_not_link() {
         assert!(!links_ztest(&metadata(&["tokio", "ztest_attr"])));
         assert!(!links_ztest(&serde_json::json!({ "workspace_root": "/repo" })));
-    }
-
-    #[test]
-    fn manifest_dependency_spellings() {
-        assert!(declares_ztest("[dependencies]\nztest = \"0.1\"\n"));
-        assert!(declares_ztest("[dev-dependencies]\n  ztest={ workspace = true }\n"));
-        assert!(declares_ztest("[workspace.dependencies]\nztest = { path = \"..\" }\n"));
-        assert!(declares_ztest("[dev-dependencies]\nztest.workspace = true\n"));
-        assert!(!declares_ztest("[dependencies]\nztest_attr = \"0.1\"\n"));
-        assert!(!declares_ztest("# ztest = \"0.1\"\nserde = \"1\"\n"));
     }
 }
