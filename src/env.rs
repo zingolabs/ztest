@@ -247,6 +247,41 @@ impl From<&SharedVolume> for crate::mount::Mount {
     }
 }
 
+/// [`SharedVolume`] cloned from a public [`ChainSnapshot`](crate::ChainSnapshot): one live
+/// zebra-state DB a following zebrad writes and a colocated zaino `State` reads.
+///
+/// - TEMPORARY: exists only while zaino ingests via `direct` (a private clone freezes at the
+///   pin); delete once zaino is fetch/JSON-RPC-only (migration planned ~2026-10)
+/// - Declared via [`TestEnv::chain_volume`]; zebrad joins with `.follow(&vol)`, zaino with
+///   `.snapshot(vol.snapshot()).mount(&vol)`
+#[derive(Debug, Clone)]
+pub struct ChainVolume {
+    shared: SharedVolume,
+    snapshot: crate::ChainSnapshot,
+}
+
+impl ChainVolume {
+    pub fn snapshot(&self) -> crate::ChainSnapshot {
+        self.snapshot
+    }
+    pub fn mount_path(&self) -> &str {
+        self.shared.mount_path()
+    }
+}
+
+impl From<&ChainVolume> for crate::mount::Mount {
+    fn from(vol: &ChainVolume) -> Self {
+        vol.shared.as_mount()
+    }
+}
+
+/// Env-scoped PVC awaiting `build()`; `seed` = cloned from that artifact, else empty
+struct PendingSharedVolume {
+    claim: String,
+    disk: Disk,
+    seed: Option<crate::Artifact>,
+}
+
 // ────────────────────────────── TestEnv ───────────────────────────────
 
 pub struct TestEnv {
@@ -254,7 +289,7 @@ pub struct TestEnv {
     pending_validators: Vec<PendingValidator>,
     pending_indexers: Vec<PendingIndexer>,
     pending_wallets: Vec<PendingWallet>,
-    pending_shared_volumes: Vec<(String, Disk)>,
+    pending_shared_volumes: Vec<PendingSharedVolume>,
     next_id: u64,
     ready_timeout: Duration,
     /// Schedule of the *regtest* chain this env mines (`None` =
@@ -264,6 +299,8 @@ pub struct TestEnv {
     /// The one archive every restoring component names + what its manifest says it holds;
     /// resolved in [`build`](Self::build), `None` when nothing (or no chain) was restored
     chain_pin: Option<crate::ChainSnapshot>,
+    /// A validator restored with `.follow(..)` → `chain_pin` = where the chain starts, not ends
+    chain_follows: bool,
 }
 
 impl std::fmt::Debug for TestEnv {
@@ -291,6 +328,7 @@ impl TestEnv {
             ready_timeout: Self::DEFAULT_READY_TIMEOUT,
             activation_override: None,
             chain_pin: None,
+            chain_follows: false,
         }
     }
 
@@ -327,9 +365,37 @@ impl TestEnv {
     /// [`shared_volume`](Self::shared_volume) for a chain that outgrows the regtest
     /// default — a restored public network, or one syncing past its pin
     pub fn shared_volume_sized(&mut self, name: &str, disk: Disk) -> SharedVolume {
+        self.declare_shared(name, disk, None)
+    }
+
+    /// Shared volume cloned from `snapshot` → the chain a following zebrad grows and a
+    /// colocated zaino `State` reads.
+    ///
+    /// - TEMPORARY with [`ChainVolume`] (fetch-only zaino needs no shared DB)
+    /// - `disk` floors at the seed's `restoreSize`; size for the blocks past the pin
+    ///
+    /// # Panics
+    ///
+    /// `snapshot` is a regtest cache (no network to follow)
+    pub fn chain_volume(&mut self, snapshot: crate::ChainSnapshot, disk: Disk) -> ChainVolume {
+        assert!(
+            snapshot.network.is_public(),
+            "chain_volume follows a public network; {} is a regtest cache",
+            snapshot.artifact.name,
+        );
+        let shared = self.declare_shared("chain", disk, Some(snapshot.artifact));
+        ChainVolume { shared, snapshot }
+    }
+
+    fn declare_shared(
+        &mut self,
+        name: &str,
+        disk: Disk,
+        seed: Option<crate::Artifact>,
+    ) -> SharedVolume {
         let slug = short_kind(name);
         let claim = format!("shared-{slug}");
-        self.pending_shared_volumes.push((claim.clone(), disk));
+        self.pending_shared_volumes.push(PendingSharedVolume { claim: claim.clone(), disk, seed });
         SharedVolume { claim, mount_path: format!("/shared/{slug}") }
     }
 
@@ -473,11 +539,12 @@ impl TestEnv {
             .iter()
             .map(|p| &p.opts)
             .chain(self.pending_indexers.iter().map(|p| &p.opts))
-            .filter_map(|opts| match opts.restore.as_ref() {
-                Some(crate::component::RestoreSource::Archive(s)) => Some((pod_name_of(opts), *s)),
-                _ => None,
-            })
+            .filter_map(|opts| Some((pod_name_of(opts), opts.restore.as_ref()?.snapshot()?)))
             .collect();
+        self.chain_follows = self
+            .pending_validators
+            .iter()
+            .any(|p| matches!(p.opts.restore, Some(crate::component::RestoreSource::Follow(_))));
 
         let Some((first_name, first)) = pinned.first() else {
             return Ok(()); // nothing restored → no chain pin
@@ -501,6 +568,8 @@ impl TestEnv {
     ///
     /// Written at the declaration in [`ztest::snapshots`](crate::snapshots), and checked
     /// against the running validator during [`build`](Self::build).
+    ///
+    /// - Validator `.follow(..)`ing → `tip_height` = where the chain started, not its tip
     ///
     /// # Panics
     ///
@@ -644,8 +713,23 @@ impl TestEnv {
 
         // Before any pod references them (WaitForFirstConsumer → the claim stays Pending
         // until the Phase-1 validator schedules)
-        for (claim, disk) in std::mem::take(&mut self.pending_shared_volumes) {
-            mounts::create_shared_pvc(&client, &sentinel, &claim, disk).await?;
+        for PendingSharedVolume { claim, disk, seed } in
+            std::mem::take(&mut self.pending_shared_volumes)
+        {
+            match seed {
+                None => mounts::create_shared_pvc(&client, &sentinel, &claim, disk).await?,
+                Some(artifact) => {
+                    let binding = mounts::create_seeded_shared_pvc(
+                        &client, &sentinel, &claim, artifact, disk,
+                    )
+                    .await?;
+                    self.inner
+                        .seed_bindings
+                        .lock()
+                        .expect("seed_bindings mutex poisoned")
+                        .push(binding);
+                }
+            }
         }
 
         let ctx = MaterializeCtx {
@@ -765,10 +849,18 @@ impl TestEnv {
         tracing::info!(stage = "validator", "verifying the restored chain");
         let rpc = validator.json_rpc().await?;
         let tip = rpc.tip_height().await.map_err(|e| EnvError::Transient(Box::new(e)))?;
-        if tip != snapshot.tip_height {
+        // Following → may already be past the pin, never below it (below = truncated clone)
+        let mismatch = match self.chain_follows {
+            true => (tip < snapshot.tip_height).then(|| {
+                format!("snapshot starts at {}, validator serves {tip}", snapshot.tip_height)
+            }),
+            false => (tip != snapshot.tip_height)
+                .then(|| format!("pinned at {}, validator serves {tip}", snapshot.tip_height)),
+        };
+        if let Some(reason) = mismatch {
             return Err(EnvError::ArchiveMismatch {
                 archive: snapshot.artifact.name.to_owned(),
-                reason: format!("pinned at {}, validator serves {tip}", snapshot.tip_height,),
+                reason,
             });
         }
         tracing::debug!(

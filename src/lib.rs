@@ -87,7 +87,7 @@ pub use crate::component::{
     ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Cpu, Disk, Indexer,
     Mem, Resources, Validator, Wallet,
 };
-pub use crate::env::{SharedVolume, TestEnv};
+pub use crate::env::{ChainVolume, SharedVolume, TestEnv};
 pub use crate::error::{EnvError, PipelineError, RpcError};
 pub use crate::handles::indexer::{
     BlockHash, BlockHeight, CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo,
@@ -154,8 +154,8 @@ macro_rules! validator_tests {
 pub mod prelude {
     pub use super::{
         Account, AccountId, BlockHash, BlockHeight, BlockSample, BlockTip, BlockchainInfo,
-        ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Cpu, Disk,
-        Endpoint, EnvError, FAUCET_SEED, FILLER_ADDRESS, GetAddressUtxosReply, Indexer,
+        ChainConfig, ChainVolume, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder,
+        Cpu, Disk, Endpoint, EnvError, FAUCET_SEED, FILLER_ADDRESS, GetAddressUtxosReply, Indexer,
         IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo, Mount,
         MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction,
         RpcError, SendResponse, SharedVolume, ShieldedProtocol, SubtreeRoot, TestEnv, TreeState,

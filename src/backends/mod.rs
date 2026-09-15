@@ -50,6 +50,13 @@ pub fn metrics_heights() -> impl Iterator<Item = crate::sync::Heights> {
     METRICS_BACKENDS.iter().filter_map(|b| b.heights)
 }
 
+/// Rows + heights of the observable backend `label` names, for a reader scraping that pod direct
+pub fn observed_backend(
+    label: &str,
+) -> Option<(&'static [crate::metrics::Row], crate::sync::Heights)> {
+    METRICS_BACKENDS.iter().find(|b| b.label == label).and_then(|b| Some((b.rows, b.heights?)))
+}
+
 /// Bundled backends in report order — the subject ahead of what it proxies, so a
 /// per-component view leads with the thing under test
 pub fn metrics_component_labels() -> impl Iterator<Item = &'static str> {
@@ -64,7 +71,10 @@ pub fn metrics_component_labels() -> impl Iterator<Item = &'static str> {
 ///   mount a seed it forgot to ask access for)
 pub fn seed_groups(opts: &crate::component::ComponentOpts) -> Vec<i64> {
     match opts.restore {
-        Some(crate::component::RestoreSource::Archive(_)) => vec![crate::materialize::SEED_GID],
+        Some(
+            crate::component::RestoreSource::Archive(_)
+            | crate::component::RestoreSource::Follow(_),
+        ) => vec![crate::materialize::SEED_GID],
         // Blank restore = empty PVC this pod fills itself (already owns every entry)
         Some(crate::component::RestoreSource::Blank) | None => Vec::new(),
     }

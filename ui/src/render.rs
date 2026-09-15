@@ -491,13 +491,17 @@ mod metric_row {
     pub(super) const MORE: &str = "{label|dim} +{count|count.dim} more";
 }
 
-/// Believability = 3 scrape intervals (one missed scrape must not blink the panel). Past it rates
-/// blank, never hold (a frozen rate drawn as healthy = the one unacceptable failure)
-const STALE_AFTER: Duration =
-    Duration::from_secs(ztest::api::metrics::SCRAPE_INTERVAL.as_secs() * 3);
+/// Believability = 3 live reads (one missed read must not blink the panel). Past it rates blank,
+/// never hold (a frozen rate drawn as healthy = the one unacceptable failure)
+const STALE_AFTER: Duration = Duration::from_secs(ztest::api::metrics::LIVE_INTERVAL.as_secs() * 3);
 
 fn stale(v: &SyncVitals, elapsed: Duration) -> bool {
     elapsed.saturating_sub(v.received_at) > STALE_AFTER
+}
+
+/// Segment span as of this frame: last read's span + local time since (ticks between reads)
+fn uptime(v: &SyncVitals, elapsed: Duration) -> Duration {
+    v.span + elapsed.saturating_sub(v.received_at)
 }
 
 /// Measured → the `{key}` cell; unmeasured or stale → `{na}` = `—` (one statement: not known now)
@@ -530,12 +534,12 @@ fn render_sync_vitals(out: &mut String, v: &SyncVitals, elapsed: Duration, theme
     }
     draw(out, pace, metric_row::PACE, Duration::ZERO, theme);
 
-    render_scan_trend(out, v, theme);
+    render_scan_trend(out, v, elapsed, theme);
 }
 
 /// Scan rate over the run + its best (a scan holding at half its demonstrated peak = a regression
 /// nothing else on the panel states)
-fn render_scan_trend(out: &mut String, v: &SyncVitals, theme: &Theme) {
+fn render_scan_trend(out: &mut String, v: &SyncVitals, elapsed: Duration, theme: &Theme) {
     let Some(blocks) = v.blocks.as_ref().filter(|b| !b.points.is_empty()) else {
         let f = Fields::new().text("label", label("blocks")).text("note", "gathering");
         draw(out, f, metric_row::NOTE, Duration::ZERO, theme);
@@ -544,7 +548,7 @@ fn render_scan_trend(out: &mut String, v: &SyncVitals, theme: &Theme) {
     let trend = Fields::new()
         .text("label", label("blocks"))
         .bands("blocks", super::report::bands(blocks))
-        .text("span", format_elapsed(v.span))
+        .text("span", format_elapsed(uptime(v, elapsed)))
         .maybe_value("peak", blocks.peak());
     draw(out, trend, metric_row::TREND, Duration::ZERO, theme);
 }
@@ -586,8 +590,9 @@ pub fn render_sync_work(state: &SyncWatchState, elapsed: Duration, theme: &Theme
     let fresh = |r: Option<f64>| r.filter(|_| !stale);
 
     // Carries the span (else ten minutes and two days of history look alike)
-    let f =
-        Fields::new().text("label", side_label("total")).text("span", format_elapsed(vitals.span));
+    let f = Fields::new()
+        .text("label", side_label("total"))
+        .text("span", format_elapsed(uptime(vitals, elapsed)));
     draw(
         &mut out,
         rate(f, "rate", "rate_na", fresh(vitals.work_rate())),

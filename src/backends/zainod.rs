@@ -142,20 +142,12 @@ impl IndexerConfig for ZainoBackend {
                 )
             }
             IndexerMode::Public => {
-                // Frozen archive, no writer to share with → a shared volume here = a
-                // regtest topology on the wrong mode (name it, don't fail on an empty mount)
-                if opts.shared_state.is_some() {
-                    return Err(EnvError::Config {
-                        reason: "shared state volume is regtest-only, not with .testnet/.mainnet"
-                            .to_string(),
-                    });
-                }
                 // Which chain comes off the archive, not the mode (which says only
                 // *public*). `.testnet(_)`/`.mainnet(_)` set both → an absent archive
                 // here = a config bug, not a topology a user can express
-                let archive = match opts.restore {
-                    Some(crate::component::RestoreSource::Archive(handle)) => handle,
-                    _ => {
+                let archive = match opts.restore.as_ref().and_then(|r| r.snapshot()) {
+                    Some(handle) => handle,
+                    None => {
                         return Err(EnvError::Config {
                             reason:
                                 "public-network zaino names no archive; use .testnet()/.mainnet()"
@@ -175,10 +167,17 @@ impl IndexerConfig for ZainoBackend {
                 // Only `State` opens the DB; `Fetch` sources the same chain over JSON-RPC.
                 // Archive is multi-GB → attaching it to a fetch pod buys a CoW clone and a
                 // volume attach per test for a mount nothing opens
-                if state {
-                    opts.mounts
-                        .push(crate::regtest::archive_mount(archive.artifact, ZAINO_ZEBRA_DB));
-                }
+                // - `ChainVolume` mounted (TEMPORARY, direct-only) → the following zebrad's live
+                //   DB; else a private clone frozen at the pin
+                let zebra_db_path = match (state, opts.shared_state.as_ref()) {
+                    (true, Some(shared)) => shared.mount_path.clone(),
+                    (true, None) => {
+                        opts.mounts
+                            .push(crate::regtest::archive_mount(archive.artifact, ZAINO_ZEBRA_DB));
+                        ZAINO_ZEBRA_DB.to_string()
+                    }
+                    (false, _) => ZAINO_ZEBRA_DB.to_string(),
+                };
                 let host = validator_host.unwrap_or(ZAINO_PUBLIC_VALIDATOR_HOST);
                 // `backend = 'direct'` (State) reads the CoW clone through zebra's
                 // `ReadStateService` and rejects its config without a syncer gRPC address;
@@ -193,7 +192,7 @@ impl IndexerConfig for ZainoBackend {
                     ZAINO_PUBLIC_JSONRPC_PORT,
                     host,
                     ZAINO_PUBLIC_VALIDATOR_RPC_PORT,
-                    ZAINO_ZEBRA_DB,
+                    &zebra_db_path,
                     ZAINO_DB,
                     validator_grpc.as_deref(),
                     opts.image.metrics_enabled().then(|| self.metrics_port()).flatten(),

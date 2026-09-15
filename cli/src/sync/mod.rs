@@ -1387,8 +1387,6 @@ async fn live_header(
 ///   panels then state why they are empty rather than failing the report
 /// - Window = the segment's own span
 async fn build_report_view(client: &Client, ns: &str, mut view: ReportView) -> ReportView {
-    use ztest::api::metrics::Facet;
-
     let Some(window) = view.span else {
         view.note = Some("no segment recorded yet — nothing to window".into());
         return view;
@@ -1422,15 +1420,7 @@ async fn build_report_view(client: &Client, ns: &str, mut view: ReportView) -> R
             })
         }
         Ok(series) => {
-            let of = |facet: Facet| -> Vec<_> {
-                series.iter().filter(|s| s.facet == Some(facet)).cloned().collect()
-            };
-            view.transparent = of(Facet::Transparent);
-            view.shielded = of(Facet::Shielded);
-            view.blocks = of(Facet::Blocks);
-            view.throughput = of(Facet::Throughput);
-            view.write_path = of(Facet::WritePath);
-            view.store = of(Facet::Store);
+            place_by_facet(&mut view, &series);
 
             // Resolved by declared gauge, never by display label: a reworded row must not
             // silently drop the height check
@@ -1471,6 +1461,21 @@ async fn build_report_view(client: &Client, ns: &str, mut view: ReportView) -> R
         Err(e) => view.note = Some(format!("prometheus unreadable: {e}")),
     }
     view
+}
+
+/// Row series → the panel their facet names (report + live watch fill panels one way)
+fn place_by_facet(view: &mut ReportView, series: &[Series]) {
+    use ztest::api::metrics::Facet;
+
+    let of = |facet: Facet| -> Vec<_> {
+        series.iter().filter(|s| s.facet == Some(facet)).cloned().collect()
+    };
+    view.transparent = of(Facet::Transparent);
+    view.shielded = of(Facet::Shielded);
+    view.blocks = of(Facet::Blocks);
+    view.throughput = of(Facet::Throughput);
+    view.write_path = of(Facet::WritePath);
+    view.store = of(Facet::Store);
 }
 
 /// Scrape gaps under the run's totals, worst first.

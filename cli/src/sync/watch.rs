@@ -1,13 +1,16 @@
 //! `ztest sync watch` — the live view of a detached sync.
 //!
-//! - Pinned panel = one `report_view` read per scrape interval (the TSDB read `status` draws)
+//! - Vitals = SUT + driver `/metrics` scraped direct every [`LIVE_INTERVAL`] (`status` = the TSDB)
+//! - Loads = cAdvisor off the TSDB (no component sees its own cgroup)
 //! - Scrollback = driver-pod log + indexer-under-test log, verbatim
-//! - Both read over the kube API (no `kubectl` on the laptop)
+//! - All over the kube API (no `kubectl` on the laptop)
 //! - Read-only: Ctrl-C detaches, never stops the sync (only `ztest sync stop` does)
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{IsTerminal, stdout};
-use std::time::{Duration, Instant, SystemTime};
+use std::pin::Pin;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use futures::{AsyncBufReadExt as _, StreamExt as _};
@@ -15,10 +18,13 @@ use k8s_openapi::api::core::v1::{ContainerState, Pod};
 use kube::api::{Api, ListParams, LogParams};
 use tokio::sync::watch;
 
+use ztest::api::Heights;
 use ztest::api::Resources;
-use ztest::api::metrics::{SCRAPE_INTERVAL, Series};
+use ztest::api::metrics::{Exposition, LIVE_INTERVAL, Live, PORT_NAME, SCRAPE_INTERVAL, Series};
 use ztest::api::naming::RUN_NAMESPACE;
-use ztest::sync::{SyncStatus, driver_pod_for, find_driver, namespace_for};
+use ztest::api::portforward::Forwarder;
+use ztest::api::ports::SYNC_DRIVER_METRICS;
+use ztest::sync::{SyncStatus, driver_family, driver_pod_for, find_driver, namespace_for};
 use ztest_ui::console::{Console, SceneFrame};
 use ztest_ui::template::{Fields, draw};
 use ztest_ui::{
@@ -26,7 +32,7 @@ use ztest_ui::{
     render_sync_load, render_sync_watch_panel, render_sync_work,
 };
 
-use super::{DRIVER_CONTAINER, driver_profile, render, report_view};
+use super::{DRIVER_CONTAINER, by_component, driver_profile, place_by_facet, render, report_view};
 
 /// Driver-pod address: run-namespace API handle + pod name.
 ///
@@ -59,6 +65,9 @@ const TAIL_LINES: i64 = 200;
 /// Component whose **log** rides alongside the driver's, by category (`lightwalletd` followed
 /// like `zainod`)
 const SUT_SELECTOR: &str = "ztest.io/component-category=indexer";
+
+/// Backend a pod runs → the metric layout its `/metrics` is read with
+const COMPONENT_LABEL: &str = "ztest.io/component";
 
 type LineStream = std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<String>> + Send>>;
 
@@ -115,10 +124,12 @@ pub(super) async fn watch(id: &str) -> Result<WatchEnd> {
     };
     render(&state);
 
-    let mut reader = Reader::spawn(client.clone(), id.to_string());
+    let mut live = Poller::spawn(LIVE_INTERVAL, LiveSampler::new(client.clone(), id));
+    let mut loads =
+        Poller::spawn(SCRAPE_INTERVAL, LoadSampler { client: client.clone(), id: id.into() });
     let tail = tail_loop(
         (&driver, &sut),
-        &mut reader,
+        (&mut live, &mut loads),
         &console,
         session_start,
         &mut state,
@@ -161,44 +172,52 @@ async fn settled(client: &kube::Client, id: &str, theme: &Theme) -> Result<Watch
     Ok(WatchEnd::Settled(status))
 }
 
-// ────────────────────────────── TSDB reads ──────────────────────────────
+// ────────────────────────────── panel reads ──────────────────────────────
 
-/// One panel read: the run as `status` sees it + each container's declared limit
-#[derive(Debug, Clone)]
-struct Frame {
-    view: ReportView,
-    limits: HashMap<String, Resources>,
+/// Vitals: SUT rows placed as `status` places them, heights + segment span off the same scrape
+type LiveRead = Result<ReportView, String>;
+
+/// Loads: per-component usage + each container's declared limit
+type LoadRead = Result<(Vec<ComponentResources>, HashMap<String, Resources>), String>;
+
+/// Under [`LIVE_INTERVAL`] → a slow target skips a beat, never queues
+const LIVE_SCRAPE_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Trailing load window (≥ the TSDB grid's rate window, else no point lands)
+const LOAD_WINDOW: Duration = Duration::from_secs(120);
+
+/// One panel source, read repeatedly on its own task
+trait Sample: Send + 'static {
+    type Out: Clone + Send + Sync + 'static;
+    fn sample(&mut self) -> Pin<Box<dyn Future<Output = Self::Out> + Send + '_>>;
 }
 
-type Read = Result<Frame, String>;
-
-/// One read per [`SCRAPE_INTERVAL`] on its own task (an hours-wide history query must not stall
-/// the log tail). Drop = stop (a departed watcher must stop querying)
-struct Reader {
-    rx: watch::Receiver<Option<Read>>,
+/// One read per interval on its own task (a slow read must not stall the log tail). Drop = stop
+/// (a departed watcher must stop reading)
+struct Poller<T> {
+    rx: watch::Receiver<Option<T>>,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl Reader {
-    fn spawn(client: kube::Client, id: String) -> Reader {
+impl<T: Clone + Send + Sync + 'static> Poller<T> {
+    fn spawn<S: Sample<Out = T>>(every: Duration, mut source: S) -> Poller<T> {
         let (tx, rx) = watch::channel(None);
         let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(SCRAPE_INTERVAL);
+            let mut ticker = tokio::time::interval(every);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                let read = frame(&client, &id).await.map_err(|e| format!("{e:#}"));
-                if tx.send(Some(read)).is_err() {
+                if tx.send(Some(source.sample().await)).is_err() {
                     return;
                 }
             }
         });
-        Reader { rx, task }
+        Poller { rx, task }
     }
 
     /// Newest read, never a backlog. Cancel-safe for a `select!` arm; pends forever once the task
     /// is gone (an instantly-resolving arm spins its loop)
-    async fn changed(&mut self) -> Read {
+    async fn changed(&mut self) -> T {
         loop {
             if self.rx.changed().await.is_err() {
                 return std::future::pending().await;
@@ -210,17 +229,155 @@ impl Reader {
     }
 }
 
-impl Drop for Reader {
+impl<T> Drop for Poller<T> {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-async fn frame(client: &kube::Client, id: &str) -> Result<Frame> {
-    let (view, _) = report_view(client, id).await?;
-    let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace_for(id));
-    let listed = pods.list(&ListParams::default()).await.context("read the sync's pods")?;
-    Ok(Frame { view, limits: declared_limits(&listed.items) })
+/// SUT + driver `/metrics` over port-forwards
+///
+/// - Tunnel dropped when its own read fails → re-resolved next tick (pods get replaced mid-run)
+struct LiveSampler {
+    client: kube::Client,
+    id: String,
+    http: reqwest::Client,
+    sut: Option<SutTap>,
+    driver: Option<Forwarder>,
+}
+
+/// Tunnel to the SUT + its rolling rows. Replaced with the pod (a new pod = new counters)
+struct SutTap {
+    forwarder: Forwarder,
+    live: Live,
+    heights: Heights,
+}
+
+impl LiveSampler {
+    fn new(client: kube::Client, id: &str) -> LiveSampler {
+        LiveSampler { client, id: id.into(), http: reqwest::Client::new(), sut: None, driver: None }
+    }
+
+    /// Slot taken per read, restored only on success (a dropped tunnel = re-resolve)
+    async fn read(&mut self) -> LiveRead {
+        let driver = match self.driver.take() {
+            Some(driver) => driver,
+            None => {
+                let pod = driver_pod_for(&self.id);
+                forward(&self.client, RUN_NAMESPACE, &pod, SYNC_DRIVER_METRICS).await?
+            }
+        };
+        let origin = scrape_local(&self.http, &driver)
+            .await
+            .map_err(|e| format!("driver /metrics: {e}"))?
+            .level(driver_family::STARTED);
+        self.driver = Some(driver);
+
+        let mut sut = match self.sut.take() {
+            Some(sut) => sut,
+            None => open_sut(&self.client, &self.id).await?,
+        };
+        let exposition = scrape_local(&self.http, &sut.forwarder)
+            .await
+            .map_err(|e| format!("indexer /metrics: {e}"))?;
+        let sampled = SystemTime::now();
+        sut.live.push(Instant::now(), sampled, exposition);
+        let view = live_view(&sut, origin, sampled);
+        self.sut = Some(sut);
+        Ok(view)
+    }
+}
+
+impl Sample for LiveSampler {
+    type Out = LiveRead;
+    fn sample(&mut self) -> Pin<Box<dyn Future<Output = LiveRead> + Send + '_>> {
+        Box::pin(self.read())
+    }
+}
+
+/// `origin` = the driver's segment start (unix secs), the one uptime `status` also spans from
+fn live_view(sut: &SutTap, origin: Option<f64>, sampled: SystemTime) -> ReportView {
+    let mut view = ReportView::default();
+    place_by_facet(&mut view, &sut.live.series());
+    let height = |gauge| sut.live.latest().and_then(|e| e.height(gauge));
+    let target = sut.heights.target.and_then(height).filter(|&t| t > 0);
+    view.height = height(sut.heights.height).zip(target);
+    view.span = origin.map(|o| (UNIX_EPOCH + Duration::from_secs_f64(o), sampled));
+    view
+}
+
+async fn open_sut(client: &kube::Client, id: &str) -> Result<SutTap, String> {
+    let ns = namespace_for(id);
+    let pod =
+        sut_pod(&Api::namespaced(client.clone(), &ns)).await.ok_or("no running indexer yet")?;
+    let name = pod.metadata.name.clone().unwrap_or_default();
+    let backend = pod
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(COMPONENT_LABEL))
+        .ok_or_else(|| format!("{name} carries no {COMPONENT_LABEL} label"))?;
+    let (rows, heights) = ztest::backends::observed_backend(backend)
+        .ok_or_else(|| format!("{backend} declares no sync metrics layout"))?;
+    let port =
+        metrics_port(&pod).ok_or_else(|| format!("{name} declares no `{PORT_NAME}` port"))?;
+    let forwarder = forward(client, &ns, &name, port).await?;
+    Ok(SutTap { forwarder, live: Live::new(rows), heights })
+}
+
+fn metrics_port(pod: &Pod) -> Option<u16> {
+    pod.spec
+        .as_ref()?
+        .containers
+        .iter()
+        .flat_map(|c| c.ports.iter().flatten())
+        .find(|p| p.name.as_deref() == Some(PORT_NAME))
+        .and_then(|p| u16::try_from(p.container_port).ok())
+}
+
+async fn forward(
+    client: &kube::Client,
+    ns: &str,
+    pod: &str,
+    port: u16,
+) -> Result<Forwarder, String> {
+    Forwarder::start(client.clone(), ns.to_string(), pod.to_string(), port)
+        .await
+        .map_err(|e| format!("port-forward {pod}:{port}: {e}"))
+}
+
+async fn scrape_local(http: &reqwest::Client, forwarder: &Forwarder) -> Result<Exposition, String> {
+    let base = format!("http://127.0.0.1:{}", forwarder.local_port);
+    ztest::api::metrics::scrape(http, &base, LIVE_SCRAPE_TIMEOUT).await.map_err(|e| e.to_string())
+}
+
+/// Container usage off the TSDB's trailing [`LOAD_WINDOW`] + declared limits off the pod specs
+struct LoadSampler {
+    client: kube::Client,
+    id: String,
+}
+
+impl LoadSampler {
+    async fn read(&self) -> LoadRead {
+        let ns = namespace_for(&self.id);
+        let now = SystemTime::now();
+        let window = (now.checked_sub(LOAD_WINDOW).unwrap_or(UNIX_EPOCH), now);
+        let history = ztest::api::metrics::container_history(&self.client, &ns, window)
+            .await
+            .map_err(|e| format!("prometheus unreadable · {e}"))?;
+        let pods = Api::<Pod>::namespaced(self.client.clone(), &ns)
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| format!("read the sync's pods: {e}"))?;
+        Ok((by_component(history), declared_limits(&pods.items)))
+    }
+}
+
+impl Sample for LoadSampler {
+    type Out = LoadRead;
+    fn sample(&mut self) -> Pin<Box<dyn Future<Output = LoadRead> + Send + '_>> {
+        Box::pin(self.read())
+    }
 }
 
 /// Declared limit per container; none declared = no entry (Burstable → bare usage)
@@ -233,30 +390,27 @@ fn declared_limits(pods: &[Pod]) -> HashMap<String, Resources> {
         .collect()
 }
 
-/// One read → the panel.
-///
-/// - Vitals advance only when the TSDB did (a re-read re-dated as fresh hides a stalled scrape)
-/// - Failed read keeps the last vitals, which then age out as stale
-fn fold(state: &mut SyncWatchState, newest: &mut Option<SystemTime>, read: Read, at: Duration) {
-    let frame = match read {
-        Ok(frame) => frame,
-        Err(why) => {
-            state.metrics_note = Some(format!("prometheus unreadable · {why}"));
-            return;
+/// One live read → the vitals. Failed read keeps the last vitals, which then age out as stale
+fn fold_live(state: &mut SyncWatchState, read: LiveRead, at: Duration) {
+    match read {
+        Ok(view) => {
+            if let Some(vitals) = SyncVitals::of(&view, at) {
+                state.vitals = Some(vitals);
+            }
+            state.metrics_note = state.vitals.is_none().then(|| "no height scraped yet".into());
         }
-    };
-    let sampled = frame.view.span.map(|(_, to)| to);
-    if sampled > *newest {
-        *newest = sampled;
-        state.vitals = SyncVitals::of(&frame.view, at);
+        Err(why) => state.metrics_note = Some(why),
     }
-    state.metrics_note = match (&frame.view.note, &state.vitals) {
-        (Some(note), _) => Some(note.clone()),
-        (None, None) => Some("no height scraped yet".into()),
-        (None, Some(_)) => None,
-    };
-    state.loads = loads(&frame.view.resources, &frame.limits);
-    state.loads_note = frame.view.note;
+}
+
+fn fold_loads(state: &mut SyncWatchState, read: LoadRead) {
+    match read {
+        Ok((resources, limits)) => {
+            state.loads = loads(&resources, &limits);
+            state.loads_note = None;
+        }
+        Err(why) => state.loads_note = Some(why),
+    }
 }
 
 /// Newest cpu + memory per container, beside its declared limit
@@ -283,11 +437,11 @@ fn loads(
 
 // ────────────────────────────── log tail ──────────────────────────────
 
-/// Merge driver log + SUT log + TSDB reads + pod-phase poll until the driver's stream ends or the
-/// user detaches
+/// Merge driver log + SUT log + live/load reads + pod-phase poll until the driver's stream ends or
+/// the user detaches
 async fn tail_loop(
     (driver, api): (&DriverPod, &Api<Pod>),
-    reader: &mut Reader,
+    (live, loads): (&mut Poller<LiveRead>, &mut Poller<LoadRead>),
     console: &Console,
     session_start: Instant,
     state: &mut SyncWatchState,
@@ -296,7 +450,6 @@ async fn tail_loop(
 ) -> Result<()> {
     // Last cause shown → a standing condition is scrolled once, not once per read
     let mut last_note: Option<String> = None;
-    let mut newest: Option<SystemTime> = None;
 
     let started = open_driver_log(driver, &|| console.cancelled(), |phase| {
         state.pod_phase = phase;
@@ -322,7 +475,7 @@ async fn tail_loop(
         }
         // Applied after the `select!`: no handler may mutate what another arm borrows
         let (mut close_sut, mut lost_driver) = (false, false);
-        let mut next_read: Option<Read> = None;
+        let (mut next_live, mut next_loads): (Option<LiveRead>, Option<LoadRead>) = (None, None);
         tokio::select! {
             line = driver_log.next() => match line {
                 Some(Ok(l)) => {
@@ -339,7 +492,8 @@ async fn tail_loop(
                 // SUT stream ending != run ending (restarted/replaced pod): drop, let the poll reopen
                 Some(Err(_)) | None => close_sut = true,
             },
-            read = reader.changed() => next_read = Some(read),
+            read = live.changed() => next_live = Some(read),
+            read = loads.changed() => next_loads = Some(read),
             _ = ticker.tick() => {
                 if let Ok(Some(pod)) = driver.get().await {
                     let phase = driver_phase(&pod);
@@ -366,8 +520,12 @@ async fn tail_loop(
                 }
             }
         }
-        if let Some(read) = next_read {
-            fold(state, &mut newest, read, session_start.elapsed());
+        if let Some(read) = next_loads {
+            fold_loads(state, read);
+            render(state);
+        }
+        if let Some(read) = next_live {
+            fold_live(state, read, session_start.elapsed());
             // Panel names the cause; scrollback echoes it once, so a cleared condition leaves a trace
             let note = state.metrics_note.clone();
             if note != last_note
@@ -522,14 +680,16 @@ async fn open_log(
     Ok(Box::pin(api.log_stream(pod, &lp).await?.lines()))
 }
 
-/// Running indexer pod's name; `None` until the driver provisions one (caller retries)
-async fn find_sut(api: &Api<Pod>) -> Option<String> {
+/// Running indexer pod; `None` until the driver provisions one (caller retries)
+async fn sut_pod(api: &Api<Pod>) -> Option<Pod> {
     let pods = api.list(&ListParams::default().labels(SUT_SELECTOR)).await.ok()?;
     pods.items
         .into_iter()
-        .find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))?
-        .metadata
-        .name
+        .find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))
+}
+
+async fn find_sut(api: &Api<Pod>) -> Option<String> {
+    sut_pod(api).await?.metadata.name
 }
 
 /// Next line of an optional stream; `None` parks forever, so `select!` ignores it until one opens
@@ -579,46 +739,56 @@ mod tests {
     use super::*;
     use ztest::api::GIB;
 
-    fn frame(sampled_secs: u64, height: Option<u32>) -> Read {
-        Ok(Frame {
-            view: ReportView {
-                height: height.map(|h| (h, 1_000)),
-                span: Some((UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(sampled_secs))),
-                ..ReportView::default()
-            },
-            limits: HashMap::new(),
+    fn read(sampled_secs: u64, height: Option<u32>) -> LiveRead {
+        Ok(ReportView {
+            height: height.map(|h| (h, 1_000)),
+            span: Some((UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(sampled_secs))),
+            ..ReportView::default()
         })
     }
 
-    /// A stalled scrape re-read every interval must age out as stale, not re-date as fresh
     #[test]
-    fn vitals_date_to_the_tsdb_advancing_not_to_the_read() {
-        let (mut state, mut newest) = (SyncWatchState::default(), None);
-        fold(&mut state, &mut newest, frame(60, Some(500)), Duration::from_secs(1));
-        fold(&mut state, &mut newest, frame(60, Some(500)), Duration::from_secs(9));
-        assert_eq!(state.vitals.as_ref().map(|v| v.received_at), Some(Duration::from_secs(1)));
-
-        fold(&mut state, &mut newest, frame(65, Some(510)), Duration::from_secs(10));
+    fn each_live_read_dates_the_vitals_it_carries() {
+        let mut state = SyncWatchState::default();
+        fold_live(&mut state, read(60, Some(500)), Duration::from_secs(1));
+        fold_live(&mut state, read(61, Some(510)), Duration::from_secs(2));
         let v = state.vitals.as_ref().expect("vitals");
-        assert_eq!((v.height, v.received_at), (510, Duration::from_secs(10)));
+        assert_eq!(
+            (v.height, v.received_at, v.span),
+            (510, Duration::from_secs(2), Duration::from_secs(61))
+        );
     }
 
     #[test]
     fn a_failed_read_keeps_the_last_vitals_and_names_the_cause() {
-        let (mut state, mut newest) = (SyncWatchState::default(), None);
-        fold(&mut state, &mut newest, frame(60, Some(500)), Duration::ZERO);
-        fold(&mut state, &mut newest, Err("connection refused".into()), Duration::from_secs(5));
+        let mut state = SyncWatchState::default();
+        fold_live(&mut state, read(60, Some(500)), Duration::ZERO);
+        fold_live(
+            &mut state,
+            Err("indexer /metrics: connection refused".into()),
+            Duration::from_secs(5),
+        );
         assert_eq!(state.vitals.as_ref().map(|v| v.height), Some(500));
         let note = state.metrics_note.as_deref().unwrap_or_default();
         assert!(note.contains("connection refused"), "{note}");
     }
 
     #[test]
-    fn before_the_first_commit_the_panel_says_why_it_is_empty() {
-        let (mut state, mut newest) = (SyncWatchState::default(), None);
-        fold(&mut state, &mut newest, frame(5, None), Duration::ZERO);
+    fn before_the_first_fetch_the_panel_says_why_it_is_empty() {
+        let mut state = SyncWatchState::default();
+        fold_live(&mut state, read(5, None), Duration::ZERO);
         assert!(state.vitals.is_none());
         assert_eq!(state.metrics_note.as_deref(), Some("no height scraped yet"));
+    }
+
+    /// Load failure names itself on the load column, never on the vitals
+    #[test]
+    fn a_failed_load_read_leaves_the_vitals_note_alone() {
+        let mut state = SyncWatchState::default();
+        fold_live(&mut state, read(60, Some(500)), Duration::ZERO);
+        fold_loads(&mut state, Err("prometheus unreadable · timeout".into()));
+        assert_eq!(state.metrics_note, None);
+        assert_eq!(state.loads_note.as_deref(), Some("prometheus unreadable · timeout"));
     }
 
     fn newest_at(value: f64) -> Series {

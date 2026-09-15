@@ -279,9 +279,9 @@ impl TransferState {
 
 // ─────────────────────────── sync watch (all three columns) ───────────
 
-/// `ztest sync watch` panel model: one [`ReportView`] per scrape interval + the driver pod's phase.
+/// `ztest sync watch` panel model: vitals per live read, loads per TSDB read, driver pod's phase.
 ///
-/// - Same TSDB read `status` draws (a live panel off another source would disagree with the report)
+/// - Vitals off the SUT's `/metrics` direct, placed into a [`ReportView`] the way `status` places them
 /// - `metrics_note` / `loads_note` = why a column is empty (blank rows read as an idle subject)
 #[derive(Debug, Clone, Default)]
 pub struct SyncWatchState {
