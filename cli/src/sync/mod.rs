@@ -27,7 +27,7 @@ use serde_json::json;
 
 use clap::{Args as ClapArgs, Subcommand};
 
-use ztest::api::metrics::{Reading, Series};
+use ztest::api::metrics::Series;
 use ztest::api::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
 use ztest::api::pipeline::BuildOutcome;
 use ztest::api::pipeline::DumpOutcome;
@@ -1434,13 +1434,14 @@ async fn build_report_view(client: &Client, ns: &str, mut view: ReportView) -> R
 
             // Resolved by declared gauge, never by display label: a reworded row must not
             // silently drop the height check
+            // - Level reading, not family (one gauge also backs a `slope` row → blk/s as height)
             let heights: Vec<ztest::api::Heights> = ztest::backends::metrics_heights().collect();
             let progress =
                 |pick: fn(&ztest::api::Heights) -> Option<ztest::api::metrics::Gauge>| {
                     heights.iter().filter_map(pick).find_map(|gauge| {
                         series
                             .iter()
-                            .find(|s| s.reading.map(Reading::family) == Some(gauge.family()))
+                            .find(|s| s.reading == Some(gauge.level()))
                             .and_then(ztest::api::metrics::Series::last)
                             .map(|v| v as u32)
                     })
