@@ -222,6 +222,34 @@ impl ValidatorBackend for ZebraValidator {
         self.plumbing.regtest
     }
 
+    /// Re-renders the config `follow` left peerless. Chain volume = the only `cache_dir` a
+    /// following node has, so its absence is a topology error, not an empty peer list
+    fn with_initial_peers(
+        &self,
+        mut opts: crate::component::ComponentOpts,
+        peers: &[std::net::SocketAddr],
+    ) -> Result<crate::component::ComponentOpts, EnvError> {
+        let Some(crate::component::RestoreSource::Follow(snapshot)) = opts.restore else {
+            return Ok(opts);
+        };
+        let cache_dir =
+            opts.shared_state.as_ref().map(|shared| shared.mount_path.clone()).ok_or_else(
+                || EnvError::Config {
+                    reason: "a following zebrad needs a chain volume to write the chain into"
+                        .to_string(),
+                },
+            )?;
+        let toml = public_toml(
+            &opts,
+            snapshot.network,
+            &ChainMotion::Following { peers: peers.to_vec() },
+            &cache_dir,
+        );
+        opts.mounts.retain(|m| m.destination != std::path::Path::new(CONTAINER_CONFIG_PATH));
+        opts.mounts.push(crate::regtest::config_mount_inline(toml, CONTAINER_CONFIG_PATH));
+        Ok(opts)
+    }
+
     fn pod_spec(
         &self,
         opts: &crate::component::ComponentOpts,
@@ -506,7 +534,8 @@ fn restore_public(
         return validator;
     };
 
-    let toml = public_toml(&validator, network, ChainMotion::Pinned, ZEBRAD_PUBLIC_CACHE_DIR);
+    let toml =
+        public_toml(validator.opts(), network, &ChainMotion::Pinned, ZEBRAD_PUBLIC_CACHE_DIR);
     boot_public(validator, toml)
         .mount(crate::regtest::archive_mount(archive.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
 }
@@ -514,27 +543,30 @@ fn restore_public(
 impl crate::component::Validator<ZebraBackend> {
     /// Boot off `volume`'s snapshot, then sync onward with the network (tip moves past the pin).
     ///
+    /// - Peers land at `env.build()` ([`ValidatorBackend::with_initial_peers`]); the seed set is
+    ///   version-filtered there, so this render carries none
     /// - TEMPORARY: shared volume only while zaino ingests via `direct` (fetch migration ~2026-10)
     pub fn follow(mut self, volume: &crate::ChainVolume) -> Self {
         let snapshot = volume.snapshot();
         self.opts.restore = Some(crate::component::RestoreSource::Follow(snapshot));
-        let toml =
-            public_toml(&self, snapshot.network, ChainMotion::Following, volume.mount_path());
+        let toml = public_toml(
+            self.opts(),
+            snapshot.network,
+            &ChainMotion::Following { peers: Vec::new() },
+            volume.mount_path(),
+        );
         boot_public(self, toml).mount(volume)
     }
 }
 
 fn public_toml(
-    validator: &crate::component::Validator<ZebraBackend>,
+    opts: &crate::component::ComponentOpts,
     network: crate::Network,
-    motion: ChainMotion,
+    motion: &ChainMotion,
     cache_dir: &str,
 ) -> String {
-    let version = validator
-        .opts()
-        .version
-        .parse::<crate::regtest_conf::Semver>()
-        .expect("zebrad version must be semver");
+    let version =
+        opts.version.parse::<crate::regtest_conf::Semver>().expect("zebrad version must be semver");
     crate::public_conf::public_zebrad_conf(
         network,
         motion,
@@ -544,7 +576,7 @@ fn public_toml(
         // Always on for a public restore (colocated zaino `Direct` needs an
         // address to dial; `serves_indexer_grpc` exposes the port to match).
         Some(crate::ports::ZEBRAD_INDEXER),
-        validator.opts().image.metrics_enabled().then(|| ZebraBackend.metrics_port()).flatten(),
+        opts.image.metrics_enabled().then(|| ZebraBackend.metrics_port()).flatten(),
     )
 }
 

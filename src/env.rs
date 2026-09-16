@@ -189,6 +189,10 @@ impl EnvInner {
     }
 }
 
+/// Initial peers a following validator starts with. Enough that losing a few to churn still
+/// leaves gossip running; the crawler grows the set from there
+const FOLLOWING_PEERS_WANTED: usize = 8;
+
 // ──────────────────────── pending entries ─────────────────────────────
 
 struct PendingValidator {
@@ -564,6 +568,40 @@ impl TestEnv {
         Ok(())
     }
 
+    /// Hand every following validator the peers it may legally talk to.
+    ///
+    /// - A node past an upgrade MUST refuse peers below that epoch's protocol version (ZIP-204),
+    ///   and the DNS seeders answer mostly with un-upgraded nodes → an unfiltered seed set leaves
+    ///   it crawling forever, looking exactly like a slow sync
+    /// - Fails the build instead: a peerless validator is hours of green-looking nothing
+    async fn resolve_following_peers(&mut self) -> Result<(), EnvError> {
+        for pending in &mut self.pending_validators {
+            let Some(crate::component::RestoreSource::Follow(snapshot)) = pending.opts.restore
+            else {
+                continue;
+            };
+            let min_version =
+                crate::protocol::p2p::epoch_min_version(snapshot.network, snapshot.tip_height);
+            tracing::info!(
+                stage = "validator",
+                network = snapshot.network.as_str(),
+                min_version,
+                "discovering peers for the network this chain follows"
+            );
+            let peers = crate::protocol::p2p::compatible_peers(
+                snapshot.network,
+                min_version,
+                FOLLOWING_PEERS_WANTED,
+            )
+            .await
+            .map_err(|e| EnvError::Config { reason: e.to_string() })?;
+            tracing::info!(stage = "validator", peers = peers.len(), "peers resolved");
+            let opts = std::mem::take(&mut pending.opts);
+            pending.opts = pending.handle.with_initial_peers(opts, &peers)?;
+        }
+        Ok(())
+    }
+
     /// The chain this env restored: its pin, its network, and the artifact it came from.
     ///
     /// Written at the declaration in [`ztest::snapshots`](crate::snapshots), and checked
@@ -645,6 +683,7 @@ impl TestEnv {
         self.validate_topology()?;
         self.resolve_snapshot_pin()?;
         self.materialize_configs()?;
+        self.resolve_following_peers().await?;
 
         let started = std::time::Instant::now();
         let coords = RunCoords::from_env().map_err(env_err)?;

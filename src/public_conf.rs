@@ -24,12 +24,20 @@ fn assert_public(network: Network, who: &str) {
 
 // ─────────────────────────────── zebrad ───────────────────────────────
 
-/// Whether a restored node stays on its snapshot or syncs onward from it
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Whether a restored node stays on its snapshot or syncs onward from it.
+///
+/// - `Following` carries the peers it starts from: the seeders answer mostly with un-upgraded
+///   nodes, which a node past an upgrade MUST refuse (ZIP-204), so an unfiltered seed set can
+///   leave it crawling forever. [`crate::protocol::p2p`] picks them
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainMotion {
     Pinned,
-    Following,
+    Following { peers: Vec<std::net::SocketAddr> },
 }
+
+/// Outbound peers a following node aims for. Above zebra's default 25 because the compatible
+/// share of the address space is small
+const FOLLOWING_PEERSET_TARGET: u32 = 75;
 
 /// Render a public-network `zebrad.toml`.
 ///
@@ -37,7 +45,7 @@ pub enum ChainMotion {
 /// `[state] cache_dir` points there (tests say why `[network] cache_dir` must not)
 pub fn public_zebrad_conf(
     network: Network,
-    motion: ChainMotion,
+    motion: &ChainMotion,
     _version: Semver,
     rpc_port: u16,
     cache_dir: &str,
@@ -57,16 +65,21 @@ pub fn public_zebrad_conf(
     };
     let network_name = network.zebra_name();
     let peers_key = network.initial_peers_key();
-    // Default seeds + crawler + real sync-progress reporting = what `Following` leaves in place
-    let (peering, finished_sync) = match motion {
+    let (peering, finished_sync, peerset_target) = match motion {
         ChainMotion::Pinned => (
             format!(
                 "\n# Never: empty seeds stop the dial list, not the crawler.\n\
                  crawl_new_peer_interval = \"365d\"\n{peers_key} = []"
             ),
             "\n# The chain is complete at the pinned height.\ndebug_force_finished_sync = true",
+            25,
         ),
-        ChainMotion::Following => (String::new(), ""),
+        // Version-filtered, so the node dials peers it may actually talk to; the crawler and the
+        // DNS seeds stay on underneath (ZIP-204 §Peer Discovery)
+        ChainMotion::Following { peers } => {
+            let list = peers.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", ");
+            (format!("\n{peers_key} = [{list}]"), "", FOLLOWING_PEERSET_TARGET)
+        }
     };
     format!(
         "\
@@ -86,7 +99,7 @@ tx_cost_limit = 80000000
 cache_dir = false{peering}
 listen_addr = \"0.0.0.0:0\"
 network = \"{network_name}\"
-peerset_initial_target_size = 25
+peerset_initial_target_size = {peerset_target}
 
 [rpc]{finished_sync}
 enable_cookie_auth = false
@@ -206,7 +219,7 @@ mod tests {
         for network in PUBLIC {
             let toml = public_zebrad_conf(
                 network,
-                ChainMotion::Pinned,
+                &ChainMotion::Pinned,
                 v(),
                 18232,
                 "/var/cache/zebrad",
@@ -230,7 +243,7 @@ mod tests {
         for network in PUBLIC {
             let toml = public_zebrad_conf(
                 network,
-                ChainMotion::Pinned,
+                &ChainMotion::Pinned,
                 v(),
                 18232,
                 "/var/cache/zebrad",
@@ -249,7 +262,7 @@ mod tests {
     fn each_network_empties_its_own_peer_list() {
         let main = public_zebrad_conf(
             Network::Mainnet,
-            ChainMotion::Pinned,
+            &ChainMotion::Pinned,
             v(),
             18232,
             "/var/cache/zebrad",
@@ -262,7 +275,7 @@ mod tests {
 
         let test = public_zebrad_conf(
             Network::Testnet,
-            ChainMotion::Pinned,
+            &ChainMotion::Pinned,
             v(),
             18232,
             "/var/cache/zebrad",
@@ -303,7 +316,7 @@ mod tests {
         let net = Network::Testnet;
         let off = public_zebrad_conf(
             net,
-            ChainMotion::Pinned,
+            &ChainMotion::Pinned,
             v(),
             18232,
             "/var/cache/zebrad",
@@ -312,7 +325,7 @@ mod tests {
         );
         let on = public_zebrad_conf(
             net,
-            ChainMotion::Pinned,
+            &ChainMotion::Pinned,
             v(),
             18232,
             "/var/cache/zebrad",
@@ -364,7 +377,7 @@ mod tests {
             ));
             confs.push(public_zebrad_conf(
                 network,
-                ChainMotion::Pinned,
+                &ChainMotion::Pinned,
                 v(),
                 18232,
                 "/var/cache/zebrad",
@@ -392,7 +405,7 @@ mod tests {
     fn regtest_is_rejected_rather_than_rendered() {
         public_zebrad_conf(
             Network::Regtest,
-            ChainMotion::Pinned,
+            &ChainMotion::Pinned,
             v(),
             18232,
             "/var/cache/zebrad",
@@ -408,17 +421,42 @@ mod tests {
         for network in PUBLIC {
             let toml = public_zebrad_conf(
                 network,
-                ChainMotion::Following,
+                &ChainMotion::Following { peers: Vec::new() },
                 v(),
                 18232,
                 "/shared/chain",
                 None,
                 None,
             );
-            assert!(!toml.contains(network.initial_peers_key()));
             assert!(!toml.contains("crawl_new_peer_interval"));
             assert!(!toml.contains("debug_force_finished_sync"));
             assert!(toml.contains("cache_dir = false"), "peer cache stays out of the mount");
+            assert!(toml.contains("peerset_initial_target_size = 75"));
         }
+    }
+
+    /// Discovered peers ride the network's own key: the wrong one leaves the default seed list in
+    /// force, which is the un-upgraded set a following node must refuse
+    #[test]
+    fn discovered_peers_land_on_the_networks_own_initial_peers_key() {
+        let peers = vec![
+            "38.190.136.76:8233".parse().expect("addr"),
+            "142.93.27.189:8233".parse().expect("addr"),
+        ];
+        let toml = public_zebrad_conf(
+            Network::Mainnet,
+            &ChainMotion::Following { peers },
+            v(),
+            18232,
+            "/shared/chain",
+            None,
+            None,
+        );
+        assert!(
+            toml.contains(
+                "initial_mainnet_peers = [\"38.190.136.76:8233\", \"142.93.27.189:8233\"]"
+            )
+        );
+        assert!(!toml.contains("initial_testnet_peers"));
     }
 }

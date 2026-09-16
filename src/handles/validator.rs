@@ -135,6 +135,17 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
         pod_name: String,
     ) -> Result<crate::manifest::PodSpec, crate::EnvError>;
 
+    /// Initial peers for a `RestoreSource::Follow` validator, resolved during
+    /// [`TestEnv::build`](crate::TestEnv::build) because only a running env can dial the network.
+    /// Backends that cannot follow keep their config
+    fn with_initial_peers(
+        &self,
+        opts: crate::component::ComponentOpts,
+        _peers: &[std::net::SocketAddr],
+    ) -> Result<crate::component::ComponentOpts, crate::EnvError> {
+        Ok(opts)
+    }
+
     /// Resolve a named endpoint (e.g. `"rpc"`)
     async fn endpoint(&self, name: &str) -> Result<Endpoint, EnvError>;
 
