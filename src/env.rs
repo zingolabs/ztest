@@ -193,6 +193,28 @@ impl EnvInner {
 /// leaves gossip running; the crawler grows the set from there
 const FOLLOWING_PEERS_WANTED: usize = 8;
 
+/// A peer accepts one connection per remote IP and resets the next until it forgets the last
+/// (measured 2026-09-16 against `/Zakura:1.0.0-rc*/`: reset at 0 s, partial at 30 s, clean at 60 s).
+///
+/// - Discovery and the validator dial from one cluster egress IP, so the probe that *finds* a peer
+///   is what the validator's own dial collides with
+/// - Slept before any pod exists, so the image pull and schedule that follow count toward it
+const PEER_COOLDOWN: Duration = Duration::from_secs(90);
+
+/// Sleep off whatever remains of [`PEER_COOLDOWN`] since the peers were probed
+async fn wait_out_peer_cooldown(probed_at: Instant) {
+    let remaining = PEER_COOLDOWN.saturating_sub(probed_at.elapsed());
+    if remaining.is_zero() {
+        return;
+    }
+    tracing::info!(
+        stage = "validator",
+        seconds = remaining.as_secs(),
+        "waiting out the per-IP peer cooldown discovery just spent"
+    );
+    tokio::time::sleep(remaining).await;
+}
+
 // ──────────────────────── pending entries ─────────────────────────────
 
 struct PendingValidator {
@@ -575,6 +597,7 @@ impl TestEnv {
     ///   it crawling forever, looking exactly like a slow sync
     /// - Fails the build instead: a peerless validator is hours of green-looking nothing
     async fn resolve_following_peers(&mut self) -> Result<(), EnvError> {
+        let mut probed_at = None;
         for pending in &mut self.pending_validators {
             let Some(crate::component::RestoreSource::Follow(snapshot)) = pending.opts.restore
             else {
@@ -596,8 +619,12 @@ impl TestEnv {
             .await
             .map_err(|e| EnvError::Config { reason: e.to_string() })?;
             tracing::info!(stage = "validator", peers = peers.len(), "peers resolved");
+            probed_at = Some(Instant::now());
             let opts = std::mem::take(&mut pending.opts);
             pending.opts = pending.handle.with_initial_peers(opts, &peers)?;
+        }
+        if let Some(probed_at) = probed_at {
+            wait_out_peer_cooldown(probed_at).await;
         }
         Ok(())
     }
