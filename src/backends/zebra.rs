@@ -180,22 +180,37 @@ pub struct ZebraValidator {
 mod family {
     use crate::metrics::{Counter, Dimension, Gauge, counter, gauge};
 
-    pub const VERIFIED_HEIGHT: Gauge =
-        gauge("zebrad_chain_verified_block_height", Dimension::Count);
+    pub const VERIFIED_HEIGHT: Gauge = gauge("zcash_chain_verified_block_height", Dimension::Count);
     pub const VERIFIED_TOTAL: Counter =
-        counter("zebrad_chain_verified_block_total", Dimension::Count);
-    pub const PEERS: Gauge = gauge("zebrad_network_peers", Dimension::Count);
+        counter("zcash_chain_verified_block_total", Dimension::Count);
+    /// Single-series (`network` label only) → a `level` read is the peer count. The per-peer
+    /// `zcash_net_peers_connected` is one series per remote, each `1`, so it reads as `1`
+    pub const PEERS: Gauge = gauge("zcash_net_peers", Dimension::Count);
+    /// Highest tip the peerset advertises = `getblockchaininfo`'s `estimatedheight`. Extrapolated
+    /// from block times, so it drifts tens of blocks; unpublished while peerless
+    pub const NETWORK_TIP: Gauge = gauge("sync_estimated_network_tip_height", Dimension::Count);
 }
 
 #[rustfmt::skip]
-const ROWS: [Row; 3] = [
+const ROWS: [Row; 4] = [
     row("validator best height", family::VERIFIED_HEIGHT.level(), Facet::Progress),
+    row("network tip", family::NETWORK_TIP.level(), Facet::Progress),
     row("blocks verified", family::VERIFIED_TOTAL.rate(), Facet::Throughput),
     row("connected peers", family::PEERS.level(), Facet::Progress),
 ];
 
 impl crate::metrics::MetricLayout for ZebraValidator {
     const ROWS: &'static [Row] = &ROWS;
+}
+
+impl ZebraValidator {
+    /// Not a sync subject (it publishes no per-op work), but a following node's `tip` is the
+    /// denominator such a run measures against — the live chain, not the pin it started from
+    pub(crate) const HEIGHTS: crate::sync::Heights = crate::sync::Heights {
+        height: family::VERIFIED_HEIGHT,
+        target: None,
+        tip: Some(family::NETWORK_TIP),
+    };
 }
 
 #[async_trait]
@@ -550,7 +565,10 @@ fn public_toml(
         // Always on for a public restore (colocated zaino `Direct` needs an
         // address to dial; `serves_indexer_grpc` exposes the port to match).
         Some(crate::ports::ZEBRAD_INDEXER),
-        opts.image.metrics_enabled().then(|| ZebraBackend.metrics_port()).flatten(),
+        // Unconditional: zfnd's published images ship the exporter compiled in, and `pod_spec`
+        // declares the port either way (`metrics_enabled` gates a *build* feature, which is a
+        // zaino concern). Gating here left a declared port nothing listened on.
+        ZebraBackend.metrics_port(),
     )
 }
 
@@ -581,16 +599,10 @@ impl ZebraValidator {
         ZcashRpc::new(COMPONENT, &self.rpc_client().await?).peer_info().await
     }
 
-    /// Peers held AND tip within `ready_max_blocks_behind` of the network's. The only honest
-    /// "caught up" oracle: `getblockchaininfo`'s `estimated_height` is extrapolated from block
-    /// times, so a node whose crawler has stalled reads as caught-up through it.
+    /// Peers held, however far behind the tip. Served only by a `.follow(..)` validator
     ///
-    /// - Served only by a `.follow(..)` validator; anything else is a topology error
-    pub async fn at_network_tip(&self) -> Result<Health, RpcError> {
-        self.health("ready").await
-    }
-
-    /// Peers held, however far behind the tip
+    /// - A peerless node still answers every height query off its snapshot, so this is the only
+    ///   thing separating "syncing slowly" from "never connected"
     pub async fn has_peers(&self) -> Result<Health, RpcError> {
         self.health("healthy").await
     }
@@ -694,6 +706,40 @@ mod tests {
         assert!(serves_health(&following));
         assert!(!serves_health(&opts_restoring(crate::Network::Mainnet)));
         assert!(!serves_health(&ComponentOpts::default()));
+    }
+
+    /// Verbatim from `zfnd/zebra:6.3.0` on mainnet. A renamed family reads as *unpublished*
+    /// rather than failing, so every declared name is pinned against real output here —
+    /// `zebrad_*` was the wrong prefix and drew three blank rows for as long as it stood.
+    const EXPOSITION: &str = "\
+# TYPE zcash_chain_verified_block_height gauge
+zcash_chain_verified_block_height 2800
+# TYPE zcash_chain_verified_block_total counter
+zcash_chain_verified_block_total 2801
+# TYPE zcash_net_peers gauge
+zcash_net_peers{network=\"mainnet\"} 6
+# TYPE sync_estimated_network_tip_height gauge
+sync_estimated_network_tip_height 3506187
+";
+
+    #[test]
+    fn every_declared_family_resolves_against_a_real_zebra_exposition() {
+        let mut e = crate::metrics::Exposition::default();
+        e.absorb(EXPOSITION);
+        assert_eq!(e.height(family::VERIFIED_HEIGHT), Some(2800));
+        assert_eq!(e.counter_total(family::VERIFIED_TOTAL), Some(2801));
+        assert_eq!(e.height(family::PEERS), Some(6));
+        assert_eq!(e.height(family::NETWORK_TIP), Some(3_506_187));
+    }
+
+    /// The panel's denominator for a following run; `tip`, not `target` (zebrad publishes no
+    /// target — it is not building toward a fixed height)
+    #[test]
+    fn the_network_tip_is_the_height_a_watcher_reads_off_zebrad() {
+        let heights = ZebraValidator::HEIGHTS;
+        assert_eq!(heights.tip, Some(family::NETWORK_TIP));
+        assert_eq!(heights.target, None);
+        assert_eq!(heights.height, family::VERIFIED_HEIGHT);
     }
 
     /// `Direct` refuses to construct without a gRPC address to dial → unserved

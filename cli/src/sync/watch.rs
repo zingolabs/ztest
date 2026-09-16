@@ -1,6 +1,7 @@
 //! `ztest sync watch` — the live view of a detached sync.
 //!
-//! - Vitals = SUT + driver `/metrics` scraped direct every [`LIVE_INTERVAL`] (`status` = the TSDB)
+//! - Vitals = SUT + driver + validator `/metrics` scraped direct every [`LIVE_INTERVAL`]
+//!   (`status` = the TSDB); validator = the live network tip a following run counts up to
 //! - Loads = cAdvisor off the TSDB (no component sees its own cgroup)
 //! - Scrollback = driver-pod log + indexer-under-test log, verbatim
 //! - All over the kube API (no `kubectl` on the laptop)
@@ -65,6 +66,9 @@ const TAIL_LINES: i64 = 200;
 /// Component whose **log** rides alongside the driver's, by category (`lightwalletd` followed
 /// like `zainod`)
 const SUT_SELECTOR: &str = "ztest.io/component-category=indexer";
+
+/// Validator pod: its exporter carries the network tip a following run measures against
+const VALIDATOR_SELECTOR: &str = "ztest.io/component-category=validator";
 
 /// Backend a pod runs → the metric layout its `/metrics` is read with
 const COMPONENT_LABEL: &str = "ztest.io/component";
@@ -244,6 +248,7 @@ struct LiveSampler {
     http: reqwest::Client,
     sut: Option<SutTap>,
     driver: Option<Forwarder>,
+    validator: Option<ValidatorTap>,
 }
 
 /// Tunnel to the SUT + its rolling rows. Replaced with the pod (a new pod = new counters)
@@ -253,9 +258,22 @@ struct SutTap {
     heights: Heights,
 }
 
+/// Tunnel to the validator + the height gauges its exposition is read with
+struct ValidatorTap {
+    forwarder: Forwarder,
+    heights: Heights,
+}
+
 impl LiveSampler {
     fn new(client: kube::Client, id: &str) -> LiveSampler {
-        LiveSampler { client, id: id.into(), http: reqwest::Client::new(), sut: None, driver: None }
+        LiveSampler {
+            client,
+            id: id.into(),
+            http: reqwest::Client::new(),
+            sut: None,
+            driver: None,
+            validator: None,
+        }
     }
 
     /// Slot taken per read, restored only on success (a dropped tunnel = re-resolve)
@@ -267,22 +285,33 @@ impl LiveSampler {
                 forward(&self.client, RUN_NAMESPACE, &pod, SYNC_DRIVER_METRICS).await?
             }
         };
-        let origin = scrape_local(&self.http, &driver)
-            .await
-            .map_err(|e| format!("driver /metrics: {e}"))?
-            .level(driver_family::STARTED);
-        self.driver = Some(driver);
-
         let mut sut = match self.sut.take() {
             Some(sut) => sut,
             None => open_sut(&self.client, &self.id).await?,
         };
-        let exposition = scrape_local(&self.http, &sut.forwarder)
-            .await
-            .map_err(|e| format!("indexer /metrics: {e}"))?;
+        let validator = match self.validator.take() {
+            Some(tap) => Some(tap),
+            None => open_validator(&self.client, &self.id).await,
+        };
+
+        // Concurrent: three independent tunnels, and serialising them spends one target's
+        // timeout out of the next one's beat (`LIVE_INTERVAL` is the whole budget)
+        let (driver_read, sut_read, (tip, validator)) = tokio::join!(
+            scrape_local(&self.http, &driver),
+            scrape_local(&self.http, &sut.forwarder),
+            network_tip(&self.http, validator),
+        );
+        self.validator = validator;
+
+        // Each slot restored only on its own success — a scrape that failed means a tunnel to
+        // re-resolve next tick (pods get replaced mid-run)
+        let origin = driver_read.map_err(|e| format!("driver /metrics: {e}"))?;
+        self.driver = Some(driver);
+        let origin = origin.level(driver_family::STARTED);
+        let exposition = sut_read.map_err(|e| format!("indexer /metrics: {e}"))?;
         let sampled = SystemTime::now();
         sut.live.push(Instant::now(), sampled, exposition);
-        let view = live_view(&sut, origin, sampled);
+        let view = live_view(&sut, tip, origin, sampled);
         self.sut = Some(sut);
         Ok(view)
     }
@@ -295,15 +324,58 @@ impl Sample for LiveSampler {
     }
 }
 
+/// Network tip the validator sees, or `None` when it publishes none.
+///
+/// - Best-effort: the validator is not the subject, so a dead tunnel drops the tip for this tick
+///   rather than failing a read the SUT answered
+/// - A peerless (pinned) chain has no network tip to publish, which is the honest answer
+async fn network_tip(
+    http: &reqwest::Client,
+    tap: Option<ValidatorTap>,
+) -> (Option<u32>, Option<ValidatorTap>) {
+    let Some(tap) = tap else { return (None, None) };
+    let Ok(exposition) = scrape_local(http, &tap.forwarder).await else {
+        return (None, None);
+    };
+    let tip = tap.heights.tip.and_then(|g| exposition.height(g)).filter(|&t| t > 0);
+    (tip, Some(tap))
+}
+
 /// `origin` = the driver's segment start (unix secs), the one uptime `status` also spans from
-fn live_view(sut: &SutTap, origin: Option<f64>, sampled: SystemTime) -> ReportView {
+fn live_view(
+    sut: &SutTap,
+    network_tip: Option<u32>,
+    origin: Option<f64>,
+    sampled: SystemTime,
+) -> ReportView {
     let mut view = ReportView::default();
     place_by_facet(&mut view, &sut.live.series());
     let height = |gauge| sut.live.latest().and_then(|e| e.height(gauge));
-    let target = sut.heights.target.and_then(height).filter(|&t| t > 0);
+    // Two topologies, two quantities — not a preference order. A following chain's denominator is
+    // the live network tip, republished every scrape; a pinned chain has no network tip (peerless)
+    // and the SUT's own per-pass target IS the snapshot tip, static because the chain is.
+    let target = match network_tip {
+        Some(tip) => Some(tip),
+        None => sut.heights.target.and_then(height).filter(|&t| t > 0),
+    };
     view.height = height(sut.heights.height).zip(target);
     view.span = origin.map(|o| (UNIX_EPOCH + Duration::from_secs_f64(o), sampled));
     view
+}
+
+async fn open_validator(client: &kube::Client, id: &str) -> Option<ValidatorTap> {
+    let ns = namespace_for(id);
+    let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let pods = api.list(&ListParams::default().labels(VALIDATOR_SELECTOR)).await.ok()?;
+    let pod = pods
+        .items
+        .into_iter()
+        .find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))?;
+    let name = pod.metadata.name.clone()?;
+    let backend = pod.metadata.labels.as_ref()?.get(COMPONENT_LABEL)?;
+    let (_, heights) = ztest::backends::observed_backend(backend)?;
+    let forwarder = forward(client, &ns, &name, metrics_port(&pod)?).await.ok()?;
+    Some(ValidatorTap { forwarder, heights })
 }
 
 async fn open_sut(client: &kube::Client, id: &str) -> Result<SutTap, String> {

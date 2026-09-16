@@ -27,15 +27,19 @@ impl MetricsBackend {
         Self { label, rows: <T as crate::metrics::MetricLayout>::ROWS, heights: Some(T::HEIGHTS) }
     }
 
-    /// Publishes rows but no sync progress (nothing to watch a chain build)
-    const fn rows_only<T: crate::metrics::MetricLayout>(label: &'static str) -> Self {
-        Self { label, rows: T::ROWS, heights: None }
+    /// Not a sync subject, but publishes heights a watcher reads — a validator's view of the
+    /// network tip is the denominator a chain-following run measures against
+    const fn reference<T: crate::metrics::MetricLayout>(
+        label: &'static str,
+        heights: crate::sync::Heights,
+    ) -> Self {
+        Self { label, rows: T::ROWS, heights: Some(heights) }
     }
 }
 
 const METRICS_BACKENDS: &[MetricsBackend] = &[
     MetricsBackend::observed::<zainod::ZainoIndexer>("zainod"),
-    MetricsBackend::rows_only::<zebra::ZebraValidator>("zebrad"),
+    MetricsBackend::reference::<zebra::ZebraValidator>("zebrad", zebra::ZebraValidator::HEIGHTS),
 ];
 
 /// Every bundled backend's rows, for a reader with no pod to ask (run namespace
