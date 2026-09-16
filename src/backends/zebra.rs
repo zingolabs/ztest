@@ -222,34 +222,6 @@ impl ValidatorBackend for ZebraValidator {
         self.plumbing.regtest
     }
 
-    /// Re-renders the config `follow` left peerless. Chain volume = the only `cache_dir` a
-    /// following node has, so its absence is a topology error, not an empty peer list
-    fn with_initial_peers(
-        &self,
-        mut opts: crate::component::ComponentOpts,
-        peers: &[std::net::SocketAddr],
-    ) -> Result<crate::component::ComponentOpts, EnvError> {
-        let Some(crate::component::RestoreSource::Follow(snapshot)) = opts.restore else {
-            return Ok(opts);
-        };
-        let cache_dir =
-            opts.shared_state.as_ref().map(|shared| shared.mount_path.clone()).ok_or_else(
-                || EnvError::Config {
-                    reason: "a following zebrad needs a chain volume to write the chain into"
-                        .to_string(),
-                },
-            )?;
-        let toml = public_toml(
-            &opts,
-            snapshot.network,
-            &ChainMotion::Following { peers: peers.to_vec() },
-            &cache_dir,
-        );
-        opts.mounts.retain(|m| m.destination != std::path::Path::new(CONTAINER_CONFIG_PATH));
-        opts.mounts.push(crate::regtest::config_mount_inline(toml, CONTAINER_CONFIG_PATH));
-        Ok(opts)
-    }
-
     fn pod_spec(
         &self,
         opts: &crate::component::ComponentOpts,
@@ -271,6 +243,9 @@ impl ValidatorBackend for ZebraValidator {
                 // or restored testnet chain) needs its port exposed too.
                 if serves_indexer_grpc(opts) {
                     base.push(("indexer", crate::ports::ZEBRAD_INDEXER));
+                }
+                if serves_health(opts) {
+                    base.push(("health", crate::ports::ZEBRAD_HEALTH));
                 }
                 crate::manifest::merge_ports(&base, &opts.extra_ports)
             },
@@ -509,6 +484,11 @@ fn serves_indexer_grpc(opts: &crate::component::ComponentOpts) -> bool {
     opts.shared_state.is_some() || public_restore_network(opts).is_some()
 }
 
+/// Only a following node renders `[health]`, so only it serves the endpoints
+fn serves_health(opts: &crate::component::ComponentOpts) -> bool {
+    matches!(opts.restore, Some(crate::component::RestoreSource::Follow(_)))
+}
+
 impl crate::regtest::Restore for crate::component::Validator<ZebraBackend> {
     fn snapshot(self, snapshot: crate::ChainSnapshot) -> Self {
         restore_public(self, snapshot)
@@ -534,8 +514,7 @@ fn restore_public(
         return validator;
     };
 
-    let toml =
-        public_toml(validator.opts(), network, &ChainMotion::Pinned, ZEBRAD_PUBLIC_CACHE_DIR);
+    let toml = public_toml(validator.opts(), network, ChainMotion::Pinned, ZEBRAD_PUBLIC_CACHE_DIR);
     boot_public(validator, toml)
         .mount(crate::regtest::archive_mount(archive.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
 }
@@ -543,18 +522,13 @@ fn restore_public(
 impl crate::component::Validator<ZebraBackend> {
     /// Boot off `volume`'s snapshot, then sync onward with the network (tip moves past the pin).
     ///
-    /// - Peers land at `env.build()` ([`ValidatorBackend::with_initial_peers`]); the seed set is
-    ///   version-filtered there, so this render carries none
+    /// - Peers = zebra's own DNS seeders; naming any here would replace discovery with that list
     /// - TEMPORARY: shared volume only while zaino ingests via `direct` (fetch migration ~2026-10)
     pub fn follow(mut self, volume: &crate::ChainVolume) -> Self {
         let snapshot = volume.snapshot();
         self.opts.restore = Some(crate::component::RestoreSource::Follow(snapshot));
-        let toml = public_toml(
-            self.opts(),
-            snapshot.network,
-            &ChainMotion::Following { peers: Vec::new() },
-            volume.mount_path(),
-        );
+        let toml =
+            public_toml(self.opts(), snapshot.network, ChainMotion::Following, volume.mount_path());
         boot_public(self, toml).mount(volume)
     }
 }
@@ -562,7 +536,7 @@ impl crate::component::Validator<ZebraBackend> {
 fn public_toml(
     opts: &crate::component::ComponentOpts,
     network: crate::Network,
-    motion: &ChainMotion,
+    motion: ChainMotion,
     cache_dir: &str,
 ) -> String {
     let version =
@@ -605,6 +579,55 @@ impl ZebraValidator {
 
     pub async fn peer_info(&self) -> Result<PeerInfo, RpcError> {
         ZcashRpc::new(COMPONENT, &self.rpc_client().await?).peer_info().await
+    }
+
+    /// Peers held AND tip within `ready_max_blocks_behind` of the network's. The only honest
+    /// "caught up" oracle: `getblockchaininfo`'s `estimated_height` is extrapolated from block
+    /// times, so a node whose crawler has stalled reads as caught-up through it.
+    ///
+    /// - Served only by a `.follow(..)` validator; anything else is a topology error
+    pub async fn at_network_tip(&self) -> Result<Health, RpcError> {
+        self.health("ready").await
+    }
+
+    /// Peers held, however far behind the tip
+    pub async fn has_peers(&self) -> Result<Health, RpcError> {
+        self.health("healthy").await
+    }
+
+    async fn health(&self, path: &str) -> Result<Health, RpcError> {
+        let ep = self.plumbing.endpoint("health").await?;
+        let url = format!("{}/{path}", ep.url("http"));
+        let body = reqwest::get(&url)
+            .await
+            .map_err(|e| RpcError::backend(COMPONENT, "health", e))?
+            .text()
+            .await
+            .map_err(|e| RpcError::backend(COMPONENT, "health", e))?;
+        let body = body.trim();
+        Ok(match body {
+            "ok" => Health::Ok,
+            reason => Health::Not(reason.to_string()),
+        })
+    }
+}
+
+/// zebra's own verdict on itself, from its health server.
+///
+/// - `Not` carries zebra's reason verbatim (`insufficient peers`, `syncing`, `no tip`,
+///   `tip_age=..`, `lag=N blocks`) — the whole reason to ask zebra instead of estimating
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Health {
+    Ok,
+    Not(String),
+}
+
+impl std::fmt::Display for Health {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Health::Ok => f.write_str("ok"),
+            Health::Not(reason) => f.write_str(reason),
+        }
     }
 }
 
@@ -661,6 +684,16 @@ mod tests {
             ZEBRAD_RPC_PORT,
             "a regtest cache rides the regtest config path, so it keeps that port"
         );
+    }
+
+    /// A pinned node renders no `[health]`, so declaring the port would expose a dead listener
+    #[test]
+    fn the_health_port_is_declared_only_where_the_config_opens_it() {
+        let mut following = ComponentOpts::builder().version("6.2.3").build();
+        following.restore = Some(RestoreSource::Follow(archive(crate::Network::Mainnet)));
+        assert!(serves_health(&following));
+        assert!(!serves_health(&opts_restoring(crate::Network::Mainnet)));
+        assert!(!serves_health(&ComponentOpts::default()));
     }
 
     /// `Direct` refuses to construct without a gRPC address to dial → unserved

@@ -7,7 +7,6 @@
 //!   below `handles`, which dials through them
 
 pub mod client;
-pub mod p2p;
 pub mod types;
 pub mod zcash_rpc;
 

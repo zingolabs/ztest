@@ -82,7 +82,7 @@ pub use crate::backends::librustzcash::{LrzBackend, LrzWallet, PerformanceLevel}
 pub use crate::backends::lightwalletd::LightwalletdIndexer;
 pub use crate::backends::zainod::ZainoIndexer;
 pub use crate::backends::zcashd::ZcashdValidator;
-pub use crate::backends::zebra::ZebraValidator;
+pub use crate::backends::zebra::{Health, ZebraValidator};
 pub use crate::component::{
     ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Cpu, Disk, Indexer,
     Mem, Resources, Validator, Wallet,
@@ -155,12 +155,12 @@ pub mod prelude {
     pub use super::{
         Account, AccountId, BlockHash, BlockHeight, BlockSample, BlockTip, BlockchainInfo,
         ChainConfig, ChainVolume, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder,
-        Cpu, Disk, Endpoint, EnvError, FAUCET_SEED, FILLER_ADDRESS, GetAddressUtxosReply, Indexer,
-        IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo, Mount,
-        MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction,
-        RpcError, SendResponse, SharedVolume, ShieldedProtocol, SubtreeRoot, TestEnv, TreeState,
-        TxId, Validator, ValidatorBackend, ValidatorConfig, Wallet, WalletBackend, WalletExt,
-        ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
+        Cpu, Disk, Endpoint, EnvError, FAUCET_SEED, FILLER_ADDRESS, GetAddressUtxosReply, Health,
+        Indexer, IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo,
+        Mount, MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED,
+        RawTransaction, RpcError, SendResponse, SharedVolume, ShieldedProtocol, SubtreeRoot,
+        TestEnv, TreeState, TxId, Validator, ValidatorBackend, ValidatorConfig, Wallet,
+        WalletBackend, WalletExt, ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
     };
     /// The pinned chain a test names, and the blob it is restored from
     pub use crate::archive::{Artifact, Backend, ChainSnapshot, Network};
