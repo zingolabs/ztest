@@ -51,6 +51,17 @@ impl ContainerRuntime {
         }
     }
 
+    /// Argv a build child needs beyond `build`, before the request's own flags
+    ///
+    /// - podman defaults to the OCI image format, which drops `SHELL` and warns on every
+    ///   `RUN` after it; the docker format keeps it, and docker itself takes no such flag
+    pub fn build_flags(self) -> Vec<&'static str> {
+        match self {
+            ContainerRuntime::Docker => Vec::new(),
+            ContainerRuntime::Podman => vec!["--format", "docker"],
+        }
+    }
+
     /// Env a `kind` child needs to drive this engine
     pub fn kind_envs(self) -> Vec<(&'static str, String)> {
         match self {
@@ -195,6 +206,13 @@ mod tests {
         assert!(docker.contains(&"zebrad".to_string()));
         assert!(docker.contains(&"docker.io/library/zebrad".to_string()));
         assert_eq!(ContainerRuntime::Podman.node_repo_forms("zebrad"), ["localhost/zebrad"]);
+    }
+
+    /// Only podman needs the format flag; docker rejects `--format` on `build`
+    #[test]
+    fn only_podman_pins_the_docker_image_format() {
+        assert!(ContainerRuntime::Docker.build_flags().is_empty());
+        assert_eq!(ContainerRuntime::Podman.build_flags(), ["--format", "docker"]);
     }
 
     #[test]
