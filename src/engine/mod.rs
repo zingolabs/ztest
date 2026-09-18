@@ -45,7 +45,7 @@ use crate::engine::local_runner::EngineEnv;
 use crate::engine::reporter::StyledReporter;
 use crate::engine::schedule::{LoopConfig, PanelFrame, run_loop};
 use crate::inventory::QosEntry;
-use crate::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
+use crate::naming::{DRIVER_SERVICE_ACCOUNT, RUN_NAMESPACE};
 use crate::pipeline::SelectedBinary;
 use crate::qos::Resources;
 
@@ -137,6 +137,7 @@ pub fn run(
         color: supports_color::on(supports_color::Stream::Stdout).is_some(),
         ztest_log: std::env::var("ZTEST_LOG").ok().filter(|v| !v.trim().is_empty()),
         image_refs: input.image_refs.clone(),
+        storage: None,
     };
     let executor = match select_executor(work_rt, &input, env) {
         Ok(e) => e,
@@ -345,7 +346,7 @@ fn drive(
 fn select_executor(
     work_rt: &tokio::runtime::Runtime,
     input: &EngineInput<'_>,
-    env: EngineEnv,
+    mut env: EngineEnv,
 ) -> Result<std::sync::Arc<dyn local_runner::Executor>, crate::error::PipelineError> {
     // Preflight image (remote runs) wins over the manual env override; neither → local
     let from_preflight = input.runner_image.clone();
@@ -357,20 +358,28 @@ fn select_executor(
         None => return Ok(std::sync::Arc::new(local_runner::LocalExecutor { env })),
     };
 
-    // `ztest cluster setup` provisions the `ztest` ns + SA with the RBAC a component-spawning
-    // in-pod test needs → running as that identity needs no extra grants
+    // Driver pods run untrusted test code → DRIVER_SERVICE_ACCOUNT, whose only grants are the
+    // per-test-namespace RoleBinding `ensure_namespace` writes. Never ORCHESTRATOR_SERVICE_ACCOUNT:
+    // that one is cluster-bound, and mounting it here hands every test the whole cluster
     let namespace =
         std::env::var("ZTEST_RUNNER_NAMESPACE").unwrap_or_else(|_| RUN_NAMESPACE.to_string());
     let service_account = Some(
         std::env::var("ZTEST_RUNNER_SA")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| RUN_SERVICE_ACCOUNT.to_string()),
+            .unwrap_or_else(|| DRIVER_SERVICE_ACCOUNT.to_string()),
     );
 
     let client = work_rt
         .block_on(crate::cluster::client())
         .map_err(|e| format!("pod executor: connect to cluster: {e}"))?;
+
+    // Resolve the storage + snapshot class here and hand it to the driver: the lookup lists
+    // cluster-scoped classes, which DRIVER_SERVICE_ACCOUNT's per-namespace binding cannot grant
+    env.storage = work_rt
+        .block_on(crate::storage_class::selected(&client))
+        .ok()
+        .map(|o| (o.class_name.clone(), o.snapshot_class.clone()));
 
     // Preflight image = baked (outputs inside it); else the manual delivery knob (`baked`, or
     // `hostpath` mounting the workspace from the node)

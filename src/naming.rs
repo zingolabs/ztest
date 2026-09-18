@@ -140,11 +140,37 @@ pub fn current_package() -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum NamingError {}
 
-/// Namespace every run's pods land in
+/// Namespace every run's driver pods land in
 pub const RUN_NAMESPACE: &str = "ztest";
 
-/// ServiceAccount those pods run as
-pub const RUN_SERVICE_ACCOUNT: &str = "ztest";
+/// Orchestrator identity: drives a run from outside it — namespace lifecycle, driver pods,
+/// BuildKit exec, leases, seeds. Cluster-scoped because those are.
+///
+/// - Workstation auth = the `ztest-orchestrator-token` Secret; CI never uses it (CI is the
+///   `ztest-ci` *group*, impersonated by the tailnet, holding the same ClusterRole)
+/// - Never mounted into a pod running test code — that is [`DRIVER_SERVICE_ACCOUNT`]
+pub const ORCHESTRATOR_SERVICE_ACCOUNT: &str = "ztest-orchestrator";
+
+/// Namespace the rootless BuildKit pod lands in.
+///
+/// - Split from [`RUN_NAMESPACE`]: only BuildKit needs `privileged` Pod Security (unconfined
+///   seccomp/AppArmor), and driver pods running untrusted test code must not share that level
+pub const BUILD_NAMESPACE: &str = "ztest-build";
+
+/// Namespace `ztest sync` driver pods land in.
+///
+/// - Separate from [`RUN_NAMESPACE`] because the eBPF profiling sidecar needs `privileged` +
+///   `hostPID`, and a run driver must never sit at that level
+/// - Dev-only path: CI runs `ztest run`, never `ztest sync`
+pub const SYNC_NAMESPACE: &str = "ztest-sync";
+
+/// Identity driver pods run as. Test code holds this token → no cluster-scoped grant, ever.
+/// Reach comes from a per-test-namespace RoleBinding, never a ClusterRoleBinding
+pub const DRIVER_SERVICE_ACCOUNT: &str = "ztest-driver";
+
+/// Rules a driver pod needs inside its own test namespace. ClusterRole = written once;
+/// reach is the RoleBinding's, not this object's
+pub const DRIVER_CLUSTER_ROLE: &str = "ztest-driver";
 
 /// Image repo of the baked tests image (`docs/design-remote-execution.md`)
 pub const RUNNER_REPO: &str = "ztest-runner";

@@ -15,7 +15,7 @@ use kube::Api;
 
 use super::buildpod::{self, Route, shell_quote, tail};
 use super::{BuildRequest, Built, Dockerfile, ImageProvider, Output, note};
-use crate::naming::RUN_NAMESPACE;
+use crate::naming::BUILD_NAMESPACE;
 use crate::resource::impls::buildkit::WORK_MOUNT;
 use crate::resource::{Cx, Readiness, ResourceError};
 
@@ -46,7 +46,7 @@ impl ImageProvider for RemoteBuildkit {
                  `ztest run` creates per build"
             ))
         })?;
-        let api: Api<Pod> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
+        let api: Api<Pod> = Api::namespaced(cx.client.clone(), BUILD_NAMESPACE);
 
         // Content-keyed, so the two builds of one recipe (image + inventory export) share
         // one shipped tree. Sound because the build pod is created per run: nothing under

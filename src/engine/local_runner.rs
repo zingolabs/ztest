@@ -56,6 +56,9 @@ pub struct EngineEnv {
     pub capture: bool,
     pub color: bool,
     pub image_refs: std::collections::BTreeMap<String, String>,
+    /// (storage class, snapshot class) the orchestrator resolved. `None` on the local path,
+    /// where the process discovers them itself under the caller's own credentials
+    pub storage: Option<(String, String)>,
 }
 
 /// Outcome of one test process. `output` = merged stdout+stderr, or on the pod path the
@@ -238,6 +241,7 @@ mod tests {
             color: false,
             ztest_log: None,
             image_refs: std::collections::BTreeMap::new(),
+            storage: None,
         }
     }
 

@@ -6,6 +6,7 @@
 //!   delete → reaped explicitly
 
 use k8s_openapi::api::core::v1::{Namespace, Service, ServiceAccount};
+use k8s_openapi::api::rbac::v1::RoleBinding;
 use kube::Client;
 use kube::api::{Api, PostParams};
 use serde_json::json;
@@ -153,6 +154,7 @@ pub async fn ensure_namespace(
 ) -> Result<(), kube::Error> {
     let api: Api<Namespace> = Api::all(client.clone());
     if api.get_opt(namespace).await?.is_some() {
+        bind_driver(client, namespace).await?;
         return wait_for_default_sa(client, namespace).await;
     }
     // Label values must be DNS-1123 → `module::test` slugged for the label, verbatim in
@@ -164,6 +166,9 @@ pub async fn ensure_namespace(
         "metadata": {
             "name": namespace,
             "labels": {
+                // Component pods are built from the code under test → same trust level as the
+                // driver, so the same floor: no hostPath, no host namespaces, no privileged
+                "pod-security.kubernetes.io/enforce": "baseline",
                 "ztest.io/run-id": coords.run_id,
                 "ztest.io/role": crate::qos::ROLE_TEST_ENV,
                 "ztest.io/user": crate::naming::slug(&coords.user, crate::naming::DNS_LABEL_MAX),
@@ -182,7 +187,37 @@ pub async fn ensure_namespace(
         Err(kube::Error::Api(e)) if e.code == 409 => {}
         Err(e) => return Err(e),
     }
+    bind_driver(client, namespace).await?;
     wait_for_default_sa(client, namespace).await
+}
+
+/// Grant the driver SA its rules *in this namespace only*.
+///
+/// - The driver pod holds untrusted test code, so its reach is this binding's, nothing wider
+/// - Created per namespace because RBAC has no namespace-prefix scoping; a ClusterRoleBinding
+///   here would hand every test the whole cluster
+async fn bind_driver(client: &Client, namespace: &str) -> Result<(), kube::Error> {
+    let api: Api<RoleBinding> = Api::namespaced(client.clone(), namespace);
+    let rb: RoleBinding = serde_json::from_value(json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": { "name": crate::naming::DRIVER_CLUSTER_ROLE, "namespace": namespace },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": crate::naming::DRIVER_CLUSTER_ROLE,
+        },
+        "subjects": [{
+            "kind": "ServiceAccount",
+            "name": crate::naming::DRIVER_SERVICE_ACCOUNT,
+            "namespace": crate::naming::RUN_NAMESPACE,
+        }],
+    }))
+    .map_err(kube::Error::SerdeError)?;
+    match api.create(&PostParams::default(), &rb).await {
+        Ok(_) | Err(kube::Error::Api(kube::error::ErrorResponse { code: 409, .. })) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Block until the namespace's `default` ServiceAccount exists. The SA controller creates

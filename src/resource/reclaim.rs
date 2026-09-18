@@ -4,8 +4,8 @@
 //! | class | object | why explicit |
 //! |---|---|---|
 //! | per-test env | `Namespace ztest-*` | cascades its pods/PVCs/quota |
-//! | detached sync | `Namespace ztest-sync-*` **+ driver Pod + record ConfigMap** | persistent by design; driver in [`RUN_NAMESPACE`], record in `OBS_NAMESPACE`, neither cascades |
-//! | ephemeral run pods | `Pod` in [`RUN_NAMESPACE`] | outside the test namespace, nothing cascades them |
+//! | detached sync | `Namespace ztest-sync-*` **+ driver Pod + record ConfigMap** | persistent by design; driver in [`SYNC_NAMESPACE`], record in `OBS_NAMESPACE`, neither cascades |
+//! | ephemeral run pods | `Pod` in [`RUN_NAMESPACE`] or [`BUILD_NAMESPACE`] | outside the test namespace, nothing cascades them |
 //! | seed binding | `VolumeSnapshotContent` | cluster-scoped, no owner ref |
 //! | QoS reservation | `Lease` in [`META_NAMESPACE`] | holds admission capacity until deleted |
 //!
@@ -23,7 +23,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, DeleteParams, DynamicObject, ListParams, ResourceExt};
 use kube::{Client, Resource};
 
-use crate::naming::RUN_NAMESPACE;
+use crate::naming::{RUN_NAMESPACE, SYNC_NAMESPACE};
 use crate::qos;
 use crate::qos::ledger::{META_NAMESPACE, is_expired};
 use crate::sync::{KIND_LABEL_KEY, KIND_LABEL_VALUE, SYNC_ID_KEY, SyncStatus};
@@ -373,21 +373,24 @@ async fn delete(client: &Client, target: &Target) -> Result<Removal, kube::Error
     match target.kind {
         // Namespaces advertise `delete` only, never `deletecollection`
         Kind::TestEnv => delete_one(Api::<Namespace>::all(client.clone()), &target.name).await,
-        // Sync = namespace (topology) + driver pod in `RUN_NAMESPACE` (cascaded by
+        // Sync = namespace (topology) + driver pod in `SYNC_NAMESPACE` (cascaded by
         // nothing). Half a reap leaves an orphaned driver holding its footprint, or a
         // driverless namespace — both are always attempted, errors combined after
         // Namespace first: a draining driver keeps checkpointing against it
         Kind::Sync => {
             let ns = delete_one(Api::<Namespace>::all(client.clone()), &target.name).await;
             let driver = delete_one(
-                Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE),
+                Api::<Pod>::namespaced(client.clone(), SYNC_NAMESPACE),
                 &driver_pod_of(target),
             )
             .await;
             Ok(ns?.and(driver?))
         }
+        // Namespace from the target, not a constant: run drivers live in RUN_NAMESPACE and
+        // build pods in BUILD_NAMESPACE, and both are discovered as RunPod
         Kind::RunPod => {
-            delete_one(Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE), &target.name).await
+            let ns = target.namespace.as_deref().unwrap_or(RUN_NAMESPACE);
+            delete_one(Api::<Pod>::namespaced(client.clone(), ns), &target.name).await
         }
         Kind::SeedBinding => delete_one(vsc_api(client), &target.name).await,
         Kind::Reservation => {
@@ -493,12 +496,18 @@ async fn live_run_ids(client: &Client, errors: &mut Vec<String>) -> Vec<String> 
     }
 }
 
+/// Ephemeral test environments only.
+///
+/// - `!kind` excludes sync namespaces: they carry the same role label and are persistent by
+///   design ([`discover_syncs`] owns them), so reaping one here kills a live sync
+fn test_env_selector() -> String {
+    format!("{}={},!{KIND_LABEL_KEY}", qos::LABEL_ROLE, qos::ROLE_TEST_ENV)
+}
+
 async fn discover_test_envs(client: &Client, scope: &Scope, live_runs: &[String], plan: &mut Plan) {
     let selector = match scope {
-        Scope::User(u) => {
-            format!("{}={u},{}={}", qos::LABEL_USER, qos::LABEL_ROLE, qos::ROLE_TEST_ENV)
-        }
-        Scope::AllUsers => format!("{}={}", qos::LABEL_ROLE, qos::ROLE_TEST_ENV),
+        Scope::User(u) => format!("{}={u},{}", qos::LABEL_USER, test_env_selector()),
+        Scope::AllUsers => test_env_selector(),
     };
     let api: Api<Namespace> = Api::all(client.clone());
     let list = match api.list(&ListParams::default().labels(&selector)).await {
@@ -690,32 +699,40 @@ async fn discover_run_pods(client: &Client, scope: &Scope, live_runs: &[String],
         Scope::User(u) => format!("{}={u},!{KIND_LABEL_KEY}", qos::LABEL_USER),
         Scope::AllUsers => format!("{},!{KIND_LABEL_KEY}", qos::LABEL_RUN_ID),
     };
-    let api: Api<Pod> = Api::namespaced(client.clone(), RUN_NAMESPACE);
-    let list = match api.list(&ListParams::default().labels(&selector)).await {
-        Ok(l) => l,
-        Err(e) => {
-            return plan.errors.push(format!("list pods in {RUN_NAMESPACE}: {e}"));
+    // Build pods carry the same labels and no `kind`, so they match this selector — they just
+    // live elsewhere. Missing the namespace leaked them past every `ztest cleanup`
+    for ns in [RUN_NAMESPACE, crate::naming::BUILD_NAMESPACE] {
+        let api: Api<Pod> = Api::namespaced(client.clone(), ns);
+        let list = match api.list(&ListParams::default().labels(&selector)).await {
+            Ok(l) => l,
+            Err(e) => {
+                plan.errors.push(format!("list pods in {ns}: {e}"));
+                continue;
+            }
+        };
+        for pod in list.items {
+            let run_id = label_of(&pod, qos::LABEL_RUN_ID).unwrap_or("?").to_string();
+            let phase = pod
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.clone())
+                .unwrap_or_else(|| "Unknown".into());
+            plan.targets.push(Target {
+                kind: Kind::RunPod,
+                name: pod.name_any(),
+                namespace: Some(ns.to_string()),
+                id: Some(run_id.clone()),
+                owner: label_of(&pod, qos::LABEL_USER).map(String::from),
+                detail: format!("run-id {run_id} · {phase}"),
+                // Settled pod reclaimable even under a live run (capacity already released)
+                liveness: terminating(&pod, finalizer_blocker(pod.meta())).unwrap_or_else(|| {
+                    match phase.as_str() {
+                        "Succeeded" | "Failed" => Liveness::Finished,
+                        _ => classify_test_env(&run_id, live_runs),
+                    }
+                }),
+            });
         }
-    };
-    for pod in list.items {
-        let run_id = label_of(&pod, qos::LABEL_RUN_ID).unwrap_or("?").to_string();
-        let phase =
-            pod.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_else(|| "Unknown".into());
-        plan.targets.push(Target {
-            kind: Kind::RunPod,
-            name: pod.name_any(),
-            namespace: Some(RUN_NAMESPACE.to_string()),
-            id: Some(run_id.clone()),
-            owner: label_of(&pod, qos::LABEL_USER).map(String::from),
-            detail: format!("run-id {run_id} · {phase}"),
-            // Settled pod reclaimable even under a live run (capacity already released)
-            liveness: terminating(&pod, finalizer_blocker(pod.meta())).unwrap_or_else(
-                || match phase.as_str() {
-                    "Succeeded" | "Failed" => Liveness::Finished,
-                    _ => classify_test_env(&run_id, live_runs),
-                },
-            ),
-        });
     }
 }
 
@@ -795,6 +812,19 @@ fn vsc_api(client: &Client) -> Api<DynamicObject> {
 
 #[cfg(test)]
 mod tests {
+    /// A sync namespace carries `role=test-env` *and* `kind=sync`. Both discovery passes must
+    /// therefore agree on who owns it, or `ztest cleanup` reaps a live sync as an ephemeral env
+    #[test]
+    fn sync_namespaces_belong_to_exactly_one_discovery_pass() {
+        let selector = super::test_env_selector();
+        assert!(
+            selector.contains(&format!("!{}", super::KIND_LABEL_KEY)),
+            "test-env discovery must exclude `kind`, else it also matches sync namespaces: \
+             {selector}"
+        );
+        assert!(selector.contains(super::qos::ROLE_TEST_ENV));
+    }
+
     use super::*;
 
     #[test]

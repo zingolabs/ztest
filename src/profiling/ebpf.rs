@@ -234,13 +234,13 @@ pyroscope.write "store" {{
         self.config()
     }
 
-    /// Lives beside the driver in [`RUN_NAMESPACE`](crate::naming::RUN_NAMESPACE);
+    /// Lives beside the driver in [`SYNC_NAMESPACE`](crate::naming::SYNC_NAMESPACE);
     /// caller owner-references it to the driver pod so it is collected with it
     pub fn config_map(&self) -> ConfigMap {
         ConfigMap {
             metadata: ObjectMeta {
                 name: Some(self.config_map.to_string()),
-                namespace: Some(crate::naming::RUN_NAMESPACE.to_string()),
+                namespace: Some(crate::naming::SYNC_NAMESPACE.to_string()),
                 ..Default::default()
             },
             data: Some(BTreeMap::from([("config.alloy".to_string(), self.config())])),
@@ -500,7 +500,9 @@ mod tests {
     #[test]
     fn config_map_lives_beside_the_driver() {
         let cm = collector().config_map();
-        assert_eq!(cm.metadata.namespace.as_deref(), Some("ztest"));
+        // Same namespace as the sync driver it sidecars — never RUN_NAMESPACE, whose
+        // `baseline` Pod Security would reject the privileged collector
+        assert_eq!(cm.metadata.namespace.as_deref(), Some(crate::naming::SYNC_NAMESPACE));
         assert_eq!(cm.metadata.name.as_deref(), Some("ztest-sync-abc-profiler"));
         assert!(cm.data.expect("data").contains_key("config.alloy"));
     }

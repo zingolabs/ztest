@@ -83,7 +83,7 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
             "run identity is missing cluster permissions: {}. Re-run `ztest cluster setup` with an admin \
              kubeconfig to update the `{}` role, or grant these to the run ServiceAccount.",
             missing.join(", "),
-            crate::resource::RUN_CLUSTER_ROLE,
+            crate::resource::ORCHESTRATOR_CLUSTER_ROLE,
         );
         let _ = tx.send(Event::ProbeFailed);
         return (ProbeOutcome::Failed { detail }, None);

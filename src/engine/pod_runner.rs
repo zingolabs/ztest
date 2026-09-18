@@ -370,6 +370,14 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> 
         // instead of invented, and create + teardown skipped (`naming::TEST_NAMESPACE_ENV`)
         env_var(crate::naming::TEST_NAMESPACE_ENV, test_ns),
     ];
+    // Storage + snapshot class, resolved once by the orchestrator and handed down.
+    // - `storage_class::selected` reads these before its own lookup
+    // - That lookup lists cluster-scoped StorageClasses/VolumeSnapshotClasses, which a driver's
+    //   per-namespace RoleBinding cannot grant — passing the answer keeps the driver namespaced
+    if let Some((class, snapshot_class)) = cfg.env.storage.as_ref() {
+        env.push(env_var(crate::cluster_config::STORAGE_CLASS_ENV, class));
+        env.push(env_var(crate::cluster_config::SNAPSHOT_CLASS_ENV, snapshot_class));
+    }
     if cfg.env.no_cleanup {
         env.push(env_var(crate::cluster::NO_CLEANUP_ENV, "1"));
     }
@@ -417,6 +425,7 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> 
         env: Some(env),
         volume_mounts: Some(cfg.volume_mounts.clone()),
         resources: Some(resources),
+        security_context: Some(untrusted_security_context()),
         ..Default::default()
     };
 
@@ -432,9 +441,29 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> 
             service_account_name: cfg.service_account.clone(),
             containers: vec![container],
             volumes: Some(cfg.volumes.clone()),
+            // Explicit: the driver does need a token (`TestEnv::build` runs in-pod), and the
+            // safety is that DRIVER_SERVICE_ACCOUNT reaches exactly one namespace
+            automount_service_account_token: Some(true),
             // Pinned Guaranteed pod on `restartPolicy: Never`: a lost node must delete
             // it at once (no migration without losing its pinned CPUs), not after 300 s
             tolerations: Some(fast_evict_tolerations()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Container hardening for a pod running untrusted test code.
+///
+/// - Within PSA `baseline`, which the driver namespace enforces (`resource::entry`)
+/// - No `runAsNonRoot`: the baked runner image builds and runs as root, and flipping that is
+///   an image change, not a pod change
+fn untrusted_security_context() -> corev1::SecurityContext {
+    corev1::SecurityContext {
+        allow_privilege_escalation: Some(false),
+        privileged: Some(false),
+        capabilities: Some(corev1::Capabilities {
+            drop: Some(vec!["ALL".to_string()]),
             ..Default::default()
         }),
         ..Default::default()
@@ -573,6 +602,7 @@ mod tests {
             color: false,
             ztest_log: None,
             image_refs: BTreeMap::new(),
+            storage: None,
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
@@ -594,6 +624,59 @@ mod tests {
         assert_eq!(req["cpu"].0, "2");
     }
 
+    /// A driver pod is namespace-bound, so it cannot list cluster-scoped StorageClasses or
+    /// VolumeSnapshotClasses — the orchestrator resolves them and passes the answer down. Drop
+    /// these vars and every test declaring a volume 403s in-pod at `TestEnv::build`
+    #[test]
+    fn a_driver_pod_is_handed_the_storage_classes_it_may_not_look_up() {
+        use crate::qos::QosClass;
+        let plain = || EngineEnv {
+            dylib_path: std::ffi::OsString::from("/x"),
+            run_id: "r".into(),
+            sa: "ztest".into(),
+            no_cleanup: false,
+            capture: true,
+            color: false,
+            ztest_log: None,
+            image_refs: BTreeMap::new(),
+            storage: None,
+        };
+        let env =
+            EngineEnv { storage: Some(("fast-ssd".into(), "csi-snapclass".into())), ..plain() };
+        let cfg =
+            PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
+        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Integration), "ztest-test-ns");
+
+        let vars: std::collections::BTreeMap<&str, &str> = pod.spec.as_ref().unwrap().containers[0]
+            .env
+            .as_ref()
+            .expect("driver env")
+            .iter()
+            .map(|v| (v.name.as_str(), v.value.as_deref().unwrap_or("")))
+            .collect();
+        assert_eq!(vars.get(crate::cluster_config::STORAGE_CLASS_ENV), Some(&"fast-ssd"));
+        assert_eq!(vars.get(crate::cluster_config::SNAPSHOT_CLASS_ENV), Some(&"csi-snapclass"));
+
+        // Unresolved: the vars must be absent, not empty — `storage_class::selected` falls back
+        // to its own lookup only when neither is set
+        let cfg = PodRunConfig::baked(
+            plain(),
+            "runner:dev".into(),
+            "ztest".into(),
+            None,
+            BTreeMap::new(),
+        );
+        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Integration), "ztest-test-ns");
+        let names: Vec<&str> = pod.spec.as_ref().unwrap().containers[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert!(!names.contains(&crate::cluster_config::STORAGE_CLASS_ENV));
+    }
+
     #[test]
     fn runner_pod_evicts_immediately_on_node_loss() {
         let env = EngineEnv {
@@ -605,6 +688,7 @@ mod tests {
             color: false,
             ztest_log: None,
             image_refs: BTreeMap::new(),
+            storage: None,
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
@@ -700,6 +784,7 @@ mod tests {
             color: false,
             ztest_log: None,
             image_refs: BTreeMap::new(),
+            storage: None,
         };
         let mut refs = BTreeMap::new();
         refs.insert("k".to_string(), "reg.svc:5000/ns/zainod:dev-abc".to_string());
@@ -724,6 +809,7 @@ mod tests {
             color: false,
             ztest_log: None,
             image_refs: BTreeMap::new(),
+            storage: None,
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
@@ -743,6 +829,7 @@ mod tests {
             color: false,
             ztest_log: Some("ztest::build=debug".into()),
             image_refs: BTreeMap::new(),
+            storage: None,
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
@@ -763,6 +850,7 @@ mod tests {
             color: false,
             ztest_log: None,
             image_refs: BTreeMap::new(),
+            storage: None,
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
@@ -784,6 +872,7 @@ mod tests {
             color: false,
             ztest_log: None,
             image_refs: BTreeMap::new(),
+            storage: None,
         };
         let cfg =
             PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());

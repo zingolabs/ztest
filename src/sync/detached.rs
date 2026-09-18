@@ -69,7 +69,7 @@ pub fn profiler_config_name(sync_id: &str) -> String {
 pub async fn driver_is_live(client: &kube::Client, id: &str) -> bool {
     use k8s_openapi::api::core::v1::Pod;
     use kube::Api;
-    let ns = crate::naming::RUN_NAMESPACE;
+    let ns = crate::naming::SYNC_NAMESPACE;
     let Ok(Some(pod)) =
         Api::<Pod>::namespaced(client.clone(), ns).get_opt(&driver_pod_for(id)).await
     else {
@@ -163,7 +163,7 @@ pub enum SyncLookupError {
 /// Driver pod, by sync id. Reads the *run* namespace, never the sync's own — the driver
 /// is a runner pod, and a sync-scoped lookup silently finds nothing
 pub async fn find_driver(client: &kube::Client, sync_id: &str) -> Result<Pod, SyncLookupError> {
-    let run_ns = crate::naming::RUN_NAMESPACE;
+    let run_ns = crate::naming::SYNC_NAMESPACE;
     let pod = driver_pod_for(sync_id);
     kube::Api::<Pod>::namespaced(client.clone(), run_ns)
         .get_opt(&pod)

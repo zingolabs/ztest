@@ -9,23 +9,24 @@ ztest cluster check [--cluster <profile>]     # non-zero on any capability a run
 **The contract: a green `check` means `ztest run` and `ztest sync` will work here.** Every precondition
 either has a probe below or is named under [residual gaps](#residual-gaps) — there is no third category.
 
-| Capability                                  | Need                             | Provided by                            |
-| ------------------------------------------- | -------------------------------- | -------------------------------------- |
-| cluster reachable                           | **required**                     | operator                               |
-| snapshot-capable StorageClass               | **required**                     | operator (local: `--install-storage`)  |
-| `snapshot.storage.k8s.io/v1` + a controller | **required**                     | operator (local: `--install-storage`)  |
-| host toolchain                              | required for a run               | you — `cargo git tar` (+ `kind`, local)|
-| node capacity                               | required on a remote cluster     | operator                               |
-| image side-load (`kind load` chain)         | required on a local cluster      | you — a working `kind` + engine pair   |
-| image registry                              | required on a remote cluster     | operator                               |
-| ztest namespaces, identity, BuildKit cache  | **required**                     | `ztest cluster setup`                  |
-| run ServiceAccount permissions              | **required**                     | `ztest cluster setup`                  |
-| build pod admission (PSA)                   | **required**                     | `ztest cluster setup` + cluster policy |
-| volume expansion                            | optional — BuildKit cache growth | operator                               |
-| `metrics.k8s.io` API                        | optional — `kubectl top` / k9s   | `ztest cluster setup`                  |
-| metrics stack                               | optional — metrics & profiling   | `ztest cluster setup`                  |
-| profile collector                           | optional — CPU profiles          | your workstation                       |
-| snapshot read path (seed CDN)               | optional — chain fixtures        | none — public, no credentials ever     |
+| Capability                                  | Need                             | Provided by                             |
+| ------------------------------------------- | -------------------------------- | --------------------------------------- |
+| cluster reachable                           | **required**                     | operator                                |
+| snapshot-capable StorageClass               | **required**                     | operator (local: `--install-storage`)   |
+| `snapshot.storage.k8s.io/v1` + a controller | **required**                     | operator (local: `--install-storage`)   |
+| host toolchain                              | required for a run               | you — `cargo git tar` (+ `kind`, local) |
+| node capacity                               | required on a remote cluster     | operator                                |
+| image side-load (`kind load` chain)         | required on a local cluster      | you — a working `kind` + engine pair    |
+| image registry                              | required on a remote cluster     | operator                                |
+| ztest namespaces, identity, BuildKit cache  | **required**                     | `ztest cluster setup`                   |
+| driver identity (`ztest-driver`)            | **required**                     | `ztest cluster setup`                   |
+| run ServiceAccount permissions              | **required**                     | `ztest cluster setup`                   |
+| build pod admission (PSA)                   | **required**                     | `ztest cluster setup` + cluster policy  |
+| volume expansion                            | optional — BuildKit cache growth | operator                                |
+| `metrics.k8s.io` API                        | optional — `kubectl top` / k9s   | `ztest cluster setup`                   |
+| metrics stack                               | optional — metrics & profiling   | `ztest cluster setup`                   |
+| profile collector                           | optional — CPU profiles          | your workstation                        |
+| snapshot read path (seed CDN)               | optional — chain fixtures        | none — public, no credentials ever      |
 
 Seeds pull over plain HTTPS from whatever each manifest's `base_uri` names, which is the
 [seed CDN Worker](../workers/seed-cdn/README.md). No credential is involved and none can be:
@@ -65,7 +66,7 @@ Every probe is a read, and each reuses a signal the cluster already publishes ra
   `CrashLoopBackOff` Deployment cannot pass for a working one.
 - **Discovery, not listing** — "is this API served" is asked of `/apis`, which separates *unserved* from
   *empty* from *forbidden*; a `list` conflates all three.
-- **`SelfSubjectAccessReview` over the whole role** — every `(resource, verb)` pair the `ztest-remote`
+- **`SelfSubjectAccessReview` over the whole role** — every `(resource, verb)` pair the `ztest-orchestrator`
   ClusterRole grants is probed, not a sample. Partial grants are the failure that happens (a rule naming
   `jobs` read-only while the seed puller needs `create`), and a sample never sees them.
 - **The role's revision, not its existence** — an admin caller is allowed everything, so their own
@@ -89,14 +90,64 @@ Every probe is a read, and each reuses a signal the cluster already publishes ra
 
 Two preconditions no read-only, workstation-side probe reaches. Both are cluster egress:
 
-| Gap                          | Fails as                                           |
-| ---------------------------- | -------------------------------------------------- |
+| Gap                          | Fails as                                              |
+| ---------------------------- | ----------------------------------------------------- |
 | cluster → snapshot bucket    | seed puller exhausts its per-range retries, Job fails |
-| BuildKit pod → registry push | `buildctl` push error at the end of the compile    |
+| BuildKit pod → registry push | `buildctl` push error at the end of the compile       |
 
 `check` probes the bucket from *your* machine, which catches a wrong endpoint or a withdrawn blob but not
 an egress proxy or a `NetworkPolicy` on the cluster side. Registry push authentication is the registry's
 own concern — the build pod presents its ServiceAccount token, and what that buys differs per registry.
+
+## identities
+
+Two kinds, and the distinction matters: a ServiceAccount is an object in the cluster; a group is
+a string the authenticator asserts and only bindings ever mention.
+
+### groups
+
+| Group      | Who                                                     | Granted by                                   | Role                               |
+| ---------- | ------------------------------------------------------- | -------------------------------------------- | ---------------------------------- |
+| `ztest-ci` | nodes tagged `tag:ztest-runner` (zaino's GitHub runner) | tailnet `tailscale.com/cap/kubernetes` grant | `ztest-orchestrator`, cluster-wide |
+
+The only one today. CI **cannot** be a ServiceAccount: Tailscale's grant emits only
+`Impersonate-Group`, and an SA would mean a stored token, which the design exists to avoid.
+Note Tailscale falls back to a node's *tags* as groups when no grant applies — a new tag allowed
+to reach the operator silently becomes a group.
+
+### service accounts
+
+| ServiceAccount               | Auth                       | Role                                           | Runs                                   |
+| ---------------------------- | -------------------------- | ---------------------------------------------- | -------------------------------------- |
+| `ztest/ztest-orchestrator`   | `ztest-orchestrator-token` | `ztest-orchestrator`, cluster-wide             | the CLI on a workstation; sync drivers |
+| `ztest/ztest-driver`         | pod token                  | `ztest-driver`, RoleBinding per test namespace | run driver pods (untrusted test code)  |
+| `ztest-build/ztest-buildkit` | none, not automounted      | none                                           | the build pod (untrusted source)       |
+| `ztest-obs/ztest-prometheus` | pod token                  | read-only (`nodes`, `nodes/proxy`, `pods`)     | Prometheus                             |
+
+- `ztest-orchestrator` is not admin: no rbac-write, no secrets-read, no cluster-admin
+- `only_the_orchestrator_is_bound_cluster_wide` keeps it the only SA bound cluster-wide
+
+**Known gap**: the `ztest sync` driver runs as `ztest-orchestrator`, so a sync driver holds the
+cluster-wide token a run driver no longer does. It creates namespaces, which a namespaced role
+cannot express, so closing it needs a third identity rather than a re-binding. Dev-invoked, not
+reachable from CI.
+
+Namespaces, each at the Pod Security level its occupant actually needs:
+
+| Namespace                   | Enforce      | Occupant                                                    |
+| --------------------------- | ------------ | ----------------------------------------------------------- |
+| `ztest-build`               | `privileged` | BuildKit — rootless buildkitd's unconfined seccomp/AppArmor |
+| `ztest-sync`                | `privileged` | sync drivers — the eBPF sidecar needs `hostPID`; dev-only   |
+| `ztest`                     | `baseline`   | run driver pods, and the two SAs above                      |
+| `ztest-<pkg>-<test>-<hash>` | `baseline`   | components, built from the code under test                  |
+
+Every `privileged` namespace is one a CI run never places a pod in — that is the point of the
+split, not an accident of it.
+
+- No ClusterRoleBinding exists for `ztest-driver`; `ensure_namespace` writes the RoleBinding as
+  it creates each test namespace, so a driver's reach ends with that namespace
+- `the_run_role_covers_every_driver_grant` keeps the driver role a subset of the orchestrator
+  role — RBAC escalation prevention rejects the RoleBinding otherwise, at run time
 
 ## storage
 

@@ -10,24 +10,28 @@ use kube::api::{Api, Patch, PatchParams};
 use serde_json::json;
 
 use crate::cluster_config::ClusterClass;
-use crate::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
+use crate::naming::{
+    DRIVER_CLUSTER_ROLE, DRIVER_SERVICE_ACCOUNT, ORCHESTRATOR_SERVICE_ACCOUNT, RUN_NAMESPACE,
+    SYNC_NAMESPACE,
+};
 use crate::resource::kube::FIELD_MANAGER;
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 
 // ── Public constants (surface for cli / docs) ─────────────────────────
 
-/// Identity a remote kubeconfig authenticates as
-pub const RUN_CLUSTER_ROLE: &str = "ztest-remote";
+/// Capability shared by every principal that drives a run: the `ztest-orchestrator` SA
+/// (workstations) and the `ztest-ci` group (CI, via tailnet impersonation)
+pub const ORCHESTRATOR_CLUSTER_ROLE: &str = "ztest-orchestrator";
 /// Non-expiring token Secret for the run SA. Read with
-/// `kubectl -n ztest get secret ztest-token -o jsonpath='{.data.token}' | base64 -d`
-pub const RUN_TOKEN_SECRET: &str = "ztest-token";
+/// `kubectl -n ztest get secret ztest-orchestrator-token -o jsonpath='{.data.token}' | base64 -d`
+pub const ORCHESTRATOR_TOKEN_SECRET: &str = "ztest-orchestrator-token";
 
 /// SA the BuildKit build pod ([`crate::resource::impls::buildkit`]) runs as
 pub const BUILDKIT_SERVICE_ACCOUNT: &str = "ztest-buildkit";
 
 // ── Run identity permissions (single source of truth) ─────────────────
 //
-// One list drives BOTH the `ztest-remote` ClusterRole and the run-start self-check
+// One list drives BOTH the `ztest-orchestrator` ClusterRole and the run-start self-check
 // ([`check_access`]) — a new runtime cluster call adds its verb here, so a stale
 // grant fails at run start by name, not as a mid-run 403
 
@@ -146,9 +150,77 @@ static RUN_RULES: &[Rule] = &[
         verbs: &["get", "list"],
         scope: RuleScope::All,
     },
+    // Binds DRIVER_CLUSTER_ROLE into each test namespace as it is created (src/cluster.rs).
+    // - Bounded by RBAC escalation prevention: grants only what this identity already holds
+    // - No `update`: a binding is replaced by delete+create, never widened in place
+    Rule {
+        group: "rbac.authorization.k8s.io",
+        resources: &["rolebindings"],
+        verbs: &["get", "create", "delete"],
+        scope: RuleScope::All,
+    },
     // No registry grant: builds ride `pods/exec` above, push uses the BuildKit pod's creds
     // No metrics-plane grant: Prometheus discovers under its own SA
 ];
+
+// ── Driver identity permissions ───────────────────────────────────────
+//
+// What a pod running *untrusted test code* needs, and nothing else. Bound by a RoleBinding
+// in the one test namespace it owns → every verb below stops at that namespace boundary.
+//
+// - No namespaces, nodes, storageclasses, volumesnapshotcontents (all cluster-scoped)
+// - No rolebindings (a driver cannot re-bind itself anywhere)
+// - No jobs/leases (seed pulls + QoS ledger are the orchestrator's)
+
+/// Rules for [`DRIVER_CLUSTER_ROLE`], all namespaced. Shape mirrors [`Rule`] minus `scope`:
+/// a driver's needs do not vary by cluster class
+struct DriverRule {
+    group: &'static str,
+    resources: &'static [&'static str],
+    verbs: &'static [&'static str],
+}
+
+static DRIVER_RULES: &[DriverRule] = &[
+    // Component pods + their plumbing: what `TestEnv::build` stands up in-pod
+    DriverRule {
+        group: "",
+        resources: &["pods", "services", "configmaps", "persistentvolumeclaims"],
+        verbs: &["get", "list", "watch", "create", "update", "patch", "delete"],
+    },
+    // Self-imposed tier quota (`cluster::apply_resource_quota`)
+    DriverRule {
+        group: "",
+        resources: &["resourcequotas"],
+        verbs: &["get", "list", "watch", "create", "update", "patch", "delete"],
+    },
+    // `wait_for_default_sa` before a pod can name it
+    DriverRule { group: "", resources: &["serviceaccounts"], verbs: &["get", "list", "watch"] },
+    DriverRule { group: "", resources: &["endpoints"], verbs: &["get", "list", "watch"] },
+    // logs = assertions, exec + port-forward = reaching a component from the test body
+    DriverRule {
+        group: "",
+        resources: &["pods/log", "pods/portforward", "pods/exec"],
+        verbs: &["get", "list", "create"],
+    },
+    // Read-only: seeds are cloned by the orchestrator, the driver only waits on readiness
+    DriverRule {
+        group: "snapshot.storage.k8s.io",
+        resources: &["volumesnapshots"],
+        verbs: &["get", "list", "watch"],
+    },
+];
+
+/// Rules applicable to a driver pod, as ClusterRole `rules` JSON
+fn render_driver_rules() -> Vec<serde_json::Value> {
+    DRIVER_RULES
+        .iter()
+        .map(|r| json!({ "apiGroups": [r.group], "resources": r.resources, "verbs": r.verbs }))
+        .collect()
+}
+
+fn driver_rules_hash() -> String {
+    manifest_hash(&serde_json::Value::Array(render_driver_rules()))
+}
 
 /// Rules applicable to `backend`, as ClusterRole `rules` JSON
 fn render_run_rules(backend: ClusterClass) -> Vec<serde_json::Value> {
@@ -255,7 +327,7 @@ async fn allows(
     Ok((!allowed).then(|| format!("{verb} {resource} ({group})")))
 }
 
-/// Does the applied `ztest-remote` match what this build renders?
+/// Does the applied `ztest-orchestrator` match what this build renders?
 ///
 /// The half [`check_access`] cannot see: an admin caller is allowed everything, so their
 /// SSAR passes over a role that would 403 the run ServiceAccount mid-run
@@ -263,8 +335,14 @@ pub async fn role_is_current(
     client: &kube::Client,
     backend: ClusterClass,
 ) -> Result<bool, kube::Error> {
-    let role = Api::<ClusterRole>::all(client.clone()).get_opt(RUN_CLUSTER_ROLE).await?;
+    let role = Api::<ClusterRole>::all(client.clone()).get_opt(ORCHESTRATOR_CLUSTER_ROLE).await?;
     Ok(role.as_ref().and_then(rules_hash) == Some(run_rules_hash(backend)))
+}
+
+/// Does the applied `ztest-driver` match what this build renders?
+pub async fn driver_role_is_current(client: &kube::Client) -> Result<bool, kube::Error> {
+    let role = Api::<ClusterRole>::all(client.clone()).get_opt(DRIVER_CLUSTER_ROLE).await?;
+    Ok(role.as_ref().and_then(rules_hash) == Some(driver_rules_hash()))
 }
 
 /// Revision stamp an applied role carries, if any
@@ -274,7 +352,7 @@ fn rules_hash(role: &ClusterRole) -> Option<String> {
 
 // ── RunIdentity ───────────────────────────────────────────────────────
 
-/// Run SA + `ztest-remote` ClusterRole/binding + non-expiring token Secret.
+/// Run SA + `ztest-orchestrator` ClusterRole/binding + non-expiring token Secret.
 ///
 /// - RUN-only: no rbac-write, no policy-write, no secrets read (token cannot escalate)
 /// - `backend` gates backend-specific rules in both the rendered role and its hash
@@ -290,7 +368,10 @@ impl Provider for RunIdentityProvider {
     }
 
     fn deps(&self) -> Vec<NodeId> {
-        vec![NodeId::Namespace(RUN_NAMESPACE.to_string())]
+        vec![
+            NodeId::Namespace(RUN_NAMESPACE.to_string()),
+            NodeId::Namespace(SYNC_NAMESPACE.to_string()),
+        ]
     }
 
     fn lifetime(&self) -> Lifetime {
@@ -303,11 +384,13 @@ impl Provider for RunIdentityProvider {
         let sa: Api<ServiceAccount> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
         let sec: Api<Secret> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
         match (
-            sa.get(RUN_SERVICE_ACCOUNT).await,
-            sec.get(RUN_TOKEN_SECRET).await,
+            sa.get(ORCHESTRATOR_SERVICE_ACCOUNT).await,
+            sa.get(DRIVER_SERVICE_ACCOUNT).await,
+            sec.get(ORCHESTRATOR_TOKEN_SECRET).await,
             role_is_current(&cx.client, self.backend).await,
+            driver_role_is_current(&cx.client).await,
         ) {
-            (Ok(_), Ok(_), Ok(true)) => Readiness::Ready,
+            (Ok(_), Ok(_), Ok(_), Ok(true), Ok(true)) => Readiness::Ready,
             _ => Readiness::Absent,
         }
     }
@@ -318,48 +401,93 @@ impl Provider for RunIdentityProvider {
         let sa: ServiceAccount = serde_json::from_value(json!({
             "apiVersion": "v1",
             "kind": "ServiceAccount",
-            "metadata": { "name": RUN_SERVICE_ACCOUNT, "namespace": RUN_NAMESPACE },
+            "metadata": { "name": ORCHESTRATOR_SERVICE_ACCOUNT, "namespace": RUN_NAMESPACE },
         }))
         .expect("static ServiceAccount manifest is valid");
         Api::<ServiceAccount>::namespaced(cx.client.clone(), RUN_NAMESPACE)
-            .patch(RUN_SERVICE_ACCOUNT, &params, &Patch::Apply(&sa))
+            .patch(ORCHESTRATOR_SERVICE_ACCOUNT, &params, &Patch::Apply(&sa))
             .await
             .map_err(|e| {
-                ResourceError::Provision(format!("apply SA {RUN_SERVICE_ACCOUNT}: {e}"))
+                ResourceError::Provision(format!("apply SA {ORCHESTRATOR_SERVICE_ACCOUNT}: {e}"))
             })?;
 
         let role: ClusterRole = serde_json::from_value(json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "ClusterRole",
             "metadata": {
-                "name": RUN_CLUSTER_ROLE,
+                "name": ORCHESTRATOR_CLUSTER_ROLE,
                 "annotations": { RULES_HASH_ANNOTATION: run_rules_hash(self.backend) },
             },
             "rules": render_run_rules(self.backend),
         }))
         .expect("static ClusterRole manifest is valid");
         Api::<ClusterRole>::all(cx.client.clone())
-            .patch(RUN_CLUSTER_ROLE, &params, &Patch::Apply(&role))
-            .await
-            .map_err(|e| {
-                ResourceError::Provision(format!("apply ClusterRole {RUN_CLUSTER_ROLE}: {e}"))
-            })?;
-
-        let crb: ClusterRoleBinding = serde_json::from_value(json!({
-            "apiVersion": "rbac.authorization.k8s.io/v1",
-            "kind": "ClusterRoleBinding",
-            "metadata": { "name": RUN_CLUSTER_ROLE },
-            "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": RUN_CLUSTER_ROLE },
-            "subjects": [{ "kind": "ServiceAccount", "name": RUN_SERVICE_ACCOUNT, "namespace": RUN_NAMESPACE }],
-        }))
-        .expect("static ClusterRoleBinding manifest is valid");
-        Api::<ClusterRoleBinding>::all(cx.client.clone())
-            .patch(RUN_CLUSTER_ROLE, &params, &Patch::Apply(&crb))
+            .patch(ORCHESTRATOR_CLUSTER_ROLE, &params, &Patch::Apply(&role))
             .await
             .map_err(|e| {
                 ResourceError::Provision(format!(
-                    "apply ClusterRoleBinding {RUN_CLUSTER_ROLE}: {e}"
+                    "apply ClusterRole {ORCHESTRATOR_CLUSTER_ROLE}: {e}"
                 ))
+            })?;
+
+        let crb: ClusterRoleBinding = serde_json::from_value(run_cluster_role_binding())
+            .expect("static ClusterRoleBinding manifest is valid");
+        Api::<ClusterRoleBinding>::all(cx.client.clone())
+            .patch(ORCHESTRATOR_CLUSTER_ROLE, &params, &Patch::Apply(&crb))
+            .await
+            .map_err(|e| {
+                ResourceError::Provision(format!(
+                    "apply ClusterRoleBinding {ORCHESTRATOR_CLUSTER_ROLE}: {e}"
+                ))
+            })?;
+
+        // Sync drivers run here and name this SA; without it the pod is admitted and never
+        // starts ("error looking up service account")
+        let sync_sa: ServiceAccount = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": { "name": ORCHESTRATOR_SERVICE_ACCOUNT, "namespace": SYNC_NAMESPACE },
+        }))
+        .expect("static ServiceAccount manifest is valid");
+        Api::<ServiceAccount>::namespaced(cx.client.clone(), SYNC_NAMESPACE)
+            .patch(ORCHESTRATOR_SERVICE_ACCOUNT, &params, &Patch::Apply(&sync_sa))
+            .await
+            .map_err(|e| {
+                ResourceError::Provision(format!(
+                    "apply SA {SYNC_NAMESPACE}/{ORCHESTRATOR_SERVICE_ACCOUNT}: {e}"
+                ))
+            })?;
+
+        let driver_sa: ServiceAccount = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": { "name": DRIVER_SERVICE_ACCOUNT, "namespace": RUN_NAMESPACE },
+        }))
+        .expect("static ServiceAccount manifest is valid");
+        Api::<ServiceAccount>::namespaced(cx.client.clone(), RUN_NAMESPACE)
+            .patch(DRIVER_SERVICE_ACCOUNT, &params, &Patch::Apply(&driver_sa))
+            .await
+            .map_err(|e| {
+                ResourceError::Provision(format!("apply SA {DRIVER_SERVICE_ACCOUNT}: {e}"))
+            })?;
+
+        // No ClusterRoleBinding for this one, by design — `src/cluster.rs::ensure_namespace`
+        // binds it per test namespace, which is the whole reach a driver pod ever gets
+        let driver_role: ClusterRole = serde_json::from_value(json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {
+                "name": DRIVER_CLUSTER_ROLE,
+                "annotations": { RULES_HASH_ANNOTATION: driver_rules_hash() },
+            },
+            "rules": render_driver_rules(),
+        }))
+        .expect("static ClusterRole manifest is valid");
+        Api::<ClusterRole>::all(cx.client.clone())
+            .patch(DRIVER_CLUSTER_ROLE, &params, &Patch::Apply(&driver_role))
+            .await
+            .map_err(|e| {
+                ResourceError::Provision(format!("apply ClusterRole {DRIVER_CLUSTER_ROLE}: {e}"))
             })?;
 
         // Typed service-account-token Secret = stable workstation/CI credential
@@ -368,22 +496,51 @@ impl Provider for RunIdentityProvider {
             "apiVersion": "v1",
             "kind": "Secret",
             "metadata": {
-                "name": RUN_TOKEN_SECRET,
+                "name": ORCHESTRATOR_TOKEN_SECRET,
                 "namespace": RUN_NAMESPACE,
-                "annotations": { "kubernetes.io/service-account.name": RUN_SERVICE_ACCOUNT },
+                "annotations": { "kubernetes.io/service-account.name": ORCHESTRATOR_SERVICE_ACCOUNT },
             },
             "type": "kubernetes.io/service-account-token",
         }))
         .expect("static Secret manifest is valid");
         Api::<Secret>::namespaced(cx.client.clone(), RUN_NAMESPACE)
-            .patch(RUN_TOKEN_SECRET, &params, &Patch::Apply(&secret))
+            .patch(ORCHESTRATOR_TOKEN_SECRET, &params, &Patch::Apply(&secret))
             .await
             .map_err(|e| {
-                ResourceError::Provision(format!("apply Secret {RUN_TOKEN_SECRET}: {e}"))
+                ResourceError::Provision(format!("apply Secret {ORCHESTRATOR_TOKEN_SECRET}: {e}"))
             })?;
 
         Ok(())
     }
+}
+
+/// The one cluster-wide binding ztest creates. Subjects are the whole security story here:
+/// anything listed holds [`ORCHESTRATOR_CLUSTER_ROLE`] in every namespace
+fn run_cluster_role_binding() -> serde_json::Value {
+    json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": ORCHESTRATOR_CLUSTER_ROLE },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": ORCHESTRATOR_CLUSTER_ROLE,
+        },
+        // One identity, two homes: a pod may only name an SA in its own namespace, and sync
+        // drivers live in SYNC_NAMESPACE. Both are orchestrator-class by design
+        "subjects": [
+            {
+                "kind": "ServiceAccount",
+                "name": ORCHESTRATOR_SERVICE_ACCOUNT,
+                "namespace": RUN_NAMESPACE,
+            },
+            {
+                "kind": "ServiceAccount",
+                "name": ORCHESTRATOR_SERVICE_ACCOUNT,
+                "namespace": SYNC_NAMESPACE,
+            },
+        ],
+    })
 }
 
 /// Policy providers `ztest cluster setup` installs — run identity only, plain k8s RBAC.
@@ -458,6 +615,74 @@ mod tests {
                     !["persistentvolumes", "events", "pods/resize"].contains(res),
                     "`{res}` has no call site; drop the rule rather than grant it"
                 );
+            }
+        }
+    }
+
+    /// Exactly one identity may hold the run role cluster-wide. The driver (untrusted test
+    /// code) and BuildKit (untrusted source) must never appear here — the driver is bound
+    /// per test namespace, BuildKit holds no RBAC at all
+    #[test]
+    fn only_the_orchestrator_is_bound_cluster_wide() {
+        let subjects = run_cluster_role_binding()["subjects"].as_array().unwrap().clone();
+        let names: Vec<&str> = subjects.iter().map(|s| s["name"].as_str().unwrap()).collect();
+        // Orchestrator in both its homes (a pod names an SA in its own namespace), nothing else
+        assert!(names.iter().all(|n| *n == ORCHESTRATOR_SERVICE_ACCOUNT), "{names:?}");
+        assert!(!names.contains(&DRIVER_SERVICE_ACCOUNT));
+        assert!(!names.contains(&BUILDKIT_SERVICE_ACCOUNT));
+    }
+
+    /// Cluster-scoped resources reach past the RoleBinding that is a driver's only boundary
+    #[test]
+    fn the_driver_role_is_namespaced_only() {
+        const CLUSTER_SCOPED: &[&str] = &[
+            "namespaces",
+            "nodes",
+            "storageclasses",
+            "volumesnapshotclasses",
+            "volumesnapshotcontents",
+            "persistentvolumes",
+        ];
+        for r in DRIVER_RULES {
+            for res in r.resources {
+                assert!(
+                    !CLUSTER_SCOPED.contains(res),
+                    "`{res}` is cluster-scoped; a RoleBinding cannot contain it"
+                );
+            }
+        }
+    }
+
+    /// Test code holds this token — rbac-write would let it rebind itself anywhere, and
+    /// secrets-read would hand it every credential in the namespace
+    #[test]
+    fn the_driver_role_cannot_escalate() {
+        for r in DRIVER_RULES {
+            assert_ne!(r.group, "rbac.authorization.k8s.io", "driver may not write RBAC");
+            for res in r.resources {
+                assert!(
+                    !["secrets", "serviceaccounts/token"].contains(res),
+                    "driver reads `{res}`"
+                );
+            }
+        }
+    }
+
+    /// RBAC escalation prevention: creating the per-namespace RoleBinding succeeds only while
+    /// the orchestrator already holds every verb the driver role grants. A driver rule the run
+    /// role lacks turns into a 403 at `ensure_namespace`, long after this file was edited
+    #[test]
+    fn the_run_role_covers_every_driver_grant() {
+        for d in DRIVER_RULES {
+            for res in d.resources {
+                for verb in d.verbs {
+                    assert!(
+                        grants_verb(ClusterClass::Remote, d.group, res, verb),
+                        "driver grants {verb} {res} ({}) but the run role does not — the \
+                         RoleBinding in `ensure_namespace` will 403",
+                        d.group
+                    );
+                }
             }
         }
     }

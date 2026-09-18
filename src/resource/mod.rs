@@ -36,7 +36,8 @@ pub use graph::Graph;
 pub use impls::buildkit::probe_admission as probe_build_admission;
 pub use impls::observability::{PROFILE_RETIREMENT_LAG, RETENTION_DAYS};
 pub use impls::policy::{
-    RUN_CLUSTER_ROLE, check_access as check_run_access, role_is_current as run_role_is_current,
+    ORCHESTRATOR_CLUSTER_ROLE, check_access as check_run_access, driver_role_is_current,
+    role_is_current as run_role_is_current,
 };
 pub use provider::{NodeId, Provider};
 pub use state::{Lifetime, NodeState, Readiness, ResourceError};

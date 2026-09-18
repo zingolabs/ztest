@@ -22,7 +22,7 @@ use tokio::sync::watch;
 use ztest::api::Heights;
 use ztest::api::Resources;
 use ztest::api::metrics::{Exposition, LIVE_INTERVAL, Live, PORT_NAME, SCRAPE_INTERVAL, Series};
-use ztest::api::naming::RUN_NAMESPACE;
+use ztest::api::naming::SYNC_NAMESPACE;
 use ztest::api::portforward::Forwarder;
 use ztest::api::ports::SYNC_DRIVER_METRICS;
 use ztest::sync::{SyncStatus, driver_family, driver_pod_for, find_driver, namespace_for};
@@ -37,7 +37,7 @@ use super::{DRIVER_CONTAINER, by_component, driver_profile, place_by_facet, rend
 
 /// Driver-pod address: run-namespace API handle + pod name.
 ///
-/// - Driver = a *runner* pod in [`RUN_NAMESPACE`], not the sync namespace it deploys into (a
+/// - Driver = a *runner* pod in [`SYNC_NAMESPACE`], not the sync namespace it deploys into (a
 ///   sync-scoped `Api<Pod>` would silently read the wrong one)
 struct DriverPod {
     api: Api<Pod>,
@@ -47,7 +47,7 @@ struct DriverPod {
 impl DriverPod {
     fn new(client: &kube::Client, sync_id: &str) -> Self {
         DriverPod {
-            api: Api::namespaced(client.clone(), RUN_NAMESPACE),
+            api: Api::namespaced(client.clone(), SYNC_NAMESPACE),
             name: driver_pod_for(sync_id),
         }
     }
@@ -282,7 +282,7 @@ impl LiveSampler {
             Some(driver) => driver,
             None => {
                 let pod = driver_pod_for(&self.id);
-                forward(&self.client, RUN_NAMESPACE, &pod, SYNC_DRIVER_METRICS).await?
+                forward(&self.client, SYNC_NAMESPACE, &pod, SYNC_DRIVER_METRICS).await?
             }
         };
         let mut sut = match self.sut.take() {

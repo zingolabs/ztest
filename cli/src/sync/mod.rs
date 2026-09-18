@@ -28,7 +28,7 @@ use serde_json::json;
 use clap::{Args as ClapArgs, Subcommand};
 
 use ztest::api::metrics::Series;
-use ztest::api::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
+use ztest::api::naming::{ORCHESTRATOR_SERVICE_ACCOUNT, SYNC_NAMESPACE};
 use ztest::api::pipeline::BuildOutcome;
 use ztest::api::pipeline::DumpOutcome;
 use ztest::api::pipeline::profiles::{self, ProfileStub};
@@ -493,7 +493,7 @@ async fn launch_driver(
     // `ContainerCreating`, not just the sidecar)
     if let Some(c) = collector.filter(|c| c.placement == Placement::Sidecar) {
         let cm = c.config_map();
-        Api::<ConfigMap>::namespaced(client.clone(), RUN_NAMESPACE)
+        Api::<ConfigMap>::namespaced(client.clone(), SYNC_NAMESPACE)
             .patch(&c.config_map, &PatchParams::apply("ztest-sync").force(), &Patch::Apply(&cm))
             .await
             .context("create profiler config")?;
@@ -501,7 +501,7 @@ async fn launch_driver(
     let pod = build_driver_pod(
         sync_id, profile, ns, &ns_uid, sa, compiled, target, image_refs, collector, no_cleanup,
     );
-    let created = Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
+    let created = Api::<Pod>::namespaced(client.clone(), SYNC_NAMESPACE)
         .create(&PostParams::default(), &pod)
         .await
         .context("create driver pod")?;
@@ -549,7 +549,7 @@ async fn adopt_profiler_config(client: &Client, driver: &Pod, name: &str) {
         "name": driver.metadata.name,
         "uid": uid,
     }]}});
-    let api: Api<ConfigMap> = Api::namespaced(client.clone(), RUN_NAMESPACE);
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), SYNC_NAMESPACE);
     if let Err(e) = api.patch(name, &PatchParams::default(), &Patch::Merge(&owner)).await {
         eprintln!("ztest sync: profiler config {name} not owner-referenced: {e}");
     }
@@ -558,10 +558,10 @@ async fn adopt_profiler_config(client: &Client, driver: &Pod, name: &str) {
 /// Tear down a launch that never reached `Running` (else `sync list` shows a zombie
 /// holding no reservation). Best-effort — leftovers are `ztest cleanup`'s
 async fn abandon_launch(client: &Client, sync_id: &str, ns: &str) {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), RUN_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), SYNC_NAMESPACE);
     let _ = pods.delete(&driver_pod_for(sync_id), &Default::default()).await;
     // Explicit: the config outlives a launch that died before the pod existed to own it
-    let configs: Api<ConfigMap> = Api::namespaced(client.clone(), RUN_NAMESPACE);
+    let configs: Api<ConfigMap> = Api::namespaced(client.clone(), SYNC_NAMESPACE);
     let _ = configs.delete(&profiler_config_name(sync_id), &Default::default()).await;
     let namespaces: Api<Namespace> = Api::all(client.clone());
     let _ = namespaces.delete(ns, &Default::default()).await;
@@ -605,7 +605,7 @@ async fn record_launch(
 async fn await_driver_running(client: &Client, sync_id: &str) -> Result<()> {
     use ztest::api::pod_status as ps;
 
-    let api: Api<Pod> = Api::namespaced(client.clone(), RUN_NAMESPACE);
+    let api: Api<Pod> = Api::namespaced(client.clone(), SYNC_NAMESPACE);
     let name = driver_pod_for(sync_id);
     let mut unscheduled_since: Option<std::time::Instant> = None;
     let started = std::time::Instant::now();
@@ -956,6 +956,9 @@ async fn ensure_sync_namespace(
         "metadata": {
             "name": ns,
             "labels": {
+                // `role` says what it is, `kind` says how it dies — a sync namespace is a test
+                // environment that outlives its run, and RBAC/admission select on the former
+                ztest::qos::LABEL_ROLE: ztest::qos::ROLE_TEST_ENV,
                 KIND_LABEL_KEY: KIND_LABEL_VALUE,
                 SYNC_ID_KEY: sync_id,
                 ztest::qos::LABEL_USER: ztest::api::naming::current_user(),
@@ -973,7 +976,7 @@ async fn ensure_sync_namespace(
 /// Detached driver pod: baked runner image running `<bin> --exact <test>`, as a
 /// `ztest run` runner pod does — same *where* and *as whom*.
 ///
-/// - [`RUN_NAMESPACE`] as [`RUN_SERVICE_ACCOUNT`], the one identity `ztest cluster setup`
+/// - [`SYNC_NAMESPACE`] as [`ORCHESTRATOR_SERVICE_ACCOUNT`], the one identity `ztest cluster setup`
 ///   provisions with the RBAC a component-spawning test needs
 /// - Provisions into the sync's namespace via
 ///   [`TEST_NAMESPACE_ENV`](ztest::api::naming::TEST_NAMESPACE_ENV) → needs no identity of its own
@@ -1009,7 +1012,7 @@ fn build_driver_pod(
     let mut env = vec![
         json!({ "name": "ZTEST_ENGINE", "value": "1" }),
         // *Billing* SA (`ztest.io/sa`, the ledger's cost centre), not the credential: the
-        // driver authenticates as `RUN_SERVICE_ACCOUNT`, bills whoever launched it
+        // driver authenticates as `ORCHESTRATOR_SERVICE_ACCOUNT`, bills whoever launched it
         json!({ "name": "ZTEST_SA", "value": sa }),
         json!({ "name": ztest::api::naming::TEST_NAMESPACE_ENV, "value": ns }),
         // In-pod `RunCoords` derives from this → every component pod carries it
@@ -1076,7 +1079,7 @@ fn build_driver_pod(
         "kind": "Pod",
         "metadata": {
             "name": driver_pod_for(sync_id),
-            "namespace": RUN_NAMESPACE,
+            "namespace": SYNC_NAMESPACE,
             // Cluster-scoped owner, so a namespaced dependent in *another* namespace is
             // legal (cross-*namespace* refs are not): deleting the sync namespace GCs the
             // driver with it, making that namespace the whole run's single deletion unit
@@ -1099,7 +1102,7 @@ fn build_driver_pod(
         },
         "spec": {
             "restartPolicy": "Never",
-            "serviceAccountName": RUN_SERVICE_ACCOUNT,
+            "serviceAccountName": ORCHESTRATOR_SERVICE_ACCOUNT,
             "enableServiceLinks": false,
             "terminationGracePeriodSeconds": STOP_GRACE_SECS,
             "nodeSelector": { ztest::qos::NVME_NODE_LABEL_KEY: ztest::qos::NVME_NODE_LABEL_VALUE },
@@ -1577,7 +1580,7 @@ async fn stop(id: &str) -> Result<()> {
     let client = client().await?;
     ztest::api::profiling::reap_finished(&client).await;
     let _ = find_driver(&client, id).await?; // 404s clearly if unknown
-    let api: Api<Pod> = Api::namespaced(client, RUN_NAMESPACE);
+    let api: Api<Pod> = Api::namespaced(client, SYNC_NAMESPACE);
     let patch = json!({ "metadata": { "annotations": { STOP_ANNOTATION: "true" } } });
     api.patch(&driver_pod_for(id), &PatchParams::apply("ztest-sync"), &Patch::Merge(&patch))
         .await

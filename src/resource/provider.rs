@@ -33,7 +33,7 @@ pub enum NodeId {
     NodeLabel(String),
 
     // ── ztest run identity + policy ───────────────────────────────────
-    /// Run SA + `ztest-remote` ClusterRole/binding + non-expiring token Secret
+    /// Run SA + `ztest-orchestrator` ClusterRole/binding + non-expiring token Secret
     /// (least-privilege kubeconfig source; on every target)
     RunIdentity,
 

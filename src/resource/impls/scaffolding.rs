@@ -8,26 +8,50 @@ use serde_json::json;
 
 use crate::resource::{Cx, Lifetime, NodeId, Provider, Readiness, ResourceError};
 
+/// Pod Security level a namespace enforces. `Unset` leaves the cluster default (which is
+/// `privileged` — no enforcement), so every ztest namespace names its level explicitly
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodSecurity {
+    Unset,
+    /// Blocks hostPath, hostNetwork/PID/IPC, privileged, added capabilities, host ports
+    Baseline,
+    /// BuildKit only — rootless buildkitd's unconfined seccomp/AppArmor exceeds baseline
+    Privileged,
+}
+
+impl PodSecurity {
+    fn label(self) -> Option<&'static str> {
+        match self {
+            PodSecurity::Unset => None,
+            PodSecurity::Baseline => Some("baseline"),
+            PodSecurity::Privileged => Some(PSA_PRIVILEGED),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NamespaceProvider {
     name: String,
-    psa_privileged: bool,
+    psa: PodSecurity,
 }
 
 impl NamespaceProvider {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), psa_privileged: false }
+        Self { name: name.into(), psa: PodSecurity::Unset }
     }
 
-    /// Required by the BuildKit pod (unconfined seccomp/AppArmor exceeds
-    /// *baseline*); without it the pod dies at admission, far from BuildKit
-    pub fn pod_security_privileged(mut self) -> Self {
-        self.psa_privileged = true;
+    /// Enforced level. Absent or wrong = [`Readiness::Absent`], so a pre-existing namespace
+    /// at the wrong level is corrected by setup rather than silently accepted
+    pub fn pod_security(mut self, psa: PodSecurity) -> Self {
+        self.psa = psa;
         self
     }
 
     fn labels(&self) -> serde_json::Value {
-        if self.psa_privileged { json!({ PSA_ENFORCE_LABEL: PSA_PRIVILEGED }) } else { json!({}) }
+        match self.psa.label() {
+            Some(level) => json!({ PSA_ENFORCE_LABEL: level }),
+            None => json!({}),
+        }
     }
 }
 
@@ -50,15 +74,15 @@ impl Provider for NamespaceProvider {
             return Readiness::Absent;
         };
         // Existence != readiness under a required PSA level (a pre-existing ns would
-        // report Ready, then reject the BuildKit pod at admission)
-        if self.psa_privileged
+        // report Ready, then reject its pods at admission)
+        if let Some(want) = self.psa.label()
             && ns
                 .metadata
                 .labels
                 .as_ref()
                 .and_then(|l| l.get(PSA_ENFORCE_LABEL))
                 .map(String::as_str)
-                != Some(PSA_PRIVILEGED)
+                != Some(want)
         {
             return Readiness::Absent;
         }

@@ -20,7 +20,7 @@ use kube::api::{Api, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use kube::runtime::wait::await_condition;
 use serde_json::{Value, json};
 
-use crate::naming::RUN_NAMESPACE;
+use crate::naming::BUILD_NAMESPACE;
 use crate::qos::{LABEL_RUN_ID, LABEL_USER};
 use crate::resource::impls::policy::{BUILDKIT_SERVICE_ACCOUNT, manifest_hash};
 use crate::resource::kube::FIELD_MANAGER;
@@ -156,7 +156,7 @@ fn config_manifest() -> Value {
     json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
-        "metadata": { "name": BUILDKIT_CONFIG, "namespace": RUN_NAMESPACE },
+        "metadata": { "name": BUILDKIT_CONFIG, "namespace": BUILD_NAMESPACE },
         "data": { "buildkitd.toml": buildkitd_toml() },
     })
 }
@@ -190,6 +190,9 @@ fn pod_spec(cpu: &str, mem: &str) -> Value {
 
     json!({
         "serviceAccountName": BUILDKIT_SERVICE_ACCOUNT,
+        // buildkitd never calls the API server, and this pod compiles untrusted source —
+        // no token to steal (the SA carries no binding either, `policy::tests`)
+        "automountServiceAccountToken": false,
         // Single-use: a crashed buildkitd stays dead and fails the run loudly
         "restartPolicy": "Never",
         "terminationGracePeriodSeconds": TERMINATION_GRACE_SECS,
@@ -249,7 +252,7 @@ pub async fn create_build_pod(
     user: &str,
 ) -> Result<String, ResourceError> {
     let name = format!("ztest-build-{:08x}", rand::random::<u32>());
-    Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
+    Api::<Pod>::namespaced(client.clone(), BUILD_NAMESPACE)
         .create(&PostParams::default(), &build_pod(&name, run_id, user))
         .await
         .map_err(|e| ResourceError::Provision(format!("create build pod {name}: {e}")))?;
@@ -264,7 +267,7 @@ pub async fn create_build_pod(
 /// so twenty minutes into a run otherwise
 pub async fn probe_admission(client: &kube::Client) -> Result<(), kube::Error> {
     let params = PostParams { dry_run: true, ..Default::default() };
-    Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE)
+    Api::<Pod>::namespaced(client.clone(), BUILD_NAMESPACE)
         .create(&params, &build_pod("ztest-build-admission-probe", "probe", "probe"))
         .await
         .map(|_| ())
@@ -280,7 +283,7 @@ fn build_pod(name: &str, run_id: &str, user: &str) -> Pod {
         "kind": "Pod",
         "metadata": {
             "name": name,
-            "namespace": RUN_NAMESPACE,
+            "namespace": BUILD_NAMESPACE,
             "labels": {
                 BUILDKIT_COMPONENT: "buildkit",
                 LABEL_RUN_ID: run_id,
@@ -298,7 +301,7 @@ fn build_pod(name: &str, run_id: &str, user: &str) -> Pod {
 /// Block until the pod's `Ready` condition is `True` (buildkitd answers
 /// `buildctl debug workers`), or fail after [`READY_TIMEOUT`]
 pub async fn wait_build_pod_ready(client: &kube::Client, name: &str) -> Result<(), ResourceError> {
-    let api: Api<Pod> = Api::namespaced(client.clone(), RUN_NAMESPACE);
+    let api: Api<Pod> = Api::namespaced(client.clone(), BUILD_NAMESPACE);
     // Wake on either terminal state: `restartPolicy: Never` means a crashed or
     // unschedulable pod never recovers, so report it instead of spinning to timeout
     let settled = await_condition(api, name, |p: Option<&Pod>| {
@@ -332,7 +335,7 @@ async fn failure_log_tail(client: &kube::Client, name: &str) -> Option<String> {
         ..Default::default()
     };
     let logs =
-        Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE).logs(name, &params).await.ok()?;
+        Api::<Pod>::namespaced(client.clone(), BUILD_NAMESPACE).logs(name, &params).await.ok()?;
     let tail = logs.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n");
     (!tail.is_empty()).then(|| format!(":\n{tail}"))
 }
@@ -383,7 +386,7 @@ fn pod_failed(p: &Pod) -> Option<String> {
 ///   forever, and a lingering pod holds its Guaranteed footprint)
 /// - Best-effort: single-use throwaway, durable state on the cache PVC
 pub async fn delete_build_pod(client: &kube::Client, name: &str) {
-    let api = Api::<Pod>::namespaced(client.clone(), RUN_NAMESPACE);
+    let api = Api::<Pod>::namespaced(client.clone(), BUILD_NAMESPACE);
     if api.delete(name, &DeleteParams::default()).await.is_err() {
         return;
     }
@@ -414,7 +417,7 @@ impl Provider for BuildkitProvider {
     }
 
     fn deps(&self) -> Vec<NodeId> {
-        vec![NodeId::Namespace(RUN_NAMESPACE.to_string())]
+        vec![NodeId::Namespace(BUILD_NAMESPACE.to_string())]
     }
 
     fn lifetime(&self) -> Lifetime {
@@ -422,9 +425,9 @@ impl Provider for BuildkitProvider {
     }
 
     async fn probe(&self, cx: &Cx) -> Readiness {
-        let cm: Api<ConfigMap> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
-        let sa: Api<ServiceAccount> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
-        let pvc: Api<PersistentVolumeClaim> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
+        let cm: Api<ConfigMap> = Api::namespaced(cx.client.clone(), BUILD_NAMESPACE);
+        let sa: Api<ServiceAccount> = Api::namespaced(cx.client.clone(), BUILD_NAMESPACE);
+        let pvc: Api<PersistentVolumeClaim> = Api::namespaced(cx.client.clone(), BUILD_NAMESPACE);
         let config_current = matches!(
             cm.get(BUILDKIT_CONFIG).await,
             Ok(c) if c.data.as_ref().and_then(|d| d.get("buildkitd.toml")) == Some(&buildkitd_toml())
@@ -445,10 +448,10 @@ impl Provider for BuildkitProvider {
         let sa: ServiceAccount = serde_json::from_value(json!({
             "apiVersion": "v1",
             "kind": "ServiceAccount",
-            "metadata": { "name": BUILDKIT_SERVICE_ACCOUNT, "namespace": RUN_NAMESPACE },
+            "metadata": { "name": BUILDKIT_SERVICE_ACCOUNT, "namespace": BUILD_NAMESPACE },
         }))
         .expect("static ServiceAccount manifest is valid");
-        Api::<ServiceAccount>::namespaced(cx.client.clone(), RUN_NAMESPACE)
+        Api::<ServiceAccount>::namespaced(cx.client.clone(), BUILD_NAMESPACE)
             .patch(BUILDKIT_SERVICE_ACCOUNT, &params, &Patch::Apply(&sa))
             .await
             .map_err(|e| {
@@ -457,7 +460,7 @@ impl Provider for BuildkitProvider {
 
         let cm: ConfigMap =
             serde_json::from_value(config_manifest()).expect("static ConfigMap manifest is valid");
-        Api::<ConfigMap>::namespaced(cx.client.clone(), RUN_NAMESPACE)
+        Api::<ConfigMap>::namespaced(cx.client.clone(), BUILD_NAMESPACE)
             .patch(BUILDKIT_CONFIG, &params, &Patch::Apply(&cm))
             .await
             .map_err(|e| {
@@ -466,7 +469,8 @@ impl Provider for BuildkitProvider {
 
         // Create-if-absent, else grow: a bound PVC's class is immutable and CSI
         // only expands, so a raised `cache_size()` reconciles onto an existing cluster
-        let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(cx.client.clone(), RUN_NAMESPACE);
+        let pvc_api: Api<PersistentVolumeClaim> =
+            Api::namespaced(cx.client.clone(), BUILD_NAMESPACE);
         let mut spec = json!({
             "accessModes": ["ReadWriteOnce"],
             "resources": { "requests": { "storage": cache_size() } },
@@ -477,7 +481,7 @@ impl Provider for BuildkitProvider {
         let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
-            "metadata": { "name": BUILDKIT_CACHE_PVC, "namespace": RUN_NAMESPACE },
+            "metadata": { "name": BUILDKIT_CACHE_PVC, "namespace": BUILD_NAMESPACE },
             "spec": spec,
         }))
         .expect("static PVC manifest is valid");

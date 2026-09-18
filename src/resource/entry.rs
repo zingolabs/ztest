@@ -81,10 +81,23 @@ where
         )));
     }
 
-    // Run identity (SA + RBAC + token). Its namespace carries `privileged` Pod Security —
-    // the rootless BuildKit pod's unconfined seccomp/AppArmor needs it to pass admission
+    // Driver pods run untrusted test code → `baseline`, which blocks hostPath, host
+    // namespaces, privileged and added capabilities (the node-escape surface)
     graph.add_dedup(Box::new(
-        scaffolding::NamespaceProvider::new(crate::naming::RUN_NAMESPACE).pod_security_privileged(),
+        scaffolding::NamespaceProvider::new(crate::naming::RUN_NAMESPACE)
+            .pod_security(scaffolding::PodSecurity::Baseline),
+    ));
+    // BuildKit alone needs `privileged` (rootless buildkitd's unconfined seccomp/AppArmor).
+    // Its own namespace → that exemption never covers a pod running test code
+    graph.add_dedup(Box::new(
+        scaffolding::NamespaceProvider::new(crate::naming::BUILD_NAMESPACE)
+            .pod_security(scaffolding::PodSecurity::Privileged),
+    ));
+    // Sync drivers carry the eBPF profiling sidecar (`privileged` + `hostPID`). Dev-only, and
+    // kept out of RUN_NAMESPACE so that exemption never reaches a CI-reachable pod
+    graph.add_dedup(Box::new(
+        scaffolding::NamespaceProvider::new(crate::naming::SYNC_NAMESPACE)
+            .pod_security(scaffolding::PodSecurity::Privileged),
     ));
     for p in policy::providers(opts.backend) {
         graph.add_dedup(p);
@@ -230,24 +243,30 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
         Err(e) => errors.push(format!("list namespaces ({ns_selector}): {e}")),
     }
 
-    // Build + seed-uploader pods live in RUN_NAMESPACE → the cascade above misses them,
-    // and a SIGKILL'd run leaves them holding their Guaranteed footprint
-    let pods: Api<Pod> = Api::namespaced(client.clone(), crate::naming::RUN_NAMESPACE);
+    // Driver, build + seed-uploader pods sit outside any test namespace → the cascade above
+    // misses them, and a SIGKILL'd run leaves them holding their Guaranteed footprint
     let pod_lp = ListParams::default().labels(vsc_selector);
-    match pods.list(&pod_lp).await {
-        Ok(list) => {
-            for pod in list.items {
-                let Some(name) = pod.metadata.name.as_deref() else {
-                    continue;
-                };
-                if let Err(e) = pods.delete(name, &dp).await
-                    && !crate::cluster::is_not_found(&e)
-                {
-                    errors.push(format!("reap pod {name} ({vsc_selector}): {e}"));
+    for ns in [
+        crate::naming::RUN_NAMESPACE,
+        crate::naming::BUILD_NAMESPACE,
+        crate::naming::SYNC_NAMESPACE,
+    ] {
+        let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+        match pods.list(&pod_lp).await {
+            Ok(list) => {
+                for pod in list.items {
+                    let Some(name) = pod.metadata.name.as_deref() else {
+                        continue;
+                    };
+                    if let Err(e) = pods.delete(name, &dp).await
+                        && !crate::cluster::is_not_found(&e)
+                    {
+                        errors.push(format!("reap pod {name} ({vsc_selector}): {e}"));
+                    }
                 }
             }
+            Err(e) => errors.push(format!("list pods ({vsc_selector}): {e}")),
         }
-        Err(e) => errors.push(format!("list pods ({vsc_selector}): {e}")),
     }
 
     // Cluster-scoped → no cascade with the namespace; list + delete each by label (the

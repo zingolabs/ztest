@@ -225,7 +225,7 @@ async fn collector_metrics(client: &kube::Client, id: &str) -> Option<Exposition
         None => {
             let fwd = ztest::api::portforward::Forwarder::start(
                 client.clone(),
-                ztest::api::naming::RUN_NAMESPACE.to_string(),
+                ztest::api::naming::SYNC_NAMESPACE.to_string(),
                 ztest::sync::driver_pod_for(id),
                 port,
             )
@@ -281,7 +281,7 @@ async fn explain_empty(client: &kube::Client, id: &str, component: &str) -> Opti
     use k8s_openapi::api::core::v1::Pod;
     use kube::api::Api;
 
-    let run_ns = ztest::api::naming::RUN_NAMESPACE;
+    let run_ns = ztest::api::naming::SYNC_NAMESPACE;
     let driver: Pod =
         Api::namespaced(client.clone(), run_ns).get(&ztest::sync::driver_pod_for(id)).await.ok()?;
     let spec = driver.spec.as_ref()?;

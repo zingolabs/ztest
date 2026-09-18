@@ -446,24 +446,34 @@ async fn expandable(client: &Client) -> Finding {
 /// The role is checked by *revision*, not existence — that is the half
 /// [`permissions`] cannot see, since an admin caller's own SSAR passes over a stale role
 async fn infrastructure(client: &Client, backend: ClusterClass) -> Finding {
-    use crate::naming::{RUN_NAMESPACE, RUN_SERVICE_ACCOUNT};
+    use crate::naming::{
+        BUILD_NAMESPACE, DRIVER_CLUSTER_ROLE, DRIVER_SERVICE_ACCOUNT, ORCHESTRATOR_SERVICE_ACCOUNT,
+        RUN_NAMESPACE, SYNC_NAMESPACE,
+    };
     use crate::resource::impls::buildkit::BUILDKIT_CACHE_PVC;
-    use crate::resource::impls::policy::{BUILDKIT_SERVICE_ACCOUNT, RUN_CLUSTER_ROLE};
+    use crate::resource::impls::policy::{BUILDKIT_SERVICE_ACCOUNT, ORCHESTRATOR_CLUSTER_ROLE};
 
-    let (seeds, meta, run, sa, buildkit_sa, cache, role) = tokio::join!(
+    let (seeds, meta, run, build, sync, sa, driver_sa, buildkit_sa, cache, role, driver_role) = tokio::join!(
         cluster_object::<Namespace>(client, crate::seeds::SEEDS_NAMESPACE),
         cluster_object::<Namespace>(client, crate::qos::ledger::META_NAMESPACE),
         cluster_object::<Namespace>(client, RUN_NAMESPACE),
-        object::<ServiceAccount>(client, RUN_NAMESPACE, RUN_SERVICE_ACCOUNT),
-        object::<ServiceAccount>(client, RUN_NAMESPACE, BUILDKIT_SERVICE_ACCOUNT),
-        object::<PersistentVolumeClaim>(client, RUN_NAMESPACE, BUILDKIT_CACHE_PVC),
+        cluster_object::<Namespace>(client, BUILD_NAMESPACE),
+        cluster_object::<Namespace>(client, SYNC_NAMESPACE),
+        object::<ServiceAccount>(client, RUN_NAMESPACE, ORCHESTRATOR_SERVICE_ACCOUNT),
+        object::<ServiceAccount>(client, RUN_NAMESPACE, DRIVER_SERVICE_ACCOUNT),
+        object::<ServiceAccount>(client, BUILD_NAMESPACE, BUILDKIT_SERVICE_ACCOUNT),
+        object::<PersistentVolumeClaim>(client, BUILD_NAMESPACE, BUILDKIT_CACHE_PVC),
         async {
-            piece(RUN_CLUSTER_ROLE, crate::resource::run_role_is_current(client, backend).await)
+            piece(
+                ORCHESTRATOR_CLUSTER_ROLE,
+                crate::resource::run_role_is_current(client, backend).await,
+            )
         },
+        async { piece(DRIVER_CLUSTER_ROLE, crate::resource::driver_role_is_current(client).await) },
     );
     parts(
-        [seeds, meta, run, sa, buildkit_sa, cache, role],
-        "namespaces, run identity, BuildKit scaffolding",
+        [seeds, meta, run, build, sync, sa, driver_sa, buildkit_sa, cache, role, driver_role],
+        "namespaces, run + driver identities, BuildKit scaffolding",
     )
 }
 
