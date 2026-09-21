@@ -5,6 +5,7 @@
 //! - Whole-frame repaint (height tracks the cluster), so a shrinking frame clears its tail
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::{IsTerminal as _, Write as _, stdout};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -19,6 +20,7 @@ use kube::api::{Api, ListParams};
 use ztest::qos::Resources;
 use ztest::qos::beacon::{Beacon, LeaseKind};
 use ztest::qos::ledger;
+use ztest_ui::tty::{CURSOR_HIDE, CURSOR_SHOW, SYNC_BEGIN, SYNC_END, TtyGuard, WRAP_OFF, WRAP_ON};
 use ztest_ui::{ClaimRow, RunRow, StatusView, Theme, render_status};
 
 /// Leases and nodes number in the tens, so a list pair is cheaper than the reflector
@@ -27,6 +29,11 @@ const POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 pub struct Args {
+    /// Named cluster profile (see `ztest cluster`) — the same selector as
+    /// `ztest run --cluster`. Overrides the persisted default.
+    #[arg(long, value_name = "NAME")]
+    cluster: Option<String>,
+
     /// Render one frame and exit, instead of watching live.
     #[arg(long)]
     pub once: bool,
@@ -36,16 +43,31 @@ pub struct Args {
     pub json: bool,
 }
 
+impl Args {
+    /// `--cluster`, read back by `bind_cluster` in dispatch — the one place that binds a
+    /// profile, for every subcommand
+    pub(crate) fn cluster_profile(&self) -> Option<&str> {
+        self.cluster.as_deref()
+    }
+}
+
 pub fn execute(args: Args) -> ExitCode {
     super::block_on("status", super::Rt::Multi, run(args))
 }
 
 async fn run(args: Args) -> Result<()> {
-    let client = Client::try_default().await.context("cluster client")?;
+    let client = ztest::api::cluster::client().await.context("cluster client")?;
+    // Same binding the client came from, resolved once (fixed for the process, and a
+    // per-frame kubeconfig re-read would be a syscall per second for a constant)
+    let server = ztest::api::cluster::config()
+        .await
+        .ok()
+        .and_then(|c| c.cluster_url.host().map(str::to_string))
+        .unwrap_or_else(|| "?".into());
     let theme = Theme::detect();
     // Non-TTY has no frame to repaint into; one frame is the whole useful output
     if args.json || args.once || !stdout().is_terminal() {
-        let view = snapshot(&client).await?;
+        let view = snapshot(&client, &server).await?;
         return match args.json {
             true => emit_json(&view),
             false => {
@@ -54,14 +76,24 @@ async fn run(args: Args) -> Result<()> {
             }
         };
     }
-    live(&client, &theme).await
+    live(&client, &server, &theme).await
 }
 
-async fn live(client: &Client, theme: &Theme) -> Result<()> {
+/// Live watch. Owns the terminal for its duration: echo off (a stray keystroke would shift
+/// the frame under [`repaint`]'s row arithmetic), cursor hidden, autowrap off.
+///
+/// Restored on every exit — `Ctrl-C`, apiserver error, panic ([`TtyGuard`] `Drop`)
+async fn live(client: &Client, server: &str, theme: &Theme) -> Result<()> {
+    let tty = TtyGuard::enter();
+    {
+        let mut out = stdout().lock();
+        let _ = write!(out, "{CURSOR_HIDE}{WRAP_OFF}");
+        let _ = out.flush();
+    }
     let mut painted = 0usize;
     let mut interrupt = Box::pin(tokio::signal::ctrl_c());
     loop {
-        let frame = match snapshot(client).await {
+        let frame = match snapshot(client, server).await {
             Ok(v) => render_status(&v, term_cols(), theme),
             // A transient apiserver blip must not tear down a watch the user is reading
             Err(e) => format!("ztest status: {e:#}\n"),
@@ -72,18 +104,29 @@ async fn live(client: &Client, theme: &Theme) -> Result<()> {
             _ = tokio::time::sleep(POLL) => {}
         }
     }
-    println!();
+    let mut out = stdout().lock();
+    let _ = write!(out, "{WRAP_ON}{CURSOR_SHOW}\n");
+    let _ = out.flush();
+    tty.restore();
     Ok(())
 }
 
 /// Cursor back to the frame's top, then clear to end of screen: the erase is what lets the
-/// frame shrink when a run finishes
+/// frame shrink when a run finishes.
+///
+/// - `painted` = physical rows, == line count only while every line fits `cols` (held by
+///   the renderer, asserted in `ztest_ui`, and enforced here by `WRAP_OFF`)
+/// - Whole frame in one write, wrapped in DEC 2026 → no torn mid-repaint frame
 fn repaint(frame: &str, painted: &mut usize) {
-    let mut out = stdout().lock();
+    let mut buf = String::with_capacity(frame.len() + 32);
+    buf.push_str(SYNC_BEGIN);
     if *painted > 0 {
-        let _ = write!(out, "\x1b[{painted}A\x1b[J");
+        let _ = write!(buf, "\x1b[{painted}F\x1b[J");
     }
-    let _ = write!(out, "{frame}");
+    buf.push_str(frame);
+    buf.push_str(SYNC_END);
+    let mut out = stdout().lock();
+    let _ = out.write_all(buf.as_bytes());
     let _ = out.flush();
     *painted = frame.lines().count();
 }
@@ -94,12 +137,7 @@ fn term_cols() -> u16 {
 
 // ─────────────────────────── snapshot ─────────────────────────────────
 
-async fn snapshot(client: &Client) -> Result<StatusView> {
-    let server = kube::Config::infer()
-        .await
-        .ok()
-        .and_then(|c| c.cluster_url.host().map(str::to_string))
-        .unwrap_or_else(|| "?".into());
+async fn snapshot(client: &Client, server: &str) -> Result<StatusView> {
     let leases = ledger::lease_api(client);
     let nodes: Api<Node> = Api::all(client.clone());
     let lp = ListParams::default();
@@ -113,7 +151,7 @@ async fn snapshot(client: &Client) -> Result<StatusView> {
 
     Ok(StatusView {
         context: ztest::api::cluster_config::active_context().unwrap_or_else(|| "?".into()),
-        server,
+        server: server.to_string(),
         nodes: ztest::api::pipeline::node_summary(&nodes.items),
         allocatable: ztest::api::pipeline::cluster_allocatable(&nodes.items),
         capacity: ztest::api::pipeline::total_allocatable(&nodes.items),

@@ -180,11 +180,11 @@ fn bind_cluster(cmd: &Command) -> Result<Option<String>, ztest::api::cluster_con
         Command::Sync(a) => a.cluster_profile(),
         Command::Cleanup(a) => a.cluster_profile(),
         Command::Cluster(a) => a.cluster_profile(),
+        Command::Status(a) => a.cluster_profile(),
         Command::Replay(_)
         | Command::Store(_)
         | Command::ListMounts(_)
         | Command::Snapshot(_)
-        | Command::Status(_)
         | Command::Preview => None,
     };
     unsafe { ztest::api::cluster_config::activate(flag) }

@@ -103,53 +103,7 @@ fn two_col_split(width: u16) -> (u16, u16) {
     (left, width - left)
 }
 
-/// Restores the controlling terminal's line discipline on drop.
-///
-/// - `ECHO` + `ICANON` off (cooked mode echoes keystrokes, `^C` worst, onto the panel)
-/// - `ISIG` kept → Ctrl-C still raises `SIGINT` instead of arriving as a raw byte
-/// - Restored by [`Surface::finish`], with `Drop` as the panic/`exit` backstop
-struct TtyGuard {
-    fd: std::os::fd::RawFd,
-    original: Option<libc::termios>,
-}
-
-impl TtyGuard {
-    /// Enter no-echo / no-canonical mode on stdin's tty, saving the prior attributes.
-    /// No-op (`original: None`) off a tty
-    fn enter() -> TtyGuard {
-        let fd = libc::STDIN_FILENO;
-        let mut term: libc::termios = unsafe { std::mem::zeroed() };
-        let original = if unsafe { libc::tcgetattr(fd, &mut term) } == 0 {
-            let saved = term;
-            term.c_lflag &= !(libc::ECHO | libc::ICANON);
-            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) };
-            Some(saved)
-        } else {
-            None
-        };
-        TtyGuard { fd, original }
-    }
-
-    /// Restore the saved attributes. Idempotent — `finish` calls it (covering a
-    /// `Drop`-skipping `process::exit`) and `Drop` calls it again
-    fn restore(&self) {
-        if let Some(orig) = self.original.as_ref() {
-            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, orig) };
-        }
-    }
-}
-
-impl Drop for TtyGuard {
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
-
-/// Synchronized-update + cursor-visibility sequences (DEC private modes)
-const SYNC_BEGIN: &str = "\x1b[?2026h";
-const SYNC_END: &str = "\x1b[?2026l";
-const CURSOR_HIDE: &str = "\x1b[?25l";
-const CURSOR_SHOW: &str = "\x1b[?25h";
+use crate::tty::{CURSOR_HIDE, CURSOR_SHOW, SYNC_BEGIN, SYNC_END, TtyGuard};
 
 /// Terminal owner: manual sticky footer over real stdout, synchronous (no ratatui,
 /// no reserved viewport, no runtime). `prev_footer_rows` = last present's physical row

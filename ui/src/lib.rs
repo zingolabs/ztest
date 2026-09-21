@@ -26,6 +26,7 @@ mod status;
 pub mod template;
 pub mod text;
 mod theme;
+pub mod tty;
 
 use ztest::api::{BuildStage, NodeSummary};
 

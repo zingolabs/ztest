@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 use owo_colors::OwoColorize as _;
 
-use super::layout::pad;
+use super::layout::{display_width, pad, truncate_with};
 use super::template::{Fields, draw};
 use super::theme::Theme;
 use super::{ClaimRow, RunRow, StatusView};
@@ -76,7 +76,10 @@ mod tmpl {
     pub(super) const NARROW_CLUSTER: &str = " {context} {version} {@dot} {nodes} nodes {@dot} {control_plane} cp {@dot} {workers} wkr[{cordoned}]";
 }
 
-/// No `*` cell and no spinner in any of these rows → zero width, zero elapsed
+/// No `*` cell and no spinner in any of these rows → zero width, zero elapsed.
+///
+/// Final clip = the one chokepoint holding `line <= cols` for the whole frame; the live
+/// watch walks the cursor up by line count, so one wrapped row marches the frame downscreen
 pub fn render_status(v: &StatusView, cols: u16, theme: &Theme) -> String {
     let cols = cols.max(40) as usize;
     let mut out = String::new();
@@ -86,7 +89,11 @@ pub fn render_status(v: &StatusView, cols: u16, theme: &Theme) -> String {
     } else {
         columns(&mut out, v, cols, theme);
     }
-    out
+    let mut clipped = String::with_capacity(out.len());
+    for line in out.lines() {
+        let _ = writeln!(clipped, "{}", truncate_with(line, cols, theme.chars.ellipsis));
+    }
+    clipped
 }
 
 // ─────────────────────────── geometry ─────────────────────────────────
@@ -444,9 +451,17 @@ fn rule(label: &str, width: usize, theme: &Theme) -> String {
 fn header(out: &mut String, v: &StatusView, cols: usize, theme: &Theme) {
     let clock = v.now.format("%H:%M:%S").to_string();
     let head = format!("ztest v{}", env!("CARGO_PKG_VERSION"));
-    let mid = format!("{} {} {}", v.context, theme.chars.dot, v.server);
-    let used = head.len() + mid.len() + clock.len() + 12;
-    let fill = theme.chars.hbar(cols.saturating_sub(used));
+    // Display columns, never `len()`: `dot` is 1 column / 2 bytes. HEAD_CHROME = the
+    // template's own rules + spaces; undercounting it overflows `cols` and the frame wraps
+    const HEAD_CHROME: usize = 13;
+    let fixed = display_width(&head) + display_width(&clock) + HEAD_CHROME;
+    // `context · server` = the only unbounded part → it absorbs a narrow terminal
+    let mid = truncate_with(
+        &format!("{} {} {}", v.context, theme.chars.dot, v.server),
+        cols.saturating_sub(fixed),
+        theme.chars.ellipsis,
+    );
+    let fill = theme.chars.hbar(cols.saturating_sub(fixed + display_width(&mid)));
     let _ = writeln!(
         out,
         "{lead} {} {mid_rule} {} {fill} {clock} {lead}\n",
@@ -794,5 +809,29 @@ mod tests {
         let uni = render_status(&v, 120, &Theme::for_capabilities(false, true));
         let ascii = render_status(&v, 120, &Theme::for_capabilities(false, false));
         assert_eq!(uni.lines().count(), ascii.lines().count(), "row count diverged");
+    }
+
+    /// `ztest status` repaints by walking the cursor up `frame.lines().count()` rows, which
+    /// is only the painted height while no line wraps. A single overflowing line makes the
+    /// live frame march down the screen one row per poll
+    #[test]
+    fn no_frame_line_exceeds_the_terminal_width() {
+        let mut v = full_view();
+        // Real-world overflow case: the header's `context · server` is the unbounded part
+        v.context = "elicbarbieri@zingo-infra".into();
+        v.server = "api.crc.testing".into();
+        for unicode in [true, false] {
+            let theme = Theme::for_capabilities(false, unicode);
+            for cols in [40u16, 60, 80, 99, 100, 120, 200] {
+                let frame = render_status(&v, cols, &theme);
+                for (i, line) in frame.lines().enumerate() {
+                    let w = display_width(line);
+                    assert!(
+                        w <= cols as usize,
+                        "unicode={unicode} cols={cols}: line {i} is {w} wide\n{line}"
+                    );
+                }
+            }
+        }
     }
 }
