@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # The buildkit-native ztest runner build: compile the test binaries, dump their
 # inventory, and assemble the runtime image — one multi-stage build in the
 # ephemeral buildkit pod `ztest run` creates per run.
