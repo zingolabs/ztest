@@ -1,11 +1,13 @@
 //! `cargo xtask regen-proto` — rewrite the checked-in lightwalletd bindings.
+//! `cargo xtask release-gate` — cargo-release `pre-release-hook`; fails unless HEAD = upstream tip.
 //!
 //! - Sole reason this crate exists: keep `protoc` out of the published build graph
 //! - Drift = `git diff --exit-code src/proto/generated.rs` after a regen (CI does exactly that)
 
 use std::error::Error;
 use std::path::Path;
-use std::{fs, process::ExitCode};
+use std::process::Command;
+use std::{env, fs, process::ExitCode};
 
 const PROTOS: [&str; 2] = ["proto/compact_formats.proto", "proto/service.proto"];
 const PACKAGE: &str = "cash.z.wallet.sdk.rpc.rs";
@@ -16,12 +18,18 @@ const HEADER: &str = "\
 ";
 
 fn main() -> ExitCode {
-    if let Err(e) = regen() {
-        eprintln!("xtask: {e}");
-        return ExitCode::FAILURE;
+    let result = match env::args().nth(1).as_deref() {
+        Some("regen-proto") => regen().map(|()| println!("wrote {CHECKED_IN}")),
+        Some("release-gate") => release_gate(),
+        _ => Err("usage: cargo xtask <regen-proto | release-gate>".into()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("xtask: {e}");
+            ExitCode::FAILURE
+        }
     }
-    println!("wrote {CHECKED_IN}");
-    ExitCode::SUCCESS
 }
 
 // Client only (ztest drives pod-hosted indexers, never serves the API); both protos share
@@ -37,4 +45,27 @@ fn regen() -> Result<(), Box<dyn Error>> {
         .compile_protos(&protos, &[root.join("proto")])?;
     let generated = fs::read_to_string(out.join(PACKAGE))?;
     Ok(fs::write(root.join(CHECKED_IN), format!("{HEADER}{generated}"))?)
+}
+
+// - Fetch only (worktree + local branch untouched)
+// - Branch gate lives in release.toml `allow-branch`, not here
+fn release_gate() -> Result<(), Box<dyn Error>> {
+    git(&["fetch", "--quiet"])?;
+    let upstream = git(&["rev-parse", "--abbrev-ref", "@{upstream}"])?;
+    let (head, tip) = (git(&["rev-parse", "HEAD"])?, git(&["rev-parse", "@{upstream}"])?);
+    if head != tip {
+        return Err(
+            format!("HEAD {head:.9} != {upstream} {tip:.9}; sync with {upstream} first").into()
+        );
+    }
+    Ok(())
+}
+
+fn git(args: &[&str]) -> Result<String, Box<dyn Error>> {
+    let out = Command::new("git").args(args).output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("git {}: {}", args.join(" "), stderr.trim()).into());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_owned())
 }

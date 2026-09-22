@@ -3,6 +3,9 @@
 
 shared-version = true
 pre-release-commit-message = "{{version}} release"
+allow-branch = ["master"]
+# - HEAD must = fetched upstream tip (runs in dry-run too; built-in check skipped under `push = false`)
+pre-release-hook = ["cargo", "xtask", "release-gate"]
 
 # - default tags per-crate (5 tags/release); root `ztest` = the representative tagger
 # - every other member opts out via [package.metadata.release]
