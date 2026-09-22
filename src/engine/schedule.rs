@@ -333,6 +333,7 @@ fn emit_finished(reporter: &mut dyn RunReporter, running: &Running, outcome: &Te
         duration: outcome.duration,
         attempt: running.attempt,
         output: &outcome.output,
+        components: &outcome.components,
     });
 }
 
@@ -499,12 +500,18 @@ mod tests {
     }
 
     fn pass() -> TestOutcome {
-        TestOutcome { verdict: Verdict::Pass, output: vec![], duration: Duration::from_millis(1) }
+        TestOutcome {
+            verdict: Verdict::Pass,
+            output: vec![],
+            components: vec![],
+            duration: Duration::from_millis(1),
+        }
     }
     fn fail() -> TestOutcome {
         TestOutcome {
             verdict: Verdict::Fail(1),
             output: vec![],
+            components: vec![],
             duration: Duration::from_millis(1),
         }
     }
@@ -1046,6 +1053,7 @@ mod tests {
                 TestOutcome {
                     verdict: Verdict::Fail(2),
                     output: b"boom-output".to_vec(),
+                    components: vec![],
                     duration: Duration::from_millis(1),
                 }
             },
@@ -1093,6 +1101,7 @@ mod tests {
                     TestOutcome {
                         verdict: Verdict::Terminated,
                         output: vec![],
+                        components: vec![],
                         duration: Duration::from_millis(1),
                     }
                 }

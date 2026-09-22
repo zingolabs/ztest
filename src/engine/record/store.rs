@@ -3,8 +3,9 @@
 //!
 //! - Event log holds a [`StoreRef`] per test, never the bytes → stays small, and identical
 //!   outputs (retries, shared fixtures) are stored once
-//! - One blob kind (`combined`), not nextest's split stdout/stderr — ztest merges the
-//!   streams ([`CaptureStrategy::Combined`](crate::engine::output::CaptureStrategy))
+//! - `combined` = test's merged stdout+stderr, not nextest's split
+//!   ([`CaptureStrategy::Combined`](crate::engine::output::CaptureStrategy))
+//! - `components` = full component-pod log (tailed only at display)
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -18,12 +19,34 @@ use serde::{Deserialize, Serialize};
 /// - `Empty` = no blob (a test with no captured output)
 /// - `Truncated` = head+tail-preserved payload; `original_size` is the pre-cut byte count,
 ///   so the reporter can say how much was elided
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum StoreRef {
+    #[default]
     Empty,
-    Full { name: String },
-    Truncated { name: String, original_size: u64 },
+    Full {
+        name: String,
+    },
+    Truncated {
+        name: String,
+        original_size: u64,
+    },
+}
+
+/// Blob name suffix (`{hash}-{kind}`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobKind {
+    Combined,
+    Components,
+}
+
+impl BlobKind {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Combined => "combined",
+            Self::Components => "components",
+        }
+    }
 }
 
 fn truncation_notice(omitted: u64) -> String {
@@ -54,6 +77,7 @@ impl OutputStore {
         &self,
         seen: &mut HashSet<String>,
         data: &[u8],
+        kind: BlobKind,
         max_output: usize,
     ) -> io::Result<StoreRef> {
         if data.is_empty() {
@@ -61,7 +85,7 @@ impl OutputStore {
         }
         let (payload, original_size) = truncate(data, max_output);
         let hash = blake3::hash(&payload).to_hex();
-        let name = format!("{}-combined", &hash[..32]);
+        let name = format!("{}-{}", &hash[..32], kind.suffix());
         if seen.insert(name.clone()) {
             let compressed = zstd::encode_all(payload.as_ref(), ZSTD_LEVEL)?;
             fs::write(self.dir.join(&name), compressed)?;
@@ -119,21 +143,30 @@ mod tests {
         let tmp = tempdir();
         let store = OutputStore::create(&tmp).unwrap();
         let mut seen = HashSet::new();
-        let r = store.put(&mut seen, b"", 4096).unwrap();
+        let r = store.put(&mut seen, b"", BlobKind::Combined, 4096).unwrap();
         assert_eq!(r, StoreRef::Empty);
         assert!(store.get(&r).unwrap().is_empty());
     }
 
     #[test]
-    fn roundtrips_and_dedups_identical_output() {
+    fn roundtrips_and_dedups_identical_output_per_kind() {
         let tmp = tempdir();
         let store = OutputStore::create(&tmp).unwrap();
         let mut seen = HashSet::new();
-        let a = store.put(&mut seen, b"boom output\n", 4096).unwrap();
-        let b = store.put(&mut seen, b"boom output\n", 4096).unwrap();
+        let a = store.put(&mut seen, b"boom output\n", BlobKind::Combined, 4096).unwrap();
+        let b = store.put(&mut seen, b"boom output\n", BlobKind::Combined, 4096).unwrap();
         assert_eq!(a, b, "identical output → identical content address");
         assert_eq!(seen.len(), 1, "the blob is written once");
         assert_eq!(store.get(&a).unwrap(), b"boom output\n");
+
+        let c = store.put(&mut seen, b"boom output\n", BlobKind::Components, 0).unwrap();
+        match (&a, &c) {
+            (StoreRef::Full { name: a }, StoreRef::Full { name: c }) => {
+                assert!(a.ends_with("-combined") && c.ends_with("-components"), "{a} / {c}");
+            }
+            other => panic!("expected two full blobs, got {other:?}"),
+        }
+        assert_eq!(store.get(&c).unwrap(), b"boom output\n");
     }
 
     #[test]
@@ -142,7 +175,7 @@ mod tests {
         let store = OutputStore::create(&tmp).unwrap();
         let mut seen = HashSet::new();
         let data = vec![b'x'; 10_000];
-        let r = store.put(&mut seen, &data, 1024).unwrap();
+        let r = store.put(&mut seen, &data, BlobKind::Combined, 1024).unwrap();
         match &r {
             StoreRef::Truncated { original_size, .. } => assert_eq!(*original_size, 10_000),
             other => panic!("expected truncated, got {other:?}"),

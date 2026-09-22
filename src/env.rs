@@ -1184,10 +1184,13 @@ impl Drop for TestEnv {
                     if !headers.is_empty() {
                         eprint!("{headers}");
                     }
-                    let components = crate::logstream::fetch_component_lines(&client, ns).await;
-                    if let Some(section) = crate::logstream::component_section(components, color) {
-                        eprint!("{section}");
-                    }
+                    let components = crate::logstream::fetch_component_log(&client, ns).await;
+                    let sink = std::env::var_os(crate::logstream::COMPONENT_LOG_ENV);
+                    crate::logstream::hand_off(
+                        &components,
+                        sink.as_deref().map(std::path::Path::new),
+                        color,
+                    );
                 }
                 if let Some(ns) = ns_to_delete {
                     cluster::delete_namespace(&client, &ns)

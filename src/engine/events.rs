@@ -152,6 +152,7 @@ pub enum TestEvent<'a> {
         duration: Duration,
         attempt: u32,
         output: &'a [u8],
+        components: &'a [u8],
     },
     TestSkipped {
         binary_id: &'a str,

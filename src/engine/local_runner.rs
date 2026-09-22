@@ -61,13 +61,14 @@ pub struct EngineEnv {
     pub storage: Option<(String, String)>,
 }
 
-/// Outcome of one test process. `output` = merged stdout+stderr, or on the pod path the
-/// laptop-assembled unified timeline (`logstream::unified_output`): runner output woven
-/// with component-pod logs, panic pinned last
+/// Outcome of one test process. `output` = merged stdout+stderr (pod path:
+/// [`runner_output`](crate::logstream::runner_output)), `components` = full merged
+/// component-pod log (tailed only at display)
 #[derive(Debug, Clone)]
 pub struct TestOutcome {
     pub verdict: Verdict,
     pub output: Vec<u8>,
+    pub components: Vec<u8>,
     pub duration: Duration,
 }
 
@@ -91,10 +92,12 @@ pub async fn spawn_test(
     let failed = |e: std::io::Error| TestOutcome {
         verdict: Verdict::SpawnError,
         output: format!("cannot execute {}: {e}", item.binary_path.display()).into_bytes(),
+        components: Vec::new(),
         duration: started.elapsed(),
     };
 
-    let mut cmd = build_command(item, env);
+    let hand_off = hand_off_path();
+    let mut cmd = build_command(item, env, &hand_off);
     let reader = match attach_stdio(&mut cmd, env.capture) {
         Ok(r) => r,
         Err(e) => return failed(e),
@@ -139,8 +142,17 @@ pub async fn spawn_test(
         Some(task) => task.await.unwrap_or_default(),
         None => Vec::new(),
     };
+    let components = crate::logstream::collect_hand_off(&hand_off);
 
-    TestOutcome { verdict, output, duration: started.elapsed() }
+    TestOutcome { verdict, output, components, duration: started.elapsed() }
+}
+
+/// Per-attempt [`COMPONENT_LOG_ENV`](crate::logstream::COMPONENT_LOG_ENV) file, unique across
+/// concurrent children (pid + counter)
+fn hand_off_path() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("ztest-components-{}-{n}.log", std::process::id()))
 }
 
 /// One pipe for both fds, so the capture is interleaved as written.
@@ -165,7 +177,11 @@ fn attach_stdio(
 
 /// Build the `tokio` command: argv, cwd, env, and (Unix) a dedicated process group so the
 /// whole tree dies at the hard cap. Stdout/stderr attached by [`attach_stdio`]
-fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
+fn build_command(
+    item: &WorkItem,
+    env: &EngineEnv,
+    hand_off: &std::path::Path,
+) -> tokio::process::Command {
     let mut std_cmd = std::process::Command::new(&item.binary_path);
     std_cmd
         .arg("--exact")
@@ -183,7 +199,8 @@ fn build_command(item: &WorkItem, env: &EngineEnv) -> tokio::process::Command {
         // `ztest run` (`cluster::require_orchestrator`)
         .env("ZTEST_ENGINE", "1")
         .env("ZTEST_SA", &env.sa)
-        .env("ZTEST_COLOR", if env.color { "1" } else { "0" });
+        .env("ZTEST_COLOR", if env.color { "1" } else { "0" })
+        .env(crate::logstream::COMPONENT_LOG_ENV, hand_off);
     if env.no_cleanup {
         std_cmd.env(crate::cluster::NO_CLEANUP_ENV, "1");
     }

@@ -81,6 +81,7 @@ mod tests {
                 duration: Duration::from_millis(1),
                 attempt: 1,
                 output: b"",
+                components: b"",
             })
             .unwrap();
             rec.record(&TestEvent::TestFinished {
@@ -90,6 +91,7 @@ mod tests {
                 duration: Duration::from_millis(1),
                 attempt: 1,
                 output: b"",
+                components: b"",
             })
             .unwrap();
             // `parked` never finishes → absent from the passed set → a rerun runs it

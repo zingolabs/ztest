@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 pub(crate) mod bucket;
 pub(crate) mod cleanup;
 pub(crate) mod cluster;
+pub(crate) mod config;
 pub mod list_mounts;
 pub(crate) mod preview;
 pub(crate) mod progress;
@@ -91,6 +92,11 @@ pub enum Command {
     /// its registry, so `ztest run --cluster <name>` selects a whole target at
     /// once.
     Cluster(cluster::Args),
+
+    /// User settings in `~/.config/ztest/config.toml` (`get`, `set`, `unset`,
+    /// `list`, `path`), e.g. `ztest config set log-tail all`. A flag or
+    /// `ZTEST_*` env var still overrides a stored value.
+    Config(config::Args),
 
     /// Live view of everything ztest is running on the connected cluster:
     /// capacity, every active run and who launched it, the tests in flight,
@@ -182,6 +188,7 @@ fn bind_cluster(cmd: &Command) -> Result<Option<String>, ztest::api::cluster_con
         Command::Cluster(a) => a.cluster_profile(),
         Command::Status(a) => a.cluster_profile(),
         Command::Replay(_)
+        | Command::Config(_)
         | Command::Store(_)
         | Command::ListMounts(_)
         | Command::Snapshot(_)
@@ -209,6 +216,7 @@ pub fn main() -> ExitCode {
         Command::Snapshot(args) => snapshot::execute(args),
         Command::Status(args) => status::execute(args),
         Command::Cluster(args) => cluster::execute(args),
+        Command::Config(args) => config::execute(args),
         Command::Sync(args) => sync::execute(args),
         Command::Preview => preview::execute(),
     }

@@ -151,6 +151,7 @@ async fn run_in_pod(
             return TestOutcome {
                 verdict: Verdict::SpawnError,
                 output: format!("resolve run coords: {e}").into_bytes(),
+                components: Vec::new(),
                 duration: started.elapsed(),
             };
         }
@@ -175,6 +176,7 @@ async fn run_in_pod(
         return TestOutcome {
             verdict: Verdict::SpawnError,
             output: format!("create test namespace {test_ns}: {e}").into_bytes(),
+            components: Vec::new(),
             duration: started.elapsed(),
         };
     }
@@ -185,6 +187,7 @@ async fn run_in_pod(
         return TestOutcome {
             verdict: Verdict::SpawnError,
             output: format!("create runner pod {name}: {e}").into_bytes(),
+            components: Vec::new(),
             duration: started.elapsed(),
         };
     }
@@ -230,18 +233,13 @@ async fn run_in_pod(
     // Every log fetched definitively before anything is deleted, while the namespace and
     // pods still exist: the runner's libtest-framed stdout+stderr, timestamped
     // component-pod lines, and any dead component's terminal reason (OOMKilled/Evicted
-    // vs panic). `unified_output` weaves one timeline, assertion pinned last
+    // vs panic)
     let runner_raw =
         runner_api.logs(&name, &LogParams::default()).await.unwrap_or_default().into_bytes();
     let dead = crate::cluster::dead_pod_report(&client, &test_ns).await;
-    let components = crate::logstream::fetch_component_lines(&client, &test_ns).await;
-    let unified = crate::logstream::unified_output(
-        &runner_raw,
-        &item.test_name,
-        components,
-        &dead,
-        cfg.env.color,
-    );
+    let components = crate::logstream::fetch_component_log(&client, &test_ns).await;
+    let runner =
+        crate::logstream::runner_output(&runner_raw, &item.test_name, &dead, cfg.env.color);
 
     if !cfg.env.no_cleanup {
         teardown(&client, &cfg, &test_ns, &name).await;
@@ -257,17 +255,17 @@ async fn run_in_pod(
     }
 
     let (verdict, output) = match done {
-        Done::Reached(TerminalState::Passed) => (Verdict::Pass, unified),
-        Done::Reached(TerminalState::Failed(code)) => (Verdict::Fail(code), unified),
+        Done::Reached(TerminalState::Passed) => (Verdict::Pass, runner),
+        Done::Reached(TerminalState::Failed(code)) => (Verdict::Fail(code), runner),
         Done::Reached(TerminalState::ImageError(reason)) => {
             // No logs → surface the pull failure as the output, not a blank SpawnError
             (Verdict::SpawnError, format!("runner image error: {reason}").into_bytes())
         }
-        Done::Timeout => (Verdict::Timeout, unified),
-        Done::Cancelled => (Verdict::Terminated, unified),
+        Done::Timeout => (Verdict::Timeout, runner),
+        Done::Cancelled => (Verdict::Terminated, runner),
     };
 
-    TestOutcome { verdict, output, duration: started.elapsed() }
+    TestOutcome { verdict, output, components, duration: started.elapsed() }
 }
 
 /// Tear down one test's cluster footprint in order: the cluster-scoped seed-binding VSCs

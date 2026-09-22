@@ -59,6 +59,12 @@ pub struct ReporterCommonOpts {
     /// Colouring: `auto` (default), `always`, or `never`.
     #[arg(long, value_name = "WHEN")]
     pub color: Option<String>,
+
+    /// Component-pod log lines shown per test: a line count, or `all`. The
+    /// recording holds every line, so this can show more than the original run
+    /// did. Default 30, or `ZTEST_LOG_TAIL`, or `ztest config set log-tail`.
+    #[arg(long, value_name = "N|all")]
+    pub log_tail: Option<String>,
 }
 
 impl ReporterCommonOpts {
@@ -70,6 +76,7 @@ impl ReporterCommonOpts {
             success: parse_display(&self.success_output, default.success),
             failure: parse_display(&self.failure_output, default.failure),
             capture: default.capture,
+            log_tail: crate::config::log_tail(self.log_tail.as_deref(), "replay"),
         };
         if no_capture {
             cfg = cfg.with_no_capture();

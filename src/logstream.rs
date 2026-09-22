@@ -1,16 +1,19 @@
 //! Component-pod log capture for test-failure diagnostics.
 //!
-//! - One-shot kube-API fetch at the test's terminal, pods still alive → per-pod `--tail`,
-//!   merged chronologically across pods, capped once
+//! - Capture: one-shot kube-API fetch at the test's terminal (pods still alive), every line,
+//!   merged chronologically across pods
+//! - Display: [`component_section`] tails to [`LogTail`] (capture + record never cap)
 //! - Faithful: components own formatting + colour (zebrad `force_use_color`, zaino
 //!   `ZAINOLOG_FORMAT=stream`); ztest never parses/reassembles/recolours a body
 //! - ANSI stripped once at the display boundary, only for a non-colour sink
 
-/// Component-log lines shown across *all* pods, most recent by timestamp — not per pod.
-///
-/// - Doubles as the per-pod `kubectl logs --tail`, exactly enough to recover that global tail
-/// - Runner output (panic/error) = primary signal, fetched in full separately
-const MAX_LINES: usize = 30;
+use std::path::Path;
+
+use crate::engine::output::LogTail;
+
+/// Local path: file the child hands its component log through (`TestEnv` teardown runs in
+/// the child, the reporter in the engine)
+pub const COMPONENT_LOG_ENV: &str = "ZTEST_COMPONENT_LOG";
 
 const COMPONENT_HEADER: &str = "  ── component logs ──\n";
 
@@ -18,12 +21,11 @@ const COMPONENT_HEADER: &str = "  ── component logs ──\n";
 /// kube-injected for pods, tracing's for the runner — both UTC, so they sort together
 type TsLine = (String, String);
 
-/// Each pod's last [`MAX_LINES`], as `(RFC3339 timestamp, "[pod] body")`.
+/// Every pod's full log as `[pod] body` lines, merged by kube timestamp.
 ///
-/// - Per-pod tail recovers the global tail (any merged survivor is within its own)
 /// - One-shot fetch, not a follow — correct only because both runners call this at the
 ///   test's terminal, before the namespace delete
-pub async fn fetch_component_lines(client: &kube::Client, namespace: &str) -> Vec<TsLine> {
+pub async fn fetch_component_log(client: &kube::Client, namespace: &str) -> Vec<u8> {
     use k8s_openapi::api::core::v1::Pod;
     use kube::Api;
     use kube::api::{ListParams, LogParams};
@@ -38,14 +40,7 @@ pub async fn fetch_component_lines(client: &kube::Client, namespace: &str) -> Ve
             continue;
         };
         let logs = pods
-            .logs(
-                name,
-                &LogParams {
-                    tail_lines: Some(MAX_LINES as i64),
-                    timestamps: true,
-                    ..Default::default()
-                },
-            )
+            .logs(name, &LogParams { timestamps: true, ..Default::default() })
             .await
             .unwrap_or_default();
         for line in logs.lines() {
@@ -55,67 +50,84 @@ pub async fn fetch_component_lines(client: &kube::Client, namespace: &str) -> Ve
             lines.push((ts.to_string(), format!("[{name}] {}", decode(body.as_bytes()))));
         }
     }
-    lines
+    merge(lines)
 }
 
-/// Headed component section, `None` when nothing was captured. Sole renderer — both
-/// runners emit this, so the cap and the merge cannot drift apart again
-pub fn component_section(lines: Vec<TsLine>, color: bool) -> Option<String> {
-    let body = render_recent(lines, color)?;
-    Some(format!("{COMPONENT_HEADER}{body}"))
+/// Chronological merge → newline-terminated bodies. Pure (fetch separate), so
+/// unit-testable clusterless
+fn merge(mut lines: Vec<TsLine>) -> Vec<u8> {
+    // RFC3339 sorts lexically, and stably → same-timestamp continuation lines of
+    // a multi-line entry keep their order.
+    lines.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::new();
+    for (_, body) in lines {
+        out.extend_from_slice(body.as_bytes());
+        out.push(b'\n');
+    }
+    out
 }
 
-/// Pod-path FAIL diagnostic: runner output (unframed, uncapped), then components
-/// capped to [`MAX_LINES`], then dead-pod terminal reasons.
-///
-/// Separate budgets, never one pool — zaino health-checks every ~100 ms and would
-/// evict the test's own panic
-pub fn unified_output(
-    runner_raw: &[u8],
-    test_name: &str,
-    component_lines: Vec<TsLine>,
-    dead: &str,
-    color: bool,
-) -> Vec<u8> {
+/// Headed section of `log`'s most recent `tail` lines, `None` when nothing to show. Sole
+/// renderer (live + replay reporter)
+pub fn component_section(log: &[u8], tail: LogTail, color: bool) -> Option<String> {
+    let text = String::from_utf8_lossy(log);
+    let lines: Vec<&str> = text.lines().collect();
+    let kept = tail.keep(lines.len());
+    if kept == 0 {
+        return None;
+    }
+    let dropped = lines.len() - kept;
+    let mut out = String::from(COMPONENT_HEADER);
+    if dropped > 0 {
+        out.push_str(&format!(
+            "  ⋯ {dropped} earlier line(s) dropped (showing the most recent {kept}; \
+             `--log-tail all` shows every line)\n",
+        ));
+    }
+    for line in &lines[dropped..] {
+        emit(&mut out, line, color);
+    }
+    Some(out)
+}
+
+/// Pod-path runner output: libtest frame stripped, then dead-pod terminal reasons. Uncapped
+/// (runner panic/error = primary signal)
+pub fn runner_output(runner_raw: &[u8], test_name: &str, dead: &str, color: bool) -> Vec<u8> {
     let stripped = crate::libtest::strip_libtest_frame(runner_raw, test_name);
     let stripped = String::from_utf8_lossy(&stripped);
 
     let mut out = String::new();
-    for line in stripped.lines() {
-        emit(&mut out, line, color);
-    }
-    if let Some(section) = component_section(component_lines, color) {
-        out.push_str(&section);
-    }
-    for line in dead.lines() {
+    for line in stripped.lines().chain(dead.lines()) {
         emit(&mut out, line, color);
     }
     out.into_bytes()
 }
 
-/// Merge `(timestamp, body)` chronologically → most recent [`MAX_LINES`] as one block,
-/// earlier count reported. Pure (fetch is separate), so unit-testable clusterless
-fn render_recent(mut lines: Vec<TsLine>, color: bool) -> Option<String> {
-    if lines.is_empty() {
-        return None;
+/// Child side of [`COMPONENT_LOG_ENV`]: `log` → engine's file.
+///
+/// - No `sink` (no engine, e.g. detached sync driver) or failed write → stderr at the
+///   default tail
+pub fn hand_off(log: &[u8], sink: Option<&Path>, color: bool) {
+    if let Some(path) = sink {
+        match std::fs::write(path, log) {
+            Ok(()) => return,
+            Err(e) => eprintln!(
+                "ztest: component-log hand-off to {} failed ({e}); tail follows",
+                path.display()
+            ),
+        }
     }
-    // RFC3339 sorts lexically, and stably → same-timestamp continuation lines of
-    // a multi-line entry keep their order.
-    lines.sort_by(|a, b| a.0.cmp(&b.0));
-    let dropped = lines.len().saturating_sub(MAX_LINES);
-    let kept = lines.split_off(dropped);
+    if let Some(section) = component_section(log, LogTail::DEFAULT, color) {
+        eprint!("{section}");
+    }
+}
 
-    let mut out = String::new();
-    if dropped > 0 {
-        out.push_str(&format!(
-            "  ⋯ {dropped} earlier line(s) dropped (showing the most recent {})\n",
-            kept.len(),
-        ));
-    }
-    for (_, body) in kept {
-        emit(&mut out, &body, color);
-    }
-    Some(out)
+/// Engine side of [`COMPONENT_LOG_ENV`]: read + remove. Absent (test never provisioned a
+/// namespace) → empty
+pub fn collect_hand_off(path: &Path) -> Vec<u8> {
+    let log = std::fs::read(path).unwrap_or_default();
+    let _ = std::fs::remove_file(path);
+    log
 }
 
 fn emit(out: &mut String, line: &str, color: bool) {
@@ -142,34 +154,10 @@ fn decode(line: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn ts_lines(bodies: &[&str]) -> Vec<TsLine> {
-        bodies.iter().enumerate().map(|(i, b)| (format!("{i:04}"), (*b).to_string())).collect()
-    }
-
     #[test]
-    fn empty_input_renders_nothing() {
-        assert!(render_recent(Vec::new(), true).is_none());
-        assert!(component_section(Vec::new(), true).is_none());
-    }
-
-    #[test]
-    fn strips_component_ansi_when_colour_is_off() {
-        let out = render_recent(ts_lines(&["[zebrad] \x1b[33mWARN\x1b[0m x"]), false).unwrap();
-        assert!(!out.contains('\x1b'), "ANSI must be stripped on a no-colour sink");
-        assert!(out.contains("WARN x"));
-    }
-
-    #[test]
-    fn keeps_component_ansi_verbatim_when_colour_is_on() {
-        let out = render_recent(ts_lines(&["[zebrad] \x1b[33mWARN\x1b[0m x"]), true).unwrap();
-        assert!(out.contains("\x1b[33mWARN\x1b[0m x"));
-    }
-
-    #[test]
-    fn keeps_last_max_lines_total_across_pods_in_order() {
-        // Two pods interleaved, pushed out of order → merge must sort by timestamp,
-        // keeping the most recent MAX_LINES globally, not per pod.
-        let n = MAX_LINES + 5;
+    fn merge_keeps_every_line_and_the_section_tails_only_at_display() {
+        // Two pods interleaved, pushed out of order → merge must sort by timestamp
+        let n = 45;
         let mut lines: Vec<TsLine> = (0..n)
             .map(|i| {
                 let pod = if i % 2 == 0 { "zebrad" } else { "zaino" };
@@ -177,81 +165,86 @@ mod tests {
             })
             .collect();
         lines.reverse();
+        let log = merge(lines);
+        let captured: Vec<String> =
+            String::from_utf8(log.clone()).unwrap().lines().map(String::from).collect();
+        let expected: Vec<String> = (0..n)
+            .map(|i| format!("[{}] line {i}", if i % 2 == 0 { "zebrad" } else { "zaino" }))
+            .collect();
+        assert_eq!(captured, expected, "capture = every line, chronological, uncapped");
 
-        let out = render_recent(lines, false).unwrap();
-        let body: Vec<&str> = out.lines().collect();
+        let tailed = component_section(&log, LogTail::Lines(30), false).unwrap();
+        let body: Vec<&str> = tailed.lines().collect();
+        assert_eq!(body.len(), 1 + 1 + 30, "header + drop note + 30 lines:\n{tailed}");
+        assert_eq!(body[0], "  ── component logs ──");
+        assert!(body[1].contains("15 earlier line(s) dropped (showing the most recent 30;"));
+        assert!(body[1].contains("`--log-tail all`"));
+        assert_eq!(body[2], "  [zaino] line 15");
+        assert_eq!(body[31], "  [zebrad] line 44");
 
-        assert_eq!(body.len(), MAX_LINES + 1);
-        assert!(body[0].contains(&format!("{} earlier line(s) dropped", n - MAX_LINES)));
-        assert!(body[0].contains(&format!("showing the most recent {MAX_LINES}")));
-        assert!(body[1].ends_with("line 5"));
-        assert!(body[MAX_LINES].ends_with(&format!("line {}", n - 1)));
+        let all = component_section(&log, LogTail::All, false).unwrap();
+        assert!(!all.contains("dropped"), "`all` = no drop note:\n{all}");
+        assert_eq!(all.lines().count(), 1 + n);
+
+        let few = component_section(b"[zebrad] a\n[zaino] b\n", LogTail::Lines(30), false).unwrap();
+        assert_eq!(
+            few, "  ── component logs ──\n  [zebrad] a\n  [zaino] b\n",
+            "under the tail = no note"
+        );
+
+        assert_eq!(component_section(&log, LogTail::Lines(0), false), None, "0 hides the section");
+        assert_eq!(component_section(b"", LogTail::All, false), None, "nothing captured");
     }
 
     #[test]
-    fn under_the_cap_shows_everything_with_no_drop_note() {
-        let out = render_recent(ts_lines(&["[zebrad] a", "[zaino] b"]), false).unwrap();
-        assert!(!out.contains("dropped"));
-        let body: Vec<&str> = out.lines().map(str::trim).collect();
-        assert_eq!(body, ["[zebrad] a", "[zaino] b"]);
+    fn component_ansi_kept_for_colour_sinks_and_stripped_otherwise() {
+        let log = b"[zebrad] \x1b[33mWARN\x1b[0m x\n";
+        let coloured = component_section(log, LogTail::DEFAULT, true).unwrap();
+        assert!(coloured.contains("\x1b[33mWARN\x1b[0m x"), "{coloured:?}");
+        let plain = component_section(log, LogTail::DEFAULT, false).unwrap();
+        assert!(!plain.contains('\x1b') && plain.contains("WARN x"), "{plain:?}");
     }
 
     #[test]
-    fn unified_output_shows_runner_in_full_then_capped_components() {
-        // Runner output = small + primary; components far exceed MAX_LINES. Runner
-        // section must survive in full under a capped component section.
+    fn runner_output_drops_the_libtest_frame_and_appends_dead_pod_reasons() {
         let runner_raw = b"running 1 test\n\
 test my::test ... 2026-07-29T00:00:01Z  INFO ztest::env: starting\n\
-2026-07-29T00:00:03Z  INFO ztest::env: calling getdifficulty\n\
 thread 'my::test' panicked at json.rs:22:5:\n\
 responses disagree: left 1.0 right 1.19\n\
-note: run with RUST_BACKTRACE=1\n\
 FAILED\n\
 \n\
 failures:\n\
     my::test\n\
 \n\
-test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n"
-            .to_vec();
-        let components: Vec<TsLine> = (0..MAX_LINES + 10)
-            .map(|i| (format!("{i:04}"), format!("[zaino] status check {i}")))
-            .collect();
+test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n";
 
-        let out = String::from_utf8(unified_output(
-            &runner_raw,
+        let out = String::from_utf8(runner_output(
+            runner_raw,
             "my::test",
-            components,
             "container `zebrad` exit 137 (OOMKilled)",
             false,
         ))
         .unwrap();
 
-        // Runner tracing AND panic survive verbatim, never evicted by the
-        // high-volume component stream.
-        assert!(out.contains("INFO ztest::env: starting"));
-        assert!(out.contains("INFO ztest::env: calling getdifficulty"));
-        assert!(out.contains("thread 'my::test' panicked at json.rs:22:5:"));
-        assert!(out.contains("responses disagree: left 1.0 right 1.19"));
-        assert!(!out.contains("test result:"));
-
-        let runner_at = out.find("panicked").unwrap();
-        let header_at = out.find("── component logs ──").unwrap();
-        assert!(runner_at < header_at, "runner output must come first");
-        assert!(out.contains("earlier line(s) dropped"));
-        assert!(out.contains(&format!("showing the most recent {MAX_LINES}")));
-
-        assert!(header_at < out.find("OOMKilled").unwrap());
+        assert!(out.contains("INFO ztest::env: starting"), "{out}");
+        assert!(out.contains("thread 'my::test' panicked at json.rs:22:5:"), "{out}");
+        assert!(out.contains("responses disagree: left 1.0 right 1.19"), "{out}");
+        assert!(!out.contains("test result:"), "libtest frame stripped:\n{out}");
+        assert!(
+            out.find("panicked").unwrap() < out.find("OOMKilled").unwrap(),
+            "dead-pod reasons follow the runner:\n{out}"
+        );
     }
 
     #[test]
-    fn unified_output_omits_component_section_when_none_captured() {
-        let runner_raw = b"running 1 test\n\
-test my::test ... Error: archive missing\n\
-test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n"
-            .to_vec();
-        let out = String::from_utf8(unified_output(&runner_raw, "my::test", Vec::new(), "", false))
-            .unwrap();
-        assert!(out.contains("Error: archive missing"));
-        assert!(!out.contains("── component logs ──"));
+    fn hand_off_file_carries_the_full_log_and_is_consumed_once() {
+        let path = std::env::temp_dir().join(format!("ztest-handoff-test-{}", std::process::id()));
+        let log: Vec<u8> =
+            (0..100).flat_map(|i| format!("[zaino] line {i}\n").into_bytes()).collect();
+
+        hand_off(&log, Some(&path), false);
+        assert_eq!(collect_hand_off(&path), log, "every line crosses, untailed");
+        assert!(!path.exists(), "collect removes the file");
+        assert!(collect_hand_off(&path).is_empty(), "never provisioned → empty");
     }
 }

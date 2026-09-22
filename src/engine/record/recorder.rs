@@ -11,7 +11,7 @@ use std::path::Path;
 
 use zstd::stream::write::AutoFinishEncoder;
 
-use super::store::OutputStore;
+use super::store::{BlobKind, OutputStore};
 use super::{RecordedEvent, RunMeta, StoreRef};
 use crate::engine::events::{RunReporter, TestEvent};
 
@@ -102,15 +102,21 @@ impl RunRecorder {
                 duration,
                 attempt,
                 output,
+                components,
             } => {
-                let stored: StoreRef = self.store.put(&mut self.seen, output, self.max_output)?;
+                let output: StoreRef =
+                    self.store.put(&mut self.seen, output, BlobKind::Combined, self.max_output)?;
+                // Uncapped (`--log-tail all` on replay must see every line)
+                let components =
+                    self.store.put(&mut self.seen, components, BlobKind::Components, 0)?;
                 RecordedEvent::TestFinished {
                     binary_id: binary_id.to_string(),
                     test_name: test_name.to_string(),
                     verdict: verdict.clone(),
                     duration,
                     attempt,
-                    output: stored,
+                    output,
+                    components,
                 }
             }
             TestEvent::TestSkipped { binary_id, test_name, ref reason } => {

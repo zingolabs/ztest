@@ -4,6 +4,7 @@
 //!   `ztest run --cluster <name>` picks them together, not from independent
 //!   ambient signals
 //! - Store: `$XDG_CONFIG_HOME/ztest/clusters.toml`, else `~/.config/ztest/clusters.toml`
+//! - Same file carries `[bucket]` push credentials → always written `0600`
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -127,13 +128,58 @@ impl ClusterSpec {
     }
 }
 
-/// The on-disk store.
+/// The on-disk store. Written `0600` (`bucket` holds a secret)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<BucketCredentials>,
     #[serde(default)]
     pub clusters: BTreeMap<String, Profile>,
+}
+
+/// Snapshot-bucket push credentials (`ztest snapshot config set`). `region` optional (R2
+/// wants `auto`; a real region matters only on real AWS).
+///
+/// - [`Debug`] hand-written: a derive puts the secret into any `{:?}` of [`Config`]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketCredentials {
+    pub bucket: String,
+    pub endpoint: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+}
+
+impl std::fmt::Debug for BucketCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BucketCredentials")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("region", &self.region)
+            .finish()
+    }
+}
+
+impl BucketCredentials {
+    /// Secret replaced by its length (`snapshot config show` proves *something* is stored
+    /// without putting a key on a screen-shared terminal)
+    pub fn redacted(&self) -> String {
+        format!(
+            "bucket            = {}\nendpoint          = {}\naccess_key_id     = {}\n\
+             secret_access_key = <{} chars>\nregion            = {}",
+            self.bucket,
+            self.endpoint,
+            self.access_key_id,
+            self.secret_access_key.len(),
+            self.region.as_deref().unwrap_or("auto (default)"),
+        )
+    }
 }
 
 /// One named cluster.
@@ -336,7 +382,7 @@ pub fn in_cluster() -> bool {
     std::env::var("KUBERNETES_SERVICE_HOST").is_ok()
 }
 
-fn config_path() -> PathBuf {
+pub fn config_path() -> PathBuf {
     crate::paths::config_dir().join("clusters.toml")
 }
 
@@ -352,14 +398,41 @@ pub fn load() -> Result<Config, ConfigError> {
 
 impl Config {
     pub fn save(&self) -> Result<(), ConfigError> {
-        let path = config_path();
+        self.save_to(&config_path())
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> Result<(), ConfigError> {
+        use std::io::Write as _;
+        let write = |source| ConfigError::Write { path: path.to_path_buf(), source };
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|source| ConfigError::Write { path: dir.to_path_buf(), source })?;
         }
         let body = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
-        std::fs::write(&path, body).map_err(|source| ConfigError::Write { path, source })
+        let mut file = open_owner_only(path).map_err(write)?;
+        file.write_all(body.as_bytes()).map_err(write)?;
+        file.sync_data().map_err(write)
     }
+}
+
+/// Truncating open at `0600`, set before any byte lands
+#[cfg(unix)]
+fn open_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` applies only on create (pre-existing file keeps its old bits otherwise)
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)
 }
 
 // ── Activation ────────────────────────────────────────────────────────
@@ -594,10 +667,61 @@ mod tests {
             },
         );
         cfg.current = Some("prod".into());
+        cfg.bucket = Some(BucketCredentials {
+            bucket: "ztest-archives".into(),
+            endpoint: "https://acct.r2.cloudflarestorage.com".into(),
+            access_key_id: "AKID".into(),
+            secret_access_key: "super-secret-value".into(),
+            region: None,
+        });
 
         let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
         assert_eq!(back.current.as_deref(), Some("prod"));
         assert_eq!(back.clusters, cfg.clusters);
+        assert_eq!(back.bucket, cfg.bucket);
+
+        let bare: Config = toml::from_str("[clusters.dev]\n").unwrap();
+        assert_eq!(bare.bucket, None, "no [bucket] = unconfigured, not an error");
+        assert!(!toml::to_string_pretty(&bare).unwrap().contains("bucket"));
+    }
+
+    /// Every accidental-leak path: `snapshot config show`, `{:?}` on the creds, and `{:?}`
+    /// on the whole [`Config`] (a `tracing` field or an `anyhow` chain that captured one)
+    #[test]
+    fn bucket_secret_never_reaches_a_formatter() {
+        let creds = BucketCredentials {
+            bucket: "ztest-archives".into(),
+            endpoint: "https://acct.r2.cloudflarestorage.com".into(),
+            access_key_id: "AKID".into(),
+            secret_access_key: "super-secret-value".into(),
+            region: None,
+        };
+        let shown = creds.redacted();
+        assert!(shown.contains("<18 chars>") && shown.contains("AKID"), "{shown}");
+        let cfg = Config { bucket: Some(creds.clone()), ..Default::default() };
+        for shown in [shown, format!("{creds:?}"), format!("{cfg:?}")] {
+            assert!(!shown.contains("super-secret-value"), "{shown}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_tightens_a_pre_existing_world_readable_file_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("ztest-clusters-{}", std::process::id()));
+        let path = dir.join("clusters.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "current = \"old\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let cfg = Config { current: Some("new".into()), ..Default::default() };
+        cfg.save_to(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode {mode:o}");
+        let back: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.current.as_deref(), Some("new"), "contents replaced, not appended");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

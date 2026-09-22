@@ -8,7 +8,8 @@
 //! {cache}/records/{workspace_id}/{run_id}/
 //!     meta.json        run id, start time, argv, format version
 //!     run.log.zst      zstd JSON Lines: one RecordedEvent per line
-//!     out/{hash}-combined   content-addressed, deduped, zstd output blobs
+//!     out/{hash}-combined     content-addressed, deduped, zstd output blobs
+//!     out/{hash}-components   same, full component-pod log
 //! ```
 //!
 //! Right-sized vs nextest: one owned [`RecordedEvent`] (ztest has a single
@@ -122,6 +123,8 @@ pub enum RecordedEvent {
         duration: Duration,
         attempt: u32,
         output: StoreRef,
+        #[serde(default)]
+        components: StoreRef,
     },
     TestSkipped {
         binary_id: String,
@@ -191,16 +194,28 @@ mod tests {
             duration: Duration::from_millis(234),
             attempt: 2,
             output: StoreRef::Full { name: "deadbeef-combined".into() },
+            components: StoreRef::Full { name: "deadbeef-components".into() },
         };
         let line = serde_json::to_string(&ev).unwrap();
         assert!(line.contains("\"kind\":\"test-finished\""), "{line}");
         let back: RecordedEvent = serde_json::from_str(&line).unwrap();
         match back {
-            RecordedEvent::TestFinished { verdict, attempt, .. } => {
+            RecordedEvent::TestFinished { verdict, attempt, components, .. } => {
                 assert_eq!(verdict, Verdict::Fail(101));
                 assert_eq!(attempt, 2);
+                assert_eq!(components, StoreRef::Full { name: "deadbeef-components".into() });
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+
+        // Recording from before the components blob → still replays, components empty
+        let mut legacy: serde_json::Value = serde_json::from_str(&line).unwrap();
+        legacy.as_object_mut().unwrap().remove("components");
+        match serde_json::from_value::<RecordedEvent>(legacy) {
+            Ok(RecordedEvent::TestFinished { components, .. }) => {
+                assert_eq!(components, StoreRef::Empty)
+            }
+            other => panic!("legacy line must parse: {other:?}"),
         }
     }
 }

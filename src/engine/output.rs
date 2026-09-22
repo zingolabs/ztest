@@ -48,6 +48,79 @@ pub enum CaptureStrategy {
     None,
 }
 
+/// Component-log lines shown per test (`--log-tail`): most recent across all pods, or `All`.
+/// Display-only (capture + record keep every line)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogTail {
+    Lines(usize),
+    All,
+}
+
+impl LogTail {
+    pub const DEFAULT: Self = Self::Lines(30);
+
+    /// Lines kept out of `available`
+    pub fn keep(self, available: usize) -> usize {
+        match self {
+            Self::Lines(n) => n.min(available),
+            Self::All => available,
+        }
+    }
+}
+
+impl Default for LogTail {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl FromStr for LogTail {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "all" => Ok(Self::All),
+            n => n
+                .parse()
+                .map(Self::Lines)
+                .map_err(|_| format!("invalid log tail {n:?} (expected a line count or `all`)")),
+        }
+    }
+}
+
+impl std::fmt::Display for LogTail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lines(n) => write!(f, "{n}"),
+            Self::All => f.write_str("all"),
+        }
+    }
+}
+
+/// TOML form: `30` or `"all"`
+impl serde::Serialize for LogTail {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Lines(n) => s.serialize_u64(*n as u64),
+            Self::All => s.serialize_str("all"),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LogTail {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Lines(usize),
+            Word(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Lines(n) => Ok(Self::Lines(n)),
+            Raw::Word(w) => w.parse().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
 /// Resolved output policy. Defaults = nextest's `default` profile (fail shown
 /// immediately, pass captured but hidden)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +128,7 @@ pub struct OutputConfig {
     pub success: TestOutputDisplay,
     pub failure: TestOutputDisplay,
     pub capture: CaptureStrategy,
+    pub log_tail: LogTail,
 }
 
 impl Default for OutputConfig {
@@ -63,6 +137,7 @@ impl Default for OutputConfig {
             success: TestOutputDisplay::Never,
             failure: TestOutputDisplay::Immediate,
             capture: CaptureStrategy::Combined,
+            log_tail: LogTail::DEFAULT,
         }
     }
 }
@@ -138,8 +213,34 @@ mod tests {
             success: TestOutputDisplay::Final,
             failure: TestOutputDisplay::Immediate,
             capture: CaptureStrategy::Combined,
+            log_tail: LogTail::DEFAULT,
         };
         assert_eq!(c.display_for(true), TestOutputDisplay::Final);
         assert_eq!(c.display_for(false), TestOutputDisplay::Immediate);
+    }
+
+    #[test]
+    fn log_tail_parses_and_round_trips_through_toml() {
+        assert_eq!("0".parse(), Ok(LogTail::Lines(0)));
+        assert_eq!("200".parse(), Ok(LogTail::Lines(200)));
+        assert_eq!("all".parse(), Ok(LogTail::All));
+        assert!("-1".parse::<LogTail>().is_err());
+        assert!("everything".parse::<LogTail>().is_err());
+
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Doc {
+            tail: LogTail,
+        }
+        for (tail, toml_form) in
+            [(LogTail::Lines(30), "tail = 30\n"), (LogTail::All, "tail = \"all\"\n")]
+        {
+            assert_eq!(toml::to_string(&Doc { tail }).unwrap(), toml_form);
+            assert_eq!(toml::from_str::<Doc>(toml_form).unwrap(), Doc { tail });
+        }
+        assert!(toml::from_str::<Doc>("tail = \"lots\"").is_err());
+
+        assert_eq!(LogTail::Lines(30).keep(10), 10);
+        assert_eq!(LogTail::Lines(30).keep(100), 30);
+        assert_eq!(LogTail::All.keep(100), 100);
     }
 }

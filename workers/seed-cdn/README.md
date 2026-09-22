@@ -101,7 +101,7 @@ printf '%s' "$R2_SECRET" | ztest snapshot config set \
   --bucket ztest-archives --access-key-id "$R2_KEY_ID" --secret-access-key -
 ```
 
-The file is `~/.config/ztest/bucket.toml`, mode `0600`. `config set` proves the credentials
+They are stored as `[bucket]` in `~/.config/ztest/clusters.toml`, mode `0600`. `config set` proves the credentials
 against the bucket before returning, so a typo fails in seconds rather than at the end of a
 multi-hour push.
 

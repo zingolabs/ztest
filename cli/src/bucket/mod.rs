@@ -24,9 +24,7 @@ use ztest::api::storage::KEY_PREFIX;
 mod config;
 mod resume_ledger;
 
-pub(crate) use config::{
-    Credentials, credentials_path, load as load_credentials, store as store_credentials,
-};
+pub(crate) use config::{credentials_path, load as load_credentials, store as store_credentials};
 
 /// R2 has no regions, but SigV4 needs *a* region in the signing scope and Cloudflare
 /// expects this literal. Applied only when the config names none (real S3 still works)
@@ -98,6 +96,9 @@ pub(crate) enum BucketError {
 
     #[error("bucket not configured: {0}")]
     Config(String),
+
+    #[error(transparent)]
+    Store(#[from] ztest::api::cluster_config::ConfigError),
 
     #[error("bucket: {0}")]
     Bucket(String),

@@ -80,12 +80,19 @@ pub struct Args {
     /// `--profile` / `-P`, `--message-format`, and `-j` / `--test-threads`
     /// (advisory; the engine auto-scales concurrency to QoS capacity).
     ///
-    /// Plus one ztest-only flag, recognized here and not forwarded:
+    /// Plus ztest-only flags, recognized here and not forwarded:
     ///
     ///   --no-cleanup   Leave each test's Kubernetes namespace (pods, logs,
     ///                  volumes) in place instead of tearing it down, so you can
     ///                  `kubectl` into a failure for a post-mortem. A 1h janitor
     ///                  backstop still reaps them, so nothing leaks permanently.
+    ///
+    ///   --log-tail <N|all>
+    ///                  Component-pod log lines shown per test output (most
+    ///                  recent, merged across pods). Default 30, or
+    ///                  `ZTEST_LOG_TAIL`, or `ztest config set log-tail`. Every
+    ///                  line is recorded regardless, so `ztest replay
+    ///                  --log-tail all` recovers the full logs later.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "NEXTEST_ARGS")]
     pub nextest_args: Vec<String>,
 
@@ -129,6 +136,7 @@ struct RunOptions {
     slow_after: Option<std::time::Duration>,
     success_output: Option<String>,
     failure_output: Option<String>,
+    log_tail: Option<String>,
     no_capture: bool,
     unsupported: Vec<String>,
     rerun: Option<RunSelector>,
@@ -140,8 +148,9 @@ impl RunOptions {
         // Forward by default (a missed run-only flag fails loudly; a dropped selection
         // flag would silently mis-select)
 
-        // Run-only value flags `nextest list` rejects
+        // Run-only value flags `nextest list` rejects (`--log-tail` = ztest-only)
         const RUN_VALUE: &[&str] = &[
+            "--log-tail",
             "-j",
             "--test-threads",
             "--jobs",
@@ -248,6 +257,7 @@ impl RunOptions {
                     }
                     "--success-output" => o.success_output = value,
                     "--failure-output" => o.failure_output = value,
+                    "--log-tail" => o.log_tail = value,
                     _ => {
                         if WARN_UNSUPPORTED.contains(&flag) {
                             o.unsupported.push(flag.to_string());
@@ -302,6 +312,7 @@ impl RunOptions {
             success: resolve(&self.success_output, &success_env, default.success),
             failure: resolve(&self.failure_output, &failure_env, default.failure),
             capture: default.capture,
+            log_tail: crate::config::log_tail(self.log_tail.as_deref(), "run"),
         };
         if self.no_capture {
             cfg.capture = CaptureStrategy::None;
@@ -1825,13 +1836,23 @@ mod tests {
 
     #[test]
     fn output_flags_parse_into_display_policy() {
+        use ztest::api::engine::LogTail;
         use ztest::api::engine::TestOutputDisplay;
-        let o = parse(&["-p", "wt", "--success-output", "final", "--failure-output", "never"]);
+        let o = parse(&[
+            "-p",
+            "wt",
+            "--success-output",
+            "final",
+            "--failure-output",
+            "never",
+            "--log-tail=all",
+        ]);
         // Stripped from the list argv (`list` rejects run-only flags)
         assert_eq!(o.list_args, v(&["-p", "wt"]));
         let cfg = o.output_config();
         assert_eq!(cfg.success, TestOutputDisplay::Final);
         assert_eq!(cfg.failure, TestOutputDisplay::Never);
+        assert_eq!(cfg.log_tail, LogTail::All, "flag outranks env + config.toml");
         assert!(cfg.captures() && !cfg.is_serial());
     }
 

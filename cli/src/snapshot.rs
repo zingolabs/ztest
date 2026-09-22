@@ -135,7 +135,8 @@ enum SnapshotCmd {
 #[derive(Debug, Subcommand)]
 enum ConfigCmd {
     /// Write the push credentials, prompting for anything not passed as a flag.
-    /// The file is created `0600` and replaces any previous one.
+    /// Stored as `[bucket]` in `clusters.toml` (written `0600`), replacing any
+    /// previous credentials; cluster profiles are left untouched.
     Set(ConfigSetArgs),
 
     /// Print the stored settings with the secret key redacted.
@@ -660,14 +661,14 @@ async fn config(cmd: ConfigCmd) -> Result<()> {
             )),
         },
         ConfigCmd::Set(a) => {
-            let c = crate::bucket::Credentials {
+            let c = ztest::api::cluster_config::BucketCredentials {
                 endpoint: ask(a.endpoint, "S3 endpoint")?,
                 bucket: ask(a.bucket, "bucket")?,
                 access_key_id: ask(a.access_key_id, "access key id")?,
                 secret_access_key: ask_secret(a.secret_access_key)?,
                 region: a.region,
             };
-            let path = crate::bucket::store_credentials(&c)?;
+            let path = crate::bucket::store_credentials(c)?;
             say(
                 tmpl::READY,
                 Fields::new().text("name", format!("credentials written to {}", path.display())),

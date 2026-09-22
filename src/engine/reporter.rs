@@ -190,6 +190,7 @@ impl RunReporter for StyledReporter {
                 duration,
                 attempt,
                 output,
+                components,
             } => {
                 let bracket = bracket_dur(*duration);
                 let passed = matches!(verdict, Verdict::Pass);
@@ -228,9 +229,16 @@ impl RunReporter for StyledReporter {
                 // the run record for `ztest replay`; the `SIGKILL` line still prints
                 if !terminated {
                     let display = self.output.display_for(passed);
-                    // Pod path: `output` is already the laptop-assembled unified
-                    // timeline (frame-free) → no-op. Local path: strips libtest framing
-                    let shown = crate::libtest::strip_libtest_frame(output, test_name);
+                    // Pod path: `output` already frame-free → no-op. Local path: strips
+                    // libtest framing
+                    let mut shown = crate::libtest::strip_libtest_frame(output, test_name);
+                    if let Some(section) = crate::logstream::component_section(
+                        components,
+                        self.output.log_tail,
+                        self.color,
+                    ) {
+                        shown.extend_from_slice(section.as_bytes());
+                    }
                     if display.is_immediate() {
                         self.replay_output(&shown, ink);
                     }
@@ -570,6 +578,7 @@ mod tests {
             duration: Duration::from_millis(234),
             attempt,
             output: out,
+            components: b"",
         }
     }
 

@@ -129,7 +129,9 @@ fn feed(
             duration,
             attempt,
             output,
+            components,
         } => {
+            let components = store.get(&components)?;
             let mut bytes = store.get(&output)?;
             // No stored bytes under a non-capturing run = never captured; surface that
             // rather than blank output (reporter still gates on display policy)
@@ -143,6 +145,7 @@ fn feed(
                 duration,
                 attempt,
                 output: &bytes,
+                components: &components,
             });
         }
         RecordedEvent::TestSkipped { binary_id, test_name, reason } => {
@@ -179,16 +182,19 @@ fn resolve_exit(mirror_original: bool, stats: Option<RunStats>) -> i32 {
 mod tests {
     use super::*;
     use crate::engine::events::{TestEvent, Verdict};
+    use crate::engine::output::LogTail;
     use crate::engine::record::recorder::RunRecorder;
     use crate::engine::record::{FORMAT_VERSION, RunMeta};
     use crate::qos::QosClass;
     use std::time::Duration;
 
     /// End-to-end without a cluster: record → replay must reproduce verdict lines,
-    /// failure output and summary
+    /// failure output and summary; component log recorded in full, tailed per replay
     #[test]
     fn record_then_replay_reproduces_the_run() {
         let dir = tempdir("replay-e2e");
+        let components: Vec<u8> =
+            (0..50).flat_map(|i| format!("[zaino] status check {i}\n").into_bytes()).collect();
         {
             let mut rec = RunRecorder::create(&dir, &meta("ztest-run-e2e")).unwrap();
             rec.record(&TestEvent::RunStarted { total: 2, run_id: "ztest-run-e2e" }).unwrap();
@@ -206,6 +212,7 @@ mod tests {
                 duration: Duration::from_millis(100),
                 attempt: 1,
                 output: b"",
+                components: b"",
             })
             .unwrap();
             rec.record(&TestEvent::TestFinished {
@@ -215,6 +222,7 @@ mod tests {
                 duration: Duration::from_millis(200),
                 attempt: 1,
                 output: b"panic: boom\n",
+                components: &components,
             })
             .unwrap();
             rec.record(&TestEvent::RunFinished {
@@ -237,6 +245,15 @@ mod tests {
             out.contains("Summary [   1.000s] 2 tests run: 1 passed, 1 failed, 0 skipped"),
             "{out}"
         );
+        assert!(out.contains("20 earlier line(s) dropped"), "default tail = 30:\n{out}");
+        assert!(!out.contains("status check 19\n") && out.contains("status check 20\n"), "{out}");
+
+        let mut buf: Vec<u8> = Vec::new();
+        let all = OutputConfig { log_tail: LogTail::All, ..OutputConfig::default() };
+        replay_into(&dir, all, false, true, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains("dropped"), "`all` replays every recorded line:\n{out}");
+        assert!(out.contains("status check 0\n") && out.contains("status check 49\n"), "{out}");
     }
 
     #[test]
