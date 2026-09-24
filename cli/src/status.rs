@@ -105,7 +105,7 @@ async fn live(client: &Client, server: &str, theme: &Theme) -> Result<()> {
         }
     }
     let mut out = stdout().lock();
-    let _ = write!(out, "{WRAP_ON}{CURSOR_SHOW}\n");
+    let _ = writeln!(out, "{WRAP_ON}{CURSOR_SHOW}");
     let _ = out.flush();
     tty.restore();
     Ok(())
