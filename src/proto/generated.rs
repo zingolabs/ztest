@@ -395,6 +395,9 @@ pub struct TreeState {
     /// orchard commitment tree state
     #[prost(string, tag = "6")]
     pub orchard_tree: ::prost::alloc::string::String,
+    /// ironwood commitment tree state
+    #[prost(string, tag = "7")]
+    pub ironwood_tree: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetSubtreeRootsArg {
@@ -490,6 +493,7 @@ impl PoolType {
 pub enum ShieldedProtocol {
     Sapling = 0,
     Orchard = 1,
+    Ironwood = 2,
 }
 impl ShieldedProtocol {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -500,6 +504,7 @@ impl ShieldedProtocol {
         match self {
             Self::Sapling => "sapling",
             Self::Orchard => "orchard",
+            Self::Ironwood => "ironwood",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -507,6 +512,7 @@ impl ShieldedProtocol {
         match value {
             "sapling" => Some(Self::Sapling),
             "orchard" => Some(Self::Orchard),
+            "ironwood" => Some(Self::Ironwood),
             _ => None,
         }
     }
