@@ -180,7 +180,8 @@ Three altitudes, all **outside** the SUT:
 
 ### Example: verifying a wallet sync
 
-The only backend-specific line is the one that constructs the subject; everything else is harness API.
+The only backend-specific lines build the wallet (with its library-typed knobs) and the subject;
+everything else is harness API.
 
 ```rust
 #[ztest::sync_test(name = "wallet_state_sync", description = "genesis→tip wallet sync under chaos",
@@ -189,10 +190,10 @@ async fn wallet_state_sync(mut run: SyncRunner) -> SyncOutcome {
     let (zeb, zai, wallet) = run.topology(|t| (
         t.add_validator(Validator::zebrad("1.9.1").regtest().snapshot(ORCHARD_TESTNET)),
         t.add_indexer(Indexer::zaino("0.4.0").peer("zeb")),
-        t.add_wallet(Wallet::librustzcash()),
+        t.add_wallet(Wallet::librustzcash().performance(librustzcash::PerformanceLevel::High)),
     )).await?;
     let account = wallet.account(&zeb, &zai, MNEMONIC, BIRTHDAY).await?;
-    run.sync(account.wallet().sync_subject(account.id(), Some(PerformanceLevel::High)).await?);
+    run.sync(account.wallet().sync_subject(account.id()).await?);
 
     run.always(Fatal).every(secs(5)).check(height_monotonic);          // nested fns, defined below
     run.eventually(Fatal).window(mins(10)).check(no_stall);
@@ -270,7 +271,7 @@ ztest cleanup <id>                            # namespace + driver pod + record 
 - NVMe node count = the concurrency ceiling; a full pool leaves the pod `Pending` (k8s-native), not failed
 - From-genesis in-topology sync wears `#[ztest::qos::sync]`; an external sync (in-process client to a
   remote server) needs only `#[ztest::qos::wallet]`
-- A subject's own aggressiveness knob (e.g. the wallet's `PerformanceLevel` batch size) must fit the
+- A subject's own aggressiveness knob (e.g. the wallet builder's `.performance(..)` level) must fit the
   tier's footprint — the harness admits against the tier, not against what the engine decides to buffer
 
 ## Status

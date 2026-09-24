@@ -79,11 +79,13 @@ mod storage_class;
 pub use crate::archive::{Artifact, Backend, ChainSnapshot, Network};
 pub use crate::backends::image::DevSource;
 #[cfg(feature = "librustzcash")]
-pub use crate::backends::librustzcash::{LrzBackend, LrzWallet, PerformanceLevel};
+pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
 pub use crate::backends::lightwalletd::LightwalletdIndexer;
 pub use crate::backends::zainod::{ZainoIndex, ZainoIndexer};
 pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::{Health, ZebraValidator};
+#[cfg(feature = "zingolib")]
+pub use crate::backends::zingolib::{ZingolibBackend, ZingolibWallet};
 pub use crate::component::{
     ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Cpu, Disk, Indexer,
     Mem, Resources, Validator, Wallet,
@@ -98,8 +100,8 @@ pub use crate::handles::validator::{
     BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, Peer, PeerInfo,
 };
 pub use crate::handles::wallet::{
-    Account, AccountId, AccountSpec, BoxError, FAUCET_SEED, Pool, PoolBalances, RECIPIENT_SEED,
-    WalletExt,
+    Account, AccountId, AccountKey, AccountSpec, BoxError, FAUCET_SEED, Pool, PoolBalances,
+    RECIPIENT_SEED, Unsupported, WalletExt,
 };
 pub use crate::handles::{
     HandleInner, IndexerBackend, IndexerConfig, ValidatorBackend, ValidatorConfig, WalletBackend,

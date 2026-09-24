@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::Network;
 use crate::topology::ActivationHeights;
 use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
@@ -60,20 +61,44 @@ impl PoolBalances {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AccountId(pub u32);
 
-/// Everything a backend needs for one in-process wallet account. `activation` comes from
-/// the running validator (wallet cannot drift from the chain it syncs against)
+/// Key material an account is restored from. `Ufvk` = encoded UFVK → view-only (send/shield
+/// refuse with [`Unsupported::ViewOnly`])
+#[derive(Debug, Clone, Copy)]
+pub enum AccountKey<'a> {
+    Mnemonic(&'a str),
+    Ufvk(&'a str),
+}
+
+/// Everything a backend needs for one in-process wallet account.
+///
+/// - `network` + `activation` from the running validator (wallet cannot drift from its chain)
+/// - `activation` governs only when `network == Regtest` (public nets = the library's constants)
 #[derive(Debug, Clone, Copy)]
 pub struct AccountSpec<'a> {
-    pub mnemonic: &'a str,
+    pub key: AccountKey<'a>,
     pub birthday: BlockHeight,
     pub indexer_uri: &'a str,
+    pub network: Network,
     pub activation: &'a ActivationHeights,
+}
+
+/// Typed [`WalletBackend`] refusal (downcast from [`BoxError`] to tell "cannot" from "failed")
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Unsupported {
+    #[error("{backend}: {op} unsupported by this backend")]
+    Operation { backend: &'static str, op: &'static str },
+    #[error("{backend}: {op} needs a spending key (view-only account)")]
+    ViewOnly { backend: &'static str, op: &'static str },
+    #[error("{backend}: cannot restrict spent notes to {pools:?}")]
+    SpendPools { backend: &'static str, pools: Vec<Pool> },
+    #[error("{backend}: account import from {key} unsupported")]
+    AccountKey { backend: &'static str, key: &'static str },
 }
 
 // ──────────────────────────── WalletConfig ────────────────────────────
 
-/// Config ZST handed to the [`Wallet`](crate::component::Wallet) builder (e.g.
-/// `LrzBackend`) = factory for the live handle (wallets carry no pod-config)
+/// Config handed to the [`Wallet`](crate::component::Wallet) builder (e.g. `LrzBackend`) =
+/// library-typed knobs + factory for the live handle (wallets carry no pod-config)
 pub trait WalletConfig: Send + Sync + std::fmt::Debug + 'static {
     type Handle: WalletBackend + Clone;
 
@@ -137,8 +162,6 @@ pub struct Account<W: WalletBackend> {
 }
 
 impl<W: WalletBackend> Account<W> {
-    // Unused with no wallet backend compiled in; backend infra, not backend-specific
-    #[cfg_attr(not(feature = "librustzcash"), allow(dead_code))]
     pub fn new(wallet: W, id: AccountId, label: &'static str) -> Self {
         Self { wallet, id, label }
     }
@@ -260,7 +283,7 @@ const FAUCET_MATURITY_TIMEOUT: Duration = Duration::from_secs(120);
 /// well-known seeds, synced recipient, funded faucet. Auto-implemented for every backend
 #[async_trait]
 pub trait WalletExt: WalletBackend {
-    /// Account from `mnemonic`: activation heights from `validator` (sole source of
+    /// Account from `mnemonic`: network + activation heights from `validator` (sole source of
     /// truth), endpoint from `indexer`
     async fn account<V, I>(
         &self,
@@ -273,18 +296,22 @@ pub trait WalletExt: WalletBackend {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        let activation = validator.activation_heights().await?;
-        let indexer_uri = indexer.grpc_uri().await?;
-        let id = self
-            .add_account(AccountSpec {
-                mnemonic,
-                birthday,
-                indexer_uri: &indexer_uri,
-                activation: &activation,
-            })
-            .await
-            .map_err(|e| RpcError::backend_boxed(self.label(), "add_account", e))?;
-        Ok(Account::new(self.clone(), id, self.label()))
+        add_account(self, validator, indexer, AccountKey::Mnemonic(mnemonic), birthday).await
+    }
+
+    /// View-only account from an encoded UFVK; chain + endpoint as [`account`](Self::account)
+    async fn viewing_account<V, I>(
+        &self,
+        validator: &V,
+        indexer: &I,
+        ufvk: &str,
+        birthday: BlockHeight,
+    ) -> Result<Account<Self>, RpcError>
+    where
+        V: ValidatorBackend + ?Sized,
+        I: IndexerBackend + ?Sized,
+    {
+        add_account(self, validator, indexer, AccountKey::Ufvk(ufvk), birthday).await
     }
 
     /// Regtest faucet account ([`FAUCET_SEED`]), the address the validator mines to.
@@ -370,6 +397,54 @@ where
 }
 
 impl<W: WalletBackend> WalletExt for W {}
+
+async fn add_account<W, V, I>(
+    wallet: &W,
+    validator: &V,
+    indexer: &I,
+    key: AccountKey<'_>,
+    birthday: BlockHeight,
+) -> Result<Account<W>, RpcError>
+where
+    W: WalletBackend,
+    V: ValidatorBackend + ?Sized,
+    I: IndexerBackend + ?Sized,
+{
+    let network = validator_network(validator).await?;
+    let activation = validator.activation_heights().await?;
+    let indexer_uri = indexer.grpc_uri().await?;
+    let id = wallet
+        .add_account(AccountSpec {
+            key,
+            birthday,
+            indexer_uri: &indexer_uri,
+            network,
+            activation: &activation,
+        })
+        .await
+        .map_err(|e| RpcError::backend_boxed(wallet.label(), "add_account", e))?;
+    Ok(Account::new(wallet.clone(), id, wallet.label()))
+}
+
+/// - Regtest from env plumbing (zebra reports regtest as `"test"` over RPC)
+/// - Public restores from the node's own `chain`
+async fn validator_network<V>(validator: &V) -> Result<Network, RpcError>
+where
+    V: ValidatorBackend + ?Sized,
+{
+    if validator.is_regtest() {
+        return Ok(Network::Regtest);
+    }
+    match validator.chain_config().await?.network.as_str() {
+        "main" => Ok(Network::Mainnet),
+        "test" => Ok(Network::Testnet),
+        other => Err(RpcError::decode(
+            validator.label(),
+            "chain_config",
+            format!("unknown public network {other:?}"),
+        )),
+    }
+}
 
 /// Mine `n` to `miner_address`, await the indexer's new tip, sync `faucet`.
 /// No-op at `n == 0`

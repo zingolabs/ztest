@@ -2,15 +2,19 @@
 //! backends from their own crates).
 //!
 //! - Wallet backends run in-process, no pod
-//! - Default [`librustzcash`]
+//! - Default [`librustzcash`]; opt-in `zingolib` (feature `zingolib`)
 pub mod ctors;
 pub mod image;
 #[cfg(feature = "librustzcash")]
 pub mod librustzcash;
 pub mod lightwalletd;
+#[cfg(feature = "librustzcash")]
+mod sync_task;
 pub mod zainod;
 pub mod zcashd;
 pub mod zebra;
+#[cfg(feature = "zingolib")]
+pub mod zingolib;
 
 /// Bundled backends' metric catalogues, for a reader with no pod to ask (the report reads
 /// after the run namespace is gone). Every field comes off the backend's own

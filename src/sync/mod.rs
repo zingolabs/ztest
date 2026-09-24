@@ -46,9 +46,9 @@ pub use runner::{
 pub use snapshot::{History, Snapshot};
 pub use subject::{ProgressView, SyncSubject};
 pub use tree::{TreeRoot, TreeRootError, TreeRoots};
-// Frontier parser needs `sapling_crypto`/`orchard` hash types (librustzcash-gated);
+// Frontier parser needs `sapling_crypto`/`orchard` hash types (wallet-backend-gated);
 // `TreeRoots` above is plain data, available to everyone
-#[cfg(feature = "librustzcash")]
+#[cfg(any(feature = "librustzcash", feature = "zingolib"))]
 pub use tree::commitment_tree_root;
 pub use work::{Channel, Mismatch, Op, OpSet, Rate, Segment, Work};
 

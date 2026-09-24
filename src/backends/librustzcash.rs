@@ -17,7 +17,6 @@ use rand::rngs::OsRng;
 use secrecy::SecretVec;
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
 
 use zcash_client_backend::data_api::chain::{BlockCache, BlockSource, error::Error as ChainError};
 use zcash_client_backend::data_api::scanning::ScanRange;
@@ -27,7 +26,8 @@ use zcash_client_backend::data_api::wallet::{
     shield_transparent_funds,
 };
 use zcash_client_backend::data_api::{
-    AccountBirthday, WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite,
+    Account as _, AccountBirthday, AccountPurpose, WalletCommitmentTrees, WalletRead,
+    WalletSummary, WalletWrite,
 };
 use zcash_client_backend::fees::standard::SingleOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule};
@@ -40,7 +40,7 @@ use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::init_wallet_db;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_keys::address::Address;
-use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
+use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::ShieldedPool as ShieldedProtocol;
 use zcash_protocol::TxId;
@@ -49,17 +49,16 @@ use zcash_protocol::local_consensus::LocalNetwork;
 use zcash_protocol::value::Zatoshis;
 
 use crate::RpcError;
+use crate::backends::sync_task::SyncTask;
 use crate::handles::HandleInner;
 use crate::handles::wallet::{
-    AccountId, AccountSpec, BoxError, Pool, PoolBalances, WalletBackend, WalletConfig,
+    AccountId, AccountKey, AccountSpec, BoxError, Pool, PoolBalances, Unsupported, WalletBackend,
+    WalletConfig,
 };
 use crate::sync::{ProgressView, SyncSubject, TreeRoots};
 use crate::topology::ActivationHeights;
 
 const LABEL: &str = "librustzcash";
-
-/// zcash_client_backend blocks per download/scan batch during sync
-const SYNC_BATCH_SIZE: u32 = 100;
 
 /// Connect handshake only = fast-fail floor for a dead endpoint (never cuts a long
 /// sync stream on the same channel). Relay deadline = the caller's per-send `timeout`
@@ -70,25 +69,27 @@ type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, OsRng>;
 /// [`Wallet`](crate::component::Wallet) builder's librustzcash flavour → [`LrzWallet`]
 /// handle at `add_wallet` time
 #[derive(Debug, Clone, Default)]
-pub struct LrzBackend;
+pub struct LrzBackend {
+    pub(crate) performance: PerformanceLevel,
+}
 
 impl WalletConfig for LrzBackend {
     type Handle = LrzWallet;
 
     fn to_handle(&self, _plumbing: HandleInner) -> LrzWallet {
         // In-process: the handle owns its own state, no plumbing
-        LrzWallet::new()
+        LrzWallet::new(self.performance)
     }
 }
 
 /// Runs in-process. Clones share one state
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct LrzWallet {
     inner: Arc<LrzInner>,
 }
 
-#[derive(Default)]
 struct LrzInner {
+    performance: PerformanceLevel,
     accounts: StdMutex<HashMap<u32, Arc<WalletAccount>>>,
     next_id: AtomicU32,
 }
@@ -96,19 +97,34 @@ struct LrzInner {
 /// - `db` behind an async mutex (`WalletWrite`/sync take `&mut`)
 /// - `_dir` keeps the SQLite file alive
 /// - `db_path` lets the sync harness open a second WAL reader while the sync task writes
+/// - `usk` `None` = UFVK-imported view-only account
 struct WalletAccount {
     db: AsyncMutex<Db>,
     db_path: PathBuf,
-    usk: UnifiedSpendingKey,
+    ufvk: UnifiedFullViewingKey,
+    usk: Option<UnifiedSpendingKey>,
     account_id: AccountUuid,
     params: LocalNetwork,
     indexer_uri: String,
     _dir: TempDir,
 }
 
+impl WalletAccount {
+    fn spending_keys(&self, op: &'static str) -> Result<SpendingKeys, BoxError> {
+        let usk = self.usk.clone().ok_or(Unsupported::ViewOnly { backend: LABEL, op })?;
+        Ok(SpendingKeys::from_unified_spending_key(usk))
+    }
+}
+
 impl LrzWallet {
-    fn new() -> Self {
-        Self::default()
+    fn new(performance: PerformanceLevel) -> Self {
+        Self {
+            inner: Arc::new(LrzInner {
+                performance,
+                accounts: StdMutex::new(HashMap::new()),
+                next_id: AtomicU32::new(0),
+            }),
+        }
     }
 
     fn account(&self, id: AccountId) -> Result<Arc<WalletAccount>, BoxError> {
@@ -125,7 +141,10 @@ impl LrzWallet {
 impl std::fmt::Debug for LrzWallet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let n = self.inner.accounts.lock().map(|a| a.len()).unwrap_or(0);
-        f.debug_struct("LrzWallet").field("accounts", &n).finish()
+        f.debug_struct("LrzWallet")
+            .field("performance", &self.inner.performance)
+            .field("accounts", &n)
+            .finish()
     }
 }
 
@@ -263,11 +282,6 @@ impl WalletBackend for LrzWallet {
     async fn add_account(&self, spec: AccountSpec<'_>) -> Result<AccountId, BoxError> {
         let params = to_local_network(spec.activation);
 
-        let mnemonic =
-            bip0039::Mnemonic::<bip0039::English>::from_phrase(spec.mnemonic.to_string())
-                .map_err(|e| format!("librustzcash: invalid mnemonic phrase: {e}"))?;
-        let seed = SecretVec::new(mnemonic.to_seed("").to_vec());
-
         let dir =
             tempfile::tempdir().map_err(|e| format!("librustzcash: create wallet dir: {e}"))?;
         let db_path = dir.path().join("wallet.sqlite");
@@ -286,9 +300,25 @@ impl WalletBackend for LrzWallet {
         let birthday = AccountBirthday::from_treestate(treestate, None)
             .map_err(|_| "librustzcash: invalid birthday treestate".to_string())?;
 
-        let (account_id, usk) = db
-            .create_account(LABEL, &seed, &birthday, None)
-            .map_err(|e| format!("librustzcash: create_account: {e}"))?;
+        let (account_id, ufvk, usk) = match spec.key {
+            AccountKey::Mnemonic(phrase) => {
+                let mnemonic = bip0039::Mnemonic::<bip0039::English>::from_phrase(phrase)
+                    .map_err(|e| format!("librustzcash: invalid mnemonic phrase: {e}"))?;
+                let seed = SecretVec::new(mnemonic.to_seed("").to_vec());
+                let (account_id, usk) = db
+                    .create_account(LABEL, &seed, &birthday, None)
+                    .map_err(|e| format!("librustzcash: create_account: {e}"))?;
+                (account_id, usk.to_unified_full_viewing_key(), Some(usk))
+            }
+            AccountKey::Ufvk(encoded) => {
+                let ufvk = UnifiedFullViewingKey::decode(&params, encoded)
+                    .map_err(|e| format!("librustzcash: invalid UFVK: {e}"))?;
+                let account = db
+                    .import_account_ufvk(LABEL, &ufvk, &birthday, AccountPurpose::ViewOnly, None)
+                    .map_err(|e| format!("librustzcash: import_account_ufvk: {e}"))?;
+                (account.id(), ufvk, None)
+            }
+        };
 
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         self.inner.accounts.lock().expect("lrz accounts mutex poisoned").insert(
@@ -296,6 +326,7 @@ impl WalletBackend for LrzWallet {
             Arc::new(WalletAccount {
                 db: AsyncMutex::new(db),
                 db_path,
+                ufvk,
                 usk,
                 account_id,
                 params,
@@ -321,8 +352,7 @@ impl WalletBackend for LrzWallet {
         }
         .map_err(|e| format!("librustzcash: build unified address request: {e}"))?;
         let (ua, _) = acct
-            .usk
-            .to_unified_full_viewing_key()
+            .ufvk
             .default_address(request)
             .map_err(|e| format!("librustzcash: default_address: {e:?}"))?;
         let s = match pool {
@@ -359,15 +389,10 @@ impl WalletBackend for LrzWallet {
         let mut client = connect(&acct.indexer_uri).await?;
         let cache = MemBlockCache::default();
         let mut db = acct.db.lock().await;
-        zcash_client_backend::sync::run(
-            &mut client,
-            &acct.params,
-            &cache,
-            &mut *db,
-            SYNC_BATCH_SIZE,
-        )
-        .await
-        .map_err(|e| format!("librustzcash: sync: {e}"))?;
+        let batch_size = self.inner.performance.batch_size();
+        zcash_client_backend::sync::run(&mut client, &acct.params, &cache, &mut *db, batch_size)
+            .await
+            .map_err(|e| format!("librustzcash: sync: {e}"))?;
         Ok(())
     }
 
@@ -389,7 +414,7 @@ impl WalletBackend for LrzWallet {
         let prover = LocalTxProver::bundled();
         let input_selector = GreedyInputSelector::<Db>::new();
         let spend_policy = spend_policy_for(from_pools)?;
-        let sk = SpendingKeys::from_unified_spending_key(acct.usk.clone());
+        let sk = acct.spending_keys("send")?;
         let mut db = acct.db.lock().await;
         let target = tx_target_height(&db)?;
         let change_strategy = SingleOutputChangeStrategy::<Db>::new(
@@ -421,6 +446,8 @@ impl WalletBackend for LrzWallet {
             request,
             policy,
             &spend_policy,
+            // `lock_inputs`: one proposal per account at a time, nothing to lock against
+            None,
             // `proposed_version`: builder picks the branch-default tx version
             None,
         )
@@ -435,7 +462,15 @@ impl WalletBackend for LrzWallet {
             std::convert::Infallible,
             _,
         >(
-            &mut *db, &acct.params, &prover, &prover, &sk, OvkPolicy::Sender, &proposal
+            &mut *db,
+            &acct.params,
+            &prover,
+            &prover,
+            &sk,
+            OvkPolicy::Sender,
+            &proposal,
+            // `expiry_height`: builder-derived expiry
+            None,
         )
         .map_err(|e| format!("librustzcash: create transactions: {e}"))?;
         let txids: Vec<TxId> = txids.into_iter().collect();
@@ -452,7 +487,7 @@ impl WalletBackend for LrzWallet {
             ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("1 is nonzero"), false);
         let prover = LocalTxProver::bundled();
         let input_selector = GreedyInputSelector::<Db>::new();
-        let sk = SpendingKeys::from_unified_spending_key(acct.usk.clone());
+        let sk = acct.spending_keys("shield")?;
         let mut db = acct.db.lock().await;
         let target = tx_target_height(&db)?;
         let change_strategy = SingleOutputChangeStrategy::<Db>::new(
@@ -527,12 +562,13 @@ fn pool_balances(
     }
 }
 
-/// Compact-block batch size `sync_subject` drives `zcash_client_backend::sync` with.
+/// Compact-block batch size every `zcash_client_backend::sync::run` of this wallet drives with
 ///
-/// - Backend-owned: the harness has no scan concept, so this knob lives with the engine it tunes
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// - Backend-owned (harness has no scan concept → knob lives with the engine it tunes)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PerformanceLevel {
     Low,
+    #[default]
     Medium,
     High,
 }
@@ -548,22 +584,17 @@ impl PerformanceLevel {
 }
 
 impl LrzWallet {
-    /// Subject a `#[ztest::sync_test]` body binds with `run.sync(..)`: drives to
-    /// tip through `zcash_client_backend::sync` in a background task. `performance` =
-    /// compact-block batch size
-    pub async fn sync_subject(
-        &self,
-        account: AccountId,
-        performance: Option<PerformanceLevel>,
-    ) -> Result<LrzSyncSubject, BoxError> {
+    /// Subject a `#[ztest::sync_test]` body binds with `run.sync(..)`: drives to tip through
+    /// `zcash_client_backend::sync` in a background task, at the builder's
+    /// [`performance`](crate::component::Wallet::performance)
+    pub async fn sync_subject(&self, account: AccountId) -> Result<LrzSyncSubject, BoxError> {
         let acct = self.account(account)?;
         let reader = open_wallet_db(&acct.db_path, acct.params)?;
-        let batch_size = performance.map_or(SYNC_BATCH_SIZE, PerformanceLevel::batch_size);
         Ok(LrzSyncSubject {
             account: acct,
-            batch_size,
+            batch_size: self.inner.performance.batch_size(),
             reader: AsyncMutex::new(reader),
-            running: None,
+            task: None,
         })
     }
 }
@@ -671,7 +702,7 @@ pub struct LrzSyncSubject {
     account: Arc<WalletAccount>,
     batch_size: u32,
     reader: AsyncMutex<Db>,
-    running: Option<JoinHandle<Result<(), BoxError>>>,
+    task: Option<SyncTask<()>>,
 }
 
 impl std::fmt::Debug for LrzSyncSubject {
@@ -679,7 +710,7 @@ impl std::fmt::Debug for LrzSyncSubject {
         f.debug_struct("LrzSyncSubject")
             .field("indexer_uri", &self.account.indexer_uri)
             .field("batch_size", &self.batch_size)
-            .field("launched", &self.running.is_some())
+            .field("launched", &self.task.is_some())
             .finish()
     }
 }
@@ -687,13 +718,13 @@ impl std::fmt::Debug for LrzSyncSubject {
 #[async_trait]
 impl SyncSubject for LrzSyncSubject {
     async fn launch(&mut self) -> Result<(), RpcError> {
-        if self.running.is_some() {
+        if self.task.is_some() {
             return Err(RpcError::decode(LABEL, "launch", "sync already launched"));
         }
         let account = self.account.clone();
         let batch = self.batch_size;
-        let handle = tokio::spawn(async move {
-            let mut client = connect(&account.indexer_uri).await?;
+        self.task = Some(SyncTask::spawn(async move {
+            let mut client = connect(&account.indexer_uri).await.map_err(|e| e.to_string())?;
             let cache = MemBlockCache::default();
             let params = account.params;
             // Holds the primary connection for the whole drive-to-tip (monitor reads
@@ -701,10 +732,8 @@ impl SyncSubject for LrzSyncSubject {
             let mut db = account.db.lock().await;
             zcash_client_backend::sync::run(&mut client, &params, &cache, &mut *db, batch)
                 .await
-                .map_err(|e| format!("librustzcash: sync: {e}"))?;
-            Ok::<(), BoxError>(())
-        });
-        self.running = Some(handle);
+                .map_err(|e| format!("librustzcash: sync: {e}"))
+        }));
         Ok(())
     }
 
@@ -721,15 +750,20 @@ impl SyncSubject for LrzSyncSubject {
         Ok(Box::new(progress.with_tree_roots(wallet_tree_roots(&mut db, scanned))))
     }
 
+    /// Success only: a failed task is [`failure`](Self::failure), never completion
     async fn is_complete(&self) -> bool {
-        self.running.as_ref().is_some_and(|h| h.is_finished())
+        self.task.as_ref().is_some_and(|t| t.succeeded().is_some())
+    }
+
+    async fn failure(&self) -> Option<String> {
+        self.task.as_ref().and_then(SyncTask::failure)
     }
 
     async fn stop(&mut self) -> Result<(), RpcError> {
-        if let Some(h) = &self.running {
+        if let Some(task) = &self.task {
             // `sync::run` has no cooperative checkpoint → cancel by aborting at the
             // next await (each batch already committed its own transaction)
-            h.abort();
+            task.abort();
         }
         Ok(())
     }
@@ -804,5 +838,21 @@ impl BlockCache for MemBlockCache {
             blocks.remove(&k);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PerformanceLevel;
+    use crate::component::Wallet;
+
+    #[test]
+    fn builder_defaults_to_medium_batches_until_overridden() {
+        let default = Wallet::librustzcash().backend.performance;
+        assert_eq!((default, default.batch_size()), (PerformanceLevel::Medium, 100));
+        assert_eq!(
+            Wallet::librustzcash().performance(PerformanceLevel::High).backend.performance,
+            PerformanceLevel::High,
+        );
     }
 }

@@ -86,13 +86,13 @@ pub enum TreeRootError {
     Malformed(String),
 }
 
-/// Root of an indexer's `GetTreeState` frontier (`TreeState.sapling_tree`/`.orchard_tree`),
+/// Root of an indexer's `GetTreeState` frontier (`TreeState.{sapling,orchard,ironwood}_tree`),
 /// for comparison against a wallet's [`TreeRoots`].
 ///
-/// - Field = hex-encoded *legacy* `CommitmentTree`; Ironwood shares Orchard's shape
+/// - Field = hex-encoded *legacy* `CommitmentTree`; Ironwood = Orchard's hash + depth
 /// - Empty → `Ok(None)` (no tree at that height); present-but-unparseable → error
 ///   (garbage and nothing are different findings)
-#[cfg(feature = "librustzcash")]
+#[cfg(any(feature = "librustzcash", feature = "zingolib"))]
 pub fn commitment_tree_root(
     pool: Pool,
     frontier_hex: &str,
@@ -168,14 +168,45 @@ mod tests {
         TreeRoots::reported().require(Pool::Transparent);
     }
 
-    #[cfg(feature = "librustzcash")]
+    #[cfg(any(feature = "librustzcash", feature = "zingolib"))]
     #[test]
     fn an_empty_frontier_field_is_no_root_not_an_error() {
         assert_eq!(commitment_tree_root(Pool::Sapling, ""), Ok(None));
         assert_eq!(commitment_tree_root(Pool::Orchard, ""), Ok(None));
+        assert_eq!(commitment_tree_root(Pool::Ironwood, ""), Ok(None));
     }
 
-    #[cfg(feature = "librustzcash")]
+    /// Hand-framed legacy `CommitmentTree` hex (left, right, parents) → Ironwood roots match
+    /// Orchard's hash at depth 32, independent of any tree builder
+    #[cfg(any(feature = "librustzcash", feature = "zingolib"))]
+    #[test]
+    fn ironwood_frontiers_hash_as_orchard() {
+        use incrementalmerkletree::{Hashable, Level};
+        use orchard::tree::MerkleHashOrchard;
+
+        let depth = Level::from(orchard::NOTE_COMMITMENT_TREE_DEPTH as u8);
+        let empty_root = MerkleHashOrchard::empty_root(depth).to_bytes();
+        // left = None, right = None, parents = []
+        assert_eq!(commitment_tree_root(Pool::Ironwood, "000000"), Ok(Some(empty_root)));
+
+        let mut leaf_bytes = [0u8; 32];
+        leaf_bytes[0] = 1;
+        let leaf = MerkleHashOrchard::from_bytes(&leaf_bytes).expect("1 < Pallas base modulus");
+        let single_root = (0..u8::from(depth))
+            .fold(leaf, |node, l| {
+                let level = Level::from(l);
+                MerkleHashOrchard::combine(level, &node, &MerkleHashOrchard::empty_root(level))
+            })
+            .to_bytes();
+        // left = Some(leaf), right = None, parents = []
+        let single = format!("01{}0000", hex::encode(leaf_bytes));
+        assert_eq!(commitment_tree_root(Pool::Ironwood, &single), Ok(Some(single_root)));
+        assert_eq!(commitment_tree_root(Pool::Orchard, &single), Ok(Some(single_root)));
+        assert_ne!(single_root, empty_root);
+        assert_ne!(commitment_tree_root(Pool::Sapling, "000000"), Ok(Some(empty_root)));
+    }
+
+    #[cfg(any(feature = "librustzcash", feature = "zingolib"))]
     #[test]
     fn garbage_is_an_error_not_a_silent_none() {
         assert!(matches!(commitment_tree_root(Pool::Sapling, "zz"), Err(TreeRootError::NotHex(_))));
@@ -188,7 +219,7 @@ mod tests {
     /// Whole wire path (hex + legacy `CommitmentTree` framing + root hash) against the
     /// one authority that cannot disagree with itself. Empty tree specifically = what
     /// both sides report before a pool's first output, so block one starts here
-    #[cfg(feature = "librustzcash")]
+    #[cfg(any(feature = "librustzcash", feature = "zingolib"))]
     #[test]
     fn a_serialized_tree_round_trips_to_its_own_root() {
         use zcash_primitives::merkle_tree::write_commitment_tree;
