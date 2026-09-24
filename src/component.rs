@@ -31,20 +31,12 @@ impl ComponentCategory {
 pub struct Validator<B: ValidatorConfig> {
     pub backend: B,
     pub opts: ComponentOpts,
-    pub tunings: Vec<B::Tuning>,
 }
-
-/// Tuning token for a knobless backend. Uninhabited, so
-/// [`ComponentBuilder::tuning`] stays uniform yet uncallable here — compile error,
-/// not runtime no-op
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NoTuning {}
 
 /// Network fixture an indexer runs against = which `zainod.toml` gets rendered.
 ///
-/// - Orthogonal to backend [`tuning`](ComponentBuilder::tuning), which picks knobs inside it
-/// - Data-free variants; chain data lives in `ComponentOpts::restore`/`shared_state`,
-///   so which network an archive holds is recorded once and cannot self-contradict
+/// - Data-free variants; chain data lives in `ComponentOpts::restore`, so which network an
+///   archive holds is recorded once and cannot self-contradict
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum IndexerMode {
     #[default]
@@ -57,7 +49,6 @@ pub enum IndexerMode {
 pub struct Indexer<B: IndexerConfig> {
     pub backend: B,
     pub opts: ComponentOpts,
-    pub tunings: Vec<B::Tuning>,
     pub mode: IndexerMode,
 }
 
@@ -65,7 +56,6 @@ pub struct Indexer<B: IndexerConfig> {
 pub struct Wallet<B: WalletConfig> {
     pub backend: B,
     pub opts: ComponentOpts,
-    pub tunings: Vec<B::Tuning>,
 }
 
 /// Config shared by every component variant.
@@ -90,7 +80,6 @@ pub struct ComponentOpts {
     pub peers: Vec<String>,
     pub funding_streams: Option<crate::regtest::FundingStreams>,
     pub lockbox_disbursements: Option<Vec<crate::regtest::LockboxDisbursement>>,
-    pub shared_state: Option<SharedState>,
     pub coinbase_pool: Option<Pool>,
     pub restore: Option<RestoreSource>,
     pub disk: Option<Disk>,
@@ -116,14 +105,6 @@ impl RestoreSource {
             RestoreSource::Blank => None,
         }
     }
-}
-
-/// One side of a shared zebra-state DB (validator + colocated zaino). Mount path
-/// only — the PVC arrives separately as a `Mount::shared` from one
-/// [`crate::SharedVolume`]
-#[derive(Debug, Clone)]
-pub struct SharedState {
-    pub mount_path: String,
 }
 
 /// CPU, in millicores
@@ -325,19 +306,19 @@ impl From<crate::qos::Resources> for Resources {
 
 impl<B: ValidatorConfig> Validator<B> {
     pub fn custom(backend: B, opts: ComponentOpts) -> Self {
-        Self { backend, opts, tunings: Vec::new() }
+        Self { backend, opts }
     }
 }
 
 impl<B: IndexerConfig> Indexer<B> {
     pub fn custom(backend: B, opts: ComponentOpts) -> Self {
-        Self { backend, opts, tunings: Vec::new(), mode: IndexerMode::None }
+        Self { backend, opts, mode: IndexerMode::None }
     }
 }
 
 impl<B: WalletConfig> Wallet<B> {
     pub fn custom(backend: B, opts: ComponentOpts) -> Self {
-        Self { backend, opts, tunings: Vec::new() }
+        Self { backend, opts }
     }
 
     /// Default opts, for an in-process wallet needing no pod config
@@ -345,7 +326,6 @@ impl<B: WalletConfig> Wallet<B> {
         Self {
             backend,
             opts: ComponentOpts { name: Some("wallet".to_string()), ..ComponentOpts::default() },
-            tunings: Vec::new(),
         }
     }
 }
@@ -360,37 +340,13 @@ pub trait ComponentBuilder: Sized {
     #[doc(hidden)]
     fn component_opts_mut(&mut self) -> &mut ComponentOpts;
 
-    /// Backend tuning-token type. `NoTuning` for knobless backends, making
-    /// [`tuning`](Self::tuning) uncallable
-    type Tuning;
-
-    /// Outside the stable surface — call [`tuning`](Self::tuning)
-    #[doc(hidden)]
-    fn push_tuning(&mut self, tuning: Self::Tuning);
-
-    /// Apply a backend tuning token (`ZainoTuning::State`, …), read at build time.
-    /// Repeat to stack knobs; uncallable where `Tuning` is [`NoTuning`]
-    fn tuning(mut self, tuning: Self::Tuning) -> Self {
-        self.push_tuning(tuning);
-        self
-    }
-
     fn named(mut self, name: impl Into<String>) -> Self {
         self.component_opts_mut().name = Some(name.into());
         self
     }
-    /// Mount a file, dir, archive or shared volume at startup. Takes any
-    /// `Into<Mount>`, incl. a `&`[`SharedVolume`](crate::SharedVolume) carrying its
-    /// own canonical path. A shared mount doubles as this component's shared-state
-    /// dir, so same volume + same path = one store (zebrad's DB read by zaino's
-    /// `ZainoTuning::State`)
+    /// Mount a file, dir or archive at startup
     fn mount(mut self, m: impl Into<Mount>) -> Self {
-        let m = m.into();
-        if matches!(m.kind, crate::mount::MountKind::Shared) {
-            self.component_opts_mut().shared_state =
-                Some(SharedState { mount_path: m.destination.to_string_lossy().into_owned() });
-        }
-        self.component_opts_mut().mounts.push(m);
+        self.component_opts_mut().mounts.push(m.into());
         self
     }
     fn resources(mut self, cpu: Cpu, memory: Mem) -> Self {
@@ -448,12 +404,8 @@ pub trait ComponentBuilder: Sized {
 }
 
 impl<B: ValidatorConfig> ComponentBuilder for Validator<B> {
-    type Tuning = B::Tuning;
     fn component_opts_mut(&mut self) -> &mut ComponentOpts {
         &mut self.opts
-    }
-    fn push_tuning(&mut self, tuning: B::Tuning) {
-        self.tunings.push(tuning);
     }
 }
 
@@ -469,22 +421,14 @@ impl<B: ValidatorConfig> crate::regtest::Regtest for Validator<B> {
 }
 
 impl<B: IndexerConfig> ComponentBuilder for Indexer<B> {
-    type Tuning = B::Tuning;
     fn component_opts_mut(&mut self) -> &mut ComponentOpts {
         &mut self.opts
-    }
-    fn push_tuning(&mut self, tuning: B::Tuning) {
-        self.tunings.push(tuning);
     }
 }
 
 impl<B: WalletConfig> ComponentBuilder for Wallet<B> {
-    type Tuning = B::Tuning;
     fn component_opts_mut(&mut self) -> &mut ComponentOpts {
         &mut self.opts
-    }
-    fn push_tuning(&mut self, tuning: B::Tuning) {
-        self.tunings.push(tuning);
     }
 }
 
@@ -503,12 +447,8 @@ impl ComponentOpts {
 }
 
 impl ComponentBuilder for ComponentOptsBuilder {
-    type Tuning = NoTuning;
     fn component_opts_mut(&mut self) -> &mut ComponentOpts {
         &mut self.opts
-    }
-    fn push_tuning(&mut self, tuning: NoTuning) {
-        match tuning {}
     }
 }
 
@@ -599,10 +539,7 @@ mod tests {
     /// so a `Local` source's absolute Dockerfile path differs between them
     #[test]
     fn zainod_dev_id_is_path_independent() {
-        let features = vec![
-            "no_tls_use_unencrypted_traffic".to_string(),
-            "allow_unencrypted_public_json_rpc_bind".to_string(),
-        ];
+        let features = vec!["prometheus".to_string()];
         let id_for = |dockerfile: &str| {
             let src = DevSource::Local {
                 dockerfile: std::path::PathBuf::from(dockerfile),

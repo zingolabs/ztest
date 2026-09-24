@@ -63,7 +63,6 @@ pub struct ZcashdBackend;
 
 impl ValidatorConfig for ZcashdBackend {
     type Handle = ZcashdValidator;
-    type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, plumbing: HandleInner) -> ZcashdValidator {
         ZcashdValidator { plumbing }

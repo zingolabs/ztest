@@ -77,10 +77,6 @@ pub struct AccountSpec<'a> {
 pub trait WalletConfig: Send + Sync + std::fmt::Debug + 'static {
     type Handle: WalletBackend + Clone;
 
-    /// Backend tuning tokens (see [`ComponentBuilder::tuning`](crate::ComponentBuilder::tuning));
-    /// [`NoTuning`](crate::component::NoTuning) when there are no knobs
-    type Tuning: Clone + std::fmt::Debug + Send + Sync + 'static;
-
     /// Build the runtime handle. `plumbing` usually ignored (no pod, handle owns its state)
     fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
 }

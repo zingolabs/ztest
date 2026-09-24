@@ -39,10 +39,6 @@ pub struct ChainConfig {
 pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     type Handle: ValidatorBackend + Clone;
 
-    /// Backend tuning tokens ([`ComponentBuilder::tuning`](crate::ComponentBuilder::tuning));
-    /// [`NoTuning`](crate::component::NoTuning) where there are no knobs
-    type Tuning: Clone + std::fmt::Debug + Send + Sync + 'static;
-
     /// Build the runtime handle once the env has assigned `plumbing`
     fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
 

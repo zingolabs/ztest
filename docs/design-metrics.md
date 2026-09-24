@@ -76,16 +76,16 @@ once and every reader inherits it.
 
 ```rust
 mod family {
-    pub const ORCHARD_ACTIONS: Counter = counter("zaino_sync_fetched_orchard_actions_total", Dimension::Count);
-    pub const FETCHED_HEIGHT:  Gauge   = gauge("zaino_sync_fetched_height", Dimension::Count);
-    pub const BLOCK_FETCH:     Hist    = hist("zaino_sync_block_fetch_seconds", Dimension::Seconds);
+    pub const ORCHARD_ACTIONS: Counter = counter("zaino_fetch_orchard_actions_total", Dimension::Count);
+    pub const FETCH_HEIGHT:    Gauge   = gauge("zaino_fetch_height", Dimension::Count);
+    pub const FIRST_MESSAGE:   Hist    = hist("zaino_rpc_first_message_seconds", Dimension::Seconds);
 }
 
 const ROWS: &[Row] = &[
-    row("orchard",   family::ORCHARD_ACTIONS.rate(),  Facet::Shielded),
-    row("blocks",    family::FETCHED_HEIGHT.slope(),  Facet::Blocks),
-    row("fetched",   family::FETCHED_HEIGHT.level(),  Facet::Progress),
-    row("fetch p99", family::BLOCK_FETCH.p(Phi::P99), Facet::WritePath),
+    row("orchard",   family::ORCHARD_ACTIONS.rate(),    Facet::Shielded),
+    row("blocks",    family::FETCH_HEIGHT.slope(),      Facet::Blocks),
+    row("fetched",   family::FETCH_HEIGHT.level(),      Facet::Progress),
+    row("gRPC p99",  family::FIRST_MESSAGE.p(Phi::P99), Facet::WritePath),
 ];
 ```
 

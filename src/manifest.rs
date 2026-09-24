@@ -9,15 +9,10 @@ use crate::component::{ComponentCategory, Resources};
 use crate::mounts::ResolvedMount;
 use crate::naming::RunCoords;
 
-/// What "this pod is up" means to kubelet.
-///
-/// - `Tcp` = serving port open (component serves as soon as it binds)
-/// - `Http` = process-liveness endpoint, for a component whose serving port opens long
-///   after the process does (zaino: minutes of DB open before the gRPC bind)
+/// What "this pod is up" means to kubelet: serving port open
 #[derive(Debug, Clone, Copy)]
 pub enum ReadyProbe {
     Tcp(u16),
-    Http { port: u16, path: &'static str },
 }
 
 /// Consecutive probe failures before kubelet marks the pod NotReady.
@@ -31,7 +26,6 @@ impl ReadyProbe {
     fn render(self) -> Value {
         let mut probe = match self {
             ReadyProbe::Tcp(port) => json!({ "tcpSocket": { "port": port } }),
-            ReadyProbe::Http { port, path } => json!({ "httpGet": { "port": port, "path": path } }),
         };
         probe["initialDelaySeconds"] = json!(1);
         probe["periodSeconds"] = json!(2);
@@ -293,18 +287,11 @@ mod tests {
     }
 
     #[test]
-    fn tcp_and_http_probes_render_their_own_handler_and_nothing_else() {
+    fn the_tcp_probe_renders_its_handler_and_cadence() {
         let tcp = container(&base_spec().render(&coords(), "t", &[]).unwrap());
         assert_eq!(tcp["readinessProbe"]["tcpSocket"]["port"], 28232);
-        assert!(tcp["readinessProbe"]["httpGet"].is_null());
-
-        let spec =
-            PodSpec { ready: ReadyProbe::Http { port: 9998, path: "/livez" }, ..base_spec() };
-        let http = container(&spec.render(&coords(), "t", &[]).unwrap());
-        assert_eq!(http["readinessProbe"]["httpGet"]["port"], 9998);
-        assert_eq!(http["readinessProbe"]["httpGet"]["path"], "/livez");
-        assert!(http["readinessProbe"]["tcpSocket"].is_null());
-        assert_eq!(http["readinessProbe"]["periodSeconds"], 2);
+        assert_eq!(tcp["readinessProbe"]["periodSeconds"], 2);
+        assert_eq!(tcp["readinessProbe"]["failureThreshold"], READY_FAILURE_THRESHOLD);
     }
 
     /// Prometheus pod-role SD reads pod labels only; owner on the namespace alone never

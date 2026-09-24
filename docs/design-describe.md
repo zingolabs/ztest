@@ -162,7 +162,7 @@ zaino builds its chain index over the pinned Blossom mainnet snapshot; zebrad is
 ├── tags mainnet, zaino, index, blossom
 ├── image zainod BUILD
 │   ├── dockerfile <root>/Dockerfile ctx <root>
-│   └── features no_tls_with_prometheus, allow_unencrypted_public_json_rpc_bind, profile
+│   └── features prometheus, profile
 └── seed zebra-v6.2.3-mainnet-659600.tar.zst 1106bc19 13.05 GiB
     └── pvc ztest-seeds/seed-1106bc19-<driver> 48Gi
 ```
@@ -194,7 +194,7 @@ Roots = the selected tests; shared nodes expand once, repeat as `(*)`.
 the_pub_testnet_ironwood_boundary
 ├── qos testnet · reserve 8c / 8 GiB · hard cap 6h
 ├── image dev:zainod BUILD
-│   └── features no_tls_with_prometheus
+│   └── features prometheus
 └── seed IRONWOOD_TESTNET 3545da25 8.15 GiB
     ├── archive zebra-v6.2.3-testnet-4140000.tar.zst
     └── pvc ztest-seeds/seed-3545da25-<driver> 48Gi

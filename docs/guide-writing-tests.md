@@ -95,13 +95,12 @@ sites collapse to one build, distinct ones cache independently. Re-runs hit cach
 pub struct Mount { pub source: MountSource, pub destination: PathBuf, pub kind: MountKind }
 
 pub enum MountSource {
-    ConfigAbs(PathBuf),          // mount_config!
-    ConfigInline(String),        // generated config bytes (regtest_conf)
-    Seed(ChainSnapshot),         // mount_file! and mount_archive!
-    Empty,                       // Mount::scratch
-    SharedClaim { claim: String },// TestEnv::shared_volume
+    ConfigAbs(PathBuf),    // mount_config!
+    ConfigInline(String),  // generated config bytes (regtest_conf)
+    Seed(Artifact),        // mount_file! and mount_archive!
+    Empty,                 // Mount::scratch
 }
-pub enum MountKind { Config, File, DirArchive, Scratch, Shared }
+pub enum MountKind { Config, File, DirArchive, Scratch }
 ```
 
 | Macro                      | Materialized as                                        | Templated | Compile-time rules                  |

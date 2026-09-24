@@ -123,9 +123,6 @@ pub async fn resolve_all(
                     resolve_scratch(&volume_name, &m.destination)
                 }
             },
-            (MountKind::Shared, MountSource::SharedClaim { claim }) => {
-                resolve_shared(&volume_name, claim, &m.destination)
-            }
             // Macros enforce (kind, source) pairings at compile time → a mismatch here is
             // a programmer error in this crate
             (k, s) => unreachable!("mount kind/source mismatch: {k:?} / {s:?}"),
@@ -386,77 +383,6 @@ fn resolve_scratch(volume_name: &str, destination: &Path) -> ResolvedMount {
             "mountPath": destination,
         }),
     }
-}
-
-/// Pre-provisioned shared PVC, referenced by `claimName`. No side effects — the claim is
-/// minted once per env in [`create_shared_pvc`] and both pods name it. Read-write (the
-/// writer owns the DB; the reader opens it as a RocksDB secondary)
-fn resolve_shared(volume_name: &str, claim: &str, destination: &Path) -> ResolvedMount {
-    ResolvedMount {
-        volume: json!({
-            "name": volume_name,
-            "persistentVolumeClaim": { "claimName": claim }
-        }),
-        volume_mount: json!({
-            "name": volume_name,
-            "mountPath": destination,
-        }),
-    }
-}
-
-/// Seeded shared volume: `claim` cloned from `artifact`'s seed snapshot (`resolve_archive`'s
-/// clone, named for sharing instead of for one pod).
-///
-/// - Seed's CSI class, not the default one (a clone must stay on its source's driver)
-/// - TEMPORARY with `ChainVolume` (direct-only zaino topology)
-pub async fn create_seeded_shared_pvc(
-    client: &Client,
-    sentinel: &Sentinel,
-    claim: &str,
-    artifact: crate::Artifact,
-    disk: Disk,
-) -> Result<SeedBinding, EnvError> {
-    let seed = materialize::await_seed(client, artifact).await?;
-    let binding = seeds::bind_seed(client, sentinel, &seed, claim).await?;
-    create_pvc(
-        client,
-        sentinel,
-        claim,
-        Some(&binding.binding_snapshot),
-        &volume_size(Some(disk), &seed.restore_size),
-    )
-    .await?;
-    Ok(binding)
-}
-
-/// Called once per shared volume during `TestEnv::build`, before any pod exists.
-///
-/// `storageClassName` unset → the cluster's default class provisions it (on kind the
-/// node-local RWO `standard`, which is what lets two same-node pods share it);
-/// `ZAINO_SHARED_STORAGECLASS` overrides
-pub async fn create_shared_pvc(
-    client: &Client,
-    sentinel: &Sentinel,
-    claim: &str,
-    disk: Disk,
-) -> Result<(), EnvError> {
-    let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &sentinel.namespace);
-    let mut spec = json!({
-        "accessModes": ["ReadWriteOnce"],
-        "resources": { "requests": { "storage": disk.to_quantity() } },
-    });
-    if let Ok(sc) = std::env::var("ZAINO_SHARED_STORAGECLASS") {
-        spec["storageClassName"] = json!(sc);
-    }
-    let pvc_json = json!({
-        "apiVersion": "v1",
-        "kind": "PersistentVolumeClaim",
-        "metadata": { "name": claim },
-        "spec": spec,
-    });
-    let pvc: PersistentVolumeClaim = serde_json::from_value(pvc_json).expect("static manifest");
-    api.create(&PostParams::default(), &pvc).await.map_err(env_err)?;
-    Ok(())
 }
 
 fn dir_volume_from_pvc(volume_name: &str, pvc_name: &str, destination: &Path) -> ResolvedMount {

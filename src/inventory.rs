@@ -32,17 +32,13 @@ pub enum ImageSpec {
 }
 
 impl ImageSpec {
-    /// Config generators gate the metrics-listener stanza on this (rendering one
-    /// against a binary lacking the feature = hard startup rejection). `Published`
-    /// cannot opt a feature in → always `false`
+    /// Config generators + port declarations gate the metrics listener on this (no
+    /// `prometheus` feature → nothing binds it). `Published` cannot opt a feature in → `false`
     pub fn metrics_enabled(&self) -> bool {
-        matches!(
-            self,
-            ImageSpec::Dev { features, .. }
-                if features
-                    .iter()
-                    .any(|f| f == "prometheus" || f == "no_tls_with_prometheus")
-        )
+        let ImageSpec::Dev { features, .. } = self else {
+            return false;
+        };
+        features.iter().any(|f| f == "prometheus")
     }
 }
 

@@ -233,22 +233,15 @@ pub fn dev(input: TokenStream) -> TokenStream {
 
     // Derive the kind label from the variant name itself — lowercased.
     // `Indexer::Zainod` → `"zainod"`, `Validator::Zebrad` → `"zebrad"`, etc.
-    // The lowercased form is used three ways:
+    // The lowercased form is used two ways:
     //   - as the inventory `repo:` field (becomes the local image
     //     repo name in the resolved `<repo>:dev-<suffix>` tag),
-    //   - as the constructor ident (`Indexer::zainod_dev(...)`),
-    //   - keyed lookup of default cargo features below.
-    let (kind_str, default_features): (String, Vec<&'static str>) =
+    //   - as the constructor ident (`Indexer::zainod_dev(...)`).
+    let kind_str: String =
         match (variant.category.to_string().as_str(), variant.variant.to_string().as_str()) {
-            ("Validator", "Zebrad") => ("zebrad".to_string(), vec![]),
-            ("Validator", "Zcashd") => ("zcashd".to_string(), vec![]),
-            // `allow_unencrypted_public_json_rpc_bind`: pod-per-test needs zaino's
-            // JSON-RPC on 0.0.0.0 for cross-pod access. These features are the single
-            // origin — threaded into both the inventory decl and the constructor below.
-            ("Indexer", "Zainod") => (
-                "zainod".to_string(),
-                vec!["no_tls_use_unencrypted_traffic", "allow_unencrypted_public_json_rpc_bind"],
-            ),
+            ("Validator", "Zebrad") => "zebrad".to_string(),
+            ("Validator", "Zcashd") => "zcashd".to_string(),
+            ("Indexer", "Zainod") => "zainod".to_string(),
             (cat, var) => {
                 return syn::Error::new(
                     variant.span(),
@@ -263,11 +256,8 @@ pub fn dev(input: TokenStream) -> TokenStream {
             }
         };
 
-    // Feature list: explicit override, else the per-kind default.
-    let feat_lits: Vec<String> = match features {
-        Some(fs) => fs.iter().map(LitStr::value).collect(),
-        None => default_features.into_iter().map(String::from).collect(),
-    };
+    let feat_lits: Vec<String> =
+        features.map(|fs| fs.iter().map(LitStr::value).collect()).unwrap_or_default();
     let repo_lit = kind_str.clone();
     // The release this build corresponds to (validators render config / derive
     // a ceiling from it); `"dev"` when the caller doesn't say.
@@ -402,7 +392,7 @@ struct DevArgs {
     /// constructor for backends (zebra) that render config / derive a ceiling
     /// from a version. Defaults to `"dev"`.
     version: Option<LitStr>,
-    /// Cargo features override; `None` uses the per-kind default.
+    /// Cargo features; `None` = none.
     features: Option<Vec<LitStr>>,
     /// Singular `rust_version = "x"`: pins the built + selected toolchain.
     rust_version: Option<LitStr>,

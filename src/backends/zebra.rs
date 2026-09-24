@@ -57,7 +57,6 @@ pub struct ZebraBackend;
 
 impl ValidatorConfig for ZebraBackend {
     type Handle = ZebraValidator;
-    type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, plumbing: HandleInner) -> ZebraValidator {
         ZebraValidator { plumbing }
@@ -103,23 +102,6 @@ impl ValidatorConfig for ZebraBackend {
         let default_streams = crate::regtest::regtest_test_post_nu6_funding_streams();
         let funding_streams = opts.funding_streams.as_ref().unwrap_or(&default_streams);
 
-        // Persistent state, `shared_state` winning if both are set:
-        //  - `shared_state` = DB shared with a colocated zaino StateService, + indexer gRPC
-        //  - `restore` = archived chain at `ZEBRAD_REGTEST_CACHE_DIR`, no StateService/gRPC
-        let persistent = if let Some(s) = opts.shared_state.as_ref() {
-            Some(crate::regtest_conf::ZebradPersistentState {
-                cache_dir: &s.mount_path,
-                indexer_listen_port: Some(crate::ports::ZEBRAD_INDEXER),
-            })
-        } else if opts.restore.is_some() {
-            Some(crate::regtest_conf::ZebradPersistentState {
-                cache_dir: ZEBRAD_REGTEST_CACHE_DIR,
-                indexer_listen_port: None,
-            })
-        } else {
-            None
-        };
-
         let toml = crate::regtest_conf::zebrad_conf(
             version,
             activation,
@@ -128,35 +110,29 @@ impl ValidatorConfig for ZebraBackend {
             peers,
             lockbox,
             Some(funding_streams),
-            persistent,
+            opts.restore.is_some().then_some(ZEBRAD_REGTEST_CACHE_DIR),
             miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
             opts.image.metrics_enabled().then(|| self.metrics_port()).flatten(),
         );
         opts.mounts.push(crate::regtest::config_mount_inline(toml, CONTAINER_CONFIG_PATH));
 
-        // Volume behind `cache_dir`, only absent `shared_state` (that path's PVC
-        // is already mounted by the caller's `.mount(&vol)`).
-        if opts.shared_state.is_none() {
-            match &opts.restore {
-                Some(crate::component::RestoreSource::Archive(archive)) => {
-                    opts.mounts.push(crate::mount::Mount::archive(
-                        archive.artifact,
-                        ZEBRAD_REGTEST_CACHE_DIR,
-                    ));
-                }
-                Some(crate::component::RestoreSource::Blank) => {
-                    opts.mounts.push(crate::regtest::scratch_mount(ZEBRAD_REGTEST_CACHE_DIR));
-                }
-                Some(crate::component::RestoreSource::Follow(archive)) => {
-                    return Err(EnvError::Config {
-                        reason: format!(
-                            "{} is a regtest cache; only a public chain has a network to follow",
-                            archive.artifact.name,
-                        ),
-                    });
-                }
-                None => {}
+        match &opts.restore {
+            Some(crate::component::RestoreSource::Archive(archive)) => {
+                opts.mounts
+                    .push(crate::mount::Mount::archive(archive.artifact, ZEBRAD_REGTEST_CACHE_DIR));
             }
+            Some(crate::component::RestoreSource::Blank) => {
+                opts.mounts.push(crate::regtest::scratch_mount(ZEBRAD_REGTEST_CACHE_DIR));
+            }
+            Some(crate::component::RestoreSource::Follow(archive)) => {
+                return Err(EnvError::Config {
+                    reason: format!(
+                        "{} is a regtest cache; only a public chain has a network to follow",
+                        archive.artifact.name,
+                    ),
+                });
+            }
+            None => {}
         }
         Ok(opts)
     }
@@ -254,11 +230,6 @@ impl ValidatorBackend for ZebraValidator {
                     &[("rpc", rpc_port(opts)), ("p2p", crate::ports::ZEBRAD_P2P)],
                     ZebraBackend.metrics_port(),
                 );
-                // Indexer gRPC a colocated zaino `Direct` dials (shared state DB,
-                // or restored testnet chain) needs its port exposed too.
-                if serves_indexer_grpc(opts) {
-                    base.push(("indexer", crate::ports::ZEBRAD_INDEXER));
-                }
                 if serves_health(opts) {
                     base.push(("health", crate::ports::ZEBRAD_HEALTH));
                 }
@@ -269,12 +240,8 @@ impl ValidatorBackend for ZebraValidator {
             args: opts.args.clone(),
             resources: opts.resources,
             env: opts.env.clone(),
-            // Shared zebra-state DB → zebrad's uid must equal the zaino reader's,
-            // or the mode-0600 `version` file is unreadable by the StateService.
-            // fsGroup can't fix it: hostPath/local-path ignore it, and the zainod
-            // image refuses to run as root.
-            fs_group: opts.shared_state.as_ref().map(|_| 1000),
-            run_as_user: opts.shared_state.as_ref().map(|_| 1000),
+            fs_group: None,
+            run_as_user: None,
             supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
             guaranteed: Some(crate::qos::pod::VALIDATOR.into()),
@@ -493,12 +460,6 @@ fn rpc_port(opts: &crate::component::ComponentOpts) -> u16 {
     }
 }
 
-/// zebra's `rpc.indexer_listen_addr`, without which a colocated zaino `Direct`
-/// cannot construct. Two topologies: shared state DB (regtest), public-network restore
-fn serves_indexer_grpc(opts: &crate::component::ComponentOpts) -> bool {
-    opts.shared_state.is_some() || public_restore_network(opts).is_some()
-}
-
 /// Only a following node renders `[health]`, so only it serves the endpoints
 fn serves_health(opts: &crate::component::ComponentOpts) -> bool {
     matches!(opts.restore, Some(crate::component::RestoreSource::Follow(_)))
@@ -535,16 +496,29 @@ fn restore_public(
 }
 
 impl crate::component::Validator<ZebraBackend> {
-    /// Boot off `volume`'s snapshot, then sync onward with the network (tip moves past the pin).
+    /// Boot off `snapshot` → sync onward with the network (tip moves past the pin)
     ///
-    /// - Peers = zebra's own DNS seeders; naming any here would replace discovery with that list
-    /// - TEMPORARY: shared volume only while zaino ingests via `direct` (fetch migration ~2026-10)
-    pub fn follow(mut self, volume: &crate::ChainVolume) -> Self {
-        let snapshot = volume.snapshot();
+    /// - Private CoW clone of the seed → size the growth past the pin with `.disk(..)`
+    /// - Peers = zebra's own DNS seeders (naming any would replace discovery with that list)
+    ///
+    /// # Panics
+    ///
+    /// `snapshot` is a regtest cache (no network to follow)
+    pub fn follow(mut self, snapshot: crate::ChainSnapshot) -> Self {
+        assert!(
+            snapshot.network.is_public(),
+            "follow needs a public network; {} is a regtest cache",
+            snapshot.artifact.name,
+        );
         self.opts.restore = Some(crate::component::RestoreSource::Follow(snapshot));
-        let toml =
-            public_toml(self.opts(), snapshot.network, ChainMotion::Following, volume.mount_path());
-        boot_public(self, toml).mount(volume)
+        let toml = public_toml(
+            self.opts(),
+            snapshot.network,
+            ChainMotion::Following,
+            ZEBRAD_PUBLIC_CACHE_DIR,
+        );
+        boot_public(self, toml)
+            .mount(crate::regtest::archive_mount(snapshot.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
     }
 }
 
@@ -562,9 +536,6 @@ fn public_toml(
         version,
         ZEBRAD_PUBLIC_RPC_PORT,
         cache_dir,
-        // Always on for a public restore (colocated zaino `Direct` needs an
-        // address to dial; `serves_indexer_grpc` exposes the port to match).
-        Some(crate::ports::ZEBRAD_INDEXER),
         // Unconditional: zfnd's published images ship the exporter compiled in, and `pod_spec`
         // declares the port either way (`metrics_enabled` gates a *build* feature, which is a
         // zaino concern). Gating here left a declared port nothing listened on.
@@ -742,28 +713,26 @@ sync_estimated_network_tip_height 3506187
         assert_eq!(heights.height, family::VERIFIED_HEIGHT);
     }
 
-    /// `Direct` refuses to construct without a gRPC address to dial → unserved
-    /// on testnet = state indexer can never start
+    /// Private clone of the seed under the config's `cache_dir`, config dials the network, pod
+    /// serves the public RPC + health and can read the seed's group-owned entries
     #[test]
-    fn the_indexer_grpc_is_served_wherever_a_direct_backend_could_dial_it() {
-        assert!(serves_indexer_grpc(&opts_restoring(crate::Network::Testnet)));
-        assert!(!serves_indexer_grpc(&ComponentOpts::default()));
-    }
-
-    /// Chain lives on the shared volume (no private clone), config dials the network, and the
-    /// pod still serves the public RPC + indexer gRPC a colocated zaino needs
-    #[test]
-    fn a_following_validator_boots_off_the_shared_chain_and_joins_the_network() {
-        let mut env = crate::TestEnv::builder();
-        let vol = env.chain_volume(archive(crate::Network::Mainnet), crate::Disk::gib(400));
-        let opts = crate::component::Validator::zebrad("6.2.3").follow(&vol).opts;
+    fn a_following_validator_boots_off_a_private_clone_and_joins_the_network() {
+        let snapshot = archive(crate::Network::Mainnet);
+        let opts = crate::component::Validator::zebrad("6.2.3").follow(snapshot).opts;
 
         assert!(matches!(opts.restore, Some(RestoreSource::Follow(_))));
-        assert_eq!(
-            opts.shared_state.as_ref().map(|s| s.mount_path.as_str()),
-            Some(vol.mount_path())
-        );
-        assert!(!opts.mounts.iter().any(|m| matches!(m.kind, crate::MountKind::DirArchive)));
+        let clones: Vec<_> = opts
+            .mounts
+            .iter()
+            .filter(|m| matches!(m.kind, crate::MountKind::DirArchive))
+            .map(|m| {
+                (
+                    m.destination.clone(),
+                    matches!(m.source, crate::MountSource::Seed(a) if a == snapshot.artifact),
+                )
+            })
+            .collect();
+        assert_eq!(clones, vec![(ZEBRAD_PUBLIC_CACHE_DIR.into(), true)]);
         let toml = opts
             .mounts
             .iter()
@@ -772,10 +741,10 @@ sync_estimated_network_tip_height 3506187
                 _ => None,
             })
             .expect("rendered zebrad.toml");
-        assert!(toml.contains(&format!("cache_dir = \"{}\"", vol.mount_path())));
+        assert!(toml.contains(&format!("cache_dir = \"{ZEBRAD_PUBLIC_CACHE_DIR}\"")));
         assert!(!toml.contains("debug_force_finished_sync"));
         assert_eq!(rpc_port(&opts), ZEBRAD_PUBLIC_RPC_PORT);
-        assert!(serves_indexer_grpc(&opts));
+        assert!(serves_health(&opts));
         assert_eq!(crate::backends::seed_groups(&opts), vec![crate::materialize::SEED_GID]);
     }
 }

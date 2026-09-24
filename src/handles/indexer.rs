@@ -32,11 +32,6 @@ pub use zcash_protocol::value::ZatBalance;
 pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
     type Handle: IndexerBackend + Clone;
 
-    /// Tuning tokens for [`ComponentBuilder::tuning`](crate::ComponentBuilder::tuning).
-    /// Knobless backends use [`NoTuning`](crate::component::NoTuning), uninhabited so
-    /// `.tuning(..)` is uncallable at compile time
-    type Tuning: Clone + std::fmt::Debug + Send + Sync + 'static;
-
     /// Build the runtime handle once the env has assigned `plumbing`
     fn to_handle(&self, plumbing: HandleInner) -> Self::Handle;
 
@@ -46,16 +41,17 @@ pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
         None
     }
 
-    /// Render the config at build time, once the validator host resolves. Skipped when
+    /// Render the config at build time, once validator hosts resolve. Skipped when
     /// `mode` is [`IndexerMode::None`](crate::component::IndexerMode)
+    ///
+    /// - `validators` = env's validator pod names, registration order (first = block source)
     fn materialize_opts(
         &self,
         opts: crate::component::ComponentOpts,
-        tunings: &[Self::Tuning],
         mode: &crate::component::IndexerMode,
-        validator_host: Option<&str>,
+        validators: &[String],
     ) -> Result<crate::component::ComponentOpts, EnvError> {
-        let _ = (tunings, mode, validator_host);
+        let _ = (mode, validators);
         Ok(opts)
     }
 }

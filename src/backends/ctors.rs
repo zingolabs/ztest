@@ -13,11 +13,7 @@ use crate::component::{ComponentOpts, Indexer, IndexerMode, Validator};
 
 impl Validator<ZebraBackend> {
     pub fn zebrad(version: impl Into<String>) -> Self {
-        Self {
-            backend: ZebraBackend,
-            opts: opts_for(&version.into(), "zebrad"),
-            tunings: Vec::new(),
-        }
+        Self { backend: ZebraBackend, opts: opts_for(&version.into(), "zebrad") }
     }
     /// zebrad from a local Dockerfile or pinned git rev (see `dev!`). `version`
     /// must be real semver, never the `"dev"` sentinel — the regtest config and
@@ -28,21 +24,13 @@ impl Validator<ZebraBackend> {
         version: impl Into<String>,
         features: Vec<String>,
     ) -> Self {
-        Self {
-            backend: ZebraBackend,
-            opts: opts_dev(source, version.into(), features, "zebrad"),
-            tunings: Vec::new(),
-        }
+        Self { backend: ZebraBackend, opts: opts_dev(source, version.into(), features, "zebrad") }
     }
 }
 
 impl Validator<ZcashdBackend> {
     pub fn zcashd(version: impl Into<String>) -> Self {
-        Self {
-            backend: ZcashdBackend,
-            opts: opts_for(&version.into(), "zcashd"),
-            tunings: Vec::new(),
-        }
+        Self { backend: ZcashdBackend, opts: opts_for(&version.into(), "zcashd") }
     }
     #[doc(hidden)]
     pub fn zcashd_dev(
@@ -50,20 +38,15 @@ impl Validator<ZcashdBackend> {
         version: impl Into<String>,
         features: Vec<String>,
     ) -> Self {
-        Self {
-            backend: ZcashdBackend,
-            opts: opts_dev(source, version.into(), features, "zcashd"),
-            tunings: Vec::new(),
-        }
+        Self { backend: ZcashdBackend, opts: opts_dev(source, version.into(), features, "zcashd") }
     }
 }
 
 impl Indexer<ZainoBackend> {
     pub fn zaino(version: impl Into<String>) -> Self {
         Self {
-            backend: ZainoBackend,
+            backend: ZainoBackend::default(),
             opts: opts_for(&version.into(), "zainod"),
-            tunings: Vec::new(),
             mode: IndexerMode::None,
         }
     }
@@ -75,9 +58,8 @@ impl Indexer<ZainoBackend> {
         features: Vec<String>,
     ) -> Self {
         Self {
-            backend: ZainoBackend,
+            backend: ZainoBackend::default(),
             opts: opts_dev(source, version.into(), features, "zainod"),
-            tunings: Vec::new(),
             mode: IndexerMode::None,
         }
     }
@@ -88,7 +70,6 @@ impl Indexer<LightwalletdBackend> {
         Self {
             backend: LightwalletdBackend,
             opts: opts_for(&version.into(), "lightwalletd"),
-            tunings: Vec::new(),
             mode: IndexerMode::None,
         }
     }

@@ -75,7 +75,7 @@ validator serving a frozen snapshot beside an indexer building one — so the ta
 Tier ceiling = a default, not an allotment. A topology that doesn't fit declares its own:
 
 ```rust
-#[ztest::qos::integration(footprint = "3c/6Gi")]   // e.g. a 3-pod state/fetch comparison
+#[ztest::qos::integration(footprint = "3c/6Gi")]   // e.g. a 3-pod two-indexer comparison
 #[ztest::qos::sync(footprint = "15c/29Gi")]        // required: sync has no default
 #[ztest::sync_test(name = "…", subject = indexer, qos = sync, footprint = "15c/29Gi")]
 ```

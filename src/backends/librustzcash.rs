@@ -74,7 +74,6 @@ pub struct LrzBackend;
 
 impl WalletConfig for LrzBackend {
     type Handle = LrzWallet;
-    type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, _plumbing: HandleInner) -> LrzWallet {
         // In-process: the handle owns its own state, no plumbing

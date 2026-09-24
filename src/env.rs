@@ -16,7 +16,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use crate::EnvError;
 use crate::cluster;
-use crate::component::{ComponentOpts, Disk, Indexer, Validator, Wallet};
+use crate::component::{ComponentOpts, Indexer, Validator, Wallet};
 use crate::error::env_err;
 use crate::naming::Sentinel;
 use crate::topology::ActivationHeights;
@@ -38,10 +38,10 @@ type RegtestMaterializeFn = Box<
         + Send,
 >;
 
-/// Indexer config materialization, captured at `add_indexer` (validator host resolved at
+/// Indexer config materialization, captured at `add_indexer` (validator hosts resolved at
 /// build time)
 type IndexerMaterializeFn =
-    Box<dyn FnOnce(ComponentOpts, Option<&str>) -> Result<ComponentOpts, EnvError> + Send>;
+    Box<dyn FnOnce(ComponentOpts, &[String]) -> Result<ComponentOpts, EnvError> + Send>;
 use crate::manifest::PodSpec;
 use crate::mounts::{self, ResolvedMount};
 use crate::naming::{self, RunCoords};
@@ -212,76 +212,6 @@ struct PendingWallet {
     opts: ComponentOpts,
 }
 
-// ──────────────────────────── shared volume ───────────────────────────
-
-/// Env-scoped `ReadWriteOnce` PVC shared by two co-scheduled pods.
-///
-/// - Declared via [`TestEnv::shared_volume`], provisioned during [`TestEnv::build`]
-/// - [`.mount(&vol)`](crate::ComponentBuilder::mount) on a zebrad + a
-///   `.tuning(ZainoTuning::State)` zaino → one on-disk zebra-state DB
-#[derive(Debug, Clone)]
-pub struct SharedVolume {
-    claim: String,
-    mount_path: String,
-}
-
-impl SharedVolume {
-    pub fn claim(&self) -> &str {
-        &self.claim
-    }
-    /// In-pod mount path, identical in both sharing pods (zebra's `db_path` must resolve
-    /// to one directory)
-    pub fn mount_path(&self) -> &str {
-        &self.mount_path
-    }
-    /// The [`Mount`](crate::Mount) attaching this volume at its canonical path, for
-    /// [`ComponentBuilder::mount`](crate::ComponentBuilder::mount)
-    pub fn as_mount(&self) -> crate::mount::Mount {
-        crate::mount::Mount::shared(self.claim.clone(), self.mount_path.clone())
-    }
-}
-
-impl From<&SharedVolume> for crate::mount::Mount {
-    fn from(vol: &SharedVolume) -> Self {
-        vol.as_mount()
-    }
-}
-
-/// [`SharedVolume`] cloned from a public [`ChainSnapshot`](crate::ChainSnapshot): one live
-/// zebra-state DB a following zebrad writes and a colocated zaino `State` reads.
-///
-/// - TEMPORARY: exists only while zaino ingests via `direct` (a private clone freezes at the
-///   pin); delete once zaino is fetch/JSON-RPC-only (migration planned ~2026-10)
-/// - Declared via [`TestEnv::chain_volume`]; zebrad joins with `.follow(&vol)`, zaino with
-///   `.snapshot(vol.snapshot()).mount(&vol)`
-#[derive(Debug, Clone)]
-pub struct ChainVolume {
-    shared: SharedVolume,
-    snapshot: crate::ChainSnapshot,
-}
-
-impl ChainVolume {
-    pub fn snapshot(&self) -> crate::ChainSnapshot {
-        self.snapshot
-    }
-    pub fn mount_path(&self) -> &str {
-        self.shared.mount_path()
-    }
-}
-
-impl From<&ChainVolume> for crate::mount::Mount {
-    fn from(vol: &ChainVolume) -> Self {
-        vol.shared.as_mount()
-    }
-}
-
-/// Env-scoped PVC awaiting `build()`; `seed` = cloned from that artifact, else empty
-struct PendingSharedVolume {
-    claim: String,
-    disk: Disk,
-    seed: Option<crate::Artifact>,
-}
-
 // ────────────────────────────── TestEnv ───────────────────────────────
 
 pub struct TestEnv {
@@ -289,7 +219,6 @@ pub struct TestEnv {
     pending_validators: Vec<PendingValidator>,
     pending_indexers: Vec<PendingIndexer>,
     pending_wallets: Vec<PendingWallet>,
-    pending_shared_volumes: Vec<PendingSharedVolume>,
     next_id: u64,
     ready_timeout: Duration,
     /// Schedule of the *regtest* chain this env mines (`None` =
@@ -323,7 +252,6 @@ impl TestEnv {
             pending_validators: Vec::new(),
             pending_indexers: Vec::new(),
             pending_wallets: Vec::new(),
-            pending_shared_volumes: Vec::new(),
             next_id: 0,
             ready_timeout: Self::DEFAULT_READY_TIMEOUT,
             activation_override: None,
@@ -352,51 +280,6 @@ impl TestEnv {
     pub fn activation_heights(mut self, heights: ActivationHeights) -> Self {
         self.activation_override = Some(heights);
         self
-    }
-
-    /// Declare an env-scoped shared volume to
-    /// [`.mount(&vol)`](crate::ComponentBuilder::mount) on both a zebrad and a
-    /// `.tuning(ZainoTuning::State)` zaino (PVC provisioned during [`TestEnv::build`])
-    pub fn shared_volume(&mut self, name: &str) -> SharedVolume {
-        // Regtest chains are a handful of blocks; a public one wants `shared_volume_sized`
-        self.shared_volume_sized(name, Disk::gib(2))
-    }
-
-    /// [`shared_volume`](Self::shared_volume) for a chain that outgrows the regtest
-    /// default — a restored public network, or one syncing past its pin
-    pub fn shared_volume_sized(&mut self, name: &str, disk: Disk) -> SharedVolume {
-        self.declare_shared(name, disk, None)
-    }
-
-    /// Shared volume cloned from `snapshot` → the chain a following zebrad grows and a
-    /// colocated zaino `State` reads.
-    ///
-    /// - TEMPORARY with [`ChainVolume`] (fetch-only zaino needs no shared DB)
-    /// - `disk` floors at the seed's `restoreSize`; size for the blocks past the pin
-    ///
-    /// # Panics
-    ///
-    /// `snapshot` is a regtest cache (no network to follow)
-    pub fn chain_volume(&mut self, snapshot: crate::ChainSnapshot, disk: Disk) -> ChainVolume {
-        assert!(
-            snapshot.network.is_public(),
-            "chain_volume follows a public network; {} is a regtest cache",
-            snapshot.artifact.name,
-        );
-        let shared = self.declare_shared("chain", disk, Some(snapshot.artifact));
-        ChainVolume { shared, snapshot }
-    }
-
-    fn declare_shared(
-        &mut self,
-        name: &str,
-        disk: Disk,
-        seed: Option<crate::Artifact>,
-    ) -> SharedVolume {
-        let slug = short_kind(name);
-        let claim = format!("shared-{slug}");
-        self.pending_shared_volumes.push(PendingSharedVolume { claim: claim.clone(), disk, seed });
-        SharedVolume { claim, mount_path: format!("/shared/{slug}") }
     }
 
     fn fresh_id(&mut self) -> u64 {
@@ -449,14 +332,13 @@ impl TestEnv {
         let handle = i.backend.to_handle(plumbing);
         let dyn_handle: Arc<dyn IndexerBackend> = Arc::new(handle.clone());
         // Any indexer in a network mode: renders backend + mode config once the validator
-        // host resolves at build time
+        // hosts resolve at build time
         let materialize: Option<IndexerMaterializeFn> =
             (i.mode != crate::component::IndexerMode::None).then(|| {
                 let backend = i.backend;
-                let tunings = i.tunings.clone();
                 let mode = i.mode.clone();
-                Box::new(move |opts, validator_host: Option<&str>| {
-                    backend.materialize_opts(opts, &tunings, &mode, validator_host)
+                Box::new(move |opts, validators: &[String]| {
+                    backend.materialize_opts(opts, &mode, validators)
                 }) as IndexerMaterializeFn
             });
         self.pending_indexers.push(PendingIndexer {
@@ -623,12 +505,13 @@ impl TestEnv {
         }
         self.pending_validators = materialized;
 
-        let validator_host = self.pending_validators.iter().map(|p| pod_name_of(&p.opts)).next();
+        let validators: Vec<String> =
+            self.pending_validators.iter().map(|p| pod_name_of(&p.opts)).collect();
         let pending = std::mem::take(&mut self.pending_indexers);
         let mut materialized = Vec::with_capacity(pending.len());
         for mut p in pending {
             if let Some(materialize) = p.materialize.take() {
-                p.opts = materialize(p.opts, validator_host.as_deref())?;
+                p.opts = materialize(p.opts, &validators)?;
             }
             materialized.push(p);
         }
@@ -710,27 +593,6 @@ impl TestEnv {
         // Pods size themselves (`qos::pod` defaults, `.resources()` per pod); this is the
         // only thing the tier ceiling does to a topology
         let mut budget = DeployBudget::new(effective.footprint);
-
-        // Before any pod references them (WaitForFirstConsumer → the claim stays Pending
-        // until the Phase-1 validator schedules)
-        for PendingSharedVolume { claim, disk, seed } in
-            std::mem::take(&mut self.pending_shared_volumes)
-        {
-            match seed {
-                None => mounts::create_shared_pvc(&client, &sentinel, &claim, disk).await?,
-                Some(artifact) => {
-                    let binding = mounts::create_seeded_shared_pvc(
-                        &client, &sentinel, &claim, artifact, disk,
-                    )
-                    .await?;
-                    self.inner
-                        .seed_bindings
-                        .lock()
-                        .expect("seed_bindings mutex poisoned")
-                        .push(binding);
-                }
-            }
-        }
 
         let ctx = MaterializeCtx {
             client: &client,

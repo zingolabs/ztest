@@ -12,10 +12,6 @@ pub const ZEBRAD_P2P: u16 = 18233;
 /// zebrad health server (`health.listen_addr`). Off unless a config names it, so only a
 /// `ChainMotion::Following` node serves `/healthy` (peers) and `/ready` (peers + near tip)
 pub const ZEBRAD_HEALTH: u16 = 18080;
-/// zebrad indexer gRPC (`rpc.indexer_listen_addr`). Served only on a shared
-/// state DB (`Shared`-volume `.mount(&vol)`); consumed by a colocated zaino
-/// StateService for non-finalized-state sync
-pub const ZEBRAD_INDEXER: u16 = 18230;
 pub const ZCASHD_RPC: u16 = 28232;
 pub const ZAINO_GRPC: u16 = 8137;
 pub const ZAINO_JSONRPC: u16 = 8232;

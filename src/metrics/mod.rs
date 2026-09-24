@@ -83,7 +83,7 @@ impl Tally {
 
 /// Narrows a split family to one label value (folding a producer's dimension changes the quantity).
 ///
-/// zaino stages every ingest counter (`finalised`/`non-finalised`/`migration`) → a fold counts 3×
+/// - e.g. zaino's per-index heights (`index="tree_state"`): max over indexes = no index's height
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Select {
     pub label: &'static str,
@@ -156,6 +156,15 @@ pub const fn counter_where(
     value: &'static str,
 ) -> Counter {
     Counter(Family { name, select: Some(Select { label, value }), dim, ready: DEFAULT_READY })
+}
+
+pub const fn gauge_where(
+    name: &'static str,
+    dim: Dimension,
+    label: &'static str,
+    value: &'static str,
+) -> Gauge {
+    Gauge(Family { name, select: Some(Select { label, value }), dim, ready: DEFAULT_READY })
 }
 
 macro_rules! shape {

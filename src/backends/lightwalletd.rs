@@ -50,7 +50,6 @@ const DATA_DIR: &str = "/var/lib/lightwalletd";
 
 impl IndexerConfig for LightwalletdBackend {
     type Handle = LightwalletdIndexer;
-    type Tuning = crate::component::NoTuning;
 
     fn to_handle(&self, plumbing: HandleInner) -> LightwalletdIndexer {
         LightwalletdIndexer { plumbing }
@@ -62,9 +61,8 @@ impl IndexerConfig for LightwalletdBackend {
     fn materialize_opts(
         &self,
         mut opts: crate::component::ComponentOpts,
-        _tunings: &[Self::Tuning],
         mode: &crate::component::IndexerMode,
-        validator_host: Option<&str>,
+        validators: &[String],
     ) -> Result<crate::component::ComponentOpts, EnvError> {
         use crate::component::IndexerMode;
 
@@ -78,7 +76,7 @@ impl IndexerConfig for LightwalletdBackend {
             }
         }
 
-        let validator_host = validator_host.ok_or_else(|| EnvError::Config {
+        let validator_host = validators.first().ok_or_else(|| EnvError::Config {
             reason: "lightwalletd indexer opted in to regtest but no validator is \
                      registered in this env"
                 .to_string(),

@@ -124,10 +124,9 @@ pub fn parse_activation_heights_from_rpc(
 ///
 /// ```ignore
 /// let zebrad = env.add_validator(Validator::zebrad("5.1.1").regtest());
-/// let zaino  = env.add_indexer(Indexer::zainod("0.4.0-rc.2-no-tls").regtest());
+/// let zaino  = env.add_indexer(Indexer::zaino("0.4.0").regtest());
 /// ```
 pub trait Regtest: Sized {
-    /// Standard regtest fixture. Fetch/state backend stays orthogonal (`Indexer::backend`)
     fn regtest(self) -> Self;
 }
 
@@ -138,7 +137,7 @@ pub trait Regtest: Sized {
 /// - One verb, parts not independently choosable: renders the config, mounts a private CoW
 ///   clone at the backend's chain path, records the archive (preflight materializes the
 ///   seed + grants a readable GID)
-/// - Backend opening no chain DB (zaino `Fetch`) takes the config, skips the multi-GB clone
+/// - Backend opening no chain DB (zaino) takes the config, skips the multi-GB clone
 /// - **Not** an index restore: validator *is* the chain, indexer *reads* it and builds its
 ///   own index into empty pod-local scratch
 ///
@@ -148,9 +147,8 @@ pub trait Regtest: Sized {
 /// #[ztest::needs(IRONWOOD)]
 /// #[tokio::test]
 /// async fn t() {
-///     let zebra       = env.add_validator(Validator::zebrad("6.2.3").testnet(IRONWOOD));
-///     let zaino_state = env.add_indexer(Indexer::zainod("0.4.0").testnet(IRONWOOD)
-///                                           .tuning(ZainoTuning::State));
+///     let zebra = env.add_validator(Validator::zebrad("6.2.3").snapshot(IRONWOOD));
+///     let zaino = env.add_indexer(Indexer::zaino("0.4.0").snapshot(IRONWOOD));
 /// }
 /// ```
 ///
@@ -159,9 +157,8 @@ pub trait Restore: Sized {
     /// Run on the chain `snapshot` pins.
     ///
     /// One verb, not `.testnet()`/`.mainnet()`: the snapshot carries its own network, so a
-    /// second statement of it could only ever disagree. Fetch/state backend stays orthogonal
-    /// (`Indexer::backend`). Mainnet rungs are ~10× testnet's — prefer testnet unless the
-    /// test needs mainnet's transaction density
+    /// second statement of it could only ever disagree. Mainnet rungs are ~10× testnet's —
+    /// prefer testnet unless the test needs mainnet's transaction density
     fn snapshot(self, snapshot: crate::ChainSnapshot) -> Self;
 }
 
