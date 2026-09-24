@@ -102,6 +102,14 @@ pub trait SyncSubject: Send + Sync {
         None
     }
 
+    /// Terminal failure of the driven sync (`Some` = its task died, with this error)
+    ///
+    /// - Checked each tick before [`is_complete`](Self::is_complete) (a dead task reads complete)
+    /// - `Some` → subject stopped, phase `Failed` with this text, no later phase
+    async fn failure(&self) -> Option<String> {
+        None
+    }
+
     /// Graceful stop — checkpoint, never a kill; observers have nothing to stop
     async fn stop(&mut self) -> Result<(), RpcError> {
         Ok(())

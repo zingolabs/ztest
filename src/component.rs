@@ -83,6 +83,7 @@ pub struct ComponentOpts {
     pub coinbase_pool: Option<Pool>,
     pub restore: Option<RestoreSource>,
     pub disk: Option<Disk>,
+    pub restartable: bool,
 }
 
 /// Source of a component's pre-existing on-disk state. `Archive` covers a synced
@@ -365,6 +366,14 @@ pub trait ComponentBuilder: Sized {
     /// Expose a named container port beyond the backend defaults
     fn expose(mut self, name: &str, container_port: u16) -> Self {
         self.component_opts_mut().extra_ports.push((name.to_string(), container_port));
+        self
+    }
+    /// Pod killable + restarted in place ([`ComponentPod::kill`](crate::handles::ComponentPod::kill))
+    ///
+    /// - `restartPolicy: OnFailure` (crashes restart too → `Snapshot::restarts`)
+    /// - `shareProcessNamespace: true` (component no longer PID 1)
+    fn restartable(mut self) -> Self {
+        self.component_opts_mut().restartable = true;
         self
     }
     fn command<I, S>(mut self, argv: I) -> Self

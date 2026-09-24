@@ -42,6 +42,8 @@ pub struct Snapshot {
     observed_reorg: bool,
     observed_reconnect: bool,
     last_fault_at: Option<Instant>,
+    restarts: u32,
+    restarting: bool,
 }
 
 impl Snapshot {
@@ -101,6 +103,19 @@ impl Snapshot {
     pub fn observed_reconnect(&self) -> bool {
         self.observed_reconnect
     }
+    /// Container restarts across the topology's pods since this phase's first tick
+    pub fn restarts(&self) -> u32 {
+        self.restarts
+    }
+    /// Coverage: a component restarted (killed or crashed) at or before this tick
+    pub fn observed_restart(&self) -> bool {
+        self.restarts > 0
+    }
+    /// Inside a restart window (container down, or back but subject not answering yet) →
+    /// `eventually` windows paused
+    pub fn restarting(&self) -> bool {
+        self.restarting
+    }
 
     /// Confirmed per-pool balances; panics when the subject reports none (balance probe on a
     /// non-wallet subject = test bug, and zeroed [`PoolBalances`] would be unfailable).
@@ -129,6 +144,14 @@ impl Snapshot {
 
 fn missing_balances(accessor: &str) -> ! {
     panic!("Snapshot::{accessor}: subject reports no balances (wallet only)")
+}
+
+/// Runner-side facts of one tick: the fault timeline + the restart window
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TickEvents {
+    pub last_fault_at: Option<Instant>,
+    pub restarts: u32,
+    pub restarting: bool,
 }
 
 /// Rolling state threaded across ticks to build each [`Snapshot`]. Separate so the snapshot
@@ -161,14 +184,13 @@ impl SnapshotBuilder {
         }
     }
 
-    /// Fold one reading captured at `now` into a snapshot, advancing the rolling state.
-    /// `last_fault_at` comes from the fault timeline
+    /// Fold one reading captured at `now` into a snapshot, advancing the rolling state
     pub fn build(
         &mut self,
         p: &dyn ProgressView,
         now: Instant,
         work: Work,
-        last_fault_at: Option<Instant>,
+        events: TickEvents,
     ) -> Snapshot {
         let height = p.height();
         let balances = p.balances();
@@ -207,7 +229,9 @@ impl SnapshotBuilder {
             last_progress_at: self.last_progress_at,
             observed_reorg: self.observed_reorg,
             observed_reconnect: self.observed_reconnect,
-            last_fault_at,
+            last_fault_at: events.last_fault_at,
+            restarts: events.restarts,
+            restarting: events.restarting,
         };
 
         self.seq += 1;

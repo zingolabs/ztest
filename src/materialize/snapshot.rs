@@ -18,8 +18,7 @@ use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
-use kube::api::{Api, AttachParams, DynamicObject, ListParams};
-use tokio::io::AsyncReadExt as _;
+use kube::api::{Api, DynamicObject, ListParams};
 
 use super::progress::human;
 use crate::progress::StepProgress;
@@ -177,15 +176,13 @@ impl Meter {
     }
 }
 
-async fn exec_capture(pods: &Api<Pod>, pod: &str, script: &str) -> Result<String, kube::Error> {
-    let params = AttachParams::default().container(PLUGIN_CONTAINER).stdout(true).stderr(false);
-    let mut proc = pods.exec(pod, ["sh", "-c", script], &params).await?;
-    let mut out = String::new();
-    if let Some(mut stdout) = proc.stdout() {
-        let _ = stdout.read_to_string(&mut out).await;
-    }
-    let _ = proc.join().await;
-    Ok(out)
+async fn exec_capture(
+    pods: &Api<Pod>,
+    pod: &str,
+    script: &str,
+) -> Result<String, crate::exec::ExecError> {
+    let out = crate::exec::exec(pods, pod, PLUGIN_CONTAINER, &["sh", "-c", script], None).await?;
+    Ok(out.stdout)
 }
 
 /// `<name> <bytes>` from [`NEWEST_SNAP`], or `None` when no `.snap` exists yet

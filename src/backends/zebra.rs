@@ -149,6 +149,12 @@ pub struct ZebraValidator {
     plumbing: HandleInner,
 }
 
+impl crate::handles::PodHandle for ZebraValidator {
+    fn plumbing(&self) -> &HandleInner {
+        &self.plumbing
+    }
+}
+
 /// Families zebrad publishes, in report order.
 ///
 /// Verification switches families at the highest checkpoint (concurrency 1000 → 20), so a

@@ -127,6 +127,12 @@ pub struct LightwalletdIndexer {
     plumbing: HandleInner,
 }
 
+impl crate::handles::PodHandle for LightwalletdIndexer {
+    fn plumbing(&self) -> &HandleInner {
+        &self.plumbing
+    }
+}
+
 #[async_trait]
 impl IndexerBackend for LightwalletdIndexer {
     fn label(&self) -> &'static str {

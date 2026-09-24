@@ -46,6 +46,7 @@ mod capability;
 mod cluster;
 mod cluster_config;
 mod engine;
+mod exec;
 mod extra_config;
 mod fmt;
 mod libtest;
@@ -164,6 +165,8 @@ pub mod prelude {
     };
     /// The pinned chain a test names, and the blob it is restored from
     pub use crate::archive::{Artifact, Backend, ChainSnapshot, Network};
+    /// `handle.exec(..)` / `handle.kill_and_await_restart(..)` need the trait in scope
+    pub use crate::handles::{ComponentPod, ExecOutput, PodHandle, Restart};
     pub use crate::loadtest::{
         BlockOracle, Distribution, LoadDriver, LoadReport, LwdClient, Rel, Scenario,
     };

@@ -805,6 +805,11 @@ impl TestEnv {
         self.inner.client.get().cloned()
     }
 
+    /// Every provisioned component's pod, once [`build`](Self::build) has run
+    pub async fn component_pods(&self) -> Result<Vec<crate::handles::ComponentPod>, EnvError> {
+        crate::handles::ComponentPod::all(&self.inner).await
+    }
+
     /// Namespace this env provisioned into, once [`build`](Self::build) has run. Locates
     /// this run's stop-watch and report ConfigMaps
     #[cfg_attr(not(feature = "librustzcash"), allow(dead_code))]
@@ -934,7 +939,7 @@ impl TestEnv {
                 .lock()
                 .expect("seed_bindings mutex poisoned")
                 .extend(resolved.seed_bindings);
-            apply_pod(ctx, spec, &resolved.mounts).await?;
+            apply_pod(ctx, spec, &resolved.mounts, opts.restartable).await?;
             self.inner.components.write().await.insert(*id, state);
         }
 
@@ -1155,8 +1160,12 @@ async fn apply_pod(
     ctx: &MaterializeCtx<'_>,
     spec: &PodSpec,
     mounts: &[ResolvedMount],
+    restartable: bool,
 ) -> Result<(), EnvError> {
-    let pod = spec.render(ctx.coords, ctx.test_name, mounts)?;
+    let mut pod = spec.render(ctx.coords, ctx.test_name, mounts)?;
+    if restartable {
+        crate::handles::pod::make_restartable(&mut pod);
+    }
     ctx.pods.create(&PostParams::default(), &pod).await.map(|_| ()).map_err(env_err)
 }
 

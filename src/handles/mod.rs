@@ -5,6 +5,7 @@
 //! - Backend-specific RPCs stay inherent (wrong backend = compile error)
 
 pub mod indexer;
+pub mod pod;
 pub mod validator;
 pub mod wallet;
 
@@ -20,6 +21,7 @@ use crate::portforward::Forwarder;
 use crate::protocol::Endpoint;
 
 pub use self::indexer::{IndexerBackend, IndexerConfig};
+pub use self::pod::{ComponentPod, ContainerSample, ExecOutput, PodError, PodHandle, Restart};
 pub use self::validator::{ValidatorBackend, ValidatorConfig};
 pub use self::wallet::{WalletBackend, WalletConfig};
 
@@ -61,6 +63,10 @@ impl HandleInner {
         let inner = self.ensure_built()?;
         let state = inner.component_state(self.component_id).await?;
         inner.resolve_port(&state, port).await
+    }
+
+    pub async fn pod(&self) -> Result<ComponentPod, EnvError> {
+        ComponentPod::of(&*self.ensure_built()?, self.component_id).await
     }
 }
 

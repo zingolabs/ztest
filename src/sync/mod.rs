@@ -1,14 +1,17 @@
 //! Sync-testing harness (`docs/design-sync.md`).
 //!
 //! Long-running wallet/indexer/validator sync as a continuous monitor: [`SyncRunner`]
-//! launches a [`SyncSubject`], captures a [`Snapshot`] per tick, evaluates probes at their
-//! own cadences across the four classes, ends on a completion predicate or fatal violation.
+//! runs [`Phase`]s in order, each launching a [`SyncSubject`], capturing a [`Snapshot`] per
+//! tick, evaluating its probes at their own cadences across the four classes, ending on a
+//! completion predicate or fatal violation.
 
 mod chainwork;
 mod detached;
 mod nemesis;
 mod observe;
+mod phase;
 mod probe;
+mod restart;
 mod runner;
 mod snapshot;
 mod subject;
@@ -32,6 +35,7 @@ pub use nemesis::{
 pub use observe::{
     Cost, CostMs, Heights, Latency, Observation, Observe, Observed, ObservedSource, Timing, Window,
 };
+pub use phase::{Phase, PhaseError, PhaseOutcome};
 pub use probe::{
     Cadence, Class, ProbeBuilder, ProbeState, ProbeStatus, Severity, SyncCtx, Verdict, Violation,
     hours, mins, secs,
@@ -55,4 +59,4 @@ mod export;
 
 pub use export::family as driver_family;
 
-pub use facade::{SyncManifest, SyncRunner};
+pub use facade::{PhaseManifest, SyncManifest, SyncRunner};

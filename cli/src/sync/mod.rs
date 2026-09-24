@@ -1344,6 +1344,7 @@ fn mirror_header(r: &SyncReportMirror) -> ReportView {
             .collect(),
         coverage_gaps: r.coverage_gaps.clone(),
         error: r.error.clone(),
+        phases: r.phases.iter().map(ztest::sync::PhaseOutcome::describe).collect(),
         ticks: r.ticks,
         dropped_snapshots: r.dropped_snapshots,
         ..ReportView::default()

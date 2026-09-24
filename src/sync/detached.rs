@@ -345,6 +345,7 @@ pub struct SyncReportMirror {
     /// Recorded, not re-derived: a denominator read off a series makes one bad scrape a shortfall
     pub target: Option<u32>,
     pub unpublished: Vec<String>,
+    pub phases: Vec<crate::sync::PhaseOutcome>,
 }
 
 /// Recorded violation, projected for the durable report
@@ -382,6 +383,7 @@ impl SyncReportMirror {
                 .collect(),
             coverage_gaps: outcome.coverage_gaps.clone(),
             error: outcome.error.clone(),
+            phases: outcome.phases.clone(),
         }
     }
 
@@ -391,7 +393,7 @@ impl SyncReportMirror {
 
     /// Compact human line, for `status`/`report` non-JSON output
     pub fn summary(&self) -> String {
-        format!(
+        let mut line = format!(
             "{} [{}]: {} — {} ticks, {} violations, {} coverage gaps",
             self.sync_id,
             self.profile,
@@ -399,7 +401,21 @@ impl SyncReportMirror {
             self.ticks,
             self.violations.len(),
             self.coverage_gaps.len(),
-        )
+        );
+        // Single-phase run = the line above already
+        if self.phases.len() > 1 {
+            let phases: Vec<String> = self
+                .phases
+                .iter()
+                .map(|p| {
+                    let elapsed = std::time::Duration::from_millis(p.elapsed_ms);
+                    let span = crate::fmt::format_span(elapsed);
+                    format!("{} {} {span}", p.name, p.verdict)
+                })
+                .collect();
+            line.push_str(&format!(" [{}]", phases.join(" → ")));
+        }
+        line
     }
 }
 
@@ -597,6 +613,7 @@ mod tests {
             segment: None,
             target: None,
             unpublished: Vec::new(),
+            phases: Vec::new(),
         }
     }
 
@@ -700,10 +717,30 @@ mod tests {
     /// Mirror JSON written by an older driver (verdict as a bare debug name) still reads
     #[test]
     fn a_report_round_trips_through_its_configmap_json() {
-        let json = serde_json::to_string(&mirror(SyncVerdict::Failed)).expect("serialize");
+        let phase = |name: &str, verdict, elapsed_ms| crate::sync::PhaseOutcome {
+            name: name.into(),
+            verdict,
+            started_ms: 1,
+            elapsed_ms,
+            ticks: 3,
+            violations: 0,
+            coverage_gaps: Vec::new(),
+            error: None,
+            restarts: 1,
+        };
+        let phases = vec![
+            phase("index", SyncVerdict::Passed, 60_000),
+            phase("wallet", SyncVerdict::Failed, 0),
+        ];
+        let report = SyncReportMirror { phases: phases.clone(), ..mirror(SyncVerdict::Failed) };
+        let json = serde_json::to_string(&report).expect("serialize");
         assert!(json.contains(r#""verdict":"Failed""#), "{json}");
         let back: SyncReportMirror = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.verdict, SyncVerdict::Failed);
         assert!(!back.passed());
+        assert_eq!(back.phases, phases);
+        let summary = back.summary();
+        assert!(summary.contains("[index Passed 1m"), "{summary}");
+        assert!(summary.contains("→ wallet Failed"), "{summary}");
     }
 }

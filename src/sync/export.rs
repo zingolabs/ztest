@@ -6,6 +6,7 @@
 
 use std::time::SystemTime;
 
+use super::phase::PhaseOutcome;
 use super::probe::Verdict;
 use super::runner::SyncReporter;
 use super::snapshot::Snapshot;
@@ -17,6 +18,15 @@ pub mod family {
     pub const STARTED: Gauge = gauge("ztest_sync_started_timestamp_seconds", Dimension::Seconds);
     /// Split by `probe`
     pub const VIOLATIONS: Counter = counter("ztest_sync_violations_total", Dimension::Count);
+    /// Split by `phase`, unix seconds; absent `ENDED` = phase still running
+    pub const PHASE_STARTED: Gauge =
+        gauge("ztest_sync_phase_started_timestamp_seconds", Dimension::Seconds);
+    pub const PHASE_ENDED: Gauge =
+        gauge("ztest_sync_phase_ended_timestamp_seconds", Dimension::Seconds);
+}
+
+fn unix_seconds(at: SystemTime) -> f64 {
+    at.duration_since(std::time::UNIX_EPOCH).expect("wall clock after the epoch").as_secs_f64()
 }
 
 pub(super) fn install() -> Result<(), metrics_exporter_prometheus::BuildError> {
@@ -32,9 +42,19 @@ pub(super) struct MetricsReporter;
 
 impl SyncReporter for MetricsReporter {
     fn on_tick(&mut self, _snap: &Snapshot, origin: SystemTime) {
-        let since =
-            origin.duration_since(std::time::UNIX_EPOCH).expect("wall clock after the epoch");
-        metrics::gauge!(family::STARTED.family().name).set(since.as_secs_f64());
+        metrics::gauge!(family::STARTED.family().name).set(unix_seconds(origin));
+    }
+
+    fn on_phase_start(&mut self, name: &str) {
+        metrics::gauge!(family::PHASE_STARTED.family().name, "phase" => name.to_string())
+            .set(unix_seconds(SystemTime::now()));
+    }
+
+    /// Verdict rides the mirrored report (a state string is no quantity)
+    fn on_phase(&mut self, phase: &PhaseOutcome) {
+        metrics::gauge!(family::PHASE_ENDED.family().name, "phase" => phase.name.clone())
+            .set(unix_seconds(SystemTime::now()));
+        tracing::info!(phase = %phase.name, "phase finished: {}", phase.describe());
     }
 
     /// Count to the TSDB, detail to the log (free text is no label value)

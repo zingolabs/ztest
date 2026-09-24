@@ -1,14 +1,15 @@
 //! The nemesis: scheduled + probabilistic chaos (design §"Chaos: the nemesis").
 //!
-//! Adversity injected at two altitudes, both *outside* the sync engine:
+//! Adversity injected at three altitudes, all *outside* the sync engine:
 //!
 //! - **channel** — probabilistic per-RPC faults on the wallet↔indexer link, applied by
 //!   wrapping the `Indexer` client (`ChaosIndexer`); deterministic via seed-logged `buggify`
 //! - **k8s network** — scheduled `partition`/`netem`/`isolate_p2p` as `NetworkChaos`
+//! - **process** — scheduled `kill` = SIGKILL + in-place container restart
 //!
-//! Owned here: the author-facing schedule ([`Nemesis`]/[`NemesisBuilder`]) + the decision
-//! core ([`Buggify`]). Applying faults is cluster-side wiring; the schedule stays pure,
-//! seed-reproducible data, and is what `describe` prints
+//! - Owned here: the author-facing schedule ([`Nemesis`]/[`NemesisBuilder`]) + the decision
+//!   core ([`Buggify`]); schedule = pure, seed-reproducible data, what `describe` prints
+//! - Applied today: `kill` only (runner, at `at` from run start); network kinds stay recorded
 
 use std::time::Duration;
 
@@ -55,6 +56,7 @@ pub enum FaultKind {
     Partition { a: String, b: String },
     Netem { node: String, spec: NetemSpec },
     IsolateP2p { node: String },
+    Kill { component: String },
 }
 
 /// Fault firing `at` an offset from sync start, held for `duration` then healed
@@ -142,6 +144,15 @@ impl<'n> NemesisBuilder<'n> {
         self.push_scheduled(kind);
         self
     }
+    /// SIGKILL `component`'s main process (pod name or label); kubelet restarts it in place.
+    ///
+    /// - Component must be `.restartable()` (checked before the run starts)
+    /// - `for_` ignored (the outage lasts as long as the restart does)
+    pub fn kill(mut self, component: impl Into<String>) -> Self {
+        let kind = FaultKind::Kill { component: component.into() };
+        self.push_scheduled(kind);
+        self
+    }
 
     /// Target the wallet channel for the following `buggify` rule(s)
     pub fn channel<T>(mut self, _target: T) -> Self {
@@ -223,6 +234,9 @@ mod tests {
             .at(Duration::from_secs(2100))
             .for_(Duration::from_secs(120))
             .netem("zai", Delay(300).jitter(80).loss(0.03))
+            .named("crash")
+            .at(Duration::from_secs(3000))
+            .kill("zai")
             .channel(())
             .buggify(0.01, Fault::DropConnection)
             .channel(())
@@ -232,7 +246,16 @@ mod tests {
 
         assert_eq!(n.seed, 0x5EC0_1DAB);
         assert!(n.heal_on_drop);
-        assert_eq!(n.scheduled.len(), 2);
+        assert_eq!(n.scheduled.len(), 3);
+        assert_eq!(
+            n.scheduled[2],
+            ScheduledFault {
+                name: Some("crash".into()),
+                at: Duration::from_secs(3000),
+                duration: None,
+                kind: FaultKind::Kill { component: "zai".into() },
+            }
+        );
         assert_eq!(
             n.scheduled[0],
             ScheduledFault {

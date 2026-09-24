@@ -122,6 +122,12 @@ pub struct ZcashdValidator {
     plumbing: HandleInner,
 }
 
+impl crate::handles::PodHandle for ZcashdValidator {
+    fn plumbing(&self) -> &HandleInner {
+        &self.plumbing
+    }
+}
+
 impl ZcashdValidator {
     /// JSON-RPC with Basic Auth (zcashd 401s unauthed calls)
     async fn rpc_client(&self) -> Result<AuthedRpc, EnvError> {

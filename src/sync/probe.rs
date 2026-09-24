@@ -16,6 +16,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::component::ComponentCategory;
+use crate::handles::ComponentPod;
 use crate::handles::indexer::IndexerBackend;
 
 use super::snapshot::Snapshot;
@@ -95,24 +97,52 @@ pub enum Cadence {
     Window(Duration),
 }
 
-/// Context for RPC-backed probes: the independent oracle (indexer) wallet state is checked against
+/// Context for RPC-backed probes + phase factories: the independent oracle (indexer) wallet
+/// state is checked against, and the topology's pods (exec, kill). One per run, every phase
+#[derive(Clone)]
 pub struct SyncCtx {
     indexer: Option<Arc<dyn IndexerBackend>>,
+    pods: Vec<ComponentPod>,
 }
 
 impl std::fmt::Debug for SyncCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SyncCtx").field("has_indexer", &self.indexer.is_some()).finish()
+        f.debug_struct("SyncCtx")
+            .field("has_indexer", &self.indexer.is_some())
+            .field("pods", &self.pods)
+            .finish()
     }
 }
 
 impl SyncCtx {
     pub fn new(indexer: Option<Arc<dyn IndexerBackend>>) -> Self {
-        Self { indexer }
+        Self { indexer, pods: Vec::new() }
+    }
+    pub fn with_pods(mut self, pods: Vec<ComponentPod>) -> Self {
+        self.pods = pods;
+        self
     }
     /// `None` in a walletless/observer setup (no topology bound one)
     pub fn indexer(&self) -> Option<&dyn IndexerBackend> {
         self.indexer.as_deref()
+    }
+    pub fn indexer_arc(&self) -> Option<Arc<dyn IndexerBackend>> {
+        self.indexer.clone()
+    }
+    pub fn pods(&self) -> &[ComponentPod] {
+        &self.pods
+    }
+    /// By pod name (`.named(..)`) or component label (`zainod`)
+    pub fn pod(&self, name: &str) -> Option<&ComponentPod> {
+        self.pods.iter().find(|p| p.answers_to(name))
+    }
+    /// The one indexer pod; `None` on zero or several
+    pub fn indexer_pod(&self) -> Option<&ComponentPod> {
+        let mut it = self.pods.iter().filter(|p| p.category() == ComponentCategory::Indexer);
+        match (it.next(), it.next()) {
+            (Some(p), None) => Some(p),
+            _ => None,
+        }
     }
 }
 

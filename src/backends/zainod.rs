@@ -212,6 +212,12 @@ pub struct ZainoIndexer {
     plumbing: HandleInner,
 }
 
+impl crate::handles::PodHandle for ZainoIndexer {
+    fn plumbing(&self) -> &HandleInner {
+        &self.plumbing
+    }
+}
+
 #[async_trait]
 impl IndexerBackend for ZainoIndexer {
     fn label(&self) -> &'static str {

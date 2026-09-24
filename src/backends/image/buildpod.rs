@@ -21,11 +21,7 @@ use crate::resource::impls::buildkit::BUILDKIT_CONTAINER;
 /// the exit-code source (k8s `exec` Status has a version-fragile Rust shape)
 const OUTER: &str = r#"sh -c "$1"; printf '\nZTEST_EXIT=%s\n' "$?""#;
 
-/// Live stderr sink for the non-interactive (CI) path, one line per call.
-/// `Send + Sync` — held across an await in [`ImageProvider`]'s boxed `Send` future
-///
-/// [`ImageProvider`]: super::ImageProvider
-pub(crate) type LineSink<'a> = &'a (dyn Fn(&str) + Send + Sync);
+pub(crate) use crate::exec::LineSink;
 
 /// Where one build's output travels. BuildKit gates its progress UI on a TTY, so the
 /// `--progress` flag baked into the command and the exec that runs it must agree — one
@@ -71,61 +67,19 @@ pub(crate) async fn exec_build(
     }
 }
 
-/// `exec` in the build pod → `(stdout, stderr, exit_code)`, each stderr line to `on_line`.
-/// No TTY → both streams share ONE websocket and MUST be drained concurrently
+/// `exec` in the build pod → `(stdout, stderr, exit_code)`, each stderr line to `on_line`
 async fn exec_streamed(
     api: &Api<Pod>,
     pod: &str,
     cmd: &str,
     on_line: Option<LineSink<'_>>,
 ) -> Result<(String, String, i32), PipelineError> {
-    use tokio::io::AsyncBufReadExt as _;
-
-    let ap = AttachParams::default()
-        .container(BUILDKIT_CONTAINER)
-        .stdin(false)
-        .stdout(true)
-        .stderr(true);
-    let mut attached = api
-        .exec(pod, ["/bin/sh", "-c", OUTER, "ztest-exec", cmd], &ap)
+    let argv = ["/bin/sh", "-c", OUTER, "ztest-exec", cmd];
+    let out = crate::exec::exec(api, pod, BUILDKIT_CONTAINER, &argv, on_line)
         .await
-        .map_err(|e| format!("exec in build pod {pod}: {e}"))?;
-
-    let mut stdout = attached.stdout();
-    let stderr = attached.stderr();
-    let mut out = String::new();
-    let mut err = String::new();
-    let (ro, re) = tokio::join!(
-        async {
-            match stdout.as_mut() {
-                Some(s) => s.read_to_string(&mut out).await.map(|_| ()),
-                None => Ok(()),
-            }
-        },
-        async {
-            let Some(s) = stderr else { return Ok(()) };
-            let mut lines = tokio::io::BufReader::new(s).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        if let Some(cb) = on_line {
-                            cb(&line);
-                        }
-                        err.push_str(&line);
-                        err.push('\n');
-                    }
-                    Ok(None) => break Ok(()),
-                    Err(e) => break Err(e),
-                }
-            }
-        },
-    );
-    ro.map_err(|e| format!("read exec stdout: {e}"))?;
-    re.map_err(|e| format!("read exec stderr: {e}"))?;
-    let _ = attached.join().await;
-
-    let (clean, code) = split_exit_sentinel(&out);
-    Ok((clean, err, code))
+        .map_err(|e| e.to_string())?;
+    let (clean, code) = split_exit_sentinel(&out.stdout);
+    Ok((clean, out.stderr, code))
 }
 
 /// `exec` under a remote **PTY**, merged raw output → `on_bytes` (BuildKit's progress UI

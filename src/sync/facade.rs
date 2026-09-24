@@ -1,55 +1,52 @@
 //! Test-author `SyncRunner` facade (design §"Test-author API").
 //!
 //! - Body = registration program: topology → bind subject → named invariants at
-//!   cadences → nemesis schedule → `run.run()`
-//! - `run()` builds a [`SyncEngine`](crate::sync::SyncEngine) over the bound subject
+//!   cadences → later phases (`then`) → nemesis schedule → `run.run()`
+//! - Derefs to the first [`Phase`] → `run.always(..)`/`run.tick(..)` register there
 //! - `topology()`/`run()` are cluster-bound ([`TestEnv`]); registration +
 //!   [`manifest`](SyncRunner::manifest) is cluster-free (powers `describe`)
 
-use std::time::Duration;
+use std::future::Future;
+use std::sync::Arc;
 
 use crate::env::TestEnv;
 use crate::error::EnvError;
+use crate::handles::pod::Watched;
 
 use super::nemesis::{Nemesis, NemesisBuilder};
-use super::probe::{Cadence, Class, ProbeBuilder, ProbeSpec, Severity, SyncCtx};
-use super::runner::{SyncEngine, SyncOutcome, SyncVerdict};
+use super::phase::{Phase, PhaseError, Source};
+use super::probe::{Class, SyncCtx};
+use super::runner::{SyncEngine, SyncOutcome};
 use super::subject::SyncSubject;
-use super::work::OpSet;
 
-/// Cluster-free summary of a profile's registrations: invariants + nemesis, for
-/// `ztest sync describe`
+/// Cluster-free summary of a profile's registrations: phases + their invariants + nemesis,
+/// for `ztest sync describe`
 #[derive(Debug, Clone)]
 pub struct SyncManifest {
-    pub probes: Vec<(String, Class)>,
+    pub phases: Vec<PhaseManifest>,
     pub scheduled_faults: Vec<String>,
     pub buggify_rules: usize,
     pub seed: u64,
 }
 
-pub struct SyncRunner {
-    env: TestEnv,
-    probes: Vec<ProbeSpec>,
-    nemesis: Nemesis,
-    subject: Option<Box<dyn SyncSubject>>,
-    engine: EngineOpts,
+#[derive(Debug, Clone)]
+pub struct PhaseManifest {
+    pub name: String,
+    pub probes: Vec<(String, Class)>,
 }
 
-/// Engine knobs a profile sets, carried to [`drive`] as one value
-#[derive(Debug)]
-struct EngineOpts {
-    tick: Duration,
-    timeout: Option<Duration>,
-    stop_height: Option<u32>,
-    required_work: OpSet,
-    ready: Vec<crate::metrics::Family>,
+pub struct SyncRunner {
+    env: TestEnv,
+    first: Phase,
+    rest: Vec<Phase>,
+    nemesis: Nemesis,
 }
 
 impl std::fmt::Debug for SyncRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncRunner")
-            .field("probes", &self.probes.len())
-            .field("bound_subject", &self.subject.is_some())
+            .field("first", &self.first)
+            .field("rest", &self.rest)
             .field("scheduled_faults", &self.nemesis.scheduled.len())
             .finish_non_exhaustive()
     }
@@ -61,20 +58,25 @@ impl Default for SyncRunner {
     }
 }
 
+impl std::ops::Deref for SyncRunner {
+    type Target = Phase;
+    fn deref(&self) -> &Phase {
+        &self.first
+    }
+}
+impl std::ops::DerefMut for SyncRunner {
+    fn deref_mut(&mut self) -> &mut Phase {
+        &mut self.first
+    }
+}
+
 impl SyncRunner {
     pub fn new() -> Self {
         Self {
             env: TestEnv::builder(),
-            probes: Vec::new(),
+            first: Phase::new("sync", Source::Unbound),
+            rest: Vec::new(),
             nemesis: Nemesis::default(),
-            subject: None,
-            engine: EngineOpts {
-                tick: crate::sync::DEFAULT_TICK,
-                timeout: None,
-                stop_height: None,
-                required_work: OpSet::NONE,
-                ready: Vec::new(),
-            },
         }
     }
 
@@ -89,10 +91,26 @@ impl SyncRunner {
         Ok(handles)
     }
 
-    /// Bind what this profile watches. Any [`SyncSubject`] — ztest's backends implement it,
-    /// and so can a consuming crate's own component; the harness never names an engine
+    /// Bind what the first phase watches. Any [`SyncSubject`] — ztest's backends implement
+    /// it, and so can a consuming crate's own component; the harness never names an engine
     pub fn sync(&mut self, subject: impl SyncSubject + 'static) {
-        self.subject = Some(Box::new(subject));
+        self.first.source = Source::Bound(Box::new(subject));
+    }
+
+    /// Later phase; its probes/knobs registered on the returned [`Phase`]
+    ///
+    /// - `build(ctx)` → subject, run at phase start (e.g. wallet needing a serving indexer)
+    /// - Starts only after the previous phase completed with no fatal violation
+    /// - Own tick/timeout/`requires_work`/probes; nothing inherited from phase 1
+    pub fn then<F, Fut, S>(&mut self, name: impl Into<String>, build: F) -> &mut Phase
+    where
+        F: FnOnce(SyncCtx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<S, PhaseError>> + Send + 'static,
+        S: SyncSubject + 'static,
+    {
+        let index = self.rest.len();
+        self.rest.push(Phase::deferred(name, build));
+        &mut self.rest[index]
     }
 
     /// Chain this run is pinned to: read from the artifact manifest at compile
@@ -107,78 +125,6 @@ impl SyncRunner {
         self.env.chain()
     }
 
-    /// Base sampling interval (default 5 s)
-    pub fn tick(&mut self, tick: Duration) -> &mut Self {
-        self.engine.tick = tick;
-        self
-    }
-    pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
-        self.engine.timeout = Some(timeout);
-        self
-    }
-
-    /// Finish at `height`, not at tip — what makes throughput a measurement of the
-    /// *software* (two runs to tip cover different work; `perf --base` refuses them)
-    pub fn until_height(&mut self, height: u32) -> &mut Self {
-        self.engine.stop_height = Some(height);
-        self
-    }
-
-    /// Ops this profile's probes will [`Work::require`](crate::sync::Work::require).
-    ///
-    /// - Checked against one live reading before the run → a subject not publishing them
-    ///   fails by series name, not as a `require` panic hours in
-    /// - Subject ↔ component agree on those series by string only, across repos
-    pub fn requires_work(&mut self, ops: OpSet) -> &mut Self {
-        self.engine.required_work = ops;
-        self
-    }
-
-    /// Widen (or narrow) one family's ready window for this profile — e.g. a cold mainnet
-    /// validator delaying zaino's first block past
-    /// `ztest::backends::zainod::family::FETCHED_HEIGHT`'s 60 s default
-    pub fn ready_within(
-        &mut self,
-        family: impl Into<crate::metrics::Family>,
-        ready: Duration,
-    ) -> &mut Self {
-        self.engine.ready.push(crate::metrics::Family { ready, ..family.into() });
-        self
-    }
-
-    /// Register a safety invariant (true at every tick)
-    pub fn always(&mut self, severity: Severity) -> ProbeBuilder<'_> {
-        self.builder(Class::Always, severity)
-    }
-    /// Register a liveness invariant (must (re)satisfy within its `window`)
-    pub fn eventually(&mut self, severity: Severity) -> ProbeBuilder<'_> {
-        self.builder(Class::Eventually, severity)
-    }
-    /// Register a coverage invariant (true on ≥1 tick over the run)
-    pub fn sometimes(&mut self) -> ProbeBuilder<'_> {
-        self.builder(Class::Sometimes, Severity::Fatal)
-    }
-    /// Register a terminal post-condition (evaluated once at tip)
-    pub fn at_completion(&mut self, severity: Severity) -> ProbeBuilder<'_> {
-        self.builder(Class::AtCompletion, severity)
-    }
-
-    fn builder(&mut self, class: Class, severity: Severity) -> ProbeBuilder<'_> {
-        let cadence = match class {
-            Class::Eventually => Cadence::Window(Duration::MAX),
-            _ => Cadence::EachTick,
-        };
-        ProbeBuilder {
-            sink: &mut self.probes,
-            class,
-            severity,
-            cadence,
-            after: None,
-            name: None,
-            hold_for: None,
-        }
-    }
-
     /// Configure the chaos schedule (`run.nemesis().at(..).partition(..)...`)
     pub fn nemesis(&mut self) -> NemesisBuilder<'_> {
         self.nemesis.builder()
@@ -187,7 +133,13 @@ impl SyncRunner {
     /// Cluster-free registration manifest (for `describe`)
     pub fn manifest(&self) -> SyncManifest {
         SyncManifest {
-            probes: self.probes.iter().map(|p| (p.name.clone(), p.class)).collect(),
+            phases: std::iter::once(&self.first)
+                .chain(&self.rest)
+                .map(|phase| PhaseManifest {
+                    name: phase.name.clone(),
+                    probes: phase.probes.iter().map(|p| (p.name.clone(), p.class)).collect(),
+                })
+                .collect(),
             scheduled_faults: self
                 .nemesis
                 .scheduled
@@ -199,55 +151,45 @@ impl SyncRunner {
         }
     }
 
-    /// Provision if needed, bind the engine over the subject, run to completion.
+    /// Provision if needed, bind the engine over the phases, run to completion.
     /// (Cluster-bound.)
     pub async fn run(self) -> SyncOutcome {
-        let Some(subject) = self.subject else {
-            return errored("run.sync(..) must be called before run.run()");
-        };
+        let SyncRunner { env, first, rest, nemesis } = self;
+        if matches!(first.source, Source::Unbound) {
+            return SyncOutcome::error_outcome(
+                "run.sync(..) must be called before run.run()".into(),
+            );
+        }
         // `ChainWork` reads `chainMetadata` through this to turn a height into a
         // work vector, and it names the segment's network. No reader = no denominator
-        let reader = match self.env.single_indexer().await {
+        let reader = match env.single_indexer().await {
             Ok(ix) => ix,
-            Err(e) => return errored(format!("bind chain reader: {e}")),
+            Err(e) => return SyncOutcome::error_outcome(format!("bind chain reader: {e}")),
         };
-        let ctx = SyncCtx::new(Some(reader));
-
-        drive(self.env, subject, ctx, self.probes, self.engine).await
+        let pods = match env.component_pods().await {
+            Ok(pods) => pods,
+            Err(e) => return SyncOutcome::error_outcome(format!("list component pods: {e}")),
+        };
+        let watched: Vec<Arc<dyn Watched>> =
+            pods.iter().cloned().map(|p| Arc::new(p) as Arc<dyn Watched>).collect();
+        let engine = SyncEngine::phased(first, rest)
+            .with_ctx(SyncCtx::new(Some(reader)).with_pods(pods))
+            .with_nemesis(&nemesis)
+            .with_watched(watched);
+        drive(env, engine).await
     }
 }
 
-/// Configure the engine over `subject`, run it, attach what the engine cannot
+/// Wire what only a detached run has onto `engine`, run it, attach what the engine cannot
 /// reach: flushed profiles + the mirrored durable report
-async fn drive(
-    env: TestEnv,
-    subject: Box<dyn SyncSubject>,
-    ctx: SyncCtx,
-    probes: Vec<ProbeSpec>,
-    opts: EngineOpts,
-) -> SyncOutcome {
+async fn drive(env: TestEnv, mut engine: SyncEngine) -> SyncOutcome {
     let detached = super::active_sync_id();
     let profile = std::env::var(super::SYNC_PROFILE_ENV).unwrap_or_default();
-    let tick = opts.tick;
-    let mut engine = SyncEngine::new(subject)
-        .with_probes(probes)
-        .with_tick(tick)
-        .with_ctx(ctx)
-        .requires_work(opts.required_work);
-    for family in opts.ready {
-        engine = engine.with_ready(family);
-    }
-    if let Some(t) = opts.timeout {
-        engine = engine.with_timeout(t);
-    }
-    if let Some(h) = opts.stop_height {
-        engine = engine.with_stop_height(h);
-    }
     // Detached: a Prometheus target, read like any component. Local runs keep the silent
     // reporter (nothing scrapes a `cargo test`)
     if detached.is_some() {
         if let Err(e) = super::export::install() {
-            return errored(format!("driver metrics exporter: {e}"));
+            return SyncOutcome::error_outcome(format!("driver metrics exporter: {e}"));
         }
         engine = engine.with_reporter(Box::new(super::export::MetricsReporter));
     }
@@ -260,8 +202,6 @@ async fn drive(
         engine = engine.with_cancel(cancel);
         tracing::info!(sync_id = %sync_id, "detached sync: stop-watch armed");
     }
-    // Nemesis application (`ChaosIndexer` wrap + timed k8s `NetworkChaos`) is
-    // cluster-side wiring; only the recorded schedule reaches `describe`
     let outcome = engine.run().await;
     if let Some(sync_id) = &detached {
         tracing::info!("profiles available with `ztest sync perf {sync_id}`");
@@ -281,18 +221,4 @@ async fn drive(
         super::detached::mark_finished(&kube, sync_id).await;
     }
     outcome
-}
-
-fn errored(msg: impl Into<String>) -> SyncOutcome {
-    SyncOutcome {
-        verdict: SyncVerdict::Errored,
-        violations: Vec::new(),
-        coverage_gaps: Vec::new(),
-        error: Some(msg.into()),
-        ticks: 0,
-        dropped_snapshots: 0,
-        segment: None,
-        target: None,
-        unpublished: Vec::new(),
-    }
 }

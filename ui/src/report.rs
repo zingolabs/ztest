@@ -129,6 +129,9 @@ pub struct ReportView {
     pub violations: Vec<(String, String)>,
     pub coverage_gaps: Vec<String>,
     pub error: Option<String>,
+    /// One line per attempted phase ([`PhaseOutcome::describe`](ztest::sync::PhaseOutcome));
+    /// drawn only for a multi-phase run
+    pub phases: Vec<String>,
     pub ticks: u64,
     pub dropped_snapshots: u64,
     pub transparent: Vec<Series>,
@@ -597,6 +600,11 @@ fn footer(out: &mut String, v: &ReportView, theme: &Theme, width: usize) {
         let _ = writeln!(out, "{}", draw(&Template::parse(src), data, width, theme));
     };
 
+    if v.phases.len() > 1 {
+        for phase in &v.phases {
+            line(row::INDENTED, &Fields::new().text("text", &**phase));
+        }
+    }
     // Wrapped, never truncated: this is the one line stating *why* the run failed, and
     // a backend error carries its cause last (`{component} {op}: {source}`) — clipping
     // to the terminal keeps the half that names nothing
@@ -802,6 +810,7 @@ mod tests {
             ],
             coverage_gaps: Vec::new(),
             error: None,
+            phases: Vec::new(),
             ticks: 118,
             dropped_snapshots: 0,
             transparent: vec![p("transparent", &wave(70_000.0, 60, 0.0), Channel::Transparent)],

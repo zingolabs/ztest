@@ -31,6 +31,7 @@ pub trait SyncSubject: Send + Sync {          // Sync, not just Send: progress(&
     async fn launch(&mut self) -> Result<(), RpcError>;              // once; no-op if it syncs itself
     async fn progress(&self) -> Result<Box<dyn ProgressView>, RpcError>;
     async fn is_complete(&self) -> bool;
+    async fn failure(&self) -> Option<String> { None }               // task died → phase Failed, checked before is_complete
     fn work_source(&self, op: Op) -> Option<&'static str> { None }   // series `progress` reads op from
     async fn stop(&mut self) -> Result<(), RpcError> { Ok(()) }      // graceful checkpoint; observers no-op
 }
@@ -93,6 +94,46 @@ Grounded in Prometheus rule evaluation + Gomega `Consistently` + CronJob semanti
 - **Multi-cadence = multiple registrations**, not a combinator (SLO multi-window multi-burn-rate): same
   predicate at 30 s and 1 h with different severities
 
+## Phases
+
+One profile = ordered phases, each a subject + its own probe set.
+
+```rust
+run.sync(zai.clone());                                  // phase 1 = the runner itself (Deref → Phase)
+run.named("index").at_completion(Fatal).check(reached_pinned_tip);
+let wallet = run.then("wallet", move |cx: SyncCtx| async move {
+    Ok(build_wallet_subject(cx.indexer_arc(), BIRTHDAY).await?)   // indexer serving by now
+});
+wallet.timeout(hours(2)).tick(secs(10));
+wallet.at_completion(Fatal).check_rpc(tree_root_matches_indexer);
+run.run().await
+```
+
+- Per phase: tick, timeout (subject construction included), `until_height`, `requires_work` preflight,
+  ready windows, probes, snapshot history, completion
+- Next phase starts only after one that **completed** with no fatal violation (fatal `always`/`eventually`,
+  fatal `at_completion`, coverage gap, `SyncSubject::failure`); recorded violations fail the verdict but let
+  it proceed
+- Later subjects built by an async factory at phase start → may depend on earlier phases' state
+- One `SyncCtx` for the run → phase-2 probes still reach the indexer + every pod
+- Outcome: `SyncOutcome.phases` (name, verdict, start, elapsed, ticks, violations, gaps, error,
+  restarts) → mirror, `status` footer, driver series `ztest_sync_phase_{started,ended}_timestamp_seconds`
+- Top-level `segment`/`target` = first phase's (what `perf --base` compares)
+
+## Component pods: exec, kill, restart
+
+- `ComponentPod` (via `handle.pod()`, `PodHandle`, `SyncCtx::pod(name)`/`indexer_pod()`): `exec(argv,
+  timeout) → ExecOutput { status, stdout, stderr }`, `read_file`, `sample`, `kill`, `await_restart`,
+  `kill_and_await_restart`
+- One exec primitive (`src/exec.rs`) under build pod, csi meter and component pods; exit code off the
+  websocket status channel
+- Kill needs `.restartable()` at topology time: renders `restartPolicy: OnFailure` +
+  `shareProcessNamespace: true` (component = PID 1 otherwise, and own-namespace init ignores SIGKILL)
+- Container restart, not pod recreation → `emptyDir` scratch + PVCs survive, pod IP + port-forwards stay
+- Kubelet crash backoff (10 s, doubling within 10 min, 5 min cap) → size restart timeouts past it
+- Runner samples every pod each tick → `Snapshot::restarts()` / `observed_restart()` / `restarting()`;
+  restart window (down, or back but subject not answering) pauses every `eventually` window
+
 ## Chaos: the nemesis
 
 Three altitudes, all **outside** the SUT:
@@ -113,6 +154,9 @@ Three altitudes, all **outside** the SUT:
   guarantee its own reversion is not shipped
 - Native, not delegated: NetworkPolicy for partitions (declarative, zero privilege) + a privileged netem
   sidecar reusing the buildkit admission machinery — no Chaos Mesh controller dependency
+- Applied today: `kill(component)` only (`run.nemesis().named("crash").at(mins(20)).kill("zai")`) — runner
+  fires it at `at` from run start, across phases; target resolved + restartability checked before the run;
+  `.after("crash")` probes arm at the kill. Network kinds stay recorded (`describe`), unapplied
 
 ## Test-author API
 
@@ -233,10 +277,12 @@ ztest cleanup <id>                            # namespace + driver pod + record 
 
 - Landed: object-safe subject seam (`sync/subject.rs`) + backend-free facade (`sync/facade.rs`), which
   compiles with no wallet feature; probe scheduler
-  and taxonomy (`sync/runner.rs`, `sync/probe.rs`); `#[ztest::sync_test]`; nemesis injectors
-  (`sync/nemesis.rs` → `NetworkChaos`); detached pod lifecycle (`sync/detached.rs`, `cli/sync/`)
-- Outstanding: the indexer proxy — programmable gRPC subjects, turning the chaos surface from "what the
-  network can do to a client" into "what a misbehaving server can do to one"
+  and taxonomy (`sync/runner.rs`, `sync/probe.rs`); phases (`sync/phase.rs`); `#[ztest::sync_test]`;
+  nemesis schedule (`sync/nemesis.rs`, `kill` applied); restart window (`sync/restart.rs`); pod exec/kill
+  (`handles/pod.rs`); detached pod lifecycle (`sync/detached.rs`, `cli/sync/`)
+- Outstanding: network fault application (`NetworkChaos`); the indexer proxy — programmable gRPC subjects,
+  turning the chaos surface from "what the network can do to a client" into "what a misbehaving server can
+  do to one"
 
 ## Open decisions
 
