@@ -341,6 +341,18 @@ impl Row {
 pub trait MetricLayout {
     /// Report order — a reader renders them top to bottom
     const ROWS: &'static [Row];
+    /// Size-tiered stores, one bar chart each (none = no LSM to show)
+    const TIERS: &'static [Tiers] = &[];
+}
+
+/// One size-tiered store's shape: `segments` and `merging` split by their `tier` label into one
+/// bar per tier, `stall_at` = count a merging tier holds before its writer waits
+#[derive(Debug, Clone, Copy)]
+pub struct Tiers {
+    pub label: &'static str,
+    pub segments: Gauge,
+    pub merging: Gauge,
+    pub stall_at: Gauge,
 }
 
 // ───────────────────────────── the exposition ─────────────────────────────

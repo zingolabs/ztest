@@ -1460,6 +1460,12 @@ async fn build_report_view(client: &Client, ns: &str, mut view: ReportView) -> R
     // spans one must not read as a clean measurement
     view.coverage_gaps.extend(scrape_gaps(&view));
 
+    let stores: Vec<_> = ztest::backends::metrics_tiers().copied().collect();
+    match ztest::api::metrics::tier_history(client, ns, &stores, window).await {
+        Ok(shapes) => view.tiers = shapes,
+        Err(e) => view.note = Some(format!("prometheus unreadable: {e}")),
+    }
+
     match ztest::api::metrics::container_history(client, ns, window).await {
         Ok(history) => view.resources = by_component(history),
         Err(e) => view.note = Some(format!("prometheus unreadable: {e}")),

@@ -22,7 +22,7 @@ use zcash_protocol::value::ZatBalance;
 use crate::component::ComponentBuilder;
 use crate::handles::HandleInner;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
-use crate::metrics::{Counter, Exporter, Exposition, Facet, Row, row};
+use crate::metrics::{Counter, Exporter, Exposition, Facet, Row, Tiers, row};
 use crate::protocol::Endpoint;
 use crate::protocol::client::JsonRpcClient;
 use crate::sync::Channel as Pool;
@@ -268,7 +268,12 @@ impl IndexerBackend for ZainoIndexer {
         pod_name: String,
     ) -> Result<crate::manifest::PodSpec, EnvError> {
         // Profiling env injected in `materialize_phase` (knows the Pyroscope endpoint)
-        let env = opts.env.clone();
+        // - colour forced like zebrad's `force_use_color` (no TTY in a pod → `auto` = plain);
+        //   first, so a test's own `env` overrides it
+        let env = [("ZAINOLOG_COLOR".to_string(), "true".to_string())]
+            .into_iter()
+            .chain(opts.env.iter().cloned())
+            .collect();
         Ok(crate::manifest::PodSpec {
             pod_name,
             category: crate::component::ComponentCategory::Indexer,
@@ -692,11 +697,40 @@ pub mod family {
     /// Validator JSON-RPC call, retries included = the ingest path's cost
     pub const VALIDATOR_RPC: Hist =
         hist("zaino_validator_rpc_duration_seconds", Dimension::Seconds);
+
+    // LSM segment sets (`receives` / `spent` / `by_hash`); segments + merging split by `tier`
+    pub const fn lsm_segments(set: &'static str) -> Gauge {
+        gauge_where("zaino_lsm_segments", Dimension::Count, "set", set)
+    }
+    pub const fn lsm_merging(set: &'static str) -> Gauge {
+        gauge_where("zaino_lsm_merging", Dimension::Count, "set", set)
+    }
+    pub const fn lsm_stall_at(set: &'static str) -> Gauge {
+        gauge_where("zaino_lsm_stall_at", Dimension::Count, "set", set)
+    }
+    // Summed over sets; merge rows / batch rows = write amplification
+    pub const LSM_BATCH_ROWS: Counter = counter("zaino_lsm_batch_rows_total", Dimension::Count);
+    pub const LSM_MERGE_ROWS: Counter = counter("zaino_lsm_merge_rows_total", Dimension::Count);
+    pub const LSM_MERGE_BYTES: Counter = counter("zaino_lsm_merge_bytes_total", Dimension::Bytes);
+    pub const LSM_MERGE: Hist = hist("zaino_lsm_merge_duration_seconds", Dimension::Seconds);
+    /// Unpublished = no commit ever waited on a merge
+    pub const LSM_STALL: Hist = hist("zaino_lsm_stall_duration_seconds", Dimension::Seconds);
 }
+
+const fn lsm(set: &'static str) -> Tiers {
+    Tiers {
+        label: set,
+        segments: family::lsm_segments(set),
+        merging: family::lsm_merging(set),
+        stall_at: family::lsm_stall_at(set),
+    }
+}
+
+const TIERS: [Tiers; 3] = [lsm("receives"), lsm("spent"), lsm("by_hash")];
 
 /// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns scannable
 #[rustfmt::skip]
-const ROWS: [Row; 15] = [
+const ROWS: [Row; 20] = [
     // Directions kept apart: only outputs are checkable against the note-commitment trees
     row("transparent in", family::TRANSPARENT_INPUTS.rate(), Facet::Transparent).pool(Pool::Transparent),
     row("transparent out", family::TRANSPARENT_OUTPUTS.rate(), Facet::Transparent).pool(Pool::Transparent),
@@ -708,16 +742,23 @@ const ROWS: [Row; 15] = [
     // Transactions, not ops (one tx spans many ops → never joins the stack above)
     row("transactions", family::TRANSACTIONS.rate(), Facet::Throughput),
     row("validator RPC", family::VALIDATOR_RPC.mean(), Facet::WritePath),
+    row("merge", family::LSM_MERGE.mean(), Facet::WritePath),
+    row("commit stall", family::LSM_STALL.mean(), Facet::WritePath),
     row("fetched", family::FETCH_HEIGHT.level(), Facet::Progress),
     row("best tip", family::BEST_TIP.level(), Facet::Progress),
     row("compact block", family::index_finalized_height(ZainoIndex::CompactBlock).level(), Facet::Progress),
     row("tree state", family::index_finalized_height(ZainoIndex::TreeState).level(), Facet::Progress),
     row("transparent address", family::index_finalized_height(ZainoIndex::TransparentAddress).level(), Facet::Progress),
     row("reorgs", family::REORGS.rate(), Facet::Progress),
+    // Byte flow first: the store panel plots its first row's unit
+    row("merge write", family::LSM_MERGE_BYTES.rate(), Facet::Store),
+    row("rows batched", family::LSM_BATCH_ROWS.rate(), Facet::Store),
+    row("rows merged", family::LSM_MERGE_ROWS.rate(), Facet::Store),
 ];
 
 impl crate::metrics::MetricLayout for ZainoIndexer {
     const ROWS: &'static [Row] = &ROWS;
+    const TIERS: &'static [Tiers] = &TIERS;
 }
 
 impl Observe for ZainoIndexer {

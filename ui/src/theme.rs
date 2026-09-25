@@ -110,6 +110,8 @@ pub struct ThemeChars {
     pub clip_start: char,
     pub clip_end: char,
     pub tick_now: char,
+    pub busy: char,  // tier bars: a merge in flight on this tier
+    pub limit: char, // tier bars: the count a writer stalls at
     pub graph: super::plot::GraphMode,
     pub frame: [&'static str; 6],
 }
@@ -144,6 +146,8 @@ impl ThemeChars {
             clip_start: '◀',
             clip_end: '▶',
             tick_now: '▼',
+            busy: '⟳',
+            limit: '┆',
             graph: super::plot::GraphMode::Braille,
             frame: ["╭", "╮", "╰", "╯", "─", "│"],
         }
@@ -178,6 +182,8 @@ impl ThemeChars {
             clip_start: '<',
             clip_end: '>',
             tick_now: 'v',
+            busy: '@',
+            limit: ':',
             graph: super::plot::GraphMode::Ascii,
             frame: ["+", "+", "+", "+", "-", "|"],
         }
@@ -238,6 +244,8 @@ mod tests {
                 .chain([c.bar_fill.to_string(), c.bar_empty.to_string()])
                 .collect::<Vec<_>>(),
         );
+        // Tier bars: fill, merge mark and stall line share one row
+        distinct("tier", &[c.bar_fill.to_string(), c.busy.to_string(), c.limit.to_string()]);
     }
 
     /// The whole point of the table: every role answers in both encodings, and the ASCII
@@ -278,6 +286,8 @@ mod tests {
             ("clip_start", c.clip_start),
             ("clip_end", c.clip_end),
             ("tick_now", c.tick_now),
+            ("busy", c.busy),
+            ("limit", c.limit),
         ] {
             assert!(ch.is_ascii(), "ascii `{role}` is {ch:?}");
         }

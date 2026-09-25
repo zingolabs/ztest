@@ -22,13 +22,20 @@ pub mod zingolib;
 struct MetricsBackend {
     label: &'static str,
     rows: &'static [crate::metrics::Row],
+    tiers: &'static [crate::metrics::Tiers],
     heights: Option<crate::sync::Heights>,
 }
 
 impl MetricsBackend {
     /// Component whose sync is observable — rows + the heights that measure it
     const fn observed<T: crate::sync::Observe>(label: &'static str) -> Self {
-        Self { label, rows: <T as crate::metrics::MetricLayout>::ROWS, heights: Some(T::HEIGHTS) }
+        use crate::metrics::MetricLayout;
+        Self {
+            label,
+            rows: <T as MetricLayout>::ROWS,
+            tiers: <T as MetricLayout>::TIERS,
+            heights: Some(T::HEIGHTS),
+        }
     }
 
     /// Not a sync subject, but publishes heights a watcher reads — a validator's view of the
@@ -37,7 +44,7 @@ impl MetricsBackend {
         label: &'static str,
         heights: crate::sync::Heights,
     ) -> Self {
-        Self { label, rows: T::ROWS, heights: Some(heights) }
+        Self { label, rows: T::ROWS, tiers: T::TIERS, heights: Some(heights) }
     }
 }
 
@@ -50,6 +57,11 @@ const METRICS_BACKENDS: &[MetricsBackend] = &[
 /// gone by report time)
 pub fn metrics_components() -> impl Iterator<Item = &'static crate::metrics::Row> {
     METRICS_BACKENDS.iter().flat_map(|b| b.rows)
+}
+
+/// Every bundled backend's size-tiered stores
+pub fn metrics_tiers() -> impl Iterator<Item = &'static crate::metrics::Tiers> {
+    METRICS_BACKENDS.iter().flat_map(|b| b.tiers)
 }
 
 /// Height gauges the bundled backends declare, for a reader resolving a progress row by

@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kube::Client;
 use serde::Deserialize;
 
-use crate::metrics::{Facet, Family, Reading, Row, SCRAPE_INTERVAL, Unit};
+use crate::metrics::{Facet, Family, Reading, Row, SCRAPE_INTERVAL, Tiers, Unit};
 use crate::portforward::Forwarder;
 
 /// Container cpu, cores. Cumulative seconds-per-second → a rate
@@ -405,6 +405,89 @@ pub async fn totals_now(
         .into_iter()
         .filter_map(|(labels, (_, v))| Some((labels.get(by)?.clone(), v)))
         .collect())
+}
+
+// ──────────────────────────────── tiers ────────────────────────────────
+
+/// Label a [`Tiers`] store splits its gauges by
+pub const TIER_LABEL: &str = "tier";
+
+/// One tier over the window: segments at its end, at its peak, and a merge running at its end
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TierBar {
+    pub tier: u32,
+    pub now: f64,
+    pub peak: f64,
+    pub merging: bool,
+}
+
+/// One store's bars, tier 0 up to its highest ever occupied
+#[derive(Debug, Clone, PartialEq)]
+pub struct TierShape {
+    pub label: String,
+    pub bars: Vec<TierBar>,
+    pub stall_at: Option<f64>,
+}
+
+/// Every declared store's shape over `window` (never occupied → omitted)
+pub async fn tier_history(
+    client: &Client,
+    namespace: &str,
+    stores: &[Tiers],
+    window: (SystemTime, SystemTime),
+) -> Result<Vec<TierShape>, crate::error::PipelineError> {
+    let reader = Reader::open(client).await?;
+    let raw = |gauge: crate::metrics::Gauge| promql_raw(gauge.level(), namespace, span(window));
+    let mut out = Vec::new();
+    for store in stores {
+        let segments = reader.raw(&raw(store.segments), window.1).await?;
+        let merging = reader.raw(&raw(store.merging), window.1).await?;
+        let stall_at = reader.raw(&raw(store.stall_at), window.1).await?;
+        let stall_at = latest_value(stall_at.iter().flat_map(|s| &s.points));
+        let bars = tier_bars(&segments, &merging);
+        if !bars.is_empty() {
+            out.push(TierShape { label: store.label.to_string(), bars, stall_at });
+        }
+    }
+    Ok(out)
+}
+
+/// Series split by [`TIER_LABEL`] → one bar per tier, `0..=` the highest ever occupied.
+///
+/// - Tier's label sets pooled (a restart → a new pod label, same tier)
+/// - `now` / `merging` = newest sample across them
+fn tier_bars(segments: &[Labelled], merging: &[Labelled]) -> Vec<TierBar> {
+    let by_tier = |series: &[Labelled]| -> BTreeMap<u32, Vec<(f64, f64)>> {
+        let mut tiers: BTreeMap<u32, Vec<(f64, f64)>> = BTreeMap::new();
+        for s in series {
+            if let Some(tier) = s.labels.get(TIER_LABEL).and_then(|t| t.parse().ok()) {
+                tiers.entry(tier).or_default().extend(&s.points);
+            }
+        }
+        tiers
+    };
+    let (segments, merging) = (by_tier(segments), by_tier(merging));
+    let peak = |points: &[(f64, f64)]| points.iter().map(|&(_, v)| v).fold(0.0, f64::max);
+    let Some(highest) = segments.iter().filter(|(_, p)| peak(p) > 0.0).map(|(&t, _)| t).max()
+    else {
+        return Vec::new();
+    };
+    (0..=highest)
+        .map(|tier| {
+            let points = segments.get(&tier).map_or(&[][..], Vec::as_slice);
+            TierBar {
+                tier,
+                now: latest_value(points).unwrap_or(0.0),
+                peak: peak(points),
+                merging: merging.get(&tier).and_then(latest_value).is_some_and(|busy| busy > 0.0),
+            }
+        })
+        .collect()
+}
+
+/// Value of the latest-stamped sample
+fn latest_value<'a>(points: impl IntoIterator<Item = &'a (f64, f64)>) -> Option<f64> {
+    points.into_iter().max_by(|a, b| a.0.total_cmp(&b.0)).map(|&(_, v)| v)
 }
 
 /// What the kubelet saw of a run's containers, each split per container.
@@ -1091,5 +1174,40 @@ mod tests {
         assert_eq!(empty.mean(), None);
         assert_eq!(empty.peak(), None);
         assert_eq!(empty.last(), None);
+    }
+
+    /// Tiers pooled across a restart's two pods, newest sample wins, a hole below the top tier
+    /// kept as zero, a tier above it never occupied dropped, merging read at the window's end
+    #[test]
+    fn tier_bars_pool_label_sets_and_span_tier_zero_to_the_highest_occupied() {
+        let series = |tier: &str, pod: &str, points: Vec<(f64, f64)>| Labelled {
+            labels: BTreeMap::from([
+                (TIER_LABEL.to_string(), tier.to_string()),
+                ("pod".to_string(), pod.to_string()),
+            ]),
+            points,
+        };
+        let segments = [
+            series("0", "a", vec![(0.0, 3.0), (10.0, 7.0)]),
+            series("0", "b", vec![(20.0, 2.0)]),
+            series("2", "a", vec![(0.0, 1.0), (10.0, 4.0), (20.0, 1.0)]),
+            series("3", "a", vec![(0.0, 0.0), (20.0, 0.0)]),
+            series("x", "a", vec![(20.0, 9.0)]),
+        ];
+        let merging = [
+            series("0", "a", vec![(0.0, 1.0), (10.0, 1.0)]),
+            series("0", "b", vec![(20.0, 0.0)]),
+            series("2", "b", vec![(20.0, 1.0)]),
+        ];
+
+        assert_eq!(
+            tier_bars(&segments, &merging),
+            vec![
+                TierBar { tier: 0, now: 2.0, peak: 7.0, merging: false },
+                TierBar { tier: 1, now: 0.0, peak: 0.0, merging: false },
+                TierBar { tier: 2, now: 1.0, peak: 4.0, merging: true },
+            ]
+        );
+        assert_eq!(tier_bars(&[series("0", "a", vec![(0.0, 0.0)])], &[]), vec![]);
     }
 }

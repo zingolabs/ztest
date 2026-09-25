@@ -16,7 +16,7 @@ use owo_colors::OwoColorize as _;
 
 use super::Theme;
 use super::boxes::{beside, boxed, interior};
-use super::layout::{display_width, truncate};
+use super::layout::{display_width, pad, truncate};
 use super::plot::{self, Band, Palette, PlotOpts};
 use super::template::{Fields, Template};
 use super::text::y_axis;
@@ -24,6 +24,7 @@ use ztest::api::Reading;
 use ztest::api::Series;
 use ztest::api::SyncStatus;
 use ztest::api::Unit;
+use ztest::api::metrics::{TierBar, TierShape};
 use ztest::api::{format_elapsed, thousands, unit_value};
 
 /// Full terminal, capped. Past this the plots stop gaining resolution the eye can use
@@ -32,6 +33,9 @@ const MAX_WIDTH: usize = 160;
 
 /// Below this a single column is wider than two cramped ones
 const MIN_TWO_COLUMN: usize = 100;
+
+/// Narrowest tier column worth drawing beside another (below → stores stack)
+const MIN_TIER_COLUMN: usize = 30;
 
 const PLOT_ROWS: usize = 5;
 /// cpu over mem in one panel: two stacks, each shorter than a lone plot
@@ -141,6 +145,7 @@ pub struct ReportView {
     /// Per-stage cost + its tail. Paired by label: `fetch` carries `fetch p99`
     pub write_path: Vec<Series>,
     pub store: Vec<Series>,
+    pub tiers: Vec<TierShape>,
     pub resources: Vec<ComponentResources>,
     /// `label <- family{sel}` the build never published (em-dashes read like a quiet run)
     pub unpublished: Vec<String>,
@@ -186,9 +191,13 @@ pub fn render_sync_report(view: &ReportView, theme: &Theme, width: usize) -> Str
         ),
         (
             latency_box("write path", &view.write_path, view, theme, left_w),
-            gauge_box("store", &view.store, view, theme, right_w),
+            store_box("store", &view.store, view, theme, right_w),
         ),
     ];
+    // Full width, not paired: one column per store reads across as one shape
+    if !view.tiers.is_empty() {
+        panels.push((tiers_box(&view.tiers, theme, width), Vec::new()));
+    }
     match view.resources.is_empty() {
         true => panels.push((empty(theme, "resources", view, left_w), Vec::new())),
         // Pairwise: a third component earns its own row rather than a narrower one
@@ -497,9 +506,9 @@ fn latency_box(
     boxed(title, "", &body, width, theme)
 }
 
-/// A held quantity rather than a flow: plotted as published, summarised by where it
-/// finished. No total — integrating a size yields byte-seconds
-fn gauge_box(
+/// Store's flows: plot = rows in the first row's unit (never two units on one axis), then one
+/// `avg · peak · total` line per row
+fn store_box(
     title: &str,
     series: &[Series],
     v: &ReportView,
@@ -511,20 +520,153 @@ fn gauge_box(
         return empty(theme, title, v, width);
     }
     let unit = series[0].unit;
-    let mut body: Vec<String> = stacked(series, PLOT_ROWS, Some(unit), inner, 0, theme)
+    let plotted: Vec<Series> = series.iter().filter(|s| s.unit == unit).cloned().collect();
+    let mut body: Vec<String> = stacked(&plotted, PLOT_ROWS, Some(unit), inner, 0, theme)
         .into_iter()
         .map(|(label, plotted)| format!("{} {plotted}", label.style(theme.styles.dim)))
         .collect();
     for s in series {
-        let Some(peak) = s.peak() else { continue };
-        let mut parts = vec![format!("peak {}", unit_value(unit, peak))];
-        if let Some(last) = s.last() {
-            parts.push(format!("final {}", unit_value(unit, last)));
-        }
-        let sep = format!(" {} ", theme.chars.dot);
-        body.push(label_value(&s.label, &parts.join(&sep), inner, theme));
+        let summary = summary_text(std::slice::from_ref(s), s.total, theme);
+        body.push(label_value(&s.label, &summary, inner, theme));
     }
     boxed(title, "", &body, width, theme)
+}
+
+/// Size-tiered stores side by side, bars on one scale shared by every store (comparable)
+///
+/// - bar = segments at the window's end; `(max N)` = the run's peak where above it
+/// - `limit` glyph = stall count, `busy` glyph = merge in flight
+fn tiers_box(shapes: &[TierShape], theme: &Theme, width: usize) -> Vec<String> {
+    let inner = interior(width);
+    let sep = format!(" {} ", theme.chars.vbar.style(theme.styles.dim));
+    let gaps = display_width(&sep) * shapes.len().saturating_sub(1);
+    let column = inner.saturating_sub(gaps) / shapes.len().max(1);
+    let two_up = column >= MIN_TIER_COLUMN;
+    let column = if two_up { column } else { inner };
+
+    let ceiling = shapes
+        .iter()
+        .flat_map(|s| s.bars.iter().map(|b| b.now.max(b.peak)).chain(s.stall_at))
+        .fold(1.0, f64::max);
+    let grid = TierGrid::fit(shapes, ceiling, column);
+    let blocks: Vec<Vec<String>> = shapes.iter().map(|s| tier_column(s, &grid, theme)).collect();
+
+    let mut body = Vec::new();
+    match two_up {
+        true => {
+            let rows = blocks.iter().map(Vec::len).max().unwrap_or(0);
+            for i in 0..rows {
+                let cells: Vec<String> = blocks
+                    .iter()
+                    .map(|b| pad(b.get(i).map_or("", String::as_str), column))
+                    .collect();
+                body.push(cells.join(&sep));
+            }
+        }
+        false => {
+            for (i, block) in blocks.into_iter().enumerate() {
+                if i > 0 {
+                    body.push(String::new());
+                }
+                body.extend(block);
+            }
+        }
+    }
+    let dot = theme.chars.dot;
+    body.push(
+        format!(
+            "{} stall {dot} {} merging {dot} (max) = run peak",
+            theme.chars.limit, theme.chars.busy
+        )
+        .style(theme.styles.dim)
+        .to_string(),
+    );
+    boxed("segments by tier", "", &body, width, theme)
+}
+
+/// Column geometry shared by every store (one cell = one count everywhere)
+struct TierGrid {
+    ceiling: f64,
+    tag_w: usize,
+    now_w: usize,
+    peak_w: usize,
+    cells: usize,
+}
+
+impl TierGrid {
+    fn fit(shapes: &[TierShape], ceiling: f64, column: usize) -> TierGrid {
+        let bars = || shapes.iter().flat_map(|s| &s.bars);
+        let tag_w = bars().map(|b| tier_tag(b).len()).max().unwrap_or(0);
+        let now_w = bars().map(|b| tier_count(b.now).len()).max().unwrap_or(0);
+        let peak_w = bars().filter_map(tier_peak).map(|p| p.len()).max().unwrap_or(0);
+        // tag, space, bar, space, count, peak
+        let cells = column.saturating_sub(tag_w + 1 + 1 + now_w + peak_w).max(1);
+        TierGrid { ceiling, tag_w, now_w, peak_w, cells }
+    }
+}
+
+fn tier_tag(b: &TierBar) -> String {
+    format!("t{}", b.tier)
+}
+
+fn tier_count(v: f64) -> String {
+    thousands(v.round() as u64)
+}
+
+fn tier_peak(b: &TierBar) -> Option<String> {
+    (b.peak > b.now).then(|| format!(" (max {})", tier_count(b.peak)))
+}
+
+/// One store: `label  N segments · k merging`, then `t<tier> <bar> <now> (max <peak>)` per tier
+fn tier_column(shape: &TierShape, grid: &TierGrid, theme: &Theme) -> Vec<String> {
+    let total: f64 = shape.bars.iter().map(|b| b.now).sum();
+    let state = match shape.bars.iter().filter(|b| b.merging).count() {
+        0 => "idle".to_string(),
+        n => format!("{n} merging"),
+    };
+    let head = format!(
+        "{}  {} segments {} {state}",
+        shape.label.style(theme.styles.count),
+        tier_count(total),
+        theme.chars.dot
+    );
+
+    let TierGrid { tag_w, now_w, peak_w, .. } = *grid;
+    let mut lines = vec![head];
+    for b in &shape.bars {
+        let bar = tier_bar(b, shape.stall_at, grid, theme);
+        let peak = format!("{:<peak_w$}", tier_peak(b).unwrap_or_default());
+        lines.push(format!(
+            "{:<tag_w$} {bar} {:>now_w$}{}",
+            tier_tag(b),
+            tier_count(b.now),
+            peak.style(theme.styles.dim)
+        ));
+    }
+    lines
+}
+
+/// `cells` wide: fill to `now` (≥ 1 cell when non-zero), `busy` right after it, `limit` at the
+/// stall count where the fill has not reached
+fn tier_bar(b: &TierBar, stall_at: Option<f64>, grid: &TierGrid, theme: &Theme) -> String {
+    let (ceiling, cells) = (grid.ceiling, grid.cells);
+    let at = |v: f64| ((v / ceiling * cells as f64).round() as usize).min(cells);
+    let fill = match b.now > 0.0 {
+        true => at(b.now).max(1),
+        false => 0,
+    };
+    let limit = stall_at.map(|s| at(s).min(cells - 1));
+    let busy = b.merging.then_some(fill.min(cells - 1));
+    (0..cells)
+        .map(|c| match c {
+            c if Some(c) == busy && c >= fill => {
+                theme.chars.busy.style(theme.styles.skip).to_string()
+            }
+            c if c < fill => theme.chars.bar_fill.to_string(),
+            c if Some(c) == limit => theme.chars.limit.style(theme.styles.dim).to_string(),
+            _ => " ".to_string(),
+        })
+        .collect()
 }
 
 /// One component's draw and its disk. The title carries the component, so each summary
@@ -785,6 +927,23 @@ mod tests {
         Series { reading: Some(reading), ..series(label, Unit::Millis, values) }
     }
 
+    /// `(now, peak, merging)` per tier from 0; stall at 24 (fanout 8)
+    fn tiers(label: &str, bars: &[(u32, u32, bool)]) -> TierShape {
+        TierShape {
+            label: label.into(),
+            bars: (0..)
+                .zip(bars)
+                .map(|(tier, &(now, peak, merging))| TierBar {
+                    tier,
+                    now: now.into(),
+                    peak: peak.into(),
+                    merging,
+                })
+                .collect(),
+            stall_at: Some(24.0),
+        }
+    }
+
     pub(super) fn view() -> ReportView {
         ReportView {
             sync_id: "zaino-index-construction-c3115f50".into(),
@@ -839,7 +998,16 @@ mod tests {
                 ),
                 series("errors", Unit::Count, &[0.0; 60]),
             ],
-            store: vec![series("db used", Unit::Bytes, &wave(4e9, 60, 0.0))],
+            store: vec![
+                series("merge write", Unit::BytesPerSec, &wave(3.1e7, 60, 0.0)),
+                series("rows batched", Unit::PerSec, &wave(412_000.0, 60, 0.0)),
+                series("rows merged", Unit::PerSec, &wave(1.3e6, 60, 7.0)),
+            ],
+            tiers: vec![
+                tiers("receives", &[(7, 7, false), (11, 14, true), (3, 3, false), (1, 1, true)]),
+                tiers("spent", &[(5, 5, false), (6, 6, false), (4, 4, true), (3, 3, false)]),
+                tiers("by_hash", &[(4, 4, false), (3, 3, false), (0, 2, false), (1, 1, false)]),
+            ],
             resources: vec![
                 ComponentResources {
                     component: "zainod".into(),
@@ -1087,13 +1255,48 @@ mod tests {
         assert!(!rendered.iter().any(|l| l.contains("fetch p99 ")), "no row of its own");
     }
 
-    /// Integrating a held size yields byte-seconds; only a flow has a total
+    /// Byte flow plotted alone (its axis in bytes/s, never shared with rows/s); every row still
+    /// gets its own `avg · peak` line, `total` where the row carries one
     #[test]
-    fn a_store_gauge_reports_where_it_finished_and_never_a_total() {
-        let rendered = gauge_box("store", &view().store, &view(), &theme(), 60);
-        let summary = rendered.iter().find(|l| l.contains("peak")).expect("a summary");
-        assert!(summary.contains("final"), "{summary}");
-        assert!(!rendered.iter().any(|l| l.contains("total")), "{rendered:#?}");
+    fn the_store_plots_its_first_unit_and_summarises_every_row() {
+        let rendered = store_box("store", &view().store, &view(), &theme(), 60);
+        let axis_top = rendered.get(1).expect("a plotted row");
+        assert!(axis_top.contains("B/s"), "{axis_top}");
+        for (label, total) in
+            [("merge write", false), ("rows batched", true), ("rows merged", true)]
+        {
+            let line = rendered.iter().find(|l| l.contains(label)).expect(label);
+            assert!(line.contains("avg") && line.contains("peak"), "{line}");
+            assert_eq!(line.contains("total"), total, "{line}");
+        }
+    }
+
+    /// Three stores side by side at 100 cols, stacked below the column minimum; every line
+    /// exactly the box width; bars on one scale, merge mark after the fill, stall line where
+    /// the fill has not reached, peak shown only where above now
+    #[test]
+    fn tier_bars_share_a_scale_mark_merges_and_stalls_and_stack_when_narrow() {
+        let shapes = view().tiers;
+        let wide = tiers_box(&shapes, &theme(), 100);
+        assert!(wide.iter().all(|l| display_width(l) == 100), "{wide:#?}");
+        let head = &wide[1];
+        for label in ["receives", "spent", "by_hash"] {
+            assert!(head.contains(label), "{head}");
+        }
+        assert!(head.contains("22 segments · 2 merging"), "{head}");
+        assert!(head.contains("8 segments · idle"), "{head}");
+
+        let t1 = &wide[3];
+        assert!(t1.contains("11 (max 14)"), "receives t1 peak: {t1}");
+        assert!(t1.contains(&format!("{}{}", "█", '⟳')), "merge mark after fill: {t1}");
+        let t0 = &wide[2];
+        assert!(t0.contains('┆') && !t0.contains("max"), "stall line, no peak: {t0}");
+        assert!(wide.iter().any(|l| l.contains("0 (max 2)")), "emptied tier keeps its peak");
+
+        let narrow = tiers_box(&shapes, &theme(), 80);
+        assert!(narrow.iter().all(|l| display_width(l) == 80), "{narrow:#?}");
+        let heads: Vec<_> = narrow.iter().filter(|l| l.contains("segments ·")).collect();
+        assert_eq!(heads.len(), 3, "one header line per stacked store: {narrow:#?}");
     }
 
     /// Queried and dropped, these were 10 of 23 rows: the whole per-block cost breakdown
@@ -1102,7 +1305,8 @@ mod tests {
     fn the_write_path_and_store_facets_reach_the_report() {
         let rendered = render_sync_report(&view(), &theme(), 120);
         assert!(rendered.contains("write path"), "{rendered}");
-        assert!(rendered.contains("db used"), "{rendered}");
+        assert!(rendered.contains("merge write"), "{rendered}");
+        assert!(rendered.contains("segments by tier"), "{rendered}");
     }
 
     /// Prometheus gone or the run past retention: state it, never draw an empty frame

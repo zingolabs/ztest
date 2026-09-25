@@ -4,7 +4,7 @@
 //!   merged chronologically across pods
 //! - Display: [`component_section`] tails to [`LogTail`] (capture + record never cap)
 //! - Faithful: components own formatting + colour (zebrad `force_use_color`, zaino
-//!   `ZAINOLOG_FORMAT=stream`); ztest never parses/reassembles/recolours a body
+//!   its default `terminal` format); ztest never parses/reassembles/recolours a body
 //! - ANSI stripped once at the display boundary, only for a non-colour sink
 
 use std::path::Path;
