@@ -280,6 +280,11 @@ impl SyncEngine {
         self.first.until_height(height);
         self
     }
+    /// Complete `blocks` past the first reading (see [`Phase::for_blocks`])
+    pub fn with_stop_after(mut self, blocks: u32) -> Self {
+        self.first.for_blocks(blocks);
+        self
+    }
 
     pub fn with_history_cap(mut self, cap: usize) -> Self {
         self.history_cap = cap;
@@ -660,6 +665,9 @@ impl PhaseRun<'_> {
             };
             last_work = self.read_work(&mut chain_work, progress.as_ref(), last_work).await;
             let snap = Arc::new(builder.build(progress.as_ref(), now, last_work, events));
+            if let Some(blocks) = self.phase.stop_after.take() {
+                self.phase.stop_height = Some(snap.height().saturating_add(blocks));
+            }
             let mark = Mark::new(snap.height(), last_work, now);
             origin.get_or_insert(mark);
             head = Some(mark);
@@ -1344,6 +1352,28 @@ mod tests {
         let out = run.run().await;
         assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
         assert!(out.violations.is_empty());
+    }
+
+    /// Stop resolved off the first reading, not registration (live tip unknown until the phase opens)
+    #[tokio::test(start_paused = true)]
+    async fn stop_after_counts_from_the_first_reading_and_ignores_the_subjects_own_completion() {
+        let script = (10..=20).map(|h| p(h, 20)).collect();
+        let mut run = fast_runner(FakeSubject::new(script).never_complete()).with_stop_after(3);
+        let finished_at = Arc::new(AtomicUsize::new(0));
+        let seen = finished_at.clone();
+        run.at_completion(Severity::Fatal).check(move |s: &Snapshot| {
+            seen.store(s.height() as usize, Ordering::SeqCst);
+            Verdict::Satisfied
+        });
+
+        let out = run.run().await;
+
+        assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
+        assert_eq!(
+            finished_at.load(Ordering::SeqCst),
+            14,
+            "stop at 10 (first reading) + 3, then one fresh read for the final snapshot"
+        );
     }
 
     #[tokio::test(start_paused = true)]

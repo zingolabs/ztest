@@ -1,7 +1,7 @@
 //! Zcash JSON-RPC client. [`ZcashRpc`] = authed transport + per-component
 //! attribution label + typed methods over the bitcoind-derived envelope.
 //!
-//! - Served natively by `zebrad`/`zcashd`, proxied by `zaino` on its `jsonrpc` port
+//! - Served natively by `zebrad`/`zcashd`
 //! - ztest-owned: no ecosystem crate covers the surface
 //!   (`docs/architecture-decisions/`) — `zaino-fetch` drops the mining RPCs and
 //!   `process::exit`s, `zebra-rpc` is server-side + drags Zebra,

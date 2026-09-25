@@ -4,6 +4,7 @@
 //! - No helpers shared with `lightwalletd` (the two may diverge in framing)
 //! - One ingest path: validator JSON-RPC (`[source]`) → per-index stores under the scratch mount
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,11 +22,9 @@ use zcash_protocol::value::ZatBalance;
 use crate::component::ComponentBuilder;
 use crate::handles::HandleInner;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
-use crate::handles::validator::BlockchainInfo;
 use crate::metrics::{Counter, Exporter, Exposition, Facet, Row, row};
 use crate::protocol::Endpoint;
 use crate::protocol::client::JsonRpcClient;
-use crate::protocol::zcash_rpc::ZcashRpc;
 use crate::sync::Channel as Pool;
 use crate::sync::{Cost, Heights, Observation, Observe, Op, ProgressView, SyncSubject, Work};
 use crate::{EnvError, RpcError};
@@ -50,6 +49,14 @@ pub fn image_uri(
 #[derive(Debug, Clone, Default)]
 pub struct ZainoBackend {
     chainview_peers: Vec<String>,
+    fetch: Fetch,
+}
+
+/// `[fetch]` keys set on the builder (`None` = zainod's own default, key left out)
+#[derive(Debug, Clone, Copy, Default)]
+struct Fetch {
+    finalised_depth: Option<u32>,
+    concurrency: Option<NonZeroU32>,
 }
 
 /// One of zainod's stores: `[index.<label>]` table, `index="<label>"` metric label
@@ -64,7 +71,7 @@ impl ZainoIndex {
     pub const ALL: [ZainoIndex; 3] =
         [ZainoIndex::CompactBlock, ZainoIndex::TreeState, ZainoIndex::TransparentAddress];
 
-    const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             ZainoIndex::CompactBlock => "compact_block",
             ZainoIndex::TreeState => "tree_state",
@@ -87,6 +94,22 @@ impl crate::component::Indexer<ZainoBackend> {
     /// - Checked at `env.build()` against the env's validators (≠ the block source)
     pub fn chainview_peer(mut self, validator: impl Into<String>) -> Self {
         self.backend.chainview_peers.push(validator.into());
+        self
+    }
+
+    /// `[fetch] finalised_depth`: blocks held in pre-commit below the tip
+    ///
+    /// - Unset = zainod's default (regtest: [`REGTEST_FINALISED_DEPTH`])
+    pub fn finalised_depth(mut self, depth: u32) -> Self {
+        self.backend.fetch.finalised_depth = Some(depth);
+        self
+    }
+
+    /// `[fetch] concurrency`: block fetches in flight during bulk sync
+    ///
+    /// - Unset = zainod's default
+    pub fn fetch_concurrency(mut self, in_flight: NonZeroU32) -> Self {
+        self.backend.fetch.concurrency = Some(in_flight);
         self
     }
 }
@@ -127,8 +150,20 @@ impl IndexerConfig for ZainoBackend {
                 ),
             });
         }
-        let toml =
-            zainod_conf(network, source, &self.chainview_peers, opts.image.metrics_enabled());
+        let fetch = Fetch {
+            finalised_depth: self
+                .fetch
+                .finalised_depth
+                .or((network == crate::Network::Regtest).then_some(REGTEST_FINALISED_DEPTH)),
+            ..self.fetch
+        };
+        let toml = zainod_conf(
+            network,
+            source,
+            &self.chainview_peers,
+            fetch,
+            opts.image.metrics_enabled(),
+        );
         opts.mounts.push(crate::regtest::config_mount_inline(toml, ZAINO_CONFIG));
         Ok(opts)
     }
@@ -152,6 +187,7 @@ fn zainod_conf(
     network: crate::Network,
     source: &str,
     chainview_peers: &[String],
+    fetch: Fetch,
     metrics: bool,
 ) -> String {
     let listen = crate::ports::LISTEN_ALL;
@@ -174,15 +210,17 @@ fn zainod_conf(
         out.push_str(&format!("\n[[chainview_peers]]\n{}", validator(peer)));
     }
     out.push_str(&format!(
-        "\n[serve]\ngrpc_listen_address = \"{listen}:{grpc}\"\n\
-         jsonrpc_listen_address = \"{listen}:{jsonrpc}\"\n",
-        grpc = crate::ports::ZAINO_GRPC,
-        jsonrpc = crate::ports::ZAINO_JSONRPC,
+        "\n[serve]\ngrpc_listen_address = \"{listen}:{}\"\n",
+        crate::ports::ZAINO_GRPC
     ));
-    // Regtest depth: fixtures never reach the 1000 default; 100 = a finalised band + a reorg
-    // window (0 would make every block durable → no reorg recoverable)
-    if regtest {
-        out.push_str(&format!("\n[fetch]\nfinalised_depth = {REGTEST_FINALISED_DEPTH}\n"));
+    if fetch.finalised_depth.is_some() || fetch.concurrency.is_some() {
+        out.push_str("\n[fetch]\n");
+    }
+    if let Some(depth) = fetch.finalised_depth {
+        out.push_str(&format!("finalised_depth = {depth}\n"));
+    }
+    if let Some(in_flight) = fetch.concurrency {
+        out.push_str(&format!("concurrency = {in_flight}\n"));
     }
     for index in ZainoIndex::ALL {
         out.push_str(&format!(
@@ -200,7 +238,7 @@ fn zainod_conf(
 /// Metrics port only where something binds it (`prometheus` feature)
 fn declared_ports(image: &crate::inventory::ImageSpec) -> Vec<(&'static str, u16)> {
     crate::backends::metrics_port_appended(
-        &[("grpc", crate::ports::ZAINO_GRPC), ("jsonrpc", crate::ports::ZAINO_JSONRPC)],
+        &[("grpc", crate::ports::ZAINO_GRPC)],
         image.metrics_enabled().then_some(crate::ports::ZAINO_METRICS),
     )
 }
@@ -392,13 +430,7 @@ impl IndexerBackend for ZainoIndexer {
         let shielded_protocol = match protocol {
             ShieldedProtocol::Sapling => proto::ShieldedProtocol::Sapling as i32,
             ShieldedProtocol::Orchard => proto::ShieldedProtocol::Orchard as i32,
-            other => {
-                return Err(RpcError::decode(
-                    COMPONENT,
-                    "GetSubtreeRoots",
-                    format!("pool {other:?}: no lightwalletd wire form"),
-                ));
-            }
+            ShieldedProtocol::Ironwood => proto::ShieldedProtocol::Ironwood as i32,
         };
         let mut client = connect(&ep).await?;
         let mut stream = client
@@ -554,8 +586,9 @@ impl IndexerBackend for ZainoIndexer {
         Ok(self.plumbing.endpoint("grpc").await?.url("http"))
     }
 
+    /// zainod serves no JSON-RPC (node queries → the validator's own `json_rpc()`)
     async fn json_rpc(&self) -> Result<JsonRpcClient, EnvError> {
-        Ok(JsonRpcClient::new(&self.plumbing.endpoint("jsonrpc").await?, COMPONENT))
+        Err(EnvError::UnknownEndpoint { component: COMPONENT.into(), name: "jsonrpc".into() })
     }
 
     async fn get_block_range(
@@ -622,7 +655,7 @@ pub mod family {
     use super::ZainoIndex;
     use crate::metrics::{Counter, Dimension, Gauge, Hist, counter, gauge, gauge_where, hist};
 
-    pub const BUILD_INFO: Gauge = gauge("zainod_build_info", Dimension::Count);
+    pub const BUILD_INFO: Gauge = gauge("zaino_build_info", Dimension::Count);
 
     pub const BEST_TIP: Gauge = gauge("zaino_best_tip", Dimension::Count);
     /// Highest contiguous height fetched + handed to the indexes (not durable)
@@ -653,12 +686,12 @@ pub mod family {
         counter("zaino_fetch_orchard_actions_total", Dimension::Count);
     pub const IRONWOOD_ACTIONS: Counter =
         counter("zaino_fetch_ironwood_actions_total", Dimension::Count);
-    /// Count only (`zaino_sync_reorg_depth` = the depth histogram); chain-head side, not fetch
-    pub const REORGS: Counter = counter("zaino_sync_reorg_total", Dimension::Count);
+    /// Chain-head side, not fetch
+    pub const REORGS: Counter = counter("zaino_reorgs_total", Dimension::Count);
 
-    /// Validator JSON-RPC round trip (`zaino-rpc` outbound) = the ingest path's cost
+    /// Validator JSON-RPC call, retries included = the ingest path's cost
     pub const VALIDATOR_RPC: Hist =
-        hist("zaino_rpc_outbound_request_duration_seconds", Dimension::Seconds);
+        hist("zaino_validator_rpc_duration_seconds", Dimension::Seconds);
 }
 
 /// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns scannable
@@ -751,12 +784,6 @@ impl ZainoIndexer {
     /// - `Err` = exporter unreachable
     pub async fn synced(&self, index: ZainoIndex) -> Result<Option<bool>, RpcError> {
         Ok(synced_in(&self.exporter().await?, index))
-    }
-
-    /// Answered by the validator via zaino's JSON-RPC server (`zaino-noderpc`)
-    pub async fn blockchain_info(&self) -> Result<BlockchainInfo, RpcError> {
-        let client = crate::protocol::client::json_rpc(&self.plumbing.endpoint("jsonrpc").await?);
-        ZcashRpc::new(COMPONENT, &client).blockchain_info().await
     }
 
     /// Deprecated upstream alias (kept while zaino serves it)
@@ -940,7 +967,10 @@ fn apply_pod_layout(
     ])
 }
 
-const ZAINO_CONFIG: &str = "/etc/zaino/zainod.toml";
+/// Mount path of the rendered `zainod.toml` (e.g. for `zainod verify --config` in-pod)
+pub const ZAINO_CONFIG: &str = "/etc/zaino/zainod.toml";
+/// Fixtures never reach the 1000 default; 100 = a finalised band + a reorg window (0 = every
+/// block durable → no reorg recoverable)
 pub const REGTEST_FINALISED_DEPTH: u32 = 100;
 const ZAINO_SCRATCH: &str = "/var/lib/zaino";
 
@@ -989,7 +1019,6 @@ jsonrpc_address = "zebrad:18232"
 
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
-jsonrpc_listen_address = "0.0.0.0:8232"
 
 [index.compact_block]
 path = "/var/lib/zaino/compact-block"
@@ -1011,7 +1040,10 @@ jsonrpc_address = "zebrad:18232"
 
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
-jsonrpc_listen_address = "0.0.0.0:8232"
+
+[fetch]
+finalised_depth = 250
+concurrency = 64
 
 [index.compact_block]
 path = "/var/lib/zaino/compact-block"
@@ -1040,7 +1072,6 @@ password = "test"
 
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
-jsonrpc_listen_address = "0.0.0.0:8232"
 
 [fetch]
 finalised_depth = 100
@@ -1080,7 +1111,10 @@ batch = 1
                 MAINNET,
             ),
             (
-                dev(&["prometheus"]).snapshot(snapshot(crate::Network::Testnet)),
+                dev(&["prometheus"])
+                    .snapshot(snapshot(crate::Network::Testnet))
+                    .finalised_depth(250)
+                    .fetch_concurrency(NonZeroU32::new(64).expect("non-zero")),
                 vec!["zebrad".to_string()],
                 TESTNET,
             ),
@@ -1155,7 +1189,7 @@ batch = 1
             repo: "zainod".into(),
             rust_version: None,
         };
-        let base = vec![("grpc", 8137), ("jsonrpc", 8232)];
+        let base = vec![("grpc", 8137)];
         assert_eq!(declared_ports(&crate::inventory::ImageSpec::Published), base);
         assert_eq!(declared_ports(&dev(vec!["ztest-fixture".into()])), base);
         assert_eq!(
@@ -1175,8 +1209,8 @@ batch = 1
     #[test]
     fn a_mid_sync_scrape_reads_as_fetch_progress_with_per_index_state() {
         let e = scrape(
-            "# TYPE zainod_build_info gauge\n\
-             zainod_build_info{version=\"0.2.0\"} 1\n\
+            "# TYPE zaino_build_info gauge\n\
+             zaino_build_info{version=\"0.2.0\"} 1\n\
              # TYPE zaino_best_tip gauge\n\
              zaino_best_tip 1000\n\
              # TYPE zaino_fetch_height gauge\n\
@@ -1240,10 +1274,10 @@ batch = 1
             assert_eq!(synced(series), complete, "{series:?}");
         }
 
-        let early = scrape("# TYPE zainod_build_info gauge\nzainod_build_info{version=\"x\"} 1\n");
+        let early = scrape("# TYPE zaino_build_info gauge\nzaino_build_info{version=\"x\"} 1\n");
         let err = reading_of(&early).expect_err("no fetch frontier yet");
         assert!(err.to_string().contains("no block fetched yet"), "{err}");
         let err = reading_of(&scrape("")).expect_err("no exposition");
-        assert!(err.to_string().contains("zainod_build_info"), "{err}");
+        assert!(err.to_string().contains("zaino_build_info"), "{err}");
     }
 }

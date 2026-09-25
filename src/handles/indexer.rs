@@ -71,7 +71,7 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
         pod_name: String,
     ) -> Result<crate::manifest::PodSpec, crate::EnvError>;
 
-    /// Resolve a named endpoint (`"grpc"`, `"jsonrpc"`)
+    /// Resolve a named endpoint (`"grpc"`)
     async fn endpoint(&self, name: &str) -> Result<Endpoint, EnvError>;
 
     async fn endpoint_for(&self, container_port: u16) -> Result<Endpoint, EnvError>;
@@ -151,7 +151,7 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
         crate::loadtest::LwdClient::connect(self.grpc_uri().await?).await
     }
 
-    /// Typed JSON-RPC client for the `jsonrpc` endpoint
+    /// Typed JSON-RPC client for the `jsonrpc` endpoint (zainod serves none → `UnknownEndpoint`)
     async fn json_rpc(&self) -> Result<JsonRpcClient, EnvError>;
 
     /// `get_block_range` with the default (empty) pool-type filter

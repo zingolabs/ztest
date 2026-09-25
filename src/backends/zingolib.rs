@@ -20,7 +20,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use pepper_sync::error::SyncModeError;
 use pepper_sync::keys::transparent::TransparentScope;
 use pepper_sync::sync::{SyncResult, SyncStatus};
-use pepper_sync::wallet::{KeyIdInterface as _, ShardTrees};
+use pepper_sync::wallet::{KeyIdInterface as _, OutputInterface, ShardTrees, WalletTransaction};
 use zcash_client_backend::zip321::{Payment, TransactionRequest};
 use zcash_keys::address::Address;
 use zcash_keys::encoding::AddressCodec;
@@ -135,7 +135,7 @@ impl ScanTotals {
     }
 }
 
-/// Received outputs held per pool, spent or not
+/// Unspent outputs per pool, mined transactions only (a spend in any status = spent)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoteCounts {
     pub sapling: usize,
@@ -283,17 +283,24 @@ impl ZingolibWallet {
         Ok(*self.account(account)?.last_sync.lock().expect("zingolib last_sync mutex poisoned"))
     }
 
-    pub async fn note_counts(&self, account: AccountId) -> Result<NoteCounts, BoxError> {
+    pub async fn unspent_notes(&self, account: AccountId) -> Result<NoteCounts, BoxError> {
         let acct = self.account(account)?;
         let wallet = acct.wallet.read().await;
-        Ok(wallet.wallet_transactions.values().fold(NoteCounts::default(), |mut n, tx| {
-            n.sapling += tx.sapling_notes().len();
-            n.orchard += tx.orchard_notes().len();
-            n.ironwood += tx.ironwood_notes().len();
-            n.transparent += tx.transparent_coins().len();
-            n
-        }))
+        Ok(unspent_notes(wallet.wallet_transactions.values()))
     }
+}
+
+fn unspent_notes<'a>(txs: impl Iterator<Item = &'a WalletTransaction>) -> NoteCounts {
+    fn unspent<O: OutputInterface>(outputs: &[O]) -> usize {
+        outputs.iter().filter(|o| o.spending_transaction().is_none()).count()
+    }
+    txs.filter(|tx| tx.status().is_confirmed()).fold(NoteCounts::default(), |mut n, tx| {
+        n.sapling += unspent(tx.sapling_notes());
+        n.orchard += unspent(tx.orchard_notes());
+        n.ironwood += unspent(tx.ironwood_notes());
+        n.transparent += unspent(tx.transparent_coins());
+        n
+    })
 }
 
 #[async_trait]

@@ -51,9 +51,12 @@ FROM docker.io/library/rust:1.95.0-bookworm@sha256:4c2fd73ef19c5ef9d54bee03b06b2
 # CARGO_TARGET_DIR stays an env — not the config file below — so it outranks any
 # `.cargo/config.toml` the compiled repo ships: the build must always land in the
 # mounted target cache, or the `/bins` copy-out finds nothing.
+# ZTEST_RUNNER_BUILD → `dev!` skips its path check (paths re-homed + built laptop-side; a
+# sibling like ../zebra never ships here)
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/cache/cargo \
-    CARGO_TARGET_DIR=/cache/target
+    CARGO_TARGET_DIR=/cache/target \
+    ZTEST_RUNNER_BUILD=1
 
 # The build defaults, installed at $CARGO_HOME/config.toml in each cargo step —
 # the lowest-precedence config slot, so a compiled repo's own .cargo config still

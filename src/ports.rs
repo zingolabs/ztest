@@ -4,8 +4,7 @@
 
 pub const ZEBRAD_RPC: u16 = 28232;
 /// zebrad JSON-RPC on any public network. Distinguishes which config
-/// generator rendered the node (public vs regtest [`ZEBRAD_RPC`]), not which
-/// chain — pods are namespace-isolated, and 8232 collides with [`ZAINO_JSONRPC`]
+/// generator rendered the node (public vs regtest [`ZEBRAD_RPC`]), not which chain
 pub const ZEBRAD_PUBLIC_RPC: u16 = 18232;
 pub const ZEBRAD_METRICS: u16 = 9999;
 pub const ZEBRAD_P2P: u16 = 18233;
@@ -14,7 +13,6 @@ pub const ZEBRAD_P2P: u16 = 18233;
 pub const ZEBRAD_HEALTH: u16 = 18080;
 pub const ZCASHD_RPC: u16 = 28232;
 pub const ZAINO_GRPC: u16 = 8137;
-pub const ZAINO_JSONRPC: u16 = 8232;
 pub const ZAINO_METRICS: u16 = 9998;
 /// Detached sync driver's own `/metrics` (segment origin, probe violations)
 pub const SYNC_DRIVER_METRICS: u16 = 9997;

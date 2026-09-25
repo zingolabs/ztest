@@ -78,7 +78,7 @@ once and every reader inherits it.
 mod family {
     pub const ORCHARD_ACTIONS: Counter = counter("zaino_fetch_orchard_actions_total", Dimension::Count);
     pub const FETCH_HEIGHT:    Gauge   = gauge("zaino_fetch_height", Dimension::Count);
-    pub const FIRST_MESSAGE:   Hist    = hist("zaino_rpc_first_message_seconds", Dimension::Seconds);
+    pub const FIRST_MESSAGE:   Hist    = hist("zaino_grpc_first_message_seconds", Dimension::Seconds);
 }
 
 const ROWS: &[Row] = &[

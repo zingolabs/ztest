@@ -269,12 +269,12 @@ pub fn dev(input: TokenStream) -> TokenStream {
     // pipeline resolves them against the fetched checkout).
     let (decl_source, ctor_source) = match source {
         DevSourceArg::Local { dockerfile, context } => {
-            let df_abs = match resolve_source(&dockerfile) {
+            let df_abs = match dev_local(&dockerfile, resolve_source) {
                 Ok(p) => p,
                 Err(e) => return e.to_compile_error().into(),
             };
             let ctx_abs = match context {
-                Some(c) => match resolve_dir(&c) {
+                Some(c) => match dev_local(&c, resolve_dir) {
                     Ok(p) => p,
                     Err(e) => return e.to_compile_error().into(),
                 },
@@ -555,6 +555,26 @@ impl KwArgs {
         }
         Ok(())
     }
+}
+
+/// Set by `docker/runner.Dockerfile` for the pod-side compile
+const RUNNER_BUILD: &str = "ZTEST_RUNNER_BUILD";
+
+/// `dev!` local path: `checked` on the laptop, bare join in the runner build
+///
+/// - consumed laptop-side only (re-homed + built there), so a sibling repo absent from the
+///   shipped source must not fail the pod compile
+fn dev_local(
+    rel: &LitStr,
+    checked: fn(&LitStr) -> Result<std::path::PathBuf, syn::Error>,
+) -> Result<std::path::PathBuf, syn::Error> {
+    if std::env::var_os(RUNNER_BUILD).is_none() {
+        return checked(rel);
+    }
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
+        syn::Error::new(rel.span(), "CARGO_MANIFEST_DIR not set; cannot resolve dev! path")
+    })?;
+    Ok(std::path::Path::new(&manifest).join(rel.value()))
 }
 
 fn resolve_dir(rel: &LitStr) -> Result<std::path::PathBuf, syn::Error> {

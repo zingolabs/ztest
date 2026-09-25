@@ -38,6 +38,8 @@ pub struct Phase {
     pub(super) tick: Duration,
     pub(super) timeout: Option<Duration>,
     pub(super) stop_height: Option<u32>,
+    /// Resolved into `stop_height` at the first reading
+    pub(super) stop_after: Option<u32>,
     pub(super) required_work: OpSet,
     pub(super) ready: Vec<Family>,
 }
@@ -62,6 +64,7 @@ impl Phase {
             tick: DEFAULT_TICK,
             timeout: None,
             stop_height: None,
+            stop_after: None,
             required_work: OpSet::NONE,
             ready: Vec::new(),
         }
@@ -104,6 +107,16 @@ impl Phase {
     /// *software* (two runs to tip cover different work; `perf --base` refuses them)
     pub fn until_height(&mut self, height: u32) -> &mut Self {
         self.stop_height = Some(height);
+        self.stop_after = None;
+        self
+    }
+
+    /// Finish `blocks` past the phase's first reading, not at the subject's own completion
+    ///
+    /// - For a phase opening at a live tip (start height unknown at registration)
+    pub fn for_blocks(&mut self, blocks: u32) -> &mut Self {
+        self.stop_height = None;
+        self.stop_after = Some(blocks);
         self
     }
 
