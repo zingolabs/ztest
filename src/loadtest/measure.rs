@@ -4,10 +4,11 @@
 //! - In-process `hdrhistogram` = the stage report's exact percentiles; the same samples feed
 //!   the driver's Prometheus exporter (`ztest_load_*`) for Grafana
 //! - Series handles resolved once per method (a per-request registry lookup = client CPU the
-//!   1-core driver cannot spare)
+//!   driver cannot spare)
 //! - Recording gated by [`Measure::open`]: warm-up and ramp traffic never lands in a window
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -29,10 +30,11 @@ pub enum Method {
     GetLightdInfo,
     GetMempoolStream,
     GetAddressUtxos,
+    GetTaddressTxids,
 }
 
 impl Method {
-    pub const ALL: [Method; 9] = [
+    pub const ALL: [Method; 10] = [
         Method::Connect,
         Method::GetLatestBlock,
         Method::GetBlock,
@@ -42,6 +44,7 @@ impl Method {
         Method::GetLightdInfo,
         Method::GetMempoolStream,
         Method::GetAddressUtxos,
+        Method::GetTaddressTxids,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -55,6 +58,7 @@ impl Method {
             Method::GetLightdInfo => "GetLightdInfo",
             Method::GetMempoolStream => "GetMempoolStream",
             Method::GetAddressUtxos => "GetAddressUtxos",
+            Method::GetTaddressTxids => "GetTaddressTxids",
         }
     }
 }
@@ -70,7 +74,7 @@ fn histogram() -> Histogram<u64> {
     Histogram::new(3).expect("3 significant figures is valid")
 }
 
-/// One method's window; latency = request sent → last byte of the answer
+/// One method's window; latency = request sent → whole unary answer / a stream's first message
 struct MethodTally {
     latency: Mutex<Histogram<u64>>,
     codes: Mutex<BTreeMap<i32, u64>>,
@@ -80,11 +84,17 @@ struct MethodTally {
     prom_ok: metrics::Counter,
 }
 
-/// One stage's measurements (a new one per stage)
+/// `busiest` = highest engine utilisation over any one burst's drain (1.0 = every worker on-CPU)
+struct Bursts {
+    drain: Histogram<u64>,
+    busiest: Option<f64>,
+}
+
+/// One fleet's measurements, windowed by [`open`](Measure::open) / [`close`](Measure::close)
 pub struct Measure {
     open: AtomicBool,
     methods: [MethodTally; Method::ALL.len()],
-    bursts: Mutex<Histogram<u64>>,
+    bursts: Mutex<Bursts>,
     prom_drain: metrics::Histogram,
 }
 
@@ -106,15 +116,23 @@ impl Default for Measure {
                 prom_bytes: metrics::counter!(family::RECEIVED, "method" => method.name()),
                 prom_ok: metrics::counter!(family::REQUESTS, "method" => method.name(), "code" => "Ok"),
             }),
-            bursts: Mutex::new(histogram()),
+            bursts: Mutex::new(Bursts { drain: histogram(), busiest: None }),
             prom_drain: metrics::histogram!(family::BURST_DRAIN),
         }
     }
 }
 
 impl Measure {
-    /// Samples from here on count (warm-up over)
+    /// New window: samples from here on count, earlier windows' dropped
     pub fn open(&self) {
+        self.close();
+        for tally in &self.methods {
+            tally.latency.lock().expect("latency poisoned").reset();
+            tally.codes.lock().expect("codes poisoned").clear();
+            tally.bytes.store(0, Ordering::Relaxed);
+        }
+        *self.bursts.lock().expect("bursts poisoned") =
+            Bursts { drain: histogram(), busiest: None };
         self.open.store(true, Ordering::Relaxed);
     }
 
@@ -158,12 +176,14 @@ impl Measure {
         }
     }
 
-    /// One burst: trigger → the last wallet done
-    pub fn burst(&self, drain: Duration) {
+    /// One burst: trigger → the last wallet done; `busy` = engine utilisation across that drain
+    pub fn burst(&self, drain: Duration, busy: Option<f64>) {
         self.prom_drain.record(drain.as_secs_f64());
         if self.is_open() {
             let micros = drain.as_micros().max(1) as u64;
-            let _ = self.bursts.lock().expect("bursts poisoned").record(micros);
+            let mut bursts = self.bursts.lock().expect("bursts poisoned");
+            let _ = bursts.drain.record(micros);
+            bursts.busiest = bursts.busiest.into_iter().chain(busy).reduce(f64::max);
         }
     }
 
@@ -191,9 +211,25 @@ impl Measure {
             .collect()
     }
 
+    /// p99 over every answered request of the window (dials excluded: a ramp artefact)
+    pub fn p99(&self) -> Option<Duration> {
+        let mut all = histogram();
+        for (method, tally) in Method::ALL.iter().zip(&self.methods) {
+            if *method != Method::Connect {
+                all.add(&*tally.latency.lock().expect("latency poisoned"))
+                    .expect("same-precision histograms merge");
+            }
+        }
+        (!all.is_empty()).then(|| Duration::from_micros(all.value_at_quantile(0.99)))
+    }
+
     pub fn burst_drain(&self) -> Option<LatencyStats> {
         let bursts = self.bursts.lock().expect("bursts poisoned");
-        (!bursts.is_empty()).then(|| LatencyStats::from_hist(&bursts))
+        (!bursts.drain.is_empty()).then(|| LatencyStats::from_hist(&bursts.drain))
+    }
+
+    pub fn busiest_burst(&self) -> Option<f64> {
+        self.bursts.lock().expect("bursts poisoned").busiest
     }
 }
 
@@ -266,10 +302,73 @@ impl CgroupCpu {
     }
 }
 
-/// CPU time the calling thread has run (`/proc/thread-self/schedstat`, ns): the engine thread's
-/// own share of the driver, apart from the auditor's
-pub fn thread_cpu() -> Option<Duration> {
-    let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+/// CPU the load engine's own threads have run (apart from the auditor's + the harness's, which
+/// share the driver's cgroup)
+///
+/// - Threads enlist / retire themselves (`runtime::Builder::on_thread_start` / `on_thread_stop`)
+#[derive(Debug)]
+pub struct EngineCpu {
+    workers: usize,
+    threads: Mutex<EngineThreads>,
+}
+
+#[derive(Debug, Default)]
+struct EngineThreads {
+    live: Vec<PathBuf>,
+    retired: Duration,
+}
+
+impl EngineCpu {
+    pub fn new(workers: usize) -> Self {
+        Self { workers, threads: Mutex::default() }
+    }
+
+    pub fn workers(&self) -> usize {
+        self.workers
+    }
+
+    pub fn enlist(&self) {
+        if let Some(stat) = own_schedstat() {
+            self.threads.lock().expect("engine threads poisoned").live.push(stat);
+        }
+    }
+
+    /// Keeps an exiting thread's CPU in the total (blocking-pool threads come and go per dial)
+    pub fn retire(&self) {
+        let Some(stat) = own_schedstat() else {
+            return;
+        };
+        let mut threads = self.threads.lock().expect("engine threads poisoned");
+        threads.live.retain(|live| *live != stat);
+        threads.retired += on_cpu(&stat).unwrap_or_default();
+    }
+
+    /// `None` off Linux procfs (a laptop run), never a guessed zero
+    pub fn used(&self) -> Option<Duration> {
+        let threads = self.threads.lock().expect("engine threads poisoned");
+        if threads.live.is_empty() {
+            return None;
+        }
+        Some(
+            threads.retired + threads.live.iter().filter_map(|stat| on_cpu(stat)).sum::<Duration>(),
+        )
+    }
+
+    /// Share of the workers' time spent on-CPU between two [`used`](Self::used) readings
+    pub fn busy(&self, used: Duration, over: Duration) -> f64 {
+        used.as_secs_f64() / (over.as_secs_f64() * self.workers as f64)
+    }
+}
+
+/// `/proc/<pid>/task/<tid>/schedstat` of the calling thread (readable from any thread)
+fn own_schedstat() -> Option<PathBuf> {
+    let task = std::fs::read_link("/proc/thread-self").ok()?;
+    Some(Path::new("/proc").join(task).join("schedstat"))
+}
+
+/// First `schedstat` field = ns on-CPU
+fn on_cpu(schedstat: &Path) -> Option<Duration> {
+    let stat = std::fs::read_to_string(schedstat).ok()?;
     Some(Duration::from_nanos(stat.split_whitespace().next()?.parse().ok()?))
 }
 
@@ -279,7 +378,7 @@ mod tests {
 
     /// Samples before `open` feed Prometheus only; after, the window too, by code and bytes
     #[test]
-    fn only_the_open_window_lands_in_the_stage_report() {
+    fn only_the_open_window_lands_in_the_level_report() {
         let measure = Measure::default();
         measure.request(Method::GetBlock, Duration::from_millis(9), 100, Code::Ok);
         assert!(measure.methods().is_empty(), "warm-up = no window sample");
@@ -288,14 +387,24 @@ mod tests {
         measure.request(Method::GetBlock, Duration::from_millis(2), 100, Code::Ok);
         measure.request(Method::GetBlock, Duration::from_millis(3), 0, Code::Unavailable);
         measure.streamed(Method::GetBlockRange, 5_000);
-        measure.burst(Duration::from_millis(250));
+        measure.burst(Duration::from_millis(250), Some(0.4));
+        measure.burst(Duration::from_millis(300), Some(0.9));
+        measure.burst(Duration::from_millis(200), None);
         let windows = measure.methods();
         let block = windows.iter().find(|w| w.method == Method::GetBlock).expect("GetBlock");
         assert_eq!((block.ok, block.bytes, block.latency.count), (1, 100, 1));
         assert_eq!(block.failed, BTreeMap::from([("Unavailable", 1)]));
         let range = windows.iter().find(|w| w.method == Method::GetBlockRange).expect("range");
         assert_eq!((range.ok, range.bytes), (0, 5_000));
-        assert_eq!(measure.burst_drain().map(|d| d.count), Some(1));
+        assert_eq!(measure.burst_drain().map(|d| d.count), Some(3));
+        assert_eq!(measure.busiest_burst(), Some(0.9));
+        measure.request(Method::Connect, Duration::from_secs(5), 0, Code::Ok);
+        measure.request(Method::GetTreeState, Duration::from_millis(40), 10, Code::Ok);
+        assert_eq!(measure.p99().map(|p| p.as_millis()), Some(40), "dials excluded");
+
+        measure.open();
+        assert!(measure.methods().is_empty(), "a new window starts empty");
+        assert_eq!((measure.p99(), measure.burst_drain().is_none()), (None, true));
 
         let stat = "usage_usec 2500000\nuser_usec 2000000\nsystem_usec 500000\nnr_periods 10\n\
                     nr_throttled 2\nthrottled_usec 300000\n";

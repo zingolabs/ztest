@@ -3,6 +3,7 @@
 //! - Off the load path: its own task, fed through a bounded queue ([`Ledger::queue`])
 //! - Tip-dependent answers wait until `BURIED` deep, then are judged only if zebra still holds
 //!   the block the answer names (a reorged answer = skipped, never failed)
+//! - Address UTXOs: judged on arrival, only while zebra's tip = the served tip (no history to bury)
 //! - Mempool: a served tx must be one zebra's mempool held (bytes identical), checked against a
 //!   rolling snapshot refreshed on a miss
 
@@ -120,7 +121,6 @@ impl Auditor {
             Audit::Full { height, .. } | Audit::TreeState { height, .. } => {
                 self.deferred.push_back((height, audit))
             }
-            Audit::AddressUtxos { tip, .. } => self.deferred.push_back((tip, audit)),
             Audit::Tip { ref message } => match BlockId::decode(message.as_ref()) {
                 Ok(id) => self.deferred.push_back((id.height as u32, audit)),
                 Err(e) => self.failed("latest_block", 0, format!("undecodable BlockID: {e}")),
@@ -141,7 +141,9 @@ impl Auditor {
             Audit::Tip { message } => self.latest(&message).await,
             Audit::Mempool { message } => self.mempool_tx(&message).await,
             Audit::LightdInfo { message } => self.lightd_info(&message).await,
-            Audit::AddressUtxos { address, message, .. } => self.utxos(&address, &message).await,
+            Audit::AddressUtxos { address, message, tip } => {
+                self.utxos(&address, &message, tip).await
+            }
         };
         match verdict {
             Verdict::Holds => self.ledger.audited(check),
@@ -325,7 +327,9 @@ impl Auditor {
         }
     }
 
-    async fn utxos(&mut self, address: &str, message: &[u8]) -> Verdict {
+    /// UTXOs = the address at the current tip → comparable only while zebra sits at `served_tip`
+    /// (zaino's tip when it answered) across the whole read
+    async fn utxos(&mut self, address: &str, message: &[u8], served_tip: u32) -> Verdict {
         let served = match GetAddressUtxosReplyList::decode(message) {
             Ok(list) => list.address_utxos,
             Err(e) => return Verdict::Differs(0, format!("undecodable: {e}")),
@@ -338,12 +342,13 @@ impl Auditor {
         if served == expected {
             return Verdict::Holds;
         }
-        // the address moved since zaino answered (a live address) = unjudgeable, not wrong
         match (before, self.zebra.tip().await) {
-            (Ok(a), Ok(b)) if a == b && served.len() == expected.len() => Verdict::Differs(
-                0,
+            (Ok(a), Ok(b)) if a == served_tip && b == served_tip => Verdict::Differs(
+                u64::from(served_tip),
                 format!(
-                    "{address}: first differing utxo {:?}",
+                    "{address}: {} served vs {} at zebra; first differing utxo {:?}",
+                    served.len(),
+                    expected.len(),
                     served.iter().zip(&expected).find(|(s, e)| s != e)
                 ),
             ),
