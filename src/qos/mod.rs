@@ -406,12 +406,24 @@ impl QosProfile {
     /// Component ceiling replaced by a test's `footprint = ".."`; `None` = untouched
     ///
     /// - Sole place an override lands (quota/budget/lease/request all read `footprint`)
-    /// - `runner`/`pool`/`hard_cap` not overridable (cross-test policy)
+    /// - `pool`/`hard_cap` not overridable (cross-test policy)
     pub fn with_footprint(self, footprint: Option<Resources>) -> QosProfile {
         match footprint {
             Some(footprint) => {
                 footprint.assert_pod_schedulable("footprint override");
                 QosProfile { footprint, ..self }
+            }
+            None => self,
+        }
+    }
+
+    /// Runner pod replaced by a test's `runner = ".."` (in-process load clients' cores);
+    /// `None` = the tier's
+    pub fn with_runner(self, runner: Option<Resources>) -> QosProfile {
+        match runner {
+            Some(runner) => {
+                runner.assert_pod_schedulable("runner override");
+                QosProfile { runner, ..self }
             }
             None => self,
         }
@@ -511,44 +523,51 @@ impl QosClass {
 
 // ── Runtime tier (the in-process bridge) ───────────────────────────────
 //
-// `#[ztest::qos::*]` / `#[ztest::sync_test]` inject `__enter(class, footprint)` as the body's
-// first statement; `build()` reads it back to size pods.
+// `#[ztest::qos::*]` / `#[ztest::sync_test]` inject `__enter(class, footprint, runner)` as the
+// body's first statement; `build()` reads it back to size pods.
 //
 // - Process-global, not thread-local: a `multi_thread` test migrates off the entering thread
 //   across an `.await` before `build()` reads it
 // - Sound because ztest is strictly process-per-test → the last entry is unambiguous
-// - Tier + override under one lock, so no read can see half of an entry
+// - Tier + overrides under one lock, so no read can see half of an entry
 
-/// Declaration the running test entered: tier, plus its `footprint = ".."` if it declared one
-static CURRENT: std::sync::RwLock<Option<(QosClass, Option<Resources>)>> =
-    std::sync::RwLock::new(None);
+/// Declaration the running test entered: tier + its `footprint = ".."` / `runner = ".."`
+#[derive(Debug, Clone, Copy)]
+struct Declared {
+    class: QosClass,
+    footprint: Option<Resources>,
+    runner: Option<Resources>,
+}
 
-fn current_entry() -> Option<(QosClass, Option<Resources>)> {
+static CURRENT: std::sync::RwLock<Option<Declared>> = std::sync::RwLock::new(None);
+
+fn current_entry() -> Option<Declared> {
     *CURRENT.read().expect("qos declaration lock poisoned")
 }
 
-/// Set current tier + optional override. Injected by `#[ztest::qos::*]` /
+/// Set current tier + optional overrides. Injected by `#[ztest::qos::*]` /
 /// `#[ztest::sync_test]` as the body's first statement; never called directly
 #[doc(hidden)]
-pub fn __enter(class: QosClass, footprint: Option<Resources>) {
-    *CURRENT.write().expect("qos declaration lock poisoned") = Some((class, footprint));
+pub fn __enter(class: QosClass, footprint: Option<Resources>, runner: Option<Resources>) {
+    *CURRENT.write().expect("qos declaration lock poisoned") =
+        Some(Declared { class, footprint, runner });
 }
 
 /// Tier declared by the running test, else [`QosClass::default`]. Read by `TestEnv::build`
 pub fn current() -> QosClass {
-    current_entry().map_or_else(QosClass::default, |(class, _)| class)
+    current_entry().map_or_else(QosClass::default, |d| d.class)
 }
 
 /// Override declared by the running test, else `None`
 pub(crate) fn current_footprint() -> Option<Resources> {
-    current_entry().and_then(|(_, footprint)| footprint)
+    current_entry().and_then(|d| d.footprint)
 }
 
-/// Effective profile of the running test (declared tier + declared override)
+/// Effective profile of the running test (declared tier + declared overrides)
 ///
 /// - Sole accessor for in-process sizing (quota, deploy budget, sync lease)
 pub fn current_profile() -> QosProfile {
-    current().profile_with(current_footprint())
+    current().profile_with(current_footprint()).with_runner(current_entry().and_then(|d| d.runner))
 }
 
 #[cfg(test)]
@@ -950,14 +969,20 @@ mod tests {
         assert_eq!(current(), QosClass::default());
 
         let over = Resources::new(15_000, 29 * GIB, 0, 0).with_disk(400 * GIB);
-        __enter(QosClass::Sync, Some(over));
+        __enter(QosClass::Sync, Some(over), None);
         assert_eq!(current(), QosClass::Sync);
         // Whole `Resources`, disk included — the reserve read back is the one declared
         assert_eq!(current_profile().footprint, over);
         assert_eq!(current_profile().runner, QosClass::Sync.profile().runner);
 
+        // Declared runner → the runner half + admitted total (driver lease = CLI reservation)
+        let runner = Resources::new(8_000, 8 * GIB, 0, 0);
+        __enter(QosClass::Sync, Some(over), Some(runner));
+        assert_eq!(current_profile().runner, runner);
+        assert_eq!(current_profile().admitted(), over.saturating_add(&runner));
+
         // Re-enter without one → tier default (stale override must not leak process-wide)
-        __enter(QosClass::Integration, None);
+        __enter(QosClass::Integration, None, None);
         assert_eq!(current_profile(), QosClass::Integration.profile());
     }
 }

@@ -271,6 +271,7 @@ pub struct SyncTestDecl {
     pub timeout: &'static str,
     pub qos: &'static str,
     pub footprint: Option<crate::qos::Resources>,
+    pub runner: Option<crate::qos::Resources>,
     pub tags: &'static [&'static str],
 }
 
@@ -286,6 +287,8 @@ pub struct SyncTestEntry {
     pub qos: String,
     #[serde(default)]
     pub footprint: Option<crate::qos::Resources>,
+    #[serde(default)]
+    pub runner: Option<crate::qos::Resources>,
     pub tags: Vec<String>,
 }
 
@@ -299,6 +302,7 @@ impl From<&SyncTestDecl> for SyncTestEntry {
             timeout: d.timeout.to_string(),
             qos: d.qos.to_string(),
             footprint: d.footprint,
+            runner: d.runner,
             tags: d.tags.iter().map(|t| t.to_string()).collect(),
         }
     }
@@ -310,9 +314,9 @@ impl SyncTestEntry {
         QosClass::from_label(&self.qos)
     }
 
-    /// Sole source of a sync run's sizing (declared tier + declared override)
+    /// Sole source of a sync run's sizing (declared tier + declared overrides)
     pub fn profile(&self) -> Option<crate::qos::QosProfile> {
-        Some(self.class()?.profile_with(self.footprint))
+        Some(self.class()?.profile_with(self.footprint).with_runner(self.runner))
     }
 }
 
@@ -542,6 +546,7 @@ mod tests {
             timeout: "48h".into(),
             qos: "integration".into(),
             footprint: None,
+            runner: None,
             tags: Vec::new(),
         };
         // Tier the profile named, though launched by `ztest sync`
@@ -551,6 +556,13 @@ mod tests {
         let eff = e.profile().expect("known tier");
         assert_eq!(eff.footprint.mem_bytes, 29 * crate::qos::GIB);
         assert_eq!(eff.hard_cap, QosClass::Integration.profile().hard_cap);
+        assert_eq!(eff.runner, QosClass::Integration.profile().runner, "undeclared = the tier's");
+
+        // Declared runner = the driver pod's size + its half of the admitted reserve
+        e.runner = Some(crate::qos::Resources::new(8_000, 8 * crate::qos::GIB, 0, 0));
+        let eff = e.profile().expect("known tier");
+        assert_eq!(eff.runner, crate::qos::Resources::new(8_000, 8 * crate::qos::GIB, 0, 0));
+        assert_eq!(eff.admitted().cpu_milli, 23_000);
 
         // Unknown tier refused, not defaulted
         e.qos = "nonesuch".into();

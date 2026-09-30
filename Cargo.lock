@@ -6572,6 +6572,7 @@ dependencies = [
  "directories",
  "futures",
  "globset",
+ "h2",
  "hdrhistogram",
  "hex",
  "http",

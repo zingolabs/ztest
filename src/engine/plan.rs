@@ -241,6 +241,7 @@ mod tests {
             timeout: "48h".to_string(),
             qos: "sync".to_string(),
             footprint: None,
+            runner: None,
             tags: Vec::new(),
         }
     }

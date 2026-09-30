@@ -171,10 +171,13 @@ fn entry(p: &ProfileStub, theme: &Theme, width: usize, name_w: usize) -> String 
     let clip = |s: &str, w: usize| truncate_with(s, w, theme.chars.ellipsis);
     let sep = theme.chars.dot;
 
-    // Overridden reserve shown beside the tier (else the tier alone implies its default)
-    let qos = match p.footprint {
-        Some(f) => format!("{} ({})", p.qos, ztest::qos::Resources::from_footprint(f).compact()),
-        None => p.qos.clone(),
+    // Overridden reserves shown beside the tier (else the tier alone implies its default)
+    let compact = |f| ztest::qos::Resources::from_footprint(f).compact();
+    let qos = match (p.footprint, p.runner) {
+        (Some(f), Some(r)) => format!("{} ({} + runner {})", p.qos, compact(f), compact(r)),
+        (Some(f), None) => format!("{} ({})", p.qos, compact(f)),
+        (None, Some(r)) => format!("{} (runner {})", p.qos, compact(r)),
+        (None, None) => p.qos.clone(),
     };
     let meta = format!("{} {sep} {qos} {sep} {}", p.subject, p.timeout);
 
@@ -227,6 +230,7 @@ mod tests {
             subject: subject.to_string(),
             qos: "sync".into(),
             footprint: None,
+            runner: None,
             timeout: "48h".into(),
             tags: vec!["mainnet".into(), "zaino".into(), "index".into()],
             package: "sync".into(),

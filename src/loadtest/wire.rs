@@ -1,15 +1,16 @@
 //! Raw-bytes `CompactTxStreamer` client: the load path never decodes a message.
 //!
-//! - Pass-through codec: request pre-encoded once, response = the message's exact bytes (gRPC
-//!   framing only, tonic's)
+//! - Bare `h2`, no tonic / hyper client (their stack = 2× the driver CPU per request → a driver
+//!   costing as much as the server it loads)
+//! - Request pre-encoded once; response = the message's exact bytes, framing walked in place
+//!   (zero-copy unless a message spans DATA frames)
 //! - Per-message cost = one blake3 + a top-level field walk → a 1-core driver moves GB/s
 //! - Decoding (prost) = the verifier's job, off the hot path
 
-use bytes::{Buf, BufMut, Bytes};
-use http::uri::PathAndQuery;
-use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
-use tonic::transport::Channel;
-use tonic::{Request, Status, Streaming};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use http::header::{CONTENT_TYPE, TE};
+use http::uri::{Authority, PathAndQuery, Scheme};
+use tonic::{Code, Status};
 
 use crate::EnvError;
 use crate::error::env_err;
@@ -29,80 +30,205 @@ pub mod path {
         "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids";
 }
 
-/// Bytes in, bytes out
-#[derive(Debug, Clone, Copy, Default)]
-struct PassThrough;
+/// Flow-control windows = hyper's client defaults (tonic's): h2's own 64 KiB would stall a
+/// fresh-sync block stream on round trips
+const STREAM_WINDOW: u32 = 2 << 20;
+const CONNECTION_WINDOW: u32 = 5 << 20;
 
-impl Codec for PassThrough {
-    type Encode = Bytes;
-    type Decode = Bytes;
-    type Encoder = PassThrough;
-    type Decoder = PassThrough;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        PassThrough
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        PassThrough
-    }
-}
-
-impl Encoder for PassThrough {
-    type Item = Bytes;
-    type Error = Status;
-
-    fn encode(&mut self, item: Bytes, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
-        dst.put(item);
-        Ok(())
-    }
-}
-
-impl Decoder for PassThrough {
-    type Item = Bytes;
-    type Error = Status;
-
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Bytes>, Status> {
-        Ok(Some(src.copy_to_bytes(src.remaining())))
-    }
-}
+/// gRPC message prefix: compression flag + big-endian length
+const PREFIX: usize = 5;
 
 /// One wallet's H2 connection (clone = same connection, multiplexed)
 #[derive(Debug, Clone)]
 pub struct RawClient {
-    grpc: tonic::client::Grpc<Channel>,
+    send: h2::client::SendRequest<Bytes>,
+    authority: Authority,
 }
 
 impl RawClient {
     /// Dials its own connection (one per simulated wallet, as a real wallet holds)
     pub async fn connect(uri: &str) -> Result<Self, EnvError> {
-        let channel = Channel::from_shared(uri.to_owned())
-            .map_err(env_err)?
-            .connect()
+        let uri: http::Uri = uri.parse().map_err(env_err)?;
+        let authority = uri.authority().cloned().ok_or_else(|| {
+            env_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{uri}: no host"),
+            ))
+        })?;
+        let socket = tokio::net::TcpStream::connect(authority.as_str()).await.map_err(env_err)?;
+        socket.set_nodelay(true).map_err(env_err)?;
+        let (send, connection) = h2::client::Builder::new()
+            .initial_window_size(STREAM_WINDOW)
+            .initial_connection_window_size(CONNECTION_WINDOW)
+            .handshake(socket)
             .await
             .map_err(env_err)?;
-        Ok(Self { grpc: tonic::client::Grpc::new(channel) })
+        // ends once every clone of `send` is dropped (or the peer closes)
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(Self { send, authority })
     }
 
+    /// Exactly one message, then an `Ok` status
     pub async fn unary(&self, path: &'static str, request: Bytes) -> Result<Bytes, Status> {
-        let mut grpc = self.grpc.clone();
-        grpc.ready().await.map_err(|e| Status::unavailable(e.to_string()))?;
-        let answer =
-            grpc.unary(Request::new(request), PathAndQuery::from_static(path), PassThrough).await?;
-        Ok(answer.into_inner())
+        let mut answer = self.stream(path, request).await?;
+        let message =
+            answer.message().await?.ok_or_else(|| Status::internal("unary answer: no message"))?;
+        match answer.message().await? {
+            None => Ok(message),
+            Some(_) => Err(Status::internal("unary answer: a second message")),
+        }
     }
 
-    pub async fn stream(
-        &self,
-        path: &'static str,
-        request: Bytes,
-    ) -> Result<Streaming<Bytes>, Status> {
-        let mut grpc = self.grpc.clone();
-        grpc.ready().await.map_err(|e| Status::unavailable(e.to_string()))?;
-        let answer = grpc
-            .server_streaming(Request::new(request), PathAndQuery::from_static(path), PassThrough)
-            .await?;
-        Ok(answer.into_inner())
+    /// Returns once the response headers arrive (a refusal in them = `Err` here)
+    pub async fn stream(&self, path: &'static str, request: Bytes) -> Result<Messages, Status> {
+        let uri = http::Uri::builder()
+            .scheme(Scheme::HTTP)
+            .authority(self.authority.clone())
+            .path_and_query(PathAndQuery::from_static(path))
+            .build()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let head = http::Request::post(uri)
+            .header(CONTENT_TYPE, "application/grpc")
+            .header(TE, "trailers")
+            .body(())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut send = self.send.clone().ready().await.map_err(transport)?;
+        let (response, mut body) = send.send_request(head, false).map_err(transport)?;
+        let mut framed = BytesMut::with_capacity(PREFIX + request.len());
+        framed.put_u8(0);
+        framed.put_u32(request.len() as u32);
+        framed.put_slice(&request);
+        body.send_data(framed.freeze(), true).map_err(transport)?;
+
+        let (head, recv) = response.await.map_err(transport)?.into_parts();
+        if head.status != http::StatusCode::OK {
+            return Err(Status::unknown(format!("HTTP {}", head.status)));
+        }
+        // Trailers-Only (or a unary answer finished in its headers): the status is here
+        let status = Status::from_header_map(&head.headers);
+        if let Some(refused) = status.clone().filter(|s| s.code() != Code::Ok) {
+            return Err(refused);
+        }
+        Ok(Messages { recv, frames: Deframer::default(), status })
+    }
+}
+
+/// A response body, message by message
+///
+/// - `status` = one already carried by the headers (then no trailers owed)
+#[derive(Debug)]
+pub struct Messages {
+    recv: h2::RecvStream,
+    frames: Deframer,
+    status: Option<Status>,
+}
+
+impl Messages {
+    /// Next message; `Ok(None)` = ended with an `Ok` status
+    pub async fn message(&mut self) -> Result<Option<Bytes>, Status> {
+        loop {
+            if let Some(message) = self.frames.next()? {
+                return Ok(Some(message));
+            }
+            match self.recv.data().await {
+                Some(chunk) => {
+                    let chunk = chunk.map_err(transport)?;
+                    let _ = self.recv.flow_control().release_capacity(chunk.len());
+                    self.frames.push(chunk);
+                }
+                None if self.frames.mid_message() => {
+                    return Err(Status::internal("stream ended mid-message"));
+                }
+                None => return self.finish().await.map(|()| None),
+            }
+        }
+    }
+
+    async fn finish(&mut self) -> Result<(), Status> {
+        let status = match self.status.take() {
+            Some(status) => status,
+            None => {
+                let trailers = self.recv.trailers().await.map_err(transport)?;
+                trailers
+                    .as_ref()
+                    .and_then(Status::from_header_map)
+                    .ok_or_else(|| Status::internal("stream ended without a grpc-status"))?
+            }
+        };
+        match status.code() {
+            Code::Ok => Ok(()),
+            _ => Err(status),
+        }
+    }
+}
+
+/// gRPC messages out of DATA frames: a slice of the frame when whole in it, else one copy
+///
+/// - `pending` = latest frame's unread tail; `partial` = a message spanning frames
+#[derive(Debug, Default)]
+struct Deframer {
+    pending: Bytes,
+    partial: BytesMut,
+}
+
+impl Deframer {
+    /// Callers drain [`next`](Self::next) to `None` first (`pending` = one frame at a time)
+    fn push(&mut self, frame: Bytes) {
+        debug_assert!(self.pending.is_empty(), "frame pushed over an unread one");
+        self.pending = frame;
+    }
+
+    fn mid_message(&self) -> bool {
+        !self.partial.is_empty() || !self.pending.is_empty()
+    }
+
+    /// One whole message (`None` = needs the next frame)
+    fn next(&mut self) -> Result<Option<Bytes>, Status> {
+        if self.partial.is_empty()
+            && let Some(len) = prefixed_len(&self.pending)?
+            && self.pending.len() >= PREFIX + len
+        {
+            let mut message = self.pending.split_to(PREFIX + len);
+            message.advance(PREFIX);
+            return Ok(Some(message));
+        }
+        // spans frames: copied up to its prefix, then up to its announced length
+        loop {
+            let want = prefixed_len(&self.partial)?.map_or(PREFIX, |len| PREFIX + len);
+            if self.partial.len() >= PREFIX && self.partial.len() == want {
+                let mut message = self.partial.split().freeze();
+                message.advance(PREFIX);
+                return Ok(Some(message));
+            }
+            if self.pending.is_empty() {
+                return Ok(None);
+            }
+            let take = (want - self.partial.len()).min(self.pending.len());
+            self.partial.reserve(want - self.partial.len());
+            self.partial.extend_from_slice(&self.pending.split_to(take));
+        }
+    }
+}
+
+/// Length a complete 5-byte prefix announces (`None` = prefix not yet whole)
+fn prefixed_len(bytes: &[u8]) -> Result<Option<usize>, Status> {
+    let Some(prefix) = bytes.get(..PREFIX) else {
+        return Ok(None);
+    };
+    if prefix[0] != 0 {
+        return Err(Status::internal("compressed message (none negotiated)"));
+    }
+    Ok(Some(u32::from_be_bytes(prefix[1..].try_into().expect("4 bytes")) as usize))
+}
+
+/// Refusals the wallet backs off from (`Unavailable`) vs a stream it walked away from
+fn transport(error: h2::Error) -> Status {
+    match error.reason() {
+        Some(h2::Reason::CANCEL) => Status::cancelled(error.to_string()),
+        Some(h2::Reason::REFUSED_STREAM) | None => Status::unavailable(error.to_string()),
+        Some(_) => Status::internal(error.to_string()),
     }
 }
 
@@ -205,5 +331,45 @@ mod tests {
         assert_eq!(head, want);
         assert_eq!(block_head(&bytes[..bytes.len() - 1]), None, "cut mid-field");
         assert_ne!(digest(&bytes), digest(&bytes[..bytes.len() - 1]));
+    }
+
+    /// Messages whole in a frame, several per frame, empty, split mid-prefix and mid-body across
+    /// three frames: each out intact and in order; a compressed flag refused
+    #[test]
+    fn a_deframer_yields_every_message_however_the_frames_cut_them() {
+        let framed = |m: &[u8]| {
+            let mut b = vec![0];
+            b.extend_from_slice(&(m.len() as u32).to_be_bytes());
+            b.extend_from_slice(m);
+            b
+        };
+        let big = vec![7u8; 40];
+        let wire: Vec<u8> = [framed(b"one"), framed(b""), framed(b"three"), framed(&big)].concat();
+        let want: Vec<Bytes> =
+            [&b"one"[..], b"", b"three", &big].iter().map(|m| Bytes::copy_from_slice(m)).collect();
+
+        for cuts in [vec![], vec![3], vec![10, 11], vec![20, 25, 40]] {
+            let mut frames = Deframer::default();
+            let mut got = Vec::new();
+            let mut from = 0;
+            for to in cuts.iter().copied().chain([wire.len()]) {
+                frames.push(Bytes::copy_from_slice(&wire[from..to]));
+                while let Some(message) = frames.next().expect("uncompressed") {
+                    got.push(message);
+                }
+                from = to;
+            }
+            assert_eq!(got, want, "cut at {cuts:?}");
+            assert!(!frames.mid_message(), "cut at {cuts:?}: nothing left over");
+        }
+
+        let mut cut_short = Deframer::default();
+        cut_short.push(Bytes::copy_from_slice(&framed(b"three")[..6]));
+        assert_eq!(cut_short.next().expect("uncompressed"), None);
+        assert!(cut_short.mid_message(), "a stream ending here ended mid-message");
+
+        let mut compressed = Deframer::default();
+        compressed.push(Bytes::from_static(&[1, 0, 0, 0, 1, 9]));
+        assert_eq!(compressed.next().map_err(|s| s.code()), Err(Code::Internal));
     }
 }

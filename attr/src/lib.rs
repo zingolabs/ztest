@@ -19,7 +19,8 @@ pub const DEFAULT_TIMEOUT: &str = "48h";
 
 /// Parsed `#[ztest::sync_test(..)]` args (`syn` types kept — macro re-splices with original spans).
 ///
-/// - `footprint` parsed here, not at expansion (malformed → compile error on the literal)
+/// - `footprint` / `runner` parsed here, not at expansion (malformed → compile error on the literal)
+/// - `runner` = driver pod replacing the tier's (in-process load clients' cores), `<cpu>/<mem>`
 pub struct SyncTestArgs {
     pub name: LitStr,
     pub description: LitStr,
@@ -27,6 +28,7 @@ pub struct SyncTestArgs {
     pub timeout: LitStr,
     pub qos: syn::Ident,
     pub footprint: Option<Footprint>,
+    pub runner: Option<Footprint>,
     pub tags: Vec<LitStr>,
 }
 
@@ -38,6 +40,7 @@ impl Parse for SyncTestArgs {
         let mut timeout: Option<LitStr> = None;
         let mut qos: Option<syn::Ident> = None;
         let mut footprint: Option<Footprint> = None;
+        let mut runner: Option<Footprint> = None;
         let mut tags: Vec<LitStr> = Vec::new();
 
         while !input.is_empty() {
@@ -56,6 +59,18 @@ impl Parse for SyncTestArgs {
                             .map_err(|why| syn::Error::new(lit.span(), why))?,
                     );
                 }
+                "runner" => {
+                    let lit: LitStr = input.parse()?;
+                    let parsed = footprint::parse(&lit.value())
+                        .map_err(|why| syn::Error::new(lit.span(), format!("runner: {why}")))?;
+                    if parsed.disk_bytes.is_some() {
+                        return Err(syn::Error::new(
+                            lit.span(),
+                            "runner takes `<cpu>/<mem>` only (no volume of its own to reserve)",
+                        ));
+                    }
+                    runner = Some(parsed);
+                }
                 "tags" => {
                     let content;
                     syn::bracketed!(content in input);
@@ -67,7 +82,7 @@ impl Parse for SyncTestArgs {
                         key.span(),
                         format!(
                             "unknown sync_test key `{other}` \
-                             (expected name/description/subject/timeout/qos/footprint/tags)"
+                             (expected name/description/subject/timeout/qos/footprint/runner/tags)"
                         ),
                     ));
                 }
@@ -103,6 +118,7 @@ impl Parse for SyncTestArgs {
             timeout: timeout.unwrap_or_else(|| LitStr::new(DEFAULT_TIMEOUT, Span::call_site())),
             qos,
             footprint,
+            runner,
             tags,
         })
     }
@@ -235,6 +251,27 @@ mod tests {
         let args: SyncTestArgs =
             syn::parse_str(r#"name = "p", subject = wallet, qos = sync"#).expect("parses");
         assert!(args.footprint.is_none());
+        assert!(args.runner.is_none());
+    }
+
+    #[test]
+    fn a_runner_override_takes_cpu_and_memory_only() {
+        let args: SyncTestArgs = syn::parse_str(
+            r#"name = "p", subject = indexer, qos = sync, footprint = "14c/20Gi", runner = "8c/8Gi""#,
+        )
+        .expect("parses");
+        let want = Footprint {
+            cpu_milli: 8_000,
+            mem_bytes: 8 * 1024 * 1024 * 1024,
+            disk_bytes: None,
+            disk_bps: None,
+            disk_iops: None,
+        };
+        assert_eq!(args.runner, Some(want));
+        for bad in ["8c/8Gi/100Gi", "8c", "1500m/8Gi"] {
+            let src = format!(r#"name = "p", subject = wallet, qos = sync, runner = "{bad}""#);
+            assert!(syn::parse_str::<SyncTestArgs>(&src).is_err(), "runner `{bad}` must not parse");
+        }
     }
 
     #[test]

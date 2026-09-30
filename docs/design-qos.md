@@ -41,9 +41,10 @@ Sizing lives with the component, not with the tier. Each backend renders its own
 | `testnet`     | 6 h      | 8c / 10 GiB | 1c / 1 GiB | 9c / 11 GiB | general pool                    |
 | `sync`        | 48 h     | *declared*  | 2c / 4 GiB | *declared*  | NVMe node-selector + toleration |
 
-- *Ceiling* = `QosProfile::footprint`, the bound on Σ component-pod reserves — the only
-  overridable column. It does **not** size pods; `2c/4Gi` is the two-pod validator+indexer
-  shape at the defaults above
+- *Ceiling* = `QosProfile::footprint`, the bound on Σ component-pod reserves. It does **not**
+  size pods; `2c/4Gi` is the two-pod validator+indexer shape at the defaults above
+- *Runner* overridable by a `sync_test` alone (`runner = ".."`, see
+  [below](#per-test-runner-override))
 - *Admitted* = `ceiling + runner`, what admission, the lease and the namespace quota all charge
 - `wallet` differs from `integration` in the runner alone (the in-process wallet lives there);
   every other runner only orchestrates
@@ -80,8 +81,9 @@ Tier ceiling = a default, not an allotment. A test that declares its own reserve
 #[ztest::sync_test(name = "…", subject = indexer, qos = sync, footprint = "15c/29Gi")]
 ```
 
-- Replaces the **component** half only — `runner`, `pool`, `hard_cap` still come from the tier (a test
-  that could raise its own cap would hold capacity its peers are queued for)
+- Replaces the **component** half only — `pool`, `hard_cap` still come from the tier (a test
+  that could raise its own cap would hold capacity its peers are queued for); `runner` has its own
+  override, below
 - Exact, not a ceiling: declared = Σ component-pod requests (cpu + mem), checked by
   `DeployBudget::close` before the first pod deploys; slack or overflow names every pod + the fix
 - Driver / in-process wallet / load clients = `runner`, never folded into the footprint
@@ -108,6 +110,21 @@ override takes effect:
 - `ztest sync` resolves tier + override from `SyncTestEntry::profile`, never assuming `sync` from the
   subcommand, and refuses a reserve larger than cluster `allocatable` up front rather than polling the
   ledger to a timeout
+
+## Per-test runner override
+
+A `sync_test` whose driver hosts load clients (`loadtest::load`) sizes its driver pod itself:
+
+```rust
+#[ztest::sync_test(name = "…", subject = indexer, qos = sync, footprint = "14c/20Gi", runner = "8c/8Gi")]
+```
+
+- Replaces the tier's `runner` (sync: `2c/4Gi` = one load-engine worker, a client-bound ceiling far
+  below any indexer's)
+- Same grammar as `footprint`, `<cpu>/<mem>` only (the driver claims no volume)
+- Lowered by `QosProfile::with_runner`: the driver pod's Guaranteed size, and its half of
+  `admitted()` in both the CLI reservation and the driver's adopted lease (`__enter` carries it)
+- `sync_test` only: `ztest run` tiers keep their policy runner
 
 ## The attribute macro — dual emission
 

@@ -61,6 +61,24 @@ impl Method {
             Method::GetTaddressTxids => "GetTaddressTxids",
         }
     }
+
+    /// Server span matching this method's client clock (`None` = no server twin: a dial, or a
+    /// held subscription whose clock stops at its headers)
+    pub const fn span(self) -> Option<Span> {
+        match self {
+            Method::Connect | Method::GetMempoolStream => None,
+            Method::GetBlockRange => Some(Span::FirstMessage),
+            _ => Some(Span::Whole),
+        }
+    }
+}
+
+/// Where a request's clock stops: its first message (a block stream = client-paced after it) or
+/// its trailers
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Span {
+    FirstMessage,
+    Whole,
 }
 
 mod family {

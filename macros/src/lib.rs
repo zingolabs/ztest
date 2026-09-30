@@ -631,7 +631,11 @@ fn qos_attr(variant: &str, attr: TokenStream, item: TokenStream) -> TokenStream 
     // (b) in-process bridge: set the task-local tier + override as the first
     // statement, before any `.await` can migrate the test future across threads.
     let enter: syn::Stmt = syn::parse_quote! {
-        ::ztest::macro_support::__enter(::ztest::qos::QosClass::#variant, #footprint_res);
+        ::ztest::macro_support::__enter(
+            ::ztest::qos::QosClass::#variant,
+            #footprint_res,
+            ::core::option::Option::None,
+        );
     };
     func.block.stmts.insert(0, enter);
 
@@ -688,7 +692,7 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Nest the author's body under a fixed name inside the generated wrapper.
     body_fn.sig.ident = syn::Ident::new("__ztest_sync_body", test_ident.span());
 
-    let SyncTestArgs { name, description, subject, timeout, qos, footprint, tags } = args;
+    let SyncTestArgs { name, description, subject, timeout, qos, footprint, runner, tags } = args;
     // Same rule as the bare `#[ztest::qos::sync]` attribute: the tier reserves nothing by
     // default, so a profile riding it must price its own topology
     if qos == "sync" && footprint.is_none() {
@@ -703,6 +707,7 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let subject_str = LitStr::new(&subject.to_string(), subject.span());
     let qos_str = LitStr::new(&qos.to_string(), qos.span());
     let footprint_res = footprint_resources_tokens(footprint);
+    let runner_res = footprint_resources_tokens(runner);
     // The tier ident (`sync`) → the `QosClass` variant (`Sync`), so the wrapper
     // can enter the tier at runtime exactly as `#[ztest::qos::*]` does. Without
     // this the in-pod `TestEnv` would size the topology's component pods at the
@@ -727,6 +732,7 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 timeout: #timeout,
                 qos: #qos_str,
                 footprint: #footprint_res,
+                runner: #runner_res,
                 tags: &[#(#tags),*],
             }
         }
@@ -737,7 +743,11 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `#[ztest::qos::*]` attribute) so `TestEnv::build()` sizes the
             // topology at this profile's tier, whether run by the CI engine or
             // detached via `ztest sync start`.
-            ::ztest::macro_support::__enter(::ztest::qos::QosClass::#qos_variant, #footprint_res);
+            ::ztest::macro_support::__enter(
+                ::ztest::qos::QosClass::#qos_variant,
+                #footprint_res,
+                #runner_res,
+            );
             #body_fn
             let __outcome = __ztest_sync_body(::ztest::sync::SyncRunner::new()).await;
             assert!(

@@ -378,6 +378,13 @@ fn unjudged(error: ReferenceError) -> Verdict {
     Verdict::Unjudged
 }
 
+/// Calibration's own checks (the ledger's totals also take the auditor's, running beside it)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Calibration {
+    pub audited: u64,
+    pub violations: u64,
+}
+
 /// Calibration: `heights` served one at a time on a quiet server, every fee recomputed,
 /// both shapes (`GetBlock` + `GetBlockRange`) held to zebra
 pub async fn calibrate(
@@ -385,10 +392,11 @@ pub async fn calibrate(
     client: &crate::loadtest::wire::RawClient,
     heights: &[u32],
     ledger: &Ledger,
-) {
+) -> Calibration {
     use crate::loadtest::wire::{encoded, path};
     use crate::proto::BlockRange;
 
+    let mut tally = Calibration::default();
     for &height in heights {
         let id = BlockId { height: u64::from(height), hash: Vec::new() };
         let range =
@@ -402,6 +410,7 @@ pub async fn calibrate(
         let (full, shielded_answer) = match (full, shielded_answer) {
             (Ok(full), Ok(Some(one))) => (full, one),
             (full, one) => {
+                tally.violations += 1;
                 ledger.violated(
                     "calibration",
                     u64::from(height),
@@ -417,12 +426,14 @@ pub async fn calibrate(
         let (Ok(full_block), Ok(shielded_block)) =
             (CompactBlock::decode(full.as_ref()), CompactBlock::decode(shielded_answer.as_ref()))
         else {
+            tally.violations += 1;
             ledger.violated("calibration", u64::from(height), "undecodable CompactBlock".into());
             continue;
         };
         let expected = match zebra.compact_block(height, Fees::Checked).await {
             Ok(expected) => expected,
             Err(error) => {
+                tally.violations += 1;
                 ledger.violated("calibration", u64::from(height), format!("zebra: {error}"));
                 continue;
             }
@@ -433,10 +444,17 @@ pub async fn calibrate(
         ];
         for (check, diff) in diffs {
             match diff {
-                None => ledger.audited(check),
-                Some(detail) => ledger.violated(check, u64::from(height), detail),
+                None => {
+                    tally.audited += 1;
+                    ledger.audited(check);
+                }
+                Some(detail) => {
+                    tally.violations += 1;
+                    ledger.violated(check, u64::from(height), detail);
+                }
             }
         }
         ledger.shielded_block(height, &shielded_answer);
     }
+    tally
 }

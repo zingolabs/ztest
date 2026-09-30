@@ -7,7 +7,10 @@
 //! - Capacity = the last level within the SLO, soaked [`Plan::soak`] to confirm it holds
 //! - Engine = own runtime, one worker per driver core but one ([`EngineCpu`]); a client-bound
 //!   level stops the ramp too (its numbers bound the driver, not the server)
+//! - Breach under a saturated driver = the server's only where its own clock breaks the SLO
+//!   ([`ServerMeter::slower_than`])
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -35,15 +38,19 @@ use crate::protocol::client::JsonRpcClient;
 use crate::sync::{ProgressView, SyncSubject};
 use crate::{EnvError, RpcError};
 
-/// Server-side cost, read off the indexer pod (cgroup v2)
+/// Server side of a level: its pod's cost + its own clock
 #[async_trait]
 pub trait ServerMeter: Send + Sync + fmt::Debug {
     async fn cpu(&self) -> Result<Duration, String>;
     /// Resident bytes page-cache pressure cannot reclaim (heap + stacks)
     async fn memory(&self) -> Result<u64, String>;
+    /// Answers per method the server's own clock ran past `over`, cumulative
+    ///
+    /// - Span = the client's for that method ([`Method::span`]); a method without one absent
+    async fn slower_than(&self, over: Duration) -> Result<BTreeMap<Method, u64>, String>;
 }
 
-/// [`ServerMeter`] over a component pod's own cgroup (v2), read with `cat` in its container
+/// A component pod's own cgroup (v2), read with `cat` in its container
 #[derive(Debug, Clone)]
 pub struct PodCgroup {
     pod: crate::handles::ComponentPod,
@@ -52,6 +59,21 @@ pub struct PodCgroup {
 impl PodCgroup {
     pub fn new(pod: crate::handles::ComponentPod) -> Self {
         Self { pod }
+    }
+
+    pub async fn cpu(&self) -> Result<Duration, String> {
+        let stat = self.read("cpu.stat").await?;
+        CgroupCpu::parse(&stat)
+            .map(|cpu| cpu.usage)
+            .ok_or_else(|| format!("cpu.stat without usage_usec: {stat}"))
+    }
+
+    /// `anon` of `memory.stat` = heap + stacks, the part page-cache pressure cannot reclaim
+    pub async fn memory(&self) -> Result<u64, String> {
+        let stat = self.read("memory.stat").await?;
+        stat.lines()
+            .find_map(|line| line.strip_prefix("anon ")?.trim().parse().ok())
+            .ok_or_else(|| format!("memory.stat without anon: {stat}"))
     }
 
     async fn read(&self, file: &str) -> Result<String, String> {
@@ -65,24 +87,6 @@ impl PodCgroup {
             true => Ok(output.stdout),
             false => Err(format!("cat {path}: exit {}: {}", output.status, output.stderr)),
         }
-    }
-}
-
-#[async_trait]
-impl ServerMeter for PodCgroup {
-    async fn cpu(&self) -> Result<Duration, String> {
-        let stat = self.read("cpu.stat").await?;
-        CgroupCpu::parse(&stat)
-            .map(|cpu| cpu.usage)
-            .ok_or_else(|| format!("cpu.stat without usage_usec: {stat}"))
-    }
-
-    /// `anon` of `memory.stat` = heap + stacks, the part page-cache pressure cannot reclaim
-    async fn memory(&self) -> Result<u64, String> {
-        let stat = self.read("memory.stat").await?;
-        stat.lines()
-            .find_map(|line| line.strip_prefix("anon ")?.trim().parse().ok())
-            .ok_or_else(|| format!("memory.stat without anon: {stat}"))
     }
 }
 
@@ -121,6 +125,7 @@ impl Ramp {
 
 /// Set point a level must hold to count as served
 ///
+/// - `p99` per method (an aggregate hides a slow low-volume method under fast bulk traffic)
 /// - `errors` = failed share of requests; `goodput` = fresh wallets' paced demand delivered
 #[derive(Debug, Clone, Copy)]
 pub struct Slo {
@@ -129,26 +134,40 @@ pub struct Slo {
     pub goodput: f64,
 }
 
+/// Share of a method's answers a p99 lets run past it
+const TAIL: f64 = 0.01;
+
 impl Slo {
     /// First reason `level` falls short
     ///
-    /// - A saturated driver only inflates latency → a pass under it still counts; a breach under
-    ///   it = [`Breach::ClientBound`] (says nothing of the server)
+    /// - Error codes = the server's answers (no client deadline) → never voided by the driver
+    /// - Saturated driver inflates latency + starves goodput → a breach under it counts only where
+    ///   the server's own clock alone breaks the p99, else [`Breach::ClientBound`]
     pub fn breach(&self, level: &Level) -> Option<Breach> {
-        let breach = self.served_short(level)?;
-        Some(if level.client_bound() { Breach::ClientBound } else { breach })
-    }
-
-    fn served_short(&self, level: &Level) -> Option<Breach> {
         if level.error_rate() > self.errors {
             return Some(Breach::Errors(level.error_rate()));
         }
-        match level.p99 {
-            None => return Some(Breach::NothingAnswered),
-            Some(p99) if p99 > self.p99 => return Some(Breach::Latency(p99)),
-            Some(_) => {}
+        if level.p99.is_none() {
+            return Some(Breach::NothingAnswered);
         }
-        level.goodput().filter(|share| *share < self.goodput).map(Breach::Goodput)
+        let mut voided = false;
+        for m in level.methods.iter().filter(|m| m.method != Method::Connect) {
+            if m.latency.count == 0 || m.latency.p99 <= self.p99 {
+                continue;
+            }
+            let server = level.server_share_slow(m);
+            if !level.client_bound() || server.is_some_and(|share| share > TAIL) {
+                return Some(Breach::Latency { method: m.method, p99: m.latency.p99, server });
+            }
+            voided = true;
+        }
+        if let Some(share) = level.goodput().filter(|share| *share < self.goodput) {
+            if !level.client_bound() {
+                return Some(Breach::Goodput(share));
+            }
+            voided = true;
+        }
+        voided.then_some(Breach::ClientBound)
     }
 }
 
@@ -156,7 +175,7 @@ impl fmt::Display for Slo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "p99 ≤ {:?}, errors ≤ {:.1}%, fresh goodput ≥ {:.0}%",
+            "p99 ≤ {:?} per method, errors ≤ {:.1}%, fresh goodput ≥ {:.0}%",
             self.p99,
             self.errors * 100.0,
             self.goodput * 100.0
@@ -164,12 +183,14 @@ impl fmt::Display for Slo {
     }
 }
 
+/// `Latency.server` = share of the method's answers zainod's own clock ran past the SLO (`None` =
+/// no server twin, or no reading)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Breach {
     ClientBound,
     Errors(f64),
     NothingAnswered,
-    Latency(Duration),
+    Latency { method: Method, p99: Duration, server: Option<f64> },
     Goodput(f64),
 }
 
@@ -181,7 +202,19 @@ impl fmt::Display for Breach {
             }
             Breach::Errors(rate) => write!(f, "errors {:.2}%", rate * 100.0),
             Breach::NothingAnswered => write!(f, "nothing answered"),
-            Breach::Latency(p99) => write!(f, "p99 {p99:.2?}"),
+            Breach::Latency { method, p99, server } => {
+                write!(f, "{} p99 {p99:.2?}", method.name())?;
+                match server {
+                    Some(share) => {
+                        write!(
+                            f,
+                            " ({:.1}% of answers past the SLO on the server's clock)",
+                            share * 100.0
+                        )
+                    }
+                    None => Ok(()),
+                }
+            }
             Breach::Goodput(share) => write!(f, "goodput {:.0}% of paced demand", share * 100.0),
         }
     }
@@ -223,11 +256,12 @@ impl Plan {
     /// Mainnet after a full index build: each scenario ramped ×1.5 per 30 s level from a known
     /// good start, then its capacity soaked 2 min
     ///
-    /// - 10k connections + mempool streams: sized by the `QosClass::Sync` runner
+    /// - 15k connections + mempool streams: under a 16,384-connection zainod cap, sized by the
+    ///   test's declared `runner`
     pub fn mainnet() -> Self {
         Self {
             ramps: vec![
-                Ramp { scenario: Scenario::Incremental, from: 250, growth: 1.5, ceiling: 10_000 },
+                Ramp { scenario: Scenario::Incremental, from: 250, growth: 1.5, ceiling: 15_000 },
                 Ramp { scenario: Scenario::Fresh, from: 16, growth: 1.5, ceiling: 1_000 },
             ],
             slo: Slo { p99: Duration::from_secs(1), errors: 0.01, goodput: 0.9 },
@@ -254,33 +288,6 @@ impl Plan {
             bury_wait: Duration::from_secs(120),
         }
     }
-
-    /// Minutes on a regtest chain: both scenarios, every answer audited, unpaced (regtest
-    /// blocks too small for goodput to mean anything)
-    pub fn smoke() -> Self {
-        Self {
-            ramps: vec![
-                Ramp { scenario: Scenario::Incremental, from: 10, growth: 2.0, ceiling: 40 },
-                Ramp { scenario: Scenario::Fresh, from: 2, growth: 2.0, ceiling: 4 },
-            ],
-            slo: Slo { p99: Duration::from_secs(5), errors: 0.01, goodput: 0.0 },
-            settle: Duration::from_secs(3),
-            measure: Duration::from_secs(7),
-            soak: Duration::from_secs(10),
-            birthdays: vec![Birthdays::Recent { blocks: 20 }, Birthdays::Anywhere],
-            pace: None,
-            calibration: 64,
-            audit_every: 1,
-            audit_queue: 16_384,
-            reorg_margin: 2,
-            burst_tick: Duration::from_secs(3),
-            mobile_every: 2,
-            librustzcash_every: 2,
-            librustzcash_batch: 10,
-            dials: 32,
-            bury_wait: Duration::from_secs(60),
-        }
-    }
 }
 
 /// What the load is aimed at
@@ -298,6 +305,7 @@ pub struct Target {
 ///
 /// - `offered` = fresh wallets' paced demand, bytes/s; `client_*` = engine utilisation (1.0 =
 ///   every worker on-CPU) over the window and across its busiest burst's drain
+/// - `server_slow` = per method, answers the server's clock ran past [`Slo::p99`] in the window
 #[derive(Debug, Clone)]
 pub struct Level {
     pub scenario: Scenario,
@@ -310,6 +318,7 @@ pub struct Level {
     pub offered: Option<f64>,
     pub server_cores: Option<f64>,
     pub server_memory: Option<u64>,
+    pub server_slow: Option<BTreeMap<Method, u64>>,
     pub client_busy: Option<f64>,
     pub client_busiest_burst: Option<f64>,
     pub client_workers: usize,
@@ -329,6 +338,13 @@ impl Level {
         self.throttled.is_some_and(|t| t > THROTTLED)
             || self.client_busy.is_some_and(|busy| busy > SATURATED)
             || self.client_busiest_burst.is_some_and(|busy| busy > SATURATED)
+    }
+
+    /// Share of `m`'s answered requests the server's own clock ran past the SLO (`None` = no
+    /// server twin for `m`, or no reading)
+    pub fn server_share_slow(&self, m: &MethodWindow) -> Option<f64> {
+        let slow = *self.server_slow.as_ref()?.get(&m.method)?;
+        Some((slow as f64 / m.latency.count.max(1) as f64).min(1.0))
     }
 
     pub fn requests_per_second(&self) -> f64 {
@@ -405,12 +421,18 @@ impl fmt::Display for Level {
         for m in &self.methods {
             writeln!(
                 f,
-                "  {:<18} ok {:>8}  p50 {:>9.2?}  p99 {:>9.2?}  {:>9.1} MB{}",
+                "  {:<18} ok {:>8}  p50 {:>9.2?}  p99 {:>9.2?}  {:>9.1} MB{}{}",
                 m.method.name(),
                 m.ok,
                 m.latency.p50,
                 m.latency.p99,
                 m.bytes as f64 / 1e6,
+                match self.server_share_slow(m) {
+                    Some(share) if share > 0.0 => {
+                        format!("  server past SLO {:.1}%", share * 100.0)
+                    }
+                    _ => String::new(),
+                },
                 if m.failed.is_empty() {
                     String::new()
                 } else {
@@ -483,7 +505,7 @@ impl fmt::Display for ScenarioReport {
 #[derive(Debug, Clone)]
 pub struct LoadReport {
     pub calibrated: Vec<u32>,
-    pub calibration: Tallies,
+    pub calibration: audit::Calibration,
     pub slo: Slo,
     pub scenarios: Vec<ScenarioReport>,
     pub ledger: Tallies,
@@ -551,7 +573,7 @@ impl LoadRun {
 }
 
 /// Calibrate, then ramp every scenario in order
-pub async fn run(target: Target, plan: Plan, state: Arc<LoadRun>) -> Result<LoadReport, LoadError> {
+async fn run(target: Target, plan: Plan, state: Arc<LoadRun>) -> Result<LoadReport, LoadError> {
     let raise = rlimit::increase_nofile_limit(u64::MAX);
     tracing::info!(nofile = ?raise, "load driver open-file limit");
     let zebra = Arc::new(Zebra::new(target.zebra.clone()));
@@ -586,8 +608,7 @@ pub async fn run(target: Target, plan: Plan, state: Arc<LoadRun>) -> Result<Load
         stable_below,
         "load calibration: served blocks vs zebra"
     );
-    audit::calibrate(&zebra, &client, &calibrated, &ledger).await;
-    let calibration = ledger.tallies();
+    let calibration = audit::calibrate(&zebra, &client, &calibrated, &ledger).await;
     let addresses = Arc::new(chain.addresses(&target.zebra, &calibrated).await);
 
     let shape = SyncShape {
@@ -774,6 +795,7 @@ struct Engine {
 struct Reading {
     at: Instant,
     server_cpu: Option<Duration>,
+    server_slow: Option<BTreeMap<Method, u64>>,
     driver: Option<CgroupCpu>,
     engine: Option<Duration>,
 }
@@ -842,6 +864,12 @@ impl Engine {
                 .await
                 .inspect_err(|e| tracing::warn!(%e, "server cpu"))
                 .ok(),
+            server_slow: self
+                .server
+                .slower_than(self.plan.slo.p99)
+                .await
+                .inspect_err(|e| tracing::warn!(%e, "server latency"))
+                .ok(),
             driver: CgroupCpu::own(),
             engine: self.cpu.used(),
         }
@@ -878,6 +906,14 @@ impl Engine {
                 .zip(after.server_cpu)
                 .map(|(b, a)| per_second(a.saturating_sub(b))),
             server_memory: self.server.memory().await.ok(),
+            server_slow: before.server_slow.zip(after.server_slow).map(|(before, after)| {
+                after
+                    .into_iter()
+                    .map(|(method, n)| {
+                        (method, n.saturating_sub(before.get(&method).copied().unwrap_or(0)))
+                    })
+                    .collect()
+            }),
             client_busy: before
                 .engine
                 .zip(after.engine)
@@ -1100,59 +1136,85 @@ mod tests {
 
         let slo = Slo { p99: Duration::from_secs(1), errors: 0.01, goodput: 0.9 };
         let window = Duration::from_secs(10);
-        let ms = Duration::from_millis(50);
-        let range = |failed: u64, mb: u64| MethodWindow {
-            method: Method::GetBlockRange,
-            latency: LatencyStats { p50: ms, p90: ms, p99: ms, p999: ms, max: ms, count: 1_000 },
-            ok: 1_000,
-            failed: if failed == 0 { Default::default() } else { [("Unavailable", failed)].into() },
-            bytes: mb * 1_000_000,
+        let method = |method, p99_ms, count: u64, failed: u64, mb: u64| {
+            let (p50, p99) = (Duration::from_millis(5), Duration::from_millis(p99_ms));
+            MethodWindow {
+                method,
+                latency: LatencyStats { p50, p90: p50, p99, p999: p99, max: p99, count },
+                ok: count,
+                failed: if failed == 0 {
+                    Default::default()
+                } else {
+                    [("Unavailable", failed)].into()
+                },
+                bytes: mb * 1_000_000,
+            }
         };
-        let level = |methods: Vec<MethodWindow>, p99_ms, offered, busy| Level {
-            scenario: Scenario::Fresh,
-            wallets: 10,
-            connected: 10,
-            window,
-            methods,
-            p99: Some(Duration::from_millis(p99_ms)),
-            burst_drain: None,
-            offered,
-            server_cores: Some(1.0),
-            server_memory: None,
-            client_busy: Some(busy),
-            client_busiest_burst: None,
-            client_workers: 1,
-            throttled: Some(0.0),
-            ledger: Tallies::default(),
-        };
+        let (range, utxos) = (Method::GetBlockRange, Method::GetAddressUtxos);
+        let level =
+            |methods: Vec<MethodWindow>, offered, busy, server_slow: &[(Method, u64)]| Level {
+                scenario: Scenario::Fresh,
+                wallets: 10,
+                connected: 10,
+                window,
+                p99: methods.iter().map(|m| m.latency.p99).max(),
+                methods,
+                burst_drain: None,
+                offered,
+                server_cores: Some(1.0),
+                server_memory: None,
+                server_slow: Some(server_slow.iter().copied().collect()),
+                client_busy: Some(busy),
+                client_busiest_burst: None,
+                client_workers: 1,
+                throttled: Some(0.0),
+                ledger: Tallies::default(),
+            };
+        let fast = || method(range, 50, 1_000, 0, 460);
+        let slow_utxos = || method(utxos, 9_000, 20, 0, 0);
         let cases = [
-            (level(vec![range(0, 460)], 200, Some(50e6), 0.3), None, "within every set point"),
+            (level(vec![fast()], Some(50e6), 0.3, &[]), None, "within every set point"),
             (
-                level(vec![range(0, 460)], 200, Some(50e6), 0.9),
+                level(vec![fast()], Some(50e6), 0.9, &[]),
                 None,
                 "saturated driver, SLO held: a pass (client only inflates latency)",
             ),
             (
-                level(vec![range(0, 460)], 1_500, Some(50e6), 0.9),
-                Some(Breach::ClientBound),
-                "saturated driver, SLO missed: inconclusive, not zaino's",
-            ),
-            (
-                level(vec![range(20, 460)], 200, Some(50e6), 0.3),
+                level(vec![method(range, 20, 1_000, 20, 460)], Some(50e6), 0.9, &[]),
                 Some(Breach::Errors(20.0 / 1_020.0)),
-                "2% failed",
+                "2% failed: the server's answers, saturated driver or not",
             ),
             (
-                level(vec![range(0, 460)], 1_500, Some(50e6), 0.3),
-                Some(Breach::Latency(Duration::from_millis(1_500))),
-                "slow",
+                level(vec![fast(), slow_utxos()], Some(50e6), 0.3, &[]),
+                Some(Breach::Latency { method: utxos, p99: Duration::from_secs(9), server: None }),
+                "20 slow of 1,020: under an aggregate p99, a breach of its own method's",
             ),
             (
-                level(vec![range(0, 400)], 200, Some(50e6), 0.3),
+                level(vec![fast(), slow_utxos()], Some(50e6), 0.9, &[(utxos, 0)]),
+                Some(Breach::ClientBound),
+                "saturated driver, server fast: the driver's latency, inconclusive",
+            ),
+            (
+                level(vec![fast(), slow_utxos()], Some(50e6), 0.9, &[(utxos, 16)]),
+                Some(Breach::Latency {
+                    method: utxos,
+                    p99: Duration::from_secs(9),
+                    server: Some(0.8),
+                }),
+                "saturated driver, 16 of 20 past the SLO on the server's clock: zaino's",
+            ),
+            (
+                level(vec![method(range, 50, 1_000, 0, 400)], Some(50e6), 0.3, &[]),
                 Some(Breach::Goodput(0.8)),
                 "40 of 50 MB/s",
             ),
-            (level(vec![range(0, 1)], 200, None, 0.3), None, "unpaced: no goodput set point"),
+            (
+                level(vec![method(range, 50, 1_000, 0, 400)], Some(50e6), 0.9, &[]),
+                Some(Breach::ClientBound),
+                "short goodput under a saturated driver: its decode, inconclusive",
+            ),
+            (level(vec![method(range, 50, 1_000, 0, 1)], None, 0.3, &[]), None, "unpaced"),
+            (level(vec![], None, 0.3, &[]), Some(Breach::NothingAnswered), "nothing answered"),
         ];
         for (level, want, why) in cases {
             assert_eq!(slo.breach(&level), want, "{why}");

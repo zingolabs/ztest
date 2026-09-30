@@ -167,6 +167,15 @@ pub const fn gauge_where(
     Gauge(Family { name, select: Some(Select { label, value }), dim, ready: DEFAULT_READY })
 }
 
+pub const fn hist_where(
+    name: &'static str,
+    dim: Dimension,
+    label: &'static str,
+    value: &'static str,
+) -> Hist {
+    Hist(Family { name, select: Some(Select { label, value }), dim, ready: DEFAULT_READY })
+}
+
 macro_rules! shape {
     ($($t:ty),*) => {$(
         impl $t {
@@ -413,6 +422,16 @@ pub fn windowed_quantile(before: &[(f64, f64)], after: &[(f64, f64)], phi: Phi) 
     None
 }
 
+/// Observations past the first finite edge ≥ `at` seconds, cumulative
+///
+/// - Between edges unrecoverable → rounds toward fewer (an edge at `at` = exact)
+/// - `None` = no finite edge ≥ `at`, or no `+Inf` bucket to total against
+pub fn count_above(ladder: &[(f64, f64)], at: f64) -> Option<f64> {
+    let &(inf, total) = ladder.last()?;
+    let &(_, within) = ladder.iter().find(|(le, _)| le.is_finite() && *le >= at)?;
+    inf.is_infinite().then_some(total - within)
+}
+
 /// Unselected admits every series; a series missing the label is not that value
 fn admits(select: Option<Select>, labels: &prometheus_parse::Labels) -> bool {
     match select {
@@ -645,6 +664,35 @@ zaino_grpc_request_duration_seconds_count 17
             Some(6.0),
             "9.6s over 150 would be the fold — a different quantity under the same label"
         );
+    }
+
+    /// Per-method ladder read through a selector; the count past an SLO rounds toward fewer
+    #[test]
+    fn a_selected_ladder_counts_what_ran_past_a_threshold() {
+        let e = exposition(&["# TYPE zaino_grpc_duration_seconds histogram\n\
+             zaino_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"0.1\"} 90\n\
+             zaino_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"1\"} 97\n\
+             zaino_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"10\"} 99\n\
+             zaino_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"+Inf\"} 100\n\
+             zaino_grpc_duration_seconds_sum{method=\"GetBlock\"} 30\n\
+             zaino_grpc_duration_seconds_count{method=\"GetBlock\"} 100\n\
+             zaino_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"0.1\"} 0\n\
+             zaino_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"1\"} 0\n\
+             zaino_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"10\"} 0\n\
+             zaino_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"+Inf\"} 50\n\
+             zaino_grpc_duration_seconds_sum{method=\"GetTreeState\"} 900\n\
+             zaino_grpc_duration_seconds_count{method=\"GetTreeState\"} 50\n"]);
+        let ladder = |method| {
+            let family =
+                hist_where("zaino_grpc_duration_seconds", Dimension::Seconds, "method", method);
+            e.buckets(family.family()).expect("published")
+        };
+        let block = ladder("GetBlock");
+        assert_eq!(count_above(&block, 1.0), Some(3.0), "edge at the threshold = exact");
+        assert_eq!(count_above(&block, 5.0), Some(1.0), "no edge at 5 s → the 10 s one (fewer)");
+        assert_eq!(count_above(&block, 60.0), None, "no finite edge that high");
+        assert_eq!(count_above(&ladder("GetTreeState"), 1.0), Some(50.0), "its own, not folded");
+        assert_eq!(count_above(&block[..3], 1.0), None, "no +Inf to total against");
     }
 
     /// Absent != nothing happened; neither is a latency of zero

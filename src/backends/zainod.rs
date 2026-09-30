@@ -4,6 +4,7 @@
 //! - No helpers shared with `lightwalletd` (the two may diverge in framing)
 //! - One ingest path: validator JSON-RPC (`[source]`) → per-index stores under the scratch mount
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -21,8 +22,11 @@ use zcash_protocol::value::ZatBalance;
 
 use crate::component::ComponentBuilder;
 use crate::handles::HandleInner;
+use crate::handles::PodHandle;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
-use crate::metrics::{Counter, Exporter, Exposition, Facet, Row, Tiers, row};
+use crate::loadtest::load::{PodCgroup, ServerMeter};
+use crate::loadtest::measure::{Method, Span};
+use crate::metrics::{Counter, Exporter, Exposition, Facet, Row, Tiers, count_above, row};
 use crate::protocol::Endpoint;
 use crate::protocol::client::JsonRpcClient;
 use crate::sync::Channel as Pool;
@@ -694,7 +698,9 @@ impl IndexerBackend for ZainoIndexer {
 /// once → an illegal reading is a compile error, not a wrong number
 pub mod family {
     use super::ZainoIndex;
-    use crate::metrics::{Counter, Dimension, Gauge, Hist, counter, gauge, gauge_where, hist};
+    use crate::metrics::{
+        Counter, Dimension, Gauge, Hist, counter, gauge, gauge_where, hist, hist_where,
+    };
 
     pub const BUILD_INFO: Gauge = gauge("zaino_build_info", Dimension::Count);
 
@@ -751,6 +757,14 @@ pub mod family {
     pub const LSM_MERGE: Hist = hist("zaino_lsm_merge_duration_seconds", Dimension::Seconds);
     /// Unpublished = no commit ever waited on a merge
     pub const LSM_STALL: Hist = hist("zaino_lsm_stall_duration_seconds", Dimension::Seconds);
+
+    // zainod's own clock per `CompactTxStreamer` method, from admission (its queueing included)
+    pub const fn grpc_first_message(method: &'static str) -> Hist {
+        hist_where("zaino_grpc_first_message_seconds", Dimension::Seconds, "method", method)
+    }
+    pub const fn grpc_duration(method: &'static str) -> Hist {
+        hist_where("zaino_grpc_duration_seconds", Dimension::Seconds, "method", method)
+    }
 }
 
 const fn lsm(set: &'static str) -> Tiers {
@@ -839,6 +853,43 @@ const EXPORTER_SCRAPE_TIMEOUT: Duration = Duration::from_secs(1);
 impl Exporter for ZainoIndexer {
     async fn endpoint(&self) -> Result<Endpoint, EnvError> {
         self.plumbing.endpoint(crate::metrics::PORT_NAME).await
+    }
+}
+
+/// Load-window edge scrape (a loaded exporter answers slower than a tick's budget allows)
+const LOAD_SCRAPE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pod resolved per reading (a restarted zainod = a new pod)
+#[async_trait]
+impl ServerMeter for ZainoIndexer {
+    async fn cpu(&self) -> Result<Duration, String> {
+        PodCgroup::new(self.pod().await.map_err(|e| e.to_string())?).cpu().await
+    }
+
+    async fn memory(&self) -> Result<u64, String> {
+        PodCgroup::new(self.pod().await.map_err(|e| e.to_string())?).memory().await
+    }
+
+    /// - Method never called = no series = none slow
+    /// - Ladder without an edge ≥ `over` = an error (a zero would clear zaino of every breach)
+    async fn slower_than(&self, over: Duration) -> Result<BTreeMap<Method, u64>, String> {
+        let exposition = self.read(LOAD_SCRAPE_TIMEOUT).await.map_err(|e| e.to_string())?;
+        let mut slow = BTreeMap::new();
+        for method in Method::ALL {
+            let hist = match method.span() {
+                None => continue,
+                Some(Span::FirstMessage) => family::grpc_first_message(method.name()),
+                Some(Span::Whole) => family::grpc_duration(method.name()),
+            };
+            let Some(ladder) = exposition.buckets(hist.family()) else {
+                slow.insert(method, 0);
+                continue;
+            };
+            let above = count_above(&ladder, over.as_secs_f64())
+                .ok_or_else(|| format!("{hist}: no bucket edge at or above {over:?}"))?;
+            slow.insert(method, above as u64);
+        }
+        Ok(slow)
     }
 }
 
