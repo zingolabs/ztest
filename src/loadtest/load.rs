@@ -256,12 +256,11 @@ impl Plan {
     /// Mainnet after a full index build: each scenario ramped ×1.5 per 30 s level from a known
     /// good start, then its capacity soaked 2 min
     ///
-    /// - 15k connections + mempool streams: under a 16,384-connection zainod cap, sized by the
-    ///   test's declared `runner`
+    /// - 10k connections + mempool streams: fit the `QosClass::Sync` runner's 4 GiB
     pub fn mainnet() -> Self {
         Self {
             ramps: vec![
-                Ramp { scenario: Scenario::Incremental, from: 250, growth: 1.5, ceiling: 15_000 },
+                Ramp { scenario: Scenario::Incremental, from: 250, growth: 1.5, ceiling: 10_000 },
                 Ramp { scenario: Scenario::Fresh, from: 16, growth: 1.5, ceiling: 1_000 },
             ],
             slo: Slo { p99: Duration::from_secs(1), errors: 0.01, goodput: 0.9 },
