@@ -294,8 +294,9 @@ async fn explain_empty(client: &kube::Client, id: &str, component: &str) -> Opti
     let has_host = ztest::api::profiling::metrics_port(id).await.is_some();
     if !has_sidecar && !has_host {
         return Some(format!(
-            "sync {id} carries no profiler; nothing was ever collected — \
-             restart it with `ztest sync start <profile>`"
+            "sync {id} has no profiler running (never started, or its collector was removed): \
+             nothing is collected now, and this window holds no samples — a window from \
+             before it stopped still answers"
         ));
     }
 

@@ -7,6 +7,8 @@
 //! - Container ids still match: nested containerd ids appear verbatim in the host cgroup path
 //! - Lifetime = the run's, enforced by reaping against the driver pod (the CLI is detached, so
 //!   nothing stays resident to stop it)
+//! - Reaped only by a command bound to the collector's own cluster (collectors = machine-wide,
+//!   a driver's liveness = per cluster)
 
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -20,6 +22,9 @@ pub const HOST_KUBECONFIG: &str = "/etc/alloy/kubeconfig";
 
 /// Marks a container as ours *and* whose: reaping needs the sync id without a pid file
 const SYNC_LABEL: &str = "ztest.io/sync-id";
+
+/// Kube context the run bound to: the only cluster that can say whether its driver is live
+const CONTEXT_LABEL: &str = "ztest.io/kube-context";
 
 /// kind labels its node containers; the cluster's engine network is read off one of them so
 /// the collector joins it rather than guessing a name
@@ -220,6 +225,8 @@ pub async fn start(
     let name = container_name(sync_id);
     let _ = Command::new(runtime::program()).args(["rm", "-f", &name]).output().await;
 
+    let context = crate::cluster_config::active_context()
+        .ok_or("no kube context to bind the host collector to")?;
     let network = cluster_network().await.ok_or("no kind docker network found for this cluster")?;
     let http = format!("--server.http.listen-addr=0.0.0.0:{HTTP_PORT}");
     let publish = format!("127.0.0.1::{HTTP_PORT}");
@@ -231,6 +238,8 @@ pub async fn start(
             &name,
             "--label",
             &format!("{SYNC_LABEL}={sync_id}"),
+            "--label",
+            &format!("{CONTEXT_LABEL}={context}"),
             "--privileged",
             "--pid=host",
             "--network",
@@ -314,17 +323,19 @@ pub async fn stop(sync_id: &str) {
     let _ = std::fs::remove_dir_all(run_dir(sync_id));
 }
 
-/// Sync ids with a host collector container, running *or* exited.
+/// Sync ids with a host collector container bound to `context`, running *or* exited.
 ///
 /// - `ps -a`, not `ps`: a collector that died (bind clash, rejected config) still owns a
 ///   container name and a scratch dir, and only this sweep frees them
-pub async fn collectors() -> Vec<String> {
+async fn collectors(context: &str) -> Vec<String> {
     let Ok(out) = Command::new(runtime::program())
         .args([
             "ps",
             "-a",
             "--filter",
             &format!("label={SYNC_LABEL}"),
+            "--filter",
+            &format!("label={CONTEXT_LABEL}={context}"),
             "--format",
             "{{.Label \"ztest.io/sync-id\"}}",
         ])
@@ -343,8 +354,13 @@ pub async fn collectors() -> Vec<String> {
 
 /// Reap collectors whose run is over. The CLI is detached, so this is the only thing that
 /// stops one — called wherever a sync's liveness is already being read.
+///
+/// - Only collectors of `client`'s own cluster (another cluster reads every driver as gone)
 pub async fn reap_finished(client: &kube::Client) {
-    for id in collectors().await {
+    let Some(context) = crate::cluster_config::active_context() else {
+        return;
+    };
+    for id in collectors(&context).await {
         let live = crate::sync::driver_is_live(client, &id).await;
         if !live {
             stop(&id).await;
