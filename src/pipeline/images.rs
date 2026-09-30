@@ -11,7 +11,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use crate::inventory::{
-    DevImageEntry, InventoryLine, QosEntry, SeedEntry, SeedPayload, SyncTestEntry, TestDepEntry,
+    DevImageEntry, InventoryLine, QosEntry, SeedEntry, SyncTestEntry, TestDepEntry,
 };
 use crate::pipeline::build::SelectedBinary;
 
@@ -101,7 +101,7 @@ pub fn assemble(
     dumps: Vec<Dumped>,
 ) -> (DumpOutcome, Vec<(String, Vec<QosEntry>)>) {
     let mut seen_img: BTreeSet<DedupKey> = BTreeSet::new();
-    let mut seen_seed: BTreeSet<(String, SeedPayload)> = BTreeSet::new();
+    let mut seen_seed: BTreeSet<String> = BTreeSet::new();
     let mut images: Vec<DevImageEntry> = Vec::new();
     let mut seeds: Vec<SeedEntry> = Vec::new();
     let mut qos_by_binary: Vec<(String, Vec<QosEntry>)> = Vec::new();
@@ -130,7 +130,7 @@ pub fn assemble(
         for e in s {
             // Dedup on the OID: one artifact declared from two binaries is one seed, and
             // content addressing gets there without the two agreeing on a file path
-            if seen_seed.insert((e.oid.clone(), e.payload)) {
+            if seen_seed.insert(e.oid.clone()) {
                 seeds.push(e);
             }
         }

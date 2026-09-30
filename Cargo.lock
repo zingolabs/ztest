@@ -1955,12 +1955,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "humantime"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
-
-[[package]]
 name = "hybrid-array"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2707,16 +2701,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "md-5"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
-dependencies = [
- "cfg-if",
- "digest 0.10.7",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2925,43 +2909,6 @@ checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
 dependencies = [
  "hermit-abi",
  "libc",
-]
-
-[[package]]
-name = "object_store"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "622acbc9100d3c10e2ee15804b0caa40e55c933d5aa53814cd520805b7958a49"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "form_urlencoded",
- "futures-channel",
- "futures-core",
- "futures-util",
- "http",
- "http-body-util",
- "humantime",
- "hyper",
- "itertools 0.14.0",
- "md-5",
- "parking_lot",
- "percent-encoding",
- "quick-xml",
- "rand 0.10.2",
- "reqwest",
- "ring",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "url",
- "wasm-bindgen-futures",
- "web-time",
 ]
 
 [[package]]
@@ -3187,6 +3134,7 @@ dependencies = [
  "zcash_note_encryption",
  "zcash_primitives",
  "zcash_protocol",
+ "zcash_script",
  "zcash_transparent",
  "zingo-memo",
  "zingo-netutils",
@@ -3561,16 +3509,6 @@ name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
-
-[[package]]
-name = "quick-xml"
-version = "0.39.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
-dependencies = [
- "memchr",
- "serde",
-]
 
 [[package]]
 name = "quinn"
@@ -3954,7 +3892,6 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
- "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -3967,7 +3904,6 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls 0.23.43",
- "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -4026,6 +3962,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e48cf93482ea998ad1302c42739bc73ab3adc574890c373ec89710e219357579"
 dependencies = [
  "digest 0.11.0-pre.9",
+]
+
+[[package]]
+name = "rlimit"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f35ee2729c56bb610f6dba436bf78135f728b7373bdffae2ec815b2d3eb98cc3"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -6445,6 +6390,7 @@ name = "zingo-netutils"
 version = "5.0.1"
 dependencies = [
  "http",
+ "hyper-util",
  "lightwallet-protocol",
  "rand 0.8.7",
  "rustls 0.23.43",
@@ -6482,7 +6428,7 @@ dependencies = [
 
 [[package]]
 name = "zingolib"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "append-only-vec",
  "bech32",
@@ -6617,6 +6563,7 @@ dependencies = [
  "base64 0.22.1",
  "bip0039",
  "blake3",
+ "bytes",
  "bytesize",
  "chrono",
  "console",
@@ -6644,6 +6591,7 @@ dependencies = [
  "prost",
  "rand 0.8.7",
  "reqwest",
+ "rlimit",
  "rusqlite",
  "rustls 0.23.43",
  "sapling-crypto",
@@ -6660,6 +6608,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tinyvec",
  "tokio",
+ "tokio-util",
  "toml 0.8.23",
  "tonic",
  "tonic-prost",
@@ -6702,7 +6651,6 @@ dependencies = [
  "kube",
  "libc",
  "nextest-metadata",
- "object_store",
  "rand 0.8.7",
  "reqwest",
  "serde",

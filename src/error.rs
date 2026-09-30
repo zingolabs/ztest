@@ -132,6 +132,16 @@ impl RpcError {
         RpcError::Backend { component, op, source: Box::new(source) }
     }
 
+    /// Status code a gRPC server answered with (`None` = transport failure, or not gRPC)
+    pub fn grpc_code(&self) -> Option<tonic::Code> {
+        match self {
+            RpcError::Backend { source, .. } => {
+                source.downcast_ref::<tonic::Status>().map(tonic::Status::code)
+            }
+            _ => None,
+        }
+    }
+
     pub fn backend_boxed(
         component: &'static str,
         op: &'static str,

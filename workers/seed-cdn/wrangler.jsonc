@@ -8,7 +8,7 @@
   "preview_urls": false,
   // Fill from `npx wrangler whoami`.  Prevents publishing to wrong account
   "account_id": "bb5cc5e2ef0e85af44eabfabe715b9e3",
-  // Bucket holding `lfs/<oid>`; must be in the account above
+  // Bucket holding `snap/<oid>/…`; must be in the account above
   "r2_buckets": [
     {
       "binding": "SEEDS",

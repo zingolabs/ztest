@@ -4,7 +4,7 @@
 //!   `ztest run --cluster <name>` picks them together, not from independent
 //!   ambient signals
 //! - Store: `$XDG_CONFIG_HOME/ztest/clusters.toml`, else `~/.config/ztest/clusters.toml`
-//! - Same file carries `[bucket]` push credentials → always written `0600`
+//! - Always written `0600`
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -128,58 +128,13 @@ impl ClusterSpec {
     }
 }
 
-/// The on-disk store. Written `0600` (`bucket` holds a secret)
+/// The on-disk store. Unknown top-level tables ignored
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bucket: Option<BucketCredentials>,
     #[serde(default)]
     pub clusters: BTreeMap<String, Profile>,
-}
-
-/// Snapshot-bucket push credentials (`ztest snapshot config set`). `region` optional (R2
-/// wants `auto`; a real region matters only on real AWS).
-///
-/// - [`Debug`] hand-written: a derive puts the secret into any `{:?}` of [`Config`]
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BucketCredentials {
-    pub bucket: String,
-    pub endpoint: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-}
-
-impl std::fmt::Debug for BucketCredentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BucketCredentials")
-            .field("bucket", &self.bucket)
-            .field("endpoint", &self.endpoint)
-            .field("access_key_id", &self.access_key_id)
-            .field("secret_access_key", &"<redacted>")
-            .field("region", &self.region)
-            .finish()
-    }
-}
-
-impl BucketCredentials {
-    /// Secret replaced by its length (`snapshot config show` proves *something* is stored
-    /// without putting a key on a screen-shared terminal)
-    pub fn redacted(&self) -> String {
-        format!(
-            "bucket            = {}\nendpoint          = {}\naccess_key_id     = {}\n\
-             secret_access_key = <{} chars>\nregion            = {}",
-            self.bucket,
-            self.endpoint,
-            self.access_key_id,
-            self.secret_access_key.len(),
-            self.region.as_deref().unwrap_or("auto (default)"),
-        )
-    }
 }
 
 /// One named cluster.
@@ -605,23 +560,15 @@ pub async fn kubelet_is_nested(client: &kube::Client) -> bool {
     nested.unwrap_or(false)
 }
 
-/// Above every artifact whose manifest predates `uncompressed_bytes`
-const SEED_SIZE_UNMEASURED: &str = "48Gi";
-/// Extract + this much = the request. Covers filesystem metadata and the 5% ext4 keeps back
+/// Tree + this much = the request. Covers filesystem metadata and the 5% ext4 keeps back
 const SEED_HEADROOM_PCT: u64 = 15;
 
-/// Seed-PVC request for an artifact measuring `uncompressed_bytes` extracted. Holds the
-/// *extracted chain archive* only (indexer DBs = per-pod `emptyDir`)
-///
-/// - `0` = unmeasured (sidecar manifests carry identity without a size)
-/// - Rounds up to whole GiB: a PVC request is a floor, and CSI rounds anyway
-pub fn seed_size_for(uncompressed_bytes: u64) -> String {
-    if uncompressed_bytes == 0 {
-        return SEED_SIZE_UNMEASURED.to_string();
-    }
+/// Seed-PVC request for a snapshot tree of `size_bytes` (chain state only; indexer DBs =
+/// per-pod `emptyDir`). Rounds up to whole GiB (PVC request = floor, CSI rounds anyway)
+pub fn seed_size_for(size_bytes: u64) -> String {
     const GIB: u64 = 1024 * 1024 * 1024;
-    let headroom = uncompressed_bytes / 100 * SEED_HEADROOM_PCT;
-    format!("{}Gi", uncompressed_bytes.saturating_add(headroom).div_ceil(GIB).max(1))
+    let headroom = size_bytes / 100 * SEED_HEADROOM_PCT;
+    format!("{}Gi", size_bytes.saturating_add(headroom).div_ceil(GIB).max(1))
 }
 
 #[cfg(test)]
@@ -630,24 +577,17 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    /// The rung that forced per-artifact sizing: 48Gi would not hold a tenth of it
+    /// Mainnet vs testnet Ironwood trees: sized per artifact, never one flat default
     #[test]
-    fn a_measured_artifact_sizes_from_its_manifest() {
-        // mainnet Ironwood, `uncompressed_bytes` off snapshots/mainnet/zebra-6.2.3-ironwood.toml
+    fn a_tree_sizes_its_seed_from_its_manifest() {
         assert_eq!(seed_size_for(276_863_224_320), "297Gi");
-        // testnet Ironwood — smaller than the old flat default, so sizing frees space too
         assert_eq!(seed_size_for(10_459_813_376), "12Gi");
     }
 
-    #[test]
-    fn an_unmeasured_artifact_takes_the_flat_default() {
-        assert_eq!(seed_size_for(0), SEED_SIZE_UNMEASURED);
-    }
-
-    /// A PVC request is a floor; rounding down would hand the extract a volume it
-    /// cannot finish unpacking into
+    /// PVC request = floor (rounding down → volume the pull cannot finish writing into)
     #[test]
     fn sizing_rounds_up_and_never_returns_zero() {
+        assert_eq!(seed_size_for(0), "1Gi");
         assert_eq!(seed_size_for(1), "1Gi");
         assert_eq!(seed_size_for(GIB), "2Gi");
     }
@@ -667,41 +607,19 @@ mod tests {
             },
         );
         cfg.current = Some("prod".into());
-        cfg.bucket = Some(BucketCredentials {
-            bucket: "ztest-archives".into(),
-            endpoint: "https://acct.r2.cloudflarestorage.com".into(),
-            access_key_id: "AKID".into(),
-            secret_access_key: "super-secret-value".into(),
-            region: None,
-        });
 
         let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
         assert_eq!(back.current.as_deref(), Some("prod"));
         assert_eq!(back.clusters, cfg.clusters);
-        assert_eq!(back.bucket, cfg.bucket);
-
-        let bare: Config = toml::from_str("[clusters.dev]\n").unwrap();
-        assert_eq!(bare.bucket, None, "no [bucket] = unconfigured, not an error");
-        assert!(!toml::to_string_pretty(&bare).unwrap().contains("bucket"));
     }
 
-    /// Every accidental-leak path: `snapshot config show`, `{:?}` on the creds, and `{:?}`
-    /// on the whole [`Config`] (a `tracing` field or an `anyhow` chain that captured one)
+    /// Stale `[bucket]` table (credentials now live in rclone) loads, and the next save drops it
     #[test]
-    fn bucket_secret_never_reaches_a_formatter() {
-        let creds = BucketCredentials {
-            bucket: "ztest-archives".into(),
-            endpoint: "https://acct.r2.cloudflarestorage.com".into(),
-            access_key_id: "AKID".into(),
-            secret_access_key: "super-secret-value".into(),
-            region: None,
-        };
-        let shown = creds.redacted();
-        assert!(shown.contains("<18 chars>") && shown.contains("AKID"), "{shown}");
-        let cfg = Config { bucket: Some(creds.clone()), ..Default::default() };
-        for shown in [shown, format!("{creds:?}"), format!("{cfg:?}")] {
-            assert!(!shown.contains("super-secret-value"), "{shown}");
-        }
+    fn an_unknown_top_level_table_is_ignored_and_not_rewritten() {
+        let cfg: Config =
+            toml::from_str("[bucket]\nsecret_access_key = \"s\"\n[clusters.dev]\n").unwrap();
+        assert!(cfg.clusters.contains_key("dev"));
+        assert!(!toml::to_string_pretty(&cfg).unwrap().contains("secret_access_key"));
     }
 
     #[cfg(unix)]

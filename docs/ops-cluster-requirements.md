@@ -31,12 +31,13 @@ either has a probe below or is named under [residual gaps](#residual-gaps) — t
 Seeds pull over plain HTTPS from whatever each manifest's `base_uri` names, which is the
 [seed CDN Worker](../workers/seed-cdn/README.md). No credential is involved and none can be:
 the library carries no S3 client. The Worker is the bucket's *only* public read path —
-`r2.dev` access is disabled, so the `lfs/<64 hex>` key pattern it enforces cannot be
-sidestepped, and the endpoint Cloudflare rate-limits and bandwidth-throttles by design is no
+`r2.dev` access is disabled, so the `snap/<64 hex>/<relpath>` key pattern it enforces cannot
+be sidestepped, and the endpoint Cloudflare rate-limits and bandwidth-throttles by design is no
 longer reachable to fall back to.
 
-Publishing a fixture is the one credentialed operation: `ztest snapshot config set` stores the
-key, `ztest snapshot push` uses it. Nothing else in ztest reads it.
+Publishing a snapshot is the one credentialed operation: `ztest snapshot push` shells out to
+`rclone`, whose own config holds the key ([setup](design-snapshots.md#publishing)). ztest stores
+and reads none.
 
 Three outcomes, and the third matters:
 

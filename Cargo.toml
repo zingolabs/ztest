@@ -207,6 +207,9 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false, fe
 pepper-sync = { path = "../zingolib/pepper-sync", optional = true }
 zingolib = { path = "../zingolib/zingolib", optional = true }
 zip32 = { version = "0.2.1", optional = true }
+bytes = "1"
+rlimit = "0.11"
+tokio-util = "0.7"
 
 [features]
 default = ["librustzcash"]

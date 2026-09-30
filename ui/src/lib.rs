@@ -35,7 +35,7 @@ pub use self::plan::render as render_plan;
 pub use self::render::{
     render, render_cancel_panel, render_live_panel, render_preflight_panel,
     render_sync_build_panel, render_sync_load, render_sync_watch_panel, render_sync_work,
-    render_transfer_line, render_transfers,
+    render_transfers,
 };
 pub use self::report::{
     ComponentResources, ReportView, render_sync_report, render_sync_verdict, status_mark,
@@ -203,7 +203,6 @@ pub enum TransferKind {
     Download,
     Image,
     Seed,
-    Upload,
 }
 
 /// Live state of a [`TransferRow`].
@@ -221,14 +220,14 @@ pub enum TransferProgress {
     Failed { detail: String },
 }
 
-/// Byte reports arrive ~1/s (`dd status=progress`; image pulls no faster), sizing the
+/// Byte reports arrive ~1/s (puller's rclone stats; image pulls no faster), sizing the
 /// [`Window`](ztest::api::Window) that smooths them
 const BYTE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// One row's [`Progress`](ztest::api::Progress) reports folded into a [`TransferProgress`],
 /// owning the rate window behind them.
 ///
-/// - Single fold for every surface (console build phase, `snapshot push`, `snapshot warm`)
+/// - Single fold for every surface (console build phase)
 /// - Window dropped on leaving byte mode (resumed bar must not date its rate to the gap)
 /// - `Failed` latches (a failed row keeps its failure until the phase ends)
 #[derive(Debug)]

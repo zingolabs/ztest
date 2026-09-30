@@ -1,7 +1,6 @@
 //! User-facing mount types.
 //!
-//! - `mount_config!` / `mount_file!` / `mount_archive!` emit [`MountSource`] values,
-//!   wrapped into a [`Mount`] and attached to a component by the builder
+//! - `mount_config!` emits a [`Mount`]; builders attach [`Mount::scratch`] / [`Mount::seed`]
 //! - Resolver (ConfigMaps, PVCs, seed-binding VolumeSnapshotContents) = `crate::mounts`
 
 use std::path::PathBuf;
@@ -16,7 +15,7 @@ pub struct Mount {
 /// Where a mount's contents come from; the paired [`MountKind`] decides their fate.
 ///
 /// - `Config*` → ConfigMap, under `mount_config!`'s ≤1 MiB UTF-8 cap
-/// - `Seed` = one oid-named bucket artifact (`DirArchive` extracts, `File` copies verbatim)
+/// - `Seed` = one oid-named snapshot tree from the bucket
 /// - `Empty` = `Scratch`'s `emptyDir`
 #[derive(Debug, Clone)]
 pub enum MountSource {
@@ -31,8 +30,7 @@ pub enum MountSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountKind {
     Config,
-    File,
-    DirArchive,
+    Seed,
     Scratch,
 }
 
@@ -46,15 +44,13 @@ impl Mount {
         }
     }
 
-    /// Mount `archive`, extracted into a fresh PVC at `destination`.
-    ///
-    /// - Pulled into a seed PVC once per cluster (`crate::materialize`), CoW-cloned per test
-    /// - Compressor derived from the artifact's *name* (the bytes never exist locally)
-    pub fn archive(archive: crate::Artifact, destination: impl Into<PathBuf>) -> Self {
+    /// Mount `snapshot`'s tree at `destination` (seed PVC pulled once per cluster by
+    /// `crate::materialize`, CoW-cloned per test)
+    pub fn seed(snapshot: crate::Artifact, destination: impl Into<PathBuf>) -> Self {
         Mount {
-            source: MountSource::Seed(archive),
+            source: MountSource::Seed(snapshot),
             destination: destination.into(),
-            kind: MountKind::DirArchive,
+            kind: MountKind::Seed,
         }
     }
 }

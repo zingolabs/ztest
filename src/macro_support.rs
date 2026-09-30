@@ -8,6 +8,6 @@
 // and the re-export reads as unused here. Dropping it breaks downstream compilation silently
 #[allow(unused_imports)]
 pub use crate::inventory::{
-    DevImageDecl, DevSourceDecl, QosDecl, SeedDecl, SeedPayload, SyncTestDecl, TestDepDecl,
+    DevImageDecl, DevSourceDecl, QosDecl, SeedDecl, SyncTestDecl, TestDepDecl,
 };
 pub use crate::qos::__enter;

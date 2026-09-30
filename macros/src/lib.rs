@@ -1,9 +1,8 @@
-//! Compile-time mount macros for `ztest`.
+//! Compile-time macros for `ztest`.
 //!
-//! Each macro takes `(relative_source, container_destination)` and:
+//! `mount_config!` takes `(relative_source, container_destination)` and:
 //! - resolves the source against `CARGO_MANIFEST_DIR` of the *invoking* crate,
-//! - asserts the file exists at compile time (`compile_error!` otherwise),
-//! - for `mount_config!`, additionally asserts UTF-8 and size `< 1 MiB`,
+//! - asserts the file exists, is UTF-8 and `< 1 MiB` at compile time,
 //! - expands to a `::ztest::Mount` value carrying the absolute path.
 
 use proc_macro::TokenStream;
@@ -69,47 +68,6 @@ fn emit_config_mount(
     }
 }
 
-/// A PVC-backed mount: a content-addressed seed, identified by the archive's
-/// oid and mounted at `destination`.
-///
-/// Also registers a static `SeedDecl` in the link-time inventory — same pattern
-/// as `dev!` — so the preflight resource graph pre-provisions the seed before
-/// any test runs, instead of the first test to reach `build()` materializing a
-/// multi-GB artifact lazily inside its own `ready_timeout`.
-///
-/// `kind_ident` decides what the puller does with the bytes once they land:
-/// `DirArchive` extracts the tar, `File` copies the blob verbatim.
-fn emit_seed_mount(
-    baked: &BakedArchive,
-    destination: &LitStr,
-    kind_ident: &str,
-    payload_ident: &str,
-) -> proc_macro2::TokenStream {
-    let dst = destination.value();
-    let kind = syn::Ident::new(kind_ident, Span::call_site());
-    let (name, oid, size) = (&baked.name, &baked.oid, baked.size);
-    let seed = seed_decl_submit(baked, payload_ident);
-    quote! {
-        {
-            #seed
-            ::ztest::Mount {
-                // `uncompressed_bytes: 0` = unmeasured → seed PVC takes the flat default.
-                // A mount's sidecar manifest carries identity only
-                source: ::ztest::MountSource::Seed(::ztest::Artifact {
-                    name: #name,
-                    oid: #oid,
-                    size: #size,
-                    uncompressed_bytes: 0,
-                    base_uri: ::ztest::api::storage::BASE_URI,
-                    key_prefix: ::ztest::api::storage::KEY_PREFIX,
-                }),
-                destination: ::std::path::PathBuf::from(#dst),
-                kind: ::ztest::MountKind::#kind,
-            }
-        }
-    }
-}
-
 /// `mount_config!("rel/path.toml", "/etc/foo/foo.toml")`
 ///
 /// Becomes a `ConfigMap`-backed mount. Compile-time checks: file exists,
@@ -152,44 +110,6 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
         .into();
     }
     emit_config_mount(&abs, &destination).into()
-}
-
-/// `mount_file!("rel/blob.bin", "/path/in/container")`
-///
-/// Materializes as a content-addressed single-file PVC, copied verbatim.
-/// Requires a sidecar manifest carrying the blob's `sha256`/`size_bytes` — those
-/// address the bytes in the snapshot bucket, like every seed.
-#[proc_macro]
-pub fn mount_file(input: TokenStream) -> TokenStream {
-    let MountArgs { source, destination } = parse_macro_input!(input as MountArgs);
-    let abs = match resolve_source(&source) {
-        Ok(p) => p,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let baked = match bake_archive(&abs, source.span()) {
-        Ok(b) => b,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    emit_seed_mount(&baked, &destination, "File", "File").into()
-}
-
-/// `mount_archive!("rel/data.tar.zst", "/data")`
-///
-/// Materializes as a content-addressed extracted-tar PVC (CoW clone per use).
-/// Requires a sidecar manifest carrying the archive's `sha256`/`size_bytes` —
-/// those address the bytes in the snapshot bucket, like every seed.
-#[proc_macro]
-pub fn mount_archive(input: TokenStream) -> TokenStream {
-    let MountArgs { source, destination } = parse_macro_input!(input as MountArgs);
-    let abs = match resolve_source(&source) {
-        Ok(p) => p,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let baked = match bake_archive(&abs, source.span()) {
-        Ok(b) => b,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    emit_seed_mount(&baked, &destination, "DirArchive", "Archive").into()
 }
 
 // ───────────────────────────── dev! macro ─────────────────────────────
@@ -599,68 +519,8 @@ fn resolve_dir(rel: &LitStr) -> Result<std::path::PathBuf, syn::Error> {
 
 // ─────────────────────── typed resource handles ───────────────────────
 //
-// Two macros, one meaning each:
-//
-//   ztest::archive!(pub SAPLING = "snapshots/….tar.zst")
-//       binds a module-level `const SAPLING: ArchiveHandle` from the sidecar
-//       manifest. Declaration only.
-//
-//   #[ztest::needs(SAPLING)]
-//       on a test, submits the `SeedDecl` that makes it provisionable and the
-//       `TestDepDecl` that binds it to this test, so `ztest run` pre-provisions
-//       the seed and cleanly SKIPs only the tests whose archive failed.
-//
-// There is deliberately no combined declare-and-depend attribute. It would be
-// these two spelled together, and a third spelling of the same two facts is how
-// the old `testnet_snapshot!`/`#[archive]` split happened in the first place.
-// A handle is a real `const`, so naming an undeclared one is a compile error.
-
-/// The `inventory::submit!` that makes an archive provisionable.
-///
-/// Every field is a const expression, so this works equally from a string
-/// literal baked by `mount_archive!` and from `HANDLE.oid()` in `#[needs]` —
-/// no path is stored and no manifest is re-read at runtime.
-fn seed_decl_submit_expr(
-    name: &proc_macro2::TokenStream,
-    oid: &proc_macro2::TokenStream,
-    size: &proc_macro2::TokenStream,
-    uncompressed_bytes: &proc_macro2::TokenStream,
-    base_uri: &proc_macro2::TokenStream,
-    key_prefix: &proc_macro2::TokenStream,
-    payload_ident: &str,
-) -> proc_macro2::TokenStream {
-    let payload = syn::Ident::new(payload_ident, Span::call_site());
-    quote! {
-        ::ztest::__private::inventory::submit! {
-            ::ztest::macro_support::SeedDecl {
-                name: #name,
-                oid: #oid,
-                size: #size,
-                uncompressed_bytes: #uncompressed_bytes,
-                payload: ::ztest::macro_support::SeedPayload::#payload,
-                base_uri: #base_uri,
-                key_prefix: #key_prefix,
-            }
-        }
-    }
-}
-
-/// [`seed_decl_submit_expr`] for an archive whose manifest was read at this
-/// call site, so the values are literals rather than handle accessors.
-fn seed_decl_submit(baked: &BakedArchive, payload_ident: &str) -> proc_macro2::TokenStream {
-    let (name, oid, size) = (&baked.name, &baked.oid, baked.size);
-    // Sidecar manifests carry identity only → location falls back to the published bucket,
-    // size to the unmeasured default
-    seed_decl_submit_expr(
-        &quote! { #name },
-        &quote! { #oid },
-        &quote! { #size },
-        &quote! { 0u64 },
-        &quote! { ::ztest::api::storage::BASE_URI },
-        &quote! { ::ztest::api::storage::KEY_PREFIX },
-        payload_ident,
-    )
-}
+// - `artifact!("snapshots/….toml")` = declaration only (`const` → undeclared = compile error)
+// - `#[ztest::needs(CONST)]` = `SeedDecl` (provisionable) + `TestDepDecl` (bound to this test)
 
 /// The `inventory::submit!` for one test→resource edge. `resource` is a const
 /// expression yielding the archive's OID — the same identity the paired
@@ -692,8 +552,8 @@ fn test_dep_submit(
 ///   2. a `::ztest::macro_support::__enter(class)` first statement so the runtime can
 ///      read the tier in `TestEnv::build()` (the in-process bridge).
 ///
-/// One optional argument, `footprint = "15c/29Gi[/400Gi]"`: replaces this test's component
-/// ceiling only (tier still supplies pool/hard cap). Omitted → tier default, and
+/// One optional argument, `footprint = "15c/29Gi[/400Gi]"`: this test's exact component
+/// reserve (= Σ pod requests; tier still supplies pool/hard cap). Omitted → tier default, and
 /// pods size themselves from `qos::pod` unless they call `.resources(..)`.
 ///
 /// `sync` has no default ceiling, so there it is required rather than optional.
@@ -890,52 +750,12 @@ pub fn sync_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
-// ───────────────────── archive manifests ─────────────────────
+// ───────────────────── snapshot manifests ─────────────────────
 //
-// Every archive resource — a pre-synced testnet chain, a regtest chain cache,
-// an opaque fixture tarball — is declared the same way and carries the same
-// identity. The sidecar `<stem>.toml` is what makes that possible: it records
-// the archive's `sha256` and `size_bytes`, which address the bytes in the
-// snapshot bucket. The manifest is plaintext and committed while the archive
-// itself is gitignored, so it is readable in every checkout and every build
-// context, and the identity bakes with no `git` invocation and no access to the
-// archive bytes.
-//
-// This is the whole reason there is one macro here instead of two. The old
-// `testnet_snapshot!` derived a filename from typed arguments and parsed the
-// manifest; `#[archive]` took a literal path and did not. Both were "declare an
-// archive"; the manifest was always the source of truth for what the archive
-// *is*.
+// - `snapshots/<network>/*.toml`, written by `ztest snapshot push`, committed (bytes never are)
+// - Keys: `name`, `sha256` (= oid of SHA256SUMS), `size_bytes`, `base_uri`, `key_prefix`
 
-/// Compound suffixes that name a tar stream. Longest-first: `.tar.zst` must win
-/// over `.zst`, or the manifest for `chain.tar.zst` is looked for at
-/// `chain.tar.toml`.
-const ARCHIVE_SUFFIXES: &[&str] = &[".tar.zst", ".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".tar"];
-
-/// The sidecar manifest path for a source: same directory, archive suffix
-/// replaced with `.toml`.
-///
-/// A filename is not a reliable place to split on `.` — the chain fixtures are
-/// named `zebra-v6.2.3-testnet-286000.tar.zst`, whose *first* dot is inside the
-/// version. So the known compound suffixes are stripped explicitly, and
-/// anything else falls back to dropping one final extension (`blob.bin` →
-/// `blob.toml`).
-fn manifest_path(source_abs: &std::path::Path) -> std::path::PathBuf {
-    let name = source_abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let stem = ARCHIVE_SUFFIXES
-        .iter()
-        .find_map(|suf| name.strip_suffix(suf))
-        .map(str::to_owned)
-        .unwrap_or_else(|| match name.rsplit_once('.') {
-            Some((s, _)) => s.to_owned(),
-            None => name.clone(),
-        });
-    source_abs.with_file_name(format!("{stem}.toml"))
-}
-
-/// Read `key` from `table` as a `u64`, or produce a located error naming the
-/// manifest — a manifest missing a field is a producer bug, and the consumer
-/// should say which file and which field rather than defaulting.
+/// Missing field = producer bug → name the file and the field, never default
 fn manifest_int(
     table: &toml::Value,
     key: &str,
@@ -971,71 +791,11 @@ fn manifest_str(
     })
 }
 
-/// A mounted archive's baked identity: what the inventory declarations need.
-struct BakedArchive {
-    name: String,
-    oid: String,
-    size: u64,
-}
-
-/// Parse `source_abs`'s sidecar manifest and bake it into an `ArchiveHandle`.
-///
-/// Required of every archive: `sha256` and `size_bytes`, the identity. The
-/// `[chain]`-shaped fields (`backend`, `network`, `version`, `tip_height`, …)
-/// are required as a *set* — present together on a validator state snapshot,
-/// absent together on an opaque blob — so a manifest that lists half of them is
-/// a producer bug reported by name rather than a handle that silently claims
-/// less than the artifact carries.
-fn bake_archive(source_abs: &std::path::Path, span: Span) -> Result<BakedArchive, syn::Error> {
-    let manifest_abs = manifest_path(source_abs);
-    if !manifest_abs.is_file() {
-        return Err(syn::Error::new(
-            span,
-            format!(
-                "archive {} has no sidecar manifest at {}\n\
-                 every archive needs one: it carries the `sha256`/`size_bytes` addressing \
-                 the bytes in the snapshot bucket, and it is the only part of the artifact \
-                 present in a build pod or a checkout (the archive itself is gitignored). \
-                 Produce it with `ztest snapshot push <archive>`, or hand-write one \
-                 with just those two fields for a non-chain archive.",
-                source_abs.display(),
-                manifest_abs.display()
-            ),
-        ));
-    }
-    let text = std::fs::read_to_string(&manifest_abs).map_err(|e| {
-        syn::Error::new(span, format!("reading manifest {}: {e}", manifest_abs.display()))
-    })?;
-    let doc: toml::Value = toml::from_str(&text).map_err(|e| {
-        syn::Error::new(span, format!("manifest {} is not valid TOML: {e}", manifest_abs.display()))
-    })?;
-
-    let oid = manifest_str(&doc, "sha256", &manifest_abs, span)?;
-    if oid.len() != 64 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(syn::Error::new(
-            span,
-            format!(
-                "manifest {} records sha256 = {oid:?}, which is not a 64-character hex \
-                 digest; it must be the SHA-256 of the archive, which is also its bucket \
-                 oid",
-                manifest_abs.display()
-            ),
-        ));
-    }
-    let oid = oid.to_ascii_lowercase();
-    let size = manifest_int(&doc, "size_bytes", &manifest_abs, span)?;
-
-    let name = source_abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-
-    Ok(BakedArchive { name, oid, size })
-}
-
 /// `artifact!("snapshots/testnet/zebra-6.2.3-orchard.toml")` — bake a manifest into an
 /// [`Artifact`](ztest::Artifact) expression.
 ///
-/// Reads the manifest at expansion time, so a checkout holding none of the
-/// archives still compiles. The path names the *manifest*, not the archive: the
-/// archive is the one file that is never in the tree.
+/// Reads the manifest at expansion time, so a checkout holding none of the snapshot bytes
+/// still compiles.
 #[proc_macro]
 pub fn artifact(input: TokenStream) -> TokenStream {
     let source = parse_macro_input!(input as LitStr);
@@ -1061,6 +821,15 @@ fn bake_artifact(
         syn::Error::new(span, format!("manifest {} is not valid TOML: {e}", manifest_abs.display()))
     })?;
     let name = manifest_str(&doc, "name", manifest_abs, span)?;
+    if doc.get("uncompressed_bytes").is_some() || name.ends_with(".tar.zst") {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "manifest {} predates the rclone format; republish with `ztest snapshot push`",
+                manifest_abs.display()
+            ),
+        ));
+    }
     let oid = manifest_str(&doc, "sha256", manifest_abs, span)?;
     if oid.len() != 64 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(syn::Error::new(
@@ -1073,7 +842,6 @@ fn bake_artifact(
     }
     let oid = oid.to_ascii_lowercase();
     let size = manifest_int(&doc, "size_bytes", manifest_abs, span)?;
-    let uncompressed_bytes = manifest_int(&doc, "uncompressed_bytes", manifest_abs, span)?;
     let base_uri = manifest_str(&doc, "base_uri", manifest_abs, span)?;
     let key_prefix = manifest_str(&doc, "key_prefix", manifest_abs, span)?;
     Ok(quote! {
@@ -1081,23 +849,16 @@ fn bake_artifact(
             name: #name,
             oid: #oid,
             size: #size,
-            uncompressed_bytes: #uncompressed_bytes,
             base_uri: #base_uri,
             key_prefix: #key_prefix,
         }
     })
 }
 
-/// `#[ztest::needs(NAME)]` — depend on an archive declared out of line.
+/// `#[ztest::needs(SNAPSHOT)]` — depend on a snapshot declared out of line.
 ///
-/// The companion to [`archive`]: the handle is already bound (by
-/// `ztest::archive!`, in this crate or in `ztest::snapshots`), and this
-/// attribute contributes the two inventory declarations that make it
-/// provisionable and bind it to *this* test — so `ztest run` pre-provisions the
-/// seed and cleanly SKIPs only the tests whose archive failed.
-///
-/// Every field the `SeedDecl` needs is a `const fn` on the handle, so the
-/// submission is a const expression and no path or manifest is re-read here.
+/// Submits the `SeedDecl` (preflight pre-provisions the seed) and the `TestDepDecl` binding it
+/// to *this* test (`ztest run` SKIPs only the tests whose seed failed). All const expressions.
 #[proc_macro_attribute]
 pub fn needs(attr: TokenStream, item: TokenStream) -> TokenStream {
     let handle = parse_macro_input!(attr as syn::Path);
@@ -1106,18 +867,17 @@ pub fn needs(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
     let ident = func.sig.ident.clone();
-    let seed = seed_decl_submit_expr(
-        &quote! { #handle.artifact.name },
-        &quote! { #handle.artifact.oid },
-        &quote! { #handle.artifact.size },
-        &quote! { #handle.artifact.uncompressed_bytes },
-        &quote! { #handle.artifact.base_uri },
-        &quote! { #handle.artifact.key_prefix },
-        "Archive",
-    );
     let dep = test_dep_submit(&ident, &quote! { #handle.artifact.oid });
     quote! {
-        #seed
+        ::ztest::__private::inventory::submit! {
+            ::ztest::macro_support::SeedDecl {
+                name: #handle.artifact.name,
+                oid: #handle.artifact.oid,
+                size: #handle.artifact.size,
+                base_uri: #handle.artifact.base_uri,
+                key_prefix: #handle.artifact.key_prefix,
+            }
+        }
         #dep
         #func
     }

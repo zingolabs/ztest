@@ -1,7 +1,7 @@
 //! Version-aware config generators for the public networks.
 //!
 //! Companion to [`crate::regtest_conf`]: renders `zebrad.toml` for a validator booting from
-//! a pre-synced chain archive (`regtest::archive_mount`).
+//! a pre-synced chain snapshot ([`Mount::seed`](crate::Mount::seed)).
 //!
 //! - Network = a *parameter*, not a second module: mainnet and testnet differ in two
 //!   rendered values (`[network] network`, the per-network initial-peers key)
@@ -24,13 +24,21 @@ fn assert_public(network: Network, who: &str) {
 // ─────────────────────────────── zebrad ───────────────────────────────
 
 /// Whether a restored node stays on its snapshot or syncs onward from it.
-///
-/// - `Following` names no peers: zebra ships the DNS seeders *as* `initial_<net>_peers`, so any
-///   value here replaces discovery with that one list (tests hold the invariant)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainMotion {
     Pinned,
-    Following,
+    Following(Seeds),
+}
+
+/// Where a following node's first peers come from.
+///
+/// - `Dns` writes no `initial_<net>_peers`: zebra ships the DNS seeders *as* that key's default
+/// - `Peers` replaces the seeders with named `host:port`s; addresses they gossip still reach the
+///   crawler (zebra has no connect-only mode)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seeds {
+    Dns,
+    Peers(Vec<String>),
 }
 
 /// Outbound peers a following node aims for. Above zebra's default 25 because the compatible
@@ -70,13 +78,20 @@ pub fn public_zebrad_conf(
             25,
             String::new(),
         ),
-        // `{peers_key}` + `crawl_new_peer_interval` omitted → zebra's own defaults, which *are*
-        // the ZIP-204 DNS seeders. Peer cache shares the chain volume (zebra's own layout:
-        // `network/` beside `state/`), so a restart re-dials known-good peers instead of reseeding
-        ChainMotion::Following => (
+        // `crawl_new_peer_interval` omitted → zebra's default crawler. Peer cache shares the chain
+        // volume (zebra's own layout: `network/` beside `state/`), so a restart re-dials
+        // known-good peers instead of reseeding
+        ChainMotion::Following(seeds) => (
             format!(
-                "\ncache_dir = \"{cache_dir}\"\nlisten_addr = \"0.0.0.0:{}\"",
-                crate::ports::ZEBRAD_P2P
+                "\ncache_dir = \"{cache_dir}\"\nlisten_addr = \"0.0.0.0:{}\"{}",
+                crate::ports::ZEBRAD_P2P,
+                match seeds {
+                    Seeds::Dns => String::new(),
+                    Seeds::Peers(peers) => format!(
+                        "\n{peers_key} = [{}]",
+                        peers.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", ")
+                    ),
+                }
             ),
             "",
             FOLLOWING_PEERSET_TARGET,
@@ -221,7 +236,7 @@ mod tests {
         for network in PUBLIC {
             let conf = public_zebrad_conf(
                 network,
-                ChainMotion::Following,
+                ChainMotion::Following(Seeds::Dns),
                 v(),
                 18232,
                 "/var/cache/zebrad",
@@ -259,7 +274,7 @@ mod tests {
         for network in PUBLIC {
             let toml = public_zebrad_conf(
                 network,
-                ChainMotion::Following,
+                ChainMotion::Following(Seeds::Dns),
                 v(),
                 18232,
                 "/var/cache/zebrad",
@@ -271,21 +286,40 @@ mod tests {
         }
     }
 
-    /// The shipped `initial_<net>_peers` ARE the DNS seeders, so naming even one address replaces
-    /// discovery with that list. A following node must leave both keys unwritten.
+    /// The shipped `initial_<net>_peers` ARE the DNS seeders: `Dns` leaves both keys unwritten,
+    /// `Peers` writes exactly its own network's key (the other would name the wrong list), and
+    /// neither turns the crawler off
     #[test]
-    fn a_following_validator_names_no_initial_peers() {
-        for network in PUBLIC {
+    fn a_following_validator_seeds_from_dns_or_exactly_the_named_peers() {
+        let named = Seeds::Peers(vec!["golden.ts.net:8233".into(), "10.0.0.7:8233".into()]);
+        for (network, seeds, mainnet_key, testnet_key) in [
+            (Network::Mainnet, Seeds::Dns, None, None),
+            (Network::Testnet, Seeds::Dns, None, None),
+            (
+                Network::Mainnet,
+                named.clone(),
+                Some("initial_mainnet_peers = [\"golden.ts.net:8233\", \"10.0.0.7:8233\"]"),
+                None,
+            ),
+            (
+                Network::Testnet,
+                named.clone(),
+                None,
+                Some("initial_testnet_peers = [\"golden.ts.net:8233\", \"10.0.0.7:8233\"]"),
+            ),
+        ] {
             let toml = public_zebrad_conf(
                 network,
-                ChainMotion::Following,
+                ChainMotion::Following(seeds.clone()),
                 v(),
                 18232,
                 "/var/cache/zebrad",
                 None,
             );
-            assert!(!toml.contains("initial_mainnet_peers"), "{toml}");
-            assert!(!toml.contains("initial_testnet_peers"), "{toml}");
+            let line = |key: &str| toml.lines().find(|l| l.starts_with(key)).map(str::to_owned);
+            assert_eq!(line("initial_mainnet_peers"), mainnet_key.map(str::to_owned), "{toml}");
+            assert_eq!(line("initial_testnet_peers"), testnet_key.map(str::to_owned), "{toml}");
+            assert!(!toml.contains("crawl_new_peer_interval"), "{network:?} {seeds:?}");
         }
     }
 
@@ -295,7 +329,7 @@ mod tests {
     fn a_following_validator_caches_its_peers_and_accepts_inbound() {
         let toml = public_zebrad_conf(
             Network::Mainnet,
-            ChainMotion::Following,
+            ChainMotion::Following(Seeds::Dns),
             v(),
             18232,
             "/var/cache/zebrad",
@@ -311,7 +345,7 @@ mod tests {
     fn health_endpoints_serve_only_for_a_following_validator() {
         let following = public_zebrad_conf(
             Network::Mainnet,
-            ChainMotion::Following,
+            ChainMotion::Following(Seeds::Dns),
             v(),
             18232,
             "/var/cache/zebrad",

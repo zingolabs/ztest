@@ -25,7 +25,7 @@ pub use crate::runtime;
 pub use crate::storage::seed_sha8;
 
 pub use crate::backends::image::DevSource;
-pub use crate::inventory::{DevImageEntry, SeedEntry, SeedPayload};
+pub use crate::inventory::{DevImageEntry, SeedEntry};
 pub use crate::plan::{Plan, PlanRoot, PrunedSeed, QosNode};
 pub use crate::qos::beacon::{Beacon, LeaseKind, RunningTest};
 pub use crate::qos::live::LiveSnapshot;

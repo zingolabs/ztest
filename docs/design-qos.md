@@ -39,7 +39,7 @@ Sizing lives with the component, not with the tier. Each backend renders its own
 | `integration` | 10 min   | 2c / 4 GiB  | 1c / 1 GiB | 3c / 5 GiB  | general pool                    |
 | `wallet`      | 10 min   | 2c / 4 GiB  | 2c / 2 GiB | 4c / 6 GiB  | general pool                    |
 | `testnet`     | 6 h      | 8c / 10 GiB | 1c / 1 GiB | 9c / 11 GiB | general pool                    |
-| `sync`        | 48 h     | *declared*  | 1c / 1 GiB | *declared*  | NVMe node-selector + toleration |
+| `sync`        | 48 h     | *declared*  | 2c / 4 GiB | *declared*  | NVMe node-selector + toleration |
 
 - *Ceiling* = `QosProfile::footprint`, the bound on Σ component-pod reserves — the only
   overridable column. It does **not** size pods; `2c/4Gi` is the two-pod validator+indexer
@@ -72,7 +72,7 @@ validator serving a frozen snapshot beside an indexer building one — so the ta
 
 ## Per-test footprint override
 
-Tier ceiling = a default, not an allotment. A topology that doesn't fit declares its own:
+Tier ceiling = a default, not an allotment. A test that declares its own reserve declares it exactly:
 
 ```rust
 #[ztest::qos::integration(footprint = "3c/6Gi")]   // e.g. a 3-pod two-indexer comparison
@@ -82,8 +82,9 @@ Tier ceiling = a default, not an allotment. A topology that doesn't fit declares
 
 - Replaces the **component** half only — `runner`, `pool`, `hard_cap` still come from the tier (a test
   that could raise its own cap would hold capacity its peers are queued for)
-- Raises the ceiling, never the pods: a third pod at `qos::pod`'s defaults needs a third core of
-  headroom, and `DeployBudget` names the whole topology when the sum does not fit
+- Exact, not a ceiling: declared = Σ component-pod requests (cpu + mem), checked by
+  `DeployBudget::close` before the first pod deploys; slack or overflow names every pod + the fix
+- Driver / in-process wallet / load clients = `runner`, never folded into the footprint
 - Grammar `"<cpu>/<mem>"` (`ztest_attr::footprint`), shared by proc-macro, CLI source scan, `qos::units`
 - Units mandatory on both halves, CPU whole cores: a bare `29` = a 29-**byte** reserve, and a fractional
   core renders (rounded up) as a pod larger than the reserve it was admitted against
@@ -96,13 +97,11 @@ override takes effect:
 | Consumer                              | Reads        |
 | ------------------------------------- | ------------ |
 | namespace `ResourceQuota`             | `footprint`  |
-| `DeployBudget` ceiling                | `footprint`  |
+| `DeployBudget` bound (`Bound::Exact`) | `footprint`  |
 | ledger reservation, scheduler request | `admitted()` |
 
-- Pods never sized from one number and admitted against another; `DeployBudget` still refuses a topology
-  whose pods sum past the declared footprint
-- Over-declaring *holds* the difference for the run's life — the number is a promise to the rest of the
-  cluster, so keep it close to what the pods request
+- Pods never sized from one number and admitted against another
+- Tier defaults stay `Bound::Ceiling` (shared across topologies → a smaller one under it = no fault)
 - In-process it rides beside the tier through `qos::__enter`, read back as `qos::current_profile()`;
   out-of-process it travels pre-parsed in the link-time inventory (`FootprintDecl`), so no reader
   re-parses a quantity string

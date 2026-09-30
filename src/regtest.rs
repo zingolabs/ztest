@@ -162,13 +162,6 @@ pub trait Restore: Sized {
     fn snapshot(self, snapshot: crate::ChainSnapshot) -> Self;
 }
 
-/// Mount an archive at `destination`. Identity from the handle, baked at compile time as a
-/// [`SeedDecl`](crate::inventory::SeedDecl) → a missing artifact cannot first surface as an
-/// on-cluster materialization failure
-pub fn archive_mount(archive: crate::Artifact, destination: &str) -> crate::mount::Mount {
-    crate::mount::Mount::archive(archive, destination)
-}
-
 // ──────────────────────────── Fixture helpers ──────────────────────────
 
 use std::path::PathBuf;

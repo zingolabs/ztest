@@ -759,28 +759,24 @@ const BUCKET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 ///
 /// - Never credentials: every read ztest makes is public, and this crate has no client
 ///   that could sign one (writes are `ztest snapshot push`'s problem)
-/// - A real declared object, not the base: public buckets do not list, and every wrong
-///   answer (base typo, public access revoked, blob evicted) 404s identically at the
-///   prefix. [`SAPLING_TESTNET`](crate::snapshots::SAPLING_TESTNET) is the smallest
-///   artifact and the default rung, so an absent one breaks every profile anyway
-/// - Workstation-side. Cluster→bucket egress is the one precondition no read-only probe
-///   reaches (`docs/ops-cluster-requirements.md`)
-/// - Presence is not enough: the puller fetches 256 MiB windows, so an endpoint that ignores
-///   `Range` turns every seed into one 245 GiB response. Both halves or the row is not green
+/// - A declared snapshot's SHA256SUMS, not the base (no listings: every wrong answer 404s alike)
+/// - [`SAPLING_TESTNET`](crate::snapshots::SAPLING_TESTNET) = smallest + default rung
+/// - Workstation-side (cluster→bucket egress: `docs/ops-cluster-requirements.md`)
 async fn bucket() -> Finding {
     let canary = crate::snapshots::SAPLING_TESTNET.artifact;
-    let url = canary.blob_url();
-    match crate::storage::blob_present(&url, canary.size, BUCKET_PROBE_TIMEOUT).await {
-        Ok(true) => (),
-        Ok(false) => return Finding::Absent(format!("no public blob at {url}")),
-        Err(why) => return Finding::Unknown(format!("{}: {why}", canary.base_uri)),
-    }
-    match crate::storage::serves_ranges(&url, BUCKET_PROBE_TIMEOUT).await {
-        Ok(true) => Finding::Present(format!("public, ranged · {}", canary.base_uri)),
-        Ok(false) => Finding::Absent(format!(
-            "{} ignores Range: every seed would pull the whole object",
-            canary.base_uri
-        )),
+    let found = crate::storage::sums_present(
+        canary.base_uri,
+        canary.key_prefix,
+        canary.oid,
+        BUCKET_PROBE_TIMEOUT,
+    )
+    .await;
+    match found {
+        Ok(true) => Finding::Present(format!("public · {}", canary.base_uri)),
+        Ok(false) => Finding::Absent(format!("no SHA256SUMS at {}", canary.sums_url())),
+        Err(why @ crate::storage::StorageError::Mismatch { .. }) => {
+            Finding::Absent(why.to_string())
+        }
         Err(why) => Finding::Unknown(format!("{}: {why}", canary.base_uri)),
     }
 }

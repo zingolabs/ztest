@@ -1,5 +1,5 @@
-//! `ztest config`: user settings in `config.toml` (cluster profiles + bucket credentials =
-//! `clusters.toml`, owned by `ztest cluster` / `ztest snapshot config`).
+//! `ztest config`: user settings in `config.toml` (cluster profiles = `clusters.toml`, owned
+//! by `ztest cluster`).
 //!
 //! - Precedence per setting: flag > `ZTEST_*` env > `config.toml` > built-in default
 

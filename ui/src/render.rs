@@ -716,22 +716,6 @@ pub fn render_transfers(
     out
 }
 
-/// One transfer row, standalone — no panel padding, no row cap, no trailing newline.
-///
-/// - [`render_transfers`] pads to `PANEL_ROWS` (paints into the console `run` owns)
-/// - Cluster-free subcommands have no console + one row → repaint discipline is theirs
-pub fn render_transfer_line(
-    row: &TransferRow,
-    elapsed: std::time::Duration,
-    theme: &Theme,
-) -> String {
-    let mut out = String::with_capacity(160);
-    let name_col = row.label.chars().count();
-    write_transfer_row(&mut out, row, name_col, elapsed, theme);
-    out.truncate(out.trim_end_matches('\n').len());
-    out
-}
-
 /// Row shapes. Three, because the variants differ in what they *are*, not in width:
 /// a stage has no bar, a failure has no spinner
 mod transfer_row {
@@ -835,7 +819,7 @@ fn write_transfer_row(
 
 fn transfer_glyph(kind: TransferKind, theme: &Theme) -> &'static str {
     match kind {
-        TransferKind::Image | TransferKind::Upload => theme.chars.up,
+        TransferKind::Image => theme.chars.up,
         TransferKind::Download | TransferKind::Seed => theme.chars.progress,
     }
 }
@@ -1183,37 +1167,6 @@ mod tests {
         assert!(s.contains("more transferring"), "overflow marker:\n{s}");
     }
 
-    /// Regression: `render_transfers` pads one row to five (repainting caller then
-    /// scrolls four lines per frame)
-    #[test]
-    fn a_standalone_transfer_line_is_one_line_and_unterminated() {
-        let row = TransferRow {
-            label: "archive.tar.zst".to_string(),
-            kind: TransferKind::Upload,
-            progress: TransferProgress::Bytes { done: 512, total: 1024, pace: None },
-        };
-        let line = render_transfer_line(&row, std::time::Duration::ZERO, &plain_unicode_theme());
-        assert!(!line.contains('\n'), "must be one unterminated line:\n{line:?}");
-        assert!(line.contains("50%"), "percent:\n{line}");
-        assert!(line.contains("512 B / 1.0 KiB"), "byte pair:\n{line}");
-    }
-
-    #[test]
-    fn an_upload_row_carries_the_up_glyph() {
-        let theme = plain_unicode_theme();
-        let row = |kind| TransferRow {
-            label: "a".to_string(),
-            kind,
-            progress: TransferProgress::Stage("hashing".to_string()),
-        };
-        let up =
-            render_transfer_line(&row(TransferKind::Upload), std::time::Duration::ZERO, &theme);
-        let down =
-            render_transfer_line(&row(TransferKind::Download), std::time::Duration::ZERO, &theme);
-        assert!(up.contains(theme.chars.up), "upload glyph:\n{up}");
-        assert_ne!(up, down, "upload and download must not render identically");
-    }
-
     /// No colours + Unicode glyphs = `Theme::detect()` under UTF-8 + `NO_COLOR=1`
     /// (lets these snapshot byte-exact output)
     fn plain_unicode_theme() -> Theme {
@@ -1300,7 +1253,7 @@ mod tests {
     fn qos_plan_renders_the_total_and_names_unschedulable_tests() {
         let mut state = sample_state();
         let mut tests = planned(&[(QosClass::Integration, 3), (QosClass::Wallet, 1)]);
-        // 15c/15Gi components + 1c/1Gi runner = 16c/16Gi > 4c/8Gi
+        // 15c/15Gi components + 2c/4Gi runner = 17c/19Gi > 4c/8Gi
         let sync = QosClass::Sync.profile_with(Some(Resources::new(15_000, 15 * GIB, 0, 0)));
         tests
             .push(ztest::api::PlannedTest { name: "zaino_sync".into(), admitted: sync.admitted() });
@@ -1311,7 +1264,7 @@ mod tests {
         assert!(s.contains("reserved total"), "missing total:\n{s}");
         assert!(!s.contains("wave") && !s.contains("integration"), "no waves, no tiers:\n{s}");
         assert!(
-            s.contains("zaino_sync needs 16c / 16 GiB") && s.contains("will be rejected"),
+            s.contains("zaino_sync needs 17c / 19 GiB") && s.contains("will be rejected"),
             "missing unschedulable warning:\n{s}"
         );
     }

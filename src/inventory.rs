@@ -32,8 +32,8 @@ pub enum ImageSpec {
 }
 
 impl ImageSpec {
-    /// Config generators + port declarations gate the metrics listener on this (no
-    /// `prometheus` feature → nothing binds it). `Published` cannot opt a feature in → `false`
+    /// Dev zebrad's exporter = its `prometheus` build feature (no feature → nothing binds it)
+    /// - `Published` cannot opt a feature in → `false`; zainod ignores this (exporter always in)
     pub fn metrics_enabled(&self) -> bool {
         let ImageSpec::Dev { features, .. } = self else {
             return false;
@@ -171,36 +171,18 @@ pub fn qos_iter() -> impl Iterator<Item = &'static QosDecl> {
 
 // ─────────────────────────── seed inventory ───────────────────────────
 //
-// Seeds declared via `mount_archive!` / `mount_file!` / `#[ztest::needs]`, static
-// so preflight pre-provisions them (else the first test at `TestEnv::build()`
-// materializes lazily)
+// Seeds declared via `#[ztest::needs]`, static so preflight pre-provisions them (else the
+// first test at `TestEnv::build()` materializes lazily)
 //
-// Identity = oid (SHA-256 of the bytes), baked from the sidecar manifest at
-// compile time, never a path — laptop, build pod, runner pod and puller Job all name
-// the same seed without any of them reading the file
+// Identity = oid (sha256 of the snapshot's SHA256SUMS), baked from the manifest at compile
+// time → laptop, build pod, runner pod and puller Job all name one seed without reading bytes
 
-/// Seed → PVC load: extracted (archive) or copied byte-for-byte (file).
-/// Field named `payload`, not `kind` (would collide with the `InventoryLine` tag)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SeedPayload {
-    Archive,
-    File,
-}
-
-/// One seed declaration for `inventory::submit!`.
-///
-/// - `oid` = identity (SHA-256 of the bytes) → PVC `seed-<oid[..8]>`, key `<key_prefix>/<oid>`
-/// - `name` = filename only, for the puller's decompression + diagnostics
-/// - `size` = the manifest's compressed `size_bytes`
+/// One seed declaration for `inventory::submit!`. `size` = manifest `size_bytes` (Σ tree files)
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SeedDecl {
     pub name: &'static str,
     pub oid: &'static str,
     pub size: u64,
-    /// Extracted; sizes the seed PVC. 0 = unmeasured (sidecar manifests carry identity only)
-    pub uncompressed_bytes: u64,
-    pub payload: SeedPayload,
     pub base_uri: &'static str,
     pub key_prefix: &'static str,
 }
@@ -212,17 +194,14 @@ pub struct SeedEntry {
     pub name: String,
     pub oid: String,
     pub size: u64,
-    #[serde(default)]
-    pub uncompressed_bytes: u64,
-    pub payload: SeedPayload,
     pub base_uri: String,
     pub key_prefix: String,
 }
 
 impl SeedEntry {
-    /// Unauthenticated URL the puller fetches
-    pub fn blob_url(&self) -> String {
-        crate::storage::blob_url(&self.base_uri, &self.key_prefix, &self.oid)
+    /// Tree root the puller resolves every relpath under
+    pub fn tree_url(&self) -> String {
+        crate::storage::tree_url(&self.base_uri, &self.key_prefix, &self.oid)
     }
 }
 
@@ -232,8 +211,6 @@ impl From<&SeedDecl> for SeedEntry {
             name: d.name.to_string(),
             oid: d.oid.to_string(),
             size: d.size,
-            uncompressed_bytes: d.uncompressed_bytes,
-            payload: d.payload,
             base_uri: d.base_uri.to_string(),
             key_prefix: d.key_prefix.to_string(),
         }
@@ -601,24 +578,19 @@ mod tests {
     #[test]
     fn seed_line_is_tagged_and_demuxes_to_seed_entry() {
         let decl = SeedDecl {
-            name: "data.tar.zst",
+            name: "zebra-6.2.3-sapling",
             oid: "d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00d47a1e00",
             size: 4096,
-            uncompressed_bytes: 0,
-            payload: SeedPayload::Archive,
             base_uri: crate::storage::BASE_URI,
             key_prefix: crate::storage::KEY_PREFIX,
         };
         let line = serde_json::to_string(&InventoryLineRef::Seed(&decl)).unwrap();
         assert!(line.contains("\"kind\":\"seed\""), "missing seed tag: {line}");
-        // `payload` must not collide with the `"kind"` tag
-        assert!(line.contains("\"payload\":\"archive\""), "payload field: {line}");
         match serde_json::from_str::<InventoryLine>(&line).unwrap() {
             InventoryLine::Seed(e) => {
-                assert_eq!(e.name, "data.tar.zst");
+                assert_eq!(e.name, "zebra-6.2.3-sapling");
                 assert_eq!(e.oid, "d47a1e00".repeat(8));
                 assert_eq!(e.size, 4096);
-                assert_eq!(e.payload, SeedPayload::Archive);
             }
             other => panic!("seed line demuxed as {other:?}"),
         }

@@ -1,7 +1,7 @@
 //! Content-addressed artifacts, and the chain snapshots that wrap one.
 //!
-//! - [`Artifact`] = any immutable blob in the snapshot bucket; identity = sha256 = bucket key
-//!   `lfs/<oid>` = seed PVC `seed-<sha8>-<driver>`, so laptop/build/runner/puller agree
+//! - [`Artifact`] = immutable tree in the snapshot bucket; oid = sha256(SHA256SUMS) = key prefix
+//!   `snap/<oid>/` = seed PVC `seed-<sha8>-<driver>`, so laptop/build/runner/puller agree
 //! - [`ChainSnapshot`] = an artifact + which chain it holds, declared as a plain `const`
 //! - Both are plain data: no methods, no derivation, nothing to keep in sync. A manifest
 //!   deserialises to `Artifact` one-to-one; every chain fact is written at the declaration
@@ -66,30 +66,22 @@ impl Network {
     }
 }
 
-/// One immutable blob in the snapshot bucket, addressed by content.
+/// One immutable snapshot tree in the bucket, addressed by content.
 ///
-/// Written by [`artifact!`](macro@crate::artifact) from a manifest at expansion time — no
-/// archive bytes read, no `git` — so a checkout holding none of the archives still compiles.
-/// Location rides the manifest too, so a consumer needs no bucket configuration
+/// Written by [`artifact!`](macro@crate::artifact) from a manifest at expansion time (no bytes
+/// read, no `git`). `size` = Σ file sizes of the tree (transfer total + seed PVC sizing)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Artifact {
-    /// Archive filename; its extension picks the puller's decompression
     pub name: &'static str,
-    /// SHA-256 of the bytes = bucket key `<key_prefix>/<oid>` and seed PVC `seed-<oid[..8]>-<driver>`
     pub oid: &'static str,
-    /// Compressed. Sizes the puller's transfer budget and its progress bar
     pub size: u64,
-    /// Extracted. Sizes the seed PVC
-    pub uncompressed_bytes: u64,
-    /// Public read base; unauthenticated `GET` (see [`crate::storage::BASE_URI`])
     pub base_uri: &'static str,
     pub key_prefix: &'static str,
 }
 
 impl Artifact {
-    /// Unauthenticated URL the puller fetches
-    pub fn blob_url(&self) -> String {
-        crate::storage::blob_url(self.base_uri, self.key_prefix, self.oid)
+    pub fn sums_url(&self) -> String {
+        crate::storage::sums_url(self.base_uri, self.key_prefix, self.oid)
     }
 }
 
@@ -104,17 +96,4 @@ pub struct ChainSnapshot {
     pub network: Network,
     pub backend: Backend,
     pub artifact: Artifact,
-}
-
-/// Filename + measurement of a local archive, hashed on the spot.
-///
-/// For `ztest snapshot warm`, handed paths on a command line and so having no
-/// [`artifact!`](macro@crate::artifact) expansion to read them off
-pub fn identity_of(
-    archive: &std::path::Path,
-) -> Result<(String, crate::storage::Digest), crate::storage::StorageError> {
-    let name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| {
-        crate::storage::StorageError::NoFilename { path: archive.display().to_string() }
-    })?;
-    Ok((name, crate::storage::digest_of(archive)?))
 }

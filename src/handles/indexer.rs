@@ -17,13 +17,15 @@ pub use crate::proto::{
     CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo, RawTransaction, SendResponse,
     SubtreeRoot, TreeState,
 };
-pub use crate::protocol::types::BlockHash;
+pub use crate::protocol::types::{BlockHash, BlockTip};
 // orchard-0.15 renamed `ShieldedProtocol` → `ShieldedPool`; re-export under the historical
 // name (stable public API, no deprecation warning)
 pub use zcash_protocol::ShieldedPool as ShieldedProtocol;
 pub use zcash_protocol::TxId;
 pub use zcash_protocol::consensus::BlockHeight;
 pub use zcash_protocol::value::ZatBalance;
+
+const TIP_POLL: Duration = Duration::from_millis(250);
 
 // ─────────────────────────── IndexerConfig ──────────────────────────
 
@@ -76,9 +78,11 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
 
     async fn endpoint_for(&self, container_port: u16) -> Result<Endpoint, EnvError>;
 
-    async fn latest_block_height(&self) -> Result<BlockHeight, RpcError>;
+    /// `GetLatestBlock`; hash in display order (= validator [`BlockTip`])
+    async fn latest_block(&self) -> Result<BlockTip, RpcError>;
     async fn indexer_info(&self) -> Result<LightdInfo, RpcError>;
     async fn get_block(&self, height: BlockHeight) -> Result<CompactBlock, RpcError>;
+    /// `hash` in display order (= validator [`BlockTip`]); reversed onto the wire
     async fn get_block_by_hash(&self, hash: BlockHash) -> Result<CompactBlock, RpcError>;
     async fn get_taddress_balance(&self, addresses: Vec<String>) -> Result<ZatBalance, RpcError>;
     async fn get_block_range_with_pools(
@@ -130,6 +134,39 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
     async fn get_transaction(&self, txid: TxId) -> Result<RawTransaction, RpcError>;
 
     // Conveniences: composition over the above, implemented per backend
+
+    async fn latest_block_height(&self) -> Result<BlockHeight, RpcError> {
+        Ok(self.latest_block().await?.0)
+    }
+
+    /// Poll until the served tip = `tip`, height and hash
+    ///
+    /// - Height alone passes on a reorg's losing branch (hash = only proof of the winner)
+    /// - UNAVAILABLE = gate closed while a reorg replays → keep polling
+    async fn wait_for_tip(&self, tip: BlockTip, timeout: Duration) -> Result<(), RpcError> {
+        let started = tokio::time::Instant::now();
+        let mut last = None;
+        loop {
+            match self.latest_block().await {
+                Ok(served) if served == tip => return Ok(()),
+                Ok(served) => last = Some(served),
+                Err(e) if e.grpc_code() == Some(tonic::Code::Unavailable) => {}
+                Err(e) => return Err(e),
+            }
+            if started.elapsed() >= timeout {
+                let (want, hash) = (u32::from(tip.0), tip.1);
+                let seen =
+                    last.map_or("nothing".to_owned(), |(h, x)| format!("{}/{x}", u32::from(h)));
+                return Err(RpcError::timeout(
+                    self.label(),
+                    "wait_for_tip",
+                    started.elapsed(),
+                    format!("want {want}/{hash}, last served {seen}"),
+                ));
+            }
+            tokio::time::sleep(TIP_POLL).await;
+        }
+    }
 
     /// gRPC URI as `http://host:port`
     async fn grpc_uri(&self) -> Result<String, EnvError>;

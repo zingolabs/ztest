@@ -589,10 +589,11 @@ impl TestEnv {
         // One read → placement + deploy ceiling both describe the reserve the ledger holds
         let effective = qos::current_profile();
         let qos_placement = Some(effective.pool);
-        // Charged per-pod as both phases build specs → bounds the *sum* that deploys.
-        // Pods size themselves (`qos::pod` defaults, `.resources()` per pod); this is the
-        // only thing the tier ceiling does to a topology
-        let mut budget = DeployBudget::new(effective.footprint);
+        // Every spec charged before the first pod deploys (pod_spec() = opts only)
+        let mut budget = DeployBudget::new(match qos::current_footprint() {
+            Some(declared) => Bound::Exact(declared),
+            None => Bound::Ceiling(effective.footprint),
+        });
 
         let ctx = MaterializeCtx {
             client: &client,
@@ -614,6 +615,18 @@ impl TestEnv {
                 Ok::<_, EnvError>((p.id, spec, p.opts, ComponentHandle::Validator(p.handle)))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let dependents: Vec<_> = self
+            .pending_indexers
+            .drain(..)
+            .map(|p| {
+                let pod_name = pod_name_of(&p.opts);
+                let mut spec = p.handle.pod_spec(&p.opts, pod_name)?;
+                spec.placement = qos_placement;
+                budget.admit(&spec);
+                Ok::<_, EnvError>((p.id, spec, p.opts, ComponentHandle::Indexer(p.handle)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        budget.close();
         let t_phase = std::time::Instant::now();
         self.materialize_phase(&ctx, &validators).await?;
         build_phase("validators_materialize", t_phase);
@@ -633,17 +646,6 @@ impl TestEnv {
         warmup?;
 
         // Phase 2: indexers. (Wallets run in-process; see below.)
-        let dependents: Vec<_> = self
-            .pending_indexers
-            .drain(..)
-            .map(|p| {
-                let pod_name = pod_name_of(&p.opts);
-                let mut spec = p.handle.pod_spec(&p.opts, pod_name)?;
-                spec.placement = qos_placement;
-                budget.admit(&spec);
-                Ok::<_, EnvError>((p.id, spec, p.opts, ComponentHandle::Indexer(p.handle)))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         // Wallets run in-process over gRPC → no pod; accounts built lazily via
         // `WalletHandle::account`
         self.pending_wallets.clear();
@@ -1204,47 +1206,84 @@ fn spec_request(spec: &PodSpec) -> crate::qos::Resources {
         .unwrap_or(crate::qos::Resources::ZERO)
 }
 
+/// What the lease + quota were sized from, and how the deployed sum must meet it
+#[derive(Debug, Clone, Copy)]
+enum Bound {
+    /// Tier default, shared by every topology in the tier
+    Ceiling(crate::qos::Resources),
+    /// Test's own `footprint = ".."` (reserved = deployed, no slack)
+    Exact(crate::qos::Resources),
+}
+
+impl Bound {
+    fn reserve(self) -> crate::qos::Resources {
+        match self {
+            Bound::Ceiling(r) | Bound::Exact(r) => r,
+        }
+    }
+}
+
 /// Bounds the *sum* of what a test's pods request
 ///
 /// - Per-pod checks miss it: 9c + 9c each fit a 15c tier, together they do not
 /// - Surplus wedges `Pending`
-/// - Ceiling = tier component footprint (what the scheduler reserved, what the quota caps)
 struct DeployBudget {
-    tier: crate::qos::Resources,
+    bound: Bound,
     committed: crate::qos::Resources,
     /// Charged pods → a violation names the whole topology, not just the last
     admitted: Vec<(String, crate::qos::Resources)>,
 }
 
 impl DeployBudget {
-    /// `tier` = effective component footprint, same number the quota + lease were sized from
-    fn new(tier: crate::qos::Resources) -> Self {
-        DeployBudget { tier, committed: crate::qos::Resources::ZERO, admitted: Vec::new() }
+    fn new(bound: Bound) -> Self {
+        DeployBudget { bound, committed: crate::qos::Resources::ZERO, admitted: Vec::new() }
     }
 
     /// Charge one pod, panicking on either bound (pre-create → assert fires
     /// instead of the deploy)
     fn admit(&mut self, spec: &PodSpec) {
-        assert_override_within_tier(spec, self.tier);
+        let reserve = self.bound.reserve();
+        assert_override_within_tier(spec, reserve);
         let want = spec_request(spec);
         self.committed = self.committed.saturating_add(&want);
         self.admitted.push((spec.pod_name.clone(), want));
         assert!(
-            self.committed.fits_within(&self.tier),
+            self.committed.fits_within(&reserve),
             "QoS over-schedule: this test's component pods request {}m cpu / {} B in total, \
              exceeding the {}m cpu / {} B its tier reserved for them.\n  {}\n\
              Each pod fits the tier on its own — it is the sum that does not. Lower the \
              `.resources()` overrides so they fit together, or raise the test's QoS tier.",
             self.committed.cpu_milli,
             self.committed.mem_bytes,
-            self.tier.cpu_milli,
-            self.tier.mem_bytes,
-            self.admitted
-                .iter()
-                .map(|(name, r)| format!("{name}: {}m / {} B", r.cpu_milli, r.mem_bytes))
-                .collect::<Vec<_>>()
-                .join("\n  "),
+            reserve.cpu_milli,
+            reserve.mem_bytes,
+            self.pod_list(),
         );
+    }
+
+    /// After the last `admit()`, before any pod deploys
+    fn close(&self) {
+        let Bound::Exact(declared) = self.bound else {
+            return;
+        };
+        assert!(
+            (self.committed.cpu_milli, self.committed.mem_bytes)
+                == (declared.cpu_milli, declared.mem_bytes),
+            "QoS reserve slack: footprint declares {}, but the component pods request {}.\n  {}\n\
+             A declared footprint must equal the sum of its pods — set it to `{}`.",
+            declared.compact(),
+            self.committed.compact(),
+            self.pod_list(),
+            self.committed.with_disk(declared.disk_bytes).compact(),
+        );
+    }
+
+    fn pod_list(&self) -> String {
+        self.admitted
+            .iter()
+            .map(|(name, r)| format!("{name}: {}m / {} B", r.cpu_milli, r.mem_bytes))
+            .collect::<Vec<_>>()
+            .join("\n  ")
     }
 }
 
@@ -1262,7 +1301,7 @@ type MaterializeItem = (u64, PodSpec, ComponentOpts, ComponentHandle);
 
 #[cfg(test)]
 mod tests {
-    use super::{DeployBudget, spec_request};
+    use super::{Bound, DeployBudget, spec_request};
     use crate::component::{Cpu, Mem};
     use crate::qos::{GIB, Resources};
 
@@ -1294,30 +1333,39 @@ mod tests {
         }
     }
 
-    /// `sync` declares no default, so every ceiling in these cases is a test's own —
-    /// the zaino index-construction shape
-    fn sync_ceiling(mem_gib: u64) -> Resources {
-        QosClass::Sync.profile_with(Some(Resources::new(15_000, mem_gib * GIB, 0, 0))).footprint
+    /// `sync` declares no default → every reserve here = a test's own declaration
+    fn sync_declared(cpu_cores: u64, mem_gib: u64) -> Bound {
+        let declared = Resources::new(cpu_cores * 1_000, mem_gib * GIB, 0, 0).with_disk(400 * GIB);
+        Bound::Exact(QosClass::Sync.profile_with(Some(declared)).footprint)
     }
 
     #[test]
-    fn a_budget_admits_overrides_that_fit_together() {
-        // Ceiling = a declared 15c/15Gi; 9+5 and 11+4 fit
-        let mut b = DeployBudget::new(sync_ceiling(15));
-        b.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(11)));
-        b.admit(&overridden("zebrad", Cpu::cores(5), Mem::gib(4)));
-        assert_eq!(b.committed.cpu_milli, 14_000);
-        assert_eq!(b.committed.mem_bytes, 15 * GIB);
+    fn a_declared_footprint_admits_only_the_exact_sum_of_its_pods() {
+        let mut exact = DeployBudget::new(sync_declared(14, 15));
+        exact.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(11)));
+        exact.admit(&overridden("zebrad", Cpu::cores(5), Mem::gib(4)));
+        assert_eq!(exact.committed, Resources::new(14_000, 15 * GIB, 0, 0));
+        exact.close();
+
+        let mut slack = DeployBudget::new(sync_declared(16, 24));
+        slack.admit(&overridden("zebrad", Cpu::cores(6), Mem::gib(10)));
+        slack.admit(&overridden("zainod", Cpu::cores(8), Mem::gib(10)));
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slack.close()))
+            .expect_err("2c/4Gi reserved past the pods must panic");
+        let msg = err.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
+        assert!(msg.contains("slack"), "names the fault: {msg}");
+        assert!(msg.contains("zebrad") && msg.contains("zainod"), "names every pod: {msg}");
+        assert!(msg.contains("set it to `14c/20Gi/400Gi`"), "names the fix, disk kept: {msg}");
     }
 
     #[test]
     fn a_budget_rejects_overrides_that_only_overflow_in_aggregate() {
         // The hole: each pod fits the ceiling alone (per-pod guard passes both),
         // only the sum overflows
-        let tier = sync_ceiling(15);
+        let tier = sync_declared(15, 15);
         let each = overridden("p", Cpu::cores(9), Mem::gib(7));
         assert!(
-            spec_request(&each).fits_within(&tier),
+            spec_request(&each).fits_within(&tier.reserve()),
             "precondition: one such pod must pass the per-pod guard"
         );
 
@@ -1336,41 +1384,34 @@ mod tests {
     /// The no-override path: pods carry the [`qos::pod`] defaults their backend rendered,
     /// and the tier ceiling is sized to hold exactly that topology
     #[test]
-    fn a_budget_charges_the_per_pod_defaults_when_a_test_sets_no_override() {
+    fn a_tier_default_charges_per_pod_defaults_and_tolerates_a_smaller_topology() {
         let defaulted = |name: &str, default: Resources| {
             let mut spec = overridden(name, Cpu::cores(1), Mem::gib(1));
             spec.resources = None;
             spec.guaranteed = Some(default.into());
             spec
         };
+        let ceiling = Bound::Ceiling(QosClass::Integration.profile().footprint);
 
-        let mut b = DeployBudget::new(QosClass::Integration.profile().footprint);
+        let mut b = DeployBudget::new(ceiling);
         b.admit(&defaulted("zebrad", crate::qos::pod::VALIDATOR));
         b.admit(&defaulted("zainod", crate::qos::pod::INDEXER));
-        assert!(b.committed.fits_within(&b.tier));
         assert_eq!(
             b.committed,
             crate::qos::pod::VALIDATOR.saturating_add(&crate::qos::pod::INDEXER),
             "the default path must charge exactly what the quota is sized to"
         );
-    }
+        b.close();
 
-    // ── same ceiling, moved by a `footprint = ".."` override ────────────
-
-    #[test]
-    fn an_override_raises_the_ceiling_the_budget_charges_against() {
-        // zaino index-construction shape: 15 GiB rejects the indexer's 24, 29 GiB admits it
-        let mut b = DeployBudget::new(sync_ceiling(29));
-        b.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(24)));
-        b.admit(&overridden("zebrad", Cpu::cores(5), Mem::gib(4)));
-        assert_eq!(b.committed.mem_bytes, 28 * GIB);
-        assert!(b.committed.fits_within(&b.tier));
+        // Tier default shared across topologies → validator-only under it = no fault
+        let mut validator_only = DeployBudget::new(ceiling);
+        validator_only.admit(&defaulted("zebrad", crate::qos::pod::VALIDATOR));
+        validator_only.close();
     }
 
     #[test]
-    fn an_override_is_still_a_ceiling_not_a_licence() {
-        // Raising the reserve moves the bound, never removes it
-        let mut b = DeployBudget::new(sync_ceiling(29));
+    fn a_declared_footprint_still_rejects_an_overflow() {
+        let mut b = DeployBudget::new(sync_declared(15, 29));
         b.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(24)));
         let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             b.admit(&overridden("zebrad", Cpu::cores(5), Mem::gib(8)))
@@ -1381,8 +1422,8 @@ mod tests {
     }
 
     #[test]
-    fn a_pod_over_the_raised_ceiling_still_trips_the_per_pod_guard() {
-        let mut b = DeployBudget::new(sync_ceiling(29));
+    fn a_pod_over_a_declared_footprint_trips_the_per_pod_guard() {
+        let mut b = DeployBudget::new(sync_declared(15, 29));
         let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             b.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(30)))
         }))

@@ -158,10 +158,9 @@ mod tests {
             network: crate::Network::Testnet,
             backend: crate::Backend::Zebra,
             artifact: crate::Artifact {
-                name: "zebra-v6.2.3-test.tar.zst",
+                name: "zebra-v6.2.3-test",
                 oid: "0".repeat(64).leak(),
                 size: 1,
-                uncompressed_bytes: 2,
                 base_uri: crate::storage::BASE_URI,
                 key_prefix: crate::storage::KEY_PREFIX,
             },

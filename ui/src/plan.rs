@@ -243,10 +243,7 @@ fn seed_node(
     let full = row.text("name", s.name.as_str()).text("sha8", sha8).value("size", s.size as f64);
     emit(out, full, tmpl::SEED, theme);
 
-    let pvc = format!(
-        "ztest-seeds/seed-{sha8}-<driver> {}",
-        ztest::api::seed_size_for(s.uncompressed_bytes)
-    );
+    let pvc = format!("ztest-seeds/seed-{sha8}-<driver> {}", ztest::api::seed_size_for(s.size));
     leaves(out, &[("pvc", pvc)], &next, theme);
 }
 
@@ -290,7 +287,6 @@ mod tests {
     use super::*;
     use ztest::api::GIB;
     use ztest::api::QosClass;
-    use ztest::api::SeedPayload;
     use ztest::api::{PlanRoot, PrunedSeed, QosNode};
 
     fn plain() -> Theme {
@@ -302,8 +298,6 @@ mod tests {
             name: name.to_string(),
             oid: oid.to_string(),
             size,
-            uncompressed_bytes: 0,
-            payload: SeedPayload::Archive,
             base_uri: ztest::api::storage::BASE_URI.to_string(),
             key_prefix: ztest::api::storage::KEY_PREFIX.to_string(),
         }
@@ -341,7 +335,7 @@ mod tests {
         let out = render(&plan, &plain());
 
         assert!(out.contains("zaino_index_construction"));
-        assert!(out.contains("qos sync · reserve 16c/16Gi · hard cap 48h · declared 48h"));
+        assert!(out.contains("qos sync · reserve 17c/19Gi · hard cap 48h · declared 48h"));
         assert!(out.contains("13.1 GiB"));
         assert!(out.contains("pruned"));
         assert!(out.contains("declared by clientless::the_pub_testnet_ironwood_boundary"));

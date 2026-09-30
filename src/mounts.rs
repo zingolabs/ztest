@@ -1,7 +1,6 @@
 //! Translate `Mount`s into per-pod `volumes` + `volumeMounts`.
 //!
-//! - Side-effecting: ConfigMaps for `mount_config!`/`mount_file!`, seed VSCs + PVCs for
-//!   `mount_archive!`
+//! - Side-effecting: ConfigMaps for `mount_config!`, seed VSCs + PVCs for [`Mount::seed`]
 //! - Everything minted in the slot namespace carries the sentinel's ownerRef → teardown
 //!   cascades
 
@@ -69,22 +68,8 @@ pub async fn resolve_all(
                 )
                 .await?
             }
-            (MountKind::File, MountSource::Seed(handle)) => {
-                resolve_file(
-                    client,
-                    sentinel,
-                    pod_prefix,
-                    i,
-                    &volume_name,
-                    *handle,
-                    &m.destination,
-                    &mut out,
-                    archive_disk,
-                )
-                .await?
-            }
-            (MountKind::DirArchive, MountSource::Seed(handle)) => {
-                resolve_archive(
+            (MountKind::Seed, MountSource::Seed(handle)) => {
+                resolve_seed(
                     client,
                     sentinel,
                     pod_prefix,
@@ -173,56 +158,23 @@ async fn resolve_config_inline(
     Ok(file_volume_from_cm(volume_name, &cm_name, destination))
 }
 
-// ───────── mount_file! ─────────
-//
-// Same content-addressed-PVC + seed-binding machinery as `mount_archive!`, except the
-// uploader writes one blob to `/seed/blob` (no extraction) and the Pod subPaths it
+// ───────── seed ─────────
 
 #[allow(clippy::too_many_arguments)]
-async fn resolve_file(
+async fn resolve_seed(
     client: &Client,
     sentinel: &Sentinel,
     pod_prefix: &str,
     index: usize,
     volume_name: &str,
-    archive: crate::Artifact,
-    destination: &Path,
-    out: &mut ResolveOutput,
-    disk: Option<Disk>,
-) -> Result<ResolvedMount, EnvError> {
-    let seed = materialize::await_seed(client, archive).await?;
-    let binding =
-        seeds::bind_seed(client, sentinel, &seed, &format!("{pod_prefix}-{index}")).await?;
-    let pvc_name = format!("{pod_prefix}-file-{index}");
-    create_pvc(
-        client,
-        sentinel,
-        &pvc_name,
-        Some(&binding.binding_snapshot),
-        &volume_size(disk, &seed.restore_size),
-    )
-    .await?;
-    out.seed_bindings.push(binding);
-    Ok(file_volume_from_pvc(volume_name, &pvc_name, destination))
-}
-
-// ───────── mount_archive! ─────────
-
-#[allow(clippy::too_many_arguments)]
-async fn resolve_archive(
-    client: &Client,
-    sentinel: &Sentinel,
-    pod_prefix: &str,
-    index: usize,
-    volume_name: &str,
-    archive: crate::Artifact,
+    snapshot: crate::Artifact,
     destination: &Path,
     out: &mut ResolveOutput,
     disk: Option<Disk>,
 ) -> Result<ResolvedMount, EnvError> {
     // 1. Resolve the already-published seed preflight, read its CSI snapshot handle.
     //    Waits, never pulls (materialize.rs)
-    let seed = materialize::await_seed(client, archive).await?;
+    let seed = materialize::await_seed(client, snapshot).await?;
 
     // 2. Bind the seed into the test ns: pre-provisioned VSC + VolumeSnapshot
     let binding =
@@ -398,23 +350,6 @@ fn dir_volume_from_pvc(volume_name: &str, pvc_name: &str, destination: &Path) ->
     }
 }
 
-/// PVC holding one file at `/blob` (`materialize.rs`), mounted at the consumer's
-/// destination via `subPath` → appears as a file, not a directory
-fn file_volume_from_pvc(volume_name: &str, pvc_name: &str, destination: &Path) -> ResolvedMount {
-    ResolvedMount {
-        volume: json!({
-            "name": volume_name,
-            "persistentVolumeClaim": { "claimName": pvc_name, "readOnly": true }
-        }),
-        volume_mount: json!({
-            "name": volume_name,
-            "mountPath": destination,
-            "subPath": "blob",
-            "readOnly": true,
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Disk, volume_size};
@@ -441,7 +376,7 @@ mod tests {
     #[test]
     fn a_scratch_claims_the_declaration_ahead_of_an_archive_clone() {
         let scratch = crate::Mount::scratch("/var/lib/zaino");
-        let archive = crate::Mount::archive(fixture_artifact(), "/var/lib/zaino/zebra-db");
+        let archive = crate::Mount::seed(fixture_artifact(), "/var/lib/zaino/zebra-db");
         let d = Disk::gib(400);
 
         // State indexer: index sized, chain clone left on the seed's floor
@@ -457,10 +392,9 @@ mod tests {
 
     fn fixture_artifact() -> crate::Artifact {
         crate::Artifact {
-            name: "chain.tar.zst",
+            name: "chain",
             oid: "a".repeat(64).leak(),
             size: 1,
-            uncompressed_bytes: 2,
             base_uri: crate::storage::BASE_URI,
             key_prefix: crate::storage::KEY_PREFIX,
         }

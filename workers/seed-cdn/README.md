@@ -1,8 +1,8 @@
 # seed-cdn — runbook
 
-**This is ztest's read path.** Every seed pull — developer, CI, `snapshot warm`, every pod —
-fetches from this Worker over plain HTTPS with no credentials. There is no authenticated
-alternative: the library carries no S3 client. Credentials exist only for
+**This is ztest's read path.** Every seed pull — developer, CI, every pod — fetches from this
+Worker over plain HTTPS with no credentials. There is no authenticated alternative: the
+library carries no S3 client. Credentials exist only in the publisher's rclone config, for
 `ztest snapshot push` (see [Push credentials](#push-credentials)).
 
 Deployed at **https://ztest-seeds.elicbarbieri.workers.dev** — the `base_uri` in every
@@ -11,7 +11,7 @@ manifest.
 Why a Worker and not the bucket's public URL: `r2.dev` is rate-limited and bandwidth
 throttled *by design*, and the throttle is **variable**. That URL is now **disabled**
 (`wrangler r2 bucket dev-url disable ztest-archives`), so this Worker is the bucket's only
-public read path and the `lfs/<64 hex>` key pattern below cannot be sidestepped. Measured on one object across a
+public read path and the `snap/<64 hex>/<relpath>` key pattern below cannot be sidestepped. Measured on one object across a
 day: 1.4 MB/s at its worst, 23.7 MB/s at its best, with three multi-hour pulls killed
 mid-stream in between. The Worker is not reliably faster at any given instant — a
 same-minute comparison put them within noise of each other — it is the endpoint with no
@@ -47,14 +47,12 @@ curl -s -X POST -H "Authorization: Bearer $T" -H 'Content-Type: application/json
 ztest checks its own read path — there is no script here to run or keep in step:
 
 ```sh
-ztest cluster check        # `snapshot bucket` row: reachable *and* honours Range
-ztest snapshot verify      # every declared blob, then the endpoint: seed keys only, writes refused
+ztest cluster check        # `snapshot bucket` row: canary SHA256SUMS readable, hashes to its oid
+ztest snapshot verify      # every declared SHA256SUMS, then the endpoint: seed keys only, writes refused
 ```
 
-The range half is the load-bearing one. Seeds arrive as 256 MiB windows, so a Worker that
-answers `200` with a whole 245 GiB body wedges every pull — and `check` fails that row rather
-than reporting a reachable bucket. Both probes live in `src/storage/mod.rs` with tests that
-assert they *fail* on a 200-to-everything endpoint.
+The probes live in `src/storage/mod.rs` with tests that assert they *fail* on a
+200-to-everything endpoint and on a SHA256SUMS that hashes to the wrong oid.
 
 To point them at a Worker before any manifest names it, deploy it and repoint one manifest's
 `base_uri` (below) on a branch; `snapshot verify` reads each manifest's own `base_uri`.
@@ -86,24 +84,9 @@ npx wrangler delete                   # remove it (repoint the manifests first)
 
 ## Push credentials
 
-Only `ztest snapshot push` needs them, and only on the machine publishing a fixture:
-
-```sh
-ztest snapshot config set             # prompts; secret is not echoed
-ztest snapshot config show            # secret shown as <n chars>
-```
-
-Non-interactive (CI):
-
-```sh
-printf '%s' "$R2_SECRET" | ztest snapshot config set \
-  --endpoint https://<account-id>.r2.cloudflarestorage.com \
-  --bucket ztest-archives --access-key-id "$R2_KEY_ID" --secret-access-key -
-```
-
-They are stored as `[bucket]` in `~/.config/ztest/clusters.toml`, mode `0600`. `config set` proves the credentials
-against the bucket before returning, so a typo fails in seconds rather than at the end of a
-multi-hour push.
+Only `ztest snapshot push` needs them, and only on the machine publishing a snapshot. They
+live in rclone's config, never in ztest — setup:
+[`docs/design-snapshots.md#publishing`](../../docs/design-snapshots.md#publishing).
 
 Scope the R2 API token to **Object Read & Write on `ztest-archives` alone** — never an
 account-wide token. The Worker needs no token at all: it reaches the bucket through a
@@ -112,20 +95,23 @@ binding, so nothing here or in `wrangler.jsonc` is a secret.
 ## Do not
 
 - **Put this behind Cache Everything or a cache rule.** Cloudflare answers a `Range` by
-  stripping the header, pulling the *whole* body from the Worker, then slicing. Against a
-  245 GiB seed that is pathological, and past the cacheable size limit (512 MB Free/Pro) it
-  cannot store the result anyway. Responses carry `cache-control: no-store` to make the
+  stripping the header, pulling the *whole* body from the Worker, then slicing. Against
+  multi-GiB files that is pathological, and past the cacheable size limit (512 MB Free/Pro)
+  it cannot store the result anyway. Responses carry `cache-control: no-store` to make the
   misconfiguration inert; do not remove it.
 - **Add write verbs.** `push` goes to the S3 endpoint with credentials. This Worker is the
   read path and has no business accepting a `PUT`.
-- **Widen the key pattern.** It serves `lfs/<64 hex>` and 404s everything else, so the
-  bucket cannot become a public filesystem by accident.
+- **Widen the key pattern.** It serves `snap/<64 hex>/<relpath>` (segments of
+  `A-Z a-z 0-9 . _ -`, no `.`/`..`) and 404s everything else, so the bucket cannot become a
+  public filesystem by accident.
 
 ## Limits that matter here
 
-| Workers Free  | limit        | one 245 GiB pull |
-| ------------- | ------------ | ---------------- |
-| requests      | 100,000/day  | ~980             |
-| CPU time      | 10 ms        | ~0 (streaming)   |
-| memory        | 128 MB       | ~0 (streaming)   |
-| response body | no limit     | —                |
+A pull costs two requests per file (HEAD + GET) plus one for `SHA256SUMS`.
+
+| Workers Free  | limit        | one pull of an N-file tree |
+| ------------- | ------------ | -------------------------- |
+| requests      | 100,000/day  | 2N + 1                     |
+| CPU time      | 10 ms        | ~0 (streaming)             |
+| memory        | 128 MB       | ~0 (streaming)             |
+| response body | no limit     | —                          |

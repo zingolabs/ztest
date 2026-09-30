@@ -10,13 +10,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-pub(crate) mod bucket;
 pub(crate) mod cleanup;
 pub(crate) mod cluster;
 pub(crate) mod config;
 pub mod list_mounts;
 pub(crate) mod preview;
-pub(crate) mod progress;
 pub mod replay;
 pub mod run;
 pub(crate) mod snapshot;
@@ -82,9 +80,9 @@ pub enum Command {
     /// itself or the seed cache.
     Cleanup(cleanup::Args),
 
-    /// Chain snapshots: derive and publish an archive's manifest
-    /// (`manifest`, `push`), and manage the content-addressed seed cache
-    /// (`list`, `prune`, `warm`).
+    /// Chain snapshots: publish a state directory (`push`), check every declared
+    /// snapshot is readable (`verify`), and manage the cluster's seed cache
+    /// (`list`, `prune`).
     Snapshot(snapshot::Args),
 
     /// Provision a cluster (`setup`, `check`) and manage the named profiles
@@ -171,7 +169,7 @@ pub(crate) fn block_on<E: Into<CliError>>(
 /// Bind the cluster profile — kube-context, kubeconfig, class, storage driver, registry —
 /// for **every** subcommand, from the one place that runs before all of them.
 ///
-/// - Was per-subcommand, and five of them never called it: `snapshot list/prune/warm`,
+/// - Was per-subcommand, and five of them never called it: `snapshot list/prune`,
 ///   `status`, `store`, `replay` and `list-mounts` resolved whatever context `kubectl`
 ///   happened to have selected, so they reported on a different cluster than `run` used
 /// - Here, not in `execute`: `activate` sets env, which is only safe before any runtime

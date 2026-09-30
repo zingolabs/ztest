@@ -97,7 +97,7 @@ pub use crate::handles::indexer::{
     RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, TreeState, TxId, ZatBalance,
 };
 pub use crate::handles::validator::{
-    BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, Peer, PeerInfo,
+    BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, Peer, PeerInfo, Reorg,
 };
 pub use crate::handles::wallet::{
     Account, AccountId, AccountKey, AccountSpec, BoxError, FAUCET_SEED, Pool, PoolBalances,
@@ -114,7 +114,7 @@ pub use crate::mount::{Mount, MountKind, MountSource};
 pub use crate::protocol::Endpoint;
 pub use crate::protocol::client::{BlockSample, JsonRpcClient};
 pub use crate::regtest_conf::FILLER_ADDRESS;
-pub use ztest_macros::{artifact, dev, mount_archive, mount_config, mount_file, needs, sync_test};
+pub use ztest_macros::{artifact, dev, mount_config, needs, sync_test};
 
 /// Runtime support for test-author proc macros. Not public API, paths may move
 #[doc(hidden)]
@@ -192,7 +192,5 @@ pub mod prelude {
     /// In public signatures (e.g. [`ValidatorBackend::activation_heights`]) → callers
     /// need the type to consume what ztest returns
     pub use crate::topology::ActivationHeights;
-    pub use ztest_macros::{
-        artifact, dev, mount_archive, mount_config, mount_file, needs, sync_test,
-    };
+    pub use ztest_macros::{artifact, dev, mount_config, needs, sync_test};
 }

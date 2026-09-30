@@ -320,15 +320,12 @@ async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inventory::SeedPayload;
 
     fn seed(oid: &str) -> SeedEntry {
         SeedEntry {
-            name: "data.tar.zst".to_string(),
+            name: "data".to_string(),
             oid: oid.to_string(),
             size: 4096,
-            uncompressed_bytes: 0,
-            payload: SeedPayload::Archive,
             base_uri: crate::storage::BASE_URI.to_string(),
             key_prefix: crate::storage::KEY_PREFIX.to_string(),
         }

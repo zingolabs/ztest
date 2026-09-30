@@ -70,16 +70,15 @@ machinery is the seed pipeline below, cloning a pre-provisioned immutable seed, 
 
 ## Seeds — content-addressed archive PVCs
 
-Pre-baked PVC content (chain/indexer state) is content-addressed and bucket-hosted: git holds a sidecar
-`<stem>.toml` recording `sha256`/`size_bytes`, bytes live in the snapshot bucket at `lfs/<oid>`
+Pre-baked PVC content (chain state) is content-addressed and bucket-hosted: git holds a manifest
+recording `sha256`/`size_bytes`, the tree's files live in the snapshot bucket at `snap/<oid>/…`
 ([design-snapshots.md](design-snapshots.md)).
 
 - Shipped chain snapshots = `ChainSnapshot` consts in `src/snapshots.rs`, manifests under
-  `snapshots/<network>/zebra-<version>-<upgrade>.toml`; a consuming crate declares its own the same way
-- Referenced by `#[ztest::needs(CONST)]` or `mount_archive!`, which reads the sidecar at compile time and
-  fails the build when missing — archive bytes are never opened, so identity bakes in a build pod that
-  cannot read them
-- Archive PVCs are keyed by oid → tests referencing identical bytes share one PVC
+  `snapshots/<network>/*.toml`; a consuming crate declares its own the same way
+- Referenced by `#[ztest::needs(CONST)]`; `artifact!` reads the manifest at compile time and fails the
+  build when missing — no bytes are opened, so identity bakes in a build pod that cannot read them
+- Seed PVCs are keyed by oid → tests referencing identical trees share one PVC
 
 | Property   | Value                                                |
 | ---------- | ---------------------------------------------------- |
@@ -89,27 +88,27 @@ Pre-baked PVC content (chain/indexer state) is content-addressed and bucket-host
 | Annotation | `last_accessed_at` (bumped per clone)                |
 | Backing    | archive pool, `size=1` (recreatable from the bucket) |
 
-Each archive has a paired `VolumeSnapshot`; tests always clone the snapshot, never the live PVC.
+Each seed has a paired `VolumeSnapshot`; tests always clone the snapshot, never the live PVC.
 
-**Publishing** — boot the component, drive it to state, then:
+**Publishing** — boot the component, drive it to state, stop it, then:
 
 ```
-tar -I zstd -cf tests/assets/<name>.tar.zst -C <data-dir> .
-ztest snapshot push <archive> > snapshots/<net>/zebra-<ver>-<up>.toml
+ztest snapshot push <data-dir> --name <name> > snapshots/<net>/<name>.toml
 ```
 
-`push` is the only ztest command that takes credentials (`ztest snapshot config set`, once per
-machine). Reading a snapshot never does.
+`push` shells out to `rclone`, whose config holds the bucket credentials (setup in
+[design-snapshots.md](design-snapshots.md#publishing)); ztest itself stores none. Reading never needs
+any.
 
-**Materialization** (lazy, first use) at `TestEnv::build()`, per archive mount:
+**Materialization** (`ztest run` preflight), per declared seed:
 
 ```
 oid = the manifest's sha256 (compile-time; a runner pod has no checkout to hash)
 if PVC seed-{sha8}-{driver} exists and labelled ready=true: reuse
 else:
     atomically create the PVC (loser of a race falls through to reuse)
-    spawn puller Job: attach PVC, fetch lfs/<oid> as ranges, extract into /seed
-      resumable object → segment at a time, marker on the PVC; a fresh pod continues
+    spawn puller Job: attach PVC, rclone snap/<oid>/… into /seed, sha256sum -c SHA256SUMS
+      pod dies → next pod reruns the copy, skipping files already whole
       success → label ready=true, create VolumeSnapshot
       failure → leave un-ready; next run retries
 ```
@@ -159,10 +158,10 @@ ztest/
 ├── src/       ztest library
 ├── cli/       the `ztest` binary
 ├── ui/        terminal rendering (console, theme, panels)
-├── macros/    ztest_macros: mount_file!, mount_archive!, dev!, qos tiers
+├── macros/    ztest_macros: mount_config!, artifact!, dev!, qos tiers
 ├── attr/      ztest_attr: the #[sync_test] grammar, shared with the CLI's source scan
 ├── proto/     lightwalletd .proto (bindings checked in at src/proto/)
-├── snapshots/ chain-snapshot manifests (sidecar .toml; archives are gitignored)
+├── snapshots/ chain-snapshot manifests (.toml; the trees live in the bucket)
 └── docs/
 ```
 

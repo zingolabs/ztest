@@ -77,6 +77,17 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
     }
 }
 
+const REORG_SETTLE: Duration = Duration::from_secs(60);
+const REORG_POLL: Duration = Duration::from_millis(250);
+
+/// Outcome of [`ValidatorBackend::reorg`]: `orphaned` ascends from `fork_parent + 1`
+#[derive(Debug, Clone)]
+pub struct Reorg {
+    pub fork_parent: BlockTip,
+    pub orphaned: Vec<BlockTip>,
+    pub tip: BlockTip,
+}
+
 /// Backend value-pool capabilities. `coinbase` follows the backend's miner
 /// address, always in `supported`, overridable per-validator via
 /// [`Validator::mine_to`](crate::component::Validator::mine_to)
@@ -232,6 +243,50 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
     fn is_regtest(&self) -> bool;
 
     // Conveniences: loops over the methods above, implemented per backend
+
+    /// Orphan the top `depth` blocks, then mine `len` replacements onto their parent
+    ///
+    /// - `len = 0` = tip retreat only; `len <= depth` = a reorg to an equal or lower tip
+    /// - Retreat awaited before mining (else `generate` extends the orphaned tip)
+    /// - Orphans invalidated (dead until [`reconsider_block`](Self::reconsider_block) of the first)
+    async fn reorg(
+        &self,
+        depth: u32,
+        len: u32,
+        miner_address: Option<&str>,
+    ) -> Result<Reorg, RpcError> {
+        let (tip, _) = self.tip().await?;
+        let parent = u32::from(tip).checked_sub(depth).filter(|_| depth > 0).ok_or_else(|| {
+            RpcError::Unsupported {
+                component: self.label(),
+                op: "reorg",
+                detail: format!("depth {depth} at tip {}", u32::from(tip)),
+            }
+        })?;
+        let fork_parent = self.get_block(BlockHeight::from(parent)).await?;
+        let mut orphaned = Vec::new();
+        for height in parent + 1..=u32::from(tip) {
+            orphaned.push(self.get_block(BlockHeight::from(height)).await?);
+        }
+        self.invalidate_block(&orphaned[0].1).await?;
+
+        let started = tokio::time::Instant::now();
+        while self.tip().await? != fork_parent {
+            if started.elapsed() >= REORG_SETTLE {
+                return Err(RpcError::timeout(
+                    self.label(),
+                    "reorg",
+                    started.elapsed(),
+                    format!("tip never retreated to {} after invalidateblock", parent),
+                ));
+            }
+            tokio::time::sleep(REORG_POLL).await;
+        }
+        if len > 0 {
+            self.generate_blocks_to(len, miner_address).await?;
+        }
+        Ok(Reorg { fork_parent, orphaned, tip: self.tip().await? })
+    }
 
     /// Poll until the chain reaches `target`, at the backend's default poll timeout
     async fn poll_chain_height(&self, target: BlockHeight) -> Result<(), RpcError>;

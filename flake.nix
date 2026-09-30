@@ -57,6 +57,9 @@
             kind
             kubectl
             git
+
+            # `ztest snapshot push` + the puller's local tests
+            rclone
           ];
 
           # protoc = maintainer-only (`cargo xtask regen-proto`); bindings checked in, so

@@ -66,15 +66,11 @@ impl Provider for SeedProvider {
 mod tests {
     use super::*;
 
-    use crate::inventory::SeedPayload;
-
     fn entry(oid: &str) -> SeedEntry {
         SeedEntry {
-            name: "chain.tar.zst".to_string(),
+            name: "chain".to_string(),
             oid: oid.to_string(),
             size: 4096,
-            uncompressed_bytes: 0,
-            payload: SeedPayload::Archive,
             base_uri: crate::storage::BASE_URI.to_string(),
             key_prefix: crate::storage::KEY_PREFIX.to_string(),
         }
@@ -110,7 +106,7 @@ mod tests {
     fn the_same_oid_dedups_to_one_node() {
         let oid = "c6f8cc7e".repeat(8);
         let mut a = entry(&oid);
-        a.name = "declared-over-here.tar.zst".into();
+        a.name = "declared-over-here".into();
         let b = entry(&oid);
         assert_eq!(SeedProvider::node_id(&a), SeedProvider::node_id(&b));
     }

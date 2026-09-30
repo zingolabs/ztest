@@ -1,18 +1,11 @@
-//! Puller liveness + progress, parent-side: one byte counter draws the row *and* is the
+//! Puller liveness + progress, parent-side: what the pod's log says draws the row *and* is the
 //! only thing the verdict reads.
 //!
-//! - Bytes move R2 → node inside the puller pod, so the only signal is what its log says
-//! - `dd status=progress` mid-pipe = that signal (`pv` unavailable: puller image cannot
-//!   install at pod start under `restricted-v2`, no common base ships it)
-//! - Mid-pipe = backpressure, so the counter advances only as `tar` consumes → one number
-//!   covers link, decompress and volume writes alike
-//! - Verdict is *silence*, never duration (no constant models transfer time — [`STALL_WINDOW`]);
-//!   a sub-floor trickle is `curl`'s to kill per-range, in the pod, not this module's
-//! - Counter absolute, not incremental (replayed records harmless once clamped monotonic)
-//! - Every record reported, not only rising ones (`dd` emits ~1/s regardless → flat
-//!   reports = the heartbeat a rate window needs to decay a stall to zero)
-//! - Counter `\r`-separated → [`super::puller_cmd`] pipes through `stdbuf -oL tr '\r' '\n'`
-//!   (CRI batches an undelimited stream into ~16 KiB = minutes of silence); split on either
+//! - Bytes move R2 → node inside the puller pod → its log = the only signal
+//! - Transfer phase: rclone JSON stats records (`stats.bytes`, exact, cumulative per pod)
+//! - Verify phase: `sha256sum -c` `relpath: OK` lines, relpaths in SHA256SUMS order (sorted)
+//! - Verdict = *silence*, never duration (no constant models transfer time — [`STALL_WINDOW`])
+//! - Counters clamped monotonic (re-attach backfill replays records harmlessly)
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -28,7 +21,7 @@ const PRE_RUN_POLL: Duration = Duration::from_millis(500);
 
 const REATTACH_DELAY: Duration = Duration::from_secs(1);
 
-/// Re-attach overlap. Counter absolute + clamped monotonic → replay is free, a gap strands the bar
+/// Re-attach overlap. Counters clamped monotonic → replay is free, a gap strands the bar
 const REATTACH_BACKFILL_SECS: i64 = 10;
 
 /// Cap on an undelimited run held while seeking a record boundary (bounds a
@@ -38,10 +31,7 @@ const MAX_RECORD: usize = 64 * 1024;
 /// Silence that means stuck — at every payload size, on every cluster.
 ///
 /// - Bounds the *gap between signals*, never the transfer (which no constant can predict)
-/// - Widest legit gap is `curl`'s own: a chunk redialed through its ladder (≈6m) or landing
-///   at the `--speed-limit` floor (256 MiB ≈ 4m)
-/// - Post-transfer it bounds the counter-less tail (mode normalize + digest join + Job
-///   condition) — work sized by file count and buffers, not by bytes
+/// - Widest legit gap: rclone's `--timeout` + retry ladder on one file, or hashing one large file
 const STALL_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// Puller state the Job would hold forever, so the parent ends it.
@@ -54,16 +44,12 @@ pub enum Stall {
     ImagePull(String),
     NoProgress { transferred: u64, total: u64 },
     Finalizing { total: u64 },
-    Restarted { transferred: u64 },
 }
 
 impl Stall {
     /// Container ran → its log tail is the diagnostic. Otherwise the reason already is
     pub fn ran(&self) -> bool {
-        matches!(
-            self,
-            Stall::NoProgress { .. } | Stall::Finalizing { .. } | Stall::Restarted { .. }
-        )
+        matches!(self, Stall::NoProgress { .. } | Stall::Finalizing { .. })
     }
 }
 
@@ -85,13 +71,8 @@ impl fmt::Display for Stall {
             ),
             Stall::Finalizing { total } => write!(
                 f,
-                "puller took all {} but did not finish extracting within {mins}m — check node disk",
+                "puller took all {} but verified nothing new within {mins}m — check node disk",
                 human(*total)
-            ),
-            Stall::Restarted { transferred } => write!(
-                f,
-                "puller restarted after {} — the transfer cannot resume, so the pull is abandoned",
-                human(*transferred)
             ),
         }
     }
@@ -143,28 +124,29 @@ impl StartWatch {
     }
 }
 
-/// Forward-motion clock: `idle_since` is the whole verdict, and only a rising counter
-/// moves it
+/// Forward-motion clock: `idle_since` is the whole verdict, and only a rising signal moves it.
+/// `base` = bytes earlier pods moved (each pod's rclone counts from zero)
 #[derive(Debug)]
 struct Liveness {
-    /// Absolute offset the counter is relative to; `dd` restarts at every frame
     base: u64,
     transferred: u64,
     total: u64,
+    verified: Option<Vec<u8>>,
     idle_since: Instant,
 }
 
 impl Liveness {
     fn new(total: u64, now: Instant) -> Self {
-        Self { base: 0, transferred: 0, total, idle_since: now }
+        Self { base: 0, transferred: 0, total, verified: None, idle_since: now }
     }
 
-    /// Segment boundary: following counts restart from zero against this offset
-    fn rebase(&mut self, base: u64) {
-        self.base = base;
+    /// Fresh pod: its byte count restarts at zero, its verify at the first relpath
+    fn next_attempt(&mut self) {
+        self.base = self.transferred;
+        self.verified = None;
     }
 
-    /// Meter count, clamped monotonic against the whole object. `true` = bytes moved
+    /// Per-pod byte count, clamped monotonic across the whole pull. `true` = bytes moved
     fn observe(&mut self, count: u64, now: Instant) -> bool {
         let absolute = self.base.saturating_add(count);
         if absolute <= self.transferred {
@@ -175,6 +157,20 @@ impl Liveness {
         true
     }
 
+    /// Verify line. Relpaths arrive in SHA256SUMS order → only a later one is forward motion
+    fn observe_verified(&mut self, relpath: &[u8], now: Instant) -> bool {
+        if self.verified.as_deref().is_some_and(|last| relpath <= last) {
+            return false;
+        }
+        self.verified = Some(relpath.to_vec());
+        self.idle_since = now;
+        true
+    }
+
+    fn shown(&self) -> u64 {
+        self.transferred.min(self.total)
+    }
+
     fn remaining(&self, now: Instant) -> Duration {
         STALL_WINDOW.saturating_sub(now.saturating_duration_since(self.idle_since))
     }
@@ -183,9 +179,9 @@ impl Liveness {
         self.remaining(now).is_zero()
     }
 
-    /// Whole payload metered = the tail is what stalled, and it reads nothing like a dead link
+    /// Whole payload moved (or verifying) = the tail stalled, which reads nothing like a dead link
     fn stall(&self) -> Stall {
-        match self.transferred >= self.total {
+        match self.verified.is_some() || self.transferred >= self.total {
             true => Stall::Finalizing { total: self.total },
             false => Stall::NoProgress { transferred: self.transferred, total: self.total },
         }
@@ -201,15 +197,12 @@ struct Attempt {
 
 /// Track the puller Job's pod, report progress, **return only to end the pull**.
 ///
-/// - Caller races this against the Job's terminal condition, so returning cancels that wait:
-///   every [`Stall`] must be a state no Job condition would ever arrive to settle
-/// - `resumable` = the object carries a frame table, so a fresh pod continues off the
-///   on-volume marker rather than starting the transfer again
+/// Caller races this against the Job's terminal condition, so returning cancels that wait:
+/// every [`Stall`] must be a state no Job condition would ever arrive to settle
 pub async fn watch_puller(
     pods: &Api<Pod>,
     job_name: &str,
     total: u64,
-    resumable: bool,
     progress: &dyn StepProgress,
 ) -> Stall {
     let mut start = StartWatch::default();
@@ -226,15 +219,11 @@ pub async fn watch_puller(
             tokio::time::sleep(PRE_RUN_POLL).await;
             continue;
         };
-        // Second pod resumes off the marker (segmented) or restarts at byte 0 (not) — only the
-        // second walks the count backwards out from under every window here
+        // Next pod reruns the copy (complete files skipped) → bar carries on from here
         if attempt.as_ref().is_some_and(|a| a.name != name) {
-            if !resumable {
-                let transferred = clock.as_ref().map_or(0, |c| c.transferred);
-                return Stall::Restarted { transferred };
+            if let Some(clock) = clock.as_mut() {
+                clock.next_attempt();
             }
-            // Counter is absolute and clamped, and the new pod re-announces its offset →
-            // nothing to reset, the bar simply carries on from where the marker left it
             progress.note("resuming pull");
             attempt = None;
         }
@@ -259,8 +248,7 @@ pub async fn watch_puller(
             return clock.stall();
         }
 
-        // Log spent: the tail (extract flush, mode normalize, digest, Job condition) has no
-        // counter of its own, so the same window bounds it
+        // Log spent: the Job condition's arrival has no signal of its own → same window
         if attempt.as_ref().is_some_and(|a| a.ended) {
             settle(&pod, progress);
             tokio::time::sleep(PRE_RUN_POLL).await;
@@ -343,12 +331,12 @@ fn pre_run_note(pod: &Pod) -> String {
     }
 }
 
-/// Follow one pod's log until clean end / stall (`Ok`) or drop (`Err`), reporting each count.
+/// Follow one pod's log until clean end / stall (`Ok`) or drop (`Err`), reporting each signal.
 ///
 /// - `clock` is the caller's, carried across re-attaches: replay never walks the bar
 ///   backwards, and a re-attach never launders elapsed silence
-/// - Read is bounded by what the clock has left, not a fixed interval — `dd` chatters ~1/s
-///   over a wedged extract, so a per-read timeout would never fire
+/// - Read bounded by what the clock has left, not a fixed interval (rclone emits flat stats
+///   records over a wedged transfer → a per-read timeout would never fire)
 async fn follow(
     pods: &Api<Pod>,
     pod: &str,
@@ -375,15 +363,18 @@ async fn follow(
 
         let mut consumed = 0;
         for (i, b) in pending.iter().enumerate() {
-            if !matches!(b, b'\r' | b'\n') {
+            if *b != b'\n' {
                 continue;
             }
             let record = &pending[consumed..i];
-            if let Some(base) = base_mark(record) {
-                clock.rebase(base);
-            } else if let Some(done) = dd_bytes(record) {
+            if let Some(done) = stats_bytes(record) {
                 clock.observe(done, Instant::now());
-                progress.bytes(clock.transferred, clock.total);
+                progress.bytes(clock.shown(), clock.total);
+            } else if let Some(relpath) = verified_path(record) {
+                if clock.verified.is_none() {
+                    progress.note("verifying");
+                }
+                clock.observe_verified(relpath, Instant::now());
             }
             consumed = i + 1;
         }
@@ -394,22 +385,15 @@ async fn follow(
     }
 }
 
-/// Absolute offset out of a segment marker, else `None`.
-///
-/// Emitted by the puller once a frame, because the meter's own count restarts with it
-fn base_mark(record: &[u8]) -> Option<u64> {
-    let mut fields = std::str::from_utf8(record).ok()?.split_ascii_whitespace();
-    (fields.next()? == super::BASE_MARK).then(|| fields.next()?.parse().ok())?
+/// Cumulative bytes out of an rclone `--use-json-log` stats record, else `None`
+pub(super) fn stats_bytes(record: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(record).ok()?;
+    v.get("stats")?.get("bytes")?.as_u64()
 }
 
-/// Byte count out of a `dd status=progress` record, else `None`.
-///
-/// - `314572800 bytes (315 MB, 300 MiB) copied, 12 s, 26.2 MB/s` → `314572800`
-/// - Other puller output fails the `bytes` check (failure path reads the log in full)
-fn dd_bytes(record: &[u8]) -> Option<u64> {
-    let mut fields = std::str::from_utf8(record).ok()?.split_ascii_whitespace();
-    let count = fields.next()?.parse().ok()?;
-    (fields.next()? == "bytes").then_some(count)
+/// Relpath out of a `sha256sum -c` success line (`a/b.sst: OK`), else `None`
+pub(super) fn verified_path(record: &[u8]) -> Option<&[u8]> {
+    record.strip_suffix(b": OK").filter(|p| !p.is_empty() && !p.starts_with(b"{"))
 }
 
 #[cfg(test)]
@@ -426,7 +410,7 @@ mod tests {
                     "name": "puller",
                     "ready": false,
                     "restartCount": 0,
-                    "image": "fedora:40",
+                    "image": "rclone",
                     "imageID": "",
                     "state": { "terminated": { "exitCode": exit_code, "reason": "Error" } },
                 }],
@@ -435,8 +419,7 @@ mod tests {
         .expect("valid Pod")
     }
 
-    /// The stuck-at-`finalizing…` bug: a dead attempt closes its log exactly like a
-    /// finished one, and `finalizing` drops the bar/rate/ETA until the Job gives up
+    /// Dead attempt closes its log exactly like a finished one (`finalizing` would hide it)
     #[test]
     fn a_nonzero_exit_is_a_failure_not_a_finalizing_pull() {
         assert_eq!(failure_note(&terminated(2)).as_deref(), Some("pull failed (exit 2)"));
@@ -483,7 +466,7 @@ mod tests {
                 "name": "puller",
                 "ready": false,
                 "restartCount": 0,
-                "image": "fedora:40",
+                "image": "rclone",
                 "imageID": "",
                 "state": { "waiting": { "reason": reason } },
             }],
@@ -491,16 +474,13 @@ mod tests {
         .expect("valid PodStatus")
     }
 
-    /// The whole point of the rewrite: a pull slower than any budget anyone would have
-    /// guessed is *not* a failure. 20 GiB at ~1 MiB/s outruns every wall-clock deadline
-    /// this module used to impose, and must still be alive as long as bytes keep landing
+    /// Slower than any budget ≠ failure: alive as long as bytes keep landing
     #[test]
     fn an_arbitrarily_slow_pull_never_stalls_while_bytes_keep_landing() {
         let t0 = Instant::now();
         let mut clock = Liveness::new(20 * GB, t0);
         let mut at = t0;
         let mut moved = 0;
-        // 10 hours, a megabyte at a time — far past any budget a throughput constant yields
         for tick in 1..=(10 * 60 * 60) {
             at = t0 + Duration::from_secs(tick);
             moved += 1024 * 1024;
@@ -510,8 +490,7 @@ mod tests {
         assert!(clock.expired(at + STALL_WINDOW), "silence after the last byte is still a stall");
     }
 
-    /// `dd` chatters ~1/s over a wedged extract, so the verdict must read the *count*, not
-    /// the record. A repeated total is a heartbeat, never forward motion
+    /// Flat stats records over a wedged transfer = heartbeat, never forward motion
     #[test]
     fn a_repeated_count_is_a_heartbeat_and_not_progress() {
         let t0 = Instant::now();
@@ -524,8 +503,7 @@ mod tests {
         assert_eq!(clock.stall(), Stall::NoProgress { transferred: 4 * GB, total: 20 * GB });
     }
 
-    /// Re-attach backfills the last 10s, so records already counted arrive a second time.
-    /// Clamped monotonic or not, a replay must never push the stall deadline out
+    /// Re-attach backfill replays counted records; a replay must never push the deadline out
     #[test]
     fn a_replayed_record_cannot_launder_elapsed_silence() {
         let t0 = Instant::now();
@@ -537,20 +515,43 @@ mod tests {
         assert!(clock.expired(t0 + STALL_WINDOW));
     }
 
-    /// Post-transfer there is no counter at all (extract flush, mode normalize, digest), so
-    /// the same window bounds the tail — but it must not be reported as a dead link
+    /// Next pod's rclone counts from zero again: the bar carries on instead of freezing
     #[test]
-    fn silence_after_the_last_byte_is_named_as_the_tail_not_the_transfer() {
+    fn a_resumed_pod_moves_the_bar_from_where_the_last_one_stopped() {
         let t0 = Instant::now();
         let mut clock = Liveness::new(20 * GB, t0);
-        clock.observe(20 * GB, t0);
-        assert!(!clock.expired(t0 + STALL_WINDOW - Duration::from_secs(1)));
-        assert!(clock.expired(t0 + STALL_WINDOW));
-        assert_eq!(clock.stall(), Stall::Finalizing { total: 20 * GB });
+        clock.observe(4 * GB, t0);
+        clock.next_attempt();
+        let later = t0 + Duration::from_secs(60);
+        assert!(clock.observe(GB, later), "the new pod's first bytes were not progress");
+        assert_eq!(clock.transferred, 5 * GB);
+        assert_eq!(clock.remaining(later), STALL_WINDOW);
     }
 
-    /// Placement is the cluster's answer, not a duration to infer: past `PENDING_TIMEOUT`
-    /// the scheduler's own message is the error, rather than "did not finish"
+    /// Refetched partial files can overcount; the row never reads past the whole tree
+    #[test]
+    fn the_bar_never_passes_the_tree_size() {
+        let mut clock = Liveness::new(GB, Instant::now());
+        clock.observe(2 * GB, Instant::now());
+        assert_eq!(clock.shown(), GB);
+    }
+
+    /// Verify = hashing only, no bytes move → the sorted relpaths are its forward motion
+    #[test]
+    fn verification_is_progress_only_in_sums_order() {
+        let t0 = Instant::now();
+        let mut clock = Liveness::new(GB, t0);
+        clock.observe(GB, t0);
+        let t1 = t0 + Duration::from_secs(600);
+        assert!(clock.observe_verified(b"a/000013.sst", t1));
+        assert!(!clock.observe_verified(b"a/000012.sst", t1 + STALL_WINDOW), "replay moved it");
+        assert!(clock.expired(t1 + STALL_WINDOW));
+        assert_eq!(clock.stall(), Stall::Finalizing { total: GB });
+        clock.next_attempt();
+        assert!(clock.observe_verified(b"a/000001.sst", t1), "new pod's verify never counted");
+    }
+
+    /// Past `PENDING_TIMEOUT` the scheduler's own message is the error
     #[test]
     fn an_unplaceable_puller_fails_with_the_schedulers_reason() {
         let t0 = Instant::now();
@@ -564,7 +565,6 @@ mod tests {
         assert!(reason.contains("0/1 nodes are available"), "{reason}");
     }
 
-    /// A placed pod's clock never starts — the old code burned the whole budget here
     #[test]
     fn a_placed_puller_never_trips_the_pending_clock() {
         let t0 = Instant::now();
@@ -574,8 +574,7 @@ mod tests {
         assert_eq!(start.observe(&status, t0 + pod_status::PENDING_TIMEOUT * 10), None);
     }
 
-    /// Kubelet backoff clears a transient pull storm, so the grace must survive it and only
-    /// a *persisting* error ends the wait
+    /// Kubelet backoff clears a transient pull storm → only a *persisting* error ends the wait
     #[test]
     fn a_transient_image_pull_error_is_waited_out_and_a_persisting_one_is_not() {
         let t0 = Instant::now();
@@ -591,7 +590,6 @@ mod tests {
         );
     }
 
-    /// A 100 MB cache and a 250 GiB chain are both seeds; "0.1 GiB" names neither well
     #[test]
     fn a_byte_count_is_named_at_the_scale_it_lands_on() {
         assert_eq!(human(20 * GB), "20.0 GiB");
@@ -600,18 +598,15 @@ mod tests {
         assert_eq!(human(17), "17 B");
     }
 
-    /// The tail is the diagnostic only where a container reached the point of writing one;
-    /// an unplaceable pod has no log, and its reason already carries the scheduler's words
+    /// Unplaceable pod has no log; its reason already carries the scheduler's words
     #[test]
     fn only_a_stall_that_ran_has_a_log_worth_quoting() {
         assert!(Stall::NoProgress { transferred: 0, total: GB }.ran());
         assert!(Stall::Finalizing { total: GB }.ran());
-        assert!(Stall::Restarted { transferred: GB }.ran());
         assert!(!Stall::ImagePull("ErrImagePull".into()).ran());
         assert!(!Stall::Unschedulable { reason: "x".into(), elapsed: STALL_WINDOW }.ran());
     }
 
-    /// Every message names what to go look at, on one line
     #[test]
     fn every_stall_reads_as_a_fact_and_an_action() {
         let stalls = [
@@ -619,7 +614,6 @@ mod tests {
             Stall::ImagePull("ImagePullBackOff".into()),
             Stall::NoProgress { transferred: 4 * GB, total: 20 * GB },
             Stall::Finalizing { total: 20 * GB },
-            Stall::Restarted { transferred: 4 * GB },
         ];
         for stall in stalls {
             let msg = stall.to_string();
@@ -628,35 +622,36 @@ mod tests {
         }
     }
 
+    /// Verbatim rclone 1.75 `--use-json-log --stats-one-line` record
     #[test]
-    fn a_progress_record_yields_its_absolute_count() {
-        assert_eq!(
-            dd_bytes(b"314572800 bytes (315 MB, 300 MiB) copied, 12 s, 26.2 MB/s"),
-            Some(314572800)
-        );
+    fn a_stats_record_yields_its_cumulative_byte_count() {
+        let record = br#"{"time":"2026-09-29T18:50:39.466706624-07:00","level":"notice","msg":"   10.027 MiB / 28.610 MiB, 35%, 5.027 MiB/s, ETA 3s\n","stats":{"bytes":10514435,"checks":0,"totalBytes":30000003,"transfers":1},"source":"accounting/stats.go:551"}"#;
+        assert_eq!(stats_bytes(record), Some(10514435));
     }
 
+    /// rclone errors are JSON too; sha256sum lines are not → neither reads as a count
     #[test]
-    fn the_final_summary_record_is_read_the_same_way() {
-        assert_eq!(
-            dd_bytes(b"4194304000 bytes (4.2 GB, 3.9 GiB) copied, 231.4 s, 18.1 MB/s"),
-            Some(4194304000)
-        );
-    }
-
-    /// Everything else on the merged stderr must fall through (else a `curl`
-    /// diagnostic reads as a byte count)
-    #[test]
-    fn non_progress_output_is_not_a_count() {
+    fn non_stats_output_is_not_a_count() {
         for line in [
-            &b"4000+0 records in"[..],
-            b"curl: (22) The requested URL returned error: 403",
-            b"tar: Unexpected EOF in archive",
+            &br#"{"level":"error","msg":"a/b.sst: Failed to copy: 404 Not Found"}"#[..],
+            b"a/b.sst: OK",
+            b"SHA256SUMS hashes to 00, manifest says 11",
             b"",
             b"1024",
-            b"1024 records",
         ] {
-            assert_eq!(dd_bytes(line), None, "{}", String::from_utf8_lossy(line));
+            assert_eq!(stats_bytes(line), None, "{}", String::from_utf8_lossy(line));
+        }
+    }
+
+    #[test]
+    fn only_a_passing_verify_line_names_a_verified_path() {
+        assert_eq!(
+            verified_path(b"state/v28/mainnet/000013.sst: OK"),
+            Some(&b"state/v28/mainnet/000013.sst"[..])
+        );
+        for line in [&b"a/x.log: FAILED"[..], b": OK", br#"{"msg":"x: OK"}"#, b"sha256sum: WARNING"]
+        {
+            assert_eq!(verified_path(line), None, "{}", String::from_utf8_lossy(line));
         }
     }
 }

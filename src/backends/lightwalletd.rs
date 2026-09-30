@@ -11,7 +11,7 @@ use tonic::transport::Channel;
 use crate::proto;
 use crate::proto::compact_tx_streamer_client::CompactTxStreamerClient;
 use crate::proto::{CompactBlock, CompactTx};
-use crate::protocol::types::BlockHash;
+use crate::protocol::types::{BlockHash, BlockTip};
 use zcash_protocol::ShieldedPool as ShieldedProtocol;
 use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
@@ -177,7 +177,7 @@ impl IndexerBackend for LightwalletdIndexer {
         self.plumbing.endpoint_for(container_port).await
     }
 
-    async fn latest_block_height(&self) -> Result<BlockHeight, RpcError> {
+    async fn latest_block(&self) -> Result<BlockTip, RpcError> {
         let ep = self.plumbing.endpoint("grpc").await?;
         let endpoint = &ep;
         let mut client = connect(endpoint).await?;
@@ -186,7 +186,11 @@ impl IndexerBackend for LightwalletdIndexer {
             .await
             .map_err(|e| RpcError::backend(COMPONENT, "GetLatestBlock", e))?
             .into_inner();
-        Ok(BlockHeight::from(u32_height(COMPONENT, "GetLatestBlock", resp.height)?))
+        let height = BlockHeight::from(u32_height(COMPONENT, "GetLatestBlock", resp.height)?);
+        let hash = BlockHash::from_wire(&resp.hash).ok_or_else(|| {
+            RpcError::decode(COMPONENT, "GetLatestBlock", format!("{}-byte hash", resp.hash.len()))
+        })?;
+        Ok((height, hash))
     }
 
     async fn indexer_info(&self) -> Result<proto::LightdInfo, RpcError> {
@@ -213,7 +217,7 @@ impl IndexerBackend for LightwalletdIndexer {
     async fn get_block_by_hash(&self, hash: BlockHash) -> Result<CompactBlock, RpcError> {
         let ep = self.plumbing.endpoint("grpc").await?;
         let endpoint = &ep;
-        fetch_block(endpoint, proto::BlockId { height: 0, hash: hash.0.to_vec() }).await
+        fetch_block(endpoint, proto::BlockId { height: 0, hash: hash.to_wire() }).await
     }
 
     async fn get_taddress_balance(&self, addresses: Vec<String>) -> Result<ZatBalance, RpcError> {

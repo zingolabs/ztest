@@ -43,14 +43,6 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync
 toml = "0.8"
 anyhow = "1.0.104"
 thiserror.workspace = true
-# S3 client for the snapshot bucket: `ztest snapshot push`, and nothing else. A *CLI*
-# dependency on purpose — reads are unauthenticated public GETs, so no test binary should
-# link an S3 client. `aws` is the only backend wanted.
-#
-# PINNED TO 0.13 ON PURPOSE — do not bump to 0.14 without reading this:
-#   * 0.14 moves to `reqwest ^0.13`, which would put a *second* reqwest in the
-#     graph alongside the 0.12 the rest of ztest uses.
-object_store = { version = "0.13.1", default-features = false, features = ["aws"] }
 
 [dev-dependencies]
 ztest = { workspace = true, features = ["librustzcash"] }

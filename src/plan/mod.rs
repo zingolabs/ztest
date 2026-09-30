@@ -204,15 +204,12 @@ fn tier_for<'a>(tiers: &BTreeMap<&str, &'a QosEntry>, test: &str) -> Option<&'a 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inventory::SeedPayload;
 
     fn seed(oid: &str) -> SeedEntry {
         SeedEntry {
-            name: format!("{oid}.tar.zst"),
+            name: oid.to_string(),
             oid: oid.to_string(),
             size: 1,
-            uncompressed_bytes: 0,
-            payload: SeedPayload::Archive,
             base_uri: crate::storage::BASE_URI.to_string(),
             key_prefix: crate::storage::KEY_PREFIX.to_string(),
         }

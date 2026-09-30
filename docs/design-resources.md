@@ -136,17 +136,11 @@ Neither side holds a credential, and the bytes never pass through this process:
 | --------------------- | ------------------------- | ----------------------------------- |
 | runs in               | `ztest run` preflight     | the runner pod, at `TestEnv::build` |
 | needs bucket creds    | no — nothing here can     | no                                  |
-| needs the archive     | no (only its OID)         | no                                  |
+| needs the bytes       | no (only its OID)         | no                                  |
 | creates the PVC / Job | yes                       | no                                  |
 
-- `provision_seed` hands the manifest's public URL for `lfs/<oid>` to a puller Job; the pod `curl`s it
-  into `tar -x -C /seed` itself → CDN → node at cluster bandwidth. No credential Secret is mounted into
-  the cluster because none exists to mount
-- `await_seed` only waits. A seed missing there is a preflight bug (a test mounting an archive it never
+- `provision_seed` hands the manifest's public `snap/<oid>/` URL to a puller Job; the pod rclones the
+  tree into `/seed` and `sha256sum -c`s it → CDN → node at cluster bandwidth. No credential Secret is
+  mounted into the cluster because none exists to mount
+- `await_seed` only waits. A seed missing there is a preflight bug (a test mounting a snapshot it never
   declared with `#[ztest::needs]`) and the error says so instead of timing out
-
-### Compression
-
-Derived from the artifact's filename (`compression_from_name`), recorded in the manifest. No magic-byte
-fallback — there are no local bytes to sniff, and GNU `tar` cannot auto-detect on the non-seekable pipe
-the puller feeds it, so the flag resolves before the Job is created.

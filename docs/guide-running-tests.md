@@ -72,12 +72,13 @@ Per required `seed-<sha8>-<driver>` PVC in `ztest-seeds`:
 
 - ready → cached
 - not ready → attach to the puller Job's log stream
-- absent → create PVC + puller Job, which `curl`s the public URL for `lfs/<oid>` straight
-  into `tar -x` — bytes go **R2 → node**, never through ztest or the apiserver
+- absent → create PVC + puller Job, which rclones the public `snap/<oid>/` tree into the volume
+  and verifies it against its `SHA256SUMS` — bytes go **R2 → node**, never through ztest or the
+  apiserver
 
-Archives are gitignored, so a checkout holds none and nothing is fetched at clone time. The OID comes
-from `snapshots/<network>/zebra-<version>-<upgrade>.toml`, read at compile time, along with the
-`base_uri`/`key_prefix` the bytes are fetched from. Reads from object storage are public.
+A checkout holds no snapshot bytes and nothing is fetched at clone time. The OID comes from
+`snapshots/<network>/*.toml`, read at compile time, along with the `base_uri`/`key_prefix` the files
+are fetched from. Reads from object storage are public.
 
 `ztest cluster check` will verify that configured seeds are reachable from the current cluster
 

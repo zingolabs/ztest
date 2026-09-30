@@ -17,7 +17,7 @@ use crate::metrics::{Facet, Row, row};
 use crate::protocol::Endpoint;
 use crate::protocol::client::{AuthedRpc, JsonRpcClient, json_rpc, wait_for_rpc_ready};
 use crate::protocol::zcash_rpc::ZcashRpc;
-use crate::public_conf::ChainMotion;
+use crate::public_conf::{ChainMotion, Seeds};
 use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zebrad";
@@ -119,7 +119,7 @@ impl ValidatorConfig for ZebraBackend {
         match &opts.restore {
             Some(crate::component::RestoreSource::Archive(archive)) => {
                 opts.mounts
-                    .push(crate::mount::Mount::archive(archive.artifact, ZEBRAD_REGTEST_CACHE_DIR));
+                    .push(crate::mount::Mount::seed(archive.artifact, ZEBRAD_REGTEST_CACHE_DIR));
             }
             Some(crate::component::RestoreSource::Blank) => {
                 opts.mounts.push(crate::regtest::scratch_mount(ZEBRAD_REGTEST_CACHE_DIR));
@@ -498,19 +498,41 @@ fn restore_public(
 
     let toml = public_toml(validator.opts(), network, ChainMotion::Pinned, ZEBRAD_PUBLIC_CACHE_DIR);
     boot_public(validator, toml)
-        .mount(crate::regtest::archive_mount(archive.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
+        .mount(crate::mount::Mount::seed(archive.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
 }
 
 impl crate::component::Validator<ZebraBackend> {
     /// Boot off `snapshot` → sync onward with the network (tip moves past the pin)
     ///
     /// - Private CoW clone of the seed → size the growth past the pin with `.disk(..)`
-    /// - Peers = zebra's own DNS seeders (naming any would replace discovery with that list)
+    /// - Peers = zebra's own DNS seeders
     ///
     /// # Panics
     ///
     /// `snapshot` is a regtest cache (no network to follow)
-    pub fn follow(mut self, snapshot: crate::ChainSnapshot) -> Self {
+    pub fn follow(self, snapshot: crate::ChainSnapshot) -> Self {
+        self.following(snapshot, Seeds::Dns)
+    }
+
+    /// [`follow`](Self::follow), first peers = `peers` (`host:port`) in place of the DNS seeders
+    ///
+    /// - For a node our own reference zebra should feed (egress IP whose public peer slots are
+    ///   taken); gossip from `peers` still reaches the crawler
+    ///
+    /// # Panics
+    ///
+    /// `peers` is empty (`[]` = no seeds at all), or `snapshot` is a regtest cache
+    pub fn follow_from<P: Into<String>>(
+        self,
+        snapshot: crate::ChainSnapshot,
+        peers: impl IntoIterator<Item = P>,
+    ) -> Self {
+        let peers: Vec<String> = peers.into_iter().map(Into::into).collect();
+        assert!(!peers.is_empty(), "follow_from needs at least one peer; [] would seed nothing");
+        self.following(snapshot, Seeds::Peers(peers))
+    }
+
+    fn following(mut self, snapshot: crate::ChainSnapshot, seeds: Seeds) -> Self {
         assert!(
             snapshot.network.is_public(),
             "follow needs a public network; {} is a regtest cache",
@@ -520,11 +542,11 @@ impl crate::component::Validator<ZebraBackend> {
         let toml = public_toml(
             self.opts(),
             snapshot.network,
-            ChainMotion::Following,
+            ChainMotion::Following(seeds),
             ZEBRAD_PUBLIC_CACHE_DIR,
         );
         boot_public(self, toml)
-            .mount(crate::regtest::archive_mount(snapshot.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
+            .mount(crate::mount::Mount::seed(snapshot.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
     }
 }
 
@@ -543,8 +565,8 @@ fn public_toml(
         ZEBRAD_PUBLIC_RPC_PORT,
         cache_dir,
         // Unconditional: zfnd's published images ship the exporter compiled in, and `pod_spec`
-        // declares the port either way (`metrics_enabled` gates a *build* feature, which is a
-        // zaino concern). Gating here left a declared port nothing listened on.
+        // declares the port either way (`metrics_enabled` gates a *dev* build feature only).
+        // Gating here left a declared port nothing listened on.
         ZebraBackend.metrics_port(),
     )
 }
@@ -632,10 +654,9 @@ mod tests {
             network,
             backend: Backend::Zebra,
             artifact: crate::Artifact {
-                name: "zebra-v6.2.3-test.tar.zst",
+                name: "zebra-v6.2.3-test",
                 oid: "0".repeat(64).leak(),
                 size: 1,
-                uncompressed_bytes: 2,
                 base_uri: crate::storage::BASE_URI,
                 key_prefix: crate::storage::KEY_PREFIX,
             },
@@ -730,7 +751,7 @@ sync_estimated_network_tip_height 3506187
         let clones: Vec<_> = opts
             .mounts
             .iter()
-            .filter(|m| matches!(m.kind, crate::MountKind::DirArchive))
+            .filter(|m| matches!(m.kind, crate::MountKind::Seed))
             .map(|m| {
                 (
                     m.destination.clone(),
@@ -752,5 +773,43 @@ sync_estimated_network_tip_height 3506187
         assert_eq!(rpc_port(&opts), ZEBRAD_PUBLIC_RPC_PORT);
         assert!(serves_health(&opts));
         assert_eq!(crate::backends::seed_groups(&opts), vec![crate::materialize::SEED_GID]);
+    }
+
+    /// Same following node as `follow` (restore, clone mount, health) with the seeders swapped
+    /// for the named peers
+    #[test]
+    fn following_from_named_peers_differs_from_follow_only_in_its_seeds() {
+        let snapshot = archive(crate::Network::Mainnet);
+        let toml = |opts: &crate::component::ComponentOpts| {
+            opts.mounts
+                .iter()
+                .find_map(|m| match &m.source {
+                    crate::MountSource::ConfigInline(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .expect("rendered zebrad.toml")
+        };
+        let seeded = crate::component::Validator::zebrad("6.2.3").follow(snapshot).opts;
+        let peered = crate::component::Validator::zebrad("6.2.3")
+            .follow_from(snapshot, ["golden-mainnet-zebra.example.ts.net:8233"])
+            .opts;
+
+        assert!(matches!(peered.restore, Some(RestoreSource::Follow(_))));
+        assert!(serves_health(&peered));
+        assert_eq!(peered.mounts.len(), seeded.mounts.len());
+        let peers = "initial_mainnet_peers = [\"golden-mainnet-zebra.example.ts.net:8233\"]";
+        assert_eq!(
+            toml(&peered).replacen(&format!("\n{peers}"), "", 1),
+            toml(&seeded),
+            "only the peers line differs"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "follow_from needs at least one peer")]
+    fn following_from_no_peers_is_refused() {
+        let snapshot = archive(crate::Network::Mainnet);
+        let _ = crate::component::Validator::zebrad("6.2.3")
+            .follow_from(snapshot, Vec::<String>::new());
     }
 }

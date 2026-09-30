@@ -1,30 +1,26 @@
-//! `ztest snapshot`: publishing chain archives, and the seed cache in `ztest-seeds`.
+//! `ztest snapshot`: publishing chain snapshots, and the seed cache in `ztest-seeds`.
 //!
-//! - `push` packs an archive into resumable segments, uploads it under the packed blob's
-//!   sha256, and prints the record the tree commits — one command, because the record
-//!   describes the *packed* object and nothing can describe it without packing it
+//! - `push` = thin shim over `rclone` (hash tree → SHA256SUMS → upload files, sums last)
 //! - `verify` asserts every declared snapshot resolves. Both are cluster-free
 //! - Seed = `seed-<sha8>-<driver>` PVC filled once from the bucket + paired
 //!   `VolumeSnapshot`; tests clone it copy-on-write (`materialize.rs` / `seeds.rs`)
 //! - Keyed on content *and* driver → `list` reports `DRIVER this|other` and seeds
 //!   for a driver this cluster no longer uses are inert, never selected
-//! - `list` inspects, `prune` reclaims, `warm` pre-populates without a test run
+//! - `list` inspects, `prune` reclaims
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams};
 use kube::{Client, ResourceExt};
 
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
-use ztest::api::progress::StepProgress as _;
 use ztest::api::seeds::SEEDS_NAMESPACE;
+use ztest::api::storage::{KEY_PREFIX, SUMS_FILE, StorageError};
+use ztest_ui::Theme;
 use ztest_ui::template::{Fields, draw};
-use ztest_ui::{Theme, TransferKind};
-
-use crate::progress::LiveStep;
 
 const READY_LABEL: &str = "seeds.ztest.io/ready";
 const DRIVER_LABEL: &str = "seeds.ztest.io/driver";
@@ -36,12 +32,10 @@ const SEED_COL_MAX: usize = 44;
 
 mod tmpl {
     pub(super) const NOTE: &str = "{note|dim}";
-    pub(super) const PUSH_RESULT: &str = "{verb} lfs/{oid} {@dot|dim} {size|bytes.bold}";
-    pub(super) const WARMING: &str = "{entry|dim} warming seed {sha|bold} {@dot|dim} {name}";
-    pub(super) const READY: &str = "{@ok|pass} {name}";
+    pub(super) const PUSH_RESULT: &str = "pushed snap/{oid} {@dot|dim} {size|bytes.bold}";
     pub(super) const PRUNED: &str = "{@ok|pass} pruned {name}";
     pub(super) const PRUNED_ORPHAN: &str = "{@ok|pass} pruned orphan {name}";
-    pub(super) const PRUNE_ERROR: &str = "  {@fail|fail} {detail|dim}";
+    pub(super) const FAIL_DETAIL: &str = "  {@fail|fail} {detail|dim}";
     pub(super) const VERIFY_TALLY: &str =
         "{count|bold} snapshots, all present · read path {endpoints|bold} sound";
 
@@ -78,7 +72,7 @@ fn note(text: &str, theme: &Theme) {
     say(tmpl::NOTE, Fields::new().text("note", text), theme);
 }
 
-/// `{ok} … {name}` row (pruned / pruned orphan / ready differ in wording alone)
+/// `{ok} … {name}` row (pruned / pruned orphan differ in wording alone)
 fn ok_line(src: &str, name: &str, theme: &Theme) {
     say(src, Fields::new().text("name", name), theme);
 }
@@ -93,9 +87,9 @@ fn header_fields() -> Fields<'static> {
         .text("snap", "SNAPSHOT")
 }
 
-/// Non-fatal sweep failure (`prune` carries on → reports, never returns)
-fn prune_error(detail: &str, theme: &Theme) {
-    say_err(tmpl::PRUNE_ERROR, Fields::new().text("detail", detail), theme);
+/// Non-fatal failure (`prune`/`verify` carry on → report, never return)
+fn fail_detail(detail: &str, theme: &Theme) {
+    say_err(tmpl::FAIL_DETAIL, Fields::new().text("detail", detail), theme);
 }
 
 #[derive(Debug, Parser)]
@@ -113,78 +107,33 @@ enum SnapshotCmd {
     /// orphaned cluster-scoped seed-binding VolumeSnapshotContents.
     Prune(PruneArgs),
 
-    /// Pre-materialize one or more local archives into seeds without
-    /// running a test.
-    Warm(WarmArgs),
-
-    /// Pack an archive into resumable segments, upload it under the packed
-    /// blob's content address, and print its manifest to stdout. Idempotent:
-    /// packing is deterministic, so re-pushing lands on the same key.
+    /// Publish a snapshot directory to the bucket and print its manifest.
+    ///
+    /// Hashes every file under DIR into a SHA256SUMS (the sha256 of that file is the
+    /// snapshot's id), uploads the files to `ztest-seeds:snap/<id>/`, uploads SHA256SUMS
+    /// last, then prints the manifest TOML to stdout. Redirect it into
+    /// `snapshots/<network>/<name>.toml` and commit it; progress goes to stderr.
+    ///
+    /// Needs `rclone` on PATH with a `ztest-seeds` remote (setup:
+    /// docs/design-snapshots.md#publishing). Safe to rerun: files already uploaded are
+    /// skipped, so an interrupted push resumes where it stopped.
     Push(PushArgs),
 
-    /// Assert every declared snapshot resolves to an object in the bucket.
-    /// A committed manifest is a claim the bytes exist; this is what checks it.
+    /// Check every declared snapshot is published and readable without credentials:
+    /// its SHA256SUMS must exist on the public read path and hash to the manifest's
+    /// `sha256`. Then check each read endpoint serves seed keys only and refuses writes.
     Verify,
-
-    /// Store the credentials `push` uploads with. Optional: pulling seeds needs
-    /// none, so only someone publishing a fixture ever runs this.
-    #[command(subcommand)]
-    Config(ConfigCmd),
-}
-
-#[derive(Debug, Subcommand)]
-enum ConfigCmd {
-    /// Write the push credentials, prompting for anything not passed as a flag.
-    /// Stored as `[bucket]` in `clusters.toml` (written `0600`), replacing any
-    /// previous credentials; cluster profiles are left untouched.
-    Set(ConfigSetArgs),
-
-    /// Print the stored settings with the secret key redacted.
-    Show,
-
-    /// Print the config file's path and exit.
-    Path,
-}
-
-#[derive(Debug, Parser)]
-struct ConfigSetArgs {
-    /// S3 API endpoint, e.g. `https://<account-id>.r2.cloudflarestorage.com`.
-    #[arg(long)]
-    endpoint: Option<String>,
-
-    /// Bucket holding the snapshot objects.
-    #[arg(long)]
-    bucket: Option<String>,
-
-    /// Access key id from an R2 API token with object write permission.
-    #[arg(long)]
-    access_key_id: Option<String>,
-
-    /// Secret access key. Prompted for without echo when omitted; pass `-` to
-    /// read it from stdin, which is how CI should supply it.
-    #[arg(long)]
-    secret_access_key: Option<String>,
-
-    /// Signing region. R2 ignores it and wants `auto`, which is the default.
-    #[arg(long)]
-    region: Option<String>,
 }
 
 #[derive(Debug, Parser)]
 struct PushArgs {
-    /// Archive to publish. Re-packed into resumable segments first, so the
-    /// object's SHA-256 is the packed blob's, not this file's.
-    archive: PathBuf,
+    /// Snapshot directory, e.g. a synced zebra state cache. Every file under it is
+    /// published; paths may only use `A-Z a-z 0-9 . _ -` and `/`.
+    dir: PathBuf,
 
-    /// Where to write the packed intermediate. Needs room for a second copy of
-    /// the archive; defaults to the archive's own directory.
+    /// Snapshot name recorded in the manifest, e.g. `zebra-6.2.3-orchard-testnet`.
     #[arg(long)]
-    pack_dir: Option<PathBuf>,
-
-    /// zstd level for the re-compression. Chain trees are already-compressed
-    /// SSTs, so the default trades the last few percent for speed.
-    #[arg(long, default_value_t = ztest::api::storage::pack::DEFAULT_LEVEL)]
-    level: i32,
+    name: String,
 }
 
 #[derive(Debug, Parser)]
@@ -198,162 +147,211 @@ struct PruneArgs {
     shas: Vec<String>,
 }
 
-#[derive(Debug, Parser)]
-struct WarmArgs {
-    /// Archive file(s) to materialize. Treated as compressed tar
-    /// archives (extracted into the seed); content-addressed by hash.
-    #[arg(required = true)]
-    archives: Vec<PathBuf>,
-}
-
 pub fn execute(args: Args) -> ExitCode {
     super::block_on("snapshot", super::Rt::Current, async {
-        // `manifest` touches only the file, `verify` only the public read path, `push` the
-        // bucket. None needs a cluster: connecting first would make publishing a fixture
-        // require one to be up
+        // `push` touches only the bucket, `verify` only the public read path: neither needs
+        // a cluster (connecting first would make publishing require one to be up)
         match args.cmd {
             SnapshotCmd::Push(p) => return push(&p).await,
             SnapshotCmd::Verify => return verify().await,
-            SnapshotCmd::Config(c) => return config(c).await,
             _ => {}
         }
         let client = ztest::api::cluster::client().await.context("connecting to cluster")?;
         match args.cmd {
             SnapshotCmd::List => list(&client).await,
             SnapshotCmd::Prune(p) => prune(&client, &p).await,
-            SnapshotCmd::Warm(w) => warm(&client, &w).await,
-            SnapshotCmd::Push(_) | SnapshotCmd::Verify | SnapshotCmd::Config(_) => {
-                unreachable!("handled above")
-            }
+            SnapshotCmd::Push(_) | SnapshotCmd::Verify => unreachable!("handled above"),
         }
     })
 }
 
-/// Derive `archive`'s manifest and print it.
-///
-/// stdout carries the TOML alone, so it redirects straight into the tree; where it belongs
-/// goes to stderr, because a hand-picked filename disagreeing with the content is exactly
-/// what the declaration exists to prevent
-fn file_name(archive: &std::path::Path) -> Result<String> {
-    archive
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .with_context(|| format!("{} has no filename", archive.display()))
+// ─────────────────────────── push ───────────────────────────
+
+/// rclone alias → `<r2-remote>:<bucket>`; ztest holds no credentials, rclone's config does
+const REMOTE: &str = "ztest-seeds";
+const SETUP_DOC: &str = "docs/design-snapshots.md#publishing";
+
+/// Multi-hour uploads over a flaky link (rerun = resume: rclone skips what landed)
+const UPLOAD_FLAGS: &[&str] = &[
+    "--transfers",
+    "8",
+    "--checkers",
+    "16",
+    "--retries",
+    "20",
+    "--retries-sleep",
+    "30s",
+    "--low-level-retries",
+    "100",
+    "--timeout",
+    "5m",
+    "--contimeout",
+    "1m",
+    "--stats",
+    "30s",
+    "--stats-one-line",
+    "--stats-log-level",
+    "NOTICE",
+];
+
+/// Hash, upload files, upload SHA256SUMS last, print the manifest (stdout = TOML only)
+async fn push(args: &PushArgs) -> Result<()> {
+    let theme = Theme::detect();
+    if !args.dir.is_dir() {
+        bail!("{} is not a directory", args.dir.display());
+    }
+    if !valid_segment(&args.name) {
+        bail!("--name {:?}: use only A-Z a-z 0-9 . _ -", args.name);
+    }
+    let scratch = Scratch::new()?;
+    let hashsum = scratch.0.join("hashsum");
+    note_err("hashing", &theme);
+    rclone(&["hashsum", "sha256", "--checkers", "16", "--output-file"], &[&hashsum, &args.dir])
+        .await?;
+    let listed = std::fs::read_to_string(&hashsum).context("reading rclone hashsum output")?;
+    let sums = Sums::parse(&listed)?;
+    let size = sums.tree_size(&args.dir)?;
+    let text = sums.text();
+    let oid = ztest::api::storage::oid_of(text.as_bytes());
+    let (sums_path, files) = (scratch.0.join(SUMS_FILE), scratch.0.join("files"));
+    std::fs::write(&sums_path, &text).context("writing SHA256SUMS")?;
+    std::fs::write(&files, sums.relpaths()).context("writing file list")?;
+
+    let dest = format!("{REMOTE}:{KEY_PREFIX}/{oid}");
+    note_err(&format!("uploading {} files to {dest}", sums.0.len()), &theme);
+    // Exactly the hashed set (a file added since hashing never publishes)
+    let copy = [&["copy"][..], UPLOAD_FLAGS, &["--files-from-raw"]].concat();
+    rclone(&copy, &[&files, &args.dir, Path::new(&dest)]).await?;
+    let copyto = [&["copyto"][..], UPLOAD_FLAGS].concat();
+    rclone(&copyto, &[&sums_path, Path::new(&format!("{dest}/{SUMS_FILE}"))]).await?;
+
+    say_err(
+        tmpl::PUSH_RESULT,
+        Fields::new().text("oid", oid.as_str()).value("size", size as f64),
+        &theme,
+    );
+    print!("{}", manifest_toml(&args.name, &oid, size));
+    Ok(())
 }
 
-/// The record a published blob is addressed by. Derived from the *packed* bytes — the
-/// source archive is an input to publishing, never the thing that gets published
-fn manifest_toml(name: &str, packed: &ztest::api::storage::pack::Packed) -> String {
+fn note_err(text: &str, theme: &Theme) {
+    say_err(tmpl::NOTE, Fields::new().text("note", text), theme);
+}
+
+/// The record `artifact!` bakes; `sha256` = oid of the tree's SHA256SUMS
+fn manifest_toml(name: &str, oid: &str, size_bytes: u64) -> String {
     format!(
-        "# Generated by `ztest snapshot push` — do not hand-edit.\n\
-         #\n\
-         # The archive itself is not in the tree; these values are how it is located,\n\
-         # addressed, sized, and verified. Chain facts live at the declaration in\n\
-         # src/snapshots.rs.\n\
-         name               = {name:?}\n\
-         sha256             = {:?}\n\
-         size_bytes         = {}\n\
-         uncompressed_bytes = {}\n\
-         base_uri           = {:?}\n\
-         key_prefix         = {:?}\n",
-        packed.sha256,
-        packed.size_bytes,
-        packed.uncompressed_bytes,
+        "# Generated by `ztest snapshot push` — do not hand-edit\n\
+         name       = {name:?}\n\
+         sha256     = {oid:?}\n\
+         size_bytes = {size_bytes}\n\
+         base_uri   = {:?}\n\
+         key_prefix = {KEY_PREFIX:?}\n",
         ztest::api::storage::BASE_URI,
-        ztest::api::storage::KEY_PREFIX,
     )
 }
 
-/// Packed blob and the path it lives at until the caller is done with it
-struct PackedBlob {
-    blob: ztest::api::storage::pack::Packed,
-    path: PathBuf,
+/// `rclone <args> <paths>`: stdout → our stderr (stdout carries the manifest alone)
+async fn rclone(args: &[&str], paths: &[&Path]) -> Result<()> {
+    let status = tokio::process::Command::new("rclone")
+        .args(args)
+        .args(paths)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(std::io::stderr()))
+        .status()
+        .await
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow!("rclone not found on PATH — install it and set up `{REMOTE}` ({SETUP_DOC})")
+            }
+            _ => anyhow!("spawning rclone: {e}"),
+        })?;
+    match status.success() {
+        true => Ok(()),
+        false => Err(anyhow!(
+            "`rclone {}` failed ({status}) — is the `{REMOTE}` remote configured? ({SETUP_DOC})",
+            args[0]
+        )),
+    }
 }
 
-impl Drop for PackedBlob {
-    /// The intermediate is the size of the archive again; leaving one behind on a 245 GiB
-    /// seed is not a tidiness problem
+/// Temp dir for rclone's hashsum output, SHA256SUMS and the file list; removed on drop
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!("ztest-push-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        Ok(Scratch(dir))
+    }
+}
+
+impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-/// Re-emit `archive` as segments next to it (or in `dir`).
-///
-/// Published name must stay `.tar.zst`: the packer always writes zstd frames, so any other
-/// suffix would tell the puller to decompress the object the wrong way
-fn pack_to_temp(
-    archive: &std::path::Path,
-    dir: Option<&std::path::Path>,
-    level: i32,
-    step: &LiveStep,
-) -> Result<PackedBlob> {
-    let name = file_name(archive)?;
-    if !name.ends_with(".tar.zst") {
-        return Err(anyhow!("{name}: publish a .tar.zst — the packer writes zstd frames"));
+/// SHA256SUMS lines `(sha256 hex, relpath)`, bytewise-sorted by relpath
+#[derive(Debug, PartialEq, Eq)]
+struct Sums(Vec<(String, String)>);
+
+impl Sums {
+    /// `rclone hashsum sha256` output → the canonical line set.
+    ///
+    /// - relpaths = Worker-servable keys only (`[A-Za-z0-9._-]` segments, no `.`/`..`/empty)
+    /// - root `SHA256SUMS` rejected (its key is the checksum file's)
+    fn parse(hashsum: &str) -> Result<Sums> {
+        let mut lines = Vec::new();
+        for line in hashsum.lines().filter(|l| !l.is_empty()) {
+            let (hash, rel) = line
+                .split_once("  ")
+                .with_context(|| format!("unparseable hashsum line {line:?}"))?;
+            let hash = hash.to_ascii_lowercase();
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                bail!("{rel}: {hash:?} is not a sha256");
+            }
+            if !rel.split('/').all(valid_segment) || rel == SUMS_FILE {
+                bail!("{rel:?}: not publishable (segments of A-Z a-z 0-9 . _ -, not {SUMS_FILE})");
+            }
+            lines.push((hash, rel.to_string()));
+        }
+        if lines.is_empty() {
+            bail!("empty tree: nothing to publish");
+        }
+        lines.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+        if let Some(w) = lines.windows(2).find(|w| w[0].1 == w[1].1) {
+            bail!("{} listed twice", w[0].1);
+        }
+        Ok(Sums(lines))
     }
-    let dir = dir
-        .map(std::path::Path::to_path_buf)
-        .or_else(|| archive.parent().map(std::path::Path::to_path_buf))
-        .unwrap_or_default();
-    let path = dir.join(format!(".{name}.ztest-pack"));
-    let blob = ztest::api::storage::pack::pack(archive, &path, level, step)
-        .with_context(|| format!("packing {}", archive.display()))?;
-    Ok(PackedBlob { blob, path })
+
+    /// Exact coreutils `sha256sum` format (`sha256sum -c` in the puller reads it)
+    fn text(&self) -> String {
+        self.0.iter().map(|(hash, rel)| format!("{hash}  {rel}\n")).collect()
+    }
+
+    fn relpaths(&self) -> String {
+        self.0.iter().map(|(_, rel)| format!("{rel}\n")).collect()
+    }
+
+    fn tree_size(&self, dir: &Path) -> Result<u64> {
+        self.0.iter().try_fold(0u64, |sum, (_, rel)| {
+            let len =
+                std::fs::metadata(dir.join(rel)).with_context(|| format!("stat {rel}"))?.len();
+            Ok(sum + len)
+        })
+    }
 }
 
-/// Upload `archive` under its own content address. Idempotent by construction — the key
-/// *is* the content, so re-pushing identical bytes is a no-op
-async fn push(args: &PushArgs) -> Result<()> {
-    let theme = Theme::detect();
-    let label = args
-        .archive
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| args.archive.display().to_string());
-    // - one row across both phases (hash + upload = one push to a watcher)
-    // - stage note marks the crossing
-    let step = LiveStep::new(label, TransferKind::Upload);
-    let result = push_reporting(args, &step, &theme).await;
-    step.finish();
-    result
+fn valid_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// Pack, upload, and print the record the tree commits.
-///
-/// stdout carries the TOML alone (it redirects straight into `snapshots/`), so every other
-/// line here goes to stderr — same contract `manifest` has always had
-async fn push_reporting(args: &PushArgs, step: &LiveStep, theme: &Theme) -> Result<()> {
-    let name = file_name(&args.archive)?;
-    let packed = pack_to_temp(&args.archive, args.pack_dir.as_deref(), args.level, step)?;
-    let (oid, total) = (packed.blob.sha256.clone(), packed.blob.size_bytes);
-    let result = |verb| {
-        say_err(
-            tmpl::PUSH_RESULT,
-            Fields::new().text("verb", verb).text("oid", oid.as_str()).value("size", total as f64),
-            theme,
-        )
-    };
-    let bucket = crate::bucket::Bucket::resolve()?;
-    // Packing is deterministic, so re-publishing an archive lands on the key already there
-    if !bucket.has(&oid, total).await? {
-        step.note("uploading");
-        bucket.put(&oid, total, &packed.path, &mut |sent| step.bytes(sent, total)).await?;
-        step.finish();
-        result("pushed");
-    } else {
-        step.finish();
-        result("already present:");
-    }
-    let segments = packed.blob.segments.len();
-    say_err(
-        tmpl::NOTE,
-        Fields::new().text("note", format!("{segments} resumable segments")),
-        theme,
-    );
-    print!("{}", manifest_toml(&name, &packed.blob));
-    Ok(())
-}
+// ─────────────────────────── seed cache ───────────────────────────
 
 fn volume_snapshot_ar() -> ApiResource {
     ApiResource::from_gvk(&GroupVersionKind {
@@ -469,7 +467,7 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<()> {
         match pod_api.delete(&uploader, &dp).await {
             Ok(_) => {}
             Err(kube::Error::Api(e)) if e.code == 404 => {}
-            Err(e) => prune_error(&format!("uploader pod {uploader}: {e}"), &theme),
+            Err(e) => fail_detail(&format!("uploader pod {uploader}: {e}"), &theme),
         }
         // Snapshot next → its content releases before the PVC
         match snap_api.delete(name, &dp).await {
@@ -497,7 +495,7 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<()> {
                 match vsc_api.delete(&n, &dp).await {
                     Ok(_) => ok_line(tmpl::PRUNED_ORPHAN, &n, &theme),
                     Err(kube::Error::Api(e)) if e.code == 404 => {}
-                    Err(e) => prune_error(&format!("{n}: {e}"), &theme),
+                    Err(e) => fail_detail(&format!("{n}: {e}"), &theme),
                 }
             }
         }
@@ -505,62 +503,29 @@ async fn prune(client: &Client, args: &PruneArgs) -> Result<()> {
     Ok(())
 }
 
-/// Pre-provision seeds for the named archives.
-///
-/// The archive is hashed locally ([`identity_of`]) to learn its oid — the bytes then come
-/// from the bucket, never from this file. So it needs the archive present, unlike the
-/// `artifact!` path a test uses, which reads the oid out of a committed manifest
-async fn warm(client: &Client, args: &WarmArgs) -> Result<()> {
-    let theme = Theme::detect();
-    for archive in &args.archives {
-        let (name, digest) = ztest::archive::identity_of(archive)?;
-        let entry = ztest::api::inventory::SeedEntry {
-            name,
-            oid: digest.sha256,
-            size: digest.size_bytes,
-            uncompressed_bytes: digest.uncompressed_bytes,
-            payload: ztest::api::inventory::SeedPayload::Archive,
-            base_uri: ztest::api::storage::BASE_URI.to_string(),
-            key_prefix: ztest::api::storage::KEY_PREFIX.to_string(),
-        };
-        say_err(
-            tmpl::WARMING,
-            Fields::new()
-                .text("entry", theme.chars.entry)
-                .text("sha", ztest::api::storage::seed_sha8(&entry.oid))
-                .text("name", entry.name.as_str()),
-            &theme,
-        );
-        // Name comes back on the handle: only `provision_seed` knows the driver half
-        let step = LiveStep::new(entry.name.clone(), TransferKind::Seed);
-        let handle = ztest::api::materialize::provision_seed(client, &entry, &step).await;
-        step.finish();
-        let handle = handle.with_context(|| format!("materializing {}", entry.name))?;
-        ok_line(tmpl::READY, &handle.seed_pvc, &theme);
-    }
-    Ok(())
-}
+// ─────────────────────────── verify ───────────────────────────
 
-/// Every declared snapshot's bytes must be reachable on the read path.
+/// Every declared snapshot must be readable on the public read path.
 ///
-/// The lockfile integrity check: committing a manifest claims an object exists, and
-/// nothing else enforces that the `push` happened. `HEAD` per object, no transfer.
-///
-/// Deliberately unauthenticated: it checks the URL consumers actually fetch, so it
-/// catches a blob that exists but is unreadable — and it runs for someone who has never
-/// configured a credential
-///
-/// Then the endpoint itself, once per distinct `base_uri`: a non-seed key must 404 and a
-/// write must be refused. Presence says the bytes are there; these say the thing serving
-/// them is still the read-only seed path and not, say, public bucket access restored by hand
+/// - Committed manifest = claim the tree exists; nothing else enforces that `push` finished
+/// - One GET of SHA256SUMS per snapshot, checked against the oid (no transfer, no credentials)
+/// - Then each distinct `base_uri`: non-seed key must 404, a write must be refused
 async fn verify() -> Result<()> {
     let theme = Theme::detect();
     let mut missing = 0usize;
     for snapshot in ztest::snapshots::ALL {
         let a = &snapshot.artifact;
-        let present = ztest::api::storage::blob_present(&a.blob_url(), a.size, VERIFY_TIMEOUT)
-            .await
-            .with_context(|| format!("checking {}", a.name))?;
+        let found =
+            ztest::api::storage::sums_present(a.base_uri, a.key_prefix, a.oid, VERIFY_TIMEOUT)
+                .await;
+        let present = match found {
+            Ok(present) => present,
+            Err(e @ StorageError::Mismatch { .. }) => {
+                fail_detail(&e.to_string(), &theme);
+                false
+            }
+            Err(e) => return Err(e).with_context(|| format!("checking {}", a.name)),
+        };
         let (mark, tone) = match present {
             true => (theme.chars.ok, "pass"),
             false => (theme.chars.warn, "fail"),
@@ -608,17 +573,16 @@ async fn verify() -> Result<()> {
         }
         (0, n) => Err(anyhow!("{n}/{} read endpoints unsound", endpoints.len())),
         (n, _) => Err(anyhow!(
-            "{n}/{} declared snapshots absent from the bucket",
+            "{n}/{} declared snapshots absent from the bucket or corrupt",
             ztest::snapshots::ALL.len(),
         )),
     }
 }
 
-/// The read path serves seeds and nothing else. `Err` carries what it did instead.
+/// Read path serves seeds and nothing else. `Err` carries what it did instead.
 ///
-/// The write probe targets a well-formed but unused oid, never a declared artifact. This
-/// check only does anything when the endpoint turns out to be writable — and aimed at a real
-/// seed, that is exactly the case where it would overwrite one with its own probe body
+/// Write probe targets an unused oid, never a declared one (a writable endpoint would
+/// otherwise have a real snapshot's SHA256SUMS overwritten by the probe body)
 async fn endpoint_is_sound(base: &str) -> Result<(), String> {
     let only_seeds = ztest::api::storage::serves_only_seeds(base, VERIFY_TIMEOUT)
         .await
@@ -626,8 +590,7 @@ async fn endpoint_is_sound(base: &str) -> Result<(), String> {
     if !only_seeds {
         return Err("a non-seed key did not 404 — endpoint exposes the whole bucket".into());
     }
-    let scratch =
-        ztest::api::storage::blob_url(base, ztest::api::storage::KEY_PREFIX, &"0".repeat(64));
+    let scratch = ztest::api::storage::sums_url(base, KEY_PREFIX, &"0".repeat(64));
     let read_only = ztest::api::storage::refuses_writes(&scratch, VERIFY_TIMEOUT)
         .await
         .map_err(|e| e.to_string())?;
@@ -640,97 +603,6 @@ async fn endpoint_is_sound(base: &str) -> Result<(), String> {
 /// Bounded per object: `verify` walks every declared snapshot, and a wrong base_uri hangs
 /// on connect rather than failing
 const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// `ztest snapshot config` — the only way credentials enter ztest.
-async fn config(cmd: ConfigCmd) -> Result<()> {
-    let theme = Theme::detect();
-    match cmd {
-        ConfigCmd::Path => {
-            println!("{}", crate::bucket::credentials_path().display());
-            Ok(())
-        }
-        ConfigCmd::Show => match crate::bucket::load_credentials()? {
-            Some(c) => {
-                println!("{}", crate::bucket::credentials_path().display());
-                println!("{}", c.redacted());
-                Ok(())
-            }
-            None => Err(anyhow!(
-                "no credentials at {} — run `ztest snapshot config set`",
-                crate::bucket::credentials_path().display()
-            )),
-        },
-        ConfigCmd::Set(a) => {
-            let c = ztest::api::cluster_config::BucketCredentials {
-                endpoint: ask(a.endpoint, "S3 endpoint")?,
-                bucket: ask(a.bucket, "bucket")?,
-                access_key_id: ask(a.access_key_id, "access key id")?,
-                secret_access_key: ask_secret(a.secret_access_key)?,
-                region: a.region,
-            };
-            let path = crate::bucket::store_credentials(c)?;
-            say(
-                tmpl::READY,
-                Fields::new().text("name", format!("credentials written to {}", path.display())),
-                &theme,
-            );
-            // Prove them now. A typo otherwise surfaces at the end of a multi-hour push,
-            // and the file is written either way — the target bucket may not exist yet
-            note("checking them against the bucket", &theme);
-            match check_credentials().await {
-                Ok(()) => {
-                    ok_line(tmpl::READY, "credentials accepted by the bucket", &theme);
-                    Ok(())
-                }
-                Err(why) => Err(why.context(format!(
-                    "credentials saved to {}, but the bucket rejected them",
-                    path.display()
-                ))),
-            }
-        }
-    }
-}
-
-/// One authenticated round trip against a key that is *declared*, so a `false` means the
-/// credentials read a bucket that is not the fixture store — not merely that some key is
-/// absent. Signing, endpoint, and bucket name are all exercised
-async fn check_credentials() -> Result<()> {
-    let a = ztest::snapshots::SAPLING_TESTNET.artifact;
-    match crate::bucket::Bucket::resolve()?.has(a.oid, a.size).await? {
-        true => Ok(()),
-        false => Err(anyhow!("{} is not in this bucket — wrong bucket or endpoint?", a.name)),
-    }
-}
-
-/// Flag, else prompt. A missing value is a question, not an error — `config set` with no
-/// flags at all is the interactive path
-fn ask(given: Option<String>, label: &str) -> Result<String> {
-    match given {
-        Some(v) => Ok(v),
-        None => dialoguer::Input::new()
-            .with_prompt(label)
-            .interact_text()
-            .with_context(|| format!("reading {label}")),
-    }
-}
-
-/// - `-` reads stdin, so CI pipes a secret in without it reaching argv or the environment
-/// - otherwise prompt without echo; a secret typed at a prompt is not in shell history
-fn ask_secret(given: Option<String>) -> Result<String> {
-    match given.as_deref() {
-        Some("-") => {
-            let mut buf = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                .context("reading the secret from stdin")?;
-            Ok(buf.trim().to_string())
-        }
-        Some(v) => Ok(v.to_string()),
-        None => dialoguer::Password::new()
-            .with_prompt("secret access key")
-            .interact()
-            .context("reading the secret access key"),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -770,5 +642,56 @@ mod tests {
             column(&row("48Gi"), "GiB").map(|c| c + 3)
         );
         assert_eq!(column(&head, "DRIVER"), column(&row("48Gi"), "this"));
+    }
+
+    const H1: &str = "98ea6e4f216f2fb4b69fff9b3a44842c38686ca685f3f55dc48c5d3fb1107be4";
+    const H2: &str = "68a3064ec1d3caa270e21494c5f15f47431188c4d670c894656ba42e40c1ca8d";
+
+    /// rclone lists in walk order; the oid needs one canonical byte string
+    #[test]
+    fn hashsum_output_normalises_to_bytewise_sorted_sha256sum_lines() {
+        let listed = format!("{H1}  x.txt\n{H2}  a/b/big.sst\n{H1}  B.txt\n");
+        let sums = Sums::parse(&listed).expect("parses");
+        assert_eq!(sums.text(), format!("{H1}  B.txt\n{H2}  a/b/big.sst\n{H1}  x.txt\n"));
+        assert_eq!(sums.relpaths(), "B.txt\na/b/big.sst\nx.txt\n");
+    }
+
+    /// Same tree, any listing order → same oid
+    #[test]
+    fn the_oid_does_not_depend_on_listing_order() {
+        let a = Sums::parse(&format!("{H1}  a\n{H2}  b/c\n")).expect("a");
+        let b = Sums::parse(&format!("{H2}  b/c\n{H1}  a\n")).expect("b");
+        assert_eq!(
+            ztest::api::storage::oid_of(a.text().as_bytes()),
+            ztest::api::storage::oid_of(b.text().as_bytes())
+        );
+    }
+
+    /// Anything the Worker would refuse to serve (or the puller could mis-cut) never publishes
+    #[test]
+    fn unservable_relpaths_are_rejected() {
+        for rel in ["a//b", "../x", "a/./b", "sp ace", "SHA256SUMS", "a/b/", "é"] {
+            assert!(Sums::parse(&format!("{H1}  {rel}\n")).is_err(), "{rel:?} accepted");
+        }
+        assert!(Sums::parse(&format!("{H1}  sub/SHA256SUMS\n")).is_ok());
+    }
+
+    #[test]
+    fn an_empty_tree_or_a_bad_digest_is_rejected() {
+        assert!(Sums::parse("").is_err());
+        assert!(Sums::parse("abc  a\n").is_err());
+        assert!(Sums::parse(&format!("{H1}  a\n{H2}  a\n")).is_err(), "duplicate relpath");
+    }
+
+    /// `artifact!` reads exactly these keys; `uncompressed_bytes` would fail compilation
+    #[test]
+    fn the_manifest_carries_exactly_the_artifact_keys() {
+        let toml = manifest_toml("zebra-6.2.3-orchard-testnet", H1, 42);
+        let doc: toml::Table = toml::from_str(&toml).expect("valid TOML");
+        let mut keys: Vec<&str> = doc.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["base_uri", "key_prefix", "name", "sha256", "size_bytes"]);
+        assert_eq!(doc["key_prefix"].as_str(), Some(KEY_PREFIX));
+        assert_eq!(doc["size_bytes"].as_integer(), Some(42));
     }
 }

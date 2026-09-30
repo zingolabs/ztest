@@ -23,12 +23,12 @@ const RESTART_POLL: Duration = Duration::from_millis(500);
 /// Kill exec's own budget (container teardown can cut the session, never hang it)
 const KILL_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// SIGKILL the container's main process from inside the pod.
+/// Signal `$1` (`KILL`, `STOP`, `CONT`) to the container's main process from inside the pod.
 ///
 /// - Needs `shareProcessNamespace` (PID 1 = pause; own-namespace init ignores SIGKILL)
 /// - Main = earliest-started process parented outside the namespace (exec sessions start later
 ///   and die with the container they joined)
-const KILL_MAIN: &str = r#"self=$$ best= bstart=
+const SIGNAL_MAIN: &str = r#"sig=$1 self=$$ best= bstart=
 for d in /proc/[0-9]*; do
   p=${d#/proc/}
   if [ "$p" = 1 ] || [ "$p" = "$self" ]; then continue; fi
@@ -39,7 +39,7 @@ for d in /proc/[0-9]*; do
   if [ -z "$best" ] || [ "${20}" -lt "$bstart" ]; then best=$p bstart=${20}; fi
 done
 [ -n "$best" ] || { echo "no main process in a shared process namespace" >&2; exit 3; }
-kill -9 "$best""#;
+kill -s "$sig" "$best""#;
 
 /// One finished exec. `status` = the command's exit code
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,8 +84,8 @@ pub enum PodError {
          declare `.restartable()` on the component"
     )]
     NotRestartable { pod: String, policy: String, shared: bool },
-    #[error("{pod}: kill: {reason}")]
-    Kill { pod: String, reason: String },
+    #[error("{pod}: SIG{signal}: {reason}")]
+    Signal { pod: String, signal: &'static str, reason: String },
     #[error("{pod}: not back within {after:?} of the kill ({last:?})")]
     RestartTimeout { pod: String, after: Duration, last: Option<ContainerSample> },
 }
@@ -218,24 +218,45 @@ impl ComponentPod {
     /// SIGKILL the main process, returning the pre-kill sample to wait against.
     ///
     /// - Refuses a pod not rendered restartable (the kill would end the pod for good)
-    /// - Exec session may die with the container → a lost stream is not a failed kill
+    /// - Kills a [`freeze`](Self::freeze)d process too (SIGKILL ends a stopped one)
     pub async fn kill(&self) -> Result<ContainerSample, PodError> {
         self.ensure_restartable().await?;
         let before = self.sample().await?;
-        match self.exec(&["sh", "-c", KILL_MAIN], KILL_EXEC_TIMEOUT).await {
-            Ok(out) if out.success() => {}
-            Ok(out) => {
-                return Err(PodError::Kill {
-                    pod: self.name.clone(),
-                    reason: format!("exit {}: {}", out.status, out.stderr.trim()),
-                });
-            }
-            Err(PodError::Exec { reason, .. }) => {
-                tracing::debug!(pod = %self.name, %reason, "kill exec cut short by teardown");
-            }
-            Err(e) => return Err(e),
-        }
+        self.signal_main("KILL").await?;
         Ok(before)
+    }
+
+    /// SIGSTOP the main process: stalled, no exit → no restart, until [`thaw`](Self::thaw) (same
+    /// process resumes) or [`kill`](Self::kill) (restart)
+    ///
+    /// - Holds a component down for a known span (kubelet restarts a first crash at once)
+    /// - Restartable render required (shared PID namespace + a way back via kill)
+    pub async fn freeze(&self) -> Result<(), PodError> {
+        self.ensure_restartable().await?;
+        self.signal_main("STOP").await
+    }
+
+    /// SIGCONT a [`freeze`](Self::freeze)d main process (state intact, no restart counted)
+    pub async fn thaw(&self) -> Result<(), PodError> {
+        self.ensure_restartable().await?;
+        self.signal_main("CONT").await
+    }
+
+    /// Exec session may die with the container → a lost stream is not a failed signal
+    async fn signal_main(&self, signal: &'static str) -> Result<(), PodError> {
+        match self.exec(&["sh", "-c", SIGNAL_MAIN, "sh", signal], KILL_EXEC_TIMEOUT).await {
+            Ok(out) if out.success() => Ok(()),
+            Ok(out) => Err(PodError::Signal {
+                pod: self.name.clone(),
+                signal,
+                reason: format!("exit {}: {}", out.status, out.stderr.trim()),
+            }),
+            Err(PodError::Exec { reason, .. }) => {
+                tracing::debug!(pod = %self.name, %reason, signal, "signal exec cut short");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Wait until the container restarted past `before` and reports Ready again
@@ -266,8 +287,8 @@ impl ComponentPod {
 
     /// [`kill`](Self::kill) + [`await_restart`](Self::await_restart).
     ///
-    /// - `timeout` must cover kubelet's crash backoff (10 s first, doubling per kill within
-    ///   10 min, 5 min cap) + the component's own reopen
+    /// - `timeout` must cover kubelet's crash backoff (first restart immediate, then 10 s doubling
+    ///   per kill within 10 min, 5 min cap) + the component's own reopen
     pub async fn kill_and_await_restart(&self, timeout: Duration) -> Result<Restart, PodError> {
         let started = tokio::time::Instant::now();
         let before = self.kill().await?;
@@ -420,9 +441,9 @@ mod tests {
     }
 
     #[test]
-    fn kill_script_parses_under_posix_sh() {
+    fn signal_script_parses_under_posix_sh() {
         let out = std::process::Command::new("sh")
-            .args(["-n", "-c", KILL_MAIN])
+            .args(["-n", "-c", SIGNAL_MAIN])
             .output()
             .expect("spawn sh");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

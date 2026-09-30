@@ -72,7 +72,7 @@ Both accept the builder chain + an optional Rust-version selector ([matrix](#mul
 ```rust
 let zai = t.add(dev!(Indexer::Zaino, "../packages/zainod/Dockerfile")
     .named("zaino-dev")
-    .mount(mount_archive!("tests/assets/zaino-100blocks.tar.zst", "/state")));
+    .mount(Mount::seed(MY_CHAIN.artifact, "/state")));
 ```
 
 Dockerfile/`git`/`rev`/`context` fold into a content-addressed `<repo>:dev-<hash>` tag → identical `dev!`
@@ -97,17 +97,19 @@ pub struct Mount { pub source: MountSource, pub destination: PathBuf, pub kind: 
 pub enum MountSource {
     ConfigAbs(PathBuf),    // mount_config!
     ConfigInline(String),  // generated config bytes (regtest_conf)
-    Seed(Artifact),        // mount_file! and mount_archive!
+    Seed(Artifact),        // Mount::seed
     Empty,                 // Mount::scratch
 }
-pub enum MountKind { Config, File, DirArchive, Scratch }
+pub enum MountKind { Config, Seed, Scratch }
 ```
 
-| Macro                      | Materialized as                                        | Templated | Compile-time rules                  |
-| -------------------------- | ------------------------------------------------------ | --------- | ----------------------------------- |
-| `mount_config!(rel, dst)`  | `ConfigMap` at `dst`                                   | Yes       | Must exist, UTF-8, < 1 MiB          |
-| `mount_file!(rel, dst)`    | Content-addressed single-file PVC                      | No        | Must exist                          |
-| `mount_archive!(rel, dst)` | Content-addressed extracted-tar PVC; CoW clone per use | No        | Must exist (`.tar.zst` recommended) |
+| Constructor                     | Materialized as                                   | Rules                                  |
+| ------------------------------- | ------------------------------------------------- | -------------------------------------- |
+| `mount_config!(rel, dst)`       | `ConfigMap` at `dst`                              | Must exist, UTF-8, < 1 MiB (compile)   |
+| `Mount::seed(artifact, dst)`    | Seed PVC of the snapshot tree; CoW clone per use  | Declare with `#[ztest::needs(CONST)]`  |
+| `Mount::scratch(dst)`           | Per-pod `emptyDir`                                | —                                      |
+
+A seed's `Artifact` comes from a manifest via `artifact!` ([design-snapshots.md](design-snapshots.md)).
 
 ## Handles and endpoints
 
@@ -160,7 +162,7 @@ let mut client = LightwalletdClient::new(channel);
 
 ```rust
 let alice = t.add(Validator::zebrad("1.9.1").named("alice")
-    .mount(mount_archive!("tests/assets/zebrad-100blocks.tar.zst", "/data")));
+    .mount(Mount::seed(ZEBRAD_100.artifact, "/data")));
 let bob = t.add(Validator::zebrad("1.9.1").named("bob"));
 t.peer(&alice, &bob);
 ```
@@ -171,10 +173,8 @@ Standard [rstest]; each `#[case]` becomes its own nextest target.
 
 ```rust
 #[rstest]
-#[case::zebrad(Validator::zebrad("1.9.1"),
-               mount_archive!("tests/assets/zebrad-100blocks.tar.zst", "/data"))]
-#[case::zcashd(Validator::zcashd("6.4.1"),
-               mount_archive!("tests/assets/zcashd-100blocks.tar.zst", "/data"))]
+#[case::zebrad(Validator::zebrad("1.9.1"), Mount::seed(ZEBRAD_100.artifact, "/data"))]
+#[case::zcashd(Validator::zcashd("6.4.1"), Mount::seed(ZCASHD_100.artifact, "/data"))]
 #[tokio::test]
 async fn rejects_height_past_tip(#[case] v: Validator, #[case] data: Mount) {
     let mut t = TestEnv::builder();

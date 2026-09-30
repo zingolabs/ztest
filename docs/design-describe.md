@@ -163,7 +163,7 @@ zaino builds its chain index over the pinned Blossom mainnet snapshot; zebrad is
 ├── image zainod BUILD
 │   ├── dockerfile <root>/Dockerfile ctx <root>
 │   └── features prometheus, profile
-└── seed zebra-v6.2.3-mainnet-659600.tar.zst 1106bc19 13.05 GiB
+└── seed zebra-6.2.3-blossom-mainnet 1106bc19 13.05 GiB
     └── pvc ztest-seeds/seed-1106bc19-<driver> 48Gi
 ```
 
@@ -176,7 +176,7 @@ fills in the two cases cargo-level scoping cannot reach:
 
 ```
 pruned
-└── seed zebra-v6.2.3-testnet-4140000.tar.zst 3545da25 8.15 GiB
+└── seed zebra-6.2.3-ironwood-testnet 3545da25 8.15 GiB
     └── declared by the_pub_testnet_ironwood_boundary::value_pools_respect_the_boundary…
 ```
 
@@ -196,7 +196,7 @@ the_pub_testnet_ironwood_boundary
 ├── image dev:zainod BUILD
 │   └── features prometheus
 └── seed IRONWOOD_TESTNET 3545da25 8.15 GiB
-    ├── archive zebra-v6.2.3-testnet-4140000.tar.zst
+    ├── archive zebra-6.2.3-ironwood-testnet
     └── pvc ztest-seeds/seed-3545da25-<driver> 48Gi
 
 testnet_parity::case_1_sapling
@@ -212,7 +212,7 @@ seed, `registry` on each image, `pod` children carrying the resolved topology.
 
 ```
 └── seed BLOSSOM_MAINNET 1106bc19 13.05 GiB
-    ├── archive zebra-v6.2.3-mainnet-659600.tar.zst
+    ├── archive zebra-6.2.3-blossom-mainnet
     ├── pvc ztest-seeds/seed-1106bc19-topolvm-io 48Gi
     ├── cache ✗ MISS published on hostpath.csi.k8s.io, cluster uses topolvm.io → re-pull 13.05 GiB
     └── clone zebrad → <cache_dir>, zainod → /var/lib/zaino/zebra-db

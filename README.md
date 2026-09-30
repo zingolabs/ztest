@@ -148,8 +148,9 @@ backend lands.
 ```rust
 let zebra = t.add_validator(
     Validator::zebrad("6.2.3")
-        .mount(mount_config! ("tests/assets/zebrad.toml",              "/etc/zebrad/zebrad.toml"))
-        .mount(mount_archive!("tests/assets/zebrad-100blocks.tar.zst", "/data")),
+        .mount(mount_config!("tests/assets/zebrad.toml", "/etc/zebrad/zebrad.toml"))
+        // MY_CHAIN: a `ChainSnapshot` const (`artifact!` + `#[ztest::needs(MY_CHAIN)]`)
+        .mount(Mount::seed(MY_CHAIN.artifact, "/data")),
     );
 );
 

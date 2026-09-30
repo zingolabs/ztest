@@ -5,16 +5,21 @@
 //   day, with three multi-hour pulls dropped mid-stream. Not a throughput win — measured
 //   same-minute the two are within noise. The win is having no documented throttle
 // - Binding, not S3 → no credential in the Worker, in wrangler.jsonc, or on the wire
-// - Serves `lfs/<64 hex>` and nothing else: the bucket is not a public filesystem, and a
-//   key pattern is the one check that stays true if anything else is ever stored there
+// - Serves `snap/<64 hex>/<relpath>` and nothing else: the bucket is not a public filesystem,
+//   and a key pattern is the one check that stays true if anything else is ever stored there
+// - No listings: the puller reads the file list out of `snap/<oid>/SHA256SUMS`
 //
 // Never front this route with Cache Everything. Cloudflare's cache answers a Range by
 // stripping the header, pulling the *whole* body from the Worker, then slicing — against a
-// 245 GiB seed that is pathological, and past the cacheable size limit it cannot even store
+// multi-GiB file that is pathological, and past the cacheable size limit it cannot even store
 // the result. `no-store` below makes that misconfiguration inert.
 
-/** Object keys ztest publishes: sha256, lowercase hex, under one prefix */
-const KEY = /^lfs\/[0-9a-f]{64}$/;
+/** Snapshot file keys: `snap/<sha256 of SHA256SUMS>/<relpath>`, relpath = `/`-joined segments */
+const KEY = /^snap\/[0-9a-f]{64}(\/[A-Za-z0-9._-]+)+$/;
+
+/** `.`/`..` segments would name a key outside the snapshot the oid binds */
+const servable = (key) =>
+	KEY.test(key) && !key.split("/").some((s) => s === "." || s === "..");
 
 export default {
 	async fetch(request, env) {
@@ -26,20 +31,20 @@ export default {
 		}
 
 		const key = new URL(request.url).pathname.slice(1);
-		if (!KEY.test(key)) {
+		if (!servable(key)) {
 			return new Response("Not Found", { status: 404 });
 		}
 
-		// HEAD is the existence probe (`blob_present`, `snapshot verify`): metadata only,
-		// so it never pulls a body the runtime would discard
+		// HEAD = the puller's per-file stat (rclone's http backend, before each GET): metadata
+		// only, so it never pulls a body the runtime would discard
 		if (request.method === "HEAD") {
 			const meta = await env.SEEDS.head(key);
 			if (meta === null) {
 				return new Response("Not Found", { status: 404 });
 			}
 			const headers = headersFor(meta);
-			// Explicit: with no body the runtime has no length to infer, and the probe
-			// compares this against the manifest's `size_bytes` — absent reads as absent
+			// Explicit: with no body the runtime has no length to infer, and rclone sizes the
+			// transfer (and its resume skip) off it
 			headers.set("content-length", String(meta.size));
 			return new Response(null, { status: 200, headers });
 		}
@@ -54,7 +59,7 @@ export default {
 		}
 
 		const headers = headersFor(object);
-		// A satisfied Range must answer 206 + Content-Range, or the puller cannot tell a
+		// A satisfied Range must answer 206 + Content-Range, or a client cannot tell a
 		// chunk from the whole object
 		const ranged = object.range && "offset" in object.range;
 		if (ranged) {

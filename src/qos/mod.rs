@@ -500,8 +500,8 @@ impl QosClass {
                 // never launches them — `drop_sync_tests` excludes the tier outright, so the
                 // marker routes to `ztest sync` and the reserve comes from the test
                 footprint: Resources::ZERO,
-                // Driver only marshals the test + polls an exporter; work is in the pods
-                runner: Resources::new(1_000, GIB, 0, 0),
+                // Driver hosts `loadtest::load` clients (5k conns + mempool streams OOM 1 GiB)
+                runner: Resources::new(2_000, 4 * GIB, 0, 0),
                 pool: Pool::Nvme,
                 hard_cap: Duration::from_secs(48 * 60 * 60),
             },
@@ -540,7 +540,7 @@ pub fn current() -> QosClass {
 }
 
 /// Override declared by the running test, else `None`
-fn current_footprint() -> Option<Resources> {
+pub(crate) fn current_footprint() -> Option<Resources> {
     current_entry().and_then(|(_, footprint)| footprint)
 }
 
@@ -846,11 +846,13 @@ mod tests {
     }
 
     #[test]
-    fn wallet_runner_keeps_the_in_process_wallet_compute() {
-        // Wallet runs in-process in the runner; orchestration-only tiers keep 1c
-        let wallet = QosClass::Wallet.profile().runner;
-        assert!(wallet.cpu_milli > 1_000 && wallet.mem_bytes > GIB);
-        for class in [QosClass::Integration, QosClass::Testnet, QosClass::Sync] {
+    fn in_process_client_runners_keep_their_compute() {
+        // Wallet / sync load clients run in the runner; orchestration-only tiers keep 1c
+        for class in [QosClass::Wallet, QosClass::Sync] {
+            let runner = class.profile().runner;
+            assert!(runner.cpu_milli > 1_000 && runner.mem_bytes > GIB, "{class:?} lost compute");
+        }
+        for class in [QosClass::Integration, QosClass::Testnet] {
             assert_eq!(class.profile().runner.cpu_milli, 1_000, "{class:?} only orchestrates");
         }
     }
