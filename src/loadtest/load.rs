@@ -130,11 +130,16 @@ pub struct Slo {
 }
 
 impl Slo {
-    /// First reason `level` falls short (client first: its numbers then say nothing of the server)
+    /// First reason `level` falls short
+    ///
+    /// - A saturated driver only inflates latency → a pass under it still counts; a breach under
+    ///   it = [`Breach::ClientBound`] (says nothing of the server)
     pub fn breach(&self, level: &Level) -> Option<Breach> {
-        if level.client_bound() {
-            return Some(Breach::ClientBound);
-        }
+        let breach = self.served_short(level)?;
+        Some(if level.client_bound() { Breach::ClientBound } else { breach })
+    }
+
+    fn served_short(&self, level: &Level) -> Option<Breach> {
         if level.error_rate() > self.errors {
             return Some(Breach::Errors(level.error_rate()));
         }
@@ -210,7 +215,7 @@ pub struct Plan {
     pub librustzcash_batch: u32,
     /// Concurrent dials while a level grows
     pub dials: usize,
-    /// How long after the load the auditor may wait for tip answers to bury
+    /// How long after the load the auditor may drain its backlog + wait for tip answers to bury
     pub bury_wait: Duration,
 }
 
@@ -444,8 +449,10 @@ impl fmt::Display for ScenarioReport {
             }
             (Some(wallets), Some(soak), None) => writeln!(
                 f,
-                "{}: CAPACITY {wallets} wallets, held {:.0} s",
+                "{}: CAPACITY {}{wallets} wallets, held {:.0} s",
                 self.ramp.scenario,
+                // a driver-bound stop = zaino's own limit lies further up
+                if self.stopped == Some(Breach::ClientBound) { "≥ " } else { "" },
                 soak.window.as_secs_f64()
             )?,
             (Some(wallets), _, breach) => writeln!(
@@ -498,8 +505,9 @@ impl fmt::Display for LoadReport {
         }
         writeln!(
             f,
-            "overall: {} audited vs zebra, {} consistent repeats, {} unjudged, {} audit drops, {} violations",
+            "overall: {} of {} queued audits held to zebra, {} consistent repeats, {} unjudged, {} audit drops, {} violations",
             self.ledger.audited,
+            self.ledger.queued,
             self.ledger.consistent,
             self.ledger.skipped,
             self.ledger.dropped,
@@ -618,7 +626,11 @@ pub async fn run(target: Target, plan: Plan, state: Arc<LoadRun>) -> Result<Load
         .map_err(|e| LoadError::Thread(format!("engine runtime: {e}")))?;
 
     ledger.close();
-    let _ = auditor.await;
+    // backlog + burial bounded by `bury_wait`: what is left counts as queued, never judged
+    let auditor_handle = auditor.abort_handle();
+    if tokio::time::timeout(plan.bury_wait, auditor).await.is_err() {
+        auditor_handle.abort();
+    }
     Ok(LoadReport {
         calibrated,
         calibration,
@@ -1117,8 +1129,13 @@ mod tests {
             (level(vec![range(0, 460)], 200, Some(50e6), 0.3), None, "within every set point"),
             (
                 level(vec![range(0, 460)], 200, Some(50e6), 0.9),
+                None,
+                "saturated driver, SLO held: a pass (client only inflates latency)",
+            ),
+            (
+                level(vec![range(0, 460)], 1_500, Some(50e6), 0.9),
                 Some(Breach::ClientBound),
-                "driver first",
+                "saturated driver, SLO missed: inconclusive, not zaino's",
             ),
             (
                 level(vec![range(20, 460)], 200, Some(50e6), 0.3),

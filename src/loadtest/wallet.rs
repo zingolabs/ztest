@@ -686,14 +686,22 @@ impl Pace {
         Self { rate: bytes_per_second as f64, next: tokio::time::Instant::now() }
     }
 
+    /// Token bucket: sleeps only once `PACE_QUANTUM` ahead, oversleep kept as credit
+    ///
+    /// - Per-message sleeps of < 1 ms round up to tokio's 1 ms timer → small blocks capped the
+    ///   rate at ~1 block/ms
+    /// - Credit capped at `PACE_QUANTUM` of lag (a slow server banks no burst for later)
     async fn consumed(&mut self, bytes: usize) {
         let now = tokio::time::Instant::now();
-        self.next = self.next.max(now) + Duration::from_secs_f64(bytes as f64 / self.rate);
-        if self.next > now {
+        let earliest = now.checked_sub(PACE_QUANTUM).unwrap_or(now);
+        self.next = self.next.max(earliest) + Duration::from_secs_f64(bytes as f64 / self.rate);
+        if self.next > now + PACE_QUANTUM {
             tokio::time::sleep_until(self.next).await;
         }
     }
 }
+
+const PACE_QUANTUM: Duration = Duration::from_millis(20);
 
 /// `GetBlockRange(from ..= to)`, default pools, every block checked as it arrives
 ///
@@ -778,6 +786,19 @@ async fn stream_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 3 MB in 3 KB blocks at 5 MB/s = 0.6 s: small blocks paced to the rate, not to the timer
+    #[tokio::test(start_paused = true)]
+    async fn a_paced_scan_holds_its_rate_on_small_blocks() {
+        let mut pace = Pace::new(5_000_000);
+        let started = tokio::time::Instant::now();
+        for _ in 0..1_000 {
+            pace.consumed(3_000).await;
+        }
+        let elapsed = started.elapsed();
+        let want = Duration::from_millis(600);
+        assert!(elapsed.abs_diff(want) <= PACE_QUANTUM, "{elapsed:?}, want ≈ {want:?}");
+    }
 
     /// Sapling from 10 (roots complete at 50, 120), Orchard from 100 (150, 180), Ironwood from
     /// 200 (no root yet); tip 300
