@@ -4,7 +4,8 @@
 //!   → two runs claim the same headroom and overcommit the node
 //! - Each run holds a `coordination.k8s.io/Lease` in [`META_NAMESPACE`] reserving its slice
 //!   → ceiling = `min(sa_budget, allocatable − non-ztest usage − Σ others' reservations)`
-//! - Crashed run's lease expires (TTL) and is swept
+//! - Crashed run's lease expires (TTL) and is swept; its run-scoped objects are then orphans,
+//!   reaped at the next admission ([`reap_orphans`](crate::resource::reap_orphans))
 //! - Seeds the `Scheduler`'s ceiling, never replaces it
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -380,6 +381,14 @@ pub async fn acquire(
     kind: LeaseKind,
 ) -> Result<Reservation, LedgerError> {
     require_meta_namespace(client).await?;
+    // Every admission enforces the invariant for dead runs; background (never delays this one;
+    // their pods already count as unreserved usage until gone)
+    let reaper = client.clone();
+    tokio::spawn(async move {
+        for e in crate::resource::reap_orphans(&reaper).await {
+            tracing::warn!(error = %e, "orphan reap");
+        }
+    });
     let leases: Api<Lease> = Api::namespaced(client.clone(), META_NAMESPACE);
     let allocatable = capacity.allocatable;
     let budget = sa_budget(client, sa, default_budget(allocatable)).await?;

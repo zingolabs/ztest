@@ -141,7 +141,7 @@ async fn run_in_pod(
         duration: started.elapsed(),
     };
 
-    let test_ns = match test_ns::open(&client, &cfg.env.run, &item).await {
+    let test_ns = match test_ns::open(&client, &cfg.env.run, &item, cfg.env.no_cleanup).await {
         Ok(ns) => ns,
         Err(e) => return spawn_error(e),
     };
@@ -309,10 +309,14 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> 
         .collect();
     // - run-id → parent's `reap_run` (Ctrl-C) + ledger attribution
     // - user → `ztest cleanup --mine` when that teardown never ran
-    let labels = BTreeMap::from([
+    let mut labels = BTreeMap::from([
         (crate::qos::LABEL_RUN_ID.to_string(), cfg.env.run.run_id.clone()),
         (crate::qos::LABEL_USER.to_string(), cfg.env.run.user.clone()),
     ]);
+    if cfg.env.no_cleanup {
+        let hold = test_ns::no_cleanup_hold().to_string();
+        labels.insert(crate::qos::LABEL_HOLD_UNTIL.to_string(), hold);
+    }
 
     // Guaranteed QoS: sized at its tier's runner footprint, `requests == limits` with
     // whole-core CPU — never BestEffort (`qos::QosProfile::runner`)

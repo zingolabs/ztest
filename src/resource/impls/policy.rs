@@ -471,7 +471,7 @@ impl Provider for RunIdentityProvider {
                 ResourceError::Provision(format!("apply SA {DRIVER_SERVICE_ACCOUNT}: {e}"))
             })?;
 
-        // No ClusterRoleBinding for this one, by design — `src/cluster.rs::ensure_namespace`
+        // No ClusterRoleBinding for this one, by design — `src/cluster.rs::create_test_namespace`
         // binds it per test namespace, which is the whole reach a driver pod ever gets
         let driver_role: ClusterRole = serde_json::from_value(json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -670,7 +670,7 @@ mod tests {
 
     /// RBAC escalation prevention: creating the per-namespace RoleBinding succeeds only while
     /// the orchestrator already holds every verb the driver role grants. A driver rule the run
-    /// role lacks turns into a 403 at `ensure_namespace`, long after this file was edited
+    /// role lacks turns into a 403 at `create_test_namespace`, long after this file was edited
     #[test]
     fn the_run_role_covers_every_driver_grant() {
         for d in DRIVER_RULES {
@@ -679,7 +679,7 @@ mod tests {
                     assert!(
                         grants_verb(ClusterClass::Remote, d.group, res, verb),
                         "driver grants {verb} {res} ({}) but the run role does not — the \
-                         RoleBinding in `ensure_namespace` will 403",
+                         RoleBinding in `create_test_namespace` will 403",
                         d.group
                     );
                 }

@@ -41,7 +41,7 @@ impl Executor for LocalExecutor {
         let (client, env) = (self.client.clone(), self.env.clone());
         Box::pin(async move {
             let started = Instant::now();
-            let ns = match super::test_ns::open(&client, &env.run, &item).await {
+            let ns = match super::test_ns::open(&client, &env.run, &item, env.no_cleanup).await {
                 Ok(ns) => ns,
                 Err(e) => {
                     return TestOutcome {

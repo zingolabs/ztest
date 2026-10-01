@@ -367,7 +367,7 @@ fn select_executor(
     };
 
     // Driver pods run untrusted test code → DRIVER_SERVICE_ACCOUNT, whose only grants are the
-    // per-test-namespace RoleBinding `ensure_namespace` writes. Never ORCHESTRATOR_SERVICE_ACCOUNT:
+    // per-test-namespace RoleBinding `create_test_namespace` writes. Never ORCHESTRATOR_SERVICE_ACCOUNT:
     // that one is cluster-bound, and mounting it here hands every test the whole cluster
     let namespace =
         std::env::var("ZTEST_RUNNER_NAMESPACE").unwrap_or_else(|_| RUN_NAMESPACE.to_string());

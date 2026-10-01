@@ -145,7 +145,7 @@ Namespaces, each at the Pod Security level its occupant actually needs:
 Every `privileged` namespace is one a CI run never places a pod in — that is the point of the
 split, not an accident of it.
 
-- No ClusterRoleBinding exists for `ztest-driver`; `ensure_namespace` writes the RoleBinding as
+- No ClusterRoleBinding exists for `ztest-driver`; `create_test_namespace` writes the RoleBinding as
   it creates each test namespace, so a driver's reach ends with that namespace
 - `the_run_role_covers_every_driver_grant` keeps the driver role a subset of the orchestrator
   role — RBAC escalation prevention rejects the RoleBinding otherwise, at run time

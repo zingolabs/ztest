@@ -19,16 +19,23 @@ pub async fn open(
     client: &kube::Client,
     run: &RunCoords,
     item: &WorkItem,
+    no_cleanup: bool,
 ) -> Result<String, String> {
     let ns = crate::naming::namespace_for(
         &item.binary_id,
         &item.test_name,
         &crate::naming::test_suffix(),
     );
-    crate::cluster::ensure_namespace(client, &ns, run, &item.binary_id, &item.test_name)
+    let hold = no_cleanup.then(no_cleanup_hold);
+    crate::cluster::create_test_namespace(client, &ns, run, &item.binary_id, &item.test_name, hold)
         .await
         .map_err(|e| format!("create test namespace {ns}: {e}"))?;
     Ok(ns)
+}
+
+/// `--no-cleanup` inspection window: [`LABEL_HOLD_UNTIL`](crate::qos::LABEL_HOLD_UNTIL) value
+pub fn no_cleanup_hold() -> i64 {
+    (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()
 }
 
 /// Harvest, then delete (unless `no_cleanup`: kept for inspection, `janitor/ttl` = 1h)

@@ -28,9 +28,11 @@ use serde::{Deserialize, Serialize};
 pub const LABEL_ROLE: &str = "ztest.io/role";
 /// `LABEL_ROLE` value on a per-test namespace; `ztest cleanup --all-users` reaps by it
 pub const ROLE_TEST_ENV: &str = "test-env";
-/// Value = `RunCoords::run_id` (`GITHUB_RUN_ID` in CI, `${USER}-${PPID}` in dev); the
-/// Ctrl-C reaper selects on it to find what a crash left behind
+/// Value = `RunCoords::run_id` = the run's ledger lease name. No live lease → orphan, reaped
+/// ([`reap_orphans`](crate::resource::reap_orphans))
 pub const LABEL_RUN_ID: &str = "ztest.io/run-id";
+/// Unix seconds an object outlives its run's lease until (`--no-cleanup` inspection window)
+pub const LABEL_HOLD_UNTIL: &str = "ztest.io/hold-until";
 /// Value = `RunCoords::user`, slugged; `ztest cleanup` reclaims one developer's resources
 pub const LABEL_USER: &str = "ztest.io/user";
 /// Ties a cluster-scoped seed-binding VolumeSnapshotContent to the namespace it serves;

@@ -1,7 +1,7 @@
 //! Public entry points into the resource layer — `ztest cluster setup`, `ztest run` and the
 //! Ctrl-C reaper all flow through one of these; providers and graph mechanics sit behind
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
@@ -209,6 +209,75 @@ pub fn seed_node_id(entry: &SeedEntry) -> NodeId {
     seed::SeedProvider::node_id(entry)
 }
 
+/// Run-scoped = carries a run id, belongs to no sync (a sync owns a TTL lifecycle of its own)
+const RUN_SCOPED: &str = "ztest.io/run-id,!ztest.io/kind";
+
+/// Enforce the ledger invariant: every run-scoped object is covered by its run's live lease.
+/// A run with objects but no lease died without teardown → [`reap_run`]. Called by every
+/// admission ([`acquire`](crate::qos::ledger::acquire)), so each run clears dead runs' leftovers
+pub async fn reap_orphans(client: &Client) -> Vec<String> {
+    let lp = ListParams::default().labels(RUN_SCOPED);
+    let ns_api = Api::<Namespace>::all(client.clone());
+    let run_api = Api::<Pod>::namespaced(client.clone(), crate::naming::RUN_NAMESPACE);
+    let build_api = Api::<Pod>::namespaced(client.clone(), crate::naming::BUILD_NAMESPACE);
+    let vsc_api = Api::<DynamicObject>::all_with(
+        client.clone(),
+        &crate::seeds::volume_snapshot_content_gvk(),
+    );
+    // Objects BEFORE leases: an object's lease predates it, so a later lease list cannot miss it
+    let (namespaces, run_pods, build_pods, vscs) =
+        futures::join!(ns_api.list(&lp), run_api.list(&lp), build_api.list(&lp), vsc_api.list(&lp));
+    let mut labels: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut errors = Vec::new();
+    for listed in [
+        namespaces.map(|l| l.items.into_iter().map(|o| o.metadata.labels).collect::<Vec<_>>()),
+        run_pods.map(|l| l.items.into_iter().map(|o| o.metadata.labels).collect()),
+        build_pods.map(|l| l.items.into_iter().map(|o| o.metadata.labels).collect()),
+        vscs.map(|l| l.items.into_iter().map(|o| o.metadata.labels).collect()),
+    ] {
+        match listed {
+            Ok(ls) => labels.extend(ls.into_iter().flatten()),
+            Err(e) if crate::cluster::is_not_found(&e) => {}
+            Err(e) => errors.push(format!("list run-scoped objects: {e}")),
+        }
+    }
+    let leases = match crate::qos::ledger::list_leases(&crate::qos::ledger::lease_api(client)).await
+    {
+        Ok(l) => l,
+        Err(e) => return vec![e.to_string()],
+    };
+    let now = chrono::Utc::now();
+    let live: std::collections::HashSet<String> = leases
+        .items
+        .iter()
+        .filter(|l| !crate::qos::ledger::is_expired(l, now))
+        .filter_map(|l| l.metadata.name.clone())
+        .collect();
+    for run_id in orphaned_runs(&labels, &live, now.timestamp()) {
+        tracing::warn!(run_id = %run_id, "reaping orphaned run (no live lease)");
+        errors.extend(reap_run(client, &run_id).await);
+    }
+    errors
+}
+
+/// Run ids among `labels` with no `live` lease, minus objects still under a
+/// [`LABEL_HOLD_UNTIL`](qos::LABEL_HOLD_UNTIL) at `now` (a held object holds its whole run)
+fn orphaned_runs(
+    labels: &[BTreeMap<String, String>],
+    live: &std::collections::HashSet<String>,
+    now: i64,
+) -> std::collections::BTreeSet<String> {
+    let held = |l: &BTreeMap<String, String>| {
+        l.get(qos::LABEL_HOLD_UNTIL).and_then(|t| t.parse::<i64>().ok()).is_some_and(|t| t > now)
+    };
+    let run_id = |l: &BTreeMap<String, String>| {
+        l.get(qos::LABEL_RUN_ID).cloned().expect("RUN_SCOPED selects on the run-id label")
+    };
+    let held_runs: std::collections::HashSet<String> =
+        labels.iter().filter(|l| held(l)).map(run_id).collect();
+    labels.iter().map(run_id).filter(|id| !live.contains(id) && !held_runs.contains(id)).collect()
+}
+
 /// Parent-side, by-identity teardown of a run's ephemeral resources: everything labelled
 /// `ztest.io/run-id=<run_id>` (cascading per-test Namespaces, ephemeral build/uploader
 /// pods, cluster-scoped seed-binding VolumeSnapshotContents). Infrastructure and
@@ -290,6 +359,32 @@ mod tests {
             base_uri: crate::storage::BASE_URI.to_string(),
             key_prefix: crate::storage::KEY_PREFIX.to_string(),
         }
+    }
+
+    #[test]
+    fn only_runs_with_no_live_lease_and_no_live_hold_are_orphans() {
+        let obj = |run: &str, hold: Option<i64>| {
+            let mut l = BTreeMap::from([(qos::LABEL_RUN_ID.to_string(), run.to_string())]);
+            if let Some(t) = hold {
+                l.insert(qos::LABEL_HOLD_UNTIL.to_string(), t.to_string());
+            }
+            l
+        };
+        let now = 1_000;
+        let labels = [
+            obj("live", None),
+            obj("dead", None),
+            obj("dead", None),
+            // --no-cleanup inside its window: one held object holds its whole run
+            obj("held", Some(now + 60)),
+            obj("held", None),
+            obj("hold-lapsed", Some(now - 1)),
+        ];
+        let live = std::collections::HashSet::from(["live".to_string()]);
+        assert_eq!(
+            orphaned_runs(&labels, &live, now),
+            std::collections::BTreeSet::from(["dead".to_string(), "hold-lapsed".to_string()]),
+        );
     }
 
     #[test]

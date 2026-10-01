@@ -7,8 +7,8 @@
 
 use k8s_openapi::api::core::v1::{Namespace, Service, ServiceAccount};
 use k8s_openapi::api::rbac::v1::RoleBinding;
-use kube::Client;
 use kube::api::{Api, DeleteParams, PostParams};
+use kube::{Client, ResourceExt as _};
 use serde_json::json;
 
 use crate::naming::RunCoords;
@@ -122,24 +122,20 @@ fn resource_quota_manifest(footprint: crate::qos::Resources, pods: usize) -> ser
     })
 }
 
-/// Create the per-test namespace. Idempotent — 409 (a previous run still being GC'd)
-/// counts as success
-pub async fn ensure_namespace(
+/// Create a per-test namespace (fresh random-suffixed name → a 409 is another test's, an error).
+/// `hold_until` = `--no-cleanup`: exempt from orphan reaping until then
+pub async fn create_test_namespace(
     client: &Client,
     namespace: &str,
     coords: &RunCoords,
     package: &str,
     test: &str,
+    hold_until: Option<i64>,
 ) -> Result<(), kube::Error> {
     let api: Api<Namespace> = Api::all(client.clone());
-    if api.get_opt(namespace).await?.is_some() {
-        bind_driver(client, namespace).await?;
-        return wait_for_default_sa(client, namespace).await;
-    }
     // Label values must be DNS-1123 → `module::test` slugged for the label, verbatim in
-    // an annotation. `janitor/ttl` set even under `--no-cleanup` (which only suppresses
-    // Drop teardown) so a stale namespace never leaks permanently
-    let ns: Namespace = serde_json::from_value(json!({
+    // an annotation
+    let mut ns: Namespace = serde_json::from_value(json!({
         "apiVersion": "v1",
         "kind": "Namespace",
         "metadata": {
@@ -161,11 +157,10 @@ pub async fn ensure_namespace(
         }
     }))
     .expect("static manifest is valid");
-    match api.create(&PostParams::default(), &ns).await {
-        Ok(_) => {}
-        Err(kube::Error::Api(e)) if e.code == 409 => {}
-        Err(e) => return Err(e),
+    if let Some(t) = hold_until {
+        ns.labels_mut().insert(crate::qos::LABEL_HOLD_UNTIL.to_string(), t.to_string());
     }
+    api.create(&PostParams::default(), &ns).await?;
     bind_driver(client, namespace).await?;
     wait_for_default_sa(client, namespace).await
 }
