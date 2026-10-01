@@ -162,7 +162,21 @@ impl Inner {
     }
 
     async fn delete(&self) {
-        let _ = self.api().delete(&self.id, &Default::default()).await;
+        if let Err(e) = self.api().delete(&self.id, &Default::default()).await
+            && !crate::cluster::is_not_found(&e)
+        {
+            tracing::warn!(lease = %self.id, error = %e, "lease release failed; lapses at TTL");
+        }
+    }
+
+    /// Heartbeat write. A miss is tolerated (TTL spans several), never silent: a persistent
+    /// one lets the lease lapse and peers over-admit
+    async fn renew(&self, reserve: Resources) -> Result<(), LedgerError> {
+        let res = self.write(reserve).await;
+        if let Err(e) = &res {
+            tracing::warn!(lease = %self.id, error = %e, "lease renew failed");
+        }
+        res
     }
 }
 
@@ -243,9 +257,7 @@ impl Reservation {
 
     /// Publish live test progress onto the lease. Free: the next heartbeat carries it
     pub fn report_status(&self, progress: Progress) {
-        if let Ok(mut b) = self.inner.beacon.lock() {
-            b.apply(progress);
-        }
+        self.inner.beacon.lock().expect("beacon mutex poisoned").apply(progress);
     }
 
     /// Background loop, shared by every reservation
@@ -290,7 +302,7 @@ async fn drive(
         ticker.tick().await;
 
         let Reserve::Elastic = want else {
-            let _ = inner.write(prev).await;
+            let _ = inner.renew(prev).await;
             continue;
         };
 
@@ -303,7 +315,7 @@ async fn drive(
         // run's already-scheduling pods hold.
         let d = *demand.borrow();
         if d == Demand::default() {
-            let _ = inner.write(prev).await;
+            let _ = inner.renew(prev).await;
             continue;
         }
 
@@ -313,7 +325,7 @@ async fn drive(
         };
         let target =
             reserve_from_state(&live, &pods, &inner.id, allocatable, budget, d.committed, d.demand);
-        if inner.write(target.max(&prev)).await.is_err() {
+        if inner.renew(target.max(&prev)).await.is_err() {
             continue; // a missed write can only under-admit, never overcommit
         }
         if target != prev {
@@ -370,7 +382,7 @@ pub async fn acquire(
     require_meta_namespace(client).await?;
     let leases: Api<Lease> = Api::namespaced(client.clone(), META_NAMESPACE);
     let allocatable = capacity.allocatable;
-    let budget = sa_budget(client, sa, default_budget(allocatable)).await;
+    let budget = sa_budget(client, sa, default_budget(allocatable)).await?;
 
     // Held from the first poll so a blocked run is visible to peers and to `ztest status`;
     // `started_at` = the wait's start, which is when the user launched
@@ -493,11 +505,16 @@ pub async fn sweep_expired(api: &Api<Lease>) -> Result<(), LedgerError> {
 
 /// SA budget from its annotations, else `default` ([`default_budget`]); a missing SA
 /// (a local SA name with no cluster object) also falls back
-async fn sa_budget(client: &Client, sa: &str, default: Resources) -> Resources {
+async fn sa_budget(
+    client: &Client,
+    sa: &str,
+    default: Resources,
+) -> Result<Resources, LedgerError> {
     let api: Api<ServiceAccount> = Api::namespaced(client.clone(), RUN_NAMESPACE);
-    match api.get(sa).await {
-        Ok(obj) => budget_from_annotations(obj.metadata.annotations.as_ref(), default),
-        Err(_) => default,
+    match api.get_opt(sa).await {
+        Ok(Some(obj)) => Ok(budget_from_annotations(obj.metadata.annotations.as_ref(), default)),
+        Ok(None) => Ok(default),
+        Err(e) => Err(LedgerError::Kube(format!("get ServiceAccount {sa}: {e}"))),
     }
 }
 

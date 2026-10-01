@@ -78,7 +78,7 @@ fn env() -> EngineEnv {
         capture: true,
         ztest_log: None,
         image_refs: std::collections::BTreeMap::new(),
-        storage: None,
+        storage: ("sc".into(), "vsc".into()),
     }
 }
 

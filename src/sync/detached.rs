@@ -446,34 +446,14 @@ mod runtime {
     ///   the sync namespace its `TestEnv` points at)
     pub async fn watch_stop(client: &Client) -> Cancel {
         let (source, cancel) = CancelSource::new();
-        let pod_name = std::env::var(POD_NAME_ENV).unwrap_or_default();
-        let namespace = std::env::var(POD_NAMESPACE_ENV).unwrap_or_default();
+        let pod_name = std::env::var(POD_NAME_ENV).expect("driver spec sets the downward-API name");
+        let namespace =
+            std::env::var(POD_NAMESPACE_ENV).expect("driver spec sets the downward-API namespace");
         let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
-        // Either half missing ⇒ unaddressable pod, annotation path dead, SIGTERM
-        // only. Said loudly: a silent stop-watch makes `ztest sync stop` look like
-        // it worked while the sync runs on for hours.
-        let addressable = !pod_name.is_empty() && !namespace.is_empty();
-        if !addressable {
-            tracing::warn!(
-                pod = %pod_name,
-                namespace = %namespace,
-                "sync stop-watch: incomplete pod address ({POD_NAME_ENV} / \
-                 {POD_NAMESPACE_ENV}) — `ztest sync stop` cannot be observed; \
-                 SIGTERM only"
-            );
-        }
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler installs inside a tokio runtime");
 
         tokio::spawn(async move {
-            let mut sigterm = match tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "sync stop-watch: cannot install SIGTERM handler");
-                    poll_forever(&pods, &pod_name, addressable, &source).await;
-                    return;
-                }
-            };
             let mut ticker = tokio::time::interval(STOP_POLL);
             loop {
                 tokio::select! {
@@ -483,9 +463,6 @@ mod runtime {
                         return;
                     }
                     _ = ticker.tick() => {
-                        if !addressable {
-                            continue;
-                        }
                         if stop_requested(&pods, &pod_name).await {
                             tracing::info!("sync stop-watch: stop annotation set → graceful shutdown");
                             source.cancel();
@@ -497,26 +474,6 @@ mod runtime {
         });
 
         cancel
-    }
-
-    /// Annotation-only fallback, for when no SIGTERM handler could be installed
-    async fn poll_forever(
-        pods: &Api<Pod>,
-        pod_name: &str,
-        addressable: bool,
-        source: &CancelSource,
-    ) {
-        if !addressable {
-            return;
-        }
-        let mut ticker = tokio::time::interval(STOP_POLL);
-        loop {
-            ticker.tick().await;
-            if stop_requested(pods, pod_name).await {
-                source.cancel();
-                return;
-            }
-        }
     }
 
     /// Truthy [`STOP_ANNOTATION`] on this pod? Read error = "not yet" (no stopping
@@ -569,13 +526,7 @@ mod runtime {
     /// - Owner + kind labels ride the launch half
     pub async fn write_report(client: &Client, report: &SyncReportMirror) {
         let name = super::report_cm_name(&report.sync_id);
-        let body = match serde_json::to_string_pretty(report) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "sync report: serialize failed");
-                return;
-            }
-        };
+        let body = serde_json::to_string_pretty(report).expect("SyncReportMirror serializes");
         let api: Api<ConfigMap> = Api::namespaced(client.clone(), super::report_cm_namespace());
         let params = PatchParams {
             field_manager: Some(super::REPORT_FIELD_MANAGER.into()),

@@ -1706,11 +1706,8 @@ fn provision_and_resolve(
         }
     }
 
-    // Build manifest (`DevImageId → pull ref`) for every provisioned dev image: seeded
-    // process-globally (local kind shares a process with the tests) and forwarded to each
-    // remote runner pod via `ZTEST_IMAGE_REFS`
+    // Build manifest (`DevImageId → pull ref`) → every test process via `ZTEST_IMAGE_REFS`
     let image_refs = resource::dev_image_refs(&images_by_binary, &resource_states);
-    ztest::backends::image::seed_dev_images(&image_refs);
 
     // Prebaked ref passes straight through (already built + pushed on-cluster); local kind
     // has no runner at all

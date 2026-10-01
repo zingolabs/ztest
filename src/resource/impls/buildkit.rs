@@ -537,7 +537,10 @@ impl Provider for BuildkitProvider {
             "accessModes": ["ReadWriteOnce"],
             "resources": { "requests": { "storage": cache_size() } },
         });
-        if let Some(class) = crate::storage_class::plain_class(&cx.client, CACHE_CLASS_ENV).await {
+        if let Some(class) = crate::storage_class::plain_class(&cx.client, CACHE_CLASS_ENV)
+            .await
+            .map_err(|e| ResourceError::Provision(format!("buildkit cache class: {e}")))?
+        {
             spec["storageClassName"] = json!(class);
         }
         let pvc: PersistentVolumeClaim = serde_json::from_value(json!({

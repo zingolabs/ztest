@@ -611,16 +611,14 @@ fn prometheus_config_map() -> ConfigMap {
     config_map(&format!("{PROMETHEUS_SERVICE}-config"), "prometheus.yml", scrape_config())
 }
 
-fn pyroscope_config_map() -> Result<ConfigMap, crate::error::PipelineError> {
-    let rendered = serde_yaml::to_string(&pyroscope_config())
-        .map_err(|e| format!("render Pyroscope config: {e}"))?;
-    Ok(config_map(&format!("{PYROSCOPE_SERVICE}-config"), "config.yaml", rendered))
+fn pyroscope_config_map() -> ConfigMap {
+    let rendered = serde_yaml::to_string(&pyroscope_config()).expect("static Pyroscope config");
+    config_map(&format!("{PYROSCOPE_SERVICE}-config"), "config.yaml", rendered)
 }
 
-fn pyroscope_overrides_config_map() -> Result<ConfigMap, crate::error::PipelineError> {
-    let seed = serde_yaml::to_string(&Overrides::default())
-        .map_err(|e| format!("render Pyroscope overrides: {e}"))?;
-    Ok(config_map(PYROSCOPE_OVERRIDES_CONFIGMAP, PYROSCOPE_OVERRIDES_KEY, seed))
+fn pyroscope_overrides_config_map() -> ConfigMap {
+    let seed = serde_yaml::to_string(&Overrides::default()).expect("static Pyroscope overrides");
+    config_map(PYROSCOPE_OVERRIDES_CONFIGMAP, PYROSCOPE_OVERRIDES_KEY, seed)
 }
 
 fn grafana_config_map() -> ConfigMap {
@@ -701,14 +699,14 @@ async fn apply_stack(cx: &Cx) -> Result<(), crate::error::PipelineError> {
     apply(&bindings, &prometheus_cluster_role_binding(), WHAT).await?;
 
     apply(&config_maps, &prometheus_config_map(), WHAT).await?;
-    apply(&config_maps, &pyroscope_config_map()?, WHAT).await?;
+    apply(&config_maps, &pyroscope_config_map(), WHAT).await?;
     apply(&config_maps, &grafana_config_map(), WHAT).await?;
     // Seeded only when absent: `ztest cleanup` owns the contents, and an apply here
     // would drop every retirement it has written
     seed_overrides(&config_maps).await?;
 
     // One resolution for both: a split here is how a stack ends up half on a test driver
-    let class = crate::storage_class::plain_class(client, OBS_CLASS_ENV).await;
+    let class = crate::storage_class::plain_class(client, OBS_CLASS_ENV).await?;
     let class = class.as_deref();
     apply_claim(
         &claims,
@@ -801,7 +799,7 @@ async fn seed_overrides(api: &Api<ConfigMap>) -> Result<(), crate::error::Pipeli
     if api.get_opt(PYROSCOPE_OVERRIDES_CONFIGMAP).await.map_err(|e| e.to_string())?.is_some() {
         return Ok(());
     }
-    match api.create(&PostParams::default(), &pyroscope_overrides_config_map()?).await {
+    match api.create(&PostParams::default(), &pyroscope_overrides_config_map()).await {
         Ok(_) => Ok(()),
         // Lost the race with a concurrent setup; its seed is as good as ours
         Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
@@ -917,7 +915,9 @@ fn config_hash() -> String {
     }
     // Pyroscope's too (pre-multitenancy cluster keeps pushing to `anonymous` → every
     // retirement matches nothing, reports success)
-    hasher.update(serde_yaml::to_string(&pyroscope_config()).unwrap_or_default().as_bytes());
+    hasher.update(
+        serde_yaml::to_string(&pyroscope_config()).expect("static Pyroscope config").as_bytes(),
+    );
     for arg in pyroscope_args() {
         hasher.update(arg.as_bytes());
     }
@@ -974,8 +974,8 @@ mod tests {
 
         let declared: Vec<String> = [
             prometheus_config_map(),
-            pyroscope_config_map().expect("renders"),
-            pyroscope_overrides_config_map().expect("renders"),
+            pyroscope_config_map(),
+            pyroscope_overrides_config_map(),
             grafana_config_map(),
         ]
         .iter()
@@ -1191,7 +1191,7 @@ mod tests {
     /// Seed must round-trip: `ztest cleanup` reads it back before adding a tenant
     #[test]
     fn the_seeded_overrides_document_parses_as_an_empty_override_set() {
-        let cm = pyroscope_overrides_config_map().expect("renders");
+        let cm = pyroscope_overrides_config_map();
         let seeded = &cm.data.expect("data")[PYROSCOPE_OVERRIDES_KEY];
         let parsed: Overrides = serde_yaml::from_str(seeded).expect("round-trips");
         assert!(parsed.overrides.is_empty());

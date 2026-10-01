@@ -499,7 +499,7 @@ mod tests {
             capture: true,
             ztest_log: None,
             image_refs: BTreeMap::new(),
-            storage: None,
+            storage: ("sc".into(), "vsc".into()),
         }
     }
 
@@ -528,7 +528,7 @@ mod tests {
     /// In-pod `TestEnv` reads all of these and can derive none:
     /// - run id + user + namespace → `ztest.io/*` labels on every component pod (ledger, reaping)
     /// - storage classes → driver SA may not list cluster-scoped classes (403 in-pod)
-    /// - unresolved optionals absent, never empty
+    /// - optionals (log filter, dev images) absent when unset, never empty
     #[test]
     fn runner_env_carries_the_run_identity_and_every_orchestrator_resolved_value() {
         let full = EngineEnv {
@@ -538,7 +538,7 @@ mod tests {
             capture: true,
             ztest_log: Some("ztest::build=debug".into()),
             image_refs: BTreeMap::from([("k".into(), "reg:5000/zainod:dev-abc".into())]),
-            storage: Some(("fast-ssd".into(), "csi-snapclass".into())),
+            storage: ("fast-ssd".into(), "csi-snapclass".into()),
         };
         let cfg = PodRunConfig::baked(full.clone(), "runner:dev".into(), "ztest".into(), None);
         let base = [
@@ -550,23 +550,22 @@ mod tests {
             (crate::naming::RUN_ID_ENV, "eli-0a1b2c3d"),
             ("USER", "eli"),
             (crate::naming::TEST_NAMESPACE_ENV, "ztest-b-t-0a1b2c3d"),
-        ];
-        let resolved = [
-            ("ZTEST_LOG", "ztest::build=debug"),
-            (crate::backends::image::IMAGE_REFS_ENV, r#"{"k":"reg:5000/zainod:dev-abc"}"#),
             (crate::cluster_config::STORAGE_CLASS_ENV, "fast-ssd"),
             (crate::cluster_config::SNAPSHOT_CLASS_ENV, "csi-snapclass"),
+        ];
+        let optional = [
+            ("ZTEST_LOG", "ztest::build=debug"),
+            (crate::backends::image::IMAGE_REFS_ENV, r#"{"k":"reg:5000/zainod:dev-abc"}"#),
         ];
         let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
         };
         assert_eq!(
             runner_env(&cfg, &work("crate::b", "t"), "ztest-b-t-0a1b2c3d"),
-            map(&[&base[..], &resolved[..]].concat())
+            map(&[&base[..], &optional[..]].concat())
         );
 
-        let bare =
-            EngineEnv { ztest_log: None, image_refs: BTreeMap::new(), storage: None, ..full };
+        let bare = EngineEnv { ztest_log: None, image_refs: BTreeMap::new(), ..full };
         let cfg = PodRunConfig::baked(bare, "runner:dev".into(), "ztest".into(), None);
         assert_eq!(runner_env(&cfg, &work("crate::b", "t"), "ztest-b-t-0a1b2c3d"), map(&base));
 

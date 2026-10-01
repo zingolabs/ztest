@@ -129,16 +129,7 @@ pub fn run(
         }
     }
 
-    let env = EngineEnv {
-        dylib_path: dylib::dylib_path_value(&input.summary.rust_build_meta),
-        run: input.opts.run.clone(),
-        no_cleanup: input.opts.no_cleanup,
-        capture: input.opts.output.captures(),
-        ztest_log: std::env::var("ZTEST_LOG").ok().filter(|v| !v.trim().is_empty()),
-        image_refs: input.image_refs.clone(),
-        storage: None,
-    };
-    let executor = match select_executor(work_rt, &input, env) {
+    let executor = match select_executor(work_rt, &input) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("ztest engine: {e}");
@@ -345,12 +336,25 @@ fn drive(
 fn select_executor(
     work_rt: &tokio::runtime::Runtime,
     input: &EngineInput<'_>,
-    mut env: EngineEnv,
 ) -> Result<std::sync::Arc<dyn local_runner::Executor>, crate::error::PipelineError> {
     // Both executors own per-test namespaces (`test_ns`)
     let client = work_rt
         .block_on(crate::cluster::client())
         .map_err(|e| format!("executor: connect to cluster: {e}"))?;
+    // Resolved once, handed to every test process (a driver SA cannot list the
+    // cluster-scoped classes; a local child would only repeat the lookup)
+    let storage = work_rt
+        .block_on(crate::storage_class::selected(&client))
+        .map_err(|e| format!("executor: storage class: {e}"))?;
+    let env = EngineEnv {
+        dylib_path: dylib::dylib_path_value(&input.summary.rust_build_meta),
+        run: input.opts.run.clone(),
+        no_cleanup: input.opts.no_cleanup,
+        capture: input.opts.output.captures(),
+        ztest_log: std::env::var("ZTEST_LOG").ok().filter(|v| !v.trim().is_empty()),
+        image_refs: input.image_refs.clone(),
+        storage: (storage.class_name.clone(), storage.snapshot_class.clone()),
+    };
 
     // Preflight image (remote runs) wins over the manual env override; neither → local
     let from_preflight = input.runner_image.clone();
@@ -373,13 +377,6 @@ fn select_executor(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DRIVER_SERVICE_ACCOUNT.to_string()),
     );
-
-    // Resolve the storage + snapshot class here and hand it to the driver: the lookup lists
-    // cluster-scoped classes, which DRIVER_SERVICE_ACCOUNT's per-namespace binding cannot grant
-    env.storage = work_rt
-        .block_on(crate::storage_class::selected(&client))
-        .ok()
-        .map(|o| (o.class_name.clone(), o.snapshot_class.clone()));
 
     // Preflight image = baked (outputs inside it); else the manual delivery knob (`baked`, or
     // `hostpath` mounting the workspace from the node)

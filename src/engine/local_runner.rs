@@ -71,7 +71,7 @@ impl Executor for LocalExecutor {
 /// Per-run environment shared by every child, computed once.
 ///
 /// - `capture = false` under `--no-capture`, where the child inherits this process's stdio
-/// - `storage` = (storage class, snapshot class); `None` on the local path (child discovers)
+/// - `storage` = (storage class, snapshot class)
 #[derive(Debug, Clone)]
 pub struct EngineEnv {
     pub dylib_path: OsString,
@@ -80,7 +80,7 @@ pub struct EngineEnv {
     pub ztest_log: Option<String>,
     pub capture: bool,
     pub image_refs: std::collections::BTreeMap<String, String>,
-    pub storage: Option<(String, String)>,
+    pub storage: (String, String),
 }
 
 impl EngineEnv {
@@ -94,6 +94,9 @@ impl EngineEnv {
             (crate::naming::RUN_ID_ENV, self.run.run_id.clone()),
             ("USER", self.run.user.clone()),
             (crate::naming::TEST_NAMESPACE_ENV, test_ns.to_string()),
+            // Driver SA may not list cluster-scoped storage/snapshot classes → answer handed down
+            (crate::cluster_config::STORAGE_CLASS_ENV, self.storage.0.clone()),
+            (crate::cluster_config::SNAPSHOT_CLASS_ENV, self.storage.1.clone()),
         ];
         if let Some(filter) = &self.ztest_log {
             vars.push(("ZTEST_LOG", filter.clone()));
@@ -102,11 +105,6 @@ impl EngineEnv {
         if !self.image_refs.is_empty() {
             let json = serde_json::to_string(&self.image_refs).expect("string map serializes");
             vars.push((crate::backends::image::IMAGE_REFS_ENV, json));
-        }
-        // Driver SA may not list cluster-scoped storage/snapshot classes → answer handed down
-        if let Some((class, snapshot_class)) = &self.storage {
-            vars.push((crate::cluster_config::STORAGE_CLASS_ENV, class.clone()));
-            vars.push((crate::cluster_config::SNAPSHOT_CLASS_ENV, snapshot_class.clone()));
         }
         vars
     }
@@ -276,7 +274,7 @@ mod tests {
             capture: true,
             ztest_log: None,
             image_refs: std::collections::BTreeMap::new(),
-            storage: None,
+            storage: ("sc".into(), "vsc".into()),
         }
     }
 

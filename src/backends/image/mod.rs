@@ -10,6 +10,7 @@
 //!
 //! [`dev!`]: ztest_macros::dev
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -389,19 +390,21 @@ pub(crate) fn dev_request(entry: &DevImageEntry, tag: &str) -> Result<BuildReque
     })
 }
 
-/// [Build-manifest](seed_dev_images) lookup, reads no source. Miss =
-/// [`ImageError::DevImageMissing`], never a Dockerfile hash → an in-pod test
-/// (no Dockerfile) fails loud
-fn image_reference(entry: &DevImageEntry) -> Result<String, ImageError> {
+/// Build-manifest lookup, reads no source. Miss = [`ImageError::DevImageMissing`], never a
+/// Dockerfile hash → an in-pod test (no Dockerfile) fails loud
+fn image_reference(
+    manifest: &BTreeMap<String, String>,
+    entry: &DevImageEntry,
+) -> Result<String, ImageError> {
     let id =
         DevImageId::of(&entry.repo, &entry.features, entry.rust_version.as_deref(), &entry.source);
-    lookup_dev_image(id.as_str()).ok_or_else(|| ImageError::DevImageMissing {
+    manifest.get(id.as_str()).cloned().ok_or_else(|| ImageError::DevImageMissing {
         image: entry.repo.clone(),
         declared_by: entry.source.describe(),
     })
 }
 
-/// [Build-manifest](seed_dev_images) key: repo + features + toolchain + origin kind
+/// Build-manifest ([`IMAGE_REFS_ENV`]) key: repo + features + toolchain + origin kind
 /// (`Git` rev, or the constant `"local"`) — never a filesystem path.
 ///
 /// - Path-free is load-bearing (preflight & in-pod binaries differ in `CARGO_MANIFEST_DIR`)
@@ -556,38 +559,17 @@ pub fn registry_host() -> Option<String> {
     Some(base.split('/').next().unwrap_or(&base).to_string())
 }
 
-/// JSON `{DevImageId: pull_reference}` of the preflight's resolved dev images, stamped
-/// on every runner pod by `engine::pod_runner` (a baked in-pod image has no Dockerfile).
-/// Local kind seeds the same map process-globally ([`seed_dev_images`]) → [`resolve`]
-/// has one lookup path
+/// JSON `{DevImageId: pull_reference}` of the preflight's resolved dev images, injected into
+/// every test process (`EngineEnv::test_vars`). Absent = the run provisioned no dev image
 pub const IMAGE_REFS_ENV: &str = "ZTEST_IMAGE_REFS";
 
-/// `DevImageId → pull reference`, the single source [`resolve`] consults. Seeded from
-/// [`IMAGE_REFS_ENV`], extended by [`seed_dev_images`]
-fn manifest() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, String>> {
-    use std::sync::{Mutex, OnceLock};
-    static M: OnceLock<Mutex<std::collections::BTreeMap<String, String>>> = OnceLock::new();
-    M.get_or_init(|| {
-        Mutex::new(
-            std::env::var(IMAGE_REFS_ENV)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default(),
-        )
+/// `DevImageId → pull reference`, the single source [`resolve`] consults
+fn manifest() -> &'static BTreeMap<String, String> {
+    static M: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+    M.get_or_init(|| match std::env::var(IMAGE_REFS_ENV) {
+        Ok(json) => serde_json::from_str(&json).expect("ZTEST_IMAGE_REFS is ztest-written JSON"),
+        Err(_) => BTreeMap::new(),
     })
-}
-
-/// In-process tests (local kind) resolve the same way an in-pod test resolves the
-/// [`IMAGE_REFS_ENV`]-injected map
-pub fn seed_dev_images(refs: &std::collections::BTreeMap<String, String>) {
-    manifest()
-        .lock()
-        .expect("image manifest mutex poisoned")
-        .extend(refs.iter().map(|(k, v)| (k.clone(), v.clone())));
-}
-
-fn lookup_dev_image(id: &str) -> Option<String> {
-    manifest().lock().expect("image manifest mutex poisoned").get(id).cloned()
 }
 
 /// Engine-native for kind, pull-base-qualified for remote. Shared by the preflight (manifest
@@ -601,10 +583,17 @@ pub fn pod_reference(tag: &str) -> String {
     base.map(|b| join(&b, tag)).unwrap_or_else(|| tag.to_string())
 }
 
-/// [`ImageSpec::Dev`] resolves purely from the [build manifest](seed_dev_images), never
-/// a Dockerfile. Miss = [`ImageError::DevImageMissing`] (usually: ran `cargo test`
-/// directly, nothing populated the manifest), never a degrade to `default_published`
+/// [`ImageSpec::Dev`] resolves purely from the build manifest ([`IMAGE_REFS_ENV`]), never a
+/// Dockerfile. Miss = [`ImageError::DevImageMissing`], never a degrade to `default_published`
 pub fn resolve(spec: &ImageSpec, default_published: &str) -> Result<ResolvedImage, ImageError> {
+    resolve_in(manifest(), spec, default_published)
+}
+
+fn resolve_in(
+    manifest: &BTreeMap<String, String>,
+    spec: &ImageSpec,
+    default_published: &str,
+) -> Result<ResolvedImage, ImageError> {
     match spec {
         // Verbatim: mirroring, where configured, redirects the pull node-side via an
         // ImageTagMirrorSet (`resource::impls::mirror`) — nothing rewritten here
@@ -616,7 +605,7 @@ pub fn resolve(spec: &ImageSpec, default_published: &str) -> Result<ResolvedImag
                 features: features.clone(),
                 rust_version: rust_version.clone(),
             };
-            Ok(ResolvedImage { image: image_reference(&entry)? })
+            Ok(ResolvedImage { image: image_reference(manifest, &entry)? })
         }
     }
 }
@@ -936,13 +925,21 @@ mod tests {
             rust_version: None,
         };
         // Miss → DevImageMissing, no filesystem access
-        assert!(matches!(resolve(&spec, "unused"), Err(ImageError::DevImageMissing { .. })));
-        // Seeded by the spec's id → resolves to that reference
+        let empty = BTreeMap::new();
+        assert!(matches!(
+            resolve_in(&empty, &spec, "unused"),
+            Err(ImageError::DevImageMissing { .. })
+        ));
+        // Keyed by the spec's id → resolves to that reference
         let id = DevImageId::of("manifesttest", &["x".to_string()], None, &src);
-        let mut map = std::collections::BTreeMap::new();
-        map.insert(id.as_str().to_string(), "reg.svc:5000/ns/manifesttest:dev-abc".to_string());
-        seed_dev_images(&map);
-        assert_eq!(resolve(&spec, "unused").unwrap().image, "reg.svc:5000/ns/manifesttest:dev-abc");
+        let map = BTreeMap::from([(
+            id.as_str().to_string(),
+            "reg.svc:5000/ns/manifesttest:dev-abc".to_string(),
+        )]);
+        assert_eq!(
+            resolve_in(&map, &spec, "unused").unwrap().image,
+            "reg.svc:5000/ns/manifesttest:dev-abc"
+        );
     }
 
     /// The cache rests on this: an edit must fork the digest, and a rewrite that only moves

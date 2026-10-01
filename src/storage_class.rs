@@ -47,12 +47,9 @@ pub async fn discover(
                 Some((driver.to_string(), c.metadata.name.clone()?))
             })
             .collect(),
-        // 403 = this caller can't see snapshot classes (RBAC), not "cluster has none"
-        Err(kube::Error::Api(e)) if e.code == 403 => {
-            return Err(format!("list VolumeSnapshotClasses forbidden: {}", e.message).into());
-        }
-        // Anything else (e.g. snapshot CRDs absent) = the cluster cannot snapshot
-        Err(_) => Vec::new(),
+        // Snapshot CRDs absent = the cluster cannot snapshot
+        Err(e) if crate::cluster::is_not_found(&e) => Vec::new(),
+        Err(e) => return Err(format!("list VolumeSnapshotClasses: {e}").into()),
     };
 
     Ok(snapshot_capable(&classes.items, &vsc_drivers))
@@ -72,7 +69,7 @@ fn snapshot_capable(
                 .find(|(driver, _)| driver == &sc.provisioner)
                 .map(|(_, name)| name.clone())?;
             Some(StorageOption {
-                class_name: sc.metadata.name.clone().unwrap_or_default(),
+                class_name: sc.metadata.name.clone().expect("listed StorageClass has a name"),
                 provisioner: sc.provisioner.clone(),
                 snapshot_class,
                 is_default: sc
@@ -148,23 +145,21 @@ pub async fn selected(
 ///   business on it)
 /// - no cluster default → [`selected`] (unclassed PVC would hang Pending)
 /// - class immutable once bound → steers creation only
-pub async fn plain_class(client: &kube::Client, escape: &str) -> Option<String> {
+pub async fn plain_class(
+    client: &kube::Client,
+    escape: &str,
+) -> Result<Option<String>, crate::error::PipelineError> {
     if let Some(pinned) = std::env::var(escape).ok().filter(|s| !s.trim().is_empty()) {
-        return Some(pinned);
+        return Ok(Some(pinned));
     }
-    if has_default_class(client).await {
-        return None;
-    }
-    selected(client).await.ok().map(|o| o.class_name.clone())
-}
-
-/// Any default suffices — admission takes the newest where several claim it
-async fn has_default_class(client: &kube::Client) -> bool {
+    // Any default suffices — admission takes the newest where several claim it
     let api: Api<StorageClass> = Api::all(client.clone());
-    let Ok(list) = api.list(&Default::default()).await else {
-        return false;
-    };
-    list.items.iter().any(is_default_class)
+    let list =
+        api.list(&Default::default()).await.map_err(|e| format!("list StorageClasses: {e}"))?;
+    if list.items.iter().any(is_default_class) {
+        return Ok(None);
+    }
+    Ok(Some(selected(client).await?.class_name.clone()))
 }
 
 fn is_default_class(sc: &StorageClass) -> bool {

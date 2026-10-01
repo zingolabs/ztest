@@ -182,42 +182,27 @@ impl<T> Run<T> {
 /// Wire what only a detached run has onto `engine`, run it, attach what the engine cannot
 /// reach: flushed profiles + the mirrored durable report
 async fn drive<T>(env: TestEnv, mut engine: SyncEngine<T>) -> SyncOutcome {
-    let detached = super::active_sync_id();
-    let profile = std::env::var(super::SYNC_PROFILE_ENV).unwrap_or_default();
-    // Detached: a Prometheus target, read like any component. Local runs keep the silent
-    // reporter (nothing scrapes a `cargo test`)
-    if detached.is_some() {
-        if let Err(e) = super::export::install() {
-            return SyncOutcome::error_outcome(format!("driver metrics exporter: {e}"));
-        }
-        engine = engine.with_reporter(Box::new(super::export::MetricsReporter));
+    // `ztest run` drops every `#[sync_test]` → this only ever runs as a `ztest sync` driver
+    let sync_id = super::active_sync_id().expect("sync tests run only as a ztest sync driver");
+    let profile = std::env::var(super::SYNC_PROFILE_ENV).expect("ztest sync injects the profile");
+    let kube = env.kube_client().expect("built TestEnv holds a client");
+    // A Prometheus target, read like any component
+    if let Err(e) = super::export::install() {
+        return SyncOutcome::error_outcome(format!("driver metrics exporter: {e}"));
     }
-    // `ztest sync stop` (and SIGTERM on node loss) must checkpoint, not kill →
-    // route the in-pod stop-watch into engine cancellation. No namespace arg: it
-    // polls the driver's *own* pod via the downward API, which sits in the run
-    // namespace while deploying into the sync namespace
-    if let (Some(sync_id), Some(kube)) = (&detached, env.kube_client()) {
-        let cancel = super::detached::watch_stop(&kube).await;
-        engine = engine.with_cancel(cancel);
-        tracing::info!(sync_id = %sync_id, "detached sync: stop-watch armed");
-    }
+    engine = engine.with_reporter(Box::new(super::export::MetricsReporter));
+    // `ztest sync stop` (and SIGTERM on node loss) checkpoints, never kills
+    engine = engine.with_cancel(super::detached::watch_stop(&kube).await);
+    tracing::info!(sync_id = %sync_id, "detached sync: stop-watch armed");
     let outcome = engine.run().await;
-    if let Some(sync_id) = &detached {
-        tracing::info!("profiles available with `ztest sync perf {sync_id}`");
-    }
+    tracing::info!("profiles available with `ztest sync perf {sync_id}`");
     // Mirror to a ConfigMap so `ztest sync status` works after the pod is gone
-    if let (Some(sync_id), Some(kube)) = (&detached, env.kube_client()) {
-        let report = super::SyncReportMirror::from_outcome(sync_id, &profile, &outcome);
-        super::detached::write_report(&kube, &report).await;
-        tracing::info!(sync_id = %sync_id, "detached sync: report mirrored");
-    }
-    // Strict order: verdict durable → teardown → namespace offered to the reaper. Client
-    // cloned out first because `Drop` is what tears down (seed bindings), and a reaper
-    // acting on a shortened TTL would otherwise be free to delete this pod mid-teardown
-    let kube = env.kube_client();
+    let report = super::SyncReportMirror::from_outcome(&sync_id, &profile, &outcome);
+    super::detached::write_report(&kube, &report).await;
+    tracing::info!(sync_id = %sync_id, "detached sync: report mirrored");
+    // Strict order: verdict durable → teardown (`Drop`: seed bindings) → namespace offered to
+    // the reaper (a shortened TTL acting first could delete this pod mid-teardown)
     drop(env);
-    if let (Some(sync_id), Some(kube)) = (&detached, kube) {
-        super::detached::mark_finished(&kube, sync_id).await;
-    }
+    super::detached::mark_finished(&kube, &sync_id).await;
     outcome
 }
