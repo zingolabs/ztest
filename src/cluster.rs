@@ -80,27 +80,6 @@ pub fn no_cleanup_requested() -> bool {
     std::env::var_os(NO_CLEANUP_ENV).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// Under the `ztest run` orchestrator (`ZTEST_ENGINE`)? A `TestEnv` provisions against a
-/// scheduler-owned budget → running the binary directly has no admission or accounting
-/// (see [`require_orchestrator`])
-fn orchestrated() -> bool {
-    std::env::var_os("ZTEST_ENGINE").is_some_and(|v| !v.is_empty() && v != "0")
-}
-
-/// Fail fast outside the `ztest run` orchestrator (else unbudgeted pods land on whatever
-/// kubeconfig is loaded)
-pub fn require_orchestrator() -> Result<(), crate::EnvError> {
-    if orchestrated() {
-        return Ok(());
-    }
-    Err(crate::EnvError::Config {
-        reason: format!(
-            "needs the orchestrator: ztest run -- {}",
-            crate::naming::current_test_name()
-        ),
-    })
-}
-
 /// Namespace-scoped [`ResourceQuota`] capping aggregate `requests` at `footprint` and
 /// pod count at `pods`. Idempotent (409 = success).
 ///

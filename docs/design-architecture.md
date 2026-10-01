@@ -32,8 +32,8 @@ into the 63-char DNS-1123 limit, 8-hex suffix separating re-runs and `case_N`.
 - Untruncated identity lives in labels + the `ztest.io/test-full` annotation
 - Components keep short stable names (`zebrad`, …) at `{name}.{ns}.svc.cluster.local`; concurrency needs
   no slot pattern, because different tests are in different namespaces
-- `run_id` = `${ZTEST_RUN_ID}`/`${GITHUB_RUN_ID}` in CI, else `${USER}-${PPID}` (nextest's pid separates
-  concurrent invocations) — stamped on every resource so one run groups
+- `run_id` = `{user}-{random}`, minted once by `ztest` and injected as `ZTEST_RUN_ID` (= ledger lease
+  name) — stamped on every resource so one run groups
 - Per-test resources hang off a **sentinel** ConfigMap created at `build()` via `ownerReferences`; on
   `TestEnv` drop the sentinel goes and k8s GC cascades the rest
 
@@ -141,7 +141,7 @@ Every library-created resource carries:
 
 ```yaml
 labels:
-  ztest.io/run-id:  "${RUN_ID}"        # or ${USER}-${PPID}
+  ztest.io/run-id:  "${ZTEST_RUN_ID}"
   ztest.io/user:    "${USER}"
   ztest.io/role:    "test-env"         # what cleanup/janitor/RBAC select on
   ztest.io/package: "<crate>"

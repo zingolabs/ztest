@@ -3,8 +3,8 @@
 Cluster tests run through **`ztest run`**, never bare `cargo nextest`.
 
 - Arguments after `run` forward verbatim to nextest — migration is `s/cargo nextest/ztest/`
-- `TestEnv::build()` refuses outside the orchestrator (`ZTEST_ENGINE`), naming the command to use;
-  a bare `cargo test` would otherwise create unbudgeted pods on whatever kubeconfig is loaded
+- `TestEnv::build()` refuses without `ZTEST_RUN_ID` (minted + injected by `ztest`, never set by
+  hand), naming the command to use; a bare `cargo test` has no lease, so its pods would be unbudgeted
 - ztest owns the run loop itself (`src/engine/`); nextest is invoked only for `list`
 
 ## Requirements
@@ -110,7 +110,6 @@ One job on a stock GitHub runner; every expensive operation runs on the cluster.
 
 ```yaml
 env:
-  ZTEST_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
   ZTEST_IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
 
 jobs:
@@ -125,13 +124,11 @@ jobs:
       - name: registry login
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - run: ztest run -p clientless -p e2e
-      - if: always()
-        run: kubectl delete ns -l ztest.io/run-id=$ZTEST_RUN_ID
 ```
 
 - Auth = a ServiceAccount-token kubeconfig; the SA needs namespace CRUD, VolumeSnapshot create,
   node/CSIDriver read, and `Lease` CRUD in `ztest-meta`
 - Images push to `ghcr.io` with `GITHUB_TOKEN`; the cluster pulls over egress, so no cluster ingress
-- `ZTEST_RUN_ID` labels every resource → the cleanup step and cluster-resident observability filter by
-  run; no artifact-collection step, query by `run-id`
-- Skipped cleanup (preempted runner) falls to the TTL janitor
+- Run id = `{user}-{random}`, minted per invocation (CI ids repeat across matrix jobs/attempts) →
+  labels every resource; observability filters by `run-id`, no artifact-collection step
+- No cleanup step: a killed runner's lease lapses and its run-labelled objects are reaped

@@ -81,10 +81,10 @@ images/seeds are declared) but every run makes namespaces, so their reap must be
 
 ### Run-id propagation
 
-Tests derive `run_id` from `ZTEST_RUN_ID`, else `{user}-{ppid}` — parent and child disagree unless forced
-(a child's ppid is the orchestrator, the orchestrator's is the shell). So the parent **sets
-`ZTEST_RUN_ID` before any thread starts** and every child inherits it, putting parent-reaper and children
-on one id. Shadow VSCs (cluster-scoped, uncascaded) are labeled with it at mint time.
+- `ztest` mints one id per invocation (`RunCoords::mint`) = ledger lease name = `ztest.io/run-id`
+- Injected as `ZTEST_RUN_ID` into every test process (local child, runner pod, sync driver) via
+  `EngineEnv::test_vars`; absent → `TestEnv::build` refuses, no fallback
+- Shadow VSCs (cluster-scoped, uncascaded) carry it from `Sentinel.coords` at mint time
 
 ## Shutdown state machine
 

@@ -521,16 +521,15 @@ impl TestEnv {
     }
 
     pub async fn build(&mut self) -> Result<(), EnvError> {
-        // Orchestrated → diagnostics to stdout, riding the pod-log capture path (the
-        // reporter shows them per `--success-output`)
-        crate::observ::init_in_pod();
-        cluster::require_orchestrator()?;
+        // Before any provisioning: no ztest parent = no lease, no admission
+        let coords = RunCoords::from_env().map_err(env_err)?;
+        // Diagnostics → stdout (rides capture/replay, shown per `--success-output`)
+        crate::observ::init(crate::observ::Sink::Stdout);
         self.validate_topology()?;
         self.resolve_snapshot_pin()?;
         self.materialize_configs()?;
 
         let started = std::time::Instant::now();
-        let coords = RunCoords::from_env().map_err(env_err)?;
         // Raw `module::test` for the namespace annotation, DNS slug for every label value
         // (`::` is illegal in a label)
         let test_raw = naming::current_test_name();
@@ -579,7 +578,7 @@ impl TestEnv {
                 .map_err(env_err)?;
         }
         build_phase("namespace_quota", started);
-        let sentinel = Sentinel::new(namespace.clone());
+        let sentinel = Sentinel { namespace: namespace.clone(), coords };
         let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
         let test_name = test_slug;
 
@@ -599,7 +598,6 @@ impl TestEnv {
             client: &client,
             pods: &pods,
             sentinel: &sentinel,
-            coords: &coords,
             test_name: &test_name,
         };
 
@@ -1164,7 +1162,7 @@ async fn apply_pod(
     mounts: &[ResolvedMount],
     restartable: bool,
 ) -> Result<(), EnvError> {
-    let mut pod = spec.render(ctx.coords, ctx.test_name, mounts)?;
+    let mut pod = spec.render(&ctx.sentinel.coords, ctx.test_name, mounts)?;
     if restartable {
         crate::handles::pod::make_restartable(&mut pod);
     }
@@ -1291,7 +1289,6 @@ struct MaterializeCtx<'a> {
     client: &'a kube::Client,
     pods: &'a Api<Pod>,
     sentinel: &'a Sentinel,
-    coords: &'a RunCoords,
     test_name: &'a str,
 }
 

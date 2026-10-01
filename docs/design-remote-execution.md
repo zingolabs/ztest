@@ -14,7 +14,7 @@ progress. One engine, one `Executor` seam, both targets — the cluster profile 
 ## The run, in order
 
 1. **Prologue** (`cli/run.rs`) — parse flags; `cluster_config::activate` sets kube context, backend, and
-   push/pull registries from the profile; force one `ZTEST_RUN_ID` (the teardown selector); start the
+   push/pull registries from the profile; mint the run id (lease name + teardown selector); start the
    console thread
 1. **Probe** → `ClusterCapacity` (`qos`), kept live by `pipeline/capacity_watch`
 1. **Admit across runs** — a k8s-Lease `ledger` reserves this run's fair-share slice; a 2 s `governor`
@@ -72,8 +72,8 @@ progress. One engine, one `Executor` seam, both targets — the cluster profile 
   so `docker manifest inspect` cannot reach it the way the local engine does). 401/403, a timeout or a
   dead tunnel all read as *unknown* and rebuild: a false skip runs the wrong image, a false build costs
   one builder
-- **`ZTEST_ENGINE=1`** marks the child orchestrated — a `TestEnv` refuses to provision outside a
-  `ztest run` (the parent owns capacity admission)
+- **`ZTEST_RUN_ID`** = run identity + orchestration marker — a `TestEnv` refuses to provision
+  without it (the parent owns capacity admission)
 - **`ZTEST_IMAGE_REFS`** carries a `DevImageId → pull ref` map into the pod: the baked image has no
   source tree, so an in-pod test cannot recompute a `dev-<hash>` and resolves by this map
 - **ErrImagePull is terminal only after a grace window** — a run's pods pull one image at once and the

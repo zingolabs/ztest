@@ -73,8 +73,7 @@ fn qos(binary_id: &str, helper: &str, class: QosClass) -> (String, Vec<QosEntry>
 fn env() -> EngineEnv {
     EngineEnv {
         dylib_path: std::ffi::OsString::new(),
-        run_id: child::RUN_ID.into(),
-        sa: "ztest-local".into(),
+        run: crate::naming::RunCoords { run_id: child::RUN_ID.into(), user: "tester".into() },
         no_cleanup: false,
         capture: true,
         color: false,

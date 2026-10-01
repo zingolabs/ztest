@@ -1,6 +1,8 @@
 //! Run identity / slugs — orchestrator contract.
 
-pub use crate::naming::{DNS_LABEL_MAX, RunCoords, TEST_NAMESPACE_ENV, current_user, slug};
+pub use crate::naming::{
+    DNS_LABEL_MAX, RUN_ID_ENV, RunCoords, TEST_NAMESPACE_ENV, current_user, slug,
+};
 pub use crate::naming::{GRAFANA_SERVICE, OBS_NAMESPACE};
 pub use crate::naming::{ORCHESTRATOR_SERVICE_ACCOUNT, RUN_NAMESPACE, SYNC_NAMESPACE};
 pub use crate::naming::{TTL_ANNOTATION, ttl_value};

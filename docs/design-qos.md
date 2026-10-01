@@ -7,9 +7,8 @@ calibration.
 - Execution end-to-end via the engine ([design-execution-engine.md](design-execution-engine.md))
 - `qos::scheduler::Scheduler` = intra-run admission authority; the k8s-Lease ledger coordinates
   concurrent runs
-- Orchestration mandatory: `TestEnv::build()` refuses outside `ztest run`
-  (`cluster::require_orchestrator`, keyed on `ZTEST_ENGINE`) → a bare `cargo test` errors instead of
-  creating unbudgeted pods
+- Orchestration mandatory: `TestEnv::build()` refuses without `ZTEST_RUN_ID` (`RunCoords::from_env`)
+  → a bare `cargo test` errors instead of creating unbudgeted pods
 
 ## Per-pod defaults
 

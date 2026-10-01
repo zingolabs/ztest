@@ -181,20 +181,14 @@ pub async fn bind_seed(
     // No ownerRef (GC won't cross scopes) → no namespace-delete cascade, so labels are
     // the reapers' only handle: run-id/user for the by-identity (Ctrl-C) and by-owner
     // (`ztest cleanup`) sweeps, `test-ns` for the parent's per-test teardown
-    let coords = crate::naming::RunCoords::from_env().ok();
-    let run_id = coords.as_ref().map(|c| c.run_id.clone()).unwrap_or_default();
-    let user = coords
-        .as_ref()
-        .map(|c| crate::naming::slug(&c.user, crate::naming::DNS_LABEL_MAX))
-        .unwrap_or_default();
     let vsc_body: Value = json!({
         "apiVersion": "snapshot.storage.k8s.io/v1",
         "kind": "VolumeSnapshotContent",
         "metadata": {
             "name": binding_content,
             "labels": {
-                "ztest.io/run-id": run_id,
-                "ztest.io/user": user,
+                "ztest.io/run-id": sentinel.coords.run_id,
+                "ztest.io/user": sentinel.coords.user,
                 "ztest.io/test-ns": sentinel.namespace,
             },
         },

@@ -74,20 +74,14 @@ fn prints_stdout() {
 }
 
 #[test]
-fn prints_ztest_engine() {
+fn prints_test_vars() {
     if !playing() {
         return;
     }
-    println!("ENGINE=[{}]", std::env::var("ZTEST_ENGINE").unwrap_or_default());
-    exit(0);
-}
-
-#[test]
-fn prints_image_refs() {
-    if !playing() {
-        return;
-    }
-    println!("REFS={}", std::env::var(crate::backends::image::IMAGE_REFS_ENV).unwrap_or_default());
+    let var = |k: &str| std::env::var(k).unwrap_or_default();
+    println!("RUN=[{}]", var(crate::naming::RUN_ID_ENV));
+    println!("USER=[{}]", var("USER"));
+    println!("REFS={}", var(crate::backends::image::IMAGE_REFS_ENV));
     exit(0);
 }
 

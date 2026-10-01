@@ -49,8 +49,7 @@ impl Executor for LocalExecutor {
 #[derive(Debug, Clone)]
 pub struct EngineEnv {
     pub dylib_path: OsString,
-    pub run_id: String,
-    pub sa: String,
+    pub run: crate::naming::RunCoords,
     pub no_cleanup: bool,
     pub ztest_log: Option<String>,
     pub capture: bool,
@@ -59,6 +58,33 @@ pub struct EngineEnv {
     /// (storage class, snapshot class) the orchestrator resolved. `None` on the local path,
     /// where the process discovers them itself under the caller's own credentials
     pub storage: Option<(String, String)>,
+}
+
+impl EngineEnv {
+    /// Vars every test process gets, local child or runner pod alike (one list → the two
+    /// spawn paths cannot drift)
+    pub fn test_vars(&self) -> Vec<(&'static str, String)> {
+        let mut vars = vec![
+            ("NEXTEST", "1".to_string()),
+            ("NEXTEST_EXECUTION_MODE", "process-per-test".to_string()),
+            ("NEXTEST_RUN_ID", self.run.run_id.clone()),
+            (crate::naming::RUN_ID_ENV, self.run.run_id.clone()),
+            ("USER", self.run.user.clone()),
+        ];
+        if self.no_cleanup {
+            vars.push((crate::cluster::NO_CLEANUP_ENV, "1".to_string()));
+        }
+        if let Some(filter) = &self.ztest_log {
+            vars.push(("ZTEST_LOG", filter.clone()));
+        }
+        // Preflight's resolved component-image refs (test process has no Dockerfile/manifest)
+        if !self.image_refs.is_empty()
+            && let Ok(json) = serde_json::to_string(&self.image_refs)
+        {
+            vars.push((crate::backends::image::IMAGE_REFS_ENV, json));
+        }
+        vars
+    }
 }
 
 /// Outcome of one test process. `output` = merged stdout+stderr (pod path:
@@ -191,26 +217,10 @@ fn build_command(
         .stdin(Stdio::null())
         // Dynamic-library path (the libstdc++-exit-127 fix)
         .env(super::dylib::dylib_path_envvar(), &env.dylib_path)
-        .env("NEXTEST", "1")
-        .env("NEXTEST_EXECUTION_MODE", "process-per-test")
-        .env("NEXTEST_RUN_ID", &env.run_id)
         .env("CARGO_MANIFEST_DIR", &item.cwd)
-        // Marks the child orchestrated; a `TestEnv` refuses to provision outside a
-        // `ztest run` (`cluster::require_orchestrator`)
-        .env("ZTEST_ENGINE", "1")
-        .env("ZTEST_SA", &env.sa)
         .env("ZTEST_COLOR", if env.color { "1" } else { "0" })
-        .env(crate::logstream::COMPONENT_LOG_ENV, hand_off);
-    if env.no_cleanup {
-        std_cmd.env(crate::cluster::NO_CLEANUP_ENV, "1");
-    }
-    // Preflight's resolved component-image references (`image::resolve` in the child has
-    // no seeded manifest of its own — separate process)
-    if !env.image_refs.is_empty()
-        && let Ok(json) = serde_json::to_string(&env.image_refs)
-    {
-        std_cmd.env(crate::backends::image::IMAGE_REFS_ENV, json);
-    }
+        .env(crate::logstream::COMPONENT_LOG_ENV, hand_off)
+        .envs(env.test_vars());
 
     #[cfg(unix)]
     {
@@ -251,8 +261,7 @@ mod tests {
     fn env() -> EngineEnv {
         EngineEnv {
             dylib_path: OsString::new(),
-            run_id: child::RUN_ID.into(),
-            sa: "ztest-local".into(),
+            run: crate::naming::RunCoords { run_id: child::RUN_ID.into(), user: "tester".into() },
             no_cleanup: false,
             capture: true,
             color: false,
@@ -314,26 +323,22 @@ mod tests {
         assert!(output(&out).contains("hello-stdout"), "{:?}", output(&out));
     }
 
-    /// A dropped `ZTEST_ENGINE` fails every cluster test fast at `require_orchestrator`
+    /// - Missing run id → every `TestEnv::build` refuses (`naming::NotUnderZtest`)
+    /// - Missing manifest → every `dev!` component resolves to `DevImageMissing`
     #[tokio::test]
-    async fn children_run_marked_as_orchestrated() {
-        let out = play("prints_ztest_engine", &env()).await;
-        assert_eq!(out.verdict, Verdict::Pass);
-        assert!(
-            output(&out).contains("ENGINE=[1]"),
-            "children must inherit ZTEST_ENGINE=1; got {:?}",
-            output(&out)
-        );
-    }
-
-    /// Without it every `dev!` component resolves to `DevImageMissing` (the manifest
-    /// `seed_dev_images` fills lives in the parent process)
-    #[tokio::test]
-    async fn children_inherit_the_resolved_image_manifest() {
+    async fn children_receive_the_run_identity_and_image_manifest() {
         let mut e = env();
         e.image_refs.insert("zainod@sha".into(), "zainod:dev-abc".into());
-        let out = play("prints_image_refs", &e).await;
-        assert!(output(&out).contains(r#"{"zainod@sha":"zainod:dev-abc"}"#), "{:?}", output(&out));
+        let out = play("prints_test_vars", &e).await;
+        let shown = output(&out);
+        assert_eq!(out.verdict, Verdict::Pass, "{shown:?}");
+        for want in [
+            format!("RUN=[{}]", child::RUN_ID),
+            "USER=[tester]".into(),
+            r#"REFS={"zainod@sha":"zainod:dev-abc"}"#.into(),
+        ] {
+            assert!(shown.contains(&want), "missing {want} in {shown:?}");
+        }
     }
 
     /// stderr must land *inside* the frame: appended after libtest's `test result:` line it

@@ -26,8 +26,6 @@ use crate::pod_status::{
 ///   to create the test's sibling component pods
 /// - `path_map` rewrites local→pod prefixes (longest wins, unmatched pass through) over
 ///   the binary path, the cwd and each `LD_LIBRARY_PATH` entry
-/// - `image_refs` (`DevImageId → pull reference`) ships as [`image::IMAGE_REFS_ENV`] →
-///   in-pod tests resolve component images by path-free id, no Dockerfile needed
 #[derive(Debug, Clone)]
 pub struct PodRunConfig {
     pub namespace: String,
@@ -37,7 +35,6 @@ pub struct PodRunConfig {
     pub volumes: Vec<corev1::Volume>,
     pub volume_mounts: Vec<corev1::VolumeMount>,
     pub path_map: Vec<(String, String)>,
-    pub image_refs: BTreeMap<String, String>,
     pub env: EngineEnv,
 }
 
@@ -65,7 +62,6 @@ impl PodRunConfig {
         local_workspace: String,
         node_workspace: String,
         service_account: Option<String>,
-        image_refs: BTreeMap<String, String>,
     ) -> Self {
         let volume = corev1::Volume {
             name: "workspace".to_string(),
@@ -89,7 +85,6 @@ impl PodRunConfig {
             volumes: vec![volume],
             volume_mounts: vec![mount],
             path_map: Vec::new(),
-            image_refs,
             env,
         }
     }
@@ -102,7 +97,6 @@ impl PodRunConfig {
         image: String,
         namespace: String,
         service_account: Option<String>,
-        image_refs: BTreeMap<String, String>,
     ) -> Self {
         Self {
             namespace,
@@ -112,7 +106,6 @@ impl PodRunConfig {
             volumes: Vec::new(),
             volume_mounts: Vec::new(),
             path_map: Vec::new(),
-            image_refs,
             env,
         }
     }
@@ -145,17 +138,6 @@ async fn run_in_pod(
     // fetches every pod's logs at the terminal, tears it down after → a definitive
     // `api.logs` fetch can't race an in-pod delete. The in-pod `TestEnv::build` reads
     // `ZTEST_TEST_NAMESPACE` (injected below) and skips its own create + teardown
-    let coords = match crate::naming::RunCoords::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            return TestOutcome {
-                verdict: Verdict::SpawnError,
-                output: format!("resolve run coords: {e}").into_bytes(),
-                components: Vec::new(),
-                duration: started.elapsed(),
-            };
-        }
-    };
     let test_ns = crate::naming::namespace_for(
         &item.binary_id,
         &item.test_name,
@@ -167,7 +149,7 @@ async fn run_in_pod(
     if let Err(e) = crate::cluster::ensure_namespace(
         &client,
         &test_ns,
-        &coords,
+        &cfg.env.run,
         &item.binary_id,
         &item.test_name,
     )
@@ -356,18 +338,12 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> 
 
     let mut env = vec![
         env_var(crate::engine::dylib::dylib_path_envvar(), &ld),
-        env_var("NEXTEST", "1"),
-        env_var("NEXTEST_EXECUTION_MODE", "process-per-test"),
-        env_var("NEXTEST_RUN_ID", &cfg.env.run_id),
         env_var("CARGO_MANIFEST_DIR", &cwd),
-        // Marks the child orchestrated (parent owns capacity admission); a `TestEnv`
-        // refuses to provision outside a `ztest run`
-        env_var("ZTEST_ENGINE", "1"),
-        env_var("ZTEST_SA", &cfg.env.sa),
         // Laptop-created per-test namespace this pod's `TestEnv` provisions into: read
         // instead of invented, and create + teardown skipped (`naming::TEST_NAMESPACE_ENV`)
         env_var(crate::naming::TEST_NAMESPACE_ENV, test_ns),
     ];
+    env.extend(cfg.env.test_vars().iter().map(|(k, v)| env_var(k, v)));
     // Storage + snapshot class, resolved once by the orchestrator and handed down.
     // - `storage_class::selected` reads these before its own lookup
     // - That lookup lists cluster-scoped StorageClasses/VolumeSnapshotClasses, which a driver's
@@ -376,33 +352,11 @@ fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> 
         env.push(env_var(crate::cluster_config::STORAGE_CLASS_ENV, class));
         env.push(env_var(crate::cluster_config::SNAPSHOT_CLASS_ENV, snapshot_class));
     }
-    if cfg.env.no_cleanup {
-        env.push(env_var(crate::cluster::NO_CLEANUP_ENV, "1"));
-    }
-    // Forward the laptop's diagnostics filter so `observ::init_in_pod` honours the same
-    // `ZTEST_LOG` the operator set (mirrors `NEXTEST_LOG`). Unset → the pod's own default
-    if let Some(filter) = &cfg.env.ztest_log {
-        env.push(env_var("ZTEST_LOG", filter));
-    }
-    // Laptop's resolved component-image references → the in-pod test resolves them
-    // without a Dockerfile it doesn't have (`image::resolve`)
-    if !cfg.image_refs.is_empty()
-        && let Ok(json) = serde_json::to_string(&cfg.image_refs)
-    {
-        env.push(env_var(crate::backends::image::IMAGE_REFS_ENV, &json));
-    }
-
-    // Run-id label is load-bearing: the parent's `reap_run` (Ctrl-C path) deletes every
-    // resource matching it, so a runner pod is cleaned up even if this process is killed.
-    //
-    // User label = backstop for when that teardown never runs (parent SIGKILLed, terminal
-    // closed): `ztest cleanup` scopes by [`LABEL_USER`](crate::qos::LABEL_USER), so
-    // without it the pod survives every reap the operator can reach and holds its
-    // Guaranteed footprint. From the environment — this pod is created in-process by the
-    // same operator the engine runs as
+    // - run-id → parent's `reap_run` (Ctrl-C) + ledger attribution
+    // - user → `ztest cleanup --mine` when that teardown never ran
     let labels = BTreeMap::from([
-        (crate::qos::LABEL_RUN_ID.to_string(), cfg.env.run_id.clone()),
-        (crate::qos::LABEL_USER.to_string(), crate::naming::current_user()),
+        (crate::qos::LABEL_RUN_ID.to_string(), cfg.env.run.run_id.clone()),
+        (crate::qos::LABEL_USER.to_string(), cfg.env.run.user.clone()),
     ]);
 
     // Guaranteed QoS: sized at its tier's runner footprint, `requests == limits` with
@@ -588,22 +542,24 @@ mod tests {
         WorkItem { class, ..work("crate::b", "t") }
     }
 
-    #[test]
-    fn runner_pod_is_guaranteed_and_sized_from_the_tier_runner_footprint() {
-        use crate::qos::QosClass;
-        let env = EngineEnv {
+    /// Infrastructure only: tests below assert pod shape, never these values
+    fn env() -> EngineEnv {
+        EngineEnv {
             dylib_path: std::ffi::OsString::from("/x"),
-            run_id: "r".into(),
-            sa: "ztest".into(),
+            run: crate::naming::RunCoords { run_id: "r".into(), user: "u".into() },
             no_cleanup: false,
             capture: true,
             color: false,
             ztest_log: None,
             image_refs: BTreeMap::new(),
             storage: None,
-        };
-        let cfg =
-            PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
+        }
+    }
+
+    #[test]
+    fn runner_pod_is_guaranteed_and_sized_from_the_tier_runner_footprint() {
+        use crate::qos::QosClass;
+        let cfg = PodRunConfig::baked(env(), "runner:dev".into(), "ztest".into(), None);
 
         // Regtest/integration tier runner: one whole core (orchestration)
         let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Integration), "ztest-test-ns");
@@ -622,74 +578,83 @@ mod tests {
         assert_eq!(req["cpu"].0, "2");
     }
 
-    /// A driver pod is namespace-bound, so it cannot list cluster-scoped StorageClasses or
-    /// VolumeSnapshotClasses — the orchestrator resolves them and passes the answer down. Drop
-    /// these vars and every test declaring a volume 403s in-pod at `TestEnv::build`
+    /// In-pod `TestEnv` reads all of these and can derive none:
+    /// - run id + user → `ztest.io/*` labels on every component pod (ledger attribution, reaping)
+    /// - storage classes → driver SA may not list cluster-scoped classes (403 in-pod)
+    /// - unresolved optionals stay absent, never empty
     #[test]
-    fn a_driver_pod_is_handed_the_storage_classes_it_may_not_look_up() {
-        use crate::qos::QosClass;
-        let plain = || EngineEnv {
+    fn runner_pod_carries_the_run_identity_and_every_orchestrator_resolved_value() {
+        let full = EngineEnv {
             dylib_path: std::ffi::OsString::from("/x"),
-            run_id: "r".into(),
-            sa: "ztest".into(),
-            no_cleanup: false,
+            run: crate::naming::RunCoords { run_id: "eli-0a1b2c3d".into(), user: "eli".into() },
+            no_cleanup: true,
             capture: true,
             color: false,
+            ztest_log: Some("ztest::build=debug".into()),
+            image_refs: BTreeMap::from([("k".into(), "reg.svc:5000/zainod:dev-abc".into())]),
+            storage: Some(("fast-ssd".into(), "csi-snapclass".into())),
+        };
+        let cfg = PodRunConfig::baked(full.clone(), "runner:dev".into(), "ztest".into(), None);
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-pkg-t-abcd1234");
+        let vars: BTreeMap<String, String> = pod.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|v| (v.name, v.value.unwrap_or_default()))
+            .collect();
+        let want = [
+            (crate::naming::RUN_ID_ENV, "eli-0a1b2c3d"),
+            ("NEXTEST_RUN_ID", "eli-0a1b2c3d"),
+            ("USER", "eli"),
+            (crate::naming::TEST_NAMESPACE_ENV, "ztest-pkg-t-abcd1234"),
+            (crate::cluster::NO_CLEANUP_ENV, "1"),
+            ("ZTEST_LOG", "ztest::build=debug"),
+            (crate::backends::image::IMAGE_REFS_ENV, r#"{"k":"reg.svc:5000/zainod:dev-abc"}"#),
+            (crate::cluster_config::STORAGE_CLASS_ENV, "fast-ssd"),
+            (crate::cluster_config::SNAPSHOT_CLASS_ENV, "csi-snapclass"),
+        ];
+        for (k, v) in want {
+            assert_eq!(vars.get(k).map(String::as_str), Some(v), "{k} in {vars:?}");
+        }
+        assert_eq!(
+            pod.metadata.labels.unwrap(),
+            BTreeMap::from([
+                (crate::qos::LABEL_RUN_ID.to_string(), "eli-0a1b2c3d".to_string()),
+                (crate::qos::LABEL_USER.to_string(), "eli".to_string()),
+            ])
+        );
+
+        let bare = EngineEnv {
+            no_cleanup: false,
             ztest_log: None,
             image_refs: BTreeMap::new(),
             storage: None,
+            ..full
         };
-        let env =
-            EngineEnv { storage: Some(("fast-ssd".into(), "csi-snapclass".into())), ..plain() };
-        let cfg =
-            PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
-        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Integration), "ztest-test-ns");
-
-        let vars: std::collections::BTreeMap<&str, &str> = pod.spec.as_ref().unwrap().containers[0]
+        let cfg = PodRunConfig::baked(bare, "runner:dev".into(), "ztest".into(), None);
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
+        let names: Vec<String> = pod.spec.unwrap().containers[0]
             .env
-            .as_ref()
-            .expect("driver env")
-            .iter()
-            .map(|v| (v.name.as_str(), v.value.as_deref().unwrap_or("")))
-            .collect();
-        assert_eq!(vars.get(crate::cluster_config::STORAGE_CLASS_ENV), Some(&"fast-ssd"));
-        assert_eq!(vars.get(crate::cluster_config::SNAPSHOT_CLASS_ENV), Some(&"csi-snapclass"));
-
-        // Unresolved: the vars must be absent, not empty — `storage_class::selected` falls back
-        // to its own lookup only when neither is set
-        let cfg = PodRunConfig::baked(
-            plain(),
-            "runner:dev".into(),
-            "ztest".into(),
-            None,
-            BTreeMap::new(),
-        );
-        let pod = build_pod("p", &cfg, &work_in_tier(QosClass::Integration), "ztest-test-ns");
-        let names: Vec<&str> = pod.spec.as_ref().unwrap().containers[0]
-            .env
-            .as_ref()
+            .clone()
             .unwrap()
-            .iter()
-            .map(|v| v.name.as_str())
+            .into_iter()
+            .map(|v| v.name)
             .collect();
-        assert!(!names.contains(&crate::cluster_config::STORAGE_CLASS_ENV));
+        for absent in [
+            crate::cluster::NO_CLEANUP_ENV,
+            "ZTEST_LOG",
+            crate::backends::image::IMAGE_REFS_ENV,
+            crate::cluster_config::STORAGE_CLASS_ENV,
+            crate::cluster_config::SNAPSHOT_CLASS_ENV,
+        ] {
+            assert!(!names.iter().any(|n| n == absent), "{absent} must be absent: {names:?}");
+        }
     }
 
     #[test]
     fn runner_pod_evicts_immediately_on_node_loss() {
-        let env = EngineEnv {
-            dylib_path: std::ffi::OsString::from("/x"),
-            run_id: "r".into(),
-            sa: "ztest".into(),
-            no_cleanup: false,
-            capture: true,
-            color: false,
-            ztest_log: None,
-            image_refs: BTreeMap::new(),
-            storage: None,
-        };
-        let cfg =
-            PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
+        let cfg = PodRunConfig::baked(env(), "runner:dev".into(), "ztest".into(), None);
         let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
         let tols = pod.spec.unwrap().tolerations.unwrap();
         let nr = tols
@@ -769,117 +734,5 @@ mod tests {
         let p = pod_with(Some("Pending"), None, Some("ImagePullBackOff"));
         assert!(terminal_state(&p).is_none());
         assert_eq!(image_error(p.status.as_ref().unwrap()).as_deref(), Some("ImagePullBackOff"));
-    }
-
-    #[test]
-    fn build_pod_carries_image_refs_env() {
-        let env = EngineEnv {
-            dylib_path: std::ffi::OsString::from("/x"),
-            run_id: "r".into(),
-            sa: "ztest".into(),
-            no_cleanup: false,
-            capture: true,
-            color: false,
-            ztest_log: None,
-            image_refs: BTreeMap::new(),
-            storage: None,
-        };
-        let mut refs = BTreeMap::new();
-        refs.insert("k".to_string(), "reg.svc:5000/ns/zainod:dev-abc".to_string());
-        let cfg = PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, refs);
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
-        let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
-        let refs_var = vars
-            .iter()
-            .find(|v| v.name == crate::backends::image::IMAGE_REFS_ENV)
-            .expect("IMAGE_REFS_ENV set");
-        assert!(refs_var.value.as_deref().unwrap().contains("zainod:dev-abc"));
-    }
-
-    #[test]
-    fn build_pod_omits_image_refs_env_when_empty() {
-        let env = EngineEnv {
-            dylib_path: std::ffi::OsString::from("/x"),
-            run_id: "r".into(),
-            sa: "ztest".into(),
-            no_cleanup: false,
-            capture: true,
-            color: false,
-            ztest_log: None,
-            image_refs: BTreeMap::new(),
-            storage: None,
-        };
-        let cfg =
-            PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
-        let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
-        assert!(!vars.iter().any(|v| v.name == crate::backends::image::IMAGE_REFS_ENV));
-    }
-
-    #[test]
-    fn build_pod_forwards_ztest_log_when_set() {
-        let env = EngineEnv {
-            dylib_path: std::ffi::OsString::from("/x"),
-            run_id: "r".into(),
-            sa: "ztest".into(),
-            no_cleanup: false,
-            capture: true,
-            color: false,
-            ztest_log: Some("ztest::build=debug".into()),
-            image_refs: BTreeMap::new(),
-            storage: None,
-        };
-        let cfg =
-            PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
-        let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
-        let log = vars.iter().find(|v| v.name == "ZTEST_LOG").expect("ZTEST_LOG forwarded");
-        assert_eq!(log.value.as_deref(), Some("ztest::build=debug"));
-    }
-
-    #[test]
-    fn build_pod_omits_ztest_log_when_unset() {
-        let env = EngineEnv {
-            dylib_path: std::ffi::OsString::from("/x"),
-            run_id: "r".into(),
-            sa: "ztest".into(),
-            no_cleanup: false,
-            capture: true,
-            color: false,
-            ztest_log: None,
-            image_refs: BTreeMap::new(),
-            storage: None,
-        };
-        let cfg =
-            PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
-        let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
-        assert!(!vars.iter().any(|v| v.name == "ZTEST_LOG"));
-    }
-
-    #[test]
-    fn build_pod_injects_the_laptop_chosen_test_namespace() {
-        // Parent picks and injects the per-test namespace name; the in-pod `TestEnv` reads
-        // exactly this → provisions into the namespace the parent follows and tears down
-        let env = EngineEnv {
-            dylib_path: std::ffi::OsString::from("/x"),
-            run_id: "r".into(),
-            sa: "ztest".into(),
-            no_cleanup: false,
-            capture: true,
-            color: false,
-            ztest_log: None,
-            image_refs: BTreeMap::new(),
-            storage: None,
-        };
-        let cfg =
-            PodRunConfig::baked(env, "runner:dev".into(), "ztest".into(), None, BTreeMap::new());
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-pkg-t-abcd1234");
-        let vars = pod.spec.unwrap().containers[0].env.clone().unwrap();
-        let ns = vars
-            .iter()
-            .find(|v| v.name == crate::naming::TEST_NAMESPACE_ENV)
-            .expect("ZTEST_TEST_NAMESPACE injected");
-        assert_eq!(ns.value.as_deref(), Some("ztest-pkg-t-abcd1234"));
     }
 }

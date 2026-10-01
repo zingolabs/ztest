@@ -2,8 +2,8 @@
 //! captured output the reporter replays. `ZTEST_LOG` = nextest's `NEXTEST_LOG`.
 //!
 //! Sink choice:
-//! - In-pod (`ZTEST_ENGINE=1`) → stdout, so diagnostics ride the capture/replay
-//!   path ([`init_in_pod`])
+//! - Test process → stdout, so diagnostics ride the capture/replay path
+//!   ([`TestEnv::build`](crate::env))
 //! - TTY laptop → per-run file ([`Sink::File`]); stderr would tear the pinned panel
 //! - Non-TTY (CI/piped) → stderr ([`Sink::Stderr`])
 //!
@@ -40,15 +40,6 @@ fn env_filter() -> EnvFilter {
 /// ones no-op (callers need not coordinate)
 pub fn init(sink: Sink) {
     INIT.call_once(|| install(sink));
-}
-
-/// Install the in-pod (stdout) subscriber under `ZTEST_ENGINE=1`; no-op elsewhere
-/// (plain `cargo test` unaffected). Call early from
-/// [`TestEnv::build`](crate::env)
-pub fn init_in_pod() {
-    if std::env::var_os("ZTEST_ENGINE").is_some() {
-        init(Sink::Stdout);
-    }
 }
 
 fn install(sink: Sink) {

@@ -69,7 +69,7 @@ pub struct EngineOpts {
     pub slow_after: Option<Duration>,
     pub sa: String,
     pub no_cleanup: bool,
-    pub run_id: String,
+    pub run: crate::naming::RunCoords,
     pub output: crate::engine::output::OutputConfig,
 }
 
@@ -130,8 +130,7 @@ pub fn run(
 
     let env = EngineEnv {
         dylib_path: dylib::dylib_path_value(&input.summary.rust_build_meta),
-        run_id: input.opts.run_id.clone(),
-        sa: input.opts.sa.clone(),
+        run: input.opts.run.clone(),
         no_cleanup: input.opts.no_cleanup,
         capture: input.opts.output.captures(),
         color: supports_color::on(supports_color::Stream::Stdout).is_some(),
@@ -152,7 +151,7 @@ pub fn run(
         slow_after: input.opts.slow_after,
         sa: input.opts.sa.clone(),
         redraw: Duration::from_millis(33),
-        run_id: input.opts.run_id.clone(),
+        run_id: input.opts.run.run_id.clone(),
         // Fired by the render thread on Ctrl-C; off a TTY there is none, so the process
         // dies on the default SIGINT disposition
         cancel: view.map(RunView::cancel).unwrap_or_else(Cancel::never),
@@ -170,7 +169,7 @@ pub fn run(
     // pod's `CARGO_TARGET_DIR=/cache/target` on the on-cluster path, absent on the laptop, so
     // the subscriber falls back to stderr and desyncs the pinned footer with `ztest::pod` events.
     let log_path =
-        std::env::temp_dir().join("ztest-logs").join(format!("{}.log", input.opts.run_id));
+        std::env::temp_dir().join("ztest-logs").join(format!("{}.log", input.opts.run.run_id));
     match view {
         Some(v) if output.captures() => {
             crate::observ::init(crate::observ::Sink::File(log_path.clone()));
@@ -187,7 +186,7 @@ pub fn run(
     // Recording sink, on by default (`ZTEST_NO_RECORD=1` opts out). Best effort: a setup
     // failure warns and disables rather than aborting (replay is auxiliary to running tests).
     let recorder = if record::recording_enabled() {
-        build_recorder(&input.opts.run_id, output.captures())
+        build_recorder(&input.opts.run.run_id, output.captures())
     } else {
         None
     };
@@ -385,9 +384,8 @@ fn select_executor(
     // `hostpath` mounting the workspace from the node)
     let baked = from_preflight.is_some()
         || std::env::var("ZTEST_RUNNER_DELIVERY").as_deref() == Ok("baked");
-    let image_refs = input.image_refs.clone();
     let cfg = if baked {
-        pod_runner::PodRunConfig::baked(env, image, namespace, service_account, image_refs)
+        pod_runner::PodRunConfig::baked(env, image, namespace, service_account)
     } else {
         let target_dir = input.summary.rust_build_meta.target_directory.as_str();
         let workspace = std::path::Path::new(target_dir)
@@ -403,7 +401,6 @@ fn select_executor(
             workspace,
             node_workspace,
             service_account,
-            image_refs,
         )
     };
     Ok(std::sync::Arc::new(pod_runner::PodExecutor::new(client, cfg)))

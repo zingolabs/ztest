@@ -411,22 +411,16 @@ pub fn execute(args: Args) -> ExitCode {
     let mut state = build_initial_state(&opts);
     let session_start = Instant::now();
 
-    // Shared run id up front → parent reaper + every (env-inheriting) test child agree on
-    // `ztest.io/run-id`; else each derives its own `{user}-{ppid}` and label-reap misses.
-    //
-    // SAFETY: `set_var` must precede thread creation; still single-threaded here.
-    if std::env::var_os("ZTEST_RUN_ID").is_none() && std::env::var_os("GITHUB_RUN_ID").is_none() {
-        let user = std::env::var("USER").unwrap_or_else(|_| "anon".into());
-        unsafe {
-            std::env::set_var("ZTEST_RUN_ID", format!("ztest-{user}-{}", std::process::id()));
-        }
+    // Minted here, injected into every test process; never caller-supplied (uniqueness =
+    // the lease's correctness, and CI ids repeat across jobs/attempts)
+    if std::env::var_os(ztest::api::naming::RUN_ID_ENV).is_some() {
+        eprintln!(
+            "ztest run: {} is set by ztest, not the caller; unset it",
+            ztest::api::naming::RUN_ID_ENV
+        );
+        return exit(NextestExitCode::SETUP_ERROR);
     }
-    let run_coords = ztest::api::naming::RunCoords::from_env().unwrap_or_else(|_| {
-        ztest::api::naming::RunCoords {
-            run_id: format!("ztest-{}", std::process::id()),
-            user: "anon".to_string(),
-        }
-    });
+    let run_coords = ztest::api::naming::RunCoords::mint();
 
     let tty = stdout().is_terminal();
 
@@ -748,8 +742,6 @@ fn launch_engine(
     let selected_binaries = selected_binaries.as_slice();
 
     let sa = service_account();
-    // Shared with the reservation lease → ledger's per-run invariant groups the runner pods
-    let run_id = format!("ztest-run-{}", std::process::id());
 
     // Scheduler ceiling = the granted slice, never a raw `free()` snapshot, so concurrent
     // runs carve the node up instead of all claiming the same headroom (`docs/design-qos.md`)
@@ -761,7 +753,7 @@ fn launch_engine(
     };
     let reservation = match work_rt.block_on(ztest::qos::ledger::acquire(
         &client,
-        &run_id,
+        &run.run_id,
         &sa,
         &run.user,
         *capacity,
@@ -809,7 +801,7 @@ fn launch_engine(
             slow_after: opts.slow_after,
             sa,
             no_cleanup: opts.no_cleanup,
-            run_id,
+            run: run.clone(),
             output: opts.output_config(),
         },
         reservation: Some(reservation.clone()),

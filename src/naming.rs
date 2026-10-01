@@ -8,11 +8,12 @@
 //! - Components keep short stable names (`zebrad`, …) at `{name}.{ns}.svc.cluster.local`;
 //!   concurrency needs no slot pattern (different namespaces)
 
-/// Where the test process thinks it is; picked once at `TestEnv::build`.
-///
-/// - `run_id` = `${GITHUB_RUN_ID}` in CI / `${USER}-${PPID}` in dev, stamped on every
-///   resource so one CI run or dev session groups
-/// - `user` = `${USER}` else `anon` → the `ztest.io/user` namespace label
+/// Run id: minted once by the `ztest` CLI ([`RunCoords::mint`]), handed to every test process
+/// as [`RUN_ID_ENV`]. Absent = not launched by `ztest` → hard error, never a fallback
+pub const RUN_ID_ENV: &str = "ZTEST_RUN_ID";
+
+/// One run's identity: ledger lease name = `ztest.io/run-id` on every object it creates.
+/// `user` = slugged [`current_user`] (the `ztest.io/user` label value)
 #[derive(Debug, Clone)]
 pub struct RunCoords {
     pub run_id: String,
@@ -20,41 +21,24 @@ pub struct RunCoords {
 }
 
 impl RunCoords {
+    /// CLI side: fresh, globally unique id (random suffix — pid/CI ids collide across hosts,
+    /// matrix jobs and attempts)
+    pub fn mint() -> Self {
+        let user = current_user();
+        RunCoords { run_id: format!("{user}-{}", test_suffix()), user }
+    }
+
+    /// Test side: the id the launching `ztest` process injected
     pub fn from_env() -> Result<Self, NamingError> {
-        let ci_run_id =
-            std::env::var("ZTEST_RUN_ID").ok().or_else(|| std::env::var("GITHUB_RUN_ID").ok());
-
-        let user = std::env::var("USER").unwrap_or_else(|_| "anon".into());
-        let run_id = match ci_run_id {
-            Some(id) => id,
-            None => {
-                // nextest's PID separates concurrent `cargo nextest` invocations
-                let ppid = ppid();
-                format!("{user}-{ppid}")
-            }
-        };
-
-        Ok(RunCoords { run_id, user })
+        match std::env::var(RUN_ID_ENV) {
+            Ok(run_id) if !run_id.is_empty() => Ok(RunCoords { run_id, user: current_user() }),
+            _ => Err(NamingError::NotUnderZtest { test: current_test_name() }),
+        }
     }
 }
 
-#[cfg(target_family = "unix")]
-fn ppid() -> u32 {
-    // libc not in deps → /proc instead (Linux-only, matches our target)
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines().find_map(|l| l.strip_prefix("PPid:").map(|v| v.trim().parse().ok())).flatten()
-        })
-        .unwrap_or(0)
-}
-
-#[cfg(not(target_family = "unix"))]
-fn ppid() -> u32 {
-    0
-}
-
 /// Invoking developer, slugged as a label *value*; sole source of `ztest.io/user`.
+/// Spawners forward `USER` → test processes and pods derive the same value
 ///
 /// - Engine runs, detached syncs & `ztest cleanup --mine` must derive it identically,
 ///   else cleanup misses what it owns
@@ -122,13 +106,8 @@ pub fn slug(s: &str, max: usize) -> String {
 ///
 /// - `TestEnv::build` is awaited in the test body → driven on the test-named thread on
 ///   every `#[tokio::test]` flavor (only `tokio::spawn`ed tasks degrade to `tokio-rt-worker`)
-/// - nextest sets no `NEXTEST_TEST_NAME` → thread name is truth, env var is a fallback
 pub fn current_test_name() -> String {
-    std::thread::current()
-        .name()
-        .map(str::to_string)
-        .or_else(|| std::env::var("NEXTEST_TEST_NAME").ok())
-        .unwrap_or_else(|| "unknown".into())
+    std::thread::current().name().unwrap_or("unknown").to_string()
 }
 
 /// Test crate's package name from the *runtime* `CARGO_PKG_NAME` (the test binary's
@@ -138,7 +117,10 @@ pub fn current_package() -> String {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum NamingError {}
+pub enum NamingError {
+    #[error("not launched by ztest ({RUN_ID_ENV} unset): ztest run -- {test}")]
+    NotUnderZtest { test: String },
+}
 
 /// Namespace every run's driver pods land in
 pub const RUN_NAMESPACE: &str = "ztest";
@@ -224,18 +206,12 @@ pub const PROMETHEUS_SERVICE: &str = "ztest-prometheus";
 pub const PYROSCOPE_SERVICE: &str = "ztest-pyroscope";
 pub const GRAFANA_SERVICE: &str = "ztest-grafana";
 
-/// Namespace handle threaded into the resource helpers in `mounts.rs` and `seeds.rs`.
+/// Per-test handle threaded into the resource helpers in `mounts.rs` and `seeds.rs`.
 /// Per-test namespaces cascade on delete → no owner-references needed
 #[derive(Debug, Clone)]
 pub struct Sentinel {
     pub namespace: String,
-}
-
-impl Sentinel {
-    /// Handle for an existing namespace; no API calls
-    pub fn new(namespace: String) -> Self {
-        Self { namespace }
-    }
+    pub coords: RunCoords,
 }
 
 #[cfg(test)]

@@ -398,7 +398,6 @@ async fn start(
             &sync_id,
             name,
             &ns,
-            &sa,
             &compiled,
             &target,
             &image_refs,
@@ -476,7 +475,6 @@ async fn launch_driver(
     sync_id: &str,
     profile: &str,
     ns: &str,
-    sa: &str,
     compiled: &CompileOutcome,
     target: &Target,
     image_refs: &BTreeMap<String, String>,
@@ -499,7 +497,7 @@ async fn launch_driver(
             .context("create profiler config")?;
     }
     let pod = build_driver_pod(
-        sync_id, profile, ns, &ns_uid, sa, compiled, target, image_refs, collector, no_cleanup,
+        sync_id, profile, ns, &ns_uid, compiled, target, image_refs, collector, no_cleanup,
     );
     let created = Api::<Pod>::namespaced(client.clone(), SYNC_NAMESPACE)
         .create(&PostParams::default(), &pod)
@@ -987,7 +985,6 @@ fn build_driver_pod(
     profile: &str,
     ns: &str,
     ns_uid: &str,
-    sa: &str,
     compiled: &CompileOutcome,
     target: &Target,
     image_refs: &BTreeMap<String, String>,
@@ -1010,14 +1007,10 @@ fn build_driver_pod(
     let image_refs_json = serde_json::to_string(image_refs).unwrap_or_else(|_| "{}".into());
 
     let mut env = vec![
-        json!({ "name": "ZTEST_ENGINE", "value": "1" }),
-        // *Billing* SA (`ztest.io/sa`, the ledger's cost centre), not the credential: the
-        // driver authenticates as `ORCHESTRATOR_SERVICE_ACCOUNT`, bills whoever launched it
-        json!({ "name": "ZTEST_SA", "value": sa }),
         json!({ "name": ztest::api::naming::TEST_NAMESPACE_ENV, "value": ns }),
         // In-pod `RunCoords` derives from this → every component pod carries it
         // as `ztest.io/run-id`, same reservation
-        json!({ "name": "ZTEST_RUN_ID", "value": sync_lease_id(sync_id) }),
+        json!({ "name": ztest::api::naming::RUN_ID_ENV, "value": sync_lease_id(sync_id) }),
         // Launching *person*, not the SA: the in-pod `TestEnv` derives `ztest.io/user`
         // from this, so a shared billing SA must not relabel its resources
         json!({ "name": "USER", "value": ztest::api::naming::current_user() }),

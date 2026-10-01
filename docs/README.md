@@ -1,7 +1,7 @@
 # ztest documentation
 
 `ztest` is a Rust library that boots isolated Zcash topologies on Kubernetes.
-Test binaries link it as a dev-dependency and run under `cargo nextest`; each
+Test binaries link it as a dev-dependency and run under `ztest run`; each
 test gets a fresh, peerable set of `zebrad`/`zaino`/wallet pods and tears them
 down on exit.
 
