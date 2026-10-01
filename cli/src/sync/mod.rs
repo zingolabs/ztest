@@ -855,7 +855,7 @@ async fn provision_components(
     if images.is_empty() && seeds.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let graph =
+    let (graph, dev_tags) =
         ztest::api::resource::plan_runtime(images, &seeds).context("plan component images")?;
     let states = ztest_ui::console::provision_with_tracker(
         &graph,
@@ -883,7 +883,7 @@ async fn provision_components(
     if !failed.is_empty() {
         return Err(anyhow!("component provisioning failed:\n  {}", failed.join("\n  ")));
     }
-    Ok(ztest::api::resource::dev_image_refs(images_by_binary, &states))
+    Ok(dev_tags.image_refs(&states))
 }
 
 /// Post-build handoff: themed summary of the started sync + its follow-up commands, onto
@@ -1027,7 +1027,7 @@ fn build_driver_pod(
         .to_string_lossy()
         .into_owned();
 
-    let image_refs_json = serde_json::to_string(image_refs).unwrap_or_else(|_| "{}".into());
+    let image_refs_json = serde_json::to_string(image_refs).expect("string map serializes");
 
     let mut env = vec![
         json!({ "name": ztest::api::naming::TEST_NAMESPACE_ENV, "value": ns }),

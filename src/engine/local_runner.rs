@@ -189,7 +189,7 @@ pub async fn spawn_test(
 
     // Reader completes at pipe EOF = child and every fd-inheriting descendant gone
     let output = match drain {
-        Some(task) => task.await.unwrap_or_default(),
+        Some(task) => task.await.expect("output drain task panicked"),
         None => Vec::new(),
     };
     TestOutcome { verdict, output, components: Vec::new(), duration: started.elapsed() }

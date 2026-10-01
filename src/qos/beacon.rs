@@ -212,9 +212,7 @@ impl Beacon {
             running: self.running[..self.running.len().min(MAX_RUNNING)].to_vec(),
             ..self.clone()
         };
-        if let Ok(json) = serde_json::to_string(&wire) {
-            a.insert(ANN_BEACON.to_string(), json);
-        }
+        a.insert(ANN_BEACON.to_string(), serde_json::to_string(&wire).expect("Beacon serializes"));
         a
     }
 

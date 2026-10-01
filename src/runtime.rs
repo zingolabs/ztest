@@ -115,13 +115,9 @@ impl ContainerRuntime {
 /// - Resolved post-`activate`, pre-spawn
 pub fn active() -> ContainerRuntime {
     static CELL: OnceLock<ContainerRuntime> = OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var(RUNTIME_ENV)
-            .ok()
-            .as_deref()
-            .and_then(ContainerRuntime::parse)
-            .or_else(sole_usable)
-            .unwrap_or_default()
+    *CELL.get_or_init(|| match std::env::var(RUNTIME_ENV) {
+        Ok(v) => ContainerRuntime::parse(&v).expect("validated by cluster_config::activate"),
+        Err(_) => sole_usable().unwrap_or_default(),
     })
 }
 

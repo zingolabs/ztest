@@ -302,7 +302,8 @@ impl Zebra {
         if fee < 0 {
             return Err(shape("getblock", format!("tx {} has a negative fee {fee}", tx.txid)));
         }
-        Ok(u32::try_from(fee).unwrap_or(0))
+        u32::try_from(fee)
+            .map_err(|_| shape("getblock", format!("tx {} fee {fee} overflows u32", tx.txid)))
     }
 
     async fn prevout(&self, txid: &str, vout: u32) -> Result<i64, ReferenceError> {

@@ -191,8 +191,11 @@ async fn run_in_pod(
     emit_timing(&item.test_name, last_pod.as_ref(), total);
 
     // Every log fetched before anything is deleted (pods must still exist)
-    let runner_raw =
-        runner_api.logs(&name, &LogParams::default()).await.unwrap_or_default().into_bytes();
+    // A failed fetch must read as one, not as a silent test
+    let runner_raw = match runner_api.logs(&name, &LogParams::default()).await {
+        Ok(logs) => logs.into_bytes(),
+        Err(e) => format!("ztest: runner pod {name} logs unavailable: {e}\n").into_bytes(),
+    };
     let harvest = test_ns::close(&client, &test_ns, cfg.env.no_cleanup).await;
     if !cfg.env.no_cleanup
         && let Err(e) =

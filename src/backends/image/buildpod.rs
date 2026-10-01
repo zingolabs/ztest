@@ -398,7 +398,7 @@ pub(crate) fn extract_context(ctx: &super::Context, dest: &Path) -> Result<(), P
         .output()
         .map_err(|e| format!("spawn local `tar -x`: {e}"))?;
     let status = stream.child.wait().map_err(|e| format!("wait for local `tar`: {e}"))?;
-    let warnings = warnings.join().unwrap_or_default();
+    let warnings = warnings.join().expect("tar stderr reader panicked");
     if !status.success() {
         return Err(
             format!("local `tar` of source failed ({status}):\n{}", tail(&warnings, 20)).into()
@@ -468,7 +468,7 @@ async fn ship_stream(
         drop(tar_stdout);
 
         let status = stream.child.wait().map_err(|e| format!("wait for local `tar`: {e}"))?;
-        let errs = errs.join().unwrap_or_default();
+        let errs = errs.join().expect("tar stderr reader panicked");
         match status.success() {
             true => Ok(()),
             false => Err(format!("local `tar` of source failed ({status}):\n{}", tail(&errs, 40))),

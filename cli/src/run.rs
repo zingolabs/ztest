@@ -152,8 +152,9 @@ struct RunOptions {
 }
 
 impl RunOptions {
-    /// Classify the argv in one pass: engine-owned flags out, everything else forwarded
-    fn parse(args: &[String]) -> Self {
+    /// Classify the argv in one pass: engine-owned flags out, everything else forwarded.
+    /// Unparseable engine-owned value = error (never a silent default)
+    fn parse(args: &[String]) -> Result<Self, String> {
         // Forward by default (a missed run-only flag fails loudly; a dropped selection
         // flag would silently mis-select)
 
@@ -254,15 +255,20 @@ impl RunOptions {
             if RUN_VALUE.contains(&flag) || IGNORED_VALUE.contains(&flag) {
                 let value = inline.map(str::to_owned).or_else(|| it.next().cloned());
                 match flag {
+                    // nextest's `num-cpus` = every slot
                     "-j" | "--test-threads" | "--jobs" => {
-                        o.test_threads = value.as_deref().and_then(|v| v.parse().ok());
+                        o.test_threads = match value.as_deref() {
+                            Some("num-cpus") => None,
+                            v => Some(parse_flag(flag, v, |s| s.parse().ok())?),
+                        };
                     }
                     "--no-tests" => o.no_tests = value,
                     "--retries" => {
-                        o.retries = value.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        o.retries = parse_flag(flag, value.as_deref(), |s| s.parse().ok())?
                     }
                     "--slow-timeout" => {
-                        o.slow_after = value.as_deref().and_then(parse_duration_secs);
+                        o.slow_after =
+                            Some(parse_flag(flag, value.as_deref(), parse_duration_secs)?);
                     }
                     "--success-output" => o.success_output = value,
                     "--failure-output" => o.failure_output = value,
@@ -279,7 +285,7 @@ impl RunOptions {
             // Selection / filter / build / `--profile` → `cargo nextest list`, verbatim
             o.list_args.push(arg.clone());
         }
-        o
+        Ok(o)
     }
 
     /// Zero-tests-selected policy from `--no-tests`
@@ -343,6 +349,16 @@ fn parse_duration_secs(s: &str) -> Option<std::time::Duration> {
     s.parse::<u64>().ok().map(std::time::Duration::from_secs)
 }
 
+/// An engine-owned flag's value through `parse`; absent or unparseable → one-line error
+fn parse_flag<T>(
+    flag: &str,
+    value: Option<&str>,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<T, String> {
+    let value = value.ok_or_else(|| format!("{flag} needs a value"))?;
+    parse(value).ok_or_else(|| format!("{flag}: invalid value `{value}`"))
+}
+
 /// `--flag=value` → `("--flag", Some("value"))`; bare token → `(token, None)`
 fn split_eq(arg: &str) -> (&str, Option<&str>) {
     match arg.split_once('=') {
@@ -402,12 +418,24 @@ pub fn execute(args: Args) -> ExitCode {
     // `describe` recognised only as the *first* token — `nextest_args` is `trailing_var_arg`,
     // so a real subcommand cannot be declared here. Filter for a test *named* `describe`
     // with `-E 'test(describe)'`
+    let parse = |argv: &[String]| {
+        RunOptions::parse(argv).map_err(|e| {
+            eprintln!("ztest run: {e}");
+            exit(NextestExitCode::SETUP_ERROR)
+        })
+    };
     if args.nextest_args.first().is_some_and(|a| a == "describe") {
-        let filter = RunOptions::parse(&args.nextest_args[1..]).list_args;
+        let filter = match parse(&args.nextest_args[1..]) {
+            Ok(o) => o.list_args,
+            Err(code) => return code,
+        };
         return crate::block_on("run describe", crate::Rt::Multi, describe(filter));
     }
 
-    let mut opts = RunOptions::parse(&args.nextest_args);
+    let mut opts = match parse(&args.nextest_args) {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
     opts.rerun = args.rerun.clone();
     if !opts.unsupported.is_empty() {
         eprintln!(
@@ -1616,8 +1644,8 @@ fn provision_and_resolve(
     //
     // - `probe` skips what is already present
     // - cap 1 keeps the single live region coherent across serial `docker`/`kind` children
-    let graph = match resource::plan_runtime(&images, &seeds) {
-        Ok(g) => g,
+    let (graph, dev_tags) = match resource::plan_runtime(&images, &seeds) {
+        Ok(planned) => planned,
         Err(e) => {
             return ImagePhaseOutcome {
                 failure: Some(e.to_string()),
@@ -1659,7 +1687,7 @@ fn provision_and_resolve(
     // source) key the per-test edge from `#[ztest::archive]`/`#[needs]`.
     let mut resource_deps = ztest::api::engine::ResourceDeps::default();
     for (binary_id, entries) in &images_by_binary {
-        let ids: Vec<_> = entries.iter().filter_map(|e| resource::image_node_id(e).ok()).collect();
+        let ids: Vec<_> = entries.iter().map(|e| dev_tags.node_id(e)).collect();
         if !ids.is_empty() {
             resource_deps.images_by_binary.insert(binary_id.clone(), ids);
         }
@@ -1687,7 +1715,7 @@ fn provision_and_resolve(
     // `{detail}` carries the underlying `ImageError` (build stderr tail / fetch failure).
     let image_node_ids: std::collections::BTreeSet<ztest::api::resource::NodeId> = images_by_binary
         .iter()
-        .flat_map(|(_, entries)| entries.iter().filter_map(|e| resource::image_node_id(e).ok()))
+        .flat_map(|(_, entries)| entries.iter().map(|e| dev_tags.node_id(e)))
         .collect();
     for (id, st) in &resource_states {
         if let NodeState::Failed(detail) = st {
@@ -1707,7 +1735,7 @@ fn provision_and_resolve(
     }
 
     // Build manifest (`DevImageId → pull ref`) → every test process via `ZTEST_IMAGE_REFS`
-    let image_refs = resource::dev_image_refs(&images_by_binary, &resource_states);
+    let image_refs = dev_tags.image_refs(&resource_states);
 
     // Prebaked ref passes straight through (already built + pushed on-cluster); local kind
     // has no runner at all
@@ -1765,7 +1793,7 @@ mod tests {
     }
 
     fn parse(args: &[&str]) -> RunOptions {
-        RunOptions::parse(&v(args))
+        RunOptions::parse(&v(args)).expect("valid argv")
     }
 
     #[test]
@@ -1866,11 +1894,22 @@ mod tests {
         assert_eq!(parse(&["--profile=ci"]).list_args, v(&["--profile=ci"]));
     }
 
+    /// Engine-owned values parse or refuse the run; never a silent default
     #[test]
-    fn equals_form_value_flags_are_stripped() {
-        let o = parse(&["--retries=2", "-p", "x", "--test-threads=4"]);
+    fn engine_value_flags_parse_or_refuse() {
+        let o = parse(&["--retries=2", "-p", "x", "--test-threads=4", "--slow-timeout", "60s"]);
         assert_eq!(o.list_args, v(&["-p", "x"]));
-        assert_eq!(o.test_threads, Some(4));
+        assert_eq!(
+            (o.retries, o.test_threads, o.slow_after),
+            (2, Some(4), Some(std::time::Duration::from_secs(60)))
+        );
+        assert_eq!(parse(&["-j", "num-cpus"]).test_threads, None, "nextest's all-slots spelling");
+
+        let refused = |args: &[&str]| RunOptions::parse(&v(args)).expect_err("must refuse");
+        assert_eq!(refused(&["-j", "eight"]), "-j: invalid value `eight`");
+        assert_eq!(refused(&["--retries=-1"]), "--retries: invalid value `-1`");
+        assert_eq!(refused(&["--slow-timeout", "1m"]), "--slow-timeout: invalid value `1m`");
+        assert_eq!(refused(&["--retries"]), "--retries needs a value");
     }
 
     #[test]

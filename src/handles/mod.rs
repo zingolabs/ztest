@@ -55,13 +55,13 @@ impl HandleInner {
     /// Resolve a named endpoint (e.g. `"rpc"`) of this component
     pub async fn endpoint(&self, name: &str) -> Result<Endpoint, EnvError> {
         let inner = self.ensure_built()?;
-        let state = inner.component_state(self.component_id).await?;
+        let state = inner.component_state(self.component_id).await;
         inner.resolve_named(&state, name).await
     }
 
     pub async fn endpoint_for(&self, port: u16) -> Result<Endpoint, EnvError> {
         let inner = self.ensure_built()?;
-        let state = inner.component_state(self.component_id).await?;
+        let state = inner.component_state(self.component_id).await;
         inner.resolve_port(&state, port).await
     }
 

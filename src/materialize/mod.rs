@@ -137,7 +137,7 @@ async fn selected_driver(client: &Client) -> Result<String, EnvError> {
     crate::storage_class::selected(client)
         .await
         .map(|s| s.provisioner.clone())
-        .map_err(|e| EnvError::Manifest { reason: e.to_string() })
+        .map_err(|e| EnvError::StorageClass { reason: e.to_string() })
 }
 
 /// Resolve a preflight-published seed, test side.
@@ -215,7 +215,7 @@ async fn create_seed_pvc(
 ) -> Result<bool, EnvError> {
     let storage = crate::storage_class::selected(client)
         .await
-        .map_err(|e| EnvError::Manifest { reason: e.to_string() })?;
+        .map_err(|e| EnvError::StorageClass { reason: e.to_string() })?;
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), SEEDS_NAMESPACE);
     if let Some(existing) = api.get_opt(pvc_name).await.map_err(env_err)? {
         if existing.metadata.deletion_timestamp.is_none() {
@@ -554,7 +554,7 @@ async fn materialize(
     }
     progress.finalizing();
 
-    if !job_succeeded(&jobs, &job_name).await {
+    if !job_succeeded(&jobs, &job_name).await.map_err(|e| MaterializeErr::Fatal(env_err(e)))? {
         let logs = job_logs(&pods, &job_name).await;
         return Err(MaterializeErr::Fatal(EnvError::ArchiveMaterializeFailed {
             archive: seed.name.clone(),
@@ -702,9 +702,15 @@ fn puller_job(name: &str, pvc_name: &str, seed: &SeedEntry) -> Job {
 /// Delete a terminal puller Job, freeing its name. `false` = still running, so the
 /// caller waits instead of disturbing another actor's pull
 async fn reap_finished_job(jobs: &Api<Job>, name: &str) -> bool {
-    let Ok(Some(job)) = jobs.get_opt(name).await else {
+    let job = match jobs.get_opt(name).await {
+        Ok(Some(job)) => job,
         // Vanished since the 409 — its owner cleaned up, name free
-        return true;
+        Ok(None) => return true,
+        // Unknown ≠ free: the caller waits and retries
+        Err(e) => {
+            tracing::warn!(job = %name, error = %e, "puller job lookup failed");
+            return false;
+        }
     };
     if !is_job_finished().matches_object(Some(&job)) {
         return false;
@@ -725,8 +731,8 @@ fn is_job_finished() -> impl Condition<Job> {
 }
 
 /// `Complete`, as against `Failed`
-async fn job_succeeded(jobs: &Api<Job>, name: &str) -> bool {
-    jobs.get_opt(name).await.ok().flatten().is_some_and(|job| succeeded(&job))
+async fn job_succeeded(jobs: &Api<Job>, name: &str) -> Result<bool, kube::Error> {
+    Ok(jobs.get_opt(name).await?.is_some_and(|job| succeeded(&job)))
 }
 
 /// Same verdict off a Job already in hand — no second GET to disagree with the first
@@ -756,7 +762,7 @@ async fn job_logs(pods: &Api<Pod>, job_name: &str) -> String {
 async fn create_volume_snapshot(client: &Client, pvc_name: &str) -> Result<(), EnvError> {
     let storage = crate::storage_class::selected(client)
         .await
-        .map_err(|e| EnvError::Manifest { reason: e.to_string() })?;
+        .map_err(|e| EnvError::StorageClass { reason: e.to_string() })?;
     let snap_gvk = volume_snapshot_gvk();
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), SEEDS_NAMESPACE, &snap_gvk);
     let body = json!({

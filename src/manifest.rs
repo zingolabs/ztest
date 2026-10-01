@@ -63,12 +63,7 @@ pub struct PodSpec {
 }
 
 impl PodSpec {
-    pub fn render(
-        &self,
-        coords: &RunCoords,
-        test_name: &str,
-        mounts: &[ResolvedMount],
-    ) -> Result<Pod, EnvError> {
+    pub fn render(&self, coords: &RunCoords, test_name: &str, mounts: &[ResolvedMount]) -> Pod {
         let ports_json: Vec<_> =
             self.ports.iter().map(|(n, p)| json!({ "name": n, "containerPort": p })).collect();
         let volumes: Vec<Value> = mounts.iter().map(|m| m.volume.clone()).collect();
@@ -206,8 +201,7 @@ impl PodSpec {
             pod["metadata"]["labels"][crate::sync::SYNC_ID_KEY] = Value::String(id);
         }
 
-        serde_json::from_value(pod)
-            .map_err(|e| EnvError::Manifest { reason: format!("pod {}: {e}", self.pod_name) })
+        serde_json::from_value(pod).expect("code-built pod manifest is valid")
     }
 }
 
@@ -288,7 +282,7 @@ mod tests {
 
     #[test]
     fn the_tcp_probe_renders_its_handler_and_cadence() {
-        let tcp = container(&base_spec().render(&coords(), "t", &[]).unwrap());
+        let tcp = container(&base_spec().render(&coords(), "t", &[]));
         assert_eq!(tcp["readinessProbe"]["tcpSocket"]["port"], 28232);
         assert_eq!(tcp["readinessProbe"]["periodSeconds"], 2);
         assert_eq!(tcp["readinessProbe"]["failureThreshold"], READY_FAILURE_THRESHOLD);
@@ -298,7 +292,7 @@ mod tests {
     /// reaches a series
     #[test]
     fn the_pod_carries_its_owner_for_prometheus_to_promote() {
-        let pod = base_spec().render(&coords(), "t", &[]).unwrap();
+        let pod = base_spec().render(&coords(), "t", &[]);
         let v = serde_json::to_value(&pod).unwrap();
         assert_eq!(v["metadata"]["labels"]["ztest.io/user"], "user");
     }
@@ -310,7 +304,7 @@ mod tests {
             resources: Some(Resources { cpu: Cpu::millis(500), memory: Mem::mib(512) }),
             ..base_spec()
         };
-        let pod = spec.render(&coords(), "t", &[]).unwrap();
+        let pod = spec.render(&coords(), "t", &[]);
         let c = container(&pod);
         assert_eq!(c["resources"]["requests"]["cpu"], "500m");
         assert_eq!(c["resources"]["requests"]["memory"], "512Mi");
@@ -346,7 +340,7 @@ mod tests {
             }),
             ..base_spec()
         };
-        let pod = spec.render(&coords(), "t", &[]).unwrap();
+        let pod = spec.render(&coords(), "t", &[]);
         let c = container(&pod);
         assert_eq!(c["resources"]["requests"]["cpu"], "2");
         assert_eq!(c["resources"]["limits"]["cpu"], "2");
@@ -378,7 +372,7 @@ mod tests {
             guaranteed: Some(Resources { cpu: Cpu::cores(4), memory: Mem::gib(8) }),
             ..base_spec()
         };
-        let c = container(&spec.render(&coords(), "t", &[]).unwrap());
+        let c = container(&spec.render(&coords(), "t", &[]));
         assert_eq!(c["resources"]["requests"]["cpu"], "750m");
         assert_eq!(c["resources"]["limits"]["cpu"], "750m");
         assert_eq!(c["resources"]["requests"]["memory"], "1Gi");
@@ -397,7 +391,7 @@ mod tests {
     #[test]
     fn supplemental_groups_render_alongside_the_pinned_uid() {
         let spec = PodSpec { run_as_user: Some(1000), supplemental_groups: vec![0], ..base_spec() };
-        let pod = spec.render(&coords(), "t", &[]).unwrap();
+        let pod = spec.render(&coords(), "t", &[]);
         let sc = &pod_spec_json(&pod)["securityContext"];
         // Both, not either: the pinned uid makes the extra group the only way into
         // a seed the pod does not own
@@ -407,7 +401,7 @@ mod tests {
 
     #[test]
     fn an_empty_group_set_renders_no_field() {
-        let pod = base_spec().render(&coords(), "t", &[]).unwrap();
+        let pod = base_spec().render(&coords(), "t", &[]);
         assert!(pod_spec_json(&pod)["securityContext"]["supplementalGroups"].is_null());
     }
 
@@ -417,7 +411,7 @@ mod tests {
             env: vec![("RUST_LOG".into(), "debug".into()), ("FOO".into(), "bar".into())],
             ..base_spec()
         };
-        let pod = spec.render(&coords(), "t", &[]).unwrap();
+        let pod = spec.render(&coords(), "t", &[]);
         let c = container(&pod);
         let env = c["env"].as_array().unwrap();
         assert_eq!(env[0]["name"], "RUST_LOG");
@@ -428,7 +422,7 @@ mod tests {
     #[test]
     fn no_env_omits_the_env_key() {
         // `resources` always present (every pod Guaranteed), `env` only when non-empty
-        let pod = base_spec().render(&coords(), "t", &[]).unwrap();
+        let pod = base_spec().render(&coords(), "t", &[]);
         let c = container(&pod);
         assert!(c.get("env").is_none());
         assert!(c.get("resources").is_some());
@@ -437,7 +431,7 @@ mod tests {
     #[test]
     fn image_pull_secret_renders_only_when_set() {
         // Default (kind / public registry): no key
-        let s = pod_spec_json(&base_spec().render(&coords(), "t", &[]).unwrap());
+        let s = pod_spec_json(&base_spec().render(&coords(), "t", &[]));
         assert!(s.get("imagePullSecrets").is_none());
         // Private registry: named secret injected pod-level
         let spec = PodSpec {
@@ -445,7 +439,7 @@ mod tests {
             termination_grace_period: None,
             ..base_spec()
         };
-        let s = pod_spec_json(&spec.render(&coords(), "t", &[]).unwrap());
+        let s = pod_spec_json(&spec.render(&coords(), "t", &[]));
         assert_eq!(s["imagePullSecrets"][0]["name"], "ghcr-pull");
     }
 
@@ -456,7 +450,7 @@ mod tests {
     #[test]
     fn nvme_placement_renders_node_selector_and_toleration() {
         let spec = PodSpec { placement: Some(crate::qos::Pool::Nvme), ..base_spec() };
-        let pod = spec.render(&coords(), "t", &[]).unwrap();
+        let pod = spec.render(&coords(), "t", &[]);
         let s = pod_spec_json(&pod);
         assert_eq!(
             s["nodeSelector"][crate::qos::NVME_NODE_LABEL_KEY],
@@ -481,9 +475,9 @@ mod tests {
                 .any(|t| t["effect"] == "NoSchedule" || t["key"] == crate::qos::NVME_TAINT_KEY);
             assert!(!has_nvme_tol, "no NVMe toleration for general/none: {s}");
         };
-        no_nvme(&pod_spec_json(&base_spec().render(&coords(), "t", &[]).unwrap()));
+        no_nvme(&pod_spec_json(&base_spec().render(&coords(), "t", &[])));
         // Explicit General also a no-op (schedules anywhere)
         let spec = PodSpec { placement: Some(crate::qos::Pool::General), ..base_spec() };
-        no_nvme(&pod_spec_json(&spec.render(&coords(), "t", &[]).unwrap()));
+        no_nvme(&pod_spec_json(&spec.render(&coords(), "t", &[])));
     }
 }

@@ -42,13 +42,11 @@ impl NodeState {
 ///
 /// - `Cached` = cross-run cache (dev images, seed PVCs, infra), skipped entirely —
 ///   eviction is a separate explicit prune
-/// - `RunScoped` dies with the run; `Shared` dies with its last dependent (guaranteed by
-///   reverse-topological order)
+/// - `RunScoped` dies with the run
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lifetime {
     Cached,
     RunScoped,
-    Shared,
 }
 
 impl Lifetime {

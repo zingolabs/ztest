@@ -124,9 +124,9 @@ impl EnvInner {
         self.client.get().ok_or(EnvError::NotBuilt)
     }
 
-    pub async fn component_state(&self, id: u64) -> Result<ComponentState, EnvError> {
+    pub async fn component_state(&self, id: u64) -> ComponentState {
         let map = self.components.read().await;
-        map.get(&id).cloned().ok_or(EnvError::UnknownComponent { id })
+        map.get(&id).cloned().expect("build registers every issued handle")
     }
 
     pub async fn resolve_named(
@@ -799,7 +799,7 @@ impl TestEnv {
     /// this run's stop-watch and report ConfigMaps
     #[cfg_attr(not(feature = "librustzcash"), allow(dead_code))]
     pub fn namespace(&self) -> Option<String> {
-        self.inner.namespace.lock().ok().and_then(|g| g.clone())
+        self.inner.namespace.lock().expect("namespace mutex poisoned").clone()
     }
 
     /// The one indexer in this topology, type-erased for a sync run's `SyncCtx` oracle.
@@ -1075,7 +1075,7 @@ async fn apply_pod(
     mounts: &[ResolvedMount],
     restartable: bool,
 ) -> Result<(), EnvError> {
-    let mut pod = spec.render(&ctx.sentinel.coords, ctx.test_name, mounts)?;
+    let mut pod = spec.render(&ctx.sentinel.coords, ctx.test_name, mounts);
     if restartable {
         crate::handles::pod::make_restartable(&mut pod);
     }

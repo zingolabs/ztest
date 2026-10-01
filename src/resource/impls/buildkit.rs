@@ -102,12 +102,11 @@ async fn reconcile_cache_pvc_size(api: &Api<PersistentVolumeClaim>) -> Result<()
     let existing = api.get(BUILDKIT_CACHE_PVC).await.map_err(|e| {
         ResourceError::Provision(format!("get buildkit cache PVC {BUILDKIT_CACHE_PVC}: {e}"))
     })?;
-    let current_b = serde_json::to_value(&existing)
-        .ok()
+    let current_b = existing
+        .spec
         .as_ref()
-        .and_then(|v| v.pointer("/spec/resources/requests/storage"))
-        .and_then(|q| q.as_str())
-        .and_then(quantity_bytes);
+        .and_then(|s| s.resources.as_ref()?.requests.as_ref()?.get("storage"))
+        .and_then(|q| quantity_bytes(&q.0));
     if current_b.is_some_and(|cur| cur >= desired_b) {
         return Ok(());
     }

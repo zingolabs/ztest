@@ -94,7 +94,7 @@ pub async fn apply_resource_quota(
     use k8s_openapi::api::core::v1::ResourceQuota;
     let api: Api<ResourceQuota> = Api::namespaced(client.clone(), namespace);
     let quota: ResourceQuota = serde_json::from_value(resource_quota_manifest(footprint, pods))
-        .map_err(kube::Error::SerdeError)?;
+        .expect("static manifest is valid");
     match api.create(&PostParams::default(), &quota).await {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
@@ -160,7 +160,7 @@ pub async fn ensure_namespace(
             },
         }
     }))
-    .map_err(kube::Error::SerdeError)?;
+    .expect("static manifest is valid");
     match api.create(&PostParams::default(), &ns).await {
         Ok(_) => {}
         Err(kube::Error::Api(e)) if e.code == 409 => {}
@@ -192,7 +192,7 @@ async fn bind_driver(client: &Client, namespace: &str) -> Result<(), kube::Error
             "namespace": crate::naming::RUN_NAMESPACE,
         }],
     }))
-    .map_err(kube::Error::SerdeError)?;
+    .expect("static manifest is valid");
     match api.create(&PostParams::default(), &rb).await {
         Ok(_) | Err(kube::Error::Api(kube::error::ErrorResponse { code: 409, .. })) => Ok(()),
         Err(e) => Err(e),
@@ -318,13 +318,16 @@ pub async fn delete_seed_binding_contents_for_ns(client: &Client, namespace: &st
     let vsc: Api<DynamicObject> =
         Api::all_with(client.clone(), &crate::seeds::volume_snapshot_content_gvk());
     let lp = ListParams::default().labels(&format!("{}={namespace}", crate::qos::LABEL_TEST_NS));
-    let Ok(list) = vsc.list(&lp).await else {
-        return;
+    let list = match vsc.list(&lp).await {
+        Ok(list) => list,
+        Err(e) if is_not_found(&e) => return,
+        Err(e) => {
+            tracing::warn!(namespace, error = %e, "list seed binding contents failed; left to the reaper");
+            return;
+        }
     };
     for obj in list.items {
-        let Some(name) = obj.metadata.name.as_deref() else {
-            continue;
-        };
+        let name = obj.metadata.name.as_deref().expect("listed object has a name");
         if let Err(e) = vsc.delete(name, &DeleteParams::default()).await
             && !crate::cluster::is_not_found(&e)
         {
@@ -372,7 +375,7 @@ pub async fn create_pod_service(
             "publishNotReadyAddresses": true,
         }
     }))
-    .map_err(kube::Error::SerdeError)?;
+    .expect("static manifest is valid");
     match api.create(&PostParams::default(), &svc).await {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),

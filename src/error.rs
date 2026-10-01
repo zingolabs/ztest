@@ -34,8 +34,8 @@ pub enum EnvError {
     #[error("port-forward to {component}:{port} failed: {reason}")]
     PortForwardFailed { component: String, port: u16, reason: String },
 
-    #[error("manifest serialization failed: {reason}")]
-    Manifest { reason: String },
+    #[error("storage class: {reason}")]
+    StorageClass { reason: String },
 
     #[error("invalid test environment: {reason}")]
     Config { reason: String },
@@ -58,10 +58,6 @@ pub enum EnvError {
 
     #[error("TestEnv dropped; handle unusable")]
     EnvDropped,
-
-    /// ztest bug, not user error (`build` registers every issued handle)
-    #[error("no component for handle {id}")]
-    UnknownComponent { id: u64 },
 
     #[error(transparent)]
     Transient(Box<dyn StdError + Send + Sync>),
@@ -192,12 +188,6 @@ pub enum ImageError {
         err: std::io::Error,
     },
 
-    #[error("image build: docker build failed:\n{stderr_tail}")]
-    DockerBuild { stderr_tail: String },
-
-    #[error("image build: kind load failed:\n{stderr_tail}")]
-    KindLoad { stderr_tail: String },
-
     #[error("no kind cluster `{cluster}`; have: {available}")]
     KindClusterMissing { cluster: String, available: String },
 
@@ -206,9 +196,6 @@ pub enum ImageError {
 
     #[error("`kind get nodes` failed:\n{stderr_tail}")]
     KindNodeQuery { stderr_tail: String },
-
-    #[error("image build: docker push failed:\n{stderr_tail}")]
-    DockerPush { stderr_tail: String },
 
     #[error("image build: image query failed:\n{stderr_tail}")]
     KindImageQuery { stderr_tail: String },

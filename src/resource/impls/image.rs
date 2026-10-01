@@ -26,21 +26,9 @@ pub struct ImageNode {
 }
 
 impl ImageNode {
-    /// Fails when the build context cannot be hashed (missing Dockerfile/context, IO)
-    pub fn new(entry: DevImageEntry) -> Result<Self, crate::error::PipelineError> {
-        let tag = image::dev_tag(
-            &entry.source,
-            &entry.features,
-            &entry.repo,
-            entry.rust_version.as_deref(),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(Self { entry, tag, backend: image::from_env() })
-    }
-
-    /// Lets `cli::run` key a per-binary dependency edge without re-derivation
-    pub fn node_id(entry: &DevImageEntry) -> Result<NodeId, crate::error::PipelineError> {
-        Self::new(entry.clone()).map(|p| p.id())
+    /// `tag` = the entry's content-addressed tag, hashed once ([`DevTags`](crate::resource::DevTags))
+    pub fn new(entry: DevImageEntry, tag: String) -> Self {
+        Self { entry, tag, backend: image::from_env() }
     }
 }
 

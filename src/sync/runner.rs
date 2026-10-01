@@ -397,8 +397,8 @@ fn fold(results: Vec<PhaseResult>) -> SyncOutcome {
         .map(|r| r.summary.verdict)
         .find(|v| !v.is_pass())
         .unwrap_or(SyncVerdict::Passed);
-    let (segment, target) =
-        results.first().map(|r| (r.segment.clone(), r.target)).unwrap_or((None, None));
+    let first = results.first().expect("`run` always executes the first phase");
+    let (segment, target) = (first.segment.clone(), first.target);
     let mut outcome = SyncOutcome {
         verdict,
         violations: Vec::new(),

@@ -217,6 +217,9 @@ pub enum ConfigError {
     #[error("no profile `{name}`; known: {known}")]
     NoProfile { name: String, known: String },
 
+    #[error("{RUNTIME_ENV}={value}: expected docker or podman")]
+    BadRuntime { value: String },
+
     #[error("no kube-context `{context}`; known: {known}")]
     UnknownContext { context: String, known: String },
 
@@ -401,6 +404,12 @@ fn open_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 /// # Safety
 /// No other thread may have started: `set_var` is not thread-safe.
 pub unsafe fn activate(flag: Option<&str>) -> Result<Option<String>, ConfigError> {
+    // Ambient = user input → one-line error here, so `runtime::active` reads an invariant
+    if let Ok(value) = std::env::var(RUNTIME_ENV)
+        && ContainerRuntime::parse(&value).is_none()
+    {
+        return Err(ConfigError::BadRuntime { value });
+    }
     let cfg = load()?;
     let Some(name) = flag.map(str::to_string).or_else(|| cfg.current.clone()) else {
         return Ok(None);
@@ -416,7 +425,7 @@ pub unsafe fn activate(flag: Option<&str>) -> Result<Option<String>, ConfigError
     if let Some(ctx) = &profile.context {
         verify_context(ctx)?;
     }
-    let _ = ACTIVE_PROFILE.set(name.clone());
+    ACTIVE_PROFILE.set(name.clone()).expect("activate runs once per process");
     Ok(Some(name))
 }
 

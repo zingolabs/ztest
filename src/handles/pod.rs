@@ -124,7 +124,7 @@ impl ComponentPod {
     }
 
     pub(crate) async fn of(inner: &EnvInner, component_id: u64) -> Result<Self, EnvError> {
-        let state = inner.component_state(component_id).await?;
+        let state = inner.component_state(component_id).await;
         Ok(Self::new(inner.client_ref()?, &state))
     }
 

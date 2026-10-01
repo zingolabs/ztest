@@ -138,65 +138,75 @@ where
 pub fn plan_runtime(
     images: &[DevImageEntry],
     seeds: &[SeedEntry],
-) -> Result<Graph, crate::error::PipelineError> {
+) -> Result<(Graph, DevTags), crate::error::PipelineError> {
+    let tags = DevTags::hash(images)?;
     let mut graph = Graph::new();
     for entry in images {
-        let provider = image::ImageNode::new(entry.clone())?;
-        graph.add_dedup(Box::new(provider));
+        graph.add_dedup(Box::new(image::ImageNode::new(entry.clone(), tags.tag(entry).into())));
     }
     for entry in seeds {
         graph.add_dedup(Box::new(seed::SeedProvider::new(entry.clone())));
     }
     graph.validate().map_err(|e| e.to_string())?;
-    Ok(graph)
+    Ok((graph, tags))
 }
 
-/// Content-addressed [`NodeId`] of a dev image → `cli::run` keys an image-dependency edge
-/// without duplicating the derivation
-pub fn image_node_id(entry: &DevImageEntry) -> Result<NodeId, crate::error::PipelineError> {
-    image::ImageNode::node_id(entry)
+/// Each planned dev image's content-addressed tag, keyed by its path-free `DevImageId`.
+/// Hashed once (the only fallible step: build-context IO); every later lookup reads it, so a
+/// re-hash can never disagree with the planned node
+#[derive(Debug, Default)]
+pub struct DevTags(HashMap<String, String>);
+
+impl DevTags {
+    fn hash(images: &[DevImageEntry]) -> Result<Self, crate::error::PipelineError> {
+        let mut tags = HashMap::new();
+        for e in images {
+            let rv = e.rust_version.as_deref();
+            let tag = crate::backends::image::dev_tag(&e.source, &e.features, &e.repo, rv)
+                .map_err(|err| err.to_string())?;
+            tags.insert(Self::key(e), tag);
+        }
+        Ok(DevTags(tags))
+    }
+
+    fn key(e: &DevImageEntry) -> String {
+        let rv = e.rust_version.as_deref();
+        crate::backends::image::DevImageId::of(&e.repo, &e.features, rv, &e.source)
+            .as_str()
+            .to_string()
+    }
+
+    pub fn tag(&self, e: &DevImageEntry) -> &str {
+        self.0.get(&Self::key(e)).expect("every dev-image edge names a planned image")
+    }
+
+    /// Image-dependency edge key
+    pub fn node_id(&self, e: &DevImageEntry) -> NodeId {
+        NodeId::Image(self.tag(e).to_string())
+    }
+
+    /// `DevImageId → pull ref` for every planned image that did not fail (dependents of a
+    /// failed one are already skipped) = the map test processes resolve from
+    /// ([`IMAGE_REFS_ENV`](crate::backends::image::IMAGE_REFS_ENV)). Shared by `ztest run`
+    /// and `ztest sync` → identical maps
+    pub fn image_refs(
+        &self,
+        states: &HashMap<NodeId, NodeState>,
+    ) -> std::collections::BTreeMap<String, String> {
+        self.0
+            .iter()
+            .filter(|(_, tag)| {
+                !matches!(states.get(&NodeId::Image((*tag).clone())), Some(NodeState::Failed(_)))
+            })
+            .map(|(id, tag)| (id.clone(), crate::backends::image::pod_reference(tag)))
+            .collect()
+    }
 }
 
 /// [`NodeId`] of a seed: content-addressed on the bytes, path-addressed when unreadable
 /// (see [`seed::SeedProvider`])
 pub fn seed_node_id(entry: &SeedEntry) -> NodeId {
     seed::SeedProvider::node_id(entry)
-}
-
-/// Build manifest `DevImageId → pull-reference` for a selection's dev images, given the
-/// post-provision node `states`.
-///
-/// - Keyed by the path-free [`DevImageId`](crate::backends::image::DevImageId), not the
-///   build-context bytes → an in-pod test resolves the built reference instead of
-///   rebuilding from a Dockerfile the runner image doesn't carry
-/// - FAILED builds omitted (dependent tests already skipped)
-/// - Shared by `ztest run` and the `ztest sync` controller → identical `ZTEST_IMAGE_REFS`
-pub fn dev_image_refs(
-    images_by_binary: &[(String, Vec<DevImageEntry>)],
-    states: &std::collections::HashMap<NodeId, NodeState>,
-) -> std::collections::BTreeMap<String, String> {
-    let mut refs = std::collections::BTreeMap::new();
-    for entry in images_by_binary.iter().flat_map(|(_, entries)| entries) {
-        if let Ok(id) = image_node_id(entry)
-            && matches!(states.get(&id), Some(NodeState::Failed(_)))
-        {
-            continue;
-        }
-        let rv = entry.rust_version.as_deref();
-        if let Ok(tag) =
-            crate::backends::image::dev_tag(&entry.source, &entry.features, &entry.repo, rv)
-        {
-            let key = crate::backends::image::DevImageId::of(
-                &entry.repo,
-                &entry.features,
-                rv,
-                &entry.source,
-            );
-            refs.entry(key.as_str().to_string())
-                .or_insert_with(|| crate::backends::image::pod_reference(&tag));
-        }
-    }
-    refs
 }
 
 /// Parent-side, by-identity teardown of a run's ephemeral resources: everything labelled
@@ -287,7 +297,7 @@ mod tests {
         // Planning never depends on a readable archive: OID declared at compile time,
         // bytes in the bucket → an un-pulled checkout plans like a warm one. A *fetch*
         // failure surfaces later as a provision error SKIPping only the declaring tests
-        let graph = plan_runtime(&[], &[seed(&"ab".repeat(32))])
+        let (graph, _) = plan_runtime(&[], &[seed(&"ab".repeat(32))])
             .expect("planning must not require local bytes");
         assert_eq!(graph.len(), 1);
     }

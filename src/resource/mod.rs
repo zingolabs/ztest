@@ -29,9 +29,7 @@ pub mod impls;
 // ── Public API ────────────────────────────────────────────────────────
 
 pub use context::{Cx, Progress, ProgressSink};
-pub use entry::{
-    InitializeOpts, dev_image_refs, image_node_id, initialize, plan_runtime, reap_run, seed_node_id,
-};
+pub use entry::{DevTags, InitializeOpts, initialize, plan_runtime, reap_run, seed_node_id};
 pub use graph::Graph;
 pub use impls::buildkit::probe_admission as probe_build_admission;
 pub use impls::observability::{PROFILE_RETIREMENT_LAG, RETENTION_DAYS};

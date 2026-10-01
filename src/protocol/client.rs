@@ -70,14 +70,8 @@ impl AuthedRpc {
         // Route on which of `result`/`error` is non-null → 2.0 (zebrad/zaino) vs 1.0
         // (zcashd) without a version sniff
         let value: serde_json::Value = serde_json::from_str(&text)?;
-        let error = value.get("error");
-        let has_error = matches!(error, Some(e) if !e.is_null());
-        if has_error {
-            return Err(format!(
-                "RPC error: {}",
-                serde_json::to_string(error.unwrap()).unwrap_or_default()
-            )
-            .into());
+        if let Some(error) = value.get("error").filter(|e| !e.is_null()) {
+            return Err(format!("RPC error: {error}").into());
         }
         let result = value
             .get("result")

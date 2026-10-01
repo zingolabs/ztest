@@ -358,63 +358,23 @@ fn dump_hook() {
     if std::env::var_os("ZTEST_DUMP_INVENTORY").is_none() {
         return;
     }
-    let mut stdout = std::io::stdout().lock();
+    // Partial inventory read as complete = silently wrong run → any failure panics (exit 101)
     use std::io::Write;
-    let emit = |line: std::io::Result<()>| {
-        if let Err(err) = line {
-            let _ = writeln!(std::io::stderr(), "ztest dump_inventory: write failed: {err}");
-        }
-    };
+    fn json(line: &impl serde::Serialize) -> String {
+        serde_json::to_string(line).expect("inventory line serializes")
+    }
+    let mut stdout = std::io::stdout().lock();
+    let mut emit = |line: String| writeln!(stdout, "{line}").expect("inventory write to host");
     for decl in iter() {
         for entry in expand_decl(decl) {
-            match serde_json::to_string(&InventoryLine::Dev(entry)) {
-                Ok(line) => emit(writeln!(stdout, "{line}")),
-                Err(err) => {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "ztest dump_inventory: serialize failed: {err}"
-                    );
-                }
-            }
+            emit(json(&InventoryLine::Dev(entry)));
         }
     }
-    for decl in qos_iter() {
-        match serde_json::to_string(&InventoryLineRef::Qos(decl)) {
-            Ok(line) => emit(writeln!(stdout, "{line}")),
-            Err(err) => {
-                let _ =
-                    writeln!(std::io::stderr(), "ztest dump_inventory: serialize failed: {err}");
-            }
-        }
-    }
-    for decl in seed_iter() {
-        match serde_json::to_string(&InventoryLineRef::Seed(decl)) {
-            Ok(line) => emit(writeln!(stdout, "{line}")),
-            Err(err) => {
-                let _ =
-                    writeln!(std::io::stderr(), "ztest dump_inventory: serialize failed: {err}");
-            }
-        }
-    }
-    for decl in dep_iter() {
-        match serde_json::to_string(&InventoryLineRef::Dep(decl)) {
-            Ok(line) => emit(writeln!(stdout, "{line}")),
-            Err(err) => {
-                let _ =
-                    writeln!(std::io::stderr(), "ztest dump_inventory: serialize failed: {err}");
-            }
-        }
-    }
-    for decl in sync_test_iter() {
-        match serde_json::to_string(&InventoryLineRef::SyncTest(decl)) {
-            Ok(line) => emit(writeln!(stdout, "{line}")),
-            Err(err) => {
-                let _ =
-                    writeln!(std::io::stderr(), "ztest dump_inventory: serialize failed: {err}");
-            }
-        }
-    }
-    let _ = stdout.flush();
+    qos_iter().for_each(|d| emit(json(&InventoryLineRef::Qos(d))));
+    seed_iter().for_each(|d| emit(json(&InventoryLineRef::Seed(d))));
+    dep_iter().for_each(|d| emit(json(&InventoryLineRef::Dep(d))));
+    sync_test_iter().for_each(|d| emit(json(&InventoryLineRef::SyncTest(d))));
+    stdout.flush().expect("inventory flush to host");
     std::process::exit(0);
 }
 
