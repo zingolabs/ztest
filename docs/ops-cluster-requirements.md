@@ -213,6 +213,9 @@ it down after.
 
 - Cache PVC outlives the pod deliberately: BuildKit `--mount=type=cache` state is builder-local and no
   cache backend exports it, so a pod without it rebuilds everything from scratch
+- One build at a time: the pod's fixed name `ztest-buildkit` is the cache lock (buildkitd flocks its
+  state dir). A second run waits for the pod to be gone; a pod whose run holds no live lease is an
+  orphan and is reaped. Never force-delete it: that frees the name while the daemon may still run
 - The one operator concession is the pod's security context — rootless BuildKit runs `runAsUser: 1000`
   with `seccompProfile: Unconfined`, exceeding Pod Security Admission *baseline*, so the `ztest`
   namespace needs `pod-security.kubernetes.io/enforce: privileged`, which `ztest cluster setup` applies

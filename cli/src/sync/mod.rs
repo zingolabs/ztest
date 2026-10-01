@@ -736,23 +736,26 @@ async fn build_and_provision(
 
     // On-cluster builds need the ephemeral BuildKit pod (own phase + live timer), Ready
     // before compiling; a host-engine build needs nothing
-    let build_pod = if ztest::backends::image::builds_on_cluster() {
+    let builder = if ztest::backends::image::builds_on_cluster() {
         ztest::backends::image::pull_base()
             .context("no runner registry; set ZTEST_IMAGE_REGISTRY")?;
         on_phase(Phase::Start("startup builder"));
         let t_builder = Instant::now();
-        let p = buildkit::create_build_pod(client, sync_id, &ztest::api::naming::current_user())
+        // Leased under the sync's own id (released before the sync lease is taken)
+        let run = ztest::api::naming::RunCoords {
+            run_id: sync_lease_id(sync_id),
+            user: ztest::api::naming::current_user(),
+        };
+        let capacity = ztest::api::pipeline::probe_capacity(client).await?;
+        let b = buildkit::Builder::acquire(client, &run, &service_account(), capacity)
             .await
-            .context("create build pod")?;
-        if let Err(e) = buildkit::wait_build_pod_ready(client, &p).await {
-            buildkit::delete_build_pod(client, &p).await;
-            return Err(anyhow!("build pod not ready: {e}"));
-        }
+            .context("startup builder")?;
         on_phase(Phase::Done { label: "builder pod ready", dur: t_builder.elapsed() });
-        Some(p)
+        Some(b)
     } else {
         None
     };
+    let build_pod = builder.as_ref().map(|b| b.pod().to_string());
 
     let cx = build_cx(client.clone(), console, build_pod.clone());
     let compiled = match runner::compile(&cx, &list_args, Some(&mut on_phase)).await {
@@ -761,8 +764,8 @@ async fn build_and_provision(
             if let Some(c) = console {
                 c.flush_live();
             }
-            if let Some(p) = &build_pod {
-                buildkit::delete_build_pod(client, p).await;
+            if let Some(b) = builder {
+                b.release().await?;
             }
             return Err(e.into());
         }
@@ -790,8 +793,8 @@ async fn build_and_provision(
     )
     .await;
 
-    if let Some(pod) = &build_pod {
-        buildkit::delete_build_pod(client, pod).await;
+    if let Some(b) = builder {
+        b.release().await?;
     }
     Ok((compiled, image_refs?))
 }

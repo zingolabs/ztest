@@ -864,9 +864,6 @@ impl Provider for ObservabilityProvider {
         apply_stack(cx).await.map_err(|e| ResourceError::Provision(e.to_string()))?;
 
         for name in DEPLOYMENTS {
-            // Before the wait, not after: a stranded pod holds the replica *and* the RWO
-            // mount, so the rollout below cannot start until it is gone
-            reap_unmanaged(cx, name).await;
             if let Err(timeout) = crate::resource::kube::wait_deployment_available(
                 &cx.client,
                 OBS_NAMESPACE,
@@ -949,43 +946,6 @@ async fn stalled_because(cx: &Cx, deployment: &str) -> Option<String> {
             .and_then(|c| c.message.clone())?;
         Some(format!("pod is {phase} — {reason}"))
     })
-}
-
-/// Delete stack pods the kubelet has stopped managing, so the ReplicaSet can replace them.
-///
-/// - Deployment counts a stranded pod as its one replica → no replacement is ever created
-/// - k8s pod GC reaps these only when the *node* is deleted (single-node cluster → never)
-/// - Liveness cannot cover it (kubelet-enforced, and the lost kubelet is the failure)
-/// - Grace 0: `Recreate` over RWO → the replacement blocks on the mount until the object is gone
-///
-/// Best-effort — a failed delete leaves the rollout wait to time out and name it
-async fn reap_unmanaged(cx: &Cx, deployment: &str) {
-    use k8s_openapi::api::core::v1::Pod;
-    use kube::api::{DeleteParams, ListParams};
-
-    let pods: Api<Pod> = Api::namespaced(cx.client.clone(), OBS_NAMESPACE);
-    let selector = format!("app.kubernetes.io/name={}", deployment.trim_start_matches("ztest-"));
-    let Ok(list) = pods.list(&ListParams::default().labels(&selector)).await else {
-        return;
-    };
-    let force = DeleteParams { grace_period_seconds: Some(0), ..DeleteParams::default() };
-    for pod in list.items.iter().filter(|p| pod_is_unmanaged(p)) {
-        if let Some(name) = pod.metadata.name.as_deref() {
-            let _ = pods.delete(name, &force).await;
-        }
-    }
-}
-
-/// Pod is stranded: no kubelet is driving it, and recreating is the only way forward.
-///
-/// - `Pending` is NEVER stranded — an unbound PVC or a cold pull is progress, and reaping
-///   it would loop the pod forever instead of letting the wait report why
-/// - `Running`-but-unready belongs to the readiness probe, not here
-fn pod_is_unmanaged(pod: &k8s_openapi::api::core::v1::Pod) -> bool {
-    let Some(phase) = pod.status.as_ref().and_then(|s| s.phase.as_deref()) else {
-        return false;
-    };
-    matches!(phase, "Failed" | "Succeeded")
 }
 
 fn deployment_is_available(d: &Deployment) -> bool {

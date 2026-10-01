@@ -220,101 +220,52 @@ pub async fn reap_run(client: &Client, run_id: &str) -> Vec<String> {
 /// *Run-scoped*: deletes without consulting liveness (its one caller knows the run is
 /// over). User-facing reclaim goes through [`reclaim`](crate::resource::reclaim)
 async fn reap_envs(client: &Client, ns_selector: &str, vsc_selector: &str) -> Vec<String> {
-    let dp = DeleteParams::default();
-    let mut errors = Vec::new();
-
-    // Namespaces advertise `delete`, never `deletecollection` (which 405s) → list by
-    // label, delete each
-    let namespaces: Api<Namespace> = Api::all(client.clone());
-    let ns_lp = ListParams::default().labels(ns_selector);
-    match namespaces.list(&ns_lp).await {
-        Ok(list) => {
-            for ns in list.items {
-                let Some(name) = ns.metadata.name.as_deref() else {
-                    continue;
-                };
-                if let Err(e) = namespaces.delete(name, &dp).await
-                    && !crate::cluster::is_not_found(&e)
-                {
-                    errors.push(format!("reap namespace {name} ({ns_selector}): {e}"));
-                }
-            }
-        }
-        Err(e) => errors.push(format!("list namespaces ({ns_selector}): {e}")),
+    // Namespaces + out-of-namespace pods (driver/build sit outside any test namespace)
+    let pods = |ns| Api::<Pod>::namespaced(client.clone(), ns);
+    let (namespaces, run, build, sync) = futures::join!(
+        reap_matching(Api::<Namespace>::all(client.clone()), ns_selector),
+        reap_matching(pods(crate::naming::RUN_NAMESPACE), vsc_selector),
+        reap_matching(pods(crate::naming::BUILD_NAMESPACE), vsc_selector),
+        reap_matching(pods(crate::naming::SYNC_NAMESPACE), vsc_selector),
+    );
+    let mut errors = [namespaces, run, build, sync].concat();
+    // After the namespaces: their VolumeSnapshots bind these (cluster-scoped, no cascade)
+    let vsc = Api::<DynamicObject>::all_with(
+        client.clone(),
+        &crate::seeds::volume_snapshot_content_gvk(),
+    );
+    errors.extend(reap_matching(vsc, vsc_selector).await);
+    // Lease = the admission reservation → released only once everything it covered is gone;
+    // on any failure it lapses at TTL instead
+    if errors.is_empty() {
+        let leases = Api::<Lease>::namespaced(client.clone(), qos::ledger::META_NAMESPACE);
+        errors.extend(reap_matching(leases, vsc_selector).await);
     }
-
-    // Driver, build + seed-uploader pods sit outside any test namespace → the cascade above
-    // misses them, and a SIGKILL'd run leaves them holding their Guaranteed footprint
-    let pod_lp = ListParams::default().labels(vsc_selector);
-    for ns in [
-        crate::naming::RUN_NAMESPACE,
-        crate::naming::BUILD_NAMESPACE,
-        crate::naming::SYNC_NAMESPACE,
-    ] {
-        let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
-        match pods.list(&pod_lp).await {
-            Ok(list) => {
-                for pod in list.items {
-                    let Some(name) = pod.metadata.name.as_deref() else {
-                        continue;
-                    };
-                    if let Err(e) = pods.delete(name, &dp).await
-                        && !crate::cluster::is_not_found(&e)
-                    {
-                        errors.push(format!("reap pod {name} ({vsc_selector}): {e}"));
-                    }
-                }
-            }
-            Err(e) => errors.push(format!("list pods ({vsc_selector}): {e}")),
-        }
-    }
-
-    // Cluster-scoped → no cascade with the namespace; list + delete each by label (the
-    // run role advertises `delete` only, keeping the identity minimal). No snapshot CRD
-    // = nothing to reap = success
-    let vsc: Api<DynamicObject> =
-        Api::all_with(client.clone(), &crate::seeds::volume_snapshot_content_gvk());
-    let vsc_lp = ListParams::default().labels(vsc_selector);
-    match vsc.list(&vsc_lp).await {
-        Ok(list) => {
-            for obj in list.items {
-                let Some(name) = obj.metadata.name.as_deref() else {
-                    continue;
-                };
-                if let Err(e) = vsc.delete(name, &dp).await
-                    && !crate::cluster::is_not_found(&e)
-                {
-                    errors.push(format!("reap seed binding content {name} ({vsc_selector}): {e}"));
-                }
-            }
-        }
-        Err(e) if crate::cluster::is_not_found(&e) => {}
-        Err(e) => errors.push(format!("list seed binding contents ({vsc_selector}): {e}")),
-    }
-
-    // Last, after the pods it reserves for: the Lease *is* the admission reservation, so
-    // releasing it while dying pods still hold node capacity lets a concurrent run admit
-    // against capacity that isn't free
-    let leases: Api<Lease> = Api::namespaced(client.clone(), qos::ledger::META_NAMESPACE);
-    let lease_lp = ListParams::default().labels(vsc_selector);
-    match leases.list(&lease_lp).await {
-        Ok(list) => {
-            for lease in list.items {
-                let Some(name) = lease.metadata.name.as_deref() else {
-                    continue;
-                };
-                if let Err(e) = leases.delete(name, &dp).await
-                    && !crate::cluster::is_not_found(&e)
-                {
-                    errors.push(format!("reap reservation {name} ({vsc_selector}): {e}"));
-                }
-            }
-        }
-        Err(e) if crate::cluster::is_not_found(&e) => {}
-        Err(e) => errors.push(format!("list reservations ({vsc_selector}): {e}")),
-    }
-
     errors
+}
+
+/// [`delete_and_await`](crate::cluster::delete_and_await) every object matching `selector`,
+/// concurrently. List + delete-each (roles advertise `delete`, never `deletecollection`).
+/// Missing kind (no snapshot CRD) = nothing to reap
+async fn reap_matching<K>(api: Api<K>, selector: &str) -> Vec<String>
+where
+    K: kube::Resource + Clone + std::fmt::Debug + serde::de::DeserializeOwned + Send + 'static,
+{
+    let list = match api.list(&ListParams::default().labels(selector)).await {
+        Ok(list) => list,
+        Err(e) if crate::cluster::is_not_found(&e) => return Vec::new(),
+        Err(e) => return vec![format!("list ({selector}): {e}")],
+    };
+    let deletes = list.items.iter().map(|obj| {
+        let (api, name) = (api.clone(), obj.meta().name.clone().expect("listed object has a name"));
+        async move {
+            crate::cluster::delete_and_await(&api, &name, &DeleteParams::default())
+                .await
+                .err()
+                .map(|e| format!("reap {name} ({selector}): {e}"))
+        }
+    });
+    futures::future::join_all(deletes).await.into_iter().flatten().collect()
 }
 
 #[cfg(test)]

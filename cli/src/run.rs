@@ -36,6 +36,15 @@ fn fatal(console: Option<&Console>, msg: impl std::fmt::Display, code: i32) -> E
     exit(code)
 }
 
+/// Non-fatal one-liner, durable: console scrollback (a raw `eprintln` smears the panel), else
+/// stderr
+fn note(console: Option<&Console>, msg: impl std::fmt::Display) {
+    match console {
+        Some(c) => c.scrollback(format!("ztest: {msg}\n")),
+        None => eprintln!("ztest run: {msg}"),
+    }
+}
+
 /// Route panics through [`Console::fatal`] (default hook's stderr is clobbered by the
 /// footer repaint). Console only — non-TTY keeps the default hook + its backtrace
 fn install_panic_surface(console: &Console) {
@@ -574,50 +583,14 @@ fn service_account() -> String {
     std::env::var("ZTEST_SA").unwrap_or_else(|_| "ztest-local".to_string())
 }
 
-/// BuildKit pod + its reservation, as one object (they must die as one)
-///
-/// - Largest footprint ztest places
-/// - Leaked Lease → capacity sterilised until TTL
-/// - Leaked pod → unbudgeted memory under a node admission thinks is free
-struct ReservedBuilder {
-    pod: String,
-    reservation: ztest::qos::ledger::Reservation,
-}
-
-impl ReservedBuilder {
-    /// Reserve, then create the pod it covers (reservation named for the run-id the pod
-    /// carries → ledger attributes it, peers subtract it for the pod's whole life)
-    async fn acquire(
-        client: &kube::Client,
-        run: &ztest::api::naming::RunCoords,
-        capacity: ztest::qos::ClusterCapacity,
-    ) -> Result<Self> {
-        let reservation = ztest::qos::ledger::acquire(
-            client,
-            &run.run_id,
-            &service_account(),
-            &run.user,
-            capacity,
-            ztest::qos::ledger::Reserve::Fixed(ztest::qos::build::BUILDKIT_BUILD),
-            ztest::qos::beacon::LeaseKind::Build,
-        )
-        .await?;
-        // `?` drops `reservation` → released (the point of the RAII shape)
-        let pod = ztest::api::resource::create_build_pod(client, &run.run_id, &run.user).await?;
-        if let Err(e) = ztest::api::resource::wait_build_pod_ready(client, &pod).await {
-            ztest::api::resource::delete_build_pod(client, &pod).await;
-            return Err(anyhow!("{e}"));
-        }
-        Ok(ReservedBuilder { pod, reservation })
-    }
-
-    /// Delete the pod, then release its reservation (capacity must not read free while
-    /// the pod still terminates on it)
-    fn teardown(self, work_rt: &tokio::runtime::Runtime, client: &kube::Client) {
-        work_rt.block_on(async {
-            ztest::api::resource::delete_build_pod(client, &self.pod).await;
-            self.reservation.release().await;
-        });
+/// Release the builder; a failed delete keeps its lease (lapses → orphan reaping retries)
+fn release_builder(
+    work_rt: &tokio::runtime::Runtime,
+    console: Option<&Console>,
+    builder: ztest::api::resource::Builder,
+) {
+    if let Err(e) = work_rt.block_on(builder.release()) {
+        note(console, format!("{e}; reaped once its lease lapses"));
     }
 }
 
@@ -929,7 +902,12 @@ fn run_inner_on_cluster(
     use pipeline::runner::Phase;
     on_phase(Phase::Start("startup builder"));
     let t_builder = Instant::now();
-    let builder = match work_rt.block_on(ReservedBuilder::acquire(&client, run, initial_cap)) {
+    let builder = match work_rt.block_on(ztest::api::resource::Builder::acquire(
+        &client,
+        run,
+        &service_account(),
+        initial_cap,
+    )) {
         Ok(b) => b,
         Err(e) => {
             if let Some(c) = console {
@@ -944,18 +922,18 @@ fn run_inner_on_cluster(
     };
     on_phase(Phase::Done { label: "builder pod ready", dur: t_builder.elapsed() });
     if cancelled() {
-        builder.teardown(work_rt, &client);
+        release_builder(work_rt, console, builder);
         return cancel_exit();
     }
 
-    let compile_cx = build_cx(client.clone(), console, Some(builder.pod.clone()));
+    let compile_cx = build_cx(client.clone(), console, Some(builder.pod().to_string()));
     let remote = work_rt.block_on(pipeline::runner::compile(
         &compile_cx,
         &opts.list_args,
         Some(&mut on_phase),
     ));
     if cancelled() {
-        builder.teardown(work_rt, &client);
+        release_builder(work_rt, console, builder);
         return cancel_exit();
     }
     let remote = match remote {
@@ -963,7 +941,7 @@ fn run_inner_on_cluster(
         Err(e) => {
             // Drop the builder before bailing (else its Guaranteed footprint + reservation
             // leak until the janitor)
-            builder.teardown(work_rt, &client);
+            release_builder(work_rt, console, builder);
             // Commit the failing compile's output first → the error lands after, not above,
             // the output explaining it
             if let Some(c) = console {
@@ -1002,7 +980,7 @@ fn run_inner_on_cluster(
         } => (images, seeds, images_by_binary, deps_by_binary, sync_by_binary),
         // `runner::compile` only returns `Discovered`; handled rather than unwrapped
         images::DumpOutcome::Failed { detail } => {
-            builder.teardown(work_rt, &client);
+            release_builder(work_rt, console, builder);
             if let Some(c) = console {
                 c.flush_live();
             }
@@ -1021,7 +999,7 @@ fn run_inner_on_cluster(
         deps_by_binary,
         remote.qos_by_binary,
         RunnerSource::Prebaked(remote.runner_image_ref),
-        Some(builder.pod.clone()),
+        Some(builder.pod().to_string()),
         console,
         state,
         theme,
@@ -1033,7 +1011,7 @@ fn run_inner_on_cluster(
     // Build done → drop the builder so neither footprint nor reservation is held through
     // the test run (this release is what lets `launch_engine`'s acquire see it free;
     // `reap_run` backstops the error/cancel paths)
-    builder.teardown(work_rt, &client);
+    release_builder(work_rt, console, builder);
     if cancelled() {
         return cancel_exit();
     }
@@ -1724,13 +1702,7 @@ fn provision_and_resolve(
                     "resource {id:?} failed to provision ({detail}); tests needing it will be skipped"
                 )
             };
-            // Durable scrollback, never a raw `eprintln` (render thread owns the terminal;
-            // a direct write smears across the panel and teardown can wipe it). Off a TTY
-            // there is no render thread → `eprintln`.
-            match console {
-                Some(c) => c.scrollback(format!("ztest: {msg}\n")),
-                None => eprintln!("ztest run: {msg}"),
-            }
+            note(console, msg);
         }
     }
 

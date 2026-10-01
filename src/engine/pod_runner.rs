@@ -194,8 +194,11 @@ async fn run_in_pod(
     let runner_raw =
         runner_api.logs(&name, &LogParams::default()).await.unwrap_or_default().into_bytes();
     let harvest = test_ns::close(&client, &test_ns, cfg.env.no_cleanup).await;
-    if !cfg.env.no_cleanup {
-        let _ = runner_api.delete(&name, &DeleteParams::default()).await;
+    if !cfg.env.no_cleanup
+        && let Err(e) =
+            crate::cluster::delete_and_await(&runner_api, &name, &DeleteParams::default()).await
+    {
+        tracing::warn!(target: "ztest::pod", runner_pod = %name, error = %e, "runner pod delete failed");
     }
     let runner = crate::logstream::runner_output(&runner_raw, &item.test_name, &harvest.dead);
     let components = harvest.components;

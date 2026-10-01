@@ -8,7 +8,7 @@
 use k8s_openapi::api::core::v1::{Namespace, Service, ServiceAccount};
 use k8s_openapi::api::rbac::v1::RoleBinding;
 use kube::Client;
-use kube::api::{Api, PostParams};
+use kube::api::{Api, DeleteParams, PostParams};
 use serde_json::json;
 
 use crate::naming::RunCoords;
@@ -223,15 +223,33 @@ async fn wait_for_default_sa(client: &Client, namespace: &str) -> Result<(), kub
     }))
 }
 
-/// Delete the test's namespace, cascading every Pod/PVC/CM/Service. Best-effort — 404 on
-/// an already-gone namespace counts as success
-pub async fn delete_namespace(client: &Client, namespace: &str) -> Result<(), kube::Error> {
-    let api: Api<Namespace> = Api::all(client.clone());
-    match api.delete(namespace, &Default::default()).await {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-        Err(e) => Err(e),
+/// Graceful delete, then block until that object (by uid) is gone. Sole delete path for
+/// anything whose name, volume or footprint a successor may take over.
+///
+/// - Never grace 0: a force delete frees the name while the container may still run
+/// - No give-up: slow = the cluster's problem, surfaced by the caller; Ctrl-C = only exit
+/// - Already gone (404, or deleted with no uid to wait on) = success
+pub async fn delete_and_await<K>(
+    api: &Api<K>,
+    name: &str,
+    params: &DeleteParams,
+) -> Result<(), kube::Error>
+where
+    K: kube::Resource + Clone + std::fmt::Debug + serde::de::DeserializeOwned + Send + 'static,
+{
+    use kube::runtime::wait::delete::{Error, delete_and_finalize};
+    match delete_and_finalize(api.clone(), name, params).await {
+        Ok(()) | Err(Error::NoUid) => Ok(()),
+        Err(Error::Delete(e)) if is_not_found(&e) => Ok(()),
+        Err(Error::Delete(e)) => Err(e),
+        Err(Error::Await(e)) => Err(kube::Error::Service(Box::new(e))),
     }
+}
+
+/// Delete the test's namespace (cascading every Pod/PVC/CM/Service) and wait until it is gone
+pub async fn delete_namespace(client: &Client, namespace: &str) -> Result<(), kube::Error> {
+    delete_and_await(&Api::<Namespace>::all(client.clone()), namespace, &DeleteParams::default())
+        .await
 }
 
 /// Terminal reason of any component pod in `namespace` that *died* before teardown — the
@@ -296,7 +314,7 @@ pub async fn dead_pod_report(client: &Client, namespace: &str) -> String {
 /// - Best-effort: no snapshot CRD, or a VSC already gone, counts as success
 /// - List-then-delete-each (the run role advertises `delete`, not `deletecollection`)
 pub async fn delete_seed_binding_contents_for_ns(client: &Client, namespace: &str) {
-    use kube::api::{DeleteParams, DynamicObject, ListParams};
+    use kube::api::{DynamicObject, ListParams};
     let vsc: Api<DynamicObject> =
         Api::all_with(client.clone(), &crate::seeds::volume_snapshot_content_gvk());
     let lp = ListParams::default().labels(&format!("{}={namespace}", crate::qos::LABEL_TEST_NS));

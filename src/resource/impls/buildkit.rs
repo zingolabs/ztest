@@ -7,8 +7,8 @@
 //!   + `procMount: Unmasked`, which k8s gates on `hostUsers: false`
 //! - Cost = build steps unisolated *inside this pod* (intra-pod, not the host boundary)
 //! - Unconfined exceeds PSA *baseline* → run ns carries `…/enforce: privileged`
-//! - `ztest cluster setup` provisions scaffolding only (reserves no CPU/memory); the pod is
-//!   created per build at [`crate::qos::build::BUILDKIT_BUILD`] and deleted on every exit path
+//! - `ztest cluster setup` provisions scaffolding only (reserves no CPU/memory); the pod
+//!   ([`Builder`]) is created per build at [`crate::qos::build::BUILDKIT_BUILD`]
 //! - Cache PVC at [`BUILDKIT_STATE_DIR`] persists layers across pods; context =
 //!   `emptyDir` at [`WORK_MOUNT`], thrown away with the pod
 
@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, ServiceAccount};
+use kube::ResourceExt as _;
 use kube::api::{Api, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use kube::runtime::wait::await_condition;
 use serde_json::{Value, json};
@@ -40,11 +41,8 @@ const BUILDKIT_COMPONENT: &str = "ztest.io/component";
 const READY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Log tail carried on a build-pod startup failure (daemon dies within a few lines of the cause)
 const FAILURE_LOG_LINES: i64 = 20;
-/// Grace window to abort in-flight builds and unmount overlay/runc before SIGKILL
-/// (a kill mid-unmount leaks mounts and wedges the pod `Terminating`)
+/// Grace for buildkitd to abort in-flight builds + close its bolt DB cleanly (cache integrity)
 const TERMINATION_GRACE_SECS: i64 = 30;
-/// [`delete_build_pod`] wait before force-delete (grace window + kubelet teardown margin)
-const POD_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Layer + `--mount=type=cache` store, outliving every build pod. Public so
 /// [`capability`](crate::capability) can report it as part of what `setup` provisions
@@ -237,26 +235,107 @@ fn pod_spec(cpu: &str, mem: &str) -> Value {
     })
 }
 
-/// Create the ephemeral BuildKit pod at [`BUILDKIT_BUILD`](crate::qos::build::BUILDKIT_BUILD)
-/// (Guaranteed) and return its name.
+/// Build pod name = the cache lock: buildkitd flocks its state dir on the one cache PVC, and
+/// k8s name uniqueness admits one pod object (incl. a `Terminating` one) at a time
+pub const BUILD_POD: &str = "ztest-buildkit";
+
+/// The BuildKit pod + its ledger reservation, acquired and released as one.
 ///
-/// - Run-id label → a crashed run's `reap_run` removes it; [`LABEL_USER`](crate::qos::LABEL_USER)
-///   label → `ztest cleanup` reaps it like any run-owned object
-/// - Caller must [`wait_build_pod_ready`] then [`delete_build_pod`] on every path
-/// - Footprint must already be covered by a ledger reservation
-///   ([`Reserve::Fixed`](crate::qos::ledger::Reserve::Fixed)); unbudgeted lands a
-///   builder on memory admission already promised to tests
-pub async fn create_build_pod(
-    client: &kube::Client,
-    run_id: &str,
-    user: &str,
-) -> Result<String, ResourceError> {
-    let name = format!("ztest-build-{:08x}", rand::random::<u32>());
-    Api::<Pod>::namespaced(client.clone(), BUILD_NAMESPACE)
-        .create(&PostParams::default(), &build_pod(&name, run_id, user))
+/// - Reservation covers the pod's whole life: taken before create, released after absence
+/// - Run-id label → `reap_run`/orphan reaping; user label → `ztest cleanup`
+pub struct Builder {
+    client: kube::Client,
+    reservation: crate::qos::ledger::Reservation,
+}
+
+// `kube::Client` is not `Debug`
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Builder").field("reservation", &self.reservation).finish_non_exhaustive()
+    }
+}
+
+impl Builder {
+    pub async fn acquire(
+        client: &kube::Client,
+        run: &crate::naming::RunCoords,
+        sa: &str,
+        capacity: crate::qos::ClusterCapacity,
+    ) -> Result<Self, ResourceError> {
+        let api = Api::<Pod>::namespaced(client.clone(), BUILD_NAMESPACE);
+        let reservation = loop {
+            // Before reserving: a waiter must not hold the build footprint it cannot use
+            await_build_slot(client, &api).await?;
+            let reservation = crate::qos::ledger::acquire(
+                client,
+                &run.run_id,
+                sa,
+                &run.user,
+                capacity,
+                crate::qos::ledger::Reserve::Fixed(crate::qos::build::BUILDKIT_BUILD),
+                crate::qos::beacon::LeaseKind::Build,
+            )
+            .await
+            .map_err(|e| ResourceError::Provision(format!("reserve build footprint: {e}")))?;
+            match api
+                .create(&PostParams::default(), &build_pod(BUILD_POD, &run.run_id, &run.user))
+                .await
+            {
+                Ok(_) => break reservation,
+                // Lost the create race to a peer → its pod holds the slot
+                Err(kube::Error::Api(e)) if e.code == 409 => reservation.release().await,
+                Err(e) => {
+                    reservation.release().await;
+                    return Err(ResourceError::Provision(format!("create build pod: {e}")));
+                }
+            }
+        };
+        let builder = Builder { client: client.clone(), reservation };
+        if let Err(e) = wait_build_pod_ready(client, BUILD_POD).await {
+            builder.release().await?;
+            return Err(e);
+        }
+        Ok(builder)
+    }
+
+    pub fn pod(&self) -> &'static str {
+        BUILD_POD
+    }
+
+    /// Delete the pod, await its absence, then release the reservation. A failed delete
+    /// keeps the lease (lapses at TTL → orphan reaping retries), never frees a live pod's slot
+    pub async fn release(self) -> Result<(), ResourceError> {
+        let api = Api::<Pod>::namespaced(self.client.clone(), BUILD_NAMESPACE);
+        crate::cluster::delete_and_await(&api, BUILD_POD, &DeleteParams::default())
+            .await
+            .map_err(|e| ResourceError::Provision(format!("delete build pod: {e}")))?;
+        self.reservation.release().await;
+        Ok(())
+    }
+}
+
+/// Block until [`BUILD_POD`] is absent. A holder whose run has no live lease = orphan (its
+/// process died without teardown) → reaped; a live holder → waited out
+async fn await_build_slot(client: &kube::Client, api: &Api<Pod>) -> Result<(), ResourceError> {
+    let err = |e: String| ResourceError::Provision(format!("build slot: {e}"));
+    let Some(holder) = api.get_opt(BUILD_POD).await.map_err(|e| err(e.to_string()))? else {
+        return Ok(());
+    };
+    let run_id = holder.labels().get(LABEL_RUN_ID).cloned().expect("build pod carries its run id");
+    let live =
+        crate::qos::ledger::lease_live(client, &run_id).await.map_err(|e| err(e.to_string()))?;
+    if live {
+        tracing::info!(holder = %run_id, "build slot held by a live run; waiting");
+        let uid = holder.metadata.uid.expect("API object carries a uid");
+        await_condition(api.clone(), BUILD_POD, kube::runtime::wait::conditions::is_deleted(&uid))
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        return Ok(());
+    }
+    tracing::warn!(holder = %run_id, "reaping orphaned build pod (its run holds no lease)");
+    crate::cluster::delete_and_await(api, BUILD_POD, &DeleteParams::default())
         .await
-        .map_err(|e| ResourceError::Provision(format!("create build pod {name}: {e}")))?;
-    Ok(name)
+        .map_err(|e| err(e.to_string()))
 }
 
 /// Would this cluster admit the build pod? Dry-run create runs the whole admission chain
@@ -300,7 +379,7 @@ fn build_pod(name: &str, run_id: &str, user: &str) -> Pod {
 
 /// Block until the pod's `Ready` condition is `True` (buildkitd answers
 /// `buildctl debug workers`), or fail after [`READY_TIMEOUT`]
-pub async fn wait_build_pod_ready(client: &kube::Client, name: &str) -> Result<(), ResourceError> {
+async fn wait_build_pod_ready(client: &kube::Client, name: &str) -> Result<(), ResourceError> {
     let api: Api<Pod> = Api::namespaced(client.clone(), BUILD_NAMESPACE);
     // Wake on either terminal state: `restartPolicy: Never` means a crashed or
     // unschedulable pod never recovers, so report it instead of spinning to timeout
@@ -326,7 +405,7 @@ pub async fn wait_build_pod_ready(client: &kube::Client, name: &str) -> Result<(
 }
 
 /// buildkitd's own stderr, the only place the cause is written: pod status carries an exit
-/// code, never a reason (state-dir lock held by a concurrent run, unusable snapshotter, …).
+/// code, never a reason (unusable snapshotter, bad config, …).
 /// Logs survive the container's exit, so this reads after the terminal state settles
 async fn failure_log_tail(client: &kube::Client, name: &str) -> Option<String> {
     let params = LogParams {
@@ -379,23 +458,6 @@ fn pod_failed(p: &Pod) -> Option<String> {
     None
 }
 
-/// Delete the build pod and confirm it gone.
-///
-/// - Graceful first ([`TERMINATION_GRACE_SECS`] lets a live daemon unmount cleanly)
-/// - Force-delete past [`POD_TEARDOWN_TIMEOUT`] (leaked mounts wedge `Terminating`
-///   forever, and a lingering pod holds its Guaranteed footprint)
-/// - Best-effort: single-use throwaway, durable state on the cache PVC
-pub async fn delete_build_pod(client: &kube::Client, name: &str) {
-    let api = Api::<Pod>::namespaced(client.clone(), BUILD_NAMESPACE);
-    if api.delete(name, &DeleteParams::default()).await.is_err() {
-        return;
-    }
-    let gone = await_condition(api.clone(), name, |p: Option<&Pod>| p.is_none());
-    if !matches!(tokio::time::timeout(POD_TEARDOWN_TIMEOUT, gone).await, Ok(Ok(_))) {
-        let _ = api.delete(name, &DeleteParams::default().grace_period(0)).await;
-    }
-}
-
 fn pod_ready(p: &Pod) -> bool {
     p.status
         .as_ref()
@@ -406,7 +468,7 @@ fn pod_ready(p: &Pod) -> bool {
 
 /// BuildKit scaffolding: SA, `buildkitd.toml` ConfigMap, cache PVC. `Cached`,
 /// provisioned by `ztest cluster setup`; reserves no CPU/memory (pod is ephemeral —
-/// [`create_build_pod`])
+/// [`Builder`])
 #[derive(Debug)]
 pub struct BuildkitProvider;
 

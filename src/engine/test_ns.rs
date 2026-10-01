@@ -41,8 +41,12 @@ pub async fn close(client: &kube::Client, ns: &str, no_cleanup: bool) -> Harvest
         tracing::warn!(target: "ztest::pod", namespace = %ns, "--no-cleanup: namespace kept");
         return harvest;
     }
+    // Namespace first, awaited: its VolumeSnapshots release the VSCs they bind
+    if let Err(e) = crate::cluster::delete_namespace(client, ns).await {
+        tracing::warn!(target: "ztest::pod", namespace = %ns, error = %e, "namespace delete failed");
+        return harvest;
+    }
     // Seed-binding VSCs: cluster-scoped, outside the namespace cascade
     crate::cluster::delete_seed_binding_contents_for_ns(client, ns).await;
-    let _ = crate::cluster::delete_namespace(client, ns).await;
     harvest
 }

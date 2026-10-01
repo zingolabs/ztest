@@ -549,7 +549,7 @@ async fn materialize(
             true => job_logs(&pods, &job_name).await,
             false => String::new(),
         };
-        let _ = jobs.delete(&job_name, &kube::api::DeleteParams::background()).await;
+        delete_job(&jobs, &job_name).await;
         return Err(MaterializeErr::Fatal(puller_stuck(&seed.name, stall, &tail)));
     }
     progress.finalizing();
@@ -561,11 +561,19 @@ async fn materialize(
             reason: format!("puller job failed: {}", logs.trim()),
         }));
     }
-    // Best-effort, janitor backstops. Background propagation (server default for a
-    // Job = `Orphan`, and an orphaned puller pins the PVC's `pvc-protection`
-    // finalizer forever, with no owner left to reap it)
-    let _ = jobs.delete(&job_name, &kube::api::DeleteParams::background()).await;
+    delete_job(&jobs, &job_name).await;
     Ok(())
+}
+
+/// Job name = the seed's lock → foreground delete (Job object outlives its pods, so the name
+/// frees only once no puller still writes the PVC), awaited. Server default `Orphan` would
+/// strand the pod pinning the PVC's `pvc-protection` finalizer
+async fn delete_job(jobs: &Api<Job>, name: &str) {
+    if let Err(e) =
+        crate::cluster::delete_and_await(jobs, name, &kube::api::DeleteParams::foreground()).await
+    {
+        tracing::warn!(job = %name, error = %e, "puller job delete failed");
+    }
 }
 
 /// Last thing the puller said, appended to the verdict. One line, not the tail: over a
@@ -701,21 +709,9 @@ async fn reap_finished_job(jobs: &Api<Job>, name: &str) -> bool {
     if !is_job_finished().matches_object(Some(&job)) {
         return false;
     }
-    // Background propagation so the Job's pods go with it, not orphaned
-    let dp = kube::api::DeleteParams::background();
-    if jobs.delete(name, &dp).await.is_err() {
-        return false;
-    }
-    // Name unusable until the object is gone (a create racing the delete 409s again)
-    let deadline = tokio::time::Instant::now() + WAIT_BUDGET;
-    while tokio::time::Instant::now() < deadline {
-        match jobs.get_opt(name).await {
-            Ok(None) => return true,
-            Ok(Some(_)) => tokio::time::sleep(WAIT_INTERVAL).await,
-            Err(_) => return false,
-        }
-    }
-    false
+    crate::cluster::delete_and_await(jobs, name, &kube::api::DeleteParams::foreground())
+        .await
+        .is_ok()
 }
 
 /// Terminal = `Complete` or `Failed`
