@@ -1,12 +1,10 @@
-//! Test-author `SyncRunner` facade (design §"Test-author API").
+//! Test-author facade (design §"Test-author API").
 //!
-//! - Body = registration program: topology → bind subject → named invariants at
-//!   cadences → later phases (`then`) → nemesis schedule → `run.run()`
-//! - Derefs to the first [`Phase`] → `run.always(..)`/`run.tick(..)` register there
+//! - Body = registration program: `topology` → [`Run<T>`] → phases + run-wide probes over the
+//!   typed handles → nemesis schedule → `run.run()`
 //! - `topology()`/`run()` are cluster-bound ([`TestEnv`]); registration +
-//!   [`manifest`](SyncRunner::manifest) is cluster-free (powers `describe`)
+//!   [`manifest`](Run::manifest) is cluster-free (powers `describe`)
 
-use std::future::Future;
 use std::sync::Arc;
 
 use crate::env::TestEnv;
@@ -14,8 +12,8 @@ use crate::error::EnvError;
 use crate::handles::pod::Watched;
 
 use super::nemesis::{Nemesis, NemesisBuilder};
-use super::phase::{Phase, PhaseError, Source};
-use super::probe::{Class, SyncCtx};
+use super::phase::{Phase, Throughout};
+use super::probe::{Class, ProbeSpec};
 use super::runner::{SyncEngine, SyncOutcome};
 use super::subject::SyncSubject;
 
@@ -35,21 +33,10 @@ pub struct PhaseManifest {
     pub probes: Vec<(String, Class)>,
 }
 
+/// What a `#[ztest::sync_test]` body receives: an unprovisioned topology
+#[derive(Debug)]
 pub struct SyncRunner {
     env: TestEnv,
-    first: Phase,
-    rest: Vec<Phase>,
-    nemesis: Nemesis,
-}
-
-impl std::fmt::Debug for SyncRunner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SyncRunner")
-            .field("first", &self.first)
-            .field("rest", &self.rest)
-            .field("scheduled_faults", &self.nemesis.scheduled.len())
-            .finish_non_exhaustive()
-    }
 }
 
 impl Default for SyncRunner {
@@ -58,69 +45,76 @@ impl Default for SyncRunner {
     }
 }
 
-impl std::ops::Deref for SyncRunner {
-    type Target = Phase;
-    fn deref(&self) -> &Phase {
-        &self.first
-    }
-}
-impl std::ops::DerefMut for SyncRunner {
-    fn deref_mut(&mut self) -> &mut Phase {
-        &mut self.first
-    }
-}
-
 impl SyncRunner {
     pub fn new() -> Self {
-        Self {
-            env: TestEnv::builder(),
-            first: Phase::new("sync", Source::Unbound),
-            rest: Vec::new(),
-            nemesis: Nemesis::default(),
-        }
+        Self { env: TestEnv::builder() }
     }
 
-    /// Closure adds validators/indexers/wallets and returns handles; this
-    /// provisions the cluster and hands them back. (Cluster-bound)
-    pub async fn topology<F, R>(&mut self, f: F) -> Result<R, EnvError>
-    where
-        F: FnOnce(&mut TestEnv) -> R,
-    {
-        let handles = f(&mut self.env);
+    /// Closure adds validators/indexers/wallets and returns their handles (`T`, typically a
+    /// tuple); this provisions the cluster and hands back a [`Run`] lending `&T` to every
+    /// phase factory and probe. (Cluster-bound)
+    pub async fn topology<T>(
+        mut self,
+        f: impl FnOnce(&mut TestEnv) -> T,
+    ) -> Result<Run<T>, EnvError> {
+        let topology = f(&mut self.env);
         self.env.build().await?;
-        Ok(handles)
+        Ok(Run {
+            env: self.env,
+            topology,
+            throughout: Vec::new(),
+            phases: Vec::new(),
+            nemesis: Nemesis::default(),
+        })
     }
+}
 
-    /// Bind what the first phase watches. Any [`SyncSubject`] — ztest's backends implement
-    /// it, and so can a consuming crate's own component; the harness never names an engine
-    pub fn sync(&mut self, subject: impl SyncSubject + 'static) {
-        self.first.source = Source::Bound(Box::new(subject));
+/// Provisioned run: phases in declaration order, run-wide probes, chaos schedule
+pub struct Run<T> {
+    env: TestEnv,
+    topology: T,
+    throughout: Vec<ProbeSpec<T>>,
+    phases: Vec<Phase<T>>,
+    nemesis: Nemesis,
+}
+
+impl<T> std::fmt::Debug for Run<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Run")
+            .field("throughout", &self.throughout.len())
+            .field("phases", &self.phases)
+            .field("scheduled_faults", &self.nemesis.scheduled.len())
+            .finish_non_exhaustive()
     }
+}
 
-    /// Later phase; its probes/knobs registered on the returned [`Phase`]
+impl<T> Run<T> {
+    /// Next phase; `build(&topology)` → its subject, run at phase start
     ///
-    /// - `build(ctx)` → subject, run at phase start (e.g. wallet needing a serving indexer)
     /// - Starts only after the previous phase completed with no fatal violation
-    /// - Own tick/timeout/`requires_work`/probes; nothing inherited from phase 1
-    pub fn then<F, Fut, S>(&mut self, name: impl Into<String>, build: F) -> &mut Phase
+    /// - Own tick/timeout/`requires_work`/probes; nothing inherited from earlier phases
+    pub fn phase<F, S>(&mut self, name: impl Into<String>, build: F) -> &mut Phase<T>
     where
-        F: FnOnce(SyncCtx) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<S, PhaseError>> + Send + 'static,
+        F: AsyncFnOnce(&T) -> anyhow::Result<S> + 'static,
         S: SyncSubject + 'static,
     {
-        let index = self.rest.len();
-        self.rest.push(Phase::deferred(name, build));
-        &mut self.rest[index]
+        self.phases.push(Phase::new(name, build));
+        let last = self.phases.len() - 1;
+        &mut self.phases[last]
+    }
+
+    /// Probes judged in every phase, ahead of each phase's own
+    pub fn throughout(&mut self) -> Throughout<'_, T> {
+        Throughout { probes: &mut self.throughout }
     }
 
     /// Chain this run is pinned to: read from the artifact manifest at compile
-    /// time, verified against the validator in [`topology`](Self::topology) (so a
+    /// time, verified against the validator in [`topology`](SyncRunner::topology) (so a
     /// probe asserts a fact neither subject nor validator produced).
     ///
     /// # Panics
     ///
-    /// Before [`topology`](Self::topology), or with no restored chain archive.
-    /// See [`TestEnv::chain`]
+    /// With no restored chain archive. See [`TestEnv::chain`]
     pub fn chain(&self) -> crate::ChainSnapshot {
         self.env.chain()
     }
@@ -130,14 +124,20 @@ impl SyncRunner {
         self.nemesis.builder()
     }
 
-    /// Cluster-free registration manifest (for `describe`)
+    /// Cluster-free registration manifest (for `describe`); run-wide probes listed per phase
     pub fn manifest(&self) -> SyncManifest {
         SyncManifest {
-            phases: std::iter::once(&self.first)
-                .chain(&self.rest)
+            phases: self
+                .phases
+                .iter()
                 .map(|phase| PhaseManifest {
                     name: phase.name.clone(),
-                    probes: phase.probes.iter().map(|p| (p.name.clone(), p.class)).collect(),
+                    probes: self
+                        .throughout
+                        .iter()
+                        .chain(&phase.probes)
+                        .map(|p| (p.name.clone(), p.class))
+                        .collect(),
                 })
                 .collect(),
             scheduled_faults: self
@@ -151,15 +151,13 @@ impl SyncRunner {
         }
     }
 
-    /// Provision if needed, bind the engine over the phases, run to completion.
-    /// (Cluster-bound.)
+    /// Bind the engine over the phases, run to completion. (Cluster-bound.)
     pub async fn run(self) -> SyncOutcome {
-        let SyncRunner { env, first, rest, nemesis } = self;
-        if matches!(first.source, Source::Unbound) {
-            return SyncOutcome::error_outcome(
-                "run.sync(..) must be called before run.run()".into(),
-            );
-        }
+        let Run { env, topology, throughout, phases, nemesis } = self;
+        let mut phases = phases.into_iter();
+        let Some(first) = phases.next() else {
+            return SyncOutcome::error_outcome("no phase registered (`run.phase(..)`)".into());
+        };
         // `ChainWork` reads `chainMetadata` through this to turn a height into a
         // work vector, and it names the segment's network. No reader = no denominator
         let reader = match env.single_indexer().await {
@@ -171,9 +169,10 @@ impl SyncRunner {
             Err(e) => return SyncOutcome::error_outcome(format!("list component pods: {e}")),
         };
         let watched: Vec<Arc<dyn Watched>> =
-            pods.iter().cloned().map(|p| Arc::new(p) as Arc<dyn Watched>).collect();
-        let engine = SyncEngine::phased(first, rest)
-            .with_ctx(SyncCtx::new(Some(reader)).with_pods(pods))
+            pods.into_iter().map(|p| Arc::new(p) as Arc<dyn Watched>).collect();
+        let engine = SyncEngine::phased(topology, first, phases.collect())
+            .with_throughout(throughout)
+            .with_indexer(reader)
             .with_nemesis(&nemesis)
             .with_watched(watched);
         drive(env, engine).await
@@ -182,7 +181,7 @@ impl SyncRunner {
 
 /// Wire what only a detached run has onto `engine`, run it, attach what the engine cannot
 /// reach: flushed profiles + the mirrored durable report
-async fn drive(env: TestEnv, mut engine: SyncEngine) -> SyncOutcome {
+async fn drive<T>(env: TestEnv, mut engine: SyncEngine<T>) -> SyncOutcome {
     let detached = super::active_sync_id();
     let profile = std::env::var(super::SYNC_PROFILE_ENV).unwrap_or_default();
     // Detached: a Prometheus target, read like any component. Local runs keep the silent

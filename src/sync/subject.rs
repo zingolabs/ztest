@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 
 use crate::RpcError;
-use crate::handles::wallet::PoolBalances;
+use crate::handles::wallet::{NoteCounts, PoolBalances, ScanTotals};
 use crate::metrics::Exposition;
 
 use super::tree::TreeRoots;
@@ -17,8 +17,8 @@ use super::work::{Op, Work};
 /// Progress columns every subject exposes, enough for the subject-agnostic probes
 /// (monotonic height, no-stall, reached-target).
 ///
-/// Balances + tree roots are wallet extras; observers report neither, said explicitly by
-/// the defaults rather than by a zero a probe would read as passing
+/// - Balances, tree roots, notes, scan = wallet extras
+/// - Observers report none (explicit default, not a zero a probe would read as passing)
 pub trait ProgressView: Send + std::fmt::Debug {
     fn height(&self) -> u32;
     fn target(&self) -> Option<u32>;
@@ -51,6 +51,15 @@ pub trait ProgressView: Send + std::fmt::Debug {
     /// an indexer's `GetTreeState`. [`TreeRoots::UNREPORTED`] (no trees) != per-pool `None`
     fn tree_roots(&self) -> TreeRoots {
         TreeRoots::UNREPORTED
+    }
+    /// Unspent notes per pool; `None` (default) = not a wallet, on [`balances`](Self::balances)'
+    /// terms
+    fn notes(&self) -> Option<NoteCounts> {
+        None
+    }
+    /// Last finished scan session; `None` = not a wallet, or no session finished yet
+    fn scan(&self) -> Option<ScanTotals> {
+        None
     }
 }
 

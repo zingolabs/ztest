@@ -19,13 +19,13 @@ use crate::metrics::{Family, Row};
 
 use super::chainwork::ChainWork;
 use super::nemesis::{FaultKind, Nemesis, ScheduledFault};
-use super::phase::{Phase, PhaseOutcome, Source};
-use super::probe::{Cadence, Class, ProbeSpec, Severity, SyncCtx, Verdict, Violation};
+use super::phase::{Phase, PhaseOutcome, Throughout};
+use super::probe::{Cadence, Class, ProbeSpec, Severity, Verdict, Violation};
 use super::restart::RestartWatch;
 use super::snapshot::{History, Snapshot, SnapshotBuilder, TickEvents};
 use super::subject::{ProgressView, SyncSubject};
 use super::work::{Op, OpSet, Segment, Work};
-use crate::handles::indexer::BlockHeight;
+use crate::handles::indexer::{BlockHeight, IndexerBackend};
 
 /// Engine's sampling cadence when a profile names none. Also what a watcher assumes a
 /// driver ticks at until its `Started` says otherwise
@@ -187,7 +187,7 @@ enum Readiness {
     Late(String),
 }
 
-impl std::fmt::Debug for SyncEngine {
+impl<T> std::fmt::Debug for SyncEngine<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncEngine")
             .field("first", &self.first)
@@ -197,13 +197,16 @@ impl std::fmt::Debug for SyncEngine {
 }
 
 /// Subject is boxed, not a type parameter: every profile binds one dynamically, and a
-/// generic engine would push that parameter into every caller for no gain.
+/// generic engine would push that parameter into every caller for no gain. `T` = the
+/// topology handles lent to every probe and phase factory
 ///
 /// Derefs to its first [`Phase`] → `engine.always(..)` registers there
-pub struct SyncEngine {
-    first: Phase,
-    rest: Vec<Phase>,
-    ctx: SyncCtx,
+pub struct SyncEngine<T = ()> {
+    first: Phase<T>,
+    rest: Vec<Phase<T>>,
+    throughout: Vec<ProbeSpec<T>>,
+    topology: T,
+    indexer: Option<Arc<dyn IndexerBackend>>,
     cancel: Cancel,
     history_cap: usize,
     reporter: Box<dyn SyncReporter>,
@@ -211,30 +214,34 @@ pub struct SyncEngine {
     watched: Vec<Arc<dyn Watched>>,
 }
 
-impl std::ops::Deref for SyncEngine {
-    type Target = Phase;
-    fn deref(&self) -> &Phase {
+impl<T> std::ops::Deref for SyncEngine<T> {
+    type Target = Phase<T>;
+    fn deref(&self) -> &Phase<T> {
         &self.first
     }
 }
-impl std::ops::DerefMut for SyncEngine {
-    fn deref_mut(&mut self) -> &mut Phase {
+impl<T> std::ops::DerefMut for SyncEngine<T> {
+    fn deref_mut(&mut self) -> &mut Phase<T> {
         &mut self.first
     }
 }
 
-impl SyncEngine {
-    /// Runner over `subject`: no oracle indexer, no cancellation, 5 s base tick,
+impl SyncEngine<()> {
+    /// Runner over `subject`: no topology, no oracle indexer, no cancellation, 5 s base tick,
     /// 20k-snapshot history, no timeout, `NullReporter`. Chain the setters below.
-    pub fn new(subject: Box<dyn SyncSubject>) -> Self {
-        Self::phased(Phase::new("sync", Source::Bound(subject)), Vec::new())
+    pub fn new(subject: impl SyncSubject + 'static) -> Self {
+        Self::phased((), Phase::bound("sync", subject), Vec::new())
     }
+}
 
-    pub(crate) fn phased(first: Phase, rest: Vec<Phase>) -> Self {
+impl<T> SyncEngine<T> {
+    pub(crate) fn phased(topology: T, first: Phase<T>, rest: Vec<Phase<T>>) -> Self {
         Self {
             first,
             rest,
-            ctx: SyncCtx::new(None),
+            throughout: Vec::new(),
+            topology,
+            indexer: None,
             cancel: Cancel::never(),
             history_cap: 20_000,
             reporter: Box::new(NullReporter),
@@ -244,8 +251,18 @@ impl SyncEngine {
     }
 
     /// Append a phase, run after the previous one completed with no fatal violation
-    pub fn then(mut self, phase: Phase) -> Self {
+    pub fn then(mut self, phase: Phase<T>) -> Self {
         self.rest.push(phase);
+        self
+    }
+
+    /// Probes judged in every phase, ahead of each phase's own
+    pub fn throughout(&mut self) -> Throughout<'_, T> {
+        Throughout { probes: &mut self.throughout }
+    }
+
+    pub(crate) fn with_throughout(mut self, probes: Vec<ProbeSpec<T>>) -> Self {
+        self.throughout = probes;
         self
     }
 
@@ -255,8 +272,9 @@ impl SyncEngine {
         self
     }
 
-    pub fn with_ctx(mut self, ctx: SyncCtx) -> Self {
-        self.ctx = ctx;
+    /// Chain reader behind derived work + the segment's network name
+    pub fn with_indexer(mut self, indexer: Arc<dyn IndexerBackend>) -> Self {
+        self.indexer = Some(indexer);
         self
     }
     pub fn with_cancel(mut self, cancel: Cancel) -> Self {
@@ -303,11 +321,6 @@ impl SyncEngine {
         self
     }
 
-    pub fn with_probes(mut self, probes: Vec<ProbeSpec>) -> Self {
-        self.first.probes = probes;
-        self
-    }
-
     /// Scheduled faults the runner applies (`kill`); other kinds stay recorded only
     pub fn with_nemesis(mut self, nemesis: &Nemesis) -> Self {
         self.faults = nemesis.scheduled.clone();
@@ -321,10 +334,22 @@ impl SyncEngine {
     }
 
     pub async fn run(self) -> SyncOutcome {
-        let SyncEngine { first, rest, ctx, cancel, history_cap, reporter, faults, watched } = self;
+        let SyncEngine {
+            first,
+            rest,
+            throughout,
+            topology,
+            indexer,
+            cancel,
+            history_cap,
+            reporter,
+            faults,
+            watched,
+        } = self;
         let mut shared = Shared {
             chaos: Chaos::new(faults, Instant::now()),
-            ctx,
+            topology,
+            indexer,
             cancel,
             history_cap,
             reporter,
@@ -338,6 +363,8 @@ impl SyncEngine {
         }
         let mut results = Vec::new();
         for mut phase in std::iter::once(first).chain(rest) {
+            let own = std::mem::take(&mut phase.probes);
+            phase.probes = throughout.iter().map(ProbeSpec::fresh).chain(own).collect();
             shared.reporter.on_phase_start(&phase.name);
             let result = shared.run_phase(&mut phase).await;
             shared.reporter.on_phase(&result.summary);
@@ -429,8 +456,9 @@ impl Chaos {
 }
 
 /// Run-scoped state every phase shares
-struct Shared {
-    ctx: SyncCtx,
+struct Shared<T> {
+    topology: T,
+    indexer: Option<Arc<dyn IndexerBackend>>,
     cancel: Cancel,
     history_cap: usize,
     reporter: Box<dyn SyncReporter>,
@@ -439,7 +467,7 @@ struct Shared {
     run_origin: Option<SystemTime>,
 }
 
-impl Shared {
+impl<T> Shared<T> {
     /// Every `kill` → exactly one restartable component (refused here, not at its offset hours in)
     async fn preflight_faults(&self) -> Result<(), String> {
         for fault in &self.chaos.pending {
@@ -459,32 +487,27 @@ impl Shared {
         }
     }
 
-    async fn run_phase(&mut self, phase: &mut Phase) -> PhaseResult {
+    async fn run_phase(&mut self, phase: &mut Phase<T>) -> PhaseResult {
         let started = Instant::now();
         let started_wall = SystemTime::now();
         let deadline = phase.timeout.map(|t| started + t);
-        let early = |phase: &Phase, verdict, error: Option<String>| {
+        let early = |phase: &Phase<T>, verdict, error: Option<String>| {
             PhaseResult::early(phase, verdict, error, started, started_wall)
         };
-        let subject = match std::mem::replace(&mut phase.source, Source::Unbound) {
-            Source::Bound(subject) => subject,
-            Source::Unbound => {
-                return early(phase, SyncVerdict::Errored, Some("no subject bound".into()));
-            }
-            Source::Deferred(build) => {
-                tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => return early(phase, SyncVerdict::Cancelled, None),
-                    _ = sleep_until(deadline) => return early(phase, SyncVerdict::TimedOut, None),
-                    built = build(self.ctx.clone()) => match built {
-                        Ok(subject) => subject,
-                        Err(e) => {
-                            let error = Some(format!("build subject: {e}"));
-                            return early(phase, SyncVerdict::Errored, error);
-                        }
-                    },
+        let Some(source) = phase.source.take() else {
+            return early(phase, SyncVerdict::Errored, Some("phase already ran".into()));
+        };
+        let subject = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return early(phase, SyncVerdict::Cancelled, None),
+            _ = sleep_until(deadline) => return early(phase, SyncVerdict::TimedOut, None),
+            built = source.subject(&self.topology) => match built {
+                Ok(subject) => subject,
+                Err(e) => {
+                    let error = Some(format!("build subject: {e:#}"));
+                    return early(phase, SyncVerdict::Errored, error);
                 }
-            }
+            },
         };
         let run = PhaseRun {
             s: self,
@@ -507,8 +530,8 @@ async fn sleep_until(deadline: Option<Instant>) {
 }
 
 impl PhaseResult {
-    fn early(
-        phase: &Phase,
+    fn early<T>(
+        phase: &Phase<T>,
         verdict: SyncVerdict,
         error: Option<String>,
         started: Instant,
@@ -537,9 +560,9 @@ impl PhaseResult {
 }
 
 /// One phase in flight: its subject, its probes, the run's shared state
-struct PhaseRun<'a> {
-    s: &'a mut Shared,
-    phase: &'a mut Phase,
+struct PhaseRun<'a, T> {
+    s: &'a mut Shared<T>,
+    phase: &'a mut Phase<T>,
     subject: Box<dyn SyncSubject>,
     started: Instant,
     started_wall: SystemTime,
@@ -560,7 +583,7 @@ impl Ending {
     }
 }
 
-impl PhaseRun<'_> {
+impl<T> PhaseRun<'_, T> {
     async fn run(mut self) -> PhaseResult {
         if let Err(e) = self.subject.launch().await {
             return self.early(SyncVerdict::Errored, Some(format!("launch: {e}")));
@@ -783,7 +806,7 @@ impl PhaseRun<'_> {
     /// Chain this phase is against, as the indexer names it (`main`/`test`/`regtest`); `None`
     /// with no indexer to ask. Part of a segment's identity (block 840,000 differs per network)
     async fn network(&self) -> Option<String> {
-        let indexer = self.s.ctx.indexer()?;
+        let indexer = self.s.indexer.as_deref()?;
         let name = indexer.indexer_info().await.ok()?.chain_name;
         (!name.is_empty()).then_some(name)
     }
@@ -802,7 +825,7 @@ impl PhaseRun<'_> {
         if let Some(own) = progress.work() {
             return own;
         }
-        let Some(indexer) = self.s.ctx.indexer() else {
+        let Some(indexer) = self.s.indexer.as_deref() else {
             return last;
         };
         let height = BlockHeight::from_u32(progress.height());
@@ -816,8 +839,22 @@ impl PhaseRun<'_> {
         violations: &mut Vec<Violation>,
     ) -> Result<bool, String> {
         let mut fatal = false;
-        for spec in self.phase.probes.iter_mut().filter(|s| s.class == Class::AtCompletion) {
-            match spec.check.evaluate(snap, &self.s.ctx).await {
+        for spec in self.phase.probes.iter().filter(|s| s.class == Class::AtCompletion) {
+            let retry_until = spec.within.map(|span| Instant::now() + span);
+            let verdict = loop {
+                let verdict = spec.judge(snap, &self.s.topology).await;
+                let retry = matches!(verdict, Verdict::Violated(_))
+                    && retry_until.is_some_and(|until| Instant::now() < until);
+                if !retry {
+                    break verdict;
+                }
+                tokio::select! {
+                    biased;
+                    _ = self.s.cancel.cancelled() => break verdict,
+                    _ = tokio::time::sleep(self.phase.tick) => {}
+                }
+            };
+            match verdict {
                 Verdict::Satisfied | Verdict::Pending => {}
                 Verdict::Violated(mut v) => {
                     v.probe = spec.name.clone();
@@ -844,7 +881,7 @@ impl PhaseRun<'_> {
                 Class::Sometimes => {
                     // Cheap coverage predicate → evaluate every tick, latch
                     if !spec.ever_satisfied {
-                        match spec.check.evaluate(snap, &self.s.ctx).await {
+                        match spec.judge(snap, &self.s.topology).await {
                             Verdict::Satisfied => spec.ever_satisfied = true,
                             Verdict::ProbeError(e) => {
                                 return Flow::Abort(format!("{}: {e}", spec.name));
@@ -857,7 +894,7 @@ impl PhaseRun<'_> {
                     if !spec.due(snap.height(), now) {
                         continue;
                     }
-                    let verdict = spec.check.evaluate(snap, &self.s.ctx).await;
+                    let verdict = spec.judge(snap, &self.s.topology).await;
                     spec.mark_fired(snap.seq(), snap.height(), now);
                     match verdict {
                         Verdict::Satisfied | Verdict::Pending => spec.violation_streak = 0,
@@ -890,7 +927,7 @@ impl PhaseRun<'_> {
                         Cadence::Window(d) => d,
                         _ => Duration::MAX,
                     };
-                    match spec.check.evaluate(snap, &self.s.ctx).await {
+                    match spec.judge(snap, &self.s.topology).await {
                         Verdict::Satisfied => spec.last_satisfied = Some(now),
                         Verdict::ProbeError(e) => {
                             return Flow::Abort(format!("{}: {e}", spec.name));
@@ -1059,13 +1096,13 @@ impl PhaseRun<'_> {
 }
 
 /// Restart window with no snapshot this tick → still pause every `eventually` window
-fn credit_liveness(probes: &mut [ProbeSpec], now: Instant) {
+fn credit_liveness<T>(probes: &mut [ProbeSpec<T>], now: Instant) {
     for spec in probes.iter_mut().filter(|s| s.class == Class::Eventually) {
         spec.last_satisfied = Some(now);
     }
 }
 
-fn coverage_gaps(probes: &[ProbeSpec]) -> Vec<String> {
+fn coverage_gaps<T>(probes: &[ProbeSpec<T>]) -> Vec<String> {
     probes
         .iter()
         .filter(|s| s.class == Class::Sometimes && !s.ever_satisfied)
@@ -1085,11 +1122,11 @@ mod tests {
     use crate::handles::{ContainerSample, PodError};
 
     use super::super::nemesis::Nemesis;
-    use super::super::probe::{Verdict, Violation};
     use super::super::snapshot::Snapshot;
     use super::super::subject::SyncSubject;
     use super::super::work::Op;
     use super::*;
+    use crate::{sync_ensure, sync_fail};
 
     #[derive(Clone, Debug)]
     struct FakeProgress {
@@ -1228,20 +1265,14 @@ mod tests {
         FakeProgress { height, target, sapling: u64::from(height), orchard: 0, measured }
     }
 
-    fn height_monotonic(s: &Snapshot) -> Verdict {
-        if s.height() >= s.prev_height() {
-            Verdict::Satisfied
-        } else {
-            Verdict::Violated(Violation {
-                probe: String::new(),
-                height: Some(s.height()),
-                detail: format!("height {} < prev {}", s.height(), s.prev_height()),
-            })
-        }
+    async fn height_monotonic(s: &Snapshot, _: &()) -> anyhow::Result<()> {
+        let (now, was) = (s.height(), s.prev_height());
+        sync_ensure!(at = now, now >= was, "height {now} < prev {was}");
+        Ok(())
     }
 
     fn fast_runner(subject: impl SyncSubject + 'static) -> SyncEngine {
-        SyncEngine::new(Box::new(subject)).with_tick(Duration::from_millis(10))
+        SyncEngine::new(subject).with_tick(Duration::from_millis(10))
     }
 
     /// The failure this guards is a *silent cross-repo rename*: the subject stops publishing
@@ -1337,17 +1368,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn passes_when_height_monotonic_to_tip() {
         let mut run = fast_runner(FakeSubject::new(vec![p(1, 3), p(2, 3), p(3, 3)]));
-        run.always(Severity::Fatal).each_tick().check(height_monotonic);
-        run.at_completion(Severity::Fatal).check(|s: &Snapshot| {
-            if s.target() == Some(s.height()) {
-                Verdict::Satisfied
-            } else {
-                Verdict::Violated(Violation {
-                    probe: String::new(),
-                    height: Some(s.height()),
-                    detail: "did not reach target".into(),
-                })
-            }
+        run.always("height_monotonic", Severity::Fatal).each_tick().check(height_monotonic);
+        run.at_completion("reached_target", Severity::Fatal).check(async |s, _| {
+            sync_ensure!(s.target() == Some(s.height()), "did not reach target");
+            Ok(())
         });
         let out = run.run().await;
         assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
@@ -1361,9 +1385,9 @@ mod tests {
         let mut run = fast_runner(FakeSubject::new(script).never_complete()).with_stop_after(3);
         let finished_at = Arc::new(AtomicUsize::new(0));
         let seen = finished_at.clone();
-        run.at_completion(Severity::Fatal).check(move |s: &Snapshot| {
+        run.at_completion("finished_at", Severity::Fatal).check(async move |s, _| {
             seen.store(s.height() as usize, Ordering::SeqCst);
-            Verdict::Satisfied
+            Ok(())
         });
 
         let out = run.run().await;
@@ -1382,10 +1406,12 @@ mod tests {
         let subject = FakeSubject::new(vec![p(1, 5), p(2, 5), p(1, 5), p(3, 5), p(5, 5)]);
         let stopped = subject.stopped.clone();
         let mut run = fast_runner(subject);
-        run.always(Severity::Fatal).each_tick().check(height_monotonic);
+        run.always("height_monotonic", Severity::Fatal).each_tick().check(height_monotonic);
         let out = run.run().await;
         assert_eq!(out.verdict, SyncVerdict::Failed, "{out:?}");
-        assert_eq!(out.violations.len(), 1);
+        let [v] = &out.violations[..] else { panic!("one violation: {out:?}") };
+        let got = (v.probe.as_str(), v.height, v.detail.as_str());
+        assert_eq!(got, ("height_monotonic", Some(1), "height 1 < prev 2"), "stamped + located");
         assert!(out.ticks < 5, "should have stopped before the script end");
         assert_eq!(stopped.load(Ordering::SeqCst), 1, "stop() must be called");
     }
@@ -1395,16 +1421,11 @@ mod tests {
         let subject = FakeSubject::new(vec![p(1, 3), p(1, 3), p(3, 3)]);
         // Pool-output decrease = a Recorded (non-fatal) violation here
         let mut run = fast_runner(subject);
-        run.always(Severity::Recorded).each_tick().check(|s: &Snapshot| {
-            if s.work().require(Op::OrchardAction) >= s.prev_work().require(Op::OrchardAction) {
-                Verdict::Satisfied
-            } else {
-                Verdict::Violated(Violation {
-                    probe: String::new(),
-                    height: None,
-                    detail: "orchard outputs went backwards".into(),
-                })
-            }
+        run.always("orchard_monotonic", Severity::Recorded).each_tick().check(async |s, _| {
+            let (now, was) =
+                (s.work().require(Op::OrchardAction), s.prev_work().require(Op::OrchardAction));
+            sync_ensure!(now >= was, "orchard outputs went backwards");
+            Ok(())
         });
         // orchard always 0 → never violated; run passes and reaches tip
         let out = run.run().await;
@@ -1414,9 +1435,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn sometimes_gap_fails_the_run() {
         let mut run = fast_runner(FakeSubject::new(vec![p(1, 2), p(2, 2)]));
-        run.sometimes().named("saw_reorg").check(|s: &Snapshot| {
-            if s.observed_reorg() { Verdict::Satisfied } else { Verdict::Pending }
-        });
+        run.sometimes("saw_reorg").check(async |s, _| Ok(s.observed_reorg()));
         let out = run.run().await;
         assert_eq!(out.verdict, SyncVerdict::Failed, "{out:?}");
         assert_eq!(out.coverage_gaps, vec!["saw_reorg".to_string()]);
@@ -1426,23 +1445,38 @@ mod tests {
     async fn sometimes_satisfied_passes() {
         // Height dips → observed_reorg latches true → coverage satisfied
         let mut run = fast_runner(FakeSubject::new(vec![p(2, 4), p(1, 4), p(3, 4), p(4, 4)]));
-        run.sometimes().named("saw_reorg").check(|s: &Snapshot| {
-            if s.observed_reorg() { Verdict::Satisfied } else { Verdict::Pending }
-        });
+        run.sometimes("saw_reorg").check(async |s, _| Ok(s.observed_reorg()));
         let out = run.run().await;
         assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
         assert!(out.coverage_gaps.is_empty());
     }
 
+    /// `?` on any error = harness broke (Errored, context chain kept); only `sync_fail!` /
+    /// `sync_ensure!` = the invariant broke (Failed)
     #[tokio::test(start_paused = true)]
-    async fn probe_error_aborts_distinctly() {
-        let mut run = fast_runner(FakeSubject::new(vec![p(1, 2), p(2, 2)]));
-        run.always(Severity::Fatal)
-            .each_tick()
-            .check(|_s: &Snapshot| Verdict::ProbeError("rpc broke".into()));
-        let out = run.run().await;
+    async fn a_body_error_aborts_as_errored_and_a_violation_fails() {
+        use anyhow::Context as _;
+
+        let mut errored = fast_runner(FakeSubject::new(vec![p(1, 2), p(2, 2)]));
+        errored.always("rpc", Severity::Fatal).check(async |_, _| {
+            let read: Result<u32, std::io::Error> = Err(std::io::Error::other("connection reset"));
+            read.context("zebra getblock")?;
+            Ok(())
+        });
+        let out = errored.run().await;
         assert_eq!(out.verdict, SyncVerdict::Errored, "{out:?}");
-        assert!(out.error.unwrap().contains("rpc broke"));
+        assert_eq!(out.error.as_deref(), Some("rpc: zebra getblock: connection reset"));
+        assert!(out.violations.is_empty(), "{out:?}");
+
+        let mut violated = fast_runner(FakeSubject::new(vec![p(1, 2), p(2, 2)]));
+        violated.always("served", Severity::Fatal).check(async |s, _| {
+            sync_fail!(at = s.height(), "block differs");
+        });
+        let out = violated.run().await;
+        assert_eq!(out.verdict, SyncVerdict::Failed, "{out:?}");
+        assert_eq!(out.error, None);
+        let got: Vec<_> = out.violations.iter().map(|v| (v.probe.as_str(), v.height)).collect();
+        assert_eq!(got, [("served", Some(1))]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1453,9 +1487,9 @@ mod tests {
         // once ≥5 blocks have passed
         let script: Vec<_> = (0..=5).map(|i| p(i * 2, 10)).collect();
         let mut run = fast_runner(FakeSubject::new(script));
-        run.always(Severity::Recorded).every_blocks(5).check(move |_s: &Snapshot| {
+        run.always("counted", Severity::Recorded).every_blocks(5).check(async move |_, _| {
             f.fetch_add(1, Ordering::SeqCst);
-            Verdict::Satisfied
+            Ok(())
         });
         let out = run.run().await;
         assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
@@ -1471,13 +1505,9 @@ mod tests {
         // elapses
         let subject = FakeSubject::new(vec![p(1, 9)]).never_complete();
         let mut run = fast_runner(subject);
-        run.eventually(Severity::Fatal).window(Duration::from_millis(50)).check(|s: &Snapshot| {
-            if s.progressed_within(Duration::from_millis(50)) {
-                Verdict::Satisfied
-            } else {
-                Verdict::Pending
-            }
-        });
+        run.eventually("advances", Severity::Fatal)
+            .window(Duration::from_millis(50))
+            .check(async |s, _| Ok(s.progressed_within(Duration::from_millis(50))));
         let out = run.run().await;
         assert_eq!(out.verdict, SyncVerdict::Failed, "{out:?}");
         assert!(out.violations.iter().any(|v| v.detail.contains("stall")));
@@ -1488,7 +1518,7 @@ mod tests {
         let (src, cancel) = CancelSource::new();
         let subject = FakeSubject::new(vec![p(1, 9)]).never_complete();
         let mut run = fast_runner(subject).with_cancel(cancel);
-        run.always(Severity::Fatal).each_tick().check(height_monotonic);
+        run.always("height_monotonic", Severity::Fatal).each_tick().check(height_monotonic);
         // Cancellation from another task, shortly after start
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1498,13 +1528,9 @@ mod tests {
         assert_eq!(out.verdict, SyncVerdict::Cancelled, "{out:?}");
     }
 
-    fn violated(detail: &str) -> Verdict {
-        Verdict::Violated(Violation { probe: String::new(), height: None, detail: detail.into() })
-    }
-
     /// Phase 2 ("wallet") built lazily; its factory flips `built`
-    fn wallet_phase(built: Arc<AtomicBool>) -> Phase {
-        let mut wallet = Phase::deferred("wallet", move |_cx: SyncCtx| async move {
+    fn wallet_phase(built: Arc<AtomicBool>) -> Phase<()> {
+        let mut wallet = Phase::new("wallet", async move |_: &()| {
             built.store(true, Ordering::SeqCst);
             Ok(FakeSubject::new(vec![p(10, 12), p(12, 12)]))
         });
@@ -1520,21 +1546,21 @@ mod tests {
         let cases: [(&str, Register, Option<&str>, SyncVerdict, bool); 5] = [
             (
                 "fatal always",
-                |r| r.always(Severity::Fatal).named("never").check(|_: &Snapshot| violated("x")),
+                |r| r.always("never", Severity::Fatal).check(async |_, _| sync_fail!("x")),
                 None,
                 SyncVerdict::Failed,
                 false,
             ),
             (
                 "fatal at_completion",
-                |r| r.at_completion(Severity::Fatal).check(|_: &Snapshot| violated("root")),
+                |r| r.at_completion("root", Severity::Fatal).check(async |_, _| sync_fail!("root")),
                 None,
                 SyncVerdict::Failed,
                 false,
             ),
             (
                 "coverage gap",
-                |r| r.sometimes().named("saw_reorg").check(|_: &Snapshot| Verdict::Pending),
+                |r| r.sometimes("saw_reorg").check(async |_, _| Ok(false)),
                 None,
                 SyncVerdict::Failed,
                 false,
@@ -1548,7 +1574,7 @@ mod tests {
             ),
             (
                 "recorded violation",
-                |r| r.always(Severity::Recorded).check(|_: &Snapshot| violated("noisy")),
+                |r| r.always("noisy", Severity::Recorded).check(async |_, _| sync_fail!("noisy")),
                 None,
                 SyncVerdict::Failed,
                 true,
@@ -1577,33 +1603,68 @@ mod tests {
         }
     }
 
-    /// Probes belong to their phase; each phase clocks its own timeout; the factory sees ctx
+    /// `.within(span)`: a completion violation re-judged each tick until it holds (pass) or the
+    /// span runs out (fail, last detail kept)
+    #[tokio::test(start_paused = true)]
+    async fn within_rejudges_a_completion_violation_until_its_span_ends() {
+        let cases = [(3, SyncVerdict::Passed, 3..=3), (usize::MAX, SyncVerdict::Failed, 10..=12)];
+        for (holds_from, verdict, tries) in cases {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let n = attempts.clone();
+            let mut run = fast_runner(FakeSubject::new(vec![p(1, 2), p(2, 2)]));
+            run.at_completion("served_tip", Severity::Fatal)
+                .within(Duration::from_millis(100))
+                .check(async move |_, _| {
+                    let attempt = n.fetch_add(1, Ordering::SeqCst) + 1;
+                    sync_ensure!(attempt >= holds_from, "attempt {attempt}");
+                    Ok(())
+                });
+
+            let out = run.run().await;
+
+            let made = attempts.load(Ordering::SeqCst);
+            assert_eq!(out.verdict, verdict, "holds from {holds_from}: {out:?}");
+            assert!(tries.contains(&made), "holds from {holds_from}: {made} attempts");
+            let details: Vec<_> = out.violations.iter().map(|v| v.detail.clone()).collect();
+            let want = if verdict.is_pass() { vec![] } else { vec![format!("attempt {made}")] };
+            assert_eq!(details, want, "holds from {holds_from}");
+        }
+    }
+
+    /// Probes belong to their phase, run-wide ones to every phase (one body); each phase
+    /// clocks its own timeout; factory + probes borrow the one topology
     #[tokio::test(start_paused = true)]
     async fn phases_are_scoped_sequential_and_individually_timed() {
         let phase1_evals = Arc::new(AtomicUsize::new(0));
         let phase2_evals = Arc::new(AtomicUsize::new(0));
-        let saw_ctx = Arc::new(AtomicBool::new(false));
+        let run_wide = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let mut run = fast_runner(FakeSubject::new(vec![p(1, 3), p(2, 3), p(3, 3)]))
-            .with_timeout(Duration::from_secs(60));
+        let mut sync = Phase::bound("sync", FakeSubject::new(vec![p(1, 3), p(2, 3), p(3, 3)]));
+        sync.tick(Duration::from_millis(10)).timeout(Duration::from_secs(60));
         let n1 = phase1_evals.clone();
-        run.always(Severity::Fatal).check(move |_: &Snapshot| {
+        sync.always("phase1", Severity::Fatal).check(async move |_, zai: &&str| {
+            sync_ensure!(*zai == "zai", "probe borrows the topology");
             n1.fetch_add(1, Ordering::SeqCst);
-            Verdict::Satisfied
+            Ok(())
         });
-        let seen = saw_ctx.clone();
-        let mut wallet = Phase::deferred("wallet", move |cx: SyncCtx| async move {
-            seen.store(cx.indexer().is_none() && cx.pods().is_empty(), Ordering::SeqCst);
+        let mut wallet = Phase::new("wallet", async |zai: &&str| {
+            anyhow::ensure!(*zai == "zai", "factory borrows the topology");
             Ok(FakeSubject::new(vec![p(5, 9)]).never_complete())
         });
         wallet.tick(Duration::from_millis(10)).timeout(Duration::from_millis(100));
         let n2 = phase2_evals.clone();
-        wallet.always(Severity::Fatal).check(move |_: &Snapshot| {
+        wallet.always("phase2", Severity::Fatal).check(async move |_, _| {
             n2.fetch_add(1, Ordering::SeqCst);
-            Verdict::Satisfied
+            Ok(())
+        });
+        let mut run = SyncEngine::phased("zai", sync, vec![wallet]);
+        let heights = run_wide.clone();
+        run.throughout().always("run_wide", Severity::Fatal).check(async move |s, _| {
+            heights.lock().expect("heights mutex poisoned").push(s.height());
+            Ok(())
         });
 
-        let out = run.then(wallet).run().await;
+        let out = run.run().await;
 
         assert_eq!(out.verdict, SyncVerdict::TimedOut, "{out:?}");
         let verdicts: Vec<_> = out.phases.iter().map(|p| (p.name.as_str(), p.verdict)).collect();
@@ -1611,9 +1672,11 @@ mod tests {
         assert_eq!(phase1_evals.load(Ordering::SeqCst), 3, "phase-1 probe ran only in phase 1");
         let wallet_evals = phase2_evals.load(Ordering::SeqCst);
         assert!((8..=11).contains(&wallet_evals), "phase-2 probe each tick: {wallet_evals}");
+        let seen = run_wide.lock().expect("heights mutex poisoned").clone();
+        let want: Vec<u32> = [1, 2, 3].into_iter().chain(vec![5; wallet_evals]).collect();
+        assert_eq!(seen, want, "run-wide probe: every tick of both phases, one body");
         assert!((100..=120).contains(&out.phases[1].elapsed_ms), "{:?}", out.phases[1]);
         assert!(out.phases[1].started_ms >= out.phases[0].started_ms);
-        assert!(saw_ctx.load(Ordering::SeqCst), "factory receives the run's ctx");
         assert_eq!(out.ticks, out.phases[0].ticks + out.phases[1].ticks);
         assert_eq!(out.segment.as_ref().map(|s| (s.from, s.to)), Some((1, 3)), "phase-1 span");
     }
@@ -1671,24 +1734,16 @@ mod tests {
         nemesis.builder().named("crash").at(Duration::from_millis(35)).kill("zai");
         let watched: Vec<Arc<dyn Watched>> = vec![pod.clone()];
         let mut run = fast_runner(subject).with_nemesis(&nemesis).with_watched(watched);
-        run.eventually(Severity::Fatal).named("no_stall").window(Duration::from_millis(25)).check(
-            |s: &Snapshot| {
-                if s.progressed_within(Duration::from_millis(15)) {
-                    Verdict::Satisfied
-                } else {
-                    Verdict::Pending
-                }
-            },
-        );
+        run.eventually("no_stall", Severity::Fatal)
+            .window(Duration::from_millis(25))
+            .check(async |s, _| Ok(s.progressed_within(Duration::from_millis(15))));
         let armed_at = Arc::new(AtomicUsize::new(usize::MAX));
         let armed = armed_at.clone();
-        run.eventually(Severity::Fatal).after("crash").check(move |s: &Snapshot| {
+        run.eventually("recovers", Severity::Fatal).after("crash").check(async move |s, _| {
             armed.fetch_min(s.seq() as usize, Ordering::SeqCst);
-            if s.progressed_since_fault() { Verdict::Satisfied } else { Verdict::Pending }
+            Ok(s.progressed_since_fault())
         });
-        run.sometimes().named("saw_restart").check(|s: &Snapshot| {
-            if s.observed_restart() { Verdict::Satisfied } else { Verdict::Pending }
-        });
+        run.sometimes("saw_restart").check(async |s, _| Ok(s.observed_restart()));
 
         let out = run.run().await;
 

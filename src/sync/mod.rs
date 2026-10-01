@@ -35,10 +35,10 @@ pub use nemesis::{
 pub use observe::{
     Cost, CostMs, Heights, Latency, Observation, Observe, Observed, ObservedSource, Timing, Window,
 };
-pub use phase::{Phase, PhaseError, PhaseOutcome};
+pub use phase::{Phase, PhaseOutcome, Throughout};
 pub use probe::{
-    Cadence, Class, ProbeBuilder, ProbeState, ProbeStatus, Severity, SyncCtx, Verdict, Violation,
-    hours, mins, secs,
+    Always, Answer, AtCompletion, Cadence, Class, Eventually, Kind, ProbeBuilder, Severity,
+    Sometimes, Verdict, Violation, hours, mins, secs,
 };
 pub use runner::{
     DEFAULT_TICK, NullReporter, StderrReporter, SyncEngine, SyncOutcome, SyncReporter, SyncVerdict,
@@ -59,4 +59,4 @@ mod export;
 
 pub use export::family as driver_family;
 
-pub use facade::{PhaseManifest, SyncManifest, SyncRunner};
+pub use facade::{PhaseManifest, Run, SyncManifest, SyncRunner};

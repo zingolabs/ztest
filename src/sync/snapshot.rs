@@ -11,14 +11,13 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::handles::wallet::{Pool, PoolBalances};
+use crate::handles::wallet::{NoteCounts, Pool, PoolBalances, ScanTotals};
 
 use super::subject::ProgressView;
 use super::tree::{TreeRoot, TreeRoots};
 use super::work::{Rate, Work};
 
-/// One immutable observation at a tick; probe predicates read this and nothing else
-/// (RPC-backed probes also get a [`SyncCtx`](crate::sync::SyncCtx)).
+/// One immutable observation at a tick (probes also get the run's topology handles)
 ///
 /// - `work` cumulative → `(work - prev_work) / since_prev` = every throughput number
 /// - `max_height_seen > height` = reorg rolled back
@@ -37,6 +36,8 @@ pub struct Snapshot {
     balances: Option<PoolBalances>,
     prev_balances: Option<PoolBalances>,
     tree_roots: TreeRoots,
+    notes: Option<NoteCounts>,
+    scan: Option<ScanTotals>,
     max_height_seen: u32,
     last_progress_at: Instant,
     observed_reorg: bool,
@@ -121,12 +122,12 @@ impl Snapshot {
     /// non-wallet subject = test bug, and zeroed [`PoolBalances`] would be unfailable).
     /// [`try_balances`](Self::try_balances) where absence is legitimate
     pub fn balances(&self) -> PoolBalances {
-        self.balances.unwrap_or_else(|| missing_balances("balances"))
+        self.balances.unwrap_or_else(|| missing_wallet_extra("balances"))
     }
     /// Balances at the previous tick (this tick's at `seq == 0` → opening tick never reads
     /// as a change). Panics on [`balances`](Self::balances)' terms
     pub fn prev_balances(&self) -> PoolBalances {
-        self.prev_balances.unwrap_or_else(|| missing_balances("prev_balances"))
+        self.prev_balances.unwrap_or_else(|| missing_wallet_extra("prev_balances"))
     }
     /// Balances, or `None` when this subject holds no funds
     pub fn try_balances(&self) -> Option<PoolBalances> {
@@ -140,10 +141,18 @@ impl Snapshot {
     pub fn tree_roots(&self) -> TreeRoots {
         self.tree_roots
     }
+    /// Unspent notes per pool; panics on [`balances`](Self::balances)' terms
+    pub fn notes(&self) -> NoteCounts {
+        self.notes.unwrap_or_else(|| missing_wallet_extra("notes"))
+    }
+    /// Last finished scan session; `None` until one finishes (completion snapshot = after it)
+    pub fn scan(&self) -> Option<ScanTotals> {
+        self.scan
+    }
 }
 
-fn missing_balances(accessor: &str) -> ! {
-    panic!("Snapshot::{accessor}: subject reports no balances (wallet only)")
+fn missing_wallet_extra(accessor: &str) -> ! {
+    panic!("Snapshot::{accessor}: subject is no wallet")
 }
 
 /// Runner-side facts of one tick: the fault timeline + the restart window
@@ -225,6 +234,8 @@ impl SnapshotBuilder {
             balances,
             prev_balances: self.prev_balances,
             tree_roots: p.tree_roots(),
+            notes: p.notes(),
+            scan: p.scan(),
             max_height_seen: self.max_height_seen.max(height),
             last_progress_at: self.last_progress_at,
             observed_reorg: self.observed_reorg,

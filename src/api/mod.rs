@@ -32,7 +32,7 @@ pub use crate::qos::live::LiveSnapshot;
 pub use crate::qos::schedule::{PlannedTest, QosPlan, plan as qos_plan};
 pub use crate::qos::{ClusterCapacity, GIB, QosClass, Resources};
 pub use crate::sync::{
-    Channel, Cost, CostMs, Heights, Latency, ProbeState, SyncStatus, SyncVerdict, Timing, Work,
+    Channel, Cost, CostMs, Heights, Latency, SyncStatus, SyncVerdict, Timing, Work,
 };
 
 pub mod capability;

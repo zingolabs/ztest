@@ -56,6 +56,26 @@ impl PoolBalances {
     }
 }
 
+/// Unspent outputs per pool, mined transactions only (a spend in any status = spent)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoteCounts {
+    pub sapling: usize,
+    pub orchard: usize,
+    pub ironwood: usize,
+    pub transparent: usize,
+}
+
+/// One finished sync session's scan totals
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanTotals {
+    pub start_height: u32,
+    pub end_height: u32,
+    pub blocks_scanned: u32,
+    pub sapling_outputs_scanned: u32,
+    pub orchard_outputs_scanned: u32,
+    pub ironwood_outputs_scanned: u32,
+}
+
 /// Opaque per-backend account id (1 account = 1 lightclient wallet), assigned on
 /// [`WalletBackend::add_account`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -2,39 +2,67 @@
 //!
 //! - Run = phases in declaration order; next starts only once the previous one completed with no
 //!   fatal violation (at_completion included)
-//! - Later subjects built at their start by an async factory (may need earlier phases' state)
+//! - Subject built at phase start by an async factory over the topology (may need earlier
+//!   phases' work: a wallet needs a serving indexer)
 
 use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::Family;
 
-use super::probe::{Cadence, Class, ProbeBuilder, ProbeSpec, Severity, SyncCtx};
+use super::probe::{
+    Always, AtCompletion, Eventually, ProbeBuilder, ProbeSpec, Severity, Sometimes,
+};
 use super::runner::{DEFAULT_TICK, SyncVerdict};
 use super::subject::SyncSubject;
 use super::work::OpSet;
 
-/// Anything a subject factory's `?` meets (`EnvError`, `RpcError`, a wallet's own)
-pub type PhaseError = Box<dyn std::error::Error + Send + Sync>;
+type Building<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Box<dyn SyncSubject>>> + 'a>>;
 
-type SubjectFactory =
-    Box<dyn FnOnce(SyncCtx) -> BoxFuture<'static, Result<Box<dyn SyncSubject>, PhaseError>> + Send>;
-
-pub(super) enum Source {
-    Unbound,
-    Bound(Box<dyn SyncSubject>),
-    Deferred(SubjectFactory),
+/// Object-safe `AsyncFnOnce(&T) -> Result<S>`
+pub(super) trait Factory<T> {
+    fn build<'a>(self: Box<Self>, topology: &'a T) -> Building<'a>;
 }
 
-/// Registration surface of one phase: `run.always(..)` on the runner = its first phase,
-/// [`SyncRunner::then`](crate::sync::SyncRunner::then) returns a later one
-pub struct Phase {
+struct Typed<F, S>(F, PhantomData<fn() -> S>);
+
+impl<T, S, F> Factory<T> for Typed<F, S>
+where
+    S: SyncSubject + 'static,
+    F: AsyncFnOnce(&T) -> anyhow::Result<S> + 'static,
+{
+    fn build<'a>(self: Box<Self>, topology: &'a T) -> Building<'a> {
+        Box::pin(async move {
+            let subject = (self.0)(topology).await?;
+            Ok(Box::new(subject) as Box<dyn SyncSubject>)
+        })
+    }
+}
+
+pub(super) enum Source<T> {
+    Bound(Box<dyn SyncSubject>),
+    Deferred(Box<dyn Factory<T>>),
+}
+
+impl<T> Source<T> {
+    /// Subject for this phase, built now if deferred
+    pub(super) async fn subject(self, topology: &T) -> anyhow::Result<Box<dyn SyncSubject>> {
+        match self {
+            Source::Bound(subject) => Ok(subject),
+            Source::Deferred(factory) => factory.build(topology).await,
+        }
+    }
+}
+
+/// Registration surface of one phase ([`Run::phase`](crate::sync::Run::phase))
+pub struct Phase<T> {
     pub(super) name: String,
-    pub(super) source: Source,
-    pub(super) probes: Vec<ProbeSpec>,
+    pub(super) source: Option<Source<T>>,
+    pub(super) probes: Vec<ProbeSpec<T>>,
     pub(super) tick: Duration,
     pub(super) timeout: Option<Duration>,
     pub(super) stop_height: Option<u32>,
@@ -44,7 +72,7 @@ pub struct Phase {
     pub(super) ready: Vec<Family>,
 }
 
-impl std::fmt::Debug for Phase {
+impl<T> std::fmt::Debug for Phase<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Phase")
             .field("name", &self.name)
@@ -55,11 +83,11 @@ impl std::fmt::Debug for Phase {
     }
 }
 
-impl Phase {
-    pub(super) fn new(name: impl Into<String>, source: Source) -> Self {
+impl<T> Phase<T> {
+    fn with_source(name: impl Into<String>, source: Source<T>) -> Self {
         Phase {
             name: name.into(),
-            source,
+            source: Some(source),
             probes: Vec::new(),
             tick: DEFAULT_TICK,
             timeout: None,
@@ -70,26 +98,22 @@ impl Phase {
         }
     }
 
-    /// Phase whose subject `build` constructs at phase start, from the run's [`SyncCtx`]
-    pub fn deferred<F, Fut, S>(name: impl Into<String>, build: F) -> Self
+    /// Phase over an already-built subject
+    pub fn bound(name: impl Into<String>, subject: impl SyncSubject + 'static) -> Self {
+        Self::with_source(name, Source::Bound(Box::new(subject)))
+    }
+
+    /// Phase whose subject `build` constructs at phase start, from the run's topology
+    pub fn new<F, S>(name: impl Into<String>, build: F) -> Self
     where
-        F: FnOnce(SyncCtx) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<S, PhaseError>> + Send + 'static,
+        F: AsyncFnOnce(&T) -> anyhow::Result<S> + 'static,
         S: SyncSubject + 'static,
     {
-        let factory: SubjectFactory = Box::new(move |cx| {
-            Box::pin(async move { build(cx).await.map(|s| Box::new(s) as Box<dyn SyncSubject>) })
-        });
-        Self::new(name, Source::Deferred(factory))
+        Self::with_source(name, Source::Deferred(Box::new(Typed(build, PhantomData))))
     }
 
     pub fn name(&self) -> &str {
         &self.name
-    }
-    /// Name in the report (first phase defaults to `sync`)
-    pub fn named(&mut self, name: impl Into<String>) -> &mut Self {
-        self.name = name.into();
-        self
     }
 
     /// Base sampling interval (default 5 s)
@@ -144,41 +168,70 @@ impl Phase {
         self.ready.iter().find(|f| f.is(family)).map_or(family.ready, |f| f.ready)
     }
 
-    /// Safety invariant (true at every tick)
-    pub fn always(&mut self, severity: Severity) -> ProbeBuilder<'_> {
-        self.builder(Class::Always, severity)
+    /// Safety invariant (true at every evaluation)
+    pub fn always(
+        &mut self,
+        name: impl Into<String>,
+        severity: Severity,
+    ) -> ProbeBuilder<'_, T, Always> {
+        ProbeBuilder::new(&mut self.probes, name.into(), severity)
     }
     /// Liveness invariant (must (re)satisfy within its `window`)
-    pub fn eventually(&mut self, severity: Severity) -> ProbeBuilder<'_> {
-        self.builder(Class::Eventually, severity)
+    pub fn eventually(
+        &mut self,
+        name: impl Into<String>,
+        severity: Severity,
+    ) -> ProbeBuilder<'_, T, Eventually> {
+        ProbeBuilder::new(&mut self.probes, name.into(), severity)
     }
     /// Coverage invariant, true on ≥1 tick. A miss fails the phase (green without coverage = weak)
-    pub fn sometimes(&mut self) -> ProbeBuilder<'_> {
-        self.builder(Class::Sometimes, Severity::Fatal)
+    pub fn sometimes(&mut self, name: impl Into<String>) -> ProbeBuilder<'_, T, Sometimes> {
+        ProbeBuilder::new(&mut self.probes, name.into(), Severity::Fatal)
     }
     /// Terminal post-condition (evaluated once at completion)
-    pub fn at_completion(&mut self, severity: Severity) -> ProbeBuilder<'_> {
-        self.builder(Class::AtCompletion, severity)
-    }
-
-    fn builder(&mut self, class: Class, severity: Severity) -> ProbeBuilder<'_> {
-        let cadence = match class {
-            Class::Eventually => Cadence::Window(Duration::MAX),
-            _ => Cadence::EachTick,
-        };
-        ProbeBuilder {
-            sink: &mut self.probes,
-            class,
-            severity,
-            cadence,
-            after: None,
-            name: None,
-            hold_for: None,
-        }
+    pub fn at_completion(
+        &mut self,
+        name: impl Into<String>,
+        severity: Severity,
+    ) -> ProbeBuilder<'_, T, AtCompletion> {
+        ProbeBuilder::new(&mut self.probes, name.into(), severity)
     }
 
     pub fn probe_count(&self) -> usize {
         self.probes.len()
+    }
+}
+
+/// Probes judged in every phase ([`Run::throughout`](crate::sync::Run::throughout))
+///
+/// - One body across phases (captured state carries over), scheduler state fresh per phase
+/// - No `sometimes` (coverage per phase vs per run = ambiguous)
+#[derive(Debug)]
+pub struct Throughout<'r, T> {
+    pub(super) probes: &'r mut Vec<ProbeSpec<T>>,
+}
+
+impl<T> Throughout<'_, T> {
+    pub fn always(
+        &mut self,
+        name: impl Into<String>,
+        severity: Severity,
+    ) -> ProbeBuilder<'_, T, Always> {
+        ProbeBuilder::new(self.probes, name.into(), severity)
+    }
+    pub fn eventually(
+        &mut self,
+        name: impl Into<String>,
+        severity: Severity,
+    ) -> ProbeBuilder<'_, T, Eventually> {
+        ProbeBuilder::new(self.probes, name.into(), severity)
+    }
+    pub fn at_completion(
+        &mut self,
+        name: impl Into<String>,
+        severity: Severity,
+    ) -> ProbeBuilder<'_, T, AtCompletion> {
+        ProbeBuilder::new(self.probes, name.into(), severity)
     }
 }
 

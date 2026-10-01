@@ -39,8 +39,8 @@ pub use pepper_sync::config::PerformanceLevel;
 
 use crate::handles::HandleInner;
 use crate::handles::wallet::{
-    AccountId, AccountKey, AccountSpec, BoxError, Pool, PoolBalances, Unsupported, WalletBackend,
-    WalletConfig,
+    AccountId, AccountKey, AccountSpec, BoxError, NoteCounts, Pool, PoolBalances, ScanTotals,
+    Unsupported, WalletBackend, WalletConfig,
 };
 use crate::sync::{ProgressView, SyncSubject, TreeRoots};
 use crate::topology::ActivationHeights;
@@ -111,17 +111,6 @@ impl std::fmt::Debug for ZingolibWallet {
     }
 }
 
-/// One finished sync session's scan totals (ztest-owned mirror of `SyncResult`)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScanTotals {
-    pub start_height: u32,
-    pub end_height: u32,
-    pub blocks_scanned: u32,
-    pub sapling_outputs_scanned: u32,
-    pub orchard_outputs_scanned: u32,
-    pub ironwood_outputs_scanned: u32,
-}
-
 impl ScanTotals {
     fn from_result(r: &SyncResult) -> Self {
         Self {
@@ -133,15 +122,6 @@ impl ScanTotals {
             ironwood_outputs_scanned: r.ironwood_outputs_scanned,
         }
     }
-}
-
-/// Unspent outputs per pool, mined transactions only (a spend in any status = spent)
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct NoteCounts {
-    pub sapling: usize,
-    pub orchard: usize,
-    pub ironwood: usize,
-    pub transparent: usize,
 }
 
 /// zingolib/pepper `Display` = top level only ("scan error") → walk the source chain
@@ -268,7 +248,7 @@ impl ZingolibWallet {
             .ok_or_else(|| format!("{LABEL}: unknown account {id:?}").into())
     }
 
-    /// Subject a `#[ztest::sync_test]` body binds with `run.sync(..)`, at the builder's
+    /// Subject a `#[ztest::sync_test]` phase factory returns, at the builder's
     /// [`performance`](crate::component::Wallet::performance)
     pub fn sync_subject(&self, account: AccountId) -> Result<ZingolibSyncSubject, BoxError> {
         Ok(ZingolibSyncSubject {
@@ -276,17 +256,6 @@ impl ZingolibWallet {
             launched: false,
             outcome: OnceLock::new(),
         })
-    }
-
-    /// Totals of `account`'s latest successful sync (subject or [`WalletBackend::sync`])
-    pub fn last_sync(&self, account: AccountId) -> Result<Option<ScanTotals>, BoxError> {
-        Ok(*self.account(account)?.last_sync.lock().expect("zingolib last_sync mutex poisoned"))
-    }
-
-    pub async fn unspent_notes(&self, account: AccountId) -> Result<NoteCounts, BoxError> {
-        let acct = self.account(account)?;
-        let wallet = acct.wallet.read().await;
-        Ok(unspent_notes(wallet.wallet_transactions.values()))
     }
 }
 
@@ -442,6 +411,8 @@ pub struct ZingolibProgress {
     outputs_pct: Option<f32>,
     balances: PoolBalances,
     tree_roots: TreeRoots,
+    notes: NoteCounts,
+    scan: Option<ScanTotals>,
 }
 
 impl ProgressView for ZingolibProgress {
@@ -466,6 +437,12 @@ impl ProgressView for ZingolibProgress {
     }
     fn tree_roots(&self) -> TreeRoots {
         self.tree_roots
+    }
+    fn notes(&self) -> Option<NoteCounts> {
+        Some(self.notes)
+    }
+    fn scan(&self) -> Option<ScanTotals> {
+        self.scan
     }
 }
 
@@ -547,6 +524,8 @@ impl SyncSubject for ZingolibSyncSubject {
             outputs_pct: status.as_ref().map(outputs_pct),
             balances,
             tree_roots: shard_tree_roots(&wallet.shard_trees, BlockHeight::from(height)),
+            notes: unspent_notes(wallet.wallet_transactions.values()),
+            scan: *self.account.last_sync.lock().expect("zingolib last_sync mutex poisoned"),
         }))
     }
 
@@ -648,6 +627,7 @@ mod tests {
             sync_config: SyncConfig {
                 transparent_address_discovery: TransparentAddressDiscovery::default(),
                 performance_level: PerformanceLevel::Low,
+                ..SyncConfig::default()
             },
             min_confirmations: NonZeroU32::MIN,
         };

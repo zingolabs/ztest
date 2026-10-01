@@ -1,24 +1,20 @@
 //! Probe (invariant) taxonomy + per-probe scheduling state.
 //!
-//! Probe = named predicate over a [`Snapshot`] in one of four classes (design §"the
-//! invariant taxonomy"):
+//! Probe = named async predicate over a [`Snapshot`] + the run's topology handles, in one of
+//! four classes (design §"the invariant taxonomy"):
 //!
 //! - **always** — safety, every tick; violation = bug
 //! - **eventually** — liveness, (re)satisfy within a `window`; else stall
 //! - **sometimes** — coverage, ≥1 tick over the run; else weak test
 //! - **at_completion** — post-condition, once at tip
 //!
-//! Predicate decoupled from class/cadence/severity (same fn = `always/Fatal/5s` in one
-//! profile, `always/Recorded/30s` in another)
+//! Body's answer typed per class ([`Kind::Answer`]): `()` = holds, `bool` = reached yet
 
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
-
-use crate::component::ComponentCategory;
-use crate::handles::ComponentPod;
-use crate::handles::indexer::IndexerBackend;
 
 use super::snapshot::Snapshot;
 
@@ -32,13 +28,31 @@ pub enum Verdict {
     ProbeError(String),
 }
 
-/// Recorded invariant violation. Mirrors `loadtest::oracle::Violation`
+/// Broken invariant; `probe` stamped by the runner. Raised in a body with
+/// [`sync_ensure!`](crate::sync_ensure) / [`sync_fail!`](crate::sync_fail)
 #[derive(Clone, Debug)]
 pub struct Violation {
     pub probe: String,
     pub height: Option<u32>,
     pub detail: String,
 }
+
+impl Violation {
+    pub fn new(height: Option<u32>, detail: impl Into<String>) -> Self {
+        Self { probe: String::new(), height, detail: detail.into() }
+    }
+}
+
+impl std::fmt::Display for Violation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.height {
+            Some(height) => write!(f, "at {height}: {}", self.detail),
+            None => f.write_str(&self.detail),
+        }
+    }
+}
+
+impl std::error::Error for Violation {}
 
 /// Violation ends the run, or is only recorded
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,38 +70,6 @@ pub enum Class {
     AtCompletion,
 }
 
-/// Probe's live state at one tick = the board `ztest sync watch` renders.
-///
-/// - Derived from runner-private scheduler state → a draining liveness window is visible
-///   *before* it fires
-/// - `since_satisfied`/`window` are `eventually`-only; `window: None` = unbounded
-#[derive(Clone, Debug)]
-pub struct ProbeStatus {
-    pub name: String,
-    pub class: Class,
-    pub severity: Severity,
-    pub state: ProbeState,
-    pub since_satisfied: Option<Duration>,
-    pub window: Option<Duration>,
-}
-
-/// Standing across the run, vs [`Verdict`] = one evaluation. `Violating` = already failing
-/// but not yet outlasting `hold_for`, so not fired
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProbeState {
-    Ok,
-    Pending,
-    Violating,
-    NotYet,
-}
-
-impl ProbeState {
-    pub fn is_ok(&self) -> bool {
-        matches!(self, ProbeState::Ok)
-    }
-}
-
 /// Evaluation cadence. `Window` is `eventually`'s satisfy-deadline, not a cadence
 #[derive(Clone, Copy, Debug)]
 pub enum Cadence {
@@ -97,84 +79,78 @@ pub enum Cadence {
     Window(Duration),
 }
 
-/// Context for RPC-backed probes + phase factories: the independent oracle (indexer) wallet
-/// state is checked against, and the topology's pods (exec, kill). One per run, every phase
-#[derive(Clone)]
-pub struct SyncCtx {
-    indexer: Option<Arc<dyn IndexerBackend>>,
-    pods: Vec<ComponentPod>,
+/// Body's answer → [`Verdict`]; `Err` = [`Violation`] (downcast) or harness error
+pub trait Answer: Sized + 'static {
+    fn verdict(answer: anyhow::Result<Self>) -> Verdict;
 }
 
-impl std::fmt::Debug for SyncCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SyncCtx")
-            .field("has_indexer", &self.indexer.is_some())
-            .field("pods", &self.pods)
-            .finish()
+impl Answer for () {
+    fn verdict(answer: anyhow::Result<()>) -> Verdict {
+        answer.map_or_else(failed, |()| Verdict::Satisfied)
     }
 }
 
-impl SyncCtx {
-    pub fn new(indexer: Option<Arc<dyn IndexerBackend>>) -> Self {
-        Self { indexer, pods: Vec::new() }
-    }
-    pub fn with_pods(mut self, pods: Vec<ComponentPod>) -> Self {
-        self.pods = pods;
-        self
-    }
-    /// `None` in a walletless/observer setup (no topology bound one)
-    pub fn indexer(&self) -> Option<&dyn IndexerBackend> {
-        self.indexer.as_deref()
-    }
-    pub fn indexer_arc(&self) -> Option<Arc<dyn IndexerBackend>> {
-        self.indexer.clone()
-    }
-    pub fn pods(&self) -> &[ComponentPod] {
-        &self.pods
-    }
-    /// By pod name (`.named(..)`) or component label (`zainod`)
-    pub fn pod(&self, name: &str) -> Option<&ComponentPod> {
-        self.pods.iter().find(|p| p.answers_to(name))
-    }
-    /// The one indexer pod; `None` on zero or several
-    pub fn indexer_pod(&self) -> Option<&ComponentPod> {
-        let mut it = self.pods.iter().filter(|p| p.category() == ComponentCategory::Indexer);
-        match (it.next(), it.next()) {
-            (Some(p), None) => Some(p),
-            _ => None,
+impl Answer for bool {
+    fn verdict(answer: anyhow::Result<bool>) -> Verdict {
+        match answer {
+            Ok(true) => Verdict::Satisfied,
+            Ok(false) => Verdict::Pending,
+            Err(e) => failed(e),
         }
     }
 }
 
-/// Boxed async probe body; borrows snapshot + ctx for the future's life
-type AsyncCheck = Box<
-    dyn for<'a> Fn(&'a Snapshot, &'a SyncCtx) -> Pin<Box<dyn Future<Output = Verdict> + Send + 'a>>
-        + Send
-        + Sync,
->;
-
-/// Probe body: pure predicate = sync fn, oracle-backed = async closure. No single
-/// blanket-impl `check()` (two blanket `impl`s over `F` break coherence) → `check`/`check_rpc`
-pub enum Check {
-    Sync(Box<dyn Fn(&Snapshot) -> Verdict + Send + Sync>),
-    Async(AsyncCheck),
-}
-
-impl std::fmt::Debug for Check {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Check::Sync(_) => "Check::Sync(..)",
-            Check::Async(_) => "Check::Async(..)",
-        })
+fn failed(e: anyhow::Error) -> Verdict {
+    match e.downcast::<Violation>() {
+        Ok(violation) => Verdict::Violated(violation),
+        Err(e) => Verdict::ProbeError(format!("{e:#}")),
     }
 }
 
-impl Check {
-    pub async fn evaluate(&self, snap: &Snapshot, cx: &SyncCtx) -> Verdict {
-        match self {
-            Check::Sync(f) => f(snap),
-            Check::Async(f) => f(snap, cx).await,
-        }
+/// Probe class at the type level: its [`Answer`] + the setters its builder offers
+pub trait Kind: 'static {
+    const CLASS: Class;
+    type Answer: Answer;
+}
+
+#[derive(Debug)]
+pub enum Always {}
+#[derive(Debug)]
+pub enum Eventually {}
+#[derive(Debug)]
+pub enum Sometimes {}
+#[derive(Debug)]
+pub enum AtCompletion {}
+
+impl Kind for Always {
+    const CLASS: Class = Class::Always;
+    type Answer = ();
+}
+impl Kind for Eventually {
+    const CLASS: Class = Class::Eventually;
+    type Answer = bool;
+}
+impl Kind for Sometimes {
+    const CLASS: Class = Class::Sometimes;
+    type Answer = bool;
+}
+impl Kind for AtCompletion {
+    const CLASS: Class = Class::AtCompletion;
+    type Answer = ();
+}
+
+type Judging<'a> = Pin<Box<dyn Future<Output = Verdict> + 'a>>;
+
+/// Object-safe `AsyncFn` (no `Send`: the runner awaits bodies inline, never spawns them)
+trait Body<T> {
+    fn judge<'a>(&'a self, snap: &'a Snapshot, topology: &'a T) -> Judging<'a>;
+}
+
+struct Typed<F, A>(F, PhantomData<fn() -> A>);
+
+impl<T, A: Answer, F: AsyncFn(&Snapshot, &T) -> anyhow::Result<A>> Body<T> for Typed<F, A> {
+    fn judge<'a>(&'a self, snap: &'a Snapshot, topology: &'a T) -> Judging<'a> {
+        Box::pin(async move { A::verdict((self.0)(snap, topology).await) })
     }
 }
 
@@ -183,15 +159,16 @@ impl Check {
 ///
 /// - `after` = fault that must fire before an `eventually` window arms
 /// - `hold_for` = debounce, quantized to the cadence as a consecutive-violation count
-#[derive(Debug)]
-pub struct ProbeSpec {
+/// - `within` = `at_completion` retry span (a violation re-judged each tick until it ends)
+pub struct ProbeSpec<T> {
     pub name: String,
     pub class: Class,
     pub severity: Severity,
     pub cadence: Cadence,
     pub after: Option<String>,
     pub hold_for: Option<Duration>,
-    pub check: Check,
+    pub within: Option<Duration>,
+    body: Rc<dyn Body<T>>,
     // ── rolling scheduler state ──
     pub last_fired_seq: Option<u64>,
     pub last_fired_height: u32,
@@ -201,7 +178,43 @@ pub struct ProbeSpec {
     pub ever_satisfied: bool,
 }
 
-impl ProbeSpec {
+impl<T> std::fmt::Debug for ProbeSpec<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbeSpec")
+            .field("name", &self.name)
+            .field("class", &self.class)
+            .field("severity", &self.severity)
+            .field("cadence", &self.cadence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> ProbeSpec<T> {
+    pub async fn judge(&self, snap: &Snapshot, topology: &T) -> Verdict {
+        self.body.judge(snap, topology).await
+    }
+
+    /// Same body (its captured state included), fresh scheduler state: a run-wide probe's
+    /// copy in each phase
+    pub(super) fn fresh(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            class: self.class,
+            severity: self.severity,
+            cadence: self.cadence,
+            after: self.after.clone(),
+            hold_for: self.hold_for,
+            within: self.within,
+            body: Rc::clone(&self.body),
+            last_fired_seq: None,
+            last_fired_height: 0,
+            next_due: None,
+            violation_streak: 0,
+            last_satisfied: None,
+            ever_satisfied: false,
+        }
+    }
+
     /// Due to evaluate at `(height, now)`? `always`/`eventually` honor the cadence;
     /// `sometimes`/`at_completion` evaluate at end → never due here
     pub fn due(&self, height: u32, now: tokio::time::Instant) -> bool {
@@ -236,80 +249,75 @@ impl ProbeSpec {
             _ => 1,
         }
     }
-
-    /// Live board entry at `now`, given the engine's base `tick`.
-    ///
-    /// `eventually` stores only *when* last satisfied → state read off that age: ≤tick = Ok,
-    /// >window = stall already fired, between = draining its allowance
-    pub fn status(&self, now: tokio::time::Instant, tick: Duration) -> ProbeStatus {
-        let window = match self.cadence {
-            Cadence::Window(d) if d != Duration::MAX => Some(d),
-            _ => None,
-        };
-        let since = self.last_satisfied.map(|last| now.saturating_duration_since(last));
-
-        let state = match self.class {
-            Class::Always => {
-                if self.violation_streak > 0 {
-                    ProbeState::Violating
-                } else if self.last_fired_seq.is_some() {
-                    ProbeState::Ok
-                } else {
-                    ProbeState::NotYet
-                }
-            }
-            Class::Eventually => match (since, window) {
-                (None, _) => ProbeState::NotYet,
-                (Some(since), Some(w)) if since > w => ProbeState::Violating,
-                (Some(since), _) if since > tick => ProbeState::Pending,
-                (Some(_), _) => ProbeState::Ok,
-            },
-            Class::Sometimes => {
-                if self.ever_satisfied {
-                    ProbeState::Ok
-                } else {
-                    ProbeState::NotYet
-                }
-            }
-            Class::AtCompletion => ProbeState::NotYet,
-        };
-
-        ProbeStatus {
-            name: self.name.clone(),
-            class: self.class,
-            severity: self.severity,
-            state,
-            since_satisfied: since.filter(|_| self.class == Class::Eventually),
-            window,
-        }
-    }
 }
 
-/// One probe registration: `run.always(Fatal).every(secs(5)).check(fn)`. Setters chain,
-/// `check`/`check_rpc` finalize and register
+/// One probe registration: `phase.always("name", Fatal).every(secs(5)).check(async |s, t| ..)`.
+/// Setters per class ([`Kind`]), `check` finalizes and registers
 #[must_use = "a probe builder does nothing until `.check(...)` is called"]
-pub struct ProbeBuilder<'r> {
-    pub sink: &'r mut Vec<ProbeSpec>,
-    pub class: Class,
-    pub severity: Severity,
-    pub cadence: Cadence,
-    pub after: Option<String>,
-    pub name: Option<String>,
-    pub hold_for: Option<Duration>,
+pub struct ProbeBuilder<'r, T, K> {
+    sink: &'r mut Vec<ProbeSpec<T>>,
+    name: String,
+    severity: Severity,
+    cadence: Cadence,
+    after: Option<String>,
+    hold_for: Option<Duration>,
+    within: Option<Duration>,
+    kind: PhantomData<K>,
 }
 
-impl std::fmt::Debug for ProbeBuilder<'_> {
+impl<T, K> std::fmt::Debug for ProbeBuilder<'_, T, K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProbeBuilder")
-            .field("class", &self.class)
+            .field("name", &self.name)
             .field("severity", &self.severity)
             .field("cadence", &self.cadence)
-            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
 
-impl<'r> ProbeBuilder<'r> {
+impl<'r, T, K: Kind> ProbeBuilder<'r, T, K> {
+    pub(super) fn new(sink: &'r mut Vec<ProbeSpec<T>>, name: String, severity: Severity) -> Self {
+        let cadence = match K::CLASS {
+            Class::Eventually => Cadence::Window(Duration::MAX),
+            _ => Cadence::EachTick,
+        };
+        Self {
+            sink,
+            name,
+            severity,
+            cadence,
+            after: None,
+            hold_for: None,
+            within: None,
+            kind: PhantomData,
+        }
+    }
+
+    /// Register `body`: `async |snapshot, topology| ..`, `?` on any error (= harness broke)
+    pub fn check<F>(self, body: F)
+    where
+        F: AsyncFn(&Snapshot, &T) -> anyhow::Result<K::Answer> + 'static,
+    {
+        self.sink.push(ProbeSpec {
+            name: self.name,
+            class: K::CLASS,
+            severity: self.severity,
+            cadence: self.cadence,
+            after: self.after,
+            hold_for: self.hold_for,
+            within: self.within,
+            body: Rc::new(Typed(body, PhantomData)),
+            last_fired_seq: None,
+            last_fired_height: 0,
+            next_due: None,
+            violation_streak: 0,
+            last_satisfied: None,
+            ever_satisfied: false,
+        });
+    }
+}
+
+impl<T> ProbeBuilder<'_, T, Always> {
     pub fn every(mut self, period: Duration) -> Self {
         self.cadence = Cadence::Every(period);
         self
@@ -323,7 +331,15 @@ impl<'r> ProbeBuilder<'r> {
         self.cadence = Cadence::EachTick;
         self
     }
-    /// (`eventually`) satisfaction required ≥1× per rolling `window`
+    /// Debounce: violation must persist `dur` before firing
+    pub fn hold_for(mut self, dur: Duration) -> Self {
+        self.hold_for = Some(dur);
+        self
+    }
+}
+
+impl<T> ProbeBuilder<'_, T, Eventually> {
+    /// Satisfaction required ≥1× per rolling `window`
     pub fn window(mut self, window: Duration) -> Self {
         self.cadence = Cadence::Window(window);
         self
@@ -333,55 +349,13 @@ impl<'r> ProbeBuilder<'r> {
         self.after = Some(fault.into());
         self
     }
-    /// Override the auto-derived name
-    pub fn named(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
+}
+
+impl<T> ProbeBuilder<'_, T, AtCompletion> {
+    /// Violation re-judged each tick for up to `span` before it counts (cancellation ends it)
+    pub fn within(mut self, span: Duration) -> Self {
+        self.within = Some(span);
         self
-    }
-    /// Debounce: violation must persist `dur` before firing
-    pub fn hold_for(mut self, dur: Duration) -> Self {
-        self.hold_for = Some(dur);
-        self
-    }
-
-    pub fn check<F>(self, f: F)
-    where
-        F: Fn(&Snapshot) -> Verdict + Send + Sync + 'static,
-    {
-        self.finish(Check::Sync(Box::new(f)));
-    }
-
-    /// Register an RPC/oracle-backed probe, written `|s, cx| Box::pin(async move { … })`
-    pub fn check_rpc<F>(self, f: F)
-    where
-        F: for<'a> Fn(
-                &'a Snapshot,
-                &'a SyncCtx,
-            ) -> Pin<Box<dyn Future<Output = Verdict> + Send + 'a>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.finish(Check::Async(Box::new(f)));
-    }
-
-    fn finish(self, check: Check) {
-        let name = self.name.unwrap_or_else(|| format!("probe_{}", self.sink.len()));
-        self.sink.push(ProbeSpec {
-            name,
-            class: self.class,
-            severity: self.severity,
-            cadence: self.cadence,
-            after: self.after,
-            hold_for: self.hold_for,
-            check,
-            last_fired_seq: None,
-            last_fired_height: 0,
-            next_due: None,
-            violation_streak: 0,
-            last_satisfied: None,
-            ever_satisfied: false,
-        });
     }
 }
 
@@ -396,16 +370,32 @@ pub const fn hours(n: u64) -> Duration {
     Duration::from_secs(n * 3600)
 }
 
-/// `ensure!`-style helper for pure probes: return `Violated` unless the condition holds
+/// `ensure!` for invariants: `Err(Violation)` unless `cond` (optional `at = height` first)
 #[macro_export]
 macro_rules! sync_ensure {
+    (at = $height:expr, $cond:expr, $($arg:tt)+) => {
+        if !($cond) {
+            $crate::sync_fail!(at = $height, $($arg)+);
+        }
+    };
     ($cond:expr, $($arg:tt)+) => {
         if !($cond) {
-            return $crate::sync::Verdict::Violated($crate::sync::Violation {
-                probe: String::new(),
-                height: None,
-                detail: format!($($arg)+),
-            });
+            $crate::sync_fail!($($arg)+);
         }
+    };
+}
+
+/// `bail!` for invariants: return `Err(Violation)` (optional `at = height` first)
+#[macro_export]
+macro_rules! sync_fail {
+    (at = $height:expr, $($arg:tt)+) => {
+        return ::core::result::Result::Err(::core::convert::From::from(
+            $crate::sync::Violation::new(::core::option::Option::Some($height), format!($($arg)+)),
+        ))
+    };
+    ($($arg:tt)+) => {
+        return ::core::result::Result::Err(::core::convert::From::from(
+            $crate::sync::Violation::new(::core::option::Option::None, format!($($arg)+)),
+        ))
     };
 }

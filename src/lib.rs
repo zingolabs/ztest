@@ -100,8 +100,8 @@ pub use crate::handles::validator::{
     BlockTip, BlockchainInfo, ChainConfig, MempoolInfo, Peer, PeerInfo, Reorg,
 };
 pub use crate::handles::wallet::{
-    Account, AccountId, AccountKey, AccountSpec, BoxError, FAUCET_SEED, Pool, PoolBalances,
-    RECIPIENT_SEED, Unsupported, WalletExt,
+    Account, AccountId, AccountKey, AccountSpec, BoxError, FAUCET_SEED, NoteCounts, Pool,
+    PoolBalances, RECIPIENT_SEED, ScanTotals, Unsupported, WalletExt,
 };
 pub use crate::handles::{
     HandleInner, IndexerBackend, IndexerConfig, ValidatorBackend, ValidatorConfig, WalletBackend,
@@ -160,10 +160,10 @@ pub mod prelude {
         ChainConfig, CompactBlock, CompactTx, ComponentBuilder, ComponentOptsBuilder, Cpu, Disk,
         Endpoint, EnvError, FAUCET_SEED, FILLER_ADDRESS, GetAddressUtxosReply, Health, Indexer,
         IndexerBackend, JsonRpcClient, LightdInfo, LightwalletdIndexer, Mem, MempoolInfo, Mount,
-        MountKind, MountSource, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED, RawTransaction,
-        RpcError, SendResponse, ShieldedProtocol, SubtreeRoot, TestEnv, TreeState, TxId, Validator,
-        ValidatorBackend, ValidatorConfig, Wallet, WalletBackend, WalletExt, ZainoIndex,
-        ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
+        MountKind, MountSource, NoteCounts, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED,
+        RawTransaction, RpcError, ScanTotals, SendResponse, ShieldedProtocol, SubtreeRoot, TestEnv,
+        TreeState, TxId, Validator, ValidatorBackend, ValidatorConfig, Wallet, WalletBackend,
+        WalletExt, ZainoIndex, ZainoIndexer, ZatBalance, ZcashdValidator, ZebraValidator,
     };
     /// The pinned chain a test names, and the blob it is restored from
     pub use crate::archive::{Artifact, Backend, ChainSnapshot, Network};

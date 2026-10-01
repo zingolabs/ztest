@@ -91,21 +91,28 @@ Grounded in Prometheus rule evaluation + Gomega `Consistently` + CronJob semanti
   distinct visible outcome
 - **Four outcomes, not a bool**: `Satisfied` / `Pending(retry)` / `Violated(record)` / `ProbeError(abort)`
   — a *throwing* probe means the harness/RPC broke, a false one means keep going
+- Body answer typed per class: `always`/`at_completion` → `anyhow::Result<()>`, `eventually`/`sometimes`
+  → `anyhow::Result<bool>` (`false` = pending). `sync_ensure!`/`sync_fail!` raise a `Violation`; any
+  other `?`'d error = `ProbeError` (told apart by downcast)
+- `at_completion(..).within(span)` re-judges a violation each tick until it holds or `span` ends (a
+  tip one poll behind its validator), cancellation-aware
 - **Multi-cadence = multiple registrations**, not a combinator (SLO multi-window multi-burn-rate): same
   predicate at 30 s and 1 h with different severities
 
 ## Phases
 
-One profile = ordered phases, each a subject + its own probe set.
+One profile = ordered phases, each a subject + its own probe set, plus run-wide probes.
 
 ```rust
-run.sync(zai.clone());                                  // phase 1 = the runner itself (Deref → Phase)
-run.named("index").at_completion(Fatal).check(reached_pinned_tip);
-let wallet = run.then("wallet", move |cx: SyncCtx| async move {
-    Ok(build_wallet_subject(cx.indexer_arc(), BIRTHDAY).await?)   // indexer serving by now
+let index = run.phase("index", async |(_, zai, _)| Ok(zai.clone()));
+index.at_completion("reached_pinned_tip", Fatal).check(async |s, _| { /* … */ Ok(()) });
+let wallet = run.phase("wallet", async |(zeb, zai, wallet)| {
+    let account = wallet.viewing_account(zeb, zai, UFVK, BIRTHDAY).await?;   // indexer serving by now
+    Ok(account.wallet().sync_subject(account.id())?)
 });
 wallet.timeout(hours(2)).tick(secs(10));
-wallet.at_completion(Fatal).check_rpc(tree_root_matches_indexer);
+wallet.at_completion("notes_are_the_truth", Fatal).check(async |s, _| { /* s.notes() */ Ok(()) });
+run.throughout().always("tree_states_are_zebras", Fatal).every(secs(5)).check(/* … */);
 run.run().await
 ```
 
@@ -114,17 +121,21 @@ run.run().await
 - Next phase starts only after one that **completed** with no fatal violation (fatal `always`/`eventually`,
   fatal `at_completion`, coverage gap, `SyncSubject::failure`); recorded violations fail the verdict but let
   it proceed
-- Later subjects built by an async factory at phase start → may depend on earlier phases' state
-- One `SyncCtx` for the run → phase-2 probes still reach the indexer + every pod
+- Subjects built by an async factory over `&topology` at phase start → may depend on earlier phases' work
+- `run.throughout()` = `always`/`eventually`/`at_completion` judged in every phase: one body (captured
+  state carries across), fresh scheduler state per phase. No `sometimes` (per phase vs per run =
+  ambiguous)
+- Wallet facts a probe needs ride the `Snapshot` (`balances`, `tree_roots`, `notes`, `scan`), never an
+  account id threaded from the factory
 - Outcome: `SyncOutcome.phases` (name, verdict, start, elapsed, ticks, violations, gaps, error,
   restarts) → mirror, `status` footer, driver series `ztest_sync_phase_{started,ended}_timestamp_seconds`
 - Top-level `segment`/`target` = first phase's (what `perf --base` compares)
 
 ## Component pods: exec, kill, restart
 
-- `ComponentPod` (via `handle.pod()`, `PodHandle`, `SyncCtx::pod(name)`/`indexer_pod()`): `exec(argv,
-  timeout) → ExecOutput { status, stdout, stderr }`, `read_file`, `sample`, `kill`, `await_restart`,
-  `kill_and_await_restart`
+- `ComponentPod` (via `handle.pod()` / `PodHandle` on the topology handle a probe already holds):
+  `exec(argv, timeout) → ExecOutput { status, stdout, stderr }`, `read_file`, `sample`, `kill`,
+  `await_restart`, `kill_and_await_restart`
 - One exec primitive (`src/exec.rs`) under build pod, csi meter and component pods; exit code off the
   websocket status channel
 - Kill needs `.restartable()` at topology time: renders `restartPolicy: OnFailure` +
@@ -164,19 +175,17 @@ Three altitudes, all **outside** the SUT:
 
 - **Annotation = static, known pre-run**: name, description, subject kind, timeout, QoS tier, tags.
   Powers `ztest sync list` / `--help` + admission (scheduler sizes the pod before the body runs)
-- **Body = runs in the pod**: topology, subject binding, named invariant fns at chosen cadences, nemesis
-  schedule
+- **Body = runs in the pod**: topology, phases, named invariants at chosen cadences, nemesis schedule
 - Body is pure registration up to `run.run()` → two modes. **Execute** provisions and syncs; **Collect**
   makes `run.run()` inert and returns the manifest, so `ztest sync describe <name>` prints the full
   invariant + nemesis manifest **without a cluster**
-- **Invariants are nested `fn` items**, not closures: cannot capture the enclosing scope (accidental
-  capture = compile error, predicate stays pure), but *can* read block-level `const`/`fn` items; nested
-  `async fn` allowed for RPC-backed checks. Shared ones factor into a module, referenced by path
-- Predicate decoupled from class/cadence/severity — same `height_monotonic` registers `always/Fatal/5s`
-  in one profile, `always/Recorded/30s` in another
-- Auto-named from the fn (last `type_name` segment), `.named()` overrides; each is its own `watch` row
-- `check()` takes `fn(&Snapshot) -> Verdict` or `async fn(&Snapshot, &SyncCtx) -> Verdict` via a blanket
-  `Probe` impl — cheap predicates stay sync, indexer-backed go async, both register identically
+- `run.topology(|t| (zeb, zai, wallet))` → `Run<T>`; every factory + probe borrows `&T` (destructure it
+  in the closure's args) → no handle clones, no `Arc` per probe
+- **Invariants = async closures written at registration** (`async |snapshot, (zeb, zai, _)| { … }`),
+  or a named `async fn(&Snapshot, &T)`; per-probe state lives in an `async move` closure's captures
+- Name required, first arg (`always("served_tip_tracks_zebra", Fatal)`) → its own `watch` row
+- Bodies awaited inline by the runner, never spawned → futures need not be `Send` (an `AsyncFn` future
+  cannot be bounded `Send` on stable)
 
 ### Example: verifying a wallet sync
 
@@ -186,32 +195,33 @@ everything else is harness API.
 ```rust
 #[ztest::sync_test(name = "wallet_state_sync", description = "genesis→tip wallet sync under chaos",
                    subject = wallet, timeout = "48h", qos = sync, tags = ["chaos", "regtest"])]
-async fn wallet_state_sync(mut run: SyncRunner) -> SyncOutcome {
-    let (zeb, zai, wallet) = run.topology(|t| (
+async fn wallet_state_sync(run: SyncRunner) -> SyncOutcome {
+    let mut run = match run.topology(|t| (
         t.add_validator(Validator::zebrad("1.9.1").regtest().snapshot(ORCHARD_TESTNET)),
         t.add_indexer(Indexer::zaino("0.4.0").peer("zeb")),
         t.add_wallet(Wallet::librustzcash().performance(librustzcash::PerformanceLevel::High)),
-    )).await?;
-    let account = wallet.account(&zeb, &zai, MNEMONIC, BIRTHDAY).await?;
-    run.sync(account.wallet().sync_subject(account.id()).await?);
-
-    run.always(Fatal).every(secs(5)).check(height_monotonic);          // nested fns, defined below
-    run.eventually(Fatal).window(mins(10)).check(no_stall);
-    run.sometimes().check(reorg_handled);
-    run.at_completion(Fatal).check(tree_root_matches_indexer);
-    run.nemesis().named("split").at(mins(20)).for_(mins(3)).partition(&zai, &zeb).heal_all_on_drop();
-
-    fn height_monotonic(s: &Snapshot) -> Verdict {
-        ensure!(s.height() >= s.prev_height() || s.reorg_depth() <= MAX_REORG, "rolled back too far");
-        Verdict::Pass
-    }
-    // …no_stall, reorg_handled, tree_root_matches_indexer likewise
+    )).await {
+        Ok(run) => run,
+        Err(e) => return e.into(),
+    };
+    let sync = run.phase("wallet", async |(zeb, zai, wallet)| {
+        let account = wallet.account(zeb, zai, MNEMONIC, BIRTHDAY).await?;
+        Ok(account.wallet().sync_subject(account.id())?)
+    });
+    sync.always("height_monotonic", Fatal).every(secs(5)).check(async |s, _| {
+        sync_ensure!(s.height() >= s.prev_height() || s.reorg_depth() <= MAX_REORG, "rolled back too far");
+        Ok(())
+    });
+    sync.eventually("no_stall", Fatal).window(mins(10)).check(async |s, _| Ok(s.progressed_within(mins(10))));
+    sync.sometimes("reorg_handled").check(async |s, _| Ok(s.observed_reorg()));
+    sync.at_completion("tree_root_matches_indexer", Fatal).check(async |s, (_, zai, _)| { /* … */ Ok(()) });
+    run.nemesis().named("split").at(mins(20)).for_(mins(3)).partition("zai", "zeb");
     run.run().await
 }
 ```
 
-- Swap those two subject lines for `run.sync(zaino_indexer)` or a validator handle and every probe,
-  fault and report above them is unchanged — that substitution is the whole point of the seam
+- Swap the phase factory for one returning the indexer or validator handle and every probe, fault and
+  report around it is unchanged — that substitution is the whole point of the seam
 - A subject a consuming crate wrote binds identically; ztest needs no knowledge of it
 
 Two invariant-authoring rules the harness leans on:
