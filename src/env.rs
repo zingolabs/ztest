@@ -549,8 +549,8 @@ impl TestEnv {
             "starting test run"
         );
 
-        // Pre-pod (reservation must already cover them; CLI stopped renewing)
-        self.hold_sync_reservation(&client, &sentinel.coords);
+        // Pre-pod: the reservation must already cover them
+        self.hold_sync_reservation(&client, &sentinel.coords).await?;
 
         // Quota = ours, not the parent's (sized from a topology only known here).
         // Cap at the tier component budget = what the scheduler reserved, so the
@@ -854,21 +854,23 @@ impl TestEnv {
     /// - Driver's lifetime = the pods' → it holds from here
     /// - Renewal idempotent → the CLI's overlapping heartbeat is harmless
     /// - Dropped with `TestEnv` → lease lapses at TTL
-    fn hold_sync_reservation(&self, client: &Client, coords: &RunCoords) {
+    async fn hold_sync_reservation(
+        &self,
+        client: &Client,
+        coords: &RunCoords,
+    ) -> Result<(), EnvError> {
         if crate::sync::active_sync_id().is_none() {
-            return;
+            return Ok(());
         }
-        let reserve = qos::current_profile().admitted();
-        let held = crate::qos::ledger::Reservation::adopt(
-            client,
-            &coords.run_id,
-            &coords.user,
-            reserve,
-            crate::qos::beacon::LeaseKind::Sync,
-        );
-        if self.inner.sync_lease.set(held).is_ok() {
-            tracing::info!(lease = %coords.run_id, %reserve, "detached sync: holding reservation");
-        }
+        let pod = std::env::var(crate::sync::POD_NAME_ENV)
+            .expect("ztest sync injects the driver's downward-API pod name");
+        let held = crate::qos::ledger::Reservation::adopt(client, &coords.run_id, &pod)
+            .await
+            .map_err(env_err)?;
+        let reserve = held.reserved();
+        self.inner.sync_lease.set(held).expect("one TestEnv::build per sync driver");
+        tracing::info!(lease = %coords.run_id, %reserve, "detached sync: holding reservation");
+        Ok(())
     }
 
     async fn materialize_phase(

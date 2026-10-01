@@ -408,15 +408,18 @@ async fn start(
         await_driver_running(&client, &sync_id).await
     }
     .await;
-    if let Err(e) = launched {
+    // Renew until the driver adopts (lease holder flips to its pod); never a gap in between
+    let handed = match launched {
+        Ok(()) => reservation.hand_off(driver_died(&client, &sync_id)).await,
+        Err(e) => Err((reservation, e.to_string())),
+    };
+    if let Err((reservation, why)) = handed {
         // Pod first, then the lease: capacity must not read free while a pod is
         // still terminating on it
         abandon_launch(&client, &sync_id, &ns).await;
         reservation.release().await;
-        return Err(e);
+        return Err(anyhow!(why));
     }
-    // Driver renews from here; drop stops only *our* heartbeat
-    drop(reservation);
 
     print_handoff(&theme, &sync_id, &ns);
     if watch_after {
@@ -598,8 +601,25 @@ async fn record_launch(
     ztest::sync::write_launch(client, &launch).await.context("record sync launch")
 }
 
-/// Wait for driver `Running` = where it takes over renewing (see `TestEnv::build`)
-/// — caller renews meanwhile, bridging an image pull longer than the TTL
+/// Resolves only once the driver pod is gone or terminal (= it can no longer adopt the lease)
+async fn driver_died(client: &Client, sync_id: &str) -> String {
+    let api: Api<Pod> = Api::namespaced(client.clone(), SYNC_NAMESPACE);
+    let name = driver_pod_for(sync_id);
+    let dead = kube::runtime::wait::await_condition(api, &name, |p: Option<&Pod>| {
+        p.is_none_or(|p| {
+            p.status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                .is_some_and(|ph| matches!(ph, "Succeeded" | "Failed"))
+        })
+    });
+    match dead.await {
+        Ok(_) => format!("sync driver {name} exited before adopting its reservation"),
+        Err(e) => format!("watch sync driver {name}: {e}"),
+    }
+}
+
+/// Wait for driver `Running`; caller renews meanwhile (bridges an image pull longer than the TTL)
 async fn await_driver_running(client: &Client, sync_id: &str) -> Result<()> {
     use ztest::api::pod_status as ps;
 

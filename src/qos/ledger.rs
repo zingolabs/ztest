@@ -17,6 +17,7 @@ use k8s_openapi::api::core::v1::{Pod, ServiceAccount};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
 use kube::Client;
 use kube::api::{Api, ListParams, ObjectList, Patch, PatchParams};
+use kube::runtime::wait::await_condition;
 use tokio::sync::watch;
 
 use super::beacon::{ANN_RESERVE_CPU, ANN_RESERVE_MEM, Beacon, LeaseKind, Progress};
@@ -94,13 +95,14 @@ pub struct Reservation {
 
 /// Lease identity + the status currently written (cloned into the bg task).
 ///
-/// One shared [`Beacon`]: the reconcile loop owns `reserve`, the engine owns the progress
-/// fields via [`report_status`](Reservation::report_status), and every write emits both
+/// - One shared [`Beacon`]: reconcile loop owns `reserve`, engine owns progress fields
+/// - `holder` = `spec.holderIdentity`: the renewing process (a change = adopted elsewhere)
 #[derive(Clone)]
 struct Inner {
     client: Client,
     id: String,
     user: String,
+    holder: String,
     beacon: Arc<Mutex<Beacon>>,
 }
 
@@ -147,7 +149,7 @@ impl Inner {
             let b = self.beacon.lock().expect("beacon mutex poisoned");
             Beacon { reserve, ..b.clone() }
         };
-        let lease = lease_object(&self.id, &self.user, &beacon);
+        let lease = lease_object(&self.id, &self.user, &self.holder, &beacon);
         self.api()
             .patch(&self.id, &PatchParams::apply("ztest-ledger").force(), &Patch::Apply(&lease))
             .await
@@ -193,25 +195,50 @@ impl Reservation {
         self.inner.delete().await;
     }
 
-    /// Adopt another process's reservation, renewing it here
+    /// Take over another process's lease (`ztest sync start` → driver pod), renewing it here
+    /// as `holder`.
     ///
-    /// - `ztest sync start` acquires (admission must be refusable while watched) then exits
-    /// - Driver pod picks it up for the pods' lifetime
-    /// - `reserve` must match the acquired figure (else it rewrites the reservation)
-    pub fn adopt(
-        client: &Client,
-        id: &str,
-        user: &str,
-        reserve: Resources,
-        kind: LeaseKind,
-    ) -> Self {
+    /// - Reserve/kind/user read from the lease itself (never re-derived → cannot drift)
+    /// - Written at once: the new holder is what ends the giver's [`hand_off`](Self::hand_off)
+    pub async fn adopt(client: &Client, id: &str, holder: &str) -> Result<Self, LedgerError> {
+        let lease = lease_api(client)
+            .get_opt(id)
+            .await
+            .map_err(|e| LedgerError::Kube(format!("get lease {id}: {e}")))?
+            .ok_or_else(|| LedgerError::Kube(format!("lease {id} gone before adoption")))?;
+        let beacon = Beacon::decode(&lease).expect("ledger-written lease decodes");
+        let reserve = beacon.reserve;
         let inner = Inner {
             client: client.clone(),
             id: id.to_string(),
-            user: user.to_string(),
-            beacon: Arc::new(Mutex::new(Beacon::new(id, user, kind, reserve))),
+            user: beacon.user.clone(),
+            holder: holder.to_string(),
+            beacon: Arc::new(Mutex::new(beacon)),
         };
-        Reservation::spawn(inner, Reserve::Fixed(reserve), reserve, reserve, reserve)
+        inner.write(reserve).await?;
+        Ok(Reservation::spawn(inner, Reserve::Fixed(reserve), reserve, reserve, reserve))
+    }
+
+    /// Renew until another process [`adopt`](Self::adopt)s the lease, then stop (the adopter
+    /// renews from there). `abort` resolving first = adopter died unadopted → reservation
+    /// handed back with the reason (caller tears down its pod, then releases)
+    pub async fn hand_off(
+        self,
+        abort: impl std::future::Future<Output = String>,
+    ) -> Result<(), (Self, String)> {
+        let mine = self.inner.holder.clone();
+        let adopted =
+            await_condition(self.inner.api(), &self.inner.id, move |l: Option<&Lease>| {
+                l.and_then(|l| l.spec.as_ref()?.holder_identity.as_deref())
+                    .is_some_and(|h| h != mine)
+            });
+        tokio::select! {
+            r = adopted => match r {
+                Ok(_) => Ok(()),
+                Err(e) => Err((self, format!("watch lease handoff: {e}"))),
+            },
+            why = abort => Err((self, why)),
+        }
     }
 
     /// Publish live test progress onto the lease. Free: the next heartbeat carries it
@@ -351,6 +378,7 @@ pub async fn acquire(
         client: client.clone(),
         id: lease_id.to_string(),
         user: user.to_string(),
+        holder: lease_id.to_string(),
         beacon: Arc::new(Mutex::new(Beacon::new(lease_id, user, kind, Resources::ZERO))),
     };
 
@@ -645,7 +673,7 @@ pub fn is_expired(lease: &Lease, now: chrono::DateTime<Utc>) -> bool {
 
 /// Lease for `run_id` carrying `beacon`, with run-id + user labels (so the existing label
 /// reap covers it) and a fresh `renewTime`. Identical on acquire and every renew
-fn lease_object(run_id: &str, user: &str, beacon: &Beacon) -> Lease {
+fn lease_object(run_id: &str, user: &str, holder: &str, beacon: &Beacon) -> Lease {
     let labels = BTreeMap::from([
         (LABEL_RUN_ID.to_string(), run_id.to_string()),
         (LABEL_USER.to_string(), user.to_string()),
@@ -660,7 +688,7 @@ fn lease_object(run_id: &str, user: &str, beacon: &Beacon) -> Lease {
             ..Default::default()
         },
         spec: Some(LeaseSpec {
-            holder_identity: Some(run_id.to_string()),
+            holder_identity: Some(holder.to_string()),
             lease_duration_seconds: Some(LEASE_DURATION_SECS),
             renew_time: Some(MicroTime(Utc::now())),
             ..Default::default()
