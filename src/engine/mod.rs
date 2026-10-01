@@ -13,6 +13,7 @@ pub mod pod_runner;
 pub mod record;
 pub mod reporter;
 pub mod schedule;
+pub mod test_ns;
 
 #[cfg(test)]
 mod e2e;
@@ -133,7 +134,6 @@ pub fn run(
         run: input.opts.run.clone(),
         no_cleanup: input.opts.no_cleanup,
         capture: input.opts.output.captures(),
-        color: supports_color::on(supports_color::Stream::Stdout).is_some(),
         ztest_log: std::env::var("ZTEST_LOG").ok().filter(|v| !v.trim().is_empty()),
         image_refs: input.image_refs.clone(),
         storage: None,
@@ -347,6 +347,11 @@ fn select_executor(
     input: &EngineInput<'_>,
     mut env: EngineEnv,
 ) -> Result<std::sync::Arc<dyn local_runner::Executor>, crate::error::PipelineError> {
+    // Both executors own per-test namespaces (`test_ns`)
+    let client = work_rt
+        .block_on(crate::cluster::client())
+        .map_err(|e| format!("executor: connect to cluster: {e}"))?;
+
     // Preflight image (remote runs) wins over the manual env override; neither → local
     let from_preflight = input.runner_image.clone();
     let image = match from_preflight
@@ -354,7 +359,7 @@ fn select_executor(
         .or_else(|| std::env::var("ZTEST_RUNNER_IMAGE").ok().filter(|s| !s.is_empty()))
     {
         Some(img) => img,
-        None => return Ok(std::sync::Arc::new(local_runner::LocalExecutor { env })),
+        None => return Ok(std::sync::Arc::new(local_runner::LocalExecutor { client, env })),
     };
 
     // Driver pods run untrusted test code → DRIVER_SERVICE_ACCOUNT, whose only grants are the
@@ -368,10 +373,6 @@ fn select_executor(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DRIVER_SERVICE_ACCOUNT.to_string()),
     );
-
-    let client = work_rt
-        .block_on(crate::cluster::client())
-        .map_err(|e| format!("pod executor: connect to cluster: {e}"))?;
 
     // Resolve the storage + snapshot class here and hand it to the driver: the lookup lists
     // cluster-scoped classes, which DRIVER_SERVICE_ACCOUNT's per-namespace binding cannot grant

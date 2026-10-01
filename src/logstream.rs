@@ -7,13 +7,7 @@
 //!   its default `terminal` format); ztest never parses/reassembles/recolours a body
 //! - ANSI stripped once at the display boundary, only for a non-colour sink
 
-use std::path::Path;
-
 use crate::engine::output::LogTail;
-
-/// Local path: file the child hands its component log through (`TestEnv` teardown runs in
-/// the child, the reporter in the engine)
-pub const COMPONENT_LOG_ENV: &str = "ZTEST_COMPONENT_LOG";
 
 const COMPONENT_HEADER: &str = "  ── component logs ──\n";
 
@@ -90,44 +84,17 @@ pub fn component_section(log: &[u8], tail: LogTail, color: bool) -> Option<Strin
     Some(out)
 }
 
-/// Pod-path runner output: libtest frame stripped, then dead-pod terminal reasons. Uncapped
-/// (runner panic/error = primary signal)
-pub fn runner_output(runner_raw: &[u8], test_name: &str, dead: &str, color: bool) -> Vec<u8> {
-    let stripped = crate::libtest::strip_libtest_frame(runner_raw, test_name);
-    let stripped = String::from_utf8_lossy(&stripped);
-
-    let mut out = String::new();
-    for line in stripped.lines().chain(dead.lines()) {
-        emit(&mut out, line, color);
-    }
-    out.into_bytes()
-}
-
-/// Child side of [`COMPONENT_LOG_ENV`]: `log` → engine's file.
-///
-/// - No `sink` (no engine, e.g. detached sync driver) or failed write → stderr at the
-///   default tail
-pub fn hand_off(log: &[u8], sink: Option<&Path>, color: bool) {
-    if let Some(path) = sink {
-        match std::fs::write(path, log) {
-            Ok(()) => return,
-            Err(e) => eprintln!(
-                "ztest: component-log hand-off to {} failed ({e}); tail follows",
-                path.display()
-            ),
+/// Test-process output as both executors return it: libtest frame stripped, then dead-pod
+/// terminal reasons (appended after the strip, else the `test result:` cut eats them). Uncapped
+pub fn runner_output(raw: &[u8], test_name: &str, dead: &str) -> Vec<u8> {
+    let mut out = crate::libtest::strip_libtest_frame(raw, test_name);
+    if !dead.is_empty() {
+        if !out.is_empty() && !out.ends_with(b"\n") {
+            out.push(b'\n');
         }
+        out.extend_from_slice(dead.as_bytes());
     }
-    if let Some(section) = component_section(log, LogTail::DEFAULT, color) {
-        eprint!("{section}");
-    }
-}
-
-/// Engine side of [`COMPONENT_LOG_ENV`]: read + remove. Absent (test never provisioned a
-/// namespace) → empty
-pub fn collect_hand_off(path: &Path) -> Vec<u8> {
-    let log = std::fs::read(path).unwrap_or_default();
-    let _ = std::fs::remove_file(path);
-    log
+    out
 }
 
 fn emit(out: &mut String, line: &str, color: bool) {
@@ -221,8 +188,7 @@ test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n";
         let out = String::from_utf8(runner_output(
             runner_raw,
             "my::test",
-            "container `zebrad` exit 137 (OOMKilled)",
-            false,
+            "container `zebrad` exit 137 (OOMKilled)\n",
         ))
         .unwrap();
 
@@ -234,17 +200,5 @@ test result: FAILED. 0 passed; 1 failed; finished in 0.01s\n";
             out.find("panicked").unwrap() < out.find("OOMKilled").unwrap(),
             "dead-pod reasons follow the runner:\n{out}"
         );
-    }
-
-    #[test]
-    fn hand_off_file_carries_the_full_log_and_is_consumed_once() {
-        let path = std::env::temp_dir().join(format!("ztest-handoff-test-{}", std::process::id()));
-        let log: Vec<u8> =
-            (0..100).flat_map(|i| format!("[zaino] line {i}\n").into_bytes()).collect();
-
-        hand_off(&log, Some(&path), false);
-        assert_eq!(collect_hand_off(&path), log, "every line crosses, untailed");
-        assert!(!path.exists(), "collect removes the file");
-        assert!(collect_hand_off(&path).is_empty(), "never provisioned → empty");
     }
 }

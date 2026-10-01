@@ -76,7 +76,6 @@ fn env() -> EngineEnv {
         run: crate::naming::RunCoords { run_id: child::RUN_ID.into(), user: "tester".into() },
         no_cleanup: false,
         capture: true,
-        color: false,
         ztest_log: None,
         image_refs: std::collections::BTreeMap::new(),
         storage: None,
@@ -170,7 +169,8 @@ async fn drive_real(
             async move {
                 conc.lock().unwrap().enter(fp, ceiling);
                 let cap = item.hard_cap;
-                let out = spawn_test(&item, &env, cap, &crate::cancel::Cancel::never()).await;
+                let never = crate::cancel::Cancel::never();
+                let out = spawn_test(&item, &env, "ztest-e2e-ns", cap, &never).await;
                 conc.lock().unwrap().exit(fp);
                 out
             }

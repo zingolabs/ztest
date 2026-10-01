@@ -521,8 +521,8 @@ impl TestEnv {
     }
 
     pub async fn build(&mut self) -> Result<(), EnvError> {
-        // Before any provisioning: no ztest parent = no lease, no admission
-        let coords = RunCoords::from_env().map_err(env_err)?;
+        // Before any provisioning: no ztest parent = no lease, no admission, no namespace
+        let sentinel = Sentinel::from_env().map_err(env_err)?;
         // Diagnostics → stdout (rides capture/replay, shown per `--success-output`)
         crate::observ::init(crate::observ::Sink::Stdout);
         self.validate_topology()?;
@@ -530,18 +530,10 @@ impl TestEnv {
         self.materialize_configs()?;
 
         let started = std::time::Instant::now();
-        // Raw `module::test` for the namespace annotation, DNS slug for every label value
-        // (`::` is illegal in a label)
         let test_raw = naming::current_test_name();
-        let package = naming::current_package();
+        // `::` illegal in a label value
         let test_slug = naming::slug(&test_raw, naming::DNS_LABEL_MAX);
-        // Pod path: parent `ztest run` created (and tears down) the namespace and injected
-        // its name, so it can follow every pod over the kube API → reuse it, skip creation.
-        // Unset ⇒ local path invents the name and owns the whole lifecycle in-process
-        let laptop_owned = std::env::var(naming::TEST_NAMESPACE_ENV).ok().filter(|v| !v.is_empty());
-        let namespace = laptop_owned
-            .clone()
-            .unwrap_or_else(|| naming::namespace_for(&package, &test_raw, &naming::test_suffix()));
+        let namespace = sentinel.namespace.clone();
         let client = cluster::client().await.map_err(env_err)?;
 
         let tier = qos::current();
@@ -558,15 +550,9 @@ impl TestEnv {
         );
 
         // Pre-pod (reservation must already cover them; CLI stopped renewing)
-        self.hold_sync_reservation(&client, &coords);
+        self.hold_sync_reservation(&client, &sentinel.coords);
 
-        // Local path creates the namespace; the pod path already has one. The quota stays
-        // ours either way (sized from a topology only known in-pod)
-        if laptop_owned.is_none() {
-            cluster::ensure_namespace(&client, &namespace, &coords, &package, &test_raw)
-                .await
-                .map_err(env_err)?;
-        }
+        // Quota = ours, not the parent's (sized from a topology only known here).
         // Cap at the tier component budget = what the scheduler reserved, so the
         // real bound on any `.resources()` override (apiserver enforces at create;
         // namespace delete cascades)
@@ -578,7 +564,6 @@ impl TestEnv {
                 .map_err(env_err)?;
         }
         build_phase("namespace_quota", started);
-        let sentinel = Sentinel { namespace: namespace.clone(), coords };
         let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
         let test_name = test_slug;
 
@@ -967,74 +952,21 @@ impl TestEnv {
 }
 
 impl Drop for TestEnv {
-    /// Local-path teardown. `Drop`, not a `teardown().await` an early `?` could skip —
-    /// that leak filled the cluster's pod cap and timed out every later test.
+    /// Detached-sync driver only: its seed-binding VSCs (cluster-scoped, no cascade). Every
+    /// other path = the parent's `engine::test_ns::close`, which also owns the namespace.
     ///
-    /// - Pod path (`ZTEST_TEST_NAMESPACE`) = no-op: parent owns logs + teardown over kube
-    /// - Detached-sync driver: seed bindings only. Namespace = the deletion unit it lives
-    ///   inside, reaped on its TTL ([`mark_finished`](crate::sync::mark_finished))
-    /// - Delete runs on its own OS thread + runtime, `join`ed (`Drop` can't await, and a
-    ///   spawned task dies with the test runtime before its DELETE is sent), with a client
-    ///   rebuilt inside it (the original is bound to the dying reactor)
-    /// - `ZTEST_NO_CLEANUP` suppresses the delete; the 1h `janitor/ttl` still reaps it
+    /// - Own OS thread + runtime, `join`ed (`Drop` can't await; a spawned task dies with the
+    ///   test runtime before its DELETE is sent), client rebuilt inside it
+    /// - `ZTEST_NO_CLEANUP` keeps them (sync namespace held for its full TTL)
     fn drop(&mut self) {
-        // Deleting here would race the parent's still-draining collector
-        let parented = std::env::var(naming::TEST_NAMESPACE_ENV).is_ok_and(|v| !v.is_empty());
-        // Detached driver keeps its bindings (cluster-scoped, nothing cascades them) but
-        // owns no namespace: it sits *inside* the deletion unit, and `mark_finished` hands
-        // that to the reaper instead
-        let detached = crate::sync::active_sync_id().is_some();
-        if parented && !detached {
+        if crate::sync::active_sync_id().is_none() || cluster::no_cleanup_requested() {
             return;
         }
-
-        // Colour is the reporter's call, propagated by the engine as `ZTEST_COLOR`
-        let color = std::env::var("ZTEST_COLOR").ok().as_deref() == Some("1");
-
-        let ns = match detached {
-            true => None,
-            false => self.inner.namespace.lock().ok().and_then(|mut g| g.take()),
-        };
-        let bindings: Vec<_> = self
-            .inner
-            .seed_bindings
-            .lock()
-            .ok()
-            .map(|mut g| std::mem::take(&mut *g))
-            .unwrap_or_default();
-        if ns.is_none() && bindings.is_empty() {
+        let bindings =
+            std::mem::take(&mut *self.inner.seed_bindings.lock().expect("seed_bindings poisoned"));
+        if bindings.is_empty() {
             return;
         }
-
-        // `--no-cleanup` preserves the namespace + seed bindings for inspection
-        let cleanup = !cluster::no_cleanup_requested();
-        let (ns_to_delete, bindings_to_delete) = if cleanup {
-            (ns.clone(), bindings)
-        } else {
-            if let Some(ns) = &ns {
-                // eprintln, not tracing: the hint must land in captured test output
-                eprintln!(
-                    "ztest: --no-cleanup — preserving namespace {ns} for inspection \
-                     (janitor reaps it in ~1h).\n  \
-                     inspect: kubectl get pods -n {ns}\n  \
-                     logs:    kubectl logs -n {ns} <pod>\n  \
-                     delete:  kubectl delete ns {ns}"
-                );
-            }
-            tracing::warn!(
-                namespace = ?ns,
-                seed_bindings = bindings.len(),
-                "ZTEST_NO_CLEANUP set — leaving TestEnv namespace for inspection"
-            );
-            (None, Vec::new())
-        };
-
-        tracing::debug!(
-            namespace = ?ns_to_delete,
-            seed_bindings = bindings_to_delete.len(),
-            "tearing down TestEnv (Drop)"
-        );
-        let ns_for_diag = ns.clone();
         let outcome = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1043,28 +975,7 @@ impl Drop for TestEnv {
             rt.block_on(async move {
                 let client =
                     cluster::client().await.map_err(|e| format!("teardown client: {e}"))?;
-                // Before the namespace delete takes each dead pod's reason + logs: the
-                // client-side error is only "connection refused", which can't tell an
-                // Evicted/OOMKilled pod (contention) from a panicked one (component bug)
-                if let Some(ns) = &ns_for_diag {
-                    let headers = cluster::dead_pod_report(&client, ns).await;
-                    if !headers.is_empty() {
-                        eprint!("{headers}");
-                    }
-                    let components = crate::logstream::fetch_component_log(&client, ns).await;
-                    let sink = std::env::var_os(crate::logstream::COMPONENT_LOG_ENV);
-                    crate::logstream::hand_off(
-                        &components,
-                        sink.as_deref().map(std::path::Path::new),
-                        color,
-                    );
-                }
-                if let Some(ns) = ns_to_delete {
-                    cluster::delete_namespace(&client, &ns)
-                        .await
-                        .map_err(|e| format!("delete namespace {ns}: {e}"))?;
-                }
-                for binding in bindings_to_delete {
+                for binding in bindings {
                     if let Err(e) = seeds::delete_binding(&client, &binding).await {
                         tracing::warn!(
                             error = %e,

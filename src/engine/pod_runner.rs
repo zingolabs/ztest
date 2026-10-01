@@ -14,6 +14,7 @@ use crate::cancel::Cancel;
 use crate::engine::events::Verdict;
 use crate::engine::local_runner::{EngineEnv, Executor, OutcomeFuture, TestOutcome};
 use crate::engine::plan::WorkItem;
+use crate::engine::test_ns;
 
 use crate::pod_status::{
     IMAGE_PULL_GRACE, POLL_INTERVAL, PodPhases, exit_code, image_error, pod_phases,
@@ -133,45 +134,22 @@ async fn run_in_pod(
 ) -> TestOutcome {
     let started = Instant::now();
     let name = pod_name(&item);
+    let spawn_error = |output: String| TestOutcome {
+        verdict: Verdict::SpawnError,
+        output: output.into_bytes(),
+        components: Vec::new(),
+        duration: started.elapsed(),
+    };
 
-    // Laptop owns the per-test namespace on the pod path: names it, creates it here,
-    // fetches every pod's logs at the terminal, tears it down after → a definitive
-    // `api.logs` fetch can't race an in-pod delete. The in-pod `TestEnv::build` reads
-    // `ZTEST_TEST_NAMESPACE` (injected below) and skips its own create + teardown
-    let test_ns = crate::naming::namespace_for(
-        &item.binary_id,
-        &item.test_name,
-        &crate::naming::test_suffix(),
-    );
-
+    let test_ns = match test_ns::open(&client, &cfg.env.run, &item).await {
+        Ok(ns) => ns,
+        Err(e) => return spawn_error(e),
+    };
     let runner_api: Api<corev1::Pod> = Api::namespaced(client.clone(), &cfg.namespace);
-
-    if let Err(e) = crate::cluster::ensure_namespace(
-        &client,
-        &test_ns,
-        &cfg.env.run,
-        &item.binary_id,
-        &item.test_name,
-    )
-    .await
-    {
-        return TestOutcome {
-            verdict: Verdict::SpawnError,
-            output: format!("create test namespace {test_ns}: {e}").into_bytes(),
-            components: Vec::new(),
-            duration: started.elapsed(),
-        };
-    }
-
     let pod = build_pod(&name, &cfg, &item, &test_ns);
     if let Err(e) = runner_api.create(&PostParams::default(), &pod).await {
-        teardown(&client, &cfg, &test_ns, &name).await;
-        return TestOutcome {
-            verdict: Verdict::SpawnError,
-            output: format!("create runner pod {name}: {e}").into_bytes(),
-            components: Vec::new(),
-            duration: started.elapsed(),
-        };
+        test_ns::close(&client, &test_ns, cfg.env.no_cleanup).await;
+        return spawn_error(format!("create runner pod {name}: {e}"));
     }
 
     let hard_cap = item.hard_cap;
@@ -212,29 +190,15 @@ async fn run_in_pod(
     let total = started.elapsed();
     emit_timing(&item.test_name, last_pod.as_ref(), total);
 
-    // Every log fetched definitively before anything is deleted, while the namespace and
-    // pods still exist: the runner's libtest-framed stdout+stderr, timestamped
-    // component-pod lines, and any dead component's terminal reason (OOMKilled/Evicted
-    // vs panic)
+    // Every log fetched before anything is deleted (pods must still exist)
     let runner_raw =
         runner_api.logs(&name, &LogParams::default()).await.unwrap_or_default().into_bytes();
-    let dead = crate::cluster::dead_pod_report(&client, &test_ns).await;
-    let components = crate::logstream::fetch_component_log(&client, &test_ns).await;
-    let runner =
-        crate::logstream::runner_output(&runner_raw, &item.test_name, &dead, cfg.env.color);
-
+    let harvest = test_ns::close(&client, &test_ns, cfg.env.no_cleanup).await;
     if !cfg.env.no_cleanup {
-        teardown(&client, &cfg, &test_ns, &name).await;
-    } else {
-        // Mirrors the local path's `--no-cleanup`: namespace, pods and runner pod left
-        // for a post-mortem. The 1h `janitor/ttl` still reaps → never leaks permanently
-        tracing::warn!(
-            target: "ztest::pod",
-            namespace = %test_ns,
-            runner_pod = %name,
-            "--no-cleanup: preserving per-test namespace and runner pod for inspection (janitor reaps in ~1h)"
-        );
+        let _ = runner_api.delete(&name, &DeleteParams::default()).await;
     }
+    let runner = crate::logstream::runner_output(&runner_raw, &item.test_name, &harvest.dead);
+    let components = harvest.components;
 
     let (verdict, output) = match done {
         Done::Reached(TerminalState::Passed) => (Verdict::Pass, runner),
@@ -248,18 +212,6 @@ async fn run_in_pod(
     };
 
     TestOutcome { verdict, output, components, duration: started.elapsed() }
-}
-
-/// Tear down one test's cluster footprint in order: the cluster-scoped seed-binding VSCs
-/// it minted (no cascade), the per-test namespace (cascades pods/PVCs/quota), then the
-/// runner pod (in the run namespace, out of that cascade's reach).
-///
-/// Best-effort; `reap_run` by `run-id` is the net if this process dies first
-async fn teardown(client: &kube::Client, cfg: &PodRunConfig, test_ns: &str, runner_pod: &str) {
-    crate::cluster::delete_seed_binding_contents_for_ns(client, test_ns).await;
-    let _ = crate::cluster::delete_namespace(client, test_ns).await;
-    let api: Api<corev1::Pod> = Api::namespaced(client.clone(), &cfg.namespace);
-    let _ = api.delete(runner_pod, &DeleteParams::default()).await;
 }
 
 /// How the pod-await loop finished
@@ -331,27 +283,24 @@ fn remap_search_path(value: &str, map: &[(String, String)]) -> String {
         .join(":")
 }
 
+/// Runner container env: [`EngineEnv::test_vars`] + the two paths remapped into the pod
+fn runner_env(cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> BTreeMap<String, String> {
+    let cwd = remap(&item.cwd.to_string_lossy(), &cfg.path_map);
+    let ld = remap_search_path(&cfg.env.dylib_path.to_string_lossy(), &cfg.path_map);
+    let mut env: BTreeMap<String, String> =
+        cfg.env.test_vars(test_ns).into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    env.insert(crate::engine::dylib::dylib_path_envvar().to_string(), ld);
+    env.insert("CARGO_MANIFEST_DIR".to_string(), cwd);
+    env
+}
+
 fn build_pod(name: &str, cfg: &PodRunConfig, item: &WorkItem, test_ns: &str) -> corev1::Pod {
     let bin = remap(&item.binary_path.to_string_lossy(), &cfg.path_map);
     let cwd = remap(&item.cwd.to_string_lossy(), &cfg.path_map);
-    let ld = remap_search_path(&cfg.env.dylib_path.to_string_lossy(), &cfg.path_map);
-
-    let mut env = vec![
-        env_var(crate::engine::dylib::dylib_path_envvar(), &ld),
-        env_var("CARGO_MANIFEST_DIR", &cwd),
-        // Laptop-created per-test namespace this pod's `TestEnv` provisions into: read
-        // instead of invented, and create + teardown skipped (`naming::TEST_NAMESPACE_ENV`)
-        env_var(crate::naming::TEST_NAMESPACE_ENV, test_ns),
-    ];
-    env.extend(cfg.env.test_vars().iter().map(|(k, v)| env_var(k, v)));
-    // Storage + snapshot class, resolved once by the orchestrator and handed down.
-    // - `storage_class::selected` reads these before its own lookup
-    // - That lookup lists cluster-scoped StorageClasses/VolumeSnapshotClasses, which a driver's
-    //   per-namespace RoleBinding cannot grant — passing the answer keeps the driver namespaced
-    if let Some((class, snapshot_class)) = cfg.env.storage.as_ref() {
-        env.push(env_var(crate::cluster_config::STORAGE_CLASS_ENV, class));
-        env.push(env_var(crate::cluster_config::SNAPSHOT_CLASS_ENV, snapshot_class));
-    }
+    let env: Vec<corev1::EnvVar> = runner_env(cfg, item, test_ns)
+        .into_iter()
+        .map(|(name, value)| corev1::EnvVar { name, value: Some(value), ..Default::default() })
+        .collect();
     // - run-id → parent's `reap_run` (Ctrl-C) + ledger attribution
     // - user → `ztest cleanup --mine` when that teardown never ran
     let labels = BTreeMap::from([
@@ -478,10 +427,6 @@ fn emit_timing(test: &str, pod: Option<&corev1::Pod>, total: std::time::Duration
     );
 }
 
-fn env_var(name: &str, value: &str) -> corev1::EnvVar {
-    corev1::EnvVar { name: name.to_string(), value: Some(value.to_string()), ..Default::default() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,7 +494,6 @@ mod tests {
             run: crate::naming::RunCoords { run_id: "r".into(), user: "u".into() },
             no_cleanup: false,
             capture: true,
-            color: false,
             ztest_log: None,
             image_refs: BTreeMap::new(),
             storage: None,
@@ -579,77 +523,58 @@ mod tests {
     }
 
     /// In-pod `TestEnv` reads all of these and can derive none:
-    /// - run id + user → `ztest.io/*` labels on every component pod (ledger attribution, reaping)
+    /// - run id + user + namespace → `ztest.io/*` labels on every component pod (ledger, reaping)
     /// - storage classes → driver SA may not list cluster-scoped classes (403 in-pod)
-    /// - unresolved optionals stay absent, never empty
+    /// - unresolved optionals absent, never empty
     #[test]
-    fn runner_pod_carries_the_run_identity_and_every_orchestrator_resolved_value() {
+    fn runner_env_carries_the_run_identity_and_every_orchestrator_resolved_value() {
         let full = EngineEnv {
             dylib_path: std::ffi::OsString::from("/x"),
             run: crate::naming::RunCoords { run_id: "eli-0a1b2c3d".into(), user: "eli".into() },
-            no_cleanup: true,
+            no_cleanup: false,
             capture: true,
-            color: false,
             ztest_log: Some("ztest::build=debug".into()),
-            image_refs: BTreeMap::from([("k".into(), "reg.svc:5000/zainod:dev-abc".into())]),
+            image_refs: BTreeMap::from([("k".into(), "reg:5000/zainod:dev-abc".into())]),
             storage: Some(("fast-ssd".into(), "csi-snapclass".into())),
         };
         let cfg = PodRunConfig::baked(full.clone(), "runner:dev".into(), "ztest".into(), None);
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-pkg-t-abcd1234");
-        let vars: BTreeMap<String, String> = pod.spec.unwrap().containers[0]
-            .env
-            .clone()
-            .unwrap()
-            .into_iter()
-            .map(|v| (v.name, v.value.unwrap_or_default()))
-            .collect();
-        let want = [
-            (crate::naming::RUN_ID_ENV, "eli-0a1b2c3d"),
+        let base = [
+            (crate::engine::dylib::dylib_path_envvar(), "/x"),
+            ("CARGO_MANIFEST_DIR", ""),
+            ("NEXTEST", "1"),
+            ("NEXTEST_EXECUTION_MODE", "process-per-test"),
             ("NEXTEST_RUN_ID", "eli-0a1b2c3d"),
+            (crate::naming::RUN_ID_ENV, "eli-0a1b2c3d"),
             ("USER", "eli"),
-            (crate::naming::TEST_NAMESPACE_ENV, "ztest-pkg-t-abcd1234"),
-            (crate::cluster::NO_CLEANUP_ENV, "1"),
+            (crate::naming::TEST_NAMESPACE_ENV, "ztest-b-t-0a1b2c3d"),
+        ];
+        let resolved = [
             ("ZTEST_LOG", "ztest::build=debug"),
-            (crate::backends::image::IMAGE_REFS_ENV, r#"{"k":"reg.svc:5000/zainod:dev-abc"}"#),
+            (crate::backends::image::IMAGE_REFS_ENV, r#"{"k":"reg:5000/zainod:dev-abc"}"#),
             (crate::cluster_config::STORAGE_CLASS_ENV, "fast-ssd"),
             (crate::cluster_config::SNAPSHOT_CLASS_ENV, "csi-snapclass"),
         ];
-        for (k, v) in want {
-            assert_eq!(vars.get(k).map(String::as_str), Some(v), "{k} in {vars:?}");
-        }
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
         assert_eq!(
-            pod.metadata.labels.unwrap(),
+            runner_env(&cfg, &work("crate::b", "t"), "ztest-b-t-0a1b2c3d"),
+            map(&[&base[..], &resolved[..]].concat())
+        );
+
+        let bare =
+            EngineEnv { ztest_log: None, image_refs: BTreeMap::new(), storage: None, ..full };
+        let cfg = PodRunConfig::baked(bare, "runner:dev".into(), "ztest".into(), None);
+        assert_eq!(runner_env(&cfg, &work("crate::b", "t"), "ztest-b-t-0a1b2c3d"), map(&base));
+
+        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-b-t-0a1b2c3d");
+        assert_eq!(
+            pod.metadata.labels.expect("runner pod labels"),
             BTreeMap::from([
                 (crate::qos::LABEL_RUN_ID.to_string(), "eli-0a1b2c3d".to_string()),
                 (crate::qos::LABEL_USER.to_string(), "eli".to_string()),
             ])
         );
-
-        let bare = EngineEnv {
-            no_cleanup: false,
-            ztest_log: None,
-            image_refs: BTreeMap::new(),
-            storage: None,
-            ..full
-        };
-        let cfg = PodRunConfig::baked(bare, "runner:dev".into(), "ztest".into(), None);
-        let pod = build_pod("p", &cfg, &work("crate::b", "t"), "ztest-test-ns");
-        let names: Vec<String> = pod.spec.unwrap().containers[0]
-            .env
-            .clone()
-            .unwrap()
-            .into_iter()
-            .map(|v| v.name)
-            .collect();
-        for absent in [
-            crate::cluster::NO_CLEANUP_ENV,
-            "ZTEST_LOG",
-            crate::backends::image::IMAGE_REFS_ENV,
-            crate::cluster_config::STORAGE_CLASS_ENV,
-            crate::cluster_config::SNAPSHOT_CLASS_ENV,
-        ] {
-            assert!(!names.iter().any(|n| n == absent), "{absent} must be absent: {names:?}");
-        }
     }
 
     #[test]

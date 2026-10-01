@@ -29,17 +29,18 @@ progress. One engine, one `Executor` seam, both targets — the cluster profile 
 1. **Run loop** (`engine/schedule.rs`) — sole admission authority; the pure `qos::Scheduler` admits by
    CPU×memory from one arrival-ordered queue (whatever fits, in order), gated on resource-dep
    readiness, reconciled from the governor
-1. **Pod-per-test** (`engine/pod_runner.rs`) — laptop creates the per-test namespace, then a Guaranteed
+1. **Pod-per-test** (`engine/pod_runner.rs`) — laptop creates the per-test namespace
+   (`engine/test_ns.rs`, shared with the local executor), then a Guaranteed
    single-container runner pod running `<bin> --exact <test> --nocapture` (labeled `ztest.io/run-id`),
    injecting the namespace via `ZTEST_TEST_NAMESPACE`; polls phase until Succeeded/Failed (exit code =
    verdict), timeout, or cancel
 1. **In-pod `TestEnv::build`** (`env.rs`) — the body provisions its hermetic topology as sibling pods in
    the **laptop-provided** namespace (quota-capped): validators (warmed one block), then indexers. Wallet
-   is **in-process**, no pod. Reads `ZTEST_TEST_NAMESPACE`, skips namespace create + teardown; `Drop` is
-   a no-op on the pod path
+   is **in-process**, no pod. Requires `ZTEST_TEST_NAMESPACE` (every path); never creates or deletes
+   a namespace
 1. **Logs & report** (`logstream.rs`, `engine/reporter.rs`) — at the test's terminal the laptop fetches
    every log over the kube API *before* deleting anything; `unified_output` assembles two sections
-1. **Teardown** (`engine/pod_runner.rs`) — after the collector drains, delete this test's shadow VSCs
+1. **Teardown** (`engine/test_ns.rs`) — after the harvest, delete this test's shadow VSCs
    (by `ztest.io/test-ns`: cluster-scoped, no namespace cascade), the per-test namespace (cascading
    pods, PVCs, quota), and the runner pod. `reap_run` by `run-id` is the crash-safety net; admission +
    lease release on exit

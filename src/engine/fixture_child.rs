@@ -81,6 +81,7 @@ fn prints_test_vars() {
     let var = |k: &str| std::env::var(k).unwrap_or_default();
     println!("RUN=[{}]", var(crate::naming::RUN_ID_ENV));
     println!("USER=[{}]", var("USER"));
+    println!("NS=[{}]", var(crate::naming::TEST_NAMESPACE_ENV));
     println!("REFS={}", var(crate::backends::image::IMAGE_REFS_ENV));
     exit(0);
 }

@@ -24,28 +24,54 @@ pub trait Executor: Send + Sync + 'static {
     fn run(&self, item: WorkItem, cancel: Cancel) -> OutcomeFuture;
 }
 
-#[derive(Debug, Clone)]
 pub struct LocalExecutor {
+    pub client: kube::Client,
     pub env: EngineEnv,
+}
+
+// `kube::Client` is not `Debug`
+impl std::fmt::Debug for LocalExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalExecutor").field("env", &self.env).finish_non_exhaustive()
+    }
 }
 
 impl Executor for LocalExecutor {
     fn run(&self, item: WorkItem, cancel: Cancel) -> OutcomeFuture {
-        let env = self.env.clone();
+        let (client, env) = (self.client.clone(), self.env.clone());
         Box::pin(async move {
-            let cap = item.hard_cap;
-            spawn_test(&item, &env, cap, &cancel).await
+            let started = Instant::now();
+            let ns = match super::test_ns::open(&client, &env.run, &item).await {
+                Ok(ns) => ns,
+                Err(e) => {
+                    return TestOutcome {
+                        verdict: Verdict::SpawnError,
+                        output: e.into_bytes(),
+                        components: Vec::new(),
+                        duration: started.elapsed(),
+                    };
+                }
+            };
+            let out = spawn_test(&item, &env, &ns, item.hard_cap, &cancel).await;
+            let harvest = super::test_ns::close(&client, &ns, env.no_cleanup).await;
+            TestOutcome {
+                output: crate::logstream::runner_output(
+                    &out.output,
+                    &item.test_name,
+                    &harvest.dead,
+                ),
+                components: harvest.components,
+                duration: started.elapsed(),
+                ..out
+            }
         })
     }
 }
 
 /// Per-run environment shared by every child, computed once.
 ///
-/// - `ztest_log` forwarded verbatim → an in-pod subscriber matches the laptop's
 /// - `capture = false` under `--no-capture`, where the child inherits this process's stdio
-/// - `color` rides as `ZTEST_COLOR` (the child's stderr is piped, so it cannot decide)
-/// - `image_refs` ships as [`IMAGE_REFS_ENV`](crate::backends::image::IMAGE_REFS_ENV);
-///   [`seed_dev_images`](crate::backends::image::seed_dev_images) seeds *this* process only
+/// - `storage` = (storage class, snapshot class); `None` on the local path (child discovers)
 #[derive(Debug, Clone)]
 pub struct EngineEnv {
     pub dylib_path: OsString,
@@ -53,35 +79,34 @@ pub struct EngineEnv {
     pub no_cleanup: bool,
     pub ztest_log: Option<String>,
     pub capture: bool,
-    pub color: bool,
     pub image_refs: std::collections::BTreeMap<String, String>,
-    /// (storage class, snapshot class) the orchestrator resolved. `None` on the local path,
-    /// where the process discovers them itself under the caller's own credentials
     pub storage: Option<(String, String)>,
 }
 
 impl EngineEnv {
     /// Vars every test process gets, local child or runner pod alike (one list → the two
-    /// spawn paths cannot drift)
-    pub fn test_vars(&self) -> Vec<(&'static str, String)> {
+    /// spawn paths cannot drift). Unresolved optionals stay absent, never empty
+    pub fn test_vars(&self, test_ns: &str) -> Vec<(&'static str, String)> {
         let mut vars = vec![
             ("NEXTEST", "1".to_string()),
             ("NEXTEST_EXECUTION_MODE", "process-per-test".to_string()),
             ("NEXTEST_RUN_ID", self.run.run_id.clone()),
             (crate::naming::RUN_ID_ENV, self.run.run_id.clone()),
             ("USER", self.run.user.clone()),
+            (crate::naming::TEST_NAMESPACE_ENV, test_ns.to_string()),
         ];
-        if self.no_cleanup {
-            vars.push((crate::cluster::NO_CLEANUP_ENV, "1".to_string()));
-        }
         if let Some(filter) = &self.ztest_log {
             vars.push(("ZTEST_LOG", filter.clone()));
         }
-        // Preflight's resolved component-image refs (test process has no Dockerfile/manifest)
-        if !self.image_refs.is_empty()
-            && let Ok(json) = serde_json::to_string(&self.image_refs)
-        {
+        // Test process has no Dockerfile/manifest → resolves `dev!` images by this map
+        if !self.image_refs.is_empty() {
+            let json = serde_json::to_string(&self.image_refs).expect("string map serializes");
             vars.push((crate::backends::image::IMAGE_REFS_ENV, json));
+        }
+        // Driver SA may not list cluster-scoped storage/snapshot classes → answer handed down
+        if let Some((class, snapshot_class)) = &self.storage {
+            vars.push((crate::cluster_config::STORAGE_CLASS_ENV, class.clone()));
+            vars.push((crate::cluster_config::SNAPSHOT_CLASS_ENV, snapshot_class.clone()));
         }
         vars
     }
@@ -98,7 +123,8 @@ pub struct TestOutcome {
     pub duration: Duration,
 }
 
-/// Run a single test to completion, capturing its output.
+/// Run a single test process to completion, capturing its raw output (`components` empty:
+/// the namespace harvest is the executor's).
 ///
 /// - `hard_cap` → process group SIGKILLed, [`Verdict::Timeout`]
 /// - `cancel` (run-wide Ctrl-C) → SIGKILLed, [`Verdict::Terminated`], so the run loop
@@ -106,6 +132,7 @@ pub struct TestOutcome {
 pub async fn spawn_test(
     item: &WorkItem,
     env: &EngineEnv,
+    test_ns: &str,
     hard_cap: Duration,
     cancel: &Cancel,
 ) -> TestOutcome {
@@ -122,8 +149,7 @@ pub async fn spawn_test(
         duration: started.elapsed(),
     };
 
-    let hand_off = hand_off_path();
-    let mut cmd = build_command(item, env, &hand_off);
+    let mut cmd = build_command(item, env, test_ns);
     let reader = match attach_stdio(&mut cmd, env.capture) {
         Ok(r) => r,
         Err(e) => return failed(e),
@@ -168,17 +194,7 @@ pub async fn spawn_test(
         Some(task) => task.await.unwrap_or_default(),
         None => Vec::new(),
     };
-    let components = crate::logstream::collect_hand_off(&hand_off);
-
-    TestOutcome { verdict, output, components, duration: started.elapsed() }
-}
-
-/// Per-attempt [`COMPONENT_LOG_ENV`](crate::logstream::COMPONENT_LOG_ENV) file, unique across
-/// concurrent children (pid + counter)
-fn hand_off_path() -> std::path::PathBuf {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!("ztest-components-{}-{n}.log", std::process::id()))
+    TestOutcome { verdict, output, components: Vec::new(), duration: started.elapsed() }
 }
 
 /// One pipe for both fds, so the capture is interleaved as written.
@@ -203,11 +219,7 @@ fn attach_stdio(
 
 /// Build the `tokio` command: argv, cwd, env, and (Unix) a dedicated process group so the
 /// whole tree dies at the hard cap. Stdout/stderr attached by [`attach_stdio`]
-fn build_command(
-    item: &WorkItem,
-    env: &EngineEnv,
-    hand_off: &std::path::Path,
-) -> tokio::process::Command {
+fn build_command(item: &WorkItem, env: &EngineEnv, test_ns: &str) -> tokio::process::Command {
     let mut std_cmd = std::process::Command::new(&item.binary_path);
     std_cmd
         .arg("--exact")
@@ -218,9 +230,7 @@ fn build_command(
         // Dynamic-library path (the libstdc++-exit-127 fix)
         .env(super::dylib::dylib_path_envvar(), &env.dylib_path)
         .env("CARGO_MANIFEST_DIR", &item.cwd)
-        .env("ZTEST_COLOR", if env.color { "1" } else { "0" })
-        .env(crate::logstream::COMPONENT_LOG_ENV, hand_off)
-        .envs(env.test_vars());
+        .envs(env.test_vars(test_ns));
 
     #[cfg(unix)]
     {
@@ -264,7 +274,6 @@ mod tests {
             run: crate::naming::RunCoords { run_id: child::RUN_ID.into(), user: "tester".into() },
             no_cleanup: false,
             capture: true,
-            color: false,
             ztest_log: None,
             image_refs: std::collections::BTreeMap::new(),
             storage: None,
@@ -291,6 +300,7 @@ mod tests {
         spawn_test(
             &item(&child::exe(), &child::test_name(name)),
             env,
+            "ztest-t-b-x-0a1b2c3d",
             Duration::from_secs(5),
             &Cancel::never(),
         )
@@ -323,10 +333,10 @@ mod tests {
         assert!(output(&out).contains("hello-stdout"), "{:?}", output(&out));
     }
 
-    /// - Missing run id → every `TestEnv::build` refuses (`naming::NotUnderZtest`)
+    /// - Missing run id or namespace → every `TestEnv::build` refuses
     /// - Missing manifest → every `dev!` component resolves to `DevImageMissing`
     #[tokio::test]
-    async fn children_receive_the_run_identity_and_image_manifest() {
+    async fn children_receive_the_run_identity_namespace_and_image_manifest() {
         let mut e = env();
         e.image_refs.insert("zainod@sha".into(), "zainod:dev-abc".into());
         let out = play("prints_test_vars", &e).await;
@@ -335,6 +345,7 @@ mod tests {
         for want in [
             format!("RUN=[{}]", child::RUN_ID),
             "USER=[tester]".into(),
+            "NS=[ztest-t-b-x-0a1b2c3d]".into(),
             r#"REFS={"zainod@sha":"zainod:dev-abc"}"#.into(),
         ] {
             assert!(shown.contains(&want), "missing {want} in {shown:?}");
@@ -359,6 +370,7 @@ mod tests {
         let out = spawn_test(
             &item(Path::new("/nonexistent/zzz"), "x"),
             &env(),
+            "ztest-t-b-x-0a1b2c3d",
             Duration::from_secs(5),
             &Cancel::never(),
         )
@@ -376,6 +388,7 @@ mod tests {
         let out = spawn_test(
             &item(&child::exe(), &child::test_name("sleeps_past_any_cap")),
             &env(),
+            "ztest-t-b-x-0a1b2c3d",
             Duration::from_millis(300),
             &Cancel::never(),
         )

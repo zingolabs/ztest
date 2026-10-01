@@ -65,11 +65,8 @@ pub fn namespace_for(package: &str, test: &str, suffix: &str) -> String {
 /// for either pass this as `max`
 pub const DNS_LABEL_MAX: usize = 63;
 
-/// Per-test namespace the parent `ztest run` created for a runner pod.
-///
-/// - Pod path: laptop owns the lifecycle → in-pod
-///   [`TestEnv::build`](crate::TestEnv::build) reads this and skips create/teardown
-/// - Unset on the local path, where `TestEnv` owns the namespace itself
+/// Per-test namespace the parent created; [`TestEnv::build`](crate::TestEnv::build) only
+/// provisions into it (create + harvest + delete = parent's, `engine::test_ns`)
 pub const TEST_NAMESPACE_ENV: &str = "ZTEST_TEST_NAMESPACE";
 
 /// `s` → DNS-1123-safe fragment ≤ `max`: lowercase, non-alphanumeric runs collapsed to
@@ -110,15 +107,9 @@ pub fn current_test_name() -> String {
     std::thread::current().name().unwrap_or("unknown").to_string()
 }
 
-/// Test crate's package name from the *runtime* `CARGO_PKG_NAME` (the test binary's
-/// crate), not `env!("CARGO_PKG_NAME")` — that resolves to `ztest`
-pub fn current_package() -> String {
-    std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "unknown".into())
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum NamingError {
-    #[error("not launched by ztest ({RUN_ID_ENV} unset): ztest run -- {test}")]
+    #[error("not launched by ztest ({RUN_ID_ENV}/{TEST_NAMESPACE_ENV} unset): ztest run -- {test}")]
     NotUnderZtest { test: String },
 }
 
@@ -212,6 +203,17 @@ pub const GRAFANA_SERVICE: &str = "ztest-grafana";
 pub struct Sentinel {
     pub namespace: String,
     pub coords: RunCoords,
+}
+
+impl Sentinel {
+    /// Test side: the engine-created namespace ([`TEST_NAMESPACE_ENV`]) + run coords
+    pub fn from_env() -> Result<Self, NamingError> {
+        let coords = RunCoords::from_env()?;
+        match std::env::var(TEST_NAMESPACE_ENV) {
+            Ok(namespace) if !namespace.is_empty() => Ok(Sentinel { namespace, coords }),
+            _ => Err(NamingError::NotUnderZtest { test: current_test_name() }),
+        }
+    }
 }
 
 #[cfg(test)]
