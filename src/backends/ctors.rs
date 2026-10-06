@@ -7,7 +7,7 @@ use crate::backends::lightwalletd::LightwalletdBackend;
 use crate::backends::zainod::ZainoBackend;
 use crate::backends::zcashd::ZcashdBackend;
 use crate::backends::zebra::ZebraBackend;
-#[cfg(any(feature = "librustzcash", feature = "zingolib"))]
+#[cfg(feature = "librustzcash")]
 use crate::component::Wallet;
 use crate::component::{ComponentOpts, Indexer, IndexerMode, Validator};
 
@@ -87,21 +87,6 @@ impl Wallet<crate::backends::librustzcash::LrzBackend> {
 
     /// Compact-block batch size for every sync this wallet runs (default `Medium`)
     pub fn performance(mut self, level: crate::backends::librustzcash::PerformanceLevel) -> Self {
-        self.backend.performance = level;
-        self
-    }
-}
-
-#[cfg(feature = "zingolib")]
-impl Wallet<crate::backends::zingolib::ZingolibBackend> {
-    /// Zingo wallet: zingolib's `LightClient` (pepper-sync engine), seed or UFVK accounts,
-    /// Ironwood-aware
-    pub fn zingolib() -> Self {
-        Self::new(crate::backends::zingolib::ZingolibBackend::default())
-    }
-
-    /// Written into each account's `WalletSettings.sync_config` (default = zingolib's `High`)
-    pub fn performance(mut self, level: crate::backends::zingolib::PerformanceLevel) -> Self {
         self.backend.performance = level;
         self
     }
