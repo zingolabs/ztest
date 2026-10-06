@@ -424,6 +424,8 @@ impl WalletBackend for LrzWallet {
             request,
             policy,
             &spend_policy,
+            // `lock_inputs`: one proposal per account at a time, nothing to lock against
+            None,
             // `proposed_version`: builder picks the branch-default tx version
             None,
         )
