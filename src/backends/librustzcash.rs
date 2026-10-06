@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rand::rngs::OsRng;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use secrecy::SecretVec;
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
@@ -65,7 +66,7 @@ const SYNC_BATCH_SIZE: u32 = 100;
 /// sync stream on the same channel). Relay deadline = the caller's per-send `timeout`
 const INDEXER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, OsRng>;
+type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, UnwrapErr<SysRng>>;
 
 /// [`Wallet`](crate::component::Wallet) builder's librustzcash flavour → [`LrzWallet`]
 /// handle at `add_wallet` time
@@ -144,6 +145,7 @@ fn to_local_network(a: &ActivationHeights) -> LocalNetwork {
         nu6_1: a.nu6_1().map(BlockHeight::from_u32),
         nu6_2: a.nu6_2().map(BlockHeight::from_u32),
         nu6_3: a.nu6_3().map(BlockHeight::from_u32),
+        nu7: a.nu7().map(BlockHeight::from_u32),
     }
 }
 
@@ -436,7 +438,17 @@ impl WalletBackend for LrzWallet {
             std::convert::Infallible,
             _,
         >(
-            &mut *db, &acct.params, &prover, &prover, &sk, OvkPolicy::Sender, &proposal
+            &mut *db,
+            &acct.params,
+            &SystemClock,
+            &mut UnwrapErr(SysRng),
+            &prover,
+            &prover,
+            &sk,
+            OvkPolicy::Sender,
+            &proposal,
+            // `expiry_height`: builder-derived expiry
+            None,
         )
         .map_err(|e| format!("librustzcash: create transactions: {e}"))?;
         let txids: Vec<TxId> = txids.into_iter().collect();
@@ -470,6 +482,8 @@ impl WalletBackend for LrzWallet {
         let txids = shield_transparent_funds::<Db, LocalNetwork, _, _>(
             &mut *db,
             &acct.params,
+            &SystemClock,
+            &mut UnwrapErr(SysRng),
             &prover,
             &prover,
             &input_selector,
@@ -501,7 +515,7 @@ fn open_wallet_db(path: &Path, params: LocalNetwork) -> Result<Db, BoxError> {
         .map_err(|e| format!("librustzcash: enable WAL on {}: {e}", path.display()))?;
     rusqlite::vtab::array::load_module(&conn)
         .map_err(|e| format!("librustzcash: load rarray module: {e}"))?;
-    Ok(WalletDb::from_connection(conn, params, SystemClock, OsRng))
+    Ok(WalletDb::from_connection(conn, params, SystemClock, UnwrapErr(SysRng)))
 }
 
 /// One-confirmation wallet-summary policy (matches [`WalletBackend::balances`])
