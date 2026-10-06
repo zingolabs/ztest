@@ -92,7 +92,7 @@ pub enum TreeRootError {
 /// - Field = hex-encoded *legacy* `CommitmentTree`; Ironwood = Orchard's hash + depth
 /// - Empty → `Ok(None)` (no tree at that height); present-but-unparseable → error
 ///   (garbage and nothing are different findings)
-#[cfg(any(feature = "librustzcash", feature = "zingolib"))]
+#[cfg(feature = "librustzcash")]
 pub fn commitment_tree_root(
     pool: Pool,
     frontier_hex: &str,
@@ -168,7 +168,7 @@ mod tests {
         TreeRoots::reported().require(Pool::Transparent);
     }
 
-    #[cfg(any(feature = "librustzcash", feature = "zingolib"))]
+    #[cfg(feature = "librustzcash")]
     #[test]
     fn an_empty_frontier_field_is_no_root_not_an_error() {
         assert_eq!(commitment_tree_root(Pool::Sapling, ""), Ok(None));
@@ -178,7 +178,7 @@ mod tests {
 
     /// Hand-framed legacy `CommitmentTree` hex (left, right, parents) → Ironwood roots match
     /// Orchard's hash at depth 32, independent of any tree builder
-    #[cfg(any(feature = "librustzcash", feature = "zingolib"))]
+    #[cfg(feature = "librustzcash")]
     #[test]
     fn ironwood_frontiers_hash_as_orchard() {
         use incrementalmerkletree::{Hashable, Level};
@@ -206,7 +206,7 @@ mod tests {
         assert_ne!(commitment_tree_root(Pool::Sapling, "000000"), Ok(Some(empty_root)));
     }
 
-    #[cfg(any(feature = "librustzcash", feature = "zingolib"))]
+    #[cfg(feature = "librustzcash")]
     #[test]
     fn garbage_is_an_error_not_a_silent_none() {
         assert!(matches!(commitment_tree_root(Pool::Sapling, "zz"), Err(TreeRootError::NotHex(_))));
@@ -219,7 +219,7 @@ mod tests {
     /// Whole wire path (hex + legacy `CommitmentTree` framing + root hash) against the
     /// one authority that cannot disagree with itself. Empty tree specifically = what
     /// both sides report before a pool's first output, so block one starts here
-    #[cfg(any(feature = "librustzcash", feature = "zingolib"))]
+    #[cfg(feature = "librustzcash")]
     #[test]
     fn a_serialized_tree_round_trips_to_its_own_root() {
         use zcash_primitives::merkle_tree::write_commitment_tree;

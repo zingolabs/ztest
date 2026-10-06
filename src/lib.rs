@@ -84,8 +84,6 @@ pub use crate::backends::lightwalletd::LightwalletdIndexer;
 pub use crate::backends::zainod::{ZainoIndex, ZainoIndexer};
 pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::{Health, ZebraValidator};
-#[cfg(feature = "zingolib")]
-pub use crate::backends::zingolib::{ZingolibBackend, ZingolibWallet};
 pub use crate::component::{
     ComponentBuilder, ComponentCategory, ComponentOpts, ComponentOptsBuilder, Cpu, Disk, Indexer,
     Mem, Resources, Validator, Wallet,

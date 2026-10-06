@@ -120,6 +120,9 @@ pub mod versions {
     /// First zebrad knowing the `"NU6.3"` (Ironwood) activation-height key
     /// (earlier rejects it as an unknown upgrade)
     pub const ZEBRAD_NU6_3: Semver = Semver { major: 6, minor: 0, patch: 0 };
+
+    /// First zebrad knowing the `"NU7"` activation-height key (zebrad 7.0.0-rc.0 parses as 7.0.0)
+    pub const ZEBRAD_NU7: Semver = Semver { major: 7, minor: 0, patch: 0 };
 }
 
 impl Semver {
@@ -146,6 +149,11 @@ impl Semver {
     /// `"NU6.3"` (Ironwood) height accepted + Ironwood coinbase mine/validate
     pub fn zebrad_supports_nu6_3(&self) -> bool {
         *self >= versions::ZEBRAD_NU6_3
+    }
+
+    /// `"NU7"` height accepted as an activation height
+    pub fn zebrad_supports_nu7(&self) -> bool {
+        *self >= versions::ZEBRAD_NU7
     }
 }
 
@@ -305,15 +313,16 @@ miner_address = \"{miner_address}\"{metrics_block}"
     );
 
     // One entry per activated upgrade. `None` = excluded by the topology ceiling →
-    // omit, never invent a value. NU6.1/NU6.2 also need `zebrad_supports_*`
+    // omit, never invent a value. NU6.1+ also need `zebrad_supports_*`
     out.push_str("\n\n[network.testnet_parameters.activation_heights]");
-    let activation_entries: [(&str, Option<u32>); 6] = [
+    let activation_entries: [(&str, Option<u32>); 7] = [
         ("Canopy", activation.canopy()),
         ("NU5", activation.nu5()),
         ("NU6", activation.nu6()),
         ("\"NU6.1\"", activation.nu6_1().filter(|_| version.zebrad_supports_nu6_1())),
         ("\"NU6.2\"", activation.nu6_2().filter(|_| version.zebrad_supports_nu6_2())),
         ("\"NU6.3\"", activation.nu6_3().filter(|_| version.zebrad_supports_nu6_3())),
+        ("NU7", activation.nu7().filter(|_| version.zebrad_supports_nu7())),
     ];
     for (key, height) in activation_entries {
         if let Some(h) = height {
@@ -431,6 +440,28 @@ mod tests {
         assert!(!pre_cutoff.contains("\"NU6.1\""));
         assert!(!pre_cutoff.contains("\"NU6.2\""));
         assert!(pre_cutoff.contains("initial_testnet_peers = []"));
+    }
+
+    #[test]
+    fn zebrad_nu7_activation_is_version_gated() {
+        let heights = ActivationHeights::builder().set_nu5(Some(2)).set_nu7(Some(9)).build();
+        let render = |version: &str| {
+            zebrad_conf(
+                version.parse().unwrap(),
+                &heights,
+                28232,
+                18233,
+                &[],
+                &[],
+                None,
+                None,
+                MINER_ADDRESS,
+                None,
+            )
+        };
+        assert!(render("7.0.0-rc.0").contains("\nNU7 = 9"));
+        assert!(render("7.0.0").contains("\nNU7 = 9"));
+        assert!(!render("6.4.2").contains("NU7"));
     }
 
     #[test]
