@@ -2,7 +2,7 @@
 //!
 //! - lightwalletd `CompactTxStreamer` gRPC on the `grpc` port (fresh tonic conn per call)
 //! - No helpers shared with `lightwalletd` (the two may diverge in framing)
-//! - One ingest path: validator JSON-RPC (`[source]`) → per-index stores under the scratch mount
+//! - One ingest path: `[[trusted_validators]]` JSON-RPC → per-index stores under the scratch mount
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -52,17 +52,19 @@ pub fn image_uri(
 /// `add_indexer` time
 #[derive(Debug, Clone, Default)]
 pub struct ZainoBackend {
-    chainview_peers: Vec<String>,
-    fetch: Fetch,
+    extra_trusted: Vec<String>,
+    sync: Sync,
     serve_caps: Option<ServeCaps>,
     max_address_rows: Option<NonZeroU32>,
 }
 
-/// `[fetch]` keys set on the builder (`None` = zainod's own default, key left out)
+/// `[sync]` keys set on the builder (`None` = zainod's own default, key left out)
 #[derive(Debug, Clone, Copy, Default)]
-struct Fetch {
+struct Sync {
     finalised_depth: Option<u32>,
     concurrency: Option<NonZeroU32>,
+    batch_mib: Option<NonZeroU32>,
+    queue_mib: Option<NonZeroU32>,
 }
 
 /// `[grpc]` caps a load test lifts (one driver pod = one client address to zainod)
@@ -103,30 +105,52 @@ impl ZainoIndex {
             ZainoIndex::TransparentAddress => "transparent_address",
         }
     }
+
+    /// `[index.<table>]` owning this store (`None` = value_balance, rides `compact_block`)
+    const fn table(self) -> Option<&'static str> {
+        match self {
+            ZainoIndex::ValueBalance => None,
+            index => Some(index.label()),
+        }
+    }
 }
 
 impl crate::component::Indexer<ZainoBackend> {
-    /// Extra validator for zainod's mempool quorum (`chainview_peers`), by component name
+    /// Extra `[[trusted_validators]]` entry, by component name (env's first validator always in)
     ///
-    /// - Checked at `env.build()` against the env's validators (≠ the block source)
-    pub fn chainview_peer(mut self, validator: impl Into<String>) -> Self {
-        self.backend.chainview_peers.push(validator.into());
+    /// - Checked at `env.build()` against the env's other validators
+    pub fn trusted_validator(mut self, validator: impl Into<String>) -> Self {
+        self.backend.extra_trusted.push(validator.into());
         self
     }
 
-    /// `[fetch] finalised_depth`: blocks held in pre-commit below the tip
+    /// `[sync] finalised_depth`: blocks held reorg-able below the tip
     ///
     /// - Unset = zainod's default (regtest: [`REGTEST_FINALISED_DEPTH`])
+    /// - Off regtest: >= [`PUBLIC_MIN_FINALISED_DEPTH`], else rejected at `env.build()`
     pub fn finalised_depth(mut self, depth: u32) -> Self {
-        self.backend.fetch.finalised_depth = Some(depth);
+        self.backend.sync.finalised_depth = Some(depth);
         self
     }
 
-    /// `[fetch] concurrency`: block fetches in flight during bulk sync
+    /// `[sync] concurrency`: block fetches (+ folds) in flight ahead of the next one needed
     ///
     /// - Unset = zainod's default
     pub fn fetch_concurrency(mut self, in_flight: NonZeroU32) -> Self {
-        self.backend.fetch.concurrency = Some(in_flight);
+        self.backend.sync.concurrency = Some(in_flight);
+        self
+    }
+
+    /// `[sync] batch_mib`: index changes per bulk-sync commit (unset = zainod's default)
+    pub fn sync_batch_mib(mut self, mib: NonZeroU32) -> Self {
+        self.backend.sync.batch_mib = Some(mib);
+        self
+    }
+
+    /// `[sync] queue_mib`: final blocks one index may trail the fetch by before it throttles
+    /// (unset = zainod's default)
+    pub fn sync_queue_mib(mut self, mib: NonZeroU32) -> Self {
+        self.backend.sync.queue_mib = Some(mib);
         self
     }
 
@@ -168,33 +192,38 @@ impl IndexerConfig for ZainoBackend {
             IndexerMode::Regtest => crate::Network::Regtest,
             IndexerMode::Public => public_network(&opts)?,
         };
-        let (source, others) = validators.split_first().ok_or_else(|| EnvError::Config {
+        let (first, others) = validators.split_first().ok_or_else(|| EnvError::Config {
             reason: "zainod sources blocks over validator JSON-RPC; no validator registered"
                 .to_string(),
         })?;
-        if let Some(stray) = self.chainview_peers.iter().find(|p| !others.contains(p)) {
+        if let Some(stray) = self.extra_trusted.iter().find(|p| !others.contains(p)) {
             return Err(EnvError::Config {
                 reason: format!(
-                    "chainview_peer {stray:?} names no validator besides the source \
-                     {source:?}; others: {others:?}"
+                    "trusted_validator {stray:?} names no validator besides the first \
+                     {first:?}; others: {others:?}"
                 ),
             });
         }
-        let fetch = Fetch {
+        let regtest = network == crate::Network::Regtest;
+        let sync = Sync {
             finalised_depth: self
-                .fetch
+                .sync
                 .finalised_depth
-                .or((network == crate::Network::Regtest).then_some(REGTEST_FINALISED_DEPTH)),
-            ..self.fetch
+                .or(regtest.then_some(REGTEST_FINALISED_DEPTH)),
+            ..self.sync
         };
-        let toml = zainod_conf(
-            network,
-            source,
-            &self.chainview_peers,
-            fetch,
-            self.serve_caps,
-            self.max_address_rows,
-        );
+        let floor = if regtest { 1 } else { PUBLIC_MIN_FINALISED_DEPTH };
+        if let Some(depth) = sync.finalised_depth.filter(|&depth| depth < floor) {
+            return Err(EnvError::Config {
+                reason: format!(
+                    "finalised_depth = {depth} on {}: zainod refuses below {floor}",
+                    network.as_str()
+                ),
+            });
+        }
+        let trusted: Vec<&str> =
+            std::iter::once(first).chain(&self.extra_trusted).map(String::as_str).collect();
+        let toml = zainod_conf(network, &trusted, sync, self.serve_caps, self.max_address_rows);
         opts.mounts.push(crate::regtest::config_mount_inline(toml, ZAINO_CONFIG));
         Ok(opts)
     }
@@ -213,13 +242,12 @@ fn public_network(opts: &crate::component::ComponentOpts) -> Result<crate::Netwo
 /// `zainod.toml` for zainod's `DaemonConfig` (`deny_unknown_fields` → stale key aborts boot)
 ///
 /// - Regtest: `test`/`test` auth (zcashd demands it, zebrad ignores it)
-/// - No `[index.*]`: every index takes its default dir, under [`ZAINO_DATA`]
-/// - `metrics_endpoint` always (zainod exporter compiled in, no build feature)
+/// - Every index pinned under [`ZAINO_DATA`] (no reliance on the image's XDG symlink)
+/// - `[metrics]` always (zainod exporter compiled in, no build feature)
 fn zainod_conf(
     network: crate::Network,
-    source: &str,
-    chainview_peers: &[String],
-    fetch: Fetch,
+    trusted: &[&str],
+    sync: Sync,
     caps: Option<ServeCaps>,
     max_address_rows: Option<NonZeroU32>,
 ) -> String {
@@ -229,16 +257,19 @@ fn zainod_conf(
         true => (crate::ports::ZEBRAD_RPC, "\nuser = \"test\"\npassword = \"test\""),
         false => (crate::ports::ZEBRAD_PUBLIC_RPC, ""),
     };
-    let validator = |host: &str| format!("jsonrpc_address = \"{host}:{rpc_port}\"{auth}\n");
 
     let mut out = format!(
         "# Generated by `ztest::backends::zainod` — do not hand-edit\n\nnetwork = \"{}\"\n",
         network.as_str()
     );
-    out.push_str(&format!("metrics_endpoint = \"{listen}:{}\"\n", crate::ports::ZAINO_METRICS));
-    out.push_str(&format!("\n[source]\n{}", validator(source)));
-    for peer in chainview_peers {
-        out.push_str(&format!("\n[[chainview_peers]]\n{}", validator(peer)));
+    out.push_str(&format!(
+        "\n[metrics]\nlisten_address = \"{listen}:{}\"\n",
+        crate::ports::ZAINO_METRICS
+    ));
+    for host in trusted {
+        out.push_str(&format!(
+            "\n[[trusted_validators]]\njsonrpc_address = \"{host}:{rpc_port}\"{auth}\n"
+        ));
     }
     out.push_str(&format!(
         "\n[serve]\ngrpc_listen_address = \"{listen}:{}\"\n",
@@ -246,15 +277,6 @@ fn zainod_conf(
     ));
     if let Some(rows) = max_address_rows {
         out.push_str(&format!("max_address_rows = {rows}\n"));
-    }
-    if fetch.finalised_depth.is_some() || fetch.concurrency.is_some() {
-        out.push_str("\n[fetch]\n");
-    }
-    if let Some(depth) = fetch.finalised_depth {
-        out.push_str(&format!("finalised_depth = {depth}\n"));
-    }
-    if let Some(in_flight) = fetch.concurrency {
-        out.push_str(&format!("concurrency = {in_flight}\n"));
     }
     if let Some(caps) = caps {
         out.push_str(&format!(
@@ -266,6 +288,30 @@ fn zainod_conf(
             caps.max_subscriptions
         ));
     }
+    let Sync { finalised_depth, concurrency, batch_mib, queue_mib } = sync;
+    let keys: Vec<(&str, u32)> = [
+        ("finalised_depth", finalised_depth),
+        ("concurrency", concurrency.map(NonZeroU32::get)),
+        ("batch_mib", batch_mib.map(NonZeroU32::get)),
+        ("queue_mib", queue_mib.map(NonZeroU32::get)),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key, value?)))
+    .collect();
+    if !keys.is_empty() {
+        out.push_str("\n[sync]\n");
+    }
+    for (key, value) in keys {
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+    for table in ZainoIndex::ALL.into_iter().filter_map(ZainoIndex::table) {
+        out.push_str(&format!(
+            "\n[index.{table}]\nenabled = true\npath = \"{ZAINO_DATA}/indexes/{table}\"\n"
+        ));
+    }
+    out.push_str(&format!(
+        "\n[index.header_chain]\npath = \"{ZAINO_DATA}/indexes/header_chain\"\n"
+    ));
     out
 }
 
@@ -740,7 +786,7 @@ pub mod family {
     pub const VALIDATOR_RPC: Hist =
         hist("zaino_validator_rpc_duration_seconds", Dimension::Seconds);
 
-    // LSM segment sets (`receives` / `spent` / `by_hash`); segments + merging split by `tier`
+    // LSM segment sets (`receives` / `spent` / `by_hash` / `outputs`); segments + merging by `tier`
     pub const fn lsm_segments(set: &'static str) -> Gauge {
         gauge_where("zaino_lsm_segments", Dimension::Count, "set", set)
     }
@@ -776,7 +822,7 @@ const fn lsm(set: &'static str) -> Tiers {
     }
 }
 
-const TIERS: [Tiers; 3] = [lsm("receives"), lsm("spent"), lsm("by_hash")];
+const TIERS: [Tiers; 4] = [lsm("receives"), lsm("spent"), lsm("by_hash"), lsm("outputs")];
 
 /// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns scannable
 #[rustfmt::skip]
@@ -1099,8 +1145,9 @@ const ZAINO_CONFIG: &str = "/app/config/zainod.toml";
 /// Fixtures never reach the 1000 default; 100 = a finalised band + a reorg window (0 = every
 /// block durable → no reorg recoverable)
 pub const REGTEST_FINALISED_DEPTH: u32 = 100;
-/// Image's data mount point (zaino `Dockerfile`: zainod's default cache dir symlinks here) →
-/// every index, current or future, defaults onto the scratch volume
+/// zaino's `MAX_BLOCK_REORG_HEIGHT` (zainod `validate()` floor off regtest)
+pub const PUBLIC_MIN_FINALISED_DEPTH: u32 = 1000;
+/// Image's data mount point (zaino `Dockerfile`: zainod's default cache dir symlinks here)
 const ZAINO_DATA: &str = "/app/data";
 
 #[cfg(test)]
@@ -1141,42 +1188,88 @@ mod tests {
     const MAINNET: &str = r#"# Generated by `ztest::backends::zainod` — do not hand-edit
 
 network = "mainnet"
-metrics_endpoint = "0.0.0.0:9998"
 
-[source]
+[metrics]
+listen_address = "0.0.0.0:9998"
+
+[[trusted_validators]]
 jsonrpc_address = "zebrad:18232"
 
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
+
+[index.compact_block]
+enabled = true
+path = "/app/data/indexes/compact_block"
+
+[index.block_hash]
+enabled = true
+path = "/app/data/indexes/block_hash"
+
+[index.tree_state]
+enabled = true
+path = "/app/data/indexes/tree_state"
+
+[index.transparent_address]
+enabled = true
+path = "/app/data/indexes/transparent_address"
+
+[index.header_chain]
+path = "/app/data/indexes/header_chain"
 "#;
 
     const TESTNET: &str = r#"# Generated by `ztest::backends::zainod` — do not hand-edit
 
 network = "testnet"
-metrics_endpoint = "0.0.0.0:9998"
 
-[source]
+[metrics]
+listen_address = "0.0.0.0:9998"
+
+[[trusted_validators]]
 jsonrpc_address = "zebrad:18232"
 
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
 
-[fetch]
-finalised_depth = 250
+[sync]
+finalised_depth = 2000
 concurrency = 64
+batch_mib = 32
+queue_mib = 128
+
+[index.compact_block]
+enabled = true
+path = "/app/data/indexes/compact_block"
+
+[index.block_hash]
+enabled = true
+path = "/app/data/indexes/block_hash"
+
+[index.tree_state]
+enabled = true
+path = "/app/data/indexes/tree_state"
+
+[index.transparent_address]
+enabled = true
+path = "/app/data/indexes/transparent_address"
+
+[index.header_chain]
+path = "/app/data/indexes/header_chain"
 "#;
 
     const REGTEST: &str = r#"# Generated by `ztest::backends::zainod` — do not hand-edit
 
 network = "regtest"
-metrics_endpoint = "0.0.0.0:9998"
 
-[source]
+[metrics]
+listen_address = "0.0.0.0:9998"
+
+[[trusted_validators]]
 jsonrpc_address = "zebrad:28232"
 user = "test"
 password = "test"
 
-[[chainview_peers]]
+[[trusted_validators]]
 jsonrpc_address = "zcashd:28232"
 user = "test"
 password = "test"
@@ -1184,13 +1277,31 @@ password = "test"
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
 
-[fetch]
+[sync]
 finalised_depth = 100
+
+[index.compact_block]
+enabled = true
+path = "/app/data/indexes/compact_block"
+
+[index.block_hash]
+enabled = true
+path = "/app/data/indexes/block_hash"
+
+[index.tree_state]
+enabled = true
+path = "/app/data/indexes/tree_state"
+
+[index.transparent_address]
+enabled = true
+path = "/app/data/indexes/transparent_address"
+
+[index.header_chain]
+path = "/app/data/indexes/header_chain"
 "#;
 
     /// Whole `zainod.toml` pinned per network kind (`deny_unknown_fields` upstream → any drift
-    /// in a key = a pod that never boots). No index path: every index defaults under the scratch
-    /// volume at the image's data root
+    /// in a key = a pod that never boots). Index paths = zainod's defaults, pinned explicit
     #[test]
     fn rendered_config_is_exactly_the_daemon_schema() {
         let dev = |features: &[&str]| {
@@ -1213,13 +1324,15 @@ finalised_depth = 100
             (
                 dev(&[])
                     .snapshot(snapshot(crate::Network::Testnet))
-                    .finalised_depth(250)
-                    .fetch_concurrency(NonZeroU32::new(64).expect("non-zero")),
+                    .finalised_depth(2000)
+                    .fetch_concurrency(NonZeroU32::new(64).expect("non-zero"))
+                    .sync_batch_mib(NonZeroU32::new(32).expect("non-zero"))
+                    .sync_queue_mib(NonZeroU32::new(128).expect("non-zero")),
                 vec!["zebrad".to_string()],
                 TESTNET,
             ),
             (
-                dev(&[]).regtest().chainview_peer("zcashd"),
+                dev(&[]).regtest().trusted_validator("zcashd"),
                 vec!["zebrad".to_string(), "zcashd".to_string()],
                 REGTEST,
             ),
@@ -1245,7 +1358,7 @@ finalised_depth = 100
 
     /// Unbuildable topologies fail at `env.build()` by name, not as a pod that never syncs
     #[test]
-    fn a_config_naming_a_missing_validator_is_rejected() {
+    fn a_config_zainod_would_refuse_is_rejected_by_name() {
         let regtest = crate::component::Indexer::zaino("1.0.0").regtest();
         let reject = |indexer: crate::component::Indexer<ZainoBackend>, validators: &[&str]| {
             let validators: Vec<String> = validators.iter().map(|v| v.to_string()).collect();
@@ -1258,9 +1371,23 @@ finalised_depth = 100
 
         assert!(reject(regtest.clone(), &[]).contains("no validator registered"));
         assert!(
-            reject(regtest.clone().chainview_peer("zebrad"), &["zebrad"]).contains("\"zebrad\"")
+            reject(regtest.clone().trusted_validator("zebrad"), &["zebrad"]).contains("\"zebrad\"")
         );
-        assert!(reject(regtest.chainview_peer("typo"), &["zebrad", "zcashd"]).contains("\"typo\""));
+        assert!(
+            reject(regtest.clone().trusted_validator("typo"), &["zebrad", "zcashd"])
+                .contains("\"typo\"")
+        );
+        assert!(
+            reject(regtest.finalised_depth(0), &["zebrad"])
+                .contains("finalised_depth = 0 on regtest: zainod refuses below 1")
+        );
+        let shallow = crate::component::Indexer::zaino("1.0.0")
+            .snapshot(snapshot(crate::Network::Mainnet))
+            .finalised_depth(PUBLIC_MIN_FINALISED_DEPTH - 1);
+        assert!(
+            reject(shallow, &["zebrad"])
+                .contains("finalised_depth = 999 on mainnet: zainod refuses below 1000")
+        );
         let regtest_cache =
             crate::component::Indexer::zaino("1.0.0").snapshot(snapshot(crate::Network::Regtest));
         assert!(reject(regtest_cache, &["zebrad"]).contains("not a public-network"));
