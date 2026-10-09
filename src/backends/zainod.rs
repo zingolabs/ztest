@@ -53,6 +53,7 @@ pub fn image_uri(
 #[derive(Debug, Clone, Default)]
 pub struct ZainoBackend {
     extra_trusted: Vec<String>,
+    validator_connections: Option<NonZeroU32>,
     sync: Sync,
     serve_caps: Option<ServeCaps>,
     max_address_rows: Option<NonZeroU32>,
@@ -120,6 +121,14 @@ impl crate::component::Indexer<ZainoBackend> {
     /// - Checked at `env.build()` against the env's other validators
     pub fn trusted_validator(mut self, validator: impl Into<String>) -> Self {
         self.backend.extra_trusted.push(validator.into());
+        self
+    }
+
+    /// `[[trusted_validators]] max_connections`, every validator (unset = zainod's default)
+    ///
+    /// - Block fetches in flight <= this − the poll's 1 − the other lanes' reserves
+    pub fn validator_max_connections(mut self, connections: NonZeroU32) -> Self {
+        self.backend.validator_connections = Some(connections);
         self
     }
 
@@ -216,7 +225,9 @@ impl IndexerConfig for ZainoBackend {
         }
         let trusted: Vec<&str> =
             std::iter::once(first).chain(&self.extra_trusted).map(String::as_str).collect();
-        let toml = zainod_conf(network, &trusted, sync, self.serve_caps, self.max_address_rows);
+        let validators =
+            TrustedValidators { hosts: &trusted, connections: self.validator_connections };
+        let toml = zainod_conf(network, validators, sync, self.serve_caps, self.max_address_rows);
         opts.mounts.push(crate::regtest::config_mount_inline(toml, ZAINO_CONFIG));
         Ok(opts)
     }
@@ -232,6 +243,12 @@ fn public_network(opts: &crate::component::ComponentOpts) -> Result<crate::Netwo
     })
 }
 
+/// `[[trusted_validators]]` entries: one per host, same `max_connections` on each
+struct TrustedValidators<'a> {
+    hosts: &'a [&'a str],
+    connections: Option<NonZeroU32>,
+}
+
 /// `zainod.toml` for zainod's `DaemonConfig` (`deny_unknown_fields` → stale key aborts boot)
 ///
 /// - Regtest: `test`/`test` auth (zcashd demands it, zebrad ignores it)
@@ -239,7 +256,7 @@ fn public_network(opts: &crate::component::ComponentOpts) -> Result<crate::Netwo
 /// - `[metrics]` always (zainod exporter compiled in, no build feature)
 fn zainod_conf(
     network: crate::Network,
-    trusted: &[&str],
+    trusted: TrustedValidators<'_>,
     sync: Sync,
     caps: Option<ServeCaps>,
     max_address_rows: Option<NonZeroU32>,
@@ -259,10 +276,13 @@ fn zainod_conf(
         "\n[metrics]\nlisten_address = \"{listen}:{}\"\n",
         crate::ports::ZAINO_METRICS
     ));
-    for host in trusted {
+    for host in trusted.hosts {
         out.push_str(&format!(
             "\n[[trusted_validators]]\njsonrpc_address = \"{host}:{rpc_port}\"{auth}\n"
         ));
+        if let Some(connections) = trusted.connections {
+            out.push_str(&format!("max_connections = {connections}\n"));
+        }
     }
     out.push_str(&format!(
         "\n[serve]\ngrpc_listen_address = \"{listen}:{}\"\n",
@@ -1213,6 +1233,7 @@ listen_address = "0.0.0.0:9998"
 
 [[trusted_validators]]
 jsonrpc_address = "zebrad:18232"
+max_connections = 72
 
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
@@ -1304,6 +1325,7 @@ path = "/app/data/indexes/transparent_address"
                 dev(&[])
                     .snapshot(snapshot(crate::Network::Testnet))
                     .finalised_depth(2000)
+                    .validator_max_connections(NonZeroU32::new(72).expect("non-zero"))
                     .fetch_concurrency(NonZeroU32::new(64).expect("non-zero"))
                     .sync_queue_mib(NonZeroU32::new(128).expect("non-zero")),
                 vec!["zebrad".to_string()],
