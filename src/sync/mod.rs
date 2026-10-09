@@ -54,9 +54,10 @@ pub use work::{Channel, Mismatch, Op, OpSet, Rate, Segment, Work};
 
 // Test-author facade; subject-agnostic, so it needs no backend feature
 mod facade;
-// Driver-side exporter, installed on the facade's detached run path
+// Driver-side exporter, up before any pod (`TestEnv::build`)
 mod export;
 
 pub use export::family as driver_family;
+pub(crate) use export::install as install_driver_exporter;
 
 pub use facade::{PhaseManifest, Run, SyncManifest, SyncRunner};

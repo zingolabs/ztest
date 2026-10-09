@@ -551,6 +551,10 @@ impl TestEnv {
 
         // Pre-pod: the reservation must already cover them
         self.hold_sync_reservation(&client, &sentinel.coords).await?;
+        // `sync watch` scrapes the driver from its start (build waits minutes on the SUT gate)
+        if crate::sync::active_sync_id().is_some() {
+            crate::sync::install_driver_exporter().map_err(env_err)?;
+        }
 
         // Quota = ours, not the parent's (sized from a topology only known here).
         // Cap at the tier component budget = what the scheduler reserved, so the
@@ -751,8 +755,8 @@ impl TestEnv {
         Ok(())
     }
 
-    /// Indexer counterpart of [`Self::wait_validators_rpc_ready`]: block until every
-    /// indexer answers gRPC `GetLightdInfo`, or `ready_timeout` elapses
+    /// Indexer counterpart of [`Self::wait_validators_rpc_ready`]: every indexer's backend `ready`
+    /// (zainod: `/statusz`; lightwalletd: `GetLightdInfo`), or `ready_timeout` elapses
     async fn wait_indexers_rpc_ready(&self) -> Result<(), EnvError> {
         let indexers: Vec<(String, Arc<dyn IndexerBackend>)> = {
             let comps = self.inner.components.read().await;
@@ -767,7 +771,7 @@ impl TestEnv {
         if indexers.is_empty() {
             return Ok(());
         }
-        tracing::info!(stage = "indexer", "waiting for gRPC GetLightdInfo");
+        tracing::info!(stage = "indexer", "waiting for indexer readiness");
 
         let timeout = self.ready_timeout;
         let probes = indexers.into_iter().map(|(pod_name, handle)| async move {

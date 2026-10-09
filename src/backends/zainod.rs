@@ -695,21 +695,21 @@ impl IndexerBackend for ZainoIndexer {
         self.get_block_range_with_pools(start, end, Vec::new()).await
     }
 
-    /// `GetLightdInfo` answers while every index still syncs (the rest = `UNAVAILABLE`)
+    /// `/statusz` reasons ⊆ {`syncing`}: booted, header chain verified, tip held
+    ///
+    /// - `syncing` allowed (bulk sync = minutes before every index serves; progress = metrics)
     async fn ready(&self, timeout: Duration) -> Result<(), RpcError> {
-        let started = tokio::time::Instant::now();
-        let deadline = started + timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let http = reqwest::Client::new();
         loop {
-            if self.indexer_info().await.is_ok() {
-                return Ok(());
-            }
+            let last = match self.statusz_reasons(&http).await {
+                Ok(reasons) if reasons.iter().all(|reason| reason == "syncing") => return Ok(()),
+                Ok(reasons) => format!("reasons {reasons:?}"),
+                Err(error) => error,
+            };
             if tokio::time::Instant::now() >= deadline {
-                return Err(RpcError::timeout(
-                    COMPONENT,
-                    "ready",
-                    timeout,
-                    "indexer gRPC GetLightdInfo never succeeded".to_string(),
-                ));
+                let detail = format!("indexer /statusz never ready: {last}");
+                return Err(RpcError::timeout(COMPONENT, "ready", timeout, detail));
             }
             tokio::time::sleep(READY_POLL_INTERVAL).await;
         }
@@ -949,6 +949,19 @@ impl ServerMeter for ZainoIndexer {
 }
 
 impl ZainoIndexer {
+    /// `/statusz` `reasons` off the admin port (before boot: `starting`)
+    async fn statusz_reasons(&self, http: &reqwest::Client) -> Result<Vec<String>, String> {
+        #[derive(serde::Deserialize)]
+        struct Statusz {
+            reasons: Vec<String>,
+        }
+        let ep = self.plumbing.endpoint_for(crate::ports::ZAINO_METRICS).await;
+        let url = format!("{}/statusz", ep.map_err(|e| e.to_string())?.url("http"));
+        let answer = http.get(url).send().await.map_err(|e| e.to_string())?;
+        let status = answer.json::<Statusz>().await.map_err(|e| e.to_string())?;
+        Ok(status.reasons)
+    }
+
     async fn exporter(&self) -> Result<Exposition, RpcError> {
         self.read(EXPORTER_SCRAPE_TIMEOUT)
             .await
