@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::topology::ActivationHeights;
+use crate::zebrad_sync::SyncBudget;
 
 use crate::regtest::{FundingStreams, LockboxDisbursement};
 
@@ -238,7 +239,9 @@ pub fn zebrad_conf(
     state_cache_dir: Option<&str>,
     miner_address: &str,
     metrics_port: Option<u16>,
+    sync: SyncBudget,
 ) -> String {
+    let sync_block = sync.toml();
     let metrics_block = match metrics_port {
         Some(port) => format!("\n\n[metrics]\nendpoint_addr = \"0.0.0.0:{port}\""),
         None => String::new(),
@@ -282,16 +285,11 @@ peerset_initial_target_size = 25
 [rpc]
 debug_force_finished_sync = false
 enable_cookie_auth = false
-parallel_cpu_threads = 0
 listen_addr = \"0.0.0.0:{rpc_port}\"
 
 {state_block}
 
-[sync]
-checkpoint_verify_concurrency_limit = 1000
-download_concurrency_limit = 50
-full_verify_concurrency_limit = 20
-parallel_cpu_threads = 0
+{sync_block}
 
 [tracing]
 buffer_limit = 128000
@@ -410,6 +408,7 @@ mod tests {
             None,
             MINER_ADDRESS,
             None,
+            SyncBudget::default(),
         );
         assert!(supported.contains(&format!("NU6 = {}", heights.nu6().unwrap())));
         assert!(supported.contains(&format!("\"NU6.1\" = {}", heights.nu6_1().unwrap())));
@@ -427,6 +426,7 @@ mod tests {
             None,
             MINER_ADDRESS,
             None,
+            SyncBudget::default(),
         );
         assert!(!pre_cutoff.contains("\"NU6.1\""));
         assert!(!pre_cutoff.contains("\"NU6.2\""));
@@ -447,6 +447,7 @@ mod tests {
             None,
             MINER_ADDRESS,
             None,
+            SyncBudget::default(),
         );
         assert!(toml.contains("initial_testnet_peers = [\"alice:18233\", \"bob:18233\"]"));
     }
@@ -465,6 +466,7 @@ mod tests {
                 state_cache_dir,
                 MINER_ADDRESS,
                 None,
+                SyncBudget::default(),
             )
         };
 
@@ -492,6 +494,7 @@ mod tests {
                 None,
                 MINER_ADDRESS,
                 metrics_port,
+                SyncBudget::default(),
             )
         };
         assert!(!zeb(None).contains("[metrics]"));

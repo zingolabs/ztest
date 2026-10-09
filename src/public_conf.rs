@@ -11,6 +11,7 @@
 
 use crate::Network;
 use crate::regtest_conf::Semver;
+use crate::zebrad_sync::SyncBudget;
 
 /// Panic guard: no coherent regtest render here (that has its own module)
 fn assert_public(network: Network, who: &str) {
@@ -56,8 +57,10 @@ pub fn public_zebrad_conf(
     rpc_port: u16,
     cache_dir: &str,
     metrics_port: Option<u16>,
+    sync: SyncBudget,
 ) -> String {
     assert_public(network, "public_zebrad_conf");
+    let sync_block = sync.toml();
     let metrics_block = match metrics_port {
         Some(port) => format!("\n\n[metrics]\nendpoint_addr = \"0.0.0.0:{port}\""),
         None => String::new(),
@@ -124,7 +127,6 @@ peerset_initial_target_size = {peerset_target}
 
 [rpc]{finished_sync}
 enable_cookie_auth = false
-parallel_cpu_threads = 0
 listen_addr = \"0.0.0.0:{rpc_port}\"
 
 [state]
@@ -132,11 +134,7 @@ cache_dir = \"{cache_dir}\"
 delete_old_database = false
 ephemeral = false
 
-[sync]
-checkpoint_verify_concurrency_limit = 1000
-download_concurrency_limit = 50
-full_verify_concurrency_limit = 20
-parallel_cpu_threads = 0
+{sync_block}
 
 [tracing]
 buffer_limit = 128000
@@ -171,6 +169,7 @@ mod tests {
                 18232,
                 "/var/cache/zebrad",
                 None,
+                SyncBudget::default(),
             );
             assert_eq!(toml.matches("cache_dir = \"/var/cache/zebrad\"").count(), 1);
             let state = toml.find("[state]").expect("[state] table");
@@ -194,6 +193,7 @@ mod tests {
                 18232,
                 "/var/cache/zebrad",
                 None,
+                SyncBudget::default(),
             );
             assert!(toml.contains("debug_force_finished_sync = true"));
             assert!(toml.contains("crawl_new_peer_interval = \"365d\""));
@@ -212,6 +212,7 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            SyncBudget::default(),
         );
         assert!(main.contains("network = \"Mainnet\""));
         assert!(main.contains("initial_mainnet_peers = []"));
@@ -224,6 +225,7 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            SyncBudget::default(),
         );
         assert!(test.contains("network = \"Testnet\""));
         assert!(test.contains("initial_testnet_peers = []"));
@@ -241,6 +243,7 @@ mod tests {
                 18232,
                 "/var/cache/zebrad",
                 Some(9999),
+                SyncBudget::default(),
             );
             for line in conf.lines().filter(|l| {
                 !l.trim_start().starts_with('#')
@@ -264,6 +267,7 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            SyncBudget::default(),
         );
     }
 
@@ -279,6 +283,7 @@ mod tests {
                 18232,
                 "/var/cache/zebrad",
                 None,
+                SyncBudget::default(),
             );
             assert!(!toml.contains("crawl_new_peer_interval"));
             assert!(!toml.contains("debug_force_finished_sync"));
@@ -315,6 +320,7 @@ mod tests {
                 18232,
                 "/var/cache/zebrad",
                 None,
+                SyncBudget::default(),
             );
             let line = |key: &str| toml.lines().find(|l| l.starts_with(key)).map(str::to_owned);
             assert_eq!(line("initial_mainnet_peers"), mainnet_key.map(str::to_owned), "{toml}");
@@ -334,6 +340,7 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            SyncBudget::default(),
         );
         assert_eq!(toml.matches("cache_dir = \"/var/cache/zebrad\"").count(), 2, "{toml}");
         assert!(toml.contains(&format!("listen_addr = \"0.0.0.0:{}\"", crate::ports::ZEBRAD_P2P)));
@@ -350,6 +357,7 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            SyncBudget::default(),
         );
         assert!(
             following
@@ -364,7 +372,33 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            SyncBudget::default(),
         );
         assert!(!pinned.contains("[health]"));
+    }
+
+    /// `[sync]` = the budget, pinned or following; `parallel_cpu_threads` only there (`[rpc]`'s
+    /// = dead in zebra since jsonrpsee)
+    #[test]
+    fn the_sync_budget_renders_as_sync_and_rpc_carries_no_dead_thread_key() {
+        let nz = |n| std::num::NonZeroU32::new(n).expect("non-zero");
+        let budget = SyncBudget {
+            verify_threads: Some(nz(1)),
+            full_verify_blocks: nz(2),
+            download_blocks: nz(8),
+        };
+        for motion in [ChainMotion::Pinned, ChainMotion::Following(Seeds::Dns)] {
+            let toml = public_zebrad_conf(
+                Network::Mainnet,
+                motion,
+                v(),
+                18232,
+                "/var/cache/zebrad",
+                None,
+                budget,
+            );
+            assert!(toml.contains(&budget.toml()), "{toml}");
+            assert_eq!(toml.matches("parallel_cpu_threads").count(), 1, "[sync]'s only: {toml}");
+        }
     }
 }

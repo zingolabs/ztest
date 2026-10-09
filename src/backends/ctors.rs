@@ -13,7 +13,7 @@ use crate::component::{ComponentOpts, Indexer, IndexerMode, Validator};
 
 impl Validator<ZebraBackend> {
     pub fn zebrad(version: impl Into<String>) -> Self {
-        Self { backend: ZebraBackend, opts: opts_for(&version.into(), "zebrad") }
+        Self { backend: ZebraBackend::default(), opts: opts_for(&version.into(), "zebrad") }
     }
     /// zebrad from a local Dockerfile or pinned git rev (see `dev!`). `version`
     /// must be real semver, never the `"dev"` sentinel — the regtest config and
@@ -24,7 +24,10 @@ impl Validator<ZebraBackend> {
         version: impl Into<String>,
         features: Vec<String>,
     ) -> Self {
-        Self { backend: ZebraBackend, opts: opts_dev(source, version.into(), features, "zebrad") }
+        Self {
+            backend: ZebraBackend::default(),
+            opts: opts_dev(source, version.into(), features, "zebrad"),
+        }
     }
 }
 

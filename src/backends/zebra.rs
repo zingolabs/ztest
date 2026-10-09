@@ -18,6 +18,7 @@ use crate::protocol::Endpoint;
 use crate::protocol::client::{AuthedRpc, JsonRpcClient, json_rpc, wait_for_rpc_ready};
 use crate::protocol::zcash_rpc::ZcashRpc;
 use crate::public_conf::{ChainMotion, Seeds};
+use crate::zebrad_sync::SyncBudget;
 use crate::{EnvError, RpcError};
 
 const COMPONENT: &str = "zebrad";
@@ -52,8 +53,10 @@ pub fn image_uri(
 
 /// zebrad flavour of the [`Validator`](crate::component::Validator) builder →
 /// [`ZebraValidator`] handle at `add_validator` time
-#[derive(Debug, Clone)]
-pub struct ZebraBackend;
+#[derive(Debug, Clone, Default)]
+pub struct ZebraBackend {
+    sync: SyncBudget,
+}
 
 impl ValidatorConfig for ZebraBackend {
     type Handle = ZebraValidator;
@@ -113,6 +116,7 @@ impl ValidatorConfig for ZebraBackend {
             opts.restore.is_some().then_some(ZEBRAD_REGTEST_CACHE_DIR),
             miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
             opts.image.metrics_enabled().then(|| self.metrics_port()).flatten(),
+            self.sync,
         );
         opts.mounts.push(crate::regtest::config_mount_inline(toml, CONTAINER_CONFIG_PATH));
 
@@ -234,7 +238,7 @@ impl ValidatorBackend for ZebraValidator {
                 // generator's own derivation (else testnet probes the regtest port).
                 let mut base = crate::backends::metrics_port_appended(
                     &[("rpc", rpc_port(opts)), ("p2p", crate::ports::ZEBRAD_P2P)],
-                    ZebraBackend.metrics_port(),
+                    ZebraBackend::default().metrics_port(),
                 );
                 if serves_health(opts) {
                     base.push(("health", crate::ports::ZEBRAD_HEALTH));
@@ -496,12 +500,28 @@ fn restore_public(
         return validator;
     };
 
-    let toml = public_toml(validator.opts(), network, ChainMotion::Pinned, ZEBRAD_PUBLIC_CACHE_DIR);
+    let sync = validator.backend.sync;
+    let toml =
+        public_toml(validator.opts(), network, ChainMotion::Pinned, ZEBRAD_PUBLIC_CACHE_DIR, sync);
     boot_public(validator, toml)
         .mount(crate::mount::Mount::seed(archive.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
 }
 
 impl crate::component::Validator<ZebraBackend> {
+    /// `[sync]` budget (verify threads, blocks verifying / downloading); rest of the pod = RPC
+    ///
+    /// # Panics
+    ///
+    /// After `snapshot` / `follow*` (public `zebrad.toml` renders there)
+    pub fn sync_budget(mut self, budget: SyncBudget) -> Self {
+        assert!(
+            self.opts.restore.is_none(),
+            "sync_budget before snapshot/follow/follow_from (zebrad.toml renders there)"
+        );
+        self.backend.sync = budget;
+        self
+    }
+
     /// Boot off `snapshot` → sync onward with the network (tip moves past the pin)
     ///
     /// - Private CoW clone of the seed → size the growth past the pin with `.disk(..)`
@@ -544,6 +564,7 @@ impl crate::component::Validator<ZebraBackend> {
             snapshot.network,
             ChainMotion::Following(seeds),
             ZEBRAD_PUBLIC_CACHE_DIR,
+            self.backend.sync,
         );
         boot_public(self, toml)
             .mount(crate::mount::Mount::seed(snapshot.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
@@ -555,6 +576,7 @@ fn public_toml(
     network: crate::Network,
     motion: ChainMotion,
     cache_dir: &str,
+    sync: SyncBudget,
 ) -> String {
     let version =
         opts.version.parse::<crate::regtest_conf::Semver>().expect("zebrad version must be semver");
@@ -567,7 +589,8 @@ fn public_toml(
         // Unconditional: zfnd's published images ship the exporter compiled in, and `pod_spec`
         // declares the port either way (`metrics_enabled` gates a *dev* build feature only).
         // Gating here left a declared port nothing listened on.
-        ZebraBackend.metrics_port(),
+        ZebraBackend::default().metrics_port(),
+        sync,
     )
 }
 

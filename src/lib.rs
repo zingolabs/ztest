@@ -30,6 +30,7 @@ pub mod regtest;
 pub mod regtest_conf;
 pub mod snapshots;
 pub mod topology;
+pub mod zebrad_sync;
 
 // ───────────────────────── internal machinery ──────────────────────────
 // Private: `ztest_ui` / `ztest_cli` reach core through `api` only.
