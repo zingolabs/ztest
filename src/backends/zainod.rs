@@ -65,6 +65,14 @@ struct Sync {
     finalised_depth: Option<u32>,
     concurrency: Option<NonZeroU32>,
     queue_mib: Option<NonZeroU32>,
+    lsm_store: LsmStore,
+}
+
+/// `[sync.lsm_store]` keys set on the builder (`None` = zainod's own default, key left out)
+#[derive(Debug, Clone, Copy, Default)]
+struct LsmStore {
+    fanout: Option<u32>,
+    merge_slots: Option<NonZeroU32>,
 }
 
 /// `[grpc]` caps a load test lifts (one driver pod = one client address to zainod)
@@ -156,6 +164,19 @@ impl crate::component::Indexer<ZainoBackend> {
         self
     }
 
+    /// `[sync.lsm_store] fanout`: same-tier segments merged into one (>= 2, else rejected at
+    /// `env.build()`; unset = zainod's default)
+    pub fn lsm_fanout(mut self, fanout: u32) -> Self {
+        self.backend.sync.lsm_store.fanout = Some(fanout);
+        self
+    }
+
+    /// `[sync.lsm_store] merge_slots`: merges doing disk I/O at once (unset = zainod's default)
+    pub fn lsm_merge_slots(mut self, slots: NonZeroU32) -> Self {
+        self.backend.sync.lsm_store.merge_slots = Some(slots);
+        self
+    }
+
     /// `[grpc]` caps (unset = zainod's defaults)
     pub fn serve_caps(mut self, caps: ServeCaps) -> Self {
         self.backend.serve_caps = Some(caps);
@@ -221,6 +242,11 @@ impl IndexerConfig for ZainoBackend {
                     "finalised_depth = {depth} on {}: zainod refuses below {floor}",
                     network.as_str()
                 ),
+            });
+        }
+        if let Some(fanout) = sync.lsm_store.fanout.filter(|&fanout| fanout < 2) {
+            return Err(EnvError::Config {
+                reason: format!("lsm fanout = {fanout}: zainod refuses below 2"),
             });
         }
         let trusted: Vec<&str> =
@@ -301,7 +327,7 @@ fn zainod_conf(
             caps.max_subscriptions
         ));
     }
-    let Sync { finalised_depth, concurrency, queue_mib } = sync;
+    let Sync { finalised_depth, concurrency, queue_mib, lsm_store } = sync;
     let keys: Vec<(&str, u32)> = [
         ("finalised_depth", finalised_depth),
         ("concurrency", concurrency.map(NonZeroU32::get)),
@@ -314,6 +340,18 @@ fn zainod_conf(
         out.push_str("\n[sync]\n");
     }
     for (key, value) in keys {
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+    let LsmStore { fanout, merge_slots } = lsm_store;
+    let lsm: Vec<(&str, u32)> =
+        [("fanout", fanout), ("merge_slots", merge_slots.map(NonZeroU32::get))]
+            .into_iter()
+            .filter_map(|(key, value)| Some((key, value?)))
+            .collect();
+    if !lsm.is_empty() {
+        out.push_str("\n[sync.lsm_store]\n");
+    }
+    for (key, value) in lsm {
         out.push_str(&format!("{key} = {value}\n"));
     }
     for table in ZainoIndex::ALL.into_iter().filter_map(ZainoIndex::table) {
@@ -1256,6 +1294,10 @@ finalised_depth = 2000
 concurrency = 64
 queue_mib = 128
 
+[sync.lsm_store]
+fanout = 16
+merge_slots = 2
+
 [index.compact_block]
 enabled = true
 path = "/app/data/indexes/compact_block"
@@ -1340,7 +1382,9 @@ path = "/app/data/indexes/transparent_address"
                     .finalised_depth(2000)
                     .validator_max_connections(NonZeroU32::new(72).expect("non-zero"))
                     .fetch_concurrency(NonZeroU32::new(64).expect("non-zero"))
-                    .sync_queue_mib(NonZeroU32::new(128).expect("non-zero")),
+                    .sync_queue_mib(NonZeroU32::new(128).expect("non-zero"))
+                    .lsm_fanout(16)
+                    .lsm_merge_slots(NonZeroU32::new(2).expect("non-zero")),
                 vec!["zebrad".to_string()],
                 TESTNET,
             ),
