@@ -73,6 +73,7 @@ struct Sync {
 struct LsmStore {
     fanout: Option<u32>,
     merge_slots: Option<NonZeroU32>,
+    merge_mib_per_sec: Option<NonZeroU32>,
 }
 
 /// `[grpc]` caps a load test lifts (one driver pod = one client address to zainod)
@@ -174,6 +175,13 @@ impl crate::component::Indexer<ZainoBackend> {
     /// `[sync.lsm_store] merge_slots`: merges doing disk I/O at once (unset = zainod's default)
     pub fn lsm_merge_slots(mut self, slots: NonZeroU32) -> Self {
         self.backend.sync.lsm_store.merge_slots = Some(slots);
+        self
+    }
+
+    /// `[sync.lsm_store] merge_mib_per_sec`: read + written MiB/s all merges share (unset = zainod's
+    /// default)
+    pub fn lsm_merge_mib_per_sec(mut self, mib: NonZeroU32) -> Self {
+        self.backend.sync.lsm_store.merge_mib_per_sec = Some(mib);
         self
     }
 
@@ -342,12 +350,15 @@ fn zainod_conf(
     for (key, value) in keys {
         out.push_str(&format!("{key} = {value}\n"));
     }
-    let LsmStore { fanout, merge_slots } = lsm_store;
-    let lsm: Vec<(&str, u32)> =
-        [("fanout", fanout), ("merge_slots", merge_slots.map(NonZeroU32::get))]
-            .into_iter()
-            .filter_map(|(key, value)| Some((key, value?)))
-            .collect();
+    let LsmStore { fanout, merge_slots, merge_mib_per_sec } = lsm_store;
+    let lsm: Vec<(&str, u32)> = [
+        ("fanout", fanout),
+        ("merge_slots", merge_slots.map(NonZeroU32::get)),
+        ("merge_mib_per_sec", merge_mib_per_sec.map(NonZeroU32::get)),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key, value?)))
+    .collect();
     if !lsm.is_empty() {
         out.push_str("\n[sync.lsm_store]\n");
     }
@@ -1297,6 +1308,7 @@ queue_mib = 128
 [sync.lsm_store]
 fanout = 16
 merge_slots = 2
+merge_mib_per_sec = 300
 
 [index.compact_block]
 enabled = true
@@ -1384,7 +1396,8 @@ path = "/app/data/indexes/transparent_address"
                     .fetch_concurrency(NonZeroU32::new(64).expect("non-zero"))
                     .sync_queue_mib(NonZeroU32::new(128).expect("non-zero"))
                     .lsm_fanout(16)
-                    .lsm_merge_slots(NonZeroU32::new(2).expect("non-zero")),
+                    .lsm_merge_slots(NonZeroU32::new(2).expect("non-zero"))
+                    .lsm_merge_mib_per_sec(NonZeroU32::new(300).expect("non-zero")),
                 vec!["zebrad".to_string()],
                 TESTNET,
             ),
