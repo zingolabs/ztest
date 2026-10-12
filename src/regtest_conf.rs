@@ -222,6 +222,11 @@ minetolocalwallet=0
 
 // ─────────────────────────────── zebrad ───────────────────────────────
 
+/// `[rpc]` line opening zebrad's indexer gRPC (`indexer_listen_addr`; zebra >= 6), or nothing
+pub(crate) fn indexer_listen_line(port: Option<u16>) -> String {
+    port.map(|port| format!("\nindexer_listen_addr = \"0.0.0.0:{port}\"")).unwrap_or_default()
+}
+
 /// Regtest `zebrad.toml` for one binary version.
 ///
 /// - `p2p_listen_port` `0` → zebrad binds an ephemeral port
@@ -239,9 +244,11 @@ pub fn zebrad_conf(
     state_cache_dir: Option<&str>,
     miner_address: &str,
     metrics_port: Option<u16>,
+    indexer_port: Option<u16>,
     sync: SyncBudget,
 ) -> String {
     let sync_block = sync.toml();
+    let indexer_line = indexer_listen_line(indexer_port);
     let metrics_block = match metrics_port {
         Some(port) => format!("\n\n[metrics]\nendpoint_addr = \"0.0.0.0:{port}\""),
         None => String::new(),
@@ -285,7 +292,7 @@ peerset_initial_target_size = 25
 [rpc]
 debug_force_finished_sync = false
 enable_cookie_auth = false
-listen_addr = \"0.0.0.0:{rpc_port}\"
+listen_addr = \"0.0.0.0:{rpc_port}\"{indexer_line}
 
 {state_block}
 
@@ -408,6 +415,7 @@ mod tests {
             None,
             MINER_ADDRESS,
             None,
+            None,
             SyncBudget::default(),
         );
         assert!(supported.contains(&format!("NU6 = {}", heights.nu6().unwrap())));
@@ -425,6 +433,7 @@ mod tests {
             None,
             None,
             MINER_ADDRESS,
+            None,
             None,
             SyncBudget::default(),
         );
@@ -447,6 +456,7 @@ mod tests {
             None,
             MINER_ADDRESS,
             None,
+            None,
             SyncBudget::default(),
         );
         assert!(toml.contains("initial_testnet_peers = [\"alice:18233\", \"bob:18233\"]"));
@@ -465,6 +475,7 @@ mod tests {
                 None,
                 state_cache_dir,
                 MINER_ADDRESS,
+                None,
                 None,
                 SyncBudget::default(),
             )
@@ -494,6 +505,7 @@ mod tests {
                 None,
                 MINER_ADDRESS,
                 metrics_port,
+                None,
                 SyncBudget::default(),
             )
         };

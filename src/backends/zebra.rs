@@ -56,6 +56,13 @@ pub fn image_uri(
 #[derive(Debug, Clone, Default)]
 pub struct ZebraBackend {
     sync: SyncBudget,
+    indexer: bool,
+}
+
+impl ZebraBackend {
+    fn indexer_port(&self) -> Option<u16> {
+        self.indexer.then_some(crate::ports::ZEBRAD_INDEXER)
+    }
 }
 
 impl ValidatorConfig for ZebraBackend {
@@ -116,6 +123,7 @@ impl ValidatorConfig for ZebraBackend {
             opts.restore.is_some().then_some(ZEBRAD_REGTEST_CACHE_DIR),
             miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
             opts.image.metrics_enabled().then(|| self.metrics_port()).flatten(),
+            self.indexer_port(),
             self.sync,
         );
         opts.mounts.push(crate::regtest::config_mount_inline(toml, CONTAINER_CONFIG_PATH));
@@ -500,9 +508,14 @@ fn restore_public(
         return validator;
     };
 
-    let sync = validator.backend.sync;
-    let toml =
-        public_toml(validator.opts(), network, ChainMotion::Pinned, ZEBRAD_PUBLIC_CACHE_DIR, sync);
+    let backend = validator.backend.clone();
+    let toml = public_toml(
+        validator.opts(),
+        network,
+        ChainMotion::Pinned,
+        ZEBRAD_PUBLIC_CACHE_DIR,
+        &backend,
+    );
     boot_public(validator, toml)
         .mount(crate::mount::Mount::seed(archive.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
 }
@@ -520,6 +533,21 @@ impl crate::component::Validator<ZebraBackend> {
         );
         self.backend.sync = budget;
         self
+    }
+
+    /// Indexer gRPC on [`ZEBRAD_INDEXER`](crate::ports::ZEBRAD_INDEXER) (`indexer_listen_addr`;
+    /// zebra >= 6): block streams + push events zainod's `validator_client = "grpc"` reads
+    ///
+    /// # Panics
+    ///
+    /// After `snapshot` / `follow*` (public `zebrad.toml` renders there)
+    pub fn indexer(mut self) -> Self {
+        assert!(
+            self.opts.restore.is_none(),
+            "indexer before snapshot/follow/follow_from (zebrad.toml renders there)"
+        );
+        self.backend.indexer = true;
+        self.expose("indexer", crate::ports::ZEBRAD_INDEXER)
     }
 
     /// Boot off `snapshot` → sync onward with the network (tip moves past the pin)
@@ -564,7 +592,7 @@ impl crate::component::Validator<ZebraBackend> {
             snapshot.network,
             ChainMotion::Following(seeds),
             ZEBRAD_PUBLIC_CACHE_DIR,
-            self.backend.sync,
+            &self.backend,
         );
         boot_public(self, toml)
             .mount(crate::mount::Mount::seed(snapshot.artifact, ZEBRAD_PUBLIC_CACHE_DIR))
@@ -576,7 +604,7 @@ fn public_toml(
     network: crate::Network,
     motion: ChainMotion,
     cache_dir: &str,
-    sync: SyncBudget,
+    backend: &ZebraBackend,
 ) -> String {
     let version =
         opts.version.parse::<crate::regtest_conf::Semver>().expect("zebrad version must be semver");
@@ -590,7 +618,8 @@ fn public_toml(
         // declares the port either way (`metrics_enabled` gates a *dev* build feature only).
         // Gating here left a declared port nothing listened on.
         ZebraBackend::default().metrics_port(),
-        sync,
+        backend.indexer_port(),
+        backend.sync,
     )
 }
 

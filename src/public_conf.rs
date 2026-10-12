@@ -50,6 +50,7 @@ const FOLLOWING_PEERSET_TARGET: u32 = 75;
 ///
 /// `cache_dir` = the container path the chain-archive PVC is mounted at. Only
 /// `[state] cache_dir` points there (tests say why `[network] cache_dir` must not)
+#[allow(clippy::too_many_arguments)]
 pub fn public_zebrad_conf(
     network: Network,
     motion: ChainMotion,
@@ -57,10 +58,12 @@ pub fn public_zebrad_conf(
     rpc_port: u16,
     cache_dir: &str,
     metrics_port: Option<u16>,
+    indexer_port: Option<u16>,
     sync: SyncBudget,
 ) -> String {
     assert_public(network, "public_zebrad_conf");
     let sync_block = sync.toml();
+    let indexer_line = crate::regtest_conf::indexer_listen_line(indexer_port);
     let metrics_block = match metrics_port {
         Some(port) => format!("\n\n[metrics]\nendpoint_addr = \"0.0.0.0:{port}\""),
         None => String::new(),
@@ -127,7 +130,7 @@ peerset_initial_target_size = {peerset_target}
 
 [rpc]{finished_sync}
 enable_cookie_auth = false
-listen_addr = \"0.0.0.0:{rpc_port}\"
+listen_addr = \"0.0.0.0:{rpc_port}\"{indexer_line}
 
 [state]
 cache_dir = \"{cache_dir}\"
@@ -169,6 +172,7 @@ mod tests {
                 18232,
                 "/var/cache/zebrad",
                 None,
+                None,
                 SyncBudget::default(),
             );
             assert_eq!(toml.matches("cache_dir = \"/var/cache/zebrad\"").count(), 1);
@@ -193,6 +197,7 @@ mod tests {
                 18232,
                 "/var/cache/zebrad",
                 None,
+                None,
                 SyncBudget::default(),
             );
             assert!(toml.contains("debug_force_finished_sync = true"));
@@ -212,6 +217,7 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            None,
             SyncBudget::default(),
         );
         assert!(main.contains("network = \"Mainnet\""));
@@ -225,6 +231,7 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            None,
             SyncBudget::default(),
         );
         assert!(test.contains("network = \"Testnet\""));
@@ -232,7 +239,8 @@ mod tests {
         assert!(!test.contains("initial_mainnet_peers"));
     }
 
-    /// Loopback bind = unreachable from the test pod (reads as a dead component)
+    /// Loopback bind = unreachable from the test pod (reads as a dead component); the indexer
+    /// listener = `[rpc] indexer_listen_addr` (zebrad's key, its own table)
     #[test]
     fn no_listener_binds_to_loopback() {
         for network in PUBLIC {
@@ -243,7 +251,14 @@ mod tests {
                 18232,
                 "/var/cache/zebrad",
                 Some(9999),
+                Some(crate::ports::ZEBRAD_INDEXER),
                 SyncBudget::default(),
+            );
+            let parsed: toml::Table = toml::from_str(&conf).expect("valid TOML");
+            assert_eq!(
+                parsed["rpc"]["indexer_listen_addr"].as_str(),
+                Some("0.0.0.0:8230"),
+                "{conf}"
             );
             for line in conf.lines().filter(|l| {
                 !l.trim_start().starts_with('#')
@@ -267,6 +282,7 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            None,
             SyncBudget::default(),
         );
     }
@@ -282,6 +298,7 @@ mod tests {
                 v(),
                 18232,
                 "/var/cache/zebrad",
+                None,
                 None,
                 SyncBudget::default(),
             );
@@ -320,6 +337,7 @@ mod tests {
                 18232,
                 "/var/cache/zebrad",
                 None,
+                None,
                 SyncBudget::default(),
             );
             let line = |key: &str| toml.lines().find(|l| l.starts_with(key)).map(str::to_owned);
@@ -340,6 +358,7 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            None,
             SyncBudget::default(),
         );
         assert_eq!(toml.matches("cache_dir = \"/var/cache/zebrad\"").count(), 2, "{toml}");
@@ -357,6 +376,7 @@ mod tests {
             18232,
             "/var/cache/zebrad",
             None,
+            None,
             SyncBudget::default(),
         );
         assert!(
@@ -371,6 +391,7 @@ mod tests {
             v(),
             18232,
             "/var/cache/zebrad",
+            None,
             None,
             SyncBudget::default(),
         );
@@ -394,6 +415,7 @@ mod tests {
                 v(),
                 18232,
                 "/var/cache/zebrad",
+                None,
                 None,
                 budget,
             );
