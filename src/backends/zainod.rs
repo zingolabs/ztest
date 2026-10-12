@@ -779,16 +779,17 @@ impl IndexerBackend for ZainoIndexer {
         self.get_block_range_with_pools(start, end, Vec::new()).await
     }
 
-    /// `/statusz` reasons ⊆ {`syncing`}: booted, header chain verified, tip held
+    /// `/statusz` `state` = `syncing` | `serving`: booted, header chain verified, a trusted tip held
     ///
-    /// - `syncing` allowed (bulk sync = minutes before every index serves; progress = metrics)
+    /// - `syncing` allowed (bulk sync = hours before every index serves; progress = metrics)
+    /// - `degraded` refused (tip held by peers alone: no trusted validator answering)
     async fn ready(&self, timeout: Duration) -> Result<(), RpcError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let http = reqwest::Client::new();
         loop {
-            let last = match self.statusz_reasons(&http).await {
-                Ok(reasons) if reasons.iter().all(|reason| reason == "syncing") => return Ok(()),
-                Ok(reasons) => format!("reasons {reasons:?}"),
+            let last = match self.statusz(&http).await {
+                Ok(Statusz { state: State::Syncing | State::Serving, .. }) => return Ok(()),
+                Ok(Statusz { state, detail }) => format!("state {state:?}, detail {detail:?}"),
                 Err(error) => error,
             };
             if tokio::time::Instant::now() >= deadline {
@@ -1032,18 +1033,32 @@ impl ServerMeter for ZainoIndexer {
     }
 }
 
+/// zainod `/statusz`, the part readiness reads (zaino-prod's load-balancer contract)
+#[derive(Debug, serde::Deserialize)]
+struct Statusz {
+    state: State,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum State {
+    Provisioning,
+    Syncing,
+    Serving,
+    Degraded,
+    Draining,
+    Held,
+    Down,
+}
+
 impl ZainoIndexer {
-    /// `/statusz` `reasons` off the admin port (before boot: `starting`)
-    async fn statusz_reasons(&self, http: &reqwest::Client) -> Result<Vec<String>, String> {
-        #[derive(serde::Deserialize)]
-        struct Statusz {
-            reasons: Vec<String>,
-        }
+    /// `/statusz` off the admin port (an unknown `state` = an `Err` naming it: contract drift)
+    async fn statusz(&self, http: &reqwest::Client) -> Result<Statusz, String> {
         let ep = self.plumbing.endpoint_for(crate::ports::ZAINO_METRICS).await;
         let url = format!("{}/statusz", ep.map_err(|e| e.to_string())?.url("http"));
         let answer = http.get(url).send().await.map_err(|e| e.to_string())?;
-        let status = answer.json::<Statusz>().await.map_err(|e| e.to_string())?;
-        Ok(status.reasons)
+        answer.json::<Statusz>().await.map_err(|e| format!("/statusz: {e}"))
     }
 
     async fn exporter(&self) -> Result<Exposition, RpcError> {
@@ -1261,6 +1276,34 @@ mod tests {
     use super::*;
     use crate::component::{IndexerMode, RestoreSource};
     use crate::regtest::{Regtest, Restore};
+
+    /// zainod's live `/statusz` (fields readiness ignores included) → its `state`; every state
+    /// zainod names decodes; an unknown one + the old `reasons` shape = an error naming the field
+    #[test]
+    fn statusz_decodes_zainods_state_and_refuses_contract_drift() {
+        let live = r#"{"version":"0.10.1","network":"mainnet","uptime_s":538,"ready":false,
+            "state":"syncing","progress":{"done":947433,"total":3515742,"unit":"block"},
+            "detail":null,"notes":[],"load":{"limit":256,"in_flight":0}}"#;
+        let decoded: Statusz = serde_json::from_str(live).expect("zainod's live /statusz");
+        assert_eq!((decoded.state, decoded.detail), (State::Syncing, None));
+
+        #[rustfmt::skip]
+        let states = [
+            ("provisioning", State::Provisioning), ("syncing", State::Syncing),
+            ("serving", State::Serving), ("degraded", State::Degraded),
+            ("draining", State::Draining), ("held", State::Held), ("down", State::Down),
+        ];
+        for (label, state) in states {
+            let json = format!(r#"{{"state":"{label}","detail":"why"}}"#);
+            let decoded: Statusz = serde_json::from_str(&json).expect(label);
+            assert_eq!((decoded.state, decoded.detail.as_deref()), (state, Some("why")));
+        }
+
+        let unknown = serde_json::from_str::<Statusz>(r#"{"state":"ready","detail":null}"#);
+        assert!(unknown.is_err_and(|e| e.to_string().contains("ready")), "unknown state");
+        let old = serde_json::from_str::<Statusz>(r#"{"reasons":["syncing"]}"#);
+        assert!(old.is_err_and(|e| e.to_string().contains("state")), "the old shape");
+    }
 
     fn snapshot(network: crate::Network) -> crate::ChainSnapshot {
         crate::ChainSnapshot {

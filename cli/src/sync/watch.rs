@@ -837,8 +837,13 @@ mod tests {
         let v = state.vitals.as_ref().expect("vitals");
         assert_eq!(
             (v.height, v.received_at, v.span),
-            (510, Duration::from_secs(2), Duration::from_secs(61))
+            (510, Duration::from_secs(2), Some(Duration::from_secs(61)))
         );
+
+        let unspanned = ReportView { height: Some((520, 1_000)), ..ReportView::default() };
+        fold_live(&mut state, Ok(unspanned), Duration::from_secs(3));
+        let v = state.vitals.as_ref().expect("vitals");
+        assert_eq!((v.height, v.span), (520, None), "driver start unread: no span, never 0");
     }
 
     #[test]

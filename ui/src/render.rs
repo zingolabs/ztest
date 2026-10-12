@@ -499,9 +499,11 @@ fn stale(v: &SyncVitals, elapsed: Duration) -> bool {
     elapsed.saturating_sub(v.received_at) > STALE_AFTER
 }
 
-/// Segment span as of this frame: last read's span + local time since (ticks between reads)
-fn uptime(v: &SyncVitals, elapsed: Duration) -> Duration {
-    v.span + elapsed.saturating_sub(v.received_at)
+/// Segment span as of this frame: last read's span + local time since (ticks between reads); `—`
+/// until the driver's segment start is read
+fn uptime(v: &SyncVitals, elapsed: Duration) -> String {
+    let span = v.span.map(|span| span + elapsed.saturating_sub(v.received_at));
+    span.map_or_else(|| "—".to_owned(), format_elapsed)
 }
 
 /// Measured → the `{key}` cell; unmeasured or stale → `{na}` = `—` (one statement: not known now)
@@ -548,7 +550,7 @@ fn render_scan_trend(out: &mut String, v: &SyncVitals, elapsed: Duration, theme:
     let trend = Fields::new()
         .text("label", label("blocks"))
         .bands("blocks", super::report::bands(blocks))
-        .text("span", format_elapsed(uptime(v, elapsed)))
+        .text("span", uptime(v, elapsed))
         .maybe_value("peak", blocks.peak());
     draw(out, trend, metric_row::TREND, Duration::ZERO, theme);
 }
@@ -590,9 +592,7 @@ pub fn render_sync_work(state: &SyncWatchState, elapsed: Duration, theme: &Theme
     let fresh = |r: Option<f64>| r.filter(|_| !stale);
 
     // Carries the span (else ten minutes and two days of history look alike)
-    let f = Fields::new()
-        .text("label", side_label("total"))
-        .text("span", format_elapsed(uptime(vitals, elapsed)));
+    let f = Fields::new().text("label", side_label("total")).text("span", uptime(vitals, elapsed));
     draw(
         &mut out,
         rate(f, "rate", "rate_na", fresh(vitals.work_rate())),
@@ -898,7 +898,7 @@ mod tests {
                 .zip([900.0, 19_400.0, 4_200.0, 0.0])
                 .map(|(c, r)| per_minute(c.name(), Some(*c), &[r, r]))
                 .collect(),
-            span: Duration::from_secs(3 * 3600),
+            span: Some(Duration::from_secs(3 * 3600)),
             received_at: Duration::from_secs(210),
         }
     }
