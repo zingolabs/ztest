@@ -101,7 +101,7 @@ pub struct ServeCaps {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZainoIndex {
     CompactBlock,
-    ValueBalance,
+    UtxoSet,
     BlockHash,
     TreeState,
     TransparentAddress,
@@ -110,7 +110,7 @@ pub enum ZainoIndex {
 impl ZainoIndex {
     pub const ALL: [ZainoIndex; 5] = [
         ZainoIndex::CompactBlock,
-        ZainoIndex::ValueBalance,
+        ZainoIndex::UtxoSet,
         ZainoIndex::BlockHash,
         ZainoIndex::TreeState,
         ZainoIndex::TransparentAddress,
@@ -120,17 +120,17 @@ impl ZainoIndex {
     pub const fn label(self) -> &'static str {
         match self {
             ZainoIndex::CompactBlock => "compact_block",
-            ZainoIndex::ValueBalance => "value_balance",
+            ZainoIndex::UtxoSet => "utxo_set",
             ZainoIndex::BlockHash => "block_hash",
             ZainoIndex::TreeState => "tree_state",
             ZainoIndex::TransparentAddress => "transparent_address",
         }
     }
 
-    /// `[index.<table>]` owning this store (`None` = value_balance, rides `compact_block`)
+    /// `[index.<table>]` owning this store (`None` = utxo_set, rides `compact_block`)
     const fn table(self) -> Option<&'static str> {
         match self {
-            ZainoIndex::ValueBalance => None,
+            ZainoIndex::UtxoSet => None,
             index => Some(index.label()),
         }
     }
@@ -937,7 +937,7 @@ const ROWS: [Row; 22] = [
     row("fetched", family::FETCH_HEIGHT.level(), Facet::Progress),
     row("best tip", family::BEST_TIP.level(), Facet::Progress),
     row("compact block", family::index_finalized_height(ZainoIndex::CompactBlock).level(), Facet::Progress),
-    row("value balance", family::index_finalized_height(ZainoIndex::ValueBalance).level(), Facet::Progress),
+    row("value balance", family::index_finalized_height(ZainoIndex::UtxoSet).level(), Facet::Progress),
     row("block hash", family::index_finalized_height(ZainoIndex::BlockHash).level(), Facet::Progress),
     row("tree state", family::index_finalized_height(ZainoIndex::TreeState).level(), Facet::Progress),
     row("transparent address", family::index_finalized_height(ZainoIndex::TransparentAddress).level(), Facet::Progress),
@@ -1284,7 +1284,7 @@ mod tests {
             "progress":{"done":947433,"total":3515742,"unit":"block","rate":null},"notes":[],
             "version":"0.11.0-alpha.2","network":"mainnet","tip":{"height":3515406,"hash":"00"},
             "served":3515400,"validators":{"configured":2,"connected":1},
-            "indexes":{"enabled":["value_balance","compact_block"],"total":5},
+            "indexes":{"enabled":["utxo_set","compact_block"],"total":5},
             "egress":{"start":1790000400,"mbps":12.5},"info":null}"#;
         let decoded: Status = serde_json::from_str(full).expect("zainod's /status");
         assert_eq!((decoded.state, decoded.detail), (State::Syncing, None));
