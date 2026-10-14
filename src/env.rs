@@ -756,7 +756,7 @@ impl TestEnv {
     }
 
     /// Indexer counterpart of [`Self::wait_validators_rpc_ready`]: every indexer's backend `ready`
-    /// (zainod: `/statusz`; lightwalletd: `GetLightdInfo`), or `ready_timeout` elapses
+    /// (zainod: `/status`; lightwalletd: `GetLightdInfo`), or `ready_timeout` elapses
     async fn wait_indexers_rpc_ready(&self) -> Result<(), EnvError> {
         let indexers: Vec<(String, Arc<dyn IndexerBackend>)> = {
             let comps = self.inner.components.read().await;
