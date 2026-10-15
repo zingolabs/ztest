@@ -93,7 +93,7 @@ struct LsmStore {
 pub struct ServeCaps {
     pub max_connections: NonZeroU32,
     pub max_connections_per_ip: NonZeroU32,
-    pub max_streams: NonZeroU32,
+    pub max_work_streams: NonZeroU32,
     pub max_subscriptions: NonZeroU32,
 }
 
@@ -362,11 +362,11 @@ fn zainod_conf(
     }
     if let Some(caps) = caps {
         out.push_str(&format!(
-            "\n[grpc]\nmax_connections = {}\nmax_connections_per_ip = {}\nmax_streams = {}\n\
+            "\n[grpc]\nmax_connections = {}\nmax_connections_per_ip = {}\nmax_work_streams = {}\n\
              max_subscriptions = {}\n",
             caps.max_connections,
             caps.max_connections_per_ip,
-            caps.max_streams,
+            caps.max_work_streams,
             caps.max_subscriptions
         ));
     }
