@@ -724,7 +724,13 @@ impl<T> PhaseRun<'_, T> {
                     let at = Instant::now();
                     let final_snap = Arc::new(builder.build(p.as_ref(), at, work, events));
                     head = Some(Mark::new(final_snap.height(), work, at));
-                    match self.eval_at_completion(&final_snap, &mut violations).await {
+                    // `sometimes` too (`is_complete` reads after `snap`: a fast finish lands
+                    // between two ticks)
+                    let completion = match self.eval_sometimes(&final_snap).await {
+                        Ok(()) => self.eval_at_completion(&final_snap, &mut violations).await,
+                        Err(msg) => Err(msg),
+                    };
+                    match completion {
                         Ok(any_fatal) => fatal |= any_fatal,
                         Err(msg) => error = Some(msg),
                     }
@@ -868,28 +874,32 @@ impl<T> PhaseRun<'_, T> {
         Ok(fatal)
     }
 
-    /// Every due `always`/`eventually` probe + every `sometimes` coverage probe against `snap`
+    /// Every not-yet-satisfied `sometimes` probe against `snap`, latched on `Satisfied`
+    async fn eval_sometimes(&mut self, snap: &Snapshot) -> Result<(), String> {
+        let unlatched = self.phase.probes.iter_mut();
+        for spec in unlatched.filter(|s| s.class == Class::Sometimes && !s.ever_satisfied) {
+            match spec.judge(snap, &self.s.topology).await {
+                Verdict::Satisfied => spec.ever_satisfied = true,
+                Verdict::ProbeError(e) => return Err(format!("{}: {e}", spec.name)),
+                Verdict::Pending | Verdict::Violated(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Every `sometimes` coverage probe + every due `always`/`eventually` probe against `snap`
     async fn eval_tick(
         &mut self,
         snap: &Snapshot,
         now: Instant,
         violations: &mut Vec<Violation>,
     ) -> Flow {
+        if let Err(msg) = self.eval_sometimes(snap).await {
+            return Flow::Abort(msg);
+        }
         for spec in self.phase.probes.iter_mut() {
             match spec.class {
-                Class::AtCompletion => continue,
-                Class::Sometimes => {
-                    // Cheap coverage predicate → evaluate every tick, latch
-                    if !spec.ever_satisfied {
-                        match spec.judge(snap, &self.s.topology).await {
-                            Verdict::Satisfied => spec.ever_satisfied = true,
-                            Verdict::ProbeError(e) => {
-                                return Flow::Abort(format!("{}: {e}", spec.name));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                Class::AtCompletion | Class::Sometimes => continue,
                 Class::Always => {
                     if !spec.due(snap.height(), now) {
                         continue;
@@ -1163,6 +1173,8 @@ mod tests {
         script: Vec<FakeProgress>,
         cursor: AtomicUsize,
         never_complete: bool,
+        // Readings after which `is_complete` holds (default = the whole script)
+        complete_after: Option<usize>,
         stopped: Arc<AtomicUsize>,
         // `(family, n)` = exporter publishes `family` from its n-th scrape on
         published: Option<(Family, usize)>,
@@ -1179,6 +1191,7 @@ mod tests {
                 script,
                 cursor: AtomicUsize::new(0),
                 never_complete: false,
+                complete_after: None,
                 stopped: Arc::new(AtomicUsize::new(0)),
                 published: None,
                 gated: false,
@@ -1190,6 +1203,10 @@ mod tests {
         }
         fn never_complete(mut self) -> Self {
             self.never_complete = true;
+            self
+        }
+        fn complete_after(mut self, readings: usize) -> Self {
+            self.complete_after = Some(readings);
             self
         }
         fn gated_on(mut self, family: Family, from_scrape: usize) -> Self {
@@ -1221,7 +1238,8 @@ mod tests {
             Ok(Box::new(self.script[idx].clone()))
         }
         async fn is_complete(&self) -> bool {
-            !self.never_complete && self.cursor.load(Ordering::SeqCst) >= self.script.len()
+            let after = self.complete_after.unwrap_or(self.script.len());
+            !self.never_complete && self.cursor.load(Ordering::SeqCst) >= after
         }
         async fn failure(&self) -> Option<String> {
             self.failure.clone()
@@ -1449,6 +1467,18 @@ mod tests {
         let out = run.run().await;
         assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
         assert!(out.coverage_gaps.is_empty());
+    }
+
+    /// Complete right after a tick whose snapshot predates the crossing (fast finish between two
+    /// ticks): `sometimes` judged on the final snapshot too, so no false gap
+    #[tokio::test(start_paused = true)]
+    async fn sometimes_reached_only_in_the_final_snapshot_passes() {
+        let subject = FakeSubject::new(vec![p(1, 3), p(3, 3)]).complete_after(1);
+        let mut run = fast_runner(subject);
+        run.sometimes("past_2").check(async |s, _| Ok(s.height() > 2));
+        let out = run.run().await;
+        assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
+        assert!(out.coverage_gaps.is_empty(), "{out:?}");
     }
 
     /// `?` on any error = harness broke (Errored, context chain kept); only `sync_fail!` /

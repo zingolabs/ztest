@@ -779,7 +779,7 @@ impl IndexerBackend for ZainoIndexer {
         self.get_block_range_with_pools(start, end, Vec::new()).await
     }
 
-    /// `/status` `state` = `syncing` | `serving`: booted, header chain verified, a trusted tip held
+    /// `/readyz` `state` = `syncing` | `serving`: booted, header chain verified, a trusted tip held
     ///
     /// - `syncing` allowed (bulk sync = hours before every index serves; progress = metrics)
     /// - `degraded` refused (tip held by peers alone: no trusted validator answering)
@@ -787,13 +787,13 @@ impl IndexerBackend for ZainoIndexer {
         let deadline = tokio::time::Instant::now() + timeout;
         let http = reqwest::Client::new();
         loop {
-            let last = match self.status(&http).await {
-                Ok(Status { state: State::Syncing | State::Serving, .. }) => return Ok(()),
-                Ok(Status { state, detail }) => format!("state {state:?}, detail {detail:?}"),
+            let last = match self.readyz(&http).await {
+                Ok(Readyz { state: State::Syncing | State::Serving, .. }) => return Ok(()),
+                Ok(Readyz { state, detail }) => format!("state {state:?}, detail {detail:?}"),
                 Err(error) => error,
             };
             if tokio::time::Instant::now() >= deadline {
-                let detail = format!("indexer /status never ready: {last}");
+                let detail = format!("indexer /readyz never ready: {last}");
                 return Err(RpcError::timeout(COMPONENT, "ready", timeout, detail));
             }
             tokio::time::sleep(READY_POLL_INTERVAL).await;
@@ -1033,9 +1033,9 @@ impl ServerMeter for ZainoIndexer {
     }
 }
 
-/// zainod public `/status`, the part readiness reads
+/// zainod admin `/readyz` (zaino-prod's load-balancer contract)
 #[derive(Debug, serde::Deserialize)]
-struct Status {
+struct Readyz {
     state: State,
     detail: Option<String>,
 }
@@ -1052,12 +1052,15 @@ enum State {
 }
 
 impl ZainoIndexer {
-    /// `/status` off the gRPC port (an unknown `state` = an `Err` naming it: contract drift)
-    async fn status(&self, http: &reqwest::Client) -> Result<Status, String> {
-        let ep = self.plumbing.endpoint("grpc").await;
-        let url = format!("{}/status", ep.map_err(|e| e.to_string())?.url("http"));
+    /// `/readyz` off the admin port (same port as `/metrics`)
+    ///
+    /// - body read on `503` too (`syncing` = 503, still ready for a test)
+    /// - unknown `state` = an `Err` naming it (contract drift)
+    async fn readyz(&self, http: &reqwest::Client) -> Result<Readyz, String> {
+        let ep = self.plumbing.endpoint_for(crate::ports::ZAINO_METRICS).await;
+        let url = format!("{}/readyz", ep.map_err(|e| e.to_string())?.url("http"));
         let answer = http.get(url).send().await.map_err(|e| e.to_string())?;
-        answer.json::<Status>().await.map_err(|e| format!("/status: {e}"))
+        answer.json::<Readyz>().await.map_err(|e| format!("/readyz: {e}"))
     }
 
     async fn exporter(&self) -> Result<Exposition, RpcError> {
@@ -1276,17 +1279,12 @@ mod tests {
     use crate::component::{IndexerMode, RestoreSource};
     use crate::regtest::{Regtest, Restore};
 
-    /// zainod's full `/status` (fields readiness ignores included) → its `state`; every state
-    /// zainod names decodes; an unknown one + the old `reasons` shape = an error naming the field
+    /// - zainod's live `/readyz` → its `state`
+    /// - every state zainod names decodes; an unknown one + the old `reasons` shape = an error
     #[test]
-    fn status_decodes_zainods_state_and_refuses_contract_drift() {
-        let full = r#"{"state":"syncing","detail":null,
-            "progress":{"done":947433,"total":3515742,"unit":"block","rate":null},"notes":[],
-            "version":"0.11.0-alpha.2","network":"mainnet","tip":{"height":3515406,"hash":"00"},
-            "served":3515400,"validators":{"configured":2,"connected":1},
-            "indexes":{"enabled":["utxo_set","compact_block"],"total":5},
-            "egress":{"start":1790000400,"mbps":12.5},"info":null}"#;
-        let decoded: Status = serde_json::from_str(full).expect("zainod's /status");
+    fn readyz_decodes_zainods_state_and_refuses_contract_drift() {
+        let live = r#"{"detail":null,"state":"syncing"}"#;
+        let decoded: Readyz = serde_json::from_str(live).expect("zainod's live /readyz");
         assert_eq!((decoded.state, decoded.detail), (State::Syncing, None));
 
         #[rustfmt::skip]
@@ -1297,13 +1295,13 @@ mod tests {
         ];
         for (label, state) in states {
             let json = format!(r#"{{"state":"{label}","detail":"why"}}"#);
-            let decoded: Status = serde_json::from_str(&json).expect(label);
+            let decoded: Readyz = serde_json::from_str(&json).expect(label);
             assert_eq!((decoded.state, decoded.detail.as_deref()), (state, Some("why")));
         }
 
-        let unknown = serde_json::from_str::<Status>(r#"{"state":"draining","detail":null}"#);
+        let unknown = serde_json::from_str::<Readyz>(r#"{"state":"draining","detail":null}"#);
         assert!(unknown.is_err_and(|e| e.to_string().contains("draining")), "unknown state");
-        let old = serde_json::from_str::<Status>(r#"{"reasons":["syncing"]}"#);
+        let old = serde_json::from_str::<Readyz>(r#"{"reasons":["syncing"]}"#);
         assert!(old.is_err_and(|e| e.to_string().contains("state")), "the old shape");
     }
 
