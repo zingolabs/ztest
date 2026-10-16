@@ -279,10 +279,10 @@ impl LiveSampler {
     /// Slot taken per read, restored only on success (a dropped tunnel = re-resolve)
     async fn read(&mut self) -> LiveRead {
         let driver = match self.driver.take() {
-            Some(driver) => driver,
+            Some(driver) => Some(driver),
             None => {
                 let pod = driver_pod_for(&self.id);
-                forward(&self.client, SYNC_NAMESPACE, &pod, SYNC_DRIVER_METRICS).await?
+                forward(&self.client, SYNC_NAMESPACE, &pod, SYNC_DRIVER_METRICS).await.ok()
             }
         };
         let mut sut = match self.sut.take() {
@@ -296,18 +296,14 @@ impl LiveSampler {
 
         // Concurrent: three independent tunnels, and serialising them spends one target's
         // timeout out of the next one's beat (`LIVE_INTERVAL` is the whole budget)
-        let (driver_read, sut_read, (tip, validator)) = tokio::join!(
-            scrape_local(&self.http, &driver),
+        let ((origin, driver), sut_read, (tip, validator)) = tokio::join!(
+            segment_origin(&self.http, driver),
             scrape_local(&self.http, &sut.forwarder),
             network_tip(&self.http, validator),
         );
-        self.validator = validator;
+        (self.driver, self.validator) = (driver, validator);
 
-        // Each slot restored only on its own success — a scrape that failed means a tunnel to
-        // re-resolve next tick (pods get replaced mid-run)
-        let origin = driver_read.map_err(|e| format!("driver /metrics: {e}"))?;
-        self.driver = Some(driver);
-        let origin = origin.level(driver_family::STARTED);
+        // SUT slot restored only on success (failed scrape = tunnel to re-resolve next tick)
         let exposition = sut_read.map_err(|e| format!("indexer /metrics: {e}"))?;
         let sampled = SystemTime::now();
         sut.live.push(Instant::now(), sampled, exposition);
@@ -321,6 +317,20 @@ impl Sample for LiveSampler {
     type Out = LiveRead;
     fn sample(&mut self) -> Pin<Box<dyn Future<Output = LiveRead> + Send + '_>> {
         Box::pin(self.read())
+    }
+}
+
+/// Driver's segment start (unix secs), `None` until its exporter answers
+///
+/// - Best-effort like [`network_tip`]: a missing span never hides the SUT's rows
+async fn segment_origin(
+    http: &reqwest::Client,
+    driver: Option<Forwarder>,
+) -> (Option<f64>, Option<Forwarder>) {
+    let Some(driver) = driver else { return (None, None) };
+    match scrape_local(http, &driver).await {
+        Ok(exposition) => (exposition.level(driver_family::STARTED), Some(driver)),
+        Err(_) => (None, None),
     }
 }
 
@@ -827,8 +837,13 @@ mod tests {
         let v = state.vitals.as_ref().expect("vitals");
         assert_eq!(
             (v.height, v.received_at, v.span),
-            (510, Duration::from_secs(2), Duration::from_secs(61))
+            (510, Duration::from_secs(2), Some(Duration::from_secs(61)))
         );
+
+        let unspanned = ReportView { height: Some((520, 1_000)), ..ReportView::default() };
+        fold_live(&mut state, Ok(unspanned), Duration::from_secs(3));
+        let v = state.vitals.as_ref().expect("vitals");
+        assert_eq!((v.height, v.span), (520, None), "driver start unread: no span, never 0");
     }
 
     #[test]

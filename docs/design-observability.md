@@ -25,12 +25,11 @@ declared in `src/handles/mod.rs`:
 | Binary | Build                   | Config key                | Port | Signals                                                                                                                                   |
 | ------ | ----------------------- | ------------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | zebrad | `--features prometheus` | `[metrics] endpoint_addr` | 9999 | chain tip, verification, peers                                                                                                            |
-| zaino  | `--features prometheus` | `metrics_endpoint`        | 9998 | gRPC rate/latency/errors by method, outbound JSON-RPC to the validator, sync lag, block build/write histograms, reorg count/depth, DB tip |
+| zaino  | always on (no feature)  | `[metrics] listen_address` | 9998 | gRPC rate/latency/errors by method, outbound JSON-RPC to the validator, fetch frontier vs best tip, per-index durable height + synced, LSM segments/merges/stalls, reorg count |
 
 - Zaino's by-method gRPC histograms + outbound-JSON-RPC panel show whether zaino or zebrad is the
   bottleneck directly, no inference
-- No LMDB monitoring: zaino's store is a memory-mapped C library with no metrics surface. Monitor zaino,
-  whose application-level DB tip and write timing beat raw page counts
+- Zaino's store = its own LSM (`zaino_lsm_*`, by `set`); no external DB to monitor
 
 ### Discovery: no operator, no per-run object
 

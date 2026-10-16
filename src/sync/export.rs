@@ -29,7 +29,7 @@ fn unix_seconds(at: SystemTime) -> f64 {
     at.duration_since(std::time::UNIX_EPOCH).expect("wall clock after the epoch").as_secs_f64()
 }
 
-pub(super) fn install() -> Result<(), metrics_exporter_prometheus::BuildError> {
+pub(crate) fn install() -> Result<(), metrics_exporter_prometheus::BuildError> {
     let ip: std::net::IpAddr =
         crate::ports::LISTEN_ALL.parse().expect("LISTEN_ALL is an IP literal");
     metrics_exporter_prometheus::PrometheusBuilder::new()

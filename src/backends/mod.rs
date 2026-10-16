@@ -123,7 +123,10 @@ mod tests {
     /// `default_coinbase_pool`, so an unset builder must leave it `None`
     #[test]
     fn coinbase_defaults_to_transparent_on_every_backend() {
-        assert_eq!(super::zebra::ZebraBackend.default_coinbase_pool(), Pool::Transparent);
+        assert_eq!(
+            super::zebra::ZebraBackend::default().default_coinbase_pool(),
+            Pool::Transparent
+        );
         assert_eq!(super::zcashd::ZcashdBackend.default_coinbase_pool(), Pool::Transparent);
 
         assert_eq!(Validator::zebrad("6.2.3").regtest().opts.coinbase_pool, None);

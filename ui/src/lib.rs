@@ -298,6 +298,7 @@ pub struct SyncWatchState {
 /// Live sync vitals, all off one [`ReportView`] → no row describes another instant.
 ///
 /// - `None` rate = unmeasured → `—`, never `0`
+/// - `None` span = driver's segment start unread (no phase ticked yet) → `—`, never `0`
 /// - `pools` one series per [`Channel`](ztest::api::Channel), oldest pool first
 /// - `received_at` session-elapsed → stale rates blank by subtraction
 #[derive(Debug, Clone)]
@@ -308,7 +309,7 @@ pub struct SyncVitals {
     pub tx_rate: Option<f64>,
     pub blocks: Option<ztest::api::Series>,
     pub pools: Vec<ztest::api::Series>,
-    pub span: std::time::Duration,
+    pub span: Option<std::time::Duration>,
     pub received_at: std::time::Duration,
 }
 
@@ -335,7 +336,7 @@ impl SyncVitals {
             tx_rate: view.throughput.first().and_then(ztest::api::Series::last),
             blocks,
             pools: report::fold_pools(&pools),
-            span: view.elapsed().unwrap_or_default(),
+            span: view.elapsed(),
             received_at,
         })
     }

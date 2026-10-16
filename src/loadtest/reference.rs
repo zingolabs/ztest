@@ -152,7 +152,8 @@ struct PoolTree {
     commitments: Commitments,
 }
 
-/// `finalState` absent = empty tree (zebra's pre-activation spelling)
+/// `finalState` absent = pool below its upgrade → `""` (lightwalletd copies it verbatim)
+/// - empty tree from the upgrade on = zebra's own `000000`
 #[derive(Debug, Default, Deserialize)]
 struct Commitments {
     #[serde(rename = "finalState", default)]
@@ -491,10 +492,7 @@ fn compact_tx(index: u64, tx: &Tx, fee: u32) -> Result<CompactTx, ReferenceError
 }
 
 fn tree(pool: PoolTree) -> String {
-    match pool.commitments.final_state {
-        empty if empty.is_empty() => "000000".to_owned(),
-        state => state,
-    }
+    pool.commitments.final_state
 }
 
 fn size(size: u64) -> Result<u32, ReferenceError> {
