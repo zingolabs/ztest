@@ -421,11 +421,20 @@ impl Zebra {
 }
 
 /// Default `poolTypes` (empty = every shielded pool, no transparent)
+///
+/// - tx left with no shielded component dropped (lightwalletd `filterBlockPool`: a
+///   transparent-only coinbase is absent, not empty)
 pub fn shielded(mut block: CompactBlock) -> CompactBlock {
     for tx in &mut block.vtx {
         tx.vin.clear();
         tx.vout.clear();
     }
+    block.vtx.retain(|tx| {
+        !(tx.spends.is_empty()
+            && tx.outputs.is_empty()
+            && tx.actions.is_empty()
+            && tx.ironwood_actions.is_empty())
+    });
     block
 }
 
@@ -576,4 +585,29 @@ pub fn tree_state_diff(expected: &TreeState, served: &TreeState) -> Option<Strin
         .into_iter()
         .find(|(_, a, b)| a != b)
         .map(|(field, a, b)| format!("{field}: expected {a}, served {b}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Transparent-only coinbase gone; a shielded tx kept, its transparent half stripped
+    #[test]
+    fn shielded_drops_transactions_left_with_no_shielded_component() {
+        let coinbase = CompactTx {
+            index: 0,
+            vout: vec![TxOut { value: 625_000_000, script_pub_key: vec![0x76] }],
+            ..Default::default()
+        };
+        let mixed = CompactTx {
+            index: 1,
+            vin: vec![CompactTxIn { prevout_txid: vec![7; 32], prevout_index: 0 }],
+            outputs: vec![CompactSaplingOutput::default()],
+            ..Default::default()
+        };
+        let block = CompactBlock { vtx: vec![coinbase, mixed.clone()], ..Default::default() };
+
+        let stripped = CompactTx { vin: Vec::new(), ..mixed };
+        assert_eq!(shielded(block).vtx, vec![stripped]);
+    }
 }
