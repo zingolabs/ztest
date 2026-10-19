@@ -245,7 +245,8 @@ impl Zebra {
 
     /// `GetBlock` = every pool; [`shielded`] of it = `GetBlockRange` with empty `poolTypes`
     ///
-    /// - [`Fees::AsServed`] with a tx the served block lacks → `0` (the `vtx` diff names it)
+    /// - [`Fees::AsServed`] matched on `CompactTx.index`, not `vtx` position (a pool selection
+    ///   drops txs, shifting positions); a tx the served block lacks → `0` (the `vtx` diff names it)
     pub async fn compact_block(
         &self,
         height: u32,
@@ -258,7 +259,10 @@ impl Zebra {
         let mut vtx = Vec::with_capacity(block.tx.len());
         for (index, tx) in block.tx.iter().enumerate() {
             let fee = match fees {
-                Fees::AsServed(served) => served.vtx.get(index).map_or(0, |tx| tx.fee),
+                Fees::AsServed(served) => {
+                    let at = index as u64;
+                    served.vtx.iter().find(|served| served.index == at).map_or(0, |tx| tx.fee)
+                }
                 Fees::Checked => self.fee(tx).await?,
             };
             vtx.push(compact_tx(index as u64, tx, fee)?);
