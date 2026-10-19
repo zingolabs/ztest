@@ -186,10 +186,6 @@ async fn drive<T>(env: TestEnv, mut engine: SyncEngine<T>) -> SyncOutcome {
     let sync_id = super::active_sync_id().expect("sync tests run only as a ztest sync driver");
     let profile = std::env::var(super::SYNC_PROFILE_ENV).expect("ztest sync injects the profile");
     let kube = env.kube_client().expect("built TestEnv holds a client");
-    // A Prometheus target, read like any component
-    if let Err(e) = super::export::install() {
-        return SyncOutcome::error_outcome(format!("driver metrics exporter: {e}"));
-    }
     engine = engine.with_reporter(Box::new(super::export::MetricsReporter));
     // `ztest sync stop` (and SIGTERM on node loss) checkpoints, never kills
     engine = engine.with_cancel(super::detached::watch_stop(&kube).await);

@@ -14,7 +14,7 @@ use crate::protocol::client::JsonRpcClient;
 use crate::{EnvError, RpcError};
 
 pub use crate::proto::{
-    CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo, RawTransaction, SendResponse,
+    CompactBlock, CompactTx, Empty, GetAddressUtxosReply, LightdInfo, RawTransaction, SendResponse,
     SubtreeRoot, TreeState,
 };
 pub use crate::protocol::types::{BlockHash, BlockTip};
