@@ -94,7 +94,7 @@ pub use crate::component::{
 pub use crate::env::TestEnv;
 pub use crate::error::{EnvError, PipelineError, RpcError};
 pub use crate::handles::indexer::{
-    BlockHash, BlockHeight, CompactBlock, CompactTx, GetAddressUtxosReply, LightdInfo,
+    BlockHash, BlockHeight, CompactBlock, CompactTx, Empty, GetAddressUtxosReply, LightdInfo,
     RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, TreeState, TxId, ZatBalance,
 };
 pub use crate::handles::validator::{
