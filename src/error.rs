@@ -116,7 +116,7 @@ pub enum RpcError {
     #[error("{component} {op}: unsupported: {detail}")]
     Unsupported { component: &'static str, op: &'static str, detail: String },
 
-    /// Failure inside a ztest helper (`context` = helper + step, so it never reads as the test's own)
+    /// Failure inside a ztest helper, `context` = helper + step (never reads as the test's own)
     #[error("{context}: {source}")]
     Context {
         context: String,

@@ -559,6 +559,7 @@ mod tests {
             (crate::naming::TEST_NAMESPACE_ENV, "ztest-b-t-0a1b2c3d"),
             (crate::cluster_config::STORAGE_CLASS_ENV, "fast-ssd"),
             (crate::cluster_config::SNAPSHOT_CLASS_ENV, "csi-snapclass"),
+            ("RUST_LIB_BACKTRACE", "1"),
         ];
         let optional = [
             ("ZTEST_LOG", "ztest::build=debug"),

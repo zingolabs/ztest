@@ -97,7 +97,7 @@ impl EngineEnv {
             // Driver SA may not list cluster-scoped storage/snapshot classes → answer handed down
             (crate::cluster_config::STORAGE_CLASS_ENV, self.storage.0.clone()),
             (crate::cluster_config::SNAPSHOT_CLASS_ENV, self.storage.1.clone()),
-            // anyhow backtrace at the test's `?` = only record of which call failed (panics unaffected)
+            // anyhow backtrace at the test's `?` = failed call's file:line (panics unaffected)
             ("RUST_LIB_BACKTRACE", "1".to_string()),
         ];
         if let Some(filter) = &self.ztest_log {
