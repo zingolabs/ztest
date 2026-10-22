@@ -98,6 +98,17 @@ fn fails_with_an_error_line() {
     panic!("image build failed");
 }
 
+/// Live-test shape: `anyhow::Result` test, std error lifted by `?`
+#[test]
+fn fails_through_a_question_mark() -> anyhow::Result<()> {
+    if !playing() {
+        return Ok(());
+    }
+    println!("question-mark-ran");
+    Err(std::io::Error::other("indexer stalled"))?;
+    Ok(())
+}
+
 #[test]
 fn sleeps_past_any_cap() {
     if !playing() {

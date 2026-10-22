@@ -97,6 +97,8 @@ impl EngineEnv {
             // Driver SA may not list cluster-scoped storage/snapshot classes → answer handed down
             (crate::cluster_config::STORAGE_CLASS_ENV, self.storage.0.clone()),
             (crate::cluster_config::SNAPSHOT_CLASS_ENV, self.storage.1.clone()),
+            // anyhow backtrace at the test's `?` = only record of which call failed (panics unaffected)
+            ("RUST_LIB_BACKTRACE", "1".to_string()),
         ];
         if let Some(filter) = &self.ztest_log {
             vars.push(("ZTEST_LOG", filter.clone()));
@@ -361,6 +363,19 @@ mod tests {
         let shown = crate::libtest::strip_libtest_frame(&out.output, &name);
         let shown = String::from_utf8_lossy(&shown).to_string();
         assert!(shown.contains("Error: image build failed"), "{shown:?}");
+    }
+
+    /// `Err` via `?` carries no location → the backtrace frame = only pointer to the failed call
+    #[tokio::test]
+    async fn result_err_shown_with_a_backtrace_into_the_test_file() {
+        let name = child::test_name("fails_through_a_question_mark");
+        let out = play("fails_through_a_question_mark", &env()).await;
+        let shown = crate::libtest::strip_libtest_frame(&out.output, &name);
+        let shown = String::from_utf8_lossy(&shown).to_string();
+        assert!(matches!(out.verdict, Verdict::Fail(_)), "{:?}: {shown}", out.verdict);
+        assert!(shown.contains("question-mark-ran"), "{shown}");
+        assert!(shown.contains("Error: indexer stalled\n\nStack backtrace:"), "{shown}");
+        assert!(shown.contains("src/engine/fixture_child.rs:"), "{shown}");
     }
 
     #[tokio::test]
