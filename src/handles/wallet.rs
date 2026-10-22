@@ -173,17 +173,21 @@ pub trait WalletBackend: Send + Sync + std::fmt::Debug + Clone + 'static {
 // ──────────────────────────────── account ─────────────────────────────
 
 /// Owned handle to one in-process wallet account. Cheap to clone (dispatches to the
-/// wallet handle it carries)
+/// wallet handle it carries). `role` (`faucet`/`recipient`/…) prefixes every error
 #[derive(Debug, Clone)]
 pub struct Account<W: WalletBackend> {
     wallet: W,
     id: AccountId,
-    label: &'static str,
+    role: &'static str,
 }
 
 impl<W: WalletBackend> Account<W> {
-    pub fn new(wallet: W, id: AccountId, label: &'static str) -> Self {
-        Self { wallet, id, label }
+    pub fn new(wallet: W, id: AccountId, role: &'static str) -> Self {
+        Self { wallet, id, role }
+    }
+
+    fn failed(&self, op: &'static str) -> impl FnOnce(BoxError) -> RpcError + '_ {
+        move |e| RpcError::backend_boxed(self.wallet.label(), op, e).context(self.role)
     }
 
     pub fn id(&self) -> AccountId {
@@ -196,21 +200,15 @@ impl<W: WalletBackend> Account<W> {
     }
 
     pub async fn address(&self, pool: Pool) -> Result<String, RpcError> {
-        self.wallet
-            .address(self.id, pool)
-            .await
-            .map_err(|e| RpcError::backend_boxed(self.label, "address", e))
+        self.wallet.address(self.id, pool).await.map_err(self.failed("address"))
     }
 
     pub async fn balances(&self) -> Result<PoolBalances, RpcError> {
-        self.wallet
-            .balances(self.id)
-            .await
-            .map_err(|e| RpcError::backend_boxed(self.label, "balances", e))
+        self.wallet.balances(self.id).await.map_err(self.failed("balances"))
     }
 
     pub async fn sync(&self) -> Result<(), RpcError> {
-        self.wallet.sync(self.id).await.map_err(|e| RpcError::backend_boxed(self.label, "sync", e))
+        self.wallet.sync(self.id).await.map_err(self.failed("sync"))
     }
 
     /// Send `zats` to `to`, relay bounded by [`DEFAULT_SEND_TIMEOUT`]
@@ -226,10 +224,7 @@ impl<W: WalletBackend> Account<W> {
         zats: u64,
         timeout: Duration,
     ) -> Result<Vec<TxId>, RpcError> {
-        self.wallet
-            .send(self.id, to, zats, &[], timeout)
-            .await
-            .map_err(|e| RpcError::backend_boxed(self.label, "send", e))
+        self.wallet.send(self.id, to, zats, &[], timeout).await.map_err(self.failed("send"))
     }
 
     /// Send `zats` to `to`, spent notes restricted to `from_pools` (empty = any pool);
@@ -251,10 +246,7 @@ impl<W: WalletBackend> Account<W> {
         zats: u64,
         timeout: Duration,
     ) -> Result<Vec<TxId>, RpcError> {
-        self.wallet
-            .send(self.id, to, zats, from_pools, timeout)
-            .await
-            .map_err(|e| RpcError::backend_boxed(self.label, "send", e))
+        self.wallet.send(self.id, to, zats, from_pools, timeout).await.map_err(self.failed("send"))
     }
 
     /// Shield transparent funds into the shielded pool, relay bounded by
@@ -265,10 +257,7 @@ impl<W: WalletBackend> Account<W> {
 
     /// Shield transparent funds, relay bounded by `timeout`
     pub async fn shield_with_timeout(&self, timeout: Duration) -> Result<Vec<TxId>, RpcError> {
-        self.wallet
-            .shield(self.id, timeout)
-            .await
-            .map_err(|e| RpcError::backend_boxed(self.label, "shield", e))
+        self.wallet.shield(self.id, timeout).await.map_err(self.failed("shield"))
     }
 }
 
@@ -316,7 +305,8 @@ pub trait WalletExt: WalletBackend {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        add_account(self, validator, indexer, AccountKey::Mnemonic(mnemonic), birthday).await
+        let key = AccountKey::Mnemonic(mnemonic);
+        add_account(self, validator, indexer, key, birthday, "account").await
     }
 
     /// View-only account from an encoded UFVK; chain + endpoint as [`account`](Self::account)
@@ -331,7 +321,8 @@ pub trait WalletExt: WalletBackend {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        add_account(self, validator, indexer, AccountKey::Ufvk(ufvk), birthday).await
+        add_account(self, validator, indexer, AccountKey::Ufvk(ufvk), birthday, "viewing account")
+            .await
     }
 
     /// Regtest faucet account ([`FAUCET_SEED`]), the address the validator mines to.
@@ -341,7 +332,8 @@ pub trait WalletExt: WalletBackend {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        self.account(validator, indexer, FAUCET_SEED, BlockHeight::from(TEST_WALLET_BIRTHDAY)).await
+        let (key, birthday) = (AccountKey::Mnemonic(FAUCET_SEED), TEST_WALLET_BIRTHDAY.into());
+        add_account(self, validator, indexer, key, birthday, "faucet").await
     }
 
     /// Fresh recipient account from [`RECIPIENT_SEED`]
@@ -350,8 +342,8 @@ pub trait WalletExt: WalletBackend {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        self.account(validator, indexer, RECIPIENT_SEED, BlockHeight::from(TEST_WALLET_BIRTHDAY))
-            .await
+        let (key, birthday) = (AccountKey::Mnemonic(RECIPIENT_SEED), TEST_WALLET_BIRTHDAY.into());
+        add_account(self, validator, indexer, key, birthday, "recipient").await
     }
 
     /// Faucet, synced, holding one spendable shielded note
@@ -381,23 +373,42 @@ pub trait WalletExt: WalletBackend {
         V: ValidatorBackend + ?Sized,
         I: IndexerBackend + ?Sized,
     {
-        let faucet = self.faucet(validator, indexer).await?;
-        match validator.pool_support().coinbase {
-            Pool::Orchard | Pool::Ironwood | Pool::Sapling => {
-                // Orchard/Ironwood coinbase invalid pre-NU5 (no anchor) → warm up first.
-                // Sapling activates at height 1, no warmup
-                if matches!(validator.pool_support().coinbase, Pool::Orchard | Pool::Ironwood) {
-                    warmup_to_nu5(validator).await?;
-                }
-                mine_and_sync(validator, indexer, &faucet, notes, FAUCET_CONFIRM_TIMEOUT, None)
-                    .await?;
-            }
-            Pool::Transparent => {
-                fund_via_shield(validator, indexer, &faucet, notes.max(1)).await?;
-            }
-        }
-        Ok(faucet)
+        let coinbase = validator.pool_support().coinbase;
+        fund_faucet(self, validator, indexer, coinbase, notes).await.map_err(|e| {
+            e.context(format!("funded_faucet(notes = {notes}, {coinbase:?} coinbase)"))
+        })
     }
+}
+
+impl<W: WalletBackend> WalletExt for W {}
+
+async fn fund_faucet<W, V, I>(
+    wallet: &W,
+    validator: &V,
+    indexer: &I,
+    coinbase: Pool,
+    notes: u32,
+) -> Result<Account<W>, RpcError>
+where
+    W: WalletBackend,
+    V: ValidatorBackend + ?Sized,
+    I: IndexerBackend + ?Sized,
+{
+    let faucet = wallet.faucet(validator, indexer).await?;
+    match coinbase {
+        Pool::Orchard | Pool::Ironwood | Pool::Sapling => {
+            // Orchard/Ironwood coinbase invalid pre-NU5 (no anchor) → warm up first.
+            // Sapling activates at height 1, no warmup
+            if matches!(coinbase, Pool::Orchard | Pool::Ironwood) {
+                warmup_to_nu5(validator).await.map_err(|e| e.context("warm-up to NU5"))?;
+            }
+            mine_and_sync(validator, indexer, &faucet, notes, FAUCET_CONFIRM_TIMEOUT, None).await?;
+        }
+        Pool::Transparent => {
+            fund_via_shield(validator, indexer, &faucet, notes.max(1)).await?;
+        }
+    }
+    Ok(faucet)
 }
 
 /// Advance until the next mined block is >= NU5 activation (Orchard coinbase valid).
@@ -416,15 +427,31 @@ where
     Ok(())
 }
 
-impl<W: WalletBackend> WalletExt for W {}
-
 async fn add_account<W, V, I>(
     wallet: &W,
     validator: &V,
     indexer: &I,
     key: AccountKey<'_>,
     birthday: BlockHeight,
+    role: &'static str,
 ) -> Result<Account<W>, RpcError>
+where
+    W: WalletBackend,
+    V: ValidatorBackend + ?Sized,
+    I: IndexerBackend + ?Sized,
+{
+    let id =
+        register(wallet, validator, indexer, key, birthday).await.map_err(|e| e.context(role))?;
+    Ok(Account::new(wallet.clone(), id, role))
+}
+
+async fn register<W, V, I>(
+    wallet: &W,
+    validator: &V,
+    indexer: &I,
+    key: AccountKey<'_>,
+    birthday: BlockHeight,
+) -> Result<AccountId, RpcError>
 where
     W: WalletBackend,
     V: ValidatorBackend + ?Sized,
@@ -433,7 +460,7 @@ where
     let network = validator_network(validator).await?;
     let activation = validator.activation_heights().await?;
     let indexer_uri = indexer.grpc_uri().await?;
-    let id = wallet
+    wallet
         .add_account(AccountSpec {
             key,
             birthday,
@@ -442,8 +469,7 @@ where
             activation: &activation,
         })
         .await
-        .map_err(|e| RpcError::backend_boxed(wallet.label(), "add_account", e))?;
-    Ok(Account::new(wallet.clone(), id, wallet.label()))
+        .map_err(|e| RpcError::backend_boxed(wallet.label(), "add_account", e))
 }
 
 /// - Regtest from env plumbing (zebra reports regtest as `"test"` over RPC)
@@ -484,11 +510,13 @@ where
     if n == 0 {
         return Ok(());
     }
-    let pre = validator.chain_height().await?;
-    validator.generate_blocks_to(n, miner_address).await?;
-    indexer.wait_for_block_num(pre + n, timeout).await?;
-    faucet.sync().await?;
-    Ok(())
+    let step = async {
+        let pre = validator.chain_height().await?;
+        validator.generate_blocks_to(n, miner_address).await?;
+        indexer.wait_for_block_num(pre + n, timeout).await?;
+        faucet.sync().await
+    };
+    step.await.map_err(|e| e.context(format!("mine {n} + sync ({timeout:?} indexer budget)")))
 }
 
 /// Fund `faucet` from a transparent coinbase: mature, then shield into Orchard
@@ -532,4 +560,70 @@ where
     }
     mine_and_sync(validator, indexer, faucet, 1, FAUCET_CONFIRM_TIMEOUT, filler).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    struct LockedWallet;
+
+    fn locked() -> BoxError {
+        Box::new(std::io::Error::other("wallet db locked"))
+    }
+
+    #[async_trait]
+    impl WalletBackend for LockedWallet {
+        fn label(&self) -> &'static str {
+            "lockedwallet"
+        }
+        async fn add_account(&self, _: AccountSpec<'_>) -> Result<AccountId, BoxError> {
+            Err(locked())
+        }
+        async fn address(&self, _: AccountId, _: Pool) -> Result<String, BoxError> {
+            Err(locked())
+        }
+        async fn balances(&self, _: AccountId) -> Result<PoolBalances, BoxError> {
+            Err(locked())
+        }
+        async fn sync(&self, _: AccountId) -> Result<(), BoxError> {
+            Err(locked())
+        }
+        async fn send(
+            &self,
+            _: AccountId,
+            _: &str,
+            _: u64,
+            _: &[Pool],
+            _: Duration,
+        ) -> Result<Vec<TxId>, BoxError> {
+            Err(locked())
+        }
+        async fn shield(&self, _: AccountId, _: Duration) -> Result<Vec<TxId>, BoxError> {
+            Err(locked())
+        }
+    }
+
+    #[tokio::test]
+    async fn account_errors_name_the_role_then_the_backend() {
+        let faucet = Account::new(LockedWallet, AccountId(0), "faucet");
+        let recipient = Account::new(LockedWallet, AccountId(1), "recipient");
+
+        let errors = [
+            faucet.sync().await.map(drop),
+            recipient.sync().await.map(drop),
+            recipient.shield().await.map(drop),
+        ]
+        .map(|r| r.expect_err("LockedWallet fails every op").to_string());
+
+        assert_eq!(
+            errors,
+            [
+                "faucet: lockedwallet sync: wallet db locked",
+                "recipient: lockedwallet sync: wallet db locked",
+                "recipient: lockedwallet shield: wallet db locked",
+            ]
+        );
+    }
 }

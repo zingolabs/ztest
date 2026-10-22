@@ -116,11 +116,23 @@ pub enum RpcError {
     #[error("{component} {op}: unsupported: {detail}")]
     Unsupported { component: &'static str, op: &'static str, detail: String },
 
+    /// Failure inside a ztest helper (`context` = helper + step, so it never reads as the test's own)
+    #[error("{context}: {source}")]
+    Context {
+        context: String,
+        #[source]
+        source: Box<RpcError>,
+    },
+
     #[error(transparent)]
     Env(#[from] EnvError),
 }
 
 impl RpcError {
+    pub(crate) fn context(self, context: impl Into<String>) -> Self {
+        RpcError::Context { context: context.into(), source: Box::new(self) }
+    }
+
     pub fn backend<E>(component: &'static str, op: &'static str, source: E) -> Self
     where
         E: StdError + Send + Sync + 'static,
@@ -134,6 +146,7 @@ impl RpcError {
             RpcError::Backend { source, .. } => {
                 source.downcast_ref::<tonic::Status>().map(tonic::Status::code)
             }
+            RpcError::Context { source, .. } => source.grpc_code(),
             _ => None,
         }
     }
@@ -238,5 +251,28 @@ impl ImageError {
             }
             _ => ImageError::Spawn { cmd, err },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_prefixes_the_cause_and_keeps_its_grpc_code() {
+        let stall =
+            RpcError::backend("zainod", "GetLatestBlock", tonic::Status::unavailable("gate"))
+                .context("mine 1 + sync (30s indexer budget)")
+                .context("funded_faucet(notes = 1, Orchard coinbase)");
+
+        assert_eq!(stall.grpc_code(), Some(tonic::Code::Unavailable));
+        let shown = stall.to_string();
+        assert!(
+            shown.starts_with(
+                "funded_faucet(notes = 1, Orchard coinbase): mine 1 + sync (30s indexer budget): \
+                 zainod GetLatestBlock: "
+            ),
+            "{shown}"
+        );
     }
 }
