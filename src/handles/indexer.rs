@@ -26,6 +26,7 @@ pub use zcash_protocol::consensus::BlockHeight;
 pub use zcash_protocol::value::ZatBalance;
 
 const TIP_POLL: Duration = Duration::from_millis(250);
+const HEIGHT_POLL: Duration = Duration::from_millis(100);
 
 // ─────────────────────────── IndexerConfig ──────────────────────────
 
@@ -155,16 +156,41 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
             }
             if started.elapsed() >= timeout {
                 let (want, hash) = (u32::from(tip.0), tip.1);
-                let seen =
-                    last.map_or("nothing".to_owned(), |(h, x)| format!("{}/{x}", u32::from(h)));
                 return Err(RpcError::timeout(
                     self.label(),
                     "wait_for_tip",
                     started.elapsed(),
-                    format!("want {want}/{hash}, last served {seen}"),
+                    format!("want {want}/{hash}, last served {}", served(last)),
                 ));
             }
             tokio::time::sleep(TIP_POLL).await;
+        }
+    }
+
+    /// Poll until the served tip >= `target`. UNAVAILABLE = gate closed while a reorg replays
+    async fn wait_for_block_num(
+        &self,
+        target: BlockHeight,
+        timeout: Duration,
+    ) -> Result<(), RpcError> {
+        let started = tokio::time::Instant::now();
+        let mut last = None;
+        loop {
+            match self.latest_block().await {
+                Ok((height, _)) if height >= target => return Ok(()),
+                Ok(tip) => last = Some(tip),
+                Err(e) if e.grpc_code() == Some(tonic::Code::Unavailable) => {}
+                Err(e) => return Err(e),
+            }
+            if started.elapsed() >= timeout {
+                return Err(RpcError::timeout(
+                    self.label(),
+                    "wait_for_block_num",
+                    started.elapsed(),
+                    format!("want height {}, last served {}", u32::from(target), served(last)),
+                ));
+            }
+            tokio::time::sleep(HEIGHT_POLL).await;
         }
     }
 
@@ -203,10 +229,9 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
 
     /// Poll until indexed up to `target`, at the backend's default chain-poll timeout
     async fn poll_block_height(&self, target: BlockHeight) -> Result<(), RpcError>;
+}
 
-    async fn wait_for_block_num(
-        &self,
-        target: BlockHeight,
-        timeout: Duration,
-    ) -> Result<(), RpcError>;
+/// Last tip a poll saw, as `height/hash`
+fn served(last: Option<BlockTip>) -> String {
+    last.map_or("nothing".to_owned(), |(height, hash)| format!("{}/{hash}", u32::from(height)))
 }

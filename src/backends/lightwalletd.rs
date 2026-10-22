@@ -26,7 +26,6 @@ use crate::{EnvError, RpcError};
 const COMPONENT: &str = "lightwalletd";
 
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A [`Dev`](crate::inventory::ImageSpec::Dev) override never degrades to the
@@ -526,29 +525,6 @@ impl IndexerBackend for LightwalletdIndexer {
 
     async fn poll_block_height(&self, target: BlockHeight) -> Result<(), RpcError> {
         self.wait_for_block_num(target, CHAIN_POLL_TIMEOUT).await
-    }
-
-    async fn wait_for_block_num(
-        &self,
-        target: BlockHeight,
-        timeout: Duration,
-    ) -> Result<(), RpcError> {
-        let started = tokio::time::Instant::now();
-        let deadline = started + timeout;
-        loop {
-            if self.latest_block_height().await? >= target {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(RpcError::timeout(
-                    COMPONENT,
-                    "wait_for_block_num",
-                    started.elapsed(),
-                    format!("indexer did not index up to height {}", u32::from(target)),
-                ));
-            }
-            tokio::time::sleep(CHAIN_POLL_INTERVAL).await;
-        }
     }
 }
 

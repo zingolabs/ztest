@@ -26,7 +26,6 @@ const COMPONENT: &str = "zcashd";
 pub const RPC_USER: &str = "test";
 pub const RPC_PASSWORD: &str = "test";
 
-const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 const CONTAINER_CONF_PATH: &str = "/etc/zcash/zcash.conf";
@@ -313,29 +312,6 @@ impl ValidatorBackend for ZcashdValidator {
 
     async fn poll_chain_height(&self, target: BlockHeight) -> Result<(), RpcError> {
         self.wait_for_block_num(target, CHAIN_POLL_TIMEOUT).await
-    }
-
-    async fn wait_for_block_num(
-        &self,
-        target: BlockHeight,
-        timeout: Duration,
-    ) -> Result<(), RpcError> {
-        let started = tokio::time::Instant::now();
-        let deadline = started + timeout;
-        loop {
-            if self.chain_height().await? >= target {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(RpcError::timeout(
-                    COMPONENT,
-                    "wait_for_block_num",
-                    started.elapsed(),
-                    format!("chain did not reach height {}", u32::from(target)),
-                ));
-            }
-            tokio::time::sleep(CHAIN_POLL_INTERVAL).await;
-        }
     }
 }
 

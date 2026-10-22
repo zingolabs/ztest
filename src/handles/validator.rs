@@ -79,6 +79,7 @@ pub trait ValidatorConfig: Send + Sync + std::fmt::Debug + 'static {
 
 const REORG_SETTLE: Duration = Duration::from_secs(60);
 const REORG_POLL: Duration = Duration::from_millis(250);
+const HEIGHT_POLL: Duration = Duration::from_millis(100);
 
 /// Outcome of [`ValidatorBackend::reorg`]: `orphaned` ascends from `fork_parent + 1`
 #[derive(Debug, Clone)]
@@ -295,5 +296,23 @@ pub trait ValidatorBackend: Send + Sync + std::fmt::Debug + 'static {
         &self,
         target: BlockHeight,
         timeout: Duration,
-    ) -> Result<(), RpcError>;
+    ) -> Result<(), RpcError> {
+        let started = tokio::time::Instant::now();
+        loop {
+            let height = self.chain_height().await?;
+            if height >= target {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                let (want, seen) = (u32::from(target), u32::from(height));
+                return Err(RpcError::timeout(
+                    self.label(),
+                    "wait_for_block_num",
+                    started.elapsed(),
+                    format!("want height {want}, chain at {seen}"),
+                ));
+            }
+            tokio::time::sleep(HEIGHT_POLL).await;
+        }
+    }
 }
