@@ -341,7 +341,6 @@ mod tests {
 
     fn block(height: u64) -> CompactBlock {
         CompactBlock {
-            proto_version: 1,
             height,
             hash: vec![height as u8; 32],
             prev_hash: vec![height as u8 - 1; 32],
@@ -380,7 +379,6 @@ mod tests {
         let a = block(10);
         for mutate in [
             |b: &mut CompactBlock| b.time += 1,
-            |b: &mut CompactBlock| b.proto_version += 1,
             |b: &mut CompactBlock| b.hash = vec![0xAA; 32],
             |b: &mut CompactBlock| b.header = vec![1, 2, 3],
             |b: &mut CompactBlock| b.chain_metadata = Some(Default::default()),

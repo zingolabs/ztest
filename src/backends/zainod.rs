@@ -989,6 +989,8 @@ async fn connect(endpoint: &Endpoint) -> Result<CompactTxStreamerClient<Channel>
     Ok(CompactTxStreamerClient::new(channel))
 }
 
+// deprecated upstream (lightwallet-protocol v0.4.1), still served by zainod
+#[allow(deprecated)]
 async fn get_block_nullifiers(
     endpoint: &Endpoint,
     height: BlockHeight,
@@ -1004,6 +1006,7 @@ async fn get_block_nullifiers(
         .into_inner())
 }
 
+#[allow(deprecated)]
 async fn get_block_range_nullifiers(
     endpoint: &Endpoint,
     start: BlockHeight,

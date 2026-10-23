@@ -21,24 +21,26 @@ pub struct ChainMetadata {
 /// 1. Detect a spend of your Shielded notes
 /// 1. Update your witnesses to generate new spend proofs.
 /// 1. Spend UTXOs associated to t-addresses of your wallet.
+///
+/// Currently, the `header` field should always be unset (empty). In the future,
+/// the presence or absence of header data may be made dependent on request
+/// parameters, although it is likely that such flexibility will only be provided via
+/// newly-added service methods, not via existing APIs.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompactBlock {
-    /// the version of this wire format, for storage
-    #[prost(uint32, tag = "1")]
-    pub proto_version: u32,
     /// the height of this block
     #[prost(uint64, tag = "2")]
     pub height: u64,
-    /// the ID (hash) of this block, same as in block explorers
+    /// if present, the ID (hash) of this block
     #[prost(bytes = "vec", tag = "3")]
     pub hash: ::prost::alloc::vec::Vec<u8>,
-    /// the ID (hash) of this block's predecessor
+    /// if present, the ID (hash) of this block's predecessor
     #[prost(bytes = "vec", tag = "4")]
     pub prev_hash: ::prost::alloc::vec::Vec<u8>,
-    /// Unix epoch time when the block was mined
+    /// if non-zero, Unix epoch time when the block was mined
     #[prost(uint32, tag = "5")]
     pub time: u32,
-    /// full header (as returned by the getblock RPC)
+    /// if present, full header (as returned by the getblock RPC)
     #[prost(bytes = "vec", tag = "6")]
     pub header: ::prost::alloc::vec::Vec<u8>,
     /// zero or more compact transactions from this block
@@ -70,7 +72,8 @@ pub struct CompactTx {
     /// stateless server and a transaction with transparent inputs, this will be
     /// unset because the calculation requires reference to prior transactions.
     /// If there are no transparent inputs, the fee will be calculable as:
-    /// valueBalanceSapling + valueBalanceOrchard + sum(vPubNew) - sum(vPubOld) - sum(tOut)
+    /// valueBalanceSapling + valueBalanceOrchard + valueBalanceIronwood
+    /// + sum(vPubNew) - sum(vPubOld) - sum(tOut)
     #[prost(uint32, tag = "3")]
     pub fee: u32,
     #[prost(message, repeated, tag = "4")]
@@ -79,8 +82,6 @@ pub struct CompactTx {
     pub outputs: ::prost::alloc::vec::Vec<CompactSaplingOutput>,
     #[prost(message, repeated, tag = "6")]
     pub actions: ::prost::alloc::vec::Vec<CompactOrchardAction>,
-    /// Ironwood actions (post-NU6.3). Encoded identically to Orchard actions;
-    /// tag 9 matches zaino's served proto so the wire bytes decode.
     #[prost(message, repeated, tag = "9")]
     pub ironwood_actions: ::prost::alloc::vec::Vec<CompactOrchardAction>,
     /// `CompactTxIn` values corresponding to the `vin` entries of the full transaction.
@@ -164,7 +165,9 @@ pub struct CompactOrchardAction {
     pub ciphertext: ::prost::alloc::vec::Vec<u8>,
 }
 /// A BlockID message contains identifiers to select a block: a height or a
-/// hash. Specification by hash is not implemented, but may be in the future.
+/// hash. Support for specification by hash is not mandatory. (If `hash` is
+/// non-empty, the rpc may return an error.) This field is present to support
+/// a possible future upgrade.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockId {
     #[prost(uint64, tag = "1")]
@@ -176,9 +179,9 @@ pub struct BlockId {
 /// Both BlockIDs must be heights; specification by hash is not yet supported.
 ///
 /// If no pool types are specified, the server should default to the legacy
-/// behavior of returning only data relevant to the shielded (Sapling and
-/// Orchard) pools; otherwise, the server should prune `CompactBlocks` returned
-/// to include only data relevant to the requested pool types. Clients MUST
+/// behavior of returning only data relevant to the shielded (Sapling, Orchard,
+/// and Ironwood) pools; otherwise, the server should prune `CompactBlock`s
+/// returned to include only data relevant to the requested pool types. Clients MUST
 /// verify that the version of the server they are connected to are capable
 /// of returning pruned and/or transparent data before setting `poolTypes`
 /// to a non-empty value.
@@ -341,6 +344,19 @@ pub struct PingResponse {
     #[prost(int64, tag = "2")]
     pub exit: i64,
 }
+/// StandardFee is the reply to the GetStandardFee rpc: the ZIP 317
+/// marginal fee, in zatoshis per logical action, that wallets should
+/// pay for a transaction to be mined in the next block, as reported by
+/// the backend's `getstandardfee` RPC.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StandardFee {
+    /// standard fee in zatoshis per logical action
+    #[prost(uint64, tag = "1")]
+    pub fee_zat: u64,
+    /// backend fee-estimator version, 0 = static ZIP 317 marginal fee
+    #[prost(uint32, tag = "2")]
+    pub estimator_version: u32,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Address {
     #[prost(string, tag = "1")]
@@ -370,7 +386,7 @@ pub struct GetMempoolTxRequest {
     /// The server must prune `CompactTx`s returned to include only data
     /// relevant to the requested pool types. If no pool types are specified,
     /// the server should default to the legacy behavior of returning only data
-    /// relevant to the shielded (Sapling and Orchard) pools.
+    /// relevant to the shielded (Sapling, Orchard, and Ironwood) pools.
     #[prost(enumeration = "PoolType", repeated, tag = "3")]
     pub pool_types: ::prost::alloc::vec::Vec<i32>,
 }
@@ -395,6 +411,9 @@ pub struct TreeState {
     /// orchard commitment tree state
     #[prost(string, tag = "6")]
     pub orchard_tree: ::prost::alloc::string::String,
+    /// ironwood commitment tree state
+    #[prost(string, tag = "7")]
+    pub ironwood_tree: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetSubtreeRootsArg {
@@ -460,6 +479,7 @@ pub enum PoolType {
     Transparent = 1,
     Sapling = 2,
     Orchard = 3,
+    Ironwood = 4,
 }
 impl PoolType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -472,6 +492,7 @@ impl PoolType {
             Self::Transparent => "TRANSPARENT",
             Self::Sapling => "SAPLING",
             Self::Orchard => "ORCHARD",
+            Self::Ironwood => "IRONWOOD",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -481,6 +502,7 @@ impl PoolType {
             "TRANSPARENT" => Some(Self::Transparent),
             "SAPLING" => Some(Self::Sapling),
             "ORCHARD" => Some(Self::Orchard),
+            "IRONWOOD" => Some(Self::Ironwood),
             _ => None,
         }
     }
@@ -490,6 +512,7 @@ impl PoolType {
 pub enum ShieldedProtocol {
     Sapling = 0,
     Orchard = 1,
+    Ironwood = 2,
 }
 impl ShieldedProtocol {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -500,6 +523,7 @@ impl ShieldedProtocol {
         match self {
             Self::Sapling => "sapling",
             Self::Orchard => "orchard",
+            Self::Ironwood => "ironwood",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -507,6 +531,7 @@ impl ShieldedProtocol {
         match value {
             "sapling" => Some(Self::Sapling),
             "orchard" => Some(Self::Orchard),
+            "ironwood" => Some(Self::Ironwood),
             _ => None,
         }
     }
@@ -629,7 +654,18 @@ pub mod compact_tx_streamer_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        /// Return the compact block corresponding to the given block identifier
+        /// Return the compact block corresponding to the given block identifier.
+        ///
+        /// The returned `CompactBlock` includes transaction data for all value
+        /// pools, including transparent inputs (`vin`) and outputs (`vout`). This
+        /// differs from `GetBlockRange`, which supports filtering by pool type and
+        /// defaults to returning only shielded (Sapling, Orchard, and Ironwood)
+        /// data. Clients that require only data for specific pools should use
+        /// `GetBlockRange` with the appropriate `poolTypes` set.
+        ///
+        /// Note: the single null-outpoint input for coinbase transactions is
+        /// omitted from the `vin` field of the corresponding `CompactTx`. See the
+        /// documentation of the `CompactTx` message for details.
         pub async fn get_block(
             &mut self,
             request: impl tonic::IntoRequest<super::BlockId>,
@@ -656,11 +692,15 @@ pub mod compact_tx_streamer_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        /// Same as GetBlock except the returned CompactBlock value contains only
-        /// nullifiers.
+        /// Return a compact block containing only nullifier information for the
+        /// shielded pools (Sapling spend nullifiers, Orchard action nullifiers, and
+        /// Ironwood action nullifiers). Transparent transaction data, Sapling
+        /// outputs, full Orchard/Ironwood action data, and commitment tree sizes are
+        /// not included.
         ///
-        /// Note: this method is deprecated. Implementations should ignore any
-        /// `PoolType::TRANSPARENT` member of the `poolTypes` argument.
+        /// Note: this method is deprecated; use `GetBlockRange` with the
+        /// appropriate `poolTypes` instead.
+        #[deprecated]
         pub async fn get_block_nullifiers(
             &mut self,
             request: impl tonic::IntoRequest<super::BlockId>,
@@ -721,11 +761,17 @@ pub mod compact_tx_streamer_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
-        /// Same as GetBlockRange except the returned CompactBlock values contain
-        /// only nullifiers.
+        /// Return a stream of compact blocks for the specified range, where each
+        /// block contains only nullifier information for the shielded pools
+        /// (Sapling spend nullifiers, Orchard action nullifiers, and Ironwood action
+        /// nullifiers). Transparent transaction data, Sapling outputs, full
+        /// Orchard/Ironwood action data, and commitment tree sizes are not included.
+        /// Implementations MUST ignore any
+        /// `PoolType::TRANSPARENT` member of the `poolTypes` field of the request.
         ///
-        /// Note: this method is deprecated. Implementations should ignore any
-        /// `PoolType::TRANSPARENT` member of the `poolTypes` argument.
+        /// Note: this method is deprecated; use `GetBlockRange` with the
+        /// appropriate `poolTypes` instead.
+        #[deprecated]
         pub async fn get_block_range_nullifiers(
             &mut self,
             request: impl tonic::IntoRequest<super::BlockRange>,
@@ -1054,7 +1100,7 @@ pub mod compact_tx_streamer_client {
             self.inner.unary(req, path, codec).await
         }
         /// Returns a stream of information about roots of subtrees of the note commitment tree
-        /// for the specified shielded protocol (Sapling or Orchard).
+        /// for the specified shielded protocol (Sapling, Orchard, or Ironwood).
         pub async fn get_subtree_roots(
             &mut self,
             request: impl tonic::IntoRequest<super::GetSubtreeRootsArg>,
@@ -1165,6 +1211,37 @@ pub mod compact_tx_streamer_client {
                     GrpcMethod::new(
                         "cash.z.wallet.sdk.rpc.CompactTxStreamer",
                         "GetLightdInfo",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Return the standard fee (the ZIP 317 marginal fee, in zatoshis per
+        /// logical action) that the backend recommends wallets pay for a
+        /// transaction to be mined in the next block. Requires a backend that
+        /// implements the `getstandardfee` RPC. Backends that lack it return
+        /// Unimplemented.
+        pub async fn get_standard_fee(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::StandardFee>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetStandardFee",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                        "GetStandardFee",
                     ),
                 );
             self.inner.unary(req, path, codec).await
