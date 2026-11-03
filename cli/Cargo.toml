@@ -43,6 +43,7 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync
 toml = "0.8"
 anyhow = "1.0.104"
 thiserror.workspace = true
+tailspin = { version = "7.0", default-features = false }
 
 [dev-dependencies]
 ztest = { workspace = true, features = ["librustzcash"] }

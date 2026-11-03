@@ -4734,6 +4734,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tailspin"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "666a4f4a4cd37dc325cc0acce5f3aaf8e124c7ddec758ed9f498ca8644172e99"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "nu-ansi-term",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5216,6 +5231,18 @@ dependencies = [
  "log",
  "once_cell",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-logfmt"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a250055a3518b5efba928a18ffac8d32d42ea607a9affff4532144cd5b2e378e"
+dependencies = [
+ "time",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -6616,6 +6643,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tracing",
+ "tracing-logfmt",
  "tracing-subscriber",
  "walkdir",
  "zcash_client_backend",
@@ -6660,6 +6688,7 @@ dependencies = [
  "serde_json",
  "supports-color",
  "supports-unicode",
+ "tailspin",
  "terminal_size",
  "thiserror 1.0.69",
  "tokio",

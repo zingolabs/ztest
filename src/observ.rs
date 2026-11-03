@@ -9,6 +9,8 @@
 //!
 //! Filters: `ztest::pod=debug` (runner-pod lifecycle), `ztest::build=debug`
 //! (in-pod `TestEnv::build` phases), `ztest=debug` (all).
+//!
+//! Format: logfmt, uncoloured (zainod's shape; colour = the live view's, at display)
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -43,8 +45,8 @@ pub fn init(sink: Sink) {
 }
 
 fn install(sink: Sink) {
-    let builder =
-        tracing_subscriber::fmt().with_env_filter(env_filter()).with_target(true).with_level(true);
+    let logfmt = tracing_logfmt::builder().with_span_name(false).with_span_path(false);
+    let builder = logfmt.subscriber_builder().with_env_filter(env_filter());
     // try_init, not init: a host-installed subscriber must not panic us (diagnostics = best-effort)
     match sink {
         Sink::Stderr => {
@@ -55,10 +57,7 @@ fn install(sink: Sink) {
         }
         Sink::File(path) => match open_append(&path) {
             Ok(file) => {
-                let _ = builder
-                    .with_ansi(false)
-                    .with_writer(FileMaker(Arc::new(Mutex::new(file))))
-                    .try_init();
+                let _ = builder.with_writer(FileMaker(Arc::new(Mutex::new(file)))).try_init();
             }
             // No file → drop to a null writer, never stderr (Sink::File exists to
             // keep output off the render thread's terminal)

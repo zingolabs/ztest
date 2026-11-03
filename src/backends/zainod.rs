@@ -458,8 +458,6 @@ impl IndexerBackend for ZainoIndexer {
             guaranteed: Some(crate::qos::pod::INDEXER.into()),
             image_pull_secret: crate::backends::image::pull_secret(),
             termination_grace_period: None,
-            // zainod's logfmt colours only on a terminal
-            tty: true,
         })
     }
 

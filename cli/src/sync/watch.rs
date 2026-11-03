@@ -3,7 +3,7 @@
 //! - Vitals = SUT + driver + validator `/metrics` scraped direct every [`LIVE_INTERVAL`]
 //!   (`status` = the TSDB); validator = the live network tip a following run counts up to
 //! - Loads = cAdvisor off the TSDB (no component sees its own cgroup)
-//! - Scrollback = driver-pod log + indexer-under-test log, verbatim
+//! - Scrollback = driver-pod log + indexer-under-test log, ANSI-stripped + one tailspin palette
 //! - All over the kube API (no `kubectl` on the laptop)
 //! - Read-only: Ctrl-C detaches, never stops the sync (only `ztest sync stop` does)
 
@@ -17,6 +17,12 @@ use anyhow::{Context as _, Result};
 use futures::{AsyncBufReadExt as _, StreamExt as _};
 use k8s_openapi::api::core::v1::{ContainerState, Pod};
 use kube::api::{Api, ListParams, LogParams};
+use tailspin::Highlighter;
+use tailspin::config::{
+    DateTimeConfig, DurationConfig, IpV4Config, JsonConfig, KeyValueConfig, NumberConfig,
+    QuoteConfig, RegexConfig, UnixPathConfig, UrlConfig, UuidConfig,
+};
+use tailspin::style::{Color, Style};
 use tokio::sync::watch;
 
 use ztest::api::Heights;
@@ -532,6 +538,7 @@ async fn tail_loop(
 ) -> Result<()> {
     // Last cause shown → a standing condition is scrolled once, not once per read
     let mut last_note: Option<String> = None;
+    let highlighter = log_highlighter();
 
     let started = open_driver_log(driver, &|| console.cancelled(), |phase| {
         state.pod_phase = phase;
@@ -562,14 +569,14 @@ async fn tail_loop(
             line = driver_log.next() => match line {
                 Some(Ok(l)) => {
                     driver_seen = Instant::now();
-                    console.scrollback(prefixed("driver", &l, theme));
+                    console.scrollback(component_line("driver", &l, theme, &highlighter));
                 }
                 Some(Err(_)) | None => lost_driver = true,
             },
             line = next_line(&mut sut) => match line {
                 Some(Ok(l)) => {
                     sut_seen = Instant::now();
-                    console.scrollback(prefixed(&sut_name, &l, theme));
+                    console.scrollback(component_line(&sut_name, &l, theme, &highlighter));
                 }
                 // SUT stream ending != run ending (restarted/replaced pod): drop, let the poll reopen
                 Some(Err(_)) | None => close_sut = true,
@@ -788,6 +795,47 @@ const SOURCE_ROW: &str = "{source:>8|dim} {stem|dim} {line}";
 fn prefixed(source: &str, line: &str, theme: &Theme) -> String {
     let f = Fields::new().text("source", source).text("stem", theme.chars.vbar).text("line", line);
     format!("{}\n", draw(SOURCE_ROW, &f, theme))
+}
+
+/// Component log line: its own ANSI stripped (zebrad colours itself), one palette for every source
+fn component_line(source: &str, line: &str, theme: &Theme, highlighter: &Highlighter) -> String {
+    let plain = console::strip_ansi_codes(line);
+    match theme.is_colorized() {
+        true => prefixed(source, &highlighter.apply(&plain), theme),
+        false => prefixed(source, &plain, theme),
+    }
+}
+
+/// Levels first (first-added highlighter wins an overlap), timestamps faint, then tailspin's set
+fn log_highlighter() -> Highlighter {
+    let level = |words: &str, style: Style| RegexConfig {
+        regex: format!(r"\b(?:level=(?:{lower})|{words})\b", lower = words.to_lowercase()),
+        style,
+    };
+    let faint = Style::new().faint();
+    Highlighter::builder()
+        .with_regex_highlighter(level("ERROR", Style::new().fg(Color::Red).bold()))
+        .with_regex_highlighter(level("WARN", Style::new().fg(Color::Yellow)))
+        .with_regex_highlighter(level("INFO", Style::new().fg(Color::Green)))
+        .with_regex_highlighter(level("DEBUG", Style::new().fg(Color::Blue)))
+        .with_regex_highlighter(level("TRACE", faint))
+        .with_date_time_highlighter(DateTimeConfig {
+            date: faint,
+            time: faint,
+            zone: faint,
+            separator: faint,
+        })
+        .with_json_highlighter(JsonConfig::default())
+        .with_ip_v4_highlighter(IpV4Config::default())
+        .with_url_highlighter(UrlConfig::default())
+        .with_unix_path_highlighter(UnixPathConfig::default())
+        .with_key_value_highlighter(KeyValueConfig::default())
+        .with_uuid_highlighter(UuidConfig::default())
+        .with_duration_highlighter(DurationConfig::default())
+        .with_number_highlighter(NumberConfig::default())
+        .with_quote_highlighter(QuoteConfig::default())
+        .build()
+        .expect("fixed patterns compile")
 }
 
 /// Linear follow-tail of the driver log (non-TTY, or the console won't start). Reattaches like the

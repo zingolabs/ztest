@@ -1247,7 +1247,6 @@ mod tests {
             placement: None,
             image_pull_secret: None,
             termination_grace_period: None,
-            tty: false,
         }
     }
 

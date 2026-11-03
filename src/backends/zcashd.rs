@@ -171,7 +171,6 @@ impl ValidatorBackend for ZcashdValidator {
             guaranteed: Some(crate::qos::pod::VALIDATOR.into()),
             image_pull_secret: crate::backends::image::pull_secret(),
             termination_grace_period: None,
-            tty: false,
         })
     }
 

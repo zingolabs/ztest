@@ -213,6 +213,7 @@ tokio-util = "0.7"
 bs58 = { version = "0.5.1", features = ["check"] }
 h2 = "0.4"
 anyhow = "1.0.104"
+tracing-logfmt = { version = "0.3.7", default-features = false }
 
 [features]
 default = ["librustzcash"]
