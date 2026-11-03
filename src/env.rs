@@ -743,10 +743,11 @@ impl TestEnv {
 
         let timeout = self.ready_timeout;
         let probes = validators.into_iter().map(|(pod_name, handle)| async move {
-            handle.ready(timeout).await.map_err(|_| EnvError::RpcTimeout {
+            handle.ready(timeout).await.map_err(|cause| EnvError::RpcTimeout {
                 component: pod_name,
                 op: "wait_for_ready",
                 elapsed: timeout,
+                cause: cause.to_string(),
             })
         });
         for res in join_all(probes).await {
@@ -775,10 +776,11 @@ impl TestEnv {
 
         let timeout = self.ready_timeout;
         let probes = indexers.into_iter().map(|(pod_name, handle)| async move {
-            handle.ready(timeout).await.map_err(|_| EnvError::RpcTimeout {
+            handle.ready(timeout).await.map_err(|cause| EnvError::RpcTimeout {
                 component: pod_name,
                 op: "wait_for_ready",
                 elapsed: timeout,
+                cause: cause.to_string(),
             })
         });
         for res in join_all(probes).await {
@@ -1056,6 +1058,7 @@ async fn await_pod_ready(
                         component: component(),
                         op: "pod_ready",
                         elapsed,
+                        cause: "kubelet readiness probe never passed".to_owned(),
                     });
                 }
             }

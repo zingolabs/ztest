@@ -1048,14 +1048,15 @@ enum State {
 }
 
 impl ZainoIndexer {
-    /// `/readyz` off the admin port (same port as `/metrics`)
+    /// Public `/readyz` on the gRPC listener (zaino-prod's load balancer + z3's probe)
     ///
     /// - body read on `503` too (`syncing` = 503, still ready for a test)
     /// - unknown `state` = an `Err` naming it (contract drift)
     async fn readyz(&self, http: &reqwest::Client) -> Result<Readyz, String> {
-        let ep = self.plumbing.endpoint_for(crate::ports::ZAINO_METRICS).await;
+        let ep = self.plumbing.endpoint_for(crate::ports::ZAINO_GRPC).await;
         let url = format!("{}/readyz", ep.map_err(|e| e.to_string())?.url("http"));
-        let answer = http.get(url).send().await.map_err(|e| e.to_string())?;
+        let answer = http.get(&url).send().await;
+        let answer = answer.map_err(|e| format!("GET {url}: {:#}", anyhow::Error::from(e)))?;
         answer.json::<Readyz>().await.map_err(|e| format!("/readyz: {e}"))
     }
 

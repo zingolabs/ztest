@@ -10,8 +10,8 @@ pub enum EnvError {
     #[error("{component} failed to become ready after {elapsed:?}")]
     NotReady { component: String, elapsed: Duration },
 
-    #[error("{component} RPC '{op}' timed out after {elapsed:?}")]
-    RpcTimeout { component: String, op: &'static str, elapsed: Duration },
+    #[error("{component} RPC '{op}' timed out after {elapsed:?}: {cause}")]
+    RpcTimeout { component: String, op: &'static str, elapsed: Duration, cause: String },
 
     /// Unrecoverable pod state → readiness fails fast. Not
     /// [`RpcTimeout`](Self::RpcTimeout) (ran, never opened its port), not `Pending`
