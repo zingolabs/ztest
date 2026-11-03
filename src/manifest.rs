@@ -60,6 +60,8 @@ pub struct PodSpec {
     pub placement: Option<crate::qos::Pool>,
     pub image_pull_secret: Option<String>,
     pub termination_grace_period: Option<i64>,
+    /// stdout = a terminal (a component colouring only on a TTY colours)
+    pub tty: bool,
 }
 
 impl PodSpec {
@@ -82,6 +84,9 @@ impl PodSpec {
         }
         if let Some(args) = &self.args {
             container["args"] = json!(args);
+        }
+        if self.tty {
+            container["tty"] = json!(true);
         }
         // Guaranteed QoS (§7) → requests == limits; explicit wins over the QoS reserve
         let sizing = self.resources.as_ref().or(self.guaranteed.as_ref());
@@ -271,6 +276,7 @@ mod tests {
             guaranteed: Some(Resources { cpu: Cpu::cores(1), memory: Mem::mib(512) }),
             image_pull_secret: None,
             termination_grace_period: None,
+            tty: false,
         }
     }
 
@@ -426,6 +432,15 @@ mod tests {
         let c = container(&pod);
         assert!(c.get("env").is_none());
         assert!(c.get("resources").is_some());
+    }
+
+    #[test]
+    fn tty_renders_only_when_set() {
+        let plain = container(&base_spec().render(&coords(), "t", &[]));
+        assert!(plain.get("tty").is_none(), "tty off: no key, got {plain}");
+        let spec = PodSpec { tty: true, ..base_spec() };
+        let terminal = container(&spec.render(&coords(), "t", &[]));
+        assert_eq!(terminal["tty"], true, "tty on: container tty, got {terminal}");
     }
 
     #[test]

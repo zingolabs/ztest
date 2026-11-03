@@ -433,12 +433,6 @@ impl IndexerBackend for ZainoIndexer {
         pod_name: String,
     ) -> Result<crate::manifest::PodSpec, EnvError> {
         // Profiling env injected in `materialize_phase` (knows the Pyroscope endpoint)
-        // - colour forced like zebrad's `force_use_color` (no TTY in a pod → `auto` = plain);
-        //   first, so a test's own `env` overrides it
-        let env = [("ZAINOLOG_COLOR".to_string(), "true".to_string())]
-            .into_iter()
-            .chain(opts.env.iter().cloned())
-            .collect();
         Ok(crate::manifest::PodSpec {
             pod_name,
             category: crate::component::ComponentCategory::Indexer,
@@ -455,7 +449,7 @@ impl IndexerBackend for ZainoIndexer {
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources,
-            env,
+            env: opts.env.clone(),
             fs_group: Some(1000),
             // Image `USER` = non-numeric name kubelet can't check against runAsNonRoot
             run_as_user: Some(1000),
@@ -464,6 +458,8 @@ impl IndexerBackend for ZainoIndexer {
             guaranteed: Some(crate::qos::pod::INDEXER.into()),
             image_pull_secret: crate::backends::image::pull_secret(),
             termination_grace_period: None,
+            // zainod's logfmt colours only on a terminal
+            tty: true,
         })
     }
 

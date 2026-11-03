@@ -3,8 +3,8 @@
 //! - Capture: one-shot kube-API fetch at the test's terminal (pods still alive), every line,
 //!   merged chronologically across pods
 //! - Display: [`component_section`] tails to [`LogTail`] (capture + record never cap)
-//! - Faithful: components own formatting + colour (zebrad `force_use_color`, zaino
-//!   its default `terminal` format); ztest never parses/reassembles/recolours a body
+//! - Faithful: components own formatting + colour (zebrad `force_use_color`, zainod a TTY: its
+//!   logfmt colours on a terminal); ztest never parses/reassembles/recolours a body
 //! - ANSI stripped once at the display boundary, only for a non-colour sink
 
 use crate::engine::output::LogTail;
