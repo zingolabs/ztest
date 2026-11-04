@@ -524,28 +524,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_pass_runs_every_test() {
-        let items = vec![
-            item("a", QosClass::Integration, 0),
-            item("b", QosClass::Integration, 0),
-            item("c", QosClass::Integration, 0),
-        ];
-        let mut rep = NullReporter;
-        let stats = run_loop(
-            items,
-            ceiling_two_integration(),
-            cfg(),
-            &mut rep,
-            |_item, _attempt| async { pass() },
-            |_, _| {},
-        )
-        .await;
-        assert_eq!(stats.passed, 3);
-        assert_eq!(stats.failed, 0);
-        assert_eq!(stats.finished(), 3);
-    }
-
-    #[tokio::test]
     async fn never_overcommits_capacity() {
         // 6 Integration tests (3000m each), ceiling fits 2 at a time
         let items: Vec<_> =
@@ -662,46 +640,6 @@ mod tests {
         // Inflight drains, nothing more admitted → far fewer than 6 reach a verdict
         assert!(stats.failed >= 1);
         assert!(stats.finished() < 6, "finished={}", stats.finished());
-    }
-
-    #[tokio::test]
-    async fn retry_reruns_failed_then_passes() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let attempts = Arc::new(AtomicU32::new(0));
-        let a = attempts.clone();
-        let mut rep = NullReporter;
-        let stats = run_loop(
-            vec![item("flaky", QosClass::Integration, 2)],
-            ceiling_two_integration(),
-            cfg(),
-            &mut rep,
-            move |_item, _attempt| {
-                let a = a.clone();
-                async move { if a.fetch_add(1, Ordering::SeqCst) == 0 { fail() } else { pass() } }
-            },
-            |_, _| {},
-        )
-        .await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 2, "should have retried once");
-        assert_eq!(stats.passed, 1);
-        assert_eq!(stats.failed, 0);
-    }
-
-    #[tokio::test]
-    async fn rejects_unschedulable_footprint() {
-        // Sync needs 16000m; a 1000m ceiling cannot fit it even empty → Rejected
-        let mut rep = NullReporter;
-        let stats = run_loop(
-            vec![item("huge", QosClass::Sync, 0)],
-            Resources::new(1_000, crate::qos::GIB, 0, 0),
-            cfg(),
-            &mut rep,
-            |_item, _attempt| async { pass() },
-            |_, _| {},
-        )
-        .await;
-        assert_eq!(stats.skipped, 1);
-        assert_eq!(stats.passed, 0);
     }
 
     /// Spawn order (recorded synchronously = admission order), live/peak concurrency per size

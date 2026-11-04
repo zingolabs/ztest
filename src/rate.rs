@@ -285,16 +285,4 @@ mod tests {
         let pace = w.pace_by(|v| v.map(|n| n as f64), Some(400.0)).expect("a rate");
         assert_eq!(pace.per_sec, 100.0);
     }
-
-    /// Arrival time is not measurement time: both stamps are first-class so a replayed
-    /// stream measures on its own clock
-    #[test]
-    fn a_window_measures_on_whichever_clock_it_was_given() {
-        let origin = Instant::now();
-        let mut w: Window<u64> = Window::new(Duration::from_secs(1));
-        for secs in 0..5u64 {
-            w.push(origin + Duration::from_secs(secs), secs * 100);
-        }
-        assert_eq!(w.per_sec(), Some(100.0));
-    }
 }

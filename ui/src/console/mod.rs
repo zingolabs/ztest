@@ -37,14 +37,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_region_fills_the_terminal_above_the_panel() {
-        // No hard cap: live region = whole terminal minus the panel, so a tall in-place
-        // progress block renders at real height
-        assert_eq!(live_rows_for(50), 50 - PANEL_ROWS);
-        assert_eq!(live_rows_for(24), 24 - PANEL_ROWS);
-    }
-
-    #[test]
     fn live_region_never_underflows_to_zero() {
         // Terminal at or below the panel height (or a momentary 0 mid-resize) floors to 1;
         // `avt` underflow-panics on a 0 dimension

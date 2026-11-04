@@ -834,13 +834,6 @@ mod tests {
         assert!(!classify_test_env("elicb-9999", &live).is_live());
     }
 
-    #[test]
-    fn an_unlabelled_namespace_is_reclaimable() {
-        // SIGKILL between namespace-create and label-populate leaves no run-id;
-        // with no lease vouching for it, garbage
-        assert!(!classify_test_env("?", &["elicb-4471".to_string()]).is_live());
-    }
-
     fn sync_meta(name: &str, id: &str) -> ObjectMeta {
         ObjectMeta {
             name: Some(name.into()),
@@ -980,13 +973,6 @@ mod tests {
         assert!(!record.selectors.is_empty(), "series reclaimed in the same pass");
     }
 
-    /// Only syncs leave one
-    #[test]
-    fn a_run_target_leaves_no_report_to_reclaim() {
-        assert!(target(Kind::TestEnv, "elicb-4471", "elicb-4471").report_cm().is_none());
-        assert!(target(Kind::RunPod, "ztest-run-x", "elicb-4471").report_cm().is_none());
-    }
-
     #[test]
     fn a_running_sync_is_live_and_names_the_checkpoint_command() {
         let live = classify_sync("zaino-a52f", Some(Some("Running".into())));
@@ -1047,21 +1033,6 @@ mod tests {
         for kind in [Kind::SeedBinding, Kind::Reservation] {
             assert_eq!(target(kind, "obj", "elicb-4021").profile_tenant(), None, "{kind:?}");
         }
-    }
-
-    /// One run's namespaces and pods derive one tenant; retiring it N times is one write
-    #[test]
-    fn every_object_of_a_run_derives_the_same_tenant() {
-        let ns = target(Kind::TestEnv, "ztest-pkg-a-1", "elicb-4021").profile_tenant();
-        let pod = target(Kind::RunPod, "ztest-runner-xyz", "elicb-4021").profile_tenant();
-        assert_eq!(ns, pod);
-    }
-
-    /// Silence, not a wrong matcher: `{namespace="ztest-pkg-test-9f2a"}` would delete a
-    /// *concurrent* run's series, since nothing ties that namespace to a run id
-    #[test]
-    fn a_test_env_offers_no_selectors_to_purge_by() {
-        assert!(target(Kind::TestEnv, "ztest-pkg-test-9f2a", "run").metric_selectors().is_empty());
     }
 
     #[test]

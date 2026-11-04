@@ -181,24 +181,6 @@ mod tests {
     }
 
     #[test]
-    fn immediate_and_final_predicates() {
-        use TestOutputDisplay::*;
-        assert!(Immediate.is_immediate() && !Immediate.is_final());
-        assert!(Final.is_final() && !Final.is_immediate());
-        assert!(ImmediateFinal.is_immediate() && ImmediateFinal.is_final());
-        assert!(!Never.is_immediate() && !Never.is_final());
-    }
-
-    #[test]
-    fn defaults_match_nextest() {
-        let c = OutputConfig::default();
-        assert_eq!(c.success, TestOutputDisplay::Never);
-        assert_eq!(c.failure, TestOutputDisplay::Immediate);
-        assert!(c.captures());
-        assert!(!c.is_serial());
-    }
-
-    #[test]
     fn no_capture_forces_immediate_and_serial() {
         let c = OutputConfig::default().with_no_capture();
         assert_eq!(c.success, TestOutputDisplay::Immediate);

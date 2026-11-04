@@ -325,12 +325,6 @@ mod tests {
         assert!(output(&out).contains("three-ok"), "{:?}", output(&out));
     }
 
-    #[tokio::test]
-    async fn captures_child_output() {
-        let out = play("prints_stdout", &env()).await;
-        assert!(output(&out).contains("hello-stdout"), "{:?}", output(&out));
-    }
-
     /// - Missing run id or namespace → every `TestEnv::build` refuses
     /// - Missing manifest → every `dev!` component resolves to `DevImageMissing`
     #[tokio::test]

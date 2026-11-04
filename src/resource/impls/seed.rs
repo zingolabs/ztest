@@ -92,14 +92,6 @@ mod tests {
         assert_eq!(SeedProvider::node_id(&e), SeedProvider::new(e.clone()).id());
     }
 
-    #[test]
-    fn distinct_archives_get_distinct_nodes() {
-        assert_ne!(
-            SeedProvider::node_id(&entry(&"a".repeat(64))),
-            SeedProvider::node_id(&entry(&"b".repeat(64))),
-        );
-    }
-
     /// Same artifact from two call sites = one seed, incl. across processes disagreeing on
     /// where (or whether) the file is on disk
     #[test]

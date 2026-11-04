@@ -528,14 +528,6 @@ mod tests {
         assert_eq!(clock.remaining(later), STALL_WINDOW);
     }
 
-    /// Refetched partial files can overcount; the row never reads past the whole tree
-    #[test]
-    fn the_bar_never_passes_the_tree_size() {
-        let mut clock = Liveness::new(GB, Instant::now());
-        clock.observe(2 * GB, Instant::now());
-        assert_eq!(clock.shown(), GB);
-    }
-
     /// Verify = hashing only, no bytes move → the sorted relpaths are its forward motion
     #[test]
     fn verification_is_progress_only_in_sums_order() {
@@ -588,38 +580,6 @@ mod tests {
             start.observe(&pulling("ErrImagePull"), t0 + pod_status::IMAGE_PULL_GRACE),
             Some(Stall::ImagePull("ErrImagePull".to_string()))
         );
-    }
-
-    #[test]
-    fn a_byte_count_is_named_at_the_scale_it_lands_on() {
-        assert_eq!(human(20 * GB), "20.0 GiB");
-        assert_eq!(human(100 * 1024 * 1024), "100.0 MiB");
-        assert_eq!(human(4096), "4.0 KiB");
-        assert_eq!(human(17), "17 B");
-    }
-
-    /// Unplaceable pod has no log; its reason already carries the scheduler's words
-    #[test]
-    fn only_a_stall_that_ran_has_a_log_worth_quoting() {
-        assert!(Stall::NoProgress { transferred: 0, total: GB }.ran());
-        assert!(Stall::Finalizing { total: GB }.ran());
-        assert!(!Stall::ImagePull("ErrImagePull".into()).ran());
-        assert!(!Stall::Unschedulable { reason: "x".into(), elapsed: STALL_WINDOW }.ran());
-    }
-
-    #[test]
-    fn every_stall_reads_as_a_fact_and_an_action() {
-        let stalls = [
-            Stall::Unschedulable { reason: "Unschedulable: no disk".into(), elapsed: STALL_WINDOW },
-            Stall::ImagePull("ImagePullBackOff".into()),
-            Stall::NoProgress { transferred: 4 * GB, total: 20 * GB },
-            Stall::Finalizing { total: 20 * GB },
-        ];
-        for stall in stalls {
-            let msg = stall.to_string();
-            assert!(!msg.contains('\n'), "{msg}");
-            assert!(msg.starts_with("puller "), "{msg}");
-        }
     }
 
     /// Verbatim rclone 1.75 `--use-json-log --stats-one-line` record

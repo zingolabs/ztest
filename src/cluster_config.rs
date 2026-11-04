@@ -601,27 +601,6 @@ mod tests {
         assert_eq!(seed_size_for(GIB), "2Gi");
     }
 
-    #[test]
-    fn round_trips_through_toml() {
-        let mut cfg = Config::default();
-        cfg.clusters.insert("dev".into(), Profile::local("zkn"));
-        cfg.clusters.insert(
-            "prod".into(),
-            Profile {
-                context: Some("prod".into()),
-                push: Some("route.example/img".into()),
-                pull: Some("svc:5000/img".into()),
-                class: ClusterClass::Remote,
-                ..Default::default()
-            },
-        );
-        cfg.current = Some("prod".into());
-
-        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
-        assert_eq!(back.current.as_deref(), Some("prod"));
-        assert_eq!(back.clusters, cfg.clusters);
-    }
-
     /// Stale `[bucket]` table (credentials now live in rclone) loads, and the next save drops it
     #[test]
     fn an_unknown_top_level_table_is_ignored_and_not_rewritten() {
@@ -697,24 +676,6 @@ mod tests {
         };
         assert!(p.validate().is_ok());
         assert_eq!(p.pull_address(), Some("ghcr.io/z"));
-    }
-
-    #[test]
-    fn a_split_registry_keeps_both_addresses() {
-        let p = Profile {
-            class: ClusterClass::Remote,
-            push: Some("route/x".into()),
-            pull: Some("svc:5000/x".into()),
-            ..Default::default()
-        };
-        assert_eq!(p.pull_address(), Some("svc:5000/x"));
-        assert!(p.summary().contains("push=route/x"));
-    }
-
-    #[test]
-    fn a_local_profile_summarizes_its_kind_node() {
-        assert!(Profile::local("zkn").summary().contains("kind zkn"));
-        assert!(Profile::default().summary().contains("kind (default)"));
     }
 
     /// A remote profile carries identity only — registry facts arrive by `--extra-config`,

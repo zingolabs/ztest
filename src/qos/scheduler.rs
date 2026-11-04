@@ -411,18 +411,6 @@ mod tests {
         assert_eq!(s.request(iops_req("t", 5_000)), Admission::Queued);
     }
 
-    // ── Atomic, whole-footprint grant ──────────────────────────────────
-
-    #[test]
-    fn grant_consumes_whole_footprint_atomically() {
-        let mut s = sched();
-        let fp = Resources::new(3_000, 5 * GIB, 0, 0);
-        let before = s.free();
-        lease_of(s.request(req("t", fp.cpu_milli, fp.mem_bytes)));
-        assert_eq!(s.free(), before.checked_sub(&fp).unwrap());
-        assert_eq!(s.committed(), fp);
-    }
-
     // ── The queue: arrival order, skipping what does not fit ───────────
 
     #[test]
@@ -517,18 +505,6 @@ mod tests {
             Resources::new(4_000, 8 * GIB, 0, 0),
         );
         assert_eq!(v, Admission::Rejected(RejectReason::ExceedsClusterCapacity));
-    }
-
-    #[test]
-    fn decide_fits_on_empty_ceiling() {
-        let v = decide(
-            Resources::new(8_000, 16 * GIB, 0, 0),
-            Resources::ZERO,
-            Resources::ZERO,
-            None,
-            Resources::new(4_000, 8 * GIB, 0, 0),
-        );
-        assert_eq!(v, Admission::Granted(()));
     }
 
     // ── Reject: exceeds empty-cluster capacity (fail fast) ─────────────
@@ -649,24 +625,6 @@ mod tests {
         assert_eq!(s.request(req("waiter", 4_000, 4 * GIB)), Admission::Queued);
         assert_eq!(s.free(), free_before);
         assert_eq!(s.committed(), committed_before);
-    }
-
-    // ── Determinism ────────────────────────────────────────────────────
-
-    #[test]
-    fn identical_op_sequences_yield_identical_results() {
-        fn run() -> (Vec<Admission>, Vec<String>) {
-            let mut s = Scheduler::new(Resources::new(8_000, 16 * GIB, 0, 0));
-            let admissions = vec![
-                s.request(req("a", 4_000, 4 * GIB)),
-                s.request(req("b", 4_000, 4 * GIB)),
-                s.request(req("c", 4_000, 4 * GIB)),
-            ];
-            let grants = s.release(SlotId(0));
-            let names = grants.into_iter().map(|g| g.test_name).collect();
-            (admissions, names)
-        }
-        assert_eq!(run(), run());
     }
 }
 

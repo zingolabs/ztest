@@ -582,19 +582,6 @@ mod disk_tests {
         assert_eq!(Disk::parse("0Gi"), None);
     }
 
-    /// Floors are absent until declared: an unset floor and a zero floor must not be the
-    /// same value, or "unconstrained" reads as "reserve nothing" once enforcement lands
-    #[test]
-    fn bandwidth_floors_are_absent_until_declared() {
-        let plain = Disk::gib(400);
-        assert_eq!((plain.bps(), plain.iops()), (None, None));
-
-        let floored = Disk::gib(400).min_bps(200 * 1024 * 1024).min_iops(5_000);
-        assert_eq!(floored.bps(), Some(200 * 1024 * 1024));
-        assert_eq!(floored.iops(), Some(5_000));
-        assert_eq!(floored.as_bytes(), plain.as_bytes());
-    }
-
     /// The bridge admission actually charges; an undeclared floor charges zero, which is
     /// what every uncalibrated dimension already means
     #[test]

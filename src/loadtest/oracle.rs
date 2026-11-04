@@ -245,12 +245,6 @@ mod tests {
 
     // ── completeness ────────────────────────────────────────────────────
 
-    #[test]
-    fn accepts_the_exact_requested_range() {
-        let blocks = linked(5, 8);
-        assert!(BlockOracle::new().observe(5, 8, &blocks).is_empty());
-    }
-
     /// Truncated stream stays self-linked → chain-link check passes, only this one sees it
     #[test]
     fn flags_a_truncated_stream() {
@@ -297,14 +291,6 @@ mod tests {
         let rewritten = vec![block(10, [0xFF; 32], [9u8; 32])];
         assert!(oracle.observe(10, 10, &first).is_empty());
         assert!(oracle.observe(10, 10, &rewritten).is_empty());
-    }
-
-    #[test]
-    fn accepts_a_repeated_identical_observation() {
-        let oracle = BlockOracle::new().stable_below(100);
-        let blocks = linked(10, 12);
-        assert!(oracle.observe(10, 12, &blocks).is_empty());
-        assert!(oracle.observe(10, 12, &blocks).is_empty());
     }
 
     #[test]

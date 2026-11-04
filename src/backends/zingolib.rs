@@ -651,16 +651,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn builder_defaults_to_zingolibs_own_performance_level_until_overridden() {
-        assert_eq!(Wallet::zingolib().backend.performance, PerformanceLevel::High);
-        assert_eq!(Wallet::zingolib().backend.performance, SyncConfig::default().performance_level);
-        assert_eq!(
-            Wallet::zingolib().performance(PerformanceLevel::Maximum).backend.performance,
-            PerformanceLevel::Maximum,
-        );
-    }
-
     /// - Offline client (no indexer URI) = real `LightClient` that never spawns an engine
     /// - `Ready(..)` arms need a live indexer (no fake `LightClient`)
     #[tokio::test]

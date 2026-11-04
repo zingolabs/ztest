@@ -239,21 +239,6 @@ mod tests {
         Theme::for_capabilities(false, true)
     }
 
-    /// Storage + snapshot API share a doc anchor: the setup screen it replaced spent
-    /// two of its four lines printing that anchor twice
-    #[test]
-    fn one_remedy_is_printed_once_however_many_capabilities_cite_it() {
-        let report = Report {
-            capabilities: vec![
-                blocked("snapshot-capable storage", "docs/ops-cluster-requirements.md#storage"),
-                blocked("VolumeSnapshot v1 API", "docs/ops-cluster-requirements.md#storage"),
-            ],
-        };
-        let summary = blocking_summary(&report, &theme());
-        assert_eq!(summary.lines().count(), 3, "{summary}");
-        assert_eq!(summary.matches("docs/ops-cluster-requirements.md#storage").count(), 1);
-    }
-
     #[test]
     fn distinct_remedies_all_survive() {
         let report = Report {

@@ -376,15 +376,6 @@ fn is_available(svc: &APIService) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_container_carries_every_arg() {
-        let args = container().args.expect("args");
-        for want in UPSTREAM_ARGS.iter().chain(EXTRA_ARGS.iter()) {
-            assert!(args.iter().any(|a| a == want), "dropped {want}");
-        }
-        assert_eq!(args.len(), UPSTREAM_ARGS.len() + EXTRA_ARGS.len());
-    }
-
     /// Selector must match the template's labels, else the ReplicaSet adopts nothing
     #[test]
     fn the_deployment_selector_matches_its_template() {

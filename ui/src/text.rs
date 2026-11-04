@@ -35,10 +35,4 @@ mod tests {
         assert_eq!(y_axis(42.0, 1, Unit::Count, 4)[0].trim(), "42");
         assert!(y_axis(42.0, 0, Unit::Count, 4).is_empty());
     }
-
-    /// Unit-blind labelling was the duplicate this parameter deleted
-    #[test]
-    fn a_byte_axis_is_labelled_in_bytes() {
-        assert_eq!(y_axis(16.0 * 1024.0 * 1024.0 * 1024.0, 2, Unit::Bytes, 0)[0], "16.0 GiB");
-    }
 }

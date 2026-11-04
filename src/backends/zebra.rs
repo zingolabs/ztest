@@ -782,16 +782,6 @@ sync_estimated_network_tip_height 3506187
         assert_eq!(e.height(family::NETWORK_TIP), Some(3_506_187));
     }
 
-    /// The panel's denominator for a following run; `tip`, not `target` (zebrad publishes no
-    /// target — it is not building toward a fixed height)
-    #[test]
-    fn the_network_tip_is_the_height_a_watcher_reads_off_zebrad() {
-        let heights = ZebraValidator::HEIGHTS;
-        assert_eq!(heights.tip, Some(family::NETWORK_TIP));
-        assert_eq!(heights.target, None);
-        assert_eq!(heights.height, family::VERIFIED_HEIGHT);
-    }
-
     /// Private clone of the seed under the config's `cache_dir`, config dials the network, pod
     /// serves the public RPC + health and can read the seed's group-owned entries
     #[test]

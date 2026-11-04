@@ -1257,28 +1257,35 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_footprint_admits_only_the_exact_sum_of_its_pods() {
+    fn a_declared_footprint_admits_the_exact_sum_of_its_pods() {
         let mut exact = DeployBudget::new(sync_declared(14, 15));
         exact.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(11)));
         exact.admit(&overridden("zebrad", Cpu::cores(5), Mem::gib(4)));
         assert_eq!(exact.committed, Resources::new(14_000, 15 * GIB, 0, 0));
         exact.close();
+    }
 
+    /// Names every pod + the fix, declared disk kept
+    #[test]
+    #[should_panic(expected = "QoS reserve slack: footprint declares 16c/24Gi/400Gi, but the \
+        component pods request 14c/20Gi.\n  zebrad: 6000m / 10737418240 B\n  \
+        zainod: 8000m / 10737418240 B\n\
+        A declared footprint must equal the sum of its pods — set it to `14c/20Gi/400Gi`.")]
+    fn a_declared_footprint_above_its_pods_is_refused_with_the_exact_fix() {
         let mut slack = DeployBudget::new(sync_declared(16, 24));
         slack.admit(&overridden("zebrad", Cpu::cores(6), Mem::gib(10)));
         slack.admit(&overridden("zainod", Cpu::cores(8), Mem::gib(10)));
-        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slack.close()))
-            .expect_err("2c/4Gi reserved past the pods must panic");
-        let msg = err.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
-        assert!(msg.contains("slack"), "names the fault: {msg}");
-        assert!(msg.contains("zebrad") && msg.contains("zainod"), "names every pod: {msg}");
-        assert!(msg.contains("set it to `14c/20Gi/400Gi`"), "names the fix, disk kept: {msg}");
+        slack.close();
     }
 
+    /// Each pod passes the per-pod guard alone, only the sum overflows; both pods named
     #[test]
+    #[should_panic(
+        expected = "QoS over-schedule: this test's component pods request 18000m cpu / \
+        15032385536 B in total, exceeding the 15000m cpu / 16106127360 B its tier reserved for \
+        them.\n  zainod: 9000m / 7516192768 B\n  zebrad: 9000m / 7516192768 B\n"
+    )]
     fn a_budget_rejects_overrides_that_only_overflow_in_aggregate() {
-        // The hole: each pod fits the ceiling alone (per-pod guard passes both),
-        // only the sum overflows
         let tier = sync_declared(15, 15);
         let each = overridden("p", Cpu::cores(9), Mem::gib(7));
         assert!(
@@ -1288,14 +1295,7 @@ mod tests {
 
         let mut b = DeployBudget::new(tier);
         b.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(7)));
-        let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            b.admit(&overridden("zebrad", Cpu::cores(9), Mem::gib(7)))
-        }))
-        .expect_err("18 cores across a 14-core ceiling must panic");
-        let msg = over.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
-        assert!(msg.contains("over-schedule"), "names the fault: {msg}");
-        // Both pods named, not just the one that crossed
-        assert!(msg.contains("zainod") && msg.contains("zebrad"), "{msg}");
+        b.admit(&overridden("zebrad", Cpu::cores(9), Mem::gib(7)));
     }
 
     /// The no-override path: pods carry the [`qos::pod`] defaults their backend rendered,
@@ -1327,26 +1327,11 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_footprint_still_rejects_an_overflow() {
-        let mut b = DeployBudget::new(sync_declared(15, 29));
-        b.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(24)));
-        let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            b.admit(&overridden("zebrad", Cpu::cores(5), Mem::gib(8)))
-        }))
-        .expect_err("32 GiB across a 29 GiB ceiling must panic");
-        let msg = over.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
-        assert!(msg.contains("over-schedule"), "names the fault: {msg}");
-    }
-
-    #[test]
+    #[should_panic(expected = "pod zainod .resources() override (9000m cpu / 32212254720 B) \
+        exceeds its tier footprint (15000m cpu / 31138512896 B)")]
     fn a_pod_over_a_declared_footprint_trips_the_per_pod_guard() {
         let mut b = DeployBudget::new(sync_declared(15, 29));
-        let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            b.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(30)))
-        }))
-        .expect_err("a single 30 GiB pod must not fit a 29 GiB reserve");
-        let msg = over.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
-        assert!(msg.contains("exceeds its tier footprint"), "names the fault: {msg}");
+        b.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(30)));
     }
 
     /// `deployed ≤ footprint` for the topology the tier is priced for → a test's real

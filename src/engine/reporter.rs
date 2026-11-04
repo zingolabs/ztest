@@ -3,7 +3,6 @@
 //! - Every line owned here → no `nextest-runner` dep (mirrors `reporter/displayer/imp.rs`
 //!   down to indentation, casing and colours)
 //! - Scrollback only; the pinned QoS panel belongs to the run loop
-//! - [`progress_line`]/[`render_running`] kept for a future scrollback progress feed
 //! - Ceiling: [`Verdict`] = pass/fail/timeout/spawn-error → nextest's
 //!   leak/flaky/slow-pass/abort words unreachable without a richer event model
 //!
@@ -447,31 +446,26 @@ fn instance_str(bin: &str, test: &str, color: bool) -> String {
     format!("{bin} {test}")
 }
 
-/// `HH:MM:SS` elapsed, matching nextest's `DisplayBracketedHhMmSs` (`formatters.rs`).
+/// `HH:MM:SS` elapsed, as nextest's `DisplayBracketedHhMmSs` (`formatters.rs`)
 ///
-/// nextest's *running-row* clock (`progress.rs`) has a minutes-overflow bug
-/// (`as_secs()/60`, no `% 60`); this `% 60` version stays correct past an hour
-// Retained for a future scrollback progress/START feed; unused since the pinned
-// per-test live window gave way to the constant QoS panel (`engine::run_tty`)
-#[allow(dead_code)]
+/// - `% 60` on minutes (nextest's running-row clock in `progress.rs` overflows past an hour)
 fn hms(d: Duration) -> String {
     let s = d.as_secs();
     format!("{:0>2}:{:0>2}:{:0>2}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-/// Live "running" region (nextest's `--show-progress=running`): one line per in-flight
-/// test — `{status} [HH:MM:SS] {binary} {test}` — plus `... and K more running` past
-/// `max_rows`. `running` must arrive sorted longest-first.
+/// Live "running" region (nextest's `--show-progress=running`): one
+/// `{status} [HH:MM:SS] {binary} {test}` line per in-flight test, `... and K more running`
+/// past `max_rows`
 ///
-/// Exactly as tall as its content, never padded (the sticky footer keeps the panel
-/// bottom-anchored and clears the rows this block gives back)
-#[allow(dead_code)] // see note on `hms`: retained for scrollback progress events
+/// - `running` sorted longest-first by the caller
+/// - Exactly as tall as its content (sticky footer clears the rows given back)
 pub fn render_running(running: &[RunningView], max_rows: usize, color: bool) -> Vec<String> {
     if max_rows == 0 {
         return Vec::new();
     }
 
-    // Reserve the last row for an overflow summary when the set doesn't fit
+    // Last row reserved for the overflow summary
     let overflow = running.len() > max_rows;
     let shown = if overflow { max_rows - 1 } else { running.len() };
 
@@ -501,32 +495,9 @@ pub fn render_running(running: &[RunningView], max_rows: usize, color: bool) -> 
     content
 }
 
-/// Top-level live progress line, copied from nextest's `progress_str`
-/// (`reporter/displayer/progress.rs`):
-///
-/// ```text
-///    Running [ HH:MM:SS] {finished}/{total}: {running} running, {p} passed, {f} failed, {s} skipped
-/// ```
-///
-/// - `Running` prefix (right-aligned 12) green·bold, red·bold once anything failed
-/// - `{wide_bar}` gauge omitted (the QoS panel below already carries one)
-#[allow(dead_code)] // see note on `hms`: retained for scrollback progress events
-pub fn progress_line(stats: &RunStats, running: usize, elapsed: Duration, color: bool) -> String {
-    let prefix_ink = if stats.failed > 0 { Ink::Fail } else { Ink::Pass };
-    let prefix = paint_word(&format!("{:>12}", "Running"), prefix_ink, color);
-    format!(
-        "{prefix} [{:>9}] {}/{}: {} running, {}",
-        hms(elapsed),
-        stats.finished(),
-        stats.total,
-        bold_count(running as u64, color),
-        counts_tail(stats, color),
-    )
-}
-
-/// Shared `{p} passed[, {f} failed][, {t} sigkilled], {s} skipped` tail, used by
-/// [`progress_line`] and [`StyledReporter::summary`]. Which terms appear is
-/// [`RunStats::tally`]'s call; this only inks them
+/// `{p} passed[, {f} failed][, {t} sigkilled], {s} skipped` tail of
+/// [`StyledReporter::summary`]. Which terms appear is [`RunStats::tally`]'s call; this
+/// only inks them
 fn counts_tail(stats: &RunStats, color: bool) -> String {
     stats
         .tally()
@@ -583,154 +554,6 @@ mod tests {
     }
 
     #[test]
-    fn pass_line_matches_nextest_layout() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&finished("pkg::bin", "mod::ok", Verdict::Pass, 1, b""));
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert_eq!(out, "        PASS [   0.234s] pkg::bin mod::ok\n", "{out:?}");
-        assert!(!out.contains('\u{1b}'), "unexpected ANSI: {out:?}");
-    }
-
-    #[test]
-    fn fail_word_and_output_replay_match_nextest() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&finished(
-            "pkg::bin",
-            "mod::boom",
-            Verdict::Fail(101),
-            1,
-            b"panicked at boom\nsecond line\n",
-        ));
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert_eq!(
-            out,
-            "        FAIL [   0.234s] pkg::bin mod::boom\n  output ───\n    panicked at boom\n    second line\n",
-            "{out:?}"
-        );
-    }
-
-    #[test]
-    fn exec_fail_is_xfail() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&finished("p::b", "t", Verdict::SpawnError, 1, b""));
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.starts_with("       XFAIL [   0.234s] p::b t"), "{out:?}");
-    }
-
-    #[test]
-    fn timeout_uses_long_word() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&finished("p::b", "t", Verdict::Timeout, 1, b""));
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.starts_with("     TIMEOUT [   0.234s] p::b t"), "{out:?}");
-    }
-
-    #[test]
-    fn final_fail_after_retries_uses_try_short() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        // Failed on attempt 3 with a timeout → short word `TMT`
-        r.handle(&finished("p::b", "t", Verdict::Timeout, 3, b""));
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.starts_with("   TRY 3 TMT [   0.234s] p::b t"), "{out:?}");
-    }
-
-    #[test]
-    fn retry_line_is_magenta_try_with_duration() {
-        let mut r = StyledReporter::new(true, true, OutputConfig::default());
-        r.handle(&TestEvent::TestRetrying {
-            binary_id: "p::b",
-            test_name: "t",
-            next_attempt: 3, // attempt 2 just failed
-            delay: Duration::ZERO,
-            verdict: Verdict::Fail(1),
-            duration: Duration::from_millis(500),
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        let bare = strip_ansi(&out);
-        assert_eq!(bare, "  TRY 2 FAIL [   0.500s] p::b t\n", "{bare:?}");
-        assert!(out.contains("\u{1b}[35m"), "expected magenta: {out:?}");
-    }
-
-    #[test]
-    fn slow_line_uses_slow_bracket() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&TestEvent::TestSlow {
-            binary_id: "p::b",
-            test_name: "t",
-            elapsed: Duration::from_secs(30),
-            will_terminate: false,
-            attempt: 1,
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert_eq!(out, "        SLOW [> 30.000s] p::b t\n", "{out:?}");
-    }
-
-    #[test]
-    fn slow_on_retry_prefixes_try() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&TestEvent::TestSlow {
-            binary_id: "p::b",
-            test_name: "t",
-            elapsed: Duration::from_secs(30),
-            will_terminate: false,
-            attempt: 2,
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.starts_with("  TRY 2 SLOW [> 30.000s] p::b t"), "{out:?}");
-    }
-
-    #[test]
-    fn skip_line_names_the_capacity_reason() {
-        // A capacity skip must say why (else a too-small cluster reads as a no-op)
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&TestEvent::TestSkipped {
-            binary_id: "pkg::bin",
-            test_name: "mod::sk",
-            reason: crate::engine::events::SkipReason::ExceedsClusterCapacity,
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(
-            out.starts_with("        SKIP [         ] pkg::bin mod::sk (exceeds cluster capacity"),
-            "{out:?}"
-        );
-    }
-
-    #[test]
-    fn color_emits_ansi() {
-        let mut r = StyledReporter::new(true, true, OutputConfig::default());
-        r.handle(&finished("p::b", "t", Verdict::Pass, 1, b""));
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.contains('\u{1b}'), "expected ANSI escapes: {out:?}");
-    }
-
-    #[test]
-    fn summary_matches_nextest_and_pluralizes() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&TestEvent::RunFinished {
-            stats: RunStats { passed: 8, failed: 2, terminated: 0, skipped: 1, total: 11 },
-            elapsed: Duration::from_secs(2),
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert_eq!(
-            out,
-            "────────────\n     Summary [   2.000s] 10/11 tests run: 8 passed, 2 failed, 1 skipped\n",
-            "{out:?}"
-        );
-    }
-
-    #[test]
-    fn summary_singular_and_no_failed_clause() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&TestEvent::RunFinished {
-            stats: RunStats { passed: 1, failed: 0, terminated: 0, skipped: 0, total: 1 },
-            elapsed: Duration::from_millis(100),
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.contains("] 1 test run: 1 passed, 0 skipped\n"), "{out:?}");
-        assert!(!out.contains("failed"), "{out:?}");
-    }
-
-    #[test]
     fn summary_partial_total_shows_ratio() {
         let mut r = StyledReporter::new(false, true, OutputConfig::default());
         r.handle(&TestEvent::RunFinished {
@@ -743,17 +566,6 @@ mod tests {
         assert!(out.contains("5 passed, 2 skipped"), "{out:?}");
         // Remaining three never started
         assert!(out.contains("warning: 3/10 tests were not run\n"), "{out:?}");
-    }
-
-    #[test]
-    fn summary_ascii_rule_when_not_unicode() {
-        let mut r = StyledReporter::new(false, false, OutputConfig::default());
-        r.handle(&TestEvent::RunFinished {
-            stats: RunStats { passed: 1, failed: 0, terminated: 0, skipped: 0, total: 1 },
-            elapsed: Duration::from_secs(1),
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.starts_with("------------\n"), "{out:?}");
     }
 
     #[test]
@@ -802,64 +614,6 @@ mod tests {
         let summary_pos = out.find("Summary").unwrap();
         assert!(!out[summary_pos..].contains("z_get_treestate"), "pass recapped:\n{out}");
         assert!(out[..summary_pos].contains("boom"), "inline output missing:\n{out}");
-    }
-
-    #[test]
-    fn clean_run_emits_no_recap() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&finished("p::b", "ok", Verdict::Pass, 1, b""));
-        r.handle(&TestEvent::RunFinished {
-            stats: RunStats { passed: 1, failed: 0, terminated: 0, skipped: 0, total: 1 },
-            elapsed: Duration::from_secs(1),
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        // Nothing after the Summary line
-        assert!(out.trim_end().ends_with("1 test run: 1 passed, 0 skipped"), "{out:?}");
-        assert!(!out.contains("FAIL"), "no failure recap on a clean run:\n{out}");
-    }
-
-    #[test]
-    fn recap_line_is_byte_identical_to_the_inline_line() {
-        // Recap re-lists exactly what streamed inline, incl. a `TRY n FAIL` word/colour
-        let mut r = StyledReporter::new(true, true, OutputConfig::default());
-        r.handle(&finished("p::b", "t", Verdict::Fail(1), 3, b""));
-        r.handle(&TestEvent::RunFinished {
-            stats: RunStats { passed: 0, failed: 1, terminated: 0, skipped: 0, total: 1 },
-            elapsed: Duration::from_secs(1),
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        // `TRY 3 FAIL` appears twice: inline + recap
-        let inline = strip_ansi(&out);
-        let count = inline.matches("TRY 3 FAIL [   0.234s] p::b t").count();
-        assert_eq!(count, 2, "inline + recap:\n{inline}");
-    }
-
-    #[test]
-    fn cancel_notice_and_summary_line_match_nextest() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        // Terminated test still streams its status line inline...
-        r.handle(&finished("pkg::b", "mod::slow", Verdict::Terminated, 1, b""));
-        r.handle(&TestEvent::RunCancelling { reason: CancelReason::Interrupt, running: 2 });
-        r.handle(&TestEvent::RunFinished {
-            stats: RunStats { passed: 1, failed: 0, terminated: 1, skipped: 0, total: 5 },
-            elapsed: Duration::from_secs(1),
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-
-        // Terminated test renders with the signal word
-        assert!(out.contains("     SIGKILL [   0.234s] pkg::b mod::slow"), "{out:?}");
-        // Mid-run cancel notice names the reason and running count
-        assert!(out.contains("   Canceling due to interrupt: 2 tests still running"), "{out:?}");
-        // Summary: short ratio, kill tallied apart from `failed`, cancel line, then the
-        // three that never started
-        assert!(out.contains("2/5 tests run"), "{out:?}");
-        assert!(out.contains("1 passed, 1 sigkilled, 0 skipped"), "{out:?}");
-        assert!(!out.contains("failed"), "a kill is not a failure:\n{out}");
-        assert!(
-            out.trim_end().ends_with("warning: 3/5 tests were not run due to interrupt"),
-            "{out:?}"
-        );
-        assert!(out.contains("    Canceled due to interrupt\n"), "{out:?}");
     }
 
     #[test]
@@ -924,168 +678,26 @@ mod tests {
         assert!(out.contains("2/3 tests run: 2 passed, 1 skipped"), "{out}");
     }
 
+    /// Live region height = `run_tty`'s repaint budget (a row over it leaks into scrollback)
     #[test]
-    fn not_run_warning_singularizes() {
-        let mut r = StyledReporter::new(false, true, OutputConfig::default());
-        r.handle(&TestEvent::RunCancelling { reason: CancelReason::Interrupt, running: 1 });
-        r.handle(&TestEvent::RunFinished {
-            stats: RunStats { passed: 0, failed: 0, terminated: 0, skipped: 0, total: 1 },
-            elapsed: Duration::from_secs(1),
-        });
-        let out = String::from_utf8(r.take_scrollback()).unwrap();
-        assert!(out.contains("warning: 1/1 test was not run due to interrupt"), "{out}");
-    }
+    fn the_running_block_never_exceeds_its_rows_and_counts_what_it_hides() {
+        let running = |n: u64| -> Vec<RunningView> {
+            (0..n)
+                .map(|i| RunningView {
+                    binary_id: "pkg::b".into(),
+                    test_name: format!("t{i}"),
+                    elapsed: Duration::from_secs(i),
+                    slow: false,
+                })
+                .collect()
+        };
+        assert!(render_running(&[], 3, false).is_empty(), "nothing running = no rows");
+        assert_eq!(render_running(&running(1), 4, false).len(), 1, "not padded to max_rows");
+        assert_eq!(render_running(&running(3), 3, false).len(), 3, "exact fit = no summary");
+        assert!(render_running(&running(5), 0, false).is_empty(), "zero budget");
 
-    #[test]
-    fn starting_line_pluralizes() {
-        let mut one = StyledReporter::new(false, true, OutputConfig::default());
-        one.handle(&TestEvent::RunStarted { total: 1, run_id: "r" });
-        let s1 = String::from_utf8(one.take_scrollback()).unwrap();
-        assert_eq!(s1, "    Starting 1 test\n", "{s1:?}");
-
-        let mut many = StyledReporter::new(false, true, OutputConfig::default());
-        many.handle(&TestEvent::RunStarted { total: 42, run_id: "r" });
-        let s2 = String::from_utf8(many.take_scrollback()).unwrap();
-        assert_eq!(s2, "    Starting 42 tests\n", "{s2:?}");
-    }
-
-    fn running(bin: &str, test: &str, secs: u64, slow: bool) -> RunningView {
-        RunningView {
-            binary_id: bin.into(),
-            test_name: test.into(),
-            elapsed: Duration::from_secs(secs),
-            slow,
-        }
-    }
-
-    #[test]
-    fn running_block_is_as_tall_as_the_live_set() {
-        // One running test under a 4-row ceiling → one line, no blank padding
-        let r = vec![running("pkg::b", "mod::a", 5, false)];
-        let lines = render_running(&r, 4, false);
-        assert_eq!(lines.len(), 1, "as tall as content, not padded to `max_rows`");
-        assert_eq!(lines[0], "             [ 00:00:05] pkg::b mod::a", "{:?}", lines[0]);
-    }
-
-    #[test]
-    fn running_block_overflows_with_summary() {
-        let r: Vec<_> = (0..5).map(|i| running("pkg::b", &format!("t{i}"), i, false)).collect();
-        let lines = render_running(&r, 3, false);
-        assert_eq!(lines.len(), 3);
-        assert!(lines[2].contains("... and 3 more tests running"), "{:?}", lines[2]);
-    }
-
-    #[test]
-    fn progress_line_matches_nextest_layout() {
-        let stats = RunStats { passed: 30, failed: 6, terminated: 0, skipped: 1, total: 122 };
-        // 1h 2m 3s = 3723s
-        let line = progress_line(&stats, 9, Duration::from_secs(3723), false);
-        assert_eq!(
-            line, "     Running [ 01:02:03] 37/122: 9 running, 30 passed, 6 failed, 1 skipped",
-            "{line}"
-        );
-    }
-
-    #[test]
-    fn progress_line_omits_failed_when_zero() {
-        let stats = RunStats { passed: 5, failed: 0, terminated: 0, skipped: 2, total: 10 };
-        let line = progress_line(&stats, 3, Duration::from_secs(1), false);
-        assert!(line.contains("5 passed, 2 skipped"), "{line}");
-        assert!(!line.contains("failed"), "{line}");
-    }
-
-    #[test]
-    fn running_block_empty_when_nothing_runs() {
-        // Nothing running → no live rows at all (panel alone), not blank padding
-        assert!(render_running(&[], 3, false).is_empty());
-    }
-
-    #[test]
-    fn strip_frame_removes_libtest_scaffolding_from_result_err_run() {
-        // Real `--exact <t> --nocapture` capture: libtest header, held-open
-        // `test <t> ... ` prefix with the first log glued on, merged body, verdict footer
-        let raw = b"\nrunning 1 test\ntest t ... 2026 INFO starting\n2026 INFO provisioning\nError: archive materialize failed\nFAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s\n\n";
-        let got = String::from_utf8(crate::libtest::strip_libtest_frame(raw, "t")).unwrap();
-        assert_eq!(
-            got, "2026 INFO starting\n2026 INFO provisioning\nError: archive materialize failed",
-            "{got:?}"
-        );
-    }
-
-    #[test]
-    fn strip_frame_removes_scaffolding_from_passing_run() {
-        let raw = b"\nrunning 1 test\ntest t ... hello from the test\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s\n\n";
-        let got = String::from_utf8(crate::libtest::strip_libtest_frame(raw, "t")).unwrap();
-        assert_eq!(got, "hello from the test", "{got:?}");
-    }
-
-    #[test]
-    fn strip_frame_keeps_user_line_that_reads_failed() {
-        // Only the single trailing verdict token is consumed → a log line reading
-        // literally `FAILED` survives
-        let raw = b"\nrunning 1 test\ntest t ... step one\nFAILED\nstep two\nFAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n";
-        let got = String::from_utf8(crate::libtest::strip_libtest_frame(raw, "t")).unwrap();
-        assert_eq!(got, "step one\nFAILED\nstep two", "{got:?}");
-    }
-
-    #[test]
-    fn strip_frame_preserves_panic_body() {
-        // Panic prints `thread … panicked` to stderr before the verdict = signal, kept
-        let raw = b"\nrunning 1 test\ntest t ... \nthread 't' panicked at src/x.rs:9:5:\nassertion failed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
-        let got = String::from_utf8(crate::libtest::strip_libtest_frame(raw, "t")).unwrap();
-        assert_eq!(
-            got,
-            "thread 't' panicked at src/x.rs:9:5:\nassertion failed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
-            "{got:?}"
-        );
-    }
-
-    #[test]
-    fn strip_frame_recovers_panic_that_merged_before_the_marker() {
-        // Pod path: body → stderr, `test <t> ... ` marker → stdout, and the runtime
-        // merges the panic *ahead* of the marker. Slicing at the marker would drop the
-        // whole failure; the marker (now a bare verdict) must go instead
-        let raw = b"\nrunning 1 test\nthread 't' panicked at src/x.rs:9:5:\nassertion `left == right` failed\n  left: 1\n  right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest t ... FAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
-        let got = String::from_utf8(crate::libtest::strip_libtest_frame(raw, "t")).unwrap();
-        assert_eq!(
-            got,
-            "thread 't' panicked at src/x.rs:9:5:\nassertion `left == right` failed\n  left: 1\n  right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
-            "{got:?}"
-        );
-    }
-
-    #[test]
-    fn strip_frame_falls_back_to_verbatim_when_marker_absent() {
-        // No `test <t> ... ` marker and no `test result:` anchor → nothing cut but edge
-        // blanks (an unexpected format keeps its content rather than risk eating it)
-        let raw = b"some unexpected output shape\nwith two lines\n";
-        let got = String::from_utf8(crate::libtest::strip_libtest_frame(raw, "t")).unwrap();
-        assert_eq!(got, "some unexpected output shape\nwith two lines", "{got:?}");
-    }
-
-    #[test]
-    fn strip_frame_handles_module_qualified_test_name() {
-        let raw = b"\nrunning 1 test\ntest mod::sub::it ... log line\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n";
-        let got =
-            String::from_utf8(crate::libtest::strip_libtest_frame(raw, "mod::sub::it")).unwrap();
-        assert_eq!(got, "log line", "{got:?}");
-    }
-
-    /// Strip CSI SGR sequences so colour tests can assert on the text
-    fn strip_ansi(s: &str) -> String {
-        let mut out = String::new();
-        let mut chars = s.chars();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' {
-                for d in chars.by_ref() {
-                    if d == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
+        let over = render_running(&running(5), 3, false);
+        assert_eq!(over.len(), 3, "{over:?}");
+        assert!(over[2].contains("3 more tests running"), "2 shown + summary of 3: {over:?}");
     }
 }

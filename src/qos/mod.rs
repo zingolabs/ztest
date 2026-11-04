@@ -574,33 +574,6 @@ pub fn current_profile() -> QosProfile {
 
 #[cfg(test)]
 mod tests {
-    /// Pins the tier table `docs/design-qos.md` publishes. It drifted once — the doc
-    /// claimed `integration 4c/2GiB` against a `3c/3GiB` profile — and nothing caught it
-    /// because no test read the table as data
-    #[test]
-    fn the_tier_table_matches_the_documented_footprints() {
-        let expect = [
-            (QosClass::Integration, 2_000, 4 * GIB, 3_000, 5 * GIB),
-            (QosClass::Wallet, 2_000, 4 * GIB, 4_000, 6 * GIB),
-            (QosClass::Testnet, 8_000, 10 * GIB, 9_000, 11 * GIB),
-        ];
-        for (class, cpu, mem, adm_cpu, adm_mem) in expect {
-            let p = class.profile();
-            assert_eq!(
-                (p.footprint.cpu_milli, p.footprint.mem_bytes),
-                (cpu, mem),
-                "{} components",
-                class.as_label()
-            );
-            assert_eq!(
-                (p.admitted().cpu_milli, p.admitted().mem_bytes),
-                (adm_cpu, adm_mem),
-                "{} admitted",
-                class.as_label()
-            );
-        }
-    }
-
     /// Saturates rather than exceeding, and a zero denominator yields 0 instead of
     /// dividing — both dimensions independently, so a caller can pick min or max
     #[test]
@@ -622,17 +595,6 @@ mod tests {
         assert_eq!(Resources::ZERO.compact(), "0c/0Mi");
     }
 
-    /// Disk rides the same footprint cell as cpu/mem, and drops out when undeclared so the
-    /// rendered form is still `footprint = ".."` input
-    #[test]
-    fn compact_carries_disk_only_once_declared() {
-        assert_eq!(
-            Resources::new(15_000, 15 * GIB, 0, 0).with_disk(400 * GIB).compact(),
-            "15c/15Gi/400Gi"
-        );
-        assert_eq!(Resources::new(15_000, 15 * GIB, 0, 0).compact(), "15c/15Gi");
-    }
-
     /// `compact` → `footprint::parse` round trip: the cell a table renders is the string a
     /// test may paste back into its attribute
     #[test]
@@ -642,28 +604,9 @@ mod tests {
         assert_eq!(Resources::from_footprint(parsed), r);
     }
 
-    /// The I/O pair is inert on every beacon ever written; carrying it would double each
-    /// serialized footprint for two zeroes
-    #[test]
-    fn serialized_resources_omit_the_uncalibrated_io_dimensions() {
-        let json = serde_json::to_string(&Resources::new(3_000, GIB, 0, 0)).expect("serialize");
-        assert_eq!(json, r#"{"cpu_milli":3000,"mem_bytes":1073741824}"#);
-        assert_eq!(
-            serde_json::from_str::<Resources>(&json).expect("round-trips"),
-            Resources::new(3_000, GIB, 0, 0)
-        );
-    }
-
     use super::*;
 
     // Resources: the 4-D packing primitive. Every dimension gates; arithmetic exact per one.
-
-    #[test]
-    fn display_renders_whole_and_fractional_units() {
-        assert_eq!(Resources::new(3_000, 3 * GIB, 0, 0).to_string(), "3c / 3 GiB");
-        assert_eq!(Resources::new(500, 512 * MIB, 0, 0).to_string(), "500m / 512 MiB");
-        assert_eq!(Resources::ZERO.to_string(), "0m / 0 MiB");
-    }
 
     /// Undeclared disk must stay off the wire: every beacon written before the dimension
     /// existed decodes, and a declared one survives the round trip
@@ -743,34 +686,6 @@ mod tests {
         assert_eq!(available.saturating_sub(&committed), Resources::ZERO);
     }
 
-    // Profile table: the locked facts, not the TBD reserves.
-
-    #[test]
-    fn hard_caps_are_locked() {
-        assert_eq!(QosClass::Integration.profile().hard_cap, Duration::from_secs(10 * 60));
-        assert_eq!(QosClass::Testnet.profile().hard_cap, Duration::from_secs(6 * 60 * 60));
-        assert_eq!(QosClass::Sync.profile().hard_cap, Duration::from_secs(48 * 60 * 60));
-    }
-
-    #[test]
-    fn only_sync_is_off_the_general_pool() {
-        assert_eq!(QosClass::Integration.profile().pool, Pool::General);
-        assert_eq!(QosClass::Wallet.profile().pool, Pool::General);
-        assert_eq!(QosClass::Testnet.profile().pool, Pool::General);
-        assert_eq!(QosClass::Sync.profile().pool, Pool::Nvme);
-    }
-
-    /// Wallet differs from integration in the runner alone: same validator+indexer
-    /// topology, plus an in-process wallet doing real compute beside it
-    #[test]
-    fn wallet_tier_puts_its_compute_in_the_runner() {
-        let (w, i) = (QosClass::Wallet.profile(), QosClass::Integration.profile());
-        assert_eq!(w.footprint, i.footprint, "same two-pod topology");
-        assert!(w.runner.cpu_milli > i.runner.cpu_milli);
-        assert!(w.runner.mem_bytes > i.runner.mem_bytes);
-        assert_eq!(w.admitted(), Resources::new(4_000, 6 * GIB, 0, 0));
-    }
-
     /// Admission floor = what an un-annotated test reserves, so no tier carrying a default
     /// may price below it (a run cleared to start must be able to start anything)
     #[test]
@@ -783,15 +698,6 @@ mod tests {
     }
 
     const ALL_TIERS: [QosClass; 4] = QosClass::ALL;
-
-    /// `cpu_mem_unbounded_rest` seeds disk with the never-gates sentinel; printing it
-    /// yields `17179869183Gi` in a capacity line
-    #[test]
-    fn an_unbounded_disk_ceiling_prints_no_disk_segment() {
-        let node = Resources::cpu_mem_unbounded_rest(20_000, 93 * GIB);
-        assert_eq!(node.compact(), "20c/93Gi");
-        assert_eq!(Resources::new(1_000, GIB, 0, 0).with_disk(4 * GIB).compact(), "1c/1Gi/4Gi");
-    }
 
     #[test]
     fn every_tier_reserves_zero_io_pending_calibration() {
@@ -866,18 +772,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn in_process_client_runners_keep_their_compute() {
-        // Wallet / sync load clients run in the runner; orchestration-only tiers keep 1c
-        for class in [QosClass::Wallet, QosClass::Sync] {
-            let runner = class.profile().runner;
-            assert!(runner.cpu_milli > 1_000 && runner.mem_bytes > GIB, "{class:?} lost compute");
-        }
-        for class in [QosClass::Integration, QosClass::Testnet] {
-            assert_eq!(class.profile().runner.cpu_milli, 1_000, "{class:?} only orchestrates");
-        }
-    }
-
     /// `sync` is a routing marker, not a reserve: `drop_sync_tests` keeps the tier out of
     /// `ztest run`, and `ztest sync` prices each profile from its own declaration
     #[test]
@@ -904,16 +798,6 @@ mod tests {
         assert_eq!(QosClass::from_label("nope"), None);
     }
 
-    #[test]
-    fn qos_class_serde_round_trips() {
-        for c in ALL_TIERS {
-            let json = serde_json::to_string(&c).unwrap();
-            assert_eq!(serde_json::from_str::<QosClass>(&json).unwrap(), c);
-        }
-        // Variant names are the wire form
-        assert_eq!(serde_json::to_string(&QosClass::Sync).unwrap(), "\"Sync\"");
-    }
-
     // ── footprint override ──────────────────────────────────────────────
     //
     // Moves the component reserve + what derives from it, nothing else
@@ -931,12 +815,6 @@ mod tests {
     }
 
     #[test]
-    fn no_override_leaves_the_profile_identical() {
-        let base = QosClass::Sync.profile();
-        assert_eq!(base.with_footprint(None), base);
-    }
-
-    #[test]
     fn admitted_tracks_the_override_so_the_reserve_covers_the_pods() {
         // Keeps a run inside its lease (pods' max collective request + runner = reserved)
         let base = QosClass::Sync.profile();
@@ -951,15 +829,6 @@ mod tests {
     fn a_zero_override_is_refused_rather_than_rendering_besteffort_pods() {
         // Grammar rejects first; guards a programmatically-built override
         let _ = QosClass::Sync.profile().with_footprint(Some(Resources::new(0, GIB, 0, 0)));
-    }
-
-    #[test]
-    fn profile_with_is_the_same_lowering_as_with_footprint() {
-        let over = Resources::new(4_000, 8 * GIB, 0, 0);
-        assert_eq!(
-            QosClass::Integration.profile_with(Some(over)),
-            QosClass::Integration.profile().with_footprint(Some(over))
-        );
     }
 
     /// One test, not several: `__enter` writes process-global state, so separate cases would

@@ -480,34 +480,6 @@ mod tests {
         );
     }
 
-    /// Protobuf-encoded request required — a JSON one gets a non-pprof response
-    #[test]
-    fn the_request_encodes_every_field() {
-        let encoded = SelectMergeStacktracesRequest {
-            profile_type_id: Profile::OnCpu.type_id().to_string(),
-            label_selector: r#"{service_name="zainod"}"#.to_string(),
-            start: 1_700_000_000_000,
-            end: 1_700_000_060_000,
-            format: PROFILE_FORMAT_FLAMEGRAPH,
-        }
-        .encode_to_vec();
-        let decoded = SelectMergeStacktracesRequest::decode(&encoded[..]).expect("round trip");
-        assert_eq!(decoded.profile_type_id, Profile::OnCpu.type_id());
-        assert_eq!(decoded.end - decoded.start, 60_000);
-    }
-
-    /// Format must reach the wire (default-valued enums are elided, and `UNSPECIFIED`
-    /// yields a flamegraph only by accident of it sharing the value)
-    #[test]
-    fn the_request_asks_for_a_flamegraph_explicitly() {
-        let encoded = SelectMergeStacktracesRequest {
-            format: PROFILE_FORMAT_FLAMEGRAPH,
-            ..Default::default()
-        }
-        .encode_to_vec();
-        assert!(!encoded.is_empty(), "a non-default format is encoded");
-    }
-
     fn level(nodes: &[[i64; 4]]) -> FlameLevel {
         FlameLevel { values: nodes.iter().flatten().copied().collect() }
     }

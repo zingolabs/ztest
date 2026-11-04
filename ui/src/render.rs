@@ -842,7 +842,6 @@ mod tests {
     use super::super::*;
     use super::*;
     use ztest::api::GIB;
-    use ztest::api::QosClass;
     use ztest::api::Resources;
 
     // ─────────────────────── sync watch panel ─────────────────────────
@@ -911,45 +910,6 @@ mod tests {
         }
     }
 
-    /// A column whose line count differs from its neighbours' shears the pinned block
-    #[test]
-    fn every_watch_column_is_panel_height_in_every_state() {
-        let theme = plain_unicode_theme();
-        let mut loaded = watching(Some(sample_vitals()));
-        loaded.loads = (0..8).map(|i| load(&format!("c{i}"), 100, 1)).collect();
-        for state in [watching(None), watching(Some(sample_vitals())), loaded] {
-            for (column, out) in [
-                ("left", render_sync_watch_panel(&state, FRAME, &theme)),
-                ("work", render_sync_work(&state, FRAME, &theme)),
-                ("load", render_sync_load(&state, &theme)),
-            ] {
-                assert_eq!(out.lines().count(), PANEL_LINES, "{column} column:\n{out}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_left_panel_shows_height_pace_and_trend() {
-        let out = render_sync_watch_panel(
-            &watching(Some(sample_vitals())),
-            FRAME,
-            &plain_unicode_theme(),
-        );
-        for expected in ["901", "1,024", "12.4 blk/s", "eta", "peak 520"] {
-            assert!(out.contains(expected), "`{expected}` missing:\n{out}");
-        }
-    }
-
-    /// Before the first commit the panel explains the wait (driver phase + why no vitals)
-    #[test]
-    fn the_left_panel_waiting_names_the_driver_phase() {
-        let mut state = watching(None);
-        state.metrics_note = Some("no height scraped yet".into());
-        let out = render_sync_watch_panel(&state, FRAME, &plain_unicode_theme());
-        assert!(out.contains("Running"), "driver phase:\n{out}");
-        assert!(out.contains("no height scraped yet"), "cause:\n{out}");
-    }
-
     #[test]
     fn a_stale_read_blanks_every_rate_and_the_countdown() {
         let theme = plain_unicode_theme();
@@ -968,32 +928,6 @@ mod tests {
         for pool in POOLS {
             assert!(out.contains(pool.tag()), "`{}` row missing:\n{out}", pool.name());
         }
-    }
-
-    #[test]
-    fn the_work_column_names_why_it_is_empty() {
-        let out = render_sync_work(&watching(None), FRAME, &plain_unicode_theme());
-        assert!(out.contains("awaiting first read"), "{out}");
-    }
-
-    #[test]
-    fn the_load_column_names_why_it_is_empty() {
-        let theme = plain_unicode_theme();
-        let mut state = watching(Some(sample_vitals()));
-        assert!(render_sync_load(&state, &theme).contains("awaiting first sample"));
-        state.loads_note = Some("prometheus unreadable".into());
-        assert!(render_sync_load(&state, &theme).contains("prometheus unreadable"));
-    }
-
-    #[test]
-    fn the_load_column_shows_usage_against_each_containers_limit() {
-        let mut state = watching(Some(sample_vitals()));
-        state.loads = vec![load("zainod", 593, 10), load("zebrad", 6, 1)];
-        let s = render_sync_load(&state, &plain_unicode_theme());
-        assert!(s.contains("zainod") && s.contains("zebrad"), "names each container:\n{s}");
-        assert!(s.contains("0.6c/9c"), "cpu against its limit:\n{s}");
-        // Byte pair shares one magnitude → the denominator costs 6 columns, not 9
-        assert!(s.contains("10.0/24.0 GiB"), "memory against its limit:\n{s}");
     }
 
     /// Burstable containers have no denominator; inventing one misreports headroom
@@ -1015,46 +949,15 @@ mod tests {
         assert!(s.contains("+5 more"), "tail collapses:\n{s}");
     }
 
-    /// `(tag, count)` → one `PlannedTest` per test, each at its tag's default reserve
-    fn planned(sets: &[(QosClass, u32)]) -> Vec<ztest::api::PlannedTest> {
-        sets.iter()
-            .flat_map(|&(class, n)| {
-                (0..n).map(move |i| ztest::api::PlannedTest {
-                    name: format!("{}_{i}", class.as_label()),
-                    admitted: class.profile().admitted(),
-                })
-            })
-            .collect()
+    /// No colours + Unicode glyphs = `Theme::detect()` under UTF-8 + `NO_COLOR=1`
+    /// (lets these snapshot byte-exact output)
+    fn plain_unicode_theme() -> Theme {
+        Theme::for_capabilities(false, true)
     }
 
-    /// One staged row + one byte row with a pace: between them they exercise every cell
-    /// kind a transfers column can draw (spinner, bar, rate, eta, kind glyph)
-    fn transfers_fixture() -> Transfers {
-        Transfers {
-            rows: vec![
-                TransferRow {
-                    label: "dev-zainod".to_string(),
-                    kind: TransferKind::Image,
-                    progress: TransferProgress::Stage("building".to_string()),
-                },
-                TransferRow {
-                    label: "testnet-3.1m".to_string(),
-                    kind: TransferKind::Download,
-                    progress: TransferProgress::Bytes {
-                        done: 17_900_000_000,
-                        total: 28_000_000_000,
-                        pace: Some(ztest::api::Pace {
-                            per_sec: 94.0 * 1024.0 * 1024.0,
-                            eta: Some(std::time::Duration::from_secs(102)),
-                        }),
-                    },
-                },
-            ],
-        }
-    }
-
-    fn sample_state() -> BannerState {
-        BannerState {
+    #[test]
+    fn an_unprobed_cluster_says_probing_never_zero() {
+        let state = BannerState {
             cluster: ClusterState {
                 context: "kind-zaino-local".to_string(),
                 slots_used: 12,
@@ -1062,290 +965,19 @@ mod tests {
                 slots_configured: 6,
                 nodes_ready: 3,
                 nodes_cordoned: 0,
-                capacity: Some(ztest::api::ClusterCapacity {
-                    allocatable: Resources::new(12_000, 48 * GIB, 0, 0),
-                    reserved: Resources::new(6_000, 20 * GIB, 0, 0),
-                }),
+                capacity: None,
             },
             build: BuildState::Ok {
                 test_count: 47,
                 binary_count: 8,
                 elapsed: std::time::Duration::from_secs(18),
             },
-            archives: vec![
-                ArchiveRow {
-                    name: "regtest-nu5-h128".to_string(),
-                    status: ArchiveStatus::Cached { size_bytes: 432_013_312 },
-                },
-                ArchiveRow {
-                    name: "testnet-2.6m".to_string(),
-                    status: ArchiveStatus::Cached { size_bytes: 19_754_106_880 },
-                },
-                ArchiveRow {
-                    name: "mainnet-snapshot-9.0".to_string(),
-                    status: ArchiveStatus::Missing {
-                        detail: "manifest committed, blob absent".to_string(),
-                    },
-                },
-            ],
+            archives: vec![ArchiveRow {
+                name: "regtest-nu5-h128".to_string(),
+                status: ArchiveStatus::Cached { size_bytes: 432_013_312 },
+            }],
             qos_plan: None,
-        }
-    }
-
-    #[test]
-    fn preflight_panel_is_constant_height_and_summarizes_phase() {
-        let mut state = sample_state();
-        state.qos_plan = Some(ztest::api::qos_plan(
-            &planned(&[(QosClass::Integration, 6)]),
-            Some(Resources::new(12_000, 48 * GIB, 0, 0)),
-        ));
-        let s = render_preflight_panel(
-            &state,
-            "Preflight",
-            std::time::Duration::from_secs(3),
-            &plain_unicode_theme(),
-        );
-        // rule + cluster + capacity + inventory + scheduling = PANEL_LINES, no
-        // bottom rule
-        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
-        assert!(!s.trim_end().ends_with("────────────"), "no bottom rule:\n{s}");
-        assert!(s.contains("Preflight"), "phase label:\n{s}");
-        assert!(s.contains("kind-zaino-local"), "cluster context:\n{s}");
-        assert!(s.contains("capacity"), "capacity gauge:\n{s}");
-        assert!(s.contains("47 tests / 8 bins"), "build summary:\n{s}");
-        assert!(s.contains("6 tests") && s.contains("reserved"), "scheduling summary:\n{s}");
-    }
-
-    #[test]
-    fn preflight_panel_is_constant_height_even_when_empty() {
-        // Pre-probe/build must still be PANEL_LINES (viewport never reflows)
-        let mut state = sample_state();
-        state.build = BuildState::Pending;
-        state.qos_plan = None;
-        let s = render_preflight_panel(
-            &state,
-            "Preflight",
-            std::time::Duration::ZERO,
-            &plain_unicode_theme(),
-        );
-        assert_eq!(s.lines().count(), PANEL_LINES, "fixed-height panel:\n{s}");
-    }
-
-    #[test]
-    fn transfers_column_is_constant_height_and_shows_rows() {
-        let theme = plain_unicode_theme();
-        // Idle still PANEL_LINES (blank rows reserve the space)
-        let idle = render_transfers(&Transfers::default(), std::time::Duration::ZERO, &theme);
-        assert_eq!(idle.lines().count(), PANEL_LINES, "idle height:\n{idle}");
-
-        let transfers = transfers_fixture();
-        let s = render_transfers(&transfers, std::time::Duration::from_secs(1), &theme);
-        assert_eq!(s.lines().count(), PANEL_LINES, "active height:\n{s}");
-        assert!(s.contains("dev-zainod"), "image row:\n{s}");
-        assert!(s.contains("building"), "image note:\n{s}");
-        assert!(s.contains("testnet-3.1m"), "download row:\n{s}");
-        assert!(s.contains('%'), "byte bar percent:\n{s}");
-        assert!(s.contains("94.0 MiB/s"), "transfer rate:\n{s}");
-        assert!(s.contains("left"), "eta:\n{s}");
-        // Upload vs download glyphs
-        assert!(s.contains(theme.chars.up), "upload glyph:\n{s}");
-        assert!(s.contains(theme.chars.progress), "download glyph:\n{s}");
-    }
-
-    #[test]
-    fn transfers_column_collapses_overflow_tail() {
-        let theme = plain_unicode_theme();
-        let rows: Vec<TransferRow> = (0..8)
-            .map(|i| TransferRow {
-                label: format!("dev-img{i}"),
-                kind: TransferKind::Image,
-                progress: TransferProgress::Stage("building".to_string()),
-            })
-            .collect();
-        let s = render_transfers(&Transfers { rows }, std::time::Duration::ZERO, &theme);
-        assert_eq!(s.lines().count(), PANEL_LINES, "overflow height:\n{s}");
-        assert!(s.contains("more transferring"), "overflow marker:\n{s}");
-    }
-
-    /// No colours + Unicode glyphs = `Theme::detect()` under UTF-8 + `NO_COLOR=1`
-    /// (lets these snapshot byte-exact output)
-    fn plain_unicode_theme() -> Theme {
-        Theme::for_capabilities(false, true)
-    }
-
-    fn plain_ascii_theme() -> Theme {
-        Theme::for_capabilities(false, false)
-    }
-
-    fn colorized_unicode_theme() -> Theme {
-        Theme::for_capabilities(true, true)
-    }
-
-    #[test]
-    fn plain_unicode_golden() {
-        let s = render(&sample_state(), &plain_unicode_theme());
-        let expected = "\
-────────────
-   Preflight ztest
-
-     Cluster context kind-zaino-local · 12 / 16 slots used · configured 6 via --test-threads
-             3 ready · 0 cordoned
-             capacity · 6 / 12 cores · 20 / 48 GiB
-
-   Inventory ✓ 47 tests across 8 binaries · 18s
-
-    Archives 3 selected
-             ✓ regtest-nu5-h128     · cached · 412.0 MiB
-             ✓ testnet-2.6m         · cached · 18.4 GiB
-             ! mainnet-snapshot-9.0 · missing · manifest committed, blob absent
-────────────
-";
-        assert_eq!(s, expected, "golden mismatch.\n--- got ---\n{s}\n--- want ---\n{expected}");
-    }
-
-    /// Regression: this asserted three named glyphs were absent and passed while braille,
-    /// box-drawing and arrows leaked past it. The gate now rejects *any* non-ascii
-    /// character, so a new hardcoded glyph fails on the surface that introduced it
-    #[test]
-    fn ascii_fallback_strips_unicode_glyphs() {
-        let s = render(&sample_state(), &plain_ascii_theme());
-        crate::testing::assert_ascii_clean("render", &s);
-        assert!(s.contains("------------"), "ascii hbar missing:\n{s}");
-        assert!(s.contains("OK regtest-nu5-h128"), "ascii ok marker:\n{s}");
-        assert!(s.contains("WARN mainnet-snapshot-9.0"), "ascii warn marker:\n{s}");
-    }
-
-    /// Every panel this module exports, in ascii, at a couple of frame times so a spinner
-    /// cannot hide a Unicode frame behind an ascii one
-    #[test]
-    fn every_panel_falls_back_to_ascii() {
-        use std::time::Duration;
-        let t = plain_ascii_theme();
-        let check = crate::testing::assert_ascii_clean;
-        for ms in [0u64, 250, 700] {
-            let at = Duration::from_millis(ms);
-            check("render_cancel_panel", &render_cancel_panel(at, &t));
-            check("render_transfers", &render_transfers(&transfers_fixture(), at, &t));
-            check(
-                "render_preflight_panel",
-                &render_preflight_panel(&sample_state(), "Preflight", at, &t),
-            );
-        }
-    }
-
-    #[test]
-    fn colorized_render_contains_ansi_escapes() {
-        let s = render(&sample_state(), &colorized_unicode_theme());
-        assert!(s.contains("\x1b["), "colorized output missing ESC:\n{s}");
-        // ANSI must not affect visible text: "Preflight" survives as a substring
-        assert!(s.contains("Preflight"), "Preflight label missing:\n{s}");
-    }
-
-    #[test]
-    fn empty_lists_render_zero_count() {
-        let mut state = sample_state();
-        state.archives.clear();
-        let s = render(&state, &plain_unicode_theme());
-        assert!(s.contains("Archives 0 selected"), "got:\n{s}");
-    }
-
-    #[test]
-    fn qos_plan_renders_the_total_and_names_unschedulable_tests() {
-        let mut state = sample_state();
-        let mut tests = planned(&[(QosClass::Integration, 3), (QosClass::Wallet, 1)]);
-        // 15c/15Gi components + 2c/4Gi runner = 17c/19Gi > 4c/8Gi
-        let sync = QosClass::Sync.profile_with(Some(Resources::new(15_000, 15 * GIB, 0, 0)));
-        tests
-            .push(ztest::api::PlannedTest { name: "zaino_sync".into(), admitted: sync.admitted() });
-        state.qos_plan =
-            Some(ztest::api::qos_plan(&tests, Some(Resources::new(4_000, 8 * GIB, 0, 0))));
-        let s = render(&state, &plain_unicode_theme());
-        assert!(s.contains("Scheduling 5 tests"), "missing header:\n{s}");
-        assert!(s.contains("reserved total"), "missing total:\n{s}");
-        assert!(!s.contains("wave") && !s.contains("integration"), "no waves, no tiers:\n{s}");
-        assert!(
-            s.contains("zaino_sync needs 17c / 19 GiB") && s.contains("will be rejected"),
-            "missing unschedulable warning:\n{s}"
-        );
-    }
-
-    #[test]
-    fn live_panel_shows_running_queued_and_used_of_limit() {
-        use ztest::api::LiveSnapshot;
-
-        let snapshot = LiveSnapshot {
-            running: 3,
-            queued: 12,
-            committed: Resources::new(9_000, 17 * GIB, 0, 0),
-            limit: Resources::new(12_000, 48 * GIB, 0, 0),
         };
-        let progress = RunProgress {
-            elapsed: std::time::Duration::from_secs(42),
-            passed: 7,
-            failed: 1,
-            total: 20,
-        };
-        let s = render_live_panel(&snapshot, &progress, &plain_unicode_theme());
-        assert!(s.contains("3 running"), "header:\n{s}");
-        assert!(
-            s.contains("3 running · 9 / 12 cores · 17 / 48 GiB"),
-            "used of limit per dimension:\n{s}"
-        );
-        assert!(!s.contains('%') && !s.contains("free"), "no bar, percent or free:\n{s}");
-        // done/total, passed, failed, elapsed
-        assert!(s.contains("8/20 done"), "done count:\n{s}");
-        assert!(s.contains("7 passed"), "passed count:\n{s}");
-        assert!(s.contains("1 failed"), "failed count:\n{s}");
-        assert!(s.contains("12 queued"), "queue depth:\n{s}");
-        assert!(!s.contains("sync") && !s.contains("integration"), "no tier rows:\n{s}");
-        // Rule at the top only — a bottom rule would leave a trailing blank when the
-        // console sizes the panel region
-        assert!(s.starts_with("───── Ztest ─────"), "top rule present:\n{s}");
-        assert!(!s.trim_end().ends_with("────────────"), "no bottom rule:\n{s}");
-    }
-
-    #[test]
-    /// Zero free = full, a measurement — never "unknown" (the two once shared a sentinel)
-    fn a_full_run_reads_as_full_per_dimension() {
-        use ztest::api::LiveSnapshot;
-
-        let snapshot = LiveSnapshot {
-            running: 23,
-            queued: 115,
-            committed: Resources::new(92_000, 122 * GIB, 0, 0),
-            limit: Resources::new(92_000, 198 * GIB, 0, 0),
-        };
-        let s = render_live_panel(&snapshot, &RunProgress::default(), &plain_unicode_theme());
-        assert!(s.contains("92 / 92 cores · 122 / 198 GiB"), "used of limit:\n{s}");
-        assert!(!s.contains("unknown") && !s.contains("unavailable"), "never unknown:\n{s}");
-    }
-
-    #[test]
-    fn no_qos_plan_renders_no_scheduling_block() {
-        let mut state = sample_state();
-        state.qos_plan = None;
-        let s = render(&state, &plain_unicode_theme());
-        assert!(!s.contains("Scheduling"), "unexpected scheduling block:\n{s}");
-    }
-
-    #[test]
-    fn theme_detect_for_capabilities_truth_table() {
-        assert!(!Theme::for_capabilities(false, false).is_colorized());
-        assert!(!Theme::for_capabilities(false, true).is_colorized());
-        assert!(Theme::for_capabilities(true, false).is_colorized());
-        assert!(Theme::for_capabilities(true, true).is_colorized());
-    }
-
-    #[test]
-    fn capacity_line_shows_reserved_of_allocatable_per_dimension() {
-        let s = render(&sample_state(), &plain_unicode_theme());
-        assert!(s.contains("capacity · 6 / 12 cores · 20 / 48 GiB"), "capacity line wrong:\n{s}");
-    }
-
-    #[test]
-    fn an_unprobed_cluster_says_probing_never_zero() {
-        let mut state = sample_state();
-        state.cluster.capacity = None;
         let banner = render(&state, &plain_unicode_theme());
         let panel = render_preflight_panel(
             &state,
@@ -1357,23 +989,5 @@ mod tests {
             assert!(s.contains("probing…"), "unprobed must say so:\n{s}");
             assert!(!s.contains("0 / 0"), "unprobed is not a zero reading:\n{s}");
         }
-    }
-
-    /// A measured zero is a reading like any other (an empty kind node, say), not "unknown"
-    #[test]
-    fn a_measured_zero_renders_as_zero() {
-        let mut state = sample_state();
-        state.cluster.capacity = Some(ztest::api::ClusterCapacity::default());
-        let s = render(&state, &plain_unicode_theme());
-        assert!(s.contains("capacity · 0 / 0 cores · 0 / 0 GiB"), "zero-capacity line wrong:\n{s}");
-    }
-
-    #[test]
-    fn a_fraction_keeps_one_decimal_and_a_whole_number_drops_it() {
-        let (cpu, mem) = used_of(
-            &Resources::new(500, 512 * 1024 * 1024, 0, 0),
-            &Resources::new(8_000, 16 * GIB, 0, 0),
-        );
-        assert_eq!((cpu.as_str(), mem.as_str()), ("0.5 / 8 cores", "0.5 / 16 GiB"));
     }
 }

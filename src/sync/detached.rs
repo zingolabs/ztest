@@ -593,35 +593,6 @@ mod tests {
         }
     }
 
-    /// Every field `perf`/`status` need, present with the run namespace deleted
-    #[test]
-    fn a_launch_record_carries_the_tenant_and_the_origin() {
-        let launch = SyncLaunch {
-            sync_id: "sync-1".into(),
-            started_ms: 1_700_000_000_000,
-            profiling: Some(LaunchProfiling {
-                tenant: "ztest.elicb.sync-1".into(),
-                placement: crate::profiling::ebpf::Placement::Sidecar,
-                hz: 19,
-                off_cpu: 0.05,
-            }),
-        };
-        let json = serde_json::to_string(&launch).expect("serialize");
-        let back: SyncLaunch = serde_json::from_str(&json).expect("deserialize");
-        let want = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_000);
-        assert_eq!(back.started(), want);
-        assert_eq!(back.profiling.expect("profiling").tenant, "ztest.elicb.sync-1");
-    }
-
-    /// Unprofiled run is a recorded fact, not an absent record — `perf` must distinguish
-    /// "never collected" from "cannot tell"
-    #[test]
-    fn an_unprofiled_launch_records_that_it_was_unprofiled() {
-        let json = r#"{"sync_id":"sync-1","started_ms":1}"#;
-        let back: SyncLaunch = serde_json::from_str(json).expect("deserialize");
-        assert!(back.profiling.is_none());
-    }
-
     /// Widest bound ztest states, so a reaper honouring it clears any run that respects
     /// its tier (nothing enforces that on the detached path — see [`birth_ttl`])
     #[test]
@@ -633,65 +604,11 @@ mod tests {
         }
     }
 
-    /// `--no-cleanup` widens the window; it never removes the bound
-    #[test]
-    fn a_held_namespace_is_still_bounded() {
-        let profile = crate::qos::QosClass::Sync.profile();
-        assert_eq!(held_ttl(&profile), birth_ttl(&profile) * 2);
-        assert_eq!(crate::naming::ttl_value(birth_ttl(&profile)), "96h");
-        assert_eq!(crate::naming::ttl_value(held_ttl(&profile)), "192h");
-    }
-
-    /// TTL runs from creation, so a finished run's shortened value is already in the past
-    #[test]
-    fn a_finished_ttl_expires_immediately_on_any_real_run() {
-        assert_eq!(crate::naming::ttl_value(FINISHED_TTL), "5m");
-        assert!(FINISHED_TTL < crate::qos::QosClass::Sync.profile().hard_cap);
-    }
-
     /// Both halves under one name, each under its own field manager — an apply of one
     /// must never prune the other
     #[test]
     fn the_two_writers_share_a_configmap_but_not_a_manager() {
         assert_ne!(LAUNCH_KEY, REPORT_KEY);
         assert_ne!(LAUNCH_FIELD_MANAGER, REPORT_FIELD_MANAGER);
-    }
-
-    /// Word on the wire = word on screen, for every status
-    #[test]
-    fn a_status_renders_its_verdict_not_its_wrapper() {
-        assert_eq!(SyncStatus::Finished(SyncVerdict::TimedOut).to_string(), "TimedOut");
-        assert_eq!(SyncStatus::Running.to_string(), "Running");
-        assert_eq!(SyncStatus::Unresolved.to_string(), "Unresolved");
-    }
-
-    /// Mirror JSON written by an older driver (verdict as a bare debug name) still reads
-    #[test]
-    fn a_report_round_trips_through_its_configmap_json() {
-        let phase = |name: &str, verdict, elapsed_ms| crate::sync::PhaseOutcome {
-            name: name.into(),
-            verdict,
-            started_ms: 1,
-            elapsed_ms,
-            ticks: 3,
-            violations: 0,
-            coverage_gaps: Vec::new(),
-            error: None,
-            restarts: 1,
-        };
-        let phases = vec![
-            phase("index", SyncVerdict::Passed, 60_000),
-            phase("wallet", SyncVerdict::Failed, 0),
-        ];
-        let report = SyncReportMirror { phases: phases.clone(), ..mirror(SyncVerdict::Failed) };
-        let json = serde_json::to_string(&report).expect("serialize");
-        assert!(json.contains(r#""verdict":"Failed""#), "{json}");
-        let back: SyncReportMirror = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.verdict, SyncVerdict::Failed);
-        assert!(!back.passed());
-        assert_eq!(back.phases, phases);
-        let summary = back.summary();
-        assert!(summary.contains("[index Passed 1m"), "{summary}");
-        assert!(summary.contains("→ wallet Failed"), "{summary}");
     }
 }

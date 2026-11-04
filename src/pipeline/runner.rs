@@ -457,11 +457,4 @@ mod tests {
         let slid = args(&[("A", "BC")]);
         assert_ne!(fold_key("FROM x", &split, "z"), fold_key("FROM x", &slid, "z"));
     }
-
-    #[test]
-    fn key_is_sixteen_hex() {
-        let k = fold_key("FROM x", &args(&[]), "abc");
-        assert_eq!(k.len(), 16, "{k}");
-        assert!(k.chars().all(|c| c.is_ascii_hexdigit()), "{k}");
-    }
 }

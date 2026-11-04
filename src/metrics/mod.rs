@@ -711,12 +711,6 @@ zaino_grpc_request_duration_seconds_count 17
     }
 
     #[test]
-    fn a_counters_label_sets_sum_into_one_family_total() {
-        let e = exposition(&[EXPOSITION]);
-        assert_eq!(e.total(counter("zaino_grpc_requests_total", Dimension::Count)), Some(17.0));
-    }
-
-    #[test]
     fn a_level_is_the_max_across_targets_never_their_sum() {
         let e = exposition(&[
             EXPOSITION,

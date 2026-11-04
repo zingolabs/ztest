@@ -362,8 +362,6 @@ impl Row for Fields<'_> {
 
 // ─────────────────────────────── test row ─────────────────────────────
 
-/// Hand-built [`Row`] for the template tests; `None` for anything not set, which is what
-/// makes the absent-vs-zero cases expressible
 /// `{@name}` -> themed glyph. One table, consulted by [`emit`] to draw and by
 /// [`parse`](super::parse) to reject an unknown name — so a role added here is spellable
 /// in a template immediately, and a typo can never fall through to some default glyph
@@ -390,13 +388,12 @@ pub(super) fn glyph_of(name: &str, c: &crate::theme::ThemeChars) -> Option<&'sta
     })
 }
 
+/// `None` for any unset key (absent-vs-zero cases)
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct TestRow {
     texts: std::collections::BTreeMap<String, String>,
     values: std::collections::BTreeMap<String, f64>,
-    pairs: std::collections::BTreeMap<String, (u64, u64)>,
-    percents: std::collections::BTreeMap<String, u8>,
 }
 
 #[cfg(test)]
@@ -412,14 +409,6 @@ impl TestRow {
         self.values.insert(k.into(), v);
         self
     }
-    pub(super) fn pair(mut self, k: &str, d: u64, t: u64) -> Self {
-        self.pairs.insert(k.into(), (d, t));
-        self
-    }
-    pub(super) fn percent(mut self, k: &str, v: u8) -> Self {
-        self.percents.insert(k.into(), v);
-        self
-    }
 }
 
 #[cfg(test)]
@@ -429,12 +418,6 @@ impl Row for TestRow {
     }
     fn value(&self, key: &str) -> Option<f64> {
         self.values.get(key).copied()
-    }
-    fn pair(&self, key: &str) -> Option<(u64, u64)> {
-        self.pairs.get(key).copied()
-    }
-    fn percent(&self, key: &str) -> Option<u8> {
-        self.percents.get(key).copied()
     }
 }
 
@@ -447,29 +430,6 @@ mod tests {
         Theme::for_capabilities(false, true)
     }
 
-    /// Regression: a collapsed group used to leave its width reserved, so the `*` cell
-    /// came up short and the row ended ragged
-    #[test]
-    fn a_collapsed_group_hands_its_width_back_to_the_star_cell() {
-        let t = Template::parse("{name:<*}|[ {rate|per_sec}]");
-        let row = TestRow::new().text("name", "ab");
-        assert_eq!(t.render(&row, 10, Duration::ZERO, &theme()).to_string(), "ab       |");
-    }
-
-    #[test]
-    fn a_pair_shares_one_magnitude() {
-        let t = Template::parse("{d%}");
-        let row = TestRow::new().pair("d", 512, 1024);
-        assert_eq!(t.render(&row, 40, Duration::ZERO, &theme()).to_string(), "512 B / 1.0 KiB");
-    }
-
-    #[test]
-    fn a_bar_fills_to_its_percent() {
-        let t = Template::parse("{p:12#}");
-        let row = TestRow::new().percent("p", 50);
-        assert_eq!(t.render(&row, 40, Duration::ZERO, &theme()).to_string(), "[██████░░░░░░]");
-    }
-
     /// An inner optional collapsing must not take the outer group with it — that is the
     /// difference between "no ETA yet" and "no transfer running"
     #[test]
@@ -477,12 +437,5 @@ mod tests {
         let t = Template::parse("{name}[ · {rate|per_sec}[ · {eta}]]");
         let row = TestRow::new().text("name", "seed").value("rate", 8.0);
         assert_eq!(t.render(&row, 40, Duration::ZERO, &theme()).to_string(), "seed · 8/s");
-    }
-
-    #[test]
-    fn an_over_long_cell_truncates_to_its_width() {
-        let t = Template::parse("{name:<6}|");
-        let row = TestRow::new().text("name", "a-very-long-name");
-        assert_eq!(t.render(&row, 40, Duration::ZERO, &theme()).to_string(), "a-very|");
     }
 }

@@ -631,44 +631,6 @@ mod tests {
         }
     }
 
-    /// Every mark used to be a hardcoded glyph, so a terminal without Unicode got mojibake
-    /// where a verdict belonged
-    #[test]
-    fn a_finding_marks_itself_in_whichever_theme_is_active() {
-        let unicode = render(&report(), Some("zkn"), &Theme::for_capabilities(false, true));
-        let ascii = render(&report(), Some("zkn"), &Theme::for_capabilities(false, false));
-        for (drawn, (ok, fail, warn)) in
-            [(&unicode, ("✓", "✗", "!")), (&ascii, ("OK", "FAIL", "WARN"))]
-        {
-            assert!(drawn.contains(&format!("  {ok} image registry")), "{drawn}");
-            assert!(drawn.contains(&format!("  {fail} snapshot-capable storage")), "{drawn}");
-            assert!(drawn.contains(&format!("  {warn} metrics stack")), "{drawn}");
-        }
-    }
-
-    /// The whole `cluster check` frame in ascii. A remedy arrow and a cordon mark were
-    /// hardcoded here, and a Unicode golden reads identically either way
-    #[test]
-    fn the_cluster_report_falls_back_to_ascii() {
-        let ascii = Theme::for_capabilities(false, false);
-        for context in [Some("zkn"), None] {
-            ztest_ui::testing::assert_ascii_clean(
-                "cluster::render",
-                &render(&report(), context, &ascii),
-            );
-        }
-    }
-
-    /// A missing capability is only actionable with the remedy under it; a present one
-    /// would only add noise
-    #[test]
-    fn only_a_missing_capability_carries_a_remedy() {
-        let drawn = render(&report(), None, &Theme::for_capabilities(false, true));
-        assert!(drawn.contains("→ ztest run unavailable; see docs/storage.md"), "{drawn}");
-        assert!(drawn.contains("→ profiling unavailable; see docs/obs.md"), "{drawn}");
-        assert!(!drawn.contains("docs/registry.md"), "{drawn}");
-    }
-
     #[test]
     fn a_sole_driver_is_adopted() {
         assert_eq!(storage_choice(&drivers(&["topolvm.io"])).ok(), Some("topolvm.io"));

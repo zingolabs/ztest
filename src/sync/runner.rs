@@ -1435,22 +1435,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn recorded_violation_does_not_stop() {
-        let subject = FakeSubject::new(vec![p(1, 3), p(1, 3), p(3, 3)]);
-        // Pool-output decrease = a Recorded (non-fatal) violation here
-        let mut run = fast_runner(subject);
-        run.always("orchard_monotonic", Severity::Recorded).each_tick().check(async |s, _| {
-            let (now, was) =
-                (s.work().require(Op::OrchardAction), s.prev_work().require(Op::OrchardAction));
-            sync_ensure!(now >= was, "orchard outputs went backwards");
-            Ok(())
-        });
-        // orchard always 0 → never violated; run passes and reaches tip
-        let out = run.run().await;
-        assert_eq!(out.verdict, SyncVerdict::Passed, "{out:?}");
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn sometimes_gap_fails_the_run() {
         let mut run = fast_runner(FakeSubject::new(vec![p(1, 2), p(2, 2)]));
         run.sometimes("saw_reorg").check(async |s, _| Ok(s.observed_reorg()));

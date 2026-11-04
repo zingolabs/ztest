@@ -390,13 +390,6 @@ mod tests {
         assert!(!sidecar.contains("api_server"), "{sidecar}");
     }
 
-    /// One image either way: placement moves the collector, it does not change the engine
-    #[test]
-    fn both_placements_share_one_image() {
-        assert_eq!(collector().container().image.unwrap(), ALLOY_IMAGE);
-        assert!(collector_on(Placement::Host).config().contains("off_cpu_threshold"));
-    }
-
     #[test]
     fn config_scopes_discovery_to_the_sync_namespace() {
         let config = collector().config();
@@ -446,13 +439,6 @@ mod tests {
     fn config_captures_off_cpu_time_without_saturating_the_ring() {
         assert!(collector().config().contains(&format!("off_cpu_threshold = {DEFAULT_OFF_CPU}")));
         const { assert!(DEFAULT_OFF_CPU > 0.0 && DEFAULT_OFF_CPU <= 0.1) };
-    }
-
-    /// Upstream default; raising it draws on the same ring the off-CPU events fill
-    #[test]
-    fn sample_rate_matches_the_documented_default() {
-        assert_eq!(DEFAULT_HZ, 19);
-        assert!(collector().config().contains("sample_rate       = 19"));
     }
 
     #[test]

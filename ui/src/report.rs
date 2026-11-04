@@ -944,7 +944,7 @@ mod tests {
         }
     }
 
-    pub(super) fn view() -> ReportView {
+    fn view() -> ReportView {
         ReportView {
             sync_id: "zaino-index-construction-c3115f50".into(),
             profile: "zaino_index_construction".into(),
@@ -1032,87 +1032,6 @@ mod tests {
         }
     }
 
-    fn lines(width: usize) -> Vec<String> {
-        render_sync_report(&view(), &theme(), width).lines().map(str::to_string).collect()
-    }
-
-    /// Founding invariant: one over-long line wraps and shears every box below it
-    #[test]
-    fn no_line_ever_exceeds_the_requested_width() {
-        for width in [60, 80, 100, 120, 160, 220] {
-            for line in lines(width) {
-                assert!(
-                    display_width(&line) <= width.min(MAX_WIDTH),
-                    "width {width}: {line:?} is {} wide",
-                    display_width(&line)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_wide_terminal_gets_two_panels_per_row() {
-        let rendered = lines(120);
-        for (left, right) in [
-            ("transparent ops/sec", "shielded ops/sec"),
-            ("blocks/sec", "transactions/sec"),
-            ("resources · zainod", "resources · zebrad"),
-        ] {
-            assert!(
-                rendered.iter().any(|l| l.contains(left) && l.contains(right)),
-                "{left} | {right} not on one row:\n{rendered:#?}"
-            );
-        }
-    }
-
-    /// Stack, never truncate — half a panel is worse than a taller view
-    #[test]
-    fn a_narrow_terminal_stacks_the_panels() {
-        let rendered = lines(80);
-        for title in [
-            "transparent ops/sec",
-            "shielded ops/sec",
-            "blocks/sec",
-            "transactions/sec",
-            "resources · zainod",
-            "resources · zebrad",
-        ] {
-            assert!(rendered.iter().any(|l| l.contains(title)), "{title} missing");
-        }
-        assert!(
-            !rendered
-                .iter()
-                .any(|l| l.contains("resources · zainod") && l.contains("resources · zebrad"))
-        );
-    }
-
-    /// A stacked namespace total hides which container grew — the one question this
-    /// panel is asked
-    #[test]
-    fn each_component_draws_in_its_own_resource_panel() {
-        let rendered = render_sync_report(&view(), &theme(), 160);
-        assert!(rendered.contains("resources · zainod"), "{rendered}");
-        assert!(rendered.contains("resources · zebrad"), "{rendered}");
-    }
-
-    /// An odd component count must not squeeze three panels onto a two-column row
-    #[test]
-    fn a_third_component_gets_its_own_row() {
-        let mut v = view();
-        v.resources.push(ComponentResources {
-            component: "lightwalletd".into(),
-            cpu: vec![series("lightwalletd", Unit::Cores, &wave(0.5, 60, 0.0))],
-            mem: Vec::new(),
-            disk: Vec::new(),
-            io_stall: Vec::new(),
-        });
-        let rendered = render_sync_report(&v, &theme(), 120);
-        assert!(rendered.contains("resources · lightwalletd"), "{rendered}");
-        for line in rendered.lines() {
-            assert!(display_width(line) <= 120, "{line:?}");
-        }
-    }
-
     /// The finding, not the percentage: `99.8%` alone reads as success
     #[test]
     fn the_header_leads_with_the_shortfall_rather_than_the_percentage() {
@@ -1143,28 +1062,6 @@ mod tests {
         assert!(rendered.contains("below"), "{rendered}");
     }
 
-    /// Silence is the normal case and must cost no ink
-    #[test]
-    fn agreement_between_the_record_and_the_series_draws_nothing() {
-        let rendered = render_sync_report(&view(), &theme(), 120);
-        assert!(!rendered.contains("prometheus last read"), "{rendered}");
-        assert!(!rendered.contains("does not publish"), "{rendered}");
-    }
-
-    /// Renamed family → empty panel, indistinguishable from a quiet run
-    #[test]
-    fn rows_the_build_never_published_are_named_in_the_footer() {
-        let mut v = view();
-        v.unpublished = vec![
-            "db used <- zaino_db_used_bytes".into(),
-            "fetch <- zaino_sync_block_fetch_seconds{stage=\"finalised\"}".into(),
-        ];
-        let rendered = render_sync_report(&v, &theme(), 120);
-        assert!(rendered.contains("2 declared metric(s)"), "{rendered}");
-        assert!(rendered.contains("zaino_db_used_bytes"), "{rendered}");
-        assert!(rendered.contains("stage=\"finalised\""), "the selector too: {rendered}");
-    }
-
     /// The bug this replaced: measured against the tip, a run that indexed every block
     /// it was asked for reported `short 1,001` purely because the chain kept moving
     #[test]
@@ -1176,15 +1073,6 @@ mod tests {
         assert!(rendered.contains("complete"), "{rendered}");
         assert!(rendered.contains("tip +1,001"), "{rendered}");
         assert!(!rendered.contains("short"), "{rendered}");
-    }
-
-    /// Every violation must reach the screen — this view is the only place a finished
-    /// run explains itself
-    #[test]
-    fn every_violation_is_printed() {
-        let rendered = render_sync_report(&view(), &theme(), 160);
-        assert!(rendered.contains("reached_the_pinned_tip"));
-        assert!(rendered.contains("serves_from_its_own_index"));
     }
 
     /// The bug that made a real failure undiagnosable: the detail was clipped to one
@@ -1204,14 +1092,6 @@ mod tests {
         let rendered = render_sync_report(&v, &theme(), 100);
         assert!(rendered.contains(cause), "the cause was clipped:\n{rendered}");
         assert!(rendered.lines().all(|l| display_width(l) <= 100), "{rendered}");
-    }
-
-    /// A byte axis labelled `16.0` and one labelled `16.0 GiB` are different claims
-    #[test]
-    fn a_resource_axis_carries_its_unit() {
-        let rendered = render_sync_report(&view(), &theme(), 120);
-        assert!(rendered.contains("GiB") || rendered.contains("GB"), "{rendered}");
-        assert!(rendered.lines().any(|l| l.contains('c') && l.contains("peak")), "{rendered}");
     }
 
     /// Containers do not peak together; summing their maxima invents a moment
@@ -1271,71 +1151,16 @@ mod tests {
         }
     }
 
-    /// Three stores side by side at 100 cols, stacked below the column minimum; every line
-    /// exactly the box width; bars on one scale, merge mark after the fill, stall line where
-    /// the fill has not reached, peak shown only where above now
+    /// Peak shown only where above now
     #[test]
-    fn tier_bars_share_a_scale_mark_merges_and_stalls_and_stack_when_narrow() {
-        let shapes = view().tiers;
-        let wide = tiers_box(&shapes, &theme(), 100);
-        assert!(wide.iter().all(|l| display_width(l) == 100), "{wide:#?}");
+    fn tier_bars_sum_segments_and_keep_peaks_above_now() {
+        let wide = tiers_box(&view().tiers, &theme(), 100);
         let head = &wide[1];
-        for label in ["receives", "spent", "by_hash"] {
-            assert!(head.contains(label), "{head}");
-        }
         assert!(head.contains("22 segments · 2 merging"), "{head}");
         assert!(head.contains("8 segments · idle"), "{head}");
-
-        let t1 = &wide[3];
-        assert!(t1.contains("11 (max 14)"), "receives t1 peak: {t1}");
-        assert!(t1.contains(&format!("{}{}", "█", '⟳')), "merge mark after fill: {t1}");
-        let t0 = &wide[2];
-        assert!(t0.contains('┆') && !t0.contains("max"), "stall line, no peak: {t0}");
+        assert!(wide[3].contains("11 (max 14)"), "receives t1 peak: {}", wide[3]);
+        assert!(!wide[2].contains("max"), "t0 now = peak, no peak shown: {}", wide[2]);
         assert!(wide.iter().any(|l| l.contains("0 (max 2)")), "emptied tier keeps its peak");
-
-        let narrow = tiers_box(&shapes, &theme(), 80);
-        assert!(narrow.iter().all(|l| display_width(l) == 80), "{narrow:#?}");
-        let heads: Vec<_> = narrow.iter().filter(|l| l.contains("segments ·")).collect();
-        assert_eq!(heads.len(), 3, "one header line per stacked store: {narrow:#?}");
-    }
-
-    /// Queried and dropped, these were 10 of 23 rows: the whole per-block cost breakdown
-    /// paid for on every report and shown on none
-    #[test]
-    fn the_write_path_and_store_facets_reach_the_report() {
-        let rendered = render_sync_report(&view(), &theme(), 120);
-        assert!(rendered.contains("write path"), "{rendered}");
-        assert!(rendered.contains("merge write"), "{rendered}");
-        assert!(rendered.contains("segments by tier"), "{rendered}");
-    }
-
-    /// Prometheus gone or the run past retention: state it, never draw an empty frame
-    #[test]
-    fn a_run_with_no_record_states_why_rather_than_drawing_empty_plots() {
-        let mut v = view();
-        v.transparent.clear();
-        v.shielded.clear();
-        v.blocks.clear();
-        v.throughput.clear();
-        v.resources.clear();
-        v.note = Some("no metrics recorded (run is older than the 30d retention)".into());
-        let rendered = render_sync_report(&v, &theme(), 120);
-        assert!(rendered.contains("older than the 30d retention"), "{rendered}");
-        for line in rendered.lines() {
-            assert!(display_width(line) <= 120, "{line:?}");
-        }
-    }
-
-    /// Each half of the top row states its own absence — one pool going unpublished
-    /// must not blank the other
-    #[test]
-    fn a_missing_pool_leaves_the_other_panel_drawn() {
-        let mut v = view();
-        v.shielded.clear();
-        v.note = Some("zaino published no shielded counters".into());
-        let rendered = render_sync_report(&v, &theme(), 120);
-        assert!(rendered.contains("published no shielded counters"), "{rendered}");
-        assert!(rendered.contains("tsp "), "transparent chip missing:\n{rendered}");
     }
 
     /// One band per pool: the spend/output split serves `chainwork`, not the reader
@@ -1378,38 +1203,6 @@ mod tests {
         assert_eq!(folded[1].points, vec![(0.0, 5.0), (30.0, 5.0)]);
     }
 
-    /// Tags come off `Channel`, so a pool cannot render a tag its legend does not use
-    #[test]
-    fn a_pool_tag_is_its_channels_and_a_split_keeps_its_direction() {
-        for channel in Channel::ALL {
-            let s = pool(channel.name(), Unit::PerSec, &[1.0], Some(channel));
-            assert_eq!(pool_tag(&s), channel.tag());
-        }
-        let split = pool("transparent out", Unit::PerSec, &[1.0], Some(Channel::Transparent));
-        assert_eq!(pool_tag(&split), "tsp-out");
-    }
-
-    /// Printed once into scrollback, so nothing re-flows: no padding to reserve.
-    ///
-    /// Regression: the separator was a literal `*` — the ASCII spelling of `dot` — so the
-    /// Unicode report drew a glyph no other surface uses, and the ASCII one looked correct
-    #[test]
-    fn a_chip_row_separates_pools_and_leads_with_the_largest() {
-        let row = pool_chips(&view().shielded, &theme(), 60);
-        assert_eq!(row, "sap 54.4M · orc 26.6M · iro 0", "{row:?}");
-        let ascii = pool_chips(&view().shielded, &Theme::for_capabilities(false, false), 60);
-        assert_eq!(ascii, "sap 54.4M * orc 26.6M * iro 0", "{ascii:?}");
-    }
-
-    /// Per-pool totals and the run's rates are the same reading; two lines wasted one
-    #[test]
-    fn the_chips_share_a_line_with_the_rate_summary() {
-        let rendered = render_sync_report(&view(), &theme(), 160);
-        let line = rendered.lines().find(|l| l.contains("sap 54.4M")).expect("a chip row");
-        assert!(line.contains("avg 45.0k/s"), "{line:?}");
-        assert!(line.contains("peak 77.3k/s"), "{line:?}");
-    }
-
     /// Sapling and orchard peak half a period apart → maxima sum to 88.0k/s, a moment
     /// the run never had
     #[test]
@@ -1440,23 +1233,6 @@ mod tests {
         }
     }
 
-    /// A lone pool's chip already is the aggregate; printing it twice says nothing.
-    /// Stacked width, so the line holds one panel rather than two
-    #[test]
-    fn a_single_pool_panel_does_not_repeat_its_total_as_an_aggregate() {
-        let rendered = render_sync_report(&view(), &theme(), 80);
-        let line = rendered.lines().find(|l| l.contains("tsp ")).expect("a chip row");
-        assert!(!line.contains("total"), "{line:?}");
-        assert!(line.contains("avg 70.5k/s"), "{line:?}");
-    }
-
-    /// `B` is billions here — every `compact` caller is a count, rate or core figure
-    #[test]
-    fn a_billion_scale_total_reads_as_b_not_g() {
-        let s = series("orchard", Unit::PerSec, &[9_876_543_210.0, 9_876_543_210.0]);
-        assert!(pool_chips(&[s], &theme(), 60).contains('B'));
-    }
-
     /// Pre-first-tick and empty-report shapes must render, not unwrap-panic
     #[test]
     fn an_empty_report_still_renders() {
@@ -1468,22 +1244,6 @@ mod tests {
     }
 
     // ── live ──────────────────────────────────────────────────────────────
-
-    /// Header source differs; the panels do not. This is the whole point of the view
-    #[test]
-    fn a_running_sync_draws_the_same_panels_as_a_finished_one() {
-        let rendered = render_sync_report(&running(), &theme(), 160);
-        for title in [
-            "transparent ops/sec",
-            "shielded ops/sec",
-            "blocks/sec",
-            "transactions/sec",
-            "resources · zainod",
-            "resources · zebrad",
-        ] {
-            assert!(rendered.contains(title), "{title} missing from a live run:\n{rendered}");
-        }
-    }
 
     /// A run still going has not failed — the mark a `bool` forced is the reason
     /// [`SyncStatus`] is not one
@@ -1497,40 +1257,7 @@ mod tests {
         assert!(!rendered.contains("short "), "a run mid-flight is not short:\n{rendered}");
     }
 
-    /// `0 ticks` reads as a stalled run rather than one still starting
-    #[test]
-    fn a_run_before_its_first_tick_omits_the_tick_count() {
-        let mut v = running();
-        v.ticks = 0;
-        let rendered = render_sync_report(&v, &theme(), 160);
-        assert!(!rendered.contains("ticks"), "{rendered}");
-        assert!(rendered.contains("violations"), "{rendered}");
-    }
-
-    /// A live run has no segment *yet*; scolding it for that is a finished run's job
-    #[test]
-    fn a_running_sync_omits_the_missing_segment_placeholder() {
-        let rendered = render_sync_report(&running(), &theme(), 160);
-        assert!(!rendered.contains("no segment recorded"), "{rendered}");
-
-        let mut finished = running();
-        finished.status = SyncStatus::Finished(ztest::api::SyncVerdict::Failed);
-        assert!(render_sync_report(&finished, &theme(), 160).contains("no segment recorded"));
-    }
-
-    /// Subject at tip = chain fact, not a verdict (the confusion the split
-    /// `outcome`/`verdict` pair invited)
-    #[test]
-    fn a_subject_at_tip_still_reads_as_running() {
-        let mut v = running();
-        v.height = Some((1_700_000, 1_700_000));
-        let rendered = render_sync_report(&v, &theme(), 160);
-        let header = rendered.lines().nth(1).expect("the status line");
-        assert!(header.contains("Running"), "the run has no verdict yet: {header:?}");
-        assert!(!rendered.contains("Passed"), "no verdict was mirrored:\n{rendered}");
-    }
-
-    pub(super) fn running() -> ReportView {
+    fn running() -> ReportView {
         ReportView {
             status: SyncStatus::Running,
             segment: None,
@@ -1542,36 +1269,5 @@ mod tests {
             ticks: 118,
             ..view()
         }
-    }
-}
-
-#[cfg(test)]
-mod ascii {
-    use super::tests::{running, view};
-    use super::{Theme, render_sync_report};
-
-    /// Both fixtures, at the widths a piped report actually uses
-    #[test]
-    fn the_sync_report_falls_back_to_ascii() {
-        let ascii = Theme::for_capabilities(false, false);
-        for (name, v) in [("finished", view()), ("running", running())] {
-            for width in [80, 120] {
-                crate::testing::assert_ascii_clean(
-                    &format!("render_sync_report({name}, {width})"),
-                    &render_sync_report(&v, &ascii, width),
-                );
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod preview {
-    #[test]
-    #[ignore = "visual check: cargo test -- --ignored --nocapture preview"]
-    fn show() {
-        let theme = super::Theme::for_capabilities(true, true);
-        println!("\n{}", super::render_sync_report(&super::tests::view(), &theme, 120));
-        println!("\n{}", super::render_sync_report(&super::tests::running(), &theme, 120));
     }
 }

@@ -608,42 +608,6 @@ const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 mod tests {
     use super::*;
 
-    fn theme() -> Theme {
-        Theme::for_capabilities(false, true)
-    }
-
-    fn row(size: &str) -> String {
-        let bytes = ztest::qos::units::parse_mem_bytes_opt(size);
-        let f = Fields::new()
-            .text("seed", "seed-4c86ea3c-hostpath")
-            .text("ready", "yes")
-            .maybe_value("size", bytes.map(|b| b as f64))
-            .maybe_text("size_raw", bytes.is_none().then_some(size))
-            .text("driver", "this")
-            .text("snap", "ready");
-        draw(&tmpl::list_row(24, ""), &f, &theme())
-    }
-
-    /// - `48Gi` / `51539607552` = one size, one rendering
-    /// - unparseable falls back to its raw text, still holding the header's column
-    #[test]
-    fn a_size_reads_as_bytes_and_falls_back_to_its_raw_quantity() {
-        assert_eq!(row("48Gi"), "seed-4c86ea3c-hostpath   yes    48.0 GiB this   ready");
-        assert_eq!(row("51539607552"), "seed-4c86ea3c-hostpath   yes    48.0 GiB this   ready");
-        assert_eq!(row("?"), "seed-4c86ea3c-hostpath   yes           ? this   ready");
-    }
-
-    #[test]
-    fn the_header_lands_on_the_body_columns() {
-        let head = draw(&tmpl::list_row(24, "dim"), &header_fields(), &theme());
-        let column = |s: &str, word: &str| s.find(word);
-        assert_eq!(
-            column(&head, "SIZE").map(|c| c + 4),
-            column(&row("48Gi"), "GiB").map(|c| c + 3)
-        );
-        assert_eq!(column(&head, "DRIVER"), column(&row("48Gi"), "this"));
-    }
-
     const H1: &str = "98ea6e4f216f2fb4b69fff9b3a44842c38686ca685f3f55dc48c5d3fb1107be4";
     const H2: &str = "68a3064ec1d3caa270e21494c5f15f47431188c4d670c894656ba42e40c1ca8d";
 

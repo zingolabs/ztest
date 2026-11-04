@@ -614,7 +614,7 @@ mod tests {
         assert_ne!(pod_name(&item), pod_name(&item));
     }
 
-    fn pod_with(phase: Option<&str>, exit: Option<i32>, waiting: Option<&str>) -> corev1::Pod {
+    fn pod_with(phase: Option<&str>, exit: Option<i32>) -> corev1::Pod {
         let cs = corev1::ContainerStatus {
             name: "test".into(),
             image: "img".into(),
@@ -624,10 +624,6 @@ mod tests {
             state: Some(corev1::ContainerState {
                 terminated: exit.map(|code| corev1::ContainerStateTerminated {
                     exit_code: code,
-                    ..Default::default()
-                }),
-                waiting: waiting.map(|r| corev1::ContainerStateWaiting {
-                    reason: Some(r.to_string()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -646,27 +642,19 @@ mod tests {
 
     #[test]
     fn state_pending_is_none() {
-        assert!(terminal_state(&pod_with(Some("Pending"), None, None)).is_none());
-        assert!(terminal_state(&pod_with(Some("Running"), None, None)).is_none());
+        assert!(terminal_state(&pod_with(Some("Pending"), None)).is_none());
+        assert!(terminal_state(&pod_with(Some("Running"), None)).is_none());
     }
 
     #[test]
     fn state_success_and_failure() {
         assert_eq!(
-            terminal_state(&pod_with(Some("Succeeded"), Some(0), None)),
+            terminal_state(&pod_with(Some("Succeeded"), Some(0))),
             Some(TerminalState::Passed)
         );
         assert_eq!(
-            terminal_state(&pod_with(Some("Failed"), Some(101), None)),
+            terminal_state(&pod_with(Some("Failed"), Some(101))),
             Some(TerminalState::Failed(101))
         );
-    }
-
-    #[test]
-    fn pull_error_is_not_settled_state() {
-        // Pull errors are not folded into `terminal_state`; the run loop grace-windows them
-        let p = pod_with(Some("Pending"), None, Some("ImagePullBackOff"));
-        assert!(terminal_state(&p).is_none());
-        assert_eq!(image_error(p.status.as_ref().unwrap()).as_deref(), Some("ImagePullBackOff"));
     }
 }

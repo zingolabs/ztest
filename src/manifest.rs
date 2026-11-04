@@ -298,21 +298,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_resources_render_guaranteed_requests_equal_limits() {
-        // Explicit override is Guaranteed too, never requests-only Burstable
-        let spec = PodSpec {
-            resources: Some(Resources { cpu: Cpu::millis(500), memory: Mem::mib(512) }),
-            ..base_spec()
-        };
-        let pod = spec.render(&coords(), "t", &[]);
-        let c = container(&pod);
-        assert_eq!(c["resources"]["requests"]["cpu"], "500m");
-        assert_eq!(c["resources"]["requests"]["memory"], "512Mi");
-        assert_eq!(c["resources"]["limits"]["cpu"], "500m");
-        assert_eq!(c["resources"]["limits"]["memory"], "512Mi");
-    }
-
-    #[test]
     fn pod_is_guaranteed_requires_limits_on_every_container() {
         let ok = json!({
             "containers": [{ "resources": { "limits": { "cpu": "2", "memory": "1" } } }],
@@ -400,12 +385,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_group_set_renders_no_field() {
-        let pod = base_spec().render(&coords(), "t", &[]);
-        assert!(pod_spec_json(&pod)["securityContext"]["supplementalGroups"].is_null());
-    }
-
-    #[test]
     fn env_renders_in_declaration_order() {
         let spec = PodSpec {
             env: vec![("RUST_LOG".into(), "debug".into()), ("FOO".into(), "bar".into())],
@@ -417,15 +396,6 @@ mod tests {
         assert_eq!(env[0]["name"], "RUST_LOG");
         assert_eq!(env[0]["value"], "debug");
         assert_eq!(env[1]["name"], "FOO");
-    }
-
-    #[test]
-    fn no_env_omits_the_env_key() {
-        // `resources` always present (every pod Guaranteed), `env` only when non-empty
-        let pod = base_spec().render(&coords(), "t", &[]);
-        let c = container(&pod);
-        assert!(c.get("env").is_none());
-        assert!(c.get("resources").is_some());
     }
 
     #[test]

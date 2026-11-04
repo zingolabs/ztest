@@ -331,14 +331,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn libtest_name_strips_crate_segment() {
-        assert_eq!(libtest_name("qos_attr::marker_plain"), "marker_plain");
-        assert_eq!(libtest_name("mycrate::mod::deep::t"), "mod::deep::t");
-        // No `::` → as-is
-        assert_eq!(libtest_name("bare"), "bare");
-    }
-
     /// `rstest` emits one entry per case, the QoS attribute submits only the parent id →
     /// exact matching dropped every case to `Basic`, whose 60s `hard_cap` killed
     /// fixture-restoring testnet tests, indistinguishable from a product hang

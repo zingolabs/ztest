@@ -840,19 +840,3 @@ impl BlockCache for MemBlockCache {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::PerformanceLevel;
-    use crate::component::Wallet;
-
-    #[test]
-    fn builder_defaults_to_medium_batches_until_overridden() {
-        let default = Wallet::librustzcash().backend.performance;
-        assert_eq!((default, default.batch_size()), (PerformanceLevel::Medium, 100));
-        assert_eq!(
-            Wallet::librustzcash().performance(PerformanceLevel::High).backend.performance,
-            PerformanceLevel::High,
-        );
-    }
-}

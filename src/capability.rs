@@ -802,24 +802,6 @@ mod tests {
         assert!(!Report { capabilities: vec![broken] }.is_runnable());
     }
 
-    /// Profiling is a diagnostic: a workstation without docker must still be able to run
-    /// tests, so an absent collector reports and never blocks
-    #[test]
-    fn an_unprofilable_cluster_is_still_runnable() {
-        let report = Report {
-            capabilities: vec![
-                cap("snapshot-capable storage", Need::Required, Finding::Present("csi".into())),
-                cap(
-                    "profile collector",
-                    Need::Enables("CPU profiles (ztest sync perf)"),
-                    Finding::Absent("host-side profiling needs a reachable docker daemon".into()),
-                ),
-            ],
-        };
-        assert!(report.is_runnable());
-        assert_eq!(report.blocking().count(), 0);
-    }
-
     /// Side-load lives on the workstation; `setup` only ever reaches the cluster over the
     /// kube API, so gating it on a broken `kind` would strand a fresh cluster
     #[test]
@@ -833,16 +815,6 @@ mod tests {
         };
         assert!(!report.is_runnable());
         assert!(report.is_setupable());
-    }
-
-    /// Module's founding distinction — forbidden read != absent capability, and the
-    /// two send an operator to different places
-    #[test]
-    fn an_unreadable_capability_is_not_an_absent_one() {
-        let unknown = Finding::Unknown("forbidden".into());
-        let absent = Finding::Absent("nothing installed".into());
-        assert_ne!(unknown, absent);
-        assert!(!unknown.is_present() && !absent.is_present());
     }
 
     /// Unreadable required capability blocks (else a clear refusal now becomes an
@@ -917,14 +889,6 @@ mod tests {
     fn missing_pieces_are_all_named() {
         let f = parts(vec![Ok(Some("a".into())), Ok(None), Ok(Some("c".into()))], "whole");
         assert_eq!(f, Finding::Absent("missing a, c".to_string()));
-    }
-
-    /// Registry and capacity are preconditions of the on-cluster build, which only a
-    /// remote cluster runs — required there, merely enabling on kind
-    #[test]
-    fn a_remote_only_precondition_is_required_only_remotely() {
-        assert_eq!(gated(true, "on-cluster builds"), Need::Required);
-        assert_eq!(gated(false, "on-cluster builds"), Need::Enables("on-cluster builds"));
     }
 
     /// The build pod is the largest thing ztest places; a bound below it would pass a

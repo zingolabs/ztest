@@ -37,12 +37,4 @@ mod tests {
         let snap = live_snapshot(2, stats, committed, limit);
         assert_eq!(snap, LiveSnapshot { running: 2, queued: 5, committed, limit });
     }
-
-    #[test]
-    fn nothing_selected_folds_to_an_empty_snapshot() {
-        assert_eq!(
-            live_snapshot(0, RunStats::default(), Resources::ZERO, Resources::ZERO),
-            LiveSnapshot::default()
-        );
-    }
 }

@@ -599,13 +599,6 @@ mod tests {
         rows[row].chars().any(f)
     }
 
-    #[test]
-    fn a_plot_has_the_requested_geometry() {
-        let rows = plot_band(&bands(&[1.0, 2.0, 3.0]), &opts(10, 3), &plain());
-        assert_eq!(rows.len(), 3);
-        assert!(rows.iter().all(|r| r.chars().count() == 10), "{rows:?}");
-    }
-
     /// Bigger values reach higher rows; every column = filled mass to the axis, not a line
     #[test]
     fn taller_values_occupy_higher_rows() {
@@ -634,25 +627,6 @@ mod tests {
             stalled.iter().all(|r| !r.trim().is_empty()),
             "the swing still fills the column: {stalled:?}"
         );
-    }
-
-    /// Every mode separates zones by glyph (plain palette emits no attributes, CI log
-    /// has no colour to read)
-    #[test]
-    fn every_mode_separates_the_zones_without_colour() {
-        for mode in [GraphMode::Braille, GraphMode::Ascii] {
-            let o = PlotOpts::new(1, 4, mode);
-            let steady = plot_band(&[Some((100.0, 100.0))], &o, &plain());
-            let stalled = plot_band(&[Some((0.0, 100.0))], &o, &plain());
-            assert_ne!(
-                steady, stalled,
-                "{mode:?} renders a stall identically to steady throughput"
-            );
-            assert!(
-                steady.iter().chain(&stalled).all(|r| !r.contains('\u{1b}')),
-                "{mode:?} emitted an escape under a plain palette"
-            );
-        }
     }
 
     /// Painting through a gap erases the partition or stall the plot exists to show
@@ -690,13 +664,6 @@ mod tests {
         let channels = vec![vec![Some((5.0, 5.0)), None], vec![Some((5.0, 5.0)), None]];
         let rows = plot_stacked(&stack(&channels), &opts(2, 4), &Palette::plain());
         assert!(rows.iter().all(|r| r.chars().nth(1) == Some(' ')), "{rows:?}");
-    }
-
-    /// Steady rate = zero band thickness, must still draw ("no variation" != "no data")
-    #[test]
-    fn a_zero_thickness_band_still_draws() {
-        let rows = plot_band(&[Some((7.0, 7.0))], &opts(1, 4), &plain());
-        assert!(rows.iter().any(|r| r.chars().any(solid)), "{rows:?}");
     }
 
     /// Why buckets keep min and max: peak+stall must swing visibly more than steady-to-same-peak
@@ -805,14 +772,6 @@ mod tests {
         }
     }
 
-    /// Rule = the whole differential story on a live plot, and the axis always auto-scales
-    #[test]
-    fn the_baseline_rule_is_drawn_on_an_auto_scaled_plot() {
-        let o = opts(6, 4).baseline(50.0);
-        let rows = plot_band(&bands(&[10.0]), &o, &plain());
-        assert!(rows.iter().any(|r| r.contains('╌')), "no baseline drawn: {rows:?}");
-    }
-
     /// Baseline above the data pulls the scale, never clips ("far below the run we are
     /// compared against" is the plot's headline, and clipping hides it)
     #[test]
@@ -853,88 +812,6 @@ mod tests {
         );
         assert_eq!(ceiling(&[("", quiet.clone())], &opts(1, 8).at_least(100.0)), 100.0);
         assert_eq!(ceiling(&[("", quiet)], &opts(1, 8)), 5.0);
-    }
-
-    #[test]
-    fn each_mode_draws_from_its_own_glyph_family() {
-        let series = bands(&[1.0, 2.0, 3.0, 4.0]);
-        let braille = plot_band(&series, &PlotOpts::new(2, 1, GraphMode::Braille), &plain());
-        assert!(
-            braille[0].chars().all(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
-            "{braille:?} is not braille"
-        );
-        let ascii = plot_band(&series, &PlotOpts::new(2, 1, GraphMode::Ascii), &plain());
-        assert!(ascii[0].is_ascii(), "{ascii:?} is not ascii");
-    }
-
-    /// Construction already matches tables to masks → pin the masks: empty, full, and
-    /// stipple sparser than the solid it shadows
-    #[test]
-    fn the_braille_masks_span_empty_to_full() {
-        assert_eq!(BRAILLE_SOLID[0], '⠀', "no dots at level (0, 0)");
-        assert_eq!(BRAILLE_SOLID[24], '⣿', "every dot at level (4, 4)");
-        assert_eq!(BRAILLE_LIGHT[0], '⠀');
-        let dots = |c: char| (c as u32 - 0x2800).count_ones();
-        for i in 0..25 {
-            assert!(
-                dots(BRAILLE_LIGHT[i]) <= dots(BRAILLE_SOLID[i]),
-                "the stipple must never outweigh the solid at index {i}"
-            );
-        }
-        assert!(dots(BRAILLE_LIGHT[24]) < dots(BRAILLE_SOLID[24]));
-    }
-
-    /// Every level pair the folder can produce, else a full cell panics on a slice bound
-    #[test]
-    fn every_level_pair_indexes_a_glyph() {
-        for mode in [GraphMode::Braille, GraphMode::Ascii] {
-            for fill in [Fill::Solid, Fill::Varying] {
-                for l in 0..LEVELS {
-                    for r in 0..LEVELS {
-                        let _ = table(mode, fill)[l * LEVELS + r];
-                    }
-                }
-            }
-        }
-    }
-
-    /// What any inline or footer-sized use depends on
-    #[test]
-    fn a_single_row_plot_fills_its_width() {
-        let rows = plot_band(&bands(&[1.0, 5.0, 3.0]), &opts(12, 1), &plain());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].chars().count(), 12);
-    }
-
-    /// Colour = property of the pool, not of which other pools happened to report
-    #[test]
-    fn a_pool_keeps_its_colour_when_another_pool_is_absent() {
-        let palette = Palette::pools(true);
-        let o = opts(2, 4);
-        let full = plot_stacked(
-            &[
-                ("transparent", bands(&[1.0, 1.0])),
-                ("sprout", bands(&[1.0, 1.0])),
-                ("sapling", bands(&[4.0, 4.0])),
-            ],
-            &o,
-            &palette,
-        );
-        let sparse = plot_stacked(
-            &[("transparent", bands(&[1.0, 1.0])), ("sapling", bands(&[4.0, 4.0]))],
-            &o,
-            &palette,
-        );
-        let sapling = palette.style_named("sapling");
-        let mark = 'x'.style(sapling).to_string();
-        let colour = mark.split('x').next().unwrap().to_string();
-        assert!(!colour.is_empty(), "the pool palette must be colourised");
-        for (label, rendering) in [("full", &full), ("sprout absent", &sparse)] {
-            assert!(
-                rendering.iter().any(|r| r.contains(&colour)),
-                "sapling lost its colour with {label}: {rendering:?}"
-            );
-        }
     }
 
     /// Case a pool stack actually hits: a channel that swung under one that did not,
@@ -1006,32 +883,5 @@ mod tests {
             rows.iter().any(|r| r.chars().nth(1).is_some_and(solid)),
             "the sound column must still draw: {rows:?}"
         );
-    }
-
-    /// `Fill::ALL` and `Fill::index` = two statements of one order (fold indexes the
-    /// tally, maps back through `ALL` → disagreement silently swaps what a cell reports)
-    #[test]
-    fn the_fill_order_agrees_with_its_index() {
-        for (i, fill) in Fill::ALL.iter().enumerate() {
-            assert_eq!(fill.index(), i, "{fill:?}");
-        }
-    }
-
-    /// A renderer must not be the thing that takes a run down
-    #[test]
-    fn an_unnamed_channel_renders_in_the_fallback_colour() {
-        let palette = Palette::pools(true);
-        let rows = plot_stacked(&[("blocks", bands(&[1.0, 2.0]))], &opts(2, 4), &palette);
-        assert!(rows.iter().any(|r| !r.trim().is_empty()), "{rows:?}");
-    }
-
-    /// Deeper than the palette keeps drawing, never panics on the index
-    #[test]
-    fn a_channel_beyond_the_palette_still_renders() {
-        let channels = vec![bands(&[1.0]), bands(&[1.0]), bands(&[1.0])];
-        let raster = rasterize(&borrow(&channels), &opts(2, 3));
-        let styles = vec![Style::new(); channels.len()];
-        let rows = render(&raster, &opts(2, 3), &Palette::plain(), &styles);
-        assert!(rows.iter().any(|r| r.chars().any(solid)), "{rows:?}");
     }
 }

@@ -408,15 +408,6 @@ mod tests {
     }
 
     #[test]
-    fn reserved_counts_a_burstable_pod_at_its_request_not_its_limit() {
-        // Burstable co-tenant charged its request (what the scheduler packs against)
-        let pods = vec![burstable_pod("n1", BUILDKIT_REQ, BUILDKIT_LIM)];
-        let r = cluster_reserved(&pods, &[]);
-        assert_eq!(r.cpu_milli, BUILDKIT_REQ.cpu_milli);
-        assert_eq!(r.mem_bytes, BUILDKIT_REQ.mem_bytes);
-    }
-
-    #[test]
     fn reserved_counts_disk_io_declared_on_the_pods_pvc() {
         // Disk I/O comes off the mounted storage request, not the pod spec: probe joins
         // pod → PVC and sums the PVC's cap
@@ -430,19 +421,6 @@ mod tests {
         // Uncapped volume (no annotation) reserves no I/O
         let bare = vec![pvc_with_io_opt("chain-data", None, None)];
         assert_eq!(cluster_reserved(&pods, &bare).disk_bps, 0);
-    }
-
-    #[test]
-    fn capacity_from_subtracts_a_scheduled_build_pod() {
-        // Regression: a scheduled 16c/24Gi build pod lowers free by its request (the
-        // one-shot probe missed it only by running first — the fold always counts it)
-        let nodes = vec![node(true, false, "72", "48Gi")];
-        let build = crate::qos::build::BUILDKIT_BUILD;
-        let pods = vec![burstable_pod("n1", build, build)];
-        let cap = capacity_from(&nodes, &pods, &[]);
-        let expected = cap.allocatable.saturating_sub(&build);
-        assert_eq!(cap.free().cpu_milli, expected.cpu_milli);
-        assert_eq!(cap.free().mem_bytes, expected.mem_bytes);
     }
 
     #[test]

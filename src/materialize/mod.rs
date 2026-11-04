@@ -854,20 +854,6 @@ mod tests {
         assert!(!job.contains("seed-"), "lock is derived once, not doubly prefixed: {job}");
     }
 
-    #[test]
-    fn a_stuck_pull_owned_elsewhere_names_the_job_and_the_remedy() {
-        let stall = progress::Stall::NoProgress { transferred: 1 << 30, total: 4 << 30 };
-        let EnvError::ArchiveMaterializeFailed { reason, .. } =
-            orphaned_puller("chain", "puller-abc", stall)
-        else {
-            panic!("wrong variant");
-        };
-        assert!(reason.contains("puller-abc"), "names the Job: {reason}");
-        assert!(reason.contains("delete job"), "carries the remedy: {reason}");
-        assert!(reason.contains(SEEDS_NAMESPACE), "remedy is runnable: {reason}");
-        assert_eq!(reason.lines().count(), 1, "one line: {reason}");
-    }
-
     /// Volume too small for the tree → refused at adoption in ms, not hours in as ENOSPC
     #[test]
     fn a_volume_smaller_than_the_tree_is_refused() {

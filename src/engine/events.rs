@@ -198,5 +198,12 @@ mod tests {
         let s = RunStats { passed: 3, failed: 1, terminated: 0, skipped: 2, total: 6 };
         assert_eq!(s.finished(), 6);
         assert!(s.any_failed());
+
+        // Ctrl-C'd test, nothing failed → still a non-zero exit
+        let killed = RunStats { passed: 3, failed: 0, terminated: 1, skipped: 0, total: 4 };
+        assert_eq!(killed.finished(), 4);
+        assert!(killed.any_failed(), "terminated must fail the run: {killed:?}");
+        let green = RunStats { passed: 3, failed: 0, terminated: 0, skipped: 1, total: 4 };
+        assert!(!green.any_failed(), "{green:?}");
     }
 }

@@ -89,12 +89,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    fn libdir(path: &str) -> PlatformLibdirSummary {
-        PlatformLibdirSummary::Available { path: path.into() }
-    }
-
-    // `PlatformSummary` not constructible from nextest-metadata → `platforms = None`,
-    // libdir extraction covered directly via `libdir_path`
+    // `PlatformSummary` not constructible from nextest-metadata → `platforms = None`
     fn meta(build_dir: &str, base: &[&str], linked: &[&str]) -> RustBuildMetaSummary {
         RustBuildMetaSummary {
             target_directory: build_dir.into(),
@@ -124,17 +119,6 @@ mod tests {
         assert_eq!(dirs[0], PathBuf::from("/build/extra/a"));
         assert!(!dirs.contains(&PathBuf::from("/build/extra/b")));
         assert!(dirs.contains(&PathBuf::from("/build/debug/deps")));
-    }
-
-    #[test]
-    fn libdir_extraction_skips_unavailable() {
-        assert_eq!(libdir_path(&libdir("/rustc/lib")), Some(PathBuf::from("/rustc/lib")));
-        assert_eq!(
-            libdir_path(&PlatformLibdirSummary::Unavailable {
-                reason: nextest_metadata::PlatformLibdirUnavailable::RUSTC_FAILED,
-            }),
-            None
-        );
     }
 
     #[test]

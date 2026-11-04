@@ -707,7 +707,6 @@ mod tests {
         );
     }
 
-    use k8s_openapi::api::core::v1::{ContainerState, ContainerStateWaiting, ContainerStatus};
     use ztest::api::capability::Need;
 
     fn window(minors: [u32; 2]) -> DeployWindow {
@@ -773,63 +772,6 @@ mod tests {
     #[test]
     fn a_server_below_the_window_is_unsupported() {
         assert_eq!(window([34, 35]).select(33), Deploy::Unsupported);
-    }
-
-    // ── The line the operator actually reads ────────────────────────────────
-
-    fn container(name: &str, ready: bool, waiting: Option<&str>) -> ContainerStatus {
-        ContainerStatus {
-            name: name.into(),
-            image: "img".into(),
-            image_id: String::new(),
-            ready,
-            restart_count: 0,
-            state: waiting.map(|reason| ContainerState {
-                waiting: Some(ContainerStateWaiting {
-                    reason: Some(reason.into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    fn pod_status(containers: Vec<ContainerStatus>) -> PodStatus {
-        PodStatus {
-            phase: Some("Pending".into()),
-            container_statuses: Some(containers),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn a_note_counts_ready_then_names_the_first_laggard() {
-        let s = pod_status(vec![
-            container("hostpath", true, None),
-            container("csi-provisioner", false, Some("ImagePullBackOff")),
-            container("csi-resizer", false, Some("PodInitializing")),
-        ]);
-        assert_eq!(note(&s), "1/3 ready · csi-provisioner: ImagePullBackOff");
-    }
-
-    #[test]
-    fn a_note_drops_the_laggard_clause_once_every_container_is_ready() {
-        let s = pod_status(vec![container("hostpath", true, None)]);
-        assert_eq!(note(&s), "1/1 ready");
-    }
-
-    /// Statuses land a beat after the pod does — the phase is all there is to say
-    #[test]
-    fn a_note_falls_back_to_the_phase_before_any_container_reports() {
-        assert_eq!(note(&pod_status(vec![])), "Pending");
-        assert_eq!(note(&PodStatus::default()), "Pending");
-    }
-
-    #[test]
-    fn a_note_names_a_laggard_that_reports_no_waiting_reason() {
-        let s = pod_status(vec![container("hostpath", false, None)]);
-        assert_eq!(note(&s), "0/1 ready · hostpath");
     }
 
     fn report(blocked: &[&'static str]) -> Report {

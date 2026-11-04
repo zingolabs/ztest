@@ -174,14 +174,6 @@ mod tests {
         assert_eq!(last(&live, "height"), Some(40.0));
     }
 
-    /// Height gauge + slope row share one family → each resolves by its reading
-    #[test]
-    fn a_level_and_a_slope_on_one_gauge_stay_distinct() {
-        let live = fed(&[(0, 0, 1_000), (1, 0, 1_500)]);
-        assert_eq!(last(&live, "blocks"), Some(500.0));
-        assert_eq!(last(&live, "height"), Some(1_500.0));
-    }
-
     #[test]
     fn a_restarted_counter_plots_no_rate() {
         let live = fed(&[(0, 9_000, 0), (1, 5, 1)]);

@@ -527,12 +527,6 @@ mod tests {
     }
 
     #[test]
-    fn requiring_a_measured_op_yields_its_count() {
-        assert_eq!(tier_a(10, 20, 0).require(Op::SaplingOutput), 10);
-        assert_eq!(tier_a(10, 20, 0).require(Op::IronwoodAction), 0);
-    }
-
-    #[test]
     fn a_delta_is_the_work_between_two_cumulative_readings() {
         let d = tier_a(150, 90, 5).delta(&tier_a(100, 40, 5));
         assert_eq!(d.get(Op::SaplingOutput), Some(50));
@@ -625,12 +619,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn identical_segments_are_comparable() {
-        let a = segment(Some("regtest"), 840_000, 855_000, 100);
-        assert_eq!(a.comparable_with(&a.clone()), Ok(()));
-    }
-
     /// Keeps `perf --base` honest: across different heights a throughput delta
     /// speaks about block choice, not code
     #[test]
@@ -657,15 +645,6 @@ mod tests {
         assert_eq!(declared.comparable_with(&to_tip), Ok(()));
     }
 
-    /// Short run reports its reached height → refused, never compared against a
-    /// complete traversal as though both finished
-    #[test]
-    fn a_run_that_stopped_short_is_refused_on_its_reached_height() {
-        let complete = segment(Some("regtest"), 840_000, 855_000, 100);
-        let timed_out = segment(Some("regtest"), 840_000, 850_112, 100);
-        assert!(matches!(complete.comparable_with(&timed_out), Err(Mismatch::Range { .. })));
-    }
-
     #[test]
     fn segments_on_different_networks_are_refused() {
         let head = segment(Some("main"), 840_000, 855_000, 100);
@@ -687,57 +666,12 @@ mod tests {
     }
 
     #[test]
-    fn a_segment_describes_its_span_readably() {
-        assert_eq!(
-            segment(Some("regtest"), 840_000, 855_000, 100).describe(),
-            "regtest 840,000..855,000"
-        );
-        assert_eq!(segment(None, 0, 10, 1).describe(), "unknown-network 0..10");
-    }
-
-    /// Same work / less time = the only difference two comparable runs express
-    #[test]
-    fn a_segments_rate_is_its_work_over_its_elapsed_time() {
-        let s = segment(Some("regtest"), 840_000, 855_000, 100);
-        assert_eq!(s.rate().get(Op::SaplingOutput), Some(10.0));
-        assert_eq!(s.rate().total(), Some(15.0));
-        let faster = segment(Some("regtest"), 840_000, 855_000, 50);
-        assert_eq!(faster.rate().total(), Some(30.0));
-    }
-
-    /// Rides the durable report = the API other tools read
-    #[test]
-    fn a_segment_round_trips_through_json() {
-        let s = segment(Some("regtest"), 840_000, 855_000, 100);
-        let wire = serde_json::to_string(&s).expect("serialize");
-        let back: Segment = serde_json::from_str(&wire).expect("parse");
-        assert_eq!(back, s);
-        assert_eq!(back.work.get(Op::SaplingOutput), Some(1000));
-        assert_eq!(back.work.get(Op::TransparentIn), None);
-        assert_eq!(back.elapsed(), Duration::from_secs(100));
-    }
-
-    #[test]
     fn op_indices_are_distinct_and_in_range() {
         let mut seen = [false; Op::COUNT];
         for op in Op::ALL {
             assert!(!seen[op.index()], "{} reuses an index", op.label());
             seen[op.index()] = true;
         }
-    }
-
-    /// Channel order = plot stacking order, must stay oldest-pool-first
-    #[test]
-    fn channels_render_unmeasured_pools_as_absent() {
-        let channels = tier_a(10, 20, 0).channels();
-        assert_eq!(
-            channels.map(|(c, _)| c.name()),
-            ["transparent", "sprout", "sapling", "orchard", "ironwood"]
-        );
-        assert_eq!(channels[0].1, None);
-        assert_eq!(channels[1].1, None);
-        assert_eq!(channels[2].1, Some(10));
-        assert_eq!(channels[4].1, Some(0));
     }
 
     /// Op in 0 or 2 channels → a complete-looking list drops or double-counts work

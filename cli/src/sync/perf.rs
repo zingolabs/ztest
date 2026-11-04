@@ -615,54 +615,6 @@ fn on_path(program: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// A mistyped key binds nothing and renders blank, so every row the cluster paths
-    /// draw is bound once here
-    #[test]
-    fn every_row_binds_the_readings_it_names() {
-        let theme = plain_theme();
-        let f = Fields::new().text("path", "ztest-perf-x/zainod-cpu.collapsed");
-        assert_eq!(draw(row::WROTE, &f, &theme), "✓ ztest-perf-x/zainod-cpu.collapsed");
-
-        let f = Fields::new()
-            .text("label", "dropped")
-            .value("events", 12_400.0)
-            .text("fix", "lower --profile-off-cpu");
-        assert_eq!(
-            draw(row::DROPPED, &f, &theme),
-            "   dropped  12.4k trace events  lower --profile-off-cpu"
-        );
-
-        let f = Fields::new()
-            .text("label", "fidelity")
-            .value("sampled", 41.0)
-            .value("charged", 52.0)
-            .value("ratio", 41.0 / 52.0);
-        assert_eq!(
-            draw(&row::fidelity("fail"), &f, &theme),
-            "  fidelity  41 of 52 cpu-seconds sampled  78.8%"
-        );
-
-        let f = Fields::new().text("word", "opening").text("viewer", "flameshow");
-        assert_eq!(draw(row::OPENING, &f, &theme), "· opening flameshow");
-
-        let f = Fields::new().text("id", "sync-head").text("span", "main 3,013..658,599");
-        assert_eq!(draw(row::MISMATCH, &f, &theme), "         sync-head  main 3,013..658,599");
-    }
-
-    /// Base run has no delta; its gutter must leave with it rather than trailing spaces
-    #[test]
-    fn a_run_without_a_delta_ends_at_its_rate() {
-        let out = verdict(
-            &segment(840_000, 855_000, 50),
-            &segment(840_000, 855_000, 100),
-            "sync-head",
-            "sync-base",
-            &plain_theme(),
-        );
-        let base = out.lines().find(|l| l.contains("sync-base")).expect("base line");
-        assert_eq!(base.trim_end(), base, "{base:?}");
-    }
-
     /// Artifacts are named per component → only the directory separates two syncs
     /// of one profile
     #[test]

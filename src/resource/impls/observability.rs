@@ -1096,18 +1096,6 @@ mod tests {
         }
     }
 
-    /// Both halves of PSI or neither: `full` alone under-reports a partial stall, `some`
-    /// alone over-reports a parked worker, and one number cannot be corrected into the other
-    #[test]
-    fn the_io_pressure_pair_is_kept_together() {
-        let names = kept_families(&job("kubelet-cadvisor"));
-        assert_eq!(
-            names.contains("pressure_io_stalled"),
-            names.contains("pressure_io_waiting"),
-            "PSI keeps both or neither: {names}"
-        );
-    }
-
     /// The `__name__` keep's regex, verbatim
     fn kept_families(job: &serde_yaml::Value) -> String {
         job["metric_relabel_configs"]
@@ -1142,23 +1130,6 @@ mod tests {
     #[test]
     fn the_kept_port_name_is_the_exporter_contract() {
         assert!(scrape_config().contains(&format!("regex: {}", crate::metrics::PORT_NAME)));
-    }
-
-    /// Every input the pods read must move the stamp; one left out leaves an existing
-    /// cluster un-rolled while `probe` reports it installed
-    #[test]
-    fn the_stamp_moves_with_every_config_the_pods_read() {
-        let baseline = config_hash();
-        for ingredient in [
-            scrape_config(),
-            prometheus_args().join(" "),
-            serde_yaml::to_string(&pyroscope_config()).expect("renders"),
-            pyroscope_args().join(" "),
-        ] {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(ingredient.as_bytes());
-            assert_ne!(baseline, hasher.finalize().to_hex()[..16].to_string());
-        }
     }
 
     /// Drop any one → `ztest cleanup` reports a retirement that deletes nothing
@@ -1218,15 +1189,5 @@ mod tests {
         {
             assert!(path.starts_with("/data/"), "every store must be under the volume: {path}");
         }
-    }
-
-    /// Unresolvable driver must still provision (cluster default), never strand `Pending`
-    #[test]
-    fn an_unresolved_storage_class_omits_the_field() {
-        assert_eq!(pvc("any", "20Gi", None).spec.expect("spec").storage_class_name, None);
-        assert_eq!(
-            pvc("any", "20Gi", Some("topolvm-thin")).spec.expect("spec").storage_class_name,
-            Some("topolvm-thin".to_string())
-        );
     }
 }

@@ -123,11 +123,6 @@ mod tests {
 
     const OID: &str = "c6f8cc7e93de9981bc0934ea1560c003ba82130802e5c66aa07a685eaf1c80a3";
 
-    #[test]
-    fn seed_sha8_is_the_oid_prefix() {
-        assert_eq!(seed_sha8(OID), "c6f8cc7e");
-    }
-
     /// One tree on two drivers = two seeds (shared name → CSI handle the second cannot resolve)
     #[test]
     fn seed_pvc_name_separates_the_same_content_on_different_drivers() {

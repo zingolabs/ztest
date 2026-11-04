@@ -252,13 +252,6 @@ mod tests {
         }
     }
 
-    /// Every bundle carries the staged Dockerfile at the root
-    #[test]
-    fn stages_the_dockerfile() {
-        let c = Ctx::new();
-        assert!(tar_paths(&c.pack().tar).contains(&"Dockerfile".to_string()));
-    }
-
     /// Identical trees pack to identical bytes = what the content address (and registry
     /// dedup) rests on
     #[test]

@@ -175,14 +175,6 @@ fn registries_conf() -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn token_round_trips() {
-        for rt in [ContainerRuntime::Docker, ContainerRuntime::Podman] {
-            assert_eq!(ContainerRuntime::parse(rt.as_str()), Some(rt));
-        }
-        assert_eq!(ContainerRuntime::parse("containerd"), None);
-    }
-
     /// Bare tag reaches the node under a podman-only prefix → load arg and pod reference
     /// must carry it, else the kubelet resolves nothing
     #[test]

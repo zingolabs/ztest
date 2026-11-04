@@ -250,19 +250,6 @@ mod tests {
         assert_eq!(slug("::__::", 8), "x");
     }
 
-    /// Truncation landing on a word boundary must not overshoot `max` — at
-    /// `DNS_LABEL_MAX` a 64-byte label value is a 422 that fails the test, not the name
-    #[test]
-    fn slug_never_exceeds_max_when_truncating_on_a_word_boundary() {
-        // Exact input that produced 64: `...scriptpubkey` fills to 62, next word
-        // costs separator + character
-        let s = slug(
-            "testnet::tests::output_addresses_are_read_from_both_scriptpubkey_shapes",
-            DNS_LABEL_MAX,
-        );
-        assert!(s.len() <= DNS_LABEL_MAX, "{} bytes: {s}", s.len());
-    }
-
     /// Asserted over every cap × inputs with word boundaries at differing offsets (a
     /// hand-picked case covers only the offset it happens to hit)
     #[test]

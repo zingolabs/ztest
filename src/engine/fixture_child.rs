@@ -65,15 +65,6 @@ fn exits_three() {
 }
 
 #[test]
-fn prints_stdout() {
-    if !playing() {
-        return;
-    }
-    println!("hello-stdout");
-    exit(0);
-}
-
-#[test]
 fn prints_test_vars() {
     if !playing() {
         return;

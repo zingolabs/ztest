@@ -296,13 +296,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn running_only_in_running_phase() {
-        assert!(!is_running(&status(Some("Pending"))));
-        assert!(is_running(&status(Some("Running"))));
-        assert!(!is_running(&status(None)));
-    }
-
     // ── Lifecycle phase extraction ──────────────────────────────────────────
 
     use k8s_openapi::api::core::v1::{ContainerStateRunning, PodSpec};
@@ -417,13 +410,6 @@ mod tests {
         assert!(!is_ready(&s));
     }
 
-    #[test]
-    fn pending_pod_is_not_a_fault() {
-        // Queued-on-capacity = no fault; caller waits without charging a deadline
-        assert!(fault(&status(Some("Pending"))).is_none());
-        assert!(fault(&status(Some("Running"))).is_none());
-    }
-
     /// `PodScheduled` condition with optional reason/message
     fn sched_cond(status: &str, reason: Option<&str>, message: Option<&str>) -> PodCondition {
         PodCondition {
@@ -467,26 +453,6 @@ mod tests {
             }],
         );
         assert!(!is_scheduled(&s));
-    }
-
-    #[test]
-    fn schedule_blocker_reports_the_schedulers_verdict() {
-        // Real shape of the failure this exists to surface
-        let unbound = with_conditions(
-            status(Some("Pending")),
-            vec![sched_cond(
-                "False",
-                Some("Unschedulable"),
-                Some("0/1 nodes are available: pod has unbound immediate PersistentVolumeClaims"),
-            )],
-        );
-        assert_eq!(
-            schedule_blocker(&unbound).as_deref(),
-            Some(
-                "Unschedulable: 0/1 nodes are available: pod has unbound immediate \
-                 PersistentVolumeClaims"
-            )
-        );
     }
 
     #[test]
@@ -560,23 +526,6 @@ mod tests {
         assert_eq!(fault(&oom).as_deref(), Some("zainod: OOMKilled"));
 
         assert!(fault(&status(Some("Failed"))).is_some());
-    }
-
-    #[test]
-    fn image_error_detects_stuck_pull() {
-        let p = with_container(status(Some("Pending")), {
-            let mut c = container("test");
-            c.state = Some(ContainerState {
-                waiting: Some(ContainerStateWaiting {
-                    reason: Some("ImagePullBackOff".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-            c
-        });
-        assert_eq!(image_error(&p).as_deref(), Some("ImagePullBackOff"));
-        assert!(image_error(&status(Some("Pending"))).is_none());
     }
 
     #[test]

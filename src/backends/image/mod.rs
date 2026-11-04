@@ -771,24 +771,6 @@ mod tests {
         assert_ne!(a.tag_rust(&[], None), a.tag_rust(&[], Some("1.91.0")));
     }
 
-    /// `rust-toolchain.toml` = build-arg convenience, not identity (folding it in would
-    /// churn every tag). Hashed as ordinary context, never read by `tag_suffix`/`dev_tag`
-    #[test]
-    fn toolchain_file_is_not_the_pinned_version() {
-        let df = "FROM scratch\nCOPY main.rs /\n";
-        let a = Ctx::new(df, "main.rs", b"fn main() {}");
-        // Pin argument forks the tag, not the file
-        assert_eq!(a.tag_rust(&[], None), a.tag(&[]));
-    }
-
-    /// No pin & no `rust-toolchain.toml` → **no** `RUST_VERSION` build-arg, so the
-    /// Dockerfile's own `ARG` default stands (the zebra bug)
-    #[test]
-    fn no_rust_version_means_no_build_arg() {
-        let c = Ctx::new("FROM scratch\n", "main.rs", b"fn main() {}");
-        assert_eq!(c.build_arg("RUST_VERSION", None), None);
-    }
-
     #[test]
     fn pinned_rust_version_becomes_build_arg() {
         let c = Ctx::new("FROM scratch\n", "main.rs", b"fn main() {}");

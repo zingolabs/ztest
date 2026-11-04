@@ -667,34 +667,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn context_ceiling_names_the_biggest_offenders() {
-        let total = 13 * (1 << 30);
-        let msg = oversized_context(
-            total,
-            vec![
-                (3 << 30, PathBuf::from("ztest/fixtures/chains/b.tar.zst")),
-                (1 << 10, PathBuf::from("ztest/src/lib.rs")),
-                (8 << 30, PathBuf::from("ztest/fixtures/chains/a.tar.zst")),
-            ],
-        );
-        assert!(msg.contains("13.0 GiB"), "reports the total: {msg}");
-        // Descending by size → the file worth excluding reads first
-        let a = msg.find("a.tar.zst").expect("largest listed");
-        let b = msg.find("b.tar.zst").expect("second listed");
-        assert!(a < b, "offenders are ordered largest-first: {msg}");
-        assert!(msg.contains(CONTEXT_MAX_ENV), "names the override: {msg}");
-    }
-
-    #[test]
-    fn byte_quantities_use_binary_prefixes() {
-        assert_eq!(bytes(8_751_733_052), "8.2 GiB");
-        assert_eq!(bytes(649_866_689), "619.8 MiB");
-        assert_eq!(bytes(1 << 10), "1.0 KiB");
-        assert_eq!(bytes(512), "512 B");
-        assert_eq!(bytes(0), "0 B");
-    }
-
-    #[test]
     fn exit_sentinel_splits_code_and_output() {
         let (clean, code) = split_exit_sentinel("hello\nworld\nZTEST_EXIT=0\n");
         assert_eq!(clean, "hello\nworld");

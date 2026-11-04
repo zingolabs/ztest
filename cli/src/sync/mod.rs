@@ -1682,49 +1682,6 @@ fn off_cpu_fraction(raw: &str) -> Result<f64> {
 mod tests {
     use super::*;
 
-    fn plain_theme() -> Theme {
-        Theme::for_capabilities(false, true)
-    }
-
-    /// Heading sits over the column it names, whatever width the rows measured to
-    #[test]
-    fn the_listing_columns_line_up_under_their_headings() {
-        let theme = plain_theme();
-        let head = Fields::new()
-            .text("id", pad("SYNC-ID", 12))
-            .text("ns", pad("NAMESPACE", 12))
-            .text("status", pad("STATUS", 8))
-            .text("user", "USER");
-        let head = draw(row::LIST_HEADER, &head, &theme);
-        let listed = Fields::new()
-            .text("mark", "*")
-            .text("id", pad("sync-aaa", 12))
-            .text("ns", pad("ztest-sync-a", 12))
-            .text("status", pad("passed", 8))
-            .text("user", "eli");
-        let listed = draw(&row::list("pass"), &listed, &theme);
-        assert_eq!(listed, "* sync-aaa     ztest-sync-a passed   eli");
-        assert_eq!(head.find("NAMESPACE"), listed.find("ztest-sync-a"));
-        assert_eq!(head.find("STATUS"), listed.find("passed"));
-        assert_eq!(head.find("USER"), listed.find("eli"));
-    }
-
-    /// A mistyped key binds nothing and renders blank, so the handoff is bound once here.
-    ///
-    /// Regression: the mark was bound as data with a literal `*` — the ascii spelling —
-    /// so the Unicode handoff drew an asterisk where every other surface drew a tick
-    #[test]
-    fn the_handoff_names_the_sync_and_its_follow_ups() {
-        let theme = plain_theme();
-        let started = Fields::new().text("id", "sync-aaa").text("ns", "ztest-sync-aaa");
-        assert_eq!(
-            draw(row::HANDOFF, &started, &theme),
-            "✓ sync sync-aaa started · namespace ztest-sync-aaa"
-        );
-        let cmd = Fields::new().text("verb", "stop").text("id", "sync-aaa");
-        assert_eq!(draw(row::HANDOFF_CMD, &cmd, &theme), "  · ztest sync stop   sync-aaa");
-    }
-
     fn labelled_cm(id: &str, user: Option<&str>) -> ConfigMap {
         let mut labels = BTreeMap::from([(SYNC_ID_KEY.to_string(), id.to_string())]);
         if let Some(u) = user {

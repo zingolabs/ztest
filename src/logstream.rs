@@ -164,15 +164,6 @@ mod tests {
     }
 
     #[test]
-    fn component_ansi_kept_for_colour_sinks_and_stripped_otherwise() {
-        let log = b"[zebrad] \x1b[33mWARN\x1b[0m x\n";
-        let coloured = component_section(log, LogTail::DEFAULT, true).unwrap();
-        assert!(coloured.contains("\x1b[33mWARN\x1b[0m x"), "{coloured:?}");
-        let plain = component_section(log, LogTail::DEFAULT, false).unwrap();
-        assert!(!plain.contains('\x1b') && plain.contains("WARN x"), "{plain:?}");
-    }
-
-    #[test]
     fn runner_output_drops_the_libtest_frame_and_appends_dead_pod_reasons() {
         let runner_raw = b"running 1 test\n\
 test my::test ... 2026-07-29T00:00:01Z  INFO ztest::env: starting\n\

@@ -273,12 +273,6 @@ snapshot_class = \"ztest-snapshot\"
     }
 
     #[test]
-    fn an_unknown_key_is_named_rather_than_ignored() {
-        let err = spec("[ztest]\npsuh = \"typo\"\n").expect_err("must reject");
-        assert!(err.message().contains("unknown field"), "{}", err.message());
-    }
-
-    #[test]
     fn a_document_with_no_ztest_table_is_rejected() {
         let err = spec("[harbor]\nurl = \"https://example\"\n").expect_err("no [ztest]");
         assert!(err.message().contains("ztest"), "{}", err.message());

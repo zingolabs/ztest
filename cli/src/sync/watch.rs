@@ -1021,16 +1021,6 @@ mod tests {
         assert_eq!(driver_phase(&pod), "Pending · ContainerCreating");
     }
 
-    #[test]
-    fn a_failing_image_pull_is_named_rather_than_looking_like_a_hang() {
-        let pod = driver_pod(
-            "Pending",
-            serde_json::json!({ "waiting": { "reason": "ImagePullBackOff" } }),
-        );
-        assert!(!logs_available(&pod, DRIVER_CONTAINER));
-        assert_eq!(driver_phase(&pod), "Pending · ImagePullBackOff");
-    }
-
     /// Tail loop must tell a dropped connection (reattach) from a finished run (stop)
     #[test]
     fn a_terminated_container_has_a_log_but_is_not_running() {

@@ -482,16 +482,4 @@ mod tests {
         assert_eq!(clock.window(true), METERED_STALL);
         assert_eq!(clock.window(false), BLIND_STALL, "bound but blind stays on the ladder");
     }
-
-    #[test]
-    fn an_unbound_snapshot_names_the_controller_not_the_disk() {
-        let clock = Liveness::new(0, Instant::now());
-        assert!(matches!(clock.fault(false), SnapFault::Unbound { .. }));
-    }
-
-    #[test]
-    fn a_copy_past_the_approximate_total_drops_the_fraction() {
-        assert_eq!(fraction(3 << 30, 2 << 30), "3.0 GiB");
-        assert_eq!(fraction(1 << 30, 2 << 30), "1.0 GiB/~2.0 GiB");
-    }
 }

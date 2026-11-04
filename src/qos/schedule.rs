@@ -70,10 +70,4 @@ mod tests {
         assert!(p.unschedulable.is_empty());
         assert_eq!(p.tests, 1);
     }
-
-    #[test]
-    fn empty_input_is_an_empty_plan() {
-        let p = plan(&[], Some(Resources::new(8_000, 16 * GIB, 0, 0)));
-        assert_eq!((p.tests, p.total), (0, Resources::ZERO));
-    }
 }

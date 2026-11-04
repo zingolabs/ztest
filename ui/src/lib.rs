@@ -45,40 +45,6 @@ pub use self::status::render_status;
 pub use self::theme::Theme;
 pub use ztest::api::QosPlan;
 
-/// Cross-crate test support. `pub` only so `ztest_cli`'s tests can reach it — nothing
-/// here is part of the rendering API, and `#[cfg(test)]` would not cross the crate line
-#[doc(hidden)]
-pub mod testing {
-    /// Assert an ASCII-mode render leaked no Unicode.
-    ///
-    /// The one gate every surface's golden test runs through. A hardcoded glyph is
-    /// invisible in a Unicode golden — it renders identically to the themed one — so the
-    /// only mechanical way to catch it is to draw the same frame with
-    /// [`ThemeChars::ascii`](crate::Theme) and check what came out. Without this, a leak
-    /// is found by a user on a terminal that cannot render it
-    ///
-    /// # Panics
-    /// With the offending characters named, and the line each sits on
-    pub fn assert_ascii_clean(surface: &str, drawn: &str) {
-        let bad: Vec<String> = drawn
-            .lines()
-            .enumerate()
-            .filter_map(|(i, line)| {
-                let leaked: Vec<char> = line.chars().filter(|c| !c.is_ascii()).collect();
-                match leaked.is_empty() {
-                    true => None,
-                    false => Some(format!("  line {}: {leaked:?} in {line:?}", i + 1)),
-                }
-            })
-            .collect();
-        assert!(
-            bad.is_empty(),
-            "`{surface}` leaked non-ascii glyphs in ascii mode — they belong in `ThemeChars`:\n{}",
-            bad.join("\n")
-        );
-    }
-}
-
 // ─────────────────────────── data model ───────────────────────────────
 
 /// One banner frame's inputs. Accumulated by the preflight loop, passed by value

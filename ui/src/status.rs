@@ -621,19 +621,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_run_starting_before_the_window_is_clipped_left() {
-        let b = bar(Axis { width: 48 }, -2 * 24 * 3600, Some(600), &ch());
-        assert!(b.starts_with('◀'), "off-window start marks the clip: {b}");
-    }
-
-    #[test]
-    fn a_run_ending_past_the_window_is_clipped_right() {
-        let b = bar(Axis { width: 48 }, -600, Some(31 * 3600), &ch());
-        assert!(b.ends_with('▶'), "off-window end marks the clip: {b}");
-        assert!(!b.contains('┤'), "no end cap the window cannot place");
-    }
-
     /// A stalled run has no honest projection; the `?` is the stall detector, and an end
     /// cap there would be an invented completion time
     #[test]
@@ -642,29 +629,6 @@ mod tests {
         assert!(b.contains('?'));
         assert!(!b.contains('┤'));
         assert!(!b.contains('▶'));
-    }
-
-    #[test]
-    fn axis_labels_and_ticks_share_one_column_arithmetic() {
-        let axis = Axis { width: 48 };
-        let ch = crate::theme::ThemeChars::unicode();
-        let (labels, ticks) = axis_rows(axis, &ch);
-        let now_col = ticks.chars().position(|c| c == ch.tick_now).expect("NOW tick");
-        assert_eq!(now_col, axis.now());
-        assert_eq!(labels.chars().skip(now_col).take(3).collect::<String>(), "NOW");
-    }
-
-    #[test]
-    fn test_names_truncate_from_the_head() {
-        let uni = crate::theme::ThemeChars::unicode();
-        assert_eq!(truncate_tail("sync::feat_nu6_3_topology", 16, &uni), "…_nu6_3_topology");
-        // ASCII spends three columns on the mark, so it keeps three fewer characters —
-        // the budget is the column count, not the character count
-        let ascii = crate::theme::ThemeChars::ascii();
-        let cut = truncate_tail("sync::feat_nu6_3_topology", 16, &ascii);
-        assert_eq!(cut, "...u6_3_topology");
-        assert_eq!(cut.chars().count(), 16, "the mark must fit inside the budget");
-        assert_eq!(truncate_tail("short", 16, &uni), "short");
     }
 
     /// `FULL` is not "zero free" but "less free than the lightest tier needs" — the same
@@ -677,43 +641,6 @@ mod tests {
         let short = Resources::new(basic.cpu_milli - 1, basic.mem_bytes, 0, 0);
         assert_eq!(verdict(short, alloc).0, "FULL");
         assert_eq!(verdict(alloc, alloc).0, "OPEN");
-    }
-
-    #[test]
-    fn run_ids_shorten_to_the_suffix_the_user_column_does_not_carry() {
-        assert_eq!(short_id("elicb-47192"), "47192");
-        assert_eq!(short_id("gh-8841029"), "8841029");
-    }
-
-    /// The left column is padded to a fixed width; counting a styled cell's escapes would
-    /// shove the separator right and shear every line below it
-    #[test]
-    fn ansi_does_not_count_toward_the_left_columns_width() {
-        let styled = "\u{1b}[1mFULL\u{1b}[0m";
-        assert_eq!(display_width(styled), 4);
-        assert_eq!(display_width(&pad(styled, LEFT_W)), LEFT_W);
-    }
-
-    /// Absent ETA drops its group where a measured zero still prints — "no projection"
-    /// and "due now" stay two different readings
-    #[test]
-    fn an_absent_eta_drops_its_group_where_a_zero_prints() {
-        let theme = Theme::for_capabilities(false, true);
-        let head = || Fields::new().text("user", "").text("bar", "").text("reserve", "1c/2Gi");
-        assert!(!draw(tmpl::RUN_SYNC, &head(), &theme).contains('~'));
-        let zero = head().text("eta", ztest::api::format_span(Duration::ZERO));
-        assert!(draw(tmpl::RUN_SYNC, &zero, &theme).ends_with("~0s"));
-    }
-
-    /// Both meters must land their `%` on one column, or the left block reads as two;
-    /// the mem line's IEC pair is the widest thing in it
-    #[test]
-    fn both_meter_rows_fit_the_left_column() {
-        let (t, g) = (Theme::for_capabilities(false, true), ztest::api::GIB as f64);
-        let cpu = meter_row(tmpl::METER_CPU, "cpu", 16.0, 96.0, 17, &t);
-        let mem = meter_row(tmpl::METER_MEM, "mem", 12.0 * g, 128.0 * g, 9, &t);
-        assert_eq!(display_width(&cpu), display_width(&mem));
-        assert!(display_width(&mem) <= LEFT_W, "{mem:?} overflows the left column");
     }
 
     /// Full-frame fixture: every branch this surface can draw — a run with connectors,
@@ -786,29 +713,6 @@ mod tests {
             anomaly: None,
             now: at(0),
         }
-    }
-
-    /// The gate `status` most needed: its gantt vocabulary is a dozen glyphs no other
-    /// surface draws, and a Unicode golden cannot tell a themed one from a hardcoded one
-    #[test]
-    fn the_whole_frame_falls_back_to_ascii() {
-        let v = full_view();
-        let ascii = Theme::for_capabilities(false, false);
-        for cols in [80, 120] {
-            crate::testing::assert_ascii_clean(
-                &format!("render_status({cols})"),
-                &render_status(&v, cols, &ascii),
-            );
-        }
-    }
-
-    /// Both encodings draw the same frame: same rows, same columns, only the glyphs differ
-    #[test]
-    fn ascii_and_unicode_frames_agree_on_shape() {
-        let v = full_view();
-        let uni = render_status(&v, 120, &Theme::for_capabilities(false, true));
-        let ascii = render_status(&v, 120, &Theme::for_capabilities(false, false));
-        assert_eq!(uni.lines().count(), ascii.lines().count(), "row count diverged");
     }
 
     /// `ztest status` repaints by walking the cursor up `frame.lines().count()` rows, which

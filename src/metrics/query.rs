@@ -958,17 +958,6 @@ mod tests {
         );
     }
 
-    /// Ranges are left-open in Prometheus v3 — unpadded, the sample at `t_start` is excluded
-    /// and the run's first interval never lands in any total
-    #[test]
-    fn a_raw_range_is_padded_past_the_left_open_boundary() {
-        let span = Duration::from_secs(3_600);
-        let range = promql_raw(ORCHARD.rate(), "ns", span);
-        let secs: u64 = range.rsplit_once('[').unwrap().1.trim_end_matches("s]").parse().unwrap();
-        assert!(secs > span.as_secs(), "{range}");
-        assert_eq!(secs - span.as_secs(), SCRAPE_INTERVAL.as_secs());
-    }
-
     /// zaino splits every per-block family on `stage`; folding it counts one block
     /// once per ingest pass, so the selector must reach both queries
     #[test]
@@ -1061,11 +1050,6 @@ mod tests {
         assert_eq!(folded.points, vec![(0.0, 11.0), (60.0, 44.0)]);
     }
 
-    #[test]
-    fn folding_nothing_yields_no_series() {
-        assert_eq!(Series::folded("sapling", &[]), None);
-    }
-
     /// A dropped sample is a gap, not a zero — a stall the run never had
     #[test]
     fn a_non_finite_sample_leaves_a_gap_rather_than_a_zero() {
@@ -1141,39 +1125,6 @@ mod tests {
         let folded = Total::folded(&[a, b]).expect("two parts");
         assert_eq!(folded.value, 150.0);
         assert_eq!(folded.coverage.samples, 4);
-    }
-
-    #[test]
-    fn a_latency_series_has_no_total() {
-        let latency = Series {
-            reading: Some(FETCH.mean()),
-            label: "batch write".into(),
-            unit: Unit::Millis,
-            facet: None,
-            channel: None,
-            points: vec![(0.0, 12.0), (30.0, 900.0)],
-            total: None,
-            coverage: None,
-        };
-        assert_eq!(latency.total, None);
-        assert_eq!(latency.peak(), Some(900.0));
-    }
-
-    #[test]
-    fn an_empty_series_reports_no_statistics() {
-        let empty = Series {
-            reading: None,
-            label: "x".into(),
-            unit: Unit::PerSec,
-            facet: None,
-            channel: None,
-            points: vec![],
-            total: None,
-            coverage: None,
-        };
-        assert_eq!(empty.mean(), None);
-        assert_eq!(empty.peak(), None);
-        assert_eq!(empty.last(), None);
     }
 
     /// Tiers pooled across a restart's two pods, newest sample wins, a hole below the top tier

@@ -81,3 +81,78 @@ fn strip_footer_grammar(lines: &mut Vec<&[u8]>) {
 fn is_verdict(line: &[u8]) -> bool {
     line == b"ok" || line == b"ignored" || line == b"FAILED" || line.starts_with(b"FAILED (")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::strip_libtest_frame;
+
+    #[test]
+    fn strip_frame_removes_libtest_scaffolding_from_result_err_run() {
+        // Real `--exact <t> --nocapture` capture: libtest header, held-open
+        // `test <t> ... ` prefix with the first log glued on, merged body, verdict footer
+        let raw = b"\nrunning 1 test\ntest t ... 2026 INFO starting\n2026 INFO provisioning\nError: archive materialize failed\nFAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s\n\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(
+            got, "2026 INFO starting\n2026 INFO provisioning\nError: archive materialize failed",
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn strip_frame_removes_scaffolding_from_passing_run() {
+        let raw = b"\nrunning 1 test\ntest t ... hello from the test\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s\n\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(got, "hello from the test", "{got:?}");
+    }
+
+    #[test]
+    fn strip_frame_keeps_user_line_that_reads_failed() {
+        // Only the single trailing verdict token is consumed → a log line reading
+        // literally `FAILED` survives
+        let raw = b"\nrunning 1 test\ntest t ... step one\nFAILED\nstep two\nFAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(got, "step one\nFAILED\nstep two", "{got:?}");
+    }
+
+    #[test]
+    fn strip_frame_preserves_panic_body() {
+        // Panic prints `thread … panicked` to stderr before the verdict = signal, kept
+        let raw = b"\nrunning 1 test\ntest t ... \nthread 't' panicked at src/x.rs:9:5:\nassertion failed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(
+            got,
+            "thread 't' panicked at src/x.rs:9:5:\nassertion failed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn strip_frame_recovers_panic_that_merged_before_the_marker() {
+        // Pod path: body → stderr, `test <t> ... ` marker → stdout, and the runtime
+        // merges the panic *ahead* of the marker. Slicing at the marker would drop the
+        // whole failure; the marker (now a bare verdict) must go instead
+        let raw = b"\nrunning 1 test\nthread 't' panicked at src/x.rs:9:5:\nassertion `left == right` failed\n  left: 1\n  right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest t ... FAILED\n\nfailures:\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(
+            got,
+            "thread 't' panicked at src/x.rs:9:5:\nassertion `left == right` failed\n  left: 1\n  right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn strip_frame_falls_back_to_verbatim_when_marker_absent() {
+        // No `test <t> ... ` marker and no `test result:` anchor → nothing cut but edge
+        // blanks (an unexpected format keeps its content rather than risk eating it)
+        let raw = b"some unexpected output shape\nwith two lines\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "t")).unwrap();
+        assert_eq!(got, "some unexpected output shape\nwith two lines", "{got:?}");
+    }
+
+    #[test]
+    fn strip_frame_handles_module_qualified_test_name() {
+        let raw = b"\nrunning 1 test\ntest mod::sub::it ... log line\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n";
+        let got = String::from_utf8(strip_libtest_frame(raw, "mod::sub::it")).unwrap();
+        assert_eq!(got, "log line", "{got:?}");
+    }
+}

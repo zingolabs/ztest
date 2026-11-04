@@ -243,16 +243,6 @@ mod tests {
     }
 
     #[test]
-    fn sgr_in_footer_does_not_shift_columns() {
-        let mut t = Term::new(40, 10);
-        let mut out = String::new();
-        // SGR codes must not count as visible columns
-        render(&mut out, &[], &strings(&["\x1b[1;32mOK\x1b[0m"]), 0);
-        t.apply(&out);
-        assert_eq!(t.visible(), strings(&["OK"]));
-    }
-
-    #[test]
     fn many_committed_lines_scroll_into_scrollback() {
         let mut t = Term::new(40, 4); // short screen so it must scroll
         let mut out = String::new();

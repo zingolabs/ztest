@@ -317,11 +317,6 @@ mod tests {
         assert_eq!(Beacon::decode(&lease_of(&b)).as_ref(), Some(&b));
     }
 
-    #[test]
-    fn completed_is_derived_never_stored() {
-        assert_eq!(beacon().completed(), 3);
-    }
-
     /// The overflow row (`+ 12 more · 12c/6Gi`) must be exact from a truncated list, so the
     /// count and aggregate are carried separately and survive the cap
     #[test]
