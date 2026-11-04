@@ -792,9 +792,12 @@ async fn next_line(stream: &mut Option<LineStream>) -> Option<std::io::Result<St
 const SOURCE_ROW: &str = "{source:>8|dim} {stem|dim} {line}";
 
 /// Tag a line with the pod it came from, so a merged stream stays attributable
+///
+/// - clipped to the terminal (a wrapped line = two scrollback rows; full line = `kubectl logs`)
 fn prefixed(source: &str, line: &str, theme: &Theme) -> String {
     let f = Fields::new().text("source", source).text("stem", theme.chars.vbar).text("line", line);
-    format!("{}\n", draw(SOURCE_ROW, &f, theme))
+    let row = draw(SOURCE_ROW, &f, theme);
+    format!("{}\n", console::truncate_str(&row, render::width(), "…"))
 }
 
 /// Component log line: its own ANSI stripped (zebrad colours itself), one palette for every source
@@ -806,19 +809,26 @@ fn component_line(source: &str, line: &str, theme: &Theme, highlighter: &Highlig
     }
 }
 
-/// Levels first (first-added highlighter wins an overlap), timestamps faint, then tailspin's set
+/// Levels first (first-added highlighter wins an overlap), then zaino's units, timestamps faint,
+/// then tailspin's set
+///
+/// - units = zaino's `ByteSize` (`12.8GB`) + `Human` (`1h02m`) whole, not `12` alone
 fn log_highlighter() -> Highlighter {
     let level = |words: &str, style: Style| RegexConfig {
         regex: format!(r"\b(?:level=(?:{lower})|{words})\b", lower = words.to_lowercase()),
         style,
     };
     let faint = Style::new().faint();
+    let number = NumberConfig::default().style;
+    let unit = |regex: &str| RegexConfig { regex: regex.to_string(), style: number };
     Highlighter::builder()
         .with_regex_highlighter(level("ERROR", Style::new().fg(Color::Red).bold()))
         .with_regex_highlighter(level("WARN", Style::new().fg(Color::Yellow)))
         .with_regex_highlighter(level("INFO", Style::new().fg(Color::Green)))
         .with_regex_highlighter(level("DEBUG", Style::new().fg(Color::Blue)))
         .with_regex_highlighter(level("TRACE", faint))
+        .with_regex_highlighter(unit(r"\b\d+(?:\.\d+)?(?:B|KB|MB|GB|TB)\b"))
+        .with_regex_highlighter(unit(r"\b\d+(?:ms|s|m\d{2}s|h\d{2}m|d\d{2}h)\b"))
         .with_date_time_highlighter(DateTimeConfig {
             date: faint,
             time: faint,
