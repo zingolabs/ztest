@@ -162,7 +162,7 @@ impl Burst {
     fn done(&self, cx: &Cx) {
         // saturating: a wallet joining mid-announcement takes a burst that never counted it
         let left =
-            self.pending.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| p.checked_sub(1));
+            self.pending.try_update(Ordering::Relaxed, Ordering::Relaxed, |p| p.checked_sub(1));
         if left == Ok(1) {
             let drain = self.started.elapsed();
             let busy = self
