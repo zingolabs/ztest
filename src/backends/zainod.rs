@@ -26,7 +26,7 @@ use crate::handles::PodHandle;
 use crate::handles::indexer::{IndexerBackend, IndexerConfig};
 use crate::loadtest::load::{PodCgroup, ServerMeter};
 use crate::loadtest::measure::{Method, Span};
-use crate::metrics::{Counter, Exporter, Exposition, Facet, Row, Tiers, count_above, row};
+use crate::metrics::{Counter, Exporter, Exposition, Facet, Row, count_above, row};
 use crate::protocol::Endpoint;
 use crate::protocol::client::JsonRpcClient;
 use crate::sync::Channel as Pool;
@@ -839,7 +839,9 @@ pub mod family {
     pub const BUILD_INFO: Gauge = gauge("zaino_build_info", Dimension::Count);
 
     pub const BEST_TIP: Gauge = gauge("zaino_best_tip", Dimension::Count);
-    /// Highest contiguous height fetched + handed to the indexes (not durable)
+    /// Finalized boundary (~1,000 under the best tip) = how far the fetch can reach
+    pub const FINALIZED_TIP: Gauge = gauge("zaino_finalized_tip", Dimension::Count);
+    /// Last finalized height handed to the index writers (not durable)
     pub const FETCH_HEIGHT: Gauge = gauge("zaino_fetch_height", Dimension::Count);
 
     pub const fn index_finalized_height(index: ZainoIndex) -> Gauge {
@@ -874,19 +876,7 @@ pub mod family {
     pub const VALIDATOR_RPC: Hist =
         hist("zaino_validator_rpc_duration_seconds", Dimension::Seconds);
 
-    // LSM segment sets (`receives` / `spent` / `by_hash` / `outputs`); segments + merging by `tier`
-    pub const fn lsm_segments(set: &'static str) -> Gauge {
-        gauge_where("zaino_lsm_segments", Dimension::Count, "set", set)
-    }
-    pub const fn lsm_merging(set: &'static str) -> Gauge {
-        gauge_where("zaino_lsm_merging", Dimension::Count, "set", set)
-    }
-    pub const fn lsm_stall_at(set: &'static str) -> Gauge {
-        gauge_where("zaino_lsm_stall_at", Dimension::Count, "set", set)
-    }
-    // Summed over sets; merge rows / batch rows = write amplification
-    pub const LSM_BATCH_ROWS: Counter = counter("zaino_lsm_batch_rows_total", Dimension::Count);
-    pub const LSM_MERGE_ROWS: Counter = counter("zaino_lsm_merge_rows_total", Dimension::Count);
+    // LSM, summed over `index`
     pub const LSM_MERGE_BYTES: Counter = counter("zaino_lsm_merge_bytes_total", Dimension::Bytes);
     pub const LSM_MERGE: Hist = hist("zaino_lsm_merge_duration_seconds", Dimension::Seconds);
     /// Unpublished = no commit ever waited on a merge
@@ -901,20 +891,9 @@ pub mod family {
     }
 }
 
-const fn lsm(set: &'static str) -> Tiers {
-    Tiers {
-        label: set,
-        segments: family::lsm_segments(set),
-        merging: family::lsm_merging(set),
-        stall_at: family::lsm_stall_at(set),
-    }
-}
-
-const TIERS: [Tiers; 4] = [lsm("receives"), lsm("spent"), lsm("by_hash"), lsm("outputs")];
-
 /// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns scannable
 #[rustfmt::skip]
-const ROWS: [Row; 22] = [
+const ROWS: [Row; 21] = [
     // Directions kept apart: only outputs are checkable against the note-commitment trees
     row("transparent in", family::TRANSPARENT_INPUTS.rate(), Facet::Transparent).pool(Pool::Transparent),
     row("transparent out", family::TRANSPARENT_OUTPUTS.rate(), Facet::Transparent).pool(Pool::Transparent),
@@ -929,6 +908,7 @@ const ROWS: [Row; 22] = [
     row("merge", family::LSM_MERGE.mean(), Facet::WritePath),
     row("commit stall", family::LSM_STALL.mean(), Facet::WritePath),
     row("fetched", family::FETCH_HEIGHT.level(), Facet::Progress),
+    row("finalized tip", family::FINALIZED_TIP.level(), Facet::Progress),
     row("best tip", family::BEST_TIP.level(), Facet::Progress),
     row("compact block", family::index_finalized_height(ZainoIndex::CompactBlock).level(), Facet::Progress),
     row("value balance", family::index_finalized_height(ZainoIndex::UtxoSet).level(), Facet::Progress),
@@ -936,21 +916,18 @@ const ROWS: [Row; 22] = [
     row("tree state", family::index_finalized_height(ZainoIndex::TreeState).level(), Facet::Progress),
     row("transparent address", family::index_finalized_height(ZainoIndex::TransparentAddress).level(), Facet::Progress),
     row("reorgs", family::REORGS.rate(), Facet::Progress),
-    // Byte flow first: the store panel plots its first row's unit
     row("merge write", family::LSM_MERGE_BYTES.rate(), Facet::Store),
-    row("rows batched", family::LSM_BATCH_ROWS.rate(), Facet::Store),
-    row("rows merged", family::LSM_MERGE_ROWS.rate(), Facet::Store),
 ];
 
 impl crate::metrics::MetricLayout for ZainoIndexer {
     const ROWS: &'static [Row] = &ROWS;
-    const TIERS: &'static [Tiers] = &TIERS;
 }
 
 impl Observe for ZainoIndexer {
+    /// Fetch stops at the finalized boundary (best tip = context, never the target)
     const HEIGHTS: Heights = Heights {
         height: family::FETCH_HEIGHT,
-        target: Some(family::BEST_TIP),
+        target: Some(family::FINALIZED_TIP),
         tip: Some(family::BEST_TIP),
     };
 
@@ -1557,8 +1534,9 @@ path = "/var/lib/zaino/indexes/transparent_address"
         e
     }
 
-    /// Mid-sync exposition in zainod's shape: progress = fetch frontier over best tip, work =
-    /// the unlabelled fetch counters, per-index heights/serving read by label
+    /// Mid-sync exposition in zainod's shape: progress = fetch frontier over the finalized tip
+    /// (never the best tip: fetch stops ~1,000 under it), work = the unlabelled fetch counters,
+    /// per-index heights/serving read by label
     #[test]
     fn a_mid_sync_scrape_reads_as_fetch_progress_with_per_index_state() {
         let e = scrape(
@@ -1566,8 +1544,10 @@ path = "/var/lib/zaino/indexes/transparent_address"
              zaino_build_info{version=\"0.2.0\"} 1\n\
              # TYPE zaino_best_tip gauge\n\
              zaino_best_tip 1000\n\
+             # TYPE zaino_finalized_tip gauge\n\
+             zaino_finalized_tip 900\n\
              # TYPE zaino_fetch_height gauge\n\
-             zaino_fetch_height 500\n\
+             zaino_fetch_height 450\n\
              # TYPE zaino_fetch_sapling_outputs_total counter\n\
              zaino_fetch_sapling_outputs_total 12\n\
              # TYPE zaino_fetch_orchard_actions_total counter\n\
@@ -1585,7 +1565,7 @@ path = "/var/lib/zaino/indexes/transparent_address"
         let mut work = Work::ZERO;
         work.set(Op::SaplingOutput, 12).set(Op::OrchardAction, 7);
         let progress = reading_of(&e).expect("fetch frontier published");
-        assert_eq!(progress, ZainoSyncProgress { height: 500, target: Some(1000), work });
+        assert_eq!(progress, ZainoSyncProgress { height: 450, target: Some(900), work });
         assert_eq!(progress.pct(), 50.0);
         assert_eq!(progress.work().and_then(|w| w.get(Op::TransparentOut)), None, "unmeasured");
         assert_eq!(<ZainoIndexer as Observe>::work_source(Op::SproutJoinSplit), None);
@@ -1599,7 +1579,7 @@ path = "/var/lib/zaino/indexes/transparent_address"
         assert!(!all_synced(&e), "tree_state still syncing");
 
         let observed = ZainoIndexer::observe(&e).expect("zainod exposition");
-        assert_eq!((observed.height, observed.target), (Some(500), Some(1000)));
+        assert_eq!((observed.height, observed.target), (Some(450), Some(900)));
         assert_eq!(observed.transactions, Some(40));
         assert_eq!(ZainoIndexer::observe(&scrape("zaino_best_tip 1\n")), None, "no build_info");
     }

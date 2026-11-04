@@ -110,8 +110,6 @@ pub struct ThemeChars {
     pub clip_start: char,
     pub clip_end: char,
     pub tick_now: char,
-    pub busy: char,  // tier bars: a merge in flight on this tier
-    pub limit: char, // tier bars: the count a writer stalls at
     pub graph: super::plot::GraphMode,
     pub frame: [&'static str; 6],
 }
@@ -146,8 +144,6 @@ impl ThemeChars {
             clip_start: '◀',
             clip_end: '▶',
             tick_now: '▼',
-            busy: '⟳',
-            limit: '┆',
             graph: super::plot::GraphMode::Braille,
             frame: ["╭", "╮", "╰", "╯", "─", "│"],
         }
@@ -182,8 +178,6 @@ impl ThemeChars {
             clip_start: '<',
             clip_end: '>',
             tick_now: 'v',
-            busy: '@',
-            limit: ':',
             graph: super::plot::GraphMode::Ascii,
             frame: ["+", "+", "+", "+", "-", "|"],
         }

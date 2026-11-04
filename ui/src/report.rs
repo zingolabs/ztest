@@ -16,7 +16,7 @@ use owo_colors::OwoColorize as _;
 
 use super::Theme;
 use super::boxes::{beside, boxed, interior};
-use super::layout::{display_width, pad, truncate};
+use super::layout::{display_width, truncate};
 use super::plot::{self, Band, Palette, PlotOpts};
 use super::template::{Fields, Template};
 use super::text::y_axis;
@@ -24,7 +24,6 @@ use ztest::api::Reading;
 use ztest::api::Series;
 use ztest::api::SyncStatus;
 use ztest::api::Unit;
-use ztest::api::metrics::{TierBar, TierShape};
 use ztest::api::{format_elapsed, thousands, unit_value};
 
 /// Full terminal, capped. Past this the plots stop gaining resolution the eye can use
@@ -33,9 +32,6 @@ const MAX_WIDTH: usize = 160;
 
 /// Below this a single column is wider than two cramped ones
 const MIN_TWO_COLUMN: usize = 100;
-
-/// Narrowest tier column worth drawing beside another (below → stores stack)
-const MIN_TIER_COLUMN: usize = 30;
 
 const PLOT_ROWS: usize = 5;
 /// cpu over mem in one panel: two stacks, each shorter than a lone plot
@@ -145,7 +141,6 @@ pub struct ReportView {
     /// Per-stage cost + its tail. Paired by label: `fetch` carries `fetch p99`
     pub write_path: Vec<Series>,
     pub store: Vec<Series>,
-    pub tiers: Vec<TierShape>,
     pub resources: Vec<ComponentResources>,
     /// `label <- family{sel}` the build never published (em-dashes read like a quiet run)
     pub unpublished: Vec<String>,
@@ -194,10 +189,6 @@ pub fn render_sync_report(view: &ReportView, theme: &Theme, width: usize) -> Str
             store_box("store", &view.store, view, theme, right_w),
         ),
     ];
-    // Full width, not paired: one column per store reads across as one shape
-    if !view.tiers.is_empty() {
-        panels.push((tiers_box(&view.tiers, theme, width), Vec::new()));
-    }
     match view.resources.is_empty() {
         true => panels.push((empty(theme, "resources", view, left_w), Vec::new())),
         // Pairwise: a third component earns its own row rather than a narrower one
@@ -532,143 +523,6 @@ fn store_box(
     boxed(title, "", &body, width, theme)
 }
 
-/// Size-tiered stores side by side, bars on one scale shared by every store (comparable)
-///
-/// - bar = segments at the window's end; `(max N)` = the run's peak where above it
-/// - `limit` glyph = stall count, `busy` glyph = merge in flight
-fn tiers_box(shapes: &[TierShape], theme: &Theme, width: usize) -> Vec<String> {
-    let inner = interior(width);
-    let sep = format!(" {} ", theme.chars.vbar.style(theme.styles.dim));
-    let gaps = display_width(&sep) * shapes.len().saturating_sub(1);
-    let column = inner.saturating_sub(gaps) / shapes.len().max(1);
-    let two_up = column >= MIN_TIER_COLUMN;
-    let column = if two_up { column } else { inner };
-
-    let ceiling = shapes
-        .iter()
-        .flat_map(|s| s.bars.iter().map(|b| b.now.max(b.peak)).chain(s.stall_at))
-        .fold(1.0, f64::max);
-    let grid = TierGrid::fit(shapes, ceiling, column);
-    let blocks: Vec<Vec<String>> = shapes.iter().map(|s| tier_column(s, &grid, theme)).collect();
-
-    let mut body = Vec::new();
-    match two_up {
-        true => {
-            let rows = blocks.iter().map(Vec::len).max().unwrap_or(0);
-            for i in 0..rows {
-                let cells: Vec<String> = blocks
-                    .iter()
-                    .map(|b| pad(b.get(i).map_or("", String::as_str), column))
-                    .collect();
-                body.push(cells.join(&sep));
-            }
-        }
-        false => {
-            for (i, block) in blocks.into_iter().enumerate() {
-                if i > 0 {
-                    body.push(String::new());
-                }
-                body.extend(block);
-            }
-        }
-    }
-    let dot = theme.chars.dot;
-    body.push(
-        format!(
-            "{} stall {dot} {} merging {dot} (max) = run peak",
-            theme.chars.limit, theme.chars.busy
-        )
-        .style(theme.styles.dim)
-        .to_string(),
-    );
-    boxed("segments by tier", "", &body, width, theme)
-}
-
-/// Column geometry shared by every store (one cell = one count everywhere)
-struct TierGrid {
-    ceiling: f64,
-    tag_w: usize,
-    now_w: usize,
-    peak_w: usize,
-    cells: usize,
-}
-
-impl TierGrid {
-    fn fit(shapes: &[TierShape], ceiling: f64, column: usize) -> TierGrid {
-        let bars = || shapes.iter().flat_map(|s| &s.bars);
-        let tag_w = bars().map(|b| tier_tag(b).len()).max().unwrap_or(0);
-        let now_w = bars().map(|b| tier_count(b.now).len()).max().unwrap_or(0);
-        let peak_w = bars().filter_map(tier_peak).map(|p| p.len()).max().unwrap_or(0);
-        // tag, space, bar, space, count, peak
-        let cells = column.saturating_sub(tag_w + 1 + 1 + now_w + peak_w).max(1);
-        TierGrid { ceiling, tag_w, now_w, peak_w, cells }
-    }
-}
-
-fn tier_tag(b: &TierBar) -> String {
-    format!("t{}", b.tier)
-}
-
-fn tier_count(v: f64) -> String {
-    thousands(v.round() as u64)
-}
-
-fn tier_peak(b: &TierBar) -> Option<String> {
-    (b.peak > b.now).then(|| format!(" (max {})", tier_count(b.peak)))
-}
-
-/// One store: `label  N segments · k merging`, then `t<tier> <bar> <now> (max <peak>)` per tier
-fn tier_column(shape: &TierShape, grid: &TierGrid, theme: &Theme) -> Vec<String> {
-    let total: f64 = shape.bars.iter().map(|b| b.now).sum();
-    let state = match shape.bars.iter().filter(|b| b.merging).count() {
-        0 => "idle".to_string(),
-        n => format!("{n} merging"),
-    };
-    let head = format!(
-        "{}  {} segments {} {state}",
-        shape.label.style(theme.styles.count),
-        tier_count(total),
-        theme.chars.dot
-    );
-
-    let TierGrid { tag_w, now_w, peak_w, .. } = *grid;
-    let mut lines = vec![head];
-    for b in &shape.bars {
-        let bar = tier_bar(b, shape.stall_at, grid, theme);
-        let peak = format!("{:<peak_w$}", tier_peak(b).unwrap_or_default());
-        lines.push(format!(
-            "{:<tag_w$} {bar} {:>now_w$}{}",
-            tier_tag(b),
-            tier_count(b.now),
-            peak.style(theme.styles.dim)
-        ));
-    }
-    lines
-}
-
-/// `cells` wide: fill to `now` (≥ 1 cell when non-zero), `busy` right after it, `limit` at the
-/// stall count where the fill has not reached
-fn tier_bar(b: &TierBar, stall_at: Option<f64>, grid: &TierGrid, theme: &Theme) -> String {
-    let (ceiling, cells) = (grid.ceiling, grid.cells);
-    let at = |v: f64| ((v / ceiling * cells as f64).round() as usize).min(cells);
-    let fill = match b.now > 0.0 {
-        true => at(b.now).max(1),
-        false => 0,
-    };
-    let limit = stall_at.map(|s| at(s).min(cells - 1));
-    let busy = b.merging.then_some(fill.min(cells - 1));
-    (0..cells)
-        .map(|c| match c {
-            c if Some(c) == busy && c >= fill => {
-                theme.chars.busy.style(theme.styles.skip).to_string()
-            }
-            c if c < fill => theme.chars.bar_fill.to_string(),
-            c if Some(c) == limit => theme.chars.limit.style(theme.styles.dim).to_string(),
-            _ => " ".to_string(),
-        })
-        .collect()
-}
-
 /// One component's draw and its disk. The title carries the component, so each summary
 /// names its quantity instead of repeating it.
 ///
@@ -927,23 +781,6 @@ mod tests {
         Series { reading: Some(reading), ..series(label, Unit::Millis, values) }
     }
 
-    /// `(now, peak, merging)` per tier from 0; stall at 24 (fanout 8)
-    fn tiers(label: &str, bars: &[(u32, u32, bool)]) -> TierShape {
-        TierShape {
-            label: label.into(),
-            bars: (0..)
-                .zip(bars)
-                .map(|(tier, &(now, peak, merging))| TierBar {
-                    tier,
-                    now: now.into(),
-                    peak: peak.into(),
-                    merging,
-                })
-                .collect(),
-            stall_at: Some(24.0),
-        }
-    }
-
     fn view() -> ReportView {
         ReportView {
             sync_id: "zaino-index-construction-c3115f50".into(),
@@ -1002,11 +839,6 @@ mod tests {
                 series("merge write", Unit::BytesPerSec, &wave(3.1e7, 60, 0.0)),
                 series("rows batched", Unit::PerSec, &wave(412_000.0, 60, 0.0)),
                 series("rows merged", Unit::PerSec, &wave(1.3e6, 60, 7.0)),
-            ],
-            tiers: vec![
-                tiers("receives", &[(7, 7, false), (11, 14, true), (3, 3, false), (1, 1, true)]),
-                tiers("spent", &[(5, 5, false), (6, 6, false), (4, 4, true), (3, 3, false)]),
-                tiers("by_hash", &[(4, 4, false), (3, 3, false), (0, 2, false), (1, 1, false)]),
             ],
             resources: vec![
                 ComponentResources {
@@ -1149,18 +981,6 @@ mod tests {
             assert!(line.contains("avg") && line.contains("peak"), "{line}");
             assert_eq!(line.contains("total"), total, "{line}");
         }
-    }
-
-    /// Peak shown only where above now
-    #[test]
-    fn tier_bars_sum_segments_and_keep_peaks_above_now() {
-        let wide = tiers_box(&view().tiers, &theme(), 100);
-        let head = &wide[1];
-        assert!(head.contains("22 segments · 2 merging"), "{head}");
-        assert!(head.contains("8 segments · idle"), "{head}");
-        assert!(wide[3].contains("11 (max 14)"), "receives t1 peak: {}", wide[3]);
-        assert!(!wide[2].contains("max"), "t0 now = peak, no peak shown: {}", wide[2]);
-        assert!(wide.iter().any(|l| l.contains("0 (max 2)")), "emptied tier keeps its peak");
     }
 
     /// One band per pool: the spend/output split serves `chainwork`, not the reader
