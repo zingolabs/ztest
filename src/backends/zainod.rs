@@ -783,7 +783,7 @@ impl IndexerBackend for ZainoIndexer {
         loop {
             let last = match self.readyz(&http).await {
                 Ok(Readyz { state: State::Syncing | State::Serving, .. }) => return Ok(()),
-                Ok(Readyz { state, detail }) => format!("state {state:?}, detail {detail:?}"),
+                Ok(Readyz { state, detail }) => format!("state {state:?}, detail {detail}"),
                 Err(error) => error,
             };
             if tokio::time::Instant::now() >= deadline {
@@ -1027,11 +1027,13 @@ impl ServerMeter for ZainoIndexer {
     }
 }
 
-/// zainod admin `/readyz` (zaino-prod's load-balancer contract)
+/// zainod `/readyz` (zaino-prod's load-balancer contract)
+///
+/// - `detail` opaque (per-state object: catch-up progress, `{reason, message}`), echoed only
 #[derive(Debug, serde::Deserialize)]
 struct Readyz {
     state: State,
-    detail: Option<String>,
+    detail: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -1275,24 +1277,22 @@ mod tests {
     use crate::component::{IndexerMode, RestoreSource};
     use crate::regtest::{Regtest, Restore};
 
-    /// - zainod's live `/readyz` → its `state`
-    /// - every state zainod names decodes; an unknown one + the old `reasons` shape = an error
+    /// - zainod's real `/readyz` bodies (null, catch-up object, reason object) → their `state`
+    /// - an unknown state + the old `reasons` shape = an error
     #[test]
     fn readyz_decodes_zainods_state_and_refuses_contract_drift() {
-        let live = r#"{"detail":null,"state":"syncing"}"#;
-        let decoded: Readyz = serde_json::from_str(live).expect("zainod's live /readyz");
-        assert_eq!((decoded.state, decoded.detail), (State::Syncing, None));
-
         #[rustfmt::skip]
-        let states = [
-            ("provisioning", State::Provisioning), ("syncing", State::Syncing),
-            ("serving", State::Serving), ("degraded", State::Degraded),
-            ("held", State::Held), ("down", State::Down),
+        let bodies = [
+            (r#"{"state":"provisioning","detail":null}"#, State::Provisioning),
+            (r#"{"state":"syncing","detail":{"height":1846311,"target":3528684,"blocks_per_sec":447.0}}"#, State::Syncing),
+            (r#"{"state":"serving","detail":null}"#, State::Serving),
+            (r#"{"state":"degraded","detail":{"reason":"tip_unvouched","message":"No trusted validator vouches for the tip"}}"#, State::Degraded),
+            (r#"{"state":"held","detail":{"reason":"goaway_sent","message":"GOAWAY sent"}}"#, State::Held),
+            (r#"{"state":"down","detail":{"reason":"runtime_stalled","message":"Runtime stalled"}}"#, State::Down),
         ];
-        for (label, state) in states {
-            let json = format!(r#"{{"state":"{label}","detail":"why"}}"#);
-            let decoded: Readyz = serde_json::from_str(&json).expect(label);
-            assert_eq!((decoded.state, decoded.detail.as_deref()), (state, Some("why")));
+        for (body, state) in bodies {
+            let decoded: Readyz = serde_json::from_str(body).expect(body);
+            assert_eq!(decoded.state, state, "{body}");
         }
 
         let unknown = serde_json::from_str::<Readyz>(r#"{"state":"draining","detail":null}"#);
