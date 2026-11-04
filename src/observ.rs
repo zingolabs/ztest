@@ -10,7 +10,7 @@
 //! Filters: `ztest::pod=debug` (runner-pod lifecycle), `ztest::build=debug`
 //! (in-pod `TestEnv::build` phases), `ztest=debug` (all).
 //!
-//! Format: logfmt, uncoloured (zainod's shape; colour = the live view's, at display)
+//! Format: logfmt, uncoloured, no `target=` (zainod's shape; colour = the live view's, at display)
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -45,7 +45,8 @@ pub fn init(sink: Sink) {
 }
 
 fn install(sink: Sink) {
-    let logfmt = tracing_logfmt::builder().with_span_name(false).with_span_path(false);
+    let logfmt =
+        tracing_logfmt::builder().with_target(false).with_span_name(false).with_span_path(false);
     let builder = logfmt.subscriber_builder().with_env_filter(env_filter());
     // try_init, not init: a host-installed subscriber must not panic us (diagnostics = best-effort)
     match sink {
