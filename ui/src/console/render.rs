@@ -443,7 +443,7 @@ fn wrapped(lines: &[avt::Line], cols: u16) -> Vec<String> {
 /// Live grid minus trailing blank rows (avt pads to full height)
 fn trimmed_view(vt: &Vt) -> Vec<avt::Line> {
     let mut lines: Vec<avt::Line> = vt.view().cloned().collect();
-    while lines.last().is_some_and(|l| l.cells().iter().all(|c| c.is_default())) {
+    while lines.last().is_some_and(|l| l.cells().iter().all(bridge::renders_blank)) {
         lines.pop();
     }
     lines
@@ -553,6 +553,34 @@ mod tests {
         let _ = vt.feed_str("top\r\n\r\nmid\r\n");
         let texts = bridged(&trimmed_view(&vt));
         assert_eq!(texts, vec!["top".to_string(), String::new(), "mid".to_string()]);
+    }
+
+    #[test]
+    fn buildkit_colored_newlines_stay_one_row_per_line() {
+        // BuildKit shape: SGR reset lands *after* `\r\n`, so every scroll fills the new row
+        // with the coloured pen out to NOWRAP_COLS
+        let mut vt = new_vt(3);
+        let mut carry = Vec::new();
+        let mut pending: Vec<String> = Vec::new();
+        let stream = "\x1b[34m => [a 1/2] FROM alpine\r\n\x1b[0m\
+                      \x1b[34m => [a 2/2] RUN make\r\n\x1b[0m\
+                      \x1b[2m => => # compiling\r\n\x1b[0m\
+                      \x1b[34m => exporting\r\n\x1b[0m";
+        feed(&mut vt, &mut carry, &mut pending, stream.as_bytes());
+
+        let plain = |rows: Vec<String>| -> Vec<String> {
+            rows.iter().map(|r| r.replace("\x1b[0;34m", "").replace("\x1b[0;2m", "")).collect()
+        };
+        assert_eq!(
+            plain(pending.clone()),
+            vec![" => [a 1/2] FROM alpine\x1b[0m", " => [a 2/2] RUN make\x1b[0m"],
+            "scrolled-off lines → scrollback without a 512-col blank tail"
+        );
+        assert_eq!(
+            plain(wrapped(&trimmed_view(&vt), 80)),
+            vec![" => => # compiling\x1b[0m", " => exporting\x1b[0m"],
+            "live region: one row per line, pen-filled cursor row trimmed"
+        );
     }
 
     #[test]

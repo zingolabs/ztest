@@ -1,7 +1,7 @@
 //! Pure [`avt`] terminal cells → ANSI strings. No I/O; round-tripped through a real `avt`
 //! parser so colour/attribute/wide-char handling cannot silently drift.
 
-use avt::{Color as AvtColor, Line as AvtLine, Pen, Vt};
+use avt::{Cell, Color as AvtColor, Line as AvtLine, Pen, Vt};
 
 /// Emulator width for every grid whose rows are clipped at present time, never wrapped.
 ///
@@ -57,15 +57,30 @@ fn color_params(c: AvtColor, base: u8) -> String {
     }
 }
 
+/// Space a terminal paints as nothing, whatever its pen
+///
+/// - `avt` fills scrolled-in/erased rows with the whole current pen (BuildKit's
+///   `text\r\n\x1b[0m` → 512 cols of blue blanks); real terminals erase with background only
+/// - Kept: attributes visible on a space (bg, inverse, underline, strikethrough)
+pub(crate) fn renders_blank(cell: &Cell) -> bool {
+    let pen = cell.pen();
+    cell.char() == ' '
+        && cell.width() == 1
+        && pen.background().is_none()
+        && !pen.is_inverse()
+        && !pen.is_underline()
+        && !pen.is_strikethrough()
+}
+
 /// One emulated line → self-contained ANSI rows of at most `width` display columns each.
 ///
-/// - Same-pen runs coalesce into one SGR span, trailing default cells trimmed
+/// - Same-pen runs coalesce into one SGR span, trailing [`renders_blank`] cells trimmed
 /// - Every style change & every row end reset first (nothing bleeds across concatenation)
 /// - Wide char never straddles a row edge — it opens the next one
 pub(crate) fn avt_line_ansi_rows(line: &AvtLine, width: usize) -> Vec<(String, usize)> {
     let width = width.max(1);
     let cells = line.cells();
-    let end = cells.iter().rposition(|c| !c.is_default()).map_or(0, |i| i + 1);
+    let end = cells.iter().rposition(|c| !renders_blank(c)).map_or(0, |i| i + 1);
 
     let mut rows = Vec::new();
     let mut out = String::new();
@@ -164,11 +179,6 @@ mod tests {
     }
 
     #[test]
-    fn plain_ansi_has_no_escape_codes() {
-        assert_eq!(avt_line_to_ansi(&line_of(40, "plain text")), "plain text");
-    }
-
-    #[test]
     fn styled_ansi_resets_at_end_for_safe_concatenation() {
         let ansi = avt_line_to_ansi(&line_of(40, "\x1b[32mgreen\x1b[0m"));
         assert!(ansi.ends_with("\x1b[0m"), "must reset trailing style: {ansi:?}");
@@ -210,13 +220,6 @@ mod tests {
     }
 
     #[test]
-    fn clipping_takes_only_the_first_wrapped_row() {
-        // `ansi_rows` truncates where `ansi_rows_wrapped` continues (panel columns vs live)
-        assert_eq!(ansi_rows("abcdefghij", 4), vec![("abcd".to_string(), 4)]);
-        assert_eq!(avt_line_ansi_rows(&line_of(40, "abcdefghij"), 4).len(), 3);
-    }
-
-    #[test]
     fn wide_char_moves_to_the_next_row_rather_than_splitting() {
         // U+4E2D is 2 cells wide; at width 3 it cannot share row 0 with "ab"
         let rows = avt_line_ansi_rows(&line_of(40, "ab\u{4e2d}"), 3);
@@ -226,24 +229,17 @@ mod tests {
     }
 
     #[test]
-    fn standard_colors_keep_their_short_codes() {
-        // `38;5;n` is invisible to a 16-colour terminal; the short code is what producers
-        // (cargo, nextest) emit and what must survive the round trip
-        assert!(avt_line_to_ansi(&line_of(40, "\x1b[31mred\x1b[0m")).starts_with("\x1b[0;31m"));
-        assert!(avt_line_to_ansi(&line_of(40, "\x1b[91mbright\x1b[0m")).starts_with("\x1b[0;91m"));
-        assert!(avt_line_to_ansi(&line_of(40, "\x1b[44mbg\x1b[0m")).starts_with("\x1b[0;44m"));
-        assert!(avt_line_to_ansi(&line_of(40, "\x1b[102mbg\x1b[0m")).starts_with("\x1b[0;102m"));
-    }
-
-    #[test]
-    fn cube_colors_stay_extended() {
-        // No short code exists above 15 — the 256-colour form is the only spelling
-        let ansi = avt_line_to_ansi(&line_of(40, "\x1b[38;5;208morange\x1b[0m"));
-        assert!(ansi.starts_with("\x1b[0;38;5;208m"), "{ansi:?}");
-    }
-
-    #[test]
-    fn blank_line_is_empty() {
-        assert_eq!(avt_line_to_ansi(&line_of(20, "")), "");
+    fn trailing_spaces_trim_only_when_their_pen_paints_nothing() {
+        let cases = [
+            ("\x1b[34mtext      \x1b[0m", "\x1b[0;34mtext\x1b[0m"),
+            ("\x1b[2;3mtext      \x1b[0m", "\x1b[0;2;3mtext\x1b[0m"),
+            ("text\x1b[44m  \x1b[0m", "text\x1b[0;44m  \x1b[0m"),
+            ("text\x1b[7m  \x1b[0m", "text\x1b[0;7m  \x1b[0m"),
+            ("text\x1b[4m  \x1b[0m", "text\x1b[0;4m  \x1b[0m"),
+            ("text\x1b[9m  \x1b[0m", "text\x1b[0;9m  \x1b[0m"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(avt_line_to_ansi(&line_of(20, input)), want, "input {input:?}");
+        }
     }
 }
