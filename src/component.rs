@@ -82,6 +82,7 @@ pub struct ComponentOpts {
     pub lockbox_disbursements: Option<Vec<crate::regtest::LockboxDisbursement>>,
     pub coinbase_pool: Option<Pool>,
     pub restore: Option<RestoreSource>,
+    pub shared_state: Option<SharedState>,
     pub disk: Option<Disk>,
     pub restartable: bool,
 }
@@ -106,6 +107,13 @@ impl RestoreSource {
             RestoreSource::Blank => None,
         }
     }
+}
+
+/// One side of a shared zebra-state DB (validator + colocated zaino `State`): the mount path
+/// only, the PVC arrives as a `Mount::shared` from one [`crate::SharedVolume`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedState {
+    pub mount_path: String,
 }
 
 /// CPU, in millicores
@@ -345,9 +353,18 @@ pub trait ComponentBuilder: Sized {
         self.component_opts_mut().name = Some(name.into());
         self
     }
-    /// Mount a file, dir or archive at startup
+    /// Mount a file, dir, archive or shared volume at startup (any `Into<Mount>`, incl. a
+    /// `&`[`SharedVolume`](crate::SharedVolume) carrying its own path)
+    ///
+    /// - A shared mount doubles as this component's shared-state dir: same volume + same path =
+    ///   one store (zebrad's DB read by zaino's `ZainoTuning::State`)
     fn mount(mut self, m: impl Into<Mount>) -> Self {
-        self.component_opts_mut().mounts.push(m.into());
+        let m = m.into();
+        if m.kind == crate::mount::MountKind::Shared {
+            self.component_opts_mut().shared_state =
+                Some(SharedState { mount_path: m.destination.to_string_lossy().into_owned() });
+        }
+        self.component_opts_mut().mounts.push(m);
         self
     }
     fn resources(mut self, cpu: Cpu, memory: Mem) -> Self {

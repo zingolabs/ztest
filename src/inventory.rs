@@ -38,7 +38,8 @@ impl ImageSpec {
         let ImageSpec::Dev { features, .. } = self else {
             return false;
         };
-        features.iter().any(|f| f == "prometheus")
+        // `no_tls_with_prometheus` = zaino 0.10's combined feature (plaintext gRPC + exporter)
+        features.iter().any(|f| f == "prometheus" || f == "no_tls_with_prometheus")
     }
 }
 

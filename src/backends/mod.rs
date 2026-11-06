@@ -10,6 +10,7 @@ pub mod librustzcash;
 pub mod lightwalletd;
 #[cfg(feature = "librustzcash")]
 mod sync_task;
+pub mod zainod;
 pub mod zcashd;
 pub mod zebra;
 pub mod zingod;
@@ -44,6 +45,7 @@ impl MetricsBackend {
 
 const METRICS_BACKENDS: &[MetricsBackend] = &[
     MetricsBackend::observed::<zingod::ZingodIndexer>("zingod"),
+    MetricsBackend::observed::<zainod::ZainoIndexer>("zainod"),
     MetricsBackend::reference::<zebra::ZebraValidator>("zebrad", zebra::ZebraValidator::HEIGHTS),
 ];
 

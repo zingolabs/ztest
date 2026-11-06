@@ -169,6 +169,8 @@ crate; compile fails if missing):
 
 ```rust
 let zai = t.add_indexer(dev!(Indexer::Zingod, "../Dockerfile"));
+// Legacy zaino (the 0.10 daemon): `Indexer::zaino("0.10.2")` / `dev!(Indexer::Zainod, ..)`, with
+// `.tuning(ZainoTuning::State).mount(&env.shared_volume("zebra-db"))` to read the validator's DB
 ```
 
 Accepted variants: `Validator::Zebrad`, `Validator::Zcashd`,

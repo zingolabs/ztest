@@ -82,6 +82,9 @@ pub async fn resolve_all(
                 )
                 .await?
             }
+            (MountKind::Shared, MountSource::SharedClaim { claim }) => {
+                dir_volume_from_pvc(&volume_name, claim, &m.destination)
+            }
             (MountKind::Scratch, MountSource::Empty) => match scratch_disk {
                 Some(disk) => {
                     resolve_scratch_pvc(
@@ -279,6 +282,17 @@ async fn create_cm(
 /// unbound claim until the test times out, naming neither the size nor the snapshot
 /// PVC in the test namespace, cloned from `snapshot_name` when given and empty otherwise.
 /// Reclaimed with the namespace, so no owner ref
+/// Empty RWO claim for `TestEnv::shared_volume`, before any pod names it (WaitForFirstConsumer
+/// binds it when the first sharing pod schedules)
+pub async fn create_shared_pvc(
+    client: &Client,
+    sentinel: &Sentinel,
+    claim: &str,
+    disk: Disk,
+) -> Result<(), EnvError> {
+    create_pvc(client, sentinel, claim, None, &disk.to_quantity()).await
+}
+
 async fn create_pvc(
     client: &Client,
     sentinel: &Sentinel,

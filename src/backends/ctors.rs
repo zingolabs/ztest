@@ -4,6 +4,7 @@
 //!   every backend describes itself with
 
 use crate::backends::lightwalletd::LightwalletdBackend;
+use crate::backends::zainod::ZainoBackend;
 use crate::backends::zcashd::ZcashdBackend;
 use crate::backends::zebra::ZebraBackend;
 use crate::backends::zingod::ZingodBackend;
@@ -63,6 +64,30 @@ impl Indexer<ZingodBackend> {
         Self {
             backend: ZingodBackend::default(),
             opts: opts_dev(source, version.into(), features, "zingod"),
+            mode: IndexerMode::None,
+        }
+    }
+}
+
+impl Indexer<ZainoBackend> {
+    /// Legacy zaino (`zainod`, the 0.10 line); the current daemon is [`Indexer::zingod`]
+    pub fn zaino(version: impl Into<String>) -> Self {
+        Self {
+            backend: ZainoBackend::default(),
+            opts: opts_for(&version.into(), "zainod"),
+            mode: IndexerMode::None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn zainod_dev(
+        source: crate::backends::image::DevSource,
+        version: impl Into<String>,
+        features: Vec<String>,
+    ) -> Self {
+        Self {
+            backend: ZainoBackend::default(),
+            opts: opts_dev(source, version.into(), features, "zainod"),
             mode: IndexerMode::None,
         }
     }

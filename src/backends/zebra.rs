@@ -112,6 +112,20 @@ impl ValidatorConfig for ZebraBackend {
         let default_streams = crate::regtest::regtest_test_post_nu6_funding_streams();
         let funding_streams = opts.funding_streams.as_ref().unwrap_or(&default_streams);
 
+        // Shared state (a colocated zaino `State` reads the DB) wins over `restore`: cache_dir = the
+        // shared mount, indexer gRPC on (zaino's syncer dials it) whether or not `.indexer()` was set
+        let shared = opts.shared_state.clone();
+        let cache_dir = match &shared {
+            Some(shared) => Some(shared.mount_path.as_str()),
+            None => opts.restore.is_some().then_some(ZEBRAD_REGTEST_CACHE_DIR),
+        };
+        let indexer_port = match &shared {
+            Some(_) => Some(crate::ports::ZEBRAD_INDEXER),
+            None => self.indexer_port(),
+        };
+        if shared.is_some() && !opts.extra_ports.iter().any(|(name, _)| name == "indexer") {
+            opts.extra_ports.push(("indexer".to_string(), crate::ports::ZEBRAD_INDEXER));
+        }
         let toml = crate::regtest_conf::zebrad_conf(
             version,
             activation,
@@ -120,15 +134,18 @@ impl ValidatorConfig for ZebraBackend {
             peers,
             lockbox,
             Some(funding_streams),
-            opts.restore.is_some().then_some(ZEBRAD_REGTEST_CACHE_DIR),
+            cache_dir,
             miner_address(opts.coinbase_pool.unwrap_or(DEFAULT_COINBASE_POOL)),
             opts.image.metrics_enabled().then(|| self.metrics_port()).flatten(),
-            self.indexer_port(),
+            indexer_port,
             self.sync,
         );
         opts.mounts.push(crate::regtest::config_mount_inline(toml, CONTAINER_CONFIG_PATH));
 
-        match &opts.restore {
+        // Volume behind `cache_dir`, only absent shared state (that PVC is already mounted by the
+        // caller's `.mount(&vol)`)
+        let restore = if shared.is_some() { None } else { opts.restore.as_ref() };
+        match restore {
             Some(crate::component::RestoreSource::Archive(archive)) => {
                 opts.mounts
                     .push(crate::mount::Mount::seed(archive.artifact, ZEBRAD_REGTEST_CACHE_DIR));
@@ -258,8 +275,11 @@ impl ValidatorBackend for ZebraValidator {
             args: opts.args.clone(),
             resources: opts.resources,
             env: opts.env.clone(),
-            fs_group: None,
-            run_as_user: None,
+            // Shared zebra-state DB → zebrad's uid must equal the zaino reader's, or the mode-0600
+            // `version` file is unreadable by its StateService (fsGroup can't fix it: hostPath /
+            // local-path ignore it, and the zainod image refuses to run as root)
+            fs_group: opts.shared_state.as_ref().map(|_| 1000),
+            run_as_user: opts.shared_state.as_ref().map(|_| 1000),
             supplemental_groups: crate::backends::seed_groups(opts),
             placement: None,
             guaranteed: Some(crate::qos::pod::VALIDATOR.into()),
@@ -815,6 +835,82 @@ sync_estimated_network_tip_height 3506187
         assert_eq!(rpc_port(&opts), ZEBRAD_PUBLIC_RPC_PORT);
         assert!(serves_health(&opts));
         assert_eq!(crate::backends::seed_groups(&opts), vec![crate::materialize::SEED_GID]);
+    }
+
+    /// A shared zebra-state volume (`.mount(&vol)` from `TestEnv::shared_volume`) is the DB:
+    /// `cache_dir` on it, the indexer gRPC a colocated zaino `State` dials open, no private
+    /// volume behind the dir, and the pod's uid pinned to the reader's
+    #[test]
+    fn a_shared_state_volume_is_the_regtest_db_and_opens_the_indexer_grpc() {
+        use crate::component::ComponentBuilder;
+        use crate::regtest::Regtest;
+
+        let mut env = crate::TestEnv::builder();
+        let vol = env.shared_volume("zebra-db");
+        let shared = crate::component::Validator::zebrad("6.2.3").regtest().mount(&vol);
+        let plain = crate::component::Validator::zebrad("6.2.3").regtest();
+        let heights = crate::regtest::regtest_test_activation_heights();
+        let render = |v: crate::component::Validator<ZebraBackend>| {
+            v.backend.materialize_regtest_opts(v.opts.clone(), &heights, &[]).expect("renders")
+        };
+        let toml_of = |opts: &ComponentOpts| {
+            opts.mounts
+                .iter()
+                .find_map(|m| match &m.source {
+                    crate::MountSource::ConfigInline(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .expect("rendered zebrad.toml")
+        };
+
+        assert_eq!(
+            shared.opts.shared_state.as_ref().map(|s| s.mount_path.as_str()),
+            Some("/shared/zebra-db")
+        );
+        let opts = render(shared);
+        let toml = toml_of(&opts);
+        assert!(toml.contains("cache_dir = \"/shared/zebra-db\""), "{toml}");
+        assert!(
+            toml.contains(&format!(":{}\"", crate::ports::ZEBRAD_INDEXER)),
+            "indexer gRPC: {toml}"
+        );
+        assert!(opts.extra_ports.contains(&("indexer".to_string(), crate::ports::ZEBRAD_INDEXER)));
+        let dirs: Vec<_> = opts
+            .mounts
+            .iter()
+            .filter(|m| m.kind != crate::MountKind::Config)
+            .map(|m| (m.kind, m.destination.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(dirs, vec![(crate::MountKind::Shared, "/shared/zebra-db".to_string())]);
+        let spec = ZebraValidator {
+            plumbing: HandleInner {
+                inner: std::sync::Weak::new(),
+                component_id: 0,
+                regtest: true,
+                coinbase_pool: None,
+            },
+        }
+        .pod_spec(&opts, "zebrad".into())
+        .expect("pod spec");
+        assert_eq!((spec.fs_group, spec.run_as_user), (Some(1000), Some(1000)));
+
+        let opts = render(plain);
+        assert!(
+            toml_of(&opts).contains("ephemeral = true"),
+            "no persistent state without a volume"
+        );
+        assert!(!opts.extra_ports.iter().any(|(name, _)| name == "indexer"));
+        let spec = ZebraValidator {
+            plumbing: HandleInner {
+                inner: std::sync::Weak::new(),
+                component_id: 0,
+                regtest: true,
+                coinbase_pool: None,
+            },
+        }
+        .pod_spec(&opts, "zebrad".into())
+        .expect("pod spec");
+        assert_eq!((spec.fs_group, spec.run_as_user), (None, None));
     }
 
     /// Same following node as `follow` (restore, clone mount, health) with the seeders swapped

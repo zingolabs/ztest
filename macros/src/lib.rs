@@ -117,6 +117,7 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
 /// Two forms:
 ///
 /// - Local: `dev!(Indexer::Zingod, "rel/Dockerfile" [, context = "rel/ctx", version = "…", features = ["…"]])`
+///   (`Indexer::Zainod` for the legacy daemon)
 ///   — a Dockerfile in the local checkout, path resolved against the caller's
 ///   `CARGO_MANIFEST_DIR` (same rule as the `mount_*` macros). Compile fails if
 ///   the Dockerfile doesn't exist or the context isn't a directory.
@@ -162,13 +163,14 @@ pub fn dev(input: TokenStream) -> TokenStream {
             ("Validator", "Zebrad") => "zebrad".to_string(),
             ("Validator", "Zcashd") => "zcashd".to_string(),
             ("Indexer", "Zingod") => "zingod".to_string(),
+            ("Indexer", "Zainod") => "zainod".to_string(),
             (cat, var) => {
                 return syn::Error::new(
                     variant.span(),
                     format!(
                         "dev!: unsupported component variant `{cat}::{var}`; \
                      expected one of `Validator::Zebrad`, `Validator::Zcashd`, \
-                     `Indexer::Zingod`"
+                     `Indexer::Zingod`, `Indexer::Zainod`"
                     ),
                 )
                 .to_compile_error()

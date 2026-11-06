@@ -13,6 +13,7 @@ use crate::naming::RunCoords;
 #[derive(Debug, Clone, Copy)]
 pub enum ReadyProbe {
     Tcp(u16),
+    Http { port: u16, path: &'static str },
 }
 
 /// Consecutive probe failures before kubelet marks the pod NotReady.
@@ -26,6 +27,7 @@ impl ReadyProbe {
     fn render(self) -> Value {
         let mut probe = match self {
             ReadyProbe::Tcp(port) => json!({ "tcpSocket": { "port": port } }),
+            ReadyProbe::Http { port, path } => json!({ "httpGet": { "port": port, "path": path } }),
         };
         probe["initialDelaySeconds"] = json!(1);
         probe["periodSeconds"] = json!(2);
@@ -281,11 +283,20 @@ mod tests {
     }
 
     #[test]
-    fn the_tcp_probe_renders_its_handler_and_cadence() {
+    fn tcp_and_http_probes_render_their_own_handler_and_the_shared_cadence() {
         let tcp = container(&base_spec().render(&coords(), "t", &[]));
         assert_eq!(tcp["readinessProbe"]["tcpSocket"]["port"], 28232);
+        assert!(tcp["readinessProbe"]["httpGet"].is_null());
         assert_eq!(tcp["readinessProbe"]["periodSeconds"], 2);
         assert_eq!(tcp["readinessProbe"]["failureThreshold"], READY_FAILURE_THRESHOLD);
+
+        let spec =
+            PodSpec { ready: ReadyProbe::Http { port: 9998, path: "/livez" }, ..base_spec() };
+        let http = container(&spec.render(&coords(), "t", &[]));
+        assert_eq!(http["readinessProbe"]["httpGet"]["port"], 9998);
+        assert_eq!(http["readinessProbe"]["httpGet"]["path"], "/livez");
+        assert!(http["readinessProbe"]["tcpSocket"].is_null());
+        assert_eq!(http["readinessProbe"]["failureThreshold"], READY_FAILURE_THRESHOLD);
     }
 
     /// Prometheus pod-role SD reads pod labels only; owner on the namespace alone never

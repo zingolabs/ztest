@@ -212,6 +212,46 @@ struct PendingWallet {
     opts: ComponentOpts,
 }
 
+// ──────────────────────────── shared volume ───────────────────────────
+
+/// Env-scoped `ReadWriteOnce` PVC shared by two co-scheduled pods
+///
+/// - Declared via [`TestEnv::shared_volume`], provisioned during [`TestEnv::build`]
+/// - [`.mount(&vol)`](crate::ComponentBuilder::mount) on a zebrad + a
+///   `.tuning(ZainoTuning::State)` zaino → one on-disk zebra-state DB
+#[derive(Debug, Clone)]
+pub struct SharedVolume {
+    claim: String,
+    mount_path: String,
+}
+
+impl SharedVolume {
+    pub fn claim(&self) -> &str {
+        &self.claim
+    }
+    /// In-pod mount path, identical in both sharing pods (zebra's `cache_dir` must resolve to one
+    /// directory)
+    pub fn mount_path(&self) -> &str {
+        &self.mount_path
+    }
+    /// The [`Mount`](crate::Mount) attaching this volume at its canonical path
+    pub fn as_mount(&self) -> crate::mount::Mount {
+        crate::mount::Mount::shared(self.claim.clone(), self.mount_path.clone())
+    }
+}
+
+impl From<&SharedVolume> for crate::mount::Mount {
+    fn from(vol: &SharedVolume) -> Self {
+        vol.as_mount()
+    }
+}
+
+/// Env-scoped PVC awaiting `build()`
+struct PendingSharedVolume {
+    claim: String,
+    disk: crate::component::Disk,
+}
+
 // ────────────────────────────── TestEnv ───────────────────────────────
 
 pub struct TestEnv {
@@ -219,6 +259,7 @@ pub struct TestEnv {
     pending_validators: Vec<PendingValidator>,
     pending_indexers: Vec<PendingIndexer>,
     pending_wallets: Vec<PendingWallet>,
+    pending_shared_volumes: Vec<PendingSharedVolume>,
     next_id: u64,
     ready_timeout: Duration,
     /// Schedule of the *regtest* chain this env mines (`None` =
@@ -252,6 +293,7 @@ impl TestEnv {
             pending_validators: Vec::new(),
             pending_indexers: Vec::new(),
             pending_wallets: Vec::new(),
+            pending_shared_volumes: Vec::new(),
             next_id: 0,
             ready_timeout: Self::DEFAULT_READY_TIMEOUT,
             activation_override: None,
@@ -280,6 +322,26 @@ impl TestEnv {
     pub fn activation_heights(mut self, heights: ActivationHeights) -> Self {
         self.activation_override = Some(heights);
         self
+    }
+
+    /// Declare an env-scoped shared volume to [`.mount(&vol)`](crate::ComponentBuilder::mount) on
+    /// both a zebrad and a `.tuning(ZainoTuning::State)` zaino (PVC provisioned during
+    /// [`TestEnv::build`])
+    pub fn shared_volume(&mut self, name: &str) -> SharedVolume {
+        // Regtest chains are a handful of blocks; a public one wants `shared_volume_sized`
+        self.shared_volume_sized(name, crate::component::Disk::gib(2))
+    }
+
+    /// [`shared_volume`](Self::shared_volume) for a chain that outgrows the regtest default
+    pub fn shared_volume_sized(
+        &mut self,
+        name: &str,
+        disk: crate::component::Disk,
+    ) -> SharedVolume {
+        let slug = short_kind(name);
+        let claim = format!("shared-{slug}");
+        self.pending_shared_volumes.push(PendingSharedVolume { claim: claim.clone(), disk });
+        SharedVolume { claim, mount_path: format!("/shared/{slug}") }
     }
 
     fn fresh_id(&mut self) -> u64 {
@@ -573,6 +635,13 @@ impl TestEnv {
 
         let _ = self.inner.client.set(client.clone());
         *self.inner.namespace.lock().expect("namespace mutex poisoned") = Some(namespace.clone());
+
+        // Before any pod references them (WaitForFirstConsumer → the claim stays Pending until the
+        // Phase-1 validator schedules)
+        for PendingSharedVolume { claim, disk } in std::mem::take(&mut self.pending_shared_volumes)
+        {
+            mounts::create_shared_pvc(&client, &sentinel, &claim, disk).await?;
+        }
 
         // One read → placement + deploy ceiling both describe the reserve the ledger holds
         let effective = qos::current_profile();
