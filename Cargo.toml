@@ -102,8 +102,6 @@ serde_yaml = "0.9"
 base64 = "0.22"
 toml = "0.8"
 rand = "0.10"
-# ChaCha20Rng = the `Clone` + `CryptoRng` the wallet db wants (rand 0.10's own ChaCha RNGs are not `Clone`)
-rand_chacha = { version = "0.10", optional = true }
 sha2 = "0.10"
 hex = { workspace = true }
 hdrhistogram = { version = "7", default-features = false }
@@ -232,7 +230,6 @@ librustzcash = [
     "dep:zcash_primitives",
     "dep:secrecy",
     "dep:rusqlite",
-    "dep:rand_chacha",
     "dep:tempfile",
     "dep:bip0039",
     # Observable sync harness (src/sync): the at-completion tree-root oracle

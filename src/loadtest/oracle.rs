@@ -200,7 +200,6 @@ mod tests {
 
     fn block(height: u64, hash: [u8; 32], prev: [u8; 32]) -> CompactBlock {
         CompactBlock {
-            proto_version: 1,
             height,
             hash: hash.to_vec(),
             prev_hash: prev.to_vec(),

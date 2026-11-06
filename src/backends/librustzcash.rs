@@ -13,9 +13,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rand::SeedableRng;
+use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
-use rand_chacha::ChaCha20Rng;
 use secrecy::SecretVec;
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
@@ -66,7 +65,7 @@ const LABEL: &str = "librustzcash";
 /// sync stream on the same channel). Relay deadline = the caller's per-send `timeout`
 const INDEXER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, ChaCha20Rng>;
+type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, UnwrapErr<SysRng>>;
 
 /// [`Wallet`](crate::component::Wallet) builder's librustzcash flavour → [`LrzWallet`]
 /// handle at `add_wallet` time
@@ -468,7 +467,7 @@ impl WalletBackend for LrzWallet {
             &mut *db,
             &acct.params,
             &SystemClock,
-            &mut os_seeded_rng()?,
+            &mut UnwrapErr(SysRng),
             &prover,
             &prover,
             &sk,
@@ -510,7 +509,7 @@ impl WalletBackend for LrzWallet {
             &mut *db,
             &acct.params,
             &SystemClock,
-            &mut os_seeded_rng()?,
+            &mut UnwrapErr(SysRng),
             &prover,
             &prover,
             &input_selector,
@@ -542,14 +541,7 @@ fn open_wallet_db(path: &Path, params: LocalNetwork) -> Result<Db, BoxError> {
         .map_err(|e| format!("librustzcash: enable WAL on {}: {e}", path.display()))?;
     rusqlite::vtab::array::load_module(&conn)
         .map_err(|e| format!("librustzcash: load rarray module: {e}"))?;
-    Ok(WalletDb::from_connection(conn, params, SystemClock, os_seeded_rng()?))
-}
-
-/// `SysRng` = fallible (`TryRng`); `WalletDb` wants an infallible, `Clone` `CryptoRng` (rand 0.10's own
-/// ChaCha RNGs are not `Clone`)
-fn os_seeded_rng() -> Result<ChaCha20Rng, BoxError> {
-    ChaCha20Rng::try_from_rng(&mut SysRng)
-        .map_err(|e| format!("librustzcash: seed rng: {e}").into())
+    Ok(WalletDb::from_connection(conn, params, SystemClock, UnwrapErr(SysRng)))
 }
 
 /// One-confirmation wallet-summary policy (matches [`WalletBackend::balances`])

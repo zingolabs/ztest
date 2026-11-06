@@ -268,7 +268,6 @@ impl Zebra {
             vtx.push(compact_tx(index as u64, tx, fee)?);
         }
         Ok(CompactBlock {
-            proto_version: 0,
             height: block.height,
             hash: reversed(&block.hash, "getblock")?.to_vec(),
             prev_hash: match &block.prev {
@@ -549,7 +548,6 @@ pub fn block_diff(expected: &CompactBlock, served: &CompactBlock) -> Option<Stri
             }
         };
     }
-    same!("proto_version", expected.proto_version, served.proto_version);
     same!("height", expected.height, served.height);
     same!("hash", hex::encode(&expected.hash), hex::encode(&served.hash));
     same!("prev_hash", hex::encode(&expected.prev_hash), hex::encode(&served.prev_hash));

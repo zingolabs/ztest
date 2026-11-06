@@ -1063,6 +1063,7 @@ impl ZingodIndexer {
     }
 
     /// Deprecated upstream alias (kept while zingod serves it)
+    #[allow(deprecated)]
     pub async fn get_block_range_nullifiers(
         &self,
         start: BlockHeight,

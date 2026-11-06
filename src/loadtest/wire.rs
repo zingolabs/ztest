@@ -312,7 +312,6 @@ mod tests {
     #[test]
     fn block_head_walks_the_encoded_message_and_refuses_a_truncated_one() {
         let block = CompactBlock {
-            proto_version: 1,
             height: 3_000_000,
             hash: vec![0xab; 32],
             prev_hash: vec![0xcd; 32],
