@@ -3,7 +3,7 @@
 Rust test-author API: build a topology with `TestEnv::builder`, dial components through handles, matrix a
 `dev!` image across toolchains.
 
-- Version selection lives in the test code — no `versions.toml`, no `ZAINO_*_VERSION`
+- Version selection lives in the test code — no `versions.toml`, no `ZINGOD_*_VERSION`
 - Assets (configs, seed tarballs) under the test crate's `tests/assets/`
 - `mount_*` macros resolve against `CARGO_MANIFEST_DIR` and fail *compilation* on a missing file
 
@@ -13,10 +13,10 @@ Rust test-author API: build a topology with `TestEnv::builder`, dial components 
 use ztest::prelude::*;
 
 #[tokio::test]
-async fn zaino_indexes_to_validator_tip() {
+async fn zingod_indexes_to_validator_tip() {
     let mut t = TestEnv::builder();
     let zeb = t.add(Validator::zebrad("1.9.1"));
-    let zai = t.add(Indexer::zaino("0.4.0"));
+    let zai = t.add(Indexer::zingod("0.4.0"));
     let env = t.build().await.unwrap();
 
     env.handle(&zeb).mine_blocks(10).await.unwrap();       // typed RPC sugar
@@ -32,14 +32,14 @@ async fn zaino_indexes_to_validator_tip() {
 
 ```rust
 pub enum Validator { Zebrad(ZebradOpts), Zcashd(ZcashdOpts) }
-pub enum Indexer   { Zaino(ZainoOpts) }
+pub enum Indexer   { Zingod(ZingodOpts) }
 ```
 
 | Variant  | `image_repo`            | Constructor                  | Named ports                     |
 | -------- | ----------------------- | ---------------------------- | ------------------------------- |
 | `Zebrad` | `zfnd/zebra`            | `Validator::zebrad(version)` | `rpc` (28232), `metrics` (9999) |
 | `Zcashd` | `electriccoinco/zcashd` | `Validator::zcashd(version)` | `rpc` (28232)                   |
-| `Zaino`  | `zingolabs/zaino`       | `Indexer::zaino(version)`    | `grpc` (8137), `metrics` (9998) |
+| `Zingod`  | `zingolabs/zingod`       | `Indexer::zingod(version)`    | `grpc` (8137), `metrics` (9998) |
 
 Published constructor pulls `<image_repo>:<version>`. Every variant chains the same builders:
 
@@ -58,7 +58,7 @@ the test is unchanged. Two source forms:
 ```rust
 // Local Dockerfile, resolved relative to the test source file:
 dev!(Validator::Zebrad, "../zebrad/Dockerfile")
-dev!(Indexer::Zaino,   "../packages/zainod/Dockerfile", context = "../packages")
+dev!(Indexer::Zingod,   "../packages/zingod/Dockerfile", context = "../packages")
 
 // Remote git checkout:
 dev!(Validator::Zebrad,
@@ -70,8 +70,8 @@ dev!(Validator::Zebrad,
 Both accept the builder chain + an optional Rust-version selector ([matrix](#multi-rust-version-matrix)):
 
 ```rust
-let zai = t.add(dev!(Indexer::Zaino, "../packages/zainod/Dockerfile")
-    .named("zaino-dev")
+let zai = t.add(dev!(Indexer::Zingod, "../packages/zingod/Dockerfile")
+    .named("zingod-dev")
     .mount(Mount::seed(MY_CHAIN.artifact, "/state")));
 ```
 
@@ -85,7 +85,7 @@ sites collapse to one build, distinct ones cache independently. Re-runs hit cach
   an already-built tag; a tag with no matching build fails `build()` with `DevImageMissing`
 - Valid only inside a function body. Binary-wide declaration no test references yet:
   `const _: () = { dev!(...); };`
-- At most one `dev!` image per component variant per test binary — a second `dev!(Indexer::Zaino, …)`
+- At most one `dev!` image per component variant per test binary — a second `dev!(Indexer::Zingod, …)`
   with a different source panics at startup
 - Dockerfile / `git` / `rev` / `context` must be string literals (compile-time resolved); no computed paths
 
@@ -153,7 +153,7 @@ impl ValidatorHandle {
 No shipped client for a protocol → dial the endpoint yourself:
 
 ```rust
-let ep = env.handle(&zaino).endpoint("grpc").await?;
+let ep = env.handle(&zingod).endpoint("grpc").await?;
 let channel = tonic::transport::Channel::from_shared(ep.url("http"))?.connect().await?;
 let mut client = LightwalletdClient::new(channel);
 ```
@@ -179,12 +179,12 @@ Standard [rstest]; each `#[case]` becomes its own nextest target.
 async fn rejects_height_past_tip(#[case] v: Validator, #[case] data: Mount) {
     let mut t = TestEnv::builder();
     t.add(v.mount(data));
-    let zaino = t.add(Indexer::zaino("0.4.0"));
+    let zingod = t.add(Indexer::zingod("0.4.0"));
     let env = t.build().await.unwrap();
 
-    let err = env.handle(&zaino).client().await.get_block_by_height(999).await
+    let err = env.handle(&zingod).client().await.get_block_by_height(999).await
         .expect_err("must reject past tip");
-    assert!(matches!(err, ZainoError::BlockNotFound { height: 999 }));
+    assert!(matches!(err, ZingodError::BlockNotFound { height: 999 }));
 }
 ```
 

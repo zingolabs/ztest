@@ -241,7 +241,7 @@ impl Auditor {
                 ),
             ),
             None if served.len() == expected.len() => Verdict::Holds,
-            // zaino a block behind the one completing zebra's newest subtree
+            // zingod a block behind the one completing zebra's newest subtree
             None if served.len() < expected.len() => Verdict::Unjudged,
             None => Verdict::Differs(
                 0,
@@ -261,7 +261,7 @@ impl Auditor {
         };
         match self.zebra.block_hash(served.height as u32).await {
             Ok(hash) if hash.as_slice() == served.hash => Verdict::Holds,
-            // zaino's tip then ≠ zebra's block there now = a reorg between (judged as one)
+            // zingod's tip then ≠ zebra's block there now = a reorg between (judged as one)
             Ok(_) => Verdict::Reorged,
             Err(e) => unjudged(e),
         }
@@ -328,7 +328,7 @@ impl Auditor {
     }
 
     /// UTXOs = the address at the current tip → comparable only while zebra sits at `served_tip`
-    /// (zaino's tip when it answered) across the whole read
+    /// (zingod's tip when it answered) across the whole read
     async fn utxos(&mut self, address: &str, message: &[u8], served_tip: u32) -> Verdict {
         let served = match GetAddressUtxosReplyList::decode(message) {
             Ok(list) => list.address_utxos,
@@ -415,7 +415,7 @@ pub async fn calibrate(
                     "calibration",
                     u64::from(height),
                     format!(
-                        "zaino refused: GetBlock {:?}, GetBlockRange {:?}",
+                        "zingod refused: GetBlock {:?}, GetBlockRange {:?}",
                         full.err(),
                         one.map(|o| o.is_some())
                     ),

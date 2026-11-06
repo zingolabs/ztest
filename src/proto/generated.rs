@@ -80,7 +80,7 @@ pub struct CompactTx {
     #[prost(message, repeated, tag = "6")]
     pub actions: ::prost::alloc::vec::Vec<CompactOrchardAction>,
     /// Ironwood actions (post-NU6.3). Encoded identically to Orchard actions;
-    /// tag 9 matches zaino's served proto so the wire bytes decode.
+    /// tag 9 matches zingod's served proto so the wire bytes decode.
     #[prost(message, repeated, tag = "9")]
     pub ironwood_actions: ::prost::alloc::vec::Vec<CompactOrchardAction>,
     /// `CompactTxIn` values corresponding to the `vin` entries of the full transaction.

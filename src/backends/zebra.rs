@@ -536,7 +536,7 @@ impl crate::component::Validator<ZebraBackend> {
     }
 
     /// Indexer gRPC on [`ZEBRAD_INDEXER`](crate::ports::ZEBRAD_INDEXER) (`indexer_listen_addr`;
-    /// zebra >= 6): block streams + push events zainod's `validator_client = "grpc"` reads
+    /// zebra >= 6): block streams + push events zingod's `validator_client = "grpc"` reads
     ///
     /// # Panics
     ///

@@ -70,7 +70,7 @@ const POD_POLL: Duration = Duration::from_secs(2);
 const TAIL_LINES: i64 = 200;
 
 /// Component whose **log** rides alongside the driver's, by category (`lightwalletd` followed
-/// like `zainod`)
+/// like `zingod`)
 const SUT_SELECTOR: &str = "ztest.io/component-category=indexer";
 
 /// Validator pod: its exporter carries the network tip a following run measures against
@@ -809,10 +809,10 @@ fn component_line(source: &str, line: &str, theme: &Theme, highlighter: &Highlig
     }
 }
 
-/// Levels first (first-added highlighter wins an overlap), then zaino's units, timestamps faint,
+/// Levels first (first-added highlighter wins an overlap), then zingod's units, timestamps faint,
 /// then tailspin's set
 ///
-/// - units = zaino's `ByteSize` (`12.8GB`) + `Human` (`1h02m`) whole, not `12` alone
+/// - units = zingod's `ByteSize` (`12.8GB`) + `Human` (`1h02m`) whole, not `12` alone
 fn log_highlighter() -> Highlighter {
     let level = |words: &str, style: Style| RegexConfig {
         regex: format!(r"\b(?:level=(?:{lower})|{words})\b", lower = words.to_lowercase()),
@@ -953,7 +953,7 @@ mod tests {
     fn a_load_pairs_newest_usage_with_its_containers_declared_limit() {
         let resources = [
             ComponentResources {
-                component: "zainod".into(),
+                component: "zingod".into(),
                 cpu: vec![newest_at(0.593)],
                 mem: vec![newest_at(2.0 * GIB as f64)],
                 ..ComponentResources::default()
@@ -965,12 +965,12 @@ mod tests {
             },
         ];
         let limit = Resources::new(9_000, 24 * GIB, 0, 0);
-        let limits = HashMap::from([("zainod".to_string(), limit)]);
+        let limits = HashMap::from([("zingod".to_string(), limit)]);
         assert_eq!(
             loads(&resources, &limits),
             [
                 ContainerLoad {
-                    container: "zainod".into(),
+                    container: "zingod".into(),
                     usage: Resources::new(593, 2 * GIB, 0, 0),
                     limit: Some(limit),
                 },
@@ -986,15 +986,15 @@ mod tests {
     #[test]
     fn only_a_declared_limit_becomes_a_denominator() {
         let pod: Pod = serde_json::from_value(serde_json::json!({
-            "metadata": { "name": "zainod-0" },
+            "metadata": { "name": "zingod-0" },
             "spec": { "containers": [
-                { "name": "zainod", "resources": { "limits": { "cpu": "9", "memory": "24Gi" } } },
+                { "name": "zingod", "resources": { "limits": { "cpu": "9", "memory": "24Gi" } } },
                 { "name": "sidecar" },
             ] },
         }))
         .expect("pod fixture is valid");
         let limits = declared_limits(&[pod]);
-        assert_eq!(limits.get("zainod"), Some(&Resources::new(9_000, 24 * GIB, 0, 0)));
+        assert_eq!(limits.get("zingod"), Some(&Resources::new(9_000, 24 * GIB, 0, 0)));
         assert!(!limits.contains_key("sidecar"));
     }
 

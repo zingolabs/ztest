@@ -109,7 +109,7 @@ a string the authenticator asserts and only bindings ever mention.
 
 | Group      | Who                                                     | Granted by                                   | Role                               |
 | ---------- | ------------------------------------------------------- | -------------------------------------------- | ---------------------------------- |
-| `ztest-ci` | nodes tagged `tag:ztest-runner` (zaino's GitHub runner) | tailnet `tailscale.com/cap/kubernetes` grant | `ztest-orchestrator`, cluster-wide |
+| `ztest-ci` | nodes tagged `tag:ztest-runner` (zingod's GitHub runner) | tailnet `tailscale.com/cap/kubernetes` grant | `ztest-orchestrator`, cluster-wide |
 
 The only one today. CI **cannot** be a ServiceAccount: Tailscale's grant emits only
 `Impersonate-Group`, and an SA would mean a stored token, which the design exists to avoid.

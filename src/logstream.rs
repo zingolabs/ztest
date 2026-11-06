@@ -3,7 +3,7 @@
 //! - Capture: one-shot kube-API fetch at the test's terminal (pods still alive), every line,
 //!   merged chronologically across pods
 //! - Display: [`component_section`] tails to [`LogTail`] (capture + record never cap)
-//! - Faithful: components own formatting + colour (zebrad `force_use_color`, zainod plain logfmt);
+//! - Faithful: components own formatting + colour (zebrad `force_use_color`, zingod plain logfmt);
 //!   ztest never parses/reassembles/recolours a body
 //! - ANSI stripped once at the display boundary, only for a non-colour sink
 
@@ -127,7 +127,7 @@ mod tests {
         let n = 45;
         let mut lines: Vec<TsLine> = (0..n)
             .map(|i| {
-                let pod = if i % 2 == 0 { "zebrad" } else { "zaino" };
+                let pod = if i % 2 == 0 { "zebrad" } else { "zingod" };
                 (format!("{i:04}"), format!("[{pod}] line {i}"))
             })
             .collect();
@@ -136,7 +136,7 @@ mod tests {
         let captured: Vec<String> =
             String::from_utf8(log.clone()).unwrap().lines().map(String::from).collect();
         let expected: Vec<String> = (0..n)
-            .map(|i| format!("[{}] line {i}", if i % 2 == 0 { "zebrad" } else { "zaino" }))
+            .map(|i| format!("[{}] line {i}", if i % 2 == 0 { "zebrad" } else { "zingod" }))
             .collect();
         assert_eq!(captured, expected, "capture = every line, chronological, uncapped");
 
@@ -146,16 +146,17 @@ mod tests {
         assert_eq!(body[0], "  ── component logs ──");
         assert!(body[1].contains("15 earlier line(s) dropped (showing the most recent 30;"));
         assert!(body[1].contains("`--log-tail all`"));
-        assert_eq!(body[2], "  [zaino] line 15");
+        assert_eq!(body[2], "  [zingod] line 15");
         assert_eq!(body[31], "  [zebrad] line 44");
 
         let all = component_section(&log, LogTail::All, false).unwrap();
         assert!(!all.contains("dropped"), "`all` = no drop note:\n{all}");
         assert_eq!(all.lines().count(), 1 + n);
 
-        let few = component_section(b"[zebrad] a\n[zaino] b\n", LogTail::Lines(30), false).unwrap();
+        let few =
+            component_section(b"[zebrad] a\n[zingod] b\n", LogTail::Lines(30), false).unwrap();
         assert_eq!(
-            few, "  ── component logs ──\n  [zebrad] a\n  [zaino] b\n",
+            few, "  ── component logs ──\n  [zebrad] a\n  [zingod] b\n",
             "under the tail = no note"
         );
 

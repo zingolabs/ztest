@@ -197,7 +197,7 @@ async fn resolve_seed(
 
 /// `(scratch, archive)` halves of one `.disk(..)`.
 ///
-/// - A component writes one volume: zaino writes its index into a scratch, zebra writes
+/// - A component writes one volume: zingod writes its index into a scratch, zebra writes
 ///   the chain into the archive clone it booted from
 /// - Scratch wins where both exist → a State indexer sizes its index and leaves the
 ///   read-only chain clone at the seed's floor, rather than doubling the run's storage
@@ -375,8 +375,8 @@ mod tests {
     /// double the run's storage for a volume nothing writes
     #[test]
     fn a_scratch_claims_the_declaration_ahead_of_an_archive_clone() {
-        let scratch = crate::Mount::scratch("/var/lib/zaino");
-        let archive = crate::Mount::seed(fixture_artifact(), "/var/lib/zaino/zebra-db");
+        let scratch = crate::Mount::scratch("/var/lib/zingod");
+        let archive = crate::Mount::seed(fixture_artifact(), "/var/lib/zingod/zebra-db");
         let d = Disk::gib(400);
 
         // State indexer: index sized, chain clone left on the seed's floor

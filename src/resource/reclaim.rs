@@ -865,32 +865,32 @@ mod tests {
     /// discovery on the namespace stranded it forever, with `sync list` still showing it
     #[test]
     fn a_driver_pod_without_a_namespace_is_still_reclaimable() {
-        let targets = sync_targets(vec![], Some(vec![sync_pod("zaino-a52f", "Failed")]), vec![]);
+        let targets = sync_targets(vec![], Some(vec![sync_pod("zingod-a52f", "Failed")]), vec![]);
 
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].id.as_deref(), Some("zaino-a52f"));
-        assert_eq!(targets[0].name, crate::sync::driver_pod_for("zaino-a52f"));
+        assert_eq!(targets[0].id.as_deref(), Some("zingod-a52f"));
+        assert_eq!(targets[0].name, crate::sync::driver_pod_for("zingod-a52f"));
         assert_eq!(targets[0].owner.as_deref(), Some("elicb"));
         assert!(!targets[0].liveness.is_live());
-        assert_eq!(driver_pod_of(&targets[0]), crate::sync::driver_pod_for("zaino-a52f"));
+        assert_eq!(driver_pod_of(&targets[0]), crate::sync::driver_pod_for("zingod-a52f"));
     }
 
     #[test]
     fn both_halves_of_one_sync_join_into_one_target() {
         let targets = sync_targets(
-            vec![sync_ns("zaino-a52f")],
-            Some(vec![sync_pod("zaino-a52f", "Failed")]),
+            vec![sync_ns("zingod-a52f")],
+            Some(vec![sync_pod("zingod-a52f", "Failed")]),
             vec![],
         );
 
         assert_eq!(targets.len(), 1, "namespace + driver = one reap, not two");
-        assert_eq!(targets[0].name, crate::sync::namespace_for("zaino-a52f"));
+        assert_eq!(targets[0].name, crate::sync::namespace_for("zingod-a52f"));
         assert!(targets[0].detail.contains("Failed"), "{}", targets[0].detail);
     }
 
     #[test]
     fn a_namespace_whose_driver_is_gone_is_reclaimable() {
-        let targets = sync_targets(vec![sync_ns("zaino-a52f")], Some(vec![]), vec![]);
+        let targets = sync_targets(vec![sync_ns("zingod-a52f")], Some(vec![]), vec![]);
 
         assert_eq!(targets.len(), 1);
         assert!(targets[0].detail.contains("no driver pod"), "{}", targets[0].detail);
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn a_running_driver_protects_a_sync_that_has_no_namespace_yet() {
-        let targets = sync_targets(vec![], Some(vec![sync_pod("zaino-a52f", "Running")]), vec![]);
+        let targets = sync_targets(vec![], Some(vec![sync_pod("zingod-a52f", "Running")]), vec![]);
 
         assert!(targets[0].liveness.is_live(), "provisioning sync must survive a bare cleanup");
     }
@@ -915,33 +915,33 @@ mod tests {
     /// shows: discovery anchored on namespace/pod stranded it forever
     #[test]
     fn a_record_without_namespace_or_driver_is_reclaimed_with_its_report() {
-        let targets = sync_targets(vec![], Some(vec![]), vec![sync_record("zaino-a52f")]);
+        let targets = sync_targets(vec![], Some(vec![]), vec![sync_record("zingod-a52f")]);
 
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].id.as_deref(), Some("zaino-a52f"));
+        assert_eq!(targets[0].id.as_deref(), Some("zingod-a52f"));
         assert_eq!(targets[0].owner.as_deref(), Some("elicb"));
         assert!(!targets[0].liveness.is_live());
         let record = observability_of(&targets, &[]);
-        assert_eq!(record.reports, vec![crate::sync::report_cm_name("zaino-a52f")]);
+        assert_eq!(record.reports, vec![crate::sync::report_cm_name("zingod-a52f")]);
     }
 
     #[test]
     fn a_record_joins_the_namespace_and_driver_of_its_sync() {
         let targets = sync_targets(
-            vec![sync_ns("zaino-a52f")],
-            Some(vec![sync_pod("zaino-a52f", "Failed")]),
-            vec![sync_record("zaino-a52f")],
+            vec![sync_ns("zingod-a52f")],
+            Some(vec![sync_pod("zingod-a52f", "Failed")]),
+            vec![sync_record("zingod-a52f")],
         );
 
         assert_eq!(targets.len(), 1, "namespace + driver + record = one sync");
-        assert_eq!(targets[0].name, crate::sync::namespace_for("zaino-a52f"));
+        assert_eq!(targets[0].name, crate::sync::namespace_for("zingod-a52f"));
     }
 
     /// Unreadable pod list is the one case that must fail *shut*: every sync reads as
     /// live rather than every running sync reading as garbage
     #[test]
     fn an_unreadable_pod_list_protects_every_sync() {
-        let targets = sync_targets(vec![sync_ns("zaino-a52f")], None, vec![]);
+        let targets = sync_targets(vec![sync_ns("zingod-a52f")], None, vec![]);
 
         assert_eq!(targets.len(), 1);
         assert!(targets[0].liveness.is_live());
@@ -963,8 +963,8 @@ mod tests {
     /// what lets the driver tear that namespace down and keep its verdict
     #[test]
     fn a_sync_target_addresses_its_report_in_the_observability_namespace() {
-        let sync = target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f");
-        assert_eq!(sync.report_cm().as_deref(), Some("ztest-sync-report-zaino-a52f"));
+        let sync = target(Kind::Sync, "ztest-sync-zingod-a52f", "zingod-a52f");
+        assert_eq!(sync.report_cm().as_deref(), Some("ztest-sync-report-zingod-a52f"));
         assert_eq!(crate::sync::report_cm_namespace(), crate::naming::OBS_NAMESPACE);
         assert_ne!(crate::sync::report_cm_namespace(), sync.name);
 
@@ -975,18 +975,18 @@ mod tests {
 
     #[test]
     fn a_running_sync_is_live_and_names_the_checkpoint_command() {
-        let live = classify_sync("zaino-a52f", Some(Some("Running".into())));
+        let live = classify_sync("zingod-a52f", Some(Some("Running".into())));
         assert!(live.is_live(), "a Running driver pod must protect its sync");
-        assert!(classify_sync("zaino-a52f", Some(Some("Pending".into()))).is_live());
-        assert!(!classify_sync("zaino-a52f", Some(Some("Succeeded".into()))).is_live());
-        assert!(!classify_sync("zaino-a52f", Some(None)).is_live());
+        assert!(classify_sync("zingod-a52f", Some(Some("Pending".into()))).is_live());
+        assert!(!classify_sync("zingod-a52f", Some(Some("Succeeded".into()))).is_live());
+        assert!(!classify_sync("zingod-a52f", Some(None)).is_live());
     }
 
     /// The dangerous one: an unreadable pod list used to read as "no driver pod" for
     /// *every* sync, so one flaking apiserver made a whole cleanup pass destructive
     #[test]
     fn an_unreadable_driver_phase_protects_the_sync_rather_than_reclaiming_it() {
-        assert!(classify_sync("zaino-a52f", None).is_live());
+        assert!(classify_sync("zingod-a52f", None).is_live());
     }
 
     /// All three families, derived from the id alone — no cluster read, so a purge works
@@ -994,13 +994,13 @@ mod tests {
     #[test]
     fn a_syncs_selectors_cover_components_cadvisor_and_the_driver() {
         let selectors =
-            target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f").metric_selectors();
+            target(Kind::Sync, "ztest-sync-zingod-a52f", "zingod-a52f").metric_selectors();
         assert_eq!(
             selectors,
             vec![
-                r#"{namespace="ztest-sync-zaino-a52f"}"#,
-                r#"{sync_id="zaino-a52f"}"#,
-                r#"{pod="ztest-sync-zaino-a52f"}"#,
+                r#"{namespace="ztest-sync-zingod-a52f"}"#,
+                r#"{sync_id="zingod-a52f"}"#,
+                r#"{pod="ztest-sync-zingod-a52f"}"#,
             ]
         );
     }
@@ -1009,15 +1009,15 @@ mod tests {
     /// dev's sync, and their tenant is the one holding the profiles
     #[test]
     fn a_syncs_tenant_is_keyed_on_the_owner_not_the_caller() {
-        let mut t = target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f");
+        let mut t = target(Kind::Sync, "ztest-sync-zingod-a52f", "zingod-a52f");
         t.owner = Some("dana".into());
-        assert_eq!(t.profile_tenant().as_deref(), Some("ztest.dana.zaino-a52f"));
+        assert_eq!(t.profile_tenant().as_deref(), Some("ztest.dana.zingod-a52f"));
     }
 
     /// Unlabelled object → no tenant, rather than one built from a guessed owner
     #[test]
     fn an_unowned_target_offers_no_tenant_to_retire() {
-        let mut t = target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f");
+        let mut t = target(Kind::Sync, "ztest-sync-zingod-a52f", "zingod-a52f");
         t.owner = None;
         assert_eq!(t.profile_tenant(), None);
     }
@@ -1039,25 +1039,25 @@ mod tests {
     fn a_target_is_addressable_by_id_or_object_name() {
         let mut plan = Plan {
             targets: vec![
-                target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f"),
-                target(Kind::Sync, "ztest-sync-zaino-cf67", "zaino-cf67"),
+                target(Kind::Sync, "ztest-sync-zingod-a52f", "zingod-a52f"),
+                target(Kind::Sync, "ztest-sync-zingod-cf67", "zingod-cf67"),
             ],
             errors: Vec::new(),
         };
         // Id from `ztest sync list`, not the generated namespace name
-        plan.restrict_to(&["zaino-a52f".to_string()]);
+        plan.restrict_to(&["zingod-a52f".to_string()]);
         assert_eq!(plan.targets.len(), 1);
-        assert_eq!(plan.targets[0].name, "ztest-sync-zaino-a52f");
+        assert_eq!(plan.targets[0].name, "ztest-sync-zingod-a52f");
         assert!(plan.errors.is_empty());
     }
 
     #[test]
     fn an_unmatched_token_is_an_error_not_a_silent_success() {
         let mut plan = Plan {
-            targets: vec![target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f")],
+            targets: vec![target(Kind::Sync, "ztest-sync-zingod-a52f", "zingod-a52f")],
             errors: Vec::new(),
         };
-        plan.restrict_to(&["zaino-typo".to_string()]);
+        plan.restrict_to(&["zingod-typo".to_string()]);
         assert!(plan.targets.is_empty());
         assert_eq!(plan.errors.len(), 1, "a typo'd id must not report success");
     }
@@ -1065,7 +1065,7 @@ mod tests {
     #[test]
     fn no_tokens_reclaims_everything_in_scope() {
         let mut plan = Plan {
-            targets: vec![target(Kind::Sync, "ztest-sync-zaino-a52f", "zaino-a52f")],
+            targets: vec![target(Kind::Sync, "ztest-sync-zingod-a52f", "zingod-a52f")],
             errors: Vec::new(),
         };
         plan.restrict_to(&[]);
@@ -1074,7 +1074,7 @@ mod tests {
     }
 
     fn dying(name: &str) -> Target {
-        let mut t = target(Kind::Sync, name, "zaino-a52f");
+        let mut t = target(Kind::Sync, name, "zingod-a52f");
         t.liveness = Liveness::Terminating("terminating 4s".into());
         t
     }
@@ -1084,7 +1084,7 @@ mod tests {
     #[test]
     fn a_terminating_target_is_never_re_deleted() {
         let mut outcome = Outcome::default();
-        let reclaimable = triage(vec![dying("ztest-sync-zaino-a52f")], false, &mut outcome);
+        let reclaimable = triage(vec![dying("ztest-sync-zingod-a52f")], false, &mut outcome);
         assert!(reclaimable.is_empty());
         assert_eq!(outcome.terminating.len(), 1);
         assert!(outcome.skipped.is_empty(), "terminating is not `live`; --force is not the fix");
@@ -1095,9 +1095,9 @@ mod tests {
     /// series are orphaned for the whole retention
     #[test]
     fn a_terminating_sync_still_has_its_series_and_tenant_addressed() {
-        let record = observability_of(&[], &[dying("ztest-sync-zaino-a52f")]);
+        let record = observability_of(&[], &[dying("ztest-sync-zingod-a52f")]);
         assert_eq!(record.selectors.len(), 3, "namespace, sync_id and driver-pod matchers");
-        assert_eq!(record.tenants, vec!["ztest.elicb.zaino-a52f"]);
+        assert_eq!(record.tenants, vec!["ztest.elicb.zingod-a52f"]);
     }
 
     /// One run's namespace + pod derive one tenant, whichever list they land on
@@ -1114,13 +1114,13 @@ mod tests {
     #[test]
     fn force_does_not_reclaim_a_terminating_target() {
         let mut outcome = Outcome::default();
-        assert!(triage(vec![dying("ztest-sync-zaino-a52f")], true, &mut outcome).is_empty());
+        assert!(triage(vec![dying("ztest-sync-zingod-a52f")], true, &mut outcome).is_empty());
         assert_eq!(outcome.terminating.len(), 1);
     }
 
     #[test]
     fn force_still_reclaims_a_live_target() {
-        let mut live = target(Kind::Sync, "ztest-sync-zaino-cf67", "zaino-cf67");
+        let mut live = target(Kind::Sync, "ztest-sync-zingod-cf67", "zingod-cf67");
         live.liveness = Liveness::Live("Running".into());
 
         let mut skipped = Outcome::default();

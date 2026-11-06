@@ -475,8 +475,8 @@ mod tests {
     #[test]
     fn a_selector_scopes_to_one_component_of_one_run() {
         assert_eq!(
-            selector("zainod", "ztest-sync-abc"),
-            r#"{component="zainod",namespace="ztest-sync-abc"}"#
+            selector("zingod", "ztest-sync-abc"),
+            r#"{component="zingod",namespace="ztest-sync-abc"}"#
         );
     }
 

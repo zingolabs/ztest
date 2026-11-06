@@ -8,7 +8,7 @@ legal on it, and how a total is extracted so that it is exact.
 
 ## The defect this shape exists to prevent
 
-A `zaino_index_construction` run over mainnet reported, on one screen:
+A `zingod_index_construction` run over mainnet reported, on one screen:
 
 ```
 main 761..3,433,142 (481,929,395 ops)          ← driver, raw counter delta
@@ -76,9 +76,9 @@ once and every reader inherits it.
 
 ```rust
 mod family {
-    pub const ORCHARD_ACTIONS: Counter = counter("zaino_fetch_orchard_actions_total", Dimension::Count);
-    pub const FETCH_HEIGHT:    Gauge   = gauge("zaino_fetch_height", Dimension::Count);
-    pub const FIRST_MESSAGE:   Hist    = hist("zaino_grpc_first_message_seconds", Dimension::Seconds);
+    pub const ORCHARD_ACTIONS: Counter = counter("zingod_fetch_orchard_actions_total", Dimension::Count);
+    pub const FETCH_HEIGHT:    Gauge   = gauge("zingod_fetch_height", Dimension::Count);
+    pub const FIRST_MESSAGE:   Hist    = hist("zingod_grpc_first_message_seconds", Dimension::Seconds);
 }
 
 const ROWS: &[Row] = &[

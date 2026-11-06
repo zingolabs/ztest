@@ -2,7 +2,7 @@
 //!
 //! - Sync outlives its terminal (state in k8s, no local daemon)
 //! - Driver pod (`ztest.io/{kind=sync,sync-id,user}`) in the shared run namespace; the
-//!   `zebrad`/`zaino` pods its in-pod `TestEnv` provisions in `ztest-sync-<id>`, which is
+//!   `zebrad`/`zingod` pods its in-pod `TestEnv` provisions in `ztest-sync-<id>`, which is
 //!   deleted at run end (durable record lives in `ztest-obs`, see [`ztest::sync::SyncLaunch`])
 //! - Any kubeconfig holder can `list`/`watch`/`stop` (syncs found by `kind=sync` label)
 //! - `watch` = read-only tail; only `stop` ends a sync (`sync_mode = Shutdown` → checkpoint)

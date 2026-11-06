@@ -4,9 +4,9 @@
 //!   every backend describes itself with
 
 use crate::backends::lightwalletd::LightwalletdBackend;
-use crate::backends::zainod::ZainoBackend;
 use crate::backends::zcashd::ZcashdBackend;
 use crate::backends::zebra::ZebraBackend;
+use crate::backends::zingod::ZingodBackend;
 #[cfg(any(feature = "librustzcash", feature = "zingolib"))]
 use crate::component::Wallet;
 use crate::component::{ComponentOpts, Indexer, IndexerMode, Validator};
@@ -45,24 +45,24 @@ impl Validator<ZcashdBackend> {
     }
 }
 
-impl Indexer<ZainoBackend> {
-    pub fn zaino(version: impl Into<String>) -> Self {
+impl Indexer<ZingodBackend> {
+    pub fn zingod(version: impl Into<String>) -> Self {
         Self {
-            backend: ZainoBackend::default(),
-            opts: opts_for(&version.into(), "zainod"),
+            backend: ZingodBackend::default(),
+            opts: opts_for(&version.into(), "zingod"),
             mode: IndexerMode::None,
         }
     }
 
     #[doc(hidden)]
-    pub fn zainod_dev(
+    pub fn zingod_dev(
         source: crate::backends::image::DevSource,
         version: impl Into<String>,
         features: Vec<String>,
     ) -> Self {
         Self {
-            backend: ZainoBackend::default(),
-            opts: opts_dev(source, version.into(), features, "zainod"),
+            backend: ZingodBackend::default(),
+            opts: opts_dev(source, version.into(), features, "zingod"),
             mode: IndexerMode::None,
         }
     }
@@ -145,7 +145,7 @@ fn opts_dev(
 
 fn default_repo_for(component: &str) -> &'static str {
     match component {
-        "zebrad" | "zcashd" | "zainod" => component_static(component),
+        "zebrad" | "zcashd" | "zingod" => component_static(component),
         _ => "unknown",
     }
 }
@@ -154,7 +154,7 @@ fn component_static(component: &str) -> &'static str {
     match component {
         "zebrad" => "zebrad",
         "zcashd" => "zcashd",
-        "zainod" => "zainod",
+        "zingod" => "zingod",
         _ => "unknown",
     }
 }

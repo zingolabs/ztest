@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn common_ancestor_of_sibling_repos() {
         let dirs =
-            [PathBuf::from("/home/u/proj/zaino/live-tests"), PathBuf::from("/home/u/proj/ztest")]
+            [PathBuf::from("/home/u/proj/zingod/live-tests"), PathBuf::from("/home/u/proj/ztest")]
                 .into_iter()
                 .collect();
         assert_eq!(common_ancestor(&dirs), Some(PathBuf::from("/home/u/proj")));
@@ -413,8 +413,8 @@ mod tests {
     fn rehome_maps_image_src_to_ancestor() {
         let anc = Path::new("/home/u/proj");
         assert_eq!(
-            rehome_path(Path::new("/src/zaino/live-tests/clientless"), anc),
-            PathBuf::from("/home/u/proj/zaino/live-tests/clientless")
+            rehome_path(Path::new("/src/zingod/live-tests/clientless"), anc),
+            PathBuf::from("/home/u/proj/zingod/live-tests/clientless")
         );
         assert_eq!(
             rehome_path(Path::new("/some/git/cache/ctx"), anc),

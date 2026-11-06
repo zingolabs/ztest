@@ -18,7 +18,7 @@ Sizing lives with the component, not with the tier. Each backend renders its own
 | Pod                        | Reserve    | Set by                       |
 | -------------------------- | ---------- | ---------------------------- |
 | validator (zebrad, zcashd) | 1c / 2 GiB | `qos::pod::VALIDATOR`        |
-| indexer (zainod, lwd)      | 1c / 2 GiB | `qos::pod::INDEXER`          |
+| indexer (zingod, lwd)      | 1c / 2 GiB | `qos::pod::INDEXER`          |
 | runner                     | tier       | `QosProfile::runner`         |
 
 - Memory-led: 2 GiB clears regtest Orchard proving and the NU6 boundary work
@@ -373,7 +373,7 @@ CREATE TABLE test_metrics (
 
 ### Capture
 
-Sync wall-time lives in the zebrad + zaino pods, not the ztest driver → capture targets the component
+Sync wall-time lives in the zebrad + zingod pods, not the ztest driver → capture targets the component
 processes. Injected in `PodSpec::render` for tests carrying `CalibrationDecl`, beside the
 nodeSelector/toleration/blockio injection.
 
@@ -382,7 +382,7 @@ nodeSelector/toleration/blockio injection.
   NVMe pool)
 - **Time-series**: periodic height / blocks-per-sec / rss + cgroup `io.stat` deltas as counter tracks;
   `io.stat` doubles as a cross-check that delivered throughput matches the calibrated slice
-- **Spans (optional)**: client-side RPC spans from the driver at the RPC boundary (no zebrad/zaino
+- **Spans (optional)**: client-side RPC spans from the driver at the RPC boundary (no zebrad/zingod
   change) → cross-service latency, wait attribution, and the off-CPU time v2 needs
 - Measured per-tier `io_bps`/`io_iops` feed back into `QosClass::profile`, replacing the `0` placeholders
   that keep the I/O dimension inert

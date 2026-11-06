@@ -199,7 +199,7 @@ mod tests {
     /// context would change the tree the tag hashes
     #[test]
     fn buildctl_separates_context_and_dockerfile_roots() {
-        let cmd = cmd(&req(Output::Image { tag: "zainod:dev-abc".into() }));
+        let cmd = cmd(&req(Output::Image { tag: "zingod:dev-abc".into() }));
         assert!(cmd.contains("--local context='/w/ctx'"), "{cmd}");
         assert!(cmd.contains("--local dockerfile='/w/df'"), "{cmd}");
         assert!(cmd.contains("--opt 'build-arg:FEATURES=a,b'"), "{cmd}");
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn progress_follows_the_output_route() {
         assert!(
-            cmd(&req(Output::Image { tag: "zainod:dev-abc".into() })).contains("--progress=plain")
+            cmd(&req(Output::Image { tag: "zingod:dev-abc".into() })).contains("--progress=plain")
         );
     }
 

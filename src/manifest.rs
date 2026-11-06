@@ -187,7 +187,7 @@ impl PodSpec {
                     "ztest.io/user": crate::naming::slug(&coords.user, crate::naming::DNS_LABEL_MAX),
                     "ztest.io/component": component_label,
                     // Backend-independent role: select "the indexer" without knowing
-                    // zainod vs lightwalletd (`ztest sync watch` follows it)
+                    // zingod vs lightwalletd (`ztest sync watch` follows it)
                     "ztest.io/component-category": self.category.as_str(),
                     "ztest.io/test": test_name,
                     "ztest.io/component-name": self.pod_name,

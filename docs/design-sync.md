@@ -198,7 +198,7 @@ everything else is harness API.
 async fn wallet_state_sync(run: SyncRunner) -> SyncOutcome {
     let mut run = match run.topology(|t| (
         t.add_validator(Validator::zebrad("1.9.1").regtest().snapshot(ORCHARD_TESTNET)),
-        t.add_indexer(Indexer::zaino("0.4.0").peer("zeb")),
+        t.add_indexer(Indexer::zingod("0.4.0").peer("zeb")),
         t.add_wallet(Wallet::librustzcash().performance(librustzcash::PerformanceLevel::High)),
     )).await {
         Ok(run) => run,

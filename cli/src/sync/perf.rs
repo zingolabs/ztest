@@ -619,9 +619,11 @@ mod tests {
     /// of one profile
     #[test]
     fn each_sync_gets_its_own_artifact_directory() {
-        assert_ne!(default_dest("zaino-state-sync-aaa"), default_dest("zaino-state-sync-bbb"));
+        assert_ne!(default_dest("zingod-state-sync-aaa"), default_dest("zingod-state-sync-bbb"));
         assert!(
-            default_dest("zaino-state-sync-aaa").to_string_lossy().contains("zaino-state-sync-aaa")
+            default_dest("zingod-state-sync-aaa")
+                .to_string_lossy()
+                .contains("zingod-state-sync-aaa")
         );
     }
 

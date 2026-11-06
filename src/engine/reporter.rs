@@ -628,7 +628,7 @@ mod tests {
             "mod::killed",
             Verdict::Terminated,
             1,
-            b"[zebrad] INFO spawning syncer task\n[zainod] INFO syncing block\n",
+            b"[zebrad] INFO spawning syncer task\n[zingod] INFO syncing block\n",
         ));
         r.handle(&finished("pkg::b", "mod::broke", Verdict::Fail(101), 1, b"boom\n"));
         r.handle(&TestEvent::RunFinished {
@@ -639,7 +639,7 @@ mod tests {
 
         assert!(out.contains("SIGKILL [   0.234s] pkg::b mod::killed"), "{out}");
         assert!(!out.contains("zebrad"), "kill output replayed:\n{out}");
-        assert!(!out.contains("output ───\n    [zainod"), "{out}");
+        assert!(!out.contains("output ───\n    [zingod"), "{out}");
         // A real failure in the same run keeps both its output and its recap
         assert!(out.contains("boom"), "{out}");
         let summary = out.find("Summary").unwrap();

@@ -29,7 +29,7 @@ const TIP_POLL: Duration = Duration::from_millis(250);
 
 // ─────────────────────────── IndexerConfig ──────────────────────────
 
-/// Config ZST for the [`Indexer`](crate::component::Indexer) builder (e.g. `ZainoBackend`):
+/// Config ZST for the [`Indexer`](crate::component::Indexer) builder (e.g. `ZingodBackend`):
 /// config-time behaviour + factory for a live [`IndexerBackend`]
 pub trait IndexerConfig: Send + Sync + std::fmt::Debug + 'static {
     type Handle: IndexerBackend + Clone;
@@ -188,7 +188,7 @@ pub trait IndexerBackend: Send + Sync + std::fmt::Debug + 'static {
         crate::loadtest::LwdClient::connect(self.grpc_uri().await?).await
     }
 
-    /// Typed JSON-RPC client for the `jsonrpc` endpoint (zainod serves none → `UnknownEndpoint`)
+    /// Typed JSON-RPC client for the `jsonrpc` endpoint (zingod serves none → `UnknownEndpoint`)
     async fn json_rpc(&self) -> Result<JsonRpcClient, EnvError>;
 
     /// `get_block_range` with the default (empty) pool-type filter

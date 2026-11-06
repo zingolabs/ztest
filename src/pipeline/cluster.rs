@@ -113,7 +113,7 @@ pub async fn run(tx: &EventTx) -> (ProbeOutcome, Option<Client>) {
 
     let (nodes_ready, nodes_cordoned) = count_nodes(&nodes.items);
     let capacity = capacity_from(&nodes.items, &pods.items, &pvcs.items);
-    let slots_used = count_zaino_slots(&namespaces.items);
+    let slots_used = count_zingod_slots(&namespaces.items);
 
     let _ = tx.send(Event::ProbeComplete);
 
@@ -259,9 +259,9 @@ fn pod_volume_reservation(pod: &Pod, by_name: &HashMap<&str, &PersistentVolumeCl
         .fold(Resources::ZERO, |acc, pvc| acc.saturating_add(&units::pvc_reservation(pvc)))
 }
 
-/// `zaino-{ci,dev}-*` namespaces proxy current concurrency (no authoritative session
+/// `zingod-{ci,dev}-*` namespaces proxy current concurrency (no authoritative session
 /// record to count yet)
-fn count_zaino_slots(namespaces: &[Namespace]) -> u32 {
+fn count_zingod_slots(namespaces: &[Namespace]) -> u32 {
     namespaces
         .iter()
         .filter(|ns| {
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn count_zaino_slots_matches_only_zaino_namespaces() {
+    fn count_zingod_slots_matches_only_zingod_namespaces() {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
         let ns = |name: &str| Namespace {
             metadata: ObjectMeta { name: Some(name.to_string()), ..Default::default() },
@@ -545,6 +545,6 @@ mod tests {
             ns("ztest-seeds"),
             ns("ztest-system"),
         ];
-        assert_eq!(count_zaino_slots(&nss), 2);
+        assert_eq!(count_zingod_slots(&nss), 2);
     }
 }

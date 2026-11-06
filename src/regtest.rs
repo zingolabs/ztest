@@ -124,7 +124,7 @@ pub fn parse_activation_heights_from_rpc(
 ///
 /// ```ignore
 /// let zebrad = env.add_validator(Validator::zebrad("5.1.1").regtest());
-/// let zaino  = env.add_indexer(Indexer::zaino("0.4.0").regtest());
+/// let zingod  = env.add_indexer(Indexer::zingod("0.4.0").regtest());
 /// ```
 pub trait Regtest: Sized {
     fn regtest(self) -> Self;
@@ -137,7 +137,7 @@ pub trait Regtest: Sized {
 /// - One verb, parts not independently choosable: renders the config, mounts a private CoW
 ///   clone at the backend's chain path, records the archive (preflight materializes the
 ///   seed + grants a readable GID)
-/// - Backend opening no chain DB (zaino) takes the config, skips the multi-GB clone
+/// - Backend opening no chain DB (zingod) takes the config, skips the multi-GB clone
 /// - **Not** an index restore: validator *is* the chain, indexer *reads* it and builds its
 ///   own index into empty pod-local scratch
 ///
@@ -148,7 +148,7 @@ pub trait Regtest: Sized {
 /// #[tokio::test]
 /// async fn t() {
 ///     let zebra = env.add_validator(Validator::zebrad("6.2.3").snapshot(IRONWOOD));
-///     let zaino = env.add_indexer(Indexer::zaino("0.4.0").snapshot(IRONWOOD));
+///     let zingod = env.add_indexer(Indexer::zingod("0.4.0").snapshot(IRONWOOD));
 /// }
 /// ```
 ///

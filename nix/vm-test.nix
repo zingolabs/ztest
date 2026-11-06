@@ -9,18 +9,18 @@ let
 
   day = 24 * 60 * 60;
 
-  # Cold cargo build + an in-VM image build of zainod from source, both uncached (qcow2 is sparse)
+  # Cold cargo build + an in-VM image build of zingod from source, both uncached (qcow2 is sparse)
   diskSizeMb = 131072;
 
-  zaino = {
-    url = "https://github.com/zingolabs/zaino.git";
+  zingod = {
+    url = "https://github.com/zingolabs/zingod.git";
     branch = "dev";
-    dest = "/root/zaino";
-    workspace = "/root/zaino/live-tests";
+    dest = "/root/zingod";
+    workspace = "/root/zingod/live-tests";
     selector = "-E 'binary(validator_heights)'";  # single 4c/4GiB test
   };
 
-  cloneZaino = "git clone --depth 1 --branch ${zaino.branch} ${zaino.url} ${zaino.dest}";
+  cloneZingod = "git clone --depth 1 --branch ${zingod.branch} ${zingod.url} ${zingod.dest}";
 
   # live-tests take `ztest = "0.1"` from the registry; every cargo run in the VM must reach
   # THIS build instead — $CARGO_HOME/config.toml, so an interactive `ztest run` gets it too
@@ -105,7 +105,7 @@ let
       name = "ztest-cluster-${runtime}";
       nodes.machine = node runtime;
       interactive.sshBackdoor.enable = true;
-      globalTimeout = 6 * 60 * 60; # default 1h kills the cold zaino + zainod-image builds
+      globalTimeout = 6 * 60 * 60; # default 1h kills the cold zingod + zingod-image builds
 
       testScript = ''
         import re
@@ -170,14 +170,14 @@ let
             assert status == 0, out
             assert "cannot work here" not in out, out
 
-        with subtest("zaino's live-tests run green on the harness"):
-            machine.succeed("${cloneZaino}", timeout=900)
+        with subtest("zingod's live-tests run green on the harness"):
+            machine.succeed("${cloneZingod}", timeout=900)
             machine.succeed("""${stageZtest}""")
 
-            print(machine.succeed("cd ${zaino.dest} && rustup show active-toolchain", timeout=1800))
+            print(machine.succeed("cd ${zingod.dest} && rustup show active-toolchain", timeout=1800))
 
             out = machine.succeed(
-                "cd ${zaino.workspace} && ztest run ${zaino.selector} 2>&1", timeout=5 * 3600
+                "cd ${zingod.workspace} && ztest run ${zingod.selector} 2>&1", timeout=5 * 3600
             )
             print(out)
             assert_run_green(out)
@@ -207,10 +207,10 @@ let
         machine.wait_for_unit("sockets.target")
 
         # ztest staged + patched in, so a hand-run in the shell picks up this build
-        status, out = machine.execute("""${cloneZaino} && ${stageZtest}""")
+        status, out = machine.execute("""${cloneZingod} && ${stageZtest}""")
 
         if status != 0:
-            print(f"zaino checkout failed (shell still opens):\n{out}")
+            print(f"zingod checkout failed (shell still opens):\n{out}")
 
         machine.succeed("touch ${readyMarker}")
 
@@ -335,7 +335,7 @@ in
         (lib.nameValuePair "vm-${runtime}" {
           type = "app";
           program = lib.getExe (shellApp runtime);
-          meta.description = "Boot the ${runtime} VM (zaino @ ${zaino.branch} cloned) and open a root shell";
+          meta.description = "Boot the ${runtime} VM (zingod @ ${zingod.branch} cloned) and open a root shell";
         })
       ])
       [

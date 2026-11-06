@@ -330,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn children_receive_the_run_identity_namespace_and_image_manifest() {
         let mut e = env();
-        e.image_refs.insert("zainod@sha".into(), "zainod:dev-abc".into());
+        e.image_refs.insert("zingod@sha".into(), "zingod:dev-abc".into());
         let out = play("prints_test_vars", &e).await;
         let shown = output(&out);
         assert_eq!(out.verdict, Verdict::Pass, "{shown:?}");
@@ -338,7 +338,7 @@ mod tests {
             format!("RUN=[{}]", child::RUN_ID),
             "USER=[tester]".into(),
             "NS=[ztest-t-b-x-0a1b2c3d]".into(),
-            r#"REFS={"zainod@sha":"zainod:dev-abc"}"#.into(),
+            r#"REFS={"zingod@sha":"zingod:dev-abc"}"#.into(),
         ] {
             assert!(shown.contains(&want), "missing {want} in {shown:?}");
         }

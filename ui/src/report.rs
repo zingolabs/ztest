@@ -783,8 +783,8 @@ mod tests {
 
     fn view() -> ReportView {
         ReportView {
-            sync_id: "zaino-index-construction-c3115f50".into(),
-            profile: "zaino_index_construction".into(),
+            sync_id: "zingod-index-construction-c3115f50".into(),
+            profile: "zingod_index_construction".into(),
             status: SyncStatus::Finished(ztest::api::SyncVerdict::Failed),
             height_check: None,
             unpublished: Vec::new(),
@@ -800,7 +800,7 @@ mod tests {
                 ),
                 (
                     "serves_from_its_own_index".into(),
-                    "at frontier 658599 zaino still forwards getaddressdeltas to the validator"
+                    "at frontier 658599 zingod still forwards getaddressdeltas to the validator"
                         .into(),
                 ),
             ],
@@ -819,17 +819,17 @@ mod tests {
             blocks: vec![series("blocks", Unit::PerSec, &wave(400.0, 60, 0.0))],
             throughput: vec![series("transactions", Unit::PerSec, &wave(900.0, 60, 0.0))],
             write_path: vec![
-                stage("fetch", "zaino_sync_block_fetch_seconds", &wave(4.0, 60, 0.0), false),
-                stage("fetch p99", "zaino_sync_block_fetch_seconds", &wave(30.0, 60, 14.0), true),
+                stage("fetch", "zingod_sync_block_fetch_seconds", &wave(4.0, 60, 0.0), false),
+                stage("fetch p99", "zingod_sync_block_fetch_seconds", &wave(30.0, 60, 14.0), true),
                 stage(
                     "treestate",
-                    "zaino_sync_treestate_fetch_seconds",
+                    "zingod_sync_treestate_fetch_seconds",
                     &wave(1.2, 60, 0.0),
                     false,
                 ),
                 stage(
                     "batch write",
-                    "zaino_sync_batch_write_seconds",
+                    "zingod_sync_batch_write_seconds",
                     &wave(880.0, 60, 7.0),
                     false,
                 ),
@@ -842,14 +842,14 @@ mod tests {
             ],
             resources: vec![
                 ComponentResources {
-                    component: "zainod".into(),
-                    cpu: vec![series("zainod", Unit::Cores, &wave(3.0, 60, 0.0))],
-                    mem: vec![series("zainod", Unit::Bytes, &wave(6e9, 60, 0.0))],
+                    component: "zingod".into(),
+                    cpu: vec![series("zingod", Unit::Cores, &wave(3.0, 60, 0.0))],
+                    mem: vec![series("zingod", Unit::Bytes, &wave(6e9, 60, 0.0))],
                     disk: vec![
                         series("read", Unit::BytesPerSec, &wave(4.1e8, 60, 0.0)),
                         series("write", Unit::BytesPerSec, &wave(9e7, 60, 14.0)),
                     ],
-                    io_stall: vec![series("zainod", Unit::Fraction, &wave(0.004, 60, 0.0))],
+                    io_stall: vec![series("zingod", Unit::Fraction, &wave(0.004, 60, 0.0))],
                 },
                 ComponentResources {
                     component: "zebrad".into(),
@@ -909,7 +909,7 @@ mod tests {
 
     /// The bug that made a real failure undiagnosable: the detail was clipped to one
     /// line, and `RpcError`'s cause is *last* (`{component} {op}: {source}`), so the
-    /// clip kept "zaino" and dropped everything that named the fault
+    /// clip kept "zingod" and dropped everything that named the fault
     #[test]
     fn a_violation_keeps_its_cause_however_long_the_detail() {
         let mut v = view();
@@ -918,7 +918,7 @@ mod tests {
             "index_serves_the_pinned_tip".into(),
             format!(
                 "1800s after the finalised writer committed its last batch at frontier \
-                 1692103, `gettxoutsetinfo` did not answer: zaino json_rpc: {cause}"
+                 1692103, `gettxoutsetinfo` did not answer: zingod json_rpc: {cause}"
             ),
         )];
         let rendered = render_sync_report(&v, &theme(), 100);

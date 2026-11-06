@@ -33,7 +33,7 @@ pub struct Validator<B: ValidatorConfig> {
     pub opts: ComponentOpts,
 }
 
-/// Network fixture an indexer runs against = which `zainod.toml` gets rendered.
+/// Network fixture an indexer runs against = which `zingod.toml` gets rendered.
 ///
 /// - Data-free variants; chain data lives in `ComponentOpts::restore`, so which network an
 ///   archive holds is recorded once and cannot self-contradict
@@ -547,22 +547,22 @@ mod tests {
     /// preflight and in-pod binaries compile under different `CARGO_MANIFEST_DIR`s,
     /// so a `Local` source's absolute Dockerfile path differs between them
     #[test]
-    fn zainod_dev_id_is_path_independent() {
+    fn zingod_dev_id_is_path_independent() {
         let features = vec!["prometheus".to_string()];
         let id_for = |dockerfile: &str| {
             let src = DevSource::Local {
                 dockerfile: std::path::PathBuf::from(dockerfile),
                 context: std::path::PathBuf::from("/ctx"),
             };
-            let ix = Indexer::zainod_dev(src, "dev", features.clone());
+            let ix = Indexer::zingod_dev(src, "dev", features.clone());
             let ImageSpec::Dev { source, features, repo, rust_version } = &ix.opts().image else {
-                panic!("zainod_dev must yield an ImageSpec::Dev");
+                panic!("zingod_dev must yield an ImageSpec::Dev");
             };
             DevImageId::of(repo, features, rust_version.as_deref(), source)
         };
         assert_eq!(
             id_for("/laptop/live-tests/clientless/../../Dockerfile"),
-            id_for("/cache/src/zaino/live-tests/clientless/../../Dockerfile"),
+            id_for("/cache/src/zingod/live-tests/clientless/../../Dockerfile"),
             "DevImageId must not depend on the Dockerfile path"
         );
     }

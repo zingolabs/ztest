@@ -249,22 +249,22 @@ mod tests {
     #[test]
     fn sync_profiles_leave_the_selection() {
         let mut bins =
-            vec![bin("zaino-sync-tests::zaino_sync", &["ordinary_test", "zaino_state_sync"])];
+            vec![bin("zingod-sync-tests::zingod_sync", &["ordinary_test", "zingod_state_sync"])];
         let syncs = [(
-            "zaino-sync-tests::zaino_sync".to_string(),
-            vec![sync_entry("zaino_sync::zaino_state_sync", "zaino_state_sync")],
+            "zingod-sync-tests::zingod_sync".to_string(),
+            vec![sync_entry("zingod_sync::zingod_state_sync", "zingod_state_sync")],
         )];
 
         let excluded = drop_sync_tests(&mut bins, &syncs, &[]);
 
         assert_eq!(bins[0].selected_tests, ["ordinary_test"]);
         assert_eq!(excluded.len(), 1);
-        assert_eq!(excluded[0].test_name, "zaino_state_sync");
-        assert_eq!(excluded[0].reason, SyncExclusion::Profile("zaino_state_sync".to_string()));
+        assert_eq!(excluded[0].test_name, "zingod_state_sync");
+        assert_eq!(excluded[0].reason, SyncExclusion::Profile("zingod_state_sync".to_string()));
         assert!(
             build_work_list(&bins, &[], 0, &ResourceDeps::default())
                 .iter()
-                .all(|w| w.test_name != "zaino_state_sync")
+                .all(|w| w.test_name != "zingod_state_sync")
         );
     }
 

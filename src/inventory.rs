@@ -16,7 +16,7 @@ use crate::qos::QosClass;
 /// What image a component's pod uses.
 ///
 /// - `Published` reads [`ComponentOpts::version`](crate::component::ComponentOpts::version)
-///   through the per-backend `image_uri` (zaino → `zingodevops/zainod:`)
+///   through the per-backend `image_uri` (zingod → `zingodevops/zingod:`)
 /// - `Dev` folds `features` (→ `--build-arg`) + `rust_version` into `dev-<hash>`, one
 ///   image per combination; `rust_version: None` leaves the Dockerfile's default
 #[derive(Debug, Clone, Default)]
@@ -33,7 +33,7 @@ pub enum ImageSpec {
 
 impl ImageSpec {
     /// Dev zebrad's exporter = its `prometheus` build feature (no feature → nothing binds it)
-    /// - `Published` cannot opt a feature in → `false`; zainod ignores this (exporter always in)
+    /// - `Published` cannot opt a feature in → `false`; zingod ignores this (exporter always in)
     pub fn metrics_enabled(&self) -> bool {
         let ImageSpec::Dev { features, .. } = self else {
             return false;
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn dev_line_is_tagged_and_demuxes_to_dev_entry() {
         let decl = DevImageDecl {
-            repo: "zainod",
+            repo: "zingod",
             source: DevSourceDecl::Local { dockerfile: "/df", context: "/ctx" },
             features: &["f1"],
             rust_versions: &[],
@@ -401,7 +401,7 @@ mod tests {
         assert!(line.contains("\"kind\":\"dev\""), "missing dev tag: {line}");
         match serde_json::from_str::<InventoryLine>(&line).unwrap() {
             InventoryLine::Dev(e) => {
-                assert_eq!(e.repo, "zainod");
+                assert_eq!(e.repo, "zingod");
                 assert_eq!(e.features, vec!["f1".to_string()]);
                 assert_eq!(e.rust_version, None);
                 assert_eq!(

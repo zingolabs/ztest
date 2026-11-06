@@ -21,8 +21,8 @@ Cluster tests run through **`ztest run`**, never bare `cargo nextest`.
 ## Invoking
 
 ```bash
-ztest run -p zaino-integration-tests
-ztest run -p zaino-integration-tests indexer::wallet_sync     # substring on crate::module::test_fn
+ztest run -p zingod-integration-tests
+ztest run -p zingod-integration-tests indexer::wallet_sync     # substring on crate::module::test_fn
 ztest run -E 'test(reorg)'                                    # nextest filter DSL
 ztest run --cluster okd-home -p e2e                           # named profile: context + class + registry
 ztest run --no-cleanup -E 'test(flaky_one)'                   # keep the namespace for a post-mortem

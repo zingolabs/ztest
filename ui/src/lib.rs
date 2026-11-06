@@ -70,7 +70,7 @@ pub enum BuildState {
     Failed { exit_code: i32, stage: BuildStage, elapsed: std::time::Duration },
 }
 
-/// - `slots_used` = observed `zaino-{ci,dev}-*` namespaces (concurrency proxy)
+/// - `slots_used` = observed `zingod-{ci,dev}-*` namespaces (concurrency proxy)
 /// - `capacity` = whole-cluster requested of allocatable (NVMe vs general is k8s placement, not
 ///   a second pool). `None` = probe not answered → "probing…", never a zero that reads as measured
 #[derive(Debug, Clone)]

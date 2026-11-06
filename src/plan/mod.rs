@@ -231,11 +231,11 @@ mod tests {
     /// The bug: `sync start <profile>` pulled a clientless seed no selected test declared
     #[test]
     fn seed_declared_only_by_an_unselected_test_is_pruned() {
-        let bins = [bin("sync::zaino_sync", &["zaino_index_construction"])];
+        let bins = [bin("sync::zingod_sync", &["zingod_index_construction"])];
         let deps = vec![(
-            "sync::zaino_sync".to_string(),
+            "sync::zingod_sync".to_string(),
             vec![
-                dep("zaino_sync::zaino_index_construction", "1106bc19"),
+                dep("zingod_sync::zingod_index_construction", "1106bc19"),
                 dep("the_pub_testnet_ironwood_boundary::ironwood_boundary", "3545da25"),
             ],
         )];

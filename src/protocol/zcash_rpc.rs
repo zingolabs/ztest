@@ -3,7 +3,7 @@
 //!
 //! - Served natively by `zebrad`/`zcashd`
 //! - ztest-owned: no ecosystem crate covers the surface
-//!   (`docs/architecture-decisions/`) — `zaino-fetch` drops the mining RPCs and
+//!   (`docs/architecture-decisions/`) — `zingod-fetch` drops the mining RPCs and
 //!   `process::exit`s, `zebra-rpc` is server-side + drags Zebra,
 //!   `bitcoincore-rpc` archived & Bitcoin-shaped
 

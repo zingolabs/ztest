@@ -448,7 +448,13 @@ impl ProgressView for ZingolibProgress {
 
 /// Complete sessions report 100 even over an output-free range (ratio 0 / 0 there)
 fn outputs_pct(status: &SyncStatus) -> f32 {
-    if status.is_complete() { 100.0 } else { status.percentage_total_outputs_scanned }
+    if status.is_complete() {
+        100.0
+    } else if status.total_outputs == 0 {
+        0.0
+    } else {
+        (status.total_outputs_scanned as f64 / status.total_outputs as f64 * 100.0) as f32
+    }
 }
 
 /// Observable zingolib subject over the account's own `LightClient` (client lock per call only)
@@ -494,6 +500,7 @@ impl ZingolibSyncSubject {
             }
             PollReport::Ready(Err(e)) => Err(error_chain(&e)),
             PollReport::NoHandle => Err(format!("{LABEL}: sync handle gone")),
+            PollReport::Panicked(msg) => Err(format!("{LABEL}: sync task panicked: {msg}")),
         };
         let _ = self.outcome.set(outcome);
     }
@@ -560,7 +567,6 @@ impl SyncSubject for ZingolibSyncSubject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::Wallet;
     use crate::handles::wallet::FAUCET_SEED;
     use zingolib::wallet::TransparentAddressDiscovery;
 

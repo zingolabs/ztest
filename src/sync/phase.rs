@@ -155,8 +155,8 @@ impl<T> Phase<T> {
     }
 
     /// Widen (or narrow) one family's ready window for this phase — e.g. a cold mainnet
-    /// validator delaying zaino's first block past
-    /// `ztest::backends::zainod::family::FETCHED_HEIGHT`'s 60 s default
+    /// validator delaying zingod's first block past
+    /// `ztest::backends::zingod::family::FETCHED_HEIGHT`'s 60 s default
     pub fn ready_within(&mut self, family: impl Into<Family>, ready: Duration) -> &mut Self {
         let family = Family { ready, ..family.into() };
         self.ready.retain(|f| !f.is(family));

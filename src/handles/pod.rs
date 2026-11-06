@@ -146,7 +146,7 @@ impl ComponentPod {
     pub fn category(&self) -> ComponentCategory {
         self.category
     }
-    /// `name` = pod name (`.named(..)`) or container label (`zainod`)
+    /// `name` = pod name (`.named(..)`) or container label (`zingod`)
     pub fn answers_to(&self, name: &str) -> bool {
         self.name == name || self.container == name
     }
@@ -393,7 +393,7 @@ mod tests {
         };
         PodStatus {
             container_statuses: Some(vec![ContainerStatus {
-                name: "zainod".into(),
+                name: "zingod".into(),
                 restart_count: restarts,
                 ready,
                 state: Some(state),
@@ -406,7 +406,7 @@ mod tests {
     /// Kill → backoff → running-not-ready → Ready: only the last counts as back
     #[test]
     fn restart_is_back_only_once_counted_and_ready() {
-        let before = sample_of(&status(0, true, None), "zainod").expect("sampled");
+        let before = sample_of(&status(0, true, None), "zingod").expect("sampled");
         assert_eq!(before, ContainerSample { restarts: 0, ready: true });
         assert_eq!(sample_of(&status(0, true, None), "other"), None, "wrong container");
 
@@ -418,11 +418,11 @@ mod tests {
             (status(1, true, None), true),
         ];
         for (st, want) in timeline {
-            let now = sample_of(&st, "zainod").expect("sampled");
+            let now = sample_of(&st, "zingod").expect("sampled");
             assert_eq!(came_back(before, now), want, "{now:?}");
         }
         // Stale ready flag on a waiting container never reads as up
-        let stale = sample_of(&status(2, true, Some("CrashLoopBackOff")), "zainod");
+        let stale = sample_of(&status(2, true, Some("CrashLoopBackOff")), "zingod");
         assert_eq!(stale, Some(ContainerSample { restarts: 2, ready: false }));
     }
 

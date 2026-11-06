@@ -1,6 +1,6 @@
 //! Load, stress & differential testing over a live indexer's gRPC surface.
 //!
-//! Modelled on `hhanh00/zaino`'s `zaino-admin`, reshaped from a manual CLI into a
+//! Modelled on `hhanh00/zingod`'s `zingod-admin`, reshaped from a manual CLI into a
 //! library the test body calls; both original modes collapse onto one driver.
 //!
 //! - stress ([`LoadDriver::new`]): N connections on one endpoint, [`BlockOracle`]

@@ -183,7 +183,7 @@ impl fmt::Display for Slo {
     }
 }
 
-/// `Latency.server` = share of the method's answers zainod's own clock ran past the SLO (`None` =
+/// `Latency.server` = share of the method's answers zingod's own clock ran past the SLO (`None` =
 /// no server twin, or no reading)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Breach {
@@ -198,7 +198,7 @@ impl fmt::Display for Breach {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Breach::ClientBound => {
-                write!(f, "driver saturated (CLIENT-BOUND: a floor, not zaino's)")
+                write!(f, "driver saturated (CLIENT-BOUND: a floor, not zingod's)")
             }
             Breach::Errors(rate) => write!(f, "errors {:.2}%", rate * 100.0),
             Breach::NothingAnswered => write!(f, "nothing answered"),
@@ -273,7 +273,7 @@ impl Plan {
                 Birthdays::Between { from: 1_704_000, to: 2_200_000 },
                 Birthdays::Anywhere,
             ],
-            // [assumed] wallet trial-decryption rate (zaino `lightwallet-serving-audit.md` §3.6)
+            // [assumed] wallet trial-decryption rate (zingod `lightwallet-serving-audit.md` §3.6)
             pace: Some(5_000_000),
             calibration: 100,
             audit_every: 64,
@@ -379,7 +379,7 @@ impl Level {
         self.server_cores.filter(|_| mb > 0.0).map(|cores| cores * 1e3 / mb)
     }
 
-    const HEADER: &str = "  wallets   req/s    MB/s        p99  errors  goodput  zainod     engine";
+    const HEADER: &str = "  wallets   req/s    MB/s        p99  errors  goodput  zingod     engine";
 }
 
 /// One table row; `{:#}` adds every method's line (the log's per-level record)
@@ -472,7 +472,7 @@ impl fmt::Display for ScenarioReport {
                 f,
                 "{}: CAPACITY {}{wallets} wallets, held {:.0} s",
                 self.ramp.scenario,
-                // a driver-bound stop = zaino's own limit lies further up
+                // a driver-bound stop = zingod's own limit lies further up
                 if self.stopped == Some(Breach::ClientBound) { "≥ " } else { "" },
                 soak.window.as_secs_f64()
             )?,
@@ -1200,7 +1200,7 @@ mod tests {
                     p99: Duration::from_secs(9),
                     server: Some(0.8),
                 }),
-                "saturated driver, 16 of 20 past the SLO on the server's clock: zaino's",
+                "saturated driver, 16 of 20 past the SLO on the server's clock: zingod's",
             ),
             (
                 level(vec![method(range, 50, 1_000, 0, 400)], Some(50e6), 0.3, &[]),

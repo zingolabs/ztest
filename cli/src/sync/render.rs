@@ -3,8 +3,8 @@
 //! ```text
 //! sync profiles                                    live-tests · feat_add_sync · 2
 //!
-//!  ●  zaino_index_construction   zaino builds its chain index over the pinned…
-//!  │  indexer · sync · 48h       mainnet, zaino, index, blossom
+//!  ●  zingod_index_construction   zingod builds its chain index over the pinned…
+//!  │  indexer · sync · 48h       mainnet, zingod, index, blossom
 //! ```
 //!
 //! - Listing / empty / `start` miss = one entry block, 3 conditions (3 formats would drift)

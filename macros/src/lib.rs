@@ -116,7 +116,7 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
 
 /// Two forms:
 ///
-/// - Local: `dev!(Indexer::Zainod, "rel/Dockerfile" [, context = "rel/ctx", version = "…", features = ["…"]])`
+/// - Local: `dev!(Indexer::Zingod, "rel/Dockerfile" [, context = "rel/ctx", version = "…", features = ["…"]])`
 ///   — a Dockerfile in the local checkout, path resolved against the caller's
 ///   `CARGO_MANIFEST_DIR` (same rule as the `mount_*` macros). Compile fails if
 ///   the Dockerfile doesn't exist or the context isn't a directory.
@@ -134,7 +134,7 @@ pub fn mount_config(input: TokenStream) -> TokenStream {
 /// (zebra) that render config / derive a ceiling from it; it defaults to `"dev"`.
 ///
 /// Supported component variants: `Validator::Zebrad`, `Validator::Zcashd`,
-/// `Indexer::Zainod`. Any other path yields a compile error — keeps the
+/// `Indexer::Zingod`. Any other path yields a compile error — keeps the
 /// matrix grep-able and the test-author surface small.
 #[proc_macro]
 pub fn dev(input: TokenStream) -> TokenStream {
@@ -152,23 +152,23 @@ pub fn dev(input: TokenStream) -> TokenStream {
     }
 
     // Derive the kind label from the variant name itself — lowercased.
-    // `Indexer::Zainod` → `"zainod"`, `Validator::Zebrad` → `"zebrad"`, etc.
+    // `Indexer::Zingod` → `"zingod"`, `Validator::Zebrad` → `"zebrad"`, etc.
     // The lowercased form is used two ways:
     //   - as the inventory `repo:` field (becomes the local image
     //     repo name in the resolved `<repo>:dev-<suffix>` tag),
-    //   - as the constructor ident (`Indexer::zainod_dev(...)`).
+    //   - as the constructor ident (`Indexer::zingod_dev(...)`).
     let kind_str: String =
         match (variant.category.to_string().as_str(), variant.variant.to_string().as_str()) {
             ("Validator", "Zebrad") => "zebrad".to_string(),
             ("Validator", "Zcashd") => "zcashd".to_string(),
-            ("Indexer", "Zainod") => "zainod".to_string(),
+            ("Indexer", "Zingod") => "zingod".to_string(),
             (cat, var) => {
                 return syn::Error::new(
                     variant.span(),
                     format!(
                         "dev!: unsupported component variant `{cat}::{var}`; \
                      expected one of `Validator::Zebrad`, `Validator::Zcashd`, \
-                     `Indexer::Zainod`"
+                     `Indexer::Zingod`"
                     ),
                 )
                 .to_compile_error()

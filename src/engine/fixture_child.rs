@@ -85,7 +85,7 @@ fn fails_with_an_error_line() {
         return;
     }
     println!("INFO provisioning component");
-    eprintln!("Error: image build failed for zainod");
+    eprintln!("Error: image build failed for zingod");
     panic!("image build failed");
 }
 

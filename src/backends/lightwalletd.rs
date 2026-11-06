@@ -1,7 +1,7 @@
 //! Lightwalletd indexer backend.
 //!
 //! - `CompactTxStreamer` gRPC, a fresh tonic connection per call
-//! - Shares no helpers with `zaino` (the two must diverge in framing independently)
+//! - Shares no helpers with `zingod` (the two must diverge in framing independently)
 
 use std::time::Duration;
 

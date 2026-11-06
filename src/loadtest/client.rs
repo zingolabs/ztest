@@ -16,7 +16,7 @@ use crate::error::env_err;
 use crate::proto::compact_tx_streamer_client::CompactTxStreamerClient;
 use crate::proto::{BlockId, BlockRange, ChainSpec, CompactBlock};
 
-/// Persistent lightwalletd/zainod gRPC client; clones share the multiplexed channel.
+/// Persistent lightwalletd/zingod gRPC client; clones share the multiplexed channel.
 /// Origin URI retained so per-task mode can [`dial`](LwdClient::dial) a fresh channel
 #[derive(Debug, Clone)]
 pub struct LwdClient {

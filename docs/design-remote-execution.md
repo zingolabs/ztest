@@ -51,7 +51,7 @@ progress. One engine, one `Executor` seam, both targets — the cluster profile 
 - Then component logs: each pod's kube-timestamped tail, merged chronologically, capped to the most
   recent 40 lines total
 - Then any dead-pod terminal reason (OOMKilled/Evicted)
-- Separate budgets on purpose: the runner is the test's primary voice, so a high-volume component (zaino
+- Separate budgets on purpose: the runner is the test's primary voice, so a high-volume component (zingod
   health-checks every ~100 ms) can never evict it
 - A plain fetch, not a live follow — the laptop owns teardown ordering, so pods still exist at fetch time
   and there is no attach-timing or mid-stream-EOF race

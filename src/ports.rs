@@ -14,8 +14,8 @@ pub const ZEBRAD_HEALTH: u16 = 18080;
 /// zebrad indexer gRPC (`rpc.indexer_listen_addr`): off unless the validator opts in
 pub const ZEBRAD_INDEXER: u16 = 8230;
 pub const ZCASHD_RPC: u16 = 28232;
-pub const ZAINO_GRPC: u16 = 8137;
-pub const ZAINO_METRICS: u16 = 9998;
+pub const ZINGOD_GRPC: u16 = 8137;
+pub const ZINGOD_METRICS: u16 = 9998;
 /// Detached sync driver's own `/metrics` (segment origin, probe violations)
 pub const SYNC_DRIVER_METRICS: u16 = 9997;
 pub const LIGHTWALLETD_GRPC: u16 = 9067;

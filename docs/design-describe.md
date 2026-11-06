@@ -2,7 +2,7 @@
 
 ## Why this exists
 
-`ztest sync start zaino_index_construction` pulled **two** chain snapshots: the 13.05 GiB mainnet BLOSSOM
+`ztest sync start zingod_index_construction` pulled **two** chain snapshots: the 13.05 GiB mainnet BLOSSOM
 its profile declares, plus an 8.15 GiB testnet IRONWOOD declared by
 `clientless::the_pub_testnet_ironwood_boundary` — a test neither selected nor run. 21 GiB of R2 transfer
 for a 13 GiB dependency, unknowable in advance.
@@ -153,14 +153,14 @@ Node kinds: `qos`, `tags`, `image`, `seed`, and (`--full`) `pod`. Deliberately n
 — the test id is the root's own label under `sync describe` and the root itself under `run describe`, and
 the binary is recoverable from the test id. Both were structure without information.
 
-### `ztest sync describe zaino_index_construction`
+### `ztest sync describe zingod_index_construction`
 
 ```
-zaino_index_construction
-zaino builds its chain index over the pinned Blossom mainnet snapshot; zebrad is the authority
+zingod_index_construction
+zingod builds its chain index over the pinned Blossom mainnet snapshot; zebrad is the authority
 ├── qos sync · reserve 16c / 16 GiB · hard cap 48h · declared 48h
-├── tags mainnet, zaino, index, blossom
-├── image zainod BUILD
+├── tags mainnet, zingod, index, blossom
+├── image zingod BUILD
 │   ├── dockerfile <root>/Dockerfile ctx <root>
 │   └── features prometheus, profile
 └── seed zebra-6.2.3-blossom-mainnet 1106bc19 13.05 GiB
@@ -193,7 +193,7 @@ Roots = the selected tests; shared nodes expand once, repeat as `(*)`.
 
 the_pub_testnet_ironwood_boundary
 ├── qos testnet · reserve 8c / 8 GiB · hard cap 6h
-├── image dev:zainod BUILD
+├── image dev:zingod BUILD
 │   └── features prometheus
 └── seed IRONWOOD_TESTNET 3545da25 8.15 GiB
     ├── archive zebra-6.2.3-ironwood-testnet
@@ -201,7 +201,7 @@ the_pub_testnet_ironwood_boundary
 
 testnet_parity::case_1_sapling
 ├── qos testnet · reserve 8c / 8 GiB · hard cap 6h
-├── image dev:zainod (*)
+├── image dev:zingod (*)
 └── seed IRONWOOD_TESTNET (*)
 ```
 
@@ -215,16 +215,16 @@ seed, `registry` on each image, `pod` children carrying the resolved topology.
     ├── archive zebra-6.2.3-blossom-mainnet
     ├── pvc ztest-seeds/seed-1106bc19-topolvm-io 48Gi
     ├── cache ✗ MISS published on hostpath.csi.k8s.io, cluster uses topolvm.io → re-pull 13.05 GiB
-    └── clone zebrad → <cache_dir>, zainod → /var/lib/zaino/zebra-db
+    └── clone zebrad → <cache_dir>, zingod → /var/lib/zingod/zebra-db
 ├── pod zebrad zebra:6.2.3 5c / 4 GiB
 │   ├── mount pvc clone ← seed-1106bc19 → <cache_dir>
 │   └── port 18232 rpc, 9999 metrics
-└── pod zainod dev:zainod 9c / 11 GiB
-    ├── mount pvc clone ← seed-1106bc19 → /var/lib/zaino/zebra-db (read)
-    └── mount emptyDir → /var/lib/zaino/db (index built here)
+└── pod zingod dev:zingod 9c / 11 GiB
+    ├── mount pvc clone ← seed-1106bc19 → /var/lib/zingod/zebra-db (read)
+    └── mount emptyDir → /var/lib/zingod/db (index built here)
 ```
 
-`cache ✗ MISS` is the whole point — the exact condition that failed `zaino_index_construction` after
+`cache ✗ MISS` is the whole point — the exact condition that failed `zingod_index_construction` after
 33 minutes, reported before a byte moves.
 
 ### Color

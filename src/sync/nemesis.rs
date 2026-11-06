@@ -208,10 +208,9 @@ impl Buggify {
 
     /// Roll for one RPC. Registration order, first to trigger wins (<=1 fault per call)
     pub fn next_fault(&mut self) -> Option<Fault> {
-        use rand::Rng;
+        use rand::RngExt;
         for rule in &self.rules {
-            // `r#gen` because `gen` is a 2024-edition keyword; this is rand 0.8's `Rng::gen`
-            if self.rng.r#gen::<f64>() < rule.prob {
+            if self.rng.random::<f64>() < rule.prob {
                 return Some(rule.fault);
             }
         }

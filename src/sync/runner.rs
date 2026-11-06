@@ -1008,7 +1008,7 @@ impl<T> PhaseRun<'_, T> {
 
     /// Wait for every [`gates`](SyncSubject::gates) family, each within its ready window.
     ///
-    /// - Inside the window a missing family = still starting (zaino's frontier exists only
+    /// - Inside the window a missing family = still starting (zingod's frontier exists only
     ///   after its first commit), never a read error
     /// - Past it = the phase errors naming the family and the window it missed
     async fn await_ready(&self, launched: Instant) -> Readiness {

@@ -34,7 +34,7 @@ nextest-metadata = "0.14"
 console = "0.16.4"
 reqwest = { workspace = true, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
-rand = "0.8"
+rand = "0.10"
 serde_json = { workspace = true }
 terminal_size = "0.4"
 supports-color = "3.0.2"

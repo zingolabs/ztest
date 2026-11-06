@@ -83,7 +83,7 @@ impl Tally {
 
 /// Narrows a split family to one label value (folding a producer's dimension changes the quantity).
 ///
-/// - e.g. zaino's per-index heights (`index="tree_state"`): max over indexes = no index's height
+/// - e.g. zingod's per-index heights (`index="tree_state"`): max over indexes = no index's height
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Select {
     pub label: &'static str,
@@ -581,19 +581,19 @@ pub async fn scrape(
 mod tests {
     use super::*;
 
-    /// zaino-shaped exposition: counter across two label sets, gauge, summary, as
+    /// zingod-shaped exposition: counter across two label sets, gauge, summary, as
     /// `metrics-exporter-prometheus` emits
     pub const EXPOSITION: &str = "\
-# HELP zaino_grpc_requests_total Total gRPC requests
-# TYPE zaino_grpc_requests_total counter
-zaino_grpc_requests_total{method=\"GetBlock\"} 12
-zaino_grpc_requests_total{method=\"GetLightdInfo\"} 5
-# TYPE zaino_chain_tip_height gauge
-zaino_chain_tip_height 304
-# TYPE zaino_grpc_request_duration_seconds summary
-zaino_grpc_request_duration_seconds{quantile=\"0.5\"} 0.004
-zaino_grpc_request_duration_seconds_sum 0.85
-zaino_grpc_request_duration_seconds_count 17
+# HELP zingod_grpc_requests_total Total gRPC requests
+# TYPE zingod_grpc_requests_total counter
+zingod_grpc_requests_total{method=\"GetBlock\"} 12
+zingod_grpc_requests_total{method=\"GetLightdInfo\"} 5
+# TYPE zingod_chain_tip_height gauge
+zingod_chain_tip_height 304
+# TYPE zingod_grpc_request_duration_seconds summary
+zingod_grpc_request_duration_seconds{quantile=\"0.5\"} 0.004
+zingod_grpc_request_duration_seconds_sum 0.85
+zingod_grpc_request_duration_seconds_count 17
 ";
 
     /// Unselected folds every label set; a selector reads one and an unpublished value
@@ -601,8 +601,8 @@ zaino_grpc_request_duration_seconds_count 17
     #[test]
     fn a_selector_narrows_a_split_family_instead_of_folding_it() {
         let e = exposition(&[EXPOSITION]);
-        let named = |l, v| counter_where("zaino_grpc_requests_total", Dimension::Count, l, v);
-        let all = counter("zaino_grpc_requests_total", Dimension::Count);
+        let named = |l, v| counter_where("zingod_grpc_requests_total", Dimension::Count, l, v);
+        let all = counter("zingod_grpc_requests_total", Dimension::Count);
 
         assert_eq!(e.total(all), Some(17.0), "unselected folds both methods");
         assert_eq!(e.total(named("method", "GetBlock")), Some(12.0), "selector reads its own");
@@ -618,7 +618,7 @@ zaino_grpc_request_duration_seconds_count 17
     #[test]
     fn a_windowed_reduction_refuses_to_answer_from_one_scrape() {
         let e = exposition(&[EXPOSITION]);
-        let latency = hist("zaino_grpc_request_duration_seconds", Dimension::Seconds);
+        let latency = hist("zingod_grpc_request_duration_seconds", Dimension::Seconds);
         assert_eq!(
             e.tally(latency.family()),
             Some(Tally { sum: 0.85, count: 17.0 }),
@@ -632,14 +632,14 @@ zaino_grpc_request_duration_seconds_count 17
     fn a_selected_tally_keeps_its_selector_on_both_parts() {
         let mut e = Exposition::default();
         e.absorb(
-            "# TYPE zaino_sync_block_fetch_seconds histogram\n\
-             zaino_sync_block_fetch_seconds_sum{stage=\"finalised\"} 0.6\n\
-             zaino_sync_block_fetch_seconds_count{stage=\"finalised\"} 100\n\
-             zaino_sync_block_fetch_seconds_sum{stage=\"non-finalised\"} 9.0\n\
-             zaino_sync_block_fetch_seconds_count{stage=\"non-finalised\"} 50\n",
+            "# TYPE zingod_sync_block_fetch_seconds histogram\n\
+             zingod_sync_block_fetch_seconds_sum{stage=\"finalised\"} 0.6\n\
+             zingod_sync_block_fetch_seconds_count{stage=\"finalised\"} 100\n\
+             zingod_sync_block_fetch_seconds_sum{stage=\"non-finalised\"} 9.0\n\
+             zingod_sync_block_fetch_seconds_count{stage=\"non-finalised\"} 50\n",
         );
         let one = Family {
-            name: "zaino_sync_block_fetch_seconds",
+            name: "zingod_sync_block_fetch_seconds",
             select: Some(Select { label: "stage", value: "finalised" }),
             dim: Dimension::Seconds,
             ready: DEFAULT_READY,
@@ -657,22 +657,22 @@ zaino_grpc_request_duration_seconds_count 17
     /// Per-method ladder read through a selector; the count past an SLO rounds toward fewer
     #[test]
     fn a_selected_ladder_counts_what_ran_past_a_threshold() {
-        let e = exposition(&["# TYPE zaino_grpc_duration_seconds histogram\n\
-             zaino_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"0.1\"} 90\n\
-             zaino_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"1\"} 97\n\
-             zaino_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"10\"} 99\n\
-             zaino_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"+Inf\"} 100\n\
-             zaino_grpc_duration_seconds_sum{method=\"GetBlock\"} 30\n\
-             zaino_grpc_duration_seconds_count{method=\"GetBlock\"} 100\n\
-             zaino_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"0.1\"} 0\n\
-             zaino_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"1\"} 0\n\
-             zaino_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"10\"} 0\n\
-             zaino_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"+Inf\"} 50\n\
-             zaino_grpc_duration_seconds_sum{method=\"GetTreeState\"} 900\n\
-             zaino_grpc_duration_seconds_count{method=\"GetTreeState\"} 50\n"]);
+        let e = exposition(&["# TYPE zingod_grpc_duration_seconds histogram\n\
+             zingod_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"0.1\"} 90\n\
+             zingod_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"1\"} 97\n\
+             zingod_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"10\"} 99\n\
+             zingod_grpc_duration_seconds_bucket{method=\"GetBlock\",le=\"+Inf\"} 100\n\
+             zingod_grpc_duration_seconds_sum{method=\"GetBlock\"} 30\n\
+             zingod_grpc_duration_seconds_count{method=\"GetBlock\"} 100\n\
+             zingod_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"0.1\"} 0\n\
+             zingod_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"1\"} 0\n\
+             zingod_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"10\"} 0\n\
+             zingod_grpc_duration_seconds_bucket{method=\"GetTreeState\",le=\"+Inf\"} 50\n\
+             zingod_grpc_duration_seconds_sum{method=\"GetTreeState\"} 900\n\
+             zingod_grpc_duration_seconds_count{method=\"GetTreeState\"} 50\n"]);
         let ladder = |method| {
             let family =
-                hist_where("zaino_grpc_duration_seconds", Dimension::Seconds, "method", method);
+                hist_where("zingod_grpc_duration_seconds", Dimension::Seconds, "method", method);
             e.buckets(family.family()).expect("published")
         };
         let block = ladder("GetBlock");
@@ -702,9 +702,9 @@ zaino_grpc_request_duration_seconds_count 17
     fn a_level_is_the_max_across_targets_never_their_sum() {
         let e = exposition(&[
             EXPOSITION,
-            "# TYPE zaino_chain_tip_height gauge\nzaino_chain_tip_height 309\n",
+            "# TYPE zingod_chain_tip_height gauge\nzingod_chain_tip_height 309\n",
         ]);
-        assert_eq!(e.level(gauge("zaino_chain_tip_height", Dimension::Count)), Some(309.0));
+        assert_eq!(e.level(gauge("zingod_chain_tip_height", Dimension::Count)), Some(309.0));
     }
 
     /// Only path to a quantile — `_sum`/`_count` bound the mean, saying nothing of the tail
@@ -745,19 +745,19 @@ zaino_grpc_request_duration_seconds_count 17
     fn every_reading_a_backend_declares_resolves_against_a_live_exposition() {
         let e = exposition(&[
             EXPOSITION,
-            "# TYPE zaino_sync_fetched_orchard_actions_total counter\n\
-             zaino_sync_fetched_orchard_actions_total 4200\n\
-             # TYPE zaino_sync_fetched_height gauge\n\
-             zaino_sync_fetched_height 658599\n\
-             # TYPE zaino_sync_block_fetch_seconds histogram\n\
-             zaino_sync_block_fetch_seconds_sum 0.6\n\
-             zaino_sync_block_fetch_seconds_count 100\n\
-             zaino_sync_block_fetch_seconds_bucket{le=\"0.005\"} 90\n\
-             zaino_sync_block_fetch_seconds_bucket{le=\"+Inf\"} 100\n",
+            "# TYPE zingod_sync_fetched_orchard_actions_total counter\n\
+             zingod_sync_fetched_orchard_actions_total 4200\n\
+             # TYPE zingod_sync_fetched_height gauge\n\
+             zingod_sync_fetched_height 658599\n\
+             # TYPE zingod_sync_block_fetch_seconds histogram\n\
+             zingod_sync_block_fetch_seconds_sum 0.6\n\
+             zingod_sync_block_fetch_seconds_count 100\n\
+             zingod_sync_block_fetch_seconds_bucket{le=\"0.005\"} 90\n\
+             zingod_sync_block_fetch_seconds_bucket{le=\"+Inf\"} 100\n",
         ]);
-        let counter = counter("zaino_sync_fetched_orchard_actions_total", Dimension::Count);
-        let gauge = gauge("zaino_sync_fetched_height", Dimension::Count);
-        let hist = hist("zaino_sync_block_fetch_seconds", Dimension::Seconds);
+        let counter = counter("zingod_sync_fetched_orchard_actions_total", Dimension::Count);
+        let gauge = gauge("zingod_sync_fetched_height", Dimension::Count);
+        let hist = hist("zingod_sync_block_fetch_seconds", Dimension::Seconds);
 
         for reading in [
             counter.rate(),
@@ -779,18 +779,18 @@ zaino_grpc_request_duration_seconds_count 17
         let cpu = counter("container_cpu_usage_seconds_total", Dimension::Seconds);
         let stall = counter("container_pressure_io_stalled_seconds_total", Dimension::Ratio);
         let bytes = counter("container_blkio_device_usage_total", Dimension::Bytes);
-        let ops = counter("zaino_sync_fetched_orchard_actions_total", Dimension::Count);
+        let ops = counter("zingod_sync_fetched_orchard_actions_total", Dimension::Count);
 
         assert_eq!(cpu.rate().unit(), Unit::Cores, "cpu-seconds per second = parallelism");
         assert_eq!(stall.rate().unit(), Unit::Fraction, "stall is bounded by wall clock");
         assert_eq!(bytes.rate().unit(), Unit::BytesPerSec);
         assert_eq!(ops.rate().unit(), Unit::PerSec);
 
-        let height = gauge("zaino_sync_fetched_height", Dimension::Count);
+        let height = gauge("zingod_sync_fetched_height", Dimension::Count);
         assert_eq!(height.level().unit(), Unit::Count);
         assert_eq!(height.slope().unit(), Unit::PerSec);
         assert_eq!(
-            hist("zaino_sync_block_fetch_seconds", Dimension::Seconds).mean().unit(),
+            hist("zingod_sync_block_fetch_seconds", Dimension::Seconds).mean().unit(),
             Unit::Millis,
             "a seconds histogram renders as ms"
         );
@@ -814,9 +814,9 @@ zaino_grpc_request_duration_seconds_count 17
     #[test]
     fn an_absent_family_is_none_rather_than_zero() {
         let e = exposition(&[EXPOSITION]);
-        assert_eq!(e.height(gauge("zaino_sync_finalized_height", Dimension::Count)), None);
+        assert_eq!(e.height(gauge("zingod_sync_finalized_height", Dimension::Count)), None);
         assert_eq!(
-            e.counter_total(counter("zaino_sync_fetched_orchard_actions_total", Dimension::Count)),
+            e.counter_total(counter("zingod_sync_fetched_orchard_actions_total", Dimension::Count)),
             None
         );
     }
@@ -824,6 +824,6 @@ zaino_grpc_request_duration_seconds_count 17
     #[test]
     fn a_height_narrows_back_to_a_whole_height() {
         let e = exposition(&[EXPOSITION]);
-        assert_eq!(e.height(gauge("zaino_chain_tip_height", Dimension::Count)), Some(304));
+        assert_eq!(e.height(gauge("zingod_chain_tip_height", Dimension::Count)), Some(304));
     }
 }

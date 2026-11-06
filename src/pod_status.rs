@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(fault(&crash).as_deref(), Some("zebrad: CrashLoopBackOff"));
 
         let oom = with_container(status(Some("Running")), {
-            let mut c = container("zainod");
+            let mut c = container("zingod");
             c.last_state = Some(ContainerState {
                 terminated: Some(ContainerStateTerminated {
                     reason: Some("OOMKilled".into()),
@@ -523,7 +523,7 @@ mod tests {
             });
             c
         });
-        assert_eq!(fault(&oom).as_deref(), Some("zainod: OOMKilled"));
+        assert_eq!(fault(&oom).as_deref(), Some("zingod: OOMKilled"));
 
         assert!(fault(&status(Some("Failed"))).is_some());
     }

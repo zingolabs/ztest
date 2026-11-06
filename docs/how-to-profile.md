@@ -17,7 +17,7 @@ per-CPU ring. At `1.0` a busy sync overruns it and every trace is dropped. Raise
 
 ## What you get
 
-- Flame graph spanning **Rust, C, C++ and the kernel** in one stack: `zainod` frames run through LMDB
+- Flame graph spanning **Rust, C, C++ and the kernel** in one stack: `zingod` frames run through LMDB
   into `mdb_page_search_root`, and `writev` is no longer a leaf
 - **Off-CPU time** merged with on-CPU → blocked I/O, lock contention, major page faults become visible;
   a CPU-time profiler sees none of them

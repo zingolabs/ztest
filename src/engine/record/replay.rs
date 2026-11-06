@@ -194,7 +194,7 @@ mod tests {
     fn record_then_replay_reproduces_the_run() {
         let dir = tempdir("replay-e2e");
         let components: Vec<u8> =
-            (0..50).flat_map(|i| format!("[zaino] status check {i}\n").into_bytes()).collect();
+            (0..50).flat_map(|i| format!("[zingod] status check {i}\n").into_bytes()).collect();
         {
             let mut rec = RunRecorder::create(&dir, &meta("ztest-run-e2e")).unwrap();
             rec.record(&TestEvent::RunStarted { total: 2, run_id: "ztest-run-e2e" }).unwrap();

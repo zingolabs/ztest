@@ -10,7 +10,7 @@
 //! Filters: `ztest::pod=debug` (runner-pod lifecycle), `ztest::build=debug`
 //! (in-pod `TestEnv::build` phases), `ztest=debug` (all).
 //!
-//! Format: logfmt, uncoloured, no `target=` (zainod's shape; colour = the live view's, at display)
+//! Format: logfmt, uncoloured, no `target=` (zingod's shape; colour = the live view's, at display)
 
 use std::io::Write;
 use std::path::PathBuf;

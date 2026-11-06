@@ -68,7 +68,7 @@ fn timeline(tick: u64) -> Option<Transfers> {
     let mut rows: Vec<TransferRow> = [
         // (label, kind, start_tick, total_bytes, per_tick)
         push("dev-zebrad", TransferKind::Image, 0, 512 * MIB, 22 * MIB),
-        push("dev-zainod", TransferKind::Image, 20, 190 * MIB, 18 * MIB),
+        push("dev-zingod", TransferKind::Image, 20, 190 * MIB, 18 * MIB),
         push("mainnet-9.0", TransferKind::Download, 45, 9 * GIB, 300 * MIB),
         push("dev-lightwalletd", TransferKind::Image, 70, 128 * MIB, 14 * MIB),
         push("dev-lightclient", TransferKind::Image, 95, 96 * MIB, 12 * MIB),

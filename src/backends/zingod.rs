@@ -1,4 +1,4 @@
-//! Zaino indexer backend.
+//! Zingod indexer backend.
 //!
 //! - lightwalletd `CompactTxStreamer` gRPC on the `grpc` port (fresh tonic conn per call)
 //! - No helpers shared with `lightwalletd` (the two may diverge in framing)
@@ -33,7 +33,7 @@ use crate::sync::Channel as Pool;
 use crate::sync::{Cost, Heights, Observation, Observe, Op, ProgressView, SyncSubject, Work};
 use crate::{EnvError, RpcError};
 
-const COMPONENT: &str = "zainod";
+const COMPONENT: &str = "zingod";
 
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -44,14 +44,14 @@ const CHAIN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 pub fn image_uri(
     opts: &crate::component::ComponentOpts,
 ) -> Result<crate::backends::image::ResolvedImage, crate::backends::image::ImageError> {
-    let default_image = format!("zingodevops/zainod:{}", opts.version);
+    let default_image = format!("zingodevops/zingod:{}", opts.version);
     crate::backends::image::resolve(&opts.image, &default_image)
 }
 
-/// [`Indexer`](crate::component::Indexer) builder's zaino flavour → [`ZainoIndexer`] at
+/// [`Indexer`](crate::component::Indexer) builder's zingod flavour → [`ZingodIndexer`] at
 /// `add_indexer` time
 #[derive(Debug, Clone, Default)]
-pub struct ZainoBackend {
+pub struct ZingodBackend {
     extra_trusted: Vec<String>,
     validator_connections: Option<NonZeroU32>,
     validator_client: ValidatorClient,
@@ -60,7 +60,7 @@ pub struct ZainoBackend {
     max_address_rows: Option<NonZeroU32>,
 }
 
-/// zainod's `validator_client`: how it talks to every trusted validator
+/// zingod's `validator_client`: how it talks to every trusted validator
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ValidatorClient {
     /// JSON-RPC for everything (zebrad or zcashd)
@@ -71,7 +71,7 @@ pub enum ValidatorClient {
     Grpc,
 }
 
-/// `[sync]` keys set on the builder (`None` = zainod's own default, key left out)
+/// `[sync]` keys set on the builder (`None` = zingod's own default, key left out)
 #[derive(Debug, Clone, Copy, Default)]
 struct Sync {
     finalised_depth: Option<u32>,
@@ -80,7 +80,7 @@ struct Sync {
     lsm_store: LsmStore,
 }
 
-/// `[sync.lsm_store]` keys set on the builder (`None` = zainod's own default, key left out)
+/// `[sync.lsm_store]` keys set on the builder (`None` = zingod's own default, key left out)
 #[derive(Debug, Clone, Copy, Default)]
 struct LsmStore {
     fanout: Option<u32>,
@@ -88,7 +88,7 @@ struct LsmStore {
     merge_mib_per_sec: Option<NonZeroU32>,
 }
 
-/// `[grpc]` caps a load test lifts (one driver pod = one client address to zainod)
+/// `[grpc]` caps a load test lifts (one driver pod = one client address to zingod)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServeCaps {
     pub max_connections: NonZeroU32,
@@ -97,9 +97,9 @@ pub struct ServeCaps {
     pub max_subscriptions: NonZeroU32,
 }
 
-/// One of zainod's stores: `[index.<label>]` table, `index="<label>"` metric label
+/// One of zingod's stores: `[index.<label>]` table, `index="<label>"` metric label
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ZainoIndex {
+pub enum ZingodIndex {
     CompactBlock,
     UtxoSet,
     BlockHash,
@@ -107,36 +107,36 @@ pub enum ZainoIndex {
     TransparentAddress,
 }
 
-impl ZainoIndex {
-    pub const ALL: [ZainoIndex; 5] = [
-        ZainoIndex::CompactBlock,
-        ZainoIndex::UtxoSet,
-        ZainoIndex::BlockHash,
-        ZainoIndex::TreeState,
-        ZainoIndex::TransparentAddress,
+impl ZingodIndex {
+    pub const ALL: [ZingodIndex; 5] = [
+        ZingodIndex::CompactBlock,
+        ZingodIndex::UtxoSet,
+        ZingodIndex::BlockHash,
+        ZingodIndex::TreeState,
+        ZingodIndex::TransparentAddress,
     ];
 
-    /// zainod's `IndexWriter::NAME` (its metrics' `index` label)
+    /// zingod's `IndexWriter::NAME` (its metrics' `index` label)
     pub const fn label(self) -> &'static str {
         match self {
-            ZainoIndex::CompactBlock => "compact_block",
-            ZainoIndex::UtxoSet => "utxo_set",
-            ZainoIndex::BlockHash => "block_hash",
-            ZainoIndex::TreeState => "tree_state",
-            ZainoIndex::TransparentAddress => "transparent_address",
+            ZingodIndex::CompactBlock => "compact_block",
+            ZingodIndex::UtxoSet => "utxo_set",
+            ZingodIndex::BlockHash => "block_hash",
+            ZingodIndex::TreeState => "tree_state",
+            ZingodIndex::TransparentAddress => "transparent_address",
         }
     }
 
     /// `[index.<table>]` owning this store (`None` = utxo_set, rides `compact_block`)
     const fn table(self) -> Option<&'static str> {
         match self {
-            ZainoIndex::UtxoSet => None,
+            ZingodIndex::UtxoSet => None,
             index => Some(index.label()),
         }
     }
 }
 
-impl crate::component::Indexer<ZainoBackend> {
+impl crate::component::Indexer<ZingodBackend> {
     /// Extra `[[trusted_validators]]` entry, by component name (env's first validator always in)
     ///
     /// - Checked at `env.build()` against the env's other validators
@@ -145,7 +145,7 @@ impl crate::component::Indexer<ZainoBackend> {
         self
     }
 
-    /// `[[trusted_validators]] max_connections`, every validator (unset = zainod's default)
+    /// `[[trusted_validators]] max_connections`, every validator (unset = zingod's default)
     ///
     /// - Block fetches in flight <= this − the poll's 1 − the other lanes' reserves
     pub fn validator_max_connections(mut self, connections: NonZeroU32) -> Self {
@@ -153,7 +153,7 @@ impl crate::component::Indexer<ZainoBackend> {
         self
     }
 
-    /// `validator_client`, every validator (unset = zainod's default, `legacy_rpc`)
+    /// `validator_client`, every validator (unset = zingod's default, `legacy_rpc`)
     ///
     /// - `Grpc` → each `[[trusted_validators]] indexer_address` = its `ZEBRAD_INDEXER` port (every
     ///   trusted zebrad built with `.indexer()`)
@@ -164,7 +164,7 @@ impl crate::component::Indexer<ZainoBackend> {
 
     /// `[sync] finalised_depth`: blocks held reorg-able below the tip
     ///
-    /// - Unset = zainod's default (regtest: [`REGTEST_FINALISED_DEPTH`])
+    /// - Unset = zingod's default (regtest: [`REGTEST_FINALISED_DEPTH`])
     /// - Off regtest: >= [`PUBLIC_MIN_FINALISED_DEPTH`], else rejected at `env.build()`
     pub fn finalised_depth(mut self, depth: u32) -> Self {
         self.backend.sync.finalised_depth = Some(depth);
@@ -173,46 +173,46 @@ impl crate::component::Indexer<ZainoBackend> {
 
     /// `[sync] concurrency`: block fetches (+ folds) in flight ahead of the next one needed
     ///
-    /// - Unset = zainod's default
+    /// - Unset = zingod's default
     pub fn fetch_concurrency(mut self, in_flight: NonZeroU32) -> Self {
         self.backend.sync.concurrency = Some(in_flight);
         self
     }
 
     /// `[sync] queue_mib`: final blocks one index may trail the fetch by before it throttles
-    /// (unset = zainod's default)
+    /// (unset = zingod's default)
     pub fn sync_queue_mib(mut self, mib: NonZeroU32) -> Self {
         self.backend.sync.queue_mib = Some(mib);
         self
     }
 
     /// `[sync.lsm_store] fanout`: same-tier segments merged into one (>= 2, else rejected at
-    /// `env.build()`; unset = zainod's default)
+    /// `env.build()`; unset = zingod's default)
     pub fn lsm_fanout(mut self, fanout: u32) -> Self {
         self.backend.sync.lsm_store.fanout = Some(fanout);
         self
     }
 
-    /// `[sync.lsm_store] merge_slots`: merges doing disk I/O at once (unset = zainod's default)
+    /// `[sync.lsm_store] merge_slots`: merges doing disk I/O at once (unset = zingod's default)
     pub fn lsm_merge_slots(mut self, slots: NonZeroU32) -> Self {
         self.backend.sync.lsm_store.merge_slots = Some(slots);
         self
     }
 
-    /// `[sync.lsm_store] merge_mib_per_sec`: read + written MiB/s all merges share (unset = zainod's
+    /// `[sync.lsm_store] merge_mib_per_sec`: read + written MiB/s all merges share (unset = zingod's
     /// default)
     pub fn lsm_merge_mib_per_sec(mut self, mib: NonZeroU32) -> Self {
         self.backend.sync.lsm_store.merge_mib_per_sec = Some(mib);
         self
     }
 
-    /// `[grpc]` caps (unset = zainod's defaults)
+    /// `[grpc]` caps (unset = zingod's defaults)
     pub fn serve_caps(mut self, caps: ServeCaps) -> Self {
         self.backend.serve_caps = Some(caps);
         self
     }
 
-    /// `[serve] max_address_rows`: receives one address request may walk (unset = zainod's
+    /// `[serve] max_address_rows`: receives one address request may walk (unset = zingod's
     /// default; past it = `RESOURCE_EXHAUSTED`)
     pub fn max_address_rows(mut self, rows: NonZeroU32) -> Self {
         self.backend.max_address_rows = Some(rows);
@@ -220,15 +220,15 @@ impl crate::component::Indexer<ZainoBackend> {
     }
 }
 
-impl IndexerConfig for ZainoBackend {
-    type Handle = ZainoIndexer;
+impl IndexerConfig for ZingodBackend {
+    type Handle = ZingodIndexer;
 
-    fn to_handle(&self, plumbing: HandleInner) -> ZainoIndexer {
-        ZainoIndexer { plumbing }
+    fn to_handle(&self, plumbing: HandleInner) -> ZingodIndexer {
+        ZingodIndexer { plumbing }
     }
 
     fn metrics_port(&self) -> Option<u16> {
-        Some(crate::ports::ZAINO_METRICS)
+        Some(crate::ports::ZINGOD_METRICS)
     }
 
     fn materialize_opts(
@@ -245,7 +245,7 @@ impl IndexerConfig for ZainoBackend {
             IndexerMode::Public => public_network(&opts)?,
         };
         let (first, others) = validators.split_first().ok_or_else(|| EnvError::Config {
-            reason: "zainod sources blocks over validator JSON-RPC; no validator registered"
+            reason: "zingod sources blocks over validator JSON-RPC; no validator registered"
                 .to_string(),
         })?;
         if let Some(stray) = self.extra_trusted.iter().find(|p| !others.contains(p)) {
@@ -268,14 +268,14 @@ impl IndexerConfig for ZainoBackend {
         if let Some(depth) = sync.finalised_depth.filter(|&depth| depth < floor) {
             return Err(EnvError::Config {
                 reason: format!(
-                    "finalised_depth = {depth} on {}: zainod refuses below {floor}",
+                    "finalised_depth = {depth} on {}: zingod refuses below {floor}",
                     network.as_str()
                 ),
             });
         }
         if let Some(fanout) = sync.lsm_store.fanout.filter(|&fanout| fanout < 2) {
             return Err(EnvError::Config {
-                reason: format!("lsm fanout = {fanout}: zainod refuses below 2"),
+                reason: format!("lsm fanout = {fanout}: zingod refuses below 2"),
             });
         }
         let trusted: Vec<&str> =
@@ -285,8 +285,8 @@ impl IndexerConfig for ZainoBackend {
             connections: self.validator_connections,
             client: self.validator_client,
         };
-        let toml = zainod_conf(network, validators, sync, self.serve_caps, self.max_address_rows);
-        opts.mounts.push(crate::regtest::config_mount_inline(toml, ZAINO_CONFIG));
+        let toml = zingod_conf(network, validators, sync, self.serve_caps, self.max_address_rows);
+        opts.mounts.push(crate::regtest::config_mount_inline(toml, ZINGOD_CONFIG));
         Ok(opts)
     }
 }
@@ -294,7 +294,7 @@ impl IndexerConfig for ZainoBackend {
 /// Network off the archive, not the mode (which says only *public*)
 fn public_network(opts: &crate::component::ComponentOpts) -> Result<crate::Network, EnvError> {
     let archive = opts.restore.as_ref().and_then(|r| r.snapshot()).ok_or_else(|| {
-        EnvError::Config { reason: "public-network zaino names no snapshot".to_string() }
+        EnvError::Config { reason: "public-network zingod names no snapshot".to_string() }
     })?;
     Some(archive.network).filter(|n| n.is_public()).ok_or_else(|| EnvError::Config {
         reason: format!("{} is not a public-network chain archive", archive.artifact.name),
@@ -308,12 +308,12 @@ struct TrustedValidators<'a> {
     client: ValidatorClient,
 }
 
-/// `zainod.toml` for zainod's `DaemonConfig` (`deny_unknown_fields` → stale key aborts boot)
+/// `zingod.toml` for zingod's `DaemonConfig` (`deny_unknown_fields` → stale key aborts boot)
 ///
 /// - Regtest: `test`/`test` auth (zcashd demands it, zebrad ignores it)
-/// - Every index pinned under [`ZAINO_DATA`] (no reliance on the image's XDG symlink)
-/// - `[metrics]` always (zainod exporter compiled in, no build feature)
-fn zainod_conf(
+/// - Every index pinned under [`ZINGOD_DATA`] (no reliance on the image's XDG symlink)
+/// - `[metrics]` always (zingod exporter compiled in, no build feature)
+fn zingod_conf(
     network: crate::Network,
     trusted: TrustedValidators<'_>,
     sync: Sync,
@@ -328,7 +328,7 @@ fn zainod_conf(
     };
 
     let mut out = format!(
-        "# Generated by `ztest::backends::zainod` — do not hand-edit\n\nnetwork = \"{}\"\n",
+        "# Generated by `ztest::backends::zingod` — do not hand-edit\n\nnetwork = \"{}\"\n",
         network.as_str()
     );
     let grpc = trusted.client == ValidatorClient::Grpc;
@@ -337,7 +337,7 @@ fn zainod_conf(
     }
     out.push_str(&format!(
         "\n[metrics]\nlisten_address = \"{listen}:{}\"\n",
-        crate::ports::ZAINO_METRICS
+        crate::ports::ZINGOD_METRICS
     ));
     for host in trusted.hosts {
         out.push_str(&format!(
@@ -355,11 +355,14 @@ fn zainod_conf(
     }
     out.push_str(&format!(
         "\n[serve]\ngrpc_listen_address = \"{listen}:{}\"\n",
-        crate::ports::ZAINO_GRPC
+        crate::ports::ZINGOD_GRPC
     ));
     if let Some(rows) = max_address_rows {
         out.push_str(&format!("max_address_rows = {rows}\n"));
     }
+    // both paths "plaintext" = no TLS (zingod default = self-signed): harness, wallets and `/readyz`
+    // probes all speak h2c inside the test namespace, as behind a TLS-terminating proxy
+    out.push_str("\n[serve.tls]\ncert_path = \"plaintext\"\nkey_path = \"plaintext\"\n");
     if let Some(caps) = caps {
         out.push_str(&format!(
             "\n[grpc]\nmax_connections = {}\nmax_connections_per_ip = {}\nmax_work_streams = {}\n\
@@ -400,29 +403,29 @@ fn zainod_conf(
     for (key, value) in lsm {
         out.push_str(&format!("{key} = {value}\n"));
     }
-    for table in ZainoIndex::ALL.into_iter().filter_map(ZainoIndex::table) {
+    for table in ZingodIndex::ALL.into_iter().filter_map(ZingodIndex::table) {
         out.push_str(&format!(
-            "\n[index.{table}]\nenabled = true\npath = \"{ZAINO_DATA}/indexes/{table}\"\n"
+            "\n[index.{table}]\nenabled = true\npath = \"{ZINGOD_DATA}/indexes/{table}\"\n"
         ));
     }
     out
 }
 
-// ─────────────────────────────── ZainoIndexer ─────────────────────────
+// ─────────────────────────────── ZingodIndexer ─────────────────────────
 
 #[derive(Debug, Clone)]
-pub struct ZainoIndexer {
+pub struct ZingodIndexer {
     plumbing: HandleInner,
 }
 
-impl crate::handles::PodHandle for ZainoIndexer {
+impl crate::handles::PodHandle for ZingodIndexer {
     fn plumbing(&self) -> &HandleInner {
         &self.plumbing
     }
 }
 
 #[async_trait]
-impl IndexerBackend for ZainoIndexer {
+impl IndexerBackend for ZingodIndexer {
     fn label(&self) -> &'static str {
         COMPONENT
     }
@@ -440,12 +443,12 @@ impl IndexerBackend for ZainoIndexer {
             image: crate::manifest::resolve_image(image_uri(opts), COMPONENT)?,
             ports: crate::manifest::merge_ports(
                 &crate::backends::metrics_port_appended(
-                    &[("grpc", crate::ports::ZAINO_GRPC)],
-                    Some(crate::ports::ZAINO_METRICS),
+                    &[("grpc", crate::ports::ZINGOD_GRPC)],
+                    Some(crate::ports::ZINGOD_METRICS),
                 ),
                 &opts.extra_ports,
             ),
-            ready: crate::manifest::ReadyProbe::Tcp(crate::ports::ZAINO_GRPC),
+            ready: crate::manifest::ReadyProbe::Tcp(crate::ports::ZINGOD_GRPC),
             command: opts.command.clone(),
             args: opts.args.clone(),
             resources: opts.resources,
@@ -760,7 +763,7 @@ impl IndexerBackend for ZainoIndexer {
         Ok(self.plumbing.endpoint("grpc").await?.url("http"))
     }
 
-    /// zainod serves no JSON-RPC (node queries → the validator's own `json_rpc()`)
+    /// zingod serves no JSON-RPC (node queries → the validator's own `json_rpc()`)
     async fn json_rpc(&self) -> Result<JsonRpcClient, EnvError> {
         Err(EnvError::UnknownEndpoint { component: COMPONENT.into(), name: "jsonrpc".into() })
     }
@@ -828,70 +831,70 @@ impl IndexerBackend for ZainoIndexer {
 
 // ─────────────────────────────── metrics ──────────────────────────────
 
-/// zainod's dotted metric names after scrape (exporter sanitizes `.` → `_`). Shape declared
+/// zingod's dotted metric names after scrape (exporter sanitizes `.` → `_`). Shape declared
 /// once → an illegal reading is a compile error, not a wrong number
 pub mod family {
-    use super::ZainoIndex;
+    use super::ZingodIndex;
     use crate::metrics::{
         Counter, Dimension, Gauge, Hist, counter, gauge, gauge_where, hist, hist_where,
     };
 
-    pub const BUILD_INFO: Gauge = gauge("zaino_build_info", Dimension::Count);
+    pub const BUILD_INFO: Gauge = gauge("zingod_build_info", Dimension::Count);
 
-    pub const BEST_TIP: Gauge = gauge("zaino_best_tip", Dimension::Count);
+    pub const BEST_TIP: Gauge = gauge("zingod_best_tip", Dimension::Count);
     /// Finalized boundary (~1,000 under the best tip) = how far the fetch can reach
-    pub const FINALIZED_TIP: Gauge = gauge("zaino_finalized_tip", Dimension::Count);
+    pub const FINALIZED_TIP: Gauge = gauge("zingod_finalized_tip", Dimension::Count);
     /// Last finalized height handed to the index writers (not durable)
-    pub const FETCH_HEIGHT: Gauge = gauge("zaino_fetch_height", Dimension::Count);
+    pub const FETCH_HEIGHT: Gauge = gauge("zingod_fetch_height", Dimension::Count);
 
-    pub const fn index_finalized_height(index: ZainoIndex) -> Gauge {
-        gauge_where("zaino_index_finalized_height", Dimension::Count, "index", index.label())
+    pub const fn index_finalized_height(index: ZingodIndex) -> Gauge {
+        gauge_where("zingod_index_finalized_height", Dimension::Count, "index", index.label())
     }
 
     /// `1` = serving, `0` = its methods answer `UNAVAILABLE`
-    pub const fn index_synced(index: ZainoIndex) -> Gauge {
-        gauge_where("zaino_index_synced", Dimension::Count, "index", index.label())
+    pub const fn index_synced(index: ZingodIndex) -> Gauge {
+        gauge_where("zingod_index_synced", Dimension::Count, "index", index.label())
     }
 
     // Unlabelled → no selector (a selector drops an unlabelled series: unpublished, not zero)
     // Tallied at fetch → a reorg or restart re-fetches and re-counts
-    pub const BLOCKS: Counter = counter("zaino_fetch_blocks_total", Dimension::Count);
-    pub const TRANSACTIONS: Counter = counter("zaino_fetch_transactions_total", Dimension::Count);
+    pub const BLOCKS: Counter = counter("zingod_fetch_blocks_total", Dimension::Count);
+    pub const TRANSACTIONS: Counter = counter("zingod_fetch_transactions_total", Dimension::Count);
     pub const TRANSPARENT_INPUTS: Counter =
-        counter("zaino_fetch_transparent_inputs_total", Dimension::Count);
+        counter("zingod_fetch_transparent_inputs_total", Dimension::Count);
     pub const TRANSPARENT_OUTPUTS: Counter =
-        counter("zaino_fetch_transparent_outputs_total", Dimension::Count);
+        counter("zingod_fetch_transparent_outputs_total", Dimension::Count);
     pub const SAPLING_SPENDS: Counter =
-        counter("zaino_fetch_sapling_spends_total", Dimension::Count);
+        counter("zingod_fetch_sapling_spends_total", Dimension::Count);
     pub const SAPLING_OUTPUTS: Counter =
-        counter("zaino_fetch_sapling_outputs_total", Dimension::Count);
+        counter("zingod_fetch_sapling_outputs_total", Dimension::Count);
     pub const ORCHARD_ACTIONS: Counter =
-        counter("zaino_fetch_orchard_actions_total", Dimension::Count);
+        counter("zingod_fetch_orchard_actions_total", Dimension::Count);
     pub const IRONWOOD_ACTIONS: Counter =
-        counter("zaino_fetch_ironwood_actions_total", Dimension::Count);
+        counter("zingod_fetch_ironwood_actions_total", Dimension::Count);
     /// Chain-head side, not fetch
-    pub const REORGS: Counter = counter("zaino_reorgs_total", Dimension::Count);
+    pub const REORGS: Counter = counter("zingod_reorgs_total", Dimension::Count);
 
     /// Validator JSON-RPC call, retries included = the ingest path's cost
     pub const VALIDATOR_RPC: Hist =
-        hist("zaino_validator_rpc_duration_seconds", Dimension::Seconds);
+        hist("zingod_validator_rpc_duration_seconds", Dimension::Seconds);
 
     // LSM, summed over `index`
-    pub const LSM_MERGE_BYTES: Counter = counter("zaino_lsm_merge_bytes_total", Dimension::Bytes);
-    pub const LSM_MERGE: Hist = hist("zaino_lsm_merge_duration_seconds", Dimension::Seconds);
+    pub const LSM_MERGE_BYTES: Counter = counter("zingod_lsm_merge_bytes_total", Dimension::Bytes);
+    pub const LSM_MERGE: Hist = hist("zingod_lsm_merge_duration_seconds", Dimension::Seconds);
     /// Unpublished = no commit ever waited on a merge
-    pub const LSM_STALL: Hist = hist("zaino_lsm_stall_duration_seconds", Dimension::Seconds);
+    pub const LSM_STALL: Hist = hist("zingod_lsm_stall_duration_seconds", Dimension::Seconds);
 
-    // zainod's own clock per `CompactTxStreamer` method, from admission (its queueing included)
+    // zingod's own clock per `CompactTxStreamer` method, from admission (its queueing included)
     pub const fn grpc_first_message(method: &'static str) -> Hist {
-        hist_where("zaino_grpc_first_message_seconds", Dimension::Seconds, "method", method)
+        hist_where("zingod_grpc_first_message_seconds", Dimension::Seconds, "method", method)
     }
     pub const fn grpc_duration(method: &'static str) -> Hist {
-        hist_where("zaino_grpc_duration_seconds", Dimension::Seconds, "method", method)
+        hist_where("zingod_grpc_duration_seconds", Dimension::Seconds, "method", method)
     }
 }
 
-/// What zaino publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns scannable
+/// What zingod publishes, grouped by [`Facet`]. `rustfmt::skip` keeps the columns scannable
 #[rustfmt::skip]
 const ROWS: [Row; 21] = [
     // Directions kept apart: only outputs are checkable against the note-commitment trees
@@ -910,20 +913,20 @@ const ROWS: [Row; 21] = [
     row("fetched", family::FETCH_HEIGHT.level(), Facet::Progress),
     row("finalized tip", family::FINALIZED_TIP.level(), Facet::Progress),
     row("best tip", family::BEST_TIP.level(), Facet::Progress),
-    row("compact block", family::index_finalized_height(ZainoIndex::CompactBlock).level(), Facet::Progress),
-    row("value balance", family::index_finalized_height(ZainoIndex::UtxoSet).level(), Facet::Progress),
-    row("block hash", family::index_finalized_height(ZainoIndex::BlockHash).level(), Facet::Progress),
-    row("tree state", family::index_finalized_height(ZainoIndex::TreeState).level(), Facet::Progress),
-    row("transparent address", family::index_finalized_height(ZainoIndex::TransparentAddress).level(), Facet::Progress),
+    row("compact block", family::index_finalized_height(ZingodIndex::CompactBlock).level(), Facet::Progress),
+    row("value balance", family::index_finalized_height(ZingodIndex::UtxoSet).level(), Facet::Progress),
+    row("block hash", family::index_finalized_height(ZingodIndex::BlockHash).level(), Facet::Progress),
+    row("tree state", family::index_finalized_height(ZingodIndex::TreeState).level(), Facet::Progress),
+    row("transparent address", family::index_finalized_height(ZingodIndex::TransparentAddress).level(), Facet::Progress),
     row("reorgs", family::REORGS.rate(), Facet::Progress),
     row("merge write", family::LSM_MERGE_BYTES.rate(), Facet::Store),
 ];
 
-impl crate::metrics::MetricLayout for ZainoIndexer {
+impl crate::metrics::MetricLayout for ZingodIndexer {
     const ROWS: &'static [Row] = &ROWS;
 }
 
-impl Observe for ZainoIndexer {
+impl Observe for ZingodIndexer {
     /// Fetch stops at the finalized boundary (best tip = context, never the target)
     const HEIGHTS: Heights = Heights {
         height: family::FETCH_HEIGHT,
@@ -942,7 +945,7 @@ impl Observe for ZainoIndexer {
     ];
 
     fn observe(exposition: &Exposition) -> Option<Observation> {
-        // Set once at exporter init → marks zainod's exposition before any block
+        // Set once at exporter init → marks zingod's exposition before any block
         if !exposition.publishes(family::BUILD_INFO.family()) {
             return None;
         }
@@ -961,7 +964,7 @@ impl Observe for ZainoIndexer {
 const EXPORTER_SCRAPE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[async_trait]
-impl Exporter for ZainoIndexer {
+impl Exporter for ZingodIndexer {
     async fn endpoint(&self) -> Result<Endpoint, EnvError> {
         self.plumbing.endpoint(crate::metrics::PORT_NAME).await
     }
@@ -970,9 +973,9 @@ impl Exporter for ZainoIndexer {
 /// Load-window edge scrape (a loaded exporter answers slower than a tick's budget allows)
 const LOAD_SCRAPE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Pod resolved per reading (a restarted zainod = a new pod)
+/// Pod resolved per reading (a restarted zingod = a new pod)
 #[async_trait]
-impl ServerMeter for ZainoIndexer {
+impl ServerMeter for ZingodIndexer {
     async fn cpu(&self) -> Result<Duration, String> {
         PodCgroup::new(self.pod().await.map_err(|e| e.to_string())?).cpu().await
     }
@@ -982,7 +985,7 @@ impl ServerMeter for ZainoIndexer {
     }
 
     /// - Method never called = no series = none slow
-    /// - Ladder without an edge ≥ `over` = an error (a zero would clear zaino of every breach)
+    /// - Ladder without an edge ≥ `over` = an error (a zero would clear zingod of every breach)
     async fn slower_than(&self, over: Duration) -> Result<BTreeMap<Method, u64>, String> {
         let exposition = self.read(LOAD_SCRAPE_TIMEOUT).await.map_err(|e| e.to_string())?;
         let mut slow = BTreeMap::new();
@@ -1004,7 +1007,7 @@ impl ServerMeter for ZainoIndexer {
     }
 }
 
-/// zainod `/readyz` (zaino-prod's load-balancer contract)
+/// zingod `/readyz` (zingod-prod's load-balancer contract)
 ///
 /// - `detail` opaque (per-state object: catch-up progress, `{reason, message}`), echoed only
 #[derive(Debug, serde::Deserialize)]
@@ -1024,13 +1027,13 @@ enum State {
     Down,
 }
 
-impl ZainoIndexer {
-    /// Public `/readyz` on the gRPC listener (zaino-prod's load balancer + z3's probe)
+impl ZingodIndexer {
+    /// Public `/readyz` on the gRPC listener (zingod-prod's load balancer + z3's probe)
     ///
     /// - body read on `503` too (`syncing` = 503, still ready for a test)
     /// - unknown `state` = an `Err` naming it (contract drift)
     async fn readyz(&self, http: &reqwest::Client) -> Result<Readyz, String> {
-        let ep = self.plumbing.endpoint_for(crate::ports::ZAINO_GRPC).await;
+        let ep = self.plumbing.endpoint_for(crate::ports::ZINGOD_GRPC).await;
         let url = format!("{}/readyz", ep.map_err(|e| e.to_string())?.url("http"));
         let answer = http.get(&url).send().await;
         let answer = answer.map_err(|e| format!("GET {url}: {:#}", anyhow::Error::from(e)))?;
@@ -1047,7 +1050,7 @@ impl ZainoIndexer {
     ///
     /// - `Ok(None)` = series unpublished (index disabled, or nothing committed yet)
     /// - `Err` = exporter unreachable (pod down)
-    pub async fn finalized_height(&self, index: ZainoIndex) -> Result<Option<u32>, RpcError> {
+    pub async fn finalized_height(&self, index: ZingodIndex) -> Result<Option<u32>, RpcError> {
         Ok(self.exporter().await?.height(family::index_finalized_height(index)))
     }
 
@@ -1055,11 +1058,11 @@ impl ZainoIndexer {
     ///
     /// - `Ok(None)` = series unpublished (index disabled, or not yet reporting) != `Some(false)`
     /// - `Err` = exporter unreachable
-    pub async fn synced(&self, index: ZainoIndex) -> Result<Option<bool>, RpcError> {
+    pub async fn synced(&self, index: ZingodIndex) -> Result<Option<bool>, RpcError> {
         Ok(synced_in(&self.exporter().await?, index))
     }
 
-    /// Deprecated upstream alias (kept while zaino serves it)
+    /// Deprecated upstream alias (kept while zingod serves it)
     pub async fn get_block_range_nullifiers(
         &self,
         start: BlockHeight,
@@ -1083,39 +1086,39 @@ impl ZainoIndexer {
     }
 }
 
-fn synced_in(exposition: &Exposition, index: ZainoIndex) -> Option<bool> {
+fn synced_in(exposition: &Exposition, index: ZingodIndex) -> Option<bool> {
     exposition.level(family::index_synced(index)).map(|v| v == 1.0)
 }
 
 /// ≥1 index reporting + every reporting index serving (a disabled index publishes nothing)
 fn all_synced(exposition: &Exposition) -> bool {
     let reported: Vec<bool> =
-        ZainoIndex::ALL.into_iter().filter_map(|index| synced_in(exposition, index)).collect();
+        ZingodIndex::ALL.into_iter().filter_map(|index| synced_in(exposition, index)).collect();
     !reported.is_empty() && reported.into_iter().all(|synced| synced)
 }
 
 /// Progress off one scrape (height, target, work from the *same* instant)
-fn reading_of(exposition: &Exposition) -> Result<ZainoSyncProgress, RpcError> {
-    let height = ZainoIndexer::height_of(exposition).ok_or_else(|| {
+fn reading_of(exposition: &Exposition) -> Result<ZingodSyncProgress, RpcError> {
+    let height = ZingodIndexer::height_of(exposition).ok_or_else(|| {
         let reason = match exposition.publishes(family::BUILD_INFO.family()) {
             true => format!("{} unpublished: no block fetched yet", family::FETCH_HEIGHT),
             false => format!("{COMPONENT} exposition lacks {}", family::BUILD_INFO),
         };
         RpcError::decode(COMPONENT, "progress", reason)
     })?;
-    Ok(ZainoSyncProgress {
+    Ok(ZingodSyncProgress {
         height,
-        target: ZainoIndexer::target_of(exposition),
-        work: ZainoIndexer::work_of(exposition),
+        target: ZingodIndexer::target_of(exposition),
+        work: ZingodIndexer::work_of(exposition),
     })
 }
 
-/// How fast zaino **ingests** the chain behind it, not how fast it serves
+/// How fast zingod **ingests** the chain behind it, not how fast it serves
 /// ([`loadtest`](crate::loadtest) asks that)
 ///
 /// - Progress from the exporter, never `GetLightdInfo` (answers from the validator mid-sync)
 #[async_trait]
-impl SyncSubject for ZainoIndexer {
+impl SyncSubject for ZingodIndexer {
     async fn launch(&mut self) -> Result<(), RpcError> {
         Ok(())
     }
@@ -1132,7 +1135,7 @@ impl SyncSubject for ZainoIndexer {
     }
 
     fn observes(&self) -> crate::sync::Observed {
-        crate::sync::Observed::exporter("zaino index", COMPONENT)
+        crate::sync::Observed::exporter("zingod index", COMPONENT)
     }
 
     fn rows(&self) -> &'static [Row] {
@@ -1152,15 +1155,15 @@ impl SyncSubject for ZainoIndexer {
     }
 }
 
-/// One tick of zaino's ingest, read from its own exporter
+/// One tick of zingod's ingest, read from its own exporter
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct ZainoSyncProgress {
+struct ZingodSyncProgress {
     height: u32,
     target: Option<u32>,
     work: Work,
 }
 
-impl ProgressView for ZainoSyncProgress {
+impl ProgressView for ZingodSyncProgress {
     fn height(&self) -> u32 {
         self.height
     }
@@ -1211,7 +1214,7 @@ fn u32_height(component: &'static str, op: &'static str, height: u64) -> Result<
 
 // ─────────────────────────────── builders ─────────────────────────────
 
-impl crate::regtest::Regtest for crate::component::Indexer<ZainoBackend> {
+impl crate::regtest::Regtest for crate::component::Indexer<ZingodBackend> {
     fn regtest(self) -> Self {
         let mut indexer = apply_pod_layout(self);
         indexer.mode = crate::component::IndexerMode::Regtest;
@@ -1219,8 +1222,8 @@ impl crate::regtest::Regtest for crate::component::Indexer<ZainoBackend> {
     }
 }
 
-impl crate::regtest::Restore for crate::component::Indexer<ZainoBackend> {
-    /// Snapshot = the network's identity only (zaino reads the chain off the validator)
+impl crate::regtest::Restore for crate::component::Indexer<ZingodBackend> {
+    /// Snapshot = the network's identity only (zingod reads the chain off the validator)
     fn snapshot(self, snapshot: crate::ChainSnapshot) -> Self {
         let mut indexer = apply_pod_layout(self);
         indexer.opts.restore = Some(crate::component::RestoreSource::Archive(snapshot));
@@ -1231,22 +1234,22 @@ impl crate::regtest::Restore for crate::component::Indexer<ZainoBackend> {
 
 /// Scratch volume at the image's data root (image fs belongs to another uid)
 fn apply_pod_layout(
-    indexer: crate::component::Indexer<ZainoBackend>,
-) -> crate::component::Indexer<ZainoBackend> {
-    indexer.mount(crate::regtest::scratch_mount(ZAINO_DATA))
+    indexer: crate::component::Indexer<ZingodBackend>,
+) -> crate::component::Indexer<ZingodBackend> {
+    indexer.mount(crate::regtest::scratch_mount(ZINGOD_DATA))
 }
 
-/// zainod's default config path in the image (like any operator: no args, no container-only
+/// zingod's default config path in the image (like any operator: no args, no container-only
 /// config)
-const ZAINO_CONFIG: &str = "/etc/zaino/zainod.toml";
+const ZINGOD_CONFIG: &str = "/etc/zingod/zingod.toml";
 /// Fixtures never reach the 1000 default; 100 = a finalised band + a reorg window (0 = every
 /// block durable → no reorg recoverable)
 pub const REGTEST_FINALISED_DEPTH: u32 = 100;
-/// zaino's `MAX_BLOCK_REORG_HEIGHT` (zainod `validate()` floor off regtest)
+/// zingod's `MAX_BLOCK_REORG_HEIGHT` (zingod `validate()` floor off regtest)
 pub const PUBLIC_MIN_FINALISED_DEPTH: u32 = 1000;
-/// Image's data dir (zaino `Dockerfile`: XDG cache + data homes → `/var/lib/zaino`): indexes + hold
+/// Image's data dir (zingod `Dockerfile`: XDG cache + data homes → `/var/lib/zingod`): indexes + hold
 /// state on the scratch volume
-const ZAINO_DATA: &str = "/var/lib/zaino";
+const ZINGOD_DATA: &str = "/var/lib/zingod";
 
 #[cfg(test)]
 mod tests {
@@ -1254,10 +1257,10 @@ mod tests {
     use crate::component::{IndexerMode, RestoreSource};
     use crate::regtest::{Regtest, Restore};
 
-    /// - zainod's real `/readyz` bodies (null, catch-up object, reason object) → their `state`
+    /// - zingod's real `/readyz` bodies (null, catch-up object, reason object) → their `state`
     /// - an unknown state + the old `reasons` shape = an error
     #[test]
-    fn readyz_decodes_zainods_state_and_refuses_contract_drift() {
+    fn readyz_decodes_zingods_state_and_refuses_contract_drift() {
         #[rustfmt::skip]
         let bodies = [
             (r#"{"state":"provisioning","detail":null}"#, State::Provisioning),
@@ -1298,16 +1301,16 @@ mod tests {
             .iter()
             .find_map(|m| match &m.source {
                 crate::MountSource::ConfigInline(text)
-                    if m.destination == std::path::Path::new(ZAINO_CONFIG) =>
+                    if m.destination == std::path::Path::new(ZINGOD_CONFIG) =>
                 {
                     Some(text.as_str())
                 }
                 _ => None,
             })
-            .expect("zainod.toml mounted at ZAINO_CONFIG")
+            .expect("zingod.toml mounted at ZINGOD_CONFIG")
     }
 
-    const MAINNET: &str = r#"# Generated by `ztest::backends::zainod` — do not hand-edit
+    const MAINNET: &str = r#"# Generated by `ztest::backends::zingod` — do not hand-edit
 
 network = "mainnet"
 
@@ -1320,24 +1323,28 @@ jsonrpc_address = "zebrad:18232"
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
 
+[serve.tls]
+cert_path = "plaintext"
+key_path = "plaintext"
+
 [index.compact_block]
 enabled = true
-path = "/var/lib/zaino/indexes/compact_block"
+path = "/var/lib/zingod/indexes/compact_block"
 
 [index.block_hash]
 enabled = true
-path = "/var/lib/zaino/indexes/block_hash"
+path = "/var/lib/zingod/indexes/block_hash"
 
 [index.tree_state]
 enabled = true
-path = "/var/lib/zaino/indexes/tree_state"
+path = "/var/lib/zingod/indexes/tree_state"
 
 [index.transparent_address]
 enabled = true
-path = "/var/lib/zaino/indexes/transparent_address"
+path = "/var/lib/zingod/indexes/transparent_address"
 "#;
 
-    const TESTNET: &str = r#"# Generated by `ztest::backends::zainod` — do not hand-edit
+    const TESTNET: &str = r#"# Generated by `ztest::backends::zingod` — do not hand-edit
 
 network = "testnet"
 validator_client = "grpc"
@@ -1353,6 +1360,10 @@ indexer_address = "zebrad:8230"
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
 
+[serve.tls]
+cert_path = "plaintext"
+key_path = "plaintext"
+
 [sync]
 finalised_depth = 2000
 concurrency = 64
@@ -1365,22 +1376,22 @@ merge_mib_per_sec = 300
 
 [index.compact_block]
 enabled = true
-path = "/var/lib/zaino/indexes/compact_block"
+path = "/var/lib/zingod/indexes/compact_block"
 
 [index.block_hash]
 enabled = true
-path = "/var/lib/zaino/indexes/block_hash"
+path = "/var/lib/zingod/indexes/block_hash"
 
 [index.tree_state]
 enabled = true
-path = "/var/lib/zaino/indexes/tree_state"
+path = "/var/lib/zingod/indexes/tree_state"
 
 [index.transparent_address]
 enabled = true
-path = "/var/lib/zaino/indexes/transparent_address"
+path = "/var/lib/zingod/indexes/transparent_address"
 "#;
 
-    const REGTEST: &str = r#"# Generated by `ztest::backends::zainod` — do not hand-edit
+    const REGTEST: &str = r#"# Generated by `ztest::backends::zingod` — do not hand-edit
 
 network = "regtest"
 
@@ -1400,32 +1411,36 @@ password = "test"
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
 
+[serve.tls]
+cert_path = "plaintext"
+key_path = "plaintext"
+
 [sync]
 finalised_depth = 100
 
 [index.compact_block]
 enabled = true
-path = "/var/lib/zaino/indexes/compact_block"
+path = "/var/lib/zingod/indexes/compact_block"
 
 [index.block_hash]
 enabled = true
-path = "/var/lib/zaino/indexes/block_hash"
+path = "/var/lib/zingod/indexes/block_hash"
 
 [index.tree_state]
 enabled = true
-path = "/var/lib/zaino/indexes/tree_state"
+path = "/var/lib/zingod/indexes/tree_state"
 
 [index.transparent_address]
 enabled = true
-path = "/var/lib/zaino/indexes/transparent_address"
+path = "/var/lib/zingod/indexes/transparent_address"
 "#;
 
-    /// Whole `zainod.toml` pinned per network kind (`deny_unknown_fields` upstream → any drift
-    /// in a key = a pod that never boots). Index paths = zainod's defaults, pinned explicit
+    /// Whole `zingod.toml` pinned per network kind (`deny_unknown_fields` upstream → any drift
+    /// in a key = a pod that never boots). Index paths = zingod's defaults, pinned explicit
     #[test]
     fn rendered_config_is_exactly_the_daemon_schema() {
         let dev = |features: &[&str]| {
-            crate::component::Indexer::zainod_dev(
+            crate::component::Indexer::zingod_dev(
                 crate::backends::image::DevSource::Local {
                     dockerfile: "Dockerfile".into(),
                     context: ".".into(),
@@ -1436,7 +1451,7 @@ path = "/var/lib/zaino/indexes/transparent_address"
         };
         let cases = [
             (
-                crate::component::Indexer::zaino("1.0.0")
+                crate::component::Indexer::zingod("1.0.0")
                     .snapshot(snapshot(crate::Network::Mainnet)),
                 vec!["zebrad".to_string()],
                 MAINNET,
@@ -1469,22 +1484,22 @@ path = "/var/lib/zaino/indexes/transparent_address"
             assert_eq!(rendered(&opts), golden);
             toml::from_str::<toml::Table>(golden).expect("golden is valid TOML");
             assert!(
-                opts.mounts.iter().any(|m| m.destination == std::path::Path::new(ZAINO_DATA)
+                opts.mounts.iter().any(|m| m.destination == std::path::Path::new(ZINGOD_DATA)
                     && matches!(m.kind, crate::MountKind::Scratch)),
                 "data root unmounted → every index on the image fs (unwritable, off the volume)"
             );
             assert!(
                 !opts.mounts.iter().any(|m| matches!(m.kind, crate::MountKind::Seed)),
-                "zaino reads the chain over JSON-RPC; a snapshot clone here = a wasted volume"
+                "zingod reads the chain over JSON-RPC; a snapshot clone here = a wasted volume"
             );
         }
     }
 
     /// Unbuildable topologies fail at `env.build()` by name, not as a pod that never syncs
     #[test]
-    fn a_config_zainod_would_refuse_is_rejected_by_name() {
-        let regtest = crate::component::Indexer::zaino("1.0.0").regtest();
-        let reject = |indexer: crate::component::Indexer<ZainoBackend>, validators: &[&str]| {
+    fn a_config_zingod_would_refuse_is_rejected_by_name() {
+        let regtest = crate::component::Indexer::zingod("1.0.0").regtest();
+        let reject = |indexer: crate::component::Indexer<ZingodBackend>, validators: &[&str]| {
             let validators: Vec<String> = validators.iter().map(|v| v.to_string()).collect();
             match indexer.backend.materialize_opts(indexer.opts.clone(), &indexer.mode, &validators)
             {
@@ -1503,24 +1518,24 @@ path = "/var/lib/zaino/indexes/transparent_address"
         );
         assert!(
             reject(regtest.finalised_depth(0), &["zebrad"])
-                .contains("finalised_depth = 0 on regtest: zainod refuses below 1")
+                .contains("finalised_depth = 0 on regtest: zingod refuses below 1")
         );
-        let shallow = crate::component::Indexer::zaino("1.0.0")
+        let shallow = crate::component::Indexer::zingod("1.0.0")
             .snapshot(snapshot(crate::Network::Mainnet))
             .finalised_depth(PUBLIC_MIN_FINALISED_DEPTH - 1);
         assert!(
             reject(shallow, &["zebrad"])
-                .contains("finalised_depth = 999 on mainnet: zainod refuses below 1000")
+                .contains("finalised_depth = 999 on mainnet: zingod refuses below 1000")
         );
         let regtest_cache =
-            crate::component::Indexer::zaino("1.0.0").snapshot(snapshot(crate::Network::Regtest));
+            crate::component::Indexer::zingod("1.0.0").snapshot(snapshot(crate::Network::Regtest));
         assert!(reject(regtest_cache, &["zebrad"]).contains("not a public-network"));
 
-        let unmoded = crate::component::Indexer::zaino("1.0.0");
+        let unmoded = crate::component::Indexer::zingod("1.0.0");
         assert_eq!(unmoded.mode, IndexerMode::None);
         assert!(unmoded.backend.materialize_opts(unmoded.opts.clone(), &unmoded.mode, &[]).is_ok());
         assert!(matches!(
-            crate::component::Indexer::zaino("1.0.0")
+            crate::component::Indexer::zingod("1.0.0")
                 .snapshot(snapshot(crate::Network::Mainnet))
                 .opts
                 .restore,
@@ -1534,43 +1549,43 @@ path = "/var/lib/zaino/indexes/transparent_address"
         e
     }
 
-    /// Mid-sync exposition in zainod's shape: progress = fetch frontier over the finalized tip
+    /// Mid-sync exposition in zingod's shape: progress = fetch frontier over the finalized tip
     /// (never the best tip: fetch stops ~1,000 under it), work = the unlabelled fetch counters,
     /// per-index heights/serving read by label
     #[test]
     fn a_mid_sync_scrape_reads_as_fetch_progress_with_per_index_state() {
         let e = scrape(
-            "# TYPE zaino_build_info gauge\n\
-             zaino_build_info{version=\"0.2.0\"} 1\n\
-             # TYPE zaino_best_tip gauge\n\
-             zaino_best_tip 1000\n\
-             # TYPE zaino_finalized_tip gauge\n\
-             zaino_finalized_tip 900\n\
-             # TYPE zaino_fetch_height gauge\n\
-             zaino_fetch_height 450\n\
-             # TYPE zaino_fetch_sapling_outputs_total counter\n\
-             zaino_fetch_sapling_outputs_total 12\n\
-             # TYPE zaino_fetch_orchard_actions_total counter\n\
-             zaino_fetch_orchard_actions_total 7\n\
-             # TYPE zaino_fetch_transactions_total counter\n\
-             zaino_fetch_transactions_total 40\n\
-             # TYPE zaino_index_finalized_height gauge\n\
-             zaino_index_finalized_height{index=\"compact_block\"} 480\n\
-             zaino_index_finalized_height{index=\"tree_state\"} 0\n\
-             # TYPE zaino_index_synced gauge\n\
-             zaino_index_synced{index=\"compact_block\"} 1\n\
-             zaino_index_synced{index=\"tree_state\"} 0\n",
+            "# TYPE zingod_build_info gauge\n\
+             zingod_build_info{version=\"0.2.0\"} 1\n\
+             # TYPE zingod_best_tip gauge\n\
+             zingod_best_tip 1000\n\
+             # TYPE zingod_finalized_tip gauge\n\
+             zingod_finalized_tip 900\n\
+             # TYPE zingod_fetch_height gauge\n\
+             zingod_fetch_height 450\n\
+             # TYPE zingod_fetch_sapling_outputs_total counter\n\
+             zingod_fetch_sapling_outputs_total 12\n\
+             # TYPE zingod_fetch_orchard_actions_total counter\n\
+             zingod_fetch_orchard_actions_total 7\n\
+             # TYPE zingod_fetch_transactions_total counter\n\
+             zingod_fetch_transactions_total 40\n\
+             # TYPE zingod_index_finalized_height gauge\n\
+             zingod_index_finalized_height{index=\"compact_block\"} 480\n\
+             zingod_index_finalized_height{index=\"tree_state\"} 0\n\
+             # TYPE zingod_index_synced gauge\n\
+             zingod_index_synced{index=\"compact_block\"} 1\n\
+             zingod_index_synced{index=\"tree_state\"} 0\n",
         );
 
         let mut work = Work::ZERO;
         work.set(Op::SaplingOutput, 12).set(Op::OrchardAction, 7);
         let progress = reading_of(&e).expect("fetch frontier published");
-        assert_eq!(progress, ZainoSyncProgress { height: 450, target: Some(900), work });
+        assert_eq!(progress, ZingodSyncProgress { height: 450, target: Some(900), work });
         assert_eq!(progress.pct(), 50.0);
         assert_eq!(progress.work().and_then(|w| w.get(Op::TransparentOut)), None, "unmeasured");
-        assert_eq!(<ZainoIndexer as Observe>::work_source(Op::SproutJoinSplit), None);
+        assert_eq!(<ZingodIndexer as Observe>::work_source(Op::SproutJoinSplit), None);
 
-        let heights: Vec<_> = ZainoIndex::ALL
+        let heights: Vec<_> = ZingodIndex::ALL
             .map(|ix| (e.height(family::index_finalized_height(ix)), synced_in(&e, ix)))
             .to_vec();
         let absent = (None, None);
@@ -1578,41 +1593,41 @@ path = "/var/lib/zaino/indexes/transparent_address"
         assert_eq!(heights, expected, "ALL order: compact, value, hash, tree, transparent");
         assert!(!all_synced(&e), "tree_state still syncing");
 
-        let observed = ZainoIndexer::observe(&e).expect("zainod exposition");
+        let observed = ZingodIndexer::observe(&e).expect("zingod exposition");
         assert_eq!((observed.height, observed.target), (Some(450), Some(900)));
         assert_eq!(observed.transactions, Some(40));
-        assert_eq!(ZainoIndexer::observe(&scrape("zaino_best_tip 1\n")), None, "no build_info");
+        assert_eq!(ZingodIndexer::observe(&scrape("zingod_best_tip 1\n")), None, "no build_info");
     }
 
     /// Completion = every *reporting* index serving; absent != zero, zero reports nothing
     #[test]
     fn completion_needs_one_reporting_index_and_every_reporter_serving() {
         let synced = |series: &str| {
-            all_synced(&scrape(&format!("# TYPE zaino_index_synced gauge\n{series}")))
+            all_synced(&scrape(&format!("# TYPE zingod_index_synced gauge\n{series}")))
         };
         let cases = [
             ("", false),
-            ("zaino_index_synced{index=\"compact_block\"} 1\n", true),
+            ("zingod_index_synced{index=\"compact_block\"} 1\n", true),
             (
-                "zaino_index_synced{index=\"compact_block\"} 1\n\
-                 zaino_index_synced{index=\"tree_state\"} 1\n",
+                "zingod_index_synced{index=\"compact_block\"} 1\n\
+                 zingod_index_synced{index=\"tree_state\"} 1\n",
                 true,
             ),
             (
-                "zaino_index_synced{index=\"compact_block\"} 1\n\
-                 zaino_index_synced{index=\"transparent_address\"} 0\n",
+                "zingod_index_synced{index=\"compact_block\"} 1\n\
+                 zingod_index_synced{index=\"transparent_address\"} 0\n",
                 false,
             ),
-            ("zaino_index_synced 1\n", false),
+            ("zingod_index_synced 1\n", false),
         ];
         for (series, complete) in cases {
             assert_eq!(synced(series), complete, "{series:?}");
         }
 
-        let early = scrape("# TYPE zaino_build_info gauge\nzaino_build_info{version=\"x\"} 1\n");
+        let early = scrape("# TYPE zingod_build_info gauge\nzingod_build_info{version=\"x\"} 1\n");
         let err = reading_of(&early).expect_err("no fetch frontier yet");
         assert!(err.to_string().contains("no block fetched yet"), "{err}");
         let err = reading_of(&scrape("")).expect_err("no exposition");
-        assert!(err.to_string().contains("zaino_build_info"), "{err}");
+        assert!(err.to_string().contains("zingod_build_info"), "{err}");
     }
 }

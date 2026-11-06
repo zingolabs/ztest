@@ -25,11 +25,11 @@ declared in `src/handles/mod.rs`:
 | Binary | Build                   | Config key                | Port | Signals                                                                                                                                   |
 | ------ | ----------------------- | ------------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | zebrad | `--features prometheus` | `[metrics] endpoint_addr` | 9999 | chain tip, verification, peers                                                                                                            |
-| zaino  | always on (no feature)  | `[metrics] listen_address` | 9998 | gRPC rate/latency/errors by method, outbound JSON-RPC to the validator, fetch frontier vs finalized tip, per-index durable height + synced, LSM merges/stalls, reorg count |
+| zingod  | always on (no feature)  | `[metrics] listen_address` | 9998 | gRPC rate/latency/errors by method, outbound JSON-RPC to the validator, fetch frontier vs finalized tip, per-index durable height + synced, LSM merges/stalls, reorg count |
 
-- Zaino's by-method gRPC histograms + outbound-JSON-RPC panel show whether zaino or zebrad is the
+- Zingod's by-method gRPC histograms + outbound-JSON-RPC panel show whether zingod or zebrad is the
   bottleneck directly, no inference
-- Zaino's store = its own LSM (`zaino_lsm_*`, by `index`); no external DB to monitor
+- Zingod's store = its own LSM (`zingod_lsm_*`, by `index`); no external DB to monitor
 
 ### Discovery: no operator, no per-run object
 
@@ -66,8 +66,8 @@ declares a container port named `metrics`, then promotes ztest's pod labels (`co
 - `watch` = the pinned 3-column panel (height/pace/trend · per-pool rates · per-container load) + driver
   and subject logs in scrollback; panel fed by the same `report_view` read as `status`, once per scrape
   interval → one source, two renderers
-- Height = one frontier family, in probe and panel alike (zaino's `zaino_fetch_height`: per block;
-  per-index `zaino_index_finalized_height` steps once per commit batch and carries no blocks/s)
+- Height = one frontier family, in probe and panel alike (zingod's `zingod_fetch_height`: per block;
+  per-index `zingod_index_finalized_height` steps once per commit batch and carries no blocks/s)
 - Driver = a target like any component: `ztest_sync_started_timestamp_seconds` (segment origin, the live
   window) + `ztest_sync_violations_total{probe}`. No state strings — see
   [design-metrics.md](design-metrics.md)
@@ -97,10 +97,10 @@ folds it to collapsed stacks. No component contract — see [how-to-profile.md](
 
 ### Inherent limitation
 
-`pprof-rs` samples via `SIGPROF` + backtrace with a mandatory `blocklist(["libc","libgcc","pthread", "vdso"])` → **native frames are opaque**: zaino's LMDB C and zebrad's RocksDB C++ appear as leaf nodes.
+`pprof-rs` samples via `SIGPROF` + backtrace with a mandatory `blocklist(["libc","libgcc","pthread", "vdso"])` → **native frames are opaque**: zingod's LMDB C and zebrad's RocksDB C++ appear as leaf nodes.
 
 The result is a faithful *Rust-level* flamegraph — which RPC handler, which codepath, which task burns
-CPU — which answers "why is zaino slow" ~95% of the time. Seeing inside the embedded databases needs
+CPU — which answers "why is zingod slow" ~95% of the time. Seeing inside the embedded databases needs
 host-level eBPF sampling and elevated privileges; out of scope by design.
 
 ## Dependencies

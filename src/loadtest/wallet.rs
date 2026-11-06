@@ -1,4 +1,4 @@
-//! Simulated light wallets, shaped on the two real sync engines (zaino
+//! Simulated light wallets, shaped on the two real sync engines (zingod
 //! `docs/notes/lightwallet-serving-audit.md` §1.2, read at source).
 //!
 //! - [`steady`] = pepper-sync at the tip: permanent mempool stream, `GetLatestBlock` ≤ 10 s, and
@@ -22,7 +22,7 @@ use prost::Message;
 use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status};
-use zcash_protocol::consensus::{NetworkConstants, NetworkType};
+use zcash_protocol::consensus::NetworkType;
 
 use crate::loadtest::ledger::{Audit, Ledger, sampled, splitmix64};
 use crate::loadtest::measure::{EngineCpu, Measure, Method};
@@ -44,7 +44,7 @@ const LIGHTD_POLL: Duration = Duration::from_secs(5);
 /// 1 in N `GetLightdInfo` answers audited (all identical within a block)
 const LIGHTD_AUDIT_EVERY: u64 = 64;
 
-/// Retry hint zaino sends with an admission refusal (`grpc-retry-pushback-ms`)
+/// Retry hint zingod sends with an admission refusal (`grpc-retry-pushback-ms`)
 const PUSHBACK: Duration = Duration::from_millis(250);
 
 /// Addresses a never-used zingolib wallet asks after: external 0, then 10 empties per scope
@@ -529,7 +529,7 @@ impl Shards {
 /// p2pkh of a hash no key produced = an address with no history, as an unused wallet's are
 fn unused_address(network: NetworkType, (id, round, index): (u64, u64, u64)) -> String {
     let seed: Vec<u8> = [id, round, index].iter().flat_map(|part| part.to_le_bytes()).collect();
-    let mut payload = network.b58_pubkey_address_prefix().to_vec();
+    let mut payload = zcash_address::constants::b58_pubkey_address_prefix(network).to_vec();
     payload.extend_from_slice(&blake3::hash(&seed).as_bytes()[..20]);
     bs58::encode(payload).with_check().into_string()
 }

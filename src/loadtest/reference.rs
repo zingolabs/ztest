@@ -4,7 +4,7 @@
 //! - Byte orders per zebra's renderer (`zebra-rpc/src/methods/types/transaction.rs`): txids,
 //!   Sapling nullifier/cmu/epk = display (reversed); Orchard + Ironwood = protocol order;
 //!   ciphertexts + scripts raw
-//! - Compact shape = zaino's documented contract: every tx in block order, coinbase `vin`
+//! - Compact shape = zingod's documented contract: every tx in block order, coinbase `vin`
 //!   omitted, `fee` only < 2^32, `header` empty, tree sizes after the block
 
 use std::collections::HashMap;

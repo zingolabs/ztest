@@ -246,10 +246,10 @@ mod tests {
     #[test]
     fn an_image_build_tags_with_the_reference_the_pod_will_pull() {
         let e = LocalEngine::push("ghcr.io/zingolabs".into());
-        let argv = argv(&e, Output::Image { tag: "zainod:dev-abc".into() });
+        let argv = argv(&e, Output::Image { tag: "zingod:dev-abc".into() });
         let t = argv.iter().position(|a| a == "-t").expect("-t");
-        assert_eq!(argv[t + 1], "ghcr.io/zingolabs/zainod:dev-abc");
-        assert_eq!(argv[t + 1], e.reference("zainod:dev-abc"));
+        assert_eq!(argv[t + 1], "ghcr.io/zingolabs/zingod:dev-abc");
+        assert_eq!(argv[t + 1], e.reference("zingod:dev-abc"));
     }
 
     /// A `Files` output never tags and never pushes — it is the inventory dump, not an image

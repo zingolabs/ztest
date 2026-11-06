@@ -807,13 +807,13 @@ mod tests {
     }
 
     const ORCHARD: crate::metrics::Counter = crate::metrics::counter(
-        "zaino_sync_fetched_orchard_actions_total",
+        "zingod_sync_fetched_orchard_actions_total",
         crate::metrics::Dimension::Count,
     );
     const FETCHED: crate::metrics::Gauge =
-        crate::metrics::gauge("zaino_sync_fetched_height", crate::metrics::Dimension::Count);
+        crate::metrics::gauge("zingod_sync_fetched_height", crate::metrics::Dimension::Count);
     const FETCH: crate::metrics::Hist =
-        crate::metrics::hist("zaino_sync_block_fetch_seconds", crate::metrics::Dimension::Seconds);
+        crate::metrics::hist("zingod_sync_block_fetch_seconds", crate::metrics::Dimension::Seconds);
 
     /// `rate` inside the `sum`: aggregating first builds a synthetic series whose value
     /// tracks which label sets exist, and reset correction then adds back the whole aggregate
@@ -821,7 +821,7 @@ mod tests {
     fn a_counter_plot_rates_before_it_folds() {
         assert_eq!(
             promql_plot(ORCHARD.rate(), "ns", grid()),
-            r#"sum(rate(zaino_sync_fetched_orchard_actions_total{namespace="ns"}[35s]))"#
+            r#"sum(rate(zingod_sync_fetched_orchard_actions_total{namespace="ns"}[35s]))"#
         );
     }
 
@@ -831,7 +831,7 @@ mod tests {
     fn a_gauge_plot_takes_a_clamped_derivative_never_a_rate() {
         assert_eq!(
             promql_plot(FETCHED.slope(), "ns", grid()),
-            r#"clamp_min(deriv(max(zaino_sync_fetched_height{namespace="ns"})[35s:5s]), 0)"#
+            r#"clamp_min(deriv(max(zingod_sync_fetched_height{namespace="ns"})[35s:5s]), 0)"#
         );
     }
 
@@ -839,7 +839,7 @@ mod tests {
     fn a_level_is_plotted_as_published() {
         assert_eq!(
             promql_plot(FETCHED.level(), "ns", grid()),
-            r#"max(zaino_sync_fetched_height{namespace="ns"})"#
+            r#"max(zingod_sync_fetched_height{namespace="ns"})"#
         );
     }
 
@@ -849,8 +849,8 @@ mod tests {
     fn a_mean_is_windowed_and_unguarded() {
         assert_eq!(
             promql_plot(FETCH.mean(), "ns", grid()),
-            "sum(rate(zaino_sync_block_fetch_seconds_sum{namespace=\"ns\"}[35s])) / \
-             sum(rate(zaino_sync_block_fetch_seconds_count{namespace=\"ns\"}[35s])) * 1000"
+            "sum(rate(zingod_sync_block_fetch_seconds_sum{namespace=\"ns\"}[35s])) / \
+             sum(rate(zingod_sync_block_fetch_seconds_count{namespace=\"ns\"}[35s])) * 1000"
         );
     }
 
@@ -861,7 +861,7 @@ mod tests {
         assert_eq!(
             promql_plot(FETCH.p(crate::metrics::Phi::P99), "ns", grid()),
             "histogram_quantile(0.99, sum by (le) \
-             (rate(zaino_sync_block_fetch_seconds_bucket{namespace=\"ns\"}[35s]))) * 1000"
+             (rate(zingod_sync_block_fetch_seconds_bucket{namespace=\"ns\"}[35s]))) * 1000"
         );
     }
 
@@ -871,23 +871,23 @@ mod tests {
     fn a_total_is_taken_from_raw_samples_over_the_padded_run() {
         assert_eq!(
             promql_raw(ORCHARD.rate(), "ns", Duration::from_secs(600)),
-            r#"zaino_sync_fetched_orchard_actions_total{namespace="ns"}[605s]"#
+            r#"zingod_sync_fetched_orchard_actions_total{namespace="ns"}[605s]"#
         );
     }
 
-    /// zaino splits every per-block family on `stage`; folding it counts one block
+    /// zingod splits every per-block family on `stage`; folding it counts one block
     /// once per ingest pass, so the selector must reach both queries
     #[test]
     fn a_split_family_carries_its_selector_into_every_query() {
         let split = crate::metrics::counter_where(
-            "zaino_sync_fetched_orchard_actions_total",
+            "zingod_sync_fetched_orchard_actions_total",
             crate::metrics::Dimension::Count,
             "stage",
             "finalised",
         );
         assert_eq!(
             promql_plot(split.rate(), "ns", grid()),
-            r#"sum(rate(zaino_sync_fetched_orchard_actions_total{namespace="ns",stage="finalised"}[35s]))"#
+            r#"sum(rate(zingod_sync_fetched_orchard_actions_total{namespace="ns",stage="finalised"}[35s]))"#
         );
         assert!(promql_raw(split.rate(), "ns", Duration::from_secs(60)).contains("stage="));
     }
@@ -928,12 +928,12 @@ mod tests {
     fn a_grouped_query_keeps_the_label_that_names_each_series() {
         let body: RangeResponse = serde_json::from_str(
             r#"{"data":{"result":[
-                 {"metric":{"container":"zainod"},"values":[[0,"1.5"],[30,"2.5"]]},
+                 {"metric":{"container":"zingod"},"values":[[0,"1.5"],[30,"2.5"]]},
                  {"metric":{"container":"zebrad"},"values":[[0,"0.25"]]}]}}"#,
         )
         .unwrap();
         let series: Vec<Labelled> = body.data.result.into_iter().map(Labelled::from).collect();
-        assert_eq!(series[0].labels.get("container").map(String::as_str), Some("zainod"));
+        assert_eq!(series[0].labels.get("container").map(String::as_str), Some("zingod"));
         assert_eq!(series[0].points, vec![(0.0, 1.5), (30.0, 2.5)]);
         assert_eq!(series[1].points.len(), 1);
     }

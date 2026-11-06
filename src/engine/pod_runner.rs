@@ -544,7 +544,7 @@ mod tests {
             no_cleanup: false,
             capture: true,
             ztest_log: Some("ztest::build=debug".into()),
-            image_refs: BTreeMap::from([("k".into(), "reg:5000/zainod:dev-abc".into())]),
+            image_refs: BTreeMap::from([("k".into(), "reg:5000/zingod:dev-abc".into())]),
             storage: ("fast-ssd".into(), "csi-snapclass".into()),
         };
         let cfg = PodRunConfig::baked(full.clone(), "runner:dev".into(), "ztest".into(), None);
@@ -562,7 +562,7 @@ mod tests {
         ];
         let optional = [
             ("ZTEST_LOG", "ztest::build=debug"),
-            (crate::backends::image::IMAGE_REFS_ENV, r#"{"k":"reg:5000/zainod:dev-abc"}"#),
+            (crate::backends::image::IMAGE_REFS_ENV, r#"{"k":"reg:5000/zingod:dev-abc"}"#),
         ];
         let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()

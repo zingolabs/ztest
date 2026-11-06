@@ -82,9 +82,9 @@ pub use crate::backends::image::DevSource;
 #[cfg(feature = "librustzcash")]
 pub use crate::backends::librustzcash::{LrzBackend, LrzWallet};
 pub use crate::backends::lightwalletd::LightwalletdIndexer;
-pub use crate::backends::zainod::{ValidatorClient, ZainoIndex, ZainoIndexer};
 pub use crate::backends::zcashd::ZcashdValidator;
 pub use crate::backends::zebra::{Health, ZebraValidator};
+pub use crate::backends::zingod::{ValidatorClient, ZingodIndex, ZingodIndexer};
 #[cfg(feature = "zingolib")]
 pub use crate::backends::zingolib::{ZingolibBackend, ZingolibWallet};
 pub use crate::component::{
@@ -164,8 +164,8 @@ pub mod prelude {
         MountKind, MountSource, NoteCounts, Peer, PeerInfo, Pool, PoolBalances, RECIPIENT_SEED,
         RawTransaction, RpcError, ScanTotals, SendResponse, ShieldedProtocol, SubtreeRoot, TestEnv,
         TreeState, TxId, Validator, ValidatorBackend, ValidatorClient, ValidatorConfig, Wallet,
-        WalletBackend, WalletExt, ZainoIndex, ZainoIndexer, ZatBalance, ZcashdValidator,
-        ZebraValidator,
+        WalletBackend, WalletExt, ZatBalance, ZcashdValidator, ZebraValidator, ZingodIndex,
+        ZingodIndexer,
     };
     /// The pinned chain a test names, and the blob it is restored from
     pub use crate::archive::{Artifact, Backend, ChainSnapshot, Network};

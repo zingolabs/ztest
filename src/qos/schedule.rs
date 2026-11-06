@@ -58,10 +58,10 @@ mod tests {
     fn a_test_over_the_cluster_is_named_with_its_reserve() {
         let huge = Resources::new(16_000, 16 * GIB, 0, 0);
         let p = plan(
-            &[test("small", Resources::new(3_000, 5 * GIB, 0, 0)), test("zaino_sync", huge)],
+            &[test("small", Resources::new(3_000, 5 * GIB, 0, 0)), test("zingod_sync", huge)],
             Some(Resources::new(4_000, 8 * GIB, 0, 0)),
         );
-        assert_eq!(p.unschedulable, [test("zaino_sync", huge)]);
+        assert_eq!(p.unschedulable, [test("zingod_sync", huge)]);
     }
 
     #[test]

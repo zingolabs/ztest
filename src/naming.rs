@@ -223,8 +223,8 @@ mod tests {
     /// `.` = separator → neither part may contribute one (else two syncs collide)
     #[test]
     fn a_tenant_escapes_the_separator_out_of_both_parts() {
-        assert_eq!(profile_tenant("eli.b", "zaino.a52f"), "ztest.eli_b.zaino_a52f");
-        assert_eq!(profile_tenant("elicb", "zaino-a52f"), "ztest.elicb.zaino-a52f");
+        assert_eq!(profile_tenant("eli.b", "zingod.a52f"), "ztest.eli_b.zingod_a52f");
+        assert_eq!(profile_tenant("elicb", "zingod-a52f"), "ztest.elicb.zingod-a52f");
     }
 
     /// Charset is upstream-enforced: `/` and whitespace are rejected outright

@@ -397,24 +397,24 @@ mod tests {
             r#"
             #[ztest::needs(BLOSSOM)]
             #[ztest::sync_test(
-                name = "zaino_index_construction",
+                name = "zingod_index_construction",
                 description = "builds an index",
                 subject = indexer,
                 timeout = "48h",
                 qos = sync,
-                tags = ["mainnet", "zaino"],
+                tags = ["mainnet", "zingod"],
             )]
-            async fn zaino_index_construction(run: SyncRunner) -> SyncOutcome {}
+            async fn zingod_index_construction(run: SyncRunner) -> SyncOutcome {}
             "#,
         );
         assert!(blind.is_empty(), "unexpected blind spots: {blind:?}");
         assert_eq!(found.len(), 1);
         let p = &found[0];
-        assert_eq!(p.name, "zaino_index_construction");
+        assert_eq!(p.name, "zingod_index_construction");
         assert_eq!(p.subject, "indexer");
         assert_eq!(p.qos, "sync");
         assert_eq!(p.timeout, "48h");
-        assert_eq!(p.tags, ["mainnet", "zaino"]);
+        assert_eq!(p.tags, ["mainnet", "zingod"]);
         assert!(!p.gated);
         // attribute, not fn
         assert_eq!(p.line, 3);
@@ -531,19 +531,19 @@ mod tests {
 
     #[test]
     fn resolves_a_known_name() {
-        let s = scan_with(&["zaino_index_construction", "zaino_state_fetch_parity"]);
-        assert_eq!(s.find("zaino_index_construction").expect("found").target, "t");
+        let s = scan_with(&["zingod_index_construction", "zingod_state_fetch_parity"]);
+        assert_eq!(s.find("zingod_index_construction").expect("found").target, "t");
     }
 
     #[test]
     fn suggests_the_near_miss_that_actually_happens() {
-        let s = scan_with(&["zaino_index_construction", "zaino_state_fetch_parity"]);
+        let s = scan_with(&["zingod_index_construction", "zingod_state_fetch_parity"]);
         // one dropped char = the realistic typo
-        match s.find("zaino_index_constructon") {
+        match s.find("zingod_index_constructon") {
             Err(Miss::Unknown { suggestions }) => {
                 assert_eq!(
                     suggestions.first().map(String::as_str),
-                    Some("zaino_index_construction")
+                    Some("zingod_index_construction")
                 );
             }
             other => panic!("expected an unknown-name miss, got {other:?}"),
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn offers_no_suggestion_for_an_unrelated_name() {
-        let s = scan_with(&["zaino_index_construction"]);
+        let s = scan_with(&["zingod_index_construction"]);
         match s.find("wallet_send") {
             Err(Miss::Unknown { suggestions }) => assert!(suggestions.is_empty()),
             other => panic!("expected an unknown-name miss, got {other:?}"),

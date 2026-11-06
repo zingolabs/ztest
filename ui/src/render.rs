@@ -848,8 +848,8 @@ mod tests {
 
     fn watching(vitals: Option<SyncVitals>) -> SyncWatchState {
         SyncWatchState {
-            profile: "zaino_state_sync".into(),
-            sync_id: "zaino-state-sync-a52f9ec9".into(),
+            profile: "zingod_state_sync".into(),
+            sync_id: "zingod-state-sync-a52f9ec9".into(),
             context: "zingo-infra".into(),
             pod_phase: "Running".into(),
             vitals,
@@ -934,7 +934,7 @@ mod tests {
     #[test]
     fn a_container_without_limits_shows_bare_usage() {
         let mut state = watching(Some(sample_vitals()));
-        state.loads = vec![ContainerLoad { limit: None, ..load("zainod", 1_500, 2) }];
+        state.loads = vec![ContainerLoad { limit: None, ..load("zingod", 1_500, 2) }];
         let s = render_sync_load(&state, &plain_unicode_theme());
         assert!(s.contains("1.5c"), "bare cpu:\n{s}");
         assert!(s.contains("2.0 GiB"), "bare memory:\n{s}");
@@ -959,7 +959,7 @@ mod tests {
     fn an_unprobed_cluster_says_probing_never_zero() {
         let state = BannerState {
             cluster: ClusterState {
-                context: "kind-zaino-local".to_string(),
+                context: "kind-zingod-local".to_string(),
                 slots_used: 12,
                 slots_total: 16,
                 slots_configured: 6,

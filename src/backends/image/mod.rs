@@ -704,7 +704,7 @@ mod tests {
             let features: Vec<String> = features.iter().map(|s| s.to_string()).collect();
             let source =
                 DevSource::Local { dockerfile: self.dockerfile(), context: self.dir.clone() };
-            dev_tag(&source, &features, "zainod", rust).unwrap()
+            dev_tag(&source, &features, "zingod", rust).unwrap()
         }
 
         fn request(&self, features: &[&str], rust: Option<&str>) -> BuildRequest {
@@ -739,7 +739,7 @@ mod tests {
         let b = Ctx::new(df, "main.rs", b"fn main() {}");
         assert_eq!(a.tag(&[]), b.tag(&[]));
         // Real `<repo>:dev-<hash>` shape
-        assert!(a.tag(&[]).starts_with("zainod:dev-"));
+        assert!(a.tag(&[]).starts_with("zingod:dev-"));
     }
 
     /// Poison guard: a one-byte source diff (long session at S1, agent edits to S2 in
@@ -823,9 +823,9 @@ mod tests {
     #[test]
     fn registry_reference_prefixes_base_and_preserves_hash() {
         let d = local::LocalEngine::push("ghcr.io/zingolabs".into());
-        assert_eq!(d.reference("zainod:dev-abc123"), "ghcr.io/zingolabs/zainod:dev-abc123");
+        assert_eq!(d.reference("zingod:dev-abc123"), "ghcr.io/zingolabs/zingod:dev-abc123");
         let trailing = local::LocalEngine::push("ghcr.io/zingolabs/".into());
-        assert_eq!(trailing.reference("zainod:dev-abc123"), "ghcr.io/zingolabs/zainod:dev-abc123");
+        assert_eq!(trailing.reference("zingod:dev-abc123"), "ghcr.io/zingolabs/zingod:dev-abc123");
     }
 
     /// Path is not an input; every real selecting dimension is
@@ -839,18 +839,18 @@ mod tests {
             let feats: Vec<String> = feats.iter().map(|s| s.to_string()).collect();
             DevImageId::of(repo, &feats, rust, src)
         };
-        let base = id("zainod", &["a"], None, &local("/laptop/x/../../Dockerfile"));
+        let base = id("zingod", &["a"], None, &local("/laptop/x/../../Dockerfile"));
         // Path-independent: a different absolute Dockerfile path = same id
-        assert_eq!(base, id("zainod", &["a"], None, &local("/cache/src/x/../../Dockerfile")));
+        assert_eq!(base, id("zingod", &["a"], None, &local("/cache/src/x/../../Dockerfile")));
         // Feature order-independent.
         assert_eq!(
-            id("zainod", &["a", "b"], None, &local("/x")),
-            id("zainod", &["b", "a"], None, &local("/x")),
+            id("zingod", &["a", "b"], None, &local("/x")),
+            id("zingod", &["b", "a"], None, &local("/x")),
         );
         // Every real selecting dimension changes the id.
-        assert_ne!(base, id("zainod", &["b"], None, &local("/x")));
+        assert_ne!(base, id("zingod", &["b"], None, &local("/x")));
         assert_ne!(base, id("zebrad", &["a"], None, &local("/x")));
-        assert_ne!(base, id("zainod", &["a"], Some("1.90"), &local("/x")));
+        assert_ne!(base, id("zingod", &["a"], Some("1.90"), &local("/x")));
         // Git origin stable & distinct from a local one
         let git = DevSource::Git {
             url: "u".into(),

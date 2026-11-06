@@ -67,7 +67,7 @@ impl AuthedRpc {
         params: &Value,
     ) -> std::result::Result<T, BoxError> {
         let text = self.text_from_call(method, params).await?;
-        // Route on which of `result`/`error` is non-null → 2.0 (zebrad/zaino) vs 1.0
+        // Route on which of `result`/`error` is non-null → 2.0 (zebrad/zingod) vs 1.0
         // (zcashd) without a version sniff
         let value: serde_json::Value = serde_json::from_str(&text)?;
         if let Some(error) = value.get("error").filter(|e| !e.is_null()) {

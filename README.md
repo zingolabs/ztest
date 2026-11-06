@@ -30,7 +30,7 @@ ztest cluster add kind --kind kind --set-default
 ztest cluster setup --install-storage --no-observability
 ztest cluster check
 
-cd zaino/live-tests/  # Or any other repo w/ ztest-powered tests
+cd zingod/live-tests/  # Or any other repo w/ ztest-powered tests
 ztest run
 
 ```
@@ -43,14 +43,14 @@ ztest cluster add kind --kind kind --set-default
 ztest cluster setup --install-storage # Include the observability stack
 ztest cluster check
 
-cd zaino/live-tests/sync
-ztest sync start zaino_index_construction
+cd zingod/live-tests/sync
+ztest sync start zingod_index_construction
 ztest sync list
-ztest sync status zaino_index-construction_1234abcd  # replace w/ actual id
+ztest sync status zingod_index-construction_1234abcd  # replace w/ actual id
 
 # For viewing profiling data
 uv tool install flameshow
-ztest sync perf zaino_index-construction_1234abcd --component zainod
+ztest sync perf zingod_index-construction_1234abcd --component zingod
 
 ```
 
@@ -65,11 +65,11 @@ ztest cluster add kind --kind kind --set-default
 ztest cluster setup --install-storage
 ztest cluster check
 
-cd zaino/live-tests/
+cd zingod/live-tests/
 ztest run
 
-cd zaino/live-tests/sync
-ztest sync start zaino_index_construction --watch
+cd zingod/live-tests/sync
+ztest sync start zingod_index_construction --watch
 
 
 ```
@@ -84,15 +84,15 @@ the cluster's node, and `ztest cluster check` prints it. See
 use ztest::prelude::*;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zaino_indexes_to_validator_tip() {
+async fn zingod_indexes_to_validator_tip() {
     let mut t = TestEnv::builder();
     let zebra = t.add_validator(Validator::zebrad("6.2.3").regtest());
-    let zaino = t.add_indexer(Indexer::zainod("0.7.0").regtest());
+    let zingod = t.add_indexer(Indexer::zingod("0.7.0").regtest());
     t.build().await.unwrap();
 
     // Typed RPC sugar on the validator handle:
     zebra.generate_blocks(10).await.unwrap();
-    zaino.poll_block_height(zebra.chain_height().await.unwrap())
+    zingod.poll_block_height(zebra.chain_height().await.unwrap())
         .await
         .unwrap();
 }
@@ -122,12 +122,12 @@ where
 {
     let mut t = TestEnv::builder();
     let zebra = t.add_validator(Validator::zebrad("6.2.3").regtest());
-    let zaino = t.add_indexer(Indexer::zaino("0.7.0").regtest());
+    let zingod = t.add_indexer(Indexer::zingod("0.7.0").regtest());
     let wallet = t.add_wallet(wallet);
     t.build().await.unwrap();
 
-    let faucet = wallet.funded_faucet(&zebra, &zaino).await.unwrap();
-    let recipient = wallet.recipient(&zebra, &zaino).await.unwrap();
+    let faucet = wallet.funded_faucet(&zebra, &zingod).await.unwrap();
+    let recipient = wallet.recipient(&zebra, &zingod).await.unwrap();
     let to = recipient.address(Pool::Orchard).await.unwrap();
     faucet.send(&to, 100_000).await.unwrap();
 }
@@ -168,11 +168,11 @@ a `dev!(...)` pointed at a `Dockerfile` (resolved relative to the test
 crate; compile fails if missing):
 
 ```rust
-let zai = t.add_indexer(dev!(Indexer::Zainod, "../Dockerfile"));
+let zai = t.add_indexer(dev!(Indexer::Zingod, "../Dockerfile"));
 ```
 
 Accepted variants: `Validator::Zebrad`, `Validator::Zcashd`,
-`Indexer::Zainod`, `Wallet::librustzcash`.
+`Indexer::Zingod`, `Wallet::librustzcash`.
 
 ## Long-running syncs
 
@@ -182,13 +182,13 @@ throughput by pool, block/tx rates, and per-component CPU, memory, disk and IO
 stall — from the same series Grafana serves:
 
 ```sh
-ztest sync start zaino-index-construction
+ztest sync start zingod-index-construction
 
 # blk/s tx/s, operations/s
-ztest sync status zaino-index-construction-c287448b
+ztest sync status zingod-index-construction-c287448b
 
 # Launches flamegraph viz frontend
-ztest sync perf zaino-index-construction-c287448b --component zainod
+ztest sync perf zingod-index-construction-c287448b --component zingod
 ```
 
 ![ztest sync status](docs/images/sync-status.png)
@@ -207,6 +207,6 @@ cargo run --bin ztest -- --help
 
 - [ ] Review config rendering path (Use rust structs instead of toml? How to handle version matrix w/ config migrations?) -> Put this into a trait?
 
-  - That way zaino developers can define the function to generate the config toml based on the version? Need a clear example of how this would look
+  - That way zingod developers can define the function to generate the config toml based on the version? Need a clear example of how this would look
 
-- [ ] Migrate src/backends/zainod.rs to src/backends/zainod/{config,backend,sync}.rs
+- [ ] Migrate src/backends/zingod.rs to src/backends/zingod/{config,backend,sync}.rs

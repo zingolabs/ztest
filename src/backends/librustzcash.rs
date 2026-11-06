@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rand::rngs::OsRng;
+use rand::SeedableRng;
+use rand::rngs::SysRng;
+use rand_chacha::ChaCha20Rng;
 use secrecy::SecretVec;
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
@@ -64,7 +66,7 @@ const LABEL: &str = "librustzcash";
 /// sync stream on the same channel). Relay deadline = the caller's per-send `timeout`
 const INDEXER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, OsRng>;
+type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, ChaCha20Rng>;
 
 /// [`Wallet`](crate::component::Wallet) builder's librustzcash flavour → [`LrzWallet`]
 /// handle at `add_wallet` time
@@ -162,6 +164,7 @@ fn to_local_network(a: &ActivationHeights) -> LocalNetwork {
         nu6_1: a.nu6_1().map(BlockHeight::from_u32),
         nu6_2: a.nu6_2().map(BlockHeight::from_u32),
         nu6_3: a.nu6_3().map(BlockHeight::from_u32),
+        nu7: a.nu7().map(BlockHeight::from_u32),
     }
 }
 
@@ -464,6 +467,8 @@ impl WalletBackend for LrzWallet {
         >(
             &mut *db,
             &acct.params,
+            &SystemClock,
+            &mut os_seeded_rng()?,
             &prover,
             &prover,
             &sk,
@@ -504,6 +509,8 @@ impl WalletBackend for LrzWallet {
         let txids = shield_transparent_funds::<Db, LocalNetwork, _, _>(
             &mut *db,
             &acct.params,
+            &SystemClock,
+            &mut os_seeded_rng()?,
             &prover,
             &prover,
             &input_selector,
@@ -535,7 +542,14 @@ fn open_wallet_db(path: &Path, params: LocalNetwork) -> Result<Db, BoxError> {
         .map_err(|e| format!("librustzcash: enable WAL on {}: {e}", path.display()))?;
     rusqlite::vtab::array::load_module(&conn)
         .map_err(|e| format!("librustzcash: load rarray module: {e}"))?;
-    Ok(WalletDb::from_connection(conn, params, SystemClock, OsRng))
+    Ok(WalletDb::from_connection(conn, params, SystemClock, os_seeded_rng()?))
+}
+
+/// `SysRng` = fallible (`TryRng`); `WalletDb` wants an infallible, `Clone` `CryptoRng` (rand 0.10's own
+/// ChaCha RNGs are not `Clone`)
+fn os_seeded_rng() -> Result<ChaCha20Rng, BoxError> {
+    ChaCha20Rng::try_from_rng(&mut SysRng)
+        .map_err(|e| format!("librustzcash: seed rng: {e}").into())
 }
 
 /// One-confirmation wallet-summary policy (matches [`WalletBackend::balances`])

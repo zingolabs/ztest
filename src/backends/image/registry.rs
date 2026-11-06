@@ -210,17 +210,17 @@ mod tests {
 
     #[test]
     fn a_reference_splits_host_repo_and_tag() {
-        let r = Reference::parse("zot.zot.svc.cluster.local:5000/ztest/zainod:dev-abc").unwrap();
+        let r = Reference::parse("zot.zot.svc.cluster.local:5000/ztest/zingod:dev-abc").unwrap();
         assert_eq!(r.host, "zot.zot.svc.cluster.local:5000");
-        assert_eq!(r.repo, "ztest/zainod");
+        assert_eq!(r.repo, "ztest/zingod");
         assert_eq!(r.tag, "dev-abc");
     }
 
     /// No registry host = a bare local tag (kind), nothing to probe
     #[test]
     fn a_bare_tag_is_not_a_registry_reference() {
-        assert_eq!(Reference::parse("zainod:dev-abc"), None);
-        assert_eq!(Reference::parse("ztest/zainod:dev-abc"), None);
+        assert_eq!(Reference::parse("zingod:dev-abc"), None);
+        assert_eq!(Reference::parse("ztest/zingod:dev-abc"), None);
     }
 
     #[test]

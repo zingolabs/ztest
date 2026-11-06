@@ -320,7 +320,7 @@ impl TestEnv {
         handle
     }
 
-    /// Register an indexer, returning its concrete handle (e.g. `ZainoIndexer`)
+    /// Register an indexer, returning its concrete handle (e.g. `ZingodIndexer`)
     pub fn add_indexer<B: IndexerConfig>(&mut self, i: Indexer<B>) -> B::Handle {
         let id = self.fresh_id();
         let plumbing = HandleInner {
@@ -641,7 +641,7 @@ impl TestEnv {
         build_phase("indexers_materialize", t_phase);
 
         // Indexer analogue of `wait_validators_rpc_ready`: pod-Ready ≠ gRPC listener bound
-        // (zainod serves only after its initial chain-index build, which can lag Ready by
+        // (zingod serves only after its initial chain-index build, which can lag Ready by
         // minutes under load), so gate on a live `GetLightdInfo`. `is_built` window as above
         self.inner.is_built.store(true, Ordering::Release);
         let t_phase = std::time::Instant::now();
@@ -757,7 +757,7 @@ impl TestEnv {
     }
 
     /// Indexer counterpart of [`Self::wait_validators_rpc_ready`]: every indexer's backend `ready`
-    /// (zainod: `/readyz`; lightwalletd: `GetLightdInfo`), or `ready_timeout` elapses
+    /// (zingod: `/readyz`; lightwalletd: `GetLightdInfo`), or `ready_timeout` elapses
     async fn wait_indexers_rpc_ready(&self) -> Result<(), EnvError> {
         let indexers: Vec<(String, Arc<dyn IndexerBackend>)> = {
             let comps = self.inner.components.read().await;
@@ -1259,7 +1259,7 @@ mod tests {
     #[test]
     fn a_declared_footprint_admits_the_exact_sum_of_its_pods() {
         let mut exact = DeployBudget::new(sync_declared(14, 15));
-        exact.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(11)));
+        exact.admit(&overridden("zingod", Cpu::cores(9), Mem::gib(11)));
         exact.admit(&overridden("zebrad", Cpu::cores(5), Mem::gib(4)));
         assert_eq!(exact.committed, Resources::new(14_000, 15 * GIB, 0, 0));
         exact.close();
@@ -1269,12 +1269,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "QoS reserve slack: footprint declares 16c/24Gi/400Gi, but the \
         component pods request 14c/20Gi.\n  zebrad: 6000m / 10737418240 B\n  \
-        zainod: 8000m / 10737418240 B\n\
+        zingod: 8000m / 10737418240 B\n\
         A declared footprint must equal the sum of its pods — set it to `14c/20Gi/400Gi`.")]
     fn a_declared_footprint_above_its_pods_is_refused_with_the_exact_fix() {
         let mut slack = DeployBudget::new(sync_declared(16, 24));
         slack.admit(&overridden("zebrad", Cpu::cores(6), Mem::gib(10)));
-        slack.admit(&overridden("zainod", Cpu::cores(8), Mem::gib(10)));
+        slack.admit(&overridden("zingod", Cpu::cores(8), Mem::gib(10)));
         slack.close();
     }
 
@@ -1283,7 +1283,7 @@ mod tests {
     #[should_panic(
         expected = "QoS over-schedule: this test's component pods request 18000m cpu / \
         15032385536 B in total, exceeding the 15000m cpu / 16106127360 B its tier reserved for \
-        them.\n  zainod: 9000m / 7516192768 B\n  zebrad: 9000m / 7516192768 B\n"
+        them.\n  zingod: 9000m / 7516192768 B\n  zebrad: 9000m / 7516192768 B\n"
     )]
     fn a_budget_rejects_overrides_that_only_overflow_in_aggregate() {
         let tier = sync_declared(15, 15);
@@ -1294,7 +1294,7 @@ mod tests {
         );
 
         let mut b = DeployBudget::new(tier);
-        b.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(7)));
+        b.admit(&overridden("zingod", Cpu::cores(9), Mem::gib(7)));
         b.admit(&overridden("zebrad", Cpu::cores(9), Mem::gib(7)));
     }
 
@@ -1312,7 +1312,7 @@ mod tests {
 
         let mut b = DeployBudget::new(ceiling);
         b.admit(&defaulted("zebrad", crate::qos::pod::VALIDATOR));
-        b.admit(&defaulted("zainod", crate::qos::pod::INDEXER));
+        b.admit(&defaulted("zingod", crate::qos::pod::INDEXER));
         assert_eq!(
             b.committed,
             crate::qos::pod::VALIDATOR.saturating_add(&crate::qos::pod::INDEXER),
@@ -1327,11 +1327,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "pod zainod .resources() override (9000m cpu / 32212254720 B) \
+    #[should_panic(expected = "pod zingod .resources() override (9000m cpu / 32212254720 B) \
         exceeds its tier footprint (15000m cpu / 31138512896 B)")]
     fn a_pod_over_a_declared_footprint_trips_the_per_pod_guard() {
         let mut b = DeployBudget::new(sync_declared(15, 29));
-        b.admit(&overridden("zainod", Cpu::cores(9), Mem::gib(30)));
+        b.admit(&overridden("zingod", Cpu::cores(9), Mem::gib(30)));
     }
 
     /// `deployed ≤ footprint` for the topology the tier is priced for → a test's real
@@ -1364,7 +1364,7 @@ mod tests {
         let mut admitted = 0u64;
         for i in 0..64 {
             let req = Request {
-                binary_id: "zaino".into(),
+                binary_id: "zingod".into(),
                 test_name: format!("t{i}"),
                 sa: "ci".into(),
                 footprint: per_test,
