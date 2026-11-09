@@ -116,7 +116,7 @@ impl IndexerConfig for ZainoBackend {
             });
         }
 
-        zaino_semver(&opts)?;
+        super::image_semver(&opts, "zaino")?;
         let toml = match mode {
             IndexerMode::None => return Ok(opts),
             IndexerMode::Regtest => {
@@ -1145,23 +1145,6 @@ fn read_public_chain(
     indexer.opts.restore = Some(crate::component::RestoreSource::Archive(archive));
     indexer.mode = crate::component::IndexerMode::Public;
     indexer
-}
-
-/// `ImageSpec::Dev`'s `version` holds a Dockerfile path, not a semver → from-source
-/// builds get a sentinel "newest"
-fn zaino_semver(
-    opts: &crate::component::ComponentOpts,
-) -> Result<crate::regtest_conf::Semver, EnvError> {
-    match opts.image {
-        crate::inventory::ImageSpec::Dev { .. } => {
-            Ok(crate::regtest_conf::Semver { major: u16::MAX, minor: 0, patch: 0 })
-        }
-        crate::inventory::ImageSpec::Published => {
-            opts.version.parse::<crate::regtest_conf::Semver>().map_err(|_| EnvError::Config {
-                reason: format!("zaino version {:?} is not valid semver", opts.version),
-            })
-        }
-    }
 }
 
 /// Must match the generator's `[grpc_settings] listen_address` and the named port in

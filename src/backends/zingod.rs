@@ -285,7 +285,9 @@ impl IndexerConfig for ZingodBackend {
             connections: self.validator_connections,
             client: self.validator_client,
         };
-        let toml = zingod_conf(network, validators, sync, self.serve_caps, self.max_address_rows);
+        let version = super::image_semver(&opts, COMPONENT)?;
+        let (caps, rows) = (self.serve_caps, self.max_address_rows);
+        let toml = zingod_conf(version, network, validators, sync, caps, rows);
         opts.mounts.push(crate::regtest::config_mount_inline(toml, ZINGOD_CONFIG));
         Ok(opts)
     }
@@ -314,6 +316,7 @@ struct TrustedValidators<'a> {
 /// - Every index pinned under [`ZINGOD_DATA`] (no reliance on the image's XDG symlink)
 /// - `[metrics]` always (zingod exporter compiled in, no build feature)
 fn zingod_conf(
+    version: crate::regtest_conf::Semver,
     network: crate::Network,
     trusted: TrustedValidators<'_>,
     sync: Sync,
@@ -360,9 +363,14 @@ fn zingod_conf(
     if let Some(rows) = max_address_rows {
         out.push_str(&format!("max_address_rows = {rows}\n"));
     }
-    // both paths "plaintext" = no TLS (zingod default = self-signed): harness, wallets and `/readyz`
-    // probes all speak h2c inside the test namespace, as behind a TLS-terminating proxy
-    out.push_str("\n[serve.tls]\ncert_path = \"plaintext\"\nkey_path = \"plaintext\"\n");
+    // no TLS (0.0.0.0 = refused unset): harness, wallets and `/readyz` probes all speak h2c inside
+    // the test namespace, as behind a TLS-terminating proxy
+    match version.zingod_supports_tls_mode() {
+        true => out.push_str("tls = \"off\"\n"),
+        false => {
+            out.push_str("\n[serve.tls]\ncert_path = \"plaintext\"\nkey_path = \"plaintext\"\n")
+        }
+    }
     if let Some(caps) = caps {
         out.push_str(&format!(
             "\n[grpc]\nmax_connections = {}\nmax_connections_per_ip = {}\nmax_work_streams = {}\n\
@@ -1360,10 +1368,7 @@ indexer_address = "zebrad:8230"
 
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
-
-[serve.tls]
-cert_path = "plaintext"
-key_path = "plaintext"
+tls = "off"
 
 [sync]
 finalised_depth = 2000
@@ -1411,10 +1416,7 @@ password = "test"
 
 [serve]
 grpc_listen_address = "0.0.0.0:8137"
-
-[serve.tls]
-cert_path = "plaintext"
-key_path = "plaintext"
+tls = "off"
 
 [sync]
 finalised_depth = 100
@@ -1450,12 +1452,23 @@ path = "/var/lib/zingod/indexes/transparent_address"
                 features.iter().map(|f| f.to_string()).collect(),
             )
         };
+        // ZINGOD_TLS_MODE onward: `tls = "off"` in place of 1.0.0's "plaintext" path pair
+        let mainnet_tls_mode = MAINNET.replace(
+            "\n\n[serve.tls]\ncert_path = \"plaintext\"\nkey_path = \"plaintext\"\n",
+            "\ntls = \"off\"\n",
+        );
         let cases = [
             (
                 crate::component::Indexer::zingod("1.0.0")
                     .snapshot(snapshot(crate::Network::Mainnet)),
                 vec!["zebrad".to_string()],
                 MAINNET,
+            ),
+            (
+                crate::component::Indexer::zingod("1.1.0")
+                    .snapshot(snapshot(crate::Network::Mainnet)),
+                vec!["zebrad".to_string()],
+                mainnet_tls_mode.as_str(),
             ),
             (
                 dev(&[])

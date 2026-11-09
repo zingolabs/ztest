@@ -91,6 +91,24 @@ pub fn seed_groups(opts: &crate::component::ComponentOpts) -> Vec<i64> {
     }
 }
 
+/// Version a config is rendered for (`ImageSpec::Dev`'s `version` = a Dockerfile path, not a
+/// semver → from-source builds get a sentinel "newest")
+pub(crate) fn image_semver(
+    opts: &crate::component::ComponentOpts,
+    component: &str,
+) -> Result<crate::regtest_conf::Semver, crate::EnvError> {
+    match opts.image {
+        crate::inventory::ImageSpec::Dev { .. } => {
+            Ok(crate::regtest_conf::Semver { major: u16::MAX, minor: 0, patch: 0 })
+        }
+        crate::inventory::ImageSpec::Published => {
+            opts.version.parse().map_err(|_| crate::EnvError::Config {
+                reason: format!("{component} version {:?} is not valid semver", opts.version),
+            })
+        }
+    }
+}
+
 /// `base` + the metrics port under [`crate::metrics::PORT_NAME`], when the backend
 /// declares one. Keeps the port number in the backend's `metrics_port` and nowhere else
 pub(crate) fn metrics_port_appended(

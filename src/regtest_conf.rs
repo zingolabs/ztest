@@ -124,6 +124,11 @@ pub mod versions {
 
     /// First zebrad knowing the `"NU7"` activation-height key (zebrad 7.0.0-rc.0 parses as 7.0.0)
     pub const ZEBRAD_NU7: Semver = Semver { major: 7, minor: 0, patch: 0 };
+
+    // ─── zingod ───
+    /// First zingod reading `[serve] tls = "off"` (1.0.0: both `[serve.tls]` paths `"plaintext"`,
+    /// which later versions refuse)
+    pub const ZINGOD_TLS_MODE: Semver = Semver { major: 1, minor: 1, patch: 0 };
 }
 
 impl Semver {
@@ -155,6 +160,11 @@ impl Semver {
     /// `"NU7"` height accepted as an activation height
     pub fn zebrad_supports_nu7(&self) -> bool {
         *self >= versions::ZEBRAD_NU7
+    }
+
+    /// `[serve] tls = "off"` accepted (else the 1.0.0 `"plaintext"` path pair)
+    pub fn zingod_supports_tls_mode(&self) -> bool {
+        *self >= versions::ZINGOD_TLS_MODE
     }
 }
 
