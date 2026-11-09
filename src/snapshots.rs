@@ -75,7 +75,15 @@ pub const IRONWOOD_MAINNET: ChainSnapshot = ChainSnapshot {
     artifact: artifact!("snapshots/mainnet/zebra-6.4.2-ironwood.toml"),
 };
 
-/// Walked by `ztest snapshot verify --remote`
+/// NU7 (3,543,405); near-tip finalized height (zebra 7.0.0 state v29; live-tip sync = short catch-up)
+pub const NU7_MAINNET: ChainSnapshot = ChainSnapshot {
+    tip_height: 3_545_017,
+    network: Network::Mainnet,
+    backend: Backend::Zebra,
+    artifact: artifact!("snapshots/mainnet/zebra-7.0.0-nu7.toml"),
+};
+
+/// Walked by `ztest snapshot verify`
 pub const ALL: &[&ChainSnapshot] = &[
     &SAPLING_TESTNET,
     &BLOSSOM_TESTNET,
@@ -85,6 +93,7 @@ pub const ALL: &[&ChainSnapshot] = &[
     &BLOSSOM_MAINNET,
     &ORCHARD_MAINNET,
     &IRONWOOD_MAINNET,
+    &NU7_MAINNET,
 ];
 
 #[cfg(test)]
